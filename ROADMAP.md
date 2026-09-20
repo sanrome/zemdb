@@ -321,19 +321,41 @@ La siguiente tabla mapea el origen de cada requerimiento según la recomendació
 | Validación de aridad defensiva en `from_compact_row` | Base de Datos | `rimdb-core` | **Media** | ✅ **Completado** |
 | Test unitario negativo para límite de tamaño DoS | Sistemas Distribuidos | `rimdb-core` | **Media** | ✅ **Completado** |
 | Autoridad de orden por `sequence_id` del servidor | Distribuidos / Diseño | `ARCHITECTURE.md` | **Alta** | ✅ **Completado** |
-| Tipos esenciales `Value::Uuid` y `Value::Decimal` | Base de Datos | `rimdb-core` | **Alta** | ⏳ **Pendiente (Fase 2)** |
-| Abstracción `trait CryptoEngine` para E2EE | Arquitectura | `rimdb-core` | **Media** | ⏳ **Pendiente (Fase 2)** |
+| Tipado estricto con Newtypes (`RoomId`, `ClientId`, `SeqNum`) | Arquitectura / Rust | `rimdb-core` | **Alta** | ⏳ **Fase Inmediata** |
+| Tipo de identificador universal `Value::Uuid` | Base de Datos | `rimdb-core` | **Media** | ⏳ **Fase Inmediata** |
 | Creación de `trait StorageEngine` e implementación tabular | Base de Datos / Arq. | `rimdb-storage` | **Alta** | ⏳ **Pendiente (Fase 2)** |
 | Write-Ahead Log (WAL) con suma de verificación CRC32 | Base de Datos / Arq. | `rimdb-storage` | **Alta** | ⏳ **Pendiente (Fase 2)** |
 | Snapshots comprimidos con `zstd` | Base de Datos | `rimdb-storage` | **Alta** | ⏳ **Pendiente (Fase 2)** |
-| Integridad de snapshots con BLAKE3 | Distribuidos / DB | `rimdb-storage` | **Media** | ⏳ **Pendiente (Fase 2)** |
-| Codificación Memcomparable para claves primarias | Base de Datos | `rimdb-storage` | **Baja** | ⏳ **Pendiente (Fase 2)** |
+| Abstracción `trait CryptoEngine` para E2EE | Arquitectura | `rimdb-core` / `client` | **Media** | ⏳ **Pendiente (Fase 2/4)** |
 | Modelo de actores Tokio por sala (*Room Actor*) | Sist. Distribuidos / Arq. | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
 | Caché LRU de deduplicación por `MutationId` | Sist. Distribuidos | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
 | Micro-WAL de secuencias para tolerancia a caídas | Sist. Distribuidos / DB | `rimdb-server` | **Media** | ⏳ **Pendiente (Fase 3)** |
-| Snapshot Pinning / Lease para evitar Offline Stall | Sistemas Distribuidos | `rimdb-server` | **Media** | ⏳ **Pendiente (Fase 3)** |
 | Cola Outbox persistente y pipeline de Rebase local | Sist. Distribuidos / DB | `rimdb-client` | **Alta** | ⏳ **Pendiente (Fase 4)** |
 | Abstracción de transporte dual Nativo (HTTP/2) y WASM (Fetch) | Arquitectura | `rimdb-client` | **Alta** | ⏳ **Pendiente (Fase 4)** |
 | Batería de pruebas E2E de partición y concurrencia | Sist. Distribuidos / Rust | Workspace / Tests | **Alta** | ⏳ **Pendiente (Fase 5)** |
-| Tipado estricto con Newtypes (`RoomId`, `ClientId`) | Arquitectura / Rust | `rimdb-core` | **Media** | ⏳ **Pendiente (Evolutivo)** |
-| Evaluación de política CRDT celular (`FieldMutation`) | Base de Datos | `rimdb-core` | **Media** | ⏳ **Pendiente (Evolutivo)** |
+| Tipo `DataType::Decimal` / `Value::Decimal` | Base de Datos | `rimdb-core` | Baja | 💤 **Diferido (Post-v0.1)** |
+| Snapshot Pinning / Lease para evitar Offline Stall | Sistemas Distribuidos | `rimdb-server` | Baja | 💤 **Diferido (Post-v0.1)** |
+| Integridad adicional de snapshots con BLAKE3 | Distribuidos / DB | `rimdb-storage` | Baja | 💤 **Diferido (Post-v0.1)** |
+| Codificación Memcomparable para claves en disco | Base de Datos | `rimdb-storage` | Baja | 💤 **Diferido (Post-v0.1)** |
+| Buffer Pool y Paginación Slotted-Pages (datasets > RAM) | Base de Datos | `rimdb-storage` | Baja | 💤 **Diferido (Post-v0.1)** |
+| Evaluación de política CRDT celular (`FieldMutation`) | Base de Datos | `rimdb-core` | Baja | 💤 **Diferido (Post-v0.1)** |
+
+---
+
+## 7. Alcance Diferido para Versiones Futuras (Backlog Post-v0.1)
+
+Para optimizar la velocidad de desarrollo y evitar sobre-ingeniería prematura en el MVP, los siguientes elementos identificados durante la evaluación quedan formalmente diferidos para versiones posteriores a la v0.1:
+
+1. **`DataType::Decimal` / `Value::Decimal`:**
+   - *Razón de diferimiento:* Su incorporación es 100% aditiva. Las necesidades numéricas actuales quedan cubiertas con `Int(i64)` y `Float(f64)`. Se sumará como nueva variante del enum cuando surjan casos de uso financieros o contables.
+2. **`Snapshot Pinning / Lease` (Prevención de Offline Stall extremo):**
+   - *Razón de diferimiento:* Mecanismo complejo de leasing entre pares para clientes offline prolongados sin pares activos. Para v0.1, el servidor responderá limpiamente con `ErrorCode::BehindCompaction`.
+3. **`Buffer Pool` y Paginación en Disco (*Slotted-Pages*):**
+   - *Razón de diferimiento:* Las salas de RimDB manejan de 2 a 50 participantes (5 a 100 MB de datos promedio), entrando holgadamente en la memoria RAM de dispositivos modernos. El índice en RAM con WAL append-only en disco es la solución idónea para esta escala.
+4. **Integridad Criptográfica con BLAKE3:**
+   - *Razón de diferimiento:* La biblioteca Zstandard (`zstd`) ya incluye sumas de verificación de integridad (checksums) nativas por bloque y frame en la descompresión, haciendo redundante una segunda capa criptográfica en esta etapa.
+5. **Codificación Memcomparable para Claves Primarias:**
+   - *Razón de diferimiento:* Solo necesaria para motores LSM o B-Trees que ordenen bytes crudos directamente en páginas de disco sin deserializar. En RimDB, las búsquedas e índices residen en memoria RAM y comparan en $O(1)$ sin alocaciones con `type_order`.
+6. **CRDT Celular (`FieldMutation` con timestamps por columna):**
+   - *Razón de diferimiento:* La arquitectura adopta formalmente la autoridad del `sequence_id` del servidor como único árbitro determinista para orden total y resolución Last-Write-Wins (LWW) a nivel de mutación.
+
