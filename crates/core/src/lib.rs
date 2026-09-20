@@ -1,14 +1,15 @@
+pub mod id;
 pub mod operation;
 pub mod protocol;
 pub mod schema;
 pub mod value;
 
+pub use id::{ClientId, CorrelationId, MutationId, RoomId, SequenceNumber};
 pub use operation::{
     squash_operations, Operation, SequencedOperation, SquashOutcome, UpdateBuilder,
 };
 pub use protocol::{
-    decode_message, encode_message, ClientMessage, CorrelationId, ErrorCode, MutationId,
-    ServerMessage, MAX_MESSAGE_SIZE,
+    decode_message, encode_message, ClientMessage, ErrorCode, ServerMessage, MAX_MESSAGE_SIZE,
 };
 pub use schema::{
     ColumnDef, Schema, SchemaBuilder, TableBuilder, TableSchema, ValidationError,
@@ -354,17 +355,48 @@ mod tests {
     }
 
     #[test]
+    fn test_newtypes_ergonomics_and_serde() {
+        let room = RoomId::new("room-123");
+        let client = ClientId::from("client-456");
+        let seq = SequenceNumber::from(42u64);
+        let mutation = MutationId::from([7u8; 16]);
+        let correlation = CorrelationId::from(999u64);
+
+        // Deref ergonomics
+        assert_eq!(&*room, "room-123");
+        assert_eq!(&*client, "client-456");
+        assert_eq!(*seq, 42);
+        assert_eq!(*correlation, 999);
+        assert_eq!(seq.next(), SequenceNumber::new(43));
+
+        // Display
+        assert_eq!(format!("{}", room), "room-123");
+        assert_eq!(format!("{}", client), "client-456");
+        assert_eq!(format!("{}", seq), "42");
+        assert_eq!(format!("{}", mutation), "07070707070707070707070707070707");
+
+        // Transparent Serde roundtrip: binary size should match primitive
+        let encoded_room = bincode::serialize(&room).unwrap();
+        let encoded_raw_str = bincode::serialize("room-123").unwrap();
+        assert_eq!(encoded_room, encoded_raw_str);
+
+        let encoded_seq = bincode::serialize(&seq).unwrap();
+        let encoded_raw_u64 = bincode::serialize(&42u64).unwrap();
+        assert_eq!(encoded_seq, encoded_raw_u64);
+    }
+
+    #[test]
     fn test_protocol_binary_serialization_roundtrip() {
         let row = RowBuilder::new()
             .set("id", 42i64)
             .set("note", "Testing binary")
             .build();
 
-        let mutation_id = [1u8; 16];
+        let mutation_id = MutationId::new([1u8; 16]);
         let client_msg = ClientMessage::Commit {
-            correlation_id: 1001,
-            room_id: "room-abc".to_string(),
-            client_id: "client-1".to_string(),
+            correlation_id: CorrelationId::new(1001),
+            room_id: RoomId::new("room-abc"),
+            client_id: ClientId::new("client-1"),
             mutation_id,
             op: Operation::insert_with_timestamp("notes", PrimaryKey::single(42i64), row, 500),
         };
@@ -374,11 +406,11 @@ mod tests {
         assert_eq!(client_msg, decoded);
 
         let server_msg = ServerMessage::SyncBatch {
-            correlation_id: 1001,
-            room_id: "room-abc".to_string(),
-            head_seq: 150,
+            correlation_id: CorrelationId::new(1001),
+            room_id: RoomId::new("room-abc"),
+            head_seq: SequenceNumber::new(150),
             ops: vec![SequencedOperation {
-                seq: 150,
+                seq: SequenceNumber::new(150),
                 op: Operation::delete("notes", PrimaryKey::single(42i64), 1000),
             }],
             has_more: false,

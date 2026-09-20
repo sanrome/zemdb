@@ -1,3 +1,4 @@
+use crate::id::SequenceNumber;
 use crate::value::{PrimaryKey, Row, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -137,8 +138,17 @@ impl UpdateBuilder {
 /// An operation ordered by the coordination server with an assigned sequence ID.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SequencedOperation {
-    pub seq: u64,
+    pub seq: SequenceNumber,
     pub op: Operation,
+}
+
+impl SequencedOperation {
+    pub fn new(seq: impl Into<SequenceNumber>, op: Operation) -> Self {
+        Self {
+            seq: seq.into(),
+            op,
+        }
+    }
 }
 
 /// Result of attempting to squash two sequential operations for the same (table, PK).

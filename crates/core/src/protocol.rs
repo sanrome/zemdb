@@ -1,12 +1,7 @@
+pub use crate::id::{ClientId, CorrelationId, MutationId, RoomId, SequenceNumber};
 use crate::operation::{Operation, SequencedOperation};
 use bincode::Options;
 use serde::{Deserialize, Serialize};
-
-/// Unique mutation ID (UUID v4 or 16-byte random) for commit idempotency.
-pub type MutationId = [u8; 16];
-
-/// Correlation ID for pairing asynchronous requests and responses.
-pub type CorrelationId = u64;
 
 /// Default maximum payload limit (16 MB) to protect against allocation exhaustion (DoS).
 pub const MAX_MESSAGE_SIZE: u64 = 16 * 1024 * 1024;
@@ -31,31 +26,31 @@ pub enum ClientMessage {
     /// Commit a new validated mutation into a room with idempotency key.
     Commit {
         correlation_id: CorrelationId,
-        room_id: String,
-        client_id: String,
+        room_id: RoomId,
+        client_id: ClientId,
         mutation_id: MutationId,
         op: Operation,
     },
     /// Request delta operations starting after `last_ack_seq` with flow control limit.
     Sync {
         correlation_id: CorrelationId,
-        room_id: String,
-        client_id: String,
-        last_ack_seq: u64,
+        room_id: RoomId,
+        client_id: ClientId,
+        last_ack_seq: SequenceNumber,
         max_batch_size: u32,
     },
     /// Periodically inform server that client is active and report current cursor.
     Heartbeat {
         correlation_id: CorrelationId,
-        room_id: String,
-        client_id: String,
-        last_ack_seq: u64,
+        room_id: RoomId,
+        client_id: ClientId,
+        last_ack_seq: SequenceNumber,
     },
     /// Join a room as an active client.
     RegisterClient {
         correlation_id: CorrelationId,
-        room_id: String,
-        client_id: String,
+        room_id: RoomId,
+        client_id: ClientId,
     },
 }
 
@@ -65,34 +60,34 @@ pub enum ServerMessage {
     /// Confirmation of an accepted commit with its assigned sequence number.
     CommitAck {
         correlation_id: CorrelationId,
-        room_id: String,
+        room_id: RoomId,
         mutation_id: MutationId,
-        assigned_seq: u64,
+        assigned_seq: SequenceNumber,
     },
     /// Batch of sequenced operations to be applied on the client with pagination flag.
     SyncBatch {
         correlation_id: CorrelationId,
-        room_id: String,
-        head_seq: u64,
+        room_id: RoomId,
+        head_seq: SequenceNumber,
         ops: Vec<SequencedOperation>,
         has_more: bool,
     },
     /// Acknowledgment of a heartbeat.
     HeartbeatAck {
         correlation_id: CorrelationId,
-        room_id: String,
-        current_head_seq: u64,
+        room_id: RoomId,
+        current_head_seq: SequenceNumber,
     },
     /// Confirmation of client registration.
     Registered {
         correlation_id: CorrelationId,
-        room_id: String,
-        head_seq: u64,
+        room_id: RoomId,
+        head_seq: SequenceNumber,
     },
     /// Error notification.
     Error {
         correlation_id: Option<CorrelationId>,
-        room_id: Option<String>,
+        room_id: Option<RoomId>,
         code: ErrorCode,
         message: String,
     },

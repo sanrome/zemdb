@@ -34,6 +34,7 @@
 * Validación estricta y defensiva de aridad en `from_compact_row` retornando `ValidationError::CompactRowArityMismatch`.
 * Incorporación de prueba unitaria negativa contra ataques DoS por mensajes que declaran exceder el límite de 16 MB.
 * Formalización en arquitectura de la autoridad suprema del secuenciador central (`sequence_id`) para ordenamiento determinista Total Order.
+* Implementación de Newtypes de dominio fuertemente tipados (`RoomId`, `ClientId`, `SequenceNumber`, `MutationId`, `CorrelationId`) con `#[serde(transparent)]` y ergonomía `Deref` en `rimdb-core`.
 
 ---
 
@@ -241,12 +242,12 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 
 ---
 
-### 4.6. Mejoras Evolutivas de Dominio (Fase Posterior)
+### 4.6. Mejoras Evolutivas de Dominio
 
-* **Evolución hacia Newtypes para identificadores de dominio:**
-  Reemplazar los alias `type RoomId = String` y `type ClientId = String` por structs tipo tupla opacos (`pub struct RoomId(pub String);`, `pub struct ClientId(pub String);`) para prevenir errores de inversión de argumentos en tiempo de compilación.
+* **Tipado fuerte de dominio con Newtypes (`RoomId`, `ClientId`, `SequenceNumber`, `MutationId`, `CorrelationId`):**
+  Implementado en `crates/core/src/id.rs`. Se reemplazaron las cadenas crudas y enteros primitivos por structs transparentes (`#[serde(transparent)]`) con ergonomía `Deref` e implementaciones `From`, previniendo errores de transposición de argumentos en tiempo de compilación.
 * **Evaluación de política LWW a nivel de Celda (CRDT Celular):**
-  Si el caso de uso requiere que múltiples clientes modifiquen campos disjuntos de la misma tupla de forma concurrente preservando procedencias temporales independientes por campo, evaluar migrar `Operation::Update` a `fields: BTreeMap<String, FieldMutation>`.
+  Diferido para el backlog post-v0.1 según la decisión de ADR en ARCHITECTURE.md.
 
 ---
 
@@ -270,9 +271,10 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 │ [x] Configurar [workspace.lints.rust] con unsafe_code = "forbid".           │
 │ [x] Añadir validación de aridad en from_compact_row y test negativo de DoS. │
 │ [x] Formalizar en ARCHITECTURE.md la autoridad suprema del secuenciador.    │
+│ [x] Tipado fuerte con Newtypes (RoomId, ClientId, SeqNum, MutationId, etc.).│
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ FASE 2: Motor de Almacenamiento Local (rimdb-storage) & Tipos Esenciales    │
-│ [ ] Añadir tipos Value::Uuid y Value::Decimal en rimdb-core.                │
+│ [ ] Añadir tipo Value::Uuid en rimdb-core.                                  │
 │ [ ] Definir el contrato trait CryptoEngine para E2EE en rimdb-core.         │
 │ [ ] Crear el crate crates/storage (rimdb-storage) con dependencias base.    │
 │ [ ] Definir el contrato formal trait StorageEngine.                         │
@@ -280,8 +282,8 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 │ [ ] Implementar Write-Ahead Log (WAL) append-only con checksums CRC32.      │
 │ [ ] Implementar índice primario en RAM y reconstrucción vía replay.         │
 │ [ ] Implementar compresión/descompresión de snapshots con Zstandard (zstd). │
-│ [ ] Implementar verificación de integridad con BLAKE3 y mock en memoria.    │
-│ [ ] Implementar worker de compactación en segundo plano y codif. memcomp.   │
+│ [ ] Implementar storage engine mock en memoria para pruebas unitarias.      │
+│ [ ] Implementar worker de compactación de snapshots y truncado de WAL.      │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ FASE 3: Servidor Coordinador y Secuenciador (rimdb-server)                  │
 │ [ ] Implementar actor de Tokio por Room (concurrencia sin cerrojos globales)│
@@ -289,7 +291,7 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 │ [ ] Implementar caché LRU de deduplicación de MutationId (Exactly-Once).    │
 │ [ ] Implementar buffer de compactación en RAM con índice de claves primarias│
 │ [ ] Implementar Micro-WAL para persistencia de sequence_id ante caídas.     │
-│ [ ] Implementar Snapshot Pinning / Lease para evitar Offline Stall.         │
+│ [ ] Implementar manejo de clientes offline (ErrorCode::BehindCompaction).   │
 │ [ ] Implementar router y handlers HTTP/2 en Axum (/commit, /sync, etc.).    │
 │ [ ] Implementar tarea de retención de log basada en ACK y canal SSE.        │
 ├─────────────────────────────────────────────────────────────────────────────┤
@@ -321,7 +323,7 @@ La siguiente tabla mapea el origen de cada requerimiento según la recomendació
 | Validación de aridad defensiva en `from_compact_row` | Base de Datos | `rimdb-core` | **Media** | ✅ **Completado** |
 | Test unitario negativo para límite de tamaño DoS | Sistemas Distribuidos | `rimdb-core` | **Media** | ✅ **Completado** |
 | Autoridad de orden por `sequence_id` del servidor | Distribuidos / Diseño | `ARCHITECTURE.md` | **Alta** | ✅ **Completado** |
-| Tipado estricto con Newtypes (`RoomId`, `ClientId`, `SeqNum`) | Arquitectura / Rust | `rimdb-core` | **Alta** | ⏳ **Fase Inmediata** |
+| Tipado estricto con Newtypes (`RoomId`, `ClientId`, `SequenceNumber`, `MutationId`, `CorrelationId`) | Arquitectura / Rust | `rimdb-core` | **Alta** | ✅ **Completado** |
 | Tipo de identificador universal `Value::Uuid` | Base de Datos | `rimdb-core` | **Media** | ⏳ **Fase Inmediata** |
 | Creación de `trait StorageEngine` e implementación tabular | Base de Datos / Arq. | `rimdb-storage` | **Alta** | ⏳ **Pendiente (Fase 2)** |
 | Write-Ahead Log (WAL) con suma de verificación CRC32 | Base de Datos / Arq. | `rimdb-storage` | **Alta** | ⏳ **Pendiente (Fase 2)** |
