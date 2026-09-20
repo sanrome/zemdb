@@ -25,9 +25,15 @@
 * Incorporación de identificador de correlación `CorrelationId: u64` para soporte de multiplexación asíncrona de solicitudes y respuestas.
 * Mecanismos de control de flujo y paginación en streaming (`max_batch_size: u32` en `Sync` y bandera `has_more: bool` en `SyncBatch`).
 * Blindaje defensivo del códec binario con límite de 16 MB contra ataques de agotamiento de memoria (DoS) mediante `bincode::DefaultOptions`.
-* Ampliación de la suite de pruebas unitarias a 15 casos de prueba exhaustivos cubriendo todas las nuevas invariantes relacionales y de protocolo.
+* Ampliación de la suite de pruebas unitarias a 17 casos de prueba exhaustivos cubriendo todas las nuevas invariantes relacionales y de protocolo.
 * Limpieza total de advertencias y pase sin fallos en `cargo clippy --workspace --all-targets -- -D warnings`.
 * Auditoría técnica formal multidimensional con dictamen de **APROBADO** emitido independientemente por los 4 subagentes especialistas.
+* Limpieza de directorios `.git` anidados e inicialización del repositorio Git raíz con `.gitignore` unificado.
+* Centralización de `rimdb-core` en `[workspace.dependencies]` y herencia de dependencias en `rimdb-server` y `rimdb-client`.
+* Activación de políticas de seguridad y lints de workspace con `unsafe_code = "forbid"` en todos los crates.
+* Validación estricta y defensiva de aridad en `from_compact_row` retornando `ValidationError::CompactRowArityMismatch`.
+* Incorporación de prueba unitaria negativa contra ataques DoS por mensajes que declaran exceder el límite de 16 MB.
+* Documentación y recomendación formal del constructor `Operation::insert_with_timestamp` con marcas de tiempo monótonas o HLC.
 
 ---
 
@@ -263,12 +269,12 @@ A partir de los informes técnicos de evaluación y verificación emitidos por l
 │ [x] Contrato de protocolo con MutationId, CorrelationId y paginación.       │
 │ [x] Blindaje DoS a 16MB y 15 pruebas unitarias exhaustivas en rimdb-core.   │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ FASE 1.5: Higiene de Workspace y Preparación Inmediata                      │
-│ [ ] Eliminar directorios .git anidados en crates/core, server y client.     │
-│ [ ] Inicializar repositorio Git unificado en la raíz con .gitignore.        │
-│ [ ] Centralizar rimdb-core en [workspace.dependencies] del Cargo.toml raíz. │
-│ [ ] Configurar [workspace.lints.rust] con unsafe_code = "forbid".           │
-│ [ ] Añadir validación de aridad en from_compact_row y test negativo de DoS. │
+│ FASE 1.5: Higiene de Workspace y Preparación Inmediata [COMPLETADA]         │
+│ [x] Eliminar directorios .git anidados en crates/core, server y client.     │
+│ [x] Inicializar repositorio Git unificado en la raíz con .gitignore.        │
+│ [x] Centralizar rimdb-core en [workspace.dependencies] del Cargo.toml raíz. │
+│ [x] Configurar [workspace.lints.rust] con unsafe_code = "forbid".           │
+│ [x] Añadir validación de aridad en from_compact_row y test negativo de DoS. │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ FASE 2: Motor de Almacenamiento Local (rimdb-storage)                       │
 │ [ ] Crear el crate crates/storage (rimdb-storage) con dependencias base.    │
