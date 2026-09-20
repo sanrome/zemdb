@@ -118,44 +118,9 @@ flowchart TD
 
 ## 4. Catálogo Detallado de Cambios Pendientes
 
-A partir de los informes técnicos de evaluación y verificación emitidos por los subagentes, se detallan a continuación las tareas e implementaciones que restan por ejecutar agrupadas por componente y fase:
+A partir de los informes técnicos emitidos por los 4 subagentes especialistas, y habiendo completado íntegramente la **Fase 1** (Core Refactoring) y la **Fase 1.5** (Higiene de Workspace, validación defensiva en `from_compact_row` y test negativo de DoS), se detallan a continuación las tareas e implementaciones que restan por ejecutar en las fases subsiguientes:
 
-### 4.1. Higiene del Workspace y Configuración Base (Inmediato)
-
-* **Limpieza de submódulos Git anidados:**
-  Eliminar los directorios residuales `.git/` presentes dentro de `crates/core`, `crates/server` y `crates/client` para unificar el control de versiones en el repositorio raíz.
-* **Inicialización del repositorio Git raíz:**
-  Inicializar un repositorio Git unificado en la raíz del workspace con un `.gitignore` estándar para Rust (ignorando `/target`, `*.rimdb`, `*.wal`, `.DS_Store`, etc.).
-* **Centralización de dependencias internas en Cargo:**
-  Declarar `rimdb-core = { path = "crates/core" }` en `[workspace.dependencies]` del archivo raíz [`Cargo.toml`](file:///Users/Santiago/OtherProjects/client-distributed-db/Cargo.toml) para que `rimdb-server`, `rimdb-client` y el futuro `rimdb-storage` consuman la versión canónica vía `{ workspace = true }`.
-* **Configuración de lints corporativos de workspace:**
-  Agregar la sección `[workspace.lints.rust]` en el `Cargo.toml` raíz con `unsafe_code = "forbid"` para garantizar la seguridad de memoria de todo el código de almacenamiento y red.
-
-### 4.2. Refinamientos Pendientes en `rimdb-core`
-
-* **Validación defensiva de aridad en `from_compact_row`:**
-  Añadir validación explícita para rechazar conversiones si la longitud de valores en `CompactRow` no coincide exactamente con el número de columnas definidas en `TableSchema`:
-  ```rust
-  if compact.values.len() != self.columns.len() {
-      return Err(ValidationError::CompactRowArityMismatch {
-          table: self.name.clone(),
-          expected: self.columns.len(),
-          actual: compact.values.len(),
-      });
-  }
-  ```
-* **Constructores de operaciones con sellado temporal obligatorio:**
-  Desaconsejar o deprecicar el uso de `Operation::insert` con timestamp en cero. Integrar un constructor primario que exija marca temporal monótona o Reloj Lógico Híbrido (HLC).
-* **Evolución hacia Newtypes para identificadores de dominio:**
-  Reemplazar los alias `type RoomId = String` y `type ClientId = String` por structs tipo tupla opacos (`pub struct RoomId(pub String);`, `pub struct ClientId(pub String);`) para prevenir errores de inversión de argumentos en tiempo de compilación.
-* **Prueba unitaria negativa de DoS en `lib.rs`:**
-  Incorporar un test unitario que verifique que intentar decodificar un payload binario que declare un tamaño mayor a `MAX_MESSAGE_SIZE` retorne inmediatamente un error de límite de memoria sin intentar alocar buffers en heap.
-* **Evaluación de política LWW a nivel de Celda (CRDT Celular):**
-  Si el caso de uso requiere que múltiples clientes modifiquen campos disjuntos de la misma tupla de forma concurrente preservando procedencias temporales independientes por campo, migrar `Operation::Update` a `fields: BTreeMap<String, FieldMutation>` donde `FieldMutation { value: Value, timestamp: u64 }`.
-
----
-
-### 4.3. Motor de Almacenamiento Local: `rimdb-storage` (Fase 2)
+### 4.1. Motor de Almacenamiento Local: `rimdb-storage` (Fase 2)
 
 * **Creación del crate `crates/storage` (`rimdb-storage`):**
   Configurar el manifiesto `Cargo.toml` con dependencias: `rimdb-core`, `tokio`, `async-trait`, `zstd`, `crc32fast`, `thiserror`, `bytes`.
@@ -189,7 +154,7 @@ A partir de los informes técnicos de evaluación y verificación emitidos por l
 
 ---
 
-### 4.4. Servidor de Coordinación: `rimdb-server` (Fase 3)
+### 4.2. Servidor de Coordinación: `rimdb-server` (Fase 3)
 
 * **Modelo de Concurrencia: Actor Tokio por Sala (`RoomActor`):**
   - Cada sala activa es gestionada por un actor independiente ejecutándose en su propia tarea de Tokio, recibiendo comandos a través de un canal `mpsc::Sender<RoomCommand>`.
@@ -213,7 +178,7 @@ A partir de los informes técnicos de evaluación y verificación emitidos por l
 
 ---
 
-### 4.5. Biblioteca Cliente y Reconciliación: `rimdb-client` (Fase 4)
+### 4.3. Biblioteca Cliente y Reconciliación: `rimdb-client` (Fase 4)
 
 * **Fachada ergonómica de usuario (`RimdbClient`, `Database`, `TableHandle`):**
   API tipada para aplicaciones Rust:
@@ -243,7 +208,7 @@ A partir de los informes técnicos de evaluación y verificación emitidos por l
 
 ---
 
-### 4.6. Pruebas de Integración de Extremo a Extremo y Verificación E2E (Fase 5)
+### 4.4. Pruebas de Integración de Extremo a Extremo y Verificación E2E (Fase 5)
 
 * **Suite de integración Cliente-Servidor:**
   Simulación de red en local con múltiples instancias de `RimdbClient` interactuando contra un `rimdb-server` en Tokio.
@@ -253,6 +218,15 @@ A partir de los informes técnicos de evaluación y verificación emitidos por l
   Comprobación de la barrera de 16 MB con paquetes maliciosos, límites de paginación con deltas masivos y validación de retención del buffer de compactación bajo saturación.
 * **Validación de compilación cruzada hacia WebAssembly:**
   Ejecución de `cargo build --target wasm32-unknown-unknown -p rimdb-core` y `cargo check --target wasm32-unknown-unknown -p rimdb-client --no-default-features --features wasm` en el pipeline de integración continua.
+
+---
+
+### 4.5. Mejoras Evolutivas de Dominio (Fase Posterior)
+
+* **Evolución hacia Newtypes para identificadores de dominio:**
+  Reemplazar los alias `type RoomId = String` y `type ClientId = String` por structs tipo tupla opacos (`pub struct RoomId(pub String);`, `pub struct ClientId(pub String);`) para prevenir errores de inversión de argumentos en tiempo de compilación.
+* **Evaluación de política LWW a nivel de Celda (CRDT Celular):**
+  Si el caso de uso requiere que múltiples clientes modifiquen campos disjuntos de la misma tupla de forma concurrente preservando procedencias temporales independientes por campo, migrar `Operation::Update` a `fields: BTreeMap<String, FieldMutation>` donde `FieldMutation { value: Value, timestamp: u64 }`.
 
 ---
 
@@ -314,20 +288,22 @@ A partir de los informes técnicos de evaluación y verificación emitidos por l
 
 La siguiente tabla mapea el origen de cada requerimiento pendiente según la recomendación del especialista correspondiente y el componente de destino:
 
-| Requerimiento Técnico Pendiente | Especialista Proponente | Crate Destino | Prioridad |
-| :--- | :--- | :--- | :---: |
-| Limpieza de `.git` anidados e inicialización raíz | Arquitectura / Rust | Workspace raíz | **Alta** |
-| Centralización de `rimdb-core` en dependencias de workspace | Arquitectura | Workspace raíz | **Alta** |
-| Activación de lint `unsafe_code = "forbid"` | Arquitectura | Workspace raíz | **Media** |
-| Validación de aridad defensiva en `from_compact_row` | Base de Datos | `rimdb-core` | **Media** |
-| Test unitario negativo para límite de tamaño DoS | Sistemas Distribuidos | `rimdb-core` | **Media** |
-| Tipado estricto con Newtypes (`RoomId`, `ClientId`) | Arquitectura / Rust | `rimdb-core` | **Media** |
-| Creación de `trait StorageEngine` e implementación tabular | Base de Datos / Arq. | `rimdb-storage` | **Alta** |
-| Write-Ahead Log (WAL) con suma de verificación CRC32 | Base de Datos / Arq. | `rimdb-storage` | **Alta** |
-| Snapshots comprimidos con `zstd` | Base de Datos | `rimdb-storage` | **Alta** |
-| Modelo de actores Tokio por sala (*Room Actor*) | Sist. Distribuidos / Arq. | `rimdb-server` | **Alta** |
-| Caché LRU de deduplicación por `MutationId` | Sist. Distribuidos | `rimdb-server` | **Alta** |
-| Micro-WAL de secuencias para tolerancia a caídas | Sist. Distribuidos / DB | `rimdb-server` | **Media** |
-| Cola Outbox persistente y pipeline de Rebase local | Sist. Distribuidos / DB | `rimdb-client` | **Alta** |
-| Abstracción de transporte dual Nativo (HTTP/2) y WASM (Fetch) | Arquitectura | `rimdb-client` | **Alta** |
-| Batería de pruebas E2E de partición y concurrencia | Sist. Distribuidos / Rust | Workspace / Tests | **Alta** |
+| Requerimiento Técnico | Especialista Proponente | Crate Destino | Prioridad | Estado |
+| :--- | :--- | :--- | :---: | :---: |
+| Limpieza de `.git` anidados e inicialización raíz | Arquitectura / Rust | Workspace raíz | **Alta** | ✅ **Completado** |
+| Centralización de `rimdb-core` en dependencias de workspace | Arquitectura | Workspace raíz | **Alta** | ✅ **Completado** |
+| Activación de lint `unsafe_code = "forbid"` | Arquitectura | Workspace raíz | **Media** | ✅ **Completado** |
+| Validación de aridad defensiva en `from_compact_row` | Base de Datos | `rimdb-core` | **Media** | ✅ **Completado** |
+| Test unitario negativo para límite de tamaño DoS | Sistemas Distribuidos | `rimdb-core` | **Media** | ✅ **Completado** |
+| Recomendación formal de `insert_with_timestamp` (HLC) | DB / Distribuidos | `rimdb-core` | **Media** | ✅ **Completado** |
+| Creación de `trait StorageEngine` e implementación tabular | Base de Datos / Arq. | `rimdb-storage` | **Alta** | ⏳ **Pendiente (Fase 2)** |
+| Write-Ahead Log (WAL) con suma de verificación CRC32 | Base de Datos / Arq. | `rimdb-storage` | **Alta** | ⏳ **Pendiente (Fase 2)** |
+| Snapshots comprimidos con `zstd` | Base de Datos | `rimdb-storage` | **Alta** | ⏳ **Pendiente (Fase 2)** |
+| Modelo de actores Tokio por sala (*Room Actor*) | Sist. Distribuidos / Arq. | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
+| Caché LRU de deduplicación por `MutationId` | Sist. Distribuidos | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
+| Micro-WAL de secuencias para tolerancia a caídas | Sist. Distribuidos / DB | `rimdb-server` | **Media** | ⏳ **Pendiente (Fase 3)** |
+| Cola Outbox persistente y pipeline de Rebase local | Sist. Distribuidos / DB | `rimdb-client` | **Alta** | ⏳ **Pendiente (Fase 4)** |
+| Abstracción de transporte dual Nativo (HTTP/2) y WASM (Fetch) | Arquitectura | `rimdb-client` | **Alta** | ⏳ **Pendiente (Fase 4)** |
+| Batería de pruebas E2E de partición y concurrencia | Sist. Distribuidos / Rust | Workspace / Tests | **Alta** | ⏳ **Pendiente (Fase 5)** |
+| Tipado estricto con Newtypes (`RoomId`, `ClientId`) | Arquitectura / Rust | `rimdb-core` | **Media** | ⏳ **Pendiente (Evolutivo)** |
+| Evaluación de política CRDT celular (`FieldMutation`) | Base de Datos | `rimdb-core` | **Media** | ⏳ **Pendiente (Evolutivo)** |
