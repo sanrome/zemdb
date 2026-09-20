@@ -39,7 +39,7 @@ All mutations are represented by three elemental operations:
 2. **`UPDATE`:**
    * Granular, field-level modification.
    * Only transmits modified fields, avoiding the overhead of transferring the entire tuple.
-   * **Concurrent Conflict Resolution:** If two clients update distinct fields of the same tuple concurrently, the server performs a **field-level merge**. If both clients modify the exact same field, a *Last-Write-Wins (LWW)* policy applies based on the server arrival order and logical timestamp.
+   * **Concurrent Conflict Resolution:** If two clients update distinct fields of the same tuple concurrently, the server performs a **field-level merge**. If both clients modify the exact same field, a *Last-Write-Wins (LWW)* policy applies based strictly on the server arrival order and assigned `sequence_id` (see Section 10).
 3. **`DELETE`:**
    * Logical deletion via a tombstone marker.
    * **Buffer Purge Rule:** Receiving a `DELETE` for a primary key immediately purges and discards any prior unacknowledged `INSERT` or `UPDATE` operations for that same PK in the server buffer.
@@ -117,9 +117,23 @@ To prevent the overhead and connection resource exhaustion of thousands of idle 
 ```text
 rimdb/
 ├── ARCHITECTURE.md              # Project specification and design document
+├── ROADMAP.md                   # Implementation roadmap and status
 ├── Cargo.toml                   # Root workspace manifest
 ├── crates/
 │   ├── core/                   # Shared data types, Schemas, Operations, Serialization
+│   ├── storage/                # Local tabular storage, WAL, Zstandard snapshots
 │   ├── server/                 # Sequencer, Compaction buffer, HTTP API
 │   └── client/                 # Local storage engine, Sync engine & replication logic
 ```
+
+---
+
+## 10. Architectural Decisions: Time, Ordering & Authority
+
+### 10.1. Central Server Sequencer as the Sole Authority of Total Order
+A foundational architectural decision of RimDB is that **the coordination server is the single source of truth for global ordering**:
+* **Sequence-Based Total Order:** When an operation is accepted by the Room actor on the server, it is assigned an atomically increasing `sequence_id: u64`. The global order of events in the Room is defined 100% by this monotonic sequence number.
+* **No Trust in Client Wall Clocks:** Client devices frequently suffer from clock skew (misconfigured system times, zone errors, drift). To eliminate the risk of a misconfigured device clock dominating or corrupting the room's history, **client timestamps are never used to determine global causal precedence**.
+* **Role of Client Timestamps:** The `timestamp: u64` field attached to mutations is strictly local metadata. Its sole purpose is to allow a client, while working **offline**, to deterministically order its own pending mutations in its local Outbox before synchronization.
+* **Deterministic Last-Write-Wins (LWW):** In the event of concurrent modifications to the exact same field, the operation with the higher `sequence_id` (the one processed later by the server sequencer) takes precedence. This eliminates the necessity of complex Hybrid Logical Clocks (HLC) while guaranteeing absolute convergence across all nodes.
+

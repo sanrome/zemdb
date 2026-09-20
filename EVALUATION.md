@@ -288,4 +288,4 @@ El análisis concurrente de los cuatro especialistas demuestra que el proyecto c
 
 El modelo de squashing actual genera registros zombi, la estructura de tuplas consume memoria de forma excesiva, las comparaciones de tipos degradan la CPU, y el protocolo de red carece de los mecanismos básicos de idempotencia y tolerancia a fallos exigidos por un sistema distribuido.
 
-En el documento complementario **`PROPOSAL.md`** se presenta la solución de ingeniería unificada y compatible, estableciendo la nueva arquitectura de módulos, contratos de red corregidos y el diseño detallado del motor de almacenamiento y coordinación.
+En el documento complementario [**`ROADMAP.md`**](file:///Users/Santiago/OtherProjects/client-distributed-db/ROADMAP.md) se presenta la solución de ingeniería unificada y compatible, estableciendo la nueva arquitectura de módulos, contratos de red corregidos y el diseño detallado del motor de almacenamiento y coordinación.

@@ -1,9 +1,9 @@
-# PROPOSAL.md: Hoja de Ruta y Propuesta de Arquitectura Técnica
+# ROADMAP.md: Hoja de Ruta de Implementación de RimDB
 
 **Proyecto:** `RimDB` (Motor de Base de Datos Distribuida Local-First)  
 **Fecha de Actualización:** 20 de Septiembre de 2026  
 **Documentos Relacionados:** [ARCHITECTURE.md](file:///Users/Santiago/OtherProjects/client-distributed-db/ARCHITECTURE.md) | [EVALUATION.md](file:///Users/Santiago/OtherProjects/client-distributed-db/EVALUATION.md)  
-**Estado:** Propuesta Técnica de Consenso — Fase 1 Completada / Fases 2 a 4 Planificadas
+**Estado:** Hoja de Ruta Oficial de Desarrollo — Fase 1 & 1.5 Completadas / Fases 2 a 5 Planificadas
 
 ---
 
@@ -19,8 +19,8 @@
 * Validación estricta de columnas obligatorias no nulas (`nullable: false`) y rechazo de `Value::Null` explícito en `validate_row`.
 * Validación exhaustiva de tipos de datos y aridad de componentes de clave primaria en `validate_update` y `validate_delete`.
 * Implementación de la Regla Anti-Zombi en `squash_operations` (rechazo formal de operaciones `Update` sobre entidades con `Delete` previo).
-* Incorporación de marca de tiempo (`timestamp: u64`) en `Operation::Insert` para simetría y resolución determinista Last-Write-Wins (LWW).
-* Fusión de atributos campo por campo en colisiones `Update + Update` gobernada por resolución LWW.
+* Incorporación de marca de tiempo (`timestamp: u64`) en `Operation::Insert` para consistencia interna en cola Outbox offline.
+* Fusión de atributos campo por campo en colisiones `Update + Update`.
 * Contrato de red con identificador unívoco de mutación `MutationId: [u8; 16]` para idempotencia estricta (*Exactly-Once*) en `Commit` y `CommitAck`.
 * Incorporación de identificador de correlación `CorrelationId: u64` para soporte de multiplexación asíncrona de solicitudes y respuestas.
 * Mecanismos de control de flujo y paginación en streaming (`max_batch_size: u32` en `Sync` y bandera `has_more: bool` en `SyncBatch`).
@@ -33,17 +33,18 @@
 * Activación de políticas de seguridad y lints de workspace con `unsafe_code = "forbid"` en todos los crates.
 * Validación estricta y defensiva de aridad en `from_compact_row` retornando `ValidationError::CompactRowArityMismatch`.
 * Incorporación de prueba unitaria negativa contra ataques DoS por mensajes que declaran exceder el límite de 16 MB.
-* Documentación y recomendación formal del constructor `Operation::insert_with_timestamp` con marcas de tiempo monótonas o HLC.
+* Formalización en arquitectura de la autoridad suprema del secuenciador central (`sequence_id`) para ordenamiento determinista Total Order.
 
 ---
 
 ## 2. Resumen Ejecutivo del Estado del Proyecto
 
-RimDB ha superado con éxito la **Fase 1 (Reestructuración y Blindaje de Core)**. El crate [`rimdb-core`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core) ha sido saneado de todos los anti-patrones críticos identificados en la evaluación inicial:
+RimDB ha superado con éxito la **Fase 1 y 1.5 (Reestructuración, Blindaje de Core e Higiene de Workspace)**. El crate [`rimdb-core`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core) ha sido saneado de todos los anti-patrones críticos identificados en la evaluación inicial:
 - Se eliminó el overhead de CPU y memoria en ordenamiento de valores.
 - Se cerró la anomalía de consistencia de tuplas zombi en el algoritmo de squashing.
 - Se consolidó el contrato de red con garantías formales de idempotencia y multiplexación.
 - Se mantiene el desacoplamiento estricto de I/O, garantizando que el núcleo compile hacia WebAssembly (`wasm32-unknown-unknown`).
+- Se formalizó en [`ARCHITECTURE.md`](file:///Users/Santiago/OtherProjects/client-distributed-db/ARCHITECTURE.md#10-architectural-decisions-time-ordering--authority) la decisión de diseño de que el **servidor es la única autoridad de ordenamiento global** mediante su `sequence_id` monótono, eliminando la complejidad innecesaria de sincronización de relojes (HLC).
 
 El proyecto se encuentra ahora en posición para avanzar hacia la implementación de las capas de persistencia local en disco, concurrencia por actores en el servidor y sincronización optimista reactiva en el cliente.
 
@@ -89,15 +90,15 @@ flowchart TD
     subgraph Core["rimdb-core (Agnóstico a I/O, WASM-Ready)"]
         Types["Value / CompactRow / PrimaryKey"]
         SchemaMod["Schema / TableSchema / Validations"]
-        OpMod["Operation (Insert, Update, Delete) + Timestamps"]
-        SquashMod["squash_operations (Anti-Zombie + LWW)"]
+        OpMod["Operation (Insert, Update, Delete)"]
+        SquashMod["squash_operations (Anti-Zombie + LWW por Sequence)"]
         ProtoMod["ClientMessage / ServerMessage (MutationId, CorrelationId)"]
     end
 
     subgraph Server["Servidor Coordinador (rimdb-server)"]
         AxumRouter["Axum HTTP/2 Router<br/>(/commit, /sync, /heartbeat, /register)"]
         DedupCache["Dedup Cache LRU<br/>(MutationId -> assigned_seq)"]
-        RoomActor["Room Actor (Concurrencia Aislada por Sala)<br/>- Monotonic Sequencer<br/>- Compaction Buffer (BTreeMap + PK Index)<br/>- Client ACK Tracker & TTL Truncation"]
+        RoomActor["Room Actor (Concurrencia Aislada por Sala)<br/>- Monotonic Sequencer (Autoridad Total Order)<br/>- Compaction Buffer (BTreeMap + PK Index)<br/>- Snapshot Pinning / Lease & ACK Truncation"]
         MicroWAL["Micro-WAL Metadatos<br/>(Persistencia de sequence_id ante caídas)"]
     end
 
@@ -118,12 +119,25 @@ flowchart TD
 
 ## 4. Catálogo Detallado de Cambios Pendientes
 
-A partir de los informes técnicos emitidos por los 4 subagentes especialistas, y habiendo completado íntegramente la **Fase 1** (Core Refactoring) y la **Fase 1.5** (Higiene de Workspace, validación defensiva en `from_compact_row` y test negativo de DoS), se detallan a continuación las tareas e implementaciones que restan por ejecutar en las fases subsiguientes:
+A partir de los informes técnicos emitidos por los 4 subagentes especialistas, se detallan las implementaciones que restan por ejecutar en las siguientes fases:
 
-### 4.1. Motor de Almacenamiento Local: `rimdb-storage` (Fase 2)
+### 4.1. Tipos de Datos Esenciales y Extensiones de Core (`rimdb-core`)
+
+* **Incorporación de `DataType::Uuid` y `Value::Uuid([u8; 16])`:**
+  Soporte de identificadores únicos universales (UUID v4) como tipo primitivo nativo de 16 bytes sin alocación dinámica, fundamental para claves primarias en arquitecturas distribuidas.
+* **Incorporación de `DataType::Decimal` y `Value::Decimal`:**
+  Representación de punto fijo (`i128` mantissa, `u32` escala) o integración liviana para cálculos monetarios y contables libres de los errores de redondeo de `Float` (`f64`).
+* **Definición de `trait CryptoEngine`:**
+  Puerto de abstracción para que el cliente pueda inyectar la implementación de cifrado/descifrado simétrico (ej. ChaCha20-Poly1305 / AES-GCM) para columnas marcadas con `encrypted: true`, manteniendo `rimdb-core` puro y desacoplado de dependencias criptográficas pesadas.
+* **Confirmación de Decisión de Ordenamiento:**
+  Se descarta la implementación de Relojes Lógicos Híbridos (HLC) complejos. La autoridad suprema de ordenamiento reside en el `sequence_id` emitido por el servidor (ver [Sección 10 de ARCHITECTURE.md](file:///Users/Santiago/OtherProjects/client-distributed-db/ARCHITECTURE.md#10-architectural-decisions-time-ordering--authority)).
+
+---
+
+### 4.2. Motor de Almacenamiento Local: `rimdb-storage` (Fase 2)
 
 * **Creación del crate `crates/storage` (`rimdb-storage`):**
-  Configurar el manifiesto `Cargo.toml` con dependencias: `rimdb-core`, `tokio`, `async-trait`, `zstd`, `crc32fast`, `thiserror`, `bytes`.
+  Configurar el manifiesto `Cargo.toml` con dependencias: `rimdb-core`, `tokio`, `async-trait`, `zstd`, `crc32fast`, `blake3`, `thiserror`, `bytes`.
 * **Definición del contrato `trait StorageEngine`:**
   Interfaz asíncrona desacoplada que soportará tanto la implementación en disco como el backend en memoria para pruebas:
   ```rust
@@ -145,21 +159,25 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
   - **Bloque Append-Only Delta Log (WAL):** Segmento al final del archivo donde cada mutación local commiteada o remota recibida se agrega secuencialmente precedida por su longitud en bytes (`u32`) y suma de verificación CRC32 (`u32`).
 * **Índice primario en memoria con recuperación por Replay:**
   Al inicializar una sala, leer el snapshot base y reproducir (*replay*) el WAL secuencialmente para levantar en memoria un mapa de punteros rápidos `HashMap<(TableName, PrimaryKey), FileOffset>` para resolución de lecturas en $O(1)$.
-* **Exportador y restaurador de snapshots con Zstandard (`zstd`):**
-  Módulos de compresión y descompresión de streaming para permitir volcados compactos del estado completo de la sala.
+* **Codificación Memcomparable para Claves Primarias:**
+  Serialización binaria de claves ordenables lexicográficamente directamente sobre bytes sin requerir deserializar los tipos `Value`.
+* **Integridad Criptográfica de Snapshots con BLAKE3:**
+  Cálculo y verificación de checksums BLAKE3 en snapshots exportados para detectar corrupciones de almacenamiento o tránsito antes de aplicarlos en el cliente.
 * **Worker de compactación local en segundo plano:**
   Lógica de mantenimiento que, cuando el tamaño del segmento WAL supera 3 veces el tamaño del snapshot base, genera un nuevo snapshot consolidado y trunca el log sin bloquear las lecturas locales.
 * **Mock en memoria (`MemoryStorageEngine`):**
   Implementación sobre `BTreeMap` en memoria para ejecución veloz de pruebas unitarias y de integración sin tocar el sistema de archivos.
+* **Previsión de Escalabilidad (Buffer Pool / Slotted-Pages):**
+  Diseño modular para facilitar a futuro la incorporación de un buffer pool con páginas ranuradas si el dataset de una sala supera la memoria física del dispositivo cliente.
 
 ---
 
-### 4.2. Servidor de Coordinación: `rimdb-server` (Fase 3)
+### 4.3. Servidor de Coordinación: `rimdb-server` (Fase 3)
 
 * **Modelo de Concurrencia: Actor Tokio por Sala (`RoomActor`):**
   - Cada sala activa es gestionada por un actor independiente ejecutándose en su propia tarea de Tokio, recibiendo comandos a través de un canal `mpsc::Sender<RoomCommand>`.
   - Concurrencia libre de bloqueos (*lock-free sharding*): sin contención de cerrojos (`RwLock`/`Mutex`) entre diferentes salas.
-* **Secuenciador Monótono Atómico:**
+* **Secuenciador Monótono Atómico (Autoridad Absoluta de Orden):**
   Asignación determinista de un `sequence_id` continuo y estrictamente incremental para cada mutación aceptada en la sala.
 * **Caché LRU de deduplicación de mutaciones:**
   Registro de los últimos $N$ `mutation_id` procesados en la sala con su `assigned_seq` correspondiente para garantizar semántica **Exactly-Once** y responder idempotentemente ante reintentos de red del cliente.
@@ -167,6 +185,8 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
   Buffer estructurado mediante `BTreeMap<u64, SequencedOperation>` y un índice secundario de `PrimaryKey` para resolver consultas `/sync` mediante búsqueda por rango y ejecutar squashing de operaciones redundantes sobre clientes retrasados.
 * **Micro-WAL de persistencia de secuencia:**
   Persistencia ultraligera y asíncrona del último `sequence_id` emitido en disco para resistir reinicios o caídas inesperadas del proceso servidor sin perder la monotonía de la secuencia.
+* **Prevención de Estancamiento (*Offline Stall*) mediante Snapshot Pinning / Lease:**
+  Mecanismo que retiene o asegura la disponibilidad de un snapshot consolidado reciente para clientes que regresan tras un largo período offline (`BehindCompaction`), evitando que queden bloqueados indefinidamente si no hay otros pares activos conectados.
 * **Router y Endpoints HTTP/2 en Axum:**
   - `POST /rooms/{room_id}/register`: Registro inicial del cliente, retorno del `head_seq` actual y validación de compatibilidad de esquemas.
   - `POST /rooms/{room_id}/commit`: Recepción de mutación binaria con `MutationId`, validación contra esquema, secuenciación atómica y retorno de `CommitAck`.
@@ -178,7 +198,7 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 
 ---
 
-### 4.3. Biblioteca Cliente y Reconciliación: `rimdb-client` (Fase 4)
+### 4.4. Biblioteca Cliente y Reconciliación: `rimdb-client` (Fase 4)
 
 * **Fachada ergonómica de usuario (`RimdbClient`, `Database`, `TableHandle`):**
   API tipada para aplicaciones Rust:
@@ -208,7 +228,7 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 
 ---
 
-### 4.4. Pruebas de Integración de Extremo a Extremo y Verificación E2E (Fase 5)
+### 4.5. Pruebas de Integración de Extremo a Extremo y Verificación E2E (Fase 5)
 
 * **Suite de integración Cliente-Servidor:**
   Simulación de red en local con múltiples instancias de `RimdbClient` interactuando contra un `rimdb-server` en Tokio.
@@ -221,12 +241,12 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 
 ---
 
-### 4.5. Mejoras Evolutivas de Dominio (Fase Posterior)
+### 4.6. Mejoras Evolutivas de Dominio (Fase Posterior)
 
 * **Evolución hacia Newtypes para identificadores de dominio:**
   Reemplazar los alias `type RoomId = String` y `type ClientId = String` por structs tipo tupla opacos (`pub struct RoomId(pub String);`, `pub struct ClientId(pub String);`) para prevenir errores de inversión de argumentos en tiempo de compilación.
 * **Evaluación de política LWW a nivel de Celda (CRDT Celular):**
-  Si el caso de uso requiere que múltiples clientes modifiquen campos disjuntos de la misma tupla de forma concurrente preservando procedencias temporales independientes por campo, migrar `Operation::Update` a `fields: BTreeMap<String, FieldMutation>` donde `FieldMutation { value: Value, timestamp: u64 }`.
+  Si el caso de uso requiere que múltiples clientes modifiquen campos disjuntos de la misma tupla de forma concurrente preservando procedencias temporales independientes por campo, evaluar migrar `Operation::Update` a `fields: BTreeMap<String, FieldMutation>`.
 
 ---
 
@@ -241,7 +261,7 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 │ [x] Validación estricta de esquemas, columnas requeridas y tipos de PK.     │
 │ [x] Implementación de Regla Anti-Zombi y timestamps simétricos en squashing.│
 │ [x] Contrato de protocolo con MutationId, CorrelationId y paginación.       │
-│ [x] Blindaje DoS a 16MB y 15 pruebas unitarias exhaustivas en rimdb-core.   │
+│ [x] Blindaje DoS a 16MB y 17 pruebas unitarias exhaustivas en rimdb-core.   │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ FASE 1.5: Higiene de Workspace y Preparación Inmediata [COMPLETADA]         │
 │ [x] Eliminar directorios .git anidados en crates/core, server y client.     │
@@ -249,15 +269,19 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 │ [x] Centralizar rimdb-core en [workspace.dependencies] del Cargo.toml raíz. │
 │ [x] Configurar [workspace.lints.rust] con unsafe_code = "forbid".           │
 │ [x] Añadir validación de aridad en from_compact_row y test negativo de DoS. │
+│ [x] Formalizar en ARCHITECTURE.md la autoridad suprema del secuenciador.    │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ FASE 2: Motor de Almacenamiento Local (rimdb-storage)                       │
+│ FASE 2: Motor de Almacenamiento Local (rimdb-storage) & Tipos Esenciales    │
+│ [ ] Añadir tipos Value::Uuid y Value::Decimal en rimdb-core.                │
+│ [ ] Definir el contrato trait CryptoEngine para E2EE en rimdb-core.         │
 │ [ ] Crear el crate crates/storage (rimdb-storage) con dependencias base.    │
 │ [ ] Definir el contrato formal trait StorageEngine.                         │
 │ [ ] Implementar formato de archivo room_{id}.rimdb con header mágico RIM1.  │
 │ [ ] Implementar Write-Ahead Log (WAL) append-only con checksums CRC32.      │
 │ [ ] Implementar índice primario en RAM y reconstrucción vía replay.         │
 │ [ ] Implementar compresión/descompresión de snapshots con Zstandard (zstd). │
-│ [ ] Implementar worker de compactación en segundo plano y mock en memoria.  │
+│ [ ] Implementar verificación de integridad con BLAKE3 y mock en memoria.    │
+│ [ ] Implementar worker de compactación en segundo plano y codif. memcomp.   │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ FASE 3: Servidor Coordinador y Secuenciador (rimdb-server)                  │
 │ [ ] Implementar actor de Tokio por Room (concurrencia sin cerrojos globales)│
@@ -265,6 +289,7 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 │ [ ] Implementar caché LRU de deduplicación de MutationId (Exactly-Once).    │
 │ [ ] Implementar buffer de compactación en RAM con índice de claves primarias│
 │ [ ] Implementar Micro-WAL para persistencia de sequence_id ante caídas.     │
+│ [ ] Implementar Snapshot Pinning / Lease para evitar Offline Stall.         │
 │ [ ] Implementar router y handlers HTTP/2 en Axum (/commit, /sync, etc.).    │
 │ [ ] Implementar tarea de retención de log basada en ACK y canal SSE.        │
 ├─────────────────────────────────────────────────────────────────────────────┤
@@ -286,7 +311,7 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 
 ## 6. Matriz de Trazabilidad Técnica
 
-La siguiente tabla mapea el origen de cada requerimiento pendiente según la recomendación del especialista correspondiente y el componente de destino:
+La siguiente tabla mapea el origen de cada requerimiento según la recomendación del especialista correspondiente y el componente de destino:
 
 | Requerimiento Técnico | Especialista Proponente | Crate Destino | Prioridad | Estado |
 | :--- | :--- | :--- | :---: | :---: |
@@ -295,13 +320,18 @@ La siguiente tabla mapea el origen de cada requerimiento pendiente según la rec
 | Activación de lint `unsafe_code = "forbid"` | Arquitectura | Workspace raíz | **Media** | ✅ **Completado** |
 | Validación de aridad defensiva en `from_compact_row` | Base de Datos | `rimdb-core` | **Media** | ✅ **Completado** |
 | Test unitario negativo para límite de tamaño DoS | Sistemas Distribuidos | `rimdb-core` | **Media** | ✅ **Completado** |
-| Recomendación formal de `insert_with_timestamp` (HLC) | DB / Distribuidos | `rimdb-core` | **Media** | ✅ **Completado** |
+| Autoridad de orden por `sequence_id` del servidor | Distribuidos / Diseño | `ARCHITECTURE.md` | **Alta** | ✅ **Completado** |
+| Tipos esenciales `Value::Uuid` y `Value::Decimal` | Base de Datos | `rimdb-core` | **Alta** | ⏳ **Pendiente (Fase 2)** |
+| Abstracción `trait CryptoEngine` para E2EE | Arquitectura | `rimdb-core` | **Media** | ⏳ **Pendiente (Fase 2)** |
 | Creación de `trait StorageEngine` e implementación tabular | Base de Datos / Arq. | `rimdb-storage` | **Alta** | ⏳ **Pendiente (Fase 2)** |
 | Write-Ahead Log (WAL) con suma de verificación CRC32 | Base de Datos / Arq. | `rimdb-storage` | **Alta** | ⏳ **Pendiente (Fase 2)** |
 | Snapshots comprimidos con `zstd` | Base de Datos | `rimdb-storage` | **Alta** | ⏳ **Pendiente (Fase 2)** |
+| Integridad de snapshots con BLAKE3 | Distribuidos / DB | `rimdb-storage` | **Media** | ⏳ **Pendiente (Fase 2)** |
+| Codificación Memcomparable para claves primarias | Base de Datos | `rimdb-storage` | **Baja** | ⏳ **Pendiente (Fase 2)** |
 | Modelo de actores Tokio por sala (*Room Actor*) | Sist. Distribuidos / Arq. | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
 | Caché LRU de deduplicación por `MutationId` | Sist. Distribuidos | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
 | Micro-WAL de secuencias para tolerancia a caídas | Sist. Distribuidos / DB | `rimdb-server` | **Media** | ⏳ **Pendiente (Fase 3)** |
+| Snapshot Pinning / Lease para evitar Offline Stall | Sistemas Distribuidos | `rimdb-server` | **Media** | ⏳ **Pendiente (Fase 3)** |
 | Cola Outbox persistente y pipeline de Rebase local | Sist. Distribuidos / DB | `rimdb-client` | **Alta** | ⏳ **Pendiente (Fase 4)** |
 | Abstracción de transporte dual Nativo (HTTP/2) y WASM (Fetch) | Arquitectura | `rimdb-client` | **Alta** | ⏳ **Pendiente (Fase 4)** |
 | Batería de pruebas E2E de partición y concurrencia | Sist. Distribuidos / Rust | Workspace / Tests | **Alta** | ⏳ **Pendiente (Fase 5)** |
