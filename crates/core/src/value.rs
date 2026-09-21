@@ -17,6 +17,7 @@ pub enum DataType {
     String,
     Bool,
     Bytes,
+    Uuid,
 }
 
 impl fmt::Display for DataType {
@@ -29,6 +30,7 @@ impl fmt::Display for DataType {
             DataType::String => write!(f, "String"),
             DataType::Bool => write!(f, "Bool"),
             DataType::Bytes => write!(f, "Bytes"),
+            DataType::Uuid => write!(f, "Uuid"),
         }
     }
 }
@@ -36,7 +38,8 @@ impl fmt::Display for DataType {
 /// Dynamic strongly typed value.
 ///
 /// Memory footprint is strictly bounded to 24 bytes on 64-bit platforms
-/// by boxing heap-allocated dynamic payloads (`Box<str>` and `Box<Bytes>`).
+/// by boxing heap-allocated dynamic payloads (`Box<str>` and `Box<Bytes>`)
+/// while keeping fixed-size payloads (`[u8; 16]` for UUID) directly inline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     Null,
@@ -46,6 +49,7 @@ pub enum Value {
     String(Box<str>),
     Bool(bool),
     Bytes(Box<Bytes>),
+    Uuid([u8; 16]),
 }
 
 impl Value {
@@ -57,8 +61,9 @@ impl Value {
             Value::Int(_) => 2,
             Value::Float(_) => 3,
             Value::Timestamp(_) => 4,
-            Value::String(_) => 5,
-            Value::Bytes(_) => 6,
+            Value::Uuid(_) => 5,
+            Value::String(_) => 6,
+            Value::Bytes(_) => 7,
         }
     }
 
@@ -71,6 +76,7 @@ impl Value {
             Value::String(_) => DataType::String,
             Value::Bool(_) => DataType::Bool,
             Value::Bytes(_) => DataType::Bytes,
+            Value::Uuid(_) => DataType::Uuid,
         }
     }
 
@@ -125,6 +131,68 @@ impl Value {
             Value::Bytes(b) => Some(b.as_ref()),
             _ => None,
         }
+    }
+
+    #[inline]
+    pub fn as_uuid(&self) -> Option<&[u8; 16]> {
+        match self {
+            Value::Uuid(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn to_uuid(&self) -> Option<[u8; 16]> {
+        match self {
+            Value::Uuid(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// Parses a 32-character or 36-character hyphenated UUID hex string into `[u8; 16]`.
+    pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
+        let b = s.as_bytes();
+        let mut bytes = [0u8; 16];
+        if b.len() == 36 && b[8] == b'-' && b[13] == b'-' && b[18] == b'-' && b[23] == b'-' {
+            let mut bi = 0;
+            let mut i = 0;
+            while i < 36 {
+                if i == 8 || i == 13 || i == 18 || i == 23 {
+                    i += 1;
+                    continue;
+                }
+                let hi = hex_val(b[i])?;
+                let lo = hex_val(b[i + 1])?;
+                bytes[bi] = (hi << 4) | lo;
+                bi += 1;
+                i += 2;
+            }
+            Some(bytes)
+        } else if b.len() == 32 {
+            for bi in 0..16 {
+                let hi = hex_val(b[bi * 2])?;
+                let lo = hex_val(b[bi * 2 + 1])?;
+                bytes[bi] = (hi << 4) | lo;
+            }
+            Some(bytes)
+        } else {
+            None
+        }
+    }
+
+    /// Creates a Value::Uuid from a UUID hex string (32 or 36 chars with hyphens).
+    pub fn from_uuid_str(s: &str) -> Option<Self> {
+        Self::parse_uuid(s).map(Value::Uuid)
+    }
+}
+
+#[inline]
+const fn hex_val(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -232,6 +300,12 @@ impl From<&[u8]> for Value {
     }
 }
 
+impl From<[u8; 16]> for Value {
+    fn from(bytes: [u8; 16]) -> Self {
+        Value::Uuid(bytes)
+    }
+}
+
 impl PartialEq for Value {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
@@ -252,6 +326,7 @@ impl Hash for Value {
                 canonical.to_bits().hash(state);
             }
             Value::Timestamp(v) => v.hash(state),
+            Value::Uuid(v) => v.hash(state),
             Value::String(v) => v.hash(state),
             Value::Bool(v) => v.hash(state),
             Value::Bytes(v) => v.as_ref().hash(state),
@@ -277,6 +352,7 @@ impl Ord for Value {
                 ca.total_cmp(&cb)
             }
             (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+            (Value::Uuid(a), Value::Uuid(b)) => a.cmp(b),
             (Value::String(a), Value::String(b)) => a.cmp(b),
             (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
             (a, b) => a.type_order().cmp(&b.type_order()),
@@ -291,6 +367,11 @@ impl fmt::Display for Value {
             Value::Int(v) => write!(f, "{}", v),
             Value::Float(v) => write!(f, "{}", v),
             Value::Timestamp(v) => write!(f, "Timestamp({})", v),
+            Value::Uuid(b) => write!(
+                f,
+                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+            ),
             Value::String(v) => write!(f, "\"{}\"", v),
             Value::Bool(v) => write!(f, "{}", v),
             Value::Bytes(v) => write!(f, "<bytes len={}>", v.len()),

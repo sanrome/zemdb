@@ -211,10 +211,12 @@ mod tests {
 
     #[test]
     fn test_value_ord_and_type_order() {
+        let uuid = Value::from_uuid_str("12345678-1234-1234-1234-123456789abc").unwrap();
         let mut values = [
             Value::String("hello".into()),
             Value::Null,
             Value::Timestamp(500),
+            uuid.clone(),
             Value::Int(42),
             Value::Bool(true),
             Value::Float(2.75),
@@ -228,8 +230,44 @@ mod tests {
         assert_eq!(values[2], Value::Int(42));
         assert_eq!(values[3], Value::Float(2.75));
         assert_eq!(values[4], Value::Timestamp(500));
-        assert_eq!(values[5], Value::String("hello".into()));
-        assert_eq!(values[6], Value::from(vec![1, 2, 3]));
+        assert_eq!(values[5], uuid);
+        assert_eq!(values[6], Value::String("hello".into()));
+        assert_eq!(values[7], Value::from(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn test_uuid_data_type_primary_key_and_parsing() {
+        let uuid_str = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
+        let parsed = Value::parse_uuid(uuid_str).expect("should parse valid uuid");
+        let val = Value::Uuid(parsed);
+
+        assert_eq!(val.data_type(), DataType::Uuid);
+        assert_eq!(format!("{}", val), uuid_str);
+        assert_eq!(val.to_uuid(), Some(parsed));
+
+        // Also test parsing compact 32-hex string without hyphens
+        let compact_hex = "a1b2c3d4e5f67890abcdef1234567890";
+        assert_eq!(Value::parse_uuid(compact_hex), Some(parsed));
+
+        // Schema with UUID primary key
+        let items_table = TableSchema::builder("items")
+            .primary_key("id", DataType::Uuid)
+            .column("title", DataType::String)
+            .build()
+            .unwrap();
+
+        let row = RowBuilder::new()
+            .set("id", val.clone())
+            .set("title", "Distributed Engine")
+            .build();
+
+        let pk = items_table.extract_pk(&row).unwrap();
+        assert_eq!(pk, PrimaryKey::single(val));
+
+        // Test bincode roundtrip of UUID Value
+        let encoded = bincode::serialize(&row).unwrap();
+        let decoded: Row = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(row, decoded);
     }
 
     #[test]
