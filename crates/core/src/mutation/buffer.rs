@@ -1,9 +1,16 @@
 use super::op::TableOperation;
-use super::squash::{squash_table_operations, SquashOutcome};
+use super::squash::{client_squash_table_operations, SquashOutcome};
 use crate::value::PrimaryKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Error returned when an operation cannot be applied to `TableBuffer`.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BufferError {
+    #[error("Incompatible operation for table '{table}': entity state forbids this transition")]
+    IncompatibleOperation { table: String },
+}
 
 /// In-memory mutation buffer for a single table.
 ///
@@ -22,14 +29,23 @@ impl TableBuffer {
         }
     }
 
-    pub fn apply(&mut self, op: TableOperation) -> SquashOutcome {
-        use std::collections::hash_map::Entry;
-        match self.pending.entry(op.pk.clone()) {
-            Entry::Occupied(mut entry) => squash_table_operations(entry.get_mut(), op),
-            Entry::Vacant(entry) => {
-                entry.insert(op);
-                SquashOutcome::Replaced
+    /// Applies an operation to the buffer with move semantics and squashing.
+    ///
+    /// Avoids unconditional cloning of the primary key by inspecting existing entries first.
+    /// Returns `Err(BufferError::IncompatibleOperation)` if the mutation transition is incompatible.
+    pub fn apply(&mut self, op: TableOperation) -> Result<SquashOutcome, BufferError> {
+        if let Some(existing) = self.pending.get_mut(&op.pk) {
+            let outcome = client_squash_table_operations(existing, op);
+            if outcome == SquashOutcome::Incompatible {
+                return Err(BufferError::IncompatibleOperation {
+                    table: self.table.to_string(),
+                });
             }
+            Ok(outcome)
+        } else {
+            let pk = op.pk.clone();
+            self.pending.insert(pk, op);
+            Ok(SquashOutcome::Replaced)
         }
     }
 

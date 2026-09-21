@@ -16,17 +16,36 @@ pub enum ErrorCode {
     Internal,
 }
 
-/// An operation ordered by the coordination server with an assigned sequence ID.
+/// An operation ordered by the coordination server with origin attribution and assigned sequence ID.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SequencedOperation {
     pub seq: SequenceNumber,
+    pub client_id: ClientId,
+    pub mutation_id: MutationId,
     pub op: Operation,
 }
 
 impl SequencedOperation {
-    pub fn new(seq: impl Into<SequenceNumber>, op: Operation) -> Self {
+    pub fn new(
+        seq: impl Into<SequenceNumber>,
+        client_id: impl Into<ClientId>,
+        mutation_id: impl Into<MutationId>,
+        op: Operation,
+    ) -> Self {
         Self {
             seq: seq.into(),
+            client_id: client_id.into(),
+            mutation_id: mutation_id.into(),
+            op,
+        }
+    }
+
+    /// Helper constructor creating a sequenced operation with default system origin attribution.
+    pub fn with_default_origin(seq: impl Into<SequenceNumber>, op: Operation) -> Self {
+        Self {
+            seq: seq.into(),
+            client_id: ClientId::new("system"),
+            mutation_id: MutationId::from_u128(0),
             op,
         }
     }
@@ -60,6 +79,12 @@ pub enum ClientMessage {
     },
     /// Join a room as an active client.
     RegisterClient {
+        correlation_id: CorrelationId,
+        room_id: RoomId,
+        client_id: ClientId,
+    },
+    /// Explicitly deregister a client from a room to advance retention immediately.
+    DeregisterClient {
         correlation_id: CorrelationId,
         room_id: RoomId,
         client_id: ClientId,

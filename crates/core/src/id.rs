@@ -151,6 +151,10 @@ impl MutationId {
     pub const fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
+
+    pub const fn from_u128(val: u128) -> Self {
+        Self(val.to_be_bytes())
+    }
 }
 
 impl Deref for MutationId {
@@ -172,6 +176,12 @@ impl fmt::Display for MutationId {
 impl From<[u8; 16]> for MutationId {
     fn from(bytes: [u8; 16]) -> Self {
         Self(bytes)
+    }
+}
+
+impl From<u128> for MutationId {
+    fn from(val: u128) -> Self {
+        Self::from_u128(val)
     }
 }
 

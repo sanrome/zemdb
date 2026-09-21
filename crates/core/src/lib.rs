@@ -16,8 +16,9 @@ pub mod operation {
 pub use crypto::{CryptoEngine, CryptoError, NoOpCryptoEngine};
 pub use id::{ClientId, CorrelationId, MutationId, RoomId, SequenceNumber};
 pub use mutation::{
-    squash_operations, squash_table_operations, ColumnUpdate, Operation, OperationKind,
-    SquashOutcome, TableBuffer, TableOperation, UpdateBuilder,
+    client_squash_operations, client_squash_table_operations, merge_sorted_column_updates,
+    server_squash_operations, server_squash_table_operations, BufferError, ColumnUpdate, Operation,
+    OperationKind, SquashOutcome, TableBuffer, TableOperation, UpdateBuilder,
 };
 pub use protocol::{
     decode_message, encode_message, ClientMessage, ErrorCode, ServerMessage, SequencedOperation,

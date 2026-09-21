@@ -14,3 +14,4 @@ thiserror = { workspace = true }
 bytes = { workspace = true }
 smallvec = { workspace = true }
 async-trait = { workspace = true }
+tracing = "0.1"

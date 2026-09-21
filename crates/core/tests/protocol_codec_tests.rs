@@ -37,6 +37,8 @@ fn test_protocol_binary_serialization_roundtrip() {
         head_seq: SequenceNumber::new(150),
         ops: vec![SequencedOperation {
             seq: SequenceNumber::new(150),
+            client_id: ClientId::new("client-1"),
+            mutation_id: MutationId::from_u128(999),
             op: Operation::delete("notes", PrimaryKey::single(42i64), 1000),
         }],
         has_more: false,
@@ -46,4 +48,14 @@ fn test_protocol_binary_serialization_roundtrip() {
     let decoded_server: ServerMessage =
         decode_message(&encoded_server).expect("deserialization failed");
     assert_eq!(server_msg, decoded_server);
+
+    // Test DeregisterClient roundtrip
+    let dereg_msg = ClientMessage::DeregisterClient {
+        correlation_id: CorrelationId::new(1002),
+        room_id: RoomId::new("room-abc"),
+        client_id: ClientId::new("client-1"),
+    };
+    let encoded_dereg = encode_message(&dereg_msg).expect("serialization failed");
+    let decoded_dereg: ClientMessage = decode_message(&encoded_dereg).expect("deserialization failed");
+    assert_eq!(dereg_msg, decoded_dereg);
 }

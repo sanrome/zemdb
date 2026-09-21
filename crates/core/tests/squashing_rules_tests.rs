@@ -33,7 +33,7 @@ fn test_squash_insert_then_update() {
         .build()
         .unwrap();
 
-    let outcome = squash_operations(&mut base_op, incoming);
+    let outcome = client_squash_operations(&mut base_op, incoming);
     assert_eq!(outcome, SquashOutcome::Merged);
 
     if let OperationKind::Insert { row } = &base_op.kind {
@@ -66,7 +66,7 @@ fn test_squash_update_then_update_field_merge() {
         .build()
         .unwrap();
 
-    let outcome = squash_operations(&mut base_op, incoming);
+    let outcome = client_squash_operations(&mut base_op, incoming);
     assert_eq!(outcome, SquashOutcome::Merged);
 
     if let OperationKind::Update { updates } = &base_op.kind {
@@ -93,7 +93,7 @@ fn test_anti_zombie_rule_delete_then_update_rejected() {
         .build()
         .unwrap();
 
-    let outcome = squash_operations(&mut del_op, up_op);
+    let outcome = client_squash_operations(&mut del_op, up_op);
     // Anti-zombie rule: A newer partial update CANNOT resurrect a delete!
     assert_eq!(outcome, SquashOutcome::Incompatible);
     assert!(del_op.is_delete());
@@ -105,7 +105,7 @@ fn test_anti_zombie_rule_delete_then_update_rejected() {
         .timestamp(90)
         .build()
         .unwrap();
-    let outcome_old = squash_operations(&mut del_op, older_up_op);
+    let outcome_old = client_squash_operations(&mut del_op, older_up_op);
     assert_eq!(outcome_old, SquashOutcome::Discarded);
     assert!(del_op.is_delete());
 }
@@ -125,7 +125,7 @@ fn test_squash_insert_then_delete() {
     let mut base_op = table.to_operation_insert(&row, 100).unwrap();
     let incoming = Operation::delete("users", pk, 200);
 
-    let outcome = squash_operations(&mut base_op, incoming.clone());
+    let outcome = client_squash_operations(&mut base_op, incoming.clone());
     assert_eq!(outcome, SquashOutcome::Replaced);
     assert_eq!(base_op, incoming);
 }
@@ -150,7 +150,7 @@ fn test_squash_older_insert_into_newer_update_preserves_data() {
         .build();
     let incoming_insert = table.to_operation_insert(&base_row, 100).unwrap();
 
-    let outcome = squash_operations(&mut target_op, incoming_insert);
+    let outcome = client_squash_operations(&mut target_op, incoming_insert);
     assert_eq!(outcome, SquashOutcome::Merged);
 
     // The target must have been converted to an Insert, keeping the base fields and newer update fields!
@@ -187,8 +187,8 @@ fn test_table_buffer_partitioned_squashing() {
         .build();
     let op2 = table.to_table_insert(&row2, 100).unwrap();
 
-    assert_eq!(buffer.apply(op1), SquashOutcome::Replaced);
-    assert_eq!(buffer.apply(op2), SquashOutcome::Replaced);
+    assert_eq!(buffer.apply(op1), Ok(SquashOutcome::Replaced));
+    assert_eq!(buffer.apply(op2), Ok(SquashOutcome::Replaced));
     assert_eq!(buffer.len(), 2);
 
     // Update Alice
@@ -198,7 +198,7 @@ fn test_table_buffer_partitioned_squashing() {
         .timestamp(150)
         .build_table_op()
         .unwrap();
-    assert_eq!(buffer.apply(up_alice), SquashOutcome::Merged);
+    assert_eq!(buffer.apply(up_alice), Ok(SquashOutcome::Merged));
     assert_eq!(buffer.len(), 2);
 
     // Verify squashed Alice
@@ -212,8 +212,78 @@ fn test_table_buffer_partitioned_squashing() {
 
     // Delete Bob
     let del_bob = TableOperation::delete(PrimaryKey::single(2i64), 200);
-    assert_eq!(buffer.apply(del_bob), SquashOutcome::Replaced);
+    assert_eq!(buffer.apply(del_bob), Ok(SquashOutcome::Replaced));
 
     let bob_op = buffer.get(&PrimaryKey::single(2i64)).unwrap();
     assert!(bob_op.is_delete());
+
+    // Applying UPDATE after DELETE with higher timestamp should yield BufferError::IncompatibleOperation
+    let up_bob = table
+        .update_builder(PrimaryKey::single(2i64))
+        .set("age", 50i64)
+        .timestamp(250)
+        .build_table_op()
+        .unwrap();
+    let err = buffer.apply(up_bob).unwrap_err();
+    assert_eq!(
+        err,
+        BufferError::IncompatibleOperation {
+            table: "users".to_string()
+        }
+    );
+}
+
+#[test]
+fn test_two_pointer_column_merge_linear() {
+    let mut existing = vec![
+        ColumnUpdate::new(1, Value::Int(10)),
+        ColumnUpdate::new(3, Value::String("old".into())),
+        ColumnUpdate::new(5, Value::Bool(false)),
+    ];
+    let incoming = vec![
+        ColumnUpdate::new(0, Value::Int(100)),
+        ColumnUpdate::new(3, Value::String("new".into())),
+        ColumnUpdate::new(4, Value::Int(400)),
+        ColumnUpdate::new(6, Value::Bool(true)),
+    ];
+
+    merge_sorted_column_updates(&mut existing, incoming, true);
+
+    let indices: Vec<u16> = existing.iter().map(|u| u.column_idx).collect();
+    assert_eq!(indices, vec![0, 1, 3, 4, 5, 6]);
+    assert_eq!(existing[2].value, Value::String("new".into())); // incoming won
+}
+
+#[test]
+fn test_server_squash_total_order_precedence() {
+    let schema = sample_schema();
+    let table = schema.get_table("users").unwrap();
+
+    let row = RowBuilder::new()
+        .set("id", 1i64)
+        .set("name", "Alice")
+        .set("age", 25i64)
+        .set("secret_chat", vec![1, 2, 3])
+        .build();
+
+    let mut op1 = table.to_operation_insert(&row, 100).unwrap();
+
+    // Even if client clock is skewed backwards (timestamp 50 < 100),
+    // server_squash respects arrival order!
+    let up_alice = table
+        .update_builder(PrimaryKey::single(1i64))
+        .set("age", 30i64)
+        .timestamp(50)
+        .build()
+        .unwrap();
+
+    let outcome = server_squash_operations(&mut op1, up_alice);
+    assert_eq!(outcome, SquashOutcome::Merged);
+
+    if let OperationKind::Insert { row } = &op1.kind {
+        let restored = table.from_compact_row(row).unwrap();
+        assert_eq!(restored.get("age"), Some(&Value::Int(30)));
+    } else {
+        panic!("Expected Insert");
+    }
 }

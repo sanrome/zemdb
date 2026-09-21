@@ -1,4 +1,4 @@
-use super::op::{Operation, OperationKind, TableOperation};
+use super::op::{ColumnUpdate, Operation, OperationKind, TableOperation};
 
 /// Result of attempting to squash two sequential operations for the same PK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,8 +13,53 @@ pub enum SquashOutcome {
     Incompatible,
 }
 
-/// Merges an incoming TableOperation into an existing pending TableOperation for the same PK.
-pub fn squash_table_operations(
+/// Merges two sorted lists of `ColumnUpdate` in $O(M+N)$ linear time using a two-pointer merge.
+///
+/// If `incoming_wins` is true, conflicting columns take the value from `incoming`;
+/// otherwise, the value in `existing` is retained.
+pub fn merge_sorted_column_updates(
+    existing: &mut Vec<ColumnUpdate>,
+    incoming: Vec<ColumnUpdate>,
+    incoming_wins: bool,
+) {
+    let old_existing = std::mem::take(existing);
+    let mut merged = Vec::with_capacity(old_existing.len() + incoming.len());
+    let mut it_a = old_existing.into_iter().peekable();
+    let mut it_b = incoming.into_iter().peekable();
+
+    loop {
+        match (it_a.peek(), it_b.peek()) {
+            (Some(a), Some(b)) => {
+                if a.column_idx < b.column_idx {
+                    merged.push(it_a.next().unwrap());
+                } else if a.column_idx > b.column_idx {
+                    merged.push(it_b.next().unwrap());
+                } else {
+                    let item_a = it_a.next().unwrap();
+                    let item_b = it_b.next().unwrap();
+                    if incoming_wins {
+                        merged.push(item_b);
+                    } else {
+                        merged.push(item_a);
+                    }
+                }
+            }
+            (Some(_), None) => {
+                merged.extend(it_a);
+                break;
+            }
+            (None, Some(_)) => {
+                merged.extend(it_b);
+                break;
+            }
+            (None, None) => break,
+        }
+    }
+    *existing = merged;
+}
+
+/// Merges an incoming TableOperation into an existing pending TableOperation for the same PK (Client-side LWW by timestamp).
+pub fn client_squash_table_operations(
     existing: &mut TableOperation,
     incoming: TableOperation,
 ) -> SquashOutcome {
@@ -46,7 +91,7 @@ pub fn squash_table_operations(
             SquashOutcome::Merged
         }
 
-        // Rule 2: UPDATE followed by UPDATE -> sorted delta merge preserving column_idx ascending
+        // Rule 2: UPDATE followed by UPDATE -> O(M+N) two-pointer merge preserving column_idx ascending
         (
             OperationKind::Update {
                 updates: existing_updates,
@@ -55,26 +100,10 @@ pub fn squash_table_operations(
                 updates: incoming_updates,
             },
         ) => {
-            if incoming.timestamp >= existing.timestamp {
-                for inc in incoming_updates {
-                    match existing_updates.binary_search_by_key(&inc.column_idx, |u| u.column_idx) {
-                        Ok(pos) => {
-                            existing_updates[pos].value = inc.value;
-                        }
-                        Err(pos) => {
-                            existing_updates.insert(pos, inc);
-                        }
-                    }
-                }
+            let incoming_wins = incoming.timestamp >= existing.timestamp;
+            merge_sorted_column_updates(existing_updates, incoming_updates, incoming_wins);
+            if incoming_wins {
                 existing.timestamp = incoming.timestamp;
-            } else {
-                for inc in incoming_updates {
-                    if let Err(pos) =
-                        existing_updates.binary_search_by_key(&inc.column_idx, |u| u.column_idx)
-                    {
-                        existing_updates.insert(pos, inc);
-                    }
-                }
             }
             SquashOutcome::Merged
         }
@@ -126,10 +155,77 @@ pub fn squash_table_operations(
     }
 }
 
-/// Merges an incoming operation into an existing pending operation for the same table and PK.
-pub fn squash_operations(existing: &mut Operation, incoming: Operation) -> SquashOutcome {
+/// Squashes an incoming TableOperation in server-authoritative mode.
+///
+/// In this mode, order is determined strictly by sequencer arrival order (monotonically
+/// increasing sequence number), eliminating dependency on client clocks for conflict resolution.
+pub fn server_squash_table_operations(
+    existing: &mut TableOperation,
+    incoming: TableOperation,
+) -> SquashOutcome {
+    if existing.pk != incoming.pk {
+        return SquashOutcome::Incompatible;
+    }
+
+    match (&mut existing.kind, incoming.kind) {
+        // Rule 1: INSERT followed by UPDATE -> direct slot update on CompactRow
+        (OperationKind::Insert { row }, OperationKind::Update { updates }) => {
+            for u in updates {
+                let idx = u.column_idx as usize;
+                if let Some(slot) = row.values.get_mut(idx) {
+                    *slot = u.value;
+                }
+            }
+            existing.timestamp = incoming.timestamp;
+            SquashOutcome::Merged
+        }
+
+        // Rule 2: UPDATE followed by UPDATE -> two-pointer merge with incoming winning
+        (
+            OperationKind::Update {
+                updates: existing_updates,
+            },
+            OperationKind::Update {
+                updates: incoming_updates,
+            },
+        ) => {
+            merge_sorted_column_updates(existing_updates, incoming_updates, true);
+            existing.timestamp = incoming.timestamp;
+            SquashOutcome::Merged
+        }
+
+        // Rule 3: DELETE followed by UPDATE (Anti-Zombie rule)
+        // A partial update CANNOT resurrect a deleted entity.
+        (OperationKind::Delete, OperationKind::Update { .. }) => SquashOutcome::Incompatible,
+
+        // Rule 4: Any operation followed by DELETE -> becomes DELETE
+        (target_kind, OperationKind::Delete) => {
+            *target_kind = OperationKind::Delete;
+            existing.timestamp = incoming.timestamp;
+            SquashOutcome::Replaced
+        }
+
+        // Rule 5: Any operation followed by INSERT -> replaces
+        (target_kind, OperationKind::Insert { row }) => {
+            *target_kind = OperationKind::Insert { row };
+            existing.timestamp = incoming.timestamp;
+            SquashOutcome::Replaced
+        }
+    }
+}
+
+/// Merges an incoming operation into an existing pending operation for the same table and PK (Client-side LWW by timestamp).
+pub fn client_squash_operations(existing: &mut Operation, incoming: Operation) -> SquashOutcome {
     if existing.table != incoming.table {
         return SquashOutcome::Incompatible;
     }
-    squash_table_operations(&mut existing.op, incoming.op)
+    client_squash_table_operations(&mut existing.op, incoming.op)
+}
+
+/// Squashes an incoming operation in server-authoritative mode (Strict sequencer order).
+pub fn server_squash_operations(existing: &mut Operation, incoming: Operation) -> SquashOutcome {
+    if existing.table != incoming.table {
+        return SquashOutcome::Incompatible;
+    }
+    server_squash_table_operations(&mut existing.op, incoming.op)
 }
