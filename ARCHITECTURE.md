@@ -105,18 +105,25 @@ To prevent the resource exhaustion of thousands of idle persistent connections:
 ## 8. Storage Engine (`rimdb-storage`)
 
 Persisting data locally on clients and managing snapshots is decoupled into a dedicated storage crate implementing a common `StorageEngine` abstraction:
-* **Native Structured Storage:**
-  * Custom local storage engine built in Rust.
+* **The `StorageEngine` Contract:**
+  * Clean, network-agnostic async persistence contract: `open_room`, `close_room`, `apply_batch`, `get`, `scan`, `get_head_seq`, `create_snapshot`, `apply_snapshot`.
+  * **Zero-Copy Move Semantics:** `apply_batch` takes `Vec<SequencedOperation>` by ownership value, eliminating redundant cloning between client network pipelines and local storage.
+  * **WebAssembly (WASM) Ready:** Defined with conditional concurrency bounds `#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]` and platform-specific `RowStream<'a>` definitions, allowing native execution in single-threaded browser environments (e.g. IndexedDB).
+* **Pushdown Query Capabilities (`ScanOptions`):**
+  * Modern storage abstraction supporting query execution without bloating the storage engine with SQL parsers:
+    * `KeyRange`: Flexible range bounds conforming to Rust standard range syntax (`..`, `a..b`, `a..=b`, `a..`).
+    * `ScanDirection`: Forward (`ASC`) and Backward (`DESC`) for $O(1)$ memory `ORDER BY pk DESC` traversal.
+    * `limit: Option<usize>`: Early I/O termination pushdown avoiding scanning unwanted records.
+    * `projection: Option<Vec<u16>>`: Projection pushdown returning compact rows with only requested column indices, preventing unnecessary deserialization.
+* **In-Memory Reference Engine (`MemoryStorageEngine`):**
+  * Thread-safe memory backend with **per-room lock isolation** (`Arc<RwLock<HashMap<RoomId, Arc<RwLock<RoomState>>>>>`).
+  * Operations across different rooms run 100% concurrently without lock contention. Within each room, multiple concurrent readers execute in shared mode (`read()`) while mutation batches take an exclusive lock (`write()`) on that specific room only.
+  * Tabular data stored in `BTreeMap<PrimaryKey, CompactRow>` with binary snapshot serialization.
+* **Future On-Disk Engine (`DiskStorageEngine`):**
   * Local file-per-room architecture (`room_{id}.rimdb` with magic header `RIM1`).
-  * Optimized tabular layout for fast primary key lookups and in-place field updates.
-* **Write-Ahead Log (WAL):**
-  * Append-only transaction log with per-record CRC32 checksums for crash resilience and recovery.
-* **In-Memory Primary Index:**
-  * RAM-resident index enabling $O(1)$ point lookups without requiring full disk scans.
-* **Block Compression (Zstandard - `zstd`):**
-  * Leverages schema-aware data structures with Zstandard block compression to produce minimal snapshot payloads for peer onboarding and backups.
-* **Pluggable Architecture:**
-  * The `StorageEngine` trait permits interchangeable backends, including in-memory mock engines for fast unit and integration testing.
+  * Append-only Write-Ahead Log (WAL) with per-record CRC32 checksums for crash resilience and fast recovery.
+  * RAM-resident primary index enabling $O(1)$ point lookups without requiring full disk scans.
+  * Schema-aware data structures with Zstandard block compression for onboarding snapshots.
 
 ---
 

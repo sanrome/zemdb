@@ -659,6 +659,10 @@ impl Schema {
         self.tables.get(table)
     }
 
+    pub fn has_table(&self, table: &str) -> bool {
+        self.tables.contains_key(table)
+    }
+
     pub fn validate_insert(&self, table: &str, row: &Row) -> Result<PrimaryKey, ValidationError> {
         let t = self
             .get_table(table)

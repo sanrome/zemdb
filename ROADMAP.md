@@ -50,20 +50,27 @@
 * Reducción de ancho de banda de red en más de un 50% al erradicar los nombres de columnas repetidos en cada tupla serializada en Bincode.
 * Incorporación de soporte nativo para `DataType::Uuid` y `Value::Uuid([u8; 16])` con parseo de 32/36 caracteres hexadecimales, formateo canónico 8-4-4-4-12, ordenamiento e integración transparente con claves primarias sin alocación en el heap.
 * Suite de pruebas unitarias ampliada a 25 pruebas en `rimdb-core` con aserciones rigurosas de `size_of` en todos los structs y pase sin advertencias en `cargo clippy`.
+* Creación y configuración del nuevo crate `crates/storage` (`rimdb-storage`) con `#![forbid(unsafe_code)]` y centralización en `[workspace.dependencies]`.
+* Definición del contrato formal de persistencia `StorageEngine` con semántica de movimiento (*zero-copy move semantics*) en `apply_batch`, totalmente preparado para WebAssembly (`wasm32-unknown-unknown`) mediante `#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]` y concurrencia desacoplada.
+* Soporte nativo para consultas complejas en almacenamiento sin inflar el motor: abstracción `KeyRange` (cubriendo toda la sintaxis de rangos de Rust: `..`, `a..b`, `a..=b`, `a..`), dirección `ScanDirection` (`Forward` / `Backward` para ordenamiento reverso `ORDER BY pk DESC`), *Limit pushdown* (`limit: Option<usize>`) y *Projection pushdown* (`projection: Option<Vec<u16>>`) devolviendo un `RowStream`.
+* Implementación de `MemoryStorageEngine` con **concurrencia multihilo y aislamiento estricto por sala** (`Arc<RwLock<HashMap<RoomId, Arc<RwLock<RoomState>>>>>`), erradicando la contención de cerrojos entre salas distintas y permitiendo lecturas compartidas concurrentes simultáneas (`RwLock::read`) por sala.
+* Incorporación de snapshots binarios en memoria serializados con `bincode` y método `has_table` en `Schema`.
+* Suite de pruebas unitarias ampliada a **32 tests en el workspace** con 6 pruebas de integración exhaustivas en `rimdb-storage` (incluyendo test de aislamiento y concurrencia entre salas paralelas).
 
 ---
 
 ## 2. Resumen Ejecutivo del Estado del Proyecto
 
-RimDB ha superado con éxito la **Fase 1 y 1.5 (Reestructuración, Blindaje de Core e Higiene de Workspace)**. El crate [`rimdb-core`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core) ha sido saneado de todos los anti-patrones críticos identificados en la evaluación inicial:
+RimDB ha superado con éxito la **Fase 1 y 1.5 (Reestructuración, Blindaje de Core e Higiene de Workspace)** y la **Fase 2A (Contrato Formal de Persistencia, Pushdown de Queries y Motor en Memoria)**. El crate [`rimdb-core`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core) se encuentra blindado y el nuevo crate [`rimdb-storage`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage) define la frontera limpia y asíncrona para almacenamiento local:
 - Se redujo el footprint de memoria de `Value` en un 40% (24 bytes) y `PrimaryKey` a 40 bytes (ajustado a una línea de caché L1 de CPU).
 - Se garantizó la estabilidad binaria de esquemas con orden DDL físico en `TableSchema` y conversiones zero-copy por movimiento.
 - Se cerró la pérdida de datos y anomalías de tuplas zombi en `squash_operations`.
 - Se consolidó el contrato de red con garantías formales de idempotencia y multiplexación.
-- Se mantiene el desacoplamiento estricto de I/O, garantizando que el núcleo compile hacia WebAssembly (`wasm32-unknown-unknown`).
+- Se mantiene el desacoplamiento estricto de I/O, garantizando que tanto el núcleo como el almacenamiento compilen hacia WebAssembly (`wasm32-unknown-unknown`).
 - Se formalizó en [`ARCHITECTURE.md`](file:///Users/Santiago/OtherProjects/client-distributed-db/ARCHITECTURE.md#10-architectural-decisions-time-ordering--authority) la decisión de diseño de que el **servidor es la única autoridad de ordenamiento global** mediante su `sequence_id` monótono, eliminando la complejidad innecesaria de sincronización de relojes (HLC).
+- Se estableció el contrato `StorageEngine` y se verificó con `MemoryStorageEngine` multihilo con aislamiento por sala.
 
-El proyecto se encuentra ahora en posición para avanzar hacia la implementación de las capas de persistencia local en disco, concurrencia por actores en el servidor y sincronización optimista reactiva en el cliente.
+El proyecto se encuentra ahora en posición para implementar el motor de persistencia en disco con WAL (`room_{id}.rimdb`), avanzar a la concurrencia por actores en el servidor y construir la sincronización optimista reactiva en el cliente.
 
 ---
 
@@ -81,9 +88,9 @@ El sistema se estructura en 4 crates con fronteras de responsabilidad estrictas:
 │    (`rimdb-core`)              │ operaciones, squashing, protocolo binario. Cero I/O.   │
 │                                │ Compatible con WASM (`wasm32-unknown-unknown`).        │
 ├────────────────────────────────┼────────────────────────────────────────────────────────┤
-│ 2. `crates/storage`            │ Motor de persistencia tabular local. Formato de archivo │
-│    (`rimdb-storage`)           │ `room_{id}.rimdb`, Write-Ahead Log (WAL) con CRC32,    │
-│    [PENDIENTE - FASE 2]        │ índice primario en RAM y snapshots con `zstd`.         │
+│ 2. `crates/storage`            │ Motor de persistencia tabular local. Contrato          │
+│    (`rimdb-storage`)           │ `StorageEngine`, motor en memoria con aislamiento      │
+│    [FASE 2A COMPLETADA / 2B]   │ por sala, y futuro WAL en disco `room_{id}.rimdb`.     │
 ├────────────────────────────────┼────────────────────────────────────────────────────────┤
 │ 3. `crates/server`             │ Servidor coordinador y secuenciador monótono. Modelo de │
 │    (`rimdb-server`)            │ actores Tokio por sala (*Room*), buffer efímero con     │
@@ -93,6 +100,7 @@ El sistema se estructura en 4 crates con fronteras de responsabilidad estrictas:
 │    (`rimdb-client`)            │ Fachada reactiva, Outbox local, pipeline de rebase     │
 │    [PENDIENTE - FASE 4]        │ optimista, transporte dual (Nativo HTTP/2 / Fetch Web). │
 └────────────────────────────────┴────────────────────────────────────────────────────────┘
+
 ```
 
 ```mermaid
@@ -153,26 +161,38 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 
 ### 4.2. Motor de Almacenamiento Local: `rimdb-storage` (Fase 2)
 
-* **Creación del crate `crates/storage` (`rimdb-storage`):**
-  Configurar el manifiesto `Cargo.toml` con dependencias: `rimdb-core`, `tokio`, `async-trait`, `zstd`, `crc32fast`, `blake3`, `thiserror`, `bytes`.
-* **Definición del contrato `trait StorageEngine`:**
-  Interfaz asíncrona desacoplada que soportará tanto la implementación en disco como el backend en memoria para pruebas:
+#### Fase 2A: Contrato de Persistencia y Motor en Memoria [COMPLETADO]
+* **[COMPLETADO] Creación del crate `crates/storage` (`rimdb-storage`):**
+  Configurado en el workspace heredando lints (`unsafe_code = "forbid"`), versionado y dependencias (`rimdb-core`, `async-trait`, `futures`, `tokio`, `thiserror`, `bincode`).
+* **[COMPLETADO] Definición del contrato `trait StorageEngine`:**
+  Interfaz asíncrona desacoplada con semántica de movimiento (*move semantics*), compatible condicionalmente con WebAssembly (`#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]`):
   ```rust
-  #[async_trait]
-  pub trait StorageEngine: Send + Sync {
-      async fn open_room(&self, room_id: &str, schema: Schema) -> Result<(), StorageError>;
-      async fn append_wal(&self, room_id: &str, op: &SequencedOperation) -> Result<u64, StorageError>;
-      async fn get_by_pk(&self, room_id: &str, table: &str, pk: &PrimaryKey) -> Result<Option<CompactRow>, StorageError>;
-      async fn scan_table(&self, room_id: &str, table: &str) -> Result<Vec<(PrimaryKey, CompactRow)>, StorageError>;
-      async fn create_snapshot(&self, room_id: &str) -> Result<Vec<u8>, StorageError>;
-      async fn apply_snapshot(&self, room_id: &str, snapshot_data: &[u8]) -> Result<(), StorageError>;
-      async fn get_last_synced_seq(&self, room_id: &str) -> Result<u64, StorageError>;
-      async fn set_last_synced_seq(&self, room_id: &str, seq: u64) -> Result<(), StorageError>;
+  #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+  #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+  pub trait StorageEngine: EngineConcurrencyBounds {
+      async fn open_room(&self, room_id: &RoomId, schema: Schema) -> Result<(), StorageError>;
+      async fn close_room(&self, room_id: &RoomId) -> Result<(), StorageError>;
+      async fn apply_batch(&self, room_id: &RoomId, ops: Vec<SequencedOperation>) -> Result<SequenceNumber, StorageError>;
+      async fn get(&self, room_id: &RoomId, table: &str, pk: &PrimaryKey) -> Result<Option<CompactRow>, StorageError>;
+      async fn scan<'a>(&'a self, room_id: &RoomId, table: &str, options: ScanOptions) -> Result<RowStream<'a>, StorageError>;
+      async fn get_head_seq(&self, room_id: &RoomId) -> Result<SequenceNumber, StorageError>;
+      async fn create_snapshot(&self, room_id: &RoomId) -> Result<Vec<u8>, StorageError>;
+      async fn apply_snapshot(&self, room_id: &RoomId, schema: Schema, snapshot: &[u8]) -> Result<SequenceNumber, StorageError>;
   }
   ```
+* **[COMPLETADO] Soporte para Consultas Complejas con Pushdowns:**
+  - `KeyRange`: Abstracción ergonómica sobre rangos de claves primarias (`std::ops::Bound`) con implementación `From` para rangos nativos de Rust (`..`, `a..b`, `a..=b`, `a..`).
+  - `ScanOptions`: Soporte para dirección `ScanDirection` (`Forward` / `Backward` para `ORDER BY pk DESC`), `limit: Option<usize>` (*Limit pushdown*) y `projection: Option<Vec<u16>>` (*Projection pushdown*).
+  - `RowStream<'a>`: Stream asíncrono para consumo eficiente de tuplas `(PrimaryKey, CompactRow)`.
+* **[COMPLETADO] Implementación en memoria (`MemoryStorageEngine`):**
+  - Estructura con **aislamiento y concurrencia por sala** (`Arc<RwLock<HashMap<RoomId, Arc<RwLock<RoomState>>>>>`).
+  - Operaciones sobre diferentes salas 100% paralelas sin interferencias. Múltiples lectores concurrentes por sala (`read()`) y mutaciones atómicas por lote (`write()`).
+  - Tablas particionadas en `BTreeMap<PrimaryKey, CompactRow>` y serialización/deserialización de snapshots binarios mediante `bincode`.
+
+#### Fase 2B: Motor de Almacenamiento en Disco con WAL [PENDIENTE]
 * **Formato de archivo tabular nativo por sala (`room_{id}.rimdb`):**
   - **Cabecera (Header):** Magic bytes (`RIM1`), versión de formato (`u16`), identificador de esquema, `snapshot_seq: u64`, `head_seq: u64`.
-  - **Bloque de Snapshot Base:** Dump binario consolidado de las tuplas de todas las tablas comprimido con Zstandard.
+  - **Bloque de Snapshot Base:** Dump binario consolidado de las tuplas de todas las tablas comprimido con Zstandard (`zstd`).
   - **Bloque Append-Only Delta Log (WAL):** Segmento al final del archivo donde cada mutación local commiteada o remota recibida se agrega secuencialmente precedida por su longitud en bytes (`u32`) y suma de verificación CRC32 (`u32`).
 * **Índice primario en memoria con recuperación por Replay:**
   Al inicializar una sala, leer el snapshot base y reproducir (*replay*) el WAL secuencialmente para levantar en memoria un mapa de punteros rápidos `HashMap<(TableName, PrimaryKey), FileOffset>` para resolución de lecturas en $O(1)$.
@@ -182,10 +202,9 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
   Cálculo y verificación de checksums BLAKE3 en snapshots exportados para detectar corrupciones de almacenamiento o tránsito antes de aplicarlos en el cliente.
 * **Worker de compactación local en segundo plano:**
   Lógica de mantenimiento que, cuando el tamaño del segmento WAL supera 3 veces el tamaño del snapshot base, genera un nuevo snapshot consolidado y trunca el log sin bloquear las lecturas locales.
-* **Mock en memoria (`MemoryStorageEngine`):**
-  Implementación sobre `BTreeMap` en memoria para ejecución veloz de pruebas unitarias y de integración sin tocar el sistema de archivos.
 * **Previsión de Escalabilidad (Buffer Pool / Slotted-Pages):**
   Diseño modular para facilitar a futuro la incorporación de un buffer pool con páginas ranuradas si el dataset de una sala supera la memoria física del dispositivo cliente.
+
 
 ---
 
