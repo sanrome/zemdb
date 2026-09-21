@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::ops::{Deref, Index};
 
 /// Supported primitive data types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -33,15 +34,18 @@ impl fmt::Display for DataType {
 }
 
 /// Dynamic strongly typed value.
+///
+/// Memory footprint is strictly bounded to 24 bytes on 64-bit platforms
+/// by boxing heap-allocated dynamic payloads (`Box<str>` and `Box<Bytes>`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
     Null,
     Int(i64),
     Float(f64),
     Timestamp(i64),
-    String(String),
+    String(Box<str>),
     Bool(bool),
-    Bytes(Bytes),
+    Bytes(Box<Bytes>),
 }
 
 impl Value {
@@ -70,15 +74,75 @@ impl Value {
         }
     }
 
+    #[inline]
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
 
+    #[inline]
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Value::Int(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_float(&self) -> Option<f64> {
+        match self {
+            Value::Float(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_timestamp(&self) -> Option<i64> {
+        match self {
+            Value::Timestamp(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::String(s) => Some(s.as_ref()),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    #[inline]
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Value::Bytes(b) => Some(b.as_ref()),
             _ => None,
         }
+    }
+}
+
+impl From<i8> for Value {
+    fn from(v: i8) -> Self {
+        Value::Int(v as i64)
+    }
+}
+
+impl From<i16> for Value {
+    fn from(v: i16) -> Self {
+        Value::Int(v as i64)
+    }
+}
+
+impl From<i32> for Value {
+    fn from(v: i32) -> Self {
+        Value::Int(v as i64)
     }
 }
 
@@ -88,8 +152,14 @@ impl From<i64> for Value {
     }
 }
 
-impl From<i32> for Value {
-    fn from(v: i32) -> Self {
+impl From<u8> for Value {
+    fn from(v: u8) -> Self {
+        Value::Int(v as i64)
+    }
+}
+
+impl From<u16> for Value {
+    fn from(v: u16) -> Self {
         Value::Int(v as i64)
     }
 }
@@ -100,27 +170,35 @@ impl From<u32> for Value {
     }
 }
 
-impl From<f64> for Value {
-    fn from(v: f64) -> Self {
-        Value::Float(v)
+impl From<f32> for Value {
+    fn from(v: f32) -> Self {
+        let val = if v == 0.0 { 0.0 } else { v as f64 };
+        Value::Float(val)
     }
 }
 
-impl From<f32> for Value {
-    fn from(v: f32) -> Self {
-        Value::Float(v as f64)
+impl From<f64> for Value {
+    fn from(v: f64) -> Self {
+        let val = if v == 0.0 { 0.0 } else { v };
+        Value::Float(val)
     }
 }
 
 impl From<String> for Value {
     fn from(v: String) -> Self {
-        Value::String(v)
+        Value::String(v.into_boxed_str())
     }
 }
 
 impl From<&str> for Value {
     fn from(v: &str) -> Self {
-        Value::String(v.to_string())
+        Value::String(v.into())
+    }
+}
+
+impl From<Box<str>> for Value {
+    fn from(v: Box<str>) -> Self {
+        Value::String(v)
     }
 }
 
@@ -132,34 +210,32 @@ impl From<bool> for Value {
 
 impl From<Bytes> for Value {
     fn from(b: Bytes) -> Self {
+        Value::Bytes(Box::new(b))
+    }
+}
+
+impl From<Box<Bytes>> for Value {
+    fn from(b: Box<Bytes>) -> Self {
         Value::Bytes(b)
     }
 }
 
 impl From<Vec<u8>> for Value {
     fn from(v: Vec<u8>) -> Self {
-        Value::Bytes(Bytes::from(v))
+        Value::Bytes(Box::new(Bytes::from(v)))
     }
 }
 
 impl From<&[u8]> for Value {
     fn from(v: &[u8]) -> Self {
-        Value::Bytes(Bytes::copy_from_slice(v))
+        Value::Bytes(Box::new(Bytes::copy_from_slice(v)))
     }
 }
 
 impl PartialEq for Value {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Value::Null, Value::Null) => true,
-            (Value::Int(a), Value::Int(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => a.total_cmp(b) == Ordering::Equal,
-            (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
-            (Value::String(a), Value::String(b)) => a == b,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Bytes(a), Value::Bytes(b)) => a == b,
-            _ => false,
-        }
+        self.cmp(other).is_eq()
     }
 }
 
@@ -171,7 +247,10 @@ impl Hash for Value {
         match self {
             Value::Null => {}
             Value::Int(v) => v.hash(state),
-            Value::Float(v) => v.to_bits().hash(state),
+            Value::Float(v) => {
+                let canonical = if *v == 0.0 { 0.0 } else { *v };
+                canonical.to_bits().hash(state);
+            }
             Value::Timestamp(v) => v.hash(state),
             Value::String(v) => v.hash(state),
             Value::Bool(v) => v.hash(state),
@@ -192,7 +271,11 @@ impl Ord for Value {
             (Value::Null, Value::Null) => Ordering::Equal,
             (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
             (Value::Int(a), Value::Int(b)) => a.cmp(b),
-            (Value::Float(a), Value::Float(b)) => a.total_cmp(b),
+            (Value::Float(a), Value::Float(b)) => {
+                let ca = if *a == 0.0 { 0.0 } else { *a };
+                let cb = if *b == 0.0 { 0.0 } else { *b };
+                ca.total_cmp(&cb)
+            }
             (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
             (Value::String(a), Value::String(b)) => a.cmp(b),
             (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
@@ -215,9 +298,10 @@ impl fmt::Display for Value {
     }
 }
 
-/// Primary key representation, optimized with SmallVec to keep scalar keys on the stack.
+/// Primary key representation, optimized with SmallVec to keep scalar keys on the stack
+/// while strictly fitting within a single 64-byte L1 cache line (size: 48 bytes).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct PrimaryKey(pub SmallVec<[Value; 2]>);
+pub struct PrimaryKey(pub SmallVec<[Value; 1]>);
 
 impl PrimaryKey {
     pub fn single(value: impl Into<Value>) -> Self {
@@ -232,6 +316,28 @@ impl PrimaryKey {
 
     pub fn values(&self) -> &[Value] {
         &self.0
+    }
+
+    pub fn into_values(self) -> SmallVec<[Value; 1]> {
+        self.0
+    }
+}
+
+impl Deref for PrimaryKey {
+    type Target = [Value];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Index<usize> for PrimaryKey {
+    type Output = Value;
+
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.0[index]
     }
 }
 
@@ -273,6 +379,25 @@ impl CompactRow {
 
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
+    }
+
+    pub fn into_values(self) -> Vec<Value> {
+        self.values
+    }
+}
+
+impl Deref for CompactRow {
+    type Target = [Value];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl From<Vec<Value>> for CompactRow {
+    fn from(values: Vec<Value>) -> Self {
+        Self { values }
     }
 }
 
