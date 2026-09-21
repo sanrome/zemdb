@@ -13,3 +13,4 @@ bincode = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 smallvec = { workspace = true }
+async-trait = { workspace = true }

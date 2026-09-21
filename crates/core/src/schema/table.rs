@@ -1,109 +1,10 @@
-use crate::operation::{ColumnUpdate, Operation, TableOperation};
+use super::column::ColumnDef;
+use super::validation::{self, ValidationError};
+use crate::mutation::{ColumnUpdate, Operation, TableOperation};
 use crate::value::{CompactRow, DataType, PrimaryKey, Row, Value};
 use serde::{Deserialize, Deserializer, Serialize};
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
-use thiserror::Error;
-
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum ValidationError {
-    #[error("Table '{0}' does not exist in schema")]
-    TableNotFound(String),
-
-    #[error("Primary key column '{column}' missing from row for table '{table}'")]
-    MissingPrimaryKeyColumn { table: String, column: String },
-
-    #[error("Required non-null column '{column}' missing from row for table '{table}'")]
-    MissingRequiredColumn { table: String, column: String },
-
-    #[error("Primary key arity mismatch for table '{table}': expected {expected}, got {actual}")]
-    PrimaryKeyArityMismatch {
-        table: String,
-        expected: usize,
-        actual: usize,
-    },
-
-    #[error("Primary key column '{column}' in table '{table}' expected type {expected}, got {actual}")]
-    PrimaryKeyTypeMismatch {
-        table: String,
-        column: String,
-        expected: DataType,
-        actual: DataType,
-    },
-
-    #[error("Column '{column}' in table '{table}' expected type {expected}, got {actual}")]
-    TypeMismatch {
-        table: String,
-        column: String,
-        expected: DataType,
-        actual: DataType,
-    },
-
-    #[error("Column '{column}' in table '{table}' is encrypted and must be transmitted as Value::Bytes")]
-    EncryptedColumnMustBeBytes { table: String, column: String },
-
-    #[error("Primary key column '{column}' in table '{table}' cannot be encrypted")]
-    EncryptedPrimaryKeyNotAllowed { table: String, column: String },
-
-    #[error("Primary key column '{column}' in table '{table}' cannot be nullable")]
-    NullablePrimaryKeyNotAllowed { table: String, column: String },
-
-    #[error("Unknown column '{column}' for table '{table}'")]
-    UnknownColumn { table: String, column: String },
-
-    #[error("Primary key columns cannot be modified via UPDATE in table '{table}' (column '{column}')")]
-    CannotUpdatePrimaryKey { table: String, column: String },
-
-    #[error("Empty update payload for table '{0}'")]
-    EmptyUpdate(String),
-
-    #[error("Primary key definition cannot be empty for table '{0}'")]
-    EmptyPrimaryKeyDefinition(String),
-
-    #[error("Invalid column data type for column '{column}' in table '{table}': {message}")]
-    InvalidColumnDataType {
-        table: String,
-        column: String,
-        message: String,
-    },
-
-    #[error("CompactRow arity mismatch for table '{table}': expected {expected}, got {actual}")]
-    CompactRowArityMismatch {
-        table: String,
-        expected: usize,
-        actual: usize,
-    },
-}
-
-/// Definition of a single column in a table.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ColumnDef {
-    pub name: String,
-    pub data_type: DataType,
-    pub nullable: bool,
-    pub encrypted: bool,
-}
-
-impl ColumnDef {
-    pub fn new(name: impl Into<String>, data_type: DataType) -> Self {
-        Self {
-            name: name.into(),
-            data_type,
-            nullable: false,
-            encrypted: false,
-        }
-    }
-
-    pub fn nullable(mut self, nullable: bool) -> Self {
-        self.nullable = nullable;
-        self
-    }
-
-    pub fn encrypted(mut self, encrypted: bool) -> Self {
-        self.encrypted = encrypted;
-        self
-    }
-}
 
 /// Builder for constructing TableSchema instances declaratively.
 #[derive(Debug, Clone)]
@@ -188,7 +89,8 @@ impl TableBuilder {
                 return Err(ValidationError::InvalidColumnDataType {
                     table: self.name.clone(),
                     column: col.name.clone(),
-                    message: "Columns cannot have DataType::Null as their schema definition type".to_string(),
+                    message: "Columns cannot have DataType::Null as their schema definition type"
+                        .to_string(),
                 });
             }
         }
@@ -244,7 +146,7 @@ pub struct TableSchema {
     pub primary_key: Vec<String>,
     pub columns: Vec<ColumnDef>,
     #[serde(skip)]
-    column_indices: BTreeMap<String, usize>,
+    pub(crate) column_indices: BTreeMap<String, usize>,
 }
 
 impl<'de> Deserialize<'de> for TableSchema {
@@ -304,137 +206,15 @@ impl TableSchema {
     }
 
     pub fn validate_pk(&self, pk: &PrimaryKey) -> Result<(), ValidationError> {
-        if pk.len() != self.primary_key.len() {
-            return Err(ValidationError::PrimaryKeyArityMismatch {
-                table: self.name.clone(),
-                expected: self.primary_key.len(),
-                actual: pk.len(),
-            });
-        }
-
-        for (pk_col, val) in self.primary_key.iter().zip(pk.iter()) {
-            let col_def = self.get_column(pk_col).ok_or_else(|| {
-                ValidationError::UnknownColumn {
-                    table: self.name.clone(),
-                    column: pk_col.clone(),
-                }
-            })?;
-
-            if val.data_type() != col_def.data_type {
-                return Err(ValidationError::PrimaryKeyTypeMismatch {
-                    table: self.name.clone(),
-                    column: pk_col.clone(),
-                    expected: col_def.data_type,
-                    actual: val.data_type(),
-                });
-            }
-        }
-
-        Ok(())
-    }
-
-    fn validate_field_value(&self, col_name: &str, col_def: &ColumnDef, val: &Value) -> Result<(), ValidationError> {
-        if val.is_null() {
-            if !col_def.nullable {
-                return Err(ValidationError::MissingRequiredColumn {
-                    table: self.name.clone(),
-                    column: col_name.to_string(),
-                });
-            }
-            return Ok(());
-        }
-
-        if col_def.encrypted {
-            if val.data_type() != DataType::Bytes {
-                return Err(ValidationError::EncryptedColumnMustBeBytes {
-                    table: self.name.clone(),
-                    column: col_name.to_string(),
-                });
-            }
-        } else if val.data_type() != col_def.data_type {
-            return Err(ValidationError::TypeMismatch {
-                table: self.name.clone(),
-                column: col_name.to_string(),
-                expected: col_def.data_type,
-                actual: val.data_type(),
-            });
-        }
-        Ok(())
+        validation::validate_pk(&self.name, &self.primary_key, |col| self.get_column(col), pk)
     }
 
     pub fn validate_row(&self, row: &Row) -> Result<(), ValidationError> {
-        // 1. Ensure all PK columns exist and match types
-        for pk_col in &self.primary_key {
-            let col_def = self.get_column(pk_col).ok_or_else(|| {
-                ValidationError::UnknownColumn {
-                    table: self.name.clone(),
-                    column: pk_col.clone(),
-                }
-            })?;
-            let val = row.get(pk_col).ok_or_else(|| {
-                ValidationError::MissingPrimaryKeyColumn {
-                    table: self.name.clone(),
-                    column: pk_col.clone(),
-                }
-            })?;
-            self.validate_field_value(pk_col, col_def, val)?;
-        }
-
-        // 2. Ensure all required non-null columns exist in row
-        for col in &self.columns {
-            if !col.nullable && !self.primary_key.contains(&col.name) {
-                let val = row.get(&col.name).ok_or_else(|| {
-                    ValidationError::MissingRequiredColumn {
-                        table: self.name.clone(),
-                        column: col.name.clone(),
-                    }
-                })?;
-                self.validate_field_value(&col.name, col, val)?;
-            }
-        }
-
-        // 3. Validate all provided columns match schema
-        for (col_name, val) in row {
-            if let Some(col_def) = self.get_column(col_name) {
-                if col_def.nullable {
-                    self.validate_field_value(col_name, col_def, val)?;
-                }
-            } else {
-                return Err(ValidationError::UnknownColumn {
-                    table: self.name.clone(),
-                    column: col_name.clone(),
-                });
-            }
-        }
-
-        Ok(())
+        validation::validate_row(self, row)
     }
 
     pub fn validate_update(&self, fields: &BTreeMap<String, Value>) -> Result<(), ValidationError> {
-        if fields.is_empty() {
-            return Err(ValidationError::EmptyUpdate(self.name.clone()));
-        }
-
-        for (col_name, val) in fields {
-            // PK columns cannot be updated directly
-            if self.primary_key.contains(col_name) {
-                return Err(ValidationError::CannotUpdatePrimaryKey {
-                    table: self.name.clone(),
-                    column: col_name.clone(),
-                });
-            }
-
-            let col_def = self.get_column(col_name).ok_or_else(|| {
-                ValidationError::UnknownColumn {
-                    table: self.name.clone(),
-                    column: col_name.clone(),
-                }
-            })?;
-
-            self.validate_field_value(col_name, col_def, val)?;
-        }
-
-        Ok(())
+        validation::validate_table_update(self, fields)
     }
 
     /// Converts a validated Row to CompactRow ordered by physical DDL schema columns.
@@ -532,7 +312,11 @@ impl TableSchema {
     }
 
     /// Validates a Row and compiles it into a dense `TableOperation::insert`.
-    pub fn to_table_insert(&self, row: &Row, timestamp: u64) -> Result<TableOperation, ValidationError> {
+    pub fn to_table_insert(
+        &self,
+        row: &Row,
+        timestamp: u64,
+    ) -> Result<TableOperation, ValidationError> {
         let pk = self.extract_pk(row)?;
         let compact = self.to_compact_row(row)?;
         Ok(TableOperation::insert(pk, compact, timestamp))
@@ -551,7 +335,11 @@ impl TableSchema {
     }
 
     /// Validates a Row and compiles it into a self-describing `Operation::insert`.
-    pub fn to_operation_insert(&self, row: &Row, timestamp: u64) -> Result<Operation, ValidationError> {
+    pub fn to_operation_insert(
+        &self,
+        row: &Row,
+        timestamp: u64,
+    ) -> Result<Operation, ValidationError> {
         let table_op = self.to_table_insert(row, timestamp)?;
         Ok(Operation::new(self.name.clone(), table_op))
     }
@@ -603,118 +391,12 @@ impl<'a> SchemaUpdateBuilder<'a> {
     }
 
     pub fn build(self) -> Result<Operation, ValidationError> {
-        self.schema.to_operation_update(self.pk, &self.fields, self.timestamp)
+        self.schema
+            .to_operation_update(self.pk, &self.fields, self.timestamp)
     }
 
     pub fn build_table_op(self) -> Result<TableOperation, ValidationError> {
-        self.schema.to_table_update(self.pk, &self.fields, self.timestamp)
-    }
-}
-
-/// Builder for constructing Schema instances declaratively.
-#[derive(Debug, Clone, Default)]
-pub struct SchemaBuilder {
-    tables: BTreeMap<String, TableSchema>,
-}
-
-impl SchemaBuilder {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn table(mut self, table: TableSchema) -> Self {
-        self.tables.insert(table.name.clone(), table);
-        self
-    }
-
-    pub fn build(self) -> Schema {
-        Schema {
-            tables: self.tables,
-        }
-    }
-}
-
-/// Global database schema containing all tables in a Room.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Schema {
-    pub tables: BTreeMap<String, TableSchema>,
-}
-
-impl Schema {
-    pub fn new() -> Self {
-        Self {
-            tables: BTreeMap::new(),
-        }
-    }
-
-    pub fn builder() -> SchemaBuilder {
-        SchemaBuilder::new()
-    }
-
-    pub fn add_table(&mut self, table: TableSchema) {
-        self.tables.insert(table.name.clone(), table);
-    }
-
-    pub fn get_table(&self, table: &str) -> Option<&TableSchema> {
-        self.tables.get(table)
-    }
-
-    pub fn has_table(&self, table: &str) -> bool {
-        self.tables.contains_key(table)
-    }
-
-    pub fn validate_insert(&self, table: &str, row: &Row) -> Result<PrimaryKey, ValidationError> {
-        let t = self
-            .get_table(table)
-            .ok_or_else(|| ValidationError::TableNotFound(table.to_string()))?;
-        t.validate_row(row)?;
-        t.extract_pk(row)
-    }
-
-    pub fn validate_update(
-        &self,
-        table: &str,
-        pk: &PrimaryKey,
-        fields: &BTreeMap<String, Value>,
-    ) -> Result<(), ValidationError> {
-        let t = self
-            .get_table(table)
-            .ok_or_else(|| ValidationError::TableNotFound(table.to_string()))?;
-
-        t.validate_pk(pk)?;
-        t.validate_update(fields)
-    }
-
-    pub fn validate_delete(&self, table: &str, pk: &PrimaryKey) -> Result<(), ValidationError> {
-        let t = self
-            .get_table(table)
-            .ok_or_else(|| ValidationError::TableNotFound(table.to_string()))?;
-
-        t.validate_pk(pk)
-    }
-
-    pub fn to_operation_insert(
-        &self,
-        table: &str,
-        row: &Row,
-        timestamp: u64,
-    ) -> Result<Operation, ValidationError> {
-        let t = self
-            .get_table(table)
-            .ok_or_else(|| ValidationError::TableNotFound(table.to_string()))?;
-        t.to_operation_insert(row, timestamp)
-    }
-
-    pub fn to_operation_update(
-        &self,
-        table: &str,
-        pk: PrimaryKey,
-        fields: &BTreeMap<String, Value>,
-        timestamp: u64,
-    ) -> Result<Operation, ValidationError> {
-        let t = self
-            .get_table(table)
-            .ok_or_else(|| ValidationError::TableNotFound(table.to_string()))?;
-        t.to_operation_update(pk, fields, timestamp)
+        self.schema
+            .to_table_update(self.pk, &self.fields, self.timestamp)
     }
 }

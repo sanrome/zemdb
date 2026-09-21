@@ -1,10 +1,6 @@
-pub use crate::id::{ClientId, CorrelationId, MutationId, RoomId, SequenceNumber};
-use crate::operation::{Operation, SequencedOperation};
-use bincode::Options;
+use crate::id::{ClientId, CorrelationId, MutationId, RoomId, SequenceNumber};
+use crate::mutation::Operation;
 use serde::{Deserialize, Serialize};
-
-/// Default maximum payload limit (16 MB) to protect against allocation exhaustion (DoS).
-pub const MAX_MESSAGE_SIZE: u64 = 16 * 1024 * 1024;
 
 /// Error codes returned by the coordination server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +14,22 @@ pub enum ErrorCode {
     RateLimited,
     RoomLocked,
     Internal,
+}
+
+/// An operation ordered by the coordination server with an assigned sequence ID.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SequencedOperation {
+    pub seq: SequenceNumber,
+    pub op: Operation,
+}
+
+impl SequencedOperation {
+    pub fn new(seq: impl Into<SequenceNumber>, op: Operation) -> Self {
+        Self {
+            seq: seq.into(),
+            op,
+        }
+    }
 }
 
 /// Unified message sent from Client to Server.
@@ -91,23 +103,4 @@ pub enum ServerMessage {
         code: ErrorCode,
         message: String,
     },
-}
-
-/// Serialize any protocol message to binary using bincode with defensive limits.
-pub fn encode_message<T: Serialize>(msg: &T) -> Result<Vec<u8>, bincode::Error> {
-    bincode::DefaultOptions::new()
-        .with_limit(MAX_MESSAGE_SIZE)
-        .allow_trailing_bytes()
-        .serialize(msg)
-}
-
-/// Deserialize any protocol message from binary using bincode with defensive limits against DoS.
-pub fn decode_message<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, bincode::Error> {
-    if bytes.len() as u64 > MAX_MESSAGE_SIZE {
-        return Err(Box::new(bincode::ErrorKind::SizeLimit));
-    }
-    bincode::DefaultOptions::new()
-        .with_limit(MAX_MESSAGE_SIZE)
-        .allow_trailing_bytes()
-        .deserialize(bytes)
 }
