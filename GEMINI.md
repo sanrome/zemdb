@@ -1,0 +1,1 @@
+No retrocompatibility is needed as this is the first version of the proyect so changes shouldn´t be stopped for this cause. 
