@@ -200,6 +200,39 @@ impl TableSchema {
         self.column_indices.get(name).copied()
     }
 
+    /// Appends a new nullable column to the table schema for append-only DDL evolution.
+    /// Preserves physical column order and updates secondary column indexing.
+    /// Returns the assigned positional 0-indexed column index (`u16`).
+    pub fn add_column(&mut self, col: ColumnDef) -> Result<u16, ValidationError> {
+        if self.column_indices.contains_key(&col.name) {
+            return Err(ValidationError::DuplicateColumn {
+                table: self.name.clone(),
+                column: col.name,
+            });
+        }
+
+        if !col.nullable {
+            return Err(ValidationError::AddedColumnMustBeNullable {
+                table: self.name.clone(),
+                column: col.name,
+            });
+        }
+
+        if col.data_type == DataType::Null {
+            return Err(ValidationError::InvalidColumnDataType {
+                table: self.name.clone(),
+                column: col.name,
+                message: "Columns cannot have DataType::Null as their schema definition type"
+                    .to_string(),
+            });
+        }
+
+        let new_idx = self.columns.len();
+        self.column_indices.insert(col.name.clone(), new_idx);
+        self.columns.push(col);
+        Ok(new_idx as u16)
+    }
+
     pub fn extract_pk(&self, row: &Row) -> Result<PrimaryKey, ValidationError> {
         let mut pk_values = SmallVec::new();
         for pk_col in &self.primary_key {
@@ -230,6 +263,21 @@ impl TableSchema {
         validation::validate_table_update(self, fields)
     }
 
+    /// Validates an entire CompactRow in O(C) time against this TableSchema.
+    pub fn validate_compact_row(&self, row: &CompactRow) -> Result<(), ValidationError> {
+        validation::validate_compact_row(self, row)
+    }
+
+    /// Validates positional ColumnUpdates in O(C) time against this TableSchema.
+    pub fn validate_column_updates(&self, updates: &[ColumnUpdate]) -> Result<(), ValidationError> {
+        validation::validate_column_updates(self, updates)
+    }
+
+    /// Validates an Operation in O(C) time against this TableSchema.
+    pub fn validate_operation(&self, op: &Operation) -> Result<(), ValidationError> {
+        validation::validate_operation(self, op)
+    }
+
     /// Converts a validated Row to CompactRow ordered by physical DDL schema columns.
     pub fn to_compact_row(&self, row: &Row) -> Result<CompactRow, ValidationError> {
         self.validate_row(row)?;
@@ -253,8 +301,10 @@ impl TableSchema {
     }
 
     /// Converts a CompactRow back to a structured Row, validating arity.
+    ///
+    /// Allows `compact.len() <= self.columns.len()`, treating omitted columns as null.
     pub fn from_compact_row(&self, compact: &CompactRow) -> Result<Row, ValidationError> {
-        if compact.len() != self.columns.len() {
+        if compact.len() > self.columns.len() {
             return Err(ValidationError::CompactRowArityMismatch {
                 table: self.name.clone(),
                 expected: self.columns.len(),
@@ -271,8 +321,10 @@ impl TableSchema {
     }
 
     /// Zero-copy conversion of CompactRow back to a structured Row.
+    ///
+    /// Allows `compact.len() <= self.columns.len()`, treating omitted columns as null.
     pub fn compact_into_row(&self, compact: CompactRow) -> Result<Row, ValidationError> {
-        if compact.len() != self.columns.len() {
+        if compact.len() > self.columns.len() {
             return Err(ValidationError::CompactRowArityMismatch {
                 table: self.name.clone(),
                 expected: self.columns.len(),

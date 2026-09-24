@@ -1,7 +1,9 @@
 use super::column::ColumnDef;
 use super::global::Schema;
 use super::table::TableSchema;
-use crate::value::{DataType, PrimaryKey, Row, Value};
+use crate::mutation::{ColumnUpdate, Operation, OperationKind};
+use crate::value::{CompactRow, DataType, PrimaryKey, Row, Value};
+use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -73,6 +75,29 @@ pub enum ValidationError {
         expected: usize,
         actual: usize,
     },
+
+    #[error("Column '{column}' already exists in table '{table}'")]
+    DuplicateColumn { table: String, column: String },
+
+    #[error("Added column '{column}' in table '{table}' must be nullable for schema evolution")]
+    AddedColumnMustBeNullable { table: String, column: String },
+
+    #[error("Table ID mismatch for table '{table}': expected {expected}, got {actual}")]
+    TableIdMismatch {
+        table: String,
+        expected: u16,
+        actual: u16,
+    },
+
+    #[error("Column updates for table '{table}' must be strictly sorted by column index (got index {actual_idx} after {prev_idx})")]
+    UnsortedColumnUpdates {
+        table: String,
+        prev_idx: u16,
+        actual_idx: u16,
+    },
+
+    #[error("Row primary key does not match operation primary key for table '{table}'")]
+    PrimaryKeyMismatch { table: String },
 }
 
 /// Validates an individual field value against column definition rules.
@@ -255,4 +280,140 @@ pub fn validate_delete(
         .ok_or_else(|| ValidationError::TableNotFound(table.to_string()))?;
 
     t.validate_pk(pk)
+}
+
+/// Validates an array of positional ColumnUpdates in $O(C)$ time against TableSchema.
+pub fn validate_column_updates(
+    table: &TableSchema,
+    updates: &[ColumnUpdate],
+) -> Result<(), ValidationError> {
+    if updates.is_empty() {
+        return Err(ValidationError::EmptyUpdate(table.name.clone()));
+    }
+
+    let mut seen = SmallVec::<[bool; 32]>::from_elem(false, table.columns.len());
+    let mut last_idx: Option<u16> = None;
+
+    for u in updates {
+        let col_idx = u.column_idx as usize;
+        if col_idx >= table.columns.len() {
+            return Err(ValidationError::UnknownColumn {
+                table: table.name.clone(),
+                column: format!("index {}", u.column_idx),
+            });
+        }
+
+        // Verify strictly ascending ordering without duplicates
+        if let Some(prev) = last_idx {
+            if u.column_idx == prev {
+                return Err(ValidationError::DuplicateColumn {
+                    table: table.name.clone(),
+                    column: table.columns[col_idx].name.clone(),
+                });
+            } else if u.column_idx < prev {
+                return Err(ValidationError::UnsortedColumnUpdates {
+                    table: table.name.clone(),
+                    prev_idx: prev,
+                    actual_idx: u.column_idx,
+                });
+            }
+        }
+        last_idx = Some(u.column_idx);
+
+        if seen[col_idx] {
+            return Err(ValidationError::DuplicateColumn {
+                table: table.name.clone(),
+                column: table.columns[col_idx].name.clone(),
+            });
+        }
+        seen[col_idx] = true;
+
+        let col_def = &table.columns[col_idx];
+        if table.primary_key.contains(&col_def.name) {
+            return Err(ValidationError::CannotUpdatePrimaryKey {
+                table: table.name.clone(),
+                column: col_def.name.clone(),
+            });
+        }
+
+        validate_field_value(&table.name, &col_def.name, col_def, &u.value)?;
+    }
+
+    Ok(())
+}
+
+/// Validates an entire positional CompactRow in $O(C)$ time against TableSchema.
+pub fn validate_compact_row(
+    table: &TableSchema,
+    compact: &CompactRow,
+) -> Result<(), ValidationError> {
+    if compact.len() > table.columns.len() {
+        return Err(ValidationError::CompactRowArityMismatch {
+            table: table.name.clone(),
+            expected: table.columns.len(),
+            actual: compact.len(),
+        });
+    }
+
+    for (i, col_def) in table.columns.iter().enumerate() {
+        let val = if i < compact.len() {
+            &compact.values[i]
+        } else {
+            &Value::Null
+        };
+        validate_field_value(&table.name, &col_def.name, col_def, val)?;
+    }
+
+    Ok(())
+}
+
+/// Validates an Operation against TableSchema in $O(C)$ time without reconstructing HashMaps.
+pub fn validate_operation(
+    table: &TableSchema,
+    op: &Operation,
+) -> Result<(), ValidationError> {
+    if op.table_id != table.table_id {
+        return Err(ValidationError::TableIdMismatch {
+            table: table.name.clone(),
+            expected: table.table_id,
+            actual: op.table_id,
+        });
+    }
+
+    table.validate_pk(&op.pk)?;
+
+    match &op.kind {
+        OperationKind::Insert { row } => {
+            validate_compact_row(table, row)?;
+
+            // Validate that the primary key columns in `row` match `op.pk`
+            for (pk_idx, pk_col_name) in table.primary_key.iter().enumerate() {
+                let col_idx = *table
+                    .column_indices
+                    .get(pk_col_name)
+                    .expect("primary key column must exist in column_indices");
+
+                if col_idx >= row.len() || row.values[col_idx].is_null() {
+                    return Err(ValidationError::MissingPrimaryKeyColumn {
+                        table: table.name.clone(),
+                        column: pk_col_name.clone(),
+                    });
+                }
+
+                if row.values[col_idx] != op.pk.0[pk_idx] {
+                    return Err(ValidationError::PrimaryKeyMismatch {
+                        table: table.name.clone(),
+                    });
+                }
+            }
+        }
+        OperationKind::Update { updates } => {
+            validate_column_updates(table, updates)?;
+        }
+        OperationKind::Delete => {
+            // Delete only mutates by PK, which was already verified by validate_pk above
+        }
+    }
+
+    Ok(())
 }

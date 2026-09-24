@@ -1,11 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::ops::Deref;
 
 /// Strongly typed identifier for a collaborative Room.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct RoomId(pub String);
+pub struct RoomId(String);
 
 impl RoomId {
     pub fn new(id: impl Into<String>) -> Self {
@@ -17,9 +16,8 @@ impl RoomId {
     }
 }
 
-impl Deref for RoomId {
-    type Target = str;
-    fn deref(&self) -> &Self::Target {
+impl AsRef<str> for RoomId {
+    fn as_ref(&self) -> &str {
         &self.0
     }
 }
@@ -48,10 +46,55 @@ impl From<RoomId> for String {
     }
 }
 
+/// Strongly typed identifier for a Schema definition or template.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SchemaId(String);
+
+impl SchemaId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for SchemaId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SchemaId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<String> for SchemaId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for SchemaId {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+impl From<SchemaId> for String {
+    fn from(id: SchemaId) -> Self {
+        id.0
+    }
+}
+
 /// Strongly typed identifier for a participating Client.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct ClientId(pub String);
+pub struct ClientId(String);
 
 impl ClientId {
     pub fn new(id: impl Into<String>) -> Self {
@@ -63,9 +106,8 @@ impl ClientId {
     }
 }
 
-impl Deref for ClientId {
-    type Target = str;
-    fn deref(&self) -> &Self::Target {
+impl AsRef<str> for ClientId {
+    fn as_ref(&self) -> &str {
         &self.0
     }
 }
@@ -97,7 +139,7 @@ impl From<ClientId> for String {
 /// Strictly monotonic sequence number per Room assigned by the server coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 #[serde(transparent)]
-pub struct SequenceNumber(pub u64);
+pub struct SequenceNumber(u64);
 
 impl SequenceNumber {
     pub const fn new(seq: u64) -> Self {
@@ -110,13 +152,6 @@ impl SequenceNumber {
 
     pub const fn next(&self) -> Self {
         Self(self.0 + 1)
-    }
-}
-
-impl Deref for SequenceNumber {
-    type Target = u64;
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }
 
@@ -141,7 +176,7 @@ impl From<SequenceNumber> for u64 {
 /// Unique mutation ID (UUID v4 or 16-byte random) for commit idempotency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct MutationId(pub [u8; 16]);
+pub struct MutationId([u8; 16]);
 
 impl MutationId {
     pub const fn new(bytes: [u8; 16]) -> Self {
@@ -157,9 +192,14 @@ impl MutationId {
     }
 }
 
-impl Deref for MutationId {
-    type Target = [u8; 16];
-    fn deref(&self) -> &Self::Target {
+impl AsRef<[u8]> for MutationId {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AsRef<[u8; 16]> for MutationId {
+    fn as_ref(&self) -> &[u8; 16] {
         &self.0
     }
 }
@@ -194,7 +234,7 @@ impl From<MutationId> for [u8; 16] {
 /// Correlation ID for multiplexing and pairing asynchronous requests and responses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 #[serde(transparent)]
-pub struct CorrelationId(pub u64);
+pub struct CorrelationId(u64);
 
 impl CorrelationId {
     pub const fn new(id: u64) -> Self {
@@ -203,13 +243,6 @@ impl CorrelationId {
 
     pub const fn get(&self) -> u64 {
         self.0
-    }
-}
-
-impl Deref for CorrelationId {
-    type Target = u64;
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }
 

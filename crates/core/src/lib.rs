@@ -13,15 +13,17 @@ pub mod operation {
     pub use crate::protocol::SequencedOperation;
 }
 
-pub use crypto::{CryptoEngine, CryptoError, NoOpCryptoEngine};
-pub use id::{ClientId, CorrelationId, MutationId, RoomId, SequenceNumber};
+pub use crypto::{CryptoConcurrencyBounds, CryptoEngine, CryptoError, NoOpCryptoEngine};
+pub use id::{ClientId, CorrelationId, MutationId, RoomId, SchemaId, SequenceNumber};
 pub use mutation::{
     client_squash_operations, merge_sorted_column_updates, squash_operations, BufferError,
     ColumnUpdate, Operation, OperationKind, SquashOutcome, TableBuffer, UpdateBuilder,
 };
 pub use protocol::{
-    decode_message, encode_message, ClientMessage, ErrorCode, ServerMessage, SequencedOperation,
-    MAX_MESSAGE_SIZE,
+    decode_message, decode_wal_batch_from_slice, decode_wal_record_from_slice, encode_message,
+    encode_wal_batch, encode_wal_record, replay_wal_records, ClientMessage, ErrorCode,
+    ServerMessage, SequencedOperation, WalBatchDecodeResult, WalDecodeResult, WalFrameError,
+    BATCH_HEADER_SIZE, BATCH_MAGIC, MAX_MESSAGE_SIZE,
 };
 pub use schema::{
     ColumnDef, Schema, SchemaBuilder, SchemaUpdateBuilder, TableBuilder, TableSchema,

@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 /// Dynamic strongly typed value.
 ///
 /// Memory footprint is strictly bounded to 24 bytes on 64-bit platforms
-/// by boxing heap-allocated dynamic payloads (`Box<str>` and `Box<Bytes>`)
+/// by boxing heap-allocated dynamic payloads (`Box<str>` and `Box<[u8]>`)
 /// while keeping fixed-size payloads (`[u8; 16]` for UUID) directly inline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Value {
@@ -18,7 +18,7 @@ pub enum Value {
     Timestamp(i64),
     String(Box<str>),
     Bool(bool),
-    Bytes(Box<Bytes>),
+    Bytes(Box<[u8]>),
     Uuid([u8; 16]),
 }
 
@@ -248,25 +248,25 @@ impl From<bool> for Value {
 
 impl From<Bytes> for Value {
     fn from(b: Bytes) -> Self {
-        Value::Bytes(Box::new(b))
+        Value::Bytes(b.to_vec().into_boxed_slice())
     }
 }
 
-impl From<Box<Bytes>> for Value {
-    fn from(b: Box<Bytes>) -> Self {
+impl From<Box<[u8]>> for Value {
+    fn from(b: Box<[u8]>) -> Self {
         Value::Bytes(b)
     }
 }
 
 impl From<Vec<u8>> for Value {
     fn from(v: Vec<u8>) -> Self {
-        Value::Bytes(Box::new(Bytes::from(v)))
+        Value::Bytes(v.into_boxed_slice())
     }
 }
 
 impl From<&[u8]> for Value {
     fn from(v: &[u8]) -> Self {
-        Value::Bytes(Box::new(Bytes::copy_from_slice(v)))
+        Value::Bytes(v.to_vec().into_boxed_slice())
     }
 }
 

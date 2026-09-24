@@ -1,5 +1,6 @@
-use crate::id::{ClientId, CorrelationId, MutationId, RoomId, SequenceNumber};
+use crate::id::{ClientId, CorrelationId, MutationId, RoomId, SchemaId, SequenceNumber};
 use crate::mutation::Operation;
+use crate::schema::Schema;
 use serde::{Deserialize, Serialize};
 
 /// Error codes returned by the coordination server.
@@ -14,6 +15,10 @@ pub enum ErrorCode {
     RateLimited,
     RoomLocked,
     Internal,
+    Unauthorized,
+    RoomAlreadyExists,
+    TableAlreadyExists,
+    SchemaNotFound,
 }
 
 /// An operation ordered by the coordination server with assigned sequence ID.
@@ -42,12 +47,13 @@ impl SequencedOperation {
 /// Unified message sent from Client to Server.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ClientMessage {
-    /// Commit a new validated mutation into a room with idempotency key.
+    /// Commit a new validated mutation into a room with idempotency key and client cursor for 1-RTT catch-up.
     Commit {
         correlation_id: CorrelationId,
         room_id: RoomId,
         client_id: ClientId,
         mutation_id: MutationId,
+        last_ack_seq: SequenceNumber,
         op: Operation,
     },
     /// Request delta operations starting after `last_ack_seq` with flow control limit.
@@ -65,11 +71,17 @@ pub enum ClientMessage {
         client_id: ClientId,
         last_ack_seq: SequenceNumber,
     },
-    /// Join a room as an active client.
+    /// Join a room as an active client with a signed backend authorization token.
     RegisterClient {
         correlation_id: CorrelationId,
         room_id: RoomId,
         client_id: ClientId,
+        auth_token: String,
+    },
+    /// Request current schema for a room under active evolution.
+    GetSchema {
+        correlation_id: CorrelationId,
+        room_id: RoomId,
     },
     /// Explicitly deregister a client from a room to advance retention immediately.
     DeregisterClient {
@@ -89,12 +101,14 @@ pub enum ClientMessage {
 /// Unified message sent from Server to Client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ServerMessage {
-    /// Confirmation of an accepted commit with its assigned sequence number.
+    /// Confirmation of an accepted commit with its assigned sequence number, accumulated catchup deltas and pagination flag.
     CommitAck {
         correlation_id: CorrelationId,
         room_id: RoomId,
         mutation_id: MutationId,
         assigned_seq: SequenceNumber,
+        catchup_ops: Vec<SequencedOperation>,
+        has_more: bool,
     },
     /// Batch of sequenced operations to be applied on the client with pagination flag.
     SyncBatch {
@@ -112,6 +126,8 @@ pub enum ServerMessage {
         chunk_index: u32,
         total_chunks: u32,
         total_bytes: u64,
+        /// BLAKE3 256-bit cryptographic digest of the complete concatenated snapshot payload.
+        snapshot_hash: [u8; 32],
         data: bytes::Bytes,
     },
     /// Acknowledgment of a heartbeat.
@@ -120,11 +136,20 @@ pub enum ServerMessage {
         room_id: RoomId,
         current_head_seq: SequenceNumber,
     },
-    /// Confirmation of client registration.
+    /// Confirmation of client registration, delivering the room schema and current head sequence.
     Registered {
         correlation_id: CorrelationId,
         room_id: RoomId,
         head_seq: SequenceNumber,
+        schema_id: SchemaId,
+        schema: Schema,
+    },
+    /// Room schema definition delivered in response to `GetSchema`.
+    Schema {
+        correlation_id: CorrelationId,
+        room_id: RoomId,
+        schema_id: SchemaId,
+        schema: Schema,
     },
     /// Error notification.
     Error {
@@ -134,3 +159,11 @@ pub enum ServerMessage {
         message: String,
     },
 }
+
+impl ServerMessage {
+    /// Computes the BLAKE3 256-bit cryptographic digest of an entire assembled snapshot.
+    pub fn compute_snapshot_hash(snapshot_bytes: &[u8]) -> [u8; 32] {
+        *blake3::hash(snapshot_bytes).as_bytes()
+    }
+}
+

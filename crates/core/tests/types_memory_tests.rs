@@ -80,20 +80,29 @@ fn test_uuid_data_type_primary_key_and_parsing() {
 #[test]
 fn test_newtypes_ergonomics_and_serde() {
     let room = RoomId::new("room-123");
+    let schema_id = SchemaId::new("schema-v1");
     let client = ClientId::from("client-456");
     let seq = SequenceNumber::from(42u64);
     let mutation = MutationId::from([7u8; 16]);
     let correlation = CorrelationId::from(999u64);
 
-    // Deref ergonomics
-    assert_eq!(&*room, "room-123");
-    assert_eq!(&*client, "client-456");
-    assert_eq!(*seq, 42);
-    assert_eq!(*correlation, 999);
+    // AsRef, as_str, get ergonomics (C-DEREF compliant, no Deref coercion)
+    assert_eq!(room.as_str(), "room-123");
+    assert_eq!(room.as_ref(), "room-123");
+    assert_eq!(schema_id.as_str(), "schema-v1");
+    assert_eq!(schema_id.as_ref(), "schema-v1");
+    assert_eq!(client.as_str(), "client-456");
+    assert_eq!(client.as_ref(), "client-456");
+    assert_eq!(seq.get(), 42);
+    assert_eq!(correlation.get(), 999);
+    assert_eq!(mutation.as_bytes(), &[7u8; 16]);
+    assert_eq!(AsRef::<[u8; 16]>::as_ref(&mutation), &[7u8; 16]);
+    assert_eq!(AsRef::<[u8]>::as_ref(&mutation), &[7u8; 16][..]);
     assert_eq!(seq.next(), SequenceNumber::new(43));
 
     // Display
     assert_eq!(format!("{}", room), "room-123");
+    assert_eq!(format!("{}", schema_id), "schema-v1");
     assert_eq!(format!("{}", client), "client-456");
     assert_eq!(format!("{}", seq), "42");
     assert_eq!(format!("{}", mutation), "07070707070707070707070707070707");
@@ -102,6 +111,10 @@ fn test_newtypes_ergonomics_and_serde() {
     let encoded_room = bincode::serialize(&room).unwrap();
     let encoded_raw_str = bincode::serialize("room-123").unwrap();
     assert_eq!(encoded_room, encoded_raw_str);
+
+    let encoded_schema = bincode::serialize(&schema_id).unwrap();
+    let encoded_raw_schema_str = bincode::serialize("schema-v1").unwrap();
+    assert_eq!(encoded_schema, encoded_raw_schema_str);
 
     let encoded_seq = bincode::serialize(&seq).unwrap();
     let encoded_raw_u64 = bincode::serialize(&42u64).unwrap();

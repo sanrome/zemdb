@@ -9,7 +9,7 @@ pub const MAX_MESSAGE_SIZE: u64 = 16 * 1024 * 1024;
 pub fn encode_message<T: Serialize>(msg: &T) -> Result<Vec<u8>, bincode::Error> {
     bincode::DefaultOptions::new()
         .with_limit(MAX_MESSAGE_SIZE)
-        .allow_trailing_bytes()
+        .reject_trailing_bytes()
         .serialize(msg)
 }
 
@@ -21,6 +21,6 @@ pub fn decode_message<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, binc
     }
     bincode::DefaultOptions::new()
         .with_limit(MAX_MESSAGE_SIZE)
-        .allow_trailing_bytes()
+        .reject_trailing_bytes()
         .deserialize(bytes)
 }

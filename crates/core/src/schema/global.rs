@@ -2,7 +2,7 @@ use super::table::TableSchema;
 use super::validation::{self, ValidationError};
 use crate::mutation::Operation;
 use crate::value::{PrimaryKey, Row, Value};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
 /// Builder for constructing Schema instances declaratively.
@@ -39,10 +39,55 @@ impl SchemaBuilder {
 }
 
 /// Global database schema containing all tables in a Room with bidirectional ID/Name indexing.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Schema {
     pub tables_by_id: BTreeMap<u16, TableSchema>,
+    #[serde(skip)]
     pub id_by_name: BTreeMap<String, u16>,
+}
+
+impl<'de> Deserialize<'de> for Schema {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            #[derive(Deserialize)]
+            struct HumanSchemaHelper {
+                #[serde(default)]
+                tables_by_id: BTreeMap<u16, TableSchema>,
+                #[serde(default)]
+                tables: Vec<TableSchema>,
+            }
+            let helper = HumanSchemaHelper::deserialize(deserializer)?;
+            if !helper.tables.is_empty() {
+                Ok(Schema::from_tables(helper.tables))
+            } else {
+                let mut id_by_name = BTreeMap::new();
+                for (id, table) in &helper.tables_by_id {
+                    id_by_name.insert(table.name.clone(), *id);
+                }
+                Ok(Schema {
+                    tables_by_id: helper.tables_by_id,
+                    id_by_name,
+                })
+            }
+        } else {
+            #[derive(Deserialize)]
+            struct BinarySchemaHelper {
+                tables_by_id: BTreeMap<u16, TableSchema>,
+            }
+            let helper = BinarySchemaHelper::deserialize(deserializer)?;
+            let mut id_by_name = BTreeMap::new();
+            for (id, table) in &helper.tables_by_id {
+                id_by_name.insert(table.name.clone(), *id);
+            }
+            Ok(Schema {
+                tables_by_id: helper.tables_by_id,
+                id_by_name,
+            })
+        }
+    }
 }
 
 impl Schema {
@@ -55,6 +100,15 @@ impl Schema {
 
     pub fn builder() -> SchemaBuilder {
         SchemaBuilder::new()
+    }
+
+    /// Constructs a Schema from an iterable of TableSchema, auto-assigning IDs and building indexes.
+    pub fn from_tables(tables: impl IntoIterator<Item = TableSchema>) -> Self {
+        let mut builder = Self::builder();
+        for table in tables {
+            builder = builder.table(table);
+        }
+        builder.build()
     }
 
     pub fn add_table(&mut self, mut table: TableSchema) {
@@ -105,6 +159,14 @@ impl Schema {
 
     pub fn validate_delete(&self, table: &str, pk: &PrimaryKey) -> Result<(), ValidationError> {
         validation::validate_delete(self, table, pk)
+    }
+
+    /// Validates an Operation against the corresponding TableSchema by table_id.
+    pub fn validate_operation(&self, op: &Operation) -> Result<(), ValidationError> {
+        let t = self
+            .get_table_by_id(op.table_id)
+            .ok_or_else(|| ValidationError::TableNotFound(format!("id:{}", op.table_id)))?;
+        t.validate_operation(op)
     }
 
     pub fn to_operation_insert(

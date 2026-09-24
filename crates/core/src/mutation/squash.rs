@@ -1,4 +1,5 @@
 use super::op::{ColumnUpdate, Operation, OperationKind};
+use crate::value::Value;
 
 /// Result of attempting to squash two sequential operations for the same PK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,18 +74,20 @@ pub fn squash_operations(
             if incoming.timestamp >= existing.timestamp {
                 for u in updates {
                     let idx = u.column_idx as usize;
-                    if let Some(slot) = row.values.get_mut(idx) {
-                        *slot = u.value; // Move semantics: 0 clones
+                    if idx >= row.values.len() {
+                        row.values.resize(idx + 1, Value::Null);
                     }
+                    row.values[idx] = u.value; // Move semantics: 0 clones
                 }
                 existing.timestamp = incoming.timestamp;
             } else {
                 for u in updates {
                     let idx = u.column_idx as usize;
-                    if let Some(slot) = row.values.get_mut(idx) {
-                        if slot.is_null() {
-                            *slot = u.value;
-                        }
+                    if idx >= row.values.len() {
+                        row.values.resize(idx + 1, Value::Null);
+                    }
+                    if row.values[idx].is_null() {
+                        row.values[idx] = u.value;
                     }
                 }
             }
@@ -140,9 +143,10 @@ pub fn squash_operations(
                     OperationKind::Update { updates } => {
                         for u in updates.drain(..) {
                             let idx = u.column_idx as usize;
-                            if let Some(slot) = row.values.get_mut(idx) {
-                                *slot = u.value; // Move semantics: 0 clones
+                            if idx >= row.values.len() {
+                                row.values.resize(idx + 1, Value::Null);
                             }
+                            row.values[idx] = u.value; // Move semantics: 0 clones
                         }
                         *target_kind = OperationKind::Insert { row };
                         SquashOutcome::Merged
