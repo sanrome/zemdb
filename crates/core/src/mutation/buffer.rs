@@ -1,15 +1,14 @@
-use super::op::TableOperation;
-use super::squash::{client_squash_table_operations, SquashOutcome};
+use super::op::Operation;
+use super::squash::{client_squash_operations, SquashOutcome};
 use crate::value::PrimaryKey;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// Error returned when an operation cannot be applied to `TableBuffer`.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BufferError {
-    #[error("Incompatible operation for table '{table}': entity state forbids this transition")]
-    IncompatibleOperation { table: String },
+    #[error("Incompatible operation for table_id '{table_id}': entity state forbids this transition")]
+    IncompatibleOperation { table_id: u16 },
 }
 
 /// In-memory mutation buffer for a single table.
@@ -17,14 +16,14 @@ pub enum BufferError {
 /// Collects pending mutations partitioned by PK and applies squashing automatically.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct TableBuffer {
-    pub table: Arc<str>,
-    pub pending: HashMap<PrimaryKey, TableOperation>,
+    pub table_id: u16,
+    pub pending: HashMap<PrimaryKey, Operation>,
 }
 
 impl TableBuffer {
-    pub fn new(table: impl Into<Arc<str>>) -> Self {
+    pub fn new(table_id: u16) -> Self {
         Self {
-            table: table.into(),
+            table_id,
             pending: HashMap::new(),
         }
     }
@@ -33,12 +32,18 @@ impl TableBuffer {
     ///
     /// Avoids unconditional cloning of the primary key by inspecting existing entries first.
     /// Returns `Err(BufferError::IncompatibleOperation)` if the mutation transition is incompatible.
-    pub fn apply(&mut self, op: TableOperation) -> Result<SquashOutcome, BufferError> {
+    pub fn apply(&mut self, op: Operation) -> Result<SquashOutcome, BufferError> {
+        if op.table_id != self.table_id {
+            return Err(BufferError::IncompatibleOperation {
+                table_id: self.table_id,
+            });
+        }
+
         if let Some(existing) = self.pending.get_mut(&op.pk) {
-            let outcome = client_squash_table_operations(existing, op);
+            let outcome = client_squash_operations(existing, op);
             if outcome == SquashOutcome::Incompatible {
                 return Err(BufferError::IncompatibleOperation {
-                    table: self.table.to_string(),
+                    table_id: self.table_id,
                 });
             }
             Ok(outcome)
@@ -50,17 +55,17 @@ impl TableBuffer {
     }
 
     #[inline]
-    pub fn get(&self, pk: &PrimaryKey) -> Option<&TableOperation> {
+    pub fn get(&self, pk: &PrimaryKey) -> Option<&Operation> {
         self.pending.get(pk)
     }
 
     #[inline]
-    pub fn get_mut(&mut self, pk: &PrimaryKey) -> Option<&mut TableOperation> {
+    pub fn get_mut(&mut self, pk: &PrimaryKey) -> Option<&mut Operation> {
         self.pending.get_mut(pk)
     }
 
     #[inline]
-    pub fn remove(&mut self, pk: &PrimaryKey) -> Option<TableOperation> {
+    pub fn remove(&mut self, pk: &PrimaryKey) -> Option<Operation> {
         self.pending.remove(pk)
     }
 
@@ -75,7 +80,7 @@ impl TableBuffer {
     }
 
     #[inline]
-    pub fn drain(&mut self) -> impl Iterator<Item = (PrimaryKey, TableOperation)> + '_ {
+    pub fn drain(&mut self) -> impl Iterator<Item = (PrimaryKey, Operation)> + '_ {
         self.pending.drain()
     }
 }

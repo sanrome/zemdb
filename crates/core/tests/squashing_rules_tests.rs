@@ -16,7 +16,7 @@ fn sample_schema() -> Schema {
 #[test]
 fn test_squash_insert_then_update() {
     let schema = sample_schema();
-    let table = schema.get_table("users").unwrap();
+    let table = schema.get_table_by_name("users").unwrap();
     let row = RowBuilder::new()
         .set("id", 10i64)
         .set("name", "Alice")
@@ -49,7 +49,7 @@ fn test_squash_insert_then_update() {
 #[test]
 fn test_squash_update_then_update_field_merge() {
     let schema = sample_schema();
-    let table = schema.get_table("users").unwrap();
+    let table = schema.get_table_by_name("users").unwrap();
     let pk = PrimaryKey::single(10i64);
 
     let mut base_op = table
@@ -83,9 +83,9 @@ fn test_squash_update_then_update_field_merge() {
 #[test]
 fn test_anti_zombie_rule_delete_then_update_rejected() {
     let schema = sample_schema();
-    let table = schema.get_table("users").unwrap();
+    let table = schema.get_table_by_name("users").unwrap();
     let pk = PrimaryKey::single(1i64);
-    let mut del_op = Operation::delete("users", pk.clone(), 100);
+    let mut del_op = Operation::delete(table.table_id, pk.clone(), 100);
     let up_op = table
         .update_builder(pk.clone())
         .set("name", "Zombie Alice")
@@ -113,7 +113,7 @@ fn test_anti_zombie_rule_delete_then_update_rejected() {
 #[test]
 fn test_squash_insert_then_delete() {
     let schema = sample_schema();
-    let table = schema.get_table("users").unwrap();
+    let table = schema.get_table_by_name("users").unwrap();
     let row = RowBuilder::new()
         .set("id", 1i64)
         .set("name", "Alice")
@@ -123,7 +123,7 @@ fn test_squash_insert_then_delete() {
     let pk = PrimaryKey::single(1i64);
 
     let mut base_op = table.to_operation_insert(&row, 100).unwrap();
-    let incoming = Operation::delete("users", pk, 200);
+    let incoming = Operation::delete(table.table_id, pk, 200);
 
     let outcome = client_squash_operations(&mut base_op, incoming.clone());
     assert_eq!(outcome, SquashOutcome::Replaced);
@@ -133,7 +133,7 @@ fn test_squash_insert_then_delete() {
 #[test]
 fn test_squash_older_insert_into_newer_update_preserves_data() {
     let schema = sample_schema();
-    let table = schema.get_table("users").unwrap();
+    let table = schema.get_table_by_name("users").unwrap();
     let pk = PrimaryKey::single(42i64);
     let mut target_op = table
         .update_builder(pk.clone())
@@ -168,8 +168,8 @@ fn test_squash_older_insert_into_newer_update_preserves_data() {
 #[test]
 fn test_table_buffer_partitioned_squashing() {
     let schema = sample_schema();
-    let table = schema.get_table("users").unwrap();
-    let mut buffer = TableBuffer::new("users");
+    let table = schema.get_table_by_name("users").unwrap();
+    let mut buffer = TableBuffer::new(table.table_id);
 
     let row1 = RowBuilder::new()
         .set("id", 1i64)
@@ -177,7 +177,7 @@ fn test_table_buffer_partitioned_squashing() {
         .set("age", 25i64)
         .set("secret_chat", vec![1, 2, 3])
         .build();
-    let op1 = table.to_table_insert(&row1, 100).unwrap();
+    let op1 = table.to_operation_insert(&row1, 100).unwrap();
 
     let row2 = RowBuilder::new()
         .set("id", 2i64)
@@ -185,7 +185,7 @@ fn test_table_buffer_partitioned_squashing() {
         .set("age", 40i64)
         .set("secret_chat", vec![4, 5, 6])
         .build();
-    let op2 = table.to_table_insert(&row2, 100).unwrap();
+    let op2 = table.to_operation_insert(&row2, 100).unwrap();
 
     assert_eq!(buffer.apply(op1), Ok(SquashOutcome::Replaced));
     assert_eq!(buffer.apply(op2), Ok(SquashOutcome::Replaced));
@@ -196,7 +196,7 @@ fn test_table_buffer_partitioned_squashing() {
         .update_builder(PrimaryKey::single(1i64))
         .set("age", 26i64)
         .timestamp(150)
-        .build_table_op()
+        .build()
         .unwrap();
     assert_eq!(buffer.apply(up_alice), Ok(SquashOutcome::Merged));
     assert_eq!(buffer.len(), 2);
@@ -211,7 +211,7 @@ fn test_table_buffer_partitioned_squashing() {
     }
 
     // Delete Bob
-    let del_bob = TableOperation::delete(PrimaryKey::single(2i64), 200);
+    let del_bob = Operation::delete(table.table_id, PrimaryKey::single(2i64), 200);
     assert_eq!(buffer.apply(del_bob), Ok(SquashOutcome::Replaced));
 
     let bob_op = buffer.get(&PrimaryKey::single(2i64)).unwrap();
@@ -222,13 +222,13 @@ fn test_table_buffer_partitioned_squashing() {
         .update_builder(PrimaryKey::single(2i64))
         .set("age", 50i64)
         .timestamp(250)
-        .build_table_op()
+        .build()
         .unwrap();
     let err = buffer.apply(up_bob).unwrap_err();
     assert_eq!(
         err,
         BufferError::IncompatibleOperation {
-            table: "users".to_string()
+            table_id: table.table_id
         }
     );
 }
@@ -252,38 +252,4 @@ fn test_two_pointer_column_merge_linear() {
     let indices: Vec<u16> = existing.iter().map(|u| u.column_idx).collect();
     assert_eq!(indices, vec![0, 1, 3, 4, 5, 6]);
     assert_eq!(existing[2].value, Value::String("new".into())); // incoming won
-}
-
-#[test]
-fn test_server_squash_total_order_precedence() {
-    let schema = sample_schema();
-    let table = schema.get_table("users").unwrap();
-
-    let row = RowBuilder::new()
-        .set("id", 1i64)
-        .set("name", "Alice")
-        .set("age", 25i64)
-        .set("secret_chat", vec![1, 2, 3])
-        .build();
-
-    let mut op1 = table.to_operation_insert(&row, 100).unwrap();
-
-    // Even if client clock is skewed backwards (timestamp 50 < 100),
-    // server_squash respects arrival order!
-    let up_alice = table
-        .update_builder(PrimaryKey::single(1i64))
-        .set("age", 30i64)
-        .timestamp(50)
-        .build()
-        .unwrap();
-
-    let outcome = server_squash_operations(&mut op1, up_alice);
-    assert_eq!(outcome, SquashOutcome::Merged);
-
-    if let OperationKind::Insert { row } = &op1.kind {
-        let restored = table.from_compact_row(row).unwrap();
-        assert_eq!(restored.get("age"), Some(&Value::Int(30)));
-    } else {
-        panic!("Expected Insert");
-    }
 }

@@ -10,6 +10,9 @@ pub enum StorageError {
     #[error("Room '{0}' is already opened")]
     RoomAlreadyOpen(RoomId),
 
+    #[error("Room '{0}' file is locked by another process")]
+    RoomLocked(RoomId),
+
     #[error("Table '{table}' not found in room '{room_id}'")]
     TableNotFound { room_id: RoomId, table: String },
 

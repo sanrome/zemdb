@@ -12,7 +12,19 @@ rimdb-core = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true }
+zstd = { workspace = true }
+crc32fast = { workspace = true }
+fs2 = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1.38", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

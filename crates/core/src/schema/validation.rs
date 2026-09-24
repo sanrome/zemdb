@@ -223,7 +223,7 @@ pub fn validate_insert(
     row: &Row,
 ) -> Result<PrimaryKey, ValidationError> {
     let t = schema
-        .get_table(table)
+        .get_table_by_name(table)
         .ok_or_else(|| ValidationError::TableNotFound(table.to_string()))?;
     t.validate_row(row)?;
     t.extract_pk(row)
@@ -237,7 +237,7 @@ pub fn validate_update(
     fields: &BTreeMap<String, Value>,
 ) -> Result<(), ValidationError> {
     let t = schema
-        .get_table(table)
+        .get_table_by_name(table)
         .ok_or_else(|| ValidationError::TableNotFound(table.to_string()))?;
 
     t.validate_pk(pk)?;
@@ -251,7 +251,7 @@ pub fn validate_delete(
     pk: &PrimaryKey,
 ) -> Result<(), ValidationError> {
     let t = schema
-        .get_table(table)
+        .get_table_by_name(table)
         .ok_or_else(|| ValidationError::TableNotFound(table.to_string()))?;
 
     t.validate_pk(pk)

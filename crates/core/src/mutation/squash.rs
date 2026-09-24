@@ -1,4 +1,4 @@
-use super::op::{ColumnUpdate, Operation, OperationKind, TableOperation};
+use super::op::{ColumnUpdate, Operation, OperationKind};
 
 /// Result of attempting to squash two sequential operations for the same PK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,7 +9,7 @@ pub enum SquashOutcome {
     Replaced,
     /// The incoming operation was obsolete or a no-op and was discarded (existing remains unchanged).
     Discarded,
-    /// Operations cannot be squashed (e.g. different table, PK, or invalid transition like Delete followed by Update).
+    /// Operations cannot be squashed (e.g. different table_id, PK, or invalid transition like Delete followed by Update).
     Incompatible,
 }
 
@@ -58,12 +58,12 @@ pub fn merge_sorted_column_updates(
     *existing = merged;
 }
 
-/// Merges an incoming TableOperation into an existing pending TableOperation for the same PK (Client-side LWW by timestamp).
-pub fn client_squash_table_operations(
-    existing: &mut TableOperation,
-    incoming: TableOperation,
+/// Merges an incoming Operation into an existing pending Operation for the same table_id and PK (Client-side LWW by timestamp).
+pub fn squash_operations(
+    existing: &mut Operation,
+    incoming: Operation,
 ) -> SquashOutcome {
-    if existing.pk != incoming.pk {
+    if existing.table_id != incoming.table_id || existing.pk != incoming.pk {
         return SquashOutcome::Incompatible;
     }
 
@@ -155,77 +155,4 @@ pub fn client_squash_table_operations(
     }
 }
 
-/// Squashes an incoming TableOperation in server-authoritative mode.
-///
-/// In this mode, order is determined strictly by sequencer arrival order (monotonically
-/// increasing sequence number), eliminating dependency on client clocks for conflict resolution.
-pub fn server_squash_table_operations(
-    existing: &mut TableOperation,
-    incoming: TableOperation,
-) -> SquashOutcome {
-    if existing.pk != incoming.pk {
-        return SquashOutcome::Incompatible;
-    }
-
-    match (&mut existing.kind, incoming.kind) {
-        // Rule 1: INSERT followed by UPDATE -> direct slot update on CompactRow
-        (OperationKind::Insert { row }, OperationKind::Update { updates }) => {
-            for u in updates {
-                let idx = u.column_idx as usize;
-                if let Some(slot) = row.values.get_mut(idx) {
-                    *slot = u.value;
-                }
-            }
-            existing.timestamp = incoming.timestamp;
-            SquashOutcome::Merged
-        }
-
-        // Rule 2: UPDATE followed by UPDATE -> two-pointer merge with incoming winning
-        (
-            OperationKind::Update {
-                updates: existing_updates,
-            },
-            OperationKind::Update {
-                updates: incoming_updates,
-            },
-        ) => {
-            merge_sorted_column_updates(existing_updates, incoming_updates, true);
-            existing.timestamp = incoming.timestamp;
-            SquashOutcome::Merged
-        }
-
-        // Rule 3: DELETE followed by UPDATE (Anti-Zombie rule)
-        // A partial update CANNOT resurrect a deleted entity.
-        (OperationKind::Delete, OperationKind::Update { .. }) => SquashOutcome::Incompatible,
-
-        // Rule 4: Any operation followed by DELETE -> becomes DELETE
-        (target_kind, OperationKind::Delete) => {
-            *target_kind = OperationKind::Delete;
-            existing.timestamp = incoming.timestamp;
-            SquashOutcome::Replaced
-        }
-
-        // Rule 5: Any operation followed by INSERT -> replaces
-        (target_kind, OperationKind::Insert { row }) => {
-            *target_kind = OperationKind::Insert { row };
-            existing.timestamp = incoming.timestamp;
-            SquashOutcome::Replaced
-        }
-    }
-}
-
-/// Merges an incoming operation into an existing pending operation for the same table and PK (Client-side LWW by timestamp).
-pub fn client_squash_operations(existing: &mut Operation, incoming: Operation) -> SquashOutcome {
-    if existing.table != incoming.table {
-        return SquashOutcome::Incompatible;
-    }
-    client_squash_table_operations(&mut existing.op, incoming.op)
-}
-
-/// Squashes an incoming operation in server-authoritative mode (Strict sequencer order).
-pub fn server_squash_operations(existing: &mut Operation, incoming: Operation) -> SquashOutcome {
-    if existing.table != incoming.table {
-        return SquashOutcome::Incompatible;
-    }
-    server_squash_table_operations(&mut existing.op, incoming.op)
-}
+pub use squash_operations as client_squash_operations;

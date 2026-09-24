@@ -24,7 +24,7 @@ fn test_protocol_binary_serialization_roundtrip() {
         room_id: RoomId::new("room-abc"),
         client_id: ClientId::new("client-1"),
         mutation_id,
-        op: Operation::insert("notes", PrimaryKey::single(42i64), compact, 500),
+        op: Operation::insert(0, PrimaryKey::single(42i64), compact, 500),
     };
 
     let encoded = encode_message(&client_msg).expect("serialization failed");
@@ -37,9 +37,7 @@ fn test_protocol_binary_serialization_roundtrip() {
         head_seq: SequenceNumber::new(150),
         ops: vec![SequencedOperation {
             seq: SequenceNumber::new(150),
-            client_id: ClientId::new("client-1"),
-            mutation_id: MutationId::from_u128(999),
-            op: Operation::delete("notes", PrimaryKey::single(42i64), 1000),
+            op: Operation::delete(0, PrimaryKey::single(42i64), 1000),
         }],
         has_more: false,
     };
@@ -58,4 +56,29 @@ fn test_protocol_binary_serialization_roundtrip() {
     let encoded_dereg = encode_message(&dereg_msg).expect("serialization failed");
     let decoded_dereg: ClientMessage = decode_message(&encoded_dereg).expect("deserialization failed");
     assert_eq!(dereg_msg, decoded_dereg);
+
+    // Test RequestSnapshotChunk roundtrip
+    let req_chunk = ClientMessage::RequestSnapshotChunk {
+        correlation_id: CorrelationId::new(1003),
+        room_id: RoomId::new("room-abc"),
+        chunk_index: 2,
+        chunk_size: 4 * 1024 * 1024,
+    };
+    let enc_req = encode_message(&req_chunk).expect("serialization failed");
+    let dec_req: ClientMessage = decode_message(&enc_req).expect("deserialization failed");
+    assert_eq!(req_chunk, dec_req);
+
+    // Test SnapshotChunk roundtrip
+    let snap_chunk = ServerMessage::SnapshotChunk {
+        correlation_id: CorrelationId::new(1003),
+        room_id: RoomId::new("room-abc"),
+        snapshot_head_seq: SequenceNumber::new(500),
+        chunk_index: 2,
+        total_chunks: 10,
+        total_bytes: 40 * 1024 * 1024,
+        data: bytes::Bytes::from_static(b"snapshot payload chunk 2 data..."),
+    };
+    let enc_chunk = encode_message(&snap_chunk).expect("serialization failed");
+    let dec_chunk: ServerMessage = decode_message(&enc_chunk).expect("deserialization failed");
+    assert_eq!(snap_chunk, dec_chunk);
 }

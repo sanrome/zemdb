@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use futures::Stream;
-use rimdb_core::{CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation};
+use rimdb_core::{CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation, Value};
 use std::pin::Pin;
 
 use crate::error::StorageError;
@@ -75,4 +75,81 @@ pub trait StorageEngine: EngineConcurrencyBounds {
         schema: Schema,
         snapshot: &[u8],
     ) -> Result<SequenceNumber, StorageError>;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) type ScanIterator<'a> =
+    Box<dyn Iterator<Item = Result<(PrimaryKey, CompactRow), StorageError>> + Send + 'a>;
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) type ScanIterator<'a> =
+    Box<dyn Iterator<Item = Result<(PrimaryKey, CompactRow), StorageError>> + 'a>;
+
+/// Helper to apply column projection and limit pushdowns lazily over an iterator of rows without eager allocation.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn apply_scan_transforms<'a, I>(
+    iter: I,
+    projection: Option<Vec<u16>>,
+    limit: Option<usize>,
+) -> ScanIterator<'a>
+where
+    I: Iterator<Item = (&'a PrimaryKey, &'a CompactRow)> + Send + 'a,
+{
+    let mapped = iter.map(move |(pk, row)| {
+        let row_to_return = match &projection {
+            Some(indices) => {
+                let values = indices
+                    .iter()
+                    .map(|&idx| {
+                        row.values
+                            .get(idx as usize)
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect();
+                CompactRow::new(values)
+            }
+            None => row.clone(),
+        };
+        Ok((pk.clone(), row_to_return))
+    });
+
+    match limit {
+        Some(limit) => Box::new(mapped.take(limit)),
+        None => Box::new(mapped),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn apply_scan_transforms<'a, I>(
+    iter: I,
+    projection: Option<Vec<u16>>,
+    limit: Option<usize>,
+) -> ScanIterator<'a>
+where
+    I: Iterator<Item = (&'a PrimaryKey, &'a CompactRow)> + 'a,
+{
+    let mapped = iter.map(move |(pk, row)| {
+        let row_to_return = match &projection {
+            Some(indices) => {
+                let values = indices
+                    .iter()
+                    .map(|&idx| {
+                        row.values
+                            .get(idx as usize)
+                            .cloned()
+                            .unwrap_or(Value::Null)
+                    })
+                    .collect();
+                CompactRow::new(values)
+            }
+            None => row.clone(),
+        };
+        Ok((pk.clone(), row_to_return))
+    });
+
+    match limit {
+        Some(limit) => Box::new(mapped.take(limit)),
+        None => Box::new(mapped),
+    }
 }

@@ -159,7 +159,7 @@ fn test_schema_validates_pk_type_on_update_and_delete() {
 #[test]
 fn test_schema_update_cannot_modify_pk() {
     let schema = sample_schema();
-    let table = schema.get_table("users").unwrap();
+    let table = schema.get_table_by_name("users").unwrap();
     let mut fields = BTreeMap::new();
     fields.insert("id".to_string(), Value::Int(2));
     let err = table.compact_update_fields(&fields).unwrap_err();
@@ -175,7 +175,7 @@ fn test_schema_update_cannot_modify_pk() {
 #[test]
 fn test_compact_row_conversion() {
     let schema = sample_schema();
-    let table = schema.get_table("users").unwrap();
+    let table = schema.get_table_by_name("users").unwrap();
     let row = RowBuilder::new()
         .set("id", 99i64)
         .set("name", "Carol")
@@ -195,7 +195,7 @@ fn test_compact_row_conversion() {
 #[test]
 fn test_compact_row_arity_mismatch_rejected() {
     let schema = sample_schema();
-    let table = schema.get_table("users").unwrap();
+    let table = schema.get_table_by_name("users").unwrap();
     // Table has 5 columns: id, name, age, bio, secret_chat
     let invalid_compact = CompactRow::new(vec![Value::Int(1), Value::String("Alice".into())]);
 
@@ -244,7 +244,7 @@ fn test_table_schema_preserves_ddl_definition_order() {
 #[test]
 fn test_zero_copy_row_conversions() {
     let schema = sample_schema();
-    let table = schema.get_table("users").unwrap();
+    let table = schema.get_table_by_name("users").unwrap();
     let row = RowBuilder::new()
         .set("id", 99i64)
         .set("name", "Carol")

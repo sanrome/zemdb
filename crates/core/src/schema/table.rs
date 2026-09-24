@@ -1,6 +1,6 @@
 use super::column::ColumnDef;
 use super::validation::{self, ValidationError};
-use crate::mutation::{ColumnUpdate, Operation, TableOperation};
+use crate::mutation::{ColumnUpdate, Operation};
 use crate::value::{CompactRow, DataType, PrimaryKey, Row, Value};
 use serde::{Deserialize, Deserializer, Serialize};
 use smallvec::SmallVec;
@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 /// Builder for constructing TableSchema instances declaratively.
 #[derive(Debug, Clone)]
 pub struct TableBuilder {
+    table_id: u16,
     name: String,
     primary_key: Vec<String>,
     columns: Vec<ColumnDef>,
@@ -17,10 +18,17 @@ pub struct TableBuilder {
 impl TableBuilder {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
+            table_id: 0,
             name: name.into(),
             primary_key: Vec::new(),
             columns: Vec::new(),
         }
+    }
+
+    /// Sets an explicit table_id for this table.
+    pub fn table_id(mut self, id: u16) -> Self {
+        self.table_id = id;
+        self
     }
 
     /// Declares a primary key column, recording both its name and data type.
@@ -127,6 +135,7 @@ impl TableBuilder {
         }
 
         Ok(TableSchema {
+            table_id: self.table_id,
             name: self.name,
             primary_key: self.primary_key,
             columns: self.columns,
@@ -142,6 +151,7 @@ impl TableBuilder {
 /// while providing O(log C) column lookups via `column_indices`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TableSchema {
+    pub table_id: u16,
     pub name: String,
     pub primary_key: Vec<String>,
     pub columns: Vec<ColumnDef>,
@@ -156,6 +166,8 @@ impl<'de> Deserialize<'de> for TableSchema {
     {
         #[derive(Deserialize)]
         struct TableSchemaHelper {
+            #[serde(default)]
+            table_id: u16,
             name: String,
             primary_key: Vec<String>,
             columns: Vec<ColumnDef>,
@@ -166,6 +178,7 @@ impl<'de> Deserialize<'de> for TableSchema {
             column_indices.insert(col.name.clone(), i);
         }
         Ok(TableSchema {
+            table_id: helper.table_id,
             name: helper.name,
             primary_key: helper.primary_key,
             columns: helper.columns,
@@ -311,48 +324,37 @@ impl TableSchema {
         Ok(fields)
     }
 
-    /// Validates a Row and compiles it into a dense `TableOperation::insert`.
-    pub fn to_table_insert(
-        &self,
-        row: &Row,
-        timestamp: u64,
-    ) -> Result<TableOperation, ValidationError> {
-        let pk = self.extract_pk(row)?;
-        let compact = self.to_compact_row(row)?;
-        Ok(TableOperation::insert(pk, compact, timestamp))
-    }
-
-    /// Validates an update payload and compiles it into a dense `TableOperation::update`.
-    pub fn to_table_update(
-        &self,
-        pk: PrimaryKey,
-        fields: &BTreeMap<String, Value>,
-        timestamp: u64,
-    ) -> Result<TableOperation, ValidationError> {
-        self.validate_pk(&pk)?;
-        let updates = self.compact_update_fields(fields)?;
-        Ok(TableOperation::update(pk, updates, timestamp))
-    }
-
-    /// Validates a Row and compiles it into a self-describing `Operation::insert`.
+    /// Validates a Row and compiles it into an `Operation::insert`.
     pub fn to_operation_insert(
         &self,
         row: &Row,
         timestamp: u64,
     ) -> Result<Operation, ValidationError> {
-        let table_op = self.to_table_insert(row, timestamp)?;
-        Ok(Operation::new(self.name.clone(), table_op))
+        let pk = self.extract_pk(row)?;
+        let compact = self.to_compact_row(row)?;
+        Ok(Operation::insert(self.table_id, pk, compact, timestamp))
     }
 
-    /// Validates an update payload and compiles it into a self-describing `Operation::update`.
+    /// Validates an update payload and compiles it into an `Operation::update`.
     pub fn to_operation_update(
         &self,
         pk: PrimaryKey,
         fields: &BTreeMap<String, Value>,
         timestamp: u64,
     ) -> Result<Operation, ValidationError> {
-        let table_op = self.to_table_update(pk, fields, timestamp)?;
-        Ok(Operation::new(self.name.clone(), table_op))
+        self.validate_pk(&pk)?;
+        let updates = self.compact_update_fields(fields)?;
+        Ok(Operation::update(self.table_id, pk, updates, timestamp))
+    }
+
+    /// Validates a PK and compiles it into an `Operation::delete`.
+    pub fn to_operation_delete(
+        &self,
+        pk: PrimaryKey,
+        timestamp: u64,
+    ) -> Result<Operation, ValidationError> {
+        self.validate_pk(&pk)?;
+        Ok(Operation::delete(self.table_id, pk, timestamp))
     }
 
     /// Creates a fluent update builder for this table using column names.
@@ -393,10 +395,5 @@ impl<'a> SchemaUpdateBuilder<'a> {
     pub fn build(self) -> Result<Operation, ValidationError> {
         self.schema
             .to_operation_update(self.pk, &self.fields, self.timestamp)
-    }
-
-    pub fn build_table_op(self) -> Result<TableOperation, ValidationError> {
-        self.schema
-            .to_table_update(self.pk, &self.fields, self.timestamp)
     }
 }

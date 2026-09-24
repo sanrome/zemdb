@@ -16,38 +16,26 @@ pub enum ErrorCode {
     Internal,
 }
 
-/// An operation ordered by the coordination server with origin attribution and assigned sequence ID.
+/// An operation ordered by the coordination server with assigned sequence ID.
+///
+/// Bounded strictly to 96 bytes (8B SequenceNumber + 88B Operation).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SequencedOperation {
     pub seq: SequenceNumber,
-    pub client_id: ClientId,
-    pub mutation_id: MutationId,
     pub op: Operation,
 }
 
 impl SequencedOperation {
-    pub fn new(
-        seq: impl Into<SequenceNumber>,
-        client_id: impl Into<ClientId>,
-        mutation_id: impl Into<MutationId>,
-        op: Operation,
-    ) -> Self {
+    pub fn new(seq: impl Into<SequenceNumber>, op: Operation) -> Self {
         Self {
             seq: seq.into(),
-            client_id: client_id.into(),
-            mutation_id: mutation_id.into(),
             op,
         }
     }
 
-    /// Helper constructor creating a sequenced operation with default system origin attribution.
+    /// Ergonomic alias for tests.
     pub fn with_default_origin(seq: impl Into<SequenceNumber>, op: Operation) -> Self {
-        Self {
-            seq: seq.into(),
-            client_id: ClientId::new("system"),
-            mutation_id: MutationId::from_u128(0),
-            op,
-        }
+        Self::new(seq, op)
     }
 }
 
@@ -89,6 +77,13 @@ pub enum ClientMessage {
         room_id: RoomId,
         client_id: ClientId,
     },
+    /// Request a specific chunk of the room base snapshot for bootstrapping datasets > 16 MB.
+    RequestSnapshotChunk {
+        correlation_id: CorrelationId,
+        room_id: RoomId,
+        chunk_index: u32,
+        chunk_size: u32,
+    },
 }
 
 /// Unified message sent from Server to Client.
@@ -108,6 +103,16 @@ pub enum ServerMessage {
         head_seq: SequenceNumber,
         ops: Vec<SequencedOperation>,
         has_more: bool,
+    },
+    /// Chunk of the base room snapshot during multipart bootstrapping.
+    SnapshotChunk {
+        correlation_id: CorrelationId,
+        room_id: RoomId,
+        snapshot_head_seq: SequenceNumber,
+        chunk_index: u32,
+        total_chunks: u32,
+        total_bytes: u64,
+        data: bytes::Bytes,
     },
     /// Acknowledgment of a heartbeat.
     HeartbeatAck {

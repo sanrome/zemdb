@@ -7,12 +7,13 @@ fn test_value_and_primary_key_memory_footprint() {
     assert_eq!(std::mem::size_of::<PrimaryKey>(), 40);
     assert_eq!(std::mem::size_of::<ColumnUpdate>(), 32);
     assert_eq!(std::mem::size_of::<OperationKind>(), 32);
-    assert_eq!(std::mem::size_of::<TableOperation>(), 80);
-    assert_eq!(std::mem::size_of::<Operation>(), 96);
+    assert_eq!(std::mem::size_of::<Operation>(), 88);
+    assert_eq!(std::mem::size_of::<SequencedOperation>(), 96);
     // Guarantee PrimaryKey fits in standard 64-byte L1 cache line without split!
     assert!(std::mem::size_of::<PrimaryKey>() <= 64);
-    // TableOperation is exactly 80 bytes with 0 padding at struct tail
-    assert_eq!(std::mem::size_of::<TableOperation>() % 8, 0);
+    // Operation and SequencedOperation are strictly 8-byte aligned with 0 tail padding
+    assert_eq!(std::mem::size_of::<Operation>() % 8, 0);
+    assert_eq!(std::mem::size_of::<SequencedOperation>() % 8, 0);
 }
 
 #[test]
@@ -108,15 +109,14 @@ fn test_newtypes_ergonomics_and_serde() {
 }
 
 #[test]
-fn test_deref_ergonomics_on_operation() {
+fn test_operation_methods() {
     let row = CompactRow::new(vec![Value::Int(1), Value::String("Alice".into())]);
-    let op = Operation::insert("users", PrimaryKey::single(1i64), row, 100);
+    let op = Operation::insert(1, PrimaryKey::single(1i64), row, 100);
 
-    // Access via Deref
     assert_eq!(op.pk(), &PrimaryKey::single(1i64));
     assert_eq!(op.timestamp(), 100);
     assert!(op.is_insert());
     assert!(!op.is_delete());
     assert!(!op.is_update());
-    assert_eq!(op.table(), "users");
+    assert_eq!(op.table_id(), 1);
 }

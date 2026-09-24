@@ -1,7 +1,5 @@
 use crate::value::{CompactRow, PrimaryKey, Value};
 use serde::{Deserialize, Serialize};
-use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
 
 /// Atomic column update targeting a specific column by its positional DDL index.
 ///
@@ -39,41 +37,64 @@ pub enum OperationKind {
     Delete,
 }
 
-/// Pure row mutation operation on a specific table, without table metadata redundancy.
+/// Fully self-describing mutation operation with table ID.
 ///
-/// Designed with a density of exactly 80 bytes (40B PrimaryKey + 8B timestamp + 32B OperationKind).
-/// Ideal for table-partitioned in-memory storage (`TableBuffer`) in coordination servers.
+/// Occupies exactly 88 bytes in memory (2B table_id + 6B padding + 8B timestamp + 40B pk + 32B kind).
+/// 100% stack-allocated, zero heap pointers, aligned to 8 bytes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TableOperation {
-    pub pk: PrimaryKey,
+pub struct Operation {
+    pub table_id: u16,
     pub timestamp: u64,
+    pub pk: PrimaryKey,
     pub kind: OperationKind,
 }
 
-impl TableOperation {
-    pub fn insert(pk: PrimaryKey, row: CompactRow, timestamp: u64) -> Self {
+impl Operation {
+    pub fn new(table_id: u16, pk: PrimaryKey, timestamp: u64, kind: OperationKind) -> Self {
         Self {
-            pk,
+            table_id,
             timestamp,
+            pk,
+            kind,
+        }
+    }
+
+    pub fn insert(table_id: u16, pk: PrimaryKey, row: CompactRow, timestamp: u64) -> Self {
+        Self {
+            table_id,
+            timestamp,
+            pk,
             kind: OperationKind::Insert { row },
         }
     }
 
-    pub fn update(pk: PrimaryKey, mut updates: Vec<ColumnUpdate>, timestamp: u64) -> Self {
+    pub fn update(
+        table_id: u16,
+        pk: PrimaryKey,
+        mut updates: Vec<ColumnUpdate>,
+        timestamp: u64,
+    ) -> Self {
         updates.sort_by_key(|u| u.column_idx);
         Self {
-            pk,
+            table_id,
             timestamp,
+            pk,
             kind: OperationKind::Update { updates },
         }
     }
 
-    pub fn delete(pk: PrimaryKey, timestamp: u64) -> Self {
+    pub fn delete(table_id: u16, pk: PrimaryKey, timestamp: u64) -> Self {
         Self {
-            pk,
+            table_id,
             timestamp,
+            pk,
             kind: OperationKind::Delete,
         }
+    }
+
+    #[inline]
+    pub fn table_id(&self) -> u16 {
+        self.table_id
     }
 
     #[inline]
@@ -107,86 +128,19 @@ impl TableOperation {
     }
 }
 
-/// Fully self-describing mutation operation with table namespace.
-///
-/// Composes `table: Arc<str>` with `TableOperation` (total 96 bytes).
-/// Implements `Deref<Target = TableOperation>` for transparent zero-cost ergonomics.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Operation {
-    pub table: Arc<str>,
-    pub op: TableOperation,
-}
-
-impl Deref for Operation {
-    type Target = TableOperation;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.op
-    }
-}
-
-impl DerefMut for Operation {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.op
-    }
-}
-
-impl Operation {
-    pub fn new(table: impl Into<Arc<str>>, op: TableOperation) -> Self {
-        Self {
-            table: table.into(),
-            op,
-        }
-    }
-
-    pub fn insert(
-        table: impl Into<Arc<str>>,
-        pk: PrimaryKey,
-        row: CompactRow,
-        timestamp: u64,
-    ) -> Self {
-        Self::new(table, TableOperation::insert(pk, row, timestamp))
-    }
-
-    pub fn update(
-        table: impl Into<Arc<str>>,
-        pk: PrimaryKey,
-        updates: Vec<ColumnUpdate>,
-        timestamp: u64,
-    ) -> Self {
-        Self::new(table, TableOperation::update(pk, updates, timestamp))
-    }
-
-    pub fn delete(table: impl Into<Arc<str>>, pk: PrimaryKey, timestamp: u64) -> Self {
-        Self::new(table, TableOperation::delete(pk, timestamp))
-    }
-
-    #[inline]
-    pub fn table(&self) -> &str {
-        &self.table
-    }
-
-    #[inline]
-    pub fn into_parts(self) -> (Arc<str>, TableOperation) {
-        (self.table, self.op)
-    }
-}
-
 /// Fluent builder for constructing an `Operation::Update` with positional column deltas.
 #[derive(Debug, Clone)]
 pub struct UpdateBuilder {
-    table: Arc<str>,
+    table_id: u16,
     pk: PrimaryKey,
     updates: Vec<ColumnUpdate>,
     timestamp: u64,
 }
 
 impl UpdateBuilder {
-    pub fn new(table: impl Into<Arc<str>>, pk: PrimaryKey) -> Self {
+    pub fn new(table_id: u16, pk: PrimaryKey) -> Self {
         Self {
-            table: table.into(),
+            table_id,
             pk,
             updates: Vec::new(),
             timestamp: 0,
@@ -205,11 +159,6 @@ impl UpdateBuilder {
 
     pub fn build(mut self) -> Operation {
         self.updates.sort_by_key(|u| u.column_idx);
-        Operation::update(self.table, self.pk, self.updates, self.timestamp)
-    }
-
-    pub fn build_table_op(mut self) -> TableOperation {
-        self.updates.sort_by_key(|u| u.column_idx);
-        TableOperation::update(self.pk, self.updates, self.timestamp)
+        Operation::update(self.table_id, self.pk, self.updates, self.timestamp)
     }
 }
