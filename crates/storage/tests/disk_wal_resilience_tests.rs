@@ -154,7 +154,7 @@ async fn test_disk_wal_crc32_corruption_detection() {
     engine.close_room(&room_id).await.unwrap();
 
     // Corrupt the WAL payload byte in the file
-    let file_path = temp_dir.path().join("room_room-corrupt.rimdb");
+    let file_path = temp_dir.path().join("room_room-corrupt.wal");
     let mut file_bytes = tokio::fs::read(&file_path).await.unwrap();
     let last_idx = file_bytes.len() - 1;
     file_bytes[last_idx] ^= 0xFF;
@@ -190,7 +190,7 @@ async fn test_disk_torn_write_recovery() {
     engine.close_room(&room_id).await.unwrap();
 
     // Append 5 garbage bytes simulating an interrupted write / power loss
-    let file_path = temp_dir.path().join("room_room-torn.rimdb");
+    let file_path = temp_dir.path().join("room_room-torn.wal");
     let mut file_bytes = tokio::fs::read(&file_path).await.unwrap();
     let clean_len = file_bytes.len();
     file_bytes.extend_from_slice(&[0x20, 0x00, 0x00, 0x00, 0xAA]); // truncated 5 bytes
@@ -409,3 +409,239 @@ async fn test_disk_blind_update_ignored() {
     let retrieved = engine.get(&room_id, "users", &PrimaryKey::single(999i64)).await.unwrap();
     assert_eq!(retrieved, None);
 }
+
+#[tokio::test]
+async fn test_dual_file_storage_layout_and_compaction_truncation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let options = DiskStorageOptions::new(temp_dir.path());
+    let engine = DiskStorageEngine::new(options.clone());
+    let room_id = RoomId::new("dual-layout");
+    let schema = test_schema();
+
+    engine.open_room(&room_id, schema.clone()).await.unwrap();
+
+    let snap_path = temp_dir.path().join("room_dual-layout.snap");
+    let wal_path = temp_dir.path().join("room_dual-layout.wal");
+
+    // Both files must exist after opening room
+    assert!(snap_path.exists());
+    assert!(wal_path.exists());
+    assert_eq!(tokio::fs::metadata(&snap_path).await.unwrap().len(), HEADER_SIZE as u64);
+    assert_eq!(tokio::fs::metadata(&wal_path).await.unwrap().len(), 0);
+
+    // Apply mutation batch
+    let row = CompactRow::new(vec![
+        Value::Int(1),
+        Value::String("Dual File".into()),
+        Value::Int(42),
+        Value::Bool(true),
+    ]);
+    let ops = vec![SequencedOperation::with_default_origin(
+        1u64,
+        Operation::insert(USERS_TABLE, PrimaryKey::single(1i64), row, 100),
+    )];
+    engine.apply_batch(&room_id, ops).await.unwrap();
+
+    // WAL file must now have content (> 0 bytes)
+    let wal_len_before = tokio::fs::metadata(&wal_path).await.unwrap().len();
+    assert!(wal_len_before > 0);
+
+    // Explicitly compact room
+    engine.compact_room(&room_id).await.unwrap();
+
+    // After compaction: snapshot file must have grown (> HEADER_SIZE), and WAL must be truncated to 0
+    let snap_len_after = tokio::fs::metadata(&snap_path).await.unwrap().len();
+    assert!(snap_len_after > HEADER_SIZE as u64);
+
+    let wal_len_after = tokio::fs::metadata(&wal_path).await.unwrap().len();
+    assert_eq!(wal_len_after, 0);
+
+    // Close and reopen to ensure state persists from .snap
+    engine.close_room(&room_id).await.unwrap();
+
+    let engine2 = DiskStorageEngine::new(options);
+    engine2.open_room(&room_id, schema).await.unwrap();
+
+    let head = engine2.get_head_seq(&room_id).await.unwrap();
+    assert_eq!(head, SequenceNumber::from(1u64));
+
+    let row_retrieved = engine2.get(&room_id, "users", &PrimaryKey::single(1i64)).await.unwrap().unwrap();
+    assert_eq!(row_retrieved.values[1], Value::String("Dual File".into()));
+}
+
+#[tokio::test]
+async fn test_dynamic_column_update_resizing_disk_and_wal_recovery() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let options = DiskStorageOptions::new(temp_dir.path());
+    let engine = DiskStorageEngine::new(options.clone());
+    let room_id = RoomId::new("dynamic-disk");
+
+    let users_table = TableSchema::builder("users")
+        .table_id(USERS_TABLE)
+        .primary_key("id", DataType::Int)
+        .column("name", DataType::String)
+        .nullable_column("score", DataType::Int)
+        .nullable_column("note", DataType::String)
+        .build()
+        .unwrap();
+
+    let schema = Schema::builder().table(users_table).build();
+    engine.open_room(&room_id, schema.clone()).await.unwrap();
+
+    // 1. Insert 2-column row (from older client/payload)
+    let row = CompactRow::new(vec![Value::Int(1), Value::String("Initial".into())]);
+    engine
+        .apply_batch(
+            &room_id,
+            vec![SequencedOperation::with_default_origin(
+                1u64,
+                Operation::insert(USERS_TABLE, PrimaryKey::single(1i64), row, 100),
+            )],
+        )
+        .await
+        .unwrap();
+
+    // 2. Apply Update for column 3
+    engine
+        .apply_batch(
+            &room_id,
+            vec![SequencedOperation::with_default_origin(
+                2u64,
+                Operation::update(
+                    USERS_TABLE,
+                    PrimaryKey::single(1i64),
+                    vec![rimdb_core::ColumnUpdate::new(3, Value::String("Disk Note".into()))],
+                    110,
+                ),
+            )],
+        )
+        .await
+        .unwrap();
+
+    // Verify row has 4 columns and column 3 has "Disk Note"
+    let updated = engine
+        .get(&room_id, "users", &PrimaryKey::single(1i64))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated.values.len(), 4);
+    assert_eq!(updated.values[0], Value::Int(1));
+    assert_eq!(updated.values[1], Value::String("Initial".into()));
+    assert_eq!(updated.values[2], Value::Null);
+    assert_eq!(updated.values[3], Value::String("Disk Note".into()));
+
+    // 4. Close and recover from WAL with the evolved schema
+    engine.close_room(&room_id).await.unwrap();
+
+    let engine_recovered = DiskStorageEngine::new(options);
+    engine_recovered.open_room(&room_id, schema).await.unwrap();
+
+    let recovered_row = engine_recovered
+        .get(&room_id, "users", &PrimaryKey::single(1i64))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered_row.values.len(), 4);
+    assert_eq!(recovered_row.values[0], Value::Int(1));
+    assert_eq!(recovered_row.values[1], Value::String("Initial".into()));
+    assert_eq!(recovered_row.values[2], Value::Null);
+    assert_eq!(recovered_row.values[3], Value::String("Disk Note".into()));
+}
+
+#[tokio::test]
+async fn test_wal_recovery_truncates_zero_filled_tail_at_eof() {
+    let tmp = tempfile::tempdir().unwrap();
+    let options = DiskStorageOptions::new(tmp.path());
+
+    let schema = test_schema();
+    let room_id = RoomId::new("zero_tail_room");
+
+    // 1. Open room and write a valid operation
+    let engine = DiskStorageEngine::new(options.clone());
+    engine.open_room(&room_id, schema.clone()).await.unwrap();
+
+    let op1 = SequencedOperation::with_default_origin(
+        1u64,
+        Operation::insert(
+            USERS_TABLE,
+            PrimaryKey::single(10i64),
+            CompactRow::new(vec![
+                Value::Int(10),
+                Value::String("TailTest".into()),
+                Value::Int(500),
+                Value::Bool(true),
+            ]),
+            1000,
+        ),
+    );
+    engine.apply_batch(&room_id, vec![op1]).await.unwrap();
+
+    // 2. Close room
+    engine.close_room(&room_id).await.unwrap();
+
+    let wal_path = tmp.path().join("room_zero_tail_room.wal");
+    let valid_len = std::fs::metadata(&wal_path).unwrap().len();
+    assert!(valid_len > 0);
+
+    // 3. Append 1024 zero-bytes to simulate crash on thin-provisioned/preallocated disk
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .unwrap();
+        f.write_all(&vec![0u8; 1024]).unwrap();
+        f.sync_all().unwrap();
+    }
+    assert_eq!(
+        std::fs::metadata(&wal_path).unwrap().len(),
+        valid_len + 1024
+    );
+
+    // 4. Recover room: should detect zero-filled EOF tail, truncate cleanly, and load row
+    let engine_rec = DiskStorageEngine::new(options.clone());
+    engine_rec.open_room(&room_id, schema.clone()).await.unwrap();
+
+    let row = engine_rec
+        .get(&room_id, "users", &PrimaryKey::single(10i64))
+        .await
+        .unwrap()
+        .expect("row recovered");
+    assert_eq!(row.values[0], Value::Int(10));
+    assert_eq!(row.values[1], Value::String("TailTest".into()));
+
+    // Verify WAL length on disk is restored to valid_len
+    assert_eq!(
+        std::fs::metadata(&wal_path).unwrap().len(),
+        valid_len
+    );
+
+    // 5. Subsequent write after truncation must succeed and append properly
+    let op2 = SequencedOperation::with_default_origin(
+        2u64,
+        Operation::insert(
+            USERS_TABLE,
+            PrimaryKey::single(20i64),
+            CompactRow::new(vec![
+                Value::Int(20),
+                Value::String("PostRecovery".into()),
+                Value::Int(600),
+                Value::Bool(false),
+            ]),
+            1010,
+        ),
+    );
+    engine_rec.apply_batch(&room_id, vec![op2]).await.unwrap();
+    engine_rec.close_room(&room_id).await.unwrap();
+
+    // Reopen and ensure both operations persist
+    let engine_final = DiskStorageEngine::new(options);
+    engine_final.open_room(&room_id, schema).await.unwrap();
+
+    let row1 = engine_final.get(&room_id, "users", &PrimaryKey::single(10i64)).await.unwrap().unwrap();
+    let row2 = engine_final.get(&room_id, "users", &PrimaryKey::single(20i64)).await.unwrap().unwrap();
+    assert_eq!(row1.values[0], Value::Int(10));
+    assert_eq!(row2.values[0], Value::Int(20));
+}
+
+

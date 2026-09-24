@@ -2,7 +2,6 @@
 
 pub mod engine;
 pub mod error;
-pub mod index;
 pub mod memory;
 pub mod options;
 pub mod sys;
@@ -17,7 +16,6 @@ pub mod format {
 
 pub use engine::{EngineConcurrencyBounds, RowStream, StorageEngine};
 pub use error::StorageError;
-pub use index::PrimaryIndex;
 pub use memory::MemoryStorageEngine;
 pub use options::{KeyRange, ScanDirection, ScanOptions};
 

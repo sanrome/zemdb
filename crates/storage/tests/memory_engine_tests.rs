@@ -279,3 +279,65 @@ async fn test_sequence_mismatch_rejected() {
         other => panic!("Expected SequenceMismatch error, got: {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn test_dynamic_column_update_resizing_memory() {
+    let engine = MemoryStorageEngine::new();
+    let room_id = RoomId::new("room-dynamic-col");
+
+    // Table schema with 4 columns (2 initial + 2 evolved nullable columns)
+    let users_table = TableSchema::builder("users")
+        .table_id(USERS_TABLE)
+        .primary_key("id", DataType::Int)
+        .column("name", DataType::String)
+        .nullable_column("score", DataType::Int)
+        .nullable_column("note", DataType::String)
+        .build()
+        .unwrap();
+
+    let schema = Schema::builder().table(users_table).build();
+    engine.open_room(&room_id, schema).await.unwrap();
+
+    // 1. Insert a 2-column row (from a client prior to adding score and note)
+    let row = CompactRow::new(vec![Value::Int(1), Value::String("Alice".into())]);
+    engine
+        .apply_batch(
+            &room_id,
+            vec![SequencedOperation::with_default_origin(
+                1u64,
+                Operation::insert(USERS_TABLE, PrimaryKey::single(1i64), row, 100),
+            )],
+        )
+        .await
+        .unwrap();
+
+    // 2. Apply an Update targeting column 3 (note)
+    engine
+        .apply_batch(
+            &room_id,
+            vec![SequencedOperation::with_default_origin(
+                2u64,
+                Operation::update(
+                    USERS_TABLE,
+                    PrimaryKey::single(1i64),
+                    vec![ColumnUpdate::new(3, Value::String("Updated Note".into()))],
+                    110,
+                ),
+            )],
+        )
+        .await
+        .unwrap();
+
+    // 3. Verify the row was resized to 4 columns, column 2 is Null, and column 3 has "Updated Note"
+    let updated_row = engine
+        .get(&room_id, "users", &PrimaryKey::single(1i64))
+        .await
+        .unwrap()
+        .expect("row must exist");
+
+    assert_eq!(updated_row.values.len(), 4);
+    assert_eq!(updated_row.values[0], Value::Int(1));
+    assert_eq!(updated_row.values[1], Value::String("Alice".into()));
+    assert_eq!(updated_row.values[2], Value::Null);
+    assert_eq!(updated_row.values[3], Value::String("Updated Note".into()));
+}

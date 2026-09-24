@@ -1,10 +1,11 @@
 pub mod state;
 
-pub use state::{RoomSnapshotPayload, RoomState};
+pub use state::{RoomSnapshotPayload, RoomSnapshotRef, RoomState};
 
 use async_trait::async_trait;
 use rimdb_core::{
     CompactRow, OperationKind, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation,
+    Value,
 };
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::RangeBounds;
@@ -142,11 +143,17 @@ impl StorageEngine for MemoryStorageEngine {
                 }
                 OperationKind::Update { updates } => {
                     if let Some(existing) = table_map.get_mut(&op.pk) {
+                        let target_len = schema
+                            .get_table_by_id(op.table_id)
+                            .map(|t| t.columns.len())
+                            .unwrap_or(0);
                         for col_up in updates {
                             let idx = col_up.column_idx as usize;
-                            if idx < existing.values.len() {
-                                existing.values[idx] = col_up.value;
+                            let min_len = target_len.max(idx + 1);
+                            if existing.values.len() < min_len {
+                                existing.values.resize(min_len, Value::Null);
                             }
+                            existing.values[idx] = col_up.value;
                         }
                     }
                 }
@@ -312,20 +319,9 @@ impl StorageEngine for MemoryStorageEngine {
             .read()
             .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
 
-        let tables = room_state
-            .tables
-            .iter()
-            .map(|(&id, data)| {
-                (
-                    id,
-                    data.iter().map(|(pk, r)| (pk.clone(), r.clone())).collect(),
-                )
-            })
-            .collect();
-
-        let payload = RoomSnapshotPayload {
+        let payload = RoomSnapshotRef {
             head_seq: room_state.head_seq,
-            tables,
+            tables: &room_state.tables,
         };
 
         let bytes = bincode::serialize(&payload).map_err(|e| StorageError::Serialization(e.to_string()))?;
@@ -340,22 +336,17 @@ impl StorageEngine for MemoryStorageEngine {
         schema: Schema,
         snapshot: &[u8],
     ) -> Result<SequenceNumber, StorageError> {
-        let payload: RoomSnapshotPayload = bincode::deserialize(snapshot)
+        let mut payload: RoomSnapshotPayload = bincode::deserialize(snapshot)
             .map_err(|e| StorageError::SnapshotCorruption(e.to_string()))?;
 
-        let mut tables = HashMap::new();
-        for (table_id, rows) in payload.tables {
-            let mut map = BTreeMap::new();
-            for (pk, row) in rows {
-                map.insert(pk, row);
-            }
-            tables.insert(table_id, map);
+        for table_id in schema.tables_by_id.keys() {
+            payload.tables.entry(*table_id).or_default();
         }
 
         let new_state = Arc::new(RwLock::new(RoomState {
             schema,
             head_seq: payload.head_seq,
-            tables,
+            tables: payload.tables,
         }));
 
         let mut rooms = self

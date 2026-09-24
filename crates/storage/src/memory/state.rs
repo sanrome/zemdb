@@ -27,9 +27,16 @@ impl RoomState {
     }
 }
 
-/// Payload format for serialized in-memory snapshots.
+/// In-memory snapshot payload serialized by reference to avoid copying tables during snapshot creation.
+#[derive(Debug, Serialize)]
+pub struct RoomSnapshotRef<'a> {
+    pub head_seq: SequenceNumber,
+    pub tables: &'a HashMap<u16, BTreeMap<PrimaryKey, CompactRow>>,
+}
+
+/// Payload format for deserialized database snapshots.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RoomSnapshotPayload {
     pub head_seq: SequenceNumber,
-    pub tables: HashMap<u16, Vec<(PrimaryKey, CompactRow)>>,
+    pub tables: HashMap<u16, BTreeMap<PrimaryKey, CompactRow>>,
 }

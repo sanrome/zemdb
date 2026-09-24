@@ -6,28 +6,29 @@ pub mod wal;
 use async_trait::async_trait;
 use rimdb_core::{
     CompactRow, OperationKind, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation,
+    Value,
 };
 use fs2::FileExt;
-use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::ops::RangeBounds;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs::{create_dir_all, File};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
-use crate::disk::compactor::{compact_room_internal, RoomSnapshotPayload};
-use crate::disk::format::FileHeader;
+use crate::disk::compactor::compact_room_internal;
 use crate::disk::recovery::recover_room;
+use crate::memory::{RoomSnapshotPayload, RoomSnapshotRef};
 use crate::disk::wal::WalWriter;
 use crate::engine::{apply_scan_transforms, RowStream, StorageEngine};
 use crate::error::StorageError;
-use crate::options::{ScanDirection, ScanOptions};
-use crate::sys::sync_dir;
+use crate::options::{KeyRange, ScanDirection, ScanOptions};
 
 /// Options to configure `DiskStorageEngine`.
 #[derive(Debug, Clone)]
 pub struct DiskStorageOptions {
-    /// Directory where `room_{id}.rimdb` files are stored.
+    /// Directory where `room_{id}.snap` and `room_{id}.wal` files are stored.
     pub data_dir: PathBuf,
     /// Ratio of WAL size to snapshot size that triggers automatic compaction (default: 3.0).
     pub compaction_ratio: f64,
@@ -76,28 +77,31 @@ impl DiskStorageOptions {
     }
 }
 
-/// Internal state of an open database room on disk.
+/// Internal state of an open database room on disk in the Dual-File architecture.
 #[derive(Debug)]
 pub struct DiskRoomState {
     pub schema: Schema,
     pub head_seq: SequenceNumber,
     pub snapshot_seq: SequenceNumber,
     pub tables: HashMap<u16, BTreeMap<PrimaryKey, CompactRow>>,
-    pub file: File,
-    pub file_path: PathBuf,
+    pub wal_file: File,
+    pub snap_path: PathBuf,
+    pub wal_path: PathBuf,
     pub snapshot_len: u64,
     pub wal_len: u64,
 }
 
 /// High-performance, crash-resilient disk storage engine for RimDB.
 ///
-/// Implements a file-per-room architecture (`room_{id}.rimdb`) featuring:
-/// - Fixed 64-byte binary header with magic bytes `RIM1` and CRC32 verification.
-/// - Base consolidated snapshot compressed with Zstandard (`zstd`).
-/// - Append-only Write-Ahead Log (WAL) with per-record CRC32 checksums.
+/// Implements a Dual-File architecture per room:
+/// - `room_{id}.snap`: Base consolidated snapshot with 64-byte `RIM1` header,
+///   compressed with Zstandard and checksummed.
+/// - `room_{id}.wal`: Append-only Write-Ahead Log (WAL) of delta batches enqueued
+///   with framing `0xBA7C` and per-batch CRC32.
+/// - True CoW compaction: Background snapshot generation replaces `room_{id}.snap`
+///   atomically without blocking incoming WAL writes, followed by in-place WAL truncation.
 /// - Fast in-memory index/tables (`BTreeMap`) reconstructed via startup Replay.
-/// - Torn-write detection and recovery at file EOF.
-/// - Automatic or on-demand background snapshot compaction and log truncation.
+/// - Non-blocking batched cursor scans (64 items per yield) preventing writer starvation.
 #[derive(Debug, Clone)]
 pub struct DiskStorageEngine {
     options: DiskStorageOptions,
@@ -113,9 +117,19 @@ impl DiskStorageEngine {
         }
     }
 
-    /// Computes the filesystem path for a room file.
+    /// Computes the filesystem path for a room's base snapshot file (`room_{id}.snap`).
+    pub fn snap_file_path(&self, room_id: &RoomId) -> PathBuf {
+        self.options.data_dir.join(format!("room_{}.snap", room_id))
+    }
+
+    /// Computes the filesystem path for a room's append-only WAL file (`room_{id}.wal`).
+    pub fn wal_file_path(&self, room_id: &RoomId) -> PathBuf {
+        self.options.data_dir.join(format!("room_{}.wal", room_id))
+    }
+
+    /// Compatibility helper returning the room's WAL file path.
     pub fn room_file_path(&self, room_id: &RoomId) -> PathBuf {
-        self.options.data_dir.join(format!("room_{}.rimdb", room_id))
+        self.wal_file_path(room_id)
     }
 
     /// Fast lookup of an open room handle.
@@ -127,13 +141,25 @@ impl DiskStorageEngine {
             .ok_or_else(|| StorageError::RoomNotFound(room_id.clone()))
     }
 
-    /// Explicitly triggers compaction and WAL truncation for a room.
+    /// Explicitly triggers snapshot compaction and WAL truncation for a room.
     #[tracing::instrument(skip(self), fields(room_id = %room_id))]
     pub async fn compact_room(&self, room_id: &RoomId) -> Result<(), StorageError> {
         let room_arc = self.get_room(room_id).await?;
         let mut room = room_arc.write().await;
         compact_room_internal(&mut room, &self.options).await
     }
+}
+
+struct DiskScanState {
+    room_arc: Arc<RwLock<DiskRoomState>>,
+    table_id: u16,
+    range: KeyRange,
+    direction: ScanDirection,
+    projection: Option<Vec<u16>>,
+    remaining_limit: Option<usize>,
+    cursor: Option<PrimaryKey>,
+    exhausted: bool,
+    buffer: VecDeque<Result<(PrimaryKey, CompactRow), StorageError>>,
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -147,64 +173,37 @@ impl StorageEngine for DiskStorageEngine {
         }
 
         create_dir_all(&self.options.data_dir).await?;
-        let file_path = self.room_file_path(room_id);
+        let snap_path = self.snap_file_path(room_id);
+        let wal_path = self.wal_file_path(room_id);
 
-        let room_state = if Path::new(&file_path).exists() {
-            let recovered = recover_room(room_id, &file_path, &schema).await?;
+        let std_wal_file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&wal_path)?;
 
-            DiskRoomState {
-                schema,
-                head_seq: recovered.head_seq,
-                snapshot_seq: recovered.snapshot_seq,
-                tables: recovered.tables,
-                file: recovered.file,
-                file_path,
-                snapshot_len: recovered.snapshot_len,
-                wal_len: recovered.wal_len,
-            }
-        } else {
-            // New room file: initialize with 64B header and OS-level exclusive file lock
-            let std_file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .read(true)
-                .write(true)
-                .open(&file_path)?;
+        std_wal_file
+            .try_lock_exclusive()
+            .map_err(|_| StorageError::RoomLocked(room_id.clone()))?;
 
-            std_file
-                .try_lock_exclusive()
-                .map_err(|_| StorageError::RoomLocked(room_id.clone()))?;
+        let recovered = recover_room(room_id, &snap_path, &wal_path, &schema, std_wal_file).await?;
 
-            let mut file = File::from_std(std_file);
-
-            let header = FileHeader::new(0, 0, 0);
-            file.write_all(&header.encode()).await?;
-            file.sync_all().await?;
-
-            if let Some(parent) = file_path.parent() {
-                sync_dir(parent)?;
-            }
-
-            let mut tables = HashMap::new();
-            for table_id in schema.tables_by_id.keys() {
-                tables.insert(*table_id, BTreeMap::new());
-            }
-
-            DiskRoomState {
-                schema,
-                head_seq: SequenceNumber::from(0u64),
-                snapshot_seq: SequenceNumber::from(0u64),
-                tables,
-                file,
-                file_path,
-                snapshot_len: 0,
-                wal_len: 0,
-            }
+        let room_state = DiskRoomState {
+            schema,
+            head_seq: recovered.head_seq,
+            snapshot_seq: recovered.snapshot_seq,
+            tables: recovered.tables,
+            wal_file: recovered.wal_file,
+            snap_path,
+            wal_path,
+            snapshot_len: recovered.snapshot_len,
+            wal_len: recovered.wal_len,
         };
 
         rooms.insert(room_id.clone(), Arc::new(RwLock::new(room_state)));
 
-        tracing::info!(room_id = %room_id, "Opened disk room");
+        tracing::info!(room_id = %room_id, "Opened disk room (dual-file .snap + .wal)");
         Ok(())
     }
 
@@ -213,7 +212,7 @@ impl StorageEngine for DiskStorageEngine {
         let mut rooms = self.rooms.write().await;
         if let Some(room_arc) = rooms.remove(room_id) {
             let room = room_arc.write().await;
-            room.file.sync_all().await?;
+            room.wal_file.sync_all().await?;
             tracing::info!(room_id = %room_id, "Closed disk room");
             Ok(())
         } else {
@@ -247,17 +246,18 @@ impl StorageEngine for DiskStorageEngine {
             }
         }
 
-        // 2. Encode WAL records into byte buffer
+        // 2. Encode WAL records into framed byte buffer
         let wal_batch_bytes = WalWriter::encode_batch(&ops)?;
 
-        // 3. Write to disk and fsync data
-        room.file.write_all(&wal_batch_bytes).await?;
-        room.file.sync_data().await?;
+        // 3. Write to append-only WAL file and fsync data
+        room.wal_file.write_all(&wal_batch_bytes).await?;
+        room.wal_file.sync_data().await?;
         room.wal_len += wal_batch_bytes.len() as u64;
 
         // 4. Apply operations to in-memory tables
         {
             let DiskRoomState {
+                ref schema,
                 ref mut head_seq,
                 ref mut tables,
                 ..
@@ -272,11 +272,17 @@ impl StorageEngine for DiskStorageEngine {
                     }
                     OperationKind::Update { updates } => {
                         if let Some(existing) = table_map.get_mut(&op.pk) {
+                            let target_len = schema
+                                .get_table_by_id(op.table_id)
+                                .map(|t| t.columns.len())
+                                .unwrap_or(0);
                             for col_up in updates {
                                 let idx = col_up.column_idx as usize;
-                                if idx < existing.values.len() {
-                                    existing.values[idx] = col_up.value;
+                                let min_len = target_len.max(idx + 1);
+                                if existing.values.len() < min_len {
+                                    existing.values.resize(min_len, Value::Null);
                                 }
+                                existing.values[idx] = col_up.value;
                             }
                         }
                     }
@@ -336,32 +342,79 @@ impl StorageEngine for DiskStorageEngine {
             })?
         };
 
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
-        tokio::spawn(async move {
-            let room = room_arc.read().await;
-            let empty = BTreeMap::new();
-            let table_data = room.tables.get(&table_id).unwrap_or(&empty);
+        let state = DiskScanState {
+            room_arc,
+            table_id,
+            range: options.range,
+            direction: options.direction,
+            projection: options.projection,
+            remaining_limit: options.limit,
+            cursor: None,
+            exhausted: false,
+            buffer: VecDeque::new(),
+        };
 
-            let items = match options.direction {
-                ScanDirection::Forward => {
-                    let iter = table_data.range(options.range);
-                    apply_scan_transforms(iter, options.projection, options.limit)
-                }
-                ScanDirection::Backward => {
-                    let iter = table_data.range(options.range).rev();
-                    apply_scan_transforms(iter, options.projection, options.limit)
-                }
+        let stream = futures::stream::unfold(state, |mut state| async move {
+            if let Some(item) = state.buffer.pop_front() {
+                return Some((item, state));
+            }
+
+            if state.exhausted || state.remaining_limit == Some(0) {
+                return None;
+            }
+
+            const BATCH_SIZE: usize = 64;
+            let batch_limit = match state.remaining_limit {
+                Some(limit) => limit.min(BATCH_SIZE),
+                None => BATCH_SIZE,
             };
 
-            for item in items {
-                if tx.send(item).await.is_err() {
-                    break;
-                }
-            }
-        });
+            let room_guard = state.room_arc.read().await;
+            let empty = BTreeMap::new();
+            let table_data = room_guard.tables.get(&state.table_id).unwrap_or(&empty);
 
-        let stream = futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
+            let batch_items: Vec<Result<(PrimaryKey, CompactRow), StorageError>> =
+                match state.direction {
+                    ScanDirection::Forward => {
+                        let (start_bound, end_bound) = match &state.cursor {
+                            Some(cur) => (std::ops::Bound::Excluded(cur), state.range.end_bound()),
+                            None => (state.range.start_bound(), state.range.end_bound()),
+                        };
+                        let iter = table_data.range((start_bound, end_bound));
+                        apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
+                            .collect()
+                    }
+                    ScanDirection::Backward => {
+                        let (start_bound, end_bound) = match &state.cursor {
+                            Some(cur) => (state.range.start_bound(), std::ops::Bound::Excluded(cur)),
+                            None => (state.range.start_bound(), state.range.end_bound()),
+                        };
+                        let iter = table_data.range((start_bound, end_bound)).rev();
+                        apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
+                            .collect()
+                    }
+                };
+            drop(room_guard);
+
+            let count = batch_items.len();
+            if count == 0 {
+                return None;
+            }
+
+            if count < batch_limit {
+                state.exhausted = true;
+            }
+
+            if let Some(Ok((last_pk, _))) = batch_items.last() {
+                state.cursor = Some(last_pk.clone());
+            }
+
+            if let Some(rem) = state.remaining_limit.as_mut() {
+                *rem = rem.saturating_sub(count);
+            }
+
+            state.buffer.extend(batch_items);
+            state.buffer.pop_front().map(|item| (item, state))
         });
 
         Ok(Box::pin(stream))
@@ -378,20 +431,9 @@ impl StorageEngine for DiskStorageEngine {
         let room_arc = self.get_room(room_id).await?;
         let room = room_arc.read().await;
 
-        let tables = room
-            .tables
-            .iter()
-            .map(|(&id, data)| {
-                (
-                    id,
-                    data.iter().map(|(pk, r)| (pk.clone(), r.clone())).collect(),
-                )
-            })
-            .collect();
-
-        let payload = RoomSnapshotPayload {
+        let payload = RoomSnapshotRef {
             head_seq: room.head_seq,
-            tables,
+            tables: &room.tables,
         };
 
         let raw = bincode::serialize(&payload)
@@ -417,16 +459,11 @@ impl StorageEngine for DiskStorageEngine {
             .map_err(|e| StorageError::Other(format!("Join error: {e}")))?
             .map_err(|e| StorageError::SnapshotCorruption(format!("Zstd decompression failed: {e}")))?;
 
-        let payload: RoomSnapshotPayload = bincode::deserialize(&decompressed)
+        let mut payload: RoomSnapshotPayload = bincode::deserialize(&decompressed)
             .map_err(|e| StorageError::SnapshotCorruption(e.to_string()))?;
 
-        let mut tables = HashMap::new();
-        for (table_id, rows) in payload.tables {
-            let mut map = BTreeMap::new();
-            for (pk, row) in rows {
-                map.insert(pk, row);
-            }
-            tables.insert(table_id, map);
+        for table_id in schema.tables_by_id.keys() {
+            payload.tables.entry(*table_id).or_default();
         }
 
         let room_arc = self.get_room(room_id).await?;
@@ -434,7 +471,7 @@ impl StorageEngine for DiskStorageEngine {
 
         room.schema = schema;
         room.head_seq = payload.head_seq;
-        room.tables = tables;
+        room.tables = payload.tables;
 
         // Perform atomic snapshot rewrite on disk
         compact_room_internal(&mut room, &self.options).await?;

@@ -49,3 +49,12 @@ impl From<bincode::Error> for StorageError {
         Self::Serialization(err.to_string())
     }
 }
+
+impl From<rimdb_core::WalFrameError> for StorageError {
+    fn from(err: rimdb_core::WalFrameError) -> Self {
+        match err {
+            rimdb_core::WalFrameError::Serialization(s) => StorageError::Serialization(s),
+            rimdb_core::WalFrameError::Corruption(s) => StorageError::WalCorruption(s),
+        }
+    }
+}
