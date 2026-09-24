@@ -9,26 +9,28 @@ The goal of this project is to build a client-centric (**Local-First**) distribu
 
 ---
 
-## 2. Topology & Isolation (Rooms)
-The system adopts an isolated **Room** topology:
-* Each database is an independent compartment identified by a strongly-typed `RoomId` (e.g., a chat group, team workspace, or specific collaborative project).
-* A room typically consists of a small-to-medium group of clients (e.g., 2 to 50 participants).
-* Operations, schemas, and sequence numbers are strictly scoped to their respective Room.
+## 2. Topology & Isolation (Rooms & Schema Catalog)
+The system adopts an isolated **Room** topology governed by a centralized **Schema Catalog**:
+* **Compartmentalized Rooms:** Each database is an independent compartment identified by a strongly-typed `RoomId` (e.g., a chat group, team workspace, or specific collaborative project).
+* **Small-to-Medium Groups:** A room typically consists of a small-to-medium group of clients (e.g., 2 to 50 participants).
+* **Centralized Schema Catalog (`SchemaId` Hierarchy):** A `Schema` is an independent template identified by a `SchemaId` (e.g., `workspace_v1`). Multiple rooms share the same `SchemaId`, allowing the server to maintain a single `Arc<Schema>` in memory across thousands of rooms without duplicating table definitions or memory overhead. Each room contains exactly one flat schema (no sub-namespaces or sub-schemas), keeping room lookups and storage paths predictable and fast.
+* **Per-Room Scoping:** Operations, physical WAL files, and sequence numbers are strictly scoped to their respective Room.
 
 ---
 
 ## 3. Data Model & Schema
 
 ### 3.1. Structured Typing & Schema Definitions
-Every table within a Room has an explicit schema definition with typed fields:
+Every table within a Schema has an explicit definition with typed fields:
 * **Primitive Data Types:** `Int`, `Float`, `String`, `Bool`, `Bytes`, `Null`, `Timestamp` (domain date/time), and `Uuid` (`[u8; 16]` fixed-size, ideal for distributed primary keys). Arbitrary-precision `Decimal` is deferred to post-v0.1.
-* **Strongly-Typed Domain Identifiers (Newtypes):** Domain identities (`RoomId`, `ClientId`, `SequenceNumber`, `MutationId`, `CorrelationId`) are strictly typed to prevent parameter transposition bugs while maintaining zero-overhead binary representations.
-* **In-Memory Density & Cache-Line Alignment:** Tuples are stored positionally (`CompactRow`) without duplicating column names across rows. The dynamic `Value` enum is strictly bounded to **24 bytes** on 64-bit platforms (by boxing heap payloads: `String(Box<str>)` and `Bytes(Box<Bytes>)`). Primary keys are optimized with `SmallVec<[Value; 1]>` occupying **40 bytes** on the stack, strictly fitting within a single 64-byte CPU L1 cache line to prevent cache line splits during index lookups.
-* **Compact Table Identifiers (`table_id: u16`):** Every table in a Room is assigned a compact 2-byte numerical identifier (`table_id: u16`). Strings are completely eliminated from the inner mutation loop and memory storage structures. The `Schema` maintains a bidirectional catalog with explicit, unambiguous lookup methods: `get_table_by_id`, `get_table_by_name`, `get_table_id`, `has_table_by_id`, and `has_table_by_name`.
+* **Strongly-Typed Domain Identifiers (Encapsulated Newtypes & C-DEREF Compliance):** Domain identities (`RoomId`, `SchemaId`, `ClientId`, `SequenceNumber`, `MutationId`, `CorrelationId`) are encapsulated newtypes with private inner representations. In strict accordance with Rust API Guidelines [C-DEREF], implicit `Deref` coercions are eradicated to protect type abstraction boundaries and prevent accidental string/numeric mutations. Ergonomics and zero-overhead performance are maintained through explicit accessors (`as_str()`, `get()`, `as_bytes()`), standard trait conversions (`AsRef<str>`, `AsRef<[u8]>`, `From`), and transparent Serde representations.
+* **In-Memory Density & Cache-Line Alignment:** Tuples are stored positionally (`CompactRow`) without duplicating column names across rows. The dynamic `Value` enum is strictly bounded to **24 bytes** on 64-bit platforms (by boxing heap payloads: `String(Box<str>)` and `Bytes(Box<[u8]>)`). Primary keys are optimized with `SmallVec<[Value; 1]>` occupying **40 bytes** on the stack, strictly fitting within a single 64-byte CPU L1 cache line to prevent cache line splits during index lookups.
+* **Compact Table Identifiers (`table_id: u16`):** Every table in a Room is assigned a compact 2-byte numerical identifier (`table_id: u16`). Strings are completely eliminated from the inner mutation loop and memory storage structures. The `Schema` maintains a bidirectional catalog with explicit, unambiguous lookup methods: `get_table_by_id`, `get_table_by_name`, `get_table_id`, `has_table_by_id`, and `has_table_by_name`. Secondary indexing (`id_by_name`) is dynamically constructed upon deserialization and omitted from network/disk serialization.
 * **Unified Stack-Allocated Mutation Unit (`Operation`):** All row mutations are represented by a single unified, stack-allocated `Operation` struct (`table_id: u16`, `timestamp: u64`, `pk: PrimaryKey`, `kind: OperationKind`) occupying **exactly 88 bytes** on 64-bit systems with 0 bytes heap overhead for metadata.
 * **Dense Sequenced Operations (`SequencedOperation`):** Historical log records compose a 64-bit monotonic sequence number with the mutation: `SequencedOperation { seq: SequenceNumber, op: Operation }`, occupying **exactly 96 bytes**. Ephemeral client metadata (`client_id`, `mutation_id`) is retained strictly in transit during `Commit` / `CommitAck` for idempotency and 1-RTT synchronization, eliminating 24 bytes of overhead per historical operation in RAM and persistent storage.
-* **Deterministic Column Ordering (Append-Only DDL):** `TableSchema` preserves physical column declaration order in `columns: Vec<ColumnDef>`, ensuring stable positional binary offsets in `CompactRow` across schema migrations, paired with zero-copy row transformations (`row_into_compact` and `compact_into_row`).
-* **End-to-End Encryption (E2EE):** Handled via metadata on `ColumnDef` (`encrypted: bool`). The schema preserves the real underlying `data_type` for client-side decryption, while the coordination server validates that encrypted fields in transit are transmitted strictly as opaque `Value::Bytes` without inspecting payload contents. Primary key columns cannot be encrypted.
+* **Deterministic Column Ordering (Append-Only DDL):** `TableSchema` preserves physical column declaration order in `columns: Vec<ColumnDef>`, ensuring stable positional binary offsets in `CompactRow` across schema migrations, paired with zero-copy row transformations (`row_into_compact` and `compact_into_row`). `compact_into_row` and `from_compact_row` support backward evolution where `compact.len() <= self.columns.len()` by treating omitted columns as `Value::Null`. In `StorageEngine::apply_batch`, tuples are dynamically resized upon `Update` operations targeting newly added column indices. Dynamic schema evolution (`TableSchema::add_column`) strictly enforces that newly appended columns must be nullable (`nullable: true`) to preserve backward integrity over historical records.
+* **Native $O(C)$ Positional Mutation Validation:** Positional validation algorithms (`TableSchema::validate_operation` and `TableSchema::validate_column_updates`) evaluate compact rows and sorted `ColumnUpdate` deltas directly in $O(C)$ linear time against column definitions, verifying types, nullability, E2EE constraints, and strictly ascending column index order without allocating or reconstructing intermediate `HashMap<String, Value>` instances.
+* **End-to-End Encryption (E2EE):** Handled via metadata on `ColumnDef` (`encrypted: bool`). The schema preserves the real underlying `data_type` for client-side decryption, while the coordination server validates that encrypted fields in transit are transmitted strictly as opaque `Value::Bytes` without inspecting payload contents. Primary key columns cannot be encrypted. The `CryptoEngine` contract incorporates conditional `CryptoConcurrencyBounds` (`Send + Sync` on native, relaxed on `wasm32`) and authenticated additional data (`aad: &[u8]`, providing `(table_id, pk, column_idx)`) to cryptographically defend against ciphertext column substitution attacks.
 * **Primary Key (PK):** Supports both single-column and composite (multi-column) primary keys.
 * **Soft Foreign Keys:** Relational references are supported without distributed locking or strict server-side validation. Dangling references are permitted to maintain eventual consistency without coordination bottlenecks.
 * **Schema Evolution:** Supports adding new fields over time without breaking backward compatibility.
@@ -139,26 +141,46 @@ This ensures the system is adaptable across diverse deployment profiles, from re
 
 ---
 
-## 6. Onboarding & Invitations (State Transfer)
+## 6. Onboarding, Handshake & Stateless Authentication
 
-Because the server does not store the full persistent historical state:
-1. **Invitation Flow:** An existing active client can invite a new client into the Room.
-2. **Snapshot Generation:** The inviting client creates an export (snapshot) of its local database state up to a specific base `SequenceNumber` (e.g., `#500`), applying high-ratio Zstandard compression.
+Because the server does not store the full persistent historical state and must remain completely decoupled from application user/password databases:
+
+1. **Stateless Ticket Authentication (Signed Token):**
+   * The application backend authenticates the end-user (OAuth, email/password, etc.) and issues a signed, time-bounded ticket:
+     `auth_token = sign({ client_id, room_id, exp })` using a shared cluster secret (`RIMDB_AUTH_SECRET`, HMAC-SHA256) or asymmetric key pair (Ed25519).
+   * The client connects and issues `ClientMessage::RegisterClient { correlation_id, room_id, client_id, auth_token }`.
+   * The server validates the cryptographic signature in microsecond CPU time without querying any database or storing user passwords. If valid, it responds with `ServerMessage::Registered { head_seq, schema_id, schema }`, delivering the full room schema to the client in 1 RTT.
+2. **Snapshot Generation:** If the client is onboarding into an existing room whose historical deltas have been pruned (`BehindCompaction`), an active peer creates a compressed Zstandard snapshot.
 3. **Transfer:** The compressed snapshot is transferred to the new client (via short-lived ephemeral server relay or direct P2P).
-4. **Subsequent Catch-up:** Once the snapshot is restored locally, the new client connects to the server and pulls delta changes starting from sequence `#501` onwards.
+4. **Subsequent Catch-up:** Once restored locally, the new client connects to the server and pulls delta changes starting from sequence `#head_seq + 1` onwards.
 
 ### Multipart Chunked Snapshot Transfer Protocol (> 16 MB)
 
 When database rooms grow large such that compressed snapshots exceed the strict DoS envelope (`MAX_MESSAGE_SIZE = 16 MB`), state transfer is partitioned into framed chunks:
 1. **Chunk Negotiation & Request:** The bootstrapping client issues `ClientMessage::RequestSnapshotChunk { correlation_id, room_id, chunk_index, chunk_size }` (typically requesting $2\text{ MB}$ to $4\text{ MB}$ chunks).
-2. **Chunk Streaming:** The server or relay peer streams `ServerMessage::SnapshotChunk { correlation_id, room_id, snapshot_head_seq, chunk_index, total_chunks, total_bytes, data }`.
-3. **Atomic Reconstruction:** Once all chunks `0..total_chunks` are assembled in a temporary staging buffer, the client verifies payload size and applies the snapshot in a single atomic transaction via `StorageEngine::apply_snapshot`.
+2. **Chunk Streaming:** The server or relay peer streams `ServerMessage::SnapshotChunk { correlation_id, room_id, snapshot_head_seq, chunk_index, total_chunks, total_bytes, snapshot_hash, data }`.
+3. **Cryptographic Integrity & Atomic Reconstruction:** All chunks `0..total_chunks` are assembled in a temporary staging buffer. The client validates the assembled byte stream against `snapshot_hash` using BLAKE3 (`ServerMessage::compute_snapshot_hash`), immediately rejecting corrupted transfers before decompression. If verified, it applies the snapshot in a single atomic transaction via `StorageEngine::apply_snapshot`.
 4. **Resumed Delta Catch-up:** The client sets its local cursor to `snapshot_head_seq` and seamlessly queries `/sync` starting from `snapshot_head_seq + 1`.
 
 ---
 
-## 7. Client-Server Communication Protocol
+## 7. Communication Protocol: Control Plane & Data Plane
 
+The system strictly decouples administrative lifecycle management from high-throughput client synchronization:
+
+### 7.1. Control Plane (Admin REST API - HTTP/JSON)
+Dedicated administrative interface intended for application backends, CLI tools, and automated deployment pipelines:
+* **Transport:** HTTP REST over TLS with JSON payloads.
+* **Security:** Authenticated via administrative bearer token (`Authorization: Bearer <ADMIN_SECRET>`).
+* **Endpoints:**
+  * `POST /admin/schemas`: Declares or updates a schema template identified by `SchemaId`, containing table and column definitions.
+  * `GET /admin/schemas/{schema_id}`: Retrieves schema metadata.
+  * `POST /admin/schemas/{schema_id}/columns`: Append-only DDL evolution (`TableSchema::add_column`), enforcing nullable column additions.
+  * `POST /admin/rooms`: Provisions an isolated room binding `RoomId` to a `SchemaId` and `RoomLifecyclePolicy`.
+  * `GET /admin/rooms/{room_id}`: Inspects room head sequence, disk usage, and active client leases.
+  * `DELETE /admin/rooms/{room_id}`: Archives or purges a room and its WAL.
+
+### 7.2. Data Plane (Client Synchronization Protocol - Binary HTTP/2)
 To prevent the resource exhaustion of thousands of idle persistent connections:
 * **Pull-Based HTTP/2 Binary Protocol:**
   * Transport: HTTP/2 over TLS with binary payloads serialized via `bincode`.
@@ -166,10 +188,12 @@ To prevent the resource exhaustion of thousands of idle persistent connections:
   * Multiplexing: Multiple sync/commit streams share a single underlying TCP connection using explicit correlation identifiers (`CorrelationId`).
   * Defensive Bounding: Codecs enforce an explicit message size limit (16 MB) to prevent denial-of-service memory exhaustion attacks.
 * **Core Interaction Contracts:**
-  * **Mutation Commit with Unified Sync (1 RTT):** Client submits an operation with its `MutationId`, `CorrelationId`, and its current cursor `last_ack_seq`. The server validates the mutation against schemas and constraints. If valid, the server assigns a monotonic `SequenceNumber` and returns `CommitAck` containing the assigned `SequenceNumber` along with any remote catchup deltas that occurred between `last_ack_seq` and the new sequence. This allows the client to register the write, sync pending state, and apply canonical data locally in a single network roundtrip (1 RTT) without risk of local state corruption.
+  * **Handshake & Schema Delivery (`RegisterClient` -> `Registered`):** Client presents `auth_token` and receives current `head_seq`, `schema_id`, and `Schema` in 1 RTT.
+  * **On-Demand Schema Refresh (`GetSchema` -> `Schema`):** Allows clients to refresh schema definitions during active DDL evolution without reconnecting.
+  * **Mutation Commit with Unified Sync (1 RTT):** Client submits an operation with its `MutationId`, `CorrelationId`, and its current cursor `last_ack_seq`. The server validates the mutation against schemas and constraints. If valid, the server assigns a monotonic `SequenceNumber` and returns `CommitAck` containing the assigned `SequenceNumber` along with any remote catchup deltas (`catchup_ops: Vec<SequencedOperation>`) that occurred between `last_ack_seq` and the new sequence (and `has_more: bool` pagination indicator). This allows the client to register the write, sync pending state, and apply canonical data locally in a single network roundtrip (1 RTT) without risk of local state corruption.
   * **Synchronization (Standalone / Polling):** Client requests operations starting from its `last_ack_seq` specifying a maximum batch size (`ClientMessage::Sync`). The server streams ordered `SequencedOperation` batches with pagination flags (`has_more`).
-  * **Acknowledgment / Heartbeat:** Client periodically reports processed sequences (`ClientMessage::Heartbeat`), allowing the server to prune its compaction buffer.
-  * **Error Handling:** Typed error responses communicate states such as invalid payloads (`ErrorCode::SchemaViolation`), authorization failures, or `BehindCompaction`.
+  * **Acknowledgment / Heartbeat:** Client periodically reports processed sequences (`ClientMessage::Heartbeat`), allowing the server to advance client leases and retention windows.
+  * **Error Handling:** Typed error responses communicate states such as invalid payloads (`ErrorCode::SchemaViolation`), authorization failures (`ErrorCode::Unauthorized`), or `BehindCompaction`.
 * **Optional Foreground Streaming:** While a client application is actively in the foreground, it can establish an ephemeral push channel (SSE) to receive real-time notifications of new commits.
 
 ---
@@ -191,12 +215,21 @@ Persisting data locally on clients and managing snapshots is decoupled into a de
   * Thread-safe memory backend with **per-room lock isolation** (`Arc<RwLock<HashMap<RoomId, Arc<RwLock<RoomState>>>>>`).
   * Operations across different rooms run 100% concurrently without lock contention. Within each room, multiple concurrent readers execute in shared mode (`read()`) while mutation batches take an exclusive lock (`write()`) on that specific room only.
   * Tabular data stored in `BTreeMap<PrimaryKey, CompactRow>` with binary snapshot serialization.
-* **On-Disk Engine (`DiskStorageEngine`) [IMPLEMENTED - Phase 2B]:**
-  * Local file-per-room architecture (`room_{id}.rimdb` with magic header `RIM1`).
-  * Append-only Write-Ahead Log (WAL) with batch framing (`0xBA7C`), per-batch CRC32 checksums, and POSIX `sync_dir` for crash resilience.
-  * Multi-process exclusive file locking (`flock`) preventing simultaneous database file mutations.
-  * RAM-resident primary index enabling $O(1)$ point lookups without requiring full disk scans.
-  * Non-blocking background Copy-on-Write (CoW) compaction with Zstandard block compression.
+* **On-Disk Engine (`DiskStorageEngine`) [IMPLEMENTED - Phase 2B & 2.8]:**
+  * **Dual-File Architecture:** Separate physical files per room:
+    * `room_{id}.snap`: Immutable base snapshot with 64-byte `RIM1` header, schema fingerprint, and Zstandard block compression.
+    * `room_{id}.wal`: Append-only Write-Ahead Log (WAL) containing batched mutational deltas framed with `0xBA7C` magic, payload length, unified CRC32, and operation count.
+  * **Physical WAL Framing in Core & Zero-Filled EOF Detection:** Framing definitions and batch codecs are centralized in `rimdb-core` (`protocol::wal_frame`) and shared directly by `rimdb-storage` and `rimdb-server` (Tier 2 Warm Disk Log). When modern thin-provisioned or pre-allocated filesystems crash and leave zero-padded trailing blocks at EOF, `recover_room` and `decode_wal_batch_from_slice` detect contiguous zero blocks as a `TornWrite`, cleanly truncating the file in-place to `valid_wal_bytes` without aborting with corruption.
+  * **Zero-Copy Snapshot Streaming (Anti-4x RAM Spike):** Both in-memory and on-disk snapshot generators serialize tables directly by reference (`RoomSnapshotRef<'a>`) into the Zstandard compressor, eliminating full database allocations and row cloning. Snapshot hydration assigns deserialized table trees (`RoomSnapshotPayload`) directly into memory state without intermediate vector-to-map transformations.
+  * **Non-Blocking Background Copy-on-Write (CoW) Compaction:**
+    * In-flight writes to `room_{id}.wal` are never blocked during Zstd compression.
+    * New snapshot is written to `room_{id}.snap.tmp`.
+    * Exclusive kernel `flock` is acquired on `.tmp` *before* atomic `rename` over `room_{id}.snap`.
+    * Directory metadata is synced via POSIX `sync_dir`.
+    * The active `room_{id}.wal` file is truncated in-place (`set_len(0)`), allowing active writers to proceed seamlessly without file recreation race conditions.
+  * **Non-Blocking Chunked Scan Streams:** Scans stream items in chunks (64 tuples), releasing read locks between chunks to eliminate writer starvation.
+  * **Multi-process exclusive file locking (`flock`):** Active process holds exclusive lock on the `.wal` file, preventing simultaneous mutations from concurrent processes.
+  * **RAM-Resident Primary Index:** Tabular memory state in `BTreeMap<PrimaryKey, CompactRow>` enables $O(1)$ point lookups without full disk scans.
 
 ---
 
@@ -205,7 +238,7 @@ Persisting data locally on clients and managing snapshots is decoupled into a de
 ### 9.1. Language & Ecosystem: Rust
 * Zero-cost abstractions and deterministic memory management without garbage collection pauses.
 * High-performance asynchronous networking with `tokio` and `axum`.
-* Fast, size-bounded binary serialization with `bincode`.
+* Fast, size-bounded binary serialization with `bincode` (strictly configured with `reject_trailing_bytes()` to prevent network stream desynchronization attacks).
 * Universal compilation: native binaries for desktop/mobile and **WebAssembly (WASM)** targets for browsers.
 * Strict workspace security policy: `#![forbid(unsafe_code)]` enforced across all crates.
 
@@ -220,8 +253,8 @@ rimdb/
 │   ├── audits/                  # Multidisciplinary specialist audit reports
 │   └── proposals/               # Architectural hardening and phase proposals
 ├── crates/
-│   ├── core/                    # Pure domain models, schemas, operations, Newtypes, protocol (Zero I/O, WASM)
-│   ├── storage/                 # Tabular storage, WAL with CRC32, RAM index, Zstd snapshots (StorageEngine trait)
+│   ├── core/                    # Pure domain models, schemas, operations, Newtypes, protocol (1-RTT messages, wal_frame 0xBA7C, Zero I/O, WASM)
+│   ├── storage/                 # Tabular storage, Dual-File (.snap + .wal), RAM index, Zstd snapshots (StorageEngine trait)
 │   ├── server/                  # Coordination server, Tokio room actors, LRU dedup, micro-WAL, HTTP/2 API
 │   └── client/                  # Client SDK, Write-Through with 1-RTT Sync, canonical storage, dual transport
 ```

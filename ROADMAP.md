@@ -13,9 +13,9 @@
 
 * Renombrado global del proyecto y de todos los paquetes a `rimdb` (`rimdb-core`, `rimdb-server`, `rimdb-client`).
 * Eliminación total de asignaciones de cadenas en heap en `Ord for Value` mediante discriminante directo `type_order(&self) -> u8` en $O(1)$.
-* Optimización de `Value` con footprint estricto de 24 bytes en 64 bits mediante boxing de variantes pesadas (`String(Box<str>)` y `Bytes(Box<Bytes>)`), reduciendo el consumo de memoria un 40% en tuplas y celdas.
+* Optimización de `Value` con footprint estricto de 24 bytes en 64 bits mediante boxing de variantes pesadas (`String(Box<str>)` y `Bytes(Box<[u8]>)`), reduciendo el consumo de memoria un 40% en tuplas y celdas y erradicando la doble indirección en el heap.
 * Optimización de `PrimaryKey` en la pila de memoria (*stack*) a **40 bytes** utilizando `SmallVec<[Value; 1]>`, eliminando totalmente el desbordamiento de línea de caché de CPU (*Zero L1 Cache Line Split*, $40\text{B} < 64\text{B}$).
-* Incorporación de variantes de datos fundamentales: `Value::Null`, `Value::Timestamp(i64)` y `Value::Bytes(Box<Bytes>)` (*zero-copy*).
+* Incorporación de variantes de datos fundamentales: `Value::Null`, `Value::Timestamp(i64)` y `Value::Bytes(Box<[u8]>)` (fat pointer 16B sin doble indirección en heap).
 * Preservación del orden físico DDL de declaración en `TableSchema` (`columns: Vec<ColumnDef>`), eliminando el desorden alfabético en `CompactRow` y blindando la compatibilidad binaria en migraciones de esquema.
 * Incorporación de conversiones zero-copy por movimiento en esquemas (`row_into_compact` y `compact_into_row`).
 * Estructuración de tuplas posicionales densas mediante `CompactRow` (`Vec<Value>`) y mantención de `RowBuilder`.
@@ -55,10 +55,10 @@
 * Soporte nativo para consultas complejas en almacenamiento sin inflar el motor: abstracción `KeyRange` (cubriendo toda la sintaxis de rangos de Rust: `..`, `a..b`, `a..=b`, `a..`), dirección `ScanDirection` (`Forward` / `Backward` para ordenamiento reverso `ORDER BY pk DESC`), *Limit pushdown* (`limit: Option<usize>`) y *Projection pushdown* (`projection: Option<Vec<u16>>`) devolviendo un `RowStream`.
 * Implementación de `MemoryStorageEngine` con **concurrencia multihilo y aislamiento estricto por sala** (`Arc<RwLock<HashMap<RoomId, Arc<RwLock<RoomState>>>>>`), erradicando la contención de cerrojos entre salas distintas y permitiendo lecturas compartidas concurrentes simultáneas (`RwLock::read`) por sala.
 * Incorporación de snapshots binarios en memoria serializados con `bincode` y método `has_table` en `Schema`.
-* Implementación del motor de persistencia en disco con WAL (`DiskStorageEngine`) y formato de archivo por sala `room_{id}.rimdb` con cabecera fija de 64 bytes (`RIM1`).
+* Implementación del motor de persistencia en disco con WAL (`DiskStorageEngine`) y arquitectura Dual-File por sala (`room_{id}.snap` + `room_{id}.wal`) con cabecera fija de 64 bytes (`RIM1`).
 * Enmarcado y suma de verificación CRC32 por registro WAL (`[len: u32][crc32: u32][payload]`) para durabilidad estricta y recuperación determinista ante caídas (*torn writes*).
 * Recuperación determinista por Replay: descompresión de snapshot base con Zstandard (`zstd`) y reproducción de deltas WAL hacia tablas en memoria `BTreeMap`.
-* Worker de compactación local y truncado de WAL con reemplazo atómico de archivo vía `.rimdb.tmp` sin bloqueo de lecturas.
+* Worker de compactación local y truncado de WAL con reemplazo atómico de snapshot vía `.snap.tmp` y truncado in-place de `.wal` sin bloqueo de lecturas.
 * Suite de pruebas unitarias ampliada a **45 tests en el workspace** (19 pruebas en `rimdb-storage`), con verificación de cero warnings en `clippy` y compilación hacia `wasm32-unknown-unknown`.
 * Reestructuración modular completa y desacoplamiento de `crates/core` (`rimdb-core`): separación de archivos monolíticos en submódulos especializados (`value/` con `scalar.rs`, `data_type.rs`, `row.rs`; `schema/` con `column.rs`, `table.rs`, `global.rs`, `validation.rs`; `mutation/` con `op.rs`, `squash.rs`, `buffer.rs`; `protocol/` con `messages.rs`, `codec.rs`; y `crypto.rs` con el trait formal `CryptoEngine` y `NoOpCryptoEngine`).
 * Extracción del 100% de tests unitarios de `crates/core/src/lib.rs` (25 tests) a suites de pruebas de integración externas en `crates/core/tests/` (`schema_validation_tests.rs`, `squashing_rules_tests.rs`, `protocol_codec_tests.rs`, `types_memory_tests.rs`), preservando retrocompatibilidad total de API con `pub mod operation` y cero advertencias de Clippy.
@@ -77,7 +77,7 @@
 * Verdadero lazy streaming en consultas `StorageEngine::scan` ($O(1)$ RAM): eliminación del `.collect()` impaciente a `Vec` en `apply_scan_transforms` retornando `ScanIterator` perezoso; streaming desacoplado mediante canal acotado `tokio::sync::mpsc::channel(64)` en `DiskStorageEngine` y paginación reactiva por batches perezosos con cursor en `MemoryStorageEngine` (compatible con WASM).
 * Blindaje aritmético y anti-DoS en decodificación de registros WAL (`format.rs` y `recovery.rs`): validación estricta de `record_len <= MAX_MESSAGE_SIZE` (16 MB) y uso de suma segura `8usize.checked_add(record_len)` para prevenir desbordamientos de enteros ante datos corruptos.
 * Enmarcado atómico por lote en WAL (`0xBA7C`, `encode_wal_batch`, `decode_wal_batch_from_slice`): cabecera de 14 bytes con marcador mágico, longitud, CRC32 unificado del lote y conteo de operaciones, asegurando atomicidad estricta (todo-o-nada) ante cortes de energía.
-* Protección de concurrencia multi-proceso a nivel de kernel de sistema operativo con file locking exclusivo (`fs2::FileExt::try_lock_exclusive`), devolviendo `StorageError::RoomLocked(RoomId)` para impedir la apertura simultánea o corrupción del archivo `room_{id}.rimdb` por múltiples procesos.
+* Protección de concurrencia multi-proceso a nivel de kernel de sistema operativo con file locking exclusivo (`fs2::FileExt::try_lock_exclusive`), devolviendo `StorageError::RoomLocked(RoomId)` para impedir la apertura simultánea o corrupción de los archivos de sala por múltiples procesos.
 * Sincronización POSIX del directorio padre (`sync_dir`) obligatoria y con propagación de errores en la inicialización y compactación de salas, protegiendo las entradas de directorio (*dentries*).
 * Corrección de semántica de Safe Update en `StorageEngine`: se ignoran las mutaciones `Update` sobre claves primarias inexistentes en vez de fabricar tuplas sintéticas con valores nulos que violen restricciones de esquema `nullable: false`.
 * Validación estricta de monotonía de secuencias (`seq == head_seq + 1`) en `StorageEngine::apply_batch` (tanto en `DiskStorageEngine` como en `MemoryStorageEngine`), rechazando brechas con `StorageError::SequenceMismatch` para impedir pérdida silenciosa de registros.
@@ -89,7 +89,11 @@
 * Definición de la arquitectura de almacenamiento de 4 niveles para el log append-only inmutable de `rimdb-server` (RAM Hot -> Warm Disk raw `.wal` -> Cold Disk Zstd `.wal.zst` -> Evicción / `BehindCompaction`) y política de ciclo de vida configurable `RoomLifecyclePolicy`.
 * Descarte total del squashing en el servidor para garantizar contigüidad estricta (`head_seq + 1`), eliminando brechas de secuencia y anomalías de tuplas zombi, y circunscribiendo el squashing exclusivamente a la cola de salida local del cliente (*Outbox Queue*).
 * Clarificación del modelo de estado cero en servidor: el servidor nunca genera ni almacena snapshots de base de datos a largo plazo; la compactación a snapshot es responsabilidad exclusiva de los clientes activos, actuando el servidor como relay efímero en streaming.
-* Verificación integral del workspace con 55 tests pasando (26 en `rimdb-core`, 28 en `rimdb-storage`, 1 en `rimdb-client`), cero warnings en Clippy (`-D warnings`) y compilación limpia hacia `wasm32-unknown-unknown`.
+* Detección y truncado automático de torn writes ante relleno de ceros al final del archivo WAL (`0x00...` por caídas de tensión en sistemas de archivos pre-alocados o sparse) tanto en el decodificador de frames como en la recuperación de sala en disco.
+* Integridad criptográfica de extremo a extremo en transferencias de snapshot multipart mediante digest BLAKE3 de 256 bits (`snapshot_hash`) incorporado en `ServerMessage::SnapshotChunk`.
+* Erradicación del pico de 4x de memoria RAM en la generación de snapshots mediante serialización directa por referencia con `RoomSnapshotRef<'a>` y asignación directa de árboles de tablas `RoomSnapshotPayload`.
+* Encapsulación estricta de newtypes de dominio (`RoomId`, `SchemaId`, `ClientId`, `SequenceNumber`, `MutationId`, `CorrelationId`) y cumplimiento de las directrices de diseño [C-DEREF] de la API de Rust, eliminando `Deref` y ofreciendo métodos y conversiones explícitos (`as_str()`, `get()`, `as_bytes()`, `AsRef<str>`, `AsRef<[u8]>`).
+* Verificación integral del workspace con 68 tests pasando (38 en `rimdb-core`, 29 en `rimdb-storage`, 1 en `rimdb-client`), cero warnings en Clippy (`-D warnings`) y compilación limpia hacia `wasm32-unknown-unknown`.
 
 ---
 
@@ -102,7 +106,7 @@ RimDB ha superado con éxito la **Fase 1 y 1.5 (Reestructuración, Blindaje de C
 - Se consolidó el contrato de red con garantías formales de idempotencia y multiplexación.
 - Se mantiene el desacoplamiento estricto de I/O, garantizando que tanto el núcleo como el almacenamiento compilen hacia WebAssembly (`wasm32-unknown-unknown`).
 - Se formalizó en [`ARCHITECTURE.md`](file:///Users/Santiago/OtherProjects/client-distributed-db/ARCHITECTURE.md#10-architectural-decisions-time-ordering--authority) la decisión de diseño de que el **servidor es la única autoridad de ordenamiento global** mediante su `sequence_id` monótono, eliminando la complejidad innecesaria de sincronización de relojes (HLC).
-- Se implementó `DiskStorageEngine` con persistencia en archivo nativo `room_{id}.rimdb`, WAL append-only con CRC32, compactación atómica zstd y tolerancia a fallos.
+- Se implementó `DiskStorageEngine` con persistencia en arquitectura Dual-File (`room_{id}.snap` + `room_{id}.wal`), WAL append-only con CRC32, compactación atómica zstd y tolerancia a fallos.
 
 El proyecto se encuentra ahora en posición para avanzar a la concurrencia por actores en el servidor (Fase 3) y construir la sincronización optimista reactiva en el cliente (Fase 4).
 
@@ -124,11 +128,11 @@ El sistema se estructura en 4 crates con fronteras de responsabilidad estrictas:
 ├────────────────────────────────┼────────────────────────────────────────────────────────┤
 │ 2. `crates/storage`            │ Motor de persistencia tabular local. Contrato          │
 │    (`rimdb-storage`)           │ `StorageEngine`, motor en memoria con aislamiento      │
-│    [FASE 2A Y 2B COMPLETADAS]  │ por sala, y motor en disco WAL `room_{id}.rimdb`.      │
+│    [FASE 2A Y 2B COMPLETADAS]  │ por sala, y motor en disco Dual-File (`.snap`+`.wal`). │
 ├────────────────────────────────┼────────────────────────────────────────────────────────┤
 │ 3. `crates/server`             │ Servidor coordinador y secuenciador monótono. Modelo de │
-│    (`rimdb-server`)            │ actores Tokio por sala (*Room*), buffer efímero con     │
-│    [PENDIENTE - FASE 3]        │ squashing, dedup LRU, micro-WAL y HTTP/2 sobre Axum.   │
+│    (`rimdb-server`)            │ actores Tokio por sala (*Room*), log inmutable de 4    │
+│    [PENDIENTE - FASE 3]        │ niveles (RAM->Warm->Cold), dedup LRU y HTTP/2 Axum.    │
 ├────────────────────────────────┼────────────────────────────────────────────────────────┤
 │ 4. `crates/client`             │ SDK de cliente ergonómico (`RimdbClient` -> `RoomHandle`  │
 │    (`rimdb-client`)            │ -> `TableHandle`), sincronización en 1 RTT (Write-Through │
@@ -144,23 +148,25 @@ flowchart TD
     subgraph Client["Cliente RimDB (rimdb-client)"]
         API["RimdbClient Facade<br/>(API de Tablas, Consultas & Watch)"]
         SyncWorker["SyncWorker<br/>(Commit & Sync en 1 RTT + SSE Signals)"]
-        Store["rimdb-storage<br/>(WAL + Tabular + Snapshots Canónicos)"]
+        Store["rimdb-storage<br/>(Dual-File .snap + .wal + Snapshots Canónicos)"]
+        Outbox["Outbox Queue<br/>(client_squash_operations previo a red)"]
     end
 
     subgraph Core["rimdb-core (Agnóstico a I/O, WASM-Ready)"]
         Types["Value / CompactRow / PrimaryKey"]
         SchemaMod["Schema / TableSchema / Validations"]
         OpMod["Operation / TableOperation"]
-        SquashMod["server_squash vs client_squash<br/>(Anti-Zombie + Two-Pointer Merge)"]
-        ProtoMod["ClientMessage / ServerMessage<br/>(MutationId, CorrelationId, SnapshotChunk)"]
+        SquashMod["Outbox Squashing<br/>(Anti-Zombie + Two-Pointer Merge)"]
+        WalFrame["protocol::wal_frame<br/>(Framing 0xBA7C + CRC32 por lote)"]
+        ProtoMod["ClientMessage / ServerMessage<br/>(Commit 1-RTT, CorrelationId, SnapshotChunk)"]
     end
 
     subgraph Server["Servidor Coordinador (rimdb-server)"]
         AxumRouter["Axum HTTP/2 Router<br/>(/commit, /sync, /heartbeat, /register, /deregister, SSE /events)"]
         RoomManager["RoomManager<br/>(DashMap Sharded Actors Registry)"]
         DedupCache["Dedup Cache LRU<br/>(MutationId -> assigned_seq)"]
-        RoomActor["RoomActor (Tokio Task Dedicada por Sala)<br/>- Monotonic Sequencer (Autoridad Total Order)<br/>- server_squash_table_operations<br/>- ClientLeaseTracker (Dead Man's Switch 90s)"]
-        CompBuffer["CompactionBuffer (BTreeMap + PK Index)<br/>- Background Non-Blocking CoW Compaction<br/>- Preservación Atómica de flock"]
+        RoomActor["RoomActor (Tokio Task Dedicada por Sala)<br/>- Monotonic Sequencer (Autoridad Total Order)<br/>- Log Inmutable de 4 Niveles (Cero Squashing)<br/>- ClientLeaseTracker (Dead Man's Switch 90s)"]
+        LogTiers["Jerarquía de Log Inmutable<br/>- Tier 1: Hot RAM (VecDeque contiguo)<br/>- Tier 2: Warm Disk (.wal con wal_frame)<br/>- Tier 3: Cold Disk (.wal.zst con Zstd)"]
         MicroWAL["Micro-WAL Metadatos<br/>(meta_{room_id}.wal durable con CRC32)"]
     end
 
@@ -191,9 +197,9 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 * **Incorporación de `DataType::Decimal` y `Value::Decimal`:**
   Representación de punto fijo (`i128` mantissa, `u32` escala) o integración liviana para cálculos monetarios y contables libres de los errores de redondeo de `Float` (`f64`).
 * **[COMPLETADO] Definición de `trait CryptoEngine`:**
-  Puerto de abstracción para que el cliente pueda inyectar la implementación de cifrado/descifrado simétrico para columnas marcadas con `encrypted: true`, manteniendo `rimdb-core` puro y desacoplado de dependencias criptográficas pesadas. Implementado en `crates/core/src/crypto.rs` junto a `NoOpCryptoEngine`.
-* **[COMPLETADO] Algoritmo Two-Pointer Merge y Desacoplamiento de Squashing:**
-  Fusión lineal de deltas de columna en $O(M+N)$ (`merge_sorted_column_updates`) sin alocaciones repetidas en heap ni desplazamientos cuadráticos en memoria (`crates/core/src/mutation/squash.rs`). Desacoplamiento explícito de `server_squash` (orden autoritativo por secuencia) y `client_squash` (LWW por timestamp local).
+  Puerto de abstracción para que el cliente pueda inyectar la implementación de cifrado/descifrado simétrico para columnas marcadas con `encrypted: true`, manteniendo `rimdb-core` puro y desacoplado de dependencias criptográficas pesadas. Implementado en `crates/core/src/crypto.rs` junto a `NoOpCryptoEngine`, `CryptoConcurrencyBounds` condicional para soporte de WebCrypto en `wasm32`, y soporte de datos autenticados adicionales (`aad: &[u8]`).
+* **[COMPLETADO] Algoritmo Two-Pointer Merge y Squashing en Outbox Local:**
+  Fusión lineal de deltas de columna en $O(M+N)$ (`merge_sorted_column_updates`) sin alocaciones repetidas en heap ni desplazamientos cuadráticos en memoria (`crates/core/src/mutation/squash.rs`). El squashing queda circunscrito exclusivamente a la cola de salida local del cliente (`client_squash` en Outbox Queue) antes de emitir a la red; en el servidor, el log histórico de deltas es 100% append-only, contiguo e inmutable para preservar la secuencia monotónica sin huecos.
 * **[COMPLETADO] Erradicación de Clonaciones e Incompatibilidades en `TableBuffer`:**
   Inspección in-place mediante `get_mut(&op.pk)` previo a clonar claves primarias en `TableBuffer::apply`. Retorno tipado `Result<SquashOutcome, BufferError>` (`BufferError::IncompatibleOperation`) para evitar descarte silencioso de mutaciones.
 * **[COMPLETADO] Atribución de Origen y Mensaje de Desregistro en Protocolo:**
@@ -234,18 +240,17 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
   - Tablas particionadas en `BTreeMap<PrimaryKey, CompactRow>` y serialización/deserialización de snapshots binarios mediante `bincode`.
 
 #### Fase 2B: Motor de Almacenamiento en Disco con WAL [COMPLETADO]
-* **[COMPLETADO] Formato de archivo tabular nativo por sala (`room_{id}.rimdb`):**
-  - **Cabecera (Header):** Magic bytes (`RIM1`), versión de formato (`u16`), identificador de esquema, `snapshot_seq: u64`, `head_seq: u64`.
-  - **Bloque de Snapshot Base:** Dump binario consolidado de las tuplas de todas las tablas comprimido con Zstandard (`zstd`).
-  - **Bloque Append-Only Delta Log (WAL):** Segmento al final del archivo donde cada mutación local commiteada o remota recibida se agrega secuencialmente precedida por su longitud en bytes (`u32`) y suma de verificación CRC32 (`u32`).
-* **Índice primario en memoria con recuperación por Replay:**
-  Al inicializar una sala, leer el snapshot base y reproducir (*replay*) el WAL secuencialmente para levantar en memoria un mapa de punteros rápidos `HashMap<(TableName, PrimaryKey), FileOffset>` para resolución de lecturas en $O(1)$.
+* **[COMPLETADO] Arquitectura Dual-File nativa por sala (`room_{id}.snap` + `room_{id}.wal`):**
+  - **Archivo de Snapshot Base (`room_{id}.snap`):** Cabecera fija de 64 bytes (`RIM1`), versión de formato (`u16`), `snapshot_seq: u64`, `head_seq: u64`, longitud comprimida y CRC32. Contiene el volcado binario consolidado de las tablas comprimido con Zstandard (`zstd`).
+  - **Archivo Append-Only Delta Log (`room_{id}.wal`):** Log secuencial append-only donde cada mutación local commiteada o remota recibida se agrega en lotes enmarcados (`0xBA7C`, longitud, CRC32, conteo de operaciones y payload Bincode).
+* **Mecanismo Copy-on-Write (CoW) Real y Truncado de WAL In-Place:**
+  Durante la compactación, una tarea en background genera el nuevo snapshot en `room_{id}.snap.tmp`, adquiere el cerrojo exclusivo (`flock`) sobre `.tmp` antes de invocar `rename()` atómico sobre `.snap` y ejecuta `sync_dir()`. Las mutaciones entrantes nunca se bloquean y continúan agregándose a `.wal`. Al consolidar el snapshot, `.wal` se trunca in-place a longitud 0 (`set_len(0)`).
+* **Recuperación por Replay en Streaming:**
+  Al abrir una sala, el motor desempaca el snapshot base y reproduce el log WAL secuencialmente con `BufReader` de 64 KB hacia las tablas en memoria `BTreeMap`, truncando automáticamente cualquier torn write en el extremo de `.wal`.
 * **Codificación Memcomparable para Claves Primarias:**
   Serialización binaria de claves ordenables lexicográficamente directamente sobre bytes sin requerir deserializar los tipos `Value`.
 * **Integridad Criptográfica de Snapshots con BLAKE3:**
   Cálculo y verificación de checksums BLAKE3 en snapshots exportados para detectar corrupciones de almacenamiento o tránsito antes de aplicarlos en el cliente.
-* **Worker de compactación local en segundo plano:**
-  Lógica de mantenimiento que, cuando el tamaño del segmento WAL supera 3 veces el tamaño del snapshot base, genera un nuevo snapshot consolidado y trunca el log sin bloquear las lecturas locales.
 * **Previsión de Escalabilidad (Buffer Pool / Slotted-Pages):**
   Diseño modular para facilitar a futuro la incorporación de un buffer pool con páginas ranuradas si el dataset de una sala supera la memoria física del dispositivo cliente.
 
@@ -262,13 +267,16 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
   - `src/config.rs`: Estructura deserializable `ServerConfig` con soporte para archivos TOML y variables de entorno (`RIMDB_PORT`, `RIMDB_DATA_DIR`, `RIMDB_LEASE_TIMEOUT_SECS`, etc.).
   - `src/error.rs`: Enum tipado `ServerError` con conversiones automáticas hacia códigos de estado HTTP y respuestas binarias estructuradas (`ErrorCode::SchemaViolation`, `BehindCompaction`, `RoomLocked`, `SequenceMismatch`).
   - `src/actor/`: Subsistema de concurrencia y gestión del ciclo de vida de salas (`command.rs`, `manager.rs`, `room.rs`, `lease.rs`).
-  - `src/buffer/`: Buffering en memoria, squashing autoritativo y caché de deduplicación (`compaction.rs`, `dedup.rs`).
-  - `src/wal.rs`: Motor de Micro-WAL para persistencia de secuencias (`meta_{room_id}.wal`).
+  - `src/log/`: Jerarquía de log inmutable de 4 niveles (`hot_buffer.rs`, `warm_disk.rs`, `cold_disk.rs`, `policy.rs`) y caché LRU de deduplicación (`dedup.rs`).
+  - `src/micro_wal.rs`: Motor de Micro-WAL para persistencia de secuencias (`meta_{room_id}.wal`).
   - `src/api/`: Router de Axum, handlers binarios HTTP/2 y emisor de Server-Sent Events (`router.rs`, `handlers.rs`, `sse.rs`).
 
 #### 4.3.2. Concurrencia Aislada por Actores Tokio (`RoomActor` y `RoomManager`)
+* **Catálogo Centralizado de Esquemas (`SchemaRegistry`):**
+  - Gestiona y cachea en memoria (`DashMap<SchemaId, Arc<Schema>>`) las plantillas de esquemas registradas por el administrador, persistidas en `meta_schema_{id}.json`.
+  - Múltiples salas comparten la misma referencia `Arc<Schema>`, erradicando la duplicación en memoria.
 * **Gestor Shardeado de Salas (`RoomManager`):**
-  - Registro centralizado con mapa concurrente shardeado (`DashMap<RoomId, mpsc::Sender<RoomCommand>>`) que gestiona el ciclo de vida de las salas, instanciando actores de forma perezosa (*lazy spawning*) a la primera solicitud y recolectando salas inactivas.
+  - Registro centralizado con mapa concurrente shardeado (`DashMap<RoomId, mpsc::Sender<RoomCommand>>`) que gestiona el ciclo de vida de las salas, instanciando actores de forma perezosa (*lazy spawning*) vinculados a su `SchemaId` y recolectando salas inactivas.
 * **Actor Tokio Dedicado por Sala (`RoomActor`):**
   - Cada sala activa ejecuta su propio bucle de eventos en una tarea Tokio independiente con un canal acotado `mpsc::channel(1024)`, eliminando la contención de bloqueos globales (*lock-free sharding*).
 * **Contrato Exhaustivo de Comandos (`RoomCommand`):**
@@ -276,7 +284,11 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
   pub enum RoomCommand {
       RegisterClient {
           client_id: ClientId,
-          reply_to: oneshot::Sender<Result<SequenceNumber, ServerError>>,
+          auth_token: String,
+          reply_to: oneshot::Sender<Result<(SequenceNumber, SchemaId, Schema), ServerError>>,
+      },
+      GetSchema {
+          reply_to: oneshot::Sender<Result<(SchemaId, Schema), ServerError>>,
       },
       DeregisterClient {
           client_id: ClientId,
@@ -285,8 +297,9 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
           client_id: ClientId,
           mutation_id: MutationId,
           correlation_id: CorrelationId,
+          last_ack_seq: SequenceNumber,
           op: Operation,
-          reply_to: oneshot::Sender<Result<SequenceNumber, ServerError>>,
+          reply_to: oneshot::Sender<Result<(SequenceNumber, Vec<SequencedOperation>, bool), ServerError>>,
       },
       Sync {
           last_ack_seq: SequenceNumber,
@@ -341,9 +354,18 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 * **Soporte para Desregistro Voluntario:**
   - Mediante `ClientMessage::DeregisterClient`, un cliente que se desconecta de forma ordenada notifica al actor para liberar su lease de inmediato sin esperar el timeout de inactividad.
 
-#### 4.3.8. Capa de Red Axum HTTP/2 y Canal SSE de Señalización
-* **Endpoints Binarios de Alto Rendimiento:**
-  - `POST /rooms/{room_id}/register`: Registro inicial, retorno de `head_seq` y validación de compatibilidad.
+#### 4.3.8. Separación de Planos de Red: Control Plane (Admin) y Data Plane (Clientes)
+* **Control Plane (API Administrativa REST con JSON):**
+  - Autenticado mediante header `Authorization: Bearer <ADMIN_SECRET>`.
+  - `POST /admin/schemas`: Registro y actualización de plantillas `Schema` asociadas a un `SchemaId`.
+  - `GET /admin/schemas/{schema_id}`: Inspección del esquema en formato JSON.
+  - `POST /admin/schemas/{schema_id}/columns`: Evolución de esquema *append-only* (`add_column`), forzando `nullable: true`.
+  - `POST /admin/rooms`: Aprovisionamiento de sala vinculando `RoomId` a `SchemaId` y `RoomLifecyclePolicy`.
+  - `GET /admin/rooms/{room_id}`: Métricas de sala (secuencia actual, uso de disco, leases activos).
+  - `DELETE /admin/rooms/{room_id}`: Poda o archivado de sala y su WAL.
+* **Data Plane (Endpoints Binarios HTTP/2 de Alto Rendimiento):**
+  - `POST /rooms/{room_id}/register`: Handshake inicial con verificación stateless de `auth_token` (HMAC-SHA256), retorno de `head_seq` y entrega del `Schema` completo en 1 RTT.
+  - `POST /rooms/{room_id}/schema`: Consulta bajo demanda del esquema vigente (`GetSchema` -> `Schema`) para refrescos ante migraciones.
   - `POST /rooms/{room_id}/deregister`: Desconexión voluntaria inmediata.
   - `POST /rooms/{room_id}/commit`: Recepción de mutación binaria con `MutationId`, secuenciación y respuesta `CommitAck`.
   - `POST /rooms/{room_id}/sync`: Pull paginado con backpressure según `max_batch_size` a partir de `last_ack_seq`.
@@ -493,7 +515,7 @@ tokio::spawn(async move {
 │ [x] Definir el contrato trait CryptoEngine para E2EE en rimdb-core.         │
 │ [x] Crear el crate crates/storage (rimdb-storage) con dependencias base.    │
 │ [x] Definir el contrato formal trait StorageEngine.                         │
-│ [x] Implementar formato de archivo room_{id}.rimdb con header mágico RIM1.  │
+│ [x] Implementar arquitectura Dual-File (room_{id}.snap + room_{id}.wal) RIM1│
 │ [x] Implementar Write-Ahead Log (WAL) append-only con checksums CRC32.      │
 │ [x] Implementar índice primario en RAM y reconstrucción vía replay.         │
 │ [x] Implementar compresión/descompresión de snapshots con Zstandard (zstd). │
@@ -505,7 +527,7 @@ tokio::spawn(async move {
 │ [x] Extracción de 25 tests de crates/core a suites de integración externas. │
 │ [x] Reestructuración modular de crates/storage (memory, disk, sys, index).  │
 │ [x] Extracción de 19 tests de crates/storage a suites de integración.       │
-│ [x] Abstracción PrimaryIndex y sincronización POSIX sync_dir en storage.    │
+│ [x] Gestión de índices primarios directos y POSIX sync_dir en storage.       │
 │ [x] Algoritmo Two-Pointer Merge O(M+N) lineal sin alocaciones en squashing. │
 │ [x] Erradicación de clone() incondicional y manejo tipado en TableBuffer.   │
 │ [x] Desacoplamiento de squashing server (total order) vs client (LWW).      │
@@ -525,26 +547,49 @@ tokio::spawn(async move {
 │ [x] Validación preventiva de MAX_MESSAGE_SIZE en encode_wal_batch (disco).  │
 │ [x] Fallback defensivo en sync_dir para rutas de directorio vacías (""->".").│
 │ [x] Homogeneización de dependencia tracing = { workspace = true } en core.  │
+│ [x] Newtype SchemaId y catálogo de esquemas en protocolo (GetSchema/Schema). │
+│ [x] Deserialización ergonómica de Schema y evolución DDL (add_column).       │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ FASE 2.8: Endurecimiento de Contratos Core y Storage [COMPLETADA]           │
+│ [x] Contrato 1-RTT: last_ack_seq en Commit y catchup_ops/has_more en Ack.   │
+│ [x] Arquitectura Dual-File: room_{id}.snap y room_{id}.wal en disk storage. │
+│ [x] Extracción de enmarcado físico wal_frame (0xBA7C, CRC32) en rimdb-core. │
+│ [x] Truncado in-place de .wal en compactación y flock atómico pre-rename.   │
+│ [x] Paginación de scan por bloques de 64 tuplas liberando locks de lectura. │
+│ [x] Purga absoluta de squashing en servidor (log append-only inmutable).    │
+│ [x] Trait condicional CryptoConcurrencyBounds y soporte de AAD en Crypto.   │
+│ [x] Purga de la abstracción huérfana PrimaryIndex en rimdb-storage.         │
+│ [x] Optimización de Value::Bytes(Box<[u8]>) erradicando doble indirección.  │
+│ [x] Validadores posicionales en O(C) (validate_operation y column_updates). │
+│ [x] Tolerancia de aridad compact_into_row y redimensionamiento en storage.  │
+│ [x] Rechazo estricto de trailing bytes (reject_trailing_bytes) en el códec. │
+│ [x] Detección de torn writes por ceros al EOF y truncado en recuperación.   │
+│ [x] Integridad BLAKE3 en SnapshotChunk (snapshot_hash) de extremo a extremo.│
+│ [x] Streaming zero-copy de snapshots (RoomSnapshotRef) erradicando 4x RAM.  │
+│ [x] Encapsulación de newtypes y cumplimiento C-DEREF (eliminación de Deref).│
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ FASE 3: Servidor Coordinador y Secuenciador (rimdb-server) [ACTIVA]         │
 │ [ ] Modularizar crate en src/lib.rs (reusable) y src/main.rs (CLI binario). │
 │ [ ] Struct de configuración ServerConfig (TOML y variables de entorno).     │
 │ [ ] Tipado formal ServerError y mapeo a códigos HTTP y binarios.            │
-│ [ ] Gestor shardeado RoomManager (DashMap) con creación lazy de salas.      │
+│ [ ] Catálogo centralizado de plantillas de esquemas (SchemaRegistry).        │
+│ [ ] Gestor shardeado RoomManager (DashMap) con vinculación a SchemaId.       │
 │ [ ] Actor Tokio dedicado por sala (RoomActor) con mpsc::channel(1024).      │
-│ [ ] Contrato exhaustivo de comandos RoomCommand (Register, Commit, Sync).   │
+│ [ ] Contrato de comandos RoomCommand (RegisterClient, GetSchema, Commit).   │
+│ [ ] Control Plane REST HTTP/JSON (/admin/schemas, /admin/rooms) con auth.    │
+│ [ ] Middleware de validación stateless de auth_token en RegisterClient.      │
 │ [ ] Secuenciador monótono atómico de mutaciones (head_seq += 1, Total Order)│
 │ [ ] Micro-WAL en disco (meta_{room_id}.wal) con CRC32 para durabilidad crash│
 │ [ ] Caché LRU de deduplicación de MutationId rehidratada desde Micro-WAL.   │
-│ [ ] CompactionBuffer en RAM con BTreeMap e índice primario por tabla.       │
-│ [ ] Parametrizar TableBuffer con política server_squash para el RoomActor.  │
-│ [ ] Compactación Copy-on-Write en background liberando lock durante Zstd.   │
-│ [ ] Preservación atómica de flock tomando el lock sobre .tmp antes de rename│
+│ [ ] HotBuffer en RAM: log contiguo e inmutable (VecDeque<SequencedOp>).     │
+│ [ ] WarmDisk Log en disco (.wal sin comprimir) con wal_frame de core.       │
+│ [ ] ColdDisk Log en disco (.wal.zst) con Zstd en spawn_blocking.            │
+│ [ ] Política de retención RoomLifecyclePolicy y límite BehindCompact.       │
 │ [ ] ClientLeaseTracker con Dead Man's Switch (timeout 90s) anti-OOM de RAM. │
 │ [ ] Desregistro explícito de clientes con ClientMessage::DeregisterClient.  │
 │ [ ] Router y handlers Axum HTTP/2 (/commit, /sync, /heartbeat, /register).  │
 │ [ ] Canal SSE de señalización liviana (Event::HeadAdvanced) sin payloads.   │
-│ [ ] Manejo de clientes rezagados con ErrorCode::BehindCompaction y chunks.  │
+│ [ ] Relay efímero de chunks multipart para snapshots >16MB.                 │
 │ [ ] Batería de pruebas de integración concurrentes con múltiples clientes.  │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ FASE 4: SDK Local-First Reactivo y Sincronización (rimdb-client)            │
@@ -589,27 +634,35 @@ La siguiente tabla mapea el origen de cada requerimiento según la recomendació
 | Creación de `trait StorageEngine` e implementación tabular | Base de Datos / Arq. | `rimdb-storage` | **Alta** | ✅ **Completado** |
 | Write-Ahead Log (WAL) con suma de verificación CRC32 | Base de Datos / Arq. | `rimdb-storage` | **Alta** | ✅ **Completado** |
 | Snapshots comprimidos con `zstd` | Base de Datos | `rimdb-storage` | **Alta** | ✅ **Completado** |
-| Abstracción `trait CryptoEngine` para E2EE | Arquitectura | `rimdb-core` / `client` | **Media** | ✅ **Completado** |
+| Abstracción `trait CryptoEngine` para E2EE con AAD y `CryptoConcurrencyBounds` | Arquitectura | `rimdb-core` / `client` | **Media** | ✅ **Completado** |
+| Purga de abstracción `PrimaryIndex` y simplificación de índices en storage | Arquitectura / DB | `rimdb-storage` | **Media** | ✅ **Completado** |
+| Optimización de fat pointer en `Value::Bytes(Box<[u8]>)` a 24B exactos | Rust / Rendimiento | `rimdb-core` | **Media** | ✅ **Completado** |
 | Reestructuración modular y tests externos en `rimdb-core` | Arquitectura / Rust | `rimdb-core` | **Alta** | ✅ **Completado** |
 | Reestructuración modular y tests externos en `rimdb-storage` | Arquitectura / DB | `rimdb-storage` | **Alta** | ✅ **Completado** |
 | Aislamiento de Zstandard con `spawn_blocking` | Rust / Rendimiento | `rimdb-storage` | **Alta** | ✅ **Completado** |
 | Lectura en streaming en startup (`BufReader` 64 KB) | Base de Datos | `rimdb-storage` | **Alta** | ✅ **Completado** |
 | Verdadero lazy streaming en `scan` ($O(1)$ RAM) | Rust / DB | `rimdb-storage` | **Alta** | ✅ **Completado** |
 | Blindaje aritmético y anti-DoS en decodificación WAL | Sist. Distribuidos / DB | `rimdb-storage` | **Alta** | ✅ **Completado** |
-| Enmarcado atómico por lote en WAL (`0xBA7C`) | Base de Datos / Rust | `rimdb-storage` | **Alta** | ✅ **Completado** |
+| Enmarcado físico de lotes WAL (`0xBA7C`, CRC32) extraído a `rimdb-core` | Base de Datos / Rust | `rimdb-core` / `rimdb-storage` | **Alta** | ✅ **Completado** |
+| Arquitectura Dual-File en disco (`room_{id}.snap` + `room_{id}.wal`) con truncado in-place | Base de Datos / Sist. | `rimdb-storage` | **Alta** | ✅ **Completado** |
 | File locking exclusivo multi-proceso (`flock`) | Base de Datos / Sist. | `rimdb-storage` | **Alta** | ✅ **Completado** |
+| Preservación atómica de `flock` sobre `.tmp` antes de `rename` | Base de Datos / Sist. | `rimdb-storage` | **Alta** | ✅ **Completado** |
+| Scan no bloqueante con cursor en `DiskStorageEngine` liberando locks | Rust / Rendimiento | `rimdb-storage` | **Alta** | ✅ **Completado** |
+| Contrato de sincronización atómica 1-RTT (`last_ack_seq`, `catchup_ops`, `has_more`) | Sist. Distribuidos / Arq. | `rimdb-core` | **Alta** | ✅ **Completado** |
 | Safe Update semantics (sin tuplas sintéticas Null) | Base de Datos | `rimdb-storage` | **Alta** | ✅ **Completado** |
 | Validación estricta de monotonía de secuencias | Sistemas Distribuidos | `rimdb-storage` | **Alta** | ✅ **Completado** |
 | Protocolo de bootstrapping multipart para snapshots >16MB | Sist. Distribuidos / Arq. | `rimdb-core` | **Alta** | ✅ **Completado** |
 | Observabilidad transversal (tracing) y lints Clippy | Rust / Arquitectura | Workspace / `rimdb-storage` | **Alta** | ✅ **Completado** |
+| Validadores posicionales nativos en $O(C)$ (`validate_operation` y `validate_column_updates`) | Base de Datos / Core | `rimdb-core` | **Alta** | ✅ **Completado** |
+| Tolerancia de aridad corta en `compact_into_row` y redimensionamiento dinámico en `apply_batch` | Base de Datos / Sist. | `rimdb-core` / `rimdb-storage` | **Alta** | ✅ **Completado** |
+| Endurecimiento de códec binario con `reject_trailing_bytes()` | Seguridad / Red | `rimdb-core` | **Alta** | ✅ **Completado** |
 | Modularización de `rimdb-server` (`lib.rs` + `main.rs`, `ServerConfig`) | Arquitectura / Rust | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
 | Concurrencia por actores Tokio (`RoomManager` con `DashMap`, `RoomActor` con `mpsc(1024)`) | Sist. Distribuidos / Arq. | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
 | Secuenciador monótono atómico de mutaciones (Autoridad Total Order) | Sist. Distribuidos / Diseño | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
 | Micro-WAL durable en disco (`meta_{room_id}.wal` con CRC32) | Sist. Distribuidos / DB | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
 | Caché LRU de deduplicación de `MutationId` respaldada en Micro-WAL | Sist. Distribuidos | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
-| `CompactionBuffer` en RAM con squashing autoritativo de servidor | Base de Datos / Rust | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
-| Compactación CoW no bloqueante en background (`spawn_blocking`) | Rust / Rendimiento | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
-| Preservación atómica de `flock` sobre `.tmp` antes de `rename` | Base de Datos / Sist. | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
+| Log inmutable de 4 niveles en servidor (Hot RAM -> Warm Disk -> Cold Disk) | Sist. Distribuidos / DB | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
+| Compactación CoW no bloqueante en background (`spawn_blocking`) | Rust / Rendimiento | `rimdb-storage` | **Alta** | ✅ **Completado** |
 | `ClientLeaseTracker` con Dead Man's Switch (timeout 90s) anti-OOM | Sist. Distribuidos | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
 | Router y handlers Axum HTTP/2 binarios (`/commit`, `/sync`, etc.) | Arquitectura / Red | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
 | Canal SSE de señalización liviana (`Event::HeadAdvanced`) | Sist. Distribuidos | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
@@ -623,6 +676,12 @@ La siguiente tabla mapea el origen de cada requerimiento según la recomendació
 | Adaptadores de transporte dual Nativo (HTTP/2) y WASM (WebFetch) | Arquitectura | `rimdb-client` | **Alta** | ⏳ **Pendiente (Fase 4)** |
 | Onboarding de salas y recuperación ante `BehindCompaction` (chunks >16MB) | Sist. Distribuidos / Arq. | `rimdb-client` | **Alta** | ⏳ **Pendiente (Fase 4)** |
 | Batería de pruebas E2E de partición y concurrencia | Sist. Distribuidos / Rust | Workspace / Tests | **Alta** | ⏳ **Pendiente (Fase 5)** |
+| Newtype `SchemaId` y catálogo de esquemas en protocolo | Arquitectura / Rust | `rimdb-core` | **Alta** | ✅ **Completado** |
+| Deserialización limpia de `Schema` y `add_column` DDL | Base de Datos | `rimdb-core` | **Alta** | ✅ **Completado** |
+| `SchemaRegistry` durable en servidor (`meta_schema_{id}.json`) | Base de Datos / Arq. | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
+| Control Plane REST (`/admin/schemas`, `/admin/rooms`) con Bearer auth | Red / Seguridad | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
+| Verificación stateless de `auth_token` en `RegisterClient` | Seguridad / Distribuidos | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
+| SDK de Administración dedicado para clientes (Admin SDK) | Arquitectura | `rimdb-client` | Baja | 💤 **Diferido (Post-v0.1)** |
 | Tipo `DataType::Decimal` / `Value::Decimal` | Base de Datos | `rimdb-core` | Baja | 💤 **Diferido (Post-v0.1)** |
 | Red P2P pura sin servidor / Snapshot Relay ad-hoc | Sistemas Distribuidos | `rimdb-client` | Baja | 💤 **Diferido (Post-v0.1)** |
 | Integridad adicional de snapshots con BLAKE3 | Distribuidos / DB | `rimdb-storage` | Baja | 💤 **Diferido (Post-v0.1)** |
@@ -651,8 +710,10 @@ Para optimizar la velocidad de desarrollo y evitar sobre-ingeniería prematura e
 6. **CRDT Celular (`FieldMutation` con timestamps por columna):**
    - *Razón de diferimiento:* La arquitectura adopta formalmente la autoridad del `sequence_id` del servidor como único árbitro determinista para orden total y resolución Last-Write-Wins (LWW) a nivel de mutación.
 7. **Índices Secundarios No Primarios (`BTreeMap<Value, BTreeSet<PrimaryKey>>`):**
-   - *Razón de diferimiento:* Para la v0.1 el almacenamiento indexa eficientemente por clave primaria (`PrimaryKey`) mediante `PrimaryIndex`, soportando búsquedas en $O(1)$ y escaneos de rangos (`KeyRange`). La gestión de índices secundarios en memoria y su mantenimiento atómico durante compactación y replay de WAL es 100% aditiva y se abordará tras estabilizar la sincronización cliente-servidor.
+   - *Razón de diferimiento:* Para la v0.1 el almacenamiento indexa eficientemente por clave primaria (`PrimaryKey`) mediante `BTreeMap<PrimaryKey, CompactRow>` directo por tabla, soportando búsquedas en $O(1)$ amortizado y escaneos de rangos (`KeyRange`). La gestión de índices secundarios en memoria y su mantenimiento atómico durante compactación y replay de WAL es 100% aditiva y se abordará tras estabilizar la sincronización cliente-servidor.
 8. **Borradores Offline Explícitos (Opción B: Staged Drafts):**
    - *Razón de diferimiento:* Para la v0.1 se garantiza la integridad estricta del motor de almacenamiento mediante el modelo *Server-Authoritative Write-Through con Sync en 1 RTT*: toda mutación se valida y secuencia primero en el servidor antes de ingresar al almacenamiento canónico (`StorageEngine`). Esto erradica de raíz el riesgo de inconsistencias locales por validaciones fallidas o estados huérfanos. El soporte para retener borradores no confirmados mientras el cliente esté offline es 100% aditivo y se incorporará como un gestor de borradores segregado (`DraftManager` o tabla de staging `__rimdb_drafts`), sin alterar el motor de persistencia canónico ni el protocolo del servidor.
+9. **SDK de Administración Dedicado para Clientes (Admin SDK):**
+   - *Razón de diferimiento:* El Control Plane opera sobre HTTP REST estándar con payloads JSON (`/admin/...`), permitiendo aprovisionar esquemas y salas desde cualquier herramienta (`curl`, scripts bash, Postman, o backends en Node/Python/Go/Rust). Si el backend de aplicación está escrito en Rust, puede utilizar directamente la biblioteca del servidor (`rimdb_server::lib`) en modo embebido sin costo de red. Construir un SDK cliente tipado dedicado es un wrapper de conveniencia que se implementará de forma aditiva una vez estabilizados los endpoints HTTP.
 
 
