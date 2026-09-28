@@ -103,21 +103,24 @@ To balance minimal RAM usage with flexible offline support, the coordination ser
 ```
 
 1. **Tier 1 (Hot RAM Buffer):**
-   * Serves real-time queries and fast synchronization for currently connected clients.
-   * Holds an immutable contiguous buffer of recent `SequencedOperation`s. No squashing is performed on sequenced deltas, ensuring absolute sequence contiguity (`head_seq + 1`) and preventing sequence gaps or zombie record anomalies.
-   * Promoted/flushed to Warm Disk when the batch reaches the memory threshold or RAM TTL expires.
-2. **Tier 2 (Warm Disk Log - Uncompressed `.wal`):**
+   * Serves real-time queries and sub-millisecond synchronization for currently connected clients.
+   * Holds an immutable contiguous buffer of recent `SequencedOperation`s (`VecDeque`). No squashing is performed on sequenced deltas, ensuring absolute sequence contiguity (`head_seq + 1`) and preventing sequence gaps or zombie record anomalies.
+   * Rotates and evicts older operations from RAM when the batch reaches the memory threshold (`ram_max_ops`) or RAM TTL expires, knowing data is already physically safe on disk.
+2. **Tier 2 (Warm Disk Log - Uncompressed `.wal` con Write-Through):**
    * Stored directly on disk using the standard batch framing (`0xBA7C` magic, length, unified CRC32, operation count).
-   * Remains uncompressed to completely avoid CPU decompression spikes when clients reconnect after hours or a few days.
+   * **Strict Write-Through Durability:** Every accepted mutation is synchronously written to `active.wal` with `sync_data()` before confirming `CommitAck`, guaranteeing zero data loss on power failures or server crashes.
+   * When HotBuffer rotates, `active.wal` is sealed as `segment_{start}_{end}.wal`. Remains uncompressed to avoid CPU decompression spikes when clients reconnect after hours or days.
    * Sequential I/O enables high-speed streaming during `/sync`.
 3. **Tier 3 (Cold Disk Log - Compressed `.wal.zst`):**
-   * As segments age past the Warm retention threshold, a background task compresses older `.wal` files into `.wal.zst` segments using Zstandard.
-   * Allows rooms to retain weeks of historical deltas without consuming substantial disk storage.
-4. **Tier 4 (Eviction & Compaction Boundary):**
-   * Historical operations that exceed the Cold Disk retention period or room storage quota are purged from disk.
-   * The server tracks the oldest available sequence (`tail_seq` / compaction boundary).
-   * Any client connecting with `last_ack_seq < tail_seq` is marked desynchronized and receives an `ErrorCode::BehindCompaction` response.
-   * Because the server does not hold long-term historical table states, the desynchronized client requests a full base snapshot from an **active client** in the Room (transferred directly P2P or via the server's ephemeral snapshot relay).
+   * As segments age past the Warm retention threshold, a background task compresses older `.wal` files into `.wal.zst` segments using Zstandard (isolated in `spawn_blocking`).
+   * Allows rooms to retain historical deltas with minimal disk consumption.
+4. **Tier 4 (Eviction & Compaction Boundary - Dual Mode):**
+   * **Proactive Cursor-Driven Pruning (`prune_older_than`):** In active rooms, once all registered members confirm having processed up to sequence $S$, segments with `end_seq < S` are immediately purged from disk, reclaiming physical space without waiting for arbitrary TTLs.
+   * **Client Lifecycle States (`Connected`, `Disconnected`, `Dormant`):**
+     - **`Connected`:** The client is actively communicating (heartbeats, commits, syncs). If all registered clients are `Connected` and have acknowledged sequence $S$, segments older than $S$ are pruned immediately.
+     - **`Disconnected`:** The client closed the application or lost network connectivity, but its cursor remains within the log range preserved on disk (`last_ack_seq >= tail_seq - 1`). Upon reconnecting, it fetches missing deltas via standard `/sync` and transitions back to `Connected` without needing a snapshot.
+     - **`Dormant`:** The client remained offline so long that the log containing its cursor was physically purged by retention policies (TTL or disk quota), leaving `last_ack_seq < tail_seq - 1`. The client cannot perform delta sync and **must request a full snapshot** to resynchronize. Crucially, `Dormant` clients are excluded from log retention calculations, preventing offline/abandoned clients from blocking disk compaction for active members (Anti-Disk-Bloat / Anti-OOM).
+   * **TTL & Quota Compaction:** Historical operations exceeding `cold_disk_ttl` or the room disk quota (`max_room_disk_bytes`) are automatically pruned. The server tracks the oldest available sequence (`tail_seq`). Any sync request with `last_ack_seq < tail_seq - 1` receives `BehindCompaction`, recovering state via full base snapshot transfer from an active client (via server relay or P2P).
 
 ### 5.3. Configurable Lifecycle Policy (`RoomLifecyclePolicy`)
 All tier retention thresholds and size boundaries are fully configurable per deployment and room:

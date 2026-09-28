@@ -332,10 +332,16 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 
 #### 4.3.5. Jerarquía de Almacenamiento de 4 Niveles para el Log Inmutable
 * **Estructura en 4 Niveles de Log Append-Only:**
-  - **Nivel 1: RAM Hot Buffer:** Mantiene un buffer contiguo e inmutable de deltas recientes (`VecDeque<SequencedOperation>` o `BTreeMap<SequenceNumber, SequencedOperation>`) para resolver lecturas inmediatas de `/sync`. **Cero squashing sobre deltas secuenciados**: garantiza contigüidad estricta (`head_seq + 1`), erradicando brechas de secuencia (`SequenceMismatch`) y eliminando anomalías de tuplas zombi. Vuelca a disco cálido al expirar el TTL de RAM o alcanzar el límite de operaciones.
-  - **Nivel 2: Warm Disk Log (archivo append-only `.wal` sin comprimir):** Lotes enmarcados con cabecera `0xBA7C`, CRC32 y longitud. Conserva la misma representación binaria que en RAM sin costo de compresión de CPU, permitiendo responder rápidamente a clientes que se reconectan tras horas o días de inactividad.
+  - **Nivel 1: RAM Hot Buffer:** Mantiene un buffer contiguo e inmutable de deltas recientes (`VecDeque<SequencedOperation>`) para resolver lecturas inmediatas de `/sync`. **Cero squashing sobre deltas secuenciados**: garantiza contigüidad estricta (`head_seq + 1`), erradicando brechas de secuencia (`SequenceMismatch`) y eliminando anomalías de tuplas zombi. Vuelca a disco cálido al expirar el TTL de RAM o alcanzar el límite de operaciones.
+  - **Nivel 2: Warm Disk Log (archivo append-only `.wal` sin comprimir con Write-Through):** Lotes enmarcados con cabecera `0xBA7C`, CRC32 y longitud. **Durabilidad Write-Through estricta**: cada mutación aceptada se persiste síncronamente en `active.wal` (`sync_data()`) antes de emitir `CommitAck`, garantizando cero pérdidas de datos ante caídas del servidor o cortes de energía. Conserva la misma representación binaria que en RAM sin costo de compresión de CPU, permitiendo responder rápidamente a clientes que se reconectan tras horas o días de inactividad.
   - **Nivel 3: Cold Disk Log (archivos compactos `.wal.zst` comprimidos con Zstandard):** Compresión periódica en background de segmentos cálidos para retención de semanas con mínimo consumo de disco.
-  - **Nivel 4: Límite de Retención y Evicción (`BehindCompaction`):** Descarte final de mutaciones que superen la retención fría o la cuota de disco por sala. El servidor mantiene la secuencia base disponible (`tail_seq`). Clientes desincronizados que soliciten `last_ack_seq < tail_seq` reciben `BehindCompaction`, forzando la solicitud de un snapshot completo generado por un cliente activo (vía relay del servidor o P2P).
+  - **Nivel 4: Límite de Retención, Poda Proactiva y Clientes Dormant (`BehindCompaction`):**
+    - **Poda Proactiva Guiada por Cursores (`prune_older_than`):** Si todos los clientes registrados están en estado `Connected` y confirmaron la lectura hasta la secuencia $S$, los segmentos con `end_seq < S` se eliminan físicamente de inmediato sin esperar a los TTLs.
+    - **Estados del Cliente (`Connected`, `Disconnected`, `Dormant`):**
+      - `Connected`: Cliente activo enviando mutaciones/heartbeats en tiempo real.
+      - `Disconnected`: Cliente offline o sin conexión temporal, pero con cursor dentro del rango disponible en disco (`last_ack_seq >= tail_seq - 1`). Al reconectarse, descarga los deltas pendientes vía `/sync` y regresa a `Connected` sin requerir snapshot.
+      - `Dormant`: Cliente desconectado tanto tiempo que sus deltas pendientes fueron físicamente purgados por la política de retención (`last_ack_seq < tail_seq - 1`). No frena ninguna poda de disco. Al volver, recibe `ErrorCode::BehindCompaction` y debe solicitar obligatoriamente un snapshot consolidado.
+    - **Fallback por TTL y Cuota:** Descarte final de mutaciones que superen `cold_disk_ttl` o la cuota `max_room_disk_bytes`.
 * **Política de Ciclo de Vida Configurable (`RoomLifecyclePolicy`):**
   - Permite configurar los parámetros de retención según el entorno: `ram_max_ops`, `ram_ttl`, `warm_disk_ttl`, `cold_disk_ttl` y `max_room_disk_bytes`.
 
@@ -345,14 +351,14 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 * **Relay Multipart en Servidor:**
   El servidor actúa como un relay efímero en streaming para transferir chunks comprimidos (`RequestSnapshotChunk` / `SnapshotChunk`) entre el cliente donante y el cliente receptor cuando no hay conectividad directa P2P disponible.
 
-#### 4.3.7. Gestión de Leases, Desconexiones y Dead Man's Switch
-* **`ClientLeaseTracker` y Dead Man's Switch:**
-  - Rastrea el cursor `last_ack_seq` y la marca temporal del último heartbeat de cada cliente registrado.
-  - Los clientes sin heartbeat por más del timeout configurado pasan automáticamente a estado `Dormant`, excluyéndose del cómputo de retención `min_ack_seq` en RAM.
-  - Esto evita que un cliente desconectado bloquee el flujo normal de datos hacia los niveles Warm y Cold en disco, protegiendo al servidor contra picos de memoria (Anti-OOM).
-  - Si un cliente permanece en estado `Dormant` durante días o semanas hasta caer más allá del Nivel 3 (Cold Disk), sus deltas se purgan según `RoomLifecyclePolicy` y al reconectarse recibirá `BehindCompaction`.
+#### 4.3.7. Gestión de Leases, Estados de Cliente y Dead Man's Switch
+* **`ClientLeaseTracker` y Ciclo de Vida del Cliente:**
+  - Rastrea el estado de cada cliente registrado (`Connected`, `Disconnected`, `Dormant`), su cursor `last_ack_seq` y la marca temporal del último heartbeat.
+  - **Transición a `Disconnected`:** Al perderse los heartbeats o cerrarse la conexión, el cliente pasa a `Disconnected`. Sus deltas se preservan en disco según las políticas de retención. Si se reconecta antes de que sus deltas sean purgados, realiza catch-up con `/sync` y regresa a `Connected`.
+  - **Transición a `Dormant` (Poda y Dead Man's Switch):** Si un cliente permanece desconectado y sus deltas expiran por TTL o cuota, su cursor queda por detrás de los logs disponibles (`last_ack_seq < tail_seq - 1`) y pasa a `Dormant`. En este estado queda excluido del cómputo de retención de log para evitar que bloquee la truncación de disco a sus pares activos.
+  - **Recuperación desde `Dormant` (`BehindCompaction`):** Al reconectarse un cliente `Dormant`, el servidor responde `ErrorCode::BehindCompaction`. El cliente solicita un snapshot consolidado a un par activo (vía relay o P2P), lo aplica localmente, avanza su cursor a la secuencia del snapshot y vuelve a estado `Connected`.
 * **Soporte para Desregistro Voluntario:**
-  - Mediante `ClientMessage::DeregisterClient`, un cliente que se desconecta de forma ordenada notifica al actor para liberar su lease de inmediato sin esperar el timeout de inactividad.
+  - Mediante `ClientMessage::DeregisterClient`, un cliente que abandona la sala de forma definitiva o explícita se elimina del roster de miembros de inmediato.
 
 #### 4.3.8. Separación de Planos de Red: Control Plane (Admin) y Data Plane (Clientes)
 * **Control Plane (API Administrativa REST con JSON):**
@@ -568,29 +574,29 @@ tokio::spawn(async move {
 │ [x] Streaming zero-copy de snapshots (RoomSnapshotRef) erradicando 4x RAM.  │
 │ [x] Encapsulación de newtypes y cumplimiento C-DEREF (eliminación de Deref).│
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ FASE 3: Servidor Coordinador y Secuenciador (rimdb-server) [ACTIVA]         │
-│ [ ] Modularizar crate en src/lib.rs (reusable) y src/main.rs (CLI binario). │
-│ [ ] Struct de configuración ServerConfig (TOML y variables de entorno).     │
-│ [ ] Tipado formal ServerError y mapeo a códigos HTTP y binarios.            │
-│ [ ] Catálogo centralizado de plantillas de esquemas (SchemaRegistry).        │
-│ [ ] Gestor shardeado RoomManager (DashMap) con vinculación a SchemaId.       │
-│ [ ] Actor Tokio dedicado por sala (RoomActor) con mpsc::channel(1024).      │
-│ [ ] Contrato de comandos RoomCommand (RegisterClient, GetSchema, Commit).   │
-│ [ ] Control Plane REST HTTP/JSON (/admin/schemas, /admin/rooms) con auth.    │
-│ [ ] Middleware de validación stateless de auth_token en RegisterClient.      │
-│ [ ] Secuenciador monótono atómico de mutaciones (head_seq += 1, Total Order)│
-│ [ ] Micro-WAL en disco (meta_{room_id}.wal) con CRC32 para durabilidad crash│
-│ [ ] Caché LRU de deduplicación de MutationId rehidratada desde Micro-WAL.   │
-│ [ ] HotBuffer en RAM: log contiguo e inmutable (VecDeque<SequencedOp>).     │
-│ [ ] WarmDisk Log en disco (.wal sin comprimir) con wal_frame de core.       │
-│ [ ] ColdDisk Log en disco (.wal.zst) con Zstd en spawn_blocking.            │
-│ [ ] Política de retención RoomLifecyclePolicy y límite BehindCompact.       │
-│ [ ] ClientLeaseTracker con Dead Man's Switch (timeout 90s) anti-OOM de RAM. │
-│ [ ] Desregistro explícito de clientes con ClientMessage::DeregisterClient.  │
-│ [ ] Router y handlers Axum HTTP/2 (/commit, /sync, /heartbeat, /register).  │
-│ [ ] Canal SSE de señalización liviana (Event::HeadAdvanced) sin payloads.   │
-│ [ ] Relay efímero de chunks multipart para snapshots >16MB.                 │
-│ [ ] Batería de pruebas de integración concurrentes con múltiples clientes.  │
+│ FASE 3: Servidor Coordinador y Secuenciador (rimdb-server) [COMPLETADA]     │
+│ [x] Modularizar crate en src/lib.rs (reusable) y src/main.rs (CLI binario). │
+│ [x] Struct de configuración ServerConfig (TOML y variables de entorno).     │
+│ [x] Tipado formal ServerError y mapeo a códigos HTTP y binarios.            │
+│ [x] Catálogo centralizado de plantillas de esquemas (SchemaRegistry).        │
+│ [x] Gestor shardeado RoomManager (DashMap) con vinculación a SchemaId.       │
+│ [x] Actor Tokio dedicado por sala (RoomActor) con mpsc::channel(1024).      │
+│ [x] Contrato de comandos RoomCommand (RegisterClient, GetSchema, Commit).   │
+│ [x] Control Plane REST HTTP/JSON (/admin/schemas, /admin/rooms) con auth.    │
+│ [x] Middleware de validación stateless de auth_token en RegisterClient.      │
+│ [x] Secuenciador monótono atómico de mutaciones (head_seq += 1, Total Order)│
+│ [x] Micro-WAL en disco (meta_{room_id}.wal) con CRC32 para durabilidad crash│
+│ [x] Caché LRU de deduplicación de MutationId rehidratada desde Micro-WAL.   │
+│ [x] HotBuffer en RAM: log contiguo e inmutable (VecDeque<SequencedOp>).     │
+│ [x] WarmDisk Log en disco (.wal sin comprimir) con wal_frame de core.       │
+│ [x] ColdDisk Log en disco (.wal.zst) con Zstd en spawn_blocking.            │
+│ [x] Política de retención RoomLifecyclePolicy y límite BehindCompact.       │
+│ [x] ClientLeaseTracker con Dead Man's Switch (timeout 90s) anti-OOM de RAM. │
+│ [x] Desregistro explícito de clientes con ClientMessage::DeregisterClient.  │
+│ [x] Router y handlers Axum HTTP/2 (/commit, /sync, /heartbeat, /register).  │
+│ [x] Canal SSE de señalización liviana (Event::HeadAdvanced) sin payloads.   │
+│ [x] Relay efímero de chunks multipart para snapshots >16MB.                 │
+│ [x] Batería de pruebas de integración concurrentes con múltiples clientes.  │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ FASE 4: SDK Local-First Reactivo y Sincronización (rimdb-client)            │
 │ [ ] Modularización de crates/client (lib.rs, api/, sync/, transport/).      │
@@ -656,16 +662,16 @@ La siguiente tabla mapea el origen de cada requerimiento según la recomendació
 | Validadores posicionales nativos en $O(C)$ (`validate_operation` y `validate_column_updates`) | Base de Datos / Core | `rimdb-core` | **Alta** | ✅ **Completado** |
 | Tolerancia de aridad corta en `compact_into_row` y redimensionamiento dinámico en `apply_batch` | Base de Datos / Sist. | `rimdb-core` / `rimdb-storage` | **Alta** | ✅ **Completado** |
 | Endurecimiento de códec binario con `reject_trailing_bytes()` | Seguridad / Red | `rimdb-core` | **Alta** | ✅ **Completado** |
-| Modularización de `rimdb-server` (`lib.rs` + `main.rs`, `ServerConfig`) | Arquitectura / Rust | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
-| Concurrencia por actores Tokio (`RoomManager` con `DashMap`, `RoomActor` con `mpsc(1024)`) | Sist. Distribuidos / Arq. | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
-| Secuenciador monótono atómico de mutaciones (Autoridad Total Order) | Sist. Distribuidos / Diseño | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
-| Micro-WAL durable en disco (`meta_{room_id}.wal` con CRC32) | Sist. Distribuidos / DB | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
-| Caché LRU de deduplicación de `MutationId` respaldada en Micro-WAL | Sist. Distribuidos | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
-| Log inmutable de 4 niveles en servidor (Hot RAM -> Warm Disk -> Cold Disk) | Sist. Distribuidos / DB | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
+| Modularización de `rimdb-server` (`lib.rs` + `main.rs`, `ServerConfig`) | Arquitectura / Rust | `rimdb-server` | **Alta** | ✅ **Completado** |
+| Concurrencia por actores Tokio (`RoomManager` con `DashMap`, `RoomActor` con `mpsc(1024)`) | Sist. Distribuidos / Arq. | `rimdb-server` | **Alta** | ✅ **Completado** |
+| Secuenciador monótono atómico de mutaciones (Autoridad Total Order) | Sist. Distribuidos / Diseño | `rimdb-server` | **Alta** | ✅ **Completado** |
+| Micro-WAL durable en disco (`meta_{room_id}.wal` con CRC32) | Sist. Distribuidos / DB | `rimdb-server` | **Alta** | ✅ **Completado** |
+| Caché LRU de deduplicación de `MutationId` respaldada en Micro-WAL | Sist. Distribuidos | `rimdb-server` | **Alta** | ✅ **Completado** |
+| Log inmutable de 4 niveles en servidor (Hot RAM -> Warm Disk -> Cold Disk) | Sist. Distribuidos / DB | `rimdb-server` | **Alta** | ✅ **Completado** |
 | Compactación CoW no bloqueante en background (`spawn_blocking`) | Rust / Rendimiento | `rimdb-storage` | **Alta** | ✅ **Completado** |
-| `ClientLeaseTracker` con Dead Man's Switch (timeout 90s) anti-OOM | Sist. Distribuidos | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
-| Router y handlers Axum HTTP/2 binarios (`/commit`, `/sync`, etc.) | Arquitectura / Red | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
-| Canal SSE de señalización liviana (`Event::HeadAdvanced`) | Sist. Distribuidos | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
+| `ClientLeaseTracker` con Dead Man's Switch (timeout 90s) anti-OOM | Sist. Distribuidos | `rimdb-server` | **Alta** | ✅ **Completado** |
+| Router y handlers Axum HTTP/2 binarios (`/commit`, `/sync`, etc.) | Arquitectura / Red | `rimdb-server` | **Alta** | ✅ **Completado** |
+| Canal SSE de señalización liviana (`Event::HeadAdvanced`) | Sist. Distribuidos | `rimdb-server` | **Alta** | ✅ **Completado** |
 | Modularización de `rimdb-client` (`api/`, `sync/`, `transport/`) | Arquitectura | `rimdb-client` | **Alta** | ⏳ **Pendiente (Fase 4)** |
 | Feature flags multi-target (`native` vs `wasm`) y `CryptoConcurrencyBounds` | Arquitectura / Rust | `rimdb-client` | **Alta** | ⏳ **Pendiente (Fase 4)** |
 | Fachada pública ergonómica (`RimdbClient`, `RoomHandle`, `TableHandle`) | Arquitectura / Rust | `rimdb-client` | **Alta** | ⏳ **Pendiente (Fase 4)** |
@@ -678,9 +684,9 @@ La siguiente tabla mapea el origen de cada requerimiento según la recomendació
 | Batería de pruebas E2E de partición y concurrencia | Sist. Distribuidos / Rust | Workspace / Tests | **Alta** | ⏳ **Pendiente (Fase 5)** |
 | Newtype `SchemaId` y catálogo de esquemas en protocolo | Arquitectura / Rust | `rimdb-core` | **Alta** | ✅ **Completado** |
 | Deserialización limpia de `Schema` y `add_column` DDL | Base de Datos | `rimdb-core` | **Alta** | ✅ **Completado** |
-| `SchemaRegistry` durable en servidor (`meta_schema_{id}.json`) | Base de Datos / Arq. | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
-| Control Plane REST (`/admin/schemas`, `/admin/rooms`) con Bearer auth | Red / Seguridad | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
-| Verificación stateless de `auth_token` en `RegisterClient` | Seguridad / Distribuidos | `rimdb-server` | **Alta** | ⏳ **Pendiente (Fase 3)** |
+| `SchemaRegistry` durable en servidor (`meta_schema_{id}.json`) | Base de Datos / Arq. | `rimdb-server` | **Alta** | ✅ **Completado** |
+| Control Plane REST (`/admin/schemas`, `/admin/rooms`) con Bearer auth | Red / Seguridad | `rimdb-server` | **Alta** | ✅ **Completado** |
+| Verificación stateless de `auth_token` en `RegisterClient` | Seguridad / Distribuidos | `rimdb-server` | **Alta** | ✅ **Completado** |
 | SDK de Administración dedicado para clientes (Admin SDK) | Arquitectura | `rimdb-client` | Baja | 💤 **Diferido (Post-v0.1)** |
 | Tipo `DataType::Decimal` / `Value::Decimal` | Base de Datos | `rimdb-core` | Baja | 💤 **Diferido (Post-v0.1)** |
 | Red P2P pura sin servidor / Snapshot Relay ad-hoc | Sistemas Distribuidos | `rimdb-client` | Baja | 💤 **Diferido (Post-v0.1)** |
