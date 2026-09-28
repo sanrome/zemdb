@@ -18,6 +18,7 @@ use crate::dedup::DedupLruCache;
 use crate::error::ServerError;
 use crate::log::{RoomLifecyclePolicy, TieredLog};
 use crate::micro_wal::MicroWal;
+use crate::relay::SnapshotRelay;
 
 /// Dedicated single-writer Tokio actor managing state, sequencing, durability, and synchronization for a single room.
 pub struct RoomActor {
@@ -32,6 +33,7 @@ pub struct RoomActor {
     events_tx: broadcast::Sender<SequenceNumber>,
     receiver: mpsc::Receiver<RoomCommand>,
     lease_timeout: Duration,
+    snapshot_relay: Arc<SnapshotRelay>,
 }
 
 impl RoomActor {
@@ -43,6 +45,7 @@ impl RoomActor {
         data_dir: impl AsRef<Path>,
         config: Arc<ServerConfig>,
         lifecycle_policy: RoomLifecyclePolicy,
+        snapshot_relay: Arc<SnapshotRelay>,
     ) -> Result<(mpsc::Sender<RoomCommand>, JoinHandle<()>), ServerError> {
         let room_dir = data_dir.as_ref().join("rooms").join(room_id.as_str());
         fs::create_dir_all(&room_dir)?;
@@ -84,6 +87,7 @@ impl RoomActor {
             events_tx,
             receiver: command_rx,
             lease_timeout,
+            snapshot_relay,
         };
 
         info!(
@@ -123,14 +127,23 @@ impl RoomActor {
 
     fn handle_command(&mut self, command: RoomCommand) {
         match command {
-            RoomCommand::RegisterClient { client_id, reply } => {
-                let res = self.lease_tracker.register_client(&client_id, self.head_seq).map(|_| {
-                    RegisterResponse {
+            RoomCommand::RegisterClient {
+                client_id,
+                current_seq,
+                reply,
+            } => {
+                let tail_seq = self.tiered_log.tail_seq();
+                let active_snapshot_seq = self.snapshot_relay.active_snapshot_seq(&self.room_id);
+                let res = self
+                    .lease_tracker
+                    .register_client(&client_id, current_seq, tail_seq)
+                    .map(|_| RegisterResponse {
                         head_seq: self.head_seq,
+                        tail_seq,
                         schema_id: self.schema_id.clone(),
                         schema: Arc::clone(&self.schema),
-                    }
-                });
+                        active_snapshot_seq,
+                    });
                 let _ = reply.send(res);
             }
 
@@ -193,12 +206,13 @@ impl RoomActor {
             }
 
             RoomCommand::GetMetrics { reply } => {
-                let (conn, disc, dorm, total) = self.lease_tracker.client_counts();
+                let (boot, conn, disc, dorm, total) = self.lease_tracker.client_counts();
                 let metrics = RoomMetrics {
                     room_id: self.room_id.clone(),
                     schema_id: self.schema_id.clone(),
                     head_seq: self.head_seq,
                     tail_seq: self.tiered_log.tail_seq(),
+                    bootstrapping_clients: boot,
                     connected_clients: conn,
                     disconnected_clients: disc,
                     dormant_clients: dorm,
@@ -225,8 +239,10 @@ impl RoomActor {
         op: rimdb_core::mutation::Operation,
         reply: tokio::sync::oneshot::Sender<Result<CommitResponse, ServerError>>,
     ) {
-        // 1. Check if client is Dormant (behind compaction boundary)
-        if self.lease_tracker.is_dormant(&client_id) {
+        // 1. Check if client is Dormant or Bootstrapping (behind compaction boundary)
+        if self.lease_tracker.is_dormant(&client_id)
+            || self.lease_tracker.is_bootstrapping(&client_id)
+        {
             let _ = reply.send(Err(ServerError::BehindCompaction));
             return;
         }
@@ -234,7 +250,7 @@ impl RoomActor {
         // 2. Exactly-Once Idempotency Check via DedupLruCache
         if let Some(existing_seq) = self.dedup_cache.is_duplicate(&mutation_id) {
             let from_seq = if last_ack_seq < existing_seq {
-                SequenceNumber::new(last_ack_seq.get() + 1)
+                last_ack_seq
             } else {
                 existing_seq
             };
@@ -287,12 +303,16 @@ impl RoomActor {
         // 10. Broadcast signal-only SSE event to active watchers
         let _ = self.events_tx.send(new_seq);
 
-        // 11. Compute catch-up deltas for 1-RTT synchronization
+        // 11. Compute catch-up deltas for 1-RTT synchronization (C-01 and C-02 fix)
         let (catchup_ops, has_more) = if last_ack_seq.get() < new_seq.get().saturating_sub(1) {
-            let from_seq = SequenceNumber::new(last_ack_seq.get() + 1);
-            self.tiered_log
-                .fetch_deltas(from_seq, 100)
-                .unwrap_or_else(|_| (vec![seq_op], false))
+            match self.tiered_log.fetch_deltas(last_ack_seq, 100) {
+                Ok((ops, has_more)) => (ops, has_more),
+                Err(ServerError::BehindCompaction) => {
+                    let _ = reply.send(Err(ServerError::BehindCompaction));
+                    return;
+                }
+                Err(_) => (vec![seq_op], false),
+            }
         } else {
             (vec![seq_op], false)
         };
@@ -330,8 +350,12 @@ impl RoomActor {
             .fetch_deltas(from_seq, max_batch_size)
         {
             Ok((ops, has_more)) => {
-                // Record activity only - cursor is NOT advanced until explicit Ack!
-                self.lease_tracker.record_activity(&client_id);
+                // If client was bootstrapping and synced a valid range, promote to Connected
+                if self.lease_tracker.is_bootstrapping(&client_id) {
+                    let _ = self.lease_tracker.record_ack(&client_id, from_seq);
+                } else {
+                    self.lease_tracker.record_activity(&client_id);
+                }
 
                 let _ = reply.send(Ok(SyncBatchResponse {
                     head_seq: self.head_seq,
@@ -357,14 +381,20 @@ impl RoomActor {
             return;
         }
 
-        // 2. Record explicit Ack, advancing cursor and refreshing lease
+        // 2. Record explicit Ack, advancing cursor, refreshing lease, and promoting Bootstrapping
         let res = self
             .lease_tracker
             .record_ack(&client_id, ack_seq)
             .map(|_| {
-                // 3. Trigger proactive log pruning if all connected clients are past the sequence
+                // 3. Trigger proactive log pruning if all connected clients are past the sequence,
+                // bounded by active_snapshot_seq (Retention Anchor)
                 if let Some(min_ack) = self.lease_tracker.min_connected_ack_seq() {
-                    let _ = self.tiered_log.prune_older_than(min_ack);
+                    let active_snap = self.snapshot_relay.active_snapshot_seq(&self.room_id);
+                    let retention_floor = match active_snap {
+                        Some(snap_seq) => min_ack.min(snap_seq),
+                        None => min_ack,
+                    };
+                    let _ = self.tiered_log.prune_older_than(retention_floor);
                 }
                 self.head_seq
             });
@@ -373,7 +403,7 @@ impl RoomActor {
     }
 
     fn run_periodic_maintenance(&mut self) {
-        // 1. Check client timeouts (Connected -> Disconnected -> Dormant)
+        // 1. Check client timeouts (Connected/Bootstrapping -> Disconnected -> Dormant)
         self.lease_tracker
             .check_timeouts(self.lease_timeout, self.tiered_log.tail_seq());
 
@@ -382,9 +412,15 @@ impl RoomActor {
             warn!(room = %self.room_id, error = %e, "TieredLog maintenance error");
         }
 
-        // 3. Trigger proactive cursor-driven pruning if all non-dormant clients are Connected
+        // 3. Trigger proactive cursor-driven pruning if all non-dormant clients are Connected,
+        // bounded by active_snapshot_seq (Retention Anchor)
         if let Some(min_ack) = self.lease_tracker.min_connected_ack_seq() {
-            let _ = self.tiered_log.prune_older_than(min_ack);
+            let active_snap = self.snapshot_relay.active_snapshot_seq(&self.room_id);
+            let retention_floor = match active_snap {
+                Some(snap_seq) => min_ack.min(snap_seq),
+                None => min_ack,
+            };
+            let _ = self.tiered_log.prune_older_than(retention_floor);
         }
     }
 }

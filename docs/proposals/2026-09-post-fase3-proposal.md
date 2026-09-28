@@ -149,13 +149,19 @@ Este documento define la arquitectura correctiva para erradicar la totalidad de 
   - Al ejecutar `handle_commit`, se realiza una **única escritura y sincronización en disco** en `TieredLog::append(seq_op, metadata)`.
   - Esto erradica por diseño el desfasaje de secuencias post-crash entre Micro-WAL y TieredLog, elimina la doble llamada a `sync_data()` duplicando los IOPS máximos, y resuelve el crecimiento descontrolado de `meta_{room_id}.wal`.
 
-#### Solución S-10: Corrección de Algoritmos de Sincronización y Retención (`C-01`, `C-02`, `C-08`, `M-02`, `M-10`)
-* **Módulos Afectados**: [`crates/server/src/actor/room.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs), [`crates/server/src/actor/lease.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/lease.rs), [`crates/server/src/log/tiered_log.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/log/tiered_log.rs).
-* **Diseño Técnico**:
-  - En `handle_commit`, pasar `last_ack_seq` directamente a `fetch_deltas` sin incremento en 1 ([`C-01`](../audits/2026-09-post-fase3-audit.md#c-01)).
-  - En `handle_commit`, rechazar con `Err(ServerError::BehindCompaction)` si el cliente está por detrás de `tail_seq - 1` en lugar de suprimir el error ([`C-02`](../audits/2026-09-post-fase3-audit.md#c-02)).
-  - En reintentos de commit duplicados, consultar los deltas desde `last_ack_seq` para incluir la mutación original asignada en la respuesta ([`M-02`](../audits/2026-09-post-fase3-audit.md#m-02)).
-  - En `ClientLeaseTracker::register_client`, evaluar `was_dormant` antes de mutar el estado a `Connected`, re-anclando el cursor a `current_head` ([`C-08`](../audits/2026-09-post-fase3-audit.md#c-08)).
+#### Solución S-10: Corrección de Sincronización, Retención y Rediseño de Onboarding (`C-01`, `C-02`, `C-08`, `M-02`, `M-10`) [IMPLEMENTADO / RESUELTO PARA C-01, C-02, C-08, M-02]
+* **Módulos Afectados**: [`crates/server/src/actor/room.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs), [`crates/server/src/actor/lease.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/lease.rs), [`crates/server/src/relay.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/relay.rs), [`crates/core/src/protocol/messages.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/protocol/messages.rs), [`crates/server/src/api/data_plane.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/data_plane.rs), [`crates/server/src/log/tiered_log.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/log/tiered_log.rs).
+* **Diseño Técnico e Implementación**:
+  - **Eliminación del off-by-one (`C-01`)**: En `handle_commit`, pasar `last_ack_seq` directamente a `fetch_deltas` sin incremento en 1.
+  - **Propagación preventiva de `BehindCompaction` (`C-02`)**: En `handle_commit`, rechazar inmediatamente con `Err(ServerError::BehindCompaction)` si el cliente está por detrás de `tail_seq - 1` o si no está en estado `Connected` (rechazando commits prematuros de clientes `Bootstrapping` o `Dormant`).
+  - **Deltas en reintentos idempotentes (`M-02`)**: En reintentos de commit duplicados en `dedup_cache`, consultar los deltas desde `last_ack_seq` para incluir la mutación original secuenciada en la respuesta `CommitAck`.
+  - **Rediseño Completo de Onboarding y Ancla de Retención (`C-08`)**:
+    - Re-anclar a ciegas `entry.last_ack_seq = current_head` generaba un fallo crítico cuando el snapshot base transferido pertenecía a una secuencia anterior $S < \text{current\_head}$, provocando poda de los deltas $(S, \text{current\_head}]$ y dejando al cliente en bucles infinitos de `BehindCompaction`.
+    - **Nuevo Estado `ClientState::Bootstrapping`**: Clientes nuevos o clientes reconectados con `current_seq < tail_seq - 1` ingresan en `Bootstrapping`.
+    - **Aislamiento en Poda**: Clientes en `Bootstrapping` son ignorados en `min_connected_ack_seq`, por lo que nunca bloquean la compactación para miembros conectados.
+    - **Ancla de Retención (*Retention Anchor*)**: En `RoomActor::prune_older_than`, el límite de retención se define como $\text{retention\_floor} = \min(\text{min\_connected\_ack}, \text{active\_snapshot\_seq})$. Mientras exista un snapshot en `SnapshotRelay` para la secuencia $S$, los deltas $(S, \text{current\_head}]$ quedan protegidos en disco para el catchup de los clientes en onboarding.
+    - **Protocolo de Handshake**: `RegisterClient` transmite `current_seq: Option<SequenceNumber>` y `Registered` devuelve `head_seq`, `tail_seq` y `active_snapshot_seq: Option<SequenceNumber>`.
+    - **Promoción Dinámica**: Al aplicar el snapshot en $S$ y solicitar `/sync` o emitir `Ack` para $seq \ge S$, el cliente es promovido a `Connected`.
   - En `TieredLog::prune_older_than`, calcular `self.tail_seq` estrictamente a partir del segmento físico más antiguo que permanezca en disco, evitando adelantar el cursor más allá de los deltas disponibles en `active.wal` ([`M-10`](../audits/2026-09-post-fase3-audit.md#m-10)).
   - En `ClientLeaseTracker::check_timeouts`, transicionar clientes desconectados a `Dormant` basándose en el temporizador de inactividad de 90 segundos, rompiendo el deadlock de retención ([`A-10`](../audits/2026-09-post-fase3-audit.md#a-10)).
 
@@ -222,15 +228,20 @@ Este documento define la arquitectura correctiva para erradicar la totalidad de 
     }
     ```
 
-#### Solución S-13: Snapshot Relay Multipart Fragmentado y Blindaje DoS (`C-10`, `A-15`)
-* **Módulos Afectados**: [`crates/server/src/relay.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/relay.rs), [`crates/server/src/api/router.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/router.rs).
-* **Diseño Técnico**:
-  - Exigir autorización en todos los endpoints de `SnapshotRelay`.
-  - Diseñar la API de subida fragmentada simétrica a la descarga:
-    `POST /rooms/:room_id/snapshot/upload-chunk` recibiendo fragmentos de hasta 1 MB (`SnapshotChunk`).
-  - Almacenar los chunks progresivamente en un directorio efímero de staging en disco (`data/tmp_snapshots/{room_id}/`) en lugar de retener buffers monolíticos en RAM.
-  - Al recibir el último chunk, verificar la suma criptográfica BLAKE3 del archivo consolidado en disco antes de marcarlo como listo para descarga por clientes en onboarding.
-  - Establecer una cuota máxima global de disco para staging (ej. 256 MB) con recolección de basura periódica en background.
+#### Solución S-13: Snapshot Relay Multipart Fragmentado y Blindaje DoS (`C-10`, `A-15`) [A-15 RESUELTO]
+* **Módulos Afectados**: [`crates/server/src/relay.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/relay.rs), [`crates/server/src/config.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/config.rs), [`crates/server/src/api/router.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/router.rs).
+* **Diseño Técnico e Implementación**:
+  - **[RESUELTO A-15] SnapshotRelay Respaldado en Disco y TTL Configurable**:
+    - `SnapshotRelay::new(snapshots_dir, ttl)` ahora exige obligatoriamente un directorio en disco (`data/snapshots/`) para persistir snapshots.
+    - Se incorporó `snapshot_ttl_secs: u64` en `ServerConfig` con soporte en `config.toml` y variable de entorno `RIMDB_SNAPSHOT_TTL_SECS`.
+    - Las subidas se escriben atómicamente con staging `.tmp.<nanos>` y renombrado seguro.
+    - `cleanup_expired` purga tanto de la memoria RAM como del disco (`remove_file`), eliminando riesgos de OOM y fugas de almacenamiento.
+    - Se implementó `recover_disk_snapshots()` que al reiniciar el servidor recarga snapshots válidos y descarta archivos temporales huérfanos.
+  - **[PENDIENTE C-10] Subida Multipart y Autorización**:
+    - Exigir autorización en todos los endpoints de `SnapshotRelay`.
+    - Diseñar la API de subida fragmentada simétrica a la descarga:
+      `POST /rooms/:room_id/snapshot/upload-chunk` recibiendo fragmentos de hasta 1 MB (`SnapshotChunk`).
+    - Al recibir el último chunk, verificar la suma criptográfica BLAKE3 del archivo consolidado en disco antes de marcarlo como listo para descarga por clientes en onboarding.
 
 #### Solución S-14: Concurrencia de Gestión de Salas y Resiliencia en Reinicios (`C-09`, `A-11`, `A-14`, `M-08`, `M-12`)
 * **Módulos Afectados**: [`crates/server/src/actor/manager.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/manager.rs), [`crates/server/src/api/data_plane.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/data_plane.rs).
@@ -301,10 +312,11 @@ El plan de corrección se estructurará en tres fases incrementales antes de dar
 ### Fase 3.5-A: Integridad Crítica de Datos, Secuenciación y Autenticación (Prioridad P0)
 *Objetivo: Erradicar todos los modos de falla que provocan corrupción, pérdida de eventos o evasión de seguridad.*
 
-1. **Corrección de Catchup 1-RTT y Retención**:
-   - Eliminar el off-by-one en `handle_commit` pasando `last_ack_seq` directo a `fetch_deltas` ([`C-01`](../audits/2026-09-post-fase3-audit.md#c-01)).
-   - Propagar `BehindCompaction` sin suprimir errores en `handle_commit` ([`C-02`](../audits/2026-09-post-fase3-audit.md#c-02)).
-   - Corregir el código muerto en `register_client` para clientes `Dormant` ([`C-08`](../audits/2026-09-post-fase3-audit.md#c-08)).
+1. **Corrección de Catchup 1-RTT, Retención y Onboarding**:
+   - [RESUELTO] Eliminar el off-by-one en `handle_commit` pasando `last_ack_seq` directo a `fetch_deltas` ([`C-01`](../audits/2026-09-post-fase3-audit.md#c-01)).
+   - [RESUELTO] Propagar `BehindCompaction` sin suprimir errores en `handle_commit` ([`C-02`](../audits/2026-09-post-fase3-audit.md#c-02)).
+   - [RESUELTO] Reintentos idempotentes de `Commit` devuelven `catchup_ops` con mutación original ([`M-02`](../audits/2026-09-post-fase3-audit.md#m-02)).
+   - [RESUELTO] Rediseño de Onboarding: estado `Bootstrapping`, ancla de retención en poda (`retention_floor = min(min_connected_ack, active_snapshot_seq)`) y handshake enriquecido ([`C-08`](../audits/2026-09-post-fase3-audit.md#c-08)).
 2. **Autenticación y Blindaje en Data Plane**:
    - Implementar extractor Axum `ClientAuth` para validar Bearer tokens en todos los endpoints operativos ([`C-03`](../audits/2026-09-post-fase3-audit.md#c-03)).
    - Validar estricta coincidencia de `room_id` en URL path vs payload/token ([`M-07`](../audits/2026-09-post-fase3-audit.md#m-07)).
@@ -336,7 +348,7 @@ El plan de corrección se estructurará en tres fases incrementales antes de dar
    - Implementar cerrojo fino de instanciación en `RoomManager` para erradicar TOCTOU ([`C-09`](../audits/2026-09-post-fase3-audit.md#c-09)).
    - Reemplazar `get_room` por `get_or_spawn` en endpoints de datos soportando reinicios ([`A-11`](../audits/2026-09-post-fase3-audit.md#a-11)).
    - Implementar comando `RoomCommand::Shutdown` para coordinar el borrado de salas en `delete_room` ([`A-14`](../audits/2026-09-post-fase3-audit.md#a-14)).
-   - Diseñar subida multipart fragmentada (`/snapshot/upload-chunk`) con staging en disco y autenticación ([`C-10`](../audits/2026-09-post-fase3-audit.md#c-10), [`A-15`](../audits/2026-09-post-fase3-audit.md#a-15)).
+   - [RESUELTO A-15] `SnapshotRelay` respaldado en disco con TTL configurable y purga física. Pendiente subida multipart fragmentada (`/snapshot/upload-chunk`) y autenticación ([`C-10`](../audits/2026-09-post-fase3-audit.md#c-10)).
    - Adquirir bloqueos `flock` exclusivos en descriptores de archivos del servidor ([`M-12`](../audits/2026-09-post-fase3-audit.md#m-12)).
 
 ---

@@ -32,6 +32,10 @@ pub struct ServerConfig {
     /// Maximum number of mutation IDs retained in the deduplication LRU cache per room.
     #[serde(default = "default_dedup_lru_capacity")]
     pub dedup_lru_capacity: usize,
+
+    /// TTL duration for staged snapshots in the relay before eviction (seconds).
+    #[serde(default = "default_snapshot_ttl_secs")]
+    pub snapshot_ttl_secs: u64,
 }
 
 fn default_host() -> String {
@@ -62,6 +66,10 @@ fn default_dedup_lru_capacity() -> usize {
     10_000
 }
 
+fn default_snapshot_ttl_secs() -> u64 {
+    600
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -72,6 +80,7 @@ impl Default for ServerConfig {
             admin_secret: default_admin_secret(),
             lease_timeout_secs: default_lease_timeout_secs(),
             dedup_lru_capacity: default_dedup_lru_capacity(),
+            snapshot_ttl_secs: default_snapshot_ttl_secs(),
         }
     }
 }
@@ -116,6 +125,11 @@ impl ServerConfig {
         if let Ok(lru_str) = std::env::var("RIMDB_DEDUP_LRU_CAPACITY") {
             if let Ok(cap) = lru_str.parse::<usize>() {
                 self.dedup_lru_capacity = cap;
+            }
+        }
+        if let Ok(snap_str) = std::env::var("RIMDB_SNAPSHOT_TTL_SECS") {
+            if let Ok(snap_ttl) = snap_str.parse::<u64>() {
+                self.snapshot_ttl_secs = snap_ttl;
             }
         }
     }

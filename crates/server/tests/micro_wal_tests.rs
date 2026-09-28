@@ -204,6 +204,7 @@ fn test_server_config_toml_and_env_overrides() {
         admin_secret = "custom_admin_secret_1234567890!"
         lease_timeout_secs = 120
         dedup_lru_capacity = 25000
+        snapshot_ttl_secs = 300
     "#;
 
     let mut config = ServerConfig::from_toml_str(toml_str).unwrap();
@@ -212,18 +213,22 @@ fn test_server_config_toml_and_env_overrides() {
     assert_eq!(config.data_dir.to_str().unwrap(), "/var/rimdb");
     assert_eq!(config.lease_timeout_secs, 120);
     assert_eq!(config.dedup_lru_capacity, 25000);
+    assert_eq!(config.snapshot_ttl_secs, 300);
 
     // Test environment variable overrides
     std::env::set_var("RIMDB_PORT", "9999");
     std::env::set_var("RIMDB_HOST", "192.168.1.50");
+    std::env::set_var("RIMDB_SNAPSHOT_TTL_SECS", "1800");
     config.apply_env_overrides();
 
     assert_eq!(config.port, 9999);
     assert_eq!(config.host, "192.168.1.50");
+    assert_eq!(config.snapshot_ttl_secs, 1800);
 
     // Clean up env vars
     std::env::remove_var("RIMDB_PORT");
     std::env::remove_var("RIMDB_HOST");
+    std::env::remove_var("RIMDB_SNAPSHOT_TTL_SECS");
 }
 
 #[test]

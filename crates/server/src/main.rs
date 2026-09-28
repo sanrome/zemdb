@@ -16,11 +16,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let schemas_dir = config.data_dir.join("schemas");
     let schema_registry = Arc::new(SchemaRegistry::new(schemas_dir)?);
+    let snapshots_dir = config.data_dir.join("snapshots");
+    let snapshot_relay = Arc::new(SnapshotRelay::new(
+        snapshots_dir,
+        Duration::from_secs(config.snapshot_ttl_secs),
+    )?);
     let room_manager = Arc::new(RoomManager::new(
         Arc::clone(&config),
         Arc::clone(&schema_registry),
+        Arc::clone(&snapshot_relay),
     ));
-    let snapshot_relay = Arc::new(SnapshotRelay::new(Duration::from_secs(600)));
 
     let state = AppState::new(
         Arc::clone(&config),

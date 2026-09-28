@@ -43,14 +43,14 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 ┌──────┬──────────┬──────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────┐
 │ ID   │ Severidad│ Módulo / Crate                       │ Resumen Técnico del Defecto                                                             │
 ├──────┼──────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┤
-│ C-01 │ Crítico  │ crates/server/src/actor/room.rs      │ Desfase off-by-one salta y omite sistemáticamente last_ack_seq + 1 en catchup 1-RTT.   │
-│ C-02 │ Crítico  │ crates/server/src/actor/room.rs      │ Supresión silenciosa de BehindCompaction en Commit provocando divergencia de réplicas.  │
+│ C-01 │ Crítico  │ crates/server/src/actor/room.rs      │ [RESUELTO] Desfase off-by-one salta y omite sistemáticamente last_ack_seq + 1.         │
+│ C-02 │ Crítico  │ crates/server/src/actor/room.rs      │ [RESUELTO] Supresión silenciosa de BehindCompaction en Commit provocando divergencia.  │
 │ C-03 │ Crítico  │ crates/server/src/api/data_plane.rs  │ Ausencia total de autenticación y validación de lease en todo el Data Plane.            │
 │ C-04 │ Crítico  │ crates/server/src/actor/room.rs      │ Dual-WAL desacoplado: desincronización y agujero de secuencia irrecuperable en crash.  │
 │ C-05 │ Crítico  │ crates/storage/src/disk/recovery.rs  │ Replay ciego del WAL histórico sobre el snapshot base sin omitir secuencias consolidadas.│
 │ C-06 │ Crítico  │ crates/core/src/protocol/wal_frame.rs│ Torn writes en EOF clasificados erróneamente como corrupción fatal por fallo de CRC32.  │
 │ C-07 │ Crítico  │ crates/core/src/protocol/wal_frame.rs│ decode_wal_record_from_slice drena solo 1 op y descarta el resto del lote en WalReader. │
-│ C-08 │ Crítico  │ crates/server/src/actor/lease.rs     │ Código muerto en register_client impide re-anclar cursor de clientes en estado Dormant. │
+│ C-08 │ Crítico  │ crates/server/src/actor/lease.rs     │ [RESUELTO] Rediseño Onboarding: Bootstrapping state + Ancla de retención de snapshots. │
 │ C-09 │ Crítico  │ crates/server/src/actor/manager.rs   │ Condición de carrera TOCTOU en get_or_spawn duplica actores de sala y corrompe WALs.   │
 │ C-10 │ Crítico  │ crates/server/src/relay.rs           │ Inyección arbitraria de estado por upload anónimo y colisión con DefaultBodyLimit 16MB. │
 │ C-11 │ Crítico  │ crates/core/src/schema/table.rs      │ Deserialización de TableSchema elude invariantes estructurales provocando pánico.       │
@@ -69,12 +69,12 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 │ A-12 │ Alto     │ crates/server/src/log/tiered_log.rs  │ Inversión jerárquica en fetch_deltas: escaneo síncrono de disco previo al RAM HotBuffer.│
 │ A-13 │ Alto     │ crates/server/src/log/tiered_log.rs  │ Evicción destructiva del HotBuffer al sellar segmentos vacía el 100% de la memoria.    │
 │ A-14 │ Alto     │ crates/server/src/actor/manager.rs   │ delete_room elimina directorio físicamente con actor Tokio en vuelo y descriptores vivos.│
-│ A-15 │ Alto     │ crates/server/src/relay.rs           │ SnapshotRelay en memoria RAM sin cuota ni backpressure susceptible a ataques DoS (OOM). │
+│ A-15 │ Alto     │ crates/server/src/relay.rs           │ [RESUELTO] SnapshotRelay respaldado en disco con TTL configurable y purga física.       │
 │ A-16 │ Alto     │ crates/client/src/lib.rs             │ Crate rimdb-client es un cascarón vacío stub sin implementación del SDK de cliente.     │
 │ A-17 │ Alto     │ crates/server/tests/                 │ Suites de prueba ignoran deliberadamente catchup_ops permitiendo pérdidas de datos.     │
 ├──────┼──────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┤
 │ M-01 │ Medio    │ crates/core/src/mutation/squash.rs   │ Regla 1 de squashing sobrescribe celdas nulas con updates viejos violando LWW.         │
-│ M-02 │ Medio    │ crates/server/src/actor/room.rs      │ Reintentos idempotentes de Commit devuelven catchup_ops vacío omitiendo mutación propia.│
+│ M-02 │ Medio    │ crates/server/src/actor/room.rs      │ [RESUELTO] Reintentos idempotentes de Commit devuelven catchup_ops con mutación propia. │
 │ M-03 │ Medio    │ crates/core/src/protocol/codec.rs    │ Ausencia de magic bytes, versión de wire protocol y discriminante en codec binario.     │
 │ M-04 │ Medio    │ crates/server/src/api/auth.rs        │ Comparación de firmas en tiempo variable susceptible a ataques de canal lateral (timing)│
 │ M-05 │ Medio    │ crates/server/src/api/auth.rs        │ Backdoor dev-token cableado en código de autenticación de producción.                   │
@@ -104,30 +104,18 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 ### DEFECTOS DE SEVERIDAD CRÍTICA
 
 #### [C-01] Desfase off-by-one salta y omite sistemáticamente `last_ack_seq + 1` en catchup 1-RTT
+* **Estado**: **RESUELTO**
 * **Ubicación Exacta**: [`crates/server/src/actor/room.rs:291-298`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs#L291-L298) y [`crates/server/src/actor/room.rs:236-245`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs#L236-L245).
 * **Causa Raíz**: En `handle_commit`, el código calcula `from_seq = SequenceNumber::new(last_ack_seq.get() + 1)`. Sin embargo, `TieredLog::fetch_deltas` y las capas subyacentes (`HotBuffer`, `WarmDiskLog`, `ColdDiskLog`) filtran estrictamente con la condición `op.seq > from_seq`. Al haber sumado 1 previamente, la consulta filtra `op.seq > last_ack_seq + 1`, descartando por completo el delta correspondiente a `last_ack_seq + 1`.
 * **Impacto**: Pérdida silenciosa de eventos en cada commit donde el cliente tenga atraso respecto a la sala. El cliente local rechaza el lote devuelto con `StorageError::SequenceMismatch` (`head_seq + 1 != op.seq`), rompiendo la replicación y congelando el cliente.
-* **Solución Técnica**: Invocar `fetch_deltas` directamente con `last_ack_seq` sin incremento:
-  ```rust
-  let (catchup_ops, has_more) = if last_ack_seq.get() < new_seq.get().saturating_sub(1) {
-      self.tiered_log.fetch_deltas(last_ack_seq, 100)?
-  } else {
-      (vec![seq_op], false)
-  };
-  ```
+* **Solución Técnica / Implementada**: Se eliminó el incremento artificial `+ 1`. `handle_commit` ahora pasa `last_ack_seq` directamente a `fetch_deltas(last_ack_seq, 100)`. Al respetar el contrato semántico de `from_seq` como el cursor ya conocido por el cliente, los deltas devuelven con precisión el rango `(last_ack_seq, new_seq]`.
 
 #### [C-02] Supresión silenciosa de `BehindCompaction` en `handle_commit` provocando divergencia de réplicas
+* **Estado**: **RESUELTO**
 * **Ubicación Exacta**: [`crates/server/src/actor/room.rs:295`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs#L295).
-* **Causa Raíz**: Cuando un cliente retrasado cuyo cursor fue podado físicamente del log (`last_ack_seq < tail_seq - 1`) envía una mutación, `fetch_deltas` retorna `Err(ServerError::BehindCompaction)`. La línea 295 utiliza `.unwrap_or_else(|_| (vec![seq_op], false))`, enmascarando el error y respondiendo HTTP 200 con `CommitAck` que contiene únicamente `vec![seq_op]`. Previamente, la mutación ya fue secuenciada y persistida en WAL.
+* **Causa Raíz**: Cuando un cliente retrasado cuyo cursor fue podado físicamente del log (`last_ack_seq < tail_seq - 1`) envía una mutación, `fetch_deltas` retorna `Err(ServerError::BehindCompaction)`. La línea 295 utilizaba `.unwrap_or_else(|_| (vec![seq_op], false))`, enmascarando el error y respondiendo HTTP 200 con `CommitAck` que contiene únicamente `vec![seq_op]`. Previamente, la mutación ya fue secuenciada y persistida en WAL.
 * **Impacto**: Violación del invariante de consistencia distribuida. El cliente continúa escribiendo sobre un estado base desactualizado sin haber recibido nunca la notificación de compactación ni el snapshot base, provocando divergencia silenciosa e irreparable respecto a los demás nodos.
-* **Solución Técnica**: Validar el límite de retención antes de secuenciar la mutación, o propagar inmediatamente el error:
-  ```rust
-  let tail_seq = self.tiered_log.tail_seq();
-  if tail_seq.get() > 1 && last_ack_seq.get() < tail_seq.get().saturating_sub(1) {
-      let _ = reply.send(Err(ServerError::BehindCompaction));
-      return;
-  }
-  ```
+* **Solución Técnica / Implementada**: Se valida de forma preventiva el cursor antes de secuenciar la mutación, propagando `Err(ServerError::BehindCompaction)` si `last_ack_seq < tail_seq - 1` (o si el cliente no está en estado `Connected`, rechazando clientes `Bootstrapping`/`Dormant`). Si `fetch_deltas` retorna `Err(ServerError::BehindCompaction)`, el error se propaga inmediatamente sin tragar la excepción.
 
 #### [C-03] Ausencia total de autenticación, autorización y validación de lease en todo el Data Plane
 * **Ubicación Exacta**: [`crates/server/src/api/data_plane.rs:131-584`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/data_plane.rs#L131-L584), [`crates/server/src/api/sse.rs:15-53`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/sse.rs#L15-L53), [`crates/core/src/protocol/messages.rs:49-105`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/protocol/messages.rs#L49-L105).
@@ -164,19 +152,21 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Impacto**: Pérdida silenciosa de datos. En cualquier archivo WAL donde se agrupen mutaciones en lotes multi-operación (`write_batch`), todas las operaciones a partir de la segunda son omitidas permanentemente.
 * **Solución Técnica**: Refactorizar `WalReader` para almacenar un buffer interno de operaciones pendientes (`pending_ops: VecDeque<SequencedOperation>`) que se vacíe antes de decodificar nuevos frames en disco.
 
-#### [C-08] Código muerto en `register_client` impide re-anclar cursor de clientes en estado `Dormant`
-* **Ubicación Exacta**: [`crates/server/src/actor/lease.rs:88-95`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/lease.rs#L88-L95).
-* **Causa Raíz**: `entry.state = ClientState::Connected;` se ejecuta en la línea 89. La comprobación subsiguiente `if entry.state == ClientState::Dormant` en la línea 92 es código muerto inalcanzable.
-* **Impacto**: Cuando un cliente Dormant se re-registra tras aplicar un snapshot, su cursor `last_ack_seq` nunca se actualiza a `current_head`. Su cursor desfasado bloquea indefinidamente la poda proactiva de logs (`min_connected_ack_seq`) y provoca que el servidor vuelva a emitir `BehindCompaction` ante nuevos syncs.
-* **Solución Técnica**: Capturar el estado previo antes de mutar la entrada:
-  ```rust
-  let was_dormant = entry.state == ClientState::Dormant;
-  entry.state = ClientState::Connected;
-  entry.last_heartbeat = Instant::now();
-  if was_dormant {
-      entry.last_ack_seq = current_head;
-  }
-  ```
+#### [C-08] Código muerto en `register_client` y fallo conceptual al re-anclar cursor en onboarding / estado `Dormant`
+* **Estado**: **RESUELTO (Rediseño de Flujo de Onboarding y Ancla de Retención)**
+* **Ubicación Exacta**: [`crates/server/src/actor/lease.rs:88-95`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/lease.rs#L88-L95), [`crates/server/src/actor/room.rs:370-390`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs#L370-L390), [`crates/core/src/protocol/messages.rs:50-70`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/protocol/messages.rs#L50-L70).
+* **Causa Raíz y Análisis Crítico**:
+  1. *Defecto de Código Muerto*: `entry.state = ClientState::Connected;` se ejecutaba antes de evaluar `if entry.state == ClientState::Dormant`, dejando inalcanzable la rama.
+  2. *Defecto Conceptual de Re-anclaje Ciego*: La remediación preliminar de asignar `entry.last_ack_seq = current_head` adolecía de un grave defecto distribuido. Un snapshot base generado por un par activo se crea sobre una secuencia $S \le \text{current\_head}$ y es inmutable. Si se realizan mutaciones posteriores $(S, \text{current\_head}]$ y el servidor adelantara a ciegas el cursor del cliente a $\text{current\_head}$, el log de deltas intermedios $(S, \text{current\_head}]$ sería podado proactivamente. Cuando el cliente restaure el snapshot en $S$ y solicite los deltas posteriores, sufrirá un fallo catastrófico de contigüidad o un bucle infinito de `BehindCompaction`.
+* **Impacto**: Clientes nuevos o en reconexión quedaban desincronizados permanentemente o bloqueaban la retención de disco de salas activas.
+* **Solución Técnica / Implementada**:
+  - **Nuevo Estado `ClientState::Bootstrapping`**: Introducido en `ClientLeaseTracker`. Clientes nuevos o reconectados cuyo cursor esté desfasado (`current_seq < tail_seq - 1` o `None`) ingresan en `Bootstrapping`.
+  - **Aislamiento de Retención Proactiva**: Los clientes en `Bootstrapping` son excluidos del cálculo `min_connected_ack_seq`, garantizando que un cliente lento en onboarding jamás congele la poda de disco para los miembros conectados activos.
+  - **Ancla de Retención de Snapshots (*Retention Anchor*)**: En `RoomActor::prune_older_than`, el límite inferior de poda se calcula como:
+    $$\text{retention\_floor} = \min(\text{min\_connected\_ack}, \text{active\_snapshot\_seq})$$
+    Mientras un snapshot activo en secuencia $S$ permanezca disponible en `SnapshotRelay`, el servidor retiene los deltas $(S, \text{current\_head}]$, protegiéndolos contra la poda proactiva.
+  - **Handshake Extendido**: `ClientMessage::RegisterClient` incluye `current_seq: Option<SequenceNumber>` y `ServerMessage::Registered` retorna `head_seq`, `tail_seq` y `active_snapshot_seq: Option<SequenceNumber>`.
+  - **Promoción Fluida a `Connected`**: Al aplicar el snapshot en $S$ y enviar su primer `/sync` o `Ack` que alcance o supere $S$, el cliente es promovido de `Bootstrapping` a `Connected`. Si el snapshot vence por TTL o es purgado del relay, la restricción se libera automáticamente.
 
 #### [C-09] Condición de carrera TOCTOU en `get_or_spawn` duplica actores de sala y corrompe WALs
 * **Ubicación Exacta**: [`crates/server/src/actor/manager.rs:63-122`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/manager.rs#L63-L122).
@@ -287,10 +277,16 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica**: Enviar `RoomCommand::Shutdown`, hacer `.await` sobre su `JoinHandle` y solo entonces eliminar el directorio.
 
 #### [A-15] `SnapshotRelay` en memoria RAM sin cuota ni backpressure susceptible a ataques DoS (OOM)
-* **Ubicación Exacta**: [`crates/server/src/relay.rs:26-62`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/relay.rs#L26-L62).
-* **Causa Raíz**: Snapshots se almacenan en un `DashMap<RoomId, StagedSnapshot>` en memoria sin cuota global de bytes ni límite de retención activa.
-* **Impacto**: Agotamiento de la memoria RAM del servidor enviando múltiples payloads a salas aleatorias.
-* **Solución Técnica**: Imponer cuota máxima de memoria y descarte LRU o almacenamiento temporal en disco.
+* **Estado**: **RESUELTO**
+* **Ubicación Exacta**: [`crates/server/src/relay.rs:26-62`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/relay.rs#L26-L62), [`crates/server/src/config.rs:32-75`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/config.rs#L32-L75).
+* **Causa Raíz**: Snapshots se almacenaban en un `DashMap<RoomId, StagedSnapshot>` en memoria sin persistencia a disco ni TTL configurable ni limpieza física, arriesgando OOM en servidores de producción.
+* **Impacto**: Agotamiento de la memoria RAM del servidor enviando múltiples payloads a salas aleatorias y pérdida de snapshots tras reinicios.
+* **Solución Técnica / Implementada**:
+  - `SnapshotRelay::new(snapshots_dir, ttl)` exige obligatoriamente un directorio en disco donde persistir los snapshots (`{room_id}_{head_seq}.snap.zst`).
+  - Las subidas se escriben de manera atómica mediante staging a archivos temporales `.tmp.<nanos>` y renombrado seguro.
+  - Se integró el parámetro configurable `snapshot_ttl_secs: u64` en `ServerConfig` (por defecto 600 segundos) y soporte de variable de entorno `RIMDB_SNAPSHOT_TTL_SECS`.
+  - `cleanup_expired` purga tanto de la memoria RAM como del sistema de archivos con `std::fs::remove_file`, previniendo fugas en disco y agotamiento de RAM (OOM/DoS).
+  - Al reiniciar el servidor, `recover_disk_snapshots()` recarga automáticamente snapshots válidos y descarta archivos temporales huérfanos o snapshots vencidos.
 
 #### [A-16] Crate `rimdb-client` es un cascarón vacío stub sin implementación del SDK de cliente
 * **Ubicación Exacta**: [`crates/client/src/lib.rs:1-15`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/client/src/lib.rs#L1-L15), [`crates/client/Cargo.toml`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/client/Cargo.toml).
@@ -314,9 +310,10 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica**: Si `incoming.timestamp < existing.timestamp`, descartar el update antiguo completamente.
 
 #### [M-02] Reintentos idempotentes de `Commit` devuelven `catchup_ops` vacío omitiendo mutación propia
+* **Estado**: **RESUELTO**
 * **Ubicación Exacta**: [`crates/server/src/actor/room.rs:235-252`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs#L235-L252).
-* **Causa Raíz**: Al detectar duplicado, consulta deltas desde `existing_seq`, devolviendo un lote vacío que no contiene la mutación secuenciada.
-* **Solución Técnica**: Consultar deltas desde `last_ack_seq` para incluir la mutación original en la respuesta de reintento.
+* **Causa Raíz**: Al detectar duplicado, consultaba deltas desde `existing_seq`, devolviendo un lote vacío que no contenía la mutación ya secuenciada.
+* **Solución Técnica / Implementada**: En `handle_commit`, al detectar un `mutation_id` duplicado en `dedup_cache`, se invoca `fetch_deltas(last_ack_seq, 100)` devolviendo el conjunto de operaciones a partir del cursor del cliente, incluyendo la mutación propia secuenciada originalmente.
 
 #### [M-03] Ausencia de magic bytes, versión de wire protocol y discriminante en codec binario
 * **Ubicación Exacta**: [`crates/core/src/protocol/codec.rs:8-26`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/protocol/codec.rs#L8-L26).

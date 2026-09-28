@@ -7,10 +7,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ServerError;
 
-/// Tri-state lifecycle status of a registered room client.
+/// Lifecycle status of a registered room client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientState {
-    /// Actively connected and communicating via heartbeats or commits.
+    /// Actively bootstrapping (downloading/applying a base snapshot).
+    /// Holds an active lease and emits heartbeats, but does NOT block proactive log pruning.
+    Bootstrapping,
+    /// Actively connected and communicating via heartbeats, syncs, or commits.
     Connected,
     /// Offline or disconnected, but its cursor is still within the server's retained logs.
     Disconnected,
@@ -79,36 +82,51 @@ impl ClientLeaseTracker {
         Ok(())
     }
 
-    /// Registers a client or marks an existing one as Connected.
+    /// Registers a client, setting its initial state based on its current cursor vs tail_seq:
+    /// - If `current_seq` is behind `tail_seq - 1` (or None in a pruned room), client enters `Bootstrapping`.
+    /// - Otherwise, client enters `Connected` with its actual acknowledged sequence.
     pub fn register_client(
         &mut self,
         client_id: &ClientId,
-        current_head: SequenceNumber,
-    ) -> Result<(), ServerError> {
+        current_seq: Option<SequenceNumber>,
+        tail_seq: SequenceNumber,
+    ) -> Result<ClientState, ServerError> {
+        let is_behind = match current_seq {
+            Some(seq) => tail_seq.get() > 0 && seq.get() < tail_seq.get().saturating_sub(1),
+            None => tail_seq.get() > 1,
+        };
+
+        let initial_state = if is_behind {
+            ClientState::Bootstrapping
+        } else {
+            ClientState::Connected
+        };
+
+        let last_ack = current_seq.unwrap_or(SequenceNumber::new(0));
+
         if let Some(entry) = self.clients.get_mut(client_id) {
-            entry.state = ClientState::Connected;
+            entry.state = initial_state;
             entry.last_heartbeat = Instant::now();
-            // If client was dormant, registration with head_seq re-anchors its cursor
-            if entry.state == ClientState::Dormant {
-                entry.last_ack_seq = current_head;
-            }
+            entry.last_ack_seq = last_ack;
         } else {
             self.clients.insert(
                 client_id.clone(),
                 ClientEntry {
                     client_id: client_id.clone(),
-                    state: ClientState::Connected,
-                    last_ack_seq: current_head,
+                    state: initial_state,
+                    last_ack_seq: last_ack,
                     last_heartbeat: Instant::now(),
                 },
             );
         }
 
-        self.save()
+        self.save()?;
+        Ok(initial_state)
     }
 
     /// Records an explicit acknowledgment of applied sequences from a client,
     /// advancing its cursor, resetting its lease timer, and persisting to disk.
+    /// Acknowledgment promotes a Bootstrapping client to Connected.
     pub fn record_ack(
         &mut self,
         client_id: &ClientId,
@@ -172,7 +190,7 @@ impl ClientLeaseTracker {
     }
 
     /// Evaluates timeouts for all registered clients:
-    /// - `Connected` -> `Disconnected` when lease expires without heartbeat.
+    /// - `Connected` / `Bootstrapping` -> `Disconnected` when lease expires without heartbeat.
     /// - `Disconnected` -> `Dormant` when its cursor falls behind `tail_seq - 1`.
     pub fn check_timeouts(&mut self, lease_timeout: Duration, tail_seq: SequenceNumber) -> bool {
         let mut modified = false;
@@ -180,7 +198,7 @@ impl ClientLeaseTracker {
 
         for entry in self.clients.values_mut() {
             match entry.state {
-                ClientState::Connected => {
+                ClientState::Connected | ClientState::Bootstrapping => {
                     if now.duration_since(entry.last_heartbeat) > lease_timeout {
                         entry.state = ClientState::Disconnected;
                         modified = true;
@@ -208,6 +226,7 @@ impl ClientLeaseTracker {
     /// Returns the minimum cursor among all registered clients ONLY IF all non-dormant clients
     /// are currently `Connected`. If any non-dormant client is `Disconnected`, returns `None`
     /// to avoid prematurely truncating logs that the disconnected client may still need.
+    /// Clients in `Bootstrapping` do not block proactive pruning.
     pub fn min_connected_ack_seq(&self) -> Option<SequenceNumber> {
         if self.clients.is_empty() {
             return None;
@@ -222,12 +241,19 @@ impl ClientLeaseTracker {
             return None;
         }
 
-        // Find min ack across Connected clients (ignoring Dormant)
+        // Find min ack across Connected clients (ignoring Dormant and Bootstrapping)
         self.clients
             .values()
             .filter(|c| c.state == ClientState::Connected)
             .map(|c| c.last_ack_seq)
             .min()
+    }
+
+    /// Checks if a client is in the `Bootstrapping` state.
+    pub fn is_bootstrapping(&self, client_id: &ClientId) -> bool {
+        self.clients
+            .get(client_id)
+            .is_some_and(|c| c.state == ClientState::Bootstrapping)
     }
 
     /// Checks if a client is in the `Dormant` state.
@@ -242,20 +268,22 @@ impl ClientLeaseTracker {
         self.clients.get(client_id)
     }
 
-    /// Returns (connected, disconnected, dormant, total) client counts.
-    pub fn client_counts(&self) -> (usize, usize, usize, usize) {
+    /// Returns (bootstrapping, connected, disconnected, dormant, total) client counts.
+    pub fn client_counts(&self) -> (usize, usize, usize, usize, usize) {
+        let mut bootstrapping = 0;
         let mut connected = 0;
         let mut disconnected = 0;
         let mut dormant = 0;
 
         for entry in self.clients.values() {
             match entry.state {
+                ClientState::Bootstrapping => bootstrapping += 1,
                 ClientState::Connected => connected += 1,
                 ClientState::Disconnected => disconnected += 1,
                 ClientState::Dormant => dormant += 1,
             }
         }
 
-        (connected, disconnected, dormant, self.clients.len())
+        (bootstrapping, connected, disconnected, dormant, self.clients.len())
     }
 }

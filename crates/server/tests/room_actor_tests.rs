@@ -3,10 +3,14 @@ use std::time::Duration;
 use rimdb_core::*;
 use rimdb_server::{
     CommitResponse, RegisterResponse, RoomCommand, RoomLifecyclePolicy, RoomManager, SchemaRegistry,
-    ServerConfig, ServerError, SyncBatchResponse,
+    ServerConfig, ServerError, SnapshotRelay, SyncBatchResponse,
 };
 use tempfile::tempdir;
 use tokio::sync::oneshot;
+
+fn create_test_relay() -> Arc<SnapshotRelay> {
+    Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(60)))
+}
 
 fn create_test_schema() -> Schema {
     let table = TableSchema::builder("tasks")
@@ -89,7 +93,7 @@ async fn test_room_actor_registration_and_get_schema() {
         ..Default::default()
     });
 
-    let manager = RoomManager::new(config, schema_registry);
+    let manager = RoomManager::new(config, schema_registry, create_test_relay());
     let room_id = RoomId::new("room-1");
     let sender = manager
         .get_or_spawn(&room_id, Some(&schema_id))
@@ -100,6 +104,7 @@ async fn test_room_actor_registration_and_get_schema() {
     sender
         .send(RoomCommand::RegisterClient {
             client_id: ClientId::new("client-alice"),
+            current_seq: None,
             reply: reply_tx,
         })
         .await
@@ -126,7 +131,7 @@ async fn test_room_actor_commit_validation_and_monotonic_sequencing() {
         ..Default::default()
     });
 
-    let manager = RoomManager::new(config, schema_registry);
+    let manager = RoomManager::new(config, schema_registry, create_test_relay());
     let room_id = RoomId::new("tasks-room");
     let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).unwrap();
 
@@ -214,7 +219,7 @@ async fn test_room_actor_multi_client_concurrency_and_sse_events() {
         ..Default::default()
     });
 
-    let manager = RoomManager::new(config, schema_registry);
+    let manager = RoomManager::new(config, schema_registry, create_test_relay());
     let room_id = RoomId::new("concurrent-room");
     let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).unwrap();
 
@@ -223,6 +228,7 @@ async fn test_room_actor_multi_client_concurrency_and_sse_events() {
     sender
         .send(RoomCommand::RegisterClient {
             client_id: ClientId::new("reader"),
+            current_seq: None,
             reply: reg_tx,
         })
         .await
@@ -337,7 +343,7 @@ async fn test_room_actor_client_lifecycle_and_dormant_behind_compaction() {
     // Aggressive test policy for rapid compaction
     let lifecycle_policy = RoomLifecyclePolicy::test_policy();
 
-    let manager = RoomManager::new(config, schema_registry);
+    let manager = RoomManager::new(config, schema_registry, create_test_relay());
     let room_id = RoomId::new("lifecycle-room");
     let sender = manager
         .get_or_spawn_with_policy(&room_id, Some(&schema_id), lifecycle_policy)
@@ -351,6 +357,7 @@ async fn test_room_actor_client_lifecycle_and_dormant_behind_compaction() {
     sender
         .send(RoomCommand::RegisterClient {
             client_id: alice.clone(),
+            current_seq: None,
             reply: reg_tx,
         })
         .await
@@ -361,6 +368,7 @@ async fn test_room_actor_client_lifecycle_and_dormant_behind_compaction() {
     sender
         .send(RoomCommand::RegisterClient {
             client_id: bob.clone(),
+            current_seq: None,
             reply: reg_tx2,
         })
         .await
@@ -467,7 +475,11 @@ async fn test_room_actor_recovery_retains_state_and_head_seq() {
 
     // Phase 1: Spawn, commit 5 ops, then close room actor
     {
-        let manager = RoomManager::new(Arc::clone(&config), Arc::clone(&schema_registry));
+        let manager = RoomManager::new(
+            Arc::clone(&config),
+            Arc::clone(&schema_registry),
+            create_test_relay(),
+        );
         let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).unwrap();
 
         for i in 1..=5 {
@@ -495,7 +507,11 @@ async fn test_room_actor_recovery_retains_state_and_head_seq() {
 
     // Phase 2: Respawn actor from same directory without passing schema_id explicitly
     {
-        let manager2 = RoomManager::new(Arc::clone(&config), Arc::clone(&schema_registry));
+        let manager2 = RoomManager::new(
+            Arc::clone(&config),
+            Arc::clone(&schema_registry),
+            create_test_relay(),
+        );
         let sender2 = manager2
             .get_or_spawn(&room_id, None)
             .expect("should recover room metadata");
@@ -558,7 +574,7 @@ async fn test_room_actor_cursor_advances_only_on_client_ack() {
         ..Default::default()
     });
 
-    let manager = RoomManager::new(config, schema_registry);
+    let manager = RoomManager::new(config, schema_registry, create_test_relay());
     let room_id = RoomId::new("ack-test-room");
     let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).unwrap();
 
@@ -569,6 +585,7 @@ async fn test_room_actor_cursor_advances_only_on_client_ack() {
     sender
         .send(RoomCommand::RegisterClient {
             client_id: client.clone(),
+            current_seq: None,
             reply: reg_tx,
         })
         .await
@@ -675,5 +692,124 @@ async fn test_room_actor_cursor_advances_only_on_client_ack() {
         Some(SequenceNumber::new(5)),
         "Cursor must advance after explicit client ACK"
     );
+}
+
+#[tokio::test]
+async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
+    let dir = tempdir().unwrap();
+    let schema_registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
+    let schema_id = SchemaId::new("anchor-schema");
+    let schema = create_test_schema();
+    schema_registry
+        .register_schema(schema_id.clone(), schema.clone())
+        .unwrap();
+
+    let config = Arc::new(ServerConfig {
+        data_dir: dir.path().join("data"),
+        lease_timeout_secs: 60,
+        ..Default::default()
+    });
+
+    let relay = Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(300)));
+    let manager = RoomManager::new(config, schema_registry, Arc::clone(&relay));
+    let room_id = RoomId::new("anchor-room");
+
+    let lifecycle_policy = RoomLifecyclePolicy::test_policy();
+    let sender = manager
+        .get_or_spawn_with_policy(&room_id, Some(&schema_id), lifecycle_policy)
+        .unwrap();
+
+    // 1. Stage an active snapshot at seq 5 in the relay
+    relay.stage_snapshot(
+        room_id.clone(),
+        SequenceNumber::new(5),
+        bytes::Bytes::from_static(b"fake-snapshot-data-seq-5"),
+    );
+
+    // 2. Alice registers and commits 10 operations (1..=10)
+    let alice = ClientId::new("alice");
+    let (reg_tx, reg_rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::RegisterClient {
+            client_id: alice.clone(),
+            current_seq: None,
+            reply: reg_tx,
+        })
+        .await
+        .unwrap();
+    reg_rx.await.unwrap().unwrap();
+
+    for i in 1..=10 {
+        let op = create_insert_op(&schema, i, &format!("task-{}", i));
+        let (tx, rx) = oneshot::channel();
+        sender
+            .send(RoomCommand::Commit {
+                client_id: alice.clone(),
+                mutation_id: MutationId::new([i as u8; 16]),
+                last_ack_seq: SequenceNumber::new(i as u64 - 1),
+                op,
+                reply: tx,
+            })
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap();
+    }
+
+    // 3. Alice acknowledges seq 10. Proactive pruning triggers, but
+    // Retention Anchor at seq 5 MUST prevent pruning deltas 6..=10!
+    let (ack_tx, ack_rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::Ack {
+            client_id: alice.clone(),
+            ack_seq: SequenceNumber::new(10),
+            reply: ack_tx,
+        })
+        .await
+        .unwrap();
+    ack_rx.await.unwrap().unwrap();
+
+    // 4. Bob (onboarding client) registers with current_seq = None
+    let bob = ClientId::new("bob");
+    let (reg_bob_tx, reg_bob_rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::RegisterClient {
+            client_id: bob.clone(),
+            current_seq: None,
+            reply: reg_bob_tx,
+        })
+        .await
+        .unwrap();
+    let bob_reg = reg_bob_rx.await.unwrap().unwrap();
+    assert_eq!(bob_reg.head_seq, SequenceNumber::new(10));
+    assert_eq!(bob_reg.active_snapshot_seq, Some(SequenceNumber::new(5)));
+
+    // 5. Bob applies snapshot at 5 and confirms via Ack(5)
+    let (ack_bob_tx, ack_bob_rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::Ack {
+            client_id: bob.clone(),
+            ack_seq: SequenceNumber::new(5),
+            reply: ack_bob_tx,
+        })
+        .await
+        .unwrap();
+    ack_bob_rx.await.unwrap().unwrap();
+
+    // 6. Bob requests deltas after snapshot: Sync { from_seq: 5 }
+    // These deltas MUST be present thanks to the Retention Anchor!
+    let (sync_tx, sync_rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::Sync {
+            client_id: bob.clone(),
+            from_seq: SequenceNumber::new(5),
+            max_batch_size: 50,
+            reply: sync_tx,
+        })
+        .await
+        .unwrap();
+    let sync_res = sync_rx.await.unwrap().expect("Sync after snapshot must succeed");
+    assert_eq!(sync_res.ops.len(), 5);
+    assert_eq!(sync_res.ops[0].seq, SequenceNumber::new(6));
+    assert_eq!(sync_res.ops[4].seq, SequenceNumber::new(10));
 }
 

@@ -12,8 +12,10 @@ use crate::error::ServerError;
 #[derive(Debug, Clone)]
 pub struct RegisterResponse {
     pub head_seq: SequenceNumber,
+    pub tail_seq: SequenceNumber,
     pub schema_id: SchemaId,
     pub schema: Arc<Schema>,
+    pub active_snapshot_seq: Option<SequenceNumber>,
 }
 
 /// Response returned to a client upon committing an operation.
@@ -39,6 +41,7 @@ pub struct RoomMetrics {
     pub schema_id: SchemaId,
     pub head_seq: SequenceNumber,
     pub tail_seq: SequenceNumber,
+    pub bootstrapping_clients: usize,
     pub connected_clients: usize,
     pub disconnected_clients: usize,
     pub dormant_clients: usize,
@@ -51,6 +54,7 @@ pub enum RoomCommand {
     /// Register or re-activate a client in the room.
     RegisterClient {
         client_id: ClientId,
+        current_seq: Option<SequenceNumber>,
         reply: oneshot::Sender<Result<RegisterResponse, ServerError>>,
     },
 

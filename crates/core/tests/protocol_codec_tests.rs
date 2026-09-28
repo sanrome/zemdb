@@ -119,6 +119,7 @@ fn test_protocol_binary_serialization_roundtrip() {
         room_id: RoomId::new("room-abc"),
         client_id: ClientId::new("client-1"),
         auth_token: "jwt.signed.token.abc123xyz".to_string(),
+        current_seq: Some(SequenceNumber::new(5)),
     };
     let enc_reg = encode_message(&reg_msg).expect("serialization failed");
     let dec_reg: ClientMessage = decode_message(&enc_reg).expect("deserialization failed");
@@ -144,8 +145,10 @@ fn test_protocol_binary_serialization_roundtrip() {
         correlation_id: CorrelationId::new(1004),
         room_id: RoomId::new("room-abc"),
         head_seq: SequenceNumber::new(1),
+        tail_seq: SequenceNumber::new(1),
         schema_id: SchemaId::new("schema-workspace-v1"),
         schema: test_schema.clone(),
+        active_snapshot_seq: Some(SequenceNumber::new(1)),
     };
     let enc_registered = encode_message(&registered_msg).expect("serialization failed");
     let dec_registered: ServerMessage =

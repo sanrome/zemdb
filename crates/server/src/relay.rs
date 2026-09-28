@@ -19,6 +19,7 @@ pub struct StagedSnapshot {
     pub total_bytes: u64,
     pub snapshot_hash: [u8; 32],
     pub created_at: Instant,
+    pub file_path: Option<std::path::PathBuf>,
 }
 
 /// Ephemeral relay facilitating state-transfer chunks between peers or cold snapshots and bootstrapping clients.
@@ -26,15 +27,119 @@ pub struct StagedSnapshot {
 pub struct SnapshotRelay {
     snapshots: DashMap<RoomId, StagedSnapshot>,
     ttl: Duration,
+    snapshots_dir: Option<std::path::PathBuf>,
 }
 
 impl SnapshotRelay {
-    /// Creates a new snapshot relay with a staging TTL.
-    pub fn new(ttl: Duration) -> Self {
+    /// Creates a new snapshot relay backed by a disk directory for snapshot persistence.
+    /// Creates the directory if it does not exist, and recovers any existing snapshots within TTL.
+    pub fn new(snapshots_dir: impl AsRef<std::path::Path>, ttl: Duration) -> std::io::Result<Self> {
+        let dir_buf = snapshots_dir.as_ref().to_path_buf();
+        std::fs::create_dir_all(&dir_buf)?;
+        let relay = Self {
+            snapshots: DashMap::new(),
+            ttl,
+            snapshots_dir: Some(dir_buf),
+        };
+        relay.recover_disk_snapshots();
+        Ok(relay)
+    }
+
+    /// Creates an in-memory snapshot relay without filesystem persistence (primarily for unit tests).
+    pub fn new_in_memory(ttl: Duration) -> Self {
         Self {
             snapshots: DashMap::new(),
             ttl,
+            snapshots_dir: None,
         }
+    }
+
+    /// Scans the snapshot directory and recovers valid staged snapshots that haven't exceeded TTL.
+    fn recover_disk_snapshots(&self) {
+        let dir = match self.snapshots_dir.as_ref() {
+            Some(d) => d,
+            None => return,
+        };
+
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        let now_system = std::time::SystemTime::now();
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name,
+                None => continue,
+            };
+
+            // Clean up orphan temporary write files
+            if file_name.contains(".tmp") {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+
+            if !file_name.ends_with(".snap.zst") {
+                continue;
+            }
+
+            let stem = &file_name[..file_name.len() - ".snap.zst".len()];
+            let parts: Vec<&str> = stem.rsplitn(2, '_').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+
+            let head_seq_val = match parts[0].parse::<u64>() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let room_id = RoomId::new(parts[1]);
+            let head_seq = SequenceNumber::new(head_seq_val);
+
+            let metadata = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            let modified = metadata.modified().unwrap_or(now_system);
+            let age = now_system.duration_since(modified).unwrap_or(Duration::ZERO);
+
+            if age >= self.ttl {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+
+            if let Ok(bytes) = std::fs::read(&path) {
+                let data = Bytes::from(bytes);
+                let snapshot_hash = ServerMessage::compute_snapshot_hash(&data);
+                let total_bytes = data.len() as u64;
+                let created_at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+
+                self.snapshots.insert(
+                    room_id,
+                    StagedSnapshot {
+                        head_seq,
+                        data,
+                        total_bytes,
+                        snapshot_hash,
+                        created_at,
+                        file_path: Some(path),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Returns the active snapshot sequence number for a room if one is currently staged and valid.
+    pub fn active_snapshot_seq(&self, room_id: &RoomId) -> Option<SequenceNumber> {
+        self.cleanup_expired();
+        self.snapshots.get(room_id).map(|s| s.head_seq)
     }
 
     /// Stages a complete snapshot for a room, calculating its cryptographic BLAKE3 digest.
@@ -47,6 +152,32 @@ impl SnapshotRelay {
         let snapshot_hash = ServerMessage::compute_snapshot_hash(&data);
         let total_bytes = data.len() as u64;
 
+        let file_path = if let Some(ref dir) = self.snapshots_dir {
+            let snap_path = dir.join(format!("{}_{}.snap.zst", room_id.as_str(), head_seq.get()));
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let tmp_path = snap_path.with_extension(format!("tmp.{}", nanos));
+            if std::fs::write(&tmp_path, &data).is_ok() {
+                let _ = std::fs::rename(&tmp_path, &snap_path);
+                Some(snap_path)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // If an existing snapshot for this room had a different file_path on disk, delete it
+        if let Some(old_snap) = self.snapshots.get(&room_id) {
+            if let Some(ref old_path) = old_snap.file_path {
+                if file_path.as_ref() != Some(old_path) {
+                    let _ = std::fs::remove_file(old_path);
+                }
+            }
+        }
+
         self.snapshots.insert(
             room_id,
             StagedSnapshot {
@@ -55,6 +186,7 @@ impl SnapshotRelay {
                 total_bytes,
                 snapshot_hash,
                 created_at: Instant::now(),
+                file_path,
             },
         );
 
@@ -107,11 +239,18 @@ impl SnapshotRelay {
         })
     }
 
-    /// Purges staged snapshots that exceeded their TTL.
+    /// Purges staged snapshots that exceeded their TTL both from RAM and from disk.
     pub fn cleanup_expired(&self) {
         let now = Instant::now();
-        self.snapshots
-            .retain(|_, snap| now.duration_since(snap.created_at) < self.ttl);
+        self.snapshots.retain(|_, snap| {
+            let alive = now.duration_since(snap.created_at) < self.ttl;
+            if !alive {
+                if let Some(ref path) = snap.file_path {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+            alive
+        });
     }
 }
 
@@ -125,11 +264,18 @@ pub async fn upload_snapshot(
 ) -> Result<Response, ServerError> {
     let room_id = RoomId::new(room_id_str);
 
-    let head_seq_val = headers
+    let head_seq_str = headers
         .get("x-snapshot-head-seq")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
+        .ok_or_else(|| ServerError::Config("Missing x-snapshot-head-seq header".to_string()))?;
+
+    let head_seq_val = head_seq_str
+        .parse::<u64>()
+        .map_err(|_| ServerError::Config("Invalid x-snapshot-head-seq header format".to_string()))?;
+
+    if head_seq_val == 0 {
+        return Err(ServerError::Config("x-snapshot-head-seq must be greater than 0".to_string()));
+    }
 
     let head_seq = SequenceNumber::new(head_seq_val);
     let hash = state.snapshot_relay.stage_snapshot(room_id.clone(), head_seq, body);
@@ -223,3 +369,4 @@ pub async fn request_chunk(
             .into_response(),
     }
 }
+

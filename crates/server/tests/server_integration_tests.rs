@@ -35,15 +35,18 @@ impl TestServer {
             admin_secret: "test_admin_secret_key_123456789".to_string(),
             lease_timeout_secs: 60,
             dedup_lru_capacity: 1000,
+            snapshot_ttl_secs: 60,
         });
 
         let schemas_dir = data_dir.join("schemas");
         let schema_registry = Arc::new(SchemaRegistry::new(schemas_dir).unwrap());
+        let snapshots_dir = data_dir.join("snapshots");
+        let snapshot_relay = Arc::new(SnapshotRelay::new(snapshots_dir, Duration::from_secs(config.snapshot_ttl_secs)).unwrap());
         let room_manager = Arc::new(RoomManager::new(
             Arc::clone(&config),
             Arc::clone(&schema_registry),
+            Arc::clone(&snapshot_relay),
         ));
-        let snapshot_relay = Arc::new(SnapshotRelay::new(Duration::from_secs(60)));
 
         let state = AppState::new(
             Arc::clone(&config),
@@ -282,6 +285,7 @@ async fn test_data_plane_handshake_and_1rtt_commit() {
         room_id: room_id.clone(),
         client_id: client_id.clone(),
         auth_token: "invalid.token.signature.123".to_string(),
+        current_seq: None,
     };
     let body_bad = encode_message(&reg_msg_bad).unwrap();
     let resp = server
@@ -306,6 +310,7 @@ async fn test_data_plane_handshake_and_1rtt_commit() {
         room_id: room_id.clone(),
         client_id: client_id.clone(),
         auth_token: valid_token,
+        current_seq: None,
     };
     let body_reg = encode_message(&reg_msg).unwrap();
     let resp = server
@@ -421,6 +426,7 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
         room_id: room_id.clone(),
         client_id: reader.clone(),
         auth_token: token_reader,
+        current_seq: None,
     };
     server
         .client
@@ -448,6 +454,7 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
                 room_id: room_id.clone(),
                 client_id: writer.clone(),
                 auth_token: token_writer,
+                current_seq: None,
             })
             .unwrap(),
         )
@@ -607,6 +614,7 @@ async fn test_data_plane_heartbeat_and_deregister() {
                 room_id: room_id.clone(),
                 client_id: client_id.clone(),
                 auth_token: token,
+                current_seq: None,
             })
             .unwrap(),
         )
@@ -718,6 +726,7 @@ async fn test_sse_realtime_head_advanced_events() {
                 room_id: room_id.clone(),
                 client_id: client_id.clone(),
                 auth_token: token,
+                current_seq: None,
             })
             .unwrap(),
         )
@@ -874,6 +883,7 @@ async fn test_schema_evolution_cascades_to_active_room() {
                 room_id: room_id.clone(),
                 client_id: client_id.clone(),
                 auth_token: token,
+                current_seq: None,
             })
             .unwrap(),
         )

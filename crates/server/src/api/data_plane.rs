@@ -65,6 +65,7 @@ pub async fn register(
             room_id,
             client_id,
             auth_token,
+            current_seq,
         } => {
             if room_id.as_str() != room_id_str {
                 return binary_error(
@@ -89,7 +90,11 @@ pub async fn register(
 
             let (tx, rx) = tokio::sync::oneshot::channel();
             if sender
-                .send(RoomCommand::RegisterClient { client_id, reply: tx })
+                .send(RoomCommand::RegisterClient {
+                    client_id,
+                    current_seq,
+                    reply: tx,
+                })
                 .await
                 .is_err()
             {
@@ -107,8 +112,10 @@ pub async fn register(
                         correlation_id,
                         room_id,
                         head_seq: reg_resp.head_seq,
+                        tail_seq: reg_resp.tail_seq,
                         schema_id: reg_resp.schema_id,
                         schema: (*reg_resp.schema).clone(),
+                        active_snapshot_seq: reg_resp.active_snapshot_seq,
                     },
                 ),
                 Ok(Err(err)) => binary_error(Some(correlation_id), Some(room_id), err),

@@ -12,6 +12,7 @@ use crate::actor::room::RoomActor;
 use crate::config::ServerConfig;
 use crate::error::ServerError;
 use crate::log::RoomLifecyclePolicy;
+use crate::relay::SnapshotRelay;
 use crate::schema_registry::SchemaRegistry;
 
 /// Persistent room configuration linking a RoomId to its assigned SchemaId.
@@ -28,18 +29,24 @@ pub struct RoomManager {
     room_schemas: DashMap<RoomId, SchemaId>,
     config: Arc<ServerConfig>,
     schema_registry: Arc<SchemaRegistry>,
+    snapshot_relay: Arc<SnapshotRelay>,
     data_dir: PathBuf,
 }
 
 impl RoomManager {
-    /// Creates a new RoomManager with the given configuration and schema registry.
-    pub fn new(config: Arc<ServerConfig>, schema_registry: Arc<SchemaRegistry>) -> Self {
+    /// Creates a new RoomManager with the given configuration, schema registry, and snapshot relay.
+    pub fn new(
+        config: Arc<ServerConfig>,
+        schema_registry: Arc<SchemaRegistry>,
+        snapshot_relay: Arc<SnapshotRelay>,
+    ) -> Self {
         let data_dir = config.data_dir.clone();
         Self {
             rooms: DashMap::new(),
             room_schemas: DashMap::new(),
             config,
             schema_registry,
+            snapshot_relay,
             data_dir,
         }
     }
@@ -114,6 +121,7 @@ impl RoomManager {
             &self.data_dir,
             Arc::clone(&self.config),
             lifecycle_policy,
+            Arc::clone(&self.snapshot_relay),
         )?;
 
         self.rooms.insert(room_id.clone(), sender.clone());
@@ -186,6 +194,7 @@ impl RoomManager {
             &self.data_dir,
             Arc::clone(&self.config),
             lifecycle_policy.unwrap_or_default(),
+            Arc::clone(&self.snapshot_relay),
         )?;
 
         self.rooms.insert(room_id, sender);

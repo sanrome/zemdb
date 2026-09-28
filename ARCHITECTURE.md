@@ -116,10 +116,14 @@ To balance minimal RAM usage with flexible offline support, the coordination ser
    * Allows rooms to retain historical deltas with minimal disk consumption.
 4. **Tier 4 (Eviction & Compaction Boundary - Dual Mode):**
    * **Proactive Cursor-Driven Pruning (`prune_older_than`):** In active rooms, once all registered members confirm having processed up to sequence $S$, segments with `end_seq < S` are immediately purged from disk, reclaiming physical space without waiting for arbitrary TTLs.
-   * **Client Lifecycle States (`Connected`, `Disconnected`, `Dormant`):**
+   * **Client Lifecycle States (`Connected`, `Disconnected`, `Dormant`, `Bootstrapping`):**
      - **`Connected`:** The client is actively communicating (heartbeats, commits, syncs). If all registered clients are `Connected` and have acknowledged sequence $S$, segments older than $S$ are pruned immediately.
      - **`Disconnected`:** The client closed the application or lost network connectivity, but its cursor remains within the log range preserved on disk (`last_ack_seq >= tail_seq - 1`). Upon reconnecting, it fetches missing deltas via standard `/sync` and transitions back to `Connected` without needing a snapshot.
      - **`Dormant`:** The client remained offline so long that the log containing its cursor was physically purged by retention policies (TTL or disk quota), leaving `last_ack_seq < tail_seq - 1`. The client cannot perform delta sync and **must request a full snapshot** to resynchronize. Crucially, `Dormant` clients are excluded from log retention calculations, preventing offline/abandoned clients from blocking disk compaction for active members (Anti-Disk-Bloat / Anti-OOM).
+     - **`Bootstrapping`:** The client is newly registered or reconnecting with `current_seq < tail_seq - 1`. It is currently downloading or applying a base snapshot. `Bootstrapping` clients are excluded from `min_connected_ack_seq` so they never block disk compaction for active peers.
+   * **Snapshot Retention Anchor (*Ancla de Retención*):** To protect onboarding clients against race conditions where active peers continue appending commits and pruning logs while a snapshot is being downloaded, the server anchors proactive pruning to:
+     $$\text{retention\_floor} = \min(\text{min\_connected\_ack}, \text{active\_snapshot\_seq})$$
+     As long as an active snapshot at sequence $S$ is published in `SnapshotRelay`, operations $(S, \text{head\_seq}]$ are preserved on disk. When the bootstrapping client finishes applying snapshot $S$ and fetches deltas or ACKs $\ge S$, it is automatically promoted to `Connected`.
    * **TTL & Quota Compaction:** Historical operations exceeding `cold_disk_ttl` or the room disk quota (`max_room_disk_bytes`) are automatically pruned. The server tracks the oldest available sequence (`tail_seq`). Any sync request with `last_ack_seq < tail_seq - 1` receives `BehindCompaction`, recovering state via full base snapshot transfer from an active client (via server relay or P2P).
 
 ### 5.3. Configurable Lifecycle Policy (`RoomLifecyclePolicy`)
@@ -148,14 +152,27 @@ This ensures the system is adaptable across diverse deployment profiles, from re
 
 Because the server does not store the full persistent historical state and must remain completely decoupled from application user/password databases:
 
-1. **Stateless Ticket Authentication (Signed Token):**
+1. **Stateless Ticket Authentication & Registration Handshake:**
    * The application backend authenticates the end-user (OAuth, email/password, etc.) and issues a signed, time-bounded ticket:
      `auth_token = sign({ client_id, room_id, exp })` using a shared cluster secret (`RIMDB_AUTH_SECRET`, HMAC-SHA256) or asymmetric key pair (Ed25519).
-   * The client connects and issues `ClientMessage::RegisterClient { correlation_id, room_id, client_id, auth_token }`.
-   * The server validates the cryptographic signature in microsecond CPU time without querying any database or storing user passwords. If valid, it responds with `ServerMessage::Registered { head_seq, schema_id, schema }`, delivering the full room schema to the client in 1 RTT.
-2. **Snapshot Generation:** If the client is onboarding into an existing room whose historical deltas have been pruned (`BehindCompaction`), an active peer creates a compressed Zstandard snapshot.
-3. **Transfer:** The compressed snapshot is transferred to the new client (via short-lived ephemeral server relay or direct P2P).
-4. **Subsequent Catch-up:** Once restored locally, the new client connects to the server and pulls delta changes starting from sequence `#head_seq + 1` onwards.
+   * The client connects and issues `ClientMessage::RegisterClient { correlation_id, room_id, client_id, auth_token, current_seq: Option<SequenceNumber> }`.
+   * The server validates the cryptographic signature in microsecond CPU time without querying any database or storing user passwords.
+   * The server responds with `ServerMessage::Registered { head_seq, tail_seq, active_snapshot_seq: Option<SequenceNumber>, schema_id, schema }`, delivering room boundary coordinates and the full schema in 1 RTT.
+
+2. **Client State & Synchronization Path Determination:**
+   * **Direct Delta Catch-up (`Connected`):** If the client is already known or its `current_seq >= tail_seq - 1` (or the room is unpruned), the client enters `ClientState::Connected`. It immediately queries `/sync` starting from `current_seq` to catch up with all recent deltas.
+   * **Snapshot Bootstrapping (`Bootstrapping`):** If the client is brand new or reconnecting with `current_seq < tail_seq - 1` (or `None` in a room where `tail_seq > 1`), it enters `ClientState::Bootstrapping`. The client is excluded from log retention tracking, preventing it from blocking active members.
+
+3. **Snapshot Delivery & Retention Anchor:**
+   * If an active base snapshot is already uploaded to `SnapshotRelay` (indicated by `active_snapshot_seq: Some(S)`), the client downloads it directly (via `GET /rooms/:id/snapshot/download` or the chunked protocol).
+   * If no snapshot exists on the relay, an active connected peer generates an immutable Zstandard snapshot at sequence $S$ and uploads it (`POST /rooms/:id/snapshot/upload` with header `x-snapshot-head-seq: S`).
+   * **Retention Anchor Protection:** While this snapshot remains active on the server relay, the room actor anchors its proactive pruning floor to $\min(\text{min\_connected\_ack}, S)$. This guarantees that all operations $(S, \text{head\_seq}]$ are preserved in the log.
+   * Multiple clients can onboard simultaneously against the same snapshot without race conditions.
+
+4. **Snapshot Restoration & Seamless Promotion:**
+   * The bootstrapping client restores the snapshot locally via `StorageEngine::apply_snapshot`, setting its local sequence to $S$.
+   * It then issues `ClientMessage::Sync { from_seq: S, .. }` or commits a mutation.
+   * Upon processing the deltas $(S, \dots]$, the client's ACK or sync request automatically promotes it from `Bootstrapping` to `Connected`, and normal cursor tracking resumes.
 
 ### Multipart Chunked Snapshot Transfer Protocol (> 16 MB)
 
@@ -191,7 +208,7 @@ To prevent the resource exhaustion of thousands of idle persistent connections:
   * Multiplexing: Multiple sync/commit streams share a single underlying TCP connection using explicit correlation identifiers (`CorrelationId`).
   * Defensive Bounding: Codecs enforce an explicit message size limit (16 MB) to prevent denial-of-service memory exhaustion attacks.
 * **Core Interaction Contracts:**
-  * **Handshake & Schema Delivery (`RegisterClient` -> `Registered`):** Client presents `auth_token` and receives current `head_seq`, `schema_id`, and `Schema` in 1 RTT.
+  * **Handshake & Schema Delivery (`RegisterClient` -> `Registered`):** Client presents `auth_token` and optional `current_seq`, receiving current `head_seq`, `tail_seq`, `active_snapshot_seq`, `schema_id`, and `Schema` in 1 RTT.
   * **On-Demand Schema Refresh (`GetSchema` -> `Schema`):** Allows clients to refresh schema definitions during active DDL evolution without reconnecting.
   * **Mutation Commit with Unified Sync (1 RTT):** Client submits an operation with its `MutationId`, `CorrelationId`, and its current cursor `last_ack_seq`. The server validates the mutation against schemas and constraints. If valid, the server assigns a monotonic `SequenceNumber` and returns `CommitAck` containing the assigned `SequenceNumber` along with any remote catchup deltas (`catchup_ops: Vec<SequencedOperation>`) that occurred between `last_ack_seq` and the new sequence (and `has_more: bool` pagination indicator). This allows the client to register the write, sync pending state, and apply canonical data locally in a single network roundtrip (1 RTT) without risk of local state corruption.
   * **Synchronization (Standalone / Polling):** Client requests operations starting from its `last_ack_seq` specifying a maximum batch size (`ClientMessage::Sync`). The server streams ordered `SequencedOperation` batches with pagination flags (`has_more`).

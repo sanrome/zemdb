@@ -83,6 +83,9 @@ pub enum ClientMessage {
         room_id: RoomId,
         client_id: ClientId,
         auth_token: String,
+        /// Current local sequence cursor (None if new client, Some(seq) if reconnecting or restoring).
+        #[serde(default)]
+        current_seq: Option<SequenceNumber>,
     },
     /// Request current schema for a room under active evolution.
     GetSchema {
@@ -149,13 +152,17 @@ pub enum ServerMessage {
         room_id: RoomId,
         current_head_seq: SequenceNumber,
     },
-    /// Confirmation of client registration, delivering the room schema and current head sequence.
+    /// Confirmation of client registration, delivering the room schema, current head, retention tail, and active snapshot info.
     Registered {
         correlation_id: CorrelationId,
         room_id: RoomId,
         head_seq: SequenceNumber,
+        tail_seq: SequenceNumber,
         schema_id: SchemaId,
         schema: Schema,
+        /// Sequence number of the currently active snapshot available in relay, if any.
+        #[serde(default)]
+        active_snapshot_seq: Option<SequenceNumber>,
     },
     /// Room schema definition delivered in response to `GetSchema`.
     Schema {
