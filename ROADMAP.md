@@ -94,12 +94,14 @@
 * Erradicación del pico de 4x de memoria RAM en la generación de snapshots mediante serialización directa por referencia con `RoomSnapshotRef<'a>` y asignación directa de árboles de tablas `RoomSnapshotPayload`.
 * Encapsulación estricta de newtypes de dominio (`RoomId`, `SchemaId`, `ClientId`, `SequenceNumber`, `MutationId`, `CorrelationId`) y cumplimiento de las directrices de diseño [C-DEREF] de la API de Rust, eliminando `Deref` y ofreciendo métodos y conversiones explícitos (`as_str()`, `get()`, `as_bytes()`, `AsRef<str>`, `AsRef<[u8]>`).
 * Verificación integral del workspace con 68 tests pasando (38 en `rimdb-core`, 29 en `rimdb-storage`, 1 en `rimdb-client`), cero warnings en Clippy (`-D warnings`) y compilación limpia hacia `wasm32-unknown-unknown`.
+* Fase 3.5-A.1: Corrección de desfase off-by-one en catchup 1-RTT (`C-01`), propagación estricta de `BehindCompaction` sin supresión (`C-02`), idempotencia de `Commit` con entrega de mutación original (`M-02`), y rediseño de Onboarding con estado `Bootstrapping`, ancla de retención de snapshots y apretón de manos enriquecido (`C-08`).
+* Fase 3.5-A.2: Autenticación universal y blindaje de Data Plane con extractor Axum `ClientAuth` (`C-03`), validación estricta de 3 vías en URL path vs token vs payload (`M-07`), comparación de firmas y secretos en tiempo constante con `subtle::ConstantTimeEq` (`M-04`) y erradicación definitiva del backdoor `dev-token` (`M-05`).
 
 ---
 
 ## 2. Resumen Ejecutivo del Estado del Proyecto
 
-RimDB ha superado con éxito la **Fase 1 y 1.5 (Reestructuración, Blindaje de Core e Higiene de Workspace)**, la **Fase 2A (Contrato Formal de Persistencia, Pushdown de Queries y Motor en Memoria)** y la **Fase 2B (Motor de Almacenamiento en Disco con WAL y Compresión Zstd)**. El crate [`rimdb-core`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core) se encuentra blindado y el crate [`rimdb-storage`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage) provee tanto el motor en memoria para testing y WASM como el motor en disco de alta durabilidad:
+RimDB ha superado con éxito la **Fase 1 y 1.5 (Reestructuración, Blindaje de Core e Higiene de Workspace)**, la **Fase 2A (Contrato Formal de Persistencia, Pushdown de Queries y Motor en Memoria)**, la **Fase 2B (Motor de Almacenamiento en Disco con WAL y Compresión Zstd)**, la **Fase 3 (Servidor de Coordinación por Actores `rimdb-server`)** y los hitos de remediación **Fase 3.5-A.1 y Fase 3.5-A.2 (Catchup 1-RTT, Onboarding con Bootstrapping, Autenticación Universal y Blindaje de Data Plane)**. El backend del servidor y los crates centrales se encuentran completamente verificados con pruebas unitarias y de integración end-to-end:
 - Se redujo el footprint de memoria de `Value` en un 40% (24 bytes) y `PrimaryKey` a 40 bytes (ajustado a una línea de caché L1 de CPU).
 - Se garantizó la estabilidad binaria de esquemas con orden DDL físico en `TableSchema` y conversiones zero-copy por movimiento.
 - Se cerró la pérdida de datos y anomalías de tuplas zombi en `squash_operations`.
@@ -107,8 +109,10 @@ RimDB ha superado con éxito la **Fase 1 y 1.5 (Reestructuración, Blindaje de C
 - Se mantiene el desacoplamiento estricto de I/O, garantizando que tanto el núcleo como el almacenamiento compilen hacia WebAssembly (`wasm32-unknown-unknown`).
 - Se formalizó en [`ARCHITECTURE.md`](file:///Users/Santiago/OtherProjects/client-distributed-db/ARCHITECTURE.md#10-architectural-decisions-time-ordering--authority) la decisión de diseño de que el **servidor es la única autoridad de ordenamiento global** mediante su `sequence_id` monótono, eliminando la complejidad innecesaria de sincronización de relojes (HLC).
 - Se implementó `DiskStorageEngine` con persistencia en arquitectura Dual-File (`room_{id}.snap` + `room_{id}.wal`), WAL append-only con CRC32, compactación atómica zstd y tolerancia a fallos.
+- Se implementó el servidor `rimdb-server` con arquitectura de actores Tokio (`RoomManager`, `RoomActor`), log inmutable de 4 niveles (`HotBuffer`, `WarmDiskLog`, `ColdDiskLog`), Micro-WAL y deduplicación LRU.
+- Se completó el blindaje criptográfico integral del Data Plane mediante el extractor `ClientAuth`, validación de rutas en 3 vías, tiempo constante y leases activos.
 
-El proyecto se encuentra ahora en posición para avanzar a la concurrencia por actores en el servidor (Fase 3) y construir la sincronización optimista reactiva en el cliente (Fase 4).
+El proyecto se encuentra ahora en posición para avanzar a las fases de desacoplamiento CoW e I/O asíncrono y construir la sincronización optimista reactiva en el cliente (Fase 4).
 
 ---
 
@@ -381,6 +385,27 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
   - `GET /rooms/{room_id}/events`: Canal unidireccional que emite únicamente señales livianas `Event::HeadAdvanced(head_seq)`, alertando a clientes activos para que soliciten los deltas mediante `/sync`, evitando enviar payloads voluminosos por la conexión SSE.
 * **Manejo de Clientes Rezagados (`BehindCompaction`):**
   - Si un cliente solicita sincronización con un cursor anterior a la poda del buffer, el servidor responde con `ErrorCode::BehindCompaction`, forzando al cliente a descargar el snapshot consolidado de la sala.
+
+---
+
+### 4.3.B. Blindaje de Servidor y Remediaciones Post-Fase 3 (Fase 3.5)
+
+#### 4.3.B.1. Fase 3.5-A.1: Catchup 1-RTT, Retención y Onboarding de Clientes
+* **Corrección de Desfase Off-by-One (`C-01`):** Se eliminó el incremento artificial `last_ack_seq + 1` en `handle_commit`, pasando `last_ack_seq` directamente a `fetch_deltas(last_ack_seq, 100)`. Al respetar el contrato semántico de `from_seq` como el cursor ya conocido por el cliente, los deltas devuelven con precisión el rango `(last_ack_seq, new_seq]`, erradicando el descarte sistemático de deltas.
+* **Propagación Estricta de `BehindCompaction` (`C-02`):** Se valida de forma preventiva el cursor antes de secuenciar la mutación, propagando `Err(ServerError::BehindCompaction)` si `last_ack_seq < tail_seq - 1` o si `fetch_deltas` retorna `BehindCompaction`. El servidor nunca suprime silenciosamente los errores de retención.
+* **Idempotencia de Commit con Mutación Original (`M-02`):** Ante un reintento idempotente de `Commit` (mismo `mutation_id`), el actor recupera la mutación histórica y la incluye como primer elemento de `catchup_ops`, garantizando que el cliente reciba la confirmación y la operación secuenciada.
+* **Rediseño de Onboarding y Ancla de Retención (`C-08`):** Introducción de estados formales en `ClientLeaseTracker` (`Bootstrapping`, `Connected`, `Dormant`). Un cliente en bootstrapping no bloquea la poda del log. La retención del log se ancla a `retention_floor = min(min_connected_ack, active_snapshot_seq)`, permitiendo descargas seguras de snapshots sin que el log avance más allá de lo recuperable.
+
+#### 4.3.B.2. Fase 3.5-A.2: Autenticación Universal y Blindaje de Data Plane
+* **Extractor Criptográfico Axum `ClientAuth` (`C-03`):** Implementación de `ClientAuth` vía `FromRequestParts` en Axum. Todos los endpoints operativos (`/commit`, `/sync`, `/ack`, `/heartbeat`, `/schema`, `/deregister`, `/events`) requieren Bearer token firmado criptográficamente (o parámetro de consulta `?token=` para EventSource SSE), retornando `VerifiedClientToken`.
+* **Validación de Leases Activos en `RoomActor` (`C-03`):** El actor de sala valida activamente en `handle_commit`, `handle_sync`, `handle_ack` y `Heartbeat` que el cliente se encuentre registrado en `ClientLeaseTracker::is_registered`, impidiendo que peticiones no registradas interactúen con el estado de la sala.
+* **Validación Estricta de Rutas en 3 Vías (`M-07`):** Coincidencia unívoca y forzosa entre:
+  1. `room_id` del URL path vs `room_id` del token firmado.
+  2. `room_id` del URL path vs `room_id` del payload binario `ClientMessage`.
+  3. `client_id` del token firmado vs `client_id` del payload binario.
+  Cualquier discrepancia es rechazada en el perímetro HTTP con `401 Unauthorized` / `ErrorCode::Unauthorized`.
+* **Comparaciones en Tiempo Constante (`M-04`):** Integración de `subtle::ConstantTimeEq` para validaciones de firmas BLAKE3 y de la cabecera `X-Admin-Secret`, eliminando vulnerabilidades de canal lateral por análisis de tiempos de ejecución (*timing attacks*).
+* **Erradicación del Backdoor `dev-token` (`M-05`):** Eliminación total de puertas traseras de desarrollo en código de producción; la verificación de tokens exige siempre firma criptográfica válida y clave secreta activa.
 
 ---
 
@@ -687,6 +712,10 @@ La siguiente tabla mapea el origen de cada requerimiento según la recomendació
 | `SchemaRegistry` durable en servidor (`meta_schema_{id}.json`) | Base de Datos / Arq. | `rimdb-server` | **Alta** | ✅ **Completado** |
 | Control Plane REST (`/admin/schemas`, `/admin/rooms`) con Bearer auth | Red / Seguridad | `rimdb-server` | **Alta** | ✅ **Completado** |
 | Verificación stateless de `auth_token` en `RegisterClient` | Seguridad / Distribuidos | `rimdb-server` | **Alta** | ✅ **Completado** |
+| Handshake de Onboarding enriquecido y ancla de retención (C-08) | Sist. Distribuidos | `rimdb-server` | **Alta** | ✅ **Completado** |
+| Corrección de desfase 1-RTT catchup y propagación BehindCompaction (C-01, C-02, M-02) | Sist. Distribuidos | `rimdb-server` | **Alta** | ✅ **Completado** |
+| Extractor Axum `ClientAuth` y blindaje Data Plane (C-03, M-07) | Seguridad / Red | `rimdb-server` | **Alta** | ✅ **Completado** |
+| Verificación timing-safe con `subtle` y eliminación de `dev-token` (M-04, M-05) | Seguridad / Cripto | `rimdb-server` | **Alta** | ✅ **Completado** |
 | SDK de Administración dedicado para clientes (Admin SDK) | Arquitectura | `rimdb-client` | Baja | 💤 **Diferido (Post-v0.1)** |
 | Tipo `DataType::Decimal` / `Value::Decimal` | Base de Datos | `rimdb-core` | Baja | 💤 **Diferido (Post-v0.1)** |
 | Red P2P pura sin servidor / Snapshot Relay ad-hoc | Sistemas Distribuidos | `rimdb-client` | Baja | 💤 **Diferido (Post-v0.1)** |

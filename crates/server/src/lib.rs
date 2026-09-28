@@ -12,7 +12,10 @@ pub use actor::{
     ClientEntry, ClientLeaseTracker, ClientState, CommitResponse, RegisterResponse, RoomActor,
     RoomCommand, RoomManager, RoomMetadata, RoomMetrics, SyncBatchResponse,
 };
-pub use api::{build_router, generate_client_token, verify_client_token, AdminAuth, AppState};
+pub use api::{
+    build_router, generate_client_token, verify_client_token, verify_client_token_bound, AdminAuth,
+    ClientAuth, VerifiedClientToken, AppState,
+};
 pub use config::ServerConfig;
 pub use dedup::DedupLruCache;
 pub use error::ServerError;

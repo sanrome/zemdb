@@ -189,6 +189,14 @@ impl RoomActor {
             }
 
             RoomCommand::Heartbeat { client_id, reply } => {
+                if !self.lease_tracker.is_registered(&client_id) {
+                    let _ = reply.send(Err(ServerError::Unauthorized(format!(
+                        "Client {} is not registered in room {}",
+                        client_id, self.room_id
+                    ))));
+                    return;
+                }
+
                 if self.lease_tracker.is_dormant(&client_id) {
                     let _ = reply.send(Err(ServerError::BehindCompaction));
                     return;
@@ -239,6 +247,15 @@ impl RoomActor {
         op: rimdb_core::mutation::Operation,
         reply: tokio::sync::oneshot::Sender<Result<CommitResponse, ServerError>>,
     ) {
+        // 0. Check if client is registered in the room roster
+        if !self.lease_tracker.is_registered(&client_id) {
+            let _ = reply.send(Err(ServerError::Unauthorized(format!(
+                "Client {} is not registered in room {}",
+                client_id, self.room_id
+            ))));
+            return;
+        }
+
         // 1. Check if client is Dormant or Bootstrapping (behind compaction boundary)
         if self.lease_tracker.is_dormant(&client_id)
             || self.lease_tracker.is_bootstrapping(&client_id)
@@ -303,7 +320,7 @@ impl RoomActor {
         // 10. Broadcast signal-only SSE event to active watchers
         let _ = self.events_tx.send(new_seq);
 
-        // 11. Compute catch-up deltas for 1-RTT synchronization (C-01 and C-02 fix)
+        // 11. Compute catch-up deltas for 1-RTT synchronization
         let (catchup_ops, has_more) = if last_ack_seq.get() < new_seq.get().saturating_sub(1) {
             match self.tiered_log.fetch_deltas(last_ack_seq, 100) {
                 Ok((ops, has_more)) => (ops, has_more),
@@ -331,6 +348,15 @@ impl RoomActor {
         max_batch_size: u32,
         reply: tokio::sync::oneshot::Sender<Result<SyncBatchResponse, ServerError>>,
     ) {
+        // 0. Check if client is registered in the room roster
+        if !self.lease_tracker.is_registered(&client_id) {
+            let _ = reply.send(Err(ServerError::Unauthorized(format!(
+                "Client {} is not registered in room {}",
+                client_id, self.room_id
+            ))));
+            return;
+        }
+
         // 1. Check if client is Dormant
         if self.lease_tracker.is_dormant(&client_id) {
             let _ = reply.send(Err(ServerError::BehindCompaction));
@@ -375,6 +401,15 @@ impl RoomActor {
         ack_seq: SequenceNumber,
         reply: tokio::sync::oneshot::Sender<Result<SequenceNumber, ServerError>>,
     ) {
+        // 0. Check if client is registered in the room roster
+        if !self.lease_tracker.is_registered(&client_id) {
+            let _ = reply.send(Err(ServerError::Unauthorized(format!(
+                "Client {} is not registered in room {}",
+                client_id, self.room_id
+            ))));
+            return;
+        }
+
         // 1. Check if client is Dormant
         if self.lease_tracker.is_dormant(&client_id) {
             let _ = reply.send(Err(ServerError::BehindCompaction));

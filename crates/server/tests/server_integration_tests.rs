@@ -309,7 +309,7 @@ async fn test_data_plane_handshake_and_1rtt_commit() {
         correlation_id: CorrelationId::new(2),
         room_id: room_id.clone(),
         client_id: client_id.clone(),
-        auth_token: valid_token,
+        auth_token: valid_token.clone(),
         current_seq: None,
     };
     let body_reg = encode_message(&reg_msg).unwrap();
@@ -350,6 +350,7 @@ async fn test_data_plane_handshake_and_1rtt_commit() {
     let resp1 = server
         .client
         .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", valid_token))
         .header(CONTENT_TYPE, "application/octet-stream")
         .body(body_commit1)
         .send()
@@ -379,6 +380,7 @@ async fn test_data_plane_handshake_and_1rtt_commit() {
     let resp2 = server
         .client
         .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", valid_token))
         .header(CONTENT_TYPE, "application/octet-stream")
         .body(body_commit2)
         .send()
@@ -425,7 +427,7 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
         correlation_id: CorrelationId::new(1),
         room_id: room_id.clone(),
         client_id: reader.clone(),
-        auth_token: token_reader,
+        auth_token: token_reader.clone(),
         current_seq: None,
     };
     server
@@ -453,7 +455,7 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
                 correlation_id: CorrelationId::new(2),
                 room_id: room_id.clone(),
                 client_id: writer.clone(),
-                auth_token: token_writer,
+                auth_token: token_writer.clone(),
                 current_seq: None,
             })
             .unwrap(),
@@ -477,6 +479,7 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
         server
             .client
             .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
+            .header(AUTHORIZATION, format!("Bearer {}", token_writer))
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(encode_message(&commit_msg).unwrap())
             .send()
@@ -488,6 +491,7 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
     server
         .client
         .post(format!("{}/rooms/{}/ack", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", token_writer))
         .header(CONTENT_TYPE, "application/octet-stream")
         .body(
             encode_message(&ClientMessage::Ack {
@@ -513,6 +517,7 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
     let resp = server
         .client
         .post(format!("{}/rooms/{}/sync", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", token_reader))
         .header(CONTENT_TYPE, "application/octet-stream")
         .body(encode_message(&sync_msg).unwrap())
         .send()
@@ -551,6 +556,7 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
     let ack_resp = server
         .client
         .post(format!("{}/rooms/{}/ack", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", token_reader))
         .header(CONTENT_TYPE, "application/octet-stream")
         .body(encode_message(&ack_msg).unwrap())
         .send()
@@ -613,7 +619,7 @@ async fn test_data_plane_heartbeat_and_deregister() {
                 correlation_id: CorrelationId::new(1),
                 room_id: room_id.clone(),
                 client_id: client_id.clone(),
-                auth_token: token,
+                auth_token: token.clone(),
                 current_seq: None,
             })
             .unwrap(),
@@ -626,6 +632,7 @@ async fn test_data_plane_heartbeat_and_deregister() {
     let hb_resp = server
         .client
         .post(format!("{}/rooms/{}/heartbeat", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", token))
         .header(CONTENT_TYPE, "application/octet-stream")
         .body(
             encode_message(&ClientMessage::Heartbeat {
@@ -654,6 +661,7 @@ async fn test_data_plane_heartbeat_and_deregister() {
     let dereg_resp = server
         .client
         .post(format!("{}/rooms/{}/deregister", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", token))
         .header(CONTENT_TYPE, "application/octet-stream")
         .body(
             encode_message(&ClientMessage::DeregisterClient {
@@ -709,6 +717,7 @@ async fn test_sse_realtime_head_advanced_events() {
     let sse_resp = server
         .client
         .get(format!("{}/rooms/{}/events", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", token))
         .send()
         .await
         .unwrap();
@@ -725,7 +734,7 @@ async fn test_sse_realtime_head_advanced_events() {
                 correlation_id: CorrelationId::new(1),
                 room_id: room_id.clone(),
                 client_id: client_id.clone(),
-                auth_token: token,
+                auth_token: token.clone(),
                 current_seq: None,
             })
             .unwrap(),
@@ -738,6 +747,7 @@ async fn test_sse_realtime_head_advanced_events() {
     server
         .client
         .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", token))
         .header(CONTENT_TYPE, "application/octet-stream")
         .body(
             encode_message(&ClientMessage::Commit {
@@ -882,7 +892,7 @@ async fn test_schema_evolution_cascades_to_active_room() {
                 correlation_id: CorrelationId::new(1),
                 room_id: room_id.clone(),
                 client_id: client_id.clone(),
-                auth_token: token,
+                auth_token: token.clone(),
                 current_seq: None,
             })
             .unwrap(),
@@ -924,6 +934,7 @@ async fn test_schema_evolution_cascades_to_active_room() {
     let commit_resp = server
         .client
         .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", token))
         .header(CONTENT_TYPE, "application/octet-stream")
         .body(
             encode_message(&ClientMessage::Commit {
@@ -949,4 +960,385 @@ async fn test_schema_evolution_cascades_to_active_room() {
         }
         other => panic!("Expected CommitAck, got {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn test_data_plane_auth_enforcement_rejected_without_bearer() {
+    let server = TestServer::start().await;
+    let schema_id = SchemaId::new("todo-schema");
+    server
+        .schema_registry
+        .register_schema(schema_id.clone(), create_test_schema())
+        .unwrap();
+
+    let room_id = RoomId::new("room-auth-test");
+    server
+        .room_manager
+        .create_room(room_id.clone(), schema_id, None)
+        .unwrap();
+
+    let client_id = ClientId::new("anonymous");
+
+    // 1. Commit without Authorization header -> 401 Unauthorized
+    let commit_msg = ClientMessage::Commit {
+        correlation_id: CorrelationId::new(1),
+        room_id: room_id.clone(),
+        client_id: client_id.clone(),
+        mutation_id: MutationId::new([1; 16]),
+        last_ack_seq: SequenceNumber::new(0),
+        op: create_insert_op(&create_test_schema(), 1, "test"),
+    };
+    let resp = server
+        .client
+        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&commit_msg).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 2. Sync without Authorization header -> 401 Unauthorized
+    let sync_msg = ClientMessage::Sync {
+        correlation_id: CorrelationId::new(2),
+        room_id: room_id.clone(),
+        client_id: client_id.clone(),
+        from_seq: SequenceNumber::new(0),
+        max_batch_size: 10,
+    };
+    let resp = server
+        .client
+        .post(format!("{}/rooms/{}/sync", server.base_url, room_id))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&sync_msg).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. Ack without Authorization header -> 401 Unauthorized
+    let ack_msg = ClientMessage::Ack {
+        correlation_id: CorrelationId::new(3),
+        room_id: room_id.clone(),
+        client_id: client_id.clone(),
+        ack_seq: SequenceNumber::new(1),
+    };
+    let resp = server
+        .client
+        .post(format!("{}/rooms/{}/ack", server.base_url, room_id))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&ack_msg).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 4. Heartbeat without Authorization header -> 401 Unauthorized
+    let hb_msg = ClientMessage::Heartbeat {
+        correlation_id: CorrelationId::new(4),
+        room_id: room_id.clone(),
+        client_id: client_id.clone(),
+    };
+    let resp = server
+        .client
+        .post(format!("{}/rooms/{}/heartbeat", server.base_url, room_id))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&hb_msg).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 5. Deregister without Authorization header -> 401 Unauthorized
+    let dereg_msg = ClientMessage::DeregisterClient {
+        correlation_id: CorrelationId::new(5),
+        room_id: room_id.clone(),
+        client_id: client_id.clone(),
+    };
+    let resp = server
+        .client
+        .post(format!("{}/rooms/{}/deregister", server.base_url, room_id))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&dereg_msg).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 6. SSE events without Authorization header or token query -> 401 Unauthorized
+    let sse_resp = server
+        .client
+        .get(format!("{}/rooms/{}/events", server.base_url, room_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sse_resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_data_plane_auth_token_tampered_or_expired() {
+    let server = TestServer::start().await;
+    let schema_id = SchemaId::new("todo-schema");
+    server
+        .schema_registry
+        .register_schema(schema_id.clone(), create_test_schema())
+        .unwrap();
+
+    let room_id = RoomId::new("room-tamper-test");
+    server
+        .room_manager
+        .create_room(room_id.clone(), schema_id, None)
+        .unwrap();
+
+    let client_id = ClientId::new("alice");
+
+    // 1. Expired token (0 TTL) -> 401 Unauthorized
+    let expired_token = generate_client_token(
+        &client_id,
+        &room_id,
+        Duration::from_secs(0),
+        &server.config.auth_secret,
+    );
+    let commit_msg = ClientMessage::Commit {
+        correlation_id: CorrelationId::new(1),
+        room_id: room_id.clone(),
+        client_id: client_id.clone(),
+        mutation_id: MutationId::new([1; 16]),
+        last_ack_seq: SequenceNumber::new(0),
+        op: create_insert_op(&create_test_schema(), 1, "test"),
+    };
+    let resp = server
+        .client
+        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", expired_token))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&commit_msg).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 2. Tampered signature -> 401 Unauthorized
+    let valid_token = generate_client_token(
+        &client_id,
+        &room_id,
+        Duration::from_secs(300),
+        &server.config.auth_secret,
+    );
+    let tampered_token = format!("{}deadbeef", &valid_token[..valid_token.len() - 8]);
+    let resp2 = server
+        .client
+        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", tampered_token))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&commit_msg).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_data_plane_room_path_token_and_payload_mismatch_rejected() {
+    let server = TestServer::start().await;
+    let schema_id = SchemaId::new("todo-schema");
+    server
+        .schema_registry
+        .register_schema(schema_id.clone(), create_test_schema())
+        .unwrap();
+
+    let room_a = RoomId::new("room-A");
+    let room_b = RoomId::new("room-B");
+    server
+        .room_manager
+        .create_room(room_a.clone(), schema_id.clone(), None)
+        .unwrap();
+    server
+        .room_manager
+        .create_room(room_b.clone(), schema_id, None)
+        .unwrap();
+
+    let client_id = ClientId::new("alice");
+    // Token issued for room_a
+    let token_a = generate_client_token(
+        &client_id,
+        &room_a,
+        Duration::from_secs(300),
+        &server.config.auth_secret,
+    );
+
+    // 1. Path vs Token mismatch: Using token_a on room_b endpoint
+    let commit_msg = ClientMessage::Commit {
+        correlation_id: CorrelationId::new(1),
+        room_id: room_b.clone(),
+        client_id: client_id.clone(),
+        mutation_id: MutationId::new([1; 16]),
+        last_ack_seq: SequenceNumber::new(0),
+        op: create_insert_op(&create_test_schema(), 1, "test"),
+    };
+    let resp = server
+        .client
+        .post(format!("{}/rooms/{}/commit", server.base_url, room_b))
+        .header(AUTHORIZATION, format!("Bearer {}", token_a))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&commit_msg).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(resp.status(), StatusCode::OK);
+
+    // 2. Path vs Payload mismatch: Path is room_a, token is for room_a, but payload says room_b
+    let commit_msg_mismatch = ClientMessage::Commit {
+        correlation_id: CorrelationId::new(2),
+        room_id: room_b.clone(),
+        client_id: client_id.clone(),
+        mutation_id: MutationId::new([2; 16]),
+        last_ack_seq: SequenceNumber::new(0),
+        op: create_insert_op(&create_test_schema(), 1, "test"),
+    };
+    let resp2 = server
+        .client
+        .post(format!("{}/rooms/{}/commit", server.base_url, room_a))
+        .header(AUTHORIZATION, format!("Bearer {}", token_a))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&commit_msg_mismatch).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(resp2.status(), StatusCode::OK);
+
+    // 3. Client Impersonation: Token is for alice, but payload says bob
+    let bob_id = ClientId::new("bob");
+    let commit_msg_impersonate = ClientMessage::Commit {
+        correlation_id: CorrelationId::new(3),
+        room_id: room_a.clone(),
+        client_id: bob_id,
+        mutation_id: MutationId::new([3; 16]),
+        last_ack_seq: SequenceNumber::new(0),
+        op: create_insert_op(&create_test_schema(), 1, "test"),
+    };
+    let resp3 = server
+        .client
+        .post(format!("{}/rooms/{}/commit", server.base_url, room_a))
+        .header(AUTHORIZATION, format!("Bearer {}", token_a))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&commit_msg_impersonate).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp3.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_data_plane_dev_token_backdoor_eliminated() {
+    let server = TestServer::start().await;
+    let schema_id = SchemaId::new("todo-schema");
+    server
+        .schema_registry
+        .register_schema(schema_id.clone(), create_test_schema())
+        .unwrap();
+
+    let room_id = RoomId::new("room-backdoor-test");
+    server
+        .room_manager
+        .create_room(room_id.clone(), schema_id, None)
+        .unwrap();
+
+    let client_id = ClientId::new("hacker");
+
+    // Register attempt using "dev-token" -> 401 Unauthorized
+    let reg_msg = ClientMessage::RegisterClient {
+        correlation_id: CorrelationId::new(1),
+        room_id: room_id.clone(),
+        client_id: client_id.clone(),
+        auth_token: "dev-token".to_string(),
+        current_seq: None,
+    };
+    let resp = server
+        .client
+        .post(format!("{}/rooms/{}/register", server.base_url, room_id))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&reg_msg).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Commit attempt using Bearer dev-token -> 401 Unauthorized
+    let commit_msg = ClientMessage::Commit {
+        correlation_id: CorrelationId::new(2),
+        room_id: room_id.clone(),
+        client_id,
+        mutation_id: MutationId::new([1; 16]),
+        last_ack_seq: SequenceNumber::new(0),
+        op: create_insert_op(&create_test_schema(), 1, "test"),
+    };
+    let resp2 = server
+        .client
+        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
+        .header(AUTHORIZATION, "Bearer dev-token")
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&commit_msg).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_sse_events_auth_header_and_query_param() {
+    let server = TestServer::start().await;
+    let schema_id = SchemaId::new("todo-schema");
+    server
+        .schema_registry
+        .register_schema(schema_id.clone(), create_test_schema())
+        .unwrap();
+
+    let room_id = RoomId::new("room-sse-auth");
+    server
+        .room_manager
+        .create_room(room_id.clone(), schema_id, None)
+        .unwrap();
+
+    let client_id = ClientId::new("listener");
+    let valid_token = generate_client_token(
+        &client_id,
+        &room_id,
+        Duration::from_secs(300),
+        &server.config.auth_secret,
+    );
+
+    // 1. Success via Bearer Header
+    let resp_header = server
+        .client
+        .get(format!("{}/rooms/{}/events", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", valid_token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_header.status(), StatusCode::OK);
+
+    // 2. Success via ?token= query parameter (EventSource compatibility)
+    let resp_query = server
+        .client
+        .get(format!(
+            "{}/rooms/{}/events?token={}",
+            server.base_url, room_id, valid_token
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_query.status(), StatusCode::OK);
+
+    // 3. Failure via invalid ?token=
+    let resp_bad_query = server
+        .client
+        .get(format!(
+            "{}/rooms/{}/events?token=invalid.token.123",
+            server.base_url, room_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_bad_query.status(), StatusCode::UNAUTHORIZED);
 }

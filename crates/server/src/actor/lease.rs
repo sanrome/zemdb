@@ -263,6 +263,18 @@ impl ClientLeaseTracker {
             .is_some_and(|c| c.state == ClientState::Dormant)
     }
 
+    /// Checks if a client is registered in the room roster.
+    pub fn is_registered(&self, client_id: &ClientId) -> bool {
+        self.clients.contains_key(client_id)
+    }
+
+    /// Checks if a client is currently in the `Connected` state.
+    pub fn is_connected(&self, client_id: &ClientId) -> bool {
+        self.clients
+            .get(client_id)
+            .is_some_and(|c| c.state == ClientState::Connected)
+    }
+
     /// Returns a reference to a client entry if registered.
     pub fn get_client(&self, client_id: &ClientId) -> Option<&ClientEntry> {
         self.clients.get(client_id)

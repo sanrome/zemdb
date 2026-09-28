@@ -7,15 +7,25 @@ use rimdb_core::id::RoomId;
 use tokio::sync::broadcast;
 
 use crate::actor::command::RoomCommand;
+use crate::api::auth::ClientAuth;
 use crate::api::router::AppState;
 use crate::error::ServerError;
 
 /// `GET /rooms/:room_id/events`: Signal-only Server-Sent Events (SSE) broadcast channel.
+/// Authenticated via ClientAuth (Bearer token or ?token= query parameter).
 /// Emits `head_advanced` lightweight sequence signals without transmitting row payloads.
 pub async fn room_events(
     State(state): State<AppState>,
     Path(room_id_str): Path<String>,
+    auth: ClientAuth,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ServerError> {
+    // Validate room_id in path matches authenticated token
+    if auth.room_id.as_str() != room_id_str {
+        return Err(ServerError::Config(
+            "RoomId path and token mismatch".to_string(),
+        ));
+    }
+
     let room_id = RoomId::new(room_id_str);
     let sender = state
         .room_manager

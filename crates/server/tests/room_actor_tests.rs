@@ -33,6 +33,22 @@ fn create_insert_op(schema: &Schema, id: i64, title: &str) -> Operation {
         .expect("valid insert op")
 }
 
+async fn register_client_helper(
+    sender: &tokio::sync::mpsc::Sender<RoomCommand>,
+    client_id: ClientId,
+) -> Result<RegisterResponse, ServerError> {
+    let (tx, rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::RegisterClient {
+            client_id,
+            current_seq: None,
+            reply: tx,
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap()
+}
+
 #[tokio::test]
 async fn test_schema_registry_crud_and_evolution() {
     let dir = tempdir().unwrap();
@@ -136,6 +152,24 @@ async fn test_room_actor_commit_validation_and_monotonic_sequencing() {
     let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).unwrap();
 
     let client_id = ClientId::new("client-1");
+
+    // 0. Commit from unregistered client rejected with Unauthorized
+    let op0 = create_insert_op(&schema, 0, "Unregistered attempt");
+    let (tx0, rx0) = oneshot::channel();
+    sender
+        .send(RoomCommand::Commit {
+            client_id: client_id.clone(),
+            mutation_id: MutationId::new([0; 16]),
+            last_ack_seq: SequenceNumber::new(0),
+            op: op0,
+            reply: tx0,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(rx0.await.unwrap(), Err(ServerError::Unauthorized(_))));
+
+    // Register client
+    register_client_helper(&sender, client_id.clone()).await.unwrap();
 
     // 1. Commit valid mutation
     let op1 = create_insert_op(&schema, 1, "Buy groceries");
@@ -250,6 +284,7 @@ async fn test_room_actor_multi_client_concurrency_and_sse_events() {
         let schema_clone = schema.clone();
         tasks.push(tokio::spawn(async move {
             let client_id = ClientId::new(format!("worker-{}", client_idx));
+            register_client_helper(&cmd_tx, client_id.clone()).await.unwrap();
             for op_idx in 0..20 {
                 let id = client_idx * 100 + op_idx;
                 let op = create_insert_op(&schema_clone, id, &format!("task-{}", id));
@@ -481,6 +516,7 @@ async fn test_room_actor_recovery_retains_state_and_head_seq() {
             create_test_relay(),
         );
         let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).unwrap();
+        register_client_helper(&sender, ClientId::new("c1")).await.unwrap();
 
         for i in 1..=5 {
             let op = create_insert_op(&schema, i, &format!("task-{}", i));
@@ -593,6 +629,7 @@ async fn test_room_actor_cursor_advances_only_on_client_ack() {
     reg_rx.await.unwrap().unwrap();
 
     // 2. Producer commits 5 operations (seq 1..=5)
+    register_client_helper(&sender, ClientId::new("producer")).await.unwrap();
     for i in 1..=5 {
         let op = create_insert_op(&schema, i, &format!("task-{}", i));
         let (tx, rx) = oneshot::channel();

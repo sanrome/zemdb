@@ -318,9 +318,9 @@ El plan de corrección se estructurará en tres fases incrementales antes de dar
    - [RESUELTO] Reintentos idempotentes de `Commit` devuelven `catchup_ops` con mutación original ([`M-02`](../audits/2026-09-post-fase3-audit.md#m-02)).
    - [RESUELTO] Rediseño de Onboarding: estado `Bootstrapping`, ancla de retención en poda (`retention_floor = min(min_connected_ack, active_snapshot_seq)`) y handshake enriquecido ([`C-08`](../audits/2026-09-post-fase3-audit.md#c-08)).
 2. **Autenticación y Blindaje en Data Plane**:
-   - Implementar extractor Axum `ClientAuth` para validar Bearer tokens en todos los endpoints operativos ([`C-03`](../audits/2026-09-post-fase3-audit.md#c-03)).
-   - Validar estricta coincidencia de `room_id` en URL path vs payload/token ([`M-07`](../audits/2026-09-post-fase3-audit.md#m-07)).
-   - Eliminar el backdoor `"dev-token"` y aplicar comparación en tiempo constante `subtle` ([`M-04`](../audits/2026-09-post-fase3-audit.md#m-04), [`M-05`](../audits/2026-09-post-fase3-audit.md#m-05)).
+   - [RESUELTO] Implementar extractor Axum `ClientAuth` para validar Bearer tokens en todos los endpoints operativos ([`C-03`](../audits/2026-09-post-fase3-audit.md#c-03)).
+   - [RESUELTO] Validar estricta coincidencia de `room_id` en URL path vs payload/token ([`M-07`](../audits/2026-09-post-fase3-audit.md#m-07)).
+   - [RESUELTO] Eliminar el backdoor `"dev-token"` y aplicar comparación en tiempo constante `subtle` ([`M-04`](../audits/2026-09-post-fase3-audit.md#m-04), [`M-05`](../audits/2026-09-post-fase3-audit.md#m-05)).
 3. **Persistencia Atómica y Recuperación de Fallos**:
    - Reemplazar el Dual-WAL unificando la persistencia en `active.wal` ([`C-04`](../audits/2026-09-post-fase3-audit.md#c-04)).
    - Filtrar operaciones previas a `snapshot_seq` en el replay de `recover_room` ([`C-05`](../audits/2026-09-post-fase3-audit.md#c-05)).

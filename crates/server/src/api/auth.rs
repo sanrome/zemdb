@@ -1,8 +1,10 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRef, FromRequestParts};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
+use axum::response::{IntoResponse, Response};
 use rimdb_core::id::{ClientId, RoomId};
+use subtle::ConstantTimeEq;
 
 use crate::api::router::AppState;
 use crate::error::ServerError;
@@ -32,12 +34,27 @@ impl FromRequestParts<AppState> for AdminAuth {
                 )
             })?;
 
-        if token == state.config.admin_secret {
+        // Constant-time comparison to prevent timing side-channel attacks
+        let is_valid = token
+            .as_bytes()
+            .ct_eq(state.config.admin_secret.as_bytes())
+            .unwrap_u8()
+            == 1;
+
+        if is_valid {
             Ok(AdminAuth)
         } else {
             Err(ServerError::Unauthorized("Invalid admin secret token".to_string()))
         }
     }
+}
+
+/// Cryptographically verified client token claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedClientToken {
+    pub client_id: ClientId,
+    pub room_id: RoomId,
+    pub expires_at: u64,
 }
 
 /// Generates a signed, stateless authentication ticket for a client in a specific room.
@@ -61,18 +78,12 @@ pub fn generate_client_token(
     format!("{}.{}", payload, sig.to_hex())
 }
 
-/// Cryptographically validates an incoming client `auth_token` against the room, client, and cluster secret.
+/// Cryptographically validates an incoming client `auth_token` against the cluster secret.
+/// Enforces constant-time signature comparison and rejects development tokens.
 pub fn verify_client_token(
     auth_token: &str,
-    client_id: &ClientId,
-    room_id: &RoomId,
     secret: &str,
-) -> Result<(), ServerError> {
-    // Development fallback
-    if auth_token == "dev-token" && secret == "default_auth_secret_dev_32bytes!" {
-        return Ok(());
-    }
-
+) -> Result<VerifiedClientToken, ServerError> {
     let parts: Vec<&str> = auth_token.split('.').collect();
     if parts.len() != 4 {
         return Err(ServerError::Unauthorized(
@@ -81,20 +92,6 @@ pub fn verify_client_token(
     }
 
     let (c_id, r_id, exp_str, sig_hex) = (parts[0], parts[1], parts[2], parts[3]);
-
-    if c_id != client_id.as_str() {
-        return Err(ServerError::Unauthorized(format!(
-            "Token client mismatch: expected {}, got {}",
-            client_id, c_id
-        )));
-    }
-
-    if r_id != room_id.as_str() {
-        return Err(ServerError::Unauthorized(format!(
-            "Token room mismatch: expected {}, got {}",
-            room_id, r_id
-        )));
-    }
 
     let expires_at: u64 = exp_str.parse().map_err(|_| {
         ServerError::Unauthorized("Invalid timestamp in auth token".to_string())
@@ -113,13 +110,101 @@ pub fn verify_client_token(
     let key = blake3::hash(secret.as_bytes());
     let expected_sig = blake3::keyed_hash(key.as_bytes(), payload.as_bytes());
 
-    if expected_sig.to_hex().as_str() != sig_hex {
+    // Constant-time signature comparison to eliminate timing side-channels
+    let sig_valid = expected_sig
+        .to_hex()
+        .as_bytes()
+        .ct_eq(sig_hex.as_bytes())
+        .unwrap_u8()
+        == 1;
+
+    if !sig_valid {
         return Err(ServerError::Unauthorized(
             "Cryptographic signature verification failed".to_string(),
         ));
     }
 
-    Ok(())
+    Ok(VerifiedClientToken {
+        client_id: ClientId::new(c_id),
+        room_id: RoomId::new(r_id),
+        expires_at,
+    })
+}
+
+/// Cryptographically validates an incoming client `auth_token` and strictly binds it
+/// to an expected client_id and room_id.
+pub fn verify_client_token_bound(
+    auth_token: &str,
+    client_id: &ClientId,
+    room_id: &RoomId,
+    secret: &str,
+) -> Result<VerifiedClientToken, ServerError> {
+    let verified = verify_client_token(auth_token, secret)?;
+
+    if &verified.client_id != client_id {
+        return Err(ServerError::Unauthorized(format!(
+            "Token client mismatch: expected {}, got {}",
+            client_id, verified.client_id
+        )));
+    }
+
+    if &verified.room_id != room_id {
+        return Err(ServerError::Unauthorized(format!(
+            "Token room mismatch: expected {}, got {}",
+            room_id, verified.room_id
+        )));
+    }
+
+    Ok(verified)
+}
+
+/// Axum extractor that cryptographically validates client Bearer tokens in Data Plane endpoints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientAuth {
+    pub client_id: ClientId,
+    pub room_id: RoomId,
+}
+
+#[axum::async_trait]
+impl<S> FromRequestParts<S> for ClientAuth
+where
+    S: Send + Sync,
+    AppState: FromRef<S>,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let app_state = AppState::from_ref(state);
+
+        let token_str = if let Some(auth_header) = parts
+            .headers
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+        {
+            auth_header.strip_prefix("Bearer ").unwrap_or(auth_header)
+        } else if let Some(query) = parts.uri.query() {
+            // Fallback for query parameter token (useful for SSE EventSource /events)
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("token="))
+                .ok_or_else(|| {
+                    ServerError::Unauthorized("Missing Authorization header".to_string())
+                        .into_response()
+                })?
+        } else {
+            return Err(
+                ServerError::Unauthorized("Missing Authorization header".to_string()).into_response(),
+            );
+        };
+
+        let verified = verify_client_token(token_str, &app_state.config.auth_secret)
+            .map_err(|err| err.into_response())?;
+
+        Ok(ClientAuth {
+            client_id: verified.client_id,
+            room_id: verified.room_id,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -133,21 +218,28 @@ mod tests {
         let secret = "super_secret_cluster_key_12345";
 
         let token = generate_client_token(&client_id, &room_id, Duration::from_secs(60), secret);
-        assert!(verify_client_token(&token, &client_id, &room_id, secret).is_ok());
+        let verified = verify_client_token(&token, secret).expect("token must verify");
+        assert_eq!(verified.client_id, client_id);
+        assert_eq!(verified.room_id, room_id);
+
+        assert!(verify_client_token_bound(&token, &client_id, &room_id, secret).is_ok());
 
         // Token mismatch client
         let wrong_client = ClientId::new("client-beta");
-        assert!(verify_client_token(&token, &wrong_client, &room_id, secret).is_err());
+        assert!(verify_client_token_bound(&token, &wrong_client, &room_id, secret).is_err());
 
         // Token mismatch room
         let wrong_room = RoomId::new("room-other");
-        assert!(verify_client_token(&token, &client_id, &wrong_room, secret).is_err());
+        assert!(verify_client_token_bound(&token, &client_id, &wrong_room, secret).is_err());
 
         // Wrong secret
-        assert!(verify_client_token(&token, &client_id, &room_id, "wrong_secret").is_err());
+        assert!(verify_client_token(&token, "wrong_secret").is_err());
 
         // Expired token (0 TTL)
         let expired_token = generate_client_token(&client_id, &room_id, Duration::from_secs(0), secret);
-        assert!(verify_client_token(&expired_token, &client_id, &room_id, secret).is_err());
+        assert!(verify_client_token(&expired_token, secret).is_err());
+
+        // Dev backdoor elimination test
+        assert!(verify_client_token("dev-token", "default_auth_secret_dev_32bytes!").is_err());
     }
 }

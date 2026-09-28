@@ -7,11 +7,11 @@ use rimdb_core::protocol::codec::{decode_message, encode_message};
 use rimdb_core::protocol::messages::{ClientMessage, ServerMessage};
 
 use crate::actor::command::RoomCommand;
-use crate::api::auth::verify_client_token;
+use crate::api::auth::{verify_client_token_bound, ClientAuth};
 use crate::api::router::AppState;
 use crate::error::ServerError;
 
-fn binary_response(status: StatusCode, msg: &ServerMessage) -> Response {
+pub(crate) fn binary_response(status: StatusCode, msg: &ServerMessage) -> Response {
     match encode_message(msg) {
         Ok(bytes) => (
             status,
@@ -27,7 +27,7 @@ fn binary_response(status: StatusCode, msg: &ServerMessage) -> Response {
     }
 }
 
-fn binary_error(
+pub(crate) fn binary_error(
     correlation_id: Option<CorrelationId>,
     room_id: Option<RoomId>,
     err: ServerError,
@@ -67,6 +67,7 @@ pub async fn register(
             auth_token,
             current_seq,
         } => {
+            // Validate room_id in path matches payload
             if room_id.as_str() != room_id_str {
                 return binary_error(
                     Some(correlation_id),
@@ -75,9 +76,9 @@ pub async fn register(
                 );
             }
 
-            // Verify stateless client auth_token
+            // Verify stateless client auth_token strictly bound to client_id and room_id
             if let Err(err) =
-                verify_client_token(&auth_token, &client_id, &room_id, &state.config.auth_secret)
+                verify_client_token_bound(&auth_token, &client_id, &room_id, &state.config.auth_secret)
             {
                 return binary_error(Some(correlation_id), Some(room_id), err);
             }
@@ -138,8 +139,18 @@ pub async fn register(
 pub async fn commit(
     State(state): State<AppState>,
     Path(room_id_str): Path<String>,
+    auth: ClientAuth,
     body: Bytes,
 ) -> Response {
+    // Validate room_id in path matches authenticated token
+    if auth.room_id.as_str() != room_id_str {
+        return binary_error(
+            None,
+            Some(RoomId::new(&room_id_str)),
+            ServerError::Config("RoomId path and token mismatch".to_string()),
+        );
+    }
+
     let msg: ClientMessage = match decode_message(&body) {
         Ok(m) => m,
         Err(e) => {
@@ -160,6 +171,24 @@ pub async fn commit(
             last_ack_seq,
             op,
         } => {
+            // Validate room_id in path matches payload
+            if room_id.as_str() != room_id_str {
+                return binary_error(
+                    Some(correlation_id),
+                    Some(room_id),
+                    ServerError::Config("RoomId path and payload mismatch".to_string()),
+                );
+            }
+
+            // Validate client_id in payload matches authenticated token identity
+            if client_id != auth.client_id {
+                return binary_error(
+                    Some(correlation_id),
+                    Some(room_id),
+                    ServerError::Unauthorized("Client ID in payload does not match token".to_string()),
+                );
+            }
+
             let sender = match state.room_manager.get_room(&room_id) {
                 Some(s) => s,
                 None => {
@@ -222,8 +251,18 @@ pub async fn commit(
 pub async fn sync(
     State(state): State<AppState>,
     Path(room_id_str): Path<String>,
+    auth: ClientAuth,
     body: Bytes,
 ) -> Response {
+    // Validate room_id in path matches authenticated token
+    if auth.room_id.as_str() != room_id_str {
+        return binary_error(
+            None,
+            Some(RoomId::new(&room_id_str)),
+            ServerError::Config("RoomId path and token mismatch".to_string()),
+        );
+    }
+
     let msg: ClientMessage = match decode_message(&body) {
         Ok(m) => m,
         Err(e) => {
@@ -243,6 +282,24 @@ pub async fn sync(
             from_seq,
             max_batch_size,
         } => {
+            // Validate room_id in path matches payload
+            if room_id.as_str() != room_id_str {
+                return binary_error(
+                    Some(correlation_id),
+                    Some(room_id),
+                    ServerError::Config("RoomId path and payload mismatch".to_string()),
+                );
+            }
+
+            // Validate client_id in payload matches authenticated token identity
+            if client_id != auth.client_id {
+                return binary_error(
+                    Some(correlation_id),
+                    Some(room_id),
+                    ServerError::Unauthorized("Client ID in payload does not match token".to_string()),
+                );
+            }
+
             let sender = match state.room_manager.get_room(&room_id) {
                 Some(s) => s,
                 None => {
@@ -303,8 +360,18 @@ pub async fn sync(
 pub async fn ack(
     State(state): State<AppState>,
     Path(room_id_str): Path<String>,
+    auth: ClientAuth,
     body: Bytes,
 ) -> Response {
+    // Validate room_id in path matches authenticated token
+    if auth.room_id.as_str() != room_id_str {
+        return binary_error(
+            None,
+            Some(RoomId::new(&room_id_str)),
+            ServerError::Config("RoomId path and token mismatch".to_string()),
+        );
+    }
+
     let msg: ClientMessage = match decode_message(&body) {
         Ok(m) => m,
         Err(e) => {
@@ -323,6 +390,24 @@ pub async fn ack(
             client_id,
             ack_seq,
         } => {
+            // Validate room_id in path matches payload
+            if room_id.as_str() != room_id_str {
+                return binary_error(
+                    Some(correlation_id),
+                    Some(room_id),
+                    ServerError::Config("RoomId path and payload mismatch".to_string()),
+                );
+            }
+
+            // Validate client_id in payload matches authenticated token identity
+            if client_id != auth.client_id {
+                return binary_error(
+                    Some(correlation_id),
+                    Some(room_id),
+                    ServerError::Unauthorized("Client ID in payload does not match token".to_string()),
+                );
+            }
+
             let sender = match state.room_manager.get_room(&room_id) {
                 Some(s) => s,
                 None => {
@@ -381,8 +466,18 @@ pub async fn ack(
 pub async fn heartbeat(
     State(state): State<AppState>,
     Path(room_id_str): Path<String>,
+    auth: ClientAuth,
     body: Bytes,
 ) -> Response {
+    // Validate room_id in path matches authenticated token
+    if auth.room_id.as_str() != room_id_str {
+        return binary_error(
+            None,
+            Some(RoomId::new(&room_id_str)),
+            ServerError::Config("RoomId path and token mismatch".to_string()),
+        );
+    }
+
     let msg: ClientMessage = match decode_message(&body) {
         Ok(m) => m,
         Err(e) => {
@@ -400,6 +495,24 @@ pub async fn heartbeat(
             room_id,
             client_id,
         } => {
+            // Validate room_id in path matches payload
+            if room_id.as_str() != room_id_str {
+                return binary_error(
+                    Some(correlation_id),
+                    Some(room_id),
+                    ServerError::Config("RoomId path and payload mismatch".to_string()),
+                );
+            }
+
+            // Validate client_id in payload matches authenticated token identity
+            if client_id != auth.client_id {
+                return binary_error(
+                    Some(correlation_id),
+                    Some(room_id),
+                    ServerError::Unauthorized("Client ID in payload does not match token".to_string()),
+                );
+            }
+
             let sender = match state.room_manager.get_room(&room_id) {
                 Some(s) => s,
                 None => {
@@ -456,8 +569,18 @@ pub async fn heartbeat(
 pub async fn get_schema(
     State(state): State<AppState>,
     Path(room_id_str): Path<String>,
+    auth: ClientAuth,
     body: Bytes,
 ) -> Response {
+    // Validate room_id in path matches authenticated token
+    if auth.room_id.as_str() != room_id_str {
+        return binary_error(
+            None,
+            Some(RoomId::new(&room_id_str)),
+            ServerError::Config("RoomId path and token mismatch".to_string()),
+        );
+    }
+
     let msg: ClientMessage = match decode_message(&body) {
         Ok(m) => m,
         Err(e) => {
@@ -474,6 +597,15 @@ pub async fn get_schema(
             correlation_id,
             room_id,
         } => {
+            // Validate room_id in path matches payload
+            if room_id.as_str() != room_id_str {
+                return binary_error(
+                    Some(correlation_id),
+                    Some(room_id),
+                    ServerError::Config("RoomId path and payload mismatch".to_string()),
+                );
+            }
+
             let sender = match state.room_manager.get_room(&room_id) {
                 Some(s) => s,
                 None => {
@@ -528,8 +660,18 @@ pub async fn get_schema(
 pub async fn deregister(
     State(state): State<AppState>,
     Path(room_id_str): Path<String>,
+    auth: ClientAuth,
     body: Bytes,
 ) -> Response {
+    // Validate room_id in path matches authenticated token
+    if auth.room_id.as_str() != room_id_str {
+        return binary_error(
+            None,
+            Some(RoomId::new(&room_id_str)),
+            ServerError::Config("RoomId path and token mismatch".to_string()),
+        );
+    }
+
     let msg: ClientMessage = match decode_message(&body) {
         Ok(m) => m,
         Err(e) => {
@@ -547,6 +689,24 @@ pub async fn deregister(
             room_id,
             client_id,
         } => {
+            // Validate room_id in path matches payload
+            if room_id.as_str() != room_id_str {
+                return binary_error(
+                    Some(correlation_id),
+                    Some(room_id),
+                    ServerError::Config("RoomId path and payload mismatch".to_string()),
+                );
+            }
+
+            // Validate client_id in payload matches authenticated token identity
+            if client_id != auth.client_id {
+                return binary_error(
+                    Some(correlation_id),
+                    Some(room_id),
+                    ServerError::Unauthorized("Client ID in payload does not match token".to_string()),
+                );
+            }
+
             let sender = match state.room_manager.get_room(&room_id) {
                 Some(s) => s,
                 None => {

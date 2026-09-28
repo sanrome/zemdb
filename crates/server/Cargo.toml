@@ -25,6 +25,7 @@ serde_json = { workspace = true }
 zstd = { workspace = true }
 blake3 = { workspace = true }
 futures = { workspace = true }
+subtle = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

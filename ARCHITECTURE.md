@@ -207,14 +207,24 @@ To prevent the resource exhaustion of thousands of idle persistent connections:
   * Wire Efficiency (50%+ Bandwidth Reduction): Replacing string-keyed dictionaries with `CompactRow` and `ColumnUpdate` deltas eliminates column names from the wire, reducing serialized insert/update payloads by 38% to 60%.
   * Multiplexing: Multiple sync/commit streams share a single underlying TCP connection using explicit correlation identifiers (`CorrelationId`).
   * Defensive Bounding: Codecs enforce an explicit message size limit (16 MB) to prevent denial-of-service memory exhaustion attacks.
+* **Universal Security & Defense-in-Depth (`ClientAuth`):**
+  * **Cryptographic Extractor (`ClientAuth`):** All operational Data Plane endpoints (`/commit`, `/sync`, `/ack`, `/heartbeat`, `/schema`, `/deregister`, `/events`) enforce cryptographic authentication via Axum's `FromRequestParts` extractor. Requests must supply `Authorization: Bearer <token>` (with query parameter `?token=<token>` supported for SSE `EventSource` connections).
+  * **Constant-Time Verification (`subtle::ConstantTimeEq`):** Token HMAC-BLAKE3 signatures and admin secrets are verified using constant-time byte comparisons, eliminating side-channel timing attack vulnerabilities (`M-04`).
+  * **Zero Backdoors:** Development bypasses (`"dev-token"`) are eliminated; all incoming tokens require valid cryptographic signatures issued with the configured secret (`M-05`).
+  * **3-Way Route and Token Validation (`M-07`):** Handlers enforce that:
+    1. The `room_id` in the URL path matches the `room_id` claim in the verified token.
+    2. The `room_id` in the URL path matches the `room_id` in the binary `ClientMessage` payload.
+    3. The `client_id` in the binary `ClientMessage` payload matches the `client_id` claim in the verified token.
+    Any mismatch immediately aborts with `ErrorCode::Unauthorized` / `ServerError::Unauthorized` prior to actor dispatch, preventing cross-room spoofing and gateway bypasses.
+  * **Actor-Level Lease Validation (`C-03`):** Even with a cryptographically valid token, `RoomActor` validates that the requesting client possesses an active registration in `ClientLeaseTracker` before processing `Commit`, `Sync`, `Ack`, or `Heartbeat`. Unregistered clients are rejected with `ServerError::Unauthorized`.
 * **Core Interaction Contracts:**
   * **Handshake & Schema Delivery (`RegisterClient` -> `Registered`):** Client presents `auth_token` and optional `current_seq`, receiving current `head_seq`, `tail_seq`, `active_snapshot_seq`, `schema_id`, and `Schema` in 1 RTT.
-  * **On-Demand Schema Refresh (`GetSchema` -> `Schema`):** Allows clients to refresh schema definitions during active DDL evolution without reconnecting.
+  * **On-Demand Schema Refresh (`GetSchema` -> `Schema`):** Allows clients to refresh schema definitions during active DDL evolution without reconnecting (`GET /rooms/{room_id}/schema` authenticated via `ClientAuth`).
   * **Mutation Commit with Unified Sync (1 RTT):** Client submits an operation with its `MutationId`, `CorrelationId`, and its current cursor `last_ack_seq`. The server validates the mutation against schemas and constraints. If valid, the server assigns a monotonic `SequenceNumber` and returns `CommitAck` containing the assigned `SequenceNumber` along with any remote catchup deltas (`catchup_ops: Vec<SequencedOperation>`) that occurred between `last_ack_seq` and the new sequence (and `has_more: bool` pagination indicator). This allows the client to register the write, sync pending state, and apply canonical data locally in a single network roundtrip (1 RTT) without risk of local state corruption.
   * **Synchronization (Standalone / Polling):** Client requests operations starting from its `last_ack_seq` specifying a maximum batch size (`ClientMessage::Sync`). The server streams ordered `SequencedOperation` batches with pagination flags (`has_more`).
   * **Acknowledgment / Heartbeat:** Client periodically reports processed sequences (`ClientMessage::Heartbeat`), allowing the server to advance client leases and retention windows.
   * **Error Handling:** Typed error responses communicate states such as invalid payloads (`ErrorCode::SchemaViolation`), authorization failures (`ErrorCode::Unauthorized`), or `BehindCompaction`.
-* **Optional Foreground Streaming:** While a client application is actively in the foreground, it can establish an ephemeral push channel (SSE) to receive real-time notifications of new commits.
+* **Optional Foreground Streaming:** While a client application is actively in the foreground, it can establish an ephemeral push channel (SSE: `GET /rooms/{room_id}/events` authenticated via `ClientAuth`) to receive real-time notifications of new commits.
 
 ---
 

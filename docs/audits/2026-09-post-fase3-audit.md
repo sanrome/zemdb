@@ -45,7 +45,7 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 ├──────┼──────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┤
 │ C-01 │ Crítico  │ crates/server/src/actor/room.rs      │ [RESUELTO] Desfase off-by-one salta y omite sistemáticamente last_ack_seq + 1.         │
 │ C-02 │ Crítico  │ crates/server/src/actor/room.rs      │ [RESUELTO] Supresión silenciosa de BehindCompaction en Commit provocando divergencia.  │
-│ C-03 │ Crítico  │ crates/server/src/api/data_plane.rs  │ Ausencia total de autenticación y validación de lease en todo el Data Plane.            │
+│ C-03 │ Crítico  │ crates/server/src/api/data_plane.rs  │ [RESUELTO] Ausencia total de autenticación y validación de lease en todo el Data Plane.│
 │ C-04 │ Crítico  │ crates/server/src/actor/room.rs      │ Dual-WAL desacoplado: desincronización y agujero de secuencia irrecuperable en crash.  │
 │ C-05 │ Crítico  │ crates/storage/src/disk/recovery.rs  │ Replay ciego del WAL histórico sobre el snapshot base sin omitir secuencias consolidadas.│
 │ C-06 │ Crítico  │ crates/core/src/protocol/wal_frame.rs│ Torn writes en EOF clasificados erróneamente como corrupción fatal por fallo de CRC32.  │
@@ -76,10 +76,10 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 │ M-01 │ Medio    │ crates/core/src/mutation/squash.rs   │ Regla 1 de squashing sobrescribe celdas nulas con updates viejos violando LWW.         │
 │ M-02 │ Medio    │ crates/server/src/actor/room.rs      │ [RESUELTO] Reintentos idempotentes de Commit devuelven catchup_ops con mutación propia. │
 │ M-03 │ Medio    │ crates/core/src/protocol/codec.rs    │ Ausencia de magic bytes, versión de wire protocol y discriminante en codec binario.     │
-│ M-04 │ Medio    │ crates/server/src/api/auth.rs        │ Comparación de firmas en tiempo variable susceptible a ataques de canal lateral (timing)│
-│ M-05 │ Medio    │ crates/server/src/api/auth.rs        │ Backdoor dev-token cableado en código de autenticación de producción.                   │
+│ M-04 │ Medio    │ crates/server/src/api/auth.rs        │ [RESUELTO] Comparación de firmas en tiempo variable con subtle::ConstantTimeEq.         │
+│ M-05 │ Medio    │ crates/server/src/api/auth.rs        │ [RESUELTO] Backdoor dev-token cableado eliminado de código de autenticación.            │
 │ M-06 │ Medio    │ crates/server/src/api/control_plane  │ Evolución DDL (add_column) no emite señal SSE provocando desincronización de esquemas.  │
-│ M-07 │ Medio    │ crates/server/src/api/data_plane.rs  │ Omisión de validación de room_id en URL path vs payload binario (bypass de gateway).   │
+│ M-07 │ Medio    │ crates/server/src/api/data_plane.rs  │ [RESUELTO] Validación estricta 3-way room_id en URL path vs token vs payload.          │
 │ M-08 │ Medio    │ crates/server/src/api/data_plane.rs  │ Ausencia de timeouts perimetrales en llamadas sender.send y rx.await hacia actores.     │
 │ M-09 │ Medio    │ crates/server/src/api/data_plane.rs  │ max_batch_size en /sync sin límite superior permite decodificación masiva abusiva (DoS)│
 │ M-10 │ Medio    │ crates/server/src/log/tiered_log.rs  │ Avance prematuro de tail_seq en prune_older_than induce BehindCompaction espurio.       │
@@ -118,10 +118,11 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica / Implementada**: Se valida de forma preventiva el cursor antes de secuenciar la mutación, propagando `Err(ServerError::BehindCompaction)` si `last_ack_seq < tail_seq - 1` (o si el cliente no está en estado `Connected`, rechazando clientes `Bootstrapping`/`Dormant`). Si `fetch_deltas` retorna `Err(ServerError::BehindCompaction)`, el error se propaga inmediatamente sin tragar la excepción.
 
 #### [C-03] Ausencia total de autenticación, autorización y validación de lease en todo el Data Plane
+* **Estado**: **RESUELTO (Fase 3.5-A.2)**
 * **Ubicación Exacta**: [`crates/server/src/api/data_plane.rs:131-584`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/data_plane.rs#L131-L584), [`crates/server/src/api/sse.rs:15-53`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/sse.rs#L15-L53), [`crates/core/src/protocol/messages.rs:49-105`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/protocol/messages.rs#L49-L105).
 * **Causa Raíz**: La verificación del token firmado (`verify_client_token`) se ejecuta únicamente en `/rooms/:id/register`. Los handlers `/commit`, `/sync`, `/ack`, `/heartbeat`, `/deregister` y `/events` no extraen cabeceras `Authorization` ni validan firmas. Asimismo, `RoomActor` procesa mutaciones de cualquier `client_id` sin validar si posee un lease activo en `ClientLeaseTracker`.
 * **Impacto**: Evasión absoluta del control de acceso. Cualquier entidad anónima en red puede inyectar mutaciones forjadas a nombre de cualquier usuario, descargar bases de datos históricas mediante `/sync`, o emitir `Ack` falsos que provoquen la purga anticipada de datos de clientes legítimos.
-* **Solución Técnica**: Implementar un middleware extractor `ClientAuth` en Axum que valide el Bearer token criptográfico en todas las rutas bajo `/rooms/:id/*`. En `RoomActor`, verificar que el `client_id` solicitante se encuentre en estado `Connected` en `ClientLeaseTracker`.
+* **Solución Técnica / Implementada**: Se implementó el extractor Axum `ClientAuth` (`FromRequestParts`) que valida criptográficamente tokens Bearer (y fallback `?token=` para EventSource de SSE) retornando claims tipados `VerifiedClientToken`. En el actor `RoomActor`, `handle_commit`, `handle_sync`, `handle_ack` y `Heartbeat` verifican explícitamente mediante `ClientLeaseTracker::is_registered` que el cliente se encuentre registrado, rechazando clientes no registrados con `ServerError::Unauthorized`.
 
 #### [C-04] Dual-WAL desacoplado: desincronización y agujero de secuencia irrecuperable en reinicios
 * **Ubicación Exacta**: [`crates/server/src/actor/room.rs:54-65`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs#L54-L65), [`crates/server/src/actor/room.rs:264-282`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs#L264-L282), [`crates/server/src/log/tiered_log.rs:101-107`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/log/tiered_log.rs#L101-L107).
@@ -321,14 +322,16 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica**: Anteponer un prefijo fijo de 4 bytes (`[magic: 2B][version: 1B][flags: 1B]`).
 
 #### [M-04] Comparación de firmas en tiempo variable susceptible a ataques de canal lateral (timing)
+* **Estado**: **RESUELTO (Fase 3.5-A.2)**
 * **Ubicación Exacta**: [`crates/server/src/api/auth.rs:116`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/auth.rs#L116).
 * **Causa Raíz**: Validación de firma BLAKE3 usa `!=` sobre cadenas hexadecimales en tiempo variable.
-* **Solución Técnica**: Utilizar comparación en tiempo constante (`subtle::ConstantTimeEq`).
+* **Solución Técnica / Implementada**: Se incorporó el crate `subtle = "2.6"` y se reemplazó la comparación de cadenas con `ct_eq` en tiempo constante sobre bytes (`subtle::ConstantTimeEq`), aplicándolo tanto a la verificación de firma de tokens de cliente como a la cabecera `X-Admin-Secret` en `AdminAuth`.
 
 #### [M-05] Backdoor `dev-token` cableado en código de autenticación de producción
+* **Estado**: **RESUELTO (Fase 3.5-A.2)**
 * **Ubicación Exacta**: [`crates/server/src/api/auth.rs:71-74`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/auth.rs#L71-L74).
 * **Causa Raíz**: Se acepta `dev-token` incondicionalmente si el secret es el por defecto.
-* **Solución Técnica**: Eliminar el bypass en modo producción y exigir secreto configurado.
+* **Solución Técnica / Implementada**: Se eliminó de forma completa e incondicional la rama especial para `"dev-token"` en `verify_client_token`. Todo token debe ser criptográficamente válido y estar firmado con la clave HMAC-BLAKE3 configurada en el servidor.
 
 #### [M-06] Evolución DDL (`add_column`) no emite señal SSE provocando desincronización de esquemas
 * **Ubicación Exacta**: [`crates/server/src/api/control_plane.rs:67-85`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/control_plane.rs#L67-L85), [`crates/server/src/api/sse.rs:36-50`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/sse.rs#L36-L50).
@@ -336,9 +339,10 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica**: Emitir `RoomEvent::SchemaReloaded` vía broadcast SSE para que los clientes actualicen su esquema.
 
 #### [M-07] Omisión de validación de `room_id` en URL path vs payload binario (bypass de gateway)
+* **Estado**: **RESUELTO (Fase 3.5-A.2)**
 * **Ubicación Exacta**: [`crates/server/src/api/data_plane.rs:148-583`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/data_plane.rs#L148-L583).
 * **Causa Raíz**: Handlers extraen `room_id_str` del path pero enrutan según el payload Bincode interno.
-* **Solución Técnica**: Validar `if room_id.as_str() != room_id_str` antes de despachar el comando.
+* **Solución Técnica / Implementada**: Se implementó una verificación estricta de 3 vías en todos los endpoints operativos (`/commit`, `/sync`, `/ack`, `/heartbeat`, `/schema`, `/deregister`, `/events`): el `room_id` del path de la URL debe coincidir exactamente con el `room_id` verificado del Bearer token y con el `room_id` contenido en el payload del mensaje binario (`ClientMessage`), y el `client_id` del payload debe coincidir con el `client_id` del token. Ante cualquier discrepancia, se rechaza inmediatamente con `ErrorCode::Unauthorized` / `ServerError::Unauthorized`.
 
 #### [M-08] Ausencia de timeouts perimetrales en llamadas `sender.send` y `rx.await` hacia actores
 * **Ubicación Exacta**: [`crates/server/src/api/data_plane.rs:90-204`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/data_plane.rs#L90-L204).
