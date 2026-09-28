@@ -56,20 +56,26 @@ pub enum ClientMessage {
         last_ack_seq: SequenceNumber,
         op: Operation,
     },
-    /// Request delta operations starting after `last_ack_seq` with flow control limit.
+    /// Explicitly acknowledge receipt and local persistence of operations up to `ack_seq`.
+    Ack {
+        correlation_id: CorrelationId,
+        room_id: RoomId,
+        client_id: ClientId,
+        ack_seq: SequenceNumber,
+    },
+    /// Request delta operations starting after `from_seq` with flow control limit.
     Sync {
         correlation_id: CorrelationId,
         room_id: RoomId,
         client_id: ClientId,
-        last_ack_seq: SequenceNumber,
+        from_seq: SequenceNumber,
         max_batch_size: u32,
     },
-    /// Periodically inform server that client is active and report current cursor.
+    /// Periodically inform server that client is active to maintain lease.
     Heartbeat {
         correlation_id: CorrelationId,
         room_id: RoomId,
         client_id: ClientId,
-        last_ack_seq: SequenceNumber,
     },
     /// Join a room as an active client with a signed backend authorization token.
     RegisterClient {
@@ -109,6 +115,13 @@ pub enum ServerMessage {
         assigned_seq: SequenceNumber,
         catchup_ops: Vec<SequencedOperation>,
         has_more: bool,
+    },
+    /// Confirmation of client acknowledgment and cursor persistence.
+    AckConfirmed {
+        correlation_id: CorrelationId,
+        room_id: RoomId,
+        ack_seq: SequenceNumber,
+        head_seq: SequenceNumber,
     },
     /// Batch of sequenced operations to be applied on the client with pagination flag.
     SyncBatch {

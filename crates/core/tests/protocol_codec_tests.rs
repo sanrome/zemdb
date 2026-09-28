@@ -190,7 +190,6 @@ fn test_protocol_rejects_trailing_bytes() {
         correlation_id: CorrelationId::new(42),
         client_id: ClientId::new("client-test"),
         room_id: RoomId::new("room-1"),
-        last_ack_seq: SequenceNumber::new(10),
     };
 
     let mut encoded = encode_message(&client_msg).expect("serialization failed");
@@ -203,3 +202,29 @@ fn test_protocol_rejects_trailing_bytes() {
         "Expected deserialization to reject trailing bytes, but succeeded"
     );
 }
+
+#[test]
+fn test_ack_messages_codec_roundtrip() {
+    let ack_msg = ClientMessage::Ack {
+        correlation_id: CorrelationId::new(101),
+        room_id: RoomId::new("room-ack"),
+        client_id: ClientId::new("client-ack"),
+        ack_seq: SequenceNumber::new(42),
+    };
+
+    let encoded_ack = encode_message(&ack_msg).expect("serialization failed");
+    let decoded_ack: ClientMessage = decode_message(&encoded_ack).expect("deserialization failed");
+    assert_eq!(ack_msg, decoded_ack);
+
+    let ack_confirmed = ServerMessage::AckConfirmed {
+        correlation_id: CorrelationId::new(101),
+        room_id: RoomId::new("room-ack"),
+        ack_seq: SequenceNumber::new(42),
+        head_seq: SequenceNumber::new(50),
+    };
+
+    let enc_conf = encode_message(&ack_confirmed).expect("serialization failed");
+    let dec_conf: ServerMessage = decode_message(&enc_conf).expect("deserialization failed");
+    assert_eq!(ack_confirmed, dec_conf);
+}
+
