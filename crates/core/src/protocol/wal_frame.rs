@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use crate::id::MutationId;
 use crate::protocol::codec::MAX_MESSAGE_SIZE;
 use crate::protocol::messages::SequencedOperation;
 
@@ -19,12 +20,20 @@ pub enum WalFrameError {
     Corruption(String),
 }
 
+/// Payload serialized within a framed WAL batch, carrying operations and optional mutation metadata for deduplication.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WalBatchPayload {
+    pub mutation_id: Option<MutationId>,
+    pub ops: Vec<SequencedOperation>,
+}
+
 /// Result of attempting to decode a WAL batch from a byte buffer.
 #[derive(Debug, PartialEq, Clone)]
 pub enum WalBatchDecodeResult {
-    /// Successfully decoded a batch of sequenced operations and the number of bytes consumed.
+    /// Successfully decoded a batch of sequenced operations, optional mutation metadata, and the number of bytes consumed.
     Ok {
         ops: Vec<SequencedOperation>,
+        mutation_id: Option<MutationId>,
         bytes_consumed: usize,
     },
     /// Clean end-of-file reached (no more bytes remaining in WAL segment).
@@ -40,9 +49,10 @@ pub enum WalBatchDecodeResult {
 /// Result of attempting to decode a single WAL entry from a byte buffer.
 #[derive(Debug, PartialEq, Clone)]
 pub enum WalDecodeResult {
-    /// Successfully decoded a sequenced operation and the number of bytes consumed.
+    /// Successfully decoded a sequenced operation, optional mutation metadata, and the number of bytes consumed.
     Ok {
         op: SequencedOperation,
+        mutation_id: Option<MutationId>,
         bytes_consumed: usize,
     },
     /// Clean end-of-file reached (no more bytes remaining in WAL segment).
@@ -55,16 +65,23 @@ pub enum WalDecodeResult {
     },
 }
 
-/// Encodes a batch of `SequencedOperation` into an append-only, atomically framed WAL batch.
+/// Encodes a batch of `SequencedOperation` along with optional `MutationId` metadata into an append-only, atomically framed WAL batch.
 ///
 /// Framing:
 /// - `magic`: 2 bytes (`0xBA7C`, little-endian: `[0xBA, 0x7C]`)
 /// - `batch_len`: 4 bytes (`u32`, little-endian payload length)
 /// - `batch_crc32`: 4 bytes (`u32`, little-endian CRC32 checksum of payload)
 /// - `ops_count`: 4 bytes (`u32`, little-endian count of operations in batch)
-/// - `payload`: serialized `Vec<SequencedOperation>` via bincode
-pub fn encode_wal_batch(ops: &[SequencedOperation]) -> Result<Vec<u8>, WalFrameError> {
-    let payload = bincode::serialize(ops).map_err(|e| WalFrameError::Serialization(e.to_string()))?;
+/// - `payload`: serialized `WalBatchPayload` via bincode
+pub fn encode_wal_batch(
+    ops: &[SequencedOperation],
+    mutation_id: Option<MutationId>,
+) -> Result<Vec<u8>, WalFrameError> {
+    let payload_struct = WalBatchPayload {
+        mutation_id,
+        ops: ops.to_vec(),
+    };
+    let payload = bincode::serialize(&payload_struct).map_err(|e| WalFrameError::Serialization(e.to_string()))?;
     if payload.len() as u64 > MAX_MESSAGE_SIZE {
         return Err(WalFrameError::Corruption(format!(
             "WAL batch payload size {} exceeds MAX_MESSAGE_SIZE limit {}",
@@ -85,17 +102,20 @@ pub fn encode_wal_batch(ops: &[SequencedOperation]) -> Result<Vec<u8>, WalFrameE
     Ok(record)
 }
 
-/// Encodes a single `SequencedOperation` into an append-only WAL batch.
-pub fn encode_wal_record(op: &SequencedOperation) -> Result<Vec<u8>, WalFrameError> {
-    encode_wal_batch(std::slice::from_ref(op))
+/// Encodes a single `SequencedOperation` along with optional `MutationId` metadata into an append-only WAL batch.
+pub fn encode_wal_record(
+    op: &SequencedOperation,
+    mutation_id: Option<MutationId>,
+) -> Result<Vec<u8>, WalFrameError> {
+    encode_wal_batch(std::slice::from_ref(op), mutation_id)
 }
 
 /// Decodes the next framed WAL batch from a byte slice.
 ///
 /// Returns `WalBatchDecodeResult::Ok` if a complete batch was decoded,
 /// `WalBatchDecodeResult::CleanEof` if the slice is empty,
-/// or `WalBatchDecodeResult::TornWrite` if a partial batch is present at EOF.
-/// Returns `Err(WalFrameError::Corruption)` if invalid magic, bit-flip, or corruption is detected.
+/// or `WalBatchDecodeResult::TornWrite` if a partial batch or terminal CRC mismatch is present at EOF.
+/// Returns `Err(WalFrameError::Corruption)` if invalid magic, bit-flip, or corruption followed by valid frames is detected.
 pub fn decode_wal_batch_from_slice(slice: &[u8]) -> Result<WalBatchDecodeResult, WalFrameError> {
     if slice.is_empty() {
         return Ok(WalBatchDecodeResult::CleanEof);
@@ -162,14 +182,38 @@ pub fn decode_wal_batch_from_slice(slice: &[u8]) -> Result<WalBatchDecodeResult,
     let payload = &slice[BATCH_HEADER_SIZE..total_expected_len];
     let actual_crc = crc32fast::hash(payload);
     if actual_crc != expected_crc {
+        // If there are no subsequent valid batch headers remaining, treat CRC mismatch as a torn write at EOF
+        let remaining = &slice[total_expected_len..];
+        let has_subsequent_valid_batch = if remaining.len() >= BATCH_HEADER_SIZE {
+            remaining[0..2] == BATCH_MAGIC
+        } else {
+            false
+        };
+
+        if !has_subsequent_valid_batch {
+            return Ok(WalBatchDecodeResult::TornWrite {
+                valid_bytes_offset: 0,
+                reason: format!(
+                    "WAL batch CRC32 mismatch at EOF (expected {expected_crc}, actual {actual_crc}), treating as torn write"
+                ),
+            });
+        }
+
         return Err(WalFrameError::Corruption(format!(
             "WAL batch CRC32 mismatch: expected {expected_crc}, actual {actual_crc}"
         )));
     }
 
-    let ops: Vec<SequencedOperation> = bincode::deserialize(payload).map_err(|e| {
-        WalFrameError::Corruption(format!("Failed to deserialize WAL batch operations: {e}"))
-    })?;
+    let (ops, mutation_id) = match bincode::deserialize::<WalBatchPayload>(payload) {
+        Ok(batch) => (batch.ops, batch.mutation_id),
+        Err(_) => {
+            // Fallback for slices that serialized Vec<SequencedOperation> directly
+            let ops: Vec<SequencedOperation> = bincode::deserialize(payload).map_err(|e| {
+                WalFrameError::Corruption(format!("Failed to deserialize WAL batch operations: {e}"))
+            })?;
+            (ops, None)
+        }
+    };
 
     if ops.len() != ops_count {
         return Err(WalFrameError::Corruption(format!(
@@ -180,6 +224,7 @@ pub fn decode_wal_batch_from_slice(slice: &[u8]) -> Result<WalBatchDecodeResult,
 
     Ok(WalBatchDecodeResult::Ok {
         ops,
+        mutation_id,
         bytes_consumed: total_expected_len,
     })
 }
@@ -189,10 +234,15 @@ pub fn decode_wal_record_from_slice(slice: &[u8]) -> Result<WalDecodeResult, Wal
     match decode_wal_batch_from_slice(slice)? {
         WalBatchDecodeResult::Ok {
             mut ops,
+            mutation_id,
             bytes_consumed,
         } => {
             if let Some(op) = ops.drain(..).next() {
-                Ok(WalDecodeResult::Ok { op, bytes_consumed })
+                Ok(WalDecodeResult::Ok {
+                    op,
+                    mutation_id,
+                    bytes_consumed,
+                })
             } else {
                 Err(WalFrameError::Corruption("Empty WAL batch".to_string()))
             }
@@ -225,6 +275,7 @@ pub fn replay_wal_records(
             WalBatchDecodeResult::Ok {
                 ops,
                 bytes_consumed,
+                ..
             } => {
                 all_ops.extend(ops);
                 offset += bytes_consumed;
@@ -240,63 +291,3 @@ pub fn replay_wal_records(
     Ok((all_ops, offset, torn_write_detected))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::mutation::Operation;
-    use crate::value::{CompactRow, PrimaryKey, Value};
-
-    #[test]
-    fn test_wal_frame_roundtrip() {
-        let row = CompactRow::new(vec![Value::Int(1), Value::String("Alice".into())]);
-        let op = SequencedOperation::new(1, Operation::insert(0, PrimaryKey::single(1i64), row, 100));
-        let batch = vec![op.clone()];
-
-        let encoded = encode_wal_batch(&batch).expect("encode ok");
-        assert_eq!(&encoded[0..2], &BATCH_MAGIC);
-
-        let decoded = decode_wal_batch_from_slice(&encoded).expect("decode ok");
-        match decoded {
-            WalBatchDecodeResult::Ok {
-                ops,
-                bytes_consumed,
-            } => {
-                assert_eq!(ops, batch);
-                assert_eq!(bytes_consumed, encoded.len());
-            }
-            other => panic!("Expected Ok, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_wal_frame_detects_crc_tampering() {
-        let op = SequencedOperation::new(1, Operation::delete(0, PrimaryKey::single(1i64), 100));
-        let mut encoded = encode_wal_batch(&[op]).expect("encode ok");
-
-        // Tamper with payload byte
-        let last_idx = encoded.len() - 1;
-        encoded[last_idx] ^= 0xFF;
-
-        let err = decode_wal_batch_from_slice(&encoded).unwrap_err();
-        assert!(matches!(err, WalFrameError::Corruption(_)));
-    }
-
-    #[test]
-    fn test_wal_frame_torn_write_detection() {
-        let op = SequencedOperation::new(1, Operation::delete(0, PrimaryKey::single(1i64), 100));
-        let encoded = encode_wal_batch(&[op]).expect("encode ok");
-
-        // Truncate to just partial header
-        let partial = &encoded[0..5];
-        let res = decode_wal_batch_from_slice(partial).expect("returns TornWrite");
-        assert!(matches!(res, WalBatchDecodeResult::TornWrite { .. }));
-    }
-
-    #[test]
-    fn test_wal_frame_zero_filled_eof_torn_write_detection() {
-        // Zero-filled tail at EOF (e.g., 64 zero bytes from power outage fallocate)
-        let zeros = vec![0u8; 64];
-        let res = decode_wal_batch_from_slice(&zeros).expect("returns TornWrite for zero tail");
-        assert!(matches!(res, WalBatchDecodeResult::TornWrite { valid_bytes_offset: 0, .. }));
-    }
-}

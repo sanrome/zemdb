@@ -322,10 +322,10 @@ El plan de corrección se estructurará en tres fases incrementales antes de dar
    - [RESUELTO] Validar estricta coincidencia de `room_id` en URL path vs payload/token ([`M-07`](../audits/2026-09-post-fase3-audit.md#m-07)).
    - [RESUELTO] Eliminar el backdoor `"dev-token"` y aplicar comparación en tiempo constante `subtle` ([`M-04`](../audits/2026-09-post-fase3-audit.md#m-04), [`M-05`](../audits/2026-09-post-fase3-audit.md#m-05)).
 3. **Persistencia Atómica y Recuperación de Fallos**:
-   - Reemplazar el Dual-WAL unificando la persistencia en `active.wal` ([`C-04`](../audits/2026-09-post-fase3-audit.md#c-04)).
-   - Filtrar operaciones previas a `snapshot_seq` en el replay de `recover_room` ([`C-05`](../audits/2026-09-post-fase3-audit.md#c-05)).
-   - Clasificar fallos de CRC en EOF como `TornWrite` y truncar limpiamente ([`C-06`](../audits/2026-09-post-fase3-audit.md#c-06)).
-   - Corregir `WalReader` con cola de operaciones para no perder deltas en lotes multi-op ([`C-07`](../audits/2026-09-post-fase3-audit.md#c-07)).
+   - [RESUELTO] Reemplazar el Dual-WAL unificando la persistencia en `active.wal` ([`C-04`](../audits/2026-09-post-fase3-audit.md#c-04)).
+   - [RESUELTO] Filtrar operaciones previas a `snapshot_seq` en el replay de `recover_room` ([`C-05`](../audits/2026-09-post-fase3-audit.md#c-05)).
+   - [RESUELTO] Clasificar fallos de CRC en EOF como `TornWrite` y truncar limpiamente ([`C-06`](../audits/2026-09-post-fase3-audit.md#c-06)).
+   - [RESUELTO] Corregir `WalReader` con cola de operaciones para no perder deltas en lotes multi-op ([`C-07`](../audits/2026-09-post-fase3-audit.md#c-07)).
 4. **Validaciones Estructurales y Pánicos**:
    - Implementar deserialización estricta de `TableSchema` y eliminar `.expect()` ([`C-11`](../audits/2026-09-post-fase3-audit.md#c-11)).
    - Validar `ack_seq <= head_seq` en `handle_ack` evitando purga catastrófica ([`A-07`](../audits/2026-09-post-fase3-audit.md#a-07)).

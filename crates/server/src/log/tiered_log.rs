@@ -3,7 +3,7 @@ use crate::log::cold_disk::ColdDiskLog;
 use crate::log::hot_buffer::HotBuffer;
 use crate::log::policy::RoomLifecyclePolicy;
 use crate::log::warm_disk::WarmDiskLog;
-use rimdb_core::id::SequenceNumber;
+use rimdb_core::id::{MutationId, SequenceNumber};
 use rimdb_core::protocol::messages::SequencedOperation;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -43,13 +43,13 @@ impl TieredLog {
     pub fn open_or_create(
         dir: impl AsRef<Path>,
         policy: RoomLifecyclePolicy,
-    ) -> Result<Self, ServerError> {
+    ) -> Result<(Self, Vec<(MutationId, SequenceNumber)>), ServerError> {
         let dir = dir.as_ref().to_path_buf();
         let segments_dir = dir.join("segments");
         std::fs::create_dir_all(&segments_dir)?;
 
         let mut warm_disk = WarmDiskLog::open_or_create(&segments_dir)?;
-        let recovered_ops = warm_disk.recover_all()?;
+        let mut recovered_mutations = Vec::new();
 
         let mut head_seq = SequenceNumber::new(0);
         let mut tail_seq = SequenceNumber::new(0);
@@ -59,9 +59,20 @@ impl TieredLog {
         if let Some(first_cold) = cold_segments.first() {
             tail_seq = first_cold.start_seq;
             head_seq = cold_segments.last().unwrap().end_seq;
+            for cold_seg in &cold_segments {
+                let (_, muts) = ColdDiskLog::read_range_with_mutations(
+                    &cold_seg.path,
+                    SequenceNumber::new(0),
+                    usize::MAX,
+                )?;
+                recovered_mutations.extend(muts);
+            }
         }
 
         // Incorporate recovered Warm operations
+        let (recovered_ops, warm_muts) = warm_disk.recover_all()?;
+        recovered_mutations.extend(warm_muts);
+
         if let Some(first_op) = recovered_ops.first() {
             if tail_seq.get() == 0 {
                 tail_seq = first_op.seq;
@@ -82,22 +93,29 @@ impl TieredLog {
         };
         hot_buffer.rehydrate(recovered_ops.into_iter().skip(rehydrate_start));
 
-        Ok(Self {
-            dir,
-            policy,
-            hot_buffer,
-            warm_disk,
-            head_seq,
-            tail_seq,
-        })
+        Ok((
+            Self {
+                dir,
+                policy,
+                hot_buffer,
+                warm_disk,
+                head_seq,
+                tail_seq,
+            },
+            recovered_mutations,
+        ))
     }
 
     /// Appends a new sequenced operation using the Write-Through durability model.
     ///
-    /// 1. Persists síncronamente en disco Warm (`active.wal`) con `wal_frame` y `sync_data()`.
-    /// 2. Almacena en `HotBuffer` en RAM para resolver `/sync` inmediato en sub-milisegundo.
-    /// 3. Rota y sella el segmento si se alcanza el umbral de capacidad o TTL.
-    pub fn append(&mut self, op: SequencedOperation) -> Result<(), ServerError> {
+    /// 1. Persists synchronously on Warm Disk (`active.wal`) with batch framing and `sync_data()`.
+    /// 2. Stores in `HotBuffer` in RAM to resolve immediate `/sync` queries in sub-millisecond.
+    /// 3. Rotates and seals segment if size or age threshold is exceeded.
+    pub fn append(
+        &mut self,
+        op: SequencedOperation,
+        mutation_id: Option<MutationId>,
+    ) -> Result<(), ServerError> {
         if self.head_seq.get() != 0 && op.seq.get() != self.head_seq.get() + 1 {
             return Err(ServerError::Wal(format!(
                 "Non-contiguous sequence: expected {}, got {}",
@@ -107,7 +125,7 @@ impl TieredLog {
         }
 
         // 1. Write-Through to Warm Disk
-        self.warm_disk.append_record(&op)?;
+        self.warm_disk.append_record(&op, mutation_id)?;
 
         // 2. Add to RAM HotBuffer
         self.hot_buffer.append(op)?;

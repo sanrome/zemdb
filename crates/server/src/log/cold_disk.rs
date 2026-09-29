@@ -1,5 +1,5 @@
 use crate::error::ServerError;
-use crate::log::warm_disk::{parse_segment_filename, SealedSegmentMeta};
+use crate::log::warm_disk::{parse_segment_filename, RecoveredLogData, SealedSegmentMeta};
 use rimdb_core::id::SequenceNumber;
 use rimdb_core::protocol::messages::SequencedOperation;
 use rimdb_core::protocol::wal_frame::{decode_wal_batch_from_slice, WalBatchDecodeResult};
@@ -56,8 +56,17 @@ impl ColdDiskLog {
         from_seq: SequenceNumber,
         limit: usize,
     ) -> Result<Vec<SequencedOperation>, ServerError> {
+        Self::read_range_with_mutations(cold_path, from_seq, limit).map(|(ops, _)| ops)
+    }
+
+    /// Reads operations and associated mutation IDs within `(from_seq .. ]` up to `limit` from a compressed `.wal.zst` file.
+    pub fn read_range_with_mutations(
+        cold_path: &Path,
+        from_seq: SequenceNumber,
+        limit: usize,
+    ) -> Result<RecoveredLogData, ServerError> {
         if limit == 0 || !cold_path.exists() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         let compressed_data = std::fs::read(cold_path)?;
@@ -66,12 +75,20 @@ impl ColdDiskLog {
 
         let mut offset = 0;
         let mut collected = Vec::new();
+        let mut mutations = Vec::new();
 
         while offset < decompressed_data.len() && collected.len() < limit {
             match decode_wal_batch_from_slice(&decompressed_data[offset..]) {
-                Ok(WalBatchDecodeResult::Ok { ops, bytes_consumed }) => {
+                Ok(WalBatchDecodeResult::Ok {
+                    ops,
+                    mutation_id,
+                    bytes_consumed,
+                }) => {
                     for op in ops {
                         if op.seq.get() > from_seq.get() {
+                            if let Some(m_id) = mutation_id {
+                                mutations.push((m_id, op.seq));
+                            }
                             collected.push(op);
                             if collected.len() >= limit {
                                 break;
@@ -93,7 +110,7 @@ impl ColdDiskLog {
             }
         }
 
-        Ok(collected)
+        Ok((collected, mutations))
     }
 
     /// Lists all `.wal.zst` segments in ascending sequence order.

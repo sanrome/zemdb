@@ -1,4 +1,4 @@
-use rimdb_core::SequencedOperation;
+use rimdb_core::{MutationId, SequencedOperation};
 
 use crate::error::StorageError;
 
@@ -138,13 +138,19 @@ pub use rimdb_core::protocol::wal_frame::{
 };
 
 /// Encodes a batch of `SequencedOperation` into an append-only, atomically framed WAL batch.
-pub fn encode_wal_batch(ops: &[SequencedOperation]) -> Result<Vec<u8>, StorageError> {
-    rimdb_core::protocol::wal_frame::encode_wal_batch(ops).map_err(Into::into)
+pub fn encode_wal_batch(
+    ops: &[SequencedOperation],
+    mutation_id: Option<MutationId>,
+) -> Result<Vec<u8>, StorageError> {
+    rimdb_core::protocol::wal_frame::encode_wal_batch(ops, mutation_id).map_err(Into::into)
 }
 
 /// Encodes a single `SequencedOperation` into an append-only WAL batch.
-pub fn encode_wal_record(op: &SequencedOperation) -> Result<Vec<u8>, StorageError> {
-    rimdb_core::protocol::wal_frame::encode_wal_record(op).map_err(Into::into)
+pub fn encode_wal_record(
+    op: &SequencedOperation,
+    mutation_id: Option<MutationId>,
+) -> Result<Vec<u8>, StorageError> {
+    rimdb_core::protocol::wal_frame::encode_wal_record(op, mutation_id).map_err(Into::into)
 }
 
 /// Decodes the next framed WAL batch from a byte slice.

@@ -46,17 +46,17 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 │ C-01 │ Crítico  │ crates/server/src/actor/room.rs      │ [RESUELTO] Desfase off-by-one salta y omite sistemáticamente last_ack_seq + 1.         │
 │ C-02 │ Crítico  │ crates/server/src/actor/room.rs      │ [RESUELTO] Supresión silenciosa de BehindCompaction en Commit provocando divergencia.  │
 │ C-03 │ Crítico  │ crates/server/src/api/data_plane.rs  │ [RESUELTO] Ausencia total de autenticación y validación de lease en todo el Data Plane.│
-│ C-04 │ Crítico  │ crates/server/src/actor/room.rs      │ Dual-WAL desacoplado: desincronización y agujero de secuencia irrecuperable en crash.  │
-│ C-05 │ Crítico  │ crates/storage/src/disk/recovery.rs  │ Replay ciego del WAL histórico sobre el snapshot base sin omitir secuencias consolidadas.│
-│ C-06 │ Crítico  │ crates/core/src/protocol/wal_frame.rs│ Torn writes en EOF clasificados erróneamente como corrupción fatal por fallo de CRC32.  │
-│ C-07 │ Crítico  │ crates/core/src/protocol/wal_frame.rs│ decode_wal_record_from_slice drena solo 1 op y descarta el resto del lote en WalReader. │
+│ C-04 │ Crítico  │ crates/server/src/actor/room.rs      │ [RESUELTO] Dual-WAL erradicado: persistencia atómica en active.wal con mutation_id.    │
+│ C-05 │ Crítico  │ crates/storage/src/disk/recovery.rs  │ [RESUELTO] Replay del WAL omite operaciones con op.seq <= snapshot_seq en recovery.    │
+│ C-06 │ Crítico  │ crates/core/src/protocol/wal_frame.rs│ [RESUELTO] Torn writes en EOF con CRC fallido clasificados y truncados limpiamente.    │
+│ C-07 │ Crítico  │ crates/core/src/protocol/wal_frame.rs│ [RESUELTO] WalReader bufferiza lotes multi-op sin descartar operaciones 2..N.          │
 │ C-08 │ Crítico  │ crates/server/src/actor/lease.rs     │ [RESUELTO] Rediseño Onboarding: Bootstrapping state + Ancla de retención de snapshots. │
 │ C-09 │ Crítico  │ crates/server/src/actor/manager.rs   │ Condición de carrera TOCTOU en get_or_spawn duplica actores de sala y corrompe WALs.   │
 │ C-10 │ Crítico  │ crates/server/src/relay.rs           │ Inyección arbitraria de estado por upload anónimo y colisión con DefaultBodyLimit 16MB. │
 │ C-11 │ Crítico  │ crates/core/src/schema/table.rs      │ Deserialización de TableSchema elude invariantes estructurales provocando pánico.       │
 ├──────┼──────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┤
 │ A-01 │ Alto     │ crates/server/src/actor/room.rs      │ I/O síncrono bloqueante y compresión Zstd ejecutados en el reactor asíncrono de Tokio.  │
-│ A-02 │ Alto     │ crates/server/src/micro_wal.rs       │ Crecimiento ilimitado de MicroWal y lectura monolítica a RAM con riesgo de OOM en boot.│
+│ A-02 │ Alto     │ crates/server/src/micro_wal.rs       │ [RESUELTO] Crecimiento ilimitado de MicroWal: resuelto al erradicar MicroWal (C-04).   │
 │ A-03 │ Alto     │ crates/storage/src/disk/mod.rs       │ Falsa compactación CoW: bloqueo exclusivo de sala congela escrituras concurrentes.      │
 │ A-04 │ Alto     │ crates/storage/src/disk/compactor.rs │ Carrera O_TRUNC antes de flock en compactor trunca snapshots concurrentes a 0 bytes.    │
 │ A-05 │ Alto     │ crates/storage/src/disk/format.rs    │ Cabecera FileHeader carece de checksum/CRC sobre el payload comprimido del snapshot.   │
@@ -83,7 +83,7 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 │ M-08 │ Medio    │ crates/server/src/api/data_plane.rs  │ Ausencia de timeouts perimetrales en llamadas sender.send y rx.await hacia actores.     │
 │ M-09 │ Medio    │ crates/server/src/api/data_plane.rs  │ max_batch_size en /sync sin límite superior permite decodificación masiva abusiva (DoS)│
 │ M-10 │ Medio    │ crates/server/src/log/tiered_log.rs  │ Avance prematuro de tail_seq en prune_older_than induce BehindCompaction espurio.       │
-│ M-11 │ Medio    │ crates/server/src/log/warm_disk.rs   │ Doble fsync por operación sin Group Commit ni batching en escrituras del servidor.      │
+│ M-11 │ Medio    │ crates/server/src/log/warm_disk.rs   │ [RESUELTO] Doble fsync eliminado: unificado en un solo fsync atómico por commit (C-04).│
 │ M-12 │ Medio    │ crates/server/src/log/warm_disk.rs   │ Ausencia de cerrojos multi-proceso (flock) sobre WALs del servidor.                     │
 │ M-13 │ Medio    │ crates/storage/src/engine.rs         │ Contrato StorageEngine exige table: &str en get/scan forzando búsquedas por string.     │
 │ M-14 │ Medio    │ crates/core/src/schema/global.rs     │ Sobrescritura silenciosa de tablas con igual nombre y overflow en asignación de IDs.    │
@@ -125,33 +125,38 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica / Implementada**: Se implementó el extractor Axum `ClientAuth` (`FromRequestParts`) que valida criptográficamente tokens Bearer (y fallback `?token=` para EventSource de SSE) retornando claims tipados `VerifiedClientToken`. En el actor `RoomActor`, `handle_commit`, `handle_sync`, `handle_ack` y `Heartbeat` verifican explícitamente mediante `ClientLeaseTracker::is_registered` que el cliente se encuentre registrado, rechazando clientes no registrados con `ServerError::Unauthorized`.
 
 #### [C-04] Dual-WAL desacoplado: desincronización y agujero de secuencia irrecuperable en reinicios
-* **Ubicación Exacta**: [`crates/server/src/actor/room.rs:54-65`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs#L54-L65), [`crates/server/src/actor/room.rs:264-282`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs#L264-L282), [`crates/server/src/log/tiered_log.rs:101-107`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/log/tiered_log.rs#L101-L107).
+* **Estado**: **RESUELTO (Persistencia Atómica Unificada en WAL)**
+* **Ubicación Exacta**: [`crates/server/src/actor/room.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs), [`crates/server/src/log/tiered_log.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/log/tiered_log.rs), [`crates/core/src/protocol/wal_frame.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/protocol/wal_frame.rs).
 * **Causa Raíz**: Persistencia dual independiente en cada commit: `micro_wal.append(new_seq)` seguido de `tiered_log.append(seq_op)`. Si ocurre un crash entre ambas escrituras, `micro_wal` registra la secuencia $N$, pero `tiered_log` solo alcanza $N-1$. Al reiniciar, `spawn` reconcilia `head_seq = max(wal_recovery.head_seq, tiered_log.head_seq())` ($N$), pero el campo interno de `TieredLog` permanece en $N-1$. La siguiente mutación ($N+1$) es rechazada por `TieredLog::append` con error de contigüidad no recuperable: `expected N, got N+1`.
 * **Impacto**: Inutilización permanente de la sala (*room bricking*). Todo commit posterior falla indefinidamente.
-* **Solución Técnica**: Erradicar el patrón Dual-WAL unificando la persistencia en `active.wal` incorporando `mutation_id` y `client_id` en el enmarcado de lote (`wal_frame`), o implementar una fase de reconciliación en `spawn` que trunque `MicroWal` al `head_seq` real confirmado por `TieredLog`.
+* **Solución Técnica / Implementada**: Se erradicó por completo el motor `MicroWal` y el archivo secundario `meta_{room_id}.wal`. La persistencia y deduplicación se unificaron en `active.wal` incorporando `mutation_id: Option<MutationId>` en el enmarcado de lote (`WalBatchPayload` en `wal_frame`). En cada commit, `RoomActor` ejecuta un único `append` atómico a `TieredLog` (Hot Buffer en RAM + `active.wal` con `sync_data()`). En el arranque, `DedupLruCache` se hidrata directamente a partir de las tuplas `(MutationId, SequenceNumber)` recuperadas cronológicamente de los segmentos Warm y Cold, y `head_seq` se deriva directamente de `tiered_log.head_seq()`. Esto también resuelve completamente **A-02** y **M-11**.
 
 #### [C-05] Replay ciego del WAL histórico sobre el snapshot base sin omitir secuencias consolidadas
-* **Ubicación Exacta**: [`crates/storage/src/disk/recovery.rs:232-265`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/recovery.rs#L232-L265).
+* **Estado**: **RESUELTO**
+* **Ubicación Exacta**: [`crates/storage/src/disk/recovery.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/recovery.rs).
 * **Causa Raíz**: Durante `recover_room`, el motor carga el snapshot base `room_{id}.snap` estableciendo `tables` y `snapshot_seq`. Acto seguido, abre `room_{id}.wal` desde el offset 0 y ejecuta incondicionalmente todas las operaciones sobre las tablas sin comprobar si `op.seq <= snapshot_seq`.
 * **Impacto**: Corrupción y resurrección zombi de datos si el servidor experimentó una caída antes de truncar el WAL tras un snapshot. Re-aplica deltas obsoletos sobre tuplas ya compactadas y amplifica masivamente el tiempo de arranque.
-* **Solución Técnica**: Introducir guarda estricta en el bucle de replay de `recover_room`:
+* **Solución Técnica / Implementada**: Se incorporó un filtro estricto en el bucle de replay de operaciones en `recover_room`:
   ```rust
   if op.seq <= snapshot_seq {
       continue;
   }
   ```
+  Evitando que mutaciones ya consolidadas en el snapshot sobrescriban el estado o causen violaciones de secuencia.
 
 #### [C-06] Torn writes en EOF clasificados erróneamente como corrupción fatal por fallo de CRC32
-* **Ubicación Exacta**: [`crates/core/src/protocol/wal_frame.rs:163-169`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/protocol/wal_frame.rs#L163-L169), [`crates/storage/src/disk/recovery.rs:214-220`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/recovery.rs#L214-L220), [`crates/server/src/log/warm_disk.rs:234-237`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/log/warm_disk.rs#L234-L237).
+* **Estado**: **RESUELTO (Auto-recuperación de Torn Writes en EOF)**
+* **Ubicación Exacta**: [`crates/core/src/protocol/wal_frame.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/protocol/wal_frame.rs), [`crates/storage/src/disk/recovery.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/recovery.rs), [`crates/server/src/log/warm_disk.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/log/warm_disk.rs).
 * **Causa Raíz**: Si un corte de energía interrumpe la escritura del último lote en el WAL, el payload queda truncado o con basura residual de bloque, provocando `crc != expected_crc`. El decodificador no clasifica el fallo como `TornWrite` en EOF si existen bytes no nulos en la cabecera, retornando `WalFrameError::Corruption`. Como resultado, `recover_room` aborta el arranque con `StorageError::WalCorruption`.
 * **Impacto**: Un corte de corriente durante una escritura en el WAL inhabilita el reinicio del motor (`open_room` falla), rompiendo la promesa arquitectónica de auto-recuperación de torn writes.
-* **Solución Técnica**: Si el fallo de magic bytes o CRC32 ocurre en el registro terminal del archivo y no existen tramas válidas posteriores, clasificarlo como `WalBatchDecodeResult::TornWrite`, permitiendo truncar el WAL al último desplazamiento válido (`valid_wal_bytes`) y completar el inicio.
+* **Solución Técnica / Implementada**: En `decode_wal_batch_from_slice`, cuando ocurre una discrepancia de CRC32, se verifica si el remanente posterior contiene alguna cabecera válida con magic `0xBA7C`. Si no existen registros válidos posteriores (fallo terminal en EOF), se clasifica como `WalBatchDecodeResult::TornWrite { valid_bytes_offset: 0, reason: ... }`. Tanto `recover_room` como `WarmDiskLog::inspect_active_segment` truncan automáticamente el archivo en disco a la longitud de bytes válidos previos (`valid_wal_bytes`), permitiendo el arranque normal sin intervención manual.
 
 #### [C-07] `decode_wal_record_from_slice` drena solo 1 op y descarta el resto del lote en `WalReader`
-* **Ubicación Exacta**: [`crates/core/src/protocol/wal_frame.rs:188-209`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/protocol/wal_frame.rs#L188-L209), [`crates/storage/src/disk/wal.rs:71-81`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/wal.rs#L71-L81).
+* **Estado**: **RESUELTO (Bufferizado de Lotes Multi-Operación)**
+* **Ubicación Exacta**: [`crates/storage/src/disk/wal.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/wal.rs).
 * **Causa Raíz**: `decode_wal_record_from_slice` decodifica un lote con múltiples operaciones pero ejecuta `ops.drain(..).next()`, devolviendo únicamente la primera operación pero retornando `bytes_consumed` igual al tamaño del lote completo. `WalReader::next_record` avanza su offset en la totalidad del lote.
 * **Impacto**: Pérdida silenciosa de datos. En cualquier archivo WAL donde se agrupen mutaciones en lotes multi-operación (`write_batch`), todas las operaciones a partir de la segunda son omitidas permanentemente.
-* **Solución Técnica**: Refactorizar `WalReader` para almacenar un buffer interno de operaciones pendientes (`pending_ops: VecDeque<SequencedOperation>`) que se vacíe antes de decodificar nuevos frames en disco.
+* **Solución Técnica / Implementada**: Se equipó a `WalReader` con una cola interna `pending_ops: VecDeque<SequencedOperation>`. Al invocar `next_record()`, si existen operaciones pendientes en la cola, se extrae inmediatamente la siguiente. Si la cola está vacía, se decodifica el siguiente lote mediante `next_batch()`, devolviendo la primera operación y encolando las operaciones $2..N$ restantes en `pending_ops`.
 
 #### [C-08] Código muerto en `register_client` y fallo conceptual al re-anclar cursor en onboarding / estado `Dormant`
 * **Estado**: **RESUELTO (Rediseño de Flujo de Onboarding y Ancla de Retención)**
@@ -200,10 +205,11 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica**: Confinar la compresión Zstd y las operaciones de disco a `tokio::task::spawn_blocking` o migrar descriptores a `tokio::fs`.
 
 #### [A-02] Crecimiento ilimitado de `MicroWal` y lectura monolítica a RAM con riesgo de OOM en arranque
-* **Ubicación Exacta**: [`crates/server/src/micro_wal.rs:75-141`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/micro_wal.rs#L75-L141).
-* **Causa Raíz**: `meta_{room_id}.wal` es estrictamente append-only sin rotación ni truncado. En `recover`, ejecuta `read_to_end` a memoria completa para hidratar `DedupLruCache` (capacidad de 10.000 entradas).
+* **Estado**: **RESUELTO (Erradicación de MicroWal por C-04)**
+* **Ubicación Exacta**: [`crates/server/src/micro_wal.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/micro_wal.rs).
+* **Causa Raíz**: `meta_{room_id}.wal` era estrictamente append-only sin rotación ni truncado. En `recover`, ejecutaba `read_to_end` a memoria completa para hidratar `DedupLruCache`.
 * **Impacto**: Fuga continua de almacenamiento y pánico por falta de memoria (OOM Kill) al arrancar salas con millones de transacciones históricas.
-* **Solución Técnica**: Truncar el micro-WAL periódicamente conservando únicamente las últimas $N$ entradas requeridas por la caché LRU, y leer en streaming o con `BufReader` inverso.
+* **Solución Técnica / Implementada**: Resuelto definitivamente mediante la erradicación completa de `MicroWal` (remediación `C-04`). La deduplicación se hidrata directamente desde los segmentos rotados, comprimidos y podados de `TieredLog`, eliminando el archivo secundario y su consumo desmedido de almacenamiento y memoria.
 
 #### [A-03] Falsa compactación CoW: bloqueo exclusivo de sala congela escrituras concurrentes
 * **Ubicación Exacta**: [`crates/storage/src/disk/mod.rs:301-306`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/mod.rs#L301-L306), [`crates/storage/src/disk/compactor.rs:20-88`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/compactor.rs#L20-L88).
@@ -360,9 +366,10 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica**: Asignar `tail_seq` a partir de la secuencia real más baja físicamente disponible en disco.
 
 #### [M-11] Doble fsync por operación sin Group Commit ni batching en escrituras del servidor
-* **Ubicación Exacta**: [`crates/server/src/actor/room.rs:264-279`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs#L264-L279).
-* **Causa Raíz**: Cada commit ejecuta dos `sync_data()` síncronos independientes a disco.
-* **Solución Técnica**: Implementar Group Commit o persistencia en un solo log coordinado.
+* **Estado**: **RESUELTO (Unificación de WAL por C-04)**
+* **Ubicación Exacta**: [`crates/server/src/actor/room.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs).
+* **Causa Raíz**: Cada commit ejecutaba dos `sync_data()` síncronos independientes a disco (uno en `MicroWal` y otro en `WarmDiskLog`).
+* **Solución Técnica / Implementada**: Resuelto mediante la erradicación de `MicroWal` (remediación `C-04`). Cada mutación confirmada realiza un único `sync_data()` en `active.wal`, reduciendo el I/O de disco a la mitad por commit.
 
 #### [M-12] Ausencia de cerrojos multi-proceso (`flock`) sobre WALs del servidor
 * **Ubicación Exacta**: [`crates/server/src/micro_wal.rs:51-57`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/micro_wal.rs#L51-L57), [`crates/server/src/log/warm_disk.rs:50-56`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/log/warm_disk.rs#L50-L56).

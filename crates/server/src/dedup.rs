@@ -1,4 +1,3 @@
-use crate::micro_wal::MicroWalEntry;
 use lru::LruCache;
 use rimdb_core::id::{MutationId, SequenceNumber};
 use std::num::NonZeroUsize;
@@ -32,10 +31,10 @@ impl DedupLruCache {
         self.cache.put(mutation_id, seq);
     }
 
-    /// Hydrates the deduplication cache from recovered Micro-WAL entries.
-    pub fn hydrate(&mut self, entries: impl IntoIterator<Item = MicroWalEntry>) {
-        for entry in entries {
-            self.record(entry.mutation_id, entry.seq);
+    /// Hydrates the deduplication cache from recovered log entries.
+    pub fn hydrate(&mut self, entries: impl IntoIterator<Item = (MutationId, SequenceNumber)>) {
+        for (mutation_id, seq) in entries {
+            self.record(mutation_id, seq);
         }
     }
 

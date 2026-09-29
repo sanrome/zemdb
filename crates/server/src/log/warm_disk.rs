@@ -1,5 +1,5 @@
 use crate::error::ServerError;
-use rimdb_core::id::SequenceNumber;
+use rimdb_core::id::{MutationId, SequenceNumber};
 use rimdb_core::protocol::messages::SequencedOperation;
 use rimdb_core::protocol::wal_frame::{
     decode_wal_batch_from_slice, encode_wal_record, WalBatchDecodeResult,
@@ -15,6 +15,9 @@ pub struct SealedSegmentMeta {
     pub end_seq: SequenceNumber,
     pub path: PathBuf,
 }
+
+/// Operations and mutation assignment pairs recovered from disk segments.
+pub type RecoveredLogData = (Vec<SequencedOperation>, Vec<(MutationId, SequenceNumber)>);
 
 /// Tier 2: Uncompressed append-only log on disk ensuring crash durability and fast sequential reads.
 #[derive(Debug)]
@@ -42,8 +45,12 @@ impl WarmDiskLog {
         Ok(log)
     }
 
-    /// Appends a sequenced operation to the active `.wal` segment and ensures physical durability on disk.
-    pub fn append_record(&mut self, op: &SequencedOperation) -> Result<(), ServerError> {
+    /// Appends a sequenced operation with an optional mutation ID to the active `.wal` segment and ensures physical durability on disk.
+    pub fn append_record(
+        &mut self,
+        op: &SequencedOperation,
+        mutation_id: Option<MutationId>,
+    ) -> Result<(), ServerError> {
         let active_path = self.segments_dir.join("active.wal");
 
         if self.active_file.is_none() {
@@ -60,7 +67,8 @@ impl WarmDiskLog {
         }
 
         let file = self.active_file.as_mut().unwrap();
-        let encoded = encode_wal_record(op).map_err(|e| ServerError::Wal(e.to_string()))?;
+        let encoded = encode_wal_record(op, mutation_id)
+            .map_err(|e| ServerError::Wal(e.to_string()))?;
 
         file.write_all(&encoded)?;
         file.flush()?;
@@ -135,19 +143,36 @@ impl WarmDiskLog {
         from_seq: SequenceNumber,
         limit: usize,
     ) -> Result<Vec<SequencedOperation>, ServerError> {
+        Self::read_range_with_mutations(file_path, from_seq, limit).map(|(ops, _)| ops)
+    }
+
+    /// Reads operations and associated mutation IDs within `(from_seq .. ]` up to `limit` from a specific `.wal` file.
+    pub fn read_range_with_mutations(
+        file_path: &Path,
+        from_seq: SequenceNumber,
+        limit: usize,
+    ) -> Result<RecoveredLogData, ServerError> {
         if limit == 0 || !file_path.exists() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         let data = std::fs::read(file_path)?;
         let mut offset = 0;
         let mut collected = Vec::new();
+        let mut mutations = Vec::new();
 
         while offset < data.len() && collected.len() < limit {
             match decode_wal_batch_from_slice(&data[offset..]) {
-                Ok(WalBatchDecodeResult::Ok { ops, bytes_consumed }) => {
+                Ok(WalBatchDecodeResult::Ok {
+                    ops,
+                    mutation_id,
+                    bytes_consumed,
+                }) => {
                     for op in ops {
                         if op.seq.get() > from_seq.get() {
+                            if let Some(m_id) = mutation_id {
+                                mutations.push((m_id, op.seq));
+                            }
                             collected.push(op);
                             if collected.len() >= limit {
                                 break;
@@ -169,25 +194,28 @@ impl WarmDiskLog {
             }
         }
 
-        Ok(collected)
+        Ok((collected, mutations))
     }
 
-    /// Recovers all operations present in sealed segments and active.wal in chronological order.
-    pub fn recover_all(&mut self) -> Result<Vec<SequencedOperation>, ServerError> {
+    /// Recovers all operations and mutation IDs present in sealed segments and active.wal in chronological order.
+    pub fn recover_all(&mut self) -> Result<RecoveredLogData, ServerError> {
         let mut all_ops = Vec::new();
+        let mut all_mutations = Vec::new();
 
         for sealed in self.list_sealed_segments()? {
-            let ops = Self::read_range(&sealed.path, SequenceNumber::new(0), usize::MAX)?;
+            let (ops, muts) = Self::read_range_with_mutations(&sealed.path, SequenceNumber::new(0), usize::MAX)?;
             all_ops.extend(ops);
+            all_mutations.extend(muts);
         }
 
         let active_path = self.segments_dir.join("active.wal");
         if active_path.exists() {
-            let active_ops = Self::read_range(&active_path, SequenceNumber::new(0), usize::MAX)?;
+            let (active_ops, active_muts) = Self::read_range_with_mutations(&active_path, SequenceNumber::new(0), usize::MAX)?;
             all_ops.extend(active_ops);
+            all_mutations.extend(active_muts);
         }
 
-        Ok(all_ops)
+        Ok((all_ops, all_mutations))
     }
 
     /// Inspects and repairs `active.wal` upon opening, seeking to the end for subsequent appends.
@@ -212,7 +240,7 @@ impl WarmDiskLog {
 
         while offset < data.len() {
             match decode_wal_batch_from_slice(&data[offset..]) {
-                Ok(WalBatchDecodeResult::Ok { ops, bytes_consumed }) => {
+                Ok(WalBatchDecodeResult::Ok { ops, bytes_consumed, .. }) => {
                     for op in ops {
                         if start_seq.is_none() {
                             start_seq = Some(op.seq);

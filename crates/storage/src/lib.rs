@@ -20,4 +20,4 @@ pub use memory::MemoryStorageEngine;
 pub use options::{KeyRange, ScanDirection, ScanOptions};
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use disk::{DiskStorageEngine, DiskStorageOptions};
+pub use disk::{wal::WalReader, wal::WalWriter, DiskStorageEngine, DiskStorageOptions};

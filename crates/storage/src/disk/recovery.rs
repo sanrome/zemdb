@@ -213,14 +213,33 @@ pub async fn recover_room(
 
             let actual_crc = crc32fast::hash(&payload);
             if actual_crc != expected_crc {
+                // If there are no subsequent valid batch headers remaining, treat CRC mismatch as a torn write at EOF
+                let mut peek_buf = [0u8; BATCH_HEADER_SIZE];
+                let peek_bytes = reader.read(&mut peek_buf).await?;
+                let has_subsequent_valid_batch = if peek_bytes >= 2 {
+                    peek_buf[0..2] == BATCH_MAGIC
+                } else {
+                    false
+                };
+
+                if !has_subsequent_valid_batch {
+                    torn_write = Some(format!(
+                        "WAL batch CRC32 mismatch at EOF: expected {expected_crc}, actual {actual_crc}"
+                    ));
+                    break;
+                }
+
                 return Err(StorageError::WalCorruption(format!(
                     "WAL batch CRC32 mismatch: expected {expected_crc}, actual {actual_crc}"
                 )));
             }
 
-            let ops: Vec<SequencedOperation> = bincode::deserialize(&payload).map_err(|e| {
-                StorageError::WalCorruption(format!("Failed to deserialize WAL batch operations: {e}"))
-            })?;
+            let ops = match bincode::deserialize::<rimdb_core::protocol::wal_frame::WalBatchPayload>(&payload) {
+                Ok(batch) => batch.ops,
+                Err(_) => bincode::deserialize::<Vec<SequencedOperation>>(&payload).map_err(|e| {
+                    StorageError::WalCorruption(format!("Failed to deserialize WAL batch operations: {e}"))
+                })?,
+            };
 
             if ops.len() != ops_count {
                 return Err(StorageError::WalCorruption(format!(
@@ -230,6 +249,11 @@ pub async fn recover_room(
             }
 
             for op in ops {
+                // Skip deltas already consolidated in the base snapshot
+                if op.seq <= snapshot_seq {
+                    continue;
+                }
+
                 if schema.has_table_by_id(op.op.table_id) {
                     let table_map = tables.entry(op.op.table_id).or_default();
 

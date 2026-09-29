@@ -21,18 +21,18 @@ fn test_tiered_log_write_through_and_crash_recovery() {
 
     // 1. Append 10 operations with Write-Through
     {
-        let mut log = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
         assert_eq!(log.head_seq().get(), 0);
 
         for i in 1..=10 {
-            log.append(make_test_op(i)).unwrap();
+            log.append(make_test_op(i), None).unwrap();
             assert_eq!(log.head_seq().get(), i);
         }
         // Abruptly drop log without clean shutdown (simulating server crash)
     }
 
     // 2. Reopen from disk and verify 100% of data survived
-    let log2 = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    let (log2, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
     assert_eq!(log2.head_seq().get(), 10);
 
     let (deltas, has_more) = log2
@@ -54,10 +54,10 @@ fn test_tiered_log_write_through_and_crash_recovery() {
 fn test_tiered_log_hot_buffer_fast_read() {
     let dir = tempdir().unwrap();
     let policy = RoomLifecyclePolicy::default();
-    let mut log = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
 
     for i in 1..=5 {
-        log.append(make_test_op(i)).unwrap();
+        log.append(make_test_op(i), None).unwrap();
     }
 
     // Read range from cursor 2 with limit 2 (should return 3 and 4 with has_more = true)
@@ -96,10 +96,10 @@ fn test_tiered_log_warm_segment_rotation() {
         ..Default::default()
     };
 
-    let mut log = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
 
     for i in 1..=6 {
-        log.append(make_test_op(i)).unwrap();
+        log.append(make_test_op(i), None).unwrap();
     }
 
     // Verify segments directory contains sealed segment and active.wal
@@ -131,10 +131,10 @@ fn test_tiered_log_cold_compression_and_read() {
         max_room_disk_bytes: 50 * 1024 * 1024,
     };
 
-    let mut log = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
 
     for i in 1..=5 {
-        log.append(make_test_op(i)).unwrap();
+        log.append(make_test_op(i), None).unwrap();
     }
     // Force rotate to seal segment 1..5 into .wal
     log.force_rotate_warm().unwrap();
@@ -183,11 +183,11 @@ fn test_tiered_log_multi_tier_continuous_fetch() {
         max_room_disk_bytes: 50 * 1024 * 1024,
     };
 
-    let mut log = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
 
     // 1. Operations 1..=5 -> Seal & compress to Cold
     for i in 1..=5 {
-        log.append(make_test_op(i)).unwrap();
+        log.append(make_test_op(i), None).unwrap();
     }
     log.force_rotate_warm().unwrap();
     sleep(Duration::from_millis(20));
@@ -195,13 +195,13 @@ fn test_tiered_log_multi_tier_continuous_fetch() {
 
     // 2. Operations 6..=10 -> Seal to Warm (without compressing to cold)
     for i in 6..=10 {
-        log.append(make_test_op(i)).unwrap();
+        log.append(make_test_op(i), None).unwrap();
     }
     log.force_rotate_warm().unwrap();
 
     // 3. Operations 11..=15 -> Active in RAM HotBuffer and active.wal
     for i in 11..=15 {
-        log.append(make_test_op(i)).unwrap();
+        log.append(make_test_op(i), None).unwrap();
     }
 
     assert_eq!(log.head_seq().get(), 15);
@@ -243,11 +243,11 @@ fn test_tiered_log_behind_compaction_eviction() {
         max_room_disk_bytes: 50 * 1024 * 1024,
     };
 
-    let mut log = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
 
     // 1. Create Cold segment 1..=5
     for i in 1..=5 {
-        log.append(make_test_op(i)).unwrap();
+        log.append(make_test_op(i), None).unwrap();
     }
     log.force_rotate_warm().unwrap();
     sleep(Duration::from_millis(20));
@@ -255,7 +255,7 @@ fn test_tiered_log_behind_compaction_eviction() {
 
     // 2. Append 6..=10
     for i in 6..=10 {
-        log.append(make_test_op(i)).unwrap();
+        log.append(make_test_op(i), None).unwrap();
     }
 
     // 3. Wait past cold_disk_ttl and run maintenance to prune Cold segment 1..=5
@@ -286,12 +286,12 @@ fn test_tiered_log_behind_compaction_eviction() {
 fn test_tiered_log_strict_contiguity_and_monotonicity() {
     let dir = tempdir().unwrap();
     let policy = RoomLifecyclePolicy::default();
-    let mut log = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
 
-    log.append(make_test_op(1)).unwrap();
+    log.append(make_test_op(1), None).unwrap();
 
     // Attempting to append sequence 3 directly (gap) must be rejected
-    let err = log.append(make_test_op(3)).unwrap_err();
+    let err = log.append(make_test_op(3), None).unwrap_err();
     match err {
         ServerError::Wal(msg) => {
             assert!(msg.contains("Non-contiguous sequence"));
@@ -304,17 +304,17 @@ fn test_tiered_log_strict_contiguity_and_monotonicity() {
 fn test_tiered_log_proactive_pruning_by_cursor() {
     let dir = tempdir().unwrap();
     let policy = RoomLifecyclePolicy::default();
-    let mut log = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
 
     // 1. Append 1..=5 and rotate to sealed Warm segment
     for i in 1..=5 {
-        log.append(make_test_op(i)).unwrap();
+        log.append(make_test_op(i), None).unwrap();
     }
     log.force_rotate_warm().unwrap();
 
     // 2. Append 6..=10 and rotate to sealed Warm segment
     for i in 6..=10 {
-        log.append(make_test_op(i)).unwrap();
+        log.append(make_test_op(i), None).unwrap();
     }
     log.force_rotate_warm().unwrap();
 

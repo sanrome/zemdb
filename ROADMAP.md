@@ -96,12 +96,13 @@
 * Verificación integral del workspace con 68 tests pasando (38 en `rimdb-core`, 29 en `rimdb-storage`, 1 en `rimdb-client`), cero warnings en Clippy (`-D warnings`) y compilación limpia hacia `wasm32-unknown-unknown`.
 * Fase 3.5-A.1: Corrección de desfase off-by-one en catchup 1-RTT (`C-01`), propagación estricta de `BehindCompaction` sin supresión (`C-02`), idempotencia de `Commit` con entrega de mutación original (`M-02`), y rediseño de Onboarding con estado `Bootstrapping`, ancla de retención de snapshots y apretón de manos enriquecido (`C-08`).
 * Fase 3.5-A.2: Autenticación universal y blindaje de Data Plane con extractor Axum `ClientAuth` (`C-03`), validación estricta de 3 vías en URL path vs token vs payload (`M-07`), comparación de firmas y secretos en tiempo constante con `subtle::ConstantTimeEq` (`M-04`) y erradicación definitiva del backdoor `dev-token` (`M-05`).
+* Fase 3.5-A.3: Persistencia atómica unificada y recuperación robusta ante caídas: erradicación del Dual-WAL (`C-04`, `A-02`, `M-11`) unificando persistencia y deduplicación en `active.wal` con un solo `fsync` por commit, filtrado estricto de operaciones previas a snapshot (`C-05`), autorrecuperación y truncado limpio de torn writes en EOF con CRC fallido (`C-06`) y bufferizado de lotes multi-operación en `WalReader` (`C-07`).
 
 ---
 
 ## 2. Resumen Ejecutivo del Estado del Proyecto
 
-RimDB ha superado con éxito la **Fase 1 y 1.5 (Reestructuración, Blindaje de Core e Higiene de Workspace)**, la **Fase 2A (Contrato Formal de Persistencia, Pushdown de Queries y Motor en Memoria)**, la **Fase 2B (Motor de Almacenamiento en Disco con WAL y Compresión Zstd)**, la **Fase 3 (Servidor de Coordinación por Actores `rimdb-server`)** y los hitos de remediación **Fase 3.5-A.1 y Fase 3.5-A.2 (Catchup 1-RTT, Onboarding con Bootstrapping, Autenticación Universal y Blindaje de Data Plane)**. El backend del servidor y los crates centrales se encuentran completamente verificados con pruebas unitarias y de integración end-to-end:
+RimDB ha superado con éxito la **Fase 1 y 1.5 (Reestructuración, Blindaje de Core e Higiene de Workspace)**, la **Fase 2A (Contrato Formal de Persistencia, Pushdown de Queries y Motor en Memoria)**, la **Fase 2B (Motor de Almacenamiento en Disco con WAL y Compresión Zstd)**, la **Fase 3 (Servidor de Coordinación por Actores `rimdb-server`)** y los hitos de remediación **Fase 3.5-A.1, Fase 3.5-A.2 y Fase 3.5-A.3 (Catchup 1-RTT, Onboarding con Bootstrapping, Autenticación Universal y Persistencia Atómica Unificada)**. El backend del servidor y los crates centrales se encuentran completamente verificados con pruebas unitarias y de integración end-to-end:
 - Se redujo el footprint de memoria de `Value` en un 40% (24 bytes) y `PrimaryKey` a 40 bytes (ajustado a una línea de caché L1 de CPU).
 - Se garantizó la estabilidad binaria de esquemas con orden DDL físico en `TableSchema` y conversiones zero-copy por movimiento.
 - Se cerró la pérdida de datos y anomalías de tuplas zombi en `squash_operations`.
@@ -406,6 +407,13 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
   Cualquier discrepancia es rechazada en el perímetro HTTP con `401 Unauthorized` / `ErrorCode::Unauthorized`.
 * **Comparaciones en Tiempo Constante (`M-04`):** Integración de `subtle::ConstantTimeEq` para validaciones de firmas BLAKE3 y de la cabecera `X-Admin-Secret`, eliminando vulnerabilidades de canal lateral por análisis de tiempos de ejecución (*timing attacks*).
 * **Erradicación del Backdoor `dev-token` (`M-05`):** Eliminación total de puertas traseras de desarrollo en código de producción; la verificación de tokens exige siempre firma criptográfica válida y clave secreta activa.
+
+#### 4.3.B.3. Fase 3.5-A.3: Persistencia Atómica Unificada y Recuperación de Fallos
+* **Erradicación del Dual-WAL y Unificación en `active.wal` (`C-04`, `A-02`, `M-11`):** Eliminación completa del motor secundario `MicroWal` y los archivos `meta_{room_id}.wal`. La persistencia de secuencias, mutaciones y deduplicación se unificó en el log WAL principal codificando `mutation_id: Option<MutationId>` en la trama atómica (`WalBatchPayload`). Cada commit ejecuta un único `sync_data()`, reduciendo a la mitad la latencia de fsync y eliminando por completo cualquier posibilidad de desfase o desincronización en caídas del servidor.
+* **Hidratación de Caché LRU de Deduplicación desde el Log (`C-04`):** `DedupLruCache` se hidrata directamente a partir de las tuplas `(MutationId, SequenceNumber)` recuperadas cronológicamente de los segmentos Warm y Cold en el arranque, garantizando semántica Exactly-Once sin fugas de memoria.
+* **Filtrado de Secuencias en Replay de Base Snapshot (`C-05`):** `recover_room` filtra estrictamente las operaciones en el WAL que tengan `op.seq <= snapshot_seq`, impidiendo que deltas históricos obsoletos sobrescriban el estado consolidado del snapshot base.
+* **Auto-recuperación y Truncado de Torn Writes en EOF (`C-06`):** `decode_wal_batch_from_slice` detecta fallos de CRC32 en el registro terminal del archivo sin tramas válidas posteriores como `WalBatchDecodeResult::TornWrite`, truncando el archivo físicamente a la longitud válida previa (`valid_wal_bytes`) y permitiendo reiniciar el motor sin errores fatales de corrupción.
+* **Bufferizado de Lotes Multi-Operación en `WalReader` (`C-07`):** Incorporación de una cola interna `pending_ops: VecDeque<SequencedOperation>` en `WalReader`, asegurando que `next_record()` itere y devuelva todas las operaciones de lotes agrupados sin omitir las posiciones $2..N$.
 
 ---
 

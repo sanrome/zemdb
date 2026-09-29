@@ -7,7 +7,7 @@ use rimdb_storage::format::{
     encode_wal_record, replay_wal_records, FileHeader, WalBatchDecodeResult, WalDecodeResult,
     BATCH_HEADER_SIZE, BATCH_MAGIC, HEADER_SIZE, MAGIC_BYTES,
 };
-use rimdb_storage::{DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError};
+use rimdb_storage::{DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError, WalReader};
 
 const USERS_TABLE: u16 = 0;
 
@@ -65,7 +65,7 @@ fn test_wal_record_encode_decode_clean() {
         Operation::insert(USERS_TABLE, PrimaryKey::single(1i64), row, 1000),
     );
 
-    let encoded = encode_wal_record(&op).expect("encoding ok");
+    let encoded = encode_wal_record(&op, None).expect("encoding ok");
     assert!(encoded.len() > 8);
 
     let res = decode_wal_record_from_slice(&encoded).expect("decode ok");
@@ -73,6 +73,7 @@ fn test_wal_record_encode_decode_clean() {
         WalDecodeResult::Ok {
             op: decoded_op,
             bytes_consumed,
+            ..
         } => {
             assert_eq!(op, decoded_op);
             assert_eq!(bytes_consumed, encoded.len());
@@ -83,18 +84,28 @@ fn test_wal_record_encode_decode_clean() {
 
 #[test]
 fn test_wal_record_detects_crc_corruption() {
-    let row = CompactRow::new(vec![Value::Int(1)]);
-    let op = SequencedOperation::with_default_origin(
+    let row1 = CompactRow::new(vec![Value::Int(1)]);
+    let op1 = SequencedOperation::with_default_origin(
         1u64,
-        Operation::insert(USERS_TABLE, PrimaryKey::single(1i64), row, 100),
+        Operation::insert(USERS_TABLE, PrimaryKey::single(1i64), row1, 100),
+    );
+    let row2 = CompactRow::new(vec![Value::Int(2)]);
+    let op2 = SequencedOperation::with_default_origin(
+        2u64,
+        Operation::insert(USERS_TABLE, PrimaryKey::single(2i64), row2, 200),
     );
 
-    let mut encoded = encode_wal_record(&op).expect("encoding ok");
-    // Tamper with payload byte
-    let last_idx = encoded.len() - 1;
-    encoded[last_idx] ^= 0xFF;
+    let mut enc1 = encode_wal_record(&op1, None).expect("encoding ok");
+    let enc2 = encode_wal_record(&op2, None).expect("encoding ok");
 
-    let err = decode_wal_record_from_slice(&encoded).unwrap_err();
+    // Tamper with payload byte of first record
+    let last_idx = enc1.len() - 1;
+    enc1[last_idx] ^= 0xFF;
+
+    let mut combined = enc1;
+    combined.extend_from_slice(&enc2);
+
+    let err = decode_wal_record_from_slice(&combined).unwrap_err();
     assert!(matches!(err, StorageError::WalCorruption(_)));
 }
 
@@ -112,8 +123,8 @@ fn test_wal_replay_detects_torn_write_and_recovers_valid_prefix() {
         Operation::insert(USERS_TABLE, PrimaryKey::single(2i64), row2, 200),
     );
 
-    let enc1 = encode_wal_record(&op1).unwrap();
-    let enc2 = encode_wal_record(&op2).unwrap();
+    let enc1 = encode_wal_record(&op1, None).unwrap();
+    let enc2 = encode_wal_record(&op2, None).unwrap();
 
     let mut wal_buffer = Vec::new();
     wal_buffer.extend_from_slice(&enc1);
@@ -140,30 +151,78 @@ async fn test_disk_wal_crc32_corruption_detection() {
 
     engine.open_room(&room_id, schema.clone()).await.unwrap();
 
+    let row1 = CompactRow::new(vec![
+        Value::Int(10),
+        Value::String("First".into()),
+        Value::Int(50),
+        Value::Bool(true),
+    ]);
+    let row2 = CompactRow::new(vec![
+        Value::Int(20),
+        Value::String("Second".into()),
+        Value::Int(60),
+        Value::Bool(false),
+    ]);
+    let ops1 = vec![SequencedOperation::with_default_origin(
+        1u64,
+        Operation::insert(USERS_TABLE, PrimaryKey::single(10i64), row1, 10),
+    )];
+    let ops2 = vec![SequencedOperation::with_default_origin(
+        2u64,
+        Operation::insert(USERS_TABLE, PrimaryKey::single(20i64), row2, 20),
+    )];
+    engine.apply_batch(&room_id, ops1).await.unwrap();
+    engine.apply_batch(&room_id, ops2).await.unwrap();
+    engine.close_room(&room_id).await.unwrap();
+
+    // Corrupt an intermediate WAL record in the file (op 1 followed by valid op 2)
+    let file_path = temp_dir.path().join("room_room-corrupt.wal");
+    let mut file_bytes = tokio::fs::read(&file_path).await.unwrap();
+    // Tamper with payload byte inside first record
+    file_bytes[20] ^= 0xFF;
+    tokio::fs::write(&file_path, &file_bytes).await.unwrap();
+
+    // Reopening should detect WAL corruption because valid data follows the corrupt record
+    let engine2 = DiskStorageEngine::new(options);
+    let err = engine2.open_room(&room_id, schema).await.unwrap_err();
+    assert!(matches!(err, StorageError::WalCorruption(_)));
+}
+
+#[tokio::test]
+async fn test_disk_wal_crc32_torn_write_at_eof_recovers() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let options = DiskStorageOptions::new(temp_dir.path());
+    let engine = DiskStorageEngine::new(options.clone());
+    let room_id = RoomId::new("room-torn-crc");
+    let schema = test_schema();
+
+    engine.open_room(&room_id, schema.clone()).await.unwrap();
+
     let row = CompactRow::new(vec![
         Value::Int(10),
-        Value::String("Test".into()),
+        Value::String("Valid".into()),
         Value::Int(50),
         Value::Bool(true),
     ]);
     let ops = vec![SequencedOperation::with_default_origin(
         1u64,
-        Operation::insert(USERS_TABLE, PrimaryKey::single(10i64), row, 10),
+        Operation::insert(USERS_TABLE, PrimaryKey::single(10i64), row.clone(), 10),
     )];
     engine.apply_batch(&room_id, ops).await.unwrap();
     engine.close_room(&room_id).await.unwrap();
 
-    // Corrupt the WAL payload byte in the file
-    let file_path = temp_dir.path().join("room_room-corrupt.wal");
+    // Tamper with the last byte at EOF simulating an interrupted final batch write
+    let file_path = temp_dir.path().join("room_room-torn-crc.wal");
     let mut file_bytes = tokio::fs::read(&file_path).await.unwrap();
     let last_idx = file_bytes.len() - 1;
     file_bytes[last_idx] ^= 0xFF;
     tokio::fs::write(&file_path, &file_bytes).await.unwrap();
 
-    // Reopening should detect WAL corruption
+    // Reopening should cleanly recover and treat the terminal corrupted batch as a torn write
     let engine2 = DiskStorageEngine::new(options);
-    let err = engine2.open_room(&room_id, schema).await.unwrap_err();
-    assert!(matches!(err, StorageError::WalCorruption(_)));
+    engine2.open_room(&room_id, schema).await.unwrap();
+    let head = engine2.get_head_seq(&room_id).await.unwrap();
+    assert_eq!(head, SequenceNumber::from(0u64));
 }
 
 #[tokio::test]
@@ -310,7 +369,7 @@ fn test_wal_batch_framing_roundtrip() {
         ),
     ];
 
-    let encoded_batch = encode_wal_batch(&ops).expect("encode batch ok");
+    let encoded_batch = encode_wal_batch(&ops, None).expect("encode batch ok");
     assert_eq!(&encoded_batch[0..2], &BATCH_MAGIC);
 
     let res = decode_wal_batch_from_slice(&encoded_batch).expect("decode batch ok");
@@ -318,6 +377,7 @@ fn test_wal_batch_framing_roundtrip() {
         WalBatchDecodeResult::Ok {
             ops: decoded_ops,
             bytes_consumed,
+            ..
         } => {
             assert_eq!(decoded_ops.len(), 2);
             assert_eq!(decoded_ops, ops);
@@ -642,6 +702,141 @@ async fn test_wal_recovery_truncates_zero_filled_tail_at_eof() {
     let row2 = engine_final.get(&room_id, "users", &PrimaryKey::single(20i64)).await.unwrap().unwrap();
     assert_eq!(row1.values[0], Value::Int(10));
     assert_eq!(row2.values[0], Value::Int(20));
+}
+
+#[test]
+fn test_wal_reader_multi_op_batch_iteration_buffered() {
+    let row1 = CompactRow::new(vec![Value::Int(1), Value::String("Alice".into())]);
+    let op1 = SequencedOperation::with_default_origin(
+        1u64,
+        Operation::insert(USERS_TABLE, PrimaryKey::single(1i64), row1, 100),
+    );
+    let row2 = CompactRow::new(vec![Value::Int(2), Value::String("Bob".into())]);
+    let op2 = SequencedOperation::with_default_origin(
+        2u64,
+        Operation::insert(USERS_TABLE, PrimaryKey::single(2i64), row2, 101),
+    );
+    let row3 = CompactRow::new(vec![Value::Int(3), Value::String("Charlie".into())]);
+    let op3 = SequencedOperation::with_default_origin(
+        3u64,
+        Operation::insert(USERS_TABLE, PrimaryKey::single(3i64), row3, 102),
+    );
+
+    let batch = vec![op1.clone(), op2.clone(), op3.clone()];
+    let encoded = encode_wal_batch(&batch, None).expect("encode batch");
+
+    let mut reader = WalReader::new(&encoded);
+
+    match reader.next_record().expect("read record 1") {
+        WalDecodeResult::Ok { op, .. } => assert_eq!(op, op1),
+        other => panic!("expected record 1, got {:?}", other),
+    }
+
+    match reader.next_record().expect("read record 2") {
+        WalDecodeResult::Ok { op, .. } => assert_eq!(op, op2),
+        other => panic!("expected record 2, got {:?}", other),
+    }
+
+    match reader.next_record().expect("read record 3") {
+        WalDecodeResult::Ok { op, .. } => assert_eq!(op, op3),
+        other => panic!("expected record 3, got {:?}", other),
+    }
+
+    match reader.next_record().expect("clean eof") {
+        WalDecodeResult::CleanEof => {}
+        other => panic!("expected CleanEof, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_wal_replay_skips_operations_before_snapshot_seq() {
+    use rimdb_core::ColumnUpdate;
+    use std::io::Write;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let options = DiskStorageOptions::new(tmp.path());
+    let schema = test_schema();
+    let room_id = RoomId::new("room_skip_snapshot_seq");
+
+    // 1. Initialize room and insert row at seq 1
+    let engine = DiskStorageEngine::new(options.clone());
+    engine.open_room(&room_id, schema.clone()).await.unwrap();
+
+    let op1 = SequencedOperation::with_default_origin(
+        1u64,
+        Operation::insert(
+            USERS_TABLE,
+            PrimaryKey::single(1i64),
+            CompactRow::new(vec![
+                Value::Int(1),
+                Value::String("Initial".into()),
+                Value::Int(10),
+                Value::Bool(true),
+            ]),
+            100,
+        ),
+    );
+    let op2 = SequencedOperation::with_default_origin(
+        2u64,
+        Operation::update(
+            USERS_TABLE,
+            PrimaryKey::single(1i64),
+            vec![ColumnUpdate::new(2, Value::Int(20))],
+            101,
+        ),
+    );
+    engine.apply_batch(&room_id, vec![op1, op2]).await.unwrap();
+
+    // 2. Compact room creating snapshot at seq 2 and truncating WAL
+    engine.compact_room(&room_id).await.unwrap();
+    assert_eq!(engine.get_head_seq(&room_id).await.unwrap(), SequenceNumber::from(2u64));
+    engine.close_room(&room_id).await.unwrap();
+
+    // 3. Manually append to WAL: an obsolete op with seq 1 (or 2) that tries to revert score to 999,
+    //    followed by a new op with seq 3 setting score to 30.
+    let wal_path = tmp.path().join("room_room_skip_snapshot_seq.wal");
+    let stale_op = SequencedOperation::with_default_origin(
+        1u64,
+        Operation::update(
+            USERS_TABLE,
+            PrimaryKey::single(1i64),
+            vec![ColumnUpdate::new(2, Value::Int(999))],
+            102,
+        ),
+    );
+    let new_op = SequencedOperation::with_default_origin(
+        3u64,
+        Operation::update(
+            USERS_TABLE,
+            PrimaryKey::single(1i64),
+            vec![ColumnUpdate::new(2, Value::Int(30))],
+            103,
+        ),
+    );
+
+    let stale_bytes = encode_wal_batch(&[stale_op], None).unwrap();
+    let new_bytes = encode_wal_batch(&[new_op], None).unwrap();
+
+    let mut wal_file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&wal_path)
+        .unwrap();
+    wal_file.write_all(&stale_bytes).unwrap();
+    wal_file.write_all(&new_bytes).unwrap();
+    wal_file.sync_all().unwrap();
+
+    // 4. Reopen room: recovery must skip stale_op (seq 1 <= snapshot_seq 2) and only apply new_op (seq 3)
+    let engine_rec = DiskStorageEngine::new(options);
+    engine_rec.open_room(&room_id, schema).await.unwrap();
+
+    assert_eq!(engine_rec.get_head_seq(&room_id).await.unwrap(), SequenceNumber::from(3u64));
+    let row = engine_rec
+        .get(&room_id, "users", &PrimaryKey::single(1i64))
+        .await
+        .unwrap()
+        .expect("row exists");
+    // If stale_op had been replayed, score might have been 999 or caused sequence violation.
+    assert_eq!(row.values[2], Value::Int(30));
 }
 
 

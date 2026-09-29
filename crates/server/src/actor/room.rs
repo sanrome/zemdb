@@ -17,7 +17,6 @@ use crate::config::ServerConfig;
 use crate::dedup::DedupLruCache;
 use crate::error::ServerError;
 use crate::log::{RoomLifecyclePolicy, TieredLog};
-use crate::micro_wal::MicroWal;
 use crate::relay::SnapshotRelay;
 
 /// Dedicated single-writer Tokio actor managing state, sequencing, durability, and synchronization for a single room.
@@ -25,7 +24,6 @@ pub struct RoomActor {
     room_id: RoomId,
     schema_id: SchemaId,
     schema: Arc<Schema>,
-    micro_wal: MicroWal,
     dedup_cache: DedupLruCache,
     tiered_log: TieredLog,
     lease_tracker: ClientLeaseTracker,
@@ -50,21 +48,18 @@ impl RoomActor {
         let room_dir = data_dir.as_ref().join("rooms").join(room_id.as_str());
         fs::create_dir_all(&room_dir)?;
 
-        let wal_path = room_dir.join(format!("meta_{}.wal", room_id.as_str()));
         let clients_path = room_dir.join(format!("meta_clients_{}.json", room_id.as_str()));
 
-        // 1. Recover Micro-WAL
-        let (micro_wal, wal_recovery) = MicroWal::open_or_create(&wal_path)?;
+        // 1. Open or recover 4-tier delta log and recovered mutations
+        let (tiered_log, recovered_mutations) =
+            TieredLog::open_or_create(&room_dir, lifecycle_policy.clone())?;
 
-        // 2. Hydrate deduplication LRU cache
+        // 2. Hydrate deduplication LRU cache from log
         let mut dedup_cache = DedupLruCache::new(config.dedup_lru_capacity);
-        dedup_cache.hydrate(wal_recovery.entries);
+        dedup_cache.hydrate(recovered_mutations);
 
-        // 3. Open or recover 4-tier delta log
-        let tiered_log = TieredLog::open_or_create(&room_dir, lifecycle_policy.clone())?;
-
-        // Reconcile monotonic head sequence
-        let head_seq = std::cmp::max(wal_recovery.head_seq, tiered_log.head_seq());
+        // 3. Monotonic head sequence derived directly from TieredLog
+        let head_seq = tiered_log.head_seq();
 
         // 4. Open client lease tracker
         let lease_tracker = ClientLeaseTracker::open_or_create(&clients_path)?;
@@ -79,7 +74,6 @@ impl RoomActor {
             room_id: room_id.clone(),
             schema_id,
             schema,
-            micro_wal,
             dedup_cache,
             tiered_log,
             lease_tracker,
@@ -292,10 +286,11 @@ impl RoomActor {
 
         // 4. Assign strictly monotonic sequence number
         let new_seq = self.head_seq.next();
+        let seq_op = SequencedOperation::new(new_seq, op);
 
-        // 5. Durable synchronous Micro-WAL append (torn write and crash protection)
-        if let Err(err) = self.micro_wal.append(new_seq, &mutation_id, &client_id) {
-            error!(room = %self.room_id, error = %err, "MicroWal append failure");
+        // 5. Write-Through append to TieredLog (Hot Buffer RAM + synchronous active.wal disk sync with mutation_id)
+        if let Err(err) = self.tiered_log.append(seq_op.clone(), Some(mutation_id)) {
+            error!(room = %self.room_id, error = %err, "TieredLog append failure");
             let _ = reply.send(Err(err));
             return;
         }
@@ -303,15 +298,7 @@ impl RoomActor {
         // 6. Record in DedupLruCache
         self.dedup_cache.record(mutation_id, new_seq);
 
-        // 7. Write-Through append to TieredLog (Hot Buffer RAM + synchronous active.wal disk sync)
-        let seq_op = SequencedOperation::new(new_seq, op);
-        if let Err(err) = self.tiered_log.append(seq_op.clone()) {
-            error!(room = %self.room_id, error = %err, "TieredLog append failure");
-            let _ = reply.send(Err(err));
-            return;
-        }
-
-        // 8. Advance local head sequence
+        // 7. Advance local head sequence
         self.head_seq = new_seq;
 
         // 9. Update client lease activity (cursor advances exclusively via explicit Ack)

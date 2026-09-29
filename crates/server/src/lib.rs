@@ -4,7 +4,6 @@ pub mod config;
 pub mod dedup;
 pub mod error;
 pub mod log;
-pub mod micro_wal;
 pub mod relay;
 pub mod schema_registry;
 
@@ -19,8 +18,7 @@ pub use api::{
 pub use config::ServerConfig;
 pub use dedup::DedupLruCache;
 pub use error::ServerError;
-pub use log::{MaintenanceReport, PruneReport, RoomLifecyclePolicy, TieredLog};
-pub use micro_wal::{MicroWal, MicroWalEntry, MicroWalRecovery};
+pub use log::{MaintenanceReport, PruneReport, RoomLifecyclePolicy, TieredLog, WarmDiskLog};
 pub use relay::SnapshotRelay;
 pub use schema_registry::SchemaRegistry;
 
