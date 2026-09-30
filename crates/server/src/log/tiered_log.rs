@@ -127,23 +127,20 @@ impl TieredLog {
         // 1. Write-Through to Warm Disk
         self.warm_disk.append_record(&op, mutation_id)?;
 
-        // 2. Add to RAM HotBuffer
+        // 2. Add to RAM HotBuffer and maintain sliding window
         self.hot_buffer.append(op)?;
+        self.hot_buffer
+            .apply_sliding_window(self.policy.ram_max_ops, self.policy.ram_ttl);
 
         if self.tail_seq.get() == 0 {
             self.tail_seq = self.head_seq.next();
         }
         self.head_seq = self.head_seq.next();
 
-        // 3. Segment rotation check
-        if self.hot_buffer.should_rotate(&self.policy) {
-            if let Some(sealed_path) = self.warm_disk.rotate_active_segment()? {
-                if let Some(filename) = sealed_path.file_name().and_then(|n| n.to_str()) {
-                    if let Some((_start, end)) = crate::log::warm_disk::parse_segment_filename(filename, ".wal") {
-                        self.hot_buffer.evict_older_than(SequenceNumber::new(end + 1));
-                    }
-                }
-            }
+        // 3. Segment rotation check: rotate active segment on disk when size threshold is reached,
+        // retaining recent operations in the RAM HotBuffer sliding window without destructive eviction to zero.
+        if self.warm_disk.active_ops_count() >= self.policy.ram_max_ops {
+            self.warm_disk.rotate_active_segment()?;
         }
 
         Ok(())
@@ -168,6 +165,18 @@ impl TieredLog {
         }
 
         let limit = max_batch_size as usize;
+
+        // 1. Fast Path (Tier 1: HotBuffer in RAM)
+        // If the requested cursor falls within the current RAM buffer window, serve directly
+        // from memory in sub-microsecond time without touching disk or executing system calls.
+        if let Some(min_ram) = self.hot_buffer.min_seq() {
+            if from_seq >= min_ram {
+                let ops = self.hot_buffer.get_range(from_seq, limit);
+                let has_more = ops.last().is_some_and(|last| last.seq.get() < self.head_seq.get());
+                return Ok((ops, has_more));
+            }
+        }
+
         let mut collected: Vec<SequencedOperation> = Vec::with_capacity(limit.min(1024));
         let mut current_from = from_seq;
         let segments_dir = self.dir.join("segments");
@@ -244,13 +253,13 @@ impl TieredLog {
         Ok((collected, has_more))
     }
 
-    /// Background maintenance task: compresses aged warm segments to cold Zstd segments,
-    /// and prunes expired cold segments according to retention time and disk space quota.
-    pub fn run_maintenance(&mut self) -> Result<MaintenanceReport, ServerError> {
+    /// Background maintenance task: compresses aged warm segments to cold Zstd segments
+    /// delegating heavy CPU encoding to `spawn_blocking`, and prunes expired cold segments.
+    pub async fn run_maintenance(&mut self) -> Result<MaintenanceReport, ServerError> {
         let mut report = MaintenanceReport::default();
         let segments_dir = self.dir.join("segments");
 
-        // 1. Compress aged sealed Warm segments to Cold Disk (.wal.zst)
+        // 1. Compress aged sealed Warm segments to Cold Disk (.wal.zst) asynchronously
         let sealed_warm = self.warm_disk.list_sealed_segments()?;
         let now = SystemTime::now();
 
@@ -267,10 +276,48 @@ impl TieredLog {
                 );
                 let cold_path = segments_dir.join(cold_name);
 
-                ColdDiskLog::compress_warm_segment(&sealed.path, &cold_path)?;
+                ColdDiskLog::compress_warm_segment(&sealed.path, &cold_path).await?;
                 report.warm_compressed_count += 1;
             }
         }
+
+        self.prune_and_update_tail(&mut report)?;
+        Ok(report)
+    }
+
+    /// Synchronous variant of `run_maintenance` for synchronous callers and tests.
+    pub fn run_maintenance_sync(&mut self) -> Result<MaintenanceReport, ServerError> {
+        let mut report = MaintenanceReport::default();
+        let segments_dir = self.dir.join("segments");
+
+        let sealed_warm = self.warm_disk.list_sealed_segments()?;
+        let now = SystemTime::now();
+
+        for sealed in sealed_warm {
+            let metadata = std::fs::metadata(&sealed.path)?;
+            let modified = metadata.modified().unwrap_or(now);
+            let age = now.duration_since(modified).unwrap_or_default();
+
+            if age >= self.policy.warm_disk_ttl {
+                let cold_name = format!(
+                    "segment_{:016}_{:016}.wal.zst",
+                    sealed.start_seq.get(),
+                    sealed.end_seq.get()
+                );
+                let cold_path = segments_dir.join(cold_name);
+
+                ColdDiskLog::compress_warm_segment_sync(&sealed.path, &cold_path)?;
+                report.warm_compressed_count += 1;
+            }
+        }
+
+        self.prune_and_update_tail(&mut report)?;
+        Ok(report)
+    }
+
+    fn prune_and_update_tail(&mut self, report: &mut MaintenanceReport) -> Result<(), ServerError> {
+        let segments_dir = self.dir.join("segments");
+        let now = SystemTime::now();
 
         // 2. Prune expired or over-quota Cold Disk segments
         let mut cold_segments = ColdDiskLog::list_cold_segments(&segments_dir)?;
@@ -284,6 +331,7 @@ impl TieredLog {
         }
 
         let mut to_delete = Vec::new();
+        let mut max_pruned_seq: Option<SequenceNumber> = None;
 
         for cold in &cold_segments {
             let metadata = std::fs::metadata(&cold.path)?;
@@ -295,6 +343,10 @@ impl TieredLog {
                 to_delete.push(cold.path.clone());
                 total_disk_bytes = total_disk_bytes.saturating_sub(metadata.len());
                 report.cold_pruned_count += 1;
+                max_pruned_seq = Some(match max_pruned_seq {
+                    Some(cur) => cur.max(cold.end_seq),
+                    None => cold.end_seq,
+                });
             }
         }
 
@@ -302,6 +354,11 @@ impl TieredLog {
             if path.exists() {
                 std::fs::remove_file(path)?;
             }
+        }
+
+        if let Some(pruned_end) = max_pruned_seq {
+            self.hot_buffer
+                .evict_older_than(SequenceNumber::new(pruned_end.get() + 1));
         }
 
         // 3. Update tail_seq to the oldest retained sequence
@@ -320,7 +377,7 @@ impl TieredLog {
         }
 
         report.new_tail_seq = self.tail_seq;
-        Ok(report)
+        Ok(())
     }
 
     /// Highest sequence number committed to the log.
@@ -333,16 +390,9 @@ impl TieredLog {
         self.tail_seq
     }
 
-    /// Force rotates the active Warm segment immediately.
+    /// Force rotates the active Warm segment immediately without evicting the RAM HotBuffer.
     pub fn force_rotate_warm(&mut self) -> Result<Option<PathBuf>, ServerError> {
         let sealed = self.warm_disk.rotate_active_segment()?;
-        if let Some(ref path) = sealed {
-            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                if let Some((_start, end)) = crate::log::warm_disk::parse_segment_filename(filename, ".wal") {
-                    self.hot_buffer.evict_older_than(SequenceNumber::new(end + 1));
-                }
-            }
-        }
         Ok(sealed)
     }
 

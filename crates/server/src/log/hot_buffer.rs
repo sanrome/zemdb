@@ -43,18 +43,58 @@ impl HotBuffer {
         Ok(())
     }
 
-    /// Retrieves a contiguous slice of operations strictly after `from_seq` up to `limit`.
+    /// Retrieves a contiguous slice of operations strictly after `from_seq` up to `limit` in O(1) time.
+    ///
+    /// Exploits the strictly contiguous and monotonic sequence invariant of the hot buffer
+    /// (`seq == min_seq + offset`) to compute the initial offset in constant time without linear filtering.
     pub fn get_range(&self, from_seq: SequenceNumber, limit: usize) -> Vec<SequencedOperation> {
-        if limit == 0 {
+        if limit == 0 || self.entries.is_empty() {
             return Vec::new();
         }
 
+        let min = match self.min_seq {
+            Some(m) => m.get(),
+            None => return Vec::new(),
+        };
+
+        let start_idx = if from_seq.get() < min {
+            0
+        } else {
+            (from_seq.get() + 1 - min) as usize
+        };
+
+        if start_idx >= self.entries.len() {
+            return Vec::new();
+        }
+
+        let take_count = limit.min(self.entries.len() - start_idx);
         self.entries
-            .iter()
-            .filter(|(op, _)| op.seq.get() > from_seq.get())
-            .take(limit)
+            .range(start_idx..start_idx + take_count)
             .map(|(op, _)| op.clone())
             .collect()
+    }
+
+    /// Enforces a continuous sliding window policy based on maximum capacity and retention TTL.
+    ///
+    /// Evicts aged or overflow deltas gradually from the front of the queue, ensuring
+    /// recent operations remain buffered in RAM without dropping capacity to zero upon rotation.
+    pub fn apply_sliding_window(&mut self, max_ops: usize, ttl: std::time::Duration) {
+        while self.entries.len() > max_ops {
+            self.entries.pop_front();
+        }
+
+        while let Some((_, time)) = self.entries.front() {
+            if time.elapsed() >= ttl {
+                self.entries.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        self.min_seq = self.entries.front().map(|(op, _)| op.seq);
+        if self.entries.is_empty() {
+            self.max_seq = None;
+        }
     }
 
     /// Checks if the buffer has exceeded capacity or TTL thresholds according to the lifecycle policy.

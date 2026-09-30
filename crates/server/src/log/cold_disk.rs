@@ -11,11 +11,11 @@ use std::path::Path;
 pub struct ColdDiskLog;
 
 impl ColdDiskLog {
-    /// Compresses an uncompressed Warm Disk segment (.wal) into a Cold Disk segment (.wal.zst).
+    /// Compresses an uncompressed Warm Disk segment (.wal) into a Cold Disk segment (.wal.zst) synchronously.
     ///
     /// Writes to a `.tmp` file first, flushes, syncs, atomically renames over the destination,
     /// verifies readability, and deletes the uncompressed `.wal` file.
-    pub fn compress_warm_segment(warm_path: &Path, cold_path: &Path) -> Result<(), ServerError> {
+    pub fn compress_warm_segment_sync(warm_path: &Path, cold_path: &Path) -> Result<(), ServerError> {
         if !warm_path.exists() {
             return Err(ServerError::Wal(format!(
                 "Cannot compress non-existent warm segment: {:?}",
@@ -48,6 +48,19 @@ impl ColdDiskLog {
 
         std::fs::remove_file(warm_path)?;
         Ok(())
+    }
+
+    /// Asynchronously compresses a warm segment into a cold segment, delegating CPU-heavy
+    /// Zstandard encoding and disk operations to `tokio::task::spawn_blocking` to avoid stalling Tokio worker threads.
+    pub async fn compress_warm_segment(
+        warm_path: impl AsRef<Path>,
+        cold_path: impl AsRef<Path>,
+    ) -> Result<(), ServerError> {
+        let warm = warm_path.as_ref().to_path_buf();
+        let cold = cold_path.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || Self::compress_warm_segment_sync(&warm, &cold))
+            .await
+            .map_err(|e| ServerError::Internal(format!("Spawn blocking task failed: {}", e)))?
     }
 
     /// Reads operations within `(from_seq .. ]` up to `limit` from a compressed `.wal.zst` file.

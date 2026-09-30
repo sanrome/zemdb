@@ -120,8 +120,8 @@ fn test_tiered_log_warm_segment_rotation() {
     }
 }
 
-#[test]
-fn test_tiered_log_cold_compression_and_read() {
+#[tokio::test]
+async fn test_tiered_log_cold_compression_and_read() {
     let dir = tempdir().unwrap();
     let policy = RoomLifecyclePolicy {
         ram_max_ops: 5,
@@ -149,7 +149,7 @@ fn test_tiered_log_cold_compression_and_read() {
     sleep(Duration::from_millis(20));
 
     // Run background maintenance
-    let report = log.run_maintenance().unwrap();
+    let report = log.run_maintenance().await.unwrap();
     assert_eq!(report.warm_compressed_count, 1);
 
     // Sealed .wal should be removed, and .wal.zst created
@@ -172,8 +172,8 @@ fn test_tiered_log_cold_compression_and_read() {
     }
 }
 
-#[test]
-fn test_tiered_log_multi_tier_continuous_fetch() {
+#[tokio::test]
+async fn test_tiered_log_multi_tier_continuous_fetch() {
     let dir = tempdir().unwrap();
     let policy = RoomLifecyclePolicy {
         ram_max_ops: 100,
@@ -191,7 +191,7 @@ fn test_tiered_log_multi_tier_continuous_fetch() {
     }
     log.force_rotate_warm().unwrap();
     sleep(Duration::from_millis(20));
-    log.run_maintenance().unwrap();
+    log.run_maintenance().await.unwrap();
 
     // 2. Operations 6..=10 -> Seal to Warm (without compressing to cold)
     for i in 6..=10 {
@@ -232,14 +232,14 @@ fn test_tiered_log_multi_tier_continuous_fetch() {
     assert!(paged_has_more);
 }
 
-#[test]
-fn test_tiered_log_behind_compaction_eviction() {
+#[tokio::test]
+async fn test_tiered_log_behind_compaction_eviction() {
     let dir = tempdir().unwrap();
     let policy = RoomLifecyclePolicy {
         ram_max_ops: 100,
         ram_ttl: Duration::from_secs(3600),
         warm_disk_ttl: Duration::from_millis(10),
-        cold_disk_ttl: Duration::from_millis(10), // Fast cold pruning
+        cold_disk_ttl: Duration::from_millis(35), // Fast cold pruning
         max_room_disk_bytes: 50 * 1024 * 1024,
     };
 
@@ -250,8 +250,10 @@ fn test_tiered_log_behind_compaction_eviction() {
         log.append(make_test_op(i), None).unwrap();
     }
     log.force_rotate_warm().unwrap();
-    sleep(Duration::from_millis(20));
-    log.run_maintenance().unwrap();
+    sleep(Duration::from_millis(15));
+    let r1 = log.run_maintenance().await.unwrap();
+    assert_eq!(r1.warm_compressed_count, 1);
+    assert_eq!(r1.cold_pruned_count, 0);
 
     // 2. Append 6..=10
     for i in 6..=10 {
@@ -259,8 +261,8 @@ fn test_tiered_log_behind_compaction_eviction() {
     }
 
     // 3. Wait past cold_disk_ttl and run maintenance to prune Cold segment 1..=5
-    sleep(Duration::from_millis(20));
-    let report = log.run_maintenance().unwrap();
+    sleep(Duration::from_millis(40));
+    let report = log.run_maintenance().await.unwrap();
     assert_eq!(report.cold_pruned_count, 1);
     assert_eq!(log.tail_seq().get(), 6);
 
@@ -345,5 +347,143 @@ fn test_tiered_log_proactive_pruning_by_cursor() {
     assert_eq!(deltas.len(), 5);
     assert_eq!(deltas[0].seq.get(), 6);
     assert_eq!(deltas[4].seq.get(), 10);
+    assert!(!has_more);
+}
+
+#[test]
+fn test_tiered_log_hot_buffer_sliding_window_no_zero_eviction() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 5,
+        ..Default::default()
+    };
+
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+
+    // 1. Append operations 1..=5 (filling the RAM buffer and reaching the active segment limit)
+    for i in 1..=5 {
+        log.append(make_test_op(i), None).unwrap();
+    }
+
+    // 2. Append operation 6. This triggers disk rotation of the active WAL segment into segment_1_5.wal.
+    // The sliding window must pop the oldest element (1) and retain operations 2..=6 in RAM.
+    log.append(make_test_op(6), None).unwrap();
+
+    // Verify that operations 2..=6 can still be fetched directly from the RAM buffer window without zero-eviction
+    let (deltas, has_more) = log
+        .fetch_deltas(SequenceNumber::new(1), 10)
+        .unwrap();
+
+    assert_eq!(deltas.len(), 5);
+    assert_eq!(deltas[0].seq.get(), 2);
+    assert_eq!(deltas[4].seq.get(), 6);
+    assert!(!has_more);
+
+    // Fetching from cursor 4 returns 5 and 6
+    let (recent_deltas, recent_has_more) = log
+        .fetch_deltas(SequenceNumber::new(4), 10)
+        .unwrap();
+    assert_eq!(recent_deltas.len(), 2);
+    assert_eq!(recent_deltas[0].seq.get(), 5);
+    assert_eq!(recent_deltas[1].seq.get(), 6);
+    assert!(!recent_has_more);
+}
+
+#[test]
+fn test_tiered_log_hot_buffer_o1_range_query() {
+    let mut buffer = rimdb_server::log::HotBuffer::new();
+
+    // Appending contiguous operations 10..=20
+    for i in 10..=20 {
+        buffer.append(make_test_op(i)).unwrap();
+    }
+
+    assert_eq!(buffer.min_seq().unwrap().get(), 10);
+    assert_eq!(buffer.max_seq().unwrap().get(), 20);
+
+    // Query 1: from_seq older than min_seq
+    let res = buffer.get_range(SequenceNumber::new(5), 5);
+    assert_eq!(res.len(), 5);
+    assert_eq!(res[0].seq.get(), 10);
+    assert_eq!(res[4].seq.get(), 14);
+
+    // Query 2: from_seq exactly at min_seq
+    let res = buffer.get_range(SequenceNumber::new(10), 3);
+    assert_eq!(res.len(), 3);
+    assert_eq!(res[0].seq.get(), 11);
+    assert_eq!(res[2].seq.get(), 13);
+
+    // Query 3: from_seq in the middle
+    let res = buffer.get_range(SequenceNumber::new(15), 10);
+    assert_eq!(res.len(), 5);
+    assert_eq!(res[0].seq.get(), 16);
+    assert_eq!(res[4].seq.get(), 20);
+
+    // Query 4: from_seq equal to max_seq
+    let res = buffer.get_range(SequenceNumber::new(20), 5);
+    assert!(res.is_empty());
+
+    // Query 5: from_seq greater than max_seq
+    let res = buffer.get_range(SequenceNumber::new(25), 5);
+    assert!(res.is_empty());
+
+    // Query 6: limit 0
+    let res = buffer.get_range(SequenceNumber::new(10), 0);
+    assert!(res.is_empty());
+}
+
+#[test]
+fn test_tiered_log_hierarchical_cache_inversion() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 10,
+        ..Default::default()
+    };
+
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+
+    // Append 10 operations
+    for i in 1..=10 {
+        log.append(make_test_op(i), None).unwrap();
+    }
+
+    // A query for deltas starting within the hot buffer (e.g. from 5) should resolve directly
+    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(5), 10).unwrap();
+    assert_eq!(deltas.len(), 5);
+    assert_eq!(deltas[0].seq.get(), 6);
+    assert_eq!(deltas[4].seq.get(), 10);
+    assert!(!has_more);
+}
+
+#[tokio::test]
+async fn test_tiered_log_async_maintenance_spawn_blocking() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 5,
+        ram_ttl: Duration::from_secs(60),
+        warm_disk_ttl: Duration::from_millis(5),
+        cold_disk_ttl: Duration::from_secs(3600),
+        max_room_disk_bytes: 50 * 1024 * 1024,
+    };
+
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+
+    for i in 1..=5 {
+        log.append(make_test_op(i), None).unwrap();
+    }
+    log.force_rotate_warm().unwrap();
+
+    // Wait past warm_disk_ttl
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    // Run async maintenance which delegates Zstd compression to spawn_blocking
+    let report = log.run_maintenance().await.unwrap();
+    assert_eq!(report.warm_compressed_count, 1);
+
+    // Verify Cold Disk file was created and is readable
+    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(0), 10).unwrap();
+    assert_eq!(deltas.len(), 5);
+    assert_eq!(deltas[0].seq.get(), 1);
+    assert_eq!(deltas[4].seq.get(), 5);
     assert!(!has_more);
 }
