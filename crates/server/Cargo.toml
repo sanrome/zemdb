@@ -26,6 +26,8 @@ zstd = { workspace = true }
 blake3 = { workspace = true }
 futures = { workspace = true }
 subtle = { workspace = true }
+fs2 = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

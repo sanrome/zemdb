@@ -6,7 +6,8 @@ use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use rimdb_core::id::{CorrelationId, RoomId, SequenceNumber};
 use rimdb_core::protocol::codec::{decode_message, encode_message};
-use rimdb_core::protocol::messages::{ClientMessage, ServerMessage};
+use rimdb_core::protocol::messages::{ClientMessage, ErrorCode, ServerMessage};
+use subtle::ConstantTimeEq;
 
 use crate::api::router::AppState;
 use crate::error::ServerError;
@@ -22,10 +23,32 @@ pub struct StagedSnapshot {
     pub file_path: Option<std::path::PathBuf>,
 }
 
+#[derive(Debug)]
+struct StagedUploadSession {
+    total_chunks: u32,
+    total_bytes: u64,
+    snapshot_hash: [u8; 32],
+    received_chunks: std::collections::BTreeMap<u32, Bytes>,
+    created_at: Instant,
+}
+
+/// Parameters for staging a snapshot chunk in the relay.
+#[derive(Debug, Clone)]
+pub struct SnapshotChunkUpload {
+    pub room_id: RoomId,
+    pub head_seq: SequenceNumber,
+    pub chunk_index: u32,
+    pub total_chunks: u32,
+    pub total_bytes: u64,
+    pub snapshot_hash: [u8; 32],
+    pub data: Bytes,
+}
+
 /// Ephemeral relay facilitating state-transfer chunks between peers or cold snapshots and bootstrapping clients.
 #[derive(Debug, Default)]
 pub struct SnapshotRelay {
     snapshots: DashMap<RoomId, StagedSnapshot>,
+    multipart_uploads: DashMap<(RoomId, SequenceNumber), StagedUploadSession>,
     ttl: Duration,
     snapshots_dir: Option<std::path::PathBuf>,
 }
@@ -38,6 +61,7 @@ impl SnapshotRelay {
         std::fs::create_dir_all(&dir_buf)?;
         let relay = Self {
             snapshots: DashMap::new(),
+            multipart_uploads: DashMap::new(),
             ttl,
             snapshots_dir: Some(dir_buf),
         };
@@ -49,6 +73,7 @@ impl SnapshotRelay {
     pub fn new_in_memory(ttl: Duration) -> Self {
         Self {
             snapshots: DashMap::new(),
+            multipart_uploads: DashMap::new(),
             ttl,
             snapshots_dir: None,
         }
@@ -239,6 +264,92 @@ impl SnapshotRelay {
         })
     }
 
+    /// Stages an uploaded snapshot chunk, and consolidates the snapshot when all chunks are received.
+    pub fn stage_chunk(&self, chunk: SnapshotChunkUpload) -> Result<bool, ServerError> {
+        self.cleanup_expired();
+
+        if chunk.total_chunks == 0 {
+            return Err(ServerError::Config("total_chunks must be greater than 0".to_string()));
+        }
+        if chunk.chunk_index >= chunk.total_chunks {
+            return Err(ServerError::Config(format!(
+                "chunk_index {} out of bounds for total_chunks {}",
+                chunk.chunk_index, chunk.total_chunks
+            )));
+        }
+        if chunk.data.len() > 1024 * 1024 {
+            return Err(ServerError::Config(format!(
+                "Chunk size {} bytes exceeds 1 MB maximum chunk limit",
+                chunk.data.len()
+            )));
+        }
+
+        let key = (chunk.room_id.clone(), chunk.head_seq);
+        let mut entry = self.multipart_uploads.entry(key.clone()).or_insert_with(|| {
+            StagedUploadSession {
+                total_chunks: chunk.total_chunks,
+                total_bytes: chunk.total_bytes,
+                snapshot_hash: chunk.snapshot_hash,
+                received_chunks: std::collections::BTreeMap::new(),
+                created_at: Instant::now(),
+            }
+        });
+
+        if entry.total_chunks != chunk.total_chunks
+            || entry.total_bytes != chunk.total_bytes
+            || entry.snapshot_hash != chunk.snapshot_hash
+        {
+            return Err(ServerError::Config(
+                "Upload chunk parameters mismatch existing upload session".to_string(),
+            ));
+        }
+
+        entry.received_chunks.insert(chunk.chunk_index, chunk.data);
+
+        if entry.received_chunks.len() < chunk.total_chunks as usize {
+            return Ok(false);
+        }
+
+        drop(entry);
+
+        let (_key, session) = match self.multipart_uploads.remove(&key) {
+            Some(s) => s,
+            None => return Ok(true),
+        };
+
+        // All chunks received, assemble and verify
+        let total_received: usize = session.received_chunks.values().map(|c| c.len()).sum();
+        if total_received as u64 != session.total_bytes {
+            return Err(ServerError::Serialization(format!(
+                "Assembled snapshot size {} does not match expected total_bytes {}",
+                total_received, session.total_bytes
+            )));
+        }
+
+        let mut assembled = bytes::BytesMut::with_capacity(total_received);
+        for idx in 0..chunk.total_chunks {
+            if let Some(c) = session.received_chunks.get(&idx) {
+                assembled.extend_from_slice(c);
+            } else {
+                return Err(ServerError::Serialization(format!(
+                    "Missing chunk index {} during final assembly",
+                    idx
+                )));
+            }
+        }
+
+        let full_data = assembled.freeze();
+        let computed_hash = ServerMessage::compute_snapshot_hash(&full_data);
+        if computed_hash != chunk.snapshot_hash {
+            return Err(ServerError::Serialization(
+                "BLAKE3 digest verification failed: assembled snapshot is corrupted".to_string(),
+            ));
+        }
+
+        self.stage_snapshot(chunk.room_id, chunk.head_seq, full_data);
+        Ok(true)
+    }
+
     /// Purges staged snapshots that exceeded their TTL both from RAM and from disk.
     pub fn cleanup_expired(&self) {
         let now = Instant::now();
@@ -251,7 +362,47 @@ impl SnapshotRelay {
             }
             alive
         });
+        self.multipart_uploads.retain(|_, session| {
+            now.duration_since(session.created_at) < self.ttl
+        });
     }
+}
+
+/// Validates authentication for snapshot relay endpoints using either admin secret or signed client token.
+fn authenticate_relay_request(
+    headers: &HeaderMap,
+    expected_room: &RoomId,
+    state: &AppState,
+) -> Result<(), ServerError> {
+    let auth_header = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ServerError::Unauthorized("Missing Authorization header".to_string()))?;
+
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .unwrap_or(auth_header);
+
+    // 1. Constant-time check for admin secret
+    let is_admin = token
+        .as_bytes()
+        .ct_eq(state.config.admin_secret.as_bytes())
+        .unwrap_u8()
+        == 1;
+    if is_admin {
+        return Ok(());
+    }
+
+    // 2. Cryptographic verification of client token bound to expected room
+    let verified = crate::api::auth::verify_client_token(token, &state.config.auth_secret)?;
+    if &verified.room_id != expected_room {
+        return Err(ServerError::Unauthorized(format!(
+            "Token room mismatch: expected {}, got {}",
+            expected_room, verified.room_id
+        )));
+    }
+
+    Ok(())
 }
 
 /// `POST /rooms/:room_id/snapshot/upload`: Staging endpoint where an active donor client
@@ -263,6 +414,8 @@ pub async fn upload_snapshot(
     body: Bytes,
 ) -> Result<Response, ServerError> {
     let room_id = RoomId::new(room_id_str);
+
+    authenticate_relay_request(&headers, &room_id, &state)?;
 
     let head_seq_str = headers
         .get("x-snapshot-head-seq")
@@ -300,8 +453,27 @@ pub async fn upload_snapshot(
 pub async fn request_chunk(
     State(state): State<AppState>,
     Path(room_id_str): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let room_id = RoomId::new(room_id_str.clone());
+
+    if let Err(err) = authenticate_relay_request(&headers, &room_id, &state) {
+        let err_msg = ServerMessage::Error {
+            correlation_id: None,
+            room_id: Some(room_id),
+            code: err.to_error_code(),
+            message: err.to_string(),
+        };
+        let bytes = encode_message(&err_msg).unwrap_or_default();
+        return (
+            err.to_status_code(),
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response();
+    }
+
     let msg: ClientMessage = match decode_message(&body) {
         Ok(m) => m,
         Err(e) => {
@@ -316,14 +488,22 @@ pub async fn request_chunk(
     match msg {
         ClientMessage::RequestSnapshotChunk {
             correlation_id,
-            room_id,
+            room_id: msg_room_id,
             chunk_index,
             chunk_size,
         } => {
-            if room_id.as_str() != room_id_str {
+            if msg_room_id != room_id {
+                let err_msg = ServerMessage::Error {
+                    correlation_id: Some(correlation_id),
+                    room_id: Some(room_id),
+                    code: ErrorCode::Unauthorized,
+                    message: "RoomId path and message mismatch".to_string(),
+                };
+                let bytes = encode_message(&err_msg).unwrap_or_default();
                 return (
                     StatusCode::BAD_REQUEST,
-                    "RoomId path and message mismatch",
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    bytes,
                 )
                     .into_response();
             }
@@ -365,6 +545,126 @@ pub async fn request_chunk(
         _ => (
             StatusCode::BAD_REQUEST,
             "Expected RequestSnapshotChunk message",
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /rooms/:room_id/snapshot/upload-chunk`: Handles multipart snapshot upload chunk streaming.
+pub async fn upload_chunk(
+    State(state): State<AppState>,
+    Path(room_id_str): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let room_id = RoomId::new(room_id_str.clone());
+
+    if let Err(err) = authenticate_relay_request(&headers, &room_id, &state) {
+        let err_msg = ServerMessage::Error {
+            correlation_id: None,
+            room_id: Some(room_id),
+            code: err.to_error_code(),
+            message: err.to_string(),
+        };
+        let bytes = encode_message(&err_msg).unwrap_or_default();
+        return (
+            err.to_status_code(),
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response();
+    }
+
+    let msg: ClientMessage = match decode_message(&body) {
+        Ok(m) => m,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to decode UploadSnapshotChunk: {}", e),
+            )
+                .into_response();
+        }
+    };
+
+    match msg {
+        ClientMessage::UploadSnapshotChunk {
+            correlation_id,
+            room_id: msg_room_id,
+            snapshot_head_seq,
+            chunk_index,
+            total_chunks,
+            total_bytes,
+            snapshot_hash,
+            data,
+        } => {
+            if msg_room_id != room_id {
+                let err_msg = ServerMessage::Error {
+                    correlation_id: Some(correlation_id),
+                    room_id: Some(room_id),
+                    code: ErrorCode::Unauthorized,
+                    message: "RoomId path and message mismatch".to_string(),
+                };
+                let bytes = encode_message(&err_msg).unwrap_or_default();
+                return (
+                    StatusCode::BAD_REQUEST,
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    bytes,
+                )
+                    .into_response();
+            }
+
+            let chunk_upload = SnapshotChunkUpload {
+                room_id: room_id.clone(),
+                head_seq: snapshot_head_seq,
+                chunk_index,
+                total_chunks,
+                total_bytes,
+                snapshot_hash,
+                data,
+            };
+            match state.snapshot_relay.stage_chunk(chunk_upload) {
+                Ok(staged) => {
+                    let ack_msg = ServerMessage::SnapshotUploadChunkAck {
+                        correlation_id,
+                        room_id,
+                        chunk_index,
+                        total_chunks,
+                        staged,
+                    };
+                    match encode_message(&ack_msg) {
+                        Ok(bytes) => (
+                            StatusCode::OK,
+                            [(header::CONTENT_TYPE, "application/octet-stream")],
+                            bytes,
+                        )
+                            .into_response(),
+                        Err(e) => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Serialization error: {}", e),
+                        )
+                            .into_response(),
+                    }
+                }
+                Err(err) => {
+                    let err_msg = ServerMessage::Error {
+                        correlation_id: Some(correlation_id),
+                        room_id: Some(room_id),
+                        code: err.to_error_code(),
+                        message: err.to_string(),
+                    };
+                    let bytes = encode_message(&err_msg).unwrap_or_default();
+                    (
+                        err.to_status_code(),
+                        [(header::CONTENT_TYPE, "application/octet-stream")],
+                        bytes,
+                    )
+                        .into_response()
+                }
+            }
+        }
+        _ => (
+            StatusCode::BAD_REQUEST,
+            "Expected UploadSnapshotChunk message",
         )
             .into_response(),
     }

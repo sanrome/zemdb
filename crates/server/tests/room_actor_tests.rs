@@ -113,6 +113,7 @@ async fn test_room_actor_registration_and_get_schema() {
     let room_id = RoomId::new("room-1");
     let sender = manager
         .get_or_spawn(&room_id, Some(&schema_id))
+        .await
         .expect("spawn room");
 
     // Register client
@@ -149,7 +150,7 @@ async fn test_room_actor_commit_validation_and_monotonic_sequencing() {
 
     let manager = RoomManager::new(config, schema_registry, create_test_relay());
     let room_id = RoomId::new("tasks-room");
-    let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).unwrap();
+    let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).await.unwrap();
 
     let client_id = ClientId::new("client-1");
 
@@ -255,7 +256,7 @@ async fn test_room_actor_multi_client_concurrency_and_sse_events() {
 
     let manager = RoomManager::new(config, schema_registry, create_test_relay());
     let room_id = RoomId::new("concurrent-room");
-    let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).unwrap();
+    let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).await.unwrap();
 
     // Register reader client initially so its cursor holds back proactive pruning
     let (reg_tx, reg_rx) = oneshot::channel();
@@ -382,6 +383,7 @@ async fn test_room_actor_client_lifecycle_and_dormant_behind_compaction() {
     let room_id = RoomId::new("lifecycle-room");
     let sender = manager
         .get_or_spawn_with_policy(&room_id, Some(&schema_id), lifecycle_policy)
+        .await
         .unwrap();
 
     let alice = ClientId::new("alice");
@@ -515,7 +517,7 @@ async fn test_room_actor_recovery_retains_state_and_head_seq() {
             Arc::clone(&schema_registry),
             create_test_relay(),
         );
-        let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).unwrap();
+        let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).await.unwrap();
         register_client_helper(&sender, ClientId::new("c1")).await.unwrap();
 
         for i in 1..=5 {
@@ -534,12 +536,9 @@ async fn test_room_actor_recovery_retains_state_and_head_seq() {
             rx.await.unwrap().unwrap();
         }
 
-        // Close room actor
-        manager.close_room(&room_id);
+        // Gracefully shutdown room actor
+        manager.shutdown_room(&room_id).await;
     }
-
-    // Allow tokio actor to exit
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Phase 2: Respawn actor from same directory without passing schema_id explicitly
     {
@@ -550,6 +549,7 @@ async fn test_room_actor_recovery_retains_state_and_head_seq() {
         );
         let sender2 = manager2
             .get_or_spawn(&room_id, None)
+            .await
             .expect("should recover room metadata");
 
         // Verify head_seq recovered as 5
@@ -612,7 +612,7 @@ async fn test_room_actor_cursor_advances_only_on_client_ack() {
 
     let manager = RoomManager::new(config, schema_registry, create_test_relay());
     let room_id = RoomId::new("ack-test-room");
-    let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).unwrap();
+    let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).await.unwrap();
 
     let client = ClientId::new("c-reader");
 
@@ -754,6 +754,7 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
     let lifecycle_policy = RoomLifecyclePolicy::test_policy();
     let sender = manager
         .get_or_spawn_with_policy(&room_id, Some(&schema_id), lifecycle_policy)
+        .await
         .unwrap();
 
     // 1. Stage an active snapshot at seq 5 in the relay
@@ -849,4 +850,122 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
     assert_eq!(sync_res.ops[0].seq, SequenceNumber::new(6));
     assert_eq!(sync_res.ops[4].seq, SequenceNumber::new(10));
 }
+
+#[tokio::test]
+async fn test_room_actor_rejects_future_ack_and_commit_sequences() {
+    let dir = tempdir().unwrap();
+    let schema_registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
+    let schema_id = SchemaId::new("test-schema");
+    let schema = create_test_schema();
+    schema_registry
+        .register_schema(schema_id.clone(), schema.clone())
+        .unwrap();
+
+    let config = Arc::new(ServerConfig {
+        data_dir: dir.path().join("data"),
+        ..Default::default()
+    });
+
+    let manager = RoomManager::new(config, schema_registry, create_test_relay());
+    let room_id = RoomId::new("room-seq-safety");
+    let sender = manager
+        .get_or_spawn(&room_id, Some(&schema_id))
+        .await
+        .expect("spawn room");
+
+    let alice = ClientId::new("alice");
+    let alice_reg = register_client_helper(&sender, alice.clone()).await.unwrap();
+    assert_eq!(alice_reg.head_seq, SequenceNumber::new(0));
+
+    // 1. Commit 3 operations (seq 1, 2, 3)
+    for i in 1u64..=3u64 {
+        let op = create_insert_op(&schema, i as i64, &format!("Task {i}"));
+        let (tx, rx) = oneshot::channel();
+        sender
+            .send(RoomCommand::Commit {
+                client_id: alice.clone(),
+                mutation_id: MutationId::new([i as u8; 16]),
+                last_ack_seq: SequenceNumber::new(i - 1),
+                op,
+                reply: tx,
+            })
+            .await
+            .unwrap();
+        let commit_res = rx.await.unwrap().unwrap();
+        assert_eq!(commit_res.assigned_seq, SequenceNumber::new(i));
+    }
+
+    // 2. Alice sends an invalid Ack far into the future (e.g. u64::MAX or 999)
+    let (bad_ack_tx, bad_ack_rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::Ack {
+            client_id: alice.clone(),
+            ack_seq: SequenceNumber::new(999),
+            reply: bad_ack_tx,
+        })
+        .await
+        .unwrap();
+    let bad_ack_res = bad_ack_rx.await.unwrap();
+    match bad_ack_res {
+        Err(ServerError::InvalidSequence { expected, actual }) => {
+            assert_eq!(expected, SequenceNumber::new(3));
+            assert_eq!(actual, SequenceNumber::new(999));
+        }
+        other => panic!("Expected ServerError::InvalidSequence, got {:?}", other),
+    }
+
+    // 3. Verify Alice's cursor did NOT advance to 999
+    let (cursor_tx, cursor_rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::GetClientCursor {
+            client_id: alice.clone(),
+            reply: cursor_tx,
+        })
+        .await
+        .unwrap();
+    let cursor = cursor_rx.await.unwrap();
+    assert_eq!(cursor, Some(SequenceNumber::new(0)));
+
+    // 4. Bob registers and syncs from sequence 0; deltas must NOT have been pruned
+    let bob = ClientId::new("bob");
+    register_client_helper(&sender, bob.clone()).await.unwrap();
+
+    let (sync_tx, sync_rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::Sync {
+            client_id: bob.clone(),
+            from_seq: SequenceNumber::new(0),
+            max_batch_size: 50,
+            reply: sync_tx,
+        })
+        .await
+        .unwrap();
+    let sync_res = sync_rx.await.unwrap().expect("Sync from 0 must succeed");
+    assert_eq!(sync_res.ops.len(), 3);
+    assert_eq!(sync_res.ops[0].seq, SequenceNumber::new(1));
+    assert_eq!(sync_res.ops[2].seq, SequenceNumber::new(3));
+
+    // 5. Alice attempts to commit with last_ack_seq > head_seq (e.g. 50 > 3)
+    let invalid_commit_op = create_insert_op(&schema, 100, "Invalid Commit");
+    let (invalid_commit_tx, invalid_commit_rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::Commit {
+            client_id: alice.clone(),
+            mutation_id: MutationId::new([0xFE; 16]),
+            last_ack_seq: SequenceNumber::new(50),
+            op: invalid_commit_op,
+            reply: invalid_commit_tx,
+        })
+        .await
+        .unwrap();
+    let invalid_commit_res = invalid_commit_rx.await.unwrap();
+    match invalid_commit_res {
+        Err(ServerError::InvalidSequence { expected, actual }) => {
+            assert_eq!(expected, SequenceNumber::new(3));
+            assert_eq!(actual, SequenceNumber::new(50));
+        }
+        other => panic!("Expected ServerError::InvalidSequence, got {:?}", other),
+    }
+}
+
 

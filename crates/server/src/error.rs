@@ -1,6 +1,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use rimdb_core::id::SequenceNumber;
 use rimdb_core::protocol::messages::ErrorCode;
 use serde::Serialize;
 use thiserror::Error;
@@ -52,6 +53,15 @@ pub enum ServerError {
 
     #[error("Internal server error: {0}")]
     Internal(String),
+
+    #[error("Invalid sequence number: expected <= {expected}, got {actual}")]
+    InvalidSequence {
+        expected: SequenceNumber,
+        actual: SequenceNumber,
+    },
+
+    #[error("Gateway timeout: {0}")]
+    GatewayTimeout(String),
 }
 
 impl ServerError {
@@ -67,7 +77,9 @@ impl ServerError {
             ServerError::RoomLocked(_) => ErrorCode::RoomLocked,
             ServerError::Unauthorized(_) => ErrorCode::Unauthorized,
             ServerError::RateLimited => ErrorCode::RateLimited,
-            ServerError::Io(_)
+            ServerError::InvalidSequence { .. } => ErrorCode::InvalidSequence,
+            ServerError::GatewayTimeout(_)
+            | ServerError::Io(_)
             | ServerError::Wal(_)
             | ServerError::WalCorruption(_)
             | ServerError::Config(_)
@@ -82,11 +94,14 @@ impl ServerError {
             ServerError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ServerError::RoomNotFound(_) | ServerError::SchemaNotFound(_) => StatusCode::NOT_FOUND,
             ServerError::RoomAlreadyExists(_) => StatusCode::CONFLICT,
-            ServerError::SchemaViolation(_) => StatusCode::BAD_REQUEST,
+            ServerError::SchemaViolation(_) | ServerError::InvalidSequence { .. } => {
+                StatusCode::BAD_REQUEST
+            }
             ServerError::BehindCompaction => StatusCode::GONE,
             ServerError::ClientDeregistered => StatusCode::FORBIDDEN,
             ServerError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             ServerError::RoomLocked(_) => StatusCode::LOCKED,
+            ServerError::GatewayTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
             ServerError::Io(_)
             | ServerError::Wal(_)
             | ServerError::WalCorruption(_)

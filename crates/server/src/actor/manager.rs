@@ -27,6 +27,8 @@ pub struct RoomMetadata {
 pub struct RoomManager {
     rooms: DashMap<RoomId, mpsc::Sender<RoomCommand>>,
     room_schemas: DashMap<RoomId, SchemaId>,
+    spawn_locks: DashMap<RoomId, Arc<tokio::sync::Mutex<()>>>,
+    room_handles: DashMap<RoomId, tokio::task::JoinHandle<()>>,
     config: Arc<ServerConfig>,
     schema_registry: Arc<SchemaRegistry>,
     snapshot_relay: Arc<SnapshotRelay>,
@@ -44,6 +46,8 @@ impl RoomManager {
         Self {
             rooms: DashMap::new(),
             room_schemas: DashMap::new(),
+            spawn_locks: DashMap::new(),
+            room_handles: DashMap::new(),
             config,
             schema_registry,
             snapshot_relay,
@@ -52,29 +56,45 @@ impl RoomManager {
     }
 
     /// Retrieves an existing room actor sender or lazily spawns a new one with default lifecycle policy.
-    pub fn get_or_spawn(
+    pub async fn get_or_spawn(
         &self,
         room_id: &RoomId,
         schema_id: Option<&SchemaId>,
     ) -> Result<mpsc::Sender<RoomCommand>, ServerError> {
         self.get_or_spawn_with_policy(room_id, schema_id, RoomLifecyclePolicy::default())
+            .await
     }
 
     /// Retrieves an existing room actor sender or lazily spawns a new one with a custom lifecycle policy.
-    pub fn get_or_spawn_with_policy(
+    pub async fn get_or_spawn_with_policy(
         &self,
         room_id: &RoomId,
         schema_id: Option<&SchemaId>,
         lifecycle_policy: RoomLifecyclePolicy,
     ) -> Result<mpsc::Sender<RoomCommand>, ServerError> {
-        // 1. Check if room is already active and channel is open
+        // 1. Fast check if room is already active and channel is open
         if let Some(sender) = self.rooms.get(room_id) {
             if !sender.is_closed() {
                 return Ok(sender.clone());
             }
         }
 
-        // 2. Resolve SchemaId
+        // 2. Acquire per-room spawn lock to prevent duplicate instantiation
+        let lock = self
+            .spawn_locks
+            .entry(room_id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        // 3. Double-check if another task spawned the room while waiting for the lock
+        if let Some(sender) = self.rooms.get(room_id) {
+            if !sender.is_closed() {
+                return Ok(sender.clone());
+            }
+        }
+
+        // 4. Resolve SchemaId
         let room_dir = self.data_dir.join("rooms").join(room_id.as_str());
         let meta_room_path = room_dir.join("meta_room.json");
 
@@ -101,20 +121,20 @@ impl RoomManager {
             self.room_schemas.insert(room_id.clone(), meta.schema_id.clone());
             meta.schema_id
         } else {
-            return Err(ServerError::SchemaNotFound(format!(
-                "No schema assigned for room '{}'",
+            return Err(ServerError::RoomNotFound(format!(
+                "No schema assigned or directory found for room '{}'",
                 room_id
             )));
         };
 
-        // 3. Resolve Schema definition from registry
+        // 5. Resolve Schema definition from registry
         let schema = self
             .schema_registry
             .get_schema(&resolved_schema_id)
             .ok_or_else(|| ServerError::SchemaNotFound(resolved_schema_id.to_string()))?;
 
-        // 4. Spawn RoomActor
-        let (sender, _handle) = RoomActor::spawn(
+        // 6. Spawn RoomActor and retain handle
+        let (sender, handle) = RoomActor::spawn(
             room_id.clone(),
             resolved_schema_id,
             schema,
@@ -125,6 +145,7 @@ impl RoomManager {
         )?;
 
         self.rooms.insert(room_id.clone(), sender.clone());
+        self.room_handles.insert(room_id.clone(), handle);
         info!(room = %room_id, "RoomActor lazily initialized and registered in RoomManager");
 
         Ok(sender)
@@ -141,9 +162,30 @@ impl RoomManager {
         })
     }
 
-    /// Closes a room by dropping its sender from the registry.
-    pub fn close_room(&self, room_id: &RoomId) -> bool {
-        self.rooms.remove(room_id).is_some()
+    /// Gracefully closes and shuts down an active room actor, awaiting task termination.
+    pub async fn shutdown_room(&self, room_id: &RoomId) -> bool {
+        let sender = self.rooms.remove(room_id);
+        let handle = self.room_handles.remove(room_id);
+        if let Some((_, sender)) = sender {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if sender.send(RoomCommand::Shutdown { reply: tx }).await.is_ok() {
+                let _ = rx.await;
+            }
+            if let Some((_, handle)) = handle {
+                let _ = handle.await;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Gracefully shuts down all active room actors, awaiting task terminations.
+    pub async fn shutdown_all(&self) {
+        let room_ids: Vec<RoomId> = self.rooms.iter().map(|kv| kv.key().clone()).collect();
+        for id in room_ids {
+            self.shutdown_room(&id).await;
+        }
     }
 
     /// Returns a list of all currently active RoomIds.
@@ -156,12 +198,19 @@ impl RoomManager {
     }
 
     /// Explicitly creates and provisions a new room. Returns error if room already exists.
-    pub fn create_room(
+    pub async fn create_room(
         &self,
         room_id: RoomId,
         schema_id: SchemaId,
         lifecycle_policy: Option<RoomLifecyclePolicy>,
     ) -> Result<RoomMetadata, ServerError> {
+        let lock = self
+            .spawn_locks
+            .entry(room_id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
         let room_dir = self.data_dir.join("rooms").join(room_id.as_str());
         let meta_room_path = room_dir.join("meta_room.json");
 
@@ -186,8 +235,8 @@ impl RoomManager {
         fs::write(&meta_room_path, json.as_bytes())?;
         self.room_schemas.insert(room_id.clone(), schema_id.clone());
 
-        // Spawn actor
-        let (sender, _handle) = RoomActor::spawn(
+        // Spawn actor and retain handle
+        let (sender, handle) = RoomActor::spawn(
             room_id.clone(),
             schema_id,
             schema,
@@ -197,13 +246,21 @@ impl RoomManager {
             Arc::clone(&self.snapshot_relay),
         )?;
 
-        self.rooms.insert(room_id, sender);
+        self.rooms.insert(room_id.clone(), sender);
+        self.room_handles.insert(room_id, handle);
         Ok(meta)
     }
 
-    /// Deletes a room: closes the active actor and purges the room directory from disk.
-    pub fn delete_room(&self, room_id: &RoomId) -> Result<(), ServerError> {
-        self.close_room(room_id);
+    /// Deletes a room: gracefully shuts down the active actor and purges the room directory from disk.
+    pub async fn delete_room(&self, room_id: &RoomId) -> Result<(), ServerError> {
+        let lock = self
+            .spawn_locks
+            .entry(room_id.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+
+        self.shutdown_room(room_id).await;
         self.room_schemas.remove(room_id);
 
         let room_dir = self.data_dir.join("rooms").join(room_id.as_str());

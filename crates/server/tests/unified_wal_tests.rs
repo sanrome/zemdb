@@ -255,4 +255,19 @@ fn test_server_error_mapping() {
     let room_nf = ServerError::RoomNotFound("room-123".to_string());
     assert_eq!(room_nf.to_error_code(), ErrorCode::RoomNotFound);
     assert_eq!(room_nf.to_status_code(), axum::http::StatusCode::NOT_FOUND);
+
+    let invalid_seq_err = ServerError::InvalidSequence {
+        expected: SequenceNumber::new(10),
+        actual: SequenceNumber::new(20),
+    };
+    assert_eq!(invalid_seq_err.to_error_code(), ErrorCode::InvalidSequence);
+    assert_eq!(invalid_seq_err.to_status_code(), axum::http::StatusCode::BAD_REQUEST);
+
+    let gw_err = ServerError::GatewayTimeout("Actor timed out".to_string());
+    assert_eq!(gw_err.to_error_code(), ErrorCode::Internal);
+    assert_eq!(gw_err.to_status_code(), axum::http::StatusCode::GATEWAY_TIMEOUT);
+
+    let locked_err = ServerError::RoomLocked("Room is already locked by another process".to_string());
+    assert_eq!(locked_err.to_error_code(), ErrorCode::RoomLocked);
+    assert_eq!(locked_err.to_status_code(), axum::http::StatusCode::LOCKED);
 }

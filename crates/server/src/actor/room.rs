@@ -105,6 +105,11 @@ impl RoomActor {
             tokio::select! {
                 cmd = self.receiver.recv() => {
                     match cmd {
+                        Some(RoomCommand::Shutdown { reply }) => {
+                            debug!(room = %self.room_id, "Shutdown command received, terminating actor loop");
+                            let _ = reply.send(());
+                            break;
+                        }
                         Some(command) => self.handle_command(command),
                         None => {
                             debug!(room = %self.room_id, "RoomCommand channel closed, shutting down actor loop");
@@ -113,7 +118,7 @@ impl RoomActor {
                     }
                 }
                 _ = maintenance_timer.tick() => {
-                    self.run_periodic_maintenance();
+                    self.run_periodic_maintenance().await;
                 }
             }
         }
@@ -230,6 +235,10 @@ impl RoomActor {
                     .map(|c| c.last_ack_seq);
                 let _ = reply.send(cursor);
             }
+
+            RoomCommand::Shutdown { reply } => {
+                let _ = reply.send(());
+            }
         }
     }
 
@@ -258,7 +267,16 @@ impl RoomActor {
             return;
         }
 
-        // 2. Exactly-Once Idempotency Check via DedupLruCache
+        // 2. Validate that client last_ack_seq does not exceed server head_seq
+        if last_ack_seq > self.head_seq {
+            let _ = reply.send(Err(ServerError::InvalidSequence {
+                expected: self.head_seq,
+                actual: last_ack_seq,
+            }));
+            return;
+        }
+
+        // 3. Exactly-Once Idempotency Check via DedupLruCache
         if let Some(existing_seq) = self.dedup_cache.is_duplicate(&mutation_id) {
             let from_seq = if last_ack_seq < existing_seq {
                 last_ack_seq
@@ -358,9 +376,10 @@ impl RoomActor {
         }
 
         // 3. Fetch continuous multi-tier delta batch
+        let bounded_batch_size = max_batch_size.clamp(1, 1000);
         match self
             .tiered_log
-            .fetch_deltas(from_seq, max_batch_size)
+            .fetch_deltas(from_seq, bounded_batch_size)
         {
             Ok((ops, has_more)) => {
                 // If client was bootstrapping and synced a valid range, promote to Connected
@@ -403,12 +422,21 @@ impl RoomActor {
             return;
         }
 
-        // 2. Record explicit Ack, advancing cursor, refreshing lease, and promoting Bootstrapping
+        // 2. Validate that ack_seq <= head_seq to prevent catastrophic log truncation
+        if ack_seq > self.head_seq {
+            let _ = reply.send(Err(ServerError::InvalidSequence {
+                expected: self.head_seq,
+                actual: ack_seq,
+            }));
+            return;
+        }
+
+        // 3. Record explicit Ack, advancing cursor, refreshing lease, and promoting Bootstrapping
         let res = self
             .lease_tracker
             .record_ack(&client_id, ack_seq)
             .map(|_| {
-                // 3. Trigger proactive log pruning if all connected clients are past the sequence,
+                // 4. Trigger proactive log pruning if all connected clients are past the sequence,
                 // bounded by active_snapshot_seq (Retention Anchor)
                 if let Some(min_ack) = self.lease_tracker.min_connected_ack_seq() {
                     let active_snap = self.snapshot_relay.active_snapshot_seq(&self.room_id);
@@ -424,13 +452,13 @@ impl RoomActor {
         let _ = reply.send(res);
     }
 
-    fn run_periodic_maintenance(&mut self) {
+    async fn run_periodic_maintenance(&mut self) {
         // 1. Check client timeouts (Connected/Bootstrapping -> Disconnected -> Dormant)
         self.lease_tracker
             .check_timeouts(self.lease_timeout, self.tiered_log.tail_seq());
 
-        // 2. Run TieredLog TTL and size compaction
-        if let Err(e) = self.tiered_log.run_maintenance() {
+        // 2. Run TieredLog TTL and size compaction (non-blocking via spawn_blocking)
+        if let Err(e) = self.tiered_log.run_maintenance().await {
             warn!(room = %self.room_id, error = %e, "TieredLog maintenance error");
         }
 

@@ -120,4 +120,9 @@ pub enum RoomCommand {
         client_id: ClientId,
         reply: oneshot::Sender<Option<SequenceNumber>>,
     },
+
+    /// Gracefully shutdown the room actor loop and release all file resources.
+    Shutdown {
+        reply: oneshot::Sender<()>,
+    },
 }

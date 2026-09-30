@@ -19,6 +19,7 @@ pub enum ErrorCode {
     RoomAlreadyExists,
     TableAlreadyExists,
     SchemaNotFound,
+    InvalidSequence,
 }
 
 /// An operation ordered by the coordination server with assigned sequence ID.
@@ -105,6 +106,17 @@ pub enum ClientMessage {
         chunk_index: u32,
         chunk_size: u32,
     },
+    /// Upload a chunk of the room base snapshot for multipart staging of large datasets.
+    UploadSnapshotChunk {
+        correlation_id: CorrelationId,
+        room_id: RoomId,
+        snapshot_head_seq: SequenceNumber,
+        chunk_index: u32,
+        total_chunks: u32,
+        total_bytes: u64,
+        snapshot_hash: [u8; 32],
+        data: bytes::Bytes,
+    },
 }
 
 /// Unified message sent from Server to Client.
@@ -145,6 +157,14 @@ pub enum ServerMessage {
         /// BLAKE3 256-bit cryptographic digest of the complete concatenated snapshot payload.
         snapshot_hash: [u8; 32],
         data: bytes::Bytes,
+    },
+    /// Acknowledgment of an uploaded snapshot chunk.
+    SnapshotUploadChunkAck {
+        correlation_id: CorrelationId,
+        room_id: RoomId,
+        chunk_index: u32,
+        total_chunks: u32,
+        staged: bool,
     },
     /// Acknowledgment of a heartbeat.
     HeartbeatAck {

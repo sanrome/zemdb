@@ -27,21 +27,24 @@ pub async fn room_events(
     }
 
     let room_id = RoomId::new(room_id_str);
-    let sender = state
-        .room_manager
-        .get_room(&room_id)
-        .or_else(|| state.room_manager.get_or_spawn(&room_id, None).ok())
-        .ok_or_else(|| ServerError::RoomNotFound(room_id.to_string()))?;
+    let sender = match state.room_manager.get_room(&room_id) {
+        Some(s) => s,
+        None => state.room_manager.get_or_spawn(&room_id, None).await?,
+    };
 
     let (tx, rx) = tokio::sync::oneshot::channel();
-    sender
-        .send(RoomCommand::SubscribeEvents { reply: tx })
-        .await
-        .map_err(|_| ServerError::Internal("Room actor closed".to_string()))?;
+    let call = async {
+        sender
+            .send(RoomCommand::SubscribeEvents { reply: tx })
+            .await
+            .map_err(|_| ServerError::Internal("Room actor closed".to_string()))?;
+        rx.await
+            .map_err(|_| ServerError::Internal("No response from room actor".to_string()))
+    };
 
-    let receiver = rx
+    let receiver = tokio::time::timeout(Duration::from_secs(5), call)
         .await
-        .map_err(|_| ServerError::Internal("No response from room actor".to_string()))?;
+        .map_err(|_| ServerError::GatewayTimeout("Timeout subscribing to room events".to_string()))??;
 
     let stream = futures::stream::unfold(receiver, |mut rx| async move {
         match rx.recv().await {

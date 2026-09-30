@@ -1,3 +1,4 @@
+use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
@@ -10,6 +11,8 @@ use crate::actor::command::RoomCommand;
 use crate::api::auth::{verify_client_token_bound, ClientAuth};
 use crate::api::router::AppState;
 use crate::error::ServerError;
+
+const ACTOR_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) fn binary_response(status: StatusCode, msg: &ServerMessage) -> Response {
     match encode_message(msg) {
@@ -84,29 +87,26 @@ pub async fn register(
             }
 
             // Obtain room actor sender
-            let sender = match state.room_manager.get_or_spawn(&room_id, None) {
+            let sender = match state.room_manager.get_or_spawn(&room_id, None).await {
                 Ok(s) => s,
                 Err(err) => return binary_error(Some(correlation_id), Some(room_id), err),
             };
 
             let (tx, rx) = tokio::sync::oneshot::channel();
-            if sender
-                .send(RoomCommand::RegisterClient {
-                    client_id,
-                    current_seq,
-                    reply: tx,
-                })
-                .await
-                .is_err()
-            {
-                return binary_error(
-                    Some(correlation_id),
-                    Some(room_id),
-                    ServerError::Internal("Room actor closed".to_string()),
-                );
-            }
+            let call = async {
+                sender
+                    .send(RoomCommand::RegisterClient {
+                        client_id,
+                        current_seq,
+                        reply: tx,
+                    })
+                    .await
+                    .map_err(|_| ServerError::Internal("Room actor closed".to_string()))?;
+                rx.await
+                    .map_err(|_| ServerError::Internal("Actor reply dropped".to_string()))?
+            };
 
-            match rx.await {
+            match tokio::time::timeout(ACTOR_TIMEOUT, call).await {
                 Ok(Ok(reg_resp)) => binary_response(
                     StatusCode::OK,
                     &ServerMessage::Registered {
@@ -123,7 +123,7 @@ pub async fn register(
                 Err(_) => binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::Internal("Actor reply dropped".to_string()),
+                    ServerError::GatewayTimeout("Request timed out waiting for room actor".to_string()),
                 ),
             }
         }
@@ -189,37 +189,28 @@ pub async fn commit(
                 );
             }
 
-            let sender = match state.room_manager.get_room(&room_id) {
-                Some(s) => s,
-                None => {
-                    return binary_error(
-                        Some(correlation_id),
-                        Some(room_id.clone()),
-                        ServerError::RoomNotFound(room_id.to_string()),
-                    )
-                }
+            let sender = match state.room_manager.get_or_spawn(&room_id, None).await {
+                Ok(s) => s,
+                Err(err) => return binary_error(Some(correlation_id), Some(room_id), err),
             };
 
             let (tx, rx) = tokio::sync::oneshot::channel();
-            if sender
-                .send(RoomCommand::Commit {
-                    client_id,
-                    mutation_id,
-                    last_ack_seq,
-                    op,
-                    reply: tx,
-                })
-                .await
-                .is_err()
-            {
-                return binary_error(
-                    Some(correlation_id),
-                    Some(room_id),
-                    ServerError::Internal("Room actor closed".to_string()),
-                );
-            }
+            let call = async {
+                sender
+                    .send(RoomCommand::Commit {
+                        client_id,
+                        mutation_id,
+                        last_ack_seq,
+                        op,
+                        reply: tx,
+                    })
+                    .await
+                    .map_err(|_| ServerError::Internal("Room actor closed".to_string()))?;
+                rx.await
+                    .map_err(|_| ServerError::Internal("Actor reply dropped".to_string()))?
+            };
 
-            match rx.await {
+            match tokio::time::timeout(ACTOR_TIMEOUT, call).await {
                 Ok(Ok(commit_resp)) => binary_response(
                     StatusCode::OK,
                     &ServerMessage::CommitAck {
@@ -235,7 +226,7 @@ pub async fn commit(
                 Err(_) => binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::Internal("Actor reply dropped".to_string()),
+                    ServerError::GatewayTimeout("Request timed out waiting for room actor".to_string()),
                 ),
             }
         }
@@ -300,36 +291,27 @@ pub async fn sync(
                 );
             }
 
-            let sender = match state.room_manager.get_room(&room_id) {
-                Some(s) => s,
-                None => {
-                    return binary_error(
-                        Some(correlation_id),
-                        Some(room_id.clone()),
-                        ServerError::RoomNotFound(room_id.to_string()),
-                    )
-                }
+            let sender = match state.room_manager.get_or_spawn(&room_id, None).await {
+                Ok(s) => s,
+                Err(err) => return binary_error(Some(correlation_id), Some(room_id), err),
             };
 
             let (tx, rx) = tokio::sync::oneshot::channel();
-            if sender
-                .send(RoomCommand::Sync {
-                    client_id,
-                    from_seq,
-                    max_batch_size,
-                    reply: tx,
-                })
-                .await
-                .is_err()
-            {
-                return binary_error(
-                    Some(correlation_id),
-                    Some(room_id),
-                    ServerError::Internal("Room actor closed".to_string()),
-                );
-            }
+            let call = async {
+                sender
+                    .send(RoomCommand::Sync {
+                        client_id,
+                        from_seq,
+                        max_batch_size,
+                        reply: tx,
+                    })
+                    .await
+                    .map_err(|_| ServerError::Internal("Room actor closed".to_string()))?;
+                rx.await
+                    .map_err(|_| ServerError::Internal("Actor reply dropped".to_string()))?
+            };
 
-            match rx.await {
+            match tokio::time::timeout(ACTOR_TIMEOUT, call).await {
                 Ok(Ok(sync_resp)) => binary_response(
                     StatusCode::OK,
                     &ServerMessage::SyncBatch {
@@ -344,7 +326,7 @@ pub async fn sync(
                 Err(_) => binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::Internal("Actor reply dropped".to_string()),
+                    ServerError::GatewayTimeout("Request timed out waiting for room actor".to_string()),
                 ),
             }
         }
@@ -408,35 +390,26 @@ pub async fn ack(
                 );
             }
 
-            let sender = match state.room_manager.get_room(&room_id) {
-                Some(s) => s,
-                None => {
-                    return binary_error(
-                        Some(correlation_id),
-                        Some(room_id.clone()),
-                        ServerError::RoomNotFound(room_id.to_string()),
-                    )
-                }
+            let sender = match state.room_manager.get_or_spawn(&room_id, None).await {
+                Ok(s) => s,
+                Err(err) => return binary_error(Some(correlation_id), Some(room_id), err),
             };
 
             let (tx, rx) = tokio::sync::oneshot::channel();
-            if sender
-                .send(RoomCommand::Ack {
-                    client_id,
-                    ack_seq,
-                    reply: tx,
-                })
-                .await
-                .is_err()
-            {
-                return binary_error(
-                    Some(correlation_id),
-                    Some(room_id),
-                    ServerError::Internal("Room actor closed".to_string()),
-                );
-            }
+            let call = async {
+                sender
+                    .send(RoomCommand::Ack {
+                        client_id,
+                        ack_seq,
+                        reply: tx,
+                    })
+                    .await
+                    .map_err(|_| ServerError::Internal("Room actor closed".to_string()))?;
+                rx.await
+                    .map_err(|_| ServerError::Internal("Actor reply dropped".to_string()))?
+            };
 
-            match rx.await {
+            match tokio::time::timeout(ACTOR_TIMEOUT, call).await {
                 Ok(Ok(head_seq)) => binary_response(
                     StatusCode::OK,
                     &ServerMessage::AckConfirmed {
@@ -450,7 +423,7 @@ pub async fn ack(
                 Err(_) => binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::Internal("Actor reply dropped".to_string()),
+                    ServerError::GatewayTimeout("Request timed out waiting for room actor".to_string()),
                 ),
             }
         }
@@ -513,34 +486,25 @@ pub async fn heartbeat(
                 );
             }
 
-            let sender = match state.room_manager.get_room(&room_id) {
-                Some(s) => s,
-                None => {
-                    return binary_error(
-                        Some(correlation_id),
-                        Some(room_id.clone()),
-                        ServerError::RoomNotFound(room_id.to_string()),
-                    )
-                }
+            let sender = match state.room_manager.get_or_spawn(&room_id, None).await {
+                Ok(s) => s,
+                Err(err) => return binary_error(Some(correlation_id), Some(room_id), err),
             };
 
             let (tx, rx) = tokio::sync::oneshot::channel();
-            if sender
-                .send(RoomCommand::Heartbeat {
-                    client_id,
-                    reply: tx,
-                })
-                .await
-                .is_err()
-            {
-                return binary_error(
-                    Some(correlation_id),
-                    Some(room_id),
-                    ServerError::Internal("Room actor closed".to_string()),
-                );
-            }
+            let call = async {
+                sender
+                    .send(RoomCommand::Heartbeat {
+                        client_id,
+                        reply: tx,
+                    })
+                    .await
+                    .map_err(|_| ServerError::Internal("Room actor closed".to_string()))?;
+                rx.await
+                    .map_err(|_| ServerError::Internal("Actor reply dropped".to_string()))?
+            };
 
-            match rx.await {
+            match tokio::time::timeout(ACTOR_TIMEOUT, call).await {
                 Ok(Ok(current_head_seq)) => binary_response(
                     StatusCode::OK,
                     &ServerMessage::HeartbeatAck {
@@ -553,7 +517,7 @@ pub async fn heartbeat(
                 Err(_) => binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::Internal("Actor reply dropped".to_string()),
+                    ServerError::GatewayTimeout("Request timed out waiting for room actor".to_string()),
                 ),
             }
         }
@@ -606,31 +570,22 @@ pub async fn get_schema(
                 );
             }
 
-            let sender = match state.room_manager.get_room(&room_id) {
-                Some(s) => s,
-                None => {
-                    return binary_error(
-                        Some(correlation_id),
-                        Some(room_id.clone()),
-                        ServerError::RoomNotFound(room_id.to_string()),
-                    )
-                }
+            let sender = match state.room_manager.get_or_spawn(&room_id, None).await {
+                Ok(s) => s,
+                Err(err) => return binary_error(Some(correlation_id), Some(room_id), err),
             };
 
             let (tx, rx) = tokio::sync::oneshot::channel();
-            if sender
-                .send(RoomCommand::GetSchema { reply: tx })
-                .await
-                .is_err()
-            {
-                return binary_error(
-                    Some(correlation_id),
-                    Some(room_id),
-                    ServerError::Internal("Room actor closed".to_string()),
-                );
-            }
+            let call = async {
+                sender
+                    .send(RoomCommand::GetSchema { reply: tx })
+                    .await
+                    .map_err(|_| ServerError::Internal("Room actor closed".to_string()))?;
+                rx.await
+                    .map_err(|_| ServerError::Internal("Actor reply dropped".to_string()))?
+            };
 
-            match rx.await {
+            match tokio::time::timeout(ACTOR_TIMEOUT, call).await {
                 Ok(Ok((schema_id, schema))) => binary_response(
                     StatusCode::OK,
                     &ServerMessage::Schema {
@@ -644,7 +599,7 @@ pub async fn get_schema(
                 Err(_) => binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::Internal("Actor reply dropped".to_string()),
+                    ServerError::GatewayTimeout("Request timed out waiting for room actor".to_string()),
                 ),
             }
         }
@@ -707,37 +662,28 @@ pub async fn deregister(
                 );
             }
 
-            let sender = match state.room_manager.get_room(&room_id) {
-                Some(s) => s,
-                None => {
-                    return binary_error(
-                        Some(correlation_id),
-                        Some(room_id.clone()),
-                        ServerError::RoomNotFound(room_id.to_string()),
-                    )
-                }
+            let sender = match state.room_manager.get_or_spawn(&room_id, None).await {
+                Ok(s) => s,
+                Err(err) => return binary_error(Some(correlation_id), Some(room_id), err),
             };
 
             let (tx, rx) = tokio::sync::oneshot::channel();
-            if sender
-                .send(RoomCommand::DeregisterClient { client_id, reply: tx })
-                .await
-                .is_err()
-            {
-                return binary_error(
-                    Some(correlation_id),
-                    Some(room_id),
-                    ServerError::Internal("Room actor closed".to_string()),
-                );
-            }
+            let call = async {
+                sender
+                    .send(RoomCommand::DeregisterClient { client_id, reply: tx })
+                    .await
+                    .map_err(|_| ServerError::Internal("Room actor closed".to_string()))?;
+                rx.await
+                    .map_err(|_| ServerError::Internal("Actor reply dropped".to_string()))?
+            };
 
-            match rx.await {
+            match tokio::time::timeout(ACTOR_TIMEOUT, call).await {
                 Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
                 Ok(Err(err)) => binary_error(Some(correlation_id), Some(room_id), err),
                 Err(_) => binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::Internal("Actor reply dropped".to_string()),
+                    ServerError::GatewayTimeout("Request timed out waiting for room actor".to_string()),
                 ),
             }
         }

@@ -113,6 +113,33 @@ fn test_protocol_binary_serialization_roundtrip() {
     let dec_chunk: ServerMessage = decode_message(&enc_chunk).expect("deserialization failed");
     assert_eq!(snap_chunk, dec_chunk);
 
+    // Test UploadSnapshotChunk roundtrip
+    let upload_chunk = ClientMessage::UploadSnapshotChunk {
+        correlation_id: CorrelationId::new(1004),
+        room_id: RoomId::new("room-abc"),
+        snapshot_head_seq: SequenceNumber::new(500),
+        chunk_index: 0,
+        total_chunks: 5,
+        total_bytes: 5 * 1024 * 1024,
+        snapshot_hash: expected_hash,
+        data: bytes::Bytes::from_static(dummy_payload),
+    };
+    let enc_upload = encode_message(&upload_chunk).expect("serialization failed");
+    let dec_upload: ClientMessage = decode_message(&enc_upload).expect("deserialization failed");
+    assert_eq!(upload_chunk, dec_upload);
+
+    // Test SnapshotUploadChunkAck roundtrip
+    let upload_ack = ServerMessage::SnapshotUploadChunkAck {
+        correlation_id: CorrelationId::new(1004),
+        room_id: RoomId::new("room-abc"),
+        chunk_index: 0,
+        total_chunks: 5,
+        staged: false,
+    };
+    let enc_ack = encode_message(&upload_ack).expect("serialization failed");
+    let dec_ack: ServerMessage = decode_message(&enc_ack).expect("deserialization failed");
+    assert_eq!(upload_ack, dec_ack);
+
     // Test RegisterClient with auth_token roundtrip
     let reg_msg = ClientMessage::RegisterClient {
         correlation_id: CorrelationId::new(1004),

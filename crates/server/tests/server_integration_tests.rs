@@ -275,6 +275,7 @@ async fn test_data_plane_handshake_and_1rtt_commit() {
     server
         .room_manager
         .create_room(room_id.clone(), schema_id.clone(), None)
+        .await
         .unwrap();
 
     let client_id = ClientId::new("alice");
@@ -411,6 +412,7 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
     server
         .room_manager
         .create_room(room_id.clone(), schema_id.clone(), None)
+        .await
         .unwrap();
 
     let writer = ClientId::new("writer");
@@ -599,6 +601,7 @@ async fn test_data_plane_heartbeat_and_deregister() {
     server
         .room_manager
         .create_room(room_id.clone(), schema_id.clone(), None)
+        .await
         .unwrap();
 
     let client_id = ClientId::new("hb-client");
@@ -703,6 +706,7 @@ async fn test_sse_realtime_head_advanced_events() {
     server
         .room_manager
         .create_room(room_id.clone(), schema_id.clone(), None)
+        .await
         .unwrap();
 
     let client_id = ClientId::new("writer-sse");
@@ -796,6 +800,10 @@ async fn test_snapshot_relay_chunked_transfer_and_blake3() {
             "{}/rooms/{}/snapshot/upload",
             server.base_url, room_id
         ))
+        .header(
+            AUTHORIZATION,
+            format!("Bearer {}", server.config.admin_secret),
+        )
         .header("x-snapshot-head-seq", "100")
         .body(snapshot_bytes.clone())
         .send()
@@ -821,6 +829,10 @@ async fn test_snapshot_relay_chunked_transfer_and_blake3() {
                 "{}/rooms/{}/snapshot/chunk",
                 server.base_url, room_id
             ))
+            .header(
+                AUTHORIZATION,
+                format!("Bearer {}", server.config.admin_secret),
+            )
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(encode_message(&req_msg).unwrap())
             .send()
@@ -872,6 +884,7 @@ async fn test_schema_evolution_cascades_to_active_room() {
     server
         .room_manager
         .create_room(room_id.clone(), schema_id.clone(), None)
+        .await
         .unwrap();
 
     let client_id = ClientId::new("writer-evo");
@@ -975,6 +988,7 @@ async fn test_data_plane_auth_enforcement_rejected_without_bearer() {
     server
         .room_manager
         .create_room(room_id.clone(), schema_id, None)
+        .await
         .unwrap();
 
     let client_id = ClientId::new("anonymous");
@@ -1088,6 +1102,7 @@ async fn test_data_plane_auth_token_tampered_or_expired() {
     server
         .room_manager
         .create_room(room_id.clone(), schema_id, None)
+        .await
         .unwrap();
 
     let client_id = ClientId::new("alice");
@@ -1152,10 +1167,12 @@ async fn test_data_plane_room_path_token_and_payload_mismatch_rejected() {
     server
         .room_manager
         .create_room(room_a.clone(), schema_id.clone(), None)
+        .await
         .unwrap();
     server
         .room_manager
         .create_room(room_b.clone(), schema_id, None)
+        .await
         .unwrap();
 
     let client_id = ClientId::new("alice");
@@ -1242,6 +1259,7 @@ async fn test_data_plane_dev_token_backdoor_eliminated() {
     server
         .room_manager
         .create_room(room_id.clone(), schema_id, None)
+        .await
         .unwrap();
 
     let client_id = ClientId::new("hacker");
@@ -1298,6 +1316,7 @@ async fn test_sse_events_auth_header_and_query_param() {
     server
         .room_manager
         .create_room(room_id.clone(), schema_id, None)
+        .await
         .unwrap();
 
     let client_id = ClientId::new("listener");

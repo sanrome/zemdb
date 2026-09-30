@@ -7,6 +7,7 @@ use rimdb_core::protocol::wal_frame::{
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use fs2::FileExt;
 
 /// Metadata describing a sealed uncompressed Warm Disk segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +61,10 @@ impl WarmDiskLog {
                 .create(true)
                 .truncate(false)
                 .open(&active_path)?;
+
+            file.try_lock_exclusive()
+                .map_err(|e| ServerError::RoomLocked(format!("active.wal locked by another process: {}", e)))?;
+
             self.active_file = Some(file);
             if self.active_start_seq.is_none() {
                 self.active_start_seq = Some(op.seq);
@@ -76,6 +81,26 @@ impl WarmDiskLog {
 
         self.active_end_seq = Some(op.seq);
         Ok(())
+    }
+
+    /// Number of operations currently accumulated in the unsealed active WAL segment.
+    pub fn active_ops_count(&self) -> usize {
+        match (self.active_start_seq, self.active_end_seq) {
+            (Some(start), Some(end)) if end.get() >= start.get() => {
+                (end.get() - start.get() + 1) as usize
+            }
+            _ => 0,
+        }
+    }
+
+    /// Lowest sequence number present in the currently active WAL segment.
+    pub fn active_start_seq(&self) -> Option<SequenceNumber> {
+        self.active_start_seq
+    }
+
+    /// Highest sequence number present in the currently active WAL segment.
+    pub fn active_end_seq(&self) -> Option<SequenceNumber> {
+        self.active_end_seq
     }
 
     /// Rotates and seals `active.wal` into an immutable `segment_{start}_{end}.wal` file.
@@ -229,6 +254,9 @@ impl WarmDiskLog {
             .read(true)
             .write(true)
             .open(&active_path)?;
+
+        file.try_lock_exclusive()
+            .map_err(|e| ServerError::RoomLocked(format!("active.wal locked by another process: {}", e)))?;
 
         let mut data = Vec::new();
         std::io::Read::read_to_end(&mut file, &mut data)?;

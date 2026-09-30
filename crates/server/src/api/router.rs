@@ -64,6 +64,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/rooms/:room_id/snapshot/chunk",
             post(relay::request_chunk),
+        )
+        .route(
+            "/rooms/:room_id/snapshot/upload-chunk",
+            post(relay::upload_chunk),
         );
 
     Router::new()

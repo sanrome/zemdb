@@ -92,7 +92,8 @@ pub async fn create_room(
 ) -> Result<(StatusCode, Json<RoomMetadata>), ServerError> {
     let meta = state
         .room_manager
-        .create_room(req.room_id, req.schema_id, req.lifecycle)?;
+        .create_room(req.room_id, req.schema_id, req.lifecycle)
+        .await?;
     Ok((StatusCode::CREATED, Json(meta)))
 }
 
@@ -103,7 +104,7 @@ pub async fn get_room(
     Path(room_id): Path<String>,
 ) -> Result<Json<RoomMetrics>, ServerError> {
     let rid = RoomId::new(room_id);
-    let sender = state.room_manager.get_or_spawn(&rid, None)?;
+    let sender = state.room_manager.get_or_spawn(&rid, None).await?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     sender
         .send(RoomCommand::GetMetrics { reply: tx })
@@ -123,6 +124,6 @@ pub async fn delete_room(
     Path(room_id): Path<String>,
 ) -> Result<StatusCode, ServerError> {
     let rid = RoomId::new(room_id);
-    state.room_manager.delete_room(&rid)?;
+    state.room_manager.delete_room(&rid).await?;
     Ok(StatusCode::NO_CONTENT)
 }
