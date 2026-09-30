@@ -26,12 +26,13 @@ fn test_schema() -> Schema {
 
 #[test]
 fn test_file_header_encode_decode_roundtrip() {
-    let header = FileHeader::new(100, 250, 4096);
+    let header = FileHeader::new(100, 250, 4096, 0x12345678);
     assert_eq!(header.magic, MAGIC_BYTES);
     assert_eq!(header.version, 1);
     assert_eq!(header.snapshot_seq, 100);
     assert_eq!(header.head_seq, 250);
     assert_eq!(header.snapshot_compressed_len, 4096);
+    assert_eq!(header.snapshot_payload_crc32, 0x12345678);
 
     let encoded = header.encode();
     assert_eq!(encoded.len(), HEADER_SIZE);
@@ -42,7 +43,7 @@ fn test_file_header_encode_decode_roundtrip() {
 
 #[test]
 fn test_file_header_rejects_invalid_magic() {
-    let mut header = FileHeader::new(0, 0, 0).encode();
+    let mut header = FileHeader::new(0, 0, 0, 0).encode();
     header[0] = b'X';
     let err = FileHeader::decode(&header).unwrap_err();
     assert!(matches!(err, StorageError::WalCorruption(_)));
@@ -50,7 +51,7 @@ fn test_file_header_rejects_invalid_magic() {
 
 #[test]
 fn test_file_header_rejects_corrupted_crc() {
-    let mut header = FileHeader::new(10, 20, 100).encode();
+    let mut header = FileHeader::new(10, 20, 100, 0).encode();
     // Tamper with head_seq byte
     header[16] ^= 0xFF;
     let err = FileHeader::decode(&header).unwrap_err();
@@ -837,6 +838,134 @@ async fn test_wal_replay_skips_operations_before_snapshot_seq() {
         .expect("row exists");
     // If stale_op had been replayed, score might have been 999 or caused sequence violation.
     assert_eq!(row.values[2], Value::Int(30));
+}
+
+#[tokio::test]
+async fn test_snapshot_payload_crc_corruption_detected() {
+    let tmp = tempfile::tempdir().unwrap();
+    let options = DiskStorageOptions::new(tmp.path());
+    let engine = DiskStorageEngine::new(options.clone());
+    let room_id = RoomId::new("room-crc-corruption");
+    let schema = test_schema();
+
+    engine.open_room(&room_id, schema.clone()).await.unwrap();
+
+    // Insert 5 rows
+    for i in 1..=5i64 {
+        let row = CompactRow::new(vec![
+            Value::Int(i),
+            Value::String(format!("User {i}").into()),
+            Value::Int(i * 10),
+            Value::Bool(true),
+        ]);
+        engine.apply_batch(&room_id, vec![SequencedOperation::with_default_origin(
+            i as u64,
+            Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 100),
+        )]).await.unwrap();
+    }
+
+    engine.compact_room(&room_id).await.unwrap();
+    engine.close_room(&room_id).await.unwrap();
+
+    // Tamper with a payload byte in the .snap file
+    let snap_path = tmp.path().join("room_room-crc-corruption.snap");
+    let mut snap_bytes = std::fs::read(&snap_path).unwrap();
+    assert!(snap_bytes.len() > HEADER_SIZE);
+    snap_bytes[HEADER_SIZE + 2] ^= 0xFF;
+    std::fs::write(&snap_path, snap_bytes).unwrap();
+
+    // Reopening the room must fail with SnapshotCorruption due to CRC mismatch
+    let engine_tampered = DiskStorageEngine::new(options);
+    let err = engine_tampered.open_room(&room_id, schema).await.unwrap_err();
+    assert!(matches!(err, StorageError::SnapshotCorruption(msg) if msg.contains("CRC32 mismatch")));
+}
+
+#[tokio::test]
+async fn test_crash_recovery_with_wal_compacting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let options = DiskStorageOptions::new(tmp.path());
+    let engine = DiskStorageEngine::new(options.clone());
+    let room_id = RoomId::new("room-compacting-crash");
+    let schema = test_schema();
+
+    engine.open_room(&room_id, schema.clone()).await.unwrap();
+
+    // 1. Initial 10 rows
+    for i in 1..=10i64 {
+        let row = CompactRow::new(vec![
+            Value::Int(i),
+            Value::String(format!("User {i}").into()),
+            Value::Int(i * 10),
+            Value::Bool(true),
+        ]);
+        engine.apply_batch(&room_id, vec![SequencedOperation::with_default_origin(
+            i as u64,
+            Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 100),
+        )]).await.unwrap();
+    }
+
+    engine.compact_room(&room_id).await.unwrap();
+    engine.close_room(&room_id).await.unwrap();
+
+    // 2. Simulate pre-crash state:
+    // Snapshot is at seq 10.
+    // An unfinished compaction left `wal.compacting` containing rows 11..15.
+    // The active `wal` file contains rows 16..20.
+    let mut compacting_ops = Vec::new();
+    for i in 11..=15i64 {
+        let row = CompactRow::new(vec![
+            Value::Int(i),
+            Value::String(format!("User {i}").into()),
+            Value::Int(i * 10),
+            Value::Bool(true),
+        ]);
+        compacting_ops.push(SequencedOperation::with_default_origin(
+            i as u64,
+            Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 200),
+        ));
+    }
+    let compacting_bytes = encode_wal_batch(&compacting_ops, None).unwrap();
+    let compacting_path = tmp.path().join("room_room-compacting-crash.wal.compacting");
+    std::fs::write(&compacting_path, compacting_bytes).unwrap();
+
+    let mut wal_ops = Vec::new();
+    for i in 16..=20i64 {
+        let row = CompactRow::new(vec![
+            Value::Int(i),
+            Value::String(format!("User {i}").into()),
+            Value::Int(i * 10),
+            Value::Bool(true),
+        ]);
+        wal_ops.push(SequencedOperation::with_default_origin(
+            i as u64,
+            Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 300),
+        ));
+    }
+    let wal_bytes = encode_wal_batch(&wal_ops, None).unwrap();
+    let wal_path = tmp.path().join("room_room-compacting-crash.wal");
+    std::fs::write(&wal_path, wal_bytes).unwrap();
+
+    // 3. Open room to trigger recovery
+    let engine_rec = DiskStorageEngine::new(options);
+    engine_rec.open_room(&room_id, schema).await.unwrap();
+
+    // Verify all rows from snapshot (1..10), compacting WAL (11..15), and active WAL (16..20) are restored
+    assert_eq!(
+        engine_rec.get_head_seq(&room_id).await.unwrap(),
+        SequenceNumber::from(20u64)
+    );
+
+    let row1 = engine_rec.get(&room_id, "users", &PrimaryKey::single(1i64)).await.unwrap().unwrap();
+    assert_eq!(row1.values[1], Value::String("User 1".into()));
+
+    let row12 = engine_rec.get(&room_id, "users", &PrimaryKey::single(12i64)).await.unwrap().unwrap();
+    assert_eq!(row12.values[1], Value::String("User 12".into()));
+
+    let row20 = engine_rec.get(&room_id, "users", &PrimaryKey::single(20i64)).await.unwrap().unwrap();
+    assert_eq!(row20.values[1], Value::String("User 20".into()));
+
+    // Verify wal.compacting was cleaned up
+    assert!(!compacting_path.exists());
 }
 
 

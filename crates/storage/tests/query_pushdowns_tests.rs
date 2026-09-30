@@ -345,3 +345,196 @@ async fn test_multi_batch_lazy_streaming_disk() {
     }
     assert_eq!(count, 75);
 }
+
+#[tokio::test]
+async fn test_scan_snapshot_isolation_memory() {
+    let engine = MemoryStorageEngine::new();
+    let room_id = RoomId::new("room-iso-mem");
+    engine.open_room(&room_id, test_schema()).await.unwrap();
+
+    // 1. Initial 10 rows
+    let mut initial_ops = Vec::new();
+    for i in 1..=10i64 {
+        let row = CompactRow::new(vec![
+            Value::Int(i),
+            Value::String(format!("User {i}").into()),
+            Value::Int(i * 10),
+            Value::Bool(true),
+        ]);
+        initial_ops.push(SequencedOperation::with_default_origin(
+            i as u64,
+            Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 100),
+        ));
+    }
+    engine.apply_batch(&room_id, initial_ops).await.unwrap();
+
+    // 2. Open scan stream and read first 2 rows
+    let mut stream = engine
+        .scan(&room_id, "users", ScanOptions::new())
+        .await
+        .unwrap();
+
+    let (pk1, row1) = stream.next().await.unwrap().unwrap();
+    assert_eq!(pk1, PrimaryKey::single(1i64));
+    assert_eq!(row1.values[2], Value::Int(10));
+
+    let (pk2, row2) = stream.next().await.unwrap().unwrap();
+    assert_eq!(pk2, PrimaryKey::single(2i64));
+    assert_eq!(row2.values[2], Value::Int(20));
+
+    // 3. Mutate table concurrently: insert 11..15, update 3..10 to 9999, delete 5
+    let mut mutate_ops = Vec::new();
+    let mut seq = 11u64;
+    for i in 11..=15i64 {
+        let row = CompactRow::new(vec![
+            Value::Int(i),
+            Value::String(format!("Phantom {i}").into()),
+            Value::Int(i * 100),
+            Value::Bool(false),
+        ]);
+        mutate_ops.push(SequencedOperation::with_default_origin(
+            seq,
+            Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 200),
+        ));
+        seq += 1;
+    }
+    for i in 3..=10i64 {
+        mutate_ops.push(SequencedOperation::with_default_origin(
+            seq,
+            Operation::update(
+                USERS_TABLE,
+                PrimaryKey::single(i),
+                vec![rimdb_core::ColumnUpdate::new(2, Value::Int(9999))],
+                201,
+            ),
+        ));
+        seq += 1;
+    }
+    mutate_ops.push(SequencedOperation::with_default_origin(
+        seq,
+        Operation::delete(USERS_TABLE, PrimaryKey::single(5i64), 202),
+    ));
+
+    engine.apply_batch(&room_id, mutate_ops).await.unwrap();
+
+    // 4. Continue reading from the original scan stream
+    let mut remaining_pks = Vec::new();
+    let mut remaining_scores = Vec::new();
+    while let Some(item) = stream.next().await {
+        let (pk, row) = item.unwrap();
+        remaining_pks.push(pk);
+        remaining_scores.push(row.values[2].clone());
+    }
+
+    // Verify snapshot isolation:
+    // Exactly rows 3..=10 must be returned in sequence
+    assert_eq!(
+        remaining_pks,
+        (3..=10i64).map(PrimaryKey::single).collect::<Vec<_>>()
+    );
+    // Scores must be the original ones (30, 40, ..., 100), NOT 9999
+    assert_eq!(
+        remaining_scores,
+        (3..=10i64).map(|i| Value::Int(i * 10)).collect::<Vec<_>>()
+    );
+    // Deleted row 5 was still returned in the snapshot
+    assert!(remaining_pks.contains(&PrimaryKey::single(5i64)));
+    // Phantoms 11..15 were NOT returned
+    assert!(!remaining_pks.contains(&PrimaryKey::single(11i64)));
+}
+
+#[tokio::test]
+async fn test_scan_snapshot_isolation_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let options = DiskStorageOptions::new(tmp.path());
+    let engine = DiskStorageEngine::new(options);
+    let room_id = RoomId::new("room-iso-disk");
+    engine.open_room(&room_id, test_schema()).await.unwrap();
+
+    // 1. Initial 10 rows
+    let mut initial_ops = Vec::new();
+    for i in 1..=10i64 {
+        let row = CompactRow::new(vec![
+            Value::Int(i),
+            Value::String(format!("User {i}").into()),
+            Value::Int(i * 10),
+            Value::Bool(true),
+        ]);
+        initial_ops.push(SequencedOperation::with_default_origin(
+            i as u64,
+            Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 100),
+        ));
+    }
+    engine.apply_batch(&room_id, initial_ops).await.unwrap();
+
+    // 2. Open scan stream and read first 2 rows
+    let mut stream = engine
+        .scan(&room_id, "users", ScanOptions::new())
+        .await
+        .unwrap();
+
+    let (pk1, row1) = stream.next().await.unwrap().unwrap();
+    assert_eq!(pk1, PrimaryKey::single(1i64));
+    assert_eq!(row1.values[2], Value::Int(10));
+
+    let (pk2, row2) = stream.next().await.unwrap().unwrap();
+    assert_eq!(pk2, PrimaryKey::single(2i64));
+    assert_eq!(row2.values[2], Value::Int(20));
+
+    // 3. Mutate table concurrently
+    let mut mutate_ops = Vec::new();
+    let mut seq = 11u64;
+    for i in 11..=15i64 {
+        let row = CompactRow::new(vec![
+            Value::Int(i),
+            Value::String(format!("Phantom {i}").into()),
+            Value::Int(i * 100),
+            Value::Bool(false),
+        ]);
+        mutate_ops.push(SequencedOperation::with_default_origin(
+            seq,
+            Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 200),
+        ));
+        seq += 1;
+    }
+    for i in 3..=10i64 {
+        mutate_ops.push(SequencedOperation::with_default_origin(
+            seq,
+            Operation::update(
+                USERS_TABLE,
+                PrimaryKey::single(i),
+                vec![rimdb_core::ColumnUpdate::new(2, Value::Int(9999))],
+                201,
+            ),
+        ));
+        seq += 1;
+    }
+    mutate_ops.push(SequencedOperation::with_default_origin(
+        seq,
+        Operation::delete(USERS_TABLE, PrimaryKey::single(5i64), 202),
+    ));
+
+    engine.apply_batch(&room_id, mutate_ops).await.unwrap();
+
+    // 4. Continue reading from the original scan stream
+    let mut remaining_pks = Vec::new();
+    let mut remaining_scores = Vec::new();
+    while let Some(item) = stream.next().await {
+        let (pk, row) = item.unwrap();
+        remaining_pks.push(pk);
+        remaining_scores.push(row.values[2].clone());
+    }
+
+    // Verify snapshot isolation on disk engine
+    assert_eq!(
+        remaining_pks,
+        (3..=10i64).map(PrimaryKey::single).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        remaining_scores,
+        (3..=10i64).map(|i| Value::Int(i * 10)).collect::<Vec<_>>()
+    );
+    assert!(remaining_pks.contains(&PrimaryKey::single(5i64)));
+    assert!(!remaining_pks.contains(&PrimaryKey::single(11i64)));
+}
+

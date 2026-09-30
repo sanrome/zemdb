@@ -17,7 +17,7 @@ use tokio::fs::{create_dir_all, File};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
-use crate::disk::compactor::compact_room_internal;
+use crate::disk::compactor::{compact_room_cow, compact_room_internal};
 use crate::disk::recovery::recover_room;
 use crate::memory::{RoomSnapshotPayload, RoomSnapshotRef};
 use crate::disk::wal::WalWriter;
@@ -83,12 +83,13 @@ pub struct DiskRoomState {
     pub schema: Schema,
     pub head_seq: SequenceNumber,
     pub snapshot_seq: SequenceNumber,
-    pub tables: HashMap<u16, BTreeMap<PrimaryKey, CompactRow>>,
+    pub tables: HashMap<u16, Arc<BTreeMap<PrimaryKey, CompactRow>>>,
     pub wal_file: File,
     pub snap_path: PathBuf,
     pub wal_path: PathBuf,
     pub snapshot_len: u64,
     pub wal_len: u64,
+    pub is_compacting: bool,
 }
 
 /// High-performance, crash-resilient disk storage engine for RimDB.
@@ -99,13 +100,14 @@ pub struct DiskRoomState {
 /// - `room_{id}.wal`: Append-only Write-Ahead Log (WAL) of delta batches enqueued
 ///   with framing `0xBA7C` and per-batch CRC32.
 /// - True CoW compaction: Background snapshot generation replaces `room_{id}.snap`
-///   atomically without blocking incoming WAL writes, followed by in-place WAL truncation.
-/// - Fast in-memory index/tables (`BTreeMap`) reconstructed via startup Replay.
-/// - Non-blocking batched cursor scans (64 items per yield) preventing writer starvation.
+///   atomically without blocking incoming WAL writes, rotating to `wal.compacting`.
+/// - Fast in-memory index/tables (`BTreeMap`) stored in `Arc` references for zero-lock scan isolation.
+/// - Non-blocking batched cursor scans (64 items per yield) reading frozen table snapshots.
 #[derive(Debug, Clone)]
 pub struct DiskStorageEngine {
     options: DiskStorageOptions,
     rooms: Arc<RwLock<HashMap<RoomId, Arc<RwLock<DiskRoomState>>>>>,
+    compaction_locks: Arc<dashmap::DashMap<RoomId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl DiskStorageEngine {
@@ -114,6 +116,7 @@ impl DiskStorageEngine {
         Self {
             options,
             rooms: Arc::new(RwLock::new(HashMap::new())),
+            compaction_locks: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -141,18 +144,25 @@ impl DiskStorageEngine {
             .ok_or_else(|| StorageError::RoomNotFound(room_id.clone()))
     }
 
+    fn get_compaction_lock(&self, room_id: &RoomId) -> Arc<tokio::sync::Mutex<()>> {
+        self.compaction_locks
+            .entry(room_id.clone())
+            .or_default()
+            .clone()
+    }
+
     /// Explicitly triggers snapshot compaction and WAL truncation for a room.
     #[tracing::instrument(skip(self), fields(room_id = %room_id))]
     pub async fn compact_room(&self, room_id: &RoomId) -> Result<(), StorageError> {
         let room_arc = self.get_room(room_id).await?;
-        let mut room = room_arc.write().await;
-        compact_room_internal(&mut room, &self.options).await
+        let compaction_lock = self.get_compaction_lock(room_id);
+        let _guard = compaction_lock.lock().await;
+        compact_room_cow(room_arc, &self.options).await
     }
 }
 
 struct DiskScanState {
-    room_arc: Arc<RwLock<DiskRoomState>>,
-    table_id: u16,
+    table_data: Arc<BTreeMap<PrimaryKey, CompactRow>>,
     range: KeyRange,
     direction: ScanDirection,
     projection: Option<Vec<u16>>,
@@ -199,6 +209,7 @@ impl StorageEngine for DiskStorageEngine {
             wal_path,
             snapshot_len: recovered.snapshot_len,
             wal_len: recovered.wal_len,
+            is_compacting: false,
         };
 
         rooms.insert(room_id.clone(), Arc::new(RwLock::new(room_state)));
@@ -209,10 +220,14 @@ impl StorageEngine for DiskStorageEngine {
 
     #[tracing::instrument(skip(self), fields(room_id = %room_id))]
     async fn close_room(&self, room_id: &RoomId) -> Result<(), StorageError> {
+        let compaction_lock = self.get_compaction_lock(room_id);
+        let _compaction_guard = compaction_lock.lock().await;
+
         let mut rooms = self.rooms.write().await;
         if let Some(room_arc) = rooms.remove(room_id) {
             let room = room_arc.write().await;
             room.wal_file.sync_all().await?;
+            self.compaction_locks.remove(room_id);
             tracing::info!(room_id = %room_id, "Closed disk room");
             Ok(())
         } else {
@@ -264,7 +279,8 @@ impl StorageEngine for DiskStorageEngine {
             } = *room;
 
             for SequencedOperation { seq, op } in ops {
-                let table_map = tables.entry(op.table_id).or_default();
+                let table_arc = tables.entry(op.table_id).or_default();
+                let table_map = Arc::make_mut(table_arc);
 
                 match op.kind {
                     OperationKind::Insert { row } => {
@@ -299,10 +315,21 @@ impl StorageEngine for DiskStorageEngine {
 
         // 5. Check if compaction threshold is triggered
         if self.options.auto_compact
+            && !room.is_compacting
             && room.wal_len >= self.options.min_compaction_bytes
             && room.wal_len >= (room.snapshot_len as f64 * self.options.compaction_ratio) as u64
         {
-            compact_room_internal(&mut room, &self.options).await?;
+            let compaction_lock = self.get_compaction_lock(room_id);
+            if let Ok(compaction_guard) = compaction_lock.try_lock_owned() {
+                let room_arc_clone = Arc::clone(&room_arc);
+                let options_clone = self.options.clone();
+                tokio::spawn(async move {
+                    let _guard = compaction_guard;
+                    if let Err(e) = compact_room_cow(room_arc_clone, &options_clone).await {
+                        tracing::error!(error = %e, "Background auto-compaction failed");
+                    }
+                });
+            }
         }
 
         tracing::debug!(room_id = %room_id, head_seq = room.head_seq.get(), "Applied batch to disk room");
@@ -334,17 +361,17 @@ impl StorageEngine for DiskStorageEngine {
         options: ScanOptions,
     ) -> Result<RowStream<'a>, StorageError> {
         let room_arc = self.get_room(room_id).await?;
-        let table_id = {
+        let table_data = {
             let room = room_arc.read().await;
-            room.schema.get_table_id(table).ok_or_else(|| StorageError::TableNotFound {
+            let table_id = room.schema.get_table_id(table).ok_or_else(|| StorageError::TableNotFound {
                 room_id: room_id.clone(),
                 table: table.to_string(),
-            })?
+            })?;
+            room.tables.get(&table_id).cloned().unwrap_or_else(|| Arc::new(BTreeMap::new()))
         };
 
         let state = DiskScanState {
-            room_arc,
-            table_id,
+            table_data,
             range: options.range,
             direction: options.direction,
             projection: options.projection,
@@ -369,10 +396,6 @@ impl StorageEngine for DiskStorageEngine {
                 None => BATCH_SIZE,
             };
 
-            let room_guard = state.room_arc.read().await;
-            let empty = BTreeMap::new();
-            let table_data = room_guard.tables.get(&state.table_id).unwrap_or(&empty);
-
             let batch_items: Vec<Result<(PrimaryKey, CompactRow), StorageError>> =
                 match state.direction {
                     ScanDirection::Forward => {
@@ -380,7 +403,7 @@ impl StorageEngine for DiskStorageEngine {
                             Some(cur) => (std::ops::Bound::Excluded(cur), state.range.end_bound()),
                             None => (state.range.start_bound(), state.range.end_bound()),
                         };
-                        let iter = table_data.range((start_bound, end_bound));
+                        let iter = state.table_data.range((start_bound, end_bound));
                         apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
                             .collect()
                     }
@@ -389,12 +412,11 @@ impl StorageEngine for DiskStorageEngine {
                             Some(cur) => (state.range.start_bound(), std::ops::Bound::Excluded(cur)),
                             None => (state.range.start_bound(), state.range.end_bound()),
                         };
-                        let iter = table_data.range((start_bound, end_bound)).rev();
+                        let iter = state.table_data.range((start_bound, end_bound)).rev();
                         apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
                             .collect()
                     }
                 };
-            drop(room_guard);
 
             let count = batch_items.len();
             if count == 0 {
@@ -411,6 +433,9 @@ impl StorageEngine for DiskStorageEngine {
 
             if let Some(rem) = state.remaining_limit.as_mut() {
                 *rem = rem.saturating_sub(count);
+                if *rem == 0 {
+                    state.exhausted = true;
+                }
             }
 
             state.buffer.extend(batch_items);
@@ -467,6 +492,9 @@ impl StorageEngine for DiskStorageEngine {
         }
 
         let room_arc = self.get_room(room_id).await?;
+        let compaction_lock = self.get_compaction_lock(room_id);
+        let _guard = compaction_lock.lock().await;
+
         let mut room = room_arc.write().await;
 
         room.schema = schema;

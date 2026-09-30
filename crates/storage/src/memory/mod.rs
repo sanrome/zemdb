@@ -49,8 +49,7 @@ impl MemoryStorageEngine {
 }
 
 struct MemoryScanState {
-    room_arc: Arc<RwLock<RoomState>>,
-    table_id: u16,
+    table_data: Arc<BTreeMap<PrimaryKey, CompactRow>>,
     range: KeyRange,
     direction: ScanDirection,
     projection: Option<Vec<u16>>,
@@ -133,9 +132,10 @@ impl StorageEngine for MemoryStorageEngine {
 
         // 2. Apply operations to in-memory tables
         for SequencedOperation { seq, op } in ops {
-            let table_map = tables
+            let table_arc = tables
                 .entry(op.table_id)
                 .or_default();
+            let table_map = Arc::make_mut(table_arc);
 
             match op.kind {
                 OperationKind::Insert { row } => {
@@ -201,20 +201,21 @@ impl StorageEngine for MemoryStorageEngine {
         options: ScanOptions,
     ) -> Result<RowStream<'a>, StorageError> {
         let room_arc = self.get_room(room_id)?;
-        let table_id = {
+        let table_data = {
             let room_state = room_arc
                 .read()
                 .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
 
-            room_state.schema.get_table_id(table).ok_or_else(|| StorageError::TableNotFound {
+            let table_id = room_state.schema.get_table_id(table).ok_or_else(|| StorageError::TableNotFound {
                 room_id: room_id.clone(),
                 table: table.to_string(),
-            })?
+            })?;
+
+            room_state.tables.get(&table_id).cloned().unwrap_or_else(|| Arc::new(BTreeMap::new()))
         };
 
         let state = MemoryScanState {
-            room_arc,
-            table_id,
+            table_data,
             range: options.range,
             direction: options.direction,
             projection: options.projection,
@@ -239,21 +240,6 @@ impl StorageEngine for MemoryStorageEngine {
                 None => BATCH_SIZE,
             };
 
-            let room_arc = Arc::clone(&state.room_arc);
-            let room_guard = match room_arc.read() {
-                Ok(guard) => guard,
-                Err(e) => {
-                    state.exhausted = true;
-                    return Some((
-                        Err(StorageError::Other(format!("Room lock poisoned: {e}"))),
-                        state,
-                    ));
-                }
-            };
-
-            let empty = BTreeMap::new();
-            let table_data = room_guard.tables.get(&state.table_id).unwrap_or(&empty);
-
             let batch_items: Vec<Result<(PrimaryKey, CompactRow), StorageError>> =
                 match state.direction {
                     ScanDirection::Forward => {
@@ -261,7 +247,7 @@ impl StorageEngine for MemoryStorageEngine {
                             Some(cur) => (std::ops::Bound::Excluded(cur), state.range.end_bound()),
                             None => (state.range.start_bound(), state.range.end_bound()),
                         };
-                        let iter = table_data.range((start_bound, end_bound));
+                        let iter = state.table_data.range((start_bound, end_bound));
                         apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
                             .collect()
                     }
@@ -270,12 +256,11 @@ impl StorageEngine for MemoryStorageEngine {
                             Some(cur) => (state.range.start_bound(), std::ops::Bound::Excluded(cur)),
                             None => (state.range.start_bound(), state.range.end_bound()),
                         };
-                        let iter = table_data.range((start_bound, end_bound)).rev();
+                        let iter = state.table_data.range((start_bound, end_bound)).rev();
                         apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
                             .collect()
                     }
                 };
-            drop(room_guard);
 
             let count = batch_items.len();
             if count == 0 {

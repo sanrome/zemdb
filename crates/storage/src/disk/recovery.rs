@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::SeekFrom;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 
 use rimdb_core::{
@@ -22,114 +23,32 @@ pub struct RecoveredRoom {
     pub snapshot_seq: SequenceNumber,
     pub snapshot_len: u64,
     pub wal_len: u64,
-    pub tables: HashMap<u16, BTreeMap<PrimaryKey, CompactRow>>,
+    pub tables: HashMap<u16, Arc<BTreeMap<PrimaryKey, CompactRow>>>,
 }
 
-/// Replays a room from disk following the Dual-File architecture:
-/// 1. Reads the immutable base snapshot from `snap_path` (`room_{id}.snap`),
-///    reconstructing base tables and base `head_seq`.
-/// 2. Streams and replays all framed WAL batches from `wal_path` (`room_{id}.wal`) using a 64 KB `BufReader`,
-///    applying mutations on top of tables and advancing `head_seq`.
-/// 3. Detects and truncates any incomplete torn write at WAL EOF in-place.
-#[tracing::instrument(skip(schema, wal_file_std), fields(room_id = %room_id, snap_path = ?snap_path, wal_path = ?wal_path))]
-pub async fn recover_room(
-    room_id: &RoomId,
-    snap_path: &Path,
-    wal_path: &Path,
+struct WalReplayOutcome {
+    valid_bytes: usize,
+    torn_write: Option<String>,
+    applied_count: usize,
+}
+
+async fn replay_wal_file(
+    file: &mut tokio::fs::File,
     schema: &Schema,
-    wal_file_std: std::fs::File,
-) -> Result<RecoveredRoom, StorageError> {
-    let mut tables = HashMap::new();
-    for table_id in schema.tables_by_id.keys() {
-        tables.insert(*table_id, BTreeMap::new());
-    }
-
-    let mut snapshot_seq = SequenceNumber::from(0u64);
-    let mut head_seq = SequenceNumber::from(0u64);
-    let mut snapshot_len = 0u64;
-
-    // 1. Recover base snapshot from snap_path if it exists
-    if snap_path.exists() {
-        let snap_std = std::fs::OpenOptions::new().read(true).open(snap_path)?;
-        let snap_file = tokio::fs::File::from_std(snap_std);
-        let snap_meta = snap_file.metadata().await?;
-        let snap_file_len = snap_meta.len();
-
-        if snap_file_len < HEADER_SIZE as u64 {
-            return Err(StorageError::WalCorruption(format!(
-                "Snapshot file size {snap_file_len} is smaller than minimum header size {HEADER_SIZE}"
-            )));
-        }
-
-        let mut snap_reader = BufReader::with_capacity(64 * 1024, snap_file);
-        let mut header_bytes = [0u8; HEADER_SIZE];
-        snap_reader.read_exact(&mut header_bytes).await.map_err(|e| {
-            StorageError::WalCorruption(format!("Failed to read snapshot file header: {e}"))
-        })?;
-
-        let header = FileHeader::decode(&header_bytes)?;
-        snapshot_len = header.snapshot_compressed_len;
-        snapshot_seq = SequenceNumber::from(header.snapshot_seq);
-        head_seq = SequenceNumber::from(header.head_seq);
-
-        if snapshot_len > 0 {
-            let expected_total = HEADER_SIZE as u64 + snapshot_len;
-            if snap_file_len < expected_total {
-                return Err(StorageError::SnapshotCorruption(format!(
-                    "Snapshot file truncated: expected length {expected_total}, actual {snap_file_len}"
-                )));
-            }
-
-            let mut compressed_snap = vec![0u8; snapshot_len as usize];
-            snap_reader.read_exact(&mut compressed_snap).await.map_err(|e| {
-                StorageError::SnapshotCorruption(format!("Failed to read snapshot bytes: {e}"))
-            })?;
-
-            let decompressed = tokio::task::spawn_blocking(move || {
-                zstd::decode_all(&compressed_snap[..])
-            })
-            .await
-            .map_err(|e| StorageError::Other(format!("Join error: {e}")))?
-            .map_err(|e| StorageError::SnapshotCorruption(format!("Zstd decompression failed: {e}")))?;
-
-            let mut payload: RoomSnapshotPayload = bincode::deserialize(&decompressed)
-                .map_err(|e| StorageError::SnapshotCorruption(e.to_string()))?;
-
-            snapshot_seq = payload.head_seq;
-            head_seq = payload.head_seq;
-
-            for table_id in schema.tables_by_id.keys() {
-                payload.tables.entry(*table_id).or_default();
-            }
-            tables = payload.tables;
-        }
-    } else {
-        // Create initial empty snapshot
-        let header = FileHeader::new(0, 0, 0);
-        let mut snap_file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(snap_path)
-            .await?;
-        snap_file.write_all(&header.encode()).await?;
-        snap_file.sync_all().await?;
-        if let Some(parent) = snap_path.parent() {
-            sync_dir(parent)?;
-        }
-    }
-
-    // 2. Replay append-only WAL batches from wal_path
-    let mut wal_file = tokio::fs::File::from_std(wal_file_std);
-    let wal_meta = wal_file.metadata().await?;
+    snapshot_seq: SequenceNumber,
+    head_seq: &mut SequenceNumber,
+    tables: &mut HashMap<u16, Arc<BTreeMap<PrimaryKey, CompactRow>>>,
+) -> Result<WalReplayOutcome, StorageError> {
+    let wal_meta = file.metadata().await?;
     let wal_file_len = wal_meta.len();
 
     let mut valid_wal_bytes: usize = 0;
     let mut torn_write: Option<String> = None;
+    let mut applied_count: usize = 0;
 
     if wal_file_len > 0 {
-        wal_file.seek(SeekFrom::Start(0)).await?;
-        let mut reader = BufReader::with_capacity(64 * 1024, &mut wal_file);
+        file.seek(SeekFrom::Start(0)).await?;
+        let mut reader = BufReader::with_capacity(64 * 1024, file);
 
         loop {
             let mut header_buf = [0u8; BATCH_HEADER_SIZE];
@@ -143,7 +62,6 @@ pub async fn recover_room(
             }
 
             if header_read == 0 {
-                // Clean EOF
                 break;
             }
 
@@ -156,7 +74,6 @@ pub async fn recover_room(
 
             let magic = [header_buf[0], header_buf[1]];
             if magic != BATCH_MAGIC {
-                // Check if unparsed tail is completely zero-filled (e.g. from power cut or crash on thin-provisioned/pre-allocated storage)
                 if header_buf.iter().all(|&b| b == 0) {
                     let mut rest = Vec::new();
                     reader.read_to_end(&mut rest).await?;
@@ -213,7 +130,6 @@ pub async fn recover_room(
 
             let actual_crc = crc32fast::hash(&payload);
             if actual_crc != expected_crc {
-                // If there are no subsequent valid batch headers remaining, treat CRC mismatch as a torn write at EOF
                 let mut peek_buf = [0u8; BATCH_HEADER_SIZE];
                 let peek_bytes = reader.read(&mut peek_buf).await?;
                 let has_subsequent_valid_batch = if peek_bytes >= 2 {
@@ -249,13 +165,13 @@ pub async fn recover_room(
             }
 
             for op in ops {
-                // Skip deltas already consolidated in the base snapshot
                 if op.seq <= snapshot_seq {
                     continue;
                 }
 
                 if schema.has_table_by_id(op.op.table_id) {
-                    let table_map = tables.entry(op.op.table_id).or_default();
+                    let table_arc = tables.entry(op.op.table_id).or_default();
+                    let table_map = Arc::make_mut(table_arc);
 
                     match op.op.kind {
                         OperationKind::Insert { row } => {
@@ -283,17 +199,189 @@ pub async fn recover_room(
                     }
                 }
 
-                if op.seq > head_seq {
-                    head_seq = op.seq;
+                if op.seq > *head_seq {
+                    *head_seq = op.seq;
                 }
+                applied_count += 1;
             }
 
             valid_wal_bytes += total_expected_batch_len;
         }
     }
 
-    // 3. Truncate torn write at WAL EOF if detected
-    if let Some(ref reason) = torn_write {
+    Ok(WalReplayOutcome {
+        valid_bytes: valid_wal_bytes,
+        torn_write,
+        applied_count,
+    })
+}
+
+/// Replays a room from disk following the Dual-File architecture:
+/// 1. Reads the immutable base snapshot from `snap_path` (`room_{id}.snap`),
+///    verifying header and compressed payload CRC32 checksums before decompressing.
+/// 2. If a pre-crash rotated WAL (`room_{id}.wal.compacting`) exists, checks whether its deltas
+///    were already folded into the snapshot or require recovery.
+/// 3. Streams and replays all framed WAL batches from `wal_path` (`room_{id}.wal`),
+///    applying mutations on top of tables and advancing `head_seq`.
+/// 4. Detects and truncates any incomplete torn write at WAL EOF in-place.
+#[tracing::instrument(skip(schema, wal_file_std), fields(room_id = %room_id, snap_path = ?snap_path, wal_path = ?wal_path))]
+pub async fn recover_room(
+    room_id: &RoomId,
+    snap_path: &Path,
+    wal_path: &Path,
+    schema: &Schema,
+    wal_file_std: std::fs::File,
+) -> Result<RecoveredRoom, StorageError> {
+    let mut tables: HashMap<u16, Arc<BTreeMap<PrimaryKey, CompactRow>>> = HashMap::new();
+    for table_id in schema.tables_by_id.keys() {
+        tables.insert(*table_id, Arc::new(BTreeMap::new()));
+    }
+
+    let mut snapshot_seq = SequenceNumber::from(0u64);
+    let mut head_seq = SequenceNumber::from(0u64);
+    let mut snapshot_len = 0u64;
+
+    // 1. Recover base snapshot from snap_path if it exists
+    if snap_path.exists() {
+        let snap_std = std::fs::OpenOptions::new().read(true).open(snap_path)?;
+        let snap_file = tokio::fs::File::from_std(snap_std);
+        let snap_meta = snap_file.metadata().await?;
+        let snap_file_len = snap_meta.len();
+
+        if snap_file_len < HEADER_SIZE as u64 {
+            return Err(StorageError::WalCorruption(format!(
+                "Snapshot file size {snap_file_len} is smaller than minimum header size {HEADER_SIZE}"
+            )));
+        }
+
+        let mut snap_reader = BufReader::with_capacity(64 * 1024, snap_file);
+        let mut header_bytes = [0u8; HEADER_SIZE];
+        snap_reader.read_exact(&mut header_bytes).await.map_err(|e| {
+            StorageError::WalCorruption(format!("Failed to read snapshot file header: {e}"))
+        })?;
+
+        let header = FileHeader::decode(&header_bytes)?;
+        snapshot_len = header.snapshot_compressed_len;
+        snapshot_seq = SequenceNumber::from(header.snapshot_seq);
+        head_seq = SequenceNumber::from(header.head_seq);
+
+        if snapshot_len > 0 {
+            let expected_total = HEADER_SIZE as u64 + snapshot_len;
+            if snap_file_len < expected_total {
+                return Err(StorageError::SnapshotCorruption(format!(
+                    "Snapshot file truncated: expected length {expected_total}, actual {snap_file_len}"
+                )));
+            }
+
+            let mut compressed_snap = vec![0u8; snapshot_len as usize];
+            snap_reader.read_exact(&mut compressed_snap).await.map_err(|e| {
+                StorageError::SnapshotCorruption(format!("Failed to read snapshot bytes: {e}"))
+            })?;
+
+            // Validate compressed snapshot payload CRC32 before decompression
+            let actual_payload_crc = crc32fast::hash(&compressed_snap);
+            if header.snapshot_payload_crc32 != 0 && header.snapshot_payload_crc32 != actual_payload_crc {
+                return Err(StorageError::SnapshotCorruption(format!(
+                    "Snapshot payload CRC32 mismatch: expected {}, got {}",
+                    header.snapshot_payload_crc32, actual_payload_crc
+                )));
+            }
+
+            let decompressed = tokio::task::spawn_blocking(move || {
+                zstd::decode_all(&compressed_snap[..])
+            })
+            .await
+            .map_err(|e| StorageError::Other(format!("Join error: {e}")))?
+            .map_err(|e| StorageError::SnapshotCorruption(format!("Zstd decompression failed: {e}")))?;
+
+            let mut payload: RoomSnapshotPayload = bincode::deserialize(&decompressed)
+                .map_err(|e| StorageError::SnapshotCorruption(e.to_string()))?;
+
+            snapshot_seq = payload.head_seq;
+            head_seq = payload.head_seq;
+
+            for table_id in schema.tables_by_id.keys() {
+                payload.tables.entry(*table_id).or_default();
+            }
+            tables = payload.tables;
+        }
+    } else {
+        // Create initial empty snapshot
+        let header = FileHeader::new(0, 0, 0, 0);
+        let mut snap_file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(snap_path)
+            .await?;
+        snap_file.write_all(&header.encode()).await?;
+        snap_file.sync_all().await?;
+        if let Some(parent) = snap_path.parent() {
+            sync_dir(parent)?;
+        }
+    }
+
+    // Clean up any lingering temporary snapshot files from interrupted compactions
+    if let Some(parent) = snap_path.parent() {
+        if let Ok(mut entries) = tokio::fs::read_dir(parent).await {
+            let snap_file_name = snap_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            let tmp_prefix = format!("{}.tmp.", snap_file_name);
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if let Ok(name) = entry.file_name().into_string() {
+                    if name.starts_with(&tmp_prefix) {
+                        let _ = tokio::fs::remove_file(entry.path()).await;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check for pre-crash rotating WAL (`room_{id}.wal.compacting`)
+    let wal_compacting_path = wal_path.with_extension("wal.compacting");
+    let mut wal_compacting_bytes_to_merge: Option<Vec<u8>> = None;
+
+    if wal_compacting_path.exists() {
+        let std_compacting = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&wal_compacting_path)?;
+        let mut compacting_file = tokio::fs::File::from_std(std_compacting);
+        let outcome = replay_wal_file(
+            &mut compacting_file,
+            schema,
+            snapshot_seq,
+            &mut head_seq,
+            &mut tables,
+        )
+        .await?;
+
+        if outcome.applied_count > 0 {
+            // Uncompacted deltas were present; read valid bytes to merge into the active WAL
+            compacting_file.seek(SeekFrom::Start(0)).await?;
+            let mut buf = vec![0u8; outcome.valid_bytes];
+            compacting_file.read_exact(&mut buf).await?;
+            wal_compacting_bytes_to_merge = Some(buf);
+        }
+
+        // Clean up the compacting WAL segment
+        drop(compacting_file);
+        let _ = tokio::fs::remove_file(&wal_compacting_path).await;
+    }
+
+    // 3. Replay append-only WAL batches from wal_path
+    let mut wal_file = tokio::fs::File::from_std(wal_file_std);
+    let outcome = replay_wal_file(
+        &mut wal_file,
+        schema,
+        snapshot_seq,
+        &mut head_seq,
+        &mut tables,
+    )
+    .await?;
+
+    let mut valid_wal_bytes = outcome.valid_bytes;
+
+    // Truncate torn write at WAL EOF if detected
+    if let Some(ref reason) = outcome.torn_write {
         tracing::warn!(
             room_id = %room_id,
             reason = %reason,
@@ -301,6 +389,23 @@ pub async fn recover_room(
         );
         wal_file.set_len(valid_wal_bytes as u64).await?;
         wal_file.sync_all().await?;
+    }
+
+    // If pre-crash compacting bytes needed merging, prepend them to active WAL
+    if let Some(compacting_bytes) = wal_compacting_bytes_to_merge {
+        wal_file.seek(SeekFrom::Start(0)).await?;
+        let mut active_wal_content = vec![0u8; valid_wal_bytes];
+        if valid_wal_bytes > 0 {
+            wal_file.read_exact(&mut active_wal_content).await?;
+        }
+
+        wal_file.seek(SeekFrom::Start(0)).await?;
+        wal_file.write_all(&compacting_bytes).await?;
+        wal_file.write_all(&active_wal_content).await?;
+        wal_file.sync_all().await?;
+
+        valid_wal_bytes = compacting_bytes.len() + active_wal_content.len();
+        wal_file.set_len(valid_wal_bytes as u64).await?;
     }
 
     wal_file.seek(SeekFrom::End(0)).await?;
