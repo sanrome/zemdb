@@ -51,24 +51,24 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 │ C-06 │ Crítico  │ crates/core/src/protocol/wal_frame.rs│ [RESUELTO] Torn writes en EOF con CRC fallido clasificados y truncados limpiamente.    │
 │ C-07 │ Crítico  │ crates/core/src/protocol/wal_frame.rs│ [RESUELTO] WalReader bufferiza lotes multi-op sin descartar operaciones 2..N.          │
 │ C-08 │ Crítico  │ crates/server/src/actor/lease.rs     │ [RESUELTO] Rediseño Onboarding: Bootstrapping state + Ancla de retención de snapshots. │
-│ C-09 │ Crítico  │ crates/server/src/actor/manager.rs   │ Condición de carrera TOCTOU en get_or_spawn duplica actores de sala y corrompe WALs.   │
-│ C-10 │ Crítico  │ crates/server/src/relay.rs           │ Inyección arbitraria de estado por upload anónimo y colisión con DefaultBodyLimit 16MB. │
-│ C-11 │ Crítico  │ crates/core/src/schema/table.rs      │ Deserialización de TableSchema elude invariantes estructurales provocando pánico.       │
+│ C-09 │ Crítico  │ crates/server/src/actor/manager.rs   │ [RESUELTO] TOCTOU erradicado con cerrojos asíncronos por sala en get_or_spawn.        │
+│ C-10 │ Crítico  │ crates/server/src/relay.rs           │ [RESUELTO] Upload multipart autenticado, límite 16MB superado y hash BLAKE3 validado. │
+│ C-11 │ Crítico  │ crates/core/src/schema/table.rs      │ [RESUELTO] Deserialización de TableSchema estricta y eliminación de .expect() (C-11).   │
 ├──────┼──────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┤
-│ A-01 │ Alto     │ crates/server/src/actor/room.rs      │ I/O síncrono bloqueante y compresión Zstd ejecutados en el reactor asíncrono de Tokio.  │
+│ A-01 │ Alto     │ crates/server/src/actor/room.rs      │ [RESUELTO] Aislamiento asíncrono Tokio: Zstd y disco aislados en spawn_blocking (A-01).│
 │ A-02 │ Alto     │ crates/server/src/micro_wal.rs       │ [RESUELTO] Crecimiento ilimitado de MicroWal: resuelto al erradicar MicroWal (C-04).   │
-│ A-03 │ Alto     │ crates/storage/src/disk/mod.rs       │ Falsa compactación CoW: bloqueo exclusivo de sala congela escrituras concurrentes.      │
-│ A-04 │ Alto     │ crates/storage/src/disk/compactor.rs │ Carrera O_TRUNC antes de flock en compactor trunca snapshots concurrentes a 0 bytes.    │
-│ A-05 │ Alto     │ crates/storage/src/disk/format.rs    │ Cabecera FileHeader carece de checksum/CRC sobre el payload comprimido del snapshot.   │
+│ A-03 │ Alto     │ crates/storage/src/disk/mod.rs       │ [RESUELTO] Rotación WAL y compactación CoW en 3 fases sin bloqueo escritor (A-03).    │
+│ A-04 │ Alto     │ crates/storage/src/disk/compactor.rs │ [RESUELTO] Snapshots temporales con UUID previenen carreras O_TRUNC (A-04).            │
+│ A-05 │ Alto     │ crates/storage/src/disk/format.rs    │ [RESUELTO] Checksum CRC32 sobre payload comprimido en FileHeader validado en recovery. │
 │ A-06 │ Alto     │ crates/storage/src/engine.rs         │ Ruptura de Liskov en StorageEngine: formatos incompatibles de snapshot (Memory vs Disk).│
-│ A-07 │ Alto     │ crates/server/src/actor/room.rs      │ Falta de validación ack_seq <= head_seq en handle_ack permite purga catastrófica de logs│
+│ A-07 │ Alto     │ crates/server/src/actor/room.rs      │ [RESUELTO] Validación ack_seq <= head_seq en handle_ack previene purga catastrófica.    │
 │ A-08 │ Alto     │ crates/storage/src/disk/mod.rs       │ apply_batch omite validación de esquema, permitiendo mutaciones de tipos incompatibles. │
-│ A-09 │ Alto     │ crates/storage/src/disk/mod.rs       │ Escaneo lazy por chunks libera el lock entre bloques, rompiendo Snapshot Isolation.    │
+│ A-09 │ Alto     │ crates/storage/src/disk/mod.rs       │ [RESUELTO] Snapshot Isolation en scan con vistas CoW inmutables Arc<BTreeMap> (A-09).  │
 │ A-10 │ Alto     │ crates/server/src/actor/lease.rs     │ Deadlock lógico en Dead Man's Switch: clientes Disconnected bloquean poda de logs.      │
-│ A-11 │ Alto     │ crates/server/src/api/data_plane.rs  │ Data Plane utiliza get_room en RAM en lugar de lazy-spawning, fallando tras reinicios.  │
-│ A-12 │ Alto     │ crates/server/src/log/tiered_log.rs  │ Inversión jerárquica en fetch_deltas: escaneo síncrono de disco previo al RAM HotBuffer.│
-│ A-13 │ Alto     │ crates/server/src/log/tiered_log.rs  │ Evicción destructiva del HotBuffer al sellar segmentos vacía el 100% de la memoria.    │
-│ A-14 │ Alto     │ crates/server/src/actor/manager.rs   │ delete_room elimina directorio físicamente con actor Tokio en vuelo y descriptores vivos.│
+│ A-11 │ Alto     │ crates/server/src/api/data_plane.rs  │ [RESUELTO] Data Plane reactiva salas con get_or_spawn tolerando reinicios del servidor.│
+│ A-12 │ Alto     │ crates/server/src/log/tiered_log.rs  │ [RESUELTO] Inversión jerárquica: RAM HotBuffer evaluado antes que disco en fetch_deltas.│
+│ A-13 │ Alto     │ crates/server/src/log/tiered_log.rs  │ [RESUELTO] Ventana deslizante en HotBuffer: erradicada evicción destructiva a cero.     │
+│ A-14 │ Alto     │ crates/server/src/actor/manager.rs   │ [RESUELTO] delete_room coordina RoomCommand::Shutdown y espera el JoinHandle del actor.│
 │ A-15 │ Alto     │ crates/server/src/relay.rs           │ [RESUELTO] SnapshotRelay respaldado en disco con TTL configurable y purga física.       │
 │ A-16 │ Alto     │ crates/client/src/lib.rs             │ Crate rimdb-client es un cascarón vacío stub sin implementación del SDK de cliente.     │
 │ A-17 │ Alto     │ crates/server/tests/                 │ Suites de prueba ignoran deliberadamente catchup_ops permitiendo pérdidas de datos.     │
@@ -80,13 +80,13 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 │ M-05 │ Medio    │ crates/server/src/api/auth.rs        │ [RESUELTO] Backdoor dev-token cableado eliminado de código de autenticación.            │
 │ M-06 │ Medio    │ crates/server/src/api/control_plane  │ Evolución DDL (add_column) no emite señal SSE provocando desincronización de esquemas.  │
 │ M-07 │ Medio    │ crates/server/src/api/data_plane.rs  │ [RESUELTO] Validación estricta 3-way room_id en URL path vs token vs payload.          │
-│ M-08 │ Medio    │ crates/server/src/api/data_plane.rs  │ Ausencia de timeouts perimetrales en llamadas sender.send y rx.await hacia actores.     │
-│ M-09 │ Medio    │ crates/server/src/api/data_plane.rs  │ max_batch_size en /sync sin límite superior permite decodificación masiva abusiva (DoS)│
+│ M-08 │ Medio    │ crates/server/src/api/data_plane.rs  │ [RESUELTO] Timeouts perimetrales de 5s en actor calls retornando 504 GatewayTimeout.  │
+│ M-09 │ Medio    │ crates/server/src/api/data_plane.rs  │ [RESUELTO] max_batch_size en /sync acotado defensivamente a 1..=1000 previniendo DoS. │
 │ M-10 │ Medio    │ crates/server/src/log/tiered_log.rs  │ Avance prematuro de tail_seq en prune_older_than induce BehindCompaction espurio.       │
 │ M-11 │ Medio    │ crates/server/src/log/warm_disk.rs   │ [RESUELTO] Doble fsync eliminado: unificado en un solo fsync atómico por commit (C-04).│
-│ M-12 │ Medio    │ crates/server/src/log/warm_disk.rs   │ Ausencia de cerrojos multi-proceso (flock) sobre WALs del servidor.                     │
+│ M-12 │ Medio    │ crates/server/src/log/warm_disk.rs   │ [RESUELTO] Cerrojos exclusivos multi-proceso (flock) en active.wal con fs2.            │
 │ M-13 │ Medio    │ crates/storage/src/engine.rs         │ Contrato StorageEngine exige table: &str en get/scan forzando búsquedas por string.     │
-│ M-14 │ Medio    │ crates/core/src/schema/global.rs     │ Sobrescritura silenciosa de tablas con igual nombre y overflow en asignación de IDs.    │
+│ M-14 │ Medio    │ crates/core/src/schema/global.rs     │ [RESUELTO] Detección de tablas duplicadas y aritmética segura de table_id en add_table. │
 │ M-15 │ Medio    │ crates/core/src/value/row.rs         │ Fuga de encapsulamiento e implementación impropia de Deref en PrimaryKey y CompactRow.  │
 │ M-16 │ Medio    │ crates/storage/src/disk/mod.rs       │ Retención de cerrojo global del motor durante I/O de sala en close_room.                │
 ├──────┼──────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┤
@@ -175,20 +175,23 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
   - **Promoción Fluida a `Connected`**: Al aplicar el snapshot en $S$ y enviar su primer `/sync` o `Ack` que alcance o supere $S$, el cliente es promovido de `Bootstrapping` a `Connected`. Si el snapshot vence por TTL o es purgado del relay, la restricción se libera automáticamente.
 
 #### [C-09] Condición de carrera TOCTOU en `get_or_spawn` duplica actores de sala y corrompe WALs
+* **Estado**: **RESUELTO (Fase 3.5-B.3)**
 * **Ubicación Exacta**: [`crates/server/src/actor/manager.rs:63-122`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/manager.rs#L63-L122).
 * **Causa Raíz**: `get_or_spawn_with_policy` consulta `self.rooms.get(room_id)`. Si no existe, libera el lock de `DashMap`, resuelve el esquema en disco y ejecuta `RoomActor::spawn`. Múltiples peticiones concurrentes para una sala no activa superan la comprobación en paralelo y lanzan dos o más tareas Tokio independientes para la misma sala sobre los mismos archivos en disco sin bloqueos `flock`.
 * **Impacto**: Corrupción catastrófica de los logs WAL por escrituras intercaladas no coordinadas y generación de actores huérfanos compitiendo por el secuenciador.
-* **Solución Técnica**: Utilizar el entry pattern de `DashMap` o un cerrojo shardeado de inicialización (`tokio::sync::Mutex` por `RoomId`) para garantizar que la instanciación de un `RoomActor` sea estrictamente atómica y única.
+* **Solución Técnica / Implementada**: Se introdujo un mapa de cerrojos asíncronos por sala (`spawn_locks: DashMap<RoomId, Arc<tokio::sync::Mutex<()>>>`) en `RoomManager`. Al invocar `get_or_spawn` o `get_or_spawn_with_policy`, se adquiere el cerrojo exclusivo de la sala antes de resolver el esquema o spawnear el actor, aplicando comprobación de doble verificación (*double-checked locking*). Las tareas concurrentes compitiendo por la misma sala esperan al cerrojo y reutilizan de forma segura el sender ya instanciado, erradicando por completo el TOCTOU.
 
 #### [C-10] Inyección arbitraria de estado por upload anónimo y colisión con `DefaultBodyLimit` (16 MB)
+* **Estado**: **RESUELTO (Fase 3.5-B.3)**
 * **Ubicación Exacta**: [`crates/server/src/relay.rs:120-150`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/relay.rs#L120-L150), [`crates/server/src/api/router.rs:72`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/router.rs#L72).
 * **Causa Raíz**:
   1. `POST /rooms/:id/snapshot/upload` no exige autenticación alguna; cualquier cliente puede subir un buffer binario arbitrario que el relay acepta y distribuye a clientes en onboarding.
   2. La subida se realiza monolíticamente en un solo POST (`body: Bytes`). El router aplica `.layer(DefaultBodyLimit::max(16 * 1024 * 1024))`. Si un snapshot supera 16 MB, es rechazado con HTTP 413, invalidando el protocolo multipart concebido para datasets grandes.
 * **Impacto**: Inyección y envenenamiento de estado en clientes. Inoperabilidad absoluta del bootstrapping para bases de datos superiores a 16 MB.
-* **Solución Técnica**: Exigir autenticación criptográfica en la subida e implementar un endpoint multipart por fragmentos (`POST /rooms/:id/snapshot/upload-chunk`) ensamblado en disco efímero.
+* **Solución Técnica / Implementada**: Se aseguraron todos los endpoints de subida y descarga de snapshots con autenticación estricta (Bearer token de cliente acotado a la sala o Admin secret). Se implementaron los mensajes `ClientMessage::UploadSnapshotChunk` y `ServerMessage::SnapshotUploadChunkAck` y la ruta `POST /rooms/:room_id/snapshot/upload-chunk` para cargas multipart por fragmentos de hasta 1 MB, eliminando la barrera de 16 MB de `DefaultBodyLimit`. El relay consolida y valida el digest BLAKE3 del payload completo ensamblado antes de publicarlo.
 
 #### [C-11] Deserialización de `TableSchema` elude invariantes estructurales provocando pánico
+* **Estado**: **RESUELTO (Fase 3.5-A.4)**
 * **Ubicación Exacta**: [`crates/core/src/schema/table.rs:162-188`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/schema/table.rs#L162-L188), [`crates/core/src/schema/validation.rs:390-395`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/schema/validation.rs#L390-L395).
 * **Causa Raíz**: La implementación de `Deserialize` para `TableSchema` deserializa campos crudos sin invocar las validaciones del builder (PK no vacía, columnas de PK existentes y no nulas, nombres de columna únicos). En `validation.rs`, el código asume que el invariante se cumple y ejecuta `.expect("primary key column must exist in column_indices")`.
 * **Impacto**: Un payload JSON malicioso o corrupto enviado a `/admin/schemas` provoca el pánico del proceso del servidor al procesar mutaciones sobre el esquema deserializado.
@@ -199,10 +202,11 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 ### DEFECTOS DE SEVERIDAD ALTA
 
 #### [A-01] I/O síncrono bloqueante y compresión Zstd ejecutados en el reactor asíncrono de Tokio
+* **Estado**: **RESUELTO (Fase 3.5-B.1)**
 * **Ubicación Exacta**: [`crates/server/src/actor/room.rs:104-121`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs#L104-L121), [`crates/server/src/log/cold_disk.rs:26-50`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/log/cold_disk.rs#L26-L50), [`crates/server/src/actor/lease.rs:70-80`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/lease.rs#L70-L80).
-* **Causa Raíz**: En `handle_commit`, `handle_ack` y `run_periodic_maintenance` (cada 500 ms), se invocan llamadas bloqueantes de `std::fs` (`write_all`, `sync_data`, `rename`) y compresión intensiva de CPU `zstd::stream::encode_all` directamente sobre los hilos worker de Tokio sin usar `spawn_blocking`.
+* **Causa Raíz**: En `handle_commit`, `handle_ack` y `run_periodic_maintenance` (cada 500 ms), se invocaban llamadas bloqueantes de `std::fs` (`write_all`, `sync_data`, `rename`) y compresión intensiva de CPU `zstd::stream::encode_all` directamente sobre los hilos worker de Tokio sin usar `spawn_blocking`.
 * **Impacto**: Inanición del pool de hilos de Tokio (*thread starvation*), provocando picos de latencia de red y caídas de conexiones por timeouts de heartbeat.
-* **Solución Técnica**: Confinar la compresión Zstd y las operaciones de disco a `tokio::task::spawn_blocking` o migrar descriptores a `tokio::fs`.
+* **Solución Técnica / Implementada**: Se confinó la compresión Zstandard intensiva en CPU (`ColdDiskLog::compress_warm_segment`) a tareas bloqueantes mediante `tokio::task::spawn_blocking`, evitando la inanición del pool worker de Tokio. Asimismo, `RoomActor::run_periodic_maintenance` invoca de forma asíncrona no bloqueante `TieredLog::run_maintenance().await`.
 
 #### [A-02] Crecimiento ilimitado de `MicroWal` y lectura monolítica a RAM con riesgo de OOM en arranque
 * **Estado**: **RESUELTO (Erradicación de MicroWal por C-04)**
@@ -212,22 +216,25 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica / Implementada**: Resuelto definitivamente mediante la erradicación completa de `MicroWal` (remediación `C-04`). La deduplicación se hidrata directamente desde los segmentos rotados, comprimidos y podados de `TieredLog`, eliminando el archivo secundario y su consumo desmedido de almacenamiento y memoria.
 
 #### [A-03] Falsa compactación CoW: bloqueo exclusivo de sala congela escrituras concurrentes
-* **Ubicación Exacta**: [`crates/storage/src/disk/mod.rs:301-306`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/mod.rs#L301-L306), [`crates/storage/src/disk/compactor.rs:20-88`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/compactor.rs#L20-L88).
+* **Estado**: **RESUELTO (Fase 3.5-B.2)**
+* **Ubicación Exacta**: [`crates/storage/src/disk/mod.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/mod.rs), [`crates/storage/src/disk/compactor.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/compactor.rs).
 * **Causa Raíz**: La compactación se ejecuta inline dentro de `apply_batch` manteniendo adquirido el cerrojo exclusivo `room_arc.write().await` durante toda la serialización Bincode, compresión Zstd y fsyncs.
 * **Impacto**: Congelamiento de lecturas y escrituras durante la compactación. Si se intentara mover a background sin rediseñar el WAL, `wal_file.set_len(0)` truncaría y destruiría las mutaciones añadidas concurrentemente.
-* **Solución Técnica**: Rotar el WAL a un segmento `wal.compacting`, abrir un nuevo WAL activo para escrituras concurrentes inmediatas y comprimir el segmento en background.
+* **Solución Técnica / Implementada**: Se implementó el protocolo de compactación CoW en 3 fases (`compact_room_cow`). En la Fase 1 (bloqueo exclusivo <1 ms), se vacía el WAL activo, se rota atómicamente a `wal.compacting`, se inicializa un nuevo archivo `wal` para recibir escrituras concurrentes sin interrupción, se extrae una vista CoW inmutable de las tablas (`Arc<BTreeMap>`) y el cursor de corte `cut_seq`, liberando de inmediato el cerrojo. En la Fase 2 (en background vía `spawn_blocking`), se serializa, comprime con Zstd, calcula el CRC32 y escribe a un archivo temporal único con fsync. En la Fase 3 (bloqueo exclusivo <1 ms), se reemplaza atómicamente el snapshot, se sincroniza el directorio, se desvincula `wal.compacting` y se actualiza `snapshot_seq`, preservando todas las operaciones concurrentes ingresadas al nuevo WAL durante el proceso.
 
 #### [A-04] Carrera `O_TRUNC` antes de `flock` en compactor trunca snapshots concurrentes a 0 bytes
-* **Ubicación Exacta**: [`crates/storage/src/disk/compactor.rs:46-53`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/compactor.rs#L46-L53).
+* **Estado**: **RESUELTO (Fase 3.5-B.2)**
+* **Ubicación Exacta**: [`crates/storage/src/disk/compactor.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/compactor.rs).
 * **Causa Raíz**: El archivo temporal de snapshot utiliza una ruta fija `room_{id}.snap.tmp`. Se abre con `.truncate(true)`, lo cual ejecuta la llamada al sistema `open(O_TRUNC)` antes de solicitar el cerrojo `try_lock_exclusive()`.
 * **Impacto**: Si dos procesos o workers intentan compactar la misma sala, el segundo trunca el archivo a 0 bytes mientras el primero aún escribe en él, resultando en snapshots corruptos o vacíos.
-* **Solución Técnica**: Utilizar nombres temporales únicos basados en UUIDs (`snap.tmp.{uuid}`) y adquirir cerrojos de sala independientes antes de crear archivos.
+* **Solución Técnica / Implementada**: Se reemplazó la ruta temporal estática por nombres temporales únicos basados en UUID v4 (`snap.tmp.{uuid}`) abiertos con `create_new(true)` (`O_CREAT | O_EXCL`). Adicionalmente, el motor de almacenamiento gestiona un cerrojo por sala (`compaction_locks: DashMap<RoomId, Arc<Mutex<()>>>`) que garantiza una única tarea de compactación activa por sala, eliminando cualquier riesgo de truncado concurrente destructivo.
 
 #### [A-05] Cabecera `FileHeader` carece de checksum/CRC sobre el payload comprimido del snapshot
-* **Ubicación Exacta**: [`crates/storage/src/disk/format.rs:60-70`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/format.rs#L60-L70), [`crates/storage/src/disk/recovery.rs:70-94`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/recovery.rs#L70-L94).
+* **Estado**: **RESUELTO (Fase 3.5-B.2)**
+* **Ubicación Exacta**: [`crates/storage/src/disk/format.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/format.rs), [`crates/storage/src/disk/recovery.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/recovery.rs).
 * **Causa Raíz**: `header_crc` en `FileHeader` solo cubre los primeros 32 bytes de metadatos. El cuerpo comprimido con Zstandard no posee ninguna suma de comprobación en disco.
 * **Impacto**: Corrupción silenciosa en disco (*bit rot*) no es detectada a nivel de formato, pasando directamente a la descompresión con riesgo de fallos opacos.
-* **Solución Técnica**: Utilizar bytes del campo `reserved` para incorporar `snapshot_payload_crc32: u32` o digest BLAKE3 y verificarlo antes de descomprimir.
+* **Solución Técnica / Implementada**: Se incorporó el campo `snapshot_payload_crc32: u32` dentro de la cabecera canónica de 64 bytes de `FileHeader`, aprovechando bytes reservados y asegurando que el checksum del encabezado (`header_crc`) valide también la integridad del descriptor del payload. Durante la recuperación en arranque (`recover_room`), el sistema calcula y verifica el CRC32 sobre los bytes comprimidos leídos antes de invocar la descompresión con Zstd, retornando un error explícito de corrupción (`StorageError::SnapshotCorruption`) si se detecta cualquier alteración en disco.
 
 #### [A-06] Ruptura de Liskov en `StorageEngine`: formatos incompatibles de snapshot (Memory vs Disk)
 * **Ubicación Exacta**: [`crates/storage/src/engine.rs:68-78`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/engine.rs#L68-L78), [`crates/storage/src/memory/mod.rs:327`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/memory/mod.rs#L327), [`crates/storage/src/disk/mod.rs:443`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/mod.rs#L443).
@@ -236,6 +243,7 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica**: Estandarizar un contenedor canónico de snapshot a nivel de trait con cabecera fija que declare versión y algoritmo de compresión (`None` o `Zstd`).
 
 #### [A-07] Falta de validación `ack_seq <= head_seq` en `handle_ack` permite purga catastrófica de logs
+* **Estado**: **RESUELTO (Fase 3.5-A.4)**
 * **Ubicación Exacta**: [`crates/server/src/actor/room.rs:348-373`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs#L348-L373).
 * **Causa Raíz**: `handle_ack` no valida que `ack_seq <= self.head_seq`. Si un cliente corrupto envía `ack_seq = u64::MAX`, `prune_older_than(u64::MAX)` borra todos los segmentos Warm y Cold y vacía el `HotBuffer`.
 * **Impacto**: Destrucción inmediata del historial activo de la sala. Todos los demás clientes reciben `BehindCompaction` y quedan forzados a descargar snapshots completos.
@@ -248,10 +256,11 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica**: Incorporar `room.schema.validate_operation(&op.op)?` antes de aplicar cambios en disco y memoria.
 
 #### [A-09] Escaneo lazy por chunks libera el lock entre bloques, rompiendo Snapshot Isolation
-* **Ubicación Exacta**: [`crates/storage/src/disk/mod.rs:357-418`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/mod.rs#L357-L418), [`crates/storage/src/memory/mod.rs:227-302`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/memory/mod.rs#L227-L302).
+* **Estado**: **RESUELTO (Fase 3.5-B.2)**
+* **Ubicación Exacta**: [`crates/storage/src/disk/mod.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/mod.rs), [`crates/storage/src/memory/mod.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/memory/mod.rs).
 * **Causa Raíz**: El stream de `scan` libera el cerrojo de lectura cada 64 tuplas. Mutaciones concurrentes intermedias alteran las tablas mientras el stream continúa.
 * **Impacto**: Ruptura del aislamiento transaccional (*torn reads*, lecturas fantasma e inconsistencia temporal en consultas de rango).
-* **Solución Técnica**: Clonar un puntero CoW inmutable del árbol de índices `Arc<BTreeMap>` al inicio del escaneo para garantizar aislamiento Snapshot Isolation sin bloquear escritores.
+* **Solución Técnica / Implementada**: Se migró la estructura de almacenamiento de tablas en memoria a `HashMap<u16, Arc<BTreeMap<PrimaryKey, CompactRow>>>`. Al iniciar cualquier operación `scan`, se adquiere brevemente el cerrojo de lectura (<1 µs) para clonar el puntero `Arc<BTreeMap>` correspondiente a la tabla solicitada y se libera inmediatamente el cerrojo de la sala. El stream lazy itera exclusivamente sobre la vista CoW inmutable clonada, garantizando Snapshot Isolation estricto sin retener cerrojos, sin lecturas desgarradas (*torn reads*) y permitiendo a los escritores concurrentes mutar el árbol mediante `Arc::make_mut` sin bloquearse mutuamente.
 
 #### [A-10] Deadlock lógico en Dead Man's Switch: clientes `Disconnected` bloquean poda de logs
 * **Ubicación Exacta**: [`crates/server/src/actor/lease.rs:177-231`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/lease.rs#L177-L231).
@@ -260,28 +269,32 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica**: Basar la transición a `Dormant` directamente en el tiempo transcurrido en `Disconnected` (timeout de inactividad de 90s).
 
 #### [A-11] Data Plane utiliza `get_room` en RAM en lugar de lazy-spawning, fallando tras reinicios
+* **Estado**: **RESUELTO (Fase 3.5-B.3)**
 * **Ubicación Exacta**: [`crates/server/src/api/data_plane.rs:156-544`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/data_plane.rs#L156-L544).
 * **Causa Raíz**: Los endpoints `/commit`, `/sync`, `/ack`, etc., consultan `state.room_manager.get_room(&room_id)`, que solo busca en el `DashMap` en RAM.
 * **Impacto**: Tras un reinicio del servidor, clientes legítimos previamente registrados reciben HTTP 404 `RoomNotFound`, aunque la sala exista íntegra en disco.
-* **Solución Técnica**: Utilizar `state.room_manager.get_or_spawn(&room_id, None)` en todos los handlers de datos.
+* **Solución Técnica / Implementada**: Se reemplazó el uso de `get_room` por `get_or_spawn(&room_id, None).await` en todos los endpoints del plano de datos (`/register`, `/commit`, `/sync`, `/ack`, `/heartbeat`, `/schema`, `/deregister`, `/events`). Ante un reinicio del servidor, el plano de datos reactiva la sala perezosamente en demanda recuperando el esquema y metadatos persistidos en disco sin requerir intervención del plano de control.
 
 #### [A-12] Inversión jerárquica en `fetch_deltas`: escaneo síncrono de disco previo al RAM `HotBuffer`
+* **Estado**: **RESUELTO (Fase 3.5-B.1)**
 * **Ubicación Exacta**: [`crates/server/src/log/tiered_log.rs:157-205`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/log/tiered_log.rs#L157-L205).
-* **Causa Raíz**: `fetch_deltas` escanea primero el disco Cold, luego el disco Warm con `read_dir`, y solo en último término consulta la memoria RAM.
-* **Impacto**: En el 99% de las consultas de clientes activos, el servidor ejecuta llamadas síncronas a disco para deltas que ya residen en memoria, degradando el throughput.
-* **Solución Técnica**: Invertir la evaluación: verificar primero si `from_seq >= hot_buffer.min_seq()` y responder inmediatamente en sub-milisegundo desde RAM.
+* **Causa Raíz**: `fetch_deltas` escaneaba primero el disco Cold, luego el disco Warm con `read_dir`, y solo en último término consultaba la memoria RAM.
+* **Impacto**: En el 99% de las consultas de clientes activos, el servidor ejecutaba llamadas síncronas a disco para deltas que ya residían en memoria, degradando el throughput.
+* **Solución Técnica / Implementada**: Se reordenó la jerarquía de evaluación en `TieredLog::fetch_deltas`. Se incorporó un Fast Path en RAM que verifica prioritariamente si `from_seq >= hot_buffer.min_seq()`, respondiendo inmediatamente en sub-microsegundos con búsqueda $O(1)$ sin realizar llamadas a disco ni syscalls. Solo si el cursor requerido es anterior al buffer en memoria, el flujo desciende a consultar los segmentos Warm y Cold en disco.
 
 #### [A-13] Evicción destructiva del `HotBuffer` al sellar segmentos vacía el 100% de la memoria
+* **Estado**: **RESUELTO (Fase 3.5-B.1)**
 * **Ubicación Exacta**: [`crates/server/src/log/tiered_log.rs:121-129`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/log/tiered_log.rs#L121-L129).
-* **Causa Raíz**: Al sellar un segmento Warm con límite `end`, ejecuta `hot_buffer.evict_older_than(end + 1)`. Al ser `end` la última mutación agregada, purga el 100% del buffer.
+* **Causa Raíz**: Al sellar un segmento Warm con límite `end`, ejecutaba `hot_buffer.evict_older_than(end + 1)`. Al ser `end` la última mutación agregada, purgaba el 100% del buffer.
 * **Impacto**: Caída cíclica del buffer a cero elementos (*Cache Flush Cliff*), forzando a los clientes a leer del disco tras cada rotación.
-* **Solución Técnica**: Mantener una ventana deslizante basada en `ram_max_ops` o TTL en memoria en lugar de vaciar todo el buffer.
+* **Solución Técnica / Implementada**: Se implementó una política de ventana deslizante continua en `HotBuffer` regulada por capacidad (`ram_max_ops`) y tiempo de retención (`ram_ttl`) mediante `apply_sliding_window`. Se desacopló la rotación física de segmentos en disco (`active.wal` a `segment_{start}_{end}.wal`) de la memoria, eliminando la llamada destructiva `hot_buffer.evict_older_than(end + 1)` en rotaciones. La memoria retiene de forma continua las operaciones más recientes, erradicando las caídas de caché a cero (*Cache Flush Cliff*).
 
 #### [A-14] `delete_room` elimina directorio físicamente con actor Tokio en vuelo y descriptores vivos
+* **Estado**: **RESUELTO (Fase 3.5-B.3)**
 * **Ubicación Exacta**: [`crates/server/src/actor/manager.rs:196-207`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/manager.rs#L196-L207).
 * **Causa Raíz**: `delete_room` remueve el sender del mapa y seguidamente ejecuta `fs::remove_dir_all`. La tarea del actor continúa ejecutándose con descriptores de archivo abiertos.
 * **Impacto**: Fallos de I/O (`AccessDenied`/`EBUSY`) en Windows y creación de archivos zombi en Unix.
-* **Solución Técnica**: Enviar `RoomCommand::Shutdown`, hacer `.await` sobre su `JoinHandle` y solo entonces eliminar el directorio.
+* **Solución Técnica / Implementada**: Se implementó el comando `RoomCommand::Shutdown { reply }` en el bucle del actor de sala y se almacenan los `JoinHandle<()>` en `room_handles`. Al invocar `delete_room`, se envía `Shutdown`, se espera la confirmación del actor y la terminación completa de la tarea Tokio (`handle.await`), cerrando y liberando todos los descriptores de archivo y bloqueos antes de invocar `fs::remove_dir_all`.
 
 #### [A-15] `SnapshotRelay` en memoria RAM sin cuota ni backpressure susceptible a ataques DoS (OOM)
 * **Estado**: **RESUELTO**
@@ -351,14 +364,18 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica / Implementada**: Se implementó una verificación estricta de 3 vías en todos los endpoints operativos (`/commit`, `/sync`, `/ack`, `/heartbeat`, `/schema`, `/deregister`, `/events`): el `room_id` del path de la URL debe coincidir exactamente con el `room_id` verificado del Bearer token y con el `room_id` contenido en el payload del mensaje binario (`ClientMessage`), y el `client_id` del payload debe coincidir con el `client_id` del token. Ante cualquier discrepancia, se rechaza inmediatamente con `ErrorCode::Unauthorized` / `ServerError::Unauthorized`.
 
 #### [M-08] Ausencia de timeouts perimetrales en llamadas `sender.send` y `rx.await` hacia actores
+* **Estado**: **RESUELTO (Fase 3.5-B.3)**
 * **Ubicación Exacta**: [`crates/server/src/api/data_plane.rs:90-204`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/data_plane.rs#L90-L204).
 * **Causa Raíz**: Peticiones HTTP esperan indefinidamente la respuesta del buzón del actor.
-* **Solución Técnica**: Envolver las operaciones en `tokio::time::timeout(Duration::from_secs(5), ...)`.
+* **Impacto**: Bloqueo de peticiones y agotamiento de descriptores de red ante actores congestionados o no receptivos.
+* **Solución Técnica / Implementada**: Se envolvieron todas las interacciones con los canales del actor de sala (`sender.send` y `rx.await`) en `tokio::time::timeout(ACTOR_TIMEOUT, ...)`, donde `ACTOR_TIMEOUT = Duration::from_secs(5)`. Si el actor no responde en dicho plazo, se retorna inmediatamente `ServerError::GatewayTimeout` mapeado a HTTP 504 Gateway Timeout y `ErrorCode::Internal`.
 
 #### [M-09] `max_batch_size` en `/sync` sin límite superior permite decodificación masiva abusiva (DoS)
+* **Estado**: **RESUELTO (Fase 3.5-B.3)**
 * **Ubicación Exacta**: [`crates/server/src/actor/room.rs:307-346`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs#L307-L346).
 * **Causa Raíz**: El cliente puede enviar `max_batch_size: u32::MAX`, saturando memoria en deserialización.
-* **Solución Técnica**: Acotar en el servidor: `let limit = max_batch_size.clamp(1, 1000) as usize;`.
+* **Impacto**: Consumo desmedido de CPU y memoria en deserialización y transmisión de deltas de sincronización.
+* **Solución Técnica / Implementada**: En `RoomActor::handle_sync`, se acotó defensivamente el límite solicitado mediante `let clamped_batch_size = max_batch_size.clamp(1, 1000);`, impidiendo la sobrecarga del reactor y de la memoria RAM ante valores arbitrarios o abusivos.
 
 #### [M-10] Avance prematuro de `tail_seq` en `prune_older_than` induce `BehindCompaction` espurio
 * **Ubicación Exacta**: [`crates/server/src/log/tiered_log.rs:376-378`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/log/tiered_log.rs#L376-L378).
@@ -372,9 +389,11 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica / Implementada**: Resuelto mediante la erradicación de `MicroWal` (remediación `C-04`). Cada mutación confirmada realiza un único `sync_data()` en `active.wal`, reduciendo el I/O de disco a la mitad por commit.
 
 #### [M-12] Ausencia de cerrojos multi-proceso (`flock`) sobre WALs del servidor
+* **Estado**: **RESUELTO (Fase 3.5-B.3)**
 * **Ubicación Exacta**: [`crates/server/src/micro_wal.rs:51-57`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/micro_wal.rs#L51-L57), [`crates/server/src/log/warm_disk.rs:50-56`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/log/warm_disk.rs#L50-L56).
 * **Causa Raíz**: Los archivos se abren sin `fs2::FileExt::try_lock_exclusive`.
-* **Solución Técnica**: Solicitar cerrojo exclusivo de kernel al abrir los archivos de la sala.
+* **Impacto**: Corrupción silenciosa si múltiples procesos del servidor arrancan sobre el mismo directorio de datos.
+* **Solución Técnica / Implementada**: En `WarmDiskLog::append_record` y `WarmDiskLog::inspect_active_segment`, se adquiere un cerrojo exclusivo de kernel a nivel de sistema de archivos (`file.try_lock_exclusive()`) sobre `active.wal` utilizando la crate `fs2`. Cualquier proceso concurrente o secundario que intente abrir el mismo archivo WAL recibe de inmediato un error controlado `ServerError::RoomLocked` mapeado a HTTP 423 Locked.
 
 #### [M-13] Contrato `StorageEngine` exige `table: &str` en `get`/`scan` forzando búsquedas por string
 * **Ubicación Exacta**: [`crates/storage/src/engine.rs:49-64`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/engine.rs#L49-L64).
@@ -382,6 +401,7 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica**: Sobrecargar o refactorizar la interfaz para aceptar `table_id: u16`.
 
 #### [M-14] Sobrescritura silenciosa de tablas con igual nombre y overflow en asignación de IDs
+* **Estado**: **RESUELTO (Fase 3.5-A.4)**
 * **Ubicación Exacta**: [`crates/core/src/schema/global.rs:20-31`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/schema/global.rs#L20-L31).
 * **Causa Raíz**: `add_table` inserta ciegamente sin retornar `Result` ante duplicados.
 * **Solución Técnica**: Validar colisiones y retornar `Result<u16, ValidationError>`.

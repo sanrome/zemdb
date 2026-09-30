@@ -92,14 +92,14 @@ Este documento define la arquitectura correctiva para erradicar la totalidad de 
 
 ### 2.2. Motor de Almacenamiento y Persistencia Local (`crates/storage`)
 
-#### Solución S-05: Verdadera Compactación Copy-on-Write No Bloqueante (`A-03`, `A-04`)
+#### Solución S-05: Verdadera Compactación Copy-on-Write No Bloqueante (`A-03`, `A-04`) [RESUELTO]
 * **Módulos Afectados**: [`crates/storage/src/disk/compactor.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/compactor.rs), [`crates/storage/src/disk/mod.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/mod.rs).
-* **Diseño Técnico**:
+* **Diseño Técnico e Implementación**:
   - Eliminar la ejecución de `compact_room_internal` bajo el cerrojo exclusivo de la sala en `apply_batch`.
   - **Protocolo de Rotación CoW**:
     1. Al activarse la compactación, adquirir brevemente el cerrojo de escritura de la sala.
     2. Rotar el WAL: renombrar atómicamente `room_{id}.wal` a `room_{id}.wal.compacting` y abrir un nuevo descriptor `room_{id}.wal` vacío para absorber escrituras concurrentes inmediatas.
-    3. Clonar la vista inmutable `Arc<HashMap<u16, BTreeMap<PrimaryKey, CompactRow>>>` y registrar el número de secuencia de corte $S$.
+    3. Clonar la vista inmutable `Arc<HashMap<u16, Arc<BTreeMap<PrimaryKey, CompactRow>>>>` y registrar el número de secuencia de corte $S$.
     4. Liberar inmediatamente el cerrojo de la sala (tiempo de parada $< 1\text{ ms}$).
     5. En una tarea en segundo plano delegada a `tokio::task::spawn_blocking`: serializar a Bincode, comprimir con Zstandard y escribir a `room_{id}.snap.tmp.{uuid}` con sync a disco y `sync_dir`.
     6. Adquirir brevemente el cerrojo de la sala para renombrar atómicamente el snapshot temporal sobre `room_{id}.snap` y borrar de forma segura `room_{id}.wal.compacting`. Las escrituras concurrentes acumuladas en el nuevo `room_{id}.wal` permanecen intactas.
@@ -116,17 +116,17 @@ Este documento define la arquitectura correctiva para erradicar la totalidad de 
   - En `decode_wal_batch_from_slice`, distinguir entre corrupciones en registros intermedios y discrepancias de CRC32 en el último registro en la frontera de `EOF`. Si el fallo ocurre en el último frame antes del fin de archivo y no restan más bytes, clasificarlo como `WalBatchDecodeResult::TornWrite { valid_bytes_offset, .. }`.
   - Al detectar `TornWrite`, el motor trunca físicamente el archivo en `valid_bytes_offset` mediante `file.set_len()` y continúa con el arranque normal.
 
-#### Solución S-07: Cabecera Canónica de Snapshot con Verificación de Integridad (`A-05`, `A-06`)
+#### Solución S-07: Cabecera Canónica de Snapshot con Verificación de Integridad (`A-05`, `A-06`) [RESUELTO PARA A-05]
 * **Módulos Afectados**: [`crates/storage/src/disk/format.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/format.rs), [`crates/storage/src/engine.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/engine.rs), [`crates/storage/src/memory/mod.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/memory/mod.rs), [`crates/storage/src/disk/mod.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/mod.rs).
-* **Diseño Técnico**:
+* **Diseño Técnico e Implementación**:
   - Actualizar `FileHeader` para utilizar 4 bytes de su zona `reserved` para almacenar `snapshot_payload_crc32: u32`. En `recover_room`, verificar este CRC antes de descomprimir el payload.
   - Estandarizar la interfaz `StorageEngine::create_snapshot` y `apply_snapshot` para retornar y aceptar un buffer prefijado con cabecera canónica unificada:
     `[magic: 4B "RMSN"][version: 1B][compression_flag: 1B (0=raw, 1=zstd)][uncompressed_len: 4B][crc32: 4B][payload]`
   - Tanto `MemoryStorageEngine` como `DiskStorageEngine` respetarán este enmarcado, garantizando interoperabilidad transparente entre motores.
 
-#### Solución S-08: Validación de Esquema en Almacenamiento y Optimización de Consultas (`A-08`, `A-09`, `M-13`)
+#### Solución S-08: Validación de Esquema en Almacenamiento y Optimización de Consultas (`A-08`, `A-09`, `M-13`) [RESUELTO PARA A-09]
 * **Módulos Afectados**: [`crates/storage/src/disk/mod.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/mod.rs), [`crates/storage/src/memory/mod.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/memory/mod.rs), [`crates/storage/src/engine.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/engine.rs).
-* **Diseño Técnico**:
+* **Diseño Técnico e Implementación**:
   - En `StorageEngine::apply_batch`, invocar `room.schema.validate_operation(&op.op)?` antes de persistir y aplicar en tablas.
   - En `StorageEngine::scan`, clonar un puntero inmutable CoW `Arc<BTreeMap>` al inicializar el stream, garantizando Snapshot Isolation y lecturas reproducibles sin soltar cerrojos entre lotes de 64 filas.
   - Extender el trait `StorageEngine` para aceptar consultas directas por `table_id: u16` (`get_by_id`, `scan_by_id`), eliminando el overhead de búsqueda y hashing de cadenas `table: &str` en el camino crítico.
@@ -327,8 +327,8 @@ El plan de corrección se estructurará en tres fases incrementales antes de dar
    - [RESUELTO] Clasificar fallos de CRC en EOF como `TornWrite` y truncar limpiamente ([`C-06`](../audits/2026-09-post-fase3-audit.md#c-06)).
    - [RESUELTO] Corregir `WalReader` con cola de operaciones para no perder deltas en lotes multi-op ([`C-07`](../audits/2026-09-post-fase3-audit.md#c-07)).
 4. **Validaciones Estructurales y Pánicos**:
-   - Implementar deserialización estricta de `TableSchema` y eliminar `.expect()` ([`C-11`](../audits/2026-09-post-fase3-audit.md#c-11)).
-   - Validar `ack_seq <= head_seq` en `handle_ack` evitando purga catastrófica ([`A-07`](../audits/2026-09-post-fase3-audit.md#a-07)).
+   - [RESUELTO] Implementar deserialización estricta de `TableSchema` y eliminar `.expect()` ([`C-11`](../audits/2026-09-post-fase3-audit.md#c-11), [`M-14`](../audits/2026-09-post-fase3-audit.md#m-14)).
+   - [RESUELTO] Validar `ack_seq <= head_seq` en `handle_ack` evitando purga catastrófica ([`A-07`](../audits/2026-09-post-fase3-audit.md#a-07)).
 
 ---
 
@@ -336,20 +336,22 @@ El plan de corrección se estructurará en tres fases incrementales antes de dar
 *Objetivo: Eliminar bloqueos del runtime Tokio, garantizar no-bloqueancia en compactaciones y blindar el relay de snapshots.*
 
 1. **Aislamiento Asíncrono del Reactor Tokio**:
-   - Delegar compresión Zstd y lecturas masivas a `tokio::task::spawn_blocking` ([`A-01`](../audits/2026-09-post-fase3-audit.md#a-01)).
-   - Invertir la jerarquía de consulta en `fetch_deltas` evaluando RAM `HotBuffer` antes de disco ([`A-12`](../audits/2026-09-post-fase3-audit.md#a-12)).
-   - Implementar ventana deslizante en `HotBuffer` sin evicción a cero ([`A-13`](../audits/2026-09-post-fase3-audit.md#a-13)).
+   - [RESUELTO] Delegar compresión Zstd y lecturas masivas a `tokio::task::spawn_blocking` ([`A-01`](../audits/2026-09-post-fase3-audit.md#a-01)).
+   - [RESUELTO] Invertir la jerarquía de consulta en `fetch_deltas` evaluando RAM `HotBuffer` antes de disco ([`A-12`](../audits/2026-09-post-fase3-audit.md#a-12)).
+   - [RESUELTO] Implementar ventana deslizante en `HotBuffer` sin evicción a cero ([`A-13`](../audits/2026-09-post-fase3-audit.md#a-13)).
 2. **Compactación CoW y Snapshot Isolation**:
-   - Implementar rotación de WAL (`wal.compacting`) en `compactor.rs` para liberar escritores ([`A-03`](../audits/2026-09-post-fase3-audit.md#a-03)).
-   - Usar rutas temporales únicas (`snap.tmp.{uuid}`) eliminando colisiones de truncado ([`A-04`](../audits/2026-09-post-fase3-audit.md#a-04)).
-   - Proteger escaneos de `StorageEngine::scan` con vistas CoW inmutables contra lecturas fantasma ([`A-09`](../audits/2026-09-post-fase3-audit.md#a-09)).
-   - Incorporar CRC32 del payload comprimido en `FileHeader` ([`A-05`](../audits/2026-09-post-fase3-audit.md#a-05)).
+   - [RESUELTO] Implementar rotación de WAL (`wal.compacting`) en `compactor.rs` para liberar escritores ([`A-03`](../audits/2026-09-post-fase3-audit.md#a-03)).
+   - [RESUELTO] Usar rutas temporales únicas (`snap.tmp.{uuid}`) eliminando colisiones de truncado ([`A-04`](../audits/2026-09-post-fase3-audit.md#a-04)).
+   - [RESUELTO] Proteger escaneos de `StorageEngine::scan` con vistas CoW inmutables contra lecturas fantasma ([`A-09`](../audits/2026-09-post-fase3-audit.md#a-09)).
+   - [RESUELTO] Incorporar CRC32 del payload comprimido en `FileHeader` ([`A-05`](../audits/2026-09-post-fase3-audit.md#a-05)).
 3. **Gestión de Salas y Snapshot Relay Multipart**:
-   - Implementar cerrojo fino de instanciación en `RoomManager` para erradicar TOCTOU ([`C-09`](../audits/2026-09-post-fase3-audit.md#c-09)).
-   - Reemplazar `get_room` por `get_or_spawn` en endpoints de datos soportando reinicios ([`A-11`](../audits/2026-09-post-fase3-audit.md#a-11)).
-   - Implementar comando `RoomCommand::Shutdown` para coordinar el borrado de salas en `delete_room` ([`A-14`](../audits/2026-09-post-fase3-audit.md#a-14)).
-   - [RESUELTO A-15] `SnapshotRelay` respaldado en disco con TTL configurable y purga física. Pendiente subida multipart fragmentada (`/snapshot/upload-chunk`) y autenticación ([`C-10`](../audits/2026-09-post-fase3-audit.md#c-10)).
-   - Adquirir bloqueos `flock` exclusivos en descriptores de archivos del servidor ([`M-12`](../audits/2026-09-post-fase3-audit.md#m-12)).
+   - [RESUELTO] Implementar cerrojo fino de instanciación en `RoomManager` para erradicar TOCTOU ([`C-09`](../audits/2026-09-post-fase3-audit.md#c-09)).
+   - [RESUELTO] Reemplazar `get_room` por `get_or_spawn` en endpoints de datos soportando reinicios ([`A-11`](../audits/2026-09-post-fase3-audit.md#a-11)).
+   - [RESUELTO] Implementar comando `RoomCommand::Shutdown` para coordinar el borrado de salas en `delete_room` ([`A-14`](../audits/2026-09-post-fase3-audit.md#a-14)).
+   - [RESUELTO] `SnapshotRelay` respaldado en disco con TTL configurable, subida multipart fragmentada (`/snapshot/upload-chunk`), autenticación y verificación consolidada de hash BLAKE3 ([`C-10`](../audits/2026-09-post-fase3-audit.md#c-10), [`A-15`](../audits/2026-09-post-fase3-audit.md#a-15)).
+   - [RESUELTO] Adquirir bloqueos `flock` exclusivos en descriptores de archivos del servidor ([`M-12`](../audits/2026-09-post-fase3-audit.md#m-12)).
+   - [RESUELTO] Timeouts perimetrales de 5 segundos en llamadas a actores devolviendo HTTP 504 GatewayTimeout ([`M-08`](../audits/2026-09-post-fase3-audit.md#m-08)).
+   - [RESUELTO] Acotación estricta de `max_batch_size` (1..=1000) en sincronización de deltas ([`M-09`](../audits/2026-09-post-fase3-audit.md#m-09)).
 
 ---
 
