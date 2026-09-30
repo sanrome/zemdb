@@ -1563,3 +1563,282 @@ fn test_client_lease_disconnected_to_dormant_timeout() {
         "Dormant client must not block log compaction"
     );
 }
+
+#[tokio::test]
+async fn test_commit_ack_catchup_ops_content_ordering_and_contiguity() {
+    let server = TestServer::start().await;
+    let schema_id = SchemaId::new("todo-schema-catchup");
+    let schema = create_test_schema();
+    server
+        .schema_registry
+        .register_schema(schema_id.clone(), schema.clone())
+        .unwrap();
+
+    let room_id = RoomId::new("room-catchup-contiguity-1");
+    server
+        .room_manager
+        .create_room(room_id.clone(), schema_id.clone(), None)
+        .await
+        .unwrap();
+
+    let client_alpha = ClientId::new("writer-alpha");
+    let client_beta = ClientId::new("writer-beta");
+    let client_gamma = ClientId::new("writer-gamma");
+
+    let token_alpha = generate_client_token(
+        &client_alpha,
+        &room_id,
+        Duration::from_secs(300),
+        &server.config.auth_secret,
+    );
+    let token_beta = generate_client_token(
+        &client_beta,
+        &room_id,
+        Duration::from_secs(300),
+        &server.config.auth_secret,
+    );
+    let token_gamma = generate_client_token(
+        &client_gamma,
+        &room_id,
+        Duration::from_secs(300),
+        &server.config.auth_secret,
+    );
+
+    // Register client_alpha
+    let reg_alpha = ClientMessage::RegisterClient {
+        correlation_id: CorrelationId::new(1),
+        room_id: room_id.clone(),
+        client_id: client_alpha.clone(),
+        auth_token: token_alpha.clone(),
+        current_seq: None,
+    };
+    let resp = server
+        .client
+        .post(format!("{}/rooms/{}/register", server.base_url, room_id))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&reg_alpha).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Register client_beta
+    let reg_beta = ClientMessage::RegisterClient {
+        correlation_id: CorrelationId::new(2),
+        room_id: room_id.clone(),
+        client_id: client_beta.clone(),
+        auth_token: token_beta.clone(),
+        current_seq: Some(SequenceNumber::new(2)),
+    };
+    let resp = server
+        .client
+        .post(format!("{}/rooms/{}/register", server.base_url, room_id))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&reg_beta).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Register client_gamma
+    let reg_gamma = ClientMessage::RegisterClient {
+        correlation_id: CorrelationId::new(3),
+        room_id: room_id.clone(),
+        client_id: client_gamma.clone(),
+        auth_token: token_gamma.clone(),
+        current_seq: Some(SequenceNumber::new(6)),
+    };
+    let resp = server
+        .client
+        .post(format!("{}/rooms/{}/register", server.base_url, room_id))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&reg_gamma).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Client alpha commits 5 operations sequentially (assigned_seq 1..=5)
+    let mut sent_ops = Vec::new();
+    for i in 1..=5 {
+        let op = create_insert_op(&schema, i, &format!("Task item {}", i));
+        sent_ops.push(op.clone());
+        let commit_msg = ClientMessage::Commit {
+            correlation_id: CorrelationId::new(10 + i as u64),
+            room_id: room_id.clone(),
+            client_id: client_alpha.clone(),
+            mutation_id: MutationId::new([i as u8; 16]),
+            last_ack_seq: SequenceNumber::new((i - 1) as u64),
+            op,
+        };
+        let resp = server
+            .client
+            .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
+            .header(AUTHORIZATION, format!("Bearer {}", token_alpha))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(encode_message(&commit_msg).unwrap())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.bytes().await.unwrap();
+        let ack: ServerMessage = decode_message(&bytes).unwrap();
+        match ack {
+            ServerMessage::CommitAck {
+                assigned_seq,
+                catchup_ops,
+                ..
+            } => {
+                assert_eq!(assigned_seq, SequenceNumber::new(i as u64));
+                assert_eq!(
+                    catchup_ops.len(),
+                    1,
+                    "Alpha was at last_ack_seq i-1, catchup_ops must contain its own sequenced op"
+                );
+                assert_eq!(catchup_ops[0].seq, SequenceNumber::new(i as u64));
+                assert_eq!(catchup_ops[0].op.pk, PrimaryKey::single(i));
+            }
+            other => panic!("Expected CommitAck, got {:?}", other),
+        }
+    }
+
+    // Now client_beta (whose local cursor is only at sequence 2) commits mutation 6
+    let op_beta = create_insert_op(&schema, 6, "Beta task item");
+    let mutation_beta = MutationId::new([66; 16]);
+    let commit_beta = ClientMessage::Commit {
+        correlation_id: CorrelationId::new(20),
+        room_id: room_id.clone(),
+        client_id: client_beta.clone(),
+        mutation_id: mutation_beta,
+        last_ack_seq: SequenceNumber::new(2),
+        op: op_beta.clone(),
+    };
+    let resp_beta = server
+        .client
+        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", token_beta))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&commit_beta).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_beta.status(), StatusCode::OK);
+    let bytes_beta = resp_beta.bytes().await.unwrap();
+    let ack_beta: ServerMessage = decode_message(&bytes_beta).unwrap();
+
+    match ack_beta {
+        ServerMessage::CommitAck {
+            assigned_seq,
+            catchup_ops,
+            ..
+        } => {
+            assert_eq!(assigned_seq, SequenceNumber::new(6));
+            // Catchup must contain sequences 3, 4, 5 and 6
+            assert_eq!(
+                catchup_ops.len(),
+                4,
+                "Expected 4 catchup operations for cursor lag from 2 to 6"
+            );
+
+            // Verify strict monotonicity and contiguity: [3, 4, 5, 6]
+            for (idx, seq_op) in catchup_ops.iter().enumerate() {
+                let expected_seq = (idx + 3) as u64;
+                assert_eq!(
+                    seq_op.seq,
+                    SequenceNumber::new(expected_seq),
+                    "Catchup sequence must be strictly contiguous"
+                );
+                if idx < 3 {
+                    // Ops 3, 4, 5 from Alpha
+                    assert_eq!(seq_op.op.table_id, sent_ops[idx + 2].table_id);
+                    assert_eq!(seq_op.op.pk, sent_ops[idx + 2].pk);
+                    assert_eq!(seq_op.op.kind, sent_ops[idx + 2].kind);
+                } else {
+                    // Op 6 from Beta
+                    assert_eq!(seq_op.op.table_id, op_beta.table_id);
+                    assert_eq!(seq_op.op.pk, op_beta.pk);
+                    assert_eq!(seq_op.op.kind, op_beta.kind);
+                }
+            }
+        }
+        other => panic!("Expected CommitAck, got {:?}", other),
+    }
+
+    // Now client_gamma commits mutation 7 while fully up-to-date (last_ack_seq: 6)
+    let op_gamma = create_insert_op(&schema, 7, "Gamma task item");
+    let commit_gamma = ClientMessage::Commit {
+        correlation_id: CorrelationId::new(30),
+        room_id: room_id.clone(),
+        client_id: client_gamma.clone(),
+        mutation_id: MutationId::new([77; 16]),
+        last_ack_seq: SequenceNumber::new(6),
+        op: op_gamma.clone(),
+    };
+    let resp_gamma = server
+        .client
+        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", token_gamma))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&commit_gamma).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_gamma.status(), StatusCode::OK);
+    let bytes_gamma = resp_gamma.bytes().await.unwrap();
+    let ack_gamma: ServerMessage = decode_message(&bytes_gamma).unwrap();
+
+    match ack_gamma {
+        ServerMessage::CommitAck {
+            assigned_seq,
+            catchup_ops,
+            ..
+        } => {
+            assert_eq!(assigned_seq, SequenceNumber::new(7));
+            assert_eq!(
+                catchup_ops.len(),
+                1,
+                "Gamma was up-to-date at seq 6, catchup_ops contains op 7"
+            );
+            assert_eq!(catchup_ops[0].seq, SequenceNumber::new(7));
+            assert_eq!(catchup_ops[0].op.pk, op_gamma.pk);
+        }
+        other => panic!("Expected CommitAck, got {:?}", other),
+    }
+
+    // Idempotent commit retry: client_beta resends the exact same commit_beta (same mutation_id) with last_ack_seq = 2
+    let resp_retry = server
+        .client
+        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", token_beta))
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(encode_message(&commit_beta).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_retry.status(), StatusCode::OK);
+    let bytes_retry = resp_retry.bytes().await.unwrap();
+    let ack_retry: ServerMessage = decode_message(&bytes_retry).unwrap();
+
+    match ack_retry {
+        ServerMessage::CommitAck {
+            assigned_seq,
+            catchup_ops,
+            ..
+        } => {
+            assert_eq!(assigned_seq, SequenceNumber::new(6));
+            // Should contain ops starting after cursor 2 up to current head: 3, 4, 5, 6, 7
+            assert_eq!(
+                catchup_ops.len(),
+                5,
+                "Catchup on duplicate commit must return deltas from client cursor up to head"
+            );
+            assert_eq!(catchup_ops[0].seq, SequenceNumber::new(3));
+            assert_eq!(catchup_ops[1].seq, SequenceNumber::new(4));
+            assert_eq!(catchup_ops[2].seq, SequenceNumber::new(5));
+            assert_eq!(catchup_ops[3].seq, SequenceNumber::new(6));
+            assert_eq!(catchup_ops[4].seq, SequenceNumber::new(7));
+            assert_eq!(catchup_ops[3].op.pk, op_beta.pk);
+        }
+        other => panic!("Expected CommitAck on idempotent retry, got {:?}", other),
+    }
+}

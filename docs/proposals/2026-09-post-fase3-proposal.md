@@ -372,10 +372,10 @@ El plan de corrección se estructurará en tres fases incrementales antes de dar
    - [RESUELTO] Liberación de cerrojo global antes de I/O en `close_room` ([`M-16`](../audits/2026-09-post-fase3-audit.md#m-16)).
    - [RESUELTO] Consulta pasiva en `GET /admin/rooms/:id` evitando spawn fantasma de actores ([`B-04`](../audits/2026-09-post-fase3-audit.md#b-04)).
 2. **Expansión Exhaustiva de la Batería de Pruebas**:
-   - Añadir tests de integración verificando explícitamente el contenido y contigüidad de `catchup_ops` ante desfases de secuencia ([`A-17`](../audits/2026-09-post-fase3-audit.md#a-17)).
-   - Tests de recuperación post-crash simulando caídas entre snapshot y truncado de WAL.
-   - Tests de estrés por concurrencia multi-proceso verificando `flock` y rechazo de instancias concurrentes.
-   - Tests de saturación de cuota de disco y desconexiones abruptas durante streaming de snapshots.
+   - [RESUELTO] Añadir tests de integración verificando explícitamente el contenido y contigüidad de `catchup_ops` ante desfases de secuencia ([`A-17`](../audits/2026-09-post-fase3-audit.md#a-17)).
+   - [RESUELTO] Tests de recuperación post-crash simulando caídas entre snapshot y truncado de WAL.
+   - [RESUELTO] Tests de estrés por concurrencia multi-proceso verificando `flock` y rechazo de instancias concurrentes.
+   - [RESUELTO] Tests de saturación de cuota de disco y desconexiones abruptas durante streaming de snapshots.
 
 ---
 

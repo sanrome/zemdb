@@ -474,3 +474,65 @@ async fn test_tiered_log_async_maintenance_spawn_blocking() {
     assert_eq!(deltas[4].seq.get(), 5);
     assert!(!has_more);
 }
+
+#[tokio::test]
+async fn test_tiered_log_disk_quota_saturation_pruning() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 100,
+        ram_ttl: Duration::from_secs(3600),
+        warm_disk_ttl: Duration::from_millis(5),
+        cold_disk_ttl: Duration::from_secs(3600), // Very high TTL so time expiration does not trigger
+        max_room_disk_bytes: 100, // Very low quota to force quota saturation pruning
+    };
+
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+
+    // 1. Create first segment 1..=5
+    for i in 1..=5 {
+        log.append(make_test_op(i), None).unwrap();
+    }
+    log.force_rotate_warm().unwrap();
+
+    // 2. Create second segment 6..=10
+    for i in 6..=10 {
+        log.append(make_test_op(i), None).unwrap();
+    }
+    log.force_rotate_warm().unwrap();
+
+    // Wait past warm_disk_ttl so maintenance compresses them to Cold (.wal.zst)
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    // 3. Append active segment 11..=15
+    for i in 11..=15 {
+        log.append(make_test_op(i), None).unwrap();
+    }
+
+    // 4. Run maintenance: should compress warm segments and immediately prune cold segments due to quota
+    let report = log.run_maintenance().await.unwrap();
+    assert_eq!(report.warm_compressed_count, 2);
+    assert!(
+        report.cold_pruned_count >= 1,
+        "Quota saturation must prune at least one cold segment"
+    );
+
+    // tail_seq must have advanced past 1 (at least to 6)
+    assert!(
+        log.tail_seq().get() >= 6,
+        "tail_seq must advance after quota pruning, got {}",
+        log.tail_seq().get()
+    );
+
+    // Any fetch before the new tail_seq must return BehindCompaction
+    let err = log.fetch_deltas(SequenceNumber::new(0), 10).unwrap_err();
+    match err {
+        ServerError::BehindCompaction => {}
+        other => panic!("Expected BehindCompaction on quota pruned deltas, got: {other:?}"),
+    }
+
+    // Fetch from the new tail cursor succeeds
+    let cursor = SequenceNumber::new(log.tail_seq().get() - 1);
+    let (deltas, _) = log.fetch_deltas(cursor, 10).unwrap();
+    assert!(!deltas.is_empty());
+    assert_eq!(deltas[0].seq, log.tail_seq());
+}

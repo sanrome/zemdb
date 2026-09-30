@@ -71,7 +71,7 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 │ A-14 │ Alto     │ crates/server/src/actor/manager.rs   │ [RESUELTO] delete_room coordina RoomCommand::Shutdown y espera el JoinHandle del actor.│
 │ A-15 │ Alto     │ crates/server/src/relay.rs           │ [RESUELTO] SnapshotRelay respaldado en disco con TTL configurable y purga física.       │
 │ A-16 │ Alto     │ crates/client/src/lib.rs             │ Crate rimdb-client es un cascarón vacío stub sin implementación del SDK de cliente.     │
-│ A-17 │ Alto     │ crates/server/tests/                 │ Suites de prueba ignoran deliberadamente catchup_ops permitiendo pérdidas de datos.     │
+│ A-17 │ Alto     │ crates/server/tests/                 │ [RESUELTO] Test exhaustivo de catchup_ops: orden monótono, contigüidad y reintentos (A-17)│
 ├──────┼──────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┤
 │ M-01 │ Medio    │ crates/core/src/mutation/squash.rs   │ [RESUELTO] LWW estricto en squashing (descarte de updates viejos) y purge Insert+Delete │
 │ M-02 │ Medio    │ crates/server/src/actor/room.rs      │ [RESUELTO] Reintentos idempotentes de Commit devuelven catchup_ops con mutación propia. │
@@ -318,10 +318,11 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica**: Implementar la arquitectura del SDK en Fase 4 (`RimdbClient`, `RoomHandle`, `OutboxQueue`, etc.).
 
 #### [A-17] Suites de prueba ignoran deliberadamente `catchup_ops` permitiendo pérdidas de datos
-* **Ubicación Exacta**: [`crates/server/tests/server_integration_tests.rs:357-388`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/tests/server_integration_tests.rs#L357-L388).
-* **Causa Raíz**: Los tests validan `assigned_seq` utilizando comodines `..` para ignorar `catchup_ops`.
+* **Estado**: **RESUELTO (Fase 3.5-C.2)**
+* **Ubicación Exacta**: [`crates/server/tests/server_integration_tests.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/tests/server_integration_tests.rs).
+* **Causa Raíz**: Los tests validaban `assigned_seq` utilizando comodines `..` para ignorar `catchup_ops`.
 * **Impacto**: El bug crítico de pérdida de operaciones en catchup (C-01) no fue detectado en las pruebas de integración.
-* **Solución Técnica**: Crear pruebas que validen explícitamente el contenido, orden y completitud de `catchup_ops` ante desfases de secuencia.
+* **Solución Técnica / Implementada**: Se incorporó el test de integración `test_commit_ack_catchup_ops_content_ordering_and_contiguity` en `crates/server/tests/server_integration_tests.rs`. Valida que ante desfases de secuencia del cursor cliente, `catchup_ops` devuelva de forma determinista todas las operaciones intermedias requeridas, con estricta contigüidad, orden monótono y cargas útiles idénticas a las registradas por los clientes remitentes, validando asimismo que reintentos de commit idempotentes retornen las operaciones requeridas desde el cursor del cliente hasta la mutación propia secuenciada.
 
 ---
 

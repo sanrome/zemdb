@@ -1035,3 +1035,81 @@ async fn test_crash_recovery_with_wal_compacting() {
     // Verify wal.compacting was cleaned up
     assert!(!compacting_path.exists());
 }
+
+#[tokio::test]
+async fn test_multi_thread_flock_concurrency_stress() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let options = DiskStorageOptions::new(temp_dir.path());
+    let room_id = RoomId::new("stress-flock-room");
+    let schema = test_schema();
+
+    const NUM_WORKERS: usize = 16;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(NUM_WORKERS));
+    let mut handles = Vec::new();
+
+    for _ in 0..NUM_WORKERS {
+        let b = std::sync::Arc::clone(&barrier);
+        let opts = options.clone();
+        let r_id = room_id.clone();
+        let s = schema.clone();
+
+        handles.push(tokio::spawn(async move {
+            let engine = DiskStorageEngine::new(opts);
+            b.wait().await;
+            let res = engine.open_room(&r_id, s).await;
+            (engine, res)
+        }));
+    }
+
+    let mut winner_engine = None;
+    let mut locked_failures = 0;
+
+    for handle in handles {
+        let (engine, res) = handle.await.unwrap();
+        match res {
+            Ok(()) => {
+                assert!(
+                    winner_engine.is_none(),
+                    "Only one engine must win the flock"
+                );
+                winner_engine = Some(engine);
+            }
+            Err(StorageError::RoomLocked(locked_id)) => {
+                assert_eq!(locked_id, room_id);
+                locked_failures += 1;
+            }
+            Err(other) => panic!("Expected RoomLocked, got: {other:?}"),
+        }
+    }
+
+    assert_eq!(locked_failures, NUM_WORKERS - 1);
+    let winner = winner_engine.expect("One engine must have acquired the lock");
+
+    // Close the winner
+    winner.close_room(&room_id).await.unwrap();
+
+    // Now another engine can successfully acquire the lock and write data
+    let next_engine = DiskStorageEngine::new(options);
+    next_engine.open_room(&room_id, schema).await.unwrap();
+    let row = CompactRow::new(vec![
+        Value::Int(1),
+        Value::String("Stress Winner".into()),
+        Value::Int(100),
+        Value::Bool(true),
+    ]);
+    next_engine
+        .apply_batch(
+            &room_id,
+            vec![SequencedOperation::with_default_origin(
+                1u64,
+                Operation::insert(USERS_TABLE, PrimaryKey::single(1i64), row, 1000),
+            )],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        next_engine.get_head_seq(&room_id).await.unwrap(),
+        SequenceNumber::from(1u64)
+    );
+    next_engine.close_room(&room_id).await.unwrap();
+}

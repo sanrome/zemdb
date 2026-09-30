@@ -328,3 +328,214 @@ async fn test_compaction_unique_tmp_paths() {
     }
     assert!(!found_tmp, "Temporary snapshot files must be cleaned up");
 }
+
+#[tokio::test]
+async fn test_crash_recovery_during_compaction_window_after_snapshot_rename() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let options = DiskStorageOptions::new(temp_dir.path());
+    let engine = DiskStorageEngine::new(options.clone());
+    let room_id = RoomId::new("room-crash-after-snap-rename");
+    let schema = test_schema();
+
+    engine.open_room(&room_id, schema.clone()).await.unwrap();
+
+    // 1. Initial 10 rows
+    let mut initial_ops = Vec::new();
+    for i in 1..=10i64 {
+        let row = CompactRow::new(vec![
+            Value::Int(i),
+            Value::String(format!("User {i}").into()),
+            Value::Int(i * 10),
+            Value::Bool(true),
+        ]);
+        initial_ops.push(SequencedOperation::with_default_origin(
+            i as u64,
+            Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 100),
+        ));
+    }
+    engine.apply_batch(&room_id, initial_ops).await.unwrap();
+
+    // Compact room: snapshot advances to seq 10
+    engine.compact_room(&room_id).await.unwrap();
+    engine.close_room(&room_id).await.unwrap();
+
+    // 2. Simulate pre-crash state where snapshot has already been updated/renamed up to seq 10,
+    // but wal.compacting (containing ops 1..=10) was not yet deleted before crash,
+    // and active wal has new concurrent writes (11..=15).
+    let mut compacting_ops = Vec::new();
+    for i in 1..=10i64 {
+        let row = CompactRow::new(vec![
+            Value::Int(i),
+            Value::String(format!("User {i}").into()),
+            Value::Int(i * 10),
+            Value::Bool(true),
+        ]);
+        compacting_ops.push(SequencedOperation::with_default_origin(
+            i as u64,
+            Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 100),
+        ));
+    }
+    let compacting_bytes = rimdb_storage::format::encode_wal_batch(&compacting_ops, None).unwrap();
+    let compacting_path = temp_dir
+        .path()
+        .join(format!("room_{}.wal.compacting", room_id.as_str()));
+    tokio::fs::write(&compacting_path, compacting_bytes)
+        .await
+        .unwrap();
+
+    let mut wal_ops = Vec::new();
+    for i in 11..=15i64 {
+        let row = CompactRow::new(vec![
+            Value::Int(i),
+            Value::String(format!("User {i}").into()),
+            Value::Int(i * 10),
+            Value::Bool(true),
+        ]);
+        wal_ops.push(SequencedOperation::with_default_origin(
+            i as u64,
+            Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 200),
+        ));
+    }
+    let wal_bytes = rimdb_storage::format::encode_wal_batch(&wal_ops, None).unwrap();
+    let wal_path = temp_dir
+        .path()
+        .join(format!("room_{}.wal", room_id.as_str()));
+    tokio::fs::write(&wal_path, wal_bytes).await.unwrap();
+
+    // 3. Re-open room to trigger crash recovery
+    let engine_rec = DiskStorageEngine::new(options);
+    engine_rec.open_room(&room_id, schema).await.unwrap();
+
+    // Verify wal.compacting was detected as already folded into snapshot and cleaned up
+    assert!(!compacting_path.exists(), "wal.compacting must be deleted");
+
+    // Verify head sequence advanced to 15
+    assert_eq!(
+        engine_rec.get_head_seq(&room_id).await.unwrap(),
+        SequenceNumber::from(15u64)
+    );
+
+    // Verify all rows 1..=15 exist without duplication or corruption
+    for i in 1..=15i64 {
+        let row = engine_rec
+            .get(&room_id, "users", &PrimaryKey::single(i))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row[1], Value::String(format!("User {i}").into()));
+    }
+}
+
+#[tokio::test]
+async fn test_crash_recovery_during_compaction_window_before_snapshot_rename() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let options = DiskStorageOptions::new(temp_dir.path());
+    let engine = DiskStorageEngine::new(options.clone());
+    let room_id = RoomId::new("room-crash-before-snap-rename");
+    let schema = test_schema();
+
+    engine.open_room(&room_id, schema.clone()).await.unwrap();
+
+    // 1. Initial 5 rows
+    let mut initial_ops = Vec::new();
+    for i in 1..=5i64 {
+        let row = CompactRow::new(vec![
+            Value::Int(i),
+            Value::String(format!("User {i}").into()),
+            Value::Int(i * 10),
+            Value::Bool(true),
+        ]);
+        initial_ops.push(SequencedOperation::with_default_origin(
+            i as u64,
+            Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 100),
+        ));
+    }
+    engine.apply_batch(&room_id, initial_ops).await.unwrap();
+
+    // Compact room: snapshot advances to seq 5
+    engine.compact_room(&room_id).await.unwrap();
+    engine.close_room(&room_id).await.unwrap();
+
+    // 2. Simulate pre-crash state during Phase 2:
+    // Base snapshot is at seq 5.
+    // Compaction rotated WAL: wal.compacting contains rows 6..=10.
+    // An unfinished temporary snapshot file snap.tmp.uuid exists with partial/temp data.
+    // Active wal contains subsequent writes 11..=15.
+    let mut compacting_ops = Vec::new();
+    for i in 6..=10i64 {
+        let row = CompactRow::new(vec![
+            Value::Int(i),
+            Value::String(format!("User {i}").into()),
+            Value::Int(i * 10),
+            Value::Bool(true),
+        ]);
+        compacting_ops.push(SequencedOperation::with_default_origin(
+            i as u64,
+            Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 200),
+        ));
+    }
+    let compacting_bytes = rimdb_storage::format::encode_wal_batch(&compacting_ops, None).unwrap();
+    let compacting_path = temp_dir
+        .path()
+        .join(format!("room_{}.wal.compacting", room_id.as_str()));
+    tokio::fs::write(&compacting_path, compacting_bytes)
+        .await
+        .unwrap();
+
+    // Unfinished snapshot temporary file
+    let tmp_snap_path = temp_dir
+        .path()
+        .join(format!("room_{}.snap.tmp.deadbeef-1234", room_id.as_str()));
+    tokio::fs::write(&tmp_snap_path, b"incomplete-snapshot-bytes")
+        .await
+        .unwrap();
+
+    // Active wal with rows 11..=15
+    let mut wal_ops = Vec::new();
+    for i in 11..=15i64 {
+        let row = CompactRow::new(vec![
+            Value::Int(i),
+            Value::String(format!("User {i}").into()),
+            Value::Int(i * 10),
+            Value::Bool(true),
+        ]);
+        wal_ops.push(SequencedOperation::with_default_origin(
+            i as u64,
+            Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 300),
+        ));
+    }
+    let wal_bytes = rimdb_storage::format::encode_wal_batch(&wal_ops, None).unwrap();
+    let wal_path = temp_dir
+        .path()
+        .join(format!("room_{}.wal", room_id.as_str()));
+    tokio::fs::write(&wal_path, wal_bytes).await.unwrap();
+
+    // 3. Re-open room to trigger crash recovery
+    let engine_rec = DiskStorageEngine::new(options);
+    engine_rec.open_room(&room_id, schema).await.unwrap();
+
+    // Verify orphan tmp file was purged
+    assert!(
+        !tmp_snap_path.exists(),
+        "Orphan tmp snapshot file must be removed"
+    );
+
+    // Verify wal.compacting was merged into active wal and deleted
+    assert!(!compacting_path.exists(), "wal.compacting must be deleted");
+
+    // Verify head sequence advanced to 15
+    assert_eq!(
+        engine_rec.get_head_seq(&room_id).await.unwrap(),
+        SequenceNumber::from(15u64)
+    );
+
+    // Verify all rows 1..=15 are intact
+    for i in 1..=15i64 {
+        let row = engine_rec
+            .get(&room_id, "users", &PrimaryKey::single(i))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row[1], Value::String(format!("User {i}").into()));
+    }
+}

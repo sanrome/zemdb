@@ -703,3 +703,62 @@ async fn test_snapshot_multipart_chunk_upload_and_blake3_verification() {
         .unwrap();
     assert_eq!(corrupt_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
+
+#[test]
+fn test_multi_thread_warm_disk_log_flock_concurrency_stress() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    // 1. Initial log opens and appends a record, acquiring and holding kernel flock on active.wal
+    let mut initial_log = WarmDiskLog::open_or_create(&path).unwrap();
+    let pk0 = PrimaryKey::single(Value::Int(0));
+    let op0 = Operation::delete(1, pk0, 100);
+    let seq_op0 = SequencedOperation::new(SequenceNumber::new(1), op0);
+    initial_log.append_record(&seq_op0, None).unwrap();
+
+    // 2. Spawn 12 concurrent threads contending to open_or_create against the locked directory
+    const NUM_THREADS: usize = 12;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(NUM_THREADS));
+    let mut handles = Vec::new();
+
+    for _ in 0..NUM_THREADS {
+        let b = std::sync::Arc::clone(&barrier);
+        let p = path.clone();
+
+        handles.push(std::thread::spawn(move || {
+            b.wait();
+            WarmDiskLog::open_or_create(&p)
+        }));
+    }
+
+    let mut locked_errors = 0;
+    for handle in handles {
+        let res = handle.join().unwrap();
+        match res {
+            Err(ServerError::RoomLocked(msg)) => {
+                assert!(msg.contains("active.wal locked by another process"));
+                locked_errors += 1;
+            }
+            Ok(_) => {
+                panic!("Concurrent open_or_create must not succeed while active.wal is locked")
+            }
+            Err(other) => panic!("Expected RoomLocked, got: {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        locked_errors, NUM_THREADS,
+        "All 12 concurrent threads must be rejected with RoomLocked"
+    );
+
+    // 3. Drop initial_log, releasing the kernel flock
+    drop(initial_log);
+
+    // 4. Now a subsequent instance can successfully acquire the lock and append records
+    let mut next_log = WarmDiskLog::open_or_create(&path).unwrap();
+    let pk = PrimaryKey::single(Value::Int(99));
+    let op = Operation::delete(1, pk, 9999);
+    let seq_op = SequencedOperation::new(SequenceNumber::new(2), op);
+    next_log.append_record(&seq_op, None).unwrap();
+    assert_eq!(next_log.active_end_seq().unwrap().get(), 2);
+}
