@@ -98,6 +98,12 @@ pub enum ValidationError {
 
     #[error("Row primary key does not match operation primary key for table '{table}'")]
     PrimaryKeyMismatch { table: String },
+
+    #[error("Table '{table}' already exists in schema")]
+    DuplicateTable { table: String },
+
+    #[error("Table ID assignment overflowed u16 capacity")]
+    TableIdOverflow,
 }
 
 /// Validates an individual field value against column definition rules.
@@ -391,7 +397,10 @@ pub fn validate_operation(
                 let col_idx = *table
                     .column_indices
                     .get(pk_col_name)
-                    .expect("primary key column must exist in column_indices");
+                    .ok_or_else(|| ValidationError::UnknownColumn {
+                        table: table.name.clone(),
+                        column: pk_col_name.clone(),
+                    })?;
 
                 if col_idx >= row.len() || row.values[col_idx].is_null() {
                     return Err(ValidationError::MissingPrimaryKeyColumn {

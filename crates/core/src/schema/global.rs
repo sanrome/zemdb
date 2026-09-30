@@ -17,17 +17,30 @@ impl SchemaBuilder {
         Self::default()
     }
 
-    pub fn table(mut self, mut table: TableSchema) -> Self {
-        if self.tables_by_id.contains_key(&table.table_id) {
-            let next_id = self.tables_by_id.keys().max().map_or(0, |m| m + 1);
-            table.table_id = next_id;
-        } else if table.table_id == 0 && !self.tables_by_id.is_empty() {
-            let next_id = self.tables_by_id.keys().max().map_or(0, |m| m + 1);
+    pub fn try_table(mut self, mut table: TableSchema) -> Result<Self, ValidationError> {
+        if self.id_by_name.contains_key(&table.name) {
+            return Err(ValidationError::DuplicateTable {
+                table: table.name,
+            });
+        }
+        if self.tables_by_id.contains_key(&table.table_id)
+            || (table.table_id == 0 && !self.tables_by_id.is_empty())
+        {
+            let next_id = self
+                .tables_by_id
+                .keys()
+                .max()
+                .map_or(Some(0), |m| m.checked_add(1))
+                .ok_or(ValidationError::TableIdOverflow)?;
             table.table_id = next_id;
         }
         self.id_by_name.insert(table.name.clone(), table.table_id);
         self.tables_by_id.insert(table.table_id, table);
-        self
+        Ok(self)
+    }
+
+    pub fn table(self, table: TableSchema) -> Self {
+        self.try_table(table).expect("valid table schema")
     }
 
     pub fn build(self) -> Schema {
@@ -61,16 +74,13 @@ impl<'de> Deserialize<'de> for Schema {
             }
             let helper = HumanSchemaHelper::deserialize(deserializer)?;
             if !helper.tables.is_empty() {
-                Ok(Schema::from_tables(helper.tables))
+                Schema::try_from_tables(helper.tables).map_err(serde::de::Error::custom)
             } else {
-                let mut id_by_name = BTreeMap::new();
-                for (id, table) in &helper.tables_by_id {
-                    id_by_name.insert(table.name.clone(), *id);
+                let mut schema = Schema::new();
+                for (_, table) in helper.tables_by_id {
+                    schema.add_table(table).map_err(serde::de::Error::custom)?;
                 }
-                Ok(Schema {
-                    tables_by_id: helper.tables_by_id,
-                    id_by_name,
-                })
+                Ok(schema)
             }
         } else {
             #[derive(Deserialize)]
@@ -78,14 +88,11 @@ impl<'de> Deserialize<'de> for Schema {
                 tables_by_id: BTreeMap<u16, TableSchema>,
             }
             let helper = BinarySchemaHelper::deserialize(deserializer)?;
-            let mut id_by_name = BTreeMap::new();
-            for (id, table) in &helper.tables_by_id {
-                id_by_name.insert(table.name.clone(), *id);
+            let mut schema = Schema::new();
+            for (_, table) in helper.tables_by_id {
+                schema.add_table(table).map_err(serde::de::Error::custom)?;
             }
-            Ok(Schema {
-                tables_by_id: helper.tables_by_id,
-                id_by_name,
-            })
+            Ok(schema)
         }
     }
 }
@@ -102,25 +109,43 @@ impl Schema {
         SchemaBuilder::new()
     }
 
-    /// Constructs a Schema from an iterable of TableSchema, auto-assigning IDs and building indexes.
-    pub fn from_tables(tables: impl IntoIterator<Item = TableSchema>) -> Self {
-        let mut builder = Self::builder();
+    /// Validates and constructs a Schema from an iterable of TableSchema, auto-assigning IDs and building indexes.
+    pub fn try_from_tables(
+        tables: impl IntoIterator<Item = TableSchema>,
+    ) -> Result<Self, ValidationError> {
+        let mut schema = Schema::new();
         for table in tables {
-            builder = builder.table(table);
+            schema.add_table(table)?;
         }
-        builder.build()
+        Ok(schema)
     }
 
-    pub fn add_table(&mut self, mut table: TableSchema) {
-        if self.tables_by_id.contains_key(&table.table_id) {
-            let next_id = self.tables_by_id.keys().max().map_or(0, |m| m + 1);
-            table.table_id = next_id;
-        } else if table.table_id == 0 && !self.tables_by_id.is_empty() {
-            let next_id = self.tables_by_id.keys().max().map_or(0, |m| m + 1);
+    /// Constructs a Schema from an iterable of TableSchema, auto-assigning IDs and building indexes.
+    pub fn from_tables(tables: impl IntoIterator<Item = TableSchema>) -> Self {
+        Self::try_from_tables(tables).expect("valid table schemas")
+    }
+
+    pub fn add_table(&mut self, mut table: TableSchema) -> Result<u16, ValidationError> {
+        if self.id_by_name.contains_key(&table.name) {
+            return Err(ValidationError::DuplicateTable {
+                table: table.name,
+            });
+        }
+        if self.tables_by_id.contains_key(&table.table_id)
+            || (table.table_id == 0 && !self.tables_by_id.is_empty())
+        {
+            let next_id = self
+                .tables_by_id
+                .keys()
+                .max()
+                .map_or(Some(0), |m| m.checked_add(1))
+                .ok_or(ValidationError::TableIdOverflow)?;
             table.table_id = next_id;
         }
-        self.id_by_name.insert(table.name.clone(), table.table_id);
-        self.tables_by_id.insert(table.table_id, table);
+        let assigned_id = table.table_id;
+        self.id_by_name.insert(table.name.clone(), assigned_id);
+        self.tables_by_id.insert(assigned_id, table);
+        Ok(assigned_id)
     }
 
     pub fn get_table_by_id(&self, table_id: u16) -> Option<&TableSchema> {

@@ -87,60 +87,7 @@ impl TableBuilder {
 
     /// Validates and builds the TableSchema.
     pub fn build(self) -> Result<TableSchema, ValidationError> {
-        if self.primary_key.is_empty() {
-            return Err(ValidationError::EmptyPrimaryKeyDefinition(self.name));
-        }
-
-        // Schema integrity: columns cannot have DataType::Null as their underlying type
-        for col in &self.columns {
-            if col.data_type == DataType::Null {
-                return Err(ValidationError::InvalidColumnDataType {
-                    table: self.name.clone(),
-                    column: col.name.clone(),
-                    message: "Columns cannot have DataType::Null as their schema definition type"
-                        .to_string(),
-                });
-            }
-        }
-
-        // Primary key columns cannot be marked as encrypted or nullable
-        for pk_col in &self.primary_key {
-            let col_def = self
-                .columns
-                .iter()
-                .find(|c| &c.name == pk_col)
-                .ok_or_else(|| ValidationError::UnknownColumn {
-                    table: self.name.clone(),
-                    column: pk_col.clone(),
-                })?;
-
-            if col_def.encrypted {
-                return Err(ValidationError::EncryptedPrimaryKeyNotAllowed {
-                    table: self.name.clone(),
-                    column: pk_col.clone(),
-                });
-            }
-
-            if col_def.nullable {
-                return Err(ValidationError::NullablePrimaryKeyNotAllowed {
-                    table: self.name.clone(),
-                    column: pk_col.clone(),
-                });
-            }
-        }
-
-        let mut column_indices = BTreeMap::new();
-        for (i, col) in self.columns.iter().enumerate() {
-            column_indices.insert(col.name.clone(), i);
-        }
-
-        Ok(TableSchema {
-            table_id: self.table_id,
-            name: self.name,
-            primary_key: self.primary_key,
-            columns: self.columns,
-            column_indices,
-        })
+        TableSchema::try_new(self.table_id, self.name, self.primary_key, self.columns)
     }
 }
 
@@ -173,21 +120,81 @@ impl<'de> Deserialize<'de> for TableSchema {
             columns: Vec<ColumnDef>,
         }
         let helper = TableSchemaHelper::deserialize(deserializer)?;
-        let mut column_indices = BTreeMap::new();
-        for (i, col) in helper.columns.iter().enumerate() {
-            column_indices.insert(col.name.clone(), i);
-        }
-        Ok(TableSchema {
-            table_id: helper.table_id,
-            name: helper.name,
-            primary_key: helper.primary_key,
-            columns: helper.columns,
-            column_indices,
-        })
+        TableSchema::try_new(
+            helper.table_id,
+            helper.name,
+            helper.primary_key,
+            helper.columns,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 
 impl TableSchema {
+    /// Validates all structural schema invariants and constructs a `TableSchema`.
+    pub fn try_new(
+        table_id: u16,
+        name: impl Into<String>,
+        primary_key: Vec<String>,
+        columns: Vec<ColumnDef>,
+    ) -> Result<Self, ValidationError> {
+        let name = name.into();
+        if primary_key.is_empty() {
+            return Err(ValidationError::EmptyPrimaryKeyDefinition(name));
+        }
+
+        let mut column_indices = BTreeMap::new();
+        for (i, col) in columns.iter().enumerate() {
+            if col.data_type == DataType::Null {
+                return Err(ValidationError::InvalidColumnDataType {
+                    table: name.clone(),
+                    column: col.name.clone(),
+                    message: "Columns cannot have DataType::Null as their schema definition type"
+                        .to_string(),
+                });
+            }
+
+            if column_indices.insert(col.name.clone(), i).is_some() {
+                return Err(ValidationError::DuplicateColumn {
+                    table: name.clone(),
+                    column: col.name.clone(),
+                });
+            }
+        }
+
+        for pk_col in &primary_key {
+            let col_idx = column_indices
+                .get(pk_col)
+                .ok_or_else(|| ValidationError::UnknownColumn {
+                    table: name.clone(),
+                    column: pk_col.clone(),
+                })?;
+            let col_def = &columns[*col_idx];
+
+            if col_def.encrypted {
+                return Err(ValidationError::EncryptedPrimaryKeyNotAllowed {
+                    table: name.clone(),
+                    column: pk_col.clone(),
+                });
+            }
+
+            if col_def.nullable {
+                return Err(ValidationError::NullablePrimaryKeyNotAllowed {
+                    table: name.clone(),
+                    column: pk_col.clone(),
+                });
+            }
+        }
+
+        Ok(TableSchema {
+            table_id,
+            name,
+            primary_key,
+            columns,
+            column_indices,
+        })
+    }
+
     pub fn builder(name: impl Into<String>) -> TableBuilder {
         TableBuilder::new(name)
     }

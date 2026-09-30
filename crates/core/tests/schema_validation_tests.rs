@@ -553,3 +553,178 @@ fn test_table_schema_validate_operation_insert_update_delete() {
     ));
 }
 
+#[test]
+fn test_table_schema_deserialize_rejects_empty_pk() {
+    let json = r#"{
+        "table_id": 1,
+        "name": "users",
+        "primary_key": [],
+        "columns": [
+            {"name": "id", "data_type": "Int", "nullable": false, "encrypted": false}
+        ]
+    }"#;
+    let res: Result<TableSchema, _> = serde_json::from_str(json);
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("Primary key definition cannot be empty"));
+}
+
+#[test]
+fn test_table_schema_deserialize_rejects_missing_pk_column() {
+    let json = r#"{
+        "table_id": 1,
+        "name": "users",
+        "primary_key": ["nonexistent_col"],
+        "columns": [
+            {"name": "id", "data_type": "Int", "nullable": false, "encrypted": false}
+        ]
+    }"#;
+    let res: Result<TableSchema, _> = serde_json::from_str(json);
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("Unknown column"));
+}
+
+#[test]
+fn test_table_schema_deserialize_rejects_nullable_pk() {
+    let json = r#"{
+        "table_id": 1,
+        "name": "users",
+        "primary_key": ["id"],
+        "columns": [
+            {"name": "id", "data_type": "Int", "nullable": true, "encrypted": false}
+        ]
+    }"#;
+    let res: Result<TableSchema, _> = serde_json::from_str(json);
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("cannot be nullable"));
+}
+
+#[test]
+fn test_table_schema_deserialize_rejects_encrypted_pk() {
+    let json = r#"{
+        "table_id": 1,
+        "name": "users",
+        "primary_key": ["id"],
+        "columns": [
+            {"name": "id", "data_type": "Int", "nullable": false, "encrypted": true}
+        ]
+    }"#;
+    let res: Result<TableSchema, _> = serde_json::from_str(json);
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("cannot be encrypted"));
+}
+
+#[test]
+fn test_table_schema_deserialize_rejects_duplicate_column() {
+    let json = r#"{
+        "table_id": 1,
+        "name": "users",
+        "primary_key": ["id"],
+        "columns": [
+            {"name": "id", "data_type": "Int", "nullable": false, "encrypted": false},
+            {"name": "id", "data_type": "String", "nullable": false, "encrypted": false}
+        ]
+    }"#;
+    let res: Result<TableSchema, _> = serde_json::from_str(json);
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("already exists"));
+}
+
+#[test]
+fn test_schema_add_table_rejects_duplicate_table_name() {
+    let mut schema = Schema::new();
+    let table1 = TableSchema::builder("users")
+        .primary_key("id", DataType::Int)
+        .build()
+        .unwrap();
+    let table2 = TableSchema::builder("users")
+        .primary_key("user_id", DataType::Int)
+        .build()
+        .unwrap();
+
+    let id1 = schema.add_table(table1).expect("first table ok");
+    assert_eq!(id1, 0);
+
+    let err = schema.add_table(table2).unwrap_err();
+    assert_eq!(
+        err,
+        ValidationError::DuplicateTable {
+            table: "users".to_string()
+        }
+    );
+}
+
+#[test]
+fn test_schema_deserialize_rejects_duplicate_table_name() {
+    let json = r#"{
+        "tables": [
+            {
+                "table_id": 0,
+                "name": "tasks",
+                "primary_key": ["id"],
+                "columns": [{"name": "id", "data_type": "Int", "nullable": false, "encrypted": false}]
+            },
+            {
+                "table_id": 1,
+                "name": "tasks",
+                "primary_key": ["id"],
+                "columns": [{"name": "id", "data_type": "Int", "nullable": false, "encrypted": false}]
+            }
+        ]
+    }"#;
+    let res: Result<Schema, _> = serde_json::from_str(json);
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("already exists"));
+}
+
+#[test]
+fn test_schema_add_table_detects_id_overflow() {
+    let mut schema = Schema::new();
+    let mut table_max = TableSchema::builder("max_table")
+        .primary_key("id", DataType::Int)
+        .build()
+        .unwrap();
+    table_max.table_id = u16::MAX;
+    schema.add_table(table_max).unwrap();
+
+    let next_table = TableSchema::builder("overflow_table")
+        .primary_key("id", DataType::Int)
+        .build()
+        .unwrap();
+    let err = schema.add_table(next_table).unwrap_err();
+    assert_eq!(err, ValidationError::TableIdOverflow);
+}
+
+#[test]
+fn test_validate_compact_row_op_unknown_pk_column_returns_error() {
+    let mut table = TableSchema::builder("users")
+        .primary_key("id", DataType::Int)
+        .build()
+        .unwrap();
+    // Simulate inconsistency where primary_key has a column not present in column_indices
+    table.primary_key.push("ghost_col".to_string());
+
+    let row = CompactRow::new(vec![Value::Int(10), Value::Int(20)]);
+    let insert_op = Operation::insert(
+        table.table_id,
+        PrimaryKey::composite(vec![Value::Int(10), Value::Int(20)]),
+        row,
+        100,
+    );
+
+    let res = table.validate_operation(&insert_op);
+    assert_eq!(
+        res,
+        Err(ValidationError::UnknownColumn {
+            table: "users".to_string(),
+            column: "ghost_col".to_string(),
+        })
+    );
+}
+
+
