@@ -3,12 +3,12 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::ops::{Deref, Index};
+use std::ops::Index;
 
 /// Primary key representation, optimized with SmallVec to keep scalar keys on the stack
 /// while strictly fitting within a single 64-byte L1 cache line (size: 40 bytes).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct PrimaryKey(pub SmallVec<[Value; 1]>);
+pub struct PrimaryKey(SmallVec<[Value; 1]>);
 
 impl PrimaryKey {
     pub fn single(value: impl Into<Value>) -> Self {
@@ -21,8 +21,32 @@ impl PrimaryKey {
         Self(values.into_iter().map(|v| v.into()).collect())
     }
 
+    pub fn from_smallvec(values: SmallVec<[Value; 1]>) -> Self {
+        Self(values)
+    }
+
     pub fn values(&self) -> &[Value] {
         &self.0
+    }
+
+    pub fn as_slice(&self) -> &[Value] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn get(&self, index: usize) -> Option<&Value> {
+        self.0.get(index)
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, Value> {
+        self.0.iter()
     }
 
     pub fn into_values(self) -> SmallVec<[Value; 1]> {
@@ -30,11 +54,19 @@ impl PrimaryKey {
     }
 }
 
-impl Deref for PrimaryKey {
-    type Target = [Value];
+impl<'a> IntoIterator for &'a PrimaryKey {
+    type Item = &'a Value;
+    type IntoIter = std::slice::Iter<'a, Value>;
 
     #[inline]
-    fn deref(&self) -> &Self::Target {
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl AsRef<[Value]> for PrimaryKey {
+    #[inline]
+    fn as_ref(&self) -> &[Value] {
         &self.0
     }
 }
@@ -66,9 +98,9 @@ impl fmt::Display for PrimaryKey {
 }
 
 /// Positional row storage for high memory density and zero redundant column name strings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct CompactRow {
-    pub values: Vec<Value>,
+    values: Vec<Value>,
 }
 
 impl CompactRow {
@@ -80,6 +112,10 @@ impl CompactRow {
         self.values.get(index)
     }
 
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut Value> {
+        self.values.get_mut(index)
+    }
+
     pub fn len(&self) -> usize {
         self.values.len()
     }
@@ -88,17 +124,67 @@ impl CompactRow {
         self.values.is_empty()
     }
 
+    pub fn values(&self) -> &[Value] {
+        &self.values
+    }
+
+    pub fn as_slice(&self) -> &[Value] {
+        &self.values
+    }
+
+    pub fn resize(&mut self, new_len: usize, value: Value) {
+        self.values.resize(new_len, value);
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, Value> {
+        self.values.iter()
+    }
+
     pub fn into_values(self) -> Vec<Value> {
         self.values
     }
 }
 
-impl Deref for CompactRow {
-    type Target = [Value];
+impl<'a> IntoIterator for &'a CompactRow {
+    type Item = &'a Value;
+    type IntoIter = std::slice::Iter<'a, Value>;
 
     #[inline]
-    fn deref(&self) -> &Self::Target {
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl IntoIterator for CompactRow {
+    type Item = Value;
+    type IntoIter = std::vec::IntoIter<Value>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_values().into_iter()
+    }
+}
+
+impl AsRef<[Value]> for CompactRow {
+    #[inline]
+    fn as_ref(&self) -> &[Value] {
         &self.values
+    }
+}
+
+impl Index<usize> for CompactRow {
+    type Output = Value;
+
+    #[inline]
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.values[index]
+    }
+}
+
+impl std::ops::IndexMut<usize> for CompactRow {
+    #[inline]
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.values[index]
     }
 }
 

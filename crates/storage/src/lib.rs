@@ -4,6 +4,7 @@ pub mod engine;
 pub mod error;
 pub mod memory;
 pub mod options;
+pub mod snapshot;
 pub mod sys;
 
 #[cfg(not(target_arch = "wasm32"))]

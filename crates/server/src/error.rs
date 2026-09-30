@@ -60,6 +60,9 @@ pub enum ServerError {
         actual: SequenceNumber,
     },
 
+    #[error("Protocol version mismatch: {0}")]
+    ProtocolVersionMismatch(String),
+
     #[error("Gateway timeout: {0}")]
     GatewayTimeout(String),
 }
@@ -68,6 +71,7 @@ impl ServerError {
     /// Maps the ServerError to the protocol ErrorCode.
     pub fn to_error_code(&self) -> ErrorCode {
         match self {
+            ServerError::ProtocolVersionMismatch(_) => ErrorCode::ProtocolVersionMismatch,
             ServerError::SchemaViolation(_) => ErrorCode::SchemaViolation,
             ServerError::RoomNotFound(_) => ErrorCode::RoomNotFound,
             ServerError::RoomAlreadyExists(_) => ErrorCode::RoomAlreadyExists,
@@ -94,9 +98,9 @@ impl ServerError {
             ServerError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ServerError::RoomNotFound(_) | ServerError::SchemaNotFound(_) => StatusCode::NOT_FOUND,
             ServerError::RoomAlreadyExists(_) => StatusCode::CONFLICT,
-            ServerError::SchemaViolation(_) | ServerError::InvalidSequence { .. } => {
-                StatusCode::BAD_REQUEST
-            }
+            ServerError::ProtocolVersionMismatch(_)
+            | ServerError::SchemaViolation(_)
+            | ServerError::InvalidSequence { .. } => StatusCode::BAD_REQUEST,
             ServerError::BehindCompaction => StatusCode::GONE,
             ServerError::ClientDeregistered => StatusCode::FORBIDDEN,
             ServerError::RateLimited => StatusCode::TOO_MANY_REQUESTS,

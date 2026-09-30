@@ -4,7 +4,7 @@ use crate::schema::Schema;
 use serde::{Deserialize, Serialize};
 
 /// Error codes returned by the coordination server.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ErrorCode {
     SchemaViolation,
     RoomNotFound,
@@ -20,12 +20,13 @@ pub enum ErrorCode {
     TableAlreadyExists,
     SchemaNotFound,
     InvalidSequence,
+    ProtocolVersionMismatch,
 }
 
 /// An operation ordered by the coordination server with assigned sequence ID.
 ///
 /// Bounded strictly to 96 bytes (8B SequenceNumber + 88B Operation).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SequencedOperation {
     pub seq: SequenceNumber,
     pub op: Operation,
@@ -46,7 +47,7 @@ impl SequencedOperation {
 }
 
 /// Unified message sent from Client to Server.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ClientMessage {
     /// Commit a new validated mutation into a room with idempotency key and client cursor for 1-RTT catch-up.
     Commit {
@@ -120,7 +121,7 @@ pub enum ClientMessage {
 }
 
 /// Unified message sent from Server to Client.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ServerMessage {
     /// Confirmation of an accepted commit with its assigned sequence number, accumulated catchup deltas and pagination flag.
     CommitAck {
@@ -172,6 +173,12 @@ pub enum ServerMessage {
         room_id: RoomId,
         current_head_seq: SequenceNumber,
     },
+    /// Confirmation of client deregistration from the room.
+    DeregisterAck {
+        correlation_id: CorrelationId,
+        room_id: RoomId,
+        client_id: ClientId,
+    },
     /// Confirmation of client registration, delivering the room schema, current head, retention tail, and active snapshot info.
     Registered {
         correlation_id: CorrelationId,
@@ -206,4 +213,3 @@ impl ServerMessage {
         *blake3::hash(snapshot_bytes).as_bytes()
     }
 }
-

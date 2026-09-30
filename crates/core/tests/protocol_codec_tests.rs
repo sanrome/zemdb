@@ -5,7 +5,10 @@ fn test_protocol_rejects_payload_exceeding_max_message_size() {
     // A payload whose size exceeds MAX_MESSAGE_SIZE must be rejected with SizeLimit
     let oversized = vec![0u8; (MAX_MESSAGE_SIZE + 1) as usize];
     let result: Result<ClientMessage, _> = decode_message(&oversized);
-    assert!(result.is_err(), "Expected deserialization to be rejected by size limit");
+    assert!(
+        result.is_err(),
+        "Expected deserialization to be rejected by size limit"
+    );
     let err = result.unwrap_err();
     assert!(
         matches!(*err, bincode::ErrorKind::SizeLimit),
@@ -82,7 +85,8 @@ fn test_protocol_binary_serialization_roundtrip() {
         client_id: ClientId::new("client-1"),
     };
     let encoded_dereg = encode_message(&dereg_msg).expect("serialization failed");
-    let decoded_dereg: ClientMessage = decode_message(&encoded_dereg).expect("deserialization failed");
+    let decoded_dereg: ClientMessage =
+        decode_message(&encoded_dereg).expect("deserialization failed");
     assert_eq!(dereg_msg, decoded_dereg);
 
     // Test RequestSnapshotChunk roundtrip
@@ -258,3 +262,45 @@ fn test_ack_messages_codec_roundtrip() {
     assert_eq!(ack_confirmed, dec_conf);
 }
 
+#[test]
+fn test_wire_framing_header_and_magic_version_verification() {
+    let msg = ClientMessage::Heartbeat {
+        correlation_id: CorrelationId::new(42),
+        client_id: ClientId::new("client-test"),
+        room_id: RoomId::new("room-1"),
+    };
+
+    let encoded = encode_message(&msg).expect("serialization should succeed");
+    assert!(encoded.len() >= 4);
+    assert_eq!(&encoded[0..2], b"RM");
+    assert_eq!(encoded[2], 0x01);
+    assert_eq!(encoded[3], 0x00);
+
+    // Corrupted magic bytes must be rejected
+    let mut bad_magic = encoded.clone();
+    bad_magic[0] = b'X';
+    let res: Result<ClientMessage, _> = decode_message(&bad_magic);
+    assert!(res.is_err());
+    let err_str = res.unwrap_err().to_string();
+    assert!(err_str.contains("magic"));
+
+    // Protocol version mismatch must be rejected with version mismatch error
+    let mut bad_version = encoded.clone();
+    bad_version[2] = 0x99;
+    let res: Result<ClientMessage, _> = decode_message(&bad_version);
+    assert!(res.is_err());
+    let err_str = res.unwrap_err().to_string();
+    assert!(err_str.contains("version"));
+}
+
+#[test]
+fn test_deregister_ack_message_roundtrip() {
+    let ack = ServerMessage::DeregisterAck {
+        correlation_id: CorrelationId::new(55),
+        room_id: RoomId::new("room-ack"),
+        client_id: ClientId::new("client-ack"),
+    };
+    let encoded = encode_message(&ack).expect("serialization failed");
+    let decoded: ServerMessage = decode_message(&encoded).expect("deserialization failed");
+    assert_eq!(ack, decoded);
+}

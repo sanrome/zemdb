@@ -128,13 +128,13 @@ impl StorageEngine for MemoryStorageEngine {
                     actual: op.seq,
                 });
             }
+
+            schema.validate_operation(&op.op)?;
         }
 
         // 2. Apply operations to in-memory tables
         for SequencedOperation { seq, op } in ops {
-            let table_arc = tables
-                .entry(op.table_id)
-                .or_default();
+            let table_arc = tables.entry(op.table_id).or_default();
             let table_map = Arc::make_mut(table_arc);
 
             match op.kind {
@@ -145,15 +145,15 @@ impl StorageEngine for MemoryStorageEngine {
                     if let Some(existing) = table_map.get_mut(&op.pk) {
                         let target_len = schema
                             .get_table_by_id(op.table_id)
-                            .map(|t| t.columns.len())
+                            .map(|t| t.columns().len())
                             .unwrap_or(0);
                         for col_up in updates {
                             let idx = col_up.column_idx as usize;
                             let min_len = target_len.max(idx + 1);
-                            if existing.values.len() < min_len {
-                                existing.values.resize(min_len, Value::Null);
+                            if existing.len() < min_len {
+                                existing.resize(min_len, Value::Null);
                             }
-                            existing.values[idx] = col_up.value;
+                            existing[idx] = col_up.value;
                         }
                     }
                 }
@@ -178,14 +178,40 @@ impl StorageEngine for MemoryStorageEngine {
         pk: &PrimaryKey,
     ) -> Result<Option<CompactRow>, StorageError> {
         let room_arc = self.get_room(room_id)?;
+        let table_id = {
+            let room_state = room_arc
+                .read()
+                .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
+
+            room_state
+                .schema
+                .get_table_id(table)
+                .ok_or_else(|| StorageError::TableNotFound {
+                    room_id: room_id.clone(),
+                    table: table.to_string(),
+                })?
+        };
+
+        self.get_by_id(room_id, table_id, pk).await
+    }
+
+    async fn get_by_id(
+        &self,
+        room_id: &RoomId,
+        table_id: u16,
+        pk: &PrimaryKey,
+    ) -> Result<Option<CompactRow>, StorageError> {
+        let room_arc = self.get_room(room_id)?;
         let room_state = room_arc
             .read()
             .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
 
-        let table_id = room_state.schema.get_table_id(table).ok_or_else(|| StorageError::TableNotFound {
-            room_id: room_id.clone(),
-            table: table.to_string(),
-        })?;
+        if !room_state.schema.has_table_by_id(table_id) {
+            return Err(StorageError::TableNotFound {
+                room_id: room_id.clone(),
+                table: format!("id:{}", table_id),
+            });
+        }
 
         let row = room_state
             .tables
@@ -201,17 +227,47 @@ impl StorageEngine for MemoryStorageEngine {
         options: ScanOptions,
     ) -> Result<RowStream<'a>, StorageError> {
         let room_arc = self.get_room(room_id)?;
+        let table_id = {
+            let room_state = room_arc
+                .read()
+                .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
+
+            room_state
+                .schema
+                .get_table_id(table)
+                .ok_or_else(|| StorageError::TableNotFound {
+                    room_id: room_id.clone(),
+                    table: table.to_string(),
+                })?
+        };
+
+        self.scan_by_id(room_id, table_id, options).await
+    }
+
+    async fn scan_by_id<'a>(
+        &'a self,
+        room_id: &RoomId,
+        table_id: u16,
+        options: ScanOptions,
+    ) -> Result<RowStream<'a>, StorageError> {
+        let room_arc = self.get_room(room_id)?;
         let table_data = {
             let room_state = room_arc
                 .read()
                 .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
 
-            let table_id = room_state.schema.get_table_id(table).ok_or_else(|| StorageError::TableNotFound {
-                room_id: room_id.clone(),
-                table: table.to_string(),
-            })?;
+            if !room_state.schema.has_table_by_id(table_id) {
+                return Err(StorageError::TableNotFound {
+                    room_id: room_id.clone(),
+                    table: format!("id:{}", table_id),
+                });
+            }
 
-            room_state.tables.get(&table_id).cloned().unwrap_or_else(|| Arc::new(BTreeMap::new()))
+            room_state
+                .tables
+                .get(&table_id)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(BTreeMap::new()))
         };
 
         let state = MemoryScanState {
@@ -240,27 +296,28 @@ impl StorageEngine for MemoryStorageEngine {
                 None => BATCH_SIZE,
             };
 
-            let batch_items: Vec<Result<(PrimaryKey, CompactRow), StorageError>> =
-                match state.direction {
-                    ScanDirection::Forward => {
-                        let (start_bound, end_bound) = match &state.cursor {
-                            Some(cur) => (std::ops::Bound::Excluded(cur), state.range.end_bound()),
-                            None => (state.range.start_bound(), state.range.end_bound()),
-                        };
-                        let iter = state.table_data.range((start_bound, end_bound));
-                        apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
-                            .collect()
-                    }
-                    ScanDirection::Backward => {
-                        let (start_bound, end_bound) = match &state.cursor {
-                            Some(cur) => (state.range.start_bound(), std::ops::Bound::Excluded(cur)),
-                            None => (state.range.start_bound(), state.range.end_bound()),
-                        };
-                        let iter = state.table_data.range((start_bound, end_bound)).rev();
-                        apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
-                            .collect()
-                    }
-                };
+            let batch_items: Vec<Result<(PrimaryKey, CompactRow), StorageError>> = match state
+                .direction
+            {
+                ScanDirection::Forward => {
+                    let (start_bound, end_bound) = match &state.cursor {
+                        Some(cur) => (std::ops::Bound::Excluded(cur), state.range.end_bound()),
+                        None => (state.range.start_bound(), state.range.end_bound()),
+                    };
+                    let iter = state.table_data.range((start_bound, end_bound));
+                    apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
+                        .collect()
+                }
+                ScanDirection::Backward => {
+                    let (start_bound, end_bound) = match &state.cursor {
+                        Some(cur) => (state.range.start_bound(), std::ops::Bound::Excluded(cur)),
+                        None => (state.range.start_bound(), state.range.end_bound()),
+                    };
+                    let iter = state.table_data.range((start_bound, end_bound)).rev();
+                    apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
+                        .collect()
+                }
+            };
 
             let count = batch_items.len();
             if count == 0 {
@@ -309,9 +366,11 @@ impl StorageEngine for MemoryStorageEngine {
             tables: &room_state.tables,
         };
 
-        let bytes = bincode::serialize(&payload).map_err(|e| StorageError::Serialization(e.to_string()))?;
-        tracing::debug!(room_id = %room_id, snapshot_size = bytes.len(), "Created in-memory snapshot");
-        Ok(bytes)
+        let raw_bytes =
+            bincode::serialize(&payload).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let envelope = crate::snapshot::encode_snapshot_envelope(&raw_bytes, false, 0)?;
+        tracing::debug!(room_id = %room_id, snapshot_size = envelope.len(), "Created in-memory snapshot");
+        Ok(envelope)
     }
 
     #[tracing::instrument(skip(self, schema, snapshot), fields(room_id = %room_id, snapshot_size = snapshot.len()))]
@@ -321,7 +380,8 @@ impl StorageEngine for MemoryStorageEngine {
         schema: Schema,
         snapshot: &[u8],
     ) -> Result<SequenceNumber, StorageError> {
-        let mut payload: RoomSnapshotPayload = bincode::deserialize(snapshot)
+        let decompressed = crate::snapshot::decode_snapshot_envelope(snapshot)?;
+        let mut payload: RoomSnapshotPayload = bincode::deserialize(&decompressed)
             .map_err(|e| StorageError::SnapshotCorruption(e.to_string()))?;
 
         for table_id in schema.tables_by_id.keys() {

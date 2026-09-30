@@ -1,10 +1,10 @@
-use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use rimdb_core::id::{RoomId, SchemaId};
 use rimdb_core::schema::{ColumnDef, Schema};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use crate::actor::command::{RoomCommand, RoomMetrics};
 use crate::actor::manager::RoomMetadata;
@@ -103,7 +103,10 @@ pub async fn get_room(
     State(state): State<AppState>,
     Path(room_id): Path<String>,
 ) -> Result<Json<RoomMetrics>, ServerError> {
-    let rid = RoomId::new(room_id);
+    let rid = RoomId::new(room_id.clone());
+    if !state.room_manager.room_exists(&rid) {
+        return Err(ServerError::RoomNotFound(room_id));
+    }
     let sender = state.room_manager.get_or_spawn(&rid, None).await?;
     let (tx, rx) = tokio::sync::oneshot::channel();
     sender

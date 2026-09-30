@@ -172,7 +172,9 @@ impl TieredLog {
         if let Some(min_ram) = self.hot_buffer.min_seq() {
             if from_seq >= min_ram {
                 let ops = self.hot_buffer.get_range(from_seq, limit);
-                let has_more = ops.last().is_some_and(|last| last.seq.get() < self.head_seq.get());
+                let has_more = ops
+                    .last()
+                    .is_some_and(|last| last.seq.get() < self.head_seq.get());
                 return Ok((ops, has_more));
             }
         }
@@ -185,7 +187,8 @@ impl TieredLog {
         let cold_segments = ColdDiskLog::list_cold_segments(&segments_dir)?;
         for cold in cold_segments {
             if cold.end_seq.get() > current_from.get() {
-                let ops = ColdDiskLog::read_range(&cold.path, current_from, limit - collected.len())?;
+                let ops =
+                    ColdDiskLog::read_range(&cold.path, current_from, limit - collected.len())?;
                 for op in ops {
                     current_from = op.seq;
                     collected.push(op);
@@ -204,7 +207,11 @@ impl TieredLog {
             let sealed_segments = self.warm_disk.list_sealed_segments()?;
             for sealed in sealed_segments {
                 if sealed.end_seq.get() > current_from.get() {
-                    let ops = WarmDiskLog::read_range(&sealed.path, current_from, limit - collected.len())?;
+                    let ops = WarmDiskLog::read_range(
+                        &sealed.path,
+                        current_from,
+                        limit - collected.len(),
+                    )?;
                     for op in ops {
                         current_from = op.seq;
                         collected.push(op);
@@ -221,7 +228,9 @@ impl TieredLog {
 
         // 3. Query Tier 1: HotBuffer in RAM (Fast path)
         if collected.len() < limit {
-            let ram_ops = self.hot_buffer.get_range(current_from, limit - collected.len());
+            let ram_ops = self
+                .hot_buffer
+                .get_range(current_from, limit - collected.len());
             for op in ram_ops {
                 current_from = op.seq;
                 collected.push(op);
@@ -235,7 +244,8 @@ impl TieredLog {
         if collected.len() < limit && current_from.get() < self.head_seq.get() {
             let active_path = segments_dir.join("active.wal");
             if active_path.exists() {
-                let active_ops = WarmDiskLog::read_range(&active_path, current_from, limit - collected.len())?;
+                let active_ops =
+                    WarmDiskLog::read_range(&active_path, current_from, limit - collected.len())?;
                 for op in active_ops {
                     collected.push(op);
                     if collected.len() >= limit {
@@ -339,7 +349,9 @@ impl TieredLog {
             let age = now.duration_since(modified).unwrap_or_default();
 
             // Check TTL expiration or quota overflow
-            if age >= self.policy.cold_disk_ttl || total_disk_bytes > self.policy.max_room_disk_bytes {
+            if age >= self.policy.cold_disk_ttl
+                || total_disk_bytes > self.policy.max_room_disk_bytes
+            {
                 to_delete.push(cold.path.clone());
                 total_disk_bytes = total_disk_bytes.saturating_sub(metadata.len());
                 report.cold_pruned_count += 1;
@@ -401,7 +413,10 @@ impl TieredLog {
     ///
     /// Any client requesting deltas with a cursor older than the new `tail_seq - 1`
     /// will immediately receive `BehindCompaction`.
-    pub fn prune_older_than(&mut self, target_seq: SequenceNumber) -> Result<PruneReport, ServerError> {
+    pub fn prune_older_than(
+        &mut self,
+        target_seq: SequenceNumber,
+    ) -> Result<PruneReport, ServerError> {
         let mut report = PruneReport::default();
         let segments_dir = self.dir.join("segments");
 
@@ -426,7 +441,7 @@ impl TieredLog {
         // 3. Evict from RAM HotBuffer
         self.hot_buffer.evict_older_than(target_seq);
 
-        // 4. Recalculate tail_seq
+        // 4. Recalculate tail_seq from oldest physically retained segment/RAM
         let remaining_cold = ColdDiskLog::list_cold_segments(&segments_dir)?;
         if let Some(first_cold) = remaining_cold.first() {
             self.tail_seq = first_cold.start_seq;
@@ -437,12 +452,8 @@ impl TieredLog {
             } else if let Some(min_ram) = self.hot_buffer.min_seq() {
                 self.tail_seq = min_ram;
             } else {
-                self.tail_seq = target_seq.min(self.head_seq);
+                self.tail_seq = self.head_seq;
             }
-        }
-
-        if self.tail_seq.get() < target_seq.get() && target_seq.get() <= self.head_seq.get() {
-            self.tail_seq = target_seq;
         }
 
         report.new_tail_seq = self.tail_seq;

@@ -13,7 +13,10 @@ pub struct WalWriter;
 
 impl WalWriter {
     /// Encodes and appends a single sequenced operation to the given WAL file.
-    pub async fn write_record(file: &mut File, op: &SequencedOperation) -> Result<usize, StorageError> {
+    pub async fn write_record(
+        file: &mut File,
+        op: &SequencedOperation,
+    ) -> Result<usize, StorageError> {
         let bytes = encode_wal_batch(std::slice::from_ref(op), None)?;
         file.write_all(&bytes).await?;
         Ok(bytes.len())
@@ -116,7 +119,9 @@ impl<'a> WalReader<'a> {
     }
 
     /// Reads all valid records sequentially until EOF or a torn-write is encountered.
-    pub fn read_all(&mut self) -> Result<(Vec<SequencedOperation>, usize, Option<String>), StorageError> {
+    pub fn read_all(
+        &mut self,
+    ) -> Result<(Vec<SequencedOperation>, usize, Option<String>), StorageError> {
         let mut ops = Vec::new();
         let mut torn_write = None;
 

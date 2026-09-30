@@ -81,7 +81,8 @@ pub fn encode_wal_batch(
         mutation_id,
         ops: ops.to_vec(),
     };
-    let payload = bincode::serialize(&payload_struct).map_err(|e| WalFrameError::Serialization(e.to_string()))?;
+    let payload = bincode::serialize(&payload_struct)
+        .map_err(|e| WalFrameError::Serialization(e.to_string()))?;
     if payload.len() as u64 > MAX_MESSAGE_SIZE {
         return Err(WalFrameError::Corruption(format!(
             "WAL batch payload size {} exceeds MAX_MESSAGE_SIZE limit {}",
@@ -209,7 +210,9 @@ pub fn decode_wal_batch_from_slice(slice: &[u8]) -> Result<WalBatchDecodeResult,
         Err(_) => {
             // Fallback for slices that serialized Vec<SequencedOperation> directly
             let ops: Vec<SequencedOperation> = bincode::deserialize(payload).map_err(|e| {
-                WalFrameError::Corruption(format!("Failed to deserialize WAL batch operations: {e}"))
+                WalFrameError::Corruption(format!(
+                    "Failed to deserialize WAL batch operations: {e}"
+                ))
             })?;
             (ops, None)
         }
@@ -290,4 +293,3 @@ pub fn replay_wal_records(
 
     Ok((all_ops, offset, torn_write_detected))
 }
-

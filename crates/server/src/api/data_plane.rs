@@ -1,4 +1,3 @@
-use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
@@ -6,6 +5,7 @@ use axum::response::{IntoResponse, Response};
 use rimdb_core::id::{CorrelationId, RoomId};
 use rimdb_core::protocol::codec::{decode_message, encode_message};
 use rimdb_core::protocol::messages::{ClientMessage, ServerMessage};
+use std::time::Duration;
 
 use crate::actor::command::RoomCommand;
 use crate::api::auth::{verify_client_token_bound, ClientAuth};
@@ -22,9 +22,10 @@ pub(crate) fn binary_response(status: StatusCode, msg: &ServerMessage) -> Respon
             bytes,
         )
             .into_response(),
-        Err(e) => (
+        Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Serialization error: {}", e),
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            Bytes::new(),
         )
             .into_response(),
     }
@@ -80,9 +81,12 @@ pub async fn register(
             }
 
             // Verify stateless client auth_token strictly bound to client_id and room_id
-            if let Err(err) =
-                verify_client_token_bound(&auth_token, &client_id, &room_id, &state.config.auth_secret)
-            {
+            if let Err(err) = verify_client_token_bound(
+                &auth_token,
+                &client_id,
+                &room_id,
+                &state.config.auth_secret,
+            ) {
                 return binary_error(Some(correlation_id), Some(room_id), err);
             }
 
@@ -123,7 +127,9 @@ pub async fn register(
                 Err(_) => binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::GatewayTimeout("Request timed out waiting for room actor".to_string()),
+                    ServerError::GatewayTimeout(
+                        "Request timed out waiting for room actor".to_string(),
+                    ),
                 ),
             }
         }
@@ -185,7 +191,9 @@ pub async fn commit(
                 return binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::Unauthorized("Client ID in payload does not match token".to_string()),
+                    ServerError::Unauthorized(
+                        "Client ID in payload does not match token".to_string(),
+                    ),
                 );
             }
 
@@ -226,7 +234,9 @@ pub async fn commit(
                 Err(_) => binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::GatewayTimeout("Request timed out waiting for room actor".to_string()),
+                    ServerError::GatewayTimeout(
+                        "Request timed out waiting for room actor".to_string(),
+                    ),
                 ),
             }
         }
@@ -287,7 +297,9 @@ pub async fn sync(
                 return binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::Unauthorized("Client ID in payload does not match token".to_string()),
+                    ServerError::Unauthorized(
+                        "Client ID in payload does not match token".to_string(),
+                    ),
                 );
             }
 
@@ -326,7 +338,9 @@ pub async fn sync(
                 Err(_) => binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::GatewayTimeout("Request timed out waiting for room actor".to_string()),
+                    ServerError::GatewayTimeout(
+                        "Request timed out waiting for room actor".to_string(),
+                    ),
                 ),
             }
         }
@@ -386,7 +400,9 @@ pub async fn ack(
                 return binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::Unauthorized("Client ID in payload does not match token".to_string()),
+                    ServerError::Unauthorized(
+                        "Client ID in payload does not match token".to_string(),
+                    ),
                 );
             }
 
@@ -423,7 +439,9 @@ pub async fn ack(
                 Err(_) => binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::GatewayTimeout("Request timed out waiting for room actor".to_string()),
+                    ServerError::GatewayTimeout(
+                        "Request timed out waiting for room actor".to_string(),
+                    ),
                 ),
             }
         }
@@ -482,7 +500,9 @@ pub async fn heartbeat(
                 return binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::Unauthorized("Client ID in payload does not match token".to_string()),
+                    ServerError::Unauthorized(
+                        "Client ID in payload does not match token".to_string(),
+                    ),
                 );
             }
 
@@ -517,7 +537,9 @@ pub async fn heartbeat(
                 Err(_) => binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::GatewayTimeout("Request timed out waiting for room actor".to_string()),
+                    ServerError::GatewayTimeout(
+                        "Request timed out waiting for room actor".to_string(),
+                    ),
                 ),
             }
         }
@@ -599,7 +621,9 @@ pub async fn get_schema(
                 Err(_) => binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::GatewayTimeout("Request timed out waiting for room actor".to_string()),
+                    ServerError::GatewayTimeout(
+                        "Request timed out waiting for room actor".to_string(),
+                    ),
                 ),
             }
         }
@@ -658,7 +682,9 @@ pub async fn deregister(
                 return binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::Unauthorized("Client ID in payload does not match token".to_string()),
+                    ServerError::Unauthorized(
+                        "Client ID in payload does not match token".to_string(),
+                    ),
                 );
             }
 
@@ -670,7 +696,10 @@ pub async fn deregister(
             let (tx, rx) = tokio::sync::oneshot::channel();
             let call = async {
                 sender
-                    .send(RoomCommand::DeregisterClient { client_id, reply: tx })
+                    .send(RoomCommand::DeregisterClient {
+                        client_id: client_id.clone(),
+                        reply: tx,
+                    })
                     .await
                     .map_err(|_| ServerError::Internal("Room actor closed".to_string()))?;
                 rx.await
@@ -678,12 +707,21 @@ pub async fn deregister(
             };
 
             match tokio::time::timeout(ACTOR_TIMEOUT, call).await {
-                Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+                Ok(Ok(())) => binary_response(
+                    StatusCode::OK,
+                    &ServerMessage::DeregisterAck {
+                        correlation_id,
+                        room_id,
+                        client_id,
+                    },
+                ),
                 Ok(Err(err)) => binary_error(Some(correlation_id), Some(room_id), err),
                 Err(_) => binary_error(
                     Some(correlation_id),
                     Some(room_id),
-                    ServerError::GatewayTimeout("Request timed out waiting for room actor".to_string()),
+                    ServerError::GatewayTimeout(
+                        "Request timed out waiting for room actor".to_string(),
+                    ),
                 ),
             }
         }

@@ -2,8 +2,7 @@ use rimdb_core::id::MutationId;
 use rimdb_core::mutation::Operation;
 use rimdb_core::protocol::messages::SequencedOperation;
 use rimdb_core::protocol::wal_frame::{
-    decode_wal_batch_from_slice, encode_wal_batch, WalBatchDecodeResult, WalFrameError,
-    BATCH_MAGIC,
+    decode_wal_batch_from_slice, encode_wal_batch, WalBatchDecodeResult, WalFrameError, BATCH_MAGIC,
 };
 use rimdb_core::value::{CompactRow, PrimaryKey, Value};
 
@@ -103,5 +102,11 @@ fn test_wal_frame_zero_filled_eof_torn_write_detection() {
     // Zero-filled tail at EOF (e.g., 64 zero bytes from power outage fallocate)
     let zeros = vec![0u8; 64];
     let res = decode_wal_batch_from_slice(&zeros).expect("returns TornWrite for zero tail");
-    assert!(matches!(res, WalBatchDecodeResult::TornWrite { valid_bytes_offset: 0, .. }));
+    assert!(matches!(
+        res,
+        WalBatchDecodeResult::TornWrite {
+            valid_bytes_offset: 0,
+            ..
+        }
+    ));
 }

@@ -1,9 +1,9 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::extract::{FromRef, FromRequestParts};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use rimdb_core::id::{ClientId, RoomId};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
 use crate::api::router::AppState;
@@ -26,13 +26,11 @@ impl FromRequestParts<AppState> for AdminAuth {
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| ServerError::Unauthorized("Missing Authorization header".to_string()))?;
 
-        let token = auth_header
-            .strip_prefix("Bearer ")
-            .ok_or_else(|| {
-                ServerError::Unauthorized(
-                    "Invalid Authorization header format, expected Bearer <token>".to_string(),
-                )
-            })?;
+        let token = auth_header.strip_prefix("Bearer ").ok_or_else(|| {
+            ServerError::Unauthorized(
+                "Invalid Authorization header format, expected Bearer <token>".to_string(),
+            )
+        })?;
 
         // Constant-time comparison to prevent timing side-channel attacks
         let is_valid = token
@@ -44,7 +42,9 @@ impl FromRequestParts<AppState> for AdminAuth {
         if is_valid {
             Ok(AdminAuth)
         } else {
-            Err(ServerError::Unauthorized("Invalid admin secret token".to_string()))
+            Err(ServerError::Unauthorized(
+                "Invalid admin secret token".to_string(),
+            ))
         }
     }
 }
@@ -93,9 +93,9 @@ pub fn verify_client_token(
 
     let (c_id, r_id, exp_str, sig_hex) = (parts[0], parts[1], parts[2], parts[3]);
 
-    let expires_at: u64 = exp_str.parse().map_err(|_| {
-        ServerError::Unauthorized("Invalid timestamp in auth token".to_string())
-    })?;
+    let expires_at: u64 = exp_str
+        .parse()
+        .map_err(|_| ServerError::Unauthorized("Invalid timestamp in auth token".to_string()))?;
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -103,7 +103,9 @@ pub fn verify_client_token(
         .as_secs();
 
     if now >= expires_at {
-        return Err(ServerError::Unauthorized("Client auth token expired".to_string()));
+        return Err(ServerError::Unauthorized(
+            "Client auth token expired".to_string(),
+        ));
     }
 
     let payload = format!("{}.{}.{}", c_id, r_id, exp_str);
@@ -193,7 +195,8 @@ where
                 })?
         } else {
             return Err(
-                ServerError::Unauthorized("Missing Authorization header".to_string()).into_response(),
+                ServerError::Unauthorized("Missing Authorization header".to_string())
+                    .into_response(),
             );
         };
 

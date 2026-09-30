@@ -1,5 +1,7 @@
 use rimdb_core::PrimaryKey;
-use std::ops::{Bound, Range, RangeBounds, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive};
+use std::ops::{
+    Bound, Range, RangeBounds, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive,
+};
 
 /// Direction for scanning keys in a table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

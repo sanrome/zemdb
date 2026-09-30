@@ -66,7 +66,8 @@ impl TableBuilder {
             col.data_type = data_type;
             col.nullable = true;
         } else {
-            self.columns.push(ColumnDef::new(name, data_type).nullable(true));
+            self.columns
+                .push(ColumnDef::new(name, data_type).nullable(true));
         }
         self
     }
@@ -80,7 +81,8 @@ impl TableBuilder {
             col.data_type = data_type;
             col.encrypted = true;
         } else {
-            self.columns.push(ColumnDef::new(name, data_type).encrypted(true));
+            self.columns
+                .push(ColumnDef::new(name, data_type).encrypted(true));
         }
         self
     }
@@ -96,12 +98,12 @@ impl TableBuilder {
 /// Preserves physical column order (DDL definition order) in `columns`
 /// to guarantee stable binary positional serialization and schema evolution,
 /// while providing O(log C) column lookups via `column_indices`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct TableSchema {
-    pub table_id: u16,
-    pub name: String,
-    pub primary_key: Vec<String>,
-    pub columns: Vec<ColumnDef>,
+    table_id: u16,
+    name: String,
+    primary_key: Vec<String>,
+    columns: Vec<ColumnDef>,
     #[serde(skip)]
     pub(crate) column_indices: BTreeMap<String, usize>,
 }
@@ -131,6 +133,35 @@ impl<'de> Deserialize<'de> for TableSchema {
 }
 
 impl TableSchema {
+    #[inline]
+    pub fn table_id(&self) -> u16 {
+        self.table_id
+    }
+
+    #[inline]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[inline]
+    pub fn primary_key(&self) -> &[String] {
+        &self.primary_key
+    }
+
+    #[inline]
+    pub fn columns(&self) -> &[ColumnDef] {
+        &self.columns
+    }
+
+    #[inline]
+    pub fn column_indices(&self) -> &BTreeMap<String, usize> {
+        &self.column_indices
+    }
+
+    pub fn set_table_id(&mut self, table_id: u16) {
+        self.table_id = table_id;
+    }
+
     /// Validates all structural schema invariants and constructs a `TableSchema`.
     pub fn try_new(
         table_id: u16,
@@ -163,12 +194,13 @@ impl TableSchema {
         }
 
         for pk_col in &primary_key {
-            let col_idx = column_indices
-                .get(pk_col)
-                .ok_or_else(|| ValidationError::UnknownColumn {
-                    table: name.clone(),
-                    column: pk_col.clone(),
-                })?;
+            let col_idx =
+                column_indices
+                    .get(pk_col)
+                    .ok_or_else(|| ValidationError::UnknownColumn {
+                        table: name.clone(),
+                        column: pk_col.clone(),
+                    })?;
             let col_def = &columns[*col_idx];
 
             if col_def.encrypted {
@@ -253,13 +285,18 @@ impl TableSchema {
                 }
             }
         }
-        let pk = PrimaryKey(pk_values);
+        let pk = PrimaryKey::from_smallvec(pk_values);
         self.validate_pk(&pk)?;
         Ok(pk)
     }
 
     pub fn validate_pk(&self, pk: &PrimaryKey) -> Result<(), ValidationError> {
-        validation::validate_pk(&self.name, &self.primary_key, |col| self.get_column(col), pk)
+        validation::validate_pk(
+            &self.name,
+            &self.primary_key,
+            |col| self.get_column(col),
+            pk,
+        )
     }
 
     pub fn validate_row(&self, row: &Row) -> Result<(), ValidationError> {

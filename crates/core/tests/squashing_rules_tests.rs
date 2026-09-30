@@ -85,7 +85,7 @@ fn test_anti_zombie_rule_delete_then_update_rejected() {
     let schema = sample_schema();
     let table = schema.get_table_by_name("users").unwrap();
     let pk = PrimaryKey::single(1i64);
-    let mut del_op = Operation::delete(table.table_id, pk.clone(), 100);
+    let mut del_op = Operation::delete(table.table_id(), pk.clone(), 100);
     let up_op = table
         .update_builder(pk.clone())
         .set("name", "Zombie Alice")
@@ -123,11 +123,10 @@ fn test_squash_insert_then_delete() {
     let pk = PrimaryKey::single(1i64);
 
     let mut base_op = table.to_operation_insert(&row, 100).unwrap();
-    let incoming = Operation::delete(table.table_id, pk, 200);
+    let incoming = Operation::delete(table.table_id(), pk, 200);
 
-    let outcome = client_squash_operations(&mut base_op, incoming.clone());
-    assert_eq!(outcome, SquashOutcome::Replaced);
-    assert_eq!(base_op, incoming);
+    let outcome = client_squash_operations(&mut base_op, incoming);
+    assert_eq!(outcome, SquashOutcome::Purged);
 }
 
 #[test]
@@ -157,7 +156,10 @@ fn test_squash_older_insert_into_newer_update_preserves_data() {
     if let OperationKind::Insert { row } = &target_op.kind {
         let restored = table.from_compact_row(row).unwrap();
         assert_eq!(restored.get("id"), Some(&Value::Int(42)));
-        assert_eq!(restored.get("name"), Some(&Value::String("Older Alice".into())));
+        assert_eq!(
+            restored.get("name"),
+            Some(&Value::String("Older Alice".into()))
+        );
         assert_eq!(restored.get("age"), Some(&Value::Int(35))); // Newer update field won!
         assert_eq!(target_op.timestamp, 200);
     } else {
@@ -169,7 +171,7 @@ fn test_squash_older_insert_into_newer_update_preserves_data() {
 fn test_table_buffer_partitioned_squashing() {
     let schema = sample_schema();
     let table = schema.get_table_by_name("users").unwrap();
-    let mut buffer = TableBuffer::new(table.table_id);
+    let mut buffer = TableBuffer::new(table.table_id());
 
     let row1 = RowBuilder::new()
         .set("id", 1i64)
@@ -210,9 +212,18 @@ fn test_table_buffer_partitioned_squashing() {
         panic!("Expected Insert");
     }
 
-    // Delete Bob
-    let del_bob = Operation::delete(table.table_id, PrimaryKey::single(2i64), 200);
-    assert_eq!(buffer.apply(del_bob), Ok(SquashOutcome::Replaced));
+    // Delete Bob (pending insert + delete -> mutual annihilation / purged)
+    let del_bob = Operation::delete(table.table_id(), PrimaryKey::single(2i64), 200);
+    assert_eq!(buffer.apply(del_bob), Ok(SquashOutcome::Purged));
+    assert_eq!(buffer.len(), 1);
+    assert!(buffer.get(&PrimaryKey::single(2i64)).is_none());
+
+    // Insert standalone delete for Bob
+    let del_bob_standalone = Operation::delete(table.table_id(), PrimaryKey::single(2i64), 220);
+    assert_eq!(
+        buffer.apply(del_bob_standalone),
+        Ok(SquashOutcome::Replaced)
+    );
 
     let bob_op = buffer.get(&PrimaryKey::single(2i64)).unwrap();
     assert!(bob_op.is_delete());
@@ -228,7 +239,7 @@ fn test_table_buffer_partitioned_squashing() {
     assert_eq!(
         err,
         BufferError::IncompatibleOperation {
-            table_id: table.table_id
+            table_id: table.table_id()
         }
     );
 }
@@ -252,4 +263,42 @@ fn test_two_pointer_column_merge_linear() {
     let indices: Vec<u16> = existing.iter().map(|u| u.column_idx).collect();
     assert_eq!(indices, vec![0, 1, 3, 4, 5, 6]);
     assert_eq!(existing[2].value, Value::String("new".into())); // incoming won
+}
+
+#[test]
+fn test_squash_rule_1_stale_update_discarded() {
+    let schema = sample_schema();
+    let table = schema.get_table_by_name("users").unwrap();
+    let pk = PrimaryKey::single(1i64);
+
+    let row = RowBuilder::new()
+        .set("id", 1i64)
+        .set("name", "Alice New")
+        .set("age", 30i64)
+        .set("secret_chat", vec![1, 2, 3])
+        .build();
+
+    let mut base_insert = table.to_operation_insert(&row, 200).unwrap();
+
+    let stale_update = table
+        .update_builder(pk)
+        .set("name", "Alice Old")
+        .timestamp(100)
+        .build()
+        .unwrap();
+
+    let outcome = client_squash_operations(&mut base_insert, stale_update);
+    assert_eq!(outcome, SquashOutcome::Discarded);
+
+    // Verify row data and timestamp unchanged
+    if let OperationKind::Insert { row } = &base_insert.kind {
+        let restored = table.from_compact_row(row).unwrap();
+        assert_eq!(
+            restored.get("name"),
+            Some(&Value::String("Alice New".into()))
+        );
+        assert_eq!(base_insert.timestamp, 200);
+    } else {
+        panic!("Expected Insert");
+    }
 }

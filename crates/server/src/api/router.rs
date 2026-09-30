@@ -1,7 +1,7 @@
-use std::sync::Arc;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post};
 use axum::Router;
+use std::sync::Arc;
 
 use crate::actor::manager::RoomManager;
 use crate::api::{control_plane, data_plane, sse};
@@ -61,10 +61,7 @@ pub fn build_router(state: AppState) -> Router {
             "/rooms/:room_id/snapshot/upload",
             post(relay::upload_snapshot),
         )
-        .route(
-            "/rooms/:room_id/snapshot/chunk",
-            post(relay::request_chunk),
-        )
+        .route("/rooms/:room_id/snapshot/chunk", post(relay::request_chunk))
         .route(
             "/rooms/:room_id/snapshot/upload-chunk",
             post(relay::upload_chunk),

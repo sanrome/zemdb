@@ -13,7 +13,8 @@ It is designed for small-to-medium collaborative groups (2 to 50 clients per roo
 | **Phase 1: Domain & Core** | ✅ **Completed** | Pure Zero I/O domain models, Newtypes, positional `CompactRow` tuples, 24-byte `Value`, 40-byte `PrimaryKey` (L1 cache-line aligned), schema validations, and size-bounded binary protocol. |
 | **Phase 2: Storage Engine** | ✅ **Completed** | Asynchronous `StorageEngine` contract, multi-threaded in-memory room isolation, native on-disk Dual-File format (`.snap` + `.wal`), CRC32 checksums, and Zstandard-compressed snapshots. |
 | **Phase 2.5 & 2.8: Hardening & Core/Storage Contracts** | ✅ **Completed** | Linear $O(M+N)$ column delta merge, POSIX directory sync (`sync_dir`), physical batch framing in core (`0xBA7C`), Dual-File architecture with in-place WAL truncation, atomic flock pre-rename, non-blocking chunked cursor scans, 1-RTT Commit & Catch-Up protocol, external integration test suites (60 tests passing). |
-| **Phase 3: Coordination Server** | 🚀 **In Development** | Tokio room actor model (`RoomActor` with bounded channels), durable on-disk Micro-WAL for Exactly-Once idempotency, 4-tier immutable log (Hot RAM -> Warm Disk -> Cold Disk), ClientLeaseTracker with 90s Dead Man's Switch, and Axum HTTP/2 binary endpoints with signal-only SSE. |
+| **Phase 3: Coordination Server** | ✅ **Completed** | Tokio room actor model (`RoomActor` with bounded channels), single atomic WAL with Exactly-Once idempotency, 4-tier immutable log (Hot RAM -> Warm Disk -> Cold Disk), and Axum HTTP/2 binary endpoints with signal-only SSE. |
+| **Phase 3.5: Hardening, Resiliencia y Contratos** | ✅ **Completed** | Framing de wire protocol (`RM`, ver `0x01`), snapshots universales `RMSN` con CRC32, concurrencia CoW sin bloqueos, Snapshot Isolation, relay multipart con BLAKE3, consultas directas `get_by_id`/`scan_by_id`, validación en almacenamiento, LWW estricto, encapsulación de modelos centrales y desregistro binario `DeregisterAck`. |
 | **Phase 4: Client SDK & 1-RTT Sync** | ⏳ **Planned** | Ergonomic public facade (`RimdbClient` -> `RoomHandle` -> `TableHandle`), server-authoritative 1-RTT commit-and-sync, strictly canonical storage via `rimdb-storage`, dual transport (native Reqwest / browser WebFetch), and real-time live queries (`watch`). Offline draft queue deferred to post-v0.1. |
 | **Phase 5: E2E Verification & Universality** | ⏳ **Planned** | End-to-end integration test suites with network partition simulation, stress testing, and WebAssembly compilation (`wasm32-unknown-unknown`). |
 
@@ -53,7 +54,7 @@ client-distributed-db/
 # Build entire workspace
 cargo build --workspace
 
-# Run all unit, integration, and contract tests (57 tests)
+# Run all unit, integration, and contract tests (100+ tests passing)
 cargo test --workspace
 
 # Verify clippy lints with zero warnings allowed

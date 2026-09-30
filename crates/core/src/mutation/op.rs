@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 /// Atomic column update targeting a specific column by its positional DDL index.
 ///
 /// Bounded to 32 bytes (2B column_idx + 6B padding + 24B Value).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ColumnUpdate {
     pub column_idx: u16,
     pub value: Value,
@@ -22,17 +22,13 @@ impl ColumnUpdate {
 /// Specific mutation variant payload.
 ///
 /// Memory footprint is strictly bounded to 32 bytes (max payload 24 bytes + 1 byte tag + 7 bytes padding).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OperationKind {
     /// Inserts a tuple. If the PK already exists, replaces all fields (upsert).
-    Insert {
-        row: CompactRow,
-    },
+    Insert { row: CompactRow },
     /// Updates specific fields of an existing tuple by PK.
     /// Updates are maintained strictly sorted by `column_idx` ascending.
-    Update {
-        updates: Vec<ColumnUpdate>,
-    },
+    Update { updates: Vec<ColumnUpdate> },
     /// Deletes a tuple by PK.
     Delete,
 }
@@ -41,7 +37,7 @@ pub enum OperationKind {
 ///
 /// Occupies exactly 88 bytes in memory (2B table_id + 6B padding + 8B timestamp + 40B pk + 32B kind).
 /// 100% stack-allocated, zero heap pointers, aligned to 8 bytes.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Operation {
     pub table_id: u16,
     pub timestamp: u64,

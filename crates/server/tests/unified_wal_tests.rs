@@ -50,9 +50,7 @@ fn test_unified_wal_append_and_recovery_roundtrip() {
         assert_eq!(*mut_id, MutationId::from_u128(expected_seq as u128 + 1000));
     }
 
-    let (deltas, has_more) = log2
-        .fetch_deltas(SequenceNumber::new(0), 100)
-        .unwrap();
+    let (deltas, has_more) = log2.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
     assert_eq!(deltas.len(), 10);
     assert!(!has_more);
 }
@@ -159,8 +157,7 @@ fn test_unified_wal_torn_write_recovery_and_truncation() {
     assert_eq!(damaged_len, clean_len + 10);
 
     // Reopen log: torn write should be detected and automatically truncated to clean_len
-    let (mut log2, recovered_mutations) =
-        TieredLog::open_or_create(dir.path(), policy).unwrap();
+    let (mut log2, recovered_mutations) = TieredLog::open_or_create(dir.path(), policy).unwrap();
     assert_eq!(log2.head_seq().get(), 3);
     assert_eq!(recovered_mutations.len(), 3);
 
@@ -242,11 +239,17 @@ fn test_server_config_toml_and_env_overrides() {
 fn test_server_error_mapping() {
     let schema_err = ServerError::SchemaViolation("Missing column 'title'".to_string());
     assert_eq!(schema_err.to_error_code(), ErrorCode::SchemaViolation);
-    assert_eq!(schema_err.to_status_code(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        schema_err.to_status_code(),
+        axum::http::StatusCode::BAD_REQUEST
+    );
 
     let unauth_err = ServerError::Unauthorized("Invalid bearer token".to_string());
     assert_eq!(unauth_err.to_error_code(), ErrorCode::Unauthorized);
-    assert_eq!(unauth_err.to_status_code(), axum::http::StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        unauth_err.to_status_code(),
+        axum::http::StatusCode::UNAUTHORIZED
+    );
 
     let behind_err = ServerError::BehindCompaction;
     assert_eq!(behind_err.to_error_code(), ErrorCode::BehindCompaction);
@@ -261,13 +264,20 @@ fn test_server_error_mapping() {
         actual: SequenceNumber::new(20),
     };
     assert_eq!(invalid_seq_err.to_error_code(), ErrorCode::InvalidSequence);
-    assert_eq!(invalid_seq_err.to_status_code(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid_seq_err.to_status_code(),
+        axum::http::StatusCode::BAD_REQUEST
+    );
 
     let gw_err = ServerError::GatewayTimeout("Actor timed out".to_string());
     assert_eq!(gw_err.to_error_code(), ErrorCode::Internal);
-    assert_eq!(gw_err.to_status_code(), axum::http::StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        gw_err.to_status_code(),
+        axum::http::StatusCode::GATEWAY_TIMEOUT
+    );
 
-    let locked_err = ServerError::RoomLocked("Room is already locked by another process".to_string());
+    let locked_err =
+        ServerError::RoomLocked("Room is already locked by another process".to_string());
     assert_eq!(locked_err.to_error_code(), ErrorCode::RoomLocked);
     assert_eq!(locked_err.to_status_code(), axum::http::StatusCode::LOCKED);
 }

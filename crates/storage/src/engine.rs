@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use futures::Stream;
-use rimdb_core::{CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation, Value};
+use rimdb_core::{
+    CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation, Value,
+};
 use std::pin::Pin;
 
 use crate::error::StorageError;
@@ -54,11 +56,27 @@ pub trait StorageEngine: EngineConcurrencyBounds {
         pk: &PrimaryKey,
     ) -> Result<Option<CompactRow>, StorageError>;
 
+    /// Fetches a single row by primary key from a table identified by its numeric table_id.
+    async fn get_by_id(
+        &self,
+        room_id: &RoomId,
+        table_id: u16,
+        pk: &PrimaryKey,
+    ) -> Result<Option<CompactRow>, StorageError>;
+
     /// Scans a table using the specified options (key range, direction, limit, projection).
     async fn scan<'a>(
         &'a self,
         room_id: &RoomId,
-        table: &str,
+        table_id: &str,
+        options: ScanOptions,
+    ) -> Result<RowStream<'a>, StorageError>;
+
+    /// Scans a table identified by its numeric table_id using the specified options.
+    async fn scan_by_id<'a>(
+        &'a self,
+        room_id: &RoomId,
+        table_id: u16,
         options: ScanOptions,
     ) -> Result<RowStream<'a>, StorageError>;
 
@@ -100,12 +118,7 @@ where
             Some(indices) => {
                 let values = indices
                     .iter()
-                    .map(|&idx| {
-                        row.values
-                            .get(idx as usize)
-                            .cloned()
-                            .unwrap_or(Value::Null)
-                    })
+                    .map(|&idx| row.get(idx as usize).cloned().unwrap_or(Value::Null))
                     .collect();
                 CompactRow::new(values)
             }
@@ -134,12 +147,7 @@ where
             Some(indices) => {
                 let values = indices
                     .iter()
-                    .map(|&idx| {
-                        row.values
-                            .get(idx as usize)
-                            .cloned()
-                            .unwrap_or(Value::Null)
-                    })
+                    .map(|&idx| row.get(idx as usize).cloned().unwrap_or(Value::Null))
                     .collect();
                 CompactRow::new(values)
             }

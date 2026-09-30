@@ -1,9 +1,9 @@
+use rimdb_core::id::{ClientId, SequenceNumber};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use rimdb_core::id::{ClientId, SequenceNumber};
-use serde::{Deserialize, Serialize};
 
 use crate::error::ServerError;
 
@@ -191,10 +191,11 @@ impl ClientLeaseTracker {
 
     /// Evaluates timeouts for all registered clients:
     /// - `Connected` / `Bootstrapping` -> `Disconnected` when lease expires without heartbeat.
-    /// - `Disconnected` -> `Dormant` when its cursor falls behind `tail_seq - 1`.
+    /// - `Disconnected` -> `Dormant` when its cursor falls behind `tail_seq - 1` or exceeds 90s inactivity.
     pub fn check_timeouts(&mut self, lease_timeout: Duration, tail_seq: SequenceNumber) -> bool {
         let mut modified = false;
         let now = Instant::now();
+        let max_disconnected_duration = Duration::from_secs(90);
 
         for entry in self.clients.values_mut() {
             match entry.state {
@@ -205,9 +206,12 @@ impl ClientLeaseTracker {
                     }
                 }
                 ClientState::Disconnected => {
-                    if tail_seq.get() > 0
-                        && entry.last_ack_seq.get() < tail_seq.get().saturating_sub(1)
-                    {
+                    let fallen_behind = tail_seq.get() > 0
+                        && entry.last_ack_seq.get() < tail_seq.get().saturating_sub(1);
+                    let disconnected_timed_out =
+                        now.duration_since(entry.last_heartbeat) > max_disconnected_duration;
+
+                    if fallen_behind || disconnected_timed_out {
                         entry.state = ClientState::Dormant;
                         modified = true;
                     }
@@ -280,6 +284,11 @@ impl ClientLeaseTracker {
         self.clients.get(client_id)
     }
 
+    /// Returns a mutable reference to a client entry if registered.
+    pub fn get_client_mut(&mut self, client_id: &ClientId) -> Option<&mut ClientEntry> {
+        self.clients.get_mut(client_id)
+    }
+
     /// Returns (bootstrapping, connected, disconnected, dormant, total) client counts.
     pub fn client_counts(&self) -> (usize, usize, usize, usize, usize) {
         let mut bootstrapping = 0;
@@ -296,6 +305,12 @@ impl ClientLeaseTracker {
             }
         }
 
-        (bootstrapping, connected, disconnected, dormant, self.clients.len())
+        (
+            bootstrapping,
+            connected,
+            disconnected,
+            dormant,
+            self.clients.len(),
+        )
     }
 }

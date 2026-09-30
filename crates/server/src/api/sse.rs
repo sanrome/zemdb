@@ -1,19 +1,19 @@
-use std::convert::Infallible;
-use std::time::Duration;
 use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
 use rimdb_core::id::RoomId;
+use std::convert::Infallible;
+use std::time::Duration;
 use tokio::sync::broadcast;
 
-use crate::actor::command::RoomCommand;
+use crate::actor::command::{RoomCommand, RoomEvent};
 use crate::api::auth::ClientAuth;
 use crate::api::router::AppState;
 use crate::error::ServerError;
 
 /// `GET /rooms/:room_id/events`: Signal-only Server-Sent Events (SSE) broadcast channel.
 /// Authenticated via ClientAuth (Bearer token or ?token= query parameter).
-/// Emits `head_advanced` lightweight sequence signals without transmitting row payloads.
+/// Emits `head_advanced` and `schema_reloaded` lightweight signals without transmitting row payloads.
 pub async fn room_events(
     State(state): State<AppState>,
     Path(room_id_str): Path<String>,
@@ -44,14 +44,20 @@ pub async fn room_events(
 
     let receiver = tokio::time::timeout(Duration::from_secs(5), call)
         .await
-        .map_err(|_| ServerError::GatewayTimeout("Timeout subscribing to room events".to_string()))??;
+        .map_err(|_| {
+            ServerError::GatewayTimeout("Timeout subscribing to room events".to_string())
+        })??;
 
     let stream = futures::stream::unfold(receiver, |mut rx| async move {
         match rx.recv().await {
-            Ok(seq) => {
+            Ok(RoomEvent::HeadAdvanced(seq)) => {
                 let event = Event::default()
                     .event("head_advanced")
                     .data(seq.to_string());
+                Some((Ok(event), rx))
+            }
+            Ok(RoomEvent::SchemaReloaded(schema_id)) => {
+                let event = Event::default().event("schema_reloaded").data(&schema_id);
                 Some((Ok(event), rx))
             }
             Err(broadcast::error::RecvError::Lagged(_)) => {

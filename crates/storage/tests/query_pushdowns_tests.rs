@@ -167,8 +167,8 @@ async fn test_limit_and_projection_pushdowns() {
     let (pk, proj_row) = proj_stream.next().await.unwrap().unwrap();
     assert_eq!(pk, PrimaryKey::single(1i64));
     assert_eq!(proj_row.len(), 2);
-    assert_eq!(proj_row.values[0], Value::String("Name_1".into()));
-    assert_eq!(proj_row.values[1], Value::Bool(false));
+    assert_eq!(proj_row[0], Value::String("Name_1".into()));
+    assert_eq!(proj_row[1], Value::Bool(false));
 }
 
 #[tokio::test]
@@ -209,13 +209,22 @@ async fn test_disk_query_pushdowns_parity() {
     let mut names = Vec::new();
     while let Some(item) = stream.next().await {
         let (pk, row) = item.unwrap();
-        names.push((pk, row.values[0].clone()));
+        names.push((pk, row[0].clone()));
     }
 
     assert_eq!(names.len(), 3);
-    assert_eq!(names[0], (PrimaryKey::single(10i64), Value::String("User_10".into())));
-    assert_eq!(names[1], (PrimaryKey::single(9i64), Value::String("User_9".into())));
-    assert_eq!(names[2], (PrimaryKey::single(8i64), Value::String("User_8".into())));
+    assert_eq!(
+        names[0],
+        (PrimaryKey::single(10i64), Value::String("User_10".into()))
+    );
+    assert_eq!(
+        names[1],
+        (PrimaryKey::single(9i64), Value::String("User_9".into()))
+    );
+    assert_eq!(
+        names[2],
+        (PrimaryKey::single(8i64), Value::String("User_8".into()))
+    );
 }
 
 #[tokio::test]
@@ -376,11 +385,11 @@ async fn test_scan_snapshot_isolation_memory() {
 
     let (pk1, row1) = stream.next().await.unwrap().unwrap();
     assert_eq!(pk1, PrimaryKey::single(1i64));
-    assert_eq!(row1.values[2], Value::Int(10));
+    assert_eq!(row1[2], Value::Int(10));
 
     let (pk2, row2) = stream.next().await.unwrap().unwrap();
     assert_eq!(pk2, PrimaryKey::single(2i64));
-    assert_eq!(row2.values[2], Value::Int(20));
+    assert_eq!(row2[2], Value::Int(20));
 
     // 3. Mutate table concurrently: insert 11..15, update 3..10 to 9999, delete 5
     let mut mutate_ops = Vec::new();
@@ -423,7 +432,7 @@ async fn test_scan_snapshot_isolation_memory() {
     while let Some(item) = stream.next().await {
         let (pk, row) = item.unwrap();
         remaining_pks.push(pk);
-        remaining_scores.push(row.values[2].clone());
+        remaining_scores.push(row[2].clone());
     }
 
     // Verify snapshot isolation:
@@ -475,11 +484,11 @@ async fn test_scan_snapshot_isolation_disk() {
 
     let (pk1, row1) = stream.next().await.unwrap().unwrap();
     assert_eq!(pk1, PrimaryKey::single(1i64));
-    assert_eq!(row1.values[2], Value::Int(10));
+    assert_eq!(row1[2], Value::Int(10));
 
     let (pk2, row2) = stream.next().await.unwrap().unwrap();
     assert_eq!(pk2, PrimaryKey::single(2i64));
-    assert_eq!(row2.values[2], Value::Int(20));
+    assert_eq!(row2[2], Value::Int(20));
 
     // 3. Mutate table concurrently
     let mut mutate_ops = Vec::new();
@@ -522,7 +531,7 @@ async fn test_scan_snapshot_isolation_disk() {
     while let Some(item) = stream.next().await {
         let (pk, row) = item.unwrap();
         remaining_pks.push(pk);
-        remaining_scores.push(row.values[2].clone());
+        remaining_scores.push(row[2].clone());
     }
 
     // Verify snapshot isolation on disk engine
@@ -537,4 +546,3 @@ async fn test_scan_snapshot_isolation_disk() {
     assert!(remaining_pks.contains(&PrimaryKey::single(5i64)));
     assert!(!remaining_pks.contains(&PrimaryKey::single(11i64)));
 }
-

@@ -18,13 +18,13 @@ impl SchemaBuilder {
     }
 
     pub fn try_table(mut self, mut table: TableSchema) -> Result<Self, ValidationError> {
-        if self.id_by_name.contains_key(&table.name) {
+        if self.id_by_name.contains_key(table.name()) {
             return Err(ValidationError::DuplicateTable {
-                table: table.name,
+                table: table.name().to_string(),
             });
         }
-        if self.tables_by_id.contains_key(&table.table_id)
-            || (table.table_id == 0 && !self.tables_by_id.is_empty())
+        if self.tables_by_id.contains_key(&table.table_id())
+            || (table.table_id() == 0 && !self.tables_by_id.is_empty())
         {
             let next_id = self
                 .tables_by_id
@@ -32,10 +32,11 @@ impl SchemaBuilder {
                 .max()
                 .map_or(Some(0), |m| m.checked_add(1))
                 .ok_or(ValidationError::TableIdOverflow)?;
-            table.table_id = next_id;
+            table.set_table_id(next_id);
         }
-        self.id_by_name.insert(table.name.clone(), table.table_id);
-        self.tables_by_id.insert(table.table_id, table);
+        self.id_by_name
+            .insert(table.name().to_string(), table.table_id());
+        self.tables_by_id.insert(table.table_id(), table);
         Ok(self)
     }
 
@@ -52,7 +53,7 @@ impl SchemaBuilder {
 }
 
 /// Global database schema containing all tables in a Room with bidirectional ID/Name indexing.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize)]
 pub struct Schema {
     pub tables_by_id: BTreeMap<u16, TableSchema>,
     #[serde(skip)]
@@ -126,13 +127,13 @@ impl Schema {
     }
 
     pub fn add_table(&mut self, mut table: TableSchema) -> Result<u16, ValidationError> {
-        if self.id_by_name.contains_key(&table.name) {
+        if self.id_by_name.contains_key(table.name()) {
             return Err(ValidationError::DuplicateTable {
-                table: table.name,
+                table: table.name().to_string(),
             });
         }
-        if self.tables_by_id.contains_key(&table.table_id)
-            || (table.table_id == 0 && !self.tables_by_id.is_empty())
+        if self.tables_by_id.contains_key(&table.table_id())
+            || (table.table_id() == 0 && !self.tables_by_id.is_empty())
         {
             let next_id = self
                 .tables_by_id
@@ -140,10 +141,11 @@ impl Schema {
                 .max()
                 .map_or(Some(0), |m| m.checked_add(1))
                 .ok_or(ValidationError::TableIdOverflow)?;
-            table.table_id = next_id;
+            table.set_table_id(next_id);
         }
-        let assigned_id = table.table_id;
-        self.id_by_name.insert(table.name.clone(), assigned_id);
+        let assigned_id = table.table_id();
+        self.id_by_name
+            .insert(table.name().to_string(), assigned_id);
         self.tables_by_id.insert(assigned_id, table);
         Ok(assigned_id)
     }

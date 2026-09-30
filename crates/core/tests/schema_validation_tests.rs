@@ -24,7 +24,9 @@ fn test_schema_insert_validation_success() {
         .set("secret_chat", vec![0xCA, 0xFE, 0xBA, 0xBE]) // Must be bytes in transit
         .build();
 
-    let pk = schema.validate_insert("users", &row).expect("should succeed");
+    let pk = schema
+        .validate_insert("users", &row)
+        .expect("should succeed");
     assert_eq!(pk, PrimaryKey::single(1i64));
 }
 
@@ -133,7 +135,9 @@ fn test_schema_validates_pk_type_on_update_and_delete() {
     let wrong_pk = PrimaryKey::single("not_an_int");
     let fields = RowBuilder::new().set("name", "Updated").build();
 
-    let err_update = schema.validate_update("users", &wrong_pk, &fields).unwrap_err();
+    let err_update = schema
+        .validate_update("users", &wrong_pk, &fields)
+        .unwrap_err();
     assert_eq!(
         err_update,
         ValidationError::PrimaryKeyTypeMismatch {
@@ -184,7 +188,7 @@ fn test_compact_row_conversion() {
         .build();
 
     let compact = table.to_compact_row(&row).expect("should convert");
-    assert_eq!(compact.len(), table.columns.len());
+    assert_eq!(compact.len(), table.columns().len());
 
     let restored = table.from_compact_row(&compact).expect("should restore");
     assert_eq!(restored.get("id"), Some(&Value::Int(99)));
@@ -230,10 +234,10 @@ fn test_table_schema_preserves_ddl_definition_order() {
 
     // Columns must be stored in DDL definition order (id, zebra, alpha, beta),
     // NOT alphabetical order (alpha, beta, id, zebra)!
-    assert_eq!(table.columns[0].name, "id");
-    assert_eq!(table.columns[1].name, "zebra");
-    assert_eq!(table.columns[2].name, "alpha");
-    assert_eq!(table.columns[3].name, "beta");
+    assert_eq!(table.columns()[0].name, "id");
+    assert_eq!(table.columns()[1].name, "zebra");
+    assert_eq!(table.columns()[2].name, "alpha");
+    assert_eq!(table.columns()[3].name, "beta");
 
     let row = RowBuilder::new()
         .set("id", 1i64)
@@ -243,10 +247,10 @@ fn test_table_schema_preserves_ddl_definition_order() {
         .build();
 
     let compact = table.to_compact_row(&row).expect("compact");
-    assert_eq!(compact.values[0], Value::Int(1));
-    assert_eq!(compact.values[1], Value::String("Z".into()));
-    assert_eq!(compact.values[2], Value::Int(10));
-    assert_eq!(compact.values[3], Value::Bool(true));
+    assert_eq!(compact[0], Value::Int(1));
+    assert_eq!(compact[1], Value::String("Z".into()));
+    assert_eq!(compact[2], Value::Int(10));
+    assert_eq!(compact[3], Value::Bool(true));
 }
 
 #[test]
@@ -260,10 +264,14 @@ fn test_zero_copy_row_conversions() {
         .set("secret_chat", vec![0xDE, 0xAD])
         .build();
 
-    let compact = table.row_into_compact(row).expect("should convert zero-copy");
-    assert_eq!(compact.len(), table.columns.len());
+    let compact = table
+        .row_into_compact(row)
+        .expect("should convert zero-copy");
+    assert_eq!(compact.len(), table.columns().len());
 
-    let restored = table.compact_into_row(compact).expect("should restore zero-copy");
+    let restored = table
+        .compact_into_row(compact)
+        .expect("should restore zero-copy");
     assert_eq!(restored.get("id"), Some(&Value::Int(99)));
     assert_eq!(restored.get("name"), Some(&Value::String("Carol".into())));
     assert_eq!(restored.get("age"), Some(&Value::Int(28)));
@@ -293,7 +301,8 @@ fn test_schema_json_deserialization_from_tables_list() {
         ]
     }"#;
 
-    let schema: Schema = serde_json::from_str(json).expect("failed to deserialize Schema from JSON");
+    let schema: Schema =
+        serde_json::from_str(json).expect("failed to deserialize Schema from JSON");
     assert!(schema.has_table_by_name("projects"));
     assert!(schema.has_table_by_name("tasks"));
 
@@ -302,8 +311,8 @@ fn test_schema_json_deserialization_from_tables_list() {
     assert_ne!(projects_id, tasks_id);
 
     let projects_table = schema.get_table_by_name("projects").unwrap();
-    assert_eq!(projects_table.primary_key, vec!["id"]);
-    assert_eq!(projects_table.columns.len(), 2);
+    assert_eq!(projects_table.primary_key(), vec!["id"]);
+    assert_eq!(projects_table.columns().len(), 2);
 }
 
 #[test]
@@ -314,17 +323,20 @@ fn test_table_schema_add_column_evolution() {
         .build()
         .expect("valid table");
 
-    assert_eq!(table.columns.len(), 2);
+    assert_eq!(table.columns().len(), 2);
     assert_eq!(table.column_index("title"), Some(1));
 
     // 1. Adding a nullable column succeeds
     let priority_col = ColumnDef::new("priority", DataType::Int).nullable(true);
     let assigned_idx = table.add_column(priority_col).expect("should add column");
     assert_eq!(assigned_idx, 2);
-    assert_eq!(table.columns.len(), 3);
-    assert_eq!(table.columns[2].name, "priority");
+    assert_eq!(table.columns().len(), 3);
+    assert_eq!(table.columns()[2].name, "priority");
     assert_eq!(table.column_index("priority"), Some(2));
-    assert_eq!(table.get_column("priority").unwrap().data_type, DataType::Int);
+    assert_eq!(
+        table.get_column("priority").unwrap().data_type,
+        DataType::Int
+    );
 
     // 2. Adding a duplicate column is rejected
     let dup_col = ColumnDef::new("priority", DataType::String).nullable(true);
@@ -351,7 +363,10 @@ fn test_table_schema_add_column_evolution() {
     // 4. Adding DataType::Null is rejected
     let null_col = ColumnDef::new("invalid", DataType::Null).nullable(true);
     let null_err = table.add_column(null_col).unwrap_err();
-    assert!(matches!(null_err, ValidationError::InvalidColumnDataType { .. }));
+    assert!(matches!(
+        null_err,
+        ValidationError::InvalidColumnDataType { .. }
+    ));
 }
 
 #[test]
@@ -372,7 +387,7 @@ fn test_compact_into_row_supports_schema_evolution_shorter_arity() {
     table
         .add_column(ColumnDef::new("views", DataType::Int).nullable(true))
         .unwrap();
-    assert_eq!(table.columns.len(), 4);
+    assert_eq!(table.columns().len(), 4);
 
     // from_compact_row should succeed and restore the historical columns
     let restored = table
@@ -388,7 +403,10 @@ fn test_compact_into_row_supports_schema_evolution_shorter_arity() {
         .compact_into_row(historical_compact)
         .expect("should allow shorter arity zero-copy");
     assert_eq!(restored_zero_copy.get("id"), Some(&Value::Int(100)));
-    assert_eq!(restored_zero_copy.get("title"), Some(&Value::String("Doc 1".into())));
+    assert_eq!(
+        restored_zero_copy.get("title"),
+        Some(&Value::String("Doc 1".into()))
+    );
     assert_eq!(restored_zero_copy.get("tags"), None);
     assert_eq!(restored_zero_copy.get("views"), None);
 }
@@ -501,17 +519,18 @@ fn test_table_schema_validate_operation_insert_update_delete() {
         Value::String("Bio text".into()),
         Value::Bytes(vec![1, 2, 3].into_boxed_slice()),
     ]);
-    let insert_op = Operation::insert(table.table_id, PrimaryKey::single(10i64), valid_row, 100);
+    let insert_op = Operation::insert(table.table_id(), PrimaryKey::single(10i64), valid_row, 100);
     assert!(table.validate_operation(&insert_op).is_ok());
     assert!(schema.validate_operation(&insert_op).is_ok());
 
     // 2. Insert with table_id mismatch
-    let wrong_id_op = Operation::insert(999, PrimaryKey::single(10i64), CompactRow::new(vec![]), 100);
+    let wrong_id_op =
+        Operation::insert(999, PrimaryKey::single(10i64), CompactRow::new(vec![]), 100);
     assert_eq!(
         table.validate_operation(&wrong_id_op),
         Err(ValidationError::TableIdMismatch {
             table: "users".to_string(),
-            expected: table.table_id,
+            expected: table.table_id(),
             actual: 999,
         })
     );
@@ -524,7 +543,12 @@ fn test_table_schema_validate_operation_insert_update_delete() {
         Value::Null,
         Value::Bytes(vec![1].into_boxed_slice()),
     ]);
-    let pk_mismatch_op = Operation::insert(table.table_id, PrimaryKey::single(10i64), row_mismatch, 100);
+    let pk_mismatch_op = Operation::insert(
+        table.table_id(),
+        PrimaryKey::single(10i64),
+        row_mismatch,
+        100,
+    );
     assert_eq!(
         table.validate_operation(&pk_mismatch_op),
         Err(ValidationError::PrimaryKeyMismatch {
@@ -534,7 +558,7 @@ fn test_table_schema_validate_operation_insert_update_delete() {
 
     // 4. Valid Update operation
     let update_op = Operation::update(
-        table.table_id,
+        table.table_id(),
         PrimaryKey::single(10i64),
         vec![ColumnUpdate::new(2, Value::Int(26))],
         105,
@@ -542,11 +566,11 @@ fn test_table_schema_validate_operation_insert_update_delete() {
     assert!(table.validate_operation(&update_op).is_ok());
 
     // 5. Valid Delete operation
-    let delete_op = Operation::delete(table.table_id, PrimaryKey::single(10i64), 110);
+    let delete_op = Operation::delete(table.table_id(), PrimaryKey::single(10i64), 110);
     assert!(table.validate_operation(&delete_op).is_ok());
 
     // 6. Delete with invalid PK type
-    let bad_delete_op = Operation::delete(table.table_id, PrimaryKey::single("wrong_type"), 110);
+    let bad_delete_op = Operation::delete(table.table_id(), PrimaryKey::single("wrong_type"), 110);
     assert!(matches!(
         table.validate_operation(&bad_delete_op),
         Err(ValidationError::PrimaryKeyTypeMismatch { .. })
@@ -689,7 +713,7 @@ fn test_schema_add_table_detects_id_overflow() {
         .primary_key("id", DataType::Int)
         .build()
         .unwrap();
-    table_max.table_id = u16::MAX;
+    table_max.set_table_id(u16::MAX);
     schema.add_table(table_max).unwrap();
 
     let next_table = TableSchema::builder("overflow_table")
@@ -702,22 +726,12 @@ fn test_schema_add_table_detects_id_overflow() {
 
 #[test]
 fn test_validate_compact_row_op_unknown_pk_column_returns_error() {
-    let mut table = TableSchema::builder("users")
-        .primary_key("id", DataType::Int)
-        .build()
-        .unwrap();
-    // Simulate inconsistency where primary_key has a column not present in column_indices
-    table.primary_key.push("ghost_col".to_string());
-
-    let row = CompactRow::new(vec![Value::Int(10), Value::Int(20)]);
-    let insert_op = Operation::insert(
-        table.table_id,
-        PrimaryKey::composite(vec![Value::Int(10), Value::Int(20)]),
-        row,
-        100,
+    let res = TableSchema::try_new(
+        1,
+        "users",
+        vec!["ghost_col".to_string()],
+        vec![ColumnDef::new("id", DataType::Int)],
     );
-
-    let res = table.validate_operation(&insert_op);
     assert_eq!(
         res,
         Err(ValidationError::UnknownColumn {
@@ -726,5 +740,3 @@ fn test_validate_compact_row_op_unknown_pk_column_returns_error() {
         })
     );
 }
-
-

@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use rimdb_core::id::{ClientId, MutationId, RoomId, SchemaId, SequenceNumber};
 use rimdb_core::mutation::Operation;
 use rimdb_core::protocol::messages::SequencedOperation;
 use rimdb_core::schema::Schema;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::sync::{broadcast, oneshot};
 
 use crate::error::ServerError;
@@ -46,6 +46,13 @@ pub struct RoomMetrics {
     pub disconnected_clients: usize,
     pub dormant_clients: usize,
     pub total_clients: usize,
+}
+
+/// Real-time notifications emitted by a RoomActor for SSE subscribers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoomEvent {
+    HeadAdvanced(SequenceNumber),
+    SchemaReloaded(SchemaId),
 }
 
 /// Commands dispatched to a RoomActor.
@@ -101,7 +108,7 @@ pub enum RoomCommand {
 
     /// Subscribe to the room's signal-only SSE broadcast channel.
     SubscribeEvents {
-        reply: oneshot::Sender<broadcast::Receiver<SequenceNumber>>,
+        reply: oneshot::Sender<broadcast::Receiver<RoomEvent>>,
     },
 
     /// Reload the active schema in this room (e.g. after schema evolution).
@@ -111,9 +118,7 @@ pub enum RoomCommand {
     },
 
     /// Retrieve operational metrics for this room.
-    GetMetrics {
-        reply: oneshot::Sender<RoomMetrics>,
-    },
+    GetMetrics { reply: oneshot::Sender<RoomMetrics> },
 
     /// Query the confirmed cursor (last_ack_seq) for a registered client.
     GetClientCursor {
@@ -122,7 +127,5 @@ pub enum RoomCommand {
     },
 
     /// Gracefully shutdown the room actor loop and release all file resources.
-    Shutdown {
-        reply: oneshot::Sender<()>,
-    },
+    Shutdown { reply: oneshot::Sender<()> },
 }

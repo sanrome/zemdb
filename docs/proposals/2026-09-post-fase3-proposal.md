@@ -359,14 +359,18 @@ El plan de corrección se estructurará en tres fases incrementales antes de dar
 *Objetivo: Optimizar el rendimiento algorítmico, consolidar el encapsulamiento y expandir la cobertura de tests.*
 
 1. **Refactorización de Contratos y Rendimiento**:
-   - Enmarcado con magic bytes y versionado en codec binario ([`M-03`](../audits/2026-09-post-fase3-audit.md#m-03)).
-   - Formato universal de snapshots interoperable entre `MemoryStorageEngine` y `DiskStorageEngine` ([`A-06`](../audits/2026-09-post-fase3-audit.md#a-06)).
-   - Soporte de consulta directa por `table_id: u16` en `StorageEngine` ([`M-13`](../audits/2026-09-post-fase3-audit.md#m-13)).
-   - Búsqueda en $O(1)$ sobre `HotBuffer` ([`RUST-11`](../audits/2026-09-post-fase3-audit.md#rust-11)).
-   - Encapsular campos mutables de `PrimaryKey`, `CompactRow`, `TableSchema` y remover `Deref` no idiomático ([`M-15`](../audits/2026-09-post-fase3-audit.md#m-15)).
-   - Corrección de LWW en squashing (Regla 1) y anulación mutua Insert+Delete ([`M-01`](../audits/2026-09-post-fase3-audit.md#m-01)).
-   - Señalización SSE ante migraciones DDL ([`M-06`](../audits/2026-09-post-fase3-audit.md#m-06)).
-   - Estandarizar respuestas binarias estructuradas en errores de Data Plane ([`B-03`](../audits/2026-09-post-fase3-audit.md#b-03)).
+   - [RESUELTO] Enmarcado con magic bytes y versionado en codec binario ([`M-03`](../audits/2026-09-post-fase3-audit.md#m-03)).
+   - [RESUELTO] Formato universal de snapshots interoperable entre `MemoryStorageEngine` y `DiskStorageEngine` ([`A-06`](../audits/2026-09-post-fase3-audit.md#a-06)).
+   - [RESUELTO] Soporte de consulta directa por `table_id: u16` en `StorageEngine` y validación en `apply_batch` ([`M-13`](../audits/2026-09-post-fase3-audit.md#m-13), [`A-08`](../audits/2026-09-post-fase3-audit.md#a-08)).
+   - [RESUELTO] Búsqueda en $O(1)$ sobre `HotBuffer` ([`RUST-11`](../audits/2026-09-post-fase3-audit.md#rust-11)).
+   - [RESUELTO] Encapsular campos mutables de `PrimaryKey`, `CompactRow`, `TableSchema` y remover `Deref` no idiomático ([`M-15`](../audits/2026-09-post-fase3-audit.md#m-15)).
+   - [RESUELTO] Corrección de LWW en squashing (Regla 1) y anulación mutua Insert+Delete ([`M-01`](../audits/2026-09-post-fase3-audit.md#m-01), [`B-02`](../audits/2026-09-post-fase3-audit.md#b-02)).
+   - [RESUELTO] Señalización SSE ante migraciones DDL ([`M-06`](../audits/2026-09-post-fase3-audit.md#m-06)).
+   - [RESUELTO] Estandarizar respuestas binarias estructuradas en errores de Data Plane y `DeregisterAck` ([`B-03`](../audits/2026-09-post-fase3-audit.md#b-03)).
+   - [RESUELTO] Transición de leases `Disconnected -> Dormant` tras 90s ([`A-10`](../audits/2026-09-post-fase3-audit.md#a-10)).
+   - [RESUELTO] Recálculo exacto de `tail_seq` en `prune_older_than` ([`M-10`](../audits/2026-09-post-fase3-audit.md#m-10)).
+   - [RESUELTO] Liberación de cerrojo global antes de I/O en `close_room` ([`M-16`](../audits/2026-09-post-fase3-audit.md#m-16)).
+   - [RESUELTO] Consulta pasiva en `GET /admin/rooms/:id` evitando spawn fantasma de actores ([`B-04`](../audits/2026-09-post-fase3-audit.md#b-04)).
 2. **Expansión Exhaustiva de la Batería de Pruebas**:
    - Añadir tests de integración verificando explícitamente el contenido y contigüidad de `catchup_ops` ante desfases de secuencia ([`A-17`](../audits/2026-09-post-fase3-audit.md#a-17)).
    - Tests de recuperación post-crash simulando caídas entre snapshot y truncado de WAL.

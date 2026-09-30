@@ -181,4 +181,3 @@ pub fn replay_wal_records(
 ) -> Result<(Vec<SequencedOperation>, usize, Option<String>), StorageError> {
     rimdb_core::protocol::wal_frame::replay_wal_records(wal_bytes).map_err(Into::into)
 }
-

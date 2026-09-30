@@ -1,16 +1,16 @@
+use rimdb_core::id::{MutationId, RoomId, SchemaId, SequenceNumber};
+use rimdb_core::protocol::messages::SequencedOperation;
+use rimdb_core::schema::Schema;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use rimdb_core::id::{MutationId, RoomId, SchemaId, SequenceNumber};
-use rimdb_core::protocol::messages::SequencedOperation;
-use rimdb_core::schema::Schema;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::actor::command::{
-    CommitResponse, RegisterResponse, RoomCommand, RoomMetrics, SyncBatchResponse,
+    CommitResponse, RegisterResponse, RoomCommand, RoomEvent, RoomMetrics, SyncBatchResponse,
 };
 use crate::actor::lease::ClientLeaseTracker;
 use crate::config::ServerConfig;
@@ -28,7 +28,7 @@ pub struct RoomActor {
     tiered_log: TieredLog,
     lease_tracker: ClientLeaseTracker,
     head_seq: SequenceNumber,
-    events_tx: broadcast::Sender<SequenceNumber>,
+    events_tx: broadcast::Sender<RoomEvent>,
     receiver: mpsc::Receiver<RoomCommand>,
     lease_timeout: Duration,
     snapshot_relay: Arc<SnapshotRelay>,
@@ -157,6 +157,9 @@ impl RoomActor {
 
             RoomCommand::ReloadSchema { schema, reply } => {
                 self.schema = schema;
+                let _ = self
+                    .events_tx
+                    .send(RoomEvent::SchemaReloaded(self.schema_id.clone()));
                 let _ = reply.send(Ok(()));
             }
 
@@ -323,7 +326,7 @@ impl RoomActor {
         self.lease_tracker.record_activity(&client_id);
 
         // 10. Broadcast signal-only SSE event to active watchers
-        let _ = self.events_tx.send(new_seq);
+        let _ = self.events_tx.send(RoomEvent::HeadAdvanced(new_seq));
 
         // 11. Compute catch-up deltas for 1-RTT synchronization
         let (catchup_ops, has_more) = if last_ack_seq.get() < new_seq.get().saturating_sub(1) {
@@ -377,10 +380,7 @@ impl RoomActor {
 
         // 3. Fetch continuous multi-tier delta batch
         let bounded_batch_size = max_batch_size.clamp(1, 1000);
-        match self
-            .tiered_log
-            .fetch_deltas(from_seq, bounded_batch_size)
-        {
+        match self.tiered_log.fetch_deltas(from_seq, bounded_batch_size) {
             Ok((ops, has_more)) => {
                 // If client was bootstrapping and synced a valid range, promote to Connected
                 if self.lease_tracker.is_bootstrapping(&client_id) {
@@ -432,22 +432,19 @@ impl RoomActor {
         }
 
         // 3. Record explicit Ack, advancing cursor, refreshing lease, and promoting Bootstrapping
-        let res = self
-            .lease_tracker
-            .record_ack(&client_id, ack_seq)
-            .map(|_| {
-                // 4. Trigger proactive log pruning if all connected clients are past the sequence,
-                // bounded by active_snapshot_seq (Retention Anchor)
-                if let Some(min_ack) = self.lease_tracker.min_connected_ack_seq() {
-                    let active_snap = self.snapshot_relay.active_snapshot_seq(&self.room_id);
-                    let retention_floor = match active_snap {
-                        Some(snap_seq) => min_ack.min(snap_seq),
-                        None => min_ack,
-                    };
-                    let _ = self.tiered_log.prune_older_than(retention_floor);
-                }
-                self.head_seq
-            });
+        let res = self.lease_tracker.record_ack(&client_id, ack_seq).map(|_| {
+            // 4. Trigger proactive log pruning if all connected clients are past the sequence,
+            // bounded by active_snapshot_seq (Retention Anchor)
+            if let Some(min_ack) = self.lease_tracker.min_connected_ack_seq() {
+                let active_snap = self.snapshot_relay.active_snapshot_seq(&self.room_id);
+                let retention_floor = match active_snap {
+                    Some(snap_seq) => min_ack.min(snap_seq),
+                    None => min_ack,
+                };
+                let _ = self.tiered_log.prune_older_than(retention_floor);
+            }
+            self.head_seq
+        });
 
         let _ = reply.send(res);
     }

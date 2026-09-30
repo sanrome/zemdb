@@ -3,11 +3,13 @@ use rimdb_core::{
     SequencedOperation, TableSchema, Value, MAX_MESSAGE_SIZE,
 };
 use rimdb_storage::format::{
-    decode_wal_batch_from_slice, decode_wal_record_from_slice, encode_wal_batch,
-    encode_wal_record, replay_wal_records, FileHeader, WalBatchDecodeResult, WalDecodeResult,
-    BATCH_HEADER_SIZE, BATCH_MAGIC, HEADER_SIZE, MAGIC_BYTES,
+    decode_wal_batch_from_slice, decode_wal_record_from_slice, encode_wal_batch, encode_wal_record,
+    replay_wal_records, FileHeader, WalBatchDecodeResult, WalDecodeResult, BATCH_HEADER_SIZE,
+    BATCH_MAGIC, HEADER_SIZE, MAGIC_BYTES,
 };
-use rimdb_storage::{DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError, WalReader};
+use rimdb_storage::{
+    DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError, WalReader,
+};
 
 const USERS_TABLE: u16 = 0;
 
@@ -263,7 +265,10 @@ async fn test_disk_torn_write_recovery() {
     let head = engine2.get_head_seq(&room_id).await.unwrap();
     assert_eq!(head, SequenceNumber::from(1u64));
 
-    let retrieved = engine2.get(&room_id, "users", &PrimaryKey::single(1i64)).await.unwrap();
+    let retrieved = engine2
+        .get(&room_id, "users", &PrimaryKey::single(1i64))
+        .await
+        .unwrap();
     assert_eq!(retrieved, Some(row));
 
     // Check file was truncated back to clean_len
@@ -309,7 +314,10 @@ async fn test_disk_room_lifecycle_and_persistence() {
     assert_eq!(head, SequenceNumber::from(2u64));
 
     // Point lookups
-    let res1 = engine.get(&room_id, "users", &PrimaryKey::single(1i64)).await.unwrap();
+    let res1 = engine
+        .get(&room_id, "users", &PrimaryKey::single(1i64))
+        .await
+        .unwrap();
     assert_eq!(res1, Some(row1.clone()));
 
     // Close room
@@ -322,10 +330,16 @@ async fn test_disk_room_lifecycle_and_persistence() {
     let head2 = engine2.get_head_seq(&room_id).await.unwrap();
     assert_eq!(head2, SequenceNumber::from(2u64));
 
-    let res1_replayed = engine2.get(&room_id, "users", &PrimaryKey::single(1i64)).await.unwrap();
+    let res1_replayed = engine2
+        .get(&room_id, "users", &PrimaryKey::single(1i64))
+        .await
+        .unwrap();
     assert_eq!(res1_replayed, Some(row1));
 
-    let res2_replayed = engine2.get(&room_id, "users", &PrimaryKey::single(2i64)).await.unwrap();
+    let res2_replayed = engine2
+        .get(&room_id, "users", &PrimaryKey::single(2i64))
+        .await
+        .unwrap();
     assert_eq!(res2_replayed, Some(row2));
 }
 
@@ -467,7 +481,10 @@ async fn test_disk_blind_update_ignored() {
     assert_eq!(head, SequenceNumber::from(1u64));
 
     // Must NOT have created an invalid row with nulls
-    let retrieved = engine.get(&room_id, "users", &PrimaryKey::single(999i64)).await.unwrap();
+    let retrieved = engine
+        .get(&room_id, "users", &PrimaryKey::single(999i64))
+        .await
+        .unwrap();
     assert_eq!(retrieved, None);
 }
 
@@ -487,7 +504,10 @@ async fn test_dual_file_storage_layout_and_compaction_truncation() {
     // Both files must exist after opening room
     assert!(snap_path.exists());
     assert!(wal_path.exists());
-    assert_eq!(tokio::fs::metadata(&snap_path).await.unwrap().len(), HEADER_SIZE as u64);
+    assert_eq!(
+        tokio::fs::metadata(&snap_path).await.unwrap().len(),
+        HEADER_SIZE as u64
+    );
     assert_eq!(tokio::fs::metadata(&wal_path).await.unwrap().len(), 0);
 
     // Apply mutation batch
@@ -526,8 +546,12 @@ async fn test_dual_file_storage_layout_and_compaction_truncation() {
     let head = engine2.get_head_seq(&room_id).await.unwrap();
     assert_eq!(head, SequenceNumber::from(1u64));
 
-    let row_retrieved = engine2.get(&room_id, "users", &PrimaryKey::single(1i64)).await.unwrap().unwrap();
-    assert_eq!(row_retrieved.values[1], Value::String("Dual File".into()));
+    let row_retrieved = engine2
+        .get(&room_id, "users", &PrimaryKey::single(1i64))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row_retrieved[1], Value::String("Dual File".into()));
 }
 
 #[tokio::test]
@@ -571,7 +595,10 @@ async fn test_dynamic_column_update_resizing_disk_and_wal_recovery() {
                 Operation::update(
                     USERS_TABLE,
                     PrimaryKey::single(1i64),
-                    vec![rimdb_core::ColumnUpdate::new(3, Value::String("Disk Note".into()))],
+                    vec![rimdb_core::ColumnUpdate::new(
+                        3,
+                        Value::String("Disk Note".into()),
+                    )],
                     110,
                 ),
             )],
@@ -585,11 +612,11 @@ async fn test_dynamic_column_update_resizing_disk_and_wal_recovery() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(updated.values.len(), 4);
-    assert_eq!(updated.values[0], Value::Int(1));
-    assert_eq!(updated.values[1], Value::String("Initial".into()));
-    assert_eq!(updated.values[2], Value::Null);
-    assert_eq!(updated.values[3], Value::String("Disk Note".into()));
+    assert_eq!(updated.len(), 4);
+    assert_eq!(updated[0], Value::Int(1));
+    assert_eq!(updated[1], Value::String("Initial".into()));
+    assert_eq!(updated[2], Value::Null);
+    assert_eq!(updated[3], Value::String("Disk Note".into()));
 
     // 4. Close and recover from WAL with the evolved schema
     engine.close_room(&room_id).await.unwrap();
@@ -602,11 +629,11 @@ async fn test_dynamic_column_update_resizing_disk_and_wal_recovery() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(recovered_row.values.len(), 4);
-    assert_eq!(recovered_row.values[0], Value::Int(1));
-    assert_eq!(recovered_row.values[1], Value::String("Initial".into()));
-    assert_eq!(recovered_row.values[2], Value::Null);
-    assert_eq!(recovered_row.values[3], Value::String("Disk Note".into()));
+    assert_eq!(recovered_row.len(), 4);
+    assert_eq!(recovered_row[0], Value::Int(1));
+    assert_eq!(recovered_row[1], Value::String("Initial".into()));
+    assert_eq!(recovered_row[2], Value::Null);
+    assert_eq!(recovered_row[3], Value::String("Disk Note".into()));
 }
 
 #[tokio::test]
@@ -661,21 +688,21 @@ async fn test_wal_recovery_truncates_zero_filled_tail_at_eof() {
 
     // 4. Recover room: should detect zero-filled EOF tail, truncate cleanly, and load row
     let engine_rec = DiskStorageEngine::new(options.clone());
-    engine_rec.open_room(&room_id, schema.clone()).await.unwrap();
+    engine_rec
+        .open_room(&room_id, schema.clone())
+        .await
+        .unwrap();
 
     let row = engine_rec
         .get(&room_id, "users", &PrimaryKey::single(10i64))
         .await
         .unwrap()
         .expect("row recovered");
-    assert_eq!(row.values[0], Value::Int(10));
-    assert_eq!(row.values[1], Value::String("TailTest".into()));
+    assert_eq!(row[0], Value::Int(10));
+    assert_eq!(row[1], Value::String("TailTest".into()));
 
     // Verify WAL length on disk is restored to valid_len
-    assert_eq!(
-        std::fs::metadata(&wal_path).unwrap().len(),
-        valid_len
-    );
+    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), valid_len);
 
     // 5. Subsequent write after truncation must succeed and append properly
     let op2 = SequencedOperation::with_default_origin(
@@ -699,10 +726,18 @@ async fn test_wal_recovery_truncates_zero_filled_tail_at_eof() {
     let engine_final = DiskStorageEngine::new(options);
     engine_final.open_room(&room_id, schema).await.unwrap();
 
-    let row1 = engine_final.get(&room_id, "users", &PrimaryKey::single(10i64)).await.unwrap().unwrap();
-    let row2 = engine_final.get(&room_id, "users", &PrimaryKey::single(20i64)).await.unwrap().unwrap();
-    assert_eq!(row1.values[0], Value::Int(10));
-    assert_eq!(row2.values[0], Value::Int(20));
+    let row1 = engine_final
+        .get(&room_id, "users", &PrimaryKey::single(10i64))
+        .await
+        .unwrap()
+        .unwrap();
+    let row2 = engine_final
+        .get(&room_id, "users", &PrimaryKey::single(20i64))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row1[0], Value::Int(10));
+    assert_eq!(row2[0], Value::Int(20));
 }
 
 #[test]
@@ -790,7 +825,10 @@ async fn test_wal_replay_skips_operations_before_snapshot_seq() {
 
     // 2. Compact room creating snapshot at seq 2 and truncating WAL
     engine.compact_room(&room_id).await.unwrap();
-    assert_eq!(engine.get_head_seq(&room_id).await.unwrap(), SequenceNumber::from(2u64));
+    assert_eq!(
+        engine.get_head_seq(&room_id).await.unwrap(),
+        SequenceNumber::from(2u64)
+    );
     engine.close_room(&room_id).await.unwrap();
 
     // 3. Manually append to WAL: an obsolete op with seq 1 (or 2) that tries to revert score to 999,
@@ -830,14 +868,17 @@ async fn test_wal_replay_skips_operations_before_snapshot_seq() {
     let engine_rec = DiskStorageEngine::new(options);
     engine_rec.open_room(&room_id, schema).await.unwrap();
 
-    assert_eq!(engine_rec.get_head_seq(&room_id).await.unwrap(), SequenceNumber::from(3u64));
+    assert_eq!(
+        engine_rec.get_head_seq(&room_id).await.unwrap(),
+        SequenceNumber::from(3u64)
+    );
     let row = engine_rec
         .get(&room_id, "users", &PrimaryKey::single(1i64))
         .await
         .unwrap()
         .expect("row exists");
     // If stale_op had been replayed, score might have been 999 or caused sequence violation.
-    assert_eq!(row.values[2], Value::Int(30));
+    assert_eq!(row[2], Value::Int(30));
 }
 
 #[tokio::test]
@@ -858,10 +899,16 @@ async fn test_snapshot_payload_crc_corruption_detected() {
             Value::Int(i * 10),
             Value::Bool(true),
         ]);
-        engine.apply_batch(&room_id, vec![SequencedOperation::with_default_origin(
-            i as u64,
-            Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 100),
-        )]).await.unwrap();
+        engine
+            .apply_batch(
+                &room_id,
+                vec![SequencedOperation::with_default_origin(
+                    i as u64,
+                    Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 100),
+                )],
+            )
+            .await
+            .unwrap();
     }
 
     engine.compact_room(&room_id).await.unwrap();
@@ -876,7 +923,10 @@ async fn test_snapshot_payload_crc_corruption_detected() {
 
     // Reopening the room must fail with SnapshotCorruption due to CRC mismatch
     let engine_tampered = DiskStorageEngine::new(options);
-    let err = engine_tampered.open_room(&room_id, schema).await.unwrap_err();
+    let err = engine_tampered
+        .open_room(&room_id, schema)
+        .await
+        .unwrap_err();
     assert!(matches!(err, StorageError::SnapshotCorruption(msg) if msg.contains("CRC32 mismatch")));
 }
 
@@ -898,10 +948,16 @@ async fn test_crash_recovery_with_wal_compacting() {
             Value::Int(i * 10),
             Value::Bool(true),
         ]);
-        engine.apply_batch(&room_id, vec![SequencedOperation::with_default_origin(
-            i as u64,
-            Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 100),
-        )]).await.unwrap();
+        engine
+            .apply_batch(
+                &room_id,
+                vec![SequencedOperation::with_default_origin(
+                    i as u64,
+                    Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 100),
+                )],
+            )
+            .await
+            .unwrap();
     }
 
     engine.compact_room(&room_id).await.unwrap();
@@ -955,17 +1011,27 @@ async fn test_crash_recovery_with_wal_compacting() {
         SequenceNumber::from(20u64)
     );
 
-    let row1 = engine_rec.get(&room_id, "users", &PrimaryKey::single(1i64)).await.unwrap().unwrap();
-    assert_eq!(row1.values[1], Value::String("User 1".into()));
+    let row1 = engine_rec
+        .get(&room_id, "users", &PrimaryKey::single(1i64))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row1[1], Value::String("User 1".into()));
 
-    let row12 = engine_rec.get(&room_id, "users", &PrimaryKey::single(12i64)).await.unwrap().unwrap();
-    assert_eq!(row12.values[1], Value::String("User 12".into()));
+    let row12 = engine_rec
+        .get(&room_id, "users", &PrimaryKey::single(12i64))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row12[1], Value::String("User 12".into()));
 
-    let row20 = engine_rec.get(&room_id, "users", &PrimaryKey::single(20i64)).await.unwrap().unwrap();
-    assert_eq!(row20.values[1], Value::String("User 20".into()));
+    let row20 = engine_rec
+        .get(&room_id, "users", &PrimaryKey::single(20i64))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row20[1], Value::String("User 20".into()));
 
     // Verify wal.compacting was cleaned up
     assert!(!compacting_path.exists());
 }
-
-

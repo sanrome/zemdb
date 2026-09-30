@@ -86,57 +86,60 @@ pub async fn compact_room_cow(
     }; // Lock released immediately
 
     // Phase 2: Heavy serialization, compression and disk I/O in blocking worker thread
-    let worker_res = tokio::task::spawn_blocking(move || -> Result<CompactionWorkerOutput, StorageError> {
-        let payload = RoomSnapshotPayload {
-            head_seq: cut_seq,
-            tables: snapshot_tables,
-        };
+    let worker_res =
+        tokio::task::spawn_blocking(move || -> Result<CompactionWorkerOutput, StorageError> {
+            let payload = RoomSnapshotPayload {
+                head_seq: cut_seq,
+                tables: snapshot_tables,
+            };
 
-        let serialized = bincode::serialize(&payload)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            let serialized = bincode::serialize(&payload)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
-        let compressed = zstd::encode_all(&serialized[..], zstd_level)
-            .map_err(|e| StorageError::Other(format!("Zstd compression failed: {e}")))?;
+            let compressed = zstd::encode_all(&serialized[..], zstd_level)
+                .map_err(|e| StorageError::Other(format!("Zstd compression failed: {e}")))?;
 
-        let payload_crc32 = crc32fast::hash(&compressed);
-        let uuid_str = uuid::Uuid::new_v4().to_string();
-        let tmp_path = snap_path.with_extension(format!("snap.tmp.{}", uuid_str));
+            let payload_crc32 = crc32fast::hash(&compressed);
+            let uuid_str = uuid::Uuid::new_v4().to_string();
+            let tmp_path = snap_path.with_extension(format!("snap.tmp.{}", uuid_str));
 
-        let header = FileHeader::new(
-            cut_seq.get(),
-            cut_seq.get(),
-            compressed.len() as u64,
-            payload_crc32,
-        );
+            let header = FileHeader::new(
+                cut_seq.get(),
+                cut_seq.get(),
+                compressed.len() as u64,
+                payload_crc32,
+            );
 
-        let std_tmp = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&tmp_path)?;
-        std_tmp
-            .try_lock_exclusive()
-            .map_err(|_| StorageError::RoomLocked(room_id))?;
+            let std_tmp = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&tmp_path)?;
+            std_tmp
+                .try_lock_exclusive()
+                .map_err(|_| StorageError::RoomLocked(room_id))?;
 
-        use std::io::Write;
-        let mut writer = std::io::BufWriter::new(std_tmp);
-        writer.write_all(&header.encode())?;
-        writer.write_all(&compressed)?;
-        writer.flush()?;
-        let std_file = writer.into_inner().map_err(|e| StorageError::Other(e.to_string()))?;
-        std_file.sync_all()?;
+            use std::io::Write;
+            let mut writer = std::io::BufWriter::new(std_tmp);
+            writer.write_all(&header.encode())?;
+            writer.write_all(&compressed)?;
+            writer.flush()?;
+            let std_file = writer
+                .into_inner()
+                .map_err(|e| StorageError::Other(e.to_string()))?;
+            std_file.sync_all()?;
 
-        if let Some(parent) = tmp_path.parent() {
-            sync_dir(parent)?;
-        }
+            if let Some(parent) = tmp_path.parent() {
+                sync_dir(parent)?;
+            }
 
-        Ok(CompactionWorkerOutput {
-            tmp_path,
-            cut_seq,
-            compressed_len: compressed.len() as u64,
+            Ok(CompactionWorkerOutput {
+                tmp_path,
+                cut_seq,
+                compressed_len: compressed.len() as u64,
+            })
         })
-    })
-    .await
-    .map_err(|e| StorageError::Other(format!("Join error: {e}")))?;
+        .await
+        .map_err(|e| StorageError::Other(format!("Join error: {e}")))?;
 
     let output = match worker_res {
         Ok(out) => out,
@@ -191,20 +194,21 @@ pub async fn write_snapshot_and_truncate_wal(
         tables: &room.tables,
     };
 
-    let serialized = bincode::serialize(&payload)
-        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+    let serialized =
+        bincode::serialize(&payload).map_err(|e| StorageError::Serialization(e.to_string()))?;
 
     let zstd_level = options.zstd_level;
-    let compressed = tokio::task::spawn_blocking(move || {
-        zstd::encode_all(&serialized[..], zstd_level)
-    })
-    .await
-    .map_err(|e| StorageError::Other(format!("Join error: {e}")))?
-    .map_err(|e| StorageError::Other(format!("Zstd compression failed: {e}")))?;
+    let compressed =
+        tokio::task::spawn_blocking(move || zstd::encode_all(&serialized[..], zstd_level))
+            .await
+            .map_err(|e| StorageError::Other(format!("Join error: {e}")))?
+            .map_err(|e| StorageError::Other(format!("Zstd compression failed: {e}")))?;
 
     let payload_crc32 = crc32fast::hash(&compressed);
     let uuid_str = uuid::Uuid::new_v4().to_string();
-    let tmp_path = room.snap_path.with_extension(format!("snap.tmp.{}", uuid_str));
+    let tmp_path = room
+        .snap_path
+        .with_extension(format!("snap.tmp.{}", uuid_str));
 
     let new_header = FileHeader::new(
         room.head_seq.get(),
@@ -217,18 +221,23 @@ pub async fn write_snapshot_and_truncate_wal(
         .create_new(true)
         .write(true)
         .open(&tmp_path)?;
-    std_tmp
-        .try_lock_exclusive()
-        .map_err(|_| StorageError::RoomLocked(RoomId::new(
-            room.snap_path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown")
-        )))?;
+    std_tmp.try_lock_exclusive().map_err(|_| {
+        StorageError::RoomLocked(RoomId::new(
+            room.snap_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown"),
+        ))
+    })?;
 
     use std::io::Write;
     let mut writer = std::io::BufWriter::new(std_tmp);
     writer.write_all(&new_header.encode())?;
     writer.write_all(&compressed)?;
     writer.flush()?;
-    let std_file = writer.into_inner().map_err(|e| StorageError::Other(e.to_string()))?;
+    let std_file = writer
+        .into_inner()
+        .map_err(|e| StorageError::Other(e.to_string()))?;
     std_file.sync_all()?;
 
     // Atomically replace snapshot file

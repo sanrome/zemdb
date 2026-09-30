@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use rimdb_core::{
     ColumnUpdate, CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequenceNumber,
     SequencedOperation, TableSchema, Value,
 };
 use rimdb_storage::{MemoryStorageEngine, StorageEngine, StorageError};
+use std::sync::Arc;
 
 const USERS_TABLE: u16 = 0;
 
@@ -117,7 +117,7 @@ async fn test_point_lookup_and_batch_mutation() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(updated_alice.values[2], Value::Int(120));
+    assert_eq!(updated_alice[2], Value::Int(120));
 
     // Delete Bob
     let delete_op = vec![SequencedOperation::with_default_origin(
@@ -186,7 +186,9 @@ async fn test_concurrent_rooms_isolation() {
     let handle_reader = tokio::spawn(async move {
         let mut reads = 0;
         for _ in 0..10 {
-            let _ = engine_reader.get(&ra_reader, "users", &PrimaryKey::single(1i64)).await;
+            let _ = engine_reader
+                .get(&ra_reader, "users", &PrimaryKey::single(1i64))
+                .await;
             reads += 1;
             tokio::task::yield_now().await;
         }
@@ -199,13 +201,27 @@ async fn test_concurrent_rooms_isolation() {
     assert_eq!(reads, 10);
 
     // Verify independent state
-    assert_eq!(engine.get_head_seq(&room_a).await.unwrap(), SequenceNumber::from(20u64));
-    assert_eq!(engine.get_head_seq(&room_b).await.unwrap(), SequenceNumber::from(20u64));
+    assert_eq!(
+        engine.get_head_seq(&room_a).await.unwrap(),
+        SequenceNumber::from(20u64)
+    );
+    assert_eq!(
+        engine.get_head_seq(&room_b).await.unwrap(),
+        SequenceNumber::from(20u64)
+    );
 
-    let user_a1 = engine.get(&room_a, "users", &PrimaryKey::single(1i64)).await.unwrap().unwrap();
-    let user_b1 = engine.get(&room_b, "users", &PrimaryKey::single(1i64)).await.unwrap().unwrap();
-    assert_eq!(user_a1.values[1], Value::String("User A 1".into()));
-    assert_eq!(user_b1.values[1], Value::String("User B 1".into()));
+    let user_a1 = engine
+        .get(&room_a, "users", &PrimaryKey::single(1i64))
+        .await
+        .unwrap()
+        .unwrap();
+    let user_b1 = engine
+        .get(&room_b, "users", &PrimaryKey::single(1i64))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(user_a1[1], Value::String("User A 1".into()));
+    assert_eq!(user_b1[1], Value::String("User B 1".into()));
 }
 
 #[tokio::test]
@@ -335,9 +351,9 @@ async fn test_dynamic_column_update_resizing_memory() {
         .unwrap()
         .expect("row must exist");
 
-    assert_eq!(updated_row.values.len(), 4);
-    assert_eq!(updated_row.values[0], Value::Int(1));
-    assert_eq!(updated_row.values[1], Value::String("Alice".into()));
-    assert_eq!(updated_row.values[2], Value::Null);
-    assert_eq!(updated_row.values[3], Value::String("Updated Note".into()));
+    assert_eq!(updated_row.len(), 4);
+    assert_eq!(updated_row[0], Value::Int(1));
+    assert_eq!(updated_row[1], Value::String("Alice".into()));
+    assert_eq!(updated_row[2], Value::Null);
+    assert_eq!(updated_row[3], Value::String("Updated Note".into()));
 }

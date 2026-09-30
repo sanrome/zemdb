@@ -19,7 +19,10 @@ fn test_snapshot_relay_disk_persistence_and_recovery() {
 
     // File must exist on disk
     let snap_file = snapshots_dir.join(format!("{}_{}.snap.zst", room_id.as_str(), head_seq.get()));
-    assert!(snap_file.is_file(), "Snapshot file should be written to disk");
+    assert!(
+        snap_file.is_file(),
+        "Snapshot file should be written to disk"
+    );
 
     // active_snapshot_seq returns 42
     assert_eq!(relay1.active_snapshot_seq(&room_id), Some(head_seq));
@@ -53,5 +56,8 @@ fn test_snapshot_relay_disk_persistence_and_recovery() {
     relay_expired.cleanup_expired();
 
     assert_eq!(relay_expired.active_snapshot_seq(&room_id), None);
-    assert!(!snap_file.exists(), "Expired snapshot file should be deleted from disk");
+    assert!(
+        !snap_file.exists(),
+        "Expired snapshot file should be deleted from disk"
+    );
 }

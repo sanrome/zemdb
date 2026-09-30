@@ -60,11 +60,11 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 │ A-03 │ Alto     │ crates/storage/src/disk/mod.rs       │ [RESUELTO] Rotación WAL y compactación CoW en 3 fases sin bloqueo escritor (A-03).    │
 │ A-04 │ Alto     │ crates/storage/src/disk/compactor.rs │ [RESUELTO] Snapshots temporales con UUID previenen carreras O_TRUNC (A-04).            │
 │ A-05 │ Alto     │ crates/storage/src/disk/format.rs    │ [RESUELTO] Checksum CRC32 sobre payload comprimido en FileHeader validado en recovery. │
-│ A-06 │ Alto     │ crates/storage/src/engine.rs         │ Ruptura de Liskov en StorageEngine: formatos incompatibles de snapshot (Memory vs Disk).│
+│ A-06 │ Alto     │ crates/storage/src/engine.rs         │ [RESUELTO] Envelope RMSN universal e interoperable entre Memory y Disk con CRC32 (A-06)│
 │ A-07 │ Alto     │ crates/server/src/actor/room.rs      │ [RESUELTO] Validación ack_seq <= head_seq en handle_ack previene purga catastrófica.    │
-│ A-08 │ Alto     │ crates/storage/src/disk/mod.rs       │ apply_batch omite validación de esquema, permitiendo mutaciones de tipos incompatibles. │
+│ A-08 │ Alto     │ crates/storage/src/disk/mod.rs       │ [RESUELTO] Validación de esquemas activa en apply_batch en Memory y Disk (A-08).        │
 │ A-09 │ Alto     │ crates/storage/src/disk/mod.rs       │ [RESUELTO] Snapshot Isolation en scan con vistas CoW inmutables Arc<BTreeMap> (A-09).  │
-│ A-10 │ Alto     │ crates/server/src/actor/lease.rs     │ Deadlock lógico en Dead Man's Switch: clientes Disconnected bloquean poda de logs.      │
+│ A-10 │ Alto     │ crates/server/src/actor/lease.rs     │ [RESUELTO] Clientes Disconnected pasan a Dormant tras 90s desbloqueando poda (A-10).   │
 │ A-11 │ Alto     │ crates/server/src/api/data_plane.rs  │ [RESUELTO] Data Plane reactiva salas con get_or_spawn tolerando reinicios del servidor.│
 │ A-12 │ Alto     │ crates/server/src/log/tiered_log.rs  │ [RESUELTO] Inversión jerárquica: RAM HotBuffer evaluado antes que disco en fetch_deltas.│
 │ A-13 │ Alto     │ crates/server/src/log/tiered_log.rs  │ [RESUELTO] Ventana deslizante en HotBuffer: erradicada evicción destructiva a cero.     │
@@ -73,27 +73,27 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 │ A-16 │ Alto     │ crates/client/src/lib.rs             │ Crate rimdb-client es un cascarón vacío stub sin implementación del SDK de cliente.     │
 │ A-17 │ Alto     │ crates/server/tests/                 │ Suites de prueba ignoran deliberadamente catchup_ops permitiendo pérdidas de datos.     │
 ├──────┼──────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┤
-│ M-01 │ Medio    │ crates/core/src/mutation/squash.rs   │ Regla 1 de squashing sobrescribe celdas nulas con updates viejos violando LWW.         │
+│ M-01 │ Medio    │ crates/core/src/mutation/squash.rs   │ [RESUELTO] LWW estricto en squashing (descarte de updates viejos) y purge Insert+Delete │
 │ M-02 │ Medio    │ crates/server/src/actor/room.rs      │ [RESUELTO] Reintentos idempotentes de Commit devuelven catchup_ops con mutación propia. │
-│ M-03 │ Medio    │ crates/core/src/protocol/codec.rs    │ Ausencia de magic bytes, versión de wire protocol y discriminante en codec binario.     │
+│ M-03 │ Medio    │ crates/core/src/protocol/codec.rs    │ [RESUELTO] Header canónico 4B con magic bytes RM, versión 0x01 y discriminante en codec │
 │ M-04 │ Medio    │ crates/server/src/api/auth.rs        │ [RESUELTO] Comparación de firmas en tiempo variable con subtle::ConstantTimeEq.         │
 │ M-05 │ Medio    │ crates/server/src/api/auth.rs        │ [RESUELTO] Backdoor dev-token cableado eliminado de código de autenticación.            │
-│ M-06 │ Medio    │ crates/server/src/api/control_plane  │ Evolución DDL (add_column) no emite señal SSE provocando desincronización de esquemas.  │
+│ M-06 │ Medio    │ crates/server/src/api/control_plane  │ [RESUELTO] Emisión SSE de RoomEvent::SchemaReloaded ante migraciones DDL add_column.   │
 │ M-07 │ Medio    │ crates/server/src/api/data_plane.rs  │ [RESUELTO] Validación estricta 3-way room_id en URL path vs token vs payload.          │
 │ M-08 │ Medio    │ crates/server/src/api/data_plane.rs  │ [RESUELTO] Timeouts perimetrales de 5s en actor calls retornando 504 GatewayTimeout.  │
 │ M-09 │ Medio    │ crates/server/src/api/data_plane.rs  │ [RESUELTO] max_batch_size en /sync acotado defensivamente a 1..=1000 previniendo DoS. │
-│ M-10 │ Medio    │ crates/server/src/log/tiered_log.rs  │ Avance prematuro de tail_seq en prune_older_than induce BehindCompaction espurio.       │
+│ M-10 │ Medio    │ crates/server/src/log/tiered_log.rs  │ [RESUELTO] Recálculo exacto de tail_seq en prune_older_than según segmentos retenidos. │
 │ M-11 │ Medio    │ crates/server/src/log/warm_disk.rs   │ [RESUELTO] Doble fsync eliminado: unificado en un solo fsync atómico por commit (C-04).│
 │ M-12 │ Medio    │ crates/server/src/log/warm_disk.rs   │ [RESUELTO] Cerrojos exclusivos multi-proceso (flock) en active.wal con fs2.            │
-│ M-13 │ Medio    │ crates/storage/src/engine.rs         │ Contrato StorageEngine exige table: &str en get/scan forzando búsquedas por string.     │
+│ M-13 │ Medio    │ crates/storage/src/engine.rs         │ [RESUELTO] Métodos directos get_by_id y scan_by_id con table_id: u16 en StorageEngine. │
 │ M-14 │ Medio    │ crates/core/src/schema/global.rs     │ [RESUELTO] Detección de tablas duplicadas y aritmética segura de table_id en add_table. │
-│ M-15 │ Medio    │ crates/core/src/value/row.rs         │ Fuga de encapsulamiento e implementación impropia de Deref en PrimaryKey y CompactRow.  │
-│ M-16 │ Medio    │ crates/storage/src/disk/mod.rs       │ Retención de cerrojo global del motor durante I/O de sala en close_room.                │
+│ M-15 │ Medio    │ crates/core/src/value/row.rs         │ [RESUELTO] Encapsulación de campos y remoción de Deref en PrimaryKey, CompactRow, Schema│
+│ M-16 │ Medio    │ crates/storage/src/disk/mod.rs       │ [RESUELTO] Liberación de cerrojo global antes de I/O de sala en close_room.            │
 ├──────┼──────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┤
-│ B-01 │ Bajo     │ crates/core/src/protocol/messages.rs │ Discrepancia de especificación: ClientMessage::Heartbeat carece de campo last_ack_seq.  │
-│ B-02 │ Bajo     │ crates/core/src/mutation/op.rs       │ Tipos fundamentales de mutación y mensajería omiten traits estándar Eq y Hash.          │
-│ B-03 │ Bajo     │ crates/server/src/api/data_plane.rs  │ Handlers de Data Plane devuelven texto plano o JSON ante errores en vez de Bincode.     │
-│ B-04 │ Bajo     │ crates/server/src/api/control_plane  │ GET /admin/rooms/:id produce efectos colaterales activando actores de sala en memoria.  │
+│ B-01 │ Bajo     │ crates/core/src/protocol/messages.rs │ [RESUELTO] Desacoplamiento formal de Heartbeat (liveness) frente a Ack (avance de seq). │
+│ B-02 │ Bajo     │ crates/core/src/mutation/op.rs       │ [RESUELTO] Derivación #[derive(Eq, Hash)] en Operation, SequencedOp, Messages y Kind.   │
+│ B-03 │ Bajo     │ crates/server/src/api/data_plane.rs  │ [RESUELTO] ServerMessage::DeregisterAck y Content-Type application/octet-stream en error│
+│ B-04 │ Bajo     │ crates/server/src/api/control_plane  │ [RESUELTO] GET /admin/rooms/:id verifica room_exists retornando 404 sin spawn fantasma. │
 └──────┴──────────┴──────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -237,10 +237,11 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica / Implementada**: Se incorporó el campo `snapshot_payload_crc32: u32` dentro de la cabecera canónica de 64 bytes de `FileHeader`, aprovechando bytes reservados y asegurando que el checksum del encabezado (`header_crc`) valide también la integridad del descriptor del payload. Durante la recuperación en arranque (`recover_room`), el sistema calcula y verifica el CRC32 sobre los bytes comprimidos leídos antes de invocar la descompresión con Zstd, retornando un error explícito de corrupción (`StorageError::SnapshotCorruption`) si se detecta cualquier alteración en disco.
 
 #### [A-06] Ruptura de Liskov en `StorageEngine`: formatos incompatibles de snapshot (Memory vs Disk)
-* **Ubicación Exacta**: [`crates/storage/src/engine.rs:68-78`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/engine.rs#L68-L78), [`crates/storage/src/memory/mod.rs:327`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/memory/mod.rs#L327), [`crates/storage/src/disk/mod.rs:443`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/mod.rs#L443).
-* **Causa Raíz**: `MemoryStorageEngine` emite Bincode plano sin comprimir; `DiskStorageEngine` emite Bincode comprimido con Zstandard. Ninguno incluye cabecera canónica identificadora.
-* **Impacto**: Un snapshot generado por un motor no puede ser restaurado en el otro, rompiendo la sustitución de Liskov y la interoperabilidad en clientes WASM vs nativos.
-* **Solución Técnica**: Estandarizar un contenedor canónico de snapshot a nivel de trait con cabecera fija que declare versión y algoritmo de compresión (`None` o `Zstd`).
+* **Estado**: **RESUELTO (Fase 3.5-C.1)**
+* **Ubicación Exacta**: [`crates/storage/src/snapshot.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/snapshot.rs), [`crates/storage/src/memory/mod.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/memory/mod.rs), [`crates/storage/src/disk/mod.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/mod.rs).
+* **Causa Raíz**: `MemoryStorageEngine` emitía Bincode plano sin comprimir; `DiskStorageEngine` emitía Bincode comprimido con Zstandard. Ninguno incluía cabecera canónica identificadora.
+* **Impacto**: Un snapshot generado por un motor no podía ser restaurado en el otro, rompiendo la sustitución de Liskov y la interoperabilidad en clientes WASM vs nativos.
+* **Solución Técnica / Implementada**: Se implementó el módulo canónico `rimdb_storage::snapshot` con envelope unificado de formato: magic bytes `"RMSN"`, versión `1`, flag de compresión (0 = Raw/Memory, 1 = Zstd/Disk), longitud original descomprimida y checksum CRC32 Fast del payload. Las funciones `encode_snapshot_envelope` y `decode_snapshot_envelope` son utilizadas de manera homogénea por `MemoryStorageEngine` y `DiskStorageEngine`, garantizando 100% de portabilidad cruzada bidireccional de snapshots entre cualquier motor de persistencia.
 
 #### [A-07] Falta de validación `ack_seq <= head_seq` en `handle_ack` permite purga catastrófica de logs
 * **Estado**: **RESUELTO (Fase 3.5-A.4)**
@@ -250,10 +251,11 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica**: Validar estrictamente `if ack_seq > self.head_seq { return Err(...); }`.
 
 #### [A-08] `apply_batch` omite validación de esquema, permitiendo mutaciones de tipos incompatibles
-* **Ubicación Exacta**: [`crates/storage/src/disk/mod.rs:233-247`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/mod.rs#L233-L247), [`crates/storage/src/memory/mod.rs:118-132`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/memory/mod.rs#L118-L132).
-* **Causa Raíz**: `apply_batch` verifica únicamente la existencia de la tabla y la secuencia incremental, pero nunca invoca `schema.validate_operation(&op.op)`.
-* **Impacto**: Mutaciones con tipos incompatibles, violaciones de no-nulabilidad o índices de columna fuera de rango ingresan al WAL y corrompen las tablas en memoria.
-* **Solución Técnica**: Incorporar `room.schema.validate_operation(&op.op)?` antes de aplicar cambios en disco y memoria.
+* **Estado**: **RESUELTO (Fase 3.5-C.1)**
+* **Ubicación Exacta**: [`crates/storage/src/disk/mod.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/mod.rs), [`crates/storage/src/memory/mod.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/memory/mod.rs).
+* **Causa Raíz**: `apply_batch` verificaba únicamente la existencia de la tabla y la secuencia incremental, pero nunca invocaba `schema.validate_operation(&op.op)`.
+* **Impacto**: Mutaciones con tipos incompatibles, violaciones de no-nulabilidad o índices de columna fuera de rango ingresaban al WAL y corrompían las tablas en memoria.
+* **Solución Técnica / Implementada**: Se incorporó la validación explícita `schema.validate_operation(&op.op)?` en `StorageEngine::apply_batch` de forma idéntica en `MemoryStorageEngine` y `DiskStorageEngine`, retornando `StorageError::ValidationError` antes de escribir en disco o mutar las estructuras de datos en memoria.
 
 #### [A-09] Escaneo lazy por chunks libera el lock entre bloques, rompiendo Snapshot Isolation
 * **Estado**: **RESUELTO (Fase 3.5-B.2)**
@@ -263,10 +265,11 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica / Implementada**: Se migró la estructura de almacenamiento de tablas en memoria a `HashMap<u16, Arc<BTreeMap<PrimaryKey, CompactRow>>>`. Al iniciar cualquier operación `scan`, se adquiere brevemente el cerrojo de lectura (<1 µs) para clonar el puntero `Arc<BTreeMap>` correspondiente a la tabla solicitada y se libera inmediatamente el cerrojo de la sala. El stream lazy itera exclusivamente sobre la vista CoW inmutable clonada, garantizando Snapshot Isolation estricto sin retener cerrojos, sin lecturas desgarradas (*torn reads*) y permitiendo a los escritores concurrentes mutar el árbol mediante `Arc::make_mut` sin bloquearse mutuamente.
 
 #### [A-10] Deadlock lógico en Dead Man's Switch: clientes `Disconnected` bloquean poda de logs
-* **Ubicación Exacta**: [`crates/server/src/actor/lease.rs:177-231`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/lease.rs#L177-L231).
-* **Causa Raíz**: `min_connected_ack_seq` retorna `None` si existe algún cliente en `Disconnected`. A su vez, `check_timeouts` solo pasa un cliente a `Dormant` si su cursor quedó por detrás de `tail_seq - 1`. Dado que `tail_seq` no avanza sin poda, se produce un bloqueo mutuo permanente.
+* **Estado**: **RESUELTO (Fase 3.5-C.1)**
+* **Ubicación Exacta**: [`crates/server/src/actor/lease.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/lease.rs).
+* **Causa Raíz**: `min_connected_ack_seq` retorna `None` si existe algún cliente en `Disconnected`. A su vez, `check_timeouts` solo pasaba un cliente a `Dormant` si su cursor quedaba por detrás de `tail_seq - 1`. Dado que `tail_seq` no avanzaba sin poda, se producía un bloqueo mutuo permanente.
 * **Impacto**: Inhabilitación total de la poda de logs en disco si un cliente se desconecta sin desregistrarse, acumulando WALs hasta saturar el almacenamiento.
-* **Solución Técnica**: Basar la transición a `Dormant` directamente en el tiempo transcurrido en `Disconnected` (timeout de inactividad de 90s).
+* **Solución Técnica / Implementada**: En `ClientLeaseTracker::check_timeouts`, se incorporó una condición temporal desacoplada: si un cliente en estado `Disconnected` excede 90 segundos de inactividad (`now.duration_since(entry.last_heartbeat) > Duration::from_secs(90)`), transiciona automáticamente a `ClientState::Dormant`, excluyéndose de `min_connected_ack_seq` y desbloqueando de inmediato la poda física de logs en disco.
 
 #### [A-11] Data Plane utiliza `get_room` en RAM en lugar de lazy-spawning, fallando tras reinicios
 * **Estado**: **RESUELTO (Fase 3.5-B.3)**
@@ -325,9 +328,10 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 ### DEFECTOS DE SEVERIDAD MEDIA
 
 #### [M-01] Regla 1 de squashing sobrescribe celdas nulas con updates viejos violando LWW
-* **Ubicación Exacta**: [`crates/core/src/mutation/squash.rs:83-93`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/mutation/squash.rs#L83-L93).
-* **Causa Raíz**: Cuando un `Update` entrante tiene timestamp menor que un `Insert` previo, la regla 1 resucita valores viejos en columnas que el `Insert` definió como `Null`.
-* **Solución Técnica**: Si `incoming.timestamp < existing.timestamp`, descartar el update antiguo completamente.
+* **Estado**: **RESUELTO (Fase 3.5-C.1)**
+* **Ubicación Exacta**: [`crates/core/src/mutation/squash.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/mutation/squash.rs), [`crates/core/src/mutation/buffer.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/mutation/buffer.rs).
+* **Causa Raíz**: Cuando un `Update` entrante tenía timestamp menor que un `Insert` previo, la regla 1 resucitaba valores viejos en columnas que el `Insert` definió como `Null`.
+* **Solución Técnica / Implementada**: En `squash_operations` (Regla 1), si `incoming.timestamp < existing.timestamp`, el update se descarta retornando `SquashOutcome::Discarded`. Asimismo, se incorporó `SquashOutcome::Purged` para aniquilación mutua entre `Insert` pendiente y `Delete` posterior en `TableBuffer`, eliminando la entidad de la cola sin generar registros redundantes.
 
 #### [M-02] Reintentos idempotentes de `Commit` devuelven `catchup_ops` vacío omitiendo mutación propia
 * **Estado**: **RESUELTO**
@@ -336,9 +340,10 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica / Implementada**: En `handle_commit`, al detectar un `mutation_id` duplicado en `dedup_cache`, se invoca `fetch_deltas(last_ack_seq, 100)` devolviendo el conjunto de operaciones a partir del cursor del cliente, incluyendo la mutación propia secuenciada originalmente.
 
 #### [M-03] Ausencia de magic bytes, versión de wire protocol y discriminante en codec binario
-* **Ubicación Exacta**: [`crates/core/src/protocol/codec.rs:8-26`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/protocol/codec.rs#L8-L26).
-* **Causa Raíz**: Serializa directamente enums Bincode sin enmarcado de protocolo binario ni versión.
-* **Solución Técnica**: Anteponer un prefijo fijo de 4 bytes (`[magic: 2B][version: 1B][flags: 1B]`).
+* **Estado**: **RESUELTO (Fase 3.5-C.1)**
+* **Ubicación Exacta**: [`crates/core/src/protocol/codec.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/protocol/codec.rs).
+* **Causa Raíz**: Serializaba directamente enums Bincode sin enmarcado de protocolo binario ni versión.
+* **Solución Técnica / Implementada**: Se antepone una cabecera canónica de 4 bytes en toda trama de red: magic bytes `0x52, 0x4D` (`"RM"`), versión de protocolo `0x01` y flags reservadas `0x00`. En `decode_message`, las tramas con magic bytes o versión discrepante se rechazan tempranamente devolviendo `ErrorCode::ProtocolVersionMismatch`, mapeado a `ServerError::ProtocolVersionMismatch` (HTTP 400).
 
 #### [M-04] Comparación de firmas en tiempo variable susceptible a ataques de canal lateral (timing)
 * **Estado**: **RESUELTO (Fase 3.5-A.2)**
@@ -353,9 +358,10 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica / Implementada**: Se eliminó de forma completa e incondicional la rama especial para `"dev-token"` en `verify_client_token`. Todo token debe ser criptográficamente válido y estar firmado con la clave HMAC-BLAKE3 configurada en el servidor.
 
 #### [M-06] Evolución DDL (`add_column`) no emite señal SSE provocando desincronización de esquemas
-* **Ubicación Exacta**: [`crates/server/src/api/control_plane.rs:67-85`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/control_plane.rs#L67-L85), [`crates/server/src/api/sse.rs:36-50`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/sse.rs#L36-L50).
-* **Causa Raíz**: Recarga el esquema en el actor pero no notifica a clientes conectados por el canal SSE.
-* **Solución Técnica**: Emitir `RoomEvent::SchemaReloaded` vía broadcast SSE para que los clientes actualicen su esquema.
+* **Estado**: **RESUELTO (Fase 3.5-C.1)**
+* **Ubicación Exacta**: [`crates/server/src/actor/command.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/command.rs), [`crates/server/src/actor/room.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/room.rs), [`crates/server/src/api/sse.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/sse.rs).
+* **Causa Raíz**: Recargaba el esquema en el actor pero no notificaba a los clientes conectados por el canal SSE.
+* **Solución Técnica / Implementada**: Se definió el enum de señalización `RoomEvent { HeadAdvanced(SequenceNumber), SchemaReloaded(SchemaId) }`. Al recibir `RoomCommand::ReloadSchema`, el actor de sala emite `RoomEvent::SchemaReloaded` al canal broadcast de SSE, el cual lo transmite a los clientes activos como evento `schema_reloaded` con el `schema_id` como dato.
 
 #### [M-07] Omisión de validación de `room_id` en URL path vs payload binario (bypass de gateway)
 * **Estado**: **RESUELTO (Fase 3.5-A.2)**
@@ -378,9 +384,10 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica / Implementada**: En `RoomActor::handle_sync`, se acotó defensivamente el límite solicitado mediante `let clamped_batch_size = max_batch_size.clamp(1, 1000);`, impidiendo la sobrecarga del reactor y de la memoria RAM ante valores arbitrarios o abusivos.
 
 #### [M-10] Avance prematuro de `tail_seq` en `prune_older_than` induce `BehindCompaction` espurio
-* **Ubicación Exacta**: [`crates/server/src/log/tiered_log.rs:376-378`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/log/tiered_log.rs#L376-L378).
-* **Causa Raíz**: Se sobreescribe `self.tail_seq = target_seq` sin comprobar si `active.wal` conserva deltas previos.
-* **Solución Técnica**: Asignar `tail_seq` a partir de la secuencia real más baja físicamente disponible en disco.
+* **Estado**: **RESUELTO (Fase 3.5-C.1)**
+* **Ubicación Exacta**: [`crates/server/src/log/tiered_log.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/log/tiered_log.rs).
+* **Causa Raíz**: Se sobrescribía `self.tail_seq = target_seq` sin comprobar si `active.wal` o segmentos restantes conservaban deltas previos.
+* **Solución Técnica / Implementada**: En `TieredLog::prune_older_than`, se calcula la secuencia base real buscando el mínimo entre los segmentos Cold y Warm retenidos físicamente y el rango de memoria `HotBuffer`. Solo si ningún segmento permanece se adopta el límite target o head_seq, garantizando que `tail_seq` refleje con exactitud la disponibilidad física en disco.
 
 #### [M-11] Doble fsync por operación sin Group Commit ni batching en escrituras del servidor
 * **Estado**: **RESUELTO (Unificación de WAL por C-04)**
@@ -396,9 +403,10 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica / Implementada**: En `WarmDiskLog::append_record` y `WarmDiskLog::inspect_active_segment`, se adquiere un cerrojo exclusivo de kernel a nivel de sistema de archivos (`file.try_lock_exclusive()`) sobre `active.wal` utilizando la crate `fs2`. Cualquier proceso concurrente o secundario que intente abrir el mismo archivo WAL recibe de inmediato un error controlado `ServerError::RoomLocked` mapeado a HTTP 423 Locked.
 
 #### [M-13] Contrato `StorageEngine` exige `table: &str` en `get`/`scan` forzando búsquedas por string
-* **Ubicación Exacta**: [`crates/storage/src/engine.rs:49-64`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/engine.rs#L49-L64).
+* **Estado**: **RESUELTO (Fase 3.5-C.1)**
+* **Ubicación Exacta**: [`crates/storage/src/engine.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/engine.rs), [`crates/storage/src/memory/mod.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/memory/mod.rs), [`crates/storage/src/disk/mod.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/mod.rs).
 * **Causa Raíz**: Inconsistencia con `apply_batch` que opera por `table_id: u16`.
-* **Solución Técnica**: Sobrecargar o refactorizar la interfaz para aceptar `table_id: u16`.
+* **Solución Técnica / Implementada**: Se agregaron los métodos `get_by_id` y `scan_by_id` directamente al trait `StorageEngine`, permitiendo la consulta directa por `table_id: u16` sin costo de lookup en `id_by_name`. Los métodos por nombre resuelven el ID y delegan limpiamente.
 
 #### [M-14] Sobrescritura silenciosa de tablas con igual nombre y overflow en asignación de IDs
 * **Estado**: **RESUELTO (Fase 3.5-A.4)**
@@ -407,38 +415,44 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica**: Validar colisiones y retornar `Result<u16, ValidationError>`.
 
 #### [M-15] Fuga de encapsulamiento e implementación impropia de `Deref` en `PrimaryKey` y `CompactRow`
-* **Ubicación Exacta**: [`crates/core/src/value/row.rs:11`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/value/row.rs#L11), [`crates/core/src/value/row.rs:70`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/value/row.rs#L70).
-* **Causa Raíz**: Campos públicos (`pub SmallVec`, `pub values`) y `Deref` que violan [C-DEREF].
-* **Solución Técnica**: Ocultar campos como privados y eliminar `Deref` exponiendo getters inmutables.
+* **Estado**: **RESUELTO (Fase 3.5-C.1)**
+* **Ubicación Exacta**: [`crates/core/src/value/row.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/value/row.rs), [`crates/core/src/schema/table.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/schema/table.rs).
+* **Causa Raíz**: Campos públicos (`pub SmallVec`, `pub values`) y `Deref` que violaban [C-DEREF].
+* **Solución Técnica / Implementada**: Se hicieron privados los campos internos de `PrimaryKey`, `CompactRow` y `TableSchema`. Se eliminó `Deref` y se implementaron de forma segura `Index<usize>`, `IndexMut<usize>`, `as_slice()`, `iter()`, `get()`, `len()`, `is_empty()` y `resize()` en filas, y métodos getters inmutables en `TableSchema`.
 
 #### [M-16] Retención de cerrojo global del motor durante I/O de sala en `close_room`
-* **Ubicación Exacta**: [`crates/storage/src/disk/mod.rs:212-221`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/mod.rs#L212-L221).
-* **Causa Raíz**: Mantiene `self.rooms.write().await` mientras ejecuta `room.wal_file.sync_all().await`.
-* **Solución Técnica**: Retirar el `Arc` del mapa, liberar el cerrojo global y ejecutar el flush en el `Arc` aislado.
+* **Estado**: **RESUELTO (Fase 3.5-C.1)**
+* **Ubicación Exacta**: [`crates/storage/src/disk/mod.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/mod.rs).
+* **Causa Raíz**: Mantenía `self.rooms.write().await` mientras ejecutaba `room.wal_file.sync_all().await`.
+* **Solución Técnica / Implementada**: En `close_room`, se extrae la sala del mapa `rooms.remove(room_id)` y se libera de inmediato el cerrojo de escritura del mapa antes de invocar `room.wal_file.sync_all().await`, impidiendo la contención global sobre otras salas abiertas.
 
 ---
 
 ### DEFECTOS DE SEVERIDAD BAJA
 
 #### [B-01] Discrepancia de especificación: `ClientMessage::Heartbeat` carece de campo `last_ack_seq`
-* **Ubicación Exacta**: [`crates/core/src/protocol/messages.rs:75-79`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/protocol/messages.rs#L75-L79).
+* **Estado**: **RESUELTO (Fase 3.5-C.1)**
+* **Ubicación Exacta**: [`crates/core/src/protocol/messages.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/protocol/messages.rs), [`ARCHITECTURE.md`](file:///Users/Santiago/OtherProjects/client-distributed-db/ARCHITECTURE.md).
 * **Causa Raíz**: Divergencia frente a ARCHITECTURE.md que estipulaba ACK coalescido en heartbeats.
-* **Solución Técnica**: Agregar `last_ack_seq: SequenceNumber` o sincronizar la documentación.
+* **Solución Técnica / Implementada**: Se formalizó en la arquitectura y documentación que `Heartbeat` es un mensaje de liveness puro y liviano sin avance de cursor, mientras que la confirmación y avance de secuencias se realiza de manera explícita y desacoplada mediante `ClientMessage::Ack` o dentro de `ClientMessage::Commit`.
 
 #### [B-02] Tipos fundamentales de mutación y mensajería omiten traits estándar `Eq` y `Hash`
-* **Ubicación Exacta**: [`crates/core/src/mutation/op.rs:25-50`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/mutation/op.rs#L25-L50), [`crates/core/src/protocol/messages.rs:27-49`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/protocol/messages.rs#L27-L49).
-* **Causa Raíz**: Derivan solo `PartialEq`, impidiendo su uso en `HashSet` o como claves de mapas.
-* **Solución Técnica**: Añadir `#[derive(Eq, Hash)]` en estructuras canónicas.
+* **Estado**: **RESUELTO (Fase 3.5-C.1)**
+* **Ubicación Exacta**: [`crates/core/src/mutation/op.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/mutation/op.rs), [`crates/core/src/protocol/messages.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/protocol/messages.rs), [`crates/core/src/schema/column.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/schema/column.rs).
+* **Causa Raíz**: Derivaban solo `PartialEq`, impidiendo su uso en `HashSet` o como claves de mapas.
+* **Solución Técnica / Implementada**: Se derivó `#[derive(Eq, Hash)]` en `ColumnDef`, `ColumnUpdate`, `OperationKind`, `Operation`, `SequencedOperation`, `ClientMessage`, `ServerMessage` y `ErrorCode`.
 
 #### [B-03] Handlers de Data Plane devuelven texto plano o JSON ante errores en vez de Bincode
-* **Ubicación Exacta**: [`crates/server/src/api/data_plane.rs:23-26`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/data_plane.rs#L23-L26).
-* **Causa Raíz**: `ServerError::into_response` emite JSON en rutas que esperan exclusivamente tramas binarias.
-* **Solución Técnica**: Retornar siempre tramas serializadas con `ServerMessage::Error`.
+* **Estado**: **RESUELTO (Fase 3.5-C.1)**
+* **Ubicación Exacta**: [`crates/server/src/api/data_plane.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/data_plane.rs), [`crates/core/src/protocol/messages.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/protocol/messages.rs).
+* **Causa Raíz**: `ServerError::into_response` emitía JSON en rutas que esperan exclusivamente tramas binarias, y desregistro retornaba 204 No Content.
+* **Solución Técnica / Implementada**: Se añadió la variante `ServerMessage::DeregisterAck` y se implementó en `deregister` devolviendo una trama binaria con `StatusCode::OK`. Asimismo, en respuestas de error sobre endpoints binarios se garantiza la cabecera `Content-Type: application/octet-stream`.
 
 #### [B-04] `GET /admin/rooms/:id` produce efectos colaterales activando actores de sala en memoria
-* **Ubicación Exacta**: [`crates/server/src/api/control_plane.rs:100-117`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/control_plane.rs#L100-L117).
-* **Causa Raíz**: Endpoint de lectura invoca `get_or_spawn` en lugar de consultar estado pasivo.
-* **Solución Técnica**: Consultar únicamente memoria o metadata en disco sin levantar tareas activas.
+* **Estado**: **RESUELTO (Fase 3.5-C.1)**
+* **Ubicación Exacta**: [`crates/server/src/api/control_plane.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/api/control_plane.rs), [`crates/server/src/actor/manager.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/server/src/actor/manager.rs).
+* **Causa Raíz**: Endpoint de lectura invocaba `get_or_spawn` directamente, creando directorios en disco y levantando actores para cualquier identificador arbitrario.
+* **Solución Técnica / Implementada**: Se agregó el método `RoomManager::room_exists(&self, room_id)` que comprueba pasivamente la existencia en memoria o en el sistema de archivos (`data_dir/rooms/{id}`). En `control_plane::get_room`, si la sala no existe, se retorna inmediatamente `ServerError::NotFound` (HTTP 404) sin spawn de actores ni creación de directorios huérfanos.
 
 ---
 

@@ -16,11 +16,11 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
+crc32fast = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true }
 zstd = { workspace = true }
-crc32fast = { workspace = true }
 fs2 = { workspace = true }
 uuid = { workspace = true }
 dashmap = { workspace = true }

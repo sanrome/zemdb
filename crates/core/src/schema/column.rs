@@ -2,7 +2,7 @@ use crate::value::DataType;
 use serde::{Deserialize, Serialize};
 
 /// Definition of a single column in a table.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,

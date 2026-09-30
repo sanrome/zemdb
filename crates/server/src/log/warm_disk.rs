@@ -1,4 +1,5 @@
 use crate::error::ServerError;
+use fs2::FileExt;
 use rimdb_core::id::{MutationId, SequenceNumber};
 use rimdb_core::protocol::messages::SequencedOperation;
 use rimdb_core::protocol::wal_frame::{
@@ -7,7 +8,6 @@ use rimdb_core::protocol::wal_frame::{
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use fs2::FileExt;
 
 /// Metadata describing a sealed uncompressed Warm Disk segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,8 +62,9 @@ impl WarmDiskLog {
                 .truncate(false)
                 .open(&active_path)?;
 
-            file.try_lock_exclusive()
-                .map_err(|e| ServerError::RoomLocked(format!("active.wal locked by another process: {}", e)))?;
+            file.try_lock_exclusive().map_err(|e| {
+                ServerError::RoomLocked(format!("active.wal locked by another process: {}", e))
+            })?;
 
             self.active_file = Some(file);
             if self.active_start_seq.is_none() {
@@ -72,8 +73,8 @@ impl WarmDiskLog {
         }
 
         let file = self.active_file.as_mut().unwrap();
-        let encoded = encode_wal_record(op, mutation_id)
-            .map_err(|e| ServerError::Wal(e.to_string()))?;
+        let encoded =
+            encode_wal_record(op, mutation_id).map_err(|e| ServerError::Wal(e.to_string()))?;
 
         file.write_all(&encoded)?;
         file.flush()?;
@@ -113,11 +114,7 @@ impl WarmDiskLog {
             }
 
             let active_path = self.segments_dir.join("active.wal");
-            let sealed_name = format!(
-                "segment_{:016}_{:016}.wal",
-                start.get(),
-                end.get()
-            );
+            let sealed_name = format!("segment_{:016}_{:016}.wal", start.get(), end.get());
             let sealed_path = self.segments_dir.join(sealed_name);
 
             if active_path.exists() {
@@ -207,7 +204,9 @@ impl WarmDiskLog {
                     offset += bytes_consumed;
                 }
                 Ok(WalBatchDecodeResult::CleanEof) => break,
-                Ok(WalBatchDecodeResult::TornWrite { valid_bytes_offset, .. }) => {
+                Ok(WalBatchDecodeResult::TornWrite {
+                    valid_bytes_offset, ..
+                }) => {
                     tracing::warn!(
                         path = ?file_path,
                         valid_bytes_offset = offset + valid_bytes_offset,
@@ -228,14 +227,16 @@ impl WarmDiskLog {
         let mut all_mutations = Vec::new();
 
         for sealed in self.list_sealed_segments()? {
-            let (ops, muts) = Self::read_range_with_mutations(&sealed.path, SequenceNumber::new(0), usize::MAX)?;
+            let (ops, muts) =
+                Self::read_range_with_mutations(&sealed.path, SequenceNumber::new(0), usize::MAX)?;
             all_ops.extend(ops);
             all_mutations.extend(muts);
         }
 
         let active_path = self.segments_dir.join("active.wal");
         if active_path.exists() {
-            let (active_ops, active_muts) = Self::read_range_with_mutations(&active_path, SequenceNumber::new(0), usize::MAX)?;
+            let (active_ops, active_muts) =
+                Self::read_range_with_mutations(&active_path, SequenceNumber::new(0), usize::MAX)?;
             all_ops.extend(active_ops);
             all_mutations.extend(active_muts);
         }
@@ -255,8 +256,9 @@ impl WarmDiskLog {
             .write(true)
             .open(&active_path)?;
 
-        file.try_lock_exclusive()
-            .map_err(|e| ServerError::RoomLocked(format!("active.wal locked by another process: {}", e)))?;
+        file.try_lock_exclusive().map_err(|e| {
+            ServerError::RoomLocked(format!("active.wal locked by another process: {}", e))
+        })?;
 
         let mut data = Vec::new();
         std::io::Read::read_to_end(&mut file, &mut data)?;
@@ -268,7 +270,11 @@ impl WarmDiskLog {
 
         while offset < data.len() {
             match decode_wal_batch_from_slice(&data[offset..]) {
-                Ok(WalBatchDecodeResult::Ok { ops, bytes_consumed, .. }) => {
+                Ok(WalBatchDecodeResult::Ok {
+                    ops,
+                    bytes_consumed,
+                    ..
+                }) => {
                     for op in ops {
                         if start_seq.is_none() {
                             start_seq = Some(op.seq);
@@ -279,7 +285,9 @@ impl WarmDiskLog {
                     valid_len = offset;
                 }
                 Ok(WalBatchDecodeResult::CleanEof) => break,
-                Ok(WalBatchDecodeResult::TornWrite { valid_bytes_offset, .. }) => {
+                Ok(WalBatchDecodeResult::TornWrite {
+                    valid_bytes_offset, ..
+                }) => {
                     valid_len = offset + valid_bytes_offset;
                     tracing::warn!(
                         path = ?active_path,

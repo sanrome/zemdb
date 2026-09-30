@@ -1,5 +1,3 @@
-use std::sync::Arc;
-use std::time::Duration;
 use axum::http::StatusCode;
 use futures::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -12,6 +10,8 @@ use rimdb_server::api::router::{build_router, AppState};
 use rimdb_server::config::ServerConfig;
 use rimdb_server::relay::SnapshotRelay;
 use rimdb_server::schema_registry::SchemaRegistry;
+use std::sync::Arc;
+use std::time::Duration;
 use tempfile::tempdir;
 
 struct TestServer {
@@ -41,7 +41,10 @@ impl TestServer {
         let schemas_dir = data_dir.join("schemas");
         let schema_registry = Arc::new(SchemaRegistry::new(schemas_dir).unwrap());
         let snapshots_dir = data_dir.join("snapshots");
-        let snapshot_relay = Arc::new(SnapshotRelay::new(snapshots_dir, Duration::from_secs(config.snapshot_ttl_secs)).unwrap());
+        let snapshot_relay = Arc::new(
+            SnapshotRelay::new(snapshots_dir, Duration::from_secs(config.snapshot_ttl_secs))
+                .unwrap(),
+        );
         let room_manager = Arc::new(RoomManager::new(
             Arc::clone(&config),
             Arc::clone(&schema_registry),
@@ -568,7 +571,9 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
     let ack_bytes = ack_resp.bytes().await.unwrap();
     let ack_confirmed: ServerMessage = decode_message(&ack_bytes).unwrap();
     match ack_confirmed {
-        ServerMessage::AckConfirmed { ack_seq, head_seq, .. } => {
+        ServerMessage::AckConfirmed {
+            ack_seq, head_seq, ..
+        } => {
             assert_eq!(ack_seq, SequenceNumber::new(3));
             assert_eq!(head_seq, SequenceNumber::new(3));
         }
@@ -677,7 +682,17 @@ async fn test_data_plane_heartbeat_and_deregister() {
         .send()
         .await
         .unwrap();
-    assert_eq!(dereg_resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(dereg_resp.status(), StatusCode::OK);
+    let dereg_bytes = dereg_resp.bytes().await.unwrap();
+    let ack_msg: ServerMessage = decode_message(&dereg_bytes).unwrap();
+    assert_eq!(
+        ack_msg,
+        ServerMessage::DeregisterAck {
+            correlation_id: CorrelationId::new(3),
+            room_id: room_id.clone(),
+            client_id: client_id.clone(),
+        }
+    );
 
     // Query cursor shows client removed
     let room_sender = server.room_manager.get_room(&room_id).unwrap();
@@ -781,7 +796,11 @@ async fn test_sse_realtime_head_advanced_events() {
         "Expected SSE head_advanced event, got: {}",
         text
     );
-    assert!(text.contains("data: 1"), "Expected sequence 1, got: {}", text);
+    assert!(
+        text.contains("data: 1"),
+        "Expected sequence 1, got: {}",
+        text
+    );
 }
 
 #[tokio::test]
@@ -1360,4 +1379,187 @@ async fn test_sse_events_auth_header_and_query_param() {
         .await
         .unwrap();
     assert_eq!(resp_bad_query.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_admin_get_room_non_existent_returns_404_without_spawning() {
+    let server = TestServer::start().await;
+    let auth_header = format!("Bearer {}", server.config.admin_secret);
+    let ghost_id = "ghost-room-unspawned";
+
+    let resp = server
+        .client
+        .get(format!("{}/admin/rooms/{}", server.base_url, ghost_id))
+        .header(AUTHORIZATION, &auth_header)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let room_dir = server.config.data_dir.join("rooms").join(ghost_id);
+    assert!(
+        !room_dir.exists(),
+        "Room directory should not have been created for non-existent room query"
+    );
+    assert!(
+        !server.room_manager.room_exists(&RoomId::new(ghost_id)),
+        "Room should not exist in room manager"
+    );
+}
+
+#[tokio::test]
+async fn test_sse_schema_reloaded_event_emission() {
+    let server = TestServer::start().await;
+    let schema_id = SchemaId::new("schema-reload-sse");
+    let admin_auth = format!("Bearer {}", server.config.admin_secret);
+
+    // 1. Register base schema
+    server
+        .client
+        .post(format!("{}/admin/schemas", server.base_url))
+        .header(AUTHORIZATION, &admin_auth)
+        .json(&CreateSchemaRequest {
+            schema_id: schema_id.clone(),
+            schema: create_test_schema(),
+        })
+        .send()
+        .await
+        .unwrap();
+
+    // 2. Create room
+    let room_id = RoomId::new("room-schema-sse");
+    server
+        .client
+        .post(format!("{}/admin/rooms", server.base_url))
+        .header(AUTHORIZATION, &admin_auth)
+        .json(&CreateRoomRequest {
+            room_id: room_id.clone(),
+            schema_id: schema_id.clone(),
+            lifecycle: None,
+        })
+        .send()
+        .await
+        .unwrap();
+
+    // 3. Connect SSE listener
+    let client_id = ClientId::new("sse-schema-listener");
+    let token = generate_client_token(
+        &client_id,
+        &room_id,
+        Duration::from_secs(300),
+        &server.config.auth_secret,
+    );
+
+    let sse_resp = server
+        .client
+        .get(format!("{}/rooms/{}/events", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sse_resp.status(), StatusCode::OK);
+    let mut stream = sse_resp.bytes_stream();
+
+    // 4. Evolve schema via control plane
+    let new_col = ColumnDef::new("priority", DataType::Int).nullable(true);
+    let add_col_resp = server
+        .client
+        .post(format!(
+            "{}/admin/schemas/{}/columns",
+            server.base_url, schema_id
+        ))
+        .header(AUTHORIZATION, &admin_auth)
+        .json(&AddColumnRequest {
+            table_name: "tasks".to_string(),
+            column: new_col,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(add_col_resp.status(), StatusCode::OK);
+
+    // 5. Verify SSE stream receives schema_reloaded event
+    let chunk = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("SSE event timeout")
+        .expect("Stream closed unexpectedly")
+        .unwrap();
+
+    let text = String::from_utf8_lossy(&chunk);
+    assert!(
+        text.contains("event: schema_reloaded"),
+        "Expected SSE schema_reloaded event, got: {}",
+        text
+    );
+    assert!(
+        text.contains("data: schema-reload-sse"),
+        "Expected schema_id in data, got: {}",
+        text
+    );
+}
+
+#[test]
+fn test_client_lease_disconnected_to_dormant_timeout() {
+    use rimdb_server::actor::lease::{ClientLeaseTracker, ClientState};
+    use std::time::Instant;
+
+    let dir = tempdir().unwrap();
+    let roster_path = dir.path().join("clients.json");
+    let mut tracker = ClientLeaseTracker::open_or_create(&roster_path).unwrap();
+
+    let alice = ClientId::new("alice");
+    let bob = ClientId::new("bob");
+    let lease_timeout = Duration::from_secs(5);
+    let tail_seq = SequenceNumber::new(0);
+
+    // Register alice and bob as connected
+    let state_alice = tracker
+        .register_client(&alice, Some(SequenceNumber::new(10)), tail_seq)
+        .unwrap();
+    let state_bob = tracker
+        .register_client(&bob, Some(SequenceNumber::new(10)), tail_seq)
+        .unwrap();
+    assert_eq!(state_alice, ClientState::Connected);
+    assert_eq!(state_bob, ClientState::Connected);
+    assert_eq!(
+        tracker.min_connected_ack_seq(),
+        Some(SequenceNumber::new(10))
+    );
+
+    // 1. Simulate alice lease expiry (> 5s) -> transitions to Disconnected
+    if let Some(entry) = tracker.get_client_mut(&alice) {
+        entry.last_heartbeat = Instant::now() - Duration::from_secs(6);
+    }
+    let modified = tracker.check_timeouts(lease_timeout, tail_seq);
+    assert!(modified);
+    assert_eq!(
+        tracker.get_client(&alice).unwrap().state,
+        ClientState::Disconnected
+    );
+
+    // Disconnected alice blocks proactive pruning
+    assert_eq!(
+        tracker.min_connected_ack_seq(),
+        None,
+        "Disconnected client must block proactive pruning"
+    );
+
+    // 2. Simulate prolonged disconnection (> 90s) -> transitions to Dormant
+    if let Some(entry) = tracker.get_client_mut(&alice) {
+        entry.last_heartbeat = Instant::now() - Duration::from_secs(95);
+    }
+    let modified2 = tracker.check_timeouts(lease_timeout, tail_seq);
+    assert!(modified2);
+    assert!(
+        tracker.is_dormant(&alice),
+        "Alice should transition to Dormant after 90s of disconnection"
+    );
+
+    // Dormant alice no longer blocks proactive pruning; bob's cursor is returned
+    assert_eq!(
+        tracker.min_connected_ack_seq(),
+        Some(SequenceNumber::new(10)),
+        "Dormant client must not block log compaction"
+    );
 }

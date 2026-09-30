@@ -1,9 +1,9 @@
-use std::fs;
-use std::path::PathBuf;
-use std::sync::Arc;
 use dashmap::DashMap;
 use rimdb_core::schema::{ColumnDef, Schema};
 use rimdb_core::SchemaId;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::error::ServerError;
 
@@ -46,7 +46,11 @@ impl SchemaRegistry {
     }
 
     /// Registers a new schema or updates an existing one, persisting it to disk atomically.
-    pub fn register_schema(&self, id: SchemaId, schema: Schema) -> Result<Arc<Schema>, ServerError> {
+    pub fn register_schema(
+        &self,
+        id: SchemaId,
+        schema: Schema,
+    ) -> Result<Arc<Schema>, ServerError> {
         let path = self.dir.join(format!("{}.json", id.as_str()));
         let tmp_path = self.dir.join(format!("{}.json.tmp", id.as_str()));
 
@@ -79,14 +83,16 @@ impl SchemaRegistry {
             .ok_or_else(|| ServerError::SchemaNotFound(id.to_string()))?;
 
         let mut evolved_schema = (*existing).clone();
-        let table_id = evolved_schema
-            .get_table_id(table_name)
-            .ok_or_else(|| ServerError::SchemaViolation(format!("Table '{}' not found", table_name)))?;
+        let table_id = evolved_schema.get_table_id(table_name).ok_or_else(|| {
+            ServerError::SchemaViolation(format!("Table '{}' not found", table_name))
+        })?;
 
         let table = evolved_schema
             .tables_by_id
             .get_mut(&table_id)
-            .ok_or_else(|| ServerError::SchemaViolation(format!("Table ID '{}' not found", table_id)))?;
+            .ok_or_else(|| {
+                ServerError::SchemaViolation(format!("Table ID '{}' not found", table_id))
+            })?;
 
         // add_column in TableSchema enforces nullable: true and column name uniqueness
         table

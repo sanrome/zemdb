@@ -22,7 +22,7 @@ pub use mutation::{
 pub use protocol::{
     decode_message, decode_wal_batch_from_slice, decode_wal_record_from_slice, encode_message,
     encode_wal_batch, encode_wal_record, replay_wal_records, ClientMessage, ErrorCode,
-    ServerMessage, SequencedOperation, WalBatchDecodeResult, WalDecodeResult, WalFrameError,
+    SequencedOperation, ServerMessage, WalBatchDecodeResult, WalDecodeResult, WalFrameError,
     BATCH_HEADER_SIZE, BATCH_MAGIC, MAX_MESSAGE_SIZE,
 };
 pub use schema::{

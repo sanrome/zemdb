@@ -137,7 +137,9 @@ impl From<ClientId> for String {
 }
 
 /// Strictly monotonic sequence number per Room assigned by the server coordinator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 #[serde(transparent)]
 pub struct SequenceNumber(u64);
 
@@ -232,7 +234,9 @@ impl From<MutationId> for [u8; 16] {
 }
 
 /// Correlation ID for multiplexing and pairing asynchronous requests and responses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 #[serde(transparent)]
 pub struct CorrelationId(u64);
 

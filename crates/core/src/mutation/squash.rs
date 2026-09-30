@@ -10,6 +10,8 @@ pub enum SquashOutcome {
     Replaced,
     /// The incoming operation was obsolete or a no-op and was discarded (existing remains unchanged).
     Discarded,
+    /// Both operations cancelled each other out (e.g. pending Insert followed by Delete in client buffer).
+    Purged,
     /// Operations cannot be squashed (e.g. different table_id, PK, or invalid transition like Delete followed by Update).
     Incompatible,
 }
@@ -60,10 +62,7 @@ pub fn merge_sorted_column_updates(
 }
 
 /// Merges an incoming Operation into an existing pending Operation for the same table_id and PK (Client-side LWW by timestamp).
-pub fn squash_operations(
-    existing: &mut Operation,
-    incoming: Operation,
-) -> SquashOutcome {
+pub fn squash_operations(existing: &mut Operation, incoming: Operation) -> SquashOutcome {
     if existing.table_id != incoming.table_id || existing.pk != incoming.pk {
         return SquashOutcome::Incompatible;
     }
@@ -74,24 +73,16 @@ pub fn squash_operations(
             if incoming.timestamp >= existing.timestamp {
                 for u in updates {
                     let idx = u.column_idx as usize;
-                    if idx >= row.values.len() {
-                        row.values.resize(idx + 1, Value::Null);
+                    if idx >= row.len() {
+                        row.resize(idx + 1, Value::Null);
                     }
-                    row.values[idx] = u.value; // Move semantics: 0 clones
+                    row[idx] = u.value; // Move semantics: 0 clones
                 }
                 existing.timestamp = incoming.timestamp;
+                SquashOutcome::Merged
             } else {
-                for u in updates {
-                    let idx = u.column_idx as usize;
-                    if idx >= row.values.len() {
-                        row.values.resize(idx + 1, Value::Null);
-                    }
-                    if row.values[idx].is_null() {
-                        row.values[idx] = u.value;
-                    }
-                }
+                SquashOutcome::Discarded
             }
-            SquashOutcome::Merged
         }
 
         // Rule 2: UPDATE followed by UPDATE -> O(M+N) two-pointer merge preserving column_idx ascending
@@ -124,9 +115,13 @@ pub fn squash_operations(
         // Rule 4: Any operation followed by DELETE
         (target_kind, OperationKind::Delete) => {
             if incoming.timestamp >= existing.timestamp {
-                *target_kind = OperationKind::Delete;
-                existing.timestamp = incoming.timestamp;
-                SquashOutcome::Replaced
+                if matches!(target_kind, OperationKind::Insert { .. }) {
+                    SquashOutcome::Purged
+                } else {
+                    *target_kind = OperationKind::Delete;
+                    existing.timestamp = incoming.timestamp;
+                    SquashOutcome::Replaced
+                }
             } else {
                 SquashOutcome::Discarded
             }
@@ -143,10 +138,10 @@ pub fn squash_operations(
                     OperationKind::Update { updates } => {
                         for u in updates.drain(..) {
                             let idx = u.column_idx as usize;
-                            if idx >= row.values.len() {
-                                row.values.resize(idx + 1, Value::Null);
+                            if idx >= row.len() {
+                                row.resize(idx + 1, Value::Null);
                             }
-                            row.values[idx] = u.value; // Move semantics: 0 clones
+                            row[idx] = u.value; // Move semantics: 0 clones
                         }
                         *target_kind = OperationKind::Insert { row };
                         SquashOutcome::Merged

@@ -1,4 +1,3 @@
-use std::time::{Duration, Instant};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -7,6 +6,7 @@ use dashmap::DashMap;
 use rimdb_core::id::{CorrelationId, RoomId, SequenceNumber};
 use rimdb_core::protocol::codec::{decode_message, encode_message};
 use rimdb_core::protocol::messages::{ClientMessage, ErrorCode, ServerMessage};
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
 use crate::api::router::AppState;
@@ -133,7 +133,9 @@ impl SnapshotRelay {
             };
 
             let modified = metadata.modified().unwrap_or(now_system);
-            let age = now_system.duration_since(modified).unwrap_or(Duration::ZERO);
+            let age = now_system
+                .duration_since(modified)
+                .unwrap_or(Duration::ZERO);
 
             if age >= self.ttl {
                 let _ = std::fs::remove_file(&path);
@@ -228,10 +230,9 @@ impl SnapshotRelay {
     ) -> Result<ServerMessage, ServerError> {
         self.cleanup_expired();
 
-        let staged = self
-            .snapshots
-            .get(room_id)
-            .ok_or_else(|| ServerError::RoomNotFound(format!("No staged snapshot for room {}", room_id)))?;
+        let staged = self.snapshots.get(room_id).ok_or_else(|| {
+            ServerError::RoomNotFound(format!("No staged snapshot for room {}", room_id))
+        })?;
 
         let total_bytes = staged.total_bytes;
         let chunk_size_u64 = chunk_size.max(1) as u64;
@@ -269,7 +270,9 @@ impl SnapshotRelay {
         self.cleanup_expired();
 
         if chunk.total_chunks == 0 {
-            return Err(ServerError::Config("total_chunks must be greater than 0".to_string()));
+            return Err(ServerError::Config(
+                "total_chunks must be greater than 0".to_string(),
+            ));
         }
         if chunk.chunk_index >= chunk.total_chunks {
             return Err(ServerError::Config(format!(
@@ -285,15 +288,16 @@ impl SnapshotRelay {
         }
 
         let key = (chunk.room_id.clone(), chunk.head_seq);
-        let mut entry = self.multipart_uploads.entry(key.clone()).or_insert_with(|| {
-            StagedUploadSession {
+        let mut entry = self
+            .multipart_uploads
+            .entry(key.clone())
+            .or_insert_with(|| StagedUploadSession {
                 total_chunks: chunk.total_chunks,
                 total_bytes: chunk.total_bytes,
                 snapshot_hash: chunk.snapshot_hash,
                 received_chunks: std::collections::BTreeMap::new(),
                 created_at: Instant::now(),
-            }
-        });
+            });
 
         if entry.total_chunks != chunk.total_chunks
             || entry.total_bytes != chunk.total_bytes
@@ -362,9 +366,8 @@ impl SnapshotRelay {
             }
             alive
         });
-        self.multipart_uploads.retain(|_, session| {
-            now.duration_since(session.created_at) < self.ttl
-        });
+        self.multipart_uploads
+            .retain(|_, session| now.duration_since(session.created_at) < self.ttl);
     }
 }
 
@@ -379,9 +382,7 @@ fn authenticate_relay_request(
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| ServerError::Unauthorized("Missing Authorization header".to_string()))?;
 
-    let token = auth_header
-        .strip_prefix("Bearer ")
-        .unwrap_or(auth_header);
+    let token = auth_header.strip_prefix("Bearer ").unwrap_or(auth_header);
 
     // 1. Constant-time check for admin secret
     let is_admin = token
@@ -422,16 +423,20 @@ pub async fn upload_snapshot(
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| ServerError::Config("Missing x-snapshot-head-seq header".to_string()))?;
 
-    let head_seq_val = head_seq_str
-        .parse::<u64>()
-        .map_err(|_| ServerError::Config("Invalid x-snapshot-head-seq header format".to_string()))?;
+    let head_seq_val = head_seq_str.parse::<u64>().map_err(|_| {
+        ServerError::Config("Invalid x-snapshot-head-seq header format".to_string())
+    })?;
 
     if head_seq_val == 0 {
-        return Err(ServerError::Config("x-snapshot-head-seq must be greater than 0".to_string()));
+        return Err(ServerError::Config(
+            "x-snapshot-head-seq must be greater than 0".to_string(),
+        ));
     }
 
     let head_seq = SequenceNumber::new(head_seq_val);
-    let hash = state.snapshot_relay.stage_snapshot(room_id.clone(), head_seq, body);
+    let hash = state
+        .snapshot_relay
+        .stage_snapshot(room_id.clone(), head_seq, body);
 
     let body_json = serde_json::json!({
         "room_id": room_id.as_str(),
@@ -669,4 +674,3 @@ pub async fn upload_chunk(
             .into_response(),
     }
 }
-

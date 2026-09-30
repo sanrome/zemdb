@@ -28,7 +28,7 @@ impl Default for RoomLifecyclePolicy {
         Self {
             ram_max_ops: 1_000,
             ram_ttl: Duration::from_secs(300),          // 5 minutes
-            warm_disk_ttl: Duration::from_secs(86_400),  // 24 hours
+            warm_disk_ttl: Duration::from_secs(86_400), // 24 hours
             cold_disk_ttl: Duration::from_secs(2_592_000), // 30 days
             max_room_disk_bytes: 500 * 1024 * 1024,     // 500 MB
         }

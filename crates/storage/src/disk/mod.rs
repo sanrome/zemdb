@@ -4,11 +4,11 @@ pub mod recovery;
 pub mod wal;
 
 use async_trait::async_trait;
+use fs2::FileExt;
 use rimdb_core::{
     CompactRow, OperationKind, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation,
     Value,
 };
-use fs2::FileExt;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::RangeBounds;
 use std::path::PathBuf;
@@ -19,10 +19,10 @@ use tokio::sync::RwLock;
 
 use crate::disk::compactor::{compact_room_cow, compact_room_internal};
 use crate::disk::recovery::recover_room;
-use crate::memory::{RoomSnapshotPayload, RoomSnapshotRef};
 use crate::disk::wal::WalWriter;
 use crate::engine::{apply_scan_transforms, RowStream, StorageEngine};
 use crate::error::StorageError;
+use crate::memory::{RoomSnapshotPayload, RoomSnapshotRef};
 use crate::options::{KeyRange, ScanDirection, ScanOptions};
 
 /// Options to configure `DiskStorageEngine`.
@@ -136,7 +136,10 @@ impl DiskStorageEngine {
     }
 
     /// Fast lookup of an open room handle.
-    pub async fn get_room(&self, room_id: &RoomId) -> Result<Arc<RwLock<DiskRoomState>>, StorageError> {
+    pub async fn get_room(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Arc<RwLock<DiskRoomState>>, StorageError> {
         let rooms = self.rooms.read().await;
         rooms
             .get(room_id)
@@ -225,6 +228,7 @@ impl StorageEngine for DiskStorageEngine {
 
         let mut rooms = self.rooms.write().await;
         if let Some(room_arc) = rooms.remove(room_id) {
+            drop(rooms);
             let room = room_arc.write().await;
             room.wal_file.sync_all().await?;
             self.compaction_locks.remove(room_id);
@@ -259,6 +263,8 @@ impl StorageEngine for DiskStorageEngine {
                     actual: op.seq,
                 });
             }
+
+            room.schema.validate_operation(&op.op)?;
         }
 
         // 2. Encode WAL records into framed byte buffer
@@ -290,15 +296,15 @@ impl StorageEngine for DiskStorageEngine {
                         if let Some(existing) = table_map.get_mut(&op.pk) {
                             let target_len = schema
                                 .get_table_by_id(op.table_id)
-                                .map(|t| t.columns.len())
+                                .map(|t| t.columns().len())
                                 .unwrap_or(0);
                             for col_up in updates {
                                 let idx = col_up.column_idx as usize;
                                 let min_len = target_len.max(idx + 1);
-                                if existing.values.len() < min_len {
-                                    existing.values.resize(min_len, Value::Null);
+                                if existing.len() < min_len {
+                                    existing.resize(min_len, Value::Null);
                                 }
-                                existing.values[idx] = col_up.value;
+                                existing[idx] = col_up.value;
                             }
                         }
                     }
@@ -343,12 +349,34 @@ impl StorageEngine for DiskStorageEngine {
         pk: &PrimaryKey,
     ) -> Result<Option<CompactRow>, StorageError> {
         let room_arc = self.get_room(room_id).await?;
+        let table_id = {
+            let room = room_arc.read().await;
+            room.schema
+                .get_table_id(table)
+                .ok_or_else(|| StorageError::TableNotFound {
+                    room_id: room_id.clone(),
+                    table: table.to_string(),
+                })?
+        };
+
+        self.get_by_id(room_id, table_id, pk).await
+    }
+
+    async fn get_by_id(
+        &self,
+        room_id: &RoomId,
+        table_id: u16,
+        pk: &PrimaryKey,
+    ) -> Result<Option<CompactRow>, StorageError> {
+        let room_arc = self.get_room(room_id).await?;
         let room = room_arc.read().await;
 
-        let table_id = room.schema.get_table_id(table).ok_or_else(|| StorageError::TableNotFound {
-            room_id: room_id.clone(),
-            table: table.to_string(),
-        })?;
+        if !room.schema.has_table_by_id(table_id) {
+            return Err(StorageError::TableNotFound {
+                room_id: room_id.clone(),
+                table: format!("id:{}", table_id),
+            });
+        }
 
         let row = room.tables.get(&table_id).and_then(|t| t.get(pk).cloned());
         Ok(row)
@@ -361,13 +389,38 @@ impl StorageEngine for DiskStorageEngine {
         options: ScanOptions,
     ) -> Result<RowStream<'a>, StorageError> {
         let room_arc = self.get_room(room_id).await?;
+        let table_id = {
+            let room = room_arc.read().await;
+            room.schema
+                .get_table_id(table)
+                .ok_or_else(|| StorageError::TableNotFound {
+                    room_id: room_id.clone(),
+                    table: table.to_string(),
+                })?
+        };
+
+        self.scan_by_id(room_id, table_id, options).await
+    }
+
+    async fn scan_by_id<'a>(
+        &'a self,
+        room_id: &RoomId,
+        table_id: u16,
+        options: ScanOptions,
+    ) -> Result<RowStream<'a>, StorageError> {
+        let room_arc = self.get_room(room_id).await?;
         let table_data = {
             let room = room_arc.read().await;
-            let table_id = room.schema.get_table_id(table).ok_or_else(|| StorageError::TableNotFound {
-                room_id: room_id.clone(),
-                table: table.to_string(),
-            })?;
-            room.tables.get(&table_id).cloned().unwrap_or_else(|| Arc::new(BTreeMap::new()))
+            if !room.schema.has_table_by_id(table_id) {
+                return Err(StorageError::TableNotFound {
+                    room_id: room_id.clone(),
+                    table: format!("id:{}", table_id),
+                });
+            }
+            room.tables
+                .get(&table_id)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(BTreeMap::new()))
         };
 
         let state = DiskScanState {
@@ -396,27 +449,28 @@ impl StorageEngine for DiskStorageEngine {
                 None => BATCH_SIZE,
             };
 
-            let batch_items: Vec<Result<(PrimaryKey, CompactRow), StorageError>> =
-                match state.direction {
-                    ScanDirection::Forward => {
-                        let (start_bound, end_bound) = match &state.cursor {
-                            Some(cur) => (std::ops::Bound::Excluded(cur), state.range.end_bound()),
-                            None => (state.range.start_bound(), state.range.end_bound()),
-                        };
-                        let iter = state.table_data.range((start_bound, end_bound));
-                        apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
-                            .collect()
-                    }
-                    ScanDirection::Backward => {
-                        let (start_bound, end_bound) = match &state.cursor {
-                            Some(cur) => (state.range.start_bound(), std::ops::Bound::Excluded(cur)),
-                            None => (state.range.start_bound(), state.range.end_bound()),
-                        };
-                        let iter = state.table_data.range((start_bound, end_bound)).rev();
-                        apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
-                            .collect()
-                    }
-                };
+            let batch_items: Vec<Result<(PrimaryKey, CompactRow), StorageError>> = match state
+                .direction
+            {
+                ScanDirection::Forward => {
+                    let (start_bound, end_bound) = match &state.cursor {
+                        Some(cur) => (std::ops::Bound::Excluded(cur), state.range.end_bound()),
+                        None => (state.range.start_bound(), state.range.end_bound()),
+                    };
+                    let iter = state.table_data.range((start_bound, end_bound));
+                    apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
+                        .collect()
+                }
+                ScanDirection::Backward => {
+                    let (start_bound, end_bound) = match &state.cursor {
+                        Some(cur) => (state.range.start_bound(), std::ops::Bound::Excluded(cur)),
+                        None => (state.range.start_bound(), state.range.end_bound()),
+                    };
+                    let iter = state.table_data.range((start_bound, end_bound)).rev();
+                    apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
+                        .collect()
+                }
+            };
 
             let count = batch_items.len();
             if count == 0 {
@@ -461,14 +515,15 @@ impl StorageEngine for DiskStorageEngine {
             tables: &room.tables,
         };
 
-        let raw = bincode::serialize(&payload)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let raw =
+            bincode::serialize(&payload).map_err(|e| StorageError::Serialization(e.to_string()))?;
 
         let zstd_level = self.options.zstd_level;
-        tokio::task::spawn_blocking(move || zstd::encode_all(&raw[..], zstd_level))
-            .await
-            .map_err(|e| StorageError::Other(format!("Join error: {e}")))?
-            .map_err(|e| StorageError::Other(format!("Zstd snapshot compression failed: {e}")))
+        tokio::task::spawn_blocking(move || {
+            crate::snapshot::encode_snapshot_envelope(&raw, true, zstd_level)
+        })
+        .await
+        .map_err(|e| StorageError::Other(format!("Join error: {e}")))?
     }
 
     #[tracing::instrument(skip(self, schema, snapshot), fields(room_id = %room_id, snapshot_size = snapshot.len()))]
@@ -479,10 +534,12 @@ impl StorageEngine for DiskStorageEngine {
         snapshot: &[u8],
     ) -> Result<SequenceNumber, StorageError> {
         let snapshot_vec = snapshot.to_vec();
-        let decompressed = tokio::task::spawn_blocking(move || zstd::decode_all(&snapshot_vec[..]))
-            .await
-            .map_err(|e| StorageError::Other(format!("Join error: {e}")))?
-            .map_err(|e| StorageError::SnapshotCorruption(format!("Zstd decompression failed: {e}")))?;
+        let decompressed = tokio::task::spawn_blocking(move || {
+            crate::snapshot::decode_snapshot_envelope(&snapshot_vec)
+        })
+        .await
+        .map_err(|e| StorageError::Other(format!("Join error: {e}")))?
+        .map_err(|e| StorageError::SnapshotCorruption(format!("Snapshot decode failed: {e}")))?;
 
         let mut payload: RoomSnapshotPayload = bincode::deserialize(&decompressed)
             .map_err(|e| StorageError::SnapshotCorruption(e.to_string()))?;

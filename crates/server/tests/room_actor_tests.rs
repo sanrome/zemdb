@@ -1,10 +1,10 @@
-use std::sync::Arc;
-use std::time::Duration;
 use rimdb_core::*;
 use rimdb_server::{
-    CommitResponse, RegisterResponse, RoomCommand, RoomLifecyclePolicy, RoomManager, SchemaRegistry,
-    ServerConfig, ServerError, SnapshotRelay, SyncBatchResponse,
+    CommitResponse, RegisterResponse, RoomCommand, RoomEvent, RoomLifecyclePolicy, RoomManager,
+    SchemaRegistry, ServerConfig, ServerError, SnapshotRelay, SyncBatchResponse,
 };
+use std::sync::Arc;
+use std::time::Duration;
 use tempfile::tempdir;
 use tokio::sync::oneshot;
 
@@ -150,7 +150,10 @@ async fn test_room_actor_commit_validation_and_monotonic_sequencing() {
 
     let manager = RoomManager::new(config, schema_registry, create_test_relay());
     let room_id = RoomId::new("tasks-room");
-    let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).await.unwrap();
+    let sender = manager
+        .get_or_spawn(&room_id, Some(&schema_id))
+        .await
+        .unwrap();
 
     let client_id = ClientId::new("client-1");
 
@@ -167,10 +170,15 @@ async fn test_room_actor_commit_validation_and_monotonic_sequencing() {
         })
         .await
         .unwrap();
-    assert!(matches!(rx0.await.unwrap(), Err(ServerError::Unauthorized(_))));
+    assert!(matches!(
+        rx0.await.unwrap(),
+        Err(ServerError::Unauthorized(_))
+    ));
 
     // Register client
-    register_client_helper(&sender, client_id.clone()).await.unwrap();
+    register_client_helper(&sender, client_id.clone())
+        .await
+        .unwrap();
 
     // 1. Commit valid mutation
     let op1 = create_insert_op(&schema, 1, "Buy groceries");
@@ -256,7 +264,10 @@ async fn test_room_actor_multi_client_concurrency_and_sse_events() {
 
     let manager = RoomManager::new(config, schema_registry, create_test_relay());
     let room_id = RoomId::new("concurrent-room");
-    let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).await.unwrap();
+    let sender = manager
+        .get_or_spawn(&room_id, Some(&schema_id))
+        .await
+        .unwrap();
 
     // Register reader client initially so its cursor holds back proactive pruning
     let (reg_tx, reg_rx) = oneshot::channel();
@@ -285,7 +296,9 @@ async fn test_room_actor_multi_client_concurrency_and_sse_events() {
         let schema_clone = schema.clone();
         tasks.push(tokio::spawn(async move {
             let client_id = ClientId::new(format!("worker-{}", client_idx));
-            register_client_helper(&cmd_tx, client_id.clone()).await.unwrap();
+            register_client_helper(&cmd_tx, client_id.clone())
+                .await
+                .unwrap();
             for op_idx in 0..20 {
                 let id = client_idx * 100 + op_idx;
                 let op = create_insert_op(&schema_clone, id, &format!("task-{}", id));
@@ -325,8 +338,10 @@ async fn test_room_actor_multi_client_concurrency_and_sse_events() {
 
     // Verify SSE receiver got events
     let mut last_event_seq = SequenceNumber::new(0);
-    while let Ok(seq) = sse_rx.try_recv() {
-        last_event_seq = seq;
+    while let Ok(event) = sse_rx.try_recv() {
+        if let RoomEvent::HeadAdvanced(seq) = event {
+            last_event_seq = seq;
+        }
     }
     assert_eq!(last_event_seq, SequenceNumber::new(100));
 
@@ -517,8 +532,13 @@ async fn test_room_actor_recovery_retains_state_and_head_seq() {
             Arc::clone(&schema_registry),
             create_test_relay(),
         );
-        let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).await.unwrap();
-        register_client_helper(&sender, ClientId::new("c1")).await.unwrap();
+        let sender = manager
+            .get_or_spawn(&room_id, Some(&schema_id))
+            .await
+            .unwrap();
+        register_client_helper(&sender, ClientId::new("c1"))
+            .await
+            .unwrap();
 
         for i in 1..=5 {
             let op = create_insert_op(&schema, i, &format!("task-{}", i));
@@ -612,7 +632,10 @@ async fn test_room_actor_cursor_advances_only_on_client_ack() {
 
     let manager = RoomManager::new(config, schema_registry, create_test_relay());
     let room_id = RoomId::new("ack-test-room");
-    let sender = manager.get_or_spawn(&room_id, Some(&schema_id)).await.unwrap();
+    let sender = manager
+        .get_or_spawn(&room_id, Some(&schema_id))
+        .await
+        .unwrap();
 
     let client = ClientId::new("c-reader");
 
@@ -629,7 +652,9 @@ async fn test_room_actor_cursor_advances_only_on_client_ack() {
     reg_rx.await.unwrap().unwrap();
 
     // 2. Producer commits 5 operations (seq 1..=5)
-    register_client_helper(&sender, ClientId::new("producer")).await.unwrap();
+    register_client_helper(&sender, ClientId::new("producer"))
+        .await
+        .unwrap();
     for i in 1..=5 {
         let op = create_insert_op(&schema, i, &format!("task-{}", i));
         let (tx, rx) = oneshot::channel();
@@ -845,7 +870,10 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
         })
         .await
         .unwrap();
-    let sync_res = sync_rx.await.unwrap().expect("Sync after snapshot must succeed");
+    let sync_res = sync_rx
+        .await
+        .unwrap()
+        .expect("Sync after snapshot must succeed");
     assert_eq!(sync_res.ops.len(), 5);
     assert_eq!(sync_res.ops[0].seq, SequenceNumber::new(6));
     assert_eq!(sync_res.ops[4].seq, SequenceNumber::new(10));
@@ -874,7 +902,9 @@ async fn test_room_actor_rejects_future_ack_and_commit_sequences() {
         .expect("spawn room");
 
     let alice = ClientId::new("alice");
-    let alice_reg = register_client_helper(&sender, alice.clone()).await.unwrap();
+    let alice_reg = register_client_helper(&sender, alice.clone())
+        .await
+        .unwrap();
     assert_eq!(alice_reg.head_seq, SequenceNumber::new(0));
 
     // 1. Commit 3 operations (seq 1, 2, 3)
@@ -967,5 +997,3 @@ async fn test_room_actor_rejects_future_ack_and_commit_sequences() {
         other => panic!("Expected ServerError::InvalidSequence, got {:?}", other),
     }
 }
-
-

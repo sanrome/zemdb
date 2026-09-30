@@ -4,7 +4,7 @@ pub mod manager;
 pub mod room;
 
 pub use command::{
-    CommitResponse, RegisterResponse, RoomCommand, RoomMetrics, SyncBatchResponse,
+    CommitResponse, RegisterResponse, RoomCommand, RoomEvent, RoomMetrics, SyncBatchResponse,
 };
 pub use lease::{ClientEntry, ClientLeaseTracker, ClientState};
 pub use manager::{RoomManager, RoomMetadata};

@@ -35,9 +35,7 @@ fn test_tiered_log_write_through_and_crash_recovery() {
     let (log2, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
     assert_eq!(log2.head_seq().get(), 10);
 
-    let (deltas, has_more) = log2
-        .fetch_deltas(SequenceNumber::new(0), 100)
-        .unwrap();
+    let (deltas, has_more) = log2.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
 
     assert_eq!(deltas.len(), 10);
     assert!(!has_more);
@@ -46,7 +44,10 @@ fn test_tiered_log_write_through_and_crash_recovery() {
         let expected_seq = idx as u64 + 1;
         assert_eq!(op.seq.get(), expected_seq);
         assert_eq!(op.op.table_id, 1);
-        assert_eq!(op.op.pk, PrimaryKey::single(Value::Int(expected_seq as i64)));
+        assert_eq!(
+            op.op.pk,
+            PrimaryKey::single(Value::Int(expected_seq as i64))
+        );
     }
 }
 
@@ -61,9 +62,7 @@ fn test_tiered_log_hot_buffer_fast_read() {
     }
 
     // Read range from cursor 2 with limit 2 (should return 3 and 4 with has_more = true)
-    let (batch1, has_more1) = log
-        .fetch_deltas(SequenceNumber::new(2), 2)
-        .unwrap();
+    let (batch1, has_more1) = log.fetch_deltas(SequenceNumber::new(2), 2).unwrap();
 
     assert_eq!(batch1.len(), 2);
     assert_eq!(batch1[0].seq.get(), 3);
@@ -71,18 +70,14 @@ fn test_tiered_log_hot_buffer_fast_read() {
     assert!(has_more1);
 
     // Read remaining from cursor 4 with limit 10 (should return 5 with has_more = false)
-    let (batch2, has_more2) = log
-        .fetch_deltas(SequenceNumber::new(4), 10)
-        .unwrap();
+    let (batch2, has_more2) = log.fetch_deltas(SequenceNumber::new(4), 10).unwrap();
 
     assert_eq!(batch2.len(), 1);
     assert_eq!(batch2[0].seq.get(), 5);
     assert!(!has_more2);
 
     // Read from current head (should return empty)
-    let (batch3, has_more3) = log
-        .fetch_deltas(SequenceNumber::new(5), 10)
-        .unwrap();
+    let (batch3, has_more3) = log.fetch_deltas(SequenceNumber::new(5), 10).unwrap();
 
     assert!(batch3.is_empty());
     assert!(!has_more3);
@@ -109,9 +104,7 @@ fn test_tiered_log_warm_segment_rotation() {
     assert!(segments_dir.join("active.wal").exists());
 
     // Fetch across the rotation boundary (from 0 to 6)
-    let (deltas, has_more) = log
-        .fetch_deltas(SequenceNumber::new(0), 10)
-        .unwrap();
+    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(0), 10).unwrap();
 
     assert_eq!(deltas.len(), 6);
     assert!(!has_more);
@@ -161,9 +154,7 @@ async fn test_tiered_log_cold_compression_and_read() {
     assert!(cold_zst.exists());
 
     // Fetch deltas directly from Cold Disk (.wal.zst)
-    let (deltas, has_more) = log
-        .fetch_deltas(SequenceNumber::new(0), 10)
-        .unwrap();
+    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(0), 10).unwrap();
 
     assert_eq!(deltas.len(), 5);
     assert!(!has_more);
@@ -207,9 +198,7 @@ async fn test_tiered_log_multi_tier_continuous_fetch() {
     assert_eq!(log.head_seq().get(), 15);
 
     // Fetch entire range 0..15 traversing Cold -> Warm -> Hot in a single contiguous batch
-    let (deltas, has_more) = log
-        .fetch_deltas(SequenceNumber::new(0), 20)
-        .unwrap();
+    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(0), 20).unwrap();
 
     assert_eq!(deltas.len(), 15);
     assert!(!has_more);
@@ -219,9 +208,7 @@ async fn test_tiered_log_multi_tier_continuous_fetch() {
     }
 
     // Paged fetch crossing from Cold (ends at 5) into Warm (starts at 6)
-    let (paged, paged_has_more) = log
-        .fetch_deltas(SequenceNumber::new(3), 5)
-        .unwrap();
+    let (paged, paged_has_more) = log.fetch_deltas(SequenceNumber::new(3), 5).unwrap();
 
     assert_eq!(paged.len(), 5);
     assert_eq!(paged[0].seq.get(), 4);
@@ -274,9 +261,7 @@ async fn test_tiered_log_behind_compaction_eviction() {
     }
 
     // Client requests cursor 5 (immediately before oldest available 6) -> Succeeds!
-    let (valid_deltas, has_more) = log
-        .fetch_deltas(SequenceNumber::new(5), 10)
-        .unwrap();
+    let (valid_deltas, has_more) = log.fetch_deltas(SequenceNumber::new(5), 10).unwrap();
 
     assert_eq!(valid_deltas.len(), 5);
     assert_eq!(valid_deltas[0].seq.get(), 6);
@@ -321,8 +306,14 @@ fn test_tiered_log_proactive_pruning_by_cursor() {
     log.force_rotate_warm().unwrap();
 
     // Verify both sealed segments exist on disk
-    let seg1_path = dir.path().join("segments").join("segment_0000000000000001_0000000000000005.wal");
-    let seg2_path = dir.path().join("segments").join("segment_0000000000000006_0000000000000010.wal");
+    let seg1_path = dir
+        .path()
+        .join("segments")
+        .join("segment_0000000000000001_0000000000000005.wal");
+    let seg2_path = dir
+        .path()
+        .join("segments")
+        .join("segment_0000000000000006_0000000000000010.wal");
     assert!(seg1_path.exists());
     assert!(seg2_path.exists());
 
@@ -370,9 +361,7 @@ fn test_tiered_log_hot_buffer_sliding_window_no_zero_eviction() {
     log.append(make_test_op(6), None).unwrap();
 
     // Verify that operations 2..=6 can still be fetched directly from the RAM buffer window without zero-eviction
-    let (deltas, has_more) = log
-        .fetch_deltas(SequenceNumber::new(1), 10)
-        .unwrap();
+    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(1), 10).unwrap();
 
     assert_eq!(deltas.len(), 5);
     assert_eq!(deltas[0].seq.get(), 2);
@@ -380,9 +369,7 @@ fn test_tiered_log_hot_buffer_sliding_window_no_zero_eviction() {
     assert!(!has_more);
 
     // Fetching from cursor 4 returns 5 and 6
-    let (recent_deltas, recent_has_more) = log
-        .fetch_deltas(SequenceNumber::new(4), 10)
-        .unwrap();
+    let (recent_deltas, recent_has_more) = log.fetch_deltas(SequenceNumber::new(4), 10).unwrap();
     assert_eq!(recent_deltas.len(), 2);
     assert_eq!(recent_deltas[0].seq.get(), 5);
     assert_eq!(recent_deltas[1].seq.get(), 6);

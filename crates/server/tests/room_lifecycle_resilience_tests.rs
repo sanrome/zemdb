@@ -125,9 +125,7 @@ async fn test_concurrent_get_or_spawn_elimination_of_race_condition() {
         let mgr = Arc::clone(&manager);
         let rid = room_id.clone();
         let sid = schema_id.clone();
-        let handle = tokio::spawn(async move {
-            mgr.get_or_spawn(&rid, Some(&sid)).await
-        });
+        let handle = tokio::spawn(async move { mgr.get_or_spawn(&rid, Some(&sid)).await });
         handles.push(handle);
     }
 
@@ -350,9 +348,7 @@ async fn test_data_plane_lazy_reactivation_after_restart() {
         let bytes = commit_resp.bytes().await.unwrap();
         let server_msg: ServerMessage = decode_message(&bytes).unwrap();
         match server_msg {
-            ServerMessage::CommitAck {
-                assigned_seq, ..
-            } => {
+            ServerMessage::CommitAck { assigned_seq, .. } => {
                 assert_eq!(assigned_seq, SequenceNumber::new(3));
             }
             other => panic!("Expected CommitAck, got: {:?}", other),

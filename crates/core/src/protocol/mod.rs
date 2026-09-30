@@ -5,4 +5,3 @@ pub mod wal_frame;
 pub use codec::*;
 pub use messages::*;
 pub use wal_frame::*;
-

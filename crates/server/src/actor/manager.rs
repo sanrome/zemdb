@@ -1,9 +1,9 @@
-use std::fs;
-use std::path::PathBuf;
-use std::sync::Arc;
 use dashmap::DashMap;
 use rimdb_core::id::{RoomId, SchemaId};
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -118,7 +118,8 @@ impl RoomManager {
             let meta: RoomMetadata = serde_json::from_str(&content).map_err(|e| {
                 ServerError::Serialization(format!("Failed to parse meta_room.json: {}", e))
             })?;
-            self.room_schemas.insert(room_id.clone(), meta.schema_id.clone());
+            self.room_schemas
+                .insert(room_id.clone(), meta.schema_id.clone());
             meta.schema_id
         } else {
             return Err(ServerError::RoomNotFound(format!(
@@ -151,15 +152,24 @@ impl RoomManager {
         Ok(sender)
     }
 
+    /// Fast check if a room exists in memory or on disk.
+    pub fn room_exists(&self, room_id: &RoomId) -> bool {
+        if self.rooms.contains_key(room_id) || self.room_schemas.contains_key(room_id) {
+            return true;
+        }
+        let meta_room_path = self
+            .data_dir
+            .join("rooms")
+            .join(room_id.as_str())
+            .join("meta_room.json");
+        meta_room_path.exists()
+    }
+
     /// Gets an existing active sender for the room, if running.
     pub fn get_room(&self, room_id: &RoomId) -> Option<mpsc::Sender<RoomCommand>> {
-        self.rooms.get(room_id).and_then(|s| {
-            if s.is_closed() {
-                None
-            } else {
-                Some(s.clone())
-            }
-        })
+        self.rooms
+            .get(room_id)
+            .and_then(|s| if s.is_closed() { None } else { Some(s.clone()) })
     }
 
     /// Gracefully closes and shuts down an active room actor, awaiting task termination.
@@ -168,7 +178,11 @@ impl RoomManager {
         let handle = self.room_handles.remove(room_id);
         if let Some((_, sender)) = sender {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            if sender.send(RoomCommand::Shutdown { reply: tx }).await.is_ok() {
+            if sender
+                .send(RoomCommand::Shutdown { reply: tx })
+                .await
+                .is_ok()
+            {
                 let _ = rx.await;
             }
             if let Some((_, handle)) = handle {
@@ -298,4 +312,3 @@ impl RoomManager {
         reloaded
     }
 }
-

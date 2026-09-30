@@ -15,7 +15,10 @@ impl ColdDiskLog {
     ///
     /// Writes to a `.tmp` file first, flushes, syncs, atomically renames over the destination,
     /// verifies readability, and deletes the uncompressed `.wal` file.
-    pub fn compress_warm_segment_sync(warm_path: &Path, cold_path: &Path) -> Result<(), ServerError> {
+    pub fn compress_warm_segment_sync(
+        warm_path: &Path,
+        cold_path: &Path,
+    ) -> Result<(), ServerError> {
         if !warm_path.exists() {
             return Err(ServerError::Wal(format!(
                 "Cannot compress non-existent warm segment: {:?}",
@@ -111,7 +114,9 @@ impl ColdDiskLog {
                     offset += bytes_consumed;
                 }
                 Ok(WalBatchDecodeResult::CleanEof) => break,
-                Ok(WalBatchDecodeResult::TornWrite { valid_bytes_offset, .. }) => {
+                Ok(WalBatchDecodeResult::TornWrite {
+                    valid_bytes_offset, ..
+                }) => {
                     tracing::warn!(
                         path = ?cold_path,
                         valid_bytes_offset = offset + valid_bytes_offset,

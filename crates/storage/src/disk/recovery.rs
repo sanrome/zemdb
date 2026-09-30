@@ -150,11 +150,17 @@ async fn replay_wal_file(
                 )));
             }
 
-            let ops = match bincode::deserialize::<rimdb_core::protocol::wal_frame::WalBatchPayload>(&payload) {
+            let ops = match bincode::deserialize::<rimdb_core::protocol::wal_frame::WalBatchPayload>(
+                &payload,
+            ) {
                 Ok(batch) => batch.ops,
-                Err(_) => bincode::deserialize::<Vec<SequencedOperation>>(&payload).map_err(|e| {
-                    StorageError::WalCorruption(format!("Failed to deserialize WAL batch operations: {e}"))
-                })?,
+                Err(_) => {
+                    bincode::deserialize::<Vec<SequencedOperation>>(&payload).map_err(|e| {
+                        StorageError::WalCorruption(format!(
+                            "Failed to deserialize WAL batch operations: {e}"
+                        ))
+                    })?
+                }
             };
 
             if ops.len() != ops_count {
@@ -181,15 +187,15 @@ async fn replay_wal_file(
                             if let Some(existing) = table_map.get_mut(&op.op.pk) {
                                 let target_len = schema
                                     .get_table_by_id(op.op.table_id)
-                                    .map(|t| t.columns.len())
+                                    .map(|t| t.columns().len())
                                     .unwrap_or(0);
                                 for col_up in updates {
                                     let idx = col_up.column_idx as usize;
                                     let min_len = target_len.max(idx + 1);
-                                    if existing.values.len() < min_len {
-                                        existing.values.resize(min_len, Value::Null);
+                                    if existing.len() < min_len {
+                                        existing.resize(min_len, Value::Null);
                                     }
-                                    existing.values[idx] = col_up.value;
+                                    existing[idx] = col_up.value;
                                 }
                             }
                         }
@@ -256,9 +262,12 @@ pub async fn recover_room(
 
         let mut snap_reader = BufReader::with_capacity(64 * 1024, snap_file);
         let mut header_bytes = [0u8; HEADER_SIZE];
-        snap_reader.read_exact(&mut header_bytes).await.map_err(|e| {
-            StorageError::WalCorruption(format!("Failed to read snapshot file header: {e}"))
-        })?;
+        snap_reader
+            .read_exact(&mut header_bytes)
+            .await
+            .map_err(|e| {
+                StorageError::WalCorruption(format!("Failed to read snapshot file header: {e}"))
+            })?;
 
         let header = FileHeader::decode(&header_bytes)?;
         snapshot_len = header.snapshot_compressed_len;
@@ -274,25 +283,31 @@ pub async fn recover_room(
             }
 
             let mut compressed_snap = vec![0u8; snapshot_len as usize];
-            snap_reader.read_exact(&mut compressed_snap).await.map_err(|e| {
-                StorageError::SnapshotCorruption(format!("Failed to read snapshot bytes: {e}"))
-            })?;
+            snap_reader
+                .read_exact(&mut compressed_snap)
+                .await
+                .map_err(|e| {
+                    StorageError::SnapshotCorruption(format!("Failed to read snapshot bytes: {e}"))
+                })?;
 
             // Validate compressed snapshot payload CRC32 before decompression
             let actual_payload_crc = crc32fast::hash(&compressed_snap);
-            if header.snapshot_payload_crc32 != 0 && header.snapshot_payload_crc32 != actual_payload_crc {
+            if header.snapshot_payload_crc32 != 0
+                && header.snapshot_payload_crc32 != actual_payload_crc
+            {
                 return Err(StorageError::SnapshotCorruption(format!(
                     "Snapshot payload CRC32 mismatch: expected {}, got {}",
                     header.snapshot_payload_crc32, actual_payload_crc
                 )));
             }
 
-            let decompressed = tokio::task::spawn_blocking(move || {
-                zstd::decode_all(&compressed_snap[..])
-            })
-            .await
-            .map_err(|e| StorageError::Other(format!("Join error: {e}")))?
-            .map_err(|e| StorageError::SnapshotCorruption(format!("Zstd decompression failed: {e}")))?;
+            let decompressed =
+                tokio::task::spawn_blocking(move || zstd::decode_all(&compressed_snap[..]))
+                    .await
+                    .map_err(|e| StorageError::Other(format!("Join error: {e}")))?
+                    .map_err(|e| {
+                        StorageError::SnapshotCorruption(format!("Zstd decompression failed: {e}"))
+                    })?;
 
             let mut payload: RoomSnapshotPayload = bincode::deserialize(&decompressed)
                 .map_err(|e| StorageError::SnapshotCorruption(e.to_string()))?;

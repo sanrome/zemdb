@@ -7,7 +7,9 @@ use std::collections::HashMap;
 /// Error returned when an operation cannot be applied to `TableBuffer`.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BufferError {
-    #[error("Incompatible operation for table_id '{table_id}': entity state forbids this transition")]
+    #[error(
+        "Incompatible operation for table_id '{table_id}': entity state forbids this transition"
+    )]
     IncompatibleOperation { table_id: u16 },
 }
 
@@ -39,16 +41,19 @@ impl TableBuffer {
             });
         }
 
-        if let Some(existing) = self.pending.get_mut(&op.pk) {
+        let pk = op.pk.clone();
+        if let Some(existing) = self.pending.get_mut(&pk) {
             let outcome = client_squash_operations(existing, op);
             if outcome == SquashOutcome::Incompatible {
                 return Err(BufferError::IncompatibleOperation {
                     table_id: self.table_id,
                 });
             }
+            if outcome == SquashOutcome::Purged {
+                self.pending.remove(&pk);
+            }
             Ok(outcome)
         } else {
-            let pk = op.pk.clone();
             self.pending.insert(pk, op);
             Ok(SquashOutcome::Replaced)
         }
