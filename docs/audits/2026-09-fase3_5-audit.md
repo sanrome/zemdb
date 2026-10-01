@@ -1,4 +1,4 @@
-# Auditoría Técnica Exhaustiva de RimDB — Post-Fase 3.5
+# Auditoría Técnica Exhaustiva de ZemDB — Post-Fase 3.5
 
 **Documento:** Inventario Exhaustivo de Defectos y Evaluación de Convergencia  
 **Fecha:** 30 de Septiembre de 2026  
@@ -113,7 +113,7 @@ A continuación se presenta el catálogo completo de defectos deduplicados segú
 * **Ubicación Exacta**: `crates/storage/src/engine.rs:36-96`, `crates/storage/src/memory/mod.rs:64-172`, `crates/storage/src/disk/mod.rs:180-343`
 * **Mecanismo**: El contrato formal `StorageEngine` no expone ningún método para recargar o actualizar el esquema (`reload_schema`) de una sala abierta. Tanto `MemoryStorageEngine` como `DiskStorageEngine` almacenan una instancia inmutable de `Schema` obtenida en `open_room`. En `DiskStorageEngine::open_room`, se prohíbe reabrir una sala abierta devolviendo `StorageError::RoomAlreadyOpen`.
 * **Invariante Vulnerado**: Extensibilidad y evolución de esquema DDL append-only en arquitecturas Local-First.
-* **Impacto**: `validate_column_updates` en `rimdb-core` rechaza en $O(C)$ cualquier actualización donde `col_idx >= table.columns().len()` con `ValidationError::UnknownColumn`. Cuando un administrador ejecuta una migración DDL (`POST /admin/schemas/:id/columns`), en el motor de almacenamiento local del cliente no existe mecanismo para refrescar el esquema de la sala en ejecución. Todas las mutaciones posteriores que contengan operaciones sobre las nuevas columnas fallan irreversiblemente en `StorageEngine::apply_batch`, deteniendo la sincronización local-first.
+* **Impacto**: `validate_column_updates` en `zemdb-core` rechaza en $O(C)$ cualquier actualización donde `col_idx >= table.columns().len()` con `ValidationError::UnknownColumn`. Cuando un administrador ejecuta una migración DDL (`POST /admin/schemas/:id/columns`), en el motor de almacenamiento local del cliente no existe mecanismo para refrescar el esquema de la sala en ejecución. Todas las mutaciones posteriores que contengan operaciones sobre las nuevas columnas fallan irreversiblemente en `StorageEngine::apply_batch`, deteniendo la sincronización local-first.
 
 ---
 
@@ -143,7 +143,7 @@ A continuación se presenta el catálogo completo de defectos deduplicados segú
 * **Invariante Vulnerado**: Integridad de decodificación y cero pérdida de datos en lectura secuencial de transacciones.
 * **Impacto**: Pérdida silenciosa de registros para cualquier componente o herramienta externa que utilice esta función pública en lugar de `WalReader` o `decode_wal_batch_from_slice`.
 
-#### DEF-10: Ausencia de validación de admisibilidad, integridad RMSN y límites de secuencia en carga de snapshots hacia el relay
+#### DEF-10: Ausencia de validación de admisibilidad, integridad ZMSN y límites de secuencia en carga de snapshots hacia el relay
 * **ID Canónico**: `DEF-10`
 * **Especialidad**: Distributed Systems
 * **Ubicación Exacta**: `crates/server/src/relay.rs:411-454, 560-630` y `crates/server/src/actor/room.rs:438-445`
@@ -339,7 +339,7 @@ A continuación se presenta el catálogo completo de defectos deduplicados segú
 * **ID Canónico**: `DEF-50` | **Especialidad**: Database Engine | **Ubicación**: `crates/server/src/actor/room.rs:102, 452-472` y `crates/server/src/log/tiered_log.rs:268-296`
 * **Defecto**: Ticks cada 500 ms por sala ejecutan múltiples llamadas a `read_dir` y `metadata()` sobre segmentos en disco sin cacheo en memoria, saturando controladores de almacenamiento.
 
-#### DEF-54: Ruptura de la portabilidad universal del formato de snapshot `RMSN` en WebAssembly (`wasm32`) por exclusión de descompresión Zstandard
+#### DEF-54: Ruptura de la portabilidad universal del formato de snapshot `ZMSN` en WebAssembly (`wasm32`) por exclusión de descompresión Zstandard
 * **ID Canónico**: `DEF-54` | **Especialidad**: Architecture | **Ubicación**: `crates/storage/src/snapshot.rs:122-128` y `crates/storage/Cargo.toml:21-26`
 * **Defecto**: La dependencia `zstd` está excluida en target `wasm32`, provocando que `decode_snapshot_envelope` falle en tiempo de ejecución al intentar restaurar snapshots generados por nodos nativos.
 
@@ -349,7 +349,7 @@ A continuación se presenta el catálogo completo de defectos deduplicados segú
 
 #### DEF-57: Inversión modular y ausencia de aislamiento por target en `crates/client/Cargo.toml`, impidiendo la compilación para WebAssembly
 * **ID Canónico**: `DEF-57` | **Especialidad**: Architecture | **Ubicación**: `crates/client/Cargo.toml:10-18`
-* **Defecto**: `rimdb-client` no declara a `rimdb-storage` en sus dependencias e importa Tokio (`full`) y Zstd nativo incondicionalmente, rompiendo compilación en navegador.
+* **Defecto**: `zemdb-client` no declara a `zemdb-storage` en sus dependencias e importa Tokio (`full`) y Zstd nativo incondicionalmente, rompiendo compilación en navegador.
 
 ---
 

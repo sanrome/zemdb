@@ -1,5 +1,5 @@
-use rimdb_core::{ClientId, RoomId};
-use rimdb_server::api::auth::{
+use zemdb_core::{ClientId, RoomId};
+use zemdb_server::api::auth::{
     generate_client_token, verify_client_token, verify_client_token_bound,
 };
 use std::time::Duration;

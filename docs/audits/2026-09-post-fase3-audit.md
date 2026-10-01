@@ -1,8 +1,8 @@
-# INFORME DE AUDITORÍA TÉCNICA MULTIDISCIPLINAR — RIMDB (POST-FASE 3)
+# INFORME DE AUDITORÍA TÉCNICA MULTIDISCIPLINAR — ZEMDB (POST-FASE 3)
 **Inventario Exhaustivo de Defectos, Vulnerabilidades y Deuda Técnica**
 
 **Fecha de Consolidación:** 25 de Septiembre de 2026  
-**Proyecto:** `RimDB` (Motor de Base de Datos Distribuida Local-First)  
+**Proyecto:** `ZemDB` (Motor de Base de Datos Distribuida Local-First)  
 **Coordinador Técnico:** Arquitecto Principal de Auditoría  
 **Alcance:** Repositorio completo (`crates/core`, `crates/storage`, `crates/server`, `crates/client`, `Cargo.toml`, `ARCHITECTURE.md`, `ROADMAP.md`)  
 **Metodología:** Auditoría iterativa independiente mediante 4 subagentes especializados (`rust_code_specialist`, `database_engine_specialist`, `distributed_systems_specialist`, `architecture_specialist`) con aislamiento estricto de contexto (*Zero Context Leakage*).  
@@ -13,7 +13,7 @@
 
 ## 1. RESUMEN DEL PROCESO DE AUDITORÍA Y MÉTRICAS DE CONVERGENCIA
 
-El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes y concurrentes, sometiendo a inspección analítica de primeros principios la totalidad de las 4 capas del workspace tras la finalización de la Fase 3 (`rimdb-server`).
+El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes y concurrentes, sometiendo a inspección analítica de primeros principios la totalidad de las 4 capas del workspace tras la finalización de la Fase 3 (`zemdb-server`).
 
 ### Métricas de Progresión por Iteración
 
@@ -60,7 +60,7 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 │ A-03 │ Alto     │ crates/storage/src/disk/mod.rs       │ [RESUELTO] Rotación WAL y compactación CoW en 3 fases sin bloqueo escritor (A-03).    │
 │ A-04 │ Alto     │ crates/storage/src/disk/compactor.rs │ [RESUELTO] Snapshots temporales con UUID previenen carreras O_TRUNC (A-04).            │
 │ A-05 │ Alto     │ crates/storage/src/disk/format.rs    │ [RESUELTO] Checksum CRC32 sobre payload comprimido en FileHeader validado en recovery. │
-│ A-06 │ Alto     │ crates/storage/src/engine.rs         │ [RESUELTO] Envelope RMSN universal e interoperable entre Memory y Disk con CRC32 (A-06)│
+│ A-06 │ Alto     │ crates/storage/src/engine.rs         │ [RESUELTO] Envelope ZMSN universal e interoperable entre Memory y Disk con CRC32 (A-06)│
 │ A-07 │ Alto     │ crates/server/src/actor/room.rs      │ [RESUELTO] Validación ack_seq <= head_seq en handle_ack previene purga catastrófica.    │
 │ A-08 │ Alto     │ crates/storage/src/disk/mod.rs       │ [RESUELTO] Validación de esquemas activa en apply_batch en Memory y Disk (A-08).        │
 │ A-09 │ Alto     │ crates/storage/src/disk/mod.rs       │ [RESUELTO] Snapshot Isolation en scan con vistas CoW inmutables Arc<BTreeMap> (A-09).  │
@@ -70,7 +70,7 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 │ A-13 │ Alto     │ crates/server/src/log/tiered_log.rs  │ [RESUELTO] Ventana deslizante en HotBuffer: erradicada evicción destructiva a cero.     │
 │ A-14 │ Alto     │ crates/server/src/actor/manager.rs   │ [RESUELTO] delete_room coordina RoomCommand::Shutdown y espera el JoinHandle del actor.│
 │ A-15 │ Alto     │ crates/server/src/relay.rs           │ [RESUELTO] SnapshotRelay respaldado en disco con TTL configurable y purga física.       │
-│ A-16 │ Alto     │ crates/client/src/lib.rs             │ Crate rimdb-client es un cascarón vacío stub sin implementación del SDK de cliente.     │
+│ A-16 │ Alto     │ crates/client/src/lib.rs             │ Crate zemdb-client es un cascarón vacío stub sin implementación del SDK de cliente.     │
 │ A-17 │ Alto     │ crates/server/tests/                 │ [RESUELTO] Test exhaustivo de catchup_ops: orden monótono, contigüidad y reintentos (A-17)│
 ├──────┼──────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┤
 │ M-01 │ Medio    │ crates/core/src/mutation/squash.rs   │ [RESUELTO] LWW estricto en squashing (descarte de updates viejos) y purge Insert+Delete │
@@ -241,7 +241,7 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Ubicación Exacta**: [`crates/storage/src/snapshot.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/snapshot.rs), [`crates/storage/src/memory/mod.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/memory/mod.rs), [`crates/storage/src/disk/mod.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/mod.rs).
 * **Causa Raíz**: `MemoryStorageEngine` emitía Bincode plano sin comprimir; `DiskStorageEngine` emitía Bincode comprimido con Zstandard. Ninguno incluía cabecera canónica identificadora.
 * **Impacto**: Un snapshot generado por un motor no podía ser restaurado en el otro, rompiendo la sustitución de Liskov y la interoperabilidad en clientes WASM vs nativos.
-* **Solución Técnica / Implementada**: Se implementó el módulo canónico `rimdb_storage::snapshot` con envelope unificado de formato: magic bytes `"RMSN"`, versión `1`, flag de compresión (0 = Raw/Memory, 1 = Zstd/Disk), longitud original descomprimida y checksum CRC32 Fast del payload. Las funciones `encode_snapshot_envelope` y `decode_snapshot_envelope` son utilizadas de manera homogénea por `MemoryStorageEngine` y `DiskStorageEngine`, garantizando 100% de portabilidad cruzada bidireccional de snapshots entre cualquier motor de persistencia.
+* **Solución Técnica / Implementada**: Se implementó el módulo canónico `zemdb_storage::snapshot` con envelope unificado de formato: magic bytes `"ZMSN"`, versión `1`, flag de compresión (0 = Raw/Memory, 1 = Zstd/Disk), longitud original descomprimida y checksum CRC32 Fast del payload. Las funciones `encode_snapshot_envelope` y `decode_snapshot_envelope` son utilizadas de manera homogénea por `MemoryStorageEngine` y `DiskStorageEngine`, garantizando 100% de portabilidad cruzada bidireccional de snapshots entre cualquier motor de persistencia.
 
 #### [A-07] Falta de validación `ack_seq <= head_seq` en `handle_ack` permite purga catastrófica de logs
 * **Estado**: **RESUELTO (Fase 3.5-A.4)**
@@ -307,15 +307,15 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Solución Técnica / Implementada**:
   - `SnapshotRelay::new(snapshots_dir, ttl)` exige obligatoriamente un directorio en disco donde persistir los snapshots (`{room_id}_{head_seq}.snap.zst`).
   - Las subidas se escriben de manera atómica mediante staging a archivos temporales `.tmp.<nanos>` y renombrado seguro.
-  - Se integró el parámetro configurable `snapshot_ttl_secs: u64` en `ServerConfig` (por defecto 600 segundos) y soporte de variable de entorno `RIMDB_SNAPSHOT_TTL_SECS`.
+  - Se integró el parámetro configurable `snapshot_ttl_secs: u64` en `ServerConfig` (por defecto 600 segundos) y soporte de variable de entorno `ZEMDB_SNAPSHOT_TTL_SECS`.
   - `cleanup_expired` purga tanto de la memoria RAM como del sistema de archivos con `std::fs::remove_file`, previniendo fugas en disco y agotamiento de RAM (OOM/DoS).
   - Al reiniciar el servidor, `recover_disk_snapshots()` recarga automáticamente snapshots válidos y descarta archivos temporales huérfanos o snapshots vencidos.
 
-#### [A-16] Crate `rimdb-client` es un cascarón vacío stub sin implementación del SDK de cliente
+#### [A-16] Crate `zemdb-client` es un cascarón vacío stub sin implementación del SDK de cliente
 * **Ubicación Exacta**: [`crates/client/src/lib.rs:1-15`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/client/src/lib.rs#L1-L15), [`crates/client/Cargo.toml`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/client/Cargo.toml).
 * **Causa Raíz**: Contiene únicamente `pub fn add` a pesar de declarar dependencias y arquitectura para Fase 4.
 * **Impacto**: Imposibilidad de ejecutar el sistema de extremo a extremo con clientes reales.
-* **Solución Técnica**: Implementar la arquitectura del SDK en Fase 4 (`RimdbClient`, `RoomHandle`, `OutboxQueue`, etc.).
+* **Solución Técnica**: Implementar la arquitectura del SDK en Fase 4 (`ZemdbClient`, `RoomHandle`, `OutboxQueue`, etc.).
 
 #### [A-17] Suites de prueba ignoran deliberadamente `catchup_ops` permitiendo pérdidas de datos
 * **Estado**: **RESUELTO (Fase 3.5-C.2)**
@@ -344,7 +344,7 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 * **Estado**: **RESUELTO (Fase 3.5-C.1)**
 * **Ubicación Exacta**: [`crates/core/src/protocol/codec.rs`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/protocol/codec.rs).
 * **Causa Raíz**: Serializaba directamente enums Bincode sin enmarcado de protocolo binario ni versión.
-* **Solución Técnica / Implementada**: Se antepone una cabecera canónica de 4 bytes en toda trama de red: magic bytes `0x52, 0x4D` (`"RM"`), versión de protocolo `0x01` y flags reservadas `0x00`. En `decode_message`, las tramas con magic bytes o versión discrepante se rechazan tempranamente devolviendo `ErrorCode::ProtocolVersionMismatch`, mapeado a `ServerError::ProtocolVersionMismatch` (HTTP 400).
+* **Solución Técnica / Implementada**: Se antepone una cabecera canónica de 4 bytes en toda trama de red: magic bytes `0x5A, 0x4D` (`"ZM"`), versión de protocolo `0x01` y flags reservadas `0x00`. En `decode_message`, las tramas con magic bytes o versión discrepante se rechazan tempranamente devolviendo `ErrorCode::ProtocolVersionMismatch`, mapeado a `ServerError::ProtocolVersionMismatch` (HTTP 400).
 
 #### [M-04] Comparación de firmas en tiempo variable susceptible a ataques de canal lateral (timing)
 * **Estado**: **RESUELTO (Fase 3.5-A.2)**
@@ -457,4 +457,4 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 
 ---
 
-*Fin del Inventario Exhaustivo de Defectos — RimDB (Post-Fase 3).*
+*Fin del Inventario Exhaustivo de Defectos — ZemDB (Post-Fase 3).*

@@ -1,10 +1,10 @@
-use rimdb_core::id::MutationId;
-use rimdb_core::mutation::Operation;
-use rimdb_core::protocol::messages::SequencedOperation;
-use rimdb_core::protocol::wal_frame::{
+use zemdb_core::id::MutationId;
+use zemdb_core::mutation::Operation;
+use zemdb_core::protocol::messages::SequencedOperation;
+use zemdb_core::protocol::wal_frame::{
     decode_wal_batch_from_slice, encode_wal_batch, WalBatchDecodeResult, WalFrameError, BATCH_MAGIC,
 };
-use rimdb_core::value::{CompactRow, PrimaryKey, Value};
+use zemdb_core::value::{CompactRow, PrimaryKey, Value};
 
 #[test]
 fn test_wal_frame_roundtrip() {

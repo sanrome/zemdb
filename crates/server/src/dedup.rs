@@ -1,5 +1,5 @@
 use lru::LruCache;
-use rimdb_core::id::{MutationId, SequenceNumber};
+use zemdb_core::id::{MutationId, SequenceNumber};
 use std::num::NonZeroUsize;
 
 /// Fixed-capacity in-memory LRU cache for mutation deduplication and Exactly-Once semantics.

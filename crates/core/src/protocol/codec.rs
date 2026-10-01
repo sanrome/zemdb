@@ -1,8 +1,8 @@
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 
-/// Canonical 2-byte magic identifier for RimDB wire protocol messages ("RM").
-pub const PROTOCOL_MAGIC: [u8; 2] = [0x52, 0x4D];
+/// Canonical 2-byte magic identifier for ZemDB wire protocol messages ("ZM").
+pub const PROTOCOL_MAGIC: [u8; 2] = [0x5A, 0x4D];
 
 /// Current wire protocol version.
 pub const PROTOCOL_VERSION: u8 = 0x01;

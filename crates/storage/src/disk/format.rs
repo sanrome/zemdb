@@ -1,9 +1,9 @@
-use rimdb_core::{MutationId, SequencedOperation};
+use zemdb_core::{MutationId, SequencedOperation};
 
 use crate::error::StorageError;
 
-/// Magic bytes identifying a RimDB table room file ("RIM1").
-pub const MAGIC: [u8; 4] = *b"RIM1";
+/// Magic bytes identifying a ZemDB table room file ("ZEM1").
+pub const MAGIC: [u8; 4] = *b"ZEM1";
 
 /// Alias for magic bytes for backward compatibility.
 pub const MAGIC_BYTES: [u8; 4] = MAGIC;
@@ -20,7 +20,7 @@ pub const HEADER_SIZE: usize = 64;
 /// Header of a `.snap` database room snapshot file.
 ///
 /// Layout:
-/// - `magic`: 4 bytes (`b"RIM1"`)
+/// - `magic`: 4 bytes (`b"ZEM1"`)
 /// - `version`: 2 bytes (`u16`, little-endian)
 /// - `flags`: 2 bytes (`u16`, little-endian)
 /// - `snapshot_seq`: 8 bytes (`u64`, little-endian)
@@ -99,7 +99,7 @@ impl FileHeader {
         magic.copy_from_slice(&bytes[0..4]);
         if magic != MAGIC {
             return Err(StorageError::WalCorruption(format!(
-                "Invalid magic bytes in file header: expected RIM1, got {:?}",
+                "Invalid magic bytes in file header: expected ZEM1, got {:?}",
                 magic
             )));
         }
@@ -145,7 +145,7 @@ impl FileHeader {
     }
 }
 
-pub use rimdb_core::protocol::wal_frame::{
+pub use zemdb_core::protocol::wal_frame::{
     WalBatchDecodeResult, WalDecodeResult, WalFrameError, BATCH_HEADER_SIZE, BATCH_MAGIC,
 };
 
@@ -154,7 +154,7 @@ pub fn encode_wal_batch(
     ops: &[SequencedOperation],
     mutation_id: Option<MutationId>,
 ) -> Result<Vec<u8>, StorageError> {
-    rimdb_core::protocol::wal_frame::encode_wal_batch(ops, mutation_id).map_err(Into::into)
+    zemdb_core::protocol::wal_frame::encode_wal_batch(ops, mutation_id).map_err(Into::into)
 }
 
 /// Encodes a single `SequencedOperation` into an append-only WAL batch.
@@ -162,22 +162,22 @@ pub fn encode_wal_record(
     op: &SequencedOperation,
     mutation_id: Option<MutationId>,
 ) -> Result<Vec<u8>, StorageError> {
-    rimdb_core::protocol::wal_frame::encode_wal_record(op, mutation_id).map_err(Into::into)
+    zemdb_core::protocol::wal_frame::encode_wal_record(op, mutation_id).map_err(Into::into)
 }
 
 /// Decodes the next framed WAL batch from a byte slice.
 pub fn decode_wal_batch_from_slice(slice: &[u8]) -> Result<WalBatchDecodeResult, StorageError> {
-    rimdb_core::protocol::wal_frame::decode_wal_batch_from_slice(slice).map_err(Into::into)
+    zemdb_core::protocol::wal_frame::decode_wal_batch_from_slice(slice).map_err(Into::into)
 }
 
 /// Decodes the next WAL record from a byte slice.
 pub fn decode_wal_record_from_slice(slice: &[u8]) -> Result<WalDecodeResult, StorageError> {
-    rimdb_core::protocol::wal_frame::decode_wal_record_from_slice(slice).map_err(Into::into)
+    zemdb_core::protocol::wal_frame::decode_wal_record_from_slice(slice).map_err(Into::into)
 }
 
 /// Helper to read all valid WAL records from a byte buffer.
 pub fn replay_wal_records(
     wal_bytes: &[u8],
 ) -> Result<(Vec<SequencedOperation>, usize, Option<String>), StorageError> {
-    rimdb_core::protocol::wal_frame::replay_wal_records(wal_bytes).map_err(Into::into)
+    zemdb_core::protocol::wal_frame::replay_wal_records(wal_bytes).map_err(Into::into)
 }

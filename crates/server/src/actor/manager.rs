@@ -1,5 +1,5 @@
 use dashmap::DashMap;
-use rimdb_core::id::{RoomId, SchemaId};
+use zemdb_core::id::{RoomId, SchemaId};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -290,7 +290,7 @@ impl RoomManager {
     pub async fn reload_schema_for_rooms(
         &self,
         schema_id: &SchemaId,
-        schema: Arc<rimdb_core::schema::Schema>,
+        schema: Arc<zemdb_core::schema::Schema>,
     ) -> Vec<RoomId> {
         let mut reloaded = Vec::new();
         for kv in self.room_schemas.iter() {

@@ -1,4 +1,4 @@
-use rimdb_core::PrimaryKey;
+use zemdb_core::PrimaryKey;
 use std::ops::{
     Bound, Range, RangeBounds, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive,
 };

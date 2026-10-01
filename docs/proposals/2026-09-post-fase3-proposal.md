@@ -1,8 +1,8 @@
-# PLAN MAESTRO DE MITIGACIÓN Y CORRECCIÓN ARQUITECTÓNICA — RIMDB (POST-FASE 3)
+# PLAN MAESTRO DE MITIGACIÓN Y CORRECCIÓN ARQUITECTÓNICA — ZEMDB (POST-FASE 3)
 **Especificación Técnica de Soluciones, Resolución de Trade-offs y Hoja de Ruta Priorizada**
 
 **Fecha:** 25 de Septiembre de 2026  
-**Proyecto:** `RimDB` (Motor de Base de Datos Distribuida Local-First)  
+**Proyecto:** `ZemDB` (Motor de Base de Datos Distribuida Local-First)  
 **Coordinador Técnico:** Arquitecto Principal de Auditoría  
 **Documento Relacionado:** [`docs/audits/2026-09-post-fase3-audit.md`](../audits/2026-09-post-fase3-audit.md)  
 **Premisa Operativa:** Plan de remediación estricto de **SOLO LECTURA** (sin modificaciones inmediatas al código fuente). Contexto V1 (sin requerimiento de retrocompatibilidad, lo que permite refactorizaciones estructurales profundas de contratos, formatos y traits).
@@ -13,13 +13,13 @@
 
 Habiendo alcanzado la convergencia técnica tras 3 rondas independientes de auditoría multidisciplinar con 4 subagentes especializados, se consolidó un catálogo de **48 defectos técnicos verificados** ([`docs/audits/2026-09-post-fase3-audit.md`](../audits/2026-09-post-fase3-audit.md)).
 
-Este documento define la arquitectura correctiva para erradicar la totalidad de los defectos antes de iniciar la construcción del SDK de cliente en la Fase 4 (`rimdb-client`).
+Este documento define la arquitectura correctiva para erradicar la totalidad de los defectos antes de iniciar la construcción del SDK de cliente en la Fase 4 (`zemdb-client`).
 
 ### Objetivos Centrales de la Remediación
 1. **Garantía Incondicional de Durabilidad y Replicación**: Erradicar el riesgo de pérdida silenciosa de datos en catchup 1-RTT ([`C-01`](../audits/2026-09-post-fase3-audit.md#c-01)), desincronizaciones post-reinicio por Dual-WAL ([`C-04`](../audits/2026-09-post-fase3-audit.md#c-04)) y el descarte de mutaciones en decodificación ([`C-07`](../audits/2026-09-post-fase3-audit.md#c-07)).
 2. **Defensa en Profundidad y Aislamiento de Red**: Blindar el Data Plane con autenticación universal mediante extractores de Axum ([`C-03`](../audits/2026-09-post-fase3-audit.md#c-03)), cerrar la inyección anónima de snapshots ([`C-10`](../audits/2026-09-post-fase3-audit.md#c-10)) y eliminar vulnerabilidades de temporización ([`M-04`](../audits/2026-09-post-fase3-audit.md#m-04)) y backdoors ([`M-05`](../audits/2026-09-post-fase3-audit.md#m-05)).
 3. **No-Bloqueo del Runtime Asíncrono Tokio**: Aislar de forma taxativa todas las llamadas síncronas de disco y la compresión Zstandard fuera de los worker threads de Tokio ([`A-01`](../audits/2026-09-post-fase3-audit.md#a-01)).
-4. **Verdadera Concurrencia Copy-on-Write**: Rediseñar la compactación en `rimdb-storage` para garantizar que las escrituras entrantes jamás sean bloqueadas por la compresión Zstd ([`A-03`](../audits/2026-09-post-fase3-audit.md#a-03)).
+4. **Verdadera Concurrencia Copy-on-Write**: Rediseñar la compactación en `zemdb-storage` para garantizar que las escrituras entrantes jamás sean bloqueadas por la compresión Zstd ([`A-03`](../audits/2026-09-post-fase3-audit.md#a-03)).
 5. **Estandarización y Cohesión de Contratos**: Unificar el formato de snapshot entre motores en memoria y disco ([`A-06`](../audits/2026-09-post-fase3-audit.md#a-06)), incorporar versionado de protocolo wire ([`M-03`](../audits/2026-09-post-fase3-audit.md#m-03)) y corregir interfaces asimétricas ([`M-13`](../audits/2026-09-post-fase3-audit.md#m-13)).
 
 ---
@@ -121,7 +121,7 @@ Este documento define la arquitectura correctiva para erradicar la totalidad de 
 * **Diseño Técnico e Implementación**:
   - Actualizar `FileHeader` para utilizar 4 bytes de su zona `reserved` para almacenar `snapshot_payload_crc32: u32`. En `recover_room`, verificar este CRC antes de descomprimir el payload.
   - Estandarizar la interfaz `StorageEngine::create_snapshot` y `apply_snapshot` para retornar y aceptar un buffer prefijado con cabecera canónica unificada:
-    `[magic: 4B "RMSN"][version: 1B][compression_flag: 1B (0=raw, 1=zstd)][uncompressed_len: 4B][crc32: 4B][payload]`
+    `[magic: 4B "ZMSN"][version: 1B][compression_flag: 1B (0=raw, 1=zstd)][uncompressed_len: 4B][crc32: 4B][payload]`
   - Tanto `MemoryStorageEngine` como `DiskStorageEngine` respetarán este enmarcado, garantizando interoperabilidad transparente entre motores.
 
 #### Solución S-08: Validación de Esquema en Almacenamiento y Optimización de Consultas (`A-08`, `A-09`, `M-13`) [RESUELTO PARA A-09]
@@ -233,7 +233,7 @@ Este documento define la arquitectura correctiva para erradicar la totalidad de 
 * **Diseño Técnico e Implementación**:
   - **[RESUELTO A-15] SnapshotRelay Respaldado en Disco y TTL Configurable**:
     - `SnapshotRelay::new(snapshots_dir, ttl)` ahora exige obligatoriamente un directorio en disco (`data/snapshots/`) para persistir snapshots.
-    - Se incorporó `snapshot_ttl_secs: u64` en `ServerConfig` con soporte en `config.toml` y variable de entorno `RIMDB_SNAPSHOT_TTL_SECS`.
+    - Se incorporó `snapshot_ttl_secs: u64` en `ServerConfig` con soporte en `config.toml` y variable de entorno `ZEMDB_SNAPSHOT_TTL_SECS`.
     - Las subidas se escriben atómicamente con staging `.tmp.<nanos>` y renombrado seguro.
     - `cleanup_expired` purga tanto de la memoria RAM como del disco (`remove_file`), eliminando riesgos de OOM y fugas de almacenamiento.
     - Se implementó `recover_disk_snapshots()` que al reiniciar el servidor recarga snapshots válidos y descarta archivos temporales huérfanos.
@@ -288,13 +288,13 @@ Este documento define la arquitectura correctiva para erradicar la totalidad de 
 ### Trade-Off 5: Estandarización de Formato de Snapshot (Zstd vs. Raw)
 * **Dilema**: Zstandard provee una tasa de compresión superior al 70%, pero en entornos WebAssembly puros la descompresión Zstd introduce sobrecarga de binario.
 * **Resolución**: **Contenedor Polimórfico con Bandera de Compresión**.
-  - *Justificación*: El enmarcado canónico `RMSN` contendrá la bandera `compression_flag`. En entornos nativos de alto rendimiento, `DiskStorageEngine` aplicará Zstd. En entornos de navegador WASM o tests rápidos en memoria, se admitirá compresión nula (`None`), permitiendo que ambos motores interpreten el formato de manera uniforme y sin romper el principio de sustitución de Liskov.
+  - *Justificación*: El enmarcado canónico `ZMSN` contendrá la bandera `compression_flag`. En entornos nativos de alto rendimiento, `DiskStorageEngine` aplicará Zstd. En entornos de navegador WASM o tests rápidos en memoria, se admitirá compresión nula (`None`), permitiendo que ambos motores interpreten el formato de manera uniforme y sin romper el principio de sustitución de Liskov.
 
 ---
 
 ## 4. HOJA DE RUTA PRIORIZADA Y PLAN DE REMEDIACIÓN POR FASES
 
-El plan de corrección se estructurará en tres fases incrementales antes de dar inicio formal a la Fase 4 (`rimdb-client`):
+El plan de corrección se estructurará en tres fases incrementales antes de dar inicio formal a la Fase 4 (`zemdb-client`):
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
@@ -303,7 +303,7 @@ El plan de corrección se estructurará en tres fases incrementales antes de dar
 │  FASE 3.5-A: Integridad Crítica de Datos, Secuenciación y Autenticación      [Semana 1]│
 │  FASE 3.5-B: Concurrencia CoW, Desacoplamiento de I/O y Resiliencia de Red   [Semana 2]│
 │  FASE 3.5-C: Refactorización Estructural, APIs Tipadas y Paridad de Tests    [Semana 3]│
-│  FASE 4.0:   Implementación del SDK de Cliente (rimdb-client)                [Semana 4]│
+│  FASE 4.0:   Implementación del SDK de Cliente (zemdb-client)                [Semana 4]│
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -380,12 +380,12 @@ El plan de corrección se estructurará en tres fases incrementales antes de dar
 ---
 
 ### Fase 4.0: Implementación del SDK de Cliente (`crates/client`)
-Habiendo remediado los 48 defectos de los motores de persistencia y red, se procederá con la arquitectura limpia de `rimdb-client`:
-1. **Configuración y Dependencias**: Sincronizar `crates/client/Cargo.toml` con `rimdb-core`, `rimdb-storage`, `tokio`, `reqwest`, `bytes`, `bincode`.
-2. **Fachada `RimdbClient`**: Gestión de conexiones HTTP/2, pooling de sesiones y manejo transparente de autenticación Bearer con renovación.
+Habiendo remediado los 48 defectos de los motores de persistencia y red, se procederá con la arquitectura limpia de `zemdb-client`:
+1. **Configuración y Dependencias**: Sincronizar `crates/client/Cargo.toml` con `zemdb-core`, `zemdb-storage`, `tokio`, `reqwest`, `bytes`, `bincode`.
+2. **Fachada `ZemdbClient`**: Gestión de conexiones HTTP/2, pooling de sesiones y manejo transparente de autenticación Bearer con renovación.
 3. **Manejadores `RoomHandle` y `TableHandle`**: Interfaz ergonómica para transacciones locales Write-Through, integración con `TableBuffer` para outbox queue local y deduplicación.
 4. **Worker de Sincronización y Stream SSE**: Receptor reactivo de señales `head_advanced` que despierte peticiones `/sync` con backpressure y aplique deltas sobre el `StorageEngine` local.
 
 ---
 
-*Fin del Plan Maestro de Mitigación y Corrección Arquitectónica — RimDB.*
+*Fin del Plan Maestro de Mitigación y Corrección Arquitectónica — ZemDB.*

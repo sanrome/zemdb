@@ -1,4 +1,4 @@
-use rimdb_core::*;
+use zemdb_core::*;
 
 #[test]
 fn test_protocol_rejects_payload_exceeding_max_message_size() {
@@ -272,7 +272,7 @@ fn test_wire_framing_header_and_magic_version_verification() {
 
     let encoded = encode_message(&msg).expect("serialization should succeed");
     assert!(encoded.len() >= 4);
-    assert_eq!(&encoded[0..2], b"RM");
+    assert_eq!(&encoded[0..2], b"ZM");
     assert_eq!(encoded[2], 0x01);
     assert_eq!(encoded[3], 0x00);
 

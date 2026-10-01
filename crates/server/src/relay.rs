@@ -3,9 +3,9 @@ use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
-use rimdb_core::id::{CorrelationId, RoomId, SequenceNumber};
-use rimdb_core::protocol::codec::{decode_message, encode_message};
-use rimdb_core::protocol::messages::{ClientMessage, ErrorCode, ServerMessage};
+use zemdb_core::id::{CorrelationId, RoomId, SequenceNumber};
+use zemdb_core::protocol::codec::{decode_message, encode_message};
+use zemdb_core::protocol::messages::{ClientMessage, ErrorCode, ServerMessage};
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 

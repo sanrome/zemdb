@@ -1,7 +1,7 @@
 use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
-use rimdb_core::id::RoomId;
+use zemdb_core::id::RoomId;
 use std::convert::Infallible;
 use std::time::Duration;
 use tokio::sync::broadcast;

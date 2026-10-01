@@ -1,5 +1,5 @@
 use futures::executor::block_on;
-use rimdb_core::{CryptoConcurrencyBounds, CryptoEngine, NoOpCryptoEngine, RoomId};
+use zemdb_core::{CryptoConcurrencyBounds, CryptoEngine, NoOpCryptoEngine, RoomId};
 
 #[test]
 fn test_noop_crypto_engine_roundtrip_with_aad() {

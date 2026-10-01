@@ -1,4 +1,4 @@
-# Architectural Specification: RimDB (Local-First Distributed Database Engine)
+# Architectural Specification: ZemDB (Local-First Distributed Database Engine)
 
 ## 1. Overview
 The goal of this project is to build a client-centric (**Local-First**) distributed database engine powered by a **minimal, lightweight coordination server**.
@@ -63,7 +63,7 @@ In offline scenarios, the client buffers uncommitted mutations in its local outb
 
 ---
 
-## 5. The Coordination Server (`rimdb-server`)
+## 5. The Coordination Server (`zemdb-server`)
 
 ### 5.1. Core Responsibilities
 1. **Monotonic Sequencer:** Assigns an incremental, globally ordered sequence number (`SequenceNumber`: 1, 2, 3...) per Room.
@@ -156,7 +156,7 @@ Because the server does not store the full persistent historical state and must 
 
 1. **Stateless Ticket Authentication & Registration Handshake:**
    * The application backend authenticates the end-user (OAuth, email/password, etc.) and issues a signed, time-bounded ticket:
-     `auth_token = sign({ client_id, room_id, exp })` using a shared cluster secret (`RIMDB_AUTH_SECRET`, HMAC-SHA256) or asymmetric key pair (Ed25519).
+     `auth_token = sign({ client_id, room_id, exp })` using a shared cluster secret (`ZEMDB_AUTH_SECRET`, HMAC-SHA256) or asymmetric key pair (Ed25519).
    * The client connects and issues `ClientMessage::RegisterClient { correlation_id, room_id, client_id, auth_token, current_seq: Option<SequenceNumber> }`.
    * The server validates the cryptographic signature in microsecond CPU time without querying any database or storing user passwords.
    * The server responds with `ServerMessage::Registered { head_seq, tail_seq, active_snapshot_seq: Option<SequenceNumber>, schema_id, schema }`, delivering room boundary coordinates and the full schema in 1 RTT.
@@ -206,7 +206,7 @@ Dedicated administrative interface intended for application backends, CLI tools,
 To prevent the resource exhaustion of thousands of idle persistent connections:
 * **Pull-Based HTTP/2 Binary Protocol:**
   * Transport: HTTP/2 over TLS with binary payloads serialized via `bincode`.
-  * **Canonical Wire Protocol Framing:** Every network frame is encapsulated in a fixed 4-byte header: Magic bytes `0x52, 0x4D` (`"RM"`), Protocol Version `0x01`, and Reserved Flags `0x00`. The codec validates this header before deserialization, rejecting unknown protocols or version mismatches with `ErrorCode::ProtocolVersionMismatch` (mapped to HTTP 400 `BadRequest`).
+  * **Canonical Wire Protocol Framing:** Every network frame is encapsulated in a fixed 4-byte header: Magic bytes `0x5A, 0x4D` (`"ZM"`), Protocol Version `0x01`, and Reserved Flags `0x00`. The codec validates this header before deserialization, rejecting unknown protocols or version mismatches with `ErrorCode::ProtocolVersionMismatch` (mapped to HTTP 400 `BadRequest`).
   * Wire Efficiency (50%+ Bandwidth Reduction): Replacing string-keyed dictionaries with `CompactRow` and `ColumnUpdate` deltas eliminates column names from the wire, reducing serialized insert/update payloads by 38% to 60%.
   * Multiplexing: Multiple sync/commit streams share a single underlying TCP connection using explicit correlation identifiers (`CorrelationId`).
   * Defensive Bounding: Codecs enforce an explicit message size limit (16 MB) to prevent denial-of-service memory exhaustion attacks.
@@ -232,14 +232,14 @@ To prevent the resource exhaustion of thousands of idle persistent connections:
 
 ---
 
-## 8. Storage Engine (`rimdb-storage`)
+## 8. Storage Engine (`zemdb-storage`)
 
 Persisting data locally on clients and managing snapshots is decoupled into a dedicated storage crate implementing a common `StorageEngine` abstraction:
 * **The `StorageEngine` Contract:**
   * Clean, network-agnostic async persistence contract: `open_room`, `close_room`, `apply_batch`, `get`, `get_by_id`, `scan`, `scan_by_id`, `get_head_seq`, `create_snapshot`, `apply_snapshot`.
   * **Direct ID Queries (`get_by_id` & `scan_by_id`):** Trait methods accept direct numerical table identifiers (`table_id: u16`), eliminating secondary string lookup overhead in the inner query pipeline.
   * **Active Storage Schema Validation:** `StorageEngine::apply_batch` validates every sequenced operation directly against `schema.validate_operation(&op.op)?` across both `MemoryStorageEngine` and `DiskStorageEngine`, preventing corrupt or mismatched rows from being committed to WAL or memory state.
-  * **Universal Canonical Snapshot Envelope (`RMSN`):** Snapshots across all storage engines share a standardized envelope with 4-byte magic `"RMSN"`, version `1`, compression algorithm flag (0 = Raw/Memory, 1 = Zstd/Disk), original uncompressed length, and CRC32 checksum. This guarantees 100% cross-engine snapshot portability: snapshots created by `MemoryStorageEngine` can be applied directly by `DiskStorageEngine` and vice versa with automatic Zstd decompression.
+  * **Universal Canonical Snapshot Envelope (`ZMSN`):** Snapshots across all storage engines share a standardized envelope with 4-byte magic `"ZMSN"`, version `1`, compression algorithm flag (0 = Raw/Memory, 1 = Zstd/Disk), original uncompressed length, and CRC32 checksum. This guarantees 100% cross-engine snapshot portability: snapshots created by `MemoryStorageEngine` can be applied directly by `DiskStorageEngine` and vice versa with automatic Zstd decompression.
   * **Zero-Copy Move Semantics:** `apply_batch` takes `Vec<SequencedOperation>` by ownership value, eliminating redundant cloning between client network pipelines and local storage.
   * **WebAssembly (WASM) Ready:** Defined with conditional concurrency bounds `#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]` and platform-specific `RowStream<'a>` definitions, allowing native execution in single-threaded browser environments (e.g. IndexedDB).
 * **Pushdown Query Capabilities (`ScanOptions`):**
@@ -254,9 +254,9 @@ Persisting data locally on clients and managing snapshots is decoupled into a de
   * Tabular data stored in `BTreeMap<PrimaryKey, CompactRow>` with binary snapshot serialization.
 * **On-Disk Engine (`DiskStorageEngine`) [IMPLEMENTED - Phase 2B & 2.8]:**
   * **Dual-File Architecture:** Separate physical files per room:
-    * `room_{id}.snap`: Immutable base snapshot with 64-byte `RIM1` header, schema fingerprint, and Zstandard block compression.
+    * `room_{id}.snap`: Immutable base snapshot with 64-byte `ZEM1` header, schema fingerprint, and Zstandard block compression.
     * `room_{id}.wal`: Append-only Write-Ahead Log (WAL) containing batched mutational deltas framed with `0xBA7C` magic, payload length, unified CRC32, and operation count.
-  * **Physical WAL Framing in Core, Zero-Filled EOF Detection & Multi-Op Buffering:** Framing definitions and batch codecs are centralized in `rimdb-core` (`protocol::wal_frame`) and shared directly by `rimdb-storage` and `rimdb-server` (Tier 2 Warm Disk Log). When modern thin-provisioned or pre-allocated filesystems crash and leave zero-padded trailing blocks or partial writes at EOF with CRC32 mismatch, `recover_room` and `decode_wal_batch_from_slice` detect terminal failures as a `TornWrite`, cleanly truncating the file in-place to `valid_wal_bytes` without aborting with corruption. `WalReader` buffers multi-operation batches internally in a FIFO queue so sequential record reads never discard operations #2..N of multi-operation batches. During recovery, operations with `op.seq <= snapshot_seq` are strictly skipped to prevent replaying deltas on consolidated snapshot state.
+  * **Physical WAL Framing in Core, Zero-Filled EOF Detection & Multi-Op Buffering:** Framing definitions and batch codecs are centralized in `zemdb-core` (`protocol::wal_frame`) and shared directly by `zemdb-storage` and `zemdb-server` (Tier 2 Warm Disk Log). When modern thin-provisioned or pre-allocated filesystems crash and leave zero-padded trailing blocks or partial writes at EOF with CRC32 mismatch, `recover_room` and `decode_wal_batch_from_slice` detect terminal failures as a `TornWrite`, cleanly truncating the file in-place to `valid_wal_bytes` without aborting with corruption. `WalReader` buffers multi-operation batches internally in a FIFO queue so sequential record reads never discard operations #2..N of multi-operation batches. During recovery, operations with `op.seq <= snapshot_seq` are strictly skipped to prevent replaying deltas on consolidated snapshot state.
   * **Zero-Copy Snapshot Streaming (Anti-4x RAM Spike):** Both in-memory and on-disk snapshot generators serialize tables directly by reference (`RoomSnapshotRef<'a>`) into the Zstandard compressor, eliminating full database allocations and row cloning. Snapshot hydration assigns deserialized table trees (`RoomSnapshotPayload`) directly into memory state without intermediate vector-to-map transformations.
   * **Non-Blocking Background Copy-on-Write (CoW) Compaction:**
     * In-flight writes to `room_{id}.wal` are never blocked during Zstd compression.
@@ -282,7 +282,7 @@ Persisting data locally on clients and managing snapshots is decoupled into a de
 
 ### 9.2. Workspace Layout
 ```text
-rimdb/
+zemdb/
 ├── README.md                    # Project landing, crate architecture, phase status and navigation
 ├── ARCHITECTURE.md              # High-level architectural specification and ADRs
 ├── ROADMAP.md                   # Implementation roadmap, milestone checklists, and backlog
@@ -302,12 +302,12 @@ rimdb/
 ## 10. Architectural Decisions: Time, Ordering & Authority
 
 ### 10.1. Central Server Sequencer as the Sole Authority of Total Order
-A foundational architectural decision of RimDB is that **the coordination server is the single source of truth for global ordering**:
+A foundational architectural decision of ZemDB is that **the coordination server is the single source of truth for global ordering**:
 * **Sequence-Based Total Order:** When an operation is accepted by the Room actor on the server, it is assigned an atomically increasing `SequenceNumber`. The global order of events in the Room is defined 100% by this monotonic sequence number.
 * **No Trust in Client Wall Clocks:** Client devices frequently suffer from clock skew (misconfigured system times, zone errors, drift). To eliminate the risk of a misconfigured device clock dominating or corrupting the room's history, **client timestamps are never used to determine global causal precedence**.
 * **Deterministic Last-Write-Wins (LWW):** In the event of concurrent modifications to the exact same field, the operation with the higher `SequenceNumber` (the one processed later by the server sequencer) takes precedence. This eliminates the necessity of complex Hybrid Logical Clocks (HLC) while guaranteeing absolute convergence across all nodes.
 
-### 10.2. The Three Concepts of Time in RimDB
+### 10.2. The Three Concepts of Time in ZemDB
 To prevent conceptual ambiguity, the architecture distinguishes three independent notions of time:
 1. **`SequenceNumber` (Total Order Authority):** Monotonic integer issued exclusively by the server. Defines causal precedence, commit ordering, and conflict resolution across all clients.
 2. **Mutation `timestamp: u64` (Client Metadata):** Client-generated timestamp attached to mutations for audit/tracing purposes. Not used for causal precedence or local optimistic rebase.

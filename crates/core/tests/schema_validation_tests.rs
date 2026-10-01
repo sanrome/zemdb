@@ -1,4 +1,4 @@
-use rimdb_core::*;
+use zemdb_core::*;
 use std::collections::BTreeMap;
 
 fn sample_schema() -> Schema {

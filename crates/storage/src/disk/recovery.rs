@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 
-use rimdb_core::{
+use zemdb_core::{
     CompactRow, OperationKind, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation,
     Value, BATCH_HEADER_SIZE, BATCH_MAGIC, MAX_MESSAGE_SIZE,
 };
@@ -150,7 +150,7 @@ async fn replay_wal_file(
                 )));
             }
 
-            let ops = match bincode::deserialize::<rimdb_core::protocol::wal_frame::WalBatchPayload>(
+            let ops = match bincode::deserialize::<zemdb_core::protocol::wal_frame::WalBatchPayload>(
                 &payload,
             ) {
                 Ok(batch) => batch.ops,

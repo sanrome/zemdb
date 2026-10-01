@@ -1,7 +1,7 @@
-use rimdb_core::id::{ClientId, MutationId, RoomId, SchemaId, SequenceNumber};
-use rimdb_core::mutation::Operation;
-use rimdb_core::protocol::messages::SequencedOperation;
-use rimdb_core::schema::Schema;
+use zemdb_core::id::{ClientId, MutationId, RoomId, SchemaId, SequenceNumber};
+use zemdb_core::mutation::Operation;
+use zemdb_core::protocol::messages::SequencedOperation;
+use zemdb_core::schema::Schema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{broadcast, oneshot};

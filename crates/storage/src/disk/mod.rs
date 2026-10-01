@@ -5,7 +5,7 @@ pub mod wal;
 
 use async_trait::async_trait;
 use fs2::FileExt;
-use rimdb_core::{
+use zemdb_core::{
     CompactRow, OperationKind, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation,
     Value,
 };
@@ -92,10 +92,10 @@ pub struct DiskRoomState {
     pub is_compacting: bool,
 }
 
-/// High-performance, crash-resilient disk storage engine for RimDB.
+/// High-performance, crash-resilient disk storage engine for ZemDB.
 ///
 /// Implements a Dual-File architecture per room:
-/// - `room_{id}.snap`: Base consolidated snapshot with 64-byte `RIM1` header,
+/// - `room_{id}.snap`: Base consolidated snapshot with 64-byte `ZEM1` header,
 ///   compressed with Zstandard and checksummed.
 /// - `room_{id}.wal`: Append-only Write-Ahead Log (WAL) of delta batches enqueued
 ///   with framing `0xBA7C` and per-batch CRC32.

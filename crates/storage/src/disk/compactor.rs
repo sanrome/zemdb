@@ -1,5 +1,5 @@
 use fs2::FileExt;
-use rimdb_core::{RoomId, SequenceNumber};
+use zemdb_core::{RoomId, SequenceNumber};
 use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::sync::Arc;

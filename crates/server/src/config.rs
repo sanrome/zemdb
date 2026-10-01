@@ -100,34 +100,34 @@ impl ServerConfig {
 
     /// Overrides configuration values from environment variables if present.
     pub fn apply_env_overrides(&mut self) {
-        if let Ok(host) = std::env::var("RIMDB_HOST") {
+        if let Ok(host) = std::env::var("ZEMDB_HOST") {
             self.host = host;
         }
-        if let Ok(port_str) = std::env::var("RIMDB_PORT") {
+        if let Ok(port_str) = std::env::var("ZEMDB_PORT") {
             if let Ok(port) = port_str.parse::<u16>() {
                 self.port = port;
             }
         }
-        if let Ok(data_dir) = std::env::var("RIMDB_DATA_DIR") {
+        if let Ok(data_dir) = std::env::var("ZEMDB_DATA_DIR") {
             self.data_dir = PathBuf::from(data_dir);
         }
-        if let Ok(auth_sec) = std::env::var("RIMDB_AUTH_SECRET") {
+        if let Ok(auth_sec) = std::env::var("ZEMDB_AUTH_SECRET") {
             self.auth_secret = auth_sec;
         }
-        if let Ok(admin_sec) = std::env::var("RIMDB_ADMIN_SECRET") {
+        if let Ok(admin_sec) = std::env::var("ZEMDB_ADMIN_SECRET") {
             self.admin_secret = admin_sec;
         }
-        if let Ok(lease_str) = std::env::var("RIMDB_LEASE_TIMEOUT_SECS") {
+        if let Ok(lease_str) = std::env::var("ZEMDB_LEASE_TIMEOUT_SECS") {
             if let Ok(lease) = lease_str.parse::<u64>() {
                 self.lease_timeout_secs = lease;
             }
         }
-        if let Ok(lru_str) = std::env::var("RIMDB_DEDUP_LRU_CAPACITY") {
+        if let Ok(lru_str) = std::env::var("ZEMDB_DEDUP_LRU_CAPACITY") {
             if let Ok(cap) = lru_str.parse::<usize>() {
                 self.dedup_lru_capacity = cap;
             }
         }
-        if let Ok(snap_str) = std::env::var("RIMDB_SNAPSHOT_TTL_SECS") {
+        if let Ok(snap_str) = std::env::var("ZEMDB_SNAPSHOT_TTL_SECS") {
             if let Ok(snap_ttl) = snap_str.parse::<u64>() {
                 self.snapshot_ttl_secs = snap_ttl;
             }

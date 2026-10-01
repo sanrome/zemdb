@@ -1,4 +1,4 @@
-# INFORME DE EVALUACIÓN TÉCNICA MULTIDISCIPLINAR — RIMDB (FASE 2)
+# INFORME DE EVALUACIÓN TÉCNICA MULTIDISCIPLINAR — ZEMDB (FASE 2)
 
 **Fecha de Evaluación:** 21 de Septiembre de 2026  
 **Estado del Repositorio:** Fases 1 (Core Domain) y 2 (Storage Engine: Memoria & Disco con WAL y Zstd) implementadas; preparación para Fase 3 (Server Actors) y Fase 4 (Client SDK).  
@@ -12,12 +12,12 @@
 
 ## 1. RESUMEN EJECUTIVO Y MAPA GENERAL DE RIESGOS
 
-RimDB es una base de datos distribuida *Local-First* orientada a grupos colaborativos pequeños/medianos (2 a 50 nodos por sala) basada en un servidor coordinador ultraliviano que actúa como secuenciador monótono de orden total y buffer efímero de mutaciones.
+ZemDB es una base de datos distribuida *Local-First* orientada a grupos colaborativos pequeños/medianos (2 a 50 nodos por sala) basada en un servidor coordinador ultraliviano que actúa como secuenciador monótono de orden total y buffer efímero de mutaciones.
 
 La auditoría multidisciplinar concluye unánimemente que **los cimientos de bajo nivel, la densidad de memoria en hardware y la resiliencia en disco alcanzados en las Fases 1 y 2 son excepcionales**:
 * Footprint de tipos estrictamente acotado y alineado a líneas de caché L1 (`PrimaryKey` de 40B, `Value` de 24B, `TableOperation` de 80B).
 * Tuplas posicionales (`CompactRow`) y deltas ordenados (`ColumnUpdate`) que reducen el ancho de banda y el consumo de RAM entre un 38% y un 60%.
-* Formato binario en disco `room_{id}.rimdb` con cabecera fija de 64 bytes (`RIM1`), WAL append-only protegido con sumas de verificación CRC32 y recuperación determinista ante escrituras incompletas (*torn writes*).
+* Formato binario en disco `room_{id}.zemdb` con cabecera fija de 64 bytes (`ZEM1`), WAL append-only protegido con sumas de verificación CRC32 y recuperación determinista ante escrituras incompletas (*torn writes*).
 * Política inquebrantable de `#![forbid(unsafe_code)]` en todo el workspace.
 
 No obstante, la evaluación cruzada detectó **seis riesgos estructurales críticos** que deben subsanarse de inmediato para evitar fallos de escalabilidad, cuellos de botella de latencia y anomalías distribuidas en las Fases 3 y 4:
@@ -142,7 +142,7 @@ No obstante, la evaluación cruzada detectó **seis riesgos estructurales críti
 
 ### 3.1. Fortalezas y Aciertos del Motor de Almacenamiento
 1. **Diseño de Cabecera Binaria (`FileHeader`):**
-   - Exactamente 64 bytes (una línea de caché de CPU), magic bytes `b"RIM1"`, versión `1`, sumas CRC32 que protegen la metadata crítica y 28 bytes reservados para extensiones sin romper compatibilidad.
+   - Exactamente 64 bytes (una línea de caché de CPU), magic bytes `b"ZEM1"`, versión `1`, sumas CRC32 que protegen la metadata crítica y 28 bytes reservados para extensiones sin romper compatibilidad.
 2. **Write-Ahead Log (WAL) con Detección de Corrupción:**
    - Framing robusto `[len: u32][crc32: u32][payload]` con sumas CRC32 validadas por registro contra *bit-rot*.
 3. **Manejo Determinista de *Torn Writes*:**
@@ -152,8 +152,8 @@ No obstante, la evaluación cruzada detectó **seis riesgos estructurales críti
 
 ### 3.2. Vulnerabilidades, Limitaciones y Riesgos Críticos
 1. **Ausencia Crítica de `fsync` sobre el Directorio Contenedor (`data_dir`):**
-   - En POSIX (ext4, XFS, APFS), crear un archivo o ejecutar `rename` atómico modifica la entrada de directorio (*dentry*). RimDB ejecuta `file.sync_all()`, pero **nunca sincroniza el directorio padre**.
-   - *Riesgo:* Ante un corte de energía inmediatamente posterior a la compactación, el archivo `.rimdb` puede desaparecer del árbol del filesystem o corromperse.
+   - En POSIX (ext4, XFS, APFS), crear un archivo o ejecutar `rename` atómico modifica la entrada de directorio (*dentry*). ZemDB ejecuta `file.sync_all()`, pero **nunca sincroniza el directorio padre**.
+   - *Riesgo:* Ante un corte de energía inmediatamente posterior a la compactación, el archivo `.zemdb` puede desaparecer del árbol del filesystem o corromperse.
 2. **Violación de la Atomicidad de Lotes Multi-Operación en WAL:**
    - En `apply_batch`, un lote de mutaciones se escribe como $N$ registros individuales en el WAL. Si ocurre un fallo en medio del lote, las primeras $K$ operaciones se recuperarán como válidas y las restantes $N-K$ se truncarán como torn-write. Se rompe la atomicidad transaccional del lote.
 3. **Compactación Bloqueante "Stop-The-World" y Latency Spikes:**
@@ -167,14 +167,14 @@ No obstante, la evaluación cruzada detectó **seis riesgos estructurales críti
 ### 3.3. Propuestas de Optimización y Evolución Técnica
 * **Compactación No Bloqueante en Segundo Plano (Copy-on-Write):**
   - Al dispararse la compactación, clonar las referencias de las tablas (`Arc<BTreeMap>`) o tomar un snapshot inmutable de memoria.
-  - Delegar la serialización, compresión y escritura del archivo `.rimdb.tmp` a un worker en background sin retener ningún lock de la sala.
+  - Delegar la serialización, compresión y escritura del archivo `.zemdb.tmp` a un worker en background sin retener ningún lock de la sala.
   - Al terminar, adquirir el cerrojo de escritura durante $< 1\text{ ms}$ para anexar los deltas generados durante la compactación y ejecutar el `rename` atómico.
 * **Sincronización Segura del Directorio Padre (`fsync_dir`):**
   - Implementar una utilidad POSIX obligatoria tras la creación de archivos y tras cada `rename`.
 * **Framing Atómico de Lotes en WAL:**
   - Envolver el lote completo en una cabecera transaccional con marcador `0xBA7C` y suma CRC32 global del lote para garantizar semántica todo-o-nada.
 * **File Locking a Nivel de SO (`flock`):**
-  - Bloquear el archivo `room_{id}.rimdb` para impedir que dos procesos locales concurrentes abran la misma sala y corrompan el WAL.
+  - Bloquear el archivo `room_{id}.zemdb` para impedir que dos procesos locales concurrentes abran la misma sala y corrompan el WAL.
 
 ### 3.4. Buenas Prácticas de Motores de BD: Seguidas y Nuevas
 * **Seguidas:** Formato tabular posicional, cabecera con Magic Bytes, checksum CRC32 por registro, truncado de torn-writes, compresión Zstandard.
@@ -243,7 +243,7 @@ No obstante, la evaluación cruzada detectó **seis riesgos estructurales críti
 
 ### 5.1. Fortalezas de la Arquitectura Global
 1. **Clean Architecture y Puertos y Adaptadores:**
-   - `rimdb-core` es 100% puro, determinista y desacoplado de I/O.
+   - `zemdb-core` es 100% puro, determinista y desacoplado de I/O.
    - `trait StorageEngine` desacopla la persistencia física de la lógica de dominio.
 2. **Preparación para WebAssembly:**
    - Traits condicionales `async_trait(?Send)` y dependencias nativas aisladas bajo `cfg(not(target_arch = "wasm32"))`.
@@ -255,7 +255,7 @@ No obstante, la evaluación cruzada detectó **seis riesgos estructurales críti
    - Ningún crate del workspace incluye `tracing`. En un sistema distribuido con actores asíncronos y sincronización reactiva, la falta de spans estructurados imposibilita diagnosticar latencias y fallos en producción.
 2. **Abstracción Faltante para Cifrado E2EE (`CryptoEngine`):**
    - El esquema define `encrypted: bool`, pero no existe un puerto formal `trait CryptoEngine` para inyectar implementaciones nativas (ej. ChaCha20-Poly1305) o de navegador (WebCrypto).
-3. **Peligro de Ruptura de WASM en `rimdb-client`:**
+3. **Peligro de Ruptura de WASM en `zemdb-client`:**
    - `crates/client/Cargo.toml` depende de `tokio` con features completas y `zstd`, lo que romperá la compilación en `wasm32-unknown-unknown` salvo que se introduzcan feature flags explícitos (`native` vs `wasm`).
 4. **Violación de Esquema en `Update` Ciego en Storage:**
    - Si llega un `Update` para un PK inexistente, el almacenamiento actual fabrica una fila sintética rellenada con `Value::Null`, violando restricciones de columnas obligatorias (`nullable: false`).
@@ -263,10 +263,10 @@ No obstante, la evaluación cruzada detectó **seis riesgos estructurales críti
    - Ausencia de structs de configuración deserializables para el servidor y opciones de almacenamiento rígidas.
 
 ### 5.3. Propuestas y Diseño de APIs Públicas
-* **API Pública Declarativa de `rimdb-client` (Fase 4):**
-  - Jerarquía clara: `RimdbClient` -> `RoomHandle` -> `TableHandle`.
+* **API Pública Declarativa de `zemdb-client` (Fase 4):**
+  - Jerarquía clara: `ZemdbClient` -> `RoomHandle` -> `TableHandle`.
   - Soporte de escrituras locales optimistas inmediatas, consultas directas y streams reactivos (`watch(pk)`).
-* **Arquitectura de Actores sin Contención en `rimdb-server` (Fase 3):**
+* **Arquitectura de Actores sin Contención en `zemdb-server` (Fase 3):**
   - `RoomManager` con registro concurrente de actores (`DashMap<RoomId, mpsc::Sender<RoomCommand>>`).
   - `RoomActor` aislado en tarea de Tokio por sala, garantizando secuenciación determinista sin cerrojos globales compartidos.
   - Separación de `crates/server` en `lib.rs` (reutilizable y testeable) y `main.rs` (punto de entrada binario).
@@ -294,8 +294,8 @@ No obstante, la evaluación cruzada detectó **seis riesgos estructurales críti
 
 ## 7. DICTAMEN FINAL DEL COMITÉ
 
-RimDB posee una base arquitectónica y de modelado de datos de **primer nivel mundial**: la densidad en memoria, la estructura tabular posicional y la resiliencia física del formato en disco superan con creces el promedio de la industria.
+ZemDB posee una base arquitectónica y de modelado de datos de **primer nivel mundial**: la densidad en memoria, la estructura tabular posicional y la resiliencia física del formato en disco superan con creces el promedio de la industria.
 
-Las debilidades identificadas son subsanables y constituyen el paso natural para elevar RimDB de un prototipo de alta fidelidad a un **motor de persistencia y coordinación distribuida de grado industrial**. 
+Las debilidades identificadas son subsanables y constituyen el paso natural para elevar ZemDB de un prototipo de alta fidelidad a un **motor de persistencia y coordinación distribuida de grado industrial**. 
 
 En el documento complementario **[PROPOSAL.md](file:///Users/Santiago/OtherProjects/client-distributed-db/PROPOSAL.md)** se presenta el plan técnico unificado que compatibiliza todas las recomendaciones de los especialistas y detalla la estructura modular definitiva para las Fases 3 y 4.

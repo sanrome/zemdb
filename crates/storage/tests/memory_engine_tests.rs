@@ -1,8 +1,8 @@
-use rimdb_core::{
+use zemdb_core::{
     ColumnUpdate, CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequenceNumber,
     SequencedOperation, TableSchema, Value,
 };
-use rimdb_storage::{MemoryStorageEngine, StorageEngine, StorageError};
+use zemdb_storage::{MemoryStorageEngine, StorageEngine, StorageError};
 use std::sync::Arc;
 
 const USERS_TABLE: u16 = 0;

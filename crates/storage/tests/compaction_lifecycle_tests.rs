@@ -1,8 +1,8 @@
-use rimdb_core::{
+use zemdb_core::{
     ColumnUpdate, CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequenceNumber,
     SequencedOperation, TableSchema, Value,
 };
-use rimdb_storage::{DiskStorageEngine, DiskStorageOptions, StorageEngine};
+use zemdb_storage::{DiskStorageEngine, DiskStorageOptions, StorageEngine};
 use std::sync::Arc;
 
 const USERS_TABLE: u16 = 0;
@@ -375,7 +375,7 @@ async fn test_crash_recovery_during_compaction_window_after_snapshot_rename() {
             Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 100),
         ));
     }
-    let compacting_bytes = rimdb_storage::format::encode_wal_batch(&compacting_ops, None).unwrap();
+    let compacting_bytes = zemdb_storage::format::encode_wal_batch(&compacting_ops, None).unwrap();
     let compacting_path = temp_dir
         .path()
         .join(format!("room_{}.wal.compacting", room_id.as_str()));
@@ -396,7 +396,7 @@ async fn test_crash_recovery_during_compaction_window_after_snapshot_rename() {
             Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 200),
         ));
     }
-    let wal_bytes = rimdb_storage::format::encode_wal_batch(&wal_ops, None).unwrap();
+    let wal_bytes = zemdb_storage::format::encode_wal_batch(&wal_ops, None).unwrap();
     let wal_path = temp_dir
         .path()
         .join(format!("room_{}.wal", room_id.as_str()));
@@ -474,7 +474,7 @@ async fn test_crash_recovery_during_compaction_window_before_snapshot_rename() {
             Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 200),
         ));
     }
-    let compacting_bytes = rimdb_storage::format::encode_wal_batch(&compacting_ops, None).unwrap();
+    let compacting_bytes = zemdb_storage::format::encode_wal_batch(&compacting_ops, None).unwrap();
     let compacting_path = temp_dir
         .path()
         .join(format!("room_{}.wal.compacting", room_id.as_str()));
@@ -504,7 +504,7 @@ async fn test_crash_recovery_during_compaction_window_before_snapshot_rename() {
             Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 300),
         ));
     }
-    let wal_bytes = rimdb_storage::format::encode_wal_batch(&wal_ops, None).unwrap();
+    let wal_bytes = zemdb_storage::format::encode_wal_batch(&wal_ops, None).unwrap();
     let wal_path = temp_dir
         .path()
         .join(format!("room_{}.wal", room_id.as_str()));

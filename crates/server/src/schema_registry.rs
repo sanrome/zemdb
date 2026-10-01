@@ -1,6 +1,6 @@
 use dashmap::DashMap;
-use rimdb_core::schema::{ColumnDef, Schema};
-use rimdb_core::SchemaId;
+use zemdb_core::schema::{ColumnDef, Schema};
+use zemdb_core::SchemaId;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;

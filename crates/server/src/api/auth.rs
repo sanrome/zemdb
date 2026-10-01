@@ -2,7 +2,7 @@ use axum::extract::{FromRef, FromRequestParts};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
-use rimdb_core::id::{ClientId, RoomId};
+use zemdb_core::id::{ClientId, RoomId};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 

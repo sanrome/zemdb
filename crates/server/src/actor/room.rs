@@ -1,6 +1,6 @@
-use rimdb_core::id::{MutationId, RoomId, SchemaId, SequenceNumber};
-use rimdb_core::protocol::messages::SequencedOperation;
-use rimdb_core::schema::Schema;
+use zemdb_core::id::{MutationId, RoomId, SchemaId, SequenceNumber};
+use zemdb_core::protocol::messages::SequencedOperation;
+use zemdb_core::schema::Schema;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -247,10 +247,10 @@ impl RoomActor {
 
     fn handle_commit(
         &mut self,
-        client_id: rimdb_core::id::ClientId,
+        client_id: zemdb_core::id::ClientId,
         mutation_id: MutationId,
         last_ack_seq: SequenceNumber,
-        op: rimdb_core::mutation::Operation,
+        op: zemdb_core::mutation::Operation,
         reply: tokio::sync::oneshot::Sender<Result<CommitResponse, ServerError>>,
     ) {
         // 0. Check if client is registered in the room roster
@@ -351,7 +351,7 @@ impl RoomActor {
 
     fn handle_sync(
         &mut self,
-        client_id: rimdb_core::id::ClientId,
+        client_id: zemdb_core::id::ClientId,
         from_seq: SequenceNumber,
         max_batch_size: u32,
         reply: tokio::sync::oneshot::Sender<Result<SyncBatchResponse, ServerError>>,
@@ -403,7 +403,7 @@ impl RoomActor {
 
     fn handle_ack(
         &mut self,
-        client_id: rimdb_core::id::ClientId,
+        client_id: zemdb_core::id::ClientId,
         ack_seq: SequenceNumber,
         reply: tokio::sync::oneshot::Sender<Result<SequenceNumber, ServerError>>,
     ) {

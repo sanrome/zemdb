@@ -3,7 +3,7 @@ pub mod state;
 pub use state::{RoomSnapshotPayload, RoomSnapshotRef, RoomState};
 
 use async_trait::async_trait;
-use rimdb_core::{
+use zemdb_core::{
     CompactRow, OperationKind, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation,
     Value,
 };

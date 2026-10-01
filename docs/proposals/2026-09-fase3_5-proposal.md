@@ -13,7 +13,7 @@
 
 A partir del Inventario Exhaustivo de Defectos consolidado tras la auditoría técnica iterativa e independiente (57 defectos canónicos únicos catalogados), este documento establece la especificación técnica de las soluciones, dirime las compensaciones (*trade-offs*) arquitectónicas entre las propuestas de los subagentes especializados y articula una hoja de ruta estructurada en 4 subfases prioritarias.
 
-Conforme a las directrices de diseño de RimDB (v1, sin restricciones de retrocompatibilidad), todas las soluciones se diseñan apuntando a la máxima corrección formal, durabilidad estricta (ACID/ARIES), rendimiento libre de alocaciones redundantes y desacoplamiento limpio entre planos y capas.
+Conforme a las directrices de diseño de ZemDB (v1, sin restricciones de retrocompatibilidad), todas las soluciones se diseñan apuntando a la máxima corrección formal, durabilidad estricta (ACID/ARIES), rendimiento libre de alocaciones redundantes y desacoplamiento limpio entre planos y capas.
 
 ---
 
@@ -119,7 +119,7 @@ Conforme a las directrices de diseño de RimDB (v1, sin restricciones de retroco
 * **Solución Técnica**: Interceptar subidas de snapshot en el relay despachando validación al actor de la sala:
   1. Validar que la sala exista en `RoomManager`.
   2. Verificar que `snapshot_head_seq` esté acotado: $\text{tail\_seq} \le \text{snapshot\_head\_seq} \le \text{head\_seq}$.
-  3. Comprobar que el payload cumpla con la cabecera canónica `RMSN` y coincida su checksum CRC32 antes de indexarlo en `SnapshotRelay`.
+  3. Comprobar que el payload cumpla con la cabecera canónica `ZMSN` y coincida su checksum CRC32 antes de indexarlo en `SnapshotRelay`.
 
 #### DEF-11: Enmarcado Binario Uniforme en Respuestas de Error de Chunks
 * **Componentes**: `crates/server/src/relay.rs`.
@@ -229,7 +229,7 @@ Conforme a las directrices de diseño de RimDB (v1, sin restricciones de retroco
 * **DEF-54 (Zstd en WebAssembly)**: Integrar una implementación Zstandard pura en Rust (`ruzstd`) condicionada a `cfg(target_arch = "wasm32")`.
 * **DEF-55 (Reaper de salas inactivas)**: Implementar auto-apagado de actores Tokio tras 15 minutos sin clientes conectados ni comandos.
 * **DEF-56 (Proyección CompactRow)**: Definir `ProjectedRow` o rellenar con `Value::Null` las columnas omitidas para preservar la correspondencia DDL.
-* **DEF-57 (Dependencias rimdb-client)**: Declarar `rimdb-storage` en `crates/client/Cargo.toml` y aislar Tokio y Zstd bajo `cfg(not(target_arch = "wasm32"))`.
+* **DEF-57 (Dependencias zemdb-client)**: Declarar `zemdb-storage` en `crates/client/Cargo.toml` y aislar Tokio y Zstd bajo `cfg(not(target_arch = "wasm32"))`.
 
 ---
 
@@ -259,9 +259,9 @@ Conforme a las directrices de diseño de RimDB (v1, sin restricciones de retroco
 * **Conflicto**: Permitir la mutación del esquema en caliente en un motor de almacenamiento abierto puede inducir condiciones de carrera en validaciones posicionales concurrentes.
 * **Resolución**: Utilizar punteros atómicos inmutables `Arc<Schema>`. `StorageEngine::reload_schema` valida que el nuevo esquema sea estrictamente compatible (append-only) y reemplaza el puntero atómicamente bajo el cerrojo de la sala, garantizando que transacciones en vuelo lean una instantánea consistente sin riesgo de lecturas corruptas.
 
-### 3.4. Trade-off 4: Portabilidad Universal de Snapshots `RMSN` vs. Dependencias Nativas de C
+### 3.4. Trade-off 4: Portabilidad Universal de Snapshots `ZMSN` vs. Dependencias Nativas de C
 * **Conflicto**: La biblioteca estándar `zstd` depende de código C no compilable en `wasm32-unknown-unknown` (DEF-54). Desactivar la compresión en WASM rompe la interoperabilidad con nodos nativos.
-* **Resolución**: Incorporar la biblioteca `ruzstd` (descompresor Zstd puro en Rust) bajo el target `wasm32`. De este modo, los navegadores pueden descomprimir snapshots generados por servidores nativos sin necesidad de alterar el formato canónico `RMSN`.
+* **Resolución**: Incorporar la biblioteca `ruzstd` (descompresor Zstd puro en Rust) bajo el target `wasm32`. De este modo, los navegadores pueden descomprimir snapshots generados por servidores nativos sin necesidad de alterar el formato canónico `ZMSN`.
 
 ### 3.5. Trade-off 5: Avance de Cursor de Retención en `Commit` vs. Desacoplamiento de ACK
 * **Conflicto**: En la Fase 3 se desacopló `Ack` de `Commit` para evitar avances prematuros de cursor. Sin embargo, no registrar `last_ack_seq` en `Commit` congela la poda proactiva para clientes en Write-Through activo (DEF-16).
@@ -337,7 +337,7 @@ El plan maestro se estructura en 4 subfases de implementación secuencial:
   - Test de evolución de esquema DDL en cliente local verificando la aplicación continua de mutaciones.
 
 ### Fase 3.6-D: Robustez de Dominio, Encapsulamiento, Portabilidad WASM y Rendimiento Zero-Copy (Prioridad Media)
-* **Objetivo**: Perfeccionar el encapsulamiento de contratos en `rimdb-core`, habilitar soporte WebAssembly y erradicar alocaciones superfluas.
+* **Objetivo**: Perfeccionar el encapsulamiento de contratos en `zemdb-core`, habilitar soporte WebAssembly y erradicar alocaciones superfluas.
 * **Defectos a Subsanar**: `DEF-09`, `DEF-13`, `DEF-14`, `DEF-15`, `DEF-20`, `DEF-21`, `DEF-24`, `DEF-25`, `DEF-30`, `DEF-31`, `DEF-32`, `DEF-33`, `DEF-37`, `DEF-39`, `DEF-45`, `DEF-47`, `DEF-54`, `DEF-56`, `DEF-57`.
 * **Entregables de Código**:
   1. Validación estricta en `decode_wal_record_from_slice` y soporte de `MutationId` en `WalReader` (DEF-09, DEF-45).
@@ -350,11 +350,11 @@ El plan maestro se estructura en 4 subfases de implementación secuencial:
   8. Límite DoS en deserialización WAL y validación de tamaño en descompresión de snapshots (DEF-32, DEF-39).
   9. Poda periódica de RAM en reposo dentro de `run_maintenance` (DEF-37).
   10. Corrección de nomenclatura `table: &str` en `StorageEngine::scan` (DEF-47).
-  11. Integración de `ruzstd` en `rimdb-storage` para descompresión de snapshots en `wasm32` (DEF-54).
+  11. Integración de `ruzstd` en `zemdb-storage` para descompresión de snapshots en `wasm32` (DEF-54).
   12. Formalización de `ProjectedRow` en projection pushdown (DEF-56).
   13. Declaración de dependencias y aislamiento por target en `crates/client/Cargo.toml` (DEF-57).
 * **Pruebas de Verificación**:
-  - Compilación cruzada exitosa para target `wasm32-unknown-unknown` de `rimdb-storage` y `rimdb-client`.
+  - Compilación cruzada exitosa para target `wasm32-unknown-unknown` de `zemdb-storage` y `zemdb-client`.
   - Tests unitarios de encapsulamiento e integridad de squashing y projection pushdown.
 
 ---

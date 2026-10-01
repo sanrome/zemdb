@@ -1,15 +1,15 @@
 use axum::http::StatusCode;
 use futures::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-use rimdb_core::*;
-use rimdb_server::actor::command::RoomMetrics;
-use rimdb_server::actor::manager::{RoomManager, RoomMetadata};
-use rimdb_server::api::auth::generate_client_token;
-use rimdb_server::api::control_plane::{AddColumnRequest, CreateRoomRequest, CreateSchemaRequest};
-use rimdb_server::api::router::{build_router, AppState};
-use rimdb_server::config::ServerConfig;
-use rimdb_server::relay::SnapshotRelay;
-use rimdb_server::schema_registry::SchemaRegistry;
+use zemdb_core::*;
+use zemdb_server::actor::command::RoomMetrics;
+use zemdb_server::actor::manager::{RoomManager, RoomMetadata};
+use zemdb_server::api::auth::generate_client_token;
+use zemdb_server::api::control_plane::{AddColumnRequest, CreateRoomRequest, CreateSchemaRequest};
+use zemdb_server::api::router::{build_router, AppState};
+use zemdb_server::config::ServerConfig;
+use zemdb_server::relay::SnapshotRelay;
+use zemdb_server::schema_registry::SchemaRegistry;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -543,7 +543,7 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
     let room_sender = server.room_manager.get_room(&room_id).unwrap();
     let (cur_tx, cur_rx) = tokio::sync::oneshot::channel();
     room_sender
-        .send(rimdb_server::RoomCommand::GetClientCursor {
+        .send(zemdb_server::RoomCommand::GetClientCursor {
             client_id: reader.clone(),
             reply: cur_tx,
         })
@@ -583,7 +583,7 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
     // Now reader's recorded cursor in server is 3!
     let (cur_tx2, cur_rx2) = tokio::sync::oneshot::channel();
     room_sender
-        .send(rimdb_server::RoomCommand::GetClientCursor {
+        .send(zemdb_server::RoomCommand::GetClientCursor {
             client_id: reader.clone(),
             reply: cur_tx2,
         })
@@ -698,7 +698,7 @@ async fn test_data_plane_heartbeat_and_deregister() {
     let room_sender = server.room_manager.get_room(&room_id).unwrap();
     let (tx, rx) = tokio::sync::oneshot::channel();
     room_sender
-        .send(rimdb_server::RoomCommand::GetClientCursor {
+        .send(zemdb_server::RoomCommand::GetClientCursor {
             client_id,
             reply: tx,
         })
@@ -1501,7 +1501,7 @@ async fn test_sse_schema_reloaded_event_emission() {
 
 #[test]
 fn test_client_lease_disconnected_to_dormant_timeout() {
-    use rimdb_server::actor::lease::{ClientLeaseTracker, ClientState};
+    use zemdb_server::actor::lease::{ClientLeaseTracker, ClientState};
     use std::time::Instant;
 
     let dir = tempdir().unwrap();

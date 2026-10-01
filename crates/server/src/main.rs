@@ -1,4 +1,4 @@
-use rimdb_server::{
+use zemdb_server::{
     build_router, AppState, RoomManager, SchemaRegistry, ServerConfig, SnapshotRelay,
 };
 use std::env;
@@ -42,11 +42,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         host = %config.host,
         port = config.port,
         data_dir = ?config.data_dir,
-        "RimDB coordination server listening on http://{}",
+        "ZemDB coordination server listening on http://{}",
         addr
     );
 
-    println!("RimDB coordination server listening on http://{}", addr);
+    println!("ZemDB coordination server listening on http://{}", addr);
 
     axum::serve(listener, app).await?;
 

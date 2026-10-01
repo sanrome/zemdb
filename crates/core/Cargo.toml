@@ -1,5 +1,5 @@
 [package]
-name = "rimdb-core"
+name = "zemdb-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

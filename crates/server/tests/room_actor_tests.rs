@@ -1,5 +1,5 @@
-use rimdb_core::*;
-use rimdb_server::{
+use zemdb_core::*;
+use zemdb_server::{
     CommitResponse, RegisterResponse, RoomCommand, RoomEvent, RoomLifecyclePolicy, RoomManager,
     SchemaRegistry, ServerConfig, ServerError, SnapshotRelay, SyncBatchResponse,
 };

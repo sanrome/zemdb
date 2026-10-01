@@ -1,4 +1,4 @@
-# PROPUESTA TÉCNICA UNIFICADA Y ESTRUCTURA DETALLADA DEL PROYECTO — RIMDB
+# PROPUESTA TÉCNICA UNIFICADA Y ESTRUCTURA DETALLADA DEL PROYECTO — ZEMDB
 
 **Documento:** Propuesta de Arquitectura, Estructura Modular y Plan de Ejecución  
 **Fecha:** 21 de Septiembre de 2026  
@@ -13,10 +13,10 @@ A partir de las deliberaciones de los cuatro especialistas técnicos (Rust de Si
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
-│                        ARQUITECTURA CANÓNICA UNIFICADA RIMDB                           │
+│                        ARQUITECTURA CANÓNICA UNIFICADA ZEMDB                           │
 ├────────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                        │
-│   [ rimdb-core ] (Zero I/O, WASM nativo, dominio puro)                                 │
+│   [ zemdb-core ] (Zero I/O, WASM nativo, dominio puro)                                 │
 │    ├── Dominio: RoomId, ClientId, SequenceNumber, MutationId, CorrelationId           │
 │    ├── Modelado: Value (24B), CompactRow, PrimaryKey (40B, L1), TableOperation (80B)   │
 │    ├── Esquemas: TableSchema, ColumnDef, validación estricta y aridad                 │
@@ -24,21 +24,21 @@ A partir de las deliberaciones de los cuatro especialistas técnicos (Rust de Si
 │    ├── Criptografía: trait CryptoEngine (E2EE agnóstico a transporte)                  │
 │    └── Protocolo: Mensajes binarios Bincode con límite de 16MB y Echo Cancellation     │
 │                                                                                        │
-│   [ rimdb-storage ] (Persistencia tabular, índices y snapshots)                        │
+│   [ zemdb-storage ] (Persistencia tabular, índices y snapshots)                        │
 │    ├── trait StorageEngine (Async, zero-copy move semantics, universal)                │
 │    ├── MemoryStorageEngine (Aislamiento por sala para WASM y tests)                    │
-│    └── DiskStorageEngine (Nativo WAL con CRC32, cabecera RIM1, compactación CoW)       │
+│    └── DiskStorageEngine (Nativo WAL con CRC32, cabecera ZEM1, compactación CoW)       │
 │                                                                                        │
-│   [ rimdb-server ] (Coordinador y secuenciador monótono)                               │
+│   [ zemdb-server ] (Coordinador y secuenciador monótono)                               │
 │    ├── Capa de Red: Axum HTTP/2 (/commit, /sync, /heartbeat) + SSE (Signal Only)       │
 │    ├── Concurrencia: Tokio RoomActor dedicado por sala (Cero cerraduras globales)      │
 │    ├── Durabilidad: Micro-WAL en disco para (seq, mutation_id, client_id)              │
 │    ├── Amortiguación: CompactionBuffer en RAM + Dead Man's Switch (Leases 90s)         │
 │    └── Observabilidad: Tracing estructurado y correlación con CorrelationId            │
 │                                                                                        │
-│   [ rimdb-client ] (SDK Canónico y Reactivo)                                           │
-│    ├── Fachada Pública: RimdbClient -> RoomHandle -> TableHandle                       │
-│    ├── Persistencia Canónica: Delegada a rimdb-storage (Disk o Memory)                 │
+│   [ zemdb-client ] (SDK Canónico y Reactivo)                                           │
+│    ├── Fachada Pública: ZemdbClient -> RoomHandle -> TableHandle                       │
+│    ├── Persistencia Canónica: Delegada a zemdb-storage (Disk o Memory)                 │
 │    ├── Sincronización en 1 RTT: Commit con validación server-side + deltas integrados  │
 │    ├── Consistencia Total: Cero riesgo de corrupción local por rechazo de mutación     │
 │    ├── Transporte Dual: Reqwest HTTP/2 (Nativo) vs WebFetch (WASM)                     │
@@ -86,13 +86,13 @@ A partir de las deliberaciones de los cuatro especialistas técnicos (Rust de Si
 * **Problema Resuelto:** Retener el `RwLockWriteGuard` durante la compresión Zstd y el `sync_all` congelaba todo el motor de almacenamiento ("stop-the-world").
 * **Decisión:**
   1. Al alcanzarse el umbral de compactación, el hilo de almacenamiento clona la vista inmutable de las tablas (`Arc<BTreeMap>`) y captura `compacting_seq = head_seq`.
-  2. La serialización Bincode, la compresión Zstd y la escritura en `.rimdb.tmp` se ejecutan en segundo plano vía `tokio::task::spawn_blocking`, sin retener cerrojos sobre `DiskRoomState`.
+  2. La serialización Bincode, la compresión Zstd y la escritura en `.zemdb.tmp` se ejecutan en segundo plano vía `tokio::task::spawn_blocking`, sin retener cerrojos sobre `DiskRoomState`.
   3. Las lecturas y escrituras continúan operando normalmente sobre el archivo activo.
   4. Al concluir la tarea en background, se toma el cerrojo de escritura durante menos de $1\text{ ms}$ para anexar los deltas generados entre `compacting_seq` y el nuevo `head_seq`, ejecutar `rename` atómico y sustituir el descriptor de archivo.
 
 ### 2.5. Resolución de Durabilidad POSIX: Sincronización de Directorio (`fsync_dir`)
 * **Problema Resuelto:** Cortes de energía tras `rename` o creación de archivos provocaban la pérdida de la entrada de directorio (*dentry*) en sistemas POSIX.
-* **Decisión:** Implementar la función de sistema `sync_dir(&path)` invocada obligatoriamente tras la creación del archivo `room_{id}.rimdb` y tras cada `rename` atómico de compactación.
+* **Decisión:** Implementar la función de sistema `sync_dir(&path)` invocada obligatoriamente tras la creación del archivo `room_{id}.zemdb` y tras cada `rename` atómico de compactación.
 
 ### 2.6. Resolución de Integridad de Lotes: Enmarcado Atómico de Lote en WAL
 * **Problema Resuelto:** Un corte de energía en medio de un lote multi-operación recuperaba deltas parciales.
@@ -120,7 +120,7 @@ A partir de las deliberaciones de los cuatro especialistas técnicos (Rust de Si
 A continuación se detalla la estructura modular definitiva de todo el workspace, agrupada por responsabilidades limpias:
 
 ```text
-rimdb/
+zemdb/
 ├── Cargo.toml                       # Manifest raíz con workspaces, lints y dependencias
 ├── ARCHITECTURE.md                  # Especificación arquitectónica y ADRs
 ├── ROADMAP.md                       # Hoja de ruta de desarrollo actualizada
@@ -131,7 +131,7 @@ rimdb/
 │   └── proposals/                   # Propuestas técnicas detalladas
 │
 └── crates/
-    ├── core/                        # [rimdb-core] Dominio Puro, Zero I/O, WASM
+    ├── core/                        # [zemdb-core] Dominio Puro, Zero I/O, WASM
     │   ├── Cargo.toml
     │   ├── tests/                   # Pruebas de integración externas
     │   └── src/
@@ -143,7 +143,7 @@ rimdb/
     │       ├── mutation/            # op.rs (TableOperation 80B, Operation 96B), squash.rs, buffer.rs
     │       └── protocol/            # messages.rs (Deregister, Origin Attribution), codec.rs (16MB DoS limit, tracing)
     │
-    ├── storage/                     # [rimdb-storage] Persistencia Tabular y Snapshots
+    ├── storage/                     # [zemdb-storage] Persistencia Tabular y Snapshots
     │   ├── Cargo.toml               # Features: default = ["native"], wasm = []
     │   ├── tests/                   # Pruebas de integración externas
     │   └── src/
@@ -152,11 +152,11 @@ rimdb/
     │       ├── engine.rs            # Definición formal de StorageEngine y RowStream
     │       ├── options.rs           # KeyRange, ScanDirection, ScanOptions (Limit/Projection)
     │       ├── memory/              # MemoryStorageEngine (Aislamiento concurrente por sala)
-    │       ├── disk/                # DiskStorageEngine (Format RIM1 64B, WAL, recovery, compactor CoW)
+    │       ├── disk/                # DiskStorageEngine (Format ZEM1 64B, WAL, recovery, compactor CoW)
     │       ├── index/               # PrimaryIndex en memoria y extensiones de indexado
     │       └── sys.rs               # Utilidades de bajo nivel: fsync_dir (sync_dir)
     │
-    ├── server/                      # [rimdb-server] Secuenciador y Coordinador (Fase 3)
+    ├── server/                      # [zemdb-server] Secuenciador y Coordinador (Fase 3)
     │   ├── Cargo.toml
     │   └── src/
     │       ├── lib.rs               # Biblioteca reutilizable del servidor (facilita tests)
@@ -180,7 +180,7 @@ rimdb/
     │           ├── handlers.rs      # Handlers: /commit, /sync, /heartbeat, /register
     │           └── sse.rs           # Canal de señalización liviana (Signal-Only SSE)
     │
-    └── client/                      # [rimdb-client] SDK Canónico y Reactivo (Fase 4)
+    └── client/                      # [zemdb-client] SDK Canónico y Reactivo (Fase 4)
         ├── Cargo.toml               # Features: default = ["native"], wasm = ["web-sys", ...]
         └── src/
             ├── lib.rs               # Exports públicos del SDK
@@ -188,7 +188,7 @@ rimdb/
             ├── error.rs             # ClientError (ValidationError, NetworkError, StorageError)
             ├── api/                 # Fachada pública ergonómica
             │   ├── mod.rs
-            │   ├── client.rs        # RimdbClient (Gestor global de conexión y salas)
+            │   ├── client.rs        # ZemdbClient (Gestor global de conexión y salas)
             │   ├── room.rs          # RoomHandle (Contexto de una sala activa)
             │   └── table.rs         # TableHandle (Operaciones CRUD, Scans y Live Queries)
             ├── sync/                # Motor de sincronización canónica en 1 RTT
@@ -259,7 +259,7 @@ En `crates/storage/src/memory/state.rs` y `disk/mod.rs`: Si llega un `Update` pa
 
 #### A. Jerarquía Ergonómica de API de Usuario:
 ```rust
-let client = RimdbClient::open(config, storage_engine).await?;
+let client = ZemdbClient::open(config, storage_engine).await?;
 let room = client.room(RoomId::new("engineering_team")).await?;
 let tasks = room.table("tasks")?;
 
@@ -293,7 +293,7 @@ flowchart TD
         M6["1.6 Observabilidad Transversal (Tracing en Storage y Lints Clippy)"]
     end
 
-    subgraph Fase3["Fase 3: Servidor Coordinador y Secuenciador (rimdb-server) [ACTIVA]"]
+    subgraph Fase3["Fase 3: Servidor Coordinador y Secuenciador (zemdb-server) [ACTIVA]"]
         S1["3.1 Modularización de server (lib.rs + main.rs)"]
         S2["3.2 Tokio RoomActor aislado por sala y RoomManager"]
         S3["3.3 Micro-WAL durable en disco (seq, mutation_id, client_id)"]
@@ -302,9 +302,9 @@ flowchart TD
         S6["3.6 Suite de Tests de Integración Multi-Cliente"]
     end
 
-    subgraph Fase4["Fase 4: SDK Canónico y Reactivo (rimdb-client)"]
+    subgraph Fase4["Fase 4: SDK Canónico y Reactivo (zemdb-client)"]
         C1["4.1 Configuración de Features (native vs wasm)"]
-        C2["4.2 Fachada Pública Ergonómica (RimdbClient, RoomHandle, TableHandle)"]
+        C2["4.2 Fachada Pública Ergonómica (ZemdbClient, RoomHandle, TableHandle)"]
         C3["4.3 Sincronización Server-Authoritative en 1 RTT (Write-Through)"]
         C4["4.4 Persistencia Canónica Directa en StorageEngine"]
         C5["4.5 Syncer en Background con Exponential Backoff y Full Jitter"]
@@ -317,9 +317,9 @@ flowchart TD
 
 ---
 
-### Paso 2: Fase 3 — Servidor Coordinador y Secuenciador (`rimdb-server`)
+### Paso 2: Fase 3 — Servidor Coordinador y Secuenciador (`zemdb-server`)
 
-* **3.1. Modularización del Crate `rimdb-server`:**
+* **3.1. Modularización del Crate `zemdb-server`:**
   * Separar el crate en `src/lib.rs` (biblioteca reusable con lógica de actores y handlers para pruebas de integración completas) y `src/main.rs` (entrypoint CLI binario que parsea configuración y levanta el servidor).
   * Implementar struct deserializable `ServerConfig` con soporte para configuración por TOML y variables de entorno.
 * **3.2. Arquitectura de Concurrencia por Actores Tokio (`RoomActor`):**
@@ -331,7 +331,7 @@ flowchart TD
   * Implementar `CompactionBuffer` en memoria respaldado por `BTreeMap<SequenceNumber, SequencedOperation>` e índice rápido de claves primarias.
   * **Squash de Servidor:** Parametrizar `TableBuffer` con política `server_squash_table_operations` (orden autoritativo por secuencia/llegada) para que el `RoomActor` no aplique LWW de cliente.
   * **Compactación CoW sin Pausa:** El actor clona la vista inmutable (`Arc<BTreeMap>`) y libera el lock de la sala de inmediato para seguir procesando escrituras en el WAL mientras Zstd comprime en `spawn_blocking`, re-adquiriéndolo solo $< 1\text{ ms}$ al final para volcar los deltas acumulados y renombrar.
-  * **Preservación Atómica de `flock`:** Tomar el bloqueo exclusivo sobre `.rimdb.tmp` *antes* del `rename` para que el nuevo inodo ya nazca bloqueado a nivel de sistema operativo sin micro-ventanas de carrera.
+  * **Preservación Atómica de `flock`:** Tomar el bloqueo exclusivo sobre `.zemdb.tmp` *antes* del `rename` para que el nuevo inodo ya nazca bloqueado a nivel de sistema operativo sin micro-ventanas de carrera.
   * Implementar `ClientLeaseTracker` con *Dead Man's Switch* (timeout de 90s) para degradar a clientes inactivos a estado `Dormant`, liberando el cómputo de `min_ack_seq` y permitiendo la poda continua de la RAM.
 * **3.5. Capa de Red Axum HTTP/2 y Canal Liviano SSE:**
   * Implementar handlers HTTP/2: `POST /rooms/:room_id/commit`, `POST /rooms/:room_id/sync`, `POST /rooms/:room_id/heartbeat`, `POST /rooms/:room_id/register` y `POST /rooms/:room_id/deregister`.
@@ -341,13 +341,13 @@ flowchart TD
 
 ---
 
-### Paso 3: Fase 4 — SDK Canónico y Reactivo (`rimdb-client`)
+### Paso 3: Fase 4 — SDK Canónico y Reactivo (`zemdb-client`)
 
 * **4.1. Configuración de Feature Flags para Compilación Multiplataforma:**
   * Configurar `crates/client/Cargo.toml` con features `default = ["native"]` y `wasm = ["web-sys", "wasm-bindgen-futures", "gloo-net"]`, asegurando que dependencias nativas como `tokio/full` y `reqwest` no rompan la compilación WebAssembly.
   * Implementar trait condicional `CryptoConcurrencyBounds` para `CryptoEngine` (`Send + Sync` en nativo, relajado a `?Send` en `wasm32`) para soportar objetos WebCrypto / JavaScript.
 * **4.2. Fachada Pública Ergonómica del SDK:**
-  * Implementar la jerarquía de usuario: `RimdbClient` (gestor de conexión global) -> `RoomHandle` (ámbito de sala) -> `TableHandle` (operaciones CRUD declarativas sobre tablas).
+  * Implementar la jerarquía de usuario: `ZemdbClient` (gestor de conexión global) -> `RoomHandle` (ámbito de sala) -> `TableHandle` (operaciones CRUD declarativas sobre tablas).
   * Implementar struct `ClientConfig` con builders tipados.
 * **4.3. Sincronización Server-Authoritative en 1 RTT (Write-Through):**
   * Para garantizar integridad absoluta y evitar estados corruptos por rechazos de validación: toda mutación local se envía al endpoint `/commit` junto con `last_ack_seq`.

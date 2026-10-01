@@ -1,8 +1,8 @@
 use crate::error::ServerError;
 use crate::log::warm_disk::{parse_segment_filename, RecoveredLogData, SealedSegmentMeta};
-use rimdb_core::id::SequenceNumber;
-use rimdb_core::protocol::messages::SequencedOperation;
-use rimdb_core::protocol::wal_frame::{decode_wal_batch_from_slice, WalBatchDecodeResult};
+use zemdb_core::id::SequenceNumber;
+use zemdb_core::protocol::messages::SequencedOperation;
+use zemdb_core::protocol::wal_frame::{decode_wal_batch_from_slice, WalBatchDecodeResult};
 use std::io::Write;
 use std::path::Path;
 

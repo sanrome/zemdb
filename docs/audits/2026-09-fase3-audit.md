@@ -1,7 +1,7 @@
-# INFORME DE EVALUACIÓN TÉCNICA MULTIDISCIPLINAR — RIMDB (FASE 3 - MIDPOINT)
+# INFORME DE EVALUACIÓN TÉCNICA MULTIDISCIPLINAR — ZEMDB (FASE 3 - MIDPOINT)
 
 **Fecha de Evaluación:** 24 de Septiembre de 2026  
-**Proyecto:** `RimDB` (Motor de Base de Datos Distribuida Local-First)  
+**Proyecto:** `ZemDB` (Motor de Base de Datos Distribuida Local-First)  
 **Estado del Repositorio:** Mitad de desarrollo — Fases 1 a 2.5 completadas (`crates/core` y `crates/storage`); Fase 3 activa en scaffolding (`crates/server`); Fases 4 y 5 planificadas (`crates/client`, suites E2E y WASM).  
 **Premisa Arquitectónica:** Versión v1 en desarrollo inicial activo; **no se requiere retrocompatibilidad**, lo que permite refactorizaciones profundas, cambios de contratos de red y rediseño de almacenamiento sin condicionamientos de versiones previas.  
 **Comité de Auditoría Técnica Especializada:**
@@ -14,7 +14,7 @@
 
 ## 1. RESUMEN EJECUTIVO DEL ESTADO DEL PROYECTO
 
-RimDB ha completado exitosamente sus cimientos de bajo nivel a lo largo de las Fases 1, 1.5, 2 y 2.5. El repositorio cuenta actualmente con dos crates medulares plenamente funcionales y verificados: [`crates/core`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core) (`rimdb-core`) y [`crates/storage`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage) (`rimdb-storage`), respaldados por una batería de **56 tests automatizados**, cero advertencias de Clippy (`-D warnings`) y cumplimiento estricto de `#![forbid(unsafe_code)]`.
+ZemDB ha completado exitosamente sus cimientos de bajo nivel a lo largo de las Fases 1, 1.5, 2 y 2.5. El repositorio cuenta actualmente con dos crates medulares plenamente funcionales y verificados: [`crates/core`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core) (`zemdb-core`) y [`crates/storage`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage) (`zemdb-storage`), respaldados por una batería de **56 tests automatizados**, cero advertencias de Clippy (`-D warnings`) y cumplimiento estricto de `#![forbid(unsafe_code)]`.
 
 ### Principales Logros Consolidados:
 - **Densidad de Memoria y Optimización de Hardware:**
@@ -72,13 +72,13 @@ El proyecto se encuentra en la transición crucial desde los motores locales hac
 │    │ + Sync en CryptoEngine WASM │ (Impide usar WebCrypto en navegadores)         │            │ Rust           │
 ├────┼─────────────────────────────┼────────────────────────────────────────────────┼────────────┼────────────────┤
 │ H9 │ Falso "Non-Blocking CoW" y  │ crates/storage/src/disk/mod.rs: L231-L300      │ MEDIA-ALTA │ DB             │
-│    │ Archivo Monolítico .rimdb   │ (Bloquea todo el motor durante Zstd y sync)    │            │                │
+│    │ Archivo Monolítico .zemdb   │ (Bloquea todo el motor durante Zstd y sync)    │            │                │
 ├────┼─────────────────────────────┼────────────────────────────────────────────────┼────────────┼────────────────┤
 │ H10│ Desactualización de         │ crates/storage/src/disk/mod.rs: L254-L256      │ MEDIA      │ DB             │
 │    │ FileHeader.head_seq         │ crates/storage/src/disk/format.rs: L45         │            │                │
 ├────┼─────────────────────────────┼────────────────────────────────────────────────┼────────────┼────────────────┤
 │ H11│ Ausencia de lib.rs en       │ crates/server/src/ (Solo existe main.rs)       │ MEDIA      │ Arquitectura   │
-│    │ rimdb-server                │ (Impide tests de integración en memoria)       │            │ Rust           │
+│    │ zemdb-server                │ (Impide tests de integración en memoria)       │            │ Rust           │
 ├────┼─────────────────────────────┼────────────────────────────────────────────────┼────────────┼────────────────┤
 │ H12│ Código Huérfano en          │ crates/storage/src/index/primary.rs            │ BAJA-MEDIA │ Rust           │
 │    │ PrimaryIndex                │ (No se usa ni en Memory ni en Disk storage)    │            │ Arquitectura   │
@@ -126,14 +126,14 @@ El proyecto se encuentra en la transición crucial desde los motores locales hac
 1. **Enmarcado WAL Atómico (`0xBA7C`):**
    - La cabecera fija de 14 bytes con suma de verificación CRC32 unificada por lote proporciona garantías de atomicidad estricta (todo-o-nada) ante caídas de tensión o cortes de energía.
 2. **Cabecera de Sala Alineada a CPU Cache Line:**
-   - `FileHeader` (64 bytes) coincide exactamente con la línea de caché L1 de las CPUs modernas (x86_64 y ARM64), almacenando identificadores mágicos `b"RIM1"`, secuencias base y CRC32 autónomo.
+   - `FileHeader` (64 bytes) coincide exactamente con la línea de caché L1 de las CPUs modernas (x86_64 y ARM64), almacenando identificadores mágicos `b"ZEM1"`, secuencias base y CRC32 autónomo.
 3. **Durabilidad POSIX:**
    - `sync_dir` garantiza que los metadatos del directorio contenedor persistan en disco tras renames o creaciones de archivos.
 4. **Streaming en Recuperación:**
    - `BufReader` de 64 KB en `recover_room` erradica la ingestión monolítica de archivos grandes a RAM.
 
 #### B. Deficiencias Detectadas
-1. **Acoplamiento de Snapshot y WAL en un Solo Archivo (`room_{id}.rimdb`):**
+1. **Acoplamiento de Snapshot y WAL en un Solo Archivo (`room_{id}.zemdb`):**
    - El formato monolítico ubica el snapshot base al principio y el WAL al final. Esto impide podar o truncar el WAL *in-place*. Para truncar, el motor está obligado a crear un archivo temporal completo (`.tmp`) y reescribir todo el fichero.
 2. **Falso "Non-Blocking CoW Compaction":**
    - [`compact_room_internal`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/storage/src/disk/compactor.rs#L25-L104) adquiere `room_arc.write().await` y retiene el cerrojo de toda la sala durante la serialización, compresión Zstd, escritura del temporal, `sync_all()`, `rename()` y reapertura. La compactación paraliza completamente todas las lecturas y escrituras ("stop-the-world").
@@ -175,15 +175,15 @@ El proyecto se encuentra en la transición crucial desde los motores locales hac
 1. **Pureza Conceptual de Core (Zero-I/O):**
    - [`crates/core`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core) se mantiene como una biblioteca de dominio puro sin dependencias de red o sistema de archivos, garantizando compatibilidad natural con WebAssembly.
 2. **Separación de Responsabilidades:**
-   - Fronteras nítidas entre dominio/esquemas (`rimdb-core`), persistencia tabular local (`rimdb-storage`), servidor coordinador (`rimdb-server`) y SDK cliente (`rimdb-client`).
+   - Fronteras nítidas entre dominio/esquemas (`zemdb-core`), persistencia tabular local (`zemdb-storage`), servidor coordinador (`zemdb-server`) y SDK cliente (`zemdb-client`).
 3. **Two-Pointer Merge Algorítmico:**
    - La consolidación de deltas en [`merge_sorted_column_updates`](file:///Users/Santiago/OtherProjects/client-distributed-db/crates/core/src/mutation/squash.rs#L20) se ejecuta en $O(M+N)$ sin reasignaciones en el heap.
 
 #### B. Deficiencias Detectadas
 1. **Contradicción sobre Squashing en Servidor:**
-   - [`ROADMAP.md`](file:///Users/Santiago/OtherProjects/client-distributed-db/ROADMAP.md#fase-3-servidor-coordinador-y-secuenciador-rimdb-server-activa) (líneas 560-561 y 631) menciona implementar un "CompactionBuffer con server_squash en RoomActor", mientras que [`ARCHITECTURE.md`](file:///Users/Santiago/OtherProjects/client-distributed-db/ARCHITECTURE.md#52-four-tier-storage-architecture--mutation-lifecycle) (línea 106) y la Fase 2.5 establecen taxativamente que el log del servidor es 100% inmutable y contiguo, sin squashing. El squashing en el servidor crearía huecos de secuencia que detonarían `SequenceMismatch` en los clientes.
+   - [`ROADMAP.md`](file:///Users/Santiago/OtherProjects/client-distributed-db/ROADMAP.md#fase-3-servidor-coordinador-y-secuenciador-zemdb-server-activa) (líneas 560-561 y 631) menciona implementar un "CompactionBuffer con server_squash en RoomActor", mientras que [`ARCHITECTURE.md`](file:///Users/Santiago/OtherProjects/client-distributed-db/ARCHITECTURE.md#52-four-tier-storage-architecture--mutation-lifecycle) (línea 106) y la Fase 2.5 establecen taxativamente que el log del servidor es 100% inmutable y contiguo, sin squashing. El squashing en el servidor crearía huecos de secuencia que detonarían `SequenceMismatch` en los clientes.
 2. **Atrapamiento del Framing WAL en Storage:**
-   - El enmarcado físico `0xBA7C` y las funciones de codificación/decodificación residen en `crates/storage/src/disk/format.rs`. Dado que `rimdb-server` no debe depender del motor de almacenamiento del cliente, no puede persistir sus segmentos de Tier 2 (Warm Disk Log) sin duplicar código o romper la modularidad.
+   - El enmarcado físico `0xBA7C` y las funciones de codificación/decodificación residen en `crates/storage/src/disk/format.rs`. Dado que `zemdb-server` no debe depender del motor de almacenamiento del cliente, no puede persistir sus segmentos de Tier 2 (Warm Disk Log) sin duplicar código o romper la modularidad.
 3. **Incompatibilidad WASM en `CryptoEngine`:**
    - El trait `CryptoEngine` impone `Send + Sync` incondicionalmente, rompiendo la compilación hacia `wasm32-unknown-unknown` para implementaciones basadas en WebCrypto.
 4. **Falta de `src/lib.rs` en Servidor:**
@@ -206,14 +206,14 @@ El proyecto se encuentra en la transición crucial desde los motores locales hac
    - Unanimidad en adoptar el trait `CryptoConcurrencyBounds` (`Send + Sync` en nativo, vacío en wasm32).
 
 ### 4.2. Puntos de Divergencia y Análisis Técnico
-1. **Arquitectura de Archivos en Disco: Archivo Monolítico (`.rimdb`) vs. Dual-File (`.snap` + `.wal`):**
+1. **Arquitectura de Archivos en Disco: Archivo Monolítico (`.zemdb`) vs. Dual-File (`.snap` + `.wal`):**
    - *Especialista en Bases de Datos:* Propone dividir inmediatamente el formato en dos archivos por sala: `room_{id}.snap` (snapshot base Zstd) y `room_{id}.wal` (log de deltas append-only). Argumenta que esto habilita una compactación Copy-on-Write verdaderamente no bloqueante y permite truncar el WAL sin reescribir snapshots de 50 MB.
    - *Especialista en Arquitectura:* Señala que el formato único simplifica los backups atómicos y el file-locking de sala, pero coincide en que la compactación actual es stop-the-world.
    - *Dictamen de Coordinación:* Dado que en v1 no se requiere retrocompatibilidad, la adopción de la arquitectura dual-file (`.snap` + `.wal`) es la solución técnicamente superior y definitiva para motores de bases de datos de alto rendimiento.
 2. **Ubicación del Enmarcado WAL (`0xBA7C`):**
-   - *Especialista en Arquitectura:* Propone extraer el enmarcado de lotes WAL de `crates/storage` y trasladarlo a `crates/core/src/protocol/wal_frame.rs` para que tanto el servidor (Tier 2 Warm Disk Log) como el cliente (`rimdb-storage`) lo reutilicen.
-   - *Especialista en Bases de Datos:* Sugiere crear un crate independiente `rimdb-wal`.
-   - *Dictamen de Coordinación:* Moverlo a `core::protocol::wal_frame` evita la proliferación innecesaria de micro-crates en el workspace y mantiene a `rimdb-core` como el único dueño de los contratos y enmarcados binarios.
+   - *Especialista en Arquitectura:* Propone extraer el enmarcado de lotes WAL de `crates/storage` y trasladarlo a `crates/core/src/protocol/wal_frame.rs` para que tanto el servidor (Tier 2 Warm Disk Log) como el cliente (`zemdb-storage`) lo reutilicen.
+   - *Especialista en Bases de Datos:* Sugiere crear un crate independiente `zemdb-wal`.
+   - *Dictamen de Coordinación:* Moverlo a `core::protocol::wal_frame` evita la proliferación innecesaria de micro-crates en el workspace y mantiene a `zemdb-core` como el único dueño de los contratos y enmarcados binarios.
 3. **Destino de `PrimaryIndex`:**
    - *Especialista en Rust:* Recomienda integrarlo formalmente o purgarlo si no se usa.
    - *Especialista en Bases de Datos:* Propone mantenerlo solo si almacena punteros a offsets de archivo (`HashMap<(u16, PK), FileOffset>`).

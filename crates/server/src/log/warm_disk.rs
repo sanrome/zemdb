@@ -1,8 +1,8 @@
 use crate::error::ServerError;
 use fs2::FileExt;
-use rimdb_core::id::{MutationId, SequenceNumber};
-use rimdb_core::protocol::messages::SequencedOperation;
-use rimdb_core::protocol::wal_frame::{
+use zemdb_core::id::{MutationId, SequenceNumber};
+use zemdb_core::protocol::messages::SequencedOperation;
+use zemdb_core::protocol::wal_frame::{
     decode_wal_batch_from_slice, encode_wal_record, WalBatchDecodeResult,
 };
 use std::fs::{File, OpenOptions};

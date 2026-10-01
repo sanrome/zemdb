@@ -3,8 +3,8 @@ use crate::log::cold_disk::ColdDiskLog;
 use crate::log::hot_buffer::HotBuffer;
 use crate::log::policy::RoomLifecyclePolicy;
 use crate::log::warm_disk::WarmDiskLog;
-use rimdb_core::id::{MutationId, SequenceNumber};
-use rimdb_core::protocol::messages::SequencedOperation;
+use zemdb_core::id::{MutationId, SequenceNumber};
+use zemdb_core::protocol::messages::SequencedOperation;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 

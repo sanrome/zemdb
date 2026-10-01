@@ -1,8 +1,8 @@
 use axum::body::Bytes;
-use rimdb_core::id::{CorrelationId, RoomId, SequenceNumber};
-use rimdb_core::protocol::messages::ServerMessage;
-use rimdb_server::error::ServerError;
-use rimdb_server::relay::{SnapshotChunkUpload, SnapshotRelay};
+use zemdb_core::id::{CorrelationId, RoomId, SequenceNumber};
+use zemdb_core::protocol::messages::ServerMessage;
+use zemdb_server::error::ServerError;
+use zemdb_server::relay::{SnapshotChunkUpload, SnapshotRelay};
 use std::time::Duration;
 use tempfile::tempdir;
 

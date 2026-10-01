@@ -1,8 +1,8 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use rimdb_core::id::SequenceNumber;
-use rimdb_core::protocol::messages::ErrorCode;
+use zemdb_core::id::SequenceNumber;
+use zemdb_core::protocol::messages::ErrorCode;
 use serde::Serialize;
 use thiserror::Error;
 

@@ -1,4 +1,4 @@
-use rimdb_client::add;
+use zemdb_client::add;
 
 #[test]
 fn it_works() {

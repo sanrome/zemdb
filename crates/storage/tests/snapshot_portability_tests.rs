@@ -1,6 +1,6 @@
 use futures::StreamExt;
-use rimdb_core::*;
-use rimdb_storage::{
+use zemdb_core::*;
+use zemdb_storage::{
     DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, ScanOptions, StorageEngine,
     StorageError,
 };
@@ -54,7 +54,7 @@ async fn test_cross_engine_snapshot_portability() {
 
     // Create snapshot from memory engine (Raw uncompressed envelope)
     let mem_snapshot = mem_engine.create_snapshot(&room_id).await.unwrap();
-    assert_eq!(&mem_snapshot[0..4], b"RMSN");
+    assert_eq!(&mem_snapshot[0..4], b"ZMSN");
     assert_eq!(mem_snapshot[4], 1); // version 1
     assert_eq!(mem_snapshot[5], 0); // compression flag = 0 (Raw)
 
@@ -91,7 +91,7 @@ async fn test_cross_engine_snapshot_portability() {
 
     // 3. Disk engine creates snapshot (Zstandard compressed envelope)
     let disk_snapshot = disk_engine.create_snapshot(&room_id).await.unwrap();
-    assert_eq!(&disk_snapshot[0..4], b"RMSN");
+    assert_eq!(&disk_snapshot[0..4], b"ZMSN");
     assert_eq!(disk_snapshot[4], 1); // version 1
     assert_eq!(disk_snapshot[5], 1); // compression flag = 1 (Zstd)
 

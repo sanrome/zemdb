@@ -1,7 +1,7 @@
 use crate::error::ServerError;
 use crate::log::policy::RoomLifecyclePolicy;
-use rimdb_core::id::SequenceNumber;
-use rimdb_core::protocol::messages::SequencedOperation;
+use zemdb_core::id::SequenceNumber;
+use zemdb_core::protocol::messages::SequencedOperation;
 use std::collections::VecDeque;
 use std::time::Instant;
 

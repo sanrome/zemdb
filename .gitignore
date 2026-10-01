@@ -4,8 +4,8 @@
 # These are also much more likely to be unpacked in .gitignore
 **/*.rs.bk
 
-# RimDB local data files
-*.rimdb
+# ZemDB local data files
+*.zemdb
 *.wal
 *.snap
 

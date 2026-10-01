@@ -1,9 +1,9 @@
-use rimdb_core::id::SequenceNumber;
-use rimdb_core::mutation::Operation;
-use rimdb_core::protocol::messages::SequencedOperation;
-use rimdb_core::value::{PrimaryKey, Value};
-use rimdb_server::error::ServerError;
-use rimdb_server::log::{RoomLifecyclePolicy, TieredLog};
+use zemdb_core::id::SequenceNumber;
+use zemdb_core::mutation::Operation;
+use zemdb_core::protocol::messages::SequencedOperation;
+use zemdb_core::value::{PrimaryKey, Value};
+use zemdb_server::error::ServerError;
+use zemdb_server::log::{RoomLifecyclePolicy, TieredLog};
 use std::thread::sleep;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -226,7 +226,7 @@ async fn test_tiered_log_behind_compaction_eviction() {
         ram_max_ops: 100,
         ram_ttl: Duration::from_secs(3600),
         warm_disk_ttl: Duration::from_millis(10),
-        cold_disk_ttl: Duration::from_millis(35), // Fast cold pruning
+        cold_disk_ttl: Duration::from_millis(100), // Fast cold pruning
         max_room_disk_bytes: 50 * 1024 * 1024,
     };
 
@@ -248,7 +248,7 @@ async fn test_tiered_log_behind_compaction_eviction() {
     }
 
     // 3. Wait past cold_disk_ttl and run maintenance to prune Cold segment 1..=5
-    sleep(Duration::from_millis(40));
+    sleep(Duration::from_millis(110));
     let report = log.run_maintenance().await.unwrap();
     assert_eq!(report.cold_pruned_count, 1);
     assert_eq!(log.tail_seq().get(), 6);
@@ -378,7 +378,7 @@ fn test_tiered_log_hot_buffer_sliding_window_no_zero_eviction() {
 
 #[test]
 fn test_tiered_log_hot_buffer_o1_range_query() {
-    let mut buffer = rimdb_server::log::HotBuffer::new();
+    let mut buffer = zemdb_server::log::HotBuffer::new();
 
     // Appending contiguous operations 10..=20
     for i in 10..=20 {

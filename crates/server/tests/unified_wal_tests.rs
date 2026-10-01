@@ -1,11 +1,11 @@
-use rimdb_core::id::{MutationId, SequenceNumber};
-use rimdb_core::mutation::Operation;
-use rimdb_core::protocol::messages::{ErrorCode, SequencedOperation};
-use rimdb_core::value::{PrimaryKey, Value};
-use rimdb_server::config::ServerConfig;
-use rimdb_server::dedup::DedupLruCache;
-use rimdb_server::error::ServerError;
-use rimdb_server::log::{RoomLifecyclePolicy, TieredLog};
+use zemdb_core::id::{MutationId, SequenceNumber};
+use zemdb_core::mutation::Operation;
+use zemdb_core::protocol::messages::{ErrorCode, SequencedOperation};
+use zemdb_core::value::{PrimaryKey, Value};
+use zemdb_server::config::ServerConfig;
+use zemdb_server::dedup::DedupLruCache;
+use zemdb_server::error::ServerError;
+use zemdb_server::log::{RoomLifecyclePolicy, TieredLog};
 use std::fs::OpenOptions;
 use std::io::Write;
 use tempfile::tempdir;
@@ -203,7 +203,7 @@ fn test_server_config_toml_and_env_overrides() {
     let toml_str = r#"
         host = "0.0.0.0"
         port = 9000
-        data_dir = "/var/rimdb"
+        data_dir = "/var/zemdb"
         auth_secret = "custom_cluster_secret_123456789!"
         admin_secret = "custom_admin_secret_1234567890!"
         lease_timeout_secs = 120
@@ -214,15 +214,15 @@ fn test_server_config_toml_and_env_overrides() {
     let mut config = ServerConfig::from_toml_str(toml_str).unwrap();
     assert_eq!(config.host, "0.0.0.0");
     assert_eq!(config.port, 9000);
-    assert_eq!(config.data_dir.to_str().unwrap(), "/var/rimdb");
+    assert_eq!(config.data_dir.to_str().unwrap(), "/var/zemdb");
     assert_eq!(config.lease_timeout_secs, 120);
     assert_eq!(config.dedup_lru_capacity, 25000);
     assert_eq!(config.snapshot_ttl_secs, 300);
 
     // Test environment variable overrides
-    std::env::set_var("RIMDB_PORT", "9999");
-    std::env::set_var("RIMDB_HOST", "192.168.1.50");
-    std::env::set_var("RIMDB_SNAPSHOT_TTL_SECS", "1800");
+    std::env::set_var("ZEMDB_PORT", "9999");
+    std::env::set_var("ZEMDB_HOST", "192.168.1.50");
+    std::env::set_var("ZEMDB_SNAPSHOT_TTL_SECS", "1800");
     config.apply_env_overrides();
 
     assert_eq!(config.port, 9999);
@@ -230,9 +230,9 @@ fn test_server_config_toml_and_env_overrides() {
     assert_eq!(config.snapshot_ttl_secs, 1800);
 
     // Clean up env vars
-    std::env::remove_var("RIMDB_PORT");
-    std::env::remove_var("RIMDB_HOST");
-    std::env::remove_var("RIMDB_SNAPSHOT_TTL_SECS");
+    std::env::remove_var("ZEMDB_PORT");
+    std::env::remove_var("ZEMDB_HOST");
+    std::env::remove_var("ZEMDB_SNAPSHOT_TTL_SECS");
 }
 
 #[test]

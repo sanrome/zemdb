@@ -1,4 +1,4 @@
-use rimdb_core::id::{ClientId, SequenceNumber};
+use zemdb_core::id::{ClientId, SequenceNumber};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;

@@ -1,13 +1,13 @@
-use rimdb_core::{
+use zemdb_core::{
     CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequenceNumber,
     SequencedOperation, TableSchema, Value, MAX_MESSAGE_SIZE,
 };
-use rimdb_storage::format::{
+use zemdb_storage::format::{
     decode_wal_batch_from_slice, decode_wal_record_from_slice, encode_wal_batch, encode_wal_record,
     replay_wal_records, FileHeader, WalBatchDecodeResult, WalDecodeResult, BATCH_HEADER_SIZE,
     BATCH_MAGIC, HEADER_SIZE, MAGIC_BYTES,
 };
-use rimdb_storage::{
+use zemdb_storage::{
     DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError, WalReader,
 };
 
@@ -468,7 +468,7 @@ async fn test_disk_blind_update_ignored() {
     engine.open_room(&room_id, schema).await.unwrap();
 
     // Send update for non-existent row
-    let updates = vec![rimdb_core::ColumnUpdate {
+    let updates = vec![zemdb_core::ColumnUpdate {
         column_idx: 1,
         value: Value::String("NonExistent".into()),
     }];
@@ -595,7 +595,7 @@ async fn test_dynamic_column_update_resizing_disk_and_wal_recovery() {
                 Operation::update(
                     USERS_TABLE,
                     PrimaryKey::single(1i64),
-                    vec![rimdb_core::ColumnUpdate::new(
+                    vec![zemdb_core::ColumnUpdate::new(
                         3,
                         Value::String("Disk Note".into()),
                     )],
@@ -786,7 +786,7 @@ fn test_wal_reader_multi_op_batch_iteration_buffered() {
 
 #[tokio::test]
 async fn test_wal_replay_skips_operations_before_snapshot_seq() {
-    use rimdb_core::ColumnUpdate;
+    use zemdb_core::ColumnUpdate;
     use std::io::Write;
 
     let tmp = tempfile::tempdir().unwrap();

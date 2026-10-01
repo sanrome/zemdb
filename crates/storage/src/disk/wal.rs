@@ -1,4 +1,4 @@
-use rimdb_core::SequencedOperation;
+use zemdb_core::SequencedOperation;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 

@@ -1,9 +1,9 @@
 use futures::StreamExt;
-use rimdb_core::{
+use zemdb_core::{
     CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequencedOperation, TableSchema,
     Value,
 };
-use rimdb_storage::{
+use zemdb_storage::{
     DiskStorageEngine, DiskStorageOptions, KeyRange, MemoryStorageEngine, ScanOptions,
     StorageEngine,
 };
@@ -413,7 +413,7 @@ async fn test_scan_snapshot_isolation_memory() {
             Operation::update(
                 USERS_TABLE,
                 PrimaryKey::single(i),
-                vec![rimdb_core::ColumnUpdate::new(2, Value::Int(9999))],
+                vec![zemdb_core::ColumnUpdate::new(2, Value::Int(9999))],
                 201,
             ),
         ));
@@ -512,7 +512,7 @@ async fn test_scan_snapshot_isolation_disk() {
             Operation::update(
                 USERS_TABLE,
                 PrimaryKey::single(i),
-                vec![rimdb_core::ColumnUpdate::new(2, Value::Int(9999))],
+                vec![zemdb_core::ColumnUpdate::new(2, Value::Int(9999))],
                 201,
             ),
         ));

@@ -1,4 +1,4 @@
-# Bitácora y Plan de Ejecución — Fase 3: `rimdb-server`
+# Bitácora y Plan de Ejecución — Fase 3: `zemdb-server`
 
 **Documento:** Registro de Avance, Arquitectura de Detalle y Plan de Acción  
 **Fecha de Creación:** 24 de Septiembre de 2026  
@@ -11,8 +11,8 @@
 
 ## 1. Estado Global de la Fase 3
 
-* **Estado Actual:** 🟢 **COMPLETADA — Fase 3: `rimdb-server` (100% Finalizada)**
-* **Próxima Fase:** Iniciar Fase 4: `rimdb-client` (SDK Cliente, Transacciones Locales y Sincronización 1-RTT).
+* **Estado Actual:** 🟢 **COMPLETADA — Fase 3: `zemdb-server` (100% Finalizada)**
+* **Próxima Fase:** Iniciar Fase 4: `zemdb-client` (SDK Cliente, Transacciones Locales y Sincronización 1-RTT).
 
 ---
 
@@ -39,9 +39,9 @@
   - `src/lib.rs`: Biblioteca reutilizable que exporta la máquina de actores, buffer, micro-WAL, configuración y capas de handlers para levantar el servidor in-process en tests sin spawn de procesos externos.
   - `src/main.rs`: Entrypoint ejecutable CLI que parsea argumentos, inicializa tracing, carga configuración y lanza Tokio + Axum.
 - [x] **3.1.3. Configuración (`src/config.rs`):**
-  - Struct `ServerConfig` deserializable con soporte para archivo `server.toml` y variables de entorno (`RIMDB_PORT`, `RIMDB_DATA_DIR`, `RIMDB_AUTH_SECRET`, `RIMDB_ADMIN_SECRET`, etc.).
+  - Struct `ServerConfig` deserializable con soporte para archivo `server.toml` y variables de entorno (`ZEMDB_PORT`, `ZEMDB_DATA_DIR`, `ZEMDB_AUTH_SECRET`, `ZEMDB_ADMIN_SECRET`, etc.).
 - [x] **3.1.4. Sistema de Errores Tipados (`src/error.rs`):**
-  - Enum `ServerError` con conversiones idiomáticas hacia `ErrorCode` del protocolo binario de `rimdb-core` y códigos de estado HTTP de Axum (`StatusCode`).
+  - Enum `ServerError` con conversiones idiomáticas hacia `ErrorCode` del protocolo binario de `zemdb-core` y códigos de estado HTTP de Axum (`StatusCode`).
 - [x] **3.1.5. Motor de Micro-WAL Durable (`src/micro_wal.rs`):**
   - Persistencia síncrona append-only en `meta_{room_id}.wal` con formato:
     ```text
@@ -63,7 +63,7 @@
   - Buffer contiguo e inmutable en memoria (`VecDeque<SequencedOperation>`).
   - **Cero squashing sobre deltas secuenciados**: preservación estricta de contigüidad (`head_seq + 1`), garantizando que no existan huecos de secuencia ni tuplas zombi.
 - [x] **3.2.2. Tier 2: Warm Disk Log con Write-Through (`src/log/warm_disk.rs`):**
-  - Archivos append-only `.wal` planos con códec `wal_frame` de `rimdb-core` (`0xBA7C`, CRC32, longitud).
+  - Archivos append-only `.wal` planos con códec `wal_frame` de `zemdb-core` (`0xBA7C`, CRC32, longitud).
   - Write-Through: escrituras síncronas en `active.wal` garantizando durabilidad pre-ACK ante caídas del servidor.
   - Rotación y sellado a `segment_{start}_{end}.wal`.
 - [x] **3.2.3. Tier 3: Cold Disk Log (`src/log/cold_disk.rs`):**
@@ -153,5 +153,5 @@
 | **2026-09-25** | Hito 3.2: Log Inmutable de 4 Niveles (Tiered Delta Log) | `crates/server/Cargo.toml`, `src/log/policy.rs`, `src/log/hot_buffer.rs`, `src/log/warm_disk.rs`, `src/log/cold_disk.rs`, `src/log/tiered_log.rs`, `src/log/mod.rs`, `src/lib.rs`, `tests/tiered_log_tests.rs` | Implementación de la jerarquía de 4 niveles con Write-Through duradero (HotBuffer RAM + active.wal), rotación y sellado de segmentos, compresión Zstd en background, poda por cuota/retención con límite BehindCompaction, poda proactiva por cursor unánime (prune_older_than) y motor unificado fetch_deltas. 8 tests unitarios pasando. |
 | **2026-09-25** | Hito 3.3: Concurrencia de Salas, Actores Tokio y Leases | `src/schema_registry.rs`, `src/actor/lease.rs`, `src/actor/command.rs`, `src/actor/room.rs`, `src/actor/manager.rs`, `src/actor/mod.rs`, `src/lib.rs`, `tests/room_actor_tests.rs` | Implementación del modelo de actores Tokio por sala con canal mpsc, SchemaRegistry con persistencia JSON y evolución append-only, ClientLeaseTracker con ciclo tripartito (Connected/Disconnected/Dormant), sincronización 1-RTT, canales broadcast SSE, lazy spawning en RoomManager y persistencia de metadatos de sala. Desacoplamiento estricto de Ack y Heartbeat. 7 tests de integración pasando. |
 | **2026-09-25** | Hito 3.4: Capa de Red Axum, Control/Data Plane y SSE | `crates/server/Cargo.toml`, `src/api/auth.rs`, `src/api/control_plane.rs`, `src/api/data_plane.rs`, `src/api/sse.rs`, `src/relay.rs`, `src/api/router.rs`, `src/api/mod.rs`, `src/lib.rs`, `src/main.rs`, `tests/server_integration_tests.rs` | Implementación de la capa de red Axum con Control Plane REST JSON (schemas, evolution, rooms, metrics), Data Plane binario con bincode (register, commit, sync, ack, heartbeat, deregister), canal SSE signal-only (head_advanced), relay de snapshots multipart con chunks y validación criptográfica BLAKE3, y suite de integración E2E completa. 8 tests de integración pasando (93 tests totales en workspace). |
-| **2026-09-30** | Fase 3.5-C.1: Refactorización Estructural, Contratos y Rendimiento | `crates/core`, `crates/storage`, `crates/server` | Enmarcado de wire protocol con magic bytes `RM` y versión `0x01` (`codec.rs`), snapshots canónicos universales interoperables `RMSN` con CRC32 (`snapshot.rs`), acceso directo por `table_id: u16` (`get_by_id`, `scan_by_id`) y validación de esquemas en `apply_batch`, encapsulación de `PrimaryKey`, `CompactRow` y `TableSchema` con remoción de `Deref`, corrección de LWW en squashing y anulación mutua `Insert + Delete -> Purged`, emisión SSE de `RoomEvent::SchemaReloaded` ante DDL, estandarización de `ServerMessage::DeregisterAck`, transición de leases `Disconnected -> Dormant` tras 90s, recálculo exacto de `tail_seq` en `tiered_log.rs`, liberación de locks antes de sync en `close_room`, y prevención de salas fantasma en `GET /admin/rooms/:id`. Suite completa pasando sin warnings. |
+| **2026-09-30** | Fase 3.5-C.1: Refactorización Estructural, Contratos y Rendimiento | `crates/core`, `crates/storage`, `crates/server` | Enmarcado de wire protocol con magic bytes `RM` y versión `0x01` (`codec.rs`), snapshots canónicos universales interoperables `ZMSN` con CRC32 (`snapshot.rs`), acceso directo por `table_id: u16` (`get_by_id`, `scan_by_id`) y validación de esquemas en `apply_batch`, encapsulación de `PrimaryKey`, `CompactRow` y `TableSchema` con remoción de `Deref`, corrección de LWW en squashing y anulación mutua `Insert + Delete -> Purged`, emisión SSE de `RoomEvent::SchemaReloaded` ante DDL, estandarización de `ServerMessage::DeregisterAck`, transición de leases `Disconnected -> Dormant` tras 90s, recálculo exacto de `tail_seq` en `tiered_log.rs`, liberación de locks antes de sync en `close_room`, y prevención de salas fantasma en `GET /admin/rooms/:id`. Suite completa pasando sin warnings. |
 

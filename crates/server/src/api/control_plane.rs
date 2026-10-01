@@ -1,8 +1,8 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
-use rimdb_core::id::{RoomId, SchemaId};
-use rimdb_core::schema::{ColumnDef, Schema};
+use zemdb_core::id::{RoomId, SchemaId};
+use zemdb_core::schema::{ColumnDef, Schema};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 

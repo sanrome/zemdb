@@ -1,4 +1,4 @@
-use rimdb_core::*;
+use zemdb_core::*;
 
 #[test]
 fn test_value_and_primary_key_memory_footprint() {

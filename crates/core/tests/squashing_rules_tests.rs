@@ -1,4 +1,4 @@
-use rimdb_core::*;
+use zemdb_core::*;
 
 fn sample_schema() -> Schema {
     let users = TableSchema::builder("users")

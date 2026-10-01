@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use futures::Stream;
-use rimdb_core::{
+use zemdb_core::{
     CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation, Value,
 };
 use std::pin::Pin;
@@ -26,7 +26,7 @@ pub type RowStream<'a> =
 pub type RowStream<'a> =
     Pin<Box<dyn Stream<Item = Result<(PrimaryKey, CompactRow), StorageError>> + 'a>>;
 
-/// Storage engine contract for RimDB local persistence.
+/// Storage engine contract for ZemDB local persistence.
 ///
 /// Implementations must be thread-safe (or single-thread compatible on wasm32)
 /// and handle room lifecycle, sequenced operation batches, point lookups,

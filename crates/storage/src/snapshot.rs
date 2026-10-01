@@ -1,7 +1,7 @@
 use crate::error::StorageError;
 
-/// Canonical 4-byte magic identifier for RimDB snapshot envelopes ("RMSN").
-pub const SNAPSHOT_MAGIC: [u8; 4] = *b"RMSN";
+/// Canonical 4-byte magic identifier for ZemDB snapshot envelopes ("ZMSN").
+pub const SNAPSHOT_MAGIC: [u8; 4] = *b"ZMSN";
 
 /// Current snapshot envelope container format version.
 pub const SNAPSHOT_VERSION: u8 = 0x01;

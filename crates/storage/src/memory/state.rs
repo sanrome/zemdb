@@ -1,4 +1,4 @@
-use rimdb_core::{CompactRow, PrimaryKey, Schema, SequenceNumber};
+use zemdb_core::{CompactRow, PrimaryKey, Schema, SequenceNumber};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
