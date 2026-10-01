@@ -57,12 +57,14 @@ impl HotBuffer {
             None => return Vec::new(),
         };
 
-        let start_idx = if from_seq.get() < min {
-            0
-        } else {
-            (from_seq.get() + 1 - min) as usize
-        };
+        // If the requested cursor falls before the minimum sequence present in the buffer,
+        // RAM cannot satisfy the beginning of this contiguous range without introducing a gap.
+        // Returning empty forces the caller to fetch the preceding sequence prefix from disk.
+        if from_seq.get() + 1 < min {
+            return Vec::new();
+        }
 
+        let start_idx = (from_seq.get() + 1 - min) as usize;
         if start_idx >= self.entries.len() {
             return Vec::new();
         }

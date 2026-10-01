@@ -388,8 +388,12 @@ fn test_tiered_log_hot_buffer_o1_range_query() {
     assert_eq!(buffer.min_seq().unwrap().get(), 10);
     assert_eq!(buffer.max_seq().unwrap().get(), 20);
 
-    // Query 1: from_seq older than min_seq
+    // Query 1: from_seq older than min_seq (5 + 1 < 10, cannot satisfy contiguity)
     let res = buffer.get_range(SequenceNumber::new(5), 5);
+    assert!(res.is_empty(), "Must return empty when requested cursor precedes buffer start to prevent sequence gap");
+
+    // Query 1b: from_seq immediately preceding min_seq (9 + 1 = 10, valid contiguous start)
+    let res = buffer.get_range(SequenceNumber::new(9), 5);
     assert_eq!(res.len(), 5);
     assert_eq!(res[0].seq.get(), 10);
     assert_eq!(res[4].seq.get(), 14);
@@ -536,3 +540,74 @@ async fn test_tiered_log_disk_quota_saturation_pruning() {
     assert!(!deltas.is_empty());
     assert_eq!(deltas[0].seq, log.tail_seq());
 }
+
+#[test]
+fn test_tiered_log_eviction_gap_bridged_from_active_wal() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 5,
+        ..Default::default()
+    };
+
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+
+    // Append 15 operations. With ram_max_ops = 5, operations 1..=10 are evicted
+    // from the RAM sliding window, while 11..=15 remain in RAM.
+    // All 15 operations reside in the active WAL on disk.
+    for i in 1..=15 {
+        log.append(make_test_op(i), None).unwrap();
+    }
+
+    assert_eq!(log.head_seq().get(), 15);
+
+    // Request range crossing the eviction boundary: from cursor 7 with limit 6 (expecting 8..=13).
+    // Operations 8..=10 were evicted from RAM and must be read from active.wal.
+    // Operations 11..=13 are present in RAM HotBuffer.
+    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(7), 6).unwrap();
+
+    assert_eq!(deltas.len(), 6);
+    assert!(has_more);
+
+    // Verify monotonic strict contiguity across the tier transition: 8, 9, 10, 11, 12, 13
+    for (idx, op) in deltas.iter().enumerate() {
+        let expected_seq = 8 + idx as u64;
+        assert_eq!(
+            op.seq.get(),
+            expected_seq,
+            "Operation at index {} must have sequence {}, got {}",
+            idx,
+            expected_seq,
+            op.seq.get()
+        );
+    }
+}
+
+#[test]
+fn test_tiered_log_fast_path_off_by_one_boundary() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 5,
+        ..Default::default()
+    };
+
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+
+    // Append operations 1..=6.
+    // Sliding window evicts op 1.
+    // RAM buffer contains 2..=6, min_seq = 2.
+    for i in 1..=6 {
+        log.append(make_test_op(i), None).unwrap();
+    }
+
+    // Client requests cursor 1 with limit 5 (expecting 2..=6).
+    // Because cursor 1 immediately precedes min_seq 2 (1 + 1 == 2),
+    // this request must hit the RAM Fast Path directly.
+    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(1), 5).unwrap();
+
+    assert_eq!(deltas.len(), 5);
+    assert!(!has_more);
+    for (idx, op) in deltas.iter().enumerate() {
+        assert_eq!(op.seq.get(), 2 + idx as u64);
+    }
+}
+

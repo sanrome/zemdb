@@ -170,7 +170,7 @@ impl TieredLog {
         // If the requested cursor falls within the current RAM buffer window, serve directly
         // from memory in sub-microsecond time without touching disk or executing system calls.
         if let Some(min_ram) = self.hot_buffer.min_seq() {
-            if from_seq >= min_ram {
+            if from_seq.get() + 1 >= min_ram.get() {
                 let ops = self.hot_buffer.get_range(from_seq, limit);
                 let has_more = ops
                     .last()
@@ -190,6 +190,13 @@ impl TieredLog {
                 let ops =
                     ColdDiskLog::read_range(&cold.path, current_from, limit - collected.len())?;
                 for op in ops {
+                    if op.seq.get() != current_from.get() + 1 {
+                        return Err(ServerError::Wal(format!(
+                            "Sequence discontinuity in cold log fetch: expected sequence {}, found {}",
+                            current_from.get() + 1,
+                            op.seq.get()
+                        )));
+                    }
                     current_from = op.seq;
                     collected.push(op);
                     if collected.len() >= limit {
@@ -213,6 +220,13 @@ impl TieredLog {
                         limit - collected.len(),
                     )?;
                     for op in ops {
+                        if op.seq.get() != current_from.get() + 1 {
+                            return Err(ServerError::Wal(format!(
+                                "Sequence discontinuity in warm sealed log fetch: expected sequence {}, found {}",
+                                current_from.get() + 1,
+                                op.seq.get()
+                            )));
+                        }
                         current_from = op.seq;
                         collected.push(op);
                         if collected.len() >= limit {
@@ -226,31 +240,50 @@ impl TieredLog {
             }
         }
 
-        // 3. Query Tier 1: HotBuffer in RAM (Fast path)
-        if collected.len() < limit {
-            let ram_ops = self
-                .hot_buffer
-                .get_range(current_from, limit - collected.len());
-            for op in ram_ops {
-                current_from = op.seq;
-                collected.push(op);
-                if collected.len() >= limit {
-                    break;
-                }
-            }
-        }
-
-        // Fallback: if HotBuffer evicted the range but active.wal contains it
+        // 3. Query Tier 2 Active: Active Warm Disk (active.wal)
+        // Queried before RAM HotBuffer to bridge the gap between sealed segments
+        // and the in-memory sliding window, maintaining strict chronological contiguity.
         if collected.len() < limit && current_from.get() < self.head_seq.get() {
             let active_path = segments_dir.join("active.wal");
             if active_path.exists() {
                 let active_ops =
                     WarmDiskLog::read_range(&active_path, current_from, limit - collected.len())?;
                 for op in active_ops {
+                    if op.seq.get() != current_from.get() + 1 {
+                        return Err(ServerError::Wal(format!(
+                            "Sequence discontinuity in active wal log fetch: expected sequence {}, found {}",
+                            current_from.get() + 1,
+                            op.seq.get()
+                        )));
+                    }
+                    current_from = op.seq;
                     collected.push(op);
                     if collected.len() >= limit {
                         break;
                     }
+                }
+            }
+        }
+
+        // 4. Query Tier 1: HotBuffer in RAM
+        // If remaining limit exists and cursor has reached the RAM buffer's window,
+        // satisfy the remainder directly from memory.
+        if collected.len() < limit && current_from.get() < self.head_seq.get() {
+            let ram_ops = self
+                .hot_buffer
+                .get_range(current_from, limit - collected.len());
+            for op in ram_ops {
+                if op.seq.get() != current_from.get() + 1 {
+                    return Err(ServerError::Wal(format!(
+                        "Sequence discontinuity in hot buffer log fetch: expected sequence {}, found {}",
+                        current_from.get() + 1,
+                        op.seq.get()
+                    )));
+                }
+                current_from = op.seq;
+                collected.push(op);
+                if collected.len() >= limit {
+                    break;
                 }
             }
         }
