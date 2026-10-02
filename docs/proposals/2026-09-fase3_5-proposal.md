@@ -1,5 +1,7 @@
 # Propuesta Maestra de Mitigación y Corrección — Post-Fase 3.5
 
+> ⚠️ **Documento reemplazado.** Las severidades y soluciones de este documento fueron revisadas contra el código; varias eran incorrectas. Ver [`2026-10-fase3_6-remediation-plan.md`](2026-10-fase3_6-remediation-plan.md).
+
 **Documento:** Plan Técnico Maestro de Mitigación, Resolución de Trade-offs y Hoja de Ruta  
 **Fecha:** 30 de Septiembre de 2026  
 **Referencia:** [docs/audits/2026-09-fase3_5-audit.md](../audits/2026-09-fase3_5-audit.md)  

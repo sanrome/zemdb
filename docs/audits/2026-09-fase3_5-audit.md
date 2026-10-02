@@ -1,5 +1,7 @@
 # Auditoría Técnica Exhaustiva de ZemDB — Post-Fase 3.5
 
+> ⚠️ **Documento reemplazado.** Las severidades y soluciones de este documento fueron revisadas contra el código; varias eran incorrectas. Ver [`2026-10-fase3_6-remediation-plan.md`](../proposals/2026-10-fase3_6-remediation-plan.md).
+
 **Documento:** Inventario Exhaustivo de Defectos y Evaluación de Convergencia  
 **Fecha:** 30 de Septiembre de 2026  
 **Alcance:** `crates/core`, `crates/storage`, `crates/server`, `crates/client`, `Cargo.toml`, `ARCHITECTURE.md`, `ROADMAP.md`  
