@@ -48,7 +48,7 @@
 | Lote | Tema | Ítems | Prioridad | Progreso |
 |---|---|---|---|---|
 | 1 | Consistencia del log y del commit | DEF-01, 36, 07, 58, 59, 67, 04, 29, 06 | Inmediata | ✅ 9/9 |
-| 2 | Durabilidad del motor de storage | DEF-02, 03, 65, 19(storage), 12 | Inmediata | 0/5 |
+| 2 | Durabilidad del motor de storage | DEF-02, 03, 65, 19(storage), 12 | Inmediata | ✅ 5/5 |
 | 3 | Durabilidad de metadatos del servidor | DEF-60, 19(server), 16, 48, 68 | Alta | 0/5 |
 | 4 | Autenticación e identificadores | DEF-61, 41, 66 | Alta | 0/3 |
 | 5 | Relay de snapshots | DEF-62, 10, 63, 52, 51, 39, 40, 38, 31(relay), 08(relay), 15 | Alta | 0/11 |
@@ -58,7 +58,7 @@
 | 9 | Robustez e higiene de storage y core | DEF-14, 23, 49, 17, 25(storage), 18, 09, 45, 33, 44, 47, 30, 13, 20, 21, 57 (32 descartado) | Media/Baja | 0/16 |
 | 10 | Diferido a Fase 4 / descartado | DEF-34, 54, 42, 56 | — | — |
 
-**Avance total:** 9 de 65 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
+**Avance total:** 14 de 65 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
 
 **Severidades corregidas respecto de la auditoría anterior:** de los 7 "críticos" originales, solo DEF-01 lo es. DEF-02, 03 y 04 son Altos; DEF-05 y 06 son Medios; DEF-34 es Bajo. DEF-24, 26 y 56 son falsos en la práctica.
 
@@ -152,7 +152,7 @@ Off-by-one del fast path (`from_seq + 1 >= min_ram`). Solo costaba rendimiento.
 
 > Objetivo: ninguna secuencia de fallos (incluidos dos seguidos) pierde mutaciones confirmadas.
 
-#### DEF-02 · Alto · ⬜
+#### DEF-02 · Alto · ✅ Hecho
 **Problema verificado.** (a) Tras un fallo en la fase 2 de `compact_room_cow`, `.wal.compacting` queda huérfano; la próxima compactación hace `rename(.wal → .wal.compacting)` y lo pisa. Si esa segunda compactación también falla (disco lleno es persistente) o hay un crash antes de su fase 3, se pierde todo lo que había entre el snapshot viejo y el primer corte. Un solo fallo seguido de reinicio no pierde nada (la recuperación fusiona el huérfano). (b) Cualquier `?` después de `is_compacting = true` (líneas del rename, de la creación del nuevo WAL, del join y del rename del snapshot) deja el flag trabado y `compact_room` devuelve `Ok` para siempre sin compactar. (c) Si falla la creación del nuevo `.wal` después del rename, `room.wal_file` sigue escribiendo en el archivo `.compacting`.
 **Solución.**
 1. D3: `is_compacting` como `AtomicBool` + guard RAII.
@@ -161,24 +161,24 @@ Off-by-one del fast path (`from_seq + 1 >= min_ram`). Solo costaba rendimiento.
 **Descartado de la propuesta anterior:** nombres generacionales y el "rollback-merge" de la fase 2 (que en sí mismo no era atómico).
 **Test.** Inyectar fallo en fase 2 dos veces seguidas → reabrir → todas las mutaciones presentes. Fallo con `?` en cada punto → el flag queda en `false` y la siguiente compactación corre.
 
-#### DEF-03 · Alto · ⬜
+#### DEF-03 · Alto · ✅ Hecho
 **Problema verificado.** En `recover_room`, `remove_file(.wal.compacting)` (`recovery.rs:382`) se ejecuta **antes** de la reescritura in-place del WAL activo (`:411`). Matar el proceso en esa ventana pierde el contenido de `.compacting`; una reescritura cortada deja bytes desalineados (corrupción o truncado de registros confirmados). Requiere un crash durante la recuperación de otro crash: Alto, no Crítico.
 **Errores de la propuesta anterior (tmp → rename → delete).** (a) El `wal_file` abierto y bloqueado (`flock`) seguiría apuntando al inodo viejo, ya desvinculado: las escrituras posteriores se perderían en silencio. (b) Un crash entre el rename y el borrado de `.compacting` duplica registros en el siguiente replay.
 **Solución.** Si `.compacting` tenía registros vivos: reconstruir el estado en memoria (snapshot + `.compacting` + `.wal`), escribir un **snapshot nuevo** por la ruta atómica existente (`write_snapshot_and_truncate_wal`: tmp → `sync_all` → rename → `sync_dir`), luego truncar `.wal`, borrar `.compacting` y `sync_dir`. Nunca se reescribe in-place y nunca se cambia el handle bloqueado. Cualquier crash intermedio queda cubierto por el filtro `seq <= snapshot_seq` y por DEF-65.
 **Test.** Dejar los archivos en cada estado intermedio posible (simulando crash en cada paso) → reabrir → estado completo y sin duplicados.
 
-#### DEF-65 · Medio · ⬜ (nuevo)
+#### DEF-65 · Medio · ✅ Hecho (nuevo)
 **Problema.** El replay solo descarta `seq <= snapshot_seq`; no descarta registros ya aplicados en el mismo replay. Cualquier duplicación por crash (DEF-02 y DEF-03) agranda el WAL y depende de que las operaciones sean idempotentes.
-**Solución.** En `replay_wal_file`, descartar también `op.seq <= head_seq` actual. Es seguro porque `apply_batch` exige contigüidad.
+**Solución.** En `replay_wal_file`, descartar también `op.seq <= head_seq` actual. Es seguro porque `apply_batch` exige contigüidad. Además, un registro que no continúa la secuencia (`head_seq + 1`) es un hueco y la recuperación falla con `WalCorruption` (regla 4).
 **Test.** WAL con un rango duplicado → replay produce el estado correcto y `head_seq` correcto.
 
-#### DEF-19 (storage) · Medio · ⬜
+#### DEF-19 (storage) · Medio · ✅ Hecho
 **Problema.** `compactor.rs` ignora el resultado de `sync_dir` y del borrado del `.compacting`. La auditoría no vio que el rename de la fase 1 y la creación del nuevo `.wal` tampoco tienen `sync_dir`, así que la entrada de directorio del nuevo WAL puede no ser durable.
 **Solución.** `sync_dir` tras el rename y la creación del WAL en la fase 1; propagar errores. Si `sync_dir` falla después de un rename exitoso, actualizar `snapshot_seq` y liberar el flag antes de devolver el error.
 
-#### DEF-12 · Bajo · ⬜
+#### DEF-12 · Bajo · ✅ Hecho
 **Problema verificado.** `apply_batch` con `ops` vacío escribe un frame de `ops_count = 0`. La afirmación de que "corrompe la recuperación" es **falsa**: `replay_wal_file` lo acepta. Solo `WalReader` (usado en tests) lo rechaza.
-**Solución.** Retorno anticipado en ambos motores si `ops.is_empty()`.
+**Solución.** Retorno anticipado en `DiskStorageEngine::apply_batch` si `ops.is_empty()`. En `MemoryStorageEngine` un lote vacío ya no tenía efectos (no hay WAL).
 
 ---
 

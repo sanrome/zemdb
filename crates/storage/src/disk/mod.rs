@@ -1,4 +1,5 @@
 pub mod compactor;
+pub(crate) mod fail;
 pub mod format;
 pub mod recovery;
 pub mod wal;
@@ -8,6 +9,7 @@ use fs2::FileExt;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::RangeBounds;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::fs::{create_dir_all, File};
 use tokio::io::AsyncWriteExt;
@@ -89,7 +91,9 @@ pub struct DiskRoomState {
     pub wal_path: PathBuf,
     pub snapshot_len: u64,
     pub wal_len: u64,
-    pub is_compacting: bool,
+    /// Set while a compaction runs. Atomic so that a guard can release it on drop without
+    /// awaiting the room lock.
+    pub is_compacting: Arc<AtomicBool>,
 }
 
 /// High-performance, crash-resilient disk storage engine for ZemDB.
@@ -200,7 +204,15 @@ impl StorageEngine for DiskStorageEngine {
             .try_lock_exclusive()
             .map_err(|_| StorageError::RoomLocked(room_id.clone()))?;
 
-        let recovered = recover_room(room_id, &snap_path, &wal_path, &schema, std_wal_file).await?;
+        let recovered = recover_room(
+            room_id,
+            &snap_path,
+            &wal_path,
+            &schema,
+            std_wal_file,
+            self.options.zstd_level,
+        )
+        .await?;
 
         let room_state = DiskRoomState {
             schema,
@@ -212,7 +224,7 @@ impl StorageEngine for DiskStorageEngine {
             wal_path,
             snapshot_len: recovered.snapshot_len,
             wal_len: recovered.wal_len,
-            is_compacting: false,
+            is_compacting: Arc::new(AtomicBool::new(false)),
         };
 
         rooms.insert(room_id.clone(), Arc::new(RwLock::new(room_state)));
@@ -247,6 +259,11 @@ impl StorageEngine for DiskStorageEngine {
     ) -> Result<SequenceNumber, StorageError> {
         let room_arc = self.get_room(room_id).await?;
         let mut room = room_arc.write().await;
+
+        // An empty batch changes nothing; writing it would only add an empty frame to the WAL.
+        if ops.is_empty() {
+            return Ok(room.head_seq);
+        }
 
         // 1. Validate operations against room schema and strict monotonic sequence
         for (expected_seq, op) in (room.head_seq.get() + 1..).zip(ops.iter()) {
@@ -321,7 +338,7 @@ impl StorageEngine for DiskStorageEngine {
 
         // 5. Check if compaction threshold is triggered
         if self.options.auto_compact
-            && !room.is_compacting
+            && !room.is_compacting.load(Ordering::Acquire)
             && room.wal_len >= self.options.min_compaction_bytes
             && room.wal_len >= (room.snapshot_len as f64 * self.options.compaction_ratio) as u64
         {

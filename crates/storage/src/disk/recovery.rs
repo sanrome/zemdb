@@ -9,6 +9,10 @@ use zemdb_core::{
     Value, BATCH_HEADER_SIZE, BATCH_MAGIC, MAX_MESSAGE_SIZE,
 };
 
+use crate::disk::compactor::{
+    compacting_wal_path, remove_if_exists, sync_parent, write_snapshot_file,
+};
+use crate::disk::fail;
 pub use crate::disk::format::replay_wal_records;
 use crate::disk::format::{FileHeader, HEADER_SIZE};
 use crate::error::StorageError;
@@ -32,10 +36,15 @@ struct WalReplayOutcome {
     applied_count: usize,
 }
 
+/// Replays the framed batches of one WAL file on top of `tables`, advancing `head_seq`.
+///
+/// Records at or below `head_seq` are already reflected in the state (from the snapshot or an
+/// earlier file) and are skipped: crash windows during compaction can leave the same records
+/// in more than one file. A record that does not continue the sequence exactly is a gap, which
+/// means lost data, and is reported as corruption.
 async fn replay_wal_file(
     file: &mut tokio::fs::File,
     schema: &Schema,
-    snapshot_seq: SequenceNumber,
     head_seq: &mut SequenceNumber,
     tables: &mut HashMap<u16, Arc<BTreeMap<PrimaryKey, CompactRow>>>,
 ) -> Result<WalReplayOutcome, StorageError> {
@@ -171,8 +180,15 @@ async fn replay_wal_file(
             }
 
             for op in ops {
-                if op.seq <= snapshot_seq {
+                if op.seq <= *head_seq {
                     continue;
+                }
+                if op.seq.get() != head_seq.get() + 1 {
+                    return Err(StorageError::WalCorruption(format!(
+                        "WAL sequence gap: expected {}, found {}",
+                        head_seq.get() + 1,
+                        op.seq.get()
+                    )));
                 }
 
                 if schema.has_table_by_id(op.op.table_id) {
@@ -205,9 +221,7 @@ async fn replay_wal_file(
                     }
                 }
 
-                if op.seq > *head_seq {
-                    *head_seq = op.seq;
-                }
+                *head_seq = op.seq;
                 applied_count += 1;
             }
 
@@ -225,11 +239,15 @@ async fn replay_wal_file(
 /// Replays a room from disk following the Dual-File architecture:
 /// 1. Reads the immutable base snapshot from `snap_path` (`room_{id}.snap`),
 ///    verifying header and compressed payload CRC32 checksums before decompressing.
-/// 2. If a pre-crash rotated WAL (`room_{id}.wal.compacting`) exists, checks whether its deltas
-///    were already folded into the snapshot or require recovery.
+/// 2. If a pre-crash rotated WAL (`room_{id}.wal.compacting`) exists, replays the records
+///    it holds beyond the snapshot.
 /// 3. Streams and replays all framed WAL batches from `wal_path` (`room_{id}.wal`),
-///    applying mutations on top of tables and advancing `head_seq`.
-/// 4. Detects and truncates any incomplete torn write at WAL EOF in-place.
+///    applying mutations on top of tables and advancing `head_seq`, and truncates any
+///    incomplete torn write at WAL EOF.
+/// 4. Folds `.wal.compacting` away without ever rewriting a file in place: if it held live
+///    records, writes a fresh snapshot of the recovered state through the atomic path, then
+///    empties the active WAL; only then removes `.wal.compacting`. A crash at any step leaves
+///    files that a later recovery replays to the same state.
 #[tracing::instrument(skip(schema, wal_file_std), fields(room_id = %room_id, snap_path = ?snap_path, wal_path = ?wal_path))]
 pub async fn recover_room(
     room_id: &RoomId,
@@ -237,6 +255,7 @@ pub async fn recover_room(
     wal_path: &Path,
     schema: &Schema,
     wal_file_std: std::fs::File,
+    zstd_level: i32,
 ) -> Result<RecoveredRoom, StorageError> {
     let mut tables: HashMap<u16, Arc<BTreeMap<PrimaryKey, CompactRow>>> = HashMap::new();
     for table_id in schema.tables_by_id.keys() {
@@ -344,54 +363,31 @@ pub async fn recover_room(
             while let Ok(Some(entry)) = entries.next_entry().await {
                 if let Ok(name) = entry.file_name().into_string() {
                     if name.starts_with(&tmp_prefix) {
-                        let _ = tokio::fs::remove_file(entry.path()).await;
+                        remove_if_exists(&entry.path()).await?;
                     }
                 }
             }
         }
     }
 
-    // 2. Check for pre-crash rotating WAL (`room_{id}.wal.compacting`)
-    let wal_compacting_path = wal_path.with_extension("wal.compacting");
-    let mut wal_compacting_bytes_to_merge: Option<Vec<u8>> = None;
+    // 2. Replay a pre-crash rotated WAL (`room_{id}.wal.compacting`), if any
+    let wal_compacting_path = compacting_wal_path(wal_path);
+    let compacting_exists = tokio::fs::try_exists(&wal_compacting_path).await?;
+    let mut compacting_has_live_records = false;
 
-    if wal_compacting_path.exists() {
+    if compacting_exists {
         let std_compacting = std::fs::OpenOptions::new()
             .read(true)
             .open(&wal_compacting_path)?;
         let mut compacting_file = tokio::fs::File::from_std(std_compacting);
-        let outcome = replay_wal_file(
-            &mut compacting_file,
-            schema,
-            snapshot_seq,
-            &mut head_seq,
-            &mut tables,
-        )
-        .await?;
-
-        if outcome.applied_count > 0 {
-            // Uncompacted deltas were present; read valid bytes to merge into the active WAL
-            compacting_file.seek(SeekFrom::Start(0)).await?;
-            let mut buf = vec![0u8; outcome.valid_bytes];
-            compacting_file.read_exact(&mut buf).await?;
-            wal_compacting_bytes_to_merge = Some(buf);
-        }
-
-        // Clean up the compacting WAL segment
-        drop(compacting_file);
-        let _ = tokio::fs::remove_file(&wal_compacting_path).await;
+        let outcome =
+            replay_wal_file(&mut compacting_file, schema, &mut head_seq, &mut tables).await?;
+        compacting_has_live_records = outcome.applied_count > 0;
     }
 
     // 3. Replay append-only WAL batches from wal_path
     let mut wal_file = tokio::fs::File::from_std(wal_file_std);
-    let outcome = replay_wal_file(
-        &mut wal_file,
-        schema,
-        snapshot_seq,
-        &mut head_seq,
-        &mut tables,
-    )
-    .await?;
+    let outcome = replay_wal_file(&mut wal_file, schema, &mut head_seq, &mut tables).await?;
 
     let mut valid_wal_bytes = outcome.valid_bytes;
 
@@ -406,21 +402,23 @@ pub async fn recover_room(
         wal_file.sync_all().await?;
     }
 
-    // If pre-crash compacting bytes needed merging, prepend them to active WAL
-    if let Some(compacting_bytes) = wal_compacting_bytes_to_merge {
-        wal_file.seek(SeekFrom::Start(0)).await?;
-        let mut active_wal_content = vec![0u8; valid_wal_bytes];
-        if valid_wal_bytes > 0 {
-            wal_file.read_exact(&mut active_wal_content).await?;
+    // 4. Fold the rotated WAL into a fresh snapshot, then remove it
+    if compacting_exists {
+        if compacting_has_live_records {
+            snapshot_len =
+                write_snapshot_file(snap_path, head_seq, &tables, zstd_level, room_id).await?;
+            snapshot_seq = head_seq;
+            fail::check("recovery.fold", wal_path)?;
+
+            // The snapshot now holds every record of the active WAL as well.
+            wal_file.set_len(0).await?;
+            wal_file.sync_all().await?;
+            valid_wal_bytes = 0;
         }
 
-        wal_file.seek(SeekFrom::Start(0)).await?;
-        wal_file.write_all(&compacting_bytes).await?;
-        wal_file.write_all(&active_wal_content).await?;
-        wal_file.sync_all().await?;
-
-        valid_wal_bytes = compacting_bytes.len() + active_wal_content.len();
-        wal_file.set_len(valid_wal_bytes as u64).await?;
+        fail::check("recovery.fold_cleanup", wal_path)?;
+        remove_if_exists(&wal_compacting_path).await?;
+        sync_parent(&wal_compacting_path)?;
     }
 
     wal_file.seek(SeekFrom::End(0)).await?;
@@ -441,3 +439,6 @@ pub async fn recover_room(
         tables,
     })
 }
+
+#[cfg(test)]
+mod tests;

@@ -1113,3 +1113,18 @@ async fn test_multi_thread_flock_concurrency_stress() {
     );
     next_engine.close_room(&room_id).await.unwrap();
 }
+
+#[tokio::test]
+async fn test_empty_batch_writes_nothing_to_wal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = DiskStorageEngine::new(DiskStorageOptions::new(tmp.path()));
+    let room_id = RoomId::new("empty-batch");
+    engine.open_room(&room_id, test_schema()).await.unwrap();
+    let wal_path = engine.wal_file_path(&room_id);
+    let len_before = std::fs::metadata(&wal_path).unwrap().len();
+
+    let head = engine.apply_batch(&room_id, Vec::new()).await.unwrap();
+
+    assert_eq!(head, SequenceNumber::from(0u64));
+    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), len_before);
+}
