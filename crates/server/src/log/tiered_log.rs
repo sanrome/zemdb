@@ -52,13 +52,11 @@ impl TieredLog {
         let mut recovered_mutations = Vec::new();
 
         let mut head_seq = SequenceNumber::new(0);
-        let mut tail_seq = SequenceNumber::new(0);
 
         // Check Cold Disk segments first
         let cold_segments = ColdDiskLog::list_cold_segments(&segments_dir)?;
-        if let Some(first_cold) = cold_segments.first() {
-            tail_seq = first_cold.start_seq;
-            head_seq = cold_segments.last().unwrap().end_seq;
+        if let Some(last_cold) = cold_segments.last() {
+            head_seq = last_cold.end_seq;
             for cold_seg in &cold_segments {
                 let (_, muts) = ColdDiskLog::read_range_with_mutations(
                     &cold_seg.path,
@@ -73,14 +71,9 @@ impl TieredLog {
         let (recovered_ops, warm_muts) = warm_disk.recover_all()?;
         recovered_mutations.extend(warm_muts);
 
-        if let Some(first_op) = recovered_ops.first() {
-            if tail_seq.get() == 0 {
-                tail_seq = first_op.seq;
-            }
-            if let Some(last_op) = recovered_ops.last() {
-                if last_op.seq.get() > head_seq.get() {
-                    head_seq = last_op.seq;
-                }
+        if let Some(last_op) = recovered_ops.last() {
+            if last_op.seq.get() > head_seq.get() {
+                head_seq = last_op.seq;
             }
         }
 
@@ -93,17 +86,17 @@ impl TieredLog {
         };
         hot_buffer.rehydrate(recovered_ops.into_iter().skip(rehydrate_start));
 
-        Ok((
-            Self {
-                dir,
-                policy,
-                hot_buffer,
-                warm_disk,
-                head_seq,
-                tail_seq,
-            },
-            recovered_mutations,
-        ))
+        let mut log = Self {
+            dir,
+            policy,
+            hot_buffer,
+            warm_disk,
+            head_seq,
+            tail_seq: head_seq.next(),
+        };
+        log.tail_seq = log.compute_tail_seq()?;
+
+        Ok((log, recovered_mutations))
     }
 
     /// Appends a new sequenced operation using the Write-Through durability model.
@@ -132,9 +125,8 @@ impl TieredLog {
         self.hot_buffer
             .apply_sliding_window(self.policy.ram_max_ops, self.policy.ram_ttl);
 
-        if self.tail_seq.get() == 0 {
-            self.tail_seq = self.head_seq.next();
-        }
+        // `tail_seq` needs no update here: when the log was empty it already pointed at
+        // `head_seq + 1`, which is exactly the sequence of the operation just appended.
         self.head_seq = self.head_seq.next();
 
         // 3. Segment rotation check: rotate active segment on disk when size threshold is reached,
@@ -363,7 +355,7 @@ impl TieredLog {
         let now = SystemTime::now();
 
         // 2. Prune expired or over-quota Cold Disk segments
-        let mut cold_segments = ColdDiskLog::list_cold_segments(&segments_dir)?;
+        let cold_segments = ColdDiskLog::list_cold_segments(&segments_dir)?;
         let mut total_disk_bytes: u64 = 0;
 
         for entry in std::fs::read_dir(&segments_dir)? {
@@ -407,22 +399,31 @@ impl TieredLog {
         }
 
         // 3. Update tail_seq to the oldest retained sequence
-        cold_segments = ColdDiskLog::list_cold_segments(&segments_dir)?;
-        if let Some(first_cold) = cold_segments.first() {
-            self.tail_seq = first_cold.start_seq;
-        } else {
-            let remaining_warm = self.warm_disk.list_sealed_segments()?;
-            if let Some(first_warm) = remaining_warm.first() {
-                self.tail_seq = first_warm.start_seq;
-            } else if let Some(min_ram) = self.hot_buffer.min_seq() {
-                self.tail_seq = min_ram;
-            } else {
-                self.tail_seq = self.head_seq;
-            }
-        }
+        self.tail_seq = self.compute_tail_seq()?;
 
         report.new_tail_seq = self.tail_seq;
         Ok(())
+    }
+
+    /// Computes the oldest sequence number still physically retained on disk.
+    ///
+    /// Every operation is written to disk before entering the RAM buffer, so disk tiers alone
+    /// define retention: the first cold segment, else the first sealed warm segment, else the
+    /// start of `active.wal`. When nothing is retained the tail is `head_seq + 1`, so that a
+    /// cursor at `head_seq - 1` is rejected instead of silently missing operation `head_seq`.
+    fn compute_tail_seq(&self) -> Result<SequenceNumber, ServerError> {
+        let segments_dir = self.dir.join("segments");
+
+        if let Some(first_cold) = ColdDiskLog::list_cold_segments(&segments_dir)?.first() {
+            return Ok(first_cold.start_seq);
+        }
+        if let Some(first_sealed) = self.warm_disk.list_sealed_segments()?.first() {
+            return Ok(first_sealed.start_seq);
+        }
+        if let Some(active_start) = self.warm_disk.active_start_seq() {
+            return Ok(active_start);
+        }
+        Ok(self.head_seq.next())
     }
 
     /// Highest sequence number committed to the log.
@@ -474,22 +475,13 @@ impl TieredLog {
         // 3. Evict from RAM HotBuffer
         self.hot_buffer.evict_older_than(target_seq);
 
-        // 4. Recalculate tail_seq from oldest physically retained segment/RAM
-        let remaining_cold = ColdDiskLog::list_cold_segments(&segments_dir)?;
-        if let Some(first_cold) = remaining_cold.first() {
-            self.tail_seq = first_cold.start_seq;
-        } else {
-            let remaining_warm = self.warm_disk.list_sealed_segments()?;
-            if let Some(first_warm) = remaining_warm.first() {
-                self.tail_seq = first_warm.start_seq;
-            } else if let Some(min_ram) = self.hot_buffer.min_seq() {
-                self.tail_seq = min_ram;
-            } else {
-                self.tail_seq = self.head_seq;
-            }
-        }
+        // 4. Recalculate tail_seq from the oldest physically retained segment
+        self.tail_seq = self.compute_tail_seq()?;
 
         report.new_tail_seq = self.tail_seq;
         Ok(report)
     }
 }
+
+#[cfg(test)]
+mod tests;

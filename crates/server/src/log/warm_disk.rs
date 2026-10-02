@@ -67,9 +67,6 @@ impl WarmDiskLog {
             })?;
 
             self.active_file = Some(file);
-            if self.active_start_seq.is_none() {
-                self.active_start_seq = Some(op.seq);
-            }
         }
 
         let file = self.active_file.as_mut().unwrap();
@@ -80,6 +77,11 @@ impl WarmDiskLog {
         file.flush()?;
         file.sync_data()?;
 
+        // The segment start is tracked independently of when the file handle was opened:
+        // an `active.wal` recovered empty already has an open handle but no operations yet.
+        if self.active_start_seq.is_none() {
+            self.active_start_seq = Some(op.seq);
+        }
         self.active_end_seq = Some(op.seq);
         Ok(())
     }
@@ -329,3 +331,6 @@ pub fn parse_segment_filename(name: &str, extension: &str) -> Option<(u64, u64)>
     let end = parts[1].parse::<u64>().ok()?;
     Some((start, end))
 }
+
+#[cfg(test)]
+mod tests;
