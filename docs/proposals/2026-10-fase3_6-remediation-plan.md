@@ -16,7 +16,7 @@
 **Estados:** ⬜ Pendiente · 🟡 Parcial · ✅ Hecho · ⏸ Diferido (Fase 4) · ❌ Descartado (falso o sin valor)
 
 **Reglas de trabajo** (ver `GEMINI.md`):
-1. Tests solo en `tests/` de cada crate, con al menos un test negativo que reproduzca el fallo.
+1. Tests según la estructura de dos niveles de `GEMINI.md` (unitarios en `src/.../<modulo>/tests.rs`, integración en `tests/`), con al menos un test negativo que reproduzca el fallo y que falle sin el fix.
 2. Sin códigos de auditoría (`DEF-xx`) en código, tests ni docstrings.
 3. Cada lote cierra con `cargo test --workspace` y `cargo clippy --workspace --all-targets -- -D warnings` en verde.
 
@@ -49,16 +49,16 @@
 |---|---|---|---|---|
 | 1 | Consistencia del log y del commit | DEF-01, 36, 07, 58, 59, 67, 04, 29, 06 | Inmediata | ✅ 9/9 |
 | 2 | Durabilidad del motor de storage | DEF-02, 03, 65, 19(storage), 12 | Inmediata | ✅ 5/5 |
-| 3 | Durabilidad de metadatos del servidor | DEF-60, 19(server), 16, 48, 68 | Alta | 0/5 |
+| 3 | Durabilidad de metadatos del servidor | DEF-60, 19(server), 16, 48, 68, 69 | Alta | 0/6 (DEF-68 🟡) |
 | 4 | Autenticación e identificadores | DEF-61, 41, 66 | Alta | 0/3 |
 | 5 | Relay de snapshots | DEF-62, 10, 63, 52, 51, 39, 40, 38, 31(relay), 08(relay), 15 | Alta | 0/11 |
 | 6 | Ciclo de vida de clientes y señalización | DEF-53, 05, 27 (24 y 26 descartados) | Alta | 0/3 |
-| 7 | Protocolo wire y errores HTTP | DEF-46, 28, 11, 43, 64, 22 | Media | 0/6 |
-| 8 | Rendimiento y ciclo de vida de salas | DEF-50, 35, 55, 37, 08, 31(locks), 25(server) | Media | 0/7 |
-| 9 | Robustez e higiene de storage y core | DEF-14, 23, 49, 17, 25(storage), 18, 09, 45, 33, 44, 47, 30, 13, 20, 21, 57 (32 descartado) | Media/Baja | 0/16 |
-| 10 | Diferido a Fase 4 / descartado | DEF-34, 54, 42, 56 | — | — |
+| 7 | Protocolo wire y errores HTTP | DEF-46, 28, 11, 43, 64, 22, 71 | Media | 0/7 |
+| 8 | Rendimiento, portabilidad y ciclo de vida de salas | DEF-50, 35, 55, 37, 08, 31(locks), 25(server), 72 | Media | 0/8 |
+| 9 | Robustez e higiene de storage y core | DEF-14, 23, 49, 17, 25(storage), 18, 09, 45, 33, 44, 47, 30, 13, 20, 21, 57, 70 (32 descartado) | Media/Baja | 1/17 |
+| 10 | Diferido a Fase 4 / descartado | DEF-34, 54, 42, 56, 73 | — | — |
 
-**Avance total:** 14 de 65 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
+**Avance total:** 15 de 69 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
 
 **Severidades corregidas respecto de la auditoría anterior:** de los 7 "críticos" originales, solo DEF-01 lo es. DEF-02, 03 y 04 son Altos; DEF-05 y 06 son Medios; DEF-34 es Bajo. DEF-24, 26 y 56 son falsos en la práctica.
 
@@ -160,11 +160,12 @@ Off-by-one del fast path (`from_seq + 1 >= min_ram`). Solo costaba rendimiento.
 3. Si falla algo después del rename, revertirlo antes de devolver el error.
 **Descartado de la propuesta anterior:** nombres generacionales y el "rollback-merge" de la fase 2 (que en sí mismo no era atómico).
 **Test.** Inyectar fallo en fase 2 dos veces seguidas → reabrir → todas las mutaciones presentes. Fallo con `?` en cada punto → el flag queda en `false` y la siguiente compactación corre.
+**Aplicado.** Además de lo anterior, tras la revisión independiente: el WAL se lee por su propio handle bloqueado (en Windows un segundo handle no puede leer un archivo bloqueado); si el anexo al `.compacting` falla a medias, se trunca de vuelta a su largo previo; si el rollback de la rotación falla, la sala queda marcada como fallida (`StorageError::RoomFailed`) hasta reabrirla. Puntos de fallo cubiertos por tests: `phase2`, `rotate_open`, `rotate_rollback`, `absorb`, `absorb_write`. No cubiertos: error de join del worker, rename del snapshot en fase 3 y errores de limpieza (cubiertos por la recuperación, pero sin test dedicado).
 
 #### DEF-03 · Alto · ✅ Hecho
 **Problema verificado.** En `recover_room`, `remove_file(.wal.compacting)` (`recovery.rs:382`) se ejecuta **antes** de la reescritura in-place del WAL activo (`:411`). Matar el proceso en esa ventana pierde el contenido de `.compacting`; una reescritura cortada deja bytes desalineados (corrupción o truncado de registros confirmados). Requiere un crash durante la recuperación de otro crash: Alto, no Crítico.
 **Errores de la propuesta anterior (tmp → rename → delete).** (a) El `wal_file` abierto y bloqueado (`flock`) seguiría apuntando al inodo viejo, ya desvinculado: las escrituras posteriores se perderían en silencio. (b) Un crash entre el rename y el borrado de `.compacting` duplica registros en el siguiente replay.
-**Solución.** Si `.compacting` tenía registros vivos: reconstruir el estado en memoria (snapshot + `.compacting` + `.wal`), escribir un **snapshot nuevo** por la ruta atómica existente (`write_snapshot_and_truncate_wal`: tmp → `sync_all` → rename → `sync_dir`), luego truncar `.wal`, borrar `.compacting` y `sync_dir`. Nunca se reescribe in-place y nunca se cambia el handle bloqueado. Cualquier crash intermedio queda cubierto por el filtro `seq <= snapshot_seq` y por DEF-65.
+**Solución aplicada.** Si `.compacting` tenía registros vivos: reconstruir el estado en memoria (snapshot + `.compacting` + `.wal`), escribir un **snapshot nuevo** con `write_snapshot_file` (tmp → `sync_all` → rename → `sync_dir`), luego truncar `.wal`, y recién entonces borrar `.compacting` y hacer `sync_dir`. Nunca se reescribe in-place y nunca se cambia el handle bloqueado. Cualquier crash intermedio queda cubierto porque el replay saltea los registros `<= head_seq` (DEF-65).
 **Test.** Dejar los archivos en cada estado intermedio posible (simulando crash en cada paso) → reabrir → estado completo y sin duplicados.
 
 #### DEF-65 · Medio · ✅ Hecho (nuevo)
@@ -202,10 +203,15 @@ Off-by-one del fast path (`from_seq + 1 >= min_ram`). Solo costaba rendimiento.
 **Problema.** Sin apagado ordenado. La durabilidad de commits no está en riesgo (hay `sync_data` antes del ack), pero `RoomCommand::Shutdown` solo corta el loop sin guardar leases, y `ctrl_c()` no captura SIGTERM.
 **Solución.** `axum::serve(...).with_graceful_shutdown(SIGINT | SIGTERM)` → `shutdown_all()`; el handler de `Shutdown` hace `lease_tracker.save()` (con `write_atomic`).
 
-#### DEF-68 · Alto · ⬜ (nuevo)
+#### DEF-68 · Alto · 🟡 Parcial (nuevo)
 **Problema.** Si en un commit el `write` al WAL sale bien pero falla el `fsync`, hoy se responde error y la sala sigue operando. Después de un `fsync` fallido el estado del disco es incierto: el kernel puede descartar las páginas sucias, y un `fsync` posterior "exitoso" no garantiza que esos bytes lleguen al disco ("fsyncgate"). Además, el registro escrito puede quedar en el archivo y reaparecer al reiniciar como una op confirmada que el cliente cree rechazada.
 **Solución.** Regla 1 de `GEMINI.md`: ante una falla de I/O a mitad de una escritura durable, la sala se marca como inválida (rechaza comandos con un error de servicio no disponible), el actor termina, y la próxima apertura recupera desde disco. No se reintenta el `fsync`.
 **Test.** Un punto de fallo `#[cfg(test)]` en el `sync_data` del WAL → el commit falla, los comandos siguientes son rechazados, y al reabrir la sala el estado sale del disco.
+**Hecho en storage.** `DiskStorageEngine::apply_batch` marca la sala como fallida (`StorageError::RoomFailed`) si falla la escritura o el `fsync` del WAL; escrituras y compactaciones se rechazan hasta reabrir. Lo mismo si `apply_snapshot` no puede persistir el estado ya reemplazado en memoria. **Falta el servidor** (`TieredLog::append` en el actor de sala).
+
+#### DEF-69 · Medio · ⬜ (nuevo, revisión del Lote 2)
+**Problema.** En el servidor, `WarmDiskLog::rotate_active_segment` renombra `active.wal` y `ColdDiskLog::compress_warm_segment_sync` renombra el `.tmp` a cold y borra el warm, ambos sin `sync_dir`. Tras un corte de luz, el borrado puede persistir y el rename no, dejando un hueco entre segmentos. Ya no hay pérdida silenciosa (la lectura devuelve `BehindCompaction`), pero sí datos perdidos.
+**Solución.** `durable::sync_dir` después de cada rename y antes de borrar el segmento warm.
 
 ---
 
@@ -313,6 +319,10 @@ Unos 20 sitios en `data_plane.rs` y `sse.rs` devuelven `ServerError::Config` (50
 **Error de la propuesta anterior.** Quitar `impl IntoResponse for ServerError`: el control plane y SSE sí deben responder JSON.
 **Solución.** Solo el rechazo del extractor `ClientAuth` (Data Plane) emite un frame binario `ServerMessage::Error`.
 
+#### DEF-71 · Bajo · ⬜ (nuevo, revisión del Lote 1)
+**Problema.** `tail_seq` cambió de forma visible para el cliente: una sala nueva reporta `1` (antes `0`) y una sala podada por completo reporta `tail_seq = head_seq + 1` (mayor que `head`) en `Registered`/`RegisterResponse`. Un cliente que asuma `tail <= head` se equivoca. Además, las guardas `tail > 0` de `lease.rs` quedaron siempre verdaderas.
+**Solución.** Documentar la semántica en la especificación del protocolo (ARCHITECTURE.md §7) antes de la Fase 4, y simplificar las guardas de `lease.rs` usando `TieredLog::is_behind_retention`.
+
 ---
 
 ## Lote 8 — Rendimiento y ciclo de vida de salas (servidor)
@@ -343,6 +353,13 @@ El `sync_data` de cada commit bloquea un worker de Tokio (en macOS es `F_FULLFSY
 #### DEF-25 (server) · Bajo · ⬜
 `warm_disk.rs` y `cold_disk.rs` ya usan `decode_wal_batch_from_slice`. Lo que está triplicado es el bucle de lectura: extraer un helper.
 
+#### DEF-72 · Medio · ⬜ (nuevo, revisión del Lote 2)
+**Problema.** Windows es plataforma objetivo. `WarmDiskLog::read_range` (y `recover_all`) leen `active.wal` con `std::fs::read`, un segundo handle, mientras `active_file` tiene el lock exclusivo de `fs2`. En Windows ese lock es obligatorio (`LockFileEx`) y la lectura falla: el catch-up desde `active.wal` tras desalojo por TTL de RAM no funcionaría.
+**Solución.** Leer `active.wal` a través del handle que ya tiene el lock (o con un lock compartido coordinado). Verificar en CI con Windows (DEF-73).
+
+#### Nota sobre DEF-08
+La revisión del Lote 1 señaló dos casos más de I/O bloqueante en el actor: `record_pruned_through` (escritura atómica de `log_meta.json`) y los `sync_dir` de la fase 3 de la compactación de storage. Se tratan junto con DEF-08.
+
 ---
 
 ## Lote 9 — Robustez e higiene de storage y core
@@ -362,8 +379,8 @@ El primer write por tabla después de un `scan` (o mientras la compactación ret
 #### DEF-25 (storage) · Bajo · ⬜
 `recovery.rs` duplica unas 170 líneas de parseo de WAL y además se comporta distinto del decoder de core (heurísticas de torn write diferentes). Core expone `parse_batch_header` y `decode_batch_payload`, y la recuperación los usa (lee en streaming, así que no puede usar directamente la API de slice).
 
-#### DEF-18 · Bajo · ⬜
-Guardar `room_id` en `DiskRoomState`. El ID mal derivado solo aparece en errores `RoomLocked`.
+#### DEF-18 · Bajo · ✅ Hecho
+Guardar `room_id` en `DiskRoomState`. El ID mal derivado solo aparece en errores `RoomLocked`. Resuelto junto con las correcciones de la revisión del Lote 2, porque el estado de sala fallida necesitaba el ID.
 
 #### DEF-09 y DEF-45 · Bajo · ⬜
 Sin uso en producción. Eliminar `decode_wal_record_from_slice` y `WalReader::next_record` (o hacer que el lector devuelva lotes completos) y adaptar los tests. Si se conserva el lector, que saltee los frames vacíos.
@@ -376,6 +393,10 @@ Una sola adquisición del lock en las consultas por nombre; renombrar el paráme
 
 #### DEF-13, DEF-20, DEF-21 · Bajo · ⬜
 Encapsulamiento (regla 5). DEF-13 necesita además `Schema::add_column`, porque `schema_registry.rs` usa `tables_by_id.get_mut`. Para DEF-20 no alcanza con hacer privado el campo: `get_mut`, `remove` y `Deserialize` permiten el mismo bypass. En DEF-21, `Operation` es un tipo wire que llega por `Deserialize`; la garantía real es `validate_operation`, que ya se ejecuta.
+
+#### DEF-70 · Bajo · ⬜ (nuevo, revisión del Lote 2)
+**Problema.** `apply_snapshot` acepta un snapshot cuyo `head_seq` es menor que el de la sala. Si hay un crash entre el rename del snapshot y el truncado del WAL, la recuperación encuentra registros que no continúan la secuencia y la sala no abre (`WalCorruption`). Antes se aplicaban en silencio sobre un estado incorrecto.
+**Solución.** Rechazar en `apply_snapshot` un snapshot con `head_seq` menor que el actual (no hay caso legítimo de retroceso).
 
 #### DEF-32 · ❌ Descartado
 El input es un WAL local acotado por longitud y CRC, y bincode 1.3 ya valida longitudes contra el slice. **La solución propuesta rompería todos los WAL existentes**: se escriben con `bincode::serialize` (enteros de ancho fijo), y `DefaultOptions::new()` decodifica varints. Si alguna vez se agrega un límite, usar `.with_fixint_encoding().allow_trailing_bytes().with_limit(..)`.
@@ -395,6 +416,9 @@ Usar `ruzstd` en wasm32 para descomprimir snapshots `ZMSN`, junto con la descomp
 
 #### DEF-42 · Info · ⏸
 ARCHITECTURE.md:169 presenta la descarga directa como alternativa al protocolo por chunks, que ya está implementado. Aclarar el documento; implementar el endpoint, si se quiere, después de DEF-38.
+
+#### DEF-73 · Info · ⏸ (nuevo)
+Windows es plataforma objetivo, pero hoy nada se prueba en Windows. Agregar CI (por ejemplo GitHub Actions) con `windows-latest` que corra `cargo test --workspace`; ahí se verifican DEF-72 y la lectura del WAL por su propio handle en storage.
 
 #### DEF-56 · ❌ Descartado
 Devolver las columnas en el orden de la proyección es el comportamiento estándar y coincide con lo documentado (`options.rs:133`). Rellenar con `Null` anula el sentido de proyectar. A lo sumo, documentarlo y rechazar índices fuera de rango.

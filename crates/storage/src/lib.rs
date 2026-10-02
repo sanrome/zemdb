@@ -2,6 +2,7 @@
 
 pub mod engine;
 pub mod error;
+pub(crate) mod fail_point;
 pub mod memory;
 pub mod options;
 pub mod snapshot;

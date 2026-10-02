@@ -1,5 +1,5 @@
-use crate::disk::fail;
-use crate::{DiskStorageEngine, DiskStorageOptions, StorageEngine};
+use crate::fail_point;
+use crate::{DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError};
 use std::path::Path;
 use zemdb_core::{
     CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequenceNumber,
@@ -74,11 +74,11 @@ async fn two_failed_compactions_in_a_row_lose_no_data() {
     let snap_path = engine.snap_file_path(&room);
 
     apply_range(&engine, &room, 1..=5).await;
-    fail::arm("compaction.phase2", &snap_path);
+    fail_point::arm("compaction.phase2", &snap_path);
     assert!(engine.compact_room(&room).await.is_err());
 
     apply_range(&engine, &room, 6..=10).await;
-    fail::arm("compaction.phase2", &snap_path);
+    fail_point::arm("compaction.phase2", &snap_path);
     assert!(engine.compact_room(&room).await.is_err());
 
     engine.close_room(&room).await.unwrap();
@@ -94,7 +94,7 @@ async fn compaction_after_failed_wal_rotation_still_runs() {
     let wal_path = engine.wal_file_path(&room);
 
     apply_range(&engine, &room, 1..=5).await;
-    fail::arm("compaction.rotate_open", &wal_path);
+    fail_point::arm("compaction.rotate_open", &wal_path);
     assert!(engine.compact_room(&room).await.is_err());
 
     engine.compact_room(&room).await.unwrap();
@@ -110,7 +110,7 @@ async fn writes_after_failed_wal_rotation_stay_durable() {
     let wal_path = engine.wal_file_path(&room);
 
     apply_range(&engine, &room, 1..=5).await;
-    fail::arm("compaction.rotate_open", &wal_path);
+    fail_point::arm("compaction.rotate_open", &wal_path);
     assert!(engine.compact_room(&room).await.is_err());
     apply_range(&engine, &room, 6..=10).await;
 
@@ -128,7 +128,7 @@ async fn compaction_absorbs_orphan_from_failed_attempt() {
     let compacting_path = engine.wal_file_path(&room).with_extension("wal.compacting");
 
     apply_range(&engine, &room, 1..=5).await;
-    fail::arm("compaction.phase2", &snap_path);
+    fail_point::arm("compaction.phase2", &snap_path);
     assert!(engine.compact_room(&room).await.is_err());
     assert!(compacting_path.exists());
     apply_range(&engine, &room, 6..=10).await;
@@ -151,17 +151,77 @@ async fn crash_between_absorbing_and_truncating_wal_recovers_without_duplicates(
     let wal_path = engine.wal_file_path(&room);
 
     apply_range(&engine, &room, 1..=5).await;
-    fail::arm("compaction.phase2", &snap_path);
+    fail_point::arm("compaction.phase2", &snap_path);
     assert!(engine.compact_room(&room).await.is_err());
     apply_range(&engine, &room, 6..=10).await;
 
     // The active WAL is copied into `.wal.compacting` but never truncated, so records
     // 6..=10 now exist in both files.
-    fail::arm("compaction.absorb", &wal_path);
+    fail_point::arm("compaction.absorb", &wal_path);
     assert!(engine.compact_room(&room).await.is_err());
 
     engine.close_room(&room).await.unwrap();
     let reopened = open_engine(dir.path(), &room).await;
     assert_rows(&reopened, &room, 10).await;
     apply_range(&reopened, &room, 11..=11).await;
+}
+
+#[tokio::test]
+async fn failed_absorb_leaves_no_partial_batch_in_compacting_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("partial-absorb");
+    let engine = open_engine(dir.path(), &room).await;
+    let snap_path = engine.snap_file_path(&room);
+    let wal_path = engine.wal_file_path(&room);
+    let compacting_path = wal_path.with_extension("wal.compacting");
+
+    apply_range(&engine, &room, 1..=5).await;
+    fail_point::arm("compaction.phase2", &snap_path);
+    assert!(engine.compact_room(&room).await.is_err());
+    let compacting_len = std::fs::metadata(&compacting_path).unwrap().len();
+    apply_range(&engine, &room, 6..=10).await;
+
+    // The append to `.wal.compacting` stops halfway through, as with a full disk.
+    fail_point::arm("compaction.absorb_write", &wal_path);
+    assert!(engine.compact_room(&room).await.is_err());
+    assert_eq!(
+        std::fs::metadata(&compacting_path).unwrap().len(),
+        compacting_len
+    );
+
+    // A later compaction appends after it and also fails; recovery must still read everything.
+    apply_range(&engine, &room, 11..=12).await;
+    fail_point::arm("compaction.phase2", &snap_path);
+    assert!(engine.compact_room(&room).await.is_err());
+
+    engine.close_room(&room).await.unwrap();
+    let reopened = open_engine(dir.path(), &room).await;
+    assert_rows(&reopened, &room, 12).await;
+}
+
+#[tokio::test]
+async fn failed_rotation_rollback_marks_room_failed_until_reopened() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("rollback-failure");
+    let engine = open_engine(dir.path(), &room).await;
+    let wal_path = engine.wal_file_path(&room);
+
+    apply_range(&engine, &room, 1..=5).await;
+    fail_point::arm("compaction.rotate_open", &wal_path);
+    fail_point::arm("compaction.rotate_rollback", &wal_path);
+    assert!(engine.compact_room(&room).await.is_err());
+
+    assert!(matches!(
+        engine.apply_batch(&room, vec![insert(6)]).await,
+        Err(StorageError::RoomFailed { .. })
+    ));
+    assert!(matches!(
+        engine.compact_room(&room).await,
+        Err(StorageError::RoomFailed { .. })
+    ));
+
+    engine.close_room(&room).await.unwrap();
+    let reopened = open_engine(dir.path(), &room).await;
+    assert_rows(&reopened, &room, 5).await;
+    apply_range(&reopened, &room, 6..=6).await;
 }

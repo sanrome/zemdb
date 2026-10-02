@@ -1,5 +1,4 @@
 pub mod compactor;
-pub(crate) mod fail;
 pub mod format;
 pub mod recovery;
 pub mod wal;
@@ -82,6 +81,7 @@ impl DiskStorageOptions {
 /// Internal state of an open database room on disk in the Dual-File architecture.
 #[derive(Debug)]
 pub struct DiskRoomState {
+    pub room_id: RoomId,
     pub schema: Schema,
     pub head_seq: SequenceNumber,
     pub snapshot_seq: SequenceNumber,
@@ -94,6 +94,28 @@ pub struct DiskRoomState {
     /// Set while a compaction runs. Atomic so that a guard can release it on drop without
     /// awaiting the room lock.
     pub is_compacting: Arc<AtomicBool>,
+    /// Set when an I/O failure leaves the files in a state only recovery can resolve, such as
+    /// a WAL write whose durability is unknown. Writes and compactions are then refused.
+    pub failure: Option<String>,
+}
+
+impl DiskRoomState {
+    /// Marks the room as failed; it must be closed and reopened to recover from disk.
+    pub(crate) fn mark_failed(&mut self, reason: String) {
+        tracing::error!(room_id = %self.room_id, reason = %reason, "Room marked as failed");
+        self.failure = Some(reason);
+    }
+
+    /// Returns an error if the room was marked as failed.
+    pub(crate) fn ensure_usable(&self) -> Result<(), StorageError> {
+        match &self.failure {
+            Some(reason) => Err(StorageError::RoomFailed {
+                room_id: self.room_id.clone(),
+                reason: reason.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
 }
 
 /// High-performance, crash-resilient disk storage engine for ZemDB.
@@ -215,6 +237,7 @@ impl StorageEngine for DiskStorageEngine {
         .await?;
 
         let room_state = DiskRoomState {
+            room_id: room_id.clone(),
             schema,
             head_seq: recovered.head_seq,
             snapshot_seq: recovered.snapshot_seq,
@@ -225,6 +248,7 @@ impl StorageEngine for DiskStorageEngine {
             snapshot_len: recovered.snapshot_len,
             wal_len: recovered.wal_len,
             is_compacting: Arc::new(AtomicBool::new(false)),
+            failure: None,
         };
 
         rooms.insert(room_id.clone(), Arc::new(RwLock::new(room_state)));
@@ -259,6 +283,7 @@ impl StorageEngine for DiskStorageEngine {
     ) -> Result<SequenceNumber, StorageError> {
         let room_arc = self.get_room(room_id).await?;
         let mut room = room_arc.write().await;
+        room.ensure_usable()?;
 
         // An empty batch changes nothing; writing it would only add an empty frame to the WAL.
         if ops.is_empty() {
@@ -287,9 +312,20 @@ impl StorageEngine for DiskStorageEngine {
         // 2. Encode WAL records into framed byte buffer
         let wal_batch_bytes = WalWriter::encode_batch(&ops)?;
 
-        // 3. Write to append-only WAL file and fsync data
-        room.wal_file.write_all(&wal_batch_bytes).await?;
-        room.wal_file.sync_data().await?;
+        // 3. Write to append-only WAL file and fsync data. A failure here leaves an unknown
+        // amount of the batch on disk, and a failed fsync cannot be retried safely, so the room
+        // stops accepting writes until recovery replays the WAL from disk.
+        let write_result = async {
+            room.wal_file.write_all(&wal_batch_bytes).await?;
+            crate::fail_point::check("apply_batch.sync", &room.wal_path)?;
+            room.wal_file.sync_data().await?;
+            Ok::<(), StorageError>(())
+        }
+        .await;
+        if let Err(err) = write_result {
+            room.mark_failed(format!("WAL append failed: {err}"));
+            return Err(err);
+        }
         room.wal_len += wal_batch_bytes.len() as u64;
 
         // 4. Apply operations to in-memory tables
@@ -570,14 +606,23 @@ impl StorageEngine for DiskStorageEngine {
         let _guard = compaction_lock.lock().await;
 
         let mut room = room_arc.write().await;
+        room.ensure_usable()?;
 
         room.schema = schema;
         room.head_seq = payload.head_seq;
         room.tables = payload.tables;
 
         // Perform atomic snapshot rewrite on disk
-        compact_room_internal(&mut room, &self.options).await?;
+        // The in-memory state was already replaced; if it cannot be persisted, memory and disk
+        // disagree and only recovery from disk can restore a consistent room.
+        if let Err(err) = compact_room_internal(&mut room, &self.options).await {
+            room.mark_failed(format!("Persisting an applied snapshot failed: {err}"));
+            return Err(err);
+        }
 
         Ok(room.head_seq)
     }
 }
+
+#[cfg(test)]
+mod tests;

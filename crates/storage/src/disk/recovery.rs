@@ -12,10 +12,10 @@ use zemdb_core::{
 use crate::disk::compactor::{
     compacting_wal_path, remove_if_exists, sync_parent, write_snapshot_file,
 };
-use crate::disk::fail;
 pub use crate::disk::format::replay_wal_records;
 use crate::disk::format::{FileHeader, HEADER_SIZE};
 use crate::error::StorageError;
+use crate::fail_point;
 use crate::memory::RoomSnapshotPayload;
 use crate::sys::sync_dir;
 
@@ -408,7 +408,7 @@ pub async fn recover_room(
             snapshot_len =
                 write_snapshot_file(snap_path, head_seq, &tables, zstd_level, room_id).await?;
             snapshot_seq = head_seq;
-            fail::check("recovery.fold", wal_path)?;
+            fail_point::check("recovery.fold", wal_path)?;
 
             // The snapshot now holds every record of the active WAL as well.
             wal_file.set_len(0).await?;
@@ -416,7 +416,7 @@ pub async fn recover_room(
             valid_wal_bytes = 0;
         }
 
-        fail::check("recovery.fold_cleanup", wal_path)?;
+        fail_point::check("recovery.fold_cleanup", wal_path)?;
         remove_if_exists(&wal_compacting_path).await?;
         sync_parent(&wal_compacting_path)?;
     }

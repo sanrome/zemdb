@@ -1,8 +1,10 @@
-//! Fault injection points for crash and I/O failure tests.
+//! Test infrastructure: fault injection points for crash and I/O failure tests.
 //!
-//! In test builds a fail point can be armed for a specific file path, so tests running in
-//! parallel never interfere with each other. Each armed point fires once. In non-test builds
-//! `check` is an empty function and the compiler removes it.
+//! Production code calls `check` at the exact spots where a crash or I/O error must be
+//! reproducible. In non-test builds `check` is an empty function that the compiler removes,
+//! so it has no runtime effect. In unit-test builds a test arms a point for a specific file
+//! path with `arm`, so tests running in parallel never interfere with each other; each armed
+//! point fires once.
 
 use crate::error::StorageError;
 use std::path::Path;

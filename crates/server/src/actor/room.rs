@@ -453,7 +453,9 @@ impl RoomActor {
                     Some(snap_seq) => min_ack.min(snap_seq),
                     None => min_ack,
                 };
-                let _ = self.tiered_log.prune_older_than(retention_floor);
+                if let Err(err) = self.tiered_log.prune_older_than(retention_floor) {
+                    warn!(room = %self.room_id, error = %err, "Proactive log pruning failed");
+                }
             }
             self.head_seq
         });
@@ -479,7 +481,9 @@ impl RoomActor {
                 Some(snap_seq) => min_ack.min(snap_seq),
                 None => min_ack,
             };
-            let _ = self.tiered_log.prune_older_than(retention_floor);
+            if let Err(err) = self.tiered_log.prune_older_than(retention_floor) {
+                warn!(room = %self.room_id, error = %err, "Proactive log pruning failed");
+            }
         }
     }
 }

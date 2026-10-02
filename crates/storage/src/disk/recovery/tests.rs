@@ -1,5 +1,5 @@
-use crate::disk::fail;
 use crate::disk::format::encode_wal_batch;
+use crate::fail_point;
 use crate::{DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError};
 use std::io::Write;
 use std::path::Path;
@@ -64,7 +64,7 @@ async fn leave_orphan_compacting(dir: &Path, room: &RoomId) {
     for seq in 1..=5 {
         engine.apply_batch(room, vec![insert(seq)]).await.unwrap();
     }
-    fail::arm("compaction.phase2", &engine.snap_file_path(room));
+    fail_point::arm("compaction.phase2", &engine.snap_file_path(room));
     assert!(engine.compact_room(room).await.is_err());
     for seq in 6..=8 {
         engine.apply_batch(room, vec![insert(seq)]).await.unwrap();
@@ -89,7 +89,7 @@ async fn crash_while_folding_compacting_wal_recovers_all_data() {
     leave_orphan_compacting(dir.path(), &room).await;
 
     let engine = engine_at(dir.path());
-    fail::arm("recovery.fold", &engine.wal_file_path(&room));
+    fail_point::arm("recovery.fold", &engine.wal_file_path(&room));
     assert!(engine.open_room(&room, schema()).await.is_err());
 
     engine.open_room(&room, schema()).await.unwrap();
@@ -103,7 +103,7 @@ async fn crash_before_compacting_wal_removal_recovers_all_data() {
     leave_orphan_compacting(dir.path(), &room).await;
 
     let engine = engine_at(dir.path());
-    fail::arm("recovery.fold_cleanup", &engine.wal_file_path(&room));
+    fail_point::arm("recovery.fold_cleanup", &engine.wal_file_path(&room));
     assert!(engine.open_room(&room, schema()).await.is_err());
 
     engine.open_room(&room, schema()).await.unwrap();

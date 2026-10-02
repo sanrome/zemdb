@@ -5,14 +5,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::fs::{rename, File};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 use zemdb_core::{CompactRow, PrimaryKey, RoomId, SequenceNumber};
 
-use crate::disk::fail;
 use crate::disk::format::FileHeader;
 use crate::disk::{DiskRoomState, DiskStorageOptions};
 use crate::error::StorageError;
+use crate::fail_point;
 use crate::memory::{RoomSnapshotPayload, RoomSnapshotRef};
 use crate::sys::sync_dir;
 
@@ -73,13 +73,14 @@ pub async fn compact_room_cow(
     // Phase 1: Preparation and WAL rotation under exclusive write lock
     let (_flag, cut_seq, snapshot_tables, snap_path, wal_compacting_path, room_id) = {
         let mut room = room_arc.write().await;
+        room.ensure_usable()?;
         let Some(flag) = CompactionFlag::try_acquire(&room.is_compacting) else {
             return Ok(());
         };
 
         room.wal_file.sync_all().await?;
 
-        let room_id = room_id_from_snap_path(&room.snap_path);
+        let room_id = room.room_id.clone();
         let wal_compacting_path = compacting_wal_path(&room.wal_path);
 
         if tokio::fs::try_exists(&wal_compacting_path).await? {
@@ -103,7 +104,7 @@ pub async fn compact_room_cow(
     let staged = {
         let snap_path = snap_path.clone();
         tokio::task::spawn_blocking(move || -> Result<StagedSnapshot, StorageError> {
-            fail::check("compaction.phase2", &snap_path)?;
+            fail_point::check("compaction.phase2", &snap_path)?;
             let payload = RoomSnapshotPayload {
                 head_seq: cut_seq,
                 tables: snapshot_tables,
@@ -153,8 +154,14 @@ async fn rotate_wal_to_compacting(
         Err(err) => {
             // The open handle still points at the renamed file. Move it back so that
             // subsequent writes keep landing in the file recovery reads as the active WAL.
-            rename(wal_compacting_path, &room.wal_path).await?;
-            sync_parent(&room.wal_path)?;
+            if let Err(rollback_err) = roll_back_rotation(&room.wal_path, wal_compacting_path).await
+            {
+                // Writes would now land in `.wal.compacting`, and a later compaction would
+                // absorb that file into itself. Only recovery can sort this out safely.
+                room.mark_failed(format!(
+                    "WAL rotation failed ({err}) and could not be rolled back ({rollback_err})"
+                ));
+            }
             return Err(err);
         }
     }
@@ -162,8 +169,17 @@ async fn rotate_wal_to_compacting(
     sync_parent(&room.wal_path)
 }
 
+async fn roll_back_rotation(
+    wal_path: &Path,
+    wal_compacting_path: &Path,
+) -> Result<(), StorageError> {
+    fail_point::check("compaction.rotate_rollback", wal_path)?;
+    rename(wal_compacting_path, wal_path).await?;
+    sync_parent(wal_path)
+}
+
 fn open_fresh_wal(wal_path: &Path, room_id: &RoomId) -> Result<std::fs::File, StorageError> {
-    fail::check("compaction.rotate_open", wal_path)?;
+    fail_point::check("compaction.rotate_open", wal_path)?;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -179,27 +195,77 @@ fn open_fresh_wal(wal_path: &Path, room_id: &RoomId) -> Result<std::fs::File, St
 /// the active WAL.
 ///
 /// The append is synced before the active WAL is truncated, so a crash in between only
-/// duplicates records, which recovery skips. The active WAL handle and its lock are kept.
+/// duplicates records, which recovery skips. The active WAL is read through its own locked
+/// handle (a second handle cannot read a file locked on Windows), and that handle and its lock
+/// are kept. If the append fails, `.wal.compacting` is truncated back to its previous length so
+/// that a partially written batch never sits in front of records appended later.
 async fn absorb_wal_into_compacting(
     room: &mut DiskRoomState,
     wal_compacting_path: &Path,
 ) -> Result<(), StorageError> {
-    let wal_bytes = tokio::fs::read(&room.wal_path).await?;
-    if !wal_bytes.is_empty() {
-        let mut compacting = tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(wal_compacting_path)
-            .await?;
-        compacting.write_all(&wal_bytes).await?;
-        compacting.sync_all().await?;
+    let mut wal_bytes = Vec::new();
+    let read_result = async {
+        room.wal_file.seek(SeekFrom::Start(0)).await?;
+        room.wal_file.read_to_end(&mut wal_bytes).await?;
+        Ok::<(), StorageError>(())
+    }
+    .await;
+    if let Err(err) = read_result {
+        // The handle position is unknown; appending from there could overwrite records.
+        room.mark_failed(format!("Reading the active WAL failed: {err}"));
+        return Err(err);
     }
 
-    fail::check("compaction.absorb", &room.wal_path)?;
+    if !wal_bytes.is_empty() {
+        append_synced(wal_compacting_path, &wal_bytes, room).await?;
+    }
+
+    fail_point::check("compaction.absorb", &room.wal_path)?;
 
     room.wal_file.set_len(0).await?;
     room.wal_file.seek(SeekFrom::Start(0)).await?;
     room.wal_file.sync_all().await?;
     room.wal_len = 0;
+    Ok(())
+}
+
+/// Appends `bytes` to `path` and syncs it, restoring the previous length if anything fails.
+async fn append_synced(
+    path: &Path,
+    bytes: &[u8],
+    room: &mut DiskRoomState,
+) -> Result<(), StorageError> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .await?;
+    let original_len = file.metadata().await?.len();
+
+    let append_result = async {
+        let (first, rest) = bytes.split_at(bytes.len() / 2);
+        file.write_all(first).await?;
+        fail_point::check("compaction.absorb_write", &room.wal_path)?;
+        file.write_all(rest).await?;
+        file.sync_all().await?;
+        Ok::<(), StorageError>(())
+    }
+    .await;
+
+    if let Err(err) = append_result {
+        let restore_result = async {
+            file.set_len(original_len).await?;
+            file.sync_all().await?;
+            Ok::<(), StorageError>(())
+        }
+        .await;
+        if let Err(restore_err) = restore_result {
+            room.mark_failed(format!(
+                "Appending to {path:?} failed ({err}) and its length could not be restored \
+                 ({restore_err})"
+            ));
+        }
+        return Err(err);
+    }
     Ok(())
 }
 
@@ -288,7 +354,7 @@ pub async fn write_snapshot_and_truncate_wal(
     room: &mut DiskRoomState,
     options: &DiskStorageOptions,
 ) -> Result<(), StorageError> {
-    let room_id = room_id_from_snap_path(&room.snap_path);
+    let room_id = room.room_id.clone();
     let compressed_len = write_snapshot_file(
         &room.snap_path,
         room.head_seq,
@@ -336,16 +402,6 @@ pub(crate) fn sync_parent(path: &Path) -> Result<(), StorageError> {
         sync_dir(parent)?;
     }
     Ok(())
-}
-
-/// Derives the room identifier used in lock error messages from the snapshot file name.
-fn room_id_from_snap_path(snap_path: &Path) -> RoomId {
-    RoomId::new(
-        snap_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown"),
-    )
 }
 
 #[cfg(test)]

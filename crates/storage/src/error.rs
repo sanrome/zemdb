@@ -40,6 +40,11 @@ pub enum StorageError {
     #[error("Storage engine is closed")]
     EngineClosed,
 
+    /// An I/O failure left the room's files in a state that only recovery can resolve.
+    /// Writes and compactions are refused until the room is closed and reopened.
+    #[error("Room '{room_id}' must be reopened after an unrecoverable I/O failure: {reason}")]
+    RoomFailed { room_id: RoomId, reason: String },
+
     #[error("Storage engine error: {0}")]
     Other(String),
 }
