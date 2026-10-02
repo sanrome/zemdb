@@ -93,14 +93,15 @@
 > Objetivo: que `/sync` y `/commit` nunca entreguen huecos de secuencia ni rechacen ilegítimamente a clientes cuyos deltas existen en disco.
 > Orden interno obligatorio: DEF-07 y DEF-58 antes de dar por cerrado DEF-01.
 
-#### DEF-01 · Crítico · 🟡 Parcial (eb8baa6)
+#### DEF-01 · Crítico · ✅ Hecho (eb8baa6 + f08dcff + este lote)
 **Problema.** Cuando el `HotBuffer` desalojaba ops por TTL, `fetch_deltas` servía desde RAM saltando lo que estaba en `active.wal`, entregando huecos de secuencia. El disparador realista es el TTL (5 min), no la cuota: rotación y cuota usan el mismo umbral.
 **Hecho en eb8baa6.** `get_range` rechaza cursores anteriores a la RAM; los tiers se leen en orden cronológico (cold → sealed → active → RAM); los límites entre tiers y los solapes están bien manejados.
 **Falta.**
 1. ~~DEF-07: la guarda de retención corta con `BehindCompaction` antes de llegar al puente con `active.wal`.~~ Resuelto junto con DEF-07; cubierto por `fetch_after_ram_ttl_eviction_bridges_from_active_wal`.
-2. DEF-29: `handle_commit` convierte el nuevo error de discontinuidad en un hueco (`vec![seq_op]`).
-3. Un hueco real detectado en la lectura debe mapearse a `BehindCompaction`, no a un error interno de WAL.
-4. El test `test_tiered_log_eviction_gap_bridged_from_active_wal` no ejercita lo que dice: con `ram_max_ops=5` todo rota a segmentos sellados y no queda `active.wal`. Corregir su comentario o su configuración.
+2. ~~DEF-29: `handle_commit` convierte el nuevo error de discontinuidad en un hueco (`vec![seq_op]`).~~ Resuelto con DEF-29.
+3. ~~Un hueco real detectado en la lectura debe mapearse a `BehindCompaction`, no a un error interno de WAL.~~ Hecho (`sequence_gap`, test `gap_inside_retained_range_reports_behind_compaction`).
+4. ~~El test `test_tiered_log_eviction_gap_bridged_from_active_wal` no ejercita lo que dice.~~ Renombrado a `..._from_sealed_segments` con comentarios corregidos; el caso de `active.wal` lo cubre el test unitario nuevo.
+5. Pendiente menor (Lote 8): en la ruta lenta de `fetch_deltas`, el tier de RAM quedó prácticamente sin uso, porque `active.wal` ya cubre todo lo que está en RAM.
 **Test.** Desalojo por TTL sin rotación → `run_maintenance_sync` → `fetch_deltas` desde antes de la RAM devuelve la secuencia contigua desde `active.wal`.
 
 #### DEF-36 · Bajo · ✅ Hecho (eb8baa6)
@@ -126,19 +127,19 @@ Off-by-one del fast path (`from_seq + 1 >= min_ram`). Solo costaba rendimiento.
 **Solución aplicada.** `log_meta.json` en el directorio de la sala guarda `pruned_through_seq`, escrito con `durable::write_atomic` **antes** de borrar segmentos en ambas rutas de poda. Al abrir, `head = max(head de los segmentos, pruned_through_seq)`. Un `log_meta.json` ilegible hace fallar la apertura en lugar de reiniciar la secuencia.
 **Test.** Podar todo por TTL → reabrir → `head_seq` se conserva y el siguiente append usa `head + 1`.
 
-#### DEF-04 · Alto · ⬜ (depende de D1)
+#### DEF-04 · Alto · ✅ Hecho
 **Problema.** `handle_commit` secuencia, persiste, avanza `head`, registra dedup y emite SSE; recién después llama a `fetch_deltas`, que puede fallar con `BehindCompaction`. El cliente cree que su mutación fue rechazada cuando en realidad quedó confirmada y replicada.
 **Error de la propuesta anterior.** Ponía el chequeo "al inicio del método", **antes** de la deduplicación: un reintento de una mutación ya confirmada recibiría `BehindCompaction`, reproduciendo el mismo split-brain; y si la LRU la desaloja, el reintento posterior se aplicaría dos veces. El gate actual de `Dormant`/`Bootstrapping` tiene el mismo problema de orden.
 **Solución.** Orden en `handle_commit`: (1) dedup → si es duplicado, rama de DEF-06; (2) chequeo de retención `last_ack_seq >= tail - 1` (según D1: rechazar sin efectos, o marcar `needs_snapshot`); (3) secuenciar y persistir; (4) catch-up según D2.
 **Test.** Cliente detrás de la retención hace commit → no se secuencia nada, `head` no cambia, no hay evento SSE (o, con D1 = aceptar, `CommitAck` con `needs_snapshot`). Reintento de una mutación ya confirmada desde un cliente ahora rezagado → `CommitAck` con el `assigned_seq` original.
 
-#### DEF-29 · Medio · ⬜
+#### DEF-29 · Medio · ✅ Hecho
 **Problema.** Si `fetch_deltas` falla después del append, el actor responde `(vec![seq_op], false)`, saltando las ops intermedias: hueco de secuencia en el cliente.
 **Error de la propuesta anterior.** "Propagar el error": la mutación ya es durable, así que responder `Err` reintroduce DEF-04.
 **Solución.** D2: `CommitAck` con `assigned_seq`, `catchup_ops: []`, `has_more: true`.
 **Test.** Forzar fallo de `fetch_deltas` post-append → `CommitAck` con `has_more: true` y sin huecos.
 
-#### DEF-06 · Medio · ⬜
+#### DEF-06 · Medio · ✅ Hecho
 **Problema verificado.** La afirmación principal de la auditoría es falsa: si `last_ack_seq >= existing_seq`, el cliente ya tiene su op y no hace falta reenviarla. Los problemas reales son dos: (a) `from_seq = existing_seq` reenvía ops que el cliente ya tiene cuando `existing_seq < last_ack_seq`; (b) `unwrap_or_default()` traga `BehindCompaction` y responde vacío con `has_more: false`, así que el cliente cree estar al día y se salta el hueco.
 **Solución.** En la rama de duplicado, usar siempre `from_seq = last_ack_seq` (igual que la ruta normal). Eliminar `unwrap_or_default()`; ante error, aplicar D2 (la mutación ya está confirmada).
 **Test.** Reintento con `last_ack_seq` antiguo → catch-up contiguo que incluye la op original. Reintento con cursor fuera de retención → `CommitAck` con `has_more: true`, nunca `has_more: false` vacío.

@@ -542,7 +542,7 @@ async fn test_tiered_log_disk_quota_saturation_pruning() {
 }
 
 #[test]
-fn test_tiered_log_eviction_gap_bridged_from_active_wal() {
+fn test_tiered_log_eviction_gap_bridged_from_sealed_segments() {
     let dir = tempdir().unwrap();
     let policy = RoomLifecyclePolicy {
         ram_max_ops: 5,
@@ -553,7 +553,8 @@ fn test_tiered_log_eviction_gap_bridged_from_active_wal() {
 
     // Append 15 operations. With ram_max_ops = 5, operations 1..=10 are evicted
     // from the RAM sliding window, while 11..=15 remain in RAM.
-    // All 15 operations reside in the active WAL on disk.
+    // The active segment also rotates every 5 operations, so all 15 operations
+    // reside in sealed segments on disk and no `active.wal` remains.
     for i in 1..=15 {
         log.append(make_test_op(i), None).unwrap();
     }
@@ -561,7 +562,7 @@ fn test_tiered_log_eviction_gap_bridged_from_active_wal() {
     assert_eq!(log.head_seq().get(), 15);
 
     // Request range crossing the eviction boundary: from cursor 7 with limit 6 (expecting 8..=13).
-    // Operations 8..=10 were evicted from RAM and must be read from active.wal.
+    // Operations 8..=10 were evicted from RAM and must be read from the sealed segments.
     // Operations 11..=13 are present in RAM HotBuffer.
     let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(7), 6).unwrap();
 

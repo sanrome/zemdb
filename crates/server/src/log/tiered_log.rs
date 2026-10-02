@@ -165,7 +165,7 @@ impl TieredLog {
         max_batch_size: u32,
     ) -> Result<(Vec<SequencedOperation>, bool), ServerError> {
         // Eviction check (Tier 4 boundary)
-        if self.tail_seq.get() > 1 && from_seq.get() < self.tail_seq.get().saturating_sub(1) {
+        if self.is_behind_retention(from_seq) {
             return Err(ServerError::BehindCompaction);
         }
 
@@ -200,11 +200,7 @@ impl TieredLog {
                     ColdDiskLog::read_range(&cold.path, current_from, limit - collected.len())?;
                 for op in ops {
                     if op.seq.get() != current_from.get() + 1 {
-                        return Err(ServerError::Wal(format!(
-                            "Sequence discontinuity in cold log fetch: expected sequence {}, found {}",
-                            current_from.get() + 1,
-                            op.seq.get()
-                        )));
+                        return Err(sequence_gap("cold", current_from, op.seq));
                     }
                     current_from = op.seq;
                     collected.push(op);
@@ -230,11 +226,7 @@ impl TieredLog {
                     )?;
                     for op in ops {
                         if op.seq.get() != current_from.get() + 1 {
-                            return Err(ServerError::Wal(format!(
-                                "Sequence discontinuity in warm sealed log fetch: expected sequence {}, found {}",
-                                current_from.get() + 1,
-                                op.seq.get()
-                            )));
+                            return Err(sequence_gap("warm sealed", current_from, op.seq));
                         }
                         current_from = op.seq;
                         collected.push(op);
@@ -259,11 +251,7 @@ impl TieredLog {
                     WarmDiskLog::read_range(&active_path, current_from, limit - collected.len())?;
                 for op in active_ops {
                     if op.seq.get() != current_from.get() + 1 {
-                        return Err(ServerError::Wal(format!(
-                            "Sequence discontinuity in active wal log fetch: expected sequence {}, found {}",
-                            current_from.get() + 1,
-                            op.seq.get()
-                        )));
+                        return Err(sequence_gap("active wal", current_from, op.seq));
                     }
                     current_from = op.seq;
                     collected.push(op);
@@ -283,11 +271,7 @@ impl TieredLog {
                 .get_range(current_from, limit - collected.len());
             for op in ram_ops {
                 if op.seq.get() != current_from.get() + 1 {
-                    return Err(ServerError::Wal(format!(
-                        "Sequence discontinuity in hot buffer log fetch: expected sequence {}, found {}",
-                        current_from.get() + 1,
-                        op.seq.get()
-                    )));
+                    return Err(sequence_gap("hot buffer", current_from, op.seq));
                 }
                 current_from = op.seq;
                 collected.push(op);
@@ -465,6 +449,12 @@ impl TieredLog {
         Ok(self.head_seq.next())
     }
 
+    /// Returns true if a client whose cursor is `cursor` can no longer be caught up from the log,
+    /// because the operation right after its cursor has already been pruned.
+    pub fn is_behind_retention(&self, cursor: SequenceNumber) -> bool {
+        cursor.get().saturating_add(1) < self.tail_seq.get()
+    }
+
     /// Highest sequence number committed to the log.
     pub fn head_seq(&self) -> SequenceNumber {
         self.head_seq
@@ -537,6 +527,19 @@ impl TieredLog {
         report.new_tail_seq = self.tail_seq;
         Ok(report)
     }
+}
+
+/// Handles a gap found while reading a tier: the log claims to retain the range but an
+/// operation is missing. The client cannot be caught up from the log, so it is reported as
+/// `BehindCompaction` to send it to a snapshot, and logged as a server-side fault.
+fn sequence_gap(tier: &str, cursor: SequenceNumber, found: SequenceNumber) -> ServerError {
+    tracing::error!(
+        tier,
+        expected = cursor.get() + 1,
+        found = found.get(),
+        "Sequence gap in retained log range"
+    );
+    ServerError::BehindCompaction
 }
 
 /// Reads the highest pruned sequence recorded for the log in `dir`, or zero if nothing was ever pruned.

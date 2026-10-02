@@ -1,6 +1,3 @@
-use zemdb_core::id::{MutationId, RoomId, SchemaId, SequenceNumber};
-use zemdb_core::protocol::messages::SequencedOperation;
-use zemdb_core::schema::Schema;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -8,6 +5,9 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
+use zemdb_core::id::{MutationId, RoomId, SchemaId, SequenceNumber};
+use zemdb_core::protocol::messages::SequencedOperation;
+use zemdb_core::schema::Schema;
 
 use crate::actor::command::{
     CommitResponse, RegisterResponse, RoomCommand, RoomEvent, RoomMetrics, SyncBatchResponse,
@@ -262,15 +262,7 @@ impl RoomActor {
             return;
         }
 
-        // 1. Check if client is Dormant or Bootstrapping (behind compaction boundary)
-        if self.lease_tracker.is_dormant(&client_id)
-            || self.lease_tracker.is_bootstrapping(&client_id)
-        {
-            let _ = reply.send(Err(ServerError::BehindCompaction));
-            return;
-        }
-
-        // 2. Validate that client last_ack_seq does not exceed server head_seq
+        // 1. Validate that client last_ack_seq does not exceed server head_seq
         if last_ack_seq > self.head_seq {
             let _ = reply.send(Err(ServerError::InvalidSequence {
                 expected: self.head_seq,
@@ -279,18 +271,11 @@ impl RoomActor {
             return;
         }
 
-        // 3. Exactly-Once Idempotency Check via DedupLruCache
+        // 2. Exactly-once idempotency. Checked before any rejection based on client state:
+        // a retried mutation was already committed and replicated, so it must always be
+        // acknowledged with its original sequence, never reported as a failure.
         if let Some(existing_seq) = self.dedup_cache.is_duplicate(&mutation_id) {
-            let from_seq = if last_ack_seq < existing_seq {
-                last_ack_seq
-            } else {
-                existing_seq
-            };
-            let (catchup_ops, has_more) = self
-                .tiered_log
-                .fetch_deltas(from_seq, 100)
-                .unwrap_or_default();
-
+            let (catchup_ops, has_more) = self.catchup_after_commit(last_ack_seq);
             let _ = reply.send(Ok(CommitResponse {
                 assigned_seq: existing_seq,
                 catchup_ops,
@@ -299,27 +284,39 @@ impl RoomActor {
             return;
         }
 
-        // 3. Schema validation in O(C)
+        // 3. Reject clients behind the compaction boundary before sequencing anything,
+        // so that a rejected commit leaves no trace in the log, the head or the SSE stream.
+        if self.lease_tracker.is_dormant(&client_id)
+            || self.lease_tracker.is_bootstrapping(&client_id)
+            || self.tiered_log.is_behind_retention(last_ack_seq)
+        {
+            let _ = reply.send(Err(ServerError::BehindCompaction));
+            return;
+        }
+
+        // 4. Schema validation in O(C)
         if let Err(err) = self.schema.validate_operation(&op) {
             let _ = reply.send(Err(ServerError::SchemaViolation(err.to_string())));
             return;
         }
 
-        // 4. Assign strictly monotonic sequence number
+        // 5. Assign strictly monotonic sequence number
         let new_seq = self.head_seq.next();
         let seq_op = SequencedOperation::new(new_seq, op);
 
-        // 5. Write-Through append to TieredLog (Hot Buffer RAM + synchronous active.wal disk sync with mutation_id)
+        // 6. Write-Through append to TieredLog (Hot Buffer RAM + synchronous active.wal disk sync with mutation_id)
         if let Err(err) = self.tiered_log.append(seq_op.clone(), Some(mutation_id)) {
             error!(room = %self.room_id, error = %err, "TieredLog append failure");
             let _ = reply.send(Err(err));
             return;
         }
 
-        // 6. Record in DedupLruCache
+        // From here on the mutation is durable: the reply must acknowledge it.
+
+        // 7. Record in DedupLruCache
         self.dedup_cache.record(mutation_id, new_seq);
 
-        // 7. Advance local head sequence
+        // 8. Advance local head sequence
         self.head_seq = new_seq;
 
         // 9. Update client lease activity (cursor advances exclusively via explicit Ack)
@@ -329,17 +326,10 @@ impl RoomActor {
         let _ = self.events_tx.send(RoomEvent::HeadAdvanced(new_seq));
 
         // 11. Compute catch-up deltas for 1-RTT synchronization
-        let (catchup_ops, has_more) = if last_ack_seq.get() < new_seq.get().saturating_sub(1) {
-            match self.tiered_log.fetch_deltas(last_ack_seq, 100) {
-                Ok((ops, has_more)) => (ops, has_more),
-                Err(ServerError::BehindCompaction) => {
-                    let _ = reply.send(Err(ServerError::BehindCompaction));
-                    return;
-                }
-                Err(_) => (vec![seq_op], false),
-            }
-        } else {
+        let (catchup_ops, has_more) = if last_ack_seq.get() + 1 == new_seq.get() {
             (vec![seq_op], false)
+        } else {
+            self.catchup_after_commit(last_ack_seq)
         };
 
         let _ = reply.send(Ok(CommitResponse {
@@ -347,6 +337,29 @@ impl RoomActor {
             catchup_ops,
             has_more,
         }));
+    }
+
+    /// Builds the catch-up batch returned with an acknowledged commit, starting after the
+    /// client's cursor.
+    ///
+    /// The commit itself is already durable, so a failure here must not turn into an error
+    /// reply. It degrades to an empty batch flagged `has_more`, which sends the client to
+    /// `/sync`, where the underlying error (for example `BehindCompaction`) is reported.
+    fn catchup_after_commit(
+        &self,
+        last_ack_seq: SequenceNumber,
+    ) -> (Vec<SequencedOperation>, bool) {
+        match self.tiered_log.fetch_deltas(last_ack_seq, 100) {
+            Ok(batch) => batch,
+            Err(err) => {
+                warn!(
+                    room = %self.room_id,
+                    error = %err,
+                    "Catch-up unavailable for committed mutation; deferring to sync"
+                );
+                (Vec::new(), true)
+            }
+        }
     }
 
     fn handle_sync(
@@ -372,8 +385,7 @@ impl RoomActor {
         }
 
         // 2. Check if from_seq is behind retained log tail
-        let tail_seq = self.tiered_log.tail_seq();
-        if tail_seq.get() > 0 && from_seq.get() < tail_seq.get().saturating_sub(1) {
+        if self.tiered_log.is_behind_retention(from_seq) {
             let _ = reply.send(Err(ServerError::BehindCompaction));
             return;
         }

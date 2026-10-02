@@ -239,3 +239,28 @@ fn reopen_with_corrupt_log_meta_fails_instead_of_resetting_head() {
 
     assert!(TieredLog::open_or_create(dir.path(), full_prune_policy()).is_err());
 }
+
+#[test]
+fn gap_inside_retained_range_reports_behind_compaction() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 5,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+
+    // Sealed segments [1..=5] and [6..=10]; operations 11..=12 stay in `active.wal`.
+    for seq in 1..=12 {
+        log.append(make_op(seq), None).unwrap();
+    }
+    let middle = dir
+        .path()
+        .join("segments")
+        .join(format!("segment_{:016}_{:016}.wal", 6, 10));
+    std::fs::remove_file(middle).unwrap();
+
+    assert!(matches!(
+        log.fetch_deltas(SequenceNumber::new(0), 100),
+        Err(ServerError::BehindCompaction)
+    ));
+}
