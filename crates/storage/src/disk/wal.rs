@@ -1,6 +1,6 @@
-use zemdb_core::SequencedOperation;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
+use zemdb_core::SequencedOperation;
 
 use crate::disk::format::{
     decode_wal_batch_from_slice, encode_wal_batch, WalBatchDecodeResult, WalDecodeResult,

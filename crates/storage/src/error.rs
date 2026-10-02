@@ -1,5 +1,5 @@
-use zemdb_core::{RoomId, SequenceNumber, ValidationError};
 use thiserror::Error;
+use zemdb_core::{RoomId, SequenceNumber, ValidationError};
 
 /// Storage errors that can occur during storage engine operations.
 #[derive(Debug, Error)]

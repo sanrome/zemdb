@@ -1,10 +1,10 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use zemdb_core::id::SequenceNumber;
-use zemdb_core::protocol::messages::ErrorCode;
 use serde::Serialize;
 use thiserror::Error;
+use zemdb_core::id::SequenceNumber;
+use zemdb_core::protocol::messages::ErrorCode;
 
 /// Core error type for the coordination server.
 #[derive(Debug, Error)]

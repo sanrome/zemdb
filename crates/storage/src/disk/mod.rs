@@ -5,10 +5,6 @@ pub mod wal;
 
 use async_trait::async_trait;
 use fs2::FileExt;
-use zemdb_core::{
-    CompactRow, OperationKind, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation,
-    Value,
-};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::RangeBounds;
 use std::path::PathBuf;
@@ -16,6 +12,10 @@ use std::sync::Arc;
 use tokio::fs::{create_dir_all, File};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
+use zemdb_core::{
+    CompactRow, OperationKind, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation,
+    Value,
+};
 
 use crate::disk::compactor::{compact_room_cow, compact_room_internal};
 use crate::disk::recovery::recover_room;

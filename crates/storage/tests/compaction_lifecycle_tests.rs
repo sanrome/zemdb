@@ -1,9 +1,9 @@
+use std::sync::Arc;
 use zemdb_core::{
     ColumnUpdate, CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequenceNumber,
     SequencedOperation, TableSchema, Value,
 };
 use zemdb_storage::{DiskStorageEngine, DiskStorageOptions, StorageEngine};
-use std::sync::Arc;
 
 const USERS_TABLE: u16 = 0;
 

@@ -1,11 +1,11 @@
-use zemdb_server::{
-    build_router, AppState, RoomManager, SchemaRegistry, ServerConfig, SnapshotRelay,
-};
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing::info;
+use zemdb_server::{
+    build_router, AppState, RoomManager, SchemaRegistry, ServerConfig, SnapshotRelay,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -786,8 +786,8 @@ fn test_wal_reader_multi_op_batch_iteration_buffered() {
 
 #[tokio::test]
 async fn test_wal_replay_skips_operations_before_snapshot_seq() {
-    use zemdb_core::ColumnUpdate;
     use std::io::Write;
+    use zemdb_core::ColumnUpdate;
 
     let tmp = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(tmp.path());

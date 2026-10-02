@@ -1,8 +1,8 @@
+use std::time::Duration;
 use zemdb_core::{ClientId, RoomId};
 use zemdb_server::api::auth::{
     generate_client_token, verify_client_token, verify_client_token_bound,
 };
-use std::time::Duration;
 
 #[test]
 fn test_client_token_generation_and_verification() {

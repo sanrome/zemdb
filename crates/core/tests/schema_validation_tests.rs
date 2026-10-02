@@ -1,5 +1,5 @@
-use zemdb_core::*;
 use std::collections::BTreeMap;
+use zemdb_core::*;
 
 fn sample_schema() -> Schema {
     let users = TableSchema::builder("users")

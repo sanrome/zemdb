@@ -1,7 +1,7 @@
-use zemdb_core::{CompactRow, PrimaryKey, Schema, SequenceNumber};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use zemdb_core::{CompactRow, PrimaryKey, Schema, SequenceNumber};
 
 /// In-memory state of an open database room.
 ///

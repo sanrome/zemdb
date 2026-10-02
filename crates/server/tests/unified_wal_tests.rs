@@ -1,3 +1,6 @@
+use std::fs::OpenOptions;
+use std::io::Write;
+use tempfile::tempdir;
 use zemdb_core::id::{MutationId, SequenceNumber};
 use zemdb_core::mutation::Operation;
 use zemdb_core::protocol::messages::{ErrorCode, SequencedOperation};
@@ -6,9 +9,6 @@ use zemdb_server::config::ServerConfig;
 use zemdb_server::dedup::DedupLruCache;
 use zemdb_server::error::ServerError;
 use zemdb_server::log::{RoomLifecyclePolicy, TieredLog};
-use std::fs::OpenOptions;
-use std::io::Write;
-use tempfile::tempdir;
 
 fn make_test_op(seq: u64) -> SequencedOperation {
     let pk = PrimaryKey::single(Value::Int(seq as i64));

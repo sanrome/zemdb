@@ -1,9 +1,9 @@
 use dashmap::DashMap;
-use zemdb_core::schema::{ColumnDef, Schema};
-use zemdb_core::SchemaId;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use zemdb_core::schema::{ColumnDef, Schema};
+use zemdb_core::SchemaId;
 
 use crate::error::ServerError;
 

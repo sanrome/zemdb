@@ -1,6 +1,10 @@
 use axum::http::StatusCode;
 use bytes::Bytes;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use std::sync::Arc;
+use std::time::Duration;
+use tempfile::tempdir;
+use tokio::sync::oneshot;
 use zemdb_core::*;
 use zemdb_server::actor::command::RoomCommand;
 use zemdb_server::actor::manager::RoomManager;
@@ -11,10 +15,6 @@ use zemdb_server::error::ServerError;
 use zemdb_server::log::WarmDiskLog;
 use zemdb_server::relay::SnapshotRelay;
 use zemdb_server::schema_registry::SchemaRegistry;
-use std::sync::Arc;
-use std::time::Duration;
-use tempfile::tempdir;
-use tokio::sync::oneshot;
 
 struct LifecycleTestServer {
     pub base_url: String,

@@ -1,12 +1,12 @@
+use std::thread::sleep;
+use std::time::Duration;
+use tempfile::tempdir;
 use zemdb_core::id::SequenceNumber;
 use zemdb_core::mutation::Operation;
 use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::value::{PrimaryKey, Value};
 use zemdb_server::error::ServerError;
 use zemdb_server::log::{RoomLifecyclePolicy, TieredLog};
-use std::thread::sleep;
-use std::time::Duration;
-use tempfile::tempdir;
 
 fn make_test_op(seq: u64) -> SequencedOperation {
     let pk = PrimaryKey::single(Value::Int(seq as i64));
@@ -390,7 +390,10 @@ fn test_tiered_log_hot_buffer_o1_range_query() {
 
     // Query 1: from_seq older than min_seq (5 + 1 < 10, cannot satisfy contiguity)
     let res = buffer.get_range(SequenceNumber::new(5), 5);
-    assert!(res.is_empty(), "Must return empty when requested cursor precedes buffer start to prevent sequence gap");
+    assert!(
+        res.is_empty(),
+        "Must return empty when requested cursor precedes buffer start to prevent sequence gap"
+    );
 
     // Query 1b: from_seq immediately preceding min_seq (9 + 1 = 10, valid contiguous start)
     let res = buffer.get_range(SequenceNumber::new(9), 5);
@@ -611,4 +614,3 @@ fn test_tiered_log_fast_path_off_by_one_boundary() {
         assert_eq!(op.seq.get(), 2 + idx as u64);
     }
 }
-

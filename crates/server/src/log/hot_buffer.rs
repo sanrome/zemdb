@@ -1,9 +1,9 @@
 use crate::error::ServerError;
 use crate::log::policy::RoomLifecyclePolicy;
-use zemdb_core::id::SequenceNumber;
-use zemdb_core::protocol::messages::SequencedOperation;
 use std::collections::VecDeque;
 use std::time::Instant;
+use zemdb_core::id::SequenceNumber;
+use zemdb_core::protocol::messages::SequencedOperation;
 
 /// Tier 1: In-memory contiguous read cache of recent sequenced operations.
 ///

@@ -2,9 +2,9 @@ use axum::extract::{FromRef, FromRequestParts};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
-use zemdb_core::id::{ClientId, RoomId};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
+use zemdb_core::id::{ClientId, RoomId};
 
 use crate::api::router::AppState;
 use crate::error::ServerError;

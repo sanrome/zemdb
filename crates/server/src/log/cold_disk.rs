@@ -1,10 +1,10 @@
 use crate::error::ServerError;
 use crate::log::warm_disk::{parse_segment_filename, RecoveredLogData, SealedSegmentMeta};
+use std::io::Write;
+use std::path::Path;
 use zemdb_core::id::SequenceNumber;
 use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::protocol::wal_frame::{decode_wal_batch_from_slice, WalBatchDecodeResult};
-use std::io::Write;
-use std::path::Path;
 
 /// Tier 3: Compressed delta log on disk using Zstandard for high-density long-term retention.
 #[derive(Debug, Default)]

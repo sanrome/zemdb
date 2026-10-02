@@ -1,6 +1,9 @@
 use axum::http::StatusCode;
 use futures::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+use std::sync::Arc;
+use std::time::Duration;
+use tempfile::tempdir;
 use zemdb_core::*;
 use zemdb_server::actor::command::RoomMetrics;
 use zemdb_server::actor::manager::{RoomManager, RoomMetadata};
@@ -10,9 +13,6 @@ use zemdb_server::api::router::{build_router, AppState};
 use zemdb_server::config::ServerConfig;
 use zemdb_server::relay::SnapshotRelay;
 use zemdb_server::schema_registry::SchemaRegistry;
-use std::sync::Arc;
-use std::time::Duration;
-use tempfile::tempdir;
 
 struct TestServer {
     pub base_url: String,
@@ -1501,8 +1501,8 @@ async fn test_sse_schema_reloaded_event_emission() {
 
 #[test]
 fn test_client_lease_disconnected_to_dormant_timeout() {
-    use zemdb_server::actor::lease::{ClientLeaseTracker, ClientState};
     use std::time::Instant;
+    use zemdb_server::actor::lease::{ClientLeaseTracker, ClientState};
 
     let dir = tempdir().unwrap();
     let roster_path = dir.path().join("clients.json");

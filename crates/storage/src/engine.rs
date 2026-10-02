@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use futures::Stream;
+use std::pin::Pin;
 use zemdb_core::{
     CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation, Value,
 };
-use std::pin::Pin;
 
 use crate::error::StorageError;
 use crate::options::ScanOptions;
