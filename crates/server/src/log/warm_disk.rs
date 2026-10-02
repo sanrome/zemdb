@@ -1,13 +1,13 @@
 use crate::error::ServerError;
 use fs2::FileExt;
+use std::fs::{File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use zemdb_core::id::{MutationId, SequenceNumber};
 use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::protocol::wal_frame::{
     decode_wal_batch_from_slice, encode_wal_record, WalBatchDecodeResult,
 };
-use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
 
 /// Metadata describing a sealed uncompressed Warm Disk segment.
 #[derive(Debug, Clone, PartialEq, Eq)]

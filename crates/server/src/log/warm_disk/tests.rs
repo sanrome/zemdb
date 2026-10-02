@@ -5,7 +5,10 @@ use zemdb_core::value::{PrimaryKey, Value};
 
 fn make_op(seq: u64) -> SequencedOperation {
     let pk = PrimaryKey::single(Value::Int(seq as i64));
-    SequencedOperation::new(SequenceNumber::new(seq), Operation::delete(1, pk, seq * 1000))
+    SequencedOperation::new(
+        SequenceNumber::new(seq),
+        Operation::delete(1, pk, seq * 1000),
+    )
 }
 
 #[test]

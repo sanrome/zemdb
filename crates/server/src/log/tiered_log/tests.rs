@@ -7,7 +7,10 @@ use zemdb_core::value::{PrimaryKey, Value};
 
 fn make_op(seq: u64) -> SequencedOperation {
     let pk = PrimaryKey::single(Value::Int(seq as i64));
-    SequencedOperation::new(SequenceNumber::new(seq), Operation::delete(1, pk, seq * 1000))
+    SequencedOperation::new(
+        SequenceNumber::new(seq),
+        Operation::delete(1, pk, seq * 1000),
+    )
 }
 
 /// Policy where RAM entries expire quickly but the active segment never rotates by count,
@@ -174,4 +177,65 @@ fn reopen_after_ram_ttl_eviction_restores_tail_from_disk() {
 
     assert_eq!(log.head_seq().get(), 4);
     assert_eq!(log.tail_seq().get(), 1);
+}
+
+fn full_prune_policy() -> RoomLifecyclePolicy {
+    RoomLifecyclePolicy {
+        ram_max_ops: 5,
+        warm_disk_ttl: Duration::ZERO,
+        cold_disk_ttl: Duration::ZERO,
+        ..RoomLifecyclePolicy::default()
+    }
+}
+
+#[test]
+fn reopen_after_full_prune_preserves_head() {
+    let dir = tempdir().unwrap();
+    {
+        let (mut log, _) = TieredLog::open_or_create(dir.path(), full_prune_policy()).unwrap();
+        for seq in 1..=5 {
+            log.append(make_op(seq), None).unwrap();
+        }
+        log.run_maintenance_sync().unwrap();
+        assert_eq!(log.tail_seq().get(), 6);
+    }
+
+    let (log, _) = TieredLog::open_or_create(dir.path(), full_prune_policy()).unwrap();
+
+    assert_eq!(log.head_seq().get(), 5);
+    assert_eq!(log.tail_seq().get(), 6);
+}
+
+#[test]
+fn reopen_after_full_prune_continues_sequence() {
+    let dir = tempdir().unwrap();
+    {
+        let (mut log, _) = TieredLog::open_or_create(dir.path(), full_prune_policy()).unwrap();
+        for seq in 1..=5 {
+            log.append(make_op(seq), None).unwrap();
+        }
+        log.run_maintenance_sync().unwrap();
+    }
+
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), full_prune_policy()).unwrap();
+
+    // Reusing an already delivered sequence number must be rejected.
+    assert!(log.append(make_op(1), None).is_err());
+    log.append(make_op(6), None).unwrap();
+    assert_eq!(log.head_seq().get(), 6);
+}
+
+#[test]
+fn reopen_with_corrupt_log_meta_fails_instead_of_resetting_head() {
+    let dir = tempdir().unwrap();
+    {
+        let (mut log, _) = TieredLog::open_or_create(dir.path(), full_prune_policy()).unwrap();
+        for seq in 1..=5 {
+            log.append(make_op(seq), None).unwrap();
+        }
+        log.run_maintenance_sync().unwrap();
+    }
+    std::fs::write(dir.path().join("log_meta.json"), b"{ not json").unwrap();
+
+    assert!(TieredLog::open_or_create(dir.path(), full_prune_policy()).is_err());
 }

@@ -106,24 +106,24 @@
 #### DEF-36 · Bajo · ✅ Hecho (eb8baa6)
 Off-by-one del fast path (`from_seq + 1 >= min_ram`). Solo costaba rendimiento.
 
-#### DEF-07 · Alto · ✅ Hecho (pendiente de commit)
+#### DEF-07 · Alto · ✅ Hecho (f08dcff)
 **Problema.** `prune_and_update_tail` y `prune_older_than` (código duplicado) calculan `tail_seq` como cold → sealed → `min_ram`, salteando `active.wal`. Si la RAM desalojó por TTL, `tail_seq` salta y se rechaza con `BehindCompaction` a clientes cuyos deltas están en disco.
 **Solución.** Una única función `compute_tail_seq()` usada por ambas rutas: `primer cold.start` → `primer sealed.start` → `active_start_seq` → `head + 1` (ver DEF-58). Sin `.min(min_ram)`: si no hay segmentos sellados, toda op en RAM está también en `active.wal`, así que `active_start` ya es el mínimo.
 **Test.** Desalojo TTL + mantenimiento → `tail_seq == active_start` y un cliente con cursor en `active.wal` sincroniza sin `BehindCompaction`.
 
-#### DEF-58 · Alto · ✅ Hecho (pendiente de commit) (nuevo)
+#### DEF-58 · Alto · ✅ Hecho (f08dcff) (nuevo)
 **Problema.** Con el log vacío (todo podado), `tail_seq = head_seq`. La guarda es `from < tail - 1`, así que un cliente en `head - 1` pasa, recibe una respuesta vacía con `has_more = false` y **nunca recibe la op `head`**. Alcanzable tras poda por TTL/cuota del cold tier o una vez aplicado DEF-37.
 **Solución.** Con el log vacío, `tail_seq = head + 1` (incluido en `compute_tail_seq`).
 **Test.** Podar todo → cliente en `head - 1` recibe `BehindCompaction`; cliente en `head` recibe vacío.
 
-#### DEF-59 · Medio · ✅ Hecho (pendiente de commit) (nuevo)
+#### DEF-59 · Medio · ✅ Hecho (f08dcff) (nuevo)
 **Problema.** Si `active.wal` existe pero está vacío al abrir la sala (crash, o torn write truncado a 0), `inspect_active_segment` fija `active_file` y `append_record` (`warm_disk.rs`) nunca fija `active_start_seq`. Consecuencias: `active_ops_count()` queda en 0, el archivo nunca rota, y DEF-07 deja de funcionar.
 **Solución.** `append_record` fija `active_start_seq` cuando el segmento activo no tiene ops, independientemente de si el archivo ya estaba abierto.
 **Test.** Abrir sala con `active.wal` de 0 bytes → appends → `active_start_seq` correcto y rotación al llegar a la cuota.
 
-#### DEF-67 · Alto · ⬜ (nuevo)
+#### DEF-67 · Alto · ✅ Hecho (nuevo)
 **Problema.** `TieredLog::open_or_create` reconstruye `head_seq` solo a partir de los segmentos en disco. La poda por TTL/cuota del cold tier puede borrar **todos** los segmentos (por ejemplo, en una sala inactiva después de la rotación). Al reiniciar, `head_seq` vuelve a 0 y el servidor **reutiliza números de secuencia** ya entregados a los clientes. La poda por cursores (`prune_older_than`) no llega a esto porque nunca borra el segmento que contiene `head`, pero la poda por TTL/cuota sí.
-**Solución.** Persistir el último `head_seq` podado en un archivo pequeño de metadatos del log (escritura atómica, regla 3) antes de borrar segmentos, y al abrir tomar `head = max(head de los segmentos, head persistido)`. Alternativa más simple: la poda por TTL/cuota nunca borra el último segmento retenido.
+**Solución aplicada.** `log_meta.json` en el directorio de la sala guarda `pruned_through_seq`, escrito con `durable::write_atomic` **antes** de borrar segmentos en ambas rutas de poda. Al abrir, `head = max(head de los segmentos, pruned_through_seq)`. Un `log_meta.json` ilegible hace fallar la apertura en lugar de reiniciar la secuencia.
 **Test.** Podar todo por TTL → reabrir → `head_seq` se conserva y el siguiente append usa `head + 1`.
 
 #### DEF-04 · Alto · ⬜ (depende de D1)
@@ -183,7 +183,7 @@ Off-by-one del fast path (`from_seq + 1 >= min_ram`). Solo costaba rendimiento.
 
 #### DEF-60 · Alto · ⬜ (nuevo)
 **Problema.** `meta_room.json` se escribe in-place con `fs::write` (`actor/manager.rs:111`), sin tmp ni rename. Un crash a mitad de la escritura deja un archivo truncado y la sala no vuelve a cargar.
-**Solución.** Helper `write_atomic(path, bytes)` en el servidor (tmp → `sync_all` → rename → `sync_dir`), usado para meta de sala, esquemas y roster en register/deregister. `sync_dir` hoy vive en storage; el servidor necesita su propia copia (core es zero I/O).
+**Solución.** Usar `durable::write_atomic` (ya creado en `server/src/durable.rs` para DEF-67) para meta de sala, esquemas y roster en register/deregister.
 **Test.** Archivo `.tmp` residual o destino truncado → la sala carga la última versión válida.
 
 #### DEF-19 (server) · Medio · ⬜

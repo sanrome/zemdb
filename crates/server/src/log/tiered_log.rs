@@ -1,12 +1,26 @@
+use crate::durable;
 use crate::error::ServerError;
 use crate::log::cold_disk::ColdDiskLog;
 use crate::log::hot_buffer::HotBuffer;
 use crate::log::policy::RoomLifecyclePolicy;
 use crate::log::warm_disk::WarmDiskLog;
-use zemdb_core::id::{MutationId, SequenceNumber};
-use zemdb_core::protocol::messages::SequencedOperation;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use zemdb_core::id::{MutationId, SequenceNumber};
+use zemdb_core::protocol::messages::SequencedOperation;
+
+/// File, inside the room directory, recording the highest sequence ever pruned from disk.
+const LOG_META_FILE: &str = "log_meta.json";
+
+/// Durable log metadata that must outlive the segments it describes.
+#[derive(Debug, Serialize, Deserialize)]
+struct LogMeta {
+    /// Highest sequence number whose segment has been deleted. Recovery derives `head_seq`
+    /// from the segments on disk; once all of them are pruned this is the only record of
+    /// how far the sequence advanced, preventing sequence numbers from being reused.
+    pruned_through_seq: u64,
+}
 
 /// Summary of maintenance operations performed across storage tiers.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -36,6 +50,7 @@ pub struct TieredLog {
     warm_disk: WarmDiskLog,
     head_seq: SequenceNumber,
     tail_seq: SequenceNumber,
+    pruned_through_seq: SequenceNumber,
 }
 
 impl TieredLog {
@@ -51,12 +66,13 @@ impl TieredLog {
         let mut warm_disk = WarmDiskLog::open_or_create(&segments_dir)?;
         let mut recovered_mutations = Vec::new();
 
-        let mut head_seq = SequenceNumber::new(0);
+        let pruned_through_seq = read_pruned_through_seq(&dir)?;
+        let mut head_seq = pruned_through_seq;
 
         // Check Cold Disk segments first
         let cold_segments = ColdDiskLog::list_cold_segments(&segments_dir)?;
         if let Some(last_cold) = cold_segments.last() {
-            head_seq = last_cold.end_seq;
+            head_seq = head_seq.max(last_cold.end_seq);
             for cold_seg in &cold_segments {
                 let (_, muts) = ColdDiskLog::read_range_with_mutations(
                     &cold_seg.path,
@@ -93,6 +109,7 @@ impl TieredLog {
             warm_disk,
             head_seq,
             tail_seq: head_seq.next(),
+            pruned_through_seq,
         };
         log.tail_seq = log.compute_tail_seq()?;
 
@@ -387,6 +404,9 @@ impl TieredLog {
             }
         }
 
+        if let Some(pruned_end) = max_pruned_seq {
+            self.record_pruned_through(pruned_end)?;
+        }
         for path in to_delete {
             if path.exists() {
                 std::fs::remove_file(path)?;
@@ -402,6 +422,25 @@ impl TieredLog {
         self.tail_seq = self.compute_tail_seq()?;
 
         report.new_tail_seq = self.tail_seq;
+        Ok(())
+    }
+
+    /// Durably records that every sequence up to `seq` is about to be deleted from disk.
+    ///
+    /// Must complete before the segments are removed, so that a crash in between can never
+    /// leave the log without any record of its highest sequence.
+    fn record_pruned_through(&mut self, seq: SequenceNumber) -> Result<(), ServerError> {
+        if seq.get() <= self.pruned_through_seq.get() {
+            return Ok(());
+        }
+        let meta = LogMeta {
+            pruned_through_seq: seq.get(),
+        };
+        let bytes = serde_json::to_vec(&meta).map_err(|e| {
+            ServerError::Serialization(format!("Failed to encode log metadata: {}", e))
+        })?;
+        durable::write_atomic(&self.dir.join(LOG_META_FILE), &bytes)?;
+        self.pruned_through_seq = seq;
         Ok(())
     }
 
@@ -454,19 +493,36 @@ impl TieredLog {
         let mut report = PruneReport::default();
         let segments_dir = self.dir.join("segments");
 
-        // 1. Delete sealed Warm segments strictly older than target_seq
-        let sealed_warm = self.warm_disk.list_sealed_segments()?;
-        for sealed in sealed_warm {
-            if sealed.end_seq.get() < target_seq.get() && sealed.path.exists() {
+        let sealed_to_delete: Vec<_> = self
+            .warm_disk
+            .list_sealed_segments()?
+            .into_iter()
+            .filter(|sealed| sealed.end_seq.get() < target_seq.get())
+            .collect();
+        let cold_to_delete: Vec<_> = ColdDiskLog::list_cold_segments(&segments_dir)?
+            .into_iter()
+            .filter(|cold| cold.end_seq.get() < target_seq.get())
+            .collect();
+
+        // 1. Record how far the log advanced before any segment disappears from disk
+        let max_pruned_seq = sealed_to_delete
+            .iter()
+            .map(|sealed| sealed.end_seq)
+            .chain(cold_to_delete.iter().map(|cold| cold.end_seq))
+            .max();
+        if let Some(pruned_end) = max_pruned_seq {
+            self.record_pruned_through(pruned_end)?;
+        }
+
+        // 2. Delete sealed Warm and Cold segments strictly older than target_seq
+        for sealed in sealed_to_delete {
+            if sealed.path.exists() {
                 std::fs::remove_file(&sealed.path)?;
                 report.warm_deleted_count += 1;
             }
         }
-
-        // 2. Delete Cold segments strictly older than target_seq
-        let cold_segments = ColdDiskLog::list_cold_segments(&segments_dir)?;
-        for cold in cold_segments {
-            if cold.end_seq.get() < target_seq.get() && cold.path.exists() {
+        for cold in cold_to_delete {
+            if cold.path.exists() {
                 std::fs::remove_file(&cold.path)?;
                 report.cold_deleted_count += 1;
             }
@@ -481,6 +537,28 @@ impl TieredLog {
         report.new_tail_seq = self.tail_seq;
         Ok(report)
     }
+}
+
+/// Reads the highest pruned sequence recorded for the log in `dir`, or zero if nothing was ever pruned.
+///
+/// An unreadable file is an error rather than zero: silently restarting the sequence would reuse
+/// sequence numbers already delivered to clients.
+fn read_pruned_through_seq(dir: &Path) -> Result<SequenceNumber, ServerError> {
+    let path = dir.join(LOG_META_FILE);
+    match std::fs::remove_file(durable::tmp_path_for(&path)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SequenceNumber::new(0)),
+        Err(e) => return Err(e.into()),
+    };
+    let meta: LogMeta = serde_json::from_slice(&bytes).map_err(|e| {
+        ServerError::WalCorruption(format!("Unreadable log metadata {:?}: {}", path, e))
+    })?;
+    Ok(SequenceNumber::new(meta.pruned_through_seq))
 }
 
 #[cfg(test)]

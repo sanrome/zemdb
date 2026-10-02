@@ -2,6 +2,7 @@ pub mod actor;
 pub mod api;
 pub mod config;
 pub mod dedup;
+mod durable;
 pub mod error;
 pub mod log;
 pub mod relay;
