@@ -45,18 +45,20 @@
 
 ## 3. Resumen
 
-| Lote | Tema | Ítems | Prioridad |
-|---|---|---|---|
-| 1 | Consistencia del log y del commit | DEF-01, 36, 07, 58, 59, 67, 04, 29, 06 | Inmediata |
-| 2 | Durabilidad del motor de storage | DEF-02, 03, 65, 19(storage), 12 | Inmediata |
-| 3 | Durabilidad de metadatos del servidor | DEF-60, 19(server), 16, 48 | Alta |
-| 4 | Autenticación e identificadores | DEF-61, 41, 66 | Alta |
-| 5 | Relay de snapshots | DEF-62, 10, 63, 52, 51, 39, 40, 38, 31(relay), 08(relay), 15 | Alta |
-| 6 | Ciclo de vida de clientes y señalización | DEF-53, 05, 27, 24, 26 | Alta |
-| 7 | Protocolo wire y errores HTTP | DEF-46, 28, 11, 43, 64, 22 | Media |
-| 8 | Rendimiento y ciclo de vida de salas | DEF-50, 35, 55, 37, 08, 31(locks), 25(server) | Media |
-| 9 | Robustez e higiene de storage y core | DEF-14, 23, 49, 17, 25(storage), 18, 09, 45, 33, 44, 47, 30, 13, 20, 21, 32, 57 | Media/Baja |
-| 10 | Diferido a Fase 4 / descartado | DEF-34, 54, 42, 56 | — |
+| Lote | Tema | Ítems | Prioridad | Progreso |
+|---|---|---|---|---|
+| 1 | Consistencia del log y del commit | DEF-01, 36, 07, 58, 59, 67, 04, 29, 06 | Inmediata | ✅ 9/9 |
+| 2 | Durabilidad del motor de storage | DEF-02, 03, 65, 19(storage), 12 | Inmediata | 0/5 |
+| 3 | Durabilidad de metadatos del servidor | DEF-60, 19(server), 16, 48, 68 | Alta | 0/5 |
+| 4 | Autenticación e identificadores | DEF-61, 41, 66 | Alta | 0/3 |
+| 5 | Relay de snapshots | DEF-62, 10, 63, 52, 51, 39, 40, 38, 31(relay), 08(relay), 15 | Alta | 0/11 |
+| 6 | Ciclo de vida de clientes y señalización | DEF-53, 05, 27 (24 y 26 descartados) | Alta | 0/3 |
+| 7 | Protocolo wire y errores HTTP | DEF-46, 28, 11, 43, 64, 22 | Media | 0/6 |
+| 8 | Rendimiento y ciclo de vida de salas | DEF-50, 35, 55, 37, 08, 31(locks), 25(server) | Media | 0/7 |
+| 9 | Robustez e higiene de storage y core | DEF-14, 23, 49, 17, 25(storage), 18, 09, 45, 33, 44, 47, 30, 13, 20, 21, 57 (32 descartado) | Media/Baja | 0/16 |
+| 10 | Diferido a Fase 4 / descartado | DEF-34, 54, 42, 56 | — | — |
+
+**Avance total:** 9 de 65 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
 
 **Severidades corregidas respecto de la auditoría anterior:** de los 7 "críticos" originales, solo DEF-01 lo es. DEF-02, 03 y 04 son Altos; DEF-05 y 06 son Medios; DEF-34 es Bajo. DEF-24, 26 y 56 son falsos en la práctica.
 
@@ -199,6 +201,11 @@ Off-by-one del fast path (`from_seq + 1 >= min_ram`). Solo costaba rendimiento.
 #### DEF-48 · Bajo · ⬜
 **Problema.** Sin apagado ordenado. La durabilidad de commits no está en riesgo (hay `sync_data` antes del ack), pero `RoomCommand::Shutdown` solo corta el loop sin guardar leases, y `ctrl_c()` no captura SIGTERM.
 **Solución.** `axum::serve(...).with_graceful_shutdown(SIGINT | SIGTERM)` → `shutdown_all()`; el handler de `Shutdown` hace `lease_tracker.save()` (con `write_atomic`).
+
+#### DEF-68 · Alto · ⬜ (nuevo)
+**Problema.** Si en un commit el `write` al WAL sale bien pero falla el `fsync`, hoy se responde error y la sala sigue operando. Después de un `fsync` fallido el estado del disco es incierto: el kernel puede descartar las páginas sucias, y un `fsync` posterior "exitoso" no garantiza que esos bytes lleguen al disco ("fsyncgate"). Además, el registro escrito puede quedar en el archivo y reaparecer al reiniciar como una op confirmada que el cliente cree rechazada.
+**Solución.** Regla 1 de `GEMINI.md`: ante una falla de I/O a mitad de una escritura durable, la sala se marca como inválida (rechaza comandos con un error de servicio no disponible), el actor termina, y la próxima apertura recupera desde disco. No se reintenta el `fsync`.
+**Test.** Un punto de fallo `#[cfg(test)]` en el `sync_data` del WAL → el commit falla, los comandos siguientes son rechazados, y al reabrir la sala el estado sale del disco.
 
 ---
 
