@@ -120,6 +120,13 @@ pub enum RoomCommand {
     /// Retrieve operational metrics for this room.
     GetMetrics { reply: oneshot::Sender<RoomMetrics> },
 
+    /// Query the retained log range as `(tail_seq, head_seq)`: the oldest retained sequence
+    /// and the highest committed one. The snapshot relay uses it to accept only snapshots a
+    /// client can catch up from.
+    GetLogBounds {
+        reply: oneshot::Sender<(SequenceNumber, SequenceNumber)>,
+    },
+
     /// Query the confirmed cursor (last_ack_seq) for a registered client.
     GetClientCursor {
         client_id: ClientId,

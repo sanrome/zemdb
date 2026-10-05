@@ -95,6 +95,7 @@ fn test_protocol_binary_serialization_roundtrip() {
         room_id: RoomId::new("room-abc").unwrap(),
         chunk_index: 2,
         chunk_size: 4 * 1024 * 1024,
+        snapshot_hash: Some([9u8; 32]),
     };
     let enc_req = encode_message(&req_chunk).expect("serialization failed");
     let dec_req: ClientMessage = decode_message(&enc_req).expect("deserialization failed");
@@ -275,6 +276,14 @@ fn test_wire_framing_header_and_magic_version_verification() {
     assert_eq!(&encoded[0..2], b"ZM");
     assert_eq!(encoded[2], 0x01);
     assert_eq!(encoded[3], 0x00);
+
+    // A frame with another protocol version gets a version mismatch, not a decode failure.
+    let mut other_version = encoded.clone();
+    other_version[2] = 0x02;
+    let err = decode_message::<ClientMessage>(&other_version)
+        .unwrap_err()
+        .to_string();
+    assert!(err.to_lowercase().contains("version"), "{err}");
 
     // Corrupted magic bytes must be rejected
     let mut bad_magic = encoded.clone();

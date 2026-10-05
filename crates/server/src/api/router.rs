@@ -5,9 +5,9 @@ use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::actor::manager::RoomManager;
-use crate::api::{control_plane, data_plane, sse};
+use crate::api::{control_plane, data_plane, relay, sse};
 use crate::config::ServerConfig;
-use crate::relay::{self, SnapshotRelay};
+use crate::relay::SnapshotRelay;
 use crate::schema_registry::SchemaRegistry;
 
 /// Server-wide shutdown notification shared by every handler.

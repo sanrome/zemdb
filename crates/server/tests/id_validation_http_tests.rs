@@ -35,6 +35,7 @@ async fn start_server() -> TestServer {
         lease_timeout_secs: 60,
         dedup_lru_capacity: 1000,
         snapshot_ttl_secs: 60,
+        max_snapshot_bytes: 16 * 1024 * 1024,
     });
     let schema_registry = Arc::new(SchemaRegistry::new(data_dir.join("schemas")).unwrap());
     let table = TableSchema::builder("tasks")
@@ -47,8 +48,14 @@ async fn start_server() -> TestServer {
             Schema::from_tables(vec![table]),
         )
         .unwrap();
-    let relay =
-        Arc::new(SnapshotRelay::new(data_dir.join("snapshots"), Duration::from_secs(60)).unwrap());
+    let relay = Arc::new(
+        SnapshotRelay::new(
+            data_dir.join("snapshots"),
+            Duration::from_secs(60),
+            config.max_snapshot_bytes,
+        )
+        .unwrap(),
+    );
     let room_manager = Arc::new(RoomManager::new(
         Arc::clone(&config),
         Arc::clone(&schema_registry),

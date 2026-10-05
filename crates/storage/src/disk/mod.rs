@@ -25,6 +25,7 @@ use crate::engine::{apply_scan_transforms, RowStream, StorageEngine};
 use crate::error::StorageError;
 use crate::memory::{RoomSnapshotPayload, RoomSnapshotRef};
 use crate::options::{KeyRange, ScanDirection, ScanOptions};
+use crate::snapshot::DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES;
 
 /// Options to configure `DiskStorageEngine`.
 #[derive(Debug, Clone)]
@@ -39,6 +40,9 @@ pub struct DiskStorageOptions {
     pub zstd_level: i32,
     /// Whether automatic compaction is enabled during write batches (default: true).
     pub auto_compact: bool,
+    /// Largest decompressed payload accepted by `apply_snapshot`, in bytes (default:
+    /// [`DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES`], 2 GiB).
+    pub max_snapshot_uncompressed_bytes: u64,
 }
 
 impl DiskStorageOptions {
@@ -50,6 +54,7 @@ impl DiskStorageOptions {
             min_compaction_bytes: 64 * 1024,
             zstd_level: 3,
             auto_compact: true,
+            max_snapshot_uncompressed_bytes: DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES,
         }
     }
 
@@ -74,6 +79,12 @@ impl DiskStorageOptions {
     /// Enables or disables automatic compaction during writes.
     pub fn auto_compact(mut self, enable: bool) -> Self {
         self.auto_compact = enable;
+        self
+    }
+
+    /// Sets the largest decompressed snapshot payload accepted by `apply_snapshot`.
+    pub fn max_snapshot_uncompressed_bytes(mut self, bytes: u64) -> Self {
+        self.max_snapshot_uncompressed_bytes = bytes;
         self
     }
 }
@@ -587,8 +598,9 @@ impl StorageEngine for DiskStorageEngine {
         snapshot: &[u8],
     ) -> Result<SequenceNumber, StorageError> {
         let snapshot_vec = snapshot.to_vec();
+        let max_uncompressed = self.options.max_snapshot_uncompressed_bytes;
         let decompressed = tokio::task::spawn_blocking(move || {
-            crate::snapshot::decode_snapshot_envelope(&snapshot_vec)
+            crate::snapshot::decode_snapshot_envelope_with_limit(&snapshot_vec, max_uncompressed)
         })
         .await
         .map_err(|e| StorageError::Other(format!("Join error: {e}")))?

@@ -51,6 +51,11 @@
 | **D13** | Se adelanta del Lote 7 solo `ServerError::BadRequest` / `ErrorCode::BadRequest` (HTTP 400), para responder a IDs inválidos. El resto de los códigos de error sigue en el Lote 7. | Adoptada |
 | **D14** | Secretos: el servidor se niega a arrancar si `ZEMDB_AUTH_SECRET` o `ZEMDB_ADMIN_SECRET` están vacíos, miden menos de 32 bytes, son iguales al valor de desarrollo del repo (público) o son iguales entre sí. Sin modo de desarrollo: para correr localmente hay que definirlos (ver README). | Adoptada |
 | **D15** | La validación del borde HTTP vive en extractores de axum (`api/extract.rs`): `RoomPath`, `AuthenticatedRoom` (token solo por header), `EventStreamAuth` (header o `?token=`, solo SSE), `RelayAuth` (token de cliente o secreto de admin), `BinaryMessage`, `AdminPath`, `AdminJson`. Los handlers reciben valores validados y solo comprueban la identidad dentro del mensaje (`ensure_payload_identity`). Todos los errores del data plane son frames binarios. | Adoptada |
+| **D16** | Los snapshots del relay viven solo en disco: los chunks se sirven leyendo del archivo (fuera del runtime async), sin copia en RAM. Tamaño máximo configurable `max_snapshot_bytes` (512 MiB por defecto). No hay modo en memoria: los tests también usan un directorio real. | Adoptada |
+| **D17** | Subidas por partes: una sola en curso por sala (una con seq mayor reemplaza a la anterior; igual o menor se rechaza); los chunks se escriben a un archivo temporal en disco en su offset (`ceil(total_bytes / total_chunks)` por chunk, salvo el último); chunk de hasta 4 MiB; total hasta `max_snapshot_bytes`; vence tras 2 minutos sin chunks. Al vencer, al ser reemplazada o al arrancar el servidor, el archivo temporal se borra. | Adoptada |
+| **D18** | Aceptación de snapshots en el relay: `tail - 1 ≤ seq ≤ head` (consultado al actor), seq estrictamente mayor que el snapshot activo, y cabecera `ZMSN` válida con CRC (sin descomprimir; la cabecera pasa a `zemdb-core`). El servidor no valida la estructura interna ni puede validar la veracidad del contenido (no tiene el estado de la sala): la estructura la valida el cliente al aplicarlo (Fase 4), y la defensa contra un miembro malicioso queda como DEF-81. | Adoptada |
+| **D19** | Descarga anclada: `RequestSnapshotChunk` lleva `snapshot_hash: Option<[u8; 32]>`; si el snapshot anclado ya no es el activo, se responde `ErrorCode::SnapshotSuperseded` (409) y el cliente reinicia desde el chunk 0. Tamaño de chunk de descarga limitado a 64 KiB–4 MiB. | Adoptada |
+| **D20** | Descompresión de snapshots en storage acotada: se rechaza si el tamaño descomprimido declarado supera el máximo (2 GiB por defecto, configurable) y se descomprime con un tope real por si la cabecera miente. | Adoptada |
 
 ---
 
@@ -62,14 +67,14 @@
 | 2 | Durabilidad del motor de storage | DEF-02, 03, 65, 19(storage), 12 | Inmediata | ✅ 5/5 |
 | 3 | Durabilidad de metadatos del servidor | DEF-60, 19(server), 16, 48, 68, 69 | Alta | ✅ 6/6 |
 | 4 | Autenticación e identificadores | DEF-61, 41, 66, 80 | Alta | ✅ 4/4 |
-| 5 | Relay de snapshots | DEF-62, 10, 63, 52, 51, 39, 40, 38, 31(relay), 08(relay), 15 | Alta | 0/11 |
+| 5 | Relay de snapshots | DEF-62, 10, 63, 52, 51, 39, 40, 38, 31(relay), 08(relay), 15 | Alta | ✅ 11/11 |
 | 6 | Ciclo de vida de clientes y señalización | DEF-53, 05, 27, 75, 76 (24 y 26 descartados) | Alta | 0/5 |
 | 7 | Protocolo wire y errores HTTP | DEF-46, 28, 11, 43, 64, 22, 71, 74 | Media | 0/8 |
 | 8 | Rendimiento, portabilidad y ciclo de vida de salas | DEF-50, 35, 55, 37, 08, 31(locks), 25(server), 72, 77, 79 | Media | 0/10 |
 | 9 | Robustez e higiene de storage y core | DEF-14, 23, 49, 17, 25(storage), 18, 09, 45, 33, 44, 47, 30, 13, 20, 21, 57, 70, 78 (32 descartado) | Media/Baja | 1/18 |
-| 10 | Diferido a Fase 4 / descartado | DEF-34, 54, 42, 56, 73 | — | — |
+| 10 | Diferido a Fase 4 / descartado | DEF-34, 54, 42, 56, 73, 81 | — | — |
 
-**Avance total:** 25 de 76 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
+**Avance total:** 36 de 76 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
 
 **Severidades corregidas respecto de la auditoría anterior:** de los 7 "críticos" originales, solo DEF-01 lo es. DEF-02, 03 y 04 son Altos; DEF-05 y 06 son Medios; DEF-34 es Bajo. DEF-24, 26 y 56 son falsos en la práctica.
 
@@ -251,49 +256,56 @@ ARCHITECTURE.md dice HMAC-SHA256, pero el código usa BLAKE3 con clave. Actualiz
 
 #### Notas del Lote 4
 - **Extractores (D15):** adelantan parte de DEF-15, DEF-22 y DEF-43. Cambios visibles para clientes: sala del token distinta a la de la URL 500 → 401; cuerpo indecodificable o ID inválido en el mensaje 500 → 400; JSON de admin inválido 422 → 400 (413/415 se conservan); errores de autenticación del data plane JSON → binario; errores del header `x-snapshot-head-seq` JSON 500 → binario 400. Lo que queda de esos ítems sigue en sus lotes.
-- **Compatibilidad del protocolo:** agregar `ErrorCode::BadRequest` al enum del wire no cambió la versión del protocolo; un cliente compilado antes no puede decodificar esos frames de error. Aceptable en v0.1 (los tokens anteriores tampoco valen, D11).
+- **Compatibilidad del protocolo:** agregar `ErrorCode::BadRequest` al enum del wire no cambió la versión del protocolo. No hace falta: no hubo ningún release, así que no existen clientes anteriores (ver la regla de versionado en `GEMINI.md`).
 - **Datos de versiones anteriores:** salas, esquemas, clientes del roster o snapshots con IDs que ya no son válidos (mayúsculas, puntos, etc.) quedan inaccesibles: no se borran, se ignoran con un warning (esquemas, roster, relay) o no se pueden direccionar (salas). No hay migración (no se requiere retrocompatibilidad); si hiciera falta, renombrar manualmente las carpetas y archivos a IDs válidos.
 
 ---
 
 ## Lote 5 — Relay de snapshots
 
-#### DEF-62 · Alto · ⬜ (nuevo)
+#### DEF-62 · Alto · ✅ Hecho (nuevo)
 **Problema.** `multipart_uploads` (`relay.rs:51`) no limita `total_bytes`, `total_chunks` ni la cantidad de sesiones (la clave incluye `head_seq`, así que se pueden abrir sesiones ilimitadas). Cualquier poseedor de un token puede agotar la RAM durante el TTL de 10 minutos.
 **Solución.** Tope de `total_bytes` (tamaño máximo de snapshot), tope de sesiones concurrentes por sala (1–2), y rechazo de chunks fuera de rango.
 
-#### DEF-10 · Medio · ⬜
+#### DEF-10 · Medio · ✅ Hecho
 **Problema verificado.** El token ya restringe a la sala, así que el atacante es un miembro de la sala o un cliente con bugs. El impacto de "desbordar el disco" es falso (TTL/cuota + TTL del snapshot de 600 s). El impacto real es el **envenenamiento de snapshots**: cualquier miembro puede reemplazar uno bueno por basura o por un seq menor o mayor; un seq mayor que `head` engaña a los clientes que arrancan desde él.
 **Solución.** Antes de indexar, consultar al actor (es in-process): aceptar solo si `tail - 1 ≤ S ≤ head` y `S ≥ snapshot activo`. Validar magic, versión y CRC de `ZMSN` sin descomprimir (el CRC cubre el cuerpo comprimido); para eso la cabecera del envelope se mueve a core. En el actor, usar el seq del snapshot para el suelo de retención solo si está en rango.
 
-#### DEF-63 · Medio · ⬜ (nuevo)
+#### DEF-63 · Medio · ✅ Hecho (nuevo)
 **Problema.** `stage_snapshot` es last-writer-wins (el snapshot activo puede retroceder), y dos llamadas concurrentes para la misma sala pueden borrarse los archivos entre sí (`relay.rs:200-206`).
 **Solución.** Aceptación monótona (con DEF-10) y lock por sala alrededor de stage + borrado del anterior.
 
-#### DEF-52 · Medio-Bajo · ⬜
+#### DEF-52 · Medio-Bajo · ✅ Hecho
 `recover_disk_snapshots` inserta en el orden de `read_dir`: un archivo viejo puede pisar uno nuevo. Quedarse con el de mayor seq y borrar los demás.
 
-#### DEF-51 · Medio · ⬜
+#### DEF-51 · Medio · ✅ Hecho
 **Problema verificado.** Cada `SnapshotChunk` ya incluye `snapshot_head_seq` y `snapshot_hash`, y BLAKE3 impide aplicar un snapshot mezclado: el resultado es reintentos, no corrupción (la auditoría lo sobrestima).
 **Solución.** Anclar la petición por **hash** (anclar solo por seq no alcanza: una nueva subida con el mismo seq pisa la misma ruta con otro hash). Si el snapshot anclado ya no existe, devolver un error tipado (`SnapshotSuperseded`) con el seq y el hash actuales para que el cliente reinicie desde el chunk 0.
 
-#### DEF-39 · Medio · ⬜
+#### DEF-39 · Medio · ✅ Hecho
 Bomba de descompresión en `decode_snapshot_envelope`. Validar `uncompressed_len <= cap` antes de descomprimir, decodificar con `zstd::stream::Decoder` + `.take(cap + 1)` y acotar la pre-reserva.
 
-#### DEF-40 · Bajo · ⬜
+#### DEF-40 · Bajo · ✅ Hecho
 Límites asimétricos entre subida y descarga, y `get_chunk` sin cota superior. Hacer `clamp` del `chunk_size` (el cliente se entera por `total_chunks`). Bug adicional: con `chunk_size = 0` se devuelven chunks vacíos (`relay.rs:253` usa `chunk_size` en vez de `chunk_size_u64`).
 
-#### DEF-38 · Medio · ⬜
+#### DEF-38 · Medio · ✅ Hecho
 `recover_disk_snapshots` **y** `stage_snapshot` retienen el snapshot completo en RAM (`data: Bytes`). Servir los chunks leyendo del archivo bajo demanda dentro de `spawn_blocking` (portable; `read_at` es solo Unix).
 
-#### DEF-31 (relay) · Bajo-Medio · ⬜
+#### DEF-31 (relay) · Bajo-Medio · ✅ Hecho
 `delete_room` no purga el relay: una sala recreada dentro del TTL de 600 s sirve el snapshot de la sala borrada. Agregar `snapshot_relay.purge_room(room_id)`.
 
-#### DEF-08 (relay) · Bajo · ⬜
+#### DEF-08 (relay) · Bajo · ✅ Hecho
 `upload_snapshot` hace I/O bloqueante dentro del handler async y escribe hasta 16 MB sin `fsync` antes del rename. Mover a `spawn_blocking` y aplicar `write_atomic`.
 
-#### DEF-15 · Bajo · ⬜
+#### DEF-15 · Bajo · ✅ Hecho
 Mover los handlers HTTP de `relay.rs` a `api/relay.rs`, **en el mismo cambio** que DEF-10/11/38/51, porque esos tocan los mismos handlers.
+
+#### Notas del Lote 5
+- **Formato de archivos:** los snapshots se guardan como `<sala>_<seq>_<blake3>.snap`; el hash en el nombre permite verificar el contenido al recuperar. Las subidas en curso viven en `snapshots/uploads/`.
+- **Organización del código:** el relay se separó en una carpeta `relay/` por responsabilidad (estructura y locks, tipos y límites, subidas, descargas, ciclo de vida, recuperación, archivos), con sus tests divididos igual.
+- **Decisiones de implementación no previstas en D16–D20:** chunk mínimo de 64 KiB al subir con más de un chunk (acota la cantidad de chunks); cada subida corre como tarea propia (un cliente que se desconecta no deja el relay a medias); la subida del worker de snapshots (secreto de admin) reemplaza una subida en curso del mismo seq o menor, y un cliente puede reiniciar su propia subida; como máximo 2 subidas de un solo request en vuelo por sala (las demás reciben 429); el ancla es obligatoria para pedir chunks después del primero; reenviar el último chunk de una subida ya instalada responde éxito; el primer chunk descarta un snapshot que quedó detrás del rango retenido; `max_snapshot_bytes` se valida al arrancar (1 MiB–64 GiB).
+- **Protocolo:** cambiaron `ErrorCode` y `RequestSnapshotChunk`, pero la versión del wire se mantiene en `0x01`: todavía no hubo ningún release, así que no hay clientes anteriores que distinguir (regla agregada a `GEMINI.md`).
+- **Windows:** la sincronización de archivos usa siempre un handle con permiso de escritura (en Windows `FlushFileBuffers` lo exige). No se pudo ejecutar en Windows (DEF-73).
 
 ---
 
@@ -462,6 +474,10 @@ ARCHITECTURE.md:169 presenta la descarga directa como alternativa al protocolo p
 
 #### DEF-73 · Info · ⏸ (nuevo)
 Windows es plataforma objetivo, pero hoy nada se prueba en Windows. Agregar CI (por ejemplo GitHub Actions) con `windows-latest` que corra `cargo test --workspace`; ahí se verifican DEF-72 y la lectura del WAL por su propio handle en storage.
+
+#### DEF-81 · Medio · ⏸ (nuevo, decisión D18)
+**Problema.** El servidor no tiene el estado de la sala, así que no puede verificar que un snapshot subido sea verdadero: un miembro malicioso puede subir un snapshot bien formado con datos inventados, que solo afecta en silencio a los clientes que arrancan desde él. (Un miembro malicioso ya puede escribir datos falsos con commits, pero esos quedan secuenciados y visibles.)
+**Solución propuesta (Fase 4).** Que los clientes reporten un digest determinístico del estado en ciertos seq (por ejemplo con cada ack) y que el relay solo acepte un snapshot cuyo digest coincida con el reportado por otros clientes. Requiere serialización determinística del estado y soporte en el SDK.
 
 #### DEF-56 · ❌ Descartado
 Devolver las columnas en el orden de la proyección es el comportamiento estándar y coincide con lo documentado (`options.rs:133`). Rellenar con `Null` anula el sentido de proyectar. A lo sumo, documentarlo y rechazar índices fuera de rango.

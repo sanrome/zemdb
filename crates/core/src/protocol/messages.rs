@@ -23,6 +23,11 @@ pub enum ErrorCode {
     ProtocolVersionMismatch,
     /// The request is malformed or carries an invalid value (for example an invalid ID).
     BadRequest,
+    /// The snapshot the request refers to is no longer the room's active snapshot (a newer one
+    /// replaced it, or it expired), or an upload targets a sequence that is not newer than the
+    /// active snapshot or the upload in progress. A download restarts from chunk 0 without
+    /// `snapshot_hash`.
+    SnapshotSuperseded,
 }
 
 /// An operation ordered by the coordination server with assigned sequence ID.
@@ -103,11 +108,18 @@ pub enum ClientMessage {
         client_id: ClientId,
     },
     /// Request a specific chunk of the room base snapshot for bootstrapping datasets > 16 MB.
+    ///
+    /// The server clamps `chunk_size` to its allowed range; the reply's `total_chunks` reflects
+    /// the size actually used. The first request of a download leaves `snapshot_hash` empty and
+    /// gets the active snapshot; every following request carries the `snapshot_hash` of that
+    /// reply, so that all chunks come from the same snapshot. If it is no longer the active
+    /// snapshot the server answers `ErrorCode::SnapshotSuperseded`.
     RequestSnapshotChunk {
         correlation_id: CorrelationId,
         room_id: RoomId,
         chunk_index: u32,
         chunk_size: u32,
+        snapshot_hash: Option<[u8; 32]>,
     },
     /// Upload a chunk of the room base snapshot for multipart staging of large datasets.
     UploadSnapshotChunk {

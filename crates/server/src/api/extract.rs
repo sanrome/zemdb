@@ -10,7 +10,7 @@
 //! ([`AdminPath`], [`AdminJson`]) are `ServerError::BadRequest`, rendered as JSON.
 
 use axum::body::Bytes;
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{BytesRejection, JsonRejection};
 use axum::extract::{FromRef, FromRequest, FromRequestParts, Path, Request};
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
@@ -28,6 +28,7 @@ use crate::api::auth::verify_client_token;
 use crate::api::data_plane::{binary_error, binary_response};
 use crate::api::router::AppState;
 use crate::error::ServerError;
+use crate::relay::Uploader;
 
 /// Room id taken from the `:room_id` URL path segment, validated as a [`RoomId`].
 ///
@@ -140,6 +141,8 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayAuth {
     pub room_id: RoomId,
+    /// Who made the request: the snapshot worker (admin secret) or a room member.
+    pub uploader: Uploader,
 }
 
 #[axum::async_trait]
@@ -163,12 +166,15 @@ where
             .ct_eq(app_state.config.admin_secret.as_bytes())
             .unwrap_u8()
             == 1;
-        if !is_admin {
-            verify_token_for_room(token, &room_id, &app_state)
+        let uploader = if is_admin {
+            Uploader::Admin
+        } else {
+            let client_id = verify_token_for_room(token, &room_id, &app_state)
                 .map_err(|err| binary_error(None, Some(room_id.clone()), err))?;
-        }
+            Uploader::Client(client_id)
+        };
 
-        Ok(RelayAuth { room_id })
+        Ok(RelayAuth { room_id, uploader })
     }
 }
 
@@ -196,22 +202,9 @@ where
             .ok()
             .and_then(|Path(raw)| RoomId::new(raw).ok());
 
-        let body = Bytes::from_request(req, state).await.map_err(|rejection| {
-            let status = rejection.status();
-            let err = ServerError::BadRequest(format!(
-                "Failed to read request body: {}",
-                rejection.body_text()
-            ));
-            binary_response(
-                status,
-                &ServerMessage::Error {
-                    correlation_id: None,
-                    room_id: room_id.clone(),
-                    code: err.to_error_code(),
-                    message: err.to_string(),
-                },
-            )
-        })?;
+        let body = Bytes::from_request(req, state)
+            .await
+            .map_err(|rejection| body_rejection(rejection, room_id.clone()))?;
 
         decode_message(&body).map(BinaryMessage).map_err(|e| {
             binary_error(
@@ -221,6 +214,51 @@ where
             )
         })
     }
+}
+
+/// Raw request body, read within the router's body size limit.
+///
+/// Unlike axum's `Bytes` extractor, a body that cannot be read is rejected with a binary
+/// `BadRequest` frame that keeps axum's status (413 when too large), as for [`BinaryMessage`].
+#[derive(Debug, Clone)]
+pub struct BinaryBody(pub Bytes);
+
+#[axum::async_trait]
+impl<S> FromRequest<S> for BinaryBody
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(mut req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let room_id = req
+            .extract_parts::<Path<String>>()
+            .await
+            .ok()
+            .and_then(|Path(raw)| RoomId::new(raw).ok());
+        Bytes::from_request(req, state)
+            .await
+            .map(BinaryBody)
+            .map_err(|rejection| body_rejection(rejection, room_id))
+    }
+}
+
+/// Binary `BadRequest` frame for a body that could not be read, keeping axum's status.
+fn body_rejection(rejection: BytesRejection, room_id: Option<RoomId>) -> Response {
+    let status = rejection.status();
+    let err = ServerError::BadRequest(format!(
+        "Failed to read request body: {}",
+        rejection.body_text()
+    ));
+    binary_response(
+        status,
+        &ServerMessage::Error {
+            correlation_id: None,
+            room_id,
+            code: err.to_error_code(),
+            message: err.to_string(),
+        },
+    )
 }
 
 /// Path parameters of an admin endpoint, deserialized into validated types (`RoomId`,

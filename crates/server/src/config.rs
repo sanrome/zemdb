@@ -36,6 +36,10 @@ pub struct ServerConfig {
     /// TTL duration for staged snapshots in the relay before eviction (seconds).
     #[serde(default = "default_snapshot_ttl_secs")]
     pub snapshot_ttl_secs: u64,
+
+    /// Largest snapshot the relay accepts, in bytes (default 512 MiB).
+    #[serde(default = "default_max_snapshot_bytes")]
+    pub max_snapshot_bytes: u64,
 }
 
 fn default_host() -> String {
@@ -70,6 +74,10 @@ fn default_snapshot_ttl_secs() -> u64 {
     600
 }
 
+fn default_max_snapshot_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -81,9 +89,16 @@ impl Default for ServerConfig {
             lease_timeout_secs: default_lease_timeout_secs(),
             dedup_lru_capacity: default_dedup_lru_capacity(),
             snapshot_ttl_secs: default_snapshot_ttl_secs(),
+            max_snapshot_bytes: default_max_snapshot_bytes(),
         }
     }
 }
+
+/// Smallest accepted `max_snapshot_bytes` (1 MiB).
+pub const MIN_MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024;
+
+/// Largest accepted `max_snapshot_bytes` (64 GiB).
+pub const MAX_MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Minimum length, in bytes, of the client token secret and the admin secret.
 pub const MIN_SECRET_LEN: usize = 32;
@@ -110,6 +125,26 @@ impl ServerConfig {
             return Err(ServerError::Config(
                 "auth_secret and admin_secret must be different".to_string(),
             ));
+        }
+        Ok(())
+    }
+
+    /// Checks every setting the server cannot run safely with: the secrets (see
+    /// [`validate_secrets`](Self::validate_secrets)) and the limits.
+    pub fn validate(&self) -> Result<(), ServerError> {
+        self.validate_secrets()?;
+        self.validate_limits()
+    }
+
+    /// Checks that `max_snapshot_bytes` lies within
+    /// [`MIN_MAX_SNAPSHOT_BYTES`]..=[`MAX_MAX_SNAPSHOT_BYTES`].
+    pub fn validate_limits(&self) -> Result<(), ServerError> {
+        if !(MIN_MAX_SNAPSHOT_BYTES..=MAX_MAX_SNAPSHOT_BYTES).contains(&self.max_snapshot_bytes) {
+            return Err(ServerError::Config(format!(
+                "max_snapshot_bytes (ZEMDB_MAX_SNAPSHOT_BYTES) must be between {MIN_MAX_SNAPSHOT_BYTES} \
+                 (1 MiB) and {MAX_MAX_SNAPSHOT_BYTES} (64 GiB), got {}",
+                self.max_snapshot_bytes
+            )));
         }
         Ok(())
     }
@@ -160,6 +195,11 @@ impl ServerConfig {
                 self.snapshot_ttl_secs = snap_ttl;
             }
         }
+        if let Ok(max_str) = std::env::var("ZEMDB_MAX_SNAPSHOT_BYTES") {
+            if let Ok(max_bytes) = max_str.parse::<u64>() {
+                self.max_snapshot_bytes = max_bytes;
+            }
+        }
     }
 
     /// Load configuration with optional TOML file and automatic environment variable overrides.
@@ -169,7 +209,7 @@ impl ServerConfig {
             None => Self::default(),
         };
         config.apply_env_overrides();
-        config.validate_secrets()?;
+        config.validate()?;
         Ok(config)
     }
 }

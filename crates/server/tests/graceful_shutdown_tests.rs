@@ -54,7 +54,14 @@ async fn shutdown_ends_sse_streams_and_persists_rosters() {
         ..ServerConfig::default()
     });
     let schema_registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
-    let snapshot_relay = Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(60)));
+    let snapshot_relay = Arc::new(
+        SnapshotRelay::new(
+            dir.path().join("snapshots"),
+            Duration::from_secs(60),
+            ServerConfig::default().max_snapshot_bytes,
+        )
+        .unwrap(),
+    );
     let room_manager = Arc::new(RoomManager::new(
         Arc::clone(&config),
         Arc::clone(&schema_registry),

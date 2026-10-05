@@ -35,14 +35,19 @@ impl LifecycleTestServer {
             lease_timeout_secs: 60,
             dedup_lru_capacity: 1000,
             snapshot_ttl_secs: 60,
+            max_snapshot_bytes: 16 * 1024 * 1024,
         });
 
         let schemas_dir = data_dir.join("schemas");
         let schema_registry = Arc::new(SchemaRegistry::new(schemas_dir).unwrap());
         let snapshots_dir = data_dir.join("snapshots");
         let snapshot_relay = Arc::new(
-            SnapshotRelay::new(snapshots_dir, Duration::from_secs(config.snapshot_ttl_secs))
-                .unwrap(),
+            SnapshotRelay::new(
+                snapshots_dir,
+                Duration::from_secs(config.snapshot_ttl_secs),
+                config.max_snapshot_bytes,
+            )
+            .unwrap(),
         );
         let room_manager = Arc::new(RoomManager::new(
             Arc::clone(&config),
@@ -116,7 +121,14 @@ async fn test_concurrent_get_or_spawn_elimination_of_race_condition() {
         .register_schema(schema_id.clone(), create_test_schema())
         .unwrap();
 
-    let relay = Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(60)));
+    let relay = Arc::new(
+        SnapshotRelay::new(
+            data_dir.join("snapshots"),
+            Duration::from_secs(60),
+            ServerConfig::default().max_snapshot_bytes,
+        )
+        .unwrap(),
+    );
     let manager = Arc::new(RoomManager::new(config, schema_registry, relay));
     let room_id = RoomId::new("race-condition-room").unwrap();
 
@@ -182,7 +194,14 @@ async fn test_graceful_room_deletion_and_directory_cleanup() {
         .register_schema(schema_id.clone(), schema.clone())
         .unwrap();
 
-    let relay = Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(60)));
+    let relay = Arc::new(
+        SnapshotRelay::new(
+            data_dir.join("snapshots"),
+            Duration::from_secs(60),
+            ServerConfig::default().max_snapshot_bytes,
+        )
+        .unwrap(),
+    );
     let manager = Arc::new(RoomManager::new(config, schema_registry, relay));
     let room_id = RoomId::new("deletion-target-room").unwrap();
 
@@ -400,7 +419,14 @@ async fn test_max_batch_size_clamped_in_sync() {
         .register_schema(schema_id.clone(), schema.clone())
         .unwrap();
 
-    let relay = Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(60)));
+    let relay = Arc::new(
+        SnapshotRelay::new(
+            data_dir.join("snapshots"),
+            Duration::from_secs(60),
+            ServerConfig::default().max_snapshot_bytes,
+        )
+        .unwrap(),
+    );
     let manager = Arc::new(RoomManager::new(config, schema_registry, relay));
     let room_id = RoomId::new("clamp-batch-size-room").unwrap();
 
@@ -496,8 +522,51 @@ async fn test_snapshot_multipart_chunk_upload_and_blake3_verification() {
         &server.config.auth_secret,
     );
 
-    // 1. Prepare 300 KB synthetic snapshot data
-    let snapshot_data = vec![0x42u8; 300 * 1024];
+    // 0. The relay only accepts snapshots inside the room's log range: create the room and
+    // commit 11 operations (the snapshot below is at seq 10, the corrupted one at seq 11).
+    let schema_id = SchemaId::new("doc-schema").unwrap();
+    let schema = create_test_schema();
+    server
+        .schema_registry
+        .register_schema(schema_id.clone(), schema.clone())
+        .unwrap();
+    server
+        .room_manager
+        .create_room(room_id.clone(), schema_id, None)
+        .await
+        .unwrap();
+    let sender = server.room_manager.get_room(&room_id).unwrap();
+    let (tx, rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::RegisterClient {
+            client_id: client_id.clone(),
+            current_seq: None,
+            reply: tx,
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap().unwrap();
+    for i in 1..=11u64 {
+        let (tx, rx) = oneshot::channel();
+        sender
+            .send(RoomCommand::Commit {
+                client_id: client_id.clone(),
+                mutation_id: MutationId::new([i as u8; 16]),
+                last_ack_seq: SequenceNumber::new(i - 1),
+                op: create_test_op(&schema, i as i64, "doc"),
+                reply: tx,
+            })
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap();
+    }
+
+    // 1. Prepare a 300 KB snapshot envelope
+    let body = vec![0x42u8; 300 * 1024 - SNAPSHOT_HEADER_LEN];
+    let header =
+        SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, body.len() as u32, &body);
+    let mut snapshot_data = header.to_bytes().to_vec();
+    snapshot_data.extend_from_slice(&body);
     let snapshot_hash = ServerMessage::compute_snapshot_hash(&snapshot_data);
     let total_bytes = snapshot_data.len() as u64;
     let chunk_size = 100 * 1024;
@@ -646,6 +715,7 @@ async fn test_snapshot_multipart_chunk_upload_and_blake3_verification() {
         room_id: room_id.clone(),
         chunk_index: 0,
         chunk_size: 100 * 1024,
+        snapshot_hash: None,
     };
     let download_resp = server
         .client
@@ -673,37 +743,37 @@ async fn test_snapshot_multipart_chunk_upload_and_blake3_verification() {
         other => panic!("Expected SnapshotChunk, got: {:?}", other),
     }
 
-    // 7. Verify corrupted upload detection (tampered data causing BLAKE3 digest mismatch)
-    let corrupt_room = RoomId::new("corrupt-snapshot-room").unwrap();
-    let corrupt_token = generate_client_token(
-        &client_id,
-        &corrupt_room,
-        Duration::from_secs(300),
-        &server.config.auth_secret,
-    );
+    // 7. Verify corrupted upload detection (tampered data causing BLAKE3 digest mismatch).
+    // The snapshot is a valid envelope at a newer, in-range seq; only its hash is wrong, which
+    // is a client error.
+    let tampered_body = b"test";
+    let tampered_header =
+        SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, 4, tampered_body);
+    let mut tampered = tampered_header.to_bytes().to_vec();
+    tampered.extend_from_slice(tampered_body);
     let single_chunk_tampered = ClientMessage::UploadSnapshotChunk {
         correlation_id: CorrelationId::new(6),
-        room_id: corrupt_room.clone(),
-        snapshot_head_seq: SequenceNumber::new(1),
+        room_id: room_id.clone(),
+        snapshot_head_seq: SequenceNumber::new(11),
         chunk_index: 0,
         total_chunks: 1,
-        total_bytes: 4,
+        total_bytes: tampered.len() as u64,
         snapshot_hash: [0xFF; 32], // incorrect hash
-        data: Bytes::from_static(b"test"),
+        data: Bytes::from(tampered),
     };
     let corrupt_resp = server
         .client
         .post(format!(
             "{}/rooms/{}/snapshot/upload-chunk",
-            server.base_url, corrupt_room
+            server.base_url, room_id
         ))
-        .header(AUTHORIZATION, format!("Bearer {}", corrupt_token))
+        .header(AUTHORIZATION, format!("Bearer {}", client_token))
         .header(CONTENT_TYPE, "application/octet-stream")
         .body(encode_message(&single_chunk_tampered).unwrap())
         .send()
         .await
         .unwrap();
-    assert_eq!(corrupt_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(corrupt_resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[test]

@@ -56,3 +56,32 @@ fn rejection_does_not_echo_the_secret() {
         .to_string();
     assert!(!err.contains(short), "error leaks the secret: {err}");
 }
+
+fn load_with_max_snapshot_bytes(max: u64) -> Result<ServerConfig, ServerError> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("zemdb.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "auth_secret = \"{STRONG_AUTH}\"\nadmin_secret = \"{STRONG_ADMIN}\"\nmax_snapshot_bytes = {max}\n"
+        ),
+    )
+    .unwrap();
+    ServerConfig::load_with_env(Some(&path))
+}
+
+#[test]
+fn max_snapshot_bytes_outside_its_range_fails_to_load() {
+    for max in [0, 1024 * 1024 - 1, 64 * 1024 * 1024 * 1024 + 1] {
+        let err = load_with_max_snapshot_bytes(max).unwrap_err().to_string();
+        assert!(err.contains("max_snapshot_bytes"), "{max}: {err}");
+    }
+    for max in [1024 * 1024, 512 * 1024 * 1024, 64 * 1024 * 1024 * 1024] {
+        assert_eq!(
+            load_with_max_snapshot_bytes(max)
+                .unwrap()
+                .max_snapshot_bytes,
+            max
+        );
+    }
+}

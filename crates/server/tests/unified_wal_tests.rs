@@ -218,21 +218,25 @@ fn test_server_config_toml_and_env_overrides() {
     assert_eq!(config.lease_timeout_secs, 120);
     assert_eq!(config.dedup_lru_capacity, 25000);
     assert_eq!(config.snapshot_ttl_secs, 300);
+    assert_eq!(config.max_snapshot_bytes, 512 * 1024 * 1024);
 
     // Test environment variable overrides
     std::env::set_var("ZEMDB_PORT", "9999");
     std::env::set_var("ZEMDB_HOST", "192.168.1.50");
     std::env::set_var("ZEMDB_SNAPSHOT_TTL_SECS", "1800");
+    std::env::set_var("ZEMDB_MAX_SNAPSHOT_BYTES", "1048576");
     config.apply_env_overrides();
 
     assert_eq!(config.port, 9999);
     assert_eq!(config.host, "192.168.1.50");
     assert_eq!(config.snapshot_ttl_secs, 1800);
+    assert_eq!(config.max_snapshot_bytes, 1024 * 1024);
 
     // Clean up env vars
     std::env::remove_var("ZEMDB_PORT");
     std::env::remove_var("ZEMDB_HOST");
     std::env::remove_var("ZEMDB_SNAPSHOT_TTL_SECS");
+    std::env::remove_var("ZEMDB_MAX_SNAPSHOT_BYTES");
 }
 
 #[test]
@@ -280,4 +284,14 @@ fn test_server_error_mapping() {
         ServerError::RoomLocked("Room is already locked by another process".to_string());
     assert_eq!(locked_err.to_error_code(), ErrorCode::RoomLocked);
     assert_eq!(locked_err.to_status_code(), axum::http::StatusCode::LOCKED);
+
+    let superseded_err = ServerError::SnapshotSuperseded("a newer snapshot is active".to_string());
+    assert_eq!(
+        superseded_err.to_error_code(),
+        ErrorCode::SnapshotSuperseded
+    );
+    assert_eq!(
+        superseded_err.to_status_code(),
+        axum::http::StatusCode::CONFLICT
+    );
 }

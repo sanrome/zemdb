@@ -68,6 +68,9 @@ pub enum ServerError {
 
     #[error("Bad request: {0}")]
     BadRequest(String),
+
+    #[error("Snapshot superseded: {0}")]
+    SnapshotSuperseded(String),
 }
 
 impl From<zemdb_core::InvalidIdError> for ServerError {
@@ -92,6 +95,7 @@ impl ServerError {
             ServerError::RateLimited => ErrorCode::RateLimited,
             ServerError::InvalidSequence { .. } => ErrorCode::InvalidSequence,
             ServerError::BadRequest(_) => ErrorCode::BadRequest,
+            ServerError::SnapshotSuperseded(_) => ErrorCode::SnapshotSuperseded,
             ServerError::GatewayTimeout(_)
             | ServerError::Io(_)
             | ServerError::Wal(_)
@@ -107,7 +111,9 @@ impl ServerError {
         match self {
             ServerError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ServerError::RoomNotFound(_) | ServerError::SchemaNotFound(_) => StatusCode::NOT_FOUND,
-            ServerError::RoomAlreadyExists(_) => StatusCode::CONFLICT,
+            ServerError::RoomAlreadyExists(_) | ServerError::SnapshotSuperseded(_) => {
+                StatusCode::CONFLICT
+            }
             ServerError::ProtocolVersionMismatch(_)
             | ServerError::SchemaViolation(_)
             | ServerError::InvalidSequence { .. }

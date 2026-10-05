@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
-use zemdb_core::id::{RoomId, SchemaId};
+use zemdb_core::id::{RoomId, SchemaId, SequenceNumber};
 
 use crate::actor::command::RoomCommand;
 use crate::actor::room::RoomActor;
@@ -295,6 +295,8 @@ impl RoomManager {
 
         self.shutdown_room(room_id).await;
         self.room_schemas.remove(room_id);
+        // A room recreated with the same id must not inherit this room's snapshot.
+        self.snapshot_relay.purge_room(room_id).await?;
 
         let room_dir = self.data_dir.join("rooms").join(room_id.as_str());
         if room_dir.exists() {
@@ -303,6 +305,22 @@ impl RoomManager {
         } else {
             Err(ServerError::RoomNotFound(room_id.to_string()))
         }
+    }
+
+    /// Retained log range of a room as `(tail_seq, head_seq)`, spawning its actor if needed.
+    /// A room that does not exist is `RoomNotFound`.
+    pub async fn log_bounds(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<(SequenceNumber, SequenceNumber), ServerError> {
+        let sender = self.get_or_spawn(room_id, None).await?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        sender
+            .send(RoomCommand::GetLogBounds { reply: tx })
+            .await
+            .map_err(|_| ServerError::Internal(format!("Room {room_id} actor stopped")))?;
+        rx.await
+            .map_err(|_| ServerError::Internal(format!("Room {room_id} actor stopped")))
     }
 
     /// Reloads the schema across all active rooms associated with `schema_id`.

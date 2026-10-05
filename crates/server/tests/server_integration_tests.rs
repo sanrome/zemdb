@@ -36,14 +36,19 @@ impl TestServer {
             lease_timeout_secs: 60,
             dedup_lru_capacity: 1000,
             snapshot_ttl_secs: 60,
+            max_snapshot_bytes: 16 * 1024 * 1024,
         });
 
         let schemas_dir = data_dir.join("schemas");
         let schema_registry = Arc::new(SchemaRegistry::new(schemas_dir).unwrap());
         let snapshots_dir = data_dir.join("snapshots");
         let snapshot_relay = Arc::new(
-            SnapshotRelay::new(snapshots_dir, Duration::from_secs(config.snapshot_ttl_secs))
-                .unwrap(),
+            SnapshotRelay::new(
+                snapshots_dir,
+                Duration::from_secs(config.snapshot_ttl_secs),
+                config.max_snapshot_bytes,
+            )
+            .unwrap(),
         );
         let room_manager = Arc::new(RoomManager::new(
             Arc::clone(&config),
@@ -808,8 +813,50 @@ async fn test_snapshot_relay_chunked_transfer_and_blake3() {
     let server = TestServer::start().await;
     let room_id = RoomId::new("room-relay-1").unwrap();
 
-    // 1. Prepare 512 KB synthetic snapshot payload
-    let snapshot_bytes = vec![0xABu8; 512 * 1024];
+    // 0. The relay only accepts snapshots inside the room's log range: create the room and
+    // commit one operation so that the snapshot can sit at seq 1.
+    let schema_id = SchemaId::new("relay-schema").unwrap();
+    let schema = create_test_schema();
+    server
+        .schema_registry
+        .register_schema(schema_id.clone(), schema.clone())
+        .unwrap();
+    server
+        .room_manager
+        .create_room(room_id.clone(), schema_id, None)
+        .await
+        .unwrap();
+    let sender = server.room_manager.get_room(&room_id).unwrap();
+    let writer = ClientId::new("writer").unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    sender
+        .send(zemdb_server::RoomCommand::RegisterClient {
+            client_id: writer.clone(),
+            current_seq: None,
+            reply: tx,
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap().unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    sender
+        .send(zemdb_server::RoomCommand::Commit {
+            client_id: writer,
+            mutation_id: MutationId::new([1; 16]),
+            last_ack_seq: SequenceNumber::new(0),
+            op: create_insert_op(&schema, 1, "task"),
+            reply: tx,
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap().unwrap();
+
+    // 1. Prepare a 512 KB snapshot envelope
+    let body = vec![0xABu8; 512 * 1024 - SNAPSHOT_HEADER_LEN];
+    let header =
+        SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, body.len() as u32, &body);
+    let mut snapshot_bytes = header.to_bytes().to_vec();
+    snapshot_bytes.extend_from_slice(&body);
     let expected_hash = ServerMessage::compute_snapshot_hash(&snapshot_bytes);
 
     // 2. Upload snapshot staging via POST /rooms/:id/snapshot/upload
@@ -823,7 +870,7 @@ async fn test_snapshot_relay_chunked_transfer_and_blake3() {
             AUTHORIZATION,
             format!("Bearer {}", server.config.admin_secret),
         )
-        .header("x-snapshot-head-seq", "100")
+        .header("x-snapshot-head-seq", "1")
         .body(snapshot_bytes.clone())
         .send()
         .await
@@ -840,6 +887,7 @@ async fn test_snapshot_relay_chunked_transfer_and_blake3() {
             room_id: room_id.clone(),
             chunk_index: chunk_idx,
             chunk_size,
+            snapshot_hash: (chunk_idx > 0).then_some(expected_hash),
         };
 
         let chunk_resp = server
@@ -875,7 +923,7 @@ async fn test_snapshot_relay_chunked_transfer_and_blake3() {
                 assert_eq!(total_chunks, 4);
                 assert_eq!(total_bytes, 512 * 1024);
                 assert_eq!(snapshot_hash, expected_hash);
-                assert_eq!(snapshot_head_seq, SequenceNumber::new(100));
+                assert_eq!(snapshot_head_seq, SequenceNumber::new(1));
                 assembled_data.extend_from_slice(&data);
             }
             other => panic!("Expected SnapshotChunk, got {:?}", other),

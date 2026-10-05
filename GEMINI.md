@@ -1,5 +1,7 @@
 No retrocompatibility is needed as this is the first version of the proyect so changes shouldn´t be stopped for this cause. 
 
+La versión del protocolo wire (`PROTOCOL_VERSION`) solo se incrementa por cambios del formato entre releases publicados. Antes del primer release no hay clientes que distinguir, así que se mantiene en `0x01` aunque el formato cambie.
+
 No incluir identificadores ni referencias a códigos de auditoría (por ejemplo, C-01, C-03, M-04, A-01, B-01, DEF-01, etc.) en los comentarios del código fuente, tests ni docstrings. El código debe explicar la lógica y los motivos técnicos de manera limpia, profesional y autosuficiente, reservando los códigos de defectos exclusivamente para los documentos de auditoría (`docs/audits/`) y propuestas (`docs/proposals/`).
 
 ## Estructura de Tests

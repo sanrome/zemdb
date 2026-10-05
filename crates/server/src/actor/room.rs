@@ -251,6 +251,10 @@ impl RoomActor {
                 let _ = reply.send(metrics);
             }
 
+            RoomCommand::GetLogBounds { reply } => {
+                let _ = reply.send((self.tiered_log.tail_seq(), self.head_seq));
+            }
+
             RoomCommand::GetClientCursor { client_id, reply } => {
                 let cursor = self
                     .lease_tracker
@@ -523,7 +527,14 @@ impl RoomActor {
         let Some(min_ack) = self.lease_tracker.min_connected_ack_seq() else {
             return;
         };
-        let active_snap = self.snapshot_relay.active_snapshot_seq(&self.room_id);
+        // The relay only accepts snapshots inside the retained range, but the range moves on
+        // (TTL and size compaction ignore the anchor), so a snapshot that fell out of it can no
+        // longer anchor anything and is ignored.
+        let tail_seq = self.tiered_log.tail_seq();
+        let active_snap = self
+            .snapshot_relay
+            .active_snapshot_seq(&self.room_id)
+            .filter(|seq| seq.get().saturating_add(1) >= tail_seq.get() && *seq <= self.head_seq);
         let retention_floor = match active_snap {
             Some(snap_seq) => min_ack.min(snap_seq),
             None => min_ack,

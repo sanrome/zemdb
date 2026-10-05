@@ -2,6 +2,7 @@ pub mod auth;
 pub mod control_plane;
 pub mod data_plane;
 pub mod extract;
+pub mod relay;
 pub mod router;
 pub mod serve;
 pub mod sse;

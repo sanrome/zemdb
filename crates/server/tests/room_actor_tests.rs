@@ -8,8 +8,15 @@ use zemdb_server::{
     SchemaRegistry, ServerConfig, ServerError, SnapshotRelay, SyncBatchResponse,
 };
 
-fn create_test_relay() -> Arc<SnapshotRelay> {
-    Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(60)))
+fn create_test_relay(dir: &std::path::Path) -> Arc<SnapshotRelay> {
+    Arc::new(
+        SnapshotRelay::new(
+            dir.join("snapshots"),
+            Duration::from_secs(60),
+            ServerConfig::default().max_snapshot_bytes,
+        )
+        .unwrap(),
+    )
 }
 
 fn create_test_schema() -> Schema {
@@ -109,7 +116,7 @@ async fn test_room_actor_registration_and_get_schema() {
         ..Default::default()
     });
 
-    let manager = RoomManager::new(config, schema_registry, create_test_relay());
+    let manager = RoomManager::new(config, schema_registry, create_test_relay(dir.path()));
     let room_id = RoomId::new("room-1").unwrap();
     let sender = manager
         .get_or_spawn(&room_id, Some(&schema_id))
@@ -148,7 +155,7 @@ async fn test_room_actor_commit_validation_and_monotonic_sequencing() {
         ..Default::default()
     });
 
-    let manager = RoomManager::new(config, schema_registry, create_test_relay());
+    let manager = RoomManager::new(config, schema_registry, create_test_relay(dir.path()));
     let room_id = RoomId::new("tasks-room").unwrap();
     let sender = manager
         .get_or_spawn(&room_id, Some(&schema_id))
@@ -262,7 +269,7 @@ async fn test_room_actor_multi_client_concurrency_and_sse_events() {
         ..Default::default()
     });
 
-    let manager = RoomManager::new(config, schema_registry, create_test_relay());
+    let manager = RoomManager::new(config, schema_registry, create_test_relay(dir.path()));
     let room_id = RoomId::new("concurrent-room").unwrap();
     let sender = manager
         .get_or_spawn(&room_id, Some(&schema_id))
@@ -394,7 +401,7 @@ async fn test_room_actor_client_lifecycle_and_dormant_behind_compaction() {
     // Aggressive test policy for rapid compaction
     let lifecycle_policy = RoomLifecyclePolicy::test_policy();
 
-    let manager = RoomManager::new(config, schema_registry, create_test_relay());
+    let manager = RoomManager::new(config, schema_registry, create_test_relay(dir.path()));
     let room_id = RoomId::new("lifecycle-room").unwrap();
     let sender = manager
         .get_or_spawn_with_policy(&room_id, Some(&schema_id), lifecycle_policy)
@@ -530,7 +537,7 @@ async fn test_room_actor_recovery_retains_state_and_head_seq() {
         let manager = RoomManager::new(
             Arc::clone(&config),
             Arc::clone(&schema_registry),
-            create_test_relay(),
+            create_test_relay(dir.path()),
         );
         let sender = manager
             .get_or_spawn(&room_id, Some(&schema_id))
@@ -565,7 +572,7 @@ async fn test_room_actor_recovery_retains_state_and_head_seq() {
         let manager2 = RoomManager::new(
             Arc::clone(&config),
             Arc::clone(&schema_registry),
-            create_test_relay(),
+            create_test_relay(dir.path()),
         );
         let sender2 = manager2
             .get_or_spawn(&room_id, None)
@@ -630,7 +637,7 @@ async fn test_room_actor_cursor_advances_only_on_client_ack() {
         ..Default::default()
     });
 
-    let manager = RoomManager::new(config, schema_registry, create_test_relay());
+    let manager = RoomManager::new(config, schema_registry, create_test_relay(dir.path()));
     let room_id = RoomId::new("ack-test-room").unwrap();
     let sender = manager
         .get_or_spawn(&room_id, Some(&schema_id))
@@ -772,7 +779,14 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
         ..Default::default()
     });
 
-    let relay = Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(300)));
+    let relay = Arc::new(
+        SnapshotRelay::new(
+            dir.path().join("snapshots"),
+            Duration::from_secs(300),
+            ServerConfig::default().max_snapshot_bytes,
+        )
+        .unwrap(),
+    );
     let manager = RoomManager::new(config, schema_registry, Arc::clone(&relay));
     let room_id = RoomId::new("anchor-room").unwrap();
 
@@ -788,14 +802,7 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
         .await
         .unwrap();
 
-    // 1. Stage an active snapshot at seq 5 in the relay
-    relay.stage_snapshot(
-        room_id.clone(),
-        SequenceNumber::new(5),
-        bytes::Bytes::from_static(b"fake-snapshot-data-seq-5"),
-    );
-
-    // 2. Alice registers and commits 10 operations (1..=10)
+    // 1. Alice registers and commits 10 operations (1..=10)
     let alice = ClientId::new("alice").unwrap();
     let (reg_tx, reg_rx) = oneshot::channel();
     sender
@@ -823,6 +830,25 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
             .unwrap();
         rx.await.unwrap().unwrap();
     }
+
+    // 2. Stage an active snapshot at seq 5 in the relay (it must lie inside the log range)
+    let body = b"fake-snapshot-data-seq-5";
+    let header =
+        SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, body.len() as u32, body);
+    let mut envelope = header.to_bytes().to_vec();
+    envelope.extend_from_slice(body);
+    relay
+        .stage_snapshot(
+            &room_id,
+            SequenceNumber::new(5),
+            bytes::Bytes::from(envelope),
+            async {
+                let (tail_seq, head_seq) = manager.log_bounds(&room_id).await?;
+                Ok(zemdb_server::relay::LogBounds { tail_seq, head_seq })
+            },
+        )
+        .await
+        .unwrap();
 
     // 3. Alice acknowledges seq 10. Proactive pruning triggers, but
     // Retention Anchor at seq 5 MUST prevent pruning deltas 6..=10!
@@ -900,7 +926,7 @@ async fn test_room_actor_rejects_future_ack_and_commit_sequences() {
         ..Default::default()
     });
 
-    let manager = RoomManager::new(config, schema_registry, create_test_relay());
+    let manager = RoomManager::new(config, schema_registry, create_test_relay(dir.path()));
     let room_id = RoomId::new("room-seq-safety").unwrap();
     let sender = manager
         .get_or_spawn(&room_id, Some(&schema_id))

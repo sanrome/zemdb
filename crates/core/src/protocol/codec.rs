@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 /// Canonical 2-byte magic identifier for ZemDB wire protocol messages ("ZM").
 pub const PROTOCOL_MAGIC: [u8; 2] = [0x5A, 0x4D];
 
-/// Current wire protocol version.
+/// Current wire protocol version. It stays at 1 until the first release; after that it changes
+/// with every incompatible wire change between published releases.
 pub const PROTOCOL_VERSION: u8 = 0x01;
 
 /// Fixed length of wire protocol header (2B magic + 1B version + 1B flags).

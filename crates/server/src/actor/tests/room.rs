@@ -46,13 +46,14 @@ fn mutation(n: u8) -> MutationId {
 struct Fixture {
     dir: TempDir,
     manager: RoomManager,
+    relay: Arc<SnapshotRelay>,
     room_id: RoomId,
 }
 
 impl Fixture {
     async fn new(policy: RoomLifecyclePolicy) -> Self {
         let dir = tempdir().unwrap();
-        let manager = new_manager(&dir);
+        let (manager, relay) = new_manager(&dir);
         let room_id = RoomId::new("room").unwrap();
         manager
             .create_room(
@@ -65,6 +66,7 @@ impl Fixture {
         Self {
             dir,
             manager,
+            relay,
             room_id,
         }
     }
@@ -95,7 +97,7 @@ impl Fixture {
     }
 }
 
-fn new_manager(dir: &TempDir) -> RoomManager {
+fn new_manager(dir: &TempDir) -> (RoomManager, Arc<SnapshotRelay>) {
     let config = Arc::new(ServerConfig {
         data_dir: dir.path().to_path_buf(),
         ..ServerConfig::default()
@@ -104,8 +106,18 @@ fn new_manager(dir: &TempDir) -> RoomManager {
     registry
         .register_schema(SchemaId::new("todo").unwrap(), test_schema())
         .unwrap();
-    let relay = Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(60)));
-    RoomManager::new(config, registry, relay)
+    let relay = Arc::new(
+        SnapshotRelay::new(
+            dir.path().join("snapshots"),
+            Duration::from_secs(60),
+            ServerConfig::default().max_snapshot_bytes,
+        )
+        .unwrap(),
+    );
+    (
+        RoomManager::new(config, registry, Arc::clone(&relay)),
+        relay,
+    )
 }
 
 async fn register(sender: &mpsc::Sender<RoomCommand>, client_id: &ClientId) {
@@ -511,5 +523,98 @@ async fn failed_commit_write_restarts_room_and_retry_gets_next_sequence() {
     let synced = sync_all(&recovered, &client).await.unwrap();
     let seqs: Vec<u64> = synced.ops.iter().map(|op| op.seq.get()).collect();
     assert_eq!(seqs, vec![1, 2]);
+    fx.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn log_bounds_report_the_retained_range() {
+    let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    for i in 1..=3u8 {
+        commit(
+            &sender,
+            &client,
+            mutation(i),
+            seq(u64::from(i) - 1),
+            insert_op(i64::from(i)),
+        )
+        .await
+        .unwrap();
+    }
+
+    let (tail_seq, head_seq) = fx.manager.log_bounds(&fx.room_id).await.unwrap();
+    assert_eq!(head_seq, seq(3));
+    assert_eq!(tail_seq, metrics(&sender).await.tail_seq);
+
+    let missing = RoomId::new("missing").unwrap();
+    assert!(matches!(
+        fx.manager.log_bounds(&missing).await,
+        Err(ServerError::RoomNotFound(_))
+    ));
+    fx.manager.shutdown_all().await;
+}
+
+/// A valid raw snapshot envelope.
+fn snapshot_envelope() -> bytes::Bytes {
+    use zemdb_core::protocol::snapshot_envelope::{SnapshotCompression, SnapshotEnvelopeHeader};
+    let body = b"snapshot";
+    let header = SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, 8, body);
+    let mut out = header.to_bytes().to_vec();
+    out.extend_from_slice(body);
+    bytes::Bytes::from(out)
+}
+
+// Paused time: no maintenance tick runs, so only the ack path prunes.
+#[tokio::test(start_paused = true)]
+async fn snapshot_below_the_retained_range_does_not_anchor_pruning() {
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 2,
+        ..RoomLifecyclePolicy::default()
+    };
+    let fx = Fixture::new(policy).await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    for n in 1..=8u8 {
+        commit(&sender, &client, mutation(n), seq(0), insert_op(n.into()))
+            .await
+            .unwrap();
+    }
+    ack(&sender, &client, seq(8)).await.unwrap();
+    let tail_before = metrics(&sender).await.tail_seq;
+    assert!(
+        tail_before >= seq(3),
+        "the ack must have pruned (tail {tail_before})"
+    );
+
+    // A snapshot at seq 1 is below tail - 1: the relay would no longer accept it, and it must
+    // not hold back pruning. (Staged with bounds that admit it, to simulate a snapshot that
+    // fell out of the range after it was accepted.)
+    fx.relay
+        .stage_snapshot(
+            &fx.room_id,
+            seq(1),
+            snapshot_envelope(),
+            std::future::ready(Ok(crate::relay::LogBounds {
+                tail_seq: seq(0),
+                head_seq: seq(100),
+            })),
+        )
+        .await
+        .unwrap();
+
+    for n in 9..=12u8 {
+        commit(&sender, &client, mutation(n), seq(8), insert_op(n.into()))
+            .await
+            .unwrap();
+    }
+    ack(&sender, &client, seq(12)).await.unwrap();
+    let tail_after = metrics(&sender).await.tail_seq;
+    assert!(
+        tail_after > tail_before,
+        "a stale snapshot held back pruning (tail {tail_before} -> {tail_after})"
+    );
     fx.manager.shutdown_all().await;
 }

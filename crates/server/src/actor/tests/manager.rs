@@ -27,7 +27,14 @@ fn new_manager(dir: &TempDir) -> RoomManager {
     registry
         .register_schema(SchemaId::new("second").unwrap(), test_schema())
         .unwrap();
-    let relay = Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(60)));
+    let relay = Arc::new(
+        SnapshotRelay::new(
+            dir.path().join("snapshots"),
+            Duration::from_secs(60),
+            ServerConfig::default().max_snapshot_bytes,
+        )
+        .unwrap(),
+    );
     RoomManager::new(config, registry, relay)
 }
 

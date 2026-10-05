@@ -60,7 +60,14 @@ async fn spawn_room(policy: RoomLifecyclePolicy) -> TestRoom {
         data_dir: data_dir.clone(),
         ..Default::default()
     });
-    let relay = Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(60)));
+    let relay = Arc::new(
+        SnapshotRelay::new(
+            data_dir.join("snapshots"),
+            Duration::from_secs(60),
+            ServerConfig::default().max_snapshot_bytes,
+        )
+        .unwrap(),
+    );
     let manager = RoomManager::new(config, schema_registry, relay);
     let room_id = RoomId::new("commit-room").unwrap();
     let sender = manager
