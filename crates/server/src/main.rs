@@ -2,9 +2,10 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{error, info, warn};
 use zemdb_server::{
-    build_router, AppState, RoomManager, SchemaRegistry, ServerConfig, SnapshotRelay,
+    serve_until_shutdown, AppState, RoomManager, SchemaRegistry, ServerConfig, SnapshotRelay,
+    SHUTDOWN_GRACE_PERIOD,
 };
 
 #[tokio::main]
@@ -33,7 +34,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         room_manager,
         snapshot_relay,
     );
-    let app = build_router(state);
 
     let addr = format!("{}:{}", config.host, config.port);
     let listener = TcpListener::bind(&addr).await?;
@@ -48,7 +48,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("ZemDB coordination server listening on http://{}", addr);
 
-    axum::serve(listener, app).await?;
+    if let Err(err) =
+        serve_until_shutdown(listener, state, os_shutdown_signal(), SHUTDOWN_GRACE_PERIOD).await
+    {
+        // Either the server failed or the shutdown exceeded its grace period. Exit right away
+        // instead of letting the runtime wait for tasks that may never finish.
+        error!(error = %err, "Server stopped abnormally; forcing exit");
+        std::process::exit(1);
+    }
 
+    info!("ZemDB coordination server stopped");
     Ok(())
+}
+
+/// Resolves on SIGINT or SIGTERM on Unix; on Windows on Ctrl+C, Ctrl+Close (console window
+/// closed) or Ctrl+Shutdown (system shutdown).
+async fn os_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                tokio::select! {
+                    () = ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "Cannot listen for SIGTERM; only SIGINT triggers shutdown");
+                ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        use tokio::signal::windows::{ctrl_close, ctrl_shutdown};
+        match (ctrl_close(), ctrl_shutdown()) {
+            (Ok(mut close), Ok(mut shutdown)) => {
+                tokio::select! {
+                    () = ctrl_c() => {}
+                    _ = close.recv() => {}
+                    _ = shutdown.recv() => {}
+                }
+            }
+            _ => {
+                warn!("Cannot listen for console close or system shutdown; only Ctrl+C triggers shutdown");
+                ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    ctrl_c().await;
+}
+
+/// Resolves on Ctrl+C. If the handler cannot be installed it never resolves, so that the
+/// failure does not shut the server down immediately.
+async fn ctrl_c() {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        warn!(error = %err, "Cannot listen for Ctrl+C");
+        std::future::pending::<()>().await;
+    }
 }

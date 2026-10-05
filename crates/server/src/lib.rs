@@ -4,6 +4,7 @@ pub mod config;
 pub mod dedup;
 mod durable;
 pub mod error;
+mod fail_point;
 pub mod log;
 pub mod relay;
 pub mod schema_registry;
@@ -13,12 +14,15 @@ pub use actor::{
     RoomCommand, RoomEvent, RoomManager, RoomMetadata, RoomMetrics, SyncBatchResponse,
 };
 pub use api::{
-    build_router, generate_client_token, verify_client_token, verify_client_token_bound, AdminAuth,
-    AppState, ClientAuth, VerifiedClientToken,
+    build_router, generate_client_token, serve_until_shutdown, verify_client_token,
+    verify_client_token_bound, AdminAuth, AppState, ClientAuth, ShutdownSignal,
+    VerifiedClientToken, SHUTDOWN_GRACE_PERIOD,
 };
 pub use config::ServerConfig;
 pub use dedup::DedupLruCache;
 pub use error::ServerError;
-pub use log::{MaintenanceReport, PruneReport, RoomLifecyclePolicy, TieredLog, WarmDiskLog};
+pub use log::{
+    AppendOutcome, MaintenanceReport, PruneReport, RoomLifecyclePolicy, TieredLog, WarmDiskLog,
+};
 pub use relay::SnapshotRelay;
 pub use schema_registry::SchemaRegistry;

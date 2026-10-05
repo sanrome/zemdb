@@ -1,19 +1,27 @@
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 use zemdb_core::id::{RoomId, SchemaId};
 
 use crate::actor::command::RoomCommand;
 use crate::actor::room::RoomActor;
 use crate::config::ServerConfig;
+use crate::durable;
 use crate::error::ServerError;
 use crate::log::RoomLifecyclePolicy;
 use crate::relay::SnapshotRelay;
 use crate::schema_registry::SchemaRegistry;
+
+/// File, inside the room directory, recording the room's schema assignment.
+const META_ROOM_FILE: &str = "meta_room.json";
+
+/// Interval between checks while waiting for a stopped room actor to finish exiting.
+const PREVIOUS_ACTOR_POLL: Duration = Duration::from_millis(5);
 
 /// Persistent room configuration linking a RoomId to its assigned SchemaId.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,30 +102,26 @@ impl RoomManager {
             }
         }
 
+        // 3b. A previous actor for this room stopped on its own (for example after a failed
+        // log write). Wait until it has fully exited and released the room's files before
+        // recovering the room from disk.
+        // The handle stays in the map while waiting, so a request abandoned at this point
+        // leaves the next one still waiting for the same actor.
+        self.wait_for_previous_actor(room_id).await;
+
         // 4. Resolve SchemaId
         let room_dir = self.data_dir.join("rooms").join(room_id.as_str());
-        let meta_room_path = room_dir.join("meta_room.json");
+        let meta_room_path = room_dir.join(META_ROOM_FILE);
 
         let resolved_schema_id = if let Some(sid) = schema_id {
             // Save or update meta_room.json
-            fs::create_dir_all(&room_dir)?;
-            let meta = RoomMetadata {
-                room_id: room_id.clone(),
-                schema_id: sid.clone(),
-            };
-            let json = serde_json::to_string_pretty(&meta).map_err(|e| {
-                ServerError::Serialization(format!("Failed to serialize meta_room.json: {}", e))
-            })?;
-            fs::write(&meta_room_path, json.as_bytes())?;
+            write_room_metadata(&room_dir, room_id, sid)?;
             self.room_schemas.insert(room_id.clone(), sid.clone());
             sid.clone()
         } else if let Some(sid) = self.room_schemas.get(room_id) {
             sid.clone()
         } else if meta_room_path.exists() {
-            let content = fs::read_to_string(&meta_room_path)?;
-            let meta: RoomMetadata = serde_json::from_str(&content).map_err(|e| {
-                ServerError::Serialization(format!("Failed to parse meta_room.json: {}", e))
-            })?;
+            let meta = read_room_metadata(&meta_room_path)?;
             self.room_schemas
                 .insert(room_id.clone(), meta.schema_id.clone());
             meta.schema_id
@@ -152,6 +156,29 @@ impl RoomManager {
         Ok(sender)
     }
 
+    /// Waits until the previous actor task of `room_id`, if any, has finished, then forgets it.
+    ///
+    /// Polls `is_finished` instead of awaiting the handle so that the handle is only removed
+    /// once the task is done, keeping this cancel-safe; map guards are never held across an
+    /// `.await`.
+    async fn wait_for_previous_actor(&self, room_id: &RoomId) {
+        loop {
+            let finished = self.room_handles.get(room_id).map(|h| h.is_finished());
+            match finished {
+                None => return,
+                Some(true) => {
+                    if let Some((_, previous)) = self.room_handles.remove(room_id) {
+                        if let Err(err) = previous.await {
+                            warn!(room = %room_id, error = %err, "Previous RoomActor task ended abnormally");
+                        }
+                    }
+                    return;
+                }
+                Some(false) => tokio::time::sleep(PREVIOUS_ACTOR_POLL).await,
+            }
+        }
+    }
+
     /// Fast check if a room exists in memory or on disk.
     pub fn room_exists(&self, room_id: &RoomId) -> bool {
         if self.rooms.contains_key(room_id) || self.room_schemas.contains_key(room_id) {
@@ -161,7 +188,7 @@ impl RoomManager {
             .data_dir
             .join("rooms")
             .join(room_id.as_str())
-            .join("meta_room.json");
+            .join(META_ROOM_FILE);
         meta_room_path.exists()
     }
 
@@ -226,7 +253,7 @@ impl RoomManager {
         let _guard = lock.lock().await;
 
         let room_dir = self.data_dir.join("rooms").join(room_id.as_str());
-        let meta_room_path = room_dir.join("meta_room.json");
+        let meta_room_path = room_dir.join(META_ROOM_FILE);
 
         if meta_room_path.exists() || self.rooms.contains_key(&room_id) {
             return Err(ServerError::RoomAlreadyExists(room_id.to_string()));
@@ -238,15 +265,7 @@ impl RoomManager {
             .get_schema(&schema_id)
             .ok_or_else(|| ServerError::SchemaNotFound(schema_id.to_string()))?;
 
-        fs::create_dir_all(&room_dir)?;
-        let meta = RoomMetadata {
-            room_id: room_id.clone(),
-            schema_id: schema_id.clone(),
-        };
-        let json = serde_json::to_string_pretty(&meta).map_err(|e| {
-            ServerError::Serialization(format!("Failed to serialize meta_room.json: {}", e))
-        })?;
-        fs::write(&meta_room_path, json.as_bytes())?;
+        let meta = write_room_metadata(&room_dir, &room_id, &schema_id)?;
         self.room_schemas.insert(room_id.clone(), schema_id.clone());
 
         // Spawn actor and retain handle
@@ -312,3 +331,37 @@ impl RoomManager {
         reloaded
     }
 }
+
+/// Atomically and durably writes `meta_room.json` for a room, creating its directory if needed.
+fn write_room_metadata(
+    room_dir: &Path,
+    room_id: &RoomId,
+    schema_id: &SchemaId,
+) -> Result<RoomMetadata, ServerError> {
+    durable::create_dir_all_synced(room_dir)?;
+    let meta = RoomMetadata {
+        room_id: room_id.clone(),
+        schema_id: schema_id.clone(),
+    };
+    let json = serde_json::to_string_pretty(&meta).map_err(|e| {
+        ServerError::Serialization(format!("Failed to serialize meta_room.json: {}", e))
+    })?;
+    durable::write_atomic(&room_dir.join(META_ROOM_FILE), json.as_bytes())?;
+    Ok(meta)
+}
+
+/// Reads a room's `meta_room.json`, discarding a temporary file left by an interrupted write.
+/// An unreadable file is an error: the room cannot be served without knowing its schema.
+fn read_room_metadata(meta_room_path: &Path) -> Result<RoomMetadata, ServerError> {
+    match fs::remove_file(durable::tmp_path_for(meta_room_path)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let content = fs::read_to_string(meta_room_path)?;
+    serde_json::from_str(&content)
+        .map_err(|e| ServerError::Serialization(format!("Failed to parse meta_room.json: {}", e)))
+}
+
+#[cfg(test)]
+mod tests;

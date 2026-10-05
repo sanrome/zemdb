@@ -1,3 +1,4 @@
+use crate::durable;
 use crate::error::ServerError;
 use crate::log::warm_disk::{parse_segment_filename, RecoveredLogData, SealedSegmentMeta};
 use std::io::Write;
@@ -13,8 +14,10 @@ pub struct ColdDiskLog;
 impl ColdDiskLog {
     /// Compresses an uncompressed Warm Disk segment (.wal) into a Cold Disk segment (.wal.zst) synchronously.
     ///
-    /// Writes to a `.tmp` file first, flushes, syncs, atomically renames over the destination,
-    /// verifies readability, and deletes the uncompressed `.wal` file.
+    /// Writes to a `.tmp` file first, flushes, syncs, atomically renames over the destination
+    /// and syncs the directory, verifies readability, and only then deletes the uncompressed
+    /// `.wal` file (syncing the directory again). A power loss can therefore never persist the
+    /// deletion of the warm segment without the cold segment that replaces it.
     pub fn compress_warm_segment_sync(
         warm_path: &Path,
         cold_path: &Path,
@@ -39,6 +42,8 @@ impl ColdDiskLog {
         }
 
         std::fs::rename(&tmp_path, cold_path)?;
+        let dir = cold_path.parent().unwrap_or_else(|| Path::new(""));
+        durable::sync_dir(dir)?;
 
         // Verify decompressed roundtrip before purging the uncompressed file
         let verified_ops = Self::read_range(cold_path, SequenceNumber::new(0), usize::MAX)?;
@@ -50,6 +55,7 @@ impl ColdDiskLog {
         }
 
         std::fs::remove_file(warm_path)?;
+        durable::sync_dir(warm_path.parent().unwrap_or_else(|| Path::new("")))?;
         Ok(())
     }
 
@@ -160,3 +166,6 @@ impl ColdDiskLog {
         Ok(segments)
     }
 }
+
+#[cfg(test)]
+mod tests;

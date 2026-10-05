@@ -5,6 +5,7 @@ use std::sync::Arc;
 use zemdb_core::schema::{ColumnDef, Schema};
 use zemdb_core::SchemaId;
 
+use crate::durable;
 use crate::error::ServerError;
 
 /// Thread-safe registry for room schemas with persistent disk storage.
@@ -18,14 +19,19 @@ impl SchemaRegistry {
     /// Opens or creates the schema registry at the given directory, loading any existing schema files.
     pub fn new(dir: impl Into<PathBuf>) -> Result<Self, ServerError> {
         let dir = dir.into();
-        fs::create_dir_all(&dir)?;
+        durable::create_dir_all_synced(&dir)?;
 
         let schemas = DashMap::new();
 
-        // Scan directory for {schema_id}.json files
+        // Scan directory for {schema_id}.json files. Temporary files left by an interrupted
+        // write are discarded; the matching `.json` still holds the last complete version.
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
             let path = entry.path();
+            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("tmp") {
+                fs::remove_file(&path)?;
+                continue;
+            }
             if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                     let schema_id = SchemaId::new(stem);
@@ -52,14 +58,12 @@ impl SchemaRegistry {
         schema: Schema,
     ) -> Result<Arc<Schema>, ServerError> {
         let path = self.dir.join(format!("{}.json", id.as_str()));
-        let tmp_path = self.dir.join(format!("{}.json.tmp", id.as_str()));
 
         let json = serde_json::to_string_pretty(&schema).map_err(|e| {
             ServerError::Serialization(format!("Failed to serialize schema {}: {}", id, e))
         })?;
 
-        fs::write(&tmp_path, json.as_bytes())?;
-        fs::rename(&tmp_path, &path)?;
+        durable::write_atomic(&path, json.as_bytes())?;
 
         let arc_schema = Arc::new(schema);
         self.schemas.insert(id, Arc::clone(&arc_schema));
@@ -107,3 +111,6 @@ impl SchemaRegistry {
         self.schemas.iter().map(|kv| kv.key().clone()).collect()
     }
 }
+
+#[cfg(test)]
+mod tests;

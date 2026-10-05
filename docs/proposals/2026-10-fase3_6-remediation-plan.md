@@ -40,6 +40,10 @@
 | **D2** | Un commit ya durable (`append` exitoso) **nunca** responde `Err`. Si no se puede armar el catch-up, responde `CommitAck` con `catchup_ops: []` y `has_more: true`; el siguiente `/sync` reporta el error real. No viola la regla 4 porque `has_more: true` no oculta nada: obliga al cliente a pedir más. | Adoptada |
 | **D3** | `is_compacting` pasa a `AtomicBool` fuera del `RwLock` de la sala, con guard RAII cuyo `Drop` lo resetea (regla 2). Un `Drop` no puede hacer `.await` sobre un lock de Tokio, por eso el flag sale del lock. | Adoptada |
 | **D4** | Group commit / micro-batching en el actor: **descartado** para v0.1. Con 2–50 clientes por sala la cola casi nunca tiene más de un commit. | Adoptada |
+| **D5** | Metadatos corruptos al abrir: el roster de clientes (`meta_clients_*.json`) se trata como recuperable (arranca vacío con un warning; los clientes se vuelven a registrar y la poda proactiva queda detenida hasta entonces, que es la dirección segura). `meta_room.json` y los esquemas corruptos hacen fallar la apertura. | Adoptada |
+| **D6** | Cursores de clientes: se actualizan en memoria con un flag de "sucio" y se persisten (escritura atómica) en el tick de mantenimiento; registro, desregistro y apagado se persisten en el momento. Un crash pierde ≤500 ms de avance de cursores. Persistir en cada ack/commit sumaría dos fsync por operación. **Corrección tras la revisión del Lote 3:** como la poda usa el cursor en memoria, antes de cualquier poda que vaya a borrar un segmento se persiste el roster (misma regla "registrar antes de borrar" que `log_meta.json`); así el cursor persistido nunca queda por debajo de lo podado. | Adoptada |
+| **D7** | Falla de escritura o `fsync` en un commit del servidor: el actor responde error interno (reintentable), lo registra y **termina**; el `RoomManager` relanza la sala en el siguiente request y la recupera desde disco. Si el registro llegó al disco, la deduplicación lo reconoce y un reintento con el mismo `mutation_id` recibe su `CommitAck`. | Adoptada |
+| **D8** | Apagado ordenado: SIGINT y SIGTERM; dejar de aceptar conexiones, cortar los streams SSE (si no, el apagado esperaría para siempre), esperar los requests en curso, `shutdown_all` con guardado del roster, y timeout total de 10 s tras el cual se fuerza la salida. | Adoptada |
 
 ---
 
@@ -49,16 +53,16 @@
 |---|---|---|---|---|
 | 1 | Consistencia del log y del commit | DEF-01, 36, 07, 58, 59, 67, 04, 29, 06 | Inmediata | ✅ 9/9 |
 | 2 | Durabilidad del motor de storage | DEF-02, 03, 65, 19(storage), 12 | Inmediata | ✅ 5/5 |
-| 3 | Durabilidad de metadatos del servidor | DEF-60, 19(server), 16, 48, 68, 69 | Alta | 0/6 (DEF-68 🟡) |
+| 3 | Durabilidad de metadatos del servidor | DEF-60, 19(server), 16, 48, 68, 69 | Alta | ✅ 6/6 |
 | 4 | Autenticación e identificadores | DEF-61, 41, 66 | Alta | 0/3 |
 | 5 | Relay de snapshots | DEF-62, 10, 63, 52, 51, 39, 40, 38, 31(relay), 08(relay), 15 | Alta | 0/11 |
-| 6 | Ciclo de vida de clientes y señalización | DEF-53, 05, 27 (24 y 26 descartados) | Alta | 0/3 |
-| 7 | Protocolo wire y errores HTTP | DEF-46, 28, 11, 43, 64, 22, 71 | Media | 0/7 |
-| 8 | Rendimiento, portabilidad y ciclo de vida de salas | DEF-50, 35, 55, 37, 08, 31(locks), 25(server), 72 | Media | 0/8 |
-| 9 | Robustez e higiene de storage y core | DEF-14, 23, 49, 17, 25(storage), 18, 09, 45, 33, 44, 47, 30, 13, 20, 21, 57, 70 (32 descartado) | Media/Baja | 1/17 |
+| 6 | Ciclo de vida de clientes y señalización | DEF-53, 05, 27, 75, 76 (24 y 26 descartados) | Alta | 0/5 |
+| 7 | Protocolo wire y errores HTTP | DEF-46, 28, 11, 43, 64, 22, 71, 74 | Media | 0/8 |
+| 8 | Rendimiento, portabilidad y ciclo de vida de salas | DEF-50, 35, 55, 37, 08, 31(locks), 25(server), 72, 77, 79 | Media | 0/10 |
+| 9 | Robustez e higiene de storage y core | DEF-14, 23, 49, 17, 25(storage), 18, 09, 45, 33, 44, 47, 30, 13, 20, 21, 57, 70, 78 (32 descartado) | Media/Baja | 1/18 |
 | 10 | Diferido a Fase 4 / descartado | DEF-34, 54, 42, 56, 73 | — | — |
 
-**Avance total:** 15 de 69 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
+**Avance total:** 21 de 75 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
 
 **Severidades corregidas respecto de la auditoría anterior:** de los 7 "críticos" originales, solo DEF-01 lo es. DEF-02, 03 y 04 son Altos; DEF-05 y 06 son Medios; DEF-34 es Bajo. DEF-24, 26 y 56 son falsos en la práctica.
 
@@ -185,31 +189,32 @@ Off-by-one del fast path (`from_seq + 1 >= min_ram`). Solo costaba rendimiento.
 
 ## Lote 3 — Durabilidad de metadatos del servidor
 
-#### DEF-60 · Alto · ⬜ (nuevo)
+#### DEF-60 · Alto · ✅ Hecho (nuevo)
 **Problema.** `meta_room.json` se escribe in-place con `fs::write` (`actor/manager.rs:111`), sin tmp ni rename. Un crash a mitad de la escritura deja un archivo truncado y la sala no vuelve a cargar.
 **Solución.** Usar `durable::write_atomic` (ya creado en `server/src/durable.rs` para DEF-67) para meta de sala, esquemas y roster en register/deregister.
 **Test.** Archivo `.tmp` residual o destino truncado → la sala carga la última versión válida.
 
-#### DEF-19 (server) · Medio · ⬜
+#### DEF-19 (server) · Medio · ✅ Hecho
 **Problema.** Leases y esquemas usan tmp + rename, pero sin `fsync` ni `sync_dir`. Un roster corrupto hoy hace fallar la carga (`lease.rs:55`).
 **Solución.** Usar `write_atomic`. Un roster ilegible se trata como recuperable: arrancar vacío y loguear un warning (los clientes se vuelven a registrar).
 
-#### DEF-16 · Medio · ⬜
+#### DEF-16 · Medio · ✅ Hecho
 **Problema.** `handle_commit` no registra `last_ack_seq` en el lease tracker (contradice ARCHITECTURE.md:228), así que los escritores continuos no avanzan el suelo de retención. El impacto de "agotar el disco" está exagerado (la poda por TTL/cuota sigue funcionando).
 **Solución.** `record_ack(last_ack_seq)` en el commit (ya es monótono: `if ack_seq > entry.last_ack_seq`). Hoy `record_ack` reescribe todo el roster en JSON en cada llamada: pasar a cursor en memoria + flag dirty, persistido en el tick; `write_atomic` solo en register/deregister.
 **Test.** Cliente que solo hace commits → el suelo de retención avanza y se podan segmentos.
 
-#### DEF-48 · Bajo · ⬜
+#### DEF-48 · Bajo · ✅ Hecho
 **Problema.** Sin apagado ordenado. La durabilidad de commits no está en riesgo (hay `sync_data` antes del ack), pero `RoomCommand::Shutdown` solo corta el loop sin guardar leases, y `ctrl_c()` no captura SIGTERM.
 **Solución.** `axum::serve(...).with_graceful_shutdown(SIGINT | SIGTERM)` → `shutdown_all()`; el handler de `Shutdown` hace `lease_tracker.save()` (con `write_atomic`).
+**Aplicado** según D8, en `api/serve.rs` y `main.rs`. En Windows escucha `ctrl_c`, `ctrl_close` y `ctrl_shutdown`; **ese código no se compiló todavía** (no hay target de Windows instalado), se verifica con DEF-73.
 
-#### DEF-68 · Alto · 🟡 Parcial (nuevo)
+#### DEF-68 · Alto · ✅ Hecho (nuevo)
 **Problema.** Si en un commit el `write` al WAL sale bien pero falla el `fsync`, hoy se responde error y la sala sigue operando. Después de un `fsync` fallido el estado del disco es incierto: el kernel puede descartar las páginas sucias, y un `fsync` posterior "exitoso" no garantiza que esos bytes lleguen al disco ("fsyncgate"). Además, el registro escrito puede quedar en el archivo y reaparecer al reiniciar como una op confirmada que el cliente cree rechazada.
 **Solución.** Regla 1 de `GEMINI.md`: ante una falla de I/O a mitad de una escritura durable, la sala se marca como inválida (rechaza comandos con un error de servicio no disponible), el actor termina, y la próxima apertura recupera desde disco. No se reintenta el `fsync`.
 **Test.** Un punto de fallo `#[cfg(test)]` en el `sync_data` del WAL → el commit falla, los comandos siguientes son rechazados, y al reabrir la sala el estado sale del disco.
-**Hecho en storage.** `DiskStorageEngine::apply_batch` marca la sala como fallida (`StorageError::RoomFailed`) si falla la escritura o el `fsync` del WAL; escrituras y compactaciones se rechazan hasta reabrir. Lo mismo si `apply_snapshot` no puede persistir el estado ya reemplazado en memoria. **Falta el servidor** (`TieredLog::append` en el actor de sala).
+**Hecho en storage.** `DiskStorageEngine::apply_batch` marca la sala como fallida (`StorageError::RoomFailed`) si falla la escritura o el `fsync` del WAL; escrituras y compactaciones se rechazan hasta reabrir. Lo mismo si `apply_snapshot` no puede persistir el estado ya reemplazado en memoria. **Hecho en el servidor** según D7: si falla la escritura o el `fsync`, el actor responde error reintentable y termina; el `RoomManager` lo relanza (esperando de forma cancel-safe a que el actor anterior libere sus archivos) y la sala se recupera desde disco. Si lo que falla es la rotación de segmento con el registro ya durable, el commit se confirma igual y la sala se reinicia (D2).
 
-#### DEF-69 · Medio · ⬜ (nuevo, revisión del Lote 2)
+#### DEF-69 · Medio · ✅ Hecho (nuevo, revisión del Lote 2)
 **Problema.** En el servidor, `WarmDiskLog::rotate_active_segment` renombra `active.wal` y `ColdDiskLog::compress_warm_segment_sync` renombra el `.tmp` a cold y borra el warm, ambos sin `sync_dir`. Tras un corte de luz, el borrado puede persistir y el rename no, dejando un hueco entre segmentos. Ya no hay pérdida silenciosa (la lectura devuelve `BehindCompaction`), pero sí datos perdidos.
 **Solución.** `durable::sync_dir` después de cada rename y antes de borrar el segmento warm.
 
@@ -295,6 +300,14 @@ El tick de 500 ms ya recalcula el suelo de retención; el retraso máximo es de 
 #### DEF-26 · ❌ Descartado
 Un cliente `Bootstrapping` tiene por definición el cursor por debajo de `tail - 1`, así que en el siguiente tick pasa de `Disconnected` a `Dormant`. La poda se bloquea unos 500 ms, no 90 s.
 
+#### DEF-75 · Bajo · ⬜ (nuevo, revisión del Lote 3)
+**Problema.** El test existente `test_room_actor_retention_anchor_protects_deltas_during_snapshot` pasa aunque se quite el ancla de retención: sin ella el suelo es 10, solo se poda el segmento [1,5], `tail` queda en 6 y un sync desde 5 sigue funcionando. No prueba lo que dice.
+**Solución.** Rehacer el escenario para que, sin el ancla, el sync desde el seq del snapshot reciba `BehindCompaction`.
+
+#### DEF-76 · Bajo · ⬜ (nuevo, revisión del Lote 3)
+**Problema.** `ClientLeaseTracker::record_ack` sobre un cliente no registrado lo inserta como `Connected`; `handle_sync` puede llegar a ese camino.
+**Solución.** Ignorar (o rechazar) acks de clientes no registrados.
+
 ---
 
 ## Lote 7 — Protocolo wire y errores HTTP
@@ -322,6 +335,9 @@ Unos 20 sitios en `data_plane.rs` y `sse.rs` devuelven `ServerError::Config` (50
 #### DEF-71 · Bajo · ⬜ (nuevo, revisión del Lote 1)
 **Problema.** `tail_seq` cambió de forma visible para el cliente: una sala nueva reporta `1` (antes `0`) y una sala podada por completo reporta `tail_seq = head_seq + 1` (mayor que `head`) en `Registered`/`RegisterResponse`. Un cliente que asuma `tail <= head` se equivoca. Además, las guardas `tail > 0` de `lease.rs` quedaron siempre verdaderas.
 **Solución.** Documentar la semántica en la especificación del protocolo (ARCHITECTURE.md §7) antes de la Fase 4, y simplificar las guardas de `lease.rs` usando `TieredLog::is_behind_retention`.
+
+#### DEF-74 · Bajo · ⬜ (nuevo, revisión del Lote 3)
+Los errores reintentables (sala reiniciándose tras un fallo de I/O según D7, respuesta del actor descartada) se devuelven como 500 `Internal`. Un 503 con un código de error propio indicaría al cliente que reintentar es seguro.
 
 ---
 
@@ -360,6 +376,12 @@ El `sync_data` de cada commit bloquea un worker de Tokio (en macOS es `F_FULLFSY
 #### Nota sobre DEF-08
 La revisión del Lote 1 señaló dos casos más de I/O bloqueante en el actor: `record_pruned_through` (escritura atómica de `log_meta.json`) y los `sync_dir` de la fase 3 de la compactación de storage. Se tratan junto con DEF-08.
 
+#### DEF-77 · Bajo · ⬜ (nuevo, revisión del Lote 3)
+`ColdDiskLog` usa `cold_path.with_extension("tmp")` (`segment_X_Y.wal.tmp`); un `.tmp` residual de una compresión interrumpida nunca se limpia.
+
+#### DEF-79 · Bajo · ⬜ (nuevo)
+Tests dependientes de tiempos: `tiered_log_tests::test_tiered_log_behind_compaction_eviction` (cold TTL de 100 ms) falla a veces con la suite completa en paralelo. Revisar los tests con TTL cortos y pasarlos a tiempo simulado o márgenes amplios.
+
 ---
 
 ## Lote 9 — Robustez e higiene de storage y core
@@ -397,6 +419,9 @@ Encapsulamiento (regla 5). DEF-13 necesita además `Schema::add_column`, porque 
 #### DEF-70 · Bajo · ⬜ (nuevo, revisión del Lote 2)
 **Problema.** `apply_snapshot` acepta un snapshot cuyo `head_seq` es menor que el de la sala. Si hay un crash entre el rename del snapshot y el truncado del WAL, la recuperación encuentra registros que no continúan la secuencia y la sala no abre (`WalCorruption`). Antes se aplicaban en silencio sobre un estado incorrecto.
 **Solución.** Rechazar en `apply_snapshot` un snapshot con `head_seq` menor que el actual (no hay caso legítimo de retroceso).
+
+#### DEF-78 · Bajo · ⬜ (nuevo, revisión del Lote 3)
+`SchemaRegistry::register_schema` y `add_column` no tienen lock por esquema: dos escrituras concurrentes sobre el mismo id comparten el mismo `.tmp`, y `add_column` es leer-modificar-escribir. Serializar las escrituras por id de esquema.
 
 #### DEF-32 · ❌ Descartado
 El input es un WAL local acotado por longitud y CRC, y bincode 1.3 ya valida longitudes contra el slice. **La solución propuesta rompería todos los WAL existentes**: se escriben con `bincode::serialize` (enteros de ancho fijo), y `DefaultOptions::new()` decodifica varints. Si alguna vez se agrega un límite, usar `.with_fixint_encoding().allow_trailing_bytes().with_limit(..)`.

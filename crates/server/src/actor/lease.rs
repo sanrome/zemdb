@@ -3,8 +3,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use tracing::warn;
 use zemdb_core::id::{ClientId, SequenceNumber};
 
+use crate::durable;
 use crate::error::ServerError;
 
 /// Lifecycle status of a registered room client.
@@ -33,52 +35,84 @@ pub struct ClientEntry {
 }
 
 /// Persistent tracker for client leases, cursors, and room membership.
+///
+/// Membership changes (register, deregister) are written to disk immediately. Cursor and
+/// state changes only update memory and mark the roster dirty; the owner flushes them with
+/// `persist_if_dirty`. Losing an unflushed cursor advance only makes the server retain more log.
 #[derive(Debug)]
 pub struct ClientLeaseTracker {
     path: PathBuf,
     clients: HashMap<ClientId, ClientEntry>,
+    dirty: bool,
 }
 
 impl ClientLeaseTracker {
     /// Opens an existing client metadata file or creates a new empty tracker.
+    ///
+    /// A roster that cannot be parsed is discarded with a warning and the tracker starts
+    /// empty: clients register again, and until they do no client cursor allows proactive
+    /// pruning, which is the safe direction. Errors reading the file are still reported.
     pub fn open_or_create(path: impl AsRef<Path>) -> Result<Self, ServerError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            durable::create_dir_all_synced(parent)?;
+        }
+
+        match fs::remove_file(durable::tmp_path_for(&path)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
         }
 
         let mut clients = HashMap::new();
 
-        if path.exists() {
-            let content = fs::read_to_string(&path)?;
-            if !content.trim().is_empty() {
-                let entries: Vec<ClientEntry> = serde_json::from_str(&content).map_err(|e| {
-                    ServerError::Serialization(format!(
-                        "Failed to parse clients roster from {}: {}",
-                        path.display(),
-                        e
-                    ))
-                })?;
-                for mut entry in entries {
-                    entry.last_heartbeat = Instant::now();
-                    clients.insert(entry.client_id.clone(), entry);
+        let content = match fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e.into()),
+        };
+        if !content.trim().is_empty() {
+            match serde_json::from_str::<Vec<ClientEntry>>(&content) {
+                Ok(entries) => {
+                    for mut entry in entries {
+                        entry.last_heartbeat = Instant::now();
+                        clients.insert(entry.client_id.clone(), entry);
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "Unreadable clients roster; starting with an empty roster"
+                    );
                 }
             }
         }
 
-        Ok(Self { path, clients })
+        Ok(Self {
+            path,
+            clients,
+            dirty: false,
+        })
     }
 
-    /// Atomically persists the client roster to disk.
-    pub fn save(&self) -> Result<(), ServerError> {
-        let tmp_path = self.path.with_extension("tmp");
+    /// Atomically and durably persists the client roster to disk, clearing the dirty mark.
+    pub fn save(&mut self) -> Result<(), ServerError> {
         let entries: Vec<&ClientEntry> = self.clients.values().collect();
         let json = serde_json::to_string_pretty(&entries).map_err(|e| {
             ServerError::Serialization(format!("Failed to serialize clients roster: {}", e))
         })?;
 
-        fs::write(&tmp_path, json.as_bytes())?;
-        fs::rename(&tmp_path, &self.path)?;
+        durable::write_atomic(&self.path, json.as_bytes())?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Persists the roster if it changed since the last successful save.
+    pub fn persist_if_dirty(&mut self) -> Result<(), ServerError> {
+        if self.dirty {
+            self.save()?;
+        }
         Ok(())
     }
 
@@ -120,24 +154,21 @@ impl ClientLeaseTracker {
             );
         }
 
+        self.dirty = true;
         self.save()?;
         Ok(initial_state)
     }
 
     /// Records an explicit acknowledgment of applied sequences from a client,
-    /// advancing its cursor, resetting its lease timer, and persisting to disk.
+    /// advancing its cursor (never backwards) and resetting its lease timer.
     /// Acknowledgment promotes a Bootstrapping client to Connected.
-    pub fn record_ack(
-        &mut self,
-        client_id: &ClientId,
-        ack_seq: SequenceNumber,
-    ) -> Result<(), ServerError> {
+    /// The change is kept in memory and marks the roster dirty.
+    pub fn record_ack(&mut self, client_id: &ClientId, ack_seq: SequenceNumber) {
+        self.dirty = true;
         if let Some(entry) = self.clients.get_mut(client_id) {
             entry.state = ClientState::Connected;
             entry.last_heartbeat = Instant::now();
-            if ack_seq > entry.last_ack_seq {
-                entry.last_ack_seq = ack_seq;
-            }
+            advance_monotonic(entry, ack_seq);
         } else {
             self.clients.insert(
                 client_id.clone(),
@@ -149,8 +180,17 @@ impl ClientLeaseTracker {
                 },
             );
         }
+    }
 
-        self.save()
+    /// Advances a registered client's cursor to `seq` if it is ahead of the current one,
+    /// without changing its lifecycle state or lease timer. Used when an accepted commit
+    /// reports the client's cursor. The change is kept in memory and marks the roster dirty.
+    pub fn advance_cursor(&mut self, client_id: &ClientId, seq: SequenceNumber) {
+        if let Some(entry) = self.clients.get_mut(client_id) {
+            if advance_monotonic(entry, seq) {
+                self.dirty = true;
+            }
+        }
     }
 
     /// Records a heartbeat for a client, resetting its lease timer and marking it Connected.
@@ -161,7 +201,7 @@ impl ClientLeaseTracker {
             entry.state = ClientState::Connected;
             entry.last_heartbeat = Instant::now();
             if was_disconnected {
-                return self.save();
+                self.dirty = true;
             }
             Ok(())
         } else {
@@ -173,8 +213,12 @@ impl ClientLeaseTracker {
     }
 
     /// Records client activity without modifying its acknowledged sequence.
+    /// A state change marks the roster dirty.
     pub fn record_activity(&mut self, client_id: &ClientId) {
         if let Some(entry) = self.clients.get_mut(client_id) {
+            if entry.state != ClientState::Connected {
+                self.dirty = true;
+            }
             entry.state = ClientState::Connected;
             entry.last_heartbeat = Instant::now();
         }
@@ -184,12 +228,13 @@ impl ClientLeaseTracker {
     pub fn deregister_client(&mut self, client_id: &ClientId) -> Result<bool, ServerError> {
         let removed = self.clients.remove(client_id).is_some();
         if removed {
+            self.dirty = true;
             self.save()?;
         }
         Ok(removed)
     }
 
-    /// Evaluates timeouts for all registered clients:
+    /// Evaluates timeouts for all registered clients (changes only mark the roster dirty):
     /// - `Connected` / `Bootstrapping` -> `Disconnected` when lease expires without heartbeat.
     /// - `Disconnected` -> `Dormant` when its cursor falls behind `tail_seq - 1` or exceeds 90s inactivity.
     pub fn check_timeouts(&mut self, lease_timeout: Duration, tail_seq: SequenceNumber) -> bool {
@@ -221,7 +266,7 @@ impl ClientLeaseTracker {
         }
 
         if modified {
-            let _ = self.save();
+            self.dirty = true;
         }
 
         modified
@@ -314,3 +359,17 @@ impl ClientLeaseTracker {
         )
     }
 }
+
+/// Moves `entry`'s cursor forward to `seq`; a cursor never moves backwards.
+/// Returns true if the cursor changed.
+fn advance_monotonic(entry: &mut ClientEntry, seq: SequenceNumber) -> bool {
+    if seq > entry.last_ack_seq {
+        entry.last_ack_seq = seq;
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests;

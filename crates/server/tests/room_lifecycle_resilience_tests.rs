@@ -422,7 +422,9 @@ async fn test_max_batch_size_clamped_in_sync() {
         .unwrap();
     reg_rx.await.unwrap().unwrap();
 
-    // Commit 1005 operations to room actor
+    // Commit 1005 operations to room actor. The client keeps reporting cursor 0: a cursor
+    // reported by an accepted commit advances the retention floor, and this test needs the
+    // whole log retained to sync it from the start.
     for i in 1..=1005u64 {
         let op = create_test_op(&schema, i as i64, "item");
         let (tx, rx) = oneshot::channel();
@@ -430,7 +432,7 @@ async fn test_max_batch_size_clamped_in_sync() {
             .send(RoomCommand::Commit {
                 client_id: reader_client.clone(),
                 mutation_id: MutationId::from_u128(i as u128),
-                last_ack_seq: SequenceNumber::new(i - 1),
+                last_ack_seq: SequenceNumber::new(0),
                 op,
                 reply: tx,
             })

@@ -776,7 +776,13 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
     let manager = RoomManager::new(config, schema_registry, Arc::clone(&relay));
     let room_id = RoomId::new("anchor-room");
 
-    let lifecycle_policy = RoomLifecyclePolicy::test_policy();
+    // Small segments so proactive pruning has something to delete, but default TTLs: with
+    // the short test TTLs, a slow run could prune the cold segments by age, which is not the
+    // behavior under test.
+    let lifecycle_policy = RoomLifecyclePolicy {
+        ram_max_ops: 5,
+        ..RoomLifecyclePolicy::default()
+    };
     let sender = manager
         .get_or_spawn_with_policy(&room_id, Some(&schema_id), lifecycle_policy)
         .await
@@ -944,7 +950,8 @@ async fn test_room_actor_rejects_future_ack_and_commit_sequences() {
         other => panic!("Expected ServerError::InvalidSequence, got {:?}", other),
     }
 
-    // 3. Verify Alice's cursor did NOT advance to 999
+    // 3. Verify Alice's cursor did NOT advance to 999: it stays at the cursor reported by
+    // her last accepted commit
     let (cursor_tx, cursor_rx) = oneshot::channel();
     sender
         .send(RoomCommand::GetClientCursor {
@@ -954,7 +961,7 @@ async fn test_room_actor_rejects_future_ack_and_commit_sequences() {
         .await
         .unwrap();
     let cursor = cursor_rx.await.unwrap();
-    assert_eq!(cursor, Some(SequenceNumber::new(0)));
+    assert_eq!(cursor, Some(SequenceNumber::new(2)));
 
     // 4. Bob registers and syncs from sequence 0; deltas must NOT have been pruned
     let bob = ClientId::new("bob");

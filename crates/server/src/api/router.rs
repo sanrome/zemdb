@@ -2,12 +2,48 @@ use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post};
 use axum::Router;
 use std::sync::Arc;
+use tokio::sync::watch;
 
 use crate::actor::manager::RoomManager;
 use crate::api::{control_plane, data_plane, sse};
 use crate::config::ServerConfig;
 use crate::relay::{self, SnapshotRelay};
 use crate::schema_registry::SchemaRegistry;
+
+/// Server-wide shutdown notification shared by every handler.
+///
+/// Once triggered it stays triggered. Long-lived responses (SSE streams) end when it fires,
+/// so that a graceful shutdown does not wait for them forever.
+#[derive(Debug, Clone)]
+pub struct ShutdownSignal {
+    tx: Arc<watch::Sender<bool>>,
+}
+
+impl ShutdownSignal {
+    /// Creates a signal that has not fired yet.
+    pub fn new() -> Self {
+        let (tx, _) = watch::channel(false);
+        Self { tx: Arc::new(tx) }
+    }
+
+    /// Fires the signal. Idempotent.
+    pub fn trigger(&self) {
+        self.tx.send_replace(true);
+    }
+
+    /// Resolves once the signal has fired (immediately if it already has).
+    pub async fn wait(&self) {
+        let mut rx = self.tx.subscribe();
+        // The sender lives as long as `self`, so waiting can only end by the signal firing.
+        rx.wait_for(|triggered| *triggered).await.ok();
+    }
+}
+
+impl Default for ShutdownSignal {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Shared application state injected into Axum route handlers.
 #[derive(Clone)]
@@ -16,6 +52,7 @@ pub struct AppState {
     pub schema_registry: Arc<SchemaRegistry>,
     pub room_manager: Arc<RoomManager>,
     pub snapshot_relay: Arc<SnapshotRelay>,
+    pub shutdown: ShutdownSignal,
 }
 
 impl AppState {
@@ -31,6 +68,7 @@ impl AppState {
             schema_registry,
             room_manager,
             snapshot_relay,
+            shutdown: ShutdownSignal::new(),
         }
     }
 }

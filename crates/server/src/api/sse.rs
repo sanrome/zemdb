@@ -1,6 +1,6 @@
 use axum::extract::{Path, State};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use futures::stream::Stream;
+use futures::stream::{Stream, StreamExt};
 use std::convert::Infallible;
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -14,6 +14,7 @@ use crate::error::ServerError;
 /// `GET /rooms/:room_id/events`: Signal-only Server-Sent Events (SSE) broadcast channel.
 /// Authenticated via ClientAuth (Bearer token or ?token= query parameter).
 /// Emits `head_advanced` and `schema_reloaded` lightweight signals without transmitting row payloads.
+/// The stream ends when the room actor stops or the server begins shutting down.
 pub async fn room_events(
     State(state): State<AppState>,
     Path(room_id_str): Path<String>,
@@ -48,6 +49,7 @@ pub async fn room_events(
             ServerError::GatewayTimeout("Timeout subscribing to room events".to_string())
         })??;
 
+    let shutdown = state.shutdown.clone();
     let stream = futures::stream::unfold(receiver, |mut rx| async move {
         match rx.recv().await {
             Ok(RoomEvent::HeadAdvanced(seq)) => {
@@ -66,7 +68,10 @@ pub async fn room_events(
             }
             Err(broadcast::error::RecvError::Closed) => None,
         }
-    });
+    })
+    // End the stream when the server shuts down; otherwise the graceful shutdown would wait
+    // for this connection forever.
+    .take_until(async move { shutdown.wait().await });
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }

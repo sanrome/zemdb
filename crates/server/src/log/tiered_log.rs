@@ -30,6 +30,15 @@ pub struct MaintenanceReport {
     pub new_tail_seq: SequenceNumber,
 }
 
+/// Result of a successful `TieredLog::append`: the record is durable and visible.
+#[derive(Debug, Default)]
+pub struct AppendOutcome {
+    /// Set when sealing the active segment after the append failed. The appended record is
+    /// still durable, but the segment files are in an uncertain state and the log should be
+    /// reopened from disk.
+    pub rotation_error: Option<ServerError>,
+}
+
 /// Summary of a proactive cursor-driven log pruning operation.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PruneReport {
@@ -61,7 +70,7 @@ impl TieredLog {
     ) -> Result<(Self, Vec<(MutationId, SequenceNumber)>), ServerError> {
         let dir = dir.as_ref().to_path_buf();
         let segments_dir = dir.join("segments");
-        std::fs::create_dir_all(&segments_dir)?;
+        durable::create_dir_all_synced(&segments_dir)?;
 
         let mut warm_disk = WarmDiskLog::open_or_create(&segments_dir)?;
         let mut recovered_mutations = Vec::new();
@@ -121,11 +130,14 @@ impl TieredLog {
     /// 1. Persists synchronously on Warm Disk (`active.wal`) with batch framing and `sync_data()`.
     /// 2. Stores in `HotBuffer` in RAM to resolve immediate `/sync` queries in sub-millisecond.
     /// 3. Rotates and seals segment if size or age threshold is exceeded.
+    ///
+    /// An `Err` means the record may not be durable. Once the record is durable the call
+    /// returns `Ok`, and a failure to seal the segment afterwards is reported in the outcome.
     pub fn append(
         &mut self,
         op: SequencedOperation,
         mutation_id: Option<MutationId>,
-    ) -> Result<(), ServerError> {
+    ) -> Result<AppendOutcome, ServerError> {
         if self.head_seq.get() != 0 && op.seq.get() != self.head_seq.get() + 1 {
             return Err(ServerError::Wal(format!(
                 "Non-contiguous sequence: expected {}, got {}",
@@ -148,11 +160,14 @@ impl TieredLog {
 
         // 3. Segment rotation check: rotate active segment on disk when size threshold is reached,
         // retaining recent operations in the RAM HotBuffer sliding window without destructive eviction to zero.
+        let mut outcome = AppendOutcome::default();
         if self.warm_disk.active_ops_count() >= self.policy.ram_max_ops {
-            self.warm_disk.rotate_active_segment()?;
+            if let Err(err) = self.warm_disk.rotate_active_segment() {
+                outcome.rotation_error = Some(err);
+            }
         }
 
-        Ok(())
+        Ok(outcome)
     }
 
     /// Unified multi-tier delta query engine.

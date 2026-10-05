@@ -1,4 +1,4 @@
-use std::fs;
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,9 +15,13 @@ use crate::actor::command::{
 use crate::actor::lease::ClientLeaseTracker;
 use crate::config::ServerConfig;
 use crate::dedup::DedupLruCache;
+use crate::durable;
 use crate::error::ServerError;
 use crate::log::{RoomLifecyclePolicy, TieredLog};
 use crate::relay::SnapshotRelay;
+
+/// Interval between maintenance passes (lease timeouts, log compaction, roster persistence).
+const MAINTENANCE_PERIOD: Duration = Duration::from_millis(500);
 
 /// Dedicated single-writer Tokio actor managing state, sequencing, durability, and synchronization for a single room.
 pub struct RoomActor {
@@ -46,7 +50,7 @@ impl RoomActor {
         snapshot_relay: Arc<SnapshotRelay>,
     ) -> Result<(mpsc::Sender<RoomCommand>, JoinHandle<()>), ServerError> {
         let room_dir = data_dir.as_ref().join("rooms").join(room_id.as_str());
-        fs::create_dir_all(&room_dir)?;
+        durable::create_dir_all_synced(&room_dir)?;
 
         let clients_path = room_dir.join(format!("meta_clients_{}.json", room_id.as_str()));
 
@@ -99,7 +103,11 @@ impl RoomActor {
 
     /// Primary actor loop running sequentially on Tokio.
     pub async fn run(mut self) {
-        let mut maintenance_timer = tokio::time::interval(Duration::from_millis(500));
+        // The first tick fires one period after start, not immediately.
+        let mut maintenance_timer = tokio::time::interval_at(
+            tokio::time::Instant::now() + MAINTENANCE_PERIOD,
+            MAINTENANCE_PERIOD,
+        );
 
         loop {
             tokio::select! {
@@ -107,10 +115,15 @@ impl RoomActor {
                     match cmd {
                         Some(RoomCommand::Shutdown { reply }) => {
                             debug!(room = %self.room_id, "Shutdown command received, terminating actor loop");
+                            self.persist_roster();
                             let _ = reply.send(());
                             break;
                         }
-                        Some(command) => self.handle_command(command),
+                        Some(command) => {
+                            if self.handle_command(command).is_break() {
+                                break;
+                            }
+                        }
                         None => {
                             debug!(room = %self.room_id, "RoomCommand channel closed, shutting down actor loop");
                             break;
@@ -122,9 +135,16 @@ impl RoomActor {
                 }
             }
         }
+
+        // Every exit flushes pending cursor changes. Dropping the actor afterwards releases
+        // the log's file lock and drops any command still queued, whose callers observe a
+        // closed reply channel instead of waiting forever.
+        self.persist_roster();
     }
 
-    fn handle_command(&mut self, command: RoomCommand) {
+    /// Handles one command. `Break` means the room can no longer operate safely and the
+    /// actor must stop so that the next request reopens it from disk.
+    fn handle_command(&mut self, command: RoomCommand) -> ControlFlow<()> {
         match command {
             RoomCommand::RegisterClient {
                 client_id,
@@ -170,7 +190,7 @@ impl RoomActor {
                 op,
                 reply,
             } => {
-                self.handle_commit(client_id, mutation_id, last_ack_seq, op, reply);
+                return self.handle_commit(client_id, mutation_id, last_ack_seq, op, reply);
             }
 
             RoomCommand::Sync {
@@ -196,12 +216,12 @@ impl RoomActor {
                         "Client {} is not registered in room {}",
                         client_id, self.room_id
                     ))));
-                    return;
+                    return ControlFlow::Continue(());
                 }
 
                 if self.lease_tracker.is_dormant(&client_id) {
                     let _ = reply.send(Err(ServerError::BehindCompaction));
-                    return;
+                    return ControlFlow::Continue(());
                 }
 
                 let res = self
@@ -243,6 +263,7 @@ impl RoomActor {
                 let _ = reply.send(());
             }
         }
+        ControlFlow::Continue(())
     }
 
     fn handle_commit(
@@ -252,14 +273,14 @@ impl RoomActor {
         last_ack_seq: SequenceNumber,
         op: zemdb_core::mutation::Operation,
         reply: tokio::sync::oneshot::Sender<Result<CommitResponse, ServerError>>,
-    ) {
+    ) -> ControlFlow<()> {
         // 0. Check if client is registered in the room roster
         if !self.lease_tracker.is_registered(&client_id) {
             let _ = reply.send(Err(ServerError::Unauthorized(format!(
                 "Client {} is not registered in room {}",
                 client_id, self.room_id
             ))));
-            return;
+            return ControlFlow::Continue(());
         }
 
         // 1. Validate that client last_ack_seq does not exceed server head_seq
@@ -268,20 +289,23 @@ impl RoomActor {
                 expected: self.head_seq,
                 actual: last_ack_seq,
             }));
-            return;
+            return ControlFlow::Continue(());
         }
 
         // 2. Exactly-once idempotency. Checked before any rejection based on client state:
         // a retried mutation was already committed and replicated, so it must always be
         // acknowledged with its original sequence, never reported as a failure.
         if let Some(existing_seq) = self.dedup_cache.is_duplicate(&mutation_id) {
+            // The retry is accepted, so the cursor it reports (already validated against
+            // head_seq) is recorded. Lifecycle state is left untouched.
+            self.lease_tracker.advance_cursor(&client_id, last_ack_seq);
             let (catchup_ops, has_more) = self.catchup_after_commit(last_ack_seq);
             let _ = reply.send(Ok(CommitResponse {
                 assigned_seq: existing_seq,
                 catchup_ops,
                 has_more,
             }));
-            return;
+            return ControlFlow::Continue(());
         }
 
         // 3. Reject clients behind the compaction boundary before sequencing anything,
@@ -291,13 +315,13 @@ impl RoomActor {
             || self.tiered_log.is_behind_retention(last_ack_seq)
         {
             let _ = reply.send(Err(ServerError::BehindCompaction));
-            return;
+            return ControlFlow::Continue(());
         }
 
         // 4. Schema validation in O(C)
         if let Err(err) = self.schema.validate_operation(&op) {
             let _ = reply.send(Err(ServerError::SchemaViolation(err.to_string())));
-            return;
+            return ControlFlow::Continue(());
         }
 
         // 5. Assign strictly monotonic sequence number
@@ -305,11 +329,28 @@ impl RoomActor {
         let seq_op = SequencedOperation::new(new_seq, op);
 
         // 6. Write-Through append to TieredLog (Hot Buffer RAM + synchronous active.wal disk sync with mutation_id)
-        if let Err(err) = self.tiered_log.append(seq_op.clone(), Some(mutation_id)) {
-            error!(room = %self.room_id, error = %err, "TieredLog append failure");
-            let _ = reply.send(Err(err));
-            return;
-        }
+        // A failed write or fsync leaves the log in an unknown state: the record may or may
+        // not be on disk, and a failed fsync cannot be retried safely. The room stops and is
+        // recovered from disk by the next request; if the record survived, deduplication
+        // acknowledges a retry of the same mutation with the sequence that reached disk.
+        let outcome = match self.tiered_log.append(seq_op.clone(), Some(mutation_id)) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                error!(
+                    room = %self.room_id,
+                    error = %err,
+                    "Log append failed; stopping room actor for recovery from disk"
+                );
+                // Closing the mailbox before replying guarantees that a caller retrying after
+                // this reply already sees the room as stopped and gets it respawned.
+                self.receiver.close();
+                let _ = reply.send(Err(ServerError::Internal(format!(
+                    "Room {} could not persist the commit and is restarting; retry the request",
+                    self.room_id
+                ))));
+                return ControlFlow::Break(());
+            }
+        };
 
         // From here on the mutation is durable: the reply must acknowledge it.
 
@@ -319,8 +360,10 @@ impl RoomActor {
         // 8. Advance local head sequence
         self.head_seq = new_seq;
 
-        // 9. Update client lease activity (cursor advances exclusively via explicit Ack)
+        // 9. Refresh the client's lease and record the cursor reported with the commit.
+        // Persisted on the next maintenance tick.
         self.lease_tracker.record_activity(&client_id);
+        self.lease_tracker.advance_cursor(&client_id, last_ack_seq);
 
         // 10. Broadcast signal-only SSE event to active watchers
         let _ = self.events_tx.send(RoomEvent::HeadAdvanced(new_seq));
@@ -332,11 +375,28 @@ impl RoomActor {
             self.catchup_after_commit(last_ack_seq)
         };
 
+        // A failed segment rotation after a durable append leaves the segment files in an
+        // uncertain state. The commit is still acknowledged; then the room stops and is
+        // recovered from disk by the next request.
+        let flow = match outcome.rotation_error {
+            Some(err) => {
+                error!(
+                    room = %self.room_id,
+                    error = %err,
+                    "Segment rotation failed after a durable commit; stopping room actor for recovery from disk"
+                );
+                self.receiver.close();
+                ControlFlow::Break(())
+            }
+            None => ControlFlow::Continue(()),
+        };
+
         let _ = reply.send(Ok(CommitResponse {
             assigned_seq: new_seq,
             catchup_ops,
             has_more,
         }));
+        flow
     }
 
     /// Builds the catch-up batch returned with an acknowledged commit, starting after the
@@ -396,7 +456,7 @@ impl RoomActor {
             Ok((ops, has_more)) => {
                 // If client was bootstrapping and synced a valid range, promote to Connected
                 if self.lease_tracker.is_bootstrapping(&client_id) {
-                    let _ = self.lease_tracker.record_ack(&client_id, from_seq);
+                    self.lease_tracker.record_ack(&client_id, from_seq);
                 } else {
                     self.lease_tracker.record_activity(&client_id);
                 }
@@ -443,24 +503,57 @@ impl RoomActor {
             return;
         }
 
-        // 3. Record explicit Ack, advancing cursor, refreshing lease, and promoting Bootstrapping
-        let res = self.lease_tracker.record_ack(&client_id, ack_seq).map(|_| {
-            // 4. Trigger proactive log pruning if all connected clients are past the sequence,
-            // bounded by active_snapshot_seq (Retention Anchor)
-            if let Some(min_ack) = self.lease_tracker.min_connected_ack_seq() {
-                let active_snap = self.snapshot_relay.active_snapshot_seq(&self.room_id);
-                let retention_floor = match active_snap {
-                    Some(snap_seq) => min_ack.min(snap_seq),
-                    None => min_ack,
-                };
-                if let Err(err) = self.tiered_log.prune_older_than(retention_floor) {
-                    warn!(room = %self.room_id, error = %err, "Proactive log pruning failed");
-                }
-            }
-            self.head_seq
-        });
+        // 3. Record explicit Ack, advancing cursor, refreshing lease, and promoting Bootstrapping.
+        // The cursor is persisted on the next maintenance tick.
+        self.lease_tracker.record_ack(&client_id, ack_seq);
 
-        let _ = reply.send(res);
+        // 4. Trigger proactive log pruning if all connected clients are past the sequence
+        self.prune_to_retention_floor();
+
+        let _ = reply.send(Ok(self.head_seq));
+    }
+
+    /// Prunes the log up to the retention floor when every non-dormant client is connected:
+    /// the lowest connected cursor, bounded by the active snapshot (Retention Anchor).
+    ///
+    /// The cursors that justify the prune are persisted before any segment is deleted, so the
+    /// roster on disk never falls behind the retained log; otherwise a restart would treat
+    /// those clients as fallen behind and force them to a snapshot.
+    fn prune_to_retention_floor(&mut self) {
+        let Some(min_ack) = self.lease_tracker.min_connected_ack_seq() else {
+            return;
+        };
+        let active_snap = self.snapshot_relay.active_snapshot_seq(&self.room_id);
+        let retention_floor = match active_snap {
+            Some(snap_seq) => min_ack.min(snap_seq),
+            None => min_ack,
+        };
+
+        // Segments are deleted only when they end below the floor, and none ends below the
+        // current tail, so a floor at or below the tail deletes nothing.
+        if retention_floor <= self.tiered_log.tail_seq() {
+            return;
+        }
+
+        if let Err(err) = self.lease_tracker.persist_if_dirty() {
+            warn!(
+                room = %self.room_id,
+                error = %err,
+                "Failed to persist clients roster; skipping proactive log pruning"
+            );
+            return;
+        }
+        if let Err(err) = self.tiered_log.prune_older_than(retention_floor) {
+            warn!(room = %self.room_id, error = %err, "Proactive log pruning failed");
+        }
+    }
+
+    /// Writes pending cursor and lease changes to the roster file. A failure is logged and the
+    /// changes stay pending for the next attempt; it only delays how far the log can be pruned.
+    fn persist_roster(&mut self) {
+        if let Err(err) = self.lease_tracker.persist_if_dirty() {
+            warn!(room = %self.room_id, error = %err, "Failed to persist clients roster");
+        }
     }
 
     async fn run_periodic_maintenance(&mut self) {
@@ -475,15 +568,12 @@ impl RoomActor {
 
         // 3. Trigger proactive cursor-driven pruning if all non-dormant clients are Connected,
         // bounded by active_snapshot_seq (Retention Anchor)
-        if let Some(min_ack) = self.lease_tracker.min_connected_ack_seq() {
-            let active_snap = self.snapshot_relay.active_snapshot_seq(&self.room_id);
-            let retention_floor = match active_snap {
-                Some(snap_seq) => min_ack.min(snap_seq),
-                None => min_ack,
-            };
-            if let Err(err) = self.tiered_log.prune_older_than(retention_floor) {
-                warn!(room = %self.room_id, error = %err, "Proactive log pruning failed");
-            }
-        }
+        self.prune_to_retention_floor();
+
+        // 4. Persist cursor and lease changes accumulated since the previous tick
+        self.persist_roster();
     }
 }
+
+#[cfg(test)]
+mod tests;

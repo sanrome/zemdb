@@ -264,3 +264,11 @@ fn gap_inside_retained_range_reports_behind_compaction() {
         Err(ServerError::BehindCompaction)
     ));
 }
+
+#[test]
+fn open_makes_new_segments_directory_durable() {
+    let dir = tempdir().unwrap();
+    crate::fail_point::arm("sync_dir", dir.path());
+
+    assert!(TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).is_err());
+}

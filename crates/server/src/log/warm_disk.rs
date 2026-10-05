@@ -1,4 +1,6 @@
+use crate::durable;
 use crate::error::ServerError;
+use crate::fail_point;
 use fs2::FileExt;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
@@ -33,7 +35,7 @@ impl WarmDiskLog {
     /// Opens or creates the Warm Disk directory.
     pub fn open_or_create(segments_dir: impl AsRef<Path>) -> Result<Self, ServerError> {
         let segments_dir = segments_dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&segments_dir)?;
+        durable::create_dir_all_synced(&segments_dir)?;
 
         let mut log = Self {
             segments_dir,
@@ -55,6 +57,7 @@ impl WarmDiskLog {
         let active_path = self.segments_dir.join("active.wal");
 
         if self.active_file.is_none() {
+            let created = !active_path.exists();
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -67,14 +70,22 @@ impl WarmDiskLog {
             })?;
 
             self.active_file = Some(file);
+
+            // A new file's directory entry must be durable before any record in it is
+            // acknowledged; `sync_data` on the file alone does not persist it.
+            if created {
+                durable::sync_dir(&self.segments_dir)?;
+            }
         }
 
         let file = self.active_file.as_mut().unwrap();
         let encoded =
             encode_wal_record(op, mutation_id).map_err(|e| ServerError::Wal(e.to_string()))?;
 
+        fail_point::check("warm_append_write", &active_path)?;
         file.write_all(&encoded)?;
         file.flush()?;
+        fail_point::check("warm_append_sync", &active_path)?;
         file.sync_data()?;
 
         // The segment start is tracked independently of when the file handle was opened:
@@ -119,12 +130,18 @@ impl WarmDiskLog {
             let sealed_name = format!("segment_{:016}_{:016}.wal", start.get(), end.get());
             let sealed_path = self.segments_dir.join(sealed_name);
 
-            if active_path.exists() {
+            let renamed = active_path.exists();
+            if renamed {
                 std::fs::rename(&active_path, &sealed_path)?;
             }
 
             self.active_start_seq = None;
             self.active_end_seq = None;
+
+            // Make the rename durable before the sealed segment can be compressed or pruned.
+            if renamed {
+                durable::sync_dir(&self.segments_dir)?;
+            }
             Ok(Some(sealed_path))
         } else {
             Ok(None)

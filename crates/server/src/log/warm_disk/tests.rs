@@ -46,3 +46,26 @@ fn empty_existing_active_wal_still_rotates() {
     assert_eq!(segments[0].start_seq.get(), 1);
     assert_eq!(segments[0].end_seq.get(), 3);
 }
+
+#[test]
+fn rotation_fails_when_directory_sync_fails() {
+    let dir = tempdir().unwrap();
+    let mut log = WarmDiskLog::open_or_create(dir.path()).unwrap();
+    log.append_record(&make_op(1), None).unwrap();
+
+    crate::fail_point::arm("sync_dir", dir.path());
+    assert!(log.rotate_active_segment().is_err());
+}
+
+#[test]
+fn creating_a_new_active_segment_syncs_the_directory() {
+    let dir = tempdir().unwrap();
+    let mut log = WarmDiskLog::open_or_create(dir.path()).unwrap();
+    log.append_record(&make_op(1), None).unwrap();
+    log.rotate_active_segment().unwrap();
+
+    // The next append creates a fresh active.wal, whose directory entry must be durable
+    // before the record is acknowledged.
+    crate::fail_point::arm("sync_dir", dir.path());
+    assert!(log.append_record(&make_op(2), None).is_err());
+}
