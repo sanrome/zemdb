@@ -69,7 +69,7 @@ async fn snapshot_seq(engine: &DiskStorageEngine, room: &RoomId) -> SequenceNumb
 #[tokio::test]
 async fn two_failed_compactions_in_a_row_lose_no_data() {
     let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("double-failure");
+    let room = RoomId::new("double-failure").unwrap();
     let engine = open_engine(dir.path(), &room).await;
     let snap_path = engine.snap_file_path(&room);
 
@@ -89,7 +89,7 @@ async fn two_failed_compactions_in_a_row_lose_no_data() {
 #[tokio::test]
 async fn compaction_after_failed_wal_rotation_still_runs() {
     let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("stuck-flag");
+    let room = RoomId::new("stuck-flag").unwrap();
     let engine = open_engine(dir.path(), &room).await;
     let wal_path = engine.wal_file_path(&room);
 
@@ -105,7 +105,7 @@ async fn compaction_after_failed_wal_rotation_still_runs() {
 #[tokio::test]
 async fn writes_after_failed_wal_rotation_stay_durable() {
     let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("rotation-rollback");
+    let room = RoomId::new("rotation-rollback").unwrap();
     let engine = open_engine(dir.path(), &room).await;
     let wal_path = engine.wal_file_path(&room);
 
@@ -122,7 +122,7 @@ async fn writes_after_failed_wal_rotation_stay_durable() {
 #[tokio::test]
 async fn compaction_absorbs_orphan_from_failed_attempt() {
     let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("absorb-orphan");
+    let room = RoomId::new("absorb-orphan").unwrap();
     let engine = open_engine(dir.path(), &room).await;
     let snap_path = engine.snap_file_path(&room);
     let compacting_path = engine.wal_file_path(&room).with_extension("wal.compacting");
@@ -145,7 +145,7 @@ async fn compaction_absorbs_orphan_from_failed_attempt() {
 #[tokio::test]
 async fn crash_between_absorbing_and_truncating_wal_recovers_without_duplicates() {
     let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("absorb-crash");
+    let room = RoomId::new("absorb-crash").unwrap();
     let engine = open_engine(dir.path(), &room).await;
     let snap_path = engine.snap_file_path(&room);
     let wal_path = engine.wal_file_path(&room);
@@ -169,7 +169,7 @@ async fn crash_between_absorbing_and_truncating_wal_recovers_without_duplicates(
 #[tokio::test]
 async fn failed_absorb_leaves_no_partial_batch_in_compacting_wal() {
     let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("partial-absorb");
+    let room = RoomId::new("partial-absorb").unwrap();
     let engine = open_engine(dir.path(), &room).await;
     let snap_path = engine.snap_file_path(&room);
     let wal_path = engine.wal_file_path(&room);
@@ -202,7 +202,7 @@ async fn failed_absorb_leaves_no_partial_batch_in_compacting_wal() {
 #[tokio::test]
 async fn failed_rotation_rollback_marks_room_failed_until_reopened() {
     let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("rollback-failure");
+    let room = RoomId::new("rollback-failure").unwrap();
     let engine = open_engine(dir.path(), &room).await;
     let wal_path = engine.wal_file_path(&room);
 

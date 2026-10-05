@@ -79,9 +79,9 @@ fn test_uuid_data_type_primary_key_and_parsing() {
 
 #[test]
 fn test_newtypes_ergonomics_and_serde() {
-    let room = RoomId::new("room-123");
-    let schema_id = SchemaId::new("schema-v1");
-    let client = ClientId::from("client-456");
+    let room = RoomId::new("room-123").unwrap();
+    let schema_id = SchemaId::new("schema-v1").unwrap();
+    let client = ClientId::new("client-456").unwrap();
     let seq = SequenceNumber::from(42u64);
     let mutation = MutationId::from([7u8; 16]);
     let correlation = CorrelationId::from(999u64);

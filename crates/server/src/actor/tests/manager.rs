@@ -22,10 +22,10 @@ fn new_manager(dir: &TempDir) -> RoomManager {
     });
     let registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
     registry
-        .register_schema(SchemaId::new("first"), test_schema())
+        .register_schema(SchemaId::new("first").unwrap(), test_schema())
         .unwrap();
     registry
-        .register_schema(SchemaId::new("second"), test_schema())
+        .register_schema(SchemaId::new("second").unwrap(), test_schema())
         .unwrap();
     let relay = Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(60)));
     RoomManager::new(config, registry, relay)
@@ -50,10 +50,10 @@ async fn schema_of(sender: &mpsc::Sender<RoomCommand>) -> SchemaId {
 #[tokio::test]
 async fn interrupted_meta_room_rewrite_keeps_previous_assignment() {
     let dir = tempdir().unwrap();
-    let room_id = RoomId::new("room-a");
+    let room_id = RoomId::new("room-a").unwrap();
     let manager = new_manager(&dir);
     manager
-        .create_room(room_id.clone(), SchemaId::new("first"), None)
+        .create_room(room_id.clone(), SchemaId::new("first").unwrap(), None)
         .await
         .unwrap();
     manager.shutdown_all().await;
@@ -63,13 +63,13 @@ async fn interrupted_meta_room_rewrite_keeps_previous_assignment() {
     fail_point::arm("write_atomic_before_rename", &meta_path);
     let manager = new_manager(&dir);
     let res = manager
-        .get_or_spawn(&room_id, Some(&SchemaId::new("second")))
+        .get_or_spawn(&room_id, Some(&SchemaId::new("second").unwrap()))
         .await;
     assert!(res.is_err(), "the interrupted metadata write must fail");
 
     let manager = new_manager(&dir);
     let sender = manager.get_or_spawn(&room_id, None).await.unwrap();
-    assert_eq!(schema_of(&sender).await, SchemaId::new("first"));
+    assert_eq!(schema_of(&sender).await, SchemaId::new("first").unwrap());
     assert!(!durable::tmp_path_for(&meta_path).exists());
     manager.shutdown_all().await;
 }
@@ -77,7 +77,7 @@ async fn interrupted_meta_room_rewrite_keeps_previous_assignment() {
 #[tokio::test]
 async fn interrupted_room_creation_leaves_no_room() {
     let dir = tempdir().unwrap();
-    let room_id = RoomId::new("room-b");
+    let room_id = RoomId::new("room-b").unwrap();
     let manager = new_manager(&dir);
 
     fail_point::arm(
@@ -85,13 +85,13 @@ async fn interrupted_room_creation_leaves_no_room() {
         &meta_room_path(&dir, &room_id),
     );
     let res = manager
-        .create_room(room_id.clone(), SchemaId::new("first"), None)
+        .create_room(room_id.clone(), SchemaId::new("first").unwrap(), None)
         .await;
     assert!(res.is_err(), "the interrupted metadata write must fail");
     assert!(!manager.room_exists(&room_id));
 
     manager
-        .create_room(room_id.clone(), SchemaId::new("first"), None)
+        .create_room(room_id.clone(), SchemaId::new("first").unwrap(), None)
         .await
         .unwrap();
     manager.shutdown_all().await;
@@ -100,7 +100,7 @@ async fn interrupted_room_creation_leaves_no_room() {
 #[tokio::test]
 async fn unreadable_meta_room_fails_to_load() {
     let dir = tempdir().unwrap();
-    let room_id = RoomId::new("room-c");
+    let room_id = RoomId::new("room-c").unwrap();
     let meta_path = meta_room_path(&dir, &room_id);
     fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
     fs::write(&meta_path, b"{\"room_id\": \"room-c\", \"schema_").unwrap();
@@ -113,10 +113,10 @@ async fn unreadable_meta_room_fails_to_load() {
 #[tokio::test]
 async fn cancelled_respawn_keeps_waiting_for_the_previous_actor() {
     let dir = tempdir().unwrap();
-    let room_id = RoomId::new("room-d");
+    let room_id = RoomId::new("room-d").unwrap();
     let manager = new_manager(&dir);
     manager
-        .create_room(room_id.clone(), SchemaId::new("first"), None)
+        .create_room(room_id.clone(), SchemaId::new("first").unwrap(), None)
         .await
         .unwrap();
     manager.shutdown_all().await;
@@ -158,7 +158,11 @@ async fn first_room_creation_makes_rooms_directory_durable() {
 
     fail_point::arm("sync_dir", dir.path());
     let res = manager
-        .create_room(RoomId::new("room-e"), SchemaId::new("first"), None)
+        .create_room(
+            RoomId::new("room-e").unwrap(),
+            SchemaId::new("first").unwrap(),
+            None,
+        )
         .await;
 
     assert!(res.is_err(), "creating rooms/ must sync the data directory");

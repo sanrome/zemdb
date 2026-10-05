@@ -26,7 +26,7 @@ fn test_schema() -> Schema {
 #[tokio::test]
 async fn test_range_scans_and_reverse_ordering() {
     let engine = MemoryStorageEngine::new();
-    let room_id = RoomId::new("room-scan");
+    let room_id = RoomId::new("room-scan").unwrap();
     engine.open_room(&room_id, test_schema()).await.unwrap();
 
     let mut ops = Vec::new();
@@ -110,7 +110,7 @@ async fn test_range_scans_and_reverse_ordering() {
 #[tokio::test]
 async fn test_limit_and_projection_pushdowns() {
     let engine = MemoryStorageEngine::new();
-    let room_id = RoomId::new("room-pushdowns");
+    let room_id = RoomId::new("room-pushdowns").unwrap();
     engine.open_room(&room_id, test_schema()).await.unwrap();
 
     let mut ops = Vec::new();
@@ -176,7 +176,7 @@ async fn test_disk_query_pushdowns_parity() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
     let engine = DiskStorageEngine::new(options);
-    let room_id = RoomId::new("room-disk-pushdowns");
+    let room_id = RoomId::new("room-disk-pushdowns").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_id, schema).await.unwrap();
@@ -230,7 +230,7 @@ async fn test_disk_query_pushdowns_parity() {
 #[tokio::test]
 async fn test_multi_batch_lazy_streaming_memory() {
     let engine = MemoryStorageEngine::new();
-    let room_id = RoomId::new("room-multi-batch-mem");
+    let room_id = RoomId::new("room-multi-batch-mem").unwrap();
     engine.open_room(&room_id, test_schema()).await.unwrap();
 
     let total = 150;
@@ -295,7 +295,7 @@ async fn test_multi_batch_lazy_streaming_disk() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
     let engine = DiskStorageEngine::new(options);
-    let room_id = RoomId::new("room-multi-batch-disk");
+    let room_id = RoomId::new("room-multi-batch-disk").unwrap();
     engine.open_room(&room_id, test_schema()).await.unwrap();
 
     let total = 150;
@@ -358,7 +358,7 @@ async fn test_multi_batch_lazy_streaming_disk() {
 #[tokio::test]
 async fn test_scan_snapshot_isolation_memory() {
     let engine = MemoryStorageEngine::new();
-    let room_id = RoomId::new("room-iso-mem");
+    let room_id = RoomId::new("room-iso-mem").unwrap();
     engine.open_room(&room_id, test_schema()).await.unwrap();
 
     // 1. Initial 10 rows
@@ -457,7 +457,7 @@ async fn test_scan_snapshot_isolation_disk() {
     let tmp = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(tmp.path());
     let engine = DiskStorageEngine::new(options);
-    let room_id = RoomId::new("room-iso-disk");
+    let room_id = RoomId::new("room-iso-disk").unwrap();
     engine.open_room(&room_id, test_schema()).await.unwrap();
 
     // 1. Initial 10 rows

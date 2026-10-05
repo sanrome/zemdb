@@ -111,14 +111,14 @@ async fn test_concurrent_get_or_spawn_elimination_of_race_condition() {
 
     let schemas_dir = data_dir.join("schemas");
     let schema_registry = Arc::new(SchemaRegistry::new(schemas_dir).unwrap());
-    let schema_id = SchemaId::new("doc-schema");
+    let schema_id = SchemaId::new("doc-schema").unwrap();
     schema_registry
         .register_schema(schema_id.clone(), create_test_schema())
         .unwrap();
 
     let relay = Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(60)));
     let manager = Arc::new(RoomManager::new(config, schema_registry, relay));
-    let room_id = RoomId::new("race-condition-room");
+    let room_id = RoomId::new("race-condition-room").unwrap();
 
     let mut handles = Vec::new();
     for _ in 0..50 {
@@ -139,7 +139,7 @@ async fn test_concurrent_get_or_spawn_elimination_of_race_condition() {
     assert_eq!(senders.len(), 50);
 
     // Verify all senders communicate with the exact same active room actor
-    let test_client = ClientId::new("probe-client");
+    let test_client = ClientId::new("probe-client").unwrap();
     let (reg_tx, reg_rx) = oneshot::channel();
     senders[0]
         .send(RoomCommand::RegisterClient {
@@ -176,7 +176,7 @@ async fn test_graceful_room_deletion_and_directory_cleanup() {
 
     let schemas_dir = data_dir.join("schemas");
     let schema_registry = Arc::new(SchemaRegistry::new(schemas_dir).unwrap());
-    let schema_id = SchemaId::new("doc-schema");
+    let schema_id = SchemaId::new("doc-schema").unwrap();
     let schema = create_test_schema();
     schema_registry
         .register_schema(schema_id.clone(), schema.clone())
@@ -184,7 +184,7 @@ async fn test_graceful_room_deletion_and_directory_cleanup() {
 
     let relay = Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(60)));
     let manager = Arc::new(RoomManager::new(config, schema_registry, relay));
-    let room_id = RoomId::new("deletion-target-room");
+    let room_id = RoomId::new("deletion-target-room").unwrap();
 
     // Create room and append an operation to disk
     manager
@@ -193,7 +193,7 @@ async fn test_graceful_room_deletion_and_directory_cleanup() {
         .unwrap();
     let sender = manager.get_room(&room_id).unwrap();
 
-    let client_id = ClientId::new("deleter");
+    let client_id = ClientId::new("deleter").unwrap();
     let (reg_tx, reg_rx) = oneshot::channel();
     sender
         .send(RoomCommand::RegisterClient {
@@ -239,11 +239,11 @@ async fn test_graceful_room_deletion_and_directory_cleanup() {
 async fn test_data_plane_lazy_reactivation_after_restart() {
     let dir = tempdir().unwrap();
     let data_dir = dir.path().join("data");
-    let schema_id = SchemaId::new("doc-schema");
+    let schema_id = SchemaId::new("doc-schema").unwrap();
     let schema = create_test_schema();
-    let room_id = RoomId::new("lazy-reactivation-room");
+    let room_id = RoomId::new("lazy-reactivation-room").unwrap();
 
-    let client_id = ClientId::new("reactivating-client");
+    let client_id = ClientId::new("reactivating-client").unwrap();
 
     // Server Phase 1: Create room, register client, commit 2 operations
     {
@@ -394,7 +394,7 @@ async fn test_max_batch_size_clamped_in_sync() {
 
     let schemas_dir = data_dir.join("schemas");
     let schema_registry = Arc::new(SchemaRegistry::new(schemas_dir).unwrap());
-    let schema_id = SchemaId::new("doc-schema");
+    let schema_id = SchemaId::new("doc-schema").unwrap();
     let schema = create_test_schema();
     schema_registry
         .register_schema(schema_id.clone(), schema.clone())
@@ -402,7 +402,7 @@ async fn test_max_batch_size_clamped_in_sync() {
 
     let relay = Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(60)));
     let manager = Arc::new(RoomManager::new(config, schema_registry, relay));
-    let room_id = RoomId::new("clamp-batch-size-room");
+    let room_id = RoomId::new("clamp-batch-size-room").unwrap();
 
     manager
         .create_room(room_id.clone(), schema_id.clone(), None)
@@ -410,7 +410,7 @@ async fn test_max_batch_size_clamped_in_sync() {
         .unwrap();
     let sender = manager.get_room(&room_id).unwrap();
 
-    let reader_client = ClientId::new("sync-reader");
+    let reader_client = ClientId::new("sync-reader").unwrap();
     let (reg_tx, reg_rx) = oneshot::channel();
     sender
         .send(RoomCommand::RegisterClient {
@@ -486,8 +486,8 @@ async fn test_snapshot_multipart_chunk_upload_and_blake3_verification() {
     let data_dir = dir.path().join("data");
     let server = LifecycleTestServer::start_with_dir(data_dir).await;
 
-    let room_id = RoomId::new("multipart-snapshot-room");
-    let client_id = ClientId::new("snapshot-uploader");
+    let room_id = RoomId::new("multipart-snapshot-room").unwrap();
+    let client_id = ClientId::new("snapshot-uploader").unwrap();
 
     let client_token = generate_client_token(
         &client_id,
@@ -674,7 +674,7 @@ async fn test_snapshot_multipart_chunk_upload_and_blake3_verification() {
     }
 
     // 7. Verify corrupted upload detection (tampered data causing BLAKE3 digest mismatch)
-    let corrupt_room = RoomId::new("corrupt-snapshot-room");
+    let corrupt_room = RoomId::new("corrupt-snapshot-room").unwrap();
     let corrupt_token = generate_client_token(
         &client_id,
         &corrupt_room,

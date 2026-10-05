@@ -1,14 +1,14 @@
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use dashmap::DashMap;
 use std::time::{Duration, Instant};
-use subtle::ConstantTimeEq;
 use zemdb_core::id::{CorrelationId, RoomId, SequenceNumber};
-use zemdb_core::protocol::codec::{decode_message, encode_message};
-use zemdb_core::protocol::messages::{ClientMessage, ErrorCode, ServerMessage};
+use zemdb_core::protocol::messages::{ClientMessage, ServerMessage};
 
+use crate::api::data_plane::{binary_error, binary_response};
+use crate::api::extract::{ensure_payload_identity, BinaryMessage, RelayAuth};
 use crate::api::router::AppState;
 use crate::error::ServerError;
 
@@ -124,7 +124,13 @@ impl SnapshotRelay {
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            let room_id = RoomId::new(parts[1]);
+            let room_id = match RoomId::new(parts[1]) {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::warn!(path = ?path, error = %err, "Ignoring snapshot file with an invalid room id");
+                    continue;
+                }
+            };
             let head_seq = SequenceNumber::new(head_seq_val);
 
             let metadata = match entry.metadata() {
@@ -371,67 +377,20 @@ impl SnapshotRelay {
     }
 }
 
-/// Validates authentication for snapshot relay endpoints using either admin secret or signed client token.
-fn authenticate_relay_request(
-    headers: &HeaderMap,
-    expected_room: &RoomId,
-    state: &AppState,
-) -> Result<(), ServerError> {
-    let auth_header = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| ServerError::Unauthorized("Missing Authorization header".to_string()))?;
-
-    let token = auth_header.strip_prefix("Bearer ").unwrap_or(auth_header);
-
-    // 1. Constant-time check for admin secret
-    let is_admin = token
-        .as_bytes()
-        .ct_eq(state.config.admin_secret.as_bytes())
-        .unwrap_u8()
-        == 1;
-    if is_admin {
-        return Ok(());
-    }
-
-    // 2. Cryptographic verification of client token bound to expected room
-    let verified = crate::api::auth::verify_client_token(token, &state.config.auth_secret)?;
-    if &verified.room_id != expected_room {
-        return Err(ServerError::Unauthorized(format!(
-            "Token room mismatch: expected {}, got {}",
-            expected_room, verified.room_id
-        )));
-    }
-
-    Ok(())
-}
-
 /// `POST /rooms/:room_id/snapshot/upload`: Staging endpoint where an active donor client
 /// or automated snapshot worker uploads a room snapshot.
 pub async fn upload_snapshot(
     State(state): State<AppState>,
-    Path(room_id_str): Path<String>,
+    RelayAuth { room_id }: RelayAuth,
     headers: HeaderMap,
     body: Bytes,
-) -> Result<Response, ServerError> {
-    let room_id = RoomId::new(room_id_str);
-
-    authenticate_relay_request(&headers, &room_id, &state)?;
-
-    let head_seq_str = headers
-        .get("x-snapshot-head-seq")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| ServerError::Config("Missing x-snapshot-head-seq header".to_string()))?;
-
-    let head_seq_val = head_seq_str.parse::<u64>().map_err(|_| {
-        ServerError::Config("Invalid x-snapshot-head-seq header format".to_string())
-    })?;
-
-    if head_seq_val == 0 {
-        return Err(ServerError::Config(
-            "x-snapshot-head-seq must be greater than 0".to_string(),
-        ));
-    }
+) -> Response {
+    // Errors use binary frames, like every other data plane endpoint; only the success
+    // response of this endpoint is JSON.
+    let head_seq_val = match parse_snapshot_head_seq(&headers) {
+        Ok(seq) => seq,
+        Err(err) => return binary_error(None, Some(room_id), err),
+    };
 
     let head_seq = SequenceNumber::new(head_seq_val);
     let hash = state
@@ -445,232 +404,111 @@ pub async fn upload_snapshot(
         "status": "staged"
     });
 
-    Ok((
+    (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
         body_json.to_string(),
     )
-        .into_response())
+        .into_response()
+}
+
+/// Reads the snapshot sequence from the `x-snapshot-head-seq` header: a positive integer.
+fn parse_snapshot_head_seq(headers: &HeaderMap) -> Result<u64, ServerError> {
+    let raw = headers
+        .get("x-snapshot-head-seq")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ServerError::BadRequest("Missing x-snapshot-head-seq header".to_string()))?;
+    let seq = raw.parse::<u64>().map_err(|_| {
+        ServerError::BadRequest("Invalid x-snapshot-head-seq header format".to_string())
+    })?;
+    if seq == 0 {
+        return Err(ServerError::BadRequest(
+            "x-snapshot-head-seq must be greater than 0".to_string(),
+        ));
+    }
+    Ok(seq)
 }
 
 /// `POST /rooms/:room_id/snapshot/chunk`: Handles `ClientMessage::RequestSnapshotChunk`
 /// and streams the requested binary `ServerMessage::SnapshotChunk`.
 pub async fn request_chunk(
     State(state): State<AppState>,
-    Path(room_id_str): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
+    RelayAuth { room_id }: RelayAuth,
+    BinaryMessage(msg): BinaryMessage<ClientMessage>,
 ) -> Response {
-    let room_id = RoomId::new(room_id_str.clone());
-
-    if let Err(err) = authenticate_relay_request(&headers, &room_id, &state) {
-        let err_msg = ServerMessage::Error {
-            correlation_id: None,
-            room_id: Some(room_id),
-            code: err.to_error_code(),
-            message: err.to_string(),
-        };
-        let bytes = encode_message(&err_msg).unwrap_or_default();
-        return (
-            err.to_status_code(),
-            [(header::CONTENT_TYPE, "application/octet-stream")],
-            bytes,
-        )
-            .into_response();
-    }
-
-    let msg: ClientMessage = match decode_message(&body) {
-        Ok(m) => m,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to decode RequestSnapshotChunk: {}", e),
-            )
-                .into_response();
-        }
+    let ClientMessage::RequestSnapshotChunk {
+        correlation_id,
+        room_id: msg_room_id,
+        chunk_index,
+        chunk_size,
+    } = msg
+    else {
+        return binary_error(
+            None,
+            Some(room_id),
+            ServerError::BadRequest("Expected RequestSnapshotChunk message".to_string()),
+        );
     };
 
-    match msg {
-        ClientMessage::RequestSnapshotChunk {
-            correlation_id,
-            room_id: msg_room_id,
-            chunk_index,
-            chunk_size,
-        } => {
-            if msg_room_id != room_id {
-                let err_msg = ServerMessage::Error {
-                    correlation_id: Some(correlation_id),
-                    room_id: Some(room_id),
-                    code: ErrorCode::Unauthorized,
-                    message: "RoomId path and message mismatch".to_string(),
-                };
-                let bytes = encode_message(&err_msg).unwrap_or_default();
-                return (
-                    StatusCode::BAD_REQUEST,
-                    [(header::CONTENT_TYPE, "application/octet-stream")],
-                    bytes,
-                )
-                    .into_response();
-            }
-
-            match state
-                .snapshot_relay
-                .get_chunk(correlation_id, &room_id, chunk_index, chunk_size)
-            {
-                Ok(chunk_msg) => match encode_message(&chunk_msg) {
-                    Ok(bytes) => (
-                        StatusCode::OK,
-                        [(header::CONTENT_TYPE, "application/octet-stream")],
-                        bytes,
-                    )
-                        .into_response(),
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Serialization error: {}", e),
-                    )
-                        .into_response(),
-                },
-                Err(err) => {
-                    let err_msg = ServerMessage::Error {
-                        correlation_id: Some(correlation_id),
-                        room_id: Some(room_id),
-                        code: err.to_error_code(),
-                        message: err.to_string(),
-                    };
-                    let bytes = encode_message(&err_msg).unwrap_or_default();
-                    (
-                        err.to_status_code(),
-                        [(header::CONTENT_TYPE, "application/octet-stream")],
-                        bytes,
-                    )
-                        .into_response()
-                }
-            }
-        }
-        _ => (
-            StatusCode::BAD_REQUEST,
-            "Expected RequestSnapshotChunk message",
-        )
-            .into_response(),
+    let result = ensure_payload_identity(&room_id, None, &msg_room_id, None).and_then(|()| {
+        state
+            .snapshot_relay
+            .get_chunk(correlation_id, &room_id, chunk_index, chunk_size)
+    });
+    match result {
+        Ok(chunk_msg) => binary_response(StatusCode::OK, &chunk_msg),
+        Err(err) => binary_error(Some(correlation_id), Some(room_id), err),
     }
 }
 
 /// `POST /rooms/:room_id/snapshot/upload-chunk`: Handles multipart snapshot upload chunk streaming.
 pub async fn upload_chunk(
     State(state): State<AppState>,
-    Path(room_id_str): Path<String>,
-    headers: HeaderMap,
-    body: Bytes,
+    RelayAuth { room_id }: RelayAuth,
+    BinaryMessage(msg): BinaryMessage<ClientMessage>,
 ) -> Response {
-    let room_id = RoomId::new(room_id_str.clone());
-
-    if let Err(err) = authenticate_relay_request(&headers, &room_id, &state) {
-        let err_msg = ServerMessage::Error {
-            correlation_id: None,
-            room_id: Some(room_id),
-            code: err.to_error_code(),
-            message: err.to_string(),
-        };
-        let bytes = encode_message(&err_msg).unwrap_or_default();
-        return (
-            err.to_status_code(),
-            [(header::CONTENT_TYPE, "application/octet-stream")],
-            bytes,
-        )
-            .into_response();
-    }
-
-    let msg: ClientMessage = match decode_message(&body) {
-        Ok(m) => m,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to decode UploadSnapshotChunk: {}", e),
-            )
-                .into_response();
-        }
+    let ClientMessage::UploadSnapshotChunk {
+        correlation_id,
+        room_id: msg_room_id,
+        snapshot_head_seq,
+        chunk_index,
+        total_chunks,
+        total_bytes,
+        snapshot_hash,
+        data,
+    } = msg
+    else {
+        return binary_error(
+            None,
+            Some(room_id),
+            ServerError::BadRequest("Expected UploadSnapshotChunk message".to_string()),
+        );
     };
 
-    match msg {
-        ClientMessage::UploadSnapshotChunk {
-            correlation_id,
-            room_id: msg_room_id,
-            snapshot_head_seq,
-            chunk_index,
-            total_chunks,
-            total_bytes,
-            snapshot_hash,
-            data,
-        } => {
-            if msg_room_id != room_id {
-                let err_msg = ServerMessage::Error {
-                    correlation_id: Some(correlation_id),
-                    room_id: Some(room_id),
-                    code: ErrorCode::Unauthorized,
-                    message: "RoomId path and message mismatch".to_string(),
-                };
-                let bytes = encode_message(&err_msg).unwrap_or_default();
-                return (
-                    StatusCode::BAD_REQUEST,
-                    [(header::CONTENT_TYPE, "application/octet-stream")],
-                    bytes,
-                )
-                    .into_response();
-            }
+    if let Err(err) = ensure_payload_identity(&room_id, None, &msg_room_id, None) {
+        return binary_error(Some(correlation_id), Some(room_id), err);
+    }
 
-            let chunk_upload = SnapshotChunkUpload {
-                room_id: room_id.clone(),
-                head_seq: snapshot_head_seq,
+    let chunk_upload = SnapshotChunkUpload {
+        room_id: room_id.clone(),
+        head_seq: snapshot_head_seq,
+        chunk_index,
+        total_chunks,
+        total_bytes,
+        snapshot_hash,
+        data,
+    };
+    match state.snapshot_relay.stage_chunk(chunk_upload) {
+        Ok(staged) => binary_response(
+            StatusCode::OK,
+            &ServerMessage::SnapshotUploadChunkAck {
+                correlation_id,
+                room_id,
                 chunk_index,
                 total_chunks,
-                total_bytes,
-                snapshot_hash,
-                data,
-            };
-            match state.snapshot_relay.stage_chunk(chunk_upload) {
-                Ok(staged) => {
-                    let ack_msg = ServerMessage::SnapshotUploadChunkAck {
-                        correlation_id,
-                        room_id,
-                        chunk_index,
-                        total_chunks,
-                        staged,
-                    };
-                    match encode_message(&ack_msg) {
-                        Ok(bytes) => (
-                            StatusCode::OK,
-                            [(header::CONTENT_TYPE, "application/octet-stream")],
-                            bytes,
-                        )
-                            .into_response(),
-                        Err(e) => (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Serialization error: {}", e),
-                        )
-                            .into_response(),
-                    }
-                }
-                Err(err) => {
-                    let err_msg = ServerMessage::Error {
-                        correlation_id: Some(correlation_id),
-                        room_id: Some(room_id),
-                        code: err.to_error_code(),
-                        message: err.to_string(),
-                    };
-                    let bytes = encode_message(&err_msg).unwrap_or_default();
-                    (
-                        err.to_status_code(),
-                        [(header::CONTENT_TYPE, "application/octet-stream")],
-                        bytes,
-                    )
-                        .into_response()
-                }
-            }
-        }
-        _ => (
-            StatusCode::BAD_REQUEST,
-            "Expected UploadSnapshotChunk message",
-        )
-            .into_response(),
+                staged,
+            },
+        ),
+        Err(err) => binary_error(Some(correlation_id), Some(room_id), err),
     }
 }

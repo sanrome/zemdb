@@ -25,8 +25,8 @@ async fn test_disk_zstd_snapshot_and_restore() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
     let engine = DiskStorageEngine::new(options);
-    let room_a = RoomId::new("room-snap-a");
-    let room_b = RoomId::new("room-snap-b");
+    let room_a = RoomId::new("room-snap-a").unwrap();
+    let room_b = RoomId::new("room-snap-b").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_a, schema.clone()).await.unwrap();
@@ -74,7 +74,7 @@ async fn test_disk_compaction_and_wal_truncation() {
         .min_compaction_bytes(200)
         .compaction_ratio(1.5);
     let engine = DiskStorageEngine::new(options);
-    let room_id = RoomId::new("room-compact");
+    let room_id = RoomId::new("room-compact").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_id, schema).await.unwrap();
@@ -132,7 +132,7 @@ async fn test_disk_concurrent_readers_and_writers() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
     let engine = Arc::new(DiskStorageEngine::new(options));
-    let room_id = RoomId::new("room-concurrent-disk");
+    let room_id = RoomId::new("room-concurrent-disk").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_id, schema).await.unwrap();
@@ -194,7 +194,7 @@ async fn test_cow_compaction_concurrent_writes_unblocked() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path()).zstd_level(1);
     let engine = Arc::new(DiskStorageEngine::new(options.clone()));
-    let room_id = RoomId::new("room-cow-concurrent");
+    let room_id = RoomId::new("room-cow-concurrent").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_id, schema.clone()).await.unwrap();
@@ -287,7 +287,7 @@ async fn test_compaction_unique_tmp_paths() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
     let engine = DiskStorageEngine::new(options);
-    let room_id = RoomId::new("room-unique-tmp");
+    let room_id = RoomId::new("room-unique-tmp").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_id, schema).await.unwrap();
@@ -334,7 +334,7 @@ async fn test_crash_recovery_during_compaction_window_after_snapshot_rename() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
     let engine = DiskStorageEngine::new(options.clone());
-    let room_id = RoomId::new("room-crash-after-snap-rename");
+    let room_id = RoomId::new("room-crash-after-snap-rename").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_id, schema.clone()).await.unwrap();
@@ -431,7 +431,7 @@ async fn test_crash_recovery_during_compaction_window_before_snapshot_rename() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
     let engine = DiskStorageEngine::new(options.clone());
-    let room_id = RoomId::new("room-crash-before-snap-rename");
+    let room_id = RoomId::new("room-crash-before-snap-rename").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_id, schema.clone()).await.unwrap();

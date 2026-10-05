@@ -5,7 +5,7 @@ use zemdb_core::{CryptoConcurrencyBounds, CryptoEngine, NoOpCryptoEngine, RoomId
 fn test_noop_crypto_engine_roundtrip_with_aad() {
     block_on(async {
         let engine = NoOpCryptoEngine;
-        let room_id = RoomId::new("room-e2ee-test");
+        let room_id = RoomId::new("room-e2ee-test").unwrap();
         let aad = b"table_1:pk_42:col_3";
         let plaintext = b"sensitive user payload";
 

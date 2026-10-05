@@ -19,7 +19,7 @@ fn sample_schema() -> Schema {
 #[tokio::test]
 async fn test_cross_engine_snapshot_portability() {
     let schema = sample_schema();
-    let room_id = RoomId::new("portability-room");
+    let room_id = RoomId::new("portability-room").unwrap();
 
     // 1. Memory engine populates state and creates snapshot
     let mem_engine = MemoryStorageEngine::new();
@@ -137,7 +137,7 @@ async fn test_cross_engine_snapshot_portability() {
 #[tokio::test]
 async fn test_snapshot_envelope_corruption_detection() {
     let schema = sample_schema();
-    let room_id = RoomId::new("corrupt-snap-room");
+    let room_id = RoomId::new("corrupt-snap-room").unwrap();
 
     let mem_engine = MemoryStorageEngine::new();
     mem_engine
@@ -185,7 +185,7 @@ async fn test_snapshot_envelope_corruption_detection() {
 #[tokio::test]
 async fn test_storage_engine_apply_batch_schema_validation() {
     let schema = sample_schema();
-    let room_id = RoomId::new("validation-room");
+    let room_id = RoomId::new("validation-room").unwrap();
 
     let mem_engine = MemoryStorageEngine::new();
     mem_engine

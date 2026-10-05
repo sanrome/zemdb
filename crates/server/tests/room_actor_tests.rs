@@ -54,7 +54,7 @@ async fn test_schema_registry_crud_and_evolution() {
     let dir = tempdir().unwrap();
     let registry = SchemaRegistry::new(dir.path()).unwrap();
 
-    let schema_id = SchemaId::new("todo-schema");
+    let schema_id = SchemaId::new("todo-schema").unwrap();
     let schema = create_test_schema();
 
     // 1. Register schema
@@ -99,7 +99,7 @@ async fn test_schema_registry_crud_and_evolution() {
 async fn test_room_actor_registration_and_get_schema() {
     let dir = tempdir().unwrap();
     let schema_registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
-    let schema_id = SchemaId::new("test-schema");
+    let schema_id = SchemaId::new("test-schema").unwrap();
     schema_registry
         .register_schema(schema_id.clone(), create_test_schema())
         .unwrap();
@@ -110,7 +110,7 @@ async fn test_room_actor_registration_and_get_schema() {
     });
 
     let manager = RoomManager::new(config, schema_registry, create_test_relay());
-    let room_id = RoomId::new("room-1");
+    let room_id = RoomId::new("room-1").unwrap();
     let sender = manager
         .get_or_spawn(&room_id, Some(&schema_id))
         .await
@@ -120,7 +120,7 @@ async fn test_room_actor_registration_and_get_schema() {
     let (reply_tx, reply_rx) = oneshot::channel();
     sender
         .send(RoomCommand::RegisterClient {
-            client_id: ClientId::new("client-alice"),
+            client_id: ClientId::new("client-alice").unwrap(),
             current_seq: None,
             reply: reply_tx,
         })
@@ -137,7 +137,7 @@ async fn test_room_actor_registration_and_get_schema() {
 async fn test_room_actor_commit_validation_and_monotonic_sequencing() {
     let dir = tempdir().unwrap();
     let schema_registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
-    let schema_id = SchemaId::new("tasks-schema");
+    let schema_id = SchemaId::new("tasks-schema").unwrap();
     let schema = create_test_schema();
     schema_registry
         .register_schema(schema_id.clone(), schema.clone())
@@ -149,13 +149,13 @@ async fn test_room_actor_commit_validation_and_monotonic_sequencing() {
     });
 
     let manager = RoomManager::new(config, schema_registry, create_test_relay());
-    let room_id = RoomId::new("tasks-room");
+    let room_id = RoomId::new("tasks-room").unwrap();
     let sender = manager
         .get_or_spawn(&room_id, Some(&schema_id))
         .await
         .unwrap();
 
-    let client_id = ClientId::new("client-1");
+    let client_id = ClientId::new("client-1").unwrap();
 
     // 0. Commit from unregistered client rejected with Unauthorized
     let op0 = create_insert_op(&schema, 0, "Unregistered attempt");
@@ -251,7 +251,7 @@ async fn test_room_actor_commit_validation_and_monotonic_sequencing() {
 async fn test_room_actor_multi_client_concurrency_and_sse_events() {
     let dir = tempdir().unwrap();
     let schema_registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
-    let schema_id = SchemaId::new("concurrent-schema");
+    let schema_id = SchemaId::new("concurrent-schema").unwrap();
     let schema = create_test_schema();
     schema_registry
         .register_schema(schema_id.clone(), schema.clone())
@@ -263,7 +263,7 @@ async fn test_room_actor_multi_client_concurrency_and_sse_events() {
     });
 
     let manager = RoomManager::new(config, schema_registry, create_test_relay());
-    let room_id = RoomId::new("concurrent-room");
+    let room_id = RoomId::new("concurrent-room").unwrap();
     let sender = manager
         .get_or_spawn(&room_id, Some(&schema_id))
         .await
@@ -273,7 +273,7 @@ async fn test_room_actor_multi_client_concurrency_and_sse_events() {
     let (reg_tx, reg_rx) = oneshot::channel();
     sender
         .send(RoomCommand::RegisterClient {
-            client_id: ClientId::new("reader"),
+            client_id: ClientId::new("reader").unwrap(),
             current_seq: None,
             reply: reg_tx,
         })
@@ -295,7 +295,7 @@ async fn test_room_actor_multi_client_concurrency_and_sse_events() {
         let cmd_tx = sender.clone();
         let schema_clone = schema.clone();
         tasks.push(tokio::spawn(async move {
-            let client_id = ClientId::new(format!("worker-{}", client_idx));
+            let client_id = ClientId::new(format!("worker-{}", client_idx)).unwrap();
             register_client_helper(&cmd_tx, client_id.clone())
                 .await
                 .unwrap();
@@ -349,7 +349,7 @@ async fn test_room_actor_multi_client_concurrency_and_sse_events() {
     let (sync_tx1, sync_rx1) = oneshot::channel();
     sender
         .send(RoomCommand::Sync {
-            client_id: ClientId::new("reader"),
+            client_id: ClientId::new("reader").unwrap(),
             from_seq: SequenceNumber::new(0),
             max_batch_size: 50,
             reply: sync_tx1,
@@ -363,7 +363,7 @@ async fn test_room_actor_multi_client_concurrency_and_sse_events() {
     let (sync_tx2, sync_rx2) = oneshot::channel();
     sender
         .send(RoomCommand::Sync {
-            client_id: ClientId::new("reader"),
+            client_id: ClientId::new("reader").unwrap(),
             from_seq: SequenceNumber::new(50),
             max_batch_size: 50,
             reply: sync_tx2,
@@ -379,7 +379,7 @@ async fn test_room_actor_multi_client_concurrency_and_sse_events() {
 async fn test_room_actor_client_lifecycle_and_dormant_behind_compaction() {
     let dir = tempdir().unwrap();
     let schema_registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
-    let schema_id = SchemaId::new("lifecycle-schema");
+    let schema_id = SchemaId::new("lifecycle-schema").unwrap();
     let schema = create_test_schema();
     schema_registry
         .register_schema(schema_id.clone(), schema.clone())
@@ -395,14 +395,14 @@ async fn test_room_actor_client_lifecycle_and_dormant_behind_compaction() {
     let lifecycle_policy = RoomLifecyclePolicy::test_policy();
 
     let manager = RoomManager::new(config, schema_registry, create_test_relay());
-    let room_id = RoomId::new("lifecycle-room");
+    let room_id = RoomId::new("lifecycle-room").unwrap();
     let sender = manager
         .get_or_spawn_with_policy(&room_id, Some(&schema_id), lifecycle_policy)
         .await
         .unwrap();
 
-    let alice = ClientId::new("alice");
-    let bob = ClientId::new("bob");
+    let alice = ClientId::new("alice").unwrap();
+    let bob = ClientId::new("bob").unwrap();
 
     // Register alice and bob
     let (reg_tx, reg_rx) = oneshot::channel();
@@ -512,7 +512,7 @@ async fn test_room_actor_client_lifecycle_and_dormant_behind_compaction() {
 async fn test_room_actor_recovery_retains_state_and_head_seq() {
     let dir = tempdir().unwrap();
     let schema_registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
-    let schema_id = SchemaId::new("recovery-schema");
+    let schema_id = SchemaId::new("recovery-schema").unwrap();
     let schema = create_test_schema();
     schema_registry
         .register_schema(schema_id.clone(), schema.clone())
@@ -523,7 +523,7 @@ async fn test_room_actor_recovery_retains_state_and_head_seq() {
         ..Default::default()
     });
 
-    let room_id = RoomId::new("crash-test-room");
+    let room_id = RoomId::new("crash-test-room").unwrap();
 
     // Phase 1: Spawn, commit 5 ops, then close room actor
     {
@@ -536,7 +536,7 @@ async fn test_room_actor_recovery_retains_state_and_head_seq() {
             .get_or_spawn(&room_id, Some(&schema_id))
             .await
             .unwrap();
-        register_client_helper(&sender, ClientId::new("c1"))
+        register_client_helper(&sender, ClientId::new("c1").unwrap())
             .await
             .unwrap();
 
@@ -545,7 +545,7 @@ async fn test_room_actor_recovery_retains_state_and_head_seq() {
             let (tx, rx) = oneshot::channel();
             sender
                 .send(RoomCommand::Commit {
-                    client_id: ClientId::new("c1"),
+                    client_id: ClientId::new("c1").unwrap(),
                     mutation_id: MutationId::new([i as u8; 16]),
                     last_ack_seq: SequenceNumber::new(i as u64 - 1),
                     op,
@@ -586,7 +586,7 @@ async fn test_room_actor_recovery_retains_state_and_head_seq() {
         let (tx, rx) = oneshot::channel();
         sender2
             .send(RoomCommand::Commit {
-                client_id: ClientId::new("c1"),
+                client_id: ClientId::new("c1").unwrap(),
                 mutation_id: MutationId::new([5; 16]),
                 last_ack_seq: SequenceNumber::new(4),
                 op: op5_dup,
@@ -602,7 +602,7 @@ async fn test_room_actor_recovery_retains_state_and_head_seq() {
         let (tx6, rx6) = oneshot::channel();
         sender2
             .send(RoomCommand::Commit {
-                client_id: ClientId::new("c1"),
+                client_id: ClientId::new("c1").unwrap(),
                 mutation_id: MutationId::new([6; 16]),
                 last_ack_seq: SequenceNumber::new(5),
                 op: op6,
@@ -619,7 +619,7 @@ async fn test_room_actor_recovery_retains_state_and_head_seq() {
 async fn test_room_actor_cursor_advances_only_on_client_ack() {
     let dir = tempdir().unwrap();
     let schema_registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
-    let schema_id = SchemaId::new("ack-test-schema");
+    let schema_id = SchemaId::new("ack-test-schema").unwrap();
     let schema = create_test_schema();
     schema_registry
         .register_schema(schema_id.clone(), schema.clone())
@@ -631,13 +631,13 @@ async fn test_room_actor_cursor_advances_only_on_client_ack() {
     });
 
     let manager = RoomManager::new(config, schema_registry, create_test_relay());
-    let room_id = RoomId::new("ack-test-room");
+    let room_id = RoomId::new("ack-test-room").unwrap();
     let sender = manager
         .get_or_spawn(&room_id, Some(&schema_id))
         .await
         .unwrap();
 
-    let client = ClientId::new("c-reader");
+    let client = ClientId::new("c-reader").unwrap();
 
     // 1. Register client: cursor is at 0
     let (reg_tx, reg_rx) = oneshot::channel();
@@ -652,7 +652,7 @@ async fn test_room_actor_cursor_advances_only_on_client_ack() {
     reg_rx.await.unwrap().unwrap();
 
     // 2. Producer commits 5 operations (seq 1..=5)
-    register_client_helper(&sender, ClientId::new("producer"))
+    register_client_helper(&sender, ClientId::new("producer").unwrap())
         .await
         .unwrap();
     for i in 1..=5 {
@@ -660,7 +660,7 @@ async fn test_room_actor_cursor_advances_only_on_client_ack() {
         let (tx, rx) = oneshot::channel();
         sender
             .send(RoomCommand::Commit {
-                client_id: ClientId::new("producer"),
+                client_id: ClientId::new("producer").unwrap(),
                 mutation_id: MutationId::new([i as u8; 16]),
                 last_ack_seq: SequenceNumber::new(i as u64 - 1),
                 op,
@@ -760,7 +760,7 @@ async fn test_room_actor_cursor_advances_only_on_client_ack() {
 async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
     let dir = tempdir().unwrap();
     let schema_registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
-    let schema_id = SchemaId::new("anchor-schema");
+    let schema_id = SchemaId::new("anchor-schema").unwrap();
     let schema = create_test_schema();
     schema_registry
         .register_schema(schema_id.clone(), schema.clone())
@@ -774,7 +774,7 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
 
     let relay = Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(300)));
     let manager = RoomManager::new(config, schema_registry, Arc::clone(&relay));
-    let room_id = RoomId::new("anchor-room");
+    let room_id = RoomId::new("anchor-room").unwrap();
 
     // Small segments so proactive pruning has something to delete, but default TTLs: with
     // the short test TTLs, a slow run could prune the cold segments by age, which is not the
@@ -796,7 +796,7 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
     );
 
     // 2. Alice registers and commits 10 operations (1..=10)
-    let alice = ClientId::new("alice");
+    let alice = ClientId::new("alice").unwrap();
     let (reg_tx, reg_rx) = oneshot::channel();
     sender
         .send(RoomCommand::RegisterClient {
@@ -838,7 +838,7 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
     ack_rx.await.unwrap().unwrap();
 
     // 4. Bob (onboarding client) registers with current_seq = None
-    let bob = ClientId::new("bob");
+    let bob = ClientId::new("bob").unwrap();
     let (reg_bob_tx, reg_bob_rx) = oneshot::channel();
     sender
         .send(RoomCommand::RegisterClient {
@@ -889,7 +889,7 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
 async fn test_room_actor_rejects_future_ack_and_commit_sequences() {
     let dir = tempdir().unwrap();
     let schema_registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
-    let schema_id = SchemaId::new("test-schema");
+    let schema_id = SchemaId::new("test-schema").unwrap();
     let schema = create_test_schema();
     schema_registry
         .register_schema(schema_id.clone(), schema.clone())
@@ -901,13 +901,13 @@ async fn test_room_actor_rejects_future_ack_and_commit_sequences() {
     });
 
     let manager = RoomManager::new(config, schema_registry, create_test_relay());
-    let room_id = RoomId::new("room-seq-safety");
+    let room_id = RoomId::new("room-seq-safety").unwrap();
     let sender = manager
         .get_or_spawn(&room_id, Some(&schema_id))
         .await
         .expect("spawn room");
 
-    let alice = ClientId::new("alice");
+    let alice = ClientId::new("alice").unwrap();
     let alice_reg = register_client_helper(&sender, alice.clone())
         .await
         .unwrap();
@@ -964,7 +964,7 @@ async fn test_room_actor_rejects_future_ack_and_commit_sequences() {
     assert_eq!(cursor, Some(SequenceNumber::new(2)));
 
     // 4. Bob registers and syncs from sequence 0; deltas must NOT have been pruned
-    let bob = ClientId::new("bob");
+    let bob = ClientId::new("bob").unwrap();
     register_client_helper(&sender, bob.clone()).await.unwrap();
 
     let (sync_tx, sync_rx) = oneshot::channel();

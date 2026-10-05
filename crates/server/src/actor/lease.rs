@@ -49,9 +49,10 @@ pub struct ClientLeaseTracker {
 impl ClientLeaseTracker {
     /// Opens an existing client metadata file or creates a new empty tracker.
     ///
-    /// A roster that cannot be parsed is discarded with a warning and the tracker starts
-    /// empty: clients register again, and until they do no client cursor allows proactive
-    /// pruning, which is the safe direction. Errors reading the file are still reported.
+    /// An entry that cannot be parsed is skipped with a warning; a roster that cannot be
+    /// parsed at all is discarded with a warning and the tracker starts empty. Dropped
+    /// clients register again, and until they do no client cursor allows proactive pruning,
+    /// which is the safe direction. Errors reading the file are still reported.
     pub fn open_or_create(path: impl AsRef<Path>) -> Result<Self, ServerError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -72,11 +73,24 @@ impl ClientLeaseTracker {
             Err(e) => return Err(e.into()),
         };
         if !content.trim().is_empty() {
-            match serde_json::from_str::<Vec<ClientEntry>>(&content) {
-                Ok(entries) => {
-                    for mut entry in entries {
-                        entry.last_heartbeat = Instant::now();
-                        clients.insert(entry.client_id.clone(), entry);
+            // Entries are parsed one by one so that a single invalid entry (for example a
+            // client id that no longer passes validation) only drops that client.
+            match serde_json::from_str::<Vec<serde_json::Value>>(&content) {
+                Ok(raw_entries) => {
+                    for raw in raw_entries {
+                        match serde_json::from_value::<ClientEntry>(raw) {
+                            Ok(mut entry) => {
+                                entry.last_heartbeat = Instant::now();
+                                clients.insert(entry.client_id.clone(), entry);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    path = %path.display(),
+                                    error = %e,
+                                    "Skipping invalid entry in clients roster"
+                                );
+                            }
+                        }
                     }
                 }
                 Err(e) => {

@@ -10,7 +10,7 @@ use zemdb_server::relay::{SnapshotChunkUpload, SnapshotRelay};
 fn test_snapshot_relay_disk_persistence_and_recovery() {
     let dir = tempdir().unwrap();
     let snapshots_dir = dir.path().join("snapshots");
-    let room_id = RoomId::new("room-persist");
+    let room_id = RoomId::new("room-persist").unwrap();
     let head_seq = SequenceNumber::new(42);
     let payload = Bytes::from_static(b"snapshot-binary-data-test-payload-bytes");
 
@@ -67,7 +67,7 @@ fn test_snapshot_relay_disk_persistence_and_recovery() {
 fn test_snapshot_relay_multipart_abrupt_disconnect_and_corrupted_chunk() {
     let dir = tempdir().unwrap();
     let snapshots_dir = dir.path().join("snapshots");
-    let room_id = RoomId::new("room-relay-disconnect");
+    let room_id = RoomId::new("room-relay-disconnect").unwrap();
     let relay = SnapshotRelay::new(&snapshots_dir, Duration::from_millis(50)).unwrap();
 
     let full_data =
@@ -106,7 +106,7 @@ fn test_snapshot_relay_multipart_abrupt_disconnect_and_corrupted_chunk() {
     relay.cleanup_expired();
 
     // --- Scenario 2: Corrupted chunk upload causing hash verification failure ---
-    let corrupt_room = RoomId::new("room-corrupt-upload");
+    let corrupt_room = RoomId::new("room-corrupt-upload").unwrap();
     let corrupt_head = SequenceNumber::new(15);
     let bad_chunk1_data = Bytes::from_static(b"corrupted-data-segment-here!");
     let corrupt_total_bytes = (chunk0_data.len() + bad_chunk1_data.len()) as u64;
@@ -148,7 +148,7 @@ fn test_snapshot_relay_multipart_abrupt_disconnect_and_corrupted_chunk() {
     );
 
     // --- Scenario 3: Out-of-order chunks [2, 0, 1] assembled successfully ---
-    let ooo_room = RoomId::new("room-out-of-order");
+    let ooo_room = RoomId::new("room-out-of-order").unwrap();
     let ooo_head = SequenceNumber::new(20);
 
     let ooo_chunk2 = SnapshotChunkUpload {

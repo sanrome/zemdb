@@ -24,8 +24,8 @@ fn test_protocol_binary_serialization_roundtrip() {
     let mutation_id = MutationId::new([1u8; 16]);
     let client_msg = ClientMessage::Commit {
         correlation_id: CorrelationId::new(1001),
-        room_id: RoomId::new("room-abc"),
-        client_id: ClientId::new("client-1"),
+        room_id: RoomId::new("room-abc").unwrap(),
+        client_id: ClientId::new("client-1").unwrap(),
         mutation_id,
         last_ack_seq: SequenceNumber::new(10),
         op: Operation::insert(0, PrimaryKey::single(42i64), compact, 500),
@@ -38,7 +38,7 @@ fn test_protocol_binary_serialization_roundtrip() {
     // Test CommitAck 1-RTT roundtrip with catchup_ops
     let commit_ack_msg = ServerMessage::CommitAck {
         correlation_id: CorrelationId::new(1001),
-        room_id: RoomId::new("room-abc"),
+        room_id: RoomId::new("room-abc").unwrap(),
         mutation_id,
         assigned_seq: SequenceNumber::new(12),
         catchup_ops: vec![
@@ -64,7 +64,7 @@ fn test_protocol_binary_serialization_roundtrip() {
 
     let server_msg = ServerMessage::SyncBatch {
         correlation_id: CorrelationId::new(1001),
-        room_id: RoomId::new("room-abc"),
+        room_id: RoomId::new("room-abc").unwrap(),
         head_seq: SequenceNumber::new(150),
         ops: vec![SequencedOperation {
             seq: SequenceNumber::new(150),
@@ -81,8 +81,8 @@ fn test_protocol_binary_serialization_roundtrip() {
     // Test DeregisterClient roundtrip
     let dereg_msg = ClientMessage::DeregisterClient {
         correlation_id: CorrelationId::new(1002),
-        room_id: RoomId::new("room-abc"),
-        client_id: ClientId::new("client-1"),
+        room_id: RoomId::new("room-abc").unwrap(),
+        client_id: ClientId::new("client-1").unwrap(),
     };
     let encoded_dereg = encode_message(&dereg_msg).expect("serialization failed");
     let decoded_dereg: ClientMessage =
@@ -92,7 +92,7 @@ fn test_protocol_binary_serialization_roundtrip() {
     // Test RequestSnapshotChunk roundtrip
     let req_chunk = ClientMessage::RequestSnapshotChunk {
         correlation_id: CorrelationId::new(1003),
-        room_id: RoomId::new("room-abc"),
+        room_id: RoomId::new("room-abc").unwrap(),
         chunk_index: 2,
         chunk_size: 4 * 1024 * 1024,
     };
@@ -105,7 +105,7 @@ fn test_protocol_binary_serialization_roundtrip() {
     let expected_hash = ServerMessage::compute_snapshot_hash(dummy_payload);
     let snap_chunk = ServerMessage::SnapshotChunk {
         correlation_id: CorrelationId::new(1003),
-        room_id: RoomId::new("room-abc"),
+        room_id: RoomId::new("room-abc").unwrap(),
         snapshot_head_seq: SequenceNumber::new(500),
         chunk_index: 2,
         total_chunks: 10,
@@ -120,7 +120,7 @@ fn test_protocol_binary_serialization_roundtrip() {
     // Test UploadSnapshotChunk roundtrip
     let upload_chunk = ClientMessage::UploadSnapshotChunk {
         correlation_id: CorrelationId::new(1004),
-        room_id: RoomId::new("room-abc"),
+        room_id: RoomId::new("room-abc").unwrap(),
         snapshot_head_seq: SequenceNumber::new(500),
         chunk_index: 0,
         total_chunks: 5,
@@ -135,7 +135,7 @@ fn test_protocol_binary_serialization_roundtrip() {
     // Test SnapshotUploadChunkAck roundtrip
     let upload_ack = ServerMessage::SnapshotUploadChunkAck {
         correlation_id: CorrelationId::new(1004),
-        room_id: RoomId::new("room-abc"),
+        room_id: RoomId::new("room-abc").unwrap(),
         chunk_index: 0,
         total_chunks: 5,
         staged: false,
@@ -147,8 +147,8 @@ fn test_protocol_binary_serialization_roundtrip() {
     // Test RegisterClient with auth_token roundtrip
     let reg_msg = ClientMessage::RegisterClient {
         correlation_id: CorrelationId::new(1004),
-        room_id: RoomId::new("room-abc"),
-        client_id: ClientId::new("client-1"),
+        room_id: RoomId::new("room-abc").unwrap(),
+        client_id: ClientId::new("client-1").unwrap(),
         auth_token: "jwt.signed.token.abc123xyz".to_string(),
         current_seq: Some(SequenceNumber::new(5)),
     };
@@ -159,7 +159,7 @@ fn test_protocol_binary_serialization_roundtrip() {
     // Test GetSchema roundtrip
     let get_schema_msg = ClientMessage::GetSchema {
         correlation_id: CorrelationId::new(1005),
-        room_id: RoomId::new("room-abc"),
+        room_id: RoomId::new("room-abc").unwrap(),
     };
     let enc_get_schema = encode_message(&get_schema_msg).expect("serialization failed");
     let dec_get_schema: ClientMessage =
@@ -174,10 +174,10 @@ fn test_protocol_binary_serialization_roundtrip() {
         .unwrap()]);
     let registered_msg = ServerMessage::Registered {
         correlation_id: CorrelationId::new(1004),
-        room_id: RoomId::new("room-abc"),
+        room_id: RoomId::new("room-abc").unwrap(),
         head_seq: SequenceNumber::new(1),
         tail_seq: SequenceNumber::new(1),
-        schema_id: SchemaId::new("schema-workspace-v1"),
+        schema_id: SchemaId::new("schema-workspace-v1").unwrap(),
         schema: test_schema.clone(),
         active_snapshot_seq: Some(SequenceNumber::new(1)),
     };
@@ -189,8 +189,8 @@ fn test_protocol_binary_serialization_roundtrip() {
     // Test Schema response message roundtrip
     let schema_resp_msg = ServerMessage::Schema {
         correlation_id: CorrelationId::new(1005),
-        room_id: RoomId::new("room-abc"),
-        schema_id: SchemaId::new("schema-workspace-v1"),
+        room_id: RoomId::new("room-abc").unwrap(),
+        schema_id: SchemaId::new("schema-workspace-v1").unwrap(),
         schema: test_schema,
     };
     let enc_schema_resp = encode_message(&schema_resp_msg).expect("serialization failed");
@@ -208,7 +208,7 @@ fn test_protocol_binary_serialization_roundtrip() {
     for code in error_codes {
         let err_msg = ServerMessage::Error {
             correlation_id: Some(CorrelationId::new(9999)),
-            room_id: Some(RoomId::new("room-abc")),
+            room_id: Some(RoomId::new("room-abc").unwrap()),
             code,
             message: format!("Test error for {:?}", code),
         };
@@ -222,8 +222,8 @@ fn test_protocol_binary_serialization_roundtrip() {
 fn test_protocol_rejects_trailing_bytes() {
     let client_msg = ClientMessage::Heartbeat {
         correlation_id: CorrelationId::new(42),
-        client_id: ClientId::new("client-test"),
-        room_id: RoomId::new("room-1"),
+        client_id: ClientId::new("client-test").unwrap(),
+        room_id: RoomId::new("room-1").unwrap(),
     };
 
     let mut encoded = encode_message(&client_msg).expect("serialization failed");
@@ -241,8 +241,8 @@ fn test_protocol_rejects_trailing_bytes() {
 fn test_ack_messages_codec_roundtrip() {
     let ack_msg = ClientMessage::Ack {
         correlation_id: CorrelationId::new(101),
-        room_id: RoomId::new("room-ack"),
-        client_id: ClientId::new("client-ack"),
+        room_id: RoomId::new("room-ack").unwrap(),
+        client_id: ClientId::new("client-ack").unwrap(),
         ack_seq: SequenceNumber::new(42),
     };
 
@@ -252,7 +252,7 @@ fn test_ack_messages_codec_roundtrip() {
 
     let ack_confirmed = ServerMessage::AckConfirmed {
         correlation_id: CorrelationId::new(101),
-        room_id: RoomId::new("room-ack"),
+        room_id: RoomId::new("room-ack").unwrap(),
         ack_seq: SequenceNumber::new(42),
         head_seq: SequenceNumber::new(50),
     };
@@ -266,8 +266,8 @@ fn test_ack_messages_codec_roundtrip() {
 fn test_wire_framing_header_and_magic_version_verification() {
     let msg = ClientMessage::Heartbeat {
         correlation_id: CorrelationId::new(42),
-        client_id: ClientId::new("client-test"),
-        room_id: RoomId::new("room-1"),
+        client_id: ClientId::new("client-test").unwrap(),
+        room_id: RoomId::new("room-1").unwrap(),
     };
 
     let encoded = encode_message(&msg).expect("serialization should succeed");
@@ -297,8 +297,8 @@ fn test_wire_framing_header_and_magic_version_verification() {
 fn test_deregister_ack_message_roundtrip() {
     let ack = ServerMessage::DeregisterAck {
         correlation_id: CorrelationId::new(55),
-        room_id: RoomId::new("room-ack"),
-        client_id: ClientId::new("client-ack"),
+        room_id: RoomId::new("room-ack").unwrap(),
+        client_id: ClientId::new("client-ack").unwrap(),
     };
     let encoded = encode_message(&ack).expect("serialization failed");
     let decoded: ServerMessage = decode_message(&encoded).expect("deserialization failed");

@@ -44,6 +44,13 @@
 | **D6** | Cursores de clientes: se actualizan en memoria con un flag de "sucio" y se persisten (escritura atómica) en el tick de mantenimiento; registro, desregistro y apagado se persisten en el momento. Un crash pierde ≤500 ms de avance de cursores. Persistir en cada ack/commit sumaría dos fsync por operación. **Corrección tras la revisión del Lote 3:** como la poda usa el cursor en memoria, antes de cualquier poda que vaya a borrar un segmento se persiste el roster (misma regla "registrar antes de borrar" que `log_meta.json`); así el cursor persistido nunca queda por debajo de lo podado. | Adoptada |
 | **D7** | Falla de escritura o `fsync` en un commit del servidor: el actor responde error interno (reintentable), lo registra y **termina**; el `RoomManager` relanza la sala en el siguiente request y la recupera desde disco. Si el registro llegó al disco, la deduplicación lo reconoce y un reintento con el mismo `mutation_id` recibe su `CommitAck`. | Adoptada |
 | **D8** | Apagado ordenado: SIGINT y SIGTERM; dejar de aceptar conexiones, cortar los streams SSE (si no, el apagado esperaría para siempre), esperar los requests en curso, `shutdown_all` con guardado del roster, y timeout total de 10 s tras el cual se fuerza la salida. | Adoptada |
+| **D9** | IDs de sala y de esquema (se usan como nombres de archivos y carpetas): solo `[a-z0-9_-]`, de 1 a 64 caracteres, rechazando los nombres reservados de Windows (`con`, `prn`, `aux`, `nul`, `com1`–`com9`, `lpt1`–`lpt9`). Solo minúsculas porque macOS y Windows no distinguen mayúsculas en nombres de archivo: `Sala` y `sala` compartirían archivos. | Adoptada |
+| **D10** | ID de cliente (no se usa en rutas): de 1 a 256 bytes UTF-8, sin caracteres de control. | Adoptada |
+| **D11** | Formato del token: `v1.<base64url(cliente)>.<base64url(sala)>.<expiración>.<firma>`. La firma es BLAKE3 con clave derivada del secreto con un contexto propio (`blake3::derive_key`), calculada sobre los campos con largo prefijado. Los tokens del formato anterior dejan de valer (no se requiere retrocompatibilidad). | Adoptada |
+| **D12** | Los IDs se validan en el tipo ("parse, don't validate"): `RoomId::new`, `SchemaId::new` y `ClientId::new` devuelven `Result`, y la deserialización valida (`serde(try_from)`). El borde (HTTP, token, JSON de admin) sigue siendo donde se rechaza la entrada, pero ningún código interno puede recibir un ID sin validar, incluidos los que llegan en el cuerpo binario, desde archivos o por la API de `zemdb-storage`. | Adoptada |
+| **D13** | Se adelanta del Lote 7 solo `ServerError::BadRequest` / `ErrorCode::BadRequest` (HTTP 400), para responder a IDs inválidos. El resto de los códigos de error sigue en el Lote 7. | Adoptada |
+| **D14** | Secretos: el servidor se niega a arrancar si `ZEMDB_AUTH_SECRET` o `ZEMDB_ADMIN_SECRET` están vacíos, miden menos de 32 bytes, son iguales al valor de desarrollo del repo (público) o son iguales entre sí. Sin modo de desarrollo: para correr localmente hay que definirlos (ver README). | Adoptada |
+| **D15** | La validación del borde HTTP vive en extractores de axum (`api/extract.rs`): `RoomPath`, `AuthenticatedRoom` (token solo por header), `EventStreamAuth` (header o `?token=`, solo SSE), `RelayAuth` (token de cliente o secreto de admin), `BinaryMessage`, `AdminPath`, `AdminJson`. Los handlers reciben valores validados y solo comprueban la identidad dentro del mensaje (`ensure_payload_identity`). Todos los errores del data plane son frames binarios. | Adoptada |
 
 ---
 
@@ -54,7 +61,7 @@
 | 1 | Consistencia del log y del commit | DEF-01, 36, 07, 58, 59, 67, 04, 29, 06 | Inmediata | ✅ 9/9 |
 | 2 | Durabilidad del motor de storage | DEF-02, 03, 65, 19(storage), 12 | Inmediata | ✅ 5/5 |
 | 3 | Durabilidad de metadatos del servidor | DEF-60, 19(server), 16, 48, 68, 69 | Alta | ✅ 6/6 |
-| 4 | Autenticación e identificadores | DEF-61, 41, 66 | Alta | 0/3 |
+| 4 | Autenticación e identificadores | DEF-61, 41, 66, 80 | Alta | ✅ 4/4 |
 | 5 | Relay de snapshots | DEF-62, 10, 63, 52, 51, 39, 40, 38, 31(relay), 08(relay), 15 | Alta | 0/11 |
 | 6 | Ciclo de vida de clientes y señalización | DEF-53, 05, 27, 75, 76 (24 y 26 descartados) | Alta | 0/5 |
 | 7 | Protocolo wire y errores HTTP | DEF-46, 28, 11, 43, 64, 22, 71, 74 | Media | 0/8 |
@@ -62,7 +69,7 @@
 | 9 | Robustez e higiene de storage y core | DEF-14, 23, 49, 17, 25(storage), 18, 09, 45, 33, 44, 47, 30, 13, 20, 21, 57, 70, 78 (32 descartado) | Media/Baja | 1/18 |
 | 10 | Diferido a Fase 4 / descartado | DEF-34, 54, 42, 56, 73 | — | — |
 
-**Avance total:** 21 de 75 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
+**Avance total:** 25 de 76 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
 
 **Severidades corregidas respecto de la auditoría anterior:** de los 7 "críticos" originales, solo DEF-01 lo es. DEF-02, 03 y 04 son Altos; DEF-05 y 06 son Medios; DEF-34 es Bajo. DEF-24, 26 y 56 son falsos en la práctica.
 
@@ -224,19 +231,28 @@ Off-by-one del fast path (`from_seq + 1 >= min_ram`). Solo costaba rendimiento.
 
 ## Lote 4 — Autenticación e identificadores
 
-#### DEF-61 · Alto · ⬜ (nuevo)
+#### DEF-61 · Alto · ✅ Hecho (nuevo)
 **Problema.** `RoomId::new` (`core/src/id.rs`) no valida nada y los IDs de sala terminan en rutas de archivo (`rooms/{id}`, `{id}_{seq}.snap.zst`). Un ID con `/` o `..` permite path traversal.
 **Solución.** Constructor validado: `RoomId` con charset `[A-Za-z0-9_-]` y longitud 1..=64. Para `ClientId`, verificar si llega a rutas; como mínimo, prohibir `/`, `\`, `..` y caracteres de control, y acotar la longitud. Validar también en la deserialización.
 **Test.** IDs con `../`, `/`, vacíos o demasiado largos son rechazados en la API y en la deserialización.
 
-#### DEF-41 · Medio · ⬜
+#### DEF-41 · Medio · ✅ Hecho
 **Problema verificado.** El token es `client.room.exp.sig` y `split('.')` exige 4 partes: los IDs con puntos nunca validan (problema de disponibilidad).
 **Error de la propuesta anterior (`rsplitn(3, '.')`).** Sigue sin poder separar cliente y sala, y además la firma cubre el string unido: el token de (cliente `a.b`, sala `c`) es idéntico byte a byte al de (cliente `a`, sala `b.c`). Cualquier regla fija de partición convierte esto en **confusión de autorización entre salas**.
 **Solución.** Token `base64url(client).base64url(room).exp.sig` (el alfabeto base64url no contiene `.`), con la firma calculada sobre una codificación con separación de dominio y longitudes prefijadas (p. ej. `"zemdb-client-token-v1" ‖ len ‖ client ‖ len ‖ room ‖ exp`).
 **Test.** IDs con puntos validan correctamente; tokens de pares (cliente, sala) distintos con la misma concatenación no son intercambiables.
 
-#### DEF-66 · Info · ⬜ (nuevo)
+#### DEF-66 · Info · ✅ Hecho (nuevo)
 ARCHITECTURE.md dice HMAC-SHA256, pero el código usa BLAKE3 con clave. Actualizar la documentación.
+
+#### DEF-80 · Crítico · ✅ Hecho (nuevo, revisión del Lote 4)
+**Problema.** `config.rs` traía secretos por defecto escritos en el código (`default_auth_secret_dev_32bytes!` y el de admin) y aceptaba secretos vacíos. Un despliegue que no configurara `ZEMDB_AUTH_SECRET`/`ZEMDB_ADMIN_SECRET` permitía a cualquiera emitir tokens de cliente para cualquier sala, operar como admin y subir snapshots a cualquier sala (el relay acepta el secreto de admin). Con un secreto de admin vacío, un header de autorización vacío pasaba como admin.
+**Solución aplicada (D14).** `ServerConfig::validate_secrets`, ejecutado al cargar la configuración: rechaza secretos vacíos, de menos de 32 bytes, iguales al valor de desarrollo o iguales entre sí, sin incluir el secreto en el mensaje. Verificado ejecutando el binario.
+
+#### Notas del Lote 4
+- **Extractores (D15):** adelantan parte de DEF-15, DEF-22 y DEF-43. Cambios visibles para clientes: sala del token distinta a la de la URL 500 → 401; cuerpo indecodificable o ID inválido en el mensaje 500 → 400; JSON de admin inválido 422 → 400 (413/415 se conservan); errores de autenticación del data plane JSON → binario; errores del header `x-snapshot-head-seq` JSON 500 → binario 400. Lo que queda de esos ítems sigue en sus lotes.
+- **Compatibilidad del protocolo:** agregar `ErrorCode::BadRequest` al enum del wire no cambió la versión del protocolo; un cliente compilado antes no puede decodificar esos frames de error. Aceptable en v0.1 (los tokens anteriores tampoco valen, D11).
+- **Datos de versiones anteriores:** salas, esquemas, clientes del roster o snapshots con IDs que ya no son válidos (mayúsculas, puntos, etc.) quedan inaccesibles: no se borran, se ignoran con un warning (esquemas, roster, relay) o no se pueden direccionar (salas). No hay migración (no se requiere retrocompatibilidad); si hiciera falta, renombrar manualmente las carpetas y archivos a IDs válidos.
 
 ---
 

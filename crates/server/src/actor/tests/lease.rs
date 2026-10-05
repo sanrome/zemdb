@@ -31,8 +31,8 @@ fn unreadable_roster_opens_empty() {
 fn interrupted_roster_save_keeps_previous_roster() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("meta_clients_room.json");
-    let first = ClientId::new("first");
-    let second = ClientId::new("second");
+    let first = ClientId::new("first").unwrap();
+    let second = ClientId::new("second").unwrap();
 
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
     tracker.register_client(&first, None, seq(1)).unwrap();
@@ -61,7 +61,7 @@ fn stale_roster_tmp_is_removed_on_open() {
 fn cursor_updates_are_persisted_only_when_flushed() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("meta_clients_room.json");
-    let client = ClientId::new("client");
+    let client = ClientId::new("client").unwrap();
 
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
     tracker.register_client(&client, None, seq(1)).unwrap();
@@ -78,7 +78,7 @@ fn cursor_updates_are_persisted_only_when_flushed() {
 fn advance_cursor_is_monotonic_and_keeps_state() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("meta_clients_room.json");
-    let client = ClientId::new("client");
+    let client = ClientId::new("client").unwrap();
 
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
     tracker.register_client(&client, None, seq(10)).unwrap();
@@ -95,7 +95,7 @@ fn advance_cursor_is_monotonic_and_keeps_state() {
 fn activity_that_changes_state_is_persisted_on_flush() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("meta_clients_room.json");
-    let client = ClientId::new("client");
+    let client = ClientId::new("client").unwrap();
 
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
     tracker.register_client(&client, None, seq(10)).unwrap();
@@ -104,4 +104,30 @@ fn activity_that_changes_state_is_persisted_on_flush() {
 
     let reopened = ClientLeaseTracker::open_or_create(&path).unwrap();
     assert!(reopened.is_connected(&client));
+}
+
+#[test]
+fn roster_entry_with_invalid_client_id_is_skipped_and_the_rest_kept() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("meta_clients_room.json");
+    fs::write(
+        &path,
+        br#"[
+            {"client_id": "alice", "state": "Connected", "last_ack_seq": 3},
+            {"client_id": "", "state": "Connected", "last_ack_seq": 1},
+            {"client_id": "bad\u0000id", "state": "Connected", "last_ack_seq": 1},
+            {"client_id": "carol", "state": "NoSuchState", "last_ack_seq": 1},
+            {"client_id": "bob", "state": "Disconnected", "last_ack_seq": 5}
+        ]"#,
+    )
+    .unwrap();
+
+    let tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
+
+    let alice = ClientId::new("alice").unwrap();
+    let bob = ClientId::new("bob").unwrap();
+    assert_eq!(tracker.client_counts().4, 2);
+    assert_eq!(tracker.get_client(&alice).unwrap().last_ack_seq, seq(3));
+    assert_eq!(tracker.get_client(&bob).unwrap().last_ack_seq, seq(5));
+    assert!(!tracker.is_registered(&ClientId::new("carol").unwrap()));
 }

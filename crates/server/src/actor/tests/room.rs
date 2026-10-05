@@ -53,9 +53,13 @@ impl Fixture {
     async fn new(policy: RoomLifecyclePolicy) -> Self {
         let dir = tempdir().unwrap();
         let manager = new_manager(&dir);
-        let room_id = RoomId::new("room");
+        let room_id = RoomId::new("room").unwrap();
         manager
-            .create_room(room_id.clone(), SchemaId::new("todo"), Some(policy))
+            .create_room(
+                room_id.clone(),
+                SchemaId::new("todo").unwrap(),
+                Some(policy),
+            )
             .await
             .unwrap();
         Self {
@@ -98,7 +102,7 @@ fn new_manager(dir: &TempDir) -> RoomManager {
     });
     let registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
     registry
-        .register_schema(SchemaId::new("todo"), test_schema())
+        .register_schema(SchemaId::new("todo").unwrap(), test_schema())
         .unwrap();
     let relay = Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(60)));
     RoomManager::new(config, registry, relay)
@@ -183,7 +187,7 @@ async fn sync_all(
 async fn accepted_commit_advances_client_cursor() {
     let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
     let sender = fx.sender().await;
-    let client = ClientId::new("writer");
+    let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
 
     commit(&sender, &client, mutation(1), seq(0), insert_op(1))
@@ -201,7 +205,7 @@ async fn accepted_commit_advances_client_cursor() {
 async fn retried_commit_advances_client_cursor() {
     let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
     let sender = fx.sender().await;
-    let client = ClientId::new("writer");
+    let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
 
     commit(&sender, &client, mutation(1), seq(0), insert_op(1))
@@ -223,7 +227,7 @@ async fn retried_commit_advances_client_cursor() {
 async fn rejected_commit_does_not_advance_client_cursor() {
     let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
     let sender = fx.sender().await;
-    let client = ClientId::new("writer");
+    let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
     commit(&sender, &client, mutation(1), seq(0), insert_op(1))
         .await
@@ -246,7 +250,7 @@ async fn commit_only_client_advances_retention_floor() {
     };
     let fx = Fixture::new(policy).await;
     let sender = fx.sender().await;
-    let client = ClientId::new("writer");
+    let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
 
     // Each commit reports the previous head as the client's cursor; no explicit Ack is sent.
@@ -281,7 +285,7 @@ async fn commit_only_client_advances_retention_floor() {
 async fn cursor_advance_is_persisted_by_maintenance_tick() {
     let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
     let sender = fx.sender().await;
-    let client = ClientId::new("writer");
+    let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
     commit(&sender, &client, mutation(1), seq(0), insert_op(1))
         .await
@@ -306,7 +310,7 @@ async fn cursor_advance_is_persisted_by_maintenance_tick() {
 async fn shutdown_persists_pending_roster_changes() {
     let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
     let sender = fx.sender().await;
-    let client = ClientId::new("writer");
+    let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
     commit(&sender, &client, mutation(1), seq(0), insert_op(1))
         .await
@@ -329,7 +333,7 @@ async fn shutdown_persists_pending_roster_changes() {
 async fn failed_commit_sync_stops_room_and_recovers_from_disk() {
     let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
     let sender = fx.sender().await;
-    let client = ClientId::new("writer");
+    let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
     commit(&sender, &client, mutation(1), seq(0), insert_op(1))
         .await
@@ -420,7 +424,7 @@ async fn pruning_on_ack_persists_cursor_before_deleting_segments() {
     };
     let fx = Fixture::new(policy).await;
     let sender = fx.sender().await;
-    let client = ClientId::new("writer");
+    let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
     for n in 1..=4u8 {
         commit(&sender, &client, mutation(n), seq(0), insert_op(n.into()))
@@ -448,7 +452,7 @@ async fn rotation_failure_after_durable_commit_is_acknowledged_and_restarts_room
     };
     let fx = Fixture::new(policy).await;
     let sender = fx.sender().await;
-    let client = ClientId::new("writer");
+    let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
     commit(&sender, &client, mutation(1), seq(0), insert_op(1))
         .await
@@ -484,7 +488,7 @@ async fn rotation_failure_after_durable_commit_is_acknowledged_and_restarts_room
 async fn failed_commit_write_restarts_room_and_retry_gets_next_sequence() {
     let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
     let sender = fx.sender().await;
-    let client = ClientId::new("writer");
+    let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
     commit(&sender, &client, mutation(1), seq(0), insert_op(1))
         .await

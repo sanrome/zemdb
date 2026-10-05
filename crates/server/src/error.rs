@@ -65,6 +65,15 @@ pub enum ServerError {
 
     #[error("Gateway timeout: {0}")]
     GatewayTimeout(String),
+
+    #[error("Bad request: {0}")]
+    BadRequest(String),
+}
+
+impl From<zemdb_core::InvalidIdError> for ServerError {
+    fn from(err: zemdb_core::InvalidIdError) -> Self {
+        ServerError::BadRequest(err.to_string())
+    }
 }
 
 impl ServerError {
@@ -82,6 +91,7 @@ impl ServerError {
             ServerError::Unauthorized(_) => ErrorCode::Unauthorized,
             ServerError::RateLimited => ErrorCode::RateLimited,
             ServerError::InvalidSequence { .. } => ErrorCode::InvalidSequence,
+            ServerError::BadRequest(_) => ErrorCode::BadRequest,
             ServerError::GatewayTimeout(_)
             | ServerError::Io(_)
             | ServerError::Wal(_)
@@ -100,7 +110,8 @@ impl ServerError {
             ServerError::RoomAlreadyExists(_) => StatusCode::CONFLICT,
             ServerError::ProtocolVersionMismatch(_)
             | ServerError::SchemaViolation(_)
-            | ServerError::InvalidSequence { .. } => StatusCode::BAD_REQUEST,
+            | ServerError::InvalidSequence { .. }
+            | ServerError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ServerError::BehindCompaction => StatusCode::GONE,
             ServerError::ClientDeregistered => StatusCode::FORBIDDEN,
             ServerError::RateLimited => StatusCode::TOO_MANY_REQUESTS,

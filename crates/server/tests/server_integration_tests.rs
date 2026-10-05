@@ -103,7 +103,7 @@ fn create_insert_op(schema: &Schema, id: i64, title: &str) -> Operation {
 #[tokio::test]
 async fn test_control_plane_schema_crud_and_auth() {
     let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema");
+    let schema_id = SchemaId::new("todo-schema").unwrap();
     let schema = create_test_schema();
 
     // 1. Missing Authorization header -> 401 Unauthorized
@@ -187,7 +187,7 @@ async fn test_control_plane_schema_crud_and_auth() {
 #[tokio::test]
 async fn test_control_plane_room_lifecycle() {
     let server = TestServer::start().await;
-    let schema_id = SchemaId::new("room-schema");
+    let schema_id = SchemaId::new("room-schema").unwrap();
     let schema = create_test_schema();
     let auth_header = format!("Bearer {}", server.config.admin_secret);
 
@@ -197,7 +197,7 @@ async fn test_control_plane_room_lifecycle() {
         .register_schema(schema_id.clone(), schema)
         .unwrap();
 
-    let room_id = RoomId::new("room-lifecycle-1");
+    let room_id = RoomId::new("room-lifecycle-1").unwrap();
 
     // 1. Provision room via POST /admin/rooms -> 201 Created
     let resp = server
@@ -267,21 +267,21 @@ async fn test_control_plane_room_lifecycle() {
 #[tokio::test]
 async fn test_data_plane_handshake_and_1rtt_commit() {
     let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema");
+    let schema_id = SchemaId::new("todo-schema").unwrap();
     let schema = create_test_schema();
     server
         .schema_registry
         .register_schema(schema_id.clone(), schema.clone())
         .unwrap();
 
-    let room_id = RoomId::new("room-dataplane-1");
+    let room_id = RoomId::new("room-dataplane-1").unwrap();
     server
         .room_manager
         .create_room(room_id.clone(), schema_id.clone(), None)
         .await
         .unwrap();
 
-    let client_id = ClientId::new("alice");
+    let client_id = ClientId::new("alice").unwrap();
 
     // 1. Invalid auth_token registration attempt -> 401 Unauthorized
     let reg_msg_bad = ClientMessage::RegisterClient {
@@ -404,22 +404,22 @@ async fn test_data_plane_handshake_and_1rtt_commit() {
 #[tokio::test]
 async fn test_data_plane_sync_and_explicit_ack_pruning() {
     let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema");
+    let schema_id = SchemaId::new("todo-schema").unwrap();
     let schema = create_test_schema();
     server
         .schema_registry
         .register_schema(schema_id.clone(), schema.clone())
         .unwrap();
 
-    let room_id = RoomId::new("room-sync-ack-1");
+    let room_id = RoomId::new("room-sync-ack-1").unwrap();
     server
         .room_manager
         .create_room(room_id.clone(), schema_id.clone(), None)
         .await
         .unwrap();
 
-    let writer = ClientId::new("writer");
-    let reader = ClientId::new("reader");
+    let writer = ClientId::new("writer").unwrap();
+    let reader = ClientId::new("reader").unwrap();
 
     // Pre-register reader so its cursor participates in retention tracking
     let token_reader = generate_client_token(
@@ -595,21 +595,21 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
 #[tokio::test]
 async fn test_data_plane_heartbeat_and_deregister() {
     let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema");
+    let schema_id = SchemaId::new("todo-schema").unwrap();
     let schema = create_test_schema();
     server
         .schema_registry
         .register_schema(schema_id.clone(), schema)
         .unwrap();
 
-    let room_id = RoomId::new("room-hb-dereg");
+    let room_id = RoomId::new("room-hb-dereg").unwrap();
     server
         .room_manager
         .create_room(room_id.clone(), schema_id.clone(), None)
         .await
         .unwrap();
 
-    let client_id = ClientId::new("hb-client");
+    let client_id = ClientId::new("hb-client").unwrap();
     let token = generate_client_token(
         &client_id,
         &room_id,
@@ -710,21 +710,21 @@ async fn test_data_plane_heartbeat_and_deregister() {
 #[tokio::test]
 async fn test_sse_realtime_head_advanced_events() {
     let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema");
+    let schema_id = SchemaId::new("todo-schema").unwrap();
     let schema = create_test_schema();
     server
         .schema_registry
         .register_schema(schema_id.clone(), schema.clone())
         .unwrap();
 
-    let room_id = RoomId::new("room-sse-1");
+    let room_id = RoomId::new("room-sse-1").unwrap();
     server
         .room_manager
         .create_room(room_id.clone(), schema_id.clone(), None)
         .await
         .unwrap();
 
-    let client_id = ClientId::new("writer-sse");
+    let client_id = ClientId::new("writer-sse").unwrap();
     let token = generate_client_token(
         &client_id,
         &room_id,
@@ -806,7 +806,7 @@ async fn test_sse_realtime_head_advanced_events() {
 #[tokio::test]
 async fn test_snapshot_relay_chunked_transfer_and_blake3() {
     let server = TestServer::start().await;
-    let room_id = RoomId::new("room-relay-1");
+    let room_id = RoomId::new("room-relay-1").unwrap();
 
     // 1. Prepare 512 KB synthetic snapshot payload
     let snapshot_bytes = vec![0xABu8; 512 * 1024];
@@ -892,21 +892,21 @@ async fn test_snapshot_relay_chunked_transfer_and_blake3() {
 #[tokio::test]
 async fn test_schema_evolution_cascades_to_active_room() {
     let server = TestServer::start().await;
-    let schema_id = SchemaId::new("evolving-schema");
+    let schema_id = SchemaId::new("evolving-schema").unwrap();
     let schema = create_test_schema();
     server
         .schema_registry
         .register_schema(schema_id.clone(), schema)
         .unwrap();
 
-    let room_id = RoomId::new("room-evolution-cascade");
+    let room_id = RoomId::new("room-evolution-cascade").unwrap();
     server
         .room_manager
         .create_room(room_id.clone(), schema_id.clone(), None)
         .await
         .unwrap();
 
-    let client_id = ClientId::new("writer-evo");
+    let client_id = ClientId::new("writer-evo").unwrap();
     let token = generate_client_token(
         &client_id,
         &room_id,
@@ -997,20 +997,20 @@ async fn test_schema_evolution_cascades_to_active_room() {
 #[tokio::test]
 async fn test_data_plane_auth_enforcement_rejected_without_bearer() {
     let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema");
+    let schema_id = SchemaId::new("todo-schema").unwrap();
     server
         .schema_registry
         .register_schema(schema_id.clone(), create_test_schema())
         .unwrap();
 
-    let room_id = RoomId::new("room-auth-test");
+    let room_id = RoomId::new("room-auth-test").unwrap();
     server
         .room_manager
         .create_room(room_id.clone(), schema_id, None)
         .await
         .unwrap();
 
-    let client_id = ClientId::new("anonymous");
+    let client_id = ClientId::new("anonymous").unwrap();
 
     // 1. Commit without Authorization header -> 401 Unauthorized
     let commit_msg = ClientMessage::Commit {
@@ -1111,20 +1111,20 @@ async fn test_data_plane_auth_enforcement_rejected_without_bearer() {
 #[tokio::test]
 async fn test_data_plane_auth_token_tampered_or_expired() {
     let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema");
+    let schema_id = SchemaId::new("todo-schema").unwrap();
     server
         .schema_registry
         .register_schema(schema_id.clone(), create_test_schema())
         .unwrap();
 
-    let room_id = RoomId::new("room-tamper-test");
+    let room_id = RoomId::new("room-tamper-test").unwrap();
     server
         .room_manager
         .create_room(room_id.clone(), schema_id, None)
         .await
         .unwrap();
 
-    let client_id = ClientId::new("alice");
+    let client_id = ClientId::new("alice").unwrap();
 
     // 1. Expired token (0 TTL) -> 401 Unauthorized
     let expired_token = generate_client_token(
@@ -1175,14 +1175,14 @@ async fn test_data_plane_auth_token_tampered_or_expired() {
 #[tokio::test]
 async fn test_data_plane_room_path_token_and_payload_mismatch_rejected() {
     let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema");
+    let schema_id = SchemaId::new("todo-schema").unwrap();
     server
         .schema_registry
         .register_schema(schema_id.clone(), create_test_schema())
         .unwrap();
 
-    let room_a = RoomId::new("room-A");
-    let room_b = RoomId::new("room-B");
+    let room_a = RoomId::new("room-a").unwrap();
+    let room_b = RoomId::new("room-b").unwrap();
     server
         .room_manager
         .create_room(room_a.clone(), schema_id.clone(), None)
@@ -1194,7 +1194,7 @@ async fn test_data_plane_room_path_token_and_payload_mismatch_rejected() {
         .await
         .unwrap();
 
-    let client_id = ClientId::new("alice");
+    let client_id = ClientId::new("alice").unwrap();
     // Token issued for room_a
     let token_a = generate_client_token(
         &client_id,
@@ -1244,7 +1244,7 @@ async fn test_data_plane_room_path_token_and_payload_mismatch_rejected() {
     assert_ne!(resp2.status(), StatusCode::OK);
 
     // 3. Client Impersonation: Token is for alice, but payload says bob
-    let bob_id = ClientId::new("bob");
+    let bob_id = ClientId::new("bob").unwrap();
     let commit_msg_impersonate = ClientMessage::Commit {
         correlation_id: CorrelationId::new(3),
         room_id: room_a.clone(),
@@ -1268,20 +1268,20 @@ async fn test_data_plane_room_path_token_and_payload_mismatch_rejected() {
 #[tokio::test]
 async fn test_data_plane_dev_token_backdoor_eliminated() {
     let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema");
+    let schema_id = SchemaId::new("todo-schema").unwrap();
     server
         .schema_registry
         .register_schema(schema_id.clone(), create_test_schema())
         .unwrap();
 
-    let room_id = RoomId::new("room-backdoor-test");
+    let room_id = RoomId::new("room-backdoor-test").unwrap();
     server
         .room_manager
         .create_room(room_id.clone(), schema_id, None)
         .await
         .unwrap();
 
-    let client_id = ClientId::new("hacker");
+    let client_id = ClientId::new("hacker").unwrap();
 
     // Register attempt using "dev-token" -> 401 Unauthorized
     let reg_msg = ClientMessage::RegisterClient {
@@ -1325,20 +1325,20 @@ async fn test_data_plane_dev_token_backdoor_eliminated() {
 #[tokio::test]
 async fn test_sse_events_auth_header_and_query_param() {
     let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema");
+    let schema_id = SchemaId::new("todo-schema").unwrap();
     server
         .schema_registry
         .register_schema(schema_id.clone(), create_test_schema())
         .unwrap();
 
-    let room_id = RoomId::new("room-sse-auth");
+    let room_id = RoomId::new("room-sse-auth").unwrap();
     server
         .room_manager
         .create_room(room_id.clone(), schema_id, None)
         .await
         .unwrap();
 
-    let client_id = ClientId::new("listener");
+    let client_id = ClientId::new("listener").unwrap();
     let valid_token = generate_client_token(
         &client_id,
         &room_id,
@@ -1403,7 +1403,9 @@ async fn test_admin_get_room_non_existent_returns_404_without_spawning() {
         "Room directory should not have been created for non-existent room query"
     );
     assert!(
-        !server.room_manager.room_exists(&RoomId::new(ghost_id)),
+        !server
+            .room_manager
+            .room_exists(&RoomId::new(ghost_id).unwrap()),
         "Room should not exist in room manager"
     );
 }
@@ -1411,7 +1413,7 @@ async fn test_admin_get_room_non_existent_returns_404_without_spawning() {
 #[tokio::test]
 async fn test_sse_schema_reloaded_event_emission() {
     let server = TestServer::start().await;
-    let schema_id = SchemaId::new("schema-reload-sse");
+    let schema_id = SchemaId::new("schema-reload-sse").unwrap();
     let admin_auth = format!("Bearer {}", server.config.admin_secret);
 
     // 1. Register base schema
@@ -1428,7 +1430,7 @@ async fn test_sse_schema_reloaded_event_emission() {
         .unwrap();
 
     // 2. Create room
-    let room_id = RoomId::new("room-schema-sse");
+    let room_id = RoomId::new("room-schema-sse").unwrap();
     server
         .client
         .post(format!("{}/admin/rooms", server.base_url))
@@ -1443,7 +1445,7 @@ async fn test_sse_schema_reloaded_event_emission() {
         .unwrap();
 
     // 3. Connect SSE listener
-    let client_id = ClientId::new("sse-schema-listener");
+    let client_id = ClientId::new("sse-schema-listener").unwrap();
     let token = generate_client_token(
         &client_id,
         &room_id,
@@ -1508,8 +1510,8 @@ fn test_client_lease_disconnected_to_dormant_timeout() {
     let roster_path = dir.path().join("clients.json");
     let mut tracker = ClientLeaseTracker::open_or_create(&roster_path).unwrap();
 
-    let alice = ClientId::new("alice");
-    let bob = ClientId::new("bob");
+    let alice = ClientId::new("alice").unwrap();
+    let bob = ClientId::new("bob").unwrap();
     let lease_timeout = Duration::from_secs(5);
     let tail_seq = SequenceNumber::new(0);
 
@@ -1567,23 +1569,23 @@ fn test_client_lease_disconnected_to_dormant_timeout() {
 #[tokio::test]
 async fn test_commit_ack_catchup_ops_content_ordering_and_contiguity() {
     let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema-catchup");
+    let schema_id = SchemaId::new("todo-schema-catchup").unwrap();
     let schema = create_test_schema();
     server
         .schema_registry
         .register_schema(schema_id.clone(), schema.clone())
         .unwrap();
 
-    let room_id = RoomId::new("room-catchup-contiguity-1");
+    let room_id = RoomId::new("room-catchup-contiguity-1").unwrap();
     server
         .room_manager
         .create_room(room_id.clone(), schema_id.clone(), None)
         .await
         .unwrap();
 
-    let client_alpha = ClientId::new("writer-alpha");
-    let client_beta = ClientId::new("writer-beta");
-    let client_gamma = ClientId::new("writer-gamma");
+    let client_alpha = ClientId::new("writer-alpha").unwrap();
+    let client_beta = ClientId::new("writer-beta").unwrap();
+    let client_gamma = ClientId::new("writer-gamma").unwrap();
 
     let token_alpha = generate_client_token(
         &client_alpha,

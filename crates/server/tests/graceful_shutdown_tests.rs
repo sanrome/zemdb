@@ -68,18 +68,18 @@ async fn shutdown_ends_sse_streams_and_persists_rosters() {
     );
 
     let schema = test_schema();
-    let schema_id = SchemaId::new("todo");
+    let schema_id = SchemaId::new("todo").unwrap();
     schema_registry
         .register_schema(schema_id.clone(), schema.clone())
         .unwrap();
-    let room_id = RoomId::new("room-shutdown");
+    let room_id = RoomId::new("room-shutdown").unwrap();
     room_manager
         .create_room(room_id.clone(), schema_id, None)
         .await
         .unwrap();
 
     // A client whose latest cursor is only in memory when the shutdown starts.
-    let client_id = ClientId::new("writer");
+    let client_id = ClientId::new("writer").unwrap();
     let sender = room_manager.get_or_spawn(&room_id, None).await.unwrap();
     let (tx, rx) = oneshot::channel();
     sender

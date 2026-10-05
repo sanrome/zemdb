@@ -31,7 +31,7 @@ fn insert(seq: u64) -> SequencedOperation {
 #[tokio::test]
 async fn failed_wal_sync_marks_room_failed_until_reopened() {
     let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("sync-failure");
+    let room = RoomId::new("sync-failure").unwrap();
     let options = DiskStorageOptions::new(dir.path()).auto_compact(false);
     let engine = DiskStorageEngine::new(options.clone());
     engine.open_room(&room, schema()).await.unwrap();

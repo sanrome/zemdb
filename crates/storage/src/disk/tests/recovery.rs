@@ -85,7 +85,7 @@ fn append_batch(path: &Path, ops: &[SequencedOperation]) {
 #[tokio::test]
 async fn crash_while_folding_compacting_wal_recovers_all_data() {
     let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("fold-crash");
+    let room = RoomId::new("fold-crash").unwrap();
     leave_orphan_compacting(dir.path(), &room).await;
 
     let engine = engine_at(dir.path());
@@ -99,7 +99,7 @@ async fn crash_while_folding_compacting_wal_recovers_all_data() {
 #[tokio::test]
 async fn crash_before_compacting_wal_removal_recovers_all_data() {
     let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("cleanup-crash");
+    let room = RoomId::new("cleanup-crash").unwrap();
     leave_orphan_compacting(dir.path(), &room).await;
 
     let engine = engine_at(dir.path());
@@ -113,7 +113,7 @@ async fn crash_before_compacting_wal_removal_recovers_all_data() {
 #[tokio::test]
 async fn recovered_compacting_wal_is_folded_and_removed() {
     let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("fold-ok");
+    let room = RoomId::new("fold-ok").unwrap();
     leave_orphan_compacting(dir.path(), &room).await;
 
     let engine = engine_at(dir.path());
@@ -134,7 +134,7 @@ async fn recovered_compacting_wal_is_folded_and_removed() {
 #[tokio::test]
 async fn replay_skips_records_already_applied() {
     let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("duplicate-replay");
+    let room = RoomId::new("duplicate-replay").unwrap();
     let engine = engine_at(dir.path());
     let wal_path = engine.wal_file_path(&room);
 
@@ -162,7 +162,7 @@ async fn replay_skips_records_already_applied() {
 #[tokio::test]
 async fn replay_rejects_sequence_gap() {
     let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("gap-replay");
+    let room = RoomId::new("gap-replay").unwrap();
     let engine = engine_at(dir.path());
     let wal_path = engine.wal_file_path(&room);
 

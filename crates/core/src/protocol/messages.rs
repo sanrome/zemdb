@@ -21,6 +21,8 @@ pub enum ErrorCode {
     SchemaNotFound,
     InvalidSequence,
     ProtocolVersionMismatch,
+    /// The request is malformed or carries an invalid value (for example an invalid ID).
+    BadRequest,
 }
 
 /// An operation ordered by the coordination server with assigned sequence ID.

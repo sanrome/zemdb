@@ -15,8 +15,8 @@ pub use actor::{
 };
 pub use api::{
     build_router, generate_client_token, serve_until_shutdown, verify_client_token,
-    verify_client_token_bound, AdminAuth, AppState, ClientAuth, ShutdownSignal,
-    VerifiedClientToken, SHUTDOWN_GRACE_PERIOD,
+    verify_client_token_bound, AdminAuth, AppState, ShutdownSignal, VerifiedClientToken,
+    SHUTDOWN_GRACE_PERIOD,
 };
 pub use config::ServerConfig;
 pub use dedup::DedupLruCache;

@@ -1,4 +1,4 @@
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,7 @@ use zemdb_core::schema::{ColumnDef, Schema};
 use crate::actor::command::{RoomCommand, RoomMetrics};
 use crate::actor::manager::RoomMetadata;
 use crate::api::auth::AdminAuth;
+use crate::api::extract::{AdminJson, AdminPath};
 use crate::api::router::AppState;
 use crate::error::ServerError;
 use crate::log::RoomLifecyclePolicy;
@@ -40,7 +41,7 @@ pub struct CreateRoomRequest {
 pub async fn create_schema(
     _auth: AdminAuth,
     State(state): State<AppState>,
-    Json(req): Json<CreateSchemaRequest>,
+    AdminJson(req): AdminJson<CreateSchemaRequest>,
 ) -> Result<(StatusCode, Json<Schema>), ServerError> {
     let schema_arc = state
         .schema_registry
@@ -52,9 +53,8 @@ pub async fn create_schema(
 pub async fn get_schema(
     _auth: AdminAuth,
     State(state): State<AppState>,
-    Path(schema_id): Path<String>,
+    AdminPath(sid): AdminPath<SchemaId>,
 ) -> Result<Json<Schema>, ServerError> {
-    let sid = SchemaId::new(schema_id);
     let schema = state
         .schema_registry
         .get_schema(&sid)
@@ -67,10 +67,9 @@ pub async fn get_schema(
 pub async fn add_column(
     _auth: AdminAuth,
     State(state): State<AppState>,
-    Path(schema_id): Path<String>,
-    Json(req): Json<AddColumnRequest>,
+    AdminPath(sid): AdminPath<SchemaId>,
+    AdminJson(req): AdminJson<AddColumnRequest>,
 ) -> Result<Json<Schema>, ServerError> {
-    let sid = SchemaId::new(schema_id);
     let updated = state
         .schema_registry
         .add_column(&sid, &req.table_name, req.column)?;
@@ -88,7 +87,7 @@ pub async fn add_column(
 pub async fn create_room(
     _auth: AdminAuth,
     State(state): State<AppState>,
-    Json(req): Json<CreateRoomRequest>,
+    AdminJson(req): AdminJson<CreateRoomRequest>,
 ) -> Result<(StatusCode, Json<RoomMetadata>), ServerError> {
     let meta = state
         .room_manager
@@ -101,11 +100,10 @@ pub async fn create_room(
 pub async fn get_room(
     _auth: AdminAuth,
     State(state): State<AppState>,
-    Path(room_id): Path<String>,
+    AdminPath(rid): AdminPath<RoomId>,
 ) -> Result<Json<RoomMetrics>, ServerError> {
-    let rid = RoomId::new(room_id.clone());
     if !state.room_manager.room_exists(&rid) {
-        return Err(ServerError::RoomNotFound(room_id));
+        return Err(ServerError::RoomNotFound(rid.to_string()));
     }
     let sender = state.room_manager.get_or_spawn(&rid, None).await?;
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -124,9 +122,8 @@ pub async fn get_room(
 pub async fn delete_room(
     _auth: AdminAuth,
     State(state): State<AppState>,
-    Path(room_id): Path<String>,
+    AdminPath(rid): AdminPath<RoomId>,
 ) -> Result<StatusCode, ServerError> {
-    let rid = RoomId::new(room_id);
     state.room_manager.delete_room(&rid).await?;
     Ok(StatusCode::NO_CONTENT)
 }

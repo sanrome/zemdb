@@ -34,7 +34,20 @@ impl SchemaRegistry {
             }
             if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    let schema_id = SchemaId::new(stem);
+                    // A file whose name is not a schema id was not written by the registry
+                    // (macOS `._*` metadata, manual backups such as `todo.old.json`): skip it.
+                    // A validly named file with corrupt content still fails the startup.
+                    let schema_id = match SchemaId::new(stem) {
+                        Ok(id) => id,
+                        Err(err) => {
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %err,
+                                "Ignoring schema file whose name is not a valid schema id"
+                            );
+                            continue;
+                        }
+                    };
                     let content = fs::read_to_string(&path)?;
                     let schema: Schema = serde_json::from_str(&content).map_err(|e| {
                         ServerError::Serialization(format!(

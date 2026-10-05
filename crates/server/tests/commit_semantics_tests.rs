@@ -49,7 +49,7 @@ fn long_retention_policy() -> RoomLifecyclePolicy {
 async fn spawn_room(policy: RoomLifecyclePolicy) -> TestRoom {
     let dir = tempdir().unwrap();
     let schema_registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
-    let schema_id = SchemaId::new("tasks-schema");
+    let schema_id = SchemaId::new("tasks-schema").unwrap();
     let schema = create_test_schema();
     schema_registry
         .register_schema(schema_id.clone(), schema.clone())
@@ -62,7 +62,7 @@ async fn spawn_room(policy: RoomLifecyclePolicy) -> TestRoom {
     });
     let relay = Arc::new(SnapshotRelay::new_in_memory(Duration::from_secs(60)));
     let manager = RoomManager::new(config, schema_registry, relay);
-    let room_id = RoomId::new("commit-room");
+    let room_id = RoomId::new("commit-room").unwrap();
     let sender = manager
         .get_or_spawn_with_policy(&room_id, Some(&schema_id), policy)
         .await
@@ -82,7 +82,7 @@ impl TestRoom {
         let (tx, rx) = oneshot::channel();
         self.sender
             .send(RoomCommand::RegisterClient {
-                client_id: ClientId::new(client),
+                client_id: ClientId::new(client).unwrap(),
                 current_seq: None,
                 reply: tx,
             })
@@ -109,7 +109,7 @@ impl TestRoom {
         let (tx, rx) = oneshot::channel();
         self.sender
             .send(RoomCommand::Commit {
-                client_id: ClientId::new(client),
+                client_id: ClientId::new(client).unwrap(),
                 mutation_id: MutationId::new([mutation; 16]),
                 last_ack_seq: SequenceNumber::new(last_ack_seq),
                 op,

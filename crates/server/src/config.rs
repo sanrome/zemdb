@@ -85,7 +85,35 @@ impl Default for ServerConfig {
     }
 }
 
+/// Minimum length, in bytes, of the client token secret and the admin secret.
+pub const MIN_SECRET_LEN: usize = 32;
+
 impl ServerConfig {
+    /// Checks that the configured secrets are safe to serve with.
+    ///
+    /// Rejects empty secrets, secrets shorter than [`MIN_SECRET_LEN`] bytes, the built-in
+    /// development defaults (they are public in the source code, so anyone could mint client
+    /// tokens or act as admin), and an admin secret equal to the client token secret (whoever
+    /// can issue client tokens would also be admin). Error messages never include the secrets.
+    pub fn validate_secrets(&self) -> Result<(), ServerError> {
+        check_secret(
+            "auth_secret (ZEMDB_AUTH_SECRET)",
+            &self.auth_secret,
+            &default_auth_secret(),
+        )?;
+        check_secret(
+            "admin_secret (ZEMDB_ADMIN_SECRET)",
+            &self.admin_secret,
+            &default_admin_secret(),
+        )?;
+        if self.auth_secret == self.admin_secret {
+            return Err(ServerError::Config(
+                "auth_secret and admin_secret must be different".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Parse configuration from a TOML string.
     pub fn from_toml_str(toml_str: &str) -> Result<Self, ServerError> {
         toml::from_str(toml_str).map_err(|e| ServerError::Config(e.to_string()))
@@ -141,6 +169,28 @@ impl ServerConfig {
             None => Self::default(),
         };
         config.apply_env_overrides();
+        config.validate_secrets()?;
         Ok(config)
     }
 }
+
+fn check_secret(name: &str, value: &str, development_default: &str) -> Result<(), ServerError> {
+    if value.is_empty() {
+        return Err(ServerError::Config(format!("{name} must be set")));
+    }
+    if value == development_default {
+        return Err(ServerError::Config(format!(
+            "{name} is the built-in development value, which is public; set a private secret"
+        )));
+    }
+    if value.len() < MIN_SECRET_LEN {
+        return Err(ServerError::Config(format!(
+            "{name} must be at least {MIN_SECRET_LEN} bytes long"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "tests/config.rs"]
+mod tests;

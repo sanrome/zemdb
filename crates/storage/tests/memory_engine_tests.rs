@@ -23,7 +23,7 @@ fn test_schema() -> Schema {
 #[tokio::test]
 async fn test_room_lifecycle() {
     let engine = MemoryStorageEngine::new();
-    let room_id = RoomId::new("room-1");
+    let room_id = RoomId::new("room-1").unwrap();
     let schema = test_schema();
 
     // 1. Open room
@@ -51,7 +51,7 @@ async fn test_room_lifecycle() {
 #[tokio::test]
 async fn test_point_lookup_and_batch_mutation() {
     let engine = MemoryStorageEngine::new();
-    let room_id = RoomId::new("room-point");
+    let room_id = RoomId::new("room-point").unwrap();
     engine.open_room(&room_id, test_schema()).await.unwrap();
 
     let row1 = CompactRow::new(vec![
@@ -136,8 +136,8 @@ async fn test_point_lookup_and_batch_mutation() {
 #[tokio::test]
 async fn test_concurrent_rooms_isolation() {
     let engine = Arc::new(MemoryStorageEngine::new());
-    let room_a = RoomId::new("room-a");
-    let room_b = RoomId::new("room-b");
+    let room_a = RoomId::new("room-a").unwrap();
+    let room_b = RoomId::new("room-b").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_a, schema.clone()).await.unwrap();
@@ -227,7 +227,7 @@ async fn test_concurrent_rooms_isolation() {
 #[tokio::test]
 async fn test_snapshot_create_and_restore() {
     let engine_a = MemoryStorageEngine::new();
-    let room_id = RoomId::new("room-snap");
+    let room_id = RoomId::new("room-snap").unwrap();
     let schema = test_schema();
     engine_a.open_room(&room_id, schema.clone()).await.unwrap();
 
@@ -269,7 +269,7 @@ async fn test_snapshot_create_and_restore() {
 #[tokio::test]
 async fn test_sequence_mismatch_rejected() {
     let engine = MemoryStorageEngine::new();
-    let room_id = RoomId::new("seq_test");
+    let room_id = RoomId::new("seq_test").unwrap();
     let schema = test_schema();
     engine.open_room(&room_id, schema).await.unwrap();
 
@@ -299,7 +299,7 @@ async fn test_sequence_mismatch_rejected() {
 #[tokio::test]
 async fn test_dynamic_column_update_resizing_memory() {
     let engine = MemoryStorageEngine::new();
-    let room_id = RoomId::new("room-dynamic-col");
+    let room_id = RoomId::new("room-dynamic-col").unwrap();
 
     // Table schema with 4 columns (2 initial + 2 evolved nullable columns)
     let users_table = TableSchema::builder("users")

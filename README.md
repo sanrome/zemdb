@@ -49,6 +49,15 @@ client-distributed-db/
 * Rust 1.78+ (2021 Edition)
 * Cargo
 
+### Running the Server
+The server requires two private secrets of at least 32 bytes each, different from each other. It refuses to start without them:
+```bash
+export ZEMDB_AUTH_SECRET="$(openssl rand -hex 32)"
+export ZEMDB_ADMIN_SECRET="$(openssl rand -hex 32)"
+cargo run -p zemdb-server
+```
+They can also be set in a TOML file passed as the first argument (`auth_secret`, `admin_secret`).
+
 ### Building and Testing
 ```bash
 # Build entire workspace

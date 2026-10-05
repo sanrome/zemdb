@@ -1,33 +1,24 @@
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::{Stream, StreamExt};
 use std::convert::Infallible;
 use std::time::Duration;
 use tokio::sync::broadcast;
-use zemdb_core::id::RoomId;
 
 use crate::actor::command::{RoomCommand, RoomEvent};
-use crate::api::auth::ClientAuth;
+use crate::api::extract::EventStreamAuth;
 use crate::api::router::AppState;
 use crate::error::ServerError;
 
 /// `GET /rooms/:room_id/events`: Signal-only Server-Sent Events (SSE) broadcast channel.
-/// Authenticated via ClientAuth (Bearer token or ?token= query parameter).
+/// Authenticated via `EventStreamAuth` (Bearer token or `?token=` query parameter, issued for
+/// the path room); authentication failures are binary error frames.
 /// Emits `head_advanced` and `schema_reloaded` lightweight signals without transmitting row payloads.
 /// The stream ends when the room actor stops or the server begins shutting down.
 pub async fn room_events(
     State(state): State<AppState>,
-    Path(room_id_str): Path<String>,
-    auth: ClientAuth,
+    EventStreamAuth { room_id, .. }: EventStreamAuth,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ServerError> {
-    // Validate room_id in path matches authenticated token
-    if auth.room_id.as_str() != room_id_str {
-        return Err(ServerError::Config(
-            "RoomId path and token mismatch".to_string(),
-        ));
-    }
-
-    let room_id = RoomId::new(room_id_str);
     let sender = match state.room_manager.get_room(&room_id) {
         Some(s) => s,
         None => state.room_manager.get_or_spawn(&room_id, None).await?,

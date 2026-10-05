@@ -149,7 +149,7 @@ async fn test_disk_wal_crc32_corruption_detection() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
     let engine = DiskStorageEngine::new(options.clone());
-    let room_id = RoomId::new("room-corrupt");
+    let room_id = RoomId::new("room-corrupt").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_id, schema.clone()).await.unwrap();
@@ -196,7 +196,7 @@ async fn test_disk_wal_crc32_torn_write_at_eof_recovers() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
     let engine = DiskStorageEngine::new(options.clone());
-    let room_id = RoomId::new("room-torn-crc");
+    let room_id = RoomId::new("room-torn-crc").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_id, schema.clone()).await.unwrap();
@@ -233,7 +233,7 @@ async fn test_disk_torn_write_recovery() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
     let engine = DiskStorageEngine::new(options.clone());
-    let room_id = RoomId::new("room-torn");
+    let room_id = RoomId::new("room-torn").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_id, schema.clone()).await.unwrap();
@@ -281,7 +281,7 @@ async fn test_disk_room_lifecycle_and_persistence() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
     let engine = DiskStorageEngine::new(options.clone());
-    let room_id = RoomId::new("room-disk-1");
+    let room_id = RoomId::new("room-disk-1").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_id, schema.clone()).await.unwrap();
@@ -409,7 +409,7 @@ async fn test_disk_flock_collision() {
     let engine1 = DiskStorageEngine::new(options.clone());
     let engine2 = DiskStorageEngine::new(options);
 
-    let room_id = RoomId::new("locked-room");
+    let room_id = RoomId::new("locked-room").unwrap();
     let schema = test_schema();
 
     // engine1 opens room and acquires exclusive OS file lock
@@ -436,7 +436,7 @@ async fn test_disk_apply_batch_sequence_mismatch() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
     let engine = DiskStorageEngine::new(options);
-    let room_id = RoomId::new("seq-mismatch");
+    let room_id = RoomId::new("seq-mismatch").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_id, schema).await.unwrap();
@@ -462,7 +462,7 @@ async fn test_disk_blind_update_ignored() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
     let engine = DiskStorageEngine::new(options);
-    let room_id = RoomId::new("blind-update");
+    let room_id = RoomId::new("blind-update").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_id, schema).await.unwrap();
@@ -493,7 +493,7 @@ async fn test_dual_file_storage_layout_and_compaction_truncation() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
     let engine = DiskStorageEngine::new(options.clone());
-    let room_id = RoomId::new("dual-layout");
+    let room_id = RoomId::new("dual-layout").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_id, schema.clone()).await.unwrap();
@@ -559,7 +559,7 @@ async fn test_dynamic_column_update_resizing_disk_and_wal_recovery() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
     let engine = DiskStorageEngine::new(options.clone());
-    let room_id = RoomId::new("dynamic-disk");
+    let room_id = RoomId::new("dynamic-disk").unwrap();
 
     let users_table = TableSchema::builder("users")
         .table_id(USERS_TABLE)
@@ -642,7 +642,7 @@ async fn test_wal_recovery_truncates_zero_filled_tail_at_eof() {
     let options = DiskStorageOptions::new(tmp.path());
 
     let schema = test_schema();
-    let room_id = RoomId::new("zero_tail_room");
+    let room_id = RoomId::new("zero_tail_room").unwrap();
 
     // 1. Open room and write a valid operation
     let engine = DiskStorageEngine::new(options.clone());
@@ -792,7 +792,7 @@ async fn test_wal_replay_skips_operations_before_snapshot_seq() {
     let tmp = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(tmp.path());
     let schema = test_schema();
-    let room_id = RoomId::new("room_skip_snapshot_seq");
+    let room_id = RoomId::new("room_skip_snapshot_seq").unwrap();
 
     // 1. Initialize room and insert row at seq 1
     let engine = DiskStorageEngine::new(options.clone());
@@ -886,7 +886,7 @@ async fn test_snapshot_payload_crc_corruption_detected() {
     let tmp = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(tmp.path());
     let engine = DiskStorageEngine::new(options.clone());
-    let room_id = RoomId::new("room-crc-corruption");
+    let room_id = RoomId::new("room-crc-corruption").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_id, schema.clone()).await.unwrap();
@@ -935,7 +935,7 @@ async fn test_crash_recovery_with_wal_compacting() {
     let tmp = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(tmp.path());
     let engine = DiskStorageEngine::new(options.clone());
-    let room_id = RoomId::new("room-compacting-crash");
+    let room_id = RoomId::new("room-compacting-crash").unwrap();
     let schema = test_schema();
 
     engine.open_room(&room_id, schema.clone()).await.unwrap();
@@ -1040,7 +1040,7 @@ async fn test_crash_recovery_with_wal_compacting() {
 async fn test_multi_thread_flock_concurrency_stress() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
-    let room_id = RoomId::new("stress-flock-room");
+    let room_id = RoomId::new("stress-flock-room").unwrap();
     let schema = test_schema();
 
     const NUM_WORKERS: usize = 16;
@@ -1118,7 +1118,7 @@ async fn test_multi_thread_flock_concurrency_stress() {
 async fn test_empty_batch_writes_nothing_to_wal() {
     let tmp = tempfile::tempdir().unwrap();
     let engine = DiskStorageEngine::new(DiskStorageOptions::new(tmp.path()));
-    let room_id = RoomId::new("empty-batch");
+    let room_id = RoomId::new("empty-batch").unwrap();
     engine.open_room(&room_id, test_schema()).await.unwrap();
     let wal_path = engine.wal_file_path(&room_id);
     let len_before = std::fs::metadata(&wal_path).unwrap().len();
