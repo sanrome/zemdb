@@ -364,4 +364,5 @@ fn read_room_metadata(meta_room_path: &Path) -> Result<RoomMetadata, ServerError
 }
 
 #[cfg(test)]
+#[path = "tests/manager.rs"]
 mod tests;

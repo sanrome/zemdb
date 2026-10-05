@@ -113,4 +113,5 @@ impl SchemaRegistry {
 }
 
 #[cfg(test)]
+#[path = "tests/schema_registry.rs"]
 mod tests;

@@ -405,4 +405,5 @@ pub(crate) fn sync_parent(path: &Path) -> Result<(), StorageError> {
 }
 
 #[cfg(test)]
+#[path = "tests/compactor.rs"]
 mod tests;

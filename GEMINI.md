@@ -6,11 +6,14 @@ No incluir identificadores ni referencias a códigos de auditoría (por ejemplo,
 
 Los tests nunca se escriben dentro de los archivos de código funcional. Hay dos niveles:
 
-- **Tests unitarios** (pueden acceder a elementos privados): van en un archivo separado `src/.../<modulo>/tests.rs`. El archivo fuente solo contiene, al final, la declaración:
+- **Tests unitarios** (pueden acceder a elementos privados): cada carpeta de `src/` tiene una subcarpeta `tests/`, y los tests del módulo `X` van en `tests/X.rs` dentro de la misma carpeta donde vive `X`. Por ejemplo, los de `src/actor/room.rs` van en `src/actor/tests/room.rs`, y los de `src/durable.rs` en `src/tests/durable.rs`. El archivo fuente solo contiene, al final, la declaración:
   ```rust
   #[cfg(test)]
+  #[path = "tests/room.rs"]
   mod tests;
   ```
+  `#[path]` se resuelve relativo a la carpeta del archivo fuente, y el módulo `tests` sigue siendo hijo del módulo que prueba (por eso, con `use super::*;`, ve sus elementos privados). Un módulo que es una carpeta con `mod.rs` se trata como si fuera un archivo de su carpeta padre: los tests de `src/disk/mod.rs` van en `src/tests/disk.rs`, con `#[path = "../tests/disk.rs"]`.
+  No se usa un único `mod tests` en el `mod.rs` de la carpeta para agrupar los tests de varios módulos: así los tests dejarían de ser hijos de cada módulo y perderían acceso a sus elementos privados.
   Se usan para invariantes internos, estados intermedios e inyección de fallos.
 - **Tests de integración** (solo API pública): van en `crates/<crate>/tests/`. Se usan para el comportamiento observable desde fuera del crate.
 

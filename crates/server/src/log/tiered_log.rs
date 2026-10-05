@@ -580,4 +580,5 @@ fn read_pruned_through_seq(dir: &Path) -> Result<SequenceNumber, ServerError> {
 }
 
 #[cfg(test)]
+#[path = "tests/tiered_log.rs"]
 mod tests;

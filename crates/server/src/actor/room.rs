@@ -576,4 +576,5 @@ impl RoomActor {
 }
 
 #[cfg(test)]
+#[path = "tests/room.rs"]
 mod tests;

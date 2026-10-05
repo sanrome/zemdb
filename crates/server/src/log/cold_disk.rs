@@ -168,4 +168,5 @@ impl ColdDiskLog {
 }
 
 #[cfg(test)]
+#[path = "tests/cold_disk.rs"]
 mod tests;

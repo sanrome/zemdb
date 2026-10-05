@@ -350,4 +350,5 @@ pub fn parse_segment_filename(name: &str, extension: &str) -> Option<(u64, u64)>
 }
 
 #[cfg(test)]
+#[path = "tests/warm_disk.rs"]
 mod tests;

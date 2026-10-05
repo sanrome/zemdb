@@ -16,7 +16,7 @@
 **Estados:** ⬜ Pendiente · 🟡 Parcial · ✅ Hecho · ⏸ Diferido (Fase 4) · ❌ Descartado (falso o sin valor)
 
 **Reglas de trabajo** (ver `GEMINI.md`):
-1. Tests según la estructura de dos niveles de `GEMINI.md` (unitarios en `src/.../<modulo>/tests.rs`, integración en `tests/`), con al menos un test negativo que reproduzca el fallo y que falle sin el fix.
+1. Tests según la estructura de dos niveles de `GEMINI.md` (unitarios en la carpeta `tests/` del nivel de `src/` donde vive cada módulo, por ejemplo `src/actor/tests/room.rs`; integración en `crates/<crate>/tests/`), con al menos un test negativo que reproduzca el fallo y que falle sin el fix.
 2. Sin códigos de auditoría (`DEF-xx`) en código, tests ni docstrings.
 3. Cada lote cierra con `cargo test --workspace` y `cargo clippy --workspace --all-targets -- -D warnings` en verde.
 
@@ -70,23 +70,25 @@
 
 ## Reestructuración de tests (transversal)
 
-> Objetivo: aplicar la estructura de dos niveles de `GEMINI.md` (unitarios en `src/.../<modulo>/tests.rs`, integración en `tests/`) y cerrar la visibilidad de los internals que hoy son `pub` solo porque los tests los usan.
+> Objetivo: aplicar la estructura de dos niveles de `GEMINI.md` (unitarios en `src/<carpeta>/tests/<modulo>.rs`, declarados con `#[path]`; integración en `crates/<crate>/tests/`) y cerrar la visibilidad de los internals que hoy son `pub` solo porque los tests los usan.
 
 **Estado actual** (19 archivos, ~170 tests, todos en `tests/`):
 - Varios tests de integración del servidor importan internals directamente (`zemdb_server::log::`, `actor::lease`, `actor::command`, `dedup`, `relay`, `api::router`, etc.), y por eso todos los módulos del servidor son `pub mod`.
 - `server_integration_tests.rs` (1844 líneas) y `room_actor_tests.rs` (999) mezclan temas distintos.
 
+**Cambio de estructura (4 de octubre de 2026).** Los tests unitarios escritos en los Lotes 1 a 3 estaban en `src/.../<modulo>/tests.rs`, lo que dejaba una carpeta con el mismo nombre que cada archivo fuente y un único `tests.rs` adentro. Se migraron los 11 archivos a una carpeta `tests/` por nivel de `src/` (`src/actor/tests/room.rs`, `src/log/tests/tiered_log.rs`, `src/disk/tests/compactor.rs`, etc.), declarados con `#[path]`; se verificó que se ejecuta exactamente la misma cantidad de tests (49 en server, 13 en storage).
+
 **Estrategia: incremental, no un big-bang.**
 1. **Tests nuevos** del plan: los que verifican invariantes internos van directamente como unitarios (por ejemplo `compute_tail_seq`, `HotBuffer::get_range`, los estados de la compactación y los puntos de fallo).
-2. **Al tocar un módulo** en un lote, sus tests existentes que dependen de internals se mueven a `src/.../<modulo>/tests.rs`, y el módulo pasa a `pub(crate)` si ya nadie fuera del crate lo usa.
+2. **Al tocar un módulo** en un lote, sus tests existentes que dependen de internals se mueven a `src/<carpeta>/tests/<modulo>.rs`, y el módulo pasa a `pub(crate)` si ya nadie fuera del crate lo usa.
 3. **Al final de la fase**, en un paso dedicado: revisar lo que quede, dividir los archivos grandes de integración por tema (sync, commit, onboarding, relay, auth) y ajustar las visibilidades restantes.
 
 **Clasificación tentativa** (se confirma al tocar cada módulo):
 
 | Archivo actual | Destino |
 |---|---|
-| `server/tests/tiered_log_tests.rs`, `unified_wal_tests.rs` | Unitarios en `server/src/log/` |
-| Partes de `room_actor_tests.rs` que usan `RoomCommand` y el lease tracker | Unitarios en `server/src/actor/` |
+| `server/tests/tiered_log_tests.rs`, `unified_wal_tests.rs` | Unitarios en `server/src/log/tests/` |
+| Partes de `room_actor_tests.rs` que usan `RoomCommand` y el lease tracker | Unitarios en `server/src/actor/tests/` |
 | `server_integration_tests.rs`, `room_lifecycle_resilience_tests.rs`, `snapshot_relay_tests.rs`, `auth_tests.rs` | Integración (HTTP / API pública); dividir por tema |
 | `storage/tests/*` | Mayormente integración (usan la API de `StorageEngine` y archivos en disco). `format::` pasa a unitario |
 | `core/tests/*` | Integración (API pública de core); `wal_frame_tests` se revisa con DEF-25 |

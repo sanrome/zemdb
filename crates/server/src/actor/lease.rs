@@ -372,4 +372,5 @@ fn advance_monotonic(entry: &mut ClientEntry, seq: SequenceNumber) -> bool {
 }
 
 #[cfg(test)]
+#[path = "tests/lease.rs"]
 mod tests;

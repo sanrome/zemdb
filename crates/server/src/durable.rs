@@ -80,4 +80,5 @@ fn injected(name: &'static str, path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+#[path = "tests/durable.rs"]
 mod tests;

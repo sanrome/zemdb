@@ -625,4 +625,5 @@ impl StorageEngine for DiskStorageEngine {
 }
 
 #[cfg(test)]
+#[path = "../tests/disk.rs"]
 mod tests;

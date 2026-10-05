@@ -441,4 +441,5 @@ pub async fn recover_room(
 }
 
 #[cfg(test)]
+#[path = "tests/recovery.rs"]
 mod tests;
