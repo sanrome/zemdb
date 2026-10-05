@@ -108,7 +108,7 @@
 > Objetivo: que `/sync` y `/commit` nunca entreguen huecos de secuencia ni rechacen ilegítimamente a clientes cuyos deltas existen en disco.
 > Orden interno obligatorio: DEF-07 y DEF-58 antes de dar por cerrado DEF-01.
 
-#### DEF-01 · Crítico · ✅ Hecho (eb8baa6 + 8a0d36b + este lote)
+#### DEF-01 · Crítico · ✅ Hecho (eb8baa6 + a8ecdb3 + este lote)
 **Problema.** Cuando el `HotBuffer` desalojaba ops por TTL, `fetch_deltas` servía desde RAM saltando lo que estaba en `active.wal`, entregando huecos de secuencia. El disparador realista es el TTL (5 min), no la cuota: rotación y cuota usan el mismo umbral.
 **Hecho en eb8baa6.** `get_range` rechaza cursores anteriores a la RAM; los tiers se leen en orden cronológico (cold → sealed → active → RAM); los límites entre tiers y los solapes están bien manejados.
 **Falta.**
@@ -122,17 +122,17 @@
 #### DEF-36 · Bajo · ✅ Hecho (eb8baa6)
 Off-by-one del fast path (`from_seq + 1 >= min_ram`). Solo costaba rendimiento.
 
-#### DEF-07 · Alto · ✅ Hecho (8a0d36b)
+#### DEF-07 · Alto · ✅ Hecho (a8ecdb3)
 **Problema.** `prune_and_update_tail` y `prune_older_than` (código duplicado) calculan `tail_seq` como cold → sealed → `min_ram`, salteando `active.wal`. Si la RAM desalojó por TTL, `tail_seq` salta y se rechaza con `BehindCompaction` a clientes cuyos deltas están en disco.
 **Solución.** Una única función `compute_tail_seq()` usada por ambas rutas: `primer cold.start` → `primer sealed.start` → `active_start_seq` → `head + 1` (ver DEF-58). Sin `.min(min_ram)`: si no hay segmentos sellados, toda op en RAM está también en `active.wal`, así que `active_start` ya es el mínimo.
 **Test.** Desalojo TTL + mantenimiento → `tail_seq == active_start` y un cliente con cursor en `active.wal` sincroniza sin `BehindCompaction`.
 
-#### DEF-58 · Alto · ✅ Hecho (8a0d36b) (nuevo)
+#### DEF-58 · Alto · ✅ Hecho (a8ecdb3) (nuevo)
 **Problema.** Con el log vacío (todo podado), `tail_seq = head_seq`. La guarda es `from < tail - 1`, así que un cliente en `head - 1` pasa, recibe una respuesta vacía con `has_more = false` y **nunca recibe la op `head`**. Alcanzable tras poda por TTL/cuota del cold tier o una vez aplicado DEF-37.
 **Solución.** Con el log vacío, `tail_seq = head + 1` (incluido en `compute_tail_seq`).
 **Test.** Podar todo → cliente en `head - 1` recibe `BehindCompaction`; cliente en `head` recibe vacío.
 
-#### DEF-59 · Medio · ✅ Hecho (8a0d36b) (nuevo)
+#### DEF-59 · Medio · ✅ Hecho (a8ecdb3) (nuevo)
 **Problema.** Si `active.wal` existe pero está vacío al abrir la sala (crash, o torn write truncado a 0), `inspect_active_segment` fija `active_file` y `append_record` (`warm_disk.rs`) nunca fija `active_start_seq`. Consecuencias: `active_ops_count()` queda en 0, el archivo nunca rota, y DEF-07 deja de funcionar.
 **Solución.** `append_record` fija `active_start_seq` cuando el segmento activo no tiene ops, independientemente de si el archivo ya estaba abierto.
 **Test.** Abrir sala con `active.wal` de 0 bytes → appends → `active_start_seq` correcto y rotación al llegar a la cuota.
