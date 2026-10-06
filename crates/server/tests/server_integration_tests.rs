@@ -34,8 +34,10 @@ impl TestServer {
             auth_secret: "test_cluster_secret_key_12345678".to_string(),
             admin_secret: "test_admin_secret_key_123456789".to_string(),
             lease_timeout_secs: 60,
+            dormant_after_secs: None,
             dedup_lru_capacity: 1000,
             snapshot_ttl_secs: 60,
+            snapshot_demand_ttl_secs: 60,
             max_snapshot_bytes: 16 * 1024 * 1024,
         });
 
@@ -663,9 +665,14 @@ async fn test_data_plane_heartbeat_and_deregister() {
     let hb_ack: ServerMessage = decode_message(&hb_bytes).unwrap();
     match hb_ack {
         ServerMessage::HeartbeatAck {
-            current_head_seq, ..
+            current_head_seq,
+            snapshot_wanted,
+            active_snapshot_seq,
+            ..
         } => {
             assert_eq!(current_head_seq, SequenceNumber::new(0));
+            assert!(!snapshot_wanted);
+            assert_eq!(active_snapshot_seq, None);
         }
         other => panic!("Expected HeartbeatAck, got {:?}", other),
     }
@@ -1581,7 +1588,7 @@ fn test_client_lease_disconnected_to_dormant_timeout() {
     if let Some(entry) = tracker.get_client_mut(&alice) {
         entry.last_heartbeat = Instant::now() - Duration::from_secs(6);
     }
-    let modified = tracker.check_timeouts(lease_timeout, tail_seq);
+    let modified = tracker.check_timeouts(lease_timeout, None, tail_seq);
     assert!(modified);
     assert_eq!(
         tracker.get_client(&alice).unwrap().state,
@@ -1595,15 +1602,24 @@ fn test_client_lease_disconnected_to_dormant_timeout() {
         "Disconnected client must block proactive pruning"
     );
 
-    // 2. Simulate prolonged disconnection (> 90s) -> transitions to Dormant
+    // 2. A prolonged disconnection alone keeps alice Disconnected: her cursor is still
+    // inside the retained log, so she can catch up from it.
     if let Some(entry) = tracker.get_client_mut(&alice) {
         entry.last_heartbeat = Instant::now() - Duration::from_secs(95);
     }
-    let modified2 = tracker.check_timeouts(lease_timeout, tail_seq);
+    assert!(!tracker.check_timeouts(lease_timeout, None, tail_seq));
+    assert_eq!(
+        tracker.get_client(&alice).unwrap().state,
+        ClientState::Disconnected
+    );
+
+    // 3. With a dormancy timeout configured, the same disconnection makes her Dormant.
+    let modified2 = tracker.check_timeouts(lease_timeout, Some(Duration::from_secs(90)), tail_seq);
     assert!(modified2);
-    assert!(
-        tracker.is_dormant(&alice),
-        "Alice should transition to Dormant after 90s of disconnection"
+    assert_eq!(
+        tracker.get_client(&alice).unwrap().state,
+        ClientState::Dormant,
+        "Alice should transition to Dormant after the configured dormancy timeout"
     );
 
     // Dormant alice no longer blocks proactive pruning; bob's cursor is returned
@@ -1678,7 +1694,9 @@ async fn test_commit_ack_catchup_ops_content_ordering_and_contiguity() {
         room_id: room_id.clone(),
         client_id: client_beta.clone(),
         auth_token: token_beta.clone(),
-        current_seq: Some(SequenceNumber::new(2)),
+        // The room is still empty: a cursor can only be reported once it exists. The
+        // cursor that matters below is the one each commit carries.
+        current_seq: None,
     };
     let resp = server
         .client
@@ -1696,7 +1714,9 @@ async fn test_commit_ack_catchup_ops_content_ordering_and_contiguity() {
         room_id: room_id.clone(),
         client_id: client_gamma.clone(),
         auth_token: token_gamma.clone(),
-        current_seq: Some(SequenceNumber::new(6)),
+        // The room is still empty: a cursor can only be reported once it exists. The
+        // cursor that matters below is the one each commit carries.
+        current_seq: None,
     };
     let resp = server
         .client
@@ -1891,4 +1911,282 @@ async fn test_commit_ack_catchup_ops_content_ordering_and_contiguity() {
         }
         other => panic!("Expected CommitAck on idempotent retry, got {:?}", other),
     }
+}
+
+impl TestServer {
+    /// Posts a binary data plane message with a client token and decodes the reply.
+    async fn post_message(
+        &self,
+        room_id: &RoomId,
+        endpoint: &str,
+        token: &str,
+        msg: &ClientMessage,
+    ) -> (StatusCode, ServerMessage) {
+        let resp = self
+            .client
+            .post(format!("{}/rooms/{}/{}", self.base_url, room_id, endpoint))
+            .header(AUTHORIZATION, format!("Bearer {}", token))
+            .header(CONTENT_TYPE, "application/octet-stream")
+            .body(encode_message(msg).unwrap())
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.bytes().await.unwrap();
+        (status, decode_message(&body).unwrap())
+    }
+
+    async fn heartbeat_ack(
+        &self,
+        room_id: &RoomId,
+        client_id: &ClientId,
+        token: &str,
+    ) -> (bool, Option<SequenceNumber>) {
+        let msg = ClientMessage::Heartbeat {
+            correlation_id: CorrelationId::new(90),
+            room_id: room_id.clone(),
+            client_id: client_id.clone(),
+        };
+        match self.post_message(room_id, "heartbeat", token, &msg).await {
+            (
+                StatusCode::OK,
+                ServerMessage::HeartbeatAck {
+                    snapshot_wanted,
+                    active_snapshot_seq,
+                    ..
+                },
+            ) => (snapshot_wanted, active_snapshot_seq),
+            other => panic!("Expected HeartbeatAck, got {:?}", other),
+        }
+    }
+}
+
+/// Reads an SSE byte stream until the received text contains `needle`, returning all of it.
+async fn read_sse_until(
+    stream: &mut (impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin),
+    needle: &str,
+) -> String {
+    let mut text = String::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !text.contains(needle) {
+            let chunk = stream.next().await.expect("SSE stream closed").unwrap();
+            text.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("SSE never sent {needle:?}; received: {text}"));
+    text
+}
+
+#[tokio::test]
+async fn test_snapshot_demand_signals_over_http_and_sse() {
+    let server = TestServer::start().await;
+    let schema_id = SchemaId::new("todo-schema").unwrap();
+    let schema = create_test_schema();
+    server
+        .schema_registry
+        .register_schema(schema_id.clone(), schema.clone())
+        .unwrap();
+    let room_id = RoomId::new("room-snapshot-signals").unwrap();
+    let small_segments = zemdb_server::RoomLifecyclePolicy {
+        ram_max_ops: 2,
+        ..Default::default()
+    };
+    server
+        .room_manager
+        .create_room(room_id.clone(), schema_id, Some(small_segments))
+        .await
+        .unwrap();
+
+    let token_for = |client_id: &ClientId| {
+        generate_client_token(
+            client_id,
+            &room_id,
+            Duration::from_secs(300),
+            &server.config.auth_secret,
+        )
+    };
+    let register = |client_id: &ClientId, token: &str| ClientMessage::RegisterClient {
+        correlation_id: CorrelationId::new(1),
+        room_id: room_id.clone(),
+        client_id: client_id.clone(),
+        auth_token: token.to_string(),
+        current_seq: None,
+    };
+
+    // 1. The writer commits 1..=8 and acknowledges 8, which prunes the log.
+    let writer = ClientId::new("writer").unwrap();
+    let writer_token = token_for(&writer);
+    let (status, _) = server
+        .post_message(
+            &room_id,
+            "register",
+            &writer_token,
+            &register(&writer, &writer_token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for i in 1..=8u8 {
+        let commit = ClientMessage::Commit {
+            correlation_id: CorrelationId::new(u64::from(i)),
+            room_id: room_id.clone(),
+            client_id: writer.clone(),
+            mutation_id: MutationId::new([i; 16]),
+            last_ack_seq: SequenceNumber::new(0),
+            op: create_insert_op(&schema, i64::from(i), "task"),
+        };
+        let (status, _) = server
+            .post_message(&room_id, "commit", &writer_token, &commit)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let ack = ClientMessage::Ack {
+        correlation_id: CorrelationId::new(20),
+        room_id: room_id.clone(),
+        client_id: writer.clone(),
+        ack_seq: SequenceNumber::new(8),
+    };
+    let (status, _) = server
+        .post_message(&room_id, "ack", &writer_token, &ack)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let sse_resp = server
+        .client
+        .get(format!("{}/rooms/{}/events", server.base_url, room_id))
+        .header(AUTHORIZATION, format!("Bearer {}", writer_token))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sse_resp.status(), StatusCode::OK);
+    let mut stream = sse_resp.bytes_stream();
+
+    // 2. A new client registers in the pruned room: it must bootstrap from a snapshot, and
+    // there is none, so the writer is asked for one.
+    let newcomer = ClientId::new("newcomer").unwrap();
+    let newcomer_token = token_for(&newcomer);
+    match server
+        .post_message(
+            &room_id,
+            "register",
+            &newcomer_token,
+            &register(&newcomer, &newcomer_token),
+        )
+        .await
+    {
+        (StatusCode::OK, ServerMessage::Registered { tail_seq, .. }) => {
+            assert!(tail_seq > SequenceNumber::new(1), "tail {tail_seq}")
+        }
+        other => panic!("Expected Registered, got {:?}", other),
+    }
+    let text = read_sse_until(&mut stream, "event: snapshot_wanted").await;
+    assert!(
+        text.contains("event: snapshot_wanted\ndata: \n"),
+        "snapshot_wanted carries an empty data line: {text:?}"
+    );
+
+    // The bootstrapping client's heartbeat succeeds; only the writer is asked to upload.
+    assert_eq!(
+        server
+            .heartbeat_ack(&room_id, &newcomer, &newcomer_token)
+            .await,
+        (false, None)
+    );
+    assert_eq!(
+        server.heartbeat_ack(&room_id, &writer, &writer_token).await,
+        (true, None)
+    );
+
+    // 3. The writer uploads a snapshot at 8: it is announced and the request ends.
+    let mut envelope = {
+        let body = b"snapshot-at-8";
+        SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, body.len() as u32, body)
+            .to_bytes()
+            .to_vec()
+    };
+    envelope.extend_from_slice(b"snapshot-at-8");
+    let upload = server
+        .client
+        .post(format!(
+            "{}/rooms/{}/snapshot/upload",
+            server.base_url, room_id
+        ))
+        .header(AUTHORIZATION, format!("Bearer {}", writer_token))
+        .header("x-snapshot-head-seq", "8")
+        .body(envelope)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::OK);
+
+    read_sse_until(&mut stream, "event: snapshot_available\ndata: 8\n").await;
+    assert_eq!(
+        server.heartbeat_ack(&room_id, &writer, &writer_token).await,
+        (false, Some(SequenceNumber::new(8)))
+    );
+    assert_eq!(
+        server
+            .heartbeat_ack(&room_id, &newcomer, &newcomer_token)
+            .await,
+        (false, Some(SequenceNumber::new(8)))
+    );
+}
+
+#[tokio::test]
+async fn test_register_with_a_cursor_beyond_the_head_is_an_invalid_sequence() {
+    let server = TestServer::start().await;
+    let schema_id = SchemaId::new("todo-schema").unwrap();
+    server
+        .schema_registry
+        .register_schema(schema_id.clone(), create_test_schema())
+        .unwrap();
+    let room_id = RoomId::new("room-register-ahead").unwrap();
+    server
+        .room_manager
+        .create_room(room_id.clone(), schema_id, None)
+        .await
+        .unwrap();
+
+    let client_id = ClientId::new("ahead").unwrap();
+    let token = generate_client_token(
+        &client_id,
+        &room_id,
+        Duration::from_secs(300),
+        &server.config.auth_secret,
+    );
+    let register = ClientMessage::RegisterClient {
+        correlation_id: CorrelationId::new(7),
+        room_id: room_id.clone(),
+        client_id: client_id.clone(),
+        auth_token: token.clone(),
+        current_seq: Some(SequenceNumber::new(999)),
+    };
+    match server
+        .post_message(&room_id, "register", &token, &register)
+        .await
+    {
+        (
+            StatusCode::BAD_REQUEST,
+            ServerMessage::Error {
+                correlation_id,
+                code,
+                ..
+            },
+        ) => {
+            assert_eq!(code, ErrorCode::InvalidSequence);
+            assert_eq!(correlation_id, Some(CorrelationId::new(7)));
+        }
+        other => panic!("Expected an InvalidSequence error, got {:?}", other),
+    }
+
+    // The client was not registered: its heartbeat is unauthorized.
+    let heartbeat = ClientMessage::Heartbeat {
+        correlation_id: CorrelationId::new(8),
+        room_id: room_id.clone(),
+        client_id,
+    };
+    let (status, _) = server
+        .post_message(&room_id, "heartbeat", &token, &heartbeat)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

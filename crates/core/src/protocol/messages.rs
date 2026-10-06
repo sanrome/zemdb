@@ -145,6 +145,8 @@ pub enum ServerMessage {
         assigned_seq: SequenceNumber,
         catchup_ops: Vec<SequencedOperation>,
         has_more: bool,
+        /// Whether the server chose this client to upload a room snapshot.
+        snapshot_wanted: bool,
     },
     /// Confirmation of client acknowledgment and cursor persistence.
     AckConfirmed {
@@ -160,6 +162,8 @@ pub enum ServerMessage {
         head_seq: SequenceNumber,
         ops: Vec<SequencedOperation>,
         has_more: bool,
+        /// Whether the server chose this client to upload a room snapshot.
+        snapshot_wanted: bool,
     },
     /// Chunk of the base room snapshot during multipart bootstrapping.
     SnapshotChunk {
@@ -181,11 +185,17 @@ pub enum ServerMessage {
         total_chunks: u32,
         staged: bool,
     },
-    /// Acknowledgment of a heartbeat.
+    /// Acknowledgment of a heartbeat. A heartbeat never fails because the client fell
+    /// behind the retained log; the client learns it from its next sync or commit.
     HeartbeatAck {
         correlation_id: CorrelationId,
         room_id: RoomId,
         current_head_seq: SequenceNumber,
+        /// Whether the server chose this client to upload a room snapshot.
+        snapshot_wanted: bool,
+        /// Sequence number of the relay's active snapshot, if a client can catch up from it
+        /// with the retained log.
+        active_snapshot_seq: Option<SequenceNumber>,
     },
     /// Confirmation of client deregistration from the room.
     DeregisterAck {

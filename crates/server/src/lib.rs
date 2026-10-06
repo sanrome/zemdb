@@ -10,8 +10,9 @@ pub mod relay;
 pub mod schema_registry;
 
 pub use actor::{
-    ClientEntry, ClientLeaseTracker, ClientState, CommitResponse, RegisterResponse, RoomActor,
-    RoomCommand, RoomEvent, RoomManager, RoomMetadata, RoomMetrics, SyncBatchResponse,
+    ClientEntry, ClientLeaseTracker, ClientState, CommitResponse, HeartbeatResponse,
+    RegisterResponse, RoomActor, RoomCommand, RoomEvent, RoomManager, RoomMetadata, RoomMetrics,
+    SyncBatchResponse,
 };
 pub use api::{
     build_router, generate_client_token, serve_until_shutdown, verify_client_token,

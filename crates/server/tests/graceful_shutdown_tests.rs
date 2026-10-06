@@ -7,8 +7,8 @@ use tempfile::tempdir;
 use tokio::sync::oneshot;
 use zemdb_core::*;
 use zemdb_server::{
-    generate_client_token, serve_until_shutdown, AppState, ClientEntry, RoomCommand, RoomManager,
-    SchemaRegistry, ServerConfig, SnapshotRelay,
+    generate_client_token, serve_until_shutdown, AppState, ClientLeaseTracker, RoomCommand,
+    RoomManager, SchemaRegistry, ServerConfig, SnapshotRelay,
 };
 
 fn test_schema() -> Schema {
@@ -149,8 +149,7 @@ async fn shutdown_ends_sse_streams_and_persists_rosters() {
         .join("rooms")
         .join(room_id.as_str())
         .join(format!("meta_clients_{}.json", room_id.as_str()));
-    let entries: Vec<ClientEntry> =
-        serde_json::from_str(&std::fs::read_to_string(roster).unwrap()).unwrap();
-    let entry = entries.iter().find(|e| e.client_id == client_id).unwrap();
+    let persisted = ClientLeaseTracker::open_or_create(roster).unwrap();
+    let entry = persisted.get_client(&client_id).unwrap();
     assert_eq!(entry.last_ack_seq, SequenceNumber::new(1));
 }

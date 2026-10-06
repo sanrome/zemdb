@@ -57,6 +57,7 @@ fn test_protocol_binary_serialization_roundtrip() {
             },
         ],
         has_more: false,
+        snapshot_wanted: true,
     };
     let encoded_ack = encode_message(&commit_ack_msg).expect("serialization failed");
     let decoded_ack: ServerMessage = decode_message(&encoded_ack).expect("deserialization failed");
@@ -71,12 +72,30 @@ fn test_protocol_binary_serialization_roundtrip() {
             op: Operation::delete(0, PrimaryKey::single(42i64), 1000),
         }],
         has_more: false,
+        snapshot_wanted: false,
     };
 
     let encoded_server = encode_message(&server_msg).expect("serialization failed");
     let decoded_server: ServerMessage =
         decode_message(&encoded_server).expect("deserialization failed");
     assert_eq!(server_msg, decoded_server);
+
+    // Test HeartbeatAck roundtrip with the snapshot signalling fields
+    for (snapshot_wanted, active_snapshot_seq) in
+        [(true, None), (false, Some(SequenceNumber::new(140)))]
+    {
+        let heartbeat_ack = ServerMessage::HeartbeatAck {
+            correlation_id: CorrelationId::new(1001),
+            room_id: RoomId::new("room-abc").unwrap(),
+            current_head_seq: SequenceNumber::new(150),
+            snapshot_wanted,
+            active_snapshot_seq,
+        };
+        let encoded_hb = encode_message(&heartbeat_ack).expect("serialization failed");
+        let decoded_hb: ServerMessage =
+            decode_message(&encoded_hb).expect("deserialization failed");
+        assert_eq!(heartbeat_ack, decoded_hb);
+    }
 
     // Test DeregisterClient roundtrip
     let dereg_msg = ClientMessage::DeregisterClient {

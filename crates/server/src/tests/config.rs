@@ -85,3 +85,71 @@ fn max_snapshot_bytes_outside_its_range_fails_to_load() {
         );
     }
 }
+
+#[test]
+fn lifecycle_and_snapshot_defaults() {
+    let config = ServerConfig::default();
+    assert_eq!(config.dormant_after_secs, None);
+    assert_eq!(config.snapshot_ttl_secs, 7 * 24 * 60 * 60);
+    assert_eq!(config.snapshot_demand_ttl_secs, 7 * 24 * 60 * 60);
+
+    let parsed = ServerConfig::from_toml_str("").unwrap();
+    assert_eq!(parsed.dormant_after_secs, None);
+    assert_eq!(parsed.snapshot_demand_ttl_secs, 7 * 24 * 60 * 60);
+
+    let parsed =
+        ServerConfig::from_toml_str("dormant_after_secs = 3600\nsnapshot_demand_ttl_secs = 120\n")
+            .unwrap();
+    assert_eq!(parsed.dormant_after_secs, Some(3600));
+    assert_eq!(parsed.snapshot_demand_ttl_secs, 120);
+}
+
+fn strong_config() -> ServerConfig {
+    config_with(STRONG_AUTH, STRONG_ADMIN)
+}
+
+#[test]
+fn snapshot_demand_ttl_below_a_minute_is_rejected() {
+    for ttl in [0, 1, 59] {
+        let err = ServerConfig {
+            snapshot_demand_ttl_secs: ttl,
+            ..strong_config()
+        }
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("ZEMDB_SNAPSHOT_DEMAND_TTL_SECS"),
+            "{ttl}: {err}"
+        );
+    }
+    for ttl in [60, 7 * 24 * 60 * 60] {
+        ServerConfig {
+            snapshot_demand_ttl_secs: ttl,
+            ..strong_config()
+        }
+        .validate()
+        .unwrap();
+    }
+}
+
+#[test]
+fn zero_dormancy_timeout_is_rejected() {
+    let err = ServerConfig {
+        dormant_after_secs: Some(0),
+        ..strong_config()
+    }
+    .validate()
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("ZEMDB_DORMANT_AFTER_SECS"), "{err}");
+
+    for dormant_after in [None, Some(1), Some(3600)] {
+        ServerConfig {
+            dormant_after_secs: dormant_after,
+            ..strong_config()
+        }
+        .validate()
+        .unwrap();
+    }
+}

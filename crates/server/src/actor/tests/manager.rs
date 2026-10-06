@@ -174,3 +174,80 @@ async fn first_room_creation_makes_rooms_directory_durable() {
 
     assert!(res.is_err(), "creating rooms/ must sync the data directory");
 }
+
+/// Runs `scenario` in its own thread and waits up to `limit` for it to finish. A panic in the
+/// scenario is propagated. A scenario that never finishes (for example a deadlocked runtime)
+/// is left behind and reported as `false`.
+fn finishes_within(limit: Duration, scenario: impl FnOnce() + Send + 'static) -> bool {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        scenario();
+        let _ = done_tx.send(());
+    });
+    match done_rx.recv_timeout(limit) {
+        Ok(()) => true,
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if let Err(panic) = handle.join() {
+                std::panic::resume_unwind(panic);
+            }
+            true
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
+    }
+}
+
+#[test]
+fn schema_reload_does_not_block_concurrent_room_creation() {
+    // A single-threaded runtime: while the reload waits for a room actor's reply, the room
+    // creation runs on the same thread. If the reload kept a guard of the room map across that
+    // wait, the creation would block the thread on the map's lock and nothing could progress.
+    let finished = finishes_within(Duration::from_secs(10), || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let dir = tempdir().unwrap();
+            let manager = Arc::new(new_manager(&dir));
+            let schema_id = SchemaId::new("first").unwrap();
+            let existing = RoomId::new("room-f").unwrap();
+            manager
+                .create_room(existing.clone(), schema_id.clone(), None)
+                .await
+                .unwrap();
+
+            // A new room whose schema assignment lands in the same map shard as the existing
+            // one: while a read guard on the existing entry is held, writing to it is refused.
+            let new_room = {
+                let _existing_guard = manager.room_schemas.get(&existing).unwrap();
+                (0..)
+                    .map(|i| RoomId::new(format!("room-g{i}")).unwrap())
+                    .find(|id| manager.room_schemas.try_get_mut(id).is_locked())
+                    .unwrap()
+            };
+
+            let reload = tokio::spawn({
+                let manager = Arc::clone(&manager);
+                let schema_id = schema_id.clone();
+                async move {
+                    manager
+                        .reload_schema_for_rooms(&schema_id, Arc::new(test_schema()))
+                        .await
+                }
+            });
+            let create = tokio::spawn({
+                let manager = Arc::clone(&manager);
+                let schema_id = schema_id.clone();
+                async move { manager.create_room(new_room, schema_id, None).await }
+            });
+
+            assert_eq!(reload.await.unwrap(), vec![existing]);
+            create.await.unwrap().unwrap();
+            manager.shutdown_all().await;
+        });
+    });
+    assert!(
+        finished,
+        "schema reload and room creation deadlocked on the room map"
+    );
+}

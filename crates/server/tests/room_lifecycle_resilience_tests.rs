@@ -33,8 +33,10 @@ impl LifecycleTestServer {
             auth_secret: "lifecycle_cluster_secret_key_12345678".to_string(),
             admin_secret: "lifecycle_admin_secret_key_123456789".to_string(),
             lease_timeout_secs: 60,
+            dormant_after_secs: None,
             dedup_lru_capacity: 1000,
             snapshot_ttl_secs: 60,
+            snapshot_demand_ttl_secs: 60,
             max_snapshot_bytes: 16 * 1024 * 1024,
         });
 

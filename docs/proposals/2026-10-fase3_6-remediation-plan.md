@@ -56,6 +56,11 @@
 | **D18** | Aceptación de snapshots en el relay: `tail - 1 ≤ seq ≤ head` (consultado al actor), seq estrictamente mayor que el snapshot activo, y cabecera `ZMSN` válida con CRC (sin descomprimir; la cabecera pasa a `zemdb-core`). El servidor no valida la estructura interna ni puede validar la veracidad del contenido (no tiene el estado de la sala): la estructura la valida el cliente al aplicarlo (Fase 4), y la defensa contra un miembro malicioso queda como DEF-81. | Adoptada |
 | **D19** | Descarga anclada: `RequestSnapshotChunk` lleva `snapshot_hash: Option<[u8; 32]>`; si el snapshot anclado ya no es el activo, se responde `ErrorCode::SnapshotSuperseded` (409) y el cliente reinicia desde el chunk 0. Tamaño de chunk de descarga limitado a 64 KiB–4 MiB. | Adoptada |
 | **D20** | Descompresión de snapshots en storage acotada: se rechaza si el tamaño descomprimido declarado supera el máximo (2 GiB por defecto, configurable) y se descomprime con un tope real por si la cabecera miente. | Adoptada |
+| **D21** | Pedido de snapshots: el servidor **elige un solo cliente** para subirlo y solo a ese le responde `snapshot_wanted: true`. Candidatos: clientes `Connected` (nunca uno que esté bootstrappeando); prefiere el cursor más alto y, ante empate, la actividad más reciente. Si en 60 s no empezó ninguna subida, o el elegido deja de estar `Connected`, se elige otro y el anterior queda excluido de esa ronda; mientras haya una subida en curso no se rota. | Adoptada |
+| **D22** | Demanda de snapshot (estado de la sala "necesita un snapshot"): se prende cuando no hay snapshot usable (`seq ≥ tail - 1`) y un cliente se registra como `Bootstrapping` o una operación responde `BehindCompaction`; cada uno de esos pedidos la renueva. Se apaga cuando aparece un snapshot usable (el actor lo detecta en el tick) o cuando pasa `ZEMDB_SNAPSHOT_DEMAND_TTL_SECS` sin renovarse (7 días por defecto). El TTL de los snapshots del relay (`ZEMDB_SNAPSHOT_TTL_SECS`) sube de 600 s a 7 días por defecto. Los defaults apuntan a bases que cambian poco con clientes que se conectan cada tanto. La demanda se persiste en el archivo del roster (encendida y último refresco, en hora de reloj, actualizado como mucho cada min(TTL/100, 1 h) para no reescribir el roster en cada heartbeat) para sobrevivir a reinicios y al apagado de salas inactivas (DEF-55); la designación de D21 queda en memoria y se recalcula. La demanda anticipada (pedir un snapshot por existir clientes `Dormant`) queda diferida (DEF-82). | Adoptada |
+| **D23** | Protocolo (versión sigue en `0x01`): `snapshot_wanted: bool` en `HeartbeatAck`, `SyncBatch` y `CommitAck`; `active_snapshot_seq: Option<SequenceNumber>` en `HeartbeatAck`. Eventos SSE `snapshot_wanted` (sin datos: quien lo recibe hace un heartbeat para saber si es el elegido) y `snapshot_available` (con el seq); son solo aceleradores, la fuente de verdad son las respuestas. | Adoptada |
+| **D24** | Ciclo de vida derivado del cursor. Toda actividad recalcula el estado: cursor detrás del log (`cursor < tail - 1`) → `Bootstrapping` (+ `BehindCompaction` en la operación que traía ese cursor, + demanda D22); dentro → `Connected`, lease renovado y cursor avanzado (nunca hacia atrás). Sin gates `is_dormant`/`is_bootstrapping`: un `Bootstrapping` con cursor válido puede commitear; Ack chequea retención (un ack menor que el cursor guardado es un no-op exitoso); Sync avanza el cursor de cualquier cliente a `from_seq` (validado `≤ head`); el heartbeat nunca falla por retención. `Dormant` = inactivo y detrás del log: en el tick un `Disconnected` cuyo cursor quedó detrás pasa a `Dormant`. Pasar a `Dormant` por tiempo es opcional (`ZEMDB_DORMANT_AFTER_SECS`, sin valor por defecto); al volver, el cursor decide. | Adoptada |
+| **D25** | `ClientLeaseTracker` expone una sola entrada para la actividad, `observe(cliente, cursor_reportado, tail)`, que aplica D24 y **nunca inserta** a un cliente no registrado (devuelve `None`). Reemplaza a `record_ack`, `record_activity`, `record_heartbeat` y `advance_cursor`. | Adoptada |
 
 ---
 
@@ -68,13 +73,13 @@
 | 3 | Durabilidad de metadatos del servidor | DEF-60, 19(server), 16, 48, 68, 69 | Alta | ✅ 6/6 |
 | 4 | Autenticación e identificadores | DEF-61, 41, 66, 80 | Alta | ✅ 4/4 |
 | 5 | Relay de snapshots | DEF-62, 10, 63, 52, 51, 39, 40, 38, 31(relay), 08(relay), 15 | Alta | ✅ 11/11 |
-| 6 | Ciclo de vida de clientes y señalización | DEF-53, 05, 27, 75, 76 (24 y 26 descartados) | Alta | 0/5 |
+| 6 | Ciclo de vida de clientes y señalización | DEF-53, 05, 27, 75, 76 (24 y 26 descartados) | Alta | ✅ 5/5 |
 | 7 | Protocolo wire y errores HTTP | DEF-46, 28, 11, 43, 64, 22, 71, 74 | Media | 0/8 |
-| 8 | Rendimiento, portabilidad y ciclo de vida de salas | DEF-50, 35, 55, 37, 08, 31(locks), 25(server), 72, 77, 79 | Media | 0/10 |
+| 8 | Rendimiento, portabilidad y ciclo de vida de salas | DEF-50, 35, 55, 37, 08, 31(locks), 25(server), 72, 77, 79, 83 | Media | 0/11 |
 | 9 | Robustez e higiene de storage y core | DEF-14, 23, 49, 17, 25(storage), 18, 09, 45, 33, 44, 47, 30, 13, 20, 21, 57, 70, 78 (32 descartado) | Media/Baja | 1/18 |
-| 10 | Diferido a Fase 4 / descartado | DEF-34, 54, 42, 56, 73, 81 | — | — |
+| 10 | Diferido a Fase 4 / descartado | DEF-34, 54, 42, 56, 73, 81, 82, 84, 85 | — | — |
 
-**Avance total:** 36 de 76 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
+**Avance total:** 41 de 77 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
 
 **Severidades corregidas respecto de la auditoría anterior:** de los 7 "críticos" originales, solo DEF-01 lo es. DEF-02, 03 y 04 son Altos; DEF-05 y 06 son Medios; DEF-34 es Bajo. DEF-24, 26 y 56 son falsos en la práctica.
 
@@ -311,17 +316,17 @@ Mover los handlers HTTP de `relay.rs` a `api/relay.rs`, **en el mismo cambio** q
 
 ## Lote 6 — Ciclo de vida de clientes y señalización
 
-#### DEF-53 · Alto · ⬜
+#### DEF-53 · Alto · ✅ Hecho
 **Problema.** Si un cliente necesita un snapshot y no hay ninguno en el relay, nadie se entera: `RoomEvent` solo tiene `HeadAdvanced` y `SchemaReloaded`. Se agrava al resolver DEF-04.
 **Error de la propuesta anterior.** Un evento solo por SSE no alcanza: SSE es opcional y de primer plano, y el canal broadcast descarta a los receptores lentos.
-**Solución.** Un flag `snapshot_wanted` en las respuestas de heartbeat, Sync y CommitAck, más el evento SSE como acelerador. Se activa cuando un cliente se registra como `Bootstrapping` sin snapshot activo, o cuando Sync devuelve `BehindCompaction` sin snapshot. Con debounce. Se apaga cuando el relay acepta un snapshot válido (DEF-10).
+**Solución.** Decisiones D21 (un solo cliente elegido para subir), D22 (demanda con vencimiento configurable) y D23 (campos en las respuestas y eventos SSE `snapshot_wanted` / `snapshot_available`).
 
-#### DEF-05 · Medio · ⬜
+#### DEF-05 · Medio · ✅ Hecho
 **Problema verificado.** No es permanente (`register_client` sobrescribe el estado). Los problemas reales: (a) un cliente `Disconnected` pasa a `Dormant` a los 90 s sin importar su cursor y recibe un 410 engañoso; (b) `handle_commit` rechaza a clientes `Bootstrapping`, aunque ARCHITECTURE.md:176 dice que un commit los promueve; (c) un heartbeat de un cliente `Dormant` recibe 410; (d) `handle_ack` no chequea la retención.
-**Solución.** `Dormant` significa solo "excluido del cálculo de retención". Quitar los gates `is_dormant`; cada handler decide por el cursor que trae (Sync ya lo hace; agregar el chequeo a Ack, y a Commit vía DEF-04) y promueve a `Connected` si tiene éxito. El heartbeat chequea el cursor guardado contra `tail - 1`.
+**Solución.** Decisiones D24 (estado derivado del cursor; `Dormant` = inactivo y detrás del log; timeout opcional) y D25 (`observe` en el tracker).
 **Test.** Cliente `Dormant` con cursor válido → Sync/Ack/Commit funcionan y queda `Connected`. Cliente `Dormant` con cursor expirado → `BehindCompaction`.
 
-#### DEF-27 · Medio · ⬜
+#### DEF-27 · Medio · ✅ Hecho
 `reload_schema_for_rooms` mantiene un guard de lectura de `DashMap` a través de `.await`. Hay escritores concurrentes (`get_or_spawn`, `create_room`, `delete_room`), así que es un deadlock real aunque requiere una carrera. Recolectar los `(RoomId, Sender)` en un `Vec` antes del bucle.
 
 #### DEF-24 · ❌ Descartado
@@ -330,13 +335,28 @@ El tick de 500 ms ya recalcula el suelo de retención; el retraso máximo es de 
 #### DEF-26 · ❌ Descartado
 Un cliente `Bootstrapping` tiene por definición el cursor por debajo de `tail - 1`, así que en el siguiente tick pasa de `Disconnected` a `Dormant`. La poda se bloquea unos 500 ms, no 90 s.
 
-#### DEF-75 · Bajo · ⬜ (nuevo, revisión del Lote 3)
+#### DEF-75 · Bajo · ✅ Hecho (nuevo, revisión del Lote 3)
 **Problema.** El test existente `test_room_actor_retention_anchor_protects_deltas_during_snapshot` pasa aunque se quite el ancla de retención: sin ella el suelo es 10, solo se poda el segmento [1,5], `tail` queda en 6 y un sync desde 5 sigue funcionando. No prueba lo que dice.
 **Solución.** Rehacer el escenario para que, sin el ancla, el sync desde el seq del snapshot reciba `BehindCompaction`.
 
-#### DEF-76 · Bajo · ⬜ (nuevo, revisión del Lote 3)
+#### DEF-76 · Bajo · ✅ Hecho (nuevo, revisión del Lote 3)
 **Problema.** `ClientLeaseTracker::record_ack` sobre un cliente no registrado lo inserta como `Connected`; `handle_sync` puede llegar a ese camino.
-**Solución.** Ignorar (o rechazar) acks de clientes no registrados.
+**Solución.** Resuelto por D25: `observe` nunca agrega a un cliente no registrado.
+
+#### Notas del Lote 6
+- **Organización del código:** la demanda de snapshot y la designación viven en `actor/snapshot_demand.rs` (estado puro, con el tiempo como argumento); el actor la conecta con el roster, el relay y SSE.
+- **Decisiones de implementación no previstas en D21–D25:**
+  - Commit y Sync chequean la retención contra el cursor que traen (el catch-up arranca ahí); el estado sale del cursor efectivo (el guardado, avanzado al reportado). Un cliente con el cursor guardado dentro del log que manda uno viejo recibe `BehindCompaction`, sigue `Connected` y no prende la demanda.
+  - Un hueco encontrado al leer un rango que el log dice retener (`BehindCompaction` dentro de `fetch_deltas`) sí prende la demanda siempre: nadie puede ponerse al día por ese rango.
+  - Un reintento deduplicado de commit también pasa por `observe`. Los rechazos por `InvalidSequence` o `SchemaViolation` no cambian estado ni lease.
+  - Mientras haya una subida en curso no se designa ni se rota. `snapshot_wanted` en una respuesta exige además que no haya snapshot usable.
+  - `snapshot_available` se emite cuando cambia el snapshot usable; una sala que se reabre no reanuncia el que ya había.
+  - El evento SSE `snapshot_wanted` lleva una línea `data:` vacía (los navegadores descartan eventos sin datos).
+  - La renovación persistida se escribe como mucho cada min(TTL/100, 1 h); tras un reinicio la demanda puede vencer hasta ese tiempo antes. El vencimiento se guarda como plazo (`expires_at`), no como hora de renovación hacia atrás (en Windows un `Instant` no puede ser anterior al arranque).
+  - Al arrancar se rechazan `ZEMDB_SNAPSHOT_DEMAND_TTL_SECS` menor a 60 s y `ZEMDB_DORMANT_AFTER_SECS=0`.
+  - El registro informa `active_snapshot_seq` solo si el snapshot es usable, y rechaza `current_seq > head` con `InvalidSequence` (antes se aceptaba; con D21 ese cliente sería el preferido para subir).
+- **Formato del roster:** pasa a ser un objeto `{clients, snapshot_demand}`; el formato anterior (array) se sigue leyendo. Un servidor anterior no lee el nuevo, aceptable porque no hubo release.
+- **Documentación:** `ARCHITECTURE.md` documenta la ventana de la deduplicación (DEF-85) y que, sin `ZEMDB_DORMANT_AFTER_SECS`, un cliente abandonado que nunca se desregistró frena la poda proactiva hasta que el TTL o la cuota lo dejan atrás.
 
 ---
 
@@ -383,8 +403,8 @@ Cada tick de 500 ms hace unos 8 `read_dir` más `stat` por archivo, y `prune_old
 #### DEF-35 · Medio · ⬜
 Al crear la sala se descomprime todo el cold tier y se lee todo el warm, de forma síncrona en `RoomActor::spawn`. Solo hacen falta las últimas `ram_max_ops` ops, los últimos `dedup_lru_capacity` mutation IDs y `head` (que sale de los nombres de segmento y de `active.wal`). Leer hacia atrás hasta cubrir ambas cuotas e hidratar en orden cronológico para conservar la recencia de la LRU.
 
-#### DEF-55 · Bajo-Medio · ⬜
-Las salas nunca se apagan. Agregar un reaper que apague el actor tras N minutos sin clientes conectados ni comandos. Reduce también el costo de DEF-37 y DEF-50.
+#### DEF-55 · Medio · ⬜ (subido de Bajo-Medio: con muchas salas casi siempre inactivas, cada una queda abierta para siempre)
+Las salas nunca se apagan. El actor se apaga solo (guarda el roster y libera memoria, archivos y lock) tras un tiempo configurable sin comandos, sin clientes `Connected`/`Bootstrapping`, sin suscriptores SSE y sin subida de snapshot en curso; el siguiente pedido la relanza desde disco por el mismo camino que D7. El tiempo es un parámetro más de la política de ciclo de vida (DEF-83), con default del servidor por variable de entorno y la opción de no apagar nunca. Reduce también el costo de DEF-37 y DEF-50.
 
 #### DEF-37 · Bajo · ⬜ (requiere DEF-07 y DEF-58)
 La ventana TTL de la RAM solo se aplica en `append`. No es una fuga: está acotada a `ram_max_ops` por sala. Aplicar la ventana en el mantenimiento **solo después** de DEF-07/58; antes produce `tail = head` y `BehindCompaction` masivo.
@@ -402,6 +422,10 @@ El `sync_data` de cada commit bloquea un worker de Tokio (en macOS es `F_FULLFSY
 #### DEF-72 · Medio · ⬜ (nuevo, revisión del Lote 2)
 **Problema.** Windows es plataforma objetivo. `WarmDiskLog::read_range` (y `recover_all`) leen `active.wal` con `std::fs::read`, un segundo handle, mientras `active_file` tiene el lock exclusivo de `fs2`. En Windows ese lock es obligatorio (`LockFileEx`) y la lectura falla: el catch-up desde `active.wal` tras desalojo por TTL de RAM no funcionaría.
 **Solución.** Leer `active.wal` a través del handle que ya tiene el lock (o con un lock compartido coordinado). Verificar en CI con Windows (DEF-73).
+
+#### DEF-83 · Medio · ⬜ (nuevo, revisión de documentación contra el modelo de uso)
+**Problema.** `ARCHITECTURE.md` dice que la política de ciclo de vida es configurable por deployment y por sala, pero la política que recibe `POST /admin/rooms` no se guarda en `meta_room.json`: tras un reinicio, o cuando la sala se relanza (D7), vuelve a los defaults. Tampoco hay variables de entorno para los TTL y la cuota del log. Los parámetros del ciclo de vida de clientes del Lote 6 (`ZEMDB_DORMANT_AFTER_SECS`, `ZEMDB_SNAPSHOT_DEMAND_TTL_SECS`) son solo globales.
+**Solución.** Guardar la política en `meta_room.json` (compatible con archivos que no la tienen); mover a `RoomLifecyclePolicy` los parámetros del ciclo de vida de clientes; tomar los defaults del servidor de variables de entorno, validadas al arrancar.
 
 #### Nota sobre DEF-08
 La revisión del Lote 1 señaló dos casos más de I/O bloqueante en el actor: `record_pruned_through` (escritura atómica de `log_meta.json`) y los `sync_dir` de la fase 3 de la compactación de storage. Se tratan junto con DEF-08.
@@ -478,6 +502,18 @@ Windows es plataforma objetivo, pero hoy nada se prueba en Windows. Agregar CI (
 #### DEF-81 · Medio · ⏸ (nuevo, decisión D18)
 **Problema.** El servidor no tiene el estado de la sala, así que no puede verificar que un snapshot subido sea verdadero: un miembro malicioso puede subir un snapshot bien formado con datos inventados, que solo afecta en silencio a los clientes que arrancan desde él. (Un miembro malicioso ya puede escribir datos falsos con commits, pero esos quedan secuenciados y visibles.)
 **Solución propuesta (Fase 4).** Que los clientes reporten un digest determinístico del estado en ciertos seq (por ejemplo con cada ack) y que el relay solo acepte un snapshot cuyo digest coincida con el reportado por otros clientes. Requiere serialización determinística del estado y soporte en el SDK.
+
+#### DEF-82 · Bajo · ⏸ (nuevo, decisión D22)
+**Problema.** Con clientes que se conectan cada tanto, el snapshot recién se pide cuando un cliente `Dormant` vuelve; hasta que un cliente capaz de subirlo se conecte, el que volvió espera.
+**Solución propuesta (próxima versión).** Demanda anticipada configurable: prender la demanda de D22 también cuando hay clientes `Dormant` y no hay snapshot usable. Por defecto, seguir pidiéndolo solo al volver un `Dormant`.
+
+#### DEF-84 · Bajo · ⏸ (nuevo, revisión de documentación contra el modelo de uso)
+**Problema.** Una subida por partes se descarta tras 2 minutos sin chunks (D17) y no se puede retomar en otra sesión. Un cliente que abre la app un rato puede no llegar a terminar un snapshot grande.
+**Solución propuesta.** Subidas reanudables entre sesiones (consultar qué chunks ya tiene el relay) y vencimiento configurable.
+
+#### DEF-85 · Bajo · ⏸ (nuevo, revisión de documentación contra el modelo de uso)
+**Problema.** La deduplicación (exactly-once) solo reconoce `MutationId` del log retenido y de la LRU (10.000). Un reintento de un commit cuya respuesta se perdió, hecho después de que su segmento se podó (por ejemplo, tras 30 días), se aplica dos veces; si era un update viejo, por LWW pisa datos más nuevos. Sin escritura offline en v0.1 el SDK solo reintenta dentro de la sesión, así que el caso requiere que persista commits sin confirmar entre sesiones.
+**Solución propuesta.** `MutationId` con contador monotónico por cliente y último contador confirmado guardado en el roster: un contador ≤ al guardado es duplicado aunque ya no se conozca su seq (requiere una respuesta "ya aplicado" sin seq). Mientras tanto, documentar la ventana en `ARCHITECTURE.md` y que el SDK no reintente commits sin confirmar entre sesiones.
 
 #### DEF-56 · ❌ Descartado
 Devolver las columnas en el orden de la proyección es el comportamiento estándar y coincide con lo documentado (`options.rs:133`). Rellenar con `Null` anula el sentido de proyectar. A lo sumo, documentarlo y rechazar índices fuera de rango.

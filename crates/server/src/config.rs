@@ -25,17 +25,28 @@ pub struct ServerConfig {
     #[serde(default = "default_admin_secret")]
     pub admin_secret: String,
 
-    /// Inactivity timeout before marking a client lease as Dormant (seconds).
+    /// Inactivity timeout before an active client lease is marked Disconnected (seconds).
     #[serde(default = "default_lease_timeout_secs")]
     pub lease_timeout_secs: u64,
+
+    /// Inactivity after which a Disconnected client becomes Dormant even though its cursor is
+    /// still inside the retained log (seconds). Unset by default: a Disconnected client only
+    /// becomes Dormant once its cursor falls behind the log.
+    #[serde(default)]
+    pub dormant_after_secs: Option<u64>,
 
     /// Maximum number of mutation IDs retained in the deduplication LRU cache per room.
     #[serde(default = "default_dedup_lru_capacity")]
     pub dedup_lru_capacity: usize,
 
-    /// TTL duration for staged snapshots in the relay before eviction (seconds).
+    /// TTL duration for staged snapshots in the relay before eviction (seconds, default 7 days).
     #[serde(default = "default_snapshot_ttl_secs")]
     pub snapshot_ttl_secs: u64,
+
+    /// How long a room keeps asking its clients for a snapshot without the request being
+    /// renewed (seconds, default 7 days).
+    #[serde(default = "default_snapshot_demand_ttl_secs")]
+    pub snapshot_demand_ttl_secs: u64,
 
     /// Largest snapshot the relay accepts, in bytes (default 512 MiB).
     #[serde(default = "default_max_snapshot_bytes")]
@@ -70,8 +81,15 @@ fn default_dedup_lru_capacity() -> usize {
     10_000
 }
 
+/// Seven days, in seconds.
+const SEVEN_DAYS_SECS: u64 = 7 * 24 * 60 * 60;
+
 fn default_snapshot_ttl_secs() -> u64 {
-    600
+    SEVEN_DAYS_SECS
+}
+
+fn default_snapshot_demand_ttl_secs() -> u64 {
+    SEVEN_DAYS_SECS
 }
 
 fn default_max_snapshot_bytes() -> u64 {
@@ -87,8 +105,10 @@ impl Default for ServerConfig {
             auth_secret: default_auth_secret(),
             admin_secret: default_admin_secret(),
             lease_timeout_secs: default_lease_timeout_secs(),
+            dormant_after_secs: None,
             dedup_lru_capacity: default_dedup_lru_capacity(),
             snapshot_ttl_secs: default_snapshot_ttl_secs(),
+            snapshot_demand_ttl_secs: default_snapshot_demand_ttl_secs(),
             max_snapshot_bytes: default_max_snapshot_bytes(),
         }
     }
@@ -99,6 +119,9 @@ pub const MIN_MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024;
 
 /// Largest accepted `max_snapshot_bytes` (64 GiB).
 pub const MAX_MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Smallest accepted `snapshot_demand_ttl_secs`.
+pub const MIN_SNAPSHOT_DEMAND_TTL_SECS: u64 = 60;
 
 /// Minimum length, in bytes, of the client token secret and the admin secret.
 pub const MIN_SECRET_LEN: usize = 32;
@@ -137,7 +160,9 @@ impl ServerConfig {
     }
 
     /// Checks that `max_snapshot_bytes` lies within
-    /// [`MIN_MAX_SNAPSHOT_BYTES`]..=[`MAX_MAX_SNAPSHOT_BYTES`].
+    /// [`MIN_MAX_SNAPSHOT_BYTES`]..=[`MAX_MAX_SNAPSHOT_BYTES`], that `snapshot_demand_ttl_secs`
+    /// is at least [`MIN_SNAPSHOT_DEMAND_TTL_SECS`] and that `dormant_after_secs`, if set, is
+    /// not 0.
     pub fn validate_limits(&self) -> Result<(), ServerError> {
         if !(MIN_MAX_SNAPSHOT_BYTES..=MAX_MAX_SNAPSHOT_BYTES).contains(&self.max_snapshot_bytes) {
             return Err(ServerError::Config(format!(
@@ -145,6 +170,20 @@ impl ServerConfig {
                  (1 MiB) and {MAX_MAX_SNAPSHOT_BYTES} (64 GiB), got {}",
                 self.max_snapshot_bytes
             )));
+        }
+        // A demand that expires within a few ticks would turn on and off with every request.
+        if self.snapshot_demand_ttl_secs < MIN_SNAPSHOT_DEMAND_TTL_SECS {
+            return Err(ServerError::Config(format!(
+                "snapshot_demand_ttl_secs (ZEMDB_SNAPSHOT_DEMAND_TTL_SECS) must be at least \
+                 {MIN_SNAPSHOT_DEMAND_TTL_SECS}, got {}",
+                self.snapshot_demand_ttl_secs
+            )));
+        }
+        if self.dormant_after_secs == Some(0) {
+            return Err(ServerError::Config(
+                "dormant_after_secs (ZEMDB_DORMANT_AFTER_SECS) must be greater than 0 when set"
+                    .to_string(),
+            ));
         }
         Ok(())
     }
@@ -185,6 +224,11 @@ impl ServerConfig {
                 self.lease_timeout_secs = lease;
             }
         }
+        if let Ok(dormant_str) = std::env::var("ZEMDB_DORMANT_AFTER_SECS") {
+            if let Ok(dormant_after) = dormant_str.parse::<u64>() {
+                self.dormant_after_secs = Some(dormant_after);
+            }
+        }
         if let Ok(lru_str) = std::env::var("ZEMDB_DEDUP_LRU_CAPACITY") {
             if let Ok(cap) = lru_str.parse::<usize>() {
                 self.dedup_lru_capacity = cap;
@@ -193,6 +237,11 @@ impl ServerConfig {
         if let Ok(snap_str) = std::env::var("ZEMDB_SNAPSHOT_TTL_SECS") {
             if let Ok(snap_ttl) = snap_str.parse::<u64>() {
                 self.snapshot_ttl_secs = snap_ttl;
+            }
+        }
+        if let Ok(demand_str) = std::env::var("ZEMDB_SNAPSHOT_DEMAND_TTL_SECS") {
+            if let Ok(demand_ttl) = demand_str.parse::<u64>() {
+                self.snapshot_demand_ttl_secs = demand_ttl;
             }
         }
         if let Ok(max_str) = std::env::var("ZEMDB_MAX_SNAPSHOT_BYTES") {

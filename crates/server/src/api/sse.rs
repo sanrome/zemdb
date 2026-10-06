@@ -13,7 +13,11 @@ use crate::error::ServerError;
 /// `GET /rooms/:room_id/events`: Signal-only Server-Sent Events (SSE) broadcast channel.
 /// Authenticated via `EventStreamAuth` (Bearer token or `?token=` query parameter, issued for
 /// the path room); authentication failures are binary error frames.
-/// Emits `head_advanced` and `schema_reloaded` lightweight signals without transmitting row payloads.
+/// Emits lightweight signals without transmitting row payloads: `head_advanced` (new head
+/// sequence), `schema_reloaded` (schema id), `snapshot_wanted` (a client was designated to
+/// upload a snapshot; empty data, the designee learns it is the one from a heartbeat) and
+/// `snapshot_available` (sequence of a new usable snapshot). The replies to heartbeats, syncs
+/// and commits remain the source of truth; these events only let foreground clients react sooner.
 /// The stream ends when the room actor stops or the server begins shutting down.
 pub async fn room_events(
     State(state): State<AppState>,
@@ -51,6 +55,17 @@ pub async fn room_events(
             }
             Ok(RoomEvent::SchemaReloaded(schema_id)) => {
                 let event = Event::default().event("schema_reloaded").data(&schema_id);
+                Some((Ok(event), rx))
+            }
+            Ok(RoomEvent::SnapshotWanted) => {
+                // An empty data line: browsers drop events without one.
+                let event = Event::default().event("snapshot_wanted").data("");
+                Some((Ok(event), rx))
+            }
+            Ok(RoomEvent::SnapshotAvailable(seq)) => {
+                let event = Event::default()
+                    .event("snapshot_available")
+                    .data(seq.to_string());
                 Some((Ok(event), rx))
             }
             Err(broadcast::error::RecvError::Lagged(_)) => {

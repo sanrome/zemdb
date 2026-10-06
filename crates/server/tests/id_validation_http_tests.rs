@@ -33,8 +33,10 @@ async fn start_server() -> TestServer {
         auth_secret: AUTH_SECRET.to_string(),
         admin_secret: ADMIN_SECRET.to_string(),
         lease_timeout_secs: 60,
+        dormant_after_secs: None,
         dedup_lru_capacity: 1000,
         snapshot_ttl_secs: 60,
+        snapshot_demand_ttl_secs: 60,
         max_snapshot_bytes: 16 * 1024 * 1024,
     });
     let schema_registry = Arc::new(SchemaRegistry::new(data_dir.join("schemas")).unwrap());

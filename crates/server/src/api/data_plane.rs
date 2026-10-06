@@ -179,6 +179,7 @@ pub async fn commit(
                 assigned_seq: commit_resp.assigned_seq,
                 catchup_ops: commit_resp.catchup_ops,
                 has_more: commit_resp.has_more,
+                snapshot_wanted: commit_resp.snapshot_wanted,
             },
         ),
         Err(err) => fail(room_id, err),
@@ -228,6 +229,7 @@ pub async fn sync(
                 head_seq: sync_resp.head_seq,
                 ops: sync_resp.ops,
                 has_more: sync_resp.has_more,
+                snapshot_wanted: sync_resp.snapshot_wanted,
             },
         ),
         Err(err) => fail(room_id, err),
@@ -280,7 +282,8 @@ pub async fn ack(
     }
 }
 
-/// `POST /rooms/:room_id/heartbeat`: Lightweight lease keep-alive ping.
+/// `POST /rooms/:room_id/heartbeat`: Lightweight lease keep-alive ping. Never fails because
+/// the client fell behind the log; the reply carries the snapshot signals.
 pub async fn heartbeat(
     State(state): State<AppState>,
     auth: AuthenticatedRoom,
@@ -311,12 +314,14 @@ pub async fn heartbeat(
     })
     .await
     {
-        Ok(current_head_seq) => binary_response(
+        Ok(hb_resp) => binary_response(
             StatusCode::OK,
             &ServerMessage::HeartbeatAck {
                 correlation_id,
                 room_id,
-                current_head_seq,
+                current_head_seq: hb_resp.head_seq,
+                snapshot_wanted: hb_resp.snapshot_wanted,
+                active_snapshot_seq: hb_resp.active_snapshot_seq,
             },
         ),
         Err(err) => fail(room_id, err),

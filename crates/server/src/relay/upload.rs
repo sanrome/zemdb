@@ -396,6 +396,37 @@ impl SnapshotRelay {
         Ok(true)
     }
 
+    /// Whether an upload for the room is under way: a single-request upload being received or
+    /// staged, or a multipart upload that has not gone idle.
+    ///
+    /// Reads memory without waiting, so the room actor can call it. A room whose lock is held
+    /// at that moment counts as uploading: the lock is only held briefly, and callers only
+    /// postpone a decision on it.
+    pub fn has_upload_in_progress(&self, room_id: &RoomId) -> bool {
+        if self
+            .pending_single_uploads
+            .get(room_id)
+            .is_some_and(|count| *count > 0)
+        {
+            return true;
+        }
+        let Some(slot) = self
+            .slots
+            .get(room_id)
+            .map(|slot| std::sync::Arc::clone(slot.value()))
+        else {
+            return false;
+        };
+        let in_progress = match slot.try_lock() {
+            Ok(guard) => guard
+                .upload
+                .as_ref()
+                .is_some_and(|upload| !upload.is_idle(Instant::now())),
+            Err(_) => true,
+        };
+        in_progress
+    }
+
     /// Whether the room's active snapshot is exactly `seq` with `hash`.
     fn is_active(&self, room_id: &RoomId, seq: SequenceNumber, hash: &[u8; 32]) -> bool {
         self.active(room_id)

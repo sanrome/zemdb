@@ -225,18 +225,24 @@ fn test_server_config_toml_and_env_overrides() {
     std::env::set_var("ZEMDB_HOST", "192.168.1.50");
     std::env::set_var("ZEMDB_SNAPSHOT_TTL_SECS", "1800");
     std::env::set_var("ZEMDB_MAX_SNAPSHOT_BYTES", "1048576");
+    std::env::set_var("ZEMDB_DORMANT_AFTER_SECS", "7200");
+    std::env::set_var("ZEMDB_SNAPSHOT_DEMAND_TTL_SECS", "3600");
     config.apply_env_overrides();
 
     assert_eq!(config.port, 9999);
     assert_eq!(config.host, "192.168.1.50");
     assert_eq!(config.snapshot_ttl_secs, 1800);
     assert_eq!(config.max_snapshot_bytes, 1024 * 1024);
+    assert_eq!(config.dormant_after_secs, Some(7200));
+    assert_eq!(config.snapshot_demand_ttl_secs, 3600);
 
     // Clean up env vars
     std::env::remove_var("ZEMDB_PORT");
     std::env::remove_var("ZEMDB_HOST");
     std::env::remove_var("ZEMDB_SNAPSHOT_TTL_SECS");
     std::env::remove_var("ZEMDB_MAX_SNAPSHOT_BYTES");
+    std::env::remove_var("ZEMDB_DORMANT_AFTER_SECS");
+    std::env::remove_var("ZEMDB_SNAPSHOT_DEMAND_TTL_SECS");
 }
 
 #[test]

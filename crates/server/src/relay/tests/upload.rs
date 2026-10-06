@@ -669,3 +669,80 @@ async fn uploader_may_restart_its_own_upload_at_the_same_seq() {
     let (_, hash, _) = chunk(&relay, 0, 0, None).await.unwrap();
     assert_eq!(hash, second.2);
 }
+
+#[tokio::test(start_paused = true)]
+async fn multipart_upload_is_in_progress_until_it_completes_or_goes_idle() {
+    let dir = tempdir().unwrap();
+    let relay = open(&dir);
+    let (data, layout, hash, ranges) = three_part_snapshot(1);
+    assert!(!relay.has_upload_in_progress(&room()));
+
+    for index in 0..2u32 {
+        relay
+            .stage_chunk(
+                part(
+                    10,
+                    index,
+                    layout,
+                    hash,
+                    &data[ranges[index as usize].clone()],
+                ),
+                bounds(0, 10),
+            )
+            .await
+            .unwrap();
+        assert!(relay.has_upload_in_progress(&room()));
+    }
+    assert!(!relay.has_upload_in_progress(&RoomId::new("other-room").unwrap()));
+
+    relay
+        .stage_chunk(
+            part(10, 2, layout, hash, &data[ranges[2].clone()]),
+            bounds(0, 10),
+        )
+        .await
+        .unwrap();
+    assert!(!relay.has_upload_in_progress(&room()));
+
+    // An upload that stopped receiving chunks no longer counts.
+    let (data, layout, hash, ranges) = three_part_snapshot(2);
+    relay
+        .stage_chunk(
+            part(11, 0, layout, hash, &data[ranges[0].clone()]),
+            bounds(0, 11),
+        )
+        .await
+        .unwrap();
+    assert!(relay.has_upload_in_progress(&room()));
+    tokio::time::advance(crate::relay::UPLOAD_IDLE_TIMEOUT).await;
+    assert!(!relay.has_upload_in_progress(&room()));
+}
+
+#[tokio::test]
+async fn single_request_upload_is_in_progress_while_it_is_handled() {
+    let dir = tempdir().unwrap();
+    let relay = Arc::new(open(&dir));
+    let (gate, gate_rx) = tokio::sync::oneshot::channel::<()>();
+    let upload = tokio::spawn({
+        let relay = Arc::clone(&relay);
+        async move {
+            relay
+                .stage_snapshot(&room(), seq(5), Bytes::from(envelope(100, 1)), async {
+                    gate_rx.await.ok();
+                    Ok(LogBounds {
+                        tail_seq: seq(0),
+                        head_seq: seq(10),
+                    })
+                })
+                .await
+        }
+    });
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(relay.has_upload_in_progress(&room()));
+
+    gate.send(()).unwrap();
+    upload.await.unwrap().unwrap();
+    assert!(!relay.has_upload_in_progress(&room()));
+}

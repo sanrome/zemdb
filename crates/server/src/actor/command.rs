@@ -24,6 +24,8 @@ pub struct CommitResponse {
     pub assigned_seq: SequenceNumber,
     pub catchup_ops: Vec<SequencedOperation>,
     pub has_more: bool,
+    /// Whether this client is the one designated to upload a room snapshot.
+    pub snapshot_wanted: bool,
 }
 
 /// Response returned upon requesting delta operations via Sync.
@@ -32,6 +34,18 @@ pub struct SyncBatchResponse {
     pub head_seq: SequenceNumber,
     pub ops: Vec<SequencedOperation>,
     pub has_more: bool,
+    /// Whether this client is the one designated to upload a room snapshot.
+    pub snapshot_wanted: bool,
+}
+
+/// Response returned to a client's heartbeat.
+#[derive(Debug, Clone)]
+pub struct HeartbeatResponse {
+    pub head_seq: SequenceNumber,
+    /// Whether this client is the one designated to upload a room snapshot.
+    pub snapshot_wanted: bool,
+    /// The relay's active snapshot, only if a client can catch up from it with the retained log.
+    pub active_snapshot_seq: Option<SequenceNumber>,
 }
 
 /// Metrics snapshot for a room actor.
@@ -49,10 +63,18 @@ pub struct RoomMetrics {
 }
 
 /// Real-time notifications emitted by a RoomActor for SSE subscribers.
+///
+/// Events only speed clients up: the replies to heartbeats, syncs and commits are the source
+/// of truth, since SSE is optional and a slow subscriber can miss events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoomEvent {
     HeadAdvanced(SequenceNumber),
     SchemaReloaded(SchemaId),
+    /// A client was designated to upload a snapshot. Carries no data: a client learns whether
+    /// it is the designee from its next heartbeat.
+    SnapshotWanted,
+    /// A new snapshot that clients can catch up from is available in the relay.
+    SnapshotAvailable(SequenceNumber),
 }
 
 /// Commands dispatched to a RoomActor.
@@ -103,7 +125,7 @@ pub enum RoomCommand {
     /// Inform the actor that the client is active to maintain lease (liveness ping).
     Heartbeat {
         client_id: ClientId,
-        reply: oneshot::Sender<Result<SequenceNumber, ServerError>>,
+        reply: oneshot::Sender<Result<HeartbeatResponse, ServerError>>,
     },
 
     /// Subscribe to the room's signal-only SSE broadcast channel.

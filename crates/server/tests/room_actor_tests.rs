@@ -802,7 +802,10 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
         .await
         .unwrap();
 
-    // 1. Alice registers and commits 10 operations (1..=10)
+    // 1. Alice registers and commits 20 operations (1..=20). With 5 operations per segment
+    // the log holds several sealed segments, so a floor above the snapshot can delete the
+    // deltas that follow it. Her commits report cursor 0, so no maintenance tick can prune
+    // anything before the snapshot is staged.
     let alice = ClientId::new("alice").unwrap();
     let (reg_tx, reg_rx) = oneshot::channel();
     sender
@@ -815,14 +818,14 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
         .unwrap();
     reg_rx.await.unwrap().unwrap();
 
-    for i in 1..=10 {
+    for i in 1..=20 {
         let op = create_insert_op(&schema, i, &format!("task-{}", i));
         let (tx, rx) = oneshot::channel();
         sender
             .send(RoomCommand::Commit {
                 client_id: alice.clone(),
                 mutation_id: MutationId::new([i as u8; 16]),
-                last_ack_seq: SequenceNumber::new(i as u64 - 1),
+                last_ack_seq: SequenceNumber::new(0),
                 op,
                 reply: tx,
             })
@@ -850,13 +853,14 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
         .await
         .unwrap();
 
-    // 3. Alice acknowledges seq 10. Proactive pruning triggers, but
-    // Retention Anchor at seq 5 MUST prevent pruning deltas 6..=10!
+    // 3. Alice, the only registered client, acknowledges seq 20. Her cursor alone would put
+    // the pruning floor at 20 and delete every sealed segment up to seq 15; the Retention
+    // Anchor at seq 5 must keep deltas 6..=20.
     let (ack_tx, ack_rx) = oneshot::channel();
     sender
         .send(RoomCommand::Ack {
             client_id: alice.clone(),
-            ack_seq: SequenceNumber::new(10),
+            ack_seq: SequenceNumber::new(20),
             reply: ack_tx,
         })
         .await
@@ -875,23 +879,16 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
         .await
         .unwrap();
     let bob_reg = reg_bob_rx.await.unwrap().unwrap();
-    assert_eq!(bob_reg.head_seq, SequenceNumber::new(10));
+    assert_eq!(bob_reg.head_seq, SequenceNumber::new(20));
     assert_eq!(bob_reg.active_snapshot_seq, Some(SequenceNumber::new(5)));
+    assert!(
+        bob_reg.tail_seq <= SequenceNumber::new(6),
+        "the anchor must keep the deltas after the snapshot (tail {})",
+        bob_reg.tail_seq
+    );
 
-    // 5. Bob applies snapshot at 5 and confirms via Ack(5)
-    let (ack_bob_tx, ack_bob_rx) = oneshot::channel();
-    sender
-        .send(RoomCommand::Ack {
-            client_id: bob.clone(),
-            ack_seq: SequenceNumber::new(5),
-            reply: ack_bob_tx,
-        })
-        .await
-        .unwrap();
-    ack_bob_rx.await.unwrap().unwrap();
-
-    // 6. Bob requests deltas after snapshot: Sync { from_seq: 5 }
-    // These deltas MUST be present thanks to the Retention Anchor!
+    // 5. Bob applies the snapshot at 5 and requests the deltas after it: Sync { from_seq: 5 }.
+    // These deltas MUST be present thanks to the Retention Anchor.
     let (sync_tx, sync_rx) = oneshot::channel();
     sender
         .send(RoomCommand::Sync {
@@ -906,9 +903,9 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
         .await
         .unwrap()
         .expect("Sync after snapshot must succeed");
-    assert_eq!(sync_res.ops.len(), 5);
+    assert_eq!(sync_res.ops.len(), 15);
     assert_eq!(sync_res.ops[0].seq, SequenceNumber::new(6));
-    assert_eq!(sync_res.ops[4].seq, SequenceNumber::new(10));
+    assert_eq!(sync_res.ops[14].seq, SequenceNumber::new(20));
 }
 
 #[tokio::test]

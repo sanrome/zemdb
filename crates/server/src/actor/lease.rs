@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 use zemdb_core::id::{ClientId, SequenceNumber};
 
@@ -10,17 +10,23 @@ use crate::durable;
 use crate::error::ServerError;
 
 /// Lifecycle status of a registered room client.
+///
+/// Every activity of a client recomputes its state from its cursor: a cursor behind the
+/// retained log (`cursor < tail_seq - 1`) makes it `Bootstrapping`, any other makes it
+/// `Connected`. Only the maintenance tick moves a client to `Disconnected` or `Dormant`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientState {
-    /// Actively bootstrapping (downloading/applying a base snapshot).
-    /// Holds an active lease and emits heartbeats, but does NOT block proactive log pruning.
+    /// Active, but its cursor is behind the retained log: it needs a base snapshot.
+    /// Holds an active lease, but does NOT block proactive log pruning.
     Bootstrapping,
-    /// Actively connected and communicating via heartbeats, syncs, or commits.
+    /// Active, with its cursor inside the retained log.
     Connected,
-    /// Offline or disconnected, but its cursor is still within the server's retained logs.
+    /// Its lease expired without activity, but its cursor is still within the retained log.
+    /// Blocks proactive log pruning, since it can still catch up from the log.
     Disconnected,
-    /// Offline so long that its pending deltas were pruned from disk (last_ack_seq < tail_seq - 1).
-    /// Requires a full base snapshot to catch up.
+    /// Inactive and behind the retained log (or, when configured, inactive for longer than
+    /// the dormancy timeout). Does not block pruning; on its next activity the cursor decides
+    /// whether it is `Connected` or `Bootstrapping`.
     Dormant,
 }
 
@@ -34,15 +40,19 @@ pub struct ClientEntry {
     pub last_heartbeat: Instant,
 }
 
-/// Persistent tracker for client leases, cursors, and room membership.
+/// Persistent tracker for client leases, cursors, and room membership, which also keeps the
+/// room's snapshot demand on disk.
 ///
-/// Membership changes (register, deregister) are written to disk immediately. Cursor and
-/// state changes only update memory and mark the roster dirty; the owner flushes them with
-/// `persist_if_dirty`. Losing an unflushed cursor advance only makes the server retain more log.
+/// Membership changes (register, deregister) are written to disk immediately. Cursor, state
+/// and snapshot demand changes only update memory and mark the roster dirty; the owner flushes
+/// them with `persist_if_dirty`. Losing an unflushed cursor advance only makes the server
+/// retain more log.
 #[derive(Debug)]
 pub struct ClientLeaseTracker {
     path: PathBuf,
     clients: HashMap<ClientId, ClientEntry>,
+    /// Wall-clock time of the last renewal of the room's snapshot demand, if it is on.
+    snapshot_demand: Option<SystemTime>,
     dirty: bool,
 }
 
@@ -52,7 +62,9 @@ impl ClientLeaseTracker {
     /// An entry that cannot be parsed is skipped with a warning; a roster that cannot be
     /// parsed at all is discarded with a warning and the tracker starts empty. Dropped
     /// clients register again, and until they do no client cursor allows proactive pruning,
-    /// which is the safe direction. Errors reading the file are still reported.
+    /// which is the safe direction. An invalid snapshot demand is dropped with a warning (the
+    /// next client that needs a snapshot turns it on again). Errors reading the file are
+    /// still reported.
     pub fn open_or_create(path: impl AsRef<Path>) -> Result<Self, ServerError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -65,55 +77,32 @@ impl ClientLeaseTracker {
             Err(e) => return Err(e.into()),
         }
 
-        let mut clients = HashMap::new();
-
         let content = match fs::read_to_string(&path) {
             Ok(content) => content,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e.into()),
         };
-        if !content.trim().is_empty() {
-            // Entries are parsed one by one so that a single invalid entry (for example a
-            // client id that no longer passes validation) only drops that client.
-            match serde_json::from_str::<Vec<serde_json::Value>>(&content) {
-                Ok(raw_entries) => {
-                    for raw in raw_entries {
-                        match serde_json::from_value::<ClientEntry>(raw) {
-                            Ok(mut entry) => {
-                                entry.last_heartbeat = Instant::now();
-                                clients.insert(entry.client_id.clone(), entry);
-                            }
-                            Err(e) => {
-                                warn!(
-                                    path = %path.display(),
-                                    error = %e,
-                                    "Skipping invalid entry in clients roster"
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "Unreadable clients roster; starting with an empty roster"
-                    );
-                }
-            }
-        }
+        let (clients, snapshot_demand) = if content.trim().is_empty() {
+            (HashMap::new(), None)
+        } else {
+            parse_roster(&path, &content)
+        };
 
         Ok(Self {
             path,
             clients,
+            snapshot_demand,
             dirty: false,
         })
     }
 
     /// Atomically and durably persists the client roster to disk, clearing the dirty mark.
     pub fn save(&mut self) -> Result<(), ServerError> {
-        let entries: Vec<&ClientEntry> = self.clients.values().collect();
-        let json = serde_json::to_string_pretty(&entries).map_err(|e| {
+        let roster = RosterFile {
+            clients: self.clients.values().collect(),
+            snapshot_demand: self.snapshot_demand.map(PersistedDemand::from_time),
+        };
+        let json = serde_json::to_string_pretty(&roster).map_err(|e| {
             ServerError::Serialization(format!("Failed to serialize clients roster: {}", e))
         })?;
 
@@ -130,6 +119,36 @@ impl ClientLeaseTracker {
         Ok(())
     }
 
+    /// Wall-clock time at which the room's snapshot demand was last renewed, if it is on.
+    pub fn snapshot_demand(&self) -> Option<SystemTime> {
+        self.snapshot_demand
+    }
+
+    /// Records the room's snapshot demand: the time of its last renewal, or `None` once it
+    /// is off. A change only marks the roster dirty.
+    pub fn set_snapshot_demand(&mut self, renewed_at: Option<SystemTime>) {
+        if self.snapshot_demand != renewed_at {
+            self.snapshot_demand = renewed_at;
+            self.dirty = true;
+        }
+    }
+
+    /// Records a renewal of the room's snapshot demand at the wall-clock time `now`. The stored
+    /// renewal time only moves once it is `granularity` old, so frequent renewals do not
+    /// rewrite the roster on every maintenance tick.
+    pub fn renew_snapshot_demand(&mut self, now: SystemTime, granularity: Duration) {
+        let stale = match self.snapshot_demand {
+            None => true,
+            // A stored time in the future (the clock moved backwards) is replaced as well.
+            Some(stored) => now
+                .duration_since(stored)
+                .map_or(true, |age| age >= granularity),
+        };
+        if stale {
+            self.set_snapshot_demand(Some(now));
+        }
+    }
+
     /// Registers a client, setting its initial state based on its current cursor vs tail_seq:
     /// - If `current_seq` is behind `tail_seq - 1` (or None in a pruned room), client enters `Bootstrapping`.
     /// - Otherwise, client enters `Connected` with its actual acknowledged sequence.
@@ -139,18 +158,12 @@ impl ClientLeaseTracker {
         current_seq: Option<SequenceNumber>,
         tail_seq: SequenceNumber,
     ) -> Result<ClientState, ServerError> {
-        let is_behind = match current_seq {
-            Some(seq) => tail_seq.get() > 0 && seq.get() < tail_seq.get().saturating_sub(1),
-            None => tail_seq.get() > 1,
-        };
-
-        let initial_state = if is_behind {
+        let last_ack = current_seq.unwrap_or(SequenceNumber::new(0));
+        let initial_state = if is_behind_log(last_ack, tail_seq) {
             ClientState::Bootstrapping
         } else {
             ClientState::Connected
         };
-
-        let last_ack = current_seq.unwrap_or(SequenceNumber::new(0));
 
         if let Some(entry) = self.clients.get_mut(client_id) {
             entry.state = initial_state;
@@ -173,69 +186,45 @@ impl ClientLeaseTracker {
         Ok(initial_state)
     }
 
-    /// Records an explicit acknowledgment of applied sequences from a client,
-    /// advancing its cursor (never backwards) and resetting its lease timer.
-    /// Acknowledgment promotes a Bootstrapping client to Connected.
-    /// The change is kept in memory and marks the roster dirty.
-    pub fn record_ack(&mut self, client_id: &ClientId, ack_seq: SequenceNumber) {
-        self.dirty = true;
-        if let Some(entry) = self.clients.get_mut(client_id) {
-            entry.state = ClientState::Connected;
-            entry.last_heartbeat = Instant::now();
-            advance_monotonic(entry, ack_seq);
+    /// Records activity of a registered client and recomputes its lifecycle state from its
+    /// cursor: the stored cursor, moved forward to `reported_cursor` if that is ahead (a
+    /// cursor never moves backwards).
+    ///
+    /// - Behind the retained log (`cursor < tail_seq - 1`): the client becomes `Bootstrapping`
+    ///   and its cursor is left unchanged.
+    /// - Otherwise: the client becomes `Connected` and its cursor advances.
+    ///
+    /// Either way the lease is refreshed. Returns the new state, or `None` for a client that
+    /// is not registered, which is never added to the roster. Changes only mark the roster
+    /// dirty.
+    pub fn observe(
+        &mut self,
+        client_id: &ClientId,
+        reported_cursor: Option<SequenceNumber>,
+        tail_seq: SequenceNumber,
+    ) -> Option<ClientState> {
+        let entry = self.clients.get_mut(client_id)?;
+        let cursor = match reported_cursor {
+            Some(reported) => reported.max(entry.last_ack_seq),
+            None => entry.last_ack_seq,
+        };
+        let state = if is_behind_log(cursor, tail_seq) {
+            ClientState::Bootstrapping
         } else {
-            self.clients.insert(
-                client_id.clone(),
-                ClientEntry {
-                    client_id: client_id.clone(),
-                    state: ClientState::Connected,
-                    last_ack_seq: ack_seq,
-                    last_heartbeat: Instant::now(),
-                },
-            );
-        }
-    }
+            ClientState::Connected
+        };
 
-    /// Advances a registered client's cursor to `seq` if it is ahead of the current one,
-    /// without changing its lifecycle state or lease timer. Used when an accepted commit
-    /// reports the client's cursor. The change is kept in memory and marks the roster dirty.
-    pub fn advance_cursor(&mut self, client_id: &ClientId, seq: SequenceNumber) {
-        if let Some(entry) = self.clients.get_mut(client_id) {
-            if advance_monotonic(entry, seq) {
-                self.dirty = true;
-            }
+        entry.last_heartbeat = Instant::now();
+        let mut changed = entry.state != state;
+        entry.state = state;
+        if state == ClientState::Connected && cursor != entry.last_ack_seq {
+            entry.last_ack_seq = cursor;
+            changed = true;
         }
-    }
-
-    /// Records a heartbeat for a client, resetting its lease timer and marking it Connected.
-    /// Does NOT modify the client's acknowledged sequence cursor.
-    pub fn record_heartbeat(&mut self, client_id: &ClientId) -> Result<(), ServerError> {
-        if let Some(entry) = self.clients.get_mut(client_id) {
-            let was_disconnected = entry.state == ClientState::Disconnected;
-            entry.state = ClientState::Connected;
-            entry.last_heartbeat = Instant::now();
-            if was_disconnected {
-                self.dirty = true;
-            }
-            Ok(())
-        } else {
-            Err(ServerError::Internal(format!(
-                "Client {} not registered",
-                client_id
-            )))
+        if changed {
+            self.dirty = true;
         }
-    }
-
-    /// Records client activity without modifying its acknowledged sequence.
-    /// A state change marks the roster dirty.
-    pub fn record_activity(&mut self, client_id: &ClientId) {
-        if let Some(entry) = self.clients.get_mut(client_id) {
-            if entry.state != ClientState::Connected {
-                self.dirty = true;
-            }
-            entry.state = ClientState::Connected;
-            entry.last_heartbeat = Instant::now();
-        }
+        Some(state)
     }
 
     /// Explicitly deregisters a client from the room roster.
@@ -249,28 +238,31 @@ impl ClientLeaseTracker {
     }
 
     /// Evaluates timeouts for all registered clients (changes only mark the roster dirty):
-    /// - `Connected` / `Bootstrapping` -> `Disconnected` when lease expires without heartbeat.
-    /// - `Disconnected` -> `Dormant` when its cursor falls behind `tail_seq - 1` or exceeds 90s inactivity.
-    pub fn check_timeouts(&mut self, lease_timeout: Duration, tail_seq: SequenceNumber) -> bool {
+    /// - `Connected` / `Bootstrapping` -> `Disconnected` when the lease expires without activity.
+    /// - `Disconnected` -> `Dormant` when its cursor falls behind `tail_seq - 1`, or, only if
+    ///   `dormant_after` is set, once it has been inactive for longer than that.
+    pub fn check_timeouts(
+        &mut self,
+        lease_timeout: Duration,
+        dormant_after: Option<Duration>,
+        tail_seq: SequenceNumber,
+    ) -> bool {
         let mut modified = false;
         let now = Instant::now();
-        let max_disconnected_duration = Duration::from_secs(90);
 
         for entry in self.clients.values_mut() {
+            let inactive_for = now.saturating_duration_since(entry.last_heartbeat);
             match entry.state {
                 ClientState::Connected | ClientState::Bootstrapping => {
-                    if now.duration_since(entry.last_heartbeat) > lease_timeout {
+                    if inactive_for > lease_timeout {
                         entry.state = ClientState::Disconnected;
                         modified = true;
                     }
                 }
                 ClientState::Disconnected => {
-                    let fallen_behind = tail_seq.get() > 0
-                        && entry.last_ack_seq.get() < tail_seq.get().saturating_sub(1);
-                    let disconnected_timed_out =
-                        now.duration_since(entry.last_heartbeat) > max_disconnected_duration;
-
-                    if fallen_behind || disconnected_timed_out {
+                    let fallen_behind = is_behind_log(entry.last_ack_seq, tail_seq);
+                    let dormant_by_time = dormant_after.is_some_and(|limit| inactive_for > limit);
+                    if fallen_behind || dormant_by_time {
                         entry.state = ClientState::Dormant;
                         modified = true;
                     }
@@ -312,20 +304,6 @@ impl ClientLeaseTracker {
             .min()
     }
 
-    /// Checks if a client is in the `Bootstrapping` state.
-    pub fn is_bootstrapping(&self, client_id: &ClientId) -> bool {
-        self.clients
-            .get(client_id)
-            .is_some_and(|c| c.state == ClientState::Bootstrapping)
-    }
-
-    /// Checks if a client is in the `Dormant` state.
-    pub fn is_dormant(&self, client_id: &ClientId) -> bool {
-        self.clients
-            .get(client_id)
-            .is_some_and(|c| c.state == ClientState::Dormant)
-    }
-
     /// Checks if a client is registered in the room roster.
     pub fn is_registered(&self, client_id: &ClientId) -> bool {
         self.clients.contains_key(client_id)
@@ -346,6 +324,22 @@ impl ClientLeaseTracker {
     /// Returns a mutable reference to a client entry if registered.
     pub fn get_client_mut(&mut self, client_id: &ClientId) -> Option<&mut ClientEntry> {
         self.clients.get_mut(client_id)
+    }
+
+    /// Chooses the client that should upload a snapshot: among `Connected` clients not in
+    /// `excluded`, the one with the highest cursor, then the most recent activity, then the
+    /// lowest client id (so the choice is deterministic).
+    pub fn pick_uploader(&self, excluded: &HashSet<ClientId>) -> Option<ClientId> {
+        self.clients
+            .values()
+            .filter(|c| c.state == ClientState::Connected && !excluded.contains(&c.client_id))
+            .max_by(|a, b| {
+                a.last_ack_seq
+                    .cmp(&b.last_ack_seq)
+                    .then(a.last_heartbeat.cmp(&b.last_heartbeat))
+                    .then(b.client_id.cmp(&a.client_id))
+            })
+            .map(|c| c.client_id.clone())
     }
 
     /// Returns (bootstrapping, connected, disconnected, dormant, total) client counts.
@@ -374,15 +368,107 @@ impl ClientLeaseTracker {
     }
 }
 
-/// Moves `entry`'s cursor forward to `seq`; a cursor never moves backwards.
-/// Returns true if the cursor changed.
-fn advance_monotonic(entry: &mut ClientEntry, seq: SequenceNumber) -> bool {
-    if seq > entry.last_ack_seq {
-        entry.last_ack_seq = seq;
-        true
-    } else {
-        false
+/// On-disk layout of the roster file. Files written before the snapshot demand was persisted
+/// hold only the array of clients, and still load.
+#[derive(Serialize)]
+struct RosterFile<'a> {
+    clients: Vec<&'a ClientEntry>,
+    snapshot_demand: Option<PersistedDemand>,
+}
+
+/// The room's snapshot demand on disk: when it was last renewed, in wall-clock milliseconds
+/// since the Unix epoch (an `Instant` does not survive a restart).
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedDemand {
+    renewed_at_unix_ms: u64,
+}
+
+impl PersistedDemand {
+    fn from_time(time: SystemTime) -> Self {
+        let millis = time
+            .duration_since(UNIX_EPOCH)
+            .map(|since| since.as_millis())
+            .unwrap_or(0);
+        Self {
+            renewed_at_unix_ms: u64::try_from(millis).unwrap_or(u64::MAX),
+        }
     }
+
+    fn to_time(&self) -> Option<SystemTime> {
+        UNIX_EPOCH.checked_add(Duration::from_millis(self.renewed_at_unix_ms))
+    }
+}
+
+/// Parses a roster file: the current object (`clients` and `snapshot_demand`) or the earlier
+/// array of clients.
+///
+/// Entries are parsed one by one so that a single invalid entry (for example a client id that
+/// no longer passes validation) only drops that client, and an invalid snapshot demand only
+/// drops the demand. A file whose clients cannot be found at all yields an empty roster. Each
+/// loss is logged as a warning.
+fn parse_roster(
+    path: &Path,
+    content: &str,
+) -> (HashMap<ClientId, ClientEntry>, Option<SystemTime>) {
+    let unreadable = |error: &dyn std::fmt::Display| {
+        warn!(
+            path = %path.display(),
+            error = %error,
+            "Unreadable clients roster; starting with an empty roster"
+        );
+        (HashMap::new(), None)
+    };
+    let (raw_entries, raw_demand) = match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(serde_json::Value::Array(entries)) => (entries, None),
+        Ok(serde_json::Value::Object(mut object)) => match object.remove("clients") {
+            Some(serde_json::Value::Array(entries)) => (entries, object.remove("snapshot_demand")),
+            _ => return unreadable(&"missing clients array"),
+        },
+        Ok(_) => return unreadable(&"not a roster"),
+        Err(e) => return unreadable(&e),
+    };
+
+    let mut clients = HashMap::new();
+    for raw in raw_entries {
+        match serde_json::from_value::<ClientEntry>(raw) {
+            Ok(mut entry) => {
+                entry.last_heartbeat = Instant::now();
+                clients.insert(entry.client_id.clone(), entry);
+            }
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Skipping invalid entry in clients roster"
+                );
+            }
+        }
+    }
+
+    let snapshot_demand = match raw_demand {
+        None | Some(serde_json::Value::Null) => None,
+        Some(raw) => match serde_json::from_value::<PersistedDemand>(raw)
+            .ok()
+            .and_then(|demand| demand.to_time())
+        {
+            Some(renewed_at) => Some(renewed_at),
+            None => {
+                warn!(
+                    path = %path.display(),
+                    "Invalid snapshot demand in clients roster; treating it as off"
+                );
+                None
+            }
+        },
+    };
+
+    (clients, snapshot_demand)
+}
+
+/// Whether a client at `cursor` can no longer catch up from a log retaining `tail_seq..`:
+/// it needs every operation after `cursor`, so it is behind when `cursor < tail_seq - 1`.
+fn is_behind_log(cursor: SequenceNumber, tail_seq: SequenceNumber) -> bool {
+    cursor.get().saturating_add(1) < tail_seq.get()
 }
 
 #[cfg(test)]

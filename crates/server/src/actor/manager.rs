@@ -10,6 +10,7 @@ use zemdb_core::id::{RoomId, SchemaId, SequenceNumber};
 
 use crate::actor::command::RoomCommand;
 use crate::actor::room::RoomActor;
+use crate::actor::snapshot_demand::DESIGNATION_TIMEOUT;
 use crate::config::ServerConfig;
 use crate::durable;
 use crate::error::ServerError;
@@ -41,6 +42,9 @@ pub struct RoomManager {
     schema_registry: Arc<SchemaRegistry>,
     snapshot_relay: Arc<SnapshotRelay>,
     data_dir: PathBuf,
+    /// Time a client designated to upload a snapshot has to start the upload; always
+    /// [`DESIGNATION_TIMEOUT`] outside tests.
+    designation_timeout: Duration,
 }
 
 impl RoomManager {
@@ -60,7 +64,15 @@ impl RoomManager {
             schema_registry,
             snapshot_relay,
             data_dir,
+            designation_timeout: DESIGNATION_TIMEOUT,
         }
+    }
+
+    /// Shortens the time a designated snapshot uploader has to start, for rooms spawned
+    /// afterwards.
+    #[cfg(test)]
+    pub(crate) fn set_designation_timeout(&mut self, timeout: Duration) {
+        self.designation_timeout = timeout;
     }
 
     /// Retrieves an existing room actor sender or lazily spawns a new one with default lifecycle policy.
@@ -139,7 +151,7 @@ impl RoomManager {
             .ok_or_else(|| ServerError::SchemaNotFound(resolved_schema_id.to_string()))?;
 
         // 6. Spawn RoomActor and retain handle
-        let (sender, handle) = RoomActor::spawn(
+        let (sender, handle) = RoomActor::spawn_with_designation_timeout(
             room_id.clone(),
             resolved_schema_id,
             schema,
@@ -147,6 +159,7 @@ impl RoomManager {
             Arc::clone(&self.config),
             lifecycle_policy,
             Arc::clone(&self.snapshot_relay),
+            self.designation_timeout,
         )?;
 
         self.rooms.insert(room_id.clone(), sender.clone());
@@ -269,7 +282,7 @@ impl RoomManager {
         self.room_schemas.insert(room_id.clone(), schema_id.clone());
 
         // Spawn actor and retain handle
-        let (sender, handle) = RoomActor::spawn(
+        let (sender, handle) = RoomActor::spawn_with_designation_timeout(
             room_id.clone(),
             schema_id,
             schema,
@@ -277,6 +290,7 @@ impl RoomManager {
             Arc::clone(&self.config),
             lifecycle_policy.unwrap_or_default(),
             Arc::clone(&self.snapshot_relay),
+            self.designation_timeout,
         )?;
 
         self.rooms.insert(room_id.clone(), sender);
@@ -329,21 +343,29 @@ impl RoomManager {
         schema_id: &SchemaId,
         schema: Arc<zemdb_core::schema::Schema>,
     ) -> Vec<RoomId> {
+        // The targets are collected first so that no map guard is held while waiting for the
+        // actors: a concurrent writer to the same shard would otherwise block on the lock.
+        let room_ids: Vec<RoomId> = self
+            .room_schemas
+            .iter()
+            .filter(|kv| kv.value() == schema_id)
+            .map(|kv| kv.key().clone())
+            .collect();
+        let targets: Vec<(RoomId, mpsc::Sender<RoomCommand>)> = room_ids
+            .into_iter()
+            .filter_map(|room_id| self.get_room(&room_id).map(|sender| (room_id, sender)))
+            .collect();
+
         let mut reloaded = Vec::new();
-        for kv in self.room_schemas.iter() {
-            if kv.value() == schema_id {
-                let room_id = kv.key().clone();
-                if let Some(sender) = self.get_room(&room_id) {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    let cmd = RoomCommand::ReloadSchema {
-                        schema: Arc::clone(&schema),
-                        reply: tx,
-                    };
-                    if sender.send(cmd).await.is_ok() {
-                        let _ = rx.await;
-                        reloaded.push(room_id);
-                    }
-                }
+        for (room_id, sender) in targets {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cmd = RoomCommand::ReloadSchema {
+                schema: Arc::clone(&schema),
+                reply: tx,
+            };
+            if sender.send(cmd).await.is_ok() {
+                let _ = rx.await;
+                reloaded.push(room_id);
             }
         }
         reloaded
