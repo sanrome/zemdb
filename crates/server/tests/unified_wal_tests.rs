@@ -279,8 +279,8 @@ fn test_server_error_mapping() {
         axum::http::StatusCode::BAD_REQUEST
     );
 
-    let gw_err = ServerError::GatewayTimeout("Actor timed out".to_string());
-    assert_eq!(gw_err.to_error_code(), ErrorCode::Internal);
+    let gw_err = ServerError::Timeout("Actor timed out".to_string());
+    assert_eq!(gw_err.to_error_code(), ErrorCode::Timeout);
     assert_eq!(
         gw_err.to_status_code(),
         axum::http::StatusCode::GATEWAY_TIMEOUT

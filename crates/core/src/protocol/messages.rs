@@ -4,22 +4,32 @@ use crate::schema::Schema;
 use serde::{Deserialize, Serialize};
 
 /// Error codes returned by the coordination server.
+///
+/// Clients decide how to react from the code: `Unauthorized` asks for a new token,
+/// `Forbidden` is permanent, `ClientNotRegistered` asks to register again, and `Unavailable`
+/// and `Timeout` may be retried (commits are deduplicated by `MutationId`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ErrorCode {
     SchemaViolation,
     RoomNotFound,
-    ClientDeregistered,
+    /// The client is not in the room's roster (never registered, or deregistered); it must
+    /// register again.
+    ClientNotRegistered,
     /// The client's cursor is older than the oldest retained log entry;
     /// client must request a full snapshot.
     BehindCompaction,
     RateLimited,
     RoomLocked,
+    /// An unexpected server failure. Not retried automatically.
     Internal,
+    /// The client token is missing, malformed, wrongly signed or expired; the client needs a
+    /// new token.
     Unauthorized,
     RoomAlreadyExists,
     TableAlreadyExists,
     SchemaNotFound,
     InvalidSequence,
+    /// The request frame has another protocol version than the server's.
     ProtocolVersionMismatch,
     /// The request is malformed or carries an invalid value (for example an invalid ID).
     BadRequest,
@@ -28,6 +38,14 @@ pub enum ErrorCode {
     /// active snapshot or the upload in progress. A download restarts from chunk 0 without
     /// `snapshot_hash`.
     SnapshotSuperseded,
+    /// The token is valid but does not grant the request: it was issued for another room, or
+    /// the message names another client than the token. Permanent for that token.
+    Forbidden,
+    /// The room is temporarily unable to answer (it is restarting after a failure, or its
+    /// actor stopped); retry after the delay in the `Retry-After` header.
+    Unavailable,
+    /// The room did not answer in time. Retrying is safe.
+    Timeout,
 }
 
 /// An operation ordered by the coordination server with assigned sequence ID.
@@ -184,6 +202,14 @@ pub enum ServerMessage {
         chunk_index: u32,
         total_chunks: u32,
         staged: bool,
+    },
+    /// Acknowledgment of a snapshot uploaded in a single request
+    /// (`POST /rooms/:room_id/snapshot/upload`): the snapshot is staged and active.
+    SnapshotStaged {
+        room_id: RoomId,
+        snapshot_head_seq: SequenceNumber,
+        /// BLAKE3 256-bit digest of the uploaded snapshot.
+        snapshot_hash: [u8; 32],
     },
     /// Acknowledgment of a heartbeat. A heartbeat never fails because the client fell
     /// behind the retained log; the client learns it from its next sync or commit.

@@ -27,6 +27,14 @@ pub struct WalBatchPayload {
     pub ops: Vec<SequencedOperation>,
 }
 
+/// Borrowed form of [`WalBatchPayload`], with the same encoding, used to encode and measure
+/// records without copying the operations.
+#[derive(serde::Serialize)]
+struct WalBatchPayloadRef<'a> {
+    mutation_id: Option<MutationId>,
+    ops: &'a [SequencedOperation],
+}
+
 /// Result of attempting to decode a WAL batch from a byte buffer.
 #[derive(Debug, PartialEq, Clone)]
 pub enum WalBatchDecodeResult {
@@ -77,10 +85,7 @@ pub fn encode_wal_batch(
     ops: &[SequencedOperation],
     mutation_id: Option<MutationId>,
 ) -> Result<Vec<u8>, WalFrameError> {
-    let payload_struct = WalBatchPayload {
-        mutation_id,
-        ops: ops.to_vec(),
-    };
+    let payload_struct = WalBatchPayloadRef { mutation_id, ops };
     let payload = bincode::serialize(&payload_struct)
         .map_err(|e| WalFrameError::Serialization(e.to_string()))?;
     if payload.len() as u64 > MAX_MESSAGE_SIZE {
@@ -101,6 +106,19 @@ pub fn encode_wal_batch(
     record.extend_from_slice(&ops_count.to_le_bytes());
     record.extend_from_slice(&payload);
     Ok(record)
+}
+
+/// Size of the payload of the WAL record that `encode_wal_record` would produce for `op`,
+/// without encoding it. `encode_wal_record` fails if it exceeds `MAX_MESSAGE_SIZE`.
+pub fn wal_record_payload_len(
+    op: &SequencedOperation,
+    mutation_id: Option<MutationId>,
+) -> Result<u64, WalFrameError> {
+    let payload = WalBatchPayloadRef {
+        mutation_id,
+        ops: std::slice::from_ref(op),
+    };
+    bincode::serialized_size(&payload).map_err(|e| WalFrameError::Serialization(e.to_string()))
 }
 
 /// Encodes a single `SequencedOperation` along with optional `MutationId` metadata into an append-only WAL batch.

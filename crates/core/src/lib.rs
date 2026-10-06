@@ -22,11 +22,13 @@ pub use mutation::{
     ColumnUpdate, Operation, OperationKind, SquashOutcome, TableBuffer, UpdateBuilder,
 };
 pub use protocol::{
-    decode_message, decode_wal_batch_from_slice, decode_wal_record_from_slice, encode_message,
-    encode_wal_batch, encode_wal_record, replay_wal_records, validate_snapshot_envelope,
-    ClientMessage, ErrorCode, SequencedOperation, ServerMessage, SnapshotCompression,
+    check_operation_size, decode_message, decode_wal_batch_from_slice,
+    decode_wal_record_from_slice, encode_message, encode_wal_batch, encode_wal_record,
+    peek_version, replay_wal_records, validate_snapshot_envelope, ClientMessage, DecodeError,
+    ErrorCode, OperationSizeError, SequencedOperation, ServerMessage, SnapshotCompression,
     SnapshotEnvelopeError, SnapshotEnvelopeHeader, SnapshotEnvelopeValidator, WalBatchDecodeResult,
-    WalDecodeResult, WalFrameError, BATCH_HEADER_SIZE, BATCH_MAGIC, MAX_MESSAGE_SIZE,
+    WalDecodeResult, WalFrameError, BATCH_HEADER_SIZE, BATCH_MAGIC, MAX_FRAME_SIZE,
+    MAX_MESSAGE_SIZE, MAX_RESPONSE_OPS_BYTES, PROTOCOL_HEADER_LEN, PROTOCOL_VERSION,
     SNAPSHOT_HEADER_LEN, SNAPSHOT_MAGIC, SNAPSHOT_VERSION,
 };
 pub use schema::{

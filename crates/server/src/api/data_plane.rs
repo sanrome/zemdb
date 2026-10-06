@@ -1,12 +1,11 @@
-use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use std::time::Duration;
 use tokio::sync::oneshot;
+use tracing::error;
 use zemdb_core::id::{CorrelationId, RoomId};
 use zemdb_core::protocol::codec::encode_message;
-use zemdb_core::protocol::messages::{ClientMessage, ServerMessage};
+use zemdb_core::protocol::messages::{ClientMessage, ErrorCode, ServerMessage};
 
 use crate::actor::command::RoomCommand;
 use crate::api::auth::verify_client_token_bound;
@@ -14,23 +13,32 @@ use crate::api::extract::{ensure_payload_identity, AuthenticatedRoom, BinaryMess
 use crate::api::router::AppState;
 use crate::error::ServerError;
 
-const ACTOR_TIMEOUT: Duration = Duration::from_secs(5);
-
+/// Encodes `msg` as a binary frame response. A message that cannot be encoded (a bug: every
+/// response is sized to fit a frame) is logged and answered with a small `Internal` error
+/// frame, so the reply is still a frame.
 pub(crate) fn binary_response(status: StatusCode, msg: &ServerMessage) -> Response {
-    match encode_message(msg) {
-        Ok(bytes) => (
-            status,
-            [(header::CONTENT_TYPE, "application/octet-stream")],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            [(header::CONTENT_TYPE, "application/octet-stream")],
-            Bytes::new(),
-        )
-            .into_response(),
-    }
+    let (status, bytes) = match encode_message(msg) {
+        Ok(bytes) => (status, bytes),
+        Err(err) => {
+            error!(error = %err, "Failed to encode a response frame");
+            let fallback = ServerMessage::Error {
+                correlation_id: None,
+                room_id: None,
+                code: ErrorCode::Internal,
+                message: "The response could not be encoded".to_string(),
+            };
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                encode_message(&fallback).unwrap_or_default(),
+            )
+        }
+    };
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    )
+        .into_response()
 }
 
 pub(crate) fn binary_error(
@@ -45,7 +53,9 @@ pub(crate) fn binary_error(
         code: err.to_error_code(),
         message: err.to_string(),
     };
-    binary_response(status, &msg)
+    let mut response = binary_response(status, &msg);
+    err.add_headers(&mut response);
+    response
 }
 
 /// Reply to a message of another kind than the endpoint handles.
@@ -57,27 +67,15 @@ fn unexpected_message(room_id: RoomId, expected: &str) -> Response {
     )
 }
 
-/// Sends a command to the room actor and waits for its reply, bounded by `ACTOR_TIMEOUT`.
+/// Sends a command to the room actor and waits for its reply, returning the actor's own
+/// result. The exchange itself can fail with `RoomNotFound`, `Unavailable` or `Timeout` (see
+/// [`RoomManager::ask`](crate::actor::manager::RoomManager::ask)).
 async fn ask_room<R>(
     state: &AppState,
     room_id: &RoomId,
     command: impl FnOnce(oneshot::Sender<Result<R, ServerError>>) -> RoomCommand,
 ) -> Result<R, ServerError> {
-    let sender = state.room_manager.get_or_spawn(room_id, None).await?;
-    let (tx, rx) = oneshot::channel();
-    let call = async {
-        sender
-            .send(command(tx))
-            .await
-            .map_err(|_| ServerError::Internal("Room actor closed".to_string()))?;
-        rx.await
-            .map_err(|_| ServerError::Internal("Actor reply dropped".to_string()))?
-    };
-    tokio::time::timeout(ACTOR_TIMEOUT, call)
-        .await
-        .map_err(|_| {
-            ServerError::GatewayTimeout("Request timed out waiting for room actor".to_string())
-        })?
+    state.room_manager.ask(room_id, command).await?
 }
 
 /// `POST /rooms/:room_id/register`: Handshake endpoint delivering current head_seq and schema in 1 RTT.
@@ -403,3 +401,7 @@ pub async fn deregister(
         Err(err) => fail(room_id, err),
     }
 }
+
+#[cfg(test)]
+#[path = "tests/data_plane.rs"]
+mod tests;

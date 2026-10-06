@@ -1,12 +1,18 @@
 use axum::extract::DefaultBodyLimit;
+use axum::http::{StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use std::sync::Arc;
 use tokio::sync::watch;
+use zemdb_core::protocol::codec::MAX_FRAME_SIZE;
+use zemdb_core::protocol::messages::ServerMessage;
 
 use crate::actor::manager::RoomManager;
+use crate::api::data_plane::binary_response;
 use crate::api::{control_plane, data_plane, relay, sse};
 use crate::config::ServerConfig;
+use crate::error::ServerError;
 use crate::relay::SnapshotRelay;
 use crate::schema_registry::SchemaRegistry;
 
@@ -103,11 +109,40 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/rooms/:room_id/snapshot/upload-chunk",
             post(relay::upload_chunk),
-        );
+        )
+        .method_not_allowed_fallback(|uri: Uri| async move {
+            unmatched(StatusCode::METHOD_NOT_ALLOWED, &uri)
+        });
 
     Router::new()
         .nest("/admin", admin_routes)
         .merge(data_routes)
-        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .fallback(|uri: Uri| async move { unmatched(StatusCode::NOT_FOUND, &uri) })
+        // Exactly the largest frame the codec produces. Single-request snapshot uploads, whose
+        // body is a raw snapshot, share the same limit.
+        .layer(DefaultBodyLimit::max(MAX_FRAME_SIZE))
         .with_state(state)
+}
+
+/// Answer to a request no route handles (unknown path, or a method the path does not
+/// accept). Under `/rooms/` it is a binary `BadRequest` frame with the given status, since
+/// every Data Plane response is a frame; elsewhere it is the bare status.
+fn unmatched(status: StatusCode, uri: &Uri) -> Response {
+    if !uri.path().starts_with("/rooms/") {
+        return status.into_response();
+    }
+    let err = ServerError::BadRequest(if status == StatusCode::METHOD_NOT_ALLOWED {
+        format!("Method not allowed for {}", uri.path())
+    } else {
+        format!("Unknown endpoint {}", uri.path())
+    });
+    binary_response(
+        status,
+        &ServerMessage::Error {
+            correlation_id: None,
+            room_id: None,
+            code: err.to_error_code(),
+            message: err.to_string(),
+        },
+    )
 }

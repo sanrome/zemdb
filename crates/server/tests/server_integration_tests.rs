@@ -1276,7 +1276,7 @@ async fn test_data_plane_room_path_token_and_payload_mismatch_rejected() {
         .send()
         .await
         .unwrap();
-    assert_ne!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
     // 2. Path vs Payload mismatch: Path is room_a, token is for room_a, but payload says room_b
     let commit_msg_mismatch = ClientMessage::Commit {
@@ -1296,7 +1296,7 @@ async fn test_data_plane_room_path_token_and_payload_mismatch_rejected() {
         .send()
         .await
         .unwrap();
-    assert_ne!(resp2.status(), StatusCode::OK);
+    assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
 
     // 3. Client Impersonation: Token is for alice, but payload says bob
     let bob_id = ClientId::new("bob").unwrap();
@@ -1317,7 +1317,7 @@ async fn test_data_plane_room_path_token_and_payload_mismatch_rejected() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp3.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(resp3.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -2179,7 +2179,7 @@ async fn test_register_with_a_cursor_beyond_the_head_is_an_invalid_sequence() {
         other => panic!("Expected an InvalidSequence error, got {:?}", other),
     }
 
-    // The client was not registered: its heartbeat is unauthorized.
+    // The client was not registered: its heartbeat asks it to register.
     let heartbeat = ClientMessage::Heartbeat {
         correlation_id: CorrelationId::new(8),
         room_id: room_id.clone(),
@@ -2188,5 +2188,5 @@ async fn test_register_with_a_cursor_beyond_the_head_is_an_invalid_sequence() {
     let (status, _) = server
         .post_message(&room_id, "heartbeat", &token, &heartbeat)
         .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::CONFLICT);
 }

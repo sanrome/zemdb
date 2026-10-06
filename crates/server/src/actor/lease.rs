@@ -8,6 +8,7 @@ use zemdb_core::id::{ClientId, SequenceNumber};
 
 use crate::durable;
 use crate::error::ServerError;
+use crate::log::retention::is_behind_tail;
 
 /// Lifecycle status of a registered room client.
 ///
@@ -98,16 +99,23 @@ impl ClientLeaseTracker {
 
     /// Atomically and durably persists the client roster to disk, clearing the dirty mark.
     pub fn save(&mut self) -> Result<(), ServerError> {
+        self.write_roster(self.clients.values().collect())?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Writes `clients`, with the current snapshot demand, as the roster file. Used to persist
+    /// a roster change before applying it in memory, so that a failed write leaves the
+    /// tracker unchanged.
+    fn write_roster(&self, clients: Vec<&ClientEntry>) -> Result<(), ServerError> {
         let roster = RosterFile {
-            clients: self.clients.values().collect(),
+            clients,
             snapshot_demand: self.snapshot_demand.map(PersistedDemand::from_time),
         };
         let json = serde_json::to_string_pretty(&roster).map_err(|e| {
             ServerError::Serialization(format!("Failed to serialize clients roster: {}", e))
         })?;
-
         durable::write_atomic(&self.path, json.as_bytes())?;
-        self.dirty = false;
         Ok(())
     }
 
@@ -152,6 +160,9 @@ impl ClientLeaseTracker {
     /// Registers a client, setting its initial state based on its current cursor vs tail_seq:
     /// - If `current_seq` is behind `tail_seq - 1` (or None in a pruned room), client enters `Bootstrapping`.
     /// - Otherwise, client enters `Connected` with its actual acknowledged sequence.
+    ///
+    /// The roster is written with the new entry first; only then does the tracker change, so a
+    /// failed write leaves the client as it was (unregistered, or with its previous entry).
     pub fn register_client(
         &mut self,
         client_id: &ClientId,
@@ -159,30 +170,29 @@ impl ClientLeaseTracker {
         tail_seq: SequenceNumber,
     ) -> Result<ClientState, ServerError> {
         let last_ack = current_seq.unwrap_or(SequenceNumber::new(0));
-        let initial_state = if is_behind_log(last_ack, tail_seq) {
+        let initial_state = if is_behind_tail(last_ack, tail_seq) {
             ClientState::Bootstrapping
         } else {
             ClientState::Connected
         };
 
-        if let Some(entry) = self.clients.get_mut(client_id) {
-            entry.state = initial_state;
-            entry.last_heartbeat = Instant::now();
-            entry.last_ack_seq = last_ack;
-        } else {
-            self.clients.insert(
-                client_id.clone(),
-                ClientEntry {
-                    client_id: client_id.clone(),
-                    state: initial_state,
-                    last_ack_seq: last_ack,
-                    last_heartbeat: Instant::now(),
-                },
-            );
-        }
+        let entry = ClientEntry {
+            client_id: client_id.clone(),
+            state: initial_state,
+            last_ack_seq: last_ack,
+            last_heartbeat: Instant::now(),
+        };
+        let roster = self
+            .clients
+            .values()
+            .filter(|other| &other.client_id != client_id)
+            .chain(std::iter::once(&entry))
+            .collect();
+        self.write_roster(roster)?;
 
-        self.dirty = true;
-        self.save()?;
+        // The file now holds the whole in-memory roster, including any pending change.
+        self.clients.insert(client_id.clone(), entry);
+        self.dirty = false;
         Ok(initial_state)
     }
 
@@ -208,7 +218,7 @@ impl ClientLeaseTracker {
             Some(reported) => reported.max(entry.last_ack_seq),
             None => entry.last_ack_seq,
         };
-        let state = if is_behind_log(cursor, tail_seq) {
+        let state = if is_behind_tail(cursor, tail_seq) {
             ClientState::Bootstrapping
         } else {
             ClientState::Connected
@@ -227,14 +237,22 @@ impl ClientLeaseTracker {
         Some(state)
     }
 
-    /// Explicitly deregisters a client from the room roster.
+    /// Explicitly deregisters a client from the room roster. As for registration, the roster
+    /// is written before the client is removed from memory. Returns whether it was registered.
     pub fn deregister_client(&mut self, client_id: &ClientId) -> Result<bool, ServerError> {
-        let removed = self.clients.remove(client_id).is_some();
-        if removed {
-            self.dirty = true;
-            self.save()?;
+        if !self.clients.contains_key(client_id) {
+            return Ok(false);
         }
-        Ok(removed)
+        let roster = self
+            .clients
+            .values()
+            .filter(|other| &other.client_id != client_id)
+            .collect();
+        self.write_roster(roster)?;
+
+        self.clients.remove(client_id);
+        self.dirty = false;
+        Ok(true)
     }
 
     /// Evaluates timeouts for all registered clients (changes only mark the roster dirty):
@@ -260,7 +278,7 @@ impl ClientLeaseTracker {
                     }
                 }
                 ClientState::Disconnected => {
-                    let fallen_behind = is_behind_log(entry.last_ack_seq, tail_seq);
+                    let fallen_behind = is_behind_tail(entry.last_ack_seq, tail_seq);
                     let dormant_by_time = dormant_after.is_some_and(|limit| inactive_for > limit);
                     if fallen_behind || dormant_by_time {
                         entry.state = ClientState::Dormant;
@@ -463,12 +481,6 @@ fn parse_roster(
     };
 
     (clients, snapshot_demand)
-}
-
-/// Whether a client at `cursor` can no longer catch up from a log retaining `tail_seq..`:
-/// it needs every operation after `cursor`, so it is behind when `cursor < tail_seq - 1`.
-fn is_behind_log(cursor: SequenceNumber, tail_seq: SequenceNumber) -> bool {
-    cursor.get().saturating_add(1) < tail_seq.get()
 }
 
 #[cfg(test)]

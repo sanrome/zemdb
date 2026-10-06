@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 use zemdb_core::id::{RoomId, SchemaId, SequenceNumber};
 
@@ -23,6 +23,9 @@ const META_ROOM_FILE: &str = "meta_room.json";
 
 /// Interval between checks while waiting for a stopped room actor to finish exiting.
 const PREVIOUS_ACTOR_POLL: Duration = Duration::from_millis(5);
+
+/// How long a request waits for a room actor to take its command and reply.
+pub const ACTOR_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Persistent room configuration linking a RoomId to its assigned SchemaId.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -327,14 +330,38 @@ impl RoomManager {
         &self,
         room_id: &RoomId,
     ) -> Result<(SequenceNumber, SequenceNumber), ServerError> {
-        let sender = self.get_or_spawn(room_id, None).await?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        sender
-            .send(RoomCommand::GetLogBounds { reply: tx })
+        self.ask(room_id, |reply| RoomCommand::GetLogBounds { reply })
             .await
-            .map_err(|_| ServerError::Internal(format!("Room {room_id} actor stopped")))?;
-        rx.await
-            .map_err(|_| ServerError::Internal(format!("Room {room_id} actor stopped")))
+    }
+
+    /// Sends a command to the room's actor, spawning it if needed, and waits for its reply,
+    /// bounded by [`ACTOR_TIMEOUT`].
+    ///
+    /// A room that does not exist is `RoomNotFound`. An actor that stopped (its mailbox
+    /// closed, or it dropped the command because it stopped while the command was queued) is
+    /// `Unavailable`: the next request respawns the room from disk. An actor that does not
+    /// answer in time is `Timeout`. Both may be retried.
+    pub async fn ask<R>(
+        &self,
+        room_id: &RoomId,
+        command: impl FnOnce(oneshot::Sender<R>) -> RoomCommand,
+    ) -> Result<R, ServerError> {
+        let sender = self.get_or_spawn(room_id, None).await?;
+        let (tx, rx) = oneshot::channel();
+        let call = async {
+            sender
+                .send(command(tx))
+                .await
+                .map_err(|_| ServerError::Unavailable(format!("Room {room_id} actor stopped")))?;
+            rx.await.map_err(|_| {
+                ServerError::Unavailable(format!("Room {room_id} actor stopped before replying"))
+            })
+        };
+        tokio::time::timeout(ACTOR_TIMEOUT, call)
+            .await
+            .map_err(|_| {
+                ServerError::Timeout(format!("Room {room_id} actor did not answer in time"))
+            })?
     }
 
     /// Reloads the schema across all active rooms associated with `schema_id`.

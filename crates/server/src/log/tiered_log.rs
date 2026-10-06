@@ -3,6 +3,7 @@ use crate::error::ServerError;
 use crate::log::cold_disk::ColdDiskLog;
 use crate::log::hot_buffer::HotBuffer;
 use crate::log::policy::RoomLifecyclePolicy;
+use crate::log::retention;
 use crate::log::warm_disk::WarmDiskLog;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -467,7 +468,7 @@ impl TieredLog {
     /// Returns true if a client whose cursor is `cursor` can no longer be caught up from the log,
     /// because the operation right after its cursor has already been pruned.
     pub fn is_behind_retention(&self, cursor: SequenceNumber) -> bool {
-        cursor.get().saturating_add(1) < self.tail_seq.get()
+        retention::is_behind_tail(cursor, self.tail_seq)
     }
 
     /// Highest sequence number committed to the log.

@@ -41,10 +41,54 @@ fn interrupted_roster_save_keeps_previous_roster() {
 
     fail_point::arm("write_atomic_before_rename", &path);
     assert!(tracker.register_client(&second, None, seq(1)).is_err());
+    // A failed registration leaves no trace in memory either.
+    assert!(!tracker.is_registered(&second));
 
     let reopened = ClientLeaseTracker::open_or_create(&path).unwrap();
     assert!(reopened.is_registered(&first));
     assert!(!reopened.is_registered(&second));
+}
+
+#[test]
+fn failed_re_registration_keeps_the_previous_entry() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("meta_clients_room.json");
+    let client = ClientId::new("client").unwrap();
+
+    let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
+    tracker
+        .register_client(&client, Some(seq(5)), seq(1))
+        .unwrap();
+
+    // Re-registering with a cursor behind the log would make it Bootstrapping at 0.
+    fail_point::arm("write_atomic_before_rename", &path);
+    assert!(tracker.register_client(&client, None, seq(3)).is_err());
+
+    let entry = tracker.get_client(&client).unwrap();
+    assert_eq!(entry.state, ClientState::Connected);
+    assert_eq!(entry.last_ack_seq, seq(5));
+}
+
+#[test]
+fn failed_deregistration_keeps_the_client() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("meta_clients_room.json");
+    let client = ClientId::new("client").unwrap();
+
+    let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
+    tracker.register_client(&client, None, seq(1)).unwrap();
+
+    fail_point::arm("write_atomic_before_rename", &path);
+    assert!(tracker.deregister_client(&client).is_err());
+    assert!(tracker.is_registered(&client));
+    assert!(ClientLeaseTracker::open_or_create(&path)
+        .unwrap()
+        .is_registered(&client));
+
+    // Deregistering a client that is not registered writes nothing and succeeds.
+    assert!(!tracker
+        .deregister_client(&ClientId::new("other").unwrap())
+        .unwrap());
 }
 
 #[test]

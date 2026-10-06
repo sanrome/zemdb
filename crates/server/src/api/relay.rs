@@ -3,8 +3,8 @@
 //! range, and encode responses. Every error is a binary `ServerMessage::Error` frame.
 
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::Response;
 use zemdb_core::id::{RoomId, SequenceNumber};
 use zemdb_core::protocol::messages::{ClientMessage, ServerMessage};
 
@@ -15,21 +15,19 @@ use crate::error::ServerError;
 use crate::relay::{LogBounds, SnapshotChunkUpload};
 
 /// `POST /rooms/:room_id/snapshot/upload`: Staging endpoint where an active donor client
-/// or automated snapshot worker uploads a room snapshot.
+/// or automated snapshot worker uploads a room snapshot. The body is the raw snapshot (not a
+/// protocol frame), with its sequence in the `x-snapshot-head-seq` header; success is answered
+/// with `ServerMessage::SnapshotStaged`.
 pub async fn upload_snapshot(
     State(state): State<AppState>,
     RelayAuth { room_id, .. }: RelayAuth,
     headers: HeaderMap,
     BinaryBody(body): BinaryBody,
 ) -> Response {
-    // Errors use binary frames, like every other data plane endpoint; only the success
-    // response of this endpoint is JSON.
-    let head_seq_val = match parse_snapshot_head_seq(&headers) {
-        Ok(seq) => seq,
+    let head_seq = match parse_snapshot_head_seq(&headers) {
+        Ok(seq) => SequenceNumber::new(seq),
         Err(err) => return binary_error(None, Some(room_id), err),
     };
-
-    let head_seq = SequenceNumber::new(head_seq_val);
     let task_state = state.clone();
     let task_room = room_id.clone();
     let staged = run_to_completion(async move {
@@ -44,24 +42,17 @@ pub async fn upload_snapshot(
             .await
     })
     .await;
-    let hash = match staged {
-        Ok(hash) => hash,
-        Err(err) => return binary_error(None, Some(room_id), err),
-    };
-
-    let body_json = serde_json::json!({
-        "room_id": room_id.as_str(),
-        "head_seq": head_seq_val,
-        "snapshot_hash": blake3::Hash::from(hash).to_hex().as_str(),
-        "status": "staged"
-    });
-
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        body_json.to_string(),
-    )
-        .into_response()
+    match staged {
+        Ok(snapshot_hash) => binary_response(
+            StatusCode::OK,
+            &ServerMessage::SnapshotStaged {
+                room_id,
+                snapshot_head_seq: head_seq,
+                snapshot_hash,
+            },
+        ),
+        Err(err) => binary_error(None, Some(room_id), err),
+    }
 }
 
 /// Reads the snapshot sequence from the `x-snapshot-head-seq` header: a positive integer.

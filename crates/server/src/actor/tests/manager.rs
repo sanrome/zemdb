@@ -251,3 +251,18 @@ fn schema_reload_does_not_block_concurrent_room_creation() {
         "schema reload and room creation deadlocked on the room map"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn log_bounds_of_a_stalled_actor_times_out() {
+    let dir = tempdir().unwrap();
+    let manager = new_manager(&dir);
+    let room_id = RoomId::new("stalled").unwrap();
+    // An actor that accepts commands but never answers them.
+    let (sender, _receiver) = mpsc::channel(8);
+    manager.rooms.insert(room_id.clone(), sender);
+
+    let result = tokio::time::timeout(Duration::from_secs(60), manager.log_bounds(&room_id))
+        .await
+        .expect("log_bounds must give up on a stalled actor");
+    assert!(matches!(result, Err(ServerError::Timeout(_))), "{result:?}");
+}

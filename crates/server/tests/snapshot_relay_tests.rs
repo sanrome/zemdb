@@ -371,8 +371,93 @@ async fn deleting_a_room_purges_its_snapshot() {
 async fn single_request_upload_over_the_body_limit_gets_a_binary_413() {
     let server = start_server(3).await;
     let resp = server
-        .upload(&room(), 1, vec![0u8; 16 * 1024 * 1024 + 1])
+        .upload(&room(), 1, vec![0u8; MAX_FRAME_SIZE + 1])
         .await;
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(error_code(resp).await, ErrorCode::BadRequest);
+}
+
+#[tokio::test]
+async fn single_request_upload_is_acknowledged_with_a_binary_frame() {
+    let server = start_server(3).await;
+    let snapshot = envelope(1000, 1);
+
+    let resp = server.upload(&room(), 2, snapshot.clone()).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "application/octet-stream");
+    let body = resp.bytes().await.unwrap();
+    match decode_message::<ServerMessage>(&body).unwrap() {
+        ServerMessage::SnapshotStaged {
+            room_id,
+            snapshot_head_seq,
+            snapshot_hash,
+        } => {
+            assert_eq!(room_id, room());
+            assert_eq!(snapshot_head_seq, SequenceNumber::new(2));
+            assert_eq!(
+                snapshot_hash,
+                ServerMessage::compute_snapshot_hash(&snapshot)
+            );
+        }
+        other => panic!("expected SnapshotStaged, got {other:?}"),
+    }
+}
+
+/// Request whose body is a valid frame of exactly `frame_len` bytes: an `UploadSnapshotChunk`
+/// sent to the chunk download endpoint, which decodes it and then rejects its kind.
+fn wrong_kind_frame_of_len(frame_len: usize) -> Vec<u8> {
+    let message = |data_len: usize| ClientMessage::UploadSnapshotChunk {
+        correlation_id: CorrelationId::new(1),
+        room_id: room(),
+        snapshot_head_seq: SequenceNumber::new(1),
+        chunk_index: 0,
+        total_chunks: 1,
+        total_bytes: 1,
+        snapshot_hash: [0; 32],
+        data: bytes::Bytes::from(vec![0u8; data_len]),
+    };
+    let probe_len = 1 << 20;
+    let overhead = encode_message(&message(probe_len)).unwrap().len() - probe_len;
+    let frame = encode_message(&message(frame_len - overhead)).unwrap();
+    assert_eq!(frame.len(), frame_len);
+    frame
+}
+
+#[tokio::test]
+async fn frame_of_the_maximum_size_passes_the_body_limit_and_one_byte_more_does_not() {
+    let server = start_server(0).await;
+    let post = |body: Vec<u8>| {
+        server
+            .client
+            .post(format!(
+                "{}/rooms/{}/snapshot/chunk",
+                server.base_url,
+                room()
+            ))
+            .bearer_auth(ADMIN_SECRET)
+            .body(body)
+            .send()
+    };
+
+    // The largest frame the codec produces is read and decoded: the handler rejects it only
+    // because it is not a chunk request.
+    let max_frame = wrong_kind_frame_of_len(MAX_FRAME_SIZE);
+    let resp = post(max_frame.clone()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    match decode_message::<ServerMessage>(&resp.bytes().await.unwrap()).unwrap() {
+        ServerMessage::Error { code, message, .. } => {
+            assert_eq!(code, ErrorCode::BadRequest);
+            assert!(
+                message.contains("Expected RequestSnapshotChunk"),
+                "{message}"
+            );
+        }
+        other => panic!("expected an error frame, got {other:?}"),
+    }
+
+    let mut oversized = max_frame;
+    oversized.push(0);
+    let resp = post(oversized).await.unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(error_code(resp).await, ErrorCode::BadRequest);
 }

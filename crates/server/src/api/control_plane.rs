@@ -105,16 +105,10 @@ pub async fn get_room(
     if !state.room_manager.room_exists(&rid) {
         return Err(ServerError::RoomNotFound(rid.to_string()));
     }
-    let sender = state.room_manager.get_or_spawn(&rid, None).await?;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    sender
-        .send(RoomCommand::GetMetrics { reply: tx })
-        .await
-        .map_err(|_| ServerError::Internal("Room actor channel closed".to_string()))?;
-
-    let metrics = rx
-        .await
-        .map_err(|_| ServerError::Internal("No response from room actor".to_string()))?;
+    let metrics = state
+        .room_manager
+        .ask(&rid, |reply| RoomCommand::GetMetrics { reply })
+        .await?;
     Ok(Json(metrics))
 }
 

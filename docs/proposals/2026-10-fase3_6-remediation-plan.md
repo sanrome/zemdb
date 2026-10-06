@@ -61,6 +61,11 @@
 | **D23** | Protocolo (versión sigue en `0x01`): `snapshot_wanted: bool` en `HeartbeatAck`, `SyncBatch` y `CommitAck`; `active_snapshot_seq: Option<SequenceNumber>` en `HeartbeatAck`. Eventos SSE `snapshot_wanted` (sin datos: quien lo recibe hace un heartbeat para saber si es el elegido) y `snapshot_available` (con el seq); son solo aceleradores, la fuente de verdad son las respuestas. | Adoptada |
 | **D24** | Ciclo de vida derivado del cursor. Toda actividad recalcula el estado: cursor detrás del log (`cursor < tail - 1`) → `Bootstrapping` (+ `BehindCompaction` en la operación que traía ese cursor, + demanda D22); dentro → `Connected`, lease renovado y cursor avanzado (nunca hacia atrás). Sin gates `is_dormant`/`is_bootstrapping`: un `Bootstrapping` con cursor válido puede commitear; Ack chequea retención (un ack menor que el cursor guardado es un no-op exitoso); Sync avanza el cursor de cualquier cliente a `from_seq` (validado `≤ head`); el heartbeat nunca falla por retención. `Dormant` = inactivo y detrás del log: en el tick un `Disconnected` cuyo cursor quedó detrás pasa a `Dormant`. Pasar a `Dormant` por tiempo es opcional (`ZEMDB_DORMANT_AFTER_SECS`, sin valor por defecto); al volver, el cursor decide. | Adoptada |
 | **D25** | `ClientLeaseTracker` expone una sola entrada para la actividad, `observe(cliente, cursor_reportado, tail)`, que aplica D24 y **nunca inserta** a un cliente no registrado (devuelve `None`). Reemplaza a `record_ack`, `record_activity`, `record_heartbeat` y `advance_cursor`. | Adoptada |
+| **D26** | Errores tipados del codec: `TooLarge`, `TooShort`, `InvalidMagic`, `UnsupportedVersion { expected, got }`, `Malformed`. El servidor responde `ProtocolVersionMismatch` (400) a una versión distinta y `BadRequest` al resto. Como un cliente de otra versión no puede decodificar el frame de error, la regla del protocolo es: si la cabecera de la respuesta trae el magic correcto y otra versión, es incompatibilidad de versión, sin importar el cuerpo ni el status. | Adoptada |
+| **D27** | El SDK decide por `ErrorCode`. `Unauthorized` (401): token faltante, inválido o vencido → pedir otro token. `Forbidden` (403, nuevo): token válido pero de otra sala, o `client_id` del mensaje distinto al del token → error permanente. `ClientNotRegistered` (409, renombra `ClientDeregistered`, que no se usaba): el cliente no está en el roster → registrarse de nuevo. | Adoptada |
+| **D28** | Errores reintentables: `Unavailable` (503 con `Retry-After: 1`, nuevo) cuando la sala se reinicia (D7), el actor se cerró o descartó la respuesta; `Timeout` (504, nuevo; antes `Internal`) cuando el actor no responde a tiempo. Reintentar un commit es seguro por la deduplicación. `Internal` (500) queda para errores inesperados, que el SDK no reintenta solo. | Adoptada |
+| **D29** | Contrato de `tail_seq` en `ARCHITECTURE.md` §7 (sin cambiar valores): primer seq retenido; sala nueva `tail = 1`, `head = 0`; log podado por completo `tail = head + 1`; un cliente se pone al día si `cursor ≥ tail - 1`; un snapshot es usable si `tail - 1 ≤ S ≤ head`. | Adoptada |
+| **D30** | Todo el Data Plane es binario: la respuesta exitosa de la subida de snapshot en un solo request y los errores de SSE posteriores a la autenticación pasan de JSON a frames binarios. | Adoptada |
 
 ---
 
@@ -74,12 +79,12 @@
 | 4 | Autenticación e identificadores | DEF-61, 41, 66, 80 | Alta | ✅ 4/4 |
 | 5 | Relay de snapshots | DEF-62, 10, 63, 52, 51, 39, 40, 38, 31(relay), 08(relay), 15 | Alta | ✅ 11/11 |
 | 6 | Ciclo de vida de clientes y señalización | DEF-53, 05, 27, 75, 76 (24 y 26 descartados) | Alta | ✅ 5/5 |
-| 7 | Protocolo wire y errores HTTP | DEF-46, 28, 11, 43, 64, 22, 71, 74 | Media | 0/8 |
-| 8 | Rendimiento, portabilidad y ciclo de vida de salas | DEF-50, 35, 55, 37, 08, 31(locks), 25(server), 72, 77, 79, 83 | Media | 0/11 |
+| 7 | Protocolo wire y errores HTTP | DEF-46, 28, 11, 43, 64, 22, 71, 74 | Media | ✅ 8/8 |
+| 8 | Rendimiento, portabilidad y ciclo de vida de salas | DEF-50, 35, 55, 37, 08, 31(locks), 25(server), 72, 77, 79, 83, 86 | Media | 0/12 |
 | 9 | Robustez e higiene de storage y core | DEF-14, 23, 49, 17, 25(storage), 18, 09, 45, 33, 44, 47, 30, 13, 20, 21, 57, 70, 78 (32 descartado) | Media/Baja | 1/18 |
 | 10 | Diferido a Fase 4 / descartado | DEF-34, 54, 42, 56, 73, 81, 82, 84, 85 | — | — |
 
-**Avance total:** 41 de 77 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
+**Avance total:** 49 de 78 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
 
 **Severidades corregidas respecto de la auditoría anterior:** de los 7 "críticos" originales, solo DEF-01 lo es. DEF-02, 03 y 04 son Altos; DEF-05 y 06 son Medios; DEF-34 es Bajo. DEF-24, 26 y 56 son falsos en la práctica.
 
@@ -362,32 +367,47 @@ Un cliente `Bootstrapping` tiene por definición el cursor por debajo de `tail -
 
 ## Lote 7 — Protocolo wire y errores HTTP
 
-#### DEF-46 · Bajo · ⬜
+#### DEF-46 · Bajo · ✅ Hecho
 **Problema verificado.** El diagnóstico de la auditoría era incorrecto. El bug real: `encode_message` permite payloads de 16 MiB (frame de 16 MiB + 4), pero `decode_message` rechaza frames de más de 16 MiB *contando* el header. Subir el límite HTTP a 17 MB no cambia nada.
 **Solución.** El decode chequea `len > MAX_MESSAGE_SIZE + PROTOCOL_HEADER_LEN`, y `DefaultBodyLimit` usa esa misma expresión.
 
-#### DEF-28 · Medio · ⬜
+#### DEF-28 · Medio · ✅ Hecho
 Errores tipados en el codec (`VersionMismatch`, `InvalidMagic`, …). Toda falla de decodificación pasa a 400 (hoy es 500), y la de versión mapea a `ErrorCode::ProtocolVersionMismatch`.
 
-#### DEF-11 · Medio-Bajo · ⬜
+#### DEF-11 · Medio-Bajo · ✅ Hecho
 Los endpoints de chunks responden texto plano. Agregar `ErrorCode::BadRequest` y `ServerError::BadRequest` (el snippet de la propuesta anterior usaba una variante inexistente) y reutilizar `data_plane::binary_error`.
 
-#### DEF-43 · Medio-Bajo · ⬜
+#### DEF-43 · Medio-Bajo · ✅ Hecho
 Unos 20 sitios en `data_plane.rs` y `sse.rs` devuelven `ServerError::Config` (500) para errores del cliente. Usar `BadRequest` (400) para payloads inválidos y 403 cuando la sala del token no coincide con la de la ruta.
 
-#### DEF-64 · Bajo · ⬜ (nuevo)
+#### DEF-64 · Bajo · ✅ Hecho (nuevo)
 `request_chunk` devuelve `ErrorCode::Unauthorized` con HTTP 400 cuando la sala no coincide. Debe ser 403.
 
-#### DEF-22 · Bajo-Medio · ⬜
-**Error de la propuesta anterior.** Quitar `impl IntoResponse for ServerError`: el control plane y SSE sí deben responder JSON.
+#### DEF-22 · Bajo-Medio · ✅ Hecho
+**Error de la propuesta anterior.** Quitar `impl IntoResponse for ServerError`: el control plane sí debe responder JSON. (SSE pasó a binario con D30.)
 **Solución.** Solo el rechazo del extractor `ClientAuth` (Data Plane) emite un frame binario `ServerMessage::Error`.
 
-#### DEF-71 · Bajo · ⬜ (nuevo, revisión del Lote 1)
+#### DEF-71 · Bajo · ✅ Hecho (nuevo, revisión del Lote 1)
 **Problema.** `tail_seq` cambió de forma visible para el cliente: una sala nueva reporta `1` (antes `0`) y una sala podada por completo reporta `tail_seq = head_seq + 1` (mayor que `head`) en `Registered`/`RegisterResponse`. Un cliente que asuma `tail <= head` se equivoca. Además, las guardas `tail > 0` de `lease.rs` quedaron siempre verdaderas.
 **Solución.** Documentar la semántica en la especificación del protocolo (ARCHITECTURE.md §7) antes de la Fase 4, y simplificar las guardas de `lease.rs` usando `TieredLog::is_behind_retention`.
 
-#### DEF-74 · Bajo · ⬜ (nuevo, revisión del Lote 3)
+#### DEF-74 · Bajo · ✅ Hecho (nuevo, revisión del Lote 3)
 Los errores reintentables (sala reiniciándose tras un fallo de I/O según D7, respuesta del actor descartada) se devuelven como 500 `Internal`. Un 503 con un código de error propio indicaría al cliente que reintentar es seguro.
+
+#### Notas del Lote 7
+- **Ya resueltos por los Lotes 4 y 5:** DEF-11, DEF-43 y DEF-22. Se confirmaron con tests (frames binarios en los endpoints de chunks y en los rechazos de autenticación; ningún `ServerError::Config` en la API).
+- **Códigos y estados:** ver la tabla de `ErrorCode` en `ARCHITECTURE.md` §7. `GatewayTimeout` pasó a `Timeout`; `ClientDeregistered` (sin uso) pasó a `ClientNotRegistered`.
+- **Decisiones de implementación no previstas en D26–D30:**
+  - Solo el decode tiene error tipado (`DecodeError`); el encode sigue con `bincode::Error`, porque solo falla por un bug local. El decode chequea la cabecera antes que el tamaño, así un frame de otra versión siempre es `UnsupportedVersion`. Para el cliente, `peek_version` lee la versión de la cabecera.
+  - La subida en un solo request responde un mensaje nuevo, `ServerMessage::SnapshotStaged { room_id, snapshot_head_seq, snapshot_hash }`.
+  - Las rutas desconocidas bajo `/rooms/` responden un frame binario (404, o 405 con método equivocado).
+  - `RoomManager::ask` concentra la espera al actor con el timeout de 5 s (data plane, SSE, relay y `GET /admin/rooms`).
+  - Las reglas "detrás del log" y "snapshot usable" viven en un solo módulo, `log/retention.rs`, con el contrato de D29.
+- **Hallazgos de la revisión independiente, corregidos en el lote:**
+  - Un commit válido en el protocolo podía no entrar en un registro del WAL (que serializa los enteros con tamaño fijo); el actor lo trataba como falla de disco, detenía la sala y, con D28, respondía 503 reintentable: bucle de reinicios. Ahora `check_operation_size` valida antes de secuenciar y responde `BadRequest` sin detener la sala. Invariante documentado: toda operación aceptada entra sola en un registro del WAL y en un frame de respuesta.
+  - El catch-up del commit y el sync no tenían tope de bytes: con operaciones grandes la respuesta superaba el frame y salía un 500 vacío aunque el commit ya fuera durable. Ahora se recortan al presupuesto con `has_more: true`, y si igual falla la codificación se responde un frame `Internal`.
+  - Registro y desregistro escriben el roster antes de cambiar la memoria (antes, un fallo al guardar dejaba al cliente registrado en memoria).
+- **Protocolo:** se renombró y agregó variantes de `ErrorCode` y `ServerMessage`; la versión sigue en `0x01` (sin release).
 
 ---
 
@@ -426,6 +446,10 @@ El `sync_data` de cada commit bloquea un worker de Tokio (en macOS es `F_FULLFSY
 #### DEF-83 · Medio · ⬜ (nuevo, revisión de documentación contra el modelo de uso)
 **Problema.** `ARCHITECTURE.md` dice que la política de ciclo de vida es configurable por deployment y por sala, pero la política que recibe `POST /admin/rooms` no se guarda en `meta_room.json`: tras un reinicio, o cuando la sala se relanza (D7), vuelve a los defaults. Tampoco hay variables de entorno para los TTL y la cuota del log. Los parámetros del ciclo de vida de clientes del Lote 6 (`ZEMDB_DORMANT_AFTER_SECS`, `ZEMDB_SNAPSHOT_DEMAND_TTL_SECS`) son solo globales.
 **Solución.** Guardar la política en `meta_room.json` (compatible con archivos que no la tienen); mover a `RoomLifecyclePolicy` los parámetros del ciclo de vida de clientes; tomar los defaults del servidor de variables de entorno, validadas al arrancar.
+
+#### DEF-86 · Bajo · ⬜ (nuevo, revisión del Lote 7)
+**Problema.** Si el actor de una sala entra en pánico con un comando, la respuesta se descarta y el cliente recibe `Unavailable` (503, reintentable, D28). Si el pánico depende de la entrada, cada reintento relanza la sala y vuelve a entrar en pánico: un bucle de reinicios que además descarta los comandos encolados de otros clientes. No se encontró ningún pánico alcanzable; es defensa en profundidad.
+**Solución propuesta.** Distinguir el pánico (por ejemplo, con el resultado del `JoinHandle` en el `RoomManager`) de una sala detenida a propósito (D7), y responder `Internal` (no reintentable) al comando que lo provocó.
 
 #### Nota sobre DEF-08
 La revisión del Lote 1 señaló dos casos más de I/O bloqueante en el actor: `record_pruned_through` (escritura atómica de `log_meta.json`) y los `sync_dir` de la fase 3 de la compactación de storage. Se tratan junto con DEF-08.

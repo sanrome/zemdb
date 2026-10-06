@@ -6,6 +6,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use zemdb_core::id::{ClientId, MutationId, RoomId, SchemaId, SequenceNumber};
+use zemdb_core::protocol::codec::encoded_len;
+use zemdb_core::protocol::limits::{check_operation_size, MAX_RESPONSE_OPS_BYTES};
 use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::schema::Schema;
 
@@ -19,7 +21,7 @@ use crate::config::ServerConfig;
 use crate::dedup::DedupLruCache;
 use crate::durable;
 use crate::error::ServerError;
-use crate::log::{RoomLifecyclePolicy, TieredLog};
+use crate::log::{retention, RoomLifecyclePolicy, TieredLog};
 use crate::relay::SnapshotRelay;
 
 /// Interval between maintenance passes (lease timeouts, log compaction, roster persistence).
@@ -364,9 +366,17 @@ impl RoomActor {
             return ControlFlow::Continue(());
         }
 
-        // 5. Assign strictly monotonic sequence number
+        // 5. Assign strictly monotonic sequence number (local until the append succeeds)
         let new_seq = self.head_seq.next();
         let seq_op = SequencedOperation::new(new_seq, op);
+
+        // 5b. The operation must fit alone in a log record and in a response frame. A
+        // mutation that does not is the client's error: it is rejected here, before any I/O,
+        // and the room keeps running unchanged.
+        if let Err(err) = check_operation_size(&seq_op, Some(mutation_id)) {
+            let _ = reply.send(Err(ServerError::BadRequest(err.to_string())));
+            return ControlFlow::Continue(());
+        }
 
         // 6. Write-Through append to TieredLog (Hot Buffer RAM + synchronous active.wal disk sync with mutation_id)
         // A failed write or fsync leaves the log in an unknown state: the record may or may
@@ -384,7 +394,7 @@ impl RoomActor {
                 // Closing the mailbox before replying guarantees that a caller retrying after
                 // this reply already sees the room as stopped and gets it respawned.
                 self.receiver.close();
-                let _ = reply.send(Err(ServerError::Internal(format!(
+                let _ = reply.send(Err(ServerError::Unavailable(format!(
                     "Room {} could not persist the commit and is restarting; retry the request",
                     self.room_id
                 ))));
@@ -450,7 +460,7 @@ impl RoomActor {
         last_ack_seq: SequenceNumber,
     ) -> (Vec<SequencedOperation>, bool) {
         match self.tiered_log.fetch_deltas(last_ack_seq, 100) {
-            Ok(batch) => batch,
+            Ok((ops, has_more)) => fit_in_response(ops, has_more),
             Err(err) => {
                 warn!(
                     room = %self.room_id,
@@ -495,6 +505,7 @@ impl RoomActor {
         let bounded_batch_size = max_batch_size.clamp(1, 1000);
         match self.tiered_log.fetch_deltas(from_seq, bounded_batch_size) {
             Ok((ops, has_more)) => {
+                let (ops, has_more) = fit_in_response(ops, has_more);
                 // Asking for the operations after from_seq confirms everything up to it:
                 // the cursor advances and the client becomes Connected.
                 self.observe(&client_id, Some(from_seq));
@@ -585,13 +596,13 @@ impl RoomActor {
         }));
     }
 
-    /// Returns the client's stored cursor, or `Unauthorized` if it is not registered.
+    /// Returns the client's stored cursor, or `ClientNotRegistered` if it is not in the roster.
     fn ensure_registered(&self, client_id: &ClientId) -> Result<SequenceNumber, ServerError> {
         self.lease_tracker
             .get_client(client_id)
             .map(|entry| entry.last_ack_seq)
             .ok_or_else(|| {
-                ServerError::Unauthorized(format!(
+                ServerError::ClientNotRegistered(format!(
                     "Client {} is not registered in room {}",
                     client_id, self.room_id
                 ))
@@ -631,7 +642,7 @@ impl RoomActor {
         let tail_seq = self.tiered_log.tail_seq();
         self.snapshot_relay
             .active_snapshot_seq(&self.room_id)
-            .filter(|seq| seq.get().saturating_add(1) >= tail_seq.get() && *seq <= self.head_seq)
+            .filter(|seq| retention::is_usable_snapshot(*seq, tail_seq, self.head_seq))
     }
 
     /// Some client needs a snapshot: unless a usable one exists, turns the snapshot demand on
@@ -785,6 +796,30 @@ impl RoomActor {
         // 5. Persist cursor and lease changes accumulated since the previous tick
         self.persist_roster();
     }
+}
+
+/// Keeps the longest prefix of `ops` that fits in one response frame
+/// ([`MAX_RESPONSE_OPS_BYTES`]), and at least one operation (every accepted operation fits
+/// alone). If any operation is left out the batch is flagged `has_more`, so the client asks
+/// for the rest.
+fn fit_in_response(
+    mut ops: Vec<SequencedOperation>,
+    has_more: bool,
+) -> (Vec<SequencedOperation>, bool) {
+    let mut total: u64 = 0;
+    let fitting = ops
+        .iter()
+        .position(|op| {
+            total = total.saturating_add(encoded_len(op).unwrap_or(u64::MAX));
+            total > MAX_RESPONSE_OPS_BYTES
+        })
+        .unwrap_or(ops.len())
+        .max(1);
+    if fitting < ops.len() {
+        ops.truncate(fitting);
+        return (ops, true);
+    }
+    (ops, has_more)
 }
 
 #[cfg(test)]

@@ -66,8 +66,9 @@ where
 /// path room. The SSE endpoint, whose `EventSource` clients cannot set headers, uses
 /// [`EventStreamAuth`] instead.
 ///
-/// Rejections (binary error frames): invalid path room id → 400 `BadRequest`; missing or
-/// invalid token, or token for another room → 401 `Unauthorized`.
+/// Rejections (binary error frames): invalid path room id → 400 `BadRequest`; missing,
+/// invalid or expired token → 401 `Unauthorized`; valid token for another room → 403
+/// `Forbidden`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthenticatedRoom {
     pub room_id: RoomId,
@@ -100,7 +101,8 @@ where
 ///
 /// Same rules as [`AuthenticatedRoom`], except that the token may also come from the
 /// `?token=` query parameter, because browser `EventSource` connections cannot set headers.
-/// Only the SSE endpoint accepts tokens in the URL.
+/// Only the SSE endpoint accepts tokens in the URL. Rejections are binary error frames, with
+/// the same codes as [`AuthenticatedRoom`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventStreamAuth {
     pub room_id: RoomId,
@@ -137,7 +139,8 @@ where
 /// workers. Only the `Authorization` header is read.
 ///
 /// Rejections (binary error frames): invalid path room id → 400 `BadRequest`; missing or
-/// invalid credentials, or token for another room → 401 `Unauthorized`.
+/// invalid credentials → 401 `Unauthorized`; valid client token for another room → 403
+/// `Forbidden`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayAuth {
     pub room_id: RoomId,
@@ -181,9 +184,10 @@ where
 /// Binary protocol message decoded from the request body with `decode_message`.
 ///
 /// The body is read through axum's `Bytes` extractor, so the router's body size limit applies.
-/// Rejections are binary frames with code `BadRequest`: a body that cannot be read keeps
-/// axum's status (413 when too large), and any decode failure, including an invalid identifier
-/// inside the payload, is a 400. The frame carries the path room id when it is valid.
+/// Rejections are binary frames: a body that cannot be read is `BadRequest` with axum's status
+/// (413 when too large); a frame of another protocol version is `ProtocolVersionMismatch`
+/// (400); any other decode failure, including an invalid identifier inside the payload, is
+/// `BadRequest` (400). The frame carries the path room id when it is valid.
 #[derive(Debug, Clone)]
 pub struct BinaryMessage<T>(pub T);
 
@@ -206,13 +210,9 @@ where
             .await
             .map_err(|rejection| body_rejection(rejection, room_id.clone()))?;
 
-        decode_message(&body).map(BinaryMessage).map_err(|e| {
-            binary_error(
-                None,
-                room_id.clone(),
-                ServerError::BadRequest(format!("Failed to decode request message: {e}")),
-            )
-        })
+        decode_message(&body)
+            .map(BinaryMessage)
+            .map_err(|e| binary_error(None, room_id, e.into()))
     }
 }
 
@@ -320,7 +320,7 @@ where
 ///
 /// A payload room other than the path room is a malformed request (400 `BadRequest`). A
 /// payload client other than the authenticated one is an impersonation attempt
-/// (401 `Unauthorized`); pass `None` for messages that carry no client id.
+/// (403 `Forbidden`); pass `None` for messages that carry no client id.
 pub(crate) fn ensure_payload_identity(
     room_id: &RoomId,
     client_id: Option<&ClientId>,
@@ -334,9 +334,9 @@ pub(crate) fn ensure_payload_identity(
     }
     if let (Some(expected), Some(actual)) = (client_id, payload_client_id) {
         if expected != actual {
-            return Err(ServerError::Unauthorized(
-                "Client ID in payload does not match token".to_string(),
-            ));
+            return Err(ServerError::Forbidden(format!(
+                "Client id in payload ({actual}) does not match the token ({expected})"
+            )));
         }
     }
     Ok(())
@@ -357,7 +357,8 @@ fn query_token(parts: &Parts) -> Option<&str> {
         .find_map(|pair| pair.strip_prefix("token="))
 }
 
-/// Verifies a client token and requires it to be issued for `room_id`.
+/// Verifies a client token (`Unauthorized` if invalid or expired) and requires it to be
+/// issued for `room_id` (`Forbidden` otherwise).
 fn verify_token_for_room(
     token: &str,
     room_id: &RoomId,
@@ -365,7 +366,7 @@ fn verify_token_for_room(
 ) -> Result<ClientId, ServerError> {
     let verified = verify_client_token(token, &state.config.auth_secret)?;
     if &verified.room_id != room_id {
-        return Err(ServerError::Unauthorized(format!(
+        return Err(ServerError::Forbidden(format!(
             "Token room mismatch: expected {}, got {}",
             room_id, verified.room_id
         )));

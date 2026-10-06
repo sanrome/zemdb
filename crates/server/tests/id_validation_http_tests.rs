@@ -310,7 +310,7 @@ async fn invalid_id_inside_a_binary_body_gets_binary_bad_request() {
 }
 
 #[tokio::test]
-async fn token_for_another_room_gets_binary_unauthorized() {
+async fn token_for_another_room_gets_binary_forbidden() {
     let server = start_server().await;
     create_room(&server, "room-a").await;
     create_room(&server, "room-b").await;
@@ -329,7 +329,7 @@ async fn token_for_another_room_gets_binary_unauthorized() {
         .send()
         .await
         .unwrap();
-    assert_binary_error(resp, StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized).await;
+    assert_binary_error(resp, StatusCode::FORBIDDEN, ErrorCode::Forbidden).await;
 }
 
 #[tokio::test]
@@ -353,7 +353,7 @@ async fn missing_token_gets_binary_unauthorized() {
 }
 
 #[tokio::test]
-async fn sse_with_a_token_for_another_room_is_unauthorized() {
+async fn sse_with_a_token_for_another_room_is_forbidden() {
     let server = start_server().await;
     create_room(&server, "room-a").await;
     create_room(&server, "room-b").await;
@@ -368,7 +368,7 @@ async fn sse_with_a_token_for_another_room_is_unauthorized() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_binary_error(resp, StatusCode::FORBIDDEN, ErrorCode::Forbidden).await;
 }
 
 #[tokio::test]
@@ -408,7 +408,7 @@ async fn payload_identity_must_match_the_authenticated_request() {
         .send()
         .await
         .unwrap();
-    assert_binary_error(resp, StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized).await;
+    assert_binary_error(resp, StatusCode::FORBIDDEN, ErrorCode::Forbidden).await;
 
     // A message of another kind than the endpoint expects.
     let wrong_kind = ClientMessage::GetSchema {
@@ -471,7 +471,7 @@ fn heartbeat_body(client_id: &str, room_id: &str) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn relay_rejects_a_client_token_for_another_room() {
+async fn relay_rejects_a_client_token_for_another_room_as_forbidden() {
     let server = start_server().await;
     create_room(&server, "room-a").await;
     create_room(&server, "room-b").await;
@@ -485,7 +485,7 @@ async fn relay_rejects_a_client_token_for_another_room() {
         .send()
         .await
         .unwrap();
-    assert_binary_error(resp, StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized).await;
+    assert_binary_error(resp, StatusCode::FORBIDDEN, ErrorCode::Forbidden).await;
 }
 
 #[tokio::test]

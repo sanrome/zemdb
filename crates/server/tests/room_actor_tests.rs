@@ -179,7 +179,7 @@ async fn test_room_actor_commit_validation_and_monotonic_sequencing() {
         .unwrap();
     assert!(matches!(
         rx0.await.unwrap(),
-        Err(ServerError::Unauthorized(_))
+        Err(ServerError::ClientNotRegistered(_))
     ));
 
     // Register client

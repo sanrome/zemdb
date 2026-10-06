@@ -5,6 +5,7 @@ use std::time::Duration;
 use zemdb_core::id::{ClientId, RoomId, SequenceNumber};
 
 use crate::error::ServerError;
+use crate::log::retention;
 
 /// Smallest download chunk served; smaller requested sizes are raised to it. Also the smallest
 /// chunk of a multipart upload made of more than one chunk.
@@ -36,7 +37,7 @@ impl LogBounds {
     /// Whether a client restoring a snapshot at `seq` can catch up from the retained log:
     /// `tail - 1 <= seq <= head`.
     pub(super) fn admits(&self, seq: SequenceNumber) -> bool {
-        seq.get().saturating_add(1) >= self.tail_seq.get() && seq <= self.head_seq
+        retention::is_usable_snapshot(seq, self.tail_seq, self.head_seq)
     }
 
     pub(super) fn check(&self, seq: SequenceNumber) -> Result<(), ServerError> {

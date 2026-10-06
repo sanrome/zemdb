@@ -1,6 +1,7 @@
 pub mod cold_disk;
 pub mod hot_buffer;
 pub mod policy;
+pub mod retention;
 pub mod tiered_log;
 pub mod warm_disk;
 

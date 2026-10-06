@@ -409,7 +409,7 @@ async fn failed_commit_sync_stops_room_and_recovers_from_disk() {
             "a command queued behind the failure must be dropped, not answered"
         );
     }
-    assert!(matches!(failed, Err(ServerError::Internal(_))));
+    assert!(matches!(failed, Err(ServerError::Unavailable(_))));
 
     // The next request respawns the room from disk.
     let recovered = fx.sender().await;
@@ -531,7 +531,7 @@ async fn failed_commit_write_restarts_room_and_retry_gets_next_sequence() {
         &fx.room_dir().join("segments").join("active.wal"),
     );
     let failed = commit(&sender, &client, mutation(2), seq(1), insert_op(2)).await;
-    assert!(matches!(failed, Err(ServerError::Internal(_))));
+    assert!(matches!(failed, Err(ServerError::Unavailable(_))));
     assert!(sender.is_closed());
 
     let recovered = fx.sender().await;

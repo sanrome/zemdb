@@ -191,6 +191,9 @@ pub fn verify_client_token(
 
 /// Cryptographically validates an incoming client `auth_token` and strictly binds it
 /// to an expected client_id and room_id.
+///
+/// An invalid or expired token is `Unauthorized`; a valid token issued for another client or
+/// room is `Forbidden`.
 pub fn verify_client_token_bound(
     auth_token: &str,
     client_id: &ClientId,
@@ -200,14 +203,14 @@ pub fn verify_client_token_bound(
     let verified = verify_client_token(auth_token, secret)?;
 
     if &verified.client_id != client_id {
-        return Err(ServerError::Unauthorized(format!(
+        return Err(ServerError::Forbidden(format!(
             "Token client mismatch: expected {}, got {}",
             client_id, verified.client_id
         )));
     }
 
     if &verified.room_id != room_id {
-        return Err(ServerError::Unauthorized(format!(
+        return Err(ServerError::Forbidden(format!(
             "Token room mismatch: expected {}, got {}",
             room_id, verified.room_id
         )));
