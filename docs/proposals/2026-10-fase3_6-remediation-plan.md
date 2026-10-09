@@ -73,6 +73,11 @@
 | **D35** | Índice de segmentos en memoria en `TieredLog` (rango, tier, bytes), armado con un `read_dir` al abrir y actualizado al rotar, comprimir y podar. Dos ticks: rápido (1 s, solo memoria: leases, estados, señales de snapshot, roster, inactividad) y lento (30 s, disco: compresión, TTL, cuota, ventana de RAM, poda de respaldo). La poda por cursores sigue también en cada Ack. Intervalos internos, ajustables solo en tests. | Adoptada |
 | **D36** | I/O bloqueante en el actor (append con fsync, `log_meta.json`, roster, descompresión fría) envuelta en un helper con `block_in_place`; en un runtime de un solo hilo (tests) ejecuta directo. `spawn_blocking` descartado (reestructuración mucho mayor). | Adoptada |
 | **D37** | Se adelanta DEF-73: CI en GitHub Actions (`.github/workflows/ci.yml`) con fmt, clippy y tests en Linux, Windows y macOS, y el build para wasm en Linux. El repo es público, así que no hay costo de minutos. Las fallas que aparezcan en Windows se corrigen en el Lote 8b. | Adoptada |
+| **D38** | El Lote 9 se divide en **9a** (motor de storage: DEF-23, 70, 49, 17, 25 (storage), 09/45) y **9b** (core, esquemas e higiene: DEF-14, 13, 20, 21, 44/47/30, 78, 57), cada uno con su revisión y su commit. La 9a va antes del SDK. | Adoptada |
+| **D39** | Escrituras de storage: un mutex propio del WAL cubre validar, escribir y fsync; recién después se toma el lock de la sala para aplicar en memoria. Orden de locks siempre WAL → sala, así la memoria se aplica en el orden del WAL. La rotación de la compactación también toma el mutex del WAL. Los lectores solo esperan la aplicación en memoria, no el fsync. | Adoptada |
+| **D40** | Las tablas de storage pasan de `BTreeMap` a `imbl::OrdMap` (estructura compartida): una escritura mientras hay un `scan` o una compactación en curso copia O(log n) en vez de clonar la tabla entera. Puro Rust (wasm), con serde; el formato de los snapshots no cambia. | Adoptada |
+| **D41** | `apply_snapshot`: un snapshot con `head_seq` menor que el de la sala se rechaza con error; con el mismo `head_seq` no hace nada y devuelve éxito (reintento idempotente; sin escrituras offline, la base local en S ya es igual al snapshot en S); con uno mayor se aplica reemplazando el contenido in-place bajo el lock de la sala, en ambos motores. Precondición de sala abierta unificada. | Adoptada |
+| **D42** | IDs de tabla estrictos: el builder usa `Option<u16>` y la deserialización falla ante IDs duplicados o una clave de mapa distinta del ID propio; nunca se auto-asigna un ID al leer un esquema. En la API de admin, un esquema así es 400. | Adoptada |
 
 ---
 
@@ -88,10 +93,10 @@
 | 6 | Ciclo de vida de clientes y señalización | DEF-53, 05, 27, 75, 76 (24 y 26 descartados) | Alta | ✅ 5/5 |
 | 7 | Protocolo wire y errores HTTP | DEF-46, 28, 11, 43, 64, 22, 71, 74 | Media | ✅ 8/8 |
 | 8 | Rendimiento, portabilidad y ciclo de vida de salas | DEF-50, 35, 55, 37, 08, 31(locks), 25(server), 72, 77, 79, 83, 86 (+73 adelantado) | Media | ✅ 12/12 |
-| 9 | Robustez e higiene de storage y core | DEF-14, 23, 49, 17, 25(storage), 18, 09, 45, 33, 44, 47, 30, 13, 20, 21, 57, 70, 78 (32 descartado) | Media/Baja | 1/18 |
+| 9 | Robustez e higiene de storage y core | DEF-14, 23, 49, 17, 25(storage), 18, 09, 45, 33, 44, 47, 30, 13, 20, 21, 57, 70, 78 (32 descartado) | Media/Baja | 9/18 (9a ✅) |
 | 10 | Diferido a Fase 4 / descartado | DEF-34, 54, 42, 56, 73, 81, 82, 84, 85 | — | — |
 
-**Avance total:** 62 de 79 ítems activos resueltos (DEF-73 pasó de diferido a hecho). Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
+**Avance total:** 70 de 79 ítems activos resueltos (DEF-73 pasó de diferido a hecho). Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
 
 **Severidades corregidas respecto de la auditoría anterior:** de los 7 "críticos" originales, solo DEF-01 lo es. DEF-02, 03 y 04 son Altos; DEF-05 y 06 son Medios; DEF-34 es Bajo. DEF-24, 26 y 56 son falsos en la práctica.
 
@@ -446,7 +451,7 @@ El `sync_data` de cada commit bloquea un worker de Tokio (en macOS es `F_FULLFSY
 #### DEF-25 (server) · Bajo · ✅ Hecho (8b)
 `warm_disk.rs` y `cold_disk.rs` ya usan `decode_wal_batch_from_slice`. Lo que está triplicado es el bucle de lectura: extraer un helper.
 
-#### DEF-72 · Medio · ✅ Hecho (8b; confirmar en la CI de Windows) (nuevo, revisión del Lote 2)
+#### DEF-72 · Medio · ✅ Hecho (8b; confirmado en la CI de Windows) (nuevo, revisión del Lote 2)
 **Problema.** Windows es plataforma objetivo. `WarmDiskLog::read_range` (y `recover_all`) leen `active.wal` con `std::fs::read`, un segundo handle, mientras `active_file` tiene el lock exclusivo de `fs2`. En Windows ese lock es obligatorio (`LockFileEx`) y la lectura falla: el catch-up desde `active.wal` tras desalojo por TTL de RAM no funcionaría.
 **Solución.** Leer `active.wal` a través del handle que ya tiene el lock (o con un lock compartido coordinado). Verificar en CI con Windows (DEF-73).
 
@@ -489,7 +494,7 @@ Tests dependientes de tiempos: `tiered_log_tests::test_tiered_log_behind_compact
   - Un segmento corrupto o faltante dentro del rango retenido se trata como hueco: `BehindCompaction` y pedido de snapshot. Al abrir, un segmento sellado corrupto corta la lectura hacia atrás en vez de impedir la apertura.
   - Cada log de sala toma un lock exclusivo en `log.lock` antes de leer o limpiar nada, y lo mantiene mientras vive (cubre también el intervalo entre una rotación y el siguiente append).
 - **Hallazgos de la revisión independiente, corregidos en el lote:** con `idle_timeout` menor a 30 s el mantenimiento de disco no corría nunca (ahora el apagado por inactividad hace una pasada antes de cerrar); una falla al borrar el warm después de comprimir dejaba el índice apuntando a un archivo inexistente y frenaba TTL y cuota (ahora la compresión devuelve un resultado tipado y una falla no saltea el resto del mantenimiento); la apertura limpiaba archivos antes de tomar el lock; dos casos de reintentos no reconocidos tras reabrir; `create_room` hacía I/O bloqueante fuera del helper.
-- **Verificación en Windows:** los arreglos no se pudieron correr en Windows localmente (solo clippy con el target GNU). La CI los confirma al pushear.
+- **Verificación en Windows:** la CI de `de09c5c` pasó en Linux, macOS y Windows (fmt, clippy, tests y wasm).
 
 ---
 
@@ -498,25 +503,25 @@ Tests dependientes de tiempos: `tiered_log_tests::test_tiered_log_behind_compact
 #### DEF-14 · Medio · ⬜
 El centinela `table_id == 0` reasigna IDs. Es alcanzable vía JSON de admin con la tabla 0 fuera de orden, con una clave de mapa distinta del ID propio, o con IDs duplicados (que hoy se reasignan en silencio). Usar `Option<u16>` en el builder, y que la deserialización use una inserción estricta que falle ante colisión o desajuste, **nunca** `add_table` con auto-asignación.
 
-#### DEF-23 · Bajo · ⬜
+#### DEF-23 · Bajo · ✅ Hecho (9a)
 Unificar la precondición de sala abierta en `apply_snapshot`. Además, `MemoryStorageEngine::apply_snapshot` cambia el `Arc` de la sala: un escritor que todavía tiene el viejo escribe en una copia muerta. Reemplazar el contenido in-place bajo el lock de la sala.
 
-#### DEF-49 · Bajo-Medio · ⬜
+#### DEF-49 · Bajo-Medio · ✅ Hecho (9a)
 El lock de escritura de la sala se retiene durante `sync_data`. El RwLock de Tokio es justo, así que los lectores esperan aproximadamente un fsync: es latencia, no inanición. Si se separa, el mutex del WAL debe cubrir validación + append + fsync, y la rotación de la fase 1 debe tomarlo también.
 
-#### DEF-17 · Bajo-Medio · ⬜
+#### DEF-17 · Bajo-Medio · ✅ Hecho (9a)
 El primer write por tabla después de un `scan` (o mientras la compactación retiene el `Arc`) clona el `BTreeMap` entero bajo el lock. Usar `imbl::OrdMap` (con serde); locks por tabla no resuelven esto.
 
-#### DEF-25 (storage) · Bajo · ⬜
+#### DEF-25 (storage) · Bajo · ✅ Hecho (9a)
 `recovery.rs` duplica unas 170 líneas de parseo de WAL y además se comporta distinto del decoder de core (heurísticas de torn write diferentes). Core expone `parse_batch_header` y `decode_batch_payload`, y la recuperación los usa (lee en streaming, así que no puede usar directamente la API de slice).
 
 #### DEF-18 · Bajo · ✅ Hecho
 Guardar `room_id` en `DiskRoomState`. El ID mal derivado solo aparece en errores `RoomLocked`. Resuelto junto con las correcciones de la revisión del Lote 2, porque el estado de sala fallida necesitaba el ID.
 
-#### DEF-09 y DEF-45 · Bajo · ⬜
+#### DEF-09 y DEF-45 · Bajo · ✅ Hecho (9a)
 Sin uso en producción. Eliminar `decode_wal_record_from_slice` y `WalReader::next_record` (o hacer que el lector devuelva lotes completos) y adaptar los tests. Si se conserva el lector, que saltee los frames vacíos.
 
-#### DEF-33 · Bajo · ⬜
+#### DEF-33 · Bajo · ✅ Hecho (Lote 7, al agregar `check_operation_size`)
 `encode_wal_batch` con un struct prestado (`ops: &[SequencedOperation]`). Serializa los mismos bytes.
 
 #### DEF-44, DEF-47, DEF-30 · Bajo/Info · ⬜
@@ -525,9 +530,18 @@ Una sola adquisición del lock en las consultas por nombre; renombrar el paráme
 #### DEF-13, DEF-20, DEF-21 · Bajo · ⬜
 Encapsulamiento (regla 5). DEF-13 necesita además `Schema::add_column`, porque `schema_registry.rs` usa `tables_by_id.get_mut`. Para DEF-20 no alcanza con hacer privado el campo: `get_mut`, `remove` y `Deserialize` permiten el mismo bypass. En DEF-21, `Operation` es un tipo wire que llega por `Deserialize`; la garantía real es `validate_operation`, que ya se ejecuta.
 
-#### DEF-70 · Bajo · ⬜ (nuevo, revisión del Lote 2)
+#### DEF-70 · Bajo · ✅ Hecho (9a) (nuevo, revisión del Lote 2)
 **Problema.** `apply_snapshot` acepta un snapshot cuyo `head_seq` es menor que el de la sala. Si hay un crash entre el rename del snapshot y el truncado del WAL, la recuperación encuentra registros que no continúan la secuencia y la sala no abre (`WalCorruption`). Antes se aplicaban en silencio sobre un estado incorrecto.
 **Solución.** Rechazar en `apply_snapshot` un snapshot con `head_seq` menor que el actual (no hay caso legítimo de retroceso).
+
+#### Notas del Lote 9a
+- **Estructura de una sala en disco:** el WAL (con su mutex y el estado de sala fallida), el estado en memoria (RwLock) y el lock de compactación, que ahora es parte de la sala (antes vivía en un mapa del motor y podía quedar viejo tras cerrar y reabrir). Orden de locks: compactación → WAL → estado. Los lectores solo toman el estado.
+- **Guard `PendingWrite`:** con la división aparece un `.await` entre el fsync y la aplicación en memoria. Si una escritura (o un paso de la compactación que toca archivos) se abandona por error, cancelación o pánico entre su primer byte en disco y su aplicación, la sala queda marcada como fallida. `compact_room` corre en su propia tarea, así que un llamador que deja de esperar no la corta.
+- **Lotes atómicos para los lectores:** el lote se aplica sobre copias O(1) de las tablas (`imbl`) y se publica con un lock de escritura breve; un pánico a mitad de lote no deja nada visible.
+- **`apply_snapshot`:** el archivo se prepara solo bajo el lock de compactación (los escritores no esperan la compresión ni el fsync); el head se vuelve a comprobar bajo el mutex del WAL (menor → error, igual → no-op, en ambos casos se borra el temporal). Una falla al preparar o al renombrar deja la sala usable y borra el temporal. Con el mismo head se ignora también el esquema recibido. Ambos motores exigen la sala abierta (`RoomNotFound`); el motor en memoria antes la creaba en silencio.
+- **Recuperación:** usa los parsers de core (`parse_batch_header`, `decode_batch_payload`) y llena cada buffer antes de decidir. Corrige una pérdida de datos real: una lectura corta en el borde del buffer de 64 KiB hacía que se truncara un lote válido y durable. Un CRC inválido es corrupción solo si le sigue una cabecera completa (antes alcanzaban 2 bytes).
+- **Hallazgos de la revisión independiente, corregidos en el lote:** cancelar una compactación a mitad de la rotación perdía escrituras confirmadas (bug previo, reproducido); una carrera con el lock de compactación viejo podía dejar una sala imposible de reabrir; un fallo de sync del directorio tras rotar no marcaba la sala como fallida; `apply_snapshot` bloqueaba a los escritores mientras comprimía; un pánico a mitad de lote dejaba parte visible; el test intermitente del servidor era un test con margen de tiempo escaso.
+- **Dependencia nueva:** `imbl` (licencia MPL-2.0, distinta del MIT/Apache del proyecto; aprobada: se usa sin modificar, la MPL solo obliga a publicar cambios a sus propios archivos).
 
 #### DEF-78 · Bajo · ⬜ (nuevo, revisión del Lote 3)
 `SchemaRegistry::register_schema` y `add_column` no tienen lock por esquema: dos escrituras concurrentes sobre el mismo id comparten el mismo `.tmp`, y `add_column` es leer-modificar-escribir. Serializar las escrituras por id de esquema.

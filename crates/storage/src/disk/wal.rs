@@ -2,9 +2,7 @@ use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use zemdb_core::SequencedOperation;
 
-use crate::disk::format::{
-    decode_wal_batch_from_slice, encode_wal_batch, WalBatchDecodeResult, WalDecodeResult,
-};
+use crate::disk::format::{decode_wal_batch_from_slice, encode_wal_batch, WalBatchDecodeResult};
 use crate::error::StorageError;
 
 /// Sequential writer and encoder for append-only WAL records.
@@ -38,24 +36,17 @@ impl WalWriter {
     }
 }
 
-use std::collections::VecDeque;
-
-/// Sequential reader for reading WAL records from an in-memory byte slice.
+/// Sequential reader of the framed batches in an in-memory byte slice.
 #[derive(Debug)]
 pub struct WalReader<'a> {
     slice: &'a [u8],
     offset: usize,
-    pending_ops: VecDeque<SequencedOperation>,
 }
 
 impl<'a> WalReader<'a> {
     /// Creates a new `WalReader` positioned at the start of the byte slice.
     pub fn new(slice: &'a [u8]) -> Self {
-        Self {
-            slice,
-            offset: 0,
-            pending_ops: VecDeque::new(),
-        }
+        Self { slice, offset: 0 }
     }
 
     /// Returns the current byte offset within the slice.
@@ -63,58 +54,26 @@ impl<'a> WalReader<'a> {
         self.offset
     }
 
-    /// Reads the next batch from the current offset.
+    /// Reads the next batch that holds operations, skipping frames without any.
     pub fn next_batch(&mut self) -> Result<WalBatchDecodeResult, StorageError> {
-        if self.offset >= self.slice.len() {
-            return Ok(WalBatchDecodeResult::CleanEof);
-        }
-
-        let result = decode_wal_batch_from_slice(&self.slice[self.offset..])?;
-        if let WalBatchDecodeResult::Ok { bytes_consumed, .. } = &result {
-            self.offset += bytes_consumed;
-        }
-        Ok(result)
-    }
-
-    /// Reads the next single record from the current offset, buffering remaining operations in multi-op batches.
-    pub fn next_record(&mut self) -> Result<WalDecodeResult, StorageError> {
-        if let Some(op) = self.pending_ops.pop_front() {
-            return Ok(WalDecodeResult::Ok {
-                op,
-                mutation_id: None,
-                bytes_consumed: 0,
-            });
-        }
-
-        if self.offset >= self.slice.len() {
-            return Ok(WalDecodeResult::CleanEof);
-        }
-
-        match self.next_batch()? {
-            WalBatchDecodeResult::Ok {
-                mut ops,
-                mutation_id,
-                bytes_consumed,
-            } => {
-                if ops.is_empty() {
-                    return Err(StorageError::WalCorruption("Empty WAL batch".to_string()));
-                }
-                let first = ops.remove(0);
-                self.pending_ops.extend(ops);
-                Ok(WalDecodeResult::Ok {
-                    op: first,
-                    mutation_id,
-                    bytes_consumed,
-                })
+        loop {
+            if self.offset >= self.slice.len() {
+                return Ok(WalBatchDecodeResult::CleanEof);
             }
-            WalBatchDecodeResult::CleanEof => Ok(WalDecodeResult::CleanEof),
-            WalBatchDecodeResult::TornWrite {
-                valid_bytes_offset,
-                reason,
-            } => Ok(WalDecodeResult::TornWrite {
-                valid_bytes_offset,
-                reason,
-            }),
+
+            let result = decode_wal_batch_from_slice(&self.slice[self.offset..])?;
+            if let WalBatchDecodeResult::Ok {
+                ops,
+                bytes_consumed,
+                ..
+            } = &result
+            {
+                self.offset += bytes_consumed;
+                if ops.is_empty() {
+                    continue;
+                }
+            }
+            return Ok(result);
         }
     }
 
@@ -125,7 +84,7 @@ impl<'a> WalReader<'a> {
         let mut ops = Vec::new();
         let mut torn_write = None;
 
-        while self.offset < self.slice.len() {
+        loop {
             match self.next_batch()? {
                 WalBatchDecodeResult::Ok { ops: batch_ops, .. } => {
                     ops.extend(batch_ops);

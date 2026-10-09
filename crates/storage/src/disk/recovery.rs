@@ -1,12 +1,11 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::Path;
-use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
 
 use zemdb_core::{
-    CompactRow, OperationKind, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation,
-    Value, BATCH_HEADER_SIZE, BATCH_MAGIC, MAX_MESSAGE_SIZE,
+    classify_checksum_mismatch, classify_zeroed_header, decode_batch_payload, parse_batch_header,
+    BatchPayloadDecode, RoomId, Schema, SequenceNumber, BATCH_HEADER_SIZE,
 };
 
 use crate::disk::compactor::{
@@ -16,7 +15,8 @@ pub use crate::disk::format::replay_wal_records;
 use crate::disk::format::{FileHeader, HEADER_SIZE};
 use crate::error::StorageError;
 use crate::fail_point;
-use crate::memory::RoomSnapshotPayload;
+use crate::memory::state::{apply_operation, empty_tables};
+use crate::memory::{RoomSnapshotPayload, Table};
 
 /// Recovery result containing the reconstructed in-memory state and the open WAL file handle.
 #[derive(Debug)]
@@ -26,16 +26,52 @@ pub struct RecoveredRoom {
     pub snapshot_seq: SequenceNumber,
     pub snapshot_len: u64,
     pub wal_len: u64,
-    pub tables: HashMap<u16, Arc<BTreeMap<PrimaryKey, CompactRow>>>,
+    pub tables: HashMap<u16, Table>,
 }
 
 struct WalReplayOutcome {
-    valid_bytes: usize,
+    valid_bytes: u64,
     torn_write: Option<String>,
     applied_count: usize,
 }
 
+/// Reads until `buf` is full or the reader reaches its end, and returns the bytes read. A single
+/// `read` may return fewer bytes than are left (for example at the edge of a buffer), so a short
+/// read alone does not mean the end of the file.
+async fn read_full<R: AsyncRead + Unpin>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = reader.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
+}
+
+/// Reads the reader to its end, returning whether every byte was zero and how many there were.
+async fn rest_is_zero<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<(bool, u64)> {
+    let mut chunk = [0u8; 8 * 1024];
+    let mut all_zero = true;
+    let mut len = 0u64;
+    loop {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok((all_zero, len));
+        }
+        all_zero &= chunk[..n].iter().all(|&b| b == 0);
+        len += n as u64;
+    }
+}
+
 /// Replays the framed batches of one WAL file on top of `tables`, advancing `head_seq`.
+///
+/// The file is streamed rather than read into memory, and each frame is decoded with the
+/// primitives of `zemdb_core::protocol::wal_frame`, so a torn write at the end of the file is
+/// told apart from corruption exactly as `decode_wal_batch_from_slice` does: an incomplete
+/// frame, a zero-filled tail, or a checksum mismatch not followed by a complete frame header
+/// ends the valid part of the file; anything else is corruption.
 ///
 /// Records at or below `head_seq` are already reflected in the state (from the snapshot or an
 /// earlier file) and are skipped: crash windows during compaction can leave the same records
@@ -45,191 +81,86 @@ async fn replay_wal_file(
     file: &mut tokio::fs::File,
     schema: &Schema,
     head_seq: &mut SequenceNumber,
-    tables: &mut HashMap<u16, Arc<BTreeMap<PrimaryKey, CompactRow>>>,
+    tables: &mut HashMap<u16, Table>,
 ) -> Result<WalReplayOutcome, StorageError> {
-    let wal_meta = file.metadata().await?;
-    let wal_file_len = wal_meta.len();
-
-    let mut valid_wal_bytes: usize = 0;
+    let mut valid_bytes: u64 = 0;
     let mut torn_write: Option<String> = None;
     let mut applied_count: usize = 0;
 
-    if wal_file_len > 0 {
-        file.seek(SeekFrom::Start(0)).await?;
-        let mut reader = BufReader::with_capacity(64 * 1024, file);
+    file.seek(SeekFrom::Start(0)).await?;
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
 
-        loop {
-            let mut header_buf = [0u8; BATCH_HEADER_SIZE];
-            let mut header_read = 0;
-            while header_read < BATCH_HEADER_SIZE {
-                let n = reader.read(&mut header_buf[header_read..]).await?;
-                if n == 0 {
-                    break;
-                }
-                header_read += n;
-            }
-
-            if header_read == 0 {
-                break;
-            }
-
-            if header_read < BATCH_HEADER_SIZE {
-                torn_write = Some(format!(
-                    "Incomplete WAL batch header: available {header_read} bytes, expected at least {BATCH_HEADER_SIZE}"
-                ));
-                break;
-            }
-
-            let magic = [header_buf[0], header_buf[1]];
-            if magic != BATCH_MAGIC {
-                if header_buf.iter().all(|&b| b == 0) {
-                    let mut rest = Vec::new();
-                    reader.read_to_end(&mut rest).await?;
-                    if rest.iter().all(|&b| b == 0) {
-                        torn_write = Some(format!(
-                            "Zero-filled tail detected at EOF (length: {} bytes)",
-                            header_read + rest.len()
-                        ));
-                        break;
-                    }
-                }
-
-                return Err(StorageError::WalCorruption(format!(
-                    "Invalid WAL batch magic: expected {:?}, got {:?}",
-                    BATCH_MAGIC, magic
-                )));
-            }
-
-            let batch_len = u32::from_le_bytes(header_buf[2..6].try_into().unwrap()) as usize;
-            let expected_crc = u32::from_le_bytes(header_buf[6..10].try_into().unwrap());
-            let ops_count = u32::from_le_bytes(header_buf[10..14].try_into().unwrap()) as usize;
-
-            if batch_len as u64 > MAX_MESSAGE_SIZE {
-                return Err(StorageError::WalCorruption(format!(
-                    "WAL batch length {batch_len} exceeds MAX_MESSAGE_SIZE {MAX_MESSAGE_SIZE}"
-                )));
-            }
-
-            let total_expected_batch_len = match BATCH_HEADER_SIZE.checked_add(batch_len) {
-                Some(len) => len,
-                None => {
-                    return Err(StorageError::WalCorruption(
-                        "WAL batch length caused integer overflow".to_string(),
-                    ));
-                }
-            };
-
-            let mut payload = vec![0u8; batch_len];
-            let mut payload_read = 0;
-            while payload_read < batch_len {
-                let n = reader.read(&mut payload[payload_read..]).await?;
-                if n == 0 {
-                    break;
-                }
-                payload_read += n;
-            }
-
-            if payload_read < batch_len {
-                torn_write = Some(format!(
-                    "Truncated WAL batch payload: available {payload_read} bytes, expected {batch_len}"
-                ));
-                break;
-            }
-
-            let actual_crc = crc32fast::hash(&payload);
-            if actual_crc != expected_crc {
-                let mut peek_buf = [0u8; BATCH_HEADER_SIZE];
-                let peek_bytes = reader.read(&mut peek_buf).await?;
-                let has_subsequent_valid_batch = if peek_bytes >= 2 {
-                    peek_buf[0..2] == BATCH_MAGIC
-                } else {
-                    false
-                };
-
-                if !has_subsequent_valid_batch {
-                    torn_write = Some(format!(
-                        "WAL batch CRC32 mismatch at EOF: expected {expected_crc}, actual {actual_crc}"
-                    ));
-                    break;
-                }
-
-                return Err(StorageError::WalCorruption(format!(
-                    "WAL batch CRC32 mismatch: expected {expected_crc}, actual {actual_crc}"
-                )));
-            }
-
-            let ops = match bincode::deserialize::<zemdb_core::protocol::wal_frame::WalBatchPayload>(
-                &payload,
-            ) {
-                Ok(batch) => batch.ops,
-                Err(_) => {
-                    bincode::deserialize::<Vec<SequencedOperation>>(&payload).map_err(|e| {
-                        StorageError::WalCorruption(format!(
-                            "Failed to deserialize WAL batch operations: {e}"
-                        ))
-                    })?
-                }
-            };
-
-            if ops.len() != ops_count {
-                return Err(StorageError::WalCorruption(format!(
-                    "WAL batch ops count mismatch: expected {ops_count}, got {}",
-                    ops.len()
-                )));
-            }
-
-            for op in ops {
-                if op.seq <= *head_seq {
-                    continue;
-                }
-                if op.seq.get() != head_seq.get() + 1 {
-                    return Err(StorageError::WalCorruption(format!(
-                        "WAL sequence gap: expected {}, found {}",
-                        head_seq.get() + 1,
-                        op.seq.get()
-                    )));
-                }
-
-                if schema.has_table_by_id(op.op.table_id) {
-                    let table_arc = tables.entry(op.op.table_id).or_default();
-                    let table_map = Arc::make_mut(table_arc);
-
-                    match op.op.kind {
-                        OperationKind::Insert { row } => {
-                            table_map.insert(op.op.pk, row);
-                        }
-                        OperationKind::Update { updates } => {
-                            if let Some(existing) = table_map.get_mut(&op.op.pk) {
-                                let target_len = schema
-                                    .get_table_by_id(op.op.table_id)
-                                    .map(|t| t.columns().len())
-                                    .unwrap_or(0);
-                                for col_up in updates {
-                                    let idx = col_up.column_idx as usize;
-                                    let min_len = target_len.max(idx + 1);
-                                    if existing.len() < min_len {
-                                        existing.resize(min_len, Value::Null);
-                                    }
-                                    existing[idx] = col_up.value;
-                                }
-                            }
-                        }
-                        OperationKind::Delete => {
-                            table_map.remove(&op.op.pk);
-                        }
-                    }
-                }
-
-                *head_seq = op.seq;
-                applied_count += 1;
-            }
-
-            valid_wal_bytes += total_expected_batch_len;
+    loop {
+        let mut header_buf = [0u8; BATCH_HEADER_SIZE];
+        let header_read = read_full(&mut reader, &mut header_buf).await?;
+        if header_read == 0 {
+            break;
         }
+        if header_read < BATCH_HEADER_SIZE {
+            torn_write = Some(format!(
+                "Incomplete WAL batch header: available {header_read} bytes, expected at least {BATCH_HEADER_SIZE}"
+            ));
+            break;
+        }
+
+        let Some(header) = parse_batch_header(&header_buf)? else {
+            let (tail_is_zero, rest_len) = rest_is_zero(&mut reader).await?;
+            torn_write = Some(classify_zeroed_header(
+                tail_is_zero,
+                BATCH_HEADER_SIZE as u64 + rest_len,
+            )?);
+            break;
+        };
+
+        let mut payload = vec![0u8; header.payload_len()];
+        let payload_read = read_full(&mut reader, &mut payload).await?;
+        if payload_read < payload.len() {
+            torn_write = Some(format!(
+                "Truncated WAL batch payload: available {payload_read} bytes, expected {}",
+                payload.len()
+            ));
+            break;
+        }
+
+        let ops = match decode_batch_payload(&header, &payload)? {
+            BatchPayloadDecode::Batch { ops, .. } => ops,
+            BatchPayloadDecode::ChecksumMismatch { expected, actual } => {
+                let mut following = [0u8; BATCH_HEADER_SIZE];
+                let following_len = read_full(&mut reader, &mut following).await?;
+                torn_write = Some(classify_checksum_mismatch(
+                    expected,
+                    actual,
+                    &following[..following_len],
+                )?);
+                break;
+            }
+        };
+
+        for op in ops {
+            if op.seq <= *head_seq {
+                continue;
+            }
+            if op.seq.get() != head_seq.get() + 1 {
+                return Err(StorageError::WalCorruption(format!(
+                    "WAL sequence gap: expected {}, found {}",
+                    head_seq.get() + 1,
+                    op.seq.get()
+                )));
+            }
+
+            if schema.has_table_by_id(op.op.table_id) {
+                apply_operation(tables, schema, op.op);
+            }
+
+            *head_seq = op.seq;
+            applied_count += 1;
+        }
+
+        valid_bytes += header.frame_len() as u64;
     }
 
     Ok(WalReplayOutcome {
-        valid_bytes: valid_wal_bytes,
+        valid_bytes,
         torn_write,
         applied_count,
     })
@@ -256,10 +187,7 @@ pub async fn recover_room(
     wal_file_std: std::fs::File,
     zstd_level: i32,
 ) -> Result<RecoveredRoom, StorageError> {
-    let mut tables: HashMap<u16, Arc<BTreeMap<PrimaryKey, CompactRow>>> = HashMap::new();
-    for table_id in schema.tables_by_id.keys() {
-        tables.insert(*table_id, Arc::new(BTreeMap::new()));
-    }
+    let mut tables = empty_tables(schema);
 
     let mut snapshot_seq = SequenceNumber::from(0u64);
     let mut head_seq = SequenceNumber::from(0u64);
@@ -333,9 +261,7 @@ pub async fn recover_room(
             snapshot_seq = payload.head_seq;
             head_seq = payload.head_seq;
 
-            for table_id in schema.tables_by_id.keys() {
-                payload.tables.entry(*table_id).or_default();
-            }
+            payload.fill_missing_tables(schema);
             tables = payload.tables;
         }
     } else {
@@ -395,7 +321,7 @@ pub async fn recover_room(
             reason = %reason,
             "Torn write detected at WAL EOF, truncating damaged bytes to {valid_wal_bytes}"
         );
-        wal_file.set_len(valid_wal_bytes as u64).await?;
+        wal_file.set_len(valid_wal_bytes).await?;
         wal_file.sync_all().await?;
     }
 
@@ -432,7 +358,7 @@ pub async fn recover_room(
         head_seq,
         snapshot_seq,
         snapshot_len,
-        wal_len: valid_wal_bytes as u64,
+        wal_len: valid_wal_bytes,
         tables,
     })
 }

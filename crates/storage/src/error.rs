@@ -34,6 +34,14 @@ pub enum StorageError {
         actual: SequenceNumber,
     },
 
+    /// A snapshot older than the room's state. Applying it would move the room back in time,
+    /// and the records between the two sequence numbers would no longer continue the sequence.
+    #[error("Snapshot at sequence {snapshot} is behind the room's head sequence {current}")]
+    SnapshotBehind {
+        current: SequenceNumber,
+        snapshot: SequenceNumber,
+    },
+
     #[error("Schema validation failed: {0}")]
     SchemaValidation(#[from] ValidationError),
 

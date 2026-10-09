@@ -86,7 +86,17 @@ pub trait StorageEngine: EngineConcurrencyBounds {
     /// Creates a complete snapshot of the room state as a byte buffer.
     async fn create_snapshot(&self, room_id: &RoomId) -> Result<Vec<u8>, StorageError>;
 
-    /// Restores room state from a snapshot byte buffer and sets its head sequence number.
+    /// Replaces the state of an open room with a snapshot and returns the room's head sequence.
+    ///
+    /// - A snapshot behind the room's head sequence is rejected with
+    ///   `StorageError::SnapshotBehind`: a room never moves back.
+    /// - A snapshot at the room's head sequence changes nothing and succeeds, so a retried
+    ///   apply is idempotent (without offline writes, the room at a sequence number already
+    ///   equals any snapshot taken at it). The `schema` argument is ignored too: the room keeps
+    ///   its schema.
+    /// - A snapshot ahead of the room replaces its schema, head sequence and every table.
+    ///
+    /// The room must be open; otherwise `StorageError::RoomNotFound` is returned.
     async fn apply_snapshot(
         &self,
         room_id: &RoomId,

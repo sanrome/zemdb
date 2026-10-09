@@ -3,9 +3,8 @@ use zemdb_core::{
     SequencedOperation, TableSchema, Value, MAX_MESSAGE_SIZE,
 };
 use zemdb_storage::format::{
-    decode_wal_batch_from_slice, decode_wal_record_from_slice, encode_wal_batch, encode_wal_record,
-    replay_wal_records, FileHeader, WalBatchDecodeResult, WalDecodeResult, BATCH_HEADER_SIZE,
-    BATCH_MAGIC, HEADER_SIZE, MAGIC_BYTES,
+    decode_wal_batch_from_slice, encode_wal_batch, encode_wal_record, replay_wal_records,
+    FileHeader, WalBatchDecodeResult, BATCH_HEADER_SIZE, BATCH_MAGIC, HEADER_SIZE, MAGIC_BYTES,
 };
 use zemdb_storage::{
     DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError, WalReader,
@@ -71,14 +70,14 @@ fn test_wal_record_encode_decode_clean() {
     let encoded = encode_wal_record(&op, None).expect("encoding ok");
     assert!(encoded.len() > 8);
 
-    let res = decode_wal_record_from_slice(&encoded).expect("decode ok");
+    let res = decode_wal_batch_from_slice(&encoded).expect("decode ok");
     match res {
-        WalDecodeResult::Ok {
-            op: decoded_op,
+        WalBatchDecodeResult::Ok {
+            ops,
             bytes_consumed,
             ..
         } => {
-            assert_eq!(op, decoded_op);
+            assert_eq!(ops, vec![op]);
             assert_eq!(bytes_consumed, encoded.len());
         }
         other => panic!("Expected Ok, got {:?}", other),
@@ -108,7 +107,7 @@ fn test_wal_record_detects_crc_corruption() {
     let mut combined = enc1;
     combined.extend_from_slice(&enc2);
 
-    let err = decode_wal_record_from_slice(&combined).unwrap_err();
+    let err = decode_wal_batch_from_slice(&combined).unwrap_err();
     assert!(matches!(err, StorageError::WalCorruption(_)));
 }
 
@@ -743,7 +742,7 @@ async fn test_wal_recovery_truncates_zero_filled_tail_at_eof() {
 }
 
 #[test]
-fn test_wal_reader_multi_op_batch_iteration_buffered() {
+fn test_wal_reader_returns_multi_op_batch_whole() {
     let row1 = CompactRow::new(vec![Value::Int(1), Value::String("Alice".into())]);
     let op1 = SequencedOperation::with_default_origin(
         1u64,
@@ -765,23 +764,13 @@ fn test_wal_reader_multi_op_batch_iteration_buffered() {
 
     let mut reader = WalReader::new(&encoded);
 
-    match reader.next_record().expect("read record 1") {
-        WalDecodeResult::Ok { op, .. } => assert_eq!(op, op1),
-        other => panic!("expected record 1, got {:?}", other),
+    match reader.next_batch().expect("read batch") {
+        WalBatchDecodeResult::Ok { ops, .. } => assert_eq!(ops, vec![op1, op2, op3]),
+        other => panic!("expected the whole batch, got {:?}", other),
     }
 
-    match reader.next_record().expect("read record 2") {
-        WalDecodeResult::Ok { op, .. } => assert_eq!(op, op2),
-        other => panic!("expected record 2, got {:?}", other),
-    }
-
-    match reader.next_record().expect("read record 3") {
-        WalDecodeResult::Ok { op, .. } => assert_eq!(op, op3),
-        other => panic!("expected record 3, got {:?}", other),
-    }
-
-    match reader.next_record().expect("clean eof") {
-        WalDecodeResult::CleanEof => {}
+    match reader.next_batch().expect("clean eof") {
+        WalBatchDecodeResult::CleanEof => {}
         other => panic!("expected CleanEof, got {:?}", other),
     }
 }
@@ -1129,4 +1118,28 @@ async fn test_empty_batch_writes_nothing_to_wal() {
 
     assert_eq!(head, SequenceNumber::from(0u64));
     assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), len_before);
+}
+
+#[test]
+fn wal_reader_skips_empty_frames() {
+    let row = CompactRow::new(vec![Value::Int(1), Value::String("Alice".into())]);
+    let op = SequencedOperation::with_default_origin(
+        1u64,
+        Operation::insert(USERS_TABLE, PrimaryKey::single(1i64), row, 100),
+    );
+    let mut encoded = encode_wal_batch(&[], None).expect("encode empty batch");
+    encoded.extend_from_slice(&encode_wal_batch(std::slice::from_ref(&op), None).unwrap());
+    encoded.extend_from_slice(&encode_wal_batch(&[], None).unwrap());
+
+    let mut reader = WalReader::new(&encoded);
+
+    match reader.next_batch().expect("read batch") {
+        WalBatchDecodeResult::Ok { ops, .. } => assert_eq!(ops, vec![op]),
+        other => panic!("expected the non-empty batch, got {:?}", other),
+    }
+    assert_eq!(
+        reader.next_batch().expect("clean eof"),
+        WalBatchDecodeResult::CleanEof
+    );
+    assert_eq!(reader.offset(), encoded.len());
 }

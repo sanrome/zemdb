@@ -1,15 +1,12 @@
 pub mod state;
 
-pub use state::{RoomSnapshotPayload, RoomSnapshotRef, RoomState};
+pub use state::{RoomSnapshotPayload, RoomSnapshotRef, RoomState, Table};
 
 use async_trait::async_trait;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::ops::RangeBounds;
 use std::sync::{Arc, RwLock};
-use zemdb_core::{
-    CompactRow, OperationKind, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation,
-    Value,
-};
+use zemdb_core::{CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation};
 
 use crate::engine::{apply_scan_transforms, RowStream, StorageEngine};
 use crate::error::StorageError;
@@ -49,7 +46,7 @@ impl MemoryStorageEngine {
 }
 
 struct MemoryScanState {
-    table_data: Arc<BTreeMap<PrimaryKey, CompactRow>>,
+    table_data: Table,
     range: KeyRange,
     direction: ScanDirection,
     projection: Option<Vec<u16>>,
@@ -114,54 +111,11 @@ impl StorageEngine for MemoryStorageEngine {
         } = *room_guard;
 
         // 1. Validate schema and strict monotonic sequence
-        for (expected_seq, op) in (head_seq.get() + 1..).zip(ops.iter()) {
-            if !schema.has_table_by_id(op.op.table_id) {
-                return Err(StorageError::TableNotFound {
-                    room_id: room_id.clone(),
-                    table: format!("id:{}", op.op.table_id),
-                });
-            }
-
-            if op.seq.get() != expected_seq {
-                return Err(StorageError::SequenceMismatch {
-                    expected: SequenceNumber::from(expected_seq),
-                    actual: op.seq,
-                });
-            }
-
-            schema.validate_operation(&op.op)?;
-        }
+        state::validate_batch(room_id, schema, *head_seq, &ops)?;
 
         // 2. Apply operations to in-memory tables
         for SequencedOperation { seq, op } in ops {
-            let table_arc = tables.entry(op.table_id).or_default();
-            let table_map = Arc::make_mut(table_arc);
-
-            match op.kind {
-                OperationKind::Insert { row } => {
-                    table_map.insert(op.pk, row);
-                }
-                OperationKind::Update { updates } => {
-                    if let Some(existing) = table_map.get_mut(&op.pk) {
-                        let target_len = schema
-                            .get_table_by_id(op.table_id)
-                            .map(|t| t.columns().len())
-                            .unwrap_or(0);
-                        for col_up in updates {
-                            let idx = col_up.column_idx as usize;
-                            let min_len = target_len.max(idx + 1);
-                            if existing.len() < min_len {
-                                existing.resize(min_len, Value::Null);
-                            }
-                            existing[idx] = col_up.value;
-                        }
-                    }
-                }
-                OperationKind::Delete => {
-                    table_map.remove(&op.pk);
-                }
-            }
-
+            state::apply_operation(tables, schema, op);
             if seq > *head_seq {
                 *head_seq = seq;
             }
@@ -263,11 +217,13 @@ impl StorageEngine for MemoryStorageEngine {
                 });
             }
 
+            // An O(1) clone that shares the table's nodes; writes during the scan copy only the
+            // nodes they change.
             room_state
                 .tables
                 .get(&table_id)
                 .cloned()
-                .unwrap_or_else(|| Arc::new(BTreeMap::new()))
+                .unwrap_or_default()
         };
 
         let state = MemoryScanState {
@@ -304,7 +260,9 @@ impl StorageEngine for MemoryStorageEngine {
                         Some(cur) => (std::ops::Bound::Excluded(cur), state.range.end_bound()),
                         None => (state.range.start_bound(), state.range.end_bound()),
                     };
-                    let iter = state.table_data.range((start_bound, end_bound));
+                    let iter = state
+                        .table_data
+                        .range::<_, PrimaryKey>((start_bound, end_bound));
                     apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
                         .collect()
                 }
@@ -313,7 +271,10 @@ impl StorageEngine for MemoryStorageEngine {
                         Some(cur) => (state.range.start_bound(), std::ops::Bound::Excluded(cur)),
                         None => (state.range.start_bound(), state.range.end_bound()),
                     };
-                    let iter = state.table_data.range((start_bound, end_bound)).rev();
+                    let iter = state
+                        .table_data
+                        .range::<_, PrimaryKey>((start_bound, end_bound))
+                        .rev();
                     apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
                         .collect()
                 }
@@ -373,6 +334,9 @@ impl StorageEngine for MemoryStorageEngine {
         Ok(envelope)
     }
 
+    /// Replaces the room's contents with `snapshot` (see the trait for the rules on its head
+    /// sequence). The contents are replaced in place under the room's lock: a writer that
+    /// already holds the room's handle writes into the new state, never into a detached copy.
     #[tracing::instrument(skip(self, schema, snapshot), fields(room_id = %room_id, snapshot_size = snapshot.len()))]
     async fn apply_snapshot(
         &self,
@@ -380,27 +344,35 @@ impl StorageEngine for MemoryStorageEngine {
         schema: Schema,
         snapshot: &[u8],
     ) -> Result<SequenceNumber, StorageError> {
+        let room_arc = self.get_room(room_id)?;
+
         let decompressed = crate::snapshot::decode_snapshot_envelope(snapshot)?;
         let mut payload: RoomSnapshotPayload = bincode::deserialize(&decompressed)
             .map_err(|e| StorageError::SnapshotCorruption(e.to_string()))?;
+        payload.fill_missing_tables(&schema);
 
-        for table_id in schema.tables_by_id.keys() {
-            payload.tables.entry(*table_id).or_default();
+        let mut room = room_arc
+            .write()
+            .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
+        if payload.head_seq < room.head_seq {
+            return Err(StorageError::SnapshotBehind {
+                current: room.head_seq,
+                snapshot: payload.head_seq,
+            });
+        }
+        if payload.head_seq == room.head_seq {
+            return Ok(room.head_seq);
         }
 
-        let new_state = Arc::new(RwLock::new(RoomState {
-            schema,
-            head_seq: payload.head_seq,
-            tables: payload.tables,
-        }));
-
-        let mut rooms = self
-            .rooms
-            .write()
-            .map_err(|e| StorageError::Other(format!("Engine lock poisoned: {e}")))?;
-        rooms.insert(room_id.clone(), new_state);
+        room.schema = schema;
+        room.head_seq = payload.head_seq;
+        room.tables = payload.tables;
 
         tracing::info!(room_id = %room_id, head_seq = %payload.head_seq, "Applied in-memory snapshot");
         Ok(payload.head_seq)
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/memory.rs"]
+mod tests;

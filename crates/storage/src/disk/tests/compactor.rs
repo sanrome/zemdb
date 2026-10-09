@@ -61,6 +61,7 @@ async fn snapshot_seq(engine: &DiskStorageEngine, room: &RoomId) -> SequenceNumb
         .get_room(room)
         .await
         .unwrap()
+        .state
         .read()
         .await
         .snapshot_seq
@@ -217,6 +218,51 @@ async fn failed_rotation_rollback_marks_room_failed_until_reopened() {
     ));
     assert!(matches!(
         engine.compact_room(&room).await,
+        Err(StorageError::RoomFailed { .. })
+    ));
+
+    engine.close_room(&room).await.unwrap();
+    let reopened = open_engine(dir.path(), &room).await;
+    assert_rows(&reopened, &room, 5).await;
+    apply_range(&reopened, &room, 6..=6).await;
+}
+
+#[tokio::test]
+async fn failed_wal_sync_before_compaction_marks_room_failed_until_reopened() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("compaction-sync-failure").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    let wal_path = engine.wal_file_path(&room);
+
+    apply_range(&engine, &room, 1..=5).await;
+    fail_point::arm("compaction.sync", &wal_path);
+    assert!(engine.compact_room(&room).await.is_err());
+
+    assert!(matches!(
+        engine.apply_batch(&room, vec![insert(6)]).await,
+        Err(StorageError::RoomFailed { .. })
+    ));
+
+    engine.close_room(&room).await.unwrap();
+    let reopened = open_engine(dir.path(), &room).await;
+    assert_rows(&reopened, &room, 5).await;
+    apply_range(&reopened, &room, 6..=6).await;
+}
+
+#[tokio::test]
+async fn failed_directory_sync_after_wal_rotation_marks_room_failed_until_reopened() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("rotation-dir-sync").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    let wal_path = engine.wal_file_path(&room);
+
+    apply_range(&engine, &room, 1..=5).await;
+    fail_point::arm("compaction.rotate_sync_dir", &wal_path);
+    assert!(engine.compact_room(&room).await.is_err());
+
+    // The new WAL's directory entry may not be durable: nothing may be acknowledged into it.
+    assert!(matches!(
+        engine.apply_batch(&room, vec![insert(6)]).await,
         Err(StorageError::RoomFailed { .. })
     ));
 

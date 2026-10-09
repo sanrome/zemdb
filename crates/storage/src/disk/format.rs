@@ -146,7 +146,7 @@ impl FileHeader {
 }
 
 pub use zemdb_core::protocol::wal_frame::{
-    WalBatchDecodeResult, WalDecodeResult, WalFrameError, BATCH_HEADER_SIZE, BATCH_MAGIC,
+    WalBatchDecodeResult, WalFrameError, BATCH_HEADER_SIZE, BATCH_MAGIC,
 };
 
 /// Encodes a batch of `SequencedOperation` into an append-only, atomically framed WAL batch.
@@ -168,11 +168,6 @@ pub fn encode_wal_record(
 /// Decodes the next framed WAL batch from a byte slice.
 pub fn decode_wal_batch_from_slice(slice: &[u8]) -> Result<WalBatchDecodeResult, StorageError> {
     zemdb_core::protocol::wal_frame::decode_wal_batch_from_slice(slice).map_err(Into::into)
-}
-
-/// Decodes the next WAL record from a byte slice.
-pub fn decode_wal_record_from_slice(slice: &[u8]) -> Result<WalDecodeResult, StorageError> {
-    zemdb_core::protocol::wal_frame::decode_wal_record_from_slice(slice).map_err(Into::into)
 }
 
 /// Helper to read all valid WAL records from a byte buffer.

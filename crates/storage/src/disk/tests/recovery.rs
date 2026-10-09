@@ -121,9 +121,9 @@ async fn recovered_compacting_wal_is_folded_and_removed() {
 
     let compacting = engine.wal_file_path(&room).with_extension("wal.compacting");
     assert!(!compacting.exists());
-    let state = engine.get_room(&room).await.unwrap();
-    assert_eq!(state.read().await.snapshot_seq.get(), 8);
-    drop(state);
+    let room_handle = engine.get_room(&room).await.unwrap();
+    assert_eq!(room_handle.state.read().await.snapshot_seq.get(), 8);
+    drop(room_handle);
     engine.close_room(&room).await.unwrap();
 
     let reopened = engine_at(dir.path());
@@ -172,4 +172,65 @@ async fn replay_rejects_sequence_gap() {
     let result = engine.open_room(&room, schema()).await;
 
     assert!(matches!(result, Err(StorageError::WalCorruption(_))));
+}
+
+#[tokio::test]
+async fn checksum_mismatch_before_a_partial_header_is_a_torn_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("torn-before-partial-header").unwrap();
+    let engine = engine_at(dir.path());
+    let wal_path = engine.wal_file_path(&room);
+
+    append_batch(&wal_path, &[insert(1)]);
+    let valid_len = std::fs::metadata(&wal_path).unwrap().len();
+    let mut damaged = encode_wal_batch(&[insert(2)], None).unwrap();
+    *damaged.last_mut().unwrap() ^= 0xFF;
+    // Followed by fewer bytes than a frame header, even though they start like one.
+    damaged.extend_from_slice(&[0xBA, 0x7C, 0x01, 0x00, 0x00]);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&wal_path)
+        .unwrap()
+        .write_all(&damaged)
+        .unwrap();
+
+    engine.open_room(&room, schema()).await.unwrap();
+
+    assert_rows(&engine, &room, 1).await;
+    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), valid_len);
+}
+
+#[tokio::test]
+async fn checksum_mismatch_before_a_complete_frame_is_corruption_at_any_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("corrupt-at-buffer-edge").unwrap();
+    let engine = engine_at(dir.path());
+    let wal_path = engine.wal_file_path(&room);
+
+    // A first frame that ends one byte before a 64 KiB boundary, where a buffered reader that
+    // looks ahead with a single read sees only one byte of the frame that follows.
+    let frame_len = |name_len: usize| {
+        encode_wal_batch(&[insert_named(1, 1, &"x".repeat(name_len))], None)
+            .unwrap()
+            .len()
+    };
+    let name_len = 64 * 1024 - 1 - frame_len(0);
+    let mut first = encode_wal_batch(&[insert_named(1, 1, &"x".repeat(name_len))], None).unwrap();
+    assert_eq!(first.len(), 64 * 1024 - 1);
+    *first.last_mut().unwrap() ^= 0xFF;
+    let mut wal = first;
+    wal.extend_from_slice(&encode_wal_batch(&[insert(2)], None).unwrap());
+    std::fs::write(&wal_path, &wal).unwrap();
+
+    let result = engine.open_room(&room, schema()).await;
+
+    // A complete, durable frame follows the damaged one: truncating would silently drop it.
+    assert!(
+        matches!(result, Err(StorageError::WalCorruption(_))),
+        "unexpected result: {result:?}"
+    );
+    assert_eq!(
+        std::fs::metadata(&wal_path).unwrap().len(),
+        wal.len() as u64
+    );
 }

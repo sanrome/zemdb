@@ -250,6 +250,7 @@ async fn test_snapshot_create_and_restore() {
 
     // Restore snapshot into fresh engine_b
     let engine_b = MemoryStorageEngine::new();
+    engine_b.open_room(&room_id, schema.clone()).await.unwrap();
     let restored_head = engine_b
         .apply_snapshot(&room_id, schema, &snapshot_bytes)
         .await

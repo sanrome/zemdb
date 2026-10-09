@@ -504,10 +504,10 @@ async fn room_with_an_event_subscriber_stays_open() {
 async fn requests_racing_an_inactivity_shutdown_are_never_refused() {
     let dir = tempdir().unwrap();
     let room_id = RoomId::new("idle-c").unwrap();
-    // Every maintenance tick that finds no command in the last millisecond shuts the room down,
-    // so requests keep arriving while the actor closes its mailbox and drains it.
+    // A zero idle timeout: every maintenance tick shuts the room down, however busy it is, so
+    // requests keep arriving while the actor closes its mailbox and drains it.
     let manager = Arc::new(new_manager(&dir).with_default_policy(RoomLifecyclePolicy {
-        idle_timeout: Some(Duration::from_millis(1)),
+        idle_timeout: Some(Duration::ZERO),
         ..RoomLifecyclePolicy::default()
     }));
     manager
@@ -515,7 +515,8 @@ async fn requests_racing_an_inactivity_shutdown_are_never_refused() {
         .await
         .unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    // Writers keep going until the room has restarted twice.
+    let deadline = tokio::time::Instant::now() + POLL_CEILING;
     let mut writers = Vec::new();
     for writer in 0..4u8 {
         let manager = Arc::clone(&manager);
@@ -533,7 +534,9 @@ async fn requests_racing_an_inactivity_shutdown_are_never_refused() {
                 .unwrap();
             let mut commits = 0u64;
             let mut n = 0u32;
-            while tokio::time::Instant::now() < deadline {
+            while manager.next_actor_id.load(Ordering::Relaxed) < 3
+                && tokio::time::Instant::now() < deadline
+            {
                 n += 1;
                 if n.is_multiple_of(3) {
                     manager
@@ -783,7 +786,7 @@ async fn client_inactivity_keeps_counting_across_an_inactivity_shutdown() {
     // shuts down.
     let manager = new_manager(&dir).with_default_policy(RoomLifecyclePolicy {
         idle_timeout: Some(Duration::from_millis(200)),
-        lease_timeout: Duration::from_secs(3),
+        lease_timeout: Duration::from_secs(5),
         ..RoomLifecyclePolicy::default()
     });
     manager
@@ -807,9 +810,9 @@ async fn client_inactivity_keeps_counting_across_an_inactivity_shutdown() {
     .await;
 
     // The room reopens before the lease expires. The lease keeps counting from the client's
-    // last activity, not from the reopening.
-    tokio::time::sleep_until(last_activity + Duration::from_millis(2500)).await;
-    let deadline = last_activity + Duration::from_millis(4500);
+    // last activity (expiring at 5 s), not from the reopening (it would expire at 9 s).
+    tokio::time::sleep_until(last_activity + Duration::from_secs(4)).await;
+    let deadline = last_activity + Duration::from_millis(7500);
     loop {
         let metrics = manager
             .ask(&room_id, |reply| RoomCommand::GetMetrics { reply })
@@ -939,7 +942,7 @@ async fn activity_keeps_a_room_open() {
     let dir = tempdir().unwrap();
     let room_id = RoomId::new("busy").unwrap();
     let manager = new_manager(&dir).with_default_policy(RoomLifecyclePolicy {
-        idle_timeout: Some(Duration::from_millis(300)),
+        idle_timeout: Some(Duration::from_millis(1500)),
         ..RoomLifecyclePolicy::default()
     });
     manager
@@ -948,10 +951,10 @@ async fn activity_keeps_a_room_open() {
         .unwrap();
     let actor_id = manager.rooms.get(&room_id).unwrap().actor_id;
 
-    // Commands more often than the idle timeout, for several timeouts.
-    for _ in 0..20 {
+    // Commands far more often than the idle timeout, for two timeouts.
+    for _ in 0..60 {
         manager.log_bounds(&room_id).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(
         manager.rooms.get(&room_id).map(|slot| slot.actor_id),

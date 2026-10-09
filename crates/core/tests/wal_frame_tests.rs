@@ -2,7 +2,9 @@ use zemdb_core::id::MutationId;
 use zemdb_core::mutation::Operation;
 use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::protocol::wal_frame::{
-    decode_wal_batch_from_slice, encode_wal_batch, WalBatchDecodeResult, WalFrameError, BATCH_MAGIC,
+    classify_checksum_mismatch, classify_zeroed_header, decode_batch_payload,
+    decode_wal_batch_from_slice, encode_wal_batch, parse_batch_header, BatchPayloadDecode,
+    WalBatchDecodeResult, WalFrameError, BATCH_HEADER_SIZE, BATCH_MAGIC,
 };
 use zemdb_core::value::{CompactRow, PrimaryKey, Value};
 
@@ -109,4 +111,82 @@ fn test_wal_frame_zero_filled_eof_torn_write_detection() {
             ..
         }
     ));
+}
+
+fn delete_frame(seq: u64) -> Vec<u8> {
+    let op = SequencedOperation::new(seq, Operation::delete(0, PrimaryKey::single(1i64), 100));
+    encode_wal_batch(&[op], None).expect("encode ok")
+}
+
+fn header_of(frame: &[u8]) -> &[u8; BATCH_HEADER_SIZE] {
+    frame.first_chunk().unwrap()
+}
+
+#[test]
+fn header_and_payload_decode_a_frame() {
+    let frame = delete_frame(1);
+
+    let header = parse_batch_header(header_of(&frame)).unwrap().unwrap();
+    assert_eq!(header.frame_len(), frame.len());
+    let decoded = decode_batch_payload(&header, &frame[BATCH_HEADER_SIZE..]).unwrap();
+
+    assert!(matches!(decoded, BatchPayloadDecode::Batch { ops, .. } if ops.len() == 1));
+}
+
+#[test]
+fn zeroed_header_is_not_a_frame() {
+    assert_eq!(parse_batch_header(&[0u8; BATCH_HEADER_SIZE]).unwrap(), None);
+    assert!(classify_zeroed_header(true, 64).is_ok());
+    assert!(matches!(
+        classify_zeroed_header(false, 64),
+        Err(WalFrameError::Corruption(_))
+    ));
+}
+
+#[test]
+fn header_with_invalid_magic_is_corruption() {
+    let mut frame = delete_frame(1);
+    frame[0] = 0;
+    assert!(matches!(
+        parse_batch_header(header_of(&frame)),
+        Err(WalFrameError::Corruption(_))
+    ));
+}
+
+#[test]
+fn payload_with_wrong_checksum_is_reported_not_decoded() {
+    let mut frame = delete_frame(1);
+    *frame.last_mut().unwrap() ^= 0xFF;
+
+    let header = parse_batch_header(header_of(&frame)).unwrap().unwrap();
+    let decoded = decode_batch_payload(&header, &frame[BATCH_HEADER_SIZE..]).unwrap();
+
+    assert!(matches!(
+        decoded,
+        BatchPayloadDecode::ChecksumMismatch { .. }
+    ));
+}
+
+#[test]
+fn checksum_mismatch_is_corruption_only_before_a_complete_header() {
+    let next = delete_frame(2);
+
+    assert!(classify_checksum_mismatch(1, 2, &[]).is_ok());
+    assert!(classify_checksum_mismatch(1, 2, &next[..BATCH_HEADER_SIZE - 1]).is_ok());
+    assert!(classify_checksum_mismatch(1, 2, &[0u8; BATCH_HEADER_SIZE]).is_ok());
+    assert!(matches!(
+        classify_checksum_mismatch(1, 2, &next[..BATCH_HEADER_SIZE]),
+        Err(WalFrameError::Corruption(_))
+    ));
+}
+
+#[test]
+fn checksum_mismatch_before_a_partial_header_is_a_torn_write() {
+    let mut wal = delete_frame(1);
+    *wal.last_mut().unwrap() ^= 0xFF;
+    wal.extend_from_slice(&delete_frame(2)[..5]);
+
+    let res = decode_wal_batch_from_slice(&wal).expect("returns TornWrite");
+
+    assert!(matches!(res, WalBatchDecodeResult::TornWrite { .. }));
 }

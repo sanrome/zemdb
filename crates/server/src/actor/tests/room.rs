@@ -1212,7 +1212,9 @@ async fn demand_without_candidates_waits_for_a_connected_client() {
 
 /// Designation timeout for tests that exercise it. Between a designation and the start of
 /// the upload the tests make a few round trips and a disk write, which must all fit in it.
-const DESIGNATION_TIMEOUT_IN_TESTS: Duration = Duration::from_secs(1);
+/// Four maintenance ticks: a designee is replaced on the first tick past it, and the steps a
+/// test takes between two designations have that long even on a slow machine.
+const DESIGNATION_TIMEOUT_IN_TESTS: Duration = Duration::from_secs(2);
 
 /// A valid snapshot envelope of 200 KiB, uploaded in three chunks.
 fn three_chunk_snapshot() -> (Vec<u8>, [u8; 32], usize) {
