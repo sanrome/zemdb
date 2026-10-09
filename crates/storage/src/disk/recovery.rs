@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::Path;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, BufReader};
 
 use zemdb_core::{
     classify_checksum_mismatch, classify_zeroed_header, decode_batch_payload, parse_batch_header,
@@ -9,7 +9,8 @@ use zemdb_core::{
 };
 
 use crate::disk::compactor::{
-    compacting_wal_path, remove_if_exists, sync_parent, write_snapshot_file,
+    compacting_wal_path, remove_if_exists, sync_file, sync_parent, write_empty_snapshot_file,
+    write_snapshot_file, SyncKind,
 };
 pub use crate::disk::format::replay_wal_records;
 use crate::disk::format::{FileHeader, HEADER_SIZE};
@@ -168,7 +169,9 @@ async fn replay_wal_file(
 
 /// Replays a room from disk following the Dual-File architecture:
 /// 1. Reads the immutable base snapshot from `snap_path` (`room_{id}.snap`),
-///    verifying header and compressed payload CRC32 checksums before decompressing.
+///    verifying header and compressed payload CRC32 checksums before decompressing. A new
+///    room has none: an empty one is staged in a temporary file and renamed into place, so a
+///    failure or crash never leaves a partial snapshot behind.
 /// 2. If a pre-crash rotated WAL (`room_{id}.wal.compacting`) exists, replays the records
 ///    it holds beyond the snapshot.
 /// 3. Streams and replays all framed WAL batches from `wal_path` (`room_{id}.wal`),
@@ -193,8 +196,14 @@ pub async fn recover_room(
     let mut head_seq = SequenceNumber::from(0u64);
     let mut snapshot_len = 0u64;
 
-    // 1. Recover base snapshot from snap_path if it exists
-    if snap_path.exists() {
+    // 1. Recover base snapshot from snap_path if it exists. An error checking for it is not a
+    // missing snapshot: creating an empty one in its place would lose the room's contents.
+    let snap_exists = fail_point::io_result(
+        "recovery.snapshot_exists",
+        snap_path,
+        tokio::fs::try_exists(snap_path).await,
+    )?;
+    if snap_exists {
         let snap_std = std::fs::OpenOptions::new().read(true).open(snap_path)?;
         let snap_file = tokio::fs::File::from_std(snap_std);
         let snap_meta = snap_file.metadata().await?;
@@ -265,17 +274,10 @@ pub async fn recover_room(
             tables = payload.tables;
         }
     } else {
-        // Create initial empty snapshot
-        let header = FileHeader::new(0, 0, 0, 0);
-        let mut snap_file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(snap_path)
-            .await?;
-        snap_file.write_all(&header.encode()).await?;
-        snap_file.sync_all().await?;
-        sync_parent(snap_path).await?;
+        // Create the initial empty snapshot. The rename would replace a snapshot, but there is
+        // none: `try_exists` said so, and the room's exclusive WAL lock keeps out any other
+        // engine that could create one.
+        write_empty_snapshot_file(snap_path, room_id).await?;
     }
 
     // Clean up any lingering temporary snapshot files from interrupted compactions
@@ -322,7 +324,7 @@ pub async fn recover_room(
             "Torn write detected at WAL EOF, truncating damaged bytes to {valid_wal_bytes}"
         );
         wal_file.set_len(valid_wal_bytes).await?;
-        wal_file.sync_all().await?;
+        sync_file(&mut wal_file, SyncKind::All).await?;
     }
 
     // 4. Fold the rotated WAL into a fresh snapshot, then remove it
@@ -335,7 +337,7 @@ pub async fn recover_room(
 
             // The snapshot now holds every record of the active WAL as well.
             wal_file.set_len(0).await?;
-            wal_file.sync_all().await?;
+            sync_file(&mut wal_file, SyncKind::All).await?;
             valid_wal_bytes = 0;
         }
 

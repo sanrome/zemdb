@@ -3,6 +3,7 @@ use crate::fail_point;
 use crate::{DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError};
 use std::io::Write;
 use std::path::Path;
+use std::time::Duration;
 use zemdb_core::{
     CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequencedOperation, TableSchema,
     Value,
@@ -231,4 +232,83 @@ async fn checksum_mismatch_before_a_complete_frame_is_corruption_at_any_offset()
         std::fs::metadata(&wal_path).unwrap().len(),
         wal.len() as u64
     );
+}
+
+#[tokio::test]
+async fn failed_snapshot_existence_check_fails_open_and_keeps_the_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("snapshot-stat-failure").unwrap();
+    let engine = engine_at(dir.path());
+    let snap_path = engine.snap_file_path(&room);
+    engine.open_room(&room, schema()).await.unwrap();
+    for seq in 1..=3 {
+        engine.apply_batch(&room, vec![insert(seq)]).await.unwrap();
+    }
+    // The snapshot now holds every row and the WAL is empty.
+    engine.compact_room(&room).await.unwrap();
+    engine.close_room(&room).await.unwrap();
+    let snapshot = std::fs::read(&snap_path).unwrap();
+
+    let engine = engine_at(dir.path());
+    fail_point::arm("recovery.snapshot_exists", &snap_path);
+    assert!(engine.open_room(&room, schema()).await.is_err());
+    assert_eq!(std::fs::read(&snap_path).unwrap(), snapshot);
+
+    engine.open_room(&room, schema()).await.unwrap();
+    assert_rows(&engine, &room, 3).await;
+}
+
+/// Names of the staged snapshot files left in `dir`.
+fn staged_snapshot_files(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".snap.tmp."))
+        .collect()
+}
+
+#[tokio::test]
+async fn failed_initial_snapshot_write_leaves_no_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("initial-snapshot-failure").unwrap();
+    let engine = engine_at(dir.path());
+    let snap_path = engine.snap_file_path(&room);
+
+    fail_point::arm("snapshot.stage_write", &snap_path);
+    assert!(engine.open_room(&room, schema()).await.is_err());
+
+    // A partial snapshot would keep the room from ever opening again.
+    assert!(!snap_path.exists());
+    assert!(staged_snapshot_files(dir.path()).is_empty());
+    engine.open_room(&room, schema()).await.unwrap();
+    assert_rows(&engine, &room, 0).await;
+    engine.apply_batch(&room, vec![insert(1)]).await.unwrap();
+}
+
+#[tokio::test]
+async fn crash_before_initial_snapshot_rename_is_cleaned_up_on_next_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("initial-snapshot-crash").unwrap();
+    let engine = engine_at(dir.path());
+    let snap_path = engine.snap_file_path(&room);
+
+    // The open stops for good between staging the initial snapshot and renaming it.
+    let mut pause = fail_point::arm_pause("snapshot.install", &snap_path);
+    let open = tokio::spawn({
+        let (engine, room) = (engine.clone(), room.clone());
+        async move { engine.open_room(&room, schema()).await }
+    });
+    // Bounded, so that an open that never reaches the pause fails the test instead of hanging.
+    tokio::time::timeout(Duration::from_secs(10), pause.reached())
+        .await
+        .expect("opening the room never reached the rename of the initial snapshot");
+    open.abort();
+    assert!(open.await.unwrap_err().is_cancelled());
+    drop(pause);
+
+    assert!(!snap_path.exists());
+    assert_eq!(staged_snapshot_files(dir.path()).len(), 1);
+    engine.open_room(&room, schema()).await.unwrap();
+    assert_rows(&engine, &room, 0).await;
+    assert!(staged_snapshot_files(dir.path()).is_empty());
 }

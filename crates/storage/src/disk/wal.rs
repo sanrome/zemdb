@@ -11,23 +11,36 @@ pub struct WalWriter;
 
 impl WalWriter {
     /// Encodes and appends a single sequenced operation to the given WAL file.
+    ///
+    /// The write is complete when this returns, and its error, if any, is returned here; making
+    /// it durable is up to the caller.
     pub async fn write_record(
         file: &mut File,
         op: &SequencedOperation,
     ) -> Result<usize, StorageError> {
         let bytes = encode_wal_batch(std::slice::from_ref(op), None)?;
-        file.write_all(&bytes).await?;
+        Self::write_flushed(file, &bytes).await?;
         Ok(bytes.len())
     }
 
     /// Encodes and appends a batch of sequenced operations to the given WAL file.
+    ///
+    /// The write is complete when this returns, and its error, if any, is returned here; making
+    /// it durable is up to the caller.
     pub async fn write_batch(
         file: &mut File,
         ops: &[SequencedOperation],
     ) -> Result<usize, StorageError> {
         let buffer = Self::encode_batch(ops)?;
-        file.write_all(&buffer).await?;
+        Self::write_flushed(file, &buffer).await?;
         Ok(buffer.len())
+    }
+
+    /// Writes `bytes` and waits for the write: Tokio's `write_all` returns once the bytes are
+    /// handed to the blocking pool, and only a `flush` (or a later write) reports its error.
+    async fn write_flushed(file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
+        file.write_all(bytes).await?;
+        file.flush().await
     }
 
     /// Encodes a batch of sequenced operations into an atomically framed contiguous byte buffer.

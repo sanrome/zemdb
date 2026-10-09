@@ -116,6 +116,31 @@ async fn failed_wal_sync_marks_room_failed_until_reopened() {
 }
 
 #[tokio::test]
+async fn failed_background_wal_write_marks_room_failed_until_reopened() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("background-write-failure").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    engine.apply_batch(&room, vec![insert(1)]).await.unwrap();
+
+    // The WAL write fails on the blocking pool, after `write_all` has returned.
+    fail_point::arm("apply_batch.write", &engine.wal_file_path(&room));
+    assert!(engine.apply_batch(&room, vec![insert(2)]).await.is_err());
+
+    assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), 1);
+    assert!(!has_key(&engine, &room, 2).await);
+    assert!(matches!(
+        engine.apply_batch(&room, vec![insert(2)]).await,
+        Err(StorageError::RoomFailed { .. })
+    ));
+
+    drop(engine);
+    let reopened = open_engine(dir.path(), &room).await;
+    assert_eq!(reopened.get_head_seq(&room).await.unwrap().get(), 1);
+    assert!(!has_key(&reopened, &room, 2).await);
+    reopened.apply_batch(&room, vec![insert(2)]).await.unwrap();
+}
+
+#[tokio::test]
 async fn reads_are_not_blocked_while_a_batch_syncs() {
     let dir = tempfile::tempdir().unwrap();
     let room = RoomId::new("read-during-sync").unwrap();

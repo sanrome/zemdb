@@ -78,8 +78,13 @@ impl StagedSnapshot {
 ///    `apply_snapshot`, so these files are not shared; the state lock is taken briefly to
 ///    record the new snapshot's sequence and size.
 ///
-/// If any phase fails, `.wal.compacting` stays on disk: recovery folds it back on the next
-/// open, and the next compaction absorbs it.
+/// If any phase fails before the cleanup, `.wal.compacting` stays on disk: recovery folds it
+/// back on the next open, and the next compaction absorbs it. If the directory sync after the
+/// snapshot rename fails, `room_{id}.snap` on disk is already the new one while the in-memory
+/// `snapshot_seq` and `snapshot_len` keep their old values; that is benign, since they only feed
+/// the auto-compaction threshold and `.wal.compacting` is kept. If the cleanup fails,
+/// `.wal.compacting` may already be gone, or may come back after a crash; either way its records
+/// are in the new snapshot and recovery skips them.
 #[tracing::instrument(skip(room, options), fields(room_id = %room.room_id))]
 pub(crate) async fn compact_room_cow(
     room: Arc<DiskRoom>,
@@ -98,7 +103,7 @@ pub(crate) async fn compact_room_cow(
         // A failed sync leaves the durability of earlier writes unknown, and cannot be retried.
         let sync_result = async {
             fail_point::check("compaction.sync", &room.wal_path)?;
-            wal.file.sync_all().await?;
+            sync_file(&mut wal.file, SyncKind::All).await?;
             Ok::<(), StorageError>(())
         }
         .await;
@@ -145,10 +150,17 @@ pub(crate) async fn compact_room_cow(
     };
 
     // Phase 3: Final atomic replacement and cleanup
-    if let Err(err) = rename(&staged.tmp_path, &room.snap_path).await {
-        staged.discard().await;
-        return Err(err.into());
+    let renamed = async {
+        fail_point::check("compaction.phase3_rename", &room.wal_path)?;
+        rename(&staged.tmp_path, &room.snap_path).await?;
+        Ok::<(), StorageError>(())
     }
+    .await;
+    if let Err(err) = renamed {
+        staged.discard().await;
+        return Err(err);
+    }
+    fail_point::check("compaction.phase3_sync", &room.wal_path)?;
     sync_parent(&room.snap_path).await?;
     {
         let mut state = room.state.write().await;
@@ -156,6 +168,7 @@ pub(crate) async fn compact_room_cow(
         state.snapshot_len = staged.compressed_len;
     }
 
+    fail_point::check("compaction.cleanup", &room.wal_path)?;
     remove_if_exists(&wal_compacting_path).await?;
     sync_parent(&wal_compacting_path).await?;
 
@@ -282,7 +295,7 @@ async fn truncate_wal(wal: &mut DiskWal, wal_path: &Path) -> Result<(), StorageE
     wal.file.set_len(0).await?;
     fail_point::pause("wal.truncate", wal_path).await;
     wal.file.seek(SeekFrom::Start(0)).await?;
-    wal.file.sync_all().await?;
+    sync_file(&mut wal.file, SyncKind::All).await?;
     wal.len = 0;
     Ok(())
 }
@@ -304,8 +317,9 @@ async fn append_synced(
         let (first, rest) = bytes.split_at(bytes.len() / 2);
         file.write_all(first).await?;
         fail_point::check("compaction.absorb_write", wal_path)?;
+        fail_point::read_only_handle("compaction.absorb_append", wal_path, &mut file, path).await;
         file.write_all(rest).await?;
-        file.sync_all().await?;
+        sync_file(&mut file, SyncKind::All).await?;
         Ok::<(), StorageError>(())
     }
     .await;
@@ -313,7 +327,7 @@ async fn append_synced(
     if let Err(err) = append_result {
         let restore_result = async {
             file.set_len(original_len).await?;
-            file.sync_all().await?;
+            sync_file(&mut file, SyncKind::All).await?;
             Ok::<(), StorageError>(())
         }
         .await;
@@ -337,21 +351,31 @@ fn stage_snapshot_blocking(
     zstd_level: i32,
     room_id: &RoomId,
 ) -> Result<StagedSnapshot, StorageError> {
-    use std::io::Write;
-
     let compressed = zstd::encode_all(serialized, zstd_level)
         .map_err(|e| StorageError::Other(format!("Zstd compression failed: {e}")))?;
-
-    let payload_crc32 = crc32fast::hash(&compressed);
-    let uuid_str = uuid::Uuid::new_v4().to_string();
-    let tmp_path = snap_path.with_extension(format!("snap.tmp.{}", uuid_str));
 
     let header = FileHeader::new(
         head_seq.get(),
         head_seq.get(),
         compressed.len() as u64,
-        payload_crc32,
+        crc32fast::hash(&compressed),
     );
+    stage_file_blocking(snap_path, &header, &compressed, room_id)
+}
+
+/// Writes `header` followed by `payload` to a unique temporary file next to `snap_path`, synced
+/// to disk. On failure the temporary file is removed; one left behind by a crash is removed when
+/// the room is next opened.
+fn stage_file_blocking(
+    snap_path: &Path,
+    header: &FileHeader,
+    payload: &[u8],
+    room_id: &RoomId,
+) -> Result<StagedSnapshot, StorageError> {
+    use std::io::Write;
+
+    let uuid_str = uuid::Uuid::new_v4().to_string();
+    let tmp_path = snap_path.with_extension(format!("snap.tmp.{}", uuid_str));
 
     let std_tmp = std::fs::OpenOptions::new()
         .create_new(true)
@@ -365,7 +389,7 @@ fn stage_snapshot_blocking(
         fail_point::check("snapshot.stage_write", snap_path)?;
         let mut writer = std::io::BufWriter::new(&std_tmp);
         writer.write_all(&header.encode())?;
-        writer.write_all(&compressed)?;
+        writer.write_all(payload)?;
         writer.flush()?;
         drop(writer);
         std_tmp.sync_all()?;
@@ -381,7 +405,7 @@ fn stage_snapshot_blocking(
 
     Ok(StagedSnapshot {
         tmp_path,
-        compressed_len: compressed.len() as u64,
+        compressed_len: payload.len() as u64,
     })
 }
 
@@ -422,7 +446,37 @@ pub(crate) async fn write_snapshot_file(
     room_id: &RoomId,
 ) -> Result<u64, StorageError> {
     let staged = stage_snapshot(snap_path, head_seq, tables, zstd_level, room_id).await?;
-    rename(&staged.tmp_path, snap_path).await?;
+    install_staged(snap_path, staged).await
+}
+
+/// Creates the empty snapshot of a new room (a header without payload) at `snap_path`, through
+/// a synced temporary file renamed into place, so that a failure or a crash never leaves a
+/// partial `room_{id}.snap` that would keep the room from opening.
+pub(crate) async fn write_empty_snapshot_file(
+    snap_path: &Path,
+    room_id: &RoomId,
+) -> Result<(), StorageError> {
+    let staged = {
+        let snap_path = snap_path.to_path_buf();
+        let room_id = room_id.clone();
+        tokio::task::spawn_blocking(move || {
+            stage_file_blocking(&snap_path, &FileHeader::new(0, 0, 0, 0), &[], &room_id)
+        })
+        .await
+        .map_err(|e| StorageError::Other(format!("Join error: {e}")))??
+    };
+    install_staged(snap_path, staged).await?;
+    Ok(())
+}
+
+/// Renames a staged snapshot over `snap_path` and syncs the directory. Returns the compressed
+/// payload length. If the rename fails, the staged file is removed.
+async fn install_staged(snap_path: &Path, staged: StagedSnapshot) -> Result<u64, StorageError> {
+    fail_point::pause("snapshot.install", snap_path).await;
+    if let Err(err) = rename(&staged.tmp_path, snap_path).await {
+        staged.discard().await;
+        return Err(err.into());
+    }
     sync_parent(snap_path).await?;
     Ok(staged.compressed_len)
 }
@@ -479,6 +533,30 @@ pub(crate) async fn remove_if_exists(path: &Path) -> Result<(), StorageError> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// What [`sync_file`] makes durable.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SyncKind {
+    /// The file's data (`fdatasync`), enough for an append.
+    Data,
+    /// The file's data and metadata (`fsync`).
+    All,
+}
+
+/// Makes what was written through `file` durable, and reports any error of those writes.
+///
+/// Tokio's `write_all` returns once the bytes are handed to the blocking pool. Its `sync_data`
+/// and `sync_all` wait for that write, but keep its error for a later `flush` or write and sync
+/// successfully, so a batch could be acknowledged without being on disk. `flush` reports the
+/// error. Every sync of a Tokio file in this crate goes through here.
+#[allow(clippy::disallowed_methods)]
+pub(crate) async fn sync_file(file: &mut File, kind: SyncKind) -> std::io::Result<()> {
+    file.flush().await?;
+    match kind {
+        SyncKind::Data => file.sync_data().await,
+        SyncKind::All => file.sync_all().await,
     }
 }
 
