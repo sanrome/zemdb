@@ -39,6 +39,7 @@ impl TestServer {
             snapshot_ttl_secs: 60,
             snapshot_demand_ttl_secs: 60,
             max_snapshot_bytes: 16 * 1024 * 1024,
+            ..ServerConfig::default()
         });
 
         let schemas_dir = data_dir.join("schemas");
@@ -269,6 +270,86 @@ async fn test_control_plane_room_lifecycle() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn control_plane_room_lifecycle_overrides() {
+    let server = TestServer::start().await;
+    let schema_id = SchemaId::new("policy-schema").unwrap();
+    server
+        .schema_registry
+        .register_schema(schema_id.clone(), create_test_schema())
+        .unwrap();
+    let auth_header = format!("Bearer {}", server.config.admin_secret);
+    let create = |body: String| {
+        server
+            .client
+            .post(format!("{}/admin/rooms", server.base_url))
+            .header(AUTHORIZATION, &auth_header)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+    };
+
+    // Invalid overrides are JSON BadRequest and create nothing: out of range, unknown fields
+    // (for example a duration without the `_secs` suffix) and values of the wrong type.
+    for lifecycle in [
+        r#"{"ram_max_ops": 0}"#,
+        r#"{"snapshot_demand_ttl_secs": 59}"#,
+        r#"{"ram_ttl": 5}"#,
+        r#"{"lease_timeout_secs": "90"}"#,
+        r#"{"cold_disk_ttl_secs": -1}"#,
+    ] {
+        let resp = create(format!(
+            r#"{{"room_id": "room-policy", "schema_id": "policy-schema", "lifecycle": {lifecycle}}}"#
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{lifecycle}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], "BadRequest", "{lifecycle}: {body}");
+    }
+    assert!(!server
+        .room_manager
+        .room_exists(&RoomId::new("room-policy").unwrap()));
+
+    let resp = create(
+        r#"{"room_id": "room-policy", "schema_id": "policy-schema",
+            "lifecycle": {"ram_max_ops": 7, "idle_timeout_secs": 0}}"#
+            .to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let meta: serde_json::Value = resp.json().await.unwrap();
+    let overrides = serde_json::json!({"ram_max_ops": 7, "idle_timeout_secs": 0});
+    assert_eq!(meta["lifecycle"], overrides);
+
+    // The room details show the stored overrides and the effective policy: the overrides on
+    // top of the server defaults, durations in seconds.
+    let resp = server
+        .client
+        .get(format!("{}/admin/rooms/room-policy", server.base_url))
+        .header(AUTHORIZATION, &auth_header)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let details: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(details["lifecycle_overrides"], overrides);
+    let effective = &details["lifecycle"];
+    assert_eq!(effective["ram_max_ops"], 7);
+    assert_eq!(effective["idle_timeout_secs"], 0);
+    assert_eq!(
+        effective["lease_timeout_secs"],
+        server.config.lease_timeout_secs
+    );
+    assert_eq!(
+        effective["snapshot_demand_ttl_secs"],
+        server.config.snapshot_demand_ttl_secs
+    );
+    assert_eq!(effective["dormant_after_secs"], serde_json::Value::Null);
+    assert_eq!(details["head_seq"], 0);
 }
 
 #[tokio::test]
@@ -556,7 +637,7 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
         })
         .await
         .unwrap();
-    assert_eq!(cur_rx.await.unwrap(), Some(SequenceNumber::new(0)));
+    assert_eq!(cur_rx.await.unwrap().unwrap(), Some(SequenceNumber::new(0)));
 
     // Reader sends explicit Ack for sequence 3
     let ack_msg = ClientMessage::Ack {
@@ -596,7 +677,10 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
         })
         .await
         .unwrap();
-    assert_eq!(cur_rx2.await.unwrap(), Some(SequenceNumber::new(3)));
+    assert_eq!(
+        cur_rx2.await.unwrap().unwrap(),
+        Some(SequenceNumber::new(3))
+    );
 }
 
 #[tokio::test]
@@ -716,7 +800,7 @@ async fn test_data_plane_heartbeat_and_deregister() {
         })
         .await
         .unwrap();
-    assert_eq!(rx.await.unwrap(), None);
+    assert_eq!(rx.await.unwrap().unwrap(), None);
 }
 
 #[tokio::test]
@@ -1988,8 +2072,8 @@ async fn test_snapshot_demand_signals_over_http_and_sse() {
         .register_schema(schema_id.clone(), schema.clone())
         .unwrap();
     let room_id = RoomId::new("room-snapshot-signals").unwrap();
-    let small_segments = zemdb_server::RoomLifecyclePolicy {
-        ram_max_ops: 2,
+    let small_segments = zemdb_server::RoomLifecycleOverrides {
+        ram_max_ops: Some(2),
         ..Default::default()
     };
     server

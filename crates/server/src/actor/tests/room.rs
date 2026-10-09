@@ -2,6 +2,7 @@ use super::*;
 use crate::actor::lease::ClientEntry;
 use crate::actor::manager::RoomManager;
 use crate::fail_point;
+use crate::log::RoomLifecycleOverrides;
 use crate::schema_registry::SchemaRegistry;
 use std::fs;
 use std::path::PathBuf;
@@ -51,14 +52,15 @@ struct Fixture {
 }
 
 impl Fixture {
-    async fn new(policy: RoomLifecyclePolicy) -> Self {
+    async fn new(policy: RoomLifecycleOverrides) -> Self {
         Self::with_options(policy, |_| {}, None).await
     }
 
-    /// A fixture whose server configuration is adjusted by `configure` and, if given, whose
-    /// designated snapshot uploaders time out after `designation_timeout`.
+    /// A fixture whose room has the lifecycle overrides `policy`, whose server configuration
+    /// is adjusted by `configure` and, if given, whose designated snapshot uploaders time out
+    /// after `designation_timeout`.
     async fn with_options(
-        policy: RoomLifecyclePolicy,
+        policy: RoomLifecycleOverrides,
         configure: impl FnOnce(&mut ServerConfig),
         designation_timeout: Option<Duration>,
     ) -> Self {
@@ -117,6 +119,8 @@ fn new_manager_with(
 ) -> (RoomManager, Arc<SnapshotRelay>) {
     let mut config = ServerConfig {
         data_dir: dir.path().to_path_buf(),
+        // Rooms under test stay open unless a test enables the shutdown for inactivity.
+        idle_timeout_secs: 0,
         ..ServerConfig::default()
     };
     configure(&mut config);
@@ -185,7 +189,7 @@ async fn cursor(
         })
         .await
         .unwrap();
-    rx.await.unwrap()
+    rx.await.unwrap().unwrap()
 }
 
 async fn metrics(sender: &mpsc::Sender<RoomCommand>) -> RoomMetrics {
@@ -194,7 +198,7 @@ async fn metrics(sender: &mpsc::Sender<RoomCommand>) -> RoomMetrics {
         .send(RoomCommand::GetMetrics { reply: tx })
         .await
         .unwrap();
-    rx.await.unwrap()
+    rx.await.unwrap().unwrap()
 }
 
 async fn sync_all(
@@ -216,7 +220,7 @@ async fn sync_all(
 
 #[tokio::test]
 async fn accepted_commit_advances_client_cursor() {
-    let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
     let sender = fx.sender().await;
     let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
@@ -234,7 +238,7 @@ async fn accepted_commit_advances_client_cursor() {
 
 #[tokio::test]
 async fn retried_commit_advances_client_cursor() {
-    let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
     let sender = fx.sender().await;
     let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
@@ -256,7 +260,7 @@ async fn retried_commit_advances_client_cursor() {
 
 #[tokio::test]
 async fn rejected_commit_does_not_advance_client_cursor() {
-    let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
     let sender = fx.sender().await;
     let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
@@ -275,9 +279,9 @@ async fn rejected_commit_does_not_advance_client_cursor() {
 
 #[tokio::test]
 async fn commit_only_client_advances_retention_floor() {
-    let policy = RoomLifecyclePolicy {
-        ram_max_ops: 2,
-        ..RoomLifecyclePolicy::default()
+    let policy = RoomLifecycleOverrides {
+        ram_max_ops: Some(2),
+        ..RoomLifecycleOverrides::default()
     };
     let fx = Fixture::new(policy).await;
     let sender = fx.sender().await;
@@ -314,7 +318,7 @@ async fn commit_only_client_advances_retention_floor() {
 
 #[tokio::test]
 async fn cursor_advance_is_persisted_by_maintenance_tick() {
-    let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
     let sender = fx.sender().await;
     let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
@@ -339,7 +343,7 @@ async fn cursor_advance_is_persisted_by_maintenance_tick() {
 // Paused time: the maintenance tick cannot fire on its own, so only Shutdown can flush.
 #[tokio::test(start_paused = true)]
 async fn shutdown_persists_pending_roster_changes() {
-    let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
     let sender = fx.sender().await;
     let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
@@ -362,7 +366,7 @@ async fn shutdown_persists_pending_roster_changes() {
 
 #[tokio::test]
 async fn failed_commit_sync_stops_room_and_recovers_from_disk() {
-    let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
     let sender = fx.sender().await;
     let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
@@ -449,9 +453,9 @@ async fn ack(
 // Paused time: no maintenance tick runs, so only the ack path can persist the cursor.
 #[tokio::test(start_paused = true)]
 async fn pruning_on_ack_persists_cursor_before_deleting_segments() {
-    let policy = RoomLifecyclePolicy {
-        ram_max_ops: 2,
-        ..RoomLifecyclePolicy::default()
+    let policy = RoomLifecycleOverrides {
+        ram_max_ops: Some(2),
+        ..RoomLifecycleOverrides::default()
     };
     let fx = Fixture::new(policy).await;
     let sender = fx.sender().await;
@@ -477,9 +481,9 @@ async fn pruning_on_ack_persists_cursor_before_deleting_segments() {
 
 #[tokio::test]
 async fn rotation_failure_after_durable_commit_is_acknowledged_and_restarts_room() {
-    let policy = RoomLifecyclePolicy {
-        ram_max_ops: 2,
-        ..RoomLifecyclePolicy::default()
+    let policy = RoomLifecycleOverrides {
+        ram_max_ops: Some(2),
+        ..RoomLifecycleOverrides::default()
     };
     let fx = Fixture::new(policy).await;
     let sender = fx.sender().await;
@@ -517,7 +521,7 @@ async fn rotation_failure_after_durable_commit_is_acknowledged_and_restarts_room
 
 #[tokio::test]
 async fn failed_commit_write_restarts_room_and_retry_gets_next_sequence() {
-    let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
     let sender = fx.sender().await;
     let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
@@ -547,7 +551,7 @@ async fn failed_commit_write_restarts_room_and_retry_gets_next_sequence() {
 
 #[tokio::test]
 async fn log_bounds_report_the_retained_range() {
-    let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
     let sender = fx.sender().await;
     let client = ClientId::new("writer").unwrap();
     register(&sender, &client).await;
@@ -588,9 +592,9 @@ fn snapshot_envelope() -> bytes::Bytes {
 // Paused time: no maintenance tick runs, so only the ack path prunes.
 #[tokio::test(start_paused = true)]
 async fn snapshot_below_the_retained_range_does_not_anchor_pruning() {
-    let policy = RoomLifecyclePolicy {
-        ram_max_ops: 2,
-        ..RoomLifecyclePolicy::default()
+    let policy = RoomLifecycleOverrides {
+        ram_max_ops: Some(2),
+        ..RoomLifecycleOverrides::default()
     };
     let fx = Fixture::new(policy).await;
     let sender = fx.sender().await;
@@ -731,10 +735,10 @@ fn roster_entries(entries: &[(&ClientId, &str, u64)]) -> Vec<serde_json::Value> 
 }
 
 /// Two operations per segment, so that a few commits leave segments to prune.
-fn small_segments() -> RoomLifecyclePolicy {
-    RoomLifecyclePolicy {
-        ram_max_ops: 2,
-        ..RoomLifecyclePolicy::default()
+fn small_segments() -> RoomLifecycleOverrides {
+    RoomLifecycleOverrides {
+        ram_max_ops: Some(2),
+        ..RoomLifecycleOverrides::default()
     }
 }
 
@@ -766,7 +770,7 @@ async fn prune_with_writer(fx: &Fixture) -> (ClientId, SequenceNumber) {
 // Paused time: no maintenance tick changes the lifecycle states under test.
 #[tokio::test(start_paused = true)]
 async fn dormant_client_with_a_valid_cursor_syncs_acks_commits_and_becomes_connected() {
-    let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
     let sender = fx.sender().await;
     let writer = ClientId::new("writer").unwrap();
     register(&sender, &writer).await;
@@ -910,7 +914,7 @@ async fn ack_below_the_stored_cursor_is_a_successful_no_op() {
 
 #[tokio::test(start_paused = true)]
 async fn sync_from_beyond_the_head_is_an_invalid_sequence() {
-    let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
     let sender = fx.sender().await;
     let client = ClientId::new("client").unwrap();
     register(&sender, &client).await;
@@ -929,7 +933,7 @@ async fn sync_from_beyond_the_head_is_an_invalid_sequence() {
 
 #[tokio::test(start_paused = true)]
 async fn sync_advances_the_cursor_of_any_client() {
-    let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
     let sender = fx.sender().await;
     let client = ClientId::new("client").unwrap();
     register(&sender, &client).await;
@@ -979,7 +983,7 @@ async fn subscribe(sender: &mpsc::Sender<RoomCommand>) -> broadcast::Receiver<Ro
         .send(RoomCommand::SubscribeEvents { reply: tx })
         .await
         .unwrap();
-    rx.await.unwrap()
+    rx.await.unwrap().unwrap()
 }
 
 fn is_snapshot_event(event: &RoomEvent) -> bool {
@@ -1451,7 +1455,7 @@ async fn register_reports_only_a_usable_snapshot() {
 
 #[tokio::test(start_paused = true)]
 async fn register_with_a_cursor_beyond_the_head_is_rejected_without_touching_the_roster() {
-    let fx = Fixture::new(RoomLifecyclePolicy::default()).await;
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
     let sender = fx.sender().await;
     let client = ClientId::new("client").unwrap();
     register(&sender, &client).await;
@@ -1485,5 +1489,105 @@ async fn register_with_a_cursor_beyond_the_head_is_rejected_without_touching_the
     register_result(&sender, &stranger, Some(seq(3)))
         .await
         .unwrap();
+    fx.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn room_with_a_snapshot_upload_in_progress_stays_open() {
+    let fx = Fixture::with_options(
+        RoomLifecycleOverrides {
+            idle_timeout_secs: Some(1),
+            ..RoomLifecycleOverrides::default()
+        },
+        |_| {},
+        None,
+    )
+    .await;
+    let sender = fx.sender().await;
+    let writer = ClientId::new("writer").unwrap();
+    register(&sender, &writer).await;
+    commit(&sender, &writer, mutation(1), seq(0), insert_op(1))
+        .await
+        .unwrap();
+    // The first of three chunks of a snapshot at the head: the upload stays in progress.
+    assert!(!upload_chunk(&fx, 1, 0).await);
+
+    // Well past the idle timeout, with several maintenance ticks and no command.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(
+        fx.manager.get_room(&fx.room_id).is_some(),
+        "the room shut down during an upload"
+    );
+    fx.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn commands_queued_when_the_room_goes_idle_are_handled() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    fx.manager.shutdown_all().await;
+    let config = Arc::new(ServerConfig {
+        data_dir: fx.dir.path().to_path_buf(),
+        ..ServerConfig::default()
+    });
+    let (sender, mut actor) = RoomActor::open(
+        fx.room_id.clone(),
+        SchemaId::new("todo").unwrap(),
+        Arc::new(test_schema()),
+        fx.dir.path(),
+        config,
+        RoomLifecyclePolicy::default(),
+        Arc::clone(&fx.relay),
+        DESIGNATION_TIMEOUT,
+    )
+    .unwrap();
+
+    // Requests that reached the mailbox before the actor decided to shut down.
+    let client = ClientId::new("writer").unwrap();
+    let (register_tx, register_rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::RegisterClient {
+            client_id: client.clone(),
+            current_seq: None,
+            reply: register_tx,
+        })
+        .await
+        .unwrap();
+    let (commit_tx, commit_rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::Commit {
+            client_id: client.clone(),
+            mutation_id: mutation(1),
+            last_ack_seq: seq(0),
+            op: insert_op(1),
+            reply: commit_tx,
+        })
+        .await
+        .unwrap();
+    let (subscribe_tx, subscribe_rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::SubscribeEvents {
+            reply: subscribe_tx,
+        })
+        .await
+        .unwrap();
+
+    actor.drain_for_idle_shutdown().await;
+
+    // Nothing more is accepted; what was queued was handled normally.
+    assert!(sender.is_closed());
+    register_rx.await.unwrap().unwrap();
+    assert_eq!(commit_rx.await.unwrap().unwrap().assigned_seq, seq(1));
+    // A subscription would end with the actor: it is refused so that the caller retries
+    // against the reopened room.
+    assert!(matches!(
+        subscribe_rx.await.unwrap(),
+        Err(ServerError::Unavailable(_))
+    ));
+    drop(actor);
+
+    // The commit is durable and the client registered in the reopened room.
+    let sender = fx.sender().await;
+    assert_eq!(cursor(&sender, &client).await, Some(seq(0)));
+    assert_eq!(metrics(&sender).await.head_seq, seq(1));
     fx.manager.shutdown_all().await;
 }

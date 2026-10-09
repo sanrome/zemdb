@@ -10,7 +10,7 @@ pub mod relay;
 pub mod schema_registry;
 
 pub use actor::{
-    ClientEntry, ClientLeaseTracker, ClientState, CommitResponse, HeartbeatResponse,
+    ActorExit, ClientEntry, ClientLeaseTracker, ClientState, CommitResponse, HeartbeatResponse,
     RegisterResponse, RoomActor, RoomCommand, RoomEvent, RoomManager, RoomMetadata, RoomMetrics,
     SyncBatchResponse,
 };
@@ -23,7 +23,8 @@ pub use config::ServerConfig;
 pub use dedup::DedupLruCache;
 pub use error::ServerError;
 pub use log::{
-    AppendOutcome, MaintenanceReport, PruneReport, RoomLifecyclePolicy, TieredLog, WarmDiskLog,
+    AppendOutcome, MaintenanceReport, PruneReport, RoomLifecycleOverrides, RoomLifecyclePolicy,
+    TieredLog, WarmDiskLog,
 };
 pub use relay::SnapshotRelay;
 pub use schema_registry::SchemaRegistry;

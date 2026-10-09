@@ -38,6 +38,7 @@ async fn start_server() -> TestServer {
         snapshot_ttl_secs: 60,
         snapshot_demand_ttl_secs: 60,
         max_snapshot_bytes: 16 * 1024 * 1024,
+        ..ServerConfig::default()
     });
     let schema_registry = Arc::new(SchemaRegistry::new(data_dir.join("schemas")).unwrap());
     let table = TableSchema::builder("tasks")

@@ -68,7 +68,8 @@ fn unexpected_message(room_id: RoomId, expected: &str) -> Response {
 }
 
 /// Sends a command to the room actor and waits for its reply, returning the actor's own
-/// result. The exchange itself can fail with `RoomNotFound`, `Unavailable` or `Timeout` (see
+/// result. The exchange itself can fail with `RoomNotFound`, `Unavailable`, `Internal` or
+/// `Timeout` (see
 /// [`RoomManager::ask`](crate::actor::manager::RoomManager::ask)).
 async fn ask_room<R>(
     state: &AppState,

@@ -66,6 +66,13 @@
 | **D28** | Errores reintentables: `Unavailable` (503 con `Retry-After: 1`, nuevo) cuando la sala se reinicia (D7), el actor se cerró o descartó la respuesta; `Timeout` (504, nuevo; antes `Internal`) cuando el actor no responde a tiempo. Reintentar un commit es seguro por la deduplicación. `Internal` (500) queda para errores inesperados, que el SDK no reintenta solo. | Adoptada |
 | **D29** | Contrato de `tail_seq` en `ARCHITECTURE.md` §7 (sin cambiar valores): primer seq retenido; sala nueva `tail = 1`, `head = 0`; log podado por completo `tail = head + 1`; un cliente se pone al día si `cursor ≥ tail - 1`; un snapshot es usable si `tail - 1 ≤ S ≤ head`. | Adoptada |
 | **D30** | Todo el Data Plane es binario: la respuesta exitosa de la subida de snapshot en un solo request y los errores de SSE posteriores a la autenticación pasan de JSON a frames binarios. | Adoptada |
+| **D31** | El Lote 8 se divide en **8a** (ciclo de vida de salas: DEF-83, 55, 86, 31) y **8b** (rendimiento e I/O: índice de segmentos, DEF-50, 35, 37, 08, 25, 72, 77, 79), cada uno con su revisión y su commit. | Adoptada |
+| **D32** | Política por sala como **sobrescrituras** guardadas en `meta_room.json`; lo no sobrescrito sigue al default del servidor (variables de entorno). Archivos sin política = sin sobrescrituras. Campos: `ram_max_ops`, `ram_ttl`, `warm_disk_ttl`, `cold_disk_ttl`, `max_room_disk_bytes`, `lease_timeout`, `dormant_after`, `snapshot_demand_ttl`, `idle_timeout`. El TTL y el tamaño máximo de snapshots del relay siguen globales. JSON de admin con duraciones en segundos enteros (`*_secs`). Una variable de entorno inválida impide arrancar; una política inválida en la API es 400. Cambiar la política de una sala existente queda diferido. | Adoptada |
+| **D33** | Apagado de salas inactivas: tras `idle_timeout` (default 10 min, `0` = nunca) sin comandos, sin suscriptores SSE y sin subida en curso. El actor cierra su buzón, procesa los comandos ya encolados y termina; el manager la relanza en el siguiente pedido. Ningún pedido se pierde ni recibe 503 por el apagado. Una sala apagada no corre su mantenimiento hasta reabrirse (barrido global diferido). | Adoptada |
+| **D34** | Pánico del actor: el loop corre dentro de `catch_unwind`, que marca la sala como terminada por pánico. Cuando se descarta una respuesta, el manager espera a que el actor termine y responde `Internal` (500, no reintentable) si hubo pánico, o `Unavailable` si fue una detención a propósito (D7). Los comandos encolados detrás reciben `Unavailable`. | Adoptada |
+| **D35** | Índice de segmentos en memoria en `TieredLog` (rango, tier, bytes), armado con un `read_dir` al abrir y actualizado al rotar, comprimir y podar. Dos ticks: rápido (1 s, solo memoria: leases, estados, señales de snapshot, roster, inactividad) y lento (30 s, disco: compresión, TTL, cuota, ventana de RAM, poda de respaldo). La poda por cursores sigue también en cada Ack. Intervalos internos, ajustables solo en tests. | Adoptada |
+| **D36** | I/O bloqueante en el actor (append con fsync, `log_meta.json`, roster, descompresión fría) envuelta en un helper con `block_in_place`; en un runtime de un solo hilo (tests) ejecuta directo. `spawn_blocking` descartado (reestructuración mucho mayor). | Adoptada |
+| **D37** | Se adelanta DEF-73: CI en GitHub Actions (`.github/workflows/ci.yml`) con fmt, clippy y tests en Linux, Windows y macOS, y el build para wasm en Linux. El repo es público, así que no hay costo de minutos. Las fallas que aparezcan en Windows se corrigen en el Lote 8b. | Adoptada |
 
 ---
 
@@ -80,11 +87,11 @@
 | 5 | Relay de snapshots | DEF-62, 10, 63, 52, 51, 39, 40, 38, 31(relay), 08(relay), 15 | Alta | ✅ 11/11 |
 | 6 | Ciclo de vida de clientes y señalización | DEF-53, 05, 27, 75, 76 (24 y 26 descartados) | Alta | ✅ 5/5 |
 | 7 | Protocolo wire y errores HTTP | DEF-46, 28, 11, 43, 64, 22, 71, 74 | Media | ✅ 8/8 |
-| 8 | Rendimiento, portabilidad y ciclo de vida de salas | DEF-50, 35, 55, 37, 08, 31(locks), 25(server), 72, 77, 79, 83, 86 | Media | 0/12 |
+| 8 | Rendimiento, portabilidad y ciclo de vida de salas | DEF-50, 35, 55, 37, 08, 31(locks), 25(server), 72, 77, 79, 83, 86 | Media | 4/12 (8a ✅) |
 | 9 | Robustez e higiene de storage y core | DEF-14, 23, 49, 17, 25(storage), 18, 09, 45, 33, 44, 47, 30, 13, 20, 21, 57, 70, 78 (32 descartado) | Media/Baja | 1/18 |
 | 10 | Diferido a Fase 4 / descartado | DEF-34, 54, 42, 56, 73, 81, 82, 84, 85 | — | — |
 
-**Avance total:** 49 de 78 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
+**Avance total:** 53 de 78 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
 
 **Severidades corregidas respecto de la auditoría anterior:** de los 7 "críticos" originales, solo DEF-01 lo es. DEF-02, 03 y 04 son Altos; DEF-05 y 06 son Medios; DEF-34 es Bajo. DEF-24, 26 y 56 son falsos en la práctica.
 
@@ -423,7 +430,7 @@ Cada tick de 500 ms hace unos 8 `read_dir` más `stat` por archivo, y `prune_old
 #### DEF-35 · Medio · ⬜
 Al crear la sala se descomprime todo el cold tier y se lee todo el warm, de forma síncrona en `RoomActor::spawn`. Solo hacen falta las últimas `ram_max_ops` ops, los últimos `dedup_lru_capacity` mutation IDs y `head` (que sale de los nombres de segmento y de `active.wal`). Leer hacia atrás hasta cubrir ambas cuotas e hidratar en orden cronológico para conservar la recencia de la LRU.
 
-#### DEF-55 · Medio · ⬜ (subido de Bajo-Medio: con muchas salas casi siempre inactivas, cada una queda abierta para siempre)
+#### DEF-55 · Medio · ✅ Hecho (8a) (subido de Bajo-Medio: con muchas salas casi siempre inactivas, cada una queda abierta para siempre)
 Las salas nunca se apagan. El actor se apaga solo (guarda el roster y libera memoria, archivos y lock) tras un tiempo configurable sin comandos, sin clientes `Connected`/`Bootstrapping`, sin suscriptores SSE y sin subida de snapshot en curso; el siguiente pedido la relanza desde disco por el mismo camino que D7. El tiempo es un parámetro más de la política de ciclo de vida (DEF-83), con default del servidor por variable de entorno y la opción de no apagar nunca. Reduce también el costo de DEF-37 y DEF-50.
 
 #### DEF-37 · Bajo · ⬜ (requiere DEF-07 y DEF-58)
@@ -432,7 +439,7 @@ La ventana TTL de la RAM solo se aplica en `append`. No es una fuga: está acota
 #### DEF-08 · Bajo-Medio · ⬜
 El `sync_data` de cada commit bloquea un worker de Tokio (en macOS es `F_FULLFSYNC`, 5–20 ms). Solo afecta cuando muchas salas hacen commit a la vez. Envolver el append con fsync en `tokio::task::block_in_place`, y la descompresión cold en `spawn_blocking`. Group commit descartado (D4).
 
-#### DEF-31 (spawn_locks) · Bajo · ⬜
+#### DEF-31 (spawn_locks) · Bajo · ✅ Hecho (8a)
 **Error de la propuesta anterior.** Un `spawn_locks.remove` directo rompe la exclusión mutua: quien espera con el mutex viejo y un llamador nuevo terminan con mutex distintos.
 **Solución.** Quitarlo solo bajo el guard, con `remove_if` según el refcount del `Arc`.
 
@@ -443,13 +450,24 @@ El `sync_data` de cada commit bloquea un worker de Tokio (en macOS es `F_FULLFSY
 **Problema.** Windows es plataforma objetivo. `WarmDiskLog::read_range` (y `recover_all`) leen `active.wal` con `std::fs::read`, un segundo handle, mientras `active_file` tiene el lock exclusivo de `fs2`. En Windows ese lock es obligatorio (`LockFileEx`) y la lectura falla: el catch-up desde `active.wal` tras desalojo por TTL de RAM no funcionaría.
 **Solución.** Leer `active.wal` a través del handle que ya tiene el lock (o con un lock compartido coordinado). Verificar en CI con Windows (DEF-73).
 
-#### DEF-83 · Medio · ⬜ (nuevo, revisión de documentación contra el modelo de uso)
+#### DEF-83 · Medio · ✅ Hecho (8a) (nuevo, revisión de documentación contra el modelo de uso)
 **Problema.** `ARCHITECTURE.md` dice que la política de ciclo de vida es configurable por deployment y por sala, pero la política que recibe `POST /admin/rooms` no se guarda en `meta_room.json`: tras un reinicio, o cuando la sala se relanza (D7), vuelve a los defaults. Tampoco hay variables de entorno para los TTL y la cuota del log. Los parámetros del ciclo de vida de clientes del Lote 6 (`ZEMDB_DORMANT_AFTER_SECS`, `ZEMDB_SNAPSHOT_DEMAND_TTL_SECS`) son solo globales.
 **Solución.** Guardar la política en `meta_room.json` (compatible con archivos que no la tienen); mover a `RoomLifecyclePolicy` los parámetros del ciclo de vida de clientes; tomar los defaults del servidor de variables de entorno, validadas al arrancar.
 
-#### DEF-86 · Bajo · ⬜ (nuevo, revisión del Lote 7)
+#### DEF-86 · Bajo · ✅ Hecho (8a) (nuevo, revisión del Lote 7)
 **Problema.** Si el actor de una sala entra en pánico con un comando, la respuesta se descarta y el cliente recibe `Unavailable` (503, reintentable, D28). Si el pánico depende de la entrada, cada reintento relanza la sala y vuelve a entrar en pánico: un bucle de reinicios que además descarta los comandos encolados de otros clientes. No se encontró ningún pánico alcanzable; es defensa en profundidad.
 **Solución propuesta.** Distinguir el pánico (por ejemplo, con el resultado del `JoinHandle` en el `RoomManager`) de una sala detenida a propósito (D7), y responder `Internal` (no reintentable) al comando que lo provocó.
+
+#### Notas del Lote 8a
+- **Política:** rangos válidos iguales al arrancar y en la API (por ejemplo `ram_max_ops` 1–100.000, duraciones hasta 10 años para no desbordar los relojes); ninguna regla relaciona dos campos, así que sobrescrituras válidas sobre defaults válidos siempre dan una política válida. Una sobrescritura puede fijar `dormant_after` pero no anular el default del servidor. Sobrescrituras inválidas guardadas en `meta_room.json` hacen fallar la carga. `GET /admin/rooms/{id}` devuelve métricas, política efectiva y sobrescrituras.
+- **Variables de entorno estrictas:** un valor no vacío que no se puede leer o está fuera de rango impide arrancar (también en las variables viejas, como `ZEMDB_PORT`); un valor vacío cuenta como no definido.
+- **Manager:** cada sala tiene un slot con su sender, una señal de salida y un id de actor; el actor quita su slot después de soltar los archivos, y la reapertura espera a esa salida. Un comando que el buzón rechaza al enviarlo (sala cerrándose) se reenvía a la sala relanzada; uno que ya entró al buzón nunca se reenvía. Esto también evita el 503 de un pedido que llegaba justo durante una detención D7.
+- **Pánicos:** solo el comando que lo provocó recibe `Internal`; los encolados reciben `Unavailable`. El roster no se guarda tras un pánico (la memoria del actor no es confiable). La espera acotada a la salida del actor corre fuera del timeout de 5 s, para que un comando que esperó mucho en el buzón no termine en `Timeout`.
+- **Hallazgos de la revisión independiente, corregidos en el lote:**
+  - Al reabrir una sala, la última actividad de todos los clientes volvía a "ahora", así que con el apagado por inactividad `dormant_after` nunca se cumplía. El roster guarda ahora `last_seen_unix_ms` (hora de reloj calculada al guardar, sin escrituras extra; se escribe al detenerse el actor si hubo actividad) y la restaura al reabrir. Tras un crash, la inactividad restaurada puede ser mayor que la real.
+  - Un cambio de esquema que coincidía con la reapertura de una sala la dejaba con el esquema viejo; `reload_schema_for_rooms` toma el lock de apertura de cada sala.
+  - Un pedido cancelado mientras esperaba el lock de apertura dejaba una entrada en el mapa.
+- **Interacción conocida hasta el 8b:** el apagado por inactividad hace frecuentes las reaperturas, que hoy leen todo el log de forma sincrónica (DEF-35) y fallan en Windows (DEF-72). Se corrigen en el 8b.
 
 #### Nota sobre DEF-08
 La revisión del Lote 1 señaló dos casos más de I/O bloqueante en el actor: `record_pruned_through` (escritura atómica de `log_meta.json`) y los `sync_dir` de la fase 3 de la compactación de storage. Se tratan junto con DEF-08.
@@ -520,7 +538,7 @@ Usar `ruzstd` en wasm32 para descomprimir snapshots `ZMSN`, junto con la descomp
 #### DEF-42 · Info · ⏸
 ARCHITECTURE.md:169 presenta la descarga directa como alternativa al protocolo por chunks, que ya está implementado. Aclarar el documento; implementar el endpoint, si se quiere, después de DEF-38.
 
-#### DEF-73 · Info · ⏸ (nuevo)
+#### DEF-73 · Info · 🔄 Adelantado al Lote 8b por D37 (nuevo)
 Windows es plataforma objetivo, pero hoy nada se prueba en Windows. Agregar CI (por ejemplo GitHub Actions) con `windows-latest` que corra `cargo test --workspace`; ahí se verifican DEF-72 y la lectura del WAL por su propio handle en storage.
 
 #### DEF-81 · Medio · ⏸ (nuevo, decisión D18)

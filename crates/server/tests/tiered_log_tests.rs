@@ -122,6 +122,7 @@ async fn test_tiered_log_cold_compression_and_read() {
         warm_disk_ttl: Duration::from_millis(10), // Fast warm compression
         cold_disk_ttl: Duration::from_secs(3600),
         max_room_disk_bytes: 50 * 1024 * 1024,
+        ..RoomLifecyclePolicy::default()
     };
 
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
@@ -172,6 +173,7 @@ async fn test_tiered_log_multi_tier_continuous_fetch() {
         warm_disk_ttl: Duration::from_millis(10),
         cold_disk_ttl: Duration::from_secs(3600),
         max_room_disk_bytes: 50 * 1024 * 1024,
+        ..RoomLifecyclePolicy::default()
     };
 
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
@@ -228,6 +230,7 @@ async fn test_tiered_log_behind_compaction_eviction() {
         warm_disk_ttl: Duration::from_millis(10),
         cold_disk_ttl: Duration::from_millis(100), // Fast cold pruning
         max_room_disk_bytes: 50 * 1024 * 1024,
+        ..RoomLifecyclePolicy::default()
     };
 
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
@@ -458,6 +461,7 @@ async fn test_tiered_log_async_maintenance_spawn_blocking() {
         warm_disk_ttl: Duration::from_millis(5),
         cold_disk_ttl: Duration::from_secs(3600),
         max_room_disk_bytes: 50 * 1024 * 1024,
+        ..RoomLifecyclePolicy::default()
     };
 
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
@@ -491,6 +495,7 @@ async fn test_tiered_log_disk_quota_saturation_pruning() {
         warm_disk_ttl: Duration::from_millis(5),
         cold_disk_ttl: Duration::from_secs(3600), // Very high TTL so time expiration does not trigger
         max_room_disk_bytes: 100, // Very low quota to force quota saturation pruning
+        ..RoomLifecyclePolicy::default()
     };
 
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();

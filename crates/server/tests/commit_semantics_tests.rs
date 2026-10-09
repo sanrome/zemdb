@@ -68,10 +68,10 @@ async fn spawn_room(policy: RoomLifecyclePolicy) -> TestRoom {
         )
         .unwrap(),
     );
-    let manager = RoomManager::new(config, schema_registry, relay);
+    let manager = RoomManager::new(config, schema_registry, relay).with_default_policy(policy);
     let room_id = RoomId::new("commit-room").unwrap();
     let sender = manager
-        .get_or_spawn_with_policy(&room_id, Some(&schema_id), policy)
+        .get_or_spawn(&room_id, Some(&schema_id))
         .await
         .unwrap();
 
@@ -141,7 +141,7 @@ impl TestRoom {
             .send(RoomCommand::GetMetrics { reply: tx })
             .await
             .unwrap();
-        rx.await.unwrap()
+        rx.await.unwrap().unwrap()
     }
 
     /// Waits for the actor's maintenance tick to advance the retention floor past `seq`.

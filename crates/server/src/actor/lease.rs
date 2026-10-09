@@ -32,6 +32,10 @@ pub enum ClientState {
 }
 
 /// Metadata entry tracked for each registered client in a room.
+///
+/// `last_heartbeat` is a monotonic `Instant`, which does not survive a restart: the roster
+/// file stores it as the wall-clock time of the client's last activity (see
+/// [`PersistedClient`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientEntry {
     pub client_id: ClientId,
@@ -55,6 +59,10 @@ pub struct ClientLeaseTracker {
     /// Wall-clock time of the last renewal of the room's snapshot demand, if it is on.
     snapshot_demand: Option<SystemTime>,
     dirty: bool,
+    /// Some client was active since the last save. Activity alone does not make the roster
+    /// dirty (it would cause a write per heartbeat); it is saved with the next change, and
+    /// when the room stops.
+    activity_unsaved: bool,
 }
 
 impl ClientLeaseTracker {
@@ -94,6 +102,7 @@ impl ClientLeaseTracker {
             clients,
             snapshot_demand,
             dirty: false,
+            activity_unsaved: false,
         })
     }
 
@@ -101,6 +110,7 @@ impl ClientLeaseTracker {
     pub fn save(&mut self) -> Result<(), ServerError> {
         self.write_roster(self.clients.values().collect())?;
         self.dirty = false;
+        self.activity_unsaved = false;
         Ok(())
     }
 
@@ -108,8 +118,12 @@ impl ClientLeaseTracker {
     /// a roster change before applying it in memory, so that a failed write leaves the
     /// tracker unchanged.
     fn write_roster(&self, clients: Vec<&ClientEntry>) -> Result<(), ServerError> {
+        let (instant_now, wall_now) = (Instant::now(), SystemTime::now());
         let roster = RosterFile {
-            clients,
+            clients: clients
+                .into_iter()
+                .map(|entry| PersistedClient::new(entry, instant_now, wall_now))
+                .collect(),
             snapshot_demand: self.snapshot_demand.map(PersistedDemand::from_time),
         };
         let json = serde_json::to_string_pretty(&roster).map_err(|e| {
@@ -122,6 +136,15 @@ impl ClientLeaseTracker {
     /// Persists the roster if it changed since the last successful save.
     pub fn persist_if_dirty(&mut self) -> Result<(), ServerError> {
         if self.dirty {
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    /// Persists the roster if it changed or any client was active since the last successful
+    /// save. Used when the room stops, so that the clients' last activity survives it.
+    pub fn persist_if_dirty_or_active(&mut self) -> Result<(), ServerError> {
+        if self.dirty || self.activity_unsaved {
             self.save()?;
         }
         Ok(())
@@ -193,6 +216,7 @@ impl ClientLeaseTracker {
         // The file now holds the whole in-memory roster, including any pending change.
         self.clients.insert(client_id.clone(), entry);
         self.dirty = false;
+        self.activity_unsaved = false;
         Ok(initial_state)
     }
 
@@ -225,6 +249,7 @@ impl ClientLeaseTracker {
         };
 
         entry.last_heartbeat = Instant::now();
+        self.activity_unsaved = true;
         let mut changed = entry.state != state;
         entry.state = state;
         if state == ClientState::Connected && cursor != entry.last_ack_seq {
@@ -252,6 +277,7 @@ impl ClientLeaseTracker {
 
         self.clients.remove(client_id);
         self.dirty = false;
+        self.activity_unsaved = false;
         Ok(true)
     }
 
@@ -390,8 +416,89 @@ impl ClientLeaseTracker {
 /// hold only the array of clients, and still load.
 #[derive(Serialize)]
 struct RosterFile<'a> {
-    clients: Vec<&'a ClientEntry>,
+    clients: Vec<PersistedClient<'a>>,
     snapshot_demand: Option<PersistedDemand>,
+}
+
+/// A roster entry on disk: the client entry plus the wall-clock time of its last activity, in
+/// milliseconds since the Unix epoch. It is computed from the in-memory `Instant` whenever the
+/// roster is saved, so recording activity never causes a write of its own.
+///
+/// After a crash, the roster on disk may be older than the last activity it describes: the
+/// restored activity can then be older than reality, so the client may become `Disconnected`
+/// or `Dormant` earlier than it would have. A client that is active again is unaffected, and
+/// becoming `Dormant` by time only happens with `dormant_after` set.
+#[derive(Serialize)]
+struct PersistedClient<'a> {
+    #[serde(flatten)]
+    entry: &'a ClientEntry,
+    last_seen_unix_ms: u64,
+}
+
+impl<'a> PersistedClient<'a> {
+    fn new(entry: &'a ClientEntry, instant_now: Instant, wall_now: SystemTime) -> Self {
+        let inactive_for = instant_now.saturating_duration_since(entry.last_heartbeat);
+        let last_seen = wall_now.checked_sub(inactive_for).unwrap_or(UNIX_EPOCH);
+        Self {
+            entry,
+            last_seen_unix_ms: unix_ms(last_seen),
+        }
+    }
+}
+
+/// A roster entry as read from disk. `last_seen_unix_ms` is missing in rosters written before
+/// it was persisted; such clients count as active when the room opens.
+#[derive(Deserialize)]
+struct LoadedClient {
+    #[serde(flatten)]
+    entry: ClientEntry,
+    #[serde(default)]
+    last_seen_unix_ms: Option<u64>,
+}
+
+impl LoadedClient {
+    /// The client entry, with `last_heartbeat` placed as long before `instant_now` as its last
+    /// activity is before `wall_now`. A last activity in the future (the wall clock moved
+    /// backwards) counts as now.
+    fn into_entry(self, instant_now: Instant, wall_now: SystemTime) -> ClientEntry {
+        let inactive_for = self
+            .last_seen_unix_ms
+            .and_then(|ms| UNIX_EPOCH.checked_add(Duration::from_millis(ms)))
+            .and_then(|last_seen| wall_now.duration_since(last_seen).ok())
+            .unwrap_or(Duration::ZERO);
+        ClientEntry {
+            last_heartbeat: instant_before(instant_now, inactive_for),
+            ..self.entry
+        }
+    }
+}
+
+/// The instant `age` before `now`, or, if the monotonic clock cannot represent it (it may not
+/// reach back before the machine booted), the earliest instant it can represent, to the
+/// millisecond.
+fn instant_before(now: Instant, age: Duration) -> Instant {
+    if let Some(instant) = now.checked_sub(age) {
+        return instant;
+    }
+    let (mut reachable, mut unreachable) = (Duration::ZERO, age);
+    while unreachable - reachable > Duration::from_millis(1) {
+        let middle = reachable + (unreachable - reachable) / 2;
+        if now.checked_sub(middle).is_some() {
+            reachable = middle;
+        } else {
+            unreachable = middle;
+        }
+    }
+    now - reachable
+}
+
+/// Milliseconds since the Unix epoch, saturating at both ends.
+fn unix_ms(time: SystemTime) -> u64 {
+    let millis = time
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0);
+    u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
 /// The room's snapshot demand on disk: when it was last renewed, in wall-clock milliseconds
@@ -403,12 +510,8 @@ struct PersistedDemand {
 
 impl PersistedDemand {
     fn from_time(time: SystemTime) -> Self {
-        let millis = time
-            .duration_since(UNIX_EPOCH)
-            .map(|since| since.as_millis())
-            .unwrap_or(0);
         Self {
-            renewed_at_unix_ms: u64::try_from(millis).unwrap_or(u64::MAX),
+            renewed_at_unix_ms: unix_ms(time),
         }
     }
 
@@ -446,11 +549,12 @@ fn parse_roster(
         Err(e) => return unreadable(&e),
     };
 
+    let (instant_now, wall_now) = (Instant::now(), SystemTime::now());
     let mut clients = HashMap::new();
     for raw in raw_entries {
-        match serde_json::from_value::<ClientEntry>(raw) {
-            Ok(mut entry) => {
-                entry.last_heartbeat = Instant::now();
+        match serde_json::from_value::<LoadedClient>(raw) {
+            Ok(loaded) => {
+                let entry = loaded.into_entry(instant_now, wall_now);
                 clients.insert(entry.client_id.clone(), entry);
             }
             Err(e) => {

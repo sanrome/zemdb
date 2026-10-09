@@ -1,6 +1,10 @@
 use crate::error::ServerError;
+use crate::log::policy::PolicySetting;
+use crate::log::{RoomLifecycleOverrides, RoomLifecyclePolicy};
 use serde::{Deserialize, Serialize};
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 /// Server configuration with TOML deserialization and environment variable overrides.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,13 +29,35 @@ pub struct ServerConfig {
     #[serde(default = "default_admin_secret")]
     pub admin_secret: String,
 
-    /// Inactivity timeout before an active client lease is marked Disconnected (seconds).
+    /// Server default of the room lifecycle setting `ram_max_ops`: operations kept in RAM
+    /// before the active segment is sealed.
+    #[serde(default = "default_ram_max_ops")]
+    pub ram_max_ops: usize,
+
+    /// Server default: time-to-live of operations in RAM (seconds).
+    #[serde(default = "default_ram_ttl_secs")]
+    pub ram_ttl_secs: u64,
+
+    /// Server default: age after which a sealed segment is compressed (seconds).
+    #[serde(default = "default_warm_disk_ttl_secs")]
+    pub warm_disk_ttl_secs: u64,
+
+    /// Server default: age after which a compressed segment is pruned (seconds).
+    #[serde(default = "default_cold_disk_ttl_secs")]
+    pub cold_disk_ttl_secs: u64,
+
+    /// Server default: disk space of a room's log before its oldest segments are pruned (bytes).
+    #[serde(default = "default_max_room_disk_bytes")]
+    pub max_room_disk_bytes: u64,
+
+    /// Server default: inactivity timeout before an active client lease is marked
+    /// Disconnected (seconds).
     #[serde(default = "default_lease_timeout_secs")]
     pub lease_timeout_secs: u64,
 
-    /// Inactivity after which a Disconnected client becomes Dormant even though its cursor is
-    /// still inside the retained log (seconds). Unset by default: a Disconnected client only
-    /// becomes Dormant once its cursor falls behind the log.
+    /// Server default: inactivity after which a Disconnected client becomes Dormant even
+    /// though its cursor is still inside the retained log (seconds). Unset by default: a
+    /// Disconnected client only becomes Dormant once its cursor falls behind the log.
     #[serde(default)]
     pub dormant_after_secs: Option<u64>,
 
@@ -43,10 +69,15 @@ pub struct ServerConfig {
     #[serde(default = "default_snapshot_ttl_secs")]
     pub snapshot_ttl_secs: u64,
 
-    /// How long a room keeps asking its clients for a snapshot without the request being
-    /// renewed (seconds, default 7 days).
+    /// Server default: how long a room keeps asking its clients for a snapshot without the
+    /// request being renewed (seconds, default 7 days).
     #[serde(default = "default_snapshot_demand_ttl_secs")]
     pub snapshot_demand_ttl_secs: u64,
+
+    /// Server default: time without commands, SSE subscribers or snapshot uploads after which
+    /// a room actor shuts down (seconds, default 10 minutes; 0 = never).
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
 
     /// Largest snapshot the relay accepts, in bytes (default 512 MiB).
     #[serde(default = "default_max_snapshot_bytes")]
@@ -73,8 +104,34 @@ fn default_admin_secret() -> String {
     "default_admin_secret_dev_32bytes!".to_string()
 }
 
+fn default_ram_max_ops() -> usize {
+    RoomLifecyclePolicy::default().ram_max_ops
+}
+
+fn default_ram_ttl_secs() -> u64 {
+    RoomLifecyclePolicy::default().ram_ttl.as_secs()
+}
+
+fn default_warm_disk_ttl_secs() -> u64 {
+    RoomLifecyclePolicy::default().warm_disk_ttl.as_secs()
+}
+
+fn default_cold_disk_ttl_secs() -> u64 {
+    RoomLifecyclePolicy::default().cold_disk_ttl.as_secs()
+}
+
+fn default_max_room_disk_bytes() -> u64 {
+    RoomLifecyclePolicy::default().max_room_disk_bytes
+}
+
 fn default_lease_timeout_secs() -> u64 {
-    90
+    RoomLifecyclePolicy::default().lease_timeout.as_secs()
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    RoomLifecyclePolicy::default()
+        .idle_timeout
+        .map_or(0, |idle| idle.as_secs())
 }
 
 fn default_dedup_lru_capacity() -> usize {
@@ -89,7 +146,7 @@ fn default_snapshot_ttl_secs() -> u64 {
 }
 
 fn default_snapshot_demand_ttl_secs() -> u64 {
-    SEVEN_DAYS_SECS
+    RoomLifecyclePolicy::default().snapshot_demand_ttl.as_secs()
 }
 
 fn default_max_snapshot_bytes() -> u64 {
@@ -104,11 +161,17 @@ impl Default for ServerConfig {
             data_dir: default_data_dir(),
             auth_secret: default_auth_secret(),
             admin_secret: default_admin_secret(),
+            ram_max_ops: default_ram_max_ops(),
+            ram_ttl_secs: default_ram_ttl_secs(),
+            warm_disk_ttl_secs: default_warm_disk_ttl_secs(),
+            cold_disk_ttl_secs: default_cold_disk_ttl_secs(),
+            max_room_disk_bytes: default_max_room_disk_bytes(),
             lease_timeout_secs: default_lease_timeout_secs(),
             dormant_after_secs: None,
             dedup_lru_capacity: default_dedup_lru_capacity(),
             snapshot_ttl_secs: default_snapshot_ttl_secs(),
             snapshot_demand_ttl_secs: default_snapshot_demand_ttl_secs(),
+            idle_timeout_secs: default_idle_timeout_secs(),
             max_snapshot_bytes: default_max_snapshot_bytes(),
         }
     }
@@ -119,9 +182,6 @@ pub const MIN_MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024;
 
 /// Largest accepted `max_snapshot_bytes` (64 GiB).
 pub const MAX_MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-
-/// Smallest accepted `snapshot_demand_ttl_secs`.
-pub const MIN_SNAPSHOT_DEMAND_TTL_SECS: u64 = 60;
 
 /// Minimum length, in bytes, of the client token secret and the admin secret.
 pub const MIN_SECRET_LEN: usize = 32;
@@ -160,9 +220,9 @@ impl ServerConfig {
     }
 
     /// Checks that `max_snapshot_bytes` lies within
-    /// [`MIN_MAX_SNAPSHOT_BYTES`]..=[`MAX_MAX_SNAPSHOT_BYTES`], that `snapshot_demand_ttl_secs`
-    /// is at least [`MIN_SNAPSHOT_DEMAND_TTL_SECS`] and that `dormant_after_secs`, if set, is
-    /// not 0.
+    /// [`MIN_MAX_SNAPSHOT_BYTES`]..=[`MAX_MAX_SNAPSHOT_BYTES`] and that every server default of
+    /// the room lifecycle policy lies within its range (the same ranges a room's overrides
+    /// must meet). The error names the setting and its environment variable.
     pub fn validate_limits(&self) -> Result<(), ServerError> {
         if !(MIN_MAX_SNAPSHOT_BYTES..=MAX_MAX_SNAPSHOT_BYTES).contains(&self.max_snapshot_bytes) {
             return Err(ServerError::Config(format!(
@@ -171,21 +231,36 @@ impl ServerConfig {
                 self.max_snapshot_bytes
             )));
         }
-        // A demand that expires within a few ticks would turn on and off with every request.
-        if self.snapshot_demand_ttl_secs < MIN_SNAPSHOT_DEMAND_TTL_SECS {
-            return Err(ServerError::Config(format!(
-                "snapshot_demand_ttl_secs (ZEMDB_SNAPSHOT_DEMAND_TTL_SECS) must be at least \
-                 {MIN_SNAPSHOT_DEMAND_TTL_SECS}, got {}",
-                self.snapshot_demand_ttl_secs
-            )));
+        self.lifecycle_settings()
+            .check(|setting| format!("{} ({})", setting.field(), setting.env_var()))
+            .map_err(ServerError::Config)
+    }
+
+    /// The server defaults of the room lifecycle policy, as settings in their configured
+    /// units. `dormant_after_secs` is the only one that may be unset.
+    fn lifecycle_settings(&self) -> RoomLifecycleOverrides {
+        RoomLifecycleOverrides {
+            ram_max_ops: Some(self.ram_max_ops),
+            ram_ttl_secs: Some(self.ram_ttl_secs),
+            warm_disk_ttl_secs: Some(self.warm_disk_ttl_secs),
+            cold_disk_ttl_secs: Some(self.cold_disk_ttl_secs),
+            max_room_disk_bytes: Some(self.max_room_disk_bytes),
+            lease_timeout_secs: Some(self.lease_timeout_secs),
+            dormant_after_secs: self.dormant_after_secs,
+            snapshot_demand_ttl_secs: Some(self.snapshot_demand_ttl_secs),
+            idle_timeout_secs: Some(self.idle_timeout_secs),
         }
-        if self.dormant_after_secs == Some(0) {
-            return Err(ServerError::Config(
-                "dormant_after_secs (ZEMDB_DORMANT_AFTER_SECS) must be greater than 0 when set"
-                    .to_string(),
-            ));
+    }
+
+    /// The lifecycle policy of a room without overrides: the server defaults configured here.
+    pub fn default_lifecycle_policy(&self) -> RoomLifecyclePolicy {
+        // Every setting is present except `dormant_after_secs`, whose absence means unset, so
+        // the base must not carry a dormancy of its own.
+        RoomLifecyclePolicy {
+            dormant_after: None,
+            ..RoomLifecyclePolicy::default()
         }
-        Ok(())
+        .with_overrides(&self.lifecycle_settings())
     }
 
     /// Parse configuration from a TOML string.
@@ -201,54 +276,83 @@ impl ServerConfig {
     }
 
     /// Overrides configuration values from environment variables if present.
-    pub fn apply_env_overrides(&mut self) {
-        if let Ok(host) = std::env::var("ZEMDB_HOST") {
+    ///
+    /// An empty variable counts as unset. A variable that is set but not valid Unicode, or
+    /// that does not parse as the setting's type, is an error naming the variable: the server must not start with a setting other
+    /// than the one the operator asked for. Ranges are checked afterwards by
+    /// [`validate`](Self::validate).
+    pub fn apply_env_overrides(&mut self) -> Result<(), ServerError> {
+        self.apply_overrides_from(|name| match std::env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err(ServerError::Config(format!("{name} is not valid Unicode")))
+            }
+        })
+    }
+
+    /// Applies the overrides found by `var`, which returns the value of a variable, if set.
+    /// An empty value counts as unset, as deployment templates often expand a missing
+    /// variable to an empty string.
+    fn apply_overrides_from(
+        &mut self,
+        var: impl Fn(&str) -> Result<Option<String>, ServerError>,
+    ) -> Result<(), ServerError> {
+        let var = |name: &str| Ok(var(name)?.filter(|value| !value.is_empty()));
+        if let Some(host) = var("ZEMDB_HOST")? {
             self.host = host;
         }
-        if let Ok(port_str) = std::env::var("ZEMDB_PORT") {
-            if let Ok(port) = port_str.parse::<u16>() {
-                self.port = port;
-            }
+        if let Some(port) = parse_var(&var, "ZEMDB_PORT")? {
+            self.port = port;
         }
-        if let Ok(data_dir) = std::env::var("ZEMDB_DATA_DIR") {
+        if let Some(data_dir) = var("ZEMDB_DATA_DIR")? {
             self.data_dir = PathBuf::from(data_dir);
         }
-        if let Ok(auth_sec) = std::env::var("ZEMDB_AUTH_SECRET") {
-            self.auth_secret = auth_sec;
+        if let Some(auth_secret) = var("ZEMDB_AUTH_SECRET")? {
+            self.auth_secret = auth_secret;
         }
-        if let Ok(admin_sec) = std::env::var("ZEMDB_ADMIN_SECRET") {
-            self.admin_secret = admin_sec;
+        if let Some(admin_secret) = var("ZEMDB_ADMIN_SECRET")? {
+            self.admin_secret = admin_secret;
         }
-        if let Ok(lease_str) = std::env::var("ZEMDB_LEASE_TIMEOUT_SECS") {
-            if let Ok(lease) = lease_str.parse::<u64>() {
-                self.lease_timeout_secs = lease;
-            }
+        if let Some(cap) = parse_var(&var, "ZEMDB_DEDUP_LRU_CAPACITY")? {
+            self.dedup_lru_capacity = cap;
         }
-        if let Ok(dormant_str) = std::env::var("ZEMDB_DORMANT_AFTER_SECS") {
-            if let Ok(dormant_after) = dormant_str.parse::<u64>() {
-                self.dormant_after_secs = Some(dormant_after);
-            }
+        if let Some(snapshot_ttl) = parse_var(&var, "ZEMDB_SNAPSHOT_TTL_SECS")? {
+            self.snapshot_ttl_secs = snapshot_ttl;
         }
-        if let Ok(lru_str) = std::env::var("ZEMDB_DEDUP_LRU_CAPACITY") {
-            if let Ok(cap) = lru_str.parse::<usize>() {
-                self.dedup_lru_capacity = cap;
-            }
+        if let Some(max_bytes) = parse_var(&var, "ZEMDB_MAX_SNAPSHOT_BYTES")? {
+            self.max_snapshot_bytes = max_bytes;
         }
-        if let Ok(snap_str) = std::env::var("ZEMDB_SNAPSHOT_TTL_SECS") {
-            if let Ok(snap_ttl) = snap_str.parse::<u64>() {
-                self.snapshot_ttl_secs = snap_ttl;
-            }
+
+        use PolicySetting::*;
+        if let Some(ops) = parse_var(&var, RamMaxOps.env_var())? {
+            self.ram_max_ops = ops;
         }
-        if let Ok(demand_str) = std::env::var("ZEMDB_SNAPSHOT_DEMAND_TTL_SECS") {
-            if let Ok(demand_ttl) = demand_str.parse::<u64>() {
-                self.snapshot_demand_ttl_secs = demand_ttl;
-            }
+        if let Some(secs) = parse_var(&var, RamTtl.env_var())? {
+            self.ram_ttl_secs = secs;
         }
-        if let Ok(max_str) = std::env::var("ZEMDB_MAX_SNAPSHOT_BYTES") {
-            if let Ok(max_bytes) = max_str.parse::<u64>() {
-                self.max_snapshot_bytes = max_bytes;
-            }
+        if let Some(secs) = parse_var(&var, WarmDiskTtl.env_var())? {
+            self.warm_disk_ttl_secs = secs;
         }
+        if let Some(secs) = parse_var(&var, ColdDiskTtl.env_var())? {
+            self.cold_disk_ttl_secs = secs;
+        }
+        if let Some(bytes) = parse_var(&var, MaxRoomDiskBytes.env_var())? {
+            self.max_room_disk_bytes = bytes;
+        }
+        if let Some(secs) = parse_var(&var, LeaseTimeout.env_var())? {
+            self.lease_timeout_secs = secs;
+        }
+        if let Some(secs) = parse_var(&var, DormantAfter.env_var())? {
+            self.dormant_after_secs = Some(secs);
+        }
+        if let Some(secs) = parse_var(&var, SnapshotDemandTtl.env_var())? {
+            self.snapshot_demand_ttl_secs = secs;
+        }
+        if let Some(secs) = parse_var(&var, IdleTimeout.env_var())? {
+            self.idle_timeout_secs = secs;
+        }
+        Ok(())
     }
 
     /// Load configuration with optional TOML file and automatic environment variable overrides.
@@ -257,9 +361,27 @@ impl ServerConfig {
             Some(path) => Self::from_file(path)?,
             None => Self::default(),
         };
-        config.apply_env_overrides();
+        config.apply_env_overrides()?;
         config.validate()?;
         Ok(config)
+    }
+}
+
+/// Reads the variable `name` through `var` and parses it as `T`. An unparsable value is an
+/// error naming the variable; the value is only echoed for numeric settings, never secrets.
+fn parse_var<T>(
+    var: &impl Fn(&str) -> Result<Option<String>, ServerError>,
+    name: &str,
+) -> Result<Option<T>, ServerError>
+where
+    T: FromStr,
+    T::Err: Display,
+{
+    match var(name)? {
+        None => Ok(None),
+        Some(raw) => raw.parse().map(Some).map_err(|err| {
+            ServerError::Config(format!("{name} has an invalid value {raw:?}: {err}"))
+        }),
     }
 }
 

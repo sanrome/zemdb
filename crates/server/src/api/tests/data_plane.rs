@@ -234,6 +234,42 @@ async fn commit_that_restarts_the_room_is_unavailable_with_retry_after() {
     ));
 }
 
+#[tokio::test]
+async fn request_that_makes_the_room_panic_is_internal_and_the_room_recovers() {
+    let fx = Fixture::new().await;
+    let heartbeat = ClientMessage::Heartbeat {
+        correlation_id: CorrelationId::new(7),
+        room_id: fx.room_id.clone(),
+        client_id: fx.client_id.clone(),
+    };
+
+    fail_point::arm(
+        "room_command_panic",
+        &fx.dir.path().join("rooms").join(fx.room_id.as_str()),
+    );
+    let (status, headers, reply) = fx.post("heartbeat", &heartbeat).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{reply:?}");
+    assert!(headers.get(header::RETRY_AFTER).is_none());
+    assert!(
+        matches!(
+            reply,
+            ServerMessage::Error {
+                code: ErrorCode::Internal,
+                ..
+            }
+        ),
+        "{reply:?}"
+    );
+
+    // The next request reopens the room from disk, with the client still registered.
+    let (status, _, reply) = fx.post("heartbeat", &heartbeat).await;
+    assert_eq!(status, StatusCode::OK, "{reply:?}");
+    assert!(
+        matches!(reply, ServerMessage::HeartbeatAck { .. }),
+        "{reply:?}"
+    );
+}
+
 #[test]
 fn retryable_errors_map_to_their_own_codes_and_statuses() {
     let unavailable = binary_error(

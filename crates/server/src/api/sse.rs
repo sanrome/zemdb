@@ -73,13 +73,31 @@ pub async fn room_events(
         .into_response()
 }
 
+/// How many times a subscription refused with `Unavailable` is attempted.
+const SUBSCRIBE_ATTEMPTS: usize = 3;
+
 /// Subscribes to the room's event channel, spawning the room actor if needed.
+///
+/// An actor that is shutting down for inactivity refuses new subscriptions with
+/// `Unavailable` (they would end at once); subscribing has no side effects, so it is retried
+/// against the room reopened from disk instead of failing the request.
 async fn subscribe(
     state: &AppState,
     room_id: &RoomId,
 ) -> Result<broadcast::Receiver<RoomEvent>, ServerError> {
-    state
-        .room_manager
-        .ask(room_id, |reply| RoomCommand::SubscribeEvents { reply })
-        .await
+    let mut attempt = 1;
+    loop {
+        let result = state
+            .room_manager
+            .ask(room_id, |reply| RoomCommand::SubscribeEvents { reply })
+            .await?;
+        match result {
+            Err(ServerError::Unavailable(_)) if attempt < SUBSCRIBE_ATTEMPTS => attempt += 1,
+            result => return result,
+        }
+    }
 }
+
+#[cfg(test)]
+#[path = "tests/sse.rs"]
+mod tests;

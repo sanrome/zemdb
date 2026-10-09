@@ -7,6 +7,7 @@ use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::schema::Schema;
 
 use crate::error::ServerError;
+use crate::log::RoomLifecyclePolicy;
 
 /// Response returned to a client upon successful room registration.
 #[derive(Debug, Clone)]
@@ -60,6 +61,8 @@ pub struct RoomMetrics {
     pub disconnected_clients: usize,
     pub dormant_clients: usize,
     pub total_clients: usize,
+    /// The effective lifecycle policy the room runs with.
+    pub lifecycle: RoomLifecyclePolicy,
 }
 
 /// Real-time notifications emitted by a RoomActor for SSE subscribers.
@@ -130,7 +133,7 @@ pub enum RoomCommand {
 
     /// Subscribe to the room's signal-only SSE broadcast channel.
     SubscribeEvents {
-        reply: oneshot::Sender<broadcast::Receiver<RoomEvent>>,
+        reply: oneshot::Sender<Result<broadcast::Receiver<RoomEvent>, ServerError>>,
     },
 
     /// Reload the active schema in this room (e.g. after schema evolution).
@@ -140,21 +143,71 @@ pub enum RoomCommand {
     },
 
     /// Retrieve operational metrics for this room.
-    GetMetrics { reply: oneshot::Sender<RoomMetrics> },
+    GetMetrics {
+        reply: oneshot::Sender<Result<RoomMetrics, ServerError>>,
+    },
 
     /// Query the retained log range as `(tail_seq, head_seq)`: the oldest retained sequence
     /// and the highest committed one. The snapshot relay uses it to accept only snapshots a
     /// client can catch up from.
     GetLogBounds {
-        reply: oneshot::Sender<(SequenceNumber, SequenceNumber)>,
+        reply: oneshot::Sender<Result<(SequenceNumber, SequenceNumber), ServerError>>,
     },
 
     /// Query the confirmed cursor (last_ack_seq) for a registered client.
     GetClientCursor {
         client_id: ClientId,
-        reply: oneshot::Sender<Option<SequenceNumber>>,
+        reply: oneshot::Sender<Result<Option<SequenceNumber>, ServerError>>,
     },
 
     /// Gracefully shutdown the room actor loop and release all file resources.
     Shutdown { reply: oneshot::Sender<()> },
+}
+
+impl RoomCommand {
+    /// Answers the command with `err` without executing it. `Shutdown` is answered as done:
+    /// it is only rejected once the actor has stopped.
+    pub(crate) fn reject(self, err: ServerError) {
+        match self {
+            RoomCommand::RegisterClient { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+            RoomCommand::DeregisterClient { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+            RoomCommand::GetSchema { reply } => {
+                let _ = reply.send(Err(err));
+            }
+            RoomCommand::Commit { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+            RoomCommand::Sync { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+            RoomCommand::Ack { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+            RoomCommand::Heartbeat { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+            RoomCommand::SubscribeEvents { reply } => {
+                let _ = reply.send(Err(err));
+            }
+            RoomCommand::ReloadSchema { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+            RoomCommand::GetMetrics { reply } => {
+                let _ = reply.send(Err(err));
+            }
+            RoomCommand::GetLogBounds { reply } => {
+                let _ = reply.send(Err(err));
+            }
+            RoomCommand::GetClientCursor { reply, .. } => {
+                let _ = reply.send(Err(err));
+            }
+            RoomCommand::Shutdown { reply } => {
+                let _ = reply.send(());
+            }
+        }
+    }
 }

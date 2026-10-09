@@ -496,3 +496,119 @@ fn snapshot_demand_renewals_within_the_granularity_do_not_dirty_the_roster() {
     tracker.set_snapshot_demand(None);
     assert!(tracker.dirty, "turning the demand off is persisted");
 }
+
+/// How long ago, by the wall clock, the roster on disk says `client_id` was last active.
+fn persisted_inactivity(path: &Path, client_id: &ClientId) -> Duration {
+    let roster: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    let entry = roster["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["client_id"] == client_id.as_str())
+        .unwrap();
+    let last_seen =
+        UNIX_EPOCH + Duration::from_millis(entry["last_seen_unix_ms"].as_u64().unwrap());
+    SystemTime::now()
+        .duration_since(last_seen)
+        .unwrap_or_default()
+}
+
+#[test]
+fn inactivity_survives_reopening_the_roster() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("meta_clients_room.json");
+    let client = ClientId::new("client").unwrap();
+    let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
+    tracker
+        .register_client(&client, Some(seq(5)), seq(1))
+        .unwrap();
+    tracker.get_client_mut(&client).unwrap().last_heartbeat =
+        Instant::now() - Duration::from_secs(100);
+    tracker.save().unwrap();
+
+    let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
+    let inactive_for = tracker
+        .get_client(&client)
+        .unwrap()
+        .last_heartbeat
+        .elapsed();
+    assert!(
+        (Duration::from_secs(99)..Duration::from_secs(110)).contains(&inactive_for),
+        "{inactive_for:?}"
+    );
+    // The lease and the dormancy timeout keep counting from the last activity.
+    let (lease, dormant_after) = (Duration::from_secs(90), Some(Duration::from_secs(60)));
+    tracker.check_timeouts(lease, dormant_after, seq(1));
+    assert_eq!(
+        tracker.get_client(&client).unwrap().state,
+        ClientState::Disconnected
+    );
+    tracker.check_timeouts(lease, dormant_after, seq(1));
+    assert_eq!(
+        tracker.get_client(&client).unwrap().state,
+        ClientState::Dormant
+    );
+}
+
+#[test]
+fn roster_without_last_activity_or_with_a_future_one_loads_clients_as_active() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("meta_clients_room.json");
+    let tomorrow = SystemTime::now() + Duration::from_secs(86_400);
+    let tomorrow_ms = tomorrow.duration_since(UNIX_EPOCH).unwrap().as_millis();
+    fs::write(
+        &path,
+        format!(
+            r#"{{"clients": [
+                {{"client_id": "old", "state": "Connected", "last_ack_seq": 3}},
+                {{"client_id": "future", "state": "Connected", "last_ack_seq": 3,
+                  "last_seen_unix_ms": {tomorrow_ms}}}
+            ], "snapshot_demand": null}}"#
+        ),
+    )
+    .unwrap();
+
+    let tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
+    for name in ["old", "future"] {
+        let entry = tracker.get_client(&ClientId::new(name).unwrap()).unwrap();
+        assert_eq!(entry.last_ack_seq, seq(3));
+        assert!(
+            entry.last_heartbeat.elapsed() < Duration::from_secs(5),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn activity_alone_is_written_only_when_the_room_stops() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("meta_clients_room.json");
+    let client = ClientId::new("client").unwrap();
+    let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
+    tracker
+        .register_client(&client, Some(seq(5)), seq(1))
+        .unwrap();
+    tracker.get_client_mut(&client).unwrap().last_heartbeat =
+        Instant::now() - Duration::from_secs(100);
+    tracker.save().unwrap();
+
+    // A heartbeat that changes neither the state nor the cursor.
+    tracker.observe(&client, None, seq(1));
+    tracker.persist_if_dirty().unwrap();
+    assert!(persisted_inactivity(&path, &client) >= Duration::from_secs(99));
+
+    tracker.persist_if_dirty_or_active().unwrap();
+    assert!(persisted_inactivity(&path, &client) < Duration::from_secs(5));
+}
+
+#[test]
+fn activity_before_the_clock_can_reach_saturates() {
+    let now = Instant::now();
+    let earliest = instant_before(now, Duration::from_secs(u64::MAX / 4));
+    assert!(earliest <= now);
+    assert_eq!(
+        instant_before(now, Duration::from_secs(1)),
+        now - Duration::from_secs(1)
+    );
+}

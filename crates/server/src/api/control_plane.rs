@@ -12,7 +12,7 @@ use crate::api::auth::AdminAuth;
 use crate::api::extract::{AdminJson, AdminPath};
 use crate::api::router::AppState;
 use crate::error::ServerError;
-use crate::log::RoomLifecyclePolicy;
+use crate::log::RoomLifecycleOverrides;
 
 /// Request payload for declaring or registering a new schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,8 +33,20 @@ pub struct AddColumnRequest {
 pub struct CreateRoomRequest {
     pub room_id: RoomId,
     pub schema_id: SchemaId,
+    /// Lifecycle settings in which the room differs from the server defaults. Unknown fields
+    /// and values out of range are `BadRequest`.
     #[serde(default)]
-    pub lifecycle: Option<RoomLifecyclePolicy>,
+    pub lifecycle: Option<RoomLifecycleOverrides>,
+}
+
+/// Response of `GET /admin/rooms/:room_id`: the room's metrics, including the effective
+/// lifecycle policy its actor runs with (`lifecycle`), plus the room's stored overrides.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomDetails {
+    #[serde(flatten)]
+    pub metrics: RoomMetrics,
+    /// The settings in which the room differs from the server defaults.
+    pub lifecycle_overrides: RoomLifecycleOverrides,
 }
 
 /// `POST /admin/schemas`: Declares and registers a new schema template.
@@ -96,20 +108,30 @@ pub async fn create_room(
     Ok((StatusCode::CREATED, Json(meta)))
 }
 
-/// `GET /admin/rooms/:room_id`: Retrieves operational metrics for a room.
+/// `GET /admin/rooms/:room_id`: Retrieves operational metrics and the lifecycle policy of a
+/// room.
 pub async fn get_room(
     _auth: AdminAuth,
     State(state): State<AppState>,
     AdminPath(rid): AdminPath<RoomId>,
-) -> Result<Json<RoomMetrics>, ServerError> {
+) -> Result<Json<RoomDetails>, ServerError> {
     if !state.room_manager.room_exists(&rid) {
         return Err(ServerError::RoomNotFound(rid.to_string()));
     }
     let metrics = state
         .room_manager
         .ask(&rid, |reply| RoomCommand::GetMetrics { reply })
-        .await?;
-    Ok(Json(metrics))
+        .await??;
+    // The actor is running, so the manager knows the room's metadata, unless the room was
+    // deleted in the meantime.
+    let lifecycle_overrides = state
+        .room_manager
+        .lifecycle_overrides(&rid)
+        .ok_or_else(|| ServerError::RoomNotFound(rid.to_string()))?;
+    Ok(Json(RoomDetails {
+        metrics,
+        lifecycle_overrides,
+    }))
 }
 
 /// `DELETE /admin/rooms/:room_id`: Shuts down a room actor and purges its directory from disk.

@@ -294,7 +294,7 @@ async fn test_room_actor_multi_client_concurrency_and_sse_events() {
         .send(RoomCommand::SubscribeEvents { reply: sub_tx })
         .await
         .unwrap();
-    let mut sse_rx = sub_rx.await.unwrap();
+    let mut sse_rx = sub_rx.await.unwrap().unwrap();
 
     // Concurrent commits from 5 clients (20 commits each = 100 total)
     let mut tasks = vec![];
@@ -340,7 +340,7 @@ async fn test_room_actor_multi_client_concurrency_and_sse_events() {
         .send(RoomCommand::GetMetrics { reply: metrics_tx })
         .await
         .unwrap();
-    let metrics = metrics_rx.await.unwrap();
+    let metrics = metrics_rx.await.unwrap().unwrap();
     assert_eq!(metrics.head_seq, SequenceNumber::new(100));
 
     // Verify SSE receiver got events
@@ -394,17 +394,20 @@ async fn test_room_actor_client_lifecycle_and_dormant_behind_compaction() {
 
     let config = Arc::new(ServerConfig {
         data_dir: dir.path().join("data"),
-        lease_timeout_secs: 1, // 1 second timeout for test
         ..Default::default()
     });
 
-    // Aggressive test policy for rapid compaction
-    let lifecycle_policy = RoomLifecyclePolicy::test_policy();
+    // Aggressive test policy for rapid compaction, with a 1 second lease timeout
+    let lifecycle_policy = RoomLifecyclePolicy {
+        lease_timeout: Duration::from_secs(1),
+        ..RoomLifecyclePolicy::test_policy()
+    };
 
-    let manager = RoomManager::new(config, schema_registry, create_test_relay(dir.path()));
+    let manager = RoomManager::new(config, schema_registry, create_test_relay(dir.path()))
+        .with_default_policy(lifecycle_policy);
     let room_id = RoomId::new("lifecycle-room").unwrap();
     let sender = manager
-        .get_or_spawn_with_policy(&room_id, Some(&schema_id), lifecycle_policy)
+        .get_or_spawn(&room_id, Some(&schema_id))
         .await
         .unwrap();
 
@@ -492,7 +495,7 @@ async fn test_room_actor_client_lifecycle_and_dormant_behind_compaction() {
         .send(RoomCommand::GetMetrics { reply: metrics_tx })
         .await
         .unwrap();
-    let metrics = metrics_rx.await.unwrap();
+    let metrics = metrics_rx.await.unwrap().unwrap();
 
     // If tail_seq advanced beyond 0, Bob's sync from 0 should be BehindCompaction
     if metrics.tail_seq > SequenceNumber::new(1) {
@@ -585,7 +588,7 @@ async fn test_room_actor_recovery_retains_state_and_head_seq() {
             .send(RoomCommand::GetMetrics { reply: metrics_tx })
             .await
             .unwrap();
-        let metrics = metrics_rx.await.unwrap();
+        let metrics = metrics_rx.await.unwrap().unwrap();
         assert_eq!(metrics.head_seq, SequenceNumber::new(5));
 
         // Verify DedupLruCache rehydrated (mutation 5 is duplicate)
@@ -702,7 +705,7 @@ async fn test_room_actor_cursor_advances_only_on_client_ack() {
         })
         .await
         .unwrap();
-    let cursor_before_ack = cur_rx.await.unwrap();
+    let cursor_before_ack = cur_rx.await.unwrap().unwrap();
     assert_eq!(
         cursor_before_ack,
         Some(SequenceNumber::new(0)),
@@ -729,7 +732,7 @@ async fn test_room_actor_cursor_advances_only_on_client_ack() {
         .await
         .unwrap();
     assert_eq!(
-        cur_rx_hb.await.unwrap(),
+        cur_rx_hb.await.unwrap().unwrap(),
         Some(SequenceNumber::new(0)),
         "Heartbeat is pure liveness and must NOT advance cursor"
     );
@@ -755,7 +758,7 @@ async fn test_room_actor_cursor_advances_only_on_client_ack() {
         })
         .await
         .unwrap();
-    let cursor_after_ack = cur_rx2.await.unwrap();
+    let cursor_after_ack = cur_rx2.await.unwrap().unwrap();
     assert_eq!(
         cursor_after_ack,
         Some(SequenceNumber::new(5)),
@@ -775,7 +778,6 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
 
     let config = Arc::new(ServerConfig {
         data_dir: dir.path().join("data"),
-        lease_timeout_secs: 60,
         ..Default::default()
     });
 
@@ -787,18 +789,19 @@ async fn test_room_actor_retention_anchor_protects_deltas_during_snapshot() {
         )
         .unwrap(),
     );
-    let manager = RoomManager::new(config, schema_registry, Arc::clone(&relay));
-    let room_id = RoomId::new("anchor-room").unwrap();
-
     // Small segments so proactive pruning has something to delete, but default TTLs: with
     // the short test TTLs, a slow run could prune the cold segments by age, which is not the
     // behavior under test.
     let lifecycle_policy = RoomLifecyclePolicy {
         ram_max_ops: 5,
+        lease_timeout: Duration::from_secs(60),
         ..RoomLifecyclePolicy::default()
     };
+    let manager = RoomManager::new(config, schema_registry, Arc::clone(&relay))
+        .with_default_policy(lifecycle_policy);
+    let room_id = RoomId::new("anchor-room").unwrap();
     let sender = manager
-        .get_or_spawn_with_policy(&room_id, Some(&schema_id), lifecycle_policy)
+        .get_or_spawn(&room_id, Some(&schema_id))
         .await
         .unwrap();
 
@@ -983,7 +986,7 @@ async fn test_room_actor_rejects_future_ack_and_commit_sequences() {
         })
         .await
         .unwrap();
-    let cursor = cursor_rx.await.unwrap();
+    let cursor = cursor_rx.await.unwrap().unwrap();
     assert_eq!(cursor, Some(SequenceNumber::new(2)));
 
     // 4. Bob registers and syncs from sequence 0; deltas must NOT have been pruned

@@ -1,4 +1,5 @@
 use super::*;
+use crate::log::policy::MAX_POLICY_DURATION_SECS;
 
 fn config_with(auth: &str, admin: &str) -> ServerConfig {
     ServerConfig {
@@ -152,4 +153,144 @@ fn zero_dormancy_timeout_is_rejected() {
         .validate()
         .unwrap();
     }
+}
+
+/// Applies the environment `vars` to the default configuration.
+fn with_env(vars: &[(&str, &str)]) -> Result<ServerConfig, ServerError> {
+    let vars: std::collections::HashMap<String, String> = vars
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    let mut config = strong_config();
+    config.apply_overrides_from(|name| Ok(vars.get(name).cloned()))?;
+    Ok(config)
+}
+
+#[test]
+fn unparsable_environment_values_fail_naming_the_variable() {
+    for (name, value) in [
+        ("ZEMDB_PORT", "eighty"),
+        ("ZEMDB_PORT", "70000"),
+        ("ZEMDB_DEDUP_LRU_CAPACITY", "-1"),
+        ("ZEMDB_SNAPSHOT_TTL_SECS", "1h"),
+        ("ZEMDB_MAX_SNAPSHOT_BYTES", "1e9"),
+        ("ZEMDB_RAM_MAX_OPS", "many"),
+        ("ZEMDB_RAM_TTL_SECS", "0x10"),
+        ("ZEMDB_WARM_TTL_SECS", "1.5"),
+        ("ZEMDB_COLD_TTL_SECS", "-30"),
+        ("ZEMDB_ROOM_MAX_DISK_BYTES", "500MB"),
+        ("ZEMDB_LEASE_TIMEOUT_SECS", " 90"),
+        ("ZEMDB_DORMANT_AFTER_SECS", "never"),
+        ("ZEMDB_SNAPSHOT_DEMAND_TTL_SECS", "7d"),
+        ("ZEMDB_ROOM_IDLE_TIMEOUT_SECS", "off"),
+    ] {
+        let err = with_env(&[(name, value)]).unwrap_err();
+        assert!(
+            matches!(&err, ServerError::Config(msg) if msg.contains(name)),
+            "{name}={value:?}: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn lifecycle_environment_variables_set_the_server_defaults() {
+    let config = with_env(&[
+        ("ZEMDB_RAM_MAX_OPS", "250"),
+        ("ZEMDB_RAM_TTL_SECS", "30"),
+        ("ZEMDB_WARM_TTL_SECS", "0"),
+        ("ZEMDB_COLD_TTL_SECS", "86400"),
+        ("ZEMDB_ROOM_MAX_DISK_BYTES", "2097152"),
+        ("ZEMDB_LEASE_TIMEOUT_SECS", "15"),
+        ("ZEMDB_DORMANT_AFTER_SECS", "3600"),
+        ("ZEMDB_SNAPSHOT_DEMAND_TTL_SECS", "600"),
+        ("ZEMDB_ROOM_IDLE_TIMEOUT_SECS", "0"),
+    ])
+    .unwrap();
+    config.validate().unwrap();
+    let secs = std::time::Duration::from_secs;
+    assert_eq!(
+        config.default_lifecycle_policy(),
+        RoomLifecyclePolicy {
+            ram_max_ops: 250,
+            ram_ttl: secs(30),
+            warm_disk_ttl: secs(0),
+            cold_disk_ttl: secs(86_400),
+            max_room_disk_bytes: 2 * 1024 * 1024,
+            lease_timeout: secs(15),
+            dormant_after: Some(secs(3600)),
+            snapshot_demand_ttl: secs(600),
+            idle_timeout: None,
+        }
+    );
+}
+
+#[test]
+fn default_configuration_gives_the_default_policy() {
+    let config = ServerConfig::default();
+    config.validate_limits().unwrap();
+    assert_eq!(
+        config.default_lifecycle_policy(),
+        RoomLifecyclePolicy::default()
+    );
+    assert_eq!(config.idle_timeout_secs, 600);
+}
+
+#[test]
+fn lifecycle_defaults_outside_their_range_fail_naming_the_variable() {
+    type Case = (fn(&mut ServerConfig), &'static str);
+    let cases: [Case; 9] = [
+        (|c| c.ram_max_ops = 0, "ZEMDB_RAM_MAX_OPS"),
+        (|c| c.ram_max_ops = 100_001, "ZEMDB_RAM_MAX_OPS"),
+        (|c| c.ram_ttl_secs = 0, "ZEMDB_RAM_TTL_SECS"),
+        (
+            |c| c.warm_disk_ttl_secs = MAX_POLICY_DURATION_SECS + 1,
+            "ZEMDB_WARM_TTL_SECS",
+        ),
+        (|c| c.cold_disk_ttl_secs = u64::MAX, "ZEMDB_COLD_TTL_SECS"),
+        (
+            |c| c.max_room_disk_bytes = 1024,
+            "ZEMDB_ROOM_MAX_DISK_BYTES",
+        ),
+        (|c| c.lease_timeout_secs = 0, "ZEMDB_LEASE_TIMEOUT_SECS"),
+        (
+            |c| c.dormant_after_secs = Some(u64::MAX),
+            "ZEMDB_DORMANT_AFTER_SECS",
+        ),
+        (
+            |c| c.idle_timeout_secs = u64::MAX,
+            "ZEMDB_ROOM_IDLE_TIMEOUT_SECS",
+        ),
+    ];
+    for (configure, variable) in cases {
+        let mut config = strong_config();
+        configure(&mut config);
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains(variable), "{variable}: {err}");
+    }
+}
+
+#[test]
+fn empty_environment_values_count_as_unset() {
+    // Deployment templates often expand a missing variable to an empty string.
+    let names = [
+        "ZEMDB_HOST",
+        "ZEMDB_PORT",
+        "ZEMDB_DATA_DIR",
+        "ZEMDB_AUTH_SECRET",
+        "ZEMDB_ADMIN_SECRET",
+        "ZEMDB_DEDUP_LRU_CAPACITY",
+        "ZEMDB_SNAPSHOT_TTL_SECS",
+        "ZEMDB_MAX_SNAPSHOT_BYTES",
+        "ZEMDB_RAM_MAX_OPS",
+        "ZEMDB_RAM_TTL_SECS",
+        "ZEMDB_WARM_TTL_SECS",
+        "ZEMDB_COLD_TTL_SECS",
+        "ZEMDB_ROOM_MAX_DISK_BYTES",
+        "ZEMDB_LEASE_TIMEOUT_SECS",
+        "ZEMDB_DORMANT_AFTER_SECS",
+        "ZEMDB_SNAPSHOT_DEMAND_TTL_SECS",
+        "ZEMDB_ROOM_IDLE_TIMEOUT_SECS",
+    ];
+    let vars: Vec<(&str, &str)> = names.iter().map(|name| (*name, "")).collect();
+    assert_eq!(with_env(&vars).unwrap(), strong_config());
 }

@@ -10,4 +10,4 @@ pub use command::{
 };
 pub use lease::{ClientEntry, ClientLeaseTracker, ClientState};
 pub use manager::{RoomManager, RoomMetadata};
-pub use room::RoomActor;
+pub use room::{ActorExit, RoomActor};

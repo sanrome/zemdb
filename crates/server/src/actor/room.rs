@@ -1,5 +1,9 @@
+use futures::FutureExt;
 use std::ops::ControlFlow;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{broadcast, mpsc};
@@ -24,8 +28,19 @@ use crate::error::ServerError;
 use crate::log::{retention, RoomLifecyclePolicy, TieredLog};
 use crate::relay::SnapshotRelay;
 
-/// Interval between maintenance passes (lease timeouts, log compaction, roster persistence).
+/// Interval between maintenance passes (lease timeouts, log compaction, roster persistence,
+/// inactivity).
 const MAINTENANCE_PERIOD: Duration = Duration::from_millis(500);
+
+/// How a room actor ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActorExit {
+    /// The actor stopped on purpose: shutdown, inactivity, a closed mailbox, or a failure
+    /// that requires reopening the room from disk.
+    Stopped,
+    /// The actor panicked. Commands still queued were answered with `Unavailable`.
+    Panicked,
+}
 
 /// Dedicated single-writer Tokio actor managing state, sequencing, durability, and synchronization for a single room.
 pub struct RoomActor {
@@ -38,8 +53,15 @@ pub struct RoomActor {
     head_seq: SequenceNumber,
     events_tx: broadcast::Sender<RoomEvent>,
     receiver: mpsc::Receiver<RoomCommand>,
-    lease_timeout: Duration,
-    dormant_after: Option<Duration>,
+    /// Effective lifecycle policy: the server defaults overlaid with the room's overrides.
+    policy: RoomLifecyclePolicy,
+    /// Directory holding the room's files; keys the fail points of this room in tests.
+    #[cfg(test)]
+    room_dir: PathBuf,
+    /// When the last command arrived; drives the shutdown for inactivity.
+    last_command_at: tokio::time::Instant,
+    /// Set once the actor closed its mailbox to shut down for inactivity.
+    stopping_idle: bool,
     snapshot_relay: Arc<SnapshotRelay>,
     snapshot_demand: SnapshotDemand,
     /// How stale the persisted renewal time of the snapshot demand may get.
@@ -50,6 +72,7 @@ pub struct RoomActor {
 
 impl RoomActor {
     /// Spawns a new RoomActor task, recovering state and initializing durability from disk.
+    /// `lifecycle_policy` is the room's effective policy.
     pub fn spawn(
         room_id: RoomId,
         schema_id: SchemaId,
@@ -58,8 +81,8 @@ impl RoomActor {
         config: Arc<ServerConfig>,
         lifecycle_policy: RoomLifecyclePolicy,
         snapshot_relay: Arc<SnapshotRelay>,
-    ) -> Result<(mpsc::Sender<RoomCommand>, JoinHandle<()>), ServerError> {
-        Self::spawn_with_designation_timeout(
+    ) -> Result<(mpsc::Sender<RoomCommand>, JoinHandle<ActorExit>), ServerError> {
+        let (sender, actor) = Self::open(
             room_id,
             schema_id,
             schema,
@@ -68,13 +91,15 @@ impl RoomActor {
             lifecycle_policy,
             snapshot_relay,
             DESIGNATION_TIMEOUT,
-        )
+        )?;
+        Ok((sender, tokio::spawn(actor.run())))
     }
 
-    /// Like [`spawn`](Self::spawn), with the time a client designated to upload a snapshot has
-    /// to start the upload. Production always uses [`DESIGNATION_TIMEOUT`]; tests shorten it.
+    /// Recovers the room from disk and builds its actor without starting it, with the time a
+    /// client designated to upload a snapshot has to start the upload. Production always uses
+    /// [`DESIGNATION_TIMEOUT`]; tests shorten it.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn spawn_with_designation_timeout(
+    pub(crate) fn open(
         room_id: RoomId,
         schema_id: SchemaId,
         schema: Arc<Schema>,
@@ -83,7 +108,7 @@ impl RoomActor {
         lifecycle_policy: RoomLifecyclePolicy,
         snapshot_relay: Arc<SnapshotRelay>,
         designation_timeout: Duration,
-    ) -> Result<(mpsc::Sender<RoomCommand>, JoinHandle<()>), ServerError> {
+    ) -> Result<(mpsc::Sender<RoomCommand>, Self), ServerError> {
         let room_dir = data_dir.as_ref().join("rooms").join(room_id.as_str());
         durable::create_dir_all_synced(&room_dir)?;
 
@@ -107,9 +132,7 @@ impl RoomActor {
         let (command_tx, command_rx) = mpsc::channel(1024);
         let (events_tx, _) = broadcast::channel(256);
 
-        let lease_timeout = Duration::from_secs(config.lease_timeout_secs);
-        let dormant_after = config.dormant_after_secs.map(Duration::from_secs);
-        let demand_ttl = Duration::from_secs(config.snapshot_demand_ttl_secs);
+        let demand_ttl = lifecycle_policy.snapshot_demand_ttl;
         let snapshot_demand = SnapshotDemand::new(demand_ttl, designation_timeout);
 
         let mut actor = Self {
@@ -122,8 +145,11 @@ impl RoomActor {
             head_seq,
             events_tx,
             receiver: command_rx,
-            lease_timeout,
-            dormant_after,
+            policy: lifecycle_policy,
+            #[cfg(test)]
+            room_dir,
+            last_command_at: tokio::time::Instant::now(),
+            stopping_idle: false,
             snapshot_relay,
             snapshot_demand,
             demand_persistence_granularity: persistence_granularity(demand_ttl),
@@ -136,18 +162,44 @@ impl RoomActor {
         info!(
             room = %room_id,
             head_seq = %head_seq,
-            "Spawned RoomActor task"
+            "Opened RoomActor"
         );
 
-        let handle = tokio::spawn(async move {
-            actor.run().await;
-        });
+        Ok((command_tx, actor))
+    }
 
-        Ok((command_tx, handle))
+    /// Runs the actor until it stops, and reports how it ended.
+    ///
+    /// A panic is caught here instead of ending the task: the room is reported as terminated
+    /// by a panic and every command still queued is answered with `Unavailable`, so those
+    /// callers can retry against the room reopened from disk. The command being handled when
+    /// the panic occurred loses its reply; `RoomManager` answers it with `Internal`, since
+    /// retrying it could panic again. Dropping the actor afterwards releases the room's files.
+    pub async fn run(mut self) -> ActorExit {
+        let outcome = AssertUnwindSafe(self.run_loop()).catch_unwind().await;
+        match outcome {
+            Ok(()) => ActorExit::Stopped,
+            Err(panic) => {
+                error!(
+                    room = %self.room_id,
+                    panic = panic_message(panic.as_ref()),
+                    "RoomActor panicked; the next request reopens the room from disk"
+                );
+                self.receiver.close();
+                // After `close`, `recv` yields the queued commands and then `None`.
+                while let Some(command) = self.receiver.recv().await {
+                    command.reject(ServerError::Unavailable(format!(
+                        "Room {} stopped after an internal error; retry the request",
+                        self.room_id
+                    )));
+                }
+                ActorExit::Panicked
+            }
+        }
     }
 
     /// Primary actor loop running sequentially on Tokio.
-    pub async fn run(mut self) {
+    async fn run_loop(&mut self) {
         // The first tick fires one period after start, not immediately.
         let mut maintenance_timer = tokio::time::interval_at(
             tokio::time::Instant::now() + MAINTENANCE_PERIOD,
@@ -157,10 +209,11 @@ impl RoomActor {
         loop {
             tokio::select! {
                 cmd = self.receiver.recv() => {
+                    self.last_command_at = tokio::time::Instant::now();
                     match cmd {
                         Some(RoomCommand::Shutdown { reply }) => {
                             debug!(room = %self.room_id, "Shutdown command received, terminating actor loop");
-                            self.persist_roster();
+                            self.persist_roster_at_stop();
                             let _ = reply.send(());
                             break;
                         }
@@ -177,19 +230,55 @@ impl RoomActor {
                 }
                 _ = maintenance_timer.tick() => {
                     self.run_periodic_maintenance().await;
+                    if self.is_idle() {
+                        self.drain_for_idle_shutdown().await;
+                        break;
+                    }
                 }
             }
         }
 
-        // Every exit flushes pending cursor changes. Dropping the actor afterwards releases
-        // the log's file lock and drops any command still queued, whose callers observe a
-        // closed reply channel instead of waiting forever.
-        self.persist_roster();
+        // Every exit flushes pending cursor changes and the clients' last activity. Dropping
+        // the actor afterwards releases the log's file lock and drops any command still
+        // queued, whose callers observe a closed reply channel instead of waiting forever.
+        self.persist_roster_at_stop();
+    }
+
+    /// Whether the room has been inactive for its `idle_timeout`: no command in that time,
+    /// no SSE subscriber and no snapshot upload in progress.
+    fn is_idle(&self) -> bool {
+        let Some(idle_timeout) = self.policy.idle_timeout else {
+            return false;
+        };
+        self.last_command_at.elapsed() >= idle_timeout
+            && self.events_tx.receiver_count() == 0
+            && !self.snapshot_relay.has_upload_in_progress(&self.room_id)
+    }
+
+    /// Starts the shutdown for inactivity. Closing the mailbox makes `RoomManager` respawn the
+    /// room for the next request, and a request that finds the mailbox closed is sent to the
+    /// new actor; commands that were already queued are handled normally first, so no request
+    /// is lost or refused because of the shutdown. The roster is persisted when the loop ends.
+    async fn drain_for_idle_shutdown(&mut self) {
+        info!(room = %self.room_id, "Room inactive; shutting down its actor");
+        self.receiver.close();
+        self.stopping_idle = true;
+        // After `close`, `recv` yields the queued commands and then `None`.
+        while let Some(command) = self.receiver.recv().await {
+            if self.handle_command(command).is_break() {
+                return;
+            }
+        }
     }
 
     /// Handles one command. `Break` means the room can no longer operate safely and the
     /// actor must stop so that the next request reopens it from disk.
     fn handle_command(&mut self, command: RoomCommand) -> ControlFlow<()> {
+        #[cfg(test)]
+        if crate::fail_point::check("room_command_panic", &self.room_dir).is_err() {
+            panic!("injected panic while handling a room command");
+        }
+
         match command {
             RoomCommand::RegisterClient {
                 client_id,
@@ -272,7 +361,16 @@ impl RoomActor {
             }
 
             RoomCommand::SubscribeEvents { reply } => {
-                let _ = reply.send(self.events_tx.subscribe());
+                // A subscription to an actor that is about to stop would end at once.
+                let res = if self.stopping_idle {
+                    Err(ServerError::Unavailable(format!(
+                        "Room {} is shutting down for inactivity; retry the request",
+                        self.room_id
+                    )))
+                } else {
+                    Ok(self.events_tx.subscribe())
+                };
+                let _ = reply.send(res);
             }
 
             RoomCommand::GetMetrics { reply } => {
@@ -287,12 +385,13 @@ impl RoomActor {
                     disconnected_clients: disc,
                     dormant_clients: dorm,
                     total_clients: total,
+                    lifecycle: self.policy.clone(),
                 };
-                let _ = reply.send(metrics);
+                let _ = reply.send(Ok(metrics));
             }
 
             RoomCommand::GetLogBounds { reply } => {
-                let _ = reply.send((self.tiered_log.tail_seq(), self.head_seq));
+                let _ = reply.send(Ok((self.tiered_log.tail_seq(), self.head_seq)));
             }
 
             RoomCommand::GetClientCursor { client_id, reply } => {
@@ -300,7 +399,7 @@ impl RoomActor {
                     .lease_tracker
                     .get_client(&client_id)
                     .map(|c| c.last_ack_seq);
-                let _ = reply.send(cursor);
+                let _ = reply.send(Ok(cursor));
             }
 
             RoomCommand::Shutdown { reply } => {
@@ -773,11 +872,20 @@ impl RoomActor {
         }
     }
 
+    /// Like [`persist_roster`](Self::persist_roster), but also writes the roster when only the
+    /// clients' activity changed, so that their inactivity keeps counting after the room
+    /// reopens (for example after a shutdown for inactivity).
+    fn persist_roster_at_stop(&mut self) {
+        if let Err(err) = self.lease_tracker.persist_if_dirty_or_active() {
+            warn!(room = %self.room_id, error = %err, "Failed to persist clients roster");
+        }
+    }
+
     async fn run_periodic_maintenance(&mut self) {
         // 1. Check client timeouts (Connected/Bootstrapping -> Disconnected -> Dormant)
         self.lease_tracker.check_timeouts(
-            self.lease_timeout,
-            self.dormant_after,
+            self.policy.lease_timeout,
+            self.policy.dormant_after,
             self.tiered_log.tail_seq(),
         );
 
@@ -796,6 +904,15 @@ impl RoomActor {
         // 5. Persist cursor and lease changes accumulated since the previous tick
         self.persist_roster();
     }
+}
+
+/// Text of a caught panic payload, when it is a string.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 /// Keeps the longest prefix of `ops` that fits in one response frame

@@ -1,5 +1,6 @@
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::time::Duration;
 use tempfile::tempdir;
 use zemdb_core::id::{MutationId, SequenceNumber};
 use zemdb_core::mutation::Operation;
@@ -227,7 +228,9 @@ fn test_server_config_toml_and_env_overrides() {
     std::env::set_var("ZEMDB_MAX_SNAPSHOT_BYTES", "1048576");
     std::env::set_var("ZEMDB_DORMANT_AFTER_SECS", "7200");
     std::env::set_var("ZEMDB_SNAPSHOT_DEMAND_TTL_SECS", "3600");
-    config.apply_env_overrides();
+    std::env::set_var("ZEMDB_RAM_MAX_OPS", "250");
+    std::env::set_var("ZEMDB_ROOM_IDLE_TIMEOUT_SECS", "0");
+    config.apply_env_overrides().unwrap();
 
     assert_eq!(config.port, 9999);
     assert_eq!(config.host, "192.168.1.50");
@@ -235,6 +238,13 @@ fn test_server_config_toml_and_env_overrides() {
     assert_eq!(config.max_snapshot_bytes, 1024 * 1024);
     assert_eq!(config.dormant_after_secs, Some(7200));
     assert_eq!(config.snapshot_demand_ttl_secs, 3600);
+    assert_eq!(config.ram_max_ops, 250);
+    assert_eq!(config.idle_timeout_secs, 0);
+    let policy = config.default_lifecycle_policy();
+    assert_eq!(policy.ram_max_ops, 250);
+    assert_eq!(policy.lease_timeout, Duration::from_secs(120));
+    assert_eq!(policy.dormant_after, Some(Duration::from_secs(7200)));
+    assert_eq!(policy.idle_timeout, None);
 
     // Clean up env vars
     std::env::remove_var("ZEMDB_PORT");
@@ -243,6 +253,8 @@ fn test_server_config_toml_and_env_overrides() {
     std::env::remove_var("ZEMDB_MAX_SNAPSHOT_BYTES");
     std::env::remove_var("ZEMDB_DORMANT_AFTER_SECS");
     std::env::remove_var("ZEMDB_SNAPSHOT_DEMAND_TTL_SECS");
+    std::env::remove_var("ZEMDB_RAM_MAX_OPS");
+    std::env::remove_var("ZEMDB_ROOM_IDLE_TIMEOUT_SECS");
 }
 
 #[test]

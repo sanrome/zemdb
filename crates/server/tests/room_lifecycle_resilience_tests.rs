@@ -38,6 +38,7 @@ impl LifecycleTestServer {
             snapshot_ttl_secs: 60,
             snapshot_demand_ttl_secs: 60,
             max_snapshot_bytes: 16 * 1024 * 1024,
+            ..ServerConfig::default()
         });
 
         let schemas_dir = data_dir.join("schemas");
@@ -175,7 +176,7 @@ async fn test_concurrent_get_or_spawn_elimination_of_race_condition() {
         })
         .await
         .unwrap();
-    let cursor = cur_rx.await.unwrap().unwrap();
+    let cursor = cur_rx.await.unwrap().unwrap().unwrap();
     assert_eq!(cursor, SequenceNumber::new(0));
 }
 

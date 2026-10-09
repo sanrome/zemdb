@@ -58,6 +58,8 @@ cargo run -p zemdb-server
 ```
 They can also be set in a TOML file passed as the first argument (`auth_secret`, `admin_secret`).
 
+The server defaults of the room lifecycle policy (log retention, client lease timeouts, shutdown of inactive rooms) come from `ZEMDB_*` environment variables or the same TOML file; see [`ARCHITECTURE.md` §5.3](ARCHITECTURE.md#53-configurable-lifecycle-policy-roomlifecyclepolicy) for the variables and their accepted ranges. Numeric `ZEMDB_*` variables are parsed strictly: a value that is not a valid number for the setting, or is out of its range, makes the server refuse to start with an error naming the variable (an empty value counts as unset).
+
 ### Building and Testing
 ```bash
 # Build entire workspace
