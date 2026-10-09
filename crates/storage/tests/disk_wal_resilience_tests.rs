@@ -7,7 +7,7 @@ use zemdb_storage::format::{
     FileHeader, WalBatchDecodeResult, BATCH_HEADER_SIZE, BATCH_MAGIC, HEADER_SIZE, MAGIC_BYTES,
 };
 use zemdb_storage::{
-    DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError, WalReader,
+    DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError, WalReader, WalWriter,
 };
 
 const USERS_TABLE: u16 = 0;
@@ -1138,4 +1138,21 @@ fn wal_reader_skips_empty_frames() {
         WalBatchDecodeResult::CleanEof
     );
     assert_eq!(reader.offset(), encoded.len());
+}
+
+#[tokio::test]
+async fn test_wal_writer_reports_a_write_that_fails_in_the_background() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("read-only.wal");
+    std::fs::write(&path, b"").unwrap();
+    // Writes through a read-only handle are accepted by `write_all` and fail on the blocking pool.
+    let mut file = tokio::fs::File::open(&path).await.unwrap();
+    let op = SequencedOperation::with_default_origin(
+        1u64,
+        Operation::delete(USERS_TABLE, PrimaryKey::single(1i64), 1),
+    );
+
+    assert!(WalWriter::write_record(&mut file, &op).await.is_err());
+    assert!(WalWriter::write_batch(&mut file, &[op]).await.is_err());
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
 }

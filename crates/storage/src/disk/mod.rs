@@ -16,7 +16,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use zemdb_core::{CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation};
 
 use crate::disk::compactor::{
-    compact_room_cow, install_applied_snapshot, rename_staged_snapshot, stage_snapshot,
+    compact_room_cow, install_applied_snapshot, rename_staged_snapshot, stage_snapshot, sync_file,
+    SyncKind,
 };
 use crate::disk::recovery::recover_room;
 use crate::disk::wal::WalWriter;
@@ -493,8 +494,8 @@ impl StorageEngine for DiskStorageEngine {
         // Still registered: closing needs the compaction lock, which this call holds.
         self.rooms.write().await.remove(room_id);
         // Waits for a write in progress to finish.
-        let wal = room.wal.lock().await;
-        wal.file.sync_all().await?;
+        let mut wal = room.wal.lock().await;
+        sync_file(&mut wal.file, SyncKind::All).await?;
         tracing::info!(room_id = %room_id, "Closed disk room");
         Ok(())
     }
@@ -531,10 +532,17 @@ impl StorageEngine for DiskStorageEngine {
         let mut pending = PendingWrite::begin(&mut wal);
         let write_result = async {
             let wal = pending.wal();
+            crate::fail_point::read_only_handle(
+                "apply_batch.write",
+                &room.wal_path,
+                &mut wal.file,
+                &room.wal_path,
+            )
+            .await;
             wal.file.write_all(&wal_batch_bytes).await?;
             crate::fail_point::check("apply_batch.sync", &room.wal_path)?;
             crate::fail_point::pause("apply_batch.sync", &room.wal_path).await;
-            wal.file.sync_data().await?;
+            sync_file(&mut wal.file, SyncKind::Data).await?;
             Ok::<(), StorageError>(())
         }
         .await;

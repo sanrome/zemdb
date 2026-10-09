@@ -40,7 +40,7 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 
 | ID | Decisión | Lote | Estado |
 |---|---|---|---|
-| **D43** | **Sync en storage siempre con flush previo.** Un helper único hace `flush().await?` y después `sync_data`/`sync_all` sobre un `tokio::fs::File`; todos los sitios de storage pasan por él. Para que no se pueda volver a olvidar, `clippy.toml` agrega `disallowed-methods` para `tokio::fs::File::sync_data` y `sync_all`, con un `#[allow]` solo dentro del helper. Alternativa descartada: pasar a `std::fs::File` dentro de `spawn_blocking` (cambio mucho más grande para el mismo resultado). | 1 | Propuesta |
+| **D43** | **Sync en storage siempre con flush previo.** Un helper único hace `flush().await?` y después `sync_data`/`sync_all` sobre un `tokio::fs::File`; todos los sitios de storage pasan por él. Para que no se pueda volver a olvidar, `clippy.toml` agrega `disallowed-methods` para `tokio::fs::File::sync_data` y `sync_all`, con un `#[allow]` solo dentro del helper. Alternativa descartada: pasar a `std::fs::File` dentro de `spawn_blocking` (cambio mucho más grande para el mismo resultado). | 1 | Adoptada |
 | **D44** | **Decodificación acotada en tres capas.** (a) `/register` mira el tag de variante antes de decodificar el cuerpo y solo decodifica `RegisterClient`; cualquier otra variante es 400 sin decodificar filas. (b) `Deserialize` propio para `CompactRow`, `PrimaryKey` y los deltas de `Update`, que rechaza más de `MAX_COLUMNS` elementos antes de reservar memoria (sin confiar en el `size_hint`). (c) Presupuesto de `Value` por mensaje: `decode_message` fija un contador (thread-local, la decodificación es síncrona) que los visitors de (b) descuentan; un mensaje que lo supera es `BadRequest`. Con un presupuesto del orden de 1 M de valores, un request no puede reservar más de ~24 MiB en `Value`s, sea cual sea su forma. (a) cierra el ataque sin credenciales; (c) cierra la amplificación ×24 para los endpoints autenticados, que (b) solo no resuelve. | 2 | Propuesta |
 | **D45** | **Borde HTTP con límites propios y transporte documentado como es.** Timeout de lectura de headers (hyper-util con `TokioTimer`), timeout del body y límite global de conexiones concurrentes, configurables con variables `ZEMDB_*` (SSE queda fuera del timeout de request por ser de larga vida). Transporte: el servidor habla HTTP/1.1 en texto plano y **TLS se termina en un reverse proxy**; se corrige la documentación. Activar la feature `http2` de axum (h2c) queda como opcional. TLS nativo con rustls: descartado para la v0.1. | 2 | Propuesta |
 | **D46** | **Frame WAL v2.** Header de 18 bytes: `magic(2) + payload_len(4) + payload_crc(4) + ops_count(4) + header_crc(4)`; `header_crc` cubre los 14 bytes anteriores. Clasificación del final del log: ante un header inválido, un payload truncado o un CRC de payload incorrecto, se busca hacia adelante un frame completo válido (magic + CRC del header + CRC del payload). Si existe, es **corrupción** y no se trunca nada; si no, es **torn write** y se trunca. La búsqueda solo corre ante una anomalía. Aplica a los dos consumidores de `wal_frame` (WAL de storage y segmentos del servidor). Sin retrocompatibilidad: los archivos del formato anterior no se leen (V1, sin despliegues que migrar). | 3 | Propuesta |
@@ -57,7 +57,7 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 
 | Orden | Lote | Ítems | Prioridad | Progreso |
 |---|---|---|---|---|
-| 1 | Durabilidad del storage | DEF-87, 108, 112 | Inmediata | ⬜ 0/3 |
+| 1 | Durabilidad del storage | DEF-87, 108, 112, 114 | Inmediata | ✅ 4/4 |
 | 2 | Entrada hostil y borde HTTP | DEF-89, 95, 100 | Inmediata | ⬜ 0/3 |
 | 3 | Integridad del formato WAL | DEF-91, 92 | Alta (requisito de Fase 4) | ⬜ 0/2 |
 | 4 | Memoria y E/S del log del servidor | DEF-90, 97, 99, 96 | Alta | ⬜ 0/4 |
@@ -66,7 +66,7 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 | 7 | Squashing de la outbox | DEF-88, 94, 105, 106 | Latente (antes de habilitar la outbox) | ⬜ 0/4 |
 | 8 | Tests y documentación | DEF-109, 110, 111, 113 | Baja | ⬜ 0/4 |
 
-**Avance total:** 0 de 27 ítems.
+**Avance total:** 4 de 28 ítems (DEF-114 surgió al implementar el Lote 1).
 
 **Por qué este orden, en una línea por lote:**
 1. Es la única pérdida silenciosa de datos ya confirmados, y el arreglo son pocas líneas.
@@ -84,23 +84,31 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 
 > Objetivo: que ningún batch se confirme sin estar en disco y que un error de I/O nunca termine borrando un archivo durable.
 
-#### DEF-87 · Alto · ⬜ Pendiente
+#### DEF-87 · Alto · ✅ Hecho
 **Problema.** `write_all` + `sync_data`/`sync_all` sin `flush()` sobre `tokio::fs::File`: el error de la escritura de fondo se descarta y el batch se confirma sin estar en disco. Afecta a `apply_batch`, `close_room`, la compactación (incluida la absorción de `.wal.compacting`, donde la pérdida es permanente) y recovery.
 **Solución.** D43: helper único con `flush` antes del sync en los 9 sitios, y `disallowed-methods` en `clippy.toml`.
+**Hecho.** `sync_file` (`disk/compactor.rs`) en los 9 sitios y `crates/storage/clippy.toml`, que solo aplica a `zemdb-storage`. `WalWriter::write_record`/`write_batch` (API pública sin usos internos) también hacen `flush` después de escribir. Punto de fallo de test `read_only_handle`, que reproduce el fallo real de la escritura de fondo.
 **Test exigido.**
 - Unitario del helper: un handle abierto solo para lectura, `write_all` y el helper deben devolver error (sin el flush, `sync_data` devuelve `Ok`; ya está reproducido con tokio 1.53.1).
 - `apply_batch` con una escritura de fondo que falla (por ejemplo, un punto de fallo que deja el handle del WAL en solo lectura antes de escribir): devuelve error, el batch no es visible en memoria y la sala queda fallida hasta reabrirse.
 - Lo mismo para la absorción de `.wal.compacting`: el WAL activo no se trunca si la escritura falló.
 
-#### DEF-108 · Bajo · ⬜ Pendiente
+#### DEF-108 · Bajo · ✅ Hecho
 **Problema.** `Path::exists()` devuelve `false` ante un error de `stat`, y recovery termina truncando el snapshot real.
 **Solución.** `try_exists()?` en recovery, y crear el snapshot inicial con `create_new(true)` en vez de `create` + `truncate(true)`, así un snapshot existente nunca se trunca.
 **Test exigido.** Un error en la comprobación de existencia (punto de fallo) hace fallar `open_room` y deja el snapshot intacto.
+**Hecho.** `try_exists()?`, con un punto de fallo que reemplaza su resultado (el test falla si se vuelve a `exists()`). En vez de `create_new`, el snapshot inicial pasó a crearse de forma atómica (DEF-114), así que no se trunca nunca.
 
-#### DEF-112 · Bajo · ⬜ Pendiente
+#### DEF-112 · Bajo · ✅ Hecho
 **Problema.** La fase 3 de la compactación (rename del snapshot, sync del directorio y borrado de `.wal.compacting`) no tiene puntos de fallo.
 **Solución.** Puntos de fallo `compaction.phase3_rename`, `compaction.phase3_sync` y `compaction.cleanup`.
 **Test exigido.** Para cada uno: la compactación falla, se reabre la sala y no se pierde ni se duplica ningún batch.
+**Hecho.** El código ya se comportaba así; no hubo que cambiarlo. Los tests escriben batches antes y después del fallo (incluidos un borrado y un update posteriores), reabren o compactan de nuevo y verifican el contenido exacto.
+
+#### DEF-114 · Medio · ✅ Hecho (nuevo, implementación del Lote 1)
+**Problema.** El snapshot vacío de una sala nueva se creaba directamente sobre `room_{id}.snap`. Si la escritura, el `flush` o el sync fallaban (por ejemplo, disco lleno), o había un crash antes de que los datos llegaran a disco, quedaba un `.snap` de 0 bytes o con el header incompleto, y desde ahí `open_room` fallaba siempre hasta borrarlo a mano. Antes de DEF-87 el error de escritura se tragaba y el problema aparecía recién en la apertura siguiente.
+**Solución.** Se escribe en un `*.snap.tmp.<uuid>` (el mismo que recovery ya limpia al abrir), se sincroniza, se renombra a `.snap` y se sincroniza el directorio, con el mismo camino que usan la compactación y el plegado de `.wal.compacting`. El rename no puede pisar un snapshot real: solo corre si `try_exists` dijo que no existe, con el lock exclusivo del WAL tomado.
+**Test exigido.** Un fallo al escribir el snapshot inicial hace fallar `open_room` sin dejar ningún `.snap` ni temporal, y la apertura siguiente arranca vacía; un crash entre el temporal y el rename deja solo el temporal, que la apertura siguiente limpia.
 
 ---
 

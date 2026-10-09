@@ -1,0 +1,4 @@
+disallowed-methods = [
+    { path = "tokio::fs::File::sync_data", reason = "succeeds even if a pending write failed (its error is kept for a later flush or write); use `disk::compactor::sync_file`, which flushes first" },
+    { path = "tokio::fs::File::sync_all", reason = "succeeds even if a pending write failed (its error is kept for a later flush or write); use `disk::compactor::sync_file`, which flushes first" },
+]
