@@ -110,6 +110,15 @@ pub enum ValidationError {
 
     #[error("Table ID assignment overflowed u16 capacity")]
     TableIdOverflow,
+
+    #[error("Table '{table}' has no table_id")]
+    MissingTableId { table: String },
+
+    #[error("Table id {table_id} of table '{table}' is already used by another table")]
+    DuplicateTableId { table: String, table_id: u16 },
+
+    #[error("Table '{table}' would have more than {max} columns")]
+    TooManyColumns { table: String, max: usize },
 }
 
 /// Validates an individual field value against column definition rules.

@@ -46,6 +46,9 @@ pub enum ErrorCode {
     Unavailable,
     /// The room did not answer in time. Retrying is safe.
     Timeout,
+    /// A schema with this id is already registered. A schema is declared once; it evolves
+    /// only by appending nullable columns.
+    SchemaAlreadyExists,
 }
 
 /// An operation ordered by the coordination server with assigned sequence ID.

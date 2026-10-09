@@ -9,10 +9,8 @@ use zemdb_core::value::DataType;
 fn test_schema() -> Schema {
     let table = TableSchema::builder("tasks")
         .primary_key("id", DataType::Int)
-        .column("title", DataType::String)
-        .build()
-        .unwrap();
-    Schema::from_tables(vec![table])
+        .column("title", DataType::String);
+    Schema::builder().table(table).build()
 }
 
 fn new_manager(dir: &TempDir) -> RoomManager {
@@ -21,12 +19,13 @@ fn new_manager(dir: &TempDir) -> RoomManager {
         ..ServerConfig::default()
     });
     let registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
-    registry
-        .register_schema(SchemaId::new("first").unwrap(), test_schema())
-        .unwrap();
-    registry
-        .register_schema(SchemaId::new("second").unwrap(), test_schema())
-        .unwrap();
+    // A manager reopened on the same directory (a restart) finds the schemas already there.
+    for id in ["first", "second"] {
+        let id = SchemaId::new(id).unwrap();
+        if registry.get_schema(&id).is_none() {
+            registry.register_schema(id, test_schema()).unwrap();
+        }
+    }
     let relay = Arc::new(
         SnapshotRelay::new(
             dir.path().join("snapshots"),
@@ -237,11 +236,7 @@ fn schema_reload_does_not_block_concurrent_room_creation() {
             let reload = tokio::spawn({
                 let manager = Arc::clone(&manager);
                 let schema_id = schema_id.clone();
-                async move {
-                    manager
-                        .reload_schema_for_rooms(&schema_id, Arc::new(test_schema()))
-                        .await
-                }
+                async move { manager.reload_schema_for_rooms(&schema_id).await }
             });
             let create = tokio::spawn({
                 let manager = Arc::clone(&manager);
@@ -849,12 +844,18 @@ async fn schema_reload_racing_a_respawn_reaches_the_new_actor() {
     let meta = manager.room_meta.get(&room_id).unwrap().clone();
 
     // Meanwhile the schema evolves and the reload runs.
-    let evolved = Arc::new(test_schema());
+    let evolved = manager
+        .schema_registry
+        .add_column(
+            &schema_id,
+            "tasks",
+            zemdb_core::schema::ColumnDef::new("priority", DataType::Int).nullable(true),
+        )
+        .unwrap();
     let reload = tokio::spawn({
         let manager = Arc::clone(&manager);
         let schema_id = schema_id.clone();
-        let evolved = Arc::clone(&evolved);
-        async move { manager.reload_schema_for_rooms(&schema_id, evolved).await }
+        async move { manager.reload_schema_for_rooms(&schema_id).await }
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 

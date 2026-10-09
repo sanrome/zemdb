@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 /// Bounded to 32 bytes (2B column_idx + 6B padding + 24B Value).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ColumnUpdate {
-    pub column_idx: u16,
-    pub value: Value,
+    pub(crate) column_idx: u16,
+    pub(crate) value: Value,
 }
 
 impl ColumnUpdate {
@@ -16,6 +16,22 @@ impl ColumnUpdate {
             column_idx,
             value: value.into(),
         }
+    }
+
+    #[inline]
+    pub fn column_idx(&self) -> u16 {
+        self.column_idx
+    }
+
+    #[inline]
+    pub fn value(&self) -> &Value {
+        &self.value
+    }
+
+    /// Consumes the update, returning its value without cloning it.
+    #[inline]
+    pub fn into_value(self) -> Value {
+        self.value
     }
 }
 
@@ -37,16 +53,34 @@ pub enum OperationKind {
 ///
 /// Occupies exactly 88 bytes in memory (2B table_id + 6B padding + 8B timestamp + 40B pk + 32B kind).
 /// 100% stack-allocated, zero heap pointers, aligned to 8 bytes.
+///
+/// The fields are read through accessors and are not mutable from outside the crate. The
+/// constructors keep update deltas sorted by `column_idx`. This does not make every
+/// `Operation` valid: it is a wire type, and one decoded from a client message or a WAL record
+/// comes straight from `Deserialize`, with whatever table, primary key and deltas it was
+/// encoded with. Only [`Schema::validate_operation`](crate::schema::Schema::validate_operation)
+/// checks an operation against the table it targets (table id, primary key types, row arity
+/// and types, deltas strictly ascending and in range); the server and the storage engines run
+/// it on every operation they receive before using it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Operation {
-    pub table_id: u16,
-    pub timestamp: u64,
-    pub pk: PrimaryKey,
-    pub kind: OperationKind,
+    pub(crate) table_id: u16,
+    pub(crate) timestamp: u64,
+    pub(crate) pk: PrimaryKey,
+    pub(crate) kind: OperationKind,
 }
 
 impl Operation {
+    /// Builds an operation of any kind. Update deltas are sorted by `column_idx`, as in
+    /// [`Operation::update`].
     pub fn new(table_id: u16, pk: PrimaryKey, timestamp: u64, kind: OperationKind) -> Self {
+        let kind = match kind {
+            OperationKind::Update { mut updates } => {
+                updates.sort_by_key(|u| u.column_idx);
+                OperationKind::Update { updates }
+            }
+            other => other,
+        };
         Self {
             table_id,
             timestamp,
@@ -106,6 +140,12 @@ impl Operation {
     #[inline]
     pub fn kind(&self) -> &OperationKind {
         &self.kind
+    }
+
+    /// Consumes the operation, returning its primary key and payload without cloning them.
+    #[inline]
+    pub fn into_pk_and_kind(self) -> (PrimaryKey, OperationKind) {
+        (self.pk, self.kind)
     }
 
     #[inline]

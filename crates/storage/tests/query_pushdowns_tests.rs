@@ -16,9 +16,7 @@ fn test_schema() -> Schema {
         .primary_key("id", DataType::Int)
         .column("name", DataType::String)
         .column("score", DataType::Int)
-        .column("active", DataType::Bool)
-        .build()
-        .expect("valid users table");
+        .column("active", DataType::Bool);
 
     Schema::builder().table(users).build()
 }

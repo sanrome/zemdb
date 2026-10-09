@@ -7,9 +7,7 @@ fn sample_schema() -> Schema {
         .column("name", DataType::String)
         .column("age", DataType::Int)
         .nullable_column("bio", DataType::String)
-        .encrypted_column("secret_chat", DataType::String) // Stored as bytes in transit, decrypted as string
-        .build()
-        .expect("valid table schema");
+        .encrypted_column("secret_chat", DataType::String); // Stored as bytes in transit, decrypted as string
 
     Schema::builder().table(users).build()
 }
@@ -73,6 +71,7 @@ fn test_encrypted_column_rejects_non_bytes_in_transit() {
 #[test]
 fn test_table_builder_rejects_encrypted_primary_key() {
     let result = TableSchema::builder("secrets")
+        .table_id(0)
         .column("data", DataType::String)
         // Invalid: PK cannot be encrypted
         .encrypted_column("id", DataType::Int)
@@ -225,6 +224,7 @@ fn test_compact_row_arity_mismatch_rejected() {
 #[test]
 fn test_table_schema_preserves_ddl_definition_order() {
     let table = TableSchema::builder("products")
+        .table_id(0)
         .primary_key("id", DataType::Int)
         .column("zebra", DataType::String)
         .column("alpha", DataType::Int)
@@ -234,10 +234,10 @@ fn test_table_schema_preserves_ddl_definition_order() {
 
     // Columns must be stored in DDL definition order (id, zebra, alpha, beta),
     // NOT alphabetical order (alpha, beta, id, zebra)!
-    assert_eq!(table.columns()[0].name, "id");
-    assert_eq!(table.columns()[1].name, "zebra");
-    assert_eq!(table.columns()[2].name, "alpha");
-    assert_eq!(table.columns()[3].name, "beta");
+    assert_eq!(table.columns()[0].name(), "id");
+    assert_eq!(table.columns()[1].name(), "zebra");
+    assert_eq!(table.columns()[2].name(), "alpha");
+    assert_eq!(table.columns()[3].name(), "beta");
 
     let row = RowBuilder::new()
         .set("id", 1i64)
@@ -282,6 +282,7 @@ fn test_schema_json_deserialization_from_tables_list() {
     let json = r#"{
         "tables": [
             {
+                "table_id": 0,
                 "name": "projects",
                 "primary_key": ["id"],
                 "columns": [
@@ -290,6 +291,7 @@ fn test_schema_json_deserialization_from_tables_list() {
                 ]
             },
             {
+                "table_id": 1,
                 "name": "tasks",
                 "primary_key": ["id"],
                 "columns": [
@@ -306,9 +308,8 @@ fn test_schema_json_deserialization_from_tables_list() {
     assert!(schema.has_table_by_name("projects"));
     assert!(schema.has_table_by_name("tasks"));
 
-    let projects_id = schema.get_table_id("projects").unwrap();
-    let tasks_id = schema.get_table_id("tasks").unwrap();
-    assert_ne!(projects_id, tasks_id);
+    assert_eq!(schema.get_table_id("projects"), Some(0));
+    assert_eq!(schema.get_table_id("tasks"), Some(1));
 
     let projects_table = schema.get_table_by_name("projects").unwrap();
     assert_eq!(projects_table.primary_key(), vec!["id"]);
@@ -318,6 +319,7 @@ fn test_schema_json_deserialization_from_tables_list() {
 #[test]
 fn test_table_schema_add_column_evolution() {
     let mut table = TableSchema::builder("kanban")
+        .table_id(0)
         .primary_key("id", DataType::Uuid)
         .column("title", DataType::String)
         .build()
@@ -331,10 +333,10 @@ fn test_table_schema_add_column_evolution() {
     let assigned_idx = table.add_column(priority_col).expect("should add column");
     assert_eq!(assigned_idx, 2);
     assert_eq!(table.columns().len(), 3);
-    assert_eq!(table.columns()[2].name, "priority");
+    assert_eq!(table.columns()[2].name(), "priority");
     assert_eq!(table.column_index("priority"), Some(2));
     assert_eq!(
-        table.get_column("priority").unwrap().data_type,
+        table.get_column("priority").unwrap().data_type(),
         DataType::Int
     );
 
@@ -372,6 +374,7 @@ fn test_table_schema_add_column_evolution() {
 #[test]
 fn test_compact_into_row_supports_schema_evolution_shorter_arity() {
     let mut table = TableSchema::builder("documents")
+        .table_id(0)
         .primary_key("id", DataType::Int)
         .column("title", DataType::String)
         .build()
@@ -414,6 +417,7 @@ fn test_compact_into_row_supports_schema_evolution_shorter_arity() {
 #[test]
 fn test_table_schema_validate_column_updates() {
     let table = TableSchema::builder("metrics")
+        .table_id(0)
         .primary_key("id", DataType::Int)
         .column("cpu", DataType::Float)
         .column("mem", DataType::Int)
@@ -659,27 +663,30 @@ fn test_table_schema_deserialize_rejects_duplicate_column() {
 }
 
 #[test]
-fn test_schema_add_table_rejects_duplicate_table_name() {
+fn test_schema_insert_table_rejects_duplicate_table_name() {
     let mut schema = Schema::new();
     let table1 = TableSchema::builder("users")
+        .table_id(0)
         .primary_key("id", DataType::Int)
         .build()
         .unwrap();
     let table2 = TableSchema::builder("users")
+        .table_id(1)
         .primary_key("user_id", DataType::Int)
         .build()
         .unwrap();
 
-    let id1 = schema.add_table(table1).expect("first table ok");
-    assert_eq!(id1, 0);
+    schema.insert_table(table1).expect("first table ok");
+    assert_eq!(schema.get_table_id("users"), Some(0));
 
-    let err = schema.add_table(table2).unwrap_err();
+    let err = schema.insert_table(table2).unwrap_err();
     assert_eq!(
         err,
         ValidationError::DuplicateTable {
             table: "users".to_string()
         }
     );
+    assert_eq!(schema.table_count(), 1);
 }
 
 #[test]
@@ -707,20 +714,16 @@ fn test_schema_deserialize_rejects_duplicate_table_name() {
 }
 
 #[test]
-fn test_schema_add_table_detects_id_overflow() {
-    let mut schema = Schema::new();
-    let mut table_max = TableSchema::builder("max_table")
-        .primary_key("id", DataType::Int)
-        .build()
-        .unwrap();
-    table_max.set_table_id(u16::MAX);
-    schema.add_table(table_max).unwrap();
+fn test_schema_builder_detects_id_overflow() {
+    let builder = Schema::builder().table(
+        TableSchema::builder("max_table")
+            .table_id(u16::MAX)
+            .primary_key("id", DataType::Int),
+    );
 
-    let next_table = TableSchema::builder("overflow_table")
-        .primary_key("id", DataType::Int)
-        .build()
-        .unwrap();
-    let err = schema.add_table(next_table).unwrap_err();
+    let err = builder
+        .try_table(TableSchema::builder("overflow_table").primary_key("id", DataType::Int))
+        .unwrap_err();
     assert_eq!(err, ValidationError::TableIdOverflow);
 }
 
@@ -739,4 +742,36 @@ fn test_validate_compact_row_op_unknown_pk_column_returns_error() {
             column: "ghost_col".to_string(),
         })
     );
+}
+
+/// Columns are addressed by a `u16` index (`ColumnUpdate::column_idx`, `add_column`'s result):
+/// a table holds at most `u16::MAX` columns.
+fn columns(count: usize) -> Vec<ColumnDef> {
+    (0..count)
+        .map(|i| ColumnDef::new(format!("c{i}"), DataType::Int))
+        .collect()
+}
+
+#[test]
+fn test_table_rejects_more_columns_than_a_u16_index_can_address() {
+    let at_limit = TableSchema::try_new(0, "wide", vec!["c0".to_string()], columns(65_535));
+    assert!(at_limit.is_ok());
+
+    let over = TableSchema::try_new(0, "wide", vec!["c0".to_string()], columns(65_536));
+    assert!(
+        matches!(over, Err(ValidationError::TooManyColumns { .. })),
+        "{over:?}"
+    );
+}
+
+#[test]
+fn test_add_column_rejects_a_column_past_the_u16_index_limit() {
+    let mut table =
+        TableSchema::try_new(0, "wide", vec!["c0".to_string()], columns(65_535)).unwrap();
+    let res = table.add_column(ColumnDef::new("extra", DataType::Int).nullable(true));
+    assert!(
+        matches!(res, Err(ValidationError::TooManyColumns { .. })),
+        "{res:?}"
+    );
+    assert_eq!(table.columns().len(), 65_535);
 }

@@ -18,6 +18,7 @@ use crate::blocking::blocking_io;
 use crate::config::ServerConfig;
 use crate::durable;
 use crate::error::ServerError;
+use crate::fail_point;
 use crate::log::{RoomLifecycleOverrides, RoomLifecyclePolicy};
 use crate::relay::SnapshotRelay;
 use crate::schema_registry::SchemaRegistry;
@@ -566,12 +567,19 @@ impl RoomManager {
         }
     }
 
-    /// Reloads the schema across all active rooms associated with `schema_id`.
-    pub async fn reload_schema_for_rooms(
-        &self,
-        schema_id: &SchemaId,
-        schema: Arc<zemdb_core::schema::Schema>,
-    ) -> Vec<RoomId> {
+    /// Sends the registry's current version of `schema_id` to every running room that uses
+    /// it, and returns the rooms that applied it.
+    ///
+    /// Each room gets the version the registry holds when the command is sent, read under the
+    /// room's spawn lock, not a version chosen by the caller. The registry only moves forward
+    /// and a room's commands are applied in the order they are sent, so concurrent reloads
+    /// (two column additions in a row) can arrive in any order without taking a room back to
+    /// an older schema: whichever is sent last carries the newest version.
+    pub async fn reload_schema_for_rooms(&self, schema_id: &SchemaId) -> Vec<RoomId> {
+        fail_point::hook(
+            "schema_reload_before_rooms",
+            &self.schema_registry.schema_path(schema_id),
+        );
         // The targets are collected first so that no map guard is held while waiting for the
         // actors: a concurrent writer to the same shard would otherwise block on the lock.
         // A room is listed here as soon as its metadata is resolved, before its actor reads the
@@ -593,11 +601,11 @@ impl RoomManager {
                 let Some(sender) = self.get_room(&room_id) else {
                     continue;
                 };
-                let (tx, rx) = oneshot::channel();
-                let cmd = RoomCommand::ReloadSchema {
-                    schema: Arc::clone(&schema),
-                    reply: tx,
+                let Some(schema) = self.schema_registry.get_schema(schema_id) else {
+                    continue;
                 };
+                let (tx, rx) = oneshot::channel();
+                let cmd = RoomCommand::ReloadSchema { schema, reply: tx };
                 if sender.send(cmd).await.is_err() {
                     continue;
                 }

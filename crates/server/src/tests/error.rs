@@ -35,6 +35,11 @@ fn each_error_maps_to_its_code_and_status() {
             StatusCode::GATEWAY_TIMEOUT,
         ),
         (
+            ServerError::SchemaAlreadyExists(String::new()),
+            ErrorCode::SchemaAlreadyExists,
+            StatusCode::CONFLICT,
+        ),
+        (
             ServerError::Internal(String::new()),
             ErrorCode::Internal,
             StatusCode::INTERNAL_SERVER_ERROR,

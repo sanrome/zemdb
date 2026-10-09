@@ -28,10 +28,8 @@ struct TestServer {
 fn test_schema() -> Schema {
     let table = TableSchema::builder("tasks")
         .primary_key("id", DataType::Int)
-        .column("title", DataType::String)
-        .build()
-        .unwrap();
-    Schema::from_tables(vec![table])
+        .column("title", DataType::String);
+    Schema::builder().table(table).build()
 }
 
 /// Starts a server with room `room` created and `ops` operations committed to it.

@@ -93,10 +93,10 @@
 | 6 | Ciclo de vida de clientes y señalización | DEF-53, 05, 27, 75, 76 (24 y 26 descartados) | Alta | ✅ 5/5 |
 | 7 | Protocolo wire y errores HTTP | DEF-46, 28, 11, 43, 64, 22, 71, 74 | Media | ✅ 8/8 |
 | 8 | Rendimiento, portabilidad y ciclo de vida de salas | DEF-50, 35, 55, 37, 08, 31(locks), 25(server), 72, 77, 79, 83, 86 (+73 adelantado) | Media | ✅ 12/12 |
-| 9 | Robustez e higiene de storage y core | DEF-14, 23, 49, 17, 25(storage), 18, 09, 45, 33, 44, 47, 30, 13, 20, 21, 57, 70, 78 (32 descartado) | Media/Baja | 9/18 (9a ✅) |
+| 9 | Robustez e higiene de storage y core | DEF-14, 23, 49, 17, 25(storage), 18, 09, 45, 33, 44, 47, 30, 13, 20, 21, 57, 70, 78 (32 descartado) | Media/Baja | ✅ 18/18 |
 | 10 | Diferido a Fase 4 / descartado | DEF-34, 54, 42, 56, 73, 81, 82, 84, 85 | — | — |
 
-**Avance total:** 70 de 79 ítems activos resueltos (DEF-73 pasó de diferido a hecho). Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
+**Avance total:** 79 de 79 ítems activos resueltos (DEF-73 pasó de diferido a hecho). Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
 
 **Severidades corregidas respecto de la auditoría anterior:** de los 7 "críticos" originales, solo DEF-01 lo es. DEF-02, 03 y 04 son Altos; DEF-05 y 06 son Medios; DEF-34 es Bajo. DEF-24, 26 y 56 son falsos en la práctica.
 
@@ -500,7 +500,7 @@ Tests dependientes de tiempos: `tiered_log_tests::test_tiered_log_behind_compact
 
 ## Lote 9 — Robustez e higiene de storage y core
 
-#### DEF-14 · Medio · ⬜
+#### DEF-14 · Medio · ✅ Hecho (9b)
 El centinela `table_id == 0` reasigna IDs. Es alcanzable vía JSON de admin con la tabla 0 fuera de orden, con una clave de mapa distinta del ID propio, o con IDs duplicados (que hoy se reasignan en silencio). Usar `Option<u16>` en el builder, y que la deserialización use una inserción estricta que falle ante colisión o desajuste, **nunca** `add_table` con auto-asignación.
 
 #### DEF-23 · Bajo · ✅ Hecho (9a)
@@ -524,10 +524,10 @@ Sin uso en producción. Eliminar `decode_wal_record_from_slice` y `WalReader::ne
 #### DEF-33 · Bajo · ✅ Hecho (Lote 7, al agregar `check_operation_size`)
 `encode_wal_batch` con un struct prestado (`ops: &[SequencedOperation]`). Serializa los mismos bytes.
 
-#### DEF-44, DEF-47, DEF-30 · Bajo/Info · ⬜
+#### DEF-44, DEF-47, DEF-30 · Bajo/Info · ✅ Hecho (9b)
 Una sola adquisición del lock en las consultas por nombre; renombrar el parámetro de `scan`; buscar por referencia antes de clonar la PK en `TableBuffer::apply` (el doc comment actual afirma lo contrario).
 
-#### DEF-13, DEF-20, DEF-21 · Bajo · ⬜
+#### DEF-13, DEF-20, DEF-21 · Bajo · ✅ Hecho (9b)
 Encapsulamiento (regla 5). DEF-13 necesita además `Schema::add_column`, porque `schema_registry.rs` usa `tables_by_id.get_mut`. Para DEF-20 no alcanza con hacer privado el campo: `get_mut`, `remove` y `Deserialize` permiten el mismo bypass. En DEF-21, `Operation` es un tipo wire que llega por `Deserialize`; la garantía real es `validate_operation`, que ya se ejecuta.
 
 #### DEF-70 · Bajo · ✅ Hecho (9a) (nuevo, revisión del Lote 2)
@@ -543,14 +543,24 @@ Encapsulamiento (regla 5). DEF-13 necesita además `Schema::add_column`, porque 
 - **Hallazgos de la revisión independiente, corregidos en el lote:** cancelar una compactación a mitad de la rotación perdía escrituras confirmadas (bug previo, reproducido); una carrera con el lock de compactación viejo podía dejar una sala imposible de reabrir; un fallo de sync del directorio tras rotar no marcaba la sala como fallida; `apply_snapshot` bloqueaba a los escritores mientras comprimía; un pánico a mitad de lote dejaba parte visible; el test intermitente del servidor era un test con margen de tiempo escaso.
 - **Dependencia nueva:** `imbl` (licencia MPL-2.0, distinta del MIT/Apache del proyecto; aprobada: se usa sin modificar, la MPL solo obliga a publicar cambios a sus propios archivos).
 
-#### DEF-78 · Bajo · ⬜ (nuevo, revisión del Lote 3)
+#### DEF-78 · Bajo · ✅ Hecho (9b) (nuevo, revisión del Lote 3)
 `SchemaRegistry::register_schema` y `add_column` no tienen lock por esquema: dos escrituras concurrentes sobre el mismo id comparten el mismo `.tmp`, y `add_column` es leer-modificar-escribir. Serializar las escrituras por id de esquema.
 
 #### DEF-32 · ❌ Descartado
 El input es un WAL local acotado por longitud y CRC, y bincode 1.3 ya valida longitudes contra el slice. **La solución propuesta rompería todos los WAL existentes**: se escriben con `bincode::serialize` (enteros de ancho fijo), y `DefaultOptions::new()` decodifica varints. Si alguna vez se agrega un límite, usar `.with_fixint_encoding().allow_trailing_bytes().with_limit(..)`.
 
-#### DEF-57 · Bajo · ⬜ (parcial ahora)
+#### DEF-57 · Bajo · ✅ Hecho (9b: parte de ahora; `zemdb-storage` se agrega en la Fase 4)
 `zemdb-client` no compila para wasm32 (tokio `full` arrastra mio). Ahora: quitar las dependencias `tokio` y `zstd`, que no se usan. Agregar `zemdb-storage` recién cuando haya código que lo necesite (Fase 4).
+
+
+#### Notas del Lote 9b
+- **Formato de esquema:** `{"tables":[...]}` en orden de id, con `deny_unknown_fields`, igual en JSON y binario. Sin mapa no hay clave que pueda contradecir el id. Leer un esquema nunca asigna ids (duplicado, faltante o campo desconocido → error; 400 por HTTP); solo `SchemaBuilder` asigna (máx+1). Un `TableBuilder` suelto exige id explícito.
+- **Sin compatibilidad hacia atrás:** por decisión del usuario, antes del primer release no se mantienen legibles los formatos en disco anteriores. Los `schemas/*.json` viejos (`tables_by_id`) ya no cargan.
+- **Encapsulamiento:** campos privados en `Schema`, `TableSchema`, `ColumnDef`, `Operation`, `ColumnUpdate` y `TableBuffer`; `Schema::add_column` es el único camino para evolucionar. `Operation` sigue llegando por `Deserialize`: la garantía real es `validate_operation`, y así está documentado. `zemdb-storage` ya no expone el estado interno de las salas.
+- **Registry:** un solo lock de escritura para todo el registry (los cambios de esquema son operaciones raras de admin; no hace falta un mapa de locks por id).
+- **Límites:** hasta 65.535 columnas por tabla (`MAX_COLUMNS`). La deserialización de `TableBuffer` rechaza updates con columnas desordenadas o repetidas.
+- **Hallazgos de la revisión independiente, corregidos en el lote (ambos previos):** `POST /admin/schemas` sobre un id existente lo reemplazaba entero (podía reasignar ids de tabla, borrar columnas o agregar obligatorias); ahora responde 409 `SchemaAlreadyExists` y la evolución va solo por `/columns`. Dos `add_column` simultáneos podían dejar una sala con el esquema viejo; ahora cada sala recibe la versión actual del registry y la recarga corre en su propia tarea.
+- **`zemdb-client`** compila para wasm32 y la CI lo verifica.
 
 ---
 

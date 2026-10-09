@@ -15,10 +15,8 @@ fn schema() -> Schema {
     let users = TableSchema::builder("users")
         .table_id(USERS)
         .primary_key("id", DataType::Int)
-        .column("name", DataType::String)
-        .build()
-        .unwrap();
-    Schema::from_tables(vec![users])
+        .column("name", DataType::String);
+    Schema::builder().table(users).build()
 }
 
 fn insert_key(seq: u64, key: i64) -> SequencedOperation {

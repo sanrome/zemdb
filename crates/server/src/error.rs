@@ -36,6 +36,10 @@ pub enum ServerError {
     #[error("Schema not found: {0}")]
     SchemaNotFound(String),
 
+    /// The schema id is already registered; schemas evolve only through `add_column`.
+    #[error("Schema already exists: {0}")]
+    SchemaAlreadyExists(String),
+
     #[error("Schema violation: {0}")]
     SchemaViolation(String),
 
@@ -121,6 +125,7 @@ impl ServerError {
             ServerError::RoomNotFound(_) => ErrorCode::RoomNotFound,
             ServerError::RoomAlreadyExists(_) => ErrorCode::RoomAlreadyExists,
             ServerError::SchemaNotFound(_) => ErrorCode::SchemaNotFound,
+            ServerError::SchemaAlreadyExists(_) => ErrorCode::SchemaAlreadyExists,
             ServerError::BehindCompaction => ErrorCode::BehindCompaction,
             ServerError::ClientNotRegistered(_) => ErrorCode::ClientNotRegistered,
             ServerError::RoomLocked(_) => ErrorCode::RoomLocked,
@@ -148,6 +153,7 @@ impl ServerError {
             ServerError::Forbidden(_) => StatusCode::FORBIDDEN,
             ServerError::RoomNotFound(_) | ServerError::SchemaNotFound(_) => StatusCode::NOT_FOUND,
             ServerError::RoomAlreadyExists(_)
+            | ServerError::SchemaAlreadyExists(_)
             | ServerError::SnapshotSuperseded(_)
             | ServerError::ClientNotRegistered(_) => StatusCode::CONFLICT,
             ServerError::ProtocolVersionMismatch(_)

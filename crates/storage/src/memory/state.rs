@@ -19,15 +19,15 @@ pub type Table = imbl::OrdMap<PrimaryKey, CompactRow>;
 ///
 /// Holds the room schema, monotonic head sequence number, and in-memory tables indexed by table_id.
 #[derive(Debug)]
-pub struct RoomState {
-    pub schema: Schema,
-    pub head_seq: SequenceNumber,
-    pub tables: HashMap<u16, Table>,
+pub(crate) struct RoomState {
+    pub(crate) schema: Schema,
+    pub(crate) head_seq: SequenceNumber,
+    pub(crate) tables: HashMap<u16, Table>,
 }
 
 impl RoomState {
     /// Creates a new `RoomState` initialized from a schema with empty tables.
-    pub fn new(schema: Schema) -> Self {
+    pub(crate) fn new(schema: Schema) -> Self {
         let tables = empty_tables(&schema);
         Self {
             schema,
@@ -40,10 +40,38 @@ impl RoomState {
 /// An empty table for every table of `schema`.
 pub(crate) fn empty_tables(schema: &Schema) -> HashMap<u16, Table> {
     schema
-        .tables_by_id
-        .keys()
-        .map(|table_id| (*table_id, Table::new()))
+        .table_ids()
+        .map(|table_id| (table_id, Table::new()))
         .collect()
+}
+
+/// A table named by the caller of a query, by name or by numeric id.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TableRef<'a> {
+    Name(&'a str),
+    Id(u16),
+}
+
+/// Resolves `table` to its id in `schema`, or `TableNotFound`.
+///
+/// Queries call it under the same read guard they then read the rows with, so the name is
+/// translated against the schema those rows belong to.
+pub(crate) fn resolve_table_id(
+    room_id: &RoomId,
+    schema: &Schema,
+    table: TableRef<'_>,
+) -> Result<u16, StorageError> {
+    let resolved = match table {
+        TableRef::Name(name) => schema.get_table_id(name),
+        TableRef::Id(id) => Some(id).filter(|id| schema.has_table_by_id(*id)),
+    };
+    resolved.ok_or_else(|| StorageError::TableNotFound {
+        room_id: room_id.clone(),
+        table: match table {
+            TableRef::Name(name) => name.to_string(),
+            TableRef::Id(id) => format!("id:{id}"),
+        },
+    })
 }
 
 /// Validates a batch against the room's schema and checks that its sequence numbers continue
@@ -55,10 +83,10 @@ pub(crate) fn validate_batch(
     ops: &[SequencedOperation],
 ) -> Result<(), StorageError> {
     for (expected_seq, op) in (head_seq.get() + 1..).zip(ops.iter()) {
-        if !schema.has_table_by_id(op.op.table_id) {
+        if !schema.has_table_by_id(op.op.table_id()) {
             return Err(StorageError::TableNotFound {
                 room_id: room_id.clone(),
-                table: format!("id:{}", op.op.table_id),
+                table: format!("id:{}", op.op.table_id()),
             });
         }
 
@@ -78,52 +106,54 @@ pub(crate) fn validate_batch(
 ///
 /// An update widens a row written under an older schema to the table's current width.
 pub(crate) fn apply_operation(tables: &mut HashMap<u16, Table>, schema: &Schema, op: Operation) {
-    let table = tables.entry(op.table_id).or_default();
-    match op.kind {
+    let table_id = op.table_id();
+    let table = tables.entry(table_id).or_default();
+    let (pk, kind) = op.into_pk_and_kind();
+    match kind {
         OperationKind::Insert { row } => {
-            table.insert(op.pk, row);
+            table.insert(pk, row);
         }
         OperationKind::Update { updates } => {
-            if let Some(existing) = table.get_mut(&op.pk) {
+            if let Some(existing) = table.get_mut(&pk) {
                 let target_len = schema
-                    .get_table_by_id(op.table_id)
+                    .get_table_by_id(table_id)
                     .map(|t| t.columns().len())
                     .unwrap_or(0);
                 for col_up in updates {
-                    let idx = col_up.column_idx as usize;
+                    let idx = col_up.column_idx() as usize;
                     let min_len = target_len.max(idx + 1);
                     if existing.len() < min_len {
                         existing.resize(min_len, Value::Null);
                     }
-                    existing[idx] = col_up.value;
+                    existing[idx] = col_up.into_value();
                 }
             }
         }
         OperationKind::Delete => {
-            table.remove(&op.pk);
+            table.remove(&pk);
         }
     }
 }
 
 /// In-memory snapshot payload serialized by reference to avoid copying tables during snapshot creation.
 #[derive(Debug, Serialize)]
-pub struct RoomSnapshotRef<'a> {
-    pub head_seq: SequenceNumber,
-    pub tables: &'a HashMap<u16, Table>,
+pub(crate) struct RoomSnapshotRef<'a> {
+    pub(crate) head_seq: SequenceNumber,
+    pub(crate) tables: &'a HashMap<u16, Table>,
 }
 
 /// Payload format for deserialized database snapshots.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct RoomSnapshotPayload {
-    pub head_seq: SequenceNumber,
-    pub tables: HashMap<u16, Table>,
+pub(crate) struct RoomSnapshotPayload {
+    pub(crate) head_seq: SequenceNumber,
+    pub(crate) tables: HashMap<u16, Table>,
 }
 
 impl RoomSnapshotPayload {
     /// Adds an empty table for every table of `schema` the snapshot does not contain.
     pub(crate) fn fill_missing_tables(&mut self, schema: &Schema) {
-        for table_id in schema.tables_by_id.keys() {
-            self.tables.entry(*table_id).or_default();
+        for table_id in schema.table_ids() {
+            self.tables.entry(table_id).or_default();
         }
     }
 }

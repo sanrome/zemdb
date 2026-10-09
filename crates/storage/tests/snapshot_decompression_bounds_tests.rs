@@ -73,9 +73,7 @@ fn payload_within_the_limit_roundtrips() {
 async fn disk_engine_applies_its_configured_snapshot_limit() {
     let table = TableSchema::builder("items")
         .table_id(1)
-        .primary_key("id", DataType::Int)
-        .build()
-        .unwrap();
+        .primary_key("id", DataType::Int);
     let schema = Schema::builder().table(table).build();
     let room_id = RoomId::new("bounded-room").unwrap();
 

@@ -92,10 +92,8 @@ impl LifecycleTestServer {
 fn create_test_schema() -> Schema {
     let table = TableSchema::builder("documents")
         .primary_key("doc_id", DataType::Int)
-        .column("content", DataType::String)
-        .build()
-        .expect("valid table schema");
-    Schema::from_tables(vec![table])
+        .column("content", DataType::String);
+    Schema::builder().table(table).build()
 }
 
 fn create_test_op(schema: &Schema, id: i64, content: &str) -> Operation {

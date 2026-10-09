@@ -91,10 +91,8 @@ fn create_test_schema() -> Schema {
     let table = TableSchema::builder("tasks")
         .primary_key("id", DataType::Int)
         .column("title", DataType::String)
-        .column("completed", DataType::Bool)
-        .build()
-        .expect("valid table schema");
-    Schema::from_tables(vec![table])
+        .column("completed", DataType::Bool);
+    Schema::builder().table(table).build()
 }
 
 fn create_insert_op(schema: &Schema, id: i64, title: &str) -> Operation {
@@ -166,7 +164,7 @@ async fn test_control_plane_schema_crud_and_auth() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let retrieved_schema: Schema = resp.json().await.unwrap();
-    assert_eq!(retrieved_schema.tables_by_id.len(), 1);
+    assert_eq!(retrieved_schema.table_count(), 1);
 
     // 5. Schema evolution: add nullable column via POST /admin/schemas/:id/columns
     let resp = server
@@ -1850,7 +1848,7 @@ async fn test_commit_ack_catchup_ops_content_ordering_and_contiguity() {
                     "Alpha was at last_ack_seq i-1, catchup_ops must contain its own sequenced op"
                 );
                 assert_eq!(catchup_ops[0].seq, SequenceNumber::new(i as u64));
-                assert_eq!(catchup_ops[0].op.pk, PrimaryKey::single(i));
+                assert_eq!(catchup_ops[0].op.pk(), &PrimaryKey::single(i));
             }
             other => panic!("Expected CommitAck, got {:?}", other),
         }
@@ -1904,14 +1902,14 @@ async fn test_commit_ack_catchup_ops_content_ordering_and_contiguity() {
                 );
                 if idx < 3 {
                     // Ops 3, 4, 5 from Alpha
-                    assert_eq!(seq_op.op.table_id, sent_ops[idx + 2].table_id);
-                    assert_eq!(seq_op.op.pk, sent_ops[idx + 2].pk);
-                    assert_eq!(seq_op.op.kind, sent_ops[idx + 2].kind);
+                    assert_eq!(seq_op.op.table_id(), sent_ops[idx + 2].table_id());
+                    assert_eq!(seq_op.op.pk(), sent_ops[idx + 2].pk());
+                    assert_eq!(seq_op.op.kind(), sent_ops[idx + 2].kind());
                 } else {
                     // Op 6 from Beta
-                    assert_eq!(seq_op.op.table_id, op_beta.table_id);
-                    assert_eq!(seq_op.op.pk, op_beta.pk);
-                    assert_eq!(seq_op.op.kind, op_beta.kind);
+                    assert_eq!(seq_op.op.table_id(), op_beta.table_id());
+                    assert_eq!(seq_op.op.pk(), op_beta.pk());
+                    assert_eq!(seq_op.op.kind(), op_beta.kind());
                 }
             }
         }
@@ -1954,7 +1952,7 @@ async fn test_commit_ack_catchup_ops_content_ordering_and_contiguity() {
                 "Gamma was up-to-date at seq 6, catchup_ops contains op 7"
             );
             assert_eq!(catchup_ops[0].seq, SequenceNumber::new(7));
-            assert_eq!(catchup_ops[0].op.pk, op_gamma.pk);
+            assert_eq!(catchup_ops[0].op.pk(), op_gamma.pk());
         }
         other => panic!("Expected CommitAck, got {:?}", other),
     }
@@ -1991,7 +1989,7 @@ async fn test_commit_ack_catchup_ops_content_ordering_and_contiguity() {
             assert_eq!(catchup_ops[2].seq, SequenceNumber::new(5));
             assert_eq!(catchup_ops[3].seq, SequenceNumber::new(6));
             assert_eq!(catchup_ops[4].seq, SequenceNumber::new(7));
-            assert_eq!(catchup_ops[3].op.pk, op_beta.pk);
+            assert_eq!(catchup_ops[3].op.pk(), op_beta.pk());
         }
         other => panic!("Expected CommitAck on idempotent retry, got {:?}", other),
     }

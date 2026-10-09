@@ -21,10 +21,8 @@ fn create_test_schema() -> Schema {
     let table = TableSchema::builder("tasks")
         .primary_key("id", DataType::Int)
         .column("title", DataType::String)
-        .column("completed", DataType::Bool)
-        .build()
-        .expect("valid table schema");
-    Schema::from_tables(vec![table])
+        .column("completed", DataType::Bool);
+    Schema::builder().table(table).build()
 }
 
 /// Five operations per segment, and segments that are compressed and pruned on the next

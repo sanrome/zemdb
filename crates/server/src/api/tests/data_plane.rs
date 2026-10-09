@@ -36,16 +36,14 @@ const WIDE_INT_COLUMNS: usize = 5000;
 fn schema() -> Schema {
     let tasks = TableSchema::builder("tasks")
         .primary_key("id", DataType::Int)
-        .nullable_column("title", DataType::String)
-        .build()
-        .unwrap();
+        .nullable_column("title", DataType::String);
     let mut wide = TableSchema::builder("wide")
         .primary_key("id", DataType::Int)
         .nullable_column("text", DataType::String);
     for i in 0..WIDE_INT_COLUMNS {
         wide = wide.nullable_column(format!("c{i}"), DataType::Int);
     }
-    Schema::from_tables(vec![tasks, wide.build().unwrap()])
+    Schema::builder().table(tasks).table(wide).build()
 }
 
 /// Insert into `tasks` with a title of `title_len` bytes.

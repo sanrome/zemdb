@@ -1,6 +1,6 @@
 use zemdb_core::{
-    CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequenceNumber,
-    SequencedOperation, TableSchema, Value,
+    CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequencedOperation, TableSchema,
+    Value,
 };
 use zemdb_storage::{
     DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, StorageEngine, StorageError,
@@ -12,10 +12,8 @@ fn schema() -> Schema {
     let users = TableSchema::builder("users")
         .table_id(USERS)
         .primary_key("id", DataType::Int)
-        .column("name", DataType::String)
-        .build()
-        .unwrap();
-    Schema::from_tables(vec![users])
+        .column("name", DataType::String);
+    Schema::builder().table(users).build()
 }
 
 fn insert(seq: u64, key: i64) -> SequencedOperation {
@@ -203,25 +201,4 @@ async fn memory_snapshot_requires_open_room() {
 async fn disk_snapshot_requires_open_room() {
     let dir = tempfile::tempdir().unwrap();
     snapshot_requires_open_room(&disk_engine(dir.path())).await;
-}
-
-#[tokio::test]
-async fn memory_snapshot_is_visible_through_room_handle_taken_before() {
-    let engine = MemoryStorageEngine::new();
-    let room = RoomId::new("held-handle").unwrap();
-    open_with_keys(&engine, &room, &[1]).await;
-    // A writer that looked up the room before the snapshot keeps this handle.
-    let handle = engine.get_room(&room).unwrap();
-
-    let snapshot = snapshot_with_keys(&[10, 11, 12]).await;
-    engine
-        .apply_snapshot(&room, schema(), &snapshot)
-        .await
-        .unwrap();
-
-    let state = handle.read().unwrap();
-    assert_eq!(state.head_seq, SequenceNumber::from(3u64));
-    assert!(state.tables[&USERS]
-        .get(&PrimaryKey::single(12i64))
-        .is_some());
 }

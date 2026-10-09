@@ -76,6 +76,10 @@ pub async fn get_schema(
 
 /// `POST /admin/schemas/:schema_id/columns`: Evolves a schema by appending a nullable column,
 /// automatically notifying all running room actors to reload the new schema in memory.
+///
+/// The reload runs in its own task: once the column is durable, every running room must get
+/// the new schema even if this request is dropped while the rooms are being reloaded. The
+/// handler still waits for it before answering.
 pub async fn add_column(
     _auth: AdminAuth,
     State(state): State<AppState>,
@@ -86,11 +90,13 @@ pub async fn add_column(
         .schema_registry
         .add_column(&sid, &req.table_name, req.column)?;
 
-    // Propagate schema evolution in hot memory across active rooms
-    state
-        .room_manager
-        .reload_schema_for_rooms(&sid, Arc::clone(&updated))
-        .await;
+    let room_manager = Arc::clone(&state.room_manager);
+    let reload = tokio::spawn(async move { room_manager.reload_schema_for_rooms(&sid).await });
+    // The column is durable, so the answer is a success either way; a reload task that failed
+    // only leaves its rooms to read the new schema from the registry when they respawn.
+    if let Err(err) = reload.await {
+        tracing::warn!(error = %err, "Schema reload task failed after a column was added");
+    }
 
     Ok(Json((*updated).clone()))
 }
@@ -143,3 +149,7 @@ pub async fn delete_room(
     state.room_manager.delete_room(&rid).await?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+#[path = "tests/control_plane.rs"]
+mod tests;

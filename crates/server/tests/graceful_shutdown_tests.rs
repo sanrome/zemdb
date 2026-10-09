@@ -14,10 +14,8 @@ use zemdb_server::{
 fn test_schema() -> Schema {
     let table = TableSchema::builder("tasks")
         .primary_key("id", DataType::Int)
-        .column("title", DataType::String)
-        .build()
-        .unwrap();
-    Schema::from_tables(vec![table])
+        .column("title", DataType::String);
+    Schema::builder().table(table).build()
 }
 
 fn insert_op(schema: &Schema, id: i64) -> Operation {

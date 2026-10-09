@@ -10,10 +10,8 @@ fn schema() -> Schema {
     let users = TableSchema::builder("users")
         .table_id(USERS)
         .primary_key("id", DataType::Int)
-        .column("name", DataType::String)
-        .build()
-        .unwrap();
-    Schema::from_tables(vec![users])
+        .column("name", DataType::String);
+    Schema::builder().table(users).build()
 }
 
 fn insert(seq: u64, key: i64) -> SequencedOperation {
@@ -51,4 +49,35 @@ async fn write_during_scan_shares_untouched_rows() {
         current.get(&key).unwrap()
     ));
     assert!(held.get(&PrimaryKey::single(5000i64)).is_none());
+}
+
+#[tokio::test]
+async fn snapshot_is_visible_through_room_handle_taken_before() {
+    let engine = MemoryStorageEngine::new();
+    let room = RoomId::new("held-handle").unwrap();
+    engine.open_room(&room, schema()).await.unwrap();
+    engine.apply_batch(&room, vec![insert(1, 1)]).await.unwrap();
+    // A writer that looked up the room before the snapshot keeps this handle.
+    let handle = engine.get_room(&room).unwrap();
+
+    let source = MemoryStorageEngine::new();
+    let source_room = RoomId::new("source").unwrap();
+    source.open_room(&source_room, schema()).await.unwrap();
+    let ops = [10, 11, 12]
+        .iter()
+        .enumerate()
+        .map(|(i, key)| insert(i as u64 + 1, *key))
+        .collect();
+    source.apply_batch(&source_room, ops).await.unwrap();
+    let snapshot = source.create_snapshot(&source_room).await.unwrap();
+    engine
+        .apply_snapshot(&room, schema(), &snapshot)
+        .await
+        .unwrap();
+
+    let state = handle.read().unwrap();
+    assert_eq!(state.head_seq, zemdb_core::SequenceNumber::from(3u64));
+    assert!(state.tables[&USERS]
+        .get(&PrimaryKey::single(12i64))
+        .is_some());
 }

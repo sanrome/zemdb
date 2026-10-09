@@ -185,11 +185,13 @@ fn test_protocol_binary_serialization_roundtrip() {
     assert_eq!(get_schema_msg, dec_get_schema);
 
     // Test Registered message with schema and schema_id roundtrip
-    let test_schema = Schema::from_tables(vec![TableSchema::builder("tasks")
-        .primary_key("id", DataType::Uuid)
-        .column("title", DataType::String)
-        .build()
-        .unwrap()]);
+    let test_schema = Schema::builder()
+        .table(
+            TableSchema::builder("tasks")
+                .primary_key("id", DataType::Uuid)
+                .column("title", DataType::String),
+        )
+        .build();
     let registered_msg = ServerMessage::Registered {
         correlation_id: CorrelationId::new(1004),
         room_id: RoomId::new("room-abc").unwrap(),

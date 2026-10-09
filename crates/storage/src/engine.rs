@@ -64,11 +64,12 @@ pub trait StorageEngine: EngineConcurrencyBounds {
         pk: &PrimaryKey,
     ) -> Result<Option<CompactRow>, StorageError>;
 
-    /// Scans a table using the specified options (key range, direction, limit, projection).
+    /// Scans a table identified by its name using the specified options (key range, direction,
+    /// limit, projection).
     async fn scan<'a>(
         &'a self,
         room_id: &RoomId,
-        table_id: &str,
+        table: &str,
         options: ScanOptions,
     ) -> Result<RowStream<'a>, StorageError>;
 

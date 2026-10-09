@@ -13,9 +13,7 @@ fn test_schema() -> Schema {
         .primary_key("id", DataType::Int)
         .column("name", DataType::String)
         .column("score", DataType::Int)
-        .column("active", DataType::Bool)
-        .build()
-        .expect("valid users table");
+        .column("active", DataType::Bool);
 
     Schema::builder().table(users).build()
 }
@@ -308,9 +306,7 @@ async fn test_dynamic_column_update_resizing_memory() {
         .primary_key("id", DataType::Int)
         .column("name", DataType::String)
         .nullable_column("score", DataType::Int)
-        .nullable_column("note", DataType::String)
-        .build()
-        .unwrap();
+        .nullable_column("note", DataType::String);
 
     let schema = Schema::builder().table(users_table).build();
     engine.open_room(&room_id, schema).await.unwrap();

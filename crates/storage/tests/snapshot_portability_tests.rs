@@ -10,9 +10,7 @@ fn sample_schema() -> Schema {
         .table_id(1)
         .primary_key("id", DataType::Int)
         .column("name", DataType::String)
-        .nullable_column("price", DataType::Int)
-        .build()
-        .expect("valid table schema");
+        .nullable_column("price", DataType::Int);
     Schema::builder().table(table).build()
 }
 

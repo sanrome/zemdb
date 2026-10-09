@@ -18,9 +18,7 @@ fn test_schema() -> Schema {
         .primary_key("id", DataType::Int)
         .column("name", DataType::String)
         .column("score", DataType::Int)
-        .column("active", DataType::Bool)
-        .build()
-        .expect("valid users table");
+        .column("active", DataType::Bool);
 
     Schema::builder().table(users).build()
 }
@@ -469,10 +467,10 @@ async fn test_disk_blind_update_ignored() {
     engine.open_room(&room_id, schema).await.unwrap();
 
     // Send update for non-existent row
-    let updates = vec![zemdb_core::ColumnUpdate {
-        column_idx: 1,
-        value: Value::String("NonExistent".into()),
-    }];
+    let updates = vec![zemdb_core::ColumnUpdate::new(
+        1,
+        Value::String("NonExistent".into()),
+    )];
     let update_op = vec![SequencedOperation::with_default_origin(
         1u64,
         Operation::update(USERS_TABLE, PrimaryKey::single(999i64), updates, 100),
@@ -567,9 +565,7 @@ async fn test_dynamic_column_update_resizing_disk_and_wal_recovery() {
         .primary_key("id", DataType::Int)
         .column("name", DataType::String)
         .nullable_column("score", DataType::Int)
-        .nullable_column("note", DataType::String)
-        .build()
-        .unwrap();
+        .nullable_column("note", DataType::String);
 
     let schema = Schema::builder().table(users_table).build();
     engine.open_room(&room_id, schema.clone()).await.unwrap();

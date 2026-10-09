@@ -1,6 +1,9 @@
-pub mod state;
+pub(crate) mod state;
 
-pub use state::{RoomSnapshotPayload, RoomSnapshotRef, RoomState, Table};
+pub use state::Table;
+pub(crate) use state::{RoomSnapshotPayload, RoomSnapshotRef, RoomState};
+
+use state::{resolve_table_id, TableRef};
 
 use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
@@ -32,7 +35,11 @@ impl MemoryStorageEngine {
     }
 
     /// Fast lookup of a room's isolated state handle without holding the engine map lock.
-    pub fn get_room(&self, room_id: &RoomId) -> Result<Arc<RwLock<RoomState>>, StorageError> {
+    /// Internal: the state changes only through the validating `StorageEngine` methods.
+    pub(crate) fn get_room(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Arc<RwLock<RoomState>>, StorageError> {
         let rooms = self
             .rooms
             .read()
@@ -43,165 +50,32 @@ impl MemoryStorageEngine {
             .map(Arc::clone)
             .ok_or_else(|| StorageError::RoomNotFound(room_id.clone()))
     }
-}
 
-struct MemoryScanState {
-    table_data: Table,
-    range: KeyRange,
-    direction: ScanDirection,
-    projection: Option<Vec<u16>>,
-    remaining_limit: Option<usize>,
-    cursor: Option<PrimaryKey>,
-    exhausted: bool,
-    buffer: VecDeque<Result<(PrimaryKey, CompactRow), StorageError>>,
-}
-
-#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
-#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-impl StorageEngine for MemoryStorageEngine {
-    #[tracing::instrument(skip(self, schema), fields(room_id = %room_id))]
-    async fn open_room(&self, room_id: &RoomId, schema: Schema) -> Result<(), StorageError> {
-        let mut rooms = self
-            .rooms
-            .write()
-            .map_err(|e| StorageError::Other(format!("Engine lock poisoned: {e}")))?;
-
-        if rooms.contains_key(room_id) {
-            return Err(StorageError::RoomAlreadyOpen(room_id.clone()));
-        }
-
-        rooms.insert(
-            room_id.clone(),
-            Arc::new(RwLock::new(RoomState::new(schema))),
-        );
-        tracing::info!(room_id = %room_id, "Opened in-memory room");
-        Ok(())
-    }
-
-    #[tracing::instrument(skip(self), fields(room_id = %room_id))]
-    async fn close_room(&self, room_id: &RoomId) -> Result<(), StorageError> {
-        let mut rooms = self
-            .rooms
-            .write()
-            .map_err(|e| StorageError::Other(format!("Engine lock poisoned: {e}")))?;
-
-        if rooms.remove(room_id).is_some() {
-            tracing::info!(room_id = %room_id, "Closed in-memory room");
-            Ok(())
-        } else {
-            Err(StorageError::RoomNotFound(room_id.clone()))
-        }
-    }
-
-    #[tracing::instrument(skip(self, ops), fields(room_id = %room_id, ops_count = ops.len()))]
-    async fn apply_batch(
+    /// Point lookup behind `get` and `get_by_id`: resolves the table and reads the row under
+    /// a single read lock of the room.
+    fn get_row(
         &self,
         room_id: &RoomId,
-        ops: Vec<SequencedOperation>,
-    ) -> Result<SequenceNumber, StorageError> {
-        let room_arc = self.get_room(room_id)?;
-        let mut room_guard = room_arc
-            .write()
-            .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
-
-        let RoomState {
-            ref schema,
-            ref mut head_seq,
-            ref mut tables,
-        } = *room_guard;
-
-        // 1. Validate schema and strict monotonic sequence
-        state::validate_batch(room_id, schema, *head_seq, &ops)?;
-
-        // 2. Apply operations to in-memory tables
-        for SequencedOperation { seq, op } in ops {
-            state::apply_operation(tables, schema, op);
-            if seq > *head_seq {
-                *head_seq = seq;
-            }
-        }
-
-        tracing::debug!(room_id = %room_id, new_head_seq = %head_seq, "Applied batch to in-memory room");
-        Ok(*head_seq)
-    }
-
-    async fn get(
-        &self,
-        room_id: &RoomId,
-        table: &str,
-        pk: &PrimaryKey,
-    ) -> Result<Option<CompactRow>, StorageError> {
-        let room_arc = self.get_room(room_id)?;
-        let table_id = {
-            let room_state = room_arc
-                .read()
-                .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
-
-            room_state
-                .schema
-                .get_table_id(table)
-                .ok_or_else(|| StorageError::TableNotFound {
-                    room_id: room_id.clone(),
-                    table: table.to_string(),
-                })?
-        };
-
-        self.get_by_id(room_id, table_id, pk).await
-    }
-
-    async fn get_by_id(
-        &self,
-        room_id: &RoomId,
-        table_id: u16,
+        table: TableRef<'_>,
         pk: &PrimaryKey,
     ) -> Result<Option<CompactRow>, StorageError> {
         let room_arc = self.get_room(room_id)?;
         let room_state = room_arc
             .read()
             .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
-
-        if !room_state.schema.has_table_by_id(table_id) {
-            return Err(StorageError::TableNotFound {
-                room_id: room_id.clone(),
-                table: format!("id:{}", table_id),
-            });
-        }
-
-        let row = room_state
+        let table_id = resolve_table_id(room_id, &room_state.schema, table)?;
+        Ok(room_state
             .tables
             .get(&table_id)
-            .and_then(|t| t.get(pk).cloned());
-        Ok(row)
+            .and_then(|t| t.get(pk).cloned()))
     }
 
-    async fn scan<'a>(
+    /// Scan behind `scan` and `scan_by_id`: resolves the table and takes its rows under a
+    /// single read lock of the room.
+    fn scan_table<'a>(
         &'a self,
         room_id: &RoomId,
-        table: &str,
-        options: ScanOptions,
-    ) -> Result<RowStream<'a>, StorageError> {
-        let room_arc = self.get_room(room_id)?;
-        let table_id = {
-            let room_state = room_arc
-                .read()
-                .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
-
-            room_state
-                .schema
-                .get_table_id(table)
-                .ok_or_else(|| StorageError::TableNotFound {
-                    room_id: room_id.clone(),
-                    table: table.to_string(),
-                })?
-        };
-
-        self.scan_by_id(room_id, table_id, options).await
-    }
-
-    async fn scan_by_id<'a>(
-        &'a self,
-        room_id: &RoomId,
-        table_id: u16,
+        table: TableRef<'_>,
         options: ScanOptions,
     ) -> Result<RowStream<'a>, StorageError> {
         let room_arc = self.get_room(room_id)?;
@@ -209,13 +83,7 @@ impl StorageEngine for MemoryStorageEngine {
             let room_state = room_arc
                 .read()
                 .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
-
-            if !room_state.schema.has_table_by_id(table_id) {
-                return Err(StorageError::TableNotFound {
-                    room_id: room_id.clone(),
-                    table: format!("id:{}", table_id),
-                });
-            }
+            let table_id = resolve_table_id(room_id, &room_state.schema, table)?;
 
             // An O(1) clone that shares the table's nodes; writes during the scan copy only the
             // nodes they change.
@@ -305,6 +173,123 @@ impl StorageEngine for MemoryStorageEngine {
         });
 
         Ok(Box::pin(stream))
+    }
+}
+
+struct MemoryScanState {
+    table_data: Table,
+    range: KeyRange,
+    direction: ScanDirection,
+    projection: Option<Vec<u16>>,
+    remaining_limit: Option<usize>,
+    cursor: Option<PrimaryKey>,
+    exhausted: bool,
+    buffer: VecDeque<Result<(PrimaryKey, CompactRow), StorageError>>,
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl StorageEngine for MemoryStorageEngine {
+    #[tracing::instrument(skip(self, schema), fields(room_id = %room_id))]
+    async fn open_room(&self, room_id: &RoomId, schema: Schema) -> Result<(), StorageError> {
+        let mut rooms = self
+            .rooms
+            .write()
+            .map_err(|e| StorageError::Other(format!("Engine lock poisoned: {e}")))?;
+
+        if rooms.contains_key(room_id) {
+            return Err(StorageError::RoomAlreadyOpen(room_id.clone()));
+        }
+
+        rooms.insert(
+            room_id.clone(),
+            Arc::new(RwLock::new(RoomState::new(schema))),
+        );
+        tracing::info!(room_id = %room_id, "Opened in-memory room");
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self), fields(room_id = %room_id))]
+    async fn close_room(&self, room_id: &RoomId) -> Result<(), StorageError> {
+        let mut rooms = self
+            .rooms
+            .write()
+            .map_err(|e| StorageError::Other(format!("Engine lock poisoned: {e}")))?;
+
+        if rooms.remove(room_id).is_some() {
+            tracing::info!(room_id = %room_id, "Closed in-memory room");
+            Ok(())
+        } else {
+            Err(StorageError::RoomNotFound(room_id.clone()))
+        }
+    }
+
+    #[tracing::instrument(skip(self, ops), fields(room_id = %room_id, ops_count = ops.len()))]
+    async fn apply_batch(
+        &self,
+        room_id: &RoomId,
+        ops: Vec<SequencedOperation>,
+    ) -> Result<SequenceNumber, StorageError> {
+        let room_arc = self.get_room(room_id)?;
+        let mut room_guard = room_arc
+            .write()
+            .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
+
+        let RoomState {
+            ref schema,
+            ref mut head_seq,
+            ref mut tables,
+        } = *room_guard;
+
+        // 1. Validate schema and strict monotonic sequence
+        state::validate_batch(room_id, schema, *head_seq, &ops)?;
+
+        // 2. Apply operations to in-memory tables
+        for SequencedOperation { seq, op } in ops {
+            state::apply_operation(tables, schema, op);
+            if seq > *head_seq {
+                *head_seq = seq;
+            }
+        }
+
+        tracing::debug!(room_id = %room_id, new_head_seq = %head_seq, "Applied batch to in-memory room");
+        Ok(*head_seq)
+    }
+
+    async fn get(
+        &self,
+        room_id: &RoomId,
+        table: &str,
+        pk: &PrimaryKey,
+    ) -> Result<Option<CompactRow>, StorageError> {
+        self.get_row(room_id, TableRef::Name(table), pk)
+    }
+
+    async fn get_by_id(
+        &self,
+        room_id: &RoomId,
+        table_id: u16,
+        pk: &PrimaryKey,
+    ) -> Result<Option<CompactRow>, StorageError> {
+        self.get_row(room_id, TableRef::Id(table_id), pk)
+    }
+
+    async fn scan<'a>(
+        &'a self,
+        room_id: &RoomId,
+        table: &str,
+        options: ScanOptions,
+    ) -> Result<RowStream<'a>, StorageError> {
+        self.scan_table(room_id, TableRef::Name(table), options)
+    }
+
+    async fn scan_by_id<'a>(
+        &'a self,
+        room_id: &RoomId,
+        table_id: u16,
+        options: ScanOptions,
+    ) -> Result<RowStream<'a>, StorageError> {
+        self.scan_table(room_id, TableRef::Id(table_id), options)
     }
 
     async fn get_head_seq(&self, room_id: &RoomId) -> Result<SequenceNumber, StorageError> {

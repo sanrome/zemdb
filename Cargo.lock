@@ -1980,9 +1980,7 @@ dependencies = [
  "bytes",
  "serde",
  "thiserror 1.0.69",
- "tokio",
  "zemdb-core",
- "zstd",
 ]
 
 [[package]]

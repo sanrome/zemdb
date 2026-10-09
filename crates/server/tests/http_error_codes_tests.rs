@@ -35,12 +35,9 @@ async fn start_server() -> TestServer {
     });
     let schema_registry = Arc::new(SchemaRegistry::new(data_dir.join("schemas")).unwrap());
     let schema_id = SchemaId::new("tasks").unwrap();
-    let table = TableSchema::builder("tasks")
-        .primary_key("id", DataType::Int)
-        .build()
-        .unwrap();
+    let table = TableSchema::builder("tasks").primary_key("id", DataType::Int);
     schema_registry
-        .register_schema(schema_id.clone(), Schema::from_tables(vec![table]))
+        .register_schema(schema_id.clone(), Schema::builder().table(table).build())
         .unwrap();
     let relay = Arc::new(
         SnapshotRelay::new(
@@ -308,10 +305,9 @@ async fn register_token_checks_tell_authentication_from_authorization() {
 async fn unregistered_client_gets_client_not_registered() {
     let server = start_server().await;
     let token = valid_token("alice", "room-a");
-    let schema = Schema::from_tables(vec![TableSchema::builder("tasks")
-        .primary_key("id", DataType::Int)
-        .build()
-        .unwrap()]);
+    let schema = Schema::builder()
+        .table(TableSchema::builder("tasks").primary_key("id", DataType::Int))
+        .build();
     let row = RowBuilder::new().set("id", 1i64).build();
 
     let requests = [

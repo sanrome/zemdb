@@ -148,7 +148,7 @@ async fn replay_wal_file(
                 )));
             }
 
-            if schema.has_table_by_id(op.op.table_id) {
+            if schema.has_table_by_id(op.op.table_id()) {
                 apply_operation(tables, schema, op.op);
             }
 

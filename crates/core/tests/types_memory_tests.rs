@@ -58,6 +58,7 @@ fn test_uuid_data_type_primary_key_and_parsing() {
 
     // Schema with UUID primary key
     let items_table = TableSchema::builder("items")
+        .table_id(0)
         .primary_key("id", DataType::Uuid)
         .column("title", DataType::String)
         .build()

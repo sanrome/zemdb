@@ -43,10 +43,10 @@ fn test_tiered_log_write_through_and_crash_recovery() {
     for (idx, op) in deltas.iter().enumerate() {
         let expected_seq = idx as u64 + 1;
         assert_eq!(op.seq.get(), expected_seq);
-        assert_eq!(op.op.table_id, 1);
+        assert_eq!(op.op.table_id(), 1);
         assert_eq!(
-            op.op.pk,
-            PrimaryKey::single(Value::Int(expected_seq as i64))
+            op.op.pk(),
+            &PrimaryKey::single(Value::Int(expected_seq as i64))
         );
     }
 }

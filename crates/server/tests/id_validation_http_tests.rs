@@ -41,14 +41,11 @@ async fn start_server() -> TestServer {
         ..ServerConfig::default()
     });
     let schema_registry = Arc::new(SchemaRegistry::new(data_dir.join("schemas")).unwrap());
-    let table = TableSchema::builder("tasks")
-        .primary_key("id", DataType::Int)
-        .build()
-        .unwrap();
+    let table = TableSchema::builder("tasks").primary_key("id", DataType::Int);
     schema_registry
         .register_schema(
             SchemaId::new("tasks-schema").unwrap(),
-            Schema::from_tables(vec![table]),
+            Schema::builder().table(table).build(),
         )
         .unwrap();
     let relay = Arc::new(

@@ -22,7 +22,7 @@ use crate::disk::recovery::recover_room;
 use crate::disk::wal::WalWriter;
 use crate::engine::{apply_scan_transforms, RowStream, StorageEngine};
 use crate::error::StorageError;
-use crate::memory::state::{apply_operation, validate_batch};
+use crate::memory::state::{apply_operation, resolve_table_id, validate_batch, TableRef};
 use crate::memory::{RoomSnapshotPayload, RoomSnapshotRef, Table};
 use crate::options::{KeyRange, ScanDirection, ScanOptions};
 use crate::snapshot::DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES;
@@ -249,6 +249,118 @@ impl DiskStorageEngine {
     /// Compatibility helper returning the room's WAL file path.
     pub fn room_file_path(&self, room_id: &RoomId) -> PathBuf {
         self.wal_file_path(room_id)
+    }
+
+    /// Point lookup behind `get` and `get_by_id`: resolves the table and reads the row under
+    /// a single read lock of the room's state.
+    async fn get_row(
+        &self,
+        room_id: &RoomId,
+        table: TableRef<'_>,
+        pk: &PrimaryKey,
+    ) -> Result<Option<CompactRow>, StorageError> {
+        let room = self.get_room(room_id).await?;
+        let state = room.state.read().await;
+        let table_id = resolve_table_id(room_id, &state.schema, table)?;
+        Ok(state.tables.get(&table_id).and_then(|t| t.get(pk).cloned()))
+    }
+
+    /// Scan behind `scan` and `scan_by_id`: resolves the table and takes its rows under a
+    /// single read lock of the room's state.
+    async fn scan_table<'a>(
+        &'a self,
+        room_id: &RoomId,
+        table: TableRef<'_>,
+        options: ScanOptions,
+    ) -> Result<RowStream<'a>, StorageError> {
+        let room = self.get_room(room_id).await?;
+        let table_data = {
+            let state = room.state.read().await;
+            let table_id = resolve_table_id(room_id, &state.schema, table)?;
+            // An O(1) clone that shares the table's nodes; writes during the scan copy only the
+            // nodes they change.
+            state.tables.get(&table_id).cloned().unwrap_or_default()
+        };
+
+        let state = DiskScanState {
+            table_data,
+            range: options.range,
+            direction: options.direction,
+            projection: options.projection,
+            remaining_limit: options.limit,
+            cursor: None,
+            exhausted: false,
+            buffer: VecDeque::new(),
+        };
+
+        let stream = futures::stream::unfold(state, |mut state| async move {
+            if let Some(item) = state.buffer.pop_front() {
+                return Some((item, state));
+            }
+
+            if state.exhausted || state.remaining_limit == Some(0) {
+                return None;
+            }
+
+            const BATCH_SIZE: usize = 64;
+            let batch_limit = match state.remaining_limit {
+                Some(limit) => limit.min(BATCH_SIZE),
+                None => BATCH_SIZE,
+            };
+
+            let batch_items: Vec<Result<(PrimaryKey, CompactRow), StorageError>> = match state
+                .direction
+            {
+                ScanDirection::Forward => {
+                    let (start_bound, end_bound) = match &state.cursor {
+                        Some(cur) => (std::ops::Bound::Excluded(cur), state.range.end_bound()),
+                        None => (state.range.start_bound(), state.range.end_bound()),
+                    };
+                    let iter = state
+                        .table_data
+                        .range::<_, PrimaryKey>((start_bound, end_bound));
+                    apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
+                        .collect()
+                }
+                ScanDirection::Backward => {
+                    let (start_bound, end_bound) = match &state.cursor {
+                        Some(cur) => (state.range.start_bound(), std::ops::Bound::Excluded(cur)),
+                        None => (state.range.start_bound(), state.range.end_bound()),
+                    };
+                    let iter = state
+                        .table_data
+                        .range::<_, PrimaryKey>((start_bound, end_bound))
+                        .rev();
+                    apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
+                        .collect()
+                }
+            };
+
+            let count = batch_items.len();
+            if count == 0 {
+                return None;
+            }
+
+            if count < batch_limit {
+                state.exhausted = true;
+            }
+
+            if let Some(Ok((last_pk, _))) = batch_items.last() {
+                state.cursor = Some(last_pk.clone());
+            }
+
+            if let Some(rem) = state.remaining_limit.as_mut() {
+                *rem = rem.saturating_sub(count);
+                if *rem == 0 {
+                    state.exhausted = true;
+                }
+            }
+
+            state.buffer.extend(batch_items);
+            state.buffer.pop_front().map(|item| (item, state))
+        });
+
+        Ok(Box::pin(stream))
     }
 
     /// Fast lookup of an open room handle.
@@ -482,19 +594,7 @@ impl StorageEngine for DiskStorageEngine {
         table: &str,
         pk: &PrimaryKey,
     ) -> Result<Option<CompactRow>, StorageError> {
-        let room = self.get_room(room_id).await?;
-        let table_id = {
-            let state = room.state.read().await;
-            state
-                .schema
-                .get_table_id(table)
-                .ok_or_else(|| StorageError::TableNotFound {
-                    room_id: room_id.clone(),
-                    table: table.to_string(),
-                })?
-        };
-
-        self.get_by_id(room_id, table_id, pk).await
+        self.get_row(room_id, TableRef::Name(table), pk).await
     }
 
     async fn get_by_id(
@@ -503,18 +603,7 @@ impl StorageEngine for DiskStorageEngine {
         table_id: u16,
         pk: &PrimaryKey,
     ) -> Result<Option<CompactRow>, StorageError> {
-        let room = self.get_room(room_id).await?;
-        let state = room.state.read().await;
-
-        if !state.schema.has_table_by_id(table_id) {
-            return Err(StorageError::TableNotFound {
-                room_id: room_id.clone(),
-                table: format!("id:{}", table_id),
-            });
-        }
-
-        let row = state.tables.get(&table_id).and_then(|t| t.get(pk).cloned());
-        Ok(row)
+        self.get_row(room_id, TableRef::Id(table_id), pk).await
     }
 
     async fn scan<'a>(
@@ -523,19 +612,8 @@ impl StorageEngine for DiskStorageEngine {
         table: &str,
         options: ScanOptions,
     ) -> Result<RowStream<'a>, StorageError> {
-        let room = self.get_room(room_id).await?;
-        let table_id = {
-            let state = room.state.read().await;
-            state
-                .schema
-                .get_table_id(table)
-                .ok_or_else(|| StorageError::TableNotFound {
-                    room_id: room_id.clone(),
-                    table: table.to_string(),
-                })?
-        };
-
-        self.scan_by_id(room_id, table_id, options).await
+        self.scan_table(room_id, TableRef::Name(table), options)
+            .await
     }
 
     async fn scan_by_id<'a>(
@@ -544,99 +622,8 @@ impl StorageEngine for DiskStorageEngine {
         table_id: u16,
         options: ScanOptions,
     ) -> Result<RowStream<'a>, StorageError> {
-        let room = self.get_room(room_id).await?;
-        let table_data = {
-            let state = room.state.read().await;
-            if !state.schema.has_table_by_id(table_id) {
-                return Err(StorageError::TableNotFound {
-                    room_id: room_id.clone(),
-                    table: format!("id:{}", table_id),
-                });
-            }
-            // An O(1) clone that shares the table's nodes; writes during the scan copy only the
-            // nodes they change.
-            state.tables.get(&table_id).cloned().unwrap_or_default()
-        };
-
-        let state = DiskScanState {
-            table_data,
-            range: options.range,
-            direction: options.direction,
-            projection: options.projection,
-            remaining_limit: options.limit,
-            cursor: None,
-            exhausted: false,
-            buffer: VecDeque::new(),
-        };
-
-        let stream = futures::stream::unfold(state, |mut state| async move {
-            if let Some(item) = state.buffer.pop_front() {
-                return Some((item, state));
-            }
-
-            if state.exhausted || state.remaining_limit == Some(0) {
-                return None;
-            }
-
-            const BATCH_SIZE: usize = 64;
-            let batch_limit = match state.remaining_limit {
-                Some(limit) => limit.min(BATCH_SIZE),
-                None => BATCH_SIZE,
-            };
-
-            let batch_items: Vec<Result<(PrimaryKey, CompactRow), StorageError>> = match state
-                .direction
-            {
-                ScanDirection::Forward => {
-                    let (start_bound, end_bound) = match &state.cursor {
-                        Some(cur) => (std::ops::Bound::Excluded(cur), state.range.end_bound()),
-                        None => (state.range.start_bound(), state.range.end_bound()),
-                    };
-                    let iter = state
-                        .table_data
-                        .range::<_, PrimaryKey>((start_bound, end_bound));
-                    apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
-                        .collect()
-                }
-                ScanDirection::Backward => {
-                    let (start_bound, end_bound) = match &state.cursor {
-                        Some(cur) => (state.range.start_bound(), std::ops::Bound::Excluded(cur)),
-                        None => (state.range.start_bound(), state.range.end_bound()),
-                    };
-                    let iter = state
-                        .table_data
-                        .range::<_, PrimaryKey>((start_bound, end_bound))
-                        .rev();
-                    apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
-                        .collect()
-                }
-            };
-
-            let count = batch_items.len();
-            if count == 0 {
-                return None;
-            }
-
-            if count < batch_limit {
-                state.exhausted = true;
-            }
-
-            if let Some(Ok((last_pk, _))) = batch_items.last() {
-                state.cursor = Some(last_pk.clone());
-            }
-
-            if let Some(rem) = state.remaining_limit.as_mut() {
-                *rem = rem.saturating_sub(count);
-                if *rem == 0 {
-                    state.exhausted = true;
-                }
-            }
-
-            state.buffer.extend(batch_items);
-            state.buffer.pop_front().map(|item| (item, state))
-        });
-
-        Ok(Box::pin(stream))
+        self.scan_table(room_id, TableRef::Id(table_id), options)
+            .await
     }
 
     async fn get_head_seq(&self, room_id: &RoomId) -> Result<SequenceNumber, StorageError> {

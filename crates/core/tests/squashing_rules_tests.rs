@@ -6,9 +6,7 @@ fn sample_schema() -> Schema {
         .column("name", DataType::String)
         .column("age", DataType::Int)
         .nullable_column("bio", DataType::String)
-        .encrypted_column("secret_chat", DataType::String)
-        .build()
-        .expect("valid table schema");
+        .encrypted_column("secret_chat", DataType::String);
 
     Schema::builder().table(users).build()
 }
@@ -36,11 +34,11 @@ fn test_squash_insert_then_update() {
     let outcome = client_squash_operations(&mut base_op, incoming);
     assert_eq!(outcome, SquashOutcome::Merged);
 
-    if let OperationKind::Insert { row } = &base_op.kind {
+    if let OperationKind::Insert { row } = base_op.kind() {
         let restored = table.from_compact_row(row).unwrap();
         assert_eq!(restored.get("age"), Some(&Value::Int(26)));
         assert_eq!(restored.get("name"), Some(&Value::String("Alice".into())));
-        assert_eq!(base_op.timestamp, 100);
+        assert_eq!(base_op.timestamp(), 100);
     } else {
         panic!("Expected OperationKind::Insert");
     }
@@ -69,12 +67,12 @@ fn test_squash_update_then_update_field_merge() {
     let outcome = client_squash_operations(&mut base_op, incoming);
     assert_eq!(outcome, SquashOutcome::Merged);
 
-    if let OperationKind::Update { updates } = &base_op.kind {
+    if let OperationKind::Update { updates } = base_op.kind() {
         let fields = table.expand_update_fields(updates).unwrap();
         assert_eq!(fields.len(), 2);
         assert_eq!(fields.get("name"), Some(&Value::String("Alice".into())));
         assert_eq!(fields.get("age"), Some(&Value::Int(30)));
-        assert_eq!(base_op.timestamp, 105);
+        assert_eq!(base_op.timestamp(), 105);
     } else {
         panic!("Expected OperationKind::Update");
     }
@@ -153,7 +151,7 @@ fn test_squash_older_insert_into_newer_update_preserves_data() {
     assert_eq!(outcome, SquashOutcome::Merged);
 
     // The target must have been converted to an Insert, keeping the base fields and newer update fields!
-    if let OperationKind::Insert { row } = &target_op.kind {
+    if let OperationKind::Insert { row } = target_op.kind() {
         let restored = table.from_compact_row(row).unwrap();
         assert_eq!(restored.get("id"), Some(&Value::Int(42)));
         assert_eq!(
@@ -161,7 +159,7 @@ fn test_squash_older_insert_into_newer_update_preserves_data() {
             Some(&Value::String("Older Alice".into()))
         );
         assert_eq!(restored.get("age"), Some(&Value::Int(35))); // Newer update field won!
-        assert_eq!(target_op.timestamp, 200);
+        assert_eq!(target_op.timestamp(), 200);
     } else {
         panic!("Expected target to be OperationKind::Insert");
     }
@@ -205,7 +203,7 @@ fn test_table_buffer_partitioned_squashing() {
 
     // Verify squashed Alice
     let alice_op = buffer.get(&PrimaryKey::single(1i64)).unwrap();
-    if let OperationKind::Insert { row } = &alice_op.kind {
+    if let OperationKind::Insert { row } = alice_op.kind() {
         let restored = table.from_compact_row(row).unwrap();
         assert_eq!(restored.get("age"), Some(&Value::Int(26)));
     } else {
@@ -260,9 +258,9 @@ fn test_two_pointer_column_merge_linear() {
 
     merge_sorted_column_updates(&mut existing, incoming, true);
 
-    let indices: Vec<u16> = existing.iter().map(|u| u.column_idx).collect();
+    let indices: Vec<u16> = existing.iter().map(|u| u.column_idx()).collect();
     assert_eq!(indices, vec![0, 1, 3, 4, 5, 6]);
-    assert_eq!(existing[2].value, Value::String("new".into())); // incoming won
+    assert_eq!(existing[2].value(), &Value::String("new".into())); // incoming won
 }
 
 #[test]
@@ -291,14 +289,113 @@ fn test_squash_rule_1_stale_update_discarded() {
     assert_eq!(outcome, SquashOutcome::Discarded);
 
     // Verify row data and timestamp unchanged
-    if let OperationKind::Insert { row } = &base_insert.kind {
+    if let OperationKind::Insert { row } = base_insert.kind() {
         let restored = table.from_compact_row(row).unwrap();
         assert_eq!(
             restored.get("name"),
             Some(&Value::String("Alice New".into()))
         );
-        assert_eq!(base_insert.timestamp, 200);
+        assert_eq!(base_insert.timestamp(), 200);
     } else {
         panic!("Expected Insert");
     }
+}
+
+/// Bincode layout of a `TableBuffer`: the table id followed by the list of pending
+/// operations, each stored under its own primary key once decoded.
+#[derive(serde::Serialize)]
+struct RawTableBuffer {
+    table_id: u16,
+    pending: Vec<Operation>,
+}
+
+fn decode_buffer(raw: &RawTableBuffer) -> Result<TableBuffer, bincode::Error> {
+    bincode::deserialize(&bincode::serialize(raw).unwrap())
+}
+
+#[test]
+fn table_buffer_deserialization_rejects_operation_of_another_table() {
+    let raw = RawTableBuffer {
+        table_id: 1,
+        pending: vec![Operation::delete(2, PrimaryKey::single(1i64), 10)],
+    };
+    assert!(decode_buffer(&raw).is_err());
+}
+
+#[test]
+fn table_buffer_deserialization_rejects_repeated_primary_key() {
+    let pk = PrimaryKey::single(1i64);
+    let raw = RawTableBuffer {
+        table_id: 1,
+        pending: vec![
+            Operation::delete(1, pk.clone(), 10),
+            Operation::delete(1, pk, 20),
+        ],
+    };
+    assert!(decode_buffer(&raw).is_err());
+}
+
+#[test]
+fn table_buffer_round_trips_through_bincode() {
+    let schema = sample_schema();
+    let table = schema.get_table_by_name("users").unwrap();
+    let mut buffer = TableBuffer::new(table.table_id());
+    for id in 1..=3i64 {
+        let row = RowBuilder::new()
+            .set("id", id)
+            .set("name", "n")
+            .set("age", id)
+            .set("secret_chat", vec![1, 2, 3])
+            .build();
+        buffer
+            .apply(table.to_operation_insert(&row, 100).unwrap())
+            .unwrap();
+    }
+
+    let decoded: TableBuffer = bincode::deserialize(&bincode::serialize(&buffer).unwrap()).unwrap();
+    assert_eq!(decoded, buffer);
+}
+
+/// Bincode layout of an `Operation`, which the constructors cannot produce with unsorted
+/// update deltas but a serialized buffer can contain.
+#[derive(serde::Serialize)]
+struct RawOperation {
+    table_id: u16,
+    timestamp: u64,
+    pk: PrimaryKey,
+    kind: OperationKind,
+}
+
+fn decode_buffer_with_update(column_indices: &[u16]) -> Result<TableBuffer, bincode::Error> {
+    #[derive(serde::Serialize)]
+    struct RawBuffer {
+        table_id: u16,
+        pending: Vec<RawOperation>,
+    }
+    let updates = column_indices
+        .iter()
+        .map(|idx| ColumnUpdate::new(*idx, Value::Int(1)))
+        .collect();
+    let raw = RawBuffer {
+        table_id: 1,
+        pending: vec![RawOperation {
+            table_id: 1,
+            timestamp: 10,
+            pk: PrimaryKey::single(1i64),
+            kind: OperationKind::Update { updates },
+        }],
+    };
+    bincode::deserialize(&bincode::serialize(&raw).unwrap())
+}
+
+#[test]
+fn table_buffer_deserialization_rejects_unsorted_update_deltas() {
+    assert!(decode_buffer_with_update(&[1, 3]).is_ok());
+    // Squashing merges deltas assuming strictly ascending column indices.
+    assert!(decode_buffer_with_update(&[3, 1]).is_err());
+}
+
+#[test]
+fn table_buffer_deserialization_rejects_repeated_update_column() {
+    assert!(decode_buffer_with_update(&[2, 2]).is_err());
 }

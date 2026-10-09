@@ -6,10 +6,18 @@ use serde::{Deserialize, Deserializer, Serialize};
 use smallvec::SmallVec;
 use std::collections::BTreeMap;
 
+/// Maximum number of columns of a table. Columns are addressed by a `u16` positional index
+/// (`ColumnUpdate::column_idx`, the result of `add_column`), so every index must fit in it.
+pub const MAX_COLUMNS: usize = u16::MAX as usize;
+
 /// Builder for constructing TableSchema instances declaratively.
+///
+/// The table id is explicit ([`TableBuilder::table_id`]) or, when the builder is handed to
+/// [`SchemaBuilder::table`](super::SchemaBuilder::table), assigned by the schema builder.
+/// There is no default id: [`TableBuilder::build`] requires an explicit one.
 #[derive(Debug, Clone)]
 pub struct TableBuilder {
-    table_id: u16,
+    table_id: Option<u16>,
     name: String,
     primary_key: Vec<String>,
     columns: Vec<ColumnDef>,
@@ -18,7 +26,7 @@ pub struct TableBuilder {
 impl TableBuilder {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
-            table_id: 0,
+            table_id: None,
             name: name.into(),
             primary_key: Vec::new(),
             columns: Vec::new(),
@@ -27,8 +35,13 @@ impl TableBuilder {
 
     /// Sets an explicit table_id for this table.
     pub fn table_id(mut self, id: u16) -> Self {
-        self.table_id = id;
+        self.table_id = Some(id);
         self
+    }
+
+    /// The id set with [`TableBuilder::table_id`], if any.
+    pub(crate) fn explicit_table_id(&self) -> Option<u16> {
+        self.table_id
     }
 
     /// Declares a primary key column, recording both its name and data type.
@@ -87,9 +100,20 @@ impl TableBuilder {
         self
     }
 
-    /// Validates and builds the TableSchema.
+    /// Validates and builds the TableSchema. The table id must have been set explicitly;
+    /// otherwise this fails with `ValidationError::MissingTableId`.
     pub fn build(self) -> Result<TableSchema, ValidationError> {
-        TableSchema::try_new(self.table_id, self.name, self.primary_key, self.columns)
+        let table_id = self
+            .table_id
+            .ok_or_else(|| ValidationError::MissingTableId {
+                table: self.name.clone(),
+            })?;
+        self.build_with_id(table_id)
+    }
+
+    /// Validates and builds the TableSchema with `table_id`.
+    pub(crate) fn build_with_id(self, table_id: u16) -> Result<TableSchema, ValidationError> {
+        TableSchema::try_new(table_id, self.name, self.primary_key, self.columns)
     }
 }
 
@@ -105,7 +129,7 @@ pub struct TableSchema {
     primary_key: Vec<String>,
     columns: Vec<ColumnDef>,
     #[serde(skip)]
-    pub(crate) column_indices: BTreeMap<String, usize>,
+    column_indices: BTreeMap<String, usize>,
 }
 
 impl<'de> Deserialize<'de> for TableSchema {
@@ -113,9 +137,11 @@ impl<'de> Deserialize<'de> for TableSchema {
     where
         D: Deserializer<'de>,
     {
+        // `table_id` has no default: a table read from JSON or disk keeps exactly the id it was
+        // written with, and one without an id is rejected rather than numbered on the fly.
         #[derive(Deserialize)]
+        #[serde(rename = "TableSchema", deny_unknown_fields)]
         struct TableSchemaHelper {
-            #[serde(default)]
             table_id: u16,
             name: String,
             primary_key: Vec<String>,
@@ -158,10 +184,6 @@ impl TableSchema {
         &self.column_indices
     }
 
-    pub fn set_table_id(&mut self, table_id: u16) {
-        self.table_id = table_id;
-    }
-
     /// Validates all structural schema invariants and constructs a `TableSchema`.
     pub fn try_new(
         table_id: u16,
@@ -172,6 +194,12 @@ impl TableSchema {
         let name = name.into();
         if primary_key.is_empty() {
             return Err(ValidationError::EmptyPrimaryKeyDefinition(name));
+        }
+        if columns.len() > MAX_COLUMNS {
+            return Err(ValidationError::TooManyColumns {
+                table: name,
+                max: MAX_COLUMNS,
+            });
         }
 
         let mut column_indices = BTreeMap::new();
@@ -243,6 +271,13 @@ impl TableSchema {
     /// Preserves physical column order and updates secondary column indexing.
     /// Returns the assigned positional 0-indexed column index (`u16`).
     pub fn add_column(&mut self, col: ColumnDef) -> Result<u16, ValidationError> {
+        if self.columns.len() >= MAX_COLUMNS {
+            return Err(ValidationError::TooManyColumns {
+                table: self.name.clone(),
+                max: MAX_COLUMNS,
+            });
+        }
+
         if self.column_indices.contains_key(&col.name) {
             return Err(ValidationError::DuplicateColumn {
                 table: self.name.clone(),

@@ -12,6 +12,4 @@ zemdb-core = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
 bytes = { workspace = true }
-zstd = { workspace = true }

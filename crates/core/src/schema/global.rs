@@ -1,15 +1,22 @@
-use super::table::TableSchema;
+use super::column::ColumnDef;
+use super::table::{TableBuilder, TableSchema};
 use super::validation::{self, ValidationError};
 use crate::mutation::Operation;
 use crate::value::{PrimaryKey, Row, Value};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::de;
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 
-/// Builder for constructing Schema instances declaratively.
+/// Builder for constructing Schema instances programmatically.
+///
+/// The only place where table ids are assigned automatically: a table added without an
+/// explicit id ([`TableBuilder::table_id`]) gets the id after the largest one in the schema so
+/// far, or 0 for the first table. An explicit id is kept exactly as given, and an id or a name
+/// that is already taken is an error; no table is ever renumbered.
 #[derive(Debug, Clone, Default)]
 pub struct SchemaBuilder {
-    tables_by_id: BTreeMap<u16, TableSchema>,
-    id_by_name: BTreeMap<String, u16>,
+    schema: Schema,
 }
 
 impl SchemaBuilder {
@@ -17,47 +24,62 @@ impl SchemaBuilder {
         Self::default()
     }
 
-    pub fn try_table(mut self, mut table: TableSchema) -> Result<Self, ValidationError> {
-        if self.id_by_name.contains_key(table.name()) {
-            return Err(ValidationError::DuplicateTable {
-                table: table.name().to_string(),
-            });
-        }
-        if self.tables_by_id.contains_key(&table.table_id())
-            || (table.table_id() == 0 && !self.tables_by_id.is_empty())
-        {
-            let next_id = self
-                .tables_by_id
-                .keys()
-                .max()
-                .map_or(Some(0), |m| m.checked_add(1))
-                .ok_or(ValidationError::TableIdOverflow)?;
-            table.set_table_id(next_id);
-        }
-        self.id_by_name
-            .insert(table.name().to_string(), table.table_id());
-        self.tables_by_id.insert(table.table_id(), table);
+    /// Validates and adds a table, assigning the next free id if the builder has none.
+    pub fn try_table(mut self, table: TableBuilder) -> Result<Self, ValidationError> {
+        let table_id = match table.explicit_table_id() {
+            Some(id) => id,
+            None => self.schema.next_table_id()?,
+        };
+        let table = table.build_with_id(table_id)?;
+        self.schema.insert_table(table)?;
         Ok(self)
     }
 
-    pub fn table(self, table: TableSchema) -> Self {
+    pub fn table(self, table: TableBuilder) -> Self {
         self.try_table(table).expect("valid table schema")
     }
 
     pub fn build(self) -> Schema {
-        Schema {
-            tables_by_id: self.tables_by_id,
-            id_by_name: self.id_by_name,
-        }
+        self.schema
     }
 }
 
 /// Global database schema containing all tables in a Room with bidirectional ID/Name indexing.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize)]
+///
+/// Both maps are private and change only through [`Schema::insert_table`] and
+/// [`Schema::add_column`], which keep them consistent: every table is stored under its own
+/// `table_id`, ids and names are unique, and `id_by_name` indexes exactly the stored tables.
+///
+/// Serialized form (JSON and binary): `{"tables": [table, ...]}`, in ascending `table_id`
+/// order, each table carrying its own `table_id`. Deserialization inserts the tables through
+/// the same strict path: a repeated id or name, a table without an id, or an unknown field is
+/// an error, and no id is ever assigned or changed while reading.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Schema {
-    pub tables_by_id: BTreeMap<u16, TableSchema>,
-    #[serde(skip)]
-    pub id_by_name: BTreeMap<String, u16>,
+    tables_by_id: BTreeMap<u16, TableSchema>,
+    id_by_name: BTreeMap<String, u16>,
+}
+
+impl Serialize for Schema {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        struct Tables<'a>(&'a BTreeMap<u16, TableSchema>);
+
+        impl Serialize for Tables<'_> {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.collect_seq(self.0.values())
+            }
+        }
+
+        let mut state = serializer.serialize_struct("Schema", 1)?;
+        state.serialize_field("tables", &Tables(&self.tables_by_id))?;
+        state.end()
+    }
 }
 
 impl<'de> Deserialize<'de> for Schema {
@@ -65,36 +87,13 @@ impl<'de> Deserialize<'de> for Schema {
     where
         D: Deserializer<'de>,
     {
-        if deserializer.is_human_readable() {
-            #[derive(Deserialize)]
-            struct HumanSchemaHelper {
-                #[serde(default)]
-                tables_by_id: BTreeMap<u16, TableSchema>,
-                #[serde(default)]
-                tables: Vec<TableSchema>,
-            }
-            let helper = HumanSchemaHelper::deserialize(deserializer)?;
-            if !helper.tables.is_empty() {
-                Schema::try_from_tables(helper.tables).map_err(serde::de::Error::custom)
-            } else {
-                let mut schema = Schema::new();
-                for (_, table) in helper.tables_by_id {
-                    schema.add_table(table).map_err(serde::de::Error::custom)?;
-                }
-                Ok(schema)
-            }
-        } else {
-            #[derive(Deserialize)]
-            struct BinarySchemaHelper {
-                tables_by_id: BTreeMap<u16, TableSchema>,
-            }
-            let helper = BinarySchemaHelper::deserialize(deserializer)?;
-            let mut schema = Schema::new();
-            for (_, table) in helper.tables_by_id {
-                schema.add_table(table).map_err(serde::de::Error::custom)?;
-            }
-            Ok(schema)
+        #[derive(Deserialize)]
+        #[serde(rename = "Schema", deny_unknown_fields)]
+        struct SchemaHelper {
+            tables: Vec<TableSchema>,
         }
+        let helper = SchemaHelper::deserialize(deserializer)?;
+        Schema::try_from_tables(helper.tables).map_err(de::Error::custom)
     }
 }
 
@@ -110,44 +109,77 @@ impl Schema {
         SchemaBuilder::new()
     }
 
-    /// Validates and constructs a Schema from an iterable of TableSchema, auto-assigning IDs and building indexes.
+    /// Validates and constructs a Schema from tables that already carry their ids.
+    ///
+    /// Each table keeps its own `table_id`; a repeated id or name is an error.
     pub fn try_from_tables(
         tables: impl IntoIterator<Item = TableSchema>,
     ) -> Result<Self, ValidationError> {
         let mut schema = Schema::new();
         for table in tables {
-            schema.add_table(table)?;
+            schema.insert_table(table)?;
         }
         Ok(schema)
     }
 
-    /// Constructs a Schema from an iterable of TableSchema, auto-assigning IDs and building indexes.
+    /// Constructs a Schema from tables that already carry their ids. Panics on a repeated id
+    /// or name; see [`Schema::try_from_tables`].
     pub fn from_tables(tables: impl IntoIterator<Item = TableSchema>) -> Self {
         Self::try_from_tables(tables).expect("valid table schemas")
     }
 
-    pub fn add_table(&mut self, mut table: TableSchema) -> Result<u16, ValidationError> {
+    /// Adds `table` under its own `table_id`. Fails, changing nothing, if the id or the name
+    /// is already used by another table.
+    pub fn insert_table(&mut self, table: TableSchema) -> Result<(), ValidationError> {
         if self.id_by_name.contains_key(table.name()) {
             return Err(ValidationError::DuplicateTable {
                 table: table.name().to_string(),
             });
         }
-        if self.tables_by_id.contains_key(&table.table_id())
-            || (table.table_id() == 0 && !self.tables_by_id.is_empty())
-        {
-            let next_id = self
-                .tables_by_id
-                .keys()
-                .max()
-                .map_or(Some(0), |m| m.checked_add(1))
-                .ok_or(ValidationError::TableIdOverflow)?;
-            table.set_table_id(next_id);
+        if self.tables_by_id.contains_key(&table.table_id()) {
+            return Err(ValidationError::DuplicateTableId {
+                table: table.name().to_string(),
+                table_id: table.table_id(),
+            });
         }
-        let assigned_id = table.table_id();
         self.id_by_name
-            .insert(table.name().to_string(), assigned_id);
-        self.tables_by_id.insert(assigned_id, table);
-        Ok(assigned_id)
+            .insert(table.name().to_string(), table.table_id());
+        self.tables_by_id.insert(table.table_id(), table);
+        Ok(())
+    }
+
+    /// Appends a nullable column to the table `table_name` (append-only schema evolution, see
+    /// [`TableSchema::add_column`]). Returns the column's positional index.
+    pub fn add_column(&mut self, table_name: &str, col: ColumnDef) -> Result<u16, ValidationError> {
+        let table = self
+            .id_by_name
+            .get(table_name)
+            .and_then(|id| self.tables_by_id.get_mut(id))
+            .ok_or_else(|| ValidationError::TableNotFound(table_name.to_string()))?;
+        table.add_column(col)
+    }
+
+    /// The id a table added without an explicit one receives: one past the largest id.
+    fn next_table_id(&self) -> Result<u16, ValidationError> {
+        match self.tables_by_id.keys().next_back() {
+            None => Ok(0),
+            Some(max) => max.checked_add(1).ok_or(ValidationError::TableIdOverflow),
+        }
+    }
+
+    /// The tables of the schema in ascending `table_id` order.
+    pub fn tables(&self) -> impl Iterator<Item = &TableSchema> + '_ {
+        self.tables_by_id.values()
+    }
+
+    /// The table ids of the schema in ascending order.
+    pub fn table_ids(&self) -> impl Iterator<Item = u16> + '_ {
+        self.tables_by_id.keys().copied()
+    }
+
+    /// Number of tables in the schema.
+    pub fn table_count(&self) -> usize {
+        self.tables_by_id.len()
     }
 
     pub fn get_table_by_id(&self, table_id: u16) -> Option<&TableSchema> {
