@@ -17,7 +17,6 @@ use crate::disk::format::{FileHeader, HEADER_SIZE};
 use crate::error::StorageError;
 use crate::fail_point;
 use crate::memory::RoomSnapshotPayload;
-use crate::sys::sync_dir;
 
 /// Recovery result containing the reconstructed in-memory state and the open WAL file handle.
 #[derive(Debug)]
@@ -350,9 +349,7 @@ pub async fn recover_room(
             .await?;
         snap_file.write_all(&header.encode()).await?;
         snap_file.sync_all().await?;
-        if let Some(parent) = snap_path.parent() {
-            sync_dir(parent)?;
-        }
+        sync_parent(snap_path).await?;
     }
 
     // Clean up any lingering temporary snapshot files from interrupted compactions
@@ -418,7 +415,7 @@ pub async fn recover_room(
 
         fail_point::check("recovery.fold_cleanup", wal_path)?;
         remove_if_exists(&wal_compacting_path).await?;
-        sync_parent(&wal_compacting_path)?;
+        sync_parent(&wal_compacting_path).await?;
     }
 
     wal_file.seek(SeekFrom::End(0)).await?;

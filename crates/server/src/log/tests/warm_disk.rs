@@ -40,11 +40,15 @@ fn empty_existing_active_wal_still_rotates() {
 
     let sealed = log.rotate_active_segment().unwrap();
 
-    assert!(sealed.is_some());
-    let segments = log.list_sealed_segments().unwrap();
-    assert_eq!(segments.len(), 1);
-    assert_eq!(segments[0].start_seq.get(), 1);
-    assert_eq!(segments[0].end_seq.get(), 3);
+    assert_eq!(
+        sealed,
+        Some(
+            dir.path()
+                .join("segment_0000000000000001_0000000000000003.wal")
+        )
+    );
+    assert!(sealed.unwrap().exists());
+    assert!(!dir.path().join("active.wal").exists());
 }
 
 #[test]

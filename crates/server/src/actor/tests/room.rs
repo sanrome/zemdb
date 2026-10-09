@@ -2,6 +2,7 @@ use super::*;
 use crate::actor::lease::ClientEntry;
 use crate::actor::manager::RoomManager;
 use crate::fail_point;
+use crate::log::io_probe::{self, IoEvent};
 use crate::log::RoomLifecycleOverrides;
 use crate::schema_registry::SchemaRegistry;
 use std::fs;
@@ -14,6 +15,14 @@ use zemdb_core::schema::TableSchema;
 use zemdb_core::value::{DataType, PrimaryKey, RowBuilder, Value};
 
 const POLL_CEILING: Duration = Duration::from_secs(10);
+
+/// Timings of the rooms under test: both maintenance ticks every 500 ms, so that tests waiting
+/// in real time for a tick stay fast.
+const TEST_TIMINGS: ActorTimings = ActorTimings {
+    designation_timeout: DESIGNATION_TIMEOUT,
+    fast_tick: Duration::from_millis(500),
+    slow_tick: Duration::from_millis(500),
+};
 
 fn test_schema() -> Schema {
     let table = TableSchema::builder("tasks")
@@ -57,17 +66,17 @@ impl Fixture {
     }
 
     /// A fixture whose room has the lifecycle overrides `policy`, whose server configuration
-    /// is adjusted by `configure` and, if given, whose designated snapshot uploaders time out
-    /// after `designation_timeout`.
+    /// is adjusted by `configure` and whose actor runs with `timings` ([`TEST_TIMINGS`] if not
+    /// given).
     async fn with_options(
         policy: RoomLifecycleOverrides,
         configure: impl FnOnce(&mut ServerConfig),
-        designation_timeout: Option<Duration>,
+        timings: Option<ActorTimings>,
     ) -> Self {
         let dir = tempdir().unwrap();
         let (mut manager, relay) = new_manager_with(&dir, configure);
-        if let Some(timeout) = designation_timeout {
-            manager.set_designation_timeout(timeout);
+        if let Some(timings) = timings {
+            manager.set_timings(timings);
         }
         let room_id = RoomId::new("room").unwrap();
         manager
@@ -137,10 +146,9 @@ fn new_manager_with(
         )
         .unwrap(),
     );
-    (
-        RoomManager::new(config, registry, Arc::clone(&relay)),
-        relay,
-    )
+    let mut manager = RoomManager::new(config, registry, Arc::clone(&relay));
+    manager.set_timings(TEST_TIMINGS);
+    (manager, relay)
 }
 
 async fn register(sender: &mpsc::Sender<RoomCommand>, client_id: &ClientId) {
@@ -1249,8 +1257,15 @@ async fn upload_chunk(fx: &Fixture, n: u64, index: u32) -> bool {
 
 #[tokio::test]
 async fn designee_that_does_not_upload_in_time_is_replaced_but_never_during_an_upload() {
-    let fx =
-        Fixture::with_options(small_segments(), |_| {}, Some(DESIGNATION_TIMEOUT_IN_TESTS)).await;
+    let fx = Fixture::with_options(
+        small_segments(),
+        |_| {},
+        Some(ActorTimings {
+            designation_timeout: DESIGNATION_TIMEOUT_IN_TESTS,
+            ..TEST_TIMINGS
+        }),
+    )
+    .await;
     let (writer, tail) = prune_with_writer(&fx).await;
     let sender = fx.sender().await;
     let peer = ClientId::new("peer").unwrap();
@@ -1537,7 +1552,7 @@ async fn commands_queued_when_the_room_goes_idle_are_handled() {
         config,
         RoomLifecyclePolicy::default(),
         Arc::clone(&fx.relay),
-        DESIGNATION_TIMEOUT,
+        ActorTimings::default(),
     )
     .unwrap();
 
@@ -1571,7 +1586,7 @@ async fn commands_queued_when_the_room_goes_idle_are_handled() {
         .await
         .unwrap();
 
-    actor.drain_for_idle_shutdown().await;
+    assert!(actor.drain_for_idle_shutdown().await.is_continue());
 
     // Nothing more is accepted; what was queued was handled normally.
     assert!(sender.is_closed());
@@ -1589,5 +1604,219 @@ async fn commands_queued_when_the_room_goes_idle_are_handled() {
     let sender = fx.sender().await;
     assert_eq!(cursor(&sender, &client).await, Some(seq(0)));
     assert_eq!(metrics(&sender).await.head_seq, seq(1));
+    fx.manager.shutdown_all().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn disk_maintenance_waits_for_the_slow_tick() {
+    let fx = Fixture::with_options(
+        RoomLifecycleOverrides {
+            ram_max_ops: Some(2),
+            warm_disk_ttl_secs: Some(0),
+            ..RoomLifecycleOverrides::default()
+        },
+        |_| {},
+        Some(ActorTimings::default()),
+    )
+    .await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    // Seals segment 1..=2, which may be compressed at once.
+    commit(&sender, &client, mutation(1), seq(0), insert_op(1))
+        .await
+        .unwrap();
+    commit(&sender, &client, mutation(2), seq(1), insert_op(2))
+        .await
+        .unwrap();
+    let segments = fx.room_dir().join("segments");
+    let warm = segments.join("segment_0000000000000001_0000000000000002.wal");
+    let cold = segments.join("segment_0000000000000001_0000000000000002.wal.zst");
+
+    // The fast tick persists the cursor reported by the commit, and leaves the disk alone.
+    tokio::time::sleep(FAST_TICK_PERIOD + Duration::from_millis(100)).await;
+    assert_eq!(fx.persisted_cursor(&client), Some(seq(1)));
+    assert!(warm.exists() && !cold.exists());
+
+    tokio::time::sleep(SLOW_TICK_PERIOD).await;
+    assert!(!warm.exists() && cold.exists());
+    fx.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn reopening_reads_only_the_segments_needed_for_ram_and_dedup() {
+    let fx = Fixture::with_options(
+        small_segments(),
+        |config| config.dedup_lru_capacity = 3,
+        None,
+    )
+    .await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    // Five sealed segments of two operations; active.wal is empty.
+    for n in 1..=10u8 {
+        commit(&sender, &client, mutation(n), seq(0), insert_op(n.into()))
+            .await
+            .unwrap();
+    }
+    fx.manager.shutdown_all().await;
+    let segments = fx.room_dir().join("segments");
+    let reads_before = io_probe::count(IoEvent::SegmentRead, &segments);
+
+    let sender = fx.sender().await;
+
+    // The last three mutation ids are in the two newest segments.
+    assert_eq!(
+        io_probe::count(IoEvent::SegmentRead, &segments) - reads_before,
+        2
+    );
+    // Hydrated oldest first: 8 is the least recently used and the first to be evicted.
+    let new = commit(&sender, &client, mutation(11), seq(0), insert_op(11))
+        .await
+        .unwrap();
+    assert_eq!(new.assigned_seq, seq(11));
+    for n in [9u8, 10, 11] {
+        let retry = commit(&sender, &client, mutation(n), seq(0), insert_op(n.into()))
+            .await
+            .unwrap();
+        assert_eq!(retry.assigned_seq, seq(n.into()), "retry of mutation {n}");
+    }
+    let evicted = commit(&sender, &client, mutation(8), seq(0), insert_op(8))
+        .await
+        .unwrap();
+    assert_eq!(evicted.assigned_seq, seq(12));
+    fx.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn disconnected_client_behind_ttl_compaction_becomes_dormant_and_is_behind_the_log() {
+    let dir = tempdir().unwrap();
+    let (manager, _relay) = new_manager_with(&dir, |_| {});
+    // Segments of five operations, compressed after 100 ms and pruned 200 ms later.
+    let manager = manager.with_default_policy(RoomLifecyclePolicy {
+        lease_timeout: Duration::from_secs(1),
+        ..RoomLifecyclePolicy::test_policy()
+    });
+    let room_id = RoomId::new("lifecycle-room").unwrap();
+    manager
+        .create_room(room_id.clone(), SchemaId::new("todo").unwrap(), None)
+        .await
+        .unwrap();
+    let sender = manager.get_or_spawn(&room_id, None).await.unwrap();
+    let alice = ClientId::new("alice").unwrap();
+    let bob = ClientId::new("bob").unwrap();
+    register(&sender, &alice).await;
+    register(&sender, &bob).await;
+    for n in 1..=10u8 {
+        commit(
+            &sender,
+            &alice,
+            mutation(n),
+            seq(u64::from(n) - 1),
+            insert_op(n.into()),
+        )
+        .await
+        .unwrap();
+    }
+    ack(&sender, &alice, seq(10)).await.unwrap();
+
+    // Bob stays at cursor 0 and goes silent. His lease expires, and TTL compaction prunes the
+    // whole log regardless of his cursor, so he ends up Dormant; Alice is only Disconnected.
+    let started = std::time::Instant::now();
+    loop {
+        let (states, tail) = (states(&sender).await, metrics(&sender).await.tail_seq);
+        if states == (0, 0, 1, 1) && tail == seq(11) {
+            break;
+        }
+        assert!(
+            started.elapsed() < POLL_CEILING,
+            "states {states:?}, tail {tail}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(matches!(
+        sync_from(&sender, &bob, seq(0)).await,
+        Err(ServerError::BehindCompaction)
+    ));
+    manager.shutdown_all().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn rooms_that_go_idle_before_the_slow_tick_still_get_disk_maintenance() {
+    let fx = Fixture::with_options(
+        RoomLifecycleOverrides {
+            ram_max_ops: Some(2),
+            warm_disk_ttl_secs: Some(0),
+            idle_timeout_secs: Some(1),
+            ..RoomLifecycleOverrides::default()
+        },
+        |_| {},
+        Some(ActorTimings::default()),
+    )
+    .await;
+    let segments = fx.room_dir().join("segments");
+    let client = ClientId::new("writer").unwrap();
+    for cycle in 0..3u8 {
+        let sender = fx.sender().await;
+        if cycle == 0 {
+            register(&sender, &client).await;
+        }
+        let (first, second) = (cycle * 2 + 1, cycle * 2 + 2);
+        commit(
+            &sender,
+            &client,
+            mutation(first),
+            seq(0),
+            insert_op(first.into()),
+        )
+        .await
+        .unwrap();
+        commit(
+            &sender,
+            &client,
+            mutation(second),
+            seq(0),
+            insert_op(second.into()),
+        )
+        .await
+        .unwrap();
+        // Idle well before the first slow tick (30 s).
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(fx.manager.get_room(&fx.room_id).is_none(), "cycle {cycle}");
+        let name = format!("segment_{:016}_{:016}", first, second);
+        assert!(
+            segments.join(format!("{name}.wal.zst")).exists(),
+            "cycle {cycle}"
+        );
+        assert!(
+            !segments.join(format!("{name}.wal")).exists(),
+            "cycle {cycle}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn retries_are_recognised_after_reopening_with_a_zero_dedup_capacity() {
+    let fx = Fixture::with_options(
+        RoomLifecycleOverrides::default(),
+        |config| config.dedup_lru_capacity = 0,
+        None,
+    )
+    .await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    commit(&sender, &client, mutation(1), seq(0), insert_op(1))
+        .await
+        .unwrap();
+    fx.manager.shutdown_all().await;
+
+    let sender = fx.sender().await;
+    let retry = commit(&sender, &client, mutation(1), seq(0), insert_op(1))
+        .await
+        .unwrap();
+
+    assert_eq!(retry.assigned_seq, seq(1));
     fx.manager.shutdown_all().await;
 }

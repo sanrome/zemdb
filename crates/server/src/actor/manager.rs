@@ -13,8 +13,8 @@ use zemdb_core::id::{RoomId, SchemaId, SequenceNumber};
 use zemdb_core::schema::Schema;
 
 use crate::actor::command::RoomCommand;
-use crate::actor::room::{ActorExit, RoomActor};
-use crate::actor::snapshot_demand::DESIGNATION_TIMEOUT;
+use crate::actor::room::{ActorExit, ActorTimings, RoomActor};
+use crate::blocking::blocking_io;
 use crate::config::ServerConfig;
 use crate::durable;
 use crate::error::ServerError;
@@ -148,9 +148,8 @@ pub struct RoomManager {
     data_dir: PathBuf,
     /// Lifecycle policy of a room without overrides.
     default_policy: RoomLifecyclePolicy,
-    /// Time a client designated to upload a snapshot has to start the upload; always
-    /// [`DESIGNATION_TIMEOUT`] outside tests.
-    designation_timeout: Duration,
+    /// Timings of the room actors; always [`ActorTimings::default`] outside tests.
+    timings: ActorTimings,
 }
 
 impl RoomManager {
@@ -173,7 +172,7 @@ impl RoomManager {
             snapshot_relay,
             data_dir,
             default_policy,
-            designation_timeout: DESIGNATION_TIMEOUT,
+            timings: ActorTimings::default(),
         }
     }
 
@@ -186,11 +185,11 @@ impl RoomManager {
         self
     }
 
-    /// Shortens the time a designated snapshot uploader has to start, for rooms spawned
-    /// afterwards.
+    /// Replaces the timings of the room actors spawned afterwards (snapshot designation
+    /// timeout and maintenance tick periods).
     #[cfg(test)]
-    pub(crate) fn set_designation_timeout(&mut self, timeout: Duration) {
-        self.designation_timeout = timeout;
+    pub(crate) fn set_timings(&mut self, timings: ActorTimings) {
+        self.timings = timings;
     }
 
     /// Registers `sender` as the live actor of `room_id`, for tests that play the actor
@@ -250,17 +249,20 @@ impl RoomManager {
         // leaves the next one still waiting for the same actor.
         self.wait_for_previous_actor(room_id).await;
 
-        // 4. Resolve the room's schema and lifecycle overrides
-        let meta = self.resolve_metadata(room_id, schema_id)?;
+        // Steps 4 to 6 read and write the room's files.
+        let slot = blocking_io(|| {
+            // 4. Resolve the room's schema and lifecycle overrides
+            let meta = self.resolve_metadata(room_id, schema_id)?;
 
-        // 5. Resolve Schema definition from registry
-        let schema = self
-            .schema_registry
-            .get_schema(&meta.schema_id)
-            .ok_or_else(|| ServerError::SchemaNotFound(meta.schema_id.to_string()))?;
+            // 5. Resolve Schema definition from registry
+            let schema = self
+                .schema_registry
+                .get_schema(&meta.schema_id)
+                .ok_or_else(|| ServerError::SchemaNotFound(meta.schema_id.to_string()))?;
 
-        // 6. Spawn RoomActor with its effective policy
-        let slot = self.spawn_actor(room_id, &meta, schema)?;
+            // 6. Spawn RoomActor with its effective policy
+            self.spawn_actor(room_id, &meta, schema)
+        })?;
         info!(room = %room_id, "RoomActor lazily initialized and registered in RoomManager");
         Ok(slot)
     }
@@ -359,7 +361,7 @@ impl RoomManager {
             Arc::clone(&self.config),
             policy,
             Arc::clone(&self.snapshot_relay),
-            self.designation_timeout,
+            self.timings,
         )?;
         let actor_id = self.next_actor_id.fetch_add(1, Ordering::Relaxed);
         let (exit_tx, exit_rx) = watch::channel(None);
@@ -473,7 +475,7 @@ impl RoomManager {
             schema_id,
             lifecycle,
         };
-        write_room_metadata(&room_dir, &meta)?;
+        blocking_io(|| write_room_metadata(&room_dir, &meta))?;
         self.room_meta.insert(room_id.clone(), meta.clone());
 
         // Read the schema again now that the room is listed for schema reloads: an evolution
@@ -482,7 +484,7 @@ impl RoomManager {
             .schema_registry
             .get_schema(&meta.schema_id)
             .unwrap_or(schema);
-        self.spawn_actor(&room_id, &meta, schema)?;
+        blocking_io(|| self.spawn_actor(&room_id, &meta, schema))?;
         Ok(meta)
     }
 
@@ -497,7 +499,7 @@ impl RoomManager {
 
         let room_dir = self.room_dir(room_id);
         if room_dir.exists() {
-            fs::remove_dir_all(&room_dir)?;
+            blocking_io(|| fs::remove_dir_all(&room_dir))?;
             Ok(())
         } else {
             Err(ServerError::RoomNotFound(room_id.to_string()))

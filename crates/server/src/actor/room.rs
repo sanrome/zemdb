@@ -21,6 +21,7 @@ use crate::actor::command::{
 };
 use crate::actor::lease::{ClientLeaseTracker, ClientState};
 use crate::actor::snapshot_demand::{persistence_granularity, SnapshotDemand, DESIGNATION_TIMEOUT};
+use crate::blocking::blocking_io;
 use crate::config::ServerConfig;
 use crate::dedup::DedupLruCache;
 use crate::durable;
@@ -28,9 +29,37 @@ use crate::error::ServerError;
 use crate::log::{retention, RoomLifecyclePolicy, TieredLog};
 use crate::relay::SnapshotRelay;
 
-/// Interval between maintenance passes (lease timeouts, log compaction, roster persistence,
-/// inactivity).
-const MAINTENANCE_PERIOD: Duration = Duration::from_millis(500);
+/// Period of the fast maintenance tick, which only touches memory (and the roster file when
+/// it changed): lease timeouts and state transitions, snapshot signals, roster persistence and
+/// the inactivity check.
+const FAST_TICK_PERIOD: Duration = Duration::from_secs(1);
+
+/// Period of the slow maintenance tick, the disk maintenance of the log: compression of aged
+/// warm segments, cold TTL, disk quota, the RAM TTL window and a backup pass of the
+/// cursor-driven pruning (which also runs on every Ack).
+const SLOW_TICK_PERIOD: Duration = Duration::from_secs(30);
+
+/// The timings of a room actor. Production always uses [`ActorTimings::default`]; tests
+/// shorten them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ActorTimings {
+    /// Time a client designated to upload a snapshot has to start the upload.
+    pub(crate) designation_timeout: Duration,
+    /// Period of the fast (memory) maintenance tick.
+    pub(crate) fast_tick: Duration,
+    /// Period of the slow (disk) maintenance tick.
+    pub(crate) slow_tick: Duration,
+}
+
+impl Default for ActorTimings {
+    fn default() -> Self {
+        Self {
+            designation_timeout: DESIGNATION_TIMEOUT,
+            fast_tick: FAST_TICK_PERIOD,
+            slow_tick: SLOW_TICK_PERIOD,
+        }
+    }
+}
 
 /// How a room actor ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,6 +97,7 @@ pub struct RoomActor {
     demand_persistence_granularity: Duration,
     /// The last usable snapshot announced to SSE subscribers.
     announced_snapshot: Option<SequenceNumber>,
+    timings: ActorTimings,
 }
 
 impl RoomActor {
@@ -82,22 +112,25 @@ impl RoomActor {
         lifecycle_policy: RoomLifecyclePolicy,
         snapshot_relay: Arc<SnapshotRelay>,
     ) -> Result<(mpsc::Sender<RoomCommand>, JoinHandle<ActorExit>), ServerError> {
-        let (sender, actor) = Self::open(
-            room_id,
-            schema_id,
-            schema,
-            data_dir,
-            config,
-            lifecycle_policy,
-            snapshot_relay,
-            DESIGNATION_TIMEOUT,
-        )?;
+        let (sender, actor) = blocking_io(|| {
+            Self::open(
+                room_id,
+                schema_id,
+                schema,
+                data_dir,
+                config,
+                lifecycle_policy,
+                snapshot_relay,
+                ActorTimings::default(),
+            )
+        })?;
         Ok((sender, tokio::spawn(actor.run())))
     }
 
-    /// Recovers the room from disk and builds its actor without starting it, with the time a
-    /// client designated to upload a snapshot has to start the upload. Production always uses
-    /// [`DESIGNATION_TIMEOUT`]; tests shorten it.
+    /// Recovers the room from disk and builds its actor without starting it, with the given
+    /// `timings`. Production always uses [`ActorTimings::default`]; tests shorten them.
+    ///
+    /// Reads the room's files: async callers run it through [`blocking_io`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open(
         room_id: RoomId,
@@ -107,19 +140,23 @@ impl RoomActor {
         config: Arc<ServerConfig>,
         lifecycle_policy: RoomLifecyclePolicy,
         snapshot_relay: Arc<SnapshotRelay>,
-        designation_timeout: Duration,
+        timings: ActorTimings,
     ) -> Result<(mpsc::Sender<RoomCommand>, Self), ServerError> {
         let room_dir = data_dir.as_ref().join("rooms").join(room_id.as_str());
         durable::create_dir_all_synced(&room_dir)?;
 
         let clients_path = room_dir.join(format!("meta_clients_{}.json", room_id.as_str()));
 
-        // 1. Open or recover 4-tier delta log and recovered mutations
-        let (tiered_log, recovered_mutations) =
-            TieredLog::open_or_create(&room_dir, lifecycle_policy.clone())?;
-
-        // 2. Hydrate deduplication LRU cache from log
+        // 1. Open or recover the 4-tier delta log, reading back only the newest segments: those
+        // holding the operations kept in RAM and the mutation IDs the deduplication cache holds
         let mut dedup_cache = DedupLruCache::new(config.dedup_lru_capacity);
+        let (tiered_log, recovered_mutations) = TieredLog::open_or_create_with_dedup_window(
+            &room_dir,
+            lifecycle_policy.clone(),
+            dedup_cache.capacity(),
+        )?;
+
+        // 2. Hydrate deduplication LRU cache from log, oldest first so that recency is kept
         dedup_cache.hydrate(recovered_mutations);
 
         // 3. Monotonic head sequence derived directly from TieredLog
@@ -133,7 +170,7 @@ impl RoomActor {
         let (events_tx, _) = broadcast::channel(256);
 
         let demand_ttl = lifecycle_policy.snapshot_demand_ttl;
-        let snapshot_demand = SnapshotDemand::new(demand_ttl, designation_timeout);
+        let snapshot_demand = SnapshotDemand::new(demand_ttl, timings.designation_timeout);
 
         let mut actor = Self {
             room_id: room_id.clone(),
@@ -154,6 +191,7 @@ impl RoomActor {
             snapshot_demand,
             demand_persistence_granularity: persistence_granularity(demand_ttl),
             announced_snapshot: None,
+            timings,
         };
         // A snapshot that was already usable before this actor started is not news.
         actor.announced_snapshot = actor.usable_snapshot_seq();
@@ -200,11 +238,12 @@ impl RoomActor {
 
     /// Primary actor loop running sequentially on Tokio.
     async fn run_loop(&mut self) {
-        // The first tick fires one period after start, not immediately.
-        let mut maintenance_timer = tokio::time::interval_at(
-            tokio::time::Instant::now() + MAINTENANCE_PERIOD,
-            MAINTENANCE_PERIOD,
-        );
+        // The first ticks fire one period after start, not immediately.
+        let start = tokio::time::Instant::now();
+        let mut fast_timer =
+            tokio::time::interval_at(start + self.timings.fast_tick, self.timings.fast_tick);
+        let mut slow_timer =
+            tokio::time::interval_at(start + self.timings.slow_tick, self.timings.slow_tick);
 
         loop {
             tokio::select! {
@@ -228,12 +267,20 @@ impl RoomActor {
                         }
                     }
                 }
-                _ = maintenance_timer.tick() => {
-                    self.run_periodic_maintenance().await;
+                _ = fast_timer.tick() => {
+                    self.run_fast_maintenance();
                     if self.is_idle() {
-                        self.drain_for_idle_shutdown().await;
+                        // A room whose idle timeout is shorter than the slow tick would never
+                        // reach its first slow tick, so it runs the disk maintenance on the way
+                        // out instead.
+                        if self.drain_for_idle_shutdown().await.is_continue() {
+                            self.run_disk_maintenance().await;
+                        }
                         break;
                     }
+                }
+                _ = slow_timer.tick() => {
+                    self.run_disk_maintenance().await;
                 }
             }
         }
@@ -259,16 +306,16 @@ impl RoomActor {
     /// room for the next request, and a request that finds the mailbox closed is sent to the
     /// new actor; commands that were already queued are handled normally first, so no request
     /// is lost or refused because of the shutdown. The roster is persisted when the loop ends.
-    async fn drain_for_idle_shutdown(&mut self) {
+    /// `Break` means a queued command left the room unable to operate safely.
+    async fn drain_for_idle_shutdown(&mut self) -> ControlFlow<()> {
         info!(room = %self.room_id, "Room inactive; shutting down its actor");
         self.receiver.close();
         self.stopping_idle = true;
         // After `close`, `recv` yields the queued commands and then `None`.
         while let Some(command) = self.receiver.recv().await {
-            if self.handle_command(command).is_break() {
-                return;
-            }
+            self.handle_command(command)?;
         }
+        ControlFlow::Continue(())
     }
 
     /// Handles one command. `Break` means the room can no longer operate safely and the
@@ -881,7 +928,8 @@ impl RoomActor {
         }
     }
 
-    async fn run_periodic_maintenance(&mut self) {
+    /// The fast tick: memory-only maintenance, plus writing the roster if it changed.
+    fn run_fast_maintenance(&mut self) {
         // 1. Check client timeouts (Connected/Bootstrapping -> Disconnected -> Dormant)
         self.lease_tracker.check_timeouts(
             self.policy.lease_timeout,
@@ -889,20 +937,24 @@ impl RoomActor {
             self.tiered_log.tail_seq(),
         );
 
-        // 2. Run TieredLog TTL and size compaction (non-blocking via spawn_blocking)
+        // 2. Snapshot demand, uploader designation and snapshot announcements
+        self.update_snapshot_signals();
+
+        // 3. Persist cursor and lease changes accumulated since the previous tick
+        self.persist_roster();
+    }
+
+    /// The slow tick: disk maintenance of the log, served from its segment index.
+    async fn run_disk_maintenance(&mut self) {
+        // 1. Compression, RAM TTL window, cold TTL and quota (compression in spawn_blocking)
         if let Err(e) = self.tiered_log.run_maintenance().await {
             warn!(room = %self.room_id, error = %e, "TieredLog maintenance error");
         }
 
-        // 3. Trigger proactive cursor-driven pruning if all non-dormant clients are Connected,
-        // bounded by active_snapshot_seq (Retention Anchor)
+        // 2. Backup pass of the cursor-driven pruning, which normally runs on every Ack: a
+        // floor can also move without an Ack (cursors reported by commits, clients becoming
+        // Dormant), bounded by active_snapshot_seq (Retention Anchor)
         self.prune_to_retention_floor();
-
-        // 4. Snapshot demand, uploader designation and snapshot announcements
-        self.update_snapshot_signals();
-
-        // 5. Persist cursor and lease changes accumulated since the previous tick
-        self.persist_roster();
     }
 }
 

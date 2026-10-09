@@ -123,10 +123,10 @@ pub async fn compact_room_cow(
     rename(&staged.tmp_path, &snap_path).await?;
     room.snapshot_seq = cut_seq;
     room.snapshot_len = staged.compressed_len;
-    sync_parent(&snap_path)?;
+    sync_parent(&snap_path).await?;
 
     remove_if_exists(&wal_compacting_path).await?;
-    sync_parent(&wal_compacting_path)?;
+    sync_parent(&wal_compacting_path).await?;
 
     tracing::info!(
         snap_path = ?room.snap_path,
@@ -166,7 +166,7 @@ async fn rotate_wal_to_compacting(
         }
     }
 
-    sync_parent(&room.wal_path)
+    sync_parent(&room.wal_path).await
 }
 
 async fn roll_back_rotation(
@@ -175,7 +175,7 @@ async fn roll_back_rotation(
 ) -> Result<(), StorageError> {
     fail_point::check("compaction.rotate_rollback", wal_path)?;
     rename(wal_compacting_path, wal_path).await?;
-    sync_parent(wal_path)
+    sync_parent(wal_path).await
 }
 
 fn open_fresh_wal(wal_path: &Path, room_id: &RoomId) -> Result<std::fs::File, StorageError> {
@@ -230,16 +230,16 @@ async fn absorb_wal_into_compacting(
 }
 
 /// Appends `bytes` to `path` and syncs it, restoring the previous length if anything fails.
+///
+/// The file is opened for writing and positioned at its end rather than in append mode: on
+/// Windows an append-only handle lacks the write access that truncating it back requires.
 async fn append_synced(
     path: &Path,
     bytes: &[u8],
     room: &mut DiskRoomState,
 ) -> Result<(), StorageError> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .await?;
-    let original_len = file.metadata().await?.len();
+    let mut file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
+    let original_len = file.seek(SeekFrom::End(0)).await?;
 
     let append_result = async {
         let (first, rest) = bytes.split_at(bytes.len() / 2);
@@ -342,7 +342,7 @@ pub(crate) async fn write_snapshot_file(
     };
 
     rename(&staged.tmp_path, snap_path).await?;
-    sync_parent(snap_path)?;
+    sync_parent(snap_path).await?;
     Ok(staged.compressed_len)
 }
 
@@ -374,7 +374,7 @@ pub async fn write_snapshot_and_truncate_wal(
 
     let wal_compacting_path = compacting_wal_path(&room.wal_path);
     remove_if_exists(&wal_compacting_path).await?;
-    sync_parent(&wal_compacting_path)?;
+    sync_parent(&wal_compacting_path).await?;
 
     tracing::info!(
         snap_path = ?room.snap_path,
@@ -397,10 +397,17 @@ pub(crate) async fn remove_if_exists(path: &Path) -> Result<(), StorageError> {
     }
 }
 
-pub(crate) fn sync_parent(path: &Path) -> Result<(), StorageError> {
-    if let Some(parent) = path.parent() {
-        sync_dir(parent)?;
-    }
+/// Syncs the directory holding `path`, so that a rename, creation or removal in it is
+/// durable. The directory sync blocks, so it runs on Tokio's blocking pool, like the
+/// `tokio::fs` operations around it, instead of stalling a worker thread.
+pub(crate) async fn sync_parent(path: &Path) -> Result<(), StorageError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let parent = parent.to_path_buf();
+    tokio::task::spawn_blocking(move || sync_dir(&parent))
+        .await
+        .map_err(|e| StorageError::Other(format!("Join error: {e}")))??;
     Ok(())
 }
 

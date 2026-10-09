@@ -6,16 +6,15 @@ use zemdb_core::id::{MutationId, SequenceNumber};
 #[derive(Debug)]
 pub struct DedupLruCache {
     cache: LruCache<MutationId, SequenceNumber>,
-    capacity: usize,
 }
 
 impl DedupLruCache {
-    /// Creates a new deduplication cache with a maximum capacity.
+    /// Creates a new deduplication cache with a maximum capacity. A capacity of zero is
+    /// raised to one.
     pub fn new(capacity: usize) -> Self {
         let non_zero_cap = NonZeroUsize::new(capacity.max(1)).unwrap();
         Self {
             cache: LruCache::new(non_zero_cap),
-            capacity,
         }
     }
 
@@ -48,8 +47,8 @@ impl DedupLruCache {
         self.cache.is_empty()
     }
 
-    /// Returns the configured capacity limit.
+    /// Returns the number of mutations the cache holds at most (at least one).
     pub fn capacity(&self) -> usize {
-        self.capacity
+        self.cache.cap().get()
     }
 }

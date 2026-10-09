@@ -87,11 +87,11 @@
 | 5 | Relay de snapshots | DEF-62, 10, 63, 52, 51, 39, 40, 38, 31(relay), 08(relay), 15 | Alta | ✅ 11/11 |
 | 6 | Ciclo de vida de clientes y señalización | DEF-53, 05, 27, 75, 76 (24 y 26 descartados) | Alta | ✅ 5/5 |
 | 7 | Protocolo wire y errores HTTP | DEF-46, 28, 11, 43, 64, 22, 71, 74 | Media | ✅ 8/8 |
-| 8 | Rendimiento, portabilidad y ciclo de vida de salas | DEF-50, 35, 55, 37, 08, 31(locks), 25(server), 72, 77, 79, 83, 86 | Media | 4/12 (8a ✅) |
+| 8 | Rendimiento, portabilidad y ciclo de vida de salas | DEF-50, 35, 55, 37, 08, 31(locks), 25(server), 72, 77, 79, 83, 86 (+73 adelantado) | Media | ✅ 12/12 |
 | 9 | Robustez e higiene de storage y core | DEF-14, 23, 49, 17, 25(storage), 18, 09, 45, 33, 44, 47, 30, 13, 20, 21, 57, 70, 78 (32 descartado) | Media/Baja | 1/18 |
 | 10 | Diferido a Fase 4 / descartado | DEF-34, 54, 42, 56, 73, 81, 82, 84, 85 | — | — |
 
-**Avance total:** 53 de 78 ítems activos resueltos. Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
+**Avance total:** 62 de 79 ítems activos resueltos (DEF-73 pasó de diferido a hecho). Al cerrar cada ítem se actualiza su estado, su commit y esta tabla.
 
 **Severidades corregidas respecto de la auditoría anterior:** de los 7 "críticos" originales, solo DEF-01 lo es. DEF-02, 03 y 04 son Altos; DEF-05 y 06 son Medios; DEF-34 es Bajo. DEF-24, 26 y 56 son falsos en la práctica.
 
@@ -422,31 +422,31 @@ Los errores reintentables (sala reiniciándose tras un fallo de I/O según D7, r
 
 > Habilitador común: un **índice de segmentos en memoria** en `TieredLog` (metadatos de cold y sealed, más inicio y fin del activo), actualizado en rotate, compress y prune. Elimina los `read_dir` del tick y de cada `fetch_deltas` por la ruta lenta.
 
-#### DEF-50 · Bajo · ⬜
+#### DEF-50 · Bajo · ✅ Hecho (8b)
 Cada tick de 500 ms hace unos 8 `read_dir` más `stat` por archivo, y `prune_older_than` corre además en cada Ack. Es CPU y syscalls (los metadatos están en la caché del SO), no saturación de disco.
 **Error de la propuesta anterior.** Subir el tick a 30 s también retrasa la detección de leases (`check_timeouts` corre en el mismo tick).
 **Solución.** Separar en dos ticks: leases en memoria cada 1–5 s; mantenimiento de disco cada 30–60 s, servido desde el índice. Llevar los bytes en disco por sala de forma incremental.
 
-#### DEF-35 · Medio · ⬜
+#### DEF-35 · Medio · ✅ Hecho (8b)
 Al crear la sala se descomprime todo el cold tier y se lee todo el warm, de forma síncrona en `RoomActor::spawn`. Solo hacen falta las últimas `ram_max_ops` ops, los últimos `dedup_lru_capacity` mutation IDs y `head` (que sale de los nombres de segmento y de `active.wal`). Leer hacia atrás hasta cubrir ambas cuotas e hidratar en orden cronológico para conservar la recencia de la LRU.
 
 #### DEF-55 · Medio · ✅ Hecho (8a) (subido de Bajo-Medio: con muchas salas casi siempre inactivas, cada una queda abierta para siempre)
 Las salas nunca se apagan. El actor se apaga solo (guarda el roster y libera memoria, archivos y lock) tras un tiempo configurable sin comandos, sin clientes `Connected`/`Bootstrapping`, sin suscriptores SSE y sin subida de snapshot en curso; el siguiente pedido la relanza desde disco por el mismo camino que D7. El tiempo es un parámetro más de la política de ciclo de vida (DEF-83), con default del servidor por variable de entorno y la opción de no apagar nunca. Reduce también el costo de DEF-37 y DEF-50.
 
-#### DEF-37 · Bajo · ⬜ (requiere DEF-07 y DEF-58)
+#### DEF-37 · Bajo · ✅ Hecho (8b)
 La ventana TTL de la RAM solo se aplica en `append`. No es una fuga: está acotada a `ram_max_ops` por sala. Aplicar la ventana en el mantenimiento **solo después** de DEF-07/58; antes produce `tail = head` y `BehindCompaction` masivo.
 
-#### DEF-08 · Bajo-Medio · ⬜
+#### DEF-08 · Bajo-Medio · ✅ Hecho (8b)
 El `sync_data` de cada commit bloquea un worker de Tokio (en macOS es `F_FULLFSYNC`, 5–20 ms). Solo afecta cuando muchas salas hacen commit a la vez. Envolver el append con fsync en `tokio::task::block_in_place`, y la descompresión cold en `spawn_blocking`. Group commit descartado (D4).
 
 #### DEF-31 (spawn_locks) · Bajo · ✅ Hecho (8a)
 **Error de la propuesta anterior.** Un `spawn_locks.remove` directo rompe la exclusión mutua: quien espera con el mutex viejo y un llamador nuevo terminan con mutex distintos.
 **Solución.** Quitarlo solo bajo el guard, con `remove_if` según el refcount del `Arc`.
 
-#### DEF-25 (server) · Bajo · ⬜
+#### DEF-25 (server) · Bajo · ✅ Hecho (8b)
 `warm_disk.rs` y `cold_disk.rs` ya usan `decode_wal_batch_from_slice`. Lo que está triplicado es el bucle de lectura: extraer un helper.
 
-#### DEF-72 · Medio · ⬜ (nuevo, revisión del Lote 2)
+#### DEF-72 · Medio · ✅ Hecho (8b; confirmar en la CI de Windows) (nuevo, revisión del Lote 2)
 **Problema.** Windows es plataforma objetivo. `WarmDiskLog::read_range` (y `recover_all`) leen `active.wal` con `std::fs::read`, un segundo handle, mientras `active_file` tiene el lock exclusivo de `fs2`. En Windows ese lock es obligatorio (`LockFileEx`) y la lectura falla: el catch-up desde `active.wal` tras desalojo por TTL de RAM no funcionaría.
 **Solución.** Leer `active.wal` a través del handle que ya tiene el lock (o con un lock compartido coordinado). Verificar en CI con Windows (DEF-73).
 
@@ -472,11 +472,24 @@ El `sync_data` de cada commit bloquea un worker de Tokio (en macOS es `F_FULLFSY
 #### Nota sobre DEF-08
 La revisión del Lote 1 señaló dos casos más de I/O bloqueante en el actor: `record_pruned_through` (escritura atómica de `log_meta.json`) y los `sync_dir` de la fase 3 de la compactación de storage. Se tratan junto con DEF-08.
 
-#### DEF-77 · Bajo · ⬜ (nuevo, revisión del Lote 3)
+#### DEF-77 · Bajo · ✅ Hecho (8b) (nuevo, revisión del Lote 3)
 `ColdDiskLog` usa `cold_path.with_extension("tmp")` (`segment_X_Y.wal.tmp`); un `.tmp` residual de una compresión interrumpida nunca se limpia.
 
-#### DEF-79 · Bajo · ⬜ (nuevo)
+#### DEF-79 · Bajo · ✅ Hecho (8b) (nuevo)
 Tests dependientes de tiempos: `tiered_log_tests::test_tiered_log_behind_compaction_eviction` (cold TTL de 100 ms) falla a veces con la suite completa en paralelo. Revisar los tests con TTL cortos y pasarlos a tiempo simulado o márgenes amplios.
+
+
+#### Notas del Lote 8b
+- **Primera corrida de la CI en Windows:** 18 tests fallaban. 17 del servidor venían de leer `active.wal` con un segundo handle mientras el primero tenía el lock exclusivo, que en Windows es obligatorio (DEF-72). El de storage era un bug real: `.wal.compacting` se abría solo en modo append, que en Windows no da permiso para `set_len`, así que el truncado tras una escritura fallida fallaba y la sala quedaba marcada como rota. En Unix ninguno de los dos se manifiesta.
+- **Nuevos módulos:** `blocking.rs` (`blocking_io`, único helper para I/O bloqueante: `block_in_place` en runtime multihilo, directo en uno de un solo hilo), `log/segment_index.rs` (índice y escaneo inicial, que también limpia `.tmp` residuales y conserva el warm original de una compresión interrumpida) y `log/io_probe.rs` (contador solo para tests de listados y lecturas, para verificar el índice y la apertura barata).
+- **Decisiones de implementación no previstas en D35–D36:**
+  - La edad de un segmento cuenta desde que entró a su tier (al reabrir, la fecha de modificación del archivo). Tamaños con `fs::metadata` por archivo, porque los listados de Windows pueden traer tamaños viejos.
+  - La poda por TTL y cuota borra solo un prefijo del log (antes podía borrar un segmento del medio y dejar un hueco), y sincroniza el directorio después de borrar.
+  - Al abrir, la RAM se llena solo con una racha contigua que termine exactamente en `head_seq`; si no, queda vacía y las lecturas van a disco. La ventana de deduplicación cuenta IDs distintos y usa la capacidad efectiva del cache (al menos 1).
+  - Un segmento corrupto o faltante dentro del rango retenido se trata como hueco: `BehindCompaction` y pedido de snapshot. Al abrir, un segmento sellado corrupto corta la lectura hacia atrás en vez de impedir la apertura.
+  - Cada log de sala toma un lock exclusivo en `log.lock` antes de leer o limpiar nada, y lo mantiene mientras vive (cubre también el intervalo entre una rotación y el siguiente append).
+- **Hallazgos de la revisión independiente, corregidos en el lote:** con `idle_timeout` menor a 30 s el mantenimiento de disco no corría nunca (ahora el apagado por inactividad hace una pasada antes de cerrar); una falla al borrar el warm después de comprimir dejaba el índice apuntando a un archivo inexistente y frenaba TTL y cuota (ahora la compresión devuelve un resultado tipado y una falla no saltea el resto del mantenimiento); la apertura limpiaba archivos antes de tomar el lock; dos casos de reintentos no reconocidos tras reabrir; `create_room` hacía I/O bloqueante fuera del helper.
+- **Verificación en Windows:** los arreglos no se pudieron correr en Windows localmente (solo clippy con el target GNU). La CI los confirma al pushear.
 
 ---
 
@@ -538,7 +551,7 @@ Usar `ruzstd` en wasm32 para descomprimir snapshots `ZMSN`, junto con la descomp
 #### DEF-42 · Info · ⏸
 ARCHITECTURE.md:169 presenta la descarga directa como alternativa al protocolo por chunks, que ya está implementado. Aclarar el documento; implementar el endpoint, si se quiere, después de DEF-38.
 
-#### DEF-73 · Info · 🔄 Adelantado al Lote 8b por D37 (nuevo)
+#### DEF-73 · Info · ✅ Hecho (D37: `.github/workflows/ci.yml`) (nuevo)
 Windows es plataforma objetivo, pero hoy nada se prueba en Windows. Agregar CI (por ejemplo GitHub Actions) con `windows-latest` que corra `cargo test --workspace`; ahí se verifican DEF-72 y la lectura del WAL por su propio handle en storage.
 
 #### DEF-81 · Medio · ⏸ (nuevo, decisión D18)

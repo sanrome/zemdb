@@ -14,7 +14,8 @@ use crate::log::retention::is_behind_tail;
 ///
 /// Every activity of a client recomputes its state from its cursor: a cursor behind the
 /// retained log (`cursor < tail_seq - 1`) makes it `Bootstrapping`, any other makes it
-/// `Connected`. Only the maintenance tick moves a client to `Disconnected` or `Dormant`.
+/// `Connected`. Only the fast maintenance tick moves a client to `Disconnected` or
+/// `Dormant`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientState {
     /// Active, but its cursor is behind the retained log: it needs a base snapshot.

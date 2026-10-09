@@ -81,12 +81,22 @@ impl HotBuffer {
     /// Evicts aged or overflow deltas gradually from the front of the queue, ensuring
     /// recent operations remain buffered in RAM without dropping capacity to zero upon rotation.
     pub fn apply_sliding_window(&mut self, max_ops: usize, ttl: std::time::Duration) {
+        self.apply_sliding_window_at(max_ops, ttl, Instant::now());
+    }
+
+    /// [`apply_sliding_window`](Self::apply_sliding_window) with the current time given as `now`.
+    pub fn apply_sliding_window_at(
+        &mut self,
+        max_ops: usize,
+        ttl: std::time::Duration,
+        now: Instant,
+    ) {
         while self.entries.len() > max_ops {
             self.entries.pop_front();
         }
 
         while let Some((_, time)) = self.entries.front() {
-            if time.elapsed() >= ttl {
+            if now.saturating_duration_since(*time) >= ttl {
                 self.entries.pop_front();
             } else {
                 break;

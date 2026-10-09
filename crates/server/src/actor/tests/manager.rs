@@ -35,7 +35,14 @@ fn new_manager(dir: &TempDir) -> RoomManager {
         )
         .unwrap(),
     );
-    RoomManager::new(config, registry, relay)
+    let mut manager = RoomManager::new(config, registry, relay);
+    // Both maintenance ticks every 500 ms, so that tests waiting in real time stay fast.
+    manager.set_timings(ActorTimings {
+        fast_tick: Duration::from_millis(500),
+        slow_tick: Duration::from_millis(500),
+        ..ActorTimings::default()
+    });
+    manager
 }
 
 fn meta_room_path(dir: &TempDir, room_id: &RoomId) -> PathBuf {

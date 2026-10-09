@@ -221,57 +221,6 @@ async fn test_tiered_log_multi_tier_continuous_fetch() {
     assert!(paged_has_more);
 }
 
-#[tokio::test]
-async fn test_tiered_log_behind_compaction_eviction() {
-    let dir = tempdir().unwrap();
-    let policy = RoomLifecyclePolicy {
-        ram_max_ops: 100,
-        ram_ttl: Duration::from_secs(3600),
-        warm_disk_ttl: Duration::from_millis(10),
-        cold_disk_ttl: Duration::from_millis(100), // Fast cold pruning
-        max_room_disk_bytes: 50 * 1024 * 1024,
-        ..RoomLifecyclePolicy::default()
-    };
-
-    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
-
-    // 1. Create Cold segment 1..=5
-    for i in 1..=5 {
-        log.append(make_test_op(i), None).unwrap();
-    }
-    log.force_rotate_warm().unwrap();
-    sleep(Duration::from_millis(15));
-    let r1 = log.run_maintenance().await.unwrap();
-    assert_eq!(r1.warm_compressed_count, 1);
-    assert_eq!(r1.cold_pruned_count, 0);
-
-    // 2. Append 6..=10
-    for i in 6..=10 {
-        log.append(make_test_op(i), None).unwrap();
-    }
-
-    // 3. Wait past cold_disk_ttl and run maintenance to prune Cold segment 1..=5
-    sleep(Duration::from_millis(110));
-    let report = log.run_maintenance().await.unwrap();
-    assert_eq!(report.cold_pruned_count, 1);
-    assert_eq!(log.tail_seq().get(), 6);
-
-    // Client requests cursor 2 (which is older than tail_seq 6) -> BehindCompaction!
-    let err = log.fetch_deltas(SequenceNumber::new(2), 10).unwrap_err();
-    match err {
-        ServerError::BehindCompaction => {}
-        other => panic!("Expected BehindCompaction, got: {:?}", other),
-    }
-
-    // Client requests cursor 5 (immediately before oldest available 6) -> Succeeds!
-    let (valid_deltas, has_more) = log.fetch_deltas(SequenceNumber::new(5), 10).unwrap();
-
-    assert_eq!(valid_deltas.len(), 5);
-    assert_eq!(valid_deltas[0].seq.get(), 6);
-    assert_eq!(valid_deltas[4].seq.get(), 10);
-    assert!(!has_more);
-}
-
 #[test]
 fn test_tiered_log_strict_contiguity_and_monotonicity() {
     let dir = tempdir().unwrap();

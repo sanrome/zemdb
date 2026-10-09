@@ -144,13 +144,14 @@ impl TestRoom {
         rx.await.unwrap().unwrap()
     }
 
-    /// Waits for the actor's maintenance tick to advance the retention floor past `seq`.
+    /// Waits for the actor's disk maintenance tick to advance the retention floor past `seq`.
+    /// Tests calling it run with paused time, so waiting for the tick costs nothing.
     async fn wait_for_tail_above(&self, seq: u64) {
-        for _ in 0..60 {
+        for _ in 0..120 {
             if self.metrics().await.tail_seq.get() > seq {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
         panic!("retention floor never advanced past {}", seq);
     }
@@ -160,7 +161,7 @@ fn seqs(resp: &CommitResponse) -> Vec<u64> {
     resp.catchup_ops.iter().map(|op| op.seq.get()).collect()
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn commit_behind_retention_is_rejected_without_side_effects() {
     let room = spawn_room(fast_prune_policy()).await;
     room.register("stale").await;
@@ -175,7 +176,7 @@ async fn commit_behind_retention_is_rejected_without_side_effects() {
     assert_eq!(room.metrics().await.head_seq.get(), 5);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn retried_commit_from_client_now_behind_retention_returns_original_seq() {
     let room = spawn_room(fast_prune_policy()).await;
     room.register("stale").await;

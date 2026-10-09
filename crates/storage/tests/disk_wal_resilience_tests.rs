@@ -271,7 +271,9 @@ async fn test_disk_torn_write_recovery() {
         .unwrap();
     assert_eq!(retrieved, Some(row));
 
-    // Check file was truncated back to clean_len
+    // Check file was truncated back to clean_len. The room is closed first: while it is open
+    // its handle holds the WAL's lock, which is mandatory on Windows and refuses other readers.
+    engine2.close_room(&room_id).await.unwrap();
     let repaired_bytes = tokio::fs::read(&file_path).await.unwrap();
     assert_eq!(repaired_bytes.len(), clean_len);
 }

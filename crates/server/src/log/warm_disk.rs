@@ -1,9 +1,11 @@
 use crate::durable;
 use crate::error::ServerError;
 use crate::fail_point;
+use crate::log::io_probe::{self, IoEvent};
+use crate::log::segment_index::warm_segment_path;
 use fs2::FileExt;
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use zemdb_core::id::{MutationId, SequenceNumber};
 use zemdb_core::protocol::messages::SequencedOperation;
@@ -11,29 +13,37 @@ use zemdb_core::protocol::wal_frame::{
     decode_wal_batch_from_slice, encode_wal_record, WalBatchDecodeResult,
 };
 
-/// Metadata describing a sealed uncompressed Warm Disk segment.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SealedSegmentMeta {
-    pub start_seq: SequenceNumber,
-    pub end_seq: SequenceNumber,
-    pub path: PathBuf,
-}
-
 /// Operations and mutation assignment pairs recovered from disk segments.
 pub type RecoveredLogData = (Vec<SequencedOperation>, Vec<(MutationId, SequenceNumber)>);
 
+/// Name of the active segment inside the segments directory.
+const ACTIVE_SEGMENT: &str = "active.wal";
+
 /// Tier 2: Uncompressed append-only log on disk ensuring crash durability and fast sequential reads.
+///
+/// `active.wal` is only ever accessed through `active_file`, the handle that holds its
+/// exclusive lock: on Windows the lock is mandatory, so a second handle could not read it.
 #[derive(Debug)]
 pub struct WarmDiskLog {
     segments_dir: PathBuf,
     active_file: Option<File>,
     active_start_seq: Option<SequenceNumber>,
     active_end_seq: Option<SequenceNumber>,
+    /// Length of the valid records in `active.wal`, where the next record is written.
+    active_len: u64,
 }
 
 impl WarmDiskLog {
     /// Opens or creates the Warm Disk directory.
     pub fn open_or_create(segments_dir: impl AsRef<Path>) -> Result<Self, ServerError> {
+        Self::open_recovering(segments_dir).map(|(log, _)| log)
+    }
+
+    /// Opens or creates the Warm Disk directory, and returns the operations and mutation IDs
+    /// recovered from `active.wal` in order. A torn write at its end is truncated.
+    pub(crate) fn open_recovering(
+        segments_dir: impl AsRef<Path>,
+    ) -> Result<(Self, RecoveredLogData), ServerError> {
         let segments_dir = segments_dir.as_ref().to_path_buf();
         durable::create_dir_all_synced(&segments_dir)?;
 
@@ -42,10 +52,11 @@ impl WarmDiskLog {
             active_file: None,
             active_start_seq: None,
             active_end_seq: None,
+            active_len: 0,
         };
 
-        log.inspect_active_segment()?;
-        Ok(log)
+        let recovered = log.inspect_active_segment()?;
+        Ok((log, recovered))
     }
 
     /// Appends a sequenced operation with an optional mutation ID to the active `.wal` segment and ensures physical durability on disk.
@@ -54,7 +65,7 @@ impl WarmDiskLog {
         op: &SequencedOperation,
         mutation_id: Option<MutationId>,
     ) -> Result<(), ServerError> {
-        let active_path = self.segments_dir.join("active.wal");
+        let active_path = self.segments_dir.join(ACTIVE_SEGMENT);
 
         if self.active_file.is_none() {
             let created = !active_path.exists();
@@ -68,7 +79,8 @@ impl WarmDiskLog {
             file.try_lock_exclusive().map_err(|e| {
                 ServerError::RoomLocked(format!("active.wal locked by another process: {}", e))
             })?;
-
+            // A file left behind by a failed rotation still holds its records; append after them.
+            self.active_len = file.metadata()?.len();
             self.active_file = Some(file);
 
             // A new file's directory entry must be durable before any record in it is
@@ -82,11 +94,14 @@ impl WarmDiskLog {
         let encoded =
             encode_wal_record(op, mutation_id).map_err(|e| ServerError::Wal(e.to_string()))?;
 
+        // Reads of the active segment share this handle and move its position.
+        file.seek(SeekFrom::Start(self.active_len))?;
         fail_point::check("warm_append_write", &active_path)?;
         file.write_all(&encoded)?;
         file.flush()?;
         fail_point::check("warm_append_sync", &active_path)?;
         file.sync_data()?;
+        self.active_len += encoded.len() as u64;
 
         // The segment start is tracked independently of when the file handle was opened:
         // an `active.wal` recovered empty already has an open handle but no operations yet.
@@ -117,18 +132,23 @@ impl WarmDiskLog {
         self.active_end_seq
     }
 
+    /// Size in bytes of the records in the active WAL segment.
+    pub fn active_len(&self) -> u64 {
+        self.active_len
+    }
+
     /// Rotates and seals `active.wal` into an immutable `segment_{start}_{end}.wal` file.
     pub fn rotate_active_segment(&mut self) -> Result<Option<PathBuf>, ServerError> {
         if let (Some(start), Some(end)) = (self.active_start_seq, self.active_end_seq) {
-            // Drop file handle to allow renaming on all platforms
+            // The handle is closed before the rename: renaming a file this process has open
+            // would leave it writing to the sealed segment, and closing it releases the lock.
             if let Some(mut file) = self.active_file.take() {
                 file.flush()?;
                 file.sync_all()?;
             }
 
-            let active_path = self.segments_dir.join("active.wal");
-            let sealed_name = format!("segment_{:016}_{:016}.wal", start.get(), end.get());
-            let sealed_path = self.segments_dir.join(sealed_name);
+            let active_path = self.segments_dir.join(ACTIVE_SEGMENT);
+            let sealed_path = warm_segment_path(&self.segments_dir, start, end);
 
             let renamed = active_path.exists();
             if renamed {
@@ -137,6 +157,7 @@ impl WarmDiskLog {
 
             self.active_start_seq = None;
             self.active_end_seq = None;
+            self.active_len = 0;
 
             // Make the rename durable before the sealed segment can be compressed or pruned.
             if renamed {
@@ -148,37 +169,37 @@ impl WarmDiskLog {
         }
     }
 
-    /// Lists all sealed `.wal` segments in ascending sequence order.
-    pub fn list_sealed_segments(&self) -> Result<Vec<SealedSegmentMeta>, ServerError> {
-        let mut segments = Vec::new();
-
-        if !self.segments_dir.exists() {
-            return Ok(segments);
+    /// Reads operations within `(from_seq .. ]` up to `limit` from `active.wal`, through the
+    /// handle that holds its lock.
+    pub(crate) fn read_active_range(
+        &self,
+        from_seq: SequenceNumber,
+        limit: usize,
+    ) -> Result<Vec<SequencedOperation>, ServerError> {
+        let Some(file) = self.active_file.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if limit == 0 {
+            return Ok(Vec::new());
         }
-
-        for entry in std::fs::read_dir(&self.segments_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                    if filename.starts_with("segment_") && filename.ends_with(".wal") {
-                        if let Some((start, end)) = parse_segment_filename(filename, ".wal") {
-                            segments.push(SealedSegmentMeta {
-                                start_seq: SequenceNumber::new(start),
-                                end_seq: SequenceNumber::new(end),
-                                path,
-                            });
-                        }
-                    }
-                }
-            }
+        let mut reader = file;
+        reader.seek(SeekFrom::Start(0))?;
+        let mut data = vec![0u8; self.active_len as usize];
+        reader.read_exact(&mut data)?;
+        let decoded = decode_segment(&data, from_seq, limit)?;
+        if decoded.torn {
+            // Appends are synced and recovery truncates a torn tail, so this means the file
+            // was damaged while the room was open.
+            tracing::warn!(
+                path = ?self.segments_dir.join(ACTIVE_SEGMENT),
+                valid_bytes = decoded.valid_len,
+                "Torn write detected while reading the active WAL segment"
+            );
         }
-
-        segments.sort_by_key(|s| s.start_seq.get());
-        Ok(segments)
+        Ok(decoded.ops)
     }
 
-    /// Reads operations within `(from_seq .. ]` up to `limit` from a specific `.wal` file.
+    /// Reads operations within `(from_seq .. ]` up to `limit` from a specific sealed `.wal` file.
     pub fn read_range(
         file_path: &Path,
         from_seq: SequenceNumber,
@@ -187,87 +208,50 @@ impl WarmDiskLog {
         Self::read_range_with_mutations(file_path, from_seq, limit).map(|(ops, _)| ops)
     }
 
-    /// Reads operations and associated mutation IDs within `(from_seq .. ]` up to `limit` from a specific `.wal` file.
+    /// Reads operations and associated mutation IDs within `(from_seq .. ]` up to `limit` from
+    /// a specific sealed `.wal` file. A missing file yields nothing; the caller detects the
+    /// gap it leaves.
     pub fn read_range_with_mutations(
         file_path: &Path,
         from_seq: SequenceNumber,
         limit: usize,
     ) -> Result<RecoveredLogData, ServerError> {
-        if limit == 0 || !file_path.exists() {
+        if limit == 0 {
             return Ok((Vec::new(), Vec::new()));
         }
-
-        let data = std::fs::read(file_path)?;
-        let mut offset = 0;
-        let mut collected = Vec::new();
-        let mut mutations = Vec::new();
-
-        while offset < data.len() && collected.len() < limit {
-            match decode_wal_batch_from_slice(&data[offset..]) {
-                Ok(WalBatchDecodeResult::Ok {
-                    ops,
-                    mutation_id,
-                    bytes_consumed,
-                }) => {
-                    for op in ops {
-                        if op.seq.get() > from_seq.get() {
-                            if let Some(m_id) = mutation_id {
-                                mutations.push((m_id, op.seq));
-                            }
-                            collected.push(op);
-                            if collected.len() >= limit {
-                                break;
-                            }
-                        }
-                    }
-                    offset += bytes_consumed;
-                }
-                Ok(WalBatchDecodeResult::CleanEof) => break,
-                Ok(WalBatchDecodeResult::TornWrite {
-                    valid_bytes_offset, ..
-                }) => {
-                    tracing::warn!(
-                        path = ?file_path,
-                        valid_bytes_offset = offset + valid_bytes_offset,
-                        "Torn write detected while reading WAL segment"
-                    );
-                    break;
-                }
-                Err(e) => return Err(ServerError::WalCorruption(e.to_string())),
+        let dir = file_path.parent().unwrap_or_else(|| Path::new(""));
+        if file_path
+            .file_name()
+            .is_some_and(|name| name == ACTIVE_SEGMENT)
+        {
+            io_probe::record(IoEvent::ActiveWalPathRead, dir);
+        } else {
+            io_probe::record(IoEvent::SegmentRead, dir);
+        }
+        let data = match std::fs::read(file_path) {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), Vec::new()))
             }
+            Err(e) => return Err(e.into()),
+        };
+        let decoded = decode_segment(&data, from_seq, limit)?;
+        if decoded.torn {
+            tracing::warn!(
+                path = ?file_path,
+                valid_bytes = decoded.valid_len,
+                "Torn write detected while reading WAL segment"
+            );
         }
-
-        Ok((collected, mutations))
+        Ok((decoded.ops, decoded.mutations))
     }
 
-    /// Recovers all operations and mutation IDs present in sealed segments and active.wal in chronological order.
-    pub fn recover_all(&mut self) -> Result<RecoveredLogData, ServerError> {
-        let mut all_ops = Vec::new();
-        let mut all_mutations = Vec::new();
-
-        for sealed in self.list_sealed_segments()? {
-            let (ops, muts) =
-                Self::read_range_with_mutations(&sealed.path, SequenceNumber::new(0), usize::MAX)?;
-            all_ops.extend(ops);
-            all_mutations.extend(muts);
-        }
-
-        let active_path = self.segments_dir.join("active.wal");
-        if active_path.exists() {
-            let (active_ops, active_muts) =
-                Self::read_range_with_mutations(&active_path, SequenceNumber::new(0), usize::MAX)?;
-            all_ops.extend(active_ops);
-            all_mutations.extend(active_muts);
-        }
-
-        Ok((all_ops, all_mutations))
-    }
-
-    /// Inspects and repairs `active.wal` upon opening, seeking to the end for subsequent appends.
-    fn inspect_active_segment(&mut self) -> Result<(), ServerError> {
-        let active_path = self.segments_dir.join("active.wal");
+    /// Inspects and repairs `active.wal` upon opening, reading it through the locked handle
+    /// that later appends use, and returns its operations and mutation IDs.
+    fn inspect_active_segment(&mut self) -> Result<RecoveredLogData, ServerError> {
+        let active_path = self.segments_dir.join(ACTIVE_SEGMENT);
         if !active_path.exists() {
-            return Ok(());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         let mut file = OpenOptions::new()
@@ -280,57 +264,87 @@ impl WarmDiskLog {
         })?;
 
         let mut data = Vec::new();
-        std::io::Read::read_to_end(&mut file, &mut data)?;
+        file.read_to_end(&mut data)?;
+        let decoded = decode_segment(&data, SequenceNumber::new(0), usize::MAX)?;
 
-        let mut offset = 0;
-        let mut start_seq = None;
-        let mut end_seq = None;
-        let mut valid_len = 0;
-
-        while offset < data.len() {
-            match decode_wal_batch_from_slice(&data[offset..]) {
-                Ok(WalBatchDecodeResult::Ok {
-                    ops,
-                    bytes_consumed,
-                    ..
-                }) => {
-                    for op in ops {
-                        if start_seq.is_none() {
-                            start_seq = Some(op.seq);
-                        }
-                        end_seq = Some(op.seq);
-                    }
-                    offset += bytes_consumed;
-                    valid_len = offset;
-                }
-                Ok(WalBatchDecodeResult::CleanEof) => break,
-                Ok(WalBatchDecodeResult::TornWrite {
-                    valid_bytes_offset, ..
-                }) => {
-                    valid_len = offset + valid_bytes_offset;
-                    tracing::warn!(
-                        path = ?active_path,
-                        valid_len = valid_len,
-                        "Truncating torn write in active.wal"
-                    );
-                    break;
-                }
-                Err(e) => return Err(ServerError::WalCorruption(e.to_string())),
-            }
+        if decoded.torn {
+            tracing::warn!(
+                path = ?active_path,
+                valid_len = decoded.valid_len,
+                "Truncating torn write in active.wal"
+            );
         }
-
-        if valid_len < data.len() {
-            file.set_len(valid_len as u64)?;
+        if decoded.valid_len < data.len() {
+            file.set_len(decoded.valid_len as u64)?;
             file.sync_all()?;
         }
 
-        file.seek(SeekFrom::End(0))?;
         self.active_file = Some(file);
-        self.active_start_seq = start_seq;
-        self.active_end_seq = end_seq;
+        self.active_start_seq = decoded.ops.first().map(|op| op.seq);
+        self.active_end_seq = decoded.ops.last().map(|op| op.seq);
+        self.active_len = decoded.valid_len as u64;
 
-        Ok(())
+        Ok((decoded.ops, decoded.mutations))
     }
+}
+
+/// Operations decoded from the framed batches of one segment.
+#[derive(Debug, Default)]
+pub(crate) struct DecodedSegment {
+    pub(crate) ops: Vec<SequencedOperation>,
+    pub(crate) mutations: Vec<(MutationId, SequenceNumber)>,
+    /// Length of the prefix made of complete batches that were decoded.
+    pub(crate) valid_len: usize,
+    /// Whether decoding stopped at a torn write: an incomplete or damaged batch at the end,
+    /// or a zero-filled tail.
+    pub(crate) torn: bool,
+}
+
+/// Decodes the operations after `from_seq` in the framed batches of `data`, with the mutation
+/// IDs of their batches, up to `limit` operations. Decoding stops at the first torn write;
+/// corruption anywhere else is an error.
+pub(crate) fn decode_segment(
+    data: &[u8],
+    from_seq: SequenceNumber,
+    limit: usize,
+) -> Result<DecodedSegment, ServerError> {
+    let mut decoded = DecodedSegment::default();
+    let mut offset = 0;
+
+    while offset < data.len() && decoded.ops.len() < limit {
+        match decode_wal_batch_from_slice(&data[offset..]) {
+            Ok(WalBatchDecodeResult::Ok {
+                ops,
+                mutation_id,
+                bytes_consumed,
+            }) => {
+                for op in ops {
+                    if op.seq.get() > from_seq.get() {
+                        if let Some(m_id) = mutation_id {
+                            decoded.mutations.push((m_id, op.seq));
+                        }
+                        decoded.ops.push(op);
+                        if decoded.ops.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+                offset += bytes_consumed;
+                decoded.valid_len = offset;
+            }
+            Ok(WalBatchDecodeResult::CleanEof) => break,
+            Ok(WalBatchDecodeResult::TornWrite {
+                valid_bytes_offset, ..
+            }) => {
+                decoded.valid_len = offset + valid_bytes_offset;
+                decoded.torn = true;
+                break;
+            }
+            Err(e) => return Err(ServerError::WalCorruption(e.to_string())),
+        }
+    }
+
+    Ok(decoded)
 }
 
 /// Helper function to parse `segment_{start}_{end}{extension}` filenames into (start_seq, end_seq).

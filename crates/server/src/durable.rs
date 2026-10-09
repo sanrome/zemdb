@@ -4,10 +4,16 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::blocking::blocking_io;
 use crate::fail_point;
 
 /// Flushes a directory's entries to disk so that file creations, renames and deletions
-/// inside it survive a power loss. A no-op on platforms that cannot open directories.
+/// inside it survive a power loss.
+///
+/// A no-op on platforms other than Unix. On Windows `File::open` cannot open a directory
+/// (that needs `FILE_FLAG_BACKUP_SEMANTICS`), and NTFS journals directory changes itself, so
+/// there is nothing to call; opening the directory anyway would only turn every durable write
+/// into an error there.
 pub(crate) fn sync_dir(dir_path: &Path) -> std::io::Result<()> {
     injected("sync_dir", dir_path)?;
     #[cfg(unix)]
@@ -61,8 +67,13 @@ pub(crate) fn tmp_path_for(path: &Path) -> PathBuf {
 ///
 /// Writes a temporary sibling file, syncs it, renames it over the destination and syncs the
 /// parent directory. A crash at any point leaves either the previous or the new content,
-/// never a partially written file.
+/// never a partially written file. Callers are often async (the room actor saving its roster
+/// or `log_meta.json`, the admin API), so the blocking I/O runs through [`blocking_io`].
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    blocking_io(|| write_atomic_blocking(path, bytes))
+}
+
+fn write_atomic_blocking(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp_path = tmp_path_for(path);
     {
         let mut tmp_file = File::create(&tmp_path)?;
