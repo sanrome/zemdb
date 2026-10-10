@@ -23,12 +23,13 @@ pub use mutation::{
 };
 pub use protocol::{
     check_operation_size, classify_checksum_mismatch, classify_zeroed_header, decode_batch_payload,
-    decode_message, decode_wal_batch_from_slice, encode_message, encode_wal_batch,
-    encode_wal_record, parse_batch_header, peek_version, replay_wal_records,
-    validate_snapshot_envelope, BatchHeader, BatchPayloadDecode, ClientMessage, DecodeError,
-    ErrorCode, OperationSizeError, SequencedOperation, ServerMessage, SnapshotCompression,
-    SnapshotEnvelopeError, SnapshotEnvelopeHeader, SnapshotEnvelopeValidator, WalBatchDecodeResult,
-    WalFrameError, BATCH_HEADER_SIZE, BATCH_MAGIC, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE,
+    decode_client_message, decode_message, decode_wal_batch_from_slice, encode_message,
+    encode_wal_batch, encode_wal_record, parse_batch_header, peek_client_message_kind,
+    peek_version, replay_wal_records, validate_snapshot_envelope, BatchHeader, BatchPayloadDecode,
+    ClientMessage, ClientMessageKind, DecodeError, ErrorCode, OperationSizeError,
+    SequencedOperation, ServerMessage, SnapshotCompression, SnapshotEnvelopeError,
+    SnapshotEnvelopeHeader, SnapshotEnvelopeValidator, WalBatchDecodeResult, WalFrameError,
+    BATCH_HEADER_SIZE, BATCH_MAGIC, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE, MAX_MESSAGE_VALUES,
     MAX_RESPONSE_OPS_BYTES, PROTOCOL_HEADER_LEN, PROTOCOL_VERSION, SNAPSHOT_HEADER_LEN,
     SNAPSHOT_MAGIC, SNAPSHOT_VERSION,
 };

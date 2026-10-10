@@ -6,8 +6,10 @@ use serde::{Deserialize, Serialize};
 /// Error codes returned by the coordination server.
 ///
 /// Clients decide how to react from the code: `Unauthorized` asks for a new token,
-/// `Forbidden` is permanent, `ClientNotRegistered` asks to register again, and `Unavailable`
-/// and `Timeout` may be retried (commits are deduplicated by `MutationId`).
+/// `Forbidden` is permanent, `ClientNotRegistered` asks to register again, and `Unavailable`,
+/// `Timeout` and `RequestTimeout` may be retried (commits are deduplicated by `MutationId`).
+///
+/// Encoded by variant index, so new codes are appended at the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ErrorCode {
     SchemaViolation,
@@ -49,6 +51,9 @@ pub enum ErrorCode {
     /// A schema with this id is already registered. A schema is declared once; it evolves
     /// only by appending nullable columns.
     SchemaAlreadyExists,
+    /// The request body did not arrive in time (HTTP 408). Transient: retrying with backoff is
+    /// safe (commits are deduplicated by `MutationId`).
+    RequestTimeout,
 }
 
 /// An operation ordered by the coordination server with assigned sequence ID.
@@ -153,6 +158,61 @@ pub enum ClientMessage {
         snapshot_hash: [u8; 32],
         data: bytes::Bytes,
     },
+}
+
+impl ClientMessage {
+    /// The kind of this message.
+    pub fn kind(&self) -> ClientMessageKind {
+        match self {
+            ClientMessage::Commit { .. } => ClientMessageKind::Commit,
+            ClientMessage::Ack { .. } => ClientMessageKind::Ack,
+            ClientMessage::Sync { .. } => ClientMessageKind::Sync,
+            ClientMessage::Heartbeat { .. } => ClientMessageKind::Heartbeat,
+            ClientMessage::RegisterClient { .. } => ClientMessageKind::RegisterClient,
+            ClientMessage::GetSchema { .. } => ClientMessageKind::GetSchema,
+            ClientMessage::DeregisterClient { .. } => ClientMessageKind::DeregisterClient,
+            ClientMessage::RequestSnapshotChunk { .. } => ClientMessageKind::RequestSnapshotChunk,
+            ClientMessage::UploadSnapshotChunk { .. } => ClientMessageKind::UploadSnapshotChunk,
+        }
+    }
+}
+
+/// The variant of a [`ClientMessage`], without its fields.
+///
+/// The discriminants are the variant indexes of `ClientMessage`, which is how its encoding
+/// starts, so the kind of a frame can be read without decoding the rest (see
+/// [`peek_client_message_kind`](crate::protocol::peek_client_message_kind)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClientMessageKind {
+    Commit = 0,
+    Ack = 1,
+    Sync = 2,
+    Heartbeat = 3,
+    RegisterClient = 4,
+    GetSchema = 5,
+    DeregisterClient = 6,
+    RequestSnapshotChunk = 7,
+    UploadSnapshotChunk = 8,
+}
+
+impl ClientMessageKind {
+    /// Every kind, indexed by its discriminant.
+    const ALL: [ClientMessageKind; 9] = [
+        ClientMessageKind::Commit,
+        ClientMessageKind::Ack,
+        ClientMessageKind::Sync,
+        ClientMessageKind::Heartbeat,
+        ClientMessageKind::RegisterClient,
+        ClientMessageKind::GetSchema,
+        ClientMessageKind::DeregisterClient,
+        ClientMessageKind::RequestSnapshotChunk,
+        ClientMessageKind::UploadSnapshotChunk,
+    ];
+
+    /// The kind whose `ClientMessage` variant has index `index`, if any.
+    pub(crate) fn from_variant_index(index: u32) -> Option<Self> {
+        Self::ALL.get(usize::try_from(index).ok()?).copied()
+    }
 }
 
 /// Unified message sent from Server to Client.
@@ -266,3 +326,7 @@ impl ServerMessage {
         *blake3::hash(snapshot_bytes).as_bytes()
     }
 }
+
+#[cfg(test)]
+#[path = "tests/messages.rs"]
+mod tests;

@@ -81,6 +81,10 @@ pub enum ServerError {
     #[error("Timeout: {0}")]
     Timeout(String),
 
+    /// The request body did not arrive in time; the request may be retried.
+    #[error("Request timeout: {0}")]
+    RequestTimeout(String),
+
     #[error("Invalid sequence number: expected <= {expected}, got {actual}")]
     InvalidSequence {
         expected: SequenceNumber,
@@ -133,6 +137,7 @@ impl ServerError {
             ServerError::Forbidden(_) => ErrorCode::Forbidden,
             ServerError::Unavailable(_) => ErrorCode::Unavailable,
             ServerError::Timeout(_) => ErrorCode::Timeout,
+            ServerError::RequestTimeout(_) => ErrorCode::RequestTimeout,
             ServerError::RateLimited => ErrorCode::RateLimited,
             ServerError::InvalidSequence { .. } => ErrorCode::InvalidSequence,
             ServerError::BadRequest(_) => ErrorCode::BadRequest,
@@ -165,6 +170,7 @@ impl ServerError {
             ServerError::RoomLocked(_) => StatusCode::LOCKED,
             ServerError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             ServerError::Timeout(_) => StatusCode::GATEWAY_TIMEOUT,
+            ServerError::RequestTimeout(_) => StatusCode::REQUEST_TIMEOUT,
             ServerError::Io(_)
             | ServerError::Wal(_)
             | ServerError::WalCorruption(_)

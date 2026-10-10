@@ -499,3 +499,196 @@ fn operation_whose_log_record_is_too_large_is_rejected() {
     ));
     assert!(encode_wal_record(&op, None).is_err());
 }
+
+fn commit_with(op: Operation) -> ClientMessage {
+    ClientMessage::Commit {
+        correlation_id: CorrelationId::new(1),
+        room_id: RoomId::new("room-limits").unwrap(),
+        client_id: ClientId::new("client-1").unwrap(),
+        mutation_id: MutationId::new([3u8; 16]),
+        last_ack_seq: SequenceNumber::new(0),
+        op,
+    }
+}
+
+fn nulls(count: usize) -> Vec<Value> {
+    vec![Value::Null; count]
+}
+
+#[test]
+fn rows_keys_and_deltas_over_the_column_limit_are_rejected() {
+    let over = schema::MAX_COLUMNS + 1;
+    let row = Operation::insert(0, PrimaryKey::single(1i64), CompactRow::new(nulls(over)), 0);
+    let key = Operation::delete(0, PrimaryKey::composite(nulls(over)), 0);
+    let deltas = Operation::update(
+        0,
+        PrimaryKey::single(1i64),
+        (0..over)
+            .map(|i| ColumnUpdate::new(i as u16, Value::Null))
+            .collect(),
+        0,
+    );
+    for op in [row, key, deltas] {
+        let frame = encode_message(&commit_with(op)).unwrap();
+        assert!(matches!(
+            decode_client_message(&frame),
+            Err(DecodeError::Malformed(_))
+        ));
+        // The limit belongs to the types, so it holds without a value budget too.
+        assert!(matches!(
+            decode_message::<ClientMessage>(&frame),
+            Err(DecodeError::Malformed(_))
+        ));
+    }
+}
+
+#[test]
+fn the_largest_operation_a_table_allows_is_accepted() {
+    // A row of MAX_COLUMNS values and a key of as many: the most values a commit can carry.
+    let max = schema::MAX_COLUMNS;
+    let insert = Operation::insert(
+        0,
+        PrimaryKey::composite(nulls(max)),
+        CompactRow::new(nulls(max)),
+        0,
+    );
+    let update = Operation::update(
+        0,
+        PrimaryKey::composite(nulls(max)),
+        (0..max)
+            .map(|i| ColumnUpdate::new(i as u16, Value::Null))
+            .collect(),
+        0,
+    );
+    for op in [insert, update] {
+        let msg = commit_with(op);
+        let frame = encode_message(&msg).unwrap();
+        assert_eq!(decode_client_message(&frame).unwrap(), msg);
+    }
+}
+
+#[test]
+fn a_commit_of_large_values_near_the_frame_limit_is_accepted() {
+    let probe = commit_with(Operation::insert(
+        0,
+        PrimaryKey::single(1i64),
+        CompactRow::new(vec![
+            Value::Bytes(Box::default()),
+            Value::Bytes(Box::default()),
+        ]),
+        0,
+    ));
+    let room = MAX_FRAME_SIZE - encode_message(&probe).unwrap().len() - 64;
+    let msg = commit_with(Operation::insert(
+        0,
+        PrimaryKey::single(1i64),
+        CompactRow::new(vec![
+            Value::Bytes(vec![1u8; room / 2].into_boxed_slice()),
+            Value::Bytes(vec![2u8; room / 2].into_boxed_slice()),
+        ]),
+        0,
+    ));
+    let frame = encode_message(&msg).unwrap();
+    assert!(frame.len() > MAX_FRAME_SIZE - 128);
+    assert_eq!(decode_client_message(&frame).unwrap(), msg);
+}
+
+#[test]
+fn the_kind_is_read_without_decoding_the_rest_of_the_frame() {
+    let mut frame = encode_message(&commit_with(Operation::delete(
+        0,
+        PrimaryKey::single(1i64),
+        0,
+    )))
+    .unwrap();
+    frame.truncate(PROTOCOL_HEADER_LEN + 1);
+    frame.extend_from_slice(&[0xFF; 32]);
+    assert_eq!(
+        peek_client_message_kind(&frame).unwrap(),
+        ClientMessageKind::Commit
+    );
+    assert!(matches!(
+        decode_client_message(&frame),
+        Err(DecodeError::Malformed(_))
+    ));
+}
+
+#[test]
+fn peeking_checks_the_header_and_the_variant() {
+    let frame = encode_message(&commit_with(Operation::delete(
+        0,
+        PrimaryKey::single(1i64),
+        0,
+    )))
+    .unwrap();
+    let mut other_version = frame.clone();
+    other_version[2] = PROTOCOL_VERSION + 1;
+    assert!(matches!(
+        peek_client_message_kind(&other_version),
+        Err(DecodeError::UnsupportedVersion { .. })
+    ));
+    assert!(matches!(
+        peek_client_message_kind(&frame[..PROTOCOL_HEADER_LEN]),
+        Err(DecodeError::Malformed(_))
+    ));
+    let mut unknown = frame[..PROTOCOL_HEADER_LEN].to_vec();
+    unknown.push(9);
+    assert!(matches!(
+        peek_client_message_kind(&unknown),
+        Err(DecodeError::Malformed(_))
+    ));
+}
+
+#[test]
+fn every_value_variant_round_trips_in_every_format() {
+    let values = vec![
+        Value::Null,
+        Value::Int(-7),
+        Value::Float(1.5),
+        Value::Timestamp(1_700_000_000),
+        Value::String("text".into()),
+        Value::Bool(true),
+        Value::Bytes(vec![1, 2, 3].into_boxed_slice()),
+        Value::Uuid([9u8; 16]),
+    ];
+    for value in values {
+        let frame = encode_message(&value).unwrap();
+        assert_eq!(decode_message::<Value>(&frame).unwrap(), value);
+        let fixint = bincode::serialize(&value).unwrap();
+        assert_eq!(bincode::deserialize::<Value>(&fixint).unwrap(), value);
+        let json = serde_json::to_string(&value).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&json).unwrap(), value);
+    }
+}
+
+#[test]
+fn error_codes_keep_their_wire_indexes() {
+    // Codes are encoded by variant index: a new code goes at the end, never in between.
+    let codes = [
+        ErrorCode::SchemaViolation,
+        ErrorCode::RoomNotFound,
+        ErrorCode::ClientNotRegistered,
+        ErrorCode::BehindCompaction,
+        ErrorCode::RateLimited,
+        ErrorCode::RoomLocked,
+        ErrorCode::Internal,
+        ErrorCode::Unauthorized,
+        ErrorCode::RoomAlreadyExists,
+        ErrorCode::TableAlreadyExists,
+        ErrorCode::SchemaNotFound,
+        ErrorCode::InvalidSequence,
+        ErrorCode::ProtocolVersionMismatch,
+        ErrorCode::BadRequest,
+        ErrorCode::SnapshotSuperseded,
+        ErrorCode::Forbidden,
+        ErrorCode::Unavailable,
+        ErrorCode::Timeout,
+        ErrorCode::SchemaAlreadyExists,
+        ErrorCode::RequestTimeout,
+    ];
+    for (index, code) in codes.into_iter().enumerate() {
+        let frame = encode_message(&code).unwrap();
+        assert_eq!(frame[PROTOCOL_HEADER_LEN..], [index as u8], "{code:?}");
+        assert_eq!(decode_message::<ErrorCode>(&frame).unwrap(), code);
+    }
+}

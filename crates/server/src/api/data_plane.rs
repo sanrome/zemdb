@@ -9,7 +9,9 @@ use zemdb_core::protocol::messages::{ClientMessage, ErrorCode, ServerMessage};
 
 use crate::actor::command::RoomCommand;
 use crate::api::auth::verify_client_token_bound;
-use crate::api::extract::{ensure_payload_identity, AuthenticatedRoom, BinaryMessage, RoomPath};
+use crate::api::extract::{
+    ensure_payload_identity, AuthenticatedRoom, BinaryMessage, RegisterMessage, RoomPath,
+};
 use crate::api::router::AppState;
 use crate::error::ServerError;
 
@@ -59,10 +61,10 @@ pub(crate) fn binary_error(
 }
 
 /// Reply to a message of another kind than the endpoint handles.
-fn unexpected_message(room_id: RoomId, expected: &str) -> Response {
+pub(crate) fn unexpected_message(room_id: Option<RoomId>, expected: &str) -> Response {
     binary_error(
         None,
-        Some(room_id),
+        room_id,
         ServerError::BadRequest(format!("Expected {expected} message")),
     )
 }
@@ -82,22 +84,19 @@ async fn ask_room<R>(
 /// `POST /rooms/:room_id/register`: Handshake endpoint delivering current head_seq and schema in 1 RTT.
 ///
 /// The client token travels inside the message, so it is verified here, bound to the client
-/// and room the message names.
+/// and room the message names. Until then the request is unauthenticated, so
+/// [`RegisterMessage`] rejects any other message kind without decoding it.
 pub async fn register(
     State(state): State<AppState>,
     RoomPath(path_room_id): RoomPath,
-    BinaryMessage(msg): BinaryMessage<ClientMessage>,
-) -> Response {
-    let ClientMessage::RegisterClient {
+    RegisterMessage {
         correlation_id,
         room_id,
         client_id,
         auth_token,
         current_seq,
-    } = msg
-    else {
-        return unexpected_message(path_room_id, "RegisterClient");
-    };
+    }: RegisterMessage,
+) -> Response {
     let fail = |room_id: RoomId, err| binary_error(Some(correlation_id), Some(room_id), err);
 
     if let Err(err) = ensure_payload_identity(&path_room_id, None, &room_id, None) {
@@ -136,7 +135,7 @@ pub async fn register(
 pub async fn commit(
     State(state): State<AppState>,
     auth: AuthenticatedRoom,
-    BinaryMessage(msg): BinaryMessage<ClientMessage>,
+    BinaryMessage(msg): BinaryMessage,
 ) -> Response {
     let ClientMessage::Commit {
         correlation_id,
@@ -147,7 +146,7 @@ pub async fn commit(
         op,
     } = msg
     else {
-        return unexpected_message(auth.room_id, "Commit");
+        return unexpected_message(Some(auth.room_id), "Commit");
     };
     let fail = |room_id: RoomId, err| binary_error(Some(correlation_id), Some(room_id), err);
 
@@ -189,7 +188,7 @@ pub async fn commit(
 pub async fn sync(
     State(state): State<AppState>,
     auth: AuthenticatedRoom,
-    BinaryMessage(msg): BinaryMessage<ClientMessage>,
+    BinaryMessage(msg): BinaryMessage,
 ) -> Response {
     let ClientMessage::Sync {
         correlation_id,
@@ -199,7 +198,7 @@ pub async fn sync(
         max_batch_size,
     } = msg
     else {
-        return unexpected_message(auth.room_id, "Sync");
+        return unexpected_message(Some(auth.room_id), "Sync");
     };
     let fail = |room_id: RoomId, err| binary_error(Some(correlation_id), Some(room_id), err);
 
@@ -239,7 +238,7 @@ pub async fn sync(
 pub async fn ack(
     State(state): State<AppState>,
     auth: AuthenticatedRoom,
-    BinaryMessage(msg): BinaryMessage<ClientMessage>,
+    BinaryMessage(msg): BinaryMessage,
 ) -> Response {
     let ClientMessage::Ack {
         correlation_id,
@@ -248,7 +247,7 @@ pub async fn ack(
         ack_seq,
     } = msg
     else {
-        return unexpected_message(auth.room_id, "Ack");
+        return unexpected_message(Some(auth.room_id), "Ack");
     };
     let fail = |room_id: RoomId, err| binary_error(Some(correlation_id), Some(room_id), err);
 
@@ -286,7 +285,7 @@ pub async fn ack(
 pub async fn heartbeat(
     State(state): State<AppState>,
     auth: AuthenticatedRoom,
-    BinaryMessage(msg): BinaryMessage<ClientMessage>,
+    BinaryMessage(msg): BinaryMessage,
 ) -> Response {
     let ClientMessage::Heartbeat {
         correlation_id,
@@ -294,7 +293,7 @@ pub async fn heartbeat(
         client_id,
     } = msg
     else {
-        return unexpected_message(auth.room_id, "Heartbeat");
+        return unexpected_message(Some(auth.room_id), "Heartbeat");
     };
     let fail = |room_id: RoomId, err| binary_error(Some(correlation_id), Some(room_id), err);
 
@@ -331,14 +330,14 @@ pub async fn heartbeat(
 pub async fn get_schema(
     State(state): State<AppState>,
     auth: AuthenticatedRoom,
-    BinaryMessage(msg): BinaryMessage<ClientMessage>,
+    BinaryMessage(msg): BinaryMessage,
 ) -> Response {
     let ClientMessage::GetSchema {
         correlation_id,
         room_id,
     } = msg
     else {
-        return unexpected_message(auth.room_id, "GetSchema");
+        return unexpected_message(Some(auth.room_id), "GetSchema");
     };
     let fail = |room_id: RoomId, err| binary_error(Some(correlation_id), Some(room_id), err);
 
@@ -364,7 +363,7 @@ pub async fn get_schema(
 pub async fn deregister(
     State(state): State<AppState>,
     auth: AuthenticatedRoom,
-    BinaryMessage(msg): BinaryMessage<ClientMessage>,
+    BinaryMessage(msg): BinaryMessage,
 ) -> Response {
     let ClientMessage::DeregisterClient {
         correlation_id,
@@ -372,7 +371,7 @@ pub async fn deregister(
         client_id,
     } = msg
     else {
-        return unexpected_message(auth.room_id, "DeregisterClient");
+        return unexpected_message(Some(auth.room_id), "DeregisterClient");
     };
     let fail = |room_id: RoomId, err| binary_error(Some(correlation_id), Some(room_id), err);
 

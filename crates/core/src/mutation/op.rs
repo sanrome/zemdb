@@ -1,3 +1,4 @@
+use crate::value::row::deserialize_columns;
 use crate::value::{CompactRow, PrimaryKey, Value};
 use serde::{Deserialize, Serialize};
 
@@ -43,8 +44,12 @@ pub enum OperationKind {
     /// Inserts a tuple. If the PK already exists, replaces all fields (upsert).
     Insert { row: CompactRow },
     /// Updates specific fields of an existing tuple by PK.
-    /// Updates are maintained strictly sorted by `column_idx` ascending.
-    Update { updates: Vec<ColumnUpdate> },
+    /// Updates are maintained strictly sorted by `column_idx` ascending. Deserialization
+    /// rejects more than [`MAX_COLUMNS`](crate::schema::MAX_COLUMNS) deltas.
+    Update {
+        #[serde(deserialize_with = "deserialize_columns")]
+        updates: Vec<ColumnUpdate>,
+    },
     /// Deletes a tuple by PK.
     Delete,
 }

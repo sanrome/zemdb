@@ -183,6 +183,10 @@ fn unparsable_environment_values_fail_naming_the_variable() {
         ("ZEMDB_DORMANT_AFTER_SECS", "never"),
         ("ZEMDB_SNAPSHOT_DEMAND_TTL_SECS", "7d"),
         ("ZEMDB_ROOM_IDLE_TIMEOUT_SECS", "off"),
+        ("ZEMDB_HEADER_READ_TIMEOUT_SECS", "10s"),
+        ("ZEMDB_BODY_READ_TIMEOUT_SECS", "-1"),
+        ("ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC", "32KiB"),
+        ("ZEMDB_MAX_CONNECTIONS", "10k"),
     ] {
         let err = with_env(&[(name, value)]).unwrap_err();
         assert!(
@@ -290,7 +294,68 @@ fn empty_environment_values_count_as_unset() {
         "ZEMDB_DORMANT_AFTER_SECS",
         "ZEMDB_SNAPSHOT_DEMAND_TTL_SECS",
         "ZEMDB_ROOM_IDLE_TIMEOUT_SECS",
+        "ZEMDB_HEADER_READ_TIMEOUT_SECS",
+        "ZEMDB_BODY_READ_TIMEOUT_SECS",
+        "ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC",
+        "ZEMDB_MAX_CONNECTIONS",
     ];
     let vars: Vec<(&str, &str)> = names.iter().map(|name| (*name, "")).collect();
     assert_eq!(with_env(&vars).unwrap(), strong_config());
+}
+
+#[test]
+fn http_limits_have_defaults_and_toml_keys() {
+    let config = ServerConfig::default();
+    assert_eq!(config.header_read_timeout_secs, 10);
+    assert_eq!(config.body_read_timeout_secs, 60);
+    assert_eq!(config.body_min_rate_bytes_per_sec, 32 * 1024);
+    assert_eq!(config.max_connections, 10_000);
+    assert_eq!(ServerConfig::from_toml_str("").unwrap(), config);
+
+    let parsed = ServerConfig::from_toml_str(
+        "header_read_timeout_secs = 5\nbody_read_timeout_secs = 120\n\
+         body_min_rate_bytes_per_sec = 4096\nmax_connections = 500\n",
+    )
+    .unwrap();
+    assert_eq!(parsed.header_read_timeout_secs, 5);
+    assert_eq!(parsed.body_read_timeout_secs, 120);
+    assert_eq!(parsed.body_min_rate_bytes_per_sec, 4096);
+    assert_eq!(parsed.max_connections, 500);
+}
+
+#[test]
+fn http_limit_environment_variables_set_the_limits() {
+    let config = with_env(&[
+        ("ZEMDB_HEADER_READ_TIMEOUT_SECS", "5"),
+        ("ZEMDB_BODY_READ_TIMEOUT_SECS", "3600"),
+        ("ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC", "1024"),
+        ("ZEMDB_MAX_CONNECTIONS", "1"),
+    ])
+    .unwrap();
+    config.validate().unwrap();
+    assert_eq!(config.header_read_timeout_secs, 5);
+    assert_eq!(config.body_read_timeout_secs, 3600);
+    assert_eq!(config.body_min_rate_bytes_per_sec, 1024);
+    assert_eq!(config.max_connections, 1);
+}
+
+#[test]
+fn http_limits_outside_their_range_fail_naming_the_variable() {
+    for (name, value) in [
+        ("ZEMDB_HEADER_READ_TIMEOUT_SECS", "0"),
+        ("ZEMDB_HEADER_READ_TIMEOUT_SECS", "301"),
+        ("ZEMDB_BODY_READ_TIMEOUT_SECS", "0"),
+        ("ZEMDB_BODY_READ_TIMEOUT_SECS", "3601"),
+        ("ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC", "0"),
+        ("ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC", "1023"),
+        ("ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC", "1073741825"),
+        ("ZEMDB_MAX_CONNECTIONS", "0"),
+        ("ZEMDB_MAX_CONNECTIONS", "1000001"),
+    ] {
+        let err = with_env(&[(name, value)]).unwrap().validate().unwrap_err();
+        assert!(
+            matches!(&err, ServerError::Config(msg) if msg.contains(name)),
+            "{name}={value:?}: {err:?}"
+        );
+    }
 }

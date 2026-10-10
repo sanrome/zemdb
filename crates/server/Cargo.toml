@@ -14,6 +14,9 @@ bincode = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 lru = { workspace = true }
@@ -34,5 +37,5 @@ uuid = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.4", features = ["util"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
 

@@ -40,6 +40,11 @@ fn each_error_maps_to_its_code_and_status() {
             StatusCode::CONFLICT,
         ),
         (
+            ServerError::RequestTimeout(String::new()),
+            ErrorCode::RequestTimeout,
+            StatusCode::REQUEST_TIMEOUT,
+        ),
+        (
             ServerError::Internal(String::new()),
             ErrorCode::Internal,
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -65,6 +70,7 @@ fn decode_errors_are_client_errors() {
         DecodeError::TooShort { len: 1 },
         DecodeError::TooLarge { len: 1 << 30 },
         DecodeError::InvalidMagic { got: [0, 0] },
+        DecodeError::TooManyValues { max: 1 << 20 },
     ] {
         let err: ServerError = err.into();
         assert_eq!(err.to_error_code(), ErrorCode::BadRequest);

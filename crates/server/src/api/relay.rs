@@ -77,7 +77,7 @@ fn parse_snapshot_head_seq(headers: &HeaderMap) -> Result<u64, ServerError> {
 pub async fn request_chunk(
     State(state): State<AppState>,
     RelayAuth { room_id, .. }: RelayAuth,
-    BinaryMessage(msg): BinaryMessage<ClientMessage>,
+    BinaryMessage(msg): BinaryMessage,
 ) -> Response {
     let ClientMessage::RequestSnapshotChunk {
         correlation_id,
@@ -118,7 +118,7 @@ pub async fn request_chunk(
 pub async fn upload_chunk(
     State(state): State<AppState>,
     RelayAuth { room_id, uploader }: RelayAuth,
-    BinaryMessage(msg): BinaryMessage<ClientMessage>,
+    BinaryMessage(msg): BinaryMessage,
 ) -> Response {
     let ClientMessage::UploadSnapshotChunk {
         correlation_id,

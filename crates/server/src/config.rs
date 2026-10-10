@@ -82,6 +82,33 @@ pub struct ServerConfig {
     /// Largest snapshot the relay accepts, in bytes (default 512 MiB).
     #[serde(default = "default_max_snapshot_bytes")]
     pub max_snapshot_bytes: u64,
+
+    /// Time a connection has to deliver the headers of its next request: a client that does
+    /// not complete them in time, or that keeps a connection open without a request in
+    /// progress for longer, is disconnected (seconds, default 10).
+    #[serde(default = "default_header_read_timeout_secs")]
+    pub header_read_timeout_secs: u64,
+
+    /// Base time a request body has to arrive in full, counted from the end of its headers
+    /// and extended by one second per `body_min_rate_bytes_per_sec` bytes received; a request
+    /// whose body is still incomplete at the deadline fails with 408 (seconds, default 60).
+    /// Responses, such as SSE streams, have no time limit.
+    #[serde(default = "default_body_read_timeout_secs")]
+    pub body_read_timeout_secs: u64,
+
+    /// Minimum rate of a request body: each `body_min_rate_bytes_per_sec` bytes received
+    /// extend its deadline by one second (bytes per second, default 32 KiB/s). A body that
+    /// arrives at least this fast is never cut; one that trickles in slower is cut close to
+    /// `body_read_timeout_secs`.
+    #[serde(default = "default_body_min_rate_bytes_per_sec")]
+    pub body_min_rate_bytes_per_sec: u64,
+
+    /// Most connections served at once (default 10,000). At the limit the server stops
+    /// accepting connections until an open one closes; open connections are not affected.
+    /// Each connection takes a file descriptor, so the process limit of open files
+    /// (`ulimit -n`) must be above this value.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
 }
 
 fn default_host() -> String {
@@ -153,6 +180,22 @@ fn default_max_snapshot_bytes() -> u64 {
     512 * 1024 * 1024
 }
 
+fn default_header_read_timeout_secs() -> u64 {
+    10
+}
+
+fn default_body_read_timeout_secs() -> u64 {
+    60
+}
+
+fn default_body_min_rate_bytes_per_sec() -> u64 {
+    32 * 1024
+}
+
+fn default_max_connections() -> usize {
+    10_000
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -173,6 +216,10 @@ impl Default for ServerConfig {
             snapshot_demand_ttl_secs: default_snapshot_demand_ttl_secs(),
             idle_timeout_secs: default_idle_timeout_secs(),
             max_snapshot_bytes: default_max_snapshot_bytes(),
+            header_read_timeout_secs: default_header_read_timeout_secs(),
+            body_read_timeout_secs: default_body_read_timeout_secs(),
+            body_min_rate_bytes_per_sec: default_body_min_rate_bytes_per_sec(),
+            max_connections: default_max_connections(),
         }
     }
 }
@@ -182,6 +229,19 @@ pub const MIN_MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024;
 
 /// Largest accepted `max_snapshot_bytes` (64 GiB).
 pub const MAX_MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Accepted range of `header_read_timeout_secs`: from 1 second to 5 minutes.
+pub const HEADER_READ_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=300;
+
+/// Accepted range of `body_read_timeout_secs`: from 1 second to 1 hour.
+pub const BODY_READ_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=3600;
+
+/// Accepted range of `body_min_rate_bytes_per_sec`: from 1 KiB/s (a 16 MiB body may then take
+/// about 4.5 hours) to 1 GiB/s (in practice, no extension beyond the base time).
+pub const BODY_MIN_RATE_BYTES_PER_SEC_RANGE: std::ops::RangeInclusive<u64> = 1024..=1 << 30;
+
+/// Accepted range of `max_connections`: from 1 to 1,000,000.
+pub const MAX_CONNECTIONS_RANGE: std::ops::RangeInclusive<usize> = 1..=1_000_000;
 
 /// Minimum length, in bytes, of the client token secret and the admin secret.
 pub const MIN_SECRET_LEN: usize = 32;
@@ -220,9 +280,12 @@ impl ServerConfig {
     }
 
     /// Checks that `max_snapshot_bytes` lies within
-    /// [`MIN_MAX_SNAPSHOT_BYTES`]..=[`MAX_MAX_SNAPSHOT_BYTES`] and that every server default of
-    /// the room lifecycle policy lies within its range (the same ranges a room's overrides
-    /// must meet). The error names the setting and its environment variable.
+    /// [`MIN_MAX_SNAPSHOT_BYTES`]..=[`MAX_MAX_SNAPSHOT_BYTES`], that the HTTP limits lie within
+    /// [`HEADER_READ_TIMEOUT_SECS_RANGE`], [`BODY_READ_TIMEOUT_SECS_RANGE`],
+    /// [`BODY_MIN_RATE_BYTES_PER_SEC_RANGE`] and [`MAX_CONNECTIONS_RANGE`], and that every
+    /// server default of the room lifecycle policy
+    /// lies within its range (the same ranges a room's overrides must meet). The error names
+    /// the setting and its environment variable.
     pub fn validate_limits(&self) -> Result<(), ServerError> {
         if !(MIN_MAX_SNAPSHOT_BYTES..=MAX_MAX_SNAPSHOT_BYTES).contains(&self.max_snapshot_bytes) {
             return Err(ServerError::Config(format!(
@@ -231,6 +294,26 @@ impl ServerConfig {
                 self.max_snapshot_bytes
             )));
         }
+        check_range(
+            "header_read_timeout_secs (ZEMDB_HEADER_READ_TIMEOUT_SECS)",
+            self.header_read_timeout_secs,
+            HEADER_READ_TIMEOUT_SECS_RANGE,
+        )?;
+        check_range(
+            "body_read_timeout_secs (ZEMDB_BODY_READ_TIMEOUT_SECS)",
+            self.body_read_timeout_secs,
+            BODY_READ_TIMEOUT_SECS_RANGE,
+        )?;
+        check_range(
+            "body_min_rate_bytes_per_sec (ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC)",
+            self.body_min_rate_bytes_per_sec,
+            BODY_MIN_RATE_BYTES_PER_SEC_RANGE,
+        )?;
+        check_range(
+            "max_connections (ZEMDB_MAX_CONNECTIONS)",
+            self.max_connections,
+            MAX_CONNECTIONS_RANGE,
+        )?;
         self.lifecycle_settings()
             .check(|setting| format!("{} ({})", setting.field(), setting.env_var()))
             .map_err(ServerError::Config)
@@ -323,6 +406,18 @@ impl ServerConfig {
         if let Some(max_bytes) = parse_var(&var, "ZEMDB_MAX_SNAPSHOT_BYTES")? {
             self.max_snapshot_bytes = max_bytes;
         }
+        if let Some(secs) = parse_var(&var, "ZEMDB_HEADER_READ_TIMEOUT_SECS")? {
+            self.header_read_timeout_secs = secs;
+        }
+        if let Some(secs) = parse_var(&var, "ZEMDB_BODY_READ_TIMEOUT_SECS")? {
+            self.body_read_timeout_secs = secs;
+        }
+        if let Some(rate) = parse_var(&var, "ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC")? {
+            self.body_min_rate_bytes_per_sec = rate;
+        }
+        if let Some(max) = parse_var(&var, "ZEMDB_MAX_CONNECTIONS")? {
+            self.max_connections = max;
+        }
 
         use PolicySetting::*;
         if let Some(ops) = parse_var(&var, RamMaxOps.env_var())? {
@@ -383,6 +478,25 @@ where
             ServerError::Config(format!("{name} has an invalid value {raw:?}: {err}"))
         }),
     }
+}
+
+/// Checks that `value` lies within `range`; the error names the setting.
+fn check_range<T>(
+    name: &str,
+    value: T,
+    range: std::ops::RangeInclusive<T>,
+) -> Result<(), ServerError>
+where
+    T: PartialOrd + Display,
+{
+    if range.contains(&value) {
+        return Ok(());
+    }
+    Err(ServerError::Config(format!(
+        "{name} must be between {} and {}, got {value}",
+        range.start(),
+        range.end()
+    )))
 }
 
 fn check_secret(name: &str, value: &str, development_default: &str) -> Result<(), ServerError> {

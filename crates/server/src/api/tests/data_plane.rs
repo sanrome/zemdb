@@ -14,10 +14,12 @@ use tempfile::{tempdir, TempDir};
 use tower::ServiceExt;
 use zemdb_core::id::{ClientId, MutationId, SchemaId, SequenceNumber};
 use zemdb_core::mutation::{Operation, OperationKind};
-use zemdb_core::protocol::codec::{decode_message, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE};
+use zemdb_core::protocol::codec::{
+    decode_message, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE, PROTOCOL_HEADER_LEN,
+};
 use zemdb_core::protocol::messages::{ErrorCode, SequencedOperation};
 use zemdb_core::protocol::wal_frame::encode_wal_record;
-use zemdb_core::schema::{Schema, TableSchema};
+use zemdb_core::schema::{Schema, TableSchema, MAX_COLUMNS};
 use zemdb_core::value::{CompactRow, DataType, PrimaryKey, RowBuilder, Value};
 
 const AUTH_SECRET: &str = "data_plane_cluster_secret_key_1234";
@@ -330,6 +332,107 @@ async fn commit_whose_small_ints_expand_past_the_log_limit_is_a_bad_request() {
     let (status, _, reply) = fx.post("commit", &fx.commit_op(1, 0, op)).await;
     assert_bad_request(status, &reply);
 
+    let (status, _, reply) = fx.post("commit", &fx.commit(2, 0)).await;
+    assert_eq!(status, StatusCode::OK, "{reply:?}");
+    assert!(matches!(
+        reply,
+        ServerMessage::CommitAck { assigned_seq, .. } if assigned_seq == SequenceNumber::new(1)
+    ));
+}
+
+#[tokio::test]
+async fn register_rejects_another_message_kind_without_decoding_it() {
+    let fx = Fixture::new().await;
+    // A frame tagged as a Commit whose fields are garbage. Registration does not authenticate
+    // the request before reading the message, so it must stop at the tag: decoding the rest
+    // would answer "malformed" instead (and, with a crafted row, reserve its memory first).
+    let mut frame = encode_message(&fx.commit(1, 0)).unwrap();
+    frame.truncate(PROTOCOL_HEADER_LEN + 1);
+    frame.extend_from_slice(&[0xFF; 64]);
+    let request = Request::post(format!("/rooms/{}/register", fx.room_id))
+        .body(Body::from(frame))
+        .unwrap();
+    let response = fx.app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let reply: ServerMessage = decode_message(&body).unwrap();
+    assert_bad_request(status, &reply);
+    assert!(
+        matches!(&reply, ServerMessage::Error { message, room_id: Some(room), .. }
+            if message.contains("Expected RegisterClient message") && *room == fx.room_id),
+        "{reply:?}"
+    );
+}
+
+/// Posts a registration frame of exactly `len` bytes (its token padded), without credentials.
+async fn register_with_frame_of(fx: &Fixture, len: usize) -> (StatusCode, ServerMessage) {
+    let register = |auth_token: String| ClientMessage::RegisterClient {
+        correlation_id: CorrelationId::new(1),
+        room_id: fx.room_id.clone(),
+        client_id: fx.client_id.clone(),
+        auth_token,
+        current_seq: None,
+    };
+    let probe = encode_message(&register("x".repeat(1024))).unwrap().len();
+    let frame = encode_message(&register("x".repeat(1024 + len - probe))).unwrap();
+    assert_eq!(frame.len(), len);
+    let request = Request::post(format!("/rooms/{}/register", fx.room_id))
+        .body(Body::from(frame))
+        .unwrap();
+    let response = fx.app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, decode_message(&body).unwrap())
+}
+
+#[tokio::test]
+async fn registration_has_its_own_small_body_limit() {
+    use crate::api::router::MAX_REGISTER_BODY_SIZE;
+    let fx = Fixture::new().await;
+
+    // At the limit the frame is read and decoded: the padded token is then rejected.
+    let (status, reply) = register_with_frame_of(&fx, MAX_REGISTER_BODY_SIZE).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{reply:?}");
+
+    // One byte more is rejected before it is buffered, as the general body limit does.
+    let (status, reply) = register_with_frame_of(&fx, MAX_REGISTER_BODY_SIZE + 1).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{reply:?}");
+    assert!(
+        matches!(
+            reply,
+            ServerMessage::Error {
+                code: ErrorCode::BadRequest,
+                ..
+            }
+        ),
+        "{reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn commit_with_more_values_than_a_table_has_columns_is_rejected_when_decoded() {
+    let fx = Fixture::new().await;
+    // One Null more than any table can have columns: 64 KiB on the wire, rejected by the
+    // decoder before the room sees it (the room would answer `SchemaViolation`).
+    let table_id = schema().get_table_by_name("tasks").unwrap().table_id();
+    let op = Operation::insert(
+        table_id,
+        PrimaryKey::single(Value::Int(1)),
+        CompactRow::new(vec![Value::Null; MAX_COLUMNS + 1]),
+        1000,
+    );
+    let (status, _, reply) = fx.post("commit", &fx.commit_op(1, 0, op)).await;
+    assert_bad_request(status, &reply);
+    assert!(
+        matches!(&reply, ServerMessage::Error { message, .. } if message.contains("Malformed")),
+        "{reply:?}"
+    );
+
+    // The room is untouched: the next commit gets the first sequence.
     let (status, _, reply) = fx.post("commit", &fx.commit(2, 0)).await;
     assert_eq!(status, StatusCode::OK, "{reply:?}");
     assert!(matches!(
