@@ -204,7 +204,9 @@ where
     type Rejection = Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let (room_id, body) = read_frame(req, state).await?;
+        let (room_id, body) = read_frame(req, state)
+            .await
+            .map_err(|rejection| *rejection)?;
         decode_client_message(&body)
             .map(BinaryMessage)
             .map_err(|e| binary_error(None, room_id, e.into()))
@@ -234,7 +236,9 @@ where
     type Rejection = Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let (room_id, body) = read_frame(req, state).await?;
+        let (room_id, body) = read_frame(req, state)
+            .await
+            .map_err(|rejection| *rejection)?;
         let kind = peek_client_message_kind(&body)
             .map_err(|e| binary_error(None, room_id.clone(), e.into()))?;
         if kind != ClientMessageKind::RegisterClient {
@@ -261,8 +265,12 @@ where
 }
 
 /// Reads the body of a binary request within the router's body size limit, along with the
-/// path room id when it is valid (for the error frames).
-async fn read_frame<S>(mut req: Request, state: &S) -> Result<(Option<RoomId>, Bytes), Response>
+/// path room id when it is valid (for the error frames). The rejection is boxed to keep the
+/// `Result` small; callers unbox it into their own `Response` rejection.
+async fn read_frame<S>(
+    mut req: Request,
+    state: &S,
+) -> Result<(Option<RoomId>, Bytes), Box<Response>>
 where
     S: Send + Sync,
 {
@@ -273,7 +281,7 @@ where
         .and_then(|Path(raw)| RoomId::new(raw).ok());
     let body = Bytes::from_request(req, state)
         .await
-        .map_err(|rejection| body_rejection(rejection, room_id.clone()))?;
+        .map_err(|rejection| Box::new(body_rejection(rejection, room_id.clone())))?;
     Ok((room_id, body))
 }
 
@@ -292,7 +300,9 @@ where
     type Rejection = Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let (_, body) = read_frame(req, state).await?;
+        let (_, body) = read_frame(req, state)
+            .await
+            .map_err(|rejection| *rejection)?;
         Ok(BinaryBody(body))
     }
 }
