@@ -1,9 +1,10 @@
+use std::io::Cursor;
 use zemdb_core::id::MutationId;
 use zemdb_core::mutation::Operation;
 use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::protocol::wal_frame::{
-    classify_checksum_mismatch, classify_zeroed_header, decode_batch_payload,
-    decode_wal_batch_from_slice, encode_wal_batch, parse_batch_header, BatchPayloadDecode,
+    decode_batch_payload, decode_wal_batch_from_slice, encode_wal_batch, find_valid_frame,
+    parse_batch_header, replay_wal_records, BatchPayloadDecode, FrameAnomaly, InvalidHeader,
     WalBatchDecodeResult, WalFrameError, BATCH_HEADER_SIZE, BATCH_MAGIC,
 };
 use zemdb_core::value::{CompactRow, PrimaryKey, Value};
@@ -122,11 +123,43 @@ fn header_of(frame: &[u8]) -> &[u8; BATCH_HEADER_SIZE] {
     frame.first_chunk().unwrap()
 }
 
+fn bytes_frame(seq: u64, bytes: &[u8]) -> Vec<u8> {
+    let row = CompactRow::new(vec![Value::Int(1), Value::Bytes(bytes.into())]);
+    let op = SequencedOperation::new(
+        seq,
+        Operation::insert(0, PrimaryKey::single(1i64), row, 100),
+    );
+    encode_wal_batch(&[op], None).expect("encode ok")
+}
+
+fn log_of(frames: &[Vec<u8>]) -> Vec<u8> {
+    frames.concat()
+}
+
+/// Flips a bit of the payload length in the header of the frame at `offset`.
+fn flip_length_bit(log: &mut [u8], offset: usize) {
+    log[offset + 2] ^= 0x01;
+}
+
+fn assert_corruption(result: Result<WalBatchDecodeResult, WalFrameError>) {
+    assert!(
+        matches!(result, Err(WalFrameError::Corruption(_))),
+        "expected corruption, got {result:?}"
+    );
+}
+
+fn assert_torn(result: Result<WalBatchDecodeResult, WalFrameError>) {
+    assert!(
+        matches!(result, Ok(WalBatchDecodeResult::TornWrite { .. })),
+        "expected a torn write, got {result:?}"
+    );
+}
+
 #[test]
 fn header_and_payload_decode_a_frame() {
     let frame = delete_frame(1);
 
-    let header = parse_batch_header(header_of(&frame)).unwrap().unwrap();
+    let header = parse_batch_header(header_of(&frame)).unwrap();
     assert_eq!(header.frame_len(), frame.len());
     let decoded = decode_batch_payload(&header, &frame[BATCH_HEADER_SIZE..]).unwrap();
 
@@ -134,23 +167,47 @@ fn header_and_payload_decode_a_frame() {
 }
 
 #[test]
-fn zeroed_header_is_not_a_frame() {
-    assert_eq!(parse_batch_header(&[0u8; BATCH_HEADER_SIZE]).unwrap(), None);
-    assert!(classify_zeroed_header(true, 64).is_ok());
-    assert!(matches!(
-        classify_zeroed_header(false, 64),
-        Err(WalFrameError::Corruption(_))
-    ));
-}
-
-#[test]
-fn header_with_invalid_magic_is_corruption() {
+fn header_with_invalid_magic_is_invalid() {
     let mut frame = delete_frame(1);
     frame[0] = 0;
     assert!(matches!(
         parse_batch_header(header_of(&frame)),
-        Err(WalFrameError::Corruption(_))
+        Err(InvalidHeader::Magic(_))
     ));
+    assert!(matches!(
+        parse_batch_header(&[0u8; BATCH_HEADER_SIZE]),
+        Err(InvalidHeader::Magic([0, 0]))
+    ));
+}
+
+#[test]
+fn header_checksum_covers_every_field() {
+    let frame = delete_frame(1);
+    for byte in 2..BATCH_HEADER_SIZE {
+        let mut damaged = frame.clone();
+        damaged[byte] ^= 0x01;
+        assert!(
+            matches!(
+                parse_batch_header(header_of(&damaged)),
+                Err(InvalidHeader::Checksum { .. })
+            ),
+            "a flipped bit in byte {byte} must fail the header checksum"
+        );
+    }
+}
+
+#[test]
+fn header_with_checksummed_oversized_length_is_invalid() {
+    let mut header = [0u8; BATCH_HEADER_SIZE];
+    header[0..2].copy_from_slice(&BATCH_MAGIC);
+    header[2..6].copy_from_slice(&u32::MAX.to_le_bytes());
+    let crc = crc32fast::hash(&header[..BATCH_HEADER_SIZE - 4]);
+    header[BATCH_HEADER_SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
+
+    assert_eq!(
+        parse_batch_header(&header),
+        Err(InvalidHeader::PayloadTooLong(u32::MAX))
+    );
 }
 
 #[test]
@@ -158,7 +215,7 @@ fn payload_with_wrong_checksum_is_reported_not_decoded() {
     let mut frame = delete_frame(1);
     *frame.last_mut().unwrap() ^= 0xFF;
 
-    let header = parse_batch_header(header_of(&frame)).unwrap().unwrap();
+    let header = parse_batch_header(header_of(&frame)).unwrap();
     let decoded = decode_batch_payload(&header, &frame[BATCH_HEADER_SIZE..]).unwrap();
 
     assert!(matches!(
@@ -168,25 +225,120 @@ fn payload_with_wrong_checksum_is_reported_not_decoded() {
 }
 
 #[test]
-fn checksum_mismatch_is_corruption_only_before_a_complete_header() {
-    let next = delete_frame(2);
-
-    assert!(classify_checksum_mismatch(1, 2, &[]).is_ok());
-    assert!(classify_checksum_mismatch(1, 2, &next[..BATCH_HEADER_SIZE - 1]).is_ok());
-    assert!(classify_checksum_mismatch(1, 2, &[0u8; BATCH_HEADER_SIZE]).is_ok());
+fn anomaly_is_corruption_only_when_a_valid_frame_follows() {
+    let anomaly = FrameAnomaly::InvalidHeader(InvalidHeader::Magic([0, 0]));
+    assert!(anomaly.clone().classify(None).is_ok());
     assert!(matches!(
-        classify_checksum_mismatch(1, 2, &next[..BATCH_HEADER_SIZE]),
+        anomaly.classify(Some(40)),
         Err(WalFrameError::Corruption(_))
     ));
 }
 
 #[test]
-fn checksum_mismatch_before_a_partial_header_is_a_torn_write() {
-    let mut wal = delete_frame(1);
-    *wal.last_mut().unwrap() ^= 0xFF;
-    wal.extend_from_slice(&delete_frame(2)[..5]);
+fn search_finds_only_complete_valid_frames() {
+    let frame = delete_frame(2);
+    let mut log = vec![0xBA, 0x7C, 0x01];
+    let at = log.len() as u64;
+    log.extend_from_slice(&frame);
+    let end = log.len() as u64;
 
-    let res = decode_wal_batch_from_slice(&wal).expect("returns TornWrite");
+    let mut reader = Cursor::new(&log);
+    assert_eq!(find_valid_frame(&mut reader, 0, end).unwrap(), Some(at));
+    assert_eq!(find_valid_frame(&mut reader, at + 1, end).unwrap(), None);
+    // A frame that does not end before `end` is not complete.
+    assert_eq!(find_valid_frame(&mut reader, 0, end - 1).unwrap(), None);
 
-    assert!(matches!(res, WalBatchDecodeResult::TornWrite { .. }));
+    let mut damaged = log.clone();
+    *damaged.last_mut().unwrap() ^= 0xFF;
+    assert_eq!(
+        find_valid_frame(&mut Cursor::new(&damaged), 0, end).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn search_finds_frames_across_window_edges() {
+    let frame = delete_frame(2);
+    // Frames that start just before, at, and after the edge of the 64 KiB scan window.
+    for start in [64 * 1024 - 5, 64 * 1024 - 1, 64 * 1024, 64 * 1024 + 3] {
+        let mut log = vec![0x55u8; start];
+        log.extend_from_slice(&frame);
+        let found = find_valid_frame(&mut Cursor::new(&log), 1, log.len() as u64).unwrap();
+        assert_eq!(found, Some(start as u64), "frame at {start}");
+    }
+}
+
+#[test]
+fn flipped_length_in_the_middle_is_corruption() {
+    let frames = [delete_frame(1), delete_frame(2), delete_frame(3)];
+    let second = frames[0].len();
+    let mut log = log_of(&frames);
+    flip_length_bit(&mut log, second);
+
+    assert_corruption(decode_wal_batch_from_slice(&log[second..]));
+    assert!(matches!(
+        replay_wal_records(&log),
+        Err(WalFrameError::Corruption(_))
+    ));
+}
+
+#[test]
+fn length_pointing_past_the_end_in_the_middle_is_corruption() {
+    let frames = [delete_frame(1), delete_frame(2), delete_frame(3)];
+    let second = frames[0].len();
+    let mut log = log_of(&frames);
+    log[second + 2..second + 6].copy_from_slice(&1_000_000u32.to_le_bytes());
+
+    assert_corruption(decode_wal_batch_from_slice(&log[second..]));
+}
+
+#[test]
+fn zeroed_header_followed_by_garbage_is_a_torn_write() {
+    let mut tail = vec![0u8; BATCH_HEADER_SIZE];
+    tail.extend_from_slice(&[0x13; 100]);
+    tail.extend_from_slice(&[0xBA, 0x7C, 0x01, 0x02]);
+
+    assert_torn(decode_wal_batch_from_slice(&tail));
+}
+
+#[test]
+fn zeroed_header_followed_by_a_valid_frame_is_corruption() {
+    let mut log = vec![0u8; BATCH_HEADER_SIZE];
+    log.extend_from_slice(&[0x13; 7]);
+    log.extend_from_slice(&delete_frame(2));
+
+    assert_corruption(decode_wal_batch_from_slice(&log));
+}
+
+#[test]
+fn checksum_mismatch_before_a_partial_frame_is_a_torn_write() {
+    let mut log = delete_frame(1);
+    *log.last_mut().unwrap() ^= 0xFF;
+    let next = delete_frame(2);
+    log.extend_from_slice(&next[..next.len() - 1]);
+
+    assert_torn(decode_wal_batch_from_slice(&log));
+}
+
+#[test]
+fn checksum_mismatch_before_a_later_valid_frame_is_corruption() {
+    let mut log = delete_frame(1);
+    *log.last_mut().unwrap() ^= 0xFF;
+    log.extend_from_slice(&[0x13; 9]);
+    log.extend_from_slice(&delete_frame(2));
+
+    assert_corruption(decode_wal_batch_from_slice(&log));
+}
+
+#[test]
+fn frame_nested_in_a_damaged_payload_is_not_a_following_frame() {
+    // A client can store the bytes of a valid frame as a value.
+    let frame = bytes_frame(1, &delete_frame(9));
+    let nested = find_valid_frame(&mut Cursor::new(&frame), 1, frame.len() as u64).unwrap();
+    assert!(nested.is_some(), "the payload holds a complete valid frame");
+
+    let mut damaged = frame.clone();
+    *damaged.last_mut().unwrap() ^= 0xFF;
+    assert_torn(decode_wal_batch_from_slice(&damaged));
+    assert_torn(decode_wal_batch_from_slice(&frame[..frame.len() - 1]));
 }

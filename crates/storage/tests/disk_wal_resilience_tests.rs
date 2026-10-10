@@ -343,29 +343,34 @@ async fn test_disk_room_lifecycle_and_persistence() {
 }
 
 #[test]
-fn test_wal_decode_rejects_size_exceeding_max_message_size() {
-    let mut bad_header = [0u8; BATCH_HEADER_SIZE];
-    bad_header[0..2].copy_from_slice(&BATCH_MAGIC);
-    let oversized_len = (MAX_MESSAGE_SIZE + 1) as u32;
-    bad_header[2..6].copy_from_slice(&oversized_len.to_le_bytes());
-    bad_header[6..10].copy_from_slice(&12345u32.to_le_bytes());
-    bad_header[10..14].copy_from_slice(&1u32.to_le_bytes());
+fn test_wal_decode_never_trusts_an_oversized_record_len() {
+    let next = encode_wal_batch(
+        &[SequencedOperation::with_default_origin(
+            1u64,
+            Operation::delete(USERS_TABLE, PrimaryKey::single(1i64), 100),
+        )],
+        None,
+    )
+    .unwrap();
 
-    let err = decode_wal_batch_from_slice(&bad_header).unwrap_err();
-    assert!(matches!(err, StorageError::WalCorruption(_)));
-}
+    for len in [(MAX_MESSAGE_SIZE + 1) as u32, u32::MAX] {
+        // Even with a matching header checksum, the length is never allocated or followed.
+        let mut bad_header = [0u8; BATCH_HEADER_SIZE];
+        bad_header[0..2].copy_from_slice(&BATCH_MAGIC);
+        bad_header[2..6].copy_from_slice(&len.to_le_bytes());
+        bad_header[6..10].copy_from_slice(&12345u32.to_le_bytes());
+        bad_header[10..14].copy_from_slice(&1u32.to_le_bytes());
+        let crc = crc32fast::hash(&bad_header[..14]);
+        bad_header[14..18].copy_from_slice(&crc.to_le_bytes());
 
-#[test]
-fn test_wal_decode_rejects_overflowing_record_len() {
-    let mut bad_header = [0u8; BATCH_HEADER_SIZE];
-    bad_header[0..2].copy_from_slice(&BATCH_MAGIC);
-    let overflow_len = u32::MAX;
-    bad_header[2..6].copy_from_slice(&overflow_len.to_le_bytes());
-    bad_header[6..10].copy_from_slice(&12345u32.to_le_bytes());
-    bad_header[10..14].copy_from_slice(&1u32.to_le_bytes());
+        let res = decode_wal_batch_from_slice(&bad_header).unwrap();
+        assert!(matches!(res, WalBatchDecodeResult::TornWrite { .. }));
 
-    let err = decode_wal_batch_from_slice(&bad_header).unwrap_err();
-    assert!(matches!(err, StorageError::WalCorruption(_)));
+        let mut log = bad_header.to_vec();
+        log.extend_from_slice(&next);
+        let err = decode_wal_batch_from_slice(&log).unwrap_err();
+        assert!(matches!(err, StorageError::WalCorruption(_)));
+    }
 }
 
 #[test]

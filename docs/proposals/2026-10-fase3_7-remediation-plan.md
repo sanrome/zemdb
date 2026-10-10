@@ -43,7 +43,7 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 | **D43** | **Sync en storage siempre con flush previo.** Un helper único hace `flush().await?` y después `sync_data`/`sync_all` sobre un `tokio::fs::File`; todos los sitios de storage pasan por él. Para que no se pueda volver a olvidar, `clippy.toml` agrega `disallowed-methods` para `tokio::fs::File::sync_data` y `sync_all`, con un `#[allow]` solo dentro del helper. Alternativa descartada: pasar a `std::fs::File` dentro de `spawn_blocking` (cambio mucho más grande para el mismo resultado). | 1 | Adoptada |
 | **D44** | **Decodificación acotada en tres capas.** (a) `/register` mira el tag de variante antes de decodificar el cuerpo y solo decodifica `RegisterClient`; cualquier otra variante es 400 sin decodificar filas. (b) `Deserialize` propio para `CompactRow`, `PrimaryKey` y los deltas de `Update`, que rechaza más de `MAX_COLUMNS` elementos antes de reservar memoria (sin confiar en el `size_hint`). (c) Presupuesto de 1 M de `Value`s por mensaje (`MAX_MESSAGE_VALUES`), aplicado solo cuando el servidor decodifica mensajes de clientes (`decode_client_message`), no a las respuestas: un contador thread-local (la decodificación es síncrona) que los visitors de (b) descuentan una vez por secuencia; un mensaje que lo supera es `BadRequest`. Así un request no puede reservar más de ~24 MiB en `Value`s, sea cual sea su forma. (a) cierra el ataque sin credenciales. Con los mensajes actuales, (b) ya acota los endpoints autenticados (un `Commit` lleva una sola operación, como mucho 131.070 valores); (c) cubre mensajes futuros con varias operaciones. | 2 | Adoptada |
 | **D45** | **Borde HTTP con límites propios y transporte documentado como es.** Loop de accept propio con hyper-util (`auto`: HTTP/1.1 y HTTP/2 sin TLS). Límites configurables con `ZEMDB_*` y TOML: headers en 10 s; body con plazo por tasa mínima (base de 60 s desde el fin de los headers, más 1 s por cada `ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC` bytes recibidos, 32 KiB/s por defecto, como `mod_reqtimeout`); 10.000 conexiones simultáneas (backpressure en el accept); 100 streams por conexión HTTP/2. Un request en curso, incluida la escritura de su respuesta, nunca se corta por estos límites, y SSE tampoco. Un body que no llega a tiempo responde `ErrorCode::RequestTimeout` (408, nuevo y reintentable; el protocolo sigue en `0x01`). Al apagar, las conexiones sin request en curso se cierran en el acto. Transporte: **TLS se termina en un reverse proxy** (ejemplo con Caddy en el README). TLS nativo con rustls: descartado para la v0.1. | 2 | Adoptada |
-| **D46** | **Frame WAL v2.** Header de 18 bytes: `magic(2) + payload_len(4) + payload_crc(4) + ops_count(4) + header_crc(4)`; `header_crc` cubre los 14 bytes anteriores. Clasificación del final del log: ante un header inválido, un payload truncado o un CRC de payload incorrecto, se busca hacia adelante un frame completo válido (magic + CRC del header + CRC del payload). Si existe, es **corrupción** y no se trunca nada; si no, es **torn write** y se trunca. La búsqueda solo corre ante una anomalía. Aplica a los dos consumidores de `wal_frame` (WAL de storage y segmentos del servidor). Sin retrocompatibilidad: los archivos del formato anterior no se leen (V1, sin despliegues que migrar). | 3 | Propuesta |
+| **D46** | **Header del frame WAL con CRC propio.** Header de 18 bytes: `magic(2) + payload_len(4) + payload_crc(4) + ops_count(4) + header_crc(4)`; `header_crc` cubre los 14 bytes anteriores. Clasificación del final del log: ante un header inválido, un payload truncado o un CRC de payload incorrecto, se busca hacia adelante un frame completo válido (magic + CRC del header + CRC del payload). Si existe, es **corrupción** y no se trunca nada; si no, es **torn write** y se trunca. La búsqueda solo corre ante una anomalía. Aplica a los dos consumidores de `wal_frame` (WAL de storage y segmentos del servidor). | 3 | Adoptada |
 | **D47** | **El log del servidor se acota también en bytes.** (a) `ram_max_bytes` para el HotBuffer y `segment_max_bytes` para rotar `active.wal`, además de los límites por operaciones (lo que se alcance primero), sobrescribibles por sala como el resto de la política (D32). (b) `fetch_deltas` y `get_range` reciben un presupuesto en bytes (el de la respuesta) y dejan de clonar al llenarlo; `fit_in_response` queda como red de seguridad. (c) Lectura de segmentos en streaming (`BufReader`), salteando los registros anteriores a `from_seq` con solo leer su header (seguro gracias a D46). (d) Compresión, verificación y lectura de segmentos fríos con streams de zstd, sin cargar el archivo entero. (e) Como mucho N segmentos comprimidos por tick lento (el resto queda para el siguiente), con el mismo tope en el apagado por inactividad. (f) Dedup con `LruCache::unbounded()` y tope aplicado a mano con `pop_lru`. Los valores por defecto se fijan al implementar. | 4 | Propuesta |
 | **D48** | **`apply_snapshot` valida antes de reemplazar.** Cada fila se valida contra el esquema del payload (tipos, aridad, PK de la fila igual a la clave, tablas declaradas en el esquema), y la API recibe un `expected_head_seq` (el `snapshot_head_seq` que anunció el relay): si no coincide con `payload.head_seq`, error y la sala queda intacta. Que el esquema del snapshot sea el registrado en el servidor lo verifica el SDK (Fase 4); que el contenido sea verdadero sigue siendo DEF-81. La deserialización pasa al mismo `spawn_blocking` que la descompresión, idealmente en streaming. | 5 | Propuesta |
 | **D49** | **Lock de sala estable en storage.** Un archivo `room_{id}.lock` que nunca se renombra, tomado al abrir la sala y liberado al cerrarla (como `lock_log` en el servidor). El WAL nuevo de la rotación se crea sin `truncate`. | 5 | Propuesta |
@@ -59,14 +59,14 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 |---|---|---|---|---|
 | 1 | Durabilidad del storage | DEF-87, 108, 112, 114 | Inmediata | ✅ 4/4 |
 | 2 | Entrada hostil y borde HTTP | DEF-89, 95, 100 | Inmediata | ✅ 3/3 |
-| 3 | Integridad del formato WAL | DEF-91, 92 | Alta (requisito de Fase 4) | ⬜ 0/2 |
+| 3 | Integridad del formato WAL | DEF-91, 92 | Alta (requisito de Fase 4) | ✅ 2/2 |
 | 4 | Memoria y E/S del log del servidor | DEF-90, 97, 99, 96 | Alta | ⬜ 0/4 |
 | 5 | Storage listo para el cliente | DEF-93, 98, 107, 101 | Media (requisito de Fase 4) | ⬜ 0/4 |
 | 6 | Ciclo de vida de salas del servidor | DEF-102, 104, 103 | Baja | ⬜ 0/3 |
 | 7 | Squashing de la outbox | DEF-88, 94, 105, 106 | Latente (antes de habilitar la outbox) | ⬜ 0/4 |
 | 8 | Tests y documentación | DEF-109, 110, 111, 113 | Baja | ⬜ 0/4 |
 
-**Avance total:** 7 de 28 ítems (DEF-114 surgió al implementar el Lote 1).
+**Avance total:** 9 de 28 ítems (DEF-114 surgió al implementar el Lote 1).
 
 **Por qué este orden, en una línea por lote:**
 1. Es la única pérdida silenciosa de datos ya confirmados, y el arreglo son pocas líneas.
@@ -145,15 +145,19 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 
 > Objetivo: que una corrupción a mitad del log nunca se confunda con un torn write (y viceversa), en storage y en el servidor. Requisito de la Fase 4 y del Lote 4.
 
-#### DEF-91 · Medio · ⬜ Pendiente
+#### DEF-91 · Medio · ✅ Hecho
 **Problema.** El CRC del frame no cubre `payload_len`: un bit flip en la longitud de un frame del medio se clasifica como torn write y se truncan frames durables. En el servidor, además, se reasignan secuencias ya entregadas.
 **Solución.** D46 (header con CRC propio y búsqueda hacia adelante antes de truncar).
 **Test exigido.** En los dos consumidores (recovery de storage y `warm_disk` del servidor): WAL con 3 frames y un bit flip en la longitud del segundo → error de corrupción y el archivo queda sin cambios. Variante con la longitud apuntando más allá del EOF, con el mismo resultado.
 
-#### DEF-92 · Medio · ⬜ Pendiente
+**Hecho.** Header de 18 bytes y clasificación en `core/protocol/wal_frame.rs`: `FrameAnomaly` describe por qué no se pudo leer un frame y `find_valid_frame` busca un frame completo válido leyendo por ventanas, sin cargar el resto del log. Storage la corre en un hilo bloqueante sobre un clon del archivo; el servidor la usa a través de `decode_wal_batch_from_slice`, también al leer segmentos sellados. Detalle de D46 fijado al implementar: con un header válido (su CRC coincide) la búsqueda arranca al final del frame que declara, así un frame guardado como valor dentro del payload no se toma por uno escrito después; con un header inválido arranca en el byte siguiente. Se quitó el fallback que decodificaba payloads como `Vec<SequencedOperation>` sin `mutation_id`, que no escribe nadie.
+
+#### DEF-92 · Medio · ✅ Hecho
 **Problema.** Un torn write que no deja un prefijo intacto (header en ceros seguido de bytes no nulos) se clasifica como corrupción y la sala no vuelve a abrir.
 **Solución.** D46: si después de la anomalía no hay ningún frame válido, es torn write.
 **Test exigido.** Header en ceros seguido de basura sin frames válidos después → se trunca y la sala abre con los batches anteriores. Lo mismo para un `.wal.compacting` a medio absorber. Header en ceros seguido de un frame válido → corrupción.
+
+**Hecho.** Cubierto por la misma clasificación (DEF-91): un header en ceros es un header inválido como cualquier otro. Tests en los dos consumidores y en core, que también cubren frames que cruzan el borde de la ventana de búsqueda.
 
 ---
 
@@ -284,7 +288,7 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 **Solución.**
 - `README.md`: magic "ZM", sin micro-WAL, versión de Rust real, cantidad de tests sin número fijo (o la real), "L1 cache-line aligned" reemplazado por "cabe en 64 B".
 - `Cargo.toml`: `rust-version = "1.85"` en `[workspace.package]`; README: 1.85+ para compilar, 1.88+ para correr los tests.
-- `ARCHITECTURE.md`: sin micro-WAL (§5.1 y el árbol de archivos de §9.2), merge por campo en las réplicas y no en el servidor (§4), y lo que cambien los lotes 2 a 5 (transporte, formato del frame v2, límites en bytes, validación de snapshots).
+- `ARCHITECTURE.md`: sin micro-WAL (§5.1 y el árbol de archivos de §9.2), merge por campo en las réplicas y no en el servidor (§4), y lo que cambien los lotes 2 a 5 (transporte, header del frame con CRC, límites en bytes, validación de snapshots).
 - `ROADMAP.md`: encabezado y fecha, tabla de crates, `SequencedOperation`, A-10, build wasm32 hecho, micro-WAL marcado como reemplazado por `active.wal`, y referencia a las Fases 3.6 y 3.7.
 - `docs/audits/2026-09-post-fase3-audit.md` (M-03): "RM" → "ZM".
 **Test exigido.** Ninguno (documentación). Revisión cruzada de cada afirmación cambiada contra el código.

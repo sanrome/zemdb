@@ -312,3 +312,111 @@ async fn crash_before_initial_snapshot_rename_is_cleaned_up_on_next_open() {
     assert_rows(&engine, &room, 0).await;
     assert!(staged_snapshot_files(dir.path()).is_empty());
 }
+
+fn append_raw(path: &Path, bytes: &[u8]) {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(bytes)
+        .unwrap();
+}
+
+/// Bytes a crash can leave where a frame was being written: a header still in zeros followed
+/// by data that is not a frame.
+fn zeroed_header_and_garbage() -> Vec<u8> {
+    let mut bytes = vec![0u8; zemdb_core::BATCH_HEADER_SIZE];
+    bytes.extend_from_slice(&[0x13; 100]);
+    bytes.extend_from_slice(&[0xBA, 0x7C, 0x01, 0x02]);
+    bytes
+}
+
+/// Damage done to the header of a frame, given the bytes from its start.
+type HeaderDamage = fn(&mut [u8]);
+
+#[tokio::test]
+async fn damaged_length_in_the_middle_is_corruption_and_leaves_the_wal_intact() {
+    let damage: [(&str, HeaderDamage); 2] = [
+        ("flipped-length", |header| header[2] ^= 0x01),
+        ("length-past-eof", |header| {
+            header[2..6].copy_from_slice(&1_000_000u32.to_le_bytes())
+        }),
+    ];
+    for (name, damage) in damage {
+        let dir = tempfile::tempdir().unwrap();
+        let room = RoomId::new(name).unwrap();
+        let engine = engine_at(dir.path());
+        let wal_path = engine.wal_file_path(&room);
+
+        append_batch(&wal_path, &[insert(1)]);
+        let second = std::fs::metadata(&wal_path).unwrap().len() as usize;
+        append_batch(&wal_path, &[insert(2)]);
+        append_batch(&wal_path, &[insert(3)]);
+        let mut wal = std::fs::read(&wal_path).unwrap();
+        damage(&mut wal[second..]);
+        std::fs::write(&wal_path, &wal).unwrap();
+
+        let result = engine.open_room(&room, schema()).await;
+
+        assert!(
+            matches!(result, Err(StorageError::WalCorruption(_))),
+            "{name}: unexpected result: {result:?}"
+        );
+        assert_eq!(std::fs::read(&wal_path).unwrap(), wal, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn zeroed_header_followed_by_garbage_is_a_torn_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("zeroed-header-garbage").unwrap();
+    let engine = engine_at(dir.path());
+    let wal_path = engine.wal_file_path(&room);
+
+    append_batch(&wal_path, &[insert(1)]);
+    append_batch(&wal_path, &[insert(2)]);
+    let valid_len = std::fs::metadata(&wal_path).unwrap().len();
+    append_raw(&wal_path, &zeroed_header_and_garbage());
+
+    engine.open_room(&room, schema()).await.unwrap();
+
+    assert_rows(&engine, &room, 2).await;
+    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), valid_len);
+}
+
+#[tokio::test]
+async fn zeroed_header_followed_by_a_valid_frame_is_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("zeroed-header-frame").unwrap();
+    let engine = engine_at(dir.path());
+    let wal_path = engine.wal_file_path(&room);
+
+    append_batch(&wal_path, &[insert(1)]);
+    append_raw(&wal_path, &zeroed_header_and_garbage());
+    append_batch(&wal_path, &[insert(2)]);
+    let wal = std::fs::read(&wal_path).unwrap();
+
+    let result = engine.open_room(&room, schema()).await;
+
+    assert!(
+        matches!(result, Err(StorageError::WalCorruption(_))),
+        "unexpected result: {result:?}"
+    );
+    assert_eq!(std::fs::read(&wal_path).unwrap(), wal);
+}
+
+#[tokio::test]
+async fn compacting_wal_with_a_torn_tail_is_folded() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("compacting-torn").unwrap();
+    leave_orphan_compacting(dir.path(), &room).await;
+    let engine = engine_at(dir.path());
+    let compacting = engine.wal_file_path(&room).with_extension("wal.compacting");
+    append_raw(&compacting, &zeroed_header_and_garbage());
+
+    engine.open_room(&room, schema()).await.unwrap();
+
+    assert_rows(&engine, &room, 8).await;
+    assert!(!compacting.exists());
+}

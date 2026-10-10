@@ -1,3 +1,5 @@
+use std::io::{Cursor, Read, Seek, SeekFrom};
+
 use thiserror::Error;
 
 use crate::id::MutationId;
@@ -7,8 +9,12 @@ use crate::protocol::messages::SequencedOperation;
 /// Magic bytes identifying a framed WAL batch (0xBA7C).
 pub const BATCH_MAGIC: [u8; 2] = [0xBA, 0x7C];
 
-/// Fixed WAL batch header size: 2B magic + 4B batch_len + 4B batch_crc32 + 4B ops_count = 14 bytes.
-pub const BATCH_HEADER_SIZE: usize = 14;
+/// Fixed WAL batch header size: 2B magic + 4B payload_len + 4B payload_crc32 + 4B ops_count +
+/// 4B header_crc32 = 18 bytes.
+pub const BATCH_HEADER_SIZE: usize = 18;
+
+/// Bytes of the header covered by its own checksum: every field before `header_crc32`.
+const HEADER_CHECKED_LEN: usize = BATCH_HEADER_SIZE - 4;
 
 /// Errors that can occur during WAL batch framing and decoding.
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
@@ -58,9 +64,10 @@ pub enum WalBatchDecodeResult {
 ///
 /// Framing:
 /// - `magic`: 2 bytes (`0xBA7C`, little-endian: `[0xBA, 0x7C]`)
-/// - `batch_len`: 4 bytes (`u32`, little-endian payload length)
-/// - `batch_crc32`: 4 bytes (`u32`, little-endian CRC32 checksum of payload)
+/// - `payload_len`: 4 bytes (`u32`, little-endian payload length)
+/// - `payload_crc32`: 4 bytes (`u32`, little-endian CRC32 checksum of payload)
 /// - `ops_count`: 4 bytes (`u32`, little-endian count of operations in batch)
+/// - `header_crc32`: 4 bytes (`u32`, little-endian CRC32 checksum of the 14 bytes above)
 /// - `payload`: serialized `WalBatchPayload` via bincode
 pub fn encode_wal_batch(
     ops: &[SequencedOperation],
@@ -85,6 +92,8 @@ pub fn encode_wal_batch(
     record.extend_from_slice(&batch_len.to_le_bytes());
     record.extend_from_slice(&crc.to_le_bytes());
     record.extend_from_slice(&ops_count.to_le_bytes());
+    let header_crc = crc32fast::hash(&record);
+    record.extend_from_slice(&header_crc.to_le_bytes());
     record.extend_from_slice(&payload);
     Ok(record)
 }
@@ -139,44 +148,50 @@ pub enum BatchPayloadDecode {
         mutation_id: Option<MutationId>,
     },
     /// The payload does not match its checksum. Whether that is a torn write or corruption
-    /// depends on what follows the frame; see [`classify_checksum_mismatch`].
+    /// depends on what follows the frame; see [`FrameAnomaly`].
     ChecksumMismatch { expected: u32, actual: u32 },
 }
 
-/// Parses the header of a frame.
+/// Why a header is not the header of a frame.
+#[derive(Debug, Error, PartialEq, Eq, Clone)]
+pub enum InvalidHeader {
+    #[error("magic is {0:?}, expected {BATCH_MAGIC:?}")]
+    Magic([u8; 2]),
+
+    #[error("header CRC32 is {actual}, expected {expected}")]
+    Checksum { expected: u32, actual: u32 },
+
+    #[error("payload length {0} exceeds MAX_MESSAGE_SIZE {MAX_MESSAGE_SIZE}")]
+    PayloadTooLong(u32),
+}
+
+/// Parses the header of a frame, checking its magic, its own checksum and the payload length.
 ///
-/// Returns `Ok(None)` when every byte of the header is zero, which is not a frame: it is a
-/// zero-filled tail only if every byte up to the end of the log is zero too (see
-/// [`classify_zeroed_header`]). Any other invalid magic, or a payload length above
-/// `MAX_MESSAGE_SIZE`, is corruption.
-///
-/// Together with [`decode_batch_payload`] and the `classify_*` functions, this is the decoder
-/// used by [`decode_wal_batch_from_slice`], exposed for readers that stream a log instead of
-/// holding it in memory, so that both apply the same torn-write rules.
-pub fn parse_batch_header(
-    bytes: &[u8; BATCH_HEADER_SIZE],
-) -> Result<Option<BatchHeader>, WalFrameError> {
-    let magic = [bytes[0], bytes[1]];
-    if magic != BATCH_MAGIC {
-        if bytes.iter().all(|&b| b == 0) {
-            return Ok(None);
-        }
-        return Err(invalid_magic(magic));
+/// Together with [`decode_batch_payload`], [`find_valid_frame`] and [`FrameAnomaly`], this is
+/// the decoder used by [`decode_wal_batch_from_slice`], exposed for readers that stream a log
+/// instead of holding it in memory, so that both apply the same torn-write rules.
+pub fn parse_batch_header(bytes: &[u8; BATCH_HEADER_SIZE]) -> Result<BatchHeader, InvalidHeader> {
+    let [m0, m1, l0, l1, l2, l3, c0, c1, c2, c3, n0, n1, n2, n3, h0, h1, h2, h3] = *bytes;
+    if [m0, m1] != BATCH_MAGIC {
+        return Err(InvalidHeader::Magic([m0, m1]));
     }
 
-    let [_, _, l0, l1, l2, l3, c0, c1, c2, c3, n0, n1, n2, n3] = *bytes;
+    let expected = u32::from_le_bytes([h0, h1, h2, h3]);
+    let actual = crc32fast::hash(&bytes[..HEADER_CHECKED_LEN]);
+    if actual != expected {
+        return Err(InvalidHeader::Checksum { expected, actual });
+    }
+
     let payload_len = u32::from_le_bytes([l0, l1, l2, l3]);
     if u64::from(payload_len) > MAX_MESSAGE_SIZE {
-        return Err(WalFrameError::Corruption(format!(
-            "WAL batch length {payload_len} exceeds MAX_MESSAGE_SIZE {MAX_MESSAGE_SIZE}"
-        )));
+        return Err(InvalidHeader::PayloadTooLong(payload_len));
     }
 
-    Ok(Some(BatchHeader {
+    Ok(BatchHeader {
         payload_len: payload_len as usize,
         payload_crc32: u32::from_le_bytes([c0, c1, c2, c3]),
         ops_count: u32::from_le_bytes([n0, n1, n2, n3]) as usize,
-    }))
+    })
 }
 
 /// Verifies a frame's payload against its header and decodes its operations.
@@ -202,18 +217,9 @@ pub fn decode_batch_payload(
         });
     }
 
-    let (ops, mutation_id) = match bincode::deserialize::<WalBatchPayload>(payload) {
-        Ok(batch) => (batch.ops, batch.mutation_id),
-        Err(_) => {
-            // Fallback for payloads that serialized Vec<SequencedOperation> directly
-            let ops: Vec<SequencedOperation> = bincode::deserialize(payload).map_err(|e| {
-                WalFrameError::Corruption(format!(
-                    "Failed to deserialize WAL batch operations: {e}"
-                ))
-            })?;
-            (ops, None)
-        }
-    };
+    let WalBatchPayload { ops, mutation_id } = bincode::deserialize(payload).map_err(|e| {
+        WalFrameError::Corruption(format!("Failed to deserialize WAL batch operations: {e}"))
+    })?;
 
     if ops.len() != header.ops_count {
         return Err(WalFrameError::Corruption(format!(
@@ -226,91 +232,171 @@ pub fn decode_batch_payload(
     Ok(BatchPayloadDecode::Batch { ops, mutation_id })
 }
 
-/// Decides what a frame whose payload does not match its checksum means, given the bytes that
-/// follow the frame (only the first `BATCH_HEADER_SIZE` are looked at).
+/// Why no frame could be read where the next one should start.
 ///
-/// If a complete frame header follows, later writes were made after the damaged frame was
-/// durable, so the damage is corruption in the middle of the log and dropping the tail would
-/// lose data. Otherwise the frame is the last one, cut short by a crash: a torn write, whose
-/// description is returned.
-pub fn classify_checksum_mismatch(
-    expected: u32,
-    actual: u32,
-    following: &[u8],
-) -> Result<String, WalFrameError> {
-    let frame_follows = following.len() >= BATCH_HEADER_SIZE && following[0..2] == BATCH_MAGIC;
-    if frame_follows {
-        return Err(WalFrameError::Corruption(format!(
-            "WAL batch CRC32 mismatch: expected {expected}, actual {actual}"
-        )));
-    }
-    Ok(format!(
-        "WAL batch CRC32 mismatch at EOF (expected {expected}, actual {actual}), treating as torn write"
-    ))
+/// An anomaly is either a torn write, the last frame cut short by a crash, or corruption in
+/// the middle of the log. It is corruption exactly when a complete valid frame follows it
+/// (see [`find_valid_frame`]): that frame was written after the damaged one was durable, so
+/// dropping the tail would lose it.
+#[derive(Debug, Error, PartialEq, Eq, Clone)]
+pub enum FrameAnomaly {
+    #[error("incomplete WAL batch header: {available} bytes left, expected {BATCH_HEADER_SIZE}")]
+    IncompleteHeader { available: usize },
+
+    #[error("invalid WAL batch header: {0}")]
+    InvalidHeader(InvalidHeader),
+
+    #[error("truncated WAL batch: {available} bytes left, the frame takes {frame_len}")]
+    TruncatedPayload { available: u64, frame_len: usize },
+
+    #[error("WAL batch payload CRC32 is {actual}, expected {expected}")]
+    ChecksumMismatch {
+        expected: u32,
+        actual: u32,
+        frame_len: usize,
+    },
 }
 
-/// Decides what a frame position holding a zeroed header means (see [`parse_batch_header`]).
-///
-/// `tail_is_zero` tells whether every byte from that position to the end of the log is zero,
-/// and `tail_len` is the number of those bytes. A zero-filled tail, as left by file systems that
-/// extend a file before writing its data, is a torn write, whose description is returned; zeros
-/// followed by anything else are corruption.
-pub fn classify_zeroed_header(tail_is_zero: bool, tail_len: u64) -> Result<String, WalFrameError> {
-    if !tail_is_zero {
-        return Err(invalid_magic([0, 0]));
+impl FrameAnomaly {
+    /// Offset, from the start of the damaged frame, where the search for a following frame
+    /// starts.
+    ///
+    /// A valid header is trusted (its checksum matched), so the search starts after the frame
+    /// it declares: a frame nested in its payload, which a client can write as a value, is not
+    /// taken for one written later. An invalid header says nothing about where the frame ends,
+    /// so the search starts at the next byte.
+    pub fn search_offset(&self) -> u64 {
+        match self {
+            FrameAnomaly::IncompleteHeader { available } => *available as u64,
+            FrameAnomaly::InvalidHeader(_) => 1,
+            FrameAnomaly::TruncatedPayload { frame_len, .. }
+            | FrameAnomaly::ChecksumMismatch { frame_len, .. } => *frame_len as u64,
+        }
     }
-    Ok(format!(
-        "Zero-filled tail at EOF ({tail_len} zero bytes), treating as torn write"
-    ))
+
+    /// Classifies the anomaly given the position of the first valid frame after it, as found by
+    /// [`find_valid_frame`]: with none it is a torn write, whose description is returned;
+    /// otherwise it is corruption.
+    pub fn classify(self, following_frame: Option<u64>) -> Result<String, WalFrameError> {
+        match following_frame {
+            Some(offset) => Err(WalFrameError::Corruption(format!(
+                "{self}, followed by a valid frame at offset {offset}"
+            ))),
+            None => Ok(format!(
+                "{self}, with no valid frame after it: treating as torn write"
+            )),
+        }
+    }
 }
 
-fn invalid_magic(magic: [u8; 2]) -> WalFrameError {
-    WalFrameError::Corruption(format!(
-        "Invalid WAL batch magic: expected {:?}, got {:?}",
-        BATCH_MAGIC, magic
-    ))
+/// Size of the window that [`find_valid_frame`] scans for headers at a time.
+const SEARCH_WINDOW: usize = 64 * 1024;
+
+/// Finds the first complete valid frame (magic, header checksum and payload checksum) that
+/// starts at or after `from` and ends at or before `end`, and returns where it starts.
+///
+/// The reader is scanned in windows and each payload is checksummed in chunks, so memory does
+/// not grow with the log or the frame. Its position afterwards is unspecified.
+pub fn find_valid_frame<R: Read + Seek>(
+    reader: &mut R,
+    from: u64,
+    end: u64,
+) -> std::io::Result<Option<u64>> {
+    let mut window = vec![0u8; SEARCH_WINDOW + BATCH_HEADER_SIZE - 1];
+    let mut start = from;
+    while end.saturating_sub(start) >= BATCH_HEADER_SIZE as u64 {
+        let len = (end - start).min(window.len() as u64) as usize;
+        reader.seek(SeekFrom::Start(start))?;
+        reader.read_exact(&mut window[..len])?;
+
+        // Headers starting in the last `BATCH_HEADER_SIZE - 1` bytes are scanned with the next
+        // window.
+        let candidates = len - BATCH_HEADER_SIZE + 1;
+        for i in 0..candidates {
+            if window[i..i + 2] != BATCH_MAGIC {
+                continue;
+            }
+            let Some(header_bytes) = window[i..len].first_chunk() else {
+                continue;
+            };
+            let Ok(header) = parse_batch_header(header_bytes) else {
+                continue;
+            };
+            let position = start + i as u64;
+            if end - position < header.frame_len() as u64 {
+                continue;
+            }
+            if payload_matches(reader, position + BATCH_HEADER_SIZE as u64, &header)? {
+                return Ok(Some(position));
+            }
+        }
+        start += candidates as u64;
+    }
+    Ok(None)
+}
+
+/// Whether the payload at `position` matches the checksum in `header`.
+fn payload_matches<R: Read + Seek>(
+    reader: &mut R,
+    position: u64,
+    header: &BatchHeader,
+) -> std::io::Result<bool> {
+    reader.seek(SeekFrom::Start(position))?;
+    let mut hasher = crc32fast::Hasher::new();
+    let mut chunk = [0u8; 8 * 1024];
+    let mut remaining = header.payload_len;
+    while remaining > 0 {
+        let n = remaining.min(chunk.len());
+        reader.read_exact(&mut chunk[..n])?;
+        hasher.update(&chunk[..n]);
+        remaining -= n;
+    }
+    Ok(hasher.finalize() == header.payload_crc32)
 }
 
 /// Decodes the next framed WAL batch from a byte slice.
 ///
 /// Returns `WalBatchDecodeResult::Ok` if a complete batch was decoded,
 /// `WalBatchDecodeResult::CleanEof` if the slice is empty,
-/// or `WalBatchDecodeResult::TornWrite` if a partial batch, a zero-filled tail or a terminal CRC
-/// mismatch is present at EOF.
-/// Returns `Err(WalFrameError::Corruption)` if invalid magic, bit-flip, or corruption followed by
-/// a complete frame header is detected.
+/// or `WalBatchDecodeResult::TornWrite` if the next frame cannot be read and no valid frame
+/// follows it (see [`FrameAnomaly`]).
+/// Returns `Err(WalFrameError::Corruption)` if a valid frame follows the one that cannot be
+/// read, or if a payload that matches its checksum does not decode.
 pub fn decode_wal_batch_from_slice(slice: &[u8]) -> Result<WalBatchDecodeResult, WalFrameError> {
     if slice.is_empty() {
         return Ok(WalBatchDecodeResult::CleanEof);
     }
 
-    let torn = |reason: String| {
+    let anomaly = |anomaly: FrameAnomaly| {
+        let following = find_valid_frame(
+            &mut Cursor::new(slice),
+            anomaly.search_offset(),
+            slice.len() as u64,
+        )
+        .expect("reads stay within the slice");
         Ok(WalBatchDecodeResult::TornWrite {
             valid_bytes_offset: 0,
-            reason,
+            reason: anomaly.classify(following)?,
         })
     };
 
     let Some(header_bytes) = slice.first_chunk::<BATCH_HEADER_SIZE>() else {
-        return torn(format!(
-            "Incomplete WAL batch header: available {} bytes, expected at least {}",
-            slice.len(),
-            BATCH_HEADER_SIZE
-        ));
+        return anomaly(FrameAnomaly::IncompleteHeader {
+            available: slice.len(),
+        });
     };
 
-    let Some(header) = parse_batch_header(header_bytes)? else {
-        let tail_is_zero = slice.iter().all(|&b| b == 0);
-        return torn(classify_zeroed_header(tail_is_zero, slice.len() as u64)?);
+    let header = match parse_batch_header(header_bytes) {
+        Ok(header) => header,
+        Err(invalid) => return anomaly(FrameAnomaly::InvalidHeader(invalid)),
     };
 
     let frame_len = header.frame_len();
     if slice.len() < frame_len {
-        return torn(format!(
-            "Truncated WAL batch payload: available {} bytes, expected {}",
-            slice.len(),
-            frame_len
-        ));
+        return anomaly(FrameAnomaly::TruncatedPayload {
+            available: slice.len() as u64,
+            frame_len,
+        });
     }
 
     match decode_batch_payload(&header, &slice[BATCH_HEADER_SIZE..frame_len])? {
@@ -320,9 +406,11 @@ pub fn decode_wal_batch_from_slice(slice: &[u8]) -> Result<WalBatchDecodeResult,
             bytes_consumed: frame_len,
         }),
         BatchPayloadDecode::ChecksumMismatch { expected, actual } => {
-            let following = &slice[frame_len..];
-            let following = &following[..following.len().min(BATCH_HEADER_SIZE)];
-            torn(classify_checksum_mismatch(expected, actual, following)?)
+            anomaly(FrameAnomaly::ChecksumMismatch {
+                expected,
+                actual,
+                frame_len,
+            })
         }
     }
 }

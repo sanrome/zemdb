@@ -4,8 +4,8 @@ use std::path::Path;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, BufReader};
 
 use zemdb_core::{
-    classify_checksum_mismatch, classify_zeroed_header, decode_batch_payload, parse_batch_header,
-    BatchPayloadDecode, RoomId, Schema, SequenceNumber, BATCH_HEADER_SIZE,
+    decode_batch_payload, find_valid_frame, parse_batch_header, BatchPayloadDecode, FrameAnomaly,
+    RoomId, Schema, SequenceNumber, BATCH_HEADER_SIZE,
 };
 
 use crate::disk::compactor::{
@@ -51,28 +51,32 @@ async fn read_full<R: AsyncRead + Unpin>(reader: &mut R, buf: &mut [u8]) -> std:
     Ok(filled)
 }
 
-/// Reads the reader to its end, returning whether every byte was zero and how many there were.
-async fn rest_is_zero<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<(bool, u64)> {
-    let mut chunk = [0u8; 8 * 1024];
-    let mut all_zero = true;
-    let mut len = 0u64;
-    loop {
-        let n = reader.read(&mut chunk).await?;
-        if n == 0 {
-            return Ok((all_zero, len));
-        }
-        all_zero &= chunk[..n].iter().all(|&b| b == 0);
-        len += n as u64;
-    }
+/// Classifies an anomaly found at `frame_start` of `file` (see [`FrameAnomaly`]), searching
+/// the rest of the file for a valid frame on a blocking thread. Returns the torn-write
+/// description, or corruption if a valid frame follows.
+async fn classify_anomaly(
+    file: &tokio::fs::File,
+    frame_start: u64,
+    file_len: u64,
+    anomaly: FrameAnomaly,
+) -> Result<String, StorageError> {
+    let from = frame_start.saturating_add(anomaly.search_offset());
+    // The clone shares the file position, which the caller sets again before any other use.
+    let mut search_file = file.try_clone().await?.into_std().await;
+    let following =
+        tokio::task::spawn_blocking(move || find_valid_frame(&mut search_file, from, file_len))
+            .await
+            .map_err(|e| StorageError::Other(format!("Join error: {e}")))??;
+    Ok(anomaly.classify(following)?)
 }
 
 /// Replays the framed batches of one WAL file on top of `tables`, advancing `head_seq`.
 ///
 /// The file is streamed rather than read into memory, and each frame is decoded with the
 /// primitives of `zemdb_core::protocol::wal_frame`, so a torn write at the end of the file is
-/// told apart from corruption exactly as `decode_wal_batch_from_slice` does: an incomplete
-/// frame, a zero-filled tail, or a checksum mismatch not followed by a complete frame header
-/// ends the valid part of the file; anything else is corruption.
+/// told apart from corruption exactly as `decode_wal_batch_from_slice` does: a frame that
+/// cannot be read ends the valid part of the file, unless a valid frame follows it, which is
+/// corruption.
 ///
 /// Records at or below `head_seq` are already reflected in the state (from the snapshot or an
 /// earlier file) and are skipped: crash windows during compaction can leave the same records
@@ -85,55 +89,49 @@ async fn replay_wal_file(
     tables: &mut HashMap<u16, Table>,
 ) -> Result<WalReplayOutcome, StorageError> {
     let mut valid_bytes: u64 = 0;
-    let mut torn_write: Option<String> = None;
     let mut applied_count: usize = 0;
 
+    let file_len = file.metadata().await?.len();
     file.seek(SeekFrom::Start(0)).await?;
-    let mut reader = BufReader::with_capacity(64 * 1024, file);
+    let mut reader = BufReader::with_capacity(64 * 1024, &mut *file);
 
-    loop {
+    let anomaly = loop {
         let mut header_buf = [0u8; BATCH_HEADER_SIZE];
         let header_read = read_full(&mut reader, &mut header_buf).await?;
         if header_read == 0 {
-            break;
+            break None;
         }
         if header_read < BATCH_HEADER_SIZE {
-            torn_write = Some(format!(
-                "Incomplete WAL batch header: available {header_read} bytes, expected at least {BATCH_HEADER_SIZE}"
-            ));
-            break;
+            break Some(FrameAnomaly::IncompleteHeader {
+                available: header_read,
+            });
         }
 
-        let Some(header) = parse_batch_header(&header_buf)? else {
-            let (tail_is_zero, rest_len) = rest_is_zero(&mut reader).await?;
-            torn_write = Some(classify_zeroed_header(
-                tail_is_zero,
-                BATCH_HEADER_SIZE as u64 + rest_len,
-            )?);
-            break;
+        let header = match parse_batch_header(&header_buf) {
+            Ok(header) => header,
+            Err(invalid) => break Some(FrameAnomaly::InvalidHeader(invalid)),
         };
 
-        let mut payload = vec![0u8; header.payload_len()];
-        let payload_read = read_full(&mut reader, &mut payload).await?;
-        if payload_read < payload.len() {
-            torn_write = Some(format!(
-                "Truncated WAL batch payload: available {payload_read} bytes, expected {}",
-                payload.len()
-            ));
-            break;
+        // Checked before reading so that a frame cut short does not allocate its whole length.
+        let available = file_len - valid_bytes;
+        if available < header.frame_len() as u64 {
+            break Some(FrameAnomaly::TruncatedPayload {
+                available,
+                frame_len: header.frame_len(),
+            });
         }
+
+        let mut payload = vec![0u8; header.payload_len()];
+        reader.read_exact(&mut payload).await?;
 
         let ops = match decode_batch_payload(&header, &payload)? {
             BatchPayloadDecode::Batch { ops, .. } => ops,
             BatchPayloadDecode::ChecksumMismatch { expected, actual } => {
-                let mut following = [0u8; BATCH_HEADER_SIZE];
-                let following_len = read_full(&mut reader, &mut following).await?;
-                torn_write = Some(classify_checksum_mismatch(
+                break Some(FrameAnomaly::ChecksumMismatch {
                     expected,
                     actual,
-                    &following[..following_len],
-                )?);
-                break;
+                    frame_len: header.frame_len(),
+                });
             }
         };
 
@@ -158,7 +156,12 @@ async fn replay_wal_file(
         }
 
         valid_bytes += header.frame_len() as u64;
-    }
+    };
+
+    let torn_write = match anomaly {
+        Some(anomaly) => Some(classify_anomaly(file, valid_bytes, file_len, anomaly).await?),
+        None => None,
+    };
 
     Ok(WalReplayOutcome {
         valid_bytes,
