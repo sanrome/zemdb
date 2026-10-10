@@ -125,7 +125,7 @@
   3. Recién después el handler responde 400 ("Expected RegisterClient").
   4. Con N conexiones que completan el cuerpo a la vez, el proceso muere por OOM.
 - **Alcance adicional:** cualquier poseedor de un token puede hacer lo mismo en `/commit` y `/sync`, porque la validación de esquema ocurre en el actor, después de decodificar.
-- **Nota del coordinador:** acotar cada fila a `MAX_COLUMNS` (65.535) no alcanza para los endpoints autenticados. Un `Commit` con ~256 operaciones de 65.535 `Null` cada una entra en 16 MiB y vuelve a reservar ~0,4 GB. La amplificación ×24 es propia del formato, así que hace falta además un tope global (ver el plan, decisión D44).
+- **Nota del coordinador (corregida al implementar el Lote 2):** se había escrito que acotar cada fila a `MAX_COLUMNS` no alcanzaba para los endpoints autenticados, con un `Commit` de ~256 operaciones. Es incorrecto: `ClientMessage::Commit` lleva una sola `Operation`, así que con filas, claves y deltas acotados un mensaje actual tiene como mucho 131.070 `Value`s (~3 MiB). El tope global de valores por mensaje (decisión D44 c) se mantiene como protección para mensajes futuros con varias operaciones, como el envío de la outbox.
 
 #### DEF-90 · Alto · El log del servidor se acota por operaciones, nunca por bytes
 - **Dónde:**

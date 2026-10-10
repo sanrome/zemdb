@@ -41,8 +41,8 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 | ID | Decisión | Lote | Estado |
 |---|---|---|---|
 | **D43** | **Sync en storage siempre con flush previo.** Un helper único hace `flush().await?` y después `sync_data`/`sync_all` sobre un `tokio::fs::File`; todos los sitios de storage pasan por él. Para que no se pueda volver a olvidar, `clippy.toml` agrega `disallowed-methods` para `tokio::fs::File::sync_data` y `sync_all`, con un `#[allow]` solo dentro del helper. Alternativa descartada: pasar a `std::fs::File` dentro de `spawn_blocking` (cambio mucho más grande para el mismo resultado). | 1 | Adoptada |
-| **D44** | **Decodificación acotada en tres capas.** (a) `/register` mira el tag de variante antes de decodificar el cuerpo y solo decodifica `RegisterClient`; cualquier otra variante es 400 sin decodificar filas. (b) `Deserialize` propio para `CompactRow`, `PrimaryKey` y los deltas de `Update`, que rechaza más de `MAX_COLUMNS` elementos antes de reservar memoria (sin confiar en el `size_hint`). (c) Presupuesto de `Value` por mensaje: `decode_message` fija un contador (thread-local, la decodificación es síncrona) que los visitors de (b) descuentan; un mensaje que lo supera es `BadRequest`. Con un presupuesto del orden de 1 M de valores, un request no puede reservar más de ~24 MiB en `Value`s, sea cual sea su forma. (a) cierra el ataque sin credenciales; (c) cierra la amplificación ×24 para los endpoints autenticados, que (b) solo no resuelve. | 2 | Propuesta |
-| **D45** | **Borde HTTP con límites propios y transporte documentado como es.** Timeout de lectura de headers (hyper-util con `TokioTimer`), timeout del body y límite global de conexiones concurrentes, configurables con variables `ZEMDB_*` (SSE queda fuera del timeout de request por ser de larga vida). Transporte: el servidor habla HTTP/1.1 en texto plano y **TLS se termina en un reverse proxy**; se corrige la documentación. Activar la feature `http2` de axum (h2c) queda como opcional. TLS nativo con rustls: descartado para la v0.1. | 2 | Propuesta |
+| **D44** | **Decodificación acotada en tres capas.** (a) `/register` mira el tag de variante antes de decodificar el cuerpo y solo decodifica `RegisterClient`; cualquier otra variante es 400 sin decodificar filas. (b) `Deserialize` propio para `CompactRow`, `PrimaryKey` y los deltas de `Update`, que rechaza más de `MAX_COLUMNS` elementos antes de reservar memoria (sin confiar en el `size_hint`). (c) Presupuesto de 1 M de `Value`s por mensaje (`MAX_MESSAGE_VALUES`), aplicado solo cuando el servidor decodifica mensajes de clientes (`decode_client_message`), no a las respuestas: un contador thread-local (la decodificación es síncrona) que los visitors de (b) descuentan una vez por secuencia; un mensaje que lo supera es `BadRequest`. Así un request no puede reservar más de ~24 MiB en `Value`s, sea cual sea su forma. (a) cierra el ataque sin credenciales. Con los mensajes actuales, (b) ya acota los endpoints autenticados (un `Commit` lleva una sola operación, como mucho 131.070 valores); (c) cubre mensajes futuros con varias operaciones. | 2 | Adoptada |
+| **D45** | **Borde HTTP con límites propios y transporte documentado como es.** Loop de accept propio con hyper-util (`auto`: HTTP/1.1 y HTTP/2 sin TLS). Límites configurables con `ZEMDB_*` y TOML: headers en 10 s; body con plazo por tasa mínima (base de 60 s desde el fin de los headers, más 1 s por cada `ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC` bytes recibidos, 32 KiB/s por defecto, como `mod_reqtimeout`); 10.000 conexiones simultáneas (backpressure en el accept); 100 streams por conexión HTTP/2. Un request en curso, incluida la escritura de su respuesta, nunca se corta por estos límites, y SSE tampoco. Un body que no llega a tiempo responde `ErrorCode::RequestTimeout` (408, nuevo y reintentable; el protocolo sigue en `0x01`). Al apagar, las conexiones sin request en curso se cierran en el acto. Transporte: **TLS se termina en un reverse proxy** (ejemplo con Caddy en el README). TLS nativo con rustls: descartado para la v0.1. | 2 | Adoptada |
 | **D46** | **Frame WAL v2.** Header de 18 bytes: `magic(2) + payload_len(4) + payload_crc(4) + ops_count(4) + header_crc(4)`; `header_crc` cubre los 14 bytes anteriores. Clasificación del final del log: ante un header inválido, un payload truncado o un CRC de payload incorrecto, se busca hacia adelante un frame completo válido (magic + CRC del header + CRC del payload). Si existe, es **corrupción** y no se trunca nada; si no, es **torn write** y se trunca. La búsqueda solo corre ante una anomalía. Aplica a los dos consumidores de `wal_frame` (WAL de storage y segmentos del servidor). Sin retrocompatibilidad: los archivos del formato anterior no se leen (V1, sin despliegues que migrar). | 3 | Propuesta |
 | **D47** | **El log del servidor se acota también en bytes.** (a) `ram_max_bytes` para el HotBuffer y `segment_max_bytes` para rotar `active.wal`, además de los límites por operaciones (lo que se alcance primero), sobrescribibles por sala como el resto de la política (D32). (b) `fetch_deltas` y `get_range` reciben un presupuesto en bytes (el de la respuesta) y dejan de clonar al llenarlo; `fit_in_response` queda como red de seguridad. (c) Lectura de segmentos en streaming (`BufReader`), salteando los registros anteriores a `from_seq` con solo leer su header (seguro gracias a D46). (d) Compresión, verificación y lectura de segmentos fríos con streams de zstd, sin cargar el archivo entero. (e) Como mucho N segmentos comprimidos por tick lento (el resto queda para el siguiente), con el mismo tope en el apagado por inactividad. (f) Dedup con `LruCache::unbounded()` y tope aplicado a mano con `pop_lru`. Los valores por defecto se fijan al implementar. | 4 | Propuesta |
 | **D48** | **`apply_snapshot` valida antes de reemplazar.** Cada fila se valida contra el esquema del payload (tipos, aridad, PK de la fila igual a la clave, tablas declaradas en el esquema), y la API recibe un `expected_head_seq` (el `snapshot_head_seq` que anunció el relay): si no coincide con `payload.head_seq`, error y la sala queda intacta. Que el esquema del snapshot sea el registrado en el servidor lo verifica el SDK (Fase 4); que el contenido sea verdadero sigue siendo DEF-81. La deserialización pasa al mismo `spawn_blocking` que la descompresión, idealmente en streaming. | 5 | Propuesta |
@@ -58,7 +58,7 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 | Orden | Lote | Ítems | Prioridad | Progreso |
 |---|---|---|---|---|
 | 1 | Durabilidad del storage | DEF-87, 108, 112, 114 | Inmediata | ✅ 4/4 |
-| 2 | Entrada hostil y borde HTTP | DEF-89, 95, 100 | Inmediata | ⬜ 0/3 |
+| 2 | Entrada hostil y borde HTTP | DEF-89, 95, 100 | Inmediata | ✅ 3/3 |
 | 3 | Integridad del formato WAL | DEF-91, 92 | Alta (requisito de Fase 4) | ⬜ 0/2 |
 | 4 | Memoria y E/S del log del servidor | DEF-90, 97, 99, 96 | Alta | ⬜ 0/4 |
 | 5 | Storage listo para el cliente | DEF-93, 98, 107, 101 | Media (requisito de Fase 4) | ⬜ 0/4 |
@@ -66,7 +66,7 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 | 7 | Squashing de la outbox | DEF-88, 94, 105, 106 | Latente (antes de habilitar la outbox) | ⬜ 0/4 |
 | 8 | Tests y documentación | DEF-109, 110, 111, 113 | Baja | ⬜ 0/4 |
 
-**Avance total:** 4 de 28 ítems (DEF-114 surgió al implementar el Lote 1).
+**Avance total:** 7 de 28 ítems (DEF-114 surgió al implementar el Lote 1).
 
 **Por qué este orden, en una línea por lote:**
 1. Es la única pérdida silenciosa de datos ya confirmados, y el arreglo son pocas líneas.
@@ -116,24 +116,28 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 
 > Objetivo: que ningún request, autenticado o no, pueda reservar memoria desproporcionada ni retener recursos sin plazo; y que la documentación del transporte diga la verdad.
 
-#### DEF-89 · Alto · ⬜ Pendiente
-**Problema.** `/register` decodifica el mensaje completo antes de autenticar; una `CompactRow` de ~16 M `Null` reserva ~0,5 GB. Con un token, lo mismo vale para `/commit` y `/sync`, incluso con filas acotadas, repartiendo los valores entre muchas operaciones.
+#### DEF-89 · Alto · ✅ Hecho
+**Problema.** `/register` decodifica el mensaje completo antes de autenticar; una `CompactRow` de ~16 M `Null` reserva ~0,5 GB. Con un token, lo mismo vale para `/commit` y `/sync`.
 **Solución.** D44 (a), (b) y (c).
 **Test exigido.**
 - `/register` con la variante `Commit` y un cuerpo inválido después del tag responde 400 "Expected RegisterClient" (prueba que no se decodifica el cuerpo).
 - Decodificar una `CompactRow`, una `PrimaryKey` o un `Update` con `MAX_COLUMNS + 1` elementos falla.
-- Un `Commit` autenticado con ~256 operaciones de 65.535 `Null` cada una responde `BadRequest` por el presupuesto por mensaje.
+- Un mensaje de cliente con más de 1 M de valores se rechaza por el presupuesto. (Con los mensajes actuales no se puede armar por HTTP, porque un `Commit` lleva una sola operación; se prueba decodificando con el presupuesto una lista de operaciones.)
 - Un mensaje legítimo grande (por ejemplo, valores `Bytes` cerca del límite de 16 MiB) sigue pasando.
 
-#### DEF-95 · Medio · ⬜ Pendiente
+**Hecho.** Extractor `RegisterMessage` que lee el tag de variante; `deserialize_columns` acota filas, claves y deltas; presupuesto en `core/value/decode_budget.rs`, cobrado por secuencia; `/register`, el único endpoint sin autenticación, acepta bodies de hasta 64 KiB (`MAX_REGISTER_BODY_SIZE`). La decodificación de storage quedó con el mismo costo que antes (bench) y el formato no cambió (fuzz diferencial contra la versión anterior).
+
+#### DEF-95 · Medio · ✅ Hecho
 **Problema.** Sin timeout de headers ni de body, y sin límite de conexiones: slowloris y bodies por goteo agotan file descriptors y memoria.
 **Solución.** D45 (límites).
 **Test exigido.** Con tiempo pausado: una conexión que no completa los headers se cierra al vencer el timeout; un body enviado por goteo recibe un error al vencer el suyo; un stream SSE abierto no se corta por esos timeouts; al superar el límite de conexiones, las nuevas esperan o se rechazan sin afectar a las abiertas.
+**Hecho.** Loop propio en `api/serve.rs` y plazo del body en `api/body_timeout.rs` (D45). Surgieron en la verificación y quedaron cubiertos con tests: respuestas grandes a lectores lentos que el primer watchdog cortaba (HTTP/1.1 y HTTP/2), un apagado que esperaba a conexiones a medio abrir, y un plazo fijo del body que cortaba a clientes lentos legítimos. Queda sin cubrir, como antes del lote: en HTTP/1.1, un cliente que deja de leer una respuesta retiene la conexión, porque hyper no tiene timeout de escritura.
 
-#### DEF-100 · Medio · ⬜ Pendiente
+#### DEF-100 · Medio · ✅ Hecho
 **Problema.** La documentación promete "HTTP/2 over TLS"; el servidor habla HTTP/1.1 en texto plano.
 **Solución.** D45 (transporte): corregir `ARCHITECTURE.md` §7.2 y el README (HTTP/1.1, TLS en el reverse proxy, con un ejemplo mínimo de despliegue). Si se activa h2c, documentarlo como opcional.
 **Test exigido.** Ninguno si solo cambia la documentación. Si se activa h2c: un test de integración con `reqwest` en modo `http2_prior_knowledge`.
+**Hecho.** README y `ARCHITECTURE.md` describen HTTP/1.1 y h2c sin TLS detrás de un proxy con TLS, con una sección de despliegue (Caddy, `keepalive` menor que el timeout de headers, límites por IP, `ulimit -n`) y la tabla de variables nuevas.
 
 ---
 

@@ -6,8 +6,9 @@
 //! type (see `ensure_payload_identity`).
 //!
 //! Rejections of the binary API ([`RoomPath`], [`AuthenticatedRoom`], [`RelayAuth`],
-//! [`BinaryMessage`]) are binary `ServerMessage::Error` frames. Rejections of the admin API
-//! ([`AdminPath`], [`AdminJson`]) are `ServerError::BadRequest`, rendered as JSON.
+//! [`BinaryMessage`], [`RegisterMessage`]) are binary `ServerMessage::Error` frames.
+//! Rejections of the admin API ([`AdminPath`], [`AdminJson`]) are `ServerError::BadRequest`,
+//! rendered as JSON.
 
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, JsonRejection};
@@ -20,12 +21,13 @@ use axum::Json;
 use axum::RequestExt;
 use serde::de::DeserializeOwned;
 use subtle::ConstantTimeEq;
-use zemdb_core::id::{ClientId, RoomId};
-use zemdb_core::protocol::codec::decode_message;
-use zemdb_core::protocol::messages::ServerMessage;
+use zemdb_core::id::{ClientId, CorrelationId, RoomId, SequenceNumber};
+use zemdb_core::protocol::codec::{decode_client_message, peek_client_message_kind};
+use zemdb_core::protocol::messages::{ClientMessage, ClientMessageKind, ServerMessage};
 
 use crate::api::auth::verify_client_token;
-use crate::api::data_plane::{binary_error, binary_response};
+use crate::api::body_timeout::is_body_read_timeout;
+use crate::api::data_plane::{binary_error, binary_response, unexpected_message};
 use crate::api::router::AppState;
 use crate::error::ServerError;
 use crate::relay::Uploader;
@@ -181,39 +183,98 @@ where
     }
 }
 
-/// Binary protocol message decoded from the request body with `decode_message`.
+/// Client message decoded from the request body with `decode_client_message`, which bounds
+/// the values it may materialize.
 ///
 /// The body is read through axum's `Bytes` extractor, so the router's body size limit applies.
 /// Rejections are binary frames: a body that cannot be read is `BadRequest` with axum's status
-/// (413 when too large); a frame of another protocol version is `ProtocolVersionMismatch`
-/// (400); any other decode failure, including an invalid identifier inside the payload, is
-/// `BadRequest` (400). The frame carries the path room id when it is valid.
+/// (413 when too large), or `RequestTimeout` (408) when it does not arrive in time; a frame of
+/// another protocol
+/// version is `ProtocolVersionMismatch` (400); any other decode failure, including an invalid
+/// identifier inside the payload or too many values, is `BadRequest` (400). The frame carries
+/// the path room id when it is valid.
 #[derive(Debug, Clone)]
-pub struct BinaryMessage<T>(pub T);
+pub struct BinaryMessage(pub ClientMessage);
 
 #[axum::async_trait]
-impl<S, T> FromRequest<S> for BinaryMessage<T>
+impl<S> FromRequest<S> for BinaryMessage
 where
     S: Send + Sync,
-    T: DeserializeOwned,
 {
     type Rejection = Response;
 
-    async fn from_request(mut req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let room_id = req
-            .extract_parts::<Path<String>>()
-            .await
-            .ok()
-            .and_then(|Path(raw)| RoomId::new(raw).ok());
-
-        let body = Bytes::from_request(req, state)
-            .await
-            .map_err(|rejection| body_rejection(rejection, room_id.clone()))?;
-
-        decode_message(&body)
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (room_id, body) = read_frame(req, state).await?;
+        decode_client_message(&body)
             .map(BinaryMessage)
             .map_err(|e| binary_error(None, room_id, e.into()))
     }
+}
+
+/// A `ClientMessage::RegisterClient` decoded from the request body.
+///
+/// Registration is the only endpoint without an `Authorization` header (the token travels
+/// inside the message), so the message kind is read from the frame first: any other kind is
+/// rejected without decoding the rest of the frame, as `BadRequest` (400) "Expected
+/// RegisterClient message". Other rejections are those of [`BinaryMessage`].
+#[derive(Debug, Clone)]
+pub struct RegisterMessage {
+    pub correlation_id: CorrelationId,
+    pub room_id: RoomId,
+    pub client_id: ClientId,
+    pub auth_token: String,
+    pub current_seq: Option<SequenceNumber>,
+}
+
+#[axum::async_trait]
+impl<S> FromRequest<S> for RegisterMessage
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (room_id, body) = read_frame(req, state).await?;
+        let kind = peek_client_message_kind(&body)
+            .map_err(|e| binary_error(None, room_id.clone(), e.into()))?;
+        if kind != ClientMessageKind::RegisterClient {
+            return Err(unexpected_message(room_id, "RegisterClient"));
+        }
+        match decode_client_message(&body) {
+            Ok(ClientMessage::RegisterClient {
+                correlation_id,
+                room_id,
+                client_id,
+                auth_token,
+                current_seq,
+            }) => Ok(RegisterMessage {
+                correlation_id,
+                room_id,
+                client_id,
+                auth_token,
+                current_seq,
+            }),
+            Ok(_) => Err(unexpected_message(room_id, "RegisterClient")),
+            Err(e) => Err(binary_error(None, room_id, e.into())),
+        }
+    }
+}
+
+/// Reads the body of a binary request within the router's body size limit, along with the
+/// path room id when it is valid (for the error frames).
+async fn read_frame<S>(mut req: Request, state: &S) -> Result<(Option<RoomId>, Bytes), Response>
+where
+    S: Send + Sync,
+{
+    let room_id = req
+        .extract_parts::<Path<String>>()
+        .await
+        .ok()
+        .and_then(|Path(raw)| RoomId::new(raw).ok());
+    let body = Bytes::from_request(req, state)
+        .await
+        .map_err(|rejection| body_rejection(rejection, room_id.clone()))?;
+    Ok((room_id, body))
 }
 
 /// Raw request body, read within the router's body size limit.
@@ -230,26 +291,22 @@ where
 {
     type Rejection = Response;
 
-    async fn from_request(mut req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let room_id = req
-            .extract_parts::<Path<String>>()
-            .await
-            .ok()
-            .and_then(|Path(raw)| RoomId::new(raw).ok());
-        Bytes::from_request(req, state)
-            .await
-            .map(BinaryBody)
-            .map_err(|rejection| body_rejection(rejection, room_id))
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let (_, body) = read_frame(req, state).await?;
+        Ok(BinaryBody(body))
     }
 }
 
-/// Binary `BadRequest` frame for a body that could not be read, keeping axum's status.
+/// Binary `BadRequest` frame for a body that could not be read, keeping axum's status, or a
+/// `RequestTimeout` frame (408) if the body did not arrive in time.
 fn body_rejection(rejection: BytesRejection, room_id: Option<RoomId>) -> Response {
-    let status = rejection.status();
-    let err = ServerError::BadRequest(format!(
-        "Failed to read request body: {}",
-        rejection.body_text()
-    ));
+    let message = format!("Failed to read request body: {}", rejection.body_text());
+    let (status, err) = if is_body_read_timeout(&rejection) {
+        let err = ServerError::RequestTimeout(message);
+        (err.to_status_code(), err)
+    } else {
+        (rejection.status(), ServerError::BadRequest(message))
+    };
     binary_response(
         status,
         &ServerMessage::Error {
@@ -286,7 +343,7 @@ where
 /// missing content type, an invalid identifier inside the payload) becomes a JSON error with
 /// code `BadRequest` instead of axum's plain-text responses. The status is 400, except that a
 /// body too large (413) or a missing JSON content type (415) keep their specific status, as
-/// in the binary API.
+/// in the binary API. A body that did not arrive in time is `RequestTimeout` (408).
 #[derive(Debug, Clone)]
 pub struct AdminJson<T>(pub T);
 
@@ -303,6 +360,9 @@ where
             .await
             .map(|Json(value)| AdminJson(value))
             .map_err(|rejection| {
+                if is_body_read_timeout(&rejection) {
+                    return ServerError::RequestTimeout(rejection.body_text()).into_response();
+                }
                 let status = match rejection.status() {
                     StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNSUPPORTED_MEDIA_TYPE => {
                         rejection.status()

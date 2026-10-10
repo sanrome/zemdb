@@ -1,14 +1,17 @@
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{StatusCode, Uri};
+use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
 use zemdb_core::protocol::codec::MAX_FRAME_SIZE;
 use zemdb_core::protocol::messages::ServerMessage;
 
 use crate::actor::manager::RoomManager;
+use crate::api::body_timeout::{limit_body_read_time, BodyReadLimit};
 use crate::api::data_plane::binary_response;
 use crate::api::{control_plane, data_plane, relay, sse};
 use crate::config::ServerConfig;
@@ -79,7 +82,19 @@ impl AppState {
     }
 }
 
+/// Body size limit of `POST /rooms/:room_id/register` (64 KiB). A `RegisterClient` frame
+/// takes a few hundred bytes, and the endpoint is not authenticated before its body is read,
+/// so it does not get the general limit of `MAX_FRAME_SIZE`: a large body sent quickly and
+/// then held back short of its end would keep its buffer for as long as the minimum body rate
+/// allows. A larger body is a binary `BadRequest` frame with HTTP 413, as for the general limit.
+pub const MAX_REGISTER_BODY_SIZE: usize = 64 * 1024;
+
 /// Assembles the unified Axum router for Control Plane, Data Plane, SSE, and Snapshot Relay.
+///
+/// Request bodies are limited to `MAX_FRAME_SIZE` bytes ([`MAX_REGISTER_BODY_SIZE`] for
+/// registration) and must arrive in full within the
+/// configured `body_read_timeout_secs`, extended by one second per
+/// `body_min_rate_bytes_per_sec` bytes received (otherwise 408).
 pub fn build_router(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/schemas", post(control_plane::create_schema))
@@ -93,7 +108,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/rooms/:room_id", delete(control_plane::delete_room));
 
     let data_routes = Router::new()
-        .route("/rooms/:room_id/register", post(data_plane::register))
+        .route(
+            "/rooms/:room_id/register",
+            post(data_plane::register).layer(DefaultBodyLimit::max(MAX_REGISTER_BODY_SIZE)),
+        )
         .route("/rooms/:room_id/commit", post(data_plane::commit))
         .route("/rooms/:room_id/sync", post(data_plane::sync))
         .route("/rooms/:room_id/ack", post(data_plane::ack))
@@ -114,6 +132,10 @@ pub fn build_router(state: AppState) -> Router {
             unmatched(StatusCode::METHOD_NOT_ALLOWED, &uri)
         });
 
+    let body_read_limit = BodyReadLimit {
+        base: Duration::from_secs(state.config.body_read_timeout_secs),
+        min_rate: state.config.body_min_rate_bytes_per_sec,
+    };
     Router::new()
         .nest("/admin", admin_routes)
         .merge(data_routes)
@@ -121,6 +143,11 @@ pub fn build_router(state: AppState) -> Router {
         // Exactly the largest frame the codec produces. Single-request snapshot uploads, whose
         // body is a raw snapshot, share the same limit.
         .layer(DefaultBodyLimit::max(MAX_FRAME_SIZE))
+        // A body that arrives too slowly would hold its request (and up to the size limit of
+        // memory) indefinitely.
+        .layer(middleware::map_request(
+            move |request: Request| async move { limit_body_read_time(request, body_read_limit) },
+        ))
         .with_state(state)
 }
 

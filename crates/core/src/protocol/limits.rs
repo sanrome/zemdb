@@ -1,4 +1,4 @@
-//! Size limit of a single operation.
+//! Size limits of operations and client messages.
 //!
 //! The server stores each operation as one WAL record (bincode with fixed-width integers,
 //! payload up to `MAX_MESSAGE_SIZE`) and returns it in `CommitAck` and `SyncBatch` frames
@@ -39,6 +39,20 @@ pub const RESPONSE_ENVELOPE_ALLOWANCE: u64 = MAX_VARIANT_TAG_LEN
 /// Byte budget for the operations of one response (`CommitAck::catchup_ops`,
 /// `SyncBatch::ops`), as measured by [`encoded_len`] of each `SequencedOperation`.
 pub const MAX_RESPONSE_OPS_BYTES: u64 = MAX_MESSAGE_SIZE - RESPONSE_ENVELOPE_ALLOWANCE;
+
+/// Most `Value`s that decoding one client message may materialize (1 Mi values, 24 MiB).
+///
+/// The byte limit of a frame does not bound the memory of its decode: a `Value` takes 24 bytes
+/// in memory and as little as 1 byte on the wire, so 16 MiB of `Null`s would become ~400 MB.
+/// The server decodes every client message with this budget
+/// ([`decode_client_message`](crate::protocol::decode_client_message)); responses decoded by
+/// clients are not budgeted.
+///
+/// The budget is charged where client messages carry values: the sequences of column values
+/// (primary keys, rows and update deltas), when they are deserialized. A future message that
+/// carries a `Value` outside those collections must charge it explicitly, or it escapes the
+/// budget.
+pub const MAX_MESSAGE_VALUES: u64 = 1 << 20;
 
 /// Why an operation cannot be accepted.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

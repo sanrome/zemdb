@@ -1,6 +1,11 @@
 use bincode::Options;
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::protocol::limits::MAX_MESSAGE_VALUES;
+use crate::protocol::messages::{ClientMessage, ClientMessageKind};
+use crate::value::ValueBudget;
 
 /// Canonical 2-byte magic identifier for ZemDB wire protocol messages ("ZM").
 pub const PROTOCOL_MAGIC: [u8; 2] = [0x5A, 0x4D];
@@ -38,6 +43,10 @@ pub enum DecodeError {
     /// (including invalid values, such as an invalid identifier, and trailing bytes).
     #[error("Malformed message payload: {0}")]
     Malformed(#[source] bincode::Error),
+    /// The message carries more values than a client message may (see
+    /// [`decode_client_message`]).
+    #[error("Message carries more than {max} values")]
+    TooManyValues { max: u64 },
 }
 
 /// Size of `value` encoded with the wire options, without the frame header: what it adds to a
@@ -81,6 +90,59 @@ pub fn peek_version(bytes: &[u8]) -> Option<u8> {
 /// reported as [`DecodeError::UnsupportedVersion`], whatever its length or payload.
 #[tracing::instrument(level = "trace", skip(bytes))]
 pub fn decode_message<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, DecodeError> {
+    bincode::DefaultOptions::new()
+        .with_limit(MAX_MESSAGE_SIZE)
+        .reject_trailing_bytes()
+        .deserialize(frame_payload(bytes)?)
+        .map_err(DecodeError::Malformed)
+}
+
+/// Decodes a message sent by a client, as [`decode_message`] does, materializing at most
+/// [`MAX_MESSAGE_VALUES`] values: a message with more is [`DecodeError::TooManyValues`]. It is
+/// what the server decodes requests with, so that no request reserves more memory for its
+/// values than the budget, whatever their encoded size.
+#[tracing::instrument(level = "trace", skip(bytes))]
+pub fn decode_client_message(bytes: &[u8]) -> Result<ClientMessage, DecodeError> {
+    decode_with_value_budget(bytes, MAX_MESSAGE_VALUES)
+}
+
+/// [`decode_message`] with at most `max_values` values materialized.
+fn decode_with_value_budget<'a, T: Deserialize<'a>>(
+    bytes: &'a [u8],
+    max_values: u64,
+) -> Result<T, DecodeError> {
+    // Decoding is synchronous, so the budget covers exactly the values of this message.
+    let budget = ValueBudget::start(max_values);
+    decode_message(bytes).map_err(|err| {
+        if budget.exhausted() {
+            DecodeError::TooManyValues { max: max_values }
+        } else {
+            err
+        }
+    })
+}
+
+/// Kind of the client message in a frame, read from its variant tag without decoding the
+/// rest of the payload, which can then be rejected unread. The header is checked as in
+/// [`decode_message`]; an unknown variant is [`DecodeError::Malformed`]. A frame whose kind
+/// was read can still fail to decode.
+pub fn peek_client_message_kind(bytes: &[u8]) -> Result<ClientMessageKind, DecodeError> {
+    // An enum is encoded as its variant index (a `u32`, varint with the wire options),
+    // followed by the variant's fields.
+    let index: u32 = bincode::DefaultOptions::new()
+        .with_limit(MAX_MESSAGE_SIZE)
+        .allow_trailing_bytes()
+        .deserialize(frame_payload(bytes)?)
+        .map_err(DecodeError::Malformed)?;
+    ClientMessageKind::from_variant_index(index).ok_or_else(|| {
+        DecodeError::Malformed(bincode::Error::custom(format!(
+            "unknown client message variant index {index}"
+        )))
+    })
+}
+
+/// The payload of a frame, after checking its header and size.
+fn frame_payload(bytes: &[u8]) -> Result<&[u8], DecodeError> {
     if bytes.len() < PROTOCOL_HEADER_LEN {
         return Err(DecodeError::TooShort { len: bytes.len() });
     }
@@ -98,9 +160,9 @@ pub fn decode_message<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, Deco
     if bytes.len() > MAX_FRAME_SIZE {
         return Err(DecodeError::TooLarge { len: bytes.len() });
     }
-    bincode::DefaultOptions::new()
-        .with_limit(MAX_MESSAGE_SIZE)
-        .reject_trailing_bytes()
-        .deserialize(&bytes[PROTOCOL_HEADER_LEN..])
-        .map_err(DecodeError::Malformed)
+    Ok(&bytes[PROTOCOL_HEADER_LEN..])
 }
+
+#[cfg(test)]
+#[path = "tests/codec.rs"]
+mod tests;
