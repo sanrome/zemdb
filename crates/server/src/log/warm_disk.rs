@@ -140,6 +140,13 @@ impl WarmDiskLog {
         self.active_len
     }
 
+    /// The handle that holds the lock on `active.wal`, so that tests can modify the file on
+    /// Windows, where a second handle could not.
+    #[cfg(test)]
+    pub(crate) fn active_file(&self) -> Option<&File> {
+        self.active_file.as_ref()
+    }
+
     /// Rotates and seals `active.wal` into an immutable `segment_{start}_{end}.wal` file.
     pub fn rotate_active_segment(&mut self) -> Result<Option<PathBuf>, ServerError> {
         if let (Some(start), Some(end)) = (self.active_start_seq, self.active_end_seq) {

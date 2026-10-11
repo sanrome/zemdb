@@ -1046,19 +1046,20 @@ fn opening_keeps_only_the_operations_that_fit_in_ram() {
     assert_contiguous(&ops, 7, 10);
 }
 
-/// Flips a byte in the payload of the `index`-th frame of the segment file at `path`.
-fn damage_payload(path: &Path, index: usize) {
-    use std::io::{Seek, SeekFrom, Write};
+/// Flips a byte in the payload of the `index`-th frame of the segment open in `file`.
+fn damage_payload(mut file: &File, index: usize) {
+    use std::io::{Read, Seek, SeekFrom, Write};
     use zemdb_core::protocol::wal_frame::{parse_batch_header, BATCH_HEADER_SIZE};
 
-    let bytes = std::fs::read(path).unwrap();
+    let mut bytes = Vec::new();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    file.read_to_end(&mut bytes).unwrap();
     let mut offset = 0;
     for _ in 0..index {
         let header = parse_batch_header(bytes[offset..].first_chunk().unwrap()).unwrap();
         offset += header.frame_len();
     }
     let at = offset + BATCH_HEADER_SIZE;
-    let mut file = OpenOptions::new().write(true).open(path).unwrap();
     file.seek(SeekFrom::Start(at as u64)).unwrap();
     file.write_all(&[bytes[at] ^ 0xFF]).unwrap();
 }
@@ -1078,17 +1079,20 @@ fn reads_skip_damaged_frames_before_the_cursor_in_sealed_and_active_segments() {
     assert!(log.hot_buffer.is_empty());
     let segments = segments_dir(dir.path());
 
+    let sealed = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(segments.join("segment_0000000000000001_0000000000000005.wal"))
+        .unwrap();
     for index in 0..4 {
-        damage_payload(
-            &segments.join("segment_0000000000000001_0000000000000005.wal"),
-            index,
-        );
+        damage_payload(&sealed, index);
     }
     let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(4), 100).unwrap();
     assert_contiguous(&ops, 5, 12);
     assert!(!has_more);
 
-    damage_payload(&segments.join("active.wal"), 0);
+    // Through the handle that holds the lock: Windows refuses any other.
+    damage_payload(log.warm_disk.active_file().unwrap(), 0);
     let (ops, _) = log.fetch_deltas(SequenceNumber::new(11), 100).unwrap();
     assert_contiguous(&ops, 12, 12);
 }
