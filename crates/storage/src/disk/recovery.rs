@@ -42,9 +42,13 @@ enum ReplayEnd {
     Clean,
     /// At a frame that could not be read and has no valid frame after it.
     TornWrite(String),
-    /// At a frame that could not be read and has a valid frame after it: corruption, unless
-    /// the records after it are also in another file (see `recover_room`).
-    FollowedByFrame(WalFrameError),
+    /// At a frame that could not be read and has a valid frame after it, at `following`:
+    /// corruption, unless the records after it are recovered from elsewhere (see
+    /// `recover_room`).
+    FollowedByFrame {
+        corruption: WalFrameError,
+        following: u64,
+    },
 }
 
 /// Reads until `buf` is full or the reader reaches its end, and returns the bytes read. A single
@@ -80,10 +84,43 @@ async fn classify_anomaly(
             .await
             .map_err(|e| StorageError::Other(format!("Join error: {e}")))??
     };
-    Ok(match anomaly.classify(following) {
-        Ok(reason) => ReplayEnd::TornWrite(reason),
-        Err(corruption) => ReplayEnd::FollowedByFrame(corruption),
+    Ok(match (anomaly.classify(following), following) {
+        (Err(corruption), Some(following)) => ReplayEnd::FollowedByFrame {
+            corruption,
+            following,
+        },
+        (Err(corruption), None) => return Err(corruption.into()),
+        (Ok(reason), _) => ReplayEnd::TornWrite(reason),
     })
+}
+
+/// Highest sequence number in the valid frames of `file` from `from` to `end`, skipping any
+/// damage between them as [`find_valid_frame`] does. A frame taken as valid without checking
+/// its payload yields `u64::MAX`: its records are unknown, so nothing can cover them.
+fn highest_seq_in_valid_frames(
+    file: &mut std::fs::File,
+    mut from: u64,
+    end: u64,
+) -> Result<Option<SequenceNumber>, StorageError> {
+    use std::io::{Read, Seek};
+
+    let mut highest = None;
+    while let Some(position) = find_valid_frame(file, from, end)? {
+        let mut header = [0u8; BATCH_HEADER_SIZE];
+        file.seek(SeekFrom::Start(position))?;
+        file.read_exact(&mut header)?;
+        let header = parse_batch_header(&header)
+            .map_err(|e| StorageError::WalCorruption(format!("Invalid WAL batch header: {e}")))?;
+        let mut payload = vec![0u8; header.payload_len()];
+        file.read_exact(&mut payload)?;
+        let frame_highest = match decode_batch_payload(&header, &payload)? {
+            BatchPayloadDecode::Batch { ops, .. } => ops.iter().map(|op| op.seq).max(),
+            BatchPayloadDecode::ChecksumMismatch { .. } => Some(SequenceNumber::from(u64::MAX)),
+        };
+        highest = highest.max(frame_highest);
+        from = position + header.frame_len() as u64;
+    }
+    Ok(highest)
 }
 
 /// Replays the framed batches of one WAL file on top of `tables`, advancing `head_seq`.
@@ -338,10 +375,22 @@ pub async fn recover_room(
             ),
             // Absorbing the active WAL appends all of it with a single sync and only empties it
             // afterwards, so a crash before that sync can leave a damaged frame followed by
-            // valid ones, all of whose records are still in the active WAL. They are accepted
-            // only if the active WAL continues the sequence right after the damage.
-            ReplayEnd::FollowedByFrame(corruption) => {
-                unconfirmed_compacting_tail = Some(corruption)
+            // valid ones, all of whose records are still in the active WAL. A crash while
+            // folding them leaves the same file, with its records in the snapshot instead. The
+            // damage is accepted only if the recovered state ends up covering every record of
+            // the valid frames after it.
+            ReplayEnd::FollowedByFrame {
+                corruption,
+                following,
+            } => {
+                let end = compacting_file.metadata().await?.len();
+                let mut search_file = compacting_file.try_clone().await?.into_std().await;
+                let highest = tokio::task::spawn_blocking(move || {
+                    highest_seq_in_valid_frames(&mut search_file, following, end)
+                })
+                .await
+                .map_err(|e| StorageError::Other(format!("Join error: {e}")))??;
+                unconfirmed_compacting_tail = Some((corruption, highest));
             }
         }
     }
@@ -352,19 +401,19 @@ pub async fn recover_room(
     let torn_write = match outcome.end {
         ReplayEnd::Clean => None,
         ReplayEnd::TornWrite(reason) => Some(reason),
-        ReplayEnd::FollowedByFrame(corruption) => return Err(corruption.into()),
+        ReplayEnd::FollowedByFrame { corruption, .. } => return Err(corruption.into()),
     };
 
-    // The replay rejects a gap, so a record applied from the active WAL continues the sequence
-    // where the rotated one stopped.
-    if let Some(corruption) = unconfirmed_compacting_tail {
-        if outcome.applied_count == 0 {
+    // The replay rejects a gap, so reaching the highest record after the damage means every
+    // record up to it, the damaged ones included, came from the snapshot or the active WAL.
+    if let Some((corruption, highest)) = unconfirmed_compacting_tail {
+        if highest.is_some_and(|highest| highest > head_seq) {
             return Err(corruption.into());
         }
         tracing::warn!(
             room_id = %room_id,
             reason = %corruption,
-            "Damaged tail of the rotated WAL is also in the active WAL, recovering from it"
+            "Damaged tail of the rotated WAL is covered by the snapshot and the active WAL"
         );
     }
 

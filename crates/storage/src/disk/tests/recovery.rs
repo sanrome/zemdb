@@ -479,3 +479,28 @@ async fn damaged_rotated_wal_is_corruption_when_the_active_wal_does_not_cover_it
         assert_eq!(std::fs::read(&compacting).unwrap(), before, "{name}");
     }
 }
+
+#[tokio::test]
+async fn crash_while_folding_a_damaged_absorb_recovers_on_the_next_open() {
+    for fail_point_name in ["recovery.fold", "recovery.fold_cleanup"] {
+        for (name, damage) in ABSORB_DAMAGE {
+            let dir = tempfile::tempdir().unwrap();
+            let room = RoomId::new(name).unwrap();
+            leave_orphan_compacting(dir.path(), &room).await;
+            let engine = engine_at(dir.path());
+            leave_damaged_absorb(&engine, &room, damage);
+
+            // The snapshot already holds 1..=8 when the fold fails, and the damaged
+            // `.wal.compacting` is still there.
+            fail_point::arm(fail_point_name, &engine.wal_file_path(&room));
+            assert!(engine.open_room(&room, schema()).await.is_err());
+
+            let reopened = engine_at(dir.path());
+            reopened
+                .open_room(&room, schema())
+                .await
+                .unwrap_or_else(|e| panic!("{fail_point_name}, {name}: {e:?}"));
+            assert_rows(&reopened, &room, 8).await;
+        }
+    }
+}
