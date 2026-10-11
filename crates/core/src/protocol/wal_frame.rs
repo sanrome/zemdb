@@ -292,8 +292,24 @@ impl FrameAnomaly {
 /// Size of the window that [`find_valid_frame`] scans for headers at a time.
 const SEARCH_WINDOW: usize = 64 * 1024;
 
+/// Payloads that [`find_valid_frame`] checksums before it takes a valid header as a frame.
+///
+/// Each check reads up to `MAX_MESSAGE_SIZE` bytes. Data that is not a frame passes a header
+/// checksum about once in 2^32 positions, so more failed checks than this come from headers
+/// someone wrote on purpose, such as fake headers packed into a value; without a limit they
+/// make the search quadratic in the length of the log.
+const MAX_PAYLOAD_CHECKS: usize = 16;
+
 /// Finds the first complete valid frame (magic, header checksum and payload checksum) that
 /// starts at or after `from` and ends at or before `end`, and returns where it starts.
+///
+/// After [`MAX_PAYLOAD_CHECKS`] payloads that do not match their checksum, the next frame whose
+/// header is valid is returned without checking its payload. That can only turn a torn write
+/// into corruption, which stops recovery without truncating anything.
+///
+/// A frame stored as a value inside the payload of a frame whose header is invalid is found
+/// too, so a crash that damages that header reports corruption. Telling them apart would take
+/// the header that was lost.
 ///
 /// The reader is scanned in windows and each payload is checksummed in chunks, so memory does
 /// not grow with the log or the frame. Its position afterwards is unspecified.
@@ -303,6 +319,7 @@ pub fn find_valid_frame<R: Read + Seek>(
     end: u64,
 ) -> std::io::Result<Option<u64>> {
     let mut window = vec![0u8; SEARCH_WINDOW + BATCH_HEADER_SIZE - 1];
+    let mut failed_checks = 0;
     let mut start = from;
     while end.saturating_sub(start) >= BATCH_HEADER_SIZE as u64 {
         let len = (end - start).min(window.len() as u64) as usize;
@@ -316,9 +333,9 @@ pub fn find_valid_frame<R: Read + Seek>(
             if window[i..i + 2] != BATCH_MAGIC {
                 continue;
             }
-            let Some(header_bytes) = window[i..len].first_chunk() else {
-                continue;
-            };
+            let header_bytes = window[i..i + BATCH_HEADER_SIZE]
+                .try_into()
+                .expect("a candidate has a whole header in the window");
             let Ok(header) = parse_batch_header(header_bytes) else {
                 continue;
             };
@@ -326,9 +343,12 @@ pub fn find_valid_frame<R: Read + Seek>(
             if end - position < header.frame_len() as u64 {
                 continue;
             }
-            if payload_matches(reader, position + BATCH_HEADER_SIZE as u64, &header)? {
+            if failed_checks == MAX_PAYLOAD_CHECKS
+                || payload_matches(reader, position + BATCH_HEADER_SIZE as u64, &header)?
+            {
                 return Ok(Some(position));
             }
+            failed_checks += 1;
         }
         start += candidates as u64;
     }

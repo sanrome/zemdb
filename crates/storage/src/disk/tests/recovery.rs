@@ -420,3 +420,62 @@ async fn compacting_wal_with_a_torn_tail_is_folded() {
     assert_rows(&engine, &room, 8).await;
     assert!(!compacting.exists());
 }
+
+/// Leaves the room as a crash while a retried compaction absorbs the active WAL would: the
+/// orphan `.wal.compacting` (1..=5) followed by an unsynced copy of the active WAL (6..=8)
+/// whose first frame did not reach the disk intact. The active WAL still holds 6..=8.
+fn leave_damaged_absorb(engine: &DiskStorageEngine, room: &RoomId, damage: HeaderDamage) {
+    let mut copy = std::fs::read(engine.wal_file_path(room)).unwrap();
+    damage(&mut copy);
+    let compacting = engine.wal_file_path(room).with_extension("wal.compacting");
+    append_raw(&compacting, &copy);
+}
+
+const ABSORB_DAMAGE: [(&str, HeaderDamage); 2] = [
+    ("zeroed-header", |frame| {
+        frame[..zemdb_core::BATCH_HEADER_SIZE].fill(0)
+    }),
+    ("lost-payload-byte", |frame| {
+        frame[zemdb_core::BATCH_HEADER_SIZE + 3] ^= 0xFF
+    }),
+];
+
+#[tokio::test]
+async fn crash_while_absorbing_recovers_the_damaged_copy_from_the_active_wal() {
+    for (name, damage) in ABSORB_DAMAGE {
+        let dir = tempfile::tempdir().unwrap();
+        let room = RoomId::new(name).unwrap();
+        leave_orphan_compacting(dir.path(), &room).await;
+        let engine = engine_at(dir.path());
+        leave_damaged_absorb(&engine, &room, damage);
+
+        engine.open_room(&room, schema()).await.unwrap();
+
+        assert_rows(&engine, &room, 8).await;
+        let compacting = engine.wal_file_path(&room).with_extension("wal.compacting");
+        assert!(!compacting.exists(), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn damaged_rotated_wal_is_corruption_when_the_active_wal_does_not_cover_it() {
+    for (name, damage) in ABSORB_DAMAGE {
+        let dir = tempfile::tempdir().unwrap();
+        let room = RoomId::new(name).unwrap();
+        leave_orphan_compacting(dir.path(), &room).await;
+        let engine = engine_at(dir.path());
+        leave_damaged_absorb(&engine, &room, damage);
+        // As after an absorb that completed: the active WAL was emptied.
+        std::fs::write(engine.wal_file_path(&room), b"").unwrap();
+        let compacting = engine.wal_file_path(&room).with_extension("wal.compacting");
+        let before = std::fs::read(&compacting).unwrap();
+
+        let result = engine.open_room(&room, schema()).await;
+
+        assert!(
+            matches!(result, Err(StorageError::WalCorruption(_))),
+            "{name}: unexpected result: {result:?}"
+        );
+        assert_eq!(std::fs::read(&compacting).unwrap(), before, "{name}");
+    }
+}

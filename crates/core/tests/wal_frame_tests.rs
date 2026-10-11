@@ -263,7 +263,7 @@ fn search_finds_frames_across_window_edges() {
     for start in [64 * 1024 - 5, 64 * 1024 - 1, 64 * 1024, 64 * 1024 + 3] {
         let mut log = vec![0x55u8; start];
         log.extend_from_slice(&frame);
-        let found = find_valid_frame(&mut Cursor::new(&log), 1, log.len() as u64).unwrap();
+        let found = find_valid_frame(&mut Cursor::new(&log), 0, log.len() as u64).unwrap();
         assert_eq!(found, Some(start as u64), "frame at {start}");
     }
 }
@@ -341,4 +341,54 @@ fn frame_nested_in_a_damaged_payload_is_not_a_following_frame() {
     *damaged.last_mut().unwrap() ^= 0xFF;
     assert_torn(decode_wal_batch_from_slice(&damaged));
     assert_torn(decode_wal_batch_from_slice(&frame[..frame.len() - 1]));
+}
+
+#[test]
+fn frame_nested_after_an_invalid_header_is_found() {
+    // Without its header, nothing tells the payload of the damaged frame apart from frames
+    // written after it. Reporting corruption truncates nothing.
+    let mut log = delete_frame(1);
+    let second = log.len();
+    log.extend_from_slice(&bytes_frame(2, &delete_frame(9)));
+    log[second..second + BATCH_HEADER_SIZE].fill(0);
+
+    assert_corruption(decode_wal_batch_from_slice(&log[second..]));
+}
+
+/// A header with a valid checksum declaring a 4-byte payload whose checksum does not match.
+fn fake_header() -> [u8; BATCH_HEADER_SIZE] {
+    let mut header = [0u8; BATCH_HEADER_SIZE];
+    header[0..2].copy_from_slice(&BATCH_MAGIC);
+    header[2..6].copy_from_slice(&4u32.to_le_bytes());
+    header[6..10].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+    header[10..14].copy_from_slice(&1u32.to_le_bytes());
+    let crc = crc32fast::hash(&header[..BATCH_HEADER_SIZE - 4]);
+    header[BATCH_HEADER_SIZE - 4..].copy_from_slice(&crc.to_le_bytes());
+    header
+}
+
+fn fake_headers(count: usize) -> Vec<u8> {
+    let mut log = Vec::new();
+    for _ in 0..count {
+        log.extend_from_slice(&fake_header());
+        log.extend_from_slice(&[0x13; 14]);
+    }
+    log
+}
+
+#[test]
+fn search_checks_a_bounded_number_of_payloads() {
+    // Up to 16 failed payload checks, the search goes on and finds nothing.
+    let log = fake_headers(16);
+    assert_eq!(
+        find_valid_frame(&mut Cursor::new(&log), 0, log.len() as u64).unwrap(),
+        None
+    );
+
+    // Past them, the next valid header is taken as a frame without reading its payload.
+    let log = fake_headers(17);
+    assert_eq!(
+        find_valid_frame(&mut Cursor::new(&log), 0, log.len() as u64).unwrap(),
+        Some(16 * 32)
+    );
 }

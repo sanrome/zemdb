@@ -295,8 +295,8 @@ pub(crate) struct DecodedSegment {
     pub(crate) mutations: Vec<(MutationId, SequenceNumber)>,
     /// Length of the prefix made of complete batches that were decoded.
     pub(crate) valid_len: usize,
-    /// Whether decoding stopped at a torn write: an incomplete or damaged batch at the end,
-    /// or a zero-filled tail.
+    /// Whether decoding stopped at a torn write: a batch that could not be read with no valid
+    /// batch after it.
     pub(crate) torn: bool,
 }
 
