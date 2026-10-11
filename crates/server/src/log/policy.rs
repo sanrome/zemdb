@@ -10,6 +10,12 @@ pub const MAX_POLICY_DURATION_SECS: u64 = 10 * 365 * 24 * 60 * 60;
 /// Largest accepted `ram_max_ops`: the operations of a room kept in RAM.
 pub const MAX_RAM_MAX_OPS: u64 = 100_000;
 
+/// Smallest accepted `ram_max_bytes` and `segment_max_bytes` (1 MiB).
+pub const MIN_LOG_BYTES_LIMIT: u64 = 1024 * 1024;
+
+/// Largest accepted `ram_max_bytes` and `segment_max_bytes` (1 GiB).
+pub const MAX_LOG_BYTES_LIMIT: u64 = 1024 * 1024 * 1024;
+
 /// Smallest accepted `max_room_disk_bytes` (1 MiB).
 pub const MIN_ROOM_DISK_BYTES: u64 = 1024 * 1024;
 
@@ -30,6 +36,15 @@ pub struct RoomLifecyclePolicy {
     /// Maximum number of sequenced operations retained in RAM before rotating disk segments
     /// and evicting older deltas from memory.
     pub ram_max_ops: usize,
+
+    /// Maximum encoded size of the operations retained in RAM. Whichever of this and
+    /// `ram_max_ops` is reached first evicts the oldest; an operation larger than this on its
+    /// own is not kept in RAM.
+    pub ram_max_bytes: u64,
+
+    /// Size of the active segment (`active.wal`) at which it is sealed, if `ram_max_ops`
+    /// operations have not sealed it first.
+    pub segment_max_bytes: u64,
 
     /// Maximum time-to-live for operations in RAM before segment rotation and eviction.
     pub ram_ttl: Duration,
@@ -66,10 +81,12 @@ impl Default for RoomLifecyclePolicy {
     fn default() -> Self {
         Self {
             ram_max_ops: 1_000,
-            ram_ttl: Duration::from_secs(300),          // 5 minutes
-            warm_disk_ttl: Duration::from_secs(86_400), // 24 hours
+            ram_max_bytes: 8 * 1024 * 1024,                // 8 MiB
+            segment_max_bytes: 32 * 1024 * 1024,           // 32 MiB
+            ram_ttl: Duration::from_secs(300),             // 5 minutes
+            warm_disk_ttl: Duration::from_secs(86_400),    // 24 hours
             cold_disk_ttl: Duration::from_secs(2_592_000), // 30 days
-            max_room_disk_bytes: 500 * 1024 * 1024,     // 500 MB
+            max_room_disk_bytes: 500 * 1024 * 1024,        // 500 MB
             lease_timeout: Duration::from_secs(90),
             dormant_after: None,
             snapshot_demand_ttl: Duration::from_secs(7 * 24 * 60 * 60), // 7 days
@@ -102,6 +119,10 @@ impl RoomLifecyclePolicy {
         let secs = Duration::from_secs;
         Self {
             ram_max_ops: overrides.ram_max_ops.unwrap_or(self.ram_max_ops),
+            ram_max_bytes: overrides.ram_max_bytes.unwrap_or(self.ram_max_bytes),
+            segment_max_bytes: overrides
+                .segment_max_bytes
+                .unwrap_or(self.segment_max_bytes),
             ram_ttl: overrides.ram_ttl_secs.map_or(self.ram_ttl, secs),
             warm_disk_ttl: overrides
                 .warm_disk_ttl_secs
@@ -142,6 +163,10 @@ pub struct RoomLifecycleOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ram_max_ops: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ram_max_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_max_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ram_ttl_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warm_disk_ttl_secs: Option<u64>,
@@ -179,7 +204,7 @@ impl RoomLifecycleOverrides {
         Ok(())
     }
 
-    fn settings(&self) -> [(PolicySetting, Option<u64>); 9] {
+    fn settings(&self) -> [(PolicySetting, Option<u64>); 11] {
         use PolicySetting::*;
         [
             (
@@ -187,6 +212,8 @@ impl RoomLifecycleOverrides {
                 self.ram_max_ops
                     .map(|ops| u64::try_from(ops).unwrap_or(u64::MAX)),
             ),
+            (RamMaxBytes, self.ram_max_bytes),
+            (SegmentMaxBytes, self.segment_max_bytes),
             (RamTtl, self.ram_ttl_secs),
             (WarmDiskTtl, self.warm_disk_ttl_secs),
             (ColdDiskTtl, self.cold_disk_ttl_secs),
@@ -205,6 +232,8 @@ impl RoomLifecycleOverrides {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PolicySetting {
     RamMaxOps,
+    RamMaxBytes,
+    SegmentMaxBytes,
     RamTtl,
     WarmDiskTtl,
     ColdDiskTtl,
@@ -220,6 +249,8 @@ impl PolicySetting {
     pub(crate) fn field(self) -> &'static str {
         match self {
             Self::RamMaxOps => "ram_max_ops",
+            Self::RamMaxBytes => "ram_max_bytes",
+            Self::SegmentMaxBytes => "segment_max_bytes",
             Self::RamTtl => "ram_ttl_secs",
             Self::WarmDiskTtl => "warm_disk_ttl_secs",
             Self::ColdDiskTtl => "cold_disk_ttl_secs",
@@ -235,6 +266,8 @@ impl PolicySetting {
     pub(crate) fn env_var(self) -> &'static str {
         match self {
             Self::RamMaxOps => "ZEMDB_RAM_MAX_OPS",
+            Self::RamMaxBytes => "ZEMDB_RAM_MAX_BYTES",
+            Self::SegmentMaxBytes => "ZEMDB_SEGMENT_MAX_BYTES",
             Self::RamTtl => "ZEMDB_RAM_TTL_SECS",
             Self::WarmDiskTtl => "ZEMDB_WARM_TTL_SECS",
             Self::ColdDiskTtl => "ZEMDB_COLD_TTL_SECS",
@@ -255,6 +288,7 @@ impl PolicySetting {
     fn bounds(self) -> (u64, u64) {
         match self {
             Self::RamMaxOps => (1, MAX_RAM_MAX_OPS),
+            Self::RamMaxBytes | Self::SegmentMaxBytes => (MIN_LOG_BYTES_LIMIT, MAX_LOG_BYTES_LIMIT),
             Self::RamTtl | Self::LeaseTimeout | Self::DormantAfter => (1, MAX_POLICY_DURATION_SECS),
             Self::WarmDiskTtl | Self::ColdDiskTtl | Self::IdleTimeout => {
                 (0, MAX_POLICY_DURATION_SECS)
@@ -282,6 +316,8 @@ impl PolicySetting {
 #[derive(Serialize, Deserialize)]
 struct PolicyJson {
     ram_max_ops: usize,
+    ram_max_bytes: u64,
+    segment_max_bytes: u64,
     ram_ttl_secs: u64,
     warm_disk_ttl_secs: u64,
     cold_disk_ttl_secs: u64,
@@ -302,6 +338,8 @@ impl From<RoomLifecyclePolicy> for PolicyJson {
     fn from(policy: RoomLifecyclePolicy) -> Self {
         Self {
             ram_max_ops: policy.ram_max_ops,
+            ram_max_bytes: policy.ram_max_bytes,
+            segment_max_bytes: policy.segment_max_bytes,
             ram_ttl_secs: ceil_secs(policy.ram_ttl),
             warm_disk_ttl_secs: ceil_secs(policy.warm_disk_ttl),
             cold_disk_ttl_secs: ceil_secs(policy.cold_disk_ttl),
@@ -319,6 +357,8 @@ impl From<PolicyJson> for RoomLifecyclePolicy {
         let secs = Duration::from_secs;
         Self {
             ram_max_ops: json.ram_max_ops,
+            ram_max_bytes: json.ram_max_bytes,
+            segment_max_bytes: json.segment_max_bytes,
             ram_ttl: secs(json.ram_ttl_secs),
             warm_disk_ttl: secs(json.warm_disk_ttl_secs),
             cold_disk_ttl: secs(json.cold_disk_ttl_secs),

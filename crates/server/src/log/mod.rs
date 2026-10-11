@@ -1,12 +1,15 @@
+pub mod budget;
 pub mod cold_disk;
 pub mod hot_buffer;
 pub(crate) mod io_probe;
 pub mod policy;
 pub mod retention;
 pub(crate) mod segment_index;
+pub(crate) mod segment_reader;
 pub mod tiered_log;
 pub mod warm_disk;
 
+pub use budget::ReadBudget;
 pub use cold_disk::{ColdDiskLog, CompressedSegment};
 pub use hot_buffer::HotBuffer;
 pub use policy::{RoomLifecycleOverrides, RoomLifecyclePolicy};

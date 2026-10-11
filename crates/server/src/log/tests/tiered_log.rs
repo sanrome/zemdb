@@ -1,5 +1,6 @@
 use super::*;
 use crate::log::io_probe::{self, IoEvent};
+use crate::log::policy::{MAX_LOG_BYTES_LIMIT, MIN_LOG_BYTES_LIMIT};
 use std::thread::sleep;
 use std::time::Duration;
 use tempfile::tempdir;
@@ -820,4 +821,341 @@ fn open_tolerates_a_corrupt_newest_segment() {
         Err(ServerError::BehindCompaction)
     ));
     log.append(make_op(13), None).unwrap();
+}
+
+/// An operation whose value takes `bytes` bytes.
+fn large_op(seq: u64, bytes: usize) -> SequencedOperation {
+    let row = zemdb_core::value::CompactRow::new(vec![
+        Value::Int(seq as i64),
+        Value::Bytes(vec![seq as u8; bytes].into()),
+    ]);
+    SequencedOperation::new(
+        SequenceNumber::new(seq),
+        Operation::insert(1, PrimaryKey::single(Value::Int(seq as i64)), row, seq),
+    )
+}
+
+const KIB: usize = 1024;
+const MIB: usize = 1024 * KIB;
+
+fn count_in(log: &TieredLog, tier: Tier) -> usize {
+    log.segments.iter().filter(|s| s.tier == tier).count()
+}
+
+#[test]
+fn hot_buffer_evicts_by_bytes_below_its_operation_limit() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 1_000,
+        ram_max_bytes: MIB as u64,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+
+    for seq in 1..=10 {
+        log.append(large_op(seq, 300 * KIB), None).unwrap();
+    }
+
+    assert!(log.hot_buffer.bytes() <= MIB as u64);
+    assert_eq!(log.hot_buffer.len(), 3);
+    assert_eq!(log.hot_buffer.max_seq(), Some(SequenceNumber::new(10)));
+    // Everything evicted is still served, from disk.
+    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    assert_contiguous(&ops, 1, 10);
+    assert!(!has_more);
+}
+
+#[test]
+fn operation_larger_than_ram_is_served_from_disk() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_bytes: MIB as u64,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+
+    log.append(large_op(1, 2 * MIB), None).unwrap();
+
+    assert!(log.hot_buffer.is_empty());
+    log.append(make_op(2), None).unwrap();
+    assert_eq!(log.hot_buffer.len(), 1);
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    assert_contiguous(&ops, 1, 2);
+}
+
+#[test]
+fn active_segment_rotates_at_its_byte_limit() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 1_000,
+        segment_max_bytes: MIB as u64,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+
+    for seq in 1..=3 {
+        log.append(large_op(seq, 300 * KIB), None).unwrap();
+    }
+    assert_eq!(count_in(&log, Tier::Warm), 0);
+    log.append(large_op(4, 300 * KIB), None).unwrap();
+
+    assert_eq!(count_in(&log, Tier::Warm), 1);
+    assert_eq!(log.warm_disk.active_len(), 0);
+}
+
+/// Six operations of 6 MiB: two fit in a response (`MAX_RESPONSE_OPS_BYTES` is just under
+/// 16 MiB), three do not.
+fn large_ops_log(dir: &Path, ram_max_bytes: u64) -> TieredLog {
+    let policy = RoomLifecyclePolicy {
+        ram_max_bytes,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir, policy).unwrap();
+    for seq in 1..=6 {
+        log.append(large_op(seq, 6 * MIB), None).unwrap();
+    }
+    log
+}
+
+#[test]
+fn fetch_returns_what_fits_in_a_response_from_ram() {
+    let dir = tempdir().unwrap();
+    let log = large_ops_log(dir.path(), MAX_LOG_BYTES_LIMIT);
+    assert_eq!(log.hot_buffer.len(), 6);
+
+    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+
+    assert_contiguous(&ops, 1, 2);
+    assert!(has_more);
+}
+
+#[test]
+fn fetch_returns_what_fits_in_a_response_from_disk() {
+    let dir = tempdir().unwrap();
+    let log = large_ops_log(dir.path(), MIN_LOG_BYTES_LIMIT);
+    assert!(log.hot_buffer.is_empty());
+
+    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(2), 100).unwrap();
+
+    assert_contiguous(&ops, 3, 4);
+    assert!(has_more);
+}
+
+#[test]
+fn cold_segment_of_large_operations_roundtrips() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 4,
+        ram_max_bytes: MIN_LOG_BYTES_LIMIT,
+        warm_disk_ttl: Duration::ZERO,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    let ops: Vec<_> = (1..=4).map(|seq| large_op(seq, 3 * MIB)).collect();
+    for op in &ops {
+        log.append(op.clone(), None).unwrap();
+    }
+
+    log.run_maintenance_sync().unwrap();
+
+    assert_eq!(count_in(&log, Tier::Cold), 1);
+    let (read, has_more) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    assert_eq!(read, ops);
+    assert!(!has_more);
+}
+
+#[test]
+fn maintenance_compresses_a_bounded_number_of_segments_per_pass() {
+    let dir = tempdir().unwrap();
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
+    // Six sealed segments of five operations.
+    append_range(&mut log, 1, 30);
+    assert_eq!(count_in(&log, Tier::Warm), 6);
+
+    let report = log.run_maintenance_sync().unwrap();
+    assert_eq!(report.warm_compressed_count, MAX_COMPRESSIONS_PER_PASS);
+    assert_eq!(count_in(&log, Tier::Warm), 2);
+
+    let report = log.run_maintenance_sync().unwrap();
+    assert_eq!(report.warm_compressed_count, 2);
+    assert_eq!(count_in(&log, Tier::Cold), 6);
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    assert_contiguous(&ops, 1, 30);
+}
+
+#[tokio::test]
+async fn async_maintenance_compresses_a_bounded_number_of_segments_per_pass() {
+    let dir = tempdir().unwrap();
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
+    append_range(&mut log, 1, 30);
+
+    let report = log.run_maintenance().await.unwrap();
+
+    assert_eq!(report.warm_compressed_count, MAX_COMPRESSIONS_PER_PASS);
+    assert_eq!(count_in(&log, Tier::Warm), 2);
+}
+
+#[test]
+fn reopening_loads_into_ram_only_what_fits() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 1_000,
+        ram_max_bytes: MIB as u64,
+        segment_max_bytes: MIB as u64,
+        ..RoomLifecyclePolicy::default()
+    };
+    {
+        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+        for seq in 1..=10 {
+            log.append(large_op(seq, 300 * KIB), Some(mutation_for(seq)))
+                .unwrap();
+        }
+    }
+
+    let (log, mutations) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+
+    assert!(log.hot_buffer.bytes() <= MIB as u64);
+    assert_eq!(log.hot_buffer.max_seq(), Some(SequenceNumber::new(10)));
+    assert_eq!(mutations.len(), 10);
+}
+
+#[test]
+fn opening_keeps_only_the_operations_that_fit_in_ram() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 1_000,
+        ram_max_bytes: MIB as u64,
+        segment_max_bytes: MIB as u64,
+        ..RoomLifecyclePolicy::default()
+    };
+    {
+        // Segments 1..=4 and 5..=8, and 9..=10 in active.wal.
+        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+        for seq in 1..=10 {
+            log.append(large_op(seq, 300 * KIB), Some(mutation_for(seq)))
+                .unwrap();
+        }
+    }
+    let segments = SegmentIndex::scan(&segments_dir(dir.path())).unwrap();
+    let (_warm, active) = WarmDiskLog::open_recovering(segments_dir(dir.path())).unwrap();
+
+    let (ops, mutations) = read_newest(&segments, active, &policy, usize::MAX).unwrap();
+
+    // Every mutation ID, but only the newest operations up to the first past 1 MiB.
+    assert_eq!(mutations.len(), 10);
+    assert_contiguous(&ops, 7, 10);
+}
+
+/// Flips a byte in the payload of the `index`-th frame of the segment file at `path`.
+fn damage_payload(path: &Path, index: usize) {
+    use std::io::{Seek, SeekFrom, Write};
+    use zemdb_core::protocol::wal_frame::{parse_batch_header, BATCH_HEADER_SIZE};
+
+    let bytes = std::fs::read(path).unwrap();
+    let mut offset = 0;
+    for _ in 0..index {
+        let header = parse_batch_header(bytes[offset..].first_chunk().unwrap()).unwrap();
+        offset += header.frame_len();
+    }
+    let at = offset + BATCH_HEADER_SIZE;
+    let mut file = OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(at as u64)).unwrap();
+    file.write_all(&[bytes[at] ^ 0xFF]).unwrap();
+}
+
+#[test]
+fn reads_skip_damaged_frames_before_the_cursor_in_sealed_and_active_segments() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 5,
+        // Nothing stays in RAM, so every read goes to disk.
+        ram_ttl: Duration::ZERO,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    // Segments 1..=5 and 6..=10, and 11..=12 in active.wal.
+    append_range(&mut log, 1, 12);
+    assert!(log.hot_buffer.is_empty());
+    let segments = segments_dir(dir.path());
+
+    for index in 0..4 {
+        damage_payload(
+            &segments.join("segment_0000000000000001_0000000000000005.wal"),
+            index,
+        );
+    }
+    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(4), 100).unwrap();
+    assert_contiguous(&ops, 5, 12);
+    assert!(!has_more);
+
+    damage_payload(&segments.join("active.wal"), 0);
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(11), 100).unwrap();
+    assert_contiguous(&ops, 12, 12);
+}
+
+#[test]
+fn segments_that_keep_failing_do_not_hold_back_newer_ones() {
+    let dir = tempdir().unwrap();
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
+    // Six sealed segments of five operations; the four oldest cannot be compressed.
+    append_range(&mut log, 1, 30);
+    let doomed: Vec<_> = log
+        .segments
+        .iter()
+        .take(4)
+        .map(|s| s.path.clone())
+        .collect();
+    for path in &doomed {
+        std::fs::remove_file(path).unwrap();
+    }
+
+    // The first pass tries the four oldest, which fail; the next one tries the newer ones
+    // first.
+    assert!(log.run_maintenance_sync().is_err());
+    assert_eq!(count_in(&log, Tier::Cold), 0);
+    assert!(log.run_maintenance_sync().is_err());
+    assert_eq!(count_in(&log, Tier::Cold), 2);
+}
+
+#[test]
+fn a_pass_tries_a_bounded_number_of_segments_even_when_they_fail() {
+    let dir = tempdir().unwrap();
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
+    append_range(&mut log, 1, 30);
+    let paths: Vec<_> = log.segments.iter().map(|s| s.path.clone()).collect();
+    for path in &paths {
+        std::fs::remove_file(path).unwrap();
+    }
+
+    assert!(log.run_maintenance_sync().is_err());
+    assert_eq!(log.failed_compressions.len(), MAX_COMPRESSIONS_PER_PASS);
+
+    // The two not tried yet go first, then two of those that failed.
+    assert!(log.run_maintenance_sync().is_err());
+    assert_eq!(log.failed_compressions.len(), 6);
+}
+
+#[test]
+fn retries_rotate_through_every_failed_segment() {
+    let dir = tempdir().unwrap();
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
+    append_range(&mut log, 1, 30);
+    let paths: Vec<_> = log.segments.iter().map(|s| s.path.clone()).collect();
+    let newest = std::fs::read(&paths[5]).unwrap();
+    for path in &paths {
+        std::fs::remove_file(path).unwrap();
+    }
+    // Every segment fails at least once.
+    for _ in 0..3 {
+        assert!(log.run_maintenance_sync().is_err());
+    }
+    assert_eq!(log.failed_compressions.len(), 6);
+
+    // The newest segment recovers; the four oldest keep failing.
+    std::fs::write(&paths[5], newest).unwrap();
+    for _ in 0..2 {
+        let _ = log.run_maintenance_sync();
+    }
+
+    assert_eq!(count_in(&log, Tier::Cold), 1);
 }

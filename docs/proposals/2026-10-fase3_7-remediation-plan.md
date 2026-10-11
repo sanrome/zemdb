@@ -44,7 +44,7 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 | **D44** | **Decodificación acotada en tres capas.** (a) `/register` mira el tag de variante antes de decodificar el cuerpo y solo decodifica `RegisterClient`; cualquier otra variante es 400 sin decodificar filas. (b) `Deserialize` propio para `CompactRow`, `PrimaryKey` y los deltas de `Update`, que rechaza más de `MAX_COLUMNS` elementos antes de reservar memoria (sin confiar en el `size_hint`). (c) Presupuesto de 1 M de `Value`s por mensaje (`MAX_MESSAGE_VALUES`), aplicado solo cuando el servidor decodifica mensajes de clientes (`decode_client_message`), no a las respuestas: un contador thread-local (la decodificación es síncrona) que los visitors de (b) descuentan una vez por secuencia; un mensaje que lo supera es `BadRequest`. Así un request no puede reservar más de ~24 MiB en `Value`s, sea cual sea su forma. (a) cierra el ataque sin credenciales. Con los mensajes actuales, (b) ya acota los endpoints autenticados (un `Commit` lleva una sola operación, como mucho 131.070 valores); (c) cubre mensajes futuros con varias operaciones. | 2 | Adoptada |
 | **D45** | **Borde HTTP con límites propios y transporte documentado como es.** Loop de accept propio con hyper-util (`auto`: HTTP/1.1 y HTTP/2 sin TLS). Límites configurables con `ZEMDB_*` y TOML: headers en 10 s; body con plazo por tasa mínima (base de 60 s desde el fin de los headers, más 1 s por cada `ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC` bytes recibidos, 32 KiB/s por defecto, como `mod_reqtimeout`); 10.000 conexiones simultáneas (backpressure en el accept); 100 streams por conexión HTTP/2. Un request en curso, incluida la escritura de su respuesta, nunca se corta por estos límites, y SSE tampoco. Un body que no llega a tiempo responde `ErrorCode::RequestTimeout` (408, nuevo y reintentable; el protocolo sigue en `0x01`). Al apagar, las conexiones sin request en curso se cierran en el acto. Transporte: **TLS se termina en un reverse proxy** (ejemplo con Caddy en el README). TLS nativo con rustls: descartado para la v0.1. | 2 | Adoptada |
 | **D46** | **Header del frame WAL con CRC propio.** Header de 18 bytes: `magic(2) + payload_len(4) + payload_crc(4) + ops_count(4) + header_crc(4)`; `header_crc` cubre los 14 bytes anteriores. Clasificación del final del log: ante un header inválido, un payload truncado o un CRC de payload incorrecto, se busca hacia adelante un frame completo válido (magic + CRC del header + CRC del payload). Si existe, es **corrupción** y no se trunca nada; si no, es **torn write** y se trunca. La búsqueda solo corre ante una anomalía. Aplica a los dos consumidores de `wal_frame` (WAL de storage y segmentos del servidor). | 3 | Adoptada |
-| **D47** | **El log del servidor se acota también en bytes.** (a) `ram_max_bytes` para el HotBuffer y `segment_max_bytes` para rotar `active.wal`, además de los límites por operaciones (lo que se alcance primero), sobrescribibles por sala como el resto de la política (D32). (b) `fetch_deltas` y `get_range` reciben un presupuesto en bytes (el de la respuesta) y dejan de clonar al llenarlo; `fit_in_response` queda como red de seguridad. (c) Lectura de segmentos en streaming (`BufReader`), salteando los registros anteriores a `from_seq` con solo leer su header (seguro gracias a D46). (d) Compresión, verificación y lectura de segmentos fríos con streams de zstd, sin cargar el archivo entero. (e) Como mucho N segmentos comprimidos por tick lento (el resto queda para el siguiente), con el mismo tope en el apagado por inactividad. (f) Dedup con `LruCache::unbounded()` y tope aplicado a mano con `pop_lru`. Los valores por defecto se fijan al implementar. | 4 | Propuesta |
+| **D47** | **El log del servidor se acota también en bytes.** (a) `ram_max_bytes` (8 MiB, de 1 MiB a 1 GiB, `ZEMDB_RAM_MAX_BYTES`) para el HotBuffer y `segment_max_bytes` (32 MiB, de 1 MiB a 1 GiB, `ZEMDB_SEGMENT_MAX_BYTES`) para rotar `active.wal`, además de los límites por operaciones (lo que se alcance primero), sobrescribibles por sala como el resto de la política (D32). Los bytes del HotBuffer se miden con `encoded_len`, como el presupuesto de respuesta; si una operación sola supera el límite, el HotBuffer puede quedar vacío y la lectura va a disco. (b) `fetch_deltas` y `get_range` reciben un presupuesto en bytes (`MAX_RESPONSE_OPS_BYTES`) y dejan de clonar al llenarlo; `fit_in_response` queda como red de seguridad. (c) Lectura de segmentos en streaming (`BufReader` de 64 KiB), salteando los registros anteriores a `from_seq` con solo leer su header (seguro gracias a D46): la secuencia de cada frame sale del inicio del segmento más el `ops_count` acumulado. Los payloads salteados no se verifican en esa lectura: la compresión verifica cada frame del segmento y la apertura de la sala verifica `active.wal`. (d) Compresión (nivel 3), verificación y lectura de segmentos fríos con streams de zstd, sin cargar el archivo entero. La verificación descomprime y compara longitud y CRC32 con el `.wal` original antes de borrarlo. Sin formato seekable: una lectura en frío descomprime desde el inicio del segmento. (e) Como mucho 4 compresiones intentadas por tick lento (constante, el resto queda para el siguiente; los segmentos cuya última compresión falló se intentan después de los demás, primero el que falló hace más tiempo, para que no frenen a los nuevos y los reintentos roten entre todos), con el mismo tope en el apagado por inactividad. (f) Dedup con `LruCache::unbounded()` y tope (`dedup_lru_capacity`) aplicado a mano con `pop_lru`. | 4 | Adoptada |
 | **D48** | **`apply_snapshot` valida antes de reemplazar.** Cada fila se valida contra el esquema del payload (tipos, aridad, PK de la fila igual a la clave, tablas declaradas en el esquema), y la API recibe un `expected_head_seq` (el `snapshot_head_seq` que anunció el relay): si no coincide con `payload.head_seq`, error y la sala queda intacta. Que el esquema del snapshot sea el registrado en el servidor lo verifica el SDK (Fase 4); que el contenido sea verdadero sigue siendo DEF-81. La deserialización pasa al mismo `spawn_blocking` que la descompresión, idealmente en streaming. | 5 | Propuesta |
 | **D49** | **Lock de sala estable en storage.** Un archivo `room_{id}.lock` que nunca se renombra, tomado al abrir la sala y liberado al cerrarla (como `lock_log` en el servidor). El WAL nuevo de la rotación se crea sin `truncate`. | 5 | Propuesta |
 | **D50** | **Ciclo de vida de salas del servidor.** (a) La entrada de `room_meta` se quita cuando termina el actor (bajo el spawn lock, comparando `actor_id`); la recarga de esquemas recorre solo las salas vivas, y las que se están creando siguen leyendo el registry bajo el spawn lock, como hoy. (b) `shutdown_all` cierra las salas en paralelo con concurrencia acotada. (c) Roster en JSON compacto; las entradas `Dormant` se olvidan tras un TTL largo configurable. Un cliente olvidado que vuelve recibe `ClientNotRegistered` (409) y se registra de nuevo (D27). | 6 | Propuesta |
@@ -60,13 +60,13 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 | 1 | Durabilidad del storage | DEF-87, 108, 112, 114 | Inmediata | ✅ 4/4 |
 | 2 | Entrada hostil y borde HTTP | DEF-89, 95, 100 | Inmediata | ✅ 3/3 |
 | 3 | Integridad del formato WAL | DEF-91, 92 | Alta (requisito de Fase 4) | ✅ 2/2 |
-| 4 | Memoria y E/S del log del servidor | DEF-90, 97, 99, 96 | Alta | ⬜ 0/4 |
+| 4 | Memoria y E/S del log del servidor | DEF-90, 97, 99, 96 | Alta | ✅ 4/4 |
 | 5 | Storage listo para el cliente | DEF-93, 98, 107, 101 | Media (requisito de Fase 4) | ⬜ 0/4 |
 | 6 | Ciclo de vida de salas del servidor | DEF-102, 104, 103 | Baja | ⬜ 0/3 |
 | 7 | Squashing de la outbox | DEF-88, 94, 105, 106 | Latente (antes de habilitar la outbox) | ⬜ 0/4 |
 | 8 | Tests y documentación | DEF-109, 110, 111, 113 | Baja | ⬜ 0/4 |
 
-**Avance total:** 9 de 28 ítems (DEF-114 surgió al implementar el Lote 1).
+**Avance total:** 13 de 28 ítems (DEF-114 surgió al implementar el Lote 1).
 
 **Por qué este orden, en una línea por lote:**
 1. Es la única pérdida silenciosa de datos ya confirmados, y el arreglo son pocas líneas.
@@ -165,7 +165,7 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 
 > Objetivo: que la memoria y la E/S del log dependan del tamaño de lo que se pide, no del tamaño de los segmentos ni de la cantidad de salas.
 
-#### DEF-90 · Alto · ⬜ Pendiente
+#### DEF-90 · Alto · ✅ Hecho
 **Problema.** HotBuffer, rotación de segmentos, lecturas y compresión se acotan solo por cantidad de operaciones; con operaciones grandes, una sala retiene y clona del orden de GiB.
 **Solución.** D47 (a), (b), (c) y (d).
 **Test exigido.**
@@ -174,20 +174,28 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 - Compresión y lectura fría en streaming: ida y vuelta de un segmento con operaciones grandes.
 - Los tests de continuidad entre tiers (`fetch_deltas` sin huecos) siguen en verde.
 
-#### DEF-97 · Medio · ⬜ Pendiente
+**Hecho.** `ram_max_bytes` y `segment_max_bytes` en la política, los overrides, la configuración y sus variables. `ReadBudget` (`log/budget.rs`) lleva operaciones y bytes de una lectura; los tiers toman cada operación de él al leerla, y una operación rechazada corta la lectura entera para no saltearla. `fetch_deltas` usa el de la respuesta. El HotBuffer guarda el tamaño de cada operación. Al abrir, la lectura hacia atrás guarda solo las operaciones que entran en RAM; los segmentos leídos solo por sus IDs de dedup no retienen operaciones. Lector en streaming en `log/segment_reader.rs`, compartido por `.wal`, `active.wal` (también al recuperarlo al abrir) y `.wal.zst`; compresión y verificación en streaming en `cold_disk.rs`. La compresión verifica cada frame (headers, CRC de payloads, operaciones decodificables) mientras comprime, y que las operaciones vayan exactamente del inicio al fin del nombre del segmento (el inicio en el que confían las lecturas para saltear): si algo falla, no se comprime y el segmento queda tibio. Al leer un segmento frío, los errores del archivo siguen siendo de I/O y los de datos comprimidos, corrupción.
+
+#### DEF-97 · Medio · ✅ Hecho
 **Problema.** Leer un rango decodifica y verifica todo lo anterior a `from_seq`, y en frío descomprime el archivo entero: ponerse al día cuesta O(S²/B).
 **Solución.** D47 (c) y (d).
 **Test exigido.** Leer el final de un segmento decodifica solo los frames pedidos (contado con `io_probe` o un contador de decodificaciones); el resultado es igual al de la lectura completa.
 
-#### DEF-99 · Medio · ⬜ Pendiente
+**Hecho.** En vez de contar decodificaciones, el test daña el payload de los frames anteriores al cursor: decodificar cualquiera fallaría su CRC, y la lectura del final da lo mismo que la completa (también sobre un stream de zstd). Un frame decodificado que no empieza en la secuencia a la que llevan los conteos es corrupción.
+
+#### DEF-99 · Medio · ✅ Hecho
 **Problema.** Una pasada de compresión sin tope congela al actor y los requests de la sala terminan en 504.
 **Solución.** D47 (e).
 **Test exigido.** Con N+k segmentos vencidos, un tick lento comprime como mucho N, el actor atiende un comando entre ticks y los siguientes ticks terminan el resto.
 
-#### DEF-96 · Medio · ⬜ Pendiente
+**Hecho.** `MAX_COMPRESSIONS_PER_PASS = 4` intentos en `warm_segments_due`, que usan el mantenimiento async y el sync; el apagado por inactividad corre el mismo mantenimiento. Los segmentos cuya última compresión falló van al final, así no frenan a los nuevos y una pasada sigue acotada aunque las compresiones fallen tarde. Los tests son del log (6 segmentos: una pasada comprime 4, la siguiente 2; con todos fallando, una pasada intenta 4). Que el actor atienda comandos entre ticks no cambió: el loop ya los atiende entre una pasada y la siguiente, y lo que se acotó es la duración de cada pasada.
+
+#### DEF-96 · Medio · ✅ Hecho
 **Problema.** `LruCache::new` reserva el mapa completo (~280 KiB por sala con la capacidad por defecto) aunque esté vacío.
 **Solución.** D47 (f).
 **Test exigido.** Un caché nuevo no reserva la capacidad máxima, y al superar la capacidad se desaloja lo menos usado (los tests actuales de dedup siguen en verde).
+
+**Hecho.** El workspace prohíbe `unsafe`, así que el test no cuenta memoria con un allocator: crea un caché con capacidad `usize::MAX`, que con `LruCache::new` falla al reservar.
 
 ---
 

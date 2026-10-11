@@ -6,7 +6,7 @@ use zemdb_core::mutation::Operation;
 use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::value::{PrimaryKey, Value};
 use zemdb_server::error::ServerError;
-use zemdb_server::log::{RoomLifecyclePolicy, TieredLog};
+use zemdb_server::log::{ReadBudget, RoomLifecyclePolicy, TieredLog};
 
 fn make_test_op(seq: u64) -> SequencedOperation {
     let pk = PrimaryKey::single(Value::Int(seq as i64));
@@ -341,40 +341,40 @@ fn test_tiered_log_hot_buffer_o1_range_query() {
     assert_eq!(buffer.max_seq().unwrap().get(), 20);
 
     // Query 1: from_seq older than min_seq (5 + 1 < 10, cannot satisfy contiguity)
-    let res = buffer.get_range(SequenceNumber::new(5), 5);
+    let res = buffer.get_range(SequenceNumber::new(5), &mut ReadBudget::ops(5));
     assert!(
         res.is_empty(),
         "Must return empty when requested cursor precedes buffer start to prevent sequence gap"
     );
 
     // Query 1b: from_seq immediately preceding min_seq (9 + 1 = 10, valid contiguous start)
-    let res = buffer.get_range(SequenceNumber::new(9), 5);
+    let res = buffer.get_range(SequenceNumber::new(9), &mut ReadBudget::ops(5));
     assert_eq!(res.len(), 5);
     assert_eq!(res[0].seq.get(), 10);
     assert_eq!(res[4].seq.get(), 14);
 
     // Query 2: from_seq exactly at min_seq
-    let res = buffer.get_range(SequenceNumber::new(10), 3);
+    let res = buffer.get_range(SequenceNumber::new(10), &mut ReadBudget::ops(3));
     assert_eq!(res.len(), 3);
     assert_eq!(res[0].seq.get(), 11);
     assert_eq!(res[2].seq.get(), 13);
 
     // Query 3: from_seq in the middle
-    let res = buffer.get_range(SequenceNumber::new(15), 10);
+    let res = buffer.get_range(SequenceNumber::new(15), &mut ReadBudget::ops(10));
     assert_eq!(res.len(), 5);
     assert_eq!(res[0].seq.get(), 16);
     assert_eq!(res[4].seq.get(), 20);
 
     // Query 4: from_seq equal to max_seq
-    let res = buffer.get_range(SequenceNumber::new(20), 5);
+    let res = buffer.get_range(SequenceNumber::new(20), &mut ReadBudget::ops(5));
     assert!(res.is_empty());
 
     // Query 5: from_seq greater than max_seq
-    let res = buffer.get_range(SequenceNumber::new(25), 5);
+    let res = buffer.get_range(SequenceNumber::new(25), &mut ReadBudget::ops(5));
     assert!(res.is_empty());
 
     // Query 6: limit 0
-    let res = buffer.get_range(SequenceNumber::new(10), 0);
+    let res = buffer.get_range(SequenceNumber::new(10), &mut ReadBudget::ops(0));
     assert!(res.is_empty());
 }
 

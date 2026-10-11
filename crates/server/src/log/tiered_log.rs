@@ -1,20 +1,29 @@
 use crate::blocking::blocking_io;
 use crate::durable;
 use crate::error::ServerError;
-use crate::log::cold_disk::{ColdDiskLog, CompressedSegment};
+use crate::log::budget::{op_bytes, ReadBudget};
+use crate::log::cold_disk::{read_cold_file, ColdDiskLog, CompressedSegment};
 use crate::log::hot_buffer::HotBuffer;
 use crate::log::policy::RoomLifecyclePolicy;
 use crate::log::retention;
 use crate::log::segment_index::{cold_segment_path, SegmentEntry, SegmentIndex, Tier};
-use crate::log::warm_disk::{RecoveredLogData, WarmDiskLog};
+use crate::log::warm_disk::{read_segment_file, RecoveredLogData, WarmDiskLog};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 use zemdb_core::id::{MutationId, SequenceNumber};
+use zemdb_core::protocol::limits::MAX_RESPONSE_OPS_BYTES;
 use zemdb_core::protocol::messages::SequencedOperation;
+
+/// Warm segments one maintenance pass tries to compress. The room actor waits for the pass,
+/// so this bounds how long it stops serving requests (about 0.1–0.3 s per segment of
+/// `segment_max_bytes`), whether the compressions succeed or fail late; the next pass
+/// compresses the rest. Segments whose last compression failed are tried after the others,
+/// so they do not hold back the newer ones.
+const MAX_COMPRESSIONS_PER_PASS: usize = 4;
 
 /// File, inside the room directory, recording the highest sequence ever pruned from disk.
 const LOG_META_FILE: &str = "log_meta.json";
@@ -102,6 +111,11 @@ pub struct TieredLog {
     hot_buffer: HotBuffer,
     warm_disk: WarmDiskLog,
     segments: SegmentIndex,
+    /// The warm segments whose last compression failed, by first sequence, with the pass in
+    /// which it failed.
+    failed_compressions: HashMap<SequenceNumber, u64>,
+    /// Maintenance passes run since the log was opened.
+    maintenance_passes: u64,
     head_seq: SequenceNumber,
     tail_seq: SequenceNumber,
     pruned_through_seq: SequenceNumber,
@@ -125,7 +139,8 @@ impl TieredLog {
     /// `dedup_window` mutation IDs in the log, oldest first.
     ///
     /// The log is read backwards from its newest segment only until it has the last
-    /// `ram_max_ops` operations (for the RAM buffer) and the last `dedup_window` mutation IDs,
+    /// operations that fit in RAM (`ram_max_ops` and `ram_max_bytes`) and the last
+    /// `dedup_window` mutation IDs, keeping only those operations,
     /// so the cost of opening a room does not grow with its retained history. `head_seq`
     /// comes from the segment names, `active.wal` and `log_meta.json`.
     pub fn open_or_create_with_dedup_window(
@@ -152,11 +167,12 @@ impl TieredLog {
         .max()
         .unwrap_or(pruned_through_seq);
 
-        let (ops, mutations) = read_newest(&segments, active, policy.ram_max_ops, dedup_window)?;
+        let (ops, mutations) = read_newest(&segments, active, &policy, dedup_window)?;
         let mutations = newest_distinct(mutations, dedup_window);
 
         let mut hot_buffer = HotBuffer::new();
         hot_buffer.rehydrate(contiguous_suffix(ops, policy.ram_max_ops, head_seq));
+        hot_buffer.apply_sliding_window(&policy);
 
         let mut log = Self {
             dir,
@@ -165,6 +181,8 @@ impl TieredLog {
             hot_buffer,
             warm_disk,
             segments,
+            failed_compressions: HashMap::new(),
+            maintenance_passes: 0,
             head_seq,
             tail_seq: head_seq.next(),
             pruned_through_seq,
@@ -201,17 +219,19 @@ impl TieredLog {
 
         // 2. Add to RAM HotBuffer and maintain sliding window
         self.hot_buffer.append(op)?;
-        self.hot_buffer
-            .apply_sliding_window(self.policy.ram_max_ops, self.policy.ram_ttl);
+        self.hot_buffer.apply_sliding_window(&self.policy);
 
         // `tail_seq` needs no update here: when the log was empty it already pointed at
         // `head_seq + 1`, which is exactly the sequence of the operation just appended.
         self.head_seq = self.head_seq.next();
 
-        // 3. Segment rotation check: rotate active segment on disk when size threshold is reached,
-        // retaining recent operations in the RAM HotBuffer sliding window without destructive eviction to zero.
+        // 3. Segment rotation check: rotate active segment on disk when it reaches `ram_max_ops`
+        // operations or `segment_max_bytes` bytes, retaining recent operations in the RAM
+        // HotBuffer sliding window without destructive eviction to zero.
         let mut outcome = AppendOutcome::default();
-        if self.warm_disk.active_ops_count() >= self.policy.ram_max_ops {
+        if self.warm_disk.active_ops_count() >= self.policy.ram_max_ops
+            || self.warm_disk.active_len() >= self.policy.segment_max_bytes
+        {
             if let Err(err) = blocking_io(|| self.seal_active_segment()) {
                 outcome.rotation_error = Some(err);
             }
@@ -247,6 +267,10 @@ impl TieredLog {
     ///
     /// Transparently streams deltas across Cold Disk, Warm Disk, and RAM HotBuffer,
     /// enforcing strict sequence contiguity and emitting `BehindCompaction` if the cursor is expired.
+    ///
+    /// Returns at most `max_batch_size` operations that fit in one response
+    /// ([`MAX_RESPONSE_OPS_BYTES`]), and at least one: operations beyond the budget are neither
+    /// decoded into the batch nor cloned.
     pub fn fetch_deltas(
         &self,
         from_seq: SequenceNumber,
@@ -261,14 +285,14 @@ impl TieredLog {
             return Ok((Vec::new(), false));
         }
 
-        let limit = max_batch_size as usize;
+        let budget = ReadBudget::new(max_batch_size as usize, MAX_RESPONSE_OPS_BYTES);
 
         // 1. Fast Path (Tier 1: HotBuffer in RAM)
         // If the requested cursor falls within the current RAM buffer window, serve directly
         // from memory in sub-microsecond time without touching disk or executing system calls.
         if let Some(min_ram) = self.hot_buffer.min_seq() {
             if from_seq.get() + 1 >= min_ram.get() {
-                let ops = self.hot_buffer.get_range(from_seq, limit);
+                let ops = self.hot_buffer.get_range(from_seq, &mut budget.clone());
                 if let Some(last) = ops.last() {
                     let has_more = last.seq.get() < self.head_seq.get();
                     return Ok((ops, has_more));
@@ -278,12 +302,12 @@ impl TieredLog {
 
         // 2. Disk tiers, oldest first: the indexed sealed segments (cold, then warm), then
         // `active.wal`, which bridges the sealed segments and the RAM window.
-        let mut batch = DeltaBatch::new(from_seq, limit);
+        let mut batch = DeltaBatch::new(from_seq, budget);
         blocking_io(|| self.fetch_from_disk(&mut batch))?;
 
         // 3. Tier 1: if the batch reached the RAM buffer's window, the rest comes from memory.
         if !batch.is_full() && batch.cursor.get() < self.head_seq.get() {
-            let ram_ops = self.hot_buffer.get_range(batch.cursor, batch.remaining());
+            let ram_ops = self.hot_buffer.get_range(batch.cursor, &mut batch.budget);
             batch.extend("hot buffer", ram_ops)?;
         }
 
@@ -312,23 +336,24 @@ impl TieredLog {
             if segment.end_seq.get() <= batch.cursor.get() {
                 continue;
             }
-            let (ops, _) = read_segment(segment, batch.cursor, batch.remaining())
+            let (ops, _) = read_segment(segment, batch.cursor, &mut batch.budget)
                 .map_err(|err| unreadable_range(&segment.path, err))?;
             batch.extend(segment.tier.name(), ops)?;
         }
         if !batch.is_full() && batch.cursor.get() < self.head_seq.get() {
             let ops = self
                 .warm_disk
-                .read_active_range(batch.cursor, batch.remaining())
+                .read_active_range(batch.cursor, &mut batch.budget)
                 .map_err(|err| unreadable_range(&self.segments_dir.join("active.wal"), err))?;
             batch.extend("active wal", ops)?;
         }
         Ok(())
     }
 
-    /// Disk maintenance: compresses aged warm segments into cold Zstd segments, delegating the
-    /// compression to `spawn_blocking`, applies the RAM TTL window, and prunes cold segments
-    /// past their TTL or over the room's disk quota.
+    /// Disk maintenance: compresses aged warm segments into cold Zstd segments (at most
+    /// [`MAX_COMPRESSIONS_PER_PASS`]), delegating the compression to `spawn_blocking`, applies
+    /// the RAM TTL window, and prunes cold segments past their TTL or over the room's disk
+    /// quota.
     ///
     /// A failed compression does not stop the other passes: the remaining segments are still
     /// compressed and the TTL and quota still apply. The first error is returned at the end.
@@ -393,7 +418,15 @@ impl TieredLog {
         clock: MaintenanceClock,
         report: &mut MaintenanceReport,
     ) -> Result<(), ServerError> {
-        let compressed = result?;
+        let compressed = match result {
+            Ok(compressed) => compressed,
+            Err(err) => {
+                self.failed_compressions
+                    .insert(segment.start_seq, self.maintenance_passes);
+                return Err(err);
+            }
+        };
+        self.failed_compressions.remove(&segment.start_seq);
         if let Some(err) = &compressed.cleanup_error {
             tracing::warn!(
                 path = ?segment.path,
@@ -406,14 +439,24 @@ impl TieredLog {
         Ok(())
     }
 
-    /// Warm segments that have been sealed for at least `warm_disk_ttl` at `now`.
-    fn warm_segments_due(&self, now: SystemTime) -> Vec<SegmentEntry> {
-        self.segments
+    /// The warm segments to compress in this pass: those sealed for at least `warm_disk_ttl`
+    /// at `now`, at most [`MAX_COMPRESSIONS_PER_PASS`]. Those that never failed go first,
+    /// oldest first; then those whose last failure is oldest, so that retries rotate through
+    /// every failed segment instead of always retrying the same ones.
+    fn warm_segments_due(&mut self, now: SystemTime) -> Vec<SegmentEntry> {
+        self.maintenance_passes += 1;
+        let mut due: Vec<SegmentEntry> = self
+            .segments
             .iter()
             .filter(|segment| segment.tier == Tier::Warm)
             .filter(|segment| age(segment, now) >= self.policy.warm_disk_ttl)
             .cloned()
-            .collect()
+            .collect();
+        self.failed_compressions
+            .retain(|start, _| due.iter().any(|segment| segment.start_seq == *start));
+        due.sort_by_key(|segment| self.failed_compressions.get(&segment.start_seq).copied());
+        due.truncate(MAX_COMPRESSIONS_PER_PASS);
+        due
     }
 
     /// Replaces the warm `segment` in the index with its cold copy.
@@ -443,11 +486,8 @@ impl TieredLog {
         clock: MaintenanceClock,
         report: &mut MaintenanceReport,
     ) -> Result<(), ServerError> {
-        self.hot_buffer.apply_sliding_window_at(
-            self.policy.ram_max_ops,
-            self.policy.ram_ttl,
-            clock.mono,
-        );
+        self.hot_buffer
+            .apply_sliding_window_at(&self.policy, clock.mono);
 
         // Only a prefix of the log is ever pruned, so the retained range stays contiguous.
         let mut disk_bytes = self.disk_bytes();
@@ -593,33 +633,27 @@ struct DeltaBatch {
     ops: Vec<SequencedOperation>,
     /// Sequence of the last operation collected, or the starting cursor.
     cursor: SequenceNumber,
-    limit: usize,
+    /// What the tiers may still return; they take each operation from it as they read it.
+    budget: ReadBudget,
 }
 
 impl DeltaBatch {
-    fn new(cursor: SequenceNumber, limit: usize) -> Self {
+    fn new(cursor: SequenceNumber, budget: ReadBudget) -> Self {
         Self {
-            ops: Vec::with_capacity(limit.min(1024)),
+            ops: Vec::new(),
             cursor,
-            limit,
+            budget,
         }
     }
 
-    fn remaining(&self) -> usize {
-        self.limit - self.ops.len()
-    }
-
     fn is_full(&self) -> bool {
-        self.ops.len() >= self.limit
+        self.budget.is_exhausted()
     }
 
-    /// Appends `ops`, read from `tier`, up to the limit. Each must continue the batch exactly:
-    /// a gap means the log lost operations it claims to retain.
+    /// Appends `ops`, read from `tier` within the batch's budget. Each must continue the batch
+    /// exactly: a gap means the log lost operations it claims to retain.
     fn extend(&mut self, tier: &str, ops: Vec<SequencedOperation>) -> Result<(), ServerError> {
         for op in ops {
-            if self.is_full() {
-                break;
-            }
             if op.seq.get() != self.cursor.get() + 1 {
                 return Err(sequence_gap(tier, self.cursor, op.seq));
             }
@@ -630,15 +664,16 @@ impl DeltaBatch {
     }
 }
 
-/// Reads the operations after `from_seq` in a sealed segment, up to `limit`.
+/// Reads the operations after `from_seq` in a sealed segment that fit in `budget`.
 fn read_segment(
     segment: &SegmentEntry,
     from_seq: SequenceNumber,
-    limit: usize,
+    budget: &mut ReadBudget,
 ) -> Result<RecoveredLogData, ServerError> {
+    let start_seq = Some(segment.start_seq);
     match segment.tier {
-        Tier::Warm => WarmDiskLog::read_range_with_mutations(&segment.path, from_seq, limit),
-        Tier::Cold => ColdDiskLog::read_range_with_mutations(&segment.path, from_seq, limit),
+        Tier::Warm => read_segment_file(&segment.path, start_seq, from_seq, budget),
+        Tier::Cold => read_cold_file(&segment.path, start_seq, from_seq, budget),
     }
 }
 
@@ -648,25 +683,34 @@ fn age(segment: &SegmentEntry, now: SystemTime) -> std::time::Duration {
 }
 
 /// Reads the log backwards, starting with `active` (the contents of `active.wal`) and then the
-/// sealed segments from the newest, until it holds at least `ops_wanted` operations and
-/// `mutations_wanted` distinct mutation IDs or the log is exhausted. Returns them oldest first.
+/// sealed segments from the newest, until it holds the newest operations that fit in RAM
+/// (`ram_max_ops` and `ram_max_bytes` of `policy`) and `mutations_wanted` distinct mutation
+/// IDs, or the log is exhausted. Returns them oldest first.
+///
+/// Segments read only for their mutation IDs keep none of their operations, so memory is
+/// bounded by what RAM holds plus one segment.
 ///
 /// A corrupt sealed segment stops the reading there instead of failing the open: what is
 /// older is not loaded, and a read of the damaged range later reports a gap.
 fn read_newest(
     segments: &SegmentIndex,
     active: RecoveredLogData,
-    ops_wanted: usize,
+    policy: &RoomLifecyclePolicy,
     mutations_wanted: usize,
 ) -> Result<RecoveredLogData, ServerError> {
-    let mut ops_count = active.0.len();
+    let mut ram = RamFill::new(policy);
     let mut distinct: HashSet<MutationId> = active.1.iter().map(|(id, _)| *id).collect();
-    let mut chunks = vec![active];
+    let (active_ops, active_mutations) = active;
+    let mut chunks = vec![(ram.keep_newest(active_ops), active_mutations)];
     for segment in segments.iter().rev() {
-        if ops_count >= ops_wanted && distinct.len() >= mutations_wanted {
+        if ram.is_full() && distinct.len() >= mutations_wanted {
             break;
         }
-        let chunk = match read_segment(segment, SequenceNumber::new(0), usize::MAX) {
+        let chunk = match read_segment(
+            segment,
+            SequenceNumber::new(0),
+            &mut ReadBudget::ops(usize::MAX),
+        ) {
             Ok(chunk) => chunk,
             Err(ServerError::WalCorruption(reason)) => {
                 tracing::error!(
@@ -678,18 +722,53 @@ fn read_newest(
             }
             Err(err) => return Err(err),
         };
-        ops_count += chunk.0.len();
         distinct.extend(chunk.1.iter().map(|(id, _)| *id));
-        chunks.push(chunk);
+        chunks.push((ram.keep_newest(chunk.0), chunk.1));
     }
 
-    let mut ops = Vec::with_capacity(ops_count);
+    let mut ops = Vec::new();
     let mut mutations = Vec::new();
     for (chunk_ops, chunk_mutations) in chunks.into_iter().rev() {
         ops.extend(chunk_ops);
         mutations.extend(chunk_mutations);
     }
     Ok((ops, mutations))
+}
+
+/// The operations kept for RAM while the log is read backwards on open.
+struct RamFill {
+    max_ops: usize,
+    max_bytes: u64,
+    ops: usize,
+    bytes: u64,
+}
+
+impl RamFill {
+    fn new(policy: &RoomLifecyclePolicy) -> Self {
+        Self {
+            max_ops: policy.ram_max_ops,
+            max_bytes: policy.ram_max_bytes,
+            ops: 0,
+            bytes: 0,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.ops >= self.max_ops || self.bytes >= self.max_bytes
+    }
+
+    /// Keeps the newest operations of `chunk`, which is older than everything kept so far,
+    /// while RAM is not full. One operation beyond the byte limit is kept, so that RAM is
+    /// filled up to it; the sliding window trims it afterwards.
+    fn keep_newest(&mut self, mut chunk: Vec<SequencedOperation>) -> Vec<SequencedOperation> {
+        let mut first = chunk.len();
+        while first > 0 && !self.is_full() {
+            first -= 1;
+            self.ops += 1;
+            self.bytes = self.bytes.saturating_add(op_bytes(&chunk[first]));
+        }
+        chunk.split_off(first)
+    }
 }
 
 /// The last `window` distinct mutation IDs of `mutations` (oldest first), each with its

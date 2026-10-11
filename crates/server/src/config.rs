@@ -34,6 +34,16 @@ pub struct ServerConfig {
     #[serde(default = "default_ram_max_ops")]
     pub ram_max_ops: usize,
 
+    /// Server default of the room lifecycle setting `ram_max_bytes`: encoded size of the
+    /// operations kept in RAM.
+    #[serde(default = "default_ram_max_bytes")]
+    pub ram_max_bytes: u64,
+
+    /// Server default of the room lifecycle setting `segment_max_bytes`: size at which the
+    /// active segment is sealed.
+    #[serde(default = "default_segment_max_bytes")]
+    pub segment_max_bytes: u64,
+
     /// Server default: time-to-live of operations in RAM (seconds).
     #[serde(default = "default_ram_ttl_secs")]
     pub ram_ttl_secs: u64,
@@ -135,6 +145,14 @@ fn default_ram_max_ops() -> usize {
     RoomLifecyclePolicy::default().ram_max_ops
 }
 
+fn default_ram_max_bytes() -> u64 {
+    RoomLifecyclePolicy::default().ram_max_bytes
+}
+
+fn default_segment_max_bytes() -> u64 {
+    RoomLifecyclePolicy::default().segment_max_bytes
+}
+
 fn default_ram_ttl_secs() -> u64 {
     RoomLifecyclePolicy::default().ram_ttl.as_secs()
 }
@@ -205,6 +223,8 @@ impl Default for ServerConfig {
             auth_secret: default_auth_secret(),
             admin_secret: default_admin_secret(),
             ram_max_ops: default_ram_max_ops(),
+            ram_max_bytes: default_ram_max_bytes(),
+            segment_max_bytes: default_segment_max_bytes(),
             ram_ttl_secs: default_ram_ttl_secs(),
             warm_disk_ttl_secs: default_warm_disk_ttl_secs(),
             cold_disk_ttl_secs: default_cold_disk_ttl_secs(),
@@ -324,6 +344,8 @@ impl ServerConfig {
     fn lifecycle_settings(&self) -> RoomLifecycleOverrides {
         RoomLifecycleOverrides {
             ram_max_ops: Some(self.ram_max_ops),
+            ram_max_bytes: Some(self.ram_max_bytes),
+            segment_max_bytes: Some(self.segment_max_bytes),
             ram_ttl_secs: Some(self.ram_ttl_secs),
             warm_disk_ttl_secs: Some(self.warm_disk_ttl_secs),
             cold_disk_ttl_secs: Some(self.cold_disk_ttl_secs),
@@ -422,6 +444,12 @@ impl ServerConfig {
         use PolicySetting::*;
         if let Some(ops) = parse_var(&var, RamMaxOps.env_var())? {
             self.ram_max_ops = ops;
+        }
+        if let Some(bytes) = parse_var(&var, RamMaxBytes.env_var())? {
+            self.ram_max_bytes = bytes;
+        }
+        if let Some(bytes) = parse_var(&var, SegmentMaxBytes.env_var())? {
+            self.segment_max_bytes = bytes;
         }
         if let Some(secs) = parse_var(&var, RamTtl.env_var())? {
             self.ram_ttl_secs = secs;

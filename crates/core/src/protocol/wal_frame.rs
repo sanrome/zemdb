@@ -137,6 +137,11 @@ impl BatchHeader {
     pub fn frame_len(&self) -> usize {
         BATCH_HEADER_SIZE + self.payload_len
     }
+
+    /// Number of operations the payload declares.
+    pub fn ops_count(&self) -> usize {
+        self.ops_count
+    }
 }
 
 /// Outcome of [`decode_batch_payload`].

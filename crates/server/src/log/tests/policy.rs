@@ -105,6 +105,20 @@ fn overrides_outside_their_range_are_bad_requests_naming_the_field() {
             },
             "lifecycle.idle_timeout_secs",
         ),
+        (
+            RoomLifecycleOverrides {
+                ram_max_bytes: Some(MIN_LOG_BYTES_LIMIT - 1),
+                ..Default::default()
+            },
+            "lifecycle.ram_max_bytes",
+        ),
+        (
+            RoomLifecycleOverrides {
+                segment_max_bytes: Some(MAX_LOG_BYTES_LIMIT + 1),
+                ..Default::default()
+            },
+            "lifecycle.segment_max_bytes",
+        ),
     ];
     for (overrides, field) in cases {
         match overrides.validate() {
@@ -115,6 +129,8 @@ fn overrides_outside_their_range_are_bad_requests_naming_the_field() {
 
     RoomLifecycleOverrides {
         ram_max_ops: Some(1),
+        ram_max_bytes: Some(MIN_LOG_BYTES_LIMIT),
+        segment_max_bytes: Some(MAX_LOG_BYTES_LIMIT),
         ram_ttl_secs: Some(1),
         warm_disk_ttl_secs: Some(0),
         cold_disk_ttl_secs: Some(0),

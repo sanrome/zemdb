@@ -1,12 +1,24 @@
 use crate::durable;
 use crate::error::ServerError;
 use crate::fail_point;
+use crate::log::budget::ReadBudget;
 use crate::log::io_probe::{self, IoEvent};
-use crate::log::warm_disk::{decode_segment, RecoveredLogData};
-use std::io::Write;
+use crate::log::segment_reader::{classify_in, read_frames, read_full};
+use crate::log::warm_disk::{parse_segment_filename, RecoveredLogData};
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 use zemdb_core::id::SequenceNumber;
 use zemdb_core::protocol::messages::SequencedOperation;
+use zemdb_core::protocol::wal_frame::{
+    decode_batch_payload, parse_batch_header, BatchPayloadDecode, BATCH_HEADER_SIZE,
+};
+
+/// Zstandard level of cold segments.
+const ZSTD_LEVEL: i32 = 3;
+
+/// Chunk in which a warm segment is read while compressing it.
+const COPY_CHUNK: usize = 64 * 1024;
 
 /// Tier 3: Compressed delta log on disk using Zstandard for high-density long-term retention.
 #[derive(Debug, Default)]
@@ -49,30 +61,39 @@ impl ColdDiskLog {
             )));
         }
 
-        let uncompressed_data = std::fs::read(warm_path)?;
-        let compressed_data = zstd::stream::encode_all(&uncompressed_data[..], 3)
-            .map_err(|e| ServerError::Wal(format!("Zstd compression failed: {}", e)))?;
-
         let tmp_path = durable::tmp_path_for(cold_path);
-        {
-            let mut tmp_file = std::fs::File::create(&tmp_path)?;
-            tmp_file.write_all(&compressed_data)?;
-            tmp_file.flush()?;
-            tmp_file.sync_all()?;
-        }
+        let range = warm_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| parse_segment_filename(name, ".wal"));
+        let warm_digest = match compress_to(warm_path, &tmp_path, range) {
+            Ok(digest) => digest,
+            Err(err) => {
+                // Opening the log removes it too; removing it now keeps a segment that fails
+                // on every pass from leaving one behind each time.
+                if let Err(e) = std::fs::remove_file(&tmp_path) {
+                    if e.kind() != io::ErrorKind::NotFound {
+                        tracing::warn!(path = ?tmp_path, error = %e, "Removing a failed compression's temporary file failed");
+                    }
+                }
+                return Err(err);
+            }
+        };
 
         std::fs::rename(&tmp_path, cold_path)?;
         let dir = cold_path.parent().unwrap_or_else(|| Path::new(""));
         durable::sync_dir(dir)?;
 
-        // Verify decompressed roundtrip before purging the uncompressed file
-        let verified_ops = Self::read_range(cold_path, SequenceNumber::new(0), usize::MAX)?;
-        if verified_ops.is_empty() && !uncompressed_data.is_empty() {
-            return Err(ServerError::WalCorruption(
-                "Cold segment verification failed: produced zero operations from non-empty WAL"
-                    .to_string(),
-            ));
+        // Verify that the cold segment decompresses to exactly the warm one before purging it.
+        let cold_digest = decompressed_digest(cold_path)?;
+        if cold_digest != warm_digest {
+            return Err(ServerError::WalCorruption(format!(
+                "Cold segment verification failed: it decompresses to {} bytes with CRC32 {}, \
+                 the warm segment has {} bytes with CRC32 {}",
+                cold_digest.len, cold_digest.crc, warm_digest.len, warm_digest.crc
+            )));
         }
+        let bytes = std::fs::metadata(cold_path)?.len();
 
         let cleanup = std::fs::remove_file(warm_path)
             .map_err(ServerError::from)
@@ -82,7 +103,7 @@ impl ColdDiskLog {
                     .map_err(ServerError::from)
             });
         Ok(CompressedSegment {
-            bytes: compressed_data.len() as u64,
+            bytes,
             cleanup_error: cleanup.err(),
         })
     }
@@ -118,33 +139,224 @@ impl ColdDiskLog {
         from_seq: SequenceNumber,
         limit: usize,
     ) -> Result<RecoveredLogData, ServerError> {
-        if limit == 0 {
-            return Ok((Vec::new(), Vec::new()));
-        }
-        io_probe::record(
-            IoEvent::SegmentRead,
-            cold_path.parent().unwrap_or_else(|| Path::new("")),
-        );
-        let compressed_data = match std::fs::read(cold_path) {
-            Ok(data) => data,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((Vec::new(), Vec::new()))
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let decompressed_data = zstd::stream::decode_all(&compressed_data[..])
-            .map_err(|e| ServerError::WalCorruption(format!("Zstd decompression failed: {}", e)))?;
-
-        let decoded = decode_segment(&decompressed_data, from_seq, limit)?;
-        if decoded.torn {
-            tracing::warn!(
-                path = ?cold_path,
-                valid_bytes = decoded.valid_len,
-                "Torn write detected in decompressed cold segment"
-            );
-        }
-        Ok((decoded.ops, decoded.mutations))
+        let start_seq = cold_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| parse_segment_filename(name, ".wal.zst"))
+            .map(|(start, _)| SequenceNumber::new(start));
+        read_cold_file(cold_path, start_seq, from_seq, &mut ReadBudget::ops(limit))
     }
+}
+
+/// Length and CRC32 of a stream of bytes.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Digest {
+    len: u64,
+    crc: u32,
+}
+
+/// [`Digest`] of the bytes written to it.
+#[derive(Default)]
+struct DigestWriter {
+    hasher: crc32fast::Hasher,
+    len: u64,
+}
+
+impl DigestWriter {
+    fn finish(self) -> Digest {
+        Digest {
+            len: self.len,
+            crc: self.hasher.finalize(),
+        }
+    }
+}
+
+impl Write for DigestWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.hasher.update(buf);
+        self.len += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Compresses the file at `warm_path` into a new, synced file at `tmp_path`, streaming it, and
+/// returns the digest of the uncompressed bytes.
+///
+/// Every frame is checked (header and payload checksums, decodable operations) as it is
+/// compressed, so a warm segment is only ever replaced by a copy of frames that were all
+/// verified: reads skip frames before their cursor without checking their payloads. With the
+/// `(start, end)` sequences of the segment's name, its operations must also run exactly from
+/// `start` to `end`, the start that reads trust when they skip frames. A frame that cannot be
+/// read fails the compression and the warm segment stays.
+fn compress_to(
+    warm_path: &Path,
+    tmp_path: &Path,
+    range: Option<(u64, u64)>,
+) -> Result<Digest, ServerError> {
+    let mut warm = BufReader::with_capacity(COPY_CHUNK, File::open(warm_path)?);
+    let tmp = File::create(tmp_path)?;
+    let mut encoder = zstd::stream::write::Encoder::new(BufWriter::new(tmp), ZSTD_LEVEL)
+        .map_err(|e| ServerError::Wal(format!("Zstd compression failed: {e}")))?;
+    let mut digest = DigestWriter::default();
+    let mut position = 0u64;
+    let mut next_seq = range.map(|(start, _)| start);
+    loop {
+        let invalid = |reason: String| {
+            ServerError::WalCorruption(format!(
+                "Warm segment {warm_path:?} cannot be compressed, frame at offset {position}: {reason}"
+            ))
+        };
+        let mut header_bytes = [0u8; BATCH_HEADER_SIZE];
+        let available = read_full(&mut warm, &mut header_bytes)?;
+        if available == 0 {
+            break;
+        }
+        if available < BATCH_HEADER_SIZE {
+            return Err(invalid(format!("incomplete header of {available} bytes")));
+        }
+        let header = parse_batch_header(&header_bytes).map_err(|e| invalid(e.to_string()))?;
+        let mut payload = vec![0u8; header.payload_len()];
+        let payload_read = read_full(&mut warm, &mut payload)?;
+        if payload_read < payload.len() {
+            return Err(invalid(format!(
+                "payload of {payload_read} bytes, the header declares {}",
+                payload.len()
+            )));
+        }
+        match decode_batch_payload(&header, &payload).map_err(|e| invalid(e.to_string()))? {
+            BatchPayloadDecode::Batch { ops, .. } => {
+                for op in &ops {
+                    let seq = op.seq.get();
+                    if next_seq.is_some_and(|expected| seq != expected) {
+                        return Err(invalid(format!(
+                            "operation {seq}, expected {}",
+                            next_seq.unwrap_or_default()
+                        )));
+                    }
+                    next_seq = Some(seq + 1);
+                }
+            }
+            BatchPayloadDecode::ChecksumMismatch { expected, actual } => {
+                return Err(invalid(format!(
+                    "payload CRC32 is {actual}, expected {expected}"
+                )));
+            }
+        }
+        for part in [&header_bytes[..], &payload] {
+            digest.write_all(part)?;
+            encoder.write_all(part)?;
+        }
+        position += header.frame_len() as u64;
+    }
+    if let Some((start, end)) = range {
+        if next_seq != Some(end + 1) {
+            return Err(ServerError::WalCorruption(format!(
+                "Warm segment {warm_path:?} holds operations {start} to {}, its name says {start} to {end}",
+                next_seq.map_or(start, |next| next - 1)
+            )));
+        }
+    }
+    let mut tmp = encoder
+        .finish()?
+        .into_inner()
+        .map_err(|e| ServerError::from(e.into_error()))?;
+    tmp.flush()?;
+    tmp.sync_all()?;
+    Ok(digest.finish())
+}
+
+/// Digest of the decompressed contents of the cold segment at `cold_path`, streaming it.
+fn decompressed_digest(cold_path: &Path) -> Result<Digest, ServerError> {
+    let mut decoder = open_decoder(File::open(cold_path)?)?;
+    let mut digest = DigestWriter::default();
+    io::copy(&mut decoder, &mut digest).map_err(decompression_error)?;
+    Ok(digest.finish())
+}
+
+/// An error of the file under a zstd stream, told apart from errors in the compressed data.
+#[derive(Debug)]
+struct FileError(io::Error);
+
+impl std::fmt::Display for FileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for FileError {}
+
+/// A file whose read errors are tagged as [`FileError`].
+struct TaggedFile(File);
+
+impl Read for TaggedFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0
+            .read(buf)
+            .map_err(|e| io::Error::new(e.kind(), FileError(e)))
+    }
+}
+
+type ColdDecoder = zstd::stream::read::Decoder<'static, io::BufReader<TaggedFile>>;
+
+fn open_decoder(file: File) -> Result<ColdDecoder, ServerError> {
+    zstd::stream::read::Decoder::new(TaggedFile(file)).map_err(decompression_error)
+}
+
+/// An error reading a zstd stream: I/O if the file failed, corruption otherwise.
+fn decompression_error(e: io::Error) -> ServerError {
+    if e.get_ref().is_some_and(|inner| inner.is::<FileError>()) {
+        ServerError::Io(e)
+    } else {
+        ServerError::WalCorruption(format!("Zstd decompression failed: {e}"))
+    }
+}
+
+/// Reads the operations after `from_seq` that fit in `budget` from the cold segment at `path`,
+/// whose first operation is `start_seq`, decompressing it as a stream. A missing file yields
+/// nothing; the caller detects the gap it leaves.
+pub(crate) fn read_cold_file(
+    path: &Path,
+    start_seq: Option<SequenceNumber>,
+    from_seq: SequenceNumber,
+    budget: &mut ReadBudget,
+) -> Result<RecoveredLogData, ServerError> {
+    if budget.is_exhausted() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    io_probe::record(
+        IoEvent::SegmentRead,
+        path.parent().unwrap_or_else(|| Path::new("")),
+    );
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
+        Err(e) => return Err(e.into()),
+    };
+    let mut decoder = open_decoder(file)?;
+    let read =
+        read_frames(&mut decoder, None, start_seq, from_seq, budget).map_err(|err| match err {
+            ServerError::Io(e) => decompression_error(e),
+            other => other,
+        })?;
+
+    if let Some((at, anomaly)) = read.anomaly {
+        // The stream cannot seek back, so the rest of the segment is decompressed again to
+        // look for a valid frame after the damage. This only happens on an anomaly, and the
+        // segment is bounded by `segment_max_bytes` plus one frame.
+        let mut decoder = open_decoder(File::open(path)?)?;
+        let mut rest = Vec::new();
+        io::copy(&mut decoder.by_ref().take(at), &mut io::sink())
+            .and_then(|_| decoder.read_to_end(&mut rest))
+            .map_err(decompression_error)?;
+        let end = rest.len() as u64;
+        let reason = classify_in(&mut Cursor::new(rest), 0, anomaly, end)?;
+        tracing::warn!(path = ?path, valid_bytes = at, %reason, "Torn write detected in decompressed cold segment");
+    }
+    Ok((read.ops, read.mutations))
 }
 
 #[cfg(test)]

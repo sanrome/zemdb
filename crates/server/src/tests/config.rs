@@ -200,6 +200,8 @@ fn unparsable_environment_values_fail_naming_the_variable() {
 fn lifecycle_environment_variables_set_the_server_defaults() {
     let config = with_env(&[
         ("ZEMDB_RAM_MAX_OPS", "250"),
+        ("ZEMDB_RAM_MAX_BYTES", "2097152"),
+        ("ZEMDB_SEGMENT_MAX_BYTES", "4194304"),
         ("ZEMDB_RAM_TTL_SECS", "30"),
         ("ZEMDB_WARM_TTL_SECS", "0"),
         ("ZEMDB_COLD_TTL_SECS", "86400"),
@@ -216,6 +218,8 @@ fn lifecycle_environment_variables_set_the_server_defaults() {
         config.default_lifecycle_policy(),
         RoomLifecyclePolicy {
             ram_max_ops: 250,
+            ram_max_bytes: 2 * 1024 * 1024,
+            segment_max_bytes: 4 * 1024 * 1024,
             ram_ttl: secs(30),
             warm_disk_ttl: secs(0),
             cold_disk_ttl: secs(86_400),
