@@ -396,6 +396,41 @@ pub fn validate_compact_row(
     Ok(())
 }
 
+/// Validates a row stored under the key `pk` in $O(C)$ time: the key, the row, and that the
+/// row's primary key columns hold the key's values.
+pub fn validate_keyed_row(
+    table: &TableSchema,
+    pk: &PrimaryKey,
+    row: &CompactRow,
+) -> Result<(), ValidationError> {
+    table.validate_pk(pk)?;
+    validate_compact_row(table, row)?;
+
+    for (pk_idx, pk_col_name) in table.primary_key().iter().enumerate() {
+        let col_idx = *table.column_indices().get(pk_col_name).ok_or_else(|| {
+            ValidationError::UnknownColumn {
+                table: table.name().to_string(),
+                column: pk_col_name.clone(),
+            }
+        })?;
+
+        if col_idx >= row.len() || row[col_idx].is_null() {
+            return Err(ValidationError::MissingPrimaryKeyColumn {
+                table: table.name().to_string(),
+                column: pk_col_name.clone(),
+            });
+        }
+
+        if row[col_idx] != pk[pk_idx] {
+            return Err(ValidationError::PrimaryKeyMismatch {
+                table: table.name().to_string(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Validates an Operation against TableSchema in $O(C)$ time without reconstructing HashMaps.
 pub fn validate_operation(table: &TableSchema, op: &Operation) -> Result<(), ValidationError> {
     if op.table_id != table.table_id() {
@@ -406,42 +441,13 @@ pub fn validate_operation(table: &TableSchema, op: &Operation) -> Result<(), Val
         });
     }
 
-    table.validate_pk(&op.pk)?;
-
     match &op.kind {
-        OperationKind::Insert { row } => {
-            validate_compact_row(table, row)?;
-
-            // Validate that the primary key columns in `row` match `op.pk`
-            for (pk_idx, pk_col_name) in table.primary_key().iter().enumerate() {
-                let col_idx = *table.column_indices().get(pk_col_name).ok_or_else(|| {
-                    ValidationError::UnknownColumn {
-                        table: table.name().to_string(),
-                        column: pk_col_name.clone(),
-                    }
-                })?;
-
-                if col_idx >= row.len() || row[col_idx].is_null() {
-                    return Err(ValidationError::MissingPrimaryKeyColumn {
-                        table: table.name().to_string(),
-                        column: pk_col_name.clone(),
-                    });
-                }
-
-                if row[col_idx] != op.pk[pk_idx] {
-                    return Err(ValidationError::PrimaryKeyMismatch {
-                        table: table.name().to_string(),
-                    });
-                }
-            }
-        }
+        OperationKind::Insert { row } => validate_keyed_row(table, &op.pk, row),
         OperationKind::Update { updates } => {
-            validate_column_updates(table, updates)?;
+            table.validate_pk(&op.pk)?;
+            validate_column_updates(table, updates)
         }
-        OperationKind::Delete => {
-            // Delete only mutates by PK, which was already verified by validate_pk above
-        }
+        // A delete only names its key.
+        OperationKind::Delete => table.validate_pk(&op.pk),
     }
-
-    Ok(())
 }

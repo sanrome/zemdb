@@ -66,7 +66,7 @@ async fn test_cross_engine_snapshot_portability() {
         .await
         .unwrap();
     let disk_head = disk_engine
-        .apply_snapshot(&room_id, schema.clone(), &mem_snapshot)
+        .apply_snapshot(&room_id, schema.clone(), mem_snapshot.into(), 2u64.into())
         .await
         .unwrap();
     assert_eq!(disk_head, SequenceNumber::from(2u64));
@@ -100,7 +100,7 @@ async fn test_cross_engine_snapshot_portability() {
         .await
         .unwrap();
     let mem2_head = mem_engine2
-        .apply_snapshot(&room_id, schema.clone(), &disk_snapshot)
+        .apply_snapshot(&room_id, schema.clone(), disk_snapshot.into(), 2u64.into())
         .await
         .unwrap();
     assert_eq!(mem2_head, SequenceNumber::from(2u64));
@@ -151,7 +151,7 @@ async fn test_snapshot_envelope_corruption_detection() {
     bad_magic[2] = b'D';
     bad_magic[3] = b'!';
     let res = mem_engine
-        .apply_snapshot(&room_id, schema.clone(), &bad_magic)
+        .apply_snapshot(&room_id, schema.clone(), bad_magic.into(), 0u64.into())
         .await;
     assert!(matches!(res, Err(StorageError::SnapshotCorruption(_))));
 
@@ -159,7 +159,7 @@ async fn test_snapshot_envelope_corruption_detection() {
     let mut bad_version = valid_snapshot.clone();
     bad_version[4] = 99;
     let res = mem_engine
-        .apply_snapshot(&room_id, schema.clone(), &bad_version)
+        .apply_snapshot(&room_id, schema.clone(), bad_version.into(), 0u64.into())
         .await;
     assert!(matches!(res, Err(StorageError::SnapshotCorruption(_))));
 
@@ -168,14 +168,19 @@ async fn test_snapshot_envelope_corruption_detection() {
     let last_idx = bad_crc.len() - 1;
     bad_crc[last_idx] ^= 0xFF;
     let res = mem_engine
-        .apply_snapshot(&room_id, schema.clone(), &bad_crc)
+        .apply_snapshot(&room_id, schema.clone(), bad_crc.into(), 0u64.into())
         .await;
     assert!(matches!(res, Err(StorageError::SnapshotCorruption(_))));
 
     // 4. Truncated snapshot
     let truncated = &valid_snapshot[..10];
     let res = mem_engine
-        .apply_snapshot(&room_id, schema.clone(), truncated)
+        .apply_snapshot(
+            &room_id,
+            schema.clone(),
+            truncated.to_vec().into(),
+            0u64.into(),
+        )
         .await;
     assert!(matches!(res, Err(StorageError::SnapshotCorruption(_))));
 }

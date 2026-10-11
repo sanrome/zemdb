@@ -1,11 +1,12 @@
 pub(crate) mod state;
 
 pub use state::Table;
-pub(crate) use state::{RoomSnapshotPayload, RoomSnapshotRef, RoomState};
+pub(crate) use state::{RoomSnapshotRef, RoomState};
 
-use state::{resolve_table_id, TableRef};
+use state::{decode_received_snapshot, resolve_table_id, TableRef};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::ops::RangeBounds;
 use std::sync::{Arc, RwLock};
@@ -14,6 +15,7 @@ use zemdb_core::{CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, Sequenc
 use crate::engine::{apply_scan_transforms, RowStream, StorageEngine};
 use crate::error::StorageError;
 use crate::options::{KeyRange, ScanDirection, ScanOptions};
+use crate::snapshot::DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES;
 
 /// In-memory implementation of `StorageEngine` with per-room isolation.
 ///
@@ -21,6 +23,9 @@ use crate::options::{KeyRange, ScanDirection, ScanOptions};
 /// across different rooms without global lock contention.
 /// Inside each room, multiple concurrent readers can execute queries (`get`, `scan`)
 /// while writes (`apply_batch`) take an exclusive lock on that specific room only.
+///
+/// Outside WebAssembly, `create_snapshot` and `apply_snapshot` serialize and decode on Tokio's
+/// blocking pool, so they must run inside a Tokio runtime.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryStorageEngine {
     rooms: Arc<RwLock<HashMap<RoomId, Arc<RwLock<RoomState>>>>>,
@@ -303,39 +308,75 @@ impl StorageEngine for MemoryStorageEngine {
     #[tracing::instrument(skip(self), fields(room_id = %room_id))]
     async fn create_snapshot(&self, room_id: &RoomId) -> Result<Vec<u8>, StorageError> {
         let room_arc = self.get_room(room_id)?;
-        let room_state = room_arc
-            .read()
-            .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
-
-        let payload = RoomSnapshotRef {
-            head_seq: room_state.head_seq,
-            tables: &room_state.tables,
+        // O(1) clones of the tables: serialization runs without the lock.
+        let (head_seq, tables) = {
+            let room_state = room_arc
+                .read()
+                .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
+            (room_state.head_seq, room_state.tables.clone())
         };
 
-        let raw_bytes =
-            bincode::serialize(&payload).map_err(|e| StorageError::Serialization(e.to_string()))?;
-        let envelope = crate::snapshot::encode_snapshot_envelope(&raw_bytes, false, 0)?;
+        let encode = move || {
+            let raw_bytes = bincode::serialize(&RoomSnapshotRef {
+                head_seq,
+                tables: &tables,
+            })
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            crate::snapshot::encode_snapshot_envelope(&raw_bytes, false, 0)
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let envelope = tokio::task::spawn_blocking(encode)
+            .await
+            .map_err(|e| StorageError::Other(format!("Join error: {e}")))??;
+        #[cfg(target_arch = "wasm32")]
+        let envelope = encode()?;
+
         tracing::debug!(room_id = %room_id, snapshot_size = envelope.len(), "Created in-memory snapshot");
         Ok(envelope)
     }
 
-    /// Replaces the room's contents with `snapshot` (see the trait for the rules on its head
-    /// sequence). The contents are replaced in place under the room's lock: a writer that
-    /// already holds the room's handle writes into the new state, never into a detached copy.
+    /// Replaces the room's contents with `snapshot` (see the trait for its checks and the rules
+    /// on its head sequence). The contents are replaced in place under the room's lock: a
+    /// writer that already holds the room's handle writes into the new state, never into a
+    /// detached copy.
     #[tracing::instrument(skip(self, schema, snapshot), fields(room_id = %room_id, snapshot_size = snapshot.len()))]
     async fn apply_snapshot(
         &self,
         room_id: &RoomId,
         schema: Schema,
-        snapshot: &[u8],
+        snapshot: Bytes,
+        expected_head_seq: SequenceNumber,
     ) -> Result<SequenceNumber, StorageError> {
+        // Checked before decoding, so that an unopened room is reported without decoding.
+        self.get_room(room_id)?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let (schema, payload) = {
+            let fail_key = std::path::PathBuf::from(room_id.as_str());
+            tokio::task::spawn_blocking(move || {
+                crate::fail_point::pause_blocking("apply_snapshot.decode", &fail_key);
+                let payload = decode_received_snapshot(
+                    &snapshot,
+                    DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES,
+                    &schema,
+                    expected_head_seq,
+                )?;
+                Ok::<_, StorageError>((schema, payload))
+            })
+            .await
+            .map_err(|e| StorageError::Other(format!("Join error: {e}")))??
+        };
+        #[cfg(target_arch = "wasm32")]
+        let payload = decode_received_snapshot(
+            &snapshot,
+            DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES,
+            &schema,
+            expected_head_seq,
+        )?;
+
+        // Looked up again: the room may have been closed, or closed and reopened, while the
+        // snapshot was decoded. The snapshot goes to the room open now, as in the disk engine.
         let room_arc = self.get_room(room_id)?;
-
-        let decompressed = crate::snapshot::decode_snapshot_envelope(snapshot)?;
-        let mut payload: RoomSnapshotPayload = bincode::deserialize(&decompressed)
-            .map_err(|e| StorageError::SnapshotCorruption(e.to_string()))?;
-        payload.fill_missing_tables(&schema);
-
         let mut room = room_arc
             .write()
             .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;

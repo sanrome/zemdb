@@ -347,6 +347,15 @@ impl TableSchema {
         validation::validate_compact_row(self, row)
     }
 
+    /// Validates a CompactRow stored under the key `pk` in O(C) time against this TableSchema.
+    pub fn validate_keyed_row(
+        &self,
+        pk: &PrimaryKey,
+        row: &CompactRow,
+    ) -> Result<(), ValidationError> {
+        validation::validate_keyed_row(self, pk, row)
+    }
+
     /// Validates positional ColumnUpdates in O(C) time against this TableSchema.
     pub fn validate_column_updates(&self, updates: &[ColumnUpdate]) -> Result<(), ValidationError> {
         validation::validate_column_updates(self, updates)

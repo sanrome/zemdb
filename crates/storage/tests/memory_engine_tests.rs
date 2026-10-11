@@ -250,7 +250,7 @@ async fn test_snapshot_create_and_restore() {
     let engine_b = MemoryStorageEngine::new();
     engine_b.open_room(&room_id, schema.clone()).await.unwrap();
     let restored_head = engine_b
-        .apply_snapshot(&room_id, schema, &snapshot_bytes)
+        .apply_snapshot(&room_id, schema, snapshot_bytes.into(), 1u64.into())
         .await
         .unwrap();
     assert_eq!(restored_head, SequenceNumber::from(1u64));

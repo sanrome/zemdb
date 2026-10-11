@@ -4,6 +4,7 @@ pub mod recovery;
 pub mod wal;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use fs2::FileExt;
 use std::collections::{HashMap, VecDeque};
 use std::ops::RangeBounds;
@@ -23,8 +24,10 @@ use crate::disk::recovery::recover_room;
 use crate::disk::wal::WalWriter;
 use crate::engine::{apply_scan_transforms, RowStream, StorageEngine};
 use crate::error::StorageError;
-use crate::memory::state::{apply_operation, resolve_table_id, validate_batch, TableRef};
-use crate::memory::{RoomSnapshotPayload, RoomSnapshotRef, Table};
+use crate::memory::state::{
+    apply_operation, decode_received_snapshot, resolve_table_id, validate_batch, TableRef,
+};
+use crate::memory::{RoomSnapshotRef, Table};
 use crate::options::{KeyRange, ScanDirection, ScanOptions};
 use crate::snapshot::DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES;
 
@@ -197,6 +200,10 @@ pub(crate) struct DiskRoomState {
 ///    order, so what they observe is always a prefix of the WAL.
 #[derive(Debug)]
 pub(crate) struct DiskRoom {
+    /// Handle of `room_{id}.lock`, whose exclusive lock keeps any other engine, in this process
+    /// or another, from opening the room (see [`lock_room_files`]). It is released when the room
+    /// is dropped.
+    _lock: std::fs::File,
     pub(crate) room_id: RoomId,
     pub(crate) snap_path: PathBuf,
     pub(crate) wal_path: PathBuf,
@@ -240,6 +247,11 @@ impl DiskStorageEngine {
     /// Computes the filesystem path for a room's base snapshot file (`room_{id}.snap`).
     pub fn snap_file_path(&self, room_id: &RoomId) -> PathBuf {
         self.options.data_dir.join(format!("room_{}.snap", room_id))
+    }
+
+    /// Computes the filesystem path for a room's lock file (`room_{id}.lock`).
+    pub fn lock_file_path(&self, room_id: &RoomId) -> PathBuf {
+        self.options.data_dir.join(format!("room_{}.lock", room_id))
     }
 
     /// Computes the filesystem path for a room's append-only WAL file (`room_{id}.wal`).
@@ -423,6 +435,40 @@ struct DiskScanState {
     buffer: VecDeque<Result<(PrimaryKey, CompactRow), StorageError>>,
 }
 
+/// Takes the locks of a room being opened and opens its WAL, creating it if needed.
+///
+/// The first lock is on `room_{id}.lock`, taken before any other file of the room is touched.
+/// That file is never renamed or removed, so no other engine can open the room at any moment
+/// while it is open, not even while a compaction has moved the WAL aside and its replacement
+/// does not exist yet. The WAL keeps its own exclusive lock as well, on its handle: Tokio's file
+/// operations still in flight on the blocking pool hold that handle after the room is dropped
+/// (for example by an engine dropped without closing the room), so the room cannot be opened
+/// again until a write still landing in the WAL has finished.
+fn lock_room_files(
+    lock_path: &std::path::Path,
+    wal_path: &std::path::Path,
+    room_id: &RoomId,
+) -> Result<(std::fs::File, std::fs::File), StorageError> {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    lock.try_lock_exclusive()
+        .map_err(|_| StorageError::RoomLocked(room_id.clone()))?;
+
+    let wal = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(wal_path)?;
+    wal.try_lock_exclusive()
+        .map_err(|_| StorageError::RoomLocked(room_id.clone()))?;
+    Ok((lock, wal))
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StorageEngine for DiskStorageEngine {
@@ -437,16 +483,16 @@ impl StorageEngine for DiskStorageEngine {
         let snap_path = self.snap_file_path(room_id);
         let wal_path = self.wal_file_path(room_id);
 
-        let std_wal_file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&wal_path)?;
-
-        std_wal_file
-            .try_lock_exclusive()
-            .map_err(|_| StorageError::RoomLocked(room_id.clone()))?;
+        let (lock, std_wal_file) = {
+            let (lock_path, wal_path, room_id) = (
+                self.lock_file_path(room_id),
+                wal_path.clone(),
+                room_id.clone(),
+            );
+            tokio::task::spawn_blocking(move || lock_room_files(&lock_path, &wal_path, &room_id))
+                .await
+                .map_err(|e| StorageError::Other(format!("Join error: {e}")))??
+        };
 
         let recovered = recover_room(
             room_id,
@@ -459,6 +505,7 @@ impl StorageEngine for DiskStorageEngine {
         .await?;
 
         let room = DiskRoom {
+            _lock: lock,
             room_id: room_id.clone(),
             snap_path,
             wal_path,
@@ -662,36 +709,36 @@ impl StorageEngine for DiskStorageEngine {
         .map_err(|e| StorageError::Other(format!("Join error: {e}")))?
     }
 
-    /// Replaces the room's contents with `snapshot` (see the trait for the rules on its head
-    /// sequence).
+    /// Replaces the room's contents with `snapshot` (see the trait for its checks and the rules
+    /// on its head sequence).
     ///
-    /// The snapshot is serialized, compressed and written to a temporary file under the room's
-    /// compaction lock only, so writers keep going meanwhile; the head sequence is checked
-    /// again under the WAL mutex before the file is installed. The snapshot is made durable
-    /// before memory changes, so readers keep seeing the previous state until the new one is on
-    /// disk. See [`install_applied_snapshot`] for the crash windows of replacing the files.
+    /// The snapshot is decoded and checked on the blocking pool. It is then serialized,
+    /// compressed and written to a temporary file under the room's compaction lock only, so
+    /// writers keep going meanwhile; the head sequence is checked again under the WAL mutex
+    /// before the file is installed. The snapshot is made durable before memory changes, so
+    /// readers keep seeing the previous state until the new one is on disk. See
+    /// [`install_applied_snapshot`] for the crash windows of replacing the files.
     #[tracing::instrument(skip(self, schema, snapshot), fields(room_id = %room_id, snapshot_size = snapshot.len()))]
     async fn apply_snapshot(
         &self,
         room_id: &RoomId,
         schema: Schema,
-        snapshot: &[u8],
+        snapshot: Bytes,
+        expected_head_seq: SequenceNumber,
     ) -> Result<SequenceNumber, StorageError> {
         // Checked before decoding, so that both engines report an unopened room the same way.
         self.get_room(room_id).await?;
 
-        let snapshot_vec = snapshot.to_vec();
         let max_uncompressed = self.options.max_snapshot_uncompressed_bytes;
-        let decompressed = tokio::task::spawn_blocking(move || {
-            crate::snapshot::decode_snapshot_envelope_with_limit(&snapshot_vec, max_uncompressed)
+        let fail_key = self.wal_file_path(room_id);
+        let (schema, payload) = tokio::task::spawn_blocking(move || {
+            crate::fail_point::pause_blocking("apply_snapshot.decode", &fail_key);
+            let payload =
+                decode_received_snapshot(&snapshot, max_uncompressed, &schema, expected_head_seq)?;
+            Ok::<_, StorageError>((schema, payload))
         })
         .await
-        .map_err(|e| StorageError::Other(format!("Join error: {e}")))?
-        .map_err(|e| StorageError::SnapshotCorruption(format!("Snapshot decode failed: {e}")))?;
-
-        let mut payload: RoomSnapshotPayload = bincode::deserialize(&decompressed)
-            .map_err(|e| StorageError::SnapshotCorruption(e.to_string()))?;
-        payload.fill_missing_tables(&schema);
+        .map_err(|e| StorageError::Other(format!("Join error: {e}")))??;
 
         let lock = self.compaction_lock(room_id).await?;
         crate::fail_point::pause("apply_snapshot.lock", &self.wal_file_path(room_id)).await;

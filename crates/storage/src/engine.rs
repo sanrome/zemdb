@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures::Stream;
 use std::pin::Pin;
 use zemdb_core::{
@@ -89,6 +90,14 @@ pub trait StorageEngine: EngineConcurrencyBounds {
 
     /// Replaces the state of an open room with a snapshot and returns the room's head sequence.
     ///
+    /// The snapshot is checked first, and an invalid one leaves the room untouched:
+    /// - Its head sequence must be `expected_head_seq`, the one announced for it (by the
+    ///   server's snapshot relay); otherwise `StorageError::SnapshotHeadMismatch`.
+    /// - Every table must be in `schema` and every row valid under it, with its key columns
+    ///   equal to the key it is stored under; otherwise `StorageError::SnapshotCorruption`.
+    ///   Whether `schema` is the room's registered schema is up to the caller.
+    ///
+    /// Outside WebAssembly the snapshot is decoded and checked on the blocking pool. Then:
     /// - A snapshot behind the room's head sequence is rejected with
     ///   `StorageError::SnapshotBehind`: a room never moves back.
     /// - A snapshot at the room's head sequence changes nothing and succeeds, so a retried
@@ -102,7 +111,8 @@ pub trait StorageEngine: EngineConcurrencyBounds {
         &self,
         room_id: &RoomId,
         schema: Schema,
-        snapshot: &[u8],
+        snapshot: Bytes,
+        expected_head_seq: SequenceNumber,
     ) -> Result<SequenceNumber, StorageError>;
 }
 

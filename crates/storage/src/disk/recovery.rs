@@ -16,8 +16,8 @@ pub use crate::disk::format::replay_wal_records;
 use crate::disk::format::{FileHeader, HEADER_SIZE};
 use crate::error::StorageError;
 use crate::fail_point;
-use crate::memory::state::{apply_operation, empty_tables};
-use crate::memory::{RoomSnapshotPayload, Table};
+use crate::memory::state::{apply_operation, empty_tables, RoomSnapshotPayload};
+use crate::memory::Table;
 
 /// Recovery result containing the reconstructed in-memory state and the open WAL file handle.
 #[derive(Debug)]
@@ -313,16 +313,14 @@ pub async fn recover_room(
                 )));
             }
 
-            let decompressed =
-                tokio::task::spawn_blocking(move || zstd::decode_all(&compressed_snap[..]))
-                    .await
-                    .map_err(|e| StorageError::Other(format!("Join error: {e}")))?
-                    .map_err(|e| {
-                        StorageError::SnapshotCorruption(format!("Zstd decompression failed: {e}"))
-                    })?;
-
-            let mut payload: RoomSnapshotPayload = bincode::deserialize(&decompressed)
-                .map_err(|e| StorageError::SnapshotCorruption(e.to_string()))?;
+            // Decompressed and decoded together on the blocking pool. The file was written by
+            // this engine from a validated state, and its CRC matched, so its rows are not
+            // checked again and its size is not limited.
+            let mut payload: RoomSnapshotPayload = tokio::task::spawn_blocking(move || {
+                crate::snapshot::deserialize_zstd(&compressed_snap, u64::MAX, None)
+            })
+            .await
+            .map_err(|e| StorageError::Other(format!("Join error: {e}")))??;
 
             snapshot_seq = payload.head_seq;
             head_seq = payload.head_seq;
@@ -332,8 +330,8 @@ pub async fn recover_room(
         }
     } else {
         // Create the initial empty snapshot. The rename would replace a snapshot, but there is
-        // none: `try_exists` said so, and the room's exclusive WAL lock keeps out any other
-        // engine that could create one.
+        // none: `try_exists` said so, and the room's lock keeps out any other engine that
+        // could create one.
         write_empty_snapshot_file(snap_path, room_id).await?;
     }
 

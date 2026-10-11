@@ -2,13 +2,14 @@
 //!
 //! Production code calls `check` at the exact spots where a crash or I/O error must be
 //! reproducible, and `pause` where a test must hold an operation in the middle (for example
-//! while a WAL sync is in progress). Three variants act on what is at hand instead of failing
-//! before it: `panic_point` panics, `io_result` replaces the result of an I/O call with an error,
-//! and `read_only_handle` swaps a file handle for one whose writes fail in the background. In
-//! non-test builds all of them are empty functions (or return their input) that the compiler
-//! removes, so they have no runtime effect. In unit-test builds a test arms a point for a
-//! specific file path with `arm` or `arm_pause`, so tests running in parallel never interfere
-//! with each other; each armed point fires once.
+//! while a WAL sync is in progress); `pause_blocking` does the same on the blocking pool. Three
+//! variants act on what is at hand instead of failing before it: `panic_point` panics,
+//! `io_result` replaces the result of an I/O call with an error, and `read_only_handle` swaps a
+//! file handle for one whose writes fail in the background. In non-test builds all of them are
+//! empty functions (or return their input) that the compiler removes, so they have no runtime
+//! effect. In unit-test builds a test arms a point for a specific file path with `arm`,
+//! `arm_pause` or `arm_blocking_pause`, so tests running in parallel never interfere with each
+//! other; each armed point fires once.
 
 use crate::error::StorageError;
 use std::path::Path;
@@ -153,6 +154,88 @@ pub(crate) async fn pause(name: &'static str, path: &Path) {
         if let Some((_, _, reached, release)) = armed {
             let _ = reached.send(());
             let _ = release.await;
+        }
+    }
+    #[cfg(not(test))]
+    let _ = (name, path);
+}
+
+/// How long a blocking pause waits to be released before it panics.
+#[cfg(test)]
+const BLOCKING_PAUSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A blocking pause point armed for one path: signals `reached` when hit, then blocks its thread
+/// until `release`.
+#[cfg(test)]
+type ArmedBlockingPause = (
+    &'static str,
+    std::path::PathBuf,
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+#[cfg(test)]
+static BLOCKING_PAUSES: std::sync::Mutex<Vec<ArmedBlockingPause>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Handle of an armed blocking pause point, held by the test.
+#[cfg(test)]
+pub(crate) struct BlockingPause {
+    reached: tokio::sync::oneshot::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+impl BlockingPause {
+    /// Waits until the operation reaches the pause point.
+    pub(crate) async fn reached(&mut self) {
+        (&mut self.reached).await.unwrap();
+    }
+
+    /// Lets the paused operation continue.
+    pub(crate) fn release(self) {
+        let _ = self.release.send(());
+    }
+}
+
+/// Arms the blocking pause point `name` for `path`: the next `pause_blocking` with the same pair
+/// blocks its thread until the returned handle is released.
+#[cfg(test)]
+pub(crate) fn arm_blocking_pause(name: &'static str, path: &Path) -> BlockingPause {
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    BLOCKING_PAUSES
+        .lock()
+        .unwrap()
+        .push((name, path.to_path_buf(), reached_tx, release_rx));
+    BlockingPause {
+        reached: reached_rx,
+        release: release_tx,
+    }
+}
+
+/// Blocks the calling thread until the test releases the pause point `name`, if it is armed for
+/// `path`.
+///
+/// The test releases it from an async task, which can only run while some runtime thread is
+/// free; so it panics if it is not released within a few seconds instead of hanging, which is
+/// what happens when it is reached on the only thread of a current-thread runtime.
+#[inline(always)]
+pub(crate) fn pause_blocking(name: &'static str, path: &Path) {
+    #[cfg(test)]
+    {
+        let armed = {
+            let mut pauses = BLOCKING_PAUSES.lock().unwrap();
+            pauses
+                .iter()
+                .position(|(n, p, _, _)| *n == name && p == path)
+                .map(|pos| pauses.remove(pos))
+        };
+        if let Some((_, _, reached, release)) = armed {
+            let _ = reached.send(());
+            if release.recv_timeout(BLOCKING_PAUSE_TIMEOUT).is_err() {
+                panic!("pause point {name} was not released: the runtime is blocked");
+            }
         }
     }
     #[cfg(not(test))]

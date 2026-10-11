@@ -12,7 +12,8 @@ use crate::disk::format::FileHeader;
 use crate::disk::{DiskRoom, DiskStorageOptions, DiskWal, PendingWrite};
 use crate::error::StorageError;
 use crate::fail_point;
-use crate::memory::{RoomSnapshotPayload, RoomSnapshotRef, Table};
+use crate::memory::state::RoomSnapshotPayload;
+use crate::memory::{RoomSnapshotRef, Table};
 use crate::sys::sync_dir;
 
 /// Path of the WAL segment rotated out by an in-progress (or interrupted) compaction.
@@ -236,13 +237,14 @@ async fn roll_back_rotation(
     sync_parent(wal_path).await
 }
 
+/// Creates and locks the WAL that replaces the one just renamed. It must not exist: a file
+/// found there is never truncated or adopted.
 fn open_fresh_wal(wal_path: &Path, room_id: &RoomId) -> Result<std::fs::File, StorageError> {
     fail_point::check("compaction.rotate_open", wal_path)?;
     let file = std::fs::OpenOptions::new()
-        .create(true)
+        .create_new(true)
         .read(true)
         .write(true)
-        .truncate(true)
         .open(wal_path)?;
     file.try_lock_exclusive()
         .map_err(|_| StorageError::RoomLocked(room_id.clone()))?;

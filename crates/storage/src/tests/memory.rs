@@ -1,3 +1,4 @@
+use crate::fail_point;
 use crate::{MemoryStorageEngine, StorageEngine};
 use zemdb_core::{
     CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequencedOperation, TableSchema,
@@ -71,7 +72,7 @@ async fn snapshot_is_visible_through_room_handle_taken_before() {
     source.apply_batch(&source_room, ops).await.unwrap();
     let snapshot = source.create_snapshot(&source_room).await.unwrap();
     engine
-        .apply_snapshot(&room, schema(), &snapshot)
+        .apply_snapshot(&room, schema(), snapshot.into(), 3u64.into())
         .await
         .unwrap();
 
@@ -80,4 +81,68 @@ async fn snapshot_is_visible_through_room_handle_taken_before() {
     assert!(state.tables[&USERS]
         .get(&PrimaryKey::single(12i64))
         .is_some());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_is_decoded_without_blocking_the_runtime() {
+    let engine = MemoryStorageEngine::new();
+    let room = RoomId::new("decoded-off-the-runtime").unwrap();
+    engine.open_room(&room, schema()).await.unwrap();
+    let source = MemoryStorageEngine::new();
+    source.open_room(&room, schema()).await.unwrap();
+    let ops = (1..=3).map(|seq| insert(seq, seq as i64)).collect();
+    source.apply_batch(&room, ops).await.unwrap();
+    let snapshot = source.create_snapshot(&room).await.unwrap();
+
+    let mut pause = fail_point::arm_blocking_pause(
+        "apply_snapshot.decode",
+        std::path::Path::new("decoded-off-the-runtime"),
+    );
+    // The runtime has a single thread: this task only runs if decoding leaves it free.
+    let releaser = tokio::spawn(async move {
+        pause.reached().await;
+        pause.release();
+    });
+    let head = engine
+        .apply_snapshot(&room, schema(), snapshot.into(), 3u64.into())
+        .await
+        .unwrap();
+    assert_eq!(head.get(), 3);
+    tokio::time::timeout(std::time::Duration::from_secs(10), releaser)
+        .await
+        .expect("decoding never reached its pause point")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_goes_to_the_room_open_when_decoding_ends() {
+    let engine = MemoryStorageEngine::new();
+    let room = RoomId::new("reopened-while-decoding").unwrap();
+    engine.open_room(&room, schema()).await.unwrap();
+    let source = MemoryStorageEngine::new();
+    source.open_room(&room, schema()).await.unwrap();
+    let ops = (1..=3).map(|seq| insert(seq, seq as i64)).collect();
+    source.apply_batch(&room, ops).await.unwrap();
+    let snapshot = source.create_snapshot(&room).await.unwrap();
+
+    let mut pause = fail_point::arm_blocking_pause(
+        "apply_snapshot.decode",
+        std::path::Path::new("reopened-while-decoding"),
+    );
+    let apply = tokio::spawn({
+        let (engine, room) = (engine.clone(), room.clone());
+        async move {
+            engine
+                .apply_snapshot(&room, schema(), snapshot.into(), 3u64.into())
+                .await
+        }
+    });
+    // The room is closed and reopened, empty, while the snapshot is decoded.
+    pause.reached().await;
+    engine.close_room(&room).await.unwrap();
+    engine.open_room(&room, schema()).await.unwrap();
+    pause.release();
+
+    assert_eq!(apply.await.unwrap().unwrap().get(), 3);
+    assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), 3);
 }

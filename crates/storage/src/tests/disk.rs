@@ -299,7 +299,7 @@ async fn crash_between_snapshot_rename_and_wal_truncation_recovers_the_snapshot(
     // below the snapshot's sequence.
     fail_point::arm("apply_snapshot.truncate", &engine.wal_file_path(&room));
     assert!(engine
-        .apply_snapshot(&room, schema(), &snapshot)
+        .apply_snapshot(&room, schema(), snapshot.into(), SequenceNumber::from(5u64))
         .await
         .is_err());
     engine.close_room(&room).await.unwrap();
@@ -359,7 +359,11 @@ async fn snapshot_waiting_across_a_reopen_never_runs_alongside_a_compaction() {
     let mut snapshot_pause = fail_point::arm_pause("apply_snapshot.lock", &wal_path);
     let apply = tokio::spawn({
         let (engine, room) = (engine.clone(), room.clone());
-        async move { engine.apply_snapshot(&room, schema(), &snapshot).await }
+        async move {
+            engine
+                .apply_snapshot(&room, schema(), snapshot.into(), SequenceNumber::from(5u64))
+                .await
+        }
     });
     snapshot_pause.reached().await;
 
@@ -394,6 +398,7 @@ async fn stage_snapshot_and_pause(
     engine: &DiskStorageEngine,
     room: &RoomId,
     snapshot: Vec<u8>,
+    snapshot_head: u64,
 ) -> (
     tokio::task::JoinHandle<Result<SequenceNumber, StorageError>>,
     fail_point::Pause,
@@ -401,7 +406,12 @@ async fn stage_snapshot_and_pause(
     let mut pause = fail_point::arm_pause("apply_snapshot.staged", &engine.wal_file_path(room));
     let apply = tokio::spawn({
         let (engine, room) = (engine.clone(), room.clone());
-        async move { engine.apply_snapshot(&room, schema(), &snapshot).await }
+        async move {
+            let head = SequenceNumber::from(snapshot_head);
+            engine
+                .apply_snapshot(&room, schema(), snapshot.into(), head)
+                .await
+        }
     });
     pause.reached().await;
     let room_handle = engine.get_room(room).await.unwrap();
@@ -422,7 +432,7 @@ async fn snapshot_reached_by_writers_while_staged_is_discarded() {
     }
     let snapshot = snapshot_with_rows(&room, 100, 5).await;
 
-    let (apply, pause) = stage_snapshot_and_pause(&engine, &room, snapshot).await;
+    let (apply, pause) = stage_snapshot_and_pause(&engine, &room, snapshot, 5).await;
     for seq in 4..=5 {
         engine.apply_batch(&room, vec![insert(seq)]).await.unwrap();
     }
@@ -444,7 +454,7 @@ async fn snapshot_overtaken_by_writers_while_staged_is_rejected() {
     }
     let snapshot = snapshot_with_rows(&room, 100, 5).await;
 
-    let (apply, pause) = stage_snapshot_and_pause(&engine, &room, snapshot).await;
+    let (apply, pause) = stage_snapshot_and_pause(&engine, &room, snapshot, 5).await;
     for seq in 4..=6 {
         engine.apply_batch(&room, vec![insert(seq)]).await.unwrap();
     }
@@ -472,7 +482,7 @@ async fn failed_snapshot_install_step_leaves_room_usable(fail_point_name: &'stat
     };
     fail_point::arm(fail_point_name, &path);
     assert!(engine
-        .apply_snapshot(&room, schema(), &snapshot)
+        .apply_snapshot(&room, schema(), snapshot.into(), SequenceNumber::from(5u64))
         .await
         .is_err());
 
@@ -613,4 +623,145 @@ async fn compact_room_dropped_after_renaming_the_wal_loses_no_acknowledged_write
 #[tokio::test]
 async fn compact_room_dropped_while_emptying_the_wal_loses_no_acknowledged_write() {
     compaction_aborted_at("wal.truncate", true, AfterAbort::Write, false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_is_decoded_without_blocking_the_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("decoded-off-the-runtime").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    let snapshot = snapshot_with_rows(&room, 100, 5).await;
+
+    let mut pause =
+        fail_point::arm_blocking_pause("apply_snapshot.decode", &engine.wal_file_path(&room));
+    // The runtime has a single thread: this task only runs if decoding leaves it free.
+    let releaser = tokio::spawn(async move {
+        pause.reached().await;
+        pause.release();
+    });
+    let head = engine
+        .apply_snapshot(&room, schema(), snapshot.into(), SequenceNumber::from(5u64))
+        .await
+        .unwrap();
+    assert_eq!(head.get(), 5);
+    tokio::time::timeout(std::time::Duration::from_secs(10), releaser)
+        .await
+        .expect("decoding never reached its pause point")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn room_stays_locked_while_a_compaction_has_moved_its_wal_aside() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("locked-during-rotation").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    engine.apply_batch(&room, vec![insert(1)]).await.unwrap();
+
+    let wal_path = engine.wal_file_path(&room);
+    let mut pause = fail_point::arm_pause("compaction.rotate_renamed", &wal_path);
+    let compaction = tokio::spawn({
+        let (engine, room) = (engine.clone(), room.clone());
+        async move { engine.compact_room(&room).await }
+    });
+    pause.reached().await;
+    // The WAL is now `.wal.compacting`, and its replacement does not exist yet.
+    assert!(!wal_path.exists());
+
+    let other = DiskStorageEngine::new(DiskStorageOptions::new(dir.path()).auto_compact(false));
+    let result = other.open_room(&room, schema()).await;
+    assert!(
+        matches!(result, Err(StorageError::RoomLocked(_))),
+        "{result:?}"
+    );
+    assert!(!wal_path.exists());
+
+    pause.release();
+    compaction.await.unwrap().unwrap();
+    engine.apply_batch(&room, vec![insert(2)]).await.unwrap();
+    engine.close_room(&room).await.unwrap();
+    let reopened = open_engine(dir.path(), &room).await;
+    assert_eq!(reopened.get_head_seq(&room).await.unwrap().get(), 2);
+}
+
+#[tokio::test]
+async fn write_completes_while_a_compaction_stages_its_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("write-during-staging").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    for seq in 1..=3 {
+        engine.apply_batch(&room, vec![insert(seq)]).await.unwrap();
+    }
+
+    let mut pause = fail_point::arm_pause("compaction.staging", &engine.wal_file_path(&room));
+    let compaction = tokio::spawn({
+        let (engine, room) = (engine.clone(), room.clone());
+        async move { engine.compact_room(&room).await }
+    });
+    pause.reached().await;
+
+    // The compaction has rotated the WAL and holds its snapshot back: a write that waited for
+    // it would never finish.
+    let write = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        engine.apply_batch(&room, vec![insert(4)]),
+    )
+    .await;
+    assert!(
+        matches!(write, Ok(Ok(head)) if head.get() == 4),
+        "the write waited for the compaction: {write:?}"
+    );
+    assert!(engine
+        .get(&room, "users", &PrimaryKey::single(4))
+        .await
+        .unwrap()
+        .is_some());
+
+    pause.release();
+    compaction.await.unwrap().unwrap();
+    engine.close_room(&room).await.unwrap();
+    let reopened = open_engine(dir.path(), &room).await;
+    assert_eq!(reopened.get_head_seq(&room).await.unwrap().get(), 4);
+    for key in 1..=4 {
+        assert!(reopened
+            .get(&room, "users", &PrimaryKey::single(key))
+            .await
+            .unwrap()
+            .is_some());
+    }
+}
+
+// On Unix a duplicated handle shares the lock of the handle it was duplicated from.
+#[cfg(unix)]
+#[tokio::test]
+async fn room_stays_locked_while_a_handle_of_its_wal_is_still_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("wal-still-open").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    engine.apply_batch(&room, vec![insert(1)]).await.unwrap();
+
+    // A write of `tokio::fs` still in flight on the blocking pool holds a duplicate of the WAL's
+    // handle, like this one, after the engine is dropped without closing the room.
+    let in_flight = engine
+        .get_room(&room)
+        .await
+        .unwrap()
+        .wal
+        .lock()
+        .await
+        .file
+        .try_clone()
+        .await
+        .unwrap();
+    drop(engine);
+
+    let other = DiskStorageEngine::new(DiskStorageOptions::new(dir.path()).auto_compact(false));
+    let result = other.open_room(&room, schema()).await;
+    assert!(
+        matches!(result, Err(StorageError::RoomLocked(_))),
+        "{result:?}"
+    );
+
+    drop(in_flight);
+    other.open_room(&room, schema()).await.unwrap();
+    assert_eq!(other.get_head_seq(&room).await.unwrap().get(), 1);
 }

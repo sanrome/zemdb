@@ -1,5 +1,7 @@
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+use std::fmt;
 use zemdb_core::{
     CompactRow, Operation, OperationKind, PrimaryKey, RoomId, Schema, SequenceNumber,
     SequencedOperation, Value,
@@ -146,7 +148,66 @@ pub(crate) struct RoomSnapshotRef<'a> {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct RoomSnapshotPayload {
     pub(crate) head_seq: SequenceNumber,
+    #[serde(deserialize_with = "deserialize_tables")]
     pub(crate) tables: HashMap<u16, Table>,
+}
+
+/// Deserializes the tables of a snapshot, inserting each table and row as it is read.
+///
+/// The number of tables and rows is declared by the payload, which may come from another peer.
+/// `imbl`'s own `Deserialize` reserves room for the declared number of rows up front, so a few
+/// bytes declaring billions of rows would abort the process; here nothing is reserved, and a
+/// payload that declares more rows than it holds fails when it runs out of bytes.
+fn deserialize_tables<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<HashMap<u16, Table>, D::Error> {
+    struct TablesVisitor;
+
+    impl<'de> Visitor<'de> for TablesVisitor {
+        type Value = HashMap<u16, Table>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a map of tables by id")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+            let mut tables = HashMap::new();
+            while let Some(table_id) = access.next_key::<u16>()? {
+                let RowsAsRead(table) = access.next_value()?;
+                tables.insert(table_id, table);
+            }
+            Ok(tables)
+        }
+    }
+
+    deserializer.deserialize_map(TablesVisitor)
+}
+
+/// A table deserialized row by row, without reserving room for the declared number of rows.
+struct RowsAsRead(Table);
+
+impl<'de> Deserialize<'de> for RowsAsRead {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct RowsVisitor;
+
+        impl<'de> Visitor<'de> for RowsVisitor {
+            type Value = RowsAsRead;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a map of rows by primary key")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+                let mut table = Table::new();
+                while let Some((pk, row)) = access.next_entry::<PrimaryKey, CompactRow>()? {
+                    table.insert(pk, row);
+                }
+                Ok(RowsAsRead(table))
+            }
+        }
+
+        deserializer.deserialize_map(RowsVisitor)
+    }
 }
 
 impl RoomSnapshotPayload {
@@ -156,6 +217,47 @@ impl RoomSnapshotPayload {
             self.tables.entry(table_id).or_default();
         }
     }
+}
+
+/// Decodes a snapshot envelope that `apply_snapshot` received and checks it before anything is
+/// replaced: its head sequence must be `expected_head_seq`, and every table and row must be
+/// valid under `schema` (a known table, a valid key and row, and the row's key columns equal to
+/// the key it is stored under). Tables of `schema` the snapshot does not contain are added
+/// empty.
+///
+/// Every row is decoded and checked, so outside WebAssembly the engines run it on the blocking
+/// pool.
+pub(crate) fn decode_received_snapshot(
+    envelope: &[u8],
+    max_uncompressed_bytes: u64,
+    schema: &Schema,
+    expected_head_seq: SequenceNumber,
+) -> Result<RoomSnapshotPayload, StorageError> {
+    let mut payload: RoomSnapshotPayload =
+        crate::snapshot::decode_snapshot_payload(envelope, max_uncompressed_bytes)?;
+    if payload.head_seq != expected_head_seq {
+        return Err(StorageError::SnapshotHeadMismatch {
+            expected: expected_head_seq,
+            actual: payload.head_seq,
+        });
+    }
+    for (&table_id, table) in &payload.tables {
+        let table_schema = schema.get_table_by_id(table_id).ok_or_else(|| {
+            StorageError::SnapshotCorruption(format!(
+                "Snapshot holds table id {table_id}, which is not in the schema"
+            ))
+        })?;
+        for (pk, row) in table.iter() {
+            table_schema.validate_keyed_row(pk, row).map_err(|e| {
+                StorageError::SnapshotCorruption(format!(
+                    "Invalid row in snapshot table '{}': {e}",
+                    table_schema.name()
+                ))
+            })?;
+        }
+    }
+    payload.fill_missing_tables(schema);
+    Ok(payload)
 }
 
 #[cfg(test)]

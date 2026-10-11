@@ -42,6 +42,14 @@ pub enum StorageError {
         snapshot: SequenceNumber,
     },
 
+    /// A snapshot whose head sequence is not the one announced for it. Applying it could skip
+    /// the operations between the two.
+    #[error("Snapshot head sequence {actual} differs from the expected {expected}")]
+    SnapshotHeadMismatch {
+        expected: SequenceNumber,
+        actual: SequenceNumber,
+    },
+
     #[error("Schema validation failed: {0}")]
     SchemaValidation(#[from] ValidationError),
 
