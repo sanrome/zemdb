@@ -76,6 +76,7 @@
   En `register`: `if let Some(seq) = current_seq { self.check_within_head(seq)?; }` y `if self.lease_tracker.register_client(..)? == ClientState::Bootstrapping { self.request_snapshot(); }` antes de construir la respuesta (mismo orden: `request_snapshot` ocurre antes de `usable_snapshot_seq()`). Además saca ~30 líneas de `handle_command` (hoy ~135 líneas, `room.rs:325-459`).
 - **Semántica:** en todos los caminos actuales `reply.send` es el último efecto antes de salir, así que construir el `Result` y enviarlo al final preserva el orden (incluido `observe` antes de calcular `snapshot_wanted_for`). En `sync`, el `request_snapshot()` ante `BehindCompaction` del `fetch_deltas` (`:671-673`) se mantiene antes del `return Err(e)`.
 - **Ahorro estimado:** ~30–35 líneas · **Riesgo:** bajo · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ✅ confirmada — en Register/sync/ack/heartbeat cada camino envía exactamente una respuesta y `reply.send` es el último efecto (no hay nada después en `handle_command`), así que devolver `Result` y enviarlo en `handle_command` preserva el orden: `reject_behind_log` y `request_snapshot` siguen antes del `Err`, `observe` antes de `snapshot_wanted_for`, `register_client` con error no dispara `request_snapshot`. `ClientState` deriva `PartialEq` (`lease.rs:19`), así que `== ClientState::Bootstrapping` compila. Líneas citadas correctas.
 
 ### Q2. `RoomCommand::reject`: un brazo por línea
 - **Dónde:** `command.rs:171-211`
@@ -91,12 +92,14 @@
   ```
   `drop` del `Result` equivale a `let _ =` (el `Err` devuelto contiene el valor no entregado y se descarta igual). Con los lints del workspace (`Cargo.toml:18-21`) no aplica `drop_non_drop` porque el tipo tiene drop glue; **a verificar** con clippy. Alternativa sin `drop`: `{ let _ = …; }` en una línea con `#[rustfmt::skip]` en el `match`.
 - **Ahorro estimado:** ~26 líneas · **Riesgo:** bajo · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ⚠️ corregida — la propuesta es válida y equivalente (el `Err` no entregado se descarta en el acto en ambos casos), pero el motivo del lint es otro: en `Shutdown` el valor es `Result<(), ()>`, que es `Copy` y sin drop glue, y aun así no salta `dropping_copy_types` (rustc) ni `drop_non_drop` (clippy) porque ambos eximen `drop(llamada)` cuando es el cuerpo directo de un brazo de `match`. Condición: escribir `=> drop(..),` sin llaves; con `=> { drop(..) }` la exención no aplica.
 
 ### Q3. `handle_commit`: rechazos con `?` mediante un `commit` interno
 - **Dónde:** `room.rs:461-598`
 - **Problema:** seis rechazos con `let _ = reply.send(Err(..)); return ControlFlow::Continue(());` (3–7 líneas cada uno). Es el único handler que además devuelve `ControlFlow`, por eso no encaja directamente en Q1.
 - **Propuesta:** `fn commit(&mut self, …, flow: &mut ControlFlow<()>) -> Result<CommitResponse, ServerError>` que marca `*flow = ControlFlow::Break(())` donde hoy se devuelve `Break` (fallo de `append` en `:534-551` y `rotation_error` en `:578-589`), y `handle_commit` queda en `let mut flow = Continue(()); let res = self.commit(.., &mut flow); let _ = reply.send(res); flow`. Los pasos 0 y 1 pasan a `self.ensure_registered(&client_id)?; self.check_within_head(last_ack_seq)?;`. El `receiver.close()` sigue ocurriendo antes de la respuesta, que es la garantía documentada en `:542-543`. **A verificar**: el parámetro de salida es menos idiomático; si no convence, aplicar solo los pasos 0–1 con `check_within_head` (~8 líneas).
 - **Ahorro estimado:** ~12–15 líneas · **Riesgo:** medio · **Prioridad:** media
+- **Verificación (2.ª pasada):** ✅ confirmada — con `*flow = Break` en `:534-551` y `:578-589`, `receiver.close()` sigue ocurriendo antes del `reply.send` (que pasa a `handle_commit`), y en rotación `snapshot_wanted_for` sigue calculándose después del `close`. Tras el `append` durable no queda ningún `?`, así que el commit persistido no puede convertirse en `Err`; mantener esa regla explícita en un comentario. Alternativa sin parámetro de salida: devolver `(Result<..>, ControlFlow<()>)`.
 
 ### Q4. Simplificaciones locales en `lease.rs`
 - **Dónde:** `lease.rs:338-358`, `lease.rs:242-245`, `lease.rs:254-262`, `lease.rs:327-329`, `lease.rs:197-201` + `:246-250`

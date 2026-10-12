@@ -72,6 +72,7 @@
   ```
   Si se prefiere no tocar la API pública, conservar `read_range_with_mutations` y aplicar solo el helper (ahorro ~8).
 - **Ahorro estimado:** ~25 líneas · **Riesgo:** bajo. Es API `pub` sin usos en el workspace, así que **queda a verificar** si hay consumidores externos del crate. · **Prioridad:** alta.
+- **Verificación (2.ª pasada):** ✅ confirmada — `read_range_with_mutations` solo la llaman los `read_range` (grep en `crates/`), `read_range` solo los tests citados, y ningún otro crate depende de `zemdb-server`; `read_cold_file`/`read_segment_file` devuelven `RecoveredLogData`, así que `.map(|(ops, _)| ops)` compila. Conservar en el doc "un archivo inexistente no devuelve nada".
 
 ### Q2. Llevar `parse_segment_filename` junto a `segment_path` y simplificarla
 - **Dónde:** `warm_disk.rs:334-348`. Se usa en `segment_index.rs:93`, `cold_disk.rs:65-68` y `:142-146`, y en `warm_disk.rs:227-231`.
@@ -88,6 +89,7 @@
   ```
   El comportamiento es equivalente: con `split_once`, un tercer `_` queda en `end` y `u64::parse` lo rechaza, igual que el `parts.len() != 2` actual. `strip_*` además evita el slicing manual. `cold_disk.rs:65-68` pasa a ser `parse_segment_path(warm_path, Tier::Warm)`.
 - **Ahorro estimado:** ~10 líneas (sumado a Q1) · **Riesgo:** bajo · **Prioridad:** alta.
+- **Verificación (2.ª pasada):** ✅ confirmada — líneas correctas; `split_once` + `parse` rechaza lo mismo que `parts.len() != 2` (`1_2_3`, `1`, `_`, `+5` se aceptan/rechazan igual). Única diferencia: con prefijo y extensión solapados (p. ej. `segment_x` y `"_x"`) el slicing actual entra en pánico y `strip_*` devuelve `None`; con `.wal`/`.wal.zst` es inalcanzable. Al moverla a `segment_index` (que es `pub(crate)`) desaparece el ciclo de imports `segment_index`→`warm_disk`.
 
 ### Q3. Derivar `min_seq`/`max_seq` de `HotBuffer` en vez de guardarlos
 - **Dónde:** `hot_buffer.rs:18-19`, `50-62`, `78-84`, `148`, `163`, `166-180`, `197-205`.
@@ -101,6 +103,7 @@
   ```
   La semántica es idéntica: hoy `max_seq` es `None` exactamente cuando la cola está vacía (`after_eviction`), y entre un `pop_front` y `after_eviction` no se lee. De paso, los dos `while let … { if … { pop } else { break } }` (`:140-146`, `:155-161`) pasan a `while self.entries.front().is_some_and(|e| …) { self.pop_front(); }`. En `get_range` (`:96-115`), el chequeo `entries.is_empty()` y el `match self.min_seq` se reducen a un solo `let Some(min) = self.min_seq() else { return Vec::new() };`.
 - **Ahorro estimado:** ~25 líneas · **Riesgo:** bajo · **Prioridad:** alta.
+- **Verificación (2.ª pasada):** ✅ confirmada — los únicos mutadores de `entries` son `push` (vía `append`/`rehydrate`, que actualizan los campos) y `pop_front` (solo en `apply_sliding_window_at` y `evict_older_than`, ambos cierran con `after_eviction`); no hay truncado ni rollback externo (`tiered_log.rs` solo llama `append`, `rehydrate`, `evict_older_than`, `apply_sliding_window`, `get_range`, `min_seq`). Buffer vaciado por desalojo: hoy `max_seq = None` y `append` acepta cualquier `seq`; derivado de `back()` ocurre lo mismo. `append` con error no muta en ninguna versión. En `get_range` hay que conservar el `budget.is_exhausted()`.
 
 ### Q4. Helper «abrir un segmento para leer» compartido entre warm y cold
 - **Dónde:** `warm_disk.rs:299-312`, `cold_disk.rs:327-338`.
