@@ -38,6 +38,7 @@
 - **Problema:** `pub mod operation { pub use crate::mutation::*; pub use crate::protocol::SequencedOperation; }` es un alias "para imports legacy". `grep` no encuentra ningún `zemdb_core::operation` ni `crate::operation` en el workspace (server, storage, client, tests). El proyecto está en 0.1.0 y no tiene consumidores externos. Además, el doc-comment es narrativa histórica.
 - **Propuesta:** borrar el bloque y su doc-comment.
 - **Ahorro estimado:** ~6 líneas · **Riesgo:** bajo (cambia la API pública; **a verificar** solo si hay consumidores fuera del repo) · **Prioridad:** alta.
+- **Verificación (2.ª pasada):** ✅ confirmada — el bloque está en `lib.rs:10-14` (doc + módulo); grep en todo el repo (incluidos imports multilínea `operation::`/`operation,` y `.md`) no encuentra usos de `zemdb_core::operation` ni `crate::operation`. Los mismos ítems siguen exportados por `mutation`, `protocol` y los `pub use` de la raíz.
 
 ### Q2. Macro para los newtypes `u64` (opcional)
 - **Dónde:** `id.rs:231-268` (`SequenceNumber`) y `id.rs:328-361` (`CorrelationId`).

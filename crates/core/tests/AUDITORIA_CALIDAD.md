@@ -76,6 +76,7 @@
   - reducir el bucle de `ErrorCode` (221-238) a un solo `ServerMessage::Error`, porque `error_codes_keep_their_wire_indexes` (664-694) ya hace el roundtrip de los 20 códigos;
   - opcional: reusar `commit_with` (503) para el `Commit` de las líneas 23-30, y crear `fn room() -> RoomId`, porque `RoomId::new("room-abc").unwrap()` aparece 14 veces.
 - **Ahorro estimado:** ~55–65 líneas · **Riesgo:** bajo · **Prioridad:** alta.
+- **Verificación (2.ª pasada):** ✅ confirmada — `decode_message<'a, T: Deserialize<'a>>` (`codec.rs:92`) acepta `M: DeserializeOwned`, el helper compila; líneas citadas (19, 221-238, 262-284, 370-379, 503, 664-694) correctas. Matiz: `error_codes_keep_their_wire_indexes` hace el roundtrip del `ErrorCode` suelto, no dentro de `ServerMessage::Error`; por eso conviene conservar un `ServerMessage::Error` como propone.
 
 ### Q2. Tabla de casos para la deserialización inválida de `TableSchema`
 - **Dónde:** `schema_validation_tests.rs:584-663`: 5 tests casi idénticos de 16 líneas.
@@ -84,12 +85,14 @@
   - Si se pasa de `from_str` a `from_value`, el mensaje ya no lleva el sufijo de línea y columna. Los `contains` siguen siendo válidos, pero **a verificar** al aplicarlo.
   - Alternativa sin riesgo: seguir usando `from_str` con `json.to_string()`.
 - **Ahorro estimado:** ~55–60 líneas · **Riesgo:** bajo · **Prioridad:** alta.
+- **Verificación (2.ª pasada):** ✅ confirmada — los 5 tests (`585-663`) solo comparan con `contains`; `TableSchema::deserialize` (`table.rs:135-159`) parsea el helper completo y recién después llama a `try_new`, así que el orden de claves de `json!` (BTreeMap) no cambia qué error sale. Cada caso de la tabla debe incluir `table_id` (sin default y con `deny_unknown_fields`).
 
 ### Q3. Borrar el test duplicado de nombres de tabla repetidos
 - **Dónde:** `schema_validation_tests.rs:692-714` (`test_schema_deserialize_rejects_duplicate_table_name`).
 - **Problema:** es el mismo caso que `schema_table_ids_tests.rs:64-70` (`duplicate_table_names_are_rejected`): JSON con dos tablas `tasks` de ids 0 y 1, y aserción sobre `"already exists"`. La única diferencia es que uno usa JSON literal y el otro el helper. El mismo error también se cubre por builder en `schema_validation_tests.rs:666-690`.
 - **Propuesta:** borrar el de `schema_validation_tests.rs`.
 - **Ahorro estimado:** ~24 líneas · **Riesgo:** bajo · **Prioridad:** alta.
+- **Verificación (2.ª pasada):** ✅ confirmada — mismo JSON (dos `tasks`, ids 0 y 1, mismos campos) y misma aserción `"already exists"`; la única diferencia es `from_str` vs `from_value` (`schema_table_ids_tests.rs:22-24`), irrelevante porque el chequeo está en `Schema::try_from_tables` (`global.rs:96`), tras parsear.
 
 ### Q4. Compactar asserts repetidos en `schema_validation_tests.rs`
 - **Dónde y propuesta:**
