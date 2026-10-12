@@ -60,6 +60,7 @@
   ```
   Dentro del helper, las dos ramas `Forward`/`Backward` pueden compartir el cálculo de límites (`let (start, end) = match (&state.cursor, direction) {...}`), lo que ahorra ~6 líneas más. El orden "actualizar `remaining_limit`" / "actualizar `cursor`" difiere entre las dos copias, pero ambas operaciones son independientes, así que no cambia nada.
 - **Ahorro estimado:** ~75 líneas en `disk/mod.rs` (y otras tantas en `memory/mod.rs`, fuera de este alcance) · **Riesgo:** bajo (es un traslado puro, los scans no hacen I/O) · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ✅ confirmada — comparé `memory/mod.rs:102-193` con `disk/mod.rs:298-436`: son idénticos salvo el nombre del struct y el orden cursor/`remaining_limit`, que son independientes (uno depende de `batch_items.last()` y el otro de `count`). En `engine.rs` compila en las dos plataformas: `memory::Table` existe en wasm, el estado es `Send` como hoy y `RowStream<'static>` se convierte en `RowStream<'_>`. Faltaría importar `RangeBounds`/`VecDeque` allí.
 
 ### Q2 — Helper `DiskWal::fail_on_err` para el patrón "marcar la room como fallida y propagar"
 - **Dónde:** `mod.rs:596-599`, `mod.rs:791-794`, `compactor.rs:111-114`, `compactor.rs:222-227`, `compactor.rs:274-278`, `compactor.rs:286-291`.
@@ -87,6 +88,7 @@
   ```
   En `apply_batch` queda `pending.wal().fail_on_err("WAL append failed", write_result)?;`. `pending` se suelta al hacer `?`, cuando `failure` ya está puesto, así que su `Drop` no hace nada, igual que hoy después de `pending.fail(...)`. Si además se reemplaza `mod.rs:791-794`, `PendingWrite::fail` (`mod.rs:153-156`) queda sin uso y se borra. El orden "marcar y después devolver el error" no cambia. **No** aplicar en `compactor.rs:203-211` ni en `compactor.rs:336-341`: ahí se marca la room solo cuando falla el rollback, y se devuelve el error original.
 - **Ahorro estimado:** ~18 líneas menos 6 del helper, más 4 de `fail` borradas: **~15 netas** · **Riesgo:** bajo · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ✅ confirmada — los 6 sitios y sus líneas están bien, todos son `StorageError` con formato `"{ctx}: {err}"`. `PendingWrite::fail` solo se usa en 597 y 792, y el `Drop` no hace nada si `failure` ya está puesto. Matiz: hay que guardar el resultado en una variable antes. `wal.fail_on_err(ctx, truncate_wal(wal, …).await)` no compila porque toma `&mut` dos veces.
 
 ### Q3 — Un único helper para `spawn_blocking` + `JoinError`
 - **Dónde:** `mod.rs:492-494`, `mod.rs:700-709`, `mod.rs:734-741`, `compactor.rs:139-150`, `compactor.rs:427-436`, `compactor.rs:464-468`, `compactor.rs:573-575`, `recovery.rs:83-85`, `recovery.rs:319-323`, `recovery.rs:386-390` (y dos más en `memory/mod.rs:330,367`).
@@ -119,6 +121,7 @@
   let staged = stage_snapshot(&room.snap_path, cut_seq, &snapshot_tables, options.zstd_level, &room.room_id).await?;
   ```
 - **Ahorro estimado:** ~12 líneas · **Riesgo:** medio, **a verificar**. El fail point pasaría a evaluarse en el hilo async y no en el blocking pool. Hoy `check` es `cfg(test)` y no hace nada en producción, y en tests devuelve el mismo `Err` antes de serializar, que es lo que pasa hoy, pero conviene confirmarlo con los 9 tests que lo arman. Además se añade un clon O(1) de las tablas. No cambia el orden de I/O. · **Prioridad:** media
+- **Verificación (2.ª pasada):** ✅ confirmada — `check` solo usa el `Mutex` global (no depende del hilo), con el mismo path (`room.snap_path`) y el mismo orden después de `pause("compaction.staging")`. `RoomSnapshotRef` y `RoomSnapshotPayload` serializan igual. Matiz: el clon es O(n.º de tablas), no O(1), y `snapshot_tables` queda vivo hasta el final del bloque. Conviene un `drop` explícito para no retener nodos viejos durante la fase 3.
 
 ### Q5 — `FileHeader::compute_crc` reescribe el layout de `encode`
 - **Dónde:** `format.rs:68-79` frente a `format.rs:82-94`.
@@ -132,6 +135,7 @@
   ```
   `encode` escribe exactamente esos bytes en `0..36`, y `header_crc` va en `36..40`, que el hash no incluye, así que el resultado es idéntico (también en `new`, donde `header_crc` vale 0 en ese momento). Opcional: una constante `const CRC_COVERED: usize = 36;` en lugar del número mágico, que aparece en `format.rs:30,68,70`.
 - **Ahorro estimado:** ~9 líneas · **Riesgo:** bajo · **Prioridad:** alta (corrige una duplicación del formato en disco)
+- **Verificación (2.ª pasada):** ✅ confirmada — `encode()[..36]` produce los mismos bytes que `buf`, y `header_crc` (36..40) y `reserved` quedan fuera. Las líneas 30/68/70 son correctas.
 
 ### Q6 — `WalWriter::write_record` es `write_batch` con un slice de un elemento
 - **Dónde:** `wal.rs:13-24`.

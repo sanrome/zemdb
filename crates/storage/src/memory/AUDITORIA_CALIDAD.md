@@ -51,6 +51,7 @@ Densidad baja-moderada (74 líneas de doc/comentario sobre 872) y en general de 
   ```
   Así `apply_scan_transforms` pasa a tener un solo llamador y puede ser privada.
 - **Ahorro estimado:** ~80 líneas netas en el crate (sale la copia de `disk`) · **Riesgo:** bajo (mismo código; `disk/mod.rs` lo audita otro agente, coordinar) · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ✅ confirmada — el código es idéntico al de `disk` (ver la Verificación de su Q1): el orden cursor/`remaining_limit` es independiente, y en `engine.rs` compila con `Send` (nativo) y sin él (wasm). Matiz: sin Q2, el helper sigue llamando dos veces a `apply_scan_transforms` (Forward/Backward). "Un solo llamador" quiere decir una sola función.
 
 ### Q2. Simplificar el cuerpo del `unfold` (aplica a la versión compartida de Q1)
 - **Dónde:** `memory/mod.rs:122-170`.
@@ -81,6 +82,7 @@ Densidad baja-moderada (74 líneas de doc/comentario sobre 872) y en general de 
   ```
   Nota: hoy `exhausted` solo pasa de `false` a `true`. Asignarlo directamente es equivalente, porque si ya fuera `true` la línea `118` habría retornado antes. Los préstamos (`start`/`end`/`rows` sobre `state`) terminan en el `collect()`, igual que hoy.
 - **Ahorro estimado:** ~14 líneas · **Riesgo:** bajo · **Prioridad:** alta (junto con Q1)
+- **Verificación (2.ª pasada):** ✅ confirmada — `count == 0` y `*rem == 0` sobran: el buffer vacío ya devuelve `None` y la línea 118 corta. Al llegar ahí, `exhausted` solo puede valer `false`. `ScanDirection` es `Copy`, y la tupla `(Bound<&PK>, Bound<&PK>)` ya se usa hoy como rango.
 
 ### Q3. Helper para el lock envenenado
 - **Dónde:** `mod.rs:49-51`, `68-70`, `88-90`, `200-203`, `219-222`, `239-241`, `302-304`, `313-315`, `380-382` (9 apariciones).
@@ -95,6 +97,7 @@ Densidad baja-moderada (74 líneas de doc/comentario sobre 872) y en general de 
   ```
   El mensaje queda idéntico (`"Room lock poisoned: …"` / `"Engine lock poisoned: …"`).
 - **Ahorro estimado:** ~14 líneas netas · **Riesgo:** bajo · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ✅ confirmada — son exactamente 9 sitios (std `RwLock`) y los mensajes `Engine`/`Room` quedan iguales. Hay que importar `std::sync::PoisonError`.
 
 ### Q4. `validate_batch` puede reutilizar `resolve_table_id`
 - **Dónde:** `state.rs:88-93`.
@@ -114,6 +117,7 @@ Densidad baja-moderada (74 líneas de doc/comentario sobre 872) y en general de 
   ```
   Las claves duplicadas se comportan igual (la última gana). Hay que ajustar la doc de `155-160` para decir que serde acota la reserva del mapa de tablas y `RowsAsRead` la de filas.
 - **Ahorro estimado:** ~15 líneas · **Riesgo:** medio · **Prioridad:** media · **A verificar:** que `size_hint::cautious` se aplique a `HashMap` en la versión usada. Lo cubren `memory/tests/state.rs` y los tests de snapshots maliciosos.
+- **Verificación (2.ª pasada):** ⚠️ corregida — serde 1.0.229 sí aplica `size_hint::cautious` a `HashMap`, pero el comportamiento no es idéntico. Hoy no se reserva nada; con el cambio se reservaría hasta ~1 MiB según el número de tablas que declara el peer, y se crea un segundo `HashMap` por snapshot (`into_iter().collect()`). También cambia el texto de `expecting`. El resultado funcional es el mismo (la última clave gana), pero el uso de memoria cambia.
 
 ### Q6. Helper de “ejecutar en el blocking pool o en línea en wasm”
 - **Dónde:** `mod.rs:319-332` y `353-375`. El mismo patrón `spawn_blocking(..).await.map_err(|e| StorageError::Other(format!("Join error: {e}")))??` aparece 12 veces en `crates/storage/src` (incluido `disk`).

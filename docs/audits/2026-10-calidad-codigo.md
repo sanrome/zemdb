@@ -14,6 +14,14 @@ Esta auditoría mira **cómo está escrito** el código, no su correctitud. La p
   - que `impl Display for VerifyError` no se usa;
   - que el `Display` de `DataType` es idéntico a `Debug`;
   - que `FileHeader::compute_crc` es igual a `crc32fast::hash(&encode()[..36])`.
+- **Segunda pasada adversarial**: 4 verificadores intentaron refutar las sugerencias de prioridad alta o riesgo medio. Revisaron **48 sugerencias**:
+  - **39 confirmadas** y **9 corregidas**, por detalles de implementación o líneas mal citadas;
+  - **0 descartadas**.
+  - Cada sugerencia revisada lleva en su informe la línea `Verificación (2.ª pasada)` con el motivo.
+  - Las correcciones con impacto práctico son tres:
+    - `require_table` (schema) tiene que ser `pub(super)`;
+    - el `run_blocking` de storage tiene que ser genérico en el tipo de error;
+    - la sugerencia Q5 de memory cambia el uso de memoria, así que conviene no aplicarla tal cual.
 - No se corrió `cargo`. Las métricas por archivo (líneas de código, doc, comentarios y blancos) salen de un conteo estático.
 - Los ahorros son estimaciones con rango, y las sugerencias de cada módulo se pueden aplicar por separado.
 

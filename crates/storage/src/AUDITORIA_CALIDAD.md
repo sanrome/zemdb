@@ -71,6 +71,7 @@ La densidad es adecuada (≈15 % doc) y la mayoría explica el *por qué*. Punto
   ```
   `I: MaybeSend` implica `I: Send` por el supertrait, que es lo que necesita la coerción a `Box<dyn … + Send>`. Si se aplica Q1 de `memory/AUDITORIA_CALIDAD.md` (scan compartido), la función queda con un solo llamador y puede ser privada. Los alias `ScanIterator`/`RowStream` duplicados por `cfg` (`22-28`, `119-125`) **deben quedar**: `dyn Trait + MaybeSend` no es válido porque solo los auto-traits pueden sumarse a un `dyn`.
 - **Ahorro estimado:** ~30 líneas · **Riesgo:** bajo · **Prioridad:** alta · **A verificar:** que compile en `wasm32`.
+- **Verificación (2.ª pasada):** ✅ confirmada — `I: MaybeSend` implica `I: Send` porque el supertrait se propaga, y eso alcanza para convertir a `Box<dyn … + Send>`. Los 4 llamadores pasan `Some(batch_limit)` (grep en `crates/`). `take` antes de `map` es equivalente porque el closure es puro. Solo falta compilar en wasm32.
 
 ### Q2. `KeyRange`: delegar en la biblioteca estándar
 - **Dónde:** `options.rs:37-49` y `52-68`.
@@ -86,6 +87,7 @@ La densidad es adecuada (≈15 % doc) y la mayoría explica el *por qué*. Punto
   ```
   El método inherente `contains` no tiene usos en el workspace, pero es API pública: conviene conservarlo como delegación en vez de borrarlo.
 - **Ahorro estimado:** ~20 líneas · **Riesgo:** bajo · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ✅ confirmada — `Value` y `PrimaryKey` tienen un `Ord` total (`core/src/value/scalar.rs:307`), así que `start <= pk` equivale a `pk >= start`. `Bound::as_ref` existe desde 1.65, y no hay `rust-version` ni toolchain fijado.
 
 ### Q3. `fail_point.rs`: helper de búsqueda y guardas `cfg` redundantes
 - **Dónde:** `fail_point.rs:44-50`, `147-153` y `227-233` (buscar y quitar repetido), además de `73-78` y `96-103`.
@@ -120,6 +122,7 @@ La densidad es adecuada (≈15 % doc) y la mayoría explica el *por qué*. Punto
 - **Problema:** nada construye ni compara `StorageError::EngineClosed` (0 referencias en `crates/`). Además, `zemdb_core::WalFrameError` se escribe tres veces con ruta completa.
 - **Propuesta:** eliminar la variante, o documentar para qué se reserva. Importar `use zemdb_core::WalFrameError;`.
 - **Ahorro estimado:** ~3 líneas · **Riesgo:** medio (enum público: quitar una variante rompe un `match` exhaustivo externo; **a verificar**) · **Prioridad:** baja
+- **Verificación (2.ª pasada):** ✅ confirmada — no hay ninguna referencia a `EngineClosed` en los `.rs` del repo. `StorageError` no es `#[non_exhaustive]` y `lib.rs` lo reexporta, así que quitar la variante rompe semver. El riesgo medio es correcto.
 
 ### Q6. `sys.rs`: encadenar
 - **Dónde:** `sys.rs:17-18`.
@@ -130,6 +133,7 @@ La densidad es adecuada (≈15 % doc) y la mayoría explica el *por qué*. Punto
 - **Dónde:** 12 apariciones de `.map_err(|e| StorageError::Other(format!("Join error: {e}")))` en `crates/storage/src` (por ejemplo `memory/mod.rs:330`, `367` y `disk/mod.rs:494`, `709`, `741`).
 - **Propuesta:** `pub(crate) async fn run_blocking<T>(f) -> Result<T, StorageError>` en `sys.rs` o `engine.rs`, con variante wasm que ejecuta en línea. Detalle en Q6 de `memory/AUDITORIA_CALIDAD.md`.
 - **Ahorro estimado:** ~10–15 líneas en el crate · **Riesgo:** medio · **Prioridad:** baja
+- **Verificación (2.ª pasada):** ⚠️ corregida — las 12 apariciones están bien, pero la firma `FnOnce() -> Result<T, StorageError>` no sirve para `compactor.rs:573` ni para `recovery.rs:83`, que devuelven `io::Result`. Tiene que ser genérica en `E: Into<StorageError>`, como en Q3 de disk. En wasm el bound `Send` sobra (usar `MaybeSend` de Q1). Además, `fail_point` no existe en wasm (`lib.rs:5-6`), así que `pause_blocking` y `fail_key` van con `cfg` dentro del closure.
 
 ## Duplicación entre crates (solo anotada)
 

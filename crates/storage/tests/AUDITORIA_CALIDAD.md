@@ -104,6 +104,7 @@ Si se aplica Q1–Q3, buena parte de estos comentarios desaparece sola, porque e
   - Los tests que usan filas con nombres propios ("Alice", "Bob", "Phantom {i}") deben seguir usando `row(...)` explícito.
   - Los timestamps (10, 20, 100, 200, 300, 1000) no se comparan en ningún assert de estos archivos, pero conviene mantenerlos como parámetro y no unificarlos por las dudas.
 - **Ahorro estimado:** ~400–480 líneas brutas, ~340–410 netas · **Riesgo:** bajo · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ⚠️ corregida — `user_row` no reproduce todas las filas. `compaction_lifecycle_tests.rs:34` usa score `i * 100`, y muchos bloques usan `Bool(true)`, entre ellos el ejemplo 248-261, así que `inserts(1..=10, 100)` no es idéntico. Ningún assert lee esos valores: el 300 de :121 viene de un update, :386/390/485/489 usan `i*10` y :169 espera `false`. Los tests siguen pasando, pero hay que documentarlo como cambio de datos.
 
 ### Q2. Llevar los pares memoria/disco al patrón genérico de `apply_snapshot_tests.rs`
 - **Dónde:**
@@ -117,6 +118,7 @@ Si se aplica Q1–Q3, buena parte de estos comentarios desaparece sola, porque e
   - Para los pares que viven en archivos distintos (sequence mismatch, columna dinámica), el cuerpo genérico puede ir en `common/mod.rs` y los envoltorios quedarse donde están, así no se mueve cobertura.
   - Un `fn disk_engine(dir)` en `common` (hoy está en `apply_snapshot_tests.rs:298-300`) completa el patrón.
 - **Ahorro estimado:** ~170–200 líneas · **Riesgo:** bajo. El trait `StorageEngine` expone `scan`, `apply_batch`, `get` y `get_head_seq` (`src/engine.rs:70-89`), y `apply_snapshot_tests.rs` ya lo usa así. · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ✅ confirmada — el `diff` de 356-451 contra 453-546 y de 228-289 contra 291-354 muestra que solo cambian el engine, el tempdir, el `RoomId` y los comentarios. El `tempdir` tiene que vivir en el envoltorio de disco.
 
 ### Q3. Helper `scan_rows` y vectores de claves por rango en `query_pushdowns_tests.rs`
 - **Dónde:**
@@ -135,6 +137,7 @@ Si se aplica Q1–Q3, buena parte de estos comentarios desaparece sola, porque e
   ```
   Los conteos con `limit` (líneas 134-139, 283-288 y 348-353) pasan a ser `assert_eq!(scan_rows(...).await.len(), 75)`. Se conserva el `unwrap` de cada ítem. Los tests de snapshot isolation (líneas 384-390 y 483-489) leen las dos primeras filas con `stream.next()` antes de mutar y no pueden usar el helper para esa parte, pero sí para la cola de la línea 430.
 - **Ahorro estimado:** ~90–110 líneas (se superpone en parte con Q2) · **Riesgo:** bajo · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ✅ confirmada — los 14 bucles consumen todo el stream (no hay `break`) y hacen `unwrap` de cada ítem, y `scan_rows` hace lo mismo.
 
 ### Q4. Helper para "sala con WAL o compactación interrumpida" (tres tests fabrican el mismo estado)
 - **Dónde:** `compaction_lifecycle_tests.rs:238-332`, `compaction_lifecycle_tests.rs:335-446` y `disk_wal_resilience_tests.rs:926-1029`.
@@ -160,6 +163,7 @@ Si se aplica Q1–Q3, buena parte de estos comentarios desaparece sola, porque e
 
   **A verificar:** los tres usan timestamps distintos por segmento (100, 200, 300) y no los comparan en ningún assert. Si se pasa `ts` como parámetro, no cambia nada.
 - **Ahorro estimado:** ~120–150 líneas · **Riesgo:** bajo-medio (hay que fabricar exactamente los mismos bytes en disco) · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ⚠️ corregida — el `.snap.tmp.*` lo crea el **segundo** test (`compaction_lifecycle_tests.rs:393`), no el tercero. El tercero (`disk_wal_resilience_tests.rs:976-977, 993-994`) usa rutas literales y `std::fs::write`; los otros dos usan `tokio::fs::write`, con los mismos bytes. `wal_file_path` (pub) + `with_extension("wal.compacting")` reproduce bien `compacting_wal_path`.
 
 ### Q5. Helper "escribir, cerrar, alterar el WAL y reabrir" para los tests de corrupción en disco
 - **Dónde:** `disk_wal_resilience_tests.rs:144-189` (byte intermedio alterado, debe dar `WalCorruption`), `:191-226` (último byte alterado, se recupera como torn write), `:228-276` (5 bytes de basura, se trunca), `:641-744` (1024 ceros, se trunca) y `:876-923` (byte de payload del `.snap` alterado, debe dar `SnapshotCorruption`).
