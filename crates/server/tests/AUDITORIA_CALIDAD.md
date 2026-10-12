@@ -1,4 +1,8 @@
-# Auditoría de calidad — `crates/server/tests/` (parte A: HTTP e integración general)
+# Auditoría de calidad — `crates/server/tests/`
+
+> El informe tiene dos partes. La **parte A** (HTTP e integración general) va primero. La **parte B** (actores, ciclo de vida, log, relay y WAL) está al final, en la sección [Parte B](#parte-b-actores-ciclo-de-vida-log-relay-y-wal). Las dos partes coinciden en lo mismo: hace falta un `tests/common/mod.rs` compartido con el arranque del server y la fábrica de salas. Ahorro conjunto estimado: ~1 300–1 800 líneas netas de 7 945 (≈16–23 %).
+
+## Parte A: HTTP e integración general
 
 **Fecha:** 12 de octubre de 2026 · **Commit:** `7bcb6bb` · **Alcance:** `server_integration_tests.rs`, `http_edge_tests.rs`, `http_error_codes_tests.rs`, `id_validation_http_tests.rs`, `auth_tests.rs`, `admin_schema_http_tests.rs`
 
@@ -176,3 +180,192 @@
 - **Asserts débiles a reforzar mientras se compacta**: varios POST de setup en `server_integration_tests.rs` no verifican el status (`:524-531`, `:540-555`, `:571-578`, `:584-598`, `:860-877`); el helper de Q1 los haría fallar donde corresponde. Los `if let Some(entry)` de `:1670` y `:1688` pueden saltarse un paso en silencio (Q10).
 - **`correlation_id` con valores dispersos** (1, 2, 3, 10+i, 30, 90…) en `server_integration_tests.rs`: el único assert que lo lee es `:2264`; en el resto fijarlo dentro de los helpers no cambia nada observable.
 - **Intermitencia potencial**: la lectura de un solo chunk SSE en `:880` y `:1621` (Q7).
+
+---
+
+## Parte B: actores, ciclo de vida, log, relay y WAL
+
+**Fecha:** 12 de octubre de 2026 · **Commit:** `7bcb6bb` · **Alcance:** `crates/server/tests/{room_actor_tests, room_lifecycle_resilience_tests, tiered_log_tests, snapshot_relay_tests, unified_wal_tests, commit_semantics_tests, graceful_shutdown_tests, dedup_cache_tests}.rs`
+
+### Resumen
+
+- La forma es muy despareja. `snapshot_relay_tests.rs`, `commit_semantics_tests.rs` y `dedup_cache_tests.rs` ya están bien escritos: helpers chicos, nombres descriptivos, un comportamiento por test. `room_actor_tests.rs` y `room_lifecycle_resilience_tests.rs` (casi la mitad del alcance) arman a mano cada `RoomCommand` con su `oneshot`, y eso son 10–12 líneas por llamada.
+- La mayor ganancia sale de un `tests/common/mod.rs` con: `ask` genérico sobre `mpsc::Sender<RoomCommand>`, funciones `register/commit/sync/ack/cursor/metrics`, la fábrica de sala (registro + config + relay + manager + `get_or_spawn`), `make_test_op(seq)`, `envelope(len, fill)` y `seqs(&[SequencedOperation])`. Hoy hay 9 `SnapshotRelay::new(...)` copiados en 5 archivos del alcance, y `make_test_op` tiene dos copias idénticas más tres variantes inline.
+- `tiered_log_tests.rs` y `unified_wal_tests.rs` tienen mucho bucle `for i in a..=b { log.append(...) }` (17 veces solo en tiered), paths `segment_…` armados a mano, aserciones posición por posición (`deltas[0]`, `deltas[4]`) y tres pares de tests casi iguales.
+- `unified_wal_tests.rs` contiene dos tests que no tratan del WAL (`test_server_error_mapping`, `test_server_config_toml_and_env_overrides`). El primero repite el patrón de tabla que ya existe en `src/tests/error.rs:5`.
+- **Ahorro estimado:** ~550–800 líneas netas de 3517 (≈16–23 %), contando ya las ~150–190 líneas nuevas de `common/mod.rs`. Ninguna sugerencia saca cobertura adversaria: los tests redundantes se fusionan y conservan sus aserciones únicas.
+
+### Métricas
+
+| Archivo | Total | Código | Doc | Coment. | Blancos | Ahorro estimado |
+|---|---:|---:|---:|---:|---:|---|
+| `room_actor_tests.rs` | 894 | 764 | 0 | 52 | 78 | ~300–380 |
+| `room_lifecycle_resilience_tests.rs` | 837 | 730 | 0 | 32 | 75 | ~220–290 |
+| `tiered_log_tests.rs` | 570 | 402 | 0 | 66 | 102 | ~110–150 |
+| `snapshot_relay_tests.rs` | 461 | 409 | 5 | 7 | 40 | ~15–25 |
+| `unified_wal_tests.rs` | 315 | 253 | 0 | 14 | 48 | ~70–90 |
+| `commit_semantics_tests.rs` | 241 | 203 | 6 | 3 | 29 | ~0–10 (pasa a ser la fuente de `common`) |
+| `graceful_shutdown_tests.rs` | 153 | 139 | 0 | 2 | 12 | ~25–35 |
+| `dedup_cache_tests.rs` | 46 | 33 | 1 | 3 | 9 | 0 |
+| `common/mod.rs` (nuevo) | — | — | — | — | — | +150–190 |
+| **Total** | **3517** | **2933** | **12** | **179** | **393** | **~550–800 netas** |
+
+### Comentarios
+
+Densidad baja en general (179 líneas de `//`, el 5 %), pero mal repartida. `tiered_log_tests.rs` tiene 66 y `room_actor_tests.rs` 52; la mayoría son pasos numerados que narran la línea siguiente.
+
+**Recortar (repiten el código o son ruido):**
+- `room_actor_tests.rs:65,69,83,93`: `// 1. Register schema`, `// 2. Add nullable column evolution`… Cada uno repite la llamada que tiene abajo. Lo mismo pasa con `:124,183` (`// Register client`), `:289` (`// Subscribe to SSE events`), `:335` (`// Verify metrics`), `:431` (`// Gracefully shutdown room actor`), `:472` (`// Commit op 6 successfully`) y `:804`.
+- `room_actor_tests.rs:560-561`: `// 4. CRITICAL CHECK: … MUST STILL BE 0! Because the client has NOT sent its ACK yet!` repite el mensaje del `assert_eq!` (`:574`, "Cursor must NOT advance upon delivery…"). Lo mismo con `:577` contra el assert de `:599`, y `:614` (`// 7. NOW the client's confirmed cursor in the server is 5!`) contra el de `:627`. Alcanza con el mensaje del assert.
+- `tiered_log_tests.rs`: `// Run background maintenance` (`:145`), `// Append 10 operations` (`:391`), `// Verify both sealed segments exist on disk` (`:260`), `// 1. Create first segment 1..=5` / `// 2. Create second…` (`:452,458`), `// Verify segments directory contains…` (`:100`). Todos sobran en cuanto existan `append_range` y `segment_path` (Q5).
+- `room_lifecycle_resilience_tests.rs:154,168,209,253` y los pasos `// 3. Upload chunk 0` / `// 4. Upload chunk 1` (`:600,639`), que desaparecen con el helper de Q3.
+- `unified_wal_tests.rs:25,32,43` (`// 1. Initial creation`, `// 2. Append…`, `// 3. Re-open…`) y `:296` (`// Clean up env vars`).
+
+**Desactualizados o incorrectos (corregir):**
+- `room_actor_tests.rs:165`: `// 0. Commit from unregistered client rejected with Unauthorized`. El assert de `:178-181` espera `ServerError::ClientNotRegistered`, no `Unauthorized`.
+- `room_actor_tests.rs:822`: `// … far into the future (e.g. u64::MAX or 999)`. Solo se prueba 999. Si quedara solo `u64::MAX`, el test cambiaría.
+- `tiered_log_tests.rs:404`: el nombre `test_tiered_log_async_maintenance_spawn_blocking` y el comentario `:426` ("delegates Zstd compression to spawn_blocking") describen un detalle de implementación que el test no observa (ver Q6).
+
+**Conservar (explican el *por qué* o una precondición no obvia):**
+- `room_actor_tests.rs:654-656` (por qué TTL por defecto y segmentos chicos), `:670-673` y `:721-723` (cómo el ancla de retención protege los deltas 6..=20). Son la especificación del test.
+- `room_lifecycle_resilience_tests.rs:452-454` (por qué el cliente reporta cursor 0 en los 1005 commits) y `:747-749` (el snapshot es válido y solo el hash está mal, así que es un error del cliente).
+- `commit_semantics_tests.rs:183-184`, `:203`; `graceful_shutdown_tests.rs:86,113`; `dedup_cache_tests.rs:12-13`. Todos cortos y con intención.
+- `tiered_log_tests.rs:31` (drop abrupto = crash), `:311-312` (rotación + ventana deslizante), `:511-515` y `:521-523` (qué tier sirve cada rango).
+
+### Sugerencias
+
+**Q1. `tests/common/mod.rs` con un `ask` genérico y helpers de `RoomCommand`**
+- **Dónde:** `room_actor_tests.rs`: 35 `oneshot::channel()`, que empiezan en `:45` (`register_client_helper`), `:125`, `:167`, `:190`, `:207`, `:223`, `:240`, `:278`, `:290`, `:315`, `:336`, `:354`, `:368`, `:417`, `:448`, `:458`, `:474`, `:515`, `:532`, `:547`, `:562`, `:578`, `:588`, `:603`, `:615`, `:675`, `:688`, `:724`, `:737`, `:757`, `:807`, `:823`, `:843`, `:858` y `:875`. `room_lifecycle_resilience_tests.rs`: 10 (`:156`, `:169`, `:217`, `:229`, `:441`, `:457`, `:472`, `:491`, `:540`, `:551`). `snapshot_relay_tests.rs:72,88`; `graceful_shutdown_tests.rs:33,89`; `commit_semantics_tests.rs:87,114,137`.
+- **Problema:** cada envío repite `let (tx, rx) = oneshot::channel(); sender.send(RoomCommand::X { …, reply: tx }).await.unwrap(); rx.await.unwrap()`, que rustfmt deja en 8–12 líneas. `commit_semantics_tests.rs` (`TestRoom::register/commit/metrics`), `graceful_shutdown_tests.rs` (`commit`) y `room_actor_tests.rs` (`register_client_helper`) ya inventaron su propia versión parcial, cada uno por su lado.
+- **Propuesta:** todas las respuestas de `RoomCommand` salvo `Shutdown` son `oneshot::Sender<Result<T, ServerError>>` (`src/actor/command.rs:90-160`), así que alcanza un único genérico más funciones finas:
+  ```rust
+  pub async fn ask<T>(
+      tx: &mpsc::Sender<RoomCommand>,
+      cmd: impl FnOnce(oneshot::Sender<Result<T, ServerError>>) -> RoomCommand,
+  ) -> Result<T, ServerError> {
+      let (reply, rx) = oneshot::channel();
+      tx.send(cmd(reply)).await.unwrap();
+      rx.await.unwrap()
+  }
+  pub async fn register(tx: &Sender, client: &ClientId) -> RegisterResponse { … }
+  pub async fn commit(tx: &Sender, client: &ClientId, mutation: MutationId, last_ack: u64, op: Operation) -> Result<CommitResponse, ServerError> { … }
+  pub async fn sync(tx: &Sender, client: &ClientId, from: u64, max: u32) -> Result<SyncBatchResponse, ServerError> { … }
+  pub async fn cursor(tx, client) -> Option<SequenceNumber>; ack(tx, client, seq) -> Result<…>; metrics(tx) -> RoomMetrics
+  ```
+  Antes/después (`room_actor_tests.rs:822-839`, 18 líneas → 5):
+  ```rust
+  let err = ack(&sender, &alice, 999).await.unwrap_err();
+  assert!(matches!(err, ServerError::InvalidSequence { expected, actual }
+      if expected == SequenceNumber::new(3) && actual == SequenceNumber::new(999)));
+  ```
+  Usá funciones libres sobre `&Sender`, no métodos de un `TestRoom`: `room_actor_tests.rs:301-327` clona el `Sender` dentro de `tokio::spawn`. No reemplazar por `RoomManager::ask` (`src/actor/manager.rs:552`): ese agrega timeout y reenvío a una sala respawneada, y cambiaría lo que observan estos tests.
+- **Requisito:** CI corre `cargo clippy --workspace --all-targets -- -D warnings` (`.github/workflows/ci.yml:42`). Cada archivo de `tests/` es un crate distinto y usa solo una parte de `common`, así que `common/mod.rs` necesita `#![allow(dead_code)]` (o `#[allow(dead_code)]` por ítem).
+- **Ahorro estimado:** ~350–450 líneas en el alcance (sobre todo `room_actor` y `lifecycle`) · **Riesgo:** bajo · **Prioridad:** alta
+
+**Q2. Fábrica de sala compartida (registro + config + relay + manager + `get_or_spawn`)**
+- **Dónde:** `room_actor_tests.rs:104-120`, `:143-160`, `:257-275`, `:385-398`, `:492-509`, `:633-667`, `:778-795`; `room_lifecycle_resilience_tests.rs:111-132`, `:183-205`, `:408-429`; `commit_semantics_tests.rs:47-83`; `graceful_shutdown_tests.rs:49-84`; `snapshot_relay_tests.rs:36-73`.
+- **Problema:** unas 13 copias de las mismas 15–22 líneas: `tempdir` → `SchemaRegistry::new(dir/schemas)` → `register_schema` → `ServerConfig { data_dir, ..Default }` → `SnapshotRelay::new(…, 60s, default max)` → `RoomManager::new` → `get_or_spawn`/`create_room`. `room_actor_tests.rs:11-20` (`create_test_relay`) ya extrajo una parte, pero `:645-652` lo vuelve a copiar con otro TTL.
+- **Propuesta:** generalizar `commit_semantics_tests.rs::spawn_room` en `common` como `TestRoom::spawn(policy: Option<RoomLifecyclePolicy>) -> TestRoom { _dir, manager: Arc<RoomManager>, relay: Arc<SnapshotRelay>, sender, schema, schema_id, room_id, data_dir }`. Tiene que exponer `relay` y `manager`, porque `room_actor_tests.rs:707-718` llama a `relay.stage_snapshot` con `manager.log_bounds`. Para el test de recuperación (`room_actor_tests.rs:400-488`) basta `fn manager(&dir) -> RoomManager` reutilizable. Los nombres de sala/esquema distintos por test no importan, porque cada test tiene su propio `tempdir`. Ojo: `commit_semantics_tests.rs:79` arma `segments_dir` con `"commit-room"`, así que el path tiene que derivarse de `room_id`.
+- **A verificar:** `room_actor_tests.rs:645-652` usa TTL de relay de 300 s en vez de 60 s. El snapshot se lee enseguida, así que probablemente es indistinto, pero conviene dejar el parámetro.
+- **Ahorro estimado:** ~150–200 líneas · **Riesgo:** bajo · **Prioridad:** alta
+
+**Q3. Subida multiparte de `room_lifecycle_resilience_tests.rs`: un helper `post_frame` y una aserción de ack**
+- **Dónde:** `room_lifecycle_resilience_tests.rs:576-778` (el test ocupa 268 líneas); también `:286-325` y `:340-376`.
+- **Problema:** las cuatro construcciones de `ClientMessage::UploadSnapshotChunk` (`:577-586`, `:601-610`, `:640-649`, `:677-686`) solo cambian `correlation_id`, `chunk_index` y el rango de datos. Hay seis `client.post(format!(…)).header(AUTHORIZATION…).header(CONTENT_TYPE…).body(encode_message(..)).send().await.unwrap()` de 12–15 líneas cada uno, y tres `match ack { SnapshotUploadChunkAck {..} => …, other => panic! }` casi iguales.
+- **Propuesta:** dentro de `impl LifecycleTestServer`, `async fn post_frame(&self, path: &str, token: Option<&str>, msg: &ClientMessage) -> reqwest::Response`, con el mismo estilo que `snapshot_relay_tests.rs:148-160`. En el test, un closure `chunk(i, range) -> ClientMessage` y una tabla:
+  ```rust
+  for (i, range, staged) in [(0, 0..CHUNK, false), (1, CHUNK..2 * CHUNK, false), (2, 2 * CHUNK..len, true)] {
+      let resp = server.post_frame("snapshot/upload-chunk", Some(&token), &chunk(i, range)).await;
+      assert_eq!(resp.status(), StatusCode::OK);
+      assert!(matches!(decode(resp).await,
+          ServerMessage::SnapshotUploadChunkAck { chunk_index, total_chunks: 3, staged: s, .. } if chunk_index == i && s == staged));
+  }
+  ```
+  Esto también agrega la verificación de `total_chunks == 3` en los chunks 1 y 2, que hoy solo se hace en el 0: es más estricto, no menos. Para los commits HTTP del test de reactivación perezosa (`:305-324`, `:345-358`) sirve el mismo `post_frame`.
+- **Ahorro estimado:** ~110–140 líneas · **Riesgo:** bajo · **Prioridad:** alta
+
+**Q4. `tiered_log_tests.rs` y `unified_wal_tests.rs`: helpers `append_range`, `seqs` y `segment_path`**
+- **Dónde:** `tiered_log_tests.rs`: 17 bucles `for i in a..=b { log.append(make_test_op(i), None).unwrap(); }` (empiezan en `:60`, `:96`, `:130`, `:182`, `:190`, `:196`, `:249`, `:255`, `:307`, `:392`, `:418`, `:453`, `:459`, `:468`, `:515`, `:556`; `:27` además verifica `head_seq`); paths de segmento armados a mano en `:102`, `:136-139`, `:150-153`, `:261-268`; aserciones por índice o por `enumerate` en `:43-50`, `:66-69`, `:73-76`, `:111-113`, `:162-164`, `:208-220`, `:286-292`, `:318-327`, `:396-400`, `:430-434`, `:530-540`, `:567-569`. En `unified_wal_tests.rs`: `:33-40`, `:68-74`, `:108-113`, `:139-144`.
+- **Problema:** mucho texto para afirmaciones simples. Además, las aserciones por índice (`deltas[0]`, `deltas[4]`) son más débiles que comparar la secuencia completa.
+- **Propuesta:** `src/log/tests/tiered_log.rs:28` (`assert_contiguous`) y `:287` (`append_range`) ya tienen estos helpers para los unitarios, y `commit_semantics_tests.rs:158` tiene `seqs`. Replicarlos en `common`:
+  ```rust
+  pub fn append_range(log: &mut TieredLog, seqs: RangeInclusive<u64>) { for s in seqs { log.append(make_test_op(s), None).unwrap(); } }
+  pub fn seqs(ops: &[SequencedOperation]) -> Vec<u64> { ops.iter().map(|o| o.seq.get()).collect() }
+  pub fn segment_path(dir: &Path, first: u64, last: u64) -> PathBuf { dir.join("segments").join(format!("segment_{first:016}_{last:016}.wal")) }
+  ```
+  (para el `.wal.zst` de `:150-153`: `segment_path(..).with_extension("wal.zst")`)
+  y `assert_eq!(seqs(&deltas), (6..=10).collect::<Vec<_>>())` en lugar de `len` + `[0]` + `[4]`. Las aserciones quedan más estrictas porque verifican todos los elementos.
+- **Ahorro estimado:** ~70–90 líneas · **Riesgo:** bajo · **Prioridad:** media
+
+**Q5. `test_tiered_log_hot_buffer_o1_range_query` como tabla de casos**
+- **Dónde:** `tiered_log_tests.rs:332-379`.
+- **Problema:** siete consultas `get_range(from, ReadBudget::ops(n))` con el mismo patrón y un comentario por caso.
+- **Propuesta:**
+  ```rust
+  let cases: [(u64, usize, Vec<u64>); 7] = [
+      (5, 5, vec![]),            // antes de min_seq: dejaría hueco
+      (9, 5, (10..=14).collect()),
+      (10, 3, (11..=13).collect()),
+      (15, 10, (16..=20).collect()),
+      (20, 5, vec![]), (25, 5, vec![]), (10, 0, vec![]),
+  ];
+  for (from, n, expected) in cases {
+      let got = buffer.get_range(SequenceNumber::new(from), &mut ReadBudget::ops(n));
+      assert_eq!(seqs(&got), expected, "from {from}, budget {n}");
+  }
+  ```
+  Hay que conservar el comentario del caso `from=5`, que explica por qué vuelve vacío.
+- **Ahorro estimado:** ~25 líneas · **Riesgo:** bajo · **Prioridad:** media
+
+**Q6. Fusionar tres pares de tests casi idénticos en `tiered_log_tests.rs`**
+- **Dónde y por qué:**
+  - `test_tiered_log_async_maintenance_spawn_blocking` (`:404-436`) contra `test_tiered_log_cold_compression_and_read` (`:116-165`): política equivalente (solo cambia `warm_disk_ttl`: 10 ms contra 5 ms), mismos 5 ops, `force_rotate_warm`, espera más allá de `warm_disk_ttl`, `run_maintenance` con `warm_compressed_count == 1` y lectura de 1..=5 desde frío. El segundo verifica además los archivos. La única diferencia es `tokio::time::sleep` contra `std::thread::sleep`, que no cambia lo que se observa.
+  - `test_tiered_log_fast_path_off_by_one_boundary` (`:543-570`) contra `test_tiered_log_hot_buffer_sliding_window_no_zero_eviction` (`:296-329`): los dos usan `ram_max_ops: 5`, agregan 1..=6 y piden desde el cursor 1, esperando 2..=6. Solo cambia el límite (5 contra 10). Alcanza con agregar al segundo `assert_eq!(log.fetch_deltas(SequenceNumber::new(1), 5)…, ((2..=6), false))`.
+  - `test_tiered_log_hierarchical_cache_inversion` (`:381-402`) es una lectura dentro del hot buffer, ya cubierta por `test_tiered_log_hot_buffer_fast_read` (`:55-84`), que hace lo mismo con más casos. El nombre ("cache inversion") no describe lo que prueba.
+- **Propuesta:** quedarse con un test por comportamiento y mover a él las aserciones que solo tenía el otro. No se pierde ningún caso.
+- **Ahorro estimado:** ~65–75 líneas · **Riesgo:** bajo · **Prioridad:** media
+
+**Q7. `unified_wal_tests.rs`: sacar lo que no es WAL y tabular la configuración**
+- **Dónde:** `test_server_error_mapping` (`:260-315`) y `test_server_config_toml_and_env_overrides` (`:202-258`).
+- **Problema:** (a) el mapeo de errores son ocho bloques de 3–8 líneas. `src/tests/error.rs:5-57` (`each_error_maps_to_its_code_and_status`) ya es una tabla `(err, code, status)`, pero no incluye `SchemaViolation`, `BehindCompaction`, `RoomNotFound`, `InvalidSequence`, `RoomLocked` ni `SnapshotSuperseded`; `Unauthorized` y `Timeout` están en las dos. (b) Los ocho `set_var` y los ocho `remove_var` (`:223-230`, `:297-304`) son listas paralelas, y si el test falla en el medio los `remove_var` no se ejecutan.
+- **Propuesta:** (a) agregar las seis filas que faltan a la tabla de `src/tests/error.rs` (unas 30 líneas allá, con rustfmt) y borrar el test de integración, que queda totalmente cubierto. Si se prefiere no tocar `src/tests`, convertirlo en tabla ahí mismo, con el mismo `for (err, code, status) in cases`. (b) `const ENV: [(&str, &str); 8] = [("ZEMDB_PORT", "9999"), …];` con un `for (k, v) in ENV { std::env::set_var(k, v) }` antes y un `remove_var` después. El override por closure (`apply_overrides_from`, `src/config.rs:415`) es privado, así que no está disponible desde un test de integración. Cuando el resto de la suite se ordene, conviene mover los dos tests a un archivo propio (`config_and_errors_tests.rs`) o a los unitarios. Hoy el nombre del archivo engaña.
+- **Ahorro estimado:** ~45–60 líneas en el alcance (−55 en el archivo, +~30 en `src/tests/error.rs`, −14 por la tabla de env) · **Riesgo:** bajo · **Prioridad:** media
+
+**Q8. `unified_wal_tests.rs`: fixture de log escrito y `file_len`**
+- **Dónde:** `:106-114`, `:137-145`, `:178-182` (bloque `{ let (mut log, _) = open…; append… }`); `:116`, `:147`, `:185` (`dir.path().join("segments").join("active.wal")`); `:148`, `:157`, `:165`, `:186`, `:198` (`std::fs::metadata(&p).unwrap().len()`).
+- **Propuesta:** `fn write_log(dir, n) -> PathBuf /* active.wal */`, que agregue los ops 1..=n con `MutationId::from_u128(i)` y devuelva el path, más `fn file_len(p) -> u64`. Las variables intermedias `let seq = …; let op = make_test_op(seq.get())` (`:34-36`, `:69-71`) sobran. Ojo: `test_unified_wal_dedup_idempotency` usa `i * 42` como id y `test_unified_wal_append_and_recovery_roundtrip` usa `i + 1000`; el helper tiene que aceptar la función de id o esos dos tests deben quedar como están.
+- **Ahorro estimado:** ~25 líneas · **Riesgo:** bajo · **Prioridad:** baja
+
+**Q9. Envelope de snapshot y `make_test_op` duplicados**
+- **Dónde:** `snapshot_relay_tests.rs:127-134` (`envelope`) contra las copias inline de `room_actor_tests.rs:702-706`, `room_lifecycle_resilience_tests.rs:565-569` y `:744-750`. `make_test_op` en `tiered_log_tests.rs:11-15` y `unified_wal_tests.rs:14-18` (idénticos), más las variantes inline de `room_lifecycle_resilience_tests.rs:385-387`, `:786-788` y `:832-834`.
+- **Propuesta:** moverlos a `common`. `:565-569` es literalmente `envelope(300 * 1024, 0x42)`. En `:744-750` el cuerpo `"test"` no importa: el test solo depende de que el hash `[0xFF; 32]` no coincida, así que sirve `envelope(SNAPSHOT_HEADER_LEN + 4, b't')`. En `room_actor_tests.rs:702` cualquier envelope sirve.
+- **Ahorro estimado:** ~20 líneas · **Riesgo:** bajo · **Prioridad:** baja
+
+**Q10. Detalles de `snapshot_relay_tests.rs` y `graceful_shutdown_tests.rs`**
+- `snapshot_relay_tests.rs:216-219`, `:239-242`, `:261-267`, `:293-296`, `:347-350`: `assert_eq!(server.upload(..).await.status(), StatusCode::OK)` ocupa 4–7 líneas con rustfmt. Un `async fn upload_ok(&self, seq, data)` lo deja en 1. Del mismo modo, el par `assert_eq!(resp.status(), X); assert_eq!(error_code(resp).await, Y);` (`:199-200`, `:210-211`, `:222-223`, `:231-232`, `:374-375`, `:459-460`) se resume en `expect_http_error(resp, X, Y).await`, simétrico al `expect_error` de `:186`. ~15–20 líneas.
+- `graceful_shutdown_tests.rs:49-73` repite la fábrica de Q2 (sin `get_or_spawn`) y `:89-100` reimplementa `register` + `commit` de Q1. ~25–30 líneas.
+- `room_lifecycle_resilience_tests.rs:20-24`: campos `pub` en un struct privado de test. `:30-31,37`: `host: "127.0.0.1"` y `dormant_after_secs: None` son los valores por defecto (`src/config.rs:130,244`), y `port: 0` no se usa: el listener se bindea aparte en `:69` y `config.port` solo se lee en `src/main.rs:40,45`. Se pueden borrar las tres líneas y el `pub` de los campos. Unas 3–5 líneas.
+- **Riesgo:** bajo · **Prioridad:** baja
+
+**Q11. Test de colisión de flock simple, incluido en el de estrés**
+- **Dónde:** `room_lifecycle_resilience_tests.rs:379-404` contra `:780-837`.
+- **Problema:** el test de estrés hace exactamente lo mismo (append que toma el flock, luego `open_or_create` → `RoomLocked` con el mismo mensaje) con 12 hilos, y además verifica la liberación al hacer `drop`. El test simple no aporta ningún caso propio.
+- **Propuesta:** borrarlo o fusionarlo. Si se quiere conservar el caso "un solo intento" como documentación, que quede como el primer `assert` del test de estrés antes de lanzar los hilos (3 líneas). En los dos tests, el `match` de tres brazos se puede reemplazar por `assert!(matches!(res, Err(ServerError::RoomLocked(ref m)) if m.contains("active.wal locked by another process")), "{res:?}")`. `WarmDiskLog` deriva `Debug` (`src/log/warm_disk.rs:29`), así que `{res:?}` compila.
+- **Ahorro estimado:** ~25–35 líneas · **Riesgo:** bajo · **Prioridad:** baja
+
+### Lo que conviene dejar como está
+
+- **`commit_semantics_tests.rs`**: es el modelo a seguir (`TestRoom` con métodos de dominio, políticas con nombre, `wait_for_tail_above` con tiempo pausado y nombres que describen el comportamiento). Solo cambia de lugar si sus helpers pasan a `common`.
+- **`dedup_cache_tests.rs`**: 46 líneas, tres tests mínimos con el *por qué* comentado (`:12-13`). No hay nada que recortar.
+- **`snapshot_relay_tests.rs:404-422` (`wrong_kind_frame_of_len`)**: el cálculo de overhead con una sonda de 1 MiB parece rebuscado, pero es la única forma de obtener un frame de exactamente `MAX_FRAME_SIZE` bytes sin acoplar el test al formato del codec. Su doc-comment es justo.
+- **`room_actor_tests.rs:632-774` (ancla de retención)**: aun con Q1 y Q2 va a seguir siendo largo, porque el escenario necesita 20 ops, snapshot, ack de Alice, registro y sync de Bob. Los comentarios de `:654-656`, `:670-673` y `:721-723` son la especificación del test y no se deben resumir.
+- **`room_lifecycle_resilience_tests.rs:258-377` (reactivación perezosa)**: las dos fases con servidores distintos sobre el mismo directorio son el punto del test. Solo hay que compactar los POST (Q3), no la estructura.
+- **`graceful_shutdown_tests.rs:101-152`**: los `timeout`, el SSE abierto y la lectura del roster persistido son todos aserciones necesarias.
+- **Los `matches!`/`match` con mensaje de `panic!("expected X, got {other:?}")`**: donde el valor no implementa `Debug` o el mensaje ayuda a diagnosticar, el `match` explícito está justificado.
+
+### Tests
+
+- **Coordinación con la parte A:** la mayoría de los archivos de la otra parte (`admin_schema_http_tests.rs:24-61`, `http_edge_tests.rs:37-91`, `http_error_codes_tests.rs:20-62`, `id_validation_http_tests.rs:19-66`, `server_integration_tests.rs:17-70`) definen su propio `TestServer` con el mismo armado de registro, relay, manager, router y listener que `room_lifecycle_resilience_tests.rs:19-90` y `snapshot_relay_tests.rs:20-121`. Conviene un único `common::TestServer::start(configure: impl FnOnce(&mut ServerConfig))`, con la firma de `http_edge_tests.rs:50`, que es la más flexible, más un `post_frame`. Así la fábrica HTTP y la de sala de Q2 quedan en el mismo módulo.
+- **Nombres:** `room_actor`, `lifecycle`, `tiered_log` y `unified_wal` usan el prefijo `test_…` y nombres de implementación (`…_o1_range_query`, `…_spawn_blocking`, `…_elimination_of_race_condition`). Los archivos más nuevos (`snapshot_relay`, `commit_semantics`, `dedup_cache`) usan frases de comportamiento. Unificar al estilo nuevo no ahorra líneas, pero mejora la lectura. Prioridad baja.
+- **Ubicación:** `test_schema_registry_crud_and_evolution` (`room_actor_tests.rs:57-101`) no toca el actor. Encaja mejor junto a los unitarios de `src/tests/schema_registry.rs`, que hoy no cubren el rechazo de una columna no nullable ni la recarga. Lo mismo pasa con los dos tests de `WarmDiskLog` dentro de `room_lifecycle_resilience_tests.rs` (`:379`, `:780`), que son tests de log.
+- **Sin pérdida de cobertura:** Q6, Q7(a) y Q11 eliminan tests solo cuando otro test (o la tabla unitaria) ya verifica exactamente lo mismo, y trasladan las aserciones únicas. Las pruebas adversarias (CRC alterado, escritura cortada, EOF con ceros, flock con 12 hilos, ack o commit futuros, hash BLAKE3 incorrecto, límites de frame) quedan intactas en contenido.
