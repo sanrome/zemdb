@@ -2,6 +2,20 @@
 
 **Fecha:** 12 de octubre de 2026 · **Commit:** `7bcb6bb` · **Alcance:** `config.rs`, `error.rs`, `durable.rs`, `dedup.rs`, `schema_registry.rs`, `blocking.rs`, `fail_point.rs`, `lib.rs`, `main.rs` y sus tests unitarios `tests/{config,durable,error,schema_registry,blocking}.rs` (no `tests/relay.rs`).
 
+## Actualización tras el Lote 8 (`e88874b`)
+
+El commit `e88874b` llegó a `main` después de esta auditoría y tocó este alcance:
+
+- **`dedup.rs`:** `is_empty` se borró y `len` es `#[cfg(test)]`. El módulo ahora es privado al crate y sus tests están en `tests/dedup.rs`. Lo que dice "Lo que conviene dejar como está" sobre `is_empty` y clippy ya no aplica, y tampoco el doc de `dedup.rs:53`.
+- **`lib.rs`:** `log` y `dedup` dejaron de ser públicos, y solo se reexportan `RoomLifecycleOverrides` y `RoomLifecyclePolicy`.
+- **`tests/error.rs`** pasó de 89 a 146 líneas con un test nuevo, `test_server_error_mapping`, que se movió de los tests de integración. Tiene 8 bloques de 4–8 líneas con el mismo patrón que la tabla de `:5`, así que conviene pasarlo a filas de esa tabla (unas −40 líneas). Juntos cubren **15 de las 24 variantes**. Ahora están `RoomNotFound`→404, `BehindCompaction`→410, `RoomLocked`→423, `SnapshotSuperseded`→409 e `InvalidSequence`→400. Siguen faltando `BadRequest`, `Config`, `Io`, `RateLimited`→429, `RoomAlreadyExists`, `SchemaNotFound`, `Serialization`, `Wal` y `WalCorruption`.
+- **`tests/config.rs`** pasó de 371 a 418 líneas. Cambió esto:
+  - `load_with_max_snapshot_bytes` ya no lee el entorno del proceso: usa `from_toml_str` y `validate`. La advertencia sobre `load_with_env` del final de la sección "Tests" queda resuelta.
+  - El test nuevo `test_server_config_toml_and_env_overrides` pasa las variables como un mapa y ahora comprueba `ZEMDB_HOST`, `ZEMDB_PORT`, `ZEMDB_SNAPSHOT_TTL_SECS` y `ZEMDB_MAX_SNAPSHOT_BYTES`, entre otras.
+  - El hueco de cobertura se reduce, pero siguen sin probarse `ZEMDB_DATA_DIR`, los dos secretos y `ZEMDB_DEDUP_LRU_CAPACITY`.
+  - El nombre del test nuevo usa el prefijo `test_`, a diferencia del resto del archivo, que usa frases de comportamiento.
+- **Q1, Q2, Q3–Q9 del código fuente:** `config.rs`, `durable.rs` y `schema_registry.rs` no cambiaron, así que siguen valiendo con las mismas líneas.
+
 ## Resumen
 
 - Código en buen estado: errores con `thiserror`, durabilidad correcta (tmp + `sync_all` + `rename` + `sync_dir`, `create_dir_all_synced` sincroniza cada padre), RAII para el lock de escritura de schemas y comentarios que explican el *por qué*. No hay referencias a códigos de auditoría ni narrativa histórica en el alcance.

@@ -108,6 +108,7 @@
   Opcional: `mod.rs:145-149` también puede ir en una línea (`obsolete.extend(self.snapshots.insert(..).map(|p| p.path).filter(|p| *p != new_path))`). Ojo: es menos legible.
 - **Ahorro estimado:** ~8 líneas · **Riesgo:** bajo · **Prioridad:** alta.
 - **Verificación (2.ª pasada):** ✅ confirmada — `Option::take_if(FnOnce(&mut T) -> bool)` existe desde 1.80 y el `rustc` local es 1.97.0; sin `rust-version` en ningún `Cargo.toml`; mismo efecto (solo toma si el predicado es verdadero).
+- **Actualización tras el Lote 8 (`e88874b`):** el workspace ahora fija `rust-version = "1.85"`. `Option::take_if` es de 1.80, así que la sugerencia sigue siendo válida.
 
 ### Q3. Quitar el `impl Display for VerifyError`, que nadie usa
 - **Dónde:** `files.rs:181-188`.

@@ -2,6 +2,18 @@
 
 > El informe tiene dos partes. La **parte A** (HTTP e integración general) va primero. La **parte B** (actores, ciclo de vida, log, relay y WAL) está al final, en la sección [Parte B](#parte-b-actores-ciclo-de-vida-log-relay-y-wal). Las dos partes coinciden en lo mismo: hace falta un `tests/common/mod.rs` compartido con el arranque del server y la fábrica de salas. Ahorro conjunto estimado: ~1 300–1 800 líneas netas de 7 945 (≈16–23 %).
 
+> **Actualización tras el Lote 8 (`e88874b`).** El Lote 8 sacó de `crates/server/tests/` varios archivos y tests que audita la parte B:
+> - `tiered_log_tests.rs`, `unified_wal_tests.rs` y `dedup_cache_tests.rs`;
+> - los dos tests de flock de `room_lifecycle_resilience_tests.rs`.
+>
+> Ahora son tests unitarios: `src/log/tests/{tiered_log,warm_disk,hot_buffer}.rs`, `src/tests/dedup.rs`, `src/tests/error.rs` y `src/tests/config.rs`. Con eso, el directorio pasó de 7 945 a 6 926 líneas, y las sugerencias de la parte B quedan así:
+> - **Q4, Q5, Q6, Q8 y Q11** aplican ahora a `src/log/tests/` y se siguen en `crates/server/src/log/AUDITORIA_CALIDAD.md`.
+> - **Q7:** `test_server_error_mapping` y `test_server_config_toml_and_env_overrides` se movieron tal cual a `src/tests/error.rs` y `src/tests/config.rs`. La propuesta de sumarlos a las tablas que ya existen sigue en pie y se sigue en `crates/server/src/AUDITORIA_CALIDAD.md`.
+> - **"Ubicación"**, en la sección "Tests" de la parte B: los dos tests de `WarmDiskLog` ya no están en este directorio, así que esa parte quedó resuelta.
+> - **Q1, Q2, Q3, Q9 y Q10** y toda la parte A no cambian. Por los tests e imports borrados, en `room_lifecycle_resilience_tests.rs` las líneas `:13-378` están 2 más arriba y las `:405-779`, 29 más arriba.
+>
+> Ahorro actualizado: la parte B queda en ~300–580 líneas, porque salen ~205–275 que ahora se cuentan en `src/`. El total del directorio queda en ~1 050–1 600.
+
 ## Parte A: HTTP e integración general
 
 **Fecha:** 12 de octubre de 2026 · **Commit:** `7bcb6bb` · **Alcance:** `server_integration_tests.rs`, `http_edge_tests.rs`, `http_error_codes_tests.rs`, `id_validation_http_tests.rs`, `auth_tests.rs`, `admin_schema_http_tests.rs`

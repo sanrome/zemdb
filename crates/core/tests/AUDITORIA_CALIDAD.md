@@ -2,6 +2,8 @@
 
 **Fecha:** 12 de octubre de 2026 · **Commit:** `7bcb6bb` · **Alcance:** los 9 archivos `crates/core/tests/*.rs` (2894 líneas)
 
+> **Actualización tras el Lote 8 (`e88874b`).** En `types_memory_tests.rs` se borraron el `assert!(size_of::<PrimaryKey>() <= 64)` y su comentario exclamativo (antes `:12-13`). Eso resuelve esa parte de Q8 y del apartado "Comentarios". Las líneas posteriores de ese archivo están 2 más arriba. El resto del informe no cambia.
+
 ## Resumen
 - La cobertura es buena y la mayoría de los tests prueba comportamiento observable con nombres descriptivos. Se notan dos generaciones de estilo:
   - tests antiguos con prefijo `test_`, asserts sueltos y comentarios "// Test X roundtrip";

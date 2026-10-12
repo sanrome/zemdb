@@ -4,6 +4,21 @@
 
 Esta auditoría mira **cómo está escrito** el código, no su correctitud. La pregunta es si se puede decir lo mismo en menos líneas y más claro, sin perder buenas prácticas ni comportamiento. También evalúa la cantidad y la calidad de los comentarios. **No se modificó código.** Cada módulo tiene su informe `AUDITORIA_CALIDAD.md` con las sugerencias numeradas (Q1, Q2, …), el `archivo:línea` de cada una, el ahorro estimado, el riesgo y la prioridad.
 
+## Actualización tras el Lote 8 (`e88874b`)
+
+Después de esta auditoría llegó a `main` el commit `e88874b` (Lote 8), que tocó 20 archivos `.rs`. Se revisó contra los informes, y cada informe afectado tiene ahora una sección o nota "Actualización tras el Lote 8" con lo que cambió y las líneas nuevas. Lo principal:
+
+- **Resueltas por el Lote 8:**
+  - en `server/log`, Q1 (`read_range` duplicado en warm y cold) y casi toda Q8 (pase de mantenimiento duplicado);
+  - el `assert` redundante de `PrimaryKey` en `core/tests`;
+  - el `let _ = successful_reads` en `storage/tests`;
+  - la ubicación de los tests de `WarmDiskLog`;
+  - el test de configuración que leía el entorno del proceso.
+- **Tests que cambiaron de lugar:** los de `tiered_log_tests.rs`, `unified_wal_tests.rs` y `dedup_cache_tests.rs`, y los de flock, pasaron a tests unitarios en `src/log/tests/` y `src/tests/`. Sus sugerencias de compactación siguen valiendo y ahora se siguen en `crates/server/src/log/AUDITORIA_CALIDAD.md` y `crates/server/src/AUDITORIA_CALIDAD.md`.
+- **API pública:** `log` y `dedup` del server son privados al crate. Las marcas "a verificar por consumidores externos" de esos módulos ya no aplican.
+- **`rust-version = "1.85"`:** ahora está fijado. Se revisaron las APIs de la std que proponen los informes (`take_if`, `first_chunk`, `is_some_and`, `split_once`, `iter::successors`, `Bound::as_ref`) y todas son anteriores a 1.85.
+- **Nada quedó inválido.** Las sugerencias del resto de los módulos se refieren a archivos que el Lote 8 no tocó.
+
 ## Metodología
 
 - 14 auditores en paralelo, uno por módulo, en modo solo lectura y con un límite de 13 minutos cada uno. Todos siguieron las mismas instrucciones: preservar el comportamiento exacto y los principios de `GEMINI.md`, y no proponer rediseños.
@@ -27,7 +42,7 @@ Esta auditoría mira **cómo está escrito** el código, no su correctitud. La p
 
 ## Resultado en una línea
 
-El código está **bien escrito y bien comentado**. No hay grandes excesos en el código fuente, donde el ahorro realista es de **~1 150–1 450 líneas de 18 846 (≈6–8 %)**. El volumen recortable está en los **tests**: **~2 900–3 900 líneas de 25 395 (≈11–15 %)**, casi todo por la falta de módulos `tests/common` y por setup copiado. En total serían **~4 000–5 300 líneas (≈9–12 % del workspace)**, sin perder cobertura ni cambiar comportamiento.
+El código está **bien escrito y bien comentado**. No hay grandes excesos en el código fuente, donde el ahorro realista es de **~1 150–1 450 líneas de 18 846 (≈6–8 %)**. El volumen recortable está en los **tests**: **~2 900–3 900 líneas de 25 395 (≈11–15 %)**, casi todo por la falta de módulos `tests/common` y por setup copiado. En total serían **~4 000–5 300 líneas (≈9–12 % del workspace)**, sin perder cobertura ni cambiar comportamiento. Después del Lote 8 hay que restar ~30 líneas del código fuente, porque ese commit ya aplicó Q1 y casi toda Q8 de `server/log`. Los tests que movió se siguen contando, ahora en `src/`.
 
 ## Métricas globales
 
@@ -52,12 +67,12 @@ La relación entre comentarios y código fuente es de ~0,20: 1 línea de doc o c
 | storage · memory | [`crates/storage/src/memory/AUDITORIA_CALIDAD.md`](../../crates/storage/src/memory/AUDITORIA_CALIDAD.md) | 872 | ~80 (~9 %) | Scan compartido con `disk` (~80 netas en el crate, contadas una sola vez); helper para el lock envenenado (9 repeticiones) |
 | storage · engine/snapshot/options/… | [`crates/storage/src/AUDITORIA_CALIDAD.md`](../../crates/storage/src/AUDITORIA_CALIDAD.md) | 1 083 | ~80 (7–8 %) | `apply_scan_transforms` duplicada por `cfg` wasm; `KeyRange` con `Bound::as_ref`/`RangeBounds::contains` |
 | storage · tests de integración | [`crates/storage/tests/AUDITORIA_CALIDAD.md`](../../crates/storage/tests/AUDITORIA_CALIDAD.md) | 3 306 | 700–900 (21–27 %) | No hay `tests/common/mod.rs`: el esquema `users` está copiado 4 veces y hay 40 bloques de fila + operación; los pares memoria/disco pueden usar el patrón genérico `<E: StorageEngine>` que ya tiene `apply_snapshot_tests.rs` |
-| server · log | [`crates/server/src/log/AUDITORIA_CALIDAD.md`](../../crates/server/src/log/AUDITORIA_CALIDAD.md) | 2 788 + 1 984 tests | 220–290 (src 4,5–5,5 %) | `read_range`/`read_range_with_mutations` duplicados en `warm_disk`/`cold_disk`; `HotBuffer` guarda a mano `min_seq`/`max_seq`, que se pueden derivar de la cola; comentarios sobre una rotación por edad que no existe |
+| server · log | [`crates/server/src/log/AUDITORIA_CALIDAD.md`](../../crates/server/src/log/AUDITORIA_CALIDAD.md) | 2 788 + 1 984 tests | 340–470 tras el Lote 8 (src 90–120 · tests 250–350, con los movidos) | `read_range`/`read_range_with_mutations` duplicados en `warm_disk`/`cold_disk`; `HotBuffer` guarda a mano `min_seq`/`max_seq`, que se pueden derivar de la cola; comentarios sobre una rotación por edad que no existe |
 | server · actor | [`crates/server/src/actor/AUDITORIA_CALIDAD.md`](../../crates/server/src/actor/AUDITORIA_CALIDAD.md) | 2 680 + 3 845 tests | 175–235 (src 4–5,5 %) | Handlers de `room.rs` que devuelvan `Result` y respondan una vez; `RoomCommand::reject` en una línea por brazo |
 | server · api | [`crates/server/src/api/AUDITORIA_CALIDAD.md`](../../crates/server/src/api/AUDITORIA_CALIDAD.md) | 2 418 + 969 tests | 135–175 (4–5 %) | 6 de 7 handlers de `data_plane.rs` repiten la misma forma (`ensure_payload` + `respond`); autenticación repetida en `extract.rs` |
 | server · relay | [`crates/server/src/relay/AUDITORIA_CALIDAD.md`](../../crates/server/src/relay/AUDITORIA_CALIDAD.md) | 1 344 + 1 413 tests | 205–270 | `promote_and_install` común a `stage_snapshot`/`stage_chunk`; helper `part_of` en tests (28 llamadas) |
 | server · config/error/durable/… | [`crates/server/src/AUDITORIA_CALIDAD.md`](../../crates/server/src/AUDITORIA_CALIDAD.md) | 1 369 + 749 tests | 275–325 (13–15 %) | `config.rs`: un `#[serde(default)]` en el struct elimina 23 funciones `default_*` (~110 líneas); helper `set` para los overrides |
-| server · tests de integración | [`crates/server/tests/AUDITORIA_CALIDAD.md`](../../crates/server/tests/AUDITORIA_CALIDAD.md) | 7 945 | 1 300–1 800 (16–23 %): parte A 750–1 000 · parte B 550–800 | No existe `tests/common/mod.rs`: el arranque del server se copia en 5+ archivos y la fábrica de salas ~13 veces; ~45 envíos de `RoomCommand` + `oneshot` de 10–12 líneas; `server_integration_tests.rs` no usa su propio helper `post_message` |
+| server · tests de integración | [`crates/server/tests/AUDITORIA_CALIDAD.md`](../../crates/server/tests/AUDITORIA_CALIDAD.md) | 6 926 tras el Lote 8 | 1 050–1 600: parte A 750–1 000 · parte B 300–580 | No existe `tests/common/mod.rs`: el arranque del server se copia en 5+ archivos y la fábrica de salas ~13 veces; ~45 envíos de `RoomCommand` + `oneshot` de 10–12 líneas; `server_integration_tests.rs` no usa su propio helper `post_message` |
 | client | [`crates/client/AUDITORIA_CALIDAD.md`](../../crates/client/AUDITORIA_CALIDAD.md) | 10 | — | Es el esqueleto de `cargo new`; declara 5 dependencias sin usar |
 
 ## Hallazgos transversales
@@ -114,8 +129,8 @@ Algunos auditores encontraron detalles de comportamiento o de cobertura. No se r
 - `TableSchema::try_new` acepta columnas PK repetidas.
 - Un PK con tipo incorrecto da errores distintos según la ruta (`TypeMismatch` vs. `PrimaryKeyTypeMismatch`).
 - La limpieza de `.snap.tmp.*` ignora en silencio los errores de `read_dir` (`recovery.rs:338-351`).
-- `server/src/tests/error.rs` cubre 9 de 24 variantes.
-- `tests/config.rs` no prueba varios overrides de entorno.
+- `server/src/tests/error.rs` cubría 9 de 24 variantes; tras el Lote 8 cubre 15. Faltan, entre otras, `RateLimited`→429, `SchemaNotFound` y `RoomAlreadyExists`.
+- `tests/config.rs` no prueba algunos overrides de entorno. Tras el Lote 8 siguen faltando `ZEMDB_DATA_DIR`, los secretos y `ZEMDB_DEDUP_LRU_CAPACITY`.
 
 ## Orden sugerido de aplicación
 

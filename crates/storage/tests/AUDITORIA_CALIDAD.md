@@ -2,6 +2,12 @@
 
 **Fecha:** 12 de octubre de 2026 · **Commit:** `7bcb6bb` · **Alcance:** `apply_snapshot_tests.rs`, `compaction_lifecycle_tests.rs`, `disk_wal_resilience_tests.rs`, `memory_engine_tests.rs`, `query_pushdowns_tests.rs`, `snapshot_decompression_bounds_tests.rs`, `snapshot_portability_tests.rs` (3306 líneas)
 
+> **Actualización tras el Lote 8 (`e88874b`).** `compaction_lifecycle_tests.rs` cambió en `test_disk_concurrent_readers_and_writers` (`:134-182`). Ahora escribe la fila 1 antes de que arranquen los lectores, usa un closure `batch(i)` y verifica cada lectura.
+> - El punto de `successful_reads` calculado y tirado con `let _ =`, en "Asserts verbosos", quedó resuelto.
+> - Los bloques de fila de ese test que se cuentan en Q1 ya usan un helper local.
+> - Las líneas de este archivo posteriores a `:180` están 3 más abajo. Por ejemplo, el `.snap.tmp.*` de Q4 ahora se crea en `:396`.
+> - El resto del informe no cambia.
+
 ## Resumen
 
 - La cobertura es buena y variada, con muchos casos de unhappy path: WAL corrupto, escrituras cortadas, cola con ceros, crash en cada fase de la compactación, flock, snapshots malformados y límites de descompresión. No sobra ningún escenario. El problema es **la forma**: casi todo el volumen es setup copiado y pegado.

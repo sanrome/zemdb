@@ -2,6 +2,34 @@
 
 **Fecha:** 12 de octubre de 2026 · **Commit:** `7bcb6bb` · **Alcance:** `tiered_log.rs`, `policy.rs`, `cold_disk.rs`, `warm_disk.rs`, `segment_index.rs`, `segment_reader.rs`, `hot_buffer.rs`, `budget.rs`, `retention.rs`, `io_probe.rs`, `mod.rs` y sus tests en `log/tests/` (revisados con menos profundidad).
 
+## Actualización tras el Lote 8 (`e88874b`)
+
+El commit `e88874b` llegó a `main` después de esta auditoría y cambió el módulo. El resto del informe sigue citando las líneas de `7bcb6bb`; acá están las posiciones actuales donde cambiaron.
+
+- **Q1 resuelta.** El Lote 8 borró `read_range`/`read_range_with_mutations` de `warm_disk.rs` y `cold_disk.rs`, y `tests/cold_disk.rs` ahora llama directo a `read_cold_file`. También desaparecieron las docs duplicadas de esas funciones que se mencionan en "Comentarios".
+- **Q2 sigue valiendo, con menos usos.** `parse_segment_filename` está en `warm_disk.rs:311` y la usan solo `segment_index.rs:93` y `cold_disk.rs:67`. El helper `segment_start_seq` de Q1 ya no hace falta. Mover la función a `segment_index.rs` y simplificarla con `strip_prefix`/`split_once` sigue siendo correcto, con un ahorro de ~8 líneas.
+- **Q3 sigue valiendo.** `len`, `bytes`, `is_empty` y `max_seq` de `HotBuffer` ahora son `#[cfg(test)]`; en producción solo se usa `min_seq()`. Los campos siguen en `hot_buffer.rs:18-19` y `after_eviction` en `:79`. Si se aplica la propuesta, el `max_seq()` derivado de `back()` también queda `#[cfg(test)]`.
+- **Q6:** el mensaje `RoomLocked` de `active.wal` ya no lo comparan los tests de integración, sino `tests/warm_disk.rs:190` y `:232`, adonde se movieron los tests de flock. Sigue sin poder cambiarse. Los dos `try_lock_exclusive` están en `warm_disk.rs:83` y `:224`.
+- **Q8 resuelta casi entera.** `run_maintenance_sync_at` ya no duplica el pase de mantenimiento: es `#[cfg(test)]` y corre `run_maintenance_at` en un runtime propio, así que la precedencia de errores ya no puede divergir. Solo queda la parte (a), devolver el `cold_path` desde `warm_segments_due` (~2 líneas).
+- **API pública:** `log` ahora es privado al crate y `lib.rs` solo reexporta `RoomLifecycleOverrides` y `RoomLifecyclePolicy`. Las marcas "a verificar si hay consumidores externos" de este informe ya no aplican.
+- **Comentarios:** los dos desactualizados siguen sin corregir. `tiered_log.rs:200` pasó a `:201` (rotación "or age") y `policy.rs:298` a `:299` ("seal a segment per operation"). `policy.rs:49` sigue en el mismo lugar.
+- **Tests:** a este módulo se movieron varios tests de integración:
+  - los de `crates/server/tests/tiered_log_tests.rs` y `unified_wal_tests.rs` están en `log/tests/tiered_log.rs`, que pasó de 1 165 a 1 854 líneas;
+  - los dos de flock de `room_lifecycle_resilience_tests.rs` están en `log/tests/warm_disk.rs`, que pasó de 170 a 257;
+  - el de rangos del `HotBuffer` está en el archivo nuevo `log/tests/hot_buffer.rs`.
+
+  Por eso ahora aplican acá las sugerencias Q4, Q5, Q6, Q8 y Q11 de la parte B de `crates/server/tests/AUDITORIA_CALIDAD.md`:
+  - helpers `append_range`, `seqs` y `segment_path`;
+  - la consulta de rangos como tabla de casos;
+  - fusionar tres pares de tests casi iguales;
+  - un fixture para el WAL escrito;
+  - absorber el test de flock simple en el de estrés.
+
+  `make_op` ahora está copiado tres veces (`tests/tiered_log.rs:12`, `tests/warm_disk.rs:6`, `tests/hot_buffer.rs:6`), lo que refuerza la propuesta de `test_support` de la sección "Tests". El bucle `for … append` aparece más de las 17 veces que se contaron, así que el helper rinde más.
+- **Ahorro actualizado:**
+  - **Código fuente:** ~90–120 líneas. Se descuentan Q1 y casi toda Q8.
+  - **Tests:** ~250–350 líneas, ya contando los que se movieron.
+
 ## Resumen
 - El código está bien escrito: los invariantes de durabilidad (tmp → fsync → rename → `sync_dir`, `log_meta.json` antes de borrar segmentos, poda solo de prefijos) están explícitos y comentados. No hay referencias a códigos de auditoría ni narrativa histórica en los comentarios.
 - La duplicación principal está entre `warm_disk.rs` y `cold_disk.rs`: `read_range`/`read_range_with_mutations` repetidos (y sin usos fuera de los tests unitarios), el preludio de lectura de un segmento (presupuesto → `io_probe` → abrir con `NotFound` = vacío) y el parseo del nombre del archivo, repetido tres veces. Además `parse_segment_filename` vive en `warm_disk.rs` cuando es la inversa de `segment_path` (`segment_index.rs`).
