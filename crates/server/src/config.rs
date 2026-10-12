@@ -71,6 +71,11 @@ pub struct ServerConfig {
     #[serde(default)]
     pub dormant_after_secs: Option<u64>,
 
+    /// Server default: inactivity after which a Dormant client is removed from the roster
+    /// (seconds, default 30 days).
+    #[serde(default = "default_forget_dormant_after_secs")]
+    pub forget_dormant_after_secs: u64,
+
     /// Maximum number of mutation IDs retained in the deduplication LRU cache per room.
     #[serde(default = "default_dedup_lru_capacity")]
     pub dedup_lru_capacity: usize,
@@ -190,6 +195,12 @@ fn default_snapshot_ttl_secs() -> u64 {
     SEVEN_DAYS_SECS
 }
 
+fn default_forget_dormant_after_secs() -> u64 {
+    RoomLifecyclePolicy::default()
+        .forget_dormant_after
+        .as_secs()
+}
+
 fn default_snapshot_demand_ttl_secs() -> u64 {
     RoomLifecyclePolicy::default().snapshot_demand_ttl.as_secs()
 }
@@ -231,6 +242,7 @@ impl Default for ServerConfig {
             max_room_disk_bytes: default_max_room_disk_bytes(),
             lease_timeout_secs: default_lease_timeout_secs(),
             dormant_after_secs: None,
+            forget_dormant_after_secs: default_forget_dormant_after_secs(),
             dedup_lru_capacity: default_dedup_lru_capacity(),
             snapshot_ttl_secs: default_snapshot_ttl_secs(),
             snapshot_demand_ttl_secs: default_snapshot_demand_ttl_secs(),
@@ -352,6 +364,7 @@ impl ServerConfig {
             max_room_disk_bytes: Some(self.max_room_disk_bytes),
             lease_timeout_secs: Some(self.lease_timeout_secs),
             dormant_after_secs: self.dormant_after_secs,
+            forget_dormant_after_secs: Some(self.forget_dormant_after_secs),
             snapshot_demand_ttl_secs: Some(self.snapshot_demand_ttl_secs),
             idle_timeout_secs: Some(self.idle_timeout_secs),
         }
@@ -468,6 +481,9 @@ impl ServerConfig {
         }
         if let Some(secs) = parse_var(&var, DormantAfter.env_var())? {
             self.dormant_after_secs = Some(secs);
+        }
+        if let Some(secs) = parse_var(&var, ForgetDormantAfter.env_var())? {
+            self.forget_dormant_after_secs = secs;
         }
         if let Some(secs) = parse_var(&var, SnapshotDemandTtl.env_var())? {
             self.snapshot_demand_ttl_secs = secs;

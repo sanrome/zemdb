@@ -272,8 +272,8 @@ fn disconnected_client_inside_the_log_stays_disconnected_by_default() {
     tracker.get_client_mut(&client).unwrap().last_heartbeat =
         Instant::now() - Duration::from_secs(120);
 
-    tracker.check_timeouts(Duration::from_secs(5), None, seq(1));
-    tracker.check_timeouts(Duration::from_secs(5), None, seq(1));
+    tracker.check_timeouts(Duration::from_secs(5), None, Duration::MAX, seq(1));
+    tracker.check_timeouts(Duration::from_secs(5), None, Duration::MAX, seq(1));
 
     assert_eq!(
         tracker.get_client(&client).unwrap().state,
@@ -296,19 +296,19 @@ fn disconnected_client_becomes_dormant_once_behind_the_log() {
     tracker.get_client_mut(&client).unwrap().last_heartbeat =
         Instant::now() - Duration::from_secs(6);
 
-    tracker.check_timeouts(lease, None, seq(6));
+    tracker.check_timeouts(lease, None, Duration::MAX, seq(6));
     assert_eq!(
         tracker.get_client(&client).unwrap().state,
         ClientState::Disconnected
     );
-    tracker.check_timeouts(lease, None, seq(6));
+    tracker.check_timeouts(lease, None, Duration::MAX, seq(6));
     assert_eq!(
         tracker.get_client(&client).unwrap().state,
         ClientState::Disconnected,
         "a cursor at tail - 1 can still catch up from the log"
     );
 
-    tracker.check_timeouts(lease, None, seq(7));
+    tracker.check_timeouts(lease, None, Duration::MAX, seq(7));
     assert_eq!(
         tracker.get_client(&client).unwrap().state,
         ClientState::Dormant
@@ -330,8 +330,8 @@ fn configured_dormancy_timeout_makes_a_disconnected_client_dormant() {
     tracker.get_client_mut(&client).unwrap().last_heartbeat =
         Instant::now() - Duration::from_secs(30);
 
-    tracker.check_timeouts(lease, dormant_after, seq(1));
-    tracker.check_timeouts(lease, dormant_after, seq(1));
+    tracker.check_timeouts(lease, dormant_after, Duration::MAX, seq(1));
+    tracker.check_timeouts(lease, dormant_after, Duration::MAX, seq(1));
     assert_eq!(
         tracker.get_client(&client).unwrap().state,
         ClientState::Disconnected
@@ -339,7 +339,7 @@ fn configured_dormancy_timeout_makes_a_disconnected_client_dormant() {
 
     tracker.get_client_mut(&client).unwrap().last_heartbeat =
         Instant::now() - Duration::from_secs(61);
-    tracker.check_timeouts(lease, dormant_after, seq(1));
+    tracker.check_timeouts(lease, dormant_after, Duration::MAX, seq(1));
     assert_eq!(
         tracker.get_client(&client).unwrap().state,
         ClientState::Dormant
@@ -539,12 +539,12 @@ fn inactivity_survives_reopening_the_roster() {
     );
     // The lease and the dormancy timeout keep counting from the last activity.
     let (lease, dormant_after) = (Duration::from_secs(90), Some(Duration::from_secs(60)));
-    tracker.check_timeouts(lease, dormant_after, seq(1));
+    tracker.check_timeouts(lease, dormant_after, Duration::MAX, seq(1));
     assert_eq!(
         tracker.get_client(&client).unwrap().state,
         ClientState::Disconnected
     );
-    tracker.check_timeouts(lease, dormant_after, seq(1));
+    tracker.check_timeouts(lease, dormant_after, Duration::MAX, seq(1));
     assert_eq!(
         tracker.get_client(&client).unwrap().state,
         ClientState::Dormant
@@ -611,4 +611,44 @@ fn activity_before_the_clock_can_reach_saturates() {
         instant_before(now, Duration::from_secs(1)),
         now - Duration::from_secs(1)
     );
+}
+
+#[test]
+fn dormant_client_is_forgotten_after_its_ttl_from_a_compact_roster() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("meta_clients_room.json");
+    let (gone, active) = (
+        ClientId::new("gone").unwrap(),
+        ClientId::new("active").unwrap(),
+    );
+    let (lease, forget_after) = (Duration::from_secs(5), Duration::from_secs(60));
+
+    let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
+    for client in [&gone, &active] {
+        tracker
+            .register_client(client, Some(seq(1)), seq(1))
+            .unwrap();
+    }
+    // Disconnected, then Dormant (its cursor fell behind the log), and kept before its TTL.
+    tracker.get_client_mut(&gone).unwrap().last_heartbeat =
+        Instant::now() - Duration::from_secs(59);
+    for _ in 0..3 {
+        tracker.check_timeouts(lease, None, forget_after, seq(5));
+    }
+    assert_eq!(
+        tracker.get_client(&gone).unwrap().state,
+        ClientState::Dormant
+    );
+
+    tracker.get_client_mut(&gone).unwrap().last_heartbeat =
+        Instant::now() - Duration::from_secs(61);
+    tracker.check_timeouts(lease, None, forget_after, seq(5));
+    tracker.persist_if_dirty().unwrap();
+    assert!(!tracker.is_registered(&gone) && tracker.is_registered(&active));
+
+    // The roster on disk, one compact line, forgot it too.
+    let saved = fs::read_to_string(&path).unwrap();
+    assert!(!saved.contains('\n'), "{saved}");
+    let reopened = ClientLeaseTracker::open_or_create(&path).unwrap();
+    assert!(!reopened.is_registered(&gone) && reopened.is_registered(&active));
 }

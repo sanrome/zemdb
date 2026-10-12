@@ -252,6 +252,8 @@ impl RoomActor {
                     match cmd {
                         Some(RoomCommand::Shutdown { reply }) => {
                             debug!(room = %self.room_id, "Shutdown command received, terminating actor loop");
+                            #[cfg(test)]
+                            crate::fail_point::hook("room_shutdown", &self.room_dir);
                             self.persist_roster_at_stop();
                             let _ = reply.send(());
                             break;
@@ -934,6 +936,7 @@ impl RoomActor {
         self.lease_tracker.check_timeouts(
             self.policy.lease_timeout,
             self.policy.dormant_after,
+            self.policy.forget_dormant_after,
             self.tiered_log.tail_seq(),
         );
 

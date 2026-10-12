@@ -127,7 +127,7 @@ impl ClientLeaseTracker {
                 .collect(),
             snapshot_demand: self.snapshot_demand.map(PersistedDemand::from_time),
         };
-        let json = serde_json::to_string_pretty(&roster).map_err(|e| {
+        let json = serde_json::to_string(&roster).map_err(|e| {
             ServerError::Serialization(format!("Failed to serialize clients roster: {}", e))
         })?;
         durable::write_atomic(&self.path, json.as_bytes())?;
@@ -286,16 +286,18 @@ impl ClientLeaseTracker {
     /// - `Connected` / `Bootstrapping` -> `Disconnected` when the lease expires without activity.
     /// - `Disconnected` -> `Dormant` when its cursor falls behind `tail_seq - 1`, or, only if
     ///   `dormant_after` is set, once it has been inactive for longer than that.
+    /// - `Dormant` -> removed from the roster once inactive for longer than `forget_after`.
     pub fn check_timeouts(
         &mut self,
         lease_timeout: Duration,
         dormant_after: Option<Duration>,
+        forget_after: Duration,
         tail_seq: SequenceNumber,
     ) -> bool {
         let mut modified = false;
         let now = Instant::now();
 
-        for entry in self.clients.values_mut() {
+        self.clients.retain(|_, entry| {
             let inactive_for = now.saturating_duration_since(entry.last_heartbeat);
             match entry.state {
                 ClientState::Connected | ClientState::Bootstrapping => {
@@ -312,9 +314,15 @@ impl ClientLeaseTracker {
                         modified = true;
                     }
                 }
-                ClientState::Dormant => {}
+                ClientState::Dormant => {
+                    if inactive_for > forget_after {
+                        modified = true;
+                        return false;
+                    }
+                }
             }
-        }
+            true
+        });
 
         if modified {
             self.dirty = true;

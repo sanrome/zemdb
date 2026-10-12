@@ -128,12 +128,7 @@ pub async fn get_room(
         .room_manager
         .ask(&rid, |reply| RoomCommand::GetMetrics { reply })
         .await??;
-    // The actor is running, so the manager knows the room's metadata, unless the room was
-    // deleted in the meantime.
-    let lifecycle_overrides = state
-        .room_manager
-        .lifecycle_overrides(&rid)
-        .ok_or_else(|| ServerError::RoomNotFound(rid.to_string()))?;
+    let lifecycle_overrides = state.room_manager.lifecycle_overrides(&rid).await?;
     Ok(Json(RoomDetails {
         metrics,
         lifecycle_overrides,

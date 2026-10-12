@@ -1670,7 +1670,7 @@ fn test_client_lease_disconnected_to_dormant_timeout() {
     if let Some(entry) = tracker.get_client_mut(&alice) {
         entry.last_heartbeat = Instant::now() - Duration::from_secs(6);
     }
-    let modified = tracker.check_timeouts(lease_timeout, None, tail_seq);
+    let modified = tracker.check_timeouts(lease_timeout, None, Duration::MAX, tail_seq);
     assert!(modified);
     assert_eq!(
         tracker.get_client(&alice).unwrap().state,
@@ -1689,14 +1689,19 @@ fn test_client_lease_disconnected_to_dormant_timeout() {
     if let Some(entry) = tracker.get_client_mut(&alice) {
         entry.last_heartbeat = Instant::now() - Duration::from_secs(95);
     }
-    assert!(!tracker.check_timeouts(lease_timeout, None, tail_seq));
+    assert!(!tracker.check_timeouts(lease_timeout, None, Duration::MAX, tail_seq));
     assert_eq!(
         tracker.get_client(&alice).unwrap().state,
         ClientState::Disconnected
     );
 
     // 3. With a dormancy timeout configured, the same disconnection makes her Dormant.
-    let modified2 = tracker.check_timeouts(lease_timeout, Some(Duration::from_secs(90)), tail_seq);
+    let modified2 = tracker.check_timeouts(
+        lease_timeout,
+        Some(Duration::from_secs(90)),
+        Duration::MAX,
+        tail_seq,
+    );
     assert!(modified2);
     assert_eq!(
         tracker.get_client(&alice).unwrap().state,

@@ -208,6 +208,7 @@ fn lifecycle_environment_variables_set_the_server_defaults() {
         ("ZEMDB_ROOM_MAX_DISK_BYTES", "2097152"),
         ("ZEMDB_LEASE_TIMEOUT_SECS", "15"),
         ("ZEMDB_DORMANT_AFTER_SECS", "3600"),
+        ("ZEMDB_FORGET_DORMANT_AFTER_SECS", "7200"),
         ("ZEMDB_SNAPSHOT_DEMAND_TTL_SECS", "600"),
         ("ZEMDB_ROOM_IDLE_TIMEOUT_SECS", "0"),
     ])
@@ -226,6 +227,7 @@ fn lifecycle_environment_variables_set_the_server_defaults() {
             max_room_disk_bytes: 2 * 1024 * 1024,
             lease_timeout: secs(15),
             dormant_after: Some(secs(3600)),
+            forget_dormant_after: secs(7200),
             snapshot_demand_ttl: secs(600),
             idle_timeout: None,
         }
@@ -246,7 +248,7 @@ fn default_configuration_gives_the_default_policy() {
 #[test]
 fn lifecycle_defaults_outside_their_range_fail_naming_the_variable() {
     type Case = (fn(&mut ServerConfig), &'static str);
-    let cases: [Case; 9] = [
+    let cases: [Case; 10] = [
         (|c| c.ram_max_ops = 0, "ZEMDB_RAM_MAX_OPS"),
         (|c| c.ram_max_ops = 100_001, "ZEMDB_RAM_MAX_OPS"),
         (|c| c.ram_ttl_secs = 0, "ZEMDB_RAM_TTL_SECS"),
@@ -263,6 +265,10 @@ fn lifecycle_defaults_outside_their_range_fail_naming_the_variable() {
         (
             |c| c.dormant_after_secs = Some(u64::MAX),
             "ZEMDB_DORMANT_AFTER_SECS",
+        ),
+        (
+            |c| c.forget_dormant_after_secs = 0,
+            "ZEMDB_FORGET_DORMANT_AFTER_SECS",
         ),
         (
             |c| c.idle_timeout_secs = u64::MAX,

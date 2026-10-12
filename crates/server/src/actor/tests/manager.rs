@@ -352,8 +352,8 @@ async fn lifecycle_overrides_survive_a_respawn_and_a_restart() {
     let manager = new_manager(&dir);
     assert_eq!(effective_policy(&manager, &room_id).await, expected);
     assert_eq!(
-        manager.lifecycle_overrides(&room_id),
-        Some(custom_overrides())
+        manager.lifecycle_overrides(&room_id).await.unwrap(),
+        custom_overrides()
     );
     let stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(meta_room_path(&dir, &room_id)).unwrap()).unwrap();
@@ -380,8 +380,8 @@ async fn meta_room_without_lifecycle_has_no_overrides() {
     let defaults = manager.default_policy.clone();
     assert_eq!(effective_policy(&manager, &room_id).await, defaults);
     assert_eq!(
-        manager.lifecycle_overrides(&room_id),
-        Some(RoomLifecycleOverrides::default())
+        manager.lifecycle_overrides(&room_id).await.unwrap(),
+        RoomLifecycleOverrides::default()
     );
     manager.shutdown_all().await;
 }
@@ -444,19 +444,25 @@ async fn inactive_room_shuts_down_and_reopens_with_its_overrides() {
         .create_room(
             room_id.clone(),
             SchemaId::new("first").unwrap(),
-            Some(overrides),
+            Some(overrides.clone()),
         )
         .await
         .unwrap();
 
     for _ in 0..2 {
         assert!(manager.get_room(&room_id).is_some());
-        // Once the actor has exited, the manager keeps nothing for the room but its metadata.
+        // Once the actor has exited, the manager keeps nothing for the room; its overrides are
+        // read from disk.
         wait_until("the inactive room shuts down", || {
             !manager.rooms.contains_key(&room_id)
         })
         .await;
         assert!(manager.spawn_locks.is_empty());
+        assert!(manager.room_meta.is_empty());
+        assert_eq!(
+            manager.lifecycle_overrides(&room_id).await.unwrap(),
+            overrides
+        );
 
         // The next request reopens the room, with its overrides: it shuts down again.
         let policy = effective_policy(&manager, &room_id).await;
@@ -838,10 +844,11 @@ async fn schema_reload_racing_a_respawn_reaches_the_new_actor() {
         .unwrap();
     manager.shutdown_all().await;
 
-    // A respawn is in progress: it holds the spawn lock and has read the previous schema.
+    // A respawn is in progress: it holds the spawn lock, has resolved the room's metadata and
+    // has read the previous schema.
     let spawning = manager.lock_room(&room_id).await;
+    let meta = manager.resolve_metadata(&room_id, None).unwrap();
     let previous = manager.schema_registry.get_schema(&schema_id).unwrap();
-    let meta = manager.room_meta.get(&room_id).unwrap().clone();
 
     // Meanwhile the schema evolves and the reload runs.
     let evolved = manager
@@ -963,4 +970,96 @@ async fn activity_keeps_a_room_open() {
         "the room shut down while it received commands"
     );
     manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn room_that_fails_to_spawn_leaves_no_metadata() {
+    let dir = tempdir().unwrap();
+    let room_id = RoomId::new("no-schema").unwrap();
+    let meta_path = meta_room_path(&dir, &room_id);
+    fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
+    fs::write(
+        &meta_path,
+        br#"{"room_id": "no-schema", "schema_id": "missing"}"#,
+    )
+    .unwrap();
+
+    let manager = new_manager(&dir);
+    let result = manager.get_or_spawn(&room_id, None).await;
+    assert!(
+        matches!(result, Err(ServerError::SchemaNotFound(_))),
+        "{result:?}"
+    );
+    assert!(manager.room_meta.is_empty());
+
+    // A room whose log cannot be opened: `segments` is a file, not a directory.
+    let blocked = RoomId::new("blocked").unwrap();
+    fs::create_dir_all(room_dir(&dir, &blocked)).unwrap();
+    fs::write(room_dir(&dir, &blocked).join("segments"), b"").unwrap();
+    let schema = SchemaId::new("first").unwrap();
+    assert!(manager.create_room(blocked, schema, None).await.is_err());
+    assert!(manager.room_meta.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rooms_shut_down_together_and_save_their_rosters() {
+    let dir = tempdir().unwrap();
+    let manager = Arc::new(new_manager(&dir));
+    let client = zemdb_core::id::ClientId::new("member").unwrap();
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let mut rooms = Vec::new();
+    for i in 0..3 {
+        let room_id = RoomId::new(format!("closing-{i}")).unwrap();
+        manager
+            .create_room(room_id.clone(), SchemaId::new("first").unwrap(), None)
+            .await
+            .unwrap();
+        manager
+            .ask(&room_id, |reply| RoomCommand::RegisterClient {
+                client_id: client.clone(),
+                current_seq: None,
+                reply,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        // Activity alone does not make the roster dirty: only the stop writes it again.
+        let roster = room_dir(&dir, &room_id).join(format!("meta_clients_{room_id}.json"));
+        fs::remove_file(&roster).unwrap();
+        manager
+            .ask(&room_id, |reply| RoomCommand::Heartbeat {
+                client_id: client.clone(),
+                reply,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let reached_tx = reached_tx.clone();
+        fail_point::arm_hook("room_shutdown", &room_dir(&dir, &room_id), move || {
+            reached_tx.send(()).unwrap();
+            tokio::task::block_in_place(|| release_rx.recv_timeout(Duration::from_secs(10)))
+                .unwrap();
+        });
+        rooms.push((roster, release_tx));
+    }
+
+    let shutdown = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move { manager.shutdown_all().await }
+    });
+    // Every room is in its shutdown before any of them is let go.
+    for _ in &rooms {
+        reached_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the rooms shut down one at a time");
+    }
+    for (_, release) in &rooms {
+        release.send(()).unwrap();
+    }
+    shutdown.await.unwrap();
+    for (roster, _) in &rooms {
+        assert!(roster.exists(), "{} was not saved", roster.display());
+    }
 }

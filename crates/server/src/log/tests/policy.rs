@@ -137,6 +137,7 @@ fn overrides_outside_their_range_are_bad_requests_naming_the_field() {
         max_room_disk_bytes: Some(MIN_ROOM_DISK_BYTES),
         lease_timeout_secs: Some(1),
         dormant_after_secs: Some(MAX_POLICY_DURATION_SECS),
+        forget_dormant_after_secs: Some(1),
         snapshot_demand_ttl_secs: Some(MIN_SNAPSHOT_DEMAND_TTL_SECS),
         idle_timeout_secs: Some(1),
     }

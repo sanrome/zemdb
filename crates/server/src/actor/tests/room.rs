@@ -1820,3 +1820,38 @@ async fn retries_are_recognised_after_reopening_with_a_zero_dedup_capacity() {
     assert_eq!(retry.assigned_seq, seq(1));
     fx.manager.shutdown_all().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn dormant_client_is_forgotten_after_its_ttl_and_registers_again() {
+    let fx = Fixture::new(RoomLifecycleOverrides {
+        forget_dormant_after_secs: Some(60),
+        ..RoomLifecycleOverrides::default()
+    })
+    .await;
+    let (gone, kept) = (
+        ClientId::new("gone").unwrap(),
+        ClientId::new("kept").unwrap(),
+    );
+    // A Dormant roster entry last seen `secs_ago` seconds ago.
+    let dormant = |id: &str, secs_ago: u64| {
+        let seen = std::time::UNIX_EPOCH.elapsed().unwrap() - Duration::from_secs(secs_ago);
+        serde_json::json!({
+            "client_id": id, "state": "Dormant", "last_ack_seq": 0,
+            "last_seen_unix_ms": seen.as_millis() as u64,
+        })
+    };
+    fx.manager.shutdown_room(&fx.room_id).await;
+    let roster = serde_json::json!({ "clients": [dormant("gone", 61), dormant("kept", 30)] });
+    fs::write(fx.roster_path(), roster.to_string()).unwrap();
+    let sender = fx.sender().await;
+    // A fast tick forgets the client inactive for longer than its TTL.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert!(matches!(
+        heartbeat(&sender, &gone).await,
+        Err(ServerError::ClientNotRegistered(_))
+    ));
+    heartbeat(&sender, &kept).await.unwrap();
+    register(&sender, &gone).await;
+    fx.manager.shutdown_all().await;
+}

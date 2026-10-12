@@ -68,6 +68,10 @@ pub struct RoomLifecyclePolicy {
     /// its cursor falls behind the log.
     pub dormant_after: Option<Duration>,
 
+    /// Inactivity after which a Dormant client is removed from the roster; if it comes back,
+    /// it must register again.
+    pub forget_dormant_after: Duration,
+
     /// How long the room keeps asking its clients for a snapshot without the request being
     /// renewed.
     pub snapshot_demand_ttl: Duration,
@@ -89,8 +93,9 @@ impl Default for RoomLifecyclePolicy {
             max_room_disk_bytes: 500 * 1024 * 1024,        // 500 MB
             lease_timeout: Duration::from_secs(90),
             dormant_after: None,
+            forget_dormant_after: Duration::from_secs(2_592_000), // 30 days
             snapshot_demand_ttl: Duration::from_secs(7 * 24 * 60 * 60), // 7 days
-            idle_timeout: Some(Duration::from_secs(600)),               // 10 minutes
+            idle_timeout: Some(Duration::from_secs(600)),         // 10 minutes
         }
     }
 }
@@ -140,6 +145,9 @@ impl RoomLifecyclePolicy {
                 .dormant_after_secs
                 .map(secs)
                 .or(self.dormant_after),
+            forget_dormant_after: overrides
+                .forget_dormant_after_secs
+                .map_or(self.forget_dormant_after, secs),
             snapshot_demand_ttl: overrides
                 .snapshot_demand_ttl_secs
                 .map_or(self.snapshot_demand_ttl, secs),
@@ -179,6 +187,8 @@ pub struct RoomLifecycleOverrides {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dormant_after_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub forget_dormant_after_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_demand_ttl_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_timeout_secs: Option<u64>,
@@ -204,7 +214,7 @@ impl RoomLifecycleOverrides {
         Ok(())
     }
 
-    fn settings(&self) -> [(PolicySetting, Option<u64>); 11] {
+    fn settings(&self) -> [(PolicySetting, Option<u64>); 12] {
         use PolicySetting::*;
         [
             (
@@ -220,6 +230,7 @@ impl RoomLifecycleOverrides {
             (MaxRoomDiskBytes, self.max_room_disk_bytes),
             (LeaseTimeout, self.lease_timeout_secs),
             (DormantAfter, self.dormant_after_secs),
+            (ForgetDormantAfter, self.forget_dormant_after_secs),
             (SnapshotDemandTtl, self.snapshot_demand_ttl_secs),
             (IdleTimeout, self.idle_timeout_secs),
         ]
@@ -240,6 +251,7 @@ pub(crate) enum PolicySetting {
     MaxRoomDiskBytes,
     LeaseTimeout,
     DormantAfter,
+    ForgetDormantAfter,
     SnapshotDemandTtl,
     IdleTimeout,
 }
@@ -257,6 +269,7 @@ impl PolicySetting {
             Self::MaxRoomDiskBytes => "max_room_disk_bytes",
             Self::LeaseTimeout => "lease_timeout_secs",
             Self::DormantAfter => "dormant_after_secs",
+            Self::ForgetDormantAfter => "forget_dormant_after_secs",
             Self::SnapshotDemandTtl => "snapshot_demand_ttl_secs",
             Self::IdleTimeout => "idle_timeout_secs",
         }
@@ -274,6 +287,7 @@ impl PolicySetting {
             Self::MaxRoomDiskBytes => "ZEMDB_ROOM_MAX_DISK_BYTES",
             Self::LeaseTimeout => "ZEMDB_LEASE_TIMEOUT_SECS",
             Self::DormantAfter => "ZEMDB_DORMANT_AFTER_SECS",
+            Self::ForgetDormantAfter => "ZEMDB_FORGET_DORMANT_AFTER_SECS",
             Self::SnapshotDemandTtl => "ZEMDB_SNAPSHOT_DEMAND_TTL_SECS",
             Self::IdleTimeout => "ZEMDB_ROOM_IDLE_TIMEOUT_SECS",
         }
@@ -289,7 +303,9 @@ impl PolicySetting {
         match self {
             Self::RamMaxOps => (1, MAX_RAM_MAX_OPS),
             Self::RamMaxBytes | Self::SegmentMaxBytes => (MIN_LOG_BYTES_LIMIT, MAX_LOG_BYTES_LIMIT),
-            Self::RamTtl | Self::LeaseTimeout | Self::DormantAfter => (1, MAX_POLICY_DURATION_SECS),
+            Self::RamTtl | Self::LeaseTimeout | Self::DormantAfter | Self::ForgetDormantAfter => {
+                (1, MAX_POLICY_DURATION_SECS)
+            }
             Self::WarmDiskTtl | Self::ColdDiskTtl | Self::IdleTimeout => {
                 (0, MAX_POLICY_DURATION_SECS)
             }
@@ -324,6 +340,7 @@ struct PolicyJson {
     max_room_disk_bytes: u64,
     lease_timeout_secs: u64,
     dormant_after_secs: Option<u64>,
+    forget_dormant_after_secs: u64,
     snapshot_demand_ttl_secs: u64,
     idle_timeout_secs: u64,
 }
@@ -346,6 +363,7 @@ impl From<RoomLifecyclePolicy> for PolicyJson {
             max_room_disk_bytes: policy.max_room_disk_bytes,
             lease_timeout_secs: ceil_secs(policy.lease_timeout),
             dormant_after_secs: policy.dormant_after.map(ceil_secs),
+            forget_dormant_after_secs: ceil_secs(policy.forget_dormant_after),
             snapshot_demand_ttl_secs: ceil_secs(policy.snapshot_demand_ttl),
             idle_timeout_secs: policy.idle_timeout.map_or(0, ceil_secs),
         }
@@ -365,6 +383,7 @@ impl From<PolicyJson> for RoomLifecyclePolicy {
             max_room_disk_bytes: json.max_room_disk_bytes,
             lease_timeout: secs(json.lease_timeout_secs),
             dormant_after: json.dormant_after_secs.map(secs),
+            forget_dormant_after: secs(json.forget_dormant_after_secs),
             snapshot_demand_ttl: secs(json.snapshot_demand_ttl_secs),
             idle_timeout: (json.idle_timeout_secs > 0).then(|| secs(json.idle_timeout_secs)),
         }

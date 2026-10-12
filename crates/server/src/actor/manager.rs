@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::future::Future;
@@ -36,6 +37,9 @@ const ACTOR_EXIT_WAIT: Duration = Duration::from_secs(1);
 
 /// How many times a request is sent to a room whose mailbox closed before taking it.
 const MAX_SEND_ATTEMPTS: usize = 3;
+
+/// How many rooms `shutdown_all` closes at once.
+const SHUTDOWN_CONCURRENCY: usize = 64;
 
 /// Persistent room configuration (`meta_room.json`): the room's schema and the lifecycle
 /// settings in which it differs from the server defaults.
@@ -139,8 +143,10 @@ pub struct RoomManager {
     /// Room actors from their spawn until their task finishes. The task of a stopped actor
     /// removes its own slot, so stopped rooms leave nothing behind.
     rooms: Arc<DashMap<RoomId, RoomSlot>>,
-    /// Cached `meta_room.json` of the rooms seen by this manager.
-    room_meta: DashMap<RoomId, RoomMetadata>,
+    /// Cached `meta_room.json` of the rooms whose actor is running or being spawned. An
+    /// entry is added before the actor reads its schema, so schema reloads never miss it,
+    /// and removed when the actor ends or fails to spawn.
+    room_meta: Arc<DashMap<RoomId, RoomMetadata>>,
     spawn_locks: DashMap<RoomId, Arc<Mutex<()>>>,
     next_actor_id: AtomicU64,
     config: Arc<ServerConfig>,
@@ -165,7 +171,7 @@ impl RoomManager {
         let default_policy = config.default_lifecycle_policy();
         Self {
             rooms: Arc::new(DashMap::new()),
-            room_meta: DashMap::new(),
+            room_meta: Arc::new(DashMap::new()),
             spawn_locks: DashMap::new(),
             next_actor_id: AtomicU64::new(0),
             config,
@@ -263,6 +269,9 @@ impl RoomManager {
 
             // 6. Spawn RoomActor with its effective policy
             self.spawn_actor(room_id, &meta, schema)
+        })
+        .inspect_err(|_| {
+            self.room_meta.remove(room_id);
         })?;
         info!(room = %room_id, "RoomActor lazily initialized and registered in RoomManager");
         Ok(slot)
@@ -313,13 +322,7 @@ impl RoomManager {
         room_id: &RoomId,
         schema_id: Option<&SchemaId>,
     ) -> Result<RoomMetadata, ServerError> {
-        let room_dir = self.room_dir(room_id);
-        let meta_room_path = room_dir.join(META_ROOM_FILE);
-        let known = match self.room_meta.get(room_id).map(|meta| meta.clone()) {
-            Some(meta) => Some(meta),
-            None if meta_room_path.exists() => Some(read_room_metadata(&meta_room_path)?),
-            None => None,
-        };
+        let known = self.stored_metadata(room_id)?;
         let meta = match (schema_id, known) {
             (Some(schema_id), known) => {
                 let meta = RoomMetadata {
@@ -327,7 +330,7 @@ impl RoomManager {
                     schema_id: schema_id.clone(),
                     lifecycle: known.map(|meta| meta.lifecycle).unwrap_or_default(),
                 };
-                write_room_metadata(&room_dir, &meta)?;
+                write_room_metadata(&self.room_dir(room_id), &meta)?;
                 meta
             }
             (None, Some(meta)) => meta,
@@ -340,6 +343,15 @@ impl RoomManager {
         };
         self.room_meta.insert(room_id.clone(), meta.clone());
         Ok(meta)
+    }
+
+    /// The metadata of `room_id`, cached or read from its `meta_room.json`, if it has any.
+    fn stored_metadata(&self, room_id: &RoomId) -> Result<Option<RoomMetadata>, ServerError> {
+        if let Some(meta) = self.room_meta.get(room_id) {
+            return Ok(Some(meta.clone()));
+        }
+        let path = self.room_dir(room_id).join(META_ROOM_FILE);
+        path.exists().then(|| read_room_metadata(&path)).transpose()
     }
 
     /// Opens the room with its effective lifecycle policy (the server defaults overlaid with
@@ -373,10 +385,13 @@ impl RoomManager {
         };
         self.rooms.insert(room_id.clone(), slot.clone());
 
-        let rooms = Arc::clone(&self.rooms);
+        let (rooms, room_meta) = (Arc::clone(&self.rooms), Arc::clone(&self.room_meta));
         let room_id = room_id.clone();
         tokio::spawn(async move {
             let exit = actor.run().await;
+            // Before the exit is reported: a respawn waits for it, under the spawn lock, before
+            // adding the room's metadata again. Taking the spawn lock here would deadlock.
+            room_meta.remove(&room_id);
             rooms.remove_if(&room_id, |_, slot| slot.actor_id == actor_id);
             exit_tx.send_replace(Some(exit));
         });
@@ -389,17 +404,19 @@ impl RoomManager {
 
     /// Fast check if a room exists in memory or on disk.
     pub fn room_exists(&self, room_id: &RoomId) -> bool {
-        if self.rooms.contains_key(room_id) || self.room_meta.contains_key(room_id) {
-            return true;
-        }
-        self.room_dir(room_id).join(META_ROOM_FILE).exists()
+        self.rooms.contains_key(room_id) || self.room_dir(room_id).join(META_ROOM_FILE).exists()
     }
 
-    /// The lifecycle overrides of a room this manager has opened or created.
-    pub fn lifecycle_overrides(&self, room_id: &RoomId) -> Option<RoomLifecycleOverrides> {
-        self.room_meta
-            .get(room_id)
-            .map(|meta| meta.lifecycle.clone())
+    /// The lifecycle overrides of a room, cached or read from its `meta_room.json`, under the
+    /// spawn lock that every writer of that file holds.
+    pub async fn lifecycle_overrides(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<RoomLifecycleOverrides, ServerError> {
+        let _guard = self.lock_room(room_id).await;
+        blocking_io(|| self.stored_metadata(room_id))?
+            .map(|meta| meta.lifecycle)
+            .ok_or_else(|| ServerError::RoomNotFound(room_id.to_string()))
     }
 
     /// Gets an existing active sender for the room, if running.
@@ -425,12 +442,15 @@ impl RoomManager {
         true
     }
 
-    /// Gracefully shuts down all active room actors, awaiting task terminations.
+    /// Gracefully shuts down all active room actors, up to [`SHUTDOWN_CONCURRENCY`] at once,
+    /// awaiting task terminations.
     pub async fn shutdown_all(&self) {
         let room_ids: Vec<RoomId> = self.rooms.iter().map(|kv| kv.key().clone()).collect();
-        for id in room_ids {
-            self.shutdown_room(&id).await;
-        }
+        futures::stream::iter(room_ids)
+            .for_each_concurrent(SHUTDOWN_CONCURRENCY, |id| async move {
+                self.shutdown_room(&id).await;
+            })
+            .await;
     }
 
     /// Returns a list of all currently active RoomIds.
@@ -485,7 +505,9 @@ impl RoomManager {
             .schema_registry
             .get_schema(&meta.schema_id)
             .unwrap_or(schema);
-        blocking_io(|| self.spawn_actor(&room_id, &meta, schema))?;
+        blocking_io(|| self.spawn_actor(&room_id, &meta, schema)).inspect_err(|_| {
+            self.room_meta.remove(&room_id);
+        })?;
         Ok(meta)
     }
 
