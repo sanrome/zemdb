@@ -9,7 +9,6 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::Path;
 use zemdb_core::id::SequenceNumber;
-use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::protocol::wal_frame::{
     decode_batch_payload, parse_batch_header, BatchPayloadDecode, BATCH_HEADER_SIZE,
 };
@@ -120,31 +119,6 @@ impl ColdDiskLog {
         tokio::task::spawn_blocking(move || Self::compress_warm_segment_sync(&warm, &cold))
             .await
             .map_err(|e| ServerError::Internal(format!("Spawn blocking task failed: {}", e)))?
-    }
-
-    /// Reads operations within `(from_seq .. ]` up to `limit` from a compressed `.wal.zst` file.
-    pub fn read_range(
-        cold_path: &Path,
-        from_seq: SequenceNumber,
-        limit: usize,
-    ) -> Result<Vec<SequencedOperation>, ServerError> {
-        Self::read_range_with_mutations(cold_path, from_seq, limit).map(|(ops, _)| ops)
-    }
-
-    /// Reads operations and associated mutation IDs within `(from_seq .. ]` up to `limit` from
-    /// a compressed `.wal.zst` file. A missing file yields nothing; the caller detects the gap
-    /// it leaves.
-    pub fn read_range_with_mutations(
-        cold_path: &Path,
-        from_seq: SequenceNumber,
-        limit: usize,
-    ) -> Result<RecoveredLogData, ServerError> {
-        let start_seq = cold_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| parse_segment_filename(name, ".wal.zst"))
-            .map(|(start, _)| SequenceNumber::new(start));
-        read_cold_file(cold_path, start_seq, from_seq, &mut ReadBudget::ops(limit))
     }
 }
 

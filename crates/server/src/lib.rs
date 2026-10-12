@@ -2,11 +2,11 @@ pub mod actor;
 pub mod api;
 mod blocking;
 pub mod config;
-pub mod dedup;
+mod dedup;
 mod durable;
 pub mod error;
 mod fail_point;
-pub mod log;
+mod log;
 pub mod relay;
 pub mod schema_registry;
 
@@ -21,11 +21,7 @@ pub use api::{
     SHUTDOWN_GRACE_PERIOD,
 };
 pub use config::ServerConfig;
-pub use dedup::DedupLruCache;
 pub use error::ServerError;
-pub use log::{
-    AppendOutcome, MaintenanceReport, PruneReport, RoomLifecycleOverrides, RoomLifecyclePolicy,
-    TieredLog, WarmDiskLog,
-};
+pub use log::{RoomLifecycleOverrides, RoomLifecyclePolicy};
 pub use relay::SnapshotRelay;
 pub use schema_registry::SchemaRegistry;

@@ -46,13 +46,9 @@ impl DedupLruCache {
     }
 
     /// Returns the number of mutations currently cached.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.cache.len()
-    }
-
-    /// Returns true if the cache contains no entries.
-    pub fn is_empty(&self) -> bool {
-        self.cache.is_empty()
     }
 
     /// Returns the number of mutations the cache holds at most (at least one).
@@ -60,3 +56,7 @@ impl DedupLruCache {
         self.capacity
     }
 }
+
+#[cfg(test)]
+#[path = "tests/dedup.rs"]
+mod tests;

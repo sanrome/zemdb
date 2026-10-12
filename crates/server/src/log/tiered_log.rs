@@ -128,6 +128,7 @@ pub struct TieredLog {
 impl TieredLog {
     /// Opens an existing room delta log or creates a new one, running recovery and cache
     /// rehydration, and returns every mutation ID still in the log, oldest first.
+    #[cfg(test)]
     pub fn open_or_create(
         dir: impl AsRef<Path>,
         policy: RoomLifecyclePolicy,
@@ -358,7 +359,14 @@ impl TieredLog {
     /// A failed compression does not stop the other passes: the remaining segments are still
     /// compressed and the TTL and quota still apply. The first error is returned at the end.
     pub async fn run_maintenance(&mut self) -> Result<MaintenanceReport, ServerError> {
-        let clock = MaintenanceClock::now();
+        self.run_maintenance_at(MaintenanceClock::now()).await
+    }
+
+    /// [`run_maintenance`](Self::run_maintenance) at the time `clock`.
+    async fn run_maintenance_at(
+        &mut self,
+        clock: MaintenanceClock,
+    ) -> Result<MaintenanceReport, ServerError> {
         let mut report = MaintenanceReport::default();
         let mut first_error = None;
 
@@ -378,33 +386,22 @@ impl TieredLog {
         Ok(report)
     }
 
-    /// Synchronous variant of `run_maintenance` for synchronous callers and tests.
-    pub fn run_maintenance_sync(&mut self) -> Result<MaintenanceReport, ServerError> {
+    /// [`run_maintenance`](Self::run_maintenance) for tests without a runtime.
+    #[cfg(test)]
+    fn run_maintenance_sync(&mut self) -> Result<MaintenanceReport, ServerError> {
         self.run_maintenance_sync_at(MaintenanceClock::now())
     }
 
-    /// [`run_maintenance_sync`](Self::run_maintenance_sync) at the time `clock`.
-    pub(crate) fn run_maintenance_sync_at(
+    /// [`run_maintenance_at`](Self::run_maintenance_at) on a runtime of its own, for tests
+    /// without one.
+    #[cfg(test)]
+    fn run_maintenance_sync_at(
         &mut self,
         clock: MaintenanceClock,
     ) -> Result<MaintenanceReport, ServerError> {
-        blocking_io(|| {
-            let mut report = MaintenanceReport::default();
-            let mut first_error = None;
-            for segment in self.warm_segments_due(clock.wall) {
-                let cold_path =
-                    cold_segment_path(&self.segments_dir, segment.start_seq, segment.end_seq);
-                let result = ColdDiskLog::compress_warm_segment_sync(&segment.path, &cold_path);
-                if let Err(err) =
-                    self.record_compression(segment, cold_path, result, clock, &mut report)
-                {
-                    first_error.get_or_insert(err);
-                }
-            }
-            let expired = self.expire(clock, &mut report);
-            first_error.map_or(expired, Err)?;
-            Ok(report)
-        })
+        tokio::runtime::Builder::new_current_thread()
+            .build()?
+            .block_on(self.run_maintenance_at(clock))
     }
 
     /// Updates the index after compressing the warm `segment` into `cold_path`. Whenever the
@@ -597,6 +594,7 @@ impl TieredLog {
     }
 
     /// Force rotates the active Warm segment immediately without evicting the RAM HotBuffer.
+    #[cfg(test)]
     pub fn force_rotate_warm(&mut self) -> Result<Option<PathBuf>, ServerError> {
         blocking_io(|| self.seal_active_segment())
     }

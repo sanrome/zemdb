@@ -1,7 +1,5 @@
-//! Memory and eviction of the deduplication cache.
-
+use super::*;
 use zemdb_core::id::{MutationId, SequenceNumber};
-use zemdb_server::dedup::DedupLruCache;
 
 fn id(n: u128) -> MutationId {
     MutationId::from_u128(n)

@@ -101,9 +101,10 @@ impl Default for RoomLifecyclePolicy {
 }
 
 impl RoomLifecyclePolicy {
-    /// Preset policy with aggressive thresholds designed for rapid unit/integration testing.
-    /// Rooms using it never shut down for inactivity.
-    pub fn test_policy() -> Self {
+    /// Preset policy with aggressive thresholds for fast tests. Rooms using it never shut down
+    /// for inactivity.
+    #[cfg(test)]
+    pub(crate) fn test_policy() -> Self {
         Self {
             ram_max_ops: 5,
             ram_ttl: Duration::from_millis(50),

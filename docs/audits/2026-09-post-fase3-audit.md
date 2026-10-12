@@ -75,7 +75,7 @@ El proceso de auditoría se ejecutó a lo largo de 3 iteraciones independientes 
 ├──────┼──────────┼──────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────┤
 │ M-01 │ Medio    │ crates/core/src/mutation/squash.rs   │ [RESUELTO] LWW estricto en squashing (descarte de updates viejos) y purge Insert+Delete │
 │ M-02 │ Medio    │ crates/server/src/actor/room.rs      │ [RESUELTO] Reintentos idempotentes de Commit devuelven catchup_ops con mutación propia. │
-│ M-03 │ Medio    │ crates/core/src/protocol/codec.rs    │ [RESUELTO] Header canónico 4B con magic bytes RM, versión 0x01 y discriminante en codec │
+│ M-03 │ Medio    │ crates/core/src/protocol/codec.rs    │ [RESUELTO] Header canónico 4B con magic bytes ZM, versión 0x01 y discriminante en codec │
 │ M-04 │ Medio    │ crates/server/src/api/auth.rs        │ [RESUELTO] Comparación de firmas en tiempo variable con subtle::ConstantTimeEq.         │
 │ M-05 │ Medio    │ crates/server/src/api/auth.rs        │ [RESUELTO] Backdoor dev-token cableado eliminado de código de autenticación.            │
 │ M-06 │ Medio    │ crates/server/src/api/control_plane  │ [RESUELTO] Emisión SSE de RoomEvent::SchemaReloaded ante migraciones DDL add_column.   │

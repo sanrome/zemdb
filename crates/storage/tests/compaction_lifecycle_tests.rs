@@ -134,23 +134,28 @@ async fn test_disk_concurrent_readers_and_writers() {
     let schema = test_schema();
 
     engine.open_room(&room_id, schema).await.unwrap();
+    let batch = |i: i64| {
+        let row = CompactRow::new(vec![
+            Value::Int(i),
+            Value::String(format!("Concurrent User {i}").into()),
+            Value::Int(i * 10),
+            Value::Bool(true),
+        ]);
+        let op = Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 100);
+        vec![SequencedOperation::with_default_origin(i as u64, op)]
+    };
+    // Row 1 exists before the readers start, so every read must find it.
+    engine.apply_batch(&room_id, batch(1)).await.unwrap();
 
     // Writer task
     let engine_writer = Arc::clone(&engine);
     let r_writer = room_id.clone();
     let writer_handle = tokio::spawn(async move {
-        for i in 1..=15i64 {
-            let row = CompactRow::new(vec![
-                Value::Int(i),
-                Value::String(format!("Concurrent User {i}").into()),
-                Value::Int(i * 10),
-                Value::Bool(true),
-            ]);
-            let ops = vec![SequencedOperation::with_default_origin(
-                i as u64,
-                Operation::insert(USERS_TABLE, PrimaryKey::single(i), row, 100),
-            )];
-            engine_writer.apply_batch(&r_writer, ops).await.unwrap();
+        for i in 2..=15i64 {
+            engine_writer
+                .apply_batch(&r_writer, batch(i))
+                .await
+                .unwrap();
             tokio::task::yield_now().await;
         }
     });
@@ -159,21 +164,19 @@ async fn test_disk_concurrent_readers_and_writers() {
     let engine_reader = Arc::clone(&engine);
     let r_reader = room_id.clone();
     let reader_handle = tokio::spawn(async move {
-        let mut successful_reads = 0;
         for _ in 0..15 {
-            if let Ok(Some(_)) = engine_reader
+            let row = engine_reader
                 .get(&r_reader, "users", &PrimaryKey::single(1i64))
                 .await
-            {
-                successful_reads += 1;
-            }
+                .unwrap()
+                .expect("row 1 is committed before the readers start");
+            assert_eq!(row[1], Value::String("Concurrent User 1".into()));
             tokio::task::yield_now().await;
         }
-        successful_reads
     });
 
     writer_handle.await.unwrap();
-    let _ = reader_handle.await.unwrap();
+    reader_handle.await.unwrap();
 
     assert_eq!(
         engine.get_head_seq(&room_id).await.unwrap(),

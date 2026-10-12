@@ -38,6 +38,7 @@ pub struct WarmDiskLog {
 
 impl WarmDiskLog {
     /// Opens or creates the Warm Disk directory.
+    #[cfg(test)]
     pub fn open_or_create(segments_dir: impl AsRef<Path>) -> Result<Self, ServerError> {
         Self::open_recovering(segments_dir).map(|(log, _)| log)
     }
@@ -205,31 +206,6 @@ impl WarmDiskLog {
         // Appends are synced and recovery truncates a torn tail, so a torn write here means
         // the file was damaged while the room was open.
         Ok(finish_file_read(read, reader.get_mut(), self.active_len, &path)?.0)
-    }
-
-    /// Reads operations within `(from_seq .. ]` up to `limit` from a specific sealed `.wal` file.
-    pub fn read_range(
-        file_path: &Path,
-        from_seq: SequenceNumber,
-        limit: usize,
-    ) -> Result<Vec<SequencedOperation>, ServerError> {
-        Self::read_range_with_mutations(file_path, from_seq, limit).map(|(ops, _)| ops)
-    }
-
-    /// Reads operations and associated mutation IDs within `(from_seq .. ]` up to `limit` from
-    /// a specific sealed `.wal` file. A missing file yields nothing; the caller detects the
-    /// gap it leaves.
-    pub fn read_range_with_mutations(
-        file_path: &Path,
-        from_seq: SequenceNumber,
-        limit: usize,
-    ) -> Result<RecoveredLogData, ServerError> {
-        let start_seq = file_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| parse_segment_filename(name, ".wal"))
-            .map(|(start, _)| SequenceNumber::new(start));
-        read_segment_file(file_path, start_seq, from_seq, &mut ReadBudget::ops(limit))
     }
 
     /// Inspects and repairs `active.wal` upon opening, reading it through the locked handle

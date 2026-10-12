@@ -9,9 +9,5 @@ pub(crate) mod segment_reader;
 pub mod tiered_log;
 pub mod warm_disk;
 
-pub use budget::ReadBudget;
-pub use cold_disk::{ColdDiskLog, CompressedSegment};
-pub use hot_buffer::HotBuffer;
 pub use policy::{RoomLifecycleOverrides, RoomLifecyclePolicy};
-pub use tiered_log::{AppendOutcome, MaintenanceReport, PruneReport, TieredLog};
-pub use warm_disk::WarmDiskLog;
+pub use tiered_log::TieredLog;

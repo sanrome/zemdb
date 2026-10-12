@@ -128,9 +128,10 @@ fn damaged_length_in_the_middle_is_corruption_and_leaves_the_segment_intact() {
             .path()
             .join("segment_0000000000000001_0000000000000003.wal");
         std::fs::write(&sealed, &wal).unwrap();
+        let mut all = ReadBudget::ops(usize::MAX);
         assert!(
             matches!(
-                WarmDiskLog::read_range(&sealed, SequenceNumber::new(0), usize::MAX),
+                read_segment_file(&sealed, Some(1.into()), 0.into(), &mut all),
                 Err(ServerError::WalCorruption(_))
             ),
             "{name}"
@@ -167,4 +168,90 @@ fn zeroed_header_followed_by_a_valid_frame_is_corruption() {
 
     assert!(matches!(result, Err(ServerError::WalCorruption(_))));
     assert_eq!(std::fs::read(&active).unwrap(), wal);
+}
+
+#[test]
+fn test_multi_process_file_lock_collision_on_active_wal() {
+    let dir = tempdir().unwrap();
+    let mut log1 = WarmDiskLog::open_or_create(dir.path()).unwrap();
+
+    let pk = PrimaryKey::single(Value::Int(1));
+    let op = Operation::delete(1, pk, 1000);
+    let seq_op = SequencedOperation::new(SequenceNumber::new(1), op);
+
+    // Appending a record acquires and retains exclusive flock on active.wal
+    log1.append_record(&seq_op, None).unwrap();
+
+    // Opening a second WarmDiskLog instance against the same directory must fail with RoomLocked
+    let log2_res = WarmDiskLog::open_or_create(dir.path());
+    match log2_res {
+        Err(ServerError::RoomLocked(msg)) => {
+            assert!(
+                msg.contains("active.wal locked by another process"),
+                "Expected RoomLocked error message, got: {}",
+                msg
+            );
+        }
+        Ok(_) => panic!("Expected RoomLocked error, but second open succeeded"),
+        Err(other) => panic!("Expected RoomLocked error, got: {:?}", other),
+    }
+}
+
+#[test]
+fn test_multi_thread_warm_disk_log_flock_concurrency_stress() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+
+    // 1. Initial log opens and appends a record, acquiring and holding kernel flock on active.wal
+    let mut initial_log = WarmDiskLog::open_or_create(&path).unwrap();
+    let pk0 = PrimaryKey::single(Value::Int(0));
+    let op0 = Operation::delete(1, pk0, 100);
+    let seq_op0 = SequencedOperation::new(SequenceNumber::new(1), op0);
+    initial_log.append_record(&seq_op0, None).unwrap();
+
+    // 2. Spawn 12 concurrent threads contending to open_or_create against the locked directory
+    const NUM_THREADS: usize = 12;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(NUM_THREADS));
+    let mut handles = Vec::new();
+
+    for _ in 0..NUM_THREADS {
+        let b = std::sync::Arc::clone(&barrier);
+        let p = path.clone();
+
+        handles.push(std::thread::spawn(move || {
+            b.wait();
+            WarmDiskLog::open_or_create(&p)
+        }));
+    }
+
+    let mut locked_errors = 0;
+    for handle in handles {
+        let res = handle.join().unwrap();
+        match res {
+            Err(ServerError::RoomLocked(msg)) => {
+                assert!(msg.contains("active.wal locked by another process"));
+                locked_errors += 1;
+            }
+            Ok(_) => {
+                panic!("Concurrent open_or_create must not succeed while active.wal is locked")
+            }
+            Err(other) => panic!("Expected RoomLocked, got: {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        locked_errors, NUM_THREADS,
+        "All 12 concurrent threads must be rejected with RoomLocked"
+    );
+
+    // 3. Drop initial_log, releasing the kernel flock
+    drop(initial_log);
+
+    // 4. Now a subsequent instance can successfully acquire the lock and append records
+    let mut next_log = WarmDiskLog::open_or_create(&path).unwrap();
+    let pk = PrimaryKey::single(Value::Int(99));
+    let op = Operation::delete(1, pk, 9999);
+    let seq_op = SequencedOperation::new(SequenceNumber::new(2), op);
+    next_log.append_record(&seq_op, None).unwrap();
+    assert_eq!(next_log.active_end_seq().unwrap().get(), 2);
 }

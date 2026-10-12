@@ -180,16 +180,19 @@ impl HotBuffer {
     }
 
     /// Number of operations currently resident in the buffer.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// Encoded size of the operations currently resident in the buffer.
+    #[cfg(test)]
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
 
     /// Returns true if the buffer has no operations.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -200,7 +203,12 @@ impl HotBuffer {
     }
 
     /// Highest sequence number currently present in the buffer.
+    #[cfg(test)]
     pub fn max_seq(&self) -> Option<SequenceNumber> {
         self.max_seq
     }
 }
+
+#[cfg(test)]
+#[path = "tests/hot_buffer.rs"]
+mod tests;

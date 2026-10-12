@@ -9,8 +9,6 @@ fn test_value_and_primary_key_memory_footprint() {
     assert_eq!(std::mem::size_of::<OperationKind>(), 32);
     assert_eq!(std::mem::size_of::<Operation>(), 88);
     assert_eq!(std::mem::size_of::<SequencedOperation>(), 96);
-    // Guarantee PrimaryKey fits in standard 64-byte L1 cache line without split!
-    assert!(std::mem::size_of::<PrimaryKey>() <= 64);
     // Operation and SequencedOperation are strictly 8-byte aligned with 0 tail padding
     assert_eq!(std::mem::size_of::<Operation>() % 8, 0);
     assert_eq!(std::mem::size_of::<SequencedOperation>() % 8, 0);

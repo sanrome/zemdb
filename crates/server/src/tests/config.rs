@@ -1,5 +1,6 @@
 use super::*;
 use crate::log::policy::MAX_POLICY_DURATION_SECS;
+use std::time::Duration;
 
 fn config_with(auth: &str, admin: &str) -> ServerConfig {
     ServerConfig {
@@ -59,16 +60,11 @@ fn rejection_does_not_echo_the_secret() {
 }
 
 fn load_with_max_snapshot_bytes(max: u64) -> Result<ServerConfig, ServerError> {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("zemdb.toml");
-    std::fs::write(
-        &path,
-        format!(
-            "auth_secret = \"{STRONG_AUTH}\"\nadmin_secret = \"{STRONG_ADMIN}\"\nmax_snapshot_bytes = {max}\n"
-        ),
-    )
-    .unwrap();
-    ServerConfig::load_with_env(Some(&path))
+    let config = ServerConfig::from_toml_str(&format!(
+        "auth_secret = \"{STRONG_AUTH}\"\nadmin_secret = \"{STRONG_ADMIN}\"\nmax_snapshot_bytes = {max}\n"
+    ))?;
+    config.validate()?;
+    Ok(config)
 }
 
 #[test]
@@ -368,4 +364,55 @@ fn http_limits_outside_their_range_fail_naming_the_variable() {
             "{name}={value:?}: {err:?}"
         );
     }
+}
+
+#[test]
+fn test_server_config_toml_and_env_overrides() {
+    let toml_str = r#"
+        host = "0.0.0.0"
+        port = 9000
+        data_dir = "/var/zemdb"
+        auth_secret = "custom_cluster_secret_123456789!"
+        admin_secret = "custom_admin_secret_1234567890!"
+        lease_timeout_secs = 120
+        dedup_lru_capacity = 25000
+        snapshot_ttl_secs = 300
+    "#;
+
+    let mut config = ServerConfig::from_toml_str(toml_str).unwrap();
+    assert_eq!(config.host, "0.0.0.0");
+    assert_eq!(config.port, 9000);
+    assert_eq!(config.data_dir.to_str().unwrap(), "/var/zemdb");
+    assert_eq!(config.lease_timeout_secs, 120);
+    assert_eq!(config.dedup_lru_capacity, 25000);
+    assert_eq!(config.snapshot_ttl_secs, 300);
+    assert_eq!(config.max_snapshot_bytes, 512 * 1024 * 1024);
+
+    let vars = std::collections::HashMap::from([
+        ("ZEMDB_PORT", "9999"),
+        ("ZEMDB_HOST", "192.168.1.50"),
+        ("ZEMDB_SNAPSHOT_TTL_SECS", "1800"),
+        ("ZEMDB_MAX_SNAPSHOT_BYTES", "1048576"),
+        ("ZEMDB_DORMANT_AFTER_SECS", "7200"),
+        ("ZEMDB_SNAPSHOT_DEMAND_TTL_SECS", "3600"),
+        ("ZEMDB_RAM_MAX_OPS", "250"),
+        ("ZEMDB_ROOM_IDLE_TIMEOUT_SECS", "0"),
+    ]);
+    config
+        .apply_overrides_from(|name| Ok(vars.get(name).map(|value| value.to_string())))
+        .unwrap();
+
+    assert_eq!(config.port, 9999);
+    assert_eq!(config.host, "192.168.1.50");
+    assert_eq!(config.snapshot_ttl_secs, 1800);
+    assert_eq!(config.max_snapshot_bytes, 1024 * 1024);
+    assert_eq!(config.dormant_after_secs, Some(7200));
+    assert_eq!(config.snapshot_demand_ttl_secs, 3600);
+    assert_eq!(config.ram_max_ops, 250);
+    assert_eq!(config.idle_timeout_secs, 0);
+    let policy = config.default_lifecycle_policy();
+    assert_eq!(policy.ram_max_ops, 250);
+    assert_eq!(policy.lease_timeout, Duration::from_secs(120));
+    assert_eq!(policy.dormant_after, Some(Duration::from_secs(7200)));
+    assert_eq!(policy.idle_timeout, None);
 }

@@ -3,6 +3,7 @@ use crate::fail_point;
 use crate::log::warm_disk::WarmDiskLog;
 use tempfile::tempdir;
 use zemdb_core::mutation::Operation;
+use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::value::{PrimaryKey, Value};
 
 fn sealed_segment(dir: &Path) -> std::path::PathBuf {
@@ -59,7 +60,8 @@ fn compression_replaces_warm_segment() {
     ColdDiskLog::compress_warm_segment_sync(&warm, &cold).unwrap();
 
     assert!(!warm.exists());
-    let ops = ColdDiskLog::read_range(&cold, SequenceNumber::new(0), usize::MAX).unwrap();
+    let mut all = ReadBudget::ops(usize::MAX);
+    let (ops, _) = read_cold_file(&cold, Some(1.into()), 0.into(), &mut all).unwrap();
     assert_eq!(ops.len(), 3);
 }
 

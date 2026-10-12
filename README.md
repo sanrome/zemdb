@@ -10,13 +10,13 @@ It is designed for small-to-medium collaborative groups (2 to 50 clients per roo
 
 | Phase | Status | Key Capabilities |
 | :--- | :---: | :--- |
-| **Phase 1: Domain & Core** | ✅ **Completed** | Pure Zero I/O domain models, Newtypes, positional `CompactRow` tuples, 24-byte `Value`, 40-byte `PrimaryKey` (L1 cache-line aligned), schema validations, and size-bounded binary protocol. |
+| **Phase 1: Domain & Core** | ✅ **Completed** | Pure Zero I/O domain models, Newtypes, positional `CompactRow` tuples, 24-byte `Value`, 40-byte `PrimaryKey`, schema validations, and size-bounded binary protocol. |
 | **Phase 2: Storage Engine** | ✅ **Completed** | Asynchronous `StorageEngine` contract, multi-threaded in-memory room isolation, native on-disk Dual-File format (`.snap` + `.wal`), CRC32 checksums, and Zstandard-compressed snapshots. |
 | **Phase 2.5 & 2.8: Hardening & Core/Storage Contracts** | ✅ **Completed** | Linear $O(M+N)$ column delta merge, POSIX directory sync (`sync_dir`), physical batch framing in core (`0xBA7C`), Dual-File architecture with in-place WAL truncation, atomic flock pre-rename, non-blocking chunked cursor scans, 1-RTT Commit & Catch-Up protocol, external integration test suites (60 tests passing). |
 | **Phase 3: Coordination Server** | ✅ **Completed** | Tokio room actor model (`RoomActor` with bounded channels), single atomic WAL with Exactly-Once idempotency, 4-tier immutable log (Hot RAM -> Warm Disk -> Cold Disk), and Axum binary HTTP endpoints (HTTP/1.1 and HTTP/2 without TLS, behind a TLS-terminating reverse proxy) with signal-only SSE. |
-| **Phase 3.5: Hardening, Resiliencia y Contratos** | ✅ **Completed** | Framing de wire protocol (`RM`, ver `0x01`), snapshots universales `ZMSN` con CRC32, concurrencia CoW sin bloqueos, Snapshot Isolation, relay multipart con BLAKE3, consultas directas `get_by_id`/`scan_by_id`, validación en almacenamiento, LWW estricto, encapsulación de modelos centrales y desregistro binario `DeregisterAck`. |
+| **Phase 3.5: Hardening, Resiliencia y Contratos** | ✅ **Completed** | Framing de wire protocol (`ZM`, ver `0x01`), snapshots universales `ZMSN` con CRC32, concurrencia CoW sin bloqueos, Snapshot Isolation, relay multipart con BLAKE3, consultas directas `get_by_id`/`scan_by_id`, validación en almacenamiento, LWW estricto, encapsulación de modelos centrales y desregistro binario `DeregisterAck`. |
 | **Phase 4: Client SDK & 1-RTT Sync** | ⏳ **Planned** | Ergonomic public facade (`ZemdbClient` -> `RoomHandle` -> `TableHandle`), server-authoritative 1-RTT commit-and-sync, strictly canonical storage via `zemdb-storage`, dual transport (native Reqwest / browser WebFetch), and real-time live queries (`watch`). Offline draft queue deferred to post-v0.1. |
-| **Phase 5: E2E Verification & Universality** | ⏳ **Planned** | End-to-end integration test suites with network partition simulation, stress testing, and WebAssembly compilation (`wasm32-unknown-unknown`). |
+| **Phase 5: E2E Verification & Universality** | ⏳ **Planned** | End-to-end integration test suites with network partition simulation and stress testing. Core, storage and client already build for WebAssembly (`wasm32-unknown-unknown`) in CI. |
 
 ---
 
@@ -25,11 +25,11 @@ It is designed for small-to-medium collaborative groups (2 to 50 clients per roo
 The repository is organized as a Cargo workspace with clean boundary separation and zero circular dependencies:
 
 ```text
-client-distributed-db/
+zemdb/
 ├── crates/
 │   ├── core/           # [zemdb-core] Pure algebraic domain, schemas, types, squashing, and protocol (Zero I/O, WASM)
 │   ├── storage/        # [zemdb-storage] Tabular storage engine, ZEM1 on-disk format, WAL, and Zstd snapshots
-│   ├── server/         # [zemdb-server] Coordination server, Tokio room actors, micro-WAL, and HTTP API (Phase 3)
+│   ├── server/         # [zemdb-server] Coordination server, Tokio room actors, tiered room log, and HTTP API (Phase 3)
 │   └── client/         # [zemdb-client] Local-First client SDK, reactive synchronization, and dual transport (Phase 4)
 │
 ├── ARCHITECTURE.md     # Living architectural specification: topology, models, protocol, and ADRs
@@ -46,7 +46,7 @@ client-distributed-db/
 ## 🚀 Quickstart & Verification
 
 ### Prerequisites
-* Rust 1.78+ (2021 Edition)
+* Rust 1.85+ to build (2021 Edition); 1.88+ to run the tests, whose dev-dependencies need it
 * Cargo
 
 ### Running the Server
@@ -91,7 +91,7 @@ Each connection takes a file descriptor. Raise the open files limit of the serve
 # Build entire workspace
 cargo build --workspace
 
-# Run all unit, integration, and contract tests (100+ tests passing)
+# Run all unit, integration, and contract tests
 cargo test --workspace
 
 # Verify clippy lints with zero warnings allowed

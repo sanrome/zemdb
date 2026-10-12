@@ -1,9 +1,9 @@
 # ROADMAP.md: Hoja de Ruta de Implementación de ZemDB
 
 **Proyecto:** `ZemDB` (Motor de Base de Datos Distribuida Local-First)  
-**Fecha de Actualización:** 20 de Septiembre de 2026  
-**Documentos Relacionados:** [README.md](file:///Users/Santiago/OtherProjects/client-distributed-db/README.md) | [ARCHITECTURE.md](file:///Users/Santiago/OtherProjects/client-distributed-db/ARCHITECTURE.md) | [Auditoría Fase 2](file:///Users/Santiago/OtherProjects/client-distributed-db/docs/audits/2026-09-fase2-audit.md) | [Propuesta Técnica Fases 2.5, 3 y 4](file:///Users/Santiago/OtherProjects/client-distributed-db/docs/proposals/2026-09-fase2_5-hardening-proposal.md)  
-**Estado:** Hoja de Ruta Oficial de Desarrollo — Fase 1 & 1.5 Completadas / Fases 2 a 5 Planificadas
+**Fecha de Actualización:** 12 de Octubre de 2026  
+**Documentos Relacionados:** [README.md](README.md) | [ARCHITECTURE.md](ARCHITECTURE.md) | [Auditoría Fase 2](docs/audits/2026-09-fase2-audit.md) | [Propuesta Técnica Fases 2.5, 3 y 4](docs/proposals/2026-09-fase2_5-hardening-proposal.md) | [Plan Fase 3.6](docs/proposals/2026-10-fase3_6-remediation-plan.md) | [Plan Fase 3.7](docs/proposals/2026-10-fase3_7-remediation-plan.md)  
+**Estado:** Hoja de Ruta Oficial de Desarrollo — Fases 1 a 3.7 Completadas / Fases 4 y 5 Planificadas
 
 ---
 
@@ -11,10 +11,12 @@
 
 *A continuación se listan únicamente los títulos de los cambios técnicos y estructurales completados y verificados con veredicto unánime de los 4 subagentes:*
 
+*Es un registro cronológico: un cambio posterior puede reemplazar a uno anterior (por ejemplo, el Micro-WAL o el squashing por timestamps). El estado vigente está en [ARCHITECTURE.md](ARCHITECTURE.md).*
+
 * Renombrado global del proyecto y de todos los paquetes a `zemdb` (`zemdb-core`, `zemdb-server`, `zemdb-client`).
 * Eliminación total de asignaciones de cadenas en heap en `Ord for Value` mediante discriminante directo `type_order(&self) -> u8` en $O(1)$.
 * Optimización de `Value` con footprint estricto de 24 bytes en 64 bits mediante boxing de variantes pesadas (`String(Box<str>)` y `Bytes(Box<[u8]>)`), reduciendo el consumo de memoria un 40% en tuplas y celdas y erradicando la doble indirección en el heap.
-* Optimización de `PrimaryKey` en la pila de memoria (*stack*) a **40 bytes** utilizando `SmallVec<[Value; 1]>`, eliminando totalmente el desbordamiento de línea de caché de CPU (*Zero L1 Cache Line Split*, $40\text{B} < 64\text{B}$).
+* Optimización de `PrimaryKey` en la pila de memoria (*stack*) a **40 bytes** utilizando `SmallVec<[Value; 1]>`.
 * Incorporación de variantes de datos fundamentales: `Value::Null`, `Value::Timestamp(i64)` y `Value::Bytes(Box<[u8]>)` (fat pointer 16B sin doble indirección en heap).
 * Preservación del orden físico DDL de declaración en `TableSchema` (`columns: Vec<ColumnDef>`), eliminando el desorden alfabético en `CompactRow` y blindando la compatibilidad binaria en migraciones de esquema.
 * Incorporación de conversiones zero-copy por movimiento en esquemas (`row_into_compact` y `compact_into_row`).
@@ -81,7 +83,7 @@
 * Sincronización POSIX del directorio padre (`sync_dir`) obligatoria y con propagación de errores en la inicialización y compactación de salas, protegiendo las entradas de directorio (*dentries*).
 * Corrección de semántica de Safe Update en `StorageEngine`: se ignoran las mutaciones `Update` sobre claves primarias inexistentes en vez de fabricar tuplas sintéticas con valores nulos que violen restricciones de esquema `nullable: false`.
 * Validación estricta de monotonía de secuencias (`seq == head_seq + 1`) en `StorageEngine::apply_batch` (tanto en `DiskStorageEngine` como en `MemoryStorageEngine`), rechazando brechas con `StorageError::SequenceMismatch` para impedir pérdida silenciosa de registros.
-* Extensión del contrato de mensajes de red con `ClientMessage::RequestSnapshotChunk` y `ServerMessage::SnapshotChunk` y especificación formal en [`ARCHITECTURE.md`](file:///Users/Santiago/OtherProjects/client-distributed-db/ARCHITECTURE.md#multipart-chunked-snapshot-transfer-protocol--16-mb) del protocolo de bootstrapping multipart para bases de datos que superen el límite de 16 MB.
+* Extensión del contrato de mensajes de red con `ClientMessage::RequestSnapshotChunk` y `ServerMessage::SnapshotChunk` y especificación formal en [`ARCHITECTURE.md`](ARCHITECTURE.md#multipart-chunked-snapshot-transfer-protocol--16-mb) del protocolo de bootstrapping multipart para bases de datos que superen el límite de 16 MB.
 * Incorporación de identificador numérico de tabla de 2 bytes (`table_id: u16`) en `TableSchema` y catálogo bidireccional en `Schema` (`tables_by_id: BTreeMap<u16, TableSchema>`, `id_by_name: BTreeMap<String, u16>`) con métodos explícitos y sin ambigüedades: `get_table_by_id`, `get_table_by_name`, `get_table_id`, `has_table_by_id` y `has_table_by_name`.
 * Unificación estructural de operaciones: reemplazo de `TableOperation` (80B) y `Operation` con `Arc<str>` (96B) por una única estructura `Operation` alocada 100% en el stack de **88 bytes exactos** (`table_id: u16`, `timestamp: u64`, `pk: PrimaryKey`, `kind: OperationKind`), erradicando cualquier asignación en el heap para metadatos de tabla en el bucle caliente de mutaciones.
 * Optimización y simplificación de `SequencedOperation` a **96 bytes exactos** (`seq: SequenceNumber`, `op: Operation`), eliminando `client_id` y `mutation_id` del log histórico persistente y reduciendo 24 bytes por operación en RAM y disco (manteniéndose de forma estrictamente efímera en `Commit` / `CommitAck` para idempotencia y correlación 1-RTT).
@@ -101,22 +103,23 @@
 * Fase 3.5-B.1: Aislamiento asíncrono del reactor Tokio y optimización de caché RAM: delegación de compresión Zstd intensiva y tareas de mantenimiento a `tokio::task::spawn_blocking` (`A-01`), inversión de la jerarquía en `fetch_deltas` con Fast Path $O(1)$ en `HotBuffer` antes de consultar disco (`A-12`), e implementación de ventana deslizante continua desacoplada de la rotación física sin evicción destructiva a cero (`A-13`).
 * Fase 3.5-B.2: Concurrencia CoW, tolerancia a caídas en compactador y Snapshot Isolation: rotación de WAL (`wal.compacting`) en 3 fases sin bloquear escritores concurrentes (`A-03`), uso de rutas temporales con UUID previniendo colisiones de truncado (`A-04`), suma de verificación CRC32 sobre payload comprimido en `FileHeader` (`A-05`), y Snapshot Isolation en `StorageEngine::scan` mediante vistas CoW inmutables (`A-09`).
 * Fase 3.5-B.3: Gestión atómica de salas, resiliencia y Snapshot Relay multipart: erradicación de carreras TOCTOU con cerrojos asíncronos por sala en `RoomManager` (`C-09`), autenticación y subida de snapshots multipart por fragmentos (`POST /rooms/:room_id/snapshot/upload-chunk`) con verificación consolidada de hash BLAKE3 superando el límite de 16 MB (`C-10`), reactivación perezosa de salas en endpoints de datos tolerando reinicios del servidor (`A-11`), apagado coordinado con `RoomCommand::Shutdown` y espera de `JoinHandle` en `delete_room` (`A-14`), timeouts perimetrales de 5s en llamadas a actores con HTTP 504 Gateway Timeout (`M-08`), acotación estricta de `max_batch_size` (1..=1000) en `/sync` (`M-09`), y cerrojos exclusivos multi-proceso `flock` sobre `active.wal` (`M-12`).
-* Fase 3.5-C.1: Refactorización Estructural, Contratos y Rendimiento: enmarcado wire canónico con magic bytes `RM` y versión `0x01` (`M-03`), snapshots canónicos universales interoperables `ZMSN` con CRC32 (`A-06`), consultas directas por `table_id: u16` (`get_by_id`, `scan_by_id`) y validación de esquemas en `apply_batch` (`M-13`, `A-08`), encapsulación de `PrimaryKey`, `CompactRow` y `TableSchema` con remoción de `Deref` (`M-15`), causalidad estricta LWW en squashing y anulación mutua `Insert + Delete -> Purged` (`M-01`, `B-02`), emisión SSE de `RoomEvent::SchemaReloaded` ante migraciones DDL (`M-06`), estandarización binaria de `ServerMessage::DeregisterAck` (`B-03`), transición de leases `Disconnected -> Dormant` tras 90s desbloqueando retención (`A-10`), recálculo exacto de `tail_seq` en `tiered_log.rs` (`M-10`), liberación de locks antes de sync en `close_room` (`M-16`), y rechazo HTTP 404 en `GET /admin/rooms/:id` evitando spawn fantasma (`B-04`).
+* Fase 3.5-C.1: Refactorización Estructural, Contratos y Rendimiento: enmarcado wire canónico con magic bytes `ZM` y versión `0x01` (`M-03`), snapshots canónicos universales interoperables `ZMSN` con CRC32 (`A-06`), consultas directas por `table_id: u16` (`get_by_id`, `scan_by_id`) y validación de esquemas en `apply_batch` (`M-13`, `A-08`), encapsulación de `PrimaryKey`, `CompactRow` y `TableSchema` con remoción de `Deref` (`M-15`), causalidad estricta LWW en squashing y anulación mutua `Insert + Delete -> Purged` (`M-01`, `B-02`), emisión SSE de `RoomEvent::SchemaReloaded` ante migraciones DDL (`M-06`), estandarización binaria de `ServerMessage::DeregisterAck` (`B-03`), transición de leases `Disconnected -> Dormant` tras 90s desbloqueando retención (`A-10`), recálculo exacto de `tail_seq` en `tiered_log.rs` (`M-10`), liberación de locks antes de sync en `close_room` (`M-16`), y rechazo HTTP 404 en `GET /admin/rooms/:id` evitando spawn fantasma (`B-04`).
 
 ---
 
 ## 2. Resumen Ejecutivo del Estado del Proyecto
 
 ZemDB ha superado con éxito la **Fase 1 y 1.5 (Reestructuración, Blindaje de Core e Higiene de Workspace)**, la **Fase 2A (Contrato Formal de Persistencia, Pushdown de Queries y Motor en Memoria)**, la **Fase 2B (Motor de Almacenamiento en Disco con WAL y Compresión Zstd)**, la **Fase 3 (Servidor de Coordinación por Actores `zemdb-server`)**, la **Fase 3.5-A (Catchup 1-RTT, Onboarding con Bootstrapping, Autenticación Universal, Persistencia Atómica Unificada y Validaciones Estructurales)**, la **Fase 3.5-B (Aislamiento Asíncrono Tokio, Concurrencia CoW, Snapshot Isolation, Snapshot Relay Multipart)** y la **Fase 3.5-C.1 (Refactorización Estructural, Contratos y Rendimiento)**. El backend del servidor y los crates centrales se encuentran completamente verificados con pruebas unitarias y de integración end-to-end:
-- Se redujo el footprint de memoria de `Value` en un 40% (24 bytes) y `PrimaryKey` a 40 bytes (ajustado a una línea de caché L1 de CPU).
+- Se redujo el footprint de memoria de `Value` en un 40% (24 bytes) y `PrimaryKey` a 40 bytes.
 - Se garantizó la estabilidad binaria de esquemas con orden DDL físico en `TableSchema` y conversiones zero-copy por movimiento.
 - Se cerró la pérdida de datos y anomalías de tuplas zombi en `squash_operations`.
 - Se consolidó el contrato de red con garantías formales de idempotencia y multiplexación.
 - Se mantiene el desacoplamiento estricto de I/O, garantizando que tanto el núcleo como el almacenamiento compilen hacia WebAssembly (`wasm32-unknown-unknown`).
-- Se formalizó en [`ARCHITECTURE.md`](file:///Users/Santiago/OtherProjects/client-distributed-db/ARCHITECTURE.md#10-architectural-decisions-time-ordering--authority) la decisión de diseño de que el **servidor es la única autoridad de ordenamiento global** mediante su `sequence_id` monótono, eliminando la complejidad innecesaria de sincronización de relojes (HLC).
+- Se formalizó en [`ARCHITECTURE.md`](ARCHITECTURE.md#10-architectural-decisions-time-ordering--authority) la decisión de diseño de que el **servidor es la única autoridad de ordenamiento global** mediante su `sequence_id` monótono, eliminando la complejidad innecesaria de sincronización de relojes (HLC).
 - Se implementó `DiskStorageEngine` con persistencia en arquitectura Dual-File (`room_{id}.snap` + `room_{id}.wal`), WAL append-only con CRC32, compactación atómica zstd y tolerancia a fallos.
-- Se implementó el servidor `zemdb-server` con arquitectura de actores Tokio (`RoomManager`, `RoomActor`), log inmutable de 4 niveles (`HotBuffer`, `WarmDiskLog`, `ColdDiskLog`), Micro-WAL y deduplicación LRU.
+- Se implementó el servidor `zemdb-server` con arquitectura de actores Tokio (`RoomManager`, `RoomActor`), log inmutable de 4 niveles (`HotBuffer`, `WarmDiskLog`, `ColdDiskLog`), un único WAL por sala (`active.wal`, que en la Fase 3.5-A.3 reemplazó al Micro-WAL) y deduplicación LRU.
 - Se completó el blindaje criptográfico integral del Data Plane mediante el extractor `ClientAuth`, validación de rutas en 3 vías, tiempo constante y leases activos.
+- Las Fases 3.6 y 3.7 cerraron las auditorías posteriores (ver sus planes en `docs/proposals/`): ciclo de vida de clientes derivado del cursor, política de ciclo de vida por sala, relay de snapshots en disco, borde HTTP con límites propios, header del frame WAL con CRC, log del servidor acotado en bytes, validación de snapshots recibidos y squashing de la outbox por orden de llegada.
 
 El proyecto se encuentra ahora en posición para avanzar a las fases de desacoplamiento CoW e I/O asíncrono y construir la sincronización optimista reactiva en el cliente (Fase 4).
 
@@ -142,7 +145,7 @@ El sistema se estructura en 4 crates con fronteras de responsabilidad estrictas:
 ├────────────────────────────────┼────────────────────────────────────────────────────────┤
 │ 3. `crates/server`             │ Servidor coordinador y secuenciador monótono. Modelo de │
 │    (`zemdb-server`)            │ actores Tokio por sala (*Room*), log inmutable de 4    │
-│    [PENDIENTE - FASE 3]        │ niveles (RAM->Warm->Cold), dedup LRU y HTTP/2 Axum.    │
+│    [FASE 3 COMPLETADA]         │ niveles (RAM->Warm->Cold), dedup LRU y HTTP/2 Axum.    │
 ├────────────────────────────────┼────────────────────────────────────────────────────────┤
 │ 4. `crates/client`             │ SDK de cliente ergonómico (`ZemdbClient` -> `RoomHandle`  │
 │    (`zemdb-client`)            │ -> `TableHandle`), sincronización en 1 RTT (Write-Through │
@@ -167,7 +170,7 @@ flowchart TD
         SchemaMod["Schema / TableSchema / Validations"]
         OpMod["Operation / TableOperation"]
         SquashMod["Outbox Squashing<br/>(Anti-Zombie + Two-Pointer Merge)"]
-        WalFrame["protocol::wal_frame<br/>(Framing 0xBA7C + CRC32 por lote)"]
+        WalFrame["protocol::wal_frame<br/>(Framing 0xBA7C + CRC32 del header y del payload)"]
         ProtoMod["ClientMessage / ServerMessage<br/>(Commit 1-RTT, CorrelationId, SnapshotChunk)"]
     end
 
@@ -176,8 +179,7 @@ flowchart TD
         RoomManager["RoomManager<br/>(DashMap Sharded Actors Registry)"]
         DedupCache["Dedup Cache LRU<br/>(MutationId -> assigned_seq)"]
         RoomActor["RoomActor (Tokio Task Dedicada por Sala)<br/>- Monotonic Sequencer (Autoridad Total Order)<br/>- Log Inmutable de 4 Niveles (Cero Squashing)<br/>- ClientLeaseTracker (Dead Man's Switch 90s)"]
-        LogTiers["Jerarquía de Log Inmutable<br/>- Tier 1: Hot RAM (VecDeque contiguo)<br/>- Tier 2: Warm Disk (.wal con wal_frame)<br/>- Tier 3: Cold Disk (.wal.zst con Zstd)"]
-        MicroWAL["Micro-WAL Metadatos<br/>(meta_{room_id}.wal durable con CRC32)"]
+        LogTiers["Jerarquía de Log Inmutable<br/>- Tier 1: Hot RAM (VecDeque contiguo)<br/>- Tier 2: Warm Disk (active.wal y segmentos .wal con wal_frame)<br/>- Tier 3: Cold Disk (.wal.zst con Zstd)"]
     end
 
     API --> SyncWorker
@@ -190,8 +192,7 @@ flowchart TD
     AxumRouter --> RoomManager
     RoomManager --> RoomActor
     RoomActor --> DedupCache
-    RoomActor --> CompBuffer
-    RoomActor --> MicroWAL
+    RoomActor --> LogTiers
 ```
 
 ---
@@ -213,9 +214,9 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 * **[COMPLETADO] Erradicación de Clonaciones e Incompatibilidades en `TableBuffer`:**
   Inspección in-place mediante `get_mut(&op.pk)` previo a clonar claves primarias en `TableBuffer::apply`. Retorno tipado `Result<SquashOutcome, BufferError>` (`BufferError::IncompatibleOperation`) para evitar descarte silencioso de mutaciones.
 * **[COMPLETADO] Atribución de Origen y Mensaje de Desregistro en Protocolo:**
-  Enriquecimiento de `SequencedOperation` con `client_id: ClientId` y `mutation_id: MutationId` para soporte determinista de Echo Cancellation en la capa de sincronización. Extensión del protocolo con `ClientMessage::DeregisterClient`.
+  Enriquecimiento de `SequencedOperation` con `client_id: ClientId` y `mutation_id: MutationId` para soporte determinista de Echo Cancellation en la capa de sincronización. Extensión del protocolo con `ClientMessage::DeregisterClient`. *Después se quitaron `client_id` y `mutation_id` del log: `SequencedOperation` es `{ seq, op }`.*
 * **Confirmación de Decisión de Ordenamiento:**
-  Se descarta la implementación de Relojes Lógicos Híbridos (HLC) complejos. La autoridad suprema de ordenamiento reside en el `sequence_id` emitido por el servidor (ver [Sección 10 de ARCHITECTURE.md](file:///Users/Santiago/OtherProjects/client-distributed-db/ARCHITECTURE.md#10-architectural-decisions-time-ordering--authority)).
+  Se descarta la implementación de Relojes Lógicos Híbridos (HLC) complejos. La autoridad suprema de ordenamiento reside en el `sequence_id` emitido por el servidor (ver [Sección 10 de ARCHITECTURE.md](ARCHITECTURE.md#10-architectural-decisions-time-ordering--authority)).
 
 ---
 
@@ -271,14 +272,14 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 
 #### 4.3.1. Modularización Física del Crate `zemdb-server`
 * **Separación Reutilizable (`lib.rs` y `main.rs`):**
-  - `src/lib.rs`: Biblioteca reutilizable que exporta la máquina de actores, buffer, micro-WAL, configuración y capas de handlers HTTP/2 de Axum, permitiendo levantar servidores en memoria o sobre puertos efímeros en tests de integración multi-cliente sin lanzar procesos externos.
+  - `src/lib.rs`: Biblioteca reutilizable que exporta los actores, la configuración, el relay de snapshots, el registro de esquemas y los handlers HTTP de Axum, permitiendo levantar servidores en memoria o sobre puertos efímeros en tests de integración multi-cliente sin lanzar procesos externos.
   - `src/main.rs`: Entrypoint ejecutable CLI que parsea argumentos, carga configuración (`ServerConfig`) y lanza el reactor Tokio con Axum.
 * **Módulos Internos Especializados:**
   - `src/config.rs`: Estructura deserializable `ServerConfig` con soporte para archivos TOML y variables de entorno (`ZEMDB_PORT`, `ZEMDB_DATA_DIR`, `ZEMDB_LEASE_TIMEOUT_SECS`, etc.).
   - `src/error.rs`: Enum tipado `ServerError` con conversiones automáticas hacia códigos de estado HTTP y respuestas binarias estructuradas (`ErrorCode::SchemaViolation`, `BehindCompaction`, `RoomLocked`, `SequenceMismatch`).
   - `src/actor/`: Subsistema de concurrencia y gestión del ciclo de vida de salas (`command.rs`, `manager.rs`, `room.rs`, `lease.rs`).
   - `src/log/`: Jerarquía de log inmutable de 4 niveles (`hot_buffer.rs`, `warm_disk.rs`, `cold_disk.rs`, `policy.rs`) y caché LRU de deduplicación (`dedup.rs`).
-  - `src/micro_wal.rs`: Motor de Micro-WAL para persistencia de secuencias (`meta_{room_id}.wal`).
+  - ~~`src/micro_wal.rs`~~: Micro-WAL (`meta_{room_id}.wal`), reemplazado por `active.wal` en la Fase 3.5-A.3 (ver 4.3.B.3).
   - `src/api/`: Router de Axum, handlers binarios HTTP/2 y emisor de Server-Sent Events (`router.rs`, `handlers.rs`, `sse.rs`).
 
 #### 4.3.2. Concurrencia Aislada por Actores Tokio (`RoomActor` y `RoomManager`)
@@ -332,6 +333,8 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 * **Erradicación de Relojes de Cliente:** La precedencia de escrituras concurrentes se rige 100% por el orden de llegada al actor de la sala y la secuencia emitida, descartando cualquier sesgo temporal por relojes de usuario desincronizados.
 
 #### 4.3.4. Micro-WAL Durable en Disco para Idempotencia Post-Crash
+> **Reemplazado** en la Fase 3.5-A.3 por `active.wal` (ver 4.3.B.3): las operaciones y su `MutationId` se escriben en el mismo WAL con un solo `fsync`.
+
 * **Persistencia Atómica Pre-ACK:**
   Antes de confirmar un `CommitAck` al cliente, el `RoomActor` escribe de forma síncrona en el archivo append-only `meta_{room_id}.wal` una tupla enmarcada con CRC32:
   ```text
@@ -431,10 +434,10 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 * **Envelope Canónico Universal de Snapshots (`A-06`):** Estandarización de `zemdb_storage::snapshot` con formato `"ZMSN"`, versión 1, flag de compresión (0 = Raw/Memory, 1 = Zstd/Disk), longitud descomprimida y suma CRC32 Fast. Garantiza 100% de portabilidad cruzada e interoperabilidad entre `MemoryStorageEngine` y `DiskStorageEngine`.
 * **Consultas Directas por ID y Validación de Esquema en Almacenamiento (`M-13`, `A-08`):** Adición de `get_by_id` y `scan_by_id` al trait `StorageEngine` para acceso directo en $O(1)$ sin resolución de cadenas, y validación estricta de esquemas en `apply_batch` (`schema.validate_operation(&op.op)?`) previa a mutación de tablas o persistencia en WAL.
 * **Encapsulación de Modelos Centrales y Eliminación de `Deref` (`M-15`):** Campos privados en `PrimaryKey`, `CompactRow` y `TableSchema` eliminando la implementación de `Deref` e implementando indexación directa (`Index`, `IndexMut`), iteradores y getters inmutables en estricto cumplimiento de [C-DEREF].
-* **Causalidad Estricta Last-Write-Wins y Anulación Mutua en Squashing (`M-01`, `B-02`):** Descarte incondicional de mutaciones `Update` entrantes con timestamp inferior a un `Insert` previo en Rule 1, y purga mutua (`SquashOutcome::Purged`) ante pares `Insert + Delete` en `TableBuffer`. Derivación de `#[derive(Eq, Hash)]` en estructuras canónicas.
+* **Causalidad Estricta Last-Write-Wins y Anulación Mutua en Squashing (`M-01`, `B-02`):** Descarte incondicional de mutaciones `Update` entrantes con timestamp inferior a un `Insert` previo en Rule 1, y purga mutua (`SquashOutcome::Purged`) ante pares `Insert + Delete` en `TableBuffer`. Derivación de `#[derive(Eq, Hash)]` en estructuras canónicas. *Reemplazado en la Fase 3.7: el squashing sigue el orden de llegada e `Insert + Delete` da `Delete`; ver `ARCHITECTURE.md` §4.1.*
 * **Señalización SSE ante Migraciones DDL (`M-06`):** Emisión de `RoomEvent::SchemaReloaded` ante peticiones `POST /admin/schemas/:id/columns`, transmitiendo el evento en tiempo real a clientes conectados por el canal SSE.
 * **Estandarización de Respuestas del Data Plane (`B-03`):** Implementación de `ServerMessage::DeregisterAck` para desregistro ordenado y respuestas binarias consistentes con `application/octet-stream`.
-* **Resolución de Bloqueo de Retención en Leases (`A-10`):** Transición automática a `ClientState::Dormant` para clientes desconectados que superan 90 segundos de inactividad, desbloqueando `min_connected_ack_seq` y la poda física de logs.
+* **Resolución de Bloqueo de Retención en Leases (`A-10`):** Transición automática a `ClientState::Dormant` para clientes desconectados que superan 90 segundos de inactividad, desbloqueando `min_connected_ack_seq` y la poda física de logs. *Reemplazado en la Fase 3.6: el estado se deriva del cursor (`Dormant` = inactivo y detrás del log) y pasar a `Dormant` por tiempo es opcional (`dormant_after`, `None` por defecto); ver `ARCHITECTURE.md` §5.2.*
 * **Recálculo Preciso de `tail_seq` en Tiered Log (`M-10`):** `prune_older_than` calcula la secuencia base real en base a los segmentos físicamente retenidos en Cold Disk, Warm Disk o memoria RAM, evitando exclusiones espurias por `BehindCompaction`.
 * **Liberación de Locks antes de Sync en Cierre de Salas (`M-16`):** `DiskStorageEngine::close_room` extrae la sala y libera el cerrojo global del motor antes de sincronizar archivos en disco (`wal_file.sync_all().await`).
 * **Prevención de Creación de Salas Fantasma (`B-04`):** `GET /admin/rooms/:id` verifica `room_exists` previamente y responde HTTP 404 para salas inexistentes sin crear directorios ni spawnear tareas de actor en el servidor.
@@ -538,7 +541,7 @@ tokio::spawn(async move {
 * **Pruebas de estrés y límites de carga:**
   Comprobación de la barrera de 16 MB con paquetes maliciosos, límites de paginación con deltas masivos y validación de retención del buffer de compactación bajo saturación.
 * **Validación de compilación cruzada hacia WebAssembly:**
-  Ejecución de `cargo build --target wasm32-unknown-unknown -p zemdb-core` y `cargo check --target wasm32-unknown-unknown -p zemdb-client --no-default-features --features wasm` en el pipeline de integración continua.
+  La CI ya compila `zemdb-core`, `zemdb-storage` y `zemdb-client` hacia `wasm32-unknown-unknown`. Falta `cargo check --target wasm32-unknown-unknown -p zemdb-client --no-default-features --features wasm`, cuando exista esa feature (Fase 4).
 
 ---
 
@@ -594,7 +597,7 @@ tokio::spawn(async move {
 │ [x] Algoritmo Two-Pointer Merge O(M+N) lineal sin alocaciones en squashing. │
 │ [x] Erradicación de clone() incondicional y manejo tipado en TableBuffer.   │
 │ [x] Desacoplamiento de squashing server (total order) vs client (LWW).      │
-│ [x] Atribución de origen en SequencedOperation (client_id, mutation_id).    │
+│ [x] Origen en SequencedOperation (después quitado: es { seq, op }).         │
 │ [x] Soporte para desregistro explícito de clientes (DeregisterClient).      │
 │ [x] Integración de tracing en workspace e instrumentación de códecs binarios│
 │ [x] Aislamiento CPU de Zstandard con tokio::task::spawn_blocking.           │
@@ -642,8 +645,8 @@ tokio::spawn(async move {
 │ [x] Control Plane REST HTTP/JSON (/admin/schemas, /admin/rooms) con auth.    │
 │ [x] Middleware de validación stateless de auth_token en RegisterClient.      │
 │ [x] Secuenciador monótono atómico de mutaciones (head_seq += 1, Total Order)│
-│ [x] Micro-WAL en disco (meta_{room_id}.wal) con CRC32 para durabilidad crash│
-│ [x] Caché LRU de deduplicación de MutationId rehidratada desde Micro-WAL.   │
+│ [x] Micro-WAL en disco (reemplazado por active.wal en la Fase 3.5-A.3).     │
+│ [x] Caché LRU de deduplicación de MutationId rehidratada desde el log.      │
 │ [x] HotBuffer en RAM: log contiguo e inmutable (VecDeque<SequencedOp>).     │
 │ [x] WarmDisk Log en disco (.wal sin comprimir) con wal_frame de core.       │
 │ [x] ColdDisk Log en disco (.wal.zst) con Zstd en spawn_blocking.            │
@@ -654,6 +657,12 @@ tokio::spawn(async move {
 │ [x] Canal SSE de señalización liviana (Event::HeadAdvanced) sin payloads.   │
 │ [x] Relay efímero de chunks multipart para snapshots >16MB.                 │
 │ [x] Batería de pruebas de integración concurrentes con múltiples clientes.  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ FASES 3.5, 3.6 y 3.7: Auditorías y Remediación [COMPLETADAS]                │
+│ [x] 3.5: catchup 1-RTT, auth universal, active.wal único, relay multipart.  │
+│ [x] 3.6: ciclo de vida por cursor, política por sala, relay en disco, CI.   │
+│ [x] 3.7: frame WAL con CRC de header, límites HTTP y en bytes, snapshots    │
+│     validados antes de aplicar, squashing por orden de llegada.             │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ FASE 4: SDK Local-First Reactivo y Sincronización (zemdb-client)            │
 │ [ ] Modularización de crates/client (lib.rs, api/, sync/, transport/).      │
@@ -674,7 +683,7 @@ tokio::spawn(async move {
 │ FASE 5: Pruebas de Integración E2E y Universalidad                          │
 │ [ ] Batería de pruebas E2E multi-cliente con simulación de particiones.     │
 │ [ ] Pruebas de estrés y límites de carga de memoria y concurrencia.         │
-│ [ ] Validación de compilación para navegadores web (wasm32-unknown-unknown).│
+│ [x] Build wasm32-unknown-unknown de core, storage y client en la CI.        │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -722,8 +731,8 @@ La siguiente tabla mapea el origen de cada requerimiento según la recomendació
 | Modularización de `zemdb-server` (`lib.rs` + `main.rs`, `ServerConfig`) | Arquitectura / Rust | `zemdb-server` | **Alta** | ✅ **Completado** |
 | Concurrencia por actores Tokio (`RoomManager` con `DashMap`, `RoomActor` con `mpsc(1024)`) | Sist. Distribuidos / Arq. | `zemdb-server` | **Alta** | ✅ **Completado** |
 | Secuenciador monótono atómico de mutaciones (Autoridad Total Order) | Sist. Distribuidos / Diseño | `zemdb-server` | **Alta** | ✅ **Completado** |
-| Micro-WAL durable en disco (`meta_{room_id}.wal` con CRC32) | Sist. Distribuidos / DB | `zemdb-server` | **Alta** | ✅ **Completado** |
-| Caché LRU de deduplicación de `MutationId` respaldada en Micro-WAL | Sist. Distribuidos | `zemdb-server` | **Alta** | ✅ **Completado** |
+| Micro-WAL durable en disco (`meta_{room_id}.wal` con CRC32) | Sist. Distribuidos / DB | `zemdb-server` | **Alta** | ♻️ **Reemplazado por `active.wal`** |
+| Caché LRU de deduplicación de `MutationId` respaldada en el log (`active.wal` y segmentos) | Sist. Distribuidos | `zemdb-server` | **Alta** | ✅ **Completado** |
 | Log inmutable de 4 niveles en servidor (Hot RAM -> Warm Disk -> Cold Disk) | Sist. Distribuidos / DB | `zemdb-server` | **Alta** | ✅ **Completado** |
 | Compactación CoW no bloqueante en background (`spawn_blocking`) | Rust / Rendimiento | `zemdb-storage` | **Alta** | ✅ **Completado** |
 | `ClientLeaseTracker` con Dead Man's Switch (timeout 90s) anti-OOM | Sist. Distribuidos | `zemdb-server` | **Alta** | ✅ **Completado** |

@@ -49,7 +49,7 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 | **D49** | **Lock de sala estable en storage.** `room_{id}.lock` en `data_dir` (abierto con `create`, sin `truncate`), con `try_lock_exclusive` al principio de `open_room`, antes de tocar el WAL, el snapshot o los temporales; si falla, `RoomLocked`. El handle vive en `DiskRoom` y el lock se libera cuando se suelta la sala. El archivo nunca se renombra ni se borra (como `lock_log` en el servidor). El WAL nuevo de la rotación se crea con `create_new` y se lockea: nunca trunca ni adopta un archivo existente, y si lo hubiera, la rotación falla y se revierte. El WAL activo conserva su propio lock: las operaciones de `tokio::fs` que siguen en curso en el pool bloqueante mantienen vivo su handle después de soltar la sala (por ejemplo, si se suelta el motor sin cerrarla), así que nadie puede abrir la sala mientras una escritura todavía está por llegar al WAL. Ambos archivos se abren y se lockean en el pool bloqueante. | 5 | Adoptada |
 | **D50** | **Ciclo de vida de salas del servidor.** (a) `room_meta` guarda solo las salas con actor vivo o abriéndose: la tarea del actor quita su entrada al terminar, justo antes de avisar que terminó, y un spawn que falla quita la suya. No se hace bajo el spawn lock, como decía la propuesta: un respawn toma ese lock y espera el aviso de salida, así que se trabarían; alcanza con el orden, porque un respawn agrega la entrada recién después del aviso. La recarga de esquemas sigue recorriendo `room_meta`, donde una sala entra antes de que su actor lea el esquema. `GET /admin/rooms/:id` lee los overrides de `meta_room.json` si la sala no está en caché, bajo el spawn lock. (b) `shutdown_all` cierra hasta 64 salas a la vez (`for_each_concurrent`). (c) Roster en JSON compacto. Setting nuevo `forget_dormant_after_secs` (`ZEMDB_FORGET_DORMANT_AFTER_SECS`, override por sala, 30 días por defecto, de 1 s a 10 años): el tick rápido quita del roster a un cliente `Dormant` inactivo por más tiempo. Un cliente olvidado que vuelve recibe `ClientNotRegistered` (409) y se registra de nuevo (D27). | 6 | Adoptada |
 | **D51** | **Squashing de la outbox por orden de llegada.** Enviar el resultado equivale a enviar las operaciones en el orden en que llegaron, mientras no supere el tamaño máximo de una operación (`check_operation_size`): dos `Update` de 9 MiB combinados no entran, así que el SDK tiene que enviar lo pendiente antes de combinar algo que pueda pasarse. (a) La operación entrante siempre gana y el timestamp no decide nada: la entrada combinada lleva el de la última, como metadato. `Insert` o `Delete` reemplazan lo pendiente; un `Update` se aplica a la fila de un `Insert` pendiente o se combina con un `Update` pendiente (gana el valor nuevo en cada columna). Un `Update` después de un `Delete` pendiente sigue siendo `Incompatible`: enviado en orden, el servidor lo ignoraría. Se eliminan `SquashOutcome::Discarded` y `Purged` y el parámetro `incoming_wins` de `merge_sorted_column_updates`, y `ARCHITECTURE.md` §4.1 se reescribe. (b) `Insert` + `Delete` → `Delete`: el `Delete` siempre se envía (el costo es una operación extra al crear y borrar estando offline). (c) `TableBuffer::apply(table, op)` valida la operación con `validate_operation` antes del squash; si falla, o si `table` es de otra tabla, `BufferError::Invalid` y el buffer queda igual. `UpdateBuilder::set` sobre una columna ya seteada reemplaza el valor. | 7 | Adoptada |
-| **D52** | **Tests independientes del entorno del proceso.** La configuración se lee a través de un lector de variables inyectable; los tests le pasan un mapa y no tocan `std::env`. | 8 | Propuesta |
+| **D52** | **Tests independientes del entorno del proceso.** La configuración se lee a través de un lector de variables inyectable; los tests le pasan un mapa y no tocan `std::env`. El lector ya existía (`ServerConfig::apply_overrides_from`, que `apply_env_overrides` usa con `std::env::var`): el test que hacía `set_var`/`remove_var` pasó a unitario y le pasa un `HashMap`, y los tests que cargan un TOML usan `from_toml_str` + `validate` en lugar de `load_with_env`. | 8 | Adoptada |
 
 ---
 
@@ -64,9 +64,9 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 | 5 | Storage listo para el cliente | DEF-93, 98, 107, 101 | Media (requisito de Fase 4) | ✅ 4/4 |
 | 6 | Ciclo de vida de salas del servidor | DEF-102, 104, 103 | Baja | ✅ 3/3 |
 | 7 | Squashing de la outbox | DEF-88, 94, 105, 106 | Latente (antes de habilitar la outbox) | ✅ 4/4 |
-| 8 | Tests y documentación | DEF-109, 110, 111, 113 | Baja | ⬜ 0/4 |
+| 8 | Tests y documentación | DEF-109, 110, 111, 113 | Baja | ✅ 4/4 |
 
-**Avance total:** 24 de 28 ítems (DEF-114 surgió al implementar el Lote 1).
+**Avance total:** 28 de 28 ítems (DEF-114 surgió al implementar el Lote 1).
 
 **Por qué este orden, en una línea por lote:**
 1. Es la única pérdida silenciosa de datos ya confirmados, y el arreglo son pocas líneas.
@@ -298,22 +298,28 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 
 > Objetivo: tests que prueben lo que dicen y documentación que coincida con el código después de los lotes anteriores.
 
-#### DEF-109 · Bajo · ⬜ Pendiente
+#### DEF-109 · Bajo · ✅ Hecho
 **Problema.** `test_disk_concurrent_readers_and_writers` descarta los errores y el contador de los lectores.
 **Solución.** `unwrap()` del resultado de cada lectura y verificar el contador o el valor leído.
 **Test exigido.** El propio test, que tiene que fallar si un lector recibe error.
 
-#### DEF-110 · Bajo · ⬜ Pendiente
+**Hecho.** La fila 1 se escribe antes de lanzar al lector y al escritor (que escribe las filas 2 a 15); cada lectura hace `unwrap()`, exige la fila y compara su valor, y el test espera al lector. Comprobado que falla si las lecturas devuelven error.
+
+#### DEF-110 · Bajo · ✅ Hecho
 **Problema.** Tests de configuración que fallan si hay `ZEMDB_*` en el entorno y que modifican el entorno del proceso.
 **Solución.** D52.
 **Test exigido.** `ZEMDB_LEASE_TIMEOUT_SECS=30 cargo test --workspace` en verde.
 
-#### DEF-111 · Bajo · ⬜ Pendiente
+**Hecho.** `test_server_config_toml_and_env_overrides` pasó de `tests/unified_wal_tests.rs` a `src/tests/config.rs` y lee las variables de un mapa. `load_with_max_snapshot_bytes` (tests de `max_snapshot_bytes`) usaba `load_with_env`, que lee el entorno, y fallaba con `ZEMDB_MAX_SNAPSHOT_BYTES` exportada (reproducido antes del cambio). Ningún test lee ni modifica `std::env`. `cargo test --workspace` en verde con `ZEMDB_LEASE_TIMEOUT_SECS=30` y con otras ocho `ZEMDB_*` exportadas a la vez (puerto, host, límites y TTLs).
+
+#### DEF-111 · Bajo · ✅ Hecho
 **Problema.** `tiered_log_tests.rs`, `unified_wal_tests.rs` y `room_lifecycle_resilience_tests.rs` usan internals expuestos como `pub` solo para testear.
 **Solución.** Moverlos a unitarios en `server/src/log/tests/` (y `actor/tests/` donde corresponda) y pasar `log` y `dedup` a `pub(crate)`. Cierra la reestructuración de tests que quedó pendiente en la Fase 3.6.
 **Test exigido.** Se ejecuta exactamente la misma cantidad de tests antes y después del movimiento.
 
-#### DEF-113 · Bajo · ⬜ Pendiente
+**Hecho.** De `tiered_log_tests.rs` (14 tests), 13 pasaron a `src/log/tests/tiered_log.rs` y el de rangos del `HotBuffer` a `src/log/tests/hot_buffer.rs`. De `unified_wal_tests.rs` (7), los 5 del WAL fueron a `tiered_log.rs`, el de configuración a `src/tests/config.rs` (DEF-110) y el de mapeo de errores a `src/tests/error.rs`. `dedup_cache_tests.rs` (3) también usaba `DedupLruCache` como `pub` y pasó a `src/tests/dedup.rs`. De `room_lifecycle_resilience_tests.rs` salieron los dos tests de `WarmDiskLog` (a `src/log/tests/warm_disk.rs`); el resto usa solo la API pública (`RoomManager`, `RoomCommand` y HTTP) y sigue como integración, así que no hizo falta `actor/tests/`. `log` y `dedup` son privados del crate, la raíz reexporta solo `RoomLifecycleOverrides` y `RoomLifecyclePolicy` (parte de la API pública), y lo que quedó sin uso fuera de los tests está bajo `#[cfg(test)]`, incluido `RoomLifecyclePolicy::test_policy`. Se borraron `DedupLruCache::is_empty`, que ni los tests usaban, y los `read_range` de `WarmDiskLog` y `ColdDiskLog`, que envolvían a las funciones de lectura que los tests ahora llaman directamente. `run_maintenance_sync` resultó ser una copia del bucle de `run_maintenance` que solo usaban los tests: ahora corre el mismo `run_maintenance_at` asíncrono en un runtime propio, así que los tests de mantenimiento prueban el código de producción. 690 tests antes y después, con los mismos nombres.
+
+#### DEF-113 · Bajo · ✅ Hecho
 **Problema.** Documentación desactualizada (ver la auditoría para las líneas).
 **Solución.**
 - `README.md`: magic "ZM", sin micro-WAL, versión de Rust real, cantidad de tests sin número fijo (o la real), "L1 cache-line aligned" reemplazado por "cabe en 64 B".
@@ -322,3 +328,5 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 - `ROADMAP.md`: encabezado y fecha, tabla de crates, `SequencedOperation`, A-10, build wasm32 hecho, micro-WAL marcado como reemplazado por `active.wal`, y referencia a las Fases 3.6 y 3.7.
 - `docs/audits/2026-09-post-fase3-audit.md` (M-03): "RM" → "ZM".
 **Test exigido.** Ninguno (documentación). Revisión cruzada de cada afirmación cambiada contra el código.
+
+**Hecho.** Todo lo de la lista. `rust-version = "1.85"` comprobado con los toolchains: 1.85 compila las bibliotecas y el binario, y 1.88 todos los targets (1.85 rechaza las dev-dependencies). La cantidad de tests quedó sin número. En `ARCHITECTURE.md`, el transporte, los límites en bytes y la validación de snapshots ya estaban al día desde sus lotes; faltaba el frame WAL del Lote 3: §8 describe ahora el header con CRC propio y la búsqueda de un frame válido que separa un torn write de la corrupción (incluida la excepción de `.wal.compacting`), y el Tier 2 de §5.2 remite a ella para `active.wal`. También se quitó la afirmación de la línea de caché de §3.1, del ROADMAP y de `types_memory_tests.rs` (alcanza con los 40 bytes), y se corrigieron los enlaces `file:///` del encabezado del ROADMAP, la raíz `client-distributed-db/` del árbol del README, la fila de la Fase 5 del README (el build wasm32 ya corre en la CI) y el diagrama del ROADMAP, que apuntaba a un nodo inexistente (`CompBuffer`). En el ROADMAP, A-10 y la purga `Insert + Delete` de M-01 quedan anotadas como reemplazadas (Fases 3.6 y 3.7), la lista de cambios realizados aclara que es un registro cronológico, y las Fases 3.5 a 3.7 figuran en el cronograma.
