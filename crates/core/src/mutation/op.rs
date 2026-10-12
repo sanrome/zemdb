@@ -188,7 +188,9 @@ impl UpdateBuilder {
         }
     }
 
+    /// Sets `column_idx` to `value`, replacing a value set before for the same column.
     pub fn set(mut self, column_idx: u16, value: impl Into<Value>) -> Self {
+        self.updates.retain(|u| u.column_idx != column_idx);
         self.updates.push(ColumnUpdate::new(column_idx, value));
         self
     }
@@ -198,8 +200,7 @@ impl UpdateBuilder {
         self
     }
 
-    pub fn build(mut self) -> Operation {
-        self.updates.sort_by_key(|u| u.column_idx);
+    pub fn build(self) -> Operation {
         Operation::update(self.table_id, self.pk, self.updates, self.timestamp)
     }
 }

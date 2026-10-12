@@ -48,7 +48,7 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 | **D48** | **`apply_snapshot` valida antes de reemplazar.** Corre en el cliente: el servidor no usa `zemdb-storage` y el relay sigue guardando el snapshot comprimido sin decodificarlo (D18). Firma: `apply_snapshot(room_id, schema, snapshot: Bytes, expected_head_seq)`; `Bytes` evita la copia para pasarlo al hilo bloqueante. En orden, antes de tocar la sala: (1) `payload.head_seq` igual a `expected_head_seq` (el `snapshot_head_seq` que anunció el relay), si no `SnapshotHeadMismatch { expected, actual }` (variante nueva); (2) cada `table_id` del payload existe en el `schema` recibido; (3) cada `(pk, fila)` pasa `validate_keyed_row` (nuevo en `core`, compartido con la validación de `Insert`: PK con aridad y tipos correctos, `validate_compact_row`, y columnas PK de la fila iguales a la clave). (2) y (3) fallan como `SnapshotCorruption`. Después siguen las reglas de antes (detrás se rechaza, igual no hace nada, adelante reemplaza). Fuera de wasm, decodificar y validar corre en un único `spawn_blocking` en los dos motores; en wasm, inline. Streaming: un envelope zstd se deserializa desde el decoder (buffer de 64 KiB) con Bincode limitado a `declared_len`, y el stream tiene que medir exactamente eso y terminar después del payload; uno raw se deserializa desde el slice con las mismas reglas. Las tablas y sus filas se insertan a medida que se leen: el `Deserialize` de `imbl` reserva lugar para la cantidad de filas que declara el payload, y 40 bytes que declaran 2^40 filas abortaban el proceso. Los strings de un stream se leen con un lector propio (`PayloadReader`) cuyo buffer crece con los bytes leídos: el de Bincode llena de ceros un buffer del largo declarado antes de leer, y 51 bytes comprimidos reservaban unos 2 GiB. Después de decodificar, el motor en memoria vuelve a buscar la sala, como el de disco: el snapshot va a la sala abierta en ese momento. El snapshot en disco se decodifica igual al abrir la sala, en el `spawn_blocking` y sin límite de tamaño (lo escribió el motor). `MemoryStorageEngine::create_snapshot` clona las tablas y suelta el lock antes de serializar (en `spawn_blocking` fuera de wasm). Que el esquema sea el registrado lo verifica el SDK (Fase 4); que el contenido sea verdadero sigue siendo DEF-81. | 5 | Adoptada |
 | **D49** | **Lock de sala estable en storage.** `room_{id}.lock` en `data_dir` (abierto con `create`, sin `truncate`), con `try_lock_exclusive` al principio de `open_room`, antes de tocar el WAL, el snapshot o los temporales; si falla, `RoomLocked`. El handle vive en `DiskRoom` y el lock se libera cuando se suelta la sala. El archivo nunca se renombra ni se borra (como `lock_log` en el servidor). El WAL nuevo de la rotación se crea con `create_new` y se lockea: nunca trunca ni adopta un archivo existente, y si lo hubiera, la rotación falla y se revierte. El WAL activo conserva su propio lock: las operaciones de `tokio::fs` que siguen en curso en el pool bloqueante mantienen vivo su handle después de soltar la sala (por ejemplo, si se suelta el motor sin cerrarla), así que nadie puede abrir la sala mientras una escritura todavía está por llegar al WAL. Ambos archivos se abren y se lockean en el pool bloqueante. | 5 | Adoptada |
 | **D50** | **Ciclo de vida de salas del servidor.** (a) `room_meta` guarda solo las salas con actor vivo o abriéndose: la tarea del actor quita su entrada al terminar, justo antes de avisar que terminó, y un spawn que falla quita la suya. No se hace bajo el spawn lock, como decía la propuesta: un respawn toma ese lock y espera el aviso de salida, así que se trabarían; alcanza con el orden, porque un respawn agrega la entrada recién después del aviso. La recarga de esquemas sigue recorriendo `room_meta`, donde una sala entra antes de que su actor lea el esquema. `GET /admin/rooms/:id` lee los overrides de `meta_room.json` si la sala no está en caché, bajo el spawn lock. (b) `shutdown_all` cierra hasta 64 salas a la vez (`for_each_concurrent`). (c) Roster en JSON compacto. Setting nuevo `forget_dormant_after_secs` (`ZEMDB_FORGET_DORMANT_AFTER_SECS`, override por sala, 30 días por defecto, de 1 s a 10 años): el tick rápido quita del roster a un cliente `Dormant` inactivo por más tiempo. Un cliente olvidado que vuelve recibe `ClientNotRegistered` (409) y se registra de nuevo (D27). | 6 | Adoptada |
-| **D51** | **Squashing de la outbox por orden de llegada.** (a) La operación entrante siempre gana: el timestamp no decide nada dentro del buffer (queda como metadato). Esto alinea el código con `ARCHITECTURE.md` §10.2 y obliga a reescribir `ARCHITECTURE.md:58-60` (§4.1: "Strict Last-Write-Wins", "Old Insert into Newer Update"). (b) `Insert` + `Delete` → `Delete`; se elimina la aniquilación mutua. Como `Insert` es un upsert y un `Delete` de una fila inexistente es un no-op en storage, mandar el `Delete` siempre es correcto; el costo es una operación extra en el caso de crear y borrar estando offline. Purgar cuando el SDK sepa que la fila no existía queda como optimización futura. (c) `TableBuffer::apply` rechaza deltas repetidos o desordenados (el mismo chequeo que su `Deserialize`), `UpdateBuilder::set` sobre una columna ya seteada reemplaza el valor en vez de duplicarlo, y el buffer valida cada operación contra el `TableSchema` antes de hacer squash. | 7 | Propuesta |
+| **D51** | **Squashing de la outbox por orden de llegada.** Enviar el resultado equivale a enviar las operaciones en el orden en que llegaron, mientras no supere el tamaño máximo de una operación (`check_operation_size`): dos `Update` de 9 MiB combinados no entran, así que el SDK tiene que enviar lo pendiente antes de combinar algo que pueda pasarse. (a) La operación entrante siempre gana y el timestamp no decide nada: la entrada combinada lleva el de la última, como metadato. `Insert` o `Delete` reemplazan lo pendiente; un `Update` se aplica a la fila de un `Insert` pendiente o se combina con un `Update` pendiente (gana el valor nuevo en cada columna). Un `Update` después de un `Delete` pendiente sigue siendo `Incompatible`: enviado en orden, el servidor lo ignoraría. Se eliminan `SquashOutcome::Discarded` y `Purged` y el parámetro `incoming_wins` de `merge_sorted_column_updates`, y `ARCHITECTURE.md` §4.1 se reescribe. (b) `Insert` + `Delete` → `Delete`: el `Delete` siempre se envía (el costo es una operación extra al crear y borrar estando offline). (c) `TableBuffer::apply(table, op)` valida la operación con `validate_operation` antes del squash; si falla, o si `table` es de otra tabla, `BufferError::Invalid` y el buffer queda igual. `UpdateBuilder::set` sobre una columna ya seteada reemplaza el valor. | 7 | Adoptada |
 | **D52** | **Tests independientes del entorno del proceso.** La configuración se lee a través de un lector de variables inyectable; los tests le pasan un mapa y no tocan `std::env`. | 8 | Propuesta |
 
 ---
@@ -63,10 +63,10 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 | 4 | Memoria y E/S del log del servidor | DEF-90, 97, 99, 96 | Alta | ✅ 4/4 |
 | 5 | Storage listo para el cliente | DEF-93, 98, 107, 101 | Media (requisito de Fase 4) | ✅ 4/4 |
 | 6 | Ciclo de vida de salas del servidor | DEF-102, 104, 103 | Baja | ✅ 3/3 |
-| 7 | Squashing de la outbox | DEF-88, 94, 105, 106 | Latente (antes de habilitar la outbox) | ⬜ 0/4 |
+| 7 | Squashing de la outbox | DEF-88, 94, 105, 106 | Latente (antes de habilitar la outbox) | ✅ 4/4 |
 | 8 | Tests y documentación | DEF-109, 110, 111, 113 | Baja | ⬜ 0/4 |
 
-**Avance total:** 20 de 28 ítems (DEF-114 surgió al implementar el Lote 1).
+**Avance total:** 24 de 28 ítems (DEF-114 surgió al implementar el Lote 1).
 
 **Por qué este orden, en una línea por lote:**
 1. Es la única pérdida silenciosa de datos ya confirmados, y el arreglo son pocas líneas.
@@ -264,25 +264,33 @@ Se continúa la numeración del plan de la Fase 3.6 (que termina en D42). Todas 
 
 > Objetivo: que la outbox, cuando exista, envíe siempre un resultado equivalente a enviar las operaciones en orden. Hoy no tiene consumidor (outbox diferida post-v0.1); se puede adelantar o hacer en paralelo con cualquier otro lote.
 
-#### DEF-88 · Alto · latente · ⬜ Pendiente
+#### DEF-88 · Alto · latente · ✅ Hecho
 **Problema.** `Delete → Insert → Delete` (o un `Insert` que sobrescribe seguido de un `Delete`) termina en un buffer vacío y la fila sigue viva en el servidor.
 **Solución.** D51 (b).
 **Test exigido.** `Delete(K) → Insert(K) → Delete(K)` deja un `Delete(K)` pendiente; `Insert(K) → Delete(K)` también. Los tests de `crates/core/tests/squashing_rules_tests.rs` que esperan `Purged` se actualizan a la nueva regla.
 
-#### DEF-94 · Medio · latente · ⬜ Pendiente
+**Hecho.** `delete_after_a_pending_insert_is_kept` cubre los dos casos sobre un `TableBuffer`. Los tests que esperaban `Purged` o `Discarded` se reescribieron con las reglas nuevas, y el de `Update` después de `Delete` ahora pasa por el buffer (`IncompatibleOperation`) junto con el esquema de otra tabla. Comprobado que falla con la aniquilación mutua.
+
+#### DEF-94 · Medio · latente · ✅ Hecho
 **Problema.** La precedencia depende del reloj de pared: si retrocede, un `Delete` posterior se descarta.
 **Solución.** D51 (a), y reescribir `ARCHITECTURE.md:58-60`.
 **Test exigido.** `Insert(ts=1000)` seguido de `Delete(ts=990)` deja un `Delete` pendiente; dos `Update` del mismo campo con timestamps decrecientes dejan el valor del último en llegar.
 
-#### DEF-105 · Bajo · latente · ⬜ Pendiente
+**Hecho.** `arrival_order_wins_over_timestamps` cubre el `Delete` con timestamp anterior, dos `Update` de la misma columna con timestamps decrecientes (gana el segundo y la entrada queda con su timestamp) y un `Insert` con timestamp anterior que igual reemplaza al `Update` pendiente; `insert_then_update_applies_the_deltas_to_the_row` aplica un `Update` con timestamp anterior al `Insert`. Comprobado que fallan si vuelve la precedencia por timestamp, si se descarta un `Update` viejo sobre un `Insert` y si la entrada se queda con el timestamp mayor.
+
+#### DEF-105 · Bajo · latente · ✅ Hecho
 **Problema.** El LWW por timestamp no se cumple por columna después de mezclar updates.
 **Solución.** Desaparece con D51 (a): ya no hay LWW por timestamp en el buffer.
 **Test exigido.** `U1(ts=100, A=x)`, `U2(ts=90, B=old)`, `U3(ts=95, B=new)` deja `A=x, B=new`.
 
-#### DEF-106 · Bajo · latente · ⬜ Pendiente
+**Hecho.** En el mismo test: `U1(ts=100, A=x)`, `U2(ts=90, B=old)`, `U3(ts=95, B=new)` deja `A=x, B=new`.
+
+#### DEF-106 · Bajo · latente · ✅ Hecho
 **Problema.** `apply` acepta deltas que el `Deserialize` del buffer rechaza (se pierde la outbox persistida), y un `Update` inválido contamina un `Insert` válido.
 **Solución.** D51 (c).
 **Test exigido.** `apply` con deltas repetidos o desordenados devuelve error; `UpdateBuilder::set` dos veces sobre la misma columna produce un solo delta con el último valor; `Insert` válido + `Update(col 99)` rechaza el `Update` y deja el `Insert` intacto; serializar y deserializar el buffer después de cualquier secuencia aceptada por `apply` siempre funciona.
+
+**Hecho.** `invalid_operations_are_rejected_and_leave_the_buffer_unchanged` (deltas repetidos, desordenados y fuera de rango, con el error de validación de cada uno), `update_builder_keeps_the_last_value_of_a_column` y `every_buffer_built_by_apply_deserializes_again`, que aplica las 216 secuencias de tres operaciones sobre dos filas (una de ellas con deltas repetidos) y serializa y relee el buffer después de cada una. Comprobado que fallan sin la validación y con el `set` anterior.
 
 ---
 

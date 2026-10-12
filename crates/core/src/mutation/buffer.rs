@@ -1,5 +1,6 @@
 use super::op::{Operation, OperationKind};
-use super::squash::{client_squash_operations, SquashOutcome};
+use super::squash::{squash_operations, SquashOutcome};
+use crate::schema::{TableSchema, ValidationError};
 use crate::value::PrimaryKey;
 use serde::de;
 use serde::ser::SerializeStruct;
@@ -13,14 +14,16 @@ pub enum BufferError {
         "Incompatible operation for table_id '{table_id}': entity state forbids this transition"
     )]
     IncompatibleOperation { table_id: u16 },
+    #[error("Invalid operation: {0}")]
+    Invalid(#[from] ValidationError),
 }
 
 /// In-memory mutation buffer for a single table.
 ///
 /// Collects pending mutations partitioned by PK and applies squashing automatically.
 ///
-/// The pending map changes only through [`TableBuffer::apply`], which enforces the squashing
-/// rules (last-write-wins, anti-zombie, mutual annihilation), and [`TableBuffer::drain`]. Every
+/// The pending map changes only through [`TableBuffer::apply`], which validates each operation
+/// and enforces the squashing rules (see [`squash_operations`]), and [`TableBuffer::drain`]. Every
 /// entry is stored under its operation's own primary key, and every operation targets the
 /// buffer's table.
 ///
@@ -114,34 +117,37 @@ impl TableBuffer {
         self.table_id
     }
 
-    /// Applies an operation to the buffer with move semantics and squashing.
+    /// Validates `op` against `table`, the schema of this buffer's table, and squashes it into
+    /// the pending operation for its primary key with move semantics. An invalid operation (or
+    /// the schema of another table) is `BufferError::Invalid` and an incompatible one
+    /// `IncompatibleOperation`; either leaves the buffer unchanged. Only valid operations are
+    /// kept, so a buffer built by `apply` always deserializes again.
     ///
     /// The pending entry is looked up by reference, so squashing into an existing entry never
-    /// clones the primary key. A clone is made only to insert a new entry (the map key and the
-    /// stored operation each own one) and to remove an entry purged by mutual annihilation.
-    /// Returns `Err(BufferError::IncompatibleOperation)` if the mutation transition is incompatible.
-    pub fn apply(&mut self, op: Operation) -> Result<SquashOutcome, BufferError> {
-        if op.table_id != self.table_id {
-            return Err(BufferError::IncompatibleOperation {
-                table_id: self.table_id,
-            });
+    /// clones the primary key; a new entry clones it once (the map key and the stored
+    /// operation each own one).
+    pub fn apply(
+        &mut self,
+        table: &TableSchema,
+        op: Operation,
+    ) -> Result<SquashOutcome, BufferError> {
+        if table.table_id() != self.table_id {
+            return Err(ValidationError::TableIdMismatch {
+                table: table.name().to_string(),
+                expected: self.table_id,
+                actual: table.table_id(),
+            }
+            .into());
         }
+        table.validate_operation(&op)?;
 
         match self.pending.get_mut(&op.pk) {
-            Some(existing) => {
-                let outcome = client_squash_operations(existing, op);
-                match outcome {
-                    SquashOutcome::Incompatible => Err(BufferError::IncompatibleOperation {
-                        table_id: self.table_id,
-                    }),
-                    SquashOutcome::Purged => {
-                        let pk = existing.pk.clone();
-                        self.pending.remove(&pk);
-                        Ok(outcome)
-                    }
-                    _ => Ok(outcome),
-                }
-            }
+            Some(existing) => match squash_operations(existing, op) {
+                SquashOutcome::Incompatible => Err(BufferError::IncompatibleOperation {
+                    table_id: self.table_id,
+                }),
+                outcome => Ok(outcome),
+            },
             None => {
                 self.pending.insert(op.pk.clone(), op);
                 Ok(SquashOutcome::Replaced)

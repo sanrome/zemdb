@@ -1,157 +1,69 @@
 use super::op::{ColumnUpdate, Operation, OperationKind};
 use crate::value::Value;
 
-/// Result of attempting to squash two sequential operations for the same PK.
+/// Result of squashing an incoming operation into the pending one for the same primary key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SquashOutcome {
-    /// The incoming operation was merged into the existing operation.
+    /// The incoming operation was merged into the pending one.
     Merged,
-    /// The incoming operation completely replaced the existing operation.
+    /// The incoming operation replaced the pending one, or was the first for its key.
     Replaced,
-    /// The incoming operation was obsolete or a no-op and was discarded (existing remains unchanged).
-    Discarded,
-    /// Both operations cancelled each other out (e.g. pending Insert followed by Delete in client buffer).
-    Purged,
-    /// Operations cannot be squashed (e.g. different table_id, PK, or invalid transition like Delete followed by Update).
+    /// The operations cannot be combined: a different table or primary key, or an update of a
+    /// row with a pending delete.
     Incompatible,
 }
 
-/// Merges two sorted lists of `ColumnUpdate` in $O(M+N)$ linear time using a two-pointer merge.
-///
-/// If `incoming_wins` is true, conflicting columns take the value from `incoming`;
-/// otherwise, the value in `existing` is retained.
-pub fn merge_sorted_column_updates(
-    existing: &mut Vec<ColumnUpdate>,
-    incoming: Vec<ColumnUpdate>,
-    incoming_wins: bool,
-) {
-    let old_existing = std::mem::take(existing);
-    let mut merged = Vec::with_capacity(old_existing.len() + incoming.len());
-    let mut it_a = old_existing.into_iter().peekable();
-    let mut it_b = incoming.into_iter().peekable();
-
-    loop {
-        match (it_a.peek(), it_b.peek()) {
-            (Some(a), Some(b)) => {
-                if a.column_idx < b.column_idx {
-                    merged.push(it_a.next().unwrap());
-                } else if a.column_idx > b.column_idx {
-                    merged.push(it_b.next().unwrap());
-                } else {
-                    let item_a = it_a.next().unwrap();
-                    let item_b = it_b.next().unwrap();
-                    if incoming_wins {
-                        merged.push(item_b);
-                    } else {
-                        merged.push(item_a);
-                    }
-                }
-            }
-            (Some(_), None) => {
-                merged.extend(it_a);
-                break;
-            }
-            (None, Some(_)) => {
-                merged.extend(it_b);
-                break;
-            }
-            (None, None) => break,
+/// Merges `incoming` into `existing`, both sorted by `column_idx`, in $O(M+N)$; a column in
+/// both takes the incoming value.
+pub fn merge_sorted_column_updates(existing: &mut Vec<ColumnUpdate>, incoming: Vec<ColumnUpdate>) {
+    let mut merged = Vec::with_capacity(existing.len() + incoming.len());
+    let mut older = std::mem::take(existing).into_iter().peekable();
+    for update in incoming {
+        while let Some(kept) = older.next_if(|u| u.column_idx < update.column_idx) {
+            merged.push(kept);
         }
+        older.next_if(|u| u.column_idx == update.column_idx);
+        merged.push(update);
     }
+    merged.extend(older);
     *existing = merged;
 }
 
-/// Merges an incoming Operation into an existing pending Operation for the same table_id and PK (Client-side LWW by timestamp).
+/// Squashes `incoming` into `existing`, the pending operation for the same table and primary
+/// key, so that sending the result is equivalent to sending both in the order they arrived,
+/// provided it is not too large to send (see `check_operation_size`): the incoming operation
+/// always wins. Timestamps are only metadata; the result takes the incoming one.
 pub fn squash_operations(existing: &mut Operation, incoming: Operation) -> SquashOutcome {
     if existing.table_id != incoming.table_id || existing.pk != incoming.pk {
         return SquashOutcome::Incompatible;
     }
-
-    match (&mut existing.kind, incoming.kind) {
-        // Rule 1: INSERT followed by UPDATE -> direct slot update on CompactRow
-        (OperationKind::Insert { row }, OperationKind::Update { updates }) => {
-            if incoming.timestamp >= existing.timestamp {
-                for u in updates {
-                    let idx = u.column_idx as usize;
-                    if idx >= row.len() {
-                        row.resize(idx + 1, Value::Null);
-                    }
-                    row[idx] = u.value; // Move semantics: 0 clones
-                }
-                existing.timestamp = incoming.timestamp;
-                SquashOutcome::Merged
-            } else {
-                SquashOutcome::Discarded
-            }
+    let outcome = match (&mut existing.kind, incoming.kind) {
+        // An update cannot resurrect a row with a pending delete.
+        (OperationKind::Delete, OperationKind::Update { .. }) => {
+            return SquashOutcome::Incompatible
         }
-
-        // Rule 2: UPDATE followed by UPDATE -> O(M+N) two-pointer merge preserving column_idx ascending
-        (
-            OperationKind::Update {
-                updates: existing_updates,
-            },
-            OperationKind::Update {
-                updates: incoming_updates,
-            },
-        ) => {
-            let incoming_wins = incoming.timestamp >= existing.timestamp;
-            merge_sorted_column_updates(existing_updates, incoming_updates, incoming_wins);
-            if incoming_wins {
-                existing.timestamp = incoming.timestamp;
+        (OperationKind::Insert { row }, OperationKind::Update { updates }) => {
+            for u in updates {
+                let idx = usize::from(u.column_idx);
+                if idx >= row.len() {
+                    row.resize(idx + 1, Value::Null);
+                }
+                row[idx] = u.value;
             }
             SquashOutcome::Merged
         }
-
-        // Rule 3: DELETE followed by UPDATE (Anti-Zombie rule)
-        // A partial update CANNOT resurrect a deleted entity.
-        (OperationKind::Delete, OperationKind::Update { .. }) => {
-            if incoming.timestamp <= existing.timestamp {
-                SquashOutcome::Discarded
-            } else {
-                SquashOutcome::Incompatible
-            }
+        (OperationKind::Update { updates }, OperationKind::Update { updates: incoming }) => {
+            merge_sorted_column_updates(updates, incoming);
+            SquashOutcome::Merged
         }
-
-        // Rule 4: Any operation followed by DELETE
-        (target_kind, OperationKind::Delete) => {
-            if incoming.timestamp >= existing.timestamp {
-                if matches!(target_kind, OperationKind::Insert { .. }) {
-                    SquashOutcome::Purged
-                } else {
-                    *target_kind = OperationKind::Delete;
-                    existing.timestamp = incoming.timestamp;
-                    SquashOutcome::Replaced
-                }
-            } else {
-                SquashOutcome::Discarded
-            }
+        // An insert (an upsert) or a delete replaces whatever was pending. A delete after a
+        // pending insert is still sent: the row may exist on the server, and deleting a
+        // missing row changes nothing.
+        (kind, incoming_kind) => {
+            *kind = incoming_kind;
+            SquashOutcome::Replaced
         }
-
-        // Rule 5: Any operation followed by INSERT
-        (target_kind, OperationKind::Insert { mut row }) => {
-            if incoming.timestamp >= existing.timestamp {
-                *target_kind = OperationKind::Insert { row };
-                existing.timestamp = incoming.timestamp;
-                SquashOutcome::Replaced
-            } else {
-                match target_kind {
-                    OperationKind::Update { updates } => {
-                        for u in updates.drain(..) {
-                            let idx = u.column_idx as usize;
-                            if idx >= row.len() {
-                                row.resize(idx + 1, Value::Null);
-                            }
-                            row[idx] = u.value; // Move semantics: 0 clones
-                        }
-                        *target_kind = OperationKind::Insert { row };
-                        SquashOutcome::Merged
-                    }
-                    OperationKind::Delete => SquashOutcome::Discarded,
-                    OperationKind::Insert { .. } => SquashOutcome::Discarded,
-                }
-            }
-        }
-    }
+    };
+    existing.timestamp = incoming.timestamp;
+    outcome
 }
-
-pub use squash_operations as client_squash_operations;
