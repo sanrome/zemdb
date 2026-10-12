@@ -62,6 +62,7 @@
   ```
   El comportamiento es idéntico: `new` solo ordena `Update` (el mismo `sort_by_key` estable), y para `Insert`/`Delete` el resultado es el mismo literal. Hay 159 llamadas a estos constructores en el workspace y ninguna firma cambia.
 - **Ahorro estimado:** ~20 líneas · **Riesgo:** bajo · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ✅ confirmada — `new` (`op.rs:79-93`) ya ordena solo `Update` con el mismo `sort_by_key` estable y devuelve el mismo literal; `insert`/`update`/`delete` (`95-128`) producen el mismo valor delegando. El `if let … = &mut kind` con `mut kind` compila y equivale al `match` actual.
 
 ### Q2. `Serialize` de `TableBuffer` derivado con `serialize_with`
 - **Dónde:** `buffer.rs:42-63` (y el import `SerializeStruct` en `buffer.rs:6`).
@@ -85,6 +86,7 @@
   ```
   La salida es idéntica: el derive emite `serialize_struct("TableBuffer", 2)` con `table_id` y `pending` en ese orden, y `pending` pasa por `collect_seq(values())`, igual que hoy. El `Deserialize` manual no cambia. Lo cubren los round-trips de `crates/core/tests/squashing_rules_tests.rs:282,333`.
 - **Ahorro estimado:** ~12–14 líneas · **Riesgo:** bajo · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ⚠️ corregida — la equivalencia de bytes se sostiene (el derive emite `serialize_struct("TableBuffer", 2)`, campos `table_id` y `pending` en ese orden, y `serialize_with` llama a `collect_seq(values())`; `Serializer` sigue importado, solo sobra `SerializeStruct`). Pero las líneas de test citadas están mal: `squashing_rules_tests.rs:282` y `:330-333` serializan el espejo `RawTableBuffer`, no `TableBuffer`; el round-trip real de `TableBuffer` es `squashing_rules_tests.rs:248`.
 
 ### Q3. Simplificar la validación del `Deserialize` de `TableBuffer`
 - **Dónde:** `buffer.rs:85-98`.
@@ -103,6 +105,7 @@
 - **Dónde:** `op.rs:5-7`, `op.rs:39-41`, `op.rs:57-61`, `op.rs:47-48`.
 - **Propuesta:** ver la sección Comentarios: borrar la frase falsa de `op.rs:60`, reemplazar los desgloses de padding por una referencia al test de tamaños y corregir el "strictly sorted".
 - **Ahorro estimado:** ~3–4 líneas · **Riesgo:** nulo · **Prioridad:** **alta** (no por las líneas, sino porque hoy la doc afirma algo falso)
+- **Verificación (2.ª pasada):** ✅ confirmada — solo doc; líneas 7, 41, 47-48, 59-60 correctas. `op.rs:60` es falso: `PrimaryKey` es `SmallVec<[Value; 1]>` (desborda al heap), `CompactRow` contiene un `Vec`, `Value::String/Bytes` son `Box`. Los totales (32/32/88) están asertados en `tests/types_memory_tests.rs:8-10`.
 
 ### Q5. Condensar la doc de `TableBuffer` y de `apply`
 - **Dónde:** `buffer.rs:21-35` y `buffer.rs:126-128`.

@@ -63,6 +63,7 @@
   ```
   `add_column` (`global.rs:154-158`) necesita `get_mut`, así que queda como está. `validate_operation` (`global.rs:225-227`) busca por id con el mensaje `"id:{}"` y también queda igual.
 - **Ahorro estimado:** ~9–12 líneas · **Riesgo:** bajo · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ⚠️ corregida — las 6 apariciones y líneas son correctas y el error es idéntico, pero un `fn require_table` privado en `impl Schema` (módulo `schema::global`) no es visible desde el módulo hermano `schema::validation`: hay que declararlo `pub(super)` (o `pub(crate)`), salvo que se aplique Q2 y los cuerpos de `validation.rs:273-312` se muden a `global.rs`.
 
 ### Q2. Eliminar la doble indirección `Schema`/`TableSchema` → funciones libres de `validation.rs`
 - **Dónde:** `table.rs:328-367` (7 wrappers: `validate_pk`, `validate_row`, `validate_update`, `validate_compact_row`, `validate_keyed_row`, `validate_column_updates`, `validate_operation`); `global.rs:206-221` (3 wrappers); `validation.rs:160-453` (funciones libres `pub`).
@@ -74,6 +75,7 @@
   - `validate_field_value` pasa a ser privada.
   - El orden de los chequeos y los errores no cambian. Solo se mueve código.
 - **Ahorro estimado:** ~60–75 líneas · **Riesgo:** medio. Es superficie pública: hay que confirmar que ningún consumidor fuera del workspace importa `zemdb_core::schema::validate_*`. **A verificar.** · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ✅ confirmada — grep en todo `crates/` (core, storage, server, client): ninguna llamada a `validate_*` libres ni import de `schema::validate*` fuera de `schema/`; `validate_pk` tiene un único caller con closure (`table.rs:329-334`) y `validate_field_value` no se usa fuera de `validation.rs`. Un `impl TableSchema` en otro módulo del mismo crate compila; usar los accessors (`self.name()`, `self.columns()`) como hoy. Sigue siendo un cambio de API pública.
 
 ### Q3. `seen` en `validate_column_updates` es código muerto
 - **Dónde:** `validation.rs:323`, `352-358`.
@@ -87,6 +89,7 @@
   ```
   El texto `"index {}"` lo compara un test (`schema_validation_tests.rs:459`), así que se mantiene.
 - **Ahorro estimado:** ~10–12 líneas · **Riesgo:** bajo · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ⚠️ corregida — `seen` es efectivamente inalcanzable (bounds check → `prev` rechaza `==` y `<`, así que los índices aceptados son estrictamente crecientes) y el test de duplicado da la misma variante/columna. Precisiones: el `get(...).ok_or_else` debe quedar **antes** del bloque `if let Some(prev)` (`336-349`, no `335`) para conservar la prioridad de `UnknownColumn`; y hay que borrar también `use smallvec::SmallVec;` (`validation.rs:6`), cuyo único uso es `seen` (si no, warning `unused_imports`).
 
 ### Q4. `TableBuilder`: un helper para "buscar o agregar columna"
 - **Dónde:** `table.rs:50-101`.

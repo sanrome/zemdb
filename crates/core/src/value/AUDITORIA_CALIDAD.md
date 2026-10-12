@@ -63,6 +63,7 @@
   ```
   `i64::from` es equivalente a `as i64` para estos tipos (todas son conversiones sin pérdida) y deja explícito que no se trunca.
 - **Ahorro estimado:** ~25 líneas · **Riesgo:** bajo · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ✅ confirmada — líneas 169-209 correctas; para `i8/i16/i32` `as i64` extiende signo y para `u8/u16/u32` extiende con ceros, exactamente igual que `i64::from`. (Opcional: `i64` también entra en la macro, `i64::from(i64)` es la identidad.)
 
 ### Q2. `parse_uuid` con iteradores en lugar de dos bucles con índices manuales
 - **Dónde:** `scalar.rs:123-151`.
@@ -87,6 +88,7 @@
   ```
   Es equivalente: los segmentos 8-4-4-4-12 tienen largo par, así que los pares de dígitos coinciden con los del bucle original. Un guion fuera de posición sigue fallando en `hex_val`. No asigna memoria. Los tests de `crates/core/tests/types_memory_tests.rs:21,48,57` cubren ambos formatos.
 - **Ahorro estimado:** ~10 líneas · **Riesgo:** bajo-medio (conviene sumar un caso con guion mal ubicado y uno con mayúsculas antes del cambio) · **Prioridad:** media
+- **Verificación (2.ª pasada):** ✅ confirmada — mismos pares de dígitos (el `while` original salta 8/13/18/23 y avanza de a 2: (9,10)…(24,25)…), mismo resultado `None` para largo distinto de 32/36, guiones mal ubicados (36 → `None`; guion en posición de dígito → `hex_val` falla) o hex inválido; el guard `36 if …` solo indexa tras confirmar el largo, así que no hay OOB; `digits.next()?` nunca agota (32 dígitos). Compila: `HYPHENS.contains(i)` recibe `&usize`, `?` dentro del `for` en fn que devuelve `Option`. Tests citados (`:21,48,57`) correctos.
 
 ### Q3. `Display` de `DataType` delegando en `Debug`
 - **Dónde:** `data_type.rs:17-30`.

@@ -89,12 +89,14 @@
   ```
   El comportamiento es idéntico. Con `offset == len`, el slice vacío da `CleanEof` (`wal_frame.rs:391-393`) y la función devuelve `(ops, len, None)`, igual que hoy. `bytes_consumed` siempre es mayor que 0 (vale `frame_len`, que es al menos 18), así que el bucle termina. Los errores siguen saliendo por `?`.
 - **Ahorro estimado:** ~5 líneas (3 de código, 2 de doc) · **Riesgo:** bajo · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ✅ confirmada — `decode_wal_batch_from_slice` es pura y con slice vacío devuelve `CleanEof` (`391-393`), así que la llamada extra al llegar a `offset == len` da el mismo `(ops, len, None)`; `bytes_consumed = frame_len ≥ BATCH_HEADER_SIZE (18)` y `frame_len ≤ slice.len()` (si no, `TruncatedPayload`), por lo que no hay bucle infinito ni slicing fuera de rango. Los brazos `return` tipan `!` y compilan. Consumidores (`storage/src/disk/format.rs:177`, tests) no ven diferencia.
 
 ### Q2. Comentarios desactualizados o engañosos en `wal_frame.rs`
 - **Dónde:** `wal_frame.rs:12-13`, `29`, `47`, `53-56`, `63-66`, `114`, `382-389`
 - **Problema:** ver la sección Comentarios. Lo que más importa es `TornWrite` (`55-56`), porque documenta un campo que nunca lleva información, y el "little-endian" del magic (`66`).
 - **Propuesta:** corregir `TornWrite` así: "The next frame cannot be read and no valid frame follows it (see [`FrameAnomaly`]): a torn write." Corregir el magic. Recortar el doc de `BATCH_HEADER_SIZE` a una línea con referencia a `encode_wal_batch`. Acortar los docs de `Ok`, `WalBatchPayload`, `encode_wal_batch` (primera línea) y `encode_wal_record`. En `decode_wal_batch_from_slice` (`382-389`), compactar la enumeración de retornos a 5–6 líneas sin perder ningún caso.
 - **Ahorro estimado:** ~4–6 líneas · **Riesgo:** bajo (solo comentarios) · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ✅ confirmada — solo doc. Líneas correctas; el magic es `[0xBA, 0x7C]` (`wal_frame.rs:10`) escrito tal cual con `extend_from_slice` (`:91`), así que "little-endian" en `:66` es engañoso (como `u16` LE serían `[0x7C, 0xBA]`); `TornWrite` `:55-56` describe un offset que siempre es `0` (`:403`).
 
 ### Q3. `SnapshotEnvelopeHeader::parse` con `first_chunk` + desestructuración
 - **Dónde:** `snapshot_envelope.rs:103-126`
@@ -127,6 +129,7 @@
 - **Problema:** el único productor lo fija en `0`. Ningún consumidor lo lee: `storage/src/disk/wal.rs:106` y todos los `matches!` usan `{ reason, .. }` o `{ .. }`. Solo `crates/core/tests/wal_frame_tests.rs:111` lo construye para compararlo. El offset real lo calcula quien llama (`replay_wal_records` con su `offset`).
 - **Propuesta:** quitar el campo (`TornWrite { reason: String }`), la línea `valid_bytes_offset: 0,` y la línea de `wal_frame_tests.rs:111`. Si se prefiere no tocar la API, corregir al menos el doc (Q2) para que diga que el offset es relativo al slice y por lo tanto siempre `0`.
 - **Ahorro estimado:** ~3 líneas · **Riesgo:** bajo-medio (enum público re-exportado en `lib.rs:31`; **a verificar** que no haya consumidores fuera del workspace) · **Prioridad:** media
+- **Verificación (2.ª pasada):** ✅ confirmada — grep en todo `crates/`: el único lector potencial es `storage/src/disk/wal.rs:106` con `{ reason, .. }` (sigue compilando sin el campo), `storage/tests/disk_wal_resilience_tests.rs:367` y `core/tests` usan `{ .. }`; solo `wal_frame_tests.rs:111` lo construye. El enum no se serializa (no afecta bytes en disco/red); solo cambia su salida `Debug`, que ningún test compara.
 
 ### Q5. `encode_wal_batch`: sacar los temporales de un solo uso
 - **Dónde:** `wal_frame.rs:86-94`
