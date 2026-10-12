@@ -87,6 +87,7 @@
   ```
   (Se llama `respond` y no `reply` para no chocar con el parámetro `reply` de los closures de `RoomCommand`.) El orden de efectos no cambia (identidad → actor → respuesta), `room_id` se sigue moviendo sin clones y los mensajes/códigos son los mismos. `get_schema` y `register` usan `ensure_payload_identity` con `None` y siguen igual en esa parte. Variante si se prefiere (a verificar): mover `ensure_payload` como método de `AuthenticatedRoom` en `extract.rs`, junto a `ensure_payload_identity`.
 - **Ahorro estimado:** ~35–45 líneas · **Riesgo:** bajo · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ✅ confirmada — los 7 handlers usan `StatusCode::OK` y la misma rama `Err(err) => fail(room_id, err)` (`data_plane.rs:130,183,233,279,325,358,401`); `correlation_id`/`mutation_id` ya se usan dos veces hoy (son `Copy`), así que capturarlos en `ok` compila. `ensure_payload` aplica a 5 handlers (commit, sync, ack, heartbeat, deregister).
 
 ### Q2. Extraer la autenticación común de `AuthenticatedRoom`, `EventStreamAuth` y `RelayAuth`
 - **Dónde:** `extract.rs:88-99`, `122-134`, `161-183`, `441-447`.
@@ -104,6 +105,7 @@
   ```
   `AuthenticatedRoom` y `EventStreamAuth` pasan a 3 líneas cada uno (`bearer_token(parts)` vs `bearer_token(parts).or_else(|| query_token(parts))`). `RelayAuth` usa `missing_token` y el mismo `map_err` en la rama de cliente; **su comparación `ct_eq` con el admin secret queda intacta**.
 - **Ahorro estimado:** ~10–12 líneas · **Riesgo:** bajo · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ✅ confirmada — los tres extractores usan el mismo literal "Missing Authorization header" y el mismo `map_err`; `unauthorized` solo se llama en `extract.rs:93,128,166`; el orden (falta de token → 401 antes de verificar) y el `ct_eq` de `RelayAuth` no cambian.
 
 ### Q3. Un único constructor de `ServerMessage::Error`
 - **Dónde:** `data_plane.rs:52-57`, `extract.rs:314-322` (`body_rejection`), `router.rs:166-174` (`unmatched`).

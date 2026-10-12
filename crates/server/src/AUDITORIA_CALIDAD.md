@@ -89,6 +89,7 @@
   ```
   `check_secret(…, &self.auth_secret, DEV_AUTH_SECRET)` en `:289-298`. Los valores son exactamente los mismos, incluido `dormant_after_secs: None` (hoy `#[serde(default)]` = `None` en `:71` y `None` en `:244`). En `tests/config.rs:18,21` cambia `&default_admin_secret()` por `DEV_ADMIN_SECRET` (y lo mismo con auth). Grep: ninguna función `default_*` se usa fuera de `config.rs` y sus tests (`tests/auth_tests.rs:36` usa el literal, no la función).
 - **Ahorro estimado:** ~110–115 líneas · **Riesgo:** bajo (es el idioma estándar de serde; el TOML vacío sigue dando `ServerConfig::default()`, lo cubre `tests/config.rs:323`) · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ✅ confirmada — los 24 campos ya tienen default hoy (23 `default = "…"` + `dormant_after_secs` con `#[serde(default)]`), no hay `deny_unknown_fields`, así que ningún TOML pasa de rechazado a aceptado; `impl Default` llama a las mismas funciones, valores idénticos. Matiz: los usos en tests están en `src/tests/config.rs:18,21` (y `:323`), no en `crates/server/tests/`.
 
 ### Q2. `config.rs`: un helper `set` para los 24 overrides de entorno
 
@@ -112,6 +113,7 @@
   ```
   Se mantiene el orden de lectura y el primer `?` que falla sigue cortando en la misma variable (importa para qué error se informa). Algunas líneas largas (`ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC`) las va a partir rustfmt; ya está contemplado en el ahorro.
 - **Ahorro estimado:** ~35–45 líneas · **Riesgo:** bajo · **Prioridad:** alta
+- **Verificación (2.ª pasada):** ✅ confirmada — `parse_var` es genérico en `T: FromStr`; con `.map(Some)` infiere `u64` para `dormant_after_secs`; se conserva el orden y el corte en el primer `?`. Compila (el `&mut self.campo` no choca con el closure `var`).
 
 ### Q3. `durable.rs`: bloque `cfg(not(unix))` muerto y `Path::ancestors`
 
@@ -181,6 +183,7 @@
 - **Problema:** es la única comprobación de rango escrita a mano; las otras cuatro usan `check_range`.
 - **Propuesta:** `pub const MAX_SNAPSHOT_BYTES_RANGE: RangeInclusive<u64> = 1 << 20..=64 << 30;` y `check_range("max_snapshot_bytes (ZEMDB_MAX_SNAPSHOT_BYTES)", self.max_snapshot_bytes, MAX_SNAPSHOT_BYTES_RANGE)?`. **Cambia el mensaje**: se pierden "(1 MiB)" y "(64 GiB)". El único test (`tests/config.rs:78`) busca solo `max_snapshot_bytes` y grep no encuentra "must be between" fuera de `config.rs`, pero hay que decidir si el mensaje cuenta como contrato. Además `MIN_MAX_SNAPSHOT_BYTES`/`MAX_MAX_SNAPSHOT_BYTES` son `pub` en un módulo `pub`: reemplazarlas cambia la API (no tienen usos fuera de `config.rs`).
 - **Ahorro estimado:** ~5 líneas · **Riesgo:** medio (mensaje y API) · **Prioridad:** baja
+- **Verificación (2.ª pasada):** ✅ confirmada — `1 << 20..=64 << 30` tiene la precedencia correcta y entra en `u64`; el mensaje pierde "(1 MiB)"/"(64 GiB)" tal como se advierte; ningún test compara esos textos; las constantes solo se usan en `config.rs`.
 
 ### Q8. `main.rs`: temporales innecesarios y log duplicado
 
@@ -195,6 +198,7 @@
 - **Problema:** constantes y derives públicos que nadie usa fuera del módulo amplían la API sin necesidad.
 - **Propuesta:** pasar las constantes a `pub(crate)` y evaluar si `Serialize` hace falta. No ahorra líneas; reduce superficie pública. Como `config` y `error` son módulos `pub` del crate, puede haber consumidores externos que no se ven con grep.
 - **Ahorro estimado:** 0 · **Riesgo:** medio (API) · **Prioridad:** baja
+- **Verificación (2.ª pasada):** ✅ confirmada — `RETRY_AFTER_SECS` solo se usa en `error.rs:189`; las constantes de rango solo en `config.rs`; no hay serialización de `ServerConfig` en el workspace. El riesgo de API externa sigue siendo la única duda.
 
 ## Lo que conviene dejar como está
 

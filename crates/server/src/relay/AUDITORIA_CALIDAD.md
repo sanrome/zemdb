@@ -90,6 +90,7 @@
   Las llamadas quedan así: `stage_snapshot` pasa `move |p| Ok(write_new_file(p, &data)?)`; `stage_chunk` pasa `move |p| { sync_file(p)?; verify_snapshot_file(p, &snapshot_hash)?; Ok(()) }` si se agrega el `From<VerifyError>` de Q3, o mantiene el `match` de 3 líneas de `upload.rs:368-373` (`Io → ServerError::from`, que es `ServerError::Io` por `#[from]` en `error.rs:19`; `Invalid → BadRequest`). En ambos casos el mapeo de errores es el mismo que hoy.
 - **Preservación:** se mantienen el orden de efectos (preparar → rename → `sync_dir(snapshots)` → `sync_dir(uploads)` → borrar el `src` solo si hubo error → `install`) y los mensajes de error (`BLAKE3…` e `Invalid snapshot envelope: …`, que los tests comparan en `tests/upload.rs:396` y `:433`). El mapeo `io::Error → ServerError::from` también queda igual. Solo cambia el texto de **un** `warn!` (`upload.rs:209`, "after an error"); no lo compara ningún test (verificado con grep).
 - **Ahorro estimado:** ~20–25 líneas · **Riesgo:** bajo-medio (hay que firmar bien la closure `Send + 'static`) · **Prioridad:** alta.
+- **Verificación (2.ª pasada):** ✅ confirmada — `promote` (rename → `sync_dir(snapshots)` → `sync_dir(uploads)`, con borrado del final si falla el sync) no cambia; `write_new_file` sigue haciendo `sync_all` antes del rename; el borrado de `src` ante error y el `ServerError::from(io::Error)` vía `?` son equivalentes; `&mut guard` se coerciona a `&mut RoomSlot` como hoy en `install`. Requiere `From<VerifyError>` (Q3) o mantener el `match` en el closure de `stage_chunk`.
 
 ### Q2. `Option::take_if` en `install` y `expire_locked`
 - **Dónde:** `mod.rs:135-143` y `lifecycle.rs:101-106`.
@@ -106,17 +107,20 @@
   ```
   Opcional: `mod.rs:145-149` también puede ir en una línea (`obsolete.extend(self.snapshots.insert(..).map(|p| p.path).filter(|p| *p != new_path))`). Ojo: es menos legible.
 - **Ahorro estimado:** ~8 líneas · **Riesgo:** bajo · **Prioridad:** alta.
+- **Verificación (2.ª pasada):** ✅ confirmada — `Option::take_if(FnOnce(&mut T) -> bool)` existe desde 1.80 y el `rustc` local es 1.97.0; sin `rust-version` en ningún `Cargo.toml`; mismo efecto (solo toma si el predicado es verdadero).
 
 ### Q3. Quitar el `impl Display for VerifyError`, que nadie usa
 - **Dónde:** `files.rs:181-188`.
 - **Problema:** grep no encuentra ningún uso de `VerifyError` como `Display` (ni `to_string`, ni `%err`, ni `{err}`). `recovery.rs:101-108` y `upload.rs:371-372` siempre desestructuran las variantes y formatean el `String` o el `io::Error` interno. Es código muerto que el compilador no marca porque es un `impl` de trait.
 - **Propuesta:** borrarlo. Si se quiere simplificar `upload.rs:368-373` (o la closure de Q1), se puede sumar un `impl From<VerifyError> for ServerError` de 6 líneas (`Io → ServerError::from`, `Invalid → BadRequest`) y usar `?`. El ahorro neto sería menor, pero el código queda más claro.
 - **Ahorro estimado:** ~9 líneas (≈3 si se agrega el `From`) · **Riesgo:** bajo · **Prioridad:** alta.
+- **Verificación (2.ª pasada):** ✅ confirmada — `VerifyError` (`pub(super)`, `derive(Debug)`) solo se desestructura en `recovery.rs:101-108` y `upload.rs:370-372`; no hay `impl Error` ni formateo con `%`/`{}` del enum entero.
 
 ### Q4. Corregir el doc desactualizado de `SnapshotRelay`
 - **Dónde:** `mod.rs:70`.
 - **Problema y propuesta:** ver la sección Comentarios. Contradice el diseño actual (persistencia en disco y recuperación al arrancar).
 - **Ahorro estimado:** 0 líneas · **Riesgo:** nulo · **Prioridad:** alta (claridad).
+- **Verificación (2.ª pasada):** ✅ confirmada — `mod.rs:70` sigue diciendo "Ephemeral relay…", contradice la persistencia en disco y la recuperación al arrancar.
 
 ### Q5. Un solo chequeo de tamaño máximo
 - **Dónde:** `upload.rs:162-168` y `upload.rs:50-54`.
