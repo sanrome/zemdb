@@ -249,6 +249,7 @@
 **Generales.** Los tests son de muy buena calidad: cada uno nombra un escenario de crash concreto, usan fail points deterministas en lugar de `sleep` y los timeouts están acotados y explicados. El problema es la repetición.
 
 - **T1 — Helpers duplicados entre los tres archivos (~50 líneas).** `USERS`, `schema()` (idéntico en `tests/compactor.rs:11-19`, `tests/recovery.rs:12-20` y `tests/disk.rs:12-20`), `insert`/`insert_named`/`insert_key` (tres variantes de lo mismo), `open_engine` (`tests/compactor.rs:32-36` = `tests/disk.rs:37-41`), `assert_rows` (`tests/compactor.rs:48-57` = `tests/recovery.rs:38-47`) y `staged_snapshot_files` (`tests/recovery.rs:261-268` = `tests/disk.rs:57-64`). Propuesta: un módulo `#[cfg(test)]` común, por ejemplo `disk/tests/support.rs`, declarado una sola vez desde `disk/mod.rs` con `#[cfg(test)] #[path = "tests/support.rs"] pub(crate) mod test_support;`. Respeta la convención de que los tests no viven en el código fuente, pero **a verificar** si el repo ya tiene un lugar acordado para fixtures compartidos.
+  - **Estado:** ✅ aplicada (paso 3) en `disk/tests/support.rs`, sin tocar `disk/mod.rs`: el módulo se declara desde `src/tests/disk.rs` (`#[path = "../disk/tests/support.rs"] pub(super) mod support;`), que ya es un módulo `#[cfg(test)]` de `disk`, así que lo ven `disk::compactor::tests` y `disk::recovery::tests`. Reúne `USERS`, `schema`, `sequenced` (único lugar con `with_default_origin`), `insert_named`/`insert_key`/`insert`, `engine_at`, `open_engine`, `reopen`, `apply_range`, `has_key`, `assert_rows`, `assert_room_failed`, `fail_compaction_leaving_compacting_wal`, `staged_snapshot_files`, `spawn_batch` y `spawn_compaction`. `snapshot_with_rows` sigue en `src/tests/disk.rs`, su único usuario.
 
 - **T2 — `disk/tests/compactor.rs` (~45–60 líneas):**
   - `failed_rotation_rollback_…` (`204-228`), `failed_wal_sync_before_compaction_…` (`231-250`) y `failed_directory_sync_after_wal_rotation_…` (`253-273`) son el mismo test con distintos fail points. Un helper `async fn failed_step_marks_room_failed(fail_points: &[&'static str])` y tres tests de una línea, igual que ya se hace con `failed_phase3_step_loses_no_batch`. **~25 líneas.**
@@ -257,12 +258,14 @@
   - `assert!(matches!(engine.apply_batch(&room, vec![insert(6)]).await, Err(StorageError::RoomFailed { .. })))` aparece 4 veces aquí y 4 en `tests/disk.rs`. Un helper `assert_room_failed` iría bien en T1.
   - `353`: la línea de doc supera el ancho del resto y está mal partida ("…still in effect. With `reopen_first`, the room is reopened from the").
   - `129`, `177`: usar `compacting_wal_path(&wal_path)` (`pub(crate)`) en lugar de repetir `with_extension("wal.compacting")`. Lo mismo en `tests/recovery.rs:121,415,430,455,470`.
+  - **Estado:** ✅ aplicada (paso 3) en todos los puntos. `failed_step_marks_room_failed(room, fail_points)` comprueba también en los tres tests que `compact_room` devuelve `RoomFailed` (antes solo lo hacía el de rollback); los tres pasan. El nombre de cada sala se conserva.
 
 - **T3 — `disk/tests/recovery.rs` (~40–55 líneas):**
   - `crash_while_folding_compacting_wal_recovers_all_data` (`85-96`) y `crash_before_compacting_wal_removal_recovers_all_data` (`99-110`) solo cambian el nombre del fail point. Se pueden unir en un `for fail_point_name in ["recovery.fold", "recovery.fold_cleanup"]`, como ya hace `484-506`. **~12 líneas.**
   - `append_batch` (`74-82`) es `append_raw(path, &encode_wal_batch(ops, None).unwrap())` (`append_raw` está en `316-324`), y `189-194` reimplementa `append_raw` en línea. **~12 líneas.**
   - `assert!(matches!(result, Err(StorageError::WalCorruption(_))), "...{result:?}")` aparece en `173`, `227-230`, `362-365`, `402-405` y `475-478`. Un helper `assert_corruption(&result, ctx)` ahorraría **~10 líneas.**
   - `216-217`: `frame_len(name_len)` y la construcción de `first` repiten `encode_wal_batch(&[insert_named(1, 1, &"x".repeat(n))], None)`. Un closure `frame(n)` que devuelva el `Vec` resolvería las dos cosas. **~3 líneas.**
+  - **Estado:** ✅ aplicada (paso 3), salvo la fusión de los dos tests de fold en un `for`: las instrucciones de este paso piden un test por modo de fallo, así que comparten el cuerpo `crash_while_folding_recovers_all_data(room, fail_point)` y quedan dos tests de una línea. `assert_wal_corruption(&result, context)` cubre los cinco sitios y `frame(n)` devuelve el `Vec`.
 
 - **T4 — `src/tests/disk.rs` (~45–60 líneas):**
   - `288-296` reconstruye a mano lo mismo que `snapshot_with_rows(&room, 101, 5)` (claves `100 + seq`, `seq` 1..=5). **~8 líneas.**
@@ -272,5 +275,6 @@
   - `351`: crea un motor solo para calcular `wal_path`. `engine.wal_file_path(&room)` después de `352` da lo mismo.
   - `647` y `705`: `std::time::Duration` con la ruta completa, cuando ya se usa dos veces. Basta importarlo.
   - `593-626`: los cuatro tests de `compaction_aborted_at(pause, orphan, after, direct)` reciben dos `bool` posicionales, y en la llamada `(…, false, AfterAbort::WriteAndCompact, true)` no se lee qué significa cada uno. Se puede pasar `direct` a un enum `Caller::{Direct, CompactRoom}` como ya se hizo con `AfterAbort`. Gana claridad, no líneas.
+  - **Estado:** ✅ aplicada (paso 3) en todos los puntos, con `Caller::{Direct, CompactRoom}` en lugar del `bool`. Los `RoomFailed` usan `assert_room_failed` y "cerrar y reabrir" usa `reopen`.
 
 - **Lo que no hay que tocar en los tests:** los tests de un escenario por función con nombres descriptivos (no conviene fusionarlos en tablas grandes, porque el nombre es la documentación del caso de crash) y los comentarios que explican qué estado deja el fallo inyectado (p. ej. `tests/compactor.rs:159-160`, `tests/disk.rs:157-158` y `:229-230`, `tests/recovery.rs:148-149`).

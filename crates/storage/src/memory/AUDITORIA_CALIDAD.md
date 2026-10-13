@@ -158,8 +158,11 @@ Densidad baja-moderada (74 líneas de doc/comentario sobre 872) y en general de 
 ## Tests
 
 - **`tests/memory.rs`.** Tres tests (`56`, `87`, `118`) repiten el armado de “motor fuente + sala + `apply_batch` de 3 inserts + `create_snapshot`” (`64-73`, `91-95`, `122-126`). Un helper `async fn snapshot_of(room: &RoomId, keys: impl IntoIterator<Item = i64>) -> Vec<u8>` ahorra ~10 líneas. Además, `67-71` (`[10, 11, 12].iter().enumerate()…`) se vuelve más legible.
+  - **Estado:** ✅ aplicada (paso 3): `snapshot_of(room, keys)`, con las mismas salas y claves.
 - **`tests/memory.rs:97-100` y `128-131`.** Repiten el nombre de la sala como literal en `Path::new("…")`. `Path::new(room.as_str())` refleja exactamente la clave que usa producción (`mod.rs:355`, `PathBuf::from(room_id.as_str())`) y evita que el literal se desincronice.
+  - **Estado:** ✅ aplicada (paso 3)
 - **`tests/memory.rs:80`.** `zemdb_core::SequenceNumber::from(3u64)`: los demás tests comparan con `.get() == 3`. Unificar el estilo.
+  - **Estado:** ✅ aplicada (paso 3)
 - **`memory/tests/state.rs`.** Es compacto y cubre la compatibilidad de bytes con el encoding `BTreeMap`; no hay nada que recortar.
 - **Cobertura.** Si se aplica Q2, conviene un test de scan con `limit` exacto múltiplo de `BATCH_SIZE` (64) y otro con `Backward` + cursor. Los tests de integración (`crates/storage/tests/query_pushdowns_tests.rs`) cubren gran parte; hay que verificar que incluyan esos bordes.
   - **Estado:** ✅ aplicada (paso 3). Los tests de integración los cubrían solo en parte (los límites probados eran 2, 3 y 75, y el `Backward` que cruzaba lotes no tenía rango ni terminaba en un borde de lote). `scan_stops_at_batch_boundaries` en `tests/query_pushdowns_tests.rs`, con un test por motor, prueba `limit` 64 y 128 hacia adelante y hacia atrás y un `Backward` sobre un rango de exactamente dos lotes, que continúa desde el cursor.

@@ -1,50 +1,13 @@
+use crate::disk::compactor::compacting_wal_path;
 use crate::disk::format::encode_wal_batch;
+use crate::disk::tests::support::*;
 use crate::fail_point;
-use crate::{DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError};
+use crate::{DiskStorageEngine, StorageEngine, StorageError};
+use std::fmt::Debug;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
-use zemdb_core::{
-    CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequencedOperation, TableSchema,
-    Value,
-};
-
-const USERS: u16 = 0;
-
-fn schema() -> Schema {
-    let users = TableSchema::builder("users")
-        .table_id(USERS)
-        .primary_key("id", DataType::Int)
-        .column("name", DataType::String);
-    Schema::builder().table(users).build()
-}
-
-fn insert_named(seq: u64, key: i64, name: &str) -> SequencedOperation {
-    let row = CompactRow::new(vec![Value::Int(key), Value::String(name.into())]);
-    SequencedOperation::with_default_origin(
-        seq,
-        Operation::insert(USERS, PrimaryKey::single(key), row, 100),
-    )
-}
-
-fn insert(seq: u64) -> SequencedOperation {
-    insert_named(seq, seq as i64, &format!("user {seq}"))
-}
-
-fn engine_at(dir: &Path) -> DiskStorageEngine {
-    DiskStorageEngine::new(DiskStorageOptions::new(dir).auto_compact(false))
-}
-
-async fn assert_rows(engine: &DiskStorageEngine, room: &RoomId, last: u64) {
-    assert_eq!(engine.get_head_seq(room).await.unwrap().get(), last);
-    for seq in 1..=last {
-        let row = engine
-            .get(room, "users", &PrimaryKey::single(seq as i64))
-            .await
-            .unwrap();
-        assert!(row.is_some(), "row {seq} lost");
-    }
-}
+use zemdb_core::{PrimaryKey, RoomId, SequencedOperation, Value};
 
 async fn name_of(engine: &DiskStorageEngine, room: &RoomId, key: i64) -> Value {
     let row = engine
@@ -58,55 +21,58 @@ async fn name_of(engine: &DiskStorageEngine, room: &RoomId, key: i64) -> Value {
 /// Leaves the room as a crash after a failed compaction would: snapshot without the latest
 /// writes, an orphan `.wal.compacting` holding 1..=5 and the active `.wal` holding 6..=8.
 async fn leave_orphan_compacting(dir: &Path, room: &RoomId) {
-    let engine = engine_at(dir);
-    engine.open_room(room, schema()).await.unwrap();
-    for seq in 1..=5 {
-        engine.apply_batch(room, vec![insert(seq)]).await.unwrap();
-    }
-    fail_point::arm("compaction.phase2", &engine.snap_file_path(room));
-    assert!(engine.compact_room(room).await.is_err());
-    for seq in 6..=8 {
-        engine.apply_batch(room, vec![insert(seq)]).await.unwrap();
-    }
+    let engine = open_engine(dir, room).await;
+    apply_range(&engine, room, 1..=5).await;
+    fail_compaction_leaving_compacting_wal(&engine, room).await;
+    apply_range(&engine, room, 6..=8).await;
     // Dropped without close_room, as in a crash.
 }
 
-fn append_batch(path: &Path, ops: &[SequencedOperation]) {
-    let bytes = encode_wal_batch(ops, None).unwrap();
-    let mut file = std::fs::OpenOptions::new()
+fn append_raw(path: &Path, bytes: &[u8]) {
+    std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
+        .unwrap()
+        .write_all(bytes)
         .unwrap();
-    file.write_all(&bytes).unwrap();
+}
+
+fn append_batch(path: &Path, ops: &[SequencedOperation]) {
+    append_raw(path, &encode_wal_batch(ops, None).unwrap());
+}
+
+/// Checks that `result` is a `WalCorruption` error, naming `context` if it is not.
+fn assert_wal_corruption<T: Debug>(result: &Result<T, StorageError>, context: &str) {
+    assert!(
+        matches!(result, Err(StorageError::WalCorruption(_))),
+        "{context}: unexpected result: {result:?}"
+    );
+}
+
+/// Crashes the recovery of a room with an orphan `.wal.compacting` at `fail_point_name`, while
+/// it folds that file into the snapshot, and checks that the next open recovers every row.
+async fn crash_while_folding_recovers_all_data(room_name: &str, fail_point_name: &'static str) {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new(room_name).unwrap();
+    leave_orphan_compacting(dir.path(), &room).await;
+
+    let engine = engine_at(dir.path());
+    fail_point::arm(fail_point_name, &engine.wal_file_path(&room));
+    assert!(engine.open_room(&room, schema()).await.is_err());
+
+    engine.open_room(&room, schema()).await.unwrap();
+    assert_rows(&engine, &room, 8).await;
 }
 
 #[tokio::test]
 async fn crash_while_folding_compacting_wal_recovers_all_data() {
-    let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("fold-crash").unwrap();
-    leave_orphan_compacting(dir.path(), &room).await;
-
-    let engine = engine_at(dir.path());
-    fail_point::arm("recovery.fold", &engine.wal_file_path(&room));
-    assert!(engine.open_room(&room, schema()).await.is_err());
-
-    engine.open_room(&room, schema()).await.unwrap();
-    assert_rows(&engine, &room, 8).await;
+    crash_while_folding_recovers_all_data("fold-crash", "recovery.fold").await;
 }
 
 #[tokio::test]
 async fn crash_before_compacting_wal_removal_recovers_all_data() {
-    let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("cleanup-crash").unwrap();
-    leave_orphan_compacting(dir.path(), &room).await;
-
-    let engine = engine_at(dir.path());
-    fail_point::arm("recovery.fold_cleanup", &engine.wal_file_path(&room));
-    assert!(engine.open_room(&room, schema()).await.is_err());
-
-    engine.open_room(&room, schema()).await.unwrap();
-    assert_rows(&engine, &room, 8).await;
+    crash_while_folding_recovers_all_data("cleanup-crash", "recovery.fold_cleanup").await;
 }
 
 #[tokio::test]
@@ -118,15 +84,11 @@ async fn recovered_compacting_wal_is_folded_and_removed() {
     let engine = engine_at(dir.path());
     engine.open_room(&room, schema()).await.unwrap();
 
-    let compacting = engine.wal_file_path(&room).with_extension("wal.compacting");
-    assert!(!compacting.exists());
+    assert!(!compacting_wal_path(&engine.wal_file_path(&room)).exists());
     let room_handle = engine.get_room(&room).await.unwrap();
     assert_eq!(room_handle.state.read().await.snapshot_seq.get(), 8);
     drop(room_handle);
-    engine.close_room(&room).await.unwrap();
-
-    let reopened = engine_at(dir.path());
-    reopened.open_room(&room, schema()).await.unwrap();
+    let reopened = reopen(engine, dir.path(), &room).await;
     assert_rows(&reopened, &room, 8).await;
 }
 
@@ -170,7 +132,7 @@ async fn replay_rejects_sequence_gap() {
 
     let result = engine.open_room(&room, schema()).await;
 
-    assert!(matches!(result, Err(StorageError::WalCorruption(_))));
+    assert_wal_corruption(&result, "a gap in the sequence");
 }
 
 #[tokio::test]
@@ -186,12 +148,7 @@ async fn checksum_mismatch_before_a_partial_header_is_a_torn_write() {
     *damaged.last_mut().unwrap() ^= 0xFF;
     // Followed by fewer bytes than a frame header, even though they start like one.
     damaged.extend_from_slice(&[0xBA, 0x7C, 0x01, 0x00, 0x00]);
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&wal_path)
-        .unwrap()
-        .write_all(&damaged)
-        .unwrap();
+    append_raw(&wal_path, &damaged);
 
     engine.open_room(&room, schema()).await.unwrap();
 
@@ -208,13 +165,10 @@ async fn checksum_mismatch_before_a_complete_frame_is_corruption_at_any_offset()
 
     // A first frame that ends one byte before a 64 KiB boundary, where a buffered reader that
     // looks ahead with a single read sees only one byte of the frame that follows.
-    let frame_len = |name_len: usize| {
-        encode_wal_batch(&[insert_named(1, 1, &"x".repeat(name_len))], None)
-            .unwrap()
-            .len()
+    let frame = |name_len: usize| {
+        encode_wal_batch(&[insert_named(1, 1, &"x".repeat(name_len))], None).unwrap()
     };
-    let name_len = 64 * 1024 - 1 - frame_len(0);
-    let mut first = encode_wal_batch(&[insert_named(1, 1, &"x".repeat(name_len))], None).unwrap();
+    let mut first = frame(64 * 1024 - 1 - frame(0).len());
     assert_eq!(first.len(), 64 * 1024 - 1);
     *first.last_mut().unwrap() ^= 0xFF;
     let mut wal = first;
@@ -224,10 +178,7 @@ async fn checksum_mismatch_before_a_complete_frame_is_corruption_at_any_offset()
     let result = engine.open_room(&room, schema()).await;
 
     // A complete, durable frame follows the damaged one: truncating would silently drop it.
-    assert!(
-        matches!(result, Err(StorageError::WalCorruption(_))),
-        "unexpected result: {result:?}"
-    );
+    assert_wal_corruption(&result, "a damaged frame before a complete one");
     assert_eq!(
         std::fs::metadata(&wal_path).unwrap().len(),
         wal.len() as u64
@@ -238,12 +189,9 @@ async fn checksum_mismatch_before_a_complete_frame_is_corruption_at_any_offset()
 async fn failed_snapshot_existence_check_fails_open_and_keeps_the_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let room = RoomId::new("snapshot-stat-failure").unwrap();
-    let engine = engine_at(dir.path());
+    let engine = open_engine(dir.path(), &room).await;
     let snap_path = engine.snap_file_path(&room);
-    engine.open_room(&room, schema()).await.unwrap();
-    for seq in 1..=3 {
-        engine.apply_batch(&room, vec![insert(seq)]).await.unwrap();
-    }
+    apply_range(&engine, &room, 1..=3).await;
     // The snapshot now holds every row and the WAL is empty.
     engine.compact_room(&room).await.unwrap();
     engine.close_room(&room).await.unwrap();
@@ -256,15 +204,6 @@ async fn failed_snapshot_existence_check_fails_open_and_keeps_the_snapshot() {
 
     engine.open_room(&room, schema()).await.unwrap();
     assert_rows(&engine, &room, 3).await;
-}
-
-/// Names of the staged snapshot files left in `dir`.
-fn staged_snapshot_files(dir: &Path) -> Vec<String> {
-    std::fs::read_dir(dir)
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|name| name.contains(".snap.tmp."))
-        .collect()
 }
 
 #[tokio::test]
@@ -313,16 +252,6 @@ async fn crash_before_initial_snapshot_rename_is_cleaned_up_on_next_open() {
     assert!(staged_snapshot_files(dir.path()).is_empty());
 }
 
-fn append_raw(path: &Path, bytes: &[u8]) {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .unwrap()
-        .write_all(bytes)
-        .unwrap();
-}
-
 /// Bytes a crash can leave where a frame was being written: a header still in zeros followed
 /// by data that is not a frame.
 fn zeroed_header_and_garbage() -> Vec<u8> {
@@ -359,10 +288,7 @@ async fn damaged_length_in_the_middle_is_corruption_and_leaves_the_wal_intact() 
 
         let result = engine.open_room(&room, schema()).await;
 
-        assert!(
-            matches!(result, Err(StorageError::WalCorruption(_))),
-            "{name}: unexpected result: {result:?}"
-        );
+        assert_wal_corruption(&result, name);
         assert_eq!(std::fs::read(&wal_path).unwrap(), wal, "{name}");
     }
 }
@@ -399,10 +325,7 @@ async fn zeroed_header_followed_by_a_valid_frame_is_corruption() {
 
     let result = engine.open_room(&room, schema()).await;
 
-    assert!(
-        matches!(result, Err(StorageError::WalCorruption(_))),
-        "unexpected result: {result:?}"
-    );
+    assert_wal_corruption(&result, "a zeroed header before a valid frame");
     assert_eq!(std::fs::read(&wal_path).unwrap(), wal);
 }
 
@@ -412,7 +335,7 @@ async fn compacting_wal_with_a_torn_tail_is_folded() {
     let room = RoomId::new("compacting-torn").unwrap();
     leave_orphan_compacting(dir.path(), &room).await;
     let engine = engine_at(dir.path());
-    let compacting = engine.wal_file_path(&room).with_extension("wal.compacting");
+    let compacting = compacting_wal_path(&engine.wal_file_path(&room));
     append_raw(&compacting, &zeroed_header_and_garbage());
 
     engine.open_room(&room, schema()).await.unwrap();
@@ -427,8 +350,7 @@ async fn compacting_wal_with_a_torn_tail_is_folded() {
 fn leave_damaged_absorb(engine: &DiskStorageEngine, room: &RoomId, damage: HeaderDamage) {
     let mut copy = std::fs::read(engine.wal_file_path(room)).unwrap();
     damage(&mut copy);
-    let compacting = engine.wal_file_path(room).with_extension("wal.compacting");
-    append_raw(&compacting, &copy);
+    append_raw(&compacting_wal_path(&engine.wal_file_path(room)), &copy);
 }
 
 const ABSORB_DAMAGE: [(&str, HeaderDamage); 2] = [
@@ -452,7 +374,7 @@ async fn crash_while_absorbing_recovers_the_damaged_copy_from_the_active_wal() {
         engine.open_room(&room, schema()).await.unwrap();
 
         assert_rows(&engine, &room, 8).await;
-        let compacting = engine.wal_file_path(&room).with_extension("wal.compacting");
+        let compacting = compacting_wal_path(&engine.wal_file_path(&room));
         assert!(!compacting.exists(), "{name}");
     }
 }
@@ -467,15 +389,12 @@ async fn damaged_rotated_wal_is_corruption_when_the_active_wal_does_not_cover_it
         leave_damaged_absorb(&engine, &room, damage);
         // As after an absorb that completed: the active WAL was emptied.
         std::fs::write(engine.wal_file_path(&room), b"").unwrap();
-        let compacting = engine.wal_file_path(&room).with_extension("wal.compacting");
+        let compacting = compacting_wal_path(&engine.wal_file_path(&room));
         let before = std::fs::read(&compacting).unwrap();
 
         let result = engine.open_room(&room, schema()).await;
 
-        assert!(
-            matches!(result, Err(StorageError::WalCorruption(_))),
-            "{name}: unexpected result: {result:?}"
-        );
+        assert_wal_corruption(&result, name);
         assert_eq!(std::fs::read(&compacting).unwrap(), before, "{name}");
     }
 }

@@ -2,6 +2,7 @@ mod common;
 
 use common::*;
 use futures::StreamExt;
+use std::ops::Bound;
 use zemdb_core::{CompactRow, PrimaryKey, RoomId, Value};
 use zemdb_storage::{KeyRange, MemoryStorageEngine, ScanOptions, StorageEngine};
 
@@ -214,4 +215,29 @@ async fn test_scan_snapshot_isolation_disk() {
     let tmp = tempfile::tempdir().unwrap();
     let room_id = RoomId::new("room-iso-disk").unwrap();
     scan_is_snapshot_isolated(&disk_engine(tmp.path()), &room_id).await;
+}
+
+#[test]
+fn key_range_contains_exactly_the_keys_within_its_bounds() {
+    let pk = |id: i64| PrimaryKey::single(id);
+    let after_two = KeyRange {
+        start: Bound::Excluded(pk(2)),
+        end: Bound::Unbounded,
+    };
+    let cases: [(&str, KeyRange, &[i64], &[i64]); 6] = [
+        ("2..=4", KeyRange::from(pk(2)..=pk(4)), &[2, 3, 4], &[1, 5]),
+        ("2..4", KeyRange::from(pk(2)..pk(4)), &[2, 3], &[1, 4]),
+        ("..4", KeyRange::from(..pk(4)), &[i64::MIN, 3], &[4]),
+        ("2..", KeyRange::from(pk(2)..), &[2, i64::MAX], &[1]),
+        ("(2, ..)", after_two, &[3, i64::MAX], &[1, 2]),
+        ("..", KeyRange::all(), &[i64::MIN, 0, i64::MAX], &[]),
+    ];
+    for (name, range, inside, outside) in cases {
+        for &id in inside {
+            assert!(range.contains(&pk(id)), "{name} must contain {id}");
+        }
+        for &id in outside {
+            assert!(!range.contains(&pk(id)), "{name} must not contain {id}");
+        }
+    }
 }

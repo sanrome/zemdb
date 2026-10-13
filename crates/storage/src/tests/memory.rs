@@ -1,5 +1,7 @@
 use crate::fail_point;
 use crate::{MemoryStorageEngine, StorageEngine};
+use std::path::Path;
+use std::time::Duration;
 use zemdb_core::{
     CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequencedOperation, TableSchema,
     Value,
@@ -24,6 +26,19 @@ fn insert(seq: u64, key: i64) -> SequencedOperation {
         seq,
         Operation::insert(USERS, PrimaryKey::single(key), row, 100),
     )
+}
+
+/// A snapshot of `room` holding one row per key, inserted in a single batch at sequences
+/// `1..`, so that its head sequence is the number of keys.
+async fn snapshot_of(room: &RoomId, keys: impl IntoIterator<Item = i64>) -> Vec<u8> {
+    let source = MemoryStorageEngine::new();
+    source.open_room(room, schema()).await.unwrap();
+    let ops = (1u64..)
+        .zip(keys)
+        .map(|(seq, key)| insert(seq, key))
+        .collect();
+    source.apply_batch(room, ops).await.unwrap();
+    source.create_snapshot(room).await.unwrap()
 }
 
 #[tokio::test]
@@ -61,23 +76,14 @@ async fn snapshot_is_visible_through_room_handle_taken_before() {
     // A writer that looked up the room before the snapshot keeps this handle.
     let handle = engine.get_room(&room).unwrap();
 
-    let source = MemoryStorageEngine::new();
-    let source_room = RoomId::new("source").unwrap();
-    source.open_room(&source_room, schema()).await.unwrap();
-    let ops = [10, 11, 12]
-        .iter()
-        .enumerate()
-        .map(|(i, key)| insert(i as u64 + 1, *key))
-        .collect();
-    source.apply_batch(&source_room, ops).await.unwrap();
-    let snapshot = source.create_snapshot(&source_room).await.unwrap();
+    let snapshot = snapshot_of(&RoomId::new("source").unwrap(), [10, 11, 12]).await;
     engine
         .apply_snapshot(&room, schema(), snapshot.into(), 3u64.into())
         .await
         .unwrap();
 
     let state = handle.read().unwrap();
-    assert_eq!(state.head_seq, zemdb_core::SequenceNumber::from(3u64));
+    assert_eq!(state.head_seq.get(), 3);
     assert!(state.tables[&USERS]
         .get(&PrimaryKey::single(12i64))
         .is_some());
@@ -88,16 +94,10 @@ async fn snapshot_is_decoded_without_blocking_the_runtime() {
     let engine = MemoryStorageEngine::new();
     let room = RoomId::new("decoded-off-the-runtime").unwrap();
     engine.open_room(&room, schema()).await.unwrap();
-    let source = MemoryStorageEngine::new();
-    source.open_room(&room, schema()).await.unwrap();
-    let ops = (1..=3).map(|seq| insert(seq, seq as i64)).collect();
-    source.apply_batch(&room, ops).await.unwrap();
-    let snapshot = source.create_snapshot(&room).await.unwrap();
+    let snapshot = snapshot_of(&room, 1..=3).await;
 
-    let mut pause = fail_point::arm_blocking_pause(
-        "apply_snapshot.decode",
-        std::path::Path::new("decoded-off-the-runtime"),
-    );
+    let mut pause =
+        fail_point::arm_blocking_pause("apply_snapshot.decode", Path::new(room.as_str()));
     // The runtime has a single thread: this task only runs if decoding leaves it free.
     let releaser = tokio::spawn(async move {
         pause.reached().await;
@@ -108,7 +108,7 @@ async fn snapshot_is_decoded_without_blocking_the_runtime() {
         .await
         .unwrap();
     assert_eq!(head.get(), 3);
-    tokio::time::timeout(std::time::Duration::from_secs(10), releaser)
+    tokio::time::timeout(Duration::from_secs(10), releaser)
         .await
         .expect("decoding never reached its pause point")
         .unwrap();
@@ -119,16 +119,10 @@ async fn snapshot_goes_to_the_room_open_when_decoding_ends() {
     let engine = MemoryStorageEngine::new();
     let room = RoomId::new("reopened-while-decoding").unwrap();
     engine.open_room(&room, schema()).await.unwrap();
-    let source = MemoryStorageEngine::new();
-    source.open_room(&room, schema()).await.unwrap();
-    let ops = (1..=3).map(|seq| insert(seq, seq as i64)).collect();
-    source.apply_batch(&room, ops).await.unwrap();
-    let snapshot = source.create_snapshot(&room).await.unwrap();
+    let snapshot = snapshot_of(&room, 1..=3).await;
 
-    let mut pause = fail_point::arm_blocking_pause(
-        "apply_snapshot.decode",
-        std::path::Path::new("reopened-while-decoding"),
-    );
+    let mut pause =
+        fail_point::arm_blocking_pause("apply_snapshot.decode", Path::new(room.as_str()));
     let apply = tokio::spawn({
         let (engine, room) = (engine.clone(), room.clone());
         async move {
