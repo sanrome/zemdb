@@ -158,17 +158,26 @@ macro_rules! from_lossless_int {
 
 from_lossless_int!(i8, i16, i32, i64, u8, u16, u32);
 
+/// `-0.0` and `0.0` are the same value: both map to `0.0`, which keeps `Hash` consistent with
+/// `Eq`.
+#[inline]
+fn canonical(v: f64) -> f64 {
+    if v == 0.0 {
+        0.0
+    } else {
+        v
+    }
+}
+
 impl From<f32> for Value {
     fn from(v: f32) -> Self {
-        let val = if v == 0.0 { 0.0 } else { v as f64 };
-        Value::Float(val)
+        Value::from(f64::from(v))
     }
 }
 
 impl From<f64> for Value {
     fn from(v: f64) -> Self {
-        let val = if v == 0.0 { 0.0 } else { v };
-        Value::Float(val)
+        Value::Float(canonical(v))
     }
 }
 
@@ -244,10 +253,7 @@ impl Hash for Value {
         match self {
             Value::Null => {}
             Value::Int(v) => v.hash(state),
-            Value::Float(v) => {
-                let canonical = if *v == 0.0 { 0.0 } else { *v };
-                canonical.to_bits().hash(state);
-            }
+            Value::Float(v) => canonical(*v).to_bits().hash(state),
             Value::Timestamp(v) => v.hash(state),
             Value::Uuid(v) => v.hash(state),
             Value::String(v) => v.hash(state),
@@ -269,11 +275,7 @@ impl Ord for Value {
             (Value::Null, Value::Null) => Ordering::Equal,
             (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
             (Value::Int(a), Value::Int(b)) => a.cmp(b),
-            (Value::Float(a), Value::Float(b)) => {
-                let ca = if *a == 0.0 { 0.0 } else { *a };
-                let cb = if *b == 0.0 { 0.0 } else { *b };
-                ca.total_cmp(&cb)
-            }
+            (Value::Float(a), Value::Float(b)) => canonical(*a).total_cmp(&canonical(*b)),
             (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
             (Value::Uuid(a), Value::Uuid(b)) => a.cmp(b),
             (Value::String(a), Value::String(b)) => a.cmp(b),

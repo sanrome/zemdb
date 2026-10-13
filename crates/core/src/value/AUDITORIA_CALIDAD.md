@@ -127,6 +127,7 @@
 - **Problema:** la regla "`-0.0` y `0.0` son el mismo valor" vive copiada en 5 sitios. Si se cambia en uno y no en otro, `Hash` y `Eq` quedan incoherentes.
 - **Propuesta:** agregar `#[inline] fn canonical(v: f64) -> f64 { if v == 0.0 { 0.0 } else { v } }` con una línea doc ("`-0.0` and `0.0` are the same value; keeps `Hash` consistent with `Eq`"). `From<f32>` pasa a ser `Value::from(f64::from(v))`. Para NaN no cambia nada: `NaN == 0.0` es falso, igual que hoy.
 - **Ahorro estimado:** ~0–2 líneas netas (el beneficio es claridad y una sola fuente de verdad) · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 2)
 
 ### Q7. `PrimaryKey::single` sin `push` manual
 - **Dónde:** `row.rs:20-24`.
