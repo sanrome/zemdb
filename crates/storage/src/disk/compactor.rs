@@ -93,7 +93,7 @@ pub(crate) async fn compact_room_cow(
 ) -> Result<(), StorageError> {
     let wal_compacting_path = compacting_wal_path(&room.wal_path);
 
-    // Phase 1: WAL rotation under the WAL mutex
+    // Phase 1
     let (_flag, cut_seq, snapshot_tables) = {
         let mut wal = room.wal.lock().await;
         wal.ensure_usable()?;
@@ -128,10 +128,10 @@ pub(crate) async fn compact_room_cow(
 
         let state = room.state.read().await;
         (flag, state.head_seq, state.tables.clone())
-    }; // Locks released immediately
+    }; // WAL mutex and state lock released here; the flag lives until the end
     fail_point::pause("compaction.staging", &room.wal_path).await;
 
-    // Phase 2: Heavy serialization, compression and disk I/O in blocking worker thread
+    // Phase 2
     let zstd_level = options.zstd_level;
     let staged = {
         let snap_path = room.snap_path.clone();
@@ -150,7 +150,7 @@ pub(crate) async fn compact_room_cow(
         .map_err(|e| StorageError::Other(format!("Join error: {e}")))??
     };
 
-    // Phase 3: Final atomic replacement and cleanup
+    // Phase 3
     let renamed = async {
         fail_point::check("compaction.phase3_rename", &room.wal_path)?;
         rename(&staged.tmp_path, &room.snap_path).await?;
@@ -376,8 +376,7 @@ fn stage_file_blocking(
 ) -> Result<StagedSnapshot, StorageError> {
     use std::io::Write;
 
-    let uuid_str = uuid::Uuid::new_v4().to_string();
-    let tmp_path = snap_path.with_extension(format!("snap.tmp.{}", uuid_str));
+    let tmp_path = snap_path.with_extension(format!("snap.tmp.{}", uuid::Uuid::new_v4()));
 
     let std_tmp = std::fs::OpenOptions::new()
         .create_new(true)

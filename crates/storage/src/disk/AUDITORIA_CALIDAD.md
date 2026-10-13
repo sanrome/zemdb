@@ -39,14 +39,21 @@
 
 **Recortar o reescribir:**
 - `mod.rs:218-231`, la doc de `DiskStorageEngine`: tono de marketing ("High-performance", "True CoW compaction", "Fast in-memory tables") y repite lo que ya documentan `DiskRoom` (`mod.rs:184-200`) y `compact_room_cow` (`compactor.rs:60-88`). Alcanza con 5–6 líneas: los dos archivos por room, el formato de cada uno y un enlace a `DiskRoom` y `compact_room_cow`. **~5–7 líneas.**
+  - **Estado:** ✅ aplicada (paso 1)
 - Comentarios numerados de `apply_batch` que repiten el código: `mod.rs:572` ("// 2. Encode WAL records into framed byte buffer") y `mod.rs:624` ("// 5. Check if compaction threshold is triggered"). Conviene quitar la numeración y quedarse con el texto de los pasos 3 y 4, que explica el *por qué*. `mod.rs:562` puede quedar en "// Validate against the schema and the head." **~2 líneas.**
+  - **Estado:** ✅ aplicada (paso 1)
 - `compactor.rs:131` "// Locks released immediately": engaña un poco, porque `_flag` sigue vivo hasta el final de la función. Mejor quitarlo o escribir "WAL mutex and state lock released here; the flag lives until the end".
+  - **Estado:** ✅ aplicada (paso 1) (con el texto alternativo propuesto)
 - `compactor.rs:96`, `134`, `153` ("// Phase N: …") repiten la doc de la función. Sirven como señales: se pueden dejar, pero recortadas a "// Phase 1", "// Phase 2", "// Phase 3".
+  - **Estado:** ✅ aplicada (paso 1)
 - `format.rs:8`, `format.rs:14`: "Alias … for backward compatibility". Dentro del workspace nadie usa `FILE_VERSION`, y `MAGIC_BYTES` solo lo usa un test de integración (ver Q7).
 - `format.rs:152-177`: las cuatro docs de los wrappers repiten el nombre de la función. Basta un solo comentario encima del bloque: "Wrappers that convert `WalFrameError` into `StorageError`".
+  - **Estado:** ✅ aplicada (paso 1)
 - `wal.rs:13-16` y `wal.rs:26-29`: el mismo párrafo copiado dos veces (desaparece con Q6).
+  - **Estado:** ✅ aplicada (paso 1) (junto con Q6)
 - `recovery.rs:226-240` (doc de `recover_room`) y los comentarios de paso `recovery.rs:256`, `353`, `396`, `431` se solapan. Si se aplica Q8 (partir la función), cada paso se documenta una sola vez en su helper.
 - `mod.rs:379` "Fast lookup of an open room handle." no aporta nada a la firma `get_room(&self, room_id) -> Result<Arc<DiskRoom>, _>` y se puede borrar. Lo mismo vale para `mod.rs:240` ("Creates a new `DiskStorageEngine` with the given configuration options.") y `wal.rs:60` y `wal.rs:65`.
+  - **Estado:** ✅ aplicada (paso 1)
 
 ## Sugerencias
 
@@ -136,6 +143,7 @@
   `encode` escribe exactamente esos bytes en `0..36`, y `header_crc` va en `36..40`, que el hash no incluye, así que el resultado es idéntico (también en `new`, donde `header_crc` vale 0 en ese momento). Opcional: una constante `const CRC_COVERED: usize = 36;` en lugar del número mágico, que aparece en `format.rs:30,68,70`.
 - **Ahorro estimado:** ~9 líneas · **Riesgo:** bajo · **Prioridad:** alta (corrige una duplicación del formato en disco)
 - **Verificación (2.ª pasada):** ✅ confirmada — `encode()[..36]` produce los mismos bytes que `buf`, y `header_crc` (36..40) y `reserved` quedan fuera. Las líneas 30/68/70 son correctas.
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q6 — `WalWriter::write_record` es `write_batch` con un slice de un elemento
 - **Dónde:** `wal.rs:13-24`.
@@ -148,6 +156,7 @@
   ```
   `encode_wal_batch(from_ref(op), None)` es justo lo que hace `encode_batch(from_ref(op))`, así que los bytes y el `flush` salen iguales.
 - **Ahorro estimado:** ~5 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q7 — API pública sin uso o de "compatibilidad" (a verificar)
 - **Dónde y uso real (grep en todo el workspace):**
@@ -186,6 +195,7 @@
   ```
   Conserva el orden: el `.lock` se abre y se bloquea antes de abrir el WAL, y el `?` corta antes del segundo.
 - **Ahorro estimado:** ~6 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q10 — Segunda comprobación en `apply_snapshot` con un `match` de tres ramas
 - **Dónde:** `mod.rs:766-780`.
@@ -203,6 +213,7 @@
   ```
   Es la misma prioridad (primero `ensure_usable`, después la cabeza), la misma limpieza y el mismo valor de retorno.
 - **Ahorro estimado:** ~5 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1) sobre el código actual, que ya agrupaba `ensure_usable` y `snapshot_head_outcome` en un `match` de tres ramas
 
 ### Q11 — Detalles menores de redacción
 - `recovery.rs:264-267` y `recovery.rs:360-363`: `std::fs::OpenOptions::new().read(true).open(p)?` es `std::fs::File::open(p)?` (sigue siendo síncrono, la semántica no cambia), y `snap_meta` se usa una sola vez: `let snap_file_len = snap_file.metadata().await?.len();`. **~4 líneas.**
@@ -211,6 +222,7 @@
 - `mod.rs:319-322`: `state.remaining_limit.map_or(BATCH_SIZE, |l| l.min(BATCH_SIZE))` (queda absorbido por Q1).
 - `compactor.rs:379-380`: `let tmp_path = snap_path.with_extension(format!("snap.tmp.{}", uuid::Uuid::new_v4()));`. El `to_string()` intermedio sobra. **1 línea.**
 - `compactor.rs:461-471`: con Q3, `write_empty_snapshot_file` queda en ~4 líneas.
+- **Estado:** ✅ aplicada (paso 1) en `recovery.rs:264-267` y `360-363`, `format.rs:98-99` y `121-122` y `compactor.rs:379-380`. Las viñetas de `mod.rs:487-491`, `mod.rs:319-322` y `compactor.rs:461-471` dependen de Q1 y Q3 y quedan para el paso 2.
 
 ## Lo que conviene dejar como está
 

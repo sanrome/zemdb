@@ -65,17 +65,9 @@ impl FileHeader {
         header
     }
 
-    /// Computes the CRC32 checksum over the first 36 bytes of the header.
+    /// CRC32 of the first 36 bytes of the encoded header (everything before `header_crc`).
     fn compute_crc(&self) -> u32 {
-        let mut buf = [0u8; 36];
-        buf[0..4].copy_from_slice(&self.magic);
-        buf[4..6].copy_from_slice(&self.version.to_le_bytes());
-        buf[6..8].copy_from_slice(&self.flags.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.snapshot_seq.to_le_bytes());
-        buf[16..24].copy_from_slice(&self.head_seq.to_le_bytes());
-        buf[24..32].copy_from_slice(&self.snapshot_compressed_len.to_le_bytes());
-        buf[32..36].copy_from_slice(&self.snapshot_payload_crc32.to_le_bytes());
-        crc32fast::hash(&buf)
+        crc32fast::hash(&self.encode()[..36])
     }
 
     /// Encodes the header into an exact 64-byte array.
@@ -95,8 +87,7 @@ impl FileHeader {
 
     /// Decodes and validates a `FileHeader` from a 64-byte buffer.
     pub fn decode(bytes: &[u8; HEADER_SIZE]) -> Result<Self, StorageError> {
-        let mut magic = [0u8; 4];
-        magic.copy_from_slice(&bytes[0..4]);
+        let magic: [u8; 4] = bytes[0..4].try_into().unwrap();
         if magic != MAGIC {
             return Err(StorageError::WalCorruption(format!(
                 "Invalid magic bytes in file header: expected ZEM1, got {:?}",
@@ -118,8 +109,7 @@ impl FileHeader {
         let snapshot_payload_crc32 = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
         let header_crc = u32::from_le_bytes(bytes[36..40].try_into().unwrap());
 
-        let mut reserved = [0u8; 24];
-        reserved.copy_from_slice(&bytes[40..64]);
+        let reserved: [u8; 24] = bytes[40..64].try_into().unwrap();
 
         let header = Self {
             magic,
@@ -149,7 +139,8 @@ pub use zemdb_core::protocol::wal_frame::{
     WalBatchDecodeResult, WalFrameError, BATCH_HEADER_SIZE, BATCH_MAGIC,
 };
 
-/// Encodes a batch of `SequencedOperation` into an append-only, atomically framed WAL batch.
+// Wrappers that convert `WalFrameError` into `StorageError`.
+
 pub fn encode_wal_batch(
     ops: &[SequencedOperation],
     mutation_id: Option<MutationId>,
@@ -157,7 +148,6 @@ pub fn encode_wal_batch(
     zemdb_core::protocol::wal_frame::encode_wal_batch(ops, mutation_id).map_err(Into::into)
 }
 
-/// Encodes a single `SequencedOperation` into an append-only WAL batch.
 pub fn encode_wal_record(
     op: &SequencedOperation,
     mutation_id: Option<MutationId>,
@@ -165,12 +155,10 @@ pub fn encode_wal_record(
     zemdb_core::protocol::wal_frame::encode_wal_record(op, mutation_id).map_err(Into::into)
 }
 
-/// Decodes the next framed WAL batch from a byte slice.
 pub fn decode_wal_batch_from_slice(slice: &[u8]) -> Result<WalBatchDecodeResult, StorageError> {
     zemdb_core::protocol::wal_frame::decode_wal_batch_from_slice(slice).map_err(Into::into)
 }
 
-/// Helper to read all valid WAL records from a byte buffer.
 pub fn replay_wal_records(
     wal_bytes: &[u8],
 ) -> Result<(Vec<SequencedOperation>, usize, Option<String>), StorageError> {

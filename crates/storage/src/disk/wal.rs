@@ -10,17 +10,12 @@ use crate::error::StorageError;
 pub struct WalWriter;
 
 impl WalWriter {
-    /// Encodes and appends a single sequenced operation to the given WAL file.
-    ///
-    /// The write is complete when this returns, and its error, if any, is returned here; making
-    /// it durable is up to the caller.
+    /// Encodes and appends a single sequenced operation (see [`Self::write_batch`]).
     pub async fn write_record(
         file: &mut File,
         op: &SequencedOperation,
     ) -> Result<usize, StorageError> {
-        let bytes = encode_wal_batch(std::slice::from_ref(op), None)?;
-        Self::write_flushed(file, &bytes).await?;
-        Ok(bytes.len())
+        Self::write_batch(file, std::slice::from_ref(op)).await
     }
 
     /// Encodes and appends a batch of sequenced operations to the given WAL file.
@@ -57,12 +52,10 @@ pub struct WalReader<'a> {
 }
 
 impl<'a> WalReader<'a> {
-    /// Creates a new `WalReader` positioned at the start of the byte slice.
     pub fn new(slice: &'a [u8]) -> Self {
         Self { slice, offset: 0 }
     }
 
-    /// Returns the current byte offset within the slice.
     pub fn offset(&self) -> usize {
         self.offset
     }

@@ -215,20 +215,14 @@ pub(crate) struct DiskRoom {
     pub(crate) is_compacting: Arc<AtomicBool>,
 }
 
-/// High-performance, crash-resilient disk storage engine for ZemDB.
+/// Disk storage engine. Each room is stored in two files:
+/// - `room_{id}.snap`: the base snapshot, behind a 64-byte `ZEM1` header, compressed with
+///   Zstandard and checksummed.
+/// - `room_{id}.wal`: the append-only WAL of batches since that snapshot, each framed with
+///   `0xBA7C` and a CRC32.
 ///
-/// Implements a Dual-File architecture per room:
-/// - `room_{id}.snap`: Base consolidated snapshot with 64-byte `ZEM1` header,
-///   compressed with Zstandard and checksummed.
-/// - `room_{id}.wal`: Append-only Write-Ahead Log (WAL) of delta batches enqueued
-///   with framing `0xBA7C` and per-batch CRC32.
-/// - True CoW compaction: Background snapshot generation replaces `room_{id}.snap`
-///   atomically without blocking incoming WAL writes, rotating to `wal.compacting`.
-/// - Fast in-memory tables (`imbl::OrdMap`, see [`Table`]) whose O(1) clones isolate scans and
-///   compactions from concurrent writes.
-/// - WAL appends and syncs under a per-room WAL mutex, separate from the lock readers take
-///   (see [`DiskRoom`]).
-/// - Non-blocking batched cursor scans (64 items per yield) reading frozen table snapshots.
+/// See [`DiskRoom`] for the locking of an open room and [`compactor::compact_room_cow`] for how
+/// the WAL is folded into a new snapshot.
 #[derive(Debug, Clone)]
 pub struct DiskStorageEngine {
     options: DiskStorageOptions,
@@ -236,7 +230,6 @@ pub struct DiskStorageEngine {
 }
 
 impl DiskStorageEngine {
-    /// Creates a new `DiskStorageEngine` with the given configuration options.
     pub fn new(options: DiskStorageOptions) -> Self {
         Self {
             options,
@@ -376,7 +369,6 @@ impl DiskStorageEngine {
         Ok(Box::pin(stream))
     }
 
-    /// Fast lookup of an open room handle.
     pub(crate) async fn get_room(&self, room_id: &RoomId) -> Result<Arc<DiskRoom>, StorageError> {
         let rooms = self.rooms.read().await;
         rooms
@@ -449,24 +441,19 @@ fn lock_room_files(
     wal_path: &std::path::Path,
     room_id: &RoomId,
 ) -> Result<(std::fs::File, std::fs::File), StorageError> {
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path)?;
-    lock.try_lock_exclusive()
-        .map_err(|_| StorageError::RoomLocked(room_id.clone()))?;
-
-    let wal = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(wal_path)?;
-    wal.try_lock_exclusive()
-        .map_err(|_| StorageError::RoomLocked(room_id.clone()))?;
-    Ok((lock, wal))
+    let open_locked = |path: &std::path::Path| -> Result<std::fs::File, StorageError> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(path)?;
+        file.try_lock_exclusive()
+            .map_err(|_| StorageError::RoomLocked(room_id.clone()))?;
+        Ok(file)
+    };
+    let lock = open_locked(lock_path)?;
+    Ok((lock, open_locked(wal_path)?))
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -559,7 +546,7 @@ impl StorageEngine for DiskStorageEngine {
         let mut wal = room.wal.lock().await;
         wal.ensure_usable()?;
 
-        // 1. Validate operations against room schema and strict monotonic sequence
+        // Validate against the schema and the head.
         {
             let state = room.state.read().await;
             // An empty batch changes nothing; writing it would only add an empty frame to the WAL.
@@ -569,10 +556,9 @@ impl StorageEngine for DiskStorageEngine {
             validate_batch(room_id, &state.schema, state.head_seq, &ops)?;
         }
 
-        // 2. Encode WAL records into framed byte buffer
         let wal_batch_bytes = WalWriter::encode_batch(&ops)?;
 
-        // 3. Write to append-only WAL file and fsync data, without holding the state lock, so
+        // Write to the append-only WAL file and fsync data, without holding the state lock, so
         // that readers do not wait for the sync. A failure here leaves an unknown amount of the
         // batch on disk, and a failed fsync cannot be retried safely, so the room stops
         // accepting writes until recovery replays the WAL from disk.
@@ -599,7 +585,7 @@ impl StorageEngine for DiskStorageEngine {
         }
         pending.wal().len += wal_batch_bytes.len() as u64;
 
-        // 4. Apply operations to O(1) clones of the in-memory tables, then publish them at once:
+        // Apply operations to O(1) clones of the in-memory tables, then publish them at once:
         // readers see all of the batch or none of it, even if applying it panics. Nothing else
         // changes the tables meanwhile, since that needs the WAL mutex.
         let (tables, head_seq) = {
@@ -621,7 +607,6 @@ impl StorageEngine for DiskStorageEngine {
         };
         pending.complete();
 
-        // 5. Check if compaction threshold is triggered
         if self.options.auto_compact
             && !room.is_compacting.load(Ordering::Acquire)
             && wal.len >= self.options.min_compaction_bytes
@@ -764,19 +749,13 @@ impl StorageEngine for DiskStorageEngine {
 
         let mut wal = room.wal.lock().await;
         let current = room.state.read().await.head_seq;
-        let checked = wal
-            .ensure_usable()
-            .map(|()| snapshot_head_outcome(current, payload.head_seq));
-        match checked {
-            Ok(None) => {}
-            Ok(Some(outcome)) => {
-                staged.discard().await;
-                return outcome;
-            }
-            Err(err) => {
-                staged.discard().await;
-                return Err(err);
-            }
+        let refusal = match wal.ensure_usable() {
+            Err(err) => Some(Err(err)),
+            Ok(()) => snapshot_head_outcome(current, payload.head_seq),
+        };
+        if let Some(outcome) = refusal {
+            staged.discard().await;
+            return outcome;
         }
 
         // Armed before the rename, which completes on the blocking pool even if this future is

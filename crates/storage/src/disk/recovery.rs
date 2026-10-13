@@ -261,10 +261,8 @@ pub async fn recover_room(
         tokio::fs::try_exists(snap_path).await,
     )?;
     if snap_exists {
-        let snap_std = std::fs::OpenOptions::new().read(true).open(snap_path)?;
-        let snap_file = tokio::fs::File::from_std(snap_std);
-        let snap_meta = snap_file.metadata().await?;
-        let snap_file_len = snap_meta.len();
+        let snap_file = tokio::fs::File::from_std(std::fs::File::open(snap_path)?);
+        let snap_file_len = snap_file.metadata().await?.len();
 
         if snap_file_len < HEADER_SIZE as u64 {
             return Err(StorageError::WalCorruption(format!(
@@ -357,10 +355,8 @@ pub async fn recover_room(
     let mut unconfirmed_compacting_tail = None;
 
     if compacting_exists {
-        let std_compacting = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&wal_compacting_path)?;
-        let mut compacting_file = tokio::fs::File::from_std(std_compacting);
+        let mut compacting_file =
+            tokio::fs::File::from_std(std::fs::File::open(&wal_compacting_path)?);
         let outcome =
             replay_wal_file(&mut compacting_file, schema, &mut head_seq, &mut tables).await?;
         compacting_has_live_records = outcome.applied_count > 0;
