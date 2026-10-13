@@ -101,27 +101,22 @@ impl SnapshotEnvelopeHeader {
     /// Parses the header at the start of `bytes`. Only the first [`SNAPSHOT_HEADER_LEN`] bytes
     /// are read; the body is not checked (see [`SnapshotEnvelopeHeader::verify_body`]).
     pub fn parse(bytes: &[u8]) -> Result<Self, SnapshotEnvelopeError> {
-        let header: &[u8; SNAPSHOT_HEADER_LEN] = bytes
-            .get(..SNAPSHOT_HEADER_LEN)
-            .and_then(|h| h.try_into().ok())
+        let [m0, m1, m2, m3, version, flag, l0, l1, l2, l3, c0, c1, c2, c3] = *bytes
+            .first_chunk::<SNAPSHOT_HEADER_LEN>()
             .ok_or(SnapshotEnvelopeError::TooShort)?;
-
-        let magic = [header[0], header[1], header[2], header[3]];
+        let magic = [m0, m1, m2, m3];
         if magic != SNAPSHOT_MAGIC {
             return Err(SnapshotEnvelopeError::InvalidMagic(magic));
         }
-        if header[4] != SNAPSHOT_VERSION {
-            return Err(SnapshotEnvelopeError::UnsupportedVersion(header[4]));
+        if version != SNAPSHOT_VERSION {
+            return Err(SnapshotEnvelopeError::UnsupportedVersion(version));
         }
-        let compression = SnapshotCompression::from_flag(header[5])
-            .ok_or(SnapshotEnvelopeError::UnknownCompression(header[5]))?;
-        let uncompressed_len = u32::from_be_bytes([header[6], header[7], header[8], header[9]]);
-        let body_crc = u32::from_be_bytes([header[10], header[11], header[12], header[13]]);
-
+        let compression = SnapshotCompression::from_flag(flag)
+            .ok_or(SnapshotEnvelopeError::UnknownCompression(flag))?;
         Ok(Self {
             compression,
-            uncompressed_len,
-            body_crc,
+            uncompressed_len: u32::from_be_bytes([l0, l1, l2, l3]),
+            body_crc: u32::from_be_bytes([c0, c1, c2, c3]),
         })
     }
 

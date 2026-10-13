@@ -58,7 +58,7 @@ pub enum ErrorCode {
 
 /// An operation ordered by the coordination server with assigned sequence ID.
 ///
-/// Bounded strictly to 96 bytes (8B SequenceNumber + 88B Operation).
+/// Occupies 96 bytes in memory (8B SequenceNumber + 88B Operation).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SequencedOperation {
     pub seq: SequenceNumber,
@@ -80,9 +80,11 @@ impl SequencedOperation {
 }
 
 /// Unified message sent from Client to Server.
+///
+/// Encoded by variant index, so variants are never reordered and new ones go at the end.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ClientMessage {
-    /// Commit a new validated mutation into a room with idempotency key and client cursor for 1-RTT catch-up.
+    /// Commit a validated mutation, with its idempotency key and the client cursor for catch-up.
     Commit {
         correlation_id: CorrelationId,
         room_id: RoomId,
@@ -118,7 +120,7 @@ pub enum ClientMessage {
         room_id: RoomId,
         client_id: ClientId,
         auth_token: String,
-        /// Current local sequence cursor (None if new client, Some(seq) if reconnecting or restoring).
+        /// Local sequence cursor: `None` for a new client, `Some` when reconnecting or restoring.
         #[serde(default)]
         current_seq: Option<SequenceNumber>,
     },
@@ -216,9 +218,11 @@ impl ClientMessageKind {
 }
 
 /// Unified message sent from Server to Client.
+///
+/// Encoded by variant index, so variants are never reordered and new ones go at the end.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ServerMessage {
-    /// Confirmation of an accepted commit with its assigned sequence number, accumulated catchup deltas and pagination flag.
+    /// Accepted commit: its assigned sequence number and the catch-up deltas, paginated.
     CommitAck {
         correlation_id: CorrelationId,
         room_id: RoomId,
@@ -292,7 +296,7 @@ pub enum ServerMessage {
         room_id: RoomId,
         client_id: ClientId,
     },
-    /// Confirmation of client registration, delivering the room schema, current head, retention tail, and active snapshot info.
+    /// Registration accepted: the room schema, head and retention tail, and the active snapshot.
     Registered {
         correlation_id: CorrelationId,
         room_id: RoomId,

@@ -53,6 +53,7 @@
 - `snapshot_envelope.rs:128` "Serializes the header." y los docs de los getters (`139-152`, `wal_frame.rs:131-144`) repiten la firma. Son aceptables en API pública (cuestan 1 línea cada uno); si se borra el getter sin uso (Q7), se va su doc con él.
 - `messages.rs:59-61` "Bounded strictly to 96 bytes": el dato es correcto (lo verifica `crates/core/tests/types_memory_tests.rs:11`), pero "Bounded strictly" sugiere un límite del wire. Más preciso: "Occupies 96 bytes in memory (8B SequenceNumber + 88B Operation)."
 - Opcional (+1 línea): el invariante "la codificación es por índice de variante, así que no se reordena y lo nuevo va al final" está documentado solo en `ErrorCode` (`messages.rs:12`), pero vale igual para `ClientMessage` y `ServerMessage`. `peek_client_message_kind` y `ClientMessageKind` dependen de él.
+- **Estado:** ✅ aplicada (paso 1), incluido el invariante opcional en `ClientMessage` y `ServerMessage`. El doc de `TornWrite::valid_bytes_offset` dice que es relativo al slice y por eso siempre `0` (quitar el campo es Q4). `messages.rs:76` queda para Q8 y los docs de getters/`to_bytes` se dejan, como propone el informe.
 
 ## Sugerencias
 
@@ -90,6 +91,7 @@
   El comportamiento es idéntico. Con `offset == len`, el slice vacío da `CleanEof` (`wal_frame.rs:391-393`) y la función devuelve `(ops, len, None)`, igual que hoy. `bytes_consumed` siempre es mayor que 0 (vale `frame_len`, que es al menos 18), así que el bucle termina. Los errores siguen saliendo por `?`.
 - **Ahorro estimado:** ~5 líneas (3 de código, 2 de doc) · **Riesgo:** bajo · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ✅ confirmada — `decode_wal_batch_from_slice` es pura y con slice vacío devuelve `CleanEof` (`391-393`), así que la llamada extra al llegar a `offset == len` da el mismo `(ops, len, None)`; `bytes_consumed = frame_len ≥ BATCH_HEADER_SIZE (18)` y `frame_len ≤ slice.len()` (si no, `TruncatedPayload`), por lo que no hay bucle infinito ni slicing fuera de rango. Los brazos `return` tipan `!` y compilan. Consumidores (`storage/src/disk/format.rs:177`, tests) no ven diferencia.
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q2. Comentarios desactualizados o engañosos en `wal_frame.rs`
 - **Dónde:** `wal_frame.rs:12-13`, `29`, `47`, `53-56`, `63-66`, `114`, `382-389`
@@ -97,6 +99,7 @@
 - **Propuesta:** corregir `TornWrite` así: "The next frame cannot be read and no valid frame follows it (see [`FrameAnomaly`]): a torn write." Corregir el magic. Recortar el doc de `BATCH_HEADER_SIZE` a una línea con referencia a `encode_wal_batch`. Acortar los docs de `Ok`, `WalBatchPayload`, `encode_wal_batch` (primera línea) y `encode_wal_record`. En `decode_wal_batch_from_slice` (`382-389`), compactar la enumeración de retornos a 5–6 líneas sin perder ningún caso.
 - **Ahorro estimado:** ~4–6 líneas · **Riesgo:** bajo (solo comentarios) · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ✅ confirmada — solo doc. Líneas correctas; el magic es `[0xBA, 0x7C]` (`wal_frame.rs:10`) escrito tal cual con `extend_from_slice` (`:91`), así que "little-endian" en `:66` es engañoso (como `u16` LE serían `[0x7C, 0xBA]`); `TornWrite` `:55-56` describe un offset que siempre es `0` (`:403`).
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q3. `SnapshotEnvelopeHeader::parse` con `first_chunk` + desestructuración
 - **Dónde:** `snapshot_envelope.rs:103-126`
@@ -123,6 +126,7 @@
   ```
   Se mantienen el mismo orden de chequeos y los mismos errores, y se siguen leyendo solo los primeros 14 bytes.
 - **Ahorro estimado:** ~4–5 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q4. `WalBatchDecodeResult::TornWrite::valid_bytes_offset` siempre vale `0`
 - **Dónde:** `wal_frame.rs:55-59`, `403`
@@ -145,6 +149,7 @@
   ```
   Los bytes son idénticos: mismas expresiones, en el mismo orden y con el mismo truncamiento `as u32`. Bajar `let payload_struct` a un argumento en línea (`&WalBatchPayloadRef { mutation_id, ops }`) ahorra 1 línea más.
 - **Ahorro estimado:** ~3–4 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1), incluido el `WalBatchPayloadRef` en línea.
 
 ### Q6. `codec.rs`: un helper para las opciones wire
 - **Dónde:** `codec.rs:67-70`, `93-97`, `132-136`
@@ -188,6 +193,7 @@
   ```
   Se mantienen el mismo orden (TooShort → magic → versión → tamaño) y los mismos errores. La contra es que el patrón fija 4 elementos en lugar de usar `PROTOCOL_HEADER_LEN`. Si se adopta, conviene un `const _: () = assert!(PROTOCOL_HEADER_LEN == 4);` o un comentario.
 - **Ahorro estimado:** ~2 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1), con `const _: () = assert!(PROTOCOL_HEADER_LEN == 4);`.
 
 ### Q10. `WalBatchPayload` no necesita ser `pub`
 - **Dónde:** `wal_frame.rs:29-34`

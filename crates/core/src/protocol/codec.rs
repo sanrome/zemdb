@@ -84,7 +84,7 @@ pub fn peek_version(bytes: &[u8]) -> Option<u8> {
     }
 }
 
-/// Deserialize any protocol message from binary validating wire header and using bincode limits against DoS.
+/// Deserialize any protocol message, checking the wire header and bounding its size against DoS.
 ///
 /// The header is checked before the size, so a frame of another protocol version is always
 /// reported as [`DecodeError::UnsupportedVersion`], whatever its length or payload.
@@ -143,24 +143,24 @@ pub fn peek_client_message_kind(bytes: &[u8]) -> Result<ClientMessageKind, Decod
 
 /// The payload of a frame, after checking its header and size.
 fn frame_payload(bytes: &[u8]) -> Result<&[u8], DecodeError> {
-    if bytes.len() < PROTOCOL_HEADER_LEN {
+    // The pattern spells out the `PROTOCOL_HEADER_LEN` header bytes.
+    const _: () = assert!(PROTOCOL_HEADER_LEN == 4);
+    let [m0, m1, version, _flags, payload @ ..] = bytes else {
         return Err(DecodeError::TooShort { len: bytes.len() });
+    };
+    if [*m0, *m1] != PROTOCOL_MAGIC {
+        return Err(DecodeError::InvalidMagic { got: [*m0, *m1] });
     }
-    if bytes[0..2] != PROTOCOL_MAGIC {
-        return Err(DecodeError::InvalidMagic {
-            got: [bytes[0], bytes[1]],
-        });
-    }
-    if bytes[2] != PROTOCOL_VERSION {
+    if *version != PROTOCOL_VERSION {
         return Err(DecodeError::UnsupportedVersion {
             expected: PROTOCOL_VERSION,
-            got: bytes[2],
+            got: *version,
         });
     }
     if bytes.len() > MAX_FRAME_SIZE {
         return Err(DecodeError::TooLarge { len: bytes.len() });
     }
-    Ok(&bytes[PROTOCOL_HEADER_LEN..])
+    Ok(payload)
 }
 
 #[cfg(test)]
