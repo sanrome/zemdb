@@ -133,6 +133,7 @@ Densidad baja-moderada (74 líneas de doc/comentario sobre 872) y en general de 
 - **Problema:** `apply_snapshot` duplica la llamada a `decode_received_snapshot` en la rama wasm (`369-375`), y el mapeo del `JoinError` se repite.
 - **Propuesta:** `pub(crate) async fn run_blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, StorageError> + Send + 'static) -> Result<T, StorageError>`, con implementación por `cfg`: en wasm, `f()`. El `pause_blocking` queda dentro del closure con `#[cfg(not(target_arch = "wasm32"))]`.
 - **Ahorro estimado:** ~6 líneas en `memory`, más en `disk` · **Riesgo:** medio (cfg, bounds `Send` en wasm) · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 2): `sys::run_blocking`, genérico en el tipo de error, con una variante para wasm que ejecuta en línea; `pause_blocking` y su clave van con `cfg` y la rama wasm de `apply_snapshot` ya no repite la llamada a `decode_received_snapshot`
 
 ### Q7. Ajustes menores
 - **a)** `mod.rs:36-40`: `new()` → `Self::default()` (el struct ya deriva `Default` y produce lo mismo) (−2).

@@ -144,6 +144,7 @@ La densidad es adecuada (≈15 % doc) y la mayoría explica el *por qué*. Punto
 - **Propuesta:** `pub(crate) async fn run_blocking<T>(f) -> Result<T, StorageError>` en `sys.rs` o `engine.rs`, con variante wasm que ejecuta en línea. Detalle en Q6 de `memory/AUDITORIA_CALIDAD.md`.
 - **Ahorro estimado:** ~10–15 líneas en el crate · **Riesgo:** medio · **Prioridad:** baja
 - **Verificación (2.ª pasada):** ⚠️ corregida — las 12 apariciones están bien, pero la firma `FnOnce() -> Result<T, StorageError>` no sirve para `compactor.rs:573` ni para `recovery.rs:83`, que devuelven `io::Result`. Tiene que ser genérica en `E: Into<StorageError>`, como en Q3 de disk. En wasm el bound `Send` sobra (usar `MaybeSend` de Q1). Además, `fail_point` no existe en wasm (`lib.rs:5-6`), así que `pause_blocking` y `fail_key` van con `cfg` dentro del closure.
+- **Estado:** ✅ aplicada (paso 2) con la firma corregida: `sys::run_blocking<T, E: Into<StorageError>>`, en los 12 sitios; en wasm hay una variante por `cfg` que ejecuta en línea, sin bounds `Send` (no necesita `MaybeSend`), y los fail points van con `cfg` dentro del closure
 
 ## Duplicación entre crates (solo anotada)
 

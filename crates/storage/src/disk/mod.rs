@@ -29,6 +29,7 @@ use crate::memory::state::{
 use crate::memory::{RoomSnapshotRef, Table};
 use crate::options::ScanOptions;
 use crate::snapshot::DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES;
+use crate::sys::run_blocking;
 
 /// Options to configure `DiskStorageEngine`.
 #[derive(Debug, Clone)]
@@ -386,9 +387,7 @@ impl StorageEngine for DiskStorageEngine {
                 wal_path.clone(),
                 room_id.clone(),
             );
-            tokio::task::spawn_blocking(move || lock_room_files(&lock_path, &wal_path, &room_id))
-                .await
-                .map_err(|e| StorageError::Other(format!("Join error: {e}")))??
+            run_blocking(move || lock_room_files(&lock_path, &wal_path, &room_id)).await?
         };
 
         let recovered = recover_room(
@@ -592,7 +591,7 @@ impl StorageEngine for DiskStorageEngine {
         };
 
         let zstd_level = self.options.zstd_level;
-        tokio::task::spawn_blocking(move || {
+        run_blocking(move || {
             let raw = bincode::serialize(&RoomSnapshotRef {
                 head_seq,
                 tables: &tables,
@@ -601,7 +600,6 @@ impl StorageEngine for DiskStorageEngine {
             crate::snapshot::encode_snapshot_envelope(&raw, true, zstd_level)
         })
         .await
-        .map_err(|e| StorageError::Other(format!("Join error: {e}")))?
     }
 
     /// Replaces the room's contents with `snapshot` (see the trait for its checks and the rules
@@ -626,14 +624,13 @@ impl StorageEngine for DiskStorageEngine {
 
         let max_uncompressed = self.options.max_snapshot_uncompressed_bytes;
         let fail_key = self.wal_file_path(room_id);
-        let (schema, payload) = tokio::task::spawn_blocking(move || {
+        let (schema, payload) = run_blocking(move || {
             crate::fail_point::pause_blocking("apply_snapshot.decode", &fail_key);
             let payload =
                 decode_received_snapshot(&snapshot, max_uncompressed, &schema, expected_head_seq)?;
             Ok::<_, StorageError>((schema, payload))
         })
-        .await
-        .map_err(|e| StorageError::Other(format!("Join error: {e}")))??;
+        .await?;
 
         let lock = self.compaction_lock(room_id).await?;
         crate::fail_point::pause("apply_snapshot.lock", &self.wal_file_path(room_id)).await;

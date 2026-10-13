@@ -18,6 +18,7 @@ use crate::error::StorageError;
 use crate::fail_point;
 use crate::memory::state::{apply_operation, empty_tables, RoomSnapshotPayload};
 use crate::memory::Table;
+use crate::sys::run_blocking;
 
 /// Recovery result containing the reconstructed in-memory state and the open WAL file handle.
 #[derive(Debug)]
@@ -80,9 +81,7 @@ async fn classify_anomaly(
     } else {
         // The clone shares the file position, which the caller sets again before any other use.
         let mut search_file = file.try_clone().await?.into_std().await;
-        tokio::task::spawn_blocking(move || find_valid_frame(&mut search_file, from, file_len))
-            .await
-            .map_err(|e| StorageError::Other(format!("Join error: {e}")))??
+        run_blocking(move || find_valid_frame(&mut search_file, from, file_len)).await?
     };
     Ok(match (anomaly.classify(following), following) {
         (Err(corruption), Some(following)) => ReplayEnd::FollowedByFrame {
@@ -314,11 +313,10 @@ pub async fn recover_room(
             // Decompressed and decoded together on the blocking pool. The file was written by
             // this engine from a validated state, and its CRC matched, so its rows are not
             // checked again and its size is not limited.
-            let mut payload: RoomSnapshotPayload = tokio::task::spawn_blocking(move || {
+            let mut payload: RoomSnapshotPayload = run_blocking(move || {
                 crate::snapshot::deserialize_zstd(&compressed_snap, u64::MAX, None)
             })
-            .await
-            .map_err(|e| StorageError::Other(format!("Join error: {e}")))??;
+            .await?;
 
             snapshot_seq = payload.head_seq;
             head_seq = payload.head_seq;
@@ -379,11 +377,10 @@ pub async fn recover_room(
             } => {
                 let end = compacting_file.metadata().await?.len();
                 let mut search_file = compacting_file.try_clone().await?.into_std().await;
-                let highest = tokio::task::spawn_blocking(move || {
+                let highest = run_blocking(move || {
                     highest_seq_in_valid_frames(&mut search_file, following, end)
                 })
-                .await
-                .map_err(|e| StorageError::Other(format!("Join error: {e}")))??;
+                .await?;
                 unconfirmed_compacting_tail = Some((corruption, highest));
             }
         }

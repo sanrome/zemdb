@@ -119,6 +119,7 @@
   ```
   Tiene que ser genérico en `E`: `sync_dir` (`compactor.rs:573`) y `find_valid_frame` (`recovery.rs:83`) devuelven `std::io::Result`, y los demás sitios devuelven `StorageError`. Así cada sitio queda en `run_blocking(move || …).await?`. El mensaje no cambia, y la conversión `io::Error → StorageError::Io` es la misma que hace hoy el segundo `?`. `compact_room` (`mod.rs:418-423`, "Compaction task failed") usa `tokio::spawn` y otro mensaje, así que queda como está.
 - **Ahorro estimado:** ~20 líneas en los 10 sitios menos ~13 del helper: **~7 netas en el módulo** (más si `memory/mod.rs` también lo usa). El beneficio está sobre todo en la legibilidad (`??` y `map_err` repetidos). · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 2): `sys::run_blocking`, genérico en el tipo de error, en los 10 sitios del módulo (y los 2 de `memory`)
 
 ### Q4 — La fase 2 de `compact_room_cow` duplica `stage_snapshot`
 - **Dónde:** `compactor.rs:135-151` frente a `compactor.rs:416-437`.

@@ -15,6 +15,7 @@ use crate::engine::{batched_scan, RowStream, StorageEngine};
 use crate::error::StorageError;
 use crate::options::ScanOptions;
 use crate::snapshot::DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES;
+use crate::sys::run_blocking;
 
 /// In-memory implementation of `StorageEngine` with per-room isolation.
 ///
@@ -218,20 +219,15 @@ impl StorageEngine for MemoryStorageEngine {
             (room_state.head_seq, room_state.tables.clone())
         };
 
-        let encode = move || {
+        let envelope = run_blocking(move || {
             let raw_bytes = bincode::serialize(&RoomSnapshotRef {
                 head_seq,
                 tables: &tables,
             })
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
             crate::snapshot::encode_snapshot_envelope(&raw_bytes, false, 0)
-        };
-        #[cfg(not(target_arch = "wasm32"))]
-        let envelope = tokio::task::spawn_blocking(encode)
-            .await
-            .map_err(|e| StorageError::Other(format!("Join error: {e}")))??;
-        #[cfg(target_arch = "wasm32")]
-        let envelope = encode()?;
+        })
+        .await?;
 
         tracing::debug!(room_id = %room_id, snapshot_size = envelope.len(), "Created in-memory snapshot");
         Ok(envelope)
@@ -253,28 +249,19 @@ impl StorageEngine for MemoryStorageEngine {
         self.get_room(room_id)?;
 
         #[cfg(not(target_arch = "wasm32"))]
-        let (schema, payload) = {
-            let fail_key = std::path::PathBuf::from(room_id.as_str());
-            tokio::task::spawn_blocking(move || {
-                crate::fail_point::pause_blocking("apply_snapshot.decode", &fail_key);
-                let payload = decode_received_snapshot(
-                    &snapshot,
-                    DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES,
-                    &schema,
-                    expected_head_seq,
-                )?;
-                Ok::<_, StorageError>((schema, payload))
-            })
-            .await
-            .map_err(|e| StorageError::Other(format!("Join error: {e}")))??
-        };
-        #[cfg(target_arch = "wasm32")]
-        let payload = decode_received_snapshot(
-            &snapshot,
-            DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES,
-            &schema,
-            expected_head_seq,
-        )?;
+        let fail_key = std::path::PathBuf::from(room_id.as_str());
+        let (schema, payload) = run_blocking(move || {
+            #[cfg(not(target_arch = "wasm32"))]
+            crate::fail_point::pause_blocking("apply_snapshot.decode", &fail_key);
+            let payload = decode_received_snapshot(
+                &snapshot,
+                DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES,
+                &schema,
+                expected_head_seq,
+            )?;
+            Ok::<_, StorageError>((schema, payload))
+        })
+        .await?;
 
         // Looked up again: the room may have been closed, or closed and reopened, while the
         // snapshot was decoded. The snapshot goes to the room open now, as in the disk engine.

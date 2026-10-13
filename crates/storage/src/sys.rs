@@ -1,3 +1,4 @@
+use crate::error::StorageError;
 use std::path::Path;
 
 /// Ensures that any directory entry changes (creates, renames, unlinks)
@@ -21,4 +22,27 @@ pub fn sync_dir(dir_path: &Path) -> std::io::Result<()> {
         let _ = dir_path;
     }
     Ok(())
+}
+
+/// Runs `f` on Tokio's blocking pool and returns its result, with its error converted.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn run_blocking<T, E>(
+    f: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> Result<T, StorageError>
+where
+    T: Send + 'static,
+    E: Into<StorageError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| StorageError::Other(format!("Join error: {e}")))?
+        .map_err(Into::into)
+}
+
+/// Runs `f` in place: WebAssembly has no blocking pool.
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn run_blocking<T, E: Into<StorageError>>(
+    f: impl FnOnce() -> Result<T, E>,
+) -> Result<T, StorageError> {
+    f().map_err(Into::into)
 }

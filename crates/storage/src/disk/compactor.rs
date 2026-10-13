@@ -14,7 +14,7 @@ use crate::error::StorageError;
 use crate::fail_point;
 use crate::memory::state::RoomSnapshotPayload;
 use crate::memory::{RoomSnapshotRef, Table};
-use crate::sys::sync_dir;
+use crate::sys::{run_blocking, sync_dir};
 
 /// Path of the WAL segment rotated out by an in-progress (or interrupted) compaction.
 pub(crate) fn compacting_wal_path(wal_path: &Path) -> PathBuf {
@@ -136,7 +136,7 @@ pub(crate) async fn compact_room_cow(
     let staged = {
         let snap_path = room.snap_path.clone();
         let room_id = room.room_id.clone();
-        tokio::task::spawn_blocking(move || -> Result<StagedSnapshot, StorageError> {
+        run_blocking(move || {
             fail_point::check("compaction.phase2", &snap_path)?;
             let payload = RoomSnapshotPayload {
                 head_seq: cut_seq,
@@ -146,8 +146,7 @@ pub(crate) async fn compact_room_cow(
                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
             stage_snapshot_blocking(&snap_path, cut_seq, &serialized, zstd_level, &room_id)
         })
-        .await
-        .map_err(|e| StorageError::Other(format!("Join error: {e}")))??
+        .await?
     };
 
     // Phase 3
@@ -423,7 +422,7 @@ pub(crate) async fn stage_snapshot(
     let room_id = room_id.clone();
     // O(1) clones of the tables, serialized on the blocking pool with the compression.
     let tables = tables.clone();
-    tokio::task::spawn_blocking(move || {
+    run_blocking(move || {
         let serialized = bincode::serialize(&RoomSnapshotRef {
             head_seq,
             tables: &tables,
@@ -432,7 +431,6 @@ pub(crate) async fn stage_snapshot(
         stage_snapshot_blocking(&snap_path, head_seq, &serialized, zstd_level, &room_id)
     })
     .await
-    .map_err(|e| StorageError::Other(format!("Join error: {e}")))?
 }
 
 /// Atomically replaces `snap_path` with a snapshot of `tables` at `head_seq`.
@@ -458,13 +456,11 @@ pub(crate) async fn write_empty_snapshot_file(
     room_id: &RoomId,
 ) -> Result<(), StorageError> {
     let staged = {
-        let snap_path = snap_path.to_path_buf();
-        let room_id = room_id.clone();
-        tokio::task::spawn_blocking(move || {
+        let (snap_path, room_id) = (snap_path.to_path_buf(), room_id.clone());
+        run_blocking(move || {
             stage_file_blocking(&snap_path, &FileHeader::new(0, 0, 0, 0), &[], &room_id)
         })
-        .await
-        .map_err(|e| StorageError::Other(format!("Join error: {e}")))??
+        .await?
     };
     install_staged(snap_path, staged).await?;
     Ok(())
@@ -569,10 +565,7 @@ pub(crate) async fn sync_parent(path: &Path) -> Result<(), StorageError> {
         return Ok(());
     };
     let parent = parent.to_path_buf();
-    tokio::task::spawn_blocking(move || sync_dir(&parent))
-        .await
-        .map_err(|e| StorageError::Other(format!("Join error: {e}")))??;
-    Ok(())
+    run_blocking(move || sync_dir(&parent)).await
 }
 
 #[cfg(test)]
