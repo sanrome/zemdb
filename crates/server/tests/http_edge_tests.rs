@@ -5,24 +5,22 @@
 //! paused clock jumps to the next timer whenever the runtime waits for socket events, which
 //! would let a server timeout fire before the bytes it waits for are read.
 
+mod common;
+
+use common::{
+    build, commit, read_sse_until, register, register_msg, Parts, ADMIN_SECRET, AUTH_SECRET,
+};
 use futures::StreamExt;
 use reqwest::StatusCode;
-use std::sync::Arc;
 use std::time::Duration;
-use tempfile::{tempdir, TempDir};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use zemdb_core::*;
-use zemdb_server::{
-    generate_client_token, serve_until_shutdown, AppState, RoomCommand, RoomManager,
-    SchemaRegistry, ServerConfig, ServerError, SnapshotRelay,
-};
+use zemdb_server::{generate_client_token, ServerConfig, ServerError};
 
-const AUTH_SECRET: &str = "edge_cluster_secret_key_1234567890";
-const ADMIN_SECRET: &str = "edge_admin_secret_key_12345678901";
 /// Header and body timeouts, and minimum body rate, of the tests that exercise them.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(1);
 const BODY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -36,78 +34,38 @@ fn short_timeouts(config: &mut ServerConfig) {
 
 struct TestServer {
     addr: std::net::SocketAddr,
-    room_manager: Arc<RoomManager>,
     room_id: RoomId,
     client_id: ClientId,
     token: String,
     stop: Option<oneshot::Sender<()>>,
     server: Option<JoinHandle<Result<(), ServerError>>>,
-    _dir: TempDir,
+    parts: Parts,
 }
 
 /// Serves a room `room-edge` (schema: table `tasks` with an int key and a nullable bytes
 /// column) with the default limits changed by `configure`.
 async fn start_server(configure: impl FnOnce(&mut ServerConfig)) -> TestServer {
-    let dir = tempdir().unwrap();
-    let mut config = ServerConfig {
-        data_dir: dir.path().to_path_buf(),
-        auth_secret: AUTH_SECRET.to_string(),
-        admin_secret: ADMIN_SECRET.to_string(),
-        ..ServerConfig::default()
-    };
-    configure(&mut config);
-    config.validate().unwrap();
-    let config = Arc::new(config);
-    let schema_registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
-    let schema_id = SchemaId::new("tasks").unwrap();
+    let parts = build(|config| {
+        configure(config);
+        config.validate().unwrap();
+    });
     let table = TableSchema::builder("tasks")
         .primary_key("id", DataType::Int)
         .nullable_column("data", DataType::Bytes);
-    schema_registry
-        .register_schema(schema_id.clone(), Schema::builder().table(table).build())
-        .unwrap();
-    let relay = Arc::new(
-        SnapshotRelay::new(
-            dir.path().join("snapshots"),
-            Duration::from_secs(60),
-            config.max_snapshot_bytes,
-        )
-        .unwrap(),
-    );
-    let room_manager = Arc::new(RoomManager::new(
-        Arc::clone(&config),
-        Arc::clone(&schema_registry),
-        Arc::clone(&relay),
-    ));
-    let room_id = RoomId::new("room-edge").unwrap();
-    room_manager
-        .create_room(room_id.clone(), schema_id, None)
-        .await
-        .unwrap();
+    let schema_id = parts.register_schema("tasks", Schema::builder().table(table).build());
+    let room_id = parts.create_room("room-edge", &schema_id).await;
     let client_id = ClientId::new("edge-client").unwrap();
     let token = generate_client_token(&client_id, &room_id, Duration::from_secs(3600), AUTH_SECRET);
 
-    let state = AppState::new(config, schema_registry, Arc::clone(&room_manager), relay);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (stop, stopped) = oneshot::channel::<()>();
-    let server = tokio::spawn(serve_until_shutdown(
-        listener,
-        state,
-        async move {
-            stopped.await.ok();
-        },
-        Duration::from_secs(10),
-    ));
+    let (addr, stop, server) = parts.serve_until_stopped().await;
     TestServer {
         addr,
-        room_manager,
         room_id,
         client_id,
         token,
         stop: Some(stop),
         server: Some(server),
-        _dir: dir,
+        parts,
     }
 }
 
@@ -117,14 +75,7 @@ impl TestServer {
     }
 
     fn register_frame(&self) -> Vec<u8> {
-        encode_message(&ClientMessage::RegisterClient {
-            correlation_id: CorrelationId::new(1),
-            room_id: self.room_id.clone(),
-            client_id: self.client_id.clone(),
-            auth_token: self.token.clone(),
-            current_seq: None,
-        })
-        .unwrap()
+        encode_message(&register_msg(&self.room_id, &self.client_id, &self.token)).unwrap()
     }
 
     /// Starts shutting the server down after `delay`, without waiting for it to stop.
@@ -160,39 +111,25 @@ impl TestServer {
     /// room actor.
     async fn commit_large_rows(&self, count: u8, size: usize) {
         let sender = self
+            .parts
             .room_manager
             .get_or_spawn(&self.room_id, None)
             .await
             .unwrap();
-        let (tx, rx) = oneshot::channel();
-        sender
-            .send(RoomCommand::RegisterClient {
-                client_id: self.client_id.clone(),
-                current_seq: None,
-                reply: tx,
-            })
+        register(&sender, &self.client_id).await;
+        for i in 0..count {
+            let row = vec![Value::Int(i.into()), Value::Bytes(vec![i; size].into())];
+            let op =
+                Operation::insert(0, PrimaryKey::single(i64::from(i)), CompactRow::new(row), 0);
+            commit(
+                &sender,
+                &self.client_id,
+                MutationId::new([i + 1; 16]),
+                0,
+                op,
+            )
             .await
             .unwrap();
-        rx.await.unwrap().unwrap();
-        for i in 0..count {
-            let (tx, rx) = oneshot::channel();
-            let row = vec![Value::Int(i.into()), Value::Bytes(vec![i; size].into())];
-            sender
-                .send(RoomCommand::Commit {
-                    client_id: self.client_id.clone(),
-                    mutation_id: MutationId::new([i + 1; 16]),
-                    last_ack_seq: SequenceNumber::new(0),
-                    op: Operation::insert(
-                        0,
-                        PrimaryKey::single(i64::from(i)),
-                        CompactRow::new(row),
-                        0,
-                    ),
-                    reply: tx,
-                })
-                .await
-                .unwrap();
-            rx.await.unwrap().unwrap();
         }
     }
 
@@ -232,6 +169,18 @@ async fn assert_closed_after(stream: &mut TcpStream, since: Instant, open_for: D
         elapsed >= open_for,
         "closed after {elapsed:?}, before {open_for:?}"
     );
+}
+
+/// Sends the HTTP/2 connection preface and an empty SETTINGS frame.
+async fn send_h2_preface(stream: &mut TcpStream) {
+    stream
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .unwrap();
+    stream
+        .write_all(&[0, 0, 0, 0x4, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
 }
 
 /// Sends a GET request for an unknown path on a keep-alive connection and reads the 404.
@@ -293,14 +242,7 @@ async fn http2_connection_without_requests_is_closed() {
     let start = Instant::now();
     let mut stream = TcpStream::connect(server.addr).await.unwrap();
     // The HTTP/2 connection preface and an empty SETTINGS frame, then nothing.
-    stream
-        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
-        .await
-        .unwrap();
-    stream
-        .write_all(&[0, 0, 0, 0x4, 0, 0, 0, 0, 0])
-        .await
-        .unwrap();
+    send_h2_preface(&mut stream).await;
     assert_closed_after(&mut stream, start, HEADER_TIMEOUT).await;
     server.shutdown().await;
 }
@@ -461,47 +403,23 @@ async fn open_sse_stream_outlives_both_timeouts() {
 
     // The stream still delivers events: a commit advances the head.
     let sender = server
+        .parts
         .room_manager
         .get_or_spawn(&server.room_id, None)
         .await
         .unwrap();
-    let (tx, rx) = oneshot::channel();
-    sender
-        .send(RoomCommand::RegisterClient {
-            client_id: server.client_id.clone(),
-            current_seq: None,
-            reply: tx,
-        })
+    register(&sender, &server.client_id).await;
+    let op = Operation::insert(
+        0,
+        PrimaryKey::single(1i64),
+        CompactRow::new(vec![Value::Int(1), Value::Null]),
+        0,
+    );
+    commit(&sender, &server.client_id, MutationId::new([1; 16]), 0, op)
         .await
         .unwrap();
-    rx.await.unwrap().unwrap();
-    let (tx, rx) = oneshot::channel();
-    sender
-        .send(RoomCommand::Commit {
-            client_id: server.client_id.clone(),
-            mutation_id: MutationId::new([1; 16]),
-            last_ack_seq: SequenceNumber::new(0),
-            op: Operation::insert(
-                0,
-                PrimaryKey::single(1i64),
-                CompactRow::new(vec![Value::Int(1), Value::Null]),
-                0,
-            ),
-            reply: tx,
-        })
-        .await
-        .unwrap();
-    rx.await.unwrap().unwrap();
 
-    let mut received = String::new();
-    while !received.contains("event: head_advanced") {
-        let chunk = tokio::time::timeout(Duration::from_secs(5), events.next())
-            .await
-            .expect("the SSE stream must deliver the event")
-            .expect("the SSE stream must still be open")
-            .unwrap();
-        received.push_str(&String::from_utf8_lossy(&chunk));
-    }
+    read_sse_until(&mut events, "event: head_advanced").await;
     drop(events);
     server.shutdown().await;
 }
@@ -572,6 +490,25 @@ const LARGE_ROW_SIZE: usize = 4 * 1024 * 1024;
 /// timeout has passed: the response in progress is completed before the server stops.
 const SHUTDOWN_DURING_RESPONSE: Duration = Duration::from_millis(1500);
 
+/// Sleeps 20 ms for every 64 KiB in `unpaced`, leaving the remainder: about 3 MB/s. Paced by
+/// bytes, not by reads, so the rate does not depend on how much each read returns or on the
+/// resolution of the timer.
+async fn pace(unpaced: &mut usize) {
+    while *unpaced >= 64 * 1024 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        *unpaced -= 64 * 1024;
+    }
+}
+
+/// Asserts that `body` is the `SyncBatch` of the [`LARGE_ROWS`] rows.
+fn assert_large_sync_batch(body: &[u8]) {
+    let reply: ServerMessage = decode_message(body).unwrap();
+    assert!(
+        matches!(&reply, ServerMessage::SyncBatch { ops, .. } if ops.len() == LARGE_ROWS as usize),
+        "unexpected reply"
+    );
+}
+
 #[tokio::test]
 async fn large_response_to_a_slow_http1_reader_is_delivered_in_full() {
     let mut server = start_server(short_timeouts).await;
@@ -621,19 +558,10 @@ async fn large_response_to_a_slow_http1_reader_is_delivered_in_full() {
                 response.len()
             ),
         }
-        // Paced by bytes, not by reads, so the rate does not depend on how much each read
-        // returns or on the resolution of the timer.
-        while unpaced >= 64 * 1024 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            unpaced -= 64 * 1024;
-        }
+        pace(&mut unpaced).await;
     }
     let split = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
-    let reply: ServerMessage = decode_message(&response[split + 4..]).unwrap();
-    assert!(
-        matches!(&reply, ServerMessage::SyncBatch { ops, .. } if ops.len() == LARGE_ROWS as usize),
-        "unexpected reply"
-    );
+    assert_large_sync_batch(&response[split + 4..]);
     server.wait_stopped().await;
 }
 
@@ -668,17 +596,10 @@ async fn large_response_to_a_slow_http2_reader_is_delivered_in_full() {
             }
             Err(err) => panic!("body cut after {} of {expected} bytes: {err:?}", body.len()),
         }
-        while unpaced >= 64 * 1024 {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            unpaced -= 64 * 1024;
-        }
+        pace(&mut unpaced).await;
     }
     assert_eq!(body.len(), expected);
-    let reply: ServerMessage = decode_message(&body).unwrap();
-    assert!(
-        matches!(&reply, ServerMessage::SyncBatch { ops, .. } if ops.len() == LARGE_ROWS as usize),
-        "unexpected reply"
-    );
+    assert_large_sync_batch(&body);
     drop(client);
     server.wait_stopped().await;
 }
@@ -696,12 +617,7 @@ async fn shutdown_closes_connections_without_a_request_in_progress_at_once() {
         .unwrap();
     // An HTTP/2 connection that never answers, not even the ping of a graceful shutdown.
     let mut mute = TcpStream::connect(server.addr).await.unwrap();
-    mute.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
-        .await
-        .unwrap();
-    mute.write_all(&[0, 0, 0, 0x4, 0, 0, 0, 0, 0])
-        .await
-        .unwrap();
+    send_h2_preface(&mut mute).await;
     // An idle keep-alive connection and one that sent nothing.
     let mut idle = TcpStream::connect(server.addr).await.unwrap();
     get_not_found(&mut idle).await;

@@ -1,11 +1,28 @@
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use std::time::Duration;
 use zemdb_core::{ClientId, RoomId};
 use zemdb_server::api::auth::{
     generate_client_token, verify_client_token, verify_client_token_bound,
 };
 
+/// A token for `client` in `room`, signed with `"secret"` and valid for 60 s.
+fn token(client: &str, room: &str) -> String {
+    generate_client_token(
+        &ClientId::new(client).unwrap(),
+        &RoomId::new(room).unwrap(),
+        Duration::from_secs(60),
+        "secret",
+    )
+}
+
+/// The dot-separated fields of `token`.
+fn parts(token: &str) -> Vec<String> {
+    token.split('.').map(str::to_string).collect()
+}
+
 #[test]
-fn test_client_token_generation_and_verification() {
+fn client_token_generation_and_verification() {
     let client_id = ClientId::new("client-alpha").unwrap();
     let room_id = RoomId::new("room-xyz").unwrap();
     let secret = "super_secret_cluster_key_12345";
@@ -32,7 +49,7 @@ fn test_client_token_generation_and_verification() {
     let expired_token = generate_client_token(&client_id, &room_id, Duration::from_secs(0), secret);
     assert!(verify_client_token(&expired_token, secret).is_err());
 
-    // Dev backdoor elimination test
+    // "dev-token" is not a valid token
     assert!(verify_client_token("dev-token", "default_auth_secret_dev_32bytes!").is_err());
 }
 
@@ -52,29 +69,15 @@ fn client_ids_with_dots_and_unicode_round_trip() {
 
 #[test]
 fn token_has_versioned_unambiguous_format() {
-    let token = generate_client_token(
-        &ClientId::new("a.b").unwrap(),
-        &RoomId::new("room-1").unwrap(),
-        Duration::from_secs(60),
-        "secret",
-    );
+    let token = token("a.b", "room-1");
     assert!(token.starts_with("v1."), "unexpected token format: {token}");
     assert_eq!(token.split('.').count(), 5);
 }
 
 #[test]
 fn tampered_claims_are_rejected() {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-
     let secret = "secret";
-    let token = generate_client_token(
-        &ClientId::new("alice").unwrap(),
-        &RoomId::new("room-1").unwrap(),
-        Duration::from_secs(60),
-        secret,
-    );
-    let mut parts: Vec<String> = token.split('.').map(str::to_string).collect();
+    let mut parts = parts(&token("alice", "room-1"));
     assert_eq!(parts.len(), 5);
 
     let mut other_client = parts.clone();
@@ -92,8 +95,7 @@ fn tampered_claims_are_rejected() {
 
 #[test]
 fn legacy_token_format_is_rejected() {
-    // A token in the previous `client.room.expires.signature` format, signed with the previous
-    // scheme, must no longer be accepted.
+    // The previous `client.room.expires.signature` format, with its signature, stays rejected.
     let secret = "secret";
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -126,21 +128,13 @@ fn malformed_tokens_are_rejected() {
 
 #[test]
 fn signature_binds_the_boundary_between_client_and_room() {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-
     // (client "a_", room "b") and (client "a", room "_b") concatenate to the same bytes; the
     // signature of one must not validate the other.
     let secret = "secret";
-    let token = generate_client_token(
-        &ClientId::new("a_").unwrap(),
-        &RoomId::new("b").unwrap(),
-        Duration::from_secs(60),
-        secret,
-    );
+    let token = token("a_", "b");
     assert!(verify_client_token(&token, secret).is_ok());
 
-    let mut parts: Vec<String> = token.split('.').map(str::to_string).collect();
+    let mut parts = parts(&token);
     parts[1] = URL_SAFE_NO_PAD.encode("a");
     parts[2] = URL_SAFE_NO_PAD.encode("_b");
     assert!(verify_client_token(&parts.join("."), secret).is_err());
@@ -149,19 +143,13 @@ fn signature_binds_the_boundary_between_client_and_room() {
 #[test]
 fn non_canonical_expiry_is_rejected() {
     let secret = "secret";
-    let token = generate_client_token(
-        &ClientId::new("alice").unwrap(),
-        &RoomId::new("room-1").unwrap(),
-        Duration::from_secs(60),
-        secret,
-    );
-    let parts: Vec<&str> = token.split('.').collect();
-    let exp = parts[3];
+    let parts = parts(&token("alice", "room-1"));
+    let exp = &parts[3];
 
     // Each variant decodes to the same expiry, so the signature still matches: only a strict
     // decimal format guarantees one token string per claim set.
     for variant in [format!("0{exp}"), format!("00{exp}"), format!("+{exp}")] {
-        let mut altered: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
+        let mut altered = parts.clone();
         altered[3] = variant.clone();
         assert!(
             verify_client_token(&altered.join("."), secret).is_err(),
