@@ -4,7 +4,7 @@
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -14,13 +14,13 @@ use zemdb_core::protocol::snapshot_envelope::validate_snapshot_envelope;
 
 use super::files::{
     promote, run_blocking, snapshot_file_name, sync_file, upload_file_name, verify_snapshot_file,
-    write_at, write_new_file, VerifyError, PART_EXTENSION, TMP_EXTENSION,
+    write_at, write_new_file, PART_EXTENSION, TMP_EXTENSION,
 };
 use super::types::{
     LogBounds, SnapshotChunkUpload, Uploader, MAX_CHUNK_BYTES, MAX_PENDING_SINGLE_UPLOADS,
     MIN_CHUNK_BYTES, UPLOAD_IDLE_TIMEOUT,
 };
-use super::{SnapshotRelay, StagedSnapshot};
+use super::{bad_request, RoomSlot, SnapshotRelay, StagedSnapshot};
 use crate::durable::remove_file_if_exists;
 use crate::error::ServerError;
 
@@ -40,20 +40,12 @@ impl UploadLayout {
         max_snapshot_bytes: u64,
     ) -> Result<Self, ServerError> {
         if total_chunks == 0 {
-            return Err(ServerError::BadRequest(
-                "total_chunks must be greater than 0".to_string(),
-            ));
+            return Err(bad_request("total_chunks must be greater than 0"));
         }
         if total_bytes == 0 {
-            return Err(ServerError::BadRequest(
-                "total_bytes must be greater than 0".to_string(),
-            ));
+            return Err(bad_request("total_bytes must be greater than 0"));
         }
-        if total_bytes > max_snapshot_bytes {
-            return Err(ServerError::BadRequest(format!(
-                "Snapshot of {total_bytes} bytes exceeds the maximum of {max_snapshot_bytes} bytes"
-            )));
-        }
+        check_size(total_bytes, max_snapshot_bytes)?;
         let chunk_len = total_bytes.div_ceil(u64::from(total_chunks));
         if chunk_len > u64::from(MAX_CHUNK_BYTES) {
             return Err(ServerError::BadRequest(format!(
@@ -161,13 +153,7 @@ impl SnapshotRelay {
         log_bounds: impl Future<Output = Result<LogBounds, ServerError>>,
     ) -> Result<[u8; 32], ServerError> {
         check_seq_positive(head_seq)?;
-        if data.len() as u64 > self.max_snapshot_bytes {
-            return Err(ServerError::BadRequest(format!(
-                "Snapshot of {} bytes exceeds the maximum of {} bytes",
-                data.len(),
-                self.max_snapshot_bytes
-            )));
-        }
+        check_size(data.len() as u64, self.max_snapshot_bytes)?;
 
         let _pending = PendingUpload::acquire(&self.pending_single_uploads, room_id)?;
         let slot = self.slot(room_id);
@@ -197,36 +183,17 @@ impl SnapshotRelay {
         let tmp_path = self
             .uploads_dir
             .join(upload_file_name(room_id, head_seq, TMP_EXTENSION));
-        let final_path =
-            self.snapshots_dir
-                .join(snapshot_file_name(room_id, head_seq, &snapshot_hash));
         let total_bytes = data.len() as u64;
-        let (uploads_dir, snapshots_dir) = (self.uploads_dir.clone(), self.snapshots_dir.clone());
-        let promoted_path = final_path.clone();
-        run_blocking(move || {
-            let result = write_new_file(&tmp_path, &data)
-                .and_then(|()| promote(&tmp_path, &promoted_path, &uploads_dir, &snapshots_dir));
-            if result.is_err() {
-                if let Err(err) = remove_file_if_exists(&tmp_path) {
-                    warn!(path = ?tmp_path, error = %err, "Failed to delete snapshot upload after an error");
-                }
-            }
-            result.map_err(ServerError::from)
-        })
-        .await?;
-
-        self.install(
+        self.promote_and_install(
             room_id,
             &mut guard,
-            StagedSnapshot {
-                head_seq,
-                total_bytes,
-                snapshot_hash,
-                staged_at: Instant::now(),
-                path: final_path,
-            },
+            tmp_path,
+            head_seq,
+            total_bytes,
+            snapshot_hash,
+            move |path| Ok(write_new_file(path, &data)?),
         )
-        .await;
+        .await?;
         Ok(snapshot_hash)
     }
 
@@ -355,37 +322,58 @@ impl SnapshotRelay {
             return Err(err);
         }
 
+        self.promote_and_install(
+            &room_id,
+            &mut guard,
+            session.path,
+            head_seq,
+            total_bytes,
+            snapshot_hash,
+            move |path| {
+                // The chunks were written without syncing; sync the whole file once, then read
+                // it back to check it.
+                sync_file(path)?;
+                verify_snapshot_file(path, &snapshot_hash)?;
+                Ok(())
+            },
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Runs `prepare` on the upload file `src`, promotes it and installs it as the room's
+    /// active snapshot. On any error `src` is deleted.
+    #[allow(clippy::too_many_arguments)]
+    async fn promote_and_install(
+        &self,
+        room_id: &RoomId,
+        slot: &mut RoomSlot,
+        src: PathBuf,
+        head_seq: SequenceNumber,
+        total_bytes: u64,
+        snapshot_hash: [u8; 32],
+        prepare: impl FnOnce(&Path) -> Result<(), ServerError> + Send + 'static,
+    ) -> Result<(), ServerError> {
         let final_path =
             self.snapshots_dir
-                .join(snapshot_file_name(&room_id, head_seq, &snapshot_hash));
-        let part_path = session.path.clone();
+                .join(snapshot_file_name(room_id, head_seq, &snapshot_hash));
         let (uploads_dir, snapshots_dir) = (self.uploads_dir.clone(), self.snapshots_dir.clone());
         let promoted_path = final_path.clone();
-        let outcome = run_blocking(move || {
-            // The chunks were written without syncing; sync the whole file once, then read it
-            // back to check it.
-            let verified = sync_file(&part_path)
-                .map_err(VerifyError::Io)
-                .and_then(|()| verify_snapshot_file(&part_path, &snapshot_hash));
-            let result = match verified {
-                Ok(_) => promote(&part_path, &promoted_path, &uploads_dir, &snapshots_dir)
-                    .map_err(ServerError::from),
-                Err(VerifyError::Io(err)) => Err(ServerError::from(err)),
-                Err(VerifyError::Invalid(msg)) => Err(ServerError::BadRequest(msg)),
-            };
+        run_blocking(move || {
+            let result = prepare(&src)
+                .and_then(|()| Ok(promote(&src, &promoted_path, &uploads_dir, &snapshots_dir)?));
             if result.is_err() {
-                if let Err(err) = remove_file_if_exists(&part_path) {
-                    warn!(path = ?part_path, error = %err, "Failed to delete rejected snapshot upload");
+                if let Err(err) = remove_file_if_exists(&src) {
+                    warn!(path = ?src, error = %err, "Failed to delete rejected snapshot upload");
                 }
             }
             result
         })
-        .await;
-        outcome?;
+        .await?;
 
         self.install(
-            &room_id,
-            &mut guard,
+            room_id,
+            slot,
             StagedSnapshot {
                 head_seq,
                 total_bytes,
@@ -395,7 +383,7 @@ impl SnapshotRelay {
             },
         )
         .await;
-        Ok(true)
+        Ok(())
     }
 
     /// Whether an upload for the room is under way: a single-request upload being received or
@@ -447,9 +435,16 @@ impl SnapshotRelay {
 
 fn check_seq_positive(seq: SequenceNumber) -> Result<(), ServerError> {
     if seq.get() == 0 {
-        return Err(ServerError::BadRequest(
-            "Snapshot sequence must be greater than 0".to_string(),
-        ));
+        return Err(bad_request("Snapshot sequence must be greater than 0"));
+    }
+    Ok(())
+}
+
+fn check_size(total_bytes: u64, max_snapshot_bytes: u64) -> Result<(), ServerError> {
+    if total_bytes > max_snapshot_bytes {
+        return Err(ServerError::BadRequest(format!(
+            "Snapshot of {total_bytes} bytes exceeds the maximum of {max_snapshot_bytes} bytes"
+        )));
     }
     Ok(())
 }

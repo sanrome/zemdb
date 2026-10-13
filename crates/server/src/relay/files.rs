@@ -162,6 +162,15 @@ pub(super) enum VerifyError {
     Io(std::io::Error),
 }
 
+impl From<VerifyError> for ServerError {
+    fn from(err: VerifyError) -> Self {
+        match err {
+            VerifyError::Invalid(msg) => ServerError::BadRequest(msg),
+            VerifyError::Io(err) => ServerError::from(err),
+        }
+    }
+}
+
 /// Reads a snapshot file once, checking its envelope header and CRC and that its BLAKE3 hash
 /// is `expected_hash`. Returns its size.
 pub(super) fn verify_snapshot_file(

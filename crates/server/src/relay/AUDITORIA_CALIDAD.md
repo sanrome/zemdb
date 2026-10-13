@@ -92,6 +92,7 @@
 - **Preservación:** se mantienen el orden de efectos (preparar → rename → `sync_dir(snapshots)` → `sync_dir(uploads)` → borrar el `src` solo si hubo error → `install`) y los mensajes de error (`BLAKE3…` e `Invalid snapshot envelope: …`, que los tests comparan en `tests/upload.rs:396` y `:433`). El mapeo `io::Error → ServerError::from` también queda igual. Solo cambia el texto de **un** `warn!` (`upload.rs:209`, "after an error"); no lo compara ningún test (verificado con grep).
 - **Ahorro estimado:** ~20–25 líneas · **Riesgo:** bajo-medio (hay que firmar bien la closure `Send + 'static`) · **Prioridad:** alta.
 - **Verificación (2.ª pasada):** ✅ confirmada — `promote` (rename → `sync_dir(snapshots)` → `sync_dir(uploads)`, con borrado del final si falla el sync) no cambia; `write_new_file` sigue haciendo `sync_all` antes del rename; el borrado de `src` ante error y el `ServerError::from(io::Error)` vía `?` son equivalentes; `&mut guard` se coerciona a `&mut RoomSlot` como hoy en `install`. Requiere `From<VerifyError>` (Q3) o mantener el `match` en el closure de `stage_chunk`.
+- **Estado:** ✅ aplicada (paso 2) con el `From<VerifyError> for ServerError` en `files.rs`, así que el closure de `stage_chunk` usa `?`. Con `&self`, el helper recibe 8 parámetros: lleva `#[allow(clippy::too_many_arguments)]`, como `RoomActor::open`, en lugar de agrupar `head_seq`, `total_bytes` y `snapshot_hash` en una tupla. El `warn!` de `stage_snapshot` pasa a decir "Failed to delete rejected snapshot upload", como el de `stage_chunk`.
 
 ### Q2. `Option::take_if` en `install` y `expire_locked`
 - **Dónde:** `mod.rs:135-143` y `lifecycle.rs:101-106`.
@@ -132,12 +133,14 @@
 - **Problema:** el mismo chequeo y el mismo mensaje ("Snapshot of {n} bytes exceeds the maximum of {max} bytes") están escritos dos veces.
 - **Propuesta:** `fn check_size(total: u64, max: u64) -> Result<(), ServerError>` junto a `check_seq_positive` (`upload.rs:452`), usado desde `stage_snapshot` y `UploadLayout::new`. El orden de validaciones de `UploadLayout::new` no cambia: sigue después de los chequeos `== 0`.
 - **Ahorro estimado:** ~4 líneas · **Riesgo:** bajo · **Prioridad:** media.
+- **Estado:** ✅ aplicada (paso 2)
 
 ### Q6. Un helper `bad_request` para los `BadRequest` con literal
 - **Dónde:** `upload.rs:41-43`, `:46-48`, `:454-456`; `download.rs:33-36`.
 - **Problema:** `Err(ServerError::BadRequest("…".to_string()))` ocupa 3–4 líneas por rustfmt.
 - **Propuesta:** `fn bad_request(msg: impl Into<String>) -> ServerError` en `mod.rs` (`pub(super)`), o en `crate::error` si otros módulos lo quieren (fuera de alcance). Cada caso queda en una línea: `return Err(bad_request("total_chunks must be greater than 0"));`. Los `format!` pueden seguir como están.
 - **Ahorro estimado:** ~8 líneas · **Riesgo:** bajo · **Prioridad:** media-baja.
+- **Estado:** ✅ aplicada (paso 2) en `mod.rs` (privada del módulo, visible para `upload.rs` y `download.rs`) para los cuatro mensajes literales; los `format!` siguen como están.
 
 ### Q7. `has_upload_in_progress` más compacto
 - **Dónde:** `upload.rs:405-428`.

@@ -38,6 +38,7 @@ use tracing::warn;
 use zemdb_core::id::{RoomId, SequenceNumber};
 
 use crate::durable::{self, remove_file_if_exists};
+use crate::error::ServerError;
 use files::{run_blocking, UPLOADS_DIR};
 use upload::UploadSession;
 
@@ -174,6 +175,11 @@ impl SnapshotRelay {
             warn!(error = %err, "Snapshot relay file cleanup task failed");
         }
     }
+}
+
+/// A `BadRequest` error with `message`.
+fn bad_request(message: impl Into<String>) -> ServerError {
+    ServerError::BadRequest(message.into())
 }
 
 #[cfg(test)]

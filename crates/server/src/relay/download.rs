@@ -8,7 +8,7 @@ use zemdb_core::protocol::messages::ServerMessage;
 
 use super::files::{read_range, run_blocking};
 use super::types::{LogBounds, MAX_CHUNK_BYTES, MIN_CHUNK_BYTES};
-use super::{SnapshotRelay, StagedSnapshot};
+use super::{bad_request, SnapshotRelay, StagedSnapshot};
 use crate::error::ServerError;
 
 impl SnapshotRelay {
@@ -30,9 +30,8 @@ impl SnapshotRelay {
         log_bounds: impl Future<Output = Result<LogBounds, ServerError>>,
     ) -> Result<ServerMessage, ServerError> {
         if chunk_index > 0 && snapshot_hash.is_none() {
-            return Err(ServerError::BadRequest(
-                "snapshot_hash is required after the first chunk; take it from the reply to chunk 0"
-                    .to_string(),
+            return Err(bad_request(
+                "snapshot_hash is required after the first chunk; take it from the reply to chunk 0",
             ));
         }
         let chunk_size = u64::from(chunk_size.clamp(MIN_CHUNK_BYTES, MAX_CHUNK_BYTES));
