@@ -16,15 +16,7 @@ pub enum DataType {
 
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DataType::Null => write!(f, "Null"),
-            DataType::Int => write!(f, "Int"),
-            DataType::Float => write!(f, "Float"),
-            DataType::Timestamp => write!(f, "Timestamp"),
-            DataType::String => write!(f, "String"),
-            DataType::Bool => write!(f, "Bool"),
-            DataType::Bytes => write!(f, "Bytes"),
-            DataType::Uuid => write!(f, "Uuid"),
-        }
+        // The variant name, e.g. "Int": renaming a variant changes this text.
+        fmt::Debug::fmt(self, f)
     }
 }

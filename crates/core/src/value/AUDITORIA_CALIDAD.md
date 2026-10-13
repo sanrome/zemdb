@@ -38,10 +38,12 @@
 - `row.rs:242-259` (18 líneas doc de `deserialize_columns`): el segundo y el tercer párrafo se superponen ("rejected before decoding anything … counted as they arrive" se repite con "the declared length up front … one by one any element beyond it"). Se pueden fusionar en ~13–14 líneas sin perder contenido. Ver Q8.
 - `row.rs:12-13`: "optimized with SmallVec to keep scalar keys on the stack while strictly fitting within a single 64-byte L1 cache line (size: 40 bytes)" se puede reducir a una línea, por ejemplo "Inline up to one value (40 bytes, fits a cache line)".
 - `scalar.rs:153`: "Creates a Value::Uuid from a UUID hex string (32 or 36 chars with hyphens)." repite la doc de `parse_uuid` (`scalar.rs:122`). Alcanza con "Like [`Value::parse_uuid`], wrapped in `Value::Uuid`."
+- **Estado:** ✅ aplicada (paso 1)
 
 **Agregar (falta el *por qué*):**
 - `scalar.rs:279-331`: falta un comentario de 1–2 líneas que diga que `PartialEq`/`Hash`/`Ord` son manuales para que `Float` tenga orden total (`total_cmp`) con `-0.0 == 0.0`, y que el `Hash` canonicaliza igual para ser coherente con `Eq`. Hoy hay que deducirlo.
 - `scalar.rs:27`: `type_order` es `pub` y define el orden entre tipos (lo usan `Ord` y `Hash`), pero no tiene doc.
+- **Estado:** ✅ aplicada (paso 1)
 
 ## Sugerencias
 
@@ -64,6 +66,7 @@
   `i64::from` es equivalente a `as i64` para estos tipos (todas son conversiones sin pérdida) y deja explícito que no se trunca.
 - **Ahorro estimado:** ~25 líneas · **Riesgo:** bajo · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ✅ confirmada — líneas 169-209 correctas; para `i8/i16/i32` `as i64` extiende signo y para `u8/u16/u32` extiende con ceros, exactamente igual que `i64::from`. (Opcional: `i64` también entra en la macro, `i64::from(i64)` es la identidad.)
+- **Estado:** ✅ aplicada (paso 1), con `i64` incluido en la macro.
 
 ### Q2. `parse_uuid` con iteradores en lugar de dos bucles con índices manuales
 - **Dónde:** `scalar.rs:123-151`.
@@ -89,6 +92,7 @@
   Es equivalente: los segmentos 8-4-4-4-12 tienen largo par, así que los pares de dígitos coinciden con los del bucle original. Un guion fuera de posición sigue fallando en `hex_val`. No asigna memoria. Los tests de `crates/core/tests/types_memory_tests.rs:21,48,57` cubren ambos formatos.
 - **Ahorro estimado:** ~10 líneas · **Riesgo:** bajo-medio (conviene sumar un caso con guion mal ubicado y uno con mayúsculas antes del cambio) · **Prioridad:** media
 - **Verificación (2.ª pasada):** ✅ confirmada — mismos pares de dígitos (el `while` original salta 8/13/18/23 y avanza de a 2: (9,10)…(24,25)…), mismo resultado `None` para largo distinto de 32/36, guiones mal ubicados (36 → `None`; guion en posición de dígito → `hex_val` falla) o hex inválido; el guard `36 if …` solo indexa tras confirmar el largo, así que no hay OOB; `digits.next()?` nunca agota (32 dígitos). Compila: `HYPHENS.contains(i)` recibe `&usize`, `?` dentro del `for` en fn que devuelve `Option`. Tests citados (`:21,48,57`) correctos.
+- **Estado:** ✅ aplicada (paso 1), junto con Q9 (`to_digit(16)` en lugar de `hex_val`). La equivalencia con la versión anterior se comprobó fuera del repo sobre ~2,2 millones de entradas (mutaciones de UUID válidos con y sin guiones, mayúsculas, largos 35/37, no ASCII). Los casos borde en `types_memory_tests.rs` quedan para el paso de tests.
 
 ### Q3. `Display` de `DataType` delegando en `Debug`
 - **Dónde:** `data_type.rs:17-30`.
@@ -103,6 +107,7 @@
   ```
   La salida es idéntica: el `Debug` derivado de variantes unitarias usa `write_str`, que igual que el `write!(f, "Null")` actual ignora el ancho y el relleno. Los mensajes de error que muestran `DataType` no cambian.
 - **Ahorro estimado:** ~9 líneas · **Riesgo:** bajo (el `Display` queda acoplado al nombre de la variante; si algún día se renombra una variante, cambia el texto, y el comentario lo deja dicho) · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q4. Accessors duplicados en `PrimaryKey` y `CompactRow`
 - **Dónde:** `row.rs:34-40` (`values`/`as_slice` en `PrimaryKey`), `row.rs:136-142` (lo mismo en `CompactRow`), además de `AsRef<[Value]>` (73-78 y 177-182), que hace lo mismo.
@@ -115,6 +120,7 @@
 - **Problema:** dos funciones casi idénticas. `as_uuid` no tiene usos fuera de `scalar.rs` y `to_uuid` tiene uno (`types_memory_tests.rs:53`).
 - **Propuesta:** `pub fn to_uuid(&self) -> Option<[u8; 16]> { self.as_uuid().copied() }`. Opcional y a verificar: eliminar una de las dos, porque es API pública.
 - **Ahorro estimado:** ~4 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada en parte (paso 1): `to_uuid` es `as_uuid().copied()`. Borrar una de las dos es API pública y queda para el paso 4.
 
 ### Q6. Un único helper para canonicalizar `-0.0`
 - **Dónde:** `scalar.rs:213`, `220`, `295`, `320-321` (5 apariciones de `if x == 0.0 { 0.0 } else { x }`).
@@ -126,17 +132,20 @@
 - **Dónde:** `row.rs:20-24`.
 - **Propuesta:** `Self(SmallVec::from_buf([value.into()]))`. Sigue inline, y el test `tests/row.rs:57-64` lo cubre. En la misma línea, `row.rs:27`: `.map(|v| v.into())` puede ser `.map(Into::into)`.
 - **Ahorro estimado:** ~2 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q8. Condensar la doc de `deserialize_columns`
 - **Dónde:** `row.rs:242-259`.
 - **Problema:** se superponen los párrafos 2 y 3 (ver la sección Comentarios).
 - **Propuesta:** fusionarlos. Hay que conservar: el motivo (los derives confían en el largo declarado), las tres defensas (rechazo anticipado, prealloc acotado, conteo incremental), el cobro del presupuesto (largo declarado por adelantado y luego de a uno) y la nota del `#[inline]`.
 - **Ahorro estimado:** ~4 líneas · **Riesgo:** nulo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q9. `hex_val` con `char::to_digit`
 - **Dónde:** `scalar.rs:159-167`.
 - **Propuesta:** `(c as char).to_digit(16)` acepta exactamente `0-9a-fA-F`. Combinado con Q2, `hex_val` desaparece (con un cast final `as u8`).
 - **Ahorro estimado:** ~6 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1), combinada con Q2.
 
 ### Q10. Menores de estilo, sin cambio de líneas
 - `scalar.rs:340-344`: el `format!` del UUID con 16 argumentos supera las 100 columnas, y rustfmt no lo formatea. Un bucle con `if matches!(i, 4 | 6 | 8 | 10) { f.write_str("-")?; }` y `write!(f, "{byte:02x}")` se lee mejor, aunque ocupa 1–2 líneas más.
@@ -145,6 +154,7 @@
 - `row.rs:193`: `std::ops::IndexMut` va con ruta completa mientras `Index` se importa arriba (`row.rs:10`). Unificar.
 - `row.rs:173`: `self.into_values().into_iter()` puede ser `self.values.into_iter()`.
 - `mod.rs:1-4`: los submódulos son `pub` y además se reexportan con `*`. Ningún crate externo usa las rutas `value::scalar::…`, `value::row::…` ni `value::data_type::…` (solo `mutation/op.rs:1` usa `value::row::deserialize_columns`, que es `pub(crate)`). **A verificar** si conviene hacerlos privados: es un cambio de API.
+- **Estado:** ✅ aplicada en parte (paso 1): `Display` del UUID con bucle, `write_str`/argumentos en línea, `IndexMut` importado y `self.values.into_iter()`. ⏭️ no aplicado el borrado del brazo `(Null, Null)`: el informe lo deja opcional y se conserva por explícito. Los submódulos privados de `mod.rs` cambian la API y quedan para el paso 4.
 
 ## Lo que conviene dejar como está
 - **`decode_budget.rs` completo:** el enum de tres estados, el guard RAII con `Drop` y el `#[must_use]` son la forma mínima correcta. No hay nada que recortar.

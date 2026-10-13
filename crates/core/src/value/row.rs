@@ -7,10 +7,9 @@ use smallvec::SmallVec;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
-use std::ops::Index;
+use std::ops::{Index, IndexMut};
 
-/// Primary key representation, optimized with SmallVec to keep scalar keys on the stack
-/// while strictly fitting within a single 64-byte L1 cache line (size: 40 bytes).
+/// Primary key values, inline up to one value (40 bytes, fits a cache line).
 ///
 /// Deserialization rejects more than [`MAX_COLUMNS`] values, counted as they are decoded.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -18,13 +17,11 @@ pub struct PrimaryKey(#[serde(deserialize_with = "deserialize_columns")] SmallVe
 
 impl PrimaryKey {
     pub fn single(value: impl Into<Value>) -> Self {
-        let mut v = SmallVec::new();
-        v.push(value.into());
-        Self(v)
+        Self(SmallVec::from_buf([value.into()]))
     }
 
     pub fn composite(values: impl IntoIterator<Item = impl Into<Value>>) -> Self {
-        Self(values.into_iter().map(|v| v.into()).collect())
+        Self(values.into_iter().map(Into::into).collect())
     }
 
     pub fn from_smallvec(values: SmallVec<[Value; 1]>) -> Self {
@@ -170,7 +167,7 @@ impl IntoIterator for CompactRow {
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
-        self.into_values().into_iter()
+        self.values.into_iter()
     }
 }
 
@@ -190,7 +187,7 @@ impl Index<usize> for CompactRow {
     }
 }
 
-impl std::ops::IndexMut<usize> for CompactRow {
+impl IndexMut<usize> for CompactRow {
     #[inline]
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         &mut self.values[index]
@@ -246,14 +243,12 @@ const MAX_COLUMNS_PREALLOC_BYTES: usize = 64 * 1024;
 /// 1 MiB from it and `SmallVec` all of it, and both accept any number of elements, which lets a
 /// 16 MiB frame materialize millions of values. Here a declared length above the limit is
 /// rejected before decoding anything, the preallocation is capped, and the elements are counted
-/// as they arrive, so the limit holds whatever the format declares. The serialized form is
-/// that of a plain sequence.
+/// as they arrive. The serialized form is that of a plain sequence.
 ///
-/// Every element holds one `Value` (a row or key value, or the value of an update delta), and
-/// these sequences are the only place a client message carries values, so they charge the
-/// value budget of the decode, if any (see `decode_budget`): the declared length up front,
-/// before decoding the elements (the wire format always declares it), and one by one any
-/// element beyond it, so at most one value is materialized past the budget.
+/// These sequences are the only place a client message carries values (one per element), so
+/// they charge the value budget of the decode, if any (see `decode_budget`): the declared
+/// length up front, then one by one any element beyond it, so at most one value is
+/// materialized past the budget.
 ///
 /// Rows are the hot path of log and snapshot reads: without `#[inline]` the visitor is not
 /// inlined into the derived decoders, and decoding rows gets about a third slower.

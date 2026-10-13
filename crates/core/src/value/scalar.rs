@@ -23,6 +23,8 @@ pub enum Value {
 }
 
 impl Value {
+    /// Rank of the variant in the order between values of different types, used by `Ord`
+    /// and `Hash`.
     #[inline]
     pub const fn type_order(&self) -> u8 {
         match self {
@@ -113,100 +115,48 @@ impl Value {
 
     #[inline]
     pub fn to_uuid(&self) -> Option<[u8; 16]> {
-        match self {
-            Value::Uuid(b) => Some(*b),
-            _ => None,
-        }
+        self.as_uuid().copied()
     }
 
     /// Parses a 32-character or 36-character hyphenated UUID hex string into `[u8; 16]`.
     pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
+        const HYPHENS: [usize; 4] = [8, 13, 18, 23];
         let b = s.as_bytes();
+        let hyphenated = match b.len() {
+            32 => false,
+            36 if HYPHENS.iter().all(|&i| b[i] == b'-') => true,
+            _ => return None,
+        };
+        // Every segment has an even length, so the digits pair up into bytes across hyphens.
+        let mut digits = (0..b.len())
+            .filter(|i| !(hyphenated && HYPHENS.contains(i)))
+            .map(|i| (b[i] as char).to_digit(16));
         let mut bytes = [0u8; 16];
-        if b.len() == 36 && b[8] == b'-' && b[13] == b'-' && b[18] == b'-' && b[23] == b'-' {
-            let mut bi = 0;
-            let mut i = 0;
-            while i < 36 {
-                if i == 8 || i == 13 || i == 18 || i == 23 {
-                    i += 1;
-                    continue;
-                }
-                let hi = hex_val(b[i])?;
-                let lo = hex_val(b[i + 1])?;
-                bytes[bi] = (hi << 4) | lo;
-                bi += 1;
-                i += 2;
-            }
-            Some(bytes)
-        } else if b.len() == 32 {
-            for bi in 0..16 {
-                let hi = hex_val(b[bi * 2])?;
-                let lo = hex_val(b[bi * 2 + 1])?;
-                bytes[bi] = (hi << 4) | lo;
-            }
-            Some(bytes)
-        } else {
-            None
+        for byte in &mut bytes {
+            let hi = digits.next()??;
+            let lo = digits.next()??;
+            *byte = ((hi << 4) | lo) as u8;
         }
+        Some(bytes)
     }
 
-    /// Creates a Value::Uuid from a UUID hex string (32 or 36 chars with hyphens).
+    /// Like [`Value::parse_uuid`], wrapped in `Value::Uuid`.
     pub fn from_uuid_str(s: &str) -> Option<Self> {
         Self::parse_uuid(s).map(Value::Uuid)
     }
 }
 
-#[inline]
-const fn hex_val(c: u8) -> Option<u8> {
-    match c {
-        b'0'..=b'9' => Some(c - b'0'),
-        b'a'..=b'f' => Some(c - b'a' + 10),
-        b'A'..=b'F' => Some(c - b'A' + 10),
-        _ => None,
-    }
+macro_rules! from_lossless_int {
+    ($($t:ty),*) => {$(
+        impl From<$t> for Value {
+            fn from(v: $t) -> Self {
+                Value::Int(i64::from(v))
+            }
+        }
+    )*};
 }
 
-impl From<i8> for Value {
-    fn from(v: i8) -> Self {
-        Value::Int(v as i64)
-    }
-}
-
-impl From<i16> for Value {
-    fn from(v: i16) -> Self {
-        Value::Int(v as i64)
-    }
-}
-
-impl From<i32> for Value {
-    fn from(v: i32) -> Self {
-        Value::Int(v as i64)
-    }
-}
-
-impl From<i64> for Value {
-    fn from(v: i64) -> Self {
-        Value::Int(v)
-    }
-}
-
-impl From<u8> for Value {
-    fn from(v: u8) -> Self {
-        Value::Int(v as i64)
-    }
-}
-
-impl From<u16> for Value {
-    fn from(v: u16) -> Self {
-        Value::Int(v as i64)
-    }
-}
-
-impl From<u32> for Value {
-    fn from(v: u32) -> Self {
-        Value::Int(v as i64)
-    }
-}
+from_lossless_int!(i8, i16, i32, i64, u8, u16, u32);
 
 impl From<f32> for Value {
     fn from(v: f32) -> Self {
@@ -276,6 +226,9 @@ impl From<[u8; 16]> for Value {
     }
 }
 
+// `Eq`, `Ord` and `Hash` are manual because of `Float`: floats are ordered totally with
+// `total_cmp`, after turning `-0.0` into `0.0` so that both are the same value, and `Hash`
+// canonicalizes them the same way to stay consistent with `Eq`.
 impl PartialEq for Value {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
@@ -333,17 +286,21 @@ impl Ord for Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Value::Null => write!(f, "NULL"),
-            Value::Int(v) => write!(f, "{}", v),
-            Value::Float(v) => write!(f, "{}", v),
-            Value::Timestamp(v) => write!(f, "Timestamp({})", v),
-            Value::Uuid(b) => write!(
-                f,
-                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
-            ),
-            Value::String(v) => write!(f, "\"{}\"", v),
-            Value::Bool(v) => write!(f, "{}", v),
+            Value::Null => f.write_str("NULL"),
+            Value::Int(v) => write!(f, "{v}"),
+            Value::Float(v) => write!(f, "{v}"),
+            Value::Timestamp(v) => write!(f, "Timestamp({v})"),
+            Value::Uuid(b) => {
+                for (i, byte) in b.iter().enumerate() {
+                    if matches!(i, 4 | 6 | 8 | 10) {
+                        f.write_str("-")?;
+                    }
+                    write!(f, "{byte:02x}")?;
+                }
+                Ok(())
+            }
+            Value::String(v) => write!(f, "\"{v}\""),
+            Value::Bool(v) => write!(f, "{v}"),
             Value::Bytes(v) => write!(f, "<bytes len={}>", v.len()),
         }
     }
