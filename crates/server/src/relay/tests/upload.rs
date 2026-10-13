@@ -1,6 +1,9 @@
 use super::*;
 use crate::relay::test_common::*;
 
+/// Sequences staged concurrently, out of order.
+const CONCURRENT_SEQS: [u64; 15] = [7, 3, 12, 1, 9, 15, 4, 11, 2, 14, 6, 13, 5, 10, 8];
+
 #[tokio::test]
 async fn failed_directory_sync_keeps_the_previous_snapshot() {
     let dir = tempdir().unwrap();
@@ -86,7 +89,7 @@ async fn snapshot_with_an_invalid_header_or_checksum_is_rejected() {
 #[tokio::test]
 async fn snapshot_above_the_size_limit_is_rejected() {
     let dir = tempdir().unwrap();
-    let relay = SnapshotRelay::new(dir.path().join("snapshots"), TTL, 1000).unwrap();
+    let relay = SnapshotRelay::new(snapshots_dir(&dir), TTL, 1000).unwrap();
     assert_bad_request(stage(&relay, 1, &envelope(1001, 1)).await);
     stage(&relay, 1, &envelope(1000, 1)).await.unwrap();
 }
@@ -97,7 +100,7 @@ async fn concurrent_stages_never_move_the_active_snapshot_backwards() {
     let relay = Arc::new(open(&dir));
 
     let mut tasks = Vec::new();
-    for n in [7u64, 3, 12, 1, 9, 15, 4, 11, 2, 14, 6, 13, 5, 10, 8] {
+    for n in CONCURRENT_SEQS {
         let relay = Arc::clone(&relay);
         tasks.push(tokio::spawn(async move {
             // At most two single-request uploads wait per room; retry the rejected ones.
@@ -118,10 +121,7 @@ async fn concurrent_stages_never_move_the_active_snapshot_backwards() {
         }));
     }
     let mut accepted_15 = None;
-    for (task, n) in tasks
-        .into_iter()
-        .zip([7u64, 3, 12, 1, 9, 15, 4, 11, 2, 14, 6, 13, 5, 10, 8])
-    {
+    for (task, n) in tasks.into_iter().zip(CONCURRENT_SEQS) {
         match task.await.unwrap() {
             Ok(hash) if n == 15 => accepted_15 = Some(hash),
             Ok(_) | Err(ServerError::SnapshotSuperseded(_)) => {}
@@ -143,12 +143,12 @@ async fn concurrent_stages_never_move_the_active_snapshot_backwards() {
 async fn multipart_upload_out_of_order_assembles_and_stages() {
     let dir = tempdir().unwrap();
     let relay = open(&dir);
-    let (data, layout, hash, ranges) = three_part_snapshot(7);
+    let snap = three_part_snapshot(7);
+    let hash = snap.2;
 
     for index in [2u32, 0] {
-        let r = ranges[index as usize].clone();
         assert!(!relay
-            .stage_chunk(part(10, index, layout, hash, &data[r]), bounds(0, 10))
+            .stage_chunk(part_of(10, index, &snap), bounds(0, 10))
             .await
             .unwrap());
         assert_eq!(relay.active_snapshot_seq(&room()), None);
@@ -156,10 +156,7 @@ async fn multipart_upload_out_of_order_assembles_and_stages() {
     assert_eq!(files_in(&uploads_dir(&dir)).len(), 1);
 
     assert!(relay
-        .stage_chunk(
-            part(10, 1, layout, hash, &data[ranges[1].clone()]),
-            bounds(0, 10)
-        )
+        .stage_chunk(part_of(10, 1, &snap), bounds(0, 10))
         .await
         .unwrap());
     assert_eq!(relay.active_snapshot_seq(&room()), Some(seq(10)));
@@ -172,74 +169,27 @@ async fn multipart_upload_out_of_order_assembles_and_stages() {
         let (_, _, next) = chunk(&relay, index, 0, Some(hash)).await.unwrap();
         assembled.extend_from_slice(&next);
     }
-    assert_eq!(assembled, data);
+    assert_eq!(assembled, snap.0);
 }
 
 #[tokio::test]
 async fn second_upload_for_a_lower_or_equal_seq_is_rejected() {
     let dir = tempdir().unwrap();
     let relay = open(&dir);
-    let (data, layout, hash, ranges) = three_part_snapshot(1);
-    relay
-        .stage_chunk(
-            part(10, 0, layout, hash, &data[ranges[0].clone()]),
-            bounds(0, 20),
-        )
-        .await
-        .unwrap();
+    let snap = three_part_snapshot(1);
+    upload_parts(&relay, 10, [0], &snap, (0, 20)).await;
 
-    let (other, other_layout, other_hash, other_ranges) = three_part_snapshot(2);
-    assert_superseded(
-        relay
-            .stage_chunk(
-                SnapshotChunkUpload {
-                    uploader: member("other"),
-                    ..part(
-                        9,
-                        0,
-                        other_layout,
-                        other_hash,
-                        &other[other_ranges[0].clone()],
-                    )
-                },
-                bounds(0, 20),
-            )
-            .await,
-    );
-    assert_superseded(
-        relay
-            .stage_chunk(
-                SnapshotChunkUpload {
-                    uploader: member("other"),
-                    ..part(
-                        10,
-                        0,
-                        other_layout,
-                        other_hash,
-                        &other[other_ranges[0].clone()],
-                    )
-                },
-                bounds(0, 20),
-            )
-            .await,
-    );
+    let other = three_part_snapshot(2);
+    for n in [9, 10] {
+        assert_superseded(
+            relay
+                .stage_chunk(part_by(member("other"), n, 0, &other), bounds(0, 20))
+                .await,
+        );
+    }
 
     // The original upload is untouched and still completes.
-    for index in [1u32, 2] {
-        relay
-            .stage_chunk(
-                part(
-                    10,
-                    index,
-                    layout,
-                    hash,
-                    &data[ranges[index as usize].clone()],
-                ),
-                bounds(0, 20),
-            )
-            .await
-            .unwrap();
-    }
+    upload_parts(&relay, 10, [1, 2], &snap, (0, 20)).await;
     assert_eq!(relay.active_snapshot_seq(&room()), Some(seq(10)));
 }
 
@@ -247,39 +197,17 @@ async fn second_upload_for_a_lower_or_equal_seq_is_rejected() {
 async fn upload_for_a_higher_seq_replaces_the_current_one_and_deletes_its_file() {
     let dir = tempdir().unwrap();
     let relay = open(&dir);
-    let (data, layout, hash, ranges) = three_part_snapshot(1);
-    relay
-        .stage_chunk(
-            part(10, 0, layout, hash, &data[ranges[0].clone()]),
-            bounds(0, 20),
-        )
-        .await
-        .unwrap();
+    let snap = three_part_snapshot(1);
+    upload_parts(&relay, 10, [0], &snap, (0, 20)).await;
     assert_eq!(files_in(&uploads_dir(&dir)), vec!["relay-room_10.part"]);
 
-    let (newer, newer_layout, newer_hash, newer_ranges) = three_part_snapshot(2);
-    relay
-        .stage_chunk(
-            part(
-                11,
-                0,
-                newer_layout,
-                newer_hash,
-                &newer[newer_ranges[0].clone()],
-            ),
-            bounds(0, 20),
-        )
-        .await
-        .unwrap();
+    upload_parts(&relay, 11, [0], &three_part_snapshot(2), (0, 20)).await;
     assert_eq!(files_in(&uploads_dir(&dir)), vec!["relay-room_11.part"]);
 
     // The replaced upload is gone: its next chunk would start a new upload at a lower seq.
     assert_superseded(
         relay
-            .stage_chunk(
-                part(10, 1, layout, hash, &data[ranges[1].clone()]),
-                bounds(0, 20),
-            )
+            .stage_chunk(part_of(10, 1, &snap), bounds(0, 20))
             .await,
     );
 }
@@ -287,7 +215,7 @@ async fn upload_for_a_higher_seq_replaces_the_current_one_and_deletes_its_file()
 #[tokio::test]
 async fn upload_sizes_are_bounded() {
     let dir = tempdir().unwrap();
-    let relay = SnapshotRelay::new(dir.path().join("snapshots"), TTL, 8 * 1024 * 1024).unwrap();
+    let relay = SnapshotRelay::new(snapshots_dir(&dir), TTL, 8 * 1024 * 1024).unwrap();
     let hash = [0u8; 32];
     let chunk_of = |len: usize| vec![0u8; len];
 
@@ -369,28 +297,11 @@ async fn chunk_of_the_wrong_size_is_rejected() {
 async fn multipart_upload_with_a_wrong_hash_is_rejected_and_discarded() {
     let dir = tempdir().unwrap();
     let relay = open(&dir);
-    let (data, layout, _, ranges) = three_part_snapshot(1);
-    let wrong_hash = [0xEE; 32];
-    for index in [0u32, 1] {
-        relay
-            .stage_chunk(
-                part(
-                    10,
-                    index,
-                    layout,
-                    wrong_hash,
-                    &data[ranges[index as usize].clone()],
-                ),
-                bounds(0, 10),
-            )
-            .await
-            .unwrap();
-    }
+    let mut snap = three_part_snapshot(1);
+    snap.2 = [0xEE; 32];
+    upload_parts(&relay, 10, [0, 1], &snap, (0, 10)).await;
     let result = relay
-        .stage_chunk(
-            part(10, 2, layout, wrong_hash, &data[ranges[2].clone()]),
-            bounds(0, 10),
-        )
+        .stage_chunk(part_of(10, 2, &snap), bounds(0, 10))
         .await;
     match result {
         Err(ServerError::BadRequest(msg)) => assert!(msg.contains("BLAKE3"), "{msg}"),
@@ -405,29 +316,12 @@ async fn multipart_upload_with_a_wrong_hash_is_rejected_and_discarded() {
 async fn multipart_upload_with_a_corrupted_envelope_is_rejected() {
     let dir = tempdir().unwrap();
     let relay = open(&dir);
-    let (mut data, layout, _, ranges) = three_part_snapshot(1);
-    data[100_000] ^= 0xFF;
-    let hash = ServerMessage::compute_snapshot_hash(&data);
-    for index in [0u32, 1] {
-        relay
-            .stage_chunk(
-                part(
-                    10,
-                    index,
-                    layout,
-                    hash,
-                    &data[ranges[index as usize].clone()],
-                ),
-                bounds(0, 10),
-            )
-            .await
-            .unwrap();
-    }
+    let mut snap = three_part_snapshot(1);
+    snap.0[100_000] ^= 0xFF;
+    snap.2 = ServerMessage::compute_snapshot_hash(&snap.0);
+    upload_parts(&relay, 10, [0, 1], &snap, (0, 10)).await;
     let result = relay
-        .stage_chunk(
-            part(10, 2, layout, hash, &data[ranges[2].clone()]),
-            bounds(0, 10),
-        )
+        .stage_chunk(part_of(10, 2, &snap), bounds(0, 10))
         .await;
     match result {
         Err(ServerError::BadRequest(msg)) => assert!(msg.contains("CRC32"), "{msg}"),
@@ -441,29 +335,12 @@ async fn multipart_upload_with_a_corrupted_envelope_is_rejected() {
 async fn multipart_completion_rechecks_the_log_range() {
     let dir = tempdir().unwrap();
     let relay = open(&dir);
-    let (data, layout, hash, ranges) = three_part_snapshot(1);
-    for index in [0u32, 1] {
-        relay
-            .stage_chunk(
-                part(
-                    10,
-                    index,
-                    layout,
-                    hash,
-                    &data[ranges[index as usize].clone()],
-                ),
-                bounds(5, 10),
-            )
-            .await
-            .unwrap();
-    }
+    let snap = three_part_snapshot(1);
+    upload_parts(&relay, 10, [0, 1], &snap, (5, 10)).await;
     // The log was compacted meanwhile: seq 10 is now below tail - 1.
     assert_bad_request(
         relay
-            .stage_chunk(
-                part(10, 2, layout, hash, &data[ranges[2].clone()]),
-                bounds(12, 30),
-            )
+            .stage_chunk(part_of(10, 2, &snap), bounds(12, 30))
             .await,
     );
     assert_eq!(relay.active_snapshot_seq(&room()), None);
@@ -474,31 +351,14 @@ async fn multipart_completion_rechecks_the_log_range() {
 async fn newer_snapshot_discards_the_upload_in_progress() {
     let dir = tempdir().unwrap();
     let relay = open(&dir);
-    let (data, layout, hash, ranges) = three_part_snapshot(1);
-    for index in [0u32, 1] {
-        relay
-            .stage_chunk(
-                part(
-                    10,
-                    index,
-                    layout,
-                    hash,
-                    &data[ranges[index as usize].clone()],
-                ),
-                bounds(0, 20),
-            )
-            .await
-            .unwrap();
-    }
+    let snap = three_part_snapshot(1);
+    upload_parts(&relay, 10, [0, 1], &snap, (0, 20)).await;
     // A newer snapshot arrives in one request; it makes the upload in progress obsolete.
     stage(&relay, 12, &envelope(100, 9)).await.unwrap();
     assert!(files_in(&uploads_dir(&dir)).is_empty());
     assert_superseded(
         relay
-            .stage_chunk(
-                part(10, 2, layout, hash, &data[ranges[2].clone()]),
-                bounds(0, 20),
-            )
+            .stage_chunk(part_of(10, 2, &snap), bounds(0, 20))
             .await,
     );
     assert_eq!(relay.active_snapshot_seq(&room()), Some(seq(12)));
@@ -508,28 +368,11 @@ async fn newer_snapshot_discards_the_upload_in_progress() {
 async fn resending_a_chunk_of_the_installed_upload_is_acknowledged_as_staged() {
     let dir = tempdir().unwrap();
     let relay = open(&dir);
-    let (data, layout, hash, ranges) = three_part_snapshot(1);
-    for index in [0u32, 1, 2] {
-        relay
-            .stage_chunk(
-                part(
-                    10,
-                    index,
-                    layout,
-                    hash,
-                    &data[ranges[index as usize].clone()],
-                ),
-                bounds(0, 10),
-            )
-            .await
-            .unwrap();
-    }
+    let snap = three_part_snapshot(1);
+    upload_parts(&relay, 10, 0..3, &snap, (0, 10)).await;
     // The acknowledgment of the last chunk was lost; the client sends it again.
     assert!(relay
-        .stage_chunk(
-            part(10, 2, layout, hash, &data[ranges[2].clone()]),
-            bounds(0, 10)
-        )
+        .stage_chunk(part_of(10, 2, &snap), bounds(0, 10))
         .await
         .unwrap());
     assert!(files_in(&uploads_dir(&dir)).is_empty());
@@ -553,10 +396,7 @@ async fn single_request_uploads_waiting_per_room_are_bounded() {
                     Bytes::from(envelope(100, n as u8)),
                     async {
                         rx.await.ok();
-                        Ok(LogBounds {
-                            tail_seq: seq(0),
-                            head_seq: seq(10),
-                        })
+                        Ok(log_bounds(0, 10))
                     },
                 )
                 .await
@@ -674,45 +514,20 @@ async fn uploader_may_restart_its_own_upload_at_the_same_seq() {
 async fn multipart_upload_is_in_progress_until_it_completes_or_goes_idle() {
     let dir = tempdir().unwrap();
     let relay = open(&dir);
-    let (data, layout, hash, ranges) = three_part_snapshot(1);
+    let snap = three_part_snapshot(1);
     assert!(!relay.has_upload_in_progress(&room()));
 
-    for index in 0..2u32 {
-        relay
-            .stage_chunk(
-                part(
-                    10,
-                    index,
-                    layout,
-                    hash,
-                    &data[ranges[index as usize].clone()],
-                ),
-                bounds(0, 10),
-            )
-            .await
-            .unwrap();
+    for index in 0..2 {
+        upload_parts(&relay, 10, [index], &snap, (0, 10)).await;
         assert!(relay.has_upload_in_progress(&room()));
     }
     assert!(!relay.has_upload_in_progress(&RoomId::new("other-room").unwrap()));
 
-    relay
-        .stage_chunk(
-            part(10, 2, layout, hash, &data[ranges[2].clone()]),
-            bounds(0, 10),
-        )
-        .await
-        .unwrap();
+    upload_parts(&relay, 10, [2], &snap, (0, 10)).await;
     assert!(!relay.has_upload_in_progress(&room()));
 
     // An upload that stopped receiving chunks no longer counts.
-    let (data, layout, hash, ranges) = three_part_snapshot(2);
-    relay
-        .stage_chunk(
-            part(11, 0, layout, hash, &data[ranges[0].clone()]),
-            bounds(0, 11),
-        )
-        .await
-        .unwrap();
+    upload_parts(&relay, 11, [0], &three_part_snapshot(2), (0, 11)).await;
     assert!(relay.has_upload_in_progress(&room()));
     tokio::time::advance(crate::relay::UPLOAD_IDLE_TIMEOUT).await;
     assert!(!relay.has_upload_in_progress(&room()));
@@ -729,10 +544,7 @@ async fn single_request_upload_is_in_progress_while_it_is_handled() {
             relay
                 .stage_snapshot(&room(), seq(5), Bytes::from(envelope(100, 1)), async {
                     gate_rx.await.ok();
-                    Ok(LogBounds {
-                        tail_seq: seq(0),
-                        head_seq: seq(10),
-                    })
+                    Ok(log_bounds(0, 10))
                 })
                 .await
         }

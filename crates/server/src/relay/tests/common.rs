@@ -29,14 +29,18 @@ pub(super) fn seq(n: u64) -> SequenceNumber {
 }
 
 pub(super) fn open(dir: &TempDir) -> SnapshotRelay {
-    SnapshotRelay::new(dir.path().join("snapshots"), TTL, MAX_BYTES).unwrap()
+    SnapshotRelay::new(snapshots_dir(dir), TTL, MAX_BYTES).unwrap()
+}
+
+pub(super) fn log_bounds(tail: u64, head: u64) -> LogBounds {
+    LogBounds {
+        tail_seq: seq(tail),
+        head_seq: seq(head),
+    }
 }
 
 pub(super) fn bounds(tail: u64, head: u64) -> Ready<Result<LogBounds, ServerError>> {
-    ready(Ok(LogBounds {
-        tail_seq: seq(tail),
-        head_seq: seq(head),
-    }))
+    ready(Ok(log_bounds(tail, head)))
 }
 
 /// A valid raw snapshot envelope of exactly `total_len` bytes.
@@ -107,7 +111,21 @@ pub(super) fn snapshots_dir(dir: &TempDir) -> PathBuf {
 }
 
 pub(super) fn uploads_dir(dir: &TempDir) -> PathBuf {
-    dir.path().join("snapshots").join(UPLOADS_DIR)
+    snapshots_dir(dir).join(UPLOADS_DIR)
+}
+
+/// Writes `data` as the snapshot of `room_id` at `n`, named after its hash, behind the relay's
+/// back, and returns its path.
+pub(super) fn write_snapshot_file(dir: &TempDir, room_id: &RoomId, n: u64, data: &[u8]) -> PathBuf {
+    let hash = ServerMessage::compute_snapshot_hash(data);
+    let path = snapshots_dir(dir).join(snapshot_file_name(room_id, seq(n), &hash));
+    fs::write(&path, data).unwrap();
+    path
+}
+
+/// The name of the file at `path`.
+pub(super) fn name_of(path: &Path) -> String {
+    path.file_name().unwrap().to_str().unwrap().to_string()
 }
 
 pub(super) fn part(
@@ -143,6 +161,13 @@ pub(super) fn assert_superseded<T: std::fmt::Debug>(result: Result<T, ServerErro
     );
 }
 
+pub(super) fn assert_room_not_found<T: std::fmt::Debug>(result: Result<T, ServerError>) {
+    assert!(
+        matches!(result, Err(ServerError::RoomNotFound(_))),
+        "expected RoomNotFound, got {result:?}"
+    );
+}
+
 /// Snapshot bytes, `(total_bytes, total_chunks)`, hash, and the byte range of each chunk.
 pub(super) type ThreePartSnapshot = (Vec<u8>, (u64, u32), [u8; 32], [std::ops::Range<usize>; 3]);
 
@@ -150,13 +175,32 @@ pub(super) type ThreePartSnapshot = (Vec<u8>, (u64, u32), [u8; 32], [std::ops::R
 pub(super) fn three_part_snapshot(fill: u8) -> ThreePartSnapshot {
     let data = envelope(200 * 1024, fill);
     let hash = ServerMessage::compute_snapshot_hash(&data);
-    let chunk_len = data.len().div_ceil(3);
-    let ranges = [
-        0..chunk_len,
-        chunk_len..2 * chunk_len,
-        2 * chunk_len..data.len(),
-    ];
-    (data.clone(), (data.len() as u64, 3), hash, ranges)
+    let len = data.len();
+    let chunk_len = len.div_ceil(3);
+    let ranges = [0..chunk_len, chunk_len..2 * chunk_len, 2 * chunk_len..len];
+    (data, (len as u64, 3), hash, ranges)
+}
+
+/// Chunk `index` of `snapshot` at `n`, sent by the member `uploader` that [`part`] also uses.
+pub(super) fn part_of(n: u64, index: u32, snapshot: &ThreePartSnapshot) -> SnapshotChunkUpload {
+    part_by(member("uploader"), n, index, snapshot)
+}
+
+/// Uploads the chunks `indices` of `snapshot` at `n` against the log range `tail..=head`,
+/// expecting each to be accepted.
+pub(super) async fn upload_parts(
+    relay: &SnapshotRelay,
+    n: u64,
+    indices: impl IntoIterator<Item = u32>,
+    snapshot: &ThreePartSnapshot,
+    (tail, head): (u64, u64),
+) {
+    for index in indices {
+        relay
+            .stage_chunk(part_of(n, index, snapshot), bounds(tail, head))
+            .await
+            .unwrap();
+    }
 }
 
 pub(super) fn part_by(

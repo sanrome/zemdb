@@ -8,13 +8,8 @@ async fn startup_discards_uploads_and_keeps_only_the_newest_valid_snapshot() {
     let uploads = uploads_dir(&dir);
     fs::create_dir_all(&uploads).unwrap();
 
-    let write_snapshot = |n: u64, data: &[u8]| -> String {
-        let name = snapshot_file_name(&room(), seq(n), &ServerMessage::compute_snapshot_hash(data));
-        fs::write(snapshots.join(&name), data).unwrap();
-        name
-    };
-    let _older = write_snapshot(5, &envelope(100, 5));
-    let newest_valid = write_snapshot(10, &envelope(100, 10));
+    write_snapshot_file(&dir, &room(), 5, &envelope(100, 5));
+    let newest_valid = write_snapshot_file(&dir, &room(), 10, &envelope(100, 10));
     // Newest by seq, but its content does not match the hash in its name.
     let corrupt_name = snapshot_file_name(
         &room(),
@@ -24,13 +19,7 @@ async fn startup_discards_uploads_and_keeps_only_the_newest_valid_snapshot() {
     fs::write(snapshots.join(&corrupt_name), envelope(100, 12)).unwrap();
     // Another room is recovered independently.
     let other_room = RoomId::new("other_room").unwrap();
-    let other_data = envelope(100, 1);
-    let other_name = snapshot_file_name(
-        &other_room,
-        seq(3),
-        &ServerMessage::compute_snapshot_hash(&other_data),
-    );
-    fs::write(snapshots.join(&other_name), &other_data).unwrap();
+    let other = write_snapshot_file(&dir, &other_room, 3, &envelope(100, 1));
     // Leftovers of interrupted writes and uploads.
     fs::write(uploads.join("relay-room_20.part"), b"partial").unwrap();
     fs::write(uploads.join("relay-room_21.tmp"), b"partial").unwrap();
@@ -38,7 +27,7 @@ async fn startup_discards_uploads_and_keeps_only_the_newest_valid_snapshot() {
     let relay = open(&dir);
     assert_eq!(relay.active_snapshot_seq(&room()), Some(seq(10)));
     assert_eq!(relay.active_snapshot_seq(&other_room), Some(seq(3)));
-    let mut expected = vec![newest_valid, other_name];
+    let mut expected = vec![name_of(&newest_valid), name_of(&other)];
     expected.sort();
     assert_eq!(files_in(&snapshots), expected);
     assert!(files_in(&uploads).is_empty());
@@ -50,20 +39,15 @@ async fn startup_discards_uploads_and_keeps_only_the_newest_valid_snapshot() {
 #[tokio::test]
 async fn startup_keeps_a_snapshot_it_cannot_read_and_does_not_fall_back_to_an_older_one() {
     let dir = tempdir().unwrap();
-    let (older, newer) = {
+    let (older, newer_path) = {
         let relay = open(&dir);
         let older = stage(&relay, 5, &envelope(100, 1)).await.unwrap();
         // Simulate a newer snapshot promoted to disk: keep both files.
-        let newer_data = envelope(100, 2);
-        let newer = ServerMessage::compute_snapshot_hash(&newer_data);
-        fs::write(
-            snapshots_dir(&dir).join(snapshot_file_name(&room(), seq(6), &newer)),
-            &newer_data,
+        (
+            older,
+            write_snapshot_file(&dir, &room(), 6, &envelope(100, 2)),
         )
-        .unwrap();
-        (older, newer)
     };
-    let newer_path = snapshots_dir(&dir).join(snapshot_file_name(&room(), seq(6), &newer));
     let older_path = snapshots_dir(&dir).join(snapshot_file_name(&room(), seq(5), &older));
 
     fail_point::arm("relay_verify_snapshot", &newer_path);
@@ -88,13 +72,7 @@ async fn startup_survives_a_failure_deleting_a_stale_file() {
         let older = stage(&relay, 5, &envelope(100, 1)).await.unwrap();
         let older_path = snapshots_dir(&dir).join(snapshot_file_name(&room(), seq(5), &older));
         // Crash between promoting seq 6 and recording it: both files are on disk.
-        let newer_data = envelope(100, 2);
-        let newer = ServerMessage::compute_snapshot_hash(&newer_data);
-        fs::write(
-            snapshots_dir(&dir).join(snapshot_file_name(&room(), seq(6), &newer)),
-            &newer_data,
-        )
-        .unwrap();
+        write_snapshot_file(&dir, &room(), 6, &envelope(100, 2));
         older_path
     };
 
@@ -111,21 +89,11 @@ async fn crash_between_promotion_and_install_recovers_the_newest_snapshot() {
     let newer = {
         let relay = open(&dir);
         stage(&relay, 5, &envelope(100, 1)).await.unwrap();
-        let newer_data = envelope(100, 2);
-        let newer = ServerMessage::compute_snapshot_hash(&newer_data);
-        fs::write(
-            snapshots_dir(&dir).join(snapshot_file_name(&room(), seq(6), &newer)),
-            &newer_data,
-        )
-        .unwrap();
-        newer
+        write_snapshot_file(&dir, &room(), 6, &envelope(100, 2))
     };
     let relay = open(&dir);
     assert_eq!(relay.active_snapshot_seq(&room()), Some(seq(6)));
-    assert_eq!(
-        files_in(&snapshots_dir(&dir)),
-        vec![snapshot_file_name(&room(), seq(6), &newer)]
-    );
+    assert_eq!(files_in(&snapshots_dir(&dir)), vec![name_of(&newer)]);
 }
 
 #[tokio::test]

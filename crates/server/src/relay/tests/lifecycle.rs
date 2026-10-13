@@ -6,24 +6,12 @@ use crate::relay::UPLOAD_IDLE_TIMEOUT;
 async fn idle_upload_expires_and_its_file_is_deleted() {
     let dir = tempdir().unwrap();
     let relay = open(&dir);
-    let (data, layout, hash, ranges) = three_part_snapshot(1);
-    relay
-        .stage_chunk(
-            part(10, 0, layout, hash, &data[ranges[0].clone()]),
-            bounds(0, 10),
-        )
-        .await
-        .unwrap();
+    let snap = three_part_snapshot(1);
+    upload_parts(&relay, 10, [0], &snap, (0, 10)).await;
 
     // Idle time counts from the last chunk, not from the start.
     tokio::time::advance(UPLOAD_IDLE_TIMEOUT - Duration::from_secs(1)).await;
-    relay
-        .stage_chunk(
-            part(10, 1, layout, hash, &data[ranges[1].clone()]),
-            bounds(0, 10),
-        )
-        .await
-        .unwrap();
+    upload_parts(&relay, 10, [1], &snap, (0, 10)).await;
     tokio::time::advance(UPLOAD_IDLE_TIMEOUT - Duration::from_secs(1)).await;
     relay.cleanup_expired().await;
     assert_eq!(files_in(&uploads_dir(&dir)), vec!["relay-room_10.part"]);
@@ -35,10 +23,7 @@ async fn idle_upload_expires_and_its_file_is_deleted() {
 
     // The upload is gone: the last chunk starts a new upload that cannot complete alone.
     assert!(!relay
-        .stage_chunk(
-            part(10, 2, layout, hash, &data[ranges[2].clone()]),
-            bounds(0, 10)
-        )
+        .stage_chunk(part_of(10, 2, &snap), bounds(0, 10))
         .await
         .unwrap());
 }
@@ -51,11 +36,7 @@ async fn expired_snapshot_is_dropped_and_its_file_deleted() {
 
     tokio::time::advance(TTL).await;
     assert_eq!(relay.active_snapshot_seq(&room()), None);
-    let missing = chunk(&relay, 0, 0, None).await;
-    assert!(
-        matches!(missing, Err(ServerError::RoomNotFound(_))),
-        "{missing:?}"
-    );
+    assert_room_not_found(chunk(&relay, 0, 0, None).await);
 
     relay.cleanup_expired().await;
     assert!(files_in(&snapshots_dir(&dir)).is_empty());
@@ -66,14 +47,7 @@ async fn purge_removes_the_snapshot_the_upload_and_their_files() {
     let dir = tempdir().unwrap();
     let relay = open(&dir);
     stage(&relay, 5, &envelope(100, 1)).await.unwrap();
-    let (data, layout, hash, ranges) = three_part_snapshot(1);
-    relay
-        .stage_chunk(
-            part(10, 0, layout, hash, &data[ranges[0].clone()]),
-            bounds(0, 10),
-        )
-        .await
-        .unwrap();
+    upload_parts(&relay, 10, [0], &three_part_snapshot(1), (0, 10)).await;
     // A room whose id extends this one keeps its files.
     let neighbour = RoomId::new("relay-room_2").unwrap();
     relay
@@ -105,16 +79,10 @@ async fn stage_that_was_under_way_when_the_room_was_deleted_is_dropped() {
     let result = relay
         .stage_snapshot(&room(), seq(1), Bytes::from(envelope(100, 1)), async {
             relay.purge_room(&room()).await.unwrap();
-            Ok(LogBounds {
-                tail_seq: seq(0),
-                head_seq: seq(10),
-            })
+            Ok(log_bounds(0, 10))
         })
         .await;
-    assert!(
-        matches!(result, Err(ServerError::RoomNotFound(_))),
-        "{result:?}"
-    );
+    assert_room_not_found(result);
     assert_eq!(relay.active_snapshot_seq(&room()), None);
     assert!(files_in(&snapshots_dir(&dir)).is_empty());
 }

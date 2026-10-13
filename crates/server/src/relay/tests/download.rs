@@ -25,11 +25,7 @@ async fn download_chunk_size_is_clamped() {
 async fn out_of_range_chunk_index_and_missing_snapshot_are_client_errors() {
     let dir = tempdir().unwrap();
     let relay = open(&dir);
-    let missing = chunk(&relay, 0, 0, None).await;
-    assert!(
-        matches!(missing, Err(ServerError::RoomNotFound(_))),
-        "{missing:?}"
-    );
+    assert_room_not_found(chunk(&relay, 0, 0, None).await);
 
     let hash = stage(&relay, 1, &envelope(100, 1)).await.unwrap();
     assert_bad_request(chunk(&relay, 1, 0, Some(hash)).await);
@@ -75,12 +71,10 @@ async fn first_chunk_drops_a_snapshot_below_the_retained_range() {
         .unwrap();
 
     // The log moved on: tail - 1 = 6 > 5.
-    let result = relay
-        .get_chunk(CorrelationId::new(1), &room(), 0, 0, None, bounds(7, 20))
-        .await;
-    assert!(
-        matches!(result, Err(ServerError::RoomNotFound(_))),
-        "{result:?}"
+    assert_room_not_found(
+        relay
+            .get_chunk(CorrelationId::new(1), &room(), 0, 0, None, bounds(7, 20))
+            .await,
     );
     assert_eq!(relay.active_snapshot_seq(&room()), None);
     assert!(!path.exists());
