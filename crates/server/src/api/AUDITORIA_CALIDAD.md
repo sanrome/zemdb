@@ -183,6 +183,7 @@
 - `extract.rs:441`: `unauthorized(room_id, message: String)` desaparece con Q2.
 - **Ahorro estimado conjunto:** ~3–4 líneas · **Prioridad:** baja
 - **Estado:** ✅ aplicada (paso 1) en la ruta `/rooms/:room_id` y en `parse_snapshot_head_seq`. Hacer privado `MAX_CONCURRENT_STREAMS` es un cambio de API pública (paso 4), y `unauthorized` desaparece con Q2 (paso 2).
+- **Estado:** ✅ aplicada (paso 4) en `MAX_CONCURRENT_STREAMS`, que es privada de `serve.rs`: nadie la usa fuera del archivo, ni siquiera los tests de integración. El doc de `serve_until_shutdown` dice "100" en lugar de enlazarla, porque un doc público no puede enlazar un ítem privado.
 
 ## Lo que conviene dejar como está
 

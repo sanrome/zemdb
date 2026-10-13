@@ -49,8 +49,8 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 ///
 /// While serving, the limits of `state.config` apply to every connection:
 /// - at most `max_connections` are open at once; at the limit, new connections wait in the
-///   listen backlog until an open one closes. An HTTP/2 connection carries at most
-///   [`MAX_CONCURRENT_STREAMS`] requests at once;
+///   listen backlog until an open one closes. An HTTP/2 connection carries at most 100
+///   requests at once;
 /// - a connection must deliver the headers of each request within `header_read_timeout_secs`,
 ///   counted from its opening or from the end of its previous response; one that does not, or
 ///   that stays open without a request in progress for longer, is closed;
@@ -193,7 +193,7 @@ fn is_connection_error(err: &io::Error) -> bool {
 
 /// Most HTTP/2 streams (requests) a connection may have in progress at once, so that
 /// `max_connections` still bounds the requests in flight.
-pub const MAX_CONCURRENT_STREAMS: u32 = 100;
+const MAX_CONCURRENT_STREAMS: u32 = 100;
 
 /// Largest frame of a response body handed to hyper. Hyper asks HTTP/2 for send capacity
 /// before taking each frame, so with small frames a body is done only when the client has
