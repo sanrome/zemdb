@@ -13,14 +13,15 @@ use zemdb_core::protocol::messages::ServerMessage;
 use zemdb_core::protocol::snapshot_envelope::validate_snapshot_envelope;
 
 use super::files::{
-    promote, remove_file_if_exists, run_blocking, snapshot_file_name, sync_file, upload_file_name,
-    verify_snapshot_file, write_at, write_new_file, VerifyError, PART_EXTENSION, TMP_EXTENSION,
+    promote, run_blocking, snapshot_file_name, sync_file, upload_file_name, verify_snapshot_file,
+    write_at, write_new_file, VerifyError, PART_EXTENSION, TMP_EXTENSION,
 };
 use super::types::{
     LogBounds, SnapshotChunkUpload, Uploader, MAX_CHUNK_BYTES, MAX_PENDING_SINGLE_UPLOADS,
     MIN_CHUNK_BYTES, UPLOAD_IDLE_TIMEOUT,
 };
 use super::{SnapshotRelay, StagedSnapshot};
+use crate::durable::remove_file_if_exists;
 use crate::error::ServerError;
 
 /// Chunk layout of a multipart upload: every chunk has `chunk_len` bytes except the last,

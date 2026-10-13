@@ -69,18 +69,15 @@ impl ColdDiskLog {
             Err(err) => {
                 // Opening the log removes it too; removing it now keeps a segment that fails
                 // on every pass from leaving one behind each time.
-                if let Err(e) = std::fs::remove_file(&tmp_path) {
-                    if e.kind() != io::ErrorKind::NotFound {
-                        tracing::warn!(path = ?tmp_path, error = %e, "Removing a failed compression's temporary file failed");
-                    }
+                if let Err(e) = durable::remove_file_if_exists(&tmp_path) {
+                    tracing::warn!(path = ?tmp_path, error = %e, "Removing a failed compression's temporary file failed");
                 }
                 return Err(err);
             }
         };
 
         std::fs::rename(&tmp_path, cold_path)?;
-        let dir = cold_path.parent().unwrap_or_else(|| Path::new(""));
-        durable::sync_dir(dir)?;
+        durable::sync_parent(cold_path)?;
 
         // Verify that the cold segment decompresses to exactly the warm one before purging it.
         let cold_digest = decompressed_digest(cold_path)?;
@@ -96,10 +93,7 @@ impl ColdDiskLog {
         let cleanup = std::fs::remove_file(warm_path)
             .map_err(ServerError::from)
             .and_then(|()| fail_point::check("compress_after_warm_removed", warm_path))
-            .and_then(|()| {
-                durable::sync_dir(warm_path.parent().unwrap_or_else(|| Path::new("")))
-                    .map_err(ServerError::from)
-            });
+            .and_then(|()| durable::sync_parent(warm_path).map_err(ServerError::from));
         Ok(CompressedSegment {
             bytes,
             cleanup_error: cleanup.err(),

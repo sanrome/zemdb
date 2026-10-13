@@ -147,6 +147,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y tocó este alc
   Equivalente: para `a/b` da `a/b`, `a` y se corta en `""`; para una ruta absoluta se corta en el primer ancestro que existe y, si llega a `/`, `ancestors` termina igual que el `None => break` de hoy. Opcional: las dos llamadas `sync_dir(x.parent().unwrap_or_else(|| Path::new("")))` (`:54`, `:85`) pueden ir a un `fn sync_parent(path: &Path)`; ahorra poco pero nombra la intención.
 - **Ahorro estimado:** ~10 líneas · **Riesgo:** bajo · **Prioridad:** media
 - **Estado:** ✅ aplicada (paso 1). El `sync_parent` opcional es un helper compartido por dos funciones y queda para el paso 2.
+- **Estado:** ✅ aplicada (paso 2) en `sync_parent`, que usan `create_dir_all_synced`, `write_atomic_blocking` y `log/cold_disk.rs`. En el mismo paso `durable.rs` recibió `remove_file_if_exists` (borrar tolerando `NotFound`, antes en `relay/files.rs`) y `injected` pasó a `pub(crate)` para que el relay no tenga su propia copia.
 
 ### Q4. `schema_registry.rs`: aplanar el escaneo de `SchemaRegistry::new`
 

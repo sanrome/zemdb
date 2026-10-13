@@ -152,6 +152,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y cambió el mó
 - **Problema:** las cuatro repiten el mismo `match` de 4–5 líneas. Fuera del alcance aparece igual en `actor/lease.rs:86`, `actor/manager.rs:659` y `relay/files.rs:110`.
 - **Propuesta:** `durable::remove_file_if_exists(path) -> io::Result<()>`. En `prune_segments`, `remove_file_if_exists(&segment.path)?;` (el `?` ya convierte a `ServerError`). En `cold_disk.rs:74`, `if let Err(e) = durable::remove_file_if_exists(&tmp_path) { tracing::warn!(…) }`. No cambia ni el orden ni los `sync_dir` posteriores.
 - **Ahorro estimado:** ~10 líneas en el módulo (−7 por el helper en `durable.rs`, que se recupera con los otros tres usos) · **Riesgo:** bajo · **Prioridad:** media.
+- **Estado:** ✅ aplicada (paso 2). El helper unifica el que ya tenía `relay/files.rs` y conserva su fail point, que pasó a llamarse `remove_file`. Los dos `sync_dir(x.parent()…)` de `compress_warm_segment_sync` usan además `durable::sync_parent`.
 
 ### Q6. Abrir y bloquear `active.wal` en un solo helper
 - **Dónde:** `warm_disk.rs:75-84` y `:243-250`.

@@ -81,11 +81,7 @@ impl ClientLeaseTracker {
             durable::create_dir_all_synced(parent)?;
         }
 
-        match fs::remove_file(durable::tmp_path_for(&path)) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
+        durable::remove_file_if_exists(&durable::tmp_path_for(&path))?;
 
         let content = match fs::read_to_string(&path) {
             Ok(content) => content,

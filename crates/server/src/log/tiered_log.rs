@@ -502,11 +502,7 @@ impl TieredLog {
 
         let mut deleted = (0, 0);
         let result = doomed.iter().try_for_each(|segment| {
-            match std::fs::remove_file(&segment.path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(ServerError::from(e)),
-            }
+            durable::remove_file_if_exists(&segment.path)?;
             self.segments.remove(segment.start_seq);
             match segment.tier {
                 Tier::Warm => deleted.0 += 1,
@@ -844,11 +840,7 @@ fn sequence_gap(tier: &str, cursor: SequenceNumber, found: SequenceNumber) -> Se
 /// sequence numbers already delivered to clients.
 fn read_pruned_through_seq(dir: &Path) -> Result<SequenceNumber, ServerError> {
     let path = dir.join(LOG_META_FILE);
-    match std::fs::remove_file(durable::tmp_path_for(&path)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
+    durable::remove_file_if_exists(&durable::tmp_path_for(&path))?;
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SequenceNumber::new(0)),

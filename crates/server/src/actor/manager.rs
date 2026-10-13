@@ -647,11 +647,7 @@ fn write_room_metadata(room_dir: &Path, meta: &RoomMetadata) -> Result<(), Serve
 /// An unreadable file, or one with invalid lifecycle overrides, is an error: the room cannot
 /// be served without knowing its schema and policy.
 fn read_room_metadata(meta_room_path: &Path) -> Result<RoomMetadata, ServerError> {
-    match fs::remove_file(durable::tmp_path_for(meta_room_path)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.into()),
-    }
+    durable::remove_file_if_exists(&durable::tmp_path_for(meta_room_path))?;
     let content = fs::read_to_string(meta_room_path)?;
     let meta: RoomMetadata = serde_json::from_str(&content).map_err(|e| {
         ServerError::Serialization(format!("Failed to parse meta_room.json: {}", e))

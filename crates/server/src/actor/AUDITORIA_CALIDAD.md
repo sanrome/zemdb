@@ -118,6 +118,7 @@
 - **Problema:** el mismo `match fs::remove_file(durable::tmp_path_for(p)) { Ok(()) => {}, Err(e) if NotFound => {}, Err(e) => return Err(e.into()) }` en 3 sitios.
 - **Propuesta:** `pub(crate) fn remove_stale_tmp(path: &Path) -> io::Result<()>` en `durable.rs`, y en cada sitio `durable::remove_stale_tmp(&path)?;`. Se mantiene la propagación de cualquier error distinto de `NotFound`.
 - **Ahorro estimado:** ~8 líneas en `actor/` (~12 en total, menos ~7 del helper) · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 2) con `durable::remove_file_if_exists(&durable::tmp_path_for(..))`, el helper general que comparten `log` y `relay`, en lugar de uno específico para el `.tmp`.
 
 ### Q6. Comentarios de pasos numerados redundantes
 - **Dónde:** ver la sección "Comentarios" (`room.rs:162,165,168,469,475,555,558,565,630,636,645,652,685,694`; `manager.rs:239,244,247,264,270,488`).

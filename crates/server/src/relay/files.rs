@@ -10,7 +10,6 @@ use zemdb_core::protocol::snapshot_envelope::SnapshotEnvelopeValidator;
 
 use crate::durable;
 use crate::error::ServerError;
-use crate::fail_point;
 
 /// Subdirectory of the snapshots directory holding partial uploads.
 pub(super) const UPLOADS_DIR: &str = "uploads";
@@ -92,7 +91,7 @@ pub(super) fn remove_room_files(
             .and_then(&owner)
             .is_some_and(|owner| &owner == room_id);
         if belongs {
-            remove_file_if_exists(&entry.path())?;
+            durable::remove_file_if_exists(&entry.path())?;
             removed = true;
         }
     }
@@ -100,19 +99,6 @@ pub(super) fn remove_room_files(
         durable::sync_dir(dir)?;
     }
     Ok(())
-}
-
-pub(super) fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
-    injected("relay_remove_file", path)?;
-    match fs::remove_file(path) {
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        other => other,
-    }
-}
-
-/// Surfaces an armed test fail point as the I/O error the caller would have seen.
-fn injected(name: &'static str, path: &Path) -> std::io::Result<()> {
-    fail_point::check(name, path).map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// Flushes a file's data to disk. The handle is opened for writing because Windows can only
@@ -161,7 +147,7 @@ pub(super) fn promote(
     fs::rename(tmp_path, final_path)?;
     let synced = durable::sync_dir(snapshots_dir).and_then(|()| durable::sync_dir(uploads_dir));
     if let Err(err) = synced {
-        if let Err(remove_err) = remove_file_if_exists(final_path) {
+        if let Err(remove_err) = durable::remove_file_if_exists(final_path) {
             warn!(path = ?final_path, error = %remove_err, "Failed to delete snapshot after a failed directory sync");
         }
         return Err(err);
@@ -182,7 +168,7 @@ pub(super) fn verify_snapshot_file(
     path: &Path,
     expected_hash: &[u8; 32],
 ) -> Result<u64, VerifyError> {
-    injected("relay_verify_snapshot", path).map_err(VerifyError::Io)?;
+    durable::injected("relay_verify_snapshot", path).map_err(VerifyError::Io)?;
     let mut file = File::open(path).map_err(VerifyError::Io)?;
     let mut hasher = blake3::Hasher::new();
     let mut envelope = SnapshotEnvelopeValidator::new();

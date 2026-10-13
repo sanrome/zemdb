@@ -98,7 +98,7 @@ async fn startup_survives_a_failure_deleting_a_stale_file() {
         older_path
     };
 
-    fail_point::arm("relay_remove_file", &older_path);
+    fail_point::arm("remove_file", &older_path);
     let relay = SnapshotRelay::new(snapshots_dir(&dir), TTL, MAX_BYTES)
         .expect("a failed deletion must not abort startup");
     assert_eq!(relay.active_snapshot_seq(&room()), Some(seq(6)));

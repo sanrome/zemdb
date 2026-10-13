@@ -9,12 +9,9 @@ use tokio::time::Instant;
 use tracing::{info, warn};
 use zemdb_core::id::{RoomId, SequenceNumber};
 
-use super::files::{
-    parse_snapshot_file_name, remove_file_if_exists, verify_snapshot_file, VerifyError,
-    TMP_EXTENSION,
-};
+use super::files::{parse_snapshot_file_name, verify_snapshot_file, VerifyError, TMP_EXTENSION};
 use super::{SnapshotRelay, StagedSnapshot};
-use crate::durable;
+use crate::durable::{self, remove_file_if_exists};
 
 /// Snapshot file found at startup: sequence, hash from its name, path, and age.
 type RecoveredFile = (SequenceNumber, [u8; 32], PathBuf, Duration);

@@ -129,11 +129,7 @@ impl SegmentIndex {
         if !leftovers.is_empty() {
             for path in &leftovers {
                 tracing::warn!(path = ?path, "Removing leftover of an interrupted segment compression");
-                match std::fs::remove_file(path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
-                }
+                durable::remove_file_if_exists(path)?;
             }
             durable::sync_dir(segments_dir)?;
         }

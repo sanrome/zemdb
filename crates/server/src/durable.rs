@@ -42,9 +42,23 @@ pub(crate) fn create_dir_all_synced(path: &Path) -> std::io::Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }
-        sync_dir(dir.parent().unwrap_or_else(|| Path::new("")))?;
+        sync_parent(dir)?;
     }
     Ok(())
+}
+
+/// Syncs the directory holding `path` (see [`sync_dir`]).
+pub(crate) fn sync_parent(path: &Path) -> std::io::Result<()> {
+    sync_dir(path.parent().unwrap_or_else(|| Path::new("")))
+}
+
+/// Deletes the file at `path`; a file that does not exist counts as deleted.
+pub(crate) fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
+    injected("remove_file", path)?;
+    match fs::remove_file(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
 }
 
 /// Temporary sibling path used while atomically replacing `path`.
@@ -73,11 +87,11 @@ fn write_atomic_blocking(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
     injected("write_atomic_before_rename", path)?;
     fs::rename(&tmp_path, path)?;
-    sync_dir(path.parent().unwrap_or_else(|| Path::new("")))
+    sync_parent(path)
 }
 
 /// Surfaces an armed test fail point as the I/O error the caller would have seen.
-fn injected(name: &'static str, path: &Path) -> std::io::Result<()> {
+pub(crate) fn injected(name: &'static str, path: &Path) -> std::io::Result<()> {
     fail_point::check(name, path).map_err(|e| std::io::Error::other(e.to_string()))
 }
 

@@ -37,8 +37,8 @@ use tokio::time::Instant;
 use tracing::warn;
 use zemdb_core::id::{RoomId, SequenceNumber};
 
-use crate::durable;
-use files::{remove_file_if_exists, run_blocking, UPLOADS_DIR};
+use crate::durable::{self, remove_file_if_exists};
+use files::{run_blocking, UPLOADS_DIR};
 use upload::UploadSession;
 
 /// Metadata of the active snapshot of a room. The bytes stay in the file.
