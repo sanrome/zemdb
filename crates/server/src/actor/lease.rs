@@ -32,6 +32,18 @@ pub enum ClientState {
     Dormant,
 }
 
+impl ClientState {
+    /// State of an active client whose cursor is `cursor`: `Bootstrapping` if it is behind
+    /// the retained log, otherwise `Connected`.
+    fn active_for(cursor: SequenceNumber, tail_seq: SequenceNumber) -> Self {
+        if is_behind_tail(cursor, tail_seq) {
+            ClientState::Bootstrapping
+        } else {
+            ClientState::Connected
+        }
+    }
+}
+
 /// Metadata entry tracked for each registered client in a room.
 ///
 /// `last_heartbeat` is a monotonic `Instant`, which does not survive a restart: the roster
@@ -189,11 +201,7 @@ impl ClientLeaseTracker {
         tail_seq: SequenceNumber,
     ) -> Result<ClientState, ServerError> {
         let last_ack = current_seq.unwrap_or(SequenceNumber::new(0));
-        let initial_state = if is_behind_tail(last_ack, tail_seq) {
-            ClientState::Bootstrapping
-        } else {
-            ClientState::Connected
-        };
+        let initial_state = ClientState::active_for(last_ack, tail_seq);
 
         let entry = ClientEntry {
             client_id: client_id.clone(),
@@ -235,11 +243,7 @@ impl ClientLeaseTracker {
     ) -> Option<ClientState> {
         let entry = self.clients.get_mut(client_id)?;
         let cursor = reported_cursor.map_or(entry.last_ack_seq, |r| r.max(entry.last_ack_seq));
-        let state = if is_behind_tail(cursor, tail_seq) {
-            ClientState::Bootstrapping
-        } else {
-            ClientState::Connected
-        };
+        let state = ClientState::active_for(cursor, tail_seq);
 
         entry.last_heartbeat = Instant::now();
         self.activity_unsaved = true;
@@ -452,7 +456,7 @@ impl LoadedClient {
     fn into_entry(self, instant_now: Instant, wall_now: SystemTime) -> ClientEntry {
         let inactive_for = self
             .last_seen_unix_ms
-            .and_then(|ms| UNIX_EPOCH.checked_add(Duration::from_millis(ms)))
+            .and_then(from_unix_ms)
             .and_then(|last_seen| wall_now.duration_since(last_seen).ok())
             .unwrap_or(Duration::ZERO);
         ClientEntry {
@@ -490,6 +494,11 @@ fn unix_ms(time: SystemTime) -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
+/// The time `ms` milliseconds after the Unix epoch, if `SystemTime` can represent it.
+fn from_unix_ms(ms: u64) -> Option<SystemTime> {
+    UNIX_EPOCH.checked_add(Duration::from_millis(ms))
+}
+
 /// The room's snapshot demand on disk: when it was last renewed, in wall-clock milliseconds
 /// since the Unix epoch (an `Instant` does not survive a restart).
 #[derive(Debug, Serialize, Deserialize)]
@@ -505,7 +514,7 @@ impl PersistedDemand {
     }
 
     fn to_time(&self) -> Option<SystemTime> {
-        UNIX_EPOCH.checked_add(Duration::from_millis(self.renewed_at_unix_ms))
+        from_unix_ms(self.renewed_at_unix_ms)
     }
 }
 

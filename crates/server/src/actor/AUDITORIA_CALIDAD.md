@@ -78,6 +78,7 @@
 - **Semántica:** en todos los caminos actuales `reply.send` es el último efecto antes de salir, así que construir el `Result` y enviarlo al final preserva el orden (incluido `observe` antes de calcular `snapshot_wanted_for`). En `sync`, el `request_snapshot()` ante `BehindCompaction` del `fetch_deltas` (`:671-673`) se mantiene antes del `return Err(e)`.
 - **Ahorro estimado:** ~30–35 líneas · **Riesgo:** bajo · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ✅ confirmada — en Register/sync/ack/heartbeat cada camino envía exactamente una respuesta y `reply.send` es el último efecto (no hay nada después en `handle_command`), así que devolver `Result` y enviarlo en `handle_command` preserva el orden: `reject_behind_log` y `request_snapshot` siguen antes del `Err`, `observe` antes de `snapshot_wanted_for`, `register_client` con error no dispara `request_snapshot`. `ClientState` deriva `PartialEq` (`lease.rs:19`), así que `== ClientState::Bootstrapping` compila. Líneas citadas correctas.
+- **Estado:** ✅ aplicada (paso 2). `register`, `sync`, `ack` y `heartbeat` devuelven `Result` y `handle_command` responde una vez; `check_within_head` cubre los cuatro chequeos (el de `commit` incluido).
 
 ### Q2. `RoomCommand::reject`: un brazo por línea
 - **Dónde:** `command.rs:171-211`
@@ -102,6 +103,7 @@
 - **Propuesta:** `fn commit(&mut self, …, flow: &mut ControlFlow<()>) -> Result<CommitResponse, ServerError>` que marca `*flow = ControlFlow::Break(())` donde hoy se devuelve `Break` (fallo de `append` en `:534-551` y `rotation_error` en `:578-589`), y `handle_commit` queda en `let mut flow = Continue(()); let res = self.commit(.., &mut flow); let _ = reply.send(res); flow`. Los pasos 0 y 1 pasan a `self.ensure_registered(&client_id)?; self.check_within_head(last_ack_seq)?;`. El `receiver.close()` sigue ocurriendo antes de la respuesta, que es la garantía documentada en `:542-543`. **A verificar**: el parámetro de salida es menos idiomático; si no convence, aplicar solo los pasos 0–1 con `check_within_head` (~8 líneas).
 - **Ahorro estimado:** ~12–15 líneas · **Riesgo:** medio · **Prioridad:** media
 - **Verificación (2.ª pasada):** ✅ confirmada — con `*flow = Break` en `:534-551` y `:578-589`, `receiver.close()` sigue ocurriendo antes del `reply.send` (que pasa a `handle_commit`), y en rotación `snapshot_wanted_for` sigue calculándose después del `close`. Tras el `append` durable no queda ningún `?`, así que el commit persistido no puede convertirse en `Err`; mantener esa regla explícita en un comentario. Alternativa sin parámetro de salida: devolver `(Result<..>, ControlFlow<()>)`.
+- **Estado:** ✅ aplicada (paso 2) con el parámetro de salida `flow`. `handle_commit` desapareció: el brazo `Commit` de `handle_command` llama a `commit`, responde y devuelve `flow`. Un comentario tras el `append` deja explícito que desde ahí no puede devolverse ningún error.
 
 ### Q4. Simplificaciones locales en `lease.rs`
 - **Dónde:** `lease.rs:338-358`, `lease.rs:242-245`, `lease.rs:254-262`, `lease.rs:327-329`, `lease.rs:197-201` + `:246-250`
@@ -112,6 +114,7 @@
   - La regla "behind tail → `Bootstrapping`, si no `Connected`" está duplicada en `register_client` y `observe`. Un `ClientState::active_for(cursor, tail_seq)` deja la regla del doc de `ClientState` (`:15-17`) en un solo sitio. En líneas sale neutro; lo que gana es claridad.
 - **Ahorro estimado:** ~10–12 líneas · **Riesgo:** bajo · **Prioridad:** media
 - **Estado:** ✅ aplicada (paso 1) en `min_connected_ack_seq`, `observe` y `dirty |=`. `ClientState::active_for` es un helper compartido entre dos funciones y queda para el paso 2.
+- **Estado:** ✅ aplicada (paso 2) en `ClientState::active_for`, que usan `register_client` y `observe`.
 
 ### Q5. Helper `durable` para borrar el `.tmp` huérfano ignorando `NotFound`
 - **Dónde:** `lease.rs:84-88`, `manager.rs:657-661` (y fuera de alcance `log/tiered_log.rs:864-868`)
@@ -139,6 +142,7 @@
 - **Propuesta:** `fn forget_lock_if_unused(locks: &DashMap<RoomId, Arc<Mutex<()>>>, room_id: &RoomId, lock: &Arc<Mutex<()>>)` llamado desde ambos `Drop` (mismo orden: en `SpawnLockWait` se sigue haciendo antes `self.acquiring = None`; en `SpawnGuard` se llama con `OwnedMutexGuard::mutex(&self.guard)` mientras el guard sigue vivo). Y `let guard = wait.acquiring.as_mut().expect("the acquisition is set above").await;` (mismo pánico en el caso imposible).
 - **Ahorro estimado:** ~4–5 líneas · **Riesgo:** bajo · **Prioridad:** media (por centralizar el invariante, más que por las líneas)
 - **Estado:** ✅ aplicada (paso 1) en el `expect` de `lock_room`. `forget_lock_if_unused` es un helper compartido por los dos `Drop` y queda para el paso 2.
+- **Estado:** ✅ aplicada (paso 2) en `forget_lock_if_unused`. Los docs de los dos `Drop` se conservan, porque explican por qué cada uno cuenta dos referencias.
 
 ### Q9. `parse_roster` y conversiones de tiempo en `lease.rs`
 - **Dónde:** `lease.rs:579-594`, `lease.rs:563-577`, `lease.rs:475` + `:527-529`
@@ -148,6 +152,7 @@
   - `UNIX_EPOCH.checked_add(Duration::from_millis(ms))` está en `:475` y en `PersistedDemand::to_time` (`:528`): un `fn from_unix_ms(ms: u64) -> Option<SystemTime>`, simétrico a `unix_ms` (`:505`), lo unifica.
 - **Ahorro estimado:** ~6–8 líneas · **Riesgo:** bajo · **Prioridad:** baja
 - **Estado:** ✅ aplicada (paso 1) en la demanda y en el `warn!` de `parse_roster` (rustfmt deja el brazo entre llaves porque la línea pasa de 100 columnas). `from_unix_ms` es un helper compartido por dos funciones y queda para el paso 2.
+- **Estado:** ✅ aplicada (paso 2) en `from_unix_ms`.
 
 ### Q10. Pequeños retoques en `room.rs`
 - **Dónde y propuesta:**
@@ -157,6 +162,7 @@
   - `room.rs:145` y `manager.rs:401-403` construyen la misma ruta `data_dir/rooms/<id>`. Un único `pub(crate) fn room_dir(data_dir: &Path, room_id: &RoomId) -> PathBuf` deja el layout en disco en un solo lugar (~0–1 línea; los tests también lo repiten, por ejemplo `tests/manager.rs:292-294`).
 - **Ahorro estimado:** ~7–8 líneas · **Riesgo:** bajo · **Prioridad:** baja
 - **Estado:** ✅ aplicada (paso 1) en `retention_floor`, el `info!` y los imports. `room_dir` compartida entre `room.rs` y `manager.rs` cruza archivos y queda para el paso 2.
+- **Estado:** ✅ aplicada (paso 2) en `room_dir`, una función libre de `room.rs` que reemplaza el método de `RoomManager`.
 
 ### Q11. `snapshot_demand.rs`: `extend_until` y `restore`
 - **Dónde:** `snapshot_demand.rs:80-91`, `:103-105`

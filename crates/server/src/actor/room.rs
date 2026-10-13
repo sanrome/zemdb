@@ -1,12 +1,10 @@
 use futures::FutureExt;
 use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use zemdb_core::id::{ClientId, MutationId, RoomId, SchemaId, SequenceNumber};
@@ -155,7 +153,7 @@ impl RoomActor {
         snapshot_relay: Arc<SnapshotRelay>,
         timings: ActorTimings,
     ) -> Result<(mpsc::Sender<RoomCommand>, Self), ServerError> {
-        let room_dir = data_dir.as_ref().join("rooms").join(room_id.as_str());
+        let room_dir = room_dir(data_dir.as_ref(), &room_id);
         durable::create_dir_all_synced(&room_dir)?;
 
         let clients_path = room_dir.join(format!("meta_clients_{}.json", room_id.as_str()));
@@ -340,31 +338,7 @@ impl RoomActor {
                 current_seq,
                 reply,
             } => {
-                // A cursor beyond the head was never delivered by this room. Accepting it
-                // would make the client the preferred snapshot uploader and could raise the
-                // pruning floor above the head.
-                if let Some(seq) = current_seq.filter(|seq| *seq > self.head_seq) {
-                    let _ = reply.send(Err(ServerError::InvalidSequence {
-                        expected: self.head_seq,
-                        actual: seq,
-                    }));
-                    return ControlFlow::Continue(());
-                }
-                let tail_seq = self.tiered_log.tail_seq();
-                let res = self
-                    .lease_tracker
-                    .register_client(&client_id, current_seq, tail_seq);
-                if matches!(res, Ok(ClientState::Bootstrapping)) {
-                    self.request_snapshot();
-                }
-                let res = res.map(|_| RegisterResponse {
-                    head_seq: self.head_seq,
-                    tail_seq,
-                    schema_id: self.schema_id.clone(),
-                    schema: Arc::clone(&self.schema),
-                    active_snapshot_seq: self.usable_snapshot_seq(),
-                });
-                let _ = reply.send(res);
+                let _ = reply.send(self.register(&client_id, current_seq));
             }
 
             RoomCommand::DeregisterClient { client_id, reply } => {
@@ -391,7 +365,10 @@ impl RoomActor {
                 op,
                 reply,
             } => {
-                return self.handle_commit(client_id, mutation_id, last_ack_seq, op, reply);
+                let mut flow = ControlFlow::Continue(());
+                let res = self.commit(&client_id, mutation_id, last_ack_seq, op, &mut flow);
+                let _ = reply.send(res);
+                return flow;
             }
 
             RoomCommand::Sync {
@@ -400,7 +377,7 @@ impl RoomActor {
                 max_batch_size,
                 reply,
             } => {
-                self.handle_sync(client_id, from_seq, max_batch_size, reply);
+                let _ = reply.send(self.sync(&client_id, from_seq, max_batch_size));
             }
 
             RoomCommand::Ack {
@@ -408,11 +385,11 @@ impl RoomActor {
                 ack_seq,
                 reply,
             } => {
-                self.handle_ack(client_id, ack_seq, reply);
+                let _ = reply.send(self.ack(&client_id, ack_seq));
             }
 
             RoomCommand::Heartbeat { client_id, reply } => {
-                self.handle_heartbeat(client_id, reply);
+                let _ = reply.send(self.heartbeat(&client_id));
             }
 
             RoomCommand::SubscribeEvents { reply } => {
@@ -464,26 +441,44 @@ impl RoomActor {
         ControlFlow::Continue(())
     }
 
-    fn handle_commit(
+    fn register(
         &mut self,
-        client_id: ClientId,
+        client_id: &ClientId,
+        current_seq: Option<SequenceNumber>,
+    ) -> Result<RegisterResponse, ServerError> {
+        // Accepting a cursor beyond the head would make the client the preferred snapshot
+        // uploader and could raise the pruning floor above the head.
+        if let Some(seq) = current_seq {
+            self.check_within_head(seq)?;
+        }
+        let tail_seq = self.tiered_log.tail_seq();
+        let state = self
+            .lease_tracker
+            .register_client(client_id, current_seq, tail_seq)?;
+        if state == ClientState::Bootstrapping {
+            self.request_snapshot();
+        }
+        Ok(RegisterResponse {
+            head_seq: self.head_seq,
+            tail_seq,
+            schema_id: self.schema_id.clone(),
+            schema: Arc::clone(&self.schema),
+            active_snapshot_seq: self.usable_snapshot_seq(),
+        })
+    }
+
+    /// Commits `op`. Sets `flow` to `Break`, with the mailbox already closed, when the room
+    /// must stop after replying.
+    fn commit(
+        &mut self,
+        client_id: &ClientId,
         mutation_id: MutationId,
         last_ack_seq: SequenceNumber,
         op: Operation,
-        reply: oneshot::Sender<Result<CommitResponse, ServerError>>,
-    ) -> ControlFlow<()> {
-        if let Err(err) = self.ensure_registered(&client_id) {
-            let _ = reply.send(Err(err));
-            return ControlFlow::Continue(());
-        }
-
-        if last_ack_seq > self.head_seq {
-            let _ = reply.send(Err(ServerError::InvalidSequence {
-                expected: self.head_seq,
-                actual: last_ack_seq,
-            }));
-            return ControlFlow::Continue(());
-        }
+        flow: &mut ControlFlow<()>,
+    ) -> Result<CommitResponse, ServerError> {
+        self.ensure_registered(client_id)?;
+        self.check_within_head(last_ack_seq)?;
 
         // Exactly-once idempotency. Checked before any rejection based on client state:
         // a retried mutation was already committed and replicated, so it must always be
@@ -491,15 +486,14 @@ impl RoomActor {
         if let Some(existing_seq) = self.dedup_cache.is_duplicate(&mutation_id) {
             // The retry is accepted, so the cursor it reports (already validated against
             // head_seq) is recorded and the client's state recomputed from it.
-            self.observe(&client_id, Some(last_ack_seq));
+            self.observe(client_id, Some(last_ack_seq));
             let (catchup_ops, has_more) = self.catchup_after_commit(last_ack_seq);
-            let _ = reply.send(Ok(CommitResponse {
+            return Ok(CommitResponse {
                 assigned_seq: existing_seq,
                 catchup_ops,
                 has_more,
-                snapshot_wanted: self.snapshot_wanted_for(&client_id),
-            }));
-            return ControlFlow::Continue(());
+                snapshot_wanted: self.snapshot_wanted_for(client_id),
+            });
         }
 
         // Reject a cursor behind the compaction boundary before sequencing anything, so
@@ -507,15 +501,13 @@ impl RoomActor {
         // client's lifecycle state is not a reason to reject: a client that was bootstrapping
         // or dormant commits as soon as its cursor is inside the log.
         if self.tiered_log.is_behind_retention(last_ack_seq) {
-            self.reject_behind_log(&client_id, last_ack_seq);
-            let _ = reply.send(Err(ServerError::BehindCompaction));
-            return ControlFlow::Continue(());
+            self.reject_behind_log(client_id, last_ack_seq);
+            return Err(ServerError::BehindCompaction);
         }
 
-        if let Err(err) = self.schema.validate_operation(&op) {
-            let _ = reply.send(Err(ServerError::SchemaViolation(err.to_string())));
-            return ControlFlow::Continue(());
-        }
+        self.schema
+            .validate_operation(&op)
+            .map_err(|err| ServerError::SchemaViolation(err.to_string()))?;
 
         // The new sequence stays local until the append succeeds.
         let new_seq = self.head_seq.next();
@@ -524,10 +516,8 @@ impl RoomActor {
         // The operation must fit alone in a log record and in a response frame. A
         // mutation that does not is the client's error: it is rejected here, before any I/O,
         // and the room keeps running unchanged.
-        if let Err(err) = check_operation_size(&seq_op, Some(mutation_id)) {
-            let _ = reply.send(Err(ServerError::BadRequest(err.to_string())));
-            return ControlFlow::Continue(());
-        }
+        check_operation_size(&seq_op, Some(mutation_id))
+            .map_err(|err| ServerError::BadRequest(err.to_string()))?;
 
         // A failed write or fsync leaves the log in an unknown state: the record may or may
         // not be on disk, and a failed fsync cannot be retried safely. The room stops and is
@@ -544,22 +534,23 @@ impl RoomActor {
                 // Closing the mailbox before replying guarantees that a caller retrying after
                 // this reply already sees the room as stopped and gets it respawned.
                 self.receiver.close();
-                let _ = reply.send(Err(ServerError::Unavailable(format!(
+                *flow = ControlFlow::Break(());
+                return Err(ServerError::Unavailable(format!(
                     "Room {} could not persist the commit and is restarting; retry the request",
                     self.room_id
-                ))));
-                return ControlFlow::Break(());
+                )));
             }
         };
 
-        // From here on the mutation is durable: the reply must acknowledge it.
+        // From here on the mutation is durable: the reply must acknowledge it, so nothing
+        // below may return an error.
 
         self.dedup_cache.record(mutation_id, new_seq);
         self.head_seq = new_seq;
 
         // Refresh the client's lease, record the cursor reported with the commit and make
         // the client Connected. Persisted on the next maintenance tick.
-        self.observe(&client_id, Some(last_ack_seq));
+        self.observe(client_id, Some(last_ack_seq));
 
         let _ = self.events_tx.send(RoomEvent::HeadAdvanced(new_seq));
 
@@ -573,26 +564,22 @@ impl RoomActor {
         // A failed segment rotation after a durable append leaves the segment files in an
         // uncertain state. The commit is still acknowledged; then the room stops and is
         // recovered from disk by the next request.
-        let flow = match outcome.rotation_error {
-            Some(err) => {
-                error!(
-                    room = %self.room_id,
-                    error = %err,
-                    "Segment rotation failed after a durable commit; stopping room actor for recovery from disk"
-                );
-                self.receiver.close();
-                ControlFlow::Break(())
-            }
-            None => ControlFlow::Continue(()),
-        };
+        if let Some(err) = outcome.rotation_error {
+            error!(
+                room = %self.room_id,
+                error = %err,
+                "Segment rotation failed after a durable commit; stopping room actor for recovery from disk"
+            );
+            self.receiver.close();
+            *flow = ControlFlow::Break(());
+        }
 
-        let _ = reply.send(Ok(CommitResponse {
+        Ok(CommitResponse {
             assigned_seq: new_seq,
             catchup_ops,
             has_more,
-            snapshot_wanted: self.snapshot_wanted_for(&client_id),
-        }));
-        flow
+            snapshot_wanted: self.snapshot_wanted_for(client_id),
+        })
     }
 
     /// Builds the catch-up batch returned with an acknowledged commit, starting after the
@@ -621,47 +608,23 @@ impl RoomActor {
         }
     }
 
-    fn handle_sync(
+    fn sync(
         &mut self,
-        client_id: ClientId,
+        client_id: &ClientId,
         from_seq: SequenceNumber,
         max_batch_size: u32,
-        reply: oneshot::Sender<Result<SyncBatchResponse, ServerError>>,
-    ) {
-        if let Err(err) = self.ensure_registered(&client_id) {
-            let _ = reply.send(Err(err));
-            return;
-        }
-
-        // A cursor beyond the head was never delivered by this room.
-        if from_seq > self.head_seq {
-            let _ = reply.send(Err(ServerError::InvalidSequence {
-                expected: self.head_seq,
-                actual: from_seq,
-            }));
-            return;
-        }
+    ) -> Result<SyncBatchResponse, ServerError> {
+        self.ensure_registered(client_id)?;
+        self.check_within_head(from_seq)?;
 
         if self.tiered_log.is_behind_retention(from_seq) {
-            self.reject_behind_log(&client_id, from_seq);
-            let _ = reply.send(Err(ServerError::BehindCompaction));
-            return;
+            self.reject_behind_log(client_id, from_seq);
+            return Err(ServerError::BehindCompaction);
         }
 
         let bounded_batch_size = max_batch_size.clamp(1, MAX_SYNC_BATCH);
-        match self.tiered_log.fetch_deltas(from_seq, bounded_batch_size) {
-            Ok((ops, has_more)) => {
-                let (ops, has_more) = fit_in_response(ops, has_more);
-                // Asking for the operations after from_seq confirms everything up to it:
-                // the cursor advances and the client becomes Connected.
-                self.observe(&client_id, Some(from_seq));
-                let _ = reply.send(Ok(SyncBatchResponse {
-                    head_seq: self.head_seq,
-                    ops,
-                    has_more,
-                    snapshot_wanted: self.snapshot_wanted_for(&client_id),
-                }));
-            }
+        let (ops, has_more) = match self.tiered_log.fetch_deltas(from_seq, bounded_batch_size) {
+            Ok((ops, has_more)) => fit_in_response(ops, has_more),
             Err(e) => {
                 // The range starts inside the retained log, yet the log cannot serve it (a
                 // gap). No client can catch up through it, so the client this answer sends
@@ -669,32 +632,27 @@ impl RoomActor {
                 if matches!(e, ServerError::BehindCompaction) {
                     self.request_snapshot();
                 }
-                let _ = reply.send(Err(e));
-            }
-        }
-    }
-
-    fn handle_ack(
-        &mut self,
-        client_id: ClientId,
-        ack_seq: SequenceNumber,
-        reply: oneshot::Sender<Result<SequenceNumber, ServerError>>,
-    ) {
-        let stored_cursor = match self.ensure_registered(&client_id) {
-            Ok(cursor) => cursor,
-            Err(err) => {
-                let _ = reply.send(Err(err));
-                return;
+                return Err(e);
             }
         };
+        // Asking for the operations after from_seq confirms everything up to it: the cursor
+        // advances and the client becomes Connected.
+        self.observe(client_id, Some(from_seq));
+        Ok(SyncBatchResponse {
+            head_seq: self.head_seq,
+            ops,
+            has_more,
+            snapshot_wanted: self.snapshot_wanted_for(client_id),
+        })
+    }
 
-        if ack_seq > self.head_seq {
-            let _ = reply.send(Err(ServerError::InvalidSequence {
-                expected: self.head_seq,
-                actual: ack_seq,
-            }));
-            return;
-        }
+    fn ack(
+        &mut self,
+        client_id: &ClientId,
+        ack_seq: SequenceNumber,
+    ) -> Result<SequenceNumber, ServerError> {
+        let stored_cursor = self.ensure_registered(client_id)?;
+        self.check_within_head(ack_seq)?;
 
         // The cursor never moves backwards, so an ack below the stored cursor (stale or
         // out of order) changes nothing and succeeds. Retention is checked against the
@@ -703,40 +661,41 @@ impl RoomActor {
             .tiered_log
             .is_behind_retention(ack_seq.max(stored_cursor))
         {
-            self.reject_behind_log(&client_id, ack_seq);
-            let _ = reply.send(Err(ServerError::BehindCompaction));
-            return;
+            self.reject_behind_log(client_id, ack_seq);
+            return Err(ServerError::BehindCompaction);
         }
 
         // Advance the cursor, refresh the lease and make the client Connected.
         // The cursor is persisted on the next maintenance tick.
-        self.observe(&client_id, Some(ack_seq));
+        self.observe(client_id, Some(ack_seq));
 
         self.prune_to_retention_floor();
 
-        let _ = reply.send(Ok(self.head_seq));
+        Ok(self.head_seq)
     }
 
     /// A heartbeat refreshes the lease and recomputes the client's state from its stored
     /// cursor. It never fails because the client fell behind the log: the reply tells the
     /// client whether it must upload a snapshot and which usable snapshot exists.
-    fn handle_heartbeat(
-        &mut self,
-        client_id: ClientId,
-        reply: oneshot::Sender<Result<HeartbeatResponse, ServerError>>,
-    ) {
-        if let Err(err) = self.ensure_registered(&client_id) {
-            let _ = reply.send(Err(err));
-            return;
-        }
-
-        self.observe(&client_id, None);
-
-        let _ = reply.send(Ok(HeartbeatResponse {
+    fn heartbeat(&mut self, client_id: &ClientId) -> Result<HeartbeatResponse, ServerError> {
+        self.ensure_registered(client_id)?;
+        self.observe(client_id, None);
+        Ok(HeartbeatResponse {
             head_seq: self.head_seq,
-            snapshot_wanted: self.snapshot_wanted_for(&client_id),
+            snapshot_wanted: self.snapshot_wanted_for(client_id),
             active_snapshot_seq: self.usable_snapshot_seq(),
-        }));
+        })
+    }
+
+    /// A cursor beyond the head was never delivered by this room.
+    fn check_within_head(&self, seq: SequenceNumber) -> Result<(), ServerError> {
+        if seq > self.head_seq {
+            return Err(ServerError::InvalidSequence {
+                expected: self.head_seq,
+                actual: seq,
+            });
+        }
+        Ok(())
     }
 
     /// Returns the client's stored cursor, or `ClientNotRegistered` if it is not in the roster.
@@ -953,6 +912,11 @@ impl RoomActor {
 }
 
 /// Text of a caught panic payload, when it is a string.
+/// Directory of the room `room_id` under the server's `data_dir`.
+pub(crate) fn room_dir(data_dir: &Path, room_id: &RoomId) -> PathBuf {
+    data_dir.join("rooms").join(room_id.as_str())
+}
+
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
     panic
         .downcast_ref::<&str>()

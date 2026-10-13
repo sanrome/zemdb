@@ -14,7 +14,7 @@ use zemdb_core::id::{RoomId, SchemaId, SequenceNumber};
 use zemdb_core::schema::Schema;
 
 use crate::actor::command::RoomCommand;
-use crate::actor::room::{ActorExit, ActorTimings, RoomActor};
+use crate::actor::room::{room_dir, ActorExit, ActorTimings, RoomActor};
 use crate::blocking::blocking_io;
 use crate::config::ServerConfig;
 use crate::durable;
@@ -108,10 +108,8 @@ impl Drop for SpawnGuard<'_> {
     /// this removal both take the map shard's lock: a caller either cloned it before the
     /// check, or creates a new mutex after the removal, when this critical section is over.
     fn drop(&mut self) {
-        let mutex = OwnedMutexGuard::mutex(&self.guard);
-        self.locks.remove_if(&self.room_id, |_, lock| {
-            Arc::ptr_eq(lock, mutex) && Arc::strong_count(lock) == 2
-        });
+        let lock = OwnedMutexGuard::mutex(&self.guard);
+        forget_lock_if_unused(self.locks, &self.room_id, lock);
     }
 }
 
@@ -131,10 +129,20 @@ impl Drop for SpawnLockWait<'_> {
     /// more, so nothing is removed.
     fn drop(&mut self) {
         self.acquiring = None;
-        self.locks.remove_if(&self.room_id, |_, lock| {
-            Arc::ptr_eq(lock, &self.lock) && Arc::strong_count(lock) == 2
-        });
+        forget_lock_if_unused(self.locks, &self.room_id, &self.lock);
     }
+}
+
+/// Removes `room_id`'s entry from `locks` if it is still `lock` and only the map and the
+/// caller reference it (the rule explained on [`SpawnGuard`]'s `Drop`).
+fn forget_lock_if_unused(
+    locks: &DashMap<RoomId, Arc<Mutex<()>>>,
+    room_id: &RoomId,
+    lock: &Arc<Mutex<()>>,
+) {
+    locks.remove_if(room_id, |_, entry| {
+        Arc::ptr_eq(entry, lock) && Arc::strong_count(entry) == 2
+    });
 }
 
 /// Sharded room actor manager providing lazy spawning and routing of commands to room actors.
@@ -324,7 +332,7 @@ impl RoomManager {
                     schema_id: schema_id.clone(),
                     lifecycle: known.map(|meta| meta.lifecycle).unwrap_or_default(),
                 };
-                write_room_metadata(&self.room_dir(room_id), &meta)?;
+                write_room_metadata(&room_dir(&self.data_dir, room_id), &meta)?;
                 meta
             }
             (None, Some(meta)) => meta,
@@ -344,7 +352,7 @@ impl RoomManager {
         if let Some(meta) = self.room_meta.get(room_id) {
             return Ok(Some(meta.clone()));
         }
-        let path = self.room_dir(room_id).join(META_ROOM_FILE);
+        let path = room_dir(&self.data_dir, room_id).join(META_ROOM_FILE);
         path.exists().then(|| read_room_metadata(&path)).transpose()
     }
 
@@ -392,13 +400,12 @@ impl RoomManager {
         Ok(slot)
     }
 
-    fn room_dir(&self, room_id: &RoomId) -> PathBuf {
-        self.data_dir.join("rooms").join(room_id.as_str())
-    }
-
     /// Fast check if a room exists in memory or on disk.
     pub fn room_exists(&self, room_id: &RoomId) -> bool {
-        self.rooms.contains_key(room_id) || self.room_dir(room_id).join(META_ROOM_FILE).exists()
+        self.rooms.contains_key(room_id)
+            || room_dir(&self.data_dir, room_id)
+                .join(META_ROOM_FILE)
+                .exists()
     }
 
     /// The lifecycle overrides of a room, cached or read from its `meta_room.json`, under the
@@ -472,7 +479,7 @@ impl RoomManager {
 
         let _guard = self.lock_room(&room_id).await;
 
-        let room_dir = self.room_dir(&room_id);
+        let room_dir = room_dir(&self.data_dir, &room_id);
         let meta_room_path = room_dir.join(META_ROOM_FILE);
 
         if meta_room_path.exists() || self.rooms.contains_key(&room_id) {
@@ -513,7 +520,7 @@ impl RoomManager {
         // A room recreated with the same id must not inherit this room's snapshot.
         self.snapshot_relay.purge_room(room_id).await?;
 
-        let room_dir = self.room_dir(room_id);
+        let room_dir = room_dir(&self.data_dir, room_id);
         if room_dir.exists() {
             blocking_io(|| fs::remove_dir_all(&room_dir))?;
             Ok(())
