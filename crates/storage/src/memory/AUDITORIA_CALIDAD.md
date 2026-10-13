@@ -26,11 +26,17 @@ Densidad baja-moderada (74 líneas de doc/comentario sobre 872) y en general de 
 
 - **Recortar (redundantes):**
   - `mod.rs:249` `// 1. Validate schema and strict monotonic sequence` y `mod.rs:252` `// 2. Apply operations to in-memory tables` repiten los nombres `validate_batch`/`apply_operation`. Se pueden borrar (−2).
+    - **Estado:** ✅ aplicada (paso 1)
   - `mod.rs:35` `/// Creates a new, empty MemoryStorageEngine.`: aceptable en una API pública, pero si se aplica Q7a (`new` → `Self::default()`) basta con la doc del struct.
+    - **Estado:** ✅ aplicada (paso 1) (junto con Q7a)
   - `mod.rs:22-25`: cuatro líneas sobre los locks que caben en dos (“Un `RwLock` por sala: lecturas concurrentes dentro de una sala, escrituras exclusivas solo sobre esa sala.”) (−2).
+    - **Estado:** ✅ aplicada (paso 1)
   - `state.rs:22` `Holds the room schema, monotonic head sequence number, and in-memory tables indexed by table_id.` enumera los tres campos del struct; se puede borrar (−2 con la línea `///` en blanco).
+    - **Estado:** ✅ aplicada (paso 1)
   - `state.rs:31` `Creates a new RoomState initialized from a schema with empty tables.` repite la firma y el cuerpo.
+    - **Estado:** ✅ aplicada (paso 1)
 - **Corregir (inexacto):** `state.rs:147` `Payload format for deserialized database snapshots.` También se **serializa**: `disk/compactor.rs:141-146` construye un `RoomSnapshotPayload` y lo pasa a `bincode::serialize`. Mejor: “Payload de un snapshot con tablas propias (compactación y decodificación).”
+  - **Estado:** ✅ aplicada (paso 1)
 - **Conservar (valiosos):**
   - `state.rs:12-17`: por qué `Table` es un B-tree persistente (clon O(1), escrituras copian O(log n)).
   - `state.rs:155-160`: por qué no se usa el `Deserialize` de `imbl` (reserva por longitud declarada → abort). Es crítico para la seguridad.
@@ -118,6 +124,7 @@ Densidad baja-moderada (74 líneas de doc/comentario sobre 872) y en general de 
   Las claves duplicadas se comportan igual (la última gana). Hay que ajustar la doc de `155-160` para decir que serde acota la reserva del mapa de tablas y `RowsAsRead` la de filas.
 - **Ahorro estimado:** ~15 líneas · **Riesgo:** medio · **Prioridad:** media · **A verificar:** que `size_hint::cautious` se aplique a `HashMap` en la versión usada. Lo cubren `memory/tests/state.rs` y los tests de snapshots maliciosos.
 - **Verificación (2.ª pasada):** ⚠️ corregida — serde 1.0.229 sí aplica `size_hint::cautious` a `HashMap`, pero el comportamiento no es idéntico. Hoy no se reserva nada; con el cambio se reservaría hasta ~1 MiB según el número de tablas que declara el peer, y se crea un segundo `HashMap` por snapshot (`into_iter().collect()`). También cambia el texto de `expecting`. El resultado funcional es el mismo (la última clave gana), pero el uso de memoria cambia.
+- **Estado:** ⏭️ no aplicada — la verificación de la segunda pasada muestra que cambia el uso de memoria (reserva según el número de tablas declarado por el peer y un segundo `HashMap` por snapshot); el visitor actual se conserva
 
 ### Q6. Helper de “ejecutar en el blocking pool o en línea en wasm”
 - **Dónde:** `mod.rs:319-332` y `353-375`. El mismo patrón `spawn_blocking(..).await.map_err(|e| StorageError::Other(format!("Join error: {e}")))??` aparece 12 veces en `crates/storage/src` (incluido `disk`).
@@ -132,6 +139,7 @@ Densidad baja-moderada (74 líneas de doc/comentario sobre 872) y en general de 
 - **d)** `state.rs:33-38`: `Self { tables: empty_tables(&schema), schema, head_seq: SequenceNumber::default() }`. Los campos se evalúan en orden de escritura, así que `tables` se calcula antes de mover `schema` (−1).
 - **e)** `mod.rs:249/252`: borrar los comentarios numerados (−2).
 - **Ahorro estimado:** ~9 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1)
 
 ## Lo que conviene dejar como está
 

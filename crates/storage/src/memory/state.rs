@@ -18,8 +18,6 @@ use crate::error::StorageError;
 pub type Table = imbl::OrdMap<PrimaryKey, CompactRow>;
 
 /// In-memory state of an open database room.
-///
-/// Holds the room schema, monotonic head sequence number, and in-memory tables indexed by table_id.
 #[derive(Debug)]
 pub(crate) struct RoomState {
     pub(crate) schema: Schema,
@@ -28,13 +26,11 @@ pub(crate) struct RoomState {
 }
 
 impl RoomState {
-    /// Creates a new `RoomState` initialized from a schema with empty tables.
     pub(crate) fn new(schema: Schema) -> Self {
-        let tables = empty_tables(&schema);
         Self {
+            tables: empty_tables(&schema),
             schema,
             head_seq: SequenceNumber::from(0u64),
-            tables,
         }
     }
 }
@@ -119,8 +115,7 @@ pub(crate) fn apply_operation(tables: &mut HashMap<u16, Table>, schema: &Schema,
             if let Some(existing) = table.get_mut(&pk) {
                 let target_len = schema
                     .get_table_by_id(table_id)
-                    .map(|t| t.columns().len())
-                    .unwrap_or(0);
+                    .map_or(0, |t| t.columns().len());
                 for col_up in updates {
                     let idx = col_up.column_idx() as usize;
                     let min_len = target_len.max(idx + 1);
@@ -144,7 +139,7 @@ pub(crate) struct RoomSnapshotRef<'a> {
     pub(crate) tables: &'a HashMap<u16, Table>,
 }
 
-/// Payload format for deserialized database snapshots.
+/// Snapshot payload that owns its tables: serialized by compaction and produced by decoding.
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct RoomSnapshotPayload {
     pub(crate) head_seq: SequenceNumber,

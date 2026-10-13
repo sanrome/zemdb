@@ -19,10 +19,8 @@ use crate::snapshot::DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES;
 
 /// In-memory implementation of `StorageEngine` with per-room isolation.
 ///
-/// Each room is protected by its own `RwLock`, allowing concurrent access
-/// across different rooms without global lock contention.
-/// Inside each room, multiple concurrent readers can execute queries (`get`, `scan`)
-/// while writes (`apply_batch`) take an exclusive lock on that specific room only.
+/// One `RwLock` per room: reads within a room run concurrently, and a write locks only its own
+/// room.
 ///
 /// Outside WebAssembly, `create_snapshot` and `apply_snapshot` serialize and decode on Tokio's
 /// blocking pool, so they must run inside a Tokio runtime.
@@ -32,11 +30,8 @@ pub struct MemoryStorageEngine {
 }
 
 impl MemoryStorageEngine {
-    /// Creates a new, empty `MemoryStorageEngine`.
     pub fn new() -> Self {
-        Self {
-            rooms: Arc::new(RwLock::new(HashMap::new())),
-        }
+        Self::default()
     }
 
     /// Fast lookup of a room's isolated state handle without holding the engine map lock.
@@ -221,12 +216,11 @@ impl StorageEngine for MemoryStorageEngine {
             .write()
             .map_err(|e| StorageError::Other(format!("Engine lock poisoned: {e}")))?;
 
-        if rooms.remove(room_id).is_some() {
-            tracing::info!(room_id = %room_id, "Closed in-memory room");
-            Ok(())
-        } else {
-            Err(StorageError::RoomNotFound(room_id.clone()))
-        }
+        rooms
+            .remove(room_id)
+            .ok_or_else(|| StorageError::RoomNotFound(room_id.clone()))?;
+        tracing::info!(room_id = %room_id, "Closed in-memory room");
+        Ok(())
     }
 
     #[tracing::instrument(skip(self, ops), fields(room_id = %room_id, ops_count = ops.len()))]
@@ -246,10 +240,8 @@ impl StorageEngine for MemoryStorageEngine {
             ref mut tables,
         } = *room_guard;
 
-        // 1. Validate schema and strict monotonic sequence
         state::validate_batch(room_id, schema, *head_seq, &ops)?;
 
-        // 2. Apply operations to in-memory tables
         for SequencedOperation { seq, op } in ops {
             state::apply_operation(tables, schema, op);
             if seq > *head_seq {
