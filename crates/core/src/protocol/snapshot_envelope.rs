@@ -141,11 +141,6 @@ impl SnapshotEnvelopeHeader {
         self.uncompressed_len
     }
 
-    /// Declared CRC32 of the body.
-    pub fn body_crc(&self) -> u32 {
-        self.body_crc
-    }
-
     /// Checks a body against this header: its CRC32 and, for a raw body, its length.
     pub fn verify_body(&self, body: &[u8]) -> Result<(), SnapshotEnvelopeError> {
         self.verify_digest(crc32fast::hash(body), body.len() as u64)

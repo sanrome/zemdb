@@ -134,6 +134,7 @@
 - **Propuesta:** quitar el campo (`TornWrite { reason: String }`), la línea `valid_bytes_offset: 0,` y la línea de `wal_frame_tests.rs:111`. Si se prefiere no tocar la API, corregir al menos el doc (Q2) para que diga que el offset es relativo al slice y por lo tanto siempre `0`.
 - **Ahorro estimado:** ~3 líneas · **Riesgo:** bajo-medio (enum público re-exportado en `lib.rs:31`; **a verificar** que no haya consumidores fuera del workspace) · **Prioridad:** media
 - **Verificación (2.ª pasada):** ✅ confirmada — grep en todo `crates/`: el único lector potencial es `storage/src/disk/wal.rs:106` con `{ reason, .. }` (sigue compilando sin el campo), `storage/tests/disk_wal_resilience_tests.rs:367` y `core/tests` usan `{ .. }`; solo `wal_frame_tests.rs:111` lo construye. El enum no se serializa (no afecta bytes en disco/red); solo cambia su salida `Debug`, que ningún test compara.
+- **Estado:** ✅ aplicada (paso 4): `TornWrite { reason }`; `storage` lo sigue leyendo con `{ reason, .. }` sin cambios y el test del relleno con ceros conserva la aserción de `TornWrite`.
 
 ### Q5. `encode_wal_batch`: sacar los temporales de un solo uso
 - **Dónde:** `wal_frame.rs:86-94`
@@ -170,6 +171,7 @@
 - **Problema:** no hay ningún uso en el workspace (`grep -rn '\.body_crc()' crates` → 0). `compression()` y `uncompressed_len()` sí se usan (`storage/src/snapshot.rs:87-129`).
 - **Propuesta:** eliminarlo. El campo se sigue usando internamente en `verify_digest` y `to_bytes`.
 - **Ahorro estimado:** 4 líneas · **Riesgo:** bajo (API pública del crate; **a verificar** si se considera parte del contrato) · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 4): ningún crate lo llama; el campo sigue en uso en `to_bytes` y `verify_digest`.
 
 ### Q8. Alias `SequencedOperation::with_default_origin`
 - **Dónde:** `messages.rs:76-79`
@@ -201,6 +203,7 @@
 - **Problema:** solo se usa en `decode_batch_payload` (`:225`). No está en el `pub use` de `lib.rs` ni tiene usos externos, pero el `pub use wal_frame::*` de `mod.rs:11` lo expone igual. Sus derives `Debug, Clone, PartialEq, Serialize` no se usan.
 - **Propuesta:** hacerlo privado con `#[derive(serde::Deserialize)]` solamente, dejando `WalBatchPayloadRef` al lado. Los campos van en el mismo orden (`mutation_id`, `ops`), así que la codificación no cambia. Hace falta un comentario de una línea que diga que el orden de campos de ambos structs es el formato en disco, porque hoy esa restricción solo se deduce de "with the same encoding".
 - **Ahorro estimado:** ~0 líneas (gana encapsulamiento) · **Riesgo:** bajo (**a verificar** consumidores fuera del workspace) · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 4): `WalBatchPayload` es privado, solo deriva `Deserialize` y su doc dice que el orden de campos es el formato en disco y debe coincidir con `WalBatchPayloadRef`.
 
 ## Lo que conviene dejar como está
 

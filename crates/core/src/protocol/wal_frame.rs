@@ -26,10 +26,11 @@ pub enum WalFrameError {
 }
 
 /// Payload of a framed WAL batch: the operations and the optional mutation id for deduplication.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct WalBatchPayload {
-    pub mutation_id: Option<MutationId>,
-    pub ops: Vec<SequencedOperation>,
+/// The field order is the on-disk encoding and must match [`WalBatchPayloadRef`].
+#[derive(serde::Deserialize)]
+struct WalBatchPayload {
+    mutation_id: Option<MutationId>,
+    ops: Vec<SequencedOperation>,
 }
 
 /// Borrowed form of [`WalBatchPayload`], with the same encoding, used to encode and measure
@@ -53,11 +54,7 @@ pub enum WalBatchDecodeResult {
     CleanEof,
     /// The next frame cannot be read and no valid frame follows it (see [`FrameAnomaly`]): a
     /// torn write.
-    TornWrite {
-        /// Relative to the decoded slice, which starts at the unreadable frame, so always 0.
-        valid_bytes_offset: usize,
-        reason: String,
-    },
+    TornWrite { reason: String },
 }
 
 /// Encodes `ops` and the optional `mutation_id` as one append-only, atomically framed WAL batch.
@@ -393,7 +390,6 @@ pub fn decode_wal_batch_from_slice(slice: &[u8]) -> Result<WalBatchDecodeResult,
         )
         .expect("reads stay within the slice");
         Ok(WalBatchDecodeResult::TornWrite {
-            valid_bytes_offset: 0,
             reason: anomaly.classify(following)?,
         })
     };

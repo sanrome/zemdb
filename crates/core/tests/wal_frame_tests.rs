@@ -105,13 +105,7 @@ fn test_wal_frame_zero_filled_eof_torn_write_detection() {
     // Zero-filled tail at EOF (e.g., 64 zero bytes from power outage fallocate)
     let zeros = vec![0u8; 64];
     let res = decode_wal_batch_from_slice(&zeros).expect("returns TornWrite for zero tail");
-    assert!(matches!(
-        res,
-        WalBatchDecodeResult::TornWrite {
-            valid_bytes_offset: 0,
-            ..
-        }
-    ));
+    assert!(matches!(res, WalBatchDecodeResult::TornWrite { .. }));
 }
 
 #[test]
