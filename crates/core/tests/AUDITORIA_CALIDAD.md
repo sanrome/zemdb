@@ -58,6 +58,7 @@
   - Hay nombres que no coinciden con lo que prueban. `test_validate_compact_row_op_unknown_pk_column_returns_error` (`schema_validation_tests.rs:731`) prueba `TableSchema::try_new`.
   - `test_two_pointer_column_merge_linear` (`squashing_rules_tests.rs:254`) no prueba linealidad.
 
+- **Estado:** ✅ aplicada (paso 3): se borraron los comentarios redundantes, se reescribieron los mejorables y se renombraron los dos tests con nombre equivocado (`test_try_new_rejects_an_unknown_primary_key_column`, `merged_column_updates_stay_sorted_and_incoming_values_win`). ⏭️ no se unificó el prefijo `test_` del resto: no ahorra líneas y solo agranda el diff.
 ## Sugerencias
 
 ### Q1. Helper genérico `assert_roundtrip` en `protocol_codec_tests.rs`
@@ -79,6 +80,7 @@
   - opcional: reusar `commit_with` (503) para el `Commit` de las líneas 23-30, y crear `fn room() -> RoomId`, porque `RoomId::new("room-abc").unwrap()` aparece 14 veces.
 - **Ahorro estimado:** ~55–65 líneas · **Riesgo:** bajo · **Prioridad:** alta.
 - **Verificación (2.ª pasada):** ✅ confirmada — `decode_message<'a, T: Deserialize<'a>>` (`codec.rs:92`) acepta `M: DeserializeOwned`, el helper compila; líneas citadas (19, 221-238, 262-284, 370-379, 503, 664-694) correctas. Matiz: `error_codes_keep_their_wire_indexes` hace el roundtrip del `ErrorCode` suelto, no dentro de `ServerMessage::Error`; por eso conviene conservar un `ServerMessage::Error` como propone.
+- **Estado:** ✅ aplicada en parte (paso 3): `assert_roundtrip` y `room()`, sin los comentarios "// Test X roundtrip"; `Ack`, `AckConfirmed` y `DeregisterAck` siguen en sus tests, ahora con el helper. ⏭️ no aplicado reducir el bucle de `ErrorCode` a un solo mensaje: perdería tres casos de `ServerMessage::Error` y con el helper el bucle ya es corto. ⏭️ no aplicado reusar `commit_with` en el primer `Commit`: cambiaría los datos del caso y el informe lo deja opcional.
 
 ### Q2. Tabla de casos para la deserialización inválida de `TableSchema`
 - **Dónde:** `schema_validation_tests.rs:584-663`: 5 tests casi idénticos de 16 líneas.
@@ -88,6 +90,7 @@
   - Alternativa sin riesgo: seguir usando `from_str` con `json.to_string()`.
 - **Ahorro estimado:** ~55–60 líneas · **Riesgo:** bajo · **Prioridad:** alta.
 - **Verificación (2.ª pasada):** ✅ confirmada — los 5 tests (`585-663`) solo comparan con `contains`; `TableSchema::deserialize` (`table.rs:135-159`) parsea el helper completo y recién después llama a `try_new`, así que el orden de claves de `json!` (BTreeMap) no cambia qué error sale. Cada caso de la tabla debe incluir `table_id` (sin default y con `deny_unknown_fields`).
+- **Estado:** ✅ aplicada (paso 3), con `serde_json::from_str` sobre `json!(…).to_string()` (la alternativa sin riesgo).
 
 ### Q3. Borrar el test duplicado de nombres de tabla repetidos
 - **Dónde:** `schema_validation_tests.rs:692-714` (`test_schema_deserialize_rejects_duplicate_table_name`).
@@ -95,6 +98,7 @@
 - **Propuesta:** borrar el de `schema_validation_tests.rs`.
 - **Ahorro estimado:** ~24 líneas · **Riesgo:** bajo · **Prioridad:** alta.
 - **Verificación (2.ª pasada):** ✅ confirmada — mismo JSON (dos `tasks`, ids 0 y 1, mismos campos) y misma aserción `"already exists"`; la única diferencia es `from_str` vs `from_value` (`schema_table_ids_tests.rs:22-24`), irrelevante porque el chequeo está en `Schema::try_from_tables` (`global.rs:96`), tras parsear.
+- **Estado:** ✅ aplicada (paso 3)
 
 ### Q4. Compactar asserts repetidos en `schema_validation_tests.rs`
 - **Dónde y propuesta:**
@@ -105,6 +109,7 @@
   - **418-511** (`validate_column_updates`, 94 líneas): 7 casos de error en secuencia. Convertirlos en una tabla `[(updates, expected_error)]` (~−20). Los valores de error siguen siendo verbosos, así que el ahorro es moderado.
   - **757, 760 y 770**: cambiar los literales `65_535`/`65_536` por `schema::MAX_COLUMNS`/`+ 1`, que ya usa `protocol_codec_tests.rs:520`. No ahorra líneas, pero aclara.
 - **Ahorro estimado:** ~50–55 líneas · **Riesgo:** bajo · **Prioridad:** media.
+- **Estado:** ✅ aplicada (paso 3): los dos tests de conversión quedaron en `test_compact_row_conversions_by_reference_and_by_value`.
 
 ### Q5. Helpers de aserción en `id_validation_tests.rs`
 - **Dónde:** `id_validation_tests.rs:5-11, 20-29, 35-44, 105-114`, con el par `RoomId`+`SchemaId`, y `59-62, 68-73, 126-142, 178-183, 188-193`, con `ClientId`.
@@ -124,6 +129,7 @@
   - fusionar `client_ids_reject_other_invisible_filler_and_tag_characters` (164-184) en la lista de `client_ids_reject_invisible_format_and_bidi_characters` (117-143);
   - la línea 46 solo comprueba `RoomId`; con el helper se comprobarían también los `SchemaId`. Pasan igual, porque comparten `validate_path_id`.
 - **Ahorro estimado:** ~50–60 líneas · **Riesgo:** bajo · **Prioridad:** media.
+- **Estado:** ✅ aplicada (paso 3): `com0`/`lpt0` pasaron a la lista de nombres reservados y los caracteres de relleno y etiqueta a la de invisibles (`client_ids_reject_invisible_format_bidi_filler_and_tag_characters`).
 
 ### Q6. Usar los helpers de `wal_frame_tests.rs` en los tests antiguos
 - **Dónde:** `wal_frame_tests.rs:12-115`. Son 6 tests `test_wal_frame_*` escritos antes de los helpers de las líneas 117-156.
@@ -135,6 +141,7 @@
   - **144-149**: hacer `assert_corruption` genérico (`<T: Debug>(r: Result<T, WalFrameError>)`) para usarlo también con `replay_wal_records` en 279-282 (~−3).
   - Mover todos los helpers arriba del primer test.
 - **Ahorro estimado:** ~55 líneas · **Riesgo:** bajo · **Prioridad:** media.
+- **Estado:** ✅ aplicada (paso 3): el roundtrip fusionado conserva las dos filas como casos de la tabla, y el test de CRC quedó en `checksum_mismatch_before_a_later_valid_frame_is_corruption` con `for gap in [0, 9]`.
 
 ### Q7. Constantes mágicas en `wal_frame_tests.rs` y `protocol_codec_tests.rs`
 - **Dónde y propuesta:**
@@ -146,6 +153,7 @@
   - `protocol_codec_tests.rs:598-603` y `618-623` arman el mismo frame. Extraerlo a un helper `delete_commit_frame()` (~−5).
   - `protocol_codec_tests.rs:526-528` y `558-560` generan el mismo `Vec<ColumnUpdate>` de nulos. Extraer `null_deltas(n)` (~−3).
 - **Ahorro estimado:** ~10–12 líneas · **Riesgo:** bajo · **Prioridad:** baja.
+- **Estado:** ✅ aplicada (paso 3), con `FAKE_FRAME_LEN` y `seal_header`.
 
 ### Q8. Redundancias en `types_memory_tests.rs` y `crypto_tests.rs`
 - **Dónde y propuesta:**
@@ -154,16 +162,19 @@
   - **`types_memory_tests.rs:111-118`**: el roundtrip bincode de `RoomId` y `SchemaId` como string plano repite `id_validation_tests.rs:93-101` (`ids_serialize_as_plain_strings`). Dejar solo el de `SequenceNumber` (~−7).
   - **`crypto_tests.rs:20-25`**: `test_crypto_concurrency_bounds_satisfied` no puede fallar en tiempo de ejecución, y además ya lo garantiza el compilador. `CryptoEngine: CryptoConcurrencyBounds` es supertrait, así que `impl CryptoEngine for NoOpCryptoEngine` en `crypto.rs` no compilaría sin el bound. Borrarlo (~−6).
 - **Ahorro estimado:** ~20 líneas · **Riesgo:** bajo · **Prioridad:** baja.
+- **Estado:** ✅ aplicada en parte (paso 3). ⏭️ se conserva el roundtrip bincode de `SchemaId`: `ids_serialize_as_plain_strings` solo prueba `RoomId`; se borró el de `RoomId`. Además se sumaron los casos borde de UUID que pide el informe de `value` (mayúsculas, guion fuera de lugar, hex inválido, largos 31/33/35/37).
 
 ### Q9. Tabla para la deserialización inválida de `TableBuffer`
 - **Dónde:** `squashing_rules_tests.rs:286-306` y `340-350`. Son 4 tests de 1–2 asserts sobre `decode_buffer`.
 - **Propuesta:** un único `table_buffer_deserialization_rejects_inconsistent_buffers` con los 4 `RawTableBuffer` inválidos en un array y el caso válido `[1, 3]`. Conservar el comentario de la línea 343, que explica el orden de los deltas.
 - **Ahorro estimado:** ~12–15 líneas · **Riesgo:** bajo · **Prioridad:** baja.
+- **Estado:** ✅ aplicada (paso 3)
 
 ### Q10. Fixtures comunes entre archivos (opcional)
 - **Dónde:** `squashing_rules_tests.rs:3-13` (`users()`) y `schema_validation_tests.rs:4-13` (`sample_schema()`) definen la misma tabla `users` (id, name, age, bio, secret_chat). También se repite el patrón `TableSchema::builder(x).table_id(0).primary_key("id", DataType::Int)` en `schema_table_ids_tests.rs:119-121`, `schema_validation_tests.rs` (varias veces) y `squashing_rules_tests.rs:108-112`.
 - **Propuesta:** un `tests/common/mod.rs` con `users_table()` y `table(name)`. El ahorro neto es chico (~10 líneas), porque cada archivo suma `mod common;` y hace falta `#[allow(dead_code)]` en los helpers que algún binario no use. Recomendable solo si crecen los fixtures compartidos.
 - **Ahorro estimado:** ~5–10 líneas · **Riesgo:** bajo · **Prioridad:** baja.
+- **Estado:** ⏭️ no aplicada — el ahorro neto es de unas pocas líneas y el propio informe la recomienda solo si crecen los fixtures compartidos.
 
 ## Lo que conviene dejar como está
 - **`every_buffer_built_by_apply_deserializes_again`** (`squashing_rules_tests.rs:223-251`): la enumeración exhaustiva de secuencias de 3 operaciones es compacta para lo que cubre.

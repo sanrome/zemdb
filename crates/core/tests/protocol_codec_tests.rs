@@ -1,12 +1,28 @@
-use zemdb_core::protocol::encoded_len;
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use std::fmt::Debug;
+use zemdb_core::protocol::{encoded_len, PROTOCOL_MAGIC};
 use zemdb_core::*;
+
+fn assert_roundtrip<M: Serialize + DeserializeOwned + PartialEq + Debug>(msg: &M) {
+    let frame = encode_message(msg).expect("serialization failed");
+    assert_eq!(
+        &decode_message::<M>(&frame).expect("deserialization failed"),
+        msg
+    );
+}
+
+fn room() -> RoomId {
+    RoomId::new("room-abc").unwrap()
+}
 
 #[test]
 fn test_protocol_rejects_payload_exceeding_max_message_size() {
     // A frame with a valid header that is longer than MAX_FRAME_SIZE is rejected before its
     // payload is read.
     let mut oversized = vec![0u8; MAX_FRAME_SIZE + 1];
-    oversized[..4].copy_from_slice(&[0x5A, 0x4D, PROTOCOL_VERSION, 0x00]);
+    oversized[..2].copy_from_slice(&PROTOCOL_MAGIC);
+    oversized[2] = PROTOCOL_VERSION;
     let result: Result<ClientMessage, _> = decode_message(&oversized);
     assert!(
         matches!(result, Err(DecodeError::TooLarge { len }) if len == MAX_FRAME_SIZE + 1),
@@ -20,23 +36,19 @@ fn test_protocol_binary_serialization_roundtrip() {
     let compact = CompactRow::new(vec![Value::Int(42), Value::String("Testing binary".into())]);
 
     let mutation_id = MutationId::new([1u8; 16]);
-    let client_msg = ClientMessage::Commit {
+    assert_roundtrip(&ClientMessage::Commit {
         correlation_id: CorrelationId::new(1001),
-        room_id: RoomId::new("room-abc").unwrap(),
+        room_id: room(),
         client_id: ClientId::new("client-1").unwrap(),
         mutation_id,
         last_ack_seq: SequenceNumber::new(10),
         op: Operation::insert(0, PrimaryKey::single(42i64), compact, 500),
-    };
+    });
 
-    let encoded = encode_message(&client_msg).expect("serialization failed");
-    let decoded: ClientMessage = decode_message(&encoded).expect("deserialization failed");
-    assert_eq!(client_msg, decoded);
-
-    // Test CommitAck 1-RTT roundtrip with catchup_ops
-    let commit_ack_msg = ServerMessage::CommitAck {
+    // CommitAck answers in one round trip, carrying the operations the client missed.
+    assert_roundtrip(&ServerMessage::CommitAck {
         correlation_id: CorrelationId::new(1001),
-        room_id: RoomId::new("room-abc").unwrap(),
+        room_id: room(),
         mutation_id,
         assigned_seq: SequenceNumber::new(12),
         catchup_ops: vec![
@@ -56,14 +68,11 @@ fn test_protocol_binary_serialization_roundtrip() {
         ],
         has_more: false,
         snapshot_wanted: true,
-    };
-    let encoded_ack = encode_message(&commit_ack_msg).expect("serialization failed");
-    let decoded_ack: ServerMessage = decode_message(&encoded_ack).expect("deserialization failed");
-    assert_eq!(commit_ack_msg, decoded_ack);
+    });
 
-    let server_msg = ServerMessage::SyncBatch {
+    assert_roundtrip(&ServerMessage::SyncBatch {
         correlation_id: CorrelationId::new(1001),
-        room_id: RoomId::new("room-abc").unwrap(),
+        room_id: room(),
         head_seq: SequenceNumber::new(150),
         ops: vec![SequencedOperation {
             seq: SequenceNumber::new(150),
@@ -71,120 +80,79 @@ fn test_protocol_binary_serialization_roundtrip() {
         }],
         has_more: false,
         snapshot_wanted: false,
-    };
+    });
 
-    let encoded_server = encode_message(&server_msg).expect("serialization failed");
-    let decoded_server: ServerMessage =
-        decode_message(&encoded_server).expect("deserialization failed");
-    assert_eq!(server_msg, decoded_server);
-
-    // Test HeartbeatAck roundtrip with the snapshot signalling fields
     for (snapshot_wanted, active_snapshot_seq) in
         [(true, None), (false, Some(SequenceNumber::new(140)))]
     {
-        let heartbeat_ack = ServerMessage::HeartbeatAck {
+        assert_roundtrip(&ServerMessage::HeartbeatAck {
             correlation_id: CorrelationId::new(1001),
-            room_id: RoomId::new("room-abc").unwrap(),
+            room_id: room(),
             current_head_seq: SequenceNumber::new(150),
             snapshot_wanted,
             active_snapshot_seq,
-        };
-        let encoded_hb = encode_message(&heartbeat_ack).expect("serialization failed");
-        let decoded_hb: ServerMessage =
-            decode_message(&encoded_hb).expect("deserialization failed");
-        assert_eq!(heartbeat_ack, decoded_hb);
+        });
     }
 
-    // Test DeregisterClient roundtrip
-    let dereg_msg = ClientMessage::DeregisterClient {
+    assert_roundtrip(&ClientMessage::DeregisterClient {
         correlation_id: CorrelationId::new(1002),
-        room_id: RoomId::new("room-abc").unwrap(),
+        room_id: room(),
         client_id: ClientId::new("client-1").unwrap(),
-    };
-    let encoded_dereg = encode_message(&dereg_msg).expect("serialization failed");
-    let decoded_dereg: ClientMessage =
-        decode_message(&encoded_dereg).expect("deserialization failed");
-    assert_eq!(dereg_msg, decoded_dereg);
+    });
 
-    // Test RequestSnapshotChunk roundtrip
-    let req_chunk = ClientMessage::RequestSnapshotChunk {
+    assert_roundtrip(&ClientMessage::RequestSnapshotChunk {
         correlation_id: CorrelationId::new(1003),
-        room_id: RoomId::new("room-abc").unwrap(),
+        room_id: room(),
         chunk_index: 2,
         chunk_size: 4 * 1024 * 1024,
         snapshot_hash: Some([9u8; 32]),
-    };
-    let enc_req = encode_message(&req_chunk).expect("serialization failed");
-    let dec_req: ClientMessage = decode_message(&enc_req).expect("deserialization failed");
-    assert_eq!(req_chunk, dec_req);
+    });
 
-    // Test SnapshotChunk roundtrip
     let dummy_payload = b"snapshot payload chunk 2 data...";
     let expected_hash = ServerMessage::compute_snapshot_hash(dummy_payload);
-    let snap_chunk = ServerMessage::SnapshotChunk {
+    assert_roundtrip(&ServerMessage::SnapshotChunk {
         correlation_id: CorrelationId::new(1003),
-        room_id: RoomId::new("room-abc").unwrap(),
+        room_id: room(),
         snapshot_head_seq: SequenceNumber::new(500),
         chunk_index: 2,
         total_chunks: 10,
         total_bytes: 40 * 1024 * 1024,
         snapshot_hash: expected_hash,
         data: bytes::Bytes::from_static(dummy_payload),
-    };
-    let enc_chunk = encode_message(&snap_chunk).expect("serialization failed");
-    let dec_chunk: ServerMessage = decode_message(&enc_chunk).expect("deserialization failed");
-    assert_eq!(snap_chunk, dec_chunk);
+    });
 
-    // Test UploadSnapshotChunk roundtrip
-    let upload_chunk = ClientMessage::UploadSnapshotChunk {
+    assert_roundtrip(&ClientMessage::UploadSnapshotChunk {
         correlation_id: CorrelationId::new(1004),
-        room_id: RoomId::new("room-abc").unwrap(),
+        room_id: room(),
         snapshot_head_seq: SequenceNumber::new(500),
         chunk_index: 0,
         total_chunks: 5,
         total_bytes: 5 * 1024 * 1024,
         snapshot_hash: expected_hash,
         data: bytes::Bytes::from_static(dummy_payload),
-    };
-    let enc_upload = encode_message(&upload_chunk).expect("serialization failed");
-    let dec_upload: ClientMessage = decode_message(&enc_upload).expect("deserialization failed");
-    assert_eq!(upload_chunk, dec_upload);
+    });
 
-    // Test SnapshotUploadChunkAck roundtrip
-    let upload_ack = ServerMessage::SnapshotUploadChunkAck {
+    assert_roundtrip(&ServerMessage::SnapshotUploadChunkAck {
         correlation_id: CorrelationId::new(1004),
-        room_id: RoomId::new("room-abc").unwrap(),
+        room_id: room(),
         chunk_index: 0,
         total_chunks: 5,
         staged: false,
-    };
-    let enc_ack = encode_message(&upload_ack).expect("serialization failed");
-    let dec_ack: ServerMessage = decode_message(&enc_ack).expect("deserialization failed");
-    assert_eq!(upload_ack, dec_ack);
+    });
 
-    // Test RegisterClient with auth_token roundtrip
-    let reg_msg = ClientMessage::RegisterClient {
+    assert_roundtrip(&ClientMessage::RegisterClient {
         correlation_id: CorrelationId::new(1004),
-        room_id: RoomId::new("room-abc").unwrap(),
+        room_id: room(),
         client_id: ClientId::new("client-1").unwrap(),
         auth_token: "jwt.signed.token.abc123xyz".to_string(),
         current_seq: Some(SequenceNumber::new(5)),
-    };
-    let enc_reg = encode_message(&reg_msg).expect("serialization failed");
-    let dec_reg: ClientMessage = decode_message(&enc_reg).expect("deserialization failed");
-    assert_eq!(reg_msg, dec_reg);
+    });
 
-    // Test GetSchema roundtrip
-    let get_schema_msg = ClientMessage::GetSchema {
+    assert_roundtrip(&ClientMessage::GetSchema {
         correlation_id: CorrelationId::new(1005),
-        room_id: RoomId::new("room-abc").unwrap(),
-    };
-    let enc_get_schema = encode_message(&get_schema_msg).expect("serialization failed");
-    let dec_get_schema: ClientMessage =
-        decode_message(&enc_get_schema).expect("deserialization failed");
-    assert_eq!(get_schema_msg, dec_get_schema);
+        room_id: room(),
+    });
 
-    // Test Registered message with schema and schema_id roundtrip
     let test_schema = Schema::builder()
         .table(
             TableSchema::builder("tasks")
@@ -192,49 +160,35 @@ fn test_protocol_binary_serialization_roundtrip() {
                 .column("title", DataType::String),
         )
         .build();
-    let registered_msg = ServerMessage::Registered {
+    assert_roundtrip(&ServerMessage::Registered {
         correlation_id: CorrelationId::new(1004),
-        room_id: RoomId::new("room-abc").unwrap(),
+        room_id: room(),
         head_seq: SequenceNumber::new(1),
         tail_seq: SequenceNumber::new(1),
         schema_id: SchemaId::new("schema-workspace-v1").unwrap(),
         schema: test_schema.clone(),
         active_snapshot_seq: Some(SequenceNumber::new(1)),
-    };
-    let enc_registered = encode_message(&registered_msg).expect("serialization failed");
-    let dec_registered: ServerMessage =
-        decode_message(&enc_registered).expect("deserialization failed");
-    assert_eq!(registered_msg, dec_registered);
+    });
 
-    // Test Schema response message roundtrip
-    let schema_resp_msg = ServerMessage::Schema {
+    assert_roundtrip(&ServerMessage::Schema {
         correlation_id: CorrelationId::new(1005),
-        room_id: RoomId::new("room-abc").unwrap(),
+        room_id: room(),
         schema_id: SchemaId::new("schema-workspace-v1").unwrap(),
         schema: test_schema,
-    };
-    let enc_schema_resp = encode_message(&schema_resp_msg).expect("serialization failed");
-    let dec_schema_resp: ServerMessage =
-        decode_message(&enc_schema_resp).expect("deserialization failed");
-    assert_eq!(schema_resp_msg, dec_schema_resp);
+    });
 
-    // Test new ErrorCodes roundtrip
-    let error_codes = vec![
+    for code in [
         ErrorCode::Unauthorized,
         ErrorCode::RoomAlreadyExists,
         ErrorCode::TableAlreadyExists,
         ErrorCode::SchemaNotFound,
-    ];
-    for code in error_codes {
-        let err_msg = ServerMessage::Error {
+    ] {
+        assert_roundtrip(&ServerMessage::Error {
             correlation_id: Some(CorrelationId::new(9999)),
-            room_id: Some(RoomId::new("room-abc").unwrap()),
+            room_id: Some(room()),
             code,
             message: format!("Test error for {:?}", code),
-        };
-        let enc_err = encode_message(&err_msg).expect("serialization failed");
-        let dec_err: ServerMessage = decode_message(&enc_err).expect("deserialization failed");
-        assert_eq!(err_msg, dec_err);
+        });
     }
 }
 
@@ -247,7 +201,6 @@ fn test_protocol_rejects_trailing_bytes() {
     };
 
     let mut encoded = encode_message(&client_msg).expect("serialization failed");
-    // Append trailing corrupted/garbage bytes
     encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
 
     let result: Result<ClientMessage, _> = decode_message(&encoded);
@@ -260,27 +213,18 @@ fn test_protocol_rejects_trailing_bytes() {
 
 #[test]
 fn test_ack_messages_codec_roundtrip() {
-    let ack_msg = ClientMessage::Ack {
+    assert_roundtrip(&ClientMessage::Ack {
         correlation_id: CorrelationId::new(101),
         room_id: RoomId::new("room-ack").unwrap(),
         client_id: ClientId::new("client-ack").unwrap(),
         ack_seq: SequenceNumber::new(42),
-    };
-
-    let encoded_ack = encode_message(&ack_msg).expect("serialization failed");
-    let decoded_ack: ClientMessage = decode_message(&encoded_ack).expect("deserialization failed");
-    assert_eq!(ack_msg, decoded_ack);
-
-    let ack_confirmed = ServerMessage::AckConfirmed {
+    });
+    assert_roundtrip(&ServerMessage::AckConfirmed {
         correlation_id: CorrelationId::new(101),
         room_id: RoomId::new("room-ack").unwrap(),
         ack_seq: SequenceNumber::new(42),
         head_seq: SequenceNumber::new(50),
-    };
-
-    let enc_conf = encode_message(&ack_confirmed).expect("serialization failed");
-    let dec_conf: ServerMessage = decode_message(&enc_conf).expect("deserialization failed");
-    assert_eq!(ack_confirmed, dec_conf);
+    });
 }
 
 #[test]
@@ -333,7 +277,8 @@ fn test_version_is_checked_before_size_and_payload() {
     // The version rule holds for any frame: an oversized frame or one with an unreadable
     // payload is still reported as a version mismatch when its header has another version.
     let mut oversized = vec![0u8; MAX_FRAME_SIZE + 1];
-    oversized[..4].copy_from_slice(&[0x5A, 0x4D, 0x02, 0x00]);
+    oversized[..2].copy_from_slice(&PROTOCOL_MAGIC);
+    oversized[2] = 0x02;
     assert!(matches!(
         decode_message::<ServerMessage>(&oversized),
         Err(DecodeError::UnsupportedVersion { got: 0x02, .. })
@@ -368,14 +313,11 @@ fn test_peek_version_reads_the_header_only() {
 
 #[test]
 fn test_deregister_ack_message_roundtrip() {
-    let ack = ServerMessage::DeregisterAck {
+    assert_roundtrip(&ServerMessage::DeregisterAck {
         correlation_id: CorrelationId::new(55),
         room_id: RoomId::new("room-ack").unwrap(),
         client_id: ClientId::new("client-ack").unwrap(),
-    };
-    let encoded = encode_message(&ack).expect("serialization failed");
-    let decoded: ServerMessage = decode_message(&encoded).expect("deserialization failed");
-    assert_eq!(ack, decoded);
+    });
 }
 
 /// Bytes value whose encoded frame is exactly `frame_len` bytes long. The length prefix of
@@ -391,7 +333,6 @@ fn value_with_frame_len(frame_len: usize) -> bytes::Bytes {
 
 #[test]
 fn test_max_size_payload_round_trips_and_one_more_byte_is_rejected() {
-    let max_frame = MAX_FRAME_SIZE;
     assert_eq!(
         MAX_FRAME_SIZE,
         MAX_MESSAGE_SIZE as usize + PROTOCOL_HEADER_LEN
@@ -399,14 +340,14 @@ fn test_max_size_payload_round_trips_and_one_more_byte_is_rejected() {
 
     // A payload of exactly MAX_MESSAGE_SIZE bytes is accepted by the encoder, and the frame it
     // produces (payload plus header) is accepted by the decoder.
-    let value = value_with_frame_len(max_frame);
+    let value = value_with_frame_len(MAX_FRAME_SIZE);
     let frame = encode_message(&value).expect("max-size payload must encode");
-    assert_eq!(frame.len(), max_frame);
+    assert_eq!(frame.len(), MAX_FRAME_SIZE);
     let decoded: bytes::Bytes = decode_message(&frame).expect("max-size frame must decode");
     assert_eq!(decoded, value);
 
     // One byte more cannot be encoded, and a frame of that size is rejected by the decoder.
-    assert!(encode_message(&value_with_frame_len(max_frame + 1)).is_err());
+    assert!(encode_message(&value_with_frame_len(MAX_FRAME_SIZE + 1)).is_err());
     let mut oversized = frame;
     oversized.push(7);
     assert!(matches!(
@@ -515,19 +456,27 @@ fn nulls(count: usize) -> Vec<Value> {
     vec![Value::Null; count]
 }
 
+fn null_deltas(count: usize) -> Vec<ColumnUpdate> {
+    (0..count)
+        .map(|i| ColumnUpdate::new(i as u16, Value::Null))
+        .collect()
+}
+
+fn delete_commit_frame() -> Vec<u8> {
+    encode_message(&commit_with(Operation::delete(
+        0,
+        PrimaryKey::single(1i64),
+        0,
+    )))
+    .unwrap()
+}
+
 #[test]
 fn rows_keys_and_deltas_over_the_column_limit_are_rejected() {
     let over = schema::MAX_COLUMNS + 1;
     let row = Operation::insert(0, PrimaryKey::single(1i64), CompactRow::new(nulls(over)), 0);
     let key = Operation::delete(0, PrimaryKey::composite(nulls(over)), 0);
-    let deltas = Operation::update(
-        0,
-        PrimaryKey::single(1i64),
-        (0..over)
-            .map(|i| ColumnUpdate::new(i as u16, Value::Null))
-            .collect(),
-        0,
-    );
+    let deltas = Operation::update(0, PrimaryKey::single(1i64), null_deltas(over), 0);
     for op in [row, key, deltas] {
         let frame = encode_message(&commit_with(op)).unwrap();
         assert!(matches!(
@@ -552,14 +501,7 @@ fn the_largest_operation_a_table_allows_is_accepted() {
         CompactRow::new(nulls(max)),
         0,
     );
-    let update = Operation::update(
-        0,
-        PrimaryKey::composite(nulls(max)),
-        (0..max)
-            .map(|i| ColumnUpdate::new(i as u16, Value::Null))
-            .collect(),
-        0,
-    );
+    let update = Operation::update(0, PrimaryKey::composite(nulls(max)), null_deltas(max), 0);
     for op in [insert, update] {
         let msg = commit_with(op);
         let frame = encode_message(&msg).unwrap();
@@ -595,12 +537,7 @@ fn a_commit_of_large_values_near_the_frame_limit_is_accepted() {
 
 #[test]
 fn the_kind_is_read_without_decoding_the_rest_of_the_frame() {
-    let mut frame = encode_message(&commit_with(Operation::delete(
-        0,
-        PrimaryKey::single(1i64),
-        0,
-    )))
-    .unwrap();
+    let mut frame = delete_commit_frame();
     frame.truncate(PROTOCOL_HEADER_LEN + 1);
     frame.extend_from_slice(&[0xFF; 32]);
     assert_eq!(
@@ -615,12 +552,7 @@ fn the_kind_is_read_without_decoding_the_rest_of_the_frame() {
 
 #[test]
 fn peeking_checks_the_header_and_the_variant() {
-    let frame = encode_message(&commit_with(Operation::delete(
-        0,
-        PrimaryKey::single(1i64),
-        0,
-    )))
-    .unwrap();
+    let frame = delete_commit_frame();
     let mut other_version = frame.clone();
     other_version[2] = PROTOCOL_VERSION + 1;
     assert!(matches!(

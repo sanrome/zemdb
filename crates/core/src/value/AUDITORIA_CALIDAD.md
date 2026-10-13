@@ -171,3 +171,4 @@
 - **`tests/row.rs:69,74`:** en lugar de `crate::value::ValueBudget`, conviene importarlo una vez (`use crate::value::ValueBudget;`).
 - **`tests/row.rs:47-55`:** `items.clone()` seguido de `pop()` se lee bien. Sin cambios.
 - **Fuera de alcance:** `scalar.rs` y `data_type.rs` no tienen tests unitarios en `value/tests/`; los cubren los tests de integración (`crates/core/tests/types_memory_tests.rs`). Si se aplica Q2, conviene agregar casos borde de UUID allí (guion mal ubicado, mayúsculas, 35 o 37 caracteres).
+  - **Estado:** ✅ aplicada (paso 3): `test_uuid_data_type_primary_key_and_parsing` prueba mayúsculas, guion fuera de lugar, hex inválido y largos 31/33/35/37.

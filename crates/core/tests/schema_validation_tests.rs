@@ -1,3 +1,4 @@
+use serde_json::json;
 use std::collections::BTreeMap;
 use zemdb_core::*;
 
@@ -134,28 +135,21 @@ fn test_schema_validates_pk_type_on_update_and_delete() {
     let wrong_pk = PrimaryKey::single("not_an_int");
     let fields = RowBuilder::new().set("name", "Updated").build();
 
-    let err_update = schema
-        .validate_update("users", &wrong_pk, &fields)
-        .unwrap_err();
+    let expected = ValidationError::PrimaryKeyTypeMismatch {
+        table: "users".to_string(),
+        column: "id".to_string(),
+        expected: DataType::Int,
+        actual: DataType::String,
+    };
     assert_eq!(
-        err_update,
-        ValidationError::PrimaryKeyTypeMismatch {
-            table: "users".to_string(),
-            column: "id".to_string(),
-            expected: DataType::Int,
-            actual: DataType::String,
-        }
+        schema
+            .validate_update("users", &wrong_pk, &fields)
+            .unwrap_err(),
+        expected
     );
-
-    let err_delete = schema.validate_delete("users", &wrong_pk).unwrap_err();
     assert_eq!(
-        err_delete,
-        ValidationError::PrimaryKeyTypeMismatch {
-            table: "users".to_string(),
-            column: "id".to_string(),
-            expected: DataType::Int,
-            actual: DataType::String,
-        }
+        schema.validate_delete("users", &wrong_pk).unwrap_err(),
+        expected
     );
 }
 
@@ -176,7 +170,7 @@ fn test_schema_update_cannot_modify_pk() {
 }
 
 #[test]
-fn test_compact_row_conversion() {
+fn test_compact_row_conversions_by_reference_and_by_value() {
     let schema = sample_schema();
     let table = schema.get_table_by_name("users").unwrap();
     let row = RowBuilder::new()
@@ -188,11 +182,21 @@ fn test_compact_row_conversion() {
 
     let compact = table.to_compact_row(&row).expect("should convert");
     assert_eq!(compact.len(), table.columns().len());
-
     let restored = table.from_compact_row(&compact).expect("should restore");
-    assert_eq!(restored.get("id"), Some(&Value::Int(99)));
-    assert_eq!(restored.get("name"), Some(&Value::String("Carol".into())));
-    assert_eq!(restored.get("age"), Some(&Value::Int(28)));
+
+    let compact = table
+        .row_into_compact(row)
+        .expect("should convert zero-copy");
+    assert_eq!(compact.len(), table.columns().len());
+    let restored_zero_copy = table
+        .compact_into_row(compact)
+        .expect("should restore zero-copy");
+
+    for restored in [restored, restored_zero_copy] {
+        assert_eq!(restored.get("id"), Some(&Value::Int(99)));
+        assert_eq!(restored.get("name"), Some(&Value::String("Carol".into())));
+        assert_eq!(restored.get("age"), Some(&Value::Int(28)));
+    }
 }
 
 #[test]
@@ -232,12 +236,9 @@ fn test_table_schema_preserves_ddl_definition_order() {
         .build()
         .expect("valid table");
 
-    // Columns must be stored in DDL definition order (id, zebra, alpha, beta),
-    // NOT alphabetical order (alpha, beta, id, zebra)!
-    assert_eq!(table.columns()[0].name(), "id");
-    assert_eq!(table.columns()[1].name(), "zebra");
-    assert_eq!(table.columns()[2].name(), "alpha");
-    assert_eq!(table.columns()[3].name(), "beta");
+    // Columns keep their definition order, not alphabetical order (alpha, beta, id, zebra).
+    let names: Vec<_> = table.columns().iter().map(|c| c.name()).collect();
+    assert_eq!(names, ["id", "zebra", "alpha", "beta"]);
 
     let row = RowBuilder::new()
         .set("id", 1i64)
@@ -246,35 +247,15 @@ fn test_table_schema_preserves_ddl_definition_order() {
         .set("beta", true)
         .build();
 
-    let compact = table.to_compact_row(&row).expect("compact");
-    assert_eq!(compact[0], Value::Int(1));
-    assert_eq!(compact[1], Value::String("Z".into()));
-    assert_eq!(compact[2], Value::Int(10));
-    assert_eq!(compact[3], Value::Bool(true));
-}
-
-#[test]
-fn test_zero_copy_row_conversions() {
-    let schema = sample_schema();
-    let table = schema.get_table_by_name("users").unwrap();
-    let row = RowBuilder::new()
-        .set("id", 99i64)
-        .set("name", "Carol")
-        .set("age", 28i64)
-        .set("secret_chat", vec![0xDE, 0xAD])
-        .build();
-
-    let compact = table
-        .row_into_compact(row)
-        .expect("should convert zero-copy");
-    assert_eq!(compact.len(), table.columns().len());
-
-    let restored = table
-        .compact_into_row(compact)
-        .expect("should restore zero-copy");
-    assert_eq!(restored.get("id"), Some(&Value::Int(99)));
-    assert_eq!(restored.get("name"), Some(&Value::String("Carol".into())));
-    assert_eq!(restored.get("age"), Some(&Value::Int(28)));
+    assert_eq!(
+        table.to_compact_row(&row).expect("compact"),
+        CompactRow::new(vec![
+            Value::Int(1),
+            Value::String("Z".into()),
+            Value::Int(10),
+            Value::Bool(true),
+        ])
+    );
 }
 
 #[test]
@@ -380,10 +361,8 @@ fn test_compact_into_row_supports_schema_evolution_shorter_arity() {
         .build()
         .expect("valid table");
 
-    // Historical row with 2 columns
     let historical_compact = CompactRow::new(vec![Value::Int(100), Value::String("Doc 1".into())]);
 
-    // Now evolve the schema by adding 2 nullable columns
     table
         .add_column(ColumnDef::new("tags", DataType::String).nullable(true))
         .unwrap();
@@ -392,26 +371,18 @@ fn test_compact_into_row_supports_schema_evolution_shorter_arity() {
         .unwrap();
     assert_eq!(table.columns().len(), 4);
 
-    // from_compact_row should succeed and restore the historical columns
     let restored = table
         .from_compact_row(&historical_compact)
         .expect("should allow shorter arity");
-    assert_eq!(restored.get("id"), Some(&Value::Int(100)));
-    assert_eq!(restored.get("title"), Some(&Value::String("Doc 1".into())));
-    assert_eq!(restored.get("tags"), None);
-    assert_eq!(restored.get("views"), None);
-
-    // compact_into_row should also succeed zero-copy
     let restored_zero_copy = table
         .compact_into_row(historical_compact)
         .expect("should allow shorter arity zero-copy");
-    assert_eq!(restored_zero_copy.get("id"), Some(&Value::Int(100)));
-    assert_eq!(
-        restored_zero_copy.get("title"),
-        Some(&Value::String("Doc 1".into()))
-    );
-    assert_eq!(restored_zero_copy.get("tags"), None);
-    assert_eq!(restored_zero_copy.get("views"), None);
+    for restored in [restored, restored_zero_copy] {
+        assert_eq!(restored.get("id"), Some(&Value::Int(100)));
+        assert_eq!(restored.get("title"), Some(&Value::String("Doc 1".into())));
+        assert_eq!(restored.get("tags"), None);
+        assert_eq!(restored.get("views"), None);
+    }
 }
 
 #[test]
@@ -426,7 +397,6 @@ fn test_table_schema_validate_column_updates() {
         .build()
         .unwrap();
 
-    // 1. Valid updates sorted ascending
     let valid_updates = vec![
         ColumnUpdate::new(1, Value::Float(55.5)),
         ColumnUpdate::new(2, Value::Int(1024)),
@@ -434,80 +404,69 @@ fn test_table_schema_validate_column_updates() {
     ];
     assert!(table.validate_column_updates(&valid_updates).is_ok());
 
-    // 2. Empty update rejected
-    assert_eq!(
-        table.validate_column_updates(&[]),
-        Err(ValidationError::EmptyUpdate("metrics".to_string()))
-    );
-
-    // 3. Updating primary key column rejected
-    let pk_update = vec![ColumnUpdate::new(0, Value::Int(99))];
-    assert_eq!(
-        table.validate_column_updates(&pk_update),
-        Err(ValidationError::CannotUpdatePrimaryKey {
-            table: "metrics".to_string(),
-            column: "id".to_string(),
-        })
-    );
-
-    // 4. Out of bounds index rejected
-    let oob_update = vec![ColumnUpdate::new(99, Value::Int(1))];
-    assert_eq!(
-        table.validate_column_updates(&oob_update),
-        Err(ValidationError::UnknownColumn {
-            table: "metrics".to_string(),
-            column: "index 99".to_string(),
-        })
-    );
-
-    // 5. Unsorted updates rejected
-    let unsorted = vec![
-        ColumnUpdate::new(2, Value::Int(1024)),
-        ColumnUpdate::new(1, Value::Float(55.5)),
+    let metrics = || "metrics".to_string();
+    let cases: Vec<(Vec<ColumnUpdate>, ValidationError)> = vec![
+        (vec![], ValidationError::EmptyUpdate(metrics())),
+        (
+            vec![ColumnUpdate::new(0, Value::Int(99))],
+            ValidationError::CannotUpdatePrimaryKey {
+                table: metrics(),
+                column: "id".to_string(),
+            },
+        ),
+        (
+            vec![ColumnUpdate::new(99, Value::Int(1))],
+            ValidationError::UnknownColumn {
+                table: metrics(),
+                column: "index 99".to_string(),
+            },
+        ),
+        (
+            vec![
+                ColumnUpdate::new(2, Value::Int(1024)),
+                ColumnUpdate::new(1, Value::Float(55.5)),
+            ],
+            ValidationError::UnsortedColumnUpdates {
+                table: metrics(),
+                prev_idx: 2,
+                actual_idx: 1,
+            },
+        ),
+        (
+            vec![
+                ColumnUpdate::new(1, Value::Float(55.5)),
+                ColumnUpdate::new(1, Value::Float(60.0)),
+            ],
+            ValidationError::DuplicateColumn {
+                table: metrics(),
+                column: "cpu".to_string(),
+            },
+        ),
+        (
+            vec![ColumnUpdate::new(1, Value::String("not a float".into()))],
+            ValidationError::TypeMismatch {
+                table: metrics(),
+                column: "cpu".to_string(),
+                expected: DataType::Float,
+                actual: DataType::String,
+            },
+        ),
+        // An encrypted column only accepts opaque bytes.
+        (
+            vec![ColumnUpdate::new(4, Value::String("plaintext".into()))],
+            ValidationError::EncryptedColumnMustBeBytes {
+                table: metrics(),
+                column: "token".to_string(),
+            },
+        ),
     ];
-    assert_eq!(
-        table.validate_column_updates(&unsorted),
-        Err(ValidationError::UnsortedColumnUpdates {
-            table: "metrics".to_string(),
-            prev_idx: 2,
-            actual_idx: 1,
-        })
-    );
-
-    // 6. Duplicate column updates rejected
-    let duplicate = vec![
-        ColumnUpdate::new(1, Value::Float(55.5)),
-        ColumnUpdate::new(1, Value::Float(60.0)),
-    ];
-    assert_eq!(
-        table.validate_column_updates(&duplicate),
-        Err(ValidationError::DuplicateColumn {
-            table: "metrics".to_string(),
-            column: "cpu".to_string(),
-        })
-    );
-
-    // 7. Type mismatch rejected
-    let type_err = vec![ColumnUpdate::new(1, Value::String("not a float".into()))];
-    assert_eq!(
-        table.validate_column_updates(&type_err),
-        Err(ValidationError::TypeMismatch {
-            table: "metrics".to_string(),
-            column: "cpu".to_string(),
-            expected: DataType::Float,
-            actual: DataType::String,
-        })
-    );
-
-    // 8. Encrypted column requires Value::Bytes
-    let enc_err = vec![ColumnUpdate::new(4, Value::String("plaintext".into()))];
-    assert_eq!(
-        table.validate_column_updates(&enc_err),
-        Err(ValidationError::EncryptedColumnMustBeBytes {
-            table: "metrics".to_string(),
-            column: "token".to_string(),
-        })
-    );
+    for (updates, expected) in cases {
+        assert_eq!(
+            table.validate_column_updates(&updates),
+            Err(expected),
+            "{updates:?}"
+        );
+    }
 }
 
 #[test]
@@ -582,84 +541,49 @@ fn test_table_schema_validate_operation_insert_update_delete() {
 }
 
 #[test]
-fn test_table_schema_deserialize_rejects_empty_pk() {
-    let json = r#"{
-        "table_id": 1,
-        "name": "users",
-        "primary_key": [],
-        "columns": [
-            {"name": "id", "data_type": "Int", "nullable": false, "encrypted": false}
-        ]
-    }"#;
-    let res: Result<TableSchema, _> = serde_json::from_str(json);
-    assert!(res.is_err());
-    let err_msg = res.unwrap_err().to_string();
-    assert!(err_msg.contains("Primary key definition cannot be empty"));
-}
-
-#[test]
-fn test_table_schema_deserialize_rejects_missing_pk_column() {
-    let json = r#"{
-        "table_id": 1,
-        "name": "users",
-        "primary_key": ["nonexistent_col"],
-        "columns": [
-            {"name": "id", "data_type": "Int", "nullable": false, "encrypted": false}
-        ]
-    }"#;
-    let res: Result<TableSchema, _> = serde_json::from_str(json);
-    assert!(res.is_err());
-    let err_msg = res.unwrap_err().to_string();
-    assert!(err_msg.contains("Unknown column"));
-}
-
-#[test]
-fn test_table_schema_deserialize_rejects_nullable_pk() {
-    let json = r#"{
-        "table_id": 1,
-        "name": "users",
-        "primary_key": ["id"],
-        "columns": [
-            {"name": "id", "data_type": "Int", "nullable": true, "encrypted": false}
-        ]
-    }"#;
-    let res: Result<TableSchema, _> = serde_json::from_str(json);
-    assert!(res.is_err());
-    let err_msg = res.unwrap_err().to_string();
-    assert!(err_msg.contains("cannot be nullable"));
-}
-
-#[test]
-fn test_table_schema_deserialize_rejects_encrypted_pk() {
-    let json = r#"{
-        "table_id": 1,
-        "name": "users",
-        "primary_key": ["id"],
-        "columns": [
-            {"name": "id", "data_type": "Int", "nullable": false, "encrypted": true}
-        ]
-    }"#;
-    let res: Result<TableSchema, _> = serde_json::from_str(json);
-    assert!(res.is_err());
-    let err_msg = res.unwrap_err().to_string();
-    assert!(err_msg.contains("cannot be encrypted"));
-}
-
-#[test]
-fn test_table_schema_deserialize_rejects_duplicate_column() {
-    let json = r#"{
-        "table_id": 1,
-        "name": "users",
-        "primary_key": ["id"],
-        "columns": [
-            {"name": "id", "data_type": "Int", "nullable": false, "encrypted": false},
-            {"name": "id", "data_type": "String", "nullable": false, "encrypted": false}
-        ]
-    }"#;
-    let res: Result<TableSchema, _> = serde_json::from_str(json);
-    assert!(res.is_err());
-    let err_msg = res.unwrap_err().to_string();
-    assert!(err_msg.contains("already exists"));
+fn test_table_schema_deserialize_rejects_invalid_definitions() {
+    let column = |name: &str, data_type: &str, nullable: bool, encrypted: bool| json!({"name": name, "data_type": data_type, "nullable": nullable, "encrypted": encrypted});
+    let cases = [
+        (
+            json!([]),
+            vec![column("id", "Int", false, false)],
+            "Primary key definition cannot be empty",
+        ),
+        (
+            json!(["nonexistent_col"]),
+            vec![column("id", "Int", false, false)],
+            "Unknown column",
+        ),
+        (
+            json!(["id"]),
+            vec![column("id", "Int", true, false)],
+            "cannot be nullable",
+        ),
+        (
+            json!(["id"]),
+            vec![column("id", "Int", false, true)],
+            "cannot be encrypted",
+        ),
+        (
+            json!(["id"]),
+            vec![
+                column("id", "Int", false, false),
+                column("id", "String", false, false),
+            ],
+            "already exists",
+        ),
+    ];
+    for (primary_key, columns, expected) in cases {
+        let json = json!({
+            "table_id": 1,
+            "name": "users",
+            "primary_key": primary_key,
+            "columns": columns,
+        })
+        .to_string();
+        let err = serde_json::from_str::<TableSchema>(&json).unwrap_err();
+        assert!(err.to_string().contains(expected), "{err}");
+    }
 }
 
 #[test]
@@ -690,30 +614,6 @@ fn test_schema_insert_table_rejects_duplicate_table_name() {
 }
 
 #[test]
-fn test_schema_deserialize_rejects_duplicate_table_name() {
-    let json = r#"{
-        "tables": [
-            {
-                "table_id": 0,
-                "name": "tasks",
-                "primary_key": ["id"],
-                "columns": [{"name": "id", "data_type": "Int", "nullable": false, "encrypted": false}]
-            },
-            {
-                "table_id": 1,
-                "name": "tasks",
-                "primary_key": ["id"],
-                "columns": [{"name": "id", "data_type": "Int", "nullable": false, "encrypted": false}]
-            }
-        ]
-    }"#;
-    let res: Result<Schema, _> = serde_json::from_str(json);
-    assert!(res.is_err());
-    let err_msg = res.unwrap_err().to_string();
-    assert!(err_msg.contains("already exists"));
-}
-
-#[test]
 fn test_schema_builder_detects_id_overflow() {
     let builder = Schema::builder().table(
         TableSchema::builder("max_table")
@@ -728,7 +628,7 @@ fn test_schema_builder_detects_id_overflow() {
 }
 
 #[test]
-fn test_validate_compact_row_op_unknown_pk_column_returns_error() {
+fn test_try_new_rejects_an_unknown_primary_key_column() {
     let res = TableSchema::try_new(
         1,
         "users",
@@ -744,8 +644,6 @@ fn test_validate_compact_row_op_unknown_pk_column_returns_error() {
     );
 }
 
-/// Columns are addressed by a `u16` index (`ColumnUpdate::column_idx`, `add_column`'s result):
-/// a table holds at most `u16::MAX` columns.
 fn columns(count: usize) -> Vec<ColumnDef> {
     (0..count)
         .map(|i| ColumnDef::new(format!("c{i}"), DataType::Int))
@@ -754,10 +652,22 @@ fn columns(count: usize) -> Vec<ColumnDef> {
 
 #[test]
 fn test_table_rejects_more_columns_than_a_u16_index_can_address() {
-    let at_limit = TableSchema::try_new(0, "wide", vec!["c0".to_string()], columns(65_535));
+    // Columns are addressed by a `u16` index (`ColumnUpdate::column_idx`, `add_column`'s
+    // result): a table holds at most `u16::MAX` columns.
+    let at_limit = TableSchema::try_new(
+        0,
+        "wide",
+        vec!["c0".to_string()],
+        columns(schema::MAX_COLUMNS),
+    );
     assert!(at_limit.is_ok());
 
-    let over = TableSchema::try_new(0, "wide", vec!["c0".to_string()], columns(65_536));
+    let over = TableSchema::try_new(
+        0,
+        "wide",
+        vec!["c0".to_string()],
+        columns(schema::MAX_COLUMNS + 1),
+    );
     assert!(
         matches!(over, Err(ValidationError::TooManyColumns { .. })),
         "{over:?}"
@@ -766,12 +676,17 @@ fn test_table_rejects_more_columns_than_a_u16_index_can_address() {
 
 #[test]
 fn test_add_column_rejects_a_column_past_the_u16_index_limit() {
-    let mut table =
-        TableSchema::try_new(0, "wide", vec!["c0".to_string()], columns(65_535)).unwrap();
+    let mut table = TableSchema::try_new(
+        0,
+        "wide",
+        vec!["c0".to_string()],
+        columns(schema::MAX_COLUMNS),
+    )
+    .unwrap();
     let res = table.add_column(ColumnDef::new("extra", DataType::Int).nullable(true));
     assert!(
         matches!(res, Err(ValidationError::TooManyColumns { .. })),
         "{res:?}"
     );
-    assert_eq!(table.columns().len(), 65_535);
+    assert_eq!(table.columns().len(), schema::MAX_COLUMNS);
 }

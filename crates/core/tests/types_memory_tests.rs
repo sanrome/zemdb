@@ -7,37 +7,30 @@ fn test_value_and_primary_key_memory_footprint() {
     assert_eq!(std::mem::size_of::<PrimaryKey>(), 40);
     assert_eq!(std::mem::size_of::<ColumnUpdate>(), 32);
     assert_eq!(std::mem::size_of::<OperationKind>(), 32);
+    // A SequencedOperation is an 8-byte sequence number and an Operation, with no padding.
     assert_eq!(std::mem::size_of::<Operation>(), 88);
     assert_eq!(std::mem::size_of::<SequencedOperation>(), 96);
-    // Operation and SequencedOperation are strictly 8-byte aligned with 0 tail padding
-    assert_eq!(std::mem::size_of::<Operation>() % 8, 0);
-    assert_eq!(std::mem::size_of::<SequencedOperation>() % 8, 0);
 }
 
 #[test]
 fn test_value_ord_and_type_order() {
     let uuid = Value::from_uuid_str("12345678-1234-1234-1234-123456789abc").unwrap();
-    let mut values = [
-        Value::String("hello".into()),
+    let expected = [
         Value::Null,
-        Value::Timestamp(500),
-        uuid.clone(),
-        Value::Int(42),
         Value::Bool(true),
+        Value::Int(42),
         Value::Float(2.75),
+        Value::Timestamp(500),
+        uuid,
+        Value::String("hello".into()),
         Value::from(vec![1, 2, 3]),
     ];
+    // The same values in another order.
+    let mut values = [6, 0, 4, 5, 2, 1, 3, 7].map(|i| expected[i].clone());
 
     values.sort();
 
-    assert_eq!(values[0], Value::Null);
-    assert_eq!(values[1], Value::Bool(true));
-    assert_eq!(values[2], Value::Int(42));
-    assert_eq!(values[3], Value::Float(2.75));
-    assert_eq!(values[4], Value::Timestamp(500));
-    assert_eq!(values[5], uuid);
-    assert_eq!(values[6], Value::String("hello".into()));
-    assert_eq!(values[7], Value::from(vec![1, 2, 3]));
+    assert_eq!(values, expected);
 }
 
 #[test]
@@ -50,9 +43,19 @@ fn test_uuid_data_type_primary_key_and_parsing() {
     assert_eq!(format!("{}", val), uuid_str);
     assert_eq!(val.to_uuid(), Some(parsed));
 
-    // Also test parsing compact 32-hex string without hyphens
     let compact_hex = "a1b2c3d4e5f67890abcdef1234567890";
     assert_eq!(Value::parse_uuid(compact_hex), Some(parsed));
+    assert_eq!(Value::parse_uuid(&uuid_str.to_uppercase()), Some(parsed));
+    for invalid in [
+        "a1b2c3d-4e5f6-7890-abcd-ef1234567890",
+        "a1b2c3d4-e5f6-7890-abcd-ef123456789g",
+        &uuid_str[..35],
+        format!("{uuid_str}0").as_str(),
+        &compact_hex[..31],
+        format!("{compact_hex}0").as_str(),
+    ] {
+        assert_eq!(Value::parse_uuid(invalid), None, "{invalid:?}");
+    }
 
     // Schema with UUID primary key
     let items_table = TableSchema::builder("items")
@@ -70,7 +73,6 @@ fn test_uuid_data_type_primary_key_and_parsing() {
     let pk = items_table.extract_pk(&row).unwrap();
     assert_eq!(pk, PrimaryKey::single(val));
 
-    // Test bincode roundtrip of UUID Value
     let encoded = bincode::serialize(&row).unwrap();
     let decoded: Row = bincode::deserialize(&encoded).unwrap();
     assert_eq!(row, decoded);
@@ -85,7 +87,7 @@ fn test_newtypes_ergonomics_and_serde() {
     let mutation = MutationId::from([7u8; 16]);
     let correlation = CorrelationId::from(999u64);
 
-    // AsRef, as_str, get ergonomics (C-DEREF compliant, no Deref coercion)
+    // Accessors and AsRef instead of Deref
     assert_eq!(room.as_str(), "room-123");
     assert_eq!(room.as_ref(), "room-123");
     assert_eq!(schema_id.as_str(), "schema-v1");
@@ -106,18 +108,15 @@ fn test_newtypes_ergonomics_and_serde() {
     assert_eq!(format!("{}", seq), "42");
     assert_eq!(format!("{}", mutation), "07070707070707070707070707070707");
 
-    // Transparent Serde roundtrip: binary size should match primitive
-    let encoded_room = bincode::serialize(&room).unwrap();
-    let encoded_raw_str = bincode::serialize("room-123").unwrap();
-    assert_eq!(encoded_room, encoded_raw_str);
-
-    let encoded_schema = bincode::serialize(&schema_id).unwrap();
-    let encoded_raw_schema_str = bincode::serialize("schema-v1").unwrap();
-    assert_eq!(encoded_schema, encoded_raw_schema_str);
-
-    let encoded_seq = bincode::serialize(&seq).unwrap();
-    let encoded_raw_u64 = bincode::serialize(&42u64).unwrap();
-    assert_eq!(encoded_seq, encoded_raw_u64);
+    // Serialized like the value they wrap.
+    assert_eq!(
+        bincode::serialize(&schema_id).unwrap(),
+        bincode::serialize("schema-v1").unwrap()
+    );
+    assert_eq!(
+        bincode::serialize(&seq).unwrap(),
+        bincode::serialize(&42u64).unwrap()
+    );
 }
 
 #[test]

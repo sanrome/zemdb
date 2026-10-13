@@ -251,7 +251,7 @@ fn every_buffer_built_by_apply_deserializes_again() {
 }
 
 #[test]
-fn test_two_pointer_column_merge_linear() {
+fn merged_column_updates_stay_sorted_and_incoming_values_win() {
     let mut existing = vec![
         ColumnUpdate::new(1, Value::Int(10)),
         ColumnUpdate::new(3, Value::String("old".into())),
@@ -283,28 +283,6 @@ fn decode_buffer(raw: &RawTableBuffer) -> Result<TableBuffer, bincode::Error> {
     bincode::deserialize(&bincode::serialize(raw).unwrap())
 }
 
-#[test]
-fn table_buffer_deserialization_rejects_operation_of_another_table() {
-    let raw = RawTableBuffer {
-        table_id: 1,
-        pending: vec![Operation::delete(2, PrimaryKey::single(1i64), 10)],
-    };
-    assert!(decode_buffer(&raw).is_err());
-}
-
-#[test]
-fn table_buffer_deserialization_rejects_repeated_primary_key() {
-    let pk = PrimaryKey::single(1i64);
-    let raw = RawTableBuffer {
-        table_id: 1,
-        pending: vec![
-            Operation::delete(1, pk.clone(), 10),
-            Operation::delete(1, pk, 20),
-        ],
-    };
-    assert!(decode_buffer(&raw).is_err());
-}
-
 /// Bincode layout of an `Operation`, which the constructors cannot produce with unsorted
 /// update deltas but a serialized buffer can contain.
 #[derive(serde::Serialize)]
@@ -330,21 +308,37 @@ fn decode_operation_with_update(table_id: u16, column_indices: &[u16]) -> Operat
     bincode::deserialize(&bincode::serialize(&raw).unwrap()).unwrap()
 }
 
-fn decode_buffer_with_update(column_indices: &[u16]) -> Result<TableBuffer, bincode::Error> {
-    decode_buffer(&RawTableBuffer {
+fn buffer_with_update(column_indices: &[u16]) -> RawTableBuffer {
+    RawTableBuffer {
         table_id: 1,
         pending: vec![decode_operation_with_update(1, column_indices)],
-    })
+    }
 }
 
 #[test]
-fn table_buffer_deserialization_rejects_unsorted_update_deltas() {
-    assert!(decode_buffer_with_update(&[1, 3]).is_ok());
-    // Squashing merges deltas assuming strictly ascending column indices.
-    assert!(decode_buffer_with_update(&[3, 1]).is_err());
-}
+fn table_buffer_deserialization_rejects_inconsistent_buffers() {
+    assert!(decode_buffer(&buffer_with_update(&[1, 3])).is_ok());
 
-#[test]
-fn table_buffer_deserialization_rejects_repeated_update_column() {
-    assert!(decode_buffer_with_update(&[2, 2]).is_err());
+    let pk = PrimaryKey::single(1i64);
+    let invalid = [
+        // An operation of another table.
+        RawTableBuffer {
+            table_id: 1,
+            pending: vec![Operation::delete(2, pk.clone(), 10)],
+        },
+        // The same primary key twice.
+        RawTableBuffer {
+            table_id: 1,
+            pending: vec![
+                Operation::delete(1, pk.clone(), 10),
+                Operation::delete(1, pk, 20),
+            ],
+        },
+        // Squashing merges deltas assuming strictly ascending column indices.
+        buffer_with_update(&[3, 1]),
+        buffer_with_update(&[2, 2]),
+    ];
+    for (case, raw) in invalid.iter().enumerate() {
+        assert!(decode_buffer(raw).is_err(), "case {case}");
+    }
 }

@@ -1,5 +1,5 @@
 use futures::executor::block_on;
-use zemdb_core::{CryptoConcurrencyBounds, CryptoEngine, NoOpCryptoEngine, RoomId};
+use zemdb_core::{CryptoEngine, NoOpCryptoEngine, RoomId};
 
 #[test]
 fn test_noop_crypto_engine_roundtrip_with_aad() {
@@ -15,11 +15,4 @@ fn test_noop_crypto_engine_roundtrip_with_aad() {
         let decrypted = engine.decrypt(&room_id, aad, &encrypted).await.unwrap();
         assert_eq!(decrypted, plaintext);
     });
-}
-
-fn assert_crypto_concurrency_bounds<T: CryptoConcurrencyBounds>() {}
-
-#[test]
-fn test_crypto_concurrency_bounds_satisfied() {
-    assert_crypto_concurrency_bounds::<NoOpCryptoEngine>();
 }
