@@ -1,29 +1,9 @@
-use std::path::PathBuf;
-use std::sync::Arc;
+mod common;
+
+use common::{commit, make_test_op, metrics, register, seqs, TestRoom};
 use std::time::Duration;
-use tempfile::{tempdir, TempDir};
-use tokio::sync::{mpsc, oneshot};
 use zemdb_core::*;
-use zemdb_server::{
-    CommitResponse, RoomCommand, RoomLifecyclePolicy, RoomManager, RoomMetrics, SchemaRegistry,
-    ServerConfig, ServerError, SnapshotRelay,
-};
-
-struct TestRoom {
-    _dir: TempDir,
-    _manager: RoomManager,
-    sender: mpsc::Sender<RoomCommand>,
-    schema: Schema,
-    segments_dir: PathBuf,
-}
-
-fn create_test_schema() -> Schema {
-    let table = TableSchema::builder("tasks")
-        .primary_key("id", DataType::Int)
-        .column("title", DataType::String)
-        .column("completed", DataType::Bool);
-    Schema::builder().table(table).build()
-}
+use zemdb_server::{CommitResponse, RoomLifecyclePolicy, ServerError};
 
 /// Five operations per segment, and segments that are compressed and pruned on the next
 /// maintenance tick once sealed.
@@ -45,84 +25,32 @@ fn long_retention_policy() -> RoomLifecyclePolicy {
 }
 
 async fn spawn_room(policy: RoomLifecyclePolicy) -> TestRoom {
-    let dir = tempdir().unwrap();
-    let schema_registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
-    let schema_id = SchemaId::new("tasks-schema").unwrap();
-    let schema = create_test_schema();
-    schema_registry
-        .register_schema(schema_id.clone(), schema.clone())
-        .unwrap();
+    TestRoom::spawn(Some(policy)).await
+}
 
-    let data_dir = dir.path().join("data");
-    let config = Arc::new(ServerConfig {
-        data_dir: data_dir.clone(),
-        ..Default::default()
-    });
-    let relay = Arc::new(
-        SnapshotRelay::new(
-            data_dir.join("snapshots"),
-            Duration::from_secs(60),
-            ServerConfig::default().max_snapshot_bytes,
-        )
-        .unwrap(),
-    );
-    let manager = RoomManager::new(config, schema_registry, relay).with_default_policy(policy);
-    let room_id = RoomId::new("commit-room").unwrap();
-    let sender = manager
-        .get_or_spawn(&room_id, Some(&schema_id))
-        .await
-        .unwrap();
-
-    TestRoom {
-        segments_dir: data_dir.join("rooms").join("commit-room").join("segments"),
-        _dir: dir,
-        _manager: manager,
-        sender,
-        schema,
-    }
+fn client(id: &str) -> ClientId {
+    ClientId::new(id).unwrap()
 }
 
 impl TestRoom {
-    async fn register(&self, client: &str) {
-        let (tx, rx) = oneshot::channel();
-        self.sender
-            .send(RoomCommand::RegisterClient {
-                client_id: ClientId::new(client).unwrap(),
-                current_seq: None,
-                reply: tx,
-            })
-            .await
-            .unwrap();
-        rx.await.unwrap().unwrap();
+    async fn register(&self, client_id: &str) {
+        register(&self.sender, &client(client_id)).await;
     }
 
     async fn commit(
         &self,
-        client: &str,
+        client_id: &str,
         mutation: u8,
         last_ack_seq: u64,
     ) -> Result<CommitResponse, ServerError> {
-        let row = RowBuilder::new()
-            .set("id", mutation as i64)
-            .set("title", "task")
-            .set("completed", false)
-            .build();
-        let op = self
-            .schema
-            .to_operation_insert("tasks", &row, 1000)
-            .unwrap();
-        let (tx, rx) = oneshot::channel();
-        self.sender
-            .send(RoomCommand::Commit {
-                client_id: ClientId::new(client).unwrap(),
-                mutation_id: MutationId::new([mutation; 16]),
-                last_ack_seq: SequenceNumber::new(last_ack_seq),
-                op,
-                reply: tx,
-            })
-            .await
-            .unwrap();
-        rx.await.unwrap()
+        commit(
+            &self.sender,
+            &client(client_id),
+            MutationId::new([mutation; 16]),
+            last_ack_seq,
+            make_test_op(mutation.into()),
+        )
+        .await
     }
 
     /// Commits `count` new mutations from `client`, each acknowledging the previous head.
@@ -133,13 +61,8 @@ impl TestRoom {
         }
     }
 
-    async fn metrics(&self) -> RoomMetrics {
-        let (tx, rx) = oneshot::channel();
-        self.sender
-            .send(RoomCommand::GetMetrics { reply: tx })
-            .await
-            .unwrap();
-        rx.await.unwrap().unwrap()
+    async fn metrics(&self) -> zemdb_server::RoomMetrics {
+        metrics(&self.sender).await
     }
 
     /// Waits for the actor's disk maintenance tick to advance the retention floor past `seq`.
@@ -153,10 +76,6 @@ impl TestRoom {
         }
         panic!("retention floor never advanced past {}", seq);
     }
-}
-
-fn seqs(resp: &CommitResponse) -> Vec<u64> {
-    resp.catchup_ops.iter().map(|op| op.seq.get()).collect()
 }
 
 #[tokio::test(start_paused = true)]
@@ -209,12 +128,12 @@ async fn retried_commit_catches_up_from_client_cursor() {
 
     let retry_up_to_date = room.commit("client", 1, 3).await.unwrap();
     assert_eq!(retry_up_to_date.assigned_seq.get(), 1);
-    assert!(seqs(&retry_up_to_date).is_empty());
+    assert!(seqs(&retry_up_to_date.catchup_ops).is_empty());
     assert!(!retry_up_to_date.has_more);
 
     let retry_behind = room.commit("client", 1, 0).await.unwrap();
     assert_eq!(retry_behind.assigned_seq.get(), 1);
-    assert_eq!(seqs(&retry_behind), vec![1, 2, 3]);
+    assert_eq!(seqs(&retry_behind.catchup_ops), vec![1, 2, 3]);
     assert!(!retry_behind.has_more);
 }
 
@@ -227,7 +146,7 @@ async fn durable_commit_with_unreadable_catchup_is_acknowledged_without_gap() {
     // Ops 1..=5 are sealed into a segment; 6..=7 remain in the active segment.
     room.commit_many("writer", 1, 7).await;
     let sealed = room
-        .segments_dir
+        .segments_dir()
         .join(format!("segment_{:016}_{:016}.wal", 1, 5));
     assert!(sealed.exists());
     std::fs::write(&sealed, b"corrupted segment contents").unwrap();
