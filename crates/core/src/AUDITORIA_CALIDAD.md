@@ -47,6 +47,7 @@
   - **Mantener `write!(f, "{}", self.0)`.** Cambiarlo por `fmt::Display::fmt(&self.0, f)` cambiaría el comportamiento con flags de ancho o relleno (`{:>5}`).
   - Ganancia modesta: con solo dos tipos, el código explícito actual también se lee bien. Aplicarla solo si se agrega un tercer ID numérico.
 - **Ahorro estimado:** ~15–20 líneas · **Riesgo:** bajo · **Prioridad:** baja.
+- **Estado:** ⏭️ no aplicada — el propio informe la recomienda solo cuando haya un tercer ID numérico; con dos tipos el código explícito se lee igual de bien.
 
 ### Q3. Documentar el puerto criptográfico (suma líneas, mejora la claridad)
 - **Dónde:** `crypto.rs:4-12`, `14-22`, `24-39` y `41-42`.
@@ -59,6 +60,7 @@
   - en `CryptoConcurrencyBounds`: "`Send + Sync` salvo en `wasm32`, donde los futures de WebCrypto no son `Send`";
   - en `NoOpCryptoEngine`: "Devuelve los datos sin cifrar; solo para tests o despliegues sin E2EE".
 - **Ahorro estimado:** −4 a −6 líneas (suma) · **Riesgo:** nulo · **Prioridad:** media.
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q4. Quitar `AsRef<[u8; 16]>` de `MutationId` (a verificar)
 - **Dónde:** `id.rs:295-299`.
@@ -71,6 +73,7 @@
 - **Problema:** `Cargo.toml` del workspace define `[workspace.lints.rust] unsafe_code = "forbid"` y `crates/core/Cargo.toml` hereda con `[lints] workspace = true`, así que el atributo es redundante. `crates/storage/src/lib.rs:1` también lo tiene.
 - **Propuesta:** borrarlo de `core` y `storage` a la vez, para que quede consistente. También es válido mantenerlo como defensa en profundidad, por si alguien quita `[lints] workspace = true`. Decisión de estilo.
 - **Ahorro estimado:** ~2 líneas · **Riesgo:** nulo · **Prioridad:** baja.
+- **Estado:** ⏭️ no aplicada — es una decisión de estilo (el atributo también sirve de defensa en profundidad) y, para que quede consistente, habría que tocar `crates/storage`, fuera del crate de este paso.
 
 ## Lo que conviene dejar como está
 - **`is_invisible_or_bidi` (`id.rs:99-134`):** la lista de rangos es larga por necesidad, porque `char::is_control` solo cubre la categoría Cc. Comprimirla con una dependencia de propiedades Unicode sería un cambio de dependencias, no de redacción.

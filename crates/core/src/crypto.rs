@@ -11,16 +11,20 @@ pub enum CryptoError {
     KeyDerivation(String),
 }
 
+/// `Send + Sync`, except on `wasm32`, where WebCrypto futures are not `Send`.
 #[cfg(not(target_arch = "wasm32"))]
 pub trait CryptoConcurrencyBounds: Send + Sync {}
 #[cfg(not(target_arch = "wasm32"))]
 impl<T: Send + Sync> CryptoConcurrencyBounds for T {}
 
+/// `Send + Sync`, except on `wasm32`, where WebCrypto futures are not `Send`.
 #[cfg(target_arch = "wasm32")]
 pub trait CryptoConcurrencyBounds {}
 #[cfg(target_arch = "wasm32")]
 impl<T> CryptoConcurrencyBounds for T {}
 
+/// Encrypts and decrypts the values of `encrypted` columns. `aad` is authenticated together
+/// with the ciphertext but not encrypted.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait CryptoEngine: CryptoConcurrencyBounds {
@@ -38,6 +42,7 @@ pub trait CryptoEngine: CryptoConcurrencyBounds {
     ) -> Result<Vec<u8>, CryptoError>;
 }
 
+/// Returns the data unencrypted: only for tests or deployments without end-to-end encryption.
 #[derive(Debug, Clone, Default)]
 pub struct NoOpCryptoEngine;
 
