@@ -25,25 +25,16 @@ pub(crate) fn sync_dir(dir_path: &Path) -> std::io::Result<()> {
         };
         File::open(target)?.sync_all()?;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = dir_path;
-    }
     Ok(())
 }
 
 /// Creates `path` and any missing parent directories, syncing the parent of every directory
 /// it creates so that the new entries survive a power loss.
 pub(crate) fn create_dir_all_synced(path: &Path) -> std::io::Result<()> {
-    let mut missing = Vec::new();
-    let mut current = path;
-    while !current.as_os_str().is_empty() && !current.is_dir() {
-        missing.push(current);
-        match current.parent() {
-            Some(parent) => current = parent,
-            None => break,
-        }
-    }
+    let missing: Vec<&Path> = path
+        .ancestors()
+        .take_while(|dir| !dir.as_os_str().is_empty() && !dir.is_dir())
+        .collect();
     for dir in missing.into_iter().rev() {
         match fs::create_dir(dir) {
             Ok(()) => {}
@@ -67,8 +58,8 @@ pub(crate) fn tmp_path_for(path: &Path) -> PathBuf {
 ///
 /// Writes a temporary sibling file, syncs it, renames it over the destination and syncs the
 /// parent directory. A crash at any point leaves either the previous or the new content,
-/// never a partially written file. Callers are often async (the room actor saving its roster
-/// or `log_meta.json`, the admin API), so the blocking I/O runs through [`blocking_io`].
+/// never a partially written file. Callers are often async, so the blocking I/O runs through
+/// [`blocking_io`].
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     blocking_io(|| write_atomic_blocking(path, bytes))
 }

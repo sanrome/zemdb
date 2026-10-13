@@ -27,7 +27,8 @@ pub struct SchemaRegistry {
 }
 
 impl SchemaRegistry {
-    /// Opens or creates the schema registry at the given directory, loading any existing schema files.
+    /// Opens or creates the schema registry at the given directory, loading any existing
+    /// schema files.
     pub fn new(dir: impl Into<PathBuf>) -> Result<Self, ServerError> {
         let dir = dir.into();
         durable::create_dir_all_synced(&dir)?;
@@ -37,39 +38,43 @@ impl SchemaRegistry {
         // Scan directory for {schema_id}.json files. Temporary files left by an interrupted
         // write are discarded; the matching `.json` still holds the last complete version.
         for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("tmp") {
-                fs::remove_file(&path)?;
+            let path = entry?.path();
+            if !path.is_file() {
                 continue;
             }
-            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    // A file whose name is not a schema id was not written by the registry
-                    // (macOS `._*` metadata, manual backups such as `todo.old.json`): skip it.
-                    // A validly named file with corrupt content still fails the startup.
-                    let schema_id = match SchemaId::new(stem) {
-                        Ok(id) => id,
-                        Err(err) => {
-                            tracing::warn!(
-                                path = %path.display(),
-                                error = %err,
-                                "Ignoring schema file whose name is not a valid schema id"
-                            );
-                            continue;
-                        }
-                    };
-                    let content = fs::read_to_string(&path)?;
-                    let schema: Schema = serde_json::from_str(&content).map_err(|e| {
-                        ServerError::Serialization(format!(
-                            "Failed to parse schema JSON from {}: {}",
-                            path.display(),
-                            e
-                        ))
-                    })?;
-                    schemas.insert(schema_id, Arc::new(schema));
+            match path.extension().and_then(|s| s.to_str()) {
+                Some("tmp") => {
+                    fs::remove_file(&path)?;
+                    continue;
                 }
+                Some("json") => {}
+                _ => continue,
             }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            // A file whose name is not a schema id was not written by the registry (macOS
+            // `._*` metadata, manual backups such as `todo.old.json`): skip it. A validly named
+            // file with corrupt content still fails the startup.
+            let schema_id = match SchemaId::new(stem) {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "Ignoring schema file whose name is not a valid schema id"
+                    );
+                    continue;
+                }
+            };
+            let content = fs::read_to_string(&path)?;
+            let schema: Schema = serde_json::from_str(&content).map_err(|e| {
+                ServerError::Serialization(format!(
+                    "Failed to parse schema JSON from {}: {e}",
+                    path.display()
+                ))
+            })?;
+            schemas.insert(schema_id, Arc::new(schema));
         }
 
         Ok(Self {
@@ -129,7 +134,7 @@ impl SchemaRegistry {
         Ok(arc_schema)
     }
 
-    /// Retrieves an Arc reference to the schema if registered.
+    /// The current version of schema `id`, if it is registered.
     pub fn get_schema(&self, id: &SchemaId) -> Option<Arc<Schema>> {
         self.schemas.get(id).map(|r| Arc::clone(r.value()))
     }
@@ -143,28 +148,19 @@ impl SchemaRegistry {
     ) -> Result<Arc<Schema>, ServerError> {
         blocking_io(|| {
             let _write = self.lock_writes();
-            self.add_column_locked(id, table_name, column)
+            let existing = self
+                .get_schema(id)
+                .ok_or_else(|| ServerError::SchemaNotFound(id.to_string()))?;
+
+            let mut evolved_schema = (*existing).clone();
+            fail_point::hook("schema_add_column_after_read", &self.schema_path(id));
+            // Rejects an unknown table, a duplicate column name and a non-nullable column.
+            evolved_schema
+                .add_column(table_name, column)
+                .map_err(|e| ServerError::SchemaViolation(e.to_string()))?;
+
+            self.persist(id.clone(), evolved_schema)
         })
-    }
-
-    fn add_column_locked(
-        &self,
-        id: &SchemaId,
-        table_name: &str,
-        column: ColumnDef,
-    ) -> Result<Arc<Schema>, ServerError> {
-        let existing = self
-            .get_schema(id)
-            .ok_or_else(|| ServerError::SchemaNotFound(id.to_string()))?;
-
-        let mut evolved_schema = (*existing).clone();
-        fail_point::hook("schema_add_column_after_read", &self.schema_path(id));
-        // Rejects an unknown table, a duplicate column name and a non-nullable column.
-        evolved_schema
-            .add_column(table_name, column)
-            .map_err(|e| ServerError::SchemaViolation(e.to_string()))?;
-
-        self.persist(id.clone(), evolved_schema)
     }
 
     /// Lists all registered SchemaIds.

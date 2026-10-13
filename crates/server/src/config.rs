@@ -8,250 +8,131 @@ use std::str::FromStr;
 
 /// Server configuration with TOML deserialization and environment variable overrides.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServerConfig {
     /// Host address to bind to (e.g. "127.0.0.1" or "0.0.0.0").
-    #[serde(default = "default_host")]
     pub host: String,
 
     /// Port to listen on.
-    #[serde(default = "default_port")]
     pub port: u16,
 
     /// Base directory for server data (schemas, rooms, WALs).
-    #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
 
     /// Shared cluster secret for verifying client `auth_token`s.
-    #[serde(default = "default_auth_secret")]
     pub auth_secret: String,
 
     /// Administrative Bearer token for accessing control plane endpoints.
-    #[serde(default = "default_admin_secret")]
     pub admin_secret: String,
 
     /// Server default of the room lifecycle setting `ram_max_ops`: operations kept in RAM
     /// before the active segment is sealed.
-    #[serde(default = "default_ram_max_ops")]
     pub ram_max_ops: usize,
 
     /// Server default of the room lifecycle setting `ram_max_bytes`: encoded size of the
     /// operations kept in RAM.
-    #[serde(default = "default_ram_max_bytes")]
     pub ram_max_bytes: u64,
 
     /// Server default of the room lifecycle setting `segment_max_bytes`: size at which the
     /// active segment is sealed.
-    #[serde(default = "default_segment_max_bytes")]
     pub segment_max_bytes: u64,
 
     /// Server default: time-to-live of operations in RAM (seconds).
-    #[serde(default = "default_ram_ttl_secs")]
     pub ram_ttl_secs: u64,
 
     /// Server default: age after which a sealed segment is compressed (seconds).
-    #[serde(default = "default_warm_disk_ttl_secs")]
     pub warm_disk_ttl_secs: u64,
 
     /// Server default: age after which a compressed segment is pruned (seconds).
-    #[serde(default = "default_cold_disk_ttl_secs")]
     pub cold_disk_ttl_secs: u64,
 
     /// Server default: disk space of a room's log before its oldest segments are pruned (bytes).
-    #[serde(default = "default_max_room_disk_bytes")]
     pub max_room_disk_bytes: u64,
 
     /// Server default: inactivity timeout before an active client lease is marked
     /// Disconnected (seconds).
-    #[serde(default = "default_lease_timeout_secs")]
     pub lease_timeout_secs: u64,
 
     /// Server default: inactivity after which a Disconnected client becomes Dormant even
     /// though its cursor is still inside the retained log (seconds). Unset by default: a
     /// Disconnected client only becomes Dormant once its cursor falls behind the log.
-    #[serde(default)]
     pub dormant_after_secs: Option<u64>,
 
     /// Server default: inactivity after which a Dormant client is removed from the roster
     /// (seconds, default 30 days).
-    #[serde(default = "default_forget_dormant_after_secs")]
     pub forget_dormant_after_secs: u64,
 
     /// Maximum number of mutation IDs retained in the deduplication LRU cache per room.
-    #[serde(default = "default_dedup_lru_capacity")]
     pub dedup_lru_capacity: usize,
 
     /// TTL duration for staged snapshots in the relay before eviction (seconds, default 7 days).
-    #[serde(default = "default_snapshot_ttl_secs")]
     pub snapshot_ttl_secs: u64,
 
     /// Server default: how long a room keeps asking its clients for a snapshot without the
     /// request being renewed (seconds, default 7 days).
-    #[serde(default = "default_snapshot_demand_ttl_secs")]
     pub snapshot_demand_ttl_secs: u64,
 
     /// Server default: time without commands, SSE subscribers or snapshot uploads after which
     /// a room actor shuts down (seconds, default 10 minutes; 0 = never).
-    #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
 
     /// Largest snapshot the relay accepts, in bytes (default 512 MiB).
-    #[serde(default = "default_max_snapshot_bytes")]
     pub max_snapshot_bytes: u64,
 
     /// Time a connection has to deliver the headers of its next request: a client that does
     /// not complete them in time, or that keeps a connection open without a request in
     /// progress for longer, is disconnected (seconds, default 10).
-    #[serde(default = "default_header_read_timeout_secs")]
     pub header_read_timeout_secs: u64,
 
     /// Base time a request body has to arrive in full, counted from the end of its headers
     /// and extended by one second per `body_min_rate_bytes_per_sec` bytes received; a request
     /// whose body is still incomplete at the deadline fails with 408 (seconds, default 60).
     /// Responses, such as SSE streams, have no time limit.
-    #[serde(default = "default_body_read_timeout_secs")]
     pub body_read_timeout_secs: u64,
 
-    /// Minimum rate of a request body: each `body_min_rate_bytes_per_sec` bytes received
-    /// extend its deadline by one second (bytes per second, default 32 KiB/s). A body that
-    /// arrives at least this fast is never cut; one that trickles in slower is cut close to
-    /// `body_read_timeout_secs`.
-    #[serde(default = "default_body_min_rate_bytes_per_sec")]
+    /// Minimum body rate that extends the deadline (bytes per second, default 32 KiB/s): a body
+    /// that arrives at least this fast is never cut. See `body_read_timeout_secs`.
     pub body_min_rate_bytes_per_sec: u64,
 
     /// Most connections served at once (default 10,000). At the limit the server stops
     /// accepting connections until an open one closes; open connections are not affected.
     /// Each connection takes a file descriptor, so the process limit of open files
     /// (`ulimit -n`) must be above this value.
-    #[serde(default = "default_max_connections")]
     pub max_connections: usize,
 }
 
-fn default_host() -> String {
-    "127.0.0.1".to_string()
-}
-
-fn default_port() -> u16 {
-    8080
-}
-
-fn default_data_dir() -> PathBuf {
-    PathBuf::from("./data")
-}
-
-fn default_auth_secret() -> String {
-    "default_auth_secret_dev_32bytes!".to_string()
-}
-
-fn default_admin_secret() -> String {
-    "default_admin_secret_dev_32bytes!".to_string()
-}
-
-fn default_ram_max_ops() -> usize {
-    RoomLifecyclePolicy::default().ram_max_ops
-}
-
-fn default_ram_max_bytes() -> u64 {
-    RoomLifecyclePolicy::default().ram_max_bytes
-}
-
-fn default_segment_max_bytes() -> u64 {
-    RoomLifecyclePolicy::default().segment_max_bytes
-}
-
-fn default_ram_ttl_secs() -> u64 {
-    RoomLifecyclePolicy::default().ram_ttl.as_secs()
-}
-
-fn default_warm_disk_ttl_secs() -> u64 {
-    RoomLifecyclePolicy::default().warm_disk_ttl.as_secs()
-}
-
-fn default_cold_disk_ttl_secs() -> u64 {
-    RoomLifecyclePolicy::default().cold_disk_ttl.as_secs()
-}
-
-fn default_max_room_disk_bytes() -> u64 {
-    RoomLifecyclePolicy::default().max_room_disk_bytes
-}
-
-fn default_lease_timeout_secs() -> u64 {
-    RoomLifecyclePolicy::default().lease_timeout.as_secs()
-}
-
-fn default_idle_timeout_secs() -> u64 {
-    RoomLifecyclePolicy::default()
-        .idle_timeout
-        .map_or(0, |idle| idle.as_secs())
-}
-
-fn default_dedup_lru_capacity() -> usize {
-    10_000
-}
-
-/// Seven days, in seconds.
-const SEVEN_DAYS_SECS: u64 = 7 * 24 * 60 * 60;
-
-fn default_snapshot_ttl_secs() -> u64 {
-    SEVEN_DAYS_SECS
-}
-
-fn default_forget_dormant_after_secs() -> u64 {
-    RoomLifecyclePolicy::default()
-        .forget_dormant_after
-        .as_secs()
-}
-
-fn default_snapshot_demand_ttl_secs() -> u64 {
-    RoomLifecyclePolicy::default().snapshot_demand_ttl.as_secs()
-}
-
-fn default_max_snapshot_bytes() -> u64 {
-    512 * 1024 * 1024
-}
-
-fn default_header_read_timeout_secs() -> u64 {
-    10
-}
-
-fn default_body_read_timeout_secs() -> u64 {
-    60
-}
-
-fn default_body_min_rate_bytes_per_sec() -> u64 {
-    32 * 1024
-}
-
-fn default_max_connections() -> usize {
-    10_000
-}
+/// Built-in development secrets. They are public, so `validate_secrets` rejects them.
+const DEV_AUTH_SECRET: &str = "default_auth_secret_dev_32bytes!";
+const DEV_ADMIN_SECRET: &str = "default_admin_secret_dev_32bytes!";
 
 impl Default for ServerConfig {
     fn default() -> Self {
+        let policy = RoomLifecyclePolicy::default();
         Self {
-            host: default_host(),
-            port: default_port(),
-            data_dir: default_data_dir(),
-            auth_secret: default_auth_secret(),
-            admin_secret: default_admin_secret(),
-            ram_max_ops: default_ram_max_ops(),
-            ram_max_bytes: default_ram_max_bytes(),
-            segment_max_bytes: default_segment_max_bytes(),
-            ram_ttl_secs: default_ram_ttl_secs(),
-            warm_disk_ttl_secs: default_warm_disk_ttl_secs(),
-            cold_disk_ttl_secs: default_cold_disk_ttl_secs(),
-            max_room_disk_bytes: default_max_room_disk_bytes(),
-            lease_timeout_secs: default_lease_timeout_secs(),
+            host: "127.0.0.1".to_string(),
+            port: 8080,
+            data_dir: PathBuf::from("./data"),
+            auth_secret: DEV_AUTH_SECRET.to_string(),
+            admin_secret: DEV_ADMIN_SECRET.to_string(),
+            ram_max_ops: policy.ram_max_ops,
+            ram_max_bytes: policy.ram_max_bytes,
+            segment_max_bytes: policy.segment_max_bytes,
+            ram_ttl_secs: policy.ram_ttl.as_secs(),
+            warm_disk_ttl_secs: policy.warm_disk_ttl.as_secs(),
+            cold_disk_ttl_secs: policy.cold_disk_ttl.as_secs(),
+            max_room_disk_bytes: policy.max_room_disk_bytes,
+            lease_timeout_secs: policy.lease_timeout.as_secs(),
             dormant_after_secs: None,
-            forget_dormant_after_secs: default_forget_dormant_after_secs(),
-            dedup_lru_capacity: default_dedup_lru_capacity(),
-            snapshot_ttl_secs: default_snapshot_ttl_secs(),
-            snapshot_demand_ttl_secs: default_snapshot_demand_ttl_secs(),
-            idle_timeout_secs: default_idle_timeout_secs(),
-            max_snapshot_bytes: default_max_snapshot_bytes(),
-            header_read_timeout_secs: default_header_read_timeout_secs(),
-            body_read_timeout_secs: default_body_read_timeout_secs(),
-            body_min_rate_bytes_per_sec: default_body_min_rate_bytes_per_sec(),
-            max_connections: default_max_connections(),
+            forget_dormant_after_secs: policy.forget_dormant_after.as_secs(),
+            dedup_lru_capacity: 10_000,
+            snapshot_ttl_secs: 7 * 24 * 60 * 60,
+            snapshot_demand_ttl_secs: policy.snapshot_demand_ttl.as_secs(),
+            idle_timeout_secs: policy.idle_timeout.map_or(0, |idle| idle.as_secs()),
+            max_snapshot_bytes: 512 * 1024 * 1024,
+            header_read_timeout_secs: 10,
+            body_read_timeout_secs: 60,
+            body_min_rate_bytes_per_sec: 32 * 1024,
+            max_connections: 10_000,
         }
     }
 }
@@ -289,12 +170,12 @@ impl ServerConfig {
         check_secret(
             "auth_secret (ZEMDB_AUTH_SECRET)",
             &self.auth_secret,
-            &default_auth_secret(),
+            DEV_AUTH_SECRET,
         )?;
         check_secret(
             "admin_secret (ZEMDB_ADMIN_SECRET)",
             &self.admin_secret,
-            &default_admin_secret(),
+            DEV_ADMIN_SECRET,
         )?;
         if self.auth_secret == self.admin_secret {
             return Err(ServerError::Config(
@@ -311,13 +192,9 @@ impl ServerConfig {
         self.validate_limits()
     }
 
-    /// Checks that `max_snapshot_bytes` lies within
-    /// [`MIN_MAX_SNAPSHOT_BYTES`]..=[`MAX_MAX_SNAPSHOT_BYTES`], that the HTTP limits lie within
-    /// [`HEADER_READ_TIMEOUT_SECS_RANGE`], [`BODY_READ_TIMEOUT_SECS_RANGE`],
-    /// [`BODY_MIN_RATE_BYTES_PER_SEC_RANGE`] and [`MAX_CONNECTIONS_RANGE`], and that every
-    /// server default of the room lifecycle policy
-    /// lies within its range (the same ranges a room's overrides must meet). The error names
-    /// the setting and its environment variable.
+    /// Checks that `max_snapshot_bytes`, the HTTP limits and every server default of the room
+    /// lifecycle policy lie within their ranges (the constants of this module, and the ranges a
+    /// room's overrides must meet). The error names the setting and its environment variable.
     pub fn validate_limits(&self) -> Result<(), ServerError> {
         if !(MIN_MAX_SNAPSHOT_BYTES..=MAX_MAX_SNAPSHOT_BYTES).contains(&self.max_snapshot_bytes) {
             return Err(ServerError::Config(format!(
@@ -395,10 +272,11 @@ impl ServerConfig {
 
     /// Overrides configuration values from environment variables if present.
     ///
-    /// An empty variable counts as unset. A variable that is set but not valid Unicode, or
-    /// that does not parse as the setting's type, is an error naming the variable: the server must not start with a setting other
-    /// than the one the operator asked for. Ranges are checked afterwards by
-    /// [`validate`](Self::validate).
+    /// An empty variable counts as unset, as deployment templates often expand a missing
+    /// variable to an empty string. A variable that is set but not valid Unicode, or that does
+    /// not parse as the setting's type, is an error naming the variable: the server must not
+    /// start with a setting other than the one the operator asked for. Ranges are checked
+    /// afterwards by [`validate`](Self::validate).
     pub fn apply_env_overrides(&mut self) -> Result<(), ServerError> {
         self.apply_overrides_from(|name| match std::env::var(name) {
             Ok(value) => Ok(Some(value)),
@@ -410,8 +288,6 @@ impl ServerConfig {
     }
 
     /// Applies the overrides found by `var`, which returns the value of a variable, if set.
-    /// An empty value counts as unset, as deployment templates often expand a missing
-    /// variable to an empty string.
     fn apply_overrides_from(
         &mut self,
         var: impl Fn(&str) -> Result<Option<String>, ServerError>,
@@ -494,7 +370,8 @@ impl ServerConfig {
         Ok(())
     }
 
-    /// Load configuration with optional TOML file and automatic environment variable overrides.
+    /// Loads the TOML file (or the defaults), applies the environment overrides and validates
+    /// the result.
     pub fn load_with_env(file_path: Option<impl AsRef<Path>>) -> Result<Self, ServerError> {
         let mut config = match file_path {
             Some(path) => Self::from_file(path)?,

@@ -57,6 +57,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y tocó este alc
 - **Docs que listan llamadores y pueden quedar viejos:** `durable.rs:70-71` ("the room actor saving its roster or `log_meta.json`, the admin API"). Basta con "Callers are often async, so the blocking I/O runs through [`blocking_io`]." (~-1).
 - `config.rs:191` "/// Seven days, in seconds." sobre `SEVEN_DAYS_SECS` repite el nombre; desaparece con Q1.
 - `blocking.rs:3-7`: el primer párrafo del doc de módulo enumera cinco tipos de I/O; se puede resumir en dos líneas ("most of what an actor does is synchronous file I/O, and every commit ends in an `fsync`; run on a worker thread it stalls the other tasks of that worker"). El segundo párrafo (`:9-15`, `block_in_place` vs `spawn_blocking` y el pánico en current-thread) **hay que conservarlo** (~-3).
+- **Estado:** ✅ aplicada (paso 1) en `config.rs` (`load_with_env`, `validate_limits`, la nota de variables vacías, los docs de `body_*`, `SEVEN_DAYS_SECS`), `durable.rs:70-71`, `blocking.rs:3-7` y `schema_registry.rs:132`. Los demás docs que repiten la firma se dejan: el propio punto los marca como opcionales, y los de `error.rs` caen en lo que conviene dejar como está. La nota de variables vacías quedó, con su motivo, en el doc público de `apply_env_overrides`.
 
 **A conservar sin cambios:** `schema_registry.rs:15-21` (por qué un solo lock), `:37-38`, `:48-50` (qué archivos se saltean y por qué uno corrupto sí falla), `:87-89` (poison ignorado), `:98-101` (por qué no se reemplazan schemas), `:107`; `durable.rs:10-16` (Windows/NTFS), `:50`, `:66-69`; `dedup.rs:6-7` y `:18`; `error.rs:39`, `:56-86` (semántica de cada variante, contrato con el cliente); `config.rs:68-70`, `:101-103`, `:121-124` (`ulimit -n`), `:283-287` (por qué se rechazan los secretos de desarrollo), `:375-376`; `main.rs:56-57`, `:66-67`, `:106-107`; todo `fail_point.rs:1-12`.
 
@@ -104,6 +105,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y tocó este alc
   `check_secret(…, &self.auth_secret, DEV_AUTH_SECRET)` en `:289-298`. Los valores son exactamente los mismos, incluido `dormant_after_secs: None` (hoy `#[serde(default)]` = `None` en `:71` y `None` en `:244`). En `tests/config.rs:18,21` cambia `&default_admin_secret()` por `DEV_ADMIN_SECRET` (y lo mismo con auth). Grep: ninguna función `default_*` se usa fuera de `config.rs` y sus tests (`tests/auth_tests.rs:36` usa el literal, no la función).
 - **Ahorro estimado:** ~110–115 líneas · **Riesgo:** bajo (es el idioma estándar de serde; el TOML vacío sigue dando `ServerConfig::default()`, lo cubre `tests/config.rs:323`) · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ✅ confirmada — los 24 campos ya tienen default hoy (23 `default = "…"` + `dormant_after_secs` con `#[serde(default)]`), no hay `deny_unknown_fields`, así que ningún TOML pasa de rechazado a aceptado; `impl Default` llama a las mismas funciones, valores idénticos. Matiz: los usos en tests están en `src/tests/config.rs:18,21` (y `:323`), no en `crates/server/tests/`.
+- **Estado:** ✅ aplicada (paso 1). `src/tests/config.rs:19,22` usan ahora `DEV_ADMIN_SECRET`/`DEV_AUTH_SECRET`.
 
 ### Q2. `config.rs`: un helper `set` para los 24 overrides de entorno
 
@@ -128,6 +130,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y tocó este alc
   Se mantiene el orden de lectura y el primer `?` que falla sigue cortando en la misma variable (importa para qué error se informa). Algunas líneas largas (`ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC`) las va a partir rustfmt; ya está contemplado en el ahorro.
 - **Ahorro estimado:** ~35–45 líneas · **Riesgo:** bajo · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ✅ confirmada — `parse_var` es genérico en `T: FromStr`; con `.map(Some)` infiere `u64` para `dormant_after_secs`; se conserva el orden y el corte en el primer `?`. Compila (el `&mut self.campo` no choca con el closure `var`).
+- **Estado:** ⏭️ no aplicada — compila, pero sin `rustfmt.toml` rige `fn_call_width = 60` y rustfmt parte en 4 líneas 18 de las 24 llamadas a `set` (`set(`, el campo, el valor y `);` en líneas separadas). La función quedaba con 87 líneas más las 6 del helper, frente a las 81 actuales: el cambio sumaba líneas en lugar de ahorrarlas.
 
 ### Q3. `durable.rs`: bloque `cfg(not(unix))` muerto y `Path::ancestors`
 
@@ -143,6 +146,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y tocó este alc
   ```
   Equivalente: para `a/b` da `a/b`, `a` y se corta en `""`; para una ruta absoluta se corta en el primer ancestro que existe y, si llega a `/`, `ancestors` termina igual que el `None => break` de hoy. Opcional: las dos llamadas `sync_dir(x.parent().unwrap_or_else(|| Path::new("")))` (`:54`, `:85`) pueden ir a un `fn sync_parent(path: &Path)`; ahorra poco pero nombra la intención.
 - **Ahorro estimado:** ~10 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 1). El `sync_parent` opcional es un helper compartido por dos funciones y queda para el paso 2.
 
 ### Q4. `schema_registry.rs`: aplanar el escaneo de `SchemaRegistry::new`
 
@@ -176,6 +180,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y tocó este alc
   ```
   Mismos efectos en el mismo orden (borrar `.tmp`, saltear nombres inválidos con `warn!`, fallar con `Serialization` si el JSON está corrupto) y el mismo texto de error.
 - **Ahorro estimado:** ~5–7 líneas, y dos niveles menos de indentación · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q5. `schema_registry.rs`: inlinear `add_column_locked`
 
@@ -183,6 +188,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y tocó este alc
 - **Problema:** `add_column_locked` tiene un único llamador y existe solo para que el closure de `blocking_io` sea corto. `register_schema` (`:108-114`) ya pone su lógica dentro del closure, así que las dos funciones públicas quedan con estilos distintos.
 - **Propuesta:** mover el cuerpo dentro del closure: `let _write = self.lock_writes();` y después `get_schema` → `clone` → `fail_point::hook` → `add_column` → `persist`, en el mismo orden. El `hook` sigue después de leer y con el lock tomado, que es lo que necesita el test `add_column_waits_for_a_concurrent_add_column_on_the_same_schema`.
 - **Ahorro estimado:** ~7 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q6. `config.rs`: recortar docs (ver "Comentarios")
 
@@ -190,6 +196,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y tocó este alc
 - **Problema:** docs largos, duplicados o incompletos (detalle en "Comentarios").
 - **Propuesta:** las cuatro reescrituras de la sección de comentarios; la de `:497` corrige un doc incompleto.
 - **Ahorro estimado:** ~8 líneas · **Riesgo:** nulo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q7. `config.rs`: `max_snapshot_bytes` con `check_range` (**a verificar**, cambia el texto del error)
 
@@ -198,6 +205,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y tocó este alc
 - **Propuesta:** `pub const MAX_SNAPSHOT_BYTES_RANGE: RangeInclusive<u64> = 1 << 20..=64 << 30;` y `check_range("max_snapshot_bytes (ZEMDB_MAX_SNAPSHOT_BYTES)", self.max_snapshot_bytes, MAX_SNAPSHOT_BYTES_RANGE)?`. **Cambia el mensaje**: se pierden "(1 MiB)" y "(64 GiB)". El único test (`tests/config.rs:78`) busca solo `max_snapshot_bytes` y grep no encuentra "must be between" fuera de `config.rs`, pero hay que decidir si el mensaje cuenta como contrato. Además `MIN_MAX_SNAPSHOT_BYTES`/`MAX_MAX_SNAPSHOT_BYTES` son `pub` en un módulo `pub`: reemplazarlas cambia la API (no tienen usos fuera de `config.rs`).
 - **Ahorro estimado:** ~5 líneas · **Riesgo:** medio (mensaje y API) · **Prioridad:** baja
 - **Verificación (2.ª pasada):** ✅ confirmada — `1 << 20..=64 << 30` tiene la precedencia correcta y entra en `u64`; el mensaje pierde "(1 MiB)"/"(64 GiB)" tal como se advierte; ningún test compara esos textos; las constantes solo se usan en `config.rs`.
+- **Estado:** ⏭️ no aplicada — cambia el texto del error (se pierden "(1 MiB)" y "(64 GiB)") y reemplaza constantes públicas; el paso exige mensajes idénticos y no tocar la API pública.
 
 ### Q8. `main.rs`: temporales innecesarios y log duplicado
 
@@ -205,6 +213,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y tocó este alc
 - **Problema:** `schemas_dir`/`snapshots_dir` se usan una sola vez, y el mensaje de arranque sale dos veces (log y stdout).
 - **Propuesta:** `SchemaRegistry::new(config.data_dir.join("schemas"))?` y `SnapshotRelay::new(config.data_dir.join("snapshots"), …)` sin `schemas_dir`/`snapshots_dir` (~-2). Usar `{addr}` en lugar de `"{}", addr` en `:47-48` y `:51`. El `println!` de `:51` repite el `info!` de `:43-49`; grep no encontró ningún script ni test que lea esa línea de stdout, pero quitarlo cambia la salida → **a verificar** (o dejar un comentario que explique para qué está).
 - **Ahorro estimado:** ~2–4 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1) en los temporales y los argumentos en línea. El `println!` se deja: quitarlo cambia la salida del proceso.
 
 ### Q9. Visibilidad `pub` sin usos externos (**a verificar**, API pública)
 

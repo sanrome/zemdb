@@ -16,10 +16,10 @@ const STRONG_ADMIN: &str = "3b6e9a2d5c8f1e4a7d0b3c6f9e2a5d8b";
 #[test]
 fn built_in_development_secrets_are_rejected() {
     assert!(ServerConfig::default().validate_secrets().is_err());
-    assert!(config_with(STRONG_AUTH, &default_admin_secret())
+    assert!(config_with(STRONG_AUTH, DEV_ADMIN_SECRET)
         .validate_secrets()
         .is_err());
-    assert!(config_with(&default_auth_secret(), STRONG_ADMIN)
+    assert!(config_with(DEV_AUTH_SECRET, STRONG_ADMIN)
         .validate_secrets()
         .is_err());
 }
