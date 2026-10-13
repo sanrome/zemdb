@@ -110,6 +110,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y cambió el mó
   Si se prefiere no tocar la API pública, conservar `read_range_with_mutations` y aplicar solo el helper (ahorro ~8).
 - **Ahorro estimado:** ~25 líneas · **Riesgo:** bajo. Es API `pub` sin usos en el workspace, así que **queda a verificar** si hay consumidores externos del crate. · **Prioridad:** alta.
 - **Verificación (2.ª pasada):** ✅ confirmada — `read_range_with_mutations` solo la llaman los `read_range` (grep en `crates/`), `read_range` solo los tests citados, y ningún otro crate depende de `zemdb-server`; `read_cold_file`/`read_segment_file` devuelven `RecoveredLogData`, así que `.map(|(ops, _)| ops)` compila. Conservar en el doc "un archivo inexistente no devuelve nada".
+- **Estado:** ⏭️ no aplicada — ya la resolvió el Lote 8: `read_range` y `read_range_with_mutations` no existen en `warm_disk.rs` ni en `cold_disk.rs`, y `log` es privado al crate, así que el compilador avisa de cualquier ítem sin uso.
 
 ### Q2. Llevar `parse_segment_filename` junto a `segment_path` y simplificarla
 - **Dónde:** `warm_disk.rs:334-348`. Se usa en `segment_index.rs:93`, `cold_disk.rs:65-68` y `:142-146`, y en `warm_disk.rs:227-231`.
