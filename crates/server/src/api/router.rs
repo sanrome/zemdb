@@ -2,7 +2,7 @@ use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{StatusCode, Uri};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{get, post};
 use axum::Router;
 use std::sync::Arc;
 use std::time::Duration;
@@ -65,7 +65,6 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Constructs a new AppState instance.
     pub fn new(
         config: Arc<ServerConfig>,
         schema_registry: Arc<SchemaRegistry>,
@@ -92,9 +91,8 @@ pub const MAX_REGISTER_BODY_SIZE: usize = 64 * 1024;
 /// Assembles the unified Axum router for Control Plane, Data Plane, SSE, and Snapshot Relay.
 ///
 /// Request bodies are limited to `MAX_FRAME_SIZE` bytes ([`MAX_REGISTER_BODY_SIZE`] for
-/// registration) and must arrive in full within the
-/// configured `body_read_timeout_secs`, extended by one second per
-/// `body_min_rate_bytes_per_sec` bytes received (otherwise 408).
+/// registration) and must arrive in full within the configured `body_read_timeout_secs`,
+/// extended by one second per `body_min_rate_bytes_per_sec` bytes received (otherwise 408).
 pub fn build_router(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/schemas", post(control_plane::create_schema))
@@ -104,8 +102,10 @@ pub fn build_router(state: AppState) -> Router {
             post(control_plane::add_column),
         )
         .route("/rooms", post(control_plane::create_room))
-        .route("/rooms/:room_id", get(control_plane::get_room))
-        .route("/rooms/:room_id", delete(control_plane::delete_room));
+        .route(
+            "/rooms/:room_id",
+            get(control_plane::get_room).delete(control_plane::delete_room),
+        );
 
     let data_routes = Router::new()
         .route(

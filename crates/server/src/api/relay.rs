@@ -8,16 +8,15 @@ use axum::response::Response;
 use zemdb_core::id::{RoomId, SequenceNumber};
 use zemdb_core::protocol::messages::{ClientMessage, ServerMessage};
 
-use crate::api::data_plane::{binary_error, binary_response};
+use crate::api::data_plane::{binary_error, binary_response, unexpected_message};
 use crate::api::extract::{ensure_payload_identity, BinaryBody, BinaryMessage, RelayAuth};
 use crate::api::router::AppState;
 use crate::error::ServerError;
 use crate::relay::{LogBounds, SnapshotChunkUpload};
 
-/// `POST /rooms/:room_id/snapshot/upload`: Staging endpoint where an active donor client
-/// or automated snapshot worker uploads a room snapshot. The body is the raw snapshot (not a
-/// protocol frame), with its sequence in the `x-snapshot-head-seq` header; success is answered
-/// with `ServerMessage::SnapshotStaged`.
+/// `POST /rooms/:room_id/snapshot/upload`: uploads a room snapshot in one request. The body is
+/// the raw snapshot (not a protocol frame), with its sequence in the `x-snapshot-head-seq`
+/// header; success is answered with `ServerMessage::SnapshotStaged`.
 pub async fn upload_snapshot(
     State(state): State<AppState>,
     RelayAuth { room_id, .. }: RelayAuth,
@@ -25,20 +24,14 @@ pub async fn upload_snapshot(
     BinaryBody(body): BinaryBody,
 ) -> Response {
     let head_seq = match parse_snapshot_head_seq(&headers) {
-        Ok(seq) => SequenceNumber::new(seq),
+        Ok(seq) => seq,
         Err(err) => return binary_error(None, Some(room_id), err),
     };
-    let task_state = state.clone();
     let task_room = room_id.clone();
     let staged = run_to_completion(async move {
-        task_state
+        state
             .snapshot_relay
-            .stage_snapshot(
-                &task_room,
-                head_seq,
-                body,
-                log_bounds(&task_state, &task_room),
-            )
+            .stage_snapshot(&task_room, head_seq, body, log_bounds(&state, &task_room))
             .await
     })
     .await;
@@ -56,7 +49,7 @@ pub async fn upload_snapshot(
 }
 
 /// Reads the snapshot sequence from the `x-snapshot-head-seq` header: a positive integer.
-fn parse_snapshot_head_seq(headers: &HeaderMap) -> Result<u64, ServerError> {
+fn parse_snapshot_head_seq(headers: &HeaderMap) -> Result<SequenceNumber, ServerError> {
     let raw = headers
         .get("x-snapshot-head-seq")
         .and_then(|v| v.to_str().ok())
@@ -69,7 +62,7 @@ fn parse_snapshot_head_seq(headers: &HeaderMap) -> Result<u64, ServerError> {
             "x-snapshot-head-seq must be greater than 0".to_string(),
         ));
     }
-    Ok(seq)
+    Ok(SequenceNumber::new(seq))
 }
 
 /// `POST /rooms/:room_id/snapshot/chunk`: Handles `ClientMessage::RequestSnapshotChunk`
@@ -87,11 +80,7 @@ pub async fn request_chunk(
         snapshot_hash,
     } = msg
     else {
-        return binary_error(
-            None,
-            Some(room_id),
-            ServerError::BadRequest("Expected RequestSnapshotChunk message".to_string()),
-        );
+        return unexpected_message(Some(room_id), "RequestSnapshotChunk");
     };
 
     if let Err(err) = ensure_payload_identity(&room_id, None, &msg_room_id, None) {
@@ -114,7 +103,8 @@ pub async fn request_chunk(
     }
 }
 
-/// `POST /rooms/:room_id/snapshot/upload-chunk`: Handles multipart snapshot upload chunk streaming.
+/// `POST /rooms/:room_id/snapshot/upload-chunk`: one chunk of a snapshot uploaded in several
+/// requests (`ClientMessage::UploadSnapshotChunk`).
 pub async fn upload_chunk(
     State(state): State<AppState>,
     RelayAuth { room_id, uploader }: RelayAuth,
@@ -131,11 +121,7 @@ pub async fn upload_chunk(
         data,
     } = msg
     else {
-        return binary_error(
-            None,
-            Some(room_id),
-            ServerError::BadRequest("Expected UploadSnapshotChunk message".to_string()),
-        );
+        return unexpected_message(Some(room_id), "UploadSnapshotChunk");
     };
 
     if let Err(err) = ensure_payload_identity(&room_id, None, &msg_room_id, None) {
@@ -152,12 +138,11 @@ pub async fn upload_chunk(
         snapshot_hash,
         data,
     };
-    let task_state = state.clone();
     let staged = run_to_completion(async move {
         let room_id = chunk_upload.room_id.clone();
-        task_state
+        state
             .snapshot_relay
-            .stage_chunk(chunk_upload, log_bounds(&task_state, &room_id))
+            .stage_chunk(chunk_upload, log_bounds(&state, &room_id))
             .await
     })
     .await;

@@ -45,6 +45,7 @@
 - **`extract.rs:265-267`**: tres líneas para justificar `#[allow(clippy::result_large_err)]`. Basta una: `// Same rejection type as every extractor here; runs once per request.` Ahorro 2 líneas.
 - **`sse.rs:16-26`**: el doc de `room_events` es un bloque de 11 líneas sin separación de párrafos que mezcla autenticación, errores y la lista de eventos. Conviene un `///` en blanco entre "autenticación/errores" y "eventos emitidos" (suma 1 línea, mejora la lectura). La lista de eventos es contrato con los clientes: conservar.
 - **Falta `//!` de módulo** en `data_plane.rs`, `auth.rs`, `control_plane.rs`, `router.rs` y `sse.rs` (sí lo tienen `serve.rs`, `extract.rs`, `relay.rs`, `body_timeout.rs`). Opcional; sumaría 1–2 líneas por archivo.
+- **Estado:** ✅ aplicada (paso 1), salvo los `//!` de módulo: son opcionales, suman líneas y no corrigen nada, así que no se agregaron.
 
 **Qué conservar (ejemplos):** `serve.rs:39-62` (orden de apagado, garantía de durabilidad, límites por conexión), `serve.rs:201-209` y `227-240` (por qué frames pequeños y la semántica de "idle"), `serve.rs:321-323` (`notify_one` con un único waiter), `body_timeout.rs:1-10` y `93-95` (algoritmo tipo `mod_reqtimeout` y por qué el timer se mueve como mucho una vez por espera), `router.rs:85-89` (por qué `register` tiene su propio límite de body), `auth.rs:72-73` y `124-127` (prefijo de longitud y expiry canónico: son razonamientos de seguridad), `control_plane.rs:80-82` y `95-96` (por qué la recarga de schema corre en su propia tarea), `relay.rs:179-180` (por qué `run_to_completion`), `extract.rs:66-73` (por qué no se acepta el token en la URL).
 
@@ -124,6 +125,7 @@
 - **Problema:** `binary_error(None, Some(room_id), ServerError::BadRequest("Expected RequestSnapshotChunk message".to_string()))` es exactamente `unexpected_message(Some(room_id), "RequestSnapshotChunk")` (mismo formato `"Expected {expected} message"`, mismo status, mismos `None`). Además, en `upload_snapshot` y `upload_chunk` el `State(state)` no se usa después de crear la tarea, así que `let task_state = state.clone();` sobra: basta mover `state` al `async move`.
 - **Propuesta:** `else { return unexpected_message(Some(room_id), "RequestSnapshotChunk"); };` (idem `UploadSnapshotChunk`), y usar `state` directamente en las dos tareas.
 - **Ahorro estimado:** ~10 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q5. `sse.rs`: un solo `Some((Ok(event), rx))` en el `unfold`
 - **Dónde:** `sse.rs:37-66`.
@@ -143,6 +145,7 @@
   ```
   (`return None` dentro del bloque `async move` sale del bloque, igual que hoy.) De paso, nombrar el `15` de `sse.rs:72` como `const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);` (suma 1–2 líneas; constante mágica).
 - **Ahorro estimado:** ~10–12 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q6. `is_body_read_timeout` con `iter::successors`
 - **Dónde:** `body_timeout.rs:79-88`.
@@ -154,6 +157,7 @@
   ```
   Mismo recorrido de la cadena de `source()`, mismo resultado.
 - **Ahorro estimado:** ~6 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 1). El closure tiene que desestructurar la referencia (`|&err| err.source()`): con `|err|` el préstamo de `source()` queda atado al del closure y no compila.
 
 ### Q7. `auth.rs`: helper para la hora actual y comprobación de sala compartida
 - **Dónde:** `auth.rs:96-99` y `173-176`; `auth.rs:212-217` y `extract.rs:432-437`.
@@ -166,6 +170,7 @@
 - **Problema:** `format!("... within {:?}", grace)` y `format!("... expected {}, got {}", room_id, verified.room_id)` ocupan 4–6 líneas por rustfmt.
 - **Propuesta:** `format!("Graceful shutdown did not finish within {grace:?}")` entra en una línea; `format!("Token room mismatch: expected {room_id}, got {}", verified.room_id)` ahorra 1–2 líneas por sitio. Mensajes idénticos.
 - **Ahorro estimado:** ~5–6 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q9. Menores
 - `router.rs:107-108`: `.route("/rooms/:room_id", get(control_plane::get_room).delete(control_plane::delete_room))` en vez de dos `.route` al mismo path (axum 0.7 los fusiona igual). ~1 línea. **Riesgo:** bajo.
@@ -173,6 +178,7 @@
 - `relay.rs:27-30`: `parse_snapshot_head_seq` podría devolver ya `SequenceNumber` y el handler usar `let-else`/`map`, ~1 línea. Baja.
 - `extract.rs:441`: `unauthorized(room_id, message: String)` desaparece con Q2.
 - **Ahorro estimado conjunto:** ~3–4 líneas · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1) en la ruta `/rooms/:room_id` y en `parse_snapshot_head_seq`. Hacer privado `MAX_CONCURRENT_STREAMS` es un cambio de API pública (paso 4), y `unauthorized` desaparece con Q2 (paso 2).
 
 ## Lo que conviene dejar como está
 

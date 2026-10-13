@@ -13,17 +13,18 @@ use crate::api::extract::EventStreamAuth;
 use crate::api::router::AppState;
 use crate::error::ServerError;
 
-/// `GET /rooms/:room_id/events`: Signal-only Server-Sent Events (SSE) broadcast channel.
+/// `GET /rooms/:room_id/events`: the room's signal-only Server-Sent Events (SSE) stream.
 /// Authenticated via `EventStreamAuth` (Bearer token or `?token=` query parameter, issued for
 /// the path room). Every error, before or after authentication (a room that does not exist,
 /// an actor that stopped or did not answer in time), is a binary error frame, as in the rest of
 /// the Data Plane.
+///
 /// Emits lightweight signals without transmitting row payloads: `head_advanced` (new head
 /// sequence), `schema_reloaded` (schema id), `snapshot_wanted` (a client was designated to
 /// upload a snapshot; empty data, the designee learns it is the one from a heartbeat) and
 /// `snapshot_available` (sequence of a new usable snapshot). The replies to heartbeats, syncs
-/// and commits remain the source of truth; these events only let foreground clients react sooner.
-/// The stream ends when the room actor stops or the server begins shutting down.
+/// and commits remain the source of truth; these events only let foreground clients react
+/// sooner. The stream ends when the room actor stops or the server begins shutting down.
 pub async fn room_events(
     State(state): State<AppState>,
     EventStreamAuth { room_id, .. }: EventStreamAuth,
@@ -35,43 +36,33 @@ pub async fn room_events(
 
     let shutdown = state.shutdown.clone();
     let stream = futures::stream::unfold(receiver, |mut rx| async move {
-        match rx.recv().await {
-            Ok(RoomEvent::HeadAdvanced(seq)) => {
-                let event = Event::default()
-                    .event("head_advanced")
-                    .data(seq.to_string());
-                Some((Ok::<_, Infallible>(event), rx))
-            }
+        let event = Event::default();
+        let event = match rx.recv().await {
+            Ok(RoomEvent::HeadAdvanced(seq)) => event.event("head_advanced").data(seq.to_string()),
             Ok(RoomEvent::SchemaReloaded(schema_id)) => {
-                let event = Event::default().event("schema_reloaded").data(&schema_id);
-                Some((Ok(event), rx))
+                event.event("schema_reloaded").data(&schema_id)
             }
-            Ok(RoomEvent::SnapshotWanted) => {
-                // An empty data line: browsers drop events without one.
-                let event = Event::default().event("snapshot_wanted").data("");
-                Some((Ok(event), rx))
-            }
+            // An empty data line: browsers drop events without one.
+            Ok(RoomEvent::SnapshotWanted) => event.event("snapshot_wanted").data(""),
             Ok(RoomEvent::SnapshotAvailable(seq)) => {
-                let event = Event::default()
-                    .event("snapshot_available")
-                    .data(seq.to_string());
-                Some((Ok(event), rx))
+                event.event("snapshot_available").data(seq.to_string())
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => {
-                let event = Event::default().event("lagged").data("true");
-                Some((Ok(event), rx))
-            }
-            Err(broadcast::error::RecvError::Closed) => None,
-        }
+            Err(broadcast::error::RecvError::Lagged(_)) => event.event("lagged").data("true"),
+            Err(broadcast::error::RecvError::Closed) => return None,
+        };
+        Some((Ok::<_, Infallible>(event), rx))
     })
     // End the stream when the server shuts down; otherwise the graceful shutdown would wait
     // for this connection forever.
     .take_until(async move { shutdown.wait().await });
 
     Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .keep_alive(KeepAlive::new().interval(KEEP_ALIVE_INTERVAL))
         .into_response()
 }
+
+/// Interval of the SSE keep-alive comments, which keep idle proxies from closing the stream.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// How many times a subscription refused with `Unavailable` is attempted.
 const SUBSCRIBE_ATTEMPTS: usize = 3;

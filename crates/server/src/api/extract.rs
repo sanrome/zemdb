@@ -189,10 +189,9 @@ where
 /// The body is read through axum's `Bytes` extractor, so the router's body size limit applies.
 /// Rejections are binary frames: a body that cannot be read is `BadRequest` with axum's status
 /// (413 when too large), or `RequestTimeout` (408) when it does not arrive in time; a frame of
-/// another protocol
-/// version is `ProtocolVersionMismatch` (400); any other decode failure, including an invalid
-/// identifier inside the payload or too many values, is `BadRequest` (400). The frame carries
-/// the path room id when it is valid.
+/// another protocol version is `ProtocolVersionMismatch` (400); any other decode failure,
+/// including an invalid identifier inside the payload or too many values, is `BadRequest`
+/// (400). The frame carries the path room id when it is valid.
 #[derive(Debug, Clone)]
 pub struct BinaryMessage(pub ClientMessage);
 
@@ -262,9 +261,7 @@ where
 
 /// Reads the body of a binary request within the router's body size limit, along with the
 /// path room id when it is valid (for the error frames).
-// The rejection is a `Response` (128 bytes), as for every extractor here. This runs once per
-// request, so copying it costs nothing next to reading the body, and boxing it would only add
-// an unbox at each caller.
+// Same rejection type as every extractor here; runs once per request.
 #[allow(clippy::result_large_err)]
 async fn read_frame<S>(mut req: Request, state: &S) -> Result<(Option<RoomId>, Bytes), Response>
 where
@@ -431,8 +428,8 @@ fn verify_token_for_room(
     let verified = verify_client_token(token, &state.config.auth_secret)?;
     if &verified.room_id != room_id {
         return Err(ServerError::Forbidden(format!(
-            "Token room mismatch: expected {}, got {}",
-            room_id, verified.room_id
+            "Token room mismatch: expected {room_id}, got {}",
+            verified.room_id
         )));
     }
     Ok(verified.client_id)

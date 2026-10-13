@@ -49,7 +49,7 @@ pub struct RoomDetails {
     pub lifecycle_overrides: RoomLifecycleOverrides,
 }
 
-/// `POST /admin/schemas`: Declares and registers a new schema template.
+/// `POST /admin/schemas`: registers a new schema.
 pub async fn create_schema(
     _auth: AdminAuth,
     State(state): State<AppState>,
@@ -74,8 +74,8 @@ pub async fn get_schema(
     Ok(Json((*schema).clone()))
 }
 
-/// `POST /admin/schemas/:schema_id/columns`: Evolves a schema by appending a nullable column,
-/// automatically notifying all running room actors to reload the new schema in memory.
+/// `POST /admin/schemas/:schema_id/columns`: appends a nullable column to a schema and reloads
+/// it in every running room that uses it.
 ///
 /// The reload runs in its own task: once the column is durable, every running room must get
 /// the new schema even if this request is dropped while the rooms are being reloaded. The
@@ -101,7 +101,7 @@ pub async fn add_column(
     Ok(Json((*updated).clone()))
 }
 
-/// `POST /admin/rooms`: Explicitly provisions an isolated room.
+/// `POST /admin/rooms`: creates a room.
 pub async fn create_room(
     _auth: AdminAuth,
     State(state): State<AppState>,

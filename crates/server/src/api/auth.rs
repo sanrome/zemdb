@@ -10,7 +10,8 @@ use zemdb_core::id::{ClientId, RoomId};
 use crate::api::router::AppState;
 use crate::error::ServerError;
 
-/// Axum extractor that validates administrative Bearer token authentication.
+/// Extractor that requires the admin secret as `Authorization: Bearer <secret>` (the prefix is
+/// mandatory here, unlike for client tokens). A rejection is a JSON 401.
 pub struct AdminAuth;
 
 #[axum::async_trait]
@@ -189,8 +190,8 @@ pub fn verify_client_token(
     })
 }
 
-/// Cryptographically validates an incoming client `auth_token` and strictly binds it
-/// to an expected client_id and room_id.
+/// Validates `auth_token` as [`verify_client_token`] does, and checks that it was issued for
+/// `client_id` and `room_id`.
 ///
 /// An invalid or expired token is `Unauthorized`; a valid token issued for another client or
 /// room is `Forbidden`.
@@ -204,15 +205,15 @@ pub fn verify_client_token_bound(
 
     if &verified.client_id != client_id {
         return Err(ServerError::Forbidden(format!(
-            "Token client mismatch: expected {}, got {}",
-            client_id, verified.client_id
+            "Token client mismatch: expected {client_id}, got {}",
+            verified.client_id
         )));
     }
 
     if &verified.room_id != room_id {
         return Err(ServerError::Forbidden(format!(
-            "Token room mismatch: expected {}, got {}",
-            room_id, verified.room_id
+            "Token room mismatch: expected {room_id}, got {}",
+            verified.room_id
         )));
     }
 

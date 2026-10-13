@@ -93,10 +93,7 @@ where
         room_manager.shutdown_all().await;
     };
     tokio::time::timeout(grace, drain).await.map_err(|_| {
-        ServerError::Internal(format!(
-            "Graceful shutdown did not finish within {:?}",
-            grace
-        ))
+        ServerError::Internal(format!("Graceful shutdown did not finish within {grace:?}"))
     })
 }
 

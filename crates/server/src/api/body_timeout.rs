@@ -77,14 +77,7 @@ pub(crate) fn limit_body_read_time(request: Request, limit: BodyReadLimit) -> Re
 /// Whether `err`, or any error in its source chain, is a [`BodyReadTimeout`]. The body
 /// extractors wrap the errors of the body in their own rejections.
 pub(crate) fn is_body_read_timeout(err: &(dyn Error + 'static)) -> bool {
-    let mut current = Some(err);
-    while let Some(err) = current {
-        if err.is::<BodyReadTimeout>() {
-            return true;
-        }
-        current = err.source();
-    }
-    false
+    std::iter::successors(Some(err), |&err| err.source()).any(|err| err.is::<BodyReadTimeout>())
 }
 
 /// Request body that fails with [`BodyReadTimeout`] when it is still incomplete at its

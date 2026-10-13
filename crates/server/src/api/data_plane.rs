@@ -71,8 +71,7 @@ pub(crate) fn unexpected_message(room_id: Option<RoomId>, expected: &str) -> Res
 
 /// Sends a command to the room actor and waits for its reply, returning the actor's own
 /// result. The exchange itself can fail with `RoomNotFound`, `Unavailable`, `Internal` or
-/// `Timeout` (see
-/// [`RoomManager::ask`](crate::actor::manager::RoomManager::ask)).
+/// `Timeout` (see [`RoomManager::ask`](crate::actor::manager::RoomManager::ask)).
 async fn ask_room<R>(
     state: &AppState,
     room_id: &RoomId,
@@ -81,7 +80,8 @@ async fn ask_room<R>(
     state.room_manager.ask(room_id, command).await?
 }
 
-/// `POST /rooms/:room_id/register`: Handshake endpoint delivering current head_seq and schema in 1 RTT.
+/// `POST /rooms/:room_id/register`: registers the client and returns the room's log range and
+/// schema.
 ///
 /// The client token travels inside the message, so it is verified here, bound to the client
 /// and room the message names. Until then the request is unauthenticated, so
@@ -131,7 +131,8 @@ pub async fn register(
     }
 }
 
-/// `POST /rooms/:room_id/commit`: Atomic commit with 1-RTT catchup deltas and monotonic sequencing.
+/// `POST /rooms/:room_id/commit`: sequences one mutation and returns its sequence with the
+/// operations after the client's cursor (catch-up).
 pub async fn commit(
     State(state): State<AppState>,
     auth: AuthenticatedRoom,
@@ -184,7 +185,7 @@ pub async fn commit(
     }
 }
 
-/// `POST /rooms/:room_id/sync`: Paginated batch synchronization with flow control.
+/// `POST /rooms/:room_id/sync`: the next batch of operations after the client's cursor.
 pub async fn sync(
     State(state): State<AppState>,
     auth: AuthenticatedRoom,
@@ -234,7 +235,7 @@ pub async fn sync(
     }
 }
 
-/// `POST /rooms/:room_id/ack`: Explicit client persistence acknowledgment triggering proactive log pruning.
+/// `POST /rooms/:room_id/ack`: records how far the client has persisted.
 pub async fn ack(
     State(state): State<AppState>,
     auth: AuthenticatedRoom,
@@ -280,7 +281,7 @@ pub async fn ack(
     }
 }
 
-/// `POST /rooms/:room_id/heartbeat`: Lightweight lease keep-alive ping. Never fails because
+/// `POST /rooms/:room_id/heartbeat`: refreshes the client's lease. Never fails because
 /// the client fell behind the log; the reply carries the snapshot signals.
 pub async fn heartbeat(
     State(state): State<AppState>,
@@ -326,7 +327,7 @@ pub async fn heartbeat(
     }
 }
 
-/// `POST /rooms/:room_id/schema`: On-demand schema retrieval during active DDL evolution.
+/// `POST /rooms/:room_id/schema`: the room's current schema.
 pub async fn get_schema(
     State(state): State<AppState>,
     auth: AuthenticatedRoom,
@@ -359,7 +360,7 @@ pub async fn get_schema(
     }
 }
 
-/// `POST /rooms/:room_id/deregister`: Explicit client departure advancing retention window immediately.
+/// `POST /rooms/:room_id/deregister`: removes the client from the room.
 pub async fn deregister(
     State(state): State<AppState>,
     auth: AuthenticatedRoom,
