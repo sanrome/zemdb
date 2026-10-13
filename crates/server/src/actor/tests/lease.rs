@@ -45,11 +45,11 @@ fn interrupted_roster_save_keeps_previous_roster() {
     fail_point::arm("write_atomic_before_rename", &path);
     assert!(tracker.register_client(&second, None, seq(1)).is_err());
     // A failed registration leaves no trace in memory either.
-    assert!(!tracker.is_registered(&second));
+    assert!(tracker.get_client(&second).is_none());
 
     let reopened = ClientLeaseTracker::open_or_create(&path).unwrap();
-    assert!(reopened.is_registered(&first));
-    assert!(!reopened.is_registered(&second));
+    assert!(reopened.get_client(&first).is_some());
+    assert!(reopened.get_client(&second).is_none());
 }
 
 #[test]
@@ -83,10 +83,11 @@ fn failed_deregistration_keeps_the_client() {
 
     fail_point::arm("write_atomic_before_rename", &path);
     assert!(tracker.deregister_client(&client).is_err());
-    assert!(tracker.is_registered(&client));
+    assert!(tracker.get_client(&client).is_some());
     assert!(ClientLeaseTracker::open_or_create(&path)
         .unwrap()
-        .is_registered(&client));
+        .get_client(&client)
+        .is_some());
 
     // Deregistering a client that is not registered writes nothing and succeeds.
     assert!(!tracker
@@ -246,7 +247,9 @@ fn roster_entry_with_invalid_client_id_is_skipped_and_the_rest_kept() {
     assert_eq!(tracker.client_counts().4, 2);
     assert_eq!(tracker.get_client(&alice).unwrap().last_ack_seq, seq(3));
     assert_eq!(tracker.get_client(&bob).unwrap().last_ack_seq, seq(5));
-    assert!(!tracker.is_registered(&ClientId::new("carol").unwrap()));
+    assert!(tracker
+        .get_client(&ClientId::new("carol").unwrap())
+        .is_none());
 }
 
 #[test]
@@ -258,7 +261,7 @@ fn activity_of_an_unregistered_client_does_not_register_it() {
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
     assert_eq!(tracker.observe(&stranger, Some(seq(3)), seq(1)), None);
 
-    assert!(!tracker.is_registered(&stranger));
+    assert!(tracker.get_client(&stranger).is_none());
     assert_eq!(tracker.min_connected_ack_seq(), None);
 }
 
@@ -411,7 +414,7 @@ fn snapshot_demand_is_persisted_on_flush_and_survives_reopening() {
     tracker.persist_if_dirty().unwrap();
     let reopened = ClientLeaseTracker::open_or_create(&path).unwrap();
     assert_eq!(reopened.snapshot_demand(), Some(renewed_at));
-    assert!(reopened.is_registered(&client));
+    assert!(reopened.get_client(&client).is_some());
 
     tracker.set_snapshot_demand(None);
     tracker.persist_if_dirty().unwrap();
@@ -458,7 +461,9 @@ fn unreadable_snapshot_demand_keeps_the_clients() {
     let tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
 
     assert_eq!(tracker.client_counts().4, 1);
-    assert!(tracker.is_registered(&ClientId::new("alice").unwrap()));
+    assert!(tracker
+        .get_client(&ClientId::new("alice").unwrap())
+        .is_some());
     assert_eq!(tracker.snapshot_demand(), None);
 }
 
@@ -638,11 +643,11 @@ fn dormant_client_is_forgotten_after_its_ttl_from_a_compact_roster() {
     set_inactive_for(&mut tracker, &gone, 61);
     tracker.check_timeouts(lease, None, forget_after, seq(5));
     tracker.persist_if_dirty().unwrap();
-    assert!(!tracker.is_registered(&gone) && tracker.is_registered(&active));
+    assert!(tracker.get_client(&gone).is_none() && tracker.get_client(&active).is_some());
 
     // The roster on disk, one compact line, forgot it too.
     let saved = fs::read_to_string(&path).unwrap();
     assert!(!saved.contains('\n'), "{saved}");
     let reopened = ClientLeaseTracker::open_or_create(&path).unwrap();
-    assert!(!reopened.is_registered(&gone) && reopened.is_registered(&active));
+    assert!(reopened.get_client(&gone).is_none() && reopened.get_client(&active).is_some());
 }

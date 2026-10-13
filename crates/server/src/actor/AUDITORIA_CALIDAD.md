@@ -175,6 +175,8 @@
 - **Problema:** `is_registered` solo se usa en `actor/tests/lease.rs` y equivale a `get_client(id).is_some()`. `get_client_mut` permite cambiar `state`/`last_ack_seq` sin marcar `dirty`, lo que rompe el encapsulamiento del tracker; lo usan los tests unitarios y `tests/server_integration_tests.rs:1670,1689`, así que no puede ser `#[cfg(test)]`.
 - **Propuesta:** reemplazar `is_registered` por `get_client(..).is_some()` en los tests y borrarla (−4). Para `get_client_mut`, como mínimo documentarla como "solo para tests" (`#[doc(hidden)]`). Es un cambio de API pública re-exportada en `lib.rs:14`: **a verificar**.
 - **Ahorro estimado:** ~4 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 4) en `is_registered`: se borró y los tests usan `get_client(..).is_some()`/`.is_none()`. rustfmt parte en varias líneas tres de las aserciones, así que los tests no ahorran líneas.
+- **Estado:** ⏭️ no aplicada en `get_client_mut` — la usan los tests de integración (`tests/server_integration_tests.rs`), que solo ven la API pública, así que no es API sin uso; su doc ya avisa que no marca el roster como modificado.
 
 ## Lo que conviene dejar como está
 
