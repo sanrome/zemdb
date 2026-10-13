@@ -53,9 +53,6 @@ pub enum StorageError {
     #[error("Schema validation failed: {0}")]
     SchemaValidation(#[from] ValidationError),
 
-    #[error("Storage engine is closed")]
-    EngineClosed,
-
     /// An I/O failure left the room's files in a state that only recovery can resolve.
     /// Writes and compactions are refused until the room is closed and reopened.
     #[error("Room '{room_id}' must be reopened after an unrecoverable I/O failure: {reason}")]

@@ -126,6 +126,7 @@ La densidad es adecuada (≈15 % doc) y la mayoría explica el *por qué*. Punto
 - **Ahorro estimado:** ~12–15 líneas · **Riesgo:** bajo (las constantes son API pública: **a verificar** si hay consumidores externos) · **Prioridad:** media
 - **Estado:** ✅ aplicada (paso 1) en los puntos 2 (`let _ = (compress_zstd, zstd_level);` sin `allow`), 4 (closure `failed`), 5 (un único `use std::io::{BufReader, Read};`) y 6 (`Cow<[u8]>` para el cuerpo sin comprimir), y en las docs de `snapshot.rs:32` y `69`. El punto 1 (borrar `COMPRESSION_*`, API pública) queda para el paso 4 y el punto 3 (helper compartido por los dos stubs de wasm) para el paso 2.
 - **Estado:** ⏭️ punto 3 no aplicado (paso 2) — queda más largo: rustfmt parte igual en tres líneas `Err(StorageError::SnapshotCorruption(…))` con una constante como argumento (supera `fn_call_width`), así que la constante solo suma líneas, y un helper que devuelva el error o el `Result` también deja el archivo más largo que los dos stubs actuales
+- **Estado:** ✅ punto 1 aplicado (paso 4): se borran `COMPRESSION_RAW` y `COMPRESSION_ZSTD`, sin usos en `crates/` (los flags siguen disponibles como `SnapshotCompression::*.flag()`, reexportado desde este módulo)
 
 ### Q5. `error.rs`: variante sin uso
 - **Dónde:** `error.rs:56-57` (`EngineClosed`) y `74-80`.
@@ -134,6 +135,7 @@ La densidad es adecuada (≈15 % doc) y la mayoría explica el *por qué*. Punto
 - **Ahorro estimado:** ~3 líneas · **Riesgo:** medio (enum público: quitar una variante rompe un `match` exhaustivo externo; **a verificar**) · **Prioridad:** baja
 - **Verificación (2.ª pasada):** ✅ confirmada — no hay ninguna referencia a `EngineClosed` en los `.rs` del repo. `StorageError` no es `#[non_exhaustive]` y `lib.rs` lo reexporta, así que quitar la variante rompe semver. El riesgo medio es correcto.
 - **Estado:** ✅ aplicada (paso 1) solo en el `use zemdb_core::WalFrameError;`. Quitar `EngineClosed` es un cambio de API pública y queda para el paso 4.
+- **Estado:** ✅ aplicada (paso 4): se borra `StorageError::EngineClosed`, que nada construye ni compara en `crates/`
 
 ### Q6. `sys.rs`: encadenar
 - **Dónde:** `sys.rs:17-18`.

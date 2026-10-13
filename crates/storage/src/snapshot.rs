@@ -15,12 +15,6 @@ pub use zemdb_core::protocol::snapshot_envelope::{
     SNAPSHOT_VERSION,
 };
 
-/// Compression flag indicating uncompressed raw Bincode payload.
-pub const COMPRESSION_RAW: u8 = SnapshotCompression::Raw.flag();
-
-/// Compression flag indicating Zstandard-compressed payload.
-pub const COMPRESSION_ZSTD: u8 = SnapshotCompression::Zstd.flag();
-
 /// Default upper bound for the decompressed payload of a snapshot (2 GiB).
 ///
 /// The declared length comes from the envelope, which may come from another peer, so it is
