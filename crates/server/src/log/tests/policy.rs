@@ -42,87 +42,28 @@ fn zero_idle_timeout_override_means_never() {
 #[test]
 fn overrides_outside_their_range_are_bad_requests_naming_the_field() {
     let cases = [
-        (
-            RoomLifecycleOverrides {
-                ram_max_ops: Some(0),
-                ..Default::default()
-            },
-            "lifecycle.ram_max_ops",
-        ),
-        (
-            RoomLifecycleOverrides {
-                ram_max_ops: Some(MAX_RAM_MAX_OPS as usize + 1),
-                ..Default::default()
-            },
-            "lifecycle.ram_max_ops",
-        ),
-        (
-            RoomLifecycleOverrides {
-                ram_ttl_secs: Some(0),
-                ..Default::default()
-            },
-            "lifecycle.ram_ttl_secs",
-        ),
-        (
-            RoomLifecycleOverrides {
-                cold_disk_ttl_secs: Some(MAX_POLICY_DURATION_SECS + 1),
-                ..Default::default()
-            },
-            "lifecycle.cold_disk_ttl_secs",
-        ),
-        (
-            RoomLifecycleOverrides {
-                max_room_disk_bytes: Some(MIN_ROOM_DISK_BYTES - 1),
-                ..Default::default()
-            },
-            "lifecycle.max_room_disk_bytes",
-        ),
-        (
-            RoomLifecycleOverrides {
-                lease_timeout_secs: Some(0),
-                ..Default::default()
-            },
-            "lifecycle.lease_timeout_secs",
-        ),
-        (
-            RoomLifecycleOverrides {
-                dormant_after_secs: Some(0),
-                ..Default::default()
-            },
-            "lifecycle.dormant_after_secs",
-        ),
-        (
-            RoomLifecycleOverrides {
-                snapshot_demand_ttl_secs: Some(MIN_SNAPSHOT_DEMAND_TTL_SECS - 1),
-                ..Default::default()
-            },
-            "lifecycle.snapshot_demand_ttl_secs",
-        ),
-        (
-            RoomLifecycleOverrides {
-                idle_timeout_secs: Some(u64::MAX),
-                ..Default::default()
-            },
-            "lifecycle.idle_timeout_secs",
-        ),
-        (
-            RoomLifecycleOverrides {
-                ram_max_bytes: Some(MIN_LOG_BYTES_LIMIT - 1),
-                ..Default::default()
-            },
-            "lifecycle.ram_max_bytes",
-        ),
-        (
-            RoomLifecycleOverrides {
-                segment_max_bytes: Some(MAX_LOG_BYTES_LIMIT + 1),
-                ..Default::default()
-            },
-            "lifecycle.segment_max_bytes",
-        ),
+        ("ram_max_ops", 0),
+        ("ram_max_ops", MAX_RAM_MAX_OPS + 1),
+        ("ram_ttl_secs", 0),
+        ("cold_disk_ttl_secs", MAX_POLICY_DURATION_SECS + 1),
+        ("max_room_disk_bytes", MIN_ROOM_DISK_BYTES - 1),
+        ("lease_timeout_secs", 0),
+        ("dormant_after_secs", 0),
+        ("snapshot_demand_ttl_secs", MIN_SNAPSHOT_DEMAND_TTL_SECS - 1),
+        ("idle_timeout_secs", u64::MAX),
+        ("ram_max_bytes", MIN_LOG_BYTES_LIMIT - 1),
+        ("segment_max_bytes", MAX_LOG_BYTES_LIMIT + 1),
     ];
-    for (overrides, field) in cases {
+    for (field, value) in cases {
+        let overrides: RoomLifecycleOverrides =
+            serde_json::from_value(serde_json::json!({ field: value })).unwrap();
         match overrides.validate() {
-            Err(ServerError::BadRequest(msg)) => assert!(msg.contains(field), "{field}: {msg}"),
+            Err(ServerError::BadRequest(msg)) => {
+                assert!(
+                    msg.contains(&format!("lifecycle.{field}")),
+                    "{field}: {msg}"
+                )
+            }
             other => panic!("{field}: expected BadRequest, got {other:?}"),
         }
     }

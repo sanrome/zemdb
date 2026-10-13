@@ -9,5 +9,9 @@ pub(crate) mod segment_reader;
 pub mod tiered_log;
 pub mod warm_disk;
 
+#[cfg(test)]
+#[path = "tests/support.rs"]
+mod test_support;
+
 pub use policy::{RoomLifecycleOverrides, RoomLifecyclePolicy};
 pub use tiered_log::TieredLog;

@@ -2,20 +2,13 @@ use super::*;
 use crate::dedup::DedupLruCache;
 use crate::log::io_probe::{self, IoEvent};
 use crate::log::policy::{MAX_LOG_BYTES_LIMIT, MIN_LOG_BYTES_LIMIT};
+use crate::log::test_support::{make_op, segment_file, seqs};
 use std::io::Write;
 use std::thread::sleep;
 use std::time::Duration;
 use tempfile::tempdir;
 use zemdb_core::mutation::Operation;
 use zemdb_core::value::{PrimaryKey, Value};
-
-fn make_op(seq: u64) -> SequencedOperation {
-    let pk = PrimaryKey::single(Value::Int(seq as i64));
-    SequencedOperation::new(
-        SequenceNumber::new(seq),
-        Operation::delete(1, pk, seq * 1000),
-    )
-}
 
 /// Policy where RAM entries expire quickly but the active segment never rotates by count,
 /// so evicted operations remain only in `active.wal`.
@@ -28,9 +21,51 @@ fn ttl_eviction_policy() -> RoomLifecyclePolicy {
 }
 
 fn assert_contiguous(ops: &[SequencedOperation], first: u64, last: u64) {
-    let seqs: Vec<u64> = ops.iter().map(|op| op.seq.get()).collect();
     let expected: Vec<u64> = (first..=last).collect();
-    assert_eq!(seqs, expected);
+    assert_eq!(seqs(ops), expected);
+}
+
+fn segments_dir(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("segments")
+}
+
+fn file_len(path: &Path) -> u64 {
+    std::fs::metadata(path).unwrap().len()
+}
+
+/// Total size of the files in `segments`, read through each file: on Windows a listing can
+/// report a stale size for the open `active.wal`.
+fn bytes_on_disk(segments: &Path) -> u64 {
+    std::fs::read_dir(segments)
+        .unwrap()
+        .map(|entry| file_len(&entry.unwrap().path()))
+        .sum()
+}
+
+/// Appends `first..=last` without mutation ids.
+fn append_plain(log: &mut TieredLog, first: u64, last: u64) {
+    for seq in first..=last {
+        log.append(make_op(seq), None).unwrap();
+    }
+}
+
+fn mutation_for(seq: u64) -> MutationId {
+    MutationId::from_u128(u128::from(seq))
+}
+
+/// Appends `first..=last`, each operation with the mutation id `mutation_for(seq)`.
+fn append_range(log: &mut TieredLog, first: u64, last: u64) {
+    for seq in first..=last {
+        log.append(make_op(seq), Some(mutation_for(seq))).unwrap();
+    }
+}
+
+/// Writes operations `1..=last` with the default policy, as `append_range` does, closes the
+/// log and returns the path of its `active.wal`.
+fn write_log(dir: &Path, last: u64) -> std::path::PathBuf {
+    let (mut log, _) = TieredLog::open_or_create(dir, RoomLifecyclePolicy::default()).unwrap();
+    append_range(&mut log, 1, last);
+    segments_dir(dir).join("active.wal")
 }
 
 #[test]
@@ -48,9 +83,7 @@ fn tail_stays_at_first_op_after_appends() {
     let (mut log, _) =
         TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).unwrap();
 
-    for seq in 1..=3 {
-        log.append(make_op(seq), None).unwrap();
-    }
+    append_plain(&mut log, 1, 3);
 
     assert_eq!(log.tail_seq().get(), 1);
 }
@@ -60,9 +93,7 @@ fn tail_includes_active_wal_after_ram_ttl_eviction() {
     let dir = tempdir().unwrap();
     let (mut log, _) = TieredLog::open_or_create(dir.path(), ttl_eviction_policy()).unwrap();
 
-    for seq in 1..=10 {
-        log.append(make_op(seq), None).unwrap();
-    }
+    append_plain(&mut log, 1, 10);
     sleep(Duration::from_millis(60));
     // The sliding window runs on append and evicts everything older than the RAM TTL.
     log.append(make_op(11), None).unwrap();
@@ -78,9 +109,7 @@ fn fetch_after_ram_ttl_eviction_bridges_from_active_wal() {
     let dir = tempdir().unwrap();
     let (mut log, _) = TieredLog::open_or_create(dir.path(), ttl_eviction_policy()).unwrap();
 
-    for seq in 1..=10 {
-        log.append(make_op(seq), None).unwrap();
-    }
+    append_plain(&mut log, 1, 10);
     sleep(Duration::from_millis(60));
     log.append(make_op(11), None).unwrap();
     log.run_maintenance_sync().unwrap();
@@ -91,23 +120,29 @@ fn fetch_after_ram_ttl_eviction_bridges_from_active_wal() {
     assert!(!has_more);
 }
 
-#[test]
-fn fully_pruned_log_rejects_cursor_behind_head() {
-    let dir = tempdir().unwrap();
-    let policy = RoomLifecyclePolicy {
+fn full_prune_policy() -> RoomLifecyclePolicy {
+    RoomLifecyclePolicy {
         ram_max_ops: 5,
         warm_disk_ttl: Duration::ZERO,
         cold_disk_ttl: Duration::ZERO,
         ..RoomLifecyclePolicy::default()
-    };
-    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
-
-    // Five appends rotate the active segment, leaving no `active.wal`.
-    for seq in 1..=5 {
-        log.append(make_op(seq), None).unwrap();
     }
-    // With zero TTLs, one maintenance pass compresses the sealed segment and prunes it.
+}
+
+/// A log that held operations `1..=5` and pruned them all: five appends rotate the active
+/// segment, leaving no `active.wal`, and with zero TTLs one maintenance pass compresses the
+/// sealed segment and prunes it.
+fn fully_pruned_log(dir: &Path) -> TieredLog {
+    let (mut log, _) = TieredLog::open_or_create(dir, full_prune_policy()).unwrap();
+    append_plain(&mut log, 1, 5);
     log.run_maintenance_sync().unwrap();
+    log
+}
+
+#[test]
+fn fully_pruned_log_rejects_cursor_behind_head() {
+    let dir = tempdir().unwrap();
+    let log = fully_pruned_log(dir.path());
 
     assert_eq!(log.head_seq().get(), 5);
     assert_eq!(log.tail_seq().get(), 6);
@@ -123,18 +158,8 @@ fn fully_pruned_log_rejects_cursor_behind_head() {
 #[test]
 fn append_after_full_prune_keeps_tail_on_new_op() {
     let dir = tempdir().unwrap();
-    let policy = RoomLifecyclePolicy {
-        ram_max_ops: 5,
-        warm_disk_ttl: Duration::ZERO,
-        cold_disk_ttl: Duration::ZERO,
-        ..RoomLifecyclePolicy::default()
-    };
-    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    let mut log = fully_pruned_log(dir.path());
 
-    for seq in 1..=5 {
-        log.append(make_op(seq), None).unwrap();
-    }
-    log.run_maintenance_sync().unwrap();
     log.append(make_op(6), None).unwrap();
 
     assert_eq!(log.tail_seq().get(), 6);
@@ -153,9 +178,7 @@ fn prune_older_than_keeps_tail_on_active_wal() {
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
 
     // Ops 1..=5 are sealed; ops 6..=8 stay in `active.wal`.
-    for seq in 1..=8 {
-        log.append(make_op(seq), None).unwrap();
-    }
+    append_plain(&mut log, 1, 8);
     sleep(Duration::from_millis(60));
     log.append(make_op(9), None).unwrap();
 
@@ -172,9 +195,7 @@ fn reopen_after_ram_ttl_eviction_restores_tail_from_disk() {
     let dir = tempdir().unwrap();
     {
         let (mut log, _) = TieredLog::open_or_create(dir.path(), ttl_eviction_policy()).unwrap();
-        for seq in 1..=4 {
-            log.append(make_op(seq), None).unwrap();
-        }
+        append_plain(&mut log, 1, 4);
     }
 
     let (log, _) = TieredLog::open_or_create(dir.path(), ttl_eviction_policy()).unwrap();
@@ -183,26 +204,12 @@ fn reopen_after_ram_ttl_eviction_restores_tail_from_disk() {
     assert_eq!(log.tail_seq().get(), 1);
 }
 
-fn full_prune_policy() -> RoomLifecyclePolicy {
-    RoomLifecyclePolicy {
-        ram_max_ops: 5,
-        warm_disk_ttl: Duration::ZERO,
-        cold_disk_ttl: Duration::ZERO,
-        ..RoomLifecyclePolicy::default()
-    }
-}
-
 #[test]
 fn reopen_after_full_prune_preserves_head() {
     let dir = tempdir().unwrap();
-    {
-        let (mut log, _) = TieredLog::open_or_create(dir.path(), full_prune_policy()).unwrap();
-        for seq in 1..=5 {
-            log.append(make_op(seq), None).unwrap();
-        }
-        log.run_maintenance_sync().unwrap();
-        assert_eq!(log.tail_seq().get(), 6);
-    }
+    let log = fully_pruned_log(dir.path());
+    assert_eq!(log.tail_seq().get(), 6);
+    drop(log);
 
     let (log, _) = TieredLog::open_or_create(dir.path(), full_prune_policy()).unwrap();
 
@@ -213,13 +220,7 @@ fn reopen_after_full_prune_preserves_head() {
 #[test]
 fn reopen_after_full_prune_continues_sequence() {
     let dir = tempdir().unwrap();
-    {
-        let (mut log, _) = TieredLog::open_or_create(dir.path(), full_prune_policy()).unwrap();
-        for seq in 1..=5 {
-            log.append(make_op(seq), None).unwrap();
-        }
-        log.run_maintenance_sync().unwrap();
-    }
+    drop(fully_pruned_log(dir.path()));
 
     let (mut log, _) = TieredLog::open_or_create(dir.path(), full_prune_policy()).unwrap();
 
@@ -232,13 +233,7 @@ fn reopen_after_full_prune_continues_sequence() {
 #[test]
 fn reopen_with_corrupt_log_meta_fails_instead_of_resetting_head() {
     let dir = tempdir().unwrap();
-    {
-        let (mut log, _) = TieredLog::open_or_create(dir.path(), full_prune_policy()).unwrap();
-        for seq in 1..=5 {
-            log.append(make_op(seq), None).unwrap();
-        }
-        log.run_maintenance_sync().unwrap();
-    }
+    drop(fully_pruned_log(dir.path()));
     std::fs::write(dir.path().join("log_meta.json"), b"{ not json").unwrap();
 
     assert!(TieredLog::open_or_create(dir.path(), full_prune_policy()).is_err());
@@ -254,14 +249,8 @@ fn gap_inside_retained_range_reports_behind_compaction() {
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
 
     // Sealed segments [1..=5] and [6..=10]; operations 11..=12 stay in `active.wal`.
-    for seq in 1..=12 {
-        log.append(make_op(seq), None).unwrap();
-    }
-    let middle = dir
-        .path()
-        .join("segments")
-        .join(format!("segment_{:016}_{:016}.wal", 6, 10));
-    std::fs::remove_file(middle).unwrap();
+    append_plain(&mut log, 1, 12);
+    std::fs::remove_file(segment_file(&segments_dir(dir.path()), 6, 10, "wal")).unwrap();
 
     assert!(matches!(
         log.fetch_deltas(SequenceNumber::new(0), 100),
@@ -275,21 +264,6 @@ fn open_makes_new_segments_directory_durable() {
     crate::fail_point::arm("sync_dir", dir.path());
 
     assert!(TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).is_err());
-}
-
-fn segments_dir(dir: &std::path::Path) -> std::path::PathBuf {
-    dir.join("segments")
-}
-
-fn mutation_for(seq: u64) -> MutationId {
-    MutationId::from_u128(u128::from(seq))
-}
-
-/// Appends `first..=last`, each operation with the mutation id `mutation_for(seq)`.
-fn append_range(log: &mut TieredLog, first: u64, last: u64) {
-    for seq in first..=last {
-        log.append(make_op(seq), Some(mutation_for(seq))).unwrap();
-    }
 }
 
 /// Five operations per segment; sealed segments are compressed on the next maintenance pass
@@ -376,9 +350,7 @@ fn reopen_reads_only_the_newest_segments_needed_for_ram_and_dedup() {
 fn fetch_reads_active_wal_through_the_handle_holding_its_lock() {
     let dir = tempdir().unwrap();
     let (mut log, _) = TieredLog::open_or_create(dir.path(), ttl_eviction_policy()).unwrap();
-    for seq in 1..=10 {
-        log.append(make_op(seq), None).unwrap();
-    }
+    append_plain(&mut log, 1, 10);
     sleep(Duration::from_millis(60));
     // Evicts 1..=10 from RAM: they are only in active.wal now.
     log.append(make_op(11), None).unwrap();
@@ -416,8 +388,8 @@ fn open_removes_leftover_temporary_cold_segments() {
     std::fs::create_dir_all(&segments).unwrap();
     // Compressions interrupted before their rename, with the old and the current naming.
     let leftovers = [
-        segments.join("segment_0000000000000001_0000000000000005.wal.tmp"),
-        segments.join("segment_0000000000000006_0000000000000010.wal.zst.tmp"),
+        segment_file(&segments, 1, 5, "wal.tmp"),
+        segment_file(&segments, 6, 10, "wal.zst.tmp"),
     ];
     for leftover in &leftovers {
         std::fs::write(leftover, b"partial").unwrap();
@@ -505,25 +477,17 @@ fn disk_bytes_track_the_files_of_the_log() {
     let dir = tempdir().unwrap();
     let (mut log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
     let segments = segments_dir(dir.path());
-    let on_disk = || -> u64 {
-        std::fs::read_dir(&segments)
-            .unwrap()
-            // Through each file: on Windows a listing can report a stale size for the open
-            // `active.wal`.
-            .map(|entry| std::fs::metadata(entry.unwrap().path()).unwrap().len())
-            .sum()
-    };
 
     append_range(&mut log, 1, 12);
-    assert_eq!(log.disk_bytes(), on_disk());
+    assert_eq!(log.disk_bytes(), bytes_on_disk(&segments));
     log.run_maintenance_sync().unwrap();
-    assert_eq!(log.disk_bytes(), on_disk());
+    assert_eq!(log.disk_bytes(), bytes_on_disk(&segments));
     log.prune_older_than(SequenceNumber::new(6)).unwrap();
-    assert_eq!(log.disk_bytes(), on_disk());
+    assert_eq!(log.disk_bytes(), bytes_on_disk(&segments));
     drop(log);
 
     let (log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
-    assert_eq!(log.disk_bytes(), on_disk());
+    assert_eq!(log.disk_bytes(), bytes_on_disk(&segments));
 }
 
 #[test]
@@ -554,8 +518,8 @@ fn open_keeps_the_warm_original_of_an_interrupted_compression() {
     }
     // A crash after the cold segment was renamed into place, before the warm one was removed.
     let segments = segments_dir(dir.path());
-    let warm = segments.join("segment_0000000000000001_0000000000000005.wal");
-    let cold = segments.join("segment_0000000000000001_0000000000000005.wal.zst");
+    let warm = segment_file(&segments, 1, 5, "wal");
+    let cold = segment_file(&segments, 1, 5, "wal.zst");
     std::fs::write(
         &cold,
         zstd::stream::encode_all(&std::fs::read(&warm).unwrap()[..], 3).unwrap(),
@@ -580,8 +544,8 @@ fn failed_cleanup_after_compression_keeps_the_index_on_the_cold_segment() {
     let (mut log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
     append_range(&mut log, 1, 7);
     let segments = segments_dir(dir.path());
-    let warm = segments.join("segment_0000000000000001_0000000000000005.wal");
-    let cold = segments.join("segment_0000000000000001_0000000000000005.wal.zst");
+    let warm = segment_file(&segments, 1, 5, "wal");
+    let cold = segment_file(&segments, 1, 5, "wal.zst");
 
     // The cold segment is durably in place and the warm one deleted, but the directory sync
     // that makes the deletion durable fails.
@@ -593,12 +557,7 @@ fn failed_cleanup_after_compression_keeps_the_index_on_the_cold_segment() {
     assert_eq!(report.warm_compressed_count, 0);
     let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
     assert_contiguous(&ops, 1, 7);
-    assert_eq!(log.disk_bytes(), {
-        std::fs::read_dir(&segments)
-            .unwrap()
-            .map(|entry| std::fs::metadata(entry.unwrap().path()).unwrap().len())
-            .sum::<u64>()
-    });
+    assert_eq!(log.disk_bytes(), bytes_on_disk(&segments));
 }
 
 #[test]
@@ -633,8 +592,8 @@ fn failed_compression_does_not_skip_expiry() {
 fn plant_leftovers(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let segments = segments_dir(dir);
     let planted = vec![
-        segments.join("segment_0000000000000001_0000000000000005.wal.zst"),
-        segments.join("segment_0000000000000099_0000000000000100.wal.zst.tmp"),
+        segment_file(&segments, 1, 5, "wal.zst"),
+        segment_file(&segments, 99, 100, "wal.zst.tmp"),
         dir.join("log_meta.json.tmp"),
     ];
     for path in &planted {
@@ -708,7 +667,7 @@ fn dedup_window_counts_distinct_mutation_ids() {
 /// Rewrites the warm segment `start..=end` of the log in `dir` so that it only holds
 /// `start..=last`, as if its tail had been lost.
 fn shorten_warm_segment(dir: &std::path::Path, start: u64, end: u64, last: u64) {
-    let path = segments_dir(dir).join(format!("segment_{start:016}_{end:016}.wal"));
+    let path = segment_file(&segments_dir(dir), start, end, "wal");
     let mut bytes = Vec::new();
     for seq in start..=last {
         bytes.extend(
@@ -755,10 +714,7 @@ fn missing_segment_at_the_end_of_the_disk_tiers_is_behind_compaction() {
     log.run_maintenance_sync_at(MaintenanceClock::after(Duration::from_secs(600)))
         .unwrap();
     assert!(log.hot_buffer.is_empty());
-    std::fs::remove_file(
-        segments_dir(dir.path()).join("segment_0000000000000006_0000000000000010.wal.zst"),
-    )
-    .unwrap();
+    std::fs::remove_file(segment_file(&segments_dir(dir.path()), 6, 10, "wal.zst")).unwrap();
 
     assert!(matches!(
         log.fetch_deltas(SequenceNumber::new(5), 100),
@@ -783,9 +739,7 @@ fn corrupt_segment_inside_the_retained_range_is_behind_compaction() {
     };
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
     append_range(&mut log, 1, 12);
-    corrupt_first_record(
-        &segments_dir(dir.path()).join("segment_0000000000000001_0000000000000005.wal"),
-    );
+    corrupt_first_record(&segment_file(&segments_dir(dir.path()), 1, 5, "wal"));
 
     assert!(matches!(
         log.fetch_deltas(SequenceNumber::new(0), 100),
@@ -806,9 +760,7 @@ fn open_tolerates_a_corrupt_newest_segment() {
         let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
         append_range(&mut log, 1, 12);
     }
-    corrupt_first_record(
-        &segments_dir(dir.path()).join("segment_0000000000000006_0000000000000010.wal"),
-    );
+    corrupt_first_record(&segment_file(&segments_dir(dir.path()), 6, 10, "wal"));
 
     let (mut log, mutations) =
         TieredLog::open_or_create_with_dedup_window(dir.path(), policy, 100).unwrap();
@@ -1084,7 +1036,7 @@ fn reads_skip_damaged_frames_before_the_cursor_in_sealed_and_active_segments() {
     let sealed = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(segments.join("segment_0000000000000001_0000000000000005.wal"))
+        .open(segment_file(&segments, 1, 5, "wal"))
         .unwrap();
     for index in 0..4 {
         damage_payload(&sealed, index);
@@ -1171,7 +1123,6 @@ fn test_tiered_log_write_through_and_crash_recovery() {
     let dir = tempdir().unwrap();
     let policy = RoomLifecyclePolicy::default();
 
-    // 1. Append 10 operations with Write-Through
     {
         let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
         assert_eq!(log.head_seq().get(), 0);
@@ -1183,24 +1134,14 @@ fn test_tiered_log_write_through_and_crash_recovery() {
         // Abruptly drop log without clean shutdown (simulating server crash)
     }
 
-    // 2. Reopen from disk and verify 100% of data survived
+    // Reopen from disk: every operation survived, byte for byte.
     let (log2, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
     assert_eq!(log2.head_seq().get(), 10);
 
     let (deltas, has_more) = log2.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
 
-    assert_eq!(deltas.len(), 10);
+    assert_eq!(deltas, (1..=10).map(make_op).collect::<Vec<_>>());
     assert!(!has_more);
-
-    for (idx, op) in deltas.iter().enumerate() {
-        let expected_seq = idx as u64 + 1;
-        assert_eq!(op.seq.get(), expected_seq);
-        assert_eq!(op.op.table_id(), 1);
-        assert_eq!(
-            op.op.pk(),
-            &PrimaryKey::single(Value::Int(expected_seq as i64))
-        );
-    }
 }
 
 #[test]
@@ -1209,28 +1150,18 @@ fn test_tiered_log_hot_buffer_fast_read() {
     let policy = RoomLifecyclePolicy::default();
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
 
-    for i in 1..=5 {
-        log.append(make_op(i), None).unwrap();
-    }
+    append_plain(&mut log, 1, 5);
 
-    // Read range from cursor 2 with limit 2 (should return 3 and 4 with has_more = true)
     let (batch1, has_more1) = log.fetch_deltas(SequenceNumber::new(2), 2).unwrap();
-
-    assert_eq!(batch1.len(), 2);
-    assert_eq!(batch1[0].seq.get(), 3);
-    assert_eq!(batch1[1].seq.get(), 4);
+    assert_contiguous(&batch1, 3, 4);
     assert!(has_more1);
 
-    // Read remaining from cursor 4 with limit 10 (should return 5 with has_more = false)
     let (batch2, has_more2) = log.fetch_deltas(SequenceNumber::new(4), 10).unwrap();
-
-    assert_eq!(batch2.len(), 1);
-    assert_eq!(batch2[0].seq.get(), 5);
+    assert_contiguous(&batch2, 5, 5);
     assert!(!has_more2);
 
     // Read from current head (should return empty)
     let (batch3, has_more3) = log.fetch_deltas(SequenceNumber::new(5), 10).unwrap();
-
     assert!(batch3.is_empty());
     assert!(!has_more3);
 }
@@ -1245,24 +1176,17 @@ fn test_tiered_log_warm_segment_rotation() {
 
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
 
-    for i in 1..=6 {
-        log.append(make_op(i), None).unwrap();
-    }
+    append_plain(&mut log, 1, 6);
 
-    // Verify segments directory contains sealed segment and active.wal
-    let segments_dir = dir.path().join("segments");
-    let sealed_name = "segment_0000000000000001_0000000000000005.wal";
-    assert!(segments_dir.join(sealed_name).exists());
-    assert!(segments_dir.join("active.wal").exists());
+    let segments = segments_dir(dir.path());
+    assert!(segment_file(&segments, 1, 5, "wal").exists());
+    assert!(segments.join("active.wal").exists());
 
     // Fetch across the rotation boundary (from 0 to 6)
     let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(0), 10).unwrap();
 
-    assert_eq!(deltas.len(), 6);
+    assert_contiguous(&deltas, 1, 6);
     assert!(!has_more);
-    for (i, op) in deltas.iter().enumerate() {
-        assert_eq!(op.seq.get(), i as u64 + 1);
-    }
 }
 
 #[tokio::test]
@@ -1279,41 +1203,30 @@ async fn test_tiered_log_cold_compression_and_read() {
 
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
 
-    for i in 1..=5 {
-        log.append(make_op(i), None).unwrap();
-    }
+    append_plain(&mut log, 1, 5);
     // Force rotate to seal segment 1..5 into .wal
     log.force_rotate_warm().unwrap();
 
-    let sealed_wal = dir
-        .path()
-        .join("segments")
-        .join("segment_0000000000000001_0000000000000005.wal");
+    let segments = segments_dir(dir.path());
+    let sealed_wal = segment_file(&segments, 1, 5, "wal");
     assert!(sealed_wal.exists());
 
     // Wait past warm_disk_ttl
     sleep(Duration::from_millis(20));
 
-    // Run background maintenance
+    // The async pass compresses the segment off the async worker.
     let report = log.run_maintenance().await.unwrap();
     assert_eq!(report.warm_compressed_count, 1);
 
     // Sealed .wal should be removed, and .wal.zst created
-    let cold_zst = dir
-        .path()
-        .join("segments")
-        .join("segment_0000000000000001_0000000000000005.wal.zst");
     assert!(!sealed_wal.exists());
-    assert!(cold_zst.exists());
+    assert!(segment_file(&segments, 1, 5, "wal.zst").exists());
 
     // Fetch deltas directly from Cold Disk (.wal.zst)
     let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(0), 10).unwrap();
 
-    assert_eq!(deltas.len(), 5);
+    assert_contiguous(&deltas, 1, 5);
     assert!(!has_more);
-    for (i, op) in deltas.iter().enumerate() {
-        assert_eq!(op.seq.get(), i as u64 + 1);
-    }
 }
 
 #[tokio::test]
@@ -1330,46 +1243,31 @@ async fn test_tiered_log_multi_tier_continuous_fetch() {
 
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
 
-    // 1. Operations 1..=5 -> Seal & compress to Cold
-    for i in 1..=5 {
-        log.append(make_op(i), None).unwrap();
-    }
+    // Operations 1..=5 are sealed and compressed to cold.
+    append_plain(&mut log, 1, 5);
     log.force_rotate_warm().unwrap();
     sleep(Duration::from_millis(20));
     log.run_maintenance().await.unwrap();
 
-    // 2. Operations 6..=10 -> Seal to Warm (without compressing to cold)
-    for i in 6..=10 {
-        log.append(make_op(i), None).unwrap();
-    }
+    // Operations 6..=10 are sealed to warm, without compressing them.
+    append_plain(&mut log, 6, 10);
     log.force_rotate_warm().unwrap();
 
-    // 3. Operations 11..=15 -> Active in RAM HotBuffer and active.wal
-    for i in 11..=15 {
-        log.append(make_op(i), None).unwrap();
-    }
+    // Operations 11..=15 stay in RAM and active.wal.
+    append_plain(&mut log, 11, 15);
 
     assert_eq!(log.head_seq().get(), 15);
 
     // Fetch entire range 0..15 traversing Cold -> Warm -> Hot in a single contiguous batch
     let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(0), 20).unwrap();
 
-    assert_eq!(deltas.len(), 15);
+    assert_contiguous(&deltas, 1, 15);
     assert!(!has_more);
-
-    for (i, op) in deltas.iter().enumerate() {
-        assert_eq!(op.seq.get(), i as u64 + 1);
-    }
 
     // Paged fetch crossing from Cold (ends at 5) into Warm (starts at 6)
     let (paged, paged_has_more) = log.fetch_deltas(SequenceNumber::new(3), 5).unwrap();
 
-    assert_eq!(paged.len(), 5);
-    assert_eq!(paged[0].seq.get(), 4);
-    assert_eq!(paged[1].seq.get(), 5);
-    assert_eq!(paged[2].seq.get(), 6);
-    assert_eq!(paged[3].seq.get(), 7);
-    assert_eq!(paged[4].seq.get(), 8);
+    assert_contiguous(&paged, 4, 8);
     assert!(paged_has_more);
 }
 
@@ -1383,12 +1281,10 @@ fn test_tiered_log_strict_contiguity_and_monotonicity() {
 
     // Attempting to append sequence 3 directly (gap) must be rejected
     let err = log.append(make_op(3), None).unwrap_err();
-    match err {
-        ServerError::Wal(msg) => {
-            assert!(msg.contains("Non-contiguous sequence"));
-        }
-        other => panic!("Expected ServerError::Wal, got: {:?}", other),
-    }
+    assert!(
+        matches!(&err, ServerError::Wal(msg) if msg.contains("Non-contiguous sequence")),
+        "{err:?}"
+    );
 }
 
 #[test]
@@ -1397,31 +1293,19 @@ fn test_tiered_log_proactive_pruning_by_cursor() {
     let policy = RoomLifecyclePolicy::default();
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
 
-    // 1. Append 1..=5 and rotate to sealed Warm segment
-    for i in 1..=5 {
-        log.append(make_op(i), None).unwrap();
-    }
+    // Two sealed warm segments, 1..=5 and 6..=10.
+    append_plain(&mut log, 1, 5);
+    log.force_rotate_warm().unwrap();
+    append_plain(&mut log, 6, 10);
     log.force_rotate_warm().unwrap();
 
-    // 2. Append 6..=10 and rotate to sealed Warm segment
-    for i in 6..=10 {
-        log.append(make_op(i), None).unwrap();
-    }
-    log.force_rotate_warm().unwrap();
-
-    // Verify both sealed segments exist on disk
-    let seg1_path = dir
-        .path()
-        .join("segments")
-        .join("segment_0000000000000001_0000000000000005.wal");
-    let seg2_path = dir
-        .path()
-        .join("segments")
-        .join("segment_0000000000000006_0000000000000010.wal");
+    let segments = segments_dir(dir.path());
+    let seg1_path = segment_file(&segments, 1, 5, "wal");
+    let seg2_path = segment_file(&segments, 6, 10, "wal");
     assert!(seg1_path.exists());
     assert!(seg2_path.exists());
 
-    // 3. Proactively prune all deltas older than sequence 6 (all clients confirmed >= 6)
+    // Proactively prune all deltas older than sequence 6 (all clients confirmed >= 6)
     let prune_report = log.prune_older_than(SequenceNumber::new(6)).unwrap();
     assert_eq!(prune_report.warm_deleted_count, 1);
     assert_eq!(prune_report.new_tail_seq.get(), 6);
@@ -1431,17 +1315,15 @@ fn test_tiered_log_proactive_pruning_by_cursor() {
     assert!(seg2_path.exists());
 
     // Cursor 2 is now expired -> BehindCompaction
-    let err = log.fetch_deltas(SequenceNumber::new(2), 10).unwrap_err();
-    match err {
-        ServerError::BehindCompaction => {}
-        other => panic!("Expected BehindCompaction, got: {:?}", other),
-    }
+    let result = log.fetch_deltas(SequenceNumber::new(2), 10);
+    assert!(
+        matches!(result, Err(ServerError::BehindCompaction)),
+        "{result:?}"
+    );
 
     // Cursor 5 can fetch 6..=10 smoothly
     let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(5), 10).unwrap();
-    assert_eq!(deltas.len(), 5);
-    assert_eq!(deltas[0].seq.get(), 6);
-    assert_eq!(deltas[4].seq.get(), 10);
+    assert_contiguous(&deltas, 6, 10);
     assert!(!has_more);
 }
 
@@ -1455,86 +1337,25 @@ fn test_tiered_log_hot_buffer_sliding_window_no_zero_eviction() {
 
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
 
-    // 1. Append operations 1..=5 (filling the RAM buffer and reaching the active segment limit)
-    for i in 1..=5 {
-        log.append(make_op(i), None).unwrap();
-    }
+    // Operations 1..=5 fill the RAM buffer and reach the active segment limit.
+    append_plain(&mut log, 1, 5);
 
-    // 2. Append operation 6. This triggers disk rotation of the active WAL segment into segment_1_5.wal.
-    // The sliding window must pop the oldest element (1) and retain operations 2..=6 in RAM.
+    // Operation 6 rotates the active segment into segment_1_5.wal. The sliding window must
+    // pop the oldest element (1) and retain operations 2..=6 in RAM.
     log.append(make_op(6), None).unwrap();
 
-    // Verify that operations 2..=6 can still be fetched directly from the RAM buffer window without zero-eviction
-    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(1), 10).unwrap();
-
-    assert_eq!(deltas.len(), 5);
-    assert_eq!(deltas[0].seq.get(), 2);
-    assert_eq!(deltas[4].seq.get(), 6);
-    assert!(!has_more);
+    // Cursor 1 immediately precedes the buffer start (1 + 1 == 2), so 2..=6 come straight
+    // from RAM, whether the limit is exactly the five left or larger.
+    for limit in [5, 10] {
+        let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(1), limit).unwrap();
+        assert_contiguous(&deltas, 2, 6);
+        assert!(!has_more, "limit {limit}");
+    }
 
     // Fetching from cursor 4 returns 5 and 6
     let (recent_deltas, recent_has_more) = log.fetch_deltas(SequenceNumber::new(4), 10).unwrap();
-    assert_eq!(recent_deltas.len(), 2);
-    assert_eq!(recent_deltas[0].seq.get(), 5);
-    assert_eq!(recent_deltas[1].seq.get(), 6);
+    assert_contiguous(&recent_deltas, 5, 6);
     assert!(!recent_has_more);
-}
-
-#[test]
-fn test_tiered_log_hierarchical_cache_inversion() {
-    let dir = tempdir().unwrap();
-    let policy = RoomLifecyclePolicy {
-        ram_max_ops: 10,
-        ..Default::default()
-    };
-
-    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
-
-    // Append 10 operations
-    for i in 1..=10 {
-        log.append(make_op(i), None).unwrap();
-    }
-
-    // A query for deltas starting within the hot buffer (e.g. from 5) should resolve directly
-    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(5), 10).unwrap();
-    assert_eq!(deltas.len(), 5);
-    assert_eq!(deltas[0].seq.get(), 6);
-    assert_eq!(deltas[4].seq.get(), 10);
-    assert!(!has_more);
-}
-
-#[tokio::test]
-async fn test_tiered_log_async_maintenance_spawn_blocking() {
-    let dir = tempdir().unwrap();
-    let policy = RoomLifecyclePolicy {
-        ram_max_ops: 5,
-        ram_ttl: Duration::from_secs(60),
-        warm_disk_ttl: Duration::from_millis(5),
-        cold_disk_ttl: Duration::from_secs(3600),
-        max_room_disk_bytes: 50 * 1024 * 1024,
-        ..RoomLifecyclePolicy::default()
-    };
-
-    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
-
-    for i in 1..=5 {
-        log.append(make_op(i), None).unwrap();
-    }
-    log.force_rotate_warm().unwrap();
-
-    // Wait past warm_disk_ttl
-    tokio::time::sleep(Duration::from_millis(15)).await;
-
-    // Run async maintenance which delegates Zstd compression to spawn_blocking
-    let report = log.run_maintenance().await.unwrap();
-    assert_eq!(report.warm_compressed_count, 1);
-
-    // Verify Cold Disk file was created and is readable
-    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(0), 10).unwrap();
-    assert_eq!(deltas.len(), 5);
-    assert_eq!(deltas[0].seq.get(), 1);
-    assert_eq!(deltas[4].seq.get(), 5);
-    assert!(!has_more);
 }
 
 #[tokio::test]
@@ -1551,27 +1372,19 @@ async fn test_tiered_log_disk_quota_saturation_pruning() {
 
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
 
-    // 1. Create first segment 1..=5
-    for i in 1..=5 {
-        log.append(make_op(i), None).unwrap();
-    }
+    // Two sealed warm segments, 1..=5 and 6..=10.
+    append_plain(&mut log, 1, 5);
     log.force_rotate_warm().unwrap();
-
-    // 2. Create second segment 6..=10
-    for i in 6..=10 {
-        log.append(make_op(i), None).unwrap();
-    }
+    append_plain(&mut log, 6, 10);
     log.force_rotate_warm().unwrap();
 
     // Wait past warm_disk_ttl so maintenance compresses them to Cold (.wal.zst)
     tokio::time::sleep(Duration::from_millis(15)).await;
 
-    // 3. Append active segment 11..=15
-    for i in 11..=15 {
-        log.append(make_op(i), None).unwrap();
-    }
+    // Operations 11..=15 stay in the active segment.
+    append_plain(&mut log, 11, 15);
 
-    // 4. Run maintenance: should compress warm segments and immediately prune cold segments due to quota
+    // Maintenance compresses the warm segments and immediately prunes cold ones over the quota.
     let report = log.run_maintenance().await.unwrap();
     assert_eq!(report.warm_compressed_count, 2);
     assert!(
@@ -1587,11 +1400,11 @@ async fn test_tiered_log_disk_quota_saturation_pruning() {
     );
 
     // Any fetch before the new tail_seq must return BehindCompaction
-    let err = log.fetch_deltas(SequenceNumber::new(0), 10).unwrap_err();
-    match err {
-        ServerError::BehindCompaction => {}
-        other => panic!("Expected BehindCompaction on quota pruned deltas, got: {other:?}"),
-    }
+    let result = log.fetch_deltas(SequenceNumber::new(0), 10);
+    assert!(
+        matches!(result, Err(ServerError::BehindCompaction)),
+        "Expected BehindCompaction on quota pruned deltas, got: {result:?}"
+    );
 
     // Fetch from the new tail cursor succeeds
     let cursor = SequenceNumber::new(log.tail_seq().get() - 1);
@@ -1614,9 +1427,7 @@ fn test_tiered_log_eviction_gap_bridged_from_sealed_segments() {
     // from the RAM sliding window, while 11..=15 remain in RAM.
     // The active segment also rotates every 5 operations, so all 15 operations
     // reside in sealed segments on disk and no `active.wal` remains.
-    for i in 1..=15 {
-        log.append(make_op(i), None).unwrap();
-    }
+    append_plain(&mut log, 1, 15);
 
     assert_eq!(log.head_seq().get(), 15);
 
@@ -1625,88 +1436,38 @@ fn test_tiered_log_eviction_gap_bridged_from_sealed_segments() {
     // Operations 11..=13 are present in RAM HotBuffer.
     let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(7), 6).unwrap();
 
-    assert_eq!(deltas.len(), 6);
+    assert_contiguous(&deltas, 8, 13);
     assert!(has_more);
-
-    // Verify monotonic strict contiguity across the tier transition: 8, 9, 10, 11, 12, 13
-    for (idx, op) in deltas.iter().enumerate() {
-        let expected_seq = 8 + idx as u64;
-        assert_eq!(
-            op.seq.get(),
-            expected_seq,
-            "Operation at index {} must have sequence {}, got {}",
-            idx,
-            expected_seq,
-            op.seq.get()
-        );
-    }
-}
-
-#[test]
-fn test_tiered_log_fast_path_off_by_one_boundary() {
-    let dir = tempdir().unwrap();
-    let policy = RoomLifecyclePolicy {
-        ram_max_ops: 5,
-        ..Default::default()
-    };
-
-    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
-
-    // Append operations 1..=6.
-    // Sliding window evicts op 1.
-    // RAM buffer contains 2..=6, min_seq = 2.
-    for i in 1..=6 {
-        log.append(make_op(i), None).unwrap();
-    }
-
-    // Client requests cursor 1 with limit 5 (expecting 2..=6).
-    // Because cursor 1 immediately precedes min_seq 2 (1 + 1 == 2),
-    // this request must hit the RAM Fast Path directly.
-    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(1), 5).unwrap();
-
-    assert_eq!(deltas.len(), 5);
-    assert!(!has_more);
-    for (idx, op) in deltas.iter().enumerate() {
-        assert_eq!(op.seq.get(), 2 + idx as u64);
-    }
 }
 
 #[test]
 fn test_unified_wal_append_and_recovery_roundtrip() {
     let dir = tempdir().unwrap();
     let policy = RoomLifecyclePolicy::default();
+    let mutation = |seq: u64| MutationId::from_u128(u128::from(seq) + 1000);
 
-    // 1. Initial creation
     {
         let (mut log, recovered_mutations) =
             TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
         assert_eq!(log.head_seq().get(), 0);
         assert_eq!(recovered_mutations.len(), 0);
 
-        // 2. Append 10 entries with distinct mutation IDs
         for i in 1..=10 {
-            let seq = SequenceNumber::new(i);
-            let mutation_id = MutationId::from_u128(i as u128 + 1000);
-            let op = make_op(seq.get());
-
-            log.append(op, Some(mutation_id)).unwrap();
+            log.append(make_op(i), Some(mutation(i))).unwrap();
             assert_eq!(log.head_seq().get(), i);
         }
     }
 
-    // 3. Re-open and verify full recovery of head_seq, deltas, and mutation IDs
+    // Reopening recovers head_seq, the deltas and the mutation ids.
     let (log2, recovered_mutations2) = TieredLog::open_or_create(dir.path(), policy).unwrap();
     assert_eq!(log2.head_seq().get(), 10);
-    assert_eq!(recovered_mutations2.len(), 10);
-
-    for (idx, (mut_id, seq)) in recovered_mutations2.iter().enumerate() {
-        let expected_seq = idx as u64 + 1;
-        assert_eq!(seq.get(), expected_seq);
-        assert_eq!(*mut_id, MutationId::from_u128(expected_seq as u128 + 1000));
-    }
+    let expected: Vec<_> = (1..=10)
+        .map(|seq| (mutation(seq), SequenceNumber::new(seq)))
+        .collect();
+    assert_eq!(recovered_mutations2, expected);
 
     let (deltas, has_more) = log2.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
-    assert_eq!(deltas.len(), 10);
+    assert_contiguous(&deltas, 1, 10);
     assert!(!has_more);
 }
 
@@ -1720,11 +1481,9 @@ fn test_unified_wal_dedup_idempotency() {
         let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
 
         for i in 1..=5 {
-            let seq = SequenceNumber::new(i);
             let mutation_id = MutationId::from_u128(i as u128 * 42);
-            let op = make_op(seq.get());
-            log.append(op, Some(mutation_id)).unwrap();
-            expected_entries.push((mutation_id, seq));
+            log.append(make_op(i), Some(mutation_id)).unwrap();
+            expected_entries.push((mutation_id, SequenceNumber::new(i)));
         }
     }
 
@@ -1755,51 +1514,28 @@ fn test_unified_wal_dedup_idempotency() {
 #[test]
 fn test_unified_wal_crc_tampering_detection() {
     let dir = tempdir().unwrap();
-    let policy = RoomLifecyclePolicy::default();
-
-    {
-        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
-        for i in 1..=3 {
-            let seq = SequenceNumber::new(i);
-            let mutation_id = MutationId::from_u128(i as u128);
-            let op = make_op(seq.get());
-            log.append(op, Some(mutation_id)).unwrap();
-        }
-    }
-
-    let active_path = dir.path().join("segments").join("active.wal");
-    let mut data = std::fs::read(&active_path).unwrap();
+    let active_path = write_log(dir.path(), 3);
 
     // Corrupt one byte in the middle of the first batch (after batch header)
+    let mut data = std::fs::read(&active_path).unwrap();
     data[18] ^= 0xFF;
     std::fs::write(&active_path, data).unwrap();
 
-    let err = TieredLog::open_or_create(dir.path(), policy).err().unwrap();
-    match err {
-        ServerError::WalCorruption(msg) => {
-            assert!(msg.contains("CRC") || msg.contains("crc") || msg.contains("Corruption"));
-        }
-        other => panic!("Expected WalCorruption, got: {:?}", other),
-    }
+    let err = TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default())
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&err, ServerError::WalCorruption(msg)
+            if msg.contains("CRC") || msg.contains("crc") || msg.contains("Corruption")),
+        "{err:?}"
+    );
 }
 
 #[test]
 fn test_unified_wal_torn_write_recovery_and_truncation() {
     let dir = tempdir().unwrap();
-    let policy = RoomLifecyclePolicy::default();
-
-    {
-        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
-        for i in 1..=3 {
-            let seq = SequenceNumber::new(i);
-            let mutation_id = MutationId::from_u128(i as u128);
-            let op = make_op(seq.get());
-            log.append(op, Some(mutation_id)).unwrap();
-        }
-    }
-
-    let active_path = dir.path().join("segments").join("active.wal");
-    let clean_len = std::fs::metadata(&active_path).unwrap().len();
+    let active_path = write_log(dir.path(), 3);
+    let clean_len = file_len(&active_path);
 
     // Simulate a torn write by appending incomplete bytes to active.wal
     {
@@ -1807,37 +1543,25 @@ fn test_unified_wal_torn_write_recovery_and_truncation() {
         file.write_all(&[0x52, 0x49, 0x4D, 0x42, 0x01, 0x00, 0x00, 0x00, 0xAA, 0xBB])
             .unwrap();
     }
-
-    let damaged_len = std::fs::metadata(&active_path).unwrap().len();
-    assert_eq!(damaged_len, clean_len + 10);
+    assert_eq!(file_len(&active_path), clean_len + 10);
 
     // Reopen log: torn write should be detected and automatically truncated to clean_len
-    let (mut log2, recovered_mutations) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    let (mut log2, recovered_mutations) =
+        TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).unwrap();
     assert_eq!(log2.head_seq().get(), 3);
     assert_eq!(recovered_mutations.len(), 3);
-
-    let truncated_disk_len = std::fs::metadata(&active_path).unwrap().len();
-    assert_eq!(truncated_disk_len, clean_len);
+    assert_eq!(file_len(&active_path), clean_len);
 
     // Verify subsequent append proceeds contiguously
-    let op4 = make_op(4);
-    log2.append(op4, Some(MutationId::from_u128(4))).unwrap();
+    log2.append(make_op(4), Some(mutation_for(4))).unwrap();
     assert_eq!(log2.head_seq().get(), 4);
 }
 
 #[test]
 fn test_unified_wal_zero_filled_eof_truncation() {
     let dir = tempdir().unwrap();
-    let policy = RoomLifecyclePolicy::default();
-
-    {
-        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
-        let op1 = make_op(1);
-        log.append(op1, Some(MutationId::from_u128(1))).unwrap();
-    }
-
-    let active_path = dir.path().join("segments").join("active.wal");
-    let clean_len = std::fs::metadata(&active_path).unwrap().len();
+    let active_path = write_log(dir.path(), 1);
+    let clean_len = file_len(&active_path);
 
     // Simulate zero-filled tail appended due to crash during allocation
     {
@@ -1845,10 +1569,9 @@ fn test_unified_wal_zero_filled_eof_truncation() {
         file.write_all(&[0u8; 512]).unwrap();
     }
 
-    let (log2, recovered_mutations) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    let (log2, recovered_mutations) =
+        TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).unwrap();
     assert_eq!(log2.head_seq().get(), 1);
     assert_eq!(recovered_mutations.len(), 1);
-
-    let disk_len = std::fs::metadata(&active_path).unwrap().len();
-    assert_eq!(disk_len, clean_len);
+    assert_eq!(file_len(&active_path), clean_len);
 }

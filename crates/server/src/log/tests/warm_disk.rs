@@ -1,15 +1,6 @@
 use super::*;
+use crate::log::test_support::{frames, make_op, segment_file};
 use tempfile::tempdir;
-use zemdb_core::mutation::Operation;
-use zemdb_core::value::{PrimaryKey, Value};
-
-fn make_op(seq: u64) -> SequencedOperation {
-    let pk = PrimaryKey::single(Value::Int(seq as i64));
-    SequencedOperation::new(
-        SequenceNumber::new(seq),
-        Operation::delete(1, pk, seq * 1000),
-    )
-}
 
 #[test]
 fn append_into_empty_existing_active_wal_tracks_start_seq() {
@@ -40,13 +31,7 @@ fn empty_existing_active_wal_still_rotates() {
 
     let sealed = log.rotate_active_segment().unwrap();
 
-    assert_eq!(
-        sealed,
-        Some(
-            dir.path()
-                .join("segment_0000000000000001_0000000000000003.wal")
-        )
-    );
+    assert_eq!(sealed, Some(segment_file(dir.path(), 1, 3, "wal")));
     assert!(sealed.unwrap().exists());
     assert!(!dir.path().join("active.wal").exists());
 }
@@ -77,12 +62,7 @@ fn creating_a_new_active_segment_syncs_the_directory() {
 /// Writes `active.wal` with one frame per sequence number, and returns its bytes and the offset
 /// of each frame.
 fn write_active(dir: &Path, seqs: std::ops::RangeInclusive<u64>) -> (Vec<u8>, Vec<usize>) {
-    let mut wal = Vec::new();
-    let mut offsets = Vec::new();
-    for seq in seqs {
-        offsets.push(wal.len());
-        wal.extend_from_slice(&encode_wal_record(&make_op(seq), None).unwrap());
-    }
+    let (wal, offsets) = frames(seqs);
     std::fs::write(dir.join(ACTIVE_SEGMENT), &wal).unwrap();
     (wal, offsets)
 }
@@ -124,9 +104,7 @@ fn damaged_length_in_the_middle_is_corruption_and_leaves_the_segment_intact() {
         assert_eq!(std::fs::read(&active).unwrap(), wal, "{name}");
 
         // A sealed segment with the same damage fails to read instead of returning a prefix.
-        let sealed = dir
-            .path()
-            .join("segment_0000000000000001_0000000000000003.wal");
+        let sealed = segment_file(dir.path(), 1, 3, "wal");
         std::fs::write(&sealed, &wal).unwrap();
         let mut all = ReadBudget::ops(usize::MAX);
         assert!(
@@ -170,31 +148,8 @@ fn zeroed_header_followed_by_a_valid_frame_is_corruption() {
     assert_eq!(std::fs::read(&active).unwrap(), wal);
 }
 
-#[test]
-fn test_multi_process_file_lock_collision_on_active_wal() {
-    let dir = tempdir().unwrap();
-    let mut log1 = WarmDiskLog::open_or_create(dir.path()).unwrap();
-
-    let pk = PrimaryKey::single(Value::Int(1));
-    let op = Operation::delete(1, pk, 1000);
-    let seq_op = SequencedOperation::new(SequenceNumber::new(1), op);
-
-    // Appending a record acquires and retains exclusive flock on active.wal
-    log1.append_record(&seq_op, None).unwrap();
-
-    // Opening a second WarmDiskLog instance against the same directory must fail with RoomLocked
-    let log2_res = WarmDiskLog::open_or_create(dir.path());
-    match log2_res {
-        Err(ServerError::RoomLocked(msg)) => {
-            assert!(
-                msg.contains("active.wal locked by another process"),
-                "Expected RoomLocked error message, got: {}",
-                msg
-            );
-        }
-        Ok(_) => panic!("Expected RoomLocked error, but second open succeeded"),
-        Err(other) => panic!("Expected RoomLocked error, got: {:?}", other),
-    }
+fn is_locked(res: &Result<WarmDiskLog, ServerError>) -> bool {
+    matches!(res, Err(ServerError::RoomLocked(m)) if m.contains("active.wal locked by another process"))
 }
 
 #[test]
@@ -202,14 +157,14 @@ fn test_multi_thread_warm_disk_log_flock_concurrency_stress() {
     let dir = tempdir().unwrap();
     let path = dir.path().to_path_buf();
 
-    // 1. Initial log opens and appends a record, acquiring and holding kernel flock on active.wal
+    // Appending a record acquires and retains the exclusive flock on active.wal.
     let mut initial_log = WarmDiskLog::open_or_create(&path).unwrap();
-    let pk0 = PrimaryKey::single(Value::Int(0));
-    let op0 = Operation::delete(1, pk0, 100);
-    let seq_op0 = SequencedOperation::new(SequenceNumber::new(1), op0);
-    initial_log.append_record(&seq_op0, None).unwrap();
+    initial_log.append_record(&make_op(1), None).unwrap();
 
-    // 2. Spawn 12 concurrent threads contending to open_or_create against the locked directory
+    // A second open against the locked directory fails, and so do 12 concurrent ones.
+    let res = WarmDiskLog::open_or_create(&path);
+    assert!(is_locked(&res), "{res:?}");
+
     const NUM_THREADS: usize = 12;
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(NUM_THREADS));
     let mut handles = Vec::new();
@@ -224,34 +179,14 @@ fn test_multi_thread_warm_disk_log_flock_concurrency_stress() {
         }));
     }
 
-    let mut locked_errors = 0;
     for handle in handles {
         let res = handle.join().unwrap();
-        match res {
-            Err(ServerError::RoomLocked(msg)) => {
-                assert!(msg.contains("active.wal locked by another process"));
-                locked_errors += 1;
-            }
-            Ok(_) => {
-                panic!("Concurrent open_or_create must not succeed while active.wal is locked")
-            }
-            Err(other) => panic!("Expected RoomLocked, got: {other:?}"),
-        }
+        assert!(is_locked(&res), "{res:?}");
     }
 
-    assert_eq!(
-        locked_errors, NUM_THREADS,
-        "All 12 concurrent threads must be rejected with RoomLocked"
-    );
-
-    // 3. Drop initial_log, releasing the kernel flock
+    // Dropping the log releases the flock: the next instance acquires it and appends.
     drop(initial_log);
-
-    // 4. Now a subsequent instance can successfully acquire the lock and append records
     let mut next_log = WarmDiskLog::open_or_create(&path).unwrap();
-    let pk = PrimaryKey::single(Value::Int(99));
-    let op = Operation::delete(1, pk, 9999);
-    let seq_op = SequencedOperation::new(SequenceNumber::new(2), op);
-    next_log.append_record(&seq_op, None).unwrap();
+    next_log.append_record(&make_op(2), None).unwrap();
     assert_eq!(next_log.active_end_seq().unwrap().get(), 2);
 }

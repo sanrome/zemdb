@@ -1,9 +1,6 @@
 use super::*;
+use crate::log::test_support::seq;
 use tempfile::tempdir;
-
-fn seq(n: u64) -> SequenceNumber {
-    SequenceNumber::new(n)
-}
 
 #[test]
 fn scan_indexes_both_tiers_in_sequence_order_and_ignores_other_files() {

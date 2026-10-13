@@ -1,8 +1,5 @@
 use super::*;
-
-fn seq(n: u64) -> SequenceNumber {
-    SequenceNumber::new(n)
-}
+use crate::log::test_support::seq;
 
 #[test]
 fn new_room_lets_every_cursor_catch_up() {
