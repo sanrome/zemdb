@@ -124,6 +124,7 @@
 - **Problema:** ~110 líneas que repiten casos sin añadir cobertura y viven en un archivo cuyo tema es la validación de ids.
 - **Propuesta:** borrar los duplicados exactos y mover el caso `wrong_kind` y, si se quiere, el de relay/upload a `http_error_codes_tests.rs`. Ningún caso adversario desaparece.
 - **Ahorro estimado:** ~70–90 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 3). Se borraron los tres duplicados exactos (`token_for_another_room_gets_binary_forbidden`, `missing_token_gets_binary_unauthorized`, `sse_with_a_token_for_another_room_is_forbidden`) y `payload_identity_must_match_the_authenticated_request`, cuyo caso `GetSchema` en `/heartbeat` → 400 pasó a `payload_client_other_than_the_token_is_forbidden`. `relay_rejects_a_client_token_for_another_room_as_forbidden` se juntó con `valid_token_for_another_room_is_forbidden_on_every_extractor`, que ahora recorre en `RelayAuth` la descarga de chunk y la subida en un request. `id_validation_http_tests.rs` pasa de 17 a 12 tests y `http_error_codes_tests.rs` sigue con 8, con todos los casos.
 
 ### Q6. Tablas de casos para los 401/403 del data plane en `server_integration_tests.rs`
 - **Dónde:** `:1135-1246` (`…_rejected_without_bearer`: 5 endpoints × ~17 líneas), `:1249-1310` (expirado/adulterado), `:1313-1403` (path/token/payload), `:1406-1460` (`dev-token`).
@@ -162,6 +163,7 @@
 - **Dónde:** POST binarios inline en `:281-308`, `:311-331`, `:373-425`, `:472-525`, `:525-566`, `:587-608`; el assert JSON «status 400 + `body["code"] == "BadRequest"`» en `:97-103`, `:146-153`, `:438-441`, `:579-583` (415 + `"BadRequest"`) y `admin_schema_http_tests.rs:96-100`.
 - **Propuesta:** `server.post(path, bearer, body)` (ya existe en `http_error_codes_tests.rs:91-101`; con Q4 va a `common`) y `assert_json_error(resp, StatusCode::BAD_REQUEST, "BadRequest")`. En `:132-135` el `match decode_message…` inline es `assert_binary_error` sin el chequeo de `content-type` (usarlo es más estricto; **a verificar** que esa ruta responda `application/octet-stream`, como afirman los demás tests de errores binarios).
 - **Ahorro estimado:** ~60–80 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 3). `id_validation_http_tests.rs` usa `common::TestServer::post` (y `admin()` para el control plane) y `assert_json_error`, también en `admin_schema_http_tests.rs::assert_rejected`. El `match decode_message…` de `data_plane_request_with_invalid_room_id_gets_binary_bad_request` pasó a `assert_binary_error`: la ruta responde `application/octet-stream`. Donde el assert de status llevaba el id del caso en el mensaje, se conserva antes del helper.
 
 ### Q10. Test de `ClientLeaseTracker` dentro del archivo de integración HTTP
 - **Dónde:** `server_integration_tests.rs:1641-1718` `test_client_lease_disconnected_to_dormant_timeout` (`#[test]` síncrono, sin server).

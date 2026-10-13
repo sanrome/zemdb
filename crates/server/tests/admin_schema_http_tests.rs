@@ -4,73 +4,16 @@
 //! those ids, is not accepted. A schema id is declared once: posting it again is 409
 //! `SchemaAlreadyExists`, and schemas evolve only through `POST /admin/schemas/{id}/columns`.
 
-use reqwest::StatusCode;
+mod common;
+
+use common::{assert_json_error, TestServer};
+use reqwest::{Method, StatusCode};
 use serde_json::{json, Value as Json};
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
-use tempfile::{tempdir, TempDir};
 use zemdb_core::{RoomId, SchemaId};
 use zemdb_server::actor::command::RoomCommand;
-use zemdb_server::api::router::{build_router, AppState};
-use zemdb_server::config::ServerConfig;
-use zemdb_server::relay::SnapshotRelay;
-use zemdb_server::schema_registry::SchemaRegistry;
-use zemdb_server::RoomManager;
-
-const ADMIN_SECRET: &str = "schema_admin_secret_key_123456789";
-const AUTH_SECRET: &str = "schema_cluster_secret_key_12345678";
-
-struct TestServer {
-    base_url: String,
-    data_dir: PathBuf,
-    client: reqwest::Client,
-    room_manager: Arc<RoomManager>,
-    _dir: TempDir,
-}
 
 async fn start_server() -> TestServer {
-    let dir = tempdir().unwrap();
-    let data_dir = dir.path().join("data");
-    let config = Arc::new(ServerConfig {
-        data_dir: data_dir.clone(),
-        auth_secret: AUTH_SECRET.to_string(),
-        admin_secret: ADMIN_SECRET.to_string(),
-        ..ServerConfig::default()
-    });
-    let schema_registry = Arc::new(SchemaRegistry::new(data_dir.join("schemas")).unwrap());
-    let relay = Arc::new(
-        SnapshotRelay::new(
-            data_dir.join("snapshots"),
-            Duration::from_secs(60),
-            config.max_snapshot_bytes,
-        )
-        .unwrap(),
-    );
-    let room_manager = Arc::new(RoomManager::new(
-        Arc::clone(&config),
-        Arc::clone(&schema_registry),
-        Arc::clone(&relay),
-    ));
-    let app = build_router(AppState::new(
-        config,
-        schema_registry,
-        Arc::clone(&room_manager),
-        relay,
-    ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    TestServer {
-        base_url: format!("http://{addr}"),
-        data_dir,
-        client: reqwest::Client::new(),
-        room_manager,
-        _dir: dir,
-    }
+    TestServer::start(|_| {}).await
 }
 
 fn table_json(table_id: u16, name: &str) -> Json {
@@ -84,9 +27,7 @@ fn table_json(table_id: u16, name: &str) -> Json {
 
 async fn post_schema(server: &TestServer, schema_id: &str, schema: Json) -> reqwest::Response {
     server
-        .client
-        .post(format!("{}/admin/schemas", server.base_url))
-        .bearer_auth(ADMIN_SECRET)
+        .admin(Method::POST, "/admin/schemas")
         .json(&json!({"schema_id": schema_id, "schema": schema}))
         .send()
         .await
@@ -95,9 +36,7 @@ async fn post_schema(server: &TestServer, schema_id: &str, schema: Json) -> reqw
 
 async fn assert_rejected(server: &TestServer, schema_id: &str, schema: Json) {
     let resp = post_schema(server, schema_id, schema).await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body: Json = resp.json().await.unwrap();
-    assert_eq!(body["code"], "BadRequest", "{body}");
+    assert_json_error(resp, StatusCode::BAD_REQUEST, "BadRequest").await;
     assert!(
         !server
             .data_dir
@@ -121,9 +60,7 @@ async fn table_zero_listed_after_another_table_keeps_its_id() {
     assert_eq!(resp.status(), StatusCode::CREATED);
 
     let resp = server
-        .client
-        .get(format!("{}/admin/schemas/ordered", server.base_url))
-        .bearer_auth(ADMIN_SECRET)
+        .admin(Method::GET, "/admin/schemas/ordered")
         .send()
         .await
         .unwrap();
@@ -189,9 +126,7 @@ async fn posting_an_existing_schema_id_again_is_a_conflict_and_changes_nothing()
     let resp = post_schema(&server, "todo", original).await;
     assert_eq!(resp.status(), StatusCode::CREATED);
     let resp = server
-        .client
-        .post(format!("{}/admin/rooms", server.base_url))
-        .bearer_auth(ADMIN_SECRET)
+        .admin(Method::POST, "/admin/rooms")
         .json(&json!({"room_id": "room-a", "schema_id": "todo"}))
         .send()
         .await
@@ -217,9 +152,7 @@ async fn posting_an_existing_schema_id_again_is_a_conflict_and_changes_nothing()
     assert_eq!(body["code"], "SchemaAlreadyExists", "{body}");
 
     let resp = server
-        .client
-        .get(format!("{}/admin/schemas/todo", server.base_url))
-        .bearer_auth(ADMIN_SECRET)
+        .admin(Method::GET, "/admin/schemas/todo")
         .send()
         .await
         .unwrap();
