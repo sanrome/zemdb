@@ -30,12 +30,17 @@ La densidad es adecuada (≈15 % doc) y la mayoría explica el *por qué*. Punto
 
 - **Vagos o imprecisos:**
   - `snapshot.rs:32` `Encapsulates a serialized room snapshot into the universal canonical container.` y `snapshot.rs:69` `Decodes and validates a universal snapshot envelope`: “universal canonical” no aporta nada. Mejor: “Envuelve `payload_bytes` en un sobre `ZMSN`, comprimiéndolo con Zstandard si `compress_zstd`.”
+    - **Estado:** ✅ aplicada (paso 1)
   - `engine.rs:44` `(move semantics)`: es ruido, la firma ya recibe `Vec` por valor.
+    - **Estado:** ✅ aplicada (paso 1)
   - `engine.rs:127`: la doc de `apply_scan_transforms` ocupa una sola línea de más de 100 columnas (“…lazily over an iterator of rows without eager allocation”). Partirla o acortarla.
+    - **Estado:** ✅ aplicada (paso 1)
 - **Recortables:**
   - `fail_point.rs:1-12`: la doc de módulo, de 12 líneas, enumera cada función, y las docs de cada función ya lo dicen. Se puede reducir a ~5 líneas (propósito, no-op fuera de tests, armado por ruta, disparo único) (−6).
+    - **Estado:** ✅ aplicada (paso 1)
   - `engine.rs:52`, `60`, `77`, `85`, `88`: docs de una línea que repiten el nombre del método (“Fetches a single row by primary key…”). Son aceptables en un trait público; no vale la pena tocarlas.
 - **Falta (no suma ahorro, pero suma claridad):** `EngineConcurrencyBounds` (`engine.rs:12-20`) no tiene doc. Una línea (“`Send + Sync` salvo en wasm32”) explicaría el patrón.
+  - **Estado:** ✅ aplicada (paso 1)
 - **Conservar sí o sí:**
   - `snapshot.rs:21-25` y `76-81`: el tamaño declarado no es confiable; la descompresión se corta un byte después del tamaño declarado.
   - `snapshot.rs:138-144`: dónde se acota cada reserva de memoria.
@@ -88,6 +93,7 @@ La densidad es adecuada (≈15 % doc) y la mayoría explica el *por qué*. Punto
   El método inherente `contains` no tiene usos en el workspace, pero es API pública: conviene conservarlo como delegación en vez de borrarlo.
 - **Ahorro estimado:** ~20 líneas · **Riesgo:** bajo · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ✅ confirmada — `Value` y `PrimaryKey` tienen un `Ord` total (`core/src/value/scalar.rs:307`), así que `start <= pk` equivale a `pk >= start`. `Bound::as_ref` existe desde 1.65, y no hay `rust-version` ni toolchain fijado.
+- **Estado:** ✅ aplicada (paso 1). El test de `KeyRange::contains` que sugiere la sección de tests queda para el paso 3.
 
 ### Q3. `fail_point.rs`: helper de búsqueda y guardas `cfg` redundantes
 - **Dónde:** `fail_point.rs:44-50`, `147-153` y `227-233` (buscar y quitar repetido), además de `73-78` y `96-103`.
@@ -116,6 +122,7 @@ La densidad es adecuada (≈15 % doc) y la mayoría explica el *por qué*. Punto
   6. Rendimiento, sin cambio de líneas: con payload sin comprimir, `encode_snapshot_envelope` copia el payload dos veces (`payload_bytes.to_vec()` en `51`/`57` y luego `extend_from_slice` en `64`). Un `Cow<[u8]>` evita la primera copia.
 - **Propuesta:** borrar las constantes; usar `let _ = (compress_zstd, zstd_level);` en la rama wasm y quitar el `allow`; definir un `fn zstd_unsupported() -> StorageError` (o una constante) para los stubs; usar un closure `let failed = |e| StorageError::SnapshotCorruption(format!("Zstd decompression failed: {e}"));`; dejar un único `#[cfg(not(target_arch = "wasm32"))] use std::io::{BufReader, Read};` arriba. Los mensajes `"larger than declared"` y `"length mismatch"` los compara `tests/snapshot_decompression_bounds_tests.rs:56,64`: **no cambiarlos**.
 - **Ahorro estimado:** ~12–15 líneas · **Riesgo:** bajo (las constantes son API pública: **a verificar** si hay consumidores externos) · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 1) en los puntos 2 (`let _ = (compress_zstd, zstd_level);` sin `allow`), 4 (closure `failed`), 5 (un único `use std::io::{BufReader, Read};`) y 6 (`Cow<[u8]>` para el cuerpo sin comprimir), y en las docs de `snapshot.rs:32` y `69`. El punto 1 (borrar `COMPRESSION_*`, API pública) queda para el paso 4 y el punto 3 (helper compartido por los dos stubs de wasm) para el paso 2.
 
 ### Q5. `error.rs`: variante sin uso
 - **Dónde:** `error.rs:56-57` (`EngineClosed`) y `74-80`.
@@ -123,11 +130,13 @@ La densidad es adecuada (≈15 % doc) y la mayoría explica el *por qué*. Punto
 - **Propuesta:** eliminar la variante, o documentar para qué se reserva. Importar `use zemdb_core::WalFrameError;`.
 - **Ahorro estimado:** ~3 líneas · **Riesgo:** medio (enum público: quitar una variante rompe un `match` exhaustivo externo; **a verificar**) · **Prioridad:** baja
 - **Verificación (2.ª pasada):** ✅ confirmada — no hay ninguna referencia a `EngineClosed` en los `.rs` del repo. `StorageError` no es `#[non_exhaustive]` y `lib.rs` lo reexporta, así que quitar la variante rompe semver. El riesgo medio es correcto.
+- **Estado:** ✅ aplicada (paso 1) solo en el `use zemdb_core::WalFrameError;`. Quitar `EngineClosed` es un cambio de API pública y queda para el paso 4.
 
 ### Q6. `sys.rs`: encadenar
 - **Dónde:** `sys.rs:17-18`.
 - **Propuesta:** `std::fs::File::open(target)?.sync_all()?;`, igual que la copia del server (`crates/server/src/durable.rs:26`).
 - **Ahorro estimado:** ~1 línea · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q7. Helper de `spawn_blocking` con mapeo del `JoinError` (todo el crate)
 - **Dónde:** 12 apariciones de `.map_err(|e| StorageError::Other(format!("Join error: {e}")))` en `crates/storage/src` (por ejemplo `memory/mod.rs:330`, `367` y `disk/mod.rs:494`, `709`, `741`).

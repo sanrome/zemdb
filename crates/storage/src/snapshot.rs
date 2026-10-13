@@ -7,6 +7,9 @@
 use crate::error::StorageError;
 use bincode::Options;
 use serde::de::DeserializeOwned;
+use std::borrow::Cow;
+#[cfg(not(target_arch = "wasm32"))]
+use std::io::{BufReader, Read};
 pub use zemdb_core::protocol::snapshot_envelope::{
     SnapshotCompression, SnapshotEnvelopeHeader, SNAPSHOT_HEADER_LEN, SNAPSHOT_MAGIC,
     SNAPSHOT_VERSION,
@@ -29,11 +32,11 @@ pub const DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_DECOMPRESSION_PREALLOCATION: usize = 64 * 1024 * 1024;
 
-/// Encapsulates a serialized room snapshot into the universal canonical container.
+/// Wraps `payload_bytes` in a `ZMSN` envelope, compressing it with Zstandard if `compress_zstd`.
 pub fn encode_snapshot_envelope(
     payload_bytes: &[u8],
     compress_zstd: bool,
-    #[allow(unused_variables)] zstd_level: i32,
+    zstd_level: i32,
 ) -> Result<Vec<u8>, StorageError> {
     let uncompressed_len = u32::try_from(payload_bytes.len()).map_err(|_| {
         StorageError::Serialization(format!(
@@ -46,15 +49,15 @@ pub fn encode_snapshot_envelope(
     let (body_bytes, compression) = if compress_zstd {
         let compressed = zstd::encode_all(payload_bytes, zstd_level)
             .map_err(|e| StorageError::Serialization(format!("Zstd compression failed: {e}")))?;
-        (compressed, SnapshotCompression::Zstd)
+        (Cow::Owned(compressed), SnapshotCompression::Zstd)
     } else {
-        (payload_bytes.to_vec(), SnapshotCompression::Raw)
+        (Cow::Borrowed(payload_bytes), SnapshotCompression::Raw)
     };
 
     #[cfg(target_arch = "wasm32")]
     let (body_bytes, compression) = {
-        let _ = compress_zstd;
-        (payload_bytes.to_vec(), SnapshotCompression::Raw)
+        let _ = (compress_zstd, zstd_level);
+        (Cow::Borrowed(payload_bytes), SnapshotCompression::Raw)
     };
 
     let header = SnapshotEnvelopeHeader::for_body(compression, uncompressed_len, &body_bytes);
@@ -66,7 +69,7 @@ pub fn encode_snapshot_envelope(
     Ok(envelope)
 }
 
-/// Decodes and validates a universal snapshot envelope, returning the uncompressed Bincode
+/// Decodes and validates a `ZMSN` snapshot envelope, returning the uncompressed Bincode
 /// payload. The payload may not exceed [`DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES`]; see
 /// [`decode_snapshot_envelope_with_limit`].
 pub fn decode_snapshot_envelope(envelope_bytes: &[u8]) -> Result<Vec<u8>, StorageError> {
@@ -162,8 +165,6 @@ pub(crate) fn deserialize_zstd<T: DeserializeOwned>(
     limit: u64,
     exact_len: Option<u64>,
 ) -> Result<T, StorageError> {
-    use std::io::{BufReader, Read};
-
     let corruption = |e: &dyn std::fmt::Display| {
         StorageError::SnapshotCorruption(format!("Snapshot payload decode failed: {e}"))
     };
@@ -220,8 +221,6 @@ impl<R: std::io::Read> PayloadReader<R> {
     /// `STREAM_BUFFER` bytes are reserved up front; beyond that the buffer grows with the bytes
     /// read.
     fn read_exactly(&mut self, length: usize) -> bincode::Result<Vec<u8>> {
-        use std::io::Read;
-
         let mut bytes = Vec::with_capacity(length.min(STREAM_BUFFER));
         self.by_ref().take(length as u64).read_to_end(&mut bytes)?;
         if bytes.len() != length {
@@ -269,10 +268,10 @@ impl<'de, R: std::io::Read> bincode::BincodeRead<'de> for &mut PayloadReader<R> 
 
 #[cfg(not(target_arch = "wasm32"))]
 fn decompress_bounded(body: &[u8], declared_len: u64) -> Result<Vec<u8>, StorageError> {
-    use std::io::Read;
-
-    let decoder = zstd::stream::read::Decoder::new(body)
-        .map_err(|e| StorageError::SnapshotCorruption(format!("Zstd decompression failed: {e}")))?;
+    let failed = |e: std::io::Error| {
+        StorageError::SnapshotCorruption(format!("Zstd decompression failed: {e}"))
+    };
+    let decoder = zstd::stream::read::Decoder::new(body).map_err(failed)?;
     let capacity = usize::try_from(declared_len)
         .unwrap_or(usize::MAX)
         .min(MAX_DECOMPRESSION_PREALLOCATION);
@@ -280,7 +279,7 @@ fn decompress_bounded(body: &[u8], declared_len: u64) -> Result<Vec<u8>, Storage
     decoder
         .take(declared_len.saturating_add(1))
         .read_to_end(&mut decompressed)
-        .map_err(|e| StorageError::SnapshotCorruption(format!("Zstd decompression failed: {e}")))?;
+        .map_err(failed)?;
 
     let actual_len = decompressed.len() as u64;
     if actual_len > declared_len {

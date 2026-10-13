@@ -14,8 +14,7 @@ pub fn sync_dir(dir_path: &Path) -> std::io::Result<()> {
         } else {
             dir_path
         };
-        let file = std::fs::File::open(target)?;
-        file.sync_all()?;
+        std::fs::File::open(target)?.sync_all()?;
     }
     #[cfg(not(unix))]
     {

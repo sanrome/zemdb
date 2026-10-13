@@ -9,11 +9,13 @@ use zemdb_core::{
 use crate::error::StorageError;
 use crate::options::ScanOptions;
 
+/// `Send + Sync`, except on wasm32, where engines are single-threaded.
 #[cfg(not(target_arch = "wasm32"))]
 pub trait EngineConcurrencyBounds: Send + Sync {}
 #[cfg(not(target_arch = "wasm32"))]
 impl<T: Send + Sync> EngineConcurrencyBounds for T {}
 
+/// `Send + Sync`, except on wasm32, where engines are single-threaded.
 #[cfg(target_arch = "wasm32")]
 pub trait EngineConcurrencyBounds {}
 #[cfg(target_arch = "wasm32")]
@@ -41,7 +43,7 @@ pub trait StorageEngine: EngineConcurrencyBounds {
     /// Closes a room, releasing any associated resources or file handles.
     async fn close_room(&self, room_id: &RoomId) -> Result<(), StorageError>;
 
-    /// Applies a batch of sequenced operations to the storage engine (move semantics).
+    /// Applies a batch of sequenced operations to the storage engine.
     /// Returns the new head sequence number.
     async fn apply_batch(
         &self,
@@ -124,7 +126,7 @@ pub(crate) type ScanIterator<'a> =
 pub(crate) type ScanIterator<'a> =
     Box<dyn Iterator<Item = Result<(PrimaryKey, CompactRow), StorageError>> + 'a>;
 
-/// Helper to apply column projection and limit pushdowns lazily over an iterator of rows without eager allocation.
+/// Applies the column projection and the limit lazily, without collecting the rows.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn apply_scan_transforms<'a, I>(
     iter: I,

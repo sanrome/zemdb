@@ -1,5 +1,5 @@
 use thiserror::Error;
-use zemdb_core::{RoomId, SequenceNumber, ValidationError};
+use zemdb_core::{RoomId, SequenceNumber, ValidationError, WalFrameError};
 
 /// Storage errors that can occur during storage engine operations.
 #[derive(Debug, Error)]
@@ -71,11 +71,11 @@ impl From<bincode::Error> for StorageError {
     }
 }
 
-impl From<zemdb_core::WalFrameError> for StorageError {
-    fn from(err: zemdb_core::WalFrameError) -> Self {
+impl From<WalFrameError> for StorageError {
+    fn from(err: WalFrameError) -> Self {
         match err {
-            zemdb_core::WalFrameError::Serialization(s) => StorageError::Serialization(s),
-            zemdb_core::WalFrameError::Corruption(s) => StorageError::WalCorruption(s),
+            WalFrameError::Serialization(s) => StorageError::Serialization(s),
+            WalFrameError::Corruption(s) => StorageError::WalCorruption(s),
         }
     }
 }

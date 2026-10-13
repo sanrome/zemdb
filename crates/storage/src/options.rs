@@ -35,35 +35,17 @@ impl KeyRange {
 
     /// Checks if a given primary key falls within this range.
     pub fn contains(&self, pk: &PrimaryKey) -> bool {
-        let start_ok = match &self.start {
-            Bound::Included(start) => pk >= start,
-            Bound::Excluded(start) => pk > start,
-            Bound::Unbounded => true,
-        };
-        let end_ok = match &self.end {
-            Bound::Included(end) => pk <= end,
-            Bound::Excluded(end) => pk < end,
-            Bound::Unbounded => true,
-        };
-        start_ok && end_ok
+        RangeBounds::contains(self, pk)
     }
 }
 
 impl RangeBounds<PrimaryKey> for KeyRange {
     fn start_bound(&self) -> Bound<&PrimaryKey> {
-        match &self.start {
-            Bound::Included(pk) => Bound::Included(pk),
-            Bound::Excluded(pk) => Bound::Excluded(pk),
-            Bound::Unbounded => Bound::Unbounded,
-        }
+        self.start.as_ref()
     }
 
     fn end_bound(&self) -> Bound<&PrimaryKey> {
-        match &self.end {
-            Bound::Included(pk) => Bound::Included(pk),
-            Bound::Excluded(pk) => Bound::Excluded(pk),
-            Bound::Unbounded => Bound::Unbounded,
-        }
+        self.end.as_ref()
     }
 }
 

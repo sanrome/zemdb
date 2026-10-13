@@ -1,15 +1,9 @@
 //! Test infrastructure: fault injection points for crash and I/O failure tests.
 //!
-//! Production code calls `check` at the exact spots where a crash or I/O error must be
-//! reproducible, and `pause` where a test must hold an operation in the middle (for example
-//! while a WAL sync is in progress); `pause_blocking` does the same on the blocking pool. Three
-//! variants act on what is at hand instead of failing before it: `panic_point` panics,
-//! `io_result` replaces the result of an I/O call with an error, and `read_only_handle` swaps a
-//! file handle for one whose writes fail in the background. In non-test builds all of them are
-//! empty functions (or return their input) that the compiler removes, so they have no runtime
-//! effect. In unit-test builds a test arms a point for a specific file path with `arm`,
-//! `arm_pause` or `arm_blocking_pause`, so tests running in parallel never interfere with each
-//! other; each armed point fires once.
+//! Production code marks the spots where a test must inject a failure or hold an operation in
+//! the middle. Outside test builds every point does nothing (or returns its input) and the
+//! compiler removes it. A test arms a point for a specific file path, so tests running in
+//! parallel never interfere with each other, and each armed point fires once.
 
 use crate::error::StorageError;
 use std::path::Path;
