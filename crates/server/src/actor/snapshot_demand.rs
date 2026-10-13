@@ -78,16 +78,13 @@ impl SnapshotDemand {
     }
 
     fn extend_until(&mut self, expires_at: Instant) {
-        match self.active.as_mut() {
-            Some(demand) => demand.expires_at = expires_at,
-            None => {
-                self.active = Some(ActiveDemand {
-                    expires_at,
-                    designee: None,
-                    excluded: HashSet::new(),
-                })
-            }
-        }
+        self.active
+            .get_or_insert_with(|| ActiveDemand {
+                expires_at,
+                designee: None,
+                excluded: HashSet::new(),
+            })
+            .expires_at = expires_at;
     }
 
     /// Restores a demand persisted before a restart, last renewed at the wall-clock time
@@ -100,9 +97,7 @@ impl SnapshotDemand {
         wall_now: SystemTime,
         now: Instant,
     ) -> bool {
-        let age = wall_now
-            .duration_since(renewed_at)
-            .unwrap_or(Duration::ZERO);
+        let age = wall_now.duration_since(renewed_at).unwrap_or_default();
         let Some(remaining) = self.ttl.checked_sub(age).filter(|r| !r.is_zero()) else {
             return false;
         };

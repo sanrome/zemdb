@@ -181,9 +181,8 @@ impl ClientLeaseTracker {
         }
     }
 
-    /// Registers a client, setting its initial state based on its current cursor vs tail_seq:
-    /// - If `current_seq` is behind `tail_seq - 1` (or None in a pruned room), client enters `Bootstrapping`.
-    /// - Otherwise, client enters `Connected` with its actual acknowledged sequence.
+    /// Registers a client at the cursor `current_seq` (0 if `None`): `Bootstrapping` if that is
+    /// behind the retained log (`cursor < tail_seq - 1`), otherwise `Connected`.
     ///
     /// The roster is written with the new entry first; only then does the tracker change, so a
     /// failed write leaves the client as it was (unregistered, or with its previous entry).
@@ -239,10 +238,7 @@ impl ClientLeaseTracker {
         tail_seq: SequenceNumber,
     ) -> Option<ClientState> {
         let entry = self.clients.get_mut(client_id)?;
-        let cursor = match reported_cursor {
-            Some(reported) => reported.max(entry.last_ack_seq),
-            None => entry.last_ack_seq,
-        };
+        let cursor = reported_cursor.map_or(entry.last_ack_seq, |r| r.max(entry.last_ack_seq));
         let state = if is_behind_tail(cursor, tail_seq) {
             ClientState::Bootstrapping
         } else {
@@ -257,9 +253,7 @@ impl ClientLeaseTracker {
             entry.last_ack_seq = cursor;
             changed = true;
         }
-        if changed {
-            self.dirty = true;
-        }
+        self.dirty |= changed;
         Some(state)
     }
 
@@ -324,32 +318,21 @@ impl ClientLeaseTracker {
             true
         });
 
-        if modified {
-            self.dirty = true;
-        }
-
+        self.dirty |= modified;
         modified
     }
 
-    /// Returns the minimum cursor among all registered clients ONLY IF all non-dormant clients
-    /// are currently `Connected`. If any non-dormant client is `Disconnected`, returns `None`
-    /// to avoid prematurely truncating logs that the disconnected client may still need.
-    /// Clients in `Bootstrapping` do not block proactive pruning.
+    /// The lowest cursor among `Connected` clients, or `None` while any client is
+    /// `Disconnected`: it may still need the log. `Bootstrapping` and `Dormant` clients do not
+    /// block proactive pruning.
     pub fn min_connected_ack_seq(&self) -> Option<SequenceNumber> {
-        if self.clients.is_empty() {
-            return None;
-        }
-
-        // If any non-dormant member is Disconnected, do not prune proactively
-        let any_disconnected = self
+        if self
             .clients
             .values()
-            .any(|c| c.state == ClientState::Disconnected);
-        if any_disconnected {
+            .any(|c| c.state == ClientState::Disconnected)
+        {
             return None;
         }
-
-        // Find min ack across Connected clients (ignoring Dormant and Bootstrapping)
         self.clients
             .values()
             .filter(|c| c.state == ClientState::Connected)
@@ -369,12 +352,13 @@ impl ClientLeaseTracker {
             .is_some_and(|c| c.state == ClientState::Connected)
     }
 
-    /// Returns a reference to a client entry if registered.
+    /// The entry of `client_id`, if it is registered.
     pub fn get_client(&self, client_id: &ClientId) -> Option<&ClientEntry> {
         self.clients.get(client_id)
     }
 
-    /// Returns a mutable reference to a client entry if registered.
+    /// Like [`get_client`](Self::get_client), but changes made through it do not mark the
+    /// roster dirty.
     pub fn get_client_mut(&mut self, client_id: &ClientId) -> Option<&mut ClientEntry> {
         self.clients.get_mut(client_id)
     }
@@ -567,31 +551,20 @@ fn parse_roster(
                 clients.insert(entry.client_id.clone(), entry);
             }
             Err(e) => {
-                warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "Skipping invalid entry in clients roster"
-                );
+                warn!(path = %path.display(), error = %e, "Skipping invalid entry in clients roster")
             }
         }
     }
 
-    let snapshot_demand = match raw_demand {
-        None | Some(serde_json::Value::Null) => None,
-        Some(raw) => match serde_json::from_value::<PersistedDemand>(raw)
+    let snapshot_demand = raw_demand.filter(|raw| !raw.is_null()).and_then(|raw| {
+        let renewed_at = serde_json::from_value::<PersistedDemand>(raw)
             .ok()
-            .and_then(|demand| demand.to_time())
-        {
-            Some(renewed_at) => Some(renewed_at),
-            None => {
-                warn!(
-                    path = %path.display(),
-                    "Invalid snapshot demand in clients roster; treating it as off"
-                );
-                None
-            }
-        },
-    };
+            .and_then(|demand| demand.to_time());
+        if renewed_at.is_none() {
+            warn!(path = %path.display(), "Invalid snapshot demand in clients roster; treating it as off");
+        }
+        renewed_at
+    });
 
     (clients, snapshot_demand)
 }

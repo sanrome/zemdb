@@ -169,45 +169,19 @@ impl RoomCommand {
     /// it is only rejected once the actor has stopped.
     pub(crate) fn reject(self, err: ServerError) {
         match self {
-            RoomCommand::RegisterClient { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            RoomCommand::DeregisterClient { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            RoomCommand::GetSchema { reply } => {
-                let _ = reply.send(Err(err));
-            }
-            RoomCommand::Commit { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            RoomCommand::Sync { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            RoomCommand::Ack { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            RoomCommand::Heartbeat { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            RoomCommand::SubscribeEvents { reply } => {
-                let _ = reply.send(Err(err));
-            }
-            RoomCommand::ReloadSchema { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            RoomCommand::GetMetrics { reply } => {
-                let _ = reply.send(Err(err));
-            }
-            RoomCommand::GetLogBounds { reply } => {
-                let _ = reply.send(Err(err));
-            }
-            RoomCommand::GetClientCursor { reply, .. } => {
-                let _ = reply.send(Err(err));
-            }
-            RoomCommand::Shutdown { reply } => {
-                let _ = reply.send(());
-            }
+            RoomCommand::RegisterClient { reply, .. } => drop(reply.send(Err(err))),
+            RoomCommand::DeregisterClient { reply, .. } => drop(reply.send(Err(err))),
+            RoomCommand::GetSchema { reply } => drop(reply.send(Err(err))),
+            RoomCommand::Commit { reply, .. } => drop(reply.send(Err(err))),
+            RoomCommand::Sync { reply, .. } => drop(reply.send(Err(err))),
+            RoomCommand::Ack { reply, .. } => drop(reply.send(Err(err))),
+            RoomCommand::Heartbeat { reply, .. } => drop(reply.send(Err(err))),
+            RoomCommand::SubscribeEvents { reply } => drop(reply.send(Err(err))),
+            RoomCommand::ReloadSchema { reply, .. } => drop(reply.send(Err(err))),
+            RoomCommand::GetMetrics { reply } => drop(reply.send(Err(err))),
+            RoomCommand::GetLogBounds { reply } => drop(reply.send(Err(err))),
+            RoomCommand::GetClientCursor { reply, .. } => drop(reply.send(Err(err))),
+            RoomCommand::Shutdown { reply } => drop(reply.send(())),
         }
     }
 }

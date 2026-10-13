@@ -42,6 +42,7 @@
 - **Comentarios que exceden 100 columnas**: `room.rs:529` (116: "6. Write-Through append to TieredLog (Hot Buffer RAM + synchronous active.wal disk sync with mutation_id)"; basta "6. Durable append (RAM + fsync de `active.wal`)"), `room.rs:74` (doc de `RoomActor`, 118), `manager.rs:514`, `lease.rs:185`.
 - **Doc-comments que repiten la firma**: `lease.rs:360` ("Checks if a client is registered…"), `lease.rs:372`, `lease.rs:377`, `manager.rs:422` ("Gets an existing active sender for the room, if running."), `manager.rs:456` ("Returns a list of all currently active RoomIds."). Se pueden dejar en una línea más útil o quitar.
 - **Redundancia entre docs**: "Production always uses [`ActorTimings::default`]; tests shorten them." aparece en `room.rs:42-43` y `room.rs:130-131` (y una variante en `manager.rs:158`). En `open` alcanza con "with the given `timings`".
+- **Estado:** ✅ aplicada (paso 1). Los pasos numerados de `run_fast_maintenance` y `run_disk_maintenance` también perdieron la numeración.
 
 **Qué conservar (ejemplos):** `room.rs:209-215` (manejo de pánico y qué recibe cada caller), `room.rs:290-292`, `room.rs:307-311`, `room.rs:484-486` (dedup antes de rechazos por estado), `room.rs:501-504`, `room.rs:521-523`, `room.rs:530-533` + `:542-543` (fail-stop tras fallo de append y por qué se cierra el mailbox antes de responder), `room.rs:575-577`, `room.rs:603-605`, `room.rs:668-670`, `room.rs:703-705`, `room.rs:882-884` (persistir cursores antes de borrar segmentos), `room.rs:889-891`, `room.rs:897-898`; `manager.rs:104-109` y `:127-131` (razonamiento de `strong_count == 2`), `manager.rs:252-256`, `:392-393` (por qué no se toma el spawn lock en la tarea), `:502-503`, `:583-585`, `:595-599`, `:605-608`, `:618-620`; `lease.rs:37-39`, `:52-55`, `:63-65`, `:72-77`, `:432-439` (efecto de un crash sobre la última actividad), `:485-487`; `snapshot_demand.rs:1-6`, `:15-17`, `:109-110`. Las notas de compatibilidad de formato (`lease.rs:424-425`, `:458-459`) no son narrativa histórica: justifican por qué se aceptan dos formatos de archivo.
 
@@ -93,6 +94,7 @@
   `drop` del `Result` equivale a `let _ =` (el `Err` devuelto contiene el valor no entregado y se descarta igual). Con los lints del workspace (`Cargo.toml:18-21`) no aplica `drop_non_drop` porque el tipo tiene drop glue; **a verificar** con clippy. Alternativa sin `drop`: `{ let _ = …; }` en una línea con `#[rustfmt::skip]` en el `match`.
 - **Ahorro estimado:** ~26 líneas · **Riesgo:** bajo · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ⚠️ corregida — la propuesta es válida y equivalente (el `Err` no entregado se descarta en el acto en ambos casos), pero el motivo del lint es otro: en `Shutdown` el valor es `Result<(), ()>`, que es `Copy` y sin drop glue, y aun así no salta `dropping_copy_types` (rustc) ni `drop_non_drop` (clippy) porque ambos eximen `drop(llamada)` cuando es el cuerpo directo de un brazo de `match`. Condición: escribir `=> drop(..),` sin llaves; con `=> { drop(..) }` la exención no aplica.
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q3. `handle_commit`: rechazos con `?` mediante un `commit` interno
 - **Dónde:** `room.rs:461-598`
@@ -109,6 +111,7 @@
   - `observe` y `check_timeouts`: `if changed { self.dirty = true; }` → `self.dirty |= changed;` (y `self.dirty |= modified;`). Mismo efecto: nunca baja `dirty` a `false`.
   - La regla "behind tail → `Bootstrapping`, si no `Connected`" está duplicada en `register_client` y `observe`. Un `ClientState::active_for(cursor, tail_seq)` deja la regla del doc de `ClientState` (`:15-17`) en un solo sitio. En líneas sale neutro; lo que gana es claridad.
 - **Ahorro estimado:** ~10–12 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 1) en `min_connected_ack_seq`, `observe` y `dirty |=`. `ClientState::active_for` es un helper compartido entre dos funciones y queda para el paso 2.
 
 ### Q5. Helper `durable` para borrar el `.tmp` huérfano ignorando `NotFound`
 - **Dónde:** `lease.rs:84-88`, `manager.rs:657-661` (y fuera de alcance `log/tiered_log.rs:864-868`)
@@ -120,18 +123,21 @@
 - **Dónde:** ver la sección "Comentarios" (`room.rs:162,165,168,469,475,555,558,565,630,636,645,652,685,694`; `manager.rs:239,244,247,264,270,488`).
 - **Propuesta:** borrarlos y quitar la numeración de los que se conservan. Acortar `room.rs:529` a una línea.
 - **Ahorro estimado:** ~12–15 líneas · **Riesgo:** nulo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q7. Constantes mágicas en `room.rs`
 - **Dónde:** `room.rs:610` (`fetch_deltas(last_ack_seq, 100)`), `room.rs:653` (`clamp(1, 1000)`), `room.rs:169` (`mpsc::channel(1024)`), `room.rs:170` (`broadcast::channel(256)`).
 - **Problema:** límites de protocolo y de capacidad sin nombre ni explicación, junto a constantes que sí están documentadas (`FAST_TICK_PERIOD`, `SLOW_TICK_PERIOD`).
 - **Propuesta:** `const COMMIT_CATCHUP_BATCH: u32 = 100;`, `const MAX_SYNC_BATCH: u32 = 1000;`, `const MAILBOX_CAPACITY: usize = 1024;`, `const EVENTS_CAPACITY: usize = 256;`, cada una con una línea de doc. Suma líneas, pero gana claridad.
 - **Ahorro estimado:** −6 a −8 líneas (suma) · **Riesgo:** nulo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q8. `manager.rs`: regla de "olvidar el lock" duplicada en dos `Drop` y `unreachable!` innecesario
 - **Dónde:** `manager.rs:110-115`, `manager.rs:132-137`, `manager.rs:297-300`
 - **Problema:** ambos `Drop` repiten `locks.remove_if(room_id, |_, lock| Arc::ptr_eq(lock, X) && Arc::strong_count(lock) == 2)`: el invariante delicado del módulo vive en dos copias. En `lock_room`, `match wait.acquiring.as_mut() { Some(a) => a.await, None => unreachable!(..) }` ocupa 4 líneas.
 - **Propuesta:** `fn forget_lock_if_unused(locks: &DashMap<RoomId, Arc<Mutex<()>>>, room_id: &RoomId, lock: &Arc<Mutex<()>>)` llamado desde ambos `Drop` (mismo orden: en `SpawnLockWait` se sigue haciendo antes `self.acquiring = None`; en `SpawnGuard` se llama con `OwnedMutexGuard::mutex(&self.guard)` mientras el guard sigue vivo). Y `let guard = wait.acquiring.as_mut().expect("the acquisition is set above").await;` (mismo pánico en el caso imposible).
 - **Ahorro estimado:** ~4–5 líneas · **Riesgo:** bajo · **Prioridad:** media (por centralizar el invariante, más que por las líneas)
+- **Estado:** ✅ aplicada (paso 1) en el `expect` de `lock_room`. `forget_lock_if_unused` es un helper compartido por los dos `Drop` y queda para el paso 2.
 
 ### Q9. `parse_roster` y conversiones de tiempo en `lease.rs`
 - **Dónde:** `lease.rs:579-594`, `lease.rs:563-577`, `lease.rs:475` + `:527-529`
@@ -140,6 +146,7 @@
   - El `Err(e) => { warn!(…) }` de 5 líneas (`:569-575`) puede ser `Err(e) => warn!(path = %path.display(), error = %e, "Skipping invalid entry in clients roster"),` (rustfmt no reformatea los argumentos de `tracing` con `%`).
   - `UNIX_EPOCH.checked_add(Duration::from_millis(ms))` está en `:475` y en `PersistedDemand::to_time` (`:528`): un `fn from_unix_ms(ms: u64) -> Option<SystemTime>`, simétrico a `unix_ms` (`:505`), lo unifica.
 - **Ahorro estimado:** ~6–8 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1) en la demanda y en el `warn!` de `parse_roster` (rustfmt deja el brazo entre llaves porque la línea pasa de 100 columnas). `from_unix_ms` es un helper compartido por dos funciones y queda para el paso 2.
 
 ### Q10. Pequeños retoques en `room.rs`
 - **Dónde y propuesta:**
@@ -148,11 +155,13 @@
   - `room.rs:466-467`, `:628`, `:683`, `:731`: rutas completas `tokio::sync::oneshot::Sender` y `zemdb_core::mutation::Operation`. Importar `oneshot` y `Operation` como en `command.rs` (0 líneas, más legible).
   - `room.rs:145` y `manager.rs:401-403` construyen la misma ruta `data_dir/rooms/<id>`. Un único `pub(crate) fn room_dir(data_dir: &Path, room_id: &RoomId) -> PathBuf` deja el layout en disco en un solo lugar (~0–1 línea; los tests también lo repiten, por ejemplo `tests/manager.rs:292-294`).
 - **Ahorro estimado:** ~7–8 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1) en `retention_floor`, el `info!` y los imports. `room_dir` compartida entre `room.rs` y `manager.rs` cruza archivos y queda para el paso 2.
 
 ### Q11. `snapshot_demand.rs`: `extend_until` y `restore`
 - **Dónde:** `snapshot_demand.rs:80-91`, `:103-105`
 - **Propuesta:** `self.active.get_or_insert_with(|| ActiveDemand { expires_at, designee: None, excluded: HashSet::new() }).expires_at = expires_at;` (mismo efecto: crea la demanda si no existe y siempre fija `expires_at`). `wall_now.duration_since(renewed_at).unwrap_or_default()` cabe en una línea.
 - **Ahorro estimado:** ~4–5 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q12. API pública solo usada por tests en `lease.rs` (a verificar)
 - **Dónde:** `lease.rs:361-363` (`is_registered`), `lease.rs:378-380` (`get_client_mut`)

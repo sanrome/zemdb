@@ -236,38 +236,31 @@ impl RoomManager {
         room_id: &RoomId,
         schema_id: Option<&SchemaId>,
     ) -> Result<RoomSlot, ServerError> {
-        // 1. Fast check if room is already active and channel is open
         if let Some(slot) = self.live_slot(room_id) {
             return Ok(slot);
         }
 
-        // 2. Acquire per-room spawn lock to prevent duplicate instantiation
         let _guard = self.lock_room(room_id).await;
 
-        // 3. Double-check if another task spawned the room while waiting for the lock
+        // Another task may have spawned the room while this one waited for the lock.
         if let Some(slot) = self.live_slot(room_id) {
             return Ok(slot);
         }
 
-        // 3b. A previous actor for this room stopped on its own (after a failed log write, a
+        // A previous actor for this room stopped on its own (after a failed log write, a
         // panic, or for inactivity). Wait until it has fully exited and released the room's
         // files before recovering the room from disk.
         // The slot stays in the map while waiting, so a request abandoned at this point
         // leaves the next one still waiting for the same actor.
         self.wait_for_previous_actor(room_id).await;
 
-        // Steps 4 to 6 read and write the room's files.
+        // Resolving the metadata and spawning the actor read and write the room's files.
         let slot = blocking_io(|| {
-            // 4. Resolve the room's schema and lifecycle overrides
             let meta = self.resolve_metadata(room_id, schema_id)?;
-
-            // 5. Resolve Schema definition from registry
             let schema = self
                 .schema_registry
                 .get_schema(&meta.schema_id)
                 .ok_or_else(|| ServerError::SchemaNotFound(meta.schema_id.to_string()))?;
-
-            // 6. Spawn RoomActor with its effective policy
             self.spawn_actor(room_id, &meta, schema)
         })
         .inspect_err(|_| {
@@ -294,10 +287,11 @@ impl RoomManager {
             acquiring: Some(Box::pin(Arc::clone(&lock).lock_owned())),
             lock,
         };
-        let guard = match wait.acquiring.as_mut() {
-            Some(acquiring) => acquiring.await,
-            None => unreachable!("the acquisition is set above"),
-        };
+        let guard = wait
+            .acquiring
+            .as_mut()
+            .expect("the acquisition is set above")
+            .await;
         SpawnGuard {
             locks: &self.spawn_locks,
             room_id: room_id.clone(),
@@ -419,7 +413,7 @@ impl RoomManager {
             .ok_or_else(|| ServerError::RoomNotFound(room_id.to_string()))
     }
 
-    /// Gets an existing active sender for the room, if running.
+    /// The sender of the room's actor, if it is running.
     pub fn get_room(&self, room_id: &RoomId) -> Option<mpsc::Sender<RoomCommand>> {
         self.live_slot(room_id).map(|slot| slot.sender)
     }
@@ -453,7 +447,7 @@ impl RoomManager {
             .await;
     }
 
-    /// Returns a list of all currently active RoomIds.
+    /// The rooms whose actor is running.
     pub fn list_active_rooms(&self) -> Vec<RoomId> {
         self.rooms
             .iter()
@@ -485,7 +479,6 @@ impl RoomManager {
             return Err(ServerError::RoomAlreadyExists(room_id.to_string()));
         }
 
-        // Validate schema exists in SchemaRegistry
         let schema = self
             .schema_registry
             .get_schema(&schema_id)
@@ -511,7 +504,7 @@ impl RoomManager {
         Ok(meta)
     }
 
-    /// Deletes a room: gracefully shuts down the active actor and purges the room directory from disk.
+    /// Deletes a room: shuts down its actor and removes the room directory from disk.
     pub async fn delete_room(&self, room_id: &RoomId) -> Result<(), ServerError> {
         let _guard = self.lock_room(room_id).await;
 

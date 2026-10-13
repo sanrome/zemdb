@@ -6,10 +6,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use zemdb_core::id::{ClientId, MutationId, RoomId, SchemaId, SequenceNumber};
+use zemdb_core::mutation::Operation;
 use zemdb_core::protocol::codec::encoded_len;
 use zemdb_core::protocol::limits::{check_operation_size, MAX_RESPONSE_OPS_BYTES};
 use zemdb_core::protocol::messages::SequencedOperation;
@@ -38,6 +39,18 @@ const FAST_TICK_PERIOD: Duration = Duration::from_secs(1);
 /// warm segments, cold TTL, disk quota, the RAM TTL window and a backup pass of the
 /// cursor-driven pruning (which also runs on every Ack).
 const SLOW_TICK_PERIOD: Duration = Duration::from_secs(30);
+
+/// Commands a room's mailbox queues before senders have to wait.
+const MAILBOX_CAPACITY: usize = 1024;
+
+/// Events an SSE subscriber may fall behind by before it misses some and is told it lagged.
+const EVENTS_CAPACITY: usize = 256;
+
+/// Most operations returned as catch-up with an acknowledged commit.
+const COMMIT_CATCHUP_BATCH: u32 = 100;
+
+/// Largest batch a sync is served with, whatever `max_batch_size` it asks for.
+const MAX_SYNC_BATCH: u32 = 1000;
 
 /// The timings of a room actor. Production always uses [`ActorTimings::default`]; tests
 /// shorten them.
@@ -71,7 +84,7 @@ pub enum ActorExit {
     Panicked,
 }
 
-/// Dedicated single-writer Tokio actor managing state, sequencing, durability, and synchronization for a single room.
+/// Single-writer actor of one room: sequencing, durability, client leases and snapshot signals.
 pub struct RoomActor {
     room_id: RoomId,
     schema_id: SchemaId,
@@ -128,7 +141,7 @@ impl RoomActor {
     }
 
     /// Recovers the room from disk and builds its actor without starting it, with the given
-    /// `timings`. Production always uses [`ActorTimings::default`]; tests shorten them.
+    /// `timings`.
     ///
     /// Reads the room's files: async callers run it through [`blocking_io`].
     #[allow(clippy::too_many_arguments)]
@@ -147,8 +160,8 @@ impl RoomActor {
 
         let clients_path = room_dir.join(format!("meta_clients_{}.json", room_id.as_str()));
 
-        // 1. Open or recover the 4-tier delta log, reading back only the newest segments: those
-        // holding the operations kept in RAM and the mutation IDs the deduplication cache holds
+        // Reads back only the newest segments: those holding the operations kept in RAM and
+        // the mutation IDs the deduplication cache holds.
         let mut dedup_cache = DedupLruCache::new(config.dedup_lru_capacity);
         let (tiered_log, recovered_mutations) = TieredLog::open_or_create_with_dedup_window(
             &room_dir,
@@ -156,18 +169,15 @@ impl RoomActor {
             dedup_cache.capacity(),
         )?;
 
-        // 2. Hydrate deduplication LRU cache from log, oldest first so that recency is kept
+        // Oldest first, so that recency is kept.
         dedup_cache.hydrate(recovered_mutations);
 
-        // 3. Monotonic head sequence derived directly from TieredLog
         let head_seq = tiered_log.head_seq();
 
-        // 4. Open client lease tracker
         let lease_tracker = ClientLeaseTracker::open_or_create(&clients_path)?;
 
-        // 5. Channels
-        let (command_tx, command_rx) = mpsc::channel(1024);
-        let (events_tx, _) = broadcast::channel(256);
+        let (command_tx, command_rx) = mpsc::channel(MAILBOX_CAPACITY);
+        let (events_tx, _) = broadcast::channel(EVENTS_CAPACITY);
 
         let demand_ttl = lifecycle_policy.snapshot_demand_ttl;
         let snapshot_demand = SnapshotDemand::new(demand_ttl, timings.designation_timeout);
@@ -197,11 +207,7 @@ impl RoomActor {
         actor.announced_snapshot = actor.usable_snapshot_seq();
         actor.restore_snapshot_demand();
 
-        info!(
-            room = %room_id,
-            head_seq = %head_seq,
-            "Opened RoomActor"
-        );
+        info!(room = %room_id, head_seq = %head_seq, "Opened RoomActor");
 
         Ok((command_tx, actor))
     }
@@ -463,16 +469,14 @@ impl RoomActor {
         client_id: ClientId,
         mutation_id: MutationId,
         last_ack_seq: SequenceNumber,
-        op: zemdb_core::mutation::Operation,
-        reply: tokio::sync::oneshot::Sender<Result<CommitResponse, ServerError>>,
+        op: Operation,
+        reply: oneshot::Sender<Result<CommitResponse, ServerError>>,
     ) -> ControlFlow<()> {
-        // 0. Check if client is registered in the room roster
         if let Err(err) = self.ensure_registered(&client_id) {
             let _ = reply.send(Err(err));
             return ControlFlow::Continue(());
         }
 
-        // 1. Validate that client last_ack_seq does not exceed server head_seq
         if last_ack_seq > self.head_seq {
             let _ = reply.send(Err(ServerError::InvalidSequence {
                 expected: self.head_seq,
@@ -481,7 +485,7 @@ impl RoomActor {
             return ControlFlow::Continue(());
         }
 
-        // 2. Exactly-once idempotency. Checked before any rejection based on client state:
+        // Exactly-once idempotency. Checked before any rejection based on client state:
         // a retried mutation was already committed and replicated, so it must always be
         // acknowledged with its original sequence, never reported as a failure.
         if let Some(existing_seq) = self.dedup_cache.is_duplicate(&mutation_id) {
@@ -498,7 +502,7 @@ impl RoomActor {
             return ControlFlow::Continue(());
         }
 
-        // 3. Reject a cursor behind the compaction boundary before sequencing anything, so
+        // Reject a cursor behind the compaction boundary before sequencing anything, so
         // that a rejected commit leaves no trace in the log, the head or the SSE stream. The
         // client's lifecycle state is not a reason to reject: a client that was bootstrapping
         // or dormant commits as soon as its cursor is inside the log.
@@ -508,17 +512,16 @@ impl RoomActor {
             return ControlFlow::Continue(());
         }
 
-        // 4. Schema validation in O(C)
         if let Err(err) = self.schema.validate_operation(&op) {
             let _ = reply.send(Err(ServerError::SchemaViolation(err.to_string())));
             return ControlFlow::Continue(());
         }
 
-        // 5. Assign strictly monotonic sequence number (local until the append succeeds)
+        // The new sequence stays local until the append succeeds.
         let new_seq = self.head_seq.next();
         let seq_op = SequencedOperation::new(new_seq, op);
 
-        // 5b. The operation must fit alone in a log record and in a response frame. A
+        // The operation must fit alone in a log record and in a response frame. A
         // mutation that does not is the client's error: it is rejected here, before any I/O,
         // and the room keeps running unchanged.
         if let Err(err) = check_operation_size(&seq_op, Some(mutation_id)) {
@@ -526,7 +529,6 @@ impl RoomActor {
             return ControlFlow::Continue(());
         }
 
-        // 6. Write-Through append to TieredLog (Hot Buffer RAM + synchronous active.wal disk sync with mutation_id)
         // A failed write or fsync leaves the log in an unknown state: the record may or may
         // not be on disk, and a failed fsync cannot be retried safely. The room stops and is
         // recovered from disk by the next request; if the record survived, deduplication
@@ -552,20 +554,16 @@ impl RoomActor {
 
         // From here on the mutation is durable: the reply must acknowledge it.
 
-        // 7. Record in DedupLruCache
         self.dedup_cache.record(mutation_id, new_seq);
-
-        // 8. Advance local head sequence
         self.head_seq = new_seq;
 
-        // 9. Refresh the client's lease, record the cursor reported with the commit and make
+        // Refresh the client's lease, record the cursor reported with the commit and make
         // the client Connected. Persisted on the next maintenance tick.
         self.observe(&client_id, Some(last_ack_seq));
 
-        // 10. Broadcast signal-only SSE event to active watchers
         let _ = self.events_tx.send(RoomEvent::HeadAdvanced(new_seq));
 
-        // 11. Compute catch-up deltas for 1-RTT synchronization
+        // Catch-up for 1-RTT synchronization.
         let (catchup_ops, has_more) = if last_ack_seq.get() + 1 == new_seq.get() {
             (vec![seq_op], false)
         } else {
@@ -607,7 +605,10 @@ impl RoomActor {
         &self,
         last_ack_seq: SequenceNumber,
     ) -> (Vec<SequencedOperation>, bool) {
-        match self.tiered_log.fetch_deltas(last_ack_seq, 100) {
+        match self
+            .tiered_log
+            .fetch_deltas(last_ack_seq, COMMIT_CATCHUP_BATCH)
+        {
             Ok((ops, has_more)) => fit_in_response(ops, has_more),
             Err(err) => {
                 warn!(
@@ -625,15 +626,14 @@ impl RoomActor {
         client_id: ClientId,
         from_seq: SequenceNumber,
         max_batch_size: u32,
-        reply: tokio::sync::oneshot::Sender<Result<SyncBatchResponse, ServerError>>,
+        reply: oneshot::Sender<Result<SyncBatchResponse, ServerError>>,
     ) {
-        // 0. Check if client is registered in the room roster
         if let Err(err) = self.ensure_registered(&client_id) {
             let _ = reply.send(Err(err));
             return;
         }
 
-        // 1. A cursor beyond the head was never delivered by this room
+        // A cursor beyond the head was never delivered by this room.
         if from_seq > self.head_seq {
             let _ = reply.send(Err(ServerError::InvalidSequence {
                 expected: self.head_seq,
@@ -642,15 +642,13 @@ impl RoomActor {
             return;
         }
 
-        // 2. Check if from_seq is behind retained log tail
         if self.tiered_log.is_behind_retention(from_seq) {
             self.reject_behind_log(&client_id, from_seq);
             let _ = reply.send(Err(ServerError::BehindCompaction));
             return;
         }
 
-        // 3. Fetch continuous multi-tier delta batch
-        let bounded_batch_size = max_batch_size.clamp(1, 1000);
+        let bounded_batch_size = max_batch_size.clamp(1, MAX_SYNC_BATCH);
         match self.tiered_log.fetch_deltas(from_seq, bounded_batch_size) {
             Ok((ops, has_more)) => {
                 let (ops, has_more) = fit_in_response(ops, has_more);
@@ -680,9 +678,8 @@ impl RoomActor {
         &mut self,
         client_id: ClientId,
         ack_seq: SequenceNumber,
-        reply: tokio::sync::oneshot::Sender<Result<SequenceNumber, ServerError>>,
+        reply: oneshot::Sender<Result<SequenceNumber, ServerError>>,
     ) {
-        // 0. Check if client is registered in the room roster
         let stored_cursor = match self.ensure_registered(&client_id) {
             Ok(cursor) => cursor,
             Err(err) => {
@@ -691,7 +688,6 @@ impl RoomActor {
             }
         };
 
-        // 1. Validate that ack_seq <= head_seq to prevent catastrophic log truncation
         if ack_seq > self.head_seq {
             let _ = reply.send(Err(ServerError::InvalidSequence {
                 expected: self.head_seq,
@@ -700,7 +696,7 @@ impl RoomActor {
             return;
         }
 
-        // 2. The cursor never moves backwards, so an ack below the stored cursor (stale or
+        // The cursor never moves backwards, so an ack below the stored cursor (stale or
         // out of order) changes nothing and succeeds. Retention is checked against the
         // cursor the client ends up with.
         if self
@@ -712,11 +708,10 @@ impl RoomActor {
             return;
         }
 
-        // 3. Advance the cursor, refresh the lease and make the client Connected.
+        // Advance the cursor, refresh the lease and make the client Connected.
         // The cursor is persisted on the next maintenance tick.
         self.observe(&client_id, Some(ack_seq));
 
-        // 4. Trigger proactive log pruning if all connected clients are past the sequence
         self.prune_to_retention_floor();
 
         let _ = reply.send(Ok(self.head_seq));
@@ -728,7 +723,7 @@ impl RoomActor {
     fn handle_heartbeat(
         &mut self,
         client_id: ClientId,
-        reply: tokio::sync::oneshot::Sender<Result<HeartbeatResponse, ServerError>>,
+        reply: oneshot::Sender<Result<HeartbeatResponse, ServerError>>,
     ) {
         if let Err(err) = self.ensure_registered(&client_id) {
             let _ = reply.send(Err(err));
@@ -889,10 +884,9 @@ impl RoomActor {
         // The relay only accepts snapshots inside the retained range, but the range moves on
         // (TTL and size compaction ignore the anchor), so a snapshot that fell out of it can no
         // longer anchor anything and is ignored.
-        let retention_floor = match self.usable_snapshot_seq() {
-            Some(snap_seq) => min_ack.min(snap_seq),
-            None => min_ack,
-        };
+        let retention_floor = self
+            .usable_snapshot_seq()
+            .map_or(min_ack, |snap_seq| min_ack.min(snap_seq));
 
         // Segments are deleted only when they end below the floor, and none ends below the
         // current tail, so a floor at or below the tail deletes nothing.
@@ -932,7 +926,7 @@ impl RoomActor {
 
     /// The fast tick: memory-only maintenance, plus writing the roster if it changed.
     fn run_fast_maintenance(&mut self) {
-        // 1. Check client timeouts (Connected/Bootstrapping -> Disconnected -> Dormant)
+        // Connected/Bootstrapping -> Disconnected -> Dormant.
         self.lease_tracker.check_timeouts(
             self.policy.lease_timeout,
             self.policy.dormant_after,
@@ -940,23 +934,20 @@ impl RoomActor {
             self.tiered_log.tail_seq(),
         );
 
-        // 2. Snapshot demand, uploader designation and snapshot announcements
         self.update_snapshot_signals();
-
-        // 3. Persist cursor and lease changes accumulated since the previous tick
+        // Cursor and lease changes accumulated since the previous tick.
         self.persist_roster();
     }
 
     /// The slow tick: disk maintenance of the log, served from its segment index.
     async fn run_disk_maintenance(&mut self) {
-        // 1. Compression, RAM TTL window, cold TTL and quota (compression in spawn_blocking)
+        // Compression (in spawn_blocking), RAM TTL window, cold TTL and quota.
         if let Err(e) = self.tiered_log.run_maintenance().await {
             warn!(room = %self.room_id, error = %e, "TieredLog maintenance error");
         }
 
-        // 2. Backup pass of the cursor-driven pruning, which normally runs on every Ack: a
-        // floor can also move without an Ack (cursors reported by commits, clients becoming
-        // Dormant), bounded by active_snapshot_seq (Retention Anchor)
+        // Backup pass of the cursor-driven pruning, which normally runs on every Ack: a floor
+        // can also move without an Ack (cursors reported by commits, clients becoming Dormant).
         self.prune_to_retention_floor();
     }
 }
