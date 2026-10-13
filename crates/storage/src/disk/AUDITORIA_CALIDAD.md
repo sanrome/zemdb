@@ -47,6 +47,7 @@
 - `compactor.rs:96`, `134`, `153` ("// Phase N: …") repiten la doc de la función. Sirven como señales: se pueden dejar, pero recortadas a "// Phase 1", "// Phase 2", "// Phase 3".
   - **Estado:** ✅ aplicada (paso 1)
 - `format.rs:8`, `format.rs:14`: "Alias … for backward compatibility". Dentro del workspace nadie usa `FILE_VERSION`, y `MAGIC_BYTES` solo lo usa un test de integración (ver Q7).
+  - **Estado:** ✅ aplicada (paso 4) en `FILE_VERSION`, que se borra. ⏭️ `MAGIC_BYTES` queda, con su doc, porque lo usa un test de integración (ver Q7).
 - `format.rs:152-177`: las cuatro docs de los wrappers repiten el nombre de la función. Basta un solo comentario encima del bloque: "Wrappers that convert `WalFrameError` into `StorageError`".
   - **Estado:** ✅ aplicada (paso 1)
 - `wal.rs:13-16` y `wal.rs:26-29`: el mismo párrafo copiado dos veces (desaparece con Q6).
@@ -174,6 +175,7 @@
 - **Problema:** como `disk` y `format` son `pub` en `lib.rs:13-18`, estas piezas son API pública del crate. Si nadie fuera del workspace depende de ellas, son código muerto.
 - **Propuesta:** borrarlas o bajarlas a `pub(crate)` si el crate no tiene consumidores externos. Si los tiene, dejarlas y marcarlas con `#[deprecated]`.
 - **Ahorro estimado:** ~30 líneas · **Riesgo:** bajo en el workspace, **a verificar** fuera de él (es un cambio de API pública) · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 4): sin consumidores externos, se borran `room_file_path`, `FILE_VERSION`, `WalReader::read_all` y el `pub use` de `replay_wal_records` en `recovery`, y `RecoveredRoom` y `recover_room` pasan a `pub(crate)`. ⏭️ `MAGIC_BYTES` no se toca: lo importa `tests/disk_wal_resilience_tests.rs`, así que no está sin uso (se podría borrar cambiando ese import por `MAGIC`). `format::replay_wal_records` sigue `pub` por la misma razón: lo usa ese test.
 
 ### Q8 — Partir `recover_room` (~225 líneas) en pasos con nombre
 - **Dónde:** `recovery.rs:242-467`.

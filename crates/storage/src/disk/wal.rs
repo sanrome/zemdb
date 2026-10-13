@@ -82,27 +82,4 @@ impl<'a> WalReader<'a> {
             return Ok(result);
         }
     }
-
-    /// Reads all valid records sequentially until EOF or a torn-write is encountered.
-    pub fn read_all(
-        &mut self,
-    ) -> Result<(Vec<SequencedOperation>, usize, Option<String>), StorageError> {
-        let mut ops = Vec::new();
-        let mut torn_write = None;
-
-        loop {
-            match self.next_batch()? {
-                WalBatchDecodeResult::Ok { ops: batch_ops, .. } => {
-                    ops.extend(batch_ops);
-                }
-                WalBatchDecodeResult::CleanEof => break,
-                WalBatchDecodeResult::TornWrite { reason, .. } => {
-                    torn_write = Some(reason);
-                    break;
-                }
-            }
-        }
-
-        Ok((ops, self.offset, torn_write))
-    }
 }

@@ -11,9 +11,6 @@ pub const MAGIC_BYTES: [u8; 4] = MAGIC;
 /// Current binary format version.
 pub const FORMAT_VERSION: u16 = 1;
 
-/// Alias for format version for backward compatibility.
-pub const FILE_VERSION: u16 = FORMAT_VERSION;
-
 /// Fixed file header size (exactly 64 bytes, L1 cache line aligned).
 pub const HEADER_SIZE: usize = 64;
 

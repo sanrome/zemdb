@@ -12,7 +12,6 @@ use crate::disk::compactor::{
     compacting_wal_path, remove_if_exists, sync_file, sync_parent, write_empty_snapshot_file,
     write_snapshot_file, SyncKind,
 };
-pub use crate::disk::format::replay_wal_records;
 use crate::disk::format::{FileHeader, HEADER_SIZE};
 use crate::error::StorageError;
 use crate::fail_point;
@@ -22,7 +21,7 @@ use crate::sys::run_blocking;
 
 /// Recovery result containing the reconstructed in-memory state and the open WAL file handle.
 #[derive(Debug)]
-pub struct RecoveredRoom {
+pub(crate) struct RecoveredRoom {
     pub wal_file: tokio::fs::File,
     pub head_seq: SequenceNumber,
     pub snapshot_seq: SequenceNumber,
@@ -413,7 +412,7 @@ async fn replay_compacting_wal(
 ///    empties the active WAL; only then removes `.wal.compacting`. A crash at any step leaves
 ///    files that a later recovery replays to the same state.
 #[tracing::instrument(skip(schema, wal_file_std), fields(room_id = %room_id, snap_path = ?snap_path, wal_path = ?wal_path))]
-pub async fn recover_room(
+pub(crate) async fn recover_room(
     room_id: &RoomId,
     snap_path: &Path,
     wal_path: &Path,

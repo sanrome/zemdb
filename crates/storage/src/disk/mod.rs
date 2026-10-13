@@ -260,11 +260,6 @@ impl DiskStorageEngine {
         self.options.data_dir.join(format!("room_{}.wal", room_id))
     }
 
-    /// Compatibility helper returning the room's WAL file path.
-    pub fn room_file_path(&self, room_id: &RoomId) -> PathBuf {
-        self.wal_file_path(room_id)
-    }
-
     /// Point lookup behind `get` and `get_by_id`: resolves the table and reads the row under
     /// a single read lock of the room's state.
     async fn get_row(
