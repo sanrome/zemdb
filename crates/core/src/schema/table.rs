@@ -3,7 +3,6 @@ use super::validation::{self, ValidationError};
 use crate::mutation::{ColumnUpdate, Operation};
 use crate::value::{CompactRow, DataType, PrimaryKey, Row, Value};
 use serde::{Deserialize, Deserializer, Serialize};
-use smallvec::SmallVec;
 use std::collections::BTreeMap;
 
 /// Maximum number of columns of a table. Columns are addressed by a `u16` positional index
@@ -14,7 +13,6 @@ pub const MAX_COLUMNS: usize = u16::MAX as usize;
 ///
 /// The table id is explicit ([`TableBuilder::table_id`]) or, when the builder is handed to
 /// [`SchemaBuilder::table`](super::SchemaBuilder::table), assigned by the schema builder.
-/// There is no default id: [`TableBuilder::build`] requires an explicit one.
 #[derive(Debug, Clone)]
 pub struct TableBuilder {
     table_id: Option<u16>,
@@ -33,13 +31,11 @@ impl TableBuilder {
         }
     }
 
-    /// Sets an explicit table_id for this table.
     pub fn table_id(mut self, id: u16) -> Self {
         self.table_id = Some(id);
         self
     }
 
-    /// The id set with [`TableBuilder::table_id`], if any.
     pub(crate) fn explicit_table_id(&self) -> Option<u16> {
         self.table_id
     }
@@ -61,7 +57,7 @@ impl TableBuilder {
         self
     }
 
-    /// Adds a standard non-nullable column.
+    /// Declares a column (non-nullable if new); re-declaring only changes its type.
     pub fn column(mut self, name: impl Into<String>, data_type: DataType) -> Self {
         let name = name.into();
         if let Some(col) = self.columns.iter_mut().find(|c| c.name == name) {
@@ -72,7 +68,7 @@ impl TableBuilder {
         self
     }
 
-    /// Adds a nullable column.
+    /// Declares a nullable column; re-declaring changes its type and makes it nullable.
     pub fn nullable_column(mut self, name: impl Into<String>, data_type: DataType) -> Self {
         let name = name.into();
         if let Some(col) = self.columns.iter_mut().find(|c| c.name == name) {
@@ -85,8 +81,8 @@ impl TableBuilder {
         self
     }
 
-    /// Adds an end-to-end encrypted column.
-    /// The data_type represents the underlying decrypted type for clients,
+    /// Declares an end-to-end encrypted column; re-declaring changes its type and makes it
+    /// encrypted. The data_type represents the underlying decrypted type for clients,
     /// while the server only accepts opaque Value::Bytes.
     pub fn encrypted_column(mut self, name: impl Into<String>, data_type: DataType) -> Self {
         let name = name.into();
@@ -111,7 +107,6 @@ impl TableBuilder {
         self.build_with_id(table_id)
     }
 
-    /// Validates and builds the TableSchema with `table_id`.
     pub(crate) fn build_with_id(self, table_id: u16) -> Result<TableSchema, ValidationError> {
         TableSchema::try_new(table_id, self.name, self.primary_key, self.columns)
     }
@@ -133,10 +128,7 @@ pub struct TableSchema {
 }
 
 impl<'de> Deserialize<'de> for TableSchema {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         // `table_id` has no default: a table read from JSON or disk keeps exactly the id it was
         // written with, and one without an id is rejected rather than numbered on the fly.
         #[derive(Deserialize)]
@@ -147,14 +139,13 @@ impl<'de> Deserialize<'de> for TableSchema {
             primary_key: Vec<String>,
             columns: Vec<ColumnDef>,
         }
-        let helper = TableSchemaHelper::deserialize(deserializer)?;
-        TableSchema::try_new(
-            helper.table_id,
-            helper.name,
-            helper.primary_key,
-            helper.columns,
-        )
-        .map_err(serde::de::Error::custom)
+        let TableSchemaHelper {
+            table_id,
+            name,
+            primary_key,
+            columns,
+        } = TableSchemaHelper::deserialize(deserializer)?;
+        TableSchema::try_new(table_id, name, primary_key, columns).map_err(serde::de::Error::custom)
     }
 }
 
@@ -267,9 +258,7 @@ impl TableSchema {
         self.column_indices.get(name).copied()
     }
 
-    /// Appends a new nullable column to the table schema for append-only DDL evolution.
-    /// Preserves physical column order and updates secondary column indexing.
-    /// Returns the assigned positional 0-indexed column index (`u16`).
+    /// Appends a nullable column (append-only evolution) and returns its positional index.
     pub fn add_column(&mut self, col: ColumnDef) -> Result<u16, ValidationError> {
         if self.columns.len() >= MAX_COLUMNS {
             return Err(ValidationError::TooManyColumns {
@@ -308,18 +297,18 @@ impl TableSchema {
     }
 
     pub fn extract_pk(&self, row: &Row) -> Result<PrimaryKey, ValidationError> {
-        let mut pk_values = SmallVec::new();
-        for pk_col in &self.primary_key {
-            match row.get(pk_col) {
-                Some(val) => pk_values.push(val.clone()),
-                None => {
-                    return Err(ValidationError::MissingPrimaryKeyColumn {
+        let pk_values = self
+            .primary_key
+            .iter()
+            .map(|pk_col| {
+                row.get(pk_col)
+                    .cloned()
+                    .ok_or_else(|| ValidationError::MissingPrimaryKeyColumn {
                         table: self.name.clone(),
                         column: pk_col.clone(),
-                    });
-                }
-            }
-        }
+                    })
+            })
+            .collect::<Result<_, _>>()?;
         let pk = PrimaryKey::from_smallvec(pk_values);
         self.validate_pk(&pk)?;
         Ok(pk)
@@ -342,12 +331,12 @@ impl TableSchema {
         validation::validate_table_update(self, fields)
     }
 
-    /// Validates an entire CompactRow in O(C) time against this TableSchema.
+    /// Validates an entire CompactRow against this TableSchema.
     pub fn validate_compact_row(&self, row: &CompactRow) -> Result<(), ValidationError> {
         validation::validate_compact_row(self, row)
     }
 
-    /// Validates a CompactRow stored under the key `pk` in O(C) time against this TableSchema.
+    /// Validates a CompactRow stored under the key `pk` against this TableSchema.
     pub fn validate_keyed_row(
         &self,
         pk: &PrimaryKey,
@@ -356,12 +345,12 @@ impl TableSchema {
         validation::validate_keyed_row(self, pk, row)
     }
 
-    /// Validates positional ColumnUpdates in O(C) time against this TableSchema.
+    /// Validates positional ColumnUpdates against this TableSchema.
     pub fn validate_column_updates(&self, updates: &[ColumnUpdate]) -> Result<(), ValidationError> {
         validation::validate_column_updates(self, updates)
     }
 
-    /// Validates an Operation in O(C) time against this TableSchema.
+    /// Validates an Operation against this TableSchema.
     pub fn validate_operation(&self, op: &Operation) -> Result<(), ValidationError> {
         validation::validate_operation(self, op)
     }
@@ -369,22 +358,22 @@ impl TableSchema {
     /// Converts a validated Row to CompactRow ordered by physical DDL schema columns.
     pub fn to_compact_row(&self, row: &Row) -> Result<CompactRow, ValidationError> {
         self.validate_row(row)?;
-        let mut values = Vec::with_capacity(self.columns.len());
-        for col in &self.columns {
-            let val = row.get(&col.name).cloned().unwrap_or(Value::Null);
-            values.push(val);
-        }
+        let values = self
+            .columns
+            .iter()
+            .map(|col| row.get(&col.name).cloned().unwrap_or(Value::Null))
+            .collect();
         Ok(CompactRow::new(values))
     }
 
     /// Zero-copy conversion of Row to CompactRow ordered by physical DDL schema columns.
     pub fn row_into_compact(&self, mut row: Row) -> Result<CompactRow, ValidationError> {
         self.validate_row(&row)?;
-        let mut values = Vec::with_capacity(self.columns.len());
-        for col in &self.columns {
-            let val = row.remove(&col.name).unwrap_or(Value::Null);
-            values.push(val);
-        }
+        let values = self
+            .columns
+            .iter()
+            .map(|col| row.remove(&col.name).unwrap_or(Value::Null))
+            .collect();
         Ok(CompactRow::new(values))
     }
 
@@ -399,18 +388,16 @@ impl TableSchema {
                 actual: compact.len(),
             });
         }
-        let mut row = Row::new();
-        for (col, val) in self.columns.iter().zip(compact.iter()) {
-            if !val.is_null() {
-                row.insert(col.name.clone(), val.clone());
-            }
-        }
-        Ok(row)
+        Ok(self
+            .columns
+            .iter()
+            .zip(compact.iter())
+            .filter(|(_, val)| !val.is_null())
+            .map(|(col, val)| (col.name.clone(), val.clone()))
+            .collect())
     }
 
-    /// Zero-copy conversion of CompactRow back to a structured Row.
-    ///
-    /// Allows `compact.len() <= self.columns.len()`, treating omitted columns as null.
+    /// Consuming variant of [`Self::from_compact_row`].
     pub fn compact_into_row(&self, compact: CompactRow) -> Result<Row, ValidationError> {
         if compact.len() > self.columns.len() {
             return Err(ValidationError::CompactRowArityMismatch {
@@ -419,13 +406,13 @@ impl TableSchema {
                 actual: compact.len(),
             });
         }
-        let mut row = Row::new();
-        for (col, val) in self.columns.iter().zip(compact.into_values()) {
-            if !val.is_null() {
-                row.insert(col.name.clone(), val);
-            }
-        }
-        Ok(row)
+        Ok(self
+            .columns
+            .iter()
+            .zip(compact.into_values())
+            .filter(|(_, val)| !val.is_null())
+            .map(|(col, val)| (col.name.clone(), val))
+            .collect())
     }
 
     /// Converts and validates named update fields into positional `ColumnUpdate` deltas
@@ -435,11 +422,13 @@ impl TableSchema {
         fields: &BTreeMap<String, Value>,
     ) -> Result<Vec<ColumnUpdate>, ValidationError> {
         self.validate_update(fields)?;
-        let mut updates = Vec::with_capacity(fields.len());
-        for (col_name, val) in fields {
-            let col_idx = self.column_index(col_name).expect("already validated") as u16;
-            updates.push(ColumnUpdate::new(col_idx, val.clone()));
-        }
+        let mut updates: Vec<_> = fields
+            .iter()
+            .map(|(col_name, val)| {
+                let col_idx = self.column_index(col_name).expect("already validated") as u16;
+                ColumnUpdate::new(col_idx, val.clone())
+            })
+            .collect();
         updates.sort_by_key(|u| u.column_idx);
         Ok(updates)
     }
@@ -449,19 +438,18 @@ impl TableSchema {
         &self,
         updates: &[ColumnUpdate],
     ) -> Result<BTreeMap<String, Value>, ValidationError> {
-        let mut fields = BTreeMap::new();
-        for u in updates {
-            let col_idx = u.column_idx as usize;
-            if col_idx >= self.columns.len() {
-                return Err(ValidationError::UnknownColumn {
-                    table: self.name.clone(),
-                    column: format!("index {}", u.column_idx),
-                });
-            }
-            let col_name = self.columns[col_idx].name.clone();
-            fields.insert(col_name, u.value.clone());
-        }
-        Ok(fields)
+        updates
+            .iter()
+            .map(|u| {
+                let col = self.columns.get(u.column_idx as usize).ok_or_else(|| {
+                    ValidationError::UnknownColumn {
+                        table: self.name.clone(),
+                        column: format!("index {}", u.column_idx),
+                    }
+                })?;
+                Ok((col.name.clone(), u.value.clone()))
+            })
+            .collect()
     }
 
     /// Validates a Row and compiles it into an `Operation::insert`.

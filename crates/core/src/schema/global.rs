@@ -61,32 +61,15 @@ pub struct Schema {
 }
 
 impl Serialize for Schema {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        struct Tables<'a>(&'a BTreeMap<u16, TableSchema>);
-
-        impl Serialize for Tables<'_> {
-            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: Serializer,
-            {
-                serializer.collect_seq(self.0.values())
-            }
-        }
-
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut state = serializer.serialize_struct("Schema", 1)?;
-        state.serialize_field("tables", &Tables(&self.tables_by_id))?;
+        state.serialize_field("tables", &self.tables_by_id.values().collect::<Vec<_>>())?;
         state.end()
     }
 }
 
 impl<'de> Deserialize<'de> for Schema {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         #[derive(Deserialize)]
         #[serde(rename = "Schema", deny_unknown_fields)]
         struct SchemaHelper {
@@ -99,10 +82,7 @@ impl<'de> Deserialize<'de> for Schema {
 
 impl Schema {
     pub fn new() -> Self {
-        Self {
-            tables_by_id: BTreeMap::new(),
-            id_by_name: BTreeMap::new(),
-        }
+        Self::default()
     }
 
     pub fn builder() -> SchemaBuilder {
@@ -177,7 +157,6 @@ impl Schema {
         self.tables_by_id.keys().copied()
     }
 
-    /// Number of tables in the schema.
     pub fn table_count(&self) -> usize {
         self.tables_by_id.len()
     }

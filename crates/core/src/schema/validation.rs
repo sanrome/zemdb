@@ -3,7 +3,7 @@ use super::global::Schema;
 use super::table::TableSchema;
 use crate::mutation::{ColumnUpdate, Operation, OperationKind};
 use crate::value::{CompactRow, DataType, PrimaryKey, Row, Value};
-use smallvec::SmallVec;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -121,7 +121,6 @@ pub enum ValidationError {
     TooManyColumns { table: String, max: usize },
 }
 
-/// Validates an individual field value against column definition rules.
 pub fn validate_field_value(
     table: &str,
     col_name: &str,
@@ -156,7 +155,6 @@ pub fn validate_field_value(
     Ok(())
 }
 
-/// Validates that a primary key matches expected arity and types.
 pub fn validate_pk<'a>(
     table_name: &str,
     pk_cols: &[String],
@@ -190,7 +188,6 @@ pub fn validate_pk<'a>(
     Ok(())
 }
 
-/// Validates an entire structured row against a TableSchema.
 pub fn validate_row(table: &TableSchema, row: &Row) -> Result<(), ValidationError> {
     // 1. Ensure all PK columns exist and match types
     for pk_col in table.primary_key() {
@@ -224,22 +221,20 @@ pub fn validate_row(table: &TableSchema, row: &Row) -> Result<(), ValidationErro
 
     // 3. Validate all provided columns match schema
     for (col_name, val) in row {
-        if let Some(col_def) = table.get_column(col_name) {
-            if col_def.nullable {
-                validate_field_value(table.name(), col_name, col_def, val)?;
-            }
-        } else {
-            return Err(ValidationError::UnknownColumn {
+        let col_def = table
+            .get_column(col_name)
+            .ok_or_else(|| ValidationError::UnknownColumn {
                 table: table.name().to_string(),
                 column: col_name.clone(),
-            });
+            })?;
+        if col_def.nullable {
+            validate_field_value(table.name(), col_name, col_def, val)?;
         }
     }
 
     Ok(())
 }
 
-/// Validates update field values against a TableSchema.
 pub fn validate_table_update(
     table: &TableSchema,
     fields: &BTreeMap<String, Value>,
@@ -249,7 +244,6 @@ pub fn validate_table_update(
     }
 
     for (col_name, val) in fields {
-        // PK columns cannot be updated directly
         if table.primary_key().contains(col_name) {
             return Err(ValidationError::CannotUpdatePrimaryKey {
                 table: table.name().to_string(),
@@ -270,7 +264,6 @@ pub fn validate_table_update(
     Ok(())
 }
 
-/// Validates an insert operation on a Schema, returning the extracted PrimaryKey on success.
 pub fn validate_insert(
     schema: &Schema,
     table: &str,
@@ -283,7 +276,6 @@ pub fn validate_insert(
     t.extract_pk(row)
 }
 
-/// Validates an update operation on a Schema.
 pub fn validate_update(
     schema: &Schema,
     table: &str,
@@ -298,7 +290,6 @@ pub fn validate_update(
     t.validate_update(fields)
 }
 
-/// Validates a delete operation on a Schema.
 pub fn validate_delete(
     schema: &Schema,
     table: &str,
@@ -311,7 +302,7 @@ pub fn validate_delete(
     t.validate_pk(pk)
 }
 
-/// Validates an array of positional ColumnUpdates in $O(C)$ time against TableSchema.
+/// Validates positional ColumnUpdates against TableSchema.
 pub fn validate_column_updates(
     table: &TableSchema,
     updates: &[ColumnUpdate],
@@ -320,44 +311,37 @@ pub fn validate_column_updates(
         return Err(ValidationError::EmptyUpdate(table.name().to_string()));
     }
 
-    let mut seen = SmallVec::<[bool; 32]>::from_elem(false, table.columns().len());
     let mut last_idx: Option<u16> = None;
 
     for u in updates {
-        let col_idx = u.column_idx as usize;
-        if col_idx >= table.columns().len() {
-            return Err(ValidationError::UnknownColumn {
+        let col_def = table.columns().get(u.column_idx as usize).ok_or_else(|| {
+            ValidationError::UnknownColumn {
                 table: table.name().to_string(),
                 column: format!("index {}", u.column_idx),
-            });
-        }
+            }
+        })?;
 
         // Verify strictly ascending ordering without duplicates
         if let Some(prev) = last_idx {
-            if u.column_idx == prev {
-                return Err(ValidationError::DuplicateColumn {
-                    table: table.name().to_string(),
-                    column: table.columns()[col_idx].name.clone(),
-                });
-            } else if u.column_idx < prev {
-                return Err(ValidationError::UnsortedColumnUpdates {
-                    table: table.name().to_string(),
-                    prev_idx: prev,
-                    actual_idx: u.column_idx,
-                });
+            match u.column_idx.cmp(&prev) {
+                Ordering::Equal => {
+                    return Err(ValidationError::DuplicateColumn {
+                        table: table.name().to_string(),
+                        column: col_def.name.clone(),
+                    });
+                }
+                Ordering::Less => {
+                    return Err(ValidationError::UnsortedColumnUpdates {
+                        table: table.name().to_string(),
+                        prev_idx: prev,
+                        actual_idx: u.column_idx,
+                    });
+                }
+                Ordering::Greater => {}
             }
         }
         last_idx = Some(u.column_idx);
 
-        if seen[col_idx] {
-            return Err(ValidationError::DuplicateColumn {
-                table: table.name().to_string(),
-                column: table.columns()[col_idx].name.clone(),
-            });
-        }
-        seen[col_idx] = true;
-
-        let col_def = &table.columns()[col_idx];
         if table.primary_key().contains(&col_def.name) {
             return Err(ValidationError::CannotUpdatePrimaryKey {
                 table: table.name().to_string(),
@@ -371,7 +355,7 @@ pub fn validate_column_updates(
     Ok(())
 }
 
-/// Validates an entire positional CompactRow in $O(C)$ time against TableSchema.
+/// Validates an entire positional CompactRow in O(C) time against TableSchema.
 pub fn validate_compact_row(
     table: &TableSchema,
     compact: &CompactRow,
@@ -385,18 +369,14 @@ pub fn validate_compact_row(
     }
 
     for (i, col_def) in table.columns().iter().enumerate() {
-        let val = if i < compact.len() {
-            &compact[i]
-        } else {
-            &Value::Null
-        };
+        let val = compact.get(i).unwrap_or(&Value::Null);
         validate_field_value(table.name(), &col_def.name, col_def, val)?;
     }
 
     Ok(())
 }
 
-/// Validates a row stored under the key `pk` in $O(C)$ time: the key, the row, and that the
+/// Validates a row stored under the key `pk` in O(C) time: the key, the row, and that the
 /// row's primary key columns hold the key's values.
 pub fn validate_keyed_row(
     table: &TableSchema,
@@ -414,13 +394,6 @@ pub fn validate_keyed_row(
             }
         })?;
 
-        if col_idx >= row.len() || row[col_idx].is_null() {
-            return Err(ValidationError::MissingPrimaryKeyColumn {
-                table: table.name().to_string(),
-                column: pk_col_name.clone(),
-            });
-        }
-
         if row[col_idx] != pk[pk_idx] {
             return Err(ValidationError::PrimaryKeyMismatch {
                 table: table.name().to_string(),
@@ -431,7 +404,7 @@ pub fn validate_keyed_row(
     Ok(())
 }
 
-/// Validates an Operation against TableSchema in $O(C)$ time without reconstructing HashMaps.
+/// Validates an Operation against this table.
 pub fn validate_operation(table: &TableSchema, op: &Operation) -> Result<(), ValidationError> {
     if op.table_id != table.table_id() {
         return Err(ValidationError::TableIdMismatch {

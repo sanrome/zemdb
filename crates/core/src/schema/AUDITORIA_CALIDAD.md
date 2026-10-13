@@ -44,6 +44,7 @@
   - La regla "sin id por defecto" está tres veces: `table.rs:15-17`, `table.rs:103-104` y `global.rs:13-16`. Se puede dejar en `global.rs` y en `build`.
 - **Doc impreciso:** `table.rs:64` dice "Adds a standard non-nullable column." Pero si la columna ya estaba declarada (por ejemplo con `nullable_column`), `column()` solo cambia el tipo y **conserva** `nullable`/`encrypted` (`table.rs:67-68`). Lo mismo pasa con `table.rs:75` y `table.rs:88`. Propuesta: "Declares a column (non-nullable if new); re-declaring only changes its type."
 - `validation.rs:252` (`// PK columns cannot be updated directly`) repite el nombre de la variante `CannotUpdatePrimaryKey`. Se puede borrar.
+- **Estado:** ✅ aplicada (paso 1). La complejidad quedó solo en los dos docs de `validation.rs` donde es exacta (`validate_compact_row`, `validate_keyed_row`), escrita `O(C)`.
 
 ## Sugerencias
 
@@ -90,6 +91,7 @@
   El texto `"index {}"` lo compara un test (`schema_validation_tests.rs:459`), así que se mantiene.
 - **Ahorro estimado:** ~10–12 líneas · **Riesgo:** bajo · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ⚠️ corregida — `seen` es efectivamente inalcanzable (bounds check → `prev` rechaza `==` y `<`, así que los índices aceptados son estrictamente crecientes) y el test de duplicado da la misma variante/columna. Precisiones: el `get(...).ok_or_else` debe quedar **antes** del bloque `if let Some(prev)` (`336-349`, no `335`) para conservar la prioridad de `UnknownColumn`; y hay que borrar también `use smallvec::SmallVec;` (`validation.rs:6`), cuyo único uso es `seen` (si no, warning `unused_imports`).
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q4. `TableBuilder`: un helper para "buscar o agregar columna"
 - **Dónde:** `table.rs:50-101`.
@@ -148,6 +150,7 @@
   ```
   `Row` es `BTreeMap<String, Value>` (`value/row.rs:318`), así que `from_compact_row` puede hacer `.filter(..).map(..).collect()` directamente. Un `collect()` sobre `slice::Iter().map` reserva la capacidad exacta, igual que el `with_capacity` actual.
 - **Ahorro estimado:** ~15–20 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q7. Chequeo de `DataType::Null` duplicado, con mensaje literal repetido
 - **Dónde:** `table.rs:207-214` y `table.rs:295-302`.
@@ -170,6 +173,7 @@
   ```
   `Vec<&TableSchema>` produce la misma secuencia en JSON y en bincode (longitud seguida de los elementos). El costo es un `Vec` de referencias por serialización, que es despreciable para un schema. Usar el bound inline `<S: Serializer>` / `<D: Deserializer<'de>>` ahorra 2 líneas más en cada impl manual (`global.rs:86-89`, `table.rs:136-139`). En `table.rs:150-157`, desestructurar el helper (`let TableSchemaHelper { table_id, name, primary_key, columns } = …`) deja la llamada a `try_new` en una línea.
 - **Ahorro estimado:** ~15 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q9. Ramas inalcanzables por el invariante de `try_new`
 - **Dónde:** `validation.rs:197-202`, `175-178`, `410-415` (`UnknownColumn` para una columna PK) y `validation.rs:417-422` (`MissingPrimaryKeyColumn` en `validate_keyed_row`).
@@ -179,6 +183,7 @@
   - `validate_keyed_row` es además el único uso de `column_indices()` (`table.rs:182-185`); `table.column_index(..)` alcanza.
 - **Propuesta:** borrar `417-422` y reemplazar las búsquedas por `expect("primary key column exists")`. El módulo ya usa ese estilo en `table.rs:440` (`expect("already validated")`). Si el equipo prefiere conservar el `Err` defensivo, al menos sacar `417-422`, que hoy está precedido por un chequeo que la cubre.
 - **Ahorro estimado:** ~12–18 líneas · **Riesgo:** bajo en semántica. Pasar de `Err` a `panic` en un estado imposible es una decisión de estilo. **A verificar** con la convención del equipo. · **Prioridad:** media
+- **Estado:** ✅ aplicada en parte (paso 1): se borró el chequeo inalcanzable `MissingPrimaryKeyColumn` de `validate_keyed_row`. ⏭️ no aplicado el cambio de las búsquedas de columna PK de `Err` a `expect`: pasar de error a panic es una decisión de convención que el informe deja a verificar.
 
 ### Q10. Menores
 - `global.rs:101-106`: `Schema::new` repite el `Default` derivado. Puede ser `Self::default()` (−3).
@@ -187,6 +192,7 @@
 - `global.rs:164-167`: `next_table_id` puede usar `self.tables_by_id.last_key_value()`. Es cosmético, opcional.
 - `mod.rs:1-4`: los submódulos son `pub` y además se reexportan con `*`, así que cada tipo tiene dos rutas. No hay usos de `schema::{table,global,column,validation}::` fuera del módulo. Podrían ser `mod` privados (0 líneas, API más limpia). **A verificar**: cambia las rutas de rustdoc.
 - **Ahorro estimado:** ~6–8 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada en parte (paso 1): `Schema::new` con `Self::default()`, paso 3 de `validate_row` aplanado y `match … cmp` en `validate_column_updates`. ⏭️ no aplicado `last_key_value` en `next_table_id`: es cosmético y opcional, y `keys().next_back()` ya se lee bien. Los submódulos privados de `mod.rs` cambian la API pública y quedan para el paso 4.
 
 ## Lo que conviene dejar como está
 
