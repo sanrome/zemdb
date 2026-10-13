@@ -46,7 +46,7 @@ pub struct RoomLifecyclePolicy {
     /// operations have not sealed it first.
     pub segment_max_bytes: u64,
 
-    /// Maximum time-to-live for operations in RAM before segment rotation and eviction.
+    /// Maximum age of an operation in RAM; older ones are evicted (they stay on disk).
     pub ram_ttl: Duration,
 
     /// Age threshold after which sealed uncompressed Warm Disk segments (.wal)
@@ -57,7 +57,7 @@ pub struct RoomLifecyclePolicy {
     /// advancing the Room's `tail_seq` and marking older cursors `BehindCompaction`.
     pub cold_disk_ttl: Duration,
 
-    /// Maximum cumulative disk space (bytes) allocated to this room before early eviction of cold segments.
+    /// Disk space of the room's log above which the oldest cold segments are pruned early.
     pub max_room_disk_bytes: u64,
 
     /// Inactivity after which an active client lease is marked Disconnected.
@@ -123,36 +123,24 @@ impl RoomLifecyclePolicy {
     /// are when the room reopens.
     pub fn with_overrides(&self, overrides: &RoomLifecycleOverrides) -> Self {
         let secs = Duration::from_secs;
+        let o = overrides;
         Self {
-            ram_max_ops: overrides.ram_max_ops.unwrap_or(self.ram_max_ops),
-            ram_max_bytes: overrides.ram_max_bytes.unwrap_or(self.ram_max_bytes),
-            segment_max_bytes: overrides
-                .segment_max_bytes
-                .unwrap_or(self.segment_max_bytes),
-            ram_ttl: overrides.ram_ttl_secs.map_or(self.ram_ttl, secs),
-            warm_disk_ttl: overrides
-                .warm_disk_ttl_secs
-                .map_or(self.warm_disk_ttl, secs),
-            cold_disk_ttl: overrides
-                .cold_disk_ttl_secs
-                .map_or(self.cold_disk_ttl, secs),
-            max_room_disk_bytes: overrides
-                .max_room_disk_bytes
-                .unwrap_or(self.max_room_disk_bytes),
-            lease_timeout: overrides
-                .lease_timeout_secs
-                .map_or(self.lease_timeout, secs),
-            dormant_after: overrides
-                .dormant_after_secs
-                .map(secs)
-                .or(self.dormant_after),
-            forget_dormant_after: overrides
+            ram_max_ops: o.ram_max_ops.unwrap_or(self.ram_max_ops),
+            ram_max_bytes: o.ram_max_bytes.unwrap_or(self.ram_max_bytes),
+            segment_max_bytes: o.segment_max_bytes.unwrap_or(self.segment_max_bytes),
+            ram_ttl: o.ram_ttl_secs.map_or(self.ram_ttl, secs),
+            warm_disk_ttl: o.warm_disk_ttl_secs.map_or(self.warm_disk_ttl, secs),
+            cold_disk_ttl: o.cold_disk_ttl_secs.map_or(self.cold_disk_ttl, secs),
+            max_room_disk_bytes: o.max_room_disk_bytes.unwrap_or(self.max_room_disk_bytes),
+            lease_timeout: o.lease_timeout_secs.map_or(self.lease_timeout, secs),
+            dormant_after: o.dormant_after_secs.map(secs).or(self.dormant_after),
+            forget_dormant_after: o
                 .forget_dormant_after_secs
                 .map_or(self.forget_dormant_after, secs),
-            snapshot_demand_ttl: overrides
+            snapshot_demand_ttl: o
                 .snapshot_demand_ttl_secs
                 .map_or(self.snapshot_demand_ttl, secs),
-            idle_timeout: match overrides.idle_timeout_secs {
+            idle_timeout: match o.idle_timeout_secs {
                 Some(0) => None,
                 Some(idle) => Some(secs(idle)),
                 None => self.idle_timeout,
@@ -296,7 +284,7 @@ impl PolicySetting {
 
     /// Accepted values, inclusive.
     ///
-    /// A RAM TTL of 0 would seal a segment per operation, so durations start at 1 s, except
+    /// A RAM TTL of 0 would send every read to disk, so durations start at 1 s, except
     /// the warm and cold TTLs (0 compresses or prunes a segment as soon as it is sealed or
     /// compressed) and the idle timeout (0 = never). A lease timeout or dormancy of 0 would
     /// disconnect clients between requests.

@@ -140,7 +140,7 @@ impl SegmentIndex {
         Ok(index)
     }
 
-    /// Adds a segment.
+    /// Adds `segment`, replacing the one with the same `start_seq`.
     pub(crate) fn insert(&mut self, segment: SegmentEntry) {
         self.total_bytes += segment.bytes;
         if let Some(replaced) = self.segments.insert(segment.start_seq.get(), segment) {

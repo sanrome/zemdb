@@ -19,7 +19,7 @@ const ZSTD_LEVEL: i32 = 3;
 /// Chunk in which a warm segment is read while compressing it.
 const COPY_CHUNK: usize = 64 * 1024;
 
-/// Tier 3: Compressed delta log on disk using Zstandard for high-density long-term retention.
+/// Compression of warm segments into Zstandard cold segments (`.wal.zst`).
 #[derive(Debug, Default)]
 pub struct ColdDiskLog;
 
@@ -37,8 +37,7 @@ pub struct CompressedSegment {
 }
 
 impl ColdDiskLog {
-    /// Compresses an uncompressed Warm Disk segment (.wal) into a Cold Disk segment (.wal.zst)
-    /// synchronously.
+    /// Compresses the warm segment at `warm_path` into the cold segment at `cold_path`.
     ///
     /// Writes to a `.tmp` file first, flushes, syncs, atomically renames over the destination
     /// and syncs the directory, verifies readability, and only then deletes the uncompressed
@@ -107,9 +106,7 @@ impl ColdDiskLog {
         })
     }
 
-    /// Asynchronously compresses a warm segment into a cold segment, delegating CPU-heavy
-    /// Zstandard encoding and disk operations to `tokio::task::spawn_blocking` to avoid stalling
-    /// Tokio worker threads.
+    /// [`compress_warm_segment_sync`](Self::compress_warm_segment_sync) on the blocking pool.
     pub async fn compress_warm_segment(
         warm_path: impl AsRef<Path>,
         cold_path: impl AsRef<Path>,
@@ -205,11 +202,8 @@ fn compress_to(
             BatchPayloadDecode::Batch { ops, .. } => {
                 for op in &ops {
                     let seq = op.seq.get();
-                    if next_seq.is_some_and(|expected| seq != expected) {
-                        return Err(invalid(format!(
-                            "operation {seq}, expected {}",
-                            next_seq.unwrap_or_default()
-                        )));
+                    if let Some(expected) = next_seq.filter(|&expected| expected != seq) {
+                        return Err(invalid(format!("operation {seq}, expected {expected}")));
                     }
                     next_seq = Some(seq + 1);
                 }
@@ -252,16 +246,9 @@ fn decompressed_digest(cold_path: &Path) -> Result<Digest, ServerError> {
 }
 
 /// An error of the file under a zstd stream, told apart from errors in the compressed data.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
 struct FileError(io::Error);
-
-impl std::fmt::Display for FileError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl std::error::Error for FileError {}
 
 /// A file whose read errors are tagged as [`FileError`].
 struct TaggedFile(File);
@@ -299,7 +286,7 @@ pub(crate) fn read_cold_file(
     budget: &mut ReadBudget,
 ) -> Result<RecoveredLogData, ServerError> {
     if budget.is_exhausted() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(Default::default());
     }
     io_probe::record(
         IoEvent::SegmentRead,
@@ -307,7 +294,7 @@ pub(crate) fn read_cold_file(
     );
     let file = match File::open(path) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Default::default()),
         Err(e) => return Err(e.into()),
     };
     let mut decoder = open_decoder(file)?;

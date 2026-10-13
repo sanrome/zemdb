@@ -76,6 +76,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y cambió el mó
 - `policy.rs:49`: `ram_ttl` es la «TTL … before **segment rotation** and eviction». `ram_ttl` solo se usa en `hot_buffer.rs:141` para desalojar de RAM. Propuesta: «Maximum age of an operation in RAM; older ones are evicted (they stay on disk).»
 - `policy.rs:298` (**a verificar**): «A RAM TTL of 0 would seal a segment per operation». Según el código, una TTL de 0 vacía la RAM en cada `apply_sliding_window` y no sella nada. El motivo real del mínimo de 1 s parece ser «every read would go to disk».
 - `segment_index.rs:143`: dice «Adds a segment.», pero `insert` también **reemplaza** el segmento con el mismo `start_seq`, y `mark_compressed` (`tiered_log.rs:470`) depende de eso. Propuesta: «Adds the segment, replacing the one with the same `start_seq`.»
+- **Estado:** ✅ aplicada (paso 1)
 
 **Recortar (redundantes o de marketing), unas 25–30 líneas:**
 - `tiered_log.rs:98-101`: «Unified 4-tier immutable log coordinator and delta query engine. Manages the full lifecycle…». Mezcla «4 tiers» con «Tier 4 boundary» (`:279`). Bastaría una línea: «Room delta log over RAM, `.wal` and `.wal.zst` segments, with write-through appends.»
@@ -85,6 +86,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y cambió el mó
 - `hot_buffer.rs:9-12` («Ensures zero-squashing…, guaranteeing absolute sequence contiguity… sub-millisecond response times»): se puede dejar en una línea. Además, `:41` («Creates an empty hot buffer.»), `:89-90` («Exploits … in constant time without linear filtering», que se puede reducir a «The start index is `from_seq + 1 - min_seq`: the buffer is contiguous.») y `:105-107`, que puede ir en una línea.
 - `cold_disk.rs:111-113` (la doc del async puede ir en una línea: «[`compress_warm_segment_sync`] on the blocking pool.»). Con Q1 también desaparecen las docs duplicadas en `cold_disk.rs:125`/`134-136` y `warm_disk.rs:210`/`219-221`.
 - `warm_disk.rs:65` y `policy.rs:60` tienen más de 100 columnas, y el primero dice «ensures physical durability on disk» cuando alcanza con «synced with `sync_data`».
+- **Estado:** ✅ aplicada (paso 1). Además se recortaron las docs de `ColdDiskLog`/`WarmDiskLog` («Tier 2/3 …») y de `force_rotate_warm`, `rehydrate` y `evict_older_than`.
 
 ## Sugerencias
 
@@ -162,18 +164,21 @@ El commit `e88874b` llegó a `main` después de esta auditoría y cambió el mó
 - **Problema:** con el nombre `overrides`, rustfmt (con `chain_width` 60 por defecto) parte en 3–4 líneas 7 de los 12 campos.
 - **Propuesta:** `let o = overrides;`. Así `segment_max_bytes`, `warm_disk_ttl`, `cold_disk_ttl`, `max_room_disk_bytes`, `lease_timeout` y `dormant_after` entran en una línea cada uno, y solo `forget_dormant_after` y `snapshot_demand_ttl` siguen partidos. Es un cambio puramente de formato.
 - **Ahorro estimado:** ~13 líneas · **Riesgo:** nulo · **Prioridad:** media.
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q8. Cierre duplicado del pase de mantenimiento async y sync
 - **Dónde:** `tiered_log.rs:360-408`.
 - **Problema:** `run_maintenance` y `run_maintenance_sync_at` repiten el cálculo de `cold_path` (`cold_segment_path(&self.segments_dir, …)`), la llamada a `record_compression` con `first_error.get_or_insert` y el cierre `expire` + `first_error.map_or(expired, Err)?`. La precedencia de errores podría divergir entre los dos.
 - **Propuesta:** (a) que `warm_segments_due` devuelva `(SegmentEntry, PathBuf)` con el `cold_path` ya calculado. (b) Extraer `fn finish_maintenance(&mut self, clock, mut report, first_error: Option<ServerError>) -> Result<MaintenanceReport, ServerError>` con las 3 líneas del cierre. En el async quedaría `blocking_io(|| self.finish_maintenance(clock, report, first_error))`: meter el `map_or` dentro del closure de `blocking_io` no cambia efectos, porque es puro.
 - **Ahorro estimado:** ~6 líneas · **Riesgo:** bajo · **Prioridad:** media-baja.
+- **Estado:** ⏭️ no aplicada — (b) ya la resolvió el Lote 8, y con `run_maintenance_at` como único llamador de `warm_segments_due`, mover allí el cálculo de `cold_path` (a) no ahorra líneas: solo cambia de lugar la llamada y obliga a devolver una tupla.
 
 ### Q9. `FileError` con `thiserror`
 - **Dónde:** `cold_disk.rs:280-290`.
 - **Problema:** el `impl Display` + `impl Error` es boilerplate escrito a mano, y el crate ya depende de `thiserror` (`crates/server/Cargo.toml:14`).
 - **Propuesta:** `#[derive(Debug, thiserror::Error)] #[error("{0}")] struct FileError(io::Error);`. El campo posicional sin `#[source]`/`#[from]` no se toma como `source()`, así que el comportamiento es idéntico al actual: mismo `Display` y `source() == None`.
 - **Ahorro estimado:** ~6 líneas · **Riesgo:** bajo · **Prioridad:** baja.
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q10. `compress_to`: comparar la secuencia sin `unwrap_or_default`
 - **Dónde:** `cold_disk.rs:233-240`.
@@ -186,6 +191,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y cambió el mó
   ```
   El mensaje no cambia.
 - **Ahorro estimado:** ~2 líneas · **Riesgo:** nulo · **Prioridad:** baja.
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q11. `Tier::extension()` en lugar de dos envoltorios de ruta
 - **Dónde:** `segment_index.rs:10-14`, `86-92`, `185-214`.
@@ -198,12 +204,14 @@ El commit `e88874b` llegó a `main` después de esta auditoría y cambió el mó
 - **Problema:** todo el cuerpo queda anidado dentro de un `if let … else { Ok(None) }`.
 - **Propuesta:** `let (Some(start), Some(end)) = (…) else { return Ok(None) };`, igual que en `tiered_log.rs:245-250`. Se mantiene el orden flush/sync_all → rename → reset → sync_dir.
 - **Ahorro estimado:** ~2 líneas y un nivel menos de anidación · **Riesgo:** nulo · **Prioridad:** baja.
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q13. Detalles menores
 - `Ok((Vec::new(), Vec::new()))` aparece en `cold_disk.rs:328`, `:336` y `warm_disk.rs:240`, `:300`, `:310`. Se puede escribir `Ok(Default::default())`. No ahorra líneas, pero es más corto.
 - `RecoveredLogData` se define en `warm_disk.rs:17` y lo usan cold, tiered y segment_reader. Su lugar natural es `segment_reader.rs`, junto a `FrameRead`. Prioridad baja.
 - `read_newest` (`tiered_log.rs:702-726`): `chunk.0`/`chunk.1` se leen mejor desestructurando (`let (chunk_ops, chunk_mutations) = match …`), y `distinct` puede salir de `active_mutations` después de desestructurar `active`. No ahorra líneas, mejora la claridad.
 - `io_probe::IoEvent::ActiveWalPathRead` (`warm_disk.rs:303-307`): en producción nunca se llama a `read_segment_file` con `active.wal`, así que la rama solo sirve como guarda del test `tests/tiered_log.rs:405`, que verifica que el conteo sea 0. Conviene dejarla, ver abajo.
+- **Estado:** ✅ aplicada (paso 1) en `Ok(Default::default())` y en la desestructuración de `read_newest`. Mover `RecoveredLogData` a `segment_reader.rs` cruza archivos y queda para el paso 2; `ActiveWalPathRead` se deja, como indica el punto.
 
 ## Lo que conviene dejar como está
 - **El bucle de frames de `compress_to` (`cold_disk.rs:207-254`) frente a `read_frames` (`segment_reader.rs:85-178`).** Se parecen, pero la semántica es opuesta. `compress_to` es estricta: cualquier anomalía es un error que impide comprimir, verifica cada payload y la continuidad completa contra el nombre, y copia los bytes crudos al encoder y al digest. `read_frames` tolera colas rotas (`anomaly`) y saltea payloads sin verificarlos. Unificarlas exigiría parámetros de modo que oscurecen las dos rutas de integridad.

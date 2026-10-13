@@ -22,7 +22,8 @@ const ACTIVE_SEGMENT: &str = "active.wal";
 /// Read buffer of a segment file.
 const READ_BUFFER: usize = 64 * 1024;
 
-/// Tier 2: Uncompressed append-only log on disk ensuring crash durability and fast sequential reads.
+/// Uncompressed segments on disk: the active segment `active.wal`, which every append is
+/// synced to, and its sealing into `segment_{start}_{end}.wal` files.
 ///
 /// `active.wal` is only ever accessed through `active_file`, the handle that holds its
 /// exclusive lock: on Windows the lock is mandatory, so a second handle could not read it.
@@ -63,7 +64,7 @@ impl WarmDiskLog {
         Ok((log, recovered))
     }
 
-    /// Appends a sequenced operation with an optional mutation ID to the active `.wal` segment and ensures physical durability on disk.
+    /// Appends `op` and its mutation ID to `active.wal`, synced with `sync_data`.
     pub fn append_record(
         &mut self,
         op: &SequencedOperation,
@@ -150,34 +151,33 @@ impl WarmDiskLog {
 
     /// Rotates and seals `active.wal` into an immutable `segment_{start}_{end}.wal` file.
     pub fn rotate_active_segment(&mut self) -> Result<Option<PathBuf>, ServerError> {
-        if let (Some(start), Some(end)) = (self.active_start_seq, self.active_end_seq) {
-            // The handle is closed before the rename: renaming a file this process has open
-            // would leave it writing to the sealed segment, and closing it releases the lock.
-            if let Some(mut file) = self.active_file.take() {
-                file.flush()?;
-                file.sync_all()?;
-            }
-
-            let active_path = self.segments_dir.join(ACTIVE_SEGMENT);
-            let sealed_path = warm_segment_path(&self.segments_dir, start, end);
-
-            let renamed = active_path.exists();
-            if renamed {
-                std::fs::rename(&active_path, &sealed_path)?;
-            }
-
-            self.active_start_seq = None;
-            self.active_end_seq = None;
-            self.active_len = 0;
-
-            // Make the rename durable before the sealed segment can be compressed or pruned.
-            if renamed {
-                durable::sync_dir(&self.segments_dir)?;
-            }
-            Ok(Some(sealed_path))
-        } else {
-            Ok(None)
+        let (Some(start), Some(end)) = (self.active_start_seq, self.active_end_seq) else {
+            return Ok(None);
+        };
+        // The handle is closed before the rename: renaming a file this process has open
+        // would leave it writing to the sealed segment, and closing it releases the lock.
+        if let Some(mut file) = self.active_file.take() {
+            file.flush()?;
+            file.sync_all()?;
         }
+
+        let active_path = self.segments_dir.join(ACTIVE_SEGMENT);
+        let sealed_path = warm_segment_path(&self.segments_dir, start, end);
+
+        let renamed = active_path.exists();
+        if renamed {
+            std::fs::rename(&active_path, &sealed_path)?;
+        }
+
+        self.active_start_seq = None;
+        self.active_end_seq = None;
+        self.active_len = 0;
+
+        // Make the rename durable before the sealed segment can be compressed or pruned.
+        if renamed {
+            durable::sync_dir(&self.segments_dir)?;
+        }
+        Ok(Some(sealed_path))
     }
 
     /// Reads the operations after `from_seq` that fit in `budget` from `active.wal`, through
@@ -213,7 +213,7 @@ impl WarmDiskLog {
     fn inspect_active_segment(&mut self) -> Result<RecoveredLogData, ServerError> {
         let active_path = self.segments_dir.join(ACTIVE_SEGMENT);
         if !active_path.exists() {
-            return Ok((Vec::new(), Vec::new()));
+            return Ok(Default::default());
         }
 
         let file = OpenOptions::new()
@@ -273,7 +273,7 @@ pub(crate) fn read_segment_file(
     budget: &mut ReadBudget,
 ) -> Result<RecoveredLogData, ServerError> {
     if budget.is_exhausted() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(Default::default());
     }
     let dir = path.parent().unwrap_or_else(|| Path::new(""));
     if path.file_name().is_some_and(|name| name == ACTIVE_SEGMENT) {
@@ -283,7 +283,7 @@ pub(crate) fn read_segment_file(
     }
     let file = match File::open(path) {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
         Err(e) => return Err(e.into()),
     };
     let len = file.metadata()?.len();
@@ -307,7 +307,7 @@ fn finish_file_read(
     Ok((read.ops, read.mutations))
 }
 
-/// Helper function to parse `segment_{start}_{end}{extension}` filenames into (start_seq, end_seq).
+/// `(start, end)` of a `segment_{start}_{end}{extension}` file name.
 pub fn parse_segment_filename(name: &str, extension: &str) -> Option<(u64, u64)> {
     let prefix = "segment_";
     if !name.starts_with(prefix) || !name.ends_with(extension) {

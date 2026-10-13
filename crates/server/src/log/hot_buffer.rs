@@ -6,10 +6,7 @@ use std::time::Instant;
 use zemdb_core::id::SequenceNumber;
 use zemdb_core::protocol::messages::SequencedOperation;
 
-/// Tier 1: In-memory contiguous read cache of recent sequenced operations.
-///
-/// Ensures zero-squashing on sequenced deltas, guaranteeing absolute sequence contiguity
-/// (`head_seq + 1`) and providing sub-millisecond response times for connected clients.
+/// RAM cache of the newest operations of the log, as a contiguous run of sequences.
 #[derive(Debug, Default)]
 pub struct HotBuffer {
     entries: VecDeque<Entry>,
@@ -38,14 +35,11 @@ impl Entry {
 }
 
 impl HotBuffer {
-    /// Creates an empty hot buffer.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Appends a new sequenced operation to the in-memory buffer.
-    ///
-    /// Validates strictly contiguous sequence numbering (`op.seq == last_seq + 1`).
+    /// Appends `op`, which must follow the last operation in the buffer.
     pub fn append(&mut self, op: SequencedOperation) -> Result<(), ServerError> {
         if let Some(last) = self.max_seq {
             if op.seq.get() != last.get() + 1 {
@@ -86,8 +80,7 @@ impl HotBuffer {
     /// Retrieves the contiguous operations strictly after `from_seq` that fit in `budget`,
     /// cloning only those.
     ///
-    /// Exploits the strictly contiguous and monotonic sequence invariant of the hot buffer
-    /// (`seq == min_seq + offset`) to compute the initial offset in constant time without linear filtering.
+    /// The start index is `from_seq + 1 - min_seq`: the buffer is contiguous.
     pub fn get_range(
         &self,
         from_seq: SequenceNumber,
@@ -102,9 +95,7 @@ impl HotBuffer {
             None => return Vec::new(),
         };
 
-        // If the requested cursor falls before the minimum sequence present in the buffer,
-        // RAM cannot satisfy the beginning of this contiguous range without introducing a gap.
-        // Returning empty forces the caller to fetch the preceding sequence prefix from disk.
+        // The range starts before the buffer: the caller reads that prefix from disk first.
         if from_seq.get() + 1 < min {
             return Vec::new();
         }
@@ -148,9 +139,8 @@ impl HotBuffer {
         self.after_eviction();
     }
 
-    /// Evicts operations older than `threshold_seq` from RAM cache.
-    ///
-    /// This is safe because all operations in the HotBuffer are already persisted to Warm Disk.
+    /// Evicts the operations before `threshold_seq`. Every operation in the buffer is already
+    /// on disk.
     pub fn evict_older_than(&mut self, threshold_seq: SequenceNumber) {
         while let Some(entry) = self.entries.front() {
             if entry.op.seq.get() < threshold_seq.get() {
@@ -163,7 +153,7 @@ impl HotBuffer {
         self.after_eviction();
     }
 
-    /// Clears and rehydrates the buffer from recovered operations (e.g. on server startup).
+    /// Replaces the contents with `ops`, recovered from disk.
     pub fn rehydrate(&mut self, ops: impl IntoIterator<Item = SequencedOperation>) {
         self.entries.clear();
         self.bytes = 0;

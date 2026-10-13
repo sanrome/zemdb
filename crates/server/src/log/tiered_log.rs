@@ -95,10 +95,7 @@ impl MaintenanceClock {
     }
 }
 
-/// Unified 4-tier immutable log coordinator and delta query engine.
-///
-/// Manages the full lifecycle of sequenced operations across RAM, Warm Disk, Cold Disk,
-/// and compaction eviction, enforcing Write-Through durability on every append.
+/// Room delta log over RAM, `.wal` and `.wal.zst` segments, with write-through appends.
 ///
 /// The sealed segments on disk are tracked in an in-memory [`SegmentIndex`], built with one
 /// listing of the segments directory on open and updated on every rotation, compression and
@@ -141,9 +138,9 @@ impl TieredLog {
     ///
     /// The log is read backwards from its newest segment only until it has the last
     /// operations that fit in RAM (`ram_max_ops` and `ram_max_bytes`) and the last
-    /// `dedup_window` mutation IDs, keeping only those operations,
-    /// so the cost of opening a room does not grow with its retained history. `head_seq`
-    /// comes from the segment names, `active.wal` and `log_meta.json`.
+    /// `dedup_window` mutation IDs, keeping only those operations, so the cost of opening a
+    /// room does not grow with its retained history. `head_seq` comes from the segment names,
+    /// `active.wal` and `log_meta.json`.
     pub fn open_or_create_with_dedup_window(
         dir: impl AsRef<Path>,
         policy: RoomLifecyclePolicy,
@@ -194,11 +191,8 @@ impl TieredLog {
         Ok((log, mutations))
     }
 
-    /// Appends a new sequenced operation using the Write-Through durability model.
-    ///
-    /// 1. Persists synchronously on Warm Disk (`active.wal`) with batch framing and `sync_data()`.
-    /// 2. Stores in `HotBuffer` in RAM to resolve immediate `/sync` queries in sub-millisecond.
-    /// 3. Rotates and seals segment if size or age threshold is exceeded.
+    /// Appends `op` to `active.wal` (synced with `sync_data`) and then to the RAM buffer, and
+    /// seals the segment once it reaches `ram_max_ops` operations or `segment_max_bytes`.
     ///
     /// An `Err` means the record may not be durable. Once the record is durable the call
     /// returns `Ok`, and a failure to seal the segment afterwards is reported in the outcome.
@@ -215,10 +209,8 @@ impl TieredLog {
             )));
         }
 
-        // 1. Write-Through to Warm Disk
         blocking_io(|| self.warm_disk.append_record(&op, mutation_id))?;
 
-        // 2. Add to RAM HotBuffer and maintain sliding window
         self.hot_buffer.append(op)?;
         self.hot_buffer.apply_sliding_window(&self.policy);
 
@@ -226,9 +218,7 @@ impl TieredLog {
         // `head_seq + 1`, which is exactly the sequence of the operation just appended.
         self.head_seq = self.head_seq.next();
 
-        // 3. Segment rotation check: rotate active segment on disk when it reaches `ram_max_ops`
-        // operations or `segment_max_bytes` bytes, retaining recent operations in the RAM
-        // HotBuffer sliding window without destructive eviction to zero.
+        // Seal at `ram_max_ops` operations or `segment_max_bytes`; RAM keeps its window.
         let mut outcome = AppendOutcome::default();
         if self.warm_disk.active_ops_count() >= self.policy.ram_max_ops
             || self.warm_disk.active_len() >= self.policy.segment_max_bytes
@@ -264,10 +254,8 @@ impl TieredLog {
         Ok(sealed)
     }
 
-    /// Unified multi-tier delta query engine.
-    ///
-    /// Transparently streams deltas across Cold Disk, Warm Disk, and RAM HotBuffer,
-    /// enforcing strict sequence contiguity and emitting `BehindCompaction` if the cursor is expired.
+    /// The operations after `from_seq`, read from the cold, warm and RAM tiers as one contiguous
+    /// run, or `BehindCompaction` if the cursor is past retention.
     ///
     /// Returns at most `max_batch_size` operations that fit in one response
     /// ([`MAX_RESPONSE_OPS_BYTES`]), and at least one: operations beyond the budget are neither
@@ -277,7 +265,6 @@ impl TieredLog {
         from_seq: SequenceNumber,
         max_batch_size: u32,
     ) -> Result<(Vec<SequencedOperation>, bool), ServerError> {
-        // Eviction check (Tier 4 boundary)
         if self.is_behind_retention(from_seq) {
             return Err(ServerError::BehindCompaction);
         }
@@ -288,9 +275,7 @@ impl TieredLog {
 
         let budget = ReadBudget::new(max_batch_size as usize, MAX_RESPONSE_OPS_BYTES);
 
-        // 1. Fast Path (Tier 1: HotBuffer in RAM)
-        // If the requested cursor falls within the current RAM buffer window, serve directly
-        // from memory in sub-microsecond time without touching disk or executing system calls.
+        // A cursor within the RAM window is served from memory, without touching disk.
         if let Some(min_ram) = self.hot_buffer.min_seq() {
             if from_seq.get() + 1 >= min_ram.get() {
                 let ops = self.hot_buffer.get_range(from_seq, &mut budget.clone());
@@ -301,12 +286,12 @@ impl TieredLog {
             }
         }
 
-        // 2. Disk tiers, oldest first: the indexed sealed segments (cold, then warm), then
+        // Disk tiers, oldest first: the indexed sealed segments (cold, then warm), then
         // `active.wal`, which bridges the sealed segments and the RAM window.
         let mut batch = DeltaBatch::new(from_seq, budget);
         blocking_io(|| self.fetch_from_disk(&mut batch))?;
 
-        // 3. Tier 1: if the batch reached the RAM buffer's window, the rest comes from memory.
+        // If the batch reached the RAM buffer's window, the rest comes from memory.
         if !batch.is_full() && batch.cursor.get() < self.head_seq.get() {
             let ram_ops = self.hot_buffer.get_range(batch.cursor, &mut batch.budget);
             batch.extend("hot buffer", ram_ops)?;
@@ -593,7 +578,7 @@ impl TieredLog {
         self.segments.total_bytes() + self.warm_disk.active_len()
     }
 
-    /// Force rotates the active Warm segment immediately without evicting the RAM HotBuffer.
+    /// Seals `active.wal` now, without evicting RAM.
     #[cfg(test)]
     pub fn force_rotate_warm(&mut self) -> Result<Option<PathBuf>, ServerError> {
         blocking_io(|| self.seal_active_segment())
@@ -697,14 +682,14 @@ fn read_newest(
     mutations_wanted: usize,
 ) -> Result<RecoveredLogData, ServerError> {
     let mut ram = RamFill::new(policy);
-    let mut distinct: HashSet<MutationId> = active.1.iter().map(|(id, _)| *id).collect();
     let (active_ops, active_mutations) = active;
+    let mut distinct: HashSet<MutationId> = active_mutations.iter().map(|(id, _)| *id).collect();
     let mut chunks = vec![(ram.keep_newest(active_ops), active_mutations)];
     for segment in segments.iter().rev() {
         if ram.is_full() && distinct.len() >= mutations_wanted {
             break;
         }
-        let chunk = match read_segment(
+        let (chunk_ops, chunk_mutations) = match read_segment(
             segment,
             SequenceNumber::new(0),
             &mut ReadBudget::ops(usize::MAX),
@@ -720,8 +705,8 @@ fn read_newest(
             }
             Err(err) => return Err(err),
         };
-        distinct.extend(chunk.1.iter().map(|(id, _)| *id));
-        chunks.push((ram.keep_newest(chunk.0), chunk.1));
+        distinct.extend(chunk_mutations.iter().map(|(id, _)| *id));
+        chunks.push((ram.keep_newest(chunk_ops), chunk_mutations));
     }
 
     let mut ops = Vec::new();
