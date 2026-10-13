@@ -1,13 +1,13 @@
 use crate::error::ServerError;
 use crate::log::policy::PolicySetting;
 use crate::log::{RoomLifecycleOverrides, RoomLifecyclePolicy};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 /// Server configuration with TOML deserialization and environment variable overrides.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
     /// Host address to bind to (e.g. "127.0.0.1" or "0.0.0.0").
@@ -138,34 +138,34 @@ impl Default for ServerConfig {
 }
 
 /// Smallest accepted `max_snapshot_bytes` (1 MiB).
-pub const MIN_MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024;
+const MIN_MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024;
 
 /// Largest accepted `max_snapshot_bytes` (64 GiB).
-pub const MAX_MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Accepted range of `header_read_timeout_secs`: from 1 second to 5 minutes.
-pub const HEADER_READ_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=300;
+const HEADER_READ_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=300;
 
 /// Accepted range of `body_read_timeout_secs`: from 1 second to 1 hour.
-pub const BODY_READ_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=3600;
+const BODY_READ_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=3600;
 
 /// Accepted range of `body_min_rate_bytes_per_sec`: from 1 KiB/s (a 16 MiB body may then take
 /// about 4.5 hours) to 1 GiB/s (in practice, no extension beyond the base time).
-pub const BODY_MIN_RATE_BYTES_PER_SEC_RANGE: std::ops::RangeInclusive<u64> = 1024..=1 << 30;
+const BODY_MIN_RATE_BYTES_PER_SEC_RANGE: std::ops::RangeInclusive<u64> = 1024..=1 << 30;
 
 /// Accepted range of `max_connections`: from 1 to 1,000,000.
-pub const MAX_CONNECTIONS_RANGE: std::ops::RangeInclusive<usize> = 1..=1_000_000;
+const MAX_CONNECTIONS_RANGE: std::ops::RangeInclusive<usize> = 1..=1_000_000;
 
 /// Minimum length, in bytes, of the client token secret and the admin secret.
-pub const MIN_SECRET_LEN: usize = 32;
+const MIN_SECRET_LEN: usize = 32;
 
 impl ServerConfig {
     /// Checks that the configured secrets are safe to serve with.
     ///
-    /// Rejects empty secrets, secrets shorter than [`MIN_SECRET_LEN`] bytes, the built-in
-    /// development defaults (they are public in the source code, so anyone could mint client
-    /// tokens or act as admin), and an admin secret equal to the client token secret (whoever
-    /// can issue client tokens would also be admin). Error messages never include the secrets.
+    /// Rejects empty secrets, secrets shorter than 32 bytes, the built-in development defaults
+    /// (they are public in the source code, so anyone could mint client tokens or act as admin),
+    /// and an admin secret equal to the client token secret (whoever can issue client tokens
+    /// would also be admin). Error messages never include the secrets.
     pub fn validate_secrets(&self) -> Result<(), ServerError> {
         check_secret(
             "auth_secret (ZEMDB_AUTH_SECRET)",

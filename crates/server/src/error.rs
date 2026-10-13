@@ -10,7 +10,7 @@ use zemdb_core::protocol::messages::ErrorCode;
 
 /// Seconds a client waits before retrying a request answered with 503 `Unavailable`
 /// (sent in the `Retry-After` header).
-pub const RETRY_AFTER_SECS: u64 = 1;
+const RETRY_AFTER_SECS: u64 = 1;
 
 /// Core error type for the coordination server.
 #[derive(Debug, Error)]

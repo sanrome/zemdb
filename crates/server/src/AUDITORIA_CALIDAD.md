@@ -223,6 +223,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y tocó este alc
 - **Propuesta:** pasar las constantes a `pub(crate)` y evaluar si `Serialize` hace falta. No ahorra líneas; reduce superficie pública. Como `config` y `error` son módulos `pub` del crate, puede haber consumidores externos que no se ven con grep.
 - **Ahorro estimado:** 0 · **Riesgo:** medio (API) · **Prioridad:** baja
 - **Verificación (2.ª pasada):** ✅ confirmada — `RETRY_AFTER_SECS` solo se usa en `error.rs:189`; las constantes de rango solo en `config.rs`; no hay serialización de `ServerConfig` en el workspace. El riesgo de API externa sigue siendo la única duda.
+- **Estado:** ✅ aplicada (paso 4). El crate no tiene consumidores fuera del workspace, así que las constantes pasaron a privadas del módulo y no a `pub(crate)`: `RETRY_AFTER_SECS` solo se usa en `error.rs` y las de `config.rs` solo en `config.rs` y en sus tests unitarios, que son un submódulo. Se sumó `MIN_SECRET_LEN`, en la misma situación. `ServerConfig` dejó de derivar `Serialize`. El doc de `validate_secrets` dice "32 bytes" en lugar de enlazar `MIN_SECRET_LEN`, porque un doc público no puede enlazar un ítem privado.
 
 ## Lo que conviene dejar como está
 
