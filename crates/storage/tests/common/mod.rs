@@ -42,7 +42,7 @@ pub fn evolved_users_schema() -> Schema {
 
 /// `op` at sequence `seq`.
 pub fn sequenced(seq: u64, op: Operation) -> SequencedOperation {
-    SequencedOperation::with_default_origin(seq, op)
+    SequencedOperation::new(seq, op)
 }
 
 pub fn row(id: i64, name: &str, score: i64, active: bool) -> CompactRow {

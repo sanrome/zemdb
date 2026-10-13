@@ -72,11 +72,6 @@ impl SequencedOperation {
             op,
         }
     }
-
-    /// Ergonomic alias for tests.
-    pub fn with_default_origin(seq: impl Into<SequenceNumber>, op: Operation) -> Self {
-        Self::new(seq, op)
-    }
 }
 
 /// Unified message sent from Client to Server.

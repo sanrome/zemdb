@@ -22,7 +22,7 @@ pub(crate) fn schema() -> Schema {
 
 /// `op` at sequence `seq`.
 pub(crate) fn sequenced(seq: u64, op: Operation) -> SequencedOperation {
-    SequencedOperation::with_default_origin(seq, op)
+    SequencedOperation::new(seq, op)
 }
 
 pub(crate) fn insert_named(seq: u64, key: i64, name: &str) -> SequencedOperation {

@@ -178,6 +178,7 @@
 - **Problema:** es idéntico a `new`. `SequencedOperation` no tiene ningún campo de "origin", así que el nombre no describe nada. Solo lo usan tests (~80 llamadas en otros crates).
 - **Propuesta:** eliminarlo y reemplazar las llamadas por `SequencedOperation::new` (cambio mecánico con `sed`, mismo comportamiento).
 - **Ahorro estimado:** 4 líneas en el módulo (los tests quedan con la misma cantidad de líneas) · **Riesgo:** bajo, pero toca archivos fuera de este alcance · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso final). Tras el paso 3 solo quedaban tres usos, todos en helpers de tests de `storage`, que ahora llaman a `SequencedOperation::new`.
 
 ### Q9. `frame_payload` con patrón de slice
 - **Dónde:** `codec.rs:145-164`

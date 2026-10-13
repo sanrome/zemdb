@@ -22,7 +22,7 @@ fn insert(seq: u64, key: i64) -> SequencedOperation {
         Value::Int(key),
         Value::String(format!("user {key}").into()),
     ]);
-    SequencedOperation::with_default_origin(
+    SequencedOperation::new(
         seq,
         Operation::insert(USERS, PrimaryKey::single(key), row, 100),
     )
