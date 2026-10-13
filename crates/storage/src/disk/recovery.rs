@@ -222,14 +222,189 @@ async fn replay_wal_file(
     })
 }
 
-/// Replays a room from disk following the Dual-File architecture:
-/// 1. Reads the immutable base snapshot from `snap_path` (`room_{id}.snap`),
-///    verifying header and compressed payload CRC32 checksums before decompressing. A new
-///    room has none: an empty one is staged in a temporary file and renamed into place, so a
-///    failure or crash never leaves a partial snapshot behind.
-/// 2. If a pre-crash rotated WAL (`room_{id}.wal.compacting`) exists, replays the records
-///    it holds beyond the snapshot. A damaged frame there followed by valid ones is accepted
-///    only if the active WAL holds the records after it, as a crash while absorbing leaves.
+/// A room's base snapshot, as loaded by `load_snapshot`.
+struct BaseSnapshot {
+    tables: HashMap<u16, Table>,
+    snapshot_seq: SequenceNumber,
+    head_seq: SequenceNumber,
+    snapshot_len: u64,
+}
+
+/// Loads the base snapshot from `snap_path` (`room_{id}.snap`), verifying the header and the
+/// CRC32 of the compressed payload before decompressing it.
+///
+/// A new room has none: an empty one is staged in a temporary file and renamed into place, so a
+/// failure or crash never leaves a partial snapshot behind.
+async fn load_snapshot(
+    room_id: &RoomId,
+    snap_path: &Path,
+    schema: &Schema,
+) -> Result<BaseSnapshot, StorageError> {
+    let mut base = BaseSnapshot {
+        tables: empty_tables(schema),
+        snapshot_seq: SequenceNumber::from(0u64),
+        head_seq: SequenceNumber::from(0u64),
+        snapshot_len: 0,
+    };
+
+    // An error checking for the snapshot is not a missing snapshot: creating an empty one in its
+    // place would lose the room's contents.
+    let snap_exists = fail_point::io_result(
+        "recovery.snapshot_exists",
+        snap_path,
+        tokio::fs::try_exists(snap_path).await,
+    )?;
+    if !snap_exists {
+        // The rename would replace a snapshot, but there is none: `try_exists` said so, and the
+        // room's lock keeps out any other engine that could create one.
+        write_empty_snapshot_file(snap_path, room_id).await?;
+        return Ok(base);
+    }
+
+    let snap_file = tokio::fs::File::from_std(std::fs::File::open(snap_path)?);
+    let snap_file_len = snap_file.metadata().await?.len();
+
+    if snap_file_len < HEADER_SIZE as u64 {
+        return Err(StorageError::WalCorruption(format!(
+            "Snapshot file size {snap_file_len} is smaller than minimum header size {HEADER_SIZE}"
+        )));
+    }
+
+    let mut snap_reader = BufReader::with_capacity(64 * 1024, snap_file);
+    let mut header_bytes = [0u8; HEADER_SIZE];
+    snap_reader
+        .read_exact(&mut header_bytes)
+        .await
+        .map_err(|e| {
+            StorageError::WalCorruption(format!("Failed to read snapshot file header: {e}"))
+        })?;
+
+    let header = FileHeader::decode(&header_bytes)?;
+    base.snapshot_len = header.snapshot_compressed_len;
+    base.snapshot_seq = SequenceNumber::from(header.snapshot_seq);
+    base.head_seq = SequenceNumber::from(header.head_seq);
+    if base.snapshot_len == 0 {
+        return Ok(base);
+    }
+
+    let expected_total = HEADER_SIZE as u64 + base.snapshot_len;
+    if snap_file_len < expected_total {
+        return Err(StorageError::SnapshotCorruption(format!(
+            "Snapshot file truncated: expected length {expected_total}, actual {snap_file_len}"
+        )));
+    }
+
+    let mut compressed_snap = vec![0u8; base.snapshot_len as usize];
+    snap_reader
+        .read_exact(&mut compressed_snap)
+        .await
+        .map_err(|e| {
+            StorageError::SnapshotCorruption(format!("Failed to read snapshot bytes: {e}"))
+        })?;
+
+    // Validate compressed snapshot payload CRC32 before decompression
+    let actual_payload_crc = crc32fast::hash(&compressed_snap);
+    if header.snapshot_payload_crc32 != 0 && header.snapshot_payload_crc32 != actual_payload_crc {
+        return Err(StorageError::SnapshotCorruption(format!(
+            "Snapshot payload CRC32 mismatch: expected {}, got {}",
+            header.snapshot_payload_crc32, actual_payload_crc
+        )));
+    }
+
+    // Decompressed and decoded together on the blocking pool. The file was written by this
+    // engine from a validated state, and its CRC matched, so its rows are not checked again and
+    // its size is not limited.
+    let mut payload: RoomSnapshotPayload =
+        run_blocking(move || crate::snapshot::deserialize_zstd(&compressed_snap, u64::MAX, None))
+            .await?;
+
+    payload.fill_missing_tables(schema);
+    Ok(BaseSnapshot {
+        tables: payload.tables,
+        snapshot_seq: payload.head_seq,
+        head_seq: payload.head_seq,
+        snapshot_len: base.snapshot_len,
+    })
+}
+
+/// Removes the temporary snapshot files next to `snap_path` (`room_{id}.snap.tmp.*`) left by
+/// interrupted compactions and snapshot installs.
+///
+/// The cleanup is best effort: if the directory cannot be listed, the files stay until a later
+/// open removes them. Failing to remove a file that was found is an error.
+async fn remove_staged_snapshots(snap_path: &Path) -> Result<(), StorageError> {
+    let Some(parent) = snap_path.parent() else {
+        return Ok(());
+    };
+    let Ok(mut entries) = tokio::fs::read_dir(parent).await else {
+        return Ok(());
+    };
+    let snap_file_name = snap_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let tmp_prefix = format!("{snap_file_name}.tmp.");
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Ok(name) = entry.file_name().into_string() {
+            if name.starts_with(&tmp_prefix) {
+                remove_if_exists(&entry.path()).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A damaged frame of `.wal.compacting` followed by valid frames, and the highest sequence
+/// number in those frames, which the recovered state must reach for the damage to be accepted.
+type UnconfirmedTail = (WalFrameError, Option<SequenceNumber>);
+
+/// Replays the records of a rotated WAL (`room_{id}.wal.compacting`) left by an interrupted
+/// compaction beyond the state recovered so far. Returns whether it held any such record, and
+/// its damaged tail, if any (see [`UnconfirmedTail`]).
+async fn replay_compacting_wal(
+    room_id: &RoomId,
+    wal_compacting_path: &Path,
+    schema: &Schema,
+    head_seq: &mut SequenceNumber,
+    tables: &mut HashMap<u16, Table>,
+) -> Result<(bool, Option<UnconfirmedTail>), StorageError> {
+    let mut compacting_file = tokio::fs::File::from_std(std::fs::File::open(wal_compacting_path)?);
+    let outcome = replay_wal_file(&mut compacting_file, schema, head_seq, tables).await?;
+    let has_live_records = outcome.applied_count > 0;
+    let unconfirmed_tail = match outcome.end {
+        ReplayEnd::Clean => None,
+        ReplayEnd::TornWrite(reason) => {
+            tracing::warn!(
+                room_id = %room_id,
+                reason = %reason,
+                "Torn write at the end of the rotated WAL, which is removed once folded"
+            );
+            None
+        }
+        // Absorbing the active WAL appends all of it with a single sync and only empties it
+        // afterwards, so a crash before that sync can leave a damaged frame followed by valid
+        // ones, all of whose records are still in the active WAL. A crash while folding them
+        // leaves the same file, with its records in the snapshot instead. The damage is accepted
+        // only if the recovered state ends up covering every record of the valid frames after
+        // it.
+        ReplayEnd::FollowedByFrame {
+            corruption,
+            following,
+        } => {
+            let end = compacting_file.metadata().await?.len();
+            let mut search_file = compacting_file.try_clone().await?.into_std().await;
+            let highest =
+                run_blocking(move || highest_seq_in_valid_frames(&mut search_file, following, end))
+                    .await?;
+            Some((corruption, highest))
+        }
+    };
+    Ok((has_live_records, unconfirmed_tail))
+}
+
+/// Recovers a room from its files:
+/// 1. Loads the base snapshot (`room_{id}.snap`), or creates an empty one for a new room, and
+///    removes the temporary snapshot files left behind.
+/// 2. If a pre-crash rotated WAL (`room_{id}.wal.compacting`) exists, replays the records it
+///    holds beyond the snapshot. A damaged frame there followed by valid ones is accepted only
+///    if the active WAL holds the records after it, as a crash while absorbing leaves.
 /// 3. Streams and replays all framed WAL batches from `wal_path` (`room_{id}.wal`),
 ///    applying mutations on top of tables and advancing `head_seq`, and truncates any
 ///    incomplete torn write at WAL EOF.
@@ -246,145 +421,30 @@ pub async fn recover_room(
     wal_file_std: std::fs::File,
     zstd_level: i32,
 ) -> Result<RecoveredRoom, StorageError> {
-    let mut tables = empty_tables(schema);
-
-    let mut snapshot_seq = SequenceNumber::from(0u64);
-    let mut head_seq = SequenceNumber::from(0u64);
-    let mut snapshot_len = 0u64;
-
-    // 1. Recover base snapshot from snap_path if it exists. An error checking for it is not a
-    // missing snapshot: creating an empty one in its place would lose the room's contents.
-    let snap_exists = fail_point::io_result(
-        "recovery.snapshot_exists",
-        snap_path,
-        tokio::fs::try_exists(snap_path).await,
-    )?;
-    if snap_exists {
-        let snap_file = tokio::fs::File::from_std(std::fs::File::open(snap_path)?);
-        let snap_file_len = snap_file.metadata().await?.len();
-
-        if snap_file_len < HEADER_SIZE as u64 {
-            return Err(StorageError::WalCorruption(format!(
-                "Snapshot file size {snap_file_len} is smaller than minimum header size {HEADER_SIZE}"
-            )));
-        }
-
-        let mut snap_reader = BufReader::with_capacity(64 * 1024, snap_file);
-        let mut header_bytes = [0u8; HEADER_SIZE];
-        snap_reader
-            .read_exact(&mut header_bytes)
-            .await
-            .map_err(|e| {
-                StorageError::WalCorruption(format!("Failed to read snapshot file header: {e}"))
-            })?;
-
-        let header = FileHeader::decode(&header_bytes)?;
-        snapshot_len = header.snapshot_compressed_len;
-        snapshot_seq = SequenceNumber::from(header.snapshot_seq);
-        head_seq = SequenceNumber::from(header.head_seq);
-
-        if snapshot_len > 0 {
-            let expected_total = HEADER_SIZE as u64 + snapshot_len;
-            if snap_file_len < expected_total {
-                return Err(StorageError::SnapshotCorruption(format!(
-                    "Snapshot file truncated: expected length {expected_total}, actual {snap_file_len}"
-                )));
-            }
-
-            let mut compressed_snap = vec![0u8; snapshot_len as usize];
-            snap_reader
-                .read_exact(&mut compressed_snap)
-                .await
-                .map_err(|e| {
-                    StorageError::SnapshotCorruption(format!("Failed to read snapshot bytes: {e}"))
-                })?;
-
-            // Validate compressed snapshot payload CRC32 before decompression
-            let actual_payload_crc = crc32fast::hash(&compressed_snap);
-            if header.snapshot_payload_crc32 != 0
-                && header.snapshot_payload_crc32 != actual_payload_crc
-            {
-                return Err(StorageError::SnapshotCorruption(format!(
-                    "Snapshot payload CRC32 mismatch: expected {}, got {}",
-                    header.snapshot_payload_crc32, actual_payload_crc
-                )));
-            }
-
-            // Decompressed and decoded together on the blocking pool. The file was written by
-            // this engine from a validated state, and its CRC matched, so its rows are not
-            // checked again and its size is not limited.
-            let mut payload: RoomSnapshotPayload = run_blocking(move || {
-                crate::snapshot::deserialize_zstd(&compressed_snap, u64::MAX, None)
-            })
-            .await?;
-
-            snapshot_seq = payload.head_seq;
-            head_seq = payload.head_seq;
-
-            payload.fill_missing_tables(schema);
-            tables = payload.tables;
-        }
-    } else {
-        // Create the initial empty snapshot. The rename would replace a snapshot, but there is
-        // none: `try_exists` said so, and the room's lock keeps out any other engine that
-        // could create one.
-        write_empty_snapshot_file(snap_path, room_id).await?;
-    }
-
-    // Clean up any lingering temporary snapshot files from interrupted compactions
-    if let Some(parent) = snap_path.parent() {
-        if let Ok(mut entries) = tokio::fs::read_dir(parent).await {
-            let snap_file_name = snap_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            let tmp_prefix = format!("{}.tmp.", snap_file_name);
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Ok(name) = entry.file_name().into_string() {
-                    if name.starts_with(&tmp_prefix) {
-                        remove_if_exists(&entry.path()).await?;
-                    }
-                }
-            }
-        }
-    }
+    // 1. Load the base snapshot
+    let BaseSnapshot {
+        mut tables,
+        mut snapshot_seq,
+        mut head_seq,
+        mut snapshot_len,
+    } = load_snapshot(room_id, snap_path, schema).await?;
+    remove_staged_snapshots(snap_path).await?;
 
     // 2. Replay a pre-crash rotated WAL (`room_{id}.wal.compacting`), if any
     let wal_compacting_path = compacting_wal_path(wal_path);
     let compacting_exists = tokio::fs::try_exists(&wal_compacting_path).await?;
-    let mut compacting_has_live_records = false;
-    let mut unconfirmed_compacting_tail = None;
-
-    if compacting_exists {
-        let mut compacting_file =
-            tokio::fs::File::from_std(std::fs::File::open(&wal_compacting_path)?);
-        let outcome =
-            replay_wal_file(&mut compacting_file, schema, &mut head_seq, &mut tables).await?;
-        compacting_has_live_records = outcome.applied_count > 0;
-        match outcome.end {
-            ReplayEnd::Clean => {}
-            ReplayEnd::TornWrite(reason) => tracing::warn!(
-                room_id = %room_id,
-                reason = %reason,
-                "Torn write at the end of the rotated WAL, which is removed once folded"
-            ),
-            // Absorbing the active WAL appends all of it with a single sync and only empties it
-            // afterwards, so a crash before that sync can leave a damaged frame followed by
-            // valid ones, all of whose records are still in the active WAL. A crash while
-            // folding them leaves the same file, with its records in the snapshot instead. The
-            // damage is accepted only if the recovered state ends up covering every record of
-            // the valid frames after it.
-            ReplayEnd::FollowedByFrame {
-                corruption,
-                following,
-            } => {
-                let end = compacting_file.metadata().await?.len();
-                let mut search_file = compacting_file.try_clone().await?.into_std().await;
-                let highest = run_blocking(move || {
-                    highest_seq_in_valid_frames(&mut search_file, following, end)
-                })
-                .await?;
-                unconfirmed_compacting_tail = Some((corruption, highest));
-            }
-        }
-    }
+    let (compacting_has_live_records, unconfirmed_compacting_tail) = if compacting_exists {
+        replay_compacting_wal(
+            room_id,
+            &wal_compacting_path,
+            schema,
+            &mut head_seq,
+            &mut tables,
+        )
+        .await?
+    } else {
+        (false, None)
+    };
 
     // 3. Replay append-only WAL batches from wal_path
     let mut wal_file = tokio::fs::File::from_std(wal_file_std);

@@ -12,7 +12,6 @@ use crate::disk::format::FileHeader;
 use crate::disk::{DiskRoom, DiskStorageOptions, DiskWal, PendingWrite};
 use crate::error::StorageError;
 use crate::fail_point;
-use crate::memory::state::RoomSnapshotPayload;
 use crate::memory::{RoomSnapshotRef, Table};
 use crate::sys::{run_blocking, sync_dir};
 
@@ -108,10 +107,7 @@ pub(crate) async fn compact_room_cow(
             Ok::<(), StorageError>(())
         }
         .await;
-        if let Err(err) = sync_result {
-            wal.mark_failed(format!("WAL sync before compaction failed: {err}"));
-            return Err(err);
-        }
+        wal.fail_on_err("WAL sync before compaction failed", sync_result)?;
 
         fail_point::pause("compaction.rotate", &room.wal_path).await;
         let absorb = tokio::fs::try_exists(&wal_compacting_path).await?;
@@ -132,22 +128,17 @@ pub(crate) async fn compact_room_cow(
     fail_point::pause("compaction.staging", &room.wal_path).await;
 
     // Phase 2
-    let zstd_level = options.zstd_level;
-    let staged = {
-        let snap_path = room.snap_path.clone();
-        let room_id = room.room_id.clone();
-        run_blocking(move || {
-            fail_point::check("compaction.phase2", &snap_path)?;
-            let payload = RoomSnapshotPayload {
-                head_seq: cut_seq,
-                tables: snapshot_tables,
-            };
-            let serialized = bincode::serialize(&payload)
-                .map_err(|e| StorageError::Serialization(e.to_string()))?;
-            stage_snapshot_blocking(&snap_path, cut_seq, &serialized, zstd_level, &room_id)
-        })
-        .await?
-    };
+    fail_point::check("compaction.phase2", &room.snap_path)?;
+    let staged = stage_snapshot(
+        &room.snap_path,
+        cut_seq,
+        &snapshot_tables,
+        options.zstd_level,
+        &room.room_id,
+    )
+    .await?;
+    // Dropped before phase 3, so that it stops keeping alive the nodes that writes replace.
+    drop(snapshot_tables);
 
     // Phase 3
     let renamed = async {
@@ -218,13 +209,10 @@ async fn rotate_wal_to_compacting(
         sync_parent(&room.wal_path).await
     }
     .await;
-    if let Err(err) = sync_result {
-        wal.mark_failed(format!(
-            "Syncing the directory after rotating the WAL failed: {err}"
-        ));
-        return Err(err);
-    }
-    Ok(())
+    wal.fail_on_err(
+        "Syncing the directory after rotating the WAL failed",
+        sync_result,
+    )
 }
 
 async fn roll_back_rotation(
@@ -270,11 +258,8 @@ async fn absorb_wal_into_compacting(
         Ok::<(), StorageError>(())
     }
     .await;
-    if let Err(err) = read_result {
-        // The handle position is unknown; appending from there could overwrite records.
-        wal.mark_failed(format!("Reading the active WAL failed: {err}"));
-        return Err(err);
-    }
+    // On failure the handle position is unknown; appending from there could overwrite records.
+    wal.fail_on_err("Reading the active WAL failed", read_result)?;
 
     if !wal_bytes.is_empty() {
         append_synced(wal_compacting_path, &wal_bytes, &room.wal_path, wal).await?;
@@ -282,13 +267,10 @@ async fn absorb_wal_into_compacting(
 
     fail_point::check("compaction.absorb", &room.wal_path)?;
 
-    if let Err(err) = truncate_wal(wal, &room.wal_path).await {
-        // The handle's length and position are unknown; appending from there could overwrite
-        // or misplace records.
-        wal.mark_failed(format!("Emptying the active WAL failed: {err}"));
-        return Err(err);
-    }
-    Ok(())
+    // On failure the handle's length and position are unknown; appending from there could
+    // overwrite or misplace records.
+    let truncated = truncate_wal(wal, &room.wal_path).await;
+    wal.fail_on_err("Emptying the active WAL failed", truncated)
 }
 
 /// Empties the active WAL through its own locked handle and syncs it.

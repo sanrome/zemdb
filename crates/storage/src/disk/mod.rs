@@ -111,6 +111,19 @@ impl DiskWal {
         self.failure = Some(reason);
     }
 
+    /// Marks the room as failed if `result` is an error, with `context` before the error in the
+    /// reason, and returns `result` unchanged.
+    pub(crate) fn fail_on_err<T>(
+        &mut self,
+        context: &str,
+        result: Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        if let Err(err) = &result {
+            self.mark_failed(format!("{context}: {err}"));
+        }
+        result
+    }
+
     /// Returns an error if the room was marked as failed.
     pub(crate) fn ensure_usable(&self) -> Result<(), StorageError> {
         match &self.failure {
@@ -148,11 +161,6 @@ impl<'a> PendingWrite<'a> {
 
     pub(crate) fn wal(&mut self) -> &mut DiskWal {
         self.wal
-    }
-
-    /// Marks the room as failed with a specific reason.
-    pub(crate) fn fail(self, reason: String) {
-        self.wal.mark_failed(reason);
     }
 
     /// The change reached a consistent end: it is complete, or it failed in a way it handled
@@ -488,10 +496,9 @@ impl StorageEngine for DiskStorageEngine {
             Ok::<(), StorageError>(())
         }
         .await;
-        if let Err(err) = write_result {
-            pending.fail(format!("WAL append failed: {err}"));
-            return Err(err);
-        }
+        pending
+            .wal()
+            .fail_on_err("WAL append failed", write_result)?;
         pending.wal().len += wal_batch_bytes.len() as u64;
 
         // Apply operations to O(1) clones of the in-memory tables, then publish them at once:
@@ -674,10 +681,10 @@ impl StorageEngine for DiskStorageEngine {
             staged.discard().await;
             return Err(err);
         }
-        if let Err(err) = install_applied_snapshot(&room, pending.wal()).await {
-            pending.fail(format!("Persisting an applied snapshot failed: {err}"));
-            return Err(err);
-        }
+        let installed = install_applied_snapshot(&room, pending.wal()).await;
+        pending
+            .wal()
+            .fail_on_err("Persisting an applied snapshot failed", installed)?;
 
         {
             let mut state = room.state.write().await;

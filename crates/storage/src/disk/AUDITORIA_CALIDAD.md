@@ -52,6 +52,7 @@
 - `wal.rs:13-16` y `wal.rs:26-29`: el mismo párrafo copiado dos veces (desaparece con Q6).
   - **Estado:** ✅ aplicada (paso 1) (junto con Q6)
 - `recovery.rs:226-240` (doc de `recover_room`) y los comentarios de paso `recovery.rs:256`, `353`, `396`, `431` se solapan. Si se aplica Q8 (partir la función), cada paso se documenta una sola vez en su helper.
+  - **Estado:** ✅ aplicada (paso 2) (junto con Q8): la carga del snapshot y la limpieza se documentan en sus helpers; `recover_room` conserva la lista de los cuatro pasos, porque los pasos 3 y 4 y la comprobación del final dañado de `.wal.compacting` siguen en su cuerpo
 - `mod.rs:379` "Fast lookup of an open room handle." no aporta nada a la firma `get_room(&self, room_id) -> Result<Arc<DiskRoom>, _>` y se puede borrar. Lo mismo vale para `mod.rs:240` ("Creates a new `DiskStorageEngine` with the given configuration options.") y `wal.rs:60` y `wal.rs:65`.
   - **Estado:** ✅ aplicada (paso 1)
 
@@ -97,6 +98,7 @@
   En `apply_batch` queda `pending.wal().fail_on_err("WAL append failed", write_result)?;`. `pending` se suelta al hacer `?`, cuando `failure` ya está puesto, así que su `Drop` no hace nada, igual que hoy después de `pending.fail(...)`. Si además se reemplaza `mod.rs:791-794`, `PendingWrite::fail` (`mod.rs:153-156`) queda sin uso y se borra. El orden "marcar y después devolver el error" no cambia. **No** aplicar en `compactor.rs:203-211` ni en `compactor.rs:336-341`: ahí se marca la room solo cuando falla el rollback, y se devuelve el error original.
 - **Ahorro estimado:** ~18 líneas menos 6 del helper, más 4 de `fail` borradas: **~15 netas** · **Riesgo:** bajo · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ✅ confirmada — los 6 sitios y sus líneas están bien, todos son `StorageError` con formato `"{ctx}: {err}"`. `PendingWrite::fail` solo se usa en 597 y 792, y el `Drop` no hace nada si `failure` ya está puesto. Matiz: hay que guardar el resultado en una variable antes. `wal.fail_on_err(ctx, truncate_wal(wal, …).await)` no compila porque toma `&mut` dos veces.
+- **Estado:** ✅ aplicada (paso 2) en los 6 sitios, guardando antes el resultado en una variable donde hacía falta; `PendingWrite::fail` queda sin uso y se borra
 
 ### Q3 — Un único helper para `spawn_blocking` + `JoinError`
 - **Dónde:** `mod.rs:492-494`, `mod.rs:700-709`, `mod.rs:734-741`, `compactor.rs:139-150`, `compactor.rs:427-436`, `compactor.rs:464-468`, `compactor.rs:573-575`, `recovery.rs:83-85`, `recovery.rs:319-323`, `recovery.rs:386-390` (y dos más en `memory/mod.rs:330,367`).
@@ -131,6 +133,7 @@
   ```
 - **Ahorro estimado:** ~12 líneas · **Riesgo:** medio, **a verificar**. El fail point pasaría a evaluarse en el hilo async y no en el blocking pool. Hoy `check` es `cfg(test)` y no hace nada en producción, y en tests devuelve el mismo `Err` antes de serializar, que es lo que pasa hoy, pero conviene confirmarlo con los 9 tests que lo arman. Además se añade un clon O(1) de las tablas. No cambia el orden de I/O. · **Prioridad:** media
 - **Verificación (2.ª pasada):** ✅ confirmada — `check` solo usa el `Mutex` global (no depende del hilo), con el mismo path (`room.snap_path`) y el mismo orden después de `pause("compaction.staging")`. `RoomSnapshotRef` y `RoomSnapshotPayload` serializan igual. Matiz: el clon es O(n.º de tablas), no O(1), y `snapshot_tables` queda vivo hasta el final del bloque. Conviene un `drop` explícito para no retener nodos viejos durante la fase 3.
+- **Estado:** ✅ aplicada (paso 2), con `drop(snapshot_tables)` explícito antes de la fase 3. Los tests que arman `compaction.phase2` siguen probando lo mismo: todos esperan que `compact_room` falle y deje `.wal.compacting`, y el fail point sigue devolviendo el error antes de serializar y de crear el archivo temporal, con el mismo path y después de `pause("compaction.staging")`
 
 ### Q5 — `FileHeader::compute_crc` reescribe el layout de `encode`
 - **Dónde:** `format.rs:68-79` frente a `format.rs:82-94`.
@@ -182,6 +185,7 @@
 
   La secuencia de efectos de `recover_room` no cambia (snapshot → limpieza → `.compacting` → WAL activo → truncado → pliegue → `seek(End)`). **Observación, fuera del alcance de estilo:** la limpieza de `338-351` ignora en silencio los errores de `read_dir`/`next_entry`. Es limpieza best-effort y hay que conservar ese comportamiento, pero conviene que un comentario lo diga de forma explícita.
 - **Ahorro estimado:** 0 a +5 líneas (gana claridad, no líneas) · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 2): `load_snapshot` (devuelve un struct `BaseSnapshot` en lugar de una tupla de cuatro campos), `remove_staged_snapshots` (aplanada y con un comentario que dice que la limpieza es best-effort) y `replay_compacting_wal`. El orden de efectos no cambia
 
 ### Q9 — `lock_room_files`: dos bloques idénticos de abrir y bloquear
 - **Dónde:** `mod.rs:452-468`.
@@ -225,6 +229,7 @@
 - `compactor.rs:379-380`: `let tmp_path = snap_path.with_extension(format!("snap.tmp.{}", uuid::Uuid::new_v4()));`. El `to_string()` intermedio sobra. **1 línea.**
 - `compactor.rs:461-471`: con Q3, `write_empty_snapshot_file` queda en ~4 líneas.
 - **Estado:** ✅ aplicada (paso 1) en `recovery.rs:264-267` y `360-363`, `format.rs:98-99` y `121-122` y `compactor.rs:379-380`. Las viñetas de `mod.rs:487-491`, `mod.rs:319-322` y `compactor.rs:461-471` dependen de Q1 y Q3 y quedan para el paso 2.
+- **Estado:** ✅ aplicada (paso 2) en `mod.rs:319-322` (absorbida por el scan compartido, con `map_or`) y `compactor.rs:461-471` (`run_blocking` deja el bloque en una llamada). ⏭️ `mod.rs:487-491` solo en parte: el closure de `run_blocking` es `'static` y tiene que ser dueño de sus valores, así que los clones de `lock_path`/`wal_path`/`room_id` siguen haciendo falta; el bloque queda alrededor de una sola llamada a `run_blocking`.
 
 ## Lo que conviene dejar como está
 
