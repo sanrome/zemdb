@@ -1,164 +1,108 @@
+mod common;
+
 use axum::http::StatusCode;
-use futures::StreamExt;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
-use std::sync::Arc;
+use common::{
+    commit, cursor, envelope, make_test_op, read_sse_until, register, register_msg, seqs,
+    tasks_schema, token, TestServer,
+};
+use reqwest::header::CONTENT_TYPE;
+use reqwest::Method;
 use std::time::Duration;
 use tempfile::tempdir;
 use zemdb_core::*;
 use zemdb_server::actor::command::RoomMetrics;
-use zemdb_server::actor::manager::{RoomManager, RoomMetadata};
+use zemdb_server::actor::manager::RoomMetadata;
 use zemdb_server::api::auth::generate_client_token;
 use zemdb_server::api::control_plane::{AddColumnRequest, CreateRoomRequest, CreateSchemaRequest};
-use zemdb_server::api::router::{build_router, AppState};
-use zemdb_server::config::ServerConfig;
-use zemdb_server::relay::SnapshotRelay;
-use zemdb_server::schema_registry::SchemaRegistry;
 
-struct TestServer {
-    pub base_url: String,
-    pub config: Arc<ServerConfig>,
-    pub schema_registry: Arc<SchemaRegistry>,
-    pub room_manager: Arc<RoomManager>,
-    pub _temp_dir: tempfile::TempDir,
-    pub client: reqwest::Client,
+fn client(id: &str) -> ClientId {
+    ClientId::new(id).unwrap()
+}
+
+fn commit_msg(
+    room_id: &RoomId,
+    client_id: &ClientId,
+    mutation: u8,
+    last_ack_seq: u64,
+    op: Operation,
+) -> ClientMessage {
+    ClientMessage::Commit {
+        correlation_id: CorrelationId::new(u64::from(mutation)),
+        room_id: room_id.clone(),
+        client_id: client_id.clone(),
+        mutation_id: MutationId::new([mutation; 16]),
+        last_ack_seq: SequenceNumber::new(last_ack_seq),
+        op,
+    }
+}
+
+fn ack_msg(room_id: &RoomId, client_id: &ClientId, ack_seq: u64) -> ClientMessage {
+    ClientMessage::Ack {
+        correlation_id: CorrelationId::new(30),
+        room_id: room_id.clone(),
+        client_id: client_id.clone(),
+        ack_seq: SequenceNumber::new(ack_seq),
+    }
 }
 
 impl TestServer {
-    async fn start() -> Self {
-        let temp_dir = tempdir().unwrap();
-        let data_dir = temp_dir.path().join("data");
-        let config = Arc::new(ServerConfig {
-            host: "127.0.0.1".to_string(),
-            port: 0,
-            data_dir: data_dir.clone(),
-            auth_secret: "test_cluster_secret_key_12345678".to_string(),
-            admin_secret: "test_admin_secret_key_123456789".to_string(),
-            lease_timeout_secs: 60,
-            dormant_after_secs: None,
-            dedup_lru_capacity: 1000,
-            snapshot_ttl_secs: 60,
-            snapshot_demand_ttl_secs: 60,
-            max_snapshot_bytes: 16 * 1024 * 1024,
-            ..ServerConfig::default()
-        });
-
-        let schemas_dir = data_dir.join("schemas");
-        let schema_registry = Arc::new(SchemaRegistry::new(schemas_dir).unwrap());
-        let snapshots_dir = data_dir.join("snapshots");
-        let snapshot_relay = Arc::new(
-            SnapshotRelay::new(
-                snapshots_dir,
-                Duration::from_secs(config.snapshot_ttl_secs),
-                config.max_snapshot_bytes,
-            )
-            .unwrap(),
-        );
-        let room_manager = Arc::new(RoomManager::new(
-            Arc::clone(&config),
-            Arc::clone(&schema_registry),
-            Arc::clone(&snapshot_relay),
-        ));
-
-        let state = AppState::new(
-            Arc::clone(&config),
-            Arc::clone(&schema_registry),
-            Arc::clone(&room_manager),
-            snapshot_relay,
-        );
-        let app = build_router(state);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        let base_url = format!("http://{}", addr);
-        let client = reqwest::Client::new();
-
-        Self {
-            base_url,
-            config,
-            schema_registry,
-            room_manager,
-            _temp_dir: temp_dir,
-            client,
+    async fn heartbeat_ack(
+        &self,
+        room_id: &RoomId,
+        client_id: &ClientId,
+        token: &str,
+    ) -> (bool, Option<SequenceNumber>) {
+        let msg = ClientMessage::Heartbeat {
+            correlation_id: CorrelationId::new(90),
+            room_id: room_id.clone(),
+            client_id: client_id.clone(),
+        };
+        match self.post_message(room_id, "heartbeat", token, &msg).await {
+            (
+                StatusCode::OK,
+                ServerMessage::HeartbeatAck {
+                    snapshot_wanted,
+                    active_snapshot_seq,
+                    ..
+                },
+            ) => (snapshot_wanted, active_snapshot_seq),
+            other => panic!("Expected HeartbeatAck, got {:?}", other),
         }
     }
 }
 
-fn create_test_schema() -> Schema {
-    let table = TableSchema::builder("tasks")
-        .primary_key("id", DataType::Int)
-        .column("title", DataType::String)
-        .column("completed", DataType::Bool);
-    Schema::builder().table(table).build()
-}
-
-fn create_insert_op(schema: &Schema, id: i64, title: &str) -> Operation {
-    let row = RowBuilder::new()
-        .set("id", id)
-        .set("title", title)
-        .set("completed", false)
-        .build();
-    schema
-        .to_operation_insert("tasks", &row, 1000)
-        .expect("valid insert op")
-}
-
 #[tokio::test]
-async fn test_control_plane_schema_crud_and_auth() {
-    let server = TestServer::start().await;
+async fn control_plane_schema_crud_and_auth() {
+    let server = TestServer::start(|_| {}).await;
     let schema_id = SchemaId::new("todo-schema").unwrap();
-    let schema = create_test_schema();
+    let create = CreateSchemaRequest {
+        schema_id: schema_id.clone(),
+        schema: tasks_schema(),
+    };
 
-    // 1. Missing Authorization header -> 401 Unauthorized
-    let resp = server
-        .client
-        .post(format!("{}/admin/schemas", server.base_url))
-        .json(&CreateSchemaRequest {
-            schema_id: schema_id.clone(),
-            schema: schema.clone(),
-        })
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // No Authorization header, then an invalid bearer token.
+    for auth in [None, Some("invalid_secret_token")] {
+        let mut req = server
+            .client
+            .post(server.url("/admin/schemas"))
+            .json(&create);
+        if let Some(token) = auth {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{auth:?}");
+    }
 
-    // 2. Invalid Bearer token -> 401 Unauthorized
     let resp = server
-        .client
-        .post(format!("{}/admin/schemas", server.base_url))
-        .header(AUTHORIZATION, "Bearer invalid_secret_token")
-        .json(&CreateSchemaRequest {
-            schema_id: schema_id.clone(),
-            schema: schema.clone(),
-        })
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-    // 3. Valid Bearer token -> 201 Created
-    let auth_header = format!("Bearer {}", server.config.admin_secret);
-    let resp = server
-        .client
-        .post(format!("{}/admin/schemas", server.base_url))
-        .header(AUTHORIZATION, &auth_header)
-        .json(&CreateSchemaRequest {
-            schema_id: schema_id.clone(),
-            schema: schema.clone(),
-        })
+        .admin(Method::POST, "/admin/schemas")
+        .json(&create)
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
 
-    // 4. Retrieve schema via GET /admin/schemas/:id
     let resp = server
-        .client
-        .get(format!("{}/admin/schemas/{}", server.base_url, schema_id))
-        .header(AUTHORIZATION, &auth_header)
+        .admin(Method::GET, &format!("/admin/schemas/{schema_id}"))
         .send()
         .await
         .unwrap();
@@ -166,14 +110,8 @@ async fn test_control_plane_schema_crud_and_auth() {
     let retrieved_schema: Schema = resp.json().await.unwrap();
     assert_eq!(retrieved_schema.table_count(), 1);
 
-    // 5. Schema evolution: add nullable column via POST /admin/schemas/:id/columns
     let resp = server
-        .client
-        .post(format!(
-            "{}/admin/schemas/{}/columns",
-            server.base_url, schema_id
-        ))
-        .header(AUTHORIZATION, &auth_header)
+        .admin(Method::POST, &format!("/admin/schemas/{schema_id}/columns"))
         .json(&AddColumnRequest {
             table_name: "tasks".to_string(),
             column: ColumnDef::new("priority", DataType::Int).nullable(true),
@@ -191,30 +129,20 @@ async fn test_control_plane_schema_crud_and_auth() {
 }
 
 #[tokio::test]
-async fn test_control_plane_room_lifecycle() {
-    let server = TestServer::start().await;
-    let schema_id = SchemaId::new("room-schema").unwrap();
-    let schema = create_test_schema();
-    let auth_header = format!("Bearer {}", server.config.admin_secret);
-
-    // Pre-register schema
-    server
-        .schema_registry
-        .register_schema(schema_id.clone(), schema)
-        .unwrap();
-
+async fn control_plane_room_lifecycle() {
+    let server = TestServer::start(|_| {}).await;
+    let schema_id = server.register_schema("room-schema", tasks_schema());
     let room_id = RoomId::new("room-lifecycle-1").unwrap();
+    let create = CreateRoomRequest {
+        room_id: room_id.clone(),
+        schema_id,
+        lifecycle: None,
+    };
+    let room_path = format!("/admin/rooms/{room_id}");
 
-    // 1. Provision room via POST /admin/rooms -> 201 Created
     let resp = server
-        .client
-        .post(format!("{}/admin/rooms", server.base_url))
-        .header(AUTHORIZATION, &auth_header)
-        .json(&CreateRoomRequest {
-            room_id: room_id.clone(),
-            schema_id: schema_id.clone(),
-            lifecycle: None,
-        })
+        .admin(Method::POST, "/admin/rooms")
+        .json(&create)
         .send()
         .await
         .unwrap();
@@ -222,68 +150,37 @@ async fn test_control_plane_room_lifecycle() {
     let meta: RoomMetadata = resp.json().await.unwrap();
     assert_eq!(meta.room_id, room_id);
 
-    // 2. Duplicate room creation -> 409 Conflict
     let resp = server
-        .client
-        .post(format!("{}/admin/rooms", server.base_url))
-        .header(AUTHORIZATION, &auth_header)
-        .json(&CreateRoomRequest {
-            room_id: room_id.clone(),
-            schema_id: schema_id.clone(),
-            lifecycle: None,
-        })
+        .admin(Method::POST, "/admin/rooms")
+        .json(&create)
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CONFLICT);
 
-    // 3. Inspect room metrics via GET /admin/rooms/:id
-    let resp = server
-        .client
-        .get(format!("{}/admin/rooms/{}", server.base_url, room_id))
-        .header(AUTHORIZATION, &auth_header)
-        .send()
-        .await
-        .unwrap();
+    let resp = server.admin(Method::GET, &room_path).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let metrics: RoomMetrics = resp.json().await.unwrap();
     assert_eq!(metrics.head_seq, SequenceNumber::new(0));
 
-    // 4. Delete room via DELETE /admin/rooms/:id -> 204 No Content
-    let resp = server
-        .client
-        .delete(format!("{}/admin/rooms/{}", server.base_url, room_id))
-        .header(AUTHORIZATION, &auth_header)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-
-    // 5. Subsequent delete returns 404 Not Found
-    let resp = server
-        .client
-        .delete(format!("{}/admin/rooms/{}", server.base_url, room_id))
-        .header(AUTHORIZATION, &auth_header)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    // The first delete removes the room; the second one finds nothing.
+    for expected in [StatusCode::NO_CONTENT, StatusCode::NOT_FOUND] {
+        let resp = server
+            .admin(Method::DELETE, &room_path)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), expected);
+    }
 }
 
 #[tokio::test]
 async fn control_plane_room_lifecycle_overrides() {
-    let server = TestServer::start().await;
-    let schema_id = SchemaId::new("policy-schema").unwrap();
-    server
-        .schema_registry
-        .register_schema(schema_id.clone(), create_test_schema())
-        .unwrap();
-    let auth_header = format!("Bearer {}", server.config.admin_secret);
+    let server = TestServer::start(|_| {}).await;
+    server.register_schema("policy-schema", tasks_schema());
     let create = |body: String| {
         server
-            .client
-            .post(format!("{}/admin/rooms", server.base_url))
-            .header(AUTHORIZATION, &auth_header)
+            .admin(Method::POST, "/admin/rooms")
             .header(CONTENT_TYPE, "application/json")
             .body(body)
             .send()
@@ -326,9 +223,7 @@ async fn control_plane_room_lifecycle_overrides() {
     // The room details show the stored overrides and the effective policy: the overrides on
     // top of the server defaults, durations in seconds.
     let resp = server
-        .client
-        .get(format!("{}/admin/rooms/room-policy", server.base_url))
-        .header(AUTHORIZATION, &auth_header)
+        .admin(Method::GET, "/admin/rooms/room-policy")
         .send()
         .await
         .unwrap();
@@ -351,253 +246,84 @@ async fn control_plane_room_lifecycle_overrides() {
 }
 
 #[tokio::test]
-async fn test_data_plane_handshake_and_1rtt_commit() {
-    let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema").unwrap();
-    let schema = create_test_schema();
-    server
-        .schema_registry
-        .register_schema(schema_id.clone(), schema.clone())
-        .unwrap();
+async fn data_plane_handshake_and_1rtt_commit() {
+    let server = TestServer::start(|_| {}).await;
+    let (schema_id, room_id) = server
+        .room_with_schema("todo-schema", "room-dataplane-1")
+        .await;
+    let client_id = client("alice");
 
-    let room_id = RoomId::new("room-dataplane-1").unwrap();
-    server
-        .room_manager
-        .create_room(room_id.clone(), schema_id.clone(), None)
-        .await
-        .unwrap();
-
-    let client_id = ClientId::new("alice").unwrap();
-
-    // 1. Invalid auth_token registration attempt -> 401 Unauthorized
-    let reg_msg_bad = ClientMessage::RegisterClient {
-        correlation_id: CorrelationId::new(1),
-        room_id: room_id.clone(),
-        client_id: client_id.clone(),
-        auth_token: "invalid.token.signature.123".to_string(),
-        current_seq: None,
-    };
-    let body_bad = encode_message(&reg_msg_bad).unwrap();
+    let bad_register = register_msg(&room_id, &client_id, "invalid.token.signature.123");
     let resp = server
-        .client
-        .post(format!("{}/rooms/{}/register", server.base_url, room_id))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(body_bad)
-        .send()
-        .await
-        .unwrap();
+        .post_frame(&format!("{room_id}/register"), None, &bad_register)
+        .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-    // 2. Valid token registration handshake -> 200 OK with ServerMessage::Registered
-    let valid_token = generate_client_token(
-        &client_id,
-        &room_id,
-        Duration::from_secs(300),
-        &server.config.auth_secret,
+    let (token, registered) = server.register(&room_id, &client_id).await;
+    assert!(
+        matches!(
+            &registered,
+            ServerMessage::Registered { head_seq, schema_id: sid, .. }
+                if *head_seq == SequenceNumber::new(0) && *sid == schema_id
+        ),
+        "{registered:?}"
     );
-    let reg_msg = ClientMessage::RegisterClient {
-        correlation_id: CorrelationId::new(2),
-        room_id: room_id.clone(),
-        client_id: client_id.clone(),
-        auth_token: valid_token.clone(),
-        current_seq: None,
-    };
-    let body_reg = encode_message(&reg_msg).unwrap();
-    let resp = server
-        .client
-        .post(format!("{}/rooms/{}/register", server.base_url, room_id))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(body_reg)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = resp.bytes().await.unwrap();
-    let server_msg: ServerMessage = decode_message(&bytes).unwrap();
-    match server_msg {
-        ServerMessage::Registered {
-            head_seq,
-            schema_id: sid,
-            ..
-        } => {
-            assert_eq!(head_seq, SequenceNumber::new(0));
-            assert_eq!(sid, schema_id);
-        }
-        other => panic!("Expected Registered message, got {:?}", other),
-    }
 
-    // 3. Commit mutation 1 -> 200 OK with ServerMessage::CommitAck
-    let op1 = create_insert_op(&schema, 1, "Buy milk");
-    let commit_msg1 = ClientMessage::Commit {
-        correlation_id: CorrelationId::new(3),
-        room_id: room_id.clone(),
-        client_id: client_id.clone(),
-        mutation_id: MutationId::new([1; 16]),
-        last_ack_seq: SequenceNumber::new(0),
-        op: op1,
-    };
-    let body_commit1 = encode_message(&commit_msg1).unwrap();
-    let resp1 = server
-        .client
-        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", valid_token))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(body_commit1)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp1.status(), StatusCode::OK);
-    let bytes1 = resp1.bytes().await.unwrap();
-    let ack1: ServerMessage = decode_message(&bytes1).unwrap();
-    match ack1 {
-        ServerMessage::CommitAck { assigned_seq, .. } => {
-            assert_eq!(assigned_seq, SequenceNumber::new(1));
-        }
-        other => panic!("Expected CommitAck, got {:?}", other),
-    }
-
-    // 4. Commit mutation 2 -> assigned_seq 2
-    let op2 = create_insert_op(&schema, 2, "Read book");
-    let commit_msg2 = ClientMessage::Commit {
-        correlation_id: CorrelationId::new(4),
-        room_id: room_id.clone(),
-        client_id: client_id.clone(),
-        mutation_id: MutationId::new([2; 16]),
-        last_ack_seq: SequenceNumber::new(1),
-        op: op2,
-    };
-    let body_commit2 = encode_message(&commit_msg2).unwrap();
-    let resp2 = server
-        .client
-        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", valid_token))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(body_commit2)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp2.status(), StatusCode::OK);
-    let bytes2 = resp2.bytes().await.unwrap();
-    let ack2: ServerMessage = decode_message(&bytes2).unwrap();
-    match ack2 {
-        ServerMessage::CommitAck { assigned_seq, .. } => {
-            assert_eq!(assigned_seq, SequenceNumber::new(2));
-        }
-        other => panic!("Expected CommitAck, got {:?}", other),
+    for (mutation, last_ack_seq) in [(1u8, 0), (2, 1)] {
+        let msg = commit_msg(
+            &room_id,
+            &client_id,
+            mutation,
+            last_ack_seq,
+            make_test_op(mutation.into()),
+        );
+        let (status, ack) = server.post_message(&room_id, "commit", &token, &msg).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            matches!(ack, ServerMessage::CommitAck { assigned_seq, .. } if assigned_seq == SequenceNumber::new(mutation.into())),
+            "{ack:?}"
+        );
     }
 }
 
 #[tokio::test]
-async fn test_data_plane_sync_and_explicit_ack_pruning() {
-    let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema").unwrap();
-    let schema = create_test_schema();
-    server
-        .schema_registry
-        .register_schema(schema_id.clone(), schema.clone())
-        .unwrap();
+async fn data_plane_sync_and_explicit_ack() {
+    let server = TestServer::start(|_| {}).await;
+    let (_, room_id) = server
+        .room_with_schema("todo-schema", "room-sync-ack-1")
+        .await;
+    let writer = client("writer");
+    let reader = client("reader");
 
-    let room_id = RoomId::new("room-sync-ack-1").unwrap();
-    server
-        .room_manager
-        .create_room(room_id.clone(), schema_id.clone(), None)
-        .await
-        .unwrap();
+    // The reader registers first so its cursor participates in retention tracking.
+    let (token_reader, _) = server.register(&room_id, &reader).await;
+    let (token_writer, _) = server.register(&room_id, &writer).await;
 
-    let writer = ClientId::new("writer").unwrap();
-    let reader = ClientId::new("reader").unwrap();
-
-    // Pre-register reader so its cursor participates in retention tracking
-    let token_reader = generate_client_token(
-        &reader,
-        &room_id,
-        Duration::from_secs(300),
-        &server.config.auth_secret,
-    );
-    let reg_reader = ClientMessage::RegisterClient {
-        correlation_id: CorrelationId::new(1),
-        room_id: room_id.clone(),
-        client_id: reader.clone(),
-        auth_token: token_reader.clone(),
-        current_seq: None,
-    };
-    server
-        .client
-        .post(format!("{}/rooms/{}/register", server.base_url, room_id))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&reg_reader).unwrap())
-        .send()
-        .await
-        .unwrap();
-
-    // Writer registers and commits 3 ops
-    let token_writer = generate_client_token(
-        &writer,
-        &room_id,
-        Duration::from_secs(300),
-        &server.config.auth_secret,
-    );
-    server
-        .client
-        .post(format!("{}/rooms/{}/register", server.base_url, room_id))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(
-            encode_message(&ClientMessage::RegisterClient {
-                correlation_id: CorrelationId::new(2),
-                room_id: room_id.clone(),
-                client_id: writer.clone(),
-                auth_token: token_writer.clone(),
-                current_seq: None,
-            })
-            .unwrap(),
-        )
-        .send()
-        .await
-        .unwrap();
-
-    for i in 1..=3 {
-        let op = create_insert_op(&schema, i, &format!("task-{}", i));
-        let mut mut_id = [0u8; 16];
-        mut_id[0] = i as u8;
-        let commit_msg = ClientMessage::Commit {
-            correlation_id: CorrelationId::new(10 + i as u64),
-            room_id: room_id.clone(),
-            client_id: writer.clone(),
-            mutation_id: MutationId::new(mut_id),
-            last_ack_seq: SequenceNumber::new(i as u64 - 1),
-            op,
-        };
-        server
-            .client
-            .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
-            .header(AUTHORIZATION, format!("Bearer {}", token_writer))
-            .header(CONTENT_TYPE, "application/octet-stream")
-            .body(encode_message(&commit_msg).unwrap())
-            .send()
-            .await
-            .unwrap();
+    for i in 1..=3u8 {
+        let msg = commit_msg(
+            &room_id,
+            &writer,
+            i,
+            u64::from(i) - 1,
+            make_test_op(i.into()),
+        );
+        let (status, _) = server
+            .post_message(&room_id, "commit", &token_writer, &msg)
+            .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
-    // Writer acknowledges its own ops up to 3
-    server
-        .client
-        .post(format!("{}/rooms/{}/ack", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", token_writer))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(
-            encode_message(&ClientMessage::Ack {
-                correlation_id: CorrelationId::new(30),
-                room_id: room_id.clone(),
-                client_id: writer.clone(),
-                ack_seq: SequenceNumber::new(3),
-            })
-            .unwrap(),
+    // The writer acknowledges its own ops up to 3.
+    let (status, _) = server
+        .post_message(
+            &room_id,
+            "ack",
+            &token_writer,
+            &ack_msg(&room_id, &writer, 3),
         )
-        .send()
-        .await
-        .unwrap();
+        .await;
+    assert_eq!(status, StatusCode::OK);
 
-    // Reader syncs from 0
     let sync_msg = ClientMessage::Sync {
         correlation_id: CorrelationId::new(40),
         room_id: room_id.clone(),
@@ -605,18 +331,10 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
         from_seq: SequenceNumber::new(0),
         max_batch_size: 10,
     };
-    let resp = server
-        .client
-        .post(format!("{}/rooms/{}/sync", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", token_reader))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&sync_msg).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = resp.bytes().await.unwrap();
-    let sync_batch: ServerMessage = decode_message(&bytes).unwrap();
+    let (status, sync_batch) = server
+        .post_message(&room_id, "sync", &token_reader, &sync_msg)
+        .await;
+    assert_eq!(status, StatusCode::OK);
     match sync_batch {
         ServerMessage::SyncBatch { ops, head_seq, .. } => {
             assert_eq!(ops.len(), 3);
@@ -625,37 +343,22 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
         other => panic!("Expected SyncBatch, got {:?}", other),
     }
 
-    // Explicit check: Reader's cursor MUST NOT have moved yet (still 0)
+    // Delivering the batch does not move the reader's cursor; its Ack does.
     let room_sender = server.room_manager.get_room(&room_id).unwrap();
-    let (cur_tx, cur_rx) = tokio::sync::oneshot::channel();
-    room_sender
-        .send(zemdb_server::RoomCommand::GetClientCursor {
-            client_id: reader.clone(),
-            reply: cur_tx,
-        })
-        .await
-        .unwrap();
-    assert_eq!(cur_rx.await.unwrap().unwrap(), Some(SequenceNumber::new(0)));
+    assert_eq!(
+        cursor(&room_sender, &reader).await,
+        Some(SequenceNumber::new(0))
+    );
 
-    // Reader sends explicit Ack for sequence 3
-    let ack_msg = ClientMessage::Ack {
-        correlation_id: CorrelationId::new(50),
-        room_id: room_id.clone(),
-        client_id: reader.clone(),
-        ack_seq: SequenceNumber::new(3),
-    };
-    let ack_resp = server
-        .client
-        .post(format!("{}/rooms/{}/ack", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", token_reader))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&ack_msg).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(ack_resp.status(), StatusCode::OK);
-    let ack_bytes = ack_resp.bytes().await.unwrap();
-    let ack_confirmed: ServerMessage = decode_message(&ack_bytes).unwrap();
+    let (status, ack_confirmed) = server
+        .post_message(
+            &room_id,
+            "ack",
+            &token_reader,
+            &ack_msg(&room_id, &reader, 3),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
     match ack_confirmed {
         ServerMessage::AckConfirmed {
             ack_seq, head_seq, ..
@@ -666,85 +369,30 @@ async fn test_data_plane_sync_and_explicit_ack_pruning() {
         other => panic!("Expected AckConfirmed, got {:?}", other),
     }
 
-    // Now reader's recorded cursor in server is 3!
-    let (cur_tx2, cur_rx2) = tokio::sync::oneshot::channel();
-    room_sender
-        .send(zemdb_server::RoomCommand::GetClientCursor {
-            client_id: reader.clone(),
-            reply: cur_tx2,
-        })
-        .await
-        .unwrap();
     assert_eq!(
-        cur_rx2.await.unwrap().unwrap(),
+        cursor(&room_sender, &reader).await,
         Some(SequenceNumber::new(3))
     );
 }
 
 #[tokio::test]
-async fn test_data_plane_heartbeat_and_deregister() {
-    let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema").unwrap();
-    let schema = create_test_schema();
-    server
-        .schema_registry
-        .register_schema(schema_id.clone(), schema)
-        .unwrap();
+async fn data_plane_heartbeat_and_deregister() {
+    let server = TestServer::start(|_| {}).await;
+    let (_, room_id) = server
+        .room_with_schema("todo-schema", "room-hb-dereg")
+        .await;
+    let client_id = client("hb-client");
+    let (token, _) = server.register(&room_id, &client_id).await;
 
-    let room_id = RoomId::new("room-hb-dereg").unwrap();
-    server
-        .room_manager
-        .create_room(room_id.clone(), schema_id.clone(), None)
-        .await
-        .unwrap();
-
-    let client_id = ClientId::new("hb-client").unwrap();
-    let token = generate_client_token(
-        &client_id,
-        &room_id,
-        Duration::from_secs(300),
-        &server.config.auth_secret,
-    );
-
-    // Register
-    server
-        .client
-        .post(format!("{}/rooms/{}/register", server.base_url, room_id))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(
-            encode_message(&ClientMessage::RegisterClient {
-                correlation_id: CorrelationId::new(1),
-                room_id: room_id.clone(),
-                client_id: client_id.clone(),
-                auth_token: token.clone(),
-                current_seq: None,
-            })
-            .unwrap(),
-        )
-        .send()
-        .await
-        .unwrap();
-
-    // Heartbeat
-    let hb_resp = server
-        .client
-        .post(format!("{}/rooms/{}/heartbeat", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", token))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(
-            encode_message(&ClientMessage::Heartbeat {
-                correlation_id: CorrelationId::new(2),
-                room_id: room_id.clone(),
-                client_id: client_id.clone(),
-            })
-            .unwrap(),
-        )
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(hb_resp.status(), StatusCode::OK);
-    let hb_bytes = hb_resp.bytes().await.unwrap();
-    let hb_ack: ServerMessage = decode_message(&hb_bytes).unwrap();
+    let heartbeat = ClientMessage::Heartbeat {
+        correlation_id: CorrelationId::new(2),
+        room_id: room_id.clone(),
+        client_id: client_id.clone(),
+    };
+    let (status, hb_ack) = server
+        .post_message(&room_id, "heartbeat", &token, &heartbeat)
+        .await;
+    assert_eq!(status, StatusCode::OK);
     match hb_ack {
         ServerMessage::HeartbeatAck {
             current_head_seq,
@@ -759,26 +407,15 @@ async fn test_data_plane_heartbeat_and_deregister() {
         other => panic!("Expected HeartbeatAck, got {:?}", other),
     }
 
-    // Deregister
-    let dereg_resp = server
-        .client
-        .post(format!("{}/rooms/{}/deregister", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", token))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(
-            encode_message(&ClientMessage::DeregisterClient {
-                correlation_id: CorrelationId::new(3),
-                room_id: room_id.clone(),
-                client_id: client_id.clone(),
-            })
-            .unwrap(),
-        )
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(dereg_resp.status(), StatusCode::OK);
-    let dereg_bytes = dereg_resp.bytes().await.unwrap();
-    let ack_msg: ServerMessage = decode_message(&dereg_bytes).unwrap();
+    let deregister = ClientMessage::DeregisterClient {
+        correlation_id: CorrelationId::new(3),
+        room_id: room_id.clone(),
+        client_id: client_id.clone(),
+    };
+    let (status, ack_msg) = server
+        .post_message(&room_id, "deregister", &token, &deregister)
+        .await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(
         ack_msg,
         ServerMessage::DeregisterAck {
@@ -788,177 +425,61 @@ async fn test_data_plane_heartbeat_and_deregister() {
         }
     );
 
-    // Query cursor shows client removed
+    // The deregistered client has no cursor any more.
     let room_sender = server.room_manager.get_room(&room_id).unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    room_sender
-        .send(zemdb_server::RoomCommand::GetClientCursor {
-            client_id,
-            reply: tx,
-        })
-        .await
-        .unwrap();
-    assert_eq!(rx.await.unwrap().unwrap(), None);
+    assert_eq!(cursor(&room_sender, &client_id).await, None);
 }
 
 #[tokio::test]
-async fn test_sse_realtime_head_advanced_events() {
-    let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema").unwrap();
-    let schema = create_test_schema();
-    server
-        .schema_registry
-        .register_schema(schema_id.clone(), schema.clone())
-        .unwrap();
+async fn sse_signals_head_advanced() {
+    let server = TestServer::start(|_| {}).await;
+    let (_, room_id) = server.room_with_schema("todo-schema", "room-sse-1").await;
+    let client_id = client("writer-sse");
 
-    let room_id = RoomId::new("room-sse-1").unwrap();
-    server
-        .room_manager
-        .create_room(room_id.clone(), schema_id.clone(), None)
-        .await
-        .unwrap();
-
-    let client_id = ClientId::new("writer-sse").unwrap();
-    let token = generate_client_token(
-        &client_id,
-        &room_id,
-        Duration::from_secs(300),
-        &server.config.auth_secret,
-    );
-
-    // 1. Establish SSE subscription stream
-    let sse_resp = server
-        .client
-        .get(format!("{}/rooms/{}/events", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", token))
-        .send()
-        .await
-        .unwrap();
+    let sse_resp = server.events(&room_id, &token(&client_id, &room_id)).await;
     assert_eq!(sse_resp.status(), StatusCode::OK);
     let mut stream = sse_resp.bytes_stream();
 
-    // 2. Commit a mutation via Data Plane
-    server
-        .client
-        .post(format!("{}/rooms/{}/register", server.base_url, room_id))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(
-            encode_message(&ClientMessage::RegisterClient {
-                correlation_id: CorrelationId::new(1),
-                room_id: room_id.clone(),
-                client_id: client_id.clone(),
-                auth_token: token.clone(),
-                current_seq: None,
-            })
-            .unwrap(),
-        )
-        .send()
-        .await
-        .unwrap();
+    let (token, _) = server.register(&room_id, &client_id).await;
+    let msg = commit_msg(&room_id, &client_id, 42, 0, make_test_op(1));
+    let (status, _) = server.post_message(&room_id, "commit", &token, &msg).await;
+    assert_eq!(status, StatusCode::OK);
 
-    let op = create_insert_op(&schema, 1, "SSE Trigger");
-    server
-        .client
-        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", token))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(
-            encode_message(&ClientMessage::Commit {
-                correlation_id: CorrelationId::new(2),
-                room_id: room_id.clone(),
-                client_id: client_id.clone(),
-                mutation_id: MutationId::new([42; 16]),
-                last_ack_seq: SequenceNumber::new(0),
-                op,
-            })
-            .unwrap(),
-        )
-        .send()
-        .await
-        .unwrap();
-
-    // 3. Receive signal event from SSE stream within 2 seconds
-    let chunk = tokio::time::timeout(Duration::from_secs(2), stream.next())
-        .await
-        .expect("SSE event timeout")
-        .expect("Stream closed unexpectedly")
-        .unwrap();
-
-    let text = String::from_utf8_lossy(&chunk);
+    let text = read_sse_until(&mut stream, "data: 1").await;
     assert!(
         text.contains("event: head_advanced"),
         "Expected SSE head_advanced event, got: {}",
         text
     );
-    assert!(
-        text.contains("data: 1"),
-        "Expected sequence 1, got: {}",
-        text
-    );
 }
 
 #[tokio::test]
-async fn test_snapshot_relay_chunked_transfer_and_blake3() {
-    let server = TestServer::start().await;
-    let room_id = RoomId::new("room-relay-1").unwrap();
+async fn snapshot_relay_chunked_transfer_and_blake3() {
+    let server = TestServer::start(|_| {}).await;
 
-    // 0. The relay only accepts snapshots inside the room's log range: create the room and
+    // The relay only accepts snapshots inside the room's log range: create the room and
     // commit one operation so that the snapshot can sit at seq 1.
-    let schema_id = SchemaId::new("relay-schema").unwrap();
-    let schema = create_test_schema();
-    server
-        .schema_registry
-        .register_schema(schema_id.clone(), schema.clone())
-        .unwrap();
-    server
-        .room_manager
-        .create_room(room_id.clone(), schema_id, None)
-        .await
-        .unwrap();
+    let (_, room_id) = server
+        .room_with_schema("relay-schema", "room-relay-1")
+        .await;
     let sender = server.room_manager.get_room(&room_id).unwrap();
-    let writer = ClientId::new("writer").unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    sender
-        .send(zemdb_server::RoomCommand::RegisterClient {
-            client_id: writer.clone(),
-            current_seq: None,
-            reply: tx,
-        })
-        .await
-        .unwrap();
-    rx.await.unwrap().unwrap();
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    sender
-        .send(zemdb_server::RoomCommand::Commit {
-            client_id: writer,
-            mutation_id: MutationId::new([1; 16]),
-            last_ack_seq: SequenceNumber::new(0),
-            op: create_insert_op(&schema, 1, "task"),
-            reply: tx,
-        })
-        .await
-        .unwrap();
-    rx.await.unwrap().unwrap();
+    let writer = client("writer");
+    register(&sender, &writer).await;
+    commit(
+        &sender,
+        &writer,
+        MutationId::new([1; 16]),
+        0,
+        make_test_op(1),
+    )
+    .await
+    .unwrap();
 
-    // 1. Prepare a 512 KB snapshot envelope
-    let body = vec![0xABu8; 512 * 1024 - SNAPSHOT_HEADER_LEN];
-    let header =
-        SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, body.len() as u32, &body);
-    let mut snapshot_bytes = header.to_bytes().to_vec();
-    snapshot_bytes.extend_from_slice(&body);
+    let snapshot_bytes = envelope(512 * 1024, 0xAB);
     let expected_hash = ServerMessage::compute_snapshot_hash(&snapshot_bytes);
 
-    // 2. Upload snapshot staging via POST /rooms/:id/snapshot/upload
     let upload_resp = server
-        .client
-        .post(format!(
-            "{}/rooms/{}/snapshot/upload",
-            server.base_url, room_id
-        ))
-        .header(
-            AUTHORIZATION,
-            format!("Bearer {}", server.config.admin_secret),
-        )
+        .admin(Method::POST, &format!("/rooms/{room_id}/snapshot/upload"))
         .header("x-snapshot-head-seq", "1")
         .body(snapshot_bytes.clone())
         .send()
@@ -966,10 +487,9 @@ async fn test_snapshot_relay_chunked_transfer_and_blake3() {
         .unwrap();
     assert_eq!(upload_resp.status(), StatusCode::OK);
 
-    // 3. Request chunks in 128 KB fragments (4 chunks total)
+    // Download in chunks of 128 KB (4 chunks in all).
     let chunk_size = 128 * 1024;
     let mut assembled_data = Vec::new();
-
     for chunk_idx in 0..4 {
         let req_msg = ClientMessage::RequestSnapshotChunk {
             correlation_id: CorrelationId::new(100 + chunk_idx as u64),
@@ -978,26 +498,15 @@ async fn test_snapshot_relay_chunked_transfer_and_blake3() {
             chunk_size,
             snapshot_hash: (chunk_idx > 0).then_some(expected_hash),
         };
-
-        let chunk_resp = server
-            .client
-            .post(format!(
-                "{}/rooms/{}/snapshot/chunk",
-                server.base_url, room_id
-            ))
-            .header(
-                AUTHORIZATION,
-                format!("Bearer {}", server.config.admin_secret),
+        let (status, chunk_msg) = server
+            .post_message(
+                &room_id,
+                "snapshot/chunk",
+                &server.config.admin_secret,
+                &req_msg,
             )
-            .header(CONTENT_TYPE, "application/octet-stream")
-            .body(encode_message(&req_msg).unwrap())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(chunk_resp.status(), StatusCode::OK);
-
-        let bytes = chunk_resp.bytes().await.unwrap();
-        let chunk_msg: ServerMessage = decode_message(&bytes).unwrap();
+            .await;
+        assert_eq!(status, StatusCode::OK);
         match chunk_msg {
             ServerMessage::SnapshotChunk {
                 chunk_index,
@@ -1019,7 +528,6 @@ async fn test_snapshot_relay_chunked_transfer_and_blake3() {
         }
     }
 
-    // 4. Validate cryptographic integrity of assembled stream
     assert_eq!(assembled_data.len(), 512 * 1024);
     assert_eq!(assembled_data, snapshot_bytes);
     let computed_hash = ServerMessage::compute_snapshot_hash(&assembled_data);
@@ -1027,58 +535,16 @@ async fn test_snapshot_relay_chunked_transfer_and_blake3() {
 }
 
 #[tokio::test]
-async fn test_schema_evolution_cascades_to_active_room() {
-    let server = TestServer::start().await;
-    let schema_id = SchemaId::new("evolving-schema").unwrap();
-    let schema = create_test_schema();
-    server
-        .schema_registry
-        .register_schema(schema_id.clone(), schema)
-        .unwrap();
+async fn schema_evolution_cascades_to_active_room() {
+    let server = TestServer::start(|_| {}).await;
+    let (schema_id, room_id) = server
+        .room_with_schema("evolving-schema", "room-evolution-cascade")
+        .await;
+    let client_id = client("writer-evo");
+    let (token, _) = server.register(&room_id, &client_id).await;
 
-    let room_id = RoomId::new("room-evolution-cascade").unwrap();
-    server
-        .room_manager
-        .create_room(room_id.clone(), schema_id.clone(), None)
-        .await
-        .unwrap();
-
-    let client_id = ClientId::new("writer-evo").unwrap();
-    let token = generate_client_token(
-        &client_id,
-        &room_id,
-        Duration::from_secs(300),
-        &server.config.auth_secret,
-    );
-
-    // Register writer
-    server
-        .client
-        .post(format!("{}/rooms/{}/register", server.base_url, room_id))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(
-            encode_message(&ClientMessage::RegisterClient {
-                correlation_id: CorrelationId::new(1),
-                room_id: room_id.clone(),
-                client_id: client_id.clone(),
-                auth_token: token.clone(),
-                current_seq: None,
-            })
-            .unwrap(),
-        )
-        .send()
-        .await
-        .unwrap();
-
-    // Admin adds "notes" column via Control Plane
-    let auth_header = format!("Bearer {}", server.config.admin_secret);
     let add_resp = server
-        .client
-        .post(format!(
-            "{}/admin/schemas/{}/columns",
-            server.base_url, schema_id
-        ))
-        .header(AUTHORIZATION, &auth_header)
+        .admin(Method::POST, &format!("/admin/schemas/{schema_id}/columns"))
         .json(&AddColumnRequest {
             table_name: "tasks".to_string(),
             column: ColumnDef::new("notes", DataType::String).nullable(true),
@@ -1089,7 +555,7 @@ async fn test_schema_evolution_cascades_to_active_room() {
     assert_eq!(add_resp.status(), StatusCode::OK);
     let updated_schema: Schema = add_resp.json().await.unwrap();
 
-    // Client commits an operation containing the new "notes" column
+    // The client commits an operation containing the new "notes" column.
     let row_with_notes = RowBuilder::new()
         .set("id", 100i64)
         .set("title", "Evolution task")
@@ -1099,146 +565,67 @@ async fn test_schema_evolution_cascades_to_active_room() {
     let op_with_notes = updated_schema
         .to_operation_insert("tasks", &row_with_notes, 2000)
         .unwrap();
-
-    let commit_resp = server
-        .client
-        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", token))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(
-            encode_message(&ClientMessage::Commit {
-                correlation_id: CorrelationId::new(2),
-                room_id: room_id.clone(),
-                client_id: client_id.clone(),
-                mutation_id: MutationId::new([99; 16]),
-                last_ack_seq: SequenceNumber::new(0),
-                op: op_with_notes,
-            })
-            .unwrap(),
-        )
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(commit_resp.status(), StatusCode::OK);
-    let bytes = commit_resp.bytes().await.unwrap();
-    let ack: ServerMessage = decode_message(&bytes).unwrap();
-    match ack {
-        ServerMessage::CommitAck { assigned_seq, .. } => {
-            assert_eq!(assigned_seq, SequenceNumber::new(1));
-        }
-        other => panic!("Expected CommitAck, got {:?}", other),
-    }
+    let msg = commit_msg(&room_id, &client_id, 99, 0, op_with_notes);
+    let (status, ack) = server.post_message(&room_id, "commit", &token, &msg).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        matches!(ack, ServerMessage::CommitAck { assigned_seq, .. } if assigned_seq == SequenceNumber::new(1)),
+        "{ack:?}"
+    );
 }
 
 #[tokio::test]
-async fn test_data_plane_auth_enforcement_rejected_without_bearer() {
-    let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema").unwrap();
-    server
-        .schema_registry
-        .register_schema(schema_id.clone(), create_test_schema())
-        .unwrap();
+async fn data_plane_auth_enforcement_rejected_without_bearer() {
+    let server = TestServer::start(|_| {}).await;
+    let (_, room_id) = server
+        .room_with_schema("todo-schema", "room-auth-test")
+        .await;
+    let client_id = client("anonymous");
 
-    let room_id = RoomId::new("room-auth-test").unwrap();
-    server
-        .room_manager
-        .create_room(room_id.clone(), schema_id, None)
-        .await
-        .unwrap();
+    let requests = [
+        (
+            "commit",
+            commit_msg(&room_id, &client_id, 1, 0, make_test_op(1)),
+        ),
+        (
+            "sync",
+            ClientMessage::Sync {
+                correlation_id: CorrelationId::new(2),
+                room_id: room_id.clone(),
+                client_id: client_id.clone(),
+                from_seq: SequenceNumber::new(0),
+                max_batch_size: 10,
+            },
+        ),
+        ("ack", ack_msg(&room_id, &client_id, 1)),
+        (
+            "heartbeat",
+            ClientMessage::Heartbeat {
+                correlation_id: CorrelationId::new(4),
+                room_id: room_id.clone(),
+                client_id: client_id.clone(),
+            },
+        ),
+        (
+            "deregister",
+            ClientMessage::DeregisterClient {
+                correlation_id: CorrelationId::new(5),
+                room_id: room_id.clone(),
+                client_id: client_id.clone(),
+            },
+        ),
+    ];
+    for (endpoint, msg) in &requests {
+        let resp = server
+            .post_frame(&format!("{room_id}/{endpoint}"), None, msg)
+            .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{endpoint}");
+    }
 
-    let client_id = ClientId::new("anonymous").unwrap();
-
-    // 1. Commit without Authorization header -> 401 Unauthorized
-    let commit_msg = ClientMessage::Commit {
-        correlation_id: CorrelationId::new(1),
-        room_id: room_id.clone(),
-        client_id: client_id.clone(),
-        mutation_id: MutationId::new([1; 16]),
-        last_ack_seq: SequenceNumber::new(0),
-        op: create_insert_op(&create_test_schema(), 1, "test"),
-    };
-    let resp = server
-        .client
-        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&commit_msg).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-    // 2. Sync without Authorization header -> 401 Unauthorized
-    let sync_msg = ClientMessage::Sync {
-        correlation_id: CorrelationId::new(2),
-        room_id: room_id.clone(),
-        client_id: client_id.clone(),
-        from_seq: SequenceNumber::new(0),
-        max_batch_size: 10,
-    };
-    let resp = server
-        .client
-        .post(format!("{}/rooms/{}/sync", server.base_url, room_id))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&sync_msg).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-    // 3. Ack without Authorization header -> 401 Unauthorized
-    let ack_msg = ClientMessage::Ack {
-        correlation_id: CorrelationId::new(3),
-        room_id: room_id.clone(),
-        client_id: client_id.clone(),
-        ack_seq: SequenceNumber::new(1),
-    };
-    let resp = server
-        .client
-        .post(format!("{}/rooms/{}/ack", server.base_url, room_id))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&ack_msg).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-    // 4. Heartbeat without Authorization header -> 401 Unauthorized
-    let hb_msg = ClientMessage::Heartbeat {
-        correlation_id: CorrelationId::new(4),
-        room_id: room_id.clone(),
-        client_id: client_id.clone(),
-    };
-    let resp = server
-        .client
-        .post(format!("{}/rooms/{}/heartbeat", server.base_url, room_id))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&hb_msg).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-    // 5. Deregister without Authorization header -> 401 Unauthorized
-    let dereg_msg = ClientMessage::DeregisterClient {
-        correlation_id: CorrelationId::new(5),
-        room_id: room_id.clone(),
-        client_id: client_id.clone(),
-    };
-    let resp = server
-        .client
-        .post(format!("{}/rooms/{}/deregister", server.base_url, room_id))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&dereg_msg).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-    // 6. SSE events without Authorization header or token query -> 401 Unauthorized
+    // Neither an Authorization header nor a token in the query.
     let sse_resp = server
         .client
-        .get(format!("{}/rooms/{}/events", server.base_url, room_id))
+        .get(server.url(&format!("/rooms/{room_id}/events")))
         .send()
         .await
         .unwrap();
@@ -1246,292 +633,118 @@ async fn test_data_plane_auth_enforcement_rejected_without_bearer() {
 }
 
 #[tokio::test]
-async fn test_data_plane_auth_token_tampered_or_expired() {
-    let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema").unwrap();
-    server
-        .schema_registry
-        .register_schema(schema_id.clone(), create_test_schema())
-        .unwrap();
+async fn data_plane_auth_token_tampered_or_expired() {
+    let server = TestServer::start(|_| {}).await;
+    let (_, room_id) = server
+        .room_with_schema("todo-schema", "room-tamper-test")
+        .await;
+    let client_id = client("alice");
 
-    let room_id = RoomId::new("room-tamper-test").unwrap();
-    server
-        .room_manager
-        .create_room(room_id.clone(), schema_id, None)
-        .await
-        .unwrap();
-
-    let client_id = ClientId::new("alice").unwrap();
-
-    // 1. Expired token (0 TTL) -> 401 Unauthorized
     let expired_token = generate_client_token(
         &client_id,
         &room_id,
         Duration::from_secs(0),
         &server.config.auth_secret,
     );
-    let commit_msg = ClientMessage::Commit {
-        correlation_id: CorrelationId::new(1),
-        room_id: room_id.clone(),
-        client_id: client_id.clone(),
-        mutation_id: MutationId::new([1; 16]),
-        last_ack_seq: SequenceNumber::new(0),
-        op: create_insert_op(&create_test_schema(), 1, "test"),
-    };
-    let resp = server
-        .client
-        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", expired_token))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&commit_msg).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-
-    // 2. Tampered signature -> 401 Unauthorized
-    let valid_token = generate_client_token(
-        &client_id,
-        &room_id,
-        Duration::from_secs(300),
-        &server.config.auth_secret,
-    );
+    let valid_token = token(&client_id, &room_id);
     let tampered_token = format!("{}deadbeef", &valid_token[..valid_token.len() - 8]);
-    let resp2 = server
-        .client
-        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", tampered_token))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&commit_msg).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
+    let msg = commit_msg(&room_id, &client_id, 1, 0, make_test_op(1));
+    for bad_token in [expired_token, tampered_token] {
+        let resp = server
+            .post_frame(&format!("{room_id}/commit"), Some(&bad_token), &msg)
+            .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{bad_token}");
+    }
 }
 
 #[tokio::test]
-async fn test_data_plane_room_path_token_and_payload_mismatch_rejected() {
-    let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema").unwrap();
-    server
-        .schema_registry
-        .register_schema(schema_id.clone(), create_test_schema())
-        .unwrap();
+async fn data_plane_room_path_token_and_payload_mismatch_rejected() {
+    let server = TestServer::start(|_| {}).await;
+    let schema_id = server.register_schema("todo-schema", tasks_schema());
+    let room_a = server.create_room("room-a", &schema_id).await;
+    let room_b = server.create_room("room-b", &schema_id).await;
 
-    let room_a = RoomId::new("room-a").unwrap();
-    let room_b = RoomId::new("room-b").unwrap();
-    server
-        .room_manager
-        .create_room(room_a.clone(), schema_id.clone(), None)
-        .await
-        .unwrap();
-    server
-        .room_manager
-        .create_room(room_b.clone(), schema_id, None)
-        .await
-        .unwrap();
+    let alice = client("alice");
+    let bob = client("bob");
+    let token_a = token(&alice, &room_a);
 
-    let client_id = ClientId::new("alice").unwrap();
-    // Token issued for room_a
-    let token_a = generate_client_token(
-        &client_id,
-        &room_a,
-        Duration::from_secs(300),
-        &server.config.auth_secret,
-    );
-
-    // 1. Path vs Token mismatch: Using token_a on room_b endpoint
-    let commit_msg = ClientMessage::Commit {
-        correlation_id: CorrelationId::new(1),
-        room_id: room_b.clone(),
-        client_id: client_id.clone(),
-        mutation_id: MutationId::new([1; 16]),
-        last_ack_seq: SequenceNumber::new(0),
-        op: create_insert_op(&create_test_schema(), 1, "test"),
-    };
-    let resp = server
-        .client
-        .post(format!("{}/rooms/{}/commit", server.base_url, room_b))
-        .header(AUTHORIZATION, format!("Bearer {}", token_a))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&commit_msg).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-
-    // 2. Path vs Payload mismatch: Path is room_a, token is for room_a, but payload says room_b
-    let commit_msg_mismatch = ClientMessage::Commit {
-        correlation_id: CorrelationId::new(2),
-        room_id: room_b.clone(),
-        client_id: client_id.clone(),
-        mutation_id: MutationId::new([2; 16]),
-        last_ack_seq: SequenceNumber::new(0),
-        op: create_insert_op(&create_test_schema(), 1, "test"),
-    };
-    let resp2 = server
-        .client
-        .post(format!("{}/rooms/{}/commit", server.base_url, room_a))
-        .header(AUTHORIZATION, format!("Bearer {}", token_a))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&commit_msg_mismatch).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp2.status(), StatusCode::BAD_REQUEST);
-
-    // 3. Client Impersonation: Token is for alice, but payload says bob
-    let bob_id = ClientId::new("bob").unwrap();
-    let commit_msg_impersonate = ClientMessage::Commit {
-        correlation_id: CorrelationId::new(3),
-        room_id: room_a.clone(),
-        client_id: bob_id,
-        mutation_id: MutationId::new([3; 16]),
-        last_ack_seq: SequenceNumber::new(0),
-        op: create_insert_op(&create_test_schema(), 1, "test"),
-    };
-    let resp3 = server
-        .client
-        .post(format!("{}/rooms/{}/commit", server.base_url, room_a))
-        .header(AUTHORIZATION, format!("Bearer {}", token_a))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&commit_msg_impersonate).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp3.status(), StatusCode::FORBIDDEN);
+    for (path_room, payload_room, payload_client, expected) in [
+        // A token for room_a on the endpoint of room_b.
+        (&room_b, &room_b, &alice, StatusCode::FORBIDDEN),
+        // The path and the token are for room_a, but the payload says room_b.
+        (&room_a, &room_b, &alice, StatusCode::BAD_REQUEST),
+        // The token is alice's, but the payload says bob: impersonation.
+        (&room_a, &room_a, &bob, StatusCode::FORBIDDEN),
+    ] {
+        let msg = commit_msg(payload_room, payload_client, 1, 0, make_test_op(1));
+        let resp = server
+            .post_frame(&format!("{path_room}/commit"), Some(&token_a), &msg)
+            .await;
+        assert_eq!(
+            resp.status(),
+            expected,
+            "path {path_room}, payload {payload_room}/{payload_client}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn test_data_plane_dev_token_backdoor_eliminated() {
-    let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema").unwrap();
-    server
-        .schema_registry
-        .register_schema(schema_id.clone(), create_test_schema())
-        .unwrap();
+async fn dev_token_is_not_accepted() {
+    let server = TestServer::start(|_| {}).await;
+    let (_, room_id) = server
+        .room_with_schema("todo-schema", "room-dev-token")
+        .await;
+    let client_id = client("hacker");
 
-    let room_id = RoomId::new("room-backdoor-test").unwrap();
-    server
-        .room_manager
-        .create_room(room_id.clone(), schema_id, None)
-        .await
-        .unwrap();
-
-    let client_id = ClientId::new("hacker").unwrap();
-
-    // Register attempt using "dev-token" -> 401 Unauthorized
-    let reg_msg = ClientMessage::RegisterClient {
-        correlation_id: CorrelationId::new(1),
-        room_id: room_id.clone(),
-        client_id: client_id.clone(),
-        auth_token: "dev-token".to_string(),
-        current_seq: None,
-    };
+    let register = register_msg(&room_id, &client_id, "dev-token");
     let resp = server
-        .client
-        .post(format!("{}/rooms/{}/register", server.base_url, room_id))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&reg_msg).unwrap())
-        .send()
-        .await
-        .unwrap();
+        .post_frame(&format!("{room_id}/register"), None, &register)
+        .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-    // Commit attempt using Bearer dev-token -> 401 Unauthorized
-    let commit_msg = ClientMessage::Commit {
-        correlation_id: CorrelationId::new(2),
-        room_id: room_id.clone(),
-        client_id,
-        mutation_id: MutationId::new([1; 16]),
-        last_ack_seq: SequenceNumber::new(0),
-        op: create_insert_op(&create_test_schema(), 1, "test"),
-    };
-    let resp2 = server
-        .client
-        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
-        .header(AUTHORIZATION, "Bearer dev-token")
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&commit_msg).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
+    let commit = commit_msg(&room_id, &client_id, 1, 0, make_test_op(1));
+    let resp = server
+        .post_frame(&format!("{room_id}/commit"), Some("dev-token"), &commit)
+        .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
-async fn test_sse_events_auth_header_and_query_param() {
-    let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema").unwrap();
-    server
-        .schema_registry
-        .register_schema(schema_id.clone(), create_test_schema())
-        .unwrap();
+async fn sse_events_auth_header_and_query_param() {
+    let server = TestServer::start(|_| {}).await;
+    let (_, room_id) = server
+        .room_with_schema("todo-schema", "room-sse-auth")
+        .await;
+    let valid_token = token(&client("listener"), &room_id);
 
-    let room_id = RoomId::new("room-sse-auth").unwrap();
-    server
-        .room_manager
-        .create_room(room_id.clone(), schema_id, None)
-        .await
-        .unwrap();
-
-    let client_id = ClientId::new("listener").unwrap();
-    let valid_token = generate_client_token(
-        &client_id,
-        &room_id,
-        Duration::from_secs(300),
-        &server.config.auth_secret,
-    );
-
-    // 1. Success via Bearer Header
-    let resp_header = server
-        .client
-        .get(format!("{}/rooms/{}/events", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", valid_token))
-        .send()
-        .await
-        .unwrap();
+    let resp_header = server.events(&room_id, &valid_token).await;
     assert_eq!(resp_header.status(), StatusCode::OK);
 
-    // 2. Success via ?token= query parameter (EventSource compatibility)
-    let resp_query = server
-        .client
-        .get(format!(
-            "{}/rooms/{}/events?token={}",
-            server.base_url, room_id, valid_token
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp_query.status(), StatusCode::OK);
-
-    // 3. Failure via invalid ?token=
-    let resp_bad_query = server
-        .client
-        .get(format!(
-            "{}/rooms/{}/events?token=invalid.token.123",
-            server.base_url, room_id
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp_bad_query.status(), StatusCode::UNAUTHORIZED);
+    // A token in the query also works, for EventSource compatibility; an invalid one does not.
+    for (query_token, expected) in [
+        (valid_token.as_str(), StatusCode::OK),
+        ("invalid.token.123", StatusCode::UNAUTHORIZED),
+    ] {
+        let resp = server
+            .client
+            .get(server.url(&format!("/rooms/{room_id}/events?token={query_token}")))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), expected, "{query_token}");
+    }
 }
 
 #[tokio::test]
-async fn test_admin_get_room_non_existent_returns_404_without_spawning() {
-    let server = TestServer::start().await;
-    let auth_header = format!("Bearer {}", server.config.admin_secret);
+async fn admin_get_room_non_existent_returns_404_without_spawning() {
+    let server = TestServer::start(|_| {}).await;
     let ghost_id = "ghost-room-unspawned";
 
     let resp = server
-        .client
-        .get(format!("{}/admin/rooms/{}", server.base_url, ghost_id))
-        .header(AUTHORIZATION, &auth_header)
+        .admin(Method::GET, &format!("/admin/rooms/{ghost_id}"))
         .send()
         .await
         .unwrap();
-
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
     let room_dir = server.config.data_dir.join("rooms").join(ghost_id);
@@ -1548,30 +761,23 @@ async fn test_admin_get_room_non_existent_returns_404_without_spawning() {
 }
 
 #[tokio::test]
-async fn test_sse_schema_reloaded_event_emission() {
-    let server = TestServer::start().await;
+async fn sse_signals_schema_reloaded() {
+    let server = TestServer::start(|_| {}).await;
     let schema_id = SchemaId::new("schema-reload-sse").unwrap();
-    let admin_auth = format!("Bearer {}", server.config.admin_secret);
+    let room_id = RoomId::new("room-schema-sse").unwrap();
 
-    // 1. Register base schema
-    server
-        .client
-        .post(format!("{}/admin/schemas", server.base_url))
-        .header(AUTHORIZATION, &admin_auth)
+    let resp = server
+        .admin(Method::POST, "/admin/schemas")
         .json(&CreateSchemaRequest {
             schema_id: schema_id.clone(),
-            schema: create_test_schema(),
+            schema: tasks_schema(),
         })
         .send()
         .await
         .unwrap();
-
-    // 2. Create room
-    let room_id = RoomId::new("room-schema-sse").unwrap();
-    server
-        .client
-        .post(format!("{}/admin/rooms", server.base_url))
-        .header(AUTHORIZATION, &admin_auth)
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = server
+        .admin(Method::POST, "/admin/rooms")
         .json(&CreateRoomRequest {
             room_id: room_id.clone(),
             schema_id: schema_id.clone(),
@@ -1580,66 +786,35 @@ async fn test_sse_schema_reloaded_event_emission() {
         .send()
         .await
         .unwrap();
-
-    // 3. Connect SSE listener
-    let client_id = ClientId::new("sse-schema-listener").unwrap();
-    let token = generate_client_token(
-        &client_id,
-        &room_id,
-        Duration::from_secs(300),
-        &server.config.auth_secret,
-    );
+    assert_eq!(resp.status(), StatusCode::CREATED);
 
     let sse_resp = server
-        .client
-        .get(format!("{}/rooms/{}/events", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", token))
-        .send()
-        .await
-        .unwrap();
+        .events(&room_id, &token(&client("sse-schema-listener"), &room_id))
+        .await;
     assert_eq!(sse_resp.status(), StatusCode::OK);
     let mut stream = sse_resp.bytes_stream();
 
-    // 4. Evolve schema via control plane
-    let new_col = ColumnDef::new("priority", DataType::Int).nullable(true);
     let add_col_resp = server
-        .client
-        .post(format!(
-            "{}/admin/schemas/{}/columns",
-            server.base_url, schema_id
-        ))
-        .header(AUTHORIZATION, &admin_auth)
+        .admin(Method::POST, &format!("/admin/schemas/{schema_id}/columns"))
         .json(&AddColumnRequest {
             table_name: "tasks".to_string(),
-            column: new_col,
+            column: ColumnDef::new("priority", DataType::Int).nullable(true),
         })
         .send()
         .await
         .unwrap();
     assert_eq!(add_col_resp.status(), StatusCode::OK);
 
-    // 5. Verify SSE stream receives schema_reloaded event
-    let chunk = tokio::time::timeout(Duration::from_secs(2), stream.next())
-        .await
-        .expect("SSE event timeout")
-        .expect("Stream closed unexpectedly")
-        .unwrap();
-
-    let text = String::from_utf8_lossy(&chunk);
+    let text = read_sse_until(&mut stream, "data: schema-reload-sse").await;
     assert!(
         text.contains("event: schema_reloaded"),
         "Expected SSE schema_reloaded event, got: {}",
         text
     );
-    assert!(
-        text.contains("data: schema-reload-sse"),
-        "Expected schema_id in data, got: {}",
-        text
-    );
 }
 
 #[test]
-fn test_client_lease_disconnected_to_dormant_timeout() {
+fn client_lease_disconnected_to_dormant_timeout() {
     use std::time::Instant;
     use zemdb_server::actor::lease::{ClientLeaseTracker, ClientState};
 
@@ -1647,8 +822,8 @@ fn test_client_lease_disconnected_to_dormant_timeout() {
     let roster_path = dir.path().join("clients.json");
     let mut tracker = ClientLeaseTracker::open_or_create(&roster_path).unwrap();
 
-    let alice = ClientId::new("alice").unwrap();
-    let bob = ClientId::new("bob").unwrap();
+    let alice = client("alice");
+    let bob = client("bob");
     let lease_timeout = Duration::from_secs(5);
     let tail_seq = SequenceNumber::new(0);
 
@@ -1667,9 +842,8 @@ fn test_client_lease_disconnected_to_dormant_timeout() {
     );
 
     // 1. Simulate alice lease expiry (> 5s) -> transitions to Disconnected
-    if let Some(entry) = tracker.get_client_mut(&alice) {
-        entry.last_heartbeat = Instant::now() - Duration::from_secs(6);
-    }
+    tracker.get_client_mut(&alice).unwrap().last_heartbeat =
+        Instant::now() - Duration::from_secs(6);
     let modified = tracker.check_timeouts(lease_timeout, None, Duration::MAX, tail_seq);
     assert!(modified);
     assert_eq!(
@@ -1686,9 +860,8 @@ fn test_client_lease_disconnected_to_dormant_timeout() {
 
     // 2. A prolonged disconnection alone keeps alice Disconnected: her cursor is still
     // inside the retained log, so she can catch up from it.
-    if let Some(entry) = tracker.get_client_mut(&alice) {
-        entry.last_heartbeat = Instant::now() - Duration::from_secs(95);
-    }
+    tracker.get_client_mut(&alice).unwrap().last_heartbeat =
+        Instant::now() - Duration::from_secs(95);
     assert!(!tracker.check_timeouts(lease_timeout, None, Duration::MAX, tail_seq));
     assert_eq!(
         tracker.get_client(&alice).unwrap().state,
@@ -1718,362 +891,102 @@ fn test_client_lease_disconnected_to_dormant_timeout() {
 }
 
 #[tokio::test]
-async fn test_commit_ack_catchup_ops_content_ordering_and_contiguity() {
-    let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema-catchup").unwrap();
-    let schema = create_test_schema();
-    server
-        .schema_registry
-        .register_schema(schema_id.clone(), schema.clone())
-        .unwrap();
+async fn commit_ack_catchup_ops_content_ordering_and_contiguity() {
+    let server = TestServer::start(|_| {}).await;
+    let (_, room_id) = server
+        .room_with_schema("todo-schema-catchup", "room-catchup-contiguity-1")
+        .await;
+    let client_alpha = client("writer-alpha");
+    let client_beta = client("writer-beta");
+    let client_gamma = client("writer-gamma");
 
-    let room_id = RoomId::new("room-catchup-contiguity-1").unwrap();
-    server
-        .room_manager
-        .create_room(room_id.clone(), schema_id.clone(), None)
-        .await
-        .unwrap();
+    // The room is still empty, so the clients register without a cursor: a cursor can only be
+    // reported once it exists. The cursor that matters below is the one each commit carries.
+    let (token_alpha, _) = server.register(&room_id, &client_alpha).await;
+    let (token_beta, _) = server.register(&room_id, &client_beta).await;
+    let (token_gamma, _) = server.register(&room_id, &client_gamma).await;
 
-    let client_alpha = ClientId::new("writer-alpha").unwrap();
-    let client_beta = ClientId::new("writer-beta").unwrap();
-    let client_gamma = ClientId::new("writer-gamma").unwrap();
-
-    let token_alpha = generate_client_token(
-        &client_alpha,
-        &room_id,
-        Duration::from_secs(300),
-        &server.config.auth_secret,
-    );
-    let token_beta = generate_client_token(
-        &client_beta,
-        &room_id,
-        Duration::from_secs(300),
-        &server.config.auth_secret,
-    );
-    let token_gamma = generate_client_token(
-        &client_gamma,
-        &room_id,
-        Duration::from_secs(300),
-        &server.config.auth_secret,
-    );
-
-    // Register client_alpha
-    let reg_alpha = ClientMessage::RegisterClient {
-        correlation_id: CorrelationId::new(1),
-        room_id: room_id.clone(),
-        client_id: client_alpha.clone(),
-        auth_token: token_alpha.clone(),
-        current_seq: None,
+    let commit = |token: &str, msg: ClientMessage| {
+        let server = &server;
+        let room_id = &room_id;
+        let token = token.to_string();
+        async move {
+            match server.post_message(room_id, "commit", &token, &msg).await {
+                (
+                    StatusCode::OK,
+                    ServerMessage::CommitAck {
+                        assigned_seq,
+                        catchup_ops,
+                        ..
+                    },
+                ) => (assigned_seq, catchup_ops),
+                other => panic!("Expected CommitAck, got {:?}", other),
+            }
+        }
     };
-    let resp = server
-        .client
-        .post(format!("{}/rooms/{}/register", server.base_url, room_id))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&reg_alpha).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // Register client_beta
-    let reg_beta = ClientMessage::RegisterClient {
-        correlation_id: CorrelationId::new(2),
-        room_id: room_id.clone(),
-        client_id: client_beta.clone(),
-        auth_token: token_beta.clone(),
-        // The room is still empty: a cursor can only be reported once it exists. The
-        // cursor that matters below is the one each commit carries.
-        current_seq: None,
+    let ops_of = |catchup_ops: &[SequencedOperation]| -> Vec<Operation> {
+        catchup_ops.iter().map(|o| o.op.clone()).collect()
     };
-    let resp = server
-        .client
-        .post(format!("{}/rooms/{}/register", server.base_url, room_id))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&reg_beta).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // Register client_gamma
-    let reg_gamma = ClientMessage::RegisterClient {
-        correlation_id: CorrelationId::new(3),
-        room_id: room_id.clone(),
-        client_id: client_gamma.clone(),
-        auth_token: token_gamma.clone(),
-        // The room is still empty: a cursor can only be reported once it exists. The
-        // cursor that matters below is the one each commit carries.
-        current_seq: None,
-    };
-    let resp = server
-        .client
-        .post(format!("{}/rooms/{}/register", server.base_url, room_id))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&reg_gamma).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
 
     // Client alpha commits 5 operations sequentially (assigned_seq 1..=5)
     let mut sent_ops = Vec::new();
-    for i in 1..=5 {
-        let op = create_insert_op(&schema, i, &format!("Task item {}", i));
+    for i in 1..=5u8 {
+        let op = make_test_op(i.into());
         sent_ops.push(op.clone());
-        let commit_msg = ClientMessage::Commit {
-            correlation_id: CorrelationId::new(10 + i as u64),
-            room_id: room_id.clone(),
-            client_id: client_alpha.clone(),
-            mutation_id: MutationId::new([i as u8; 16]),
-            last_ack_seq: SequenceNumber::new((i - 1) as u64),
-            op,
-        };
-        let resp = server
-            .client
-            .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
-            .header(AUTHORIZATION, format!("Bearer {}", token_alpha))
-            .header(CONTENT_TYPE, "application/octet-stream")
-            .body(encode_message(&commit_msg).unwrap())
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = resp.bytes().await.unwrap();
-        let ack: ServerMessage = decode_message(&bytes).unwrap();
-        match ack {
-            ServerMessage::CommitAck {
-                assigned_seq,
-                catchup_ops,
-                ..
-            } => {
-                assert_eq!(assigned_seq, SequenceNumber::new(i as u64));
-                assert_eq!(
-                    catchup_ops.len(),
-                    1,
-                    "Alpha was at last_ack_seq i-1, catchup_ops must contain its own sequenced op"
-                );
-                assert_eq!(catchup_ops[0].seq, SequenceNumber::new(i as u64));
-                assert_eq!(catchup_ops[0].op.pk(), &PrimaryKey::single(i));
-            }
-            other => panic!("Expected CommitAck, got {:?}", other),
-        }
+        let msg = commit_msg(&room_id, &client_alpha, i, u64::from(i) - 1, op);
+        let (assigned_seq, catchup_ops) = commit(&token_alpha, msg).await;
+        assert_eq!(assigned_seq, SequenceNumber::new(i.into()));
+        assert_eq!(
+            seqs(&catchup_ops),
+            vec![u64::from(i)],
+            "Alpha was at last_ack_seq i-1, catchup_ops must contain its own sequenced op"
+        );
+        assert_eq!(catchup_ops[0].op.pk(), &PrimaryKey::single(i64::from(i)));
     }
 
-    // Now client_beta (whose local cursor is only at sequence 2) commits mutation 6
-    let op_beta = create_insert_op(&schema, 6, "Beta task item");
-    let mutation_beta = MutationId::new([66; 16]);
-    let commit_beta = ClientMessage::Commit {
-        correlation_id: CorrelationId::new(20),
-        room_id: room_id.clone(),
-        client_id: client_beta.clone(),
-        mutation_id: mutation_beta,
-        last_ack_seq: SequenceNumber::new(2),
-        op: op_beta.clone(),
-    };
-    let resp_beta = server
-        .client
-        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", token_beta))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&commit_beta).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp_beta.status(), StatusCode::OK);
-    let bytes_beta = resp_beta.bytes().await.unwrap();
-    let ack_beta: ServerMessage = decode_message(&bytes_beta).unwrap();
-
-    match ack_beta {
-        ServerMessage::CommitAck {
-            assigned_seq,
-            catchup_ops,
-            ..
-        } => {
-            assert_eq!(assigned_seq, SequenceNumber::new(6));
-            // Catchup must contain sequences 3, 4, 5 and 6
-            assert_eq!(
-                catchup_ops.len(),
-                4,
-                "Expected 4 catchup operations for cursor lag from 2 to 6"
-            );
-
-            // Verify strict monotonicity and contiguity: [3, 4, 5, 6]
-            for (idx, seq_op) in catchup_ops.iter().enumerate() {
-                let expected_seq = (idx + 3) as u64;
-                assert_eq!(
-                    seq_op.seq,
-                    SequenceNumber::new(expected_seq),
-                    "Catchup sequence must be strictly contiguous"
-                );
-                if idx < 3 {
-                    // Ops 3, 4, 5 from Alpha
-                    assert_eq!(seq_op.op.table_id(), sent_ops[idx + 2].table_id());
-                    assert_eq!(seq_op.op.pk(), sent_ops[idx + 2].pk());
-                    assert_eq!(seq_op.op.kind(), sent_ops[idx + 2].kind());
-                } else {
-                    // Op 6 from Beta
-                    assert_eq!(seq_op.op.table_id(), op_beta.table_id());
-                    assert_eq!(seq_op.op.pk(), op_beta.pk());
-                    assert_eq!(seq_op.op.kind(), op_beta.kind());
-                }
-            }
-        }
-        other => panic!("Expected CommitAck, got {:?}", other),
-    }
+    // Client beta, whose local cursor is only at sequence 2, commits mutation 6: its catchup
+    // holds alpha's ops 3, 4 and 5 and its own op 6, contiguous and in order.
+    let op_beta = make_test_op(6);
+    let commit_beta = commit_msg(&room_id, &client_beta, 66, 2, op_beta.clone());
+    let (assigned_seq, catchup_ops) = commit(&token_beta, commit_beta.clone()).await;
+    assert_eq!(assigned_seq, SequenceNumber::new(6));
+    assert_eq!(
+        seqs(&catchup_ops),
+        vec![3, 4, 5, 6],
+        "Catchup sequence must be strictly contiguous from the cursor lag of 2 up to 6"
+    );
+    let mut expected_ops = sent_ops[2..].to_vec();
+    expected_ops.push(op_beta.clone());
+    assert_eq!(ops_of(&catchup_ops), expected_ops);
 
     // Now client_gamma commits mutation 7 while fully up-to-date (last_ack_seq: 6)
-    let op_gamma = create_insert_op(&schema, 7, "Gamma task item");
-    let commit_gamma = ClientMessage::Commit {
-        correlation_id: CorrelationId::new(30),
-        room_id: room_id.clone(),
-        client_id: client_gamma.clone(),
-        mutation_id: MutationId::new([77; 16]),
-        last_ack_seq: SequenceNumber::new(6),
-        op: op_gamma.clone(),
-    };
-    let resp_gamma = server
-        .client
-        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", token_gamma))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&commit_gamma).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp_gamma.status(), StatusCode::OK);
-    let bytes_gamma = resp_gamma.bytes().await.unwrap();
-    let ack_gamma: ServerMessage = decode_message(&bytes_gamma).unwrap();
+    let op_gamma = make_test_op(7);
+    let commit_gamma = commit_msg(&room_id, &client_gamma, 77, 6, op_gamma.clone());
+    let (assigned_seq, catchup_ops) = commit(&token_gamma, commit_gamma).await;
+    assert_eq!(assigned_seq, SequenceNumber::new(7));
+    assert_eq!(
+        seqs(&catchup_ops),
+        vec![7],
+        "Gamma was up-to-date at seq 6, catchup_ops contains op 7"
+    );
+    assert_eq!(ops_of(&catchup_ops), vec![op_gamma]);
 
-    match ack_gamma {
-        ServerMessage::CommitAck {
-            assigned_seq,
-            catchup_ops,
-            ..
-        } => {
-            assert_eq!(assigned_seq, SequenceNumber::new(7));
-            assert_eq!(
-                catchup_ops.len(),
-                1,
-                "Gamma was up-to-date at seq 6, catchup_ops contains op 7"
-            );
-            assert_eq!(catchup_ops[0].seq, SequenceNumber::new(7));
-            assert_eq!(catchup_ops[0].op.pk(), op_gamma.pk());
-        }
-        other => panic!("Expected CommitAck, got {:?}", other),
-    }
-
-    // Idempotent commit retry: client_beta resends the exact same commit_beta (same mutation_id) with last_ack_seq = 2
-    let resp_retry = server
-        .client
-        .post(format!("{}/rooms/{}/commit", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", token_beta))
-        .header(CONTENT_TYPE, "application/octet-stream")
-        .body(encode_message(&commit_beta).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp_retry.status(), StatusCode::OK);
-    let bytes_retry = resp_retry.bytes().await.unwrap();
-    let ack_retry: ServerMessage = decode_message(&bytes_retry).unwrap();
-
-    match ack_retry {
-        ServerMessage::CommitAck {
-            assigned_seq,
-            catchup_ops,
-            ..
-        } => {
-            assert_eq!(assigned_seq, SequenceNumber::new(6));
-            // Should contain ops starting after cursor 2 up to current head: 3, 4, 5, 6, 7
-            assert_eq!(
-                catchup_ops.len(),
-                5,
-                "Catchup on duplicate commit must return deltas from client cursor up to head"
-            );
-            assert_eq!(catchup_ops[0].seq, SequenceNumber::new(3));
-            assert_eq!(catchup_ops[1].seq, SequenceNumber::new(4));
-            assert_eq!(catchup_ops[2].seq, SequenceNumber::new(5));
-            assert_eq!(catchup_ops[3].seq, SequenceNumber::new(6));
-            assert_eq!(catchup_ops[4].seq, SequenceNumber::new(7));
-            assert_eq!(catchup_ops[3].op.pk(), op_beta.pk());
-        }
-        other => panic!("Expected CommitAck on idempotent retry, got {:?}", other),
-    }
-}
-
-impl TestServer {
-    /// Posts a binary data plane message with a client token and decodes the reply.
-    async fn post_message(
-        &self,
-        room_id: &RoomId,
-        endpoint: &str,
-        token: &str,
-        msg: &ClientMessage,
-    ) -> (StatusCode, ServerMessage) {
-        let resp = self
-            .client
-            .post(format!("{}/rooms/{}/{}", self.base_url, room_id, endpoint))
-            .header(AUTHORIZATION, format!("Bearer {}", token))
-            .header(CONTENT_TYPE, "application/octet-stream")
-            .body(encode_message(msg).unwrap())
-            .send()
-            .await
-            .unwrap();
-        let status = resp.status();
-        let body = resp.bytes().await.unwrap();
-        (status, decode_message(&body).unwrap())
-    }
-
-    async fn heartbeat_ack(
-        &self,
-        room_id: &RoomId,
-        client_id: &ClientId,
-        token: &str,
-    ) -> (bool, Option<SequenceNumber>) {
-        let msg = ClientMessage::Heartbeat {
-            correlation_id: CorrelationId::new(90),
-            room_id: room_id.clone(),
-            client_id: client_id.clone(),
-        };
-        match self.post_message(room_id, "heartbeat", token, &msg).await {
-            (
-                StatusCode::OK,
-                ServerMessage::HeartbeatAck {
-                    snapshot_wanted,
-                    active_snapshot_seq,
-                    ..
-                },
-            ) => (snapshot_wanted, active_snapshot_seq),
-            other => panic!("Expected HeartbeatAck, got {:?}", other),
-        }
-    }
-}
-
-/// Reads an SSE byte stream until the received text contains `needle`, returning all of it.
-async fn read_sse_until(
-    stream: &mut (impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin),
-    needle: &str,
-) -> String {
-    let mut text = String::new();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !text.contains(needle) {
-            let chunk = stream.next().await.expect("SSE stream closed").unwrap();
-            text.push_str(&String::from_utf8_lossy(&chunk));
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("SSE never sent {needle:?}; received: {text}"));
-    text
+    // Idempotent commit retry: client_beta resends the exact same commit_beta (same
+    // mutation_id) with last_ack_seq = 2, and catches up from its cursor to the head.
+    let (assigned_seq, catchup_ops) = commit(&token_beta, commit_beta).await;
+    assert_eq!(assigned_seq, SequenceNumber::new(6));
+    assert_eq!(
+        seqs(&catchup_ops),
+        vec![3, 4, 5, 6, 7],
+        "Catchup on duplicate commit must return deltas from client cursor up to head"
+    );
+    assert_eq!(catchup_ops[3].op, op_beta);
 }
 
 #[tokio::test]
-async fn test_snapshot_demand_signals_over_http_and_sse() {
-    let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema").unwrap();
-    let schema = create_test_schema();
-    server
-        .schema_registry
-        .register_schema(schema_id.clone(), schema.clone())
-        .unwrap();
+async fn snapshot_demand_signals_over_http_and_sse() {
+    let server = TestServer::start(|_| {}).await;
+    let schema_id = server.register_schema("todo-schema", tasks_schema());
     let room_id = RoomId::new("room-snapshot-signals").unwrap();
     let small_segments = zemdb_server::RoomLifecycleOverrides {
         ram_max_ops: Some(2),
@@ -2085,83 +998,36 @@ async fn test_snapshot_demand_signals_over_http_and_sse() {
         .await
         .unwrap();
 
-    let token_for = |client_id: &ClientId| {
-        generate_client_token(
-            client_id,
-            &room_id,
-            Duration::from_secs(300),
-            &server.config.auth_secret,
-        )
-    };
-    let register = |client_id: &ClientId, token: &str| ClientMessage::RegisterClient {
-        correlation_id: CorrelationId::new(1),
-        room_id: room_id.clone(),
-        client_id: client_id.clone(),
-        auth_token: token.to_string(),
-        current_seq: None,
-    };
-
     // 1. The writer commits 1..=8 and acknowledges 8, which prunes the log.
-    let writer = ClientId::new("writer").unwrap();
-    let writer_token = token_for(&writer);
-    let (status, _) = server
-        .post_message(
-            &room_id,
-            "register",
-            &writer_token,
-            &register(&writer, &writer_token),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK);
+    let writer = client("writer");
+    let (writer_token, _) = server.register(&room_id, &writer).await;
     for i in 1..=8u8 {
-        let commit = ClientMessage::Commit {
-            correlation_id: CorrelationId::new(u64::from(i)),
-            room_id: room_id.clone(),
-            client_id: writer.clone(),
-            mutation_id: MutationId::new([i; 16]),
-            last_ack_seq: SequenceNumber::new(0),
-            op: create_insert_op(&schema, i64::from(i), "task"),
-        };
+        let msg = commit_msg(&room_id, &writer, i, 0, make_test_op(i.into()));
         let (status, _) = server
-            .post_message(&room_id, "commit", &writer_token, &commit)
+            .post_message(&room_id, "commit", &writer_token, &msg)
             .await;
         assert_eq!(status, StatusCode::OK);
     }
-    let ack = ClientMessage::Ack {
-        correlation_id: CorrelationId::new(20),
-        room_id: room_id.clone(),
-        client_id: writer.clone(),
-        ack_seq: SequenceNumber::new(8),
-    };
     let (status, _) = server
-        .post_message(&room_id, "ack", &writer_token, &ack)
+        .post_message(
+            &room_id,
+            "ack",
+            &writer_token,
+            &ack_msg(&room_id, &writer, 8),
+        )
         .await;
     assert_eq!(status, StatusCode::OK);
 
-    let sse_resp = server
-        .client
-        .get(format!("{}/rooms/{}/events", server.base_url, room_id))
-        .header(AUTHORIZATION, format!("Bearer {}", writer_token))
-        .send()
-        .await
-        .unwrap();
+    let sse_resp = server.events(&room_id, &writer_token).await;
     assert_eq!(sse_resp.status(), StatusCode::OK);
     let mut stream = sse_resp.bytes_stream();
 
     // 2. A new client registers in the pruned room: it must bootstrap from a snapshot, and
     // there is none, so the writer is asked for one.
-    let newcomer = ClientId::new("newcomer").unwrap();
-    let newcomer_token = token_for(&newcomer);
-    match server
-        .post_message(
-            &room_id,
-            "register",
-            &newcomer_token,
-            &register(&newcomer, &newcomer_token),
-        )
-        .await
-    {
-        (StatusCode::OK, ServerMessage::Registered { tail_seq, .. }) => {
+    let newcomer = client("newcomer");
+    let (newcomer_token, registered) = server.register(&room_id, &newcomer).await;
+    match registered {
+        ServerMessage::Registered { tail_seq, .. } => {
             assert!(tail_seq > SequenceNumber::new(1), "tail {tail_seq}")
         }
         other => panic!("Expected Registered, got {:?}", other),
@@ -2185,22 +1051,12 @@ async fn test_snapshot_demand_signals_over_http_and_sse() {
     );
 
     // 3. The writer uploads a snapshot at 8: it is announced and the request ends.
-    let mut envelope = {
-        let body = b"snapshot-at-8";
-        SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, body.len() as u32, body)
-            .to_bytes()
-            .to_vec()
-    };
-    envelope.extend_from_slice(b"snapshot-at-8");
     let upload = server
         .client
-        .post(format!(
-            "{}/rooms/{}/snapshot/upload",
-            server.base_url, room_id
-        ))
-        .header(AUTHORIZATION, format!("Bearer {}", writer_token))
+        .post(server.url(&format!("/rooms/{room_id}/snapshot/upload")))
+        .bearer_auth(&writer_token)
         .header("x-snapshot-head-seq", "8")
-        .body(envelope)
+        .body(envelope(1000, 8))
         .send()
         .await
         .unwrap();
@@ -2220,27 +1076,14 @@ async fn test_snapshot_demand_signals_over_http_and_sse() {
 }
 
 #[tokio::test]
-async fn test_register_with_a_cursor_beyond_the_head_is_an_invalid_sequence() {
-    let server = TestServer::start().await;
-    let schema_id = SchemaId::new("todo-schema").unwrap();
-    server
-        .schema_registry
-        .register_schema(schema_id.clone(), create_test_schema())
-        .unwrap();
-    let room_id = RoomId::new("room-register-ahead").unwrap();
-    server
-        .room_manager
-        .create_room(room_id.clone(), schema_id, None)
-        .await
-        .unwrap();
+async fn register_with_a_cursor_beyond_the_head_is_an_invalid_sequence() {
+    let server = TestServer::start(|_| {}).await;
+    let (_, room_id) = server
+        .room_with_schema("todo-schema", "room-register-ahead")
+        .await;
+    let client_id = client("ahead");
+    let token = token(&client_id, &room_id);
 
-    let client_id = ClientId::new("ahead").unwrap();
-    let token = generate_client_token(
-        &client_id,
-        &room_id,
-        Duration::from_secs(300),
-        &server.config.auth_secret,
-    );
     let register = ClientMessage::RegisterClient {
         correlation_id: CorrelationId::new(7),
         room_id: room_id.clone(),

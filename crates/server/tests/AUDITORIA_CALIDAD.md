@@ -66,6 +66,7 @@
   ```
   Ojo: varios POST de setup descartan la respuesta sin mirar el status (`:524-531`, `:540-555`, `:571-578`, `:584-598`); pasarlos por un helper que haga `assert_eq!(status, OK)` es más estricto (**a verificar** que todos respondan 200; deberían, porque los pasos siguientes dependen de ellos). El `CONTENT_TYPE` explícito no lo exige el server (los otros archivos no lo mandan), pero mantenerlo dentro del helper conserva el request idéntico.
 - **Ahorro estimado:** ~250–300 líneas · **Riesgo:** bajo · **Prioridad:** alta
+- **Estado:** ✅ aplicada (paso 3). `post_message` y `post_frame` (la variante cruda con `token: Option<&str>`, que conserva el `CONTENT_TYPE`) viven en `common::TestServer`, y todos los POST de `ClientMessage` de `server_integration_tests.rs` pasan por ellos. Los POST de setup que no miraban el status ahora lo verifican, y todos responden 200. El upload crudo de snapshot sigue con su armado propio (va por `admin()`).
 
 ### Q2. Helpers de preludio en `server_integration_tests.rs`: `room_with_schema`, `token`, `register`
 - **Dónde:** preludio «register_schema + create_room» en `:354-368`, `:491-505`, `:685-700`, `:805-820`, `:1030-1045`, `:1135-1148`, `:1249-1262`, `:1313-1332`, `:1406-1419`, `:1463-1476`, `:1721-1735`, `:2069-…`, `:2223-…`; `generate_client_token(&c, &r, Duration::from_secs(300), &server.config.auth_secret)` (6 líneas) 16 veces; `ClientMessage::RegisterClient { … }` + POST 14 veces.
@@ -83,12 +84,14 @@
   `:2069-…` crea la room con `Some(small_segments)`: el helper debe aceptar el `lifecycle: Option<…>` (o ese test conserva su `create_room`).
   El `correlation_id` sólo se compara en `:2264` (`test_register_with_a_cursor_beyond_the_head…`, espera `7`); ese test conserva su mensaje armado a mano y el helper puede fijar uno para el resto. Los tests que prueban registros fallidos (`:372-389`, `:1423-1438`) siguen armando su mensaje a mano vía `post_raw`.
 - **Ahorro estimado:** ~200–250 líneas · **Riesgo:** bajo · **Prioridad:** alta
+- **Estado:** ✅ aplicada (paso 3). `room_with_schema`, `register_schema` y `create_room` están en `common::Parts` (accesibles desde `TestServer`), `common::token` firma por 300 s y `TestServer::register` registra con el token sólo en el payload, como antes, y verifica el 200. `test_snapshot_demand_signals_over_http_and_sse` conserva su `create_room` con `Some(small_segments)`; el registro con cursor más allá del head (que compara el `correlation_id` 7) y los registros fallidos (token inválido, `dev-token`) siguen armando su mensaje, con `register_msg` y `post_frame`.
 
 ### Q3. Helper `admin()` para el control plane en `server_integration_tests.rs`
 - **Dónde:** `:115-153`, `:157-187`, `:209-268`, `:274-350`, `:1522-1549`, `:1569-1617`.
 - **Problema:** `format!("Bearer {}", server.config.admin_secret)` + `.header(AUTHORIZATION, &auth_header)` + `.json(&…).send().await.unwrap()` repetido ~13 veces; los otros archivos ya usan `.bearer_auth(ADMIN_SECRET)`.
 - **Propuesta:** `fn admin(&self, method: Method, path: &str) -> reqwest::RequestBuilder` que arme URL + `bearer_auth(admin_secret)`. Los casos 1–2 de `test_control_plane_schema_crud_and_auth` (`:114-139`, sin header / bearer inválido) quedan como una tabla `for auth in [None, Some("invalid_secret_token")]`. Los pasos 1–2 y 4–5 de `test_control_plane_room_lifecycle` (`:208-268`) son el mismo request dos veces con status distinto: 2 líneas cada uno.
 - **Ahorro estimado:** ~80–100 líneas · **Riesgo:** bajo · **Prioridad:** alta
+- **Estado:** ✅ aplicada (paso 3). `TestServer::admin(method, path)` arma URL y `bearer_auth` con el secreto de admin. Los casos sin header y con bearer inválido de `control_plane_schema_crud_and_auth` son una tabla, y los dos `DELETE` de `control_plane_room_lifecycle` un bucle sobre los status esperados. La doble creación de sala queda en dos requests, porque la primera además lee el `RoomMetadata`.
 
 ### Q4. Crear `tests/common/mod.rs` con el arranque del server y los helpers binarios compartidos
 - **Dónde:** `server_integration_tests.rs:17-88`, `http_error_codes_tests.rs:20-73`, `id_validation_http_tests.rs:19-79`, `admin_schema_http_tests.rs:24-74`, `http_edge_tests.rs:37-112`; duplicados exactos: `assert_binary_error` (`http_error_codes_tests.rs:125-138` ≡ `id_validation_http_tests.rs:176-190`, difiere sólo el mensaje del assert), token de 300 s (`http_error_codes_tests.rs:83-89` ≡ `id_validation_http_tests.rs:155-162`), frame `Heartbeat` (`http_error_codes_tests.rs:140-147` ≡ `id_validation_http_tests.rs:462-469`), `RegisterClient` (`http_error_codes_tests.rs:103-122` ≈ `id_validation_http_tests.rs:444-460`).
@@ -135,11 +138,13 @@
   ```
   Estos cuatro tests solapan parcialmente `http_error_codes_tests.rs` (allí con `heartbeat` y verificando además el `ErrorCode`), pero aquí recorren `commit/sync/ack/deregister`: conservar los casos, sólo compactar. Opcional: verificar también el frame con `assert_binary_error` (más estricto, no cambia lo que se prueba).
 - **Ahorro estimado:** ~120 líneas (incluido en parte en Q1; neto adicional ~40–60) · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 3). Los cinco endpoints sin bearer son una tabla `(endpoint, msg)`; el token expirado y el adulterado, un bucle; los tres desajustes de sala/cliente, una tabla `(sala del path, sala del payload, cliente del payload, status)`. Se conservan todos los casos y se dejó sólo el status (el `ErrorCode` lo cubre `http_error_codes_tests.rs`).
 
 ### Q7. Unificar la lectura de SSE con `read_sse_until`
 - **Dónde:** `server_integration_tests.rs:880-897` y `:1621-1638` leen **un solo chunk** con timeout de 2 s y buscan dos substrings; `read_sse_until` (`:2051-2066`) ya hace el bucle robusto.
 - **Propuesta:** `let text = read_sse_until(&mut stream, "data: 1").await; assert!(text.contains("event: head_advanced"), "{text}");`. Ahorra ~10 líneas por sitio y elimina una posible intermitencia si el evento llega partido en dos chunks. Cambia el timeout de 2 a 5 s y acepta eventos repartidos en varios chunks (más tolerante; **a verificar** que no se quiera exigir que el evento llegue en un chunk).
 - **Ahorro estimado:** ~20 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 3). `read_sse_until` pasó a `common` y lo usan los dos tests de SSE (`sse_signals_head_advanced` y `sse_signals_schema_reloaded`), que siguen verificando las dos subcadenas; aceptan eventos repartidos en varios chunks, con 5 s de margen.
 
 ### Q8. Asserts verbosos del test de catchup
 - **Dónde:** `server_integration_tests.rs:1885-1921`, `:1987-1997` y similares.
@@ -151,6 +156,7 @@
   ```
   y para el contenido, un helper local `fn same_op(a: &Operation, b: &Operation)` que compare `table_id/pk/kind`. Comparar la `Operation` completa (`Operation: PartialEq`, `core/src/mutation/op.rs:70`) sería aún más corto pero más estricto: **a verificar** que el server no reescriba ningún campo (p. ej. timestamp) antes de devolverla.
 - **Ahorro estimado:** ~20–25 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 3). Las secuencias se comparan como lista completa con `common::seqs`, y el contenido como `Operation` completa: el server devuelve las operaciones sin reescribir ningún campo (el test pasa comparando igualdad entera), así que la aserción es más estricta que la de `table_id/pk/kind`.
 
 ### Q9. `id_validation_http_tests.rs`: helper `post` como el de `http_error_codes_tests.rs` y `assert_json_error`
 - **Dónde:** POST binarios inline en `:281-308`, `:311-331`, `:373-425`, `:472-525`, `:525-566`, `:587-608`; el assert JSON «status 400 + `body["code"] == "BadRequest"`» en `:97-103`, `:146-153`, `:438-441`, `:579-583` (415 + `"BadRequest"`) y `admin_schema_http_tests.rs:96-100`.
@@ -162,6 +168,7 @@
 - **Problema:** es un test unitario de `actor::lease`; los casos «desconectado dentro del log sigue `Disconnected`» y «con `dormant_after` pasa a `Dormant`» ya están en `src/actor/tests/lease.rs:263` y `:319`. Lo único que suma son los asserts de `min_connected_ack_seq` en cada estado.
 - **Propuesta:** **a verificar** si `src/actor/tests/lease.rs` cubre `min_connected_ack_seq` con clientes `Disconnected`/`Dormant`; si sí, eliminar este test; si no, mover esos asserts a los tests de `lease.rs` (es la carpeta de tests del módulo, no el código fuente). Mientras tanto, los `if let Some(entry) = tracker.get_client_mut(&alice) { … }` (`:1670`, `:1688`) deberían ser `.unwrap()` para que el test falle si alice no está, en lugar de saltarse el paso en silencio.
 - **Ahorro estimado:** ~0–78 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 3) en parte: los `if let Some(entry)` son `.unwrap()`. El test no se borra: `src/actor/tests/lease.rs` cubre `min_connected_ack_seq() == None` con un cliente `Disconnected`, pero no que un cliente `Dormant` deje de bloquear y se devuelva el cursor de otro conectado. Mover esa aserción a `lease.rs` toca `src/`, fuera del alcance de este paso.
 
 ### Q11. Retoques en `auth_tests.rs`
 - **Dónde:** `generate_client_token(&ClientId::new(..).unwrap(), &RoomId::new(..).unwrap(), Duration::from_secs(60), secret)` en `:56-61`, `:70-75`, `:138-143`, `:152-157`; `token.split('.').map(str::to_string).collect()` en `:76`, `:145`, `:158/165`; `use base64::…` repetido dentro de dos funciones (`:67-68`, `:129-130`).
@@ -177,6 +184,7 @@
 - **Dónde:** 18 de 20 tests empiezan con `test_` (p. ej. `:110`, `:354`, `:1406`), mientras el resto de `tests/` usa frases descriptivas (`register_token_checks_tell_authentication_from_authorization`).
 - **Propuesta:** quitar el prefijo `test_` y renombrar los que narran historia (`…_backdoor_eliminated` → `dev_token_is_not_accepted`). No ahorra líneas; sólo coherencia.
 - **Ahorro estimado:** 0 · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 3). Sin prefijo `test_`; `…_backdoor_eliminated` pasó a `dev_token_is_not_accepted` (sala `room-dev-token`), `test_sse_realtime_head_advanced_events` a `sse_signals_head_advanced` `test_sse_schema_reloaded_event_emission` a `sse_signals_schema_reloaded` y `test_data_plane_sync_and_explicit_ack_pruning` a `data_plane_sync_and_explicit_ack` (no observa la poda).
 
 ## Lo que conviene dejar como está
 

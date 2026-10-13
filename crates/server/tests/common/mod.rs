@@ -5,6 +5,7 @@
 // Every file in `tests/` is a crate of its own that uses only part of this module.
 #![allow(dead_code)]
 
+use futures::{Stream, StreamExt};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::{Method, StatusCode};
 use std::net::SocketAddr;
@@ -349,6 +350,23 @@ pub async fn assert_binary_error(resp: reqwest::Response, status: StatusCode, co
         Ok(ServerMessage::Error { code: actual, .. }) => assert_eq!(actual, code),
         other => panic!("expected a binary error frame, got {other:?}"),
     }
+}
+
+/// Reads an SSE byte stream until the received text contains `needle`, returning all of it.
+pub async fn read_sse_until(
+    stream: &mut (impl Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin),
+    needle: &str,
+) -> String {
+    let mut text = String::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !text.contains(needle) {
+            let chunk = stream.next().await.expect("SSE stream closed").unwrap();
+            text.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("SSE never sent {needle:?}; received: {text}"));
+    text
 }
 
 /// Asserts a JSON error body with the given status and `code`.
