@@ -1,11 +1,14 @@
 use super::*;
+use crate::actor::test_support::seq;
 use crate::durable;
 use crate::fail_point;
 use std::collections::HashSet;
 use tempfile::tempdir;
 
-fn seq(n: u64) -> SequenceNumber {
-    SequenceNumber::new(n)
+/// Backdates the last heartbeat of `client` by `secs` seconds.
+fn set_inactive_for(tracker: &mut ClientLeaseTracker, client: &ClientId, secs: u64) {
+    tracker.get_client_mut(client).unwrap().last_heartbeat =
+        Instant::now() - Duration::from_secs(secs);
 }
 
 fn persisted_cursor(path: &Path, client_id: &ClientId) -> Option<SequenceNumber> {
@@ -269,8 +272,7 @@ fn disconnected_client_inside_the_log_stays_disconnected_by_default() {
     tracker
         .register_client(&client, Some(seq(5)), seq(1))
         .unwrap();
-    tracker.get_client_mut(&client).unwrap().last_heartbeat =
-        Instant::now() - Duration::from_secs(120);
+    set_inactive_for(&mut tracker, &client, 120);
 
     tracker.check_timeouts(Duration::from_secs(5), None, Duration::MAX, seq(1));
     tracker.check_timeouts(Duration::from_secs(5), None, Duration::MAX, seq(1));
@@ -293,8 +295,7 @@ fn disconnected_client_becomes_dormant_once_behind_the_log() {
     tracker
         .register_client(&client, Some(seq(5)), seq(1))
         .unwrap();
-    tracker.get_client_mut(&client).unwrap().last_heartbeat =
-        Instant::now() - Duration::from_secs(6);
+    set_inactive_for(&mut tracker, &client, 6);
 
     tracker.check_timeouts(lease, None, Duration::MAX, seq(6));
     assert_eq!(
@@ -327,8 +328,7 @@ fn configured_dormancy_timeout_makes_a_disconnected_client_dormant() {
     tracker
         .register_client(&client, Some(seq(5)), seq(1))
         .unwrap();
-    tracker.get_client_mut(&client).unwrap().last_heartbeat =
-        Instant::now() - Duration::from_secs(30);
+    set_inactive_for(&mut tracker, &client, 30);
 
     tracker.check_timeouts(lease, dormant_after, Duration::MAX, seq(1));
     tracker.check_timeouts(lease, dormant_after, Duration::MAX, seq(1));
@@ -337,8 +337,7 @@ fn configured_dormancy_timeout_makes_a_disconnected_client_dormant() {
         ClientState::Disconnected
     );
 
-    tracker.get_client_mut(&client).unwrap().last_heartbeat =
-        Instant::now() - Duration::from_secs(61);
+    set_inactive_for(&mut tracker, &client, 61);
     tracker.check_timeouts(lease, dormant_after, Duration::MAX, seq(1));
     assert_eq!(
         tracker.get_client(&client).unwrap().state,
@@ -371,8 +370,7 @@ fn uploader_is_the_connected_client_with_the_highest_cursor() {
         .unwrap();
     tracker.register_client(&newcomer, None, seq(5)).unwrap();
     tracker.get_client_mut(&away).unwrap().state = ClientState::Disconnected;
-    tracker.get_client_mut(&older).unwrap().last_heartbeat =
-        Instant::now() - Duration::from_secs(10);
+    set_inactive_for(&mut tracker, &older, 10);
 
     let mut excluded = HashSet::new();
     assert_eq!(tracker.pick_uploader(&excluded), Some(ahead.clone()));
@@ -523,8 +521,7 @@ fn inactivity_survives_reopening_the_roster() {
     tracker
         .register_client(&client, Some(seq(5)), seq(1))
         .unwrap();
-    tracker.get_client_mut(&client).unwrap().last_heartbeat =
-        Instant::now() - Duration::from_secs(100);
+    set_inactive_for(&mut tracker, &client, 100);
     tracker.save().unwrap();
 
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
@@ -589,8 +586,7 @@ fn activity_alone_is_written_only_when_the_room_stops() {
     tracker
         .register_client(&client, Some(seq(5)), seq(1))
         .unwrap();
-    tracker.get_client_mut(&client).unwrap().last_heartbeat =
-        Instant::now() - Duration::from_secs(100);
+    set_inactive_for(&mut tracker, &client, 100);
     tracker.save().unwrap();
 
     // A heartbeat that changes neither the state nor the cursor.
@@ -630,8 +626,7 @@ fn dormant_client_is_forgotten_after_its_ttl_from_a_compact_roster() {
             .unwrap();
     }
     // Disconnected, then Dormant (its cursor fell behind the log), and kept before its TTL.
-    tracker.get_client_mut(&gone).unwrap().last_heartbeat =
-        Instant::now() - Duration::from_secs(59);
+    set_inactive_for(&mut tracker, &gone, 59);
     for _ in 0..3 {
         tracker.check_timeouts(lease, None, forget_after, seq(5));
     }
@@ -640,8 +635,7 @@ fn dormant_client_is_forgotten_after_its_ttl_from_a_compact_roster() {
         ClientState::Dormant
     );
 
-    tracker.get_client_mut(&gone).unwrap().last_heartbeat =
-        Instant::now() - Duration::from_secs(61);
+    set_inactive_for(&mut tracker, &gone, 61);
     tracker.check_timeouts(lease, None, forget_after, seq(5));
     tracker.persist_if_dirty().unwrap();
     assert!(!tracker.is_registered(&gone) && tracker.is_registered(&active));

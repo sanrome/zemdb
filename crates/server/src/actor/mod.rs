@@ -4,6 +4,10 @@ pub mod manager;
 pub mod room;
 mod snapshot_demand;
 
+#[cfg(test)]
+#[path = "tests/support.rs"]
+mod test_support;
+
 pub use command::{
     CommitResponse, HeartbeatResponse, RegisterResponse, RoomCommand, RoomEvent, RoomMetrics,
     SyncBatchResponse,

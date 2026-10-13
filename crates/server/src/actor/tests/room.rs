@@ -1,35 +1,19 @@
 use super::*;
 use crate::actor::lease::ClientEntry;
 use crate::actor::manager::RoomManager;
+use crate::actor::test_support::{
+    seq, test_manager, test_schema, wait_until, wait_until_async, POLL_CEILING, TEST_TIMINGS,
+};
 use crate::fail_point;
 use crate::log::io_probe::{self, IoEvent};
 use crate::log::RoomLifecycleOverrides;
-use crate::schema_registry::SchemaRegistry;
 use std::fs;
 use std::path::PathBuf;
 use tempfile::{tempdir, TempDir};
 use tokio::sync::oneshot;
 use zemdb_core::id::ClientId;
 use zemdb_core::mutation::Operation;
-use zemdb_core::schema::TableSchema;
-use zemdb_core::value::{DataType, PrimaryKey, RowBuilder, Value};
-
-const POLL_CEILING: Duration = Duration::from_secs(10);
-
-/// Timings of the rooms under test: both maintenance ticks every 500 ms, so that tests waiting
-/// in real time for a tick stay fast.
-const TEST_TIMINGS: ActorTimings = ActorTimings {
-    designation_timeout: DESIGNATION_TIMEOUT,
-    fast_tick: Duration::from_millis(500),
-    slow_tick: Duration::from_millis(500),
-};
-
-fn test_schema() -> Schema {
-    let table = TableSchema::builder("tasks")
-        .primary_key("id", DataType::Int)
-        .column("title", DataType::String);
-    Schema::builder().table(table).build()
-}
+use zemdb_core::value::{PrimaryKey, RowBuilder, Value};
 
 fn insert_op(id: i64) -> Operation {
     let row = RowBuilder::new().set("id", id).set("title", "task").build();
@@ -41,10 +25,6 @@ fn insert_op(id: i64) -> Operation {
 /// An operation on a table the schema does not define, rejected by validation.
 fn invalid_op() -> Operation {
     Operation::delete(999, PrimaryKey::single(Value::Int(1)), 1000)
-}
-
-fn seq(n: u64) -> SequenceNumber {
-    SequenceNumber::new(n)
 }
 
 fn mutation(n: u8) -> MutationId {
@@ -124,29 +104,11 @@ fn new_manager_with(
     dir: &TempDir,
     configure: impl FnOnce(&mut ServerConfig),
 ) -> (RoomManager, Arc<SnapshotRelay>) {
-    let mut config = ServerConfig {
-        data_dir: dir.path().to_path_buf(),
+    test_manager(dir.path(), &["todo"], |config| {
         // Rooms under test stay open unless a test enables the shutdown for inactivity.
-        idle_timeout_secs: 0,
-        ..ServerConfig::default()
-    };
-    configure(&mut config);
-    let config = Arc::new(config);
-    let registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
-    registry
-        .register_schema(SchemaId::new("todo").unwrap(), test_schema())
-        .unwrap();
-    let relay = Arc::new(
-        SnapshotRelay::new(
-            dir.path().join("snapshots"),
-            Duration::from_secs(60),
-            ServerConfig::default().max_snapshot_bytes,
-        )
-        .unwrap(),
-    );
-    let mut manager = RoomManager::new(config, registry, Arc::clone(&relay));
-    manager.set_timings(TEST_TIMINGS);
-    (manager, relay)
+        config.idle_timeout_secs = 0;
+        configure(config);
+    })
 }
 
 async fn register(sender: &mpsc::Sender<RoomCommand>, client_id: &ClientId) {
@@ -307,18 +269,11 @@ async fn commit_only_client_advances_retention_floor() {
         .unwrap();
     }
 
-    let deadline = tokio::time::Instant::now() + POLL_CEILING;
-    loop {
-        let tail = metrics(&sender).await.tail_seq;
-        if tail > seq(1) {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "retention floor never advanced (tail_seq {tail})"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let sender_ref = &sender;
+    wait_until_async("the retention floor advances", move || async move {
+        metrics(sender_ref).await.tail_seq > seq(1)
+    })
+    .await;
     fx.manager.shutdown_all().await;
 }
 
@@ -335,14 +290,10 @@ async fn cursor_advance_is_persisted_by_maintenance_tick() {
         .await
         .unwrap();
 
-    let deadline = tokio::time::Instant::now() + POLL_CEILING;
-    while fx.persisted_cursor(&client) != Some(seq(1)) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "cursor was never persisted"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_until("the cursor is persisted", || {
+        fx.persisted_cursor(&client) == Some(seq(1))
+    })
+    .await;
     fx.manager.shutdown_all().await;
 }
 
@@ -1322,14 +1273,11 @@ async fn demand_that_is_not_renewed_expires() {
     assert!(snapshot_wanted(&sender, &writer).await);
 
     // Heartbeats of the designee do not renew the demand.
-    let deadline = tokio::time::Instant::now() + POLL_CEILING;
-    while snapshot_wanted(&sender, &writer).await {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the demand never expired"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let (sender_ref, writer_ref) = (&sender, &writer);
+    wait_until_async("the demand expires", move || async move {
+        !snapshot_wanted(sender_ref, writer_ref).await
+    })
+    .await;
     assert!(started.elapsed() >= Duration::from_secs(1));
 
     // The bootstrapping client asks again.

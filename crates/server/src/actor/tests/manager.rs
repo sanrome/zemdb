@@ -1,47 +1,13 @@
 use super::*;
+use crate::actor::test_support::{test_manager, test_schema, wait_until, POLL_CEILING};
 use crate::durable;
 use crate::fail_point;
 use std::time::Duration;
 use tempfile::{tempdir, TempDir};
-use zemdb_core::schema::{Schema, TableSchema};
 use zemdb_core::value::DataType;
 
-fn test_schema() -> Schema {
-    let table = TableSchema::builder("tasks")
-        .primary_key("id", DataType::Int)
-        .column("title", DataType::String);
-    Schema::builder().table(table).build()
-}
-
 fn new_manager(dir: &TempDir) -> RoomManager {
-    let config = Arc::new(ServerConfig {
-        data_dir: dir.path().to_path_buf(),
-        ..ServerConfig::default()
-    });
-    let registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
-    // A manager reopened on the same directory (a restart) finds the schemas already there.
-    for id in ["first", "second"] {
-        let id = SchemaId::new(id).unwrap();
-        if registry.get_schema(&id).is_none() {
-            registry.register_schema(id, test_schema()).unwrap();
-        }
-    }
-    let relay = Arc::new(
-        SnapshotRelay::new(
-            dir.path().join("snapshots"),
-            Duration::from_secs(60),
-            ServerConfig::default().max_snapshot_bytes,
-        )
-        .unwrap(),
-    );
-    let mut manager = RoomManager::new(config, registry, relay);
-    // Both maintenance ticks every 500 ms, so that tests waiting in real time stay fast.
-    manager.set_timings(ActorTimings {
-        fast_tick: Duration::from_millis(500),
-        slow_tick: Duration::from_millis(500),
-        ..ActorTimings::default()
-    });
-    manager
+    test_manager(dir.path(), &["first", "second"], |_| {}).0
 }
 
 fn meta_room_path(dir: &TempDir, room_id: &RoomId) -> PathBuf {
@@ -276,17 +242,6 @@ async fn log_bounds_of_a_stalled_actor_times_out() {
         .await
         .expect("log_bounds must give up on a stalled actor");
     assert!(matches!(result, Err(ServerError::Timeout(_))), "{result:?}");
-}
-
-const POLL_CEILING: Duration = Duration::from_secs(10);
-
-/// Polls `condition` until it holds, failing the test after [`POLL_CEILING`].
-async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
-    let deadline = tokio::time::Instant::now() + POLL_CEILING;
-    while !condition() {
-        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 }
 
 fn room_dir(dir: &TempDir, room_id: &RoomId) -> PathBuf {
