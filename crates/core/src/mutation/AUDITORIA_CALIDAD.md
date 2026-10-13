@@ -34,12 +34,14 @@
 - `op.rs:60`: "100% stack-allocated, zero heap pointers, aligned to 8 bytes." es **falso**. `OperationKind::Insert` contiene un `CompactRow` (un `Vec`), `Update` un `Vec<ColumnUpdate>`, `Value::String`/`Bytes` son `Box`, y `PrimaryKey` puede desbordar al heap. Hay que borrar la frase.
 - `op.rs:59`: el desglose "2B table_id + 6B padding + 8B timestamp + …" supone un layout que Rust no garantiza (reordena campos). Lo verificable es el total, 88 bytes, que asserta `crates/core/tests/types_memory_tests.rs:10`. Basta con "88 bytes (asserted in `types_memory_tests`)". Lo mismo vale para `op.rs:7` y `op.rs:41`.
 - `op.rs:47-48`: "Updates are maintained strictly sorted by `column_idx` ascending". `Operation::new`/`update` ordenan con `sort_by_key`, pero no eliminan duplicados, así que el orden **estricto** solo lo garantiza `UpdateBuilder::set` o la validación (`schema/validation.rs:335`). Propuesta: "Constructors sort deltas by `column_idx`; [`Schema::validate_operation`] rejects duplicates."
+- **Estado:** ✅ aplicada (paso 1)
 
 **Recortar:**
 - `buffer.rs:21-35` (15 líneas): los párrafos 2 y 3 repiten que la clave de cada entrada es la PK de su operación (líneas 27-28 y 30-31). Fusionados quedan en ~11 líneas.
 - `buffer.rs:126-128`: el párrafo sobre cuándo se clona la PK es un detalle de implementación. Alcanza con un `//` de una línea junto al brazo `None =>` (`buffer.rs:151`), o con eliminarlo.
 - `op.rs:46-48`: el doc de `Update` mezcla la descripción de la variante con dos reglas. Con la corrección anterior queda en 2 líneas.
 - `squash.rs:16`: `$O(M+N)$` es notación LaTeX que rustdoc no renderiza; queda mejor `O(M+N)`. Lo mismo pasa en `schema/validation.rs:434`, fuera de alcance.
+- **Estado:** ✅ aplicada (paso 1). El doc de `Update` quedó en 4 líneas porque conserva la nota sobre `MAX_COLUMNS` y el enlace a `validate_operation`.
 
 ## Sugerencias
 
@@ -63,6 +65,7 @@
   El comportamiento es idéntico: `new` solo ordena `Update` (el mismo `sort_by_key` estable), y para `Insert`/`Delete` el resultado es el mismo literal. Hay 159 llamadas a estos constructores en el workspace y ninguna firma cambia.
 - **Ahorro estimado:** ~20 líneas · **Riesgo:** bajo · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ✅ confirmada — `new` (`op.rs:79-93`) ya ordena solo `Update` con el mismo `sort_by_key` estable y devuelve el mismo literal; `insert`/`update`/`delete` (`95-128`) producen el mismo valor delegando. El `if let … = &mut kind` con `mut kind` compila y equivale al `match` actual.
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q2. `Serialize` de `TableBuffer` derivado con `serialize_with`
 - **Dónde:** `buffer.rs:42-63` (y el import `SerializeStruct` en `buffer.rs:6`).
@@ -87,6 +90,7 @@
   La salida es idéntica: el derive emite `serialize_struct("TableBuffer", 2)` con `table_id` y `pending` en ese orden, y `pending` pasa por `collect_seq(values())`, igual que hoy. El `Deserialize` manual no cambia. Lo cubren los round-trips de `crates/core/tests/squashing_rules_tests.rs:282,333`.
 - **Ahorro estimado:** ~12–14 líneas · **Riesgo:** bajo · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ⚠️ corregida — la equivalencia de bytes se sostiene (el derive emite `serialize_struct("TableBuffer", 2)`, campos `table_id` y `pending` en ese orden, y `serialize_with` llama a `collect_seq(values())`; `Serializer` sigue importado, solo sobra `SerializeStruct`). Pero las líneas de test citadas están mal: `squashing_rules_tests.rs:282` y `:330-333` serializan el espejo `RawTableBuffer`, no `TableBuffer`; el round-trip real de `TableBuffer` es `squashing_rules_tests.rs:248`.
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q3. Simplificar la validación del `Deserialize` de `TableBuffer`
 - **Dónde:** `buffer.rs:85-98`.
@@ -100,22 +104,26 @@
   Ante un error se descarta el mapa entero, así que insertar antes de detectar el duplicado no es observable. El mensaje no cambia. Para el orden, `if let OperationKind::Update { updates } = &op.kind` + `if` se puede colapsar en `matches!`/`let-else`, o usar `!updates.is_sorted_by(|a, b| a.column_idx < b.column_idx)` (**a verificar:** requiere Rust ≥ 1.82, y el repo no fija `rust-version` ni toolchain).
 - **Ahorro estimado:** ~2–4 líneas · **Riesgo:** bajo · **Prioridad:** baja
 - **Nota:** el `insert(..).is_some()` tiene que ir en el mismo lugar que el `contains_key` actual, es decir, después del chequeo de orden de deltas. Así una operación con los dos problemas (deltas desordenados y PK repetida) sigue informando el error de deltas, como hoy.
+- **Estado:** ✅ aplicada (paso 1): `insert(..).is_some()` en el lugar del `contains_key` (después del chequeo de deltas) y `is_sorted_by` para el orden (estable desde Rust 1.82, dentro del MSRV 1.85).
 
 ### Q4. Corregir y condensar la doc de tamaños y orden
 - **Dónde:** `op.rs:5-7`, `op.rs:39-41`, `op.rs:57-61`, `op.rs:47-48`.
 - **Propuesta:** ver la sección Comentarios: borrar la frase falsa de `op.rs:60`, reemplazar los desgloses de padding por una referencia al test de tamaños y corregir el "strictly sorted".
 - **Ahorro estimado:** ~3–4 líneas · **Riesgo:** nulo · **Prioridad:** **alta** (no por las líneas, sino porque hoy la doc afirma algo falso)
 - **Verificación (2.ª pasada):** ✅ confirmada — solo doc; líneas 7, 41, 47-48, 59-60 correctas. `op.rs:60` es falso: `PrimaryKey` es `SmallVec<[Value; 1]>` (desborda al heap), `CompactRow` contiene un `Vec`, `Value::String/Bytes` son `Box`. Los totales (32/32/88) están asertados en `tests/types_memory_tests.rs:8-10`.
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q5. Condensar la doc de `TableBuffer` y de `apply`
 - **Dónde:** `buffer.rs:21-35` y `buffer.rs:126-128`.
 - **Propuesta:** fusionar los párrafos que repiten la relación clave↔PK y reducir la nota sobre el clon de la PK a un `//` junto al brazo `None` (o eliminarla).
 - **Ahorro estimado:** ~5–6 líneas · **Riesgo:** nulo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q6. Menores
 - `squash.rs:32-35`: `` `check_operation_size` `` puede ser un enlace intra-doc (`[`check_operation_size`](crate::protocol::limits::check_operation_size)`); así rustdoc lo valida si se renombra.
 - `op.rs:172-206` (`UpdateBuilder::set`): `retain` + `push` es O(n²) en el número de columnas. Es correcto y n es chico; no hace falta tocarlo, solo lo dejo anotado.
 - `buffer.rs:134-141`: el `TableIdMismatch` se construye a mano, igual que en `schema/validation.rs:437-441` (con `expected`/`actual` en roles distintos). Un helper ahorraría 2–3 líneas, pero no lo recomiendo: los dos sitios tienen semánticas diferentes.
+- **Estado:** ✅ aplicada en parte (paso 1): `check_operation_size` es un enlace intra-doc (vía el reexport `crate::protocol::check_operation_size`). ⏭️ los otros dos puntos no se aplican: el propio informe recomienda no tocarlos.
 
 ## Lo que conviene dejar como está
 - **`squash.rs` completo:** `merge_sorted_column_updates` (12 líneas, O(M+N) sin índices) y `squash_operations` ya son mínimos. El `return` dentro del brazo `Delete/Update` (`squash.rs:42-44`) importa: evita actualizar el `timestamp` en el caso incompatible, de modo que la operación pendiente queda intacta, tal como promete `buffer.rs:122-124`. El `resize` de `squash.rs:48-50` también se queda: `squash_operations` es `pub` y no puede asumir operaciones validadas.

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Atomic column update targeting a specific column by its positional DDL index.
 ///
-/// Bounded to 32 bytes (2B column_idx + 6B padding + 24B Value).
+/// 32 bytes (asserted in `types_memory_tests`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ColumnUpdate {
     pub(crate) column_idx: u16,
@@ -38,14 +38,15 @@ impl ColumnUpdate {
 
 /// Specific mutation variant payload.
 ///
-/// Memory footprint is strictly bounded to 32 bytes (max payload 24 bytes + 1 byte tag + 7 bytes padding).
+/// 32 bytes (asserted in `types_memory_tests`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OperationKind {
     /// Inserts a tuple. If the PK already exists, replaces all fields (upsert).
     Insert { row: CompactRow },
-    /// Updates specific fields of an existing tuple by PK.
-    /// Updates are maintained strictly sorted by `column_idx` ascending. Deserialization
-    /// rejects more than [`MAX_COLUMNS`](crate::schema::MAX_COLUMNS) deltas.
+    /// Updates specific fields of an existing tuple by PK. Constructors sort deltas by
+    /// `column_idx`; [`Schema::validate_operation`](crate::schema::Schema::validate_operation)
+    /// rejects duplicates. Deserialization rejects more than
+    /// [`MAX_COLUMNS`](crate::schema::MAX_COLUMNS) deltas.
     Update {
         #[serde(deserialize_with = "deserialize_columns")]
         updates: Vec<ColumnUpdate>,
@@ -56,8 +57,7 @@ pub enum OperationKind {
 
 /// Fully self-describing mutation operation with table ID.
 ///
-/// Occupies exactly 88 bytes in memory (2B table_id + 6B padding + 8B timestamp + 40B pk + 32B kind).
-/// 100% stack-allocated, zero heap pointers, aligned to 8 bytes.
+/// 88 bytes (asserted in `types_memory_tests`).
 ///
 /// The fields are read through accessors and are not mutable from outside the crate. The
 /// constructors keep update deltas sorted by `column_idx`. This does not make every
@@ -78,14 +78,10 @@ pub struct Operation {
 impl Operation {
     /// Builds an operation of any kind. Update deltas are sorted by `column_idx`, as in
     /// [`Operation::update`].
-    pub fn new(table_id: u16, pk: PrimaryKey, timestamp: u64, kind: OperationKind) -> Self {
-        let kind = match kind {
-            OperationKind::Update { mut updates } => {
-                updates.sort_by_key(|u| u.column_idx);
-                OperationKind::Update { updates }
-            }
-            other => other,
-        };
+    pub fn new(table_id: u16, pk: PrimaryKey, timestamp: u64, mut kind: OperationKind) -> Self {
+        if let OperationKind::Update { updates } = &mut kind {
+            updates.sort_by_key(|u| u.column_idx);
+        }
         Self {
             table_id,
             timestamp,
@@ -95,36 +91,20 @@ impl Operation {
     }
 
     pub fn insert(table_id: u16, pk: PrimaryKey, row: CompactRow, timestamp: u64) -> Self {
-        Self {
-            table_id,
-            timestamp,
-            pk,
-            kind: OperationKind::Insert { row },
-        }
+        Self::new(table_id, pk, timestamp, OperationKind::Insert { row })
     }
 
     pub fn update(
         table_id: u16,
         pk: PrimaryKey,
-        mut updates: Vec<ColumnUpdate>,
+        updates: Vec<ColumnUpdate>,
         timestamp: u64,
     ) -> Self {
-        updates.sort_by_key(|u| u.column_idx);
-        Self {
-            table_id,
-            timestamp,
-            pk,
-            kind: OperationKind::Update { updates },
-        }
+        Self::new(table_id, pk, timestamp, OperationKind::Update { updates })
     }
 
     pub fn delete(table_id: u16, pk: PrimaryKey, timestamp: u64) -> Self {
-        Self {
-            table_id,
-            timestamp,
-            pk,
-            kind: OperationKind::Delete,
-        }
+        Self::new(table_id, pk, timestamp, OperationKind::Delete)
     }
 
     #[inline]

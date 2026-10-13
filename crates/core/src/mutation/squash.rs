@@ -13,7 +13,7 @@ pub enum SquashOutcome {
     Incompatible,
 }
 
-/// Merges `incoming` into `existing`, both sorted by `column_idx`, in $O(M+N)$; a column in
+/// Merges `incoming` into `existing`, both sorted by `column_idx`, in O(M+N); a column in
 /// both takes the incoming value.
 pub fn merge_sorted_column_updates(existing: &mut Vec<ColumnUpdate>, incoming: Vec<ColumnUpdate>) {
     let mut merged = Vec::with_capacity(existing.len() + incoming.len());
@@ -31,7 +31,8 @@ pub fn merge_sorted_column_updates(existing: &mut Vec<ColumnUpdate>, incoming: V
 
 /// Squashes `incoming` into `existing`, the pending operation for the same table and primary
 /// key, so that sending the result is equivalent to sending both in the order they arrived,
-/// provided it is not too large to send (see `check_operation_size`): the incoming operation
+/// provided it is not too large to send (see
+/// [`check_operation_size`](crate::protocol::check_operation_size)): the incoming operation
 /// always wins. Timestamps are only metadata; the result takes the incoming one.
 pub fn squash_operations(existing: &mut Operation, incoming: Operation) -> SquashOutcome {
     if existing.table_id != incoming.table_id || existing.pk != incoming.pk {

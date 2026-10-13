@@ -3,7 +3,6 @@ use super::squash::{squash_operations, SquashOutcome};
 use crate::schema::{TableSchema, ValidationError};
 use crate::value::PrimaryKey;
 use serde::de;
-use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashMap;
 
@@ -27,39 +26,23 @@ pub enum BufferError {
 /// entry is stored under its operation's own primary key, and every operation targets the
 /// buffer's table.
 ///
-/// Serialized form: `{"table_id": .., "pending": [operation, ...]}`. The key of each entry is
-/// the operation's own primary key, so it is not serialized separately. Deserialization
-/// rejects an operation of another table, a repeated primary key, and update deltas that are
-/// not strictly ascending by column index (squashing merges deltas relying on that order). It
-/// does not replay the squashing rules, so it trusts that the serialized buffer was built by
-/// `apply`.
-#[derive(Debug, Clone, PartialEq, Default)]
+/// Serialized form: `{"table_id": .., "pending": [operation, ...]}`. Deserialization rejects an
+/// operation of another table, a repeated primary key, and update deltas that are not strictly
+/// ascending by column index (squashing merges deltas relying on that order). It does not
+/// replay the squashing rules, so it trusts that the serialized buffer was built by `apply`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
 pub struct TableBuffer {
     table_id: u16,
+    /// Serialized as the sequence of operations: each one carries its own key.
+    #[serde(serialize_with = "serialize_pending")]
     pending: HashMap<PrimaryKey, Operation>,
 }
 
-impl Serialize for TableBuffer {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        struct Pending<'a>(&'a HashMap<PrimaryKey, Operation>);
-
-        impl Serialize for Pending<'_> {
-            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-            where
-                S: Serializer,
-            {
-                serializer.collect_seq(self.0.values())
-            }
-        }
-
-        let mut state = serializer.serialize_struct("TableBuffer", 2)?;
-        state.serialize_field("table_id", &self.table_id)?;
-        state.serialize_field("pending", &Pending(&self.pending))?;
-        state.end()
-    }
+fn serialize_pending<S: Serializer>(
+    pending: &HashMap<PrimaryKey, Operation>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(pending.values())
 }
 
 impl<'de> Deserialize<'de> for TableBuffer {
@@ -83,19 +66,15 @@ impl<'de> Deserialize<'de> for TableBuffer {
                 )));
             }
             if let OperationKind::Update { updates } = &op.kind {
-                if updates
-                    .windows(2)
-                    .any(|pair| pair[0].column_idx >= pair[1].column_idx)
-                {
+                if !updates.is_sorted_by(|a, b| a.column_idx < b.column_idx) {
                     return Err(de::Error::custom(
                         "pending update deltas must be strictly ascending by column index",
                     ));
                 }
             }
-            if pending.contains_key(&op.pk) {
+            if pending.insert(op.pk.clone(), op).is_some() {
                 return Err(de::Error::custom("pending operations repeat a primary key"));
             }
-            pending.insert(op.pk.clone(), op);
         }
         Ok(TableBuffer {
             table_id: helper.table_id,
@@ -122,10 +101,6 @@ impl TableBuffer {
     /// the schema of another table) is `BufferError::Invalid` and an incompatible one
     /// `IncompatibleOperation`; either leaves the buffer unchanged. Only valid operations are
     /// kept, so a buffer built by `apply` always deserializes again.
-    ///
-    /// The pending entry is looked up by reference, so squashing into an existing entry never
-    /// clones the primary key; a new entry clones it once (the map key and the stored
-    /// operation each own one).
     pub fn apply(
         &mut self,
         table: &TableSchema,
@@ -149,6 +124,7 @@ impl TableBuffer {
                 outcome => Ok(outcome),
             },
             None => {
+                // Only a new entry clones the key: the map and the operation each own one.
                 self.pending.insert(op.pk.clone(), op);
                 Ok(SquashOutcome::Replaced)
             }
