@@ -2,9 +2,11 @@ use crate::durable;
 use crate::error::ServerError;
 use crate::fail_point;
 use crate::log::budget::ReadBudget;
-use crate::log::io_probe::{self, IoEvent};
-use crate::log::segment_reader::{classify_in, read_frames, read_full};
-use crate::log::warm_disk::{parse_segment_filename, RecoveredLogData};
+use crate::log::io_probe::IoEvent;
+use crate::log::segment_index::{parse_segment_filename, Tier};
+use crate::log::segment_reader::{
+    classify_in, open_segment, read_frames, read_full, RecoveredLogData,
+};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::Path;
@@ -63,7 +65,7 @@ impl ColdDiskLog {
         let range = warm_path
             .file_name()
             .and_then(|name| name.to_str())
-            .and_then(|name| parse_segment_filename(name, ".wal"));
+            .and_then(|name| parse_segment_filename(name, Tier::Warm));
         let warm_digest = match compress_to(warm_path, &tmp_path, range) {
             Ok(digest) => digest,
             Err(err) => {
@@ -279,17 +281,8 @@ pub(crate) fn read_cold_file(
     from_seq: SequenceNumber,
     budget: &mut ReadBudget,
 ) -> Result<RecoveredLogData, ServerError> {
-    if budget.is_exhausted() {
+    let Some(file) = open_segment(path, IoEvent::SegmentRead, budget)? else {
         return Ok(Default::default());
-    }
-    io_probe::record(
-        IoEvent::SegmentRead,
-        path.parent().unwrap_or_else(|| Path::new("")),
-    );
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Default::default()),
-        Err(e) => return Err(e.into()),
     };
     let mut decoder = open_decoder(file)?;
     let read =

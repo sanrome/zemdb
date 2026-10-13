@@ -6,8 +6,9 @@ use crate::log::cold_disk::{read_cold_file, ColdDiskLog, CompressedSegment};
 use crate::log::hot_buffer::HotBuffer;
 use crate::log::policy::RoomLifecyclePolicy;
 use crate::log::retention;
-use crate::log::segment_index::{cold_segment_path, SegmentEntry, SegmentIndex, Tier};
-use crate::log::warm_disk::{read_segment_file, RecoveredLogData, WarmDiskLog};
+use crate::log::segment_index::{segment_path, SegmentEntry, SegmentIndex, Tier};
+use crate::log::segment_reader::RecoveredLogData;
+use crate::log::warm_disk::{read_segment_file, WarmDiskLog};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -330,7 +331,7 @@ impl TieredLog {
             let ops = self
                 .warm_disk
                 .read_active_range(batch.cursor, &mut batch.budget)
-                .map_err(|err| unreadable_range(&self.segments_dir.join("active.wal"), err))?;
+                .map_err(|err| unreadable_range(&self.warm_disk.active_path(), err))?;
             batch.extend("active wal", ops)?;
         }
         Ok(())
@@ -356,8 +357,12 @@ impl TieredLog {
         let mut first_error = None;
 
         for segment in self.warm_segments_due(clock.wall) {
-            let cold_path =
-                cold_segment_path(&self.segments_dir, segment.start_seq, segment.end_seq);
+            let cold_path = segment_path(
+                &self.segments_dir,
+                segment.start_seq,
+                segment.end_seq,
+                Tier::Cold,
+            );
             let result = ColdDiskLog::compress_warm_segment(&segment.path, &cold_path).await;
             if let Err(err) =
                 self.record_compression(segment, cold_path, result, clock, &mut report)

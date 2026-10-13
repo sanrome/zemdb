@@ -2,9 +2,11 @@ use crate::durable;
 use crate::error::ServerError;
 use crate::fail_point;
 use crate::log::budget::ReadBudget;
-use crate::log::io_probe::{self, IoEvent};
-use crate::log::segment_index::warm_segment_path;
-use crate::log::segment_reader::{classify_in, read_frames, FrameRead};
+use crate::log::io_probe::IoEvent;
+use crate::log::segment_index::{segment_path, Tier};
+use crate::log::segment_reader::{
+    classify_in, open_segment, read_frames, FrameRead, RecoveredLogData,
+};
 use fs2::FileExt;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
@@ -12,9 +14,6 @@ use std::path::{Path, PathBuf};
 use zemdb_core::id::{MutationId, SequenceNumber};
 use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::protocol::wal_frame::encode_wal_record;
-
-/// Operations and mutation assignment pairs recovered from disk segments.
-pub type RecoveredLogData = (Vec<SequencedOperation>, Vec<(MutationId, SequenceNumber)>);
 
 /// Name of the active segment inside the segments directory.
 const ACTIVE_SEGMENT: &str = "active.wal";
@@ -70,20 +69,11 @@ impl WarmDiskLog {
         op: &SequencedOperation,
         mutation_id: Option<MutationId>,
     ) -> Result<(), ServerError> {
-        let active_path = self.segments_dir.join(ACTIVE_SEGMENT);
+        let active_path = self.active_path();
 
         if self.active_file.is_none() {
             let created = !active_path.exists();
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&active_path)?;
-
-            file.try_lock_exclusive().map_err(|e| {
-                ServerError::RoomLocked(format!("active.wal locked by another process: {}", e))
-            })?;
+            let file = open_active_locked(&active_path, true)?;
             // A file left behind by a failed rotation still holds its records; append after them.
             self.active_len = file.metadata()?.len();
             self.active_file = Some(file);
@@ -149,6 +139,11 @@ impl WarmDiskLog {
         self.active_file.as_ref()
     }
 
+    /// Path of `active.wal`.
+    pub(crate) fn active_path(&self) -> PathBuf {
+        self.segments_dir.join(ACTIVE_SEGMENT)
+    }
+
     /// Rotates and seals `active.wal` into an immutable `segment_{start}_{end}.wal` file.
     pub fn rotate_active_segment(&mut self) -> Result<Option<PathBuf>, ServerError> {
         let (Some(start), Some(end)) = (self.active_start_seq, self.active_end_seq) else {
@@ -161,8 +156,8 @@ impl WarmDiskLog {
             file.sync_all()?;
         }
 
-        let active_path = self.segments_dir.join(ACTIVE_SEGMENT);
-        let sealed_path = warm_segment_path(&self.segments_dir, start, end);
+        let active_path = self.active_path();
+        let sealed_path = segment_path(&self.segments_dir, start, end, Tier::Warm);
 
         let renamed = active_path.exists();
         if renamed {
@@ -202,29 +197,21 @@ impl WarmDiskLog {
             from_seq,
             budget,
         )?;
-        let path = self.segments_dir.join(ACTIVE_SEGMENT);
         // Appends are synced and recovery truncates a torn tail, so a torn write here means
         // the file was damaged while the room was open.
+        let path = self.active_path();
         Ok(finish_file_read(read, reader.get_mut(), self.active_len, &path)?.0)
     }
 
     /// Inspects and repairs `active.wal` upon opening, reading it through the locked handle
     /// that later appends use, and returns its operations and mutation IDs.
     fn inspect_active_segment(&mut self) -> Result<RecoveredLogData, ServerError> {
-        let active_path = self.segments_dir.join(ACTIVE_SEGMENT);
+        let active_path = self.active_path();
         if !active_path.exists() {
             return Ok(Default::default());
         }
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&active_path)?;
-
-        file.try_lock_exclusive().map_err(|e| {
-            ServerError::RoomLocked(format!("active.wal locked by another process: {}", e))
-        })?;
-
+        let file = open_active_locked(&active_path, false)?;
         let len = file.metadata()?.len();
         let mut reader = BufReader::with_capacity(READ_BUFFER, &file);
         let read = read_frames(
@@ -263,6 +250,21 @@ impl WarmDiskLog {
     }
 }
 
+/// Opens `active.wal` at `path` for reading and writing, creating it if `create` is set, and
+/// takes its exclusive lock.
+fn open_active_locked(path: &Path, create: bool) -> Result<File, ServerError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false)
+        .open(path)?;
+    file.try_lock_exclusive().map_err(|e| {
+        ServerError::RoomLocked(format!("active.wal locked by another process: {}", e))
+    })?;
+    Ok(file)
+}
+
 /// Reads the operations after `from_seq` that fit in `budget` from the sealed `.wal` file at
 /// `path`, whose first operation is `start_seq`, streaming it. A missing file yields nothing;
 /// the caller detects the gap it leaves.
@@ -272,19 +274,13 @@ pub(crate) fn read_segment_file(
     from_seq: SequenceNumber,
     budget: &mut ReadBudget,
 ) -> Result<RecoveredLogData, ServerError> {
-    if budget.is_exhausted() {
-        return Ok(Default::default());
-    }
-    let dir = path.parent().unwrap_or_else(|| Path::new(""));
-    if path.file_name().is_some_and(|name| name == ACTIVE_SEGMENT) {
-        io_probe::record(IoEvent::ActiveWalPathRead, dir);
+    let event = if path.file_name().is_some_and(|name| name == ACTIVE_SEGMENT) {
+        IoEvent::ActiveWalPathRead
     } else {
-        io_probe::record(IoEvent::SegmentRead, dir);
-    }
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
-        Err(e) => return Err(e.into()),
+        IoEvent::SegmentRead
+    };
+    let Some(file) = open_segment(path, event, budget)? else {
+        return Ok(Default::default());
     };
     let len = file.metadata()?.len();
     let mut reader = BufReader::with_capacity(READ_BUFFER, file);
@@ -305,22 +301,6 @@ fn finish_file_read(
         tracing::warn!(path = ?path, valid_bytes = at, %reason, "Torn write detected while reading WAL segment");
     }
     Ok((read.ops, read.mutations))
-}
-
-/// `(start, end)` of a `segment_{start}_{end}{extension}` file name.
-pub fn parse_segment_filename(name: &str, extension: &str) -> Option<(u64, u64)> {
-    let prefix = "segment_";
-    if !name.starts_with(prefix) || !name.ends_with(extension) {
-        return None;
-    }
-    let core = &name[prefix.len()..name.len() - extension.len()];
-    let parts: Vec<&str> = core.split('_').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let start = parts[0].parse::<u64>().ok()?;
-    let end = parts[1].parse::<u64>().ok()?;
-    Some((start, end))
 }
 
 #[cfg(test)]

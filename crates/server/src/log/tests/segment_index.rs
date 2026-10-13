@@ -8,8 +8,16 @@ fn seq(n: u64) -> SequenceNumber {
 #[test]
 fn scan_indexes_both_tiers_in_sequence_order_and_ignores_other_files() {
     let dir = tempdir().unwrap();
-    std::fs::write(cold_segment_path(dir.path(), seq(1), seq(5)), [0u8; 10]).unwrap();
-    std::fs::write(warm_segment_path(dir.path(), seq(6), seq(10)), [0u8; 20]).unwrap();
+    std::fs::write(
+        segment_path(dir.path(), seq(1), seq(5), Tier::Cold),
+        [0u8; 10],
+    )
+    .unwrap();
+    std::fs::write(
+        segment_path(dir.path(), seq(6), seq(10), Tier::Warm),
+        [0u8; 20],
+    )
+    .unwrap();
     std::fs::write(dir.path().join("active.wal"), [0u8; 40]).unwrap();
     std::fs::write(dir.path().join("segment_garbage.wal"), [0u8; 80]).unwrap();
 

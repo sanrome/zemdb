@@ -7,7 +7,9 @@
 //! frames before it. The payloads skipped this way are not checked against their checksum;
 //! recovery and compression check them.
 
+use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::path::Path;
 
 use zemdb_core::id::{MutationId, SequenceNumber};
 use zemdb_core::protocol::messages::SequencedOperation;
@@ -18,6 +20,10 @@ use zemdb_core::protocol::wal_frame::{
 
 use crate::error::ServerError;
 use crate::log::budget::{op_bytes, ReadBudget};
+use crate::log::io_probe::{self, IoEvent};
+
+/// Operations and mutation assignment pairs recovered from disk segments.
+pub type RecoveredLogData = (Vec<SequencedOperation>, Vec<(MutationId, SequenceNumber)>);
 
 /// A reader of frames that can skip bytes.
 pub(crate) trait FrameSource: Read {
@@ -48,6 +54,25 @@ pub(crate) struct FrameRead {
     pub(crate) mutations: Vec<(MutationId, SequenceNumber)>,
     /// The frame that could not be read and its offset, if the reading stopped at one.
     pub(crate) anomaly: Option<(u64, FrameAnomaly)>,
+}
+
+/// The segment file at `path`, opened for a read within `budget` after recording `event`:
+/// `None` if the budget is exhausted or the file is missing (the caller detects the gap it
+/// leaves).
+pub(crate) fn open_segment(
+    path: &Path,
+    event: IoEvent,
+    budget: &ReadBudget,
+) -> Result<Option<File>, ServerError> {
+    if budget.is_exhausted() {
+        return Ok(None);
+    }
+    io_probe::record(event, path.parent().unwrap_or_else(|| Path::new("")));
+    match File::open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Reads until `buf` is full or the source ends, and returns the bytes read.

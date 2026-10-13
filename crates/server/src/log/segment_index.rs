@@ -1,17 +1,10 @@
 use crate::durable;
 use crate::error::ServerError;
 use crate::log::io_probe::{self, IoEvent};
-use crate::log::warm_disk::parse_segment_filename;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use zemdb_core::id::SequenceNumber;
-
-/// Extension of a sealed, uncompressed (warm) segment.
-const WARM_EXTENSION: &str = ".wal";
-
-/// Extension of a compressed (cold) segment.
-const COLD_EXTENSION: &str = ".wal.zst";
 
 /// Storage tier of a sealed segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +21,14 @@ impl Tier {
         match self {
             Tier::Warm => "warm sealed",
             Tier::Cold => "cold",
+        }
+    }
+
+    /// Extension of the tier's segment files.
+    pub(crate) fn extension(self) -> &'static str {
+        match self {
+            Tier::Warm => ".wal",
+            Tier::Cold => ".wal.zst",
         }
     }
 }
@@ -83,14 +84,13 @@ impl SegmentIndex {
                 leftovers.push(entry.path());
                 continue;
             }
-            let (tier, extension) = if name.ends_with(COLD_EXTENSION) {
-                (Tier::Cold, COLD_EXTENSION)
-            } else if name.ends_with(WARM_EXTENSION) {
-                (Tier::Warm, WARM_EXTENSION)
-            } else {
+            let Some(tier) = [Tier::Cold, Tier::Warm]
+                .into_iter()
+                .find(|tier| name.ends_with(tier.extension()))
+            else {
                 continue;
             };
-            let Some((start, end)) = parse_segment_filename(&name, extension) else {
+            let Some((start, end)) = parse_segment_filename(&name, tier) else {
                 continue;
             };
             // Queried through the file rather than the listing: on Windows the size a
@@ -178,35 +178,28 @@ impl SegmentIndex {
     }
 }
 
-/// Path of the warm segment holding `start..=end` in `segments_dir`.
-pub(crate) fn warm_segment_path(
+/// Path of the `tier` segment holding `start..=end` in `segments_dir`.
+pub(crate) fn segment_path(
     segments_dir: &Path,
     start: SequenceNumber,
     end: SequenceNumber,
-) -> PathBuf {
-    segment_path(segments_dir, start, end, WARM_EXTENSION)
-}
-
-/// Path of the cold segment holding `start..=end` in `segments_dir`.
-pub(crate) fn cold_segment_path(
-    segments_dir: &Path,
-    start: SequenceNumber,
-    end: SequenceNumber,
-) -> PathBuf {
-    segment_path(segments_dir, start, end, COLD_EXTENSION)
-}
-
-fn segment_path(
-    segments_dir: &Path,
-    start: SequenceNumber,
-    end: SequenceNumber,
-    extension: &str,
+    tier: Tier,
 ) -> PathBuf {
     segments_dir.join(format!(
-        "segment_{:016}_{:016}{extension}",
+        "segment_{:016}_{:016}{}",
         start.get(),
-        end.get()
+        end.get(),
+        tier.extension()
     ))
+}
+
+/// `(start, end)` of a `tier` segment file name, the inverse of [`segment_path`].
+pub(crate) fn parse_segment_filename(name: &str, tier: Tier) -> Option<(u64, u64)> {
+    let core = name
+        .strip_prefix("segment_")?
+        .strip_suffix(tier.extension())?;
+    let (start, end) = core.split_once('_')?;
+    Some((start.parse().ok()?, end.parse().ok()?))
 }
 
 #[cfg(test)]

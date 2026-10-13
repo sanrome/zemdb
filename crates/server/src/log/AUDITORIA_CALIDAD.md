@@ -120,6 +120,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y cambió el mó
   El comportamiento es equivalente: con `split_once`, un tercer `_` queda en `end` y `u64::parse` lo rechaza, igual que el `parts.len() != 2` actual. `strip_*` además evita el slicing manual. `cold_disk.rs:65-68` pasa a ser `parse_segment_path(warm_path, Tier::Warm)`.
 - **Ahorro estimado:** ~10 líneas (sumado a Q1) · **Riesgo:** bajo · **Prioridad:** alta.
 - **Verificación (2.ª pasada):** ✅ confirmada — líneas correctas; `split_once` + `parse` rechaza lo mismo que `parts.len() != 2` (`1_2_3`, `1`, `_`, `+5` se aceptan/rechazan igual). Única diferencia: con prefijo y extensión solapados (p. ej. `segment_x` y `"_x"`) el slicing actual entra en pánico y `strip_*` devuelve `None`; con `.wal`/`.wal.zst` es inalcanzable. Al moverla a `segment_index` (que es `pub(crate)`) desaparece el ciclo de imports `segment_index`→`warm_disk`.
+- **Estado:** ✅ aplicada (paso 2). Recibe el `Tier` en lugar de la extensión (con Q11), así que `parse_segment_path` no hace falta: `cold_disk.rs` pasa `Tier::Warm`.
 
 ### Q3. Derivar `min_seq`/`max_seq` de `HotBuffer` en vez de guardarlos
 - **Dónde:** `hot_buffer.rs:18-19`, `50-62`, `78-84`, `148`, `163`, `166-180`, `197-205`.
@@ -134,6 +135,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y cambió el mó
   La semántica es idéntica: hoy `max_seq` es `None` exactamente cuando la cola está vacía (`after_eviction`), y entre un `pop_front` y `after_eviction` no se lee. De paso, los dos `while let … { if … { pop } else { break } }` (`:140-146`, `:155-161`) pasan a `while self.entries.front().is_some_and(|e| …) { self.pop_front(); }`. En `get_range` (`:96-115`), el chequeo `entries.is_empty()` y el `match self.min_seq` se reducen a un solo `let Some(min) = self.min_seq() else { return Vec::new() };`.
 - **Ahorro estimado:** ~25 líneas · **Riesgo:** bajo · **Prioridad:** alta.
 - **Verificación (2.ª pasada):** ✅ confirmada — los únicos mutadores de `entries` son `push` (vía `append`/`rehydrate`, que actualizan los campos) y `pop_front` (solo en `apply_sliding_window_at` y `evict_older_than`, ambos cierran con `after_eviction`); no hay truncado ni rollback externo (`tiered_log.rs` solo llama `append`, `rehydrate`, `evict_older_than`, `apply_sliding_window`, `get_range`, `min_seq`). Buffer vaciado por desalojo: hoy `max_seq = None` y `append` acepta cualquier `seq`; derivado de `back()` ocurre lo mismo. `append` con error no muta en ninguna versión. En `get_range` hay que conservar el `budget.is_exhausted()`.
+- **Estado:** ✅ aplicada (paso 2). `append` lee el último de `entries.back()`, y `max_seq()` sigue siendo `#[cfg(test)]`.
 
 ### Q4. Helper «abrir un segmento para leer» compartido entre warm y cold
 - **Dónde:** `warm_disk.rs:299-312`, `cold_disk.rs:327-338`.
@@ -146,6 +148,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y cambió el mó
   ```
   Los llamadores quedan en `let Some(file) = open_segment(path, IoEvent::SegmentRead, budget)? else { return Ok(Default::default()) };`. Se mantiene el mismo orden de efectos (presupuesto → registro → open).
 - **Ahorro estimado:** ~10 líneas netas · **Riesgo:** bajo · **Prioridad:** media.
+- **Estado:** ✅ aplicada (paso 2)
 
 ### Q5. `remove_file` que tolera `NotFound`, repetido 4 veces
 - **Dónde:** `tiered_log.rs:523-527`, `tiered_log.rs:864-868`, `segment_index.rs:132-136`, `cold_disk.rs:74-78` (variante que solo hace `warn`).
@@ -159,6 +162,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y cambió el mó
 - **Problema:** las dos aperturas de `active.wal` repiten `OpenOptions` más `try_lock_exclusive` con el mismo mensaje `RoomLocked`. Ese mensaje lo comparan `tests/room_lifecycle_resilience_tests.rs:396` y `:812`, así que no se puede cambiar.
 - **Propuesta:** `fn open_active_locked(path: &Path, create: bool) -> Result<File, ServerError>` con `.read(true).write(true).create(create).truncate(false)`. Para `create = false` es lo mismo que hoy, porque `truncate` es `false` por defecto. El `created = !active_path.exists()` se sigue calculando antes de abrir. También vale agregar `fn active_path(&self) -> PathBuf`: hoy `self.segments_dir.join(ACTIVE_SEGMENT)` se repite en `:71`, `:160`, `:204` y `:238`, y `tiered_log.rs:347` usa el literal `"active.wal"` en lugar de la constante.
 - **Ahorro estimado:** ~8 líneas · **Riesgo:** bajo · **Prioridad:** media.
+- **Estado:** ✅ aplicada (paso 2). `active_path` es `pub(crate)` y reemplaza también el literal de `tiered_log.rs`.
 
 ### Q7. `with_overrides`: alias corto para que rustfmt no parta las líneas
 - **Dónde:** `policy.rs:123-160`.
@@ -199,6 +203,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y cambió el mó
 - **Problema:** `warm_segment_path`/`cold_segment_path` solo eligen la extensión, y `scan` arma a mano el par `(tier, extension)`.
 - **Propuesta:** `impl Tier { fn extension(self) -> &'static str }` y `pub(crate) fn segment_path(dir, start, end, tier: Tier)`. Los usos son pocos: 2 en `warm_disk.rs`, 3 en `tiered_log.rs` y 2 en `tests/segment_index.rs:11-12`. `scan` puede iterar `[Tier::Cold, Tier::Warm]` buscando la extensión que coincide. El orden importa, porque `.wal.zst` debe probarse antes que `.wal`, así que hay que conservarlo.
 - **Ahorro estimado:** ~8 líneas · **Riesgo:** bajo · **Prioridad:** baja.
+- **Estado:** ✅ aplicada (paso 2)
 
 ### Q12. `rotate_active_segment` con `let-else`
 - **Dónde:** `warm_disk.rs:151-180`.
@@ -213,6 +218,7 @@ El commit `e88874b` llegó a `main` después de esta auditoría y cambió el mó
 - `read_newest` (`tiered_log.rs:702-726`): `chunk.0`/`chunk.1` se leen mejor desestructurando (`let (chunk_ops, chunk_mutations) = match …`), y `distinct` puede salir de `active_mutations` después de desestructurar `active`. No ahorra líneas, mejora la claridad.
 - `io_probe::IoEvent::ActiveWalPathRead` (`warm_disk.rs:303-307`): en producción nunca se llama a `read_segment_file` con `active.wal`, así que la rama solo sirve como guarda del test `tests/tiered_log.rs:405`, que verifica que el conteo sea 0. Conviene dejarla, ver abajo.
 - **Estado:** ✅ aplicada (paso 1) en `Ok(Default::default())` y en la desestructuración de `read_newest`. Mover `RecoveredLogData` a `segment_reader.rs` cruza archivos y queda para el paso 2; `ActiveWalPathRead` se deja, como indica el punto.
+- **Estado:** ✅ aplicada (paso 2) en `RecoveredLogData`, que ahora está en `segment_reader.rs`.
 
 ## Lo que conviene dejar como está
 - **El bucle de frames de `compress_to` (`cold_disk.rs:207-254`) frente a `read_frames` (`segment_reader.rs:85-178`).** Se parecen, pero la semántica es opuesta. `compress_to` es estricta: cualquier anomalía es un error que impide comprimir, verifica cada payload y la continuidad completa contra el nombre, y copia los bytes crudos al encoder y al digest. `read_frames` tolera colas rotas (`anomaly`) y saltea payloads sin verificarlos. Unificarlas exigiría parámetros de modo que oscurecen las dos rutas de integridad.

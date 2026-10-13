@@ -12,8 +12,6 @@ pub struct HotBuffer {
     entries: VecDeque<Entry>,
     /// Encoded size of the operations in `entries`.
     bytes: u64,
-    min_seq: Option<SequenceNumber>,
-    max_seq: Option<SequenceNumber>,
 }
 
 /// An operation in the buffer, with when it arrived and its encoded size.
@@ -41,19 +39,15 @@ impl HotBuffer {
 
     /// Appends `op`, which must follow the last operation in the buffer.
     pub fn append(&mut self, op: SequencedOperation) -> Result<(), ServerError> {
-        if let Some(last) = self.max_seq {
-            if op.seq.get() != last.get() + 1 {
+        if let Some(last) = self.entries.back() {
+            let expected = last.op.seq.get() + 1;
+            if op.seq.get() != expected {
                 return Err(ServerError::Wal(format!(
-                    "HotBuffer sequence gap: expected sequence {}, got {}",
-                    last.get() + 1,
+                    "HotBuffer sequence gap: expected sequence {expected}, got {}",
                     op.seq.get()
                 )));
             }
-        } else {
-            self.min_seq = Some(op.seq);
         }
-
-        self.max_seq = Some(op.seq);
         self.push(Entry::new(op));
         Ok(())
     }
@@ -69,14 +63,6 @@ impl HotBuffer {
         }
     }
 
-    /// Updates the sequence bounds after evicting from the front.
-    fn after_eviction(&mut self) {
-        self.min_seq = self.entries.front().map(|entry| entry.op.seq);
-        if self.entries.is_empty() {
-            self.max_seq = None;
-        }
-    }
-
     /// Retrieves the contiguous operations strictly after `from_seq` that fit in `budget`,
     /// cloning only those.
     ///
@@ -86,13 +72,11 @@ impl HotBuffer {
         from_seq: SequenceNumber,
         budget: &mut ReadBudget,
     ) -> Vec<SequencedOperation> {
-        if budget.is_exhausted() || self.entries.is_empty() {
+        if budget.is_exhausted() {
             return Vec::new();
         }
-
-        let min = match self.min_seq {
-            Some(m) => m.get(),
-            None => return Vec::new(),
+        let Some(min) = self.min_seq().map(|seq| seq.get()) else {
+            return Vec::new();
         };
 
         // The range starts before the buffer: the caller reads that prefix from disk first.
@@ -128,43 +112,31 @@ impl HotBuffer {
             self.pop_front();
         }
 
-        while let Some(entry) = self.entries.front() {
-            if now.saturating_duration_since(entry.at) >= policy.ram_ttl {
-                self.pop_front();
-            } else {
-                break;
-            }
+        while self
+            .entries
+            .front()
+            .is_some_and(|entry| now.saturating_duration_since(entry.at) >= policy.ram_ttl)
+        {
+            self.pop_front();
         }
-
-        self.after_eviction();
     }
 
     /// Evicts the operations before `threshold_seq`. Every operation in the buffer is already
     /// on disk.
     pub fn evict_older_than(&mut self, threshold_seq: SequenceNumber) {
-        while let Some(entry) = self.entries.front() {
-            if entry.op.seq.get() < threshold_seq.get() {
-                self.pop_front();
-            } else {
-                break;
-            }
+        while self
+            .entries
+            .front()
+            .is_some_and(|entry| entry.op.seq.get() < threshold_seq.get())
+        {
+            self.pop_front();
         }
-
-        self.after_eviction();
     }
 
     /// Replaces the contents with `ops`, recovered from disk.
     pub fn rehydrate(&mut self, ops: impl IntoIterator<Item = SequencedOperation>) {
-        self.entries.clear();
-        self.bytes = 0;
-        self.min_seq = None;
-        self.max_seq = None;
-
+        *self = Self::default();
         for op in ops {
-            if self.min_seq.is_none() {
-                self.min_seq = Some(op.seq);
-            }
-            self.max_seq = Some(op.seq);
             self.push(Entry::new(op));
         }
     }
@@ -189,13 +161,13 @@ impl HotBuffer {
 
     /// Lowest sequence number currently present in the buffer.
     pub fn min_seq(&self) -> Option<SequenceNumber> {
-        self.min_seq
+        self.entries.front().map(|entry| entry.op.seq)
     }
 
     /// Highest sequence number currently present in the buffer.
     #[cfg(test)]
     pub fn max_seq(&self) -> Option<SequenceNumber> {
-        self.max_seq
+        self.entries.back().map(|entry| entry.op.seq)
     }
 }
 
