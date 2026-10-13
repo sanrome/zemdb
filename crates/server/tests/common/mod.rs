@@ -307,22 +307,20 @@ impl TestServer {
         (status, decode_message(&body).unwrap())
     }
 
-    /// Registers `client_id` in `room_id` over HTTP, checks that it succeeds, and returns
-    /// the client's token with the server's reply.
+    /// Registers `client_id` in `room_id` over HTTP, with its token only in the payload,
+    /// checks that it succeeds, and returns the token with the server's reply.
     pub async fn register(
         &self,
         room_id: &RoomId,
         client_id: &ClientId,
     ) -> (String, ServerMessage) {
         let token = token(client_id, room_id);
-        let (status, reply) = self
-            .post_message(
-                room_id,
-                "register",
-                &token,
-                &register_msg(room_id, client_id, &token),
-            )
+        let msg = register_msg(room_id, client_id, &token);
+        let resp = self
+            .post_frame(&format!("{room_id}/register"), None, &msg)
             .await;
+        let status = resp.status();
+        let reply: ServerMessage = decode_message(&resp.bytes().await.unwrap()).unwrap();
         assert_eq!(status, StatusCode::OK, "{reply:?}");
         (token, reply)
     }
