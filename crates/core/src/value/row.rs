@@ -32,10 +32,6 @@ impl PrimaryKey {
         &self.0
     }
 
-    pub fn as_slice(&self) -> &[Value] {
-        &self.0
-    }
-
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -63,7 +59,7 @@ impl<'a> IntoIterator for &'a PrimaryKey {
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
-        self.as_slice().iter()
+        self.0.iter()
     }
 }
 
@@ -134,10 +130,6 @@ impl CompactRow {
         &self.values
     }
 
-    pub fn as_slice(&self) -> &[Value] {
-        &self.values
-    }
-
     pub fn resize(&mut self, new_len: usize, value: Value) {
         self.values.resize(new_len, value);
     }
@@ -157,7 +149,7 @@ impl<'a> IntoIterator for &'a CompactRow {
 
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
-        self.as_slice().iter()
+        self.values.iter()
     }
 }
 

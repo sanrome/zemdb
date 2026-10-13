@@ -1,4 +1,4 @@
-use crate::value::row::deserialize_columns;
+use crate::value::deserialize_columns;
 use crate::value::{CompactRow, PrimaryKey, Value};
 use serde::{Deserialize, Serialize};
 

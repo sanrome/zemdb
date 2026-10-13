@@ -41,7 +41,7 @@ fn test_uuid_data_type_primary_key_and_parsing() {
 
     assert_eq!(val.data_type(), DataType::Uuid);
     assert_eq!(format!("{}", val), uuid_str);
-    assert_eq!(val.to_uuid(), Some(parsed));
+    assert_eq!(val.as_uuid(), Some(&parsed));
 
     let compact_hex = "a1b2c3d4e5f67890abcdef1234567890";
     assert_eq!(Value::parse_uuid(compact_hex), Some(parsed));

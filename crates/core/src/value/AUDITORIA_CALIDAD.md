@@ -114,6 +114,7 @@
 - **Problema:** hay tres formas de obtener el mismo `&[Value]`. `as_slice()` solo se usa dentro de `row.rs:69` y `row.rs:163`; ningún otro crate, test ni bench lo llama (grep en todo el repo).
 - **Propuesta:** eliminar `as_slice` de ambos tipos y usar `self.0.iter()` / `self.values.iter()` en los `IntoIterator`.
 - **Ahorro estimado:** ~8 líneas · **Riesgo:** bajo · **a verificar:** es API `pub` de `zemdb_core`; borrarlo solo es seguro si no hay consumidores fuera del workspace · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 4): sin usos fuera de `row.rs`; los `IntoIterator` de `&PrimaryKey` y `&CompactRow` iteran el campo directamente.
 
 ### Q5. `to_uuid` como `as_uuid().copied()`
 - **Dónde:** `scalar.rs:106-120`.
@@ -121,6 +122,7 @@
 - **Propuesta:** `pub fn to_uuid(&self) -> Option<[u8; 16]> { self.as_uuid().copied() }`. Opcional y a verificar: eliminar una de las dos, porque es API pública.
 - **Ahorro estimado:** ~4 líneas · **Riesgo:** bajo · **Prioridad:** baja
 - **Estado:** ✅ aplicada en parte (paso 1): `to_uuid` es `as_uuid().copied()`. Borrar una de las dos es API pública y queda para el paso 4.
+- **Estado:** ✅ aplicada (paso 4): se borró `to_uuid` y queda `as_uuid`, que sigue el patrón de los demás accessors `as_*` (devuelven una referencia). El test de UUID compara `as_uuid()` con `Some(&parsed)`.
 
 ### Q6. Un único helper para canonicalizar `-0.0`
 - **Dónde:** `scalar.rs:213`, `220`, `295`, `320-321` (5 apariciones de `if x == 0.0 { 0.0 } else { x }`).
@@ -156,6 +158,7 @@
 - `row.rs:173`: `self.into_values().into_iter()` puede ser `self.values.into_iter()`.
 - `mod.rs:1-4`: los submódulos son `pub` y además se reexportan con `*`. Ningún crate externo usa las rutas `value::scalar::…`, `value::row::…` ni `value::data_type::…` (solo `mutation/op.rs:1` usa `value::row::deserialize_columns`, que es `pub(crate)`). **A verificar** si conviene hacerlos privados: es un cambio de API.
 - **Estado:** ✅ aplicada en parte (paso 1): `Display` del UUID con bucle, `write_str`/argumentos en línea, `IndexMut` importado y `self.values.into_iter()`. ⏭️ no aplicado el borrado del brazo `(Null, Null)`: el informe lo deja opcional y se conserva por explícito. Los submódulos privados de `mod.rs` cambian la API y quedan para el paso 4.
+- **Estado:** ✅ aplicada (paso 4): `data_type`, `row` y `scalar` son privados; ningún crate usaba esas rutas. `deserialize_columns` se reexporta como `pub(crate)` desde `value` para `mutation/op.rs`.
 
 ## Lo que conviene dejar como está
 - **`decode_budget.rs` completo:** el enum de tres estados, el guard RAII con `Drop` y el `#[must_use]` son la forma mínima correcta. No hay nada que recortar.

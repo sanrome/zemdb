@@ -113,11 +113,6 @@ impl Value {
         }
     }
 
-    #[inline]
-    pub fn to_uuid(&self) -> Option<[u8; 16]> {
-        self.as_uuid().copied()
-    }
-
     /// Parses a 32-character or 36-character hyphenated UUID hex string into `[u8; 16]`.
     pub fn parse_uuid(s: &str) -> Option<[u8; 16]> {
         const HYPHENS: [usize; 4] = [8, 13, 18, 23];
