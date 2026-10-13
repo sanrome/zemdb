@@ -81,12 +81,7 @@ pub(crate) fn validate_batch(
     ops: &[SequencedOperation],
 ) -> Result<(), StorageError> {
     for (expected_seq, op) in (head_seq.get() + 1..).zip(ops.iter()) {
-        if !schema.has_table_by_id(op.op.table_id()) {
-            return Err(StorageError::TableNotFound {
-                room_id: room_id.clone(),
-                table: format!("id:{}", op.op.table_id()),
-            });
-        }
+        resolve_table_id(room_id, schema, TableRef::Id(op.op.table_id()))?;
 
         if op.seq.get() != expected_seq {
             return Err(StorageError::SequenceMismatch {

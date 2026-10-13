@@ -8,7 +8,7 @@ use state::{decode_received_snapshot, resolve_table_id, TableRef};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, PoisonError, RwLock};
 use zemdb_core::{CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation};
 
 use crate::engine::{batched_scan, RowStream, StorageEngine};
@@ -40,10 +40,7 @@ impl MemoryStorageEngine {
         &self,
         room_id: &RoomId,
     ) -> Result<Arc<RwLock<RoomState>>, StorageError> {
-        let rooms = self
-            .rooms
-            .read()
-            .map_err(|e| StorageError::Other(format!("Engine lock poisoned: {e}")))?;
+        let rooms = self.rooms.read().map_err(poisoned("Engine"))?;
 
         rooms
             .get(room_id)
@@ -60,9 +57,7 @@ impl MemoryStorageEngine {
         pk: &PrimaryKey,
     ) -> Result<Option<CompactRow>, StorageError> {
         let room_arc = self.get_room(room_id)?;
-        let room_state = room_arc
-            .read()
-            .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
+        let room_state = room_arc.read().map_err(poisoned("Room"))?;
         let table_id = resolve_table_id(room_id, &room_state.schema, table)?;
         Ok(room_state
             .tables
@@ -80,9 +75,7 @@ impl MemoryStorageEngine {
     ) -> Result<RowStream<'a>, StorageError> {
         let room_arc = self.get_room(room_id)?;
         let table_data = {
-            let room_state = room_arc
-                .read()
-                .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
+            let room_state = room_arc.read().map_err(poisoned("Room"))?;
             let table_id = resolve_table_id(room_id, &room_state.schema, table)?;
 
             // An O(1) clone that shares the table's nodes; writes during the scan copy only the
@@ -98,15 +91,17 @@ impl MemoryStorageEngine {
     }
 }
 
+/// Maps the poisoning of the engine's or a room's lock (`lock` is "Engine" or "Room") to an error.
+fn poisoned<G>(lock: &'static str) -> impl FnOnce(PoisonError<G>) -> StorageError {
+    move |e| StorageError::Other(format!("{lock} lock poisoned: {e}"))
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StorageEngine for MemoryStorageEngine {
     #[tracing::instrument(skip(self, schema), fields(room_id = %room_id))]
     async fn open_room(&self, room_id: &RoomId, schema: Schema) -> Result<(), StorageError> {
-        let mut rooms = self
-            .rooms
-            .write()
-            .map_err(|e| StorageError::Other(format!("Engine lock poisoned: {e}")))?;
+        let mut rooms = self.rooms.write().map_err(poisoned("Engine"))?;
 
         if rooms.contains_key(room_id) {
             return Err(StorageError::RoomAlreadyOpen(room_id.clone()));
@@ -122,10 +117,7 @@ impl StorageEngine for MemoryStorageEngine {
 
     #[tracing::instrument(skip(self), fields(room_id = %room_id))]
     async fn close_room(&self, room_id: &RoomId) -> Result<(), StorageError> {
-        let mut rooms = self
-            .rooms
-            .write()
-            .map_err(|e| StorageError::Other(format!("Engine lock poisoned: {e}")))?;
+        let mut rooms = self.rooms.write().map_err(poisoned("Engine"))?;
 
         rooms
             .remove(room_id)
@@ -141,9 +133,7 @@ impl StorageEngine for MemoryStorageEngine {
         ops: Vec<SequencedOperation>,
     ) -> Result<SequenceNumber, StorageError> {
         let room_arc = self.get_room(room_id)?;
-        let mut room_guard = room_arc
-            .write()
-            .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
+        let mut room_guard = room_arc.write().map_err(poisoned("Room"))?;
 
         let RoomState {
             ref schema,
@@ -202,9 +192,7 @@ impl StorageEngine for MemoryStorageEngine {
 
     async fn get_head_seq(&self, room_id: &RoomId) -> Result<SequenceNumber, StorageError> {
         let room_arc = self.get_room(room_id)?;
-        let room_state = room_arc
-            .read()
-            .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
+        let room_state = room_arc.read().map_err(poisoned("Room"))?;
         Ok(room_state.head_seq)
     }
 
@@ -213,9 +201,7 @@ impl StorageEngine for MemoryStorageEngine {
         let room_arc = self.get_room(room_id)?;
         // O(1) clones of the tables: serialization runs without the lock.
         let (head_seq, tables) = {
-            let room_state = room_arc
-                .read()
-                .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
+            let room_state = room_arc.read().map_err(poisoned("Room"))?;
             (room_state.head_seq, room_state.tables.clone())
         };
 
@@ -266,9 +252,7 @@ impl StorageEngine for MemoryStorageEngine {
         // Looked up again: the room may have been closed, or closed and reopened, while the
         // snapshot was decoded. The snapshot goes to the room open now, as in the disk engine.
         let room_arc = self.get_room(room_id)?;
-        let mut room = room_arc
-            .write()
-            .map_err(|e| StorageError::Other(format!("Room lock poisoned: {e}")))?;
+        let mut room = room_arc.write().map_err(poisoned("Room"))?;
         if payload.head_seq < room.head_seq {
             return Err(StorageError::SnapshotBehind {
                 current: room.head_seq,

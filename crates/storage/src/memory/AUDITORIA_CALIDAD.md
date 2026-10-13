@@ -106,12 +106,14 @@ Densidad baja-moderada (74 líneas de doc/comentario sobre 872) y en general de 
   El mensaje queda idéntico (`"Room lock poisoned: …"` / `"Engine lock poisoned: …"`).
 - **Ahorro estimado:** ~14 líneas netas · **Riesgo:** bajo · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ✅ confirmada — son exactamente 9 sitios (std `RwLock`) y los mensajes `Engine`/`Room` quedan iguales. Hay que importar `std::sync::PoisonError`.
+- **Estado:** ✅ aplicada (paso 2) en los 9 sitios; los mensajes `"Engine lock poisoned: …"` y `"Room lock poisoned: …"` no cambian
 
 ### Q4. `validate_batch` puede reutilizar `resolve_table_id`
 - **Dónde:** `state.rs:88-93`.
 - **Problema:** reimplementa el chequeo de `TableRef::Id` de `resolve_table_id` (`state.rs:68`, `74`): mismo `has_table_by_id` y mismo `TableNotFound { table: format!("id:{id}") }`.
 - **Propuesta:** `resolve_table_id(room_id, schema, TableRef::Id(op.op.table_id()))?;` produce exactamente el mismo error, en el mismo orden respecto del chequeo de secuencia. Deja el formato `"id:{id}"` en un solo lugar.
 - **Ahorro estimado:** ~5 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 2)
 
 ### Q5. `deserialize_tables` sin visitor propio
 - **Dónde:** `state.rs:161-184`.
