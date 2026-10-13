@@ -1,4 +1,5 @@
 use super::*;
+use crate::value::ValueBudget;
 use serde::de::value::{Error as ValueError, SeqDeserializer};
 
 /// An iterator that claims `claimed` elements but yields only `items`.
@@ -41,7 +42,10 @@ fn the_declared_length_does_not_drive_the_preallocation() {
 #[test]
 fn a_declared_length_over_the_limit_is_rejected_before_decoding() {
     let err = columns_from(vec![1], MAX_COLUMNS + 1).unwrap_err();
-    assert!(err.to_string().contains("65536"), "{err}");
+    assert!(
+        err.to_string().contains(&(MAX_COLUMNS + 1).to_string()),
+        "{err}"
+    );
 }
 
 #[test]
@@ -66,12 +70,12 @@ fn small_primary_keys_stay_inline() {
 #[test]
 fn elements_beyond_the_declared_length_are_charged_one_by_one() {
     // A format that declares fewer elements than it holds still charges every one.
-    let budget = crate::value::ValueBudget::start(3);
+    let budget = ValueBudget::start(3);
     assert!(columns_from(vec![1, 2, 3], 0).is_ok());
     assert!(!budget.exhausted());
     drop(budget);
 
-    let budget = crate::value::ValueBudget::start(3);
+    let budget = ValueBudget::start(3);
     assert!(columns_from(vec![1, 2, 3, 4], 2).is_err());
     assert!(budget.exhausted());
 }

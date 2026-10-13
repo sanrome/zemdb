@@ -221,10 +221,13 @@
 
 **`tests/codec.rs` (106 líneas):**
 - **Expresión duplicada:** `(MAX_MESSAGE_VALUES as usize).div_ceil(crate::schema::MAX_COLUMNS) + 1` aparece en `:60` y `:78`, y `crate::schema::MAX_COLUMNS` cuatro veces (`:60`, `:61`, `:78`, `:83`). Con `use crate::schema::MAX_COLUMNS;` y un helper `fn rows_over_budget() -> usize` (1 línea de doc) se ahorran ~2–3 líneas y queda más legible.
+  - **Estado:** ✅ aplicada (paso 3)
 - **Mismo patrón de frontera en dos tests:** `a_message_over_the_value_budget_is_rejected` (`:21-32`) y `key_values_and_update_deltas_count_against_the_budget` (`:34-54`) hacen lo mismo: con presupuesto N decodifica, con N-1 devuelve `TooManyValues { max: N-1 }`. Un helper
   ```rust
   fn assert_budget_is_exact<T: DeserializeOwned + PartialEq + Debug>(value: &T, values: u64)
   ```
   que codifique, decodifique con `values`, compare y verifique el error con `values - 1` deja cada test en 3–5 líneas. **Ahorro ~6 líneas.**
+  - **Estado:** ✅ aplicada (paso 3)
 - **Redundancia parcial (a verificar):** `server_responses_are_not_budgeted` (`:76-93`) prueba que `decode_message` no aplica presupuesto, algo que ya cubren `:69-73` y `:100-103`. Su único aporte es el nombre (documenta la intención para `ServerMessage`), y materializa más de 1 Mi `Value`s, así que es de los tests más costosos del módulo. Se puede dejar por documentación o borrar (~18 líneas). Me inclino por dejarlo, pero señalo el costo.
+  - **Estado:** ⏭️ no aplicada — se conserva, como recomienda el informe: documenta que las respuestas del servidor no tienen presupuesto.
 - **`a_failed_decode_does_not_leave_its_budget_on_the_thread` (`:95-106`):** conservar. Verifica la liberación RAII del presupuesto (`Drop` de `ValueBudget`), que es un principio de GEMINI.md.

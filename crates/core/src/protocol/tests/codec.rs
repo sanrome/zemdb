@@ -1,8 +1,11 @@
 use super::*;
 use crate::id::{CorrelationId, RoomId, SequenceNumber};
-use crate::mutation::Operation;
+use crate::mutation::{ColumnUpdate, Operation};
 use crate::protocol::messages::{SequencedOperation, ServerMessage};
+use crate::schema::MAX_COLUMNS;
 use crate::value::{CompactRow, PrimaryKey, Value};
+use serde::de::DeserializeOwned;
+use std::fmt::Debug;
 
 /// Inserts whose rows hold `nulls` values each (plus one primary key value).
 fn null_inserts(count: usize, nulls: usize) -> Vec<Operation> {
@@ -18,17 +21,32 @@ fn null_inserts(count: usize, nulls: usize) -> Vec<Operation> {
         .collect()
 }
 
+/// Rows of `MAX_COLUMNS` values that together carry more than `MAX_MESSAGE_VALUES`.
+fn rows_over_budget() -> usize {
+    (MAX_MESSAGE_VALUES as usize).div_ceil(MAX_COLUMNS) + 1
+}
+
+/// `value` decodes with a budget of exactly `values`, and one less is rejected.
+fn assert_budget_is_exact<T: Serialize + DeserializeOwned + PartialEq + Debug>(
+    value: &T,
+    values: u64,
+) {
+    let frame = encode_message(value).unwrap();
+    assert_eq!(
+        &decode_with_value_budget::<T>(&frame, values).unwrap(),
+        value
+    );
+    let result = decode_with_value_budget::<T>(&frame, values - 1);
+    assert!(
+        matches!(result, Err(DecodeError::TooManyValues { max }) if max == values - 1),
+        "{result:?}"
+    );
+}
+
 #[test]
 fn a_message_over_the_value_budget_is_rejected() {
     // 3 operations of 1 key value and 4 row values each: 15 values.
-    let frame = encode_message(&null_inserts(3, 4)).unwrap();
-    let decoded: Vec<Operation> = decode_with_value_budget(&frame, 15).unwrap();
-    assert_eq!(decoded, null_inserts(3, 4));
-    let result = decode_with_value_budget::<Vec<Operation>>(&frame, 14);
-    assert!(
-        matches!(result, Err(DecodeError::TooManyValues { max: 14 })),
-        "{result:?}"
-    );
+    assert_budget_is_exact(&null_inserts(3, 4), 15);
 }
 
 #[test]
@@ -37,28 +55,18 @@ fn key_values_and_update_deltas_count_against_the_budget() {
     let op = Operation::update(
         0,
         PrimaryKey::composite([1i64, 2, 3]),
-        (0..4)
-            .map(|i| crate::mutation::ColumnUpdate::new(i, Value::Null))
-            .collect(),
+        (0..4).map(|i| ColumnUpdate::new(i, Value::Null)).collect(),
         0,
     );
-    let frame = encode_message(&op).unwrap();
-    assert_eq!(
-        decode_with_value_budget::<Operation>(&frame, 7).unwrap(),
-        op
-    );
-    assert!(matches!(
-        decode_with_value_budget::<Operation>(&frame, 6),
-        Err(DecodeError::TooManyValues { max: 6 })
-    ));
+    assert_budget_is_exact(&op, 7);
 }
 
 #[test]
 fn rows_within_the_column_limit_still_exceed_the_message_budget() {
     // Each row is within the column limit; together they carry more than the budget, in a
     // frame far below the size limit (1 byte per Null on the wire).
-    let rows = (MAX_MESSAGE_VALUES as usize).div_ceil(crate::schema::MAX_COLUMNS) + 1;
-    let ops = null_inserts(rows, crate::schema::MAX_COLUMNS);
+    let rows = rows_over_budget();
+    let ops = null_inserts(rows, MAX_COLUMNS);
     let frame = encode_message(&ops).unwrap();
     assert!(frame.len() < MAX_FRAME_SIZE / 8);
     let result = decode_with_value_budget::<Vec<Operation>>(&frame, MAX_MESSAGE_VALUES);
@@ -75,12 +83,12 @@ fn rows_within_the_column_limit_still_exceed_the_message_budget() {
 
 #[test]
 fn server_responses_are_not_budgeted() {
-    let rows = (MAX_MESSAGE_VALUES as usize).div_ceil(crate::schema::MAX_COLUMNS) + 1;
+    let rows = rows_over_budget();
     let batch = ServerMessage::SyncBatch {
         correlation_id: CorrelationId::new(1),
         room_id: RoomId::new("room").unwrap(),
         head_seq: SequenceNumber::new(rows as u64),
-        ops: null_inserts(rows, crate::schema::MAX_COLUMNS)
+        ops: null_inserts(rows, MAX_COLUMNS)
             .into_iter()
             .enumerate()
             .map(|(i, op)| SequencedOperation::new(i as u64 + 1, op))

@@ -167,8 +167,11 @@
 
 ## Tests
 - **`tests/decode_budget.rs`:** cubre bien los casos (ilimitado, exacto, en bloque, anidado, panic). Una observación de claridad: en `values_are_charged_in_bulk` (`tests/decode_budget.rs:34`), el segundo `let budget = ValueBudget::start(10);` *sombrea* al primero sin soltarlo, así que quedan dos guards anidados vivos. El test pasa, pero de casualidad respecto de lo que dice probar. Conviene agregar `drop(budget);` antes, como hace `tests/row.rs:72`.
+  - **Estado:** ✅ aplicada (paso 3)
 - **`tests/row.rs:44`:** el literal `"65536"` es `MAX_COLUMNS + 1` (`MAX_COLUMNS = u16::MAX`). Es más robusto usar `contains(&(MAX_COLUMNS + 1).to_string())`.
+  - **Estado:** ✅ aplicada (paso 3)
 - **`tests/row.rs:69,74`:** en lugar de `crate::value::ValueBudget`, conviene importarlo una vez (`use crate::value::ValueBudget;`).
+  - **Estado:** ✅ aplicada (paso 3)
 - **`tests/row.rs:47-55`:** `items.clone()` seguido de `pop()` se lee bien. Sin cambios.
 - **Fuera de alcance:** `scalar.rs` y `data_type.rs` no tienen tests unitarios en `value/tests/`; los cubren los tests de integración (`crates/core/tests/types_memory_tests.rs`). Si se aplica Q2, conviene agregar casos borde de UUID allí (guion mal ubicado, mayúsculas, 35 o 37 caracteres).
   - **Estado:** ✅ aplicada (paso 3): `test_uuid_data_type_primary_key_and_parsing` prueba mayúsculas, guion fuera de lugar, hex inválido y largos 31/33/35/37.

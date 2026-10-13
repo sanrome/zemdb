@@ -29,6 +29,7 @@ fn values_are_charged_in_bulk() {
     charge_values(6).unwrap();
     assert_eq!(charge_values(1), Err(BudgetExhausted));
     assert!(budget.exhausted());
+    drop(budget);
 
     // A charge over what is left fails whole.
     let budget = ValueBudget::start(10);
