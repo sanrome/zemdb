@@ -1,4 +1,7 @@
+mod common;
+
 use bytes::Bytes;
+use common::{disk_engine, sequenced};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use zemdb_core::{
@@ -6,9 +9,7 @@ use zemdb_core::{
     SequencedOperation, TableSchema, Value,
 };
 use zemdb_storage::snapshot::encode_snapshot_envelope;
-use zemdb_storage::{
-    DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, StorageEngine, StorageError,
-};
+use zemdb_storage::{MemoryStorageEngine, StorageEngine, StorageError};
 
 const USERS: u16 = 0;
 
@@ -28,7 +29,7 @@ fn user_row(key: i64) -> CompactRow {
 }
 
 fn insert(seq: u64, key: i64) -> SequencedOperation {
-    SequencedOperation::with_default_origin(
+    sequenced(
         seq,
         Operation::insert(USERS, PrimaryKey::single(key), user_row(key), 100),
     )
@@ -39,13 +40,7 @@ fn insert(seq: u64, key: i64) -> SequencedOperation {
 async fn snapshot_with_keys(keys: &[i64]) -> Bytes {
     let source = MemoryStorageEngine::new();
     let room = RoomId::new("snapshot-source").unwrap();
-    source.open_room(&room, schema()).await.unwrap();
-    for (seq, key) in (1u64..).zip(keys) {
-        source
-            .apply_batch(&room, vec![insert(seq, *key)])
-            .await
-            .unwrap();
-    }
+    open_with_keys(&source, &room, keys).await;
     source.create_snapshot(&room).await.unwrap().into()
 }
 
@@ -293,10 +288,6 @@ async fn snapshots_declaring_huge_counts_are_rejected<E: StorageEngine>(engine: 
         assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), 1);
         assert!(has_key(engine, &room, 1).await);
     }
-}
-
-fn disk_engine(dir: &std::path::Path) -> DiskStorageEngine {
-    DiskStorageEngine::new(DiskStorageOptions::new(dir).auto_compact(false))
 }
 
 #[tokio::test]

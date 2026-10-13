@@ -44,6 +44,7 @@
 - `snapshot_portability_tests.rs`: líneas 22, 59, 90, 96 y 117.
 
 Si se aplica Q1–Q3, buena parte de estos comentarios desaparece sola, porque el nombre del helper ya dice lo mismo.
+- **Estado:** ✅ aplicada (paso 3): se borran los comentarios que narran pasos y se conservan los de la lista "Hay que conservar".
 
 **Imprecisos o mejorables.**
 
@@ -51,6 +52,7 @@ Si se aplica Q1–Q3, buena parte de estos comentarios desaparece sola, porque e
 - `disk_wal_resilience_tests.rs:181-182` usa el índice mágico `file_bytes[20]` con el comentario "Tamper with payload byte inside first record". Es más claro escribir `file_bytes[BATCH_HEADER_SIZE + 2]`, con la constante que ya está importada en la línea 7 (18 + 2 = 20, el mismo byte). Lo mismo pasa en `disk_wal_resilience_tests.rs:54`: `header[16]` con "Tamper with head_seq byte" se puede dejar como está, porque el comentario ya explica el offset.
 - `disk_wal_resilience_tests.rs:872` dice "If stale_op had been replayed, score might have been 999 or caused sequence violation". Se puede acortar a "Replaying stale_op would set 999 or break the sequence".
 - `compaction_lifecycle_tests.rs:225` habla de "leaked .snap.tmp files", pero el test busca `.tmp.` en cualquier nombre. Conviene alinear el comentario con lo que se verifica.
+- **Estado:** ✅ aplicada (paso 3) en los cuatro puntos (`header[16]` se deja como está, como se propone).
 
 **Hay que conservar** (aportan el *por qué* o una invariante):
 
@@ -111,6 +113,7 @@ Si se aplica Q1–Q3, buena parte de estos comentarios desaparece sola, porque e
   - Los timestamps (10, 20, 100, 200, 300, 1000) no se comparan en ningún assert de estos archivos, pero conviene mantenerlos como parámetro y no unificarlos por las dudas.
 - **Ahorro estimado:** ~400–480 líneas brutas, ~340–410 netas · **Riesgo:** bajo · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ⚠️ corregida — `user_row` no reproduce todas las filas. `compaction_lifecycle_tests.rs:34` usa score `i * 100`, y muchos bloques usan `Bool(true)`, entre ellos el ejemplo 248-261, así que `inserts(1..=10, 100)` no es idéntico. Ningún assert lee esos valores: el 300 de :121 viene de un update, :386/390/485/489 usan `i*10` y :169 espera `false`. Los tests siguen pasando, pero hay que documentarlo como cambio de datos.
+- **Estado:** ✅ aplicada (paso 3). `tests/common/mod.rs` tiene `USERS_TABLE`, `users_schema`, `sequenced` (único lugar con `with_default_origin`, para cambiarlo de una vez), `row`, `user_row`, `insert`, `inserts`, `update`, `delete`, `get_user` y `assert_users_up_to`. Cambios de datos (ningún assert los leía con el valor viejo): las filas que pasan a `user_row` cambian `active` de `true` a `id % 2 == 0`, el score `i * 100` de `test_disk_zstd_snapshot_and_restore` y de `test_limit_and_projection_pushdowns` pasa a `i * 10` y los nombres "User Name {i}", "Concurrent User {i}", "User_{i}" y "Name_{i}" pasan a "User {i}" (los asserts que los comparaban comparan ahora la fila entera contra `user_row`, o el nombre nuevo). Las filas con nombre propio siguen con `row(...)`.
 
 ### Q2. Llevar los pares memoria/disco al patrón genérico de `apply_snapshot_tests.rs`
 - **Dónde:**
@@ -125,6 +128,7 @@ Si se aplica Q1–Q3, buena parte de estos comentarios desaparece sola, porque e
   - Un `fn disk_engine(dir)` en `common` (hoy está en `apply_snapshot_tests.rs:298-300`) completa el patrón.
 - **Ahorro estimado:** ~170–200 líneas · **Riesgo:** bajo. El trait `StorageEngine` expone `scan`, `apply_batch`, `get` y `get_head_seq` (`src/engine.rs:70-89`), y `apply_snapshot_tests.rs` ya lo usa así. · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ✅ confirmada — el `diff` de 356-451 contra 453-546 y de 228-289 contra 291-354 muestra que solo cambian el engine, el tempdir, el `RoomId` y los comentarios. El `tempdir` tiene que vivir en el envoltorio de disco.
+- **Estado:** ✅ aplicada (paso 3) en los cinco pares, con los cuerpos genéricos de sequence mismatch y de la columna dinámica en `common` y los envoltorios en su archivo. `disk_engine(dir)` (con `auto_compact(false)`) pasa a `common`; los envoltorios de disco de `query_pushdowns_tests.rs` y `snapshot_portability_tests.rs` lo usan en lugar de las opciones por defecto (sus WAL no llegan a los 64 KiB que necesita la compactación automática, así que nunca se disparaba). Datos unificados entre los pares: sequence mismatch usa una fila válida con seq 42 en los dos motores (memoria usaba 5, disco una fila de un valor), la columna dinámica usa "Initial"/"Note" (memoria usaba "Alice"/"Updated Note", disco "Disk Note") y la validación de esquema usa la clave 1 en los dos. La validación de esquema queda en dos tests, uno por motor (+1 test).
 
 ### Q3. Helper `scan_rows` y vectores de claves por rango en `query_pushdowns_tests.rs`
 - **Dónde:**
@@ -144,6 +148,7 @@ Si se aplica Q1–Q3, buena parte de estos comentarios desaparece sola, porque e
   Los conteos con `limit` (líneas 134-139, 283-288 y 348-353) pasan a ser `assert_eq!(scan_rows(...).await.len(), 75)`. Se conserva el `unwrap` de cada ítem. Los tests de snapshot isolation (líneas 384-390 y 483-489) leen las dos primeras filas con `stream.next()` antes de mutar y no pueden usar el helper para esa parte, pero sí para la cola de la línea 430.
 - **Ahorro estimado:** ~90–110 líneas (se superpone en parte con Q2) · **Riesgo:** bajo · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ✅ confirmada — los 14 bucles consumen todo el stream (no hay `break`) y hacen `unwrap` de cada ítem, y `scan_rows` hace lo mismo.
+- **Estado:** ✅ aplicada (paso 3) con `scan_rows`, `scan_keys` y `pks`. Los tests de streaming comparan ahora el vector completo de claves (antes: largo, primera y última).
 
 ### Q4. Helper para "sala con WAL o compactación interrumpida" (tres tests fabrican el mismo estado)
 - **Dónde:** `compaction_lifecycle_tests.rs:238-332`, `compaction_lifecycle_tests.rs:335-446` y `disk_wal_resilience_tests.rs:926-1029`.
@@ -170,6 +175,7 @@ Si se aplica Q1–Q3, buena parte de estos comentarios desaparece sola, porque e
   **A verificar:** los tres usan timestamps distintos por segmento (100, 200, 300) y no los comparan en ningún assert. Si se pasa `ts` como parámetro, no cambia nada.
 - **Ahorro estimado:** ~120–150 líneas · **Riesgo:** bajo-medio (hay que fabricar exactamente los mismos bytes en disco) · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ⚠️ corregida — el `.snap.tmp.*` lo crea el **segundo** test (`compaction_lifecycle_tests.rs:393`), no el tercero. El tercero (`disk_wal_resilience_tests.rs:976-977, 993-994`) usa rutas literales y `std::fs::write`; los otros dos usan `tokio::fs::write`, con los mismos bytes. `wal_file_path` (pub) + `with_extension("wal.compacting")` reproduce bien `compacting_wal_path`.
+- **Estado:** ✅ aplicada (paso 3) como `seed_interrupted_compaction(dir, room, snapshot, compacting, wal)`, que devuelve el engine para las rutas, más `compacting_wal_path(engine, room)` y `assert_users_up_to`. Los tres tests siguen separados. Cambios de fixture: timestamps fijos 100/200/300 por segmento (no se comparan), las filas iniciales del tercer test van en un solo batch (quedan igual en el snapshot), los archivos se escriben con `std::fs::write` (mismos bytes) y el tercer test verifica ahora todas las filas 1..=20 en lugar de la 1, la 12 y la 20.
 
 ### Q5. Helper "escribir, cerrar, alterar el WAL y reabrir" para los tests de corrupción en disco
 - **Dónde:** `disk_wal_resilience_tests.rs:144-189` (byte intermedio alterado, debe dar `WalCorruption`), `:191-226` (último byte alterado, se recupera como torn write), `:228-276` (5 bytes de basura, se trunca), `:641-744` (1024 ceros, se trunca) y `:876-923` (byte de payload del `.snap` alterado, debe dar `SnapshotCorruption`).
@@ -181,6 +187,7 @@ Si se aplica Q1–Q3, buena parte de estos comentarios desaparece sola, porque e
   ```
   Cada test queda en mutación + reapertura + asserts, unas 10 a 15 líneas en vez de 35 a 50. Hay que mantenerlos como tests separados: son modos de fallo distintos y obligatorios. **No conviene** convertirlos en una tabla, porque los resultados esperados no son homogéneos (error, head 0, head 1 + truncado, escritura posterior).
 - **Ahorro estimado:** ~60–80 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 3) con dos helpers en lugar de uno: `open_with_ops(options, room, ops)` (un batch por operación) y `damage_file(path, damage)`. Así cubre también el test del `.snap`, que compacta antes de cerrar. Los cinco tests siguen separados. El de la cola de ceros reescribe el archivo en lugar de hacer `append` + `sync_all` (mismos bytes en disco) y compara ahora las filas enteras.
 
 ### Q6. Asserts verbosos o redundantes
 - **Dónde y propuesta:**
@@ -200,6 +207,7 @@ Si se aplica Q1–Q3, buena parte de estos comentarios desaparece sola, porque e
   - **`assert!(x.await.is_ok())`:** en `memory_engine_tests.rs:28` y `:39`. Con `.unwrap()` se ve el error si falla.
   - **Bytes uno por uno:** `snapshot_portability_tests.rs:149-152` asigna 4 bytes por separado. Queda `bad_magic[..4].copy_from_slice(b"BAD!")`.
 - **Ahorro estimado:** ~70–90 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 3) en todos los puntos. El contador de `memory_engine_tests.rs` se quita y la lectura concurrente hace `unwrap` del `Result` (la sala está abierta todo el test); el de `compaction_lifecycle_tests.rs` ya estaba resuelto por el Lote 8. Los `contains(5)`/`!contains(11)` quedan como comentario.
 
 ### Q7. Tabla de casos para la corrupción del envelope en `snapshot_portability_tests.rs`
 - **Dónde:** `snapshot_portability_tests.rs:136-186`.
@@ -214,12 +222,14 @@ Si se aplica Q1–Q3, buena parte de estos comentarios desaparece sola, porque e
   ```
   Agregar el nombre del caso al mensaje además mejora el diagnóstico.
 - **Ahorro estimado:** ~15–20 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 3), con el nombre del caso en el mensaje.
 
 ### Q8. Rutas de archivos: usar las del engine en lugar de literales
 - **Dónde:** `disk_wal_resilience_tests.rs:179`, `215`, `252`, `672`, `828`, `910`, `976` y `993`, y `compaction_lifecycle_tests.rs:284-286`, `305-307`, `383-385`, `391-393` y `413-415`.
 - **Problema:** los literales `"room_room-torn.wal"` duplican el id de la sala, que ya está en `RoomId::new("room-torn")`, y se rompen en silencio si alguien cambia uno de los dos. En compaction el `format!` ocupa 3 líneas por ruta.
 - **Propuesta:** usar `engine.wal_file_path(&room_id)` y `engine.snap_file_path(&room_id)`, que son públicos (`src/disk/mod.rs:248` y `:258`) y ya se usan en `disk_wal_resilience_tests.rs:1115` y `apply_snapshot_tests.rs:323-324`. Conviene **dejar un solo test que fije el layout** con literales, `test_dual_file_storage_layout_and_compaction_truncation` (`:505-506`), porque ese es su propósito.
 - **Ahorro estimado:** ~10–15 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 3) en todas las rutas salvo las de `test_dual_file_storage_layout_and_compaction_truncation`, que fija el layout con literales a propósito. El `.snap.tmp.*` se arma con `snap_file_path(..).with_extension("snap.tmp.deadbeef-1234")`.
 
 ### Q9. Pequeños en los archivos que ya están bien
 - `apply_snapshot_tests.rs:39-50`: `snapshot_with_keys` repite el bucle de `open_with_keys` (`:74-82`). Queda `open_with_keys(&source, &room, keys).await; source.create_snapshot(&room).await.unwrap().into()`. El efecto es idéntico: `open_room` + un batch por clave con `insert(seq, key)`. Ahorro ~6.
@@ -228,6 +238,7 @@ Si se aplica Q1–Q3, buena parte de estos comentarios desaparece sola, porque e
 - `disk_wal_resilience_tests.rs:475` y `:600`, y `query_pushdowns_tests.rs:414` y `:513`: escriben `zemdb_core::ColumnUpdate::new` con la ruta completa en vez de importarlo. Con el helper `update(...)` de Q1 desaparece.
 - `compaction_lifecycle_tests.rs:226-234`: el bucle `while let` con flag `found_tmp` se reemplaza por `assert!(!std::fs::read_dir(dir)?.any(|e| e.unwrap().file_name().to_string_lossy().contains(".tmp.")), …)`. Ahorro ~5. **A verificar:** pasa de `tokio::fs` a `std::fs`, lo que en un test no cambia lo que se comprueba.
 - **Ahorro estimado:** ~25 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 3) en todos los puntos. `snapshot_with_keys` delega en `open_with_keys` y el chequeo de `.tmp.` usa `std::fs::read_dir(..).any(..)`.
 
 ## Lo que conviene dejar como está
 
@@ -246,4 +257,5 @@ Si se aplica Q1–Q3, buena parte de estos comentarios desaparece sola, porque e
   - Hay solapamiento parcial. `memory_engine_tests::test_snapshot_create_and_restore` (`:225-266`) y `compaction_lifecycle_tests::test_disk_zstd_snapshot_and_restore` (`:21-65`) prueban el ciclo crear → aplicar snapshot, que también cubren `snapshot_portability_tests::test_cross_engine_snapshot_portability` y `apply_snapshot_tests::snapshot_ahead_replaces_contents`. No sugiero borrarlos, porque cada uno ejercita un camino propio: compresión zstd, sala distinta en el mismo engine. Sí conviene compactarlos con Q1.
   - `test_file_header_rejects_invalid_magic` y `test_file_header_rejects_corrupted_crc` (`disk_wal_resilience_tests.rs:43-57`) podrían ser una tabla de dos casos, pero ya ocupan 6 líneas cada uno. No vale la pena.
 - **Nombres:** cinco archivos usan el prefijo `test_` y los otros dos usan frases descriptivas (`memory_rejects_snapshot_behind_room_head`). No ahorra líneas, pero unificar hacia el estilo descriptivo mejora el reporte de `cargo test`. Prioridad baja y solo si se tocan esos tests por otro motivo.
+  - **Estado:** ⏭️ no aplicada — los tests existentes conservan su nombre; los nuevos (`memory_`/`disk_scan_stops_at_batch_boundaries`, `memory_`/`disk_rejects_a_row_missing_columns`) usan el estilo descriptivo.
 - **Orden de adopción sugerido:** primero Q1, que es la base y lo que más rinde; después Q3 y Q2 en `query_pushdowns_tests.rs`; luego Q4 y Q5 en los tests de disco; Q6–Q9 se pueden hacer de forma oportunista. Después de cada paso hay que correr `cargo test -p zemdb-storage` y `cargo clippy --all-targets -- -D warnings`, por los `dead_code` de `common` (ver Q1).

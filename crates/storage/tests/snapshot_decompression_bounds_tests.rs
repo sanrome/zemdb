@@ -77,10 +77,7 @@ fn payload_within_the_limit_roundtrips() {
 
 #[tokio::test]
 async fn disk_engine_applies_its_configured_snapshot_limit() {
-    let table = TableSchema::builder("items")
-        .table_id(1)
-        .primary_key("id", DataType::Int);
-    let schema = Schema::builder().table(table).build();
+    let schema = items_schema();
     let room_id = RoomId::new("bounded-room").unwrap();
 
     let source = MemoryStorageEngine::new();
@@ -95,12 +92,8 @@ async fn disk_engine_applies_its_configured_snapshot_limit() {
     let result = engine
         .apply_snapshot(&room_id, schema, snapshot.into(), 0u64.into())
         .await;
-    match result {
-        Err(StorageError::SnapshotCorruption(msg)) => {
-            assert!(msg.contains("exceeds the maximum"), "{msg}")
-        }
-        other => panic!("expected the snapshot to be rejected, got {other:?}"),
-    }
+    let msg = corruption_message(result);
+    assert!(msg.contains("exceeds the maximum"), "{msg}");
 }
 
 fn items_schema() -> Schema {
