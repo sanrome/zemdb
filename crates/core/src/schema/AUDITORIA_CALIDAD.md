@@ -65,6 +65,7 @@
   `add_column` (`global.rs:154-158`) necesita `get_mut`, así que queda como está. `validate_operation` (`global.rs:225-227`) busca por id con el mensaje `"id:{}"` y también queda igual.
 - **Ahorro estimado:** ~9–12 líneas · **Riesgo:** bajo · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ⚠️ corregida — las 6 apariciones y líneas son correctas y el error es idéntico, pero un `fn require_table` privado en `impl Schema` (módulo `schema::global`) no es visible desde el módulo hermano `schema::validation`: hay que declararlo `pub(super)` (o `pub(crate)`), salvo que se aplique Q2 y los cuerpos de `validation.rs:273-312` se muden a `global.rs`.
+- **Estado:** ✅ aplicada (paso 2): como Q2 llevó los cuerpos a `global.rs`, `require_table` es privada.
 
 ### Q2. Eliminar la doble indirección `Schema`/`TableSchema` → funciones libres de `validation.rs`
 - **Dónde:** `table.rs:328-367` (7 wrappers: `validate_pk`, `validate_row`, `validate_update`, `validate_compact_row`, `validate_keyed_row`, `validate_column_updates`, `validate_operation`); `global.rs:206-221` (3 wrappers); `validation.rs:160-453` (funciones libres `pub`).
@@ -77,6 +78,7 @@
   - El orden de los chequeos y los errores no cambian. Solo se mueve código.
 - **Ahorro estimado:** ~60–75 líneas · **Riesgo:** medio. Es superficie pública: hay que confirmar que ningún consumidor fuera del workspace importa `zemdb_core::schema::validate_*`. **A verificar.** · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ✅ confirmada — grep en todo `crates/` (core, storage, server, client): ninguna llamada a `validate_*` libres ni import de `schema::validate*` fuera de `schema/`; `validate_pk` tiene un único caller con closure (`table.rs:329-334`) y `validate_field_value` no se usa fuera de `validation.rs`. Un `impl TableSchema` en otro módulo del mismo crate compila; usar los accessors (`self.name()`, `self.columns()`) como hoy. Sigue siendo un cambio de API pública.
+- **Estado:** ✅ aplicada (paso 2): las validaciones son un `impl TableSchema` en `validation.rs` (`validate_table_update` pasó a ser `TableSchema::validate_update`), sin wrappers en `table.rs`; `validate_pk` ya no recibe closure, `validate_field_value` es privada y los cuerpos de `validate_insert/update/delete` están en los métodos de `Schema`.
 
 ### Q3. `seen` en `validate_column_updates` es código muerto
 - **Dónde:** `validation.rs:323`, `352-358`.
@@ -115,12 +117,14 @@
   ```
   Se comporta exactamente igual: las columnas nuevas nacen con `nullable = encrypted = false` y se activa solo el flag del método. `column()` no toca flags. `primary_key` conserva su `push` deduplicado en `self.primary_key` y pone `.nullable = false`.
 - **Ahorro estimado:** ~12–15 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 2)
 
 ### Q5. Chequeo de aridad de `CompactRow` triplicado
 - **Dónde:** `table.rs:395-401`, `table.rs:415-421`, `validation.rs:379-385`.
 - **Problema:** el mismo `if compact.len() > columns.len() { return Err(CompactRowArityMismatch { … }) }`, de 7 líneas, aparece tres veces.
 - **Propuesta:** `pub(crate) fn check_compact_arity(&self, len: usize) -> Result<(), ValidationError>` en `TableSchema`, con una llamada de 1 línea en cada sitio.
 - **Ahorro estimado:** ~10 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 2): `TableSchema::check_compact_arity` vive en `validation.rs` con visibilidad `pub(super)`, que basta para `table.rs`.
 
 ### Q6. Bucles de acumulación → iteradores
 - **Dónde:**
@@ -157,6 +161,7 @@
 - **Problema:** las dos ramas construyen el mismo `InvalidColumnDataType` con el mismo texto largo, que es además el **único** valor de `message` en todo el workspace.
 - **Propuesta:** un helper privado `fn check_column_type(table: &str, col: &ColumnDef) -> Result<(), ValidationError>`, llamado en el mismo punto de cada función para conservar la precedencia: en `try_new` antes del duplicado, en `add_column` al final. Opcional (**a verificar**, porque cambia la forma de una variante pública): quitar el campo `message` y poner el texto en el `#[error]`. El `Display` queda idéntico, y el único test (`schema_validation_tests.rs:370`) hace match con `{ .. }`.
 - **Ahorro estimado:** ~5–8 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada en parte (paso 2): helper privado `check_column_type` en `table.rs`, llamado en el mismo punto de `try_new` y `add_column`. ⏭️ no aplicado quitar el campo `message`: cambia la forma de una variante pública y no es consecuencia del helper.
 
 ### Q8. `impl Serialize for Schema` con newtype interno
 - **Dónde:** `global.rs:63-83`.

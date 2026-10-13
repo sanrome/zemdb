@@ -1,5 +1,5 @@
 use super::column::ColumnDef;
-use super::validation::{self, ValidationError};
+use super::validation::ValidationError;
 use crate::mutation::{ColumnUpdate, Operation};
 use crate::value::{CompactRow, DataType, PrimaryKey, Row, Value};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -8,6 +8,20 @@ use std::collections::BTreeMap;
 /// Maximum number of columns of a table. Columns are addressed by a `u16` positional index
 /// (`ColumnUpdate::column_idx`, the result of `add_column`), so every index must fit in it.
 pub const MAX_COLUMNS: usize = u16::MAX as usize;
+
+/// Rejects a column declared with `DataType::Null`: that is the type of `Value::Null`, not a
+/// column type.
+fn check_column_type(table: &str, col: &ColumnDef) -> Result<(), ValidationError> {
+    if col.data_type == DataType::Null {
+        return Err(ValidationError::InvalidColumnDataType {
+            table: table.to_string(),
+            column: col.name.clone(),
+            message: "Columns cannot have DataType::Null as their schema definition type"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
 
 /// Builder for constructing TableSchema instances declaratively.
 ///
@@ -48,36 +62,19 @@ impl TableBuilder {
         if !self.primary_key.contains(&name) {
             self.primary_key.push(name.clone());
         }
-        if let Some(col) = self.columns.iter_mut().find(|c| c.name == name) {
-            col.data_type = data_type;
-            col.nullable = false;
-        } else {
-            self.columns.push(ColumnDef::new(name, data_type));
-        }
+        self.upsert_column(name, data_type).nullable = false;
         self
     }
 
     /// Declares a column (non-nullable if new); re-declaring only changes its type.
     pub fn column(mut self, name: impl Into<String>, data_type: DataType) -> Self {
-        let name = name.into();
-        if let Some(col) = self.columns.iter_mut().find(|c| c.name == name) {
-            col.data_type = data_type;
-        } else {
-            self.columns.push(ColumnDef::new(name, data_type));
-        }
+        self.upsert_column(name.into(), data_type);
         self
     }
 
     /// Declares a nullable column; re-declaring changes its type and makes it nullable.
     pub fn nullable_column(mut self, name: impl Into<String>, data_type: DataType) -> Self {
-        let name = name.into();
-        if let Some(col) = self.columns.iter_mut().find(|c| c.name == name) {
-            col.data_type = data_type;
-            col.nullable = true;
-        } else {
-            self.columns
-                .push(ColumnDef::new(name, data_type).nullable(true));
-        }
+        self.upsert_column(name.into(), data_type).nullable = true;
         self
     }
 
@@ -85,15 +82,23 @@ impl TableBuilder {
     /// encrypted. The data_type represents the underlying decrypted type for clients,
     /// while the server only accepts opaque Value::Bytes.
     pub fn encrypted_column(mut self, name: impl Into<String>, data_type: DataType) -> Self {
-        let name = name.into();
-        if let Some(col) = self.columns.iter_mut().find(|c| c.name == name) {
-            col.data_type = data_type;
-            col.encrypted = true;
-        } else {
-            self.columns
-                .push(ColumnDef::new(name, data_type).encrypted(true));
-        }
+        self.upsert_column(name.into(), data_type).encrypted = true;
         self
+    }
+
+    /// The column `name` with its type set to `data_type`, appended (neither nullable nor
+    /// encrypted) if it was not declared yet. An existing column keeps its flags.
+    fn upsert_column(&mut self, name: String, data_type: DataType) -> &mut ColumnDef {
+        let idx = match self.columns.iter().position(|c| c.name == name) {
+            Some(idx) => idx,
+            None => {
+                self.columns.push(ColumnDef::new(name, data_type));
+                self.columns.len() - 1
+            }
+        };
+        let col = &mut self.columns[idx];
+        col.data_type = data_type;
+        col
     }
 
     /// Validates and builds the TableSchema. The table id must have been set explicitly;
@@ -195,14 +200,7 @@ impl TableSchema {
 
         let mut column_indices = BTreeMap::new();
         for (i, col) in columns.iter().enumerate() {
-            if col.data_type == DataType::Null {
-                return Err(ValidationError::InvalidColumnDataType {
-                    table: name.clone(),
-                    column: col.name.clone(),
-                    message: "Columns cannot have DataType::Null as their schema definition type"
-                        .to_string(),
-                });
-            }
+            check_column_type(&name, col)?;
 
             if column_indices.insert(col.name.clone(), i).is_some() {
                 return Err(ValidationError::DuplicateColumn {
@@ -281,14 +279,7 @@ impl TableSchema {
             });
         }
 
-        if col.data_type == DataType::Null {
-            return Err(ValidationError::InvalidColumnDataType {
-                table: self.name.clone(),
-                column: col.name,
-                message: "Columns cannot have DataType::Null as their schema definition type"
-                    .to_string(),
-            });
-        }
+        check_column_type(&self.name, &col)?;
 
         let new_idx = self.columns.len();
         self.column_indices.insert(col.name.clone(), new_idx);
@@ -312,47 +303,6 @@ impl TableSchema {
         let pk = PrimaryKey::from_smallvec(pk_values);
         self.validate_pk(&pk)?;
         Ok(pk)
-    }
-
-    pub fn validate_pk(&self, pk: &PrimaryKey) -> Result<(), ValidationError> {
-        validation::validate_pk(
-            &self.name,
-            &self.primary_key,
-            |col| self.get_column(col),
-            pk,
-        )
-    }
-
-    pub fn validate_row(&self, row: &Row) -> Result<(), ValidationError> {
-        validation::validate_row(self, row)
-    }
-
-    pub fn validate_update(&self, fields: &BTreeMap<String, Value>) -> Result<(), ValidationError> {
-        validation::validate_table_update(self, fields)
-    }
-
-    /// Validates an entire CompactRow against this TableSchema.
-    pub fn validate_compact_row(&self, row: &CompactRow) -> Result<(), ValidationError> {
-        validation::validate_compact_row(self, row)
-    }
-
-    /// Validates a CompactRow stored under the key `pk` against this TableSchema.
-    pub fn validate_keyed_row(
-        &self,
-        pk: &PrimaryKey,
-        row: &CompactRow,
-    ) -> Result<(), ValidationError> {
-        validation::validate_keyed_row(self, pk, row)
-    }
-
-    /// Validates positional ColumnUpdates against this TableSchema.
-    pub fn validate_column_updates(&self, updates: &[ColumnUpdate]) -> Result<(), ValidationError> {
-        validation::validate_column_updates(self, updates)
-    }
-
-    /// Validates an Operation against this TableSchema.
-    pub fn validate_operation(&self, op: &Operation) -> Result<(), ValidationError> {
-        validation::validate_operation(self, op)
     }
 
     /// Converts a validated Row to CompactRow ordered by physical DDL schema columns.
@@ -381,13 +331,7 @@ impl TableSchema {
     ///
     /// Allows `compact.len() <= self.columns.len()`, treating omitted columns as null.
     pub fn from_compact_row(&self, compact: &CompactRow) -> Result<Row, ValidationError> {
-        if compact.len() > self.columns.len() {
-            return Err(ValidationError::CompactRowArityMismatch {
-                table: self.name.clone(),
-                expected: self.columns.len(),
-                actual: compact.len(),
-            });
-        }
+        self.check_compact_arity(compact.len())?;
         Ok(self
             .columns
             .iter()
@@ -399,13 +343,7 @@ impl TableSchema {
 
     /// Consuming variant of [`Self::from_compact_row`].
     pub fn compact_into_row(&self, compact: CompactRow) -> Result<Row, ValidationError> {
-        if compact.len() > self.columns.len() {
-            return Err(ValidationError::CompactRowArityMismatch {
-                table: self.name.clone(),
-                expected: self.columns.len(),
-                actual: compact.len(),
-            });
-        }
+        self.check_compact_arity(compact.len())?;
         Ok(self
             .columns
             .iter()

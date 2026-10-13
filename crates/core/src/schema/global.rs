@@ -1,6 +1,6 @@
 use super::column::ColumnDef;
 use super::table::{TableBuilder, TableSchema};
-use super::validation::{self, ValidationError};
+use super::validation::ValidationError;
 use crate::mutation::Operation;
 use crate::value::{PrimaryKey, Row, Value};
 use serde::de;
@@ -182,8 +182,16 @@ impl Schema {
         self.id_by_name.contains_key(name)
     }
 
+    /// The table named `name`, or `TableNotFound`.
+    fn require_table(&self, name: &str) -> Result<&TableSchema, ValidationError> {
+        self.get_table_by_name(name)
+            .ok_or_else(|| ValidationError::TableNotFound(name.to_string()))
+    }
+
     pub fn validate_insert(&self, table: &str, row: &Row) -> Result<PrimaryKey, ValidationError> {
-        validation::validate_insert(self, table, row)
+        let t = self.require_table(table)?;
+        t.validate_row(row)?;
+        t.extract_pk(row)
     }
 
     pub fn validate_update(
@@ -192,11 +200,13 @@ impl Schema {
         pk: &PrimaryKey,
         fields: &BTreeMap<String, Value>,
     ) -> Result<(), ValidationError> {
-        validation::validate_update(self, table, pk, fields)
+        let t = self.require_table(table)?;
+        t.validate_pk(pk)?;
+        t.validate_update(fields)
     }
 
     pub fn validate_delete(&self, table: &str, pk: &PrimaryKey) -> Result<(), ValidationError> {
-        validation::validate_delete(self, table, pk)
+        self.require_table(table)?.validate_pk(pk)
     }
 
     /// Validates an Operation against the corresponding TableSchema by table_id.
@@ -213,10 +223,8 @@ impl Schema {
         row: &Row,
         timestamp: u64,
     ) -> Result<Operation, ValidationError> {
-        let t = self
-            .get_table_by_name(table)
-            .ok_or_else(|| ValidationError::TableNotFound(table.to_string()))?;
-        t.to_operation_insert(row, timestamp)
+        self.require_table(table)?
+            .to_operation_insert(row, timestamp)
     }
 
     pub fn to_operation_update(
@@ -226,10 +234,8 @@ impl Schema {
         fields: &BTreeMap<String, Value>,
         timestamp: u64,
     ) -> Result<Operation, ValidationError> {
-        let t = self
-            .get_table_by_name(table)
-            .ok_or_else(|| ValidationError::TableNotFound(table.to_string()))?;
-        t.to_operation_update(pk, fields, timestamp)
+        self.require_table(table)?
+            .to_operation_update(pk, fields, timestamp)
     }
 
     pub fn to_operation_delete(
@@ -238,9 +244,7 @@ impl Schema {
         pk: PrimaryKey,
         timestamp: u64,
     ) -> Result<Operation, ValidationError> {
-        let t = self
-            .get_table_by_name(table)
-            .ok_or_else(|| ValidationError::TableNotFound(table.to_string()))?;
-        t.to_operation_delete(pk, timestamp)
+        self.require_table(table)?
+            .to_operation_delete(pk, timestamp)
     }
 }
