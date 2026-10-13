@@ -52,7 +52,13 @@ pub enum DecodeError {
 /// Size of `value` encoded with the wire options, without the frame header: what it adds to a
 /// frame's payload. Fails only if the value cannot be serialized.
 pub fn encoded_len<T: Serialize + ?Sized>(value: &T) -> Result<u64, bincode::Error> {
+    // No size limit: callers need the real size even past `MAX_MESSAGE_SIZE`, to report it.
     bincode::DefaultOptions::new().serialized_size(value)
+}
+
+/// Bincode options of the wire format: varint, little-endian, payload up to `MAX_MESSAGE_SIZE`.
+fn wire_options() -> impl Options {
+    bincode::DefaultOptions::new().with_limit(MAX_MESSAGE_SIZE)
 }
 
 /// Serialize any protocol message to binary using bincode preceded by the canonical wire header.
@@ -64,10 +70,7 @@ pub fn encode_message<T: Serialize>(msg: &T) -> Result<Vec<u8>, bincode::Error> 
     buffer.extend_from_slice(&PROTOCOL_MAGIC);
     buffer.push(PROTOCOL_VERSION);
     buffer.push(0x00); // reserved flags
-    bincode::DefaultOptions::new()
-        .with_limit(MAX_MESSAGE_SIZE)
-        .reject_trailing_bytes()
-        .serialize_into(&mut buffer, msg)?;
+    wire_options().serialize_into(&mut buffer, msg)?;
     Ok(buffer)
 }
 
@@ -90,8 +93,7 @@ pub fn peek_version(bytes: &[u8]) -> Option<u8> {
 /// reported as [`DecodeError::UnsupportedVersion`], whatever its length or payload.
 #[tracing::instrument(level = "trace", skip(bytes))]
 pub fn decode_message<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, DecodeError> {
-    bincode::DefaultOptions::new()
-        .with_limit(MAX_MESSAGE_SIZE)
+    wire_options()
         .reject_trailing_bytes()
         .deserialize(frame_payload(bytes)?)
         .map_err(DecodeError::Malformed)
@@ -129,8 +131,7 @@ fn decode_with_value_budget<'a, T: Deserialize<'a>>(
 pub fn peek_client_message_kind(bytes: &[u8]) -> Result<ClientMessageKind, DecodeError> {
     // An enum is encoded as its variant index (a `u32`, varint with the wire options),
     // followed by the variant's fields.
-    let index: u32 = bincode::DefaultOptions::new()
-        .with_limit(MAX_MESSAGE_SIZE)
+    let index: u32 = wire_options()
         .allow_trailing_bytes()
         .deserialize(frame_payload(bytes)?)
         .map_err(DecodeError::Malformed)?;

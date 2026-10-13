@@ -163,6 +163,7 @@
   ```
   y usar `wire_options().serialize_into(..)`, `wire_options().reject_trailing_bytes().deserialize(..)` y `wire_options().allow_trailing_bytes().deserialize(..)`. Los bytes serializados no cambian, porque ni el límite ni la opción de trailing alteran la codificación. `encoded_len` (`:54-56`) se queda **sin** límite a propósito: `check_operation_size` necesita el tamaño real aunque supere el máximo para reportarlo. Conviene dejarlo dicho en un comentario de una línea.
 - **Ahorro estimado:** ~0–2 líneas (es una mejora de claridad, no de longitud) · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 2): `encode_message` deja de llamar a `reject_trailing_bytes()`, que no afecta la serialización, y `encoded_len` lleva el comentario de por qué no tiene límite.
 
 ### Q7. Getter `SnapshotEnvelopeHeader::body_crc()` sin uso
 - **Dónde:** `snapshot_envelope.rs:149-152`
