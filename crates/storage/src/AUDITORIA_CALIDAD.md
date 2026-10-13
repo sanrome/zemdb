@@ -111,6 +111,7 @@ La densidad es adecuada (≈15 % doc) y la mayoría explica el *por qué*. Punto
   ```
   Con ese helper, `check`, `pause` y `pause_blocking` usan `take(&ARMED, |(n, p)| *n == name && p == path)`. En `io_result` y `read_only_handle` hay que quitar los `cfg` como en `panic_point`.
 - **Ahorro estimado:** ~10–12 líneas (más ~6 si se recorta la doc del módulo) · **Riesgo:** bajo · **Prioridad:** media · **A verificar:** que `read_only_handle` sin `cfg` no produzca avisos de import o uso en builds no-test (`AsyncWriteExt` está dentro del bloque).
+- **Estado:** ✅ aplicada (paso 2): `take` en `check`, `pause` y `pause_blocking`, y sin `cfg` en `io_result` y `read_only_handle`. Sin avisos en builds de test, no-test ni release (el `use AsyncWriteExt` queda dentro del `if`)
 
 ### Q4. `snapshot.rs`: API muerta, mensajes duplicados e imports repetidos
 - **Dónde:** `snapshot.rs:15-19`, `36` + `56`, `199-203` + `300-304`, `274-283`, `165` + `223` + `272`.
@@ -124,6 +125,7 @@ La densidad es adecuada (≈15 % doc) y la mayoría explica el *por qué*. Punto
 - **Propuesta:** borrar las constantes; usar `let _ = (compress_zstd, zstd_level);` en la rama wasm y quitar el `allow`; definir un `fn zstd_unsupported() -> StorageError` (o una constante) para los stubs; usar un closure `let failed = |e| StorageError::SnapshotCorruption(format!("Zstd decompression failed: {e}"));`; dejar un único `#[cfg(not(target_arch = "wasm32"))] use std::io::{BufReader, Read};` arriba. Los mensajes `"larger than declared"` y `"length mismatch"` los compara `tests/snapshot_decompression_bounds_tests.rs:56,64`: **no cambiarlos**.
 - **Ahorro estimado:** ~12–15 líneas · **Riesgo:** bajo (las constantes son API pública: **a verificar** si hay consumidores externos) · **Prioridad:** media
 - **Estado:** ✅ aplicada (paso 1) en los puntos 2 (`let _ = (compress_zstd, zstd_level);` sin `allow`), 4 (closure `failed`), 5 (un único `use std::io::{BufReader, Read};`) y 6 (`Cow<[u8]>` para el cuerpo sin comprimir), y en las docs de `snapshot.rs:32` y `69`. El punto 1 (borrar `COMPRESSION_*`, API pública) queda para el paso 4 y el punto 3 (helper compartido por los dos stubs de wasm) para el paso 2.
+- **Estado:** ⏭️ punto 3 no aplicado (paso 2) — queda más largo: rustfmt parte igual en tres líneas `Err(StorageError::SnapshotCorruption(…))` con una constante como argumento (supera `fn_call_width`), así que la constante solo suma líneas, y un helper que devuelva el error o el `Result` también deja el archivo más largo que los dos stubs actuales
 
 ### Q5. `error.rs`: variante sin uso
 - **Dónde:** `error.rs:56-57` (`EngineClosed`) y `74-80`.

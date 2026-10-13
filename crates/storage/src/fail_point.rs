@@ -24,6 +24,13 @@ type ArmedPause = (
 #[cfg(test)]
 static PAUSES: std::sync::Mutex<Vec<ArmedPause>> = std::sync::Mutex::new(Vec::new());
 
+/// Removes and returns the first entry of `list` that `hit` matches.
+#[cfg(test)]
+fn take<T>(list: &std::sync::Mutex<Vec<T>>, hit: impl Fn(&T) -> bool) -> Option<T> {
+    let mut list = list.lock().unwrap();
+    list.iter().position(hit).map(|pos| list.remove(pos))
+}
+
 /// Arms the fail point `name` for `path`; the next `check` with the same pair fails.
 #[cfg(test)]
 pub(crate) fn arm(name: &'static str, path: &Path) {
@@ -34,14 +41,10 @@ pub(crate) fn arm(name: &'static str, path: &Path) {
 #[inline(always)]
 pub(crate) fn check(name: &'static str, path: &Path) -> Result<(), StorageError> {
     #[cfg(test)]
-    {
-        let mut armed = ARMED.lock().unwrap();
-        if let Some(pos) = armed.iter().position(|(n, p)| *n == name && p == path) {
-            armed.remove(pos);
-            return Err(StorageError::Io(std::io::Error::other(format!(
-                "injected failure at {name}"
-            ))));
-        }
+    if take(&ARMED, |(n, p)| *n == name && p == path).is_some() {
+        return Err(StorageError::Io(std::io::Error::other(format!(
+            "injected failure at {name}"
+        ))));
     }
     #[cfg(not(test))]
     let _ = (name, path);
@@ -64,12 +67,9 @@ pub(crate) fn io_result<T>(
     path: &Path,
     result: std::io::Result<T>,
 ) -> std::io::Result<T> {
-    #[cfg(test)]
     if check(name, path).is_err() {
         return Err(std::io::Error::other(format!("injected failure at {name}")));
     }
-    #[cfg(not(test))]
-    let _ = (name, path);
     result
 }
 
@@ -87,14 +87,11 @@ pub(crate) async fn read_only_handle(
     file: &mut tokio::fs::File,
     file_path: &Path,
 ) {
-    #[cfg(test)]
     if check(name, path).is_err() {
         use tokio::io::AsyncWriteExt;
         file.flush().await.unwrap();
         *file = tokio::fs::File::from_std(std::fs::File::open(file_path).unwrap());
     }
-    #[cfg(not(test))]
-    let _ = (name, path, file, file_path);
 }
 
 /// Handle of an armed pause point, held by the test.
@@ -137,18 +134,9 @@ pub(crate) fn arm_pause(name: &'static str, path: &Path) -> Pause {
 #[inline(always)]
 pub(crate) async fn pause(name: &'static str, path: &Path) {
     #[cfg(test)]
-    {
-        let armed = {
-            let mut pauses = PAUSES.lock().unwrap();
-            pauses
-                .iter()
-                .position(|(n, p, _, _)| *n == name && p == path)
-                .map(|pos| pauses.remove(pos))
-        };
-        if let Some((_, _, reached, release)) = armed {
-            let _ = reached.send(());
-            let _ = release.await;
-        }
+    if let Some((_, _, reached, release)) = take(&PAUSES, |(n, p, _, _)| *n == name && p == path) {
+        let _ = reached.send(());
+        let _ = release.await;
     }
     #[cfg(not(test))]
     let _ = (name, path);
@@ -217,19 +205,12 @@ pub(crate) fn arm_blocking_pause(name: &'static str, path: &Path) -> BlockingPau
 #[inline(always)]
 pub(crate) fn pause_blocking(name: &'static str, path: &Path) {
     #[cfg(test)]
+    if let Some((_, _, reached, release)) =
+        take(&BLOCKING_PAUSES, |(n, p, _, _)| *n == name && p == path)
     {
-        let armed = {
-            let mut pauses = BLOCKING_PAUSES.lock().unwrap();
-            pauses
-                .iter()
-                .position(|(n, p, _, _)| *n == name && p == path)
-                .map(|pos| pauses.remove(pos))
-        };
-        if let Some((_, _, reached, release)) = armed {
-            let _ = reached.send(());
-            if release.recv_timeout(BLOCKING_PAUSE_TIMEOUT).is_err() {
-                panic!("pause point {name} was not released: the runtime is blocked");
-            }
+        let _ = reached.send(());
+        if release.recv_timeout(BLOCKING_PAUSE_TIMEOUT).is_err() {
+            panic!("pause point {name} was not released: the runtime is blocked");
         }
     }
     #[cfg(not(test))]
