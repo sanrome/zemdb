@@ -1,9 +1,7 @@
 use super::*;
 use crate::api::router::build_router;
-use crate::config::ServerConfig;
+use crate::api::test_support::TestState;
 use crate::fail_point;
-use crate::relay::SnapshotRelay;
-use crate::schema_registry::SchemaRegistry;
 use crate::RoomManager;
 use axum::body::Body;
 use axum::http::{header, Request};
@@ -40,12 +38,10 @@ async fn room_schema(manager: &RoomManager, room_id: &RoomId) -> Arc<Schema> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_column_additions_leave_every_room_with_the_latest_schema() {
     let dir = tempdir().unwrap();
-    let config = Arc::new(ServerConfig {
-        data_dir: dir.path().to_path_buf(),
-        admin_secret: ADMIN_SECRET.to_string(),
-        ..ServerConfig::default()
+    let state = TestState::new(dir.path(), |config| {
+        config.admin_secret = ADMIN_SECRET.to_string();
     });
-    let registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
+    let (registry, manager) = (&state.registry, &state.manager);
     let schema_id = SchemaId::new("todo").unwrap();
     registry
         .register_schema(
@@ -55,19 +51,6 @@ async fn concurrent_column_additions_leave_every_room_with_the_latest_schema() {
                 .build(),
         )
         .unwrap();
-    let relay = Arc::new(
-        SnapshotRelay::new(
-            dir.path().join("snapshots"),
-            Duration::from_secs(60),
-            config.max_snapshot_bytes,
-        )
-        .unwrap(),
-    );
-    let manager = Arc::new(RoomManager::new(
-        Arc::clone(&config),
-        Arc::clone(&registry),
-        Arc::clone(&relay),
-    ));
     let rooms = [
         RoomId::new("room-a").unwrap(),
         RoomId::new("room-b").unwrap(),
@@ -78,14 +61,9 @@ async fn concurrent_column_additions_leave_every_room_with_the_latest_schema() {
             .await
             .unwrap();
         // The actor is running, so the reloads below reach it.
-        room_schema(&manager, room_id).await;
+        room_schema(manager, room_id).await;
     }
-    let app = build_router(AppState::new(
-        config,
-        Arc::clone(&registry),
-        Arc::clone(&manager),
-        relay,
-    ));
+    let app = build_router(state.app_state());
 
     // The first addition is durable and about to reload the rooms when a second addition runs
     // from start to finish, reloading them with the newer schema. The first reload then
@@ -114,7 +92,7 @@ async fn concurrent_column_additions_leave_every_room_with_the_latest_schema() {
     );
 
     for room_id in &rooms {
-        let schema = room_schema(&manager, room_id).await;
+        let schema = room_schema(manager, room_id).await;
         let tasks = schema.get_table_by_name("tasks").unwrap();
         assert!(tasks.get_column("priority").is_some(), "{room_id}");
         assert!(tasks.get_column("estimate").is_some(), "{room_id}");

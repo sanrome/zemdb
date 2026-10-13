@@ -8,6 +8,10 @@ pub mod router;
 pub mod serve;
 pub mod sse;
 
+#[cfg(test)]
+#[path = "tests/support.rs"]
+mod test_support;
+
 pub use auth::{
     generate_client_token, verify_client_token, verify_client_token_bound, AdminAuth,
     VerifiedClientToken,

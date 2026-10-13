@@ -1,14 +1,10 @@
 use super::*;
 use crate::api::auth::generate_client_token;
 use crate::api::router::build_router;
-use crate::config::ServerConfig;
+use crate::api::test_support::TestState;
 use crate::fail_point;
-use crate::relay::SnapshotRelay;
-use crate::schema_registry::SchemaRegistry;
-use crate::RoomManager;
 use axum::body::Body;
 use axum::http::Request;
-use std::sync::Arc;
 use std::time::Duration;
 use tempfile::{tempdir, TempDir};
 use tower::ServiceExt;
@@ -77,31 +73,17 @@ impl Fixture {
     /// A router over a room with one registered client.
     async fn new() -> Self {
         let dir = tempdir().unwrap();
-        let config = Arc::new(ServerConfig {
-            data_dir: dir.path().to_path_buf(),
-            auth_secret: AUTH_SECRET.to_string(),
-            ..ServerConfig::default()
+        let state = TestState::new(dir.path(), |config| {
+            config.auth_secret = AUTH_SECRET.to_string();
         });
-        let registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
         let schema_id = SchemaId::new("tasks").unwrap();
-        registry
+        state
+            .registry
             .register_schema(schema_id.clone(), schema())
             .unwrap();
-        let relay = Arc::new(
-            SnapshotRelay::new(
-                dir.path().join("snapshots"),
-                Duration::from_secs(60),
-                config.max_snapshot_bytes,
-            )
-            .unwrap(),
-        );
-        let manager = Arc::new(RoomManager::new(
-            Arc::clone(&config),
-            Arc::clone(&registry),
-            Arc::clone(&relay),
-        ));
         let room_id = RoomId::new("room").unwrap();
-        manager
+        state
+            .manager
             .create_room(room_id.clone(), schema_id, None)
             .await
             .unwrap();
@@ -109,7 +91,7 @@ impl Fixture {
         let token =
             generate_client_token(&client_id, &room_id, Duration::from_secs(300), AUTH_SECRET);
         let fx = Self {
-            app: build_router(AppState::new(config, registry, manager, relay)),
+            app: build_router(state.app_state()),
             dir,
             room_id,
             client_id,
@@ -183,18 +165,22 @@ impl Fixture {
     }
 }
 
+/// Asserts an error frame with `code`, answered with HTTP `expected`.
+fn assert_error(status: StatusCode, expected: StatusCode, code: ErrorCode, reply: &ServerMessage) {
+    assert_eq!(status, expected, "{reply:?}");
+    assert!(
+        matches!(reply, ServerMessage::Error { code: got, .. } if *got == code),
+        "{reply:?}"
+    );
+}
+
 /// Asserts a `BadRequest` error frame with HTTP 400.
 fn assert_bad_request(status: StatusCode, reply: &ServerMessage) {
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{reply:?}");
-    assert!(
-        matches!(
-            reply,
-            ServerMessage::Error {
-                code: ErrorCode::BadRequest,
-                ..
-            }
-        ),
-        "{reply:?}"
+    assert_error(
+        status,
+        StatusCode::BAD_REQUEST,
+        ErrorCode::BadRequest,
+        reply,
     );
 }
 
@@ -215,15 +201,13 @@ async fn commit_that_restarts_the_room_is_unavailable_with_retry_after() {
             .join("active.wal"),
     );
     let (status, headers, reply) = fx.post("commit", &fx.commit(2, 1)).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{reply:?}");
+    assert_error(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        ErrorCode::Unavailable,
+        &reply,
+    );
     assert_eq!(headers[header::RETRY_AFTER], "1");
-    assert!(matches!(
-        reply,
-        ServerMessage::Error {
-            code: ErrorCode::Unavailable,
-            ..
-        }
-    ));
 
     // Retrying is safe and succeeds once the room is back.
     let (status, _, reply) = fx.post("commit", &fx.commit(2, 1)).await;
@@ -248,18 +232,13 @@ async fn request_that_makes_the_room_panic_is_internal_and_the_room_recovers() {
         &fx.dir.path().join("rooms").join(fx.room_id.as_str()),
     );
     let (status, headers, reply) = fx.post("heartbeat", &heartbeat).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{reply:?}");
-    assert!(headers.get(header::RETRY_AFTER).is_none());
-    assert!(
-        matches!(
-            reply,
-            ServerMessage::Error {
-                code: ErrorCode::Internal,
-                ..
-            }
-        ),
-        "{reply:?}"
+    assert_error(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorCode::Internal,
+        &reply,
     );
+    assert!(headers.get(header::RETRY_AFTER).is_none());
 
     // The next request reopens the room from disk, with the client still registered.
     let (status, _, reply) = fx.post("heartbeat", &heartbeat).await;
@@ -400,16 +379,11 @@ async fn registration_has_its_own_small_body_limit() {
 
     // One byte more is rejected before it is buffered, as the general body limit does.
     let (status, reply) = register_with_frame_of(&fx, MAX_REGISTER_BODY_SIZE + 1).await;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{reply:?}");
-    assert!(
-        matches!(
-            reply,
-            ServerMessage::Error {
-                code: ErrorCode::BadRequest,
-                ..
-            }
-        ),
-        "{reply:?}"
+    assert_error(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        ErrorCode::BadRequest,
+        &reply,
     );
 }
 
@@ -503,14 +477,13 @@ fn response_that_cannot_be_encoded_is_an_internal_error_frame() {
         data: vec![0u8; MAX_MESSAGE_SIZE as usize].into(),
     };
     let response = binary_response(StatusCode::OK, &oversized);
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let status = response.status();
     let body =
         futures::executor::block_on(axum::body::to_bytes(response.into_body(), 1 << 20)).unwrap();
-    assert!(matches!(
-        decode_message::<ServerMessage>(&body).unwrap(),
-        ServerMessage::Error {
-            code: ErrorCode::Internal,
-            ..
-        }
-    ));
+    assert_error(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        ErrorCode::Internal,
+        &decode_message(&body).unwrap(),
+    );
 }

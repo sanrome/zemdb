@@ -1,9 +1,5 @@
 use super::*;
-use crate::config::ServerConfig;
-use crate::relay::SnapshotRelay;
-use crate::schema_registry::SchemaRegistry;
-use crate::RoomManager;
-use std::sync::Arc;
+use crate::api::test_support::TestState;
 use tempfile::{tempdir, TempDir};
 use tokio::sync::mpsc;
 
@@ -11,27 +7,10 @@ use tokio::sync::mpsc;
 /// subscriptions with `Unavailable`, as an actor shutting down for inactivity does, and
 /// accepts the next ones.
 fn state_with_refusing_room(dir: &TempDir, refusals: usize) -> (AppState, RoomId) {
-    let config = Arc::new(ServerConfig {
-        data_dir: dir.path().to_path_buf(),
-        ..ServerConfig::default()
-    });
-    let registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
-    let relay = Arc::new(
-        SnapshotRelay::new(
-            dir.path().join("snapshots"),
-            Duration::from_secs(60),
-            config.max_snapshot_bytes,
-        )
-        .unwrap(),
-    );
-    let manager = Arc::new(RoomManager::new(
-        Arc::clone(&config),
-        Arc::clone(&registry),
-        Arc::clone(&relay),
-    ));
+    let state = TestState::new(dir.path(), |_| {});
     let room_id = RoomId::new("room").unwrap();
     let (sender, mut receiver) = mpsc::channel(8);
-    let exit = manager.install_test_actor(&room_id, sender);
+    let exit = state.manager.install_test_actor(&room_id, sender);
     tokio::spawn(async move {
         let _exit = exit;
         let (events, _) = broadcast::channel(8);
@@ -47,7 +26,7 @@ fn state_with_refusing_room(dir: &TempDir, refusals: usize) -> (AppState, RoomId
             }
         }
     });
-    (AppState::new(config, registry, manager, relay), room_id)
+    (state.app_state(), room_id)
 }
 
 #[tokio::test]
