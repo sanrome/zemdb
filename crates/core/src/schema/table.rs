@@ -16,8 +16,6 @@ fn check_column_type(table: &str, col: &ColumnDef) -> Result<(), ValidationError
         return Err(ValidationError::InvalidColumnDataType {
             table: table.to_string(),
             column: col.name.clone(),
-            message: "Columns cannot have DataType::Null as their schema definition type"
-                .to_string(),
         });
     }
     Ok(())

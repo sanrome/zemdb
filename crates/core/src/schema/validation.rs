@@ -67,12 +67,11 @@ pub enum ValidationError {
     #[error("Primary key definition cannot be empty for table '{0}'")]
     EmptyPrimaryKeyDefinition(String),
 
-    #[error("Invalid column data type for column '{column}' in table '{table}': {message}")]
-    InvalidColumnDataType {
-        table: String,
-        column: String,
-        message: String,
-    },
+    #[error(
+        "Invalid column data type for column '{column}' in table '{table}': \
+         Columns cannot have DataType::Null as their schema definition type"
+    )]
+    InvalidColumnDataType { table: String, column: String },
 
     #[error("CompactRow arity mismatch for table '{table}': expected {expected}, got {actual}")]
     CompactRowArityMismatch {

@@ -346,10 +346,18 @@ fn test_table_schema_add_column_evolution() {
     // 4. Adding DataType::Null is rejected
     let null_col = ColumnDef::new("invalid", DataType::Null).nullable(true);
     let null_err = table.add_column(null_col).unwrap_err();
-    assert!(matches!(
+    assert_eq!(
+        null_err.to_string(),
+        "Invalid column data type for column 'invalid' in table 'kanban': \
+         Columns cannot have DataType::Null as their schema definition type"
+    );
+    assert_eq!(
         null_err,
-        ValidationError::InvalidColumnDataType { .. }
-    ));
+        ValidationError::InvalidColumnDataType {
+            table: "kanban".to_string(),
+            column: "invalid".to_string(),
+        }
+    );
 }
 
 #[test]

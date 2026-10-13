@@ -162,6 +162,7 @@
 - **Propuesta:** un helper privado `fn check_column_type(table: &str, col: &ColumnDef) -> Result<(), ValidationError>`, llamado en el mismo punto de cada función para conservar la precedencia: en `try_new` antes del duplicado, en `add_column` al final. Opcional (**a verificar**, porque cambia la forma de una variante pública): quitar el campo `message` y poner el texto en el `#[error]`. El `Display` queda idéntico, y el único test (`schema_validation_tests.rs:370`) hace match con `{ .. }`.
 - **Ahorro estimado:** ~5–8 líneas · **Riesgo:** bajo · **Prioridad:** media
 - **Estado:** ✅ aplicada en parte (paso 2): helper privado `check_column_type` en `table.rs`, llamado en el mismo punto de `try_new` y `add_column`. ⏭️ no aplicado quitar el campo `message`: cambia la forma de una variante pública y no es consecuencia del helper.
+- **Estado:** ✅ aplicada (paso 4): el campo `message` se quitó y el texto pasó al `#[error]`; el `Display` es idéntico. Ningún crate construye ni lee la variante fuera de `core` (no se serializa), y el test de `add_column` ahora compara la variante completa y su texto.
 
 ### Q8. `impl Serialize for Schema` con newtype interno
 - **Dónde:** `global.rs:63-83`.
@@ -198,6 +199,7 @@
 - `mod.rs:1-4`: los submódulos son `pub` y además se reexportan con `*`, así que cada tipo tiene dos rutas. No hay usos de `schema::{table,global,column,validation}::` fuera del módulo. Podrían ser `mod` privados (0 líneas, API más limpia). **A verificar**: cambia las rutas de rustdoc.
 - **Ahorro estimado:** ~6–8 líneas · **Riesgo:** bajo · **Prioridad:** baja
 - **Estado:** ✅ aplicada en parte (paso 1): `Schema::new` con `Self::default()`, paso 3 de `validate_row` aplanado y `match … cmp` en `validate_column_updates`. ⏭️ no aplicado `last_key_value` en `next_table_id`: es cosmético y opcional, y `keys().next_back()` ya se lee bien. Los submódulos privados de `mod.rs` cambian la API pública y quedan para el paso 4.
+- **Estado:** ✅ aplicada (paso 4): los submódulos de `schema` son privados; ningún crate usaba las rutas `schema::{column,global,table,validation}::` y los tipos siguen saliendo por los `pub use` de `schema` y de la raíz.
 
 ## Lo que conviene dejar como está
 
