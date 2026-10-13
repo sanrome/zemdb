@@ -3,52 +3,42 @@ use axum::http::header::RETRY_AFTER;
 
 #[test]
 fn each_error_maps_to_its_code_and_status() {
+    use ErrorCode as C;
+    use ServerError::*;
+    use StatusCode as S;
+    let e = |variant: fn(String) -> ServerError| variant(String::new());
+    let io = Io(std::io::Error::other("disk"));
+    let version = e(ProtocolVersionMismatch);
+    let invalid_sequence = InvalidSequence {
+        expected: SequenceNumber::new(10),
+        actual: SequenceNumber::new(20),
+    };
+    // (error, code, status), one row per variant.
     let cases = [
-        (
-            ServerError::Unauthorized(String::new()),
-            ErrorCode::Unauthorized,
-            StatusCode::UNAUTHORIZED,
-        ),
-        (
-            ServerError::Forbidden(String::new()),
-            ErrorCode::Forbidden,
-            StatusCode::FORBIDDEN,
-        ),
-        (
-            ServerError::ClientNotRegistered(String::new()),
-            ErrorCode::ClientNotRegistered,
-            StatusCode::CONFLICT,
-        ),
-        (
-            ServerError::ProtocolVersionMismatch(String::new()),
-            ErrorCode::ProtocolVersionMismatch,
-            StatusCode::BAD_REQUEST,
-        ),
-        (
-            ServerError::Unavailable(String::new()),
-            ErrorCode::Unavailable,
-            StatusCode::SERVICE_UNAVAILABLE,
-        ),
-        (
-            ServerError::Timeout(String::new()),
-            ErrorCode::Timeout,
-            StatusCode::GATEWAY_TIMEOUT,
-        ),
-        (
-            ServerError::SchemaAlreadyExists(String::new()),
-            ErrorCode::SchemaAlreadyExists,
-            StatusCode::CONFLICT,
-        ),
-        (
-            ServerError::RequestTimeout(String::new()),
-            ErrorCode::RequestTimeout,
-            StatusCode::REQUEST_TIMEOUT,
-        ),
-        (
-            ServerError::Internal(String::new()),
-            ErrorCode::Internal,
-            StatusCode::INTERNAL_SERVER_ERROR,
-        ),
+        (io, C::Internal, S::INTERNAL_SERVER_ERROR),
+        (e(Wal), C::Internal, S::INTERNAL_SERVER_ERROR),
+        (e(WalCorruption), C::Internal, S::INTERNAL_SERVER_ERROR),
+        (e(Config), C::Internal, S::INTERNAL_SERVER_ERROR),
+        (e(RoomNotFound), C::RoomNotFound, S::NOT_FOUND),
+        (e(RoomAlreadyExists), C::RoomAlreadyExists, S::CONFLICT),
+        (e(SchemaNotFound), C::SchemaNotFound, S::NOT_FOUND),
+        (e(SchemaAlreadyExists), C::SchemaAlreadyExists, S::CONFLICT),
+        (e(SchemaViolation), C::SchemaViolation, S::BAD_REQUEST),
+        (BehindCompaction, C::BehindCompaction, S::GONE),
+        (e(ClientNotRegistered), C::ClientNotRegistered, S::CONFLICT),
+        (e(RoomLocked), C::RoomLocked, S::LOCKED),
+        (e(Unauthorized), C::Unauthorized, S::UNAUTHORIZED),
+        (e(Forbidden), C::Forbidden, S::FORBIDDEN),
+        (RateLimited, C::RateLimited, S::TOO_MANY_REQUESTS),
+        (e(Serialization), C::Internal, S::INTERNAL_SERVER_ERROR),
+        (e(Internal), C::Internal, S::INTERNAL_SERVER_ERROR),
+        (e(Unavailable), C::Unavailable, S::SERVICE_UNAVAILABLE),
+        (e(Timeout), C::Timeout, S::GATEWAY_TIMEOUT),
+        (e(RequestTimeout), C::RequestTimeout, S::REQUEST_TIMEOUT),
+        (invalid_sequence, C::InvalidSequence, S::BAD_REQUEST),
+        (version, C::ProtocolVersionMismatch, S::BAD_REQUEST),
+        (e(BadRequest), C::BadRequest, S::BAD_REQUEST),
+        (e(SnapshotSuperseded), C::SnapshotSuperseded, S::CONFLICT),
     ];
     for (err, code, status) in cases {
         assert_eq!(err.to_error_code(), code, "{err:?}");
@@ -86,61 +76,4 @@ fn json_unavailable_response_carries_retry_after() {
 
     let response = ServerError::Internal("bug".to_string()).into_response();
     assert!(response.headers().get(RETRY_AFTER).is_none());
-}
-
-#[test]
-fn test_server_error_mapping() {
-    let schema_err = ServerError::SchemaViolation("Missing column 'title'".to_string());
-    assert_eq!(schema_err.to_error_code(), ErrorCode::SchemaViolation);
-    assert_eq!(
-        schema_err.to_status_code(),
-        axum::http::StatusCode::BAD_REQUEST
-    );
-
-    let unauth_err = ServerError::Unauthorized("Invalid bearer token".to_string());
-    assert_eq!(unauth_err.to_error_code(), ErrorCode::Unauthorized);
-    assert_eq!(
-        unauth_err.to_status_code(),
-        axum::http::StatusCode::UNAUTHORIZED
-    );
-
-    let behind_err = ServerError::BehindCompaction;
-    assert_eq!(behind_err.to_error_code(), ErrorCode::BehindCompaction);
-    assert_eq!(behind_err.to_status_code(), axum::http::StatusCode::GONE);
-
-    let room_nf = ServerError::RoomNotFound("room-123".to_string());
-    assert_eq!(room_nf.to_error_code(), ErrorCode::RoomNotFound);
-    assert_eq!(room_nf.to_status_code(), axum::http::StatusCode::NOT_FOUND);
-
-    let invalid_seq_err = ServerError::InvalidSequence {
-        expected: SequenceNumber::new(10),
-        actual: SequenceNumber::new(20),
-    };
-    assert_eq!(invalid_seq_err.to_error_code(), ErrorCode::InvalidSequence);
-    assert_eq!(
-        invalid_seq_err.to_status_code(),
-        axum::http::StatusCode::BAD_REQUEST
-    );
-
-    let gw_err = ServerError::Timeout("Actor timed out".to_string());
-    assert_eq!(gw_err.to_error_code(), ErrorCode::Timeout);
-    assert_eq!(
-        gw_err.to_status_code(),
-        axum::http::StatusCode::GATEWAY_TIMEOUT
-    );
-
-    let locked_err =
-        ServerError::RoomLocked("Room is already locked by another process".to_string());
-    assert_eq!(locked_err.to_error_code(), ErrorCode::RoomLocked);
-    assert_eq!(locked_err.to_status_code(), axum::http::StatusCode::LOCKED);
-
-    let superseded_err = ServerError::SnapshotSuperseded("a newer snapshot is active".to_string());
-    assert_eq!(
-        superseded_err.to_error_code(),
-        ErrorCode::SnapshotSuperseded
-    );
-    assert_eq!(
-        superseded_err.to_status_code(),
-        axum::http::StatusCode::CONFLICT
-    );
 }

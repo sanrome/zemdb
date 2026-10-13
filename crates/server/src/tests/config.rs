@@ -2,6 +2,10 @@ use super::*;
 use crate::log::policy::MAX_POLICY_DURATION_SECS;
 use std::time::Duration;
 
+const STRONG_AUTH: &str = "9f2c7e1a5b8d3f6e0a4c7b1d9e2f5a8c";
+const STRONG_ADMIN: &str = "3b6e9a2d5c8f1e4a7d0b3c6f9e2a5d8b";
+const SEVEN_DAYS_SECS: u64 = 7 * 24 * 60 * 60;
+
 fn config_with(auth: &str, admin: &str) -> ServerConfig {
     ServerConfig {
         auth_secret: auth.to_string(),
@@ -10,43 +14,43 @@ fn config_with(auth: &str, admin: &str) -> ServerConfig {
     }
 }
 
-const STRONG_AUTH: &str = "9f2c7e1a5b8d3f6e0a4c7b1d9e2f5a8c";
-const STRONG_ADMIN: &str = "3b6e9a2d5c8f1e4a7d0b3c6f9e2a5d8b";
-
-#[test]
-fn built_in_development_secrets_are_rejected() {
-    assert!(ServerConfig::default().validate_secrets().is_err());
-    assert!(config_with(STRONG_AUTH, DEV_ADMIN_SECRET)
-        .validate_secrets()
-        .is_err());
-    assert!(config_with(DEV_AUTH_SECRET, STRONG_ADMIN)
-        .validate_secrets()
-        .is_err());
+fn strong_config() -> ServerConfig {
+    config_with(STRONG_AUTH, STRONG_ADMIN)
 }
 
 #[test]
-fn empty_and_short_secrets_are_rejected() {
-    assert!(config_with("", STRONG_ADMIN).validate_secrets().is_err());
-    assert!(config_with(STRONG_AUTH, "").validate_secrets().is_err());
+fn unsafe_secrets_are_rejected_naming_the_problem() {
+    let default = ServerConfig::default();
     let short = "x".repeat(MIN_SECRET_LEN - 1);
-    assert!(config_with(&short, STRONG_ADMIN)
-        .validate_secrets()
-        .is_err());
-    assert!(config_with(STRONG_AUTH, &short).validate_secrets().is_err());
-}
-
-#[test]
-fn identical_auth_and_admin_secrets_are_rejected() {
-    assert!(config_with(STRONG_AUTH, STRONG_AUTH)
-        .validate_secrets()
-        .is_err());
+    let cases = [
+        // The built-in development secrets.
+        (
+            default.auth_secret.as_str(),
+            default.admin_secret.as_str(),
+            "ZEMDB_AUTH_SECRET",
+        ),
+        (STRONG_AUTH, DEV_ADMIN_SECRET, "ZEMDB_ADMIN_SECRET"),
+        (DEV_AUTH_SECRET, STRONG_ADMIN, "ZEMDB_AUTH_SECRET"),
+        // Empty and short secrets.
+        ("", STRONG_ADMIN, "ZEMDB_AUTH_SECRET"),
+        (STRONG_AUTH, "", "ZEMDB_ADMIN_SECRET"),
+        (&short, STRONG_ADMIN, "ZEMDB_AUTH_SECRET"),
+        (STRONG_AUTH, &short, "ZEMDB_ADMIN_SECRET"),
+        // The same secret for clients and admin.
+        (STRONG_AUTH, STRONG_AUTH, "must be different"),
+    ];
+    for (auth, admin, expected) in cases {
+        let err = config_with(auth, admin).validate_secrets().unwrap_err();
+        assert!(
+            matches!(&err, ServerError::Config(msg) if msg.contains(expected)),
+            "{auth:?}/{admin:?}: {err:?}"
+        );
+    }
 }
 
 #[test]
 fn strong_distinct_secrets_are_accepted() {
-    assert!(config_with(STRONG_AUTH, STRONG_ADMIN)
-        .validate_secrets()
-        .is_ok());
+    assert!(strong_config().validate_secrets().is_ok());
 }
 
 #[test]
@@ -69,17 +73,17 @@ fn load_with_max_snapshot_bytes(max: u64) -> Result<ServerConfig, ServerError> {
 
 #[test]
 fn max_snapshot_bytes_outside_its_range_fails_to_load() {
-    for max in [0, 1024 * 1024 - 1, 64 * 1024 * 1024 * 1024 + 1] {
+    for max in [0, MIN_MAX_SNAPSHOT_BYTES - 1, MAX_MAX_SNAPSHOT_BYTES + 1] {
         let err = load_with_max_snapshot_bytes(max).unwrap_err().to_string();
         assert!(err.contains("max_snapshot_bytes"), "{max}: {err}");
     }
-    for max in [1024 * 1024, 512 * 1024 * 1024, 64 * 1024 * 1024 * 1024] {
-        assert_eq!(
-            load_with_max_snapshot_bytes(max)
-                .unwrap()
-                .max_snapshot_bytes,
-            max
-        );
+    for max in [
+        MIN_MAX_SNAPSHOT_BYTES,
+        512 * 1024 * 1024,
+        MAX_MAX_SNAPSHOT_BYTES,
+    ] {
+        let loaded = load_with_max_snapshot_bytes(max).unwrap();
+        assert_eq!(loaded.max_snapshot_bytes, max);
     }
 }
 
@@ -87,68 +91,18 @@ fn max_snapshot_bytes_outside_its_range_fails_to_load() {
 fn lifecycle_and_snapshot_defaults() {
     let config = ServerConfig::default();
     assert_eq!(config.dormant_after_secs, None);
-    assert_eq!(config.snapshot_ttl_secs, 7 * 24 * 60 * 60);
-    assert_eq!(config.snapshot_demand_ttl_secs, 7 * 24 * 60 * 60);
+    assert_eq!(config.snapshot_ttl_secs, SEVEN_DAYS_SECS);
+    assert_eq!(config.snapshot_demand_ttl_secs, SEVEN_DAYS_SECS);
 
     let parsed = ServerConfig::from_toml_str("").unwrap();
     assert_eq!(parsed.dormant_after_secs, None);
-    assert_eq!(parsed.snapshot_demand_ttl_secs, 7 * 24 * 60 * 60);
+    assert_eq!(parsed.snapshot_demand_ttl_secs, SEVEN_DAYS_SECS);
 
     let parsed =
         ServerConfig::from_toml_str("dormant_after_secs = 3600\nsnapshot_demand_ttl_secs = 120\n")
             .unwrap();
     assert_eq!(parsed.dormant_after_secs, Some(3600));
     assert_eq!(parsed.snapshot_demand_ttl_secs, 120);
-}
-
-fn strong_config() -> ServerConfig {
-    config_with(STRONG_AUTH, STRONG_ADMIN)
-}
-
-#[test]
-fn snapshot_demand_ttl_below_a_minute_is_rejected() {
-    for ttl in [0, 1, 59] {
-        let err = ServerConfig {
-            snapshot_demand_ttl_secs: ttl,
-            ..strong_config()
-        }
-        .validate()
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("ZEMDB_SNAPSHOT_DEMAND_TTL_SECS"),
-            "{ttl}: {err}"
-        );
-    }
-    for ttl in [60, 7 * 24 * 60 * 60] {
-        ServerConfig {
-            snapshot_demand_ttl_secs: ttl,
-            ..strong_config()
-        }
-        .validate()
-        .unwrap();
-    }
-}
-
-#[test]
-fn zero_dormancy_timeout_is_rejected() {
-    let err = ServerConfig {
-        dormant_after_secs: Some(0),
-        ..strong_config()
-    }
-    .validate()
-    .unwrap_err()
-    .to_string();
-    assert!(err.contains("ZEMDB_DORMANT_AFTER_SECS"), "{err}");
-
-    for dormant_after in [None, Some(1), Some(3600)] {
-        ServerConfig {
-            dormant_after_secs: dormant_after,
-            ..strong_config()
-        }
-        .validate()
-        .unwrap();
-    }
 }
 
 /// Applies the environment `vars` to the default configuration.
@@ -171,12 +125,15 @@ fn unparsable_environment_values_fail_naming_the_variable() {
         ("ZEMDB_SNAPSHOT_TTL_SECS", "1h"),
         ("ZEMDB_MAX_SNAPSHOT_BYTES", "1e9"),
         ("ZEMDB_RAM_MAX_OPS", "many"),
+        ("ZEMDB_RAM_MAX_BYTES", "2MiB"),
+        ("ZEMDB_SEGMENT_MAX_BYTES", "4M"),
         ("ZEMDB_RAM_TTL_SECS", "0x10"),
         ("ZEMDB_WARM_TTL_SECS", "1.5"),
         ("ZEMDB_COLD_TTL_SECS", "-30"),
         ("ZEMDB_ROOM_MAX_DISK_BYTES", "500MB"),
         ("ZEMDB_LEASE_TIMEOUT_SECS", " 90"),
         ("ZEMDB_DORMANT_AFTER_SECS", "never"),
+        ("ZEMDB_FORGET_DORMANT_AFTER_SECS", "1d"),
         ("ZEMDB_SNAPSHOT_DEMAND_TTL_SECS", "7d"),
         ("ZEMDB_ROOM_IDLE_TIMEOUT_SECS", "off"),
         ("ZEMDB_HEADER_READ_TIMEOUT_SECS", "10s"),
@@ -244,7 +201,7 @@ fn default_configuration_gives_the_default_policy() {
 #[test]
 fn lifecycle_defaults_outside_their_range_fail_naming_the_variable() {
     type Case = (fn(&mut ServerConfig), &'static str);
-    let cases: [Case; 10] = [
+    let cases: [Case; 14] = [
         (|c| c.ram_max_ops = 0, "ZEMDB_RAM_MAX_OPS"),
         (|c| c.ram_max_ops = 100_001, "ZEMDB_RAM_MAX_OPS"),
         (|c| c.ram_ttl_secs = 0, "ZEMDB_RAM_TTL_SECS"),
@@ -261,6 +218,22 @@ fn lifecycle_defaults_outside_their_range_fail_naming_the_variable() {
         (
             |c| c.dormant_after_secs = Some(u64::MAX),
             "ZEMDB_DORMANT_AFTER_SECS",
+        ),
+        (
+            |c| c.dormant_after_secs = Some(0),
+            "ZEMDB_DORMANT_AFTER_SECS",
+        ),
+        (
+            |c| c.snapshot_demand_ttl_secs = 0,
+            "ZEMDB_SNAPSHOT_DEMAND_TTL_SECS",
+        ),
+        (
+            |c| c.snapshot_demand_ttl_secs = 1,
+            "ZEMDB_SNAPSHOT_DEMAND_TTL_SECS",
+        ),
+        (
+            |c| c.snapshot_demand_ttl_secs = 59,
+            "ZEMDB_SNAPSHOT_DEMAND_TTL_SECS",
         ),
         (
             |c| c.forget_dormant_after_secs = 0,
@@ -280,6 +253,24 @@ fn lifecycle_defaults_outside_their_range_fail_naming_the_variable() {
 }
 
 #[test]
+fn lifecycle_defaults_at_their_limits_are_accepted() {
+    let cases: [fn(&mut ServerConfig); 5] = [
+        |c| c.snapshot_demand_ttl_secs = 60,
+        |c| c.snapshot_demand_ttl_secs = SEVEN_DAYS_SECS,
+        |c| c.dormant_after_secs = None,
+        |c| c.dormant_after_secs = Some(1),
+        |c| c.dormant_after_secs = Some(3600),
+    ];
+    for (index, configure) in cases.into_iter().enumerate() {
+        let mut config = strong_config();
+        configure(&mut config);
+        if let Err(err) = config.validate() {
+            panic!("case {index}: {err}");
+        }
+    }
+}
+
+#[test]
 fn empty_environment_values_count_as_unset() {
     // Deployment templates often expand a missing variable to an empty string.
     let names = [
@@ -292,12 +283,15 @@ fn empty_environment_values_count_as_unset() {
         "ZEMDB_SNAPSHOT_TTL_SECS",
         "ZEMDB_MAX_SNAPSHOT_BYTES",
         "ZEMDB_RAM_MAX_OPS",
+        "ZEMDB_RAM_MAX_BYTES",
+        "ZEMDB_SEGMENT_MAX_BYTES",
         "ZEMDB_RAM_TTL_SECS",
         "ZEMDB_WARM_TTL_SECS",
         "ZEMDB_COLD_TTL_SECS",
         "ZEMDB_ROOM_MAX_DISK_BYTES",
         "ZEMDB_LEASE_TIMEOUT_SECS",
         "ZEMDB_DORMANT_AFTER_SECS",
+        "ZEMDB_FORGET_DORMANT_AFTER_SECS",
         "ZEMDB_SNAPSHOT_DEMAND_TTL_SECS",
         "ZEMDB_ROOM_IDLE_TIMEOUT_SECS",
         "ZEMDB_HEADER_READ_TIMEOUT_SECS",
@@ -367,7 +361,7 @@ fn http_limits_outside_their_range_fail_naming_the_variable() {
 }
 
 #[test]
-fn test_server_config_toml_and_env_overrides() {
+fn toml_settings_load_and_environment_variables_override_them() {
     let toml_str = r#"
         host = "0.0.0.0"
         port = 9000
@@ -383,6 +377,8 @@ fn test_server_config_toml_and_env_overrides() {
     assert_eq!(config.host, "0.0.0.0");
     assert_eq!(config.port, 9000);
     assert_eq!(config.data_dir.to_str().unwrap(), "/var/zemdb");
+    assert_eq!(config.auth_secret, "custom_cluster_secret_123456789!");
+    assert_eq!(config.admin_secret, "custom_admin_secret_1234567890!");
     assert_eq!(config.lease_timeout_secs, 120);
     assert_eq!(config.dedup_lru_capacity, 25000);
     assert_eq!(config.snapshot_ttl_secs, 300);
@@ -391,6 +387,10 @@ fn test_server_config_toml_and_env_overrides() {
     let vars = std::collections::HashMap::from([
         ("ZEMDB_PORT", "9999"),
         ("ZEMDB_HOST", "192.168.1.50"),
+        ("ZEMDB_DATA_DIR", "/srv/zemdb"),
+        ("ZEMDB_AUTH_SECRET", STRONG_AUTH),
+        ("ZEMDB_ADMIN_SECRET", STRONG_ADMIN),
+        ("ZEMDB_DEDUP_LRU_CAPACITY", "50000"),
         ("ZEMDB_SNAPSHOT_TTL_SECS", "1800"),
         ("ZEMDB_MAX_SNAPSHOT_BYTES", "1048576"),
         ("ZEMDB_DORMANT_AFTER_SECS", "7200"),
@@ -404,6 +404,10 @@ fn test_server_config_toml_and_env_overrides() {
 
     assert_eq!(config.port, 9999);
     assert_eq!(config.host, "192.168.1.50");
+    assert_eq!(config.data_dir.to_str().unwrap(), "/srv/zemdb");
+    assert_eq!(config.auth_secret, STRONG_AUTH);
+    assert_eq!(config.admin_secret, STRONG_ADMIN);
+    assert_eq!(config.dedup_lru_capacity, 50000);
     assert_eq!(config.snapshot_ttl_secs, 1800);
     assert_eq!(config.max_snapshot_bytes, 1024 * 1024);
     assert_eq!(config.dormant_after_secs, Some(7200));

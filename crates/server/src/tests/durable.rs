@@ -47,7 +47,7 @@ fn create_dir_all_synced_creates_missing_components() {
 }
 
 #[test]
-fn create_dir_all_synced_syncs_the_parent_of_each_new_component() {
+fn create_dir_all_synced_fails_when_syncing_a_new_parent_fails() {
     let dir = tempdir().unwrap();
     let first = dir.path().join("a");
 
