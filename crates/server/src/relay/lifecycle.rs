@@ -1,6 +1,7 @@
 //! Snapshot relay lifecycle: room deletion, expiry of snapshots and idle uploads, and the
 //! background sweeper.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Weak};
 use tokio::time::Instant;
 use tracing::info;
@@ -44,15 +45,13 @@ impl SnapshotRelay {
     /// Deletes expired snapshots and idle uploads of every room, in memory and on disk.
     pub async fn cleanup_expired(&self) {
         let now = Instant::now();
-        let mut rooms: Vec<RoomId> = self
+        let rooms: BTreeSet<RoomId> = self
             .snapshots
             .iter()
             .filter(|s| s.value().is_expired(now, self.ttl))
             .map(|s| s.key().clone())
+            .chain(self.slots.iter().map(|s| s.key().clone()))
             .collect();
-        rooms.extend(self.slots.iter().map(|s| s.key().clone()));
-        rooms.sort();
-        rooms.dedup();
 
         for room_id in rooms {
             let slot = self.slot(&room_id);
@@ -88,7 +87,7 @@ impl SnapshotRelay {
         })
     }
 
-    /// Drops the room's expired snapshot and idle upload. Requires the room lock.
+    /// Drops the room's expired snapshot and idle upload.
     pub(super) async fn expire_locked(&self, room_id: &RoomId, slot: &mut RoomSlot) {
         let now = Instant::now();
         let mut doomed = Vec::new();
@@ -98,11 +97,9 @@ impl SnapshotRelay {
         {
             doomed.push(expired.path);
         }
-        if slot.upload.as_ref().is_some_and(|u| u.is_idle(now)) {
-            if let Some(idle) = slot.upload.take() {
-                info!(room = %room_id, seq = %idle.head_seq, "Discarding idle snapshot upload");
-                doomed.push(idle.path);
-            }
+        if let Some(idle) = slot.upload.take_if(|u| u.is_idle(now)) {
+            info!(room = %room_id, seq = %idle.head_seq, "Discarding idle snapshot upload");
+            doomed.push(idle.path);
         }
         self.remove_files(doomed).await;
     }

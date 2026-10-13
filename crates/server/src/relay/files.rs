@@ -27,7 +27,6 @@ pub(super) const TMP_EXTENSION: &str = "tmp";
 /// Buffer size used to hash and validate snapshot files.
 const VERIFY_BUFFER_BYTES: usize = 1024 * 1024;
 
-/// Runs blocking file work on Tokio's blocking pool.
 pub(super) async fn run_blocking<T, F>(work: F) -> Result<T, ServerError>
 where
     F: FnOnce() -> Result<T, ServerError> + Send + 'static,
@@ -106,9 +105,8 @@ pub(super) fn remove_room_files(
 pub(super) fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
     injected("relay_remove_file", path)?;
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
+        other => other,
     }
 }
 
@@ -176,15 +174,6 @@ pub(super) enum VerifyError {
     /// The file is not the snapshot it claims to be.
     Invalid(String),
     Io(std::io::Error),
-}
-
-impl std::fmt::Display for VerifyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            VerifyError::Invalid(msg) => f.write_str(msg),
-            VerifyError::Io(err) => write!(f, "{err}"),
-        }
-    }
 }
 
 /// Reads a snapshot file once, checking its envelope header and CRC and that its BLAKE3 hash

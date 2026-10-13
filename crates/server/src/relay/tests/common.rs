@@ -8,7 +8,6 @@ pub(super) use bytes::Bytes;
 pub(super) use std::fs::{self, File};
 pub(super) use std::future::{ready, Ready};
 pub(super) use std::path::{Path, PathBuf};
-pub(super) use std::sync::Arc;
 pub(super) use std::time::Duration;
 pub(super) use tempfile::{tempdir, TempDir};
 pub(super) use zemdb_core::id::{ClientId, CorrelationId, RoomId, SequenceNumber};

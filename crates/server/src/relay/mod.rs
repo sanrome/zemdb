@@ -67,7 +67,7 @@ struct RoomSlot {
     purged: bool,
 }
 
-/// Ephemeral relay facilitating state-transfer chunks between peers or cold snapshots and bootstrapping clients.
+/// Snapshot relay of every room (see the module docs).
 #[derive(Debug)]
 pub struct SnapshotRelay {
     /// Active snapshot of each room. Only changed while holding the room's slot lock.
@@ -110,9 +110,8 @@ impl SnapshotRelay {
         Ok(relay)
     }
 
-    /// Returns the active snapshot sequence number for a room if one is currently staged and valid.
-    ///
-    /// Reads memory only, so the room actor can call it.
+    /// Sequence of the room's unexpired active snapshot. Reads memory only, so the room actor
+    /// can call it.
     pub fn active_snapshot_seq(&self, room_id: &RoomId) -> Option<SequenceNumber> {
         self.active(room_id).map(|s| s.head_seq)
     }
@@ -129,18 +128,13 @@ impl SnapshotRelay {
 
     /// Makes a durable snapshot file the room's active snapshot, then deletes the files it
     /// makes obsolete: the previous snapshot and an upload for a sequence not above it.
-    /// Requires the room lock.
     async fn install(&self, room_id: &RoomId, slot: &mut RoomSlot, staged: StagedSnapshot) {
         let mut obsolete = Vec::new();
-        if slot
-            .upload
-            .as_ref()
-            .is_some_and(|u| u.head_seq <= staged.head_seq)
-        {
-            if let Some(upload) = slot.upload.take() {
-                obsolete.push(upload.path);
-            }
-        }
+        obsolete.extend(
+            slot.upload
+                .take_if(|u| u.head_seq <= staged.head_seq)
+                .map(|u| u.path),
+        );
         let new_path = staged.path.clone();
         if let Some(previous) = self.snapshots.insert(room_id.clone(), staged) {
             if previous.path != new_path {
@@ -157,19 +151,19 @@ impl SnapshotRelay {
             return;
         }
         let result = run_blocking(move || {
-            let mut dirs = Vec::new();
             for path in &paths {
                 if let Err(err) = remove_file_if_exists(path) {
                     warn!(path = ?path, error = %err, "Failed to delete snapshot relay file");
                 }
-                if let Some(dir) = path.parent() {
-                    if !dirs.iter().any(|d: &PathBuf| d == dir) {
-                        dirs.push(dir.to_path_buf());
-                    }
+            }
+            let mut dirs: Vec<&Path> = Vec::new();
+            for dir in paths.iter().filter_map(|path| path.parent()) {
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
                 }
             }
             for dir in dirs {
-                if let Err(err) = durable::sync_dir(&dir) {
+                if let Err(err) = durable::sync_dir(dir) {
                     warn!(dir = ?dir, error = %err, "Failed to sync snapshots directory");
                 }
             }

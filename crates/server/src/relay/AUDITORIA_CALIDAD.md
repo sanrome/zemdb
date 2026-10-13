@@ -41,6 +41,7 @@
 - `mod.rs:132` y `lifecycle.rs:91` ("Requires the room lock."): sobran, porque la firma recibe `&mut RoomSlot` y ese valor solo se obtiene a través del `Mutex`. El mismo aviso en `upload.rs:436` (`check_newer_than_active`) sí hay que **conservarlo**: ahí el tipo no lo garantiza.
 - `mod.rs:85-89`: el doc de `new` repite casi palabra por palabra los de `clear_uploads`/`recover_snapshots` (`recovery.rs:23`, `recovery.rs:41`). Es API pública, así que es aceptable. Si se quiere, alcanza con 2 líneas y un enlace a esos métodos. Prioridad baja.
 - `files.rs:30` ("Runs blocking file work on Tokio's blocking pool."): repite el doc del módulo (`files.rs:1-2`). Se puede quitar o dejar; es una sola línea.
+- **Estado:** ✅ aplicada (paso 1) en `mod.rs:70`, `mod.rs:113`, los dos "Requires the room lock." y `files.rs:30`. El doc de `new` (`mod.rs:85-89`) se deja: es API pública y el punto es opcional.
 
 **Conservar (valiosos):**
 - `mod.rs:1-17`: reglas de aceptación y serialización por sala. Es el contrato del módulo.
@@ -109,6 +110,7 @@
 - **Ahorro estimado:** ~8 líneas · **Riesgo:** bajo · **Prioridad:** alta.
 - **Verificación (2.ª pasada):** ✅ confirmada — `Option::take_if(FnOnce(&mut T) -> bool)` existe desde 1.80 y el `rustc` local es 1.97.0; sin `rust-version` en ningún `Cargo.toml`; mismo efecto (solo toma si el predicado es verdadero).
 - **Actualización tras el Lote 8 (`e88874b`):** el workspace ahora fija `rust-version = "1.85"`. `Option::take_if` es de 1.80, así que la sugerencia sigue siendo válida.
+- **Estado:** ✅ aplicada (paso 1). La variante opcional en una línea de `mod.rs:145-149` no se aplicó, por ser menos legible.
 
 ### Q3. Quitar el `impl Display for VerifyError`, que nadie usa
 - **Dónde:** `files.rs:181-188`.
@@ -116,12 +118,14 @@
 - **Propuesta:** borrarlo. Si se quiere simplificar `upload.rs:368-373` (o la closure de Q1), se puede sumar un `impl From<VerifyError> for ServerError` de 6 líneas (`Io → ServerError::from`, `Invalid → BadRequest`) y usar `?`. El ahorro neto sería menor, pero el código queda más claro.
 - **Ahorro estimado:** ~9 líneas (≈3 si se agrega el `From`) · **Riesgo:** bajo · **Prioridad:** alta.
 - **Verificación (2.ª pasada):** ✅ confirmada — `VerifyError` (`pub(super)`, `derive(Debug)`) solo se desestructura en `recovery.rs:101-108` y `upload.rs:370-372`; no hay `impl Error` ni formateo con `%`/`{}` del enum entero.
+- **Estado:** ✅ aplicada (paso 1), sin el `From<VerifyError>`: solo serviría a la closure de Q1, que es del paso 2.
 
 ### Q4. Corregir el doc desactualizado de `SnapshotRelay`
 - **Dónde:** `mod.rs:70`.
 - **Problema y propuesta:** ver la sección Comentarios. Contradice el diseño actual (persistencia en disco y recuperación al arrancar).
 - **Ahorro estimado:** 0 líneas · **Riesgo:** nulo · **Prioridad:** alta (claridad).
 - **Verificación (2.ª pasada):** ✅ confirmada — `mod.rs:70` sigue diciendo "Ephemeral relay…", contradice la persistencia en disco y la recuperación al arrancar.
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q5. Un solo chequeo de tamaño máximo
 - **Dónde:** `upload.rs:162-168` y `upload.rs:50-54`.
@@ -149,22 +153,26 @@
   ```
   Con `map_or`, el `Result` se *mueve* a la llamada y el guard se suelta dentro de la closure, así que no debería quedar ningún temporal prestado. Si el compilador no lo acepta, dejar el `let` con el comentario.
 - **Ahorro estimado:** ~5 líneas · **Riesgo:** bajo (solo de compilación) · **Prioridad:** media.
+- **Estado:** ✅ aplicada (paso 1). Compila con `map_or`. Como `upload.rs` importa ahora `Arc`, el reexport de `Arc` en `tests/common.rs` quedó sin uso y se borró.
 
 ### Q8. Deduplicar directorios con un set en `remove_files`
 - **Dónde:** `mod.rs:160-175`.
 - **Problema:** la búsqueda manual `dirs.iter().any(|d: &PathBuf| d == dir)` se mezcla con el loop de borrado.
 - **Propuesta:** primero borrar todos los paths, igual que ahora. Después: `let dirs: BTreeSet<&Path> = paths.iter().filter_map(|p| p.parent()).collect();` y sincronizar cada uno con su `warn!`. Se mantiene "todos los borrados antes de cualquier `sync_dir`"; solo cambia el orden en que se sincronizan los ≤2 directorios, que no tiene efecto observable. No se descarta ningún resultado.
 - **Ahorro estimado:** ~4 líneas · **Riesgo:** bajo · **Prioridad:** baja.
+- **Estado:** ✅ aplicada (paso 1) con un `Vec<&Path>` y `contains` en lugar del `BTreeSet`, para conservar el orden en que se sincronizan los directorios (el de su primera aparición).
 
 ### Q9. Juntar las salas a barrer en `cleanup_expired` con un `BTreeSet`
 - **Dónde:** `lifecycle.rs:47-55`.
 - **Propuesta:** `let rooms: BTreeSet<RoomId> = expired.chain(slots).collect();` en vez de `collect + extend + sort + dedup`. El orden de iteración sigue siendo el de `Ord`, igual que con `sort()`. `Chain` agota el primer iterador de `DashMap`, y suelta sus guards, antes de empezar el segundo.
 - **Ahorro estimado:** ~3 líneas · **Riesgo:** bajo · **Prioridad:** baja.
+- **Estado:** ✅ aplicada (paso 1)
 
 ### Q10. Detalles menores
 - `files.rs:108-112`: `match fs::remove_file(path) { Err(e) if e.kind() == NotFound => Ok(()), other => other }`. Ahorra 1 línea.
 - `upload.rs:202`, `upload.rs:360` y `lifecycle.rs:31` clonan el mismo par de directorios. Con Q1 quedan dos usos, y no vale la pena otro helper.
 - **Ahorro estimado:** ~1–2 líneas · **Riesgo:** nulo · **Prioridad:** baja.
+- **Estado:** ✅ aplicada (paso 1)
 
 ## Lo que conviene dejar como está
 

@@ -5,6 +5,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::time::Instant;
 use tracing::{info, warn};
 use zemdb_core::id::{RoomId, SequenceNumber};
@@ -410,21 +411,15 @@ impl SnapshotRelay {
         {
             return true;
         }
-        let Some(slot) = self
-            .slots
-            .get(room_id)
-            .map(|slot| std::sync::Arc::clone(slot.value()))
-        else {
+        let Some(slot) = self.slots.get(room_id).map(|slot| Arc::clone(slot.value())) else {
             return false;
         };
-        let in_progress = match slot.try_lock() {
-            Ok(guard) => guard
+        slot.try_lock().map_or(true, |guard| {
+            guard
                 .upload
                 .as_ref()
-                .is_some_and(|upload| !upload.is_idle(Instant::now())),
-            Err(_) => true,
-        };
-        in_progress
+                .is_some_and(|upload| !upload.is_idle(Instant::now()))
+        })
     }
 
     /// Whether the room's active snapshot is exactly `seq` with `hash`.
