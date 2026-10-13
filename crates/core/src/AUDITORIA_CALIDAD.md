@@ -39,6 +39,7 @@
 - **Propuesta:** borrar el bloque y su doc-comment.
 - **Ahorro estimado:** ~6 líneas · **Riesgo:** bajo (cambia la API pública; **a verificar** solo si hay consumidores fuera del repo) · **Prioridad:** alta.
 - **Verificación (2.ª pasada):** ✅ confirmada — el bloque está en `lib.rs:10-14` (doc + módulo); grep en todo el repo (incluidos imports multilínea `operation::`/`operation,` y `.md`) no encuentra usos de `zemdb_core::operation` ni `crate::operation`. Los mismos ítems siguen exportados por `mutation`, `protocol` y los `pub use` de la raíz.
+- **Estado:** ✅ aplicada (paso 4)
 
 ### Q2. Macro para los newtypes `u64` (opcional)
 - **Dónde:** `id.rs:231-268` (`SequenceNumber`) y `id.rs:328-361` (`CorrelationId`).
@@ -67,6 +68,7 @@
 - **Problema:** es redundante con `as_bytes()` (`id.rs:280-282`), que devuelve lo mismo y además es `const`. Su único uso en el workspace es una aserción en `crates/core/tests/types_memory_tests.rs:226`. `AsRef<[u8]>` (`id.rs:289-293`) tampoco tiene usos fuera de ese test, pero es el impl idiomático para APIs genéricas de bytes: conviene dejarlo.
 - **Propuesta:** borrar el impl `AsRef<[u8; 16]>` y la aserción del test.
 - **Ahorro estimado:** ~5 líneas (+1 en el test) · **Riesgo:** bajo (API pública; **a verificar** si hay consumidores externos) · **Prioridad:** baja.
+- **Estado:** ✅ aplicada (paso 4): sin usos en `storage` ni `server`; el test conserva la aserción de `as_bytes()`, que devuelve el mismo `&[u8; 16]`.
 
 ### Q5. `#![forbid(unsafe_code)]` repite el lint del workspace
 - **Dónde:** `lib.rs:1`.

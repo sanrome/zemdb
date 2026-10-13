@@ -7,12 +7,6 @@ pub mod protocol;
 pub mod schema;
 pub mod value;
 
-/// Compatibility alias module for legacy imports.
-pub mod operation {
-    pub use crate::mutation::*;
-    pub use crate::protocol::SequencedOperation;
-}
-
 pub use crypto::{CryptoConcurrencyBounds, CryptoEngine, CryptoError, NoOpCryptoEngine};
 pub use id::{
     ClientId, CorrelationId, InvalidIdError, MutationId, RoomId, SchemaId, SequenceNumber,

@@ -292,12 +292,6 @@ impl AsRef<[u8]> for MutationId {
     }
 }
 
-impl AsRef<[u8; 16]> for MutationId {
-    fn as_ref(&self) -> &[u8; 16] {
-        &self.0
-    }
-}
-
 impl fmt::Display for MutationId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for b in &self.0 {

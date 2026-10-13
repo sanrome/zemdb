@@ -97,7 +97,6 @@ fn test_newtypes_ergonomics_and_serde() {
     assert_eq!(seq.get(), 42);
     assert_eq!(correlation.get(), 999);
     assert_eq!(mutation.as_bytes(), &[7u8; 16]);
-    assert_eq!(AsRef::<[u8; 16]>::as_ref(&mutation), &[7u8; 16]);
     assert_eq!(AsRef::<[u8]>::as_ref(&mutation), &[7u8; 16][..]);
     assert_eq!(seq.next(), SequenceNumber::new(43));
 
