@@ -132,6 +132,40 @@ Algunos auditores encontraron detalles de comportamiento o de cobertura. No se r
 - `server/src/tests/error.rs` cubría 9 de 24 variantes; tras el Lote 8 cubre 15. Faltan, entre otras, `RateLimited`→429, `SchemaNotFound` y `RoomAlreadyExists`.
 - `tests/config.rs` no prueba algunos overrides de entorno. Tras el Lote 8 siguen faltando `ZEMDB_DATA_DIR`, los secretos y `ZEMDB_DEDUP_LRU_CAPACITY`.
 
+## Aplicación (13 de octubre de 2026)
+
+Las sugerencias se aplicaron en los cuatro pasos del orden sugerido, más un paso final para lo que cruzaba crates. En cada paso trabajó un agente por crate en paralelo (en el paso 3, server se partió en tests unitarios y de integración). Cada paso cerró con un checkpoint en `main`: `cargo fmt --check`, `cargo clippy --workspace --all-targets -D warnings`, el build `wasm32-unknown-unknown` de `core`, `storage` y `client`, y `cargo test --workspace`.
+
+| Paso | Commit en `main` | Contenido | Tests |
+|---|---|---|---|
+| 1 · mecánico | `622031c` | Comentarios corregidos y recortados, código muerto interno, macros y derives, reescrituras locales | 690 → 690 |
+| 2 · helpers | `8fc4e51` | Validación de `schema` sobre `TableSchema`, scan compartido de `storage`, `fail_on_err`, `run_blocking`, handlers de `room.rs` que responden una vez, `respond`/`ensure_payload`, `promote_and_install`, `HotBuffer` derivado, `durable::remove_file_if_exists` | 690 → 690 |
+| 3 · tests | `0eda896` | `tests/common` en `storage` y `server`, módulos `support` en tests unitarios, tablas de casos y fusión de duplicados | 690 → 667 |
+| 4 · API sin uso | `250c15c` | API pública sin uso en ningún crate, borrada o reducida de visibilidad | 667 → 667 |
+| Final · entre crates | `f069685` | Alias `SequencedOperation::with_default_origin` | 667 → 667 |
+
+**Líneas, comparando `2a5f7b3` con el resultado:**
+
+| | Antes | Después | Diferencia |
+|---|---:|---:|---:|
+| Código fuente | 18 795 | 17 824 | −971 (−5,2 %) |
+| · líneas de código | 14 058 | 13 222 | −836 (−5,9 %) |
+| Tests | 25 365 | 20 720 | −4 645 (−18,3 %) |
+| **Total** | **44 160** | **38 544** | **−5 616 (−12,7 %)** |
+
+Por crate (código fuente / tests): `core` 4 359 → 4 053 / 3 236 → 3 012; `storage` 3 885 → 3 647 / 5 248 → 4 004; `server` 10 548 → 10 121 / 16 874 → 13 697; `client` sin cambios en líneas (se le quitaron 5 dependencias sin uso).
+
+**Cobertura.** Los tests pasan de 690 a 667. Ningún caso ni aserción se perdió: la diferencia son 27 tests fusionados en tablas de casos o en el test que ya cubría lo mismo, más 4 tests nuevos de `storage` (bordes de lote del scan y `KeyRange::contains`). La única baja sin fusión es `test_crypto_concurrency_bounds_satisfied`, que no aseveraba nada en tiempo de ejecución: el compilador ya garantiza ese bound. Varias aserciones quedaron más estrictas (operaciones completas en lugar de campos sueltos, status de los POST de setup, todas las variantes de `ServerError` en la tabla de `error.rs`). Cada agente detalló sus fusiones en el informe del módulo.
+
+**Sugerencias que no se aplicaron**, con el motivo en la línea `Estado` de cada una:
+- Las que al implementarlas quedaban más largas con `rustfmt`: el helper `set` de los overrides de `config.rs` y el helper de los stubs wasm de `snapshot.rs`.
+- Las que cambiaban un mensaje de error: `check_range` para `max_snapshot_bytes`.
+- La Q5 de `memory`, que cambiaba el uso de memoria.
+- La API que sí usan los tests de integración: `format::MAGIC_BYTES`, `format::replay_wal_records`, `get_client_mut`.
+- Los `sleep` de los tests de `tiered_log`: ejercitan el desalojo por TTL con `Instant::now()`, que el reloj de mantenimiento no alcanza.
+
+Cada sugerencia de los informes tiene una línea `Estado` con lo que pasó: ✅ aplicada (y en qué paso) o ⏭️ no aplicada, con el motivo.
+
 ## Orden sugerido de aplicación
 
 1. **Riesgo bajo y mecánico.** Corregir las docs erróneas, borrar el código muerto (`seen`, `VerifyError: Display`, `pub mod operation`), aplicar `#[serde(default)]` en `config.rs`, la macro `From`, `compute_crc` y `RoomCommand::reject`. Es el lote con mejor relación entre ahorro y riesgo.
