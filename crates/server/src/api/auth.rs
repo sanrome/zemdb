@@ -94,11 +94,7 @@ pub fn generate_client_token(
     ttl: Duration,
     secret: &str,
 ) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let expires_at = now.saturating_add(ttl.as_secs());
+    let expires_at = unix_now_secs().saturating_add(ttl.as_secs());
     let signature = token_signature(secret, client_id.as_str(), room_id.as_str(), expires_at);
 
     format!(
@@ -171,11 +167,7 @@ pub fn verify_client_token(
         ));
     }
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    if now >= expires_at {
+    if unix_now_secs() >= expires_at {
         return Err(ServerError::Unauthorized(
             "Client auth token expired".to_string(),
         ));
@@ -210,14 +202,30 @@ pub fn verify_client_token_bound(
         )));
     }
 
+    ensure_token_room(&verified, room_id)?;
+    Ok(verified)
+}
+
+/// `Forbidden` unless `verified` was issued for `room_id`.
+pub(crate) fn ensure_token_room(
+    verified: &VerifiedClientToken,
+    room_id: &RoomId,
+) -> Result<(), ServerError> {
     if &verified.room_id != room_id {
         return Err(ServerError::Forbidden(format!(
             "Token room mismatch: expected {room_id}, got {}",
             verified.room_id
         )));
     }
+    Ok(())
+}
 
-    Ok(verified)
+/// Seconds since the Unix epoch (zero if the clock is set before it).
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]

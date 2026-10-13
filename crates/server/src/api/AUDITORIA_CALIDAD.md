@@ -89,6 +89,7 @@
   (Se llama `respond` y no `reply` para no chocar con el parámetro `reply` de los closures de `RoomCommand`.) El orden de efectos no cambia (identidad → actor → respuesta), `room_id` se sigue moviendo sin clones y los mensajes/códigos son los mismos. `get_schema` y `register` usan `ensure_payload_identity` con `None` y siguen igual en esa parte. Variante si se prefiere (a verificar): mover `ensure_payload` como método de `AuthenticatedRoom` en `extract.rs`, junto a `ensure_payload_identity`.
 - **Ahorro estimado:** ~35–45 líneas · **Riesgo:** bajo · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ✅ confirmada — los 7 handlers usan `StatusCode::OK` y la misma rama `Err(err) => fail(room_id, err)` (`data_plane.rs:130,183,233,279,325,358,401`); `correlation_id`/`mutation_id` ya se usan dos veces hoy (son `Copy`), así que capturarlos en `ok` compila. `ensure_payload` aplica a 5 handlers (commit, sync, ack, heartbeat, deregister).
+- **Estado:** ✅ aplicada (paso 2). `ensure_payload` es un método de `AuthenticatedRoom` en `extract.rs` (la variante) y recibe `&ClientId`, porque los cinco handlers pasan un cliente. Con un único rechazo antes del actor, el closure `fail` se reemplaza por `binary_error` directo, salvo en `register`, que rechaza en dos sitios.
 
 ### Q2. Extraer la autenticación común de `AuthenticatedRoom`, `EventStreamAuth` y `RelayAuth`
 - **Dónde:** `extract.rs:88-99`, `122-134`, `161-183`, `441-447`.
@@ -107,6 +108,7 @@
   `AuthenticatedRoom` y `EventStreamAuth` pasan a 3 líneas cada uno (`bearer_token(parts)` vs `bearer_token(parts).or_else(|| query_token(parts))`). `RelayAuth` usa `missing_token` y el mismo `map_err` en la rama de cliente; **su comparación `ct_eq` con el admin secret queda intacta**.
 - **Ahorro estimado:** ~10–12 líneas · **Riesgo:** bajo · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ✅ confirmada — los tres extractores usan el mismo literal "Missing Authorization header" y el mismo `map_err`; `unauthorized` solo se llama en `extract.rs:93,128,166`; el orden (falta de token → 401 antes de verificar) y el `ct_eq` de `RelayAuth` no cambian.
+- **Estado:** ✅ aplicada (paso 2) con `missing_token` y con `verify_token_for_room` devolviendo ya el rechazo binario (en lugar de un `authenticate_client` aparte), con el mismo `#[allow(clippy::result_large_err)]` que `read_frame`. `unauthorized` desapareció.
 
 ### Q3. Un único constructor de `ServerMessage::Error`
 - **Dónde:** `data_plane.rs:52-57`, `extract.rs:314-322` (`body_rejection`), `router.rs:166-174` (`unmatched`).
@@ -119,6 +121,7 @@
   ```
   y usarlo en los tres (`binary_response(status, &error_frame(None, room_id, &err))`). Es idéntico byte a byte; no se recomienda en cambio "llamar a `binary_error` y pisar el status" (como hace `AdminJson`), porque en la rama de fallo de codificación de `binary_response` el 500 quedaría pisado. `add_headers` solo actúa con 503, que ninguno de estos dos sitios produce, así que no hay diferencia de cabeceras.
 - **Ahorro estimado:** ~8–10 líneas · **Riesgo:** bajo · **Prioridad:** media
+- **Estado:** ✅ aplicada (paso 2). `binary_error` también lo usa.
 
 ### Q4. `relay.rs`: reutilizar `unexpected_message` y no clonar `state` de más
 - **Dónde:** `relay.rs:90-94`, `134-138`, `31`, `155`.
@@ -164,6 +167,7 @@
 - **Problema:** (a) `SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()` aparece dos veces. (b) La comprobación "Token room mismatch: expected {}, got {}" está duplicada entre `verify_client_token_bound` y `extract::verify_token_for_room`.
 - **Propuesta:** (a) `fn unix_now_secs() -> u64`. (b) en `auth.rs`, `pub(crate) fn ensure_token_room(verified: &VerifiedClientToken, room_id: &RoomId) -> Result<(), ServerError>`, usado por `verify_client_token_bound` **después** de la comprobación de cliente (para conservar qué mensaje gana si fallan ambos) y por `verify_token_for_room`. No toca la verificación de firma ni el `ct_eq`.
 - **Ahorro estimado:** ~8 líneas · **Riesgo:** bajo · **Prioridad:** baja
+- **Estado:** ✅ aplicada (paso 2)
 
 ### Q8. Argumentos de formato en línea
 - **Dónde:** `serve.rs:95-100`, `auth.rs:206-209`, `213-216`, `extract.rs:433-436`.

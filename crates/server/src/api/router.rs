@@ -8,11 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use zemdb_core::protocol::codec::MAX_FRAME_SIZE;
-use zemdb_core::protocol::messages::ServerMessage;
 
 use crate::actor::manager::RoomManager;
 use crate::api::body_timeout::{limit_body_read_time, BodyReadLimit};
-use crate::api::data_plane::binary_response;
+use crate::api::data_plane::{binary_response, error_frame};
 use crate::api::{control_plane, data_plane, relay, sse};
 use crate::config::ServerConfig;
 use crate::error::ServerError;
@@ -163,13 +162,5 @@ fn unmatched(status: StatusCode, uri: &Uri) -> Response {
     } else {
         format!("Unknown endpoint {}", uri.path())
     });
-    binary_response(
-        status,
-        &ServerMessage::Error {
-            correlation_id: None,
-            room_id: None,
-            code: err.to_error_code(),
-            message: err.to_string(),
-        },
-    )
+    binary_response(status, &error_frame(None, None, &err))
 }

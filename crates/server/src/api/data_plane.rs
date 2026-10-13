@@ -43,19 +43,27 @@ pub(crate) fn binary_response(status: StatusCode, msg: &ServerMessage) -> Respon
         .into_response()
 }
 
+/// The `ServerMessage::Error` frame reporting `err`.
+pub(crate) fn error_frame(
+    correlation_id: Option<CorrelationId>,
+    room_id: Option<RoomId>,
+    err: &ServerError,
+) -> ServerMessage {
+    ServerMessage::Error {
+        correlation_id,
+        room_id,
+        code: err.to_error_code(),
+        message: err.to_string(),
+    }
+}
+
 pub(crate) fn binary_error(
     correlation_id: Option<CorrelationId>,
     room_id: Option<RoomId>,
     err: ServerError,
 ) -> Response {
-    let status = err.to_status_code();
-    let msg = ServerMessage::Error {
-        correlation_id,
-        room_id,
-        code: err.to_error_code(),
-        message: err.to_string(),
-    };
-    let mut response = binary_response(status, &msg);
+    let msg = error_frame(correlation_id, room_id, &err);
+    let mut response = binary_response(err.to_status_code(), &msg);
     err.add_headers(&mut response);
     response
 }
@@ -78,6 +86,19 @@ async fn ask_room<R>(
     command: impl FnOnce(oneshot::Sender<Result<R, ServerError>>) -> RoomCommand,
 ) -> Result<R, ServerError> {
     state.room_manager.ask(room_id, command).await?
+}
+
+/// 200 with the frame `ok` builds from the room's reply, or the error frame of the request.
+fn respond<R>(
+    correlation_id: CorrelationId,
+    room_id: RoomId,
+    result: Result<R, ServerError>,
+    ok: impl FnOnce(RoomId, R) -> ServerMessage,
+) -> Response {
+    match result {
+        Ok(value) => binary_response(StatusCode::OK, &ok(room_id, value)),
+        Err(err) => binary_error(Some(correlation_id), Some(room_id), err),
+    }
 }
 
 /// `POST /rooms/:room_id/register`: registers the client and returns the room's log range and
@@ -108,27 +129,23 @@ pub async fn register(
         return fail(room_id, err);
     }
 
-    match ask_room(&state, &room_id, |reply| RoomCommand::RegisterClient {
+    let result = ask_room(&state, &room_id, |reply| RoomCommand::RegisterClient {
         client_id,
         current_seq,
         reply,
     })
-    .await
-    {
-        Ok(reg_resp) => binary_response(
-            StatusCode::OK,
-            &ServerMessage::Registered {
-                correlation_id,
-                room_id,
-                head_seq: reg_resp.head_seq,
-                tail_seq: reg_resp.tail_seq,
-                schema_id: reg_resp.schema_id,
-                schema: (*reg_resp.schema).clone(),
-                active_snapshot_seq: reg_resp.active_snapshot_seq,
-            },
-        ),
-        Err(err) => fail(room_id, err),
-    }
+    .await;
+    respond(correlation_id, room_id, result, |room_id, reg_resp| {
+        ServerMessage::Registered {
+            correlation_id,
+            room_id,
+            head_seq: reg_resp.head_seq,
+            tail_seq: reg_resp.tail_seq,
+            schema_id: reg_resp.schema_id,
+            schema: (*reg_resp.schema).clone(),
+            active_snapshot_seq: reg_resp.active_snapshot_seq,
+        }
+    })
 }
 
 /// `POST /rooms/:room_id/commit`: sequences one mutation and returns its sequence with the
@@ -149,40 +166,30 @@ pub async fn commit(
     else {
         return unexpected_message(Some(auth.room_id), "Commit");
     };
-    let fail = |room_id: RoomId, err| binary_error(Some(correlation_id), Some(room_id), err);
 
-    if let Err(err) = ensure_payload_identity(
-        &auth.room_id,
-        Some(&auth.client_id),
-        &room_id,
-        Some(&client_id),
-    ) {
-        return fail(room_id, err);
+    if let Err(err) = auth.ensure_payload(&room_id, &client_id) {
+        return binary_error(Some(correlation_id), Some(room_id), err);
     }
 
-    match ask_room(&state, &room_id, |reply| RoomCommand::Commit {
+    let result = ask_room(&state, &room_id, |reply| RoomCommand::Commit {
         client_id,
         mutation_id,
         last_ack_seq,
         op,
         reply,
     })
-    .await
-    {
-        Ok(commit_resp) => binary_response(
-            StatusCode::OK,
-            &ServerMessage::CommitAck {
-                correlation_id,
-                room_id,
-                mutation_id,
-                assigned_seq: commit_resp.assigned_seq,
-                catchup_ops: commit_resp.catchup_ops,
-                has_more: commit_resp.has_more,
-                snapshot_wanted: commit_resp.snapshot_wanted,
-            },
-        ),
-        Err(err) => fail(room_id, err),
-    }
+    .await;
+    respond(correlation_id, room_id, result, |room_id, commit_resp| {
+        ServerMessage::CommitAck {
+            correlation_id,
+            room_id,
+            mutation_id,
+            assigned_seq: commit_resp.assigned_seq,
+            catchup_ops: commit_resp.catchup_ops,
+            has_more: commit_resp.has_more,
+            snapshot_wanted: commit_resp.snapshot_wanted,
+        }
+    })
 }
 
 /// `POST /rooms/:room_id/sync`: the next batch of operations after the client's cursor.
@@ -201,38 +208,28 @@ pub async fn sync(
     else {
         return unexpected_message(Some(auth.room_id), "Sync");
     };
-    let fail = |room_id: RoomId, err| binary_error(Some(correlation_id), Some(room_id), err);
 
-    if let Err(err) = ensure_payload_identity(
-        &auth.room_id,
-        Some(&auth.client_id),
-        &room_id,
-        Some(&client_id),
-    ) {
-        return fail(room_id, err);
+    if let Err(err) = auth.ensure_payload(&room_id, &client_id) {
+        return binary_error(Some(correlation_id), Some(room_id), err);
     }
 
-    match ask_room(&state, &room_id, |reply| RoomCommand::Sync {
+    let result = ask_room(&state, &room_id, |reply| RoomCommand::Sync {
         client_id,
         from_seq,
         max_batch_size,
         reply,
     })
-    .await
-    {
-        Ok(sync_resp) => binary_response(
-            StatusCode::OK,
-            &ServerMessage::SyncBatch {
-                correlation_id,
-                room_id,
-                head_seq: sync_resp.head_seq,
-                ops: sync_resp.ops,
-                has_more: sync_resp.has_more,
-                snapshot_wanted: sync_resp.snapshot_wanted,
-            },
-        ),
-        Err(err) => fail(room_id, err),
-    }
+    .await;
+    respond(correlation_id, room_id, result, |room_id, sync_resp| {
+        ServerMessage::SyncBatch {
+            correlation_id,
+            room_id,
+            head_seq: sync_resp.head_seq,
+            ops: sync_resp.ops,
+            has_more: sync_resp.has_more,
+            snapshot_wanted: sync_resp.snapshot_wanted,
+        }
+    })
 }
 
 /// `POST /rooms/:room_id/ack`: records how far the client has persisted.
@@ -250,35 +247,25 @@ pub async fn ack(
     else {
         return unexpected_message(Some(auth.room_id), "Ack");
     };
-    let fail = |room_id: RoomId, err| binary_error(Some(correlation_id), Some(room_id), err);
 
-    if let Err(err) = ensure_payload_identity(
-        &auth.room_id,
-        Some(&auth.client_id),
-        &room_id,
-        Some(&client_id),
-    ) {
-        return fail(room_id, err);
+    if let Err(err) = auth.ensure_payload(&room_id, &client_id) {
+        return binary_error(Some(correlation_id), Some(room_id), err);
     }
 
-    match ask_room(&state, &room_id, |reply| RoomCommand::Ack {
+    let result = ask_room(&state, &room_id, |reply| RoomCommand::Ack {
         client_id,
         ack_seq,
         reply,
     })
-    .await
-    {
-        Ok(head_seq) => binary_response(
-            StatusCode::OK,
-            &ServerMessage::AckConfirmed {
-                correlation_id,
-                room_id,
-                ack_seq,
-                head_seq,
-            },
-        ),
-        Err(err) => fail(room_id, err),
-    }
+    .await;
+    respond(correlation_id, room_id, result, |room_id, head_seq| {
+        ServerMessage::AckConfirmed {
+            correlation_id,
+            room_id,
+            ack_seq,
+            head_seq,
+        }
+    })
 }
 
 /// `POST /rooms/:room_id/heartbeat`: refreshes the client's lease. Never fails because
@@ -296,35 +283,25 @@ pub async fn heartbeat(
     else {
         return unexpected_message(Some(auth.room_id), "Heartbeat");
     };
-    let fail = |room_id: RoomId, err| binary_error(Some(correlation_id), Some(room_id), err);
 
-    if let Err(err) = ensure_payload_identity(
-        &auth.room_id,
-        Some(&auth.client_id),
-        &room_id,
-        Some(&client_id),
-    ) {
-        return fail(room_id, err);
+    if let Err(err) = auth.ensure_payload(&room_id, &client_id) {
+        return binary_error(Some(correlation_id), Some(room_id), err);
     }
 
-    match ask_room(&state, &room_id, |reply| RoomCommand::Heartbeat {
+    let result = ask_room(&state, &room_id, |reply| RoomCommand::Heartbeat {
         client_id,
         reply,
     })
-    .await
-    {
-        Ok(hb_resp) => binary_response(
-            StatusCode::OK,
-            &ServerMessage::HeartbeatAck {
-                correlation_id,
-                room_id,
-                current_head_seq: hb_resp.head_seq,
-                snapshot_wanted: hb_resp.snapshot_wanted,
-                active_snapshot_seq: hb_resp.active_snapshot_seq,
-            },
-        ),
-        Err(err) => fail(room_id, err),
-    }
+    .await;
+    respond(correlation_id, room_id, result, |room_id, hb_resp| {
+        ServerMessage::HeartbeatAck {
+            correlation_id,
+            room_id,
+            current_head_seq: hb_resp.head_seq,
+            snapshot_wanted: hb_resp.snapshot_wanted,
+            active_snapshot_seq: hb_resp.active_snapshot_seq,
+        }
+    })
 }
 
 /// `POST /rooms/:room_id/schema`: the room's current schema.
@@ -340,24 +317,23 @@ pub async fn get_schema(
     else {
         return unexpected_message(Some(auth.room_id), "GetSchema");
     };
-    let fail = |room_id: RoomId, err| binary_error(Some(correlation_id), Some(room_id), err);
 
     if let Err(err) = ensure_payload_identity(&auth.room_id, None, &room_id, None) {
-        return fail(room_id, err);
+        return binary_error(Some(correlation_id), Some(room_id), err);
     }
 
-    match ask_room(&state, &room_id, |reply| RoomCommand::GetSchema { reply }).await {
-        Ok((schema_id, schema)) => binary_response(
-            StatusCode::OK,
-            &ServerMessage::Schema {
-                correlation_id,
-                room_id,
-                schema_id,
-                schema: (*schema).clone(),
-            },
-        ),
-        Err(err) => fail(room_id, err),
-    }
+    let result = ask_room(&state, &room_id, |reply| RoomCommand::GetSchema { reply }).await;
+    respond(
+        correlation_id,
+        room_id,
+        result,
+        |room_id, (schema_id, schema)| ServerMessage::Schema {
+            correlation_id,
+            room_id,
+            schema_id,
+            schema: (*schema).clone(),
+        },
+    )
 }
 
 /// `POST /rooms/:room_id/deregister`: removes the client from the room.
@@ -374,33 +350,23 @@ pub async fn deregister(
     else {
         return unexpected_message(Some(auth.room_id), "DeregisterClient");
     };
-    let fail = |room_id: RoomId, err| binary_error(Some(correlation_id), Some(room_id), err);
 
-    if let Err(err) = ensure_payload_identity(
-        &auth.room_id,
-        Some(&auth.client_id),
-        &room_id,
-        Some(&client_id),
-    ) {
-        return fail(room_id, err);
+    if let Err(err) = auth.ensure_payload(&room_id, &client_id) {
+        return binary_error(Some(correlation_id), Some(room_id), err);
     }
 
-    match ask_room(&state, &room_id, |reply| RoomCommand::DeregisterClient {
+    let result = ask_room(&state, &room_id, |reply| RoomCommand::DeregisterClient {
         client_id: client_id.clone(),
         reply,
     })
-    .await
-    {
-        Ok(()) => binary_response(
-            StatusCode::OK,
-            &ServerMessage::DeregisterAck {
-                correlation_id,
-                room_id,
-                client_id,
-            },
-        ),
-        Err(err) => fail(room_id, err),
-    }
+    .await;
+    respond(correlation_id, room_id, result, |room_id, ()| {
+        ServerMessage::DeregisterAck {
+            correlation_id,
+            room_id,
+            client_id,
+        }
+    })
 }
 
 #[cfg(test)]

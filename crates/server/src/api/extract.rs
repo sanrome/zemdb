@@ -23,11 +23,11 @@ use serde::de::DeserializeOwned;
 use subtle::ConstantTimeEq;
 use zemdb_core::id::{ClientId, CorrelationId, RoomId, SequenceNumber};
 use zemdb_core::protocol::codec::{decode_client_message, peek_client_message_kind};
-use zemdb_core::protocol::messages::{ClientMessage, ClientMessageKind, ServerMessage};
+use zemdb_core::protocol::messages::{ClientMessage, ClientMessageKind};
 
-use crate::api::auth::verify_client_token;
+use crate::api::auth::{ensure_token_room, verify_client_token};
 use crate::api::body_timeout::is_body_read_timeout;
-use crate::api::data_plane::{binary_error, binary_response, unexpected_message};
+use crate::api::data_plane::{binary_error, binary_response, error_frame, unexpected_message};
 use crate::api::router::AppState;
 use crate::error::ServerError;
 use crate::relay::Uploader;
@@ -77,6 +77,23 @@ pub struct AuthenticatedRoom {
     pub client_id: ClientId,
 }
 
+impl AuthenticatedRoom {
+    /// Checks the room and client named in a message against the path and the token (see
+    /// [`ensure_payload_identity`]).
+    pub(crate) fn ensure_payload(
+        &self,
+        room_id: &RoomId,
+        client_id: &ClientId,
+    ) -> Result<(), ServerError> {
+        ensure_payload_identity(
+            &self.room_id,
+            Some(&self.client_id),
+            room_id,
+            Some(client_id),
+        )
+    }
+}
+
 #[axum::async_trait]
 impl<S> FromRequestParts<S> for AuthenticatedRoom
 where
@@ -87,14 +104,8 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let RoomPath(room_id) = RoomPath::from_request_parts(parts, state).await?;
-        let app_state = AppState::from_ref(state);
-
-        let token = bearer_token(parts)
-            .ok_or_else(|| unauthorized(&room_id, "Missing Authorization header".to_string()))?;
-
-        let client_id = verify_token_for_room(token, &room_id, &app_state)
-            .map_err(|err| binary_error(None, Some(room_id.clone()), err))?;
-
+        let token = bearer_token(parts).ok_or_else(|| missing_token(&room_id))?;
+        let client_id = verify_token_for_room(token, &room_id, &AppState::from_ref(state))?;
         Ok(AuthenticatedRoom { room_id, client_id })
     }
 }
@@ -121,15 +132,10 @@ where
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let RoomPath(room_id) = RoomPath::from_request_parts(parts, state).await?;
-        let app_state = AppState::from_ref(state);
-
         let token = bearer_token(parts)
             .or_else(|| query_token(parts))
-            .ok_or_else(|| unauthorized(&room_id, "Missing Authorization header".to_string()))?;
-
-        let client_id = verify_token_for_room(token, &room_id, &app_state)
-            .map_err(|err| binary_error(None, Some(room_id.clone()), err))?;
-
+            .ok_or_else(|| missing_token(&room_id))?;
+        let client_id = verify_token_for_room(token, &room_id, &AppState::from_ref(state))?;
         Ok(EventStreamAuth { room_id, client_id })
     }
 }
@@ -162,8 +168,7 @@ where
         let RoomPath(room_id) = RoomPath::from_request_parts(parts, state).await?;
         let app_state = AppState::from_ref(state);
 
-        let token = bearer_token(parts)
-            .ok_or_else(|| unauthorized(&room_id, "Missing Authorization header".to_string()))?;
+        let token = bearer_token(parts).ok_or_else(|| missing_token(&room_id))?;
 
         // Constant-time comparison to prevent timing side-channel attacks
         let is_admin = token
@@ -174,9 +179,7 @@ where
         let uploader = if is_admin {
             Uploader::Admin
         } else {
-            let client_id = verify_token_for_room(token, &room_id, &app_state)
-                .map_err(|err| binary_error(None, Some(room_id.clone()), err))?;
-            Uploader::Client(client_id)
+            Uploader::Client(verify_token_for_room(token, &room_id, &app_state)?)
         };
 
         Ok(RelayAuth { room_id, uploader })
@@ -308,15 +311,7 @@ fn body_rejection(rejection: BytesRejection, room_id: Option<RoomId>) -> Respons
     } else {
         (rejection.status(), ServerError::BadRequest(message))
     };
-    binary_response(
-        status,
-        &ServerMessage::Error {
-            correlation_id: None,
-            room_id,
-            code: err.to_error_code(),
-            message: err.to_string(),
-        },
-    )
+    binary_response(status, &error_frame(None, room_id, &err))
 }
 
 /// Path parameters of an admin endpoint, deserialized into validated types (`RoomId`,
@@ -418,27 +413,29 @@ fn query_token(parts: &Parts) -> Option<&str> {
         .find_map(|pair| pair.strip_prefix("token="))
 }
 
-/// Verifies a client token (`Unauthorized` if invalid or expired) and requires it to be
-/// issued for `room_id` (`Forbidden` otherwise).
+/// Verifies a client token and requires it to be issued for `room_id`. Rejections are binary
+/// frames: `Unauthorized` if the token is invalid or expired, `Forbidden` if it was issued for
+/// another room.
+// Same rejection type as every extractor here; runs once per request.
+#[allow(clippy::result_large_err)]
 fn verify_token_for_room(
     token: &str,
     room_id: &RoomId,
     state: &AppState,
-) -> Result<ClientId, ServerError> {
-    let verified = verify_client_token(token, &state.config.auth_secret)?;
-    if &verified.room_id != room_id {
-        return Err(ServerError::Forbidden(format!(
-            "Token room mismatch: expected {room_id}, got {}",
-            verified.room_id
-        )));
-    }
-    Ok(verified.client_id)
+) -> Result<ClientId, Response> {
+    verify_client_token(token, &state.config.auth_secret)
+        .and_then(|verified| {
+            ensure_token_room(&verified, room_id)?;
+            Ok(verified.client_id)
+        })
+        .map_err(|err| binary_error(None, Some(room_id.clone()), err))
 }
 
-fn unauthorized(room_id: &RoomId, message: String) -> Response {
+/// Rejection of a request that carries no token.
+fn missing_token(room_id: &RoomId) -> Response {
     binary_error(
         None,
         Some(room_id.clone()),
-        ServerError::Unauthorized(message),
+        ServerError::Unauthorized("Missing Authorization header".to_string()),
     )
 }
