@@ -2003,13 +2003,6 @@ dependencies = [
 [[package]]
 name = "zemdb-client"
 version = "0.1.0"
-dependencies = [
- "bincode",
- "bytes",
- "serde",
- "thiserror 1.0.69",
- "zemdb-core",
-]
 
 [[package]]
 name = "zemdb-core"

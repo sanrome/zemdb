@@ -7,10 +7,3 @@ license.workspace = true
 
 [lints]
 workspace = true
-
-[dependencies]
-zemdb-core = { workspace = true }
-serde = { workspace = true }
-bincode = { workspace = true }
-thiserror = { workspace = true }
-bytes = { workspace = true }
