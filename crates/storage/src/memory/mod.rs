@@ -7,14 +7,13 @@ use state::{decode_received_snapshot, resolve_table_id, TableRef};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::collections::{HashMap, VecDeque};
-use std::ops::RangeBounds;
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use zemdb_core::{CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation};
 
-use crate::engine::{apply_scan_transforms, RowStream, StorageEngine};
+use crate::engine::{batched_scan, RowStream, StorageEngine};
 use crate::error::StorageError;
-use crate::options::{KeyRange, ScanDirection, ScanOptions};
+use crate::options::ScanOptions;
 use crate::snapshot::DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES;
 
 /// In-memory implementation of `StorageEngine` with per-room isolation.
@@ -94,97 +93,8 @@ impl MemoryStorageEngine {
                 .unwrap_or_default()
         };
 
-        let state = MemoryScanState {
-            table_data,
-            range: options.range,
-            direction: options.direction,
-            projection: options.projection,
-            remaining_limit: options.limit,
-            cursor: None,
-            exhausted: false,
-            buffer: VecDeque::new(),
-        };
-
-        let stream = futures::stream::unfold(state, |mut state| async move {
-            if let Some(item) = state.buffer.pop_front() {
-                return Some((item, state));
-            }
-
-            if state.exhausted || state.remaining_limit == Some(0) {
-                return None;
-            }
-
-            const BATCH_SIZE: usize = 64;
-            let batch_limit = match state.remaining_limit {
-                Some(limit) => limit.min(BATCH_SIZE),
-                None => BATCH_SIZE,
-            };
-
-            let batch_items: Vec<Result<(PrimaryKey, CompactRow), StorageError>> = match state
-                .direction
-            {
-                ScanDirection::Forward => {
-                    let (start_bound, end_bound) = match &state.cursor {
-                        Some(cur) => (std::ops::Bound::Excluded(cur), state.range.end_bound()),
-                        None => (state.range.start_bound(), state.range.end_bound()),
-                    };
-                    let iter = state
-                        .table_data
-                        .range::<_, PrimaryKey>((start_bound, end_bound));
-                    apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
-                        .collect()
-                }
-                ScanDirection::Backward => {
-                    let (start_bound, end_bound) = match &state.cursor {
-                        Some(cur) => (state.range.start_bound(), std::ops::Bound::Excluded(cur)),
-                        None => (state.range.start_bound(), state.range.end_bound()),
-                    };
-                    let iter = state
-                        .table_data
-                        .range::<_, PrimaryKey>((start_bound, end_bound))
-                        .rev();
-                    apply_scan_transforms(iter, state.projection.clone(), Some(batch_limit))
-                        .collect()
-                }
-            };
-
-            let count = batch_items.len();
-            if count == 0 {
-                return None;
-            }
-
-            if count < batch_limit {
-                state.exhausted = true;
-            }
-
-            if let Some(ref mut rem) = state.remaining_limit {
-                *rem = rem.saturating_sub(count);
-                if *rem == 0 {
-                    state.exhausted = true;
-                }
-            }
-
-            if let Some(Ok((ref last_pk, _))) = batch_items.last() {
-                state.cursor = Some(last_pk.clone());
-            }
-
-            state.buffer.extend(batch_items);
-            state.buffer.pop_front().map(|item| (item, state))
-        });
-
-        Ok(Box::pin(stream))
+        Ok(batched_scan(table_data, options))
     }
-}
-
-struct MemoryScanState {
-    table_data: Table,
-    range: KeyRange,
-    direction: ScanDirection,
-    projection: Option<Vec<u16>>,
-    remaining_limit: Option<usize>,
-    cursor: Option<PrimaryKey>,
-    exhausted: bool,
-    buffer: VecDeque<Result<(PrimaryKey, CompactRow), StorageError>>,
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]

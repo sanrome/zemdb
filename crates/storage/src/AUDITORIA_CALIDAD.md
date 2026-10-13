@@ -77,6 +77,7 @@ La densidad es adecuada (≈15 % doc) y la mayoría explica el *por qué*. Punto
   `I: MaybeSend` implica `I: Send` por el supertrait, que es lo que necesita la coerción a `Box<dyn … + Send>`. Si se aplica Q1 de `memory/AUDITORIA_CALIDAD.md` (scan compartido), la función queda con un solo llamador y puede ser privada. Los alias `ScanIterator`/`RowStream` duplicados por `cfg` (`22-28`, `119-125`) **deben quedar**: `dyn Trait + MaybeSend` no es válido porque solo los auto-traits pueden sumarse a un `dyn`.
 - **Ahorro estimado:** ~30 líneas · **Riesgo:** bajo · **Prioridad:** alta · **A verificar:** que compile en `wasm32`.
 - **Verificación (2.ª pasada):** ✅ confirmada — `I: MaybeSend` implica `I: Send` porque el supertrait se propaga, y eso alcanza para convertir a `Box<dyn … + Send>`. Los 4 llamadores pasan `Some(batch_limit)` (grep en `crates/`). `take` antes de `map` es equivalente porque el closure es puro. Solo falta compilar en wasm32.
+- **Estado:** ✅ aplicada (paso 2), junto con el scan compartido: `apply_scan_transforms`, `MaybeSend` y `ScanIterator` quedan privados en `engine.rs` y compila en `wasm32`
 
 ### Q2. `KeyRange`: delegar en la biblioteca estándar
 - **Dónde:** `options.rs:37-49` y `52-68`.

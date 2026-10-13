@@ -58,6 +58,7 @@ Densidad baja-moderada (74 líneas de doc/comentario sobre 872) y en general de 
   Así `apply_scan_transforms` pasa a tener un solo llamador y puede ser privada.
 - **Ahorro estimado:** ~80 líneas netas en el crate (sale la copia de `disk`) · **Riesgo:** bajo (mismo código; `disk/mod.rs` lo audita otro agente, coordinar) · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ✅ confirmada — el código es idéntico al de `disk` (ver la Verificación de su Q1): el orden cursor/`remaining_limit` es independiente, y en `engine.rs` compila con `Send` (nativo) y sin él (wasm). Matiz: sin Q2, el helper sigue llamando dos veces a `apply_scan_transforms` (Forward/Backward). "Un solo llamador" quiere decir una sola función.
+- **Estado:** ✅ aplicada (paso 2): `engine::batched_scan`, usada por los dos motores; `apply_scan_transforms` queda privada en `engine.rs`
 
 ### Q2. Simplificar el cuerpo del `unfold` (aplica a la versión compartida de Q1)
 - **Dónde:** `memory/mod.rs:122-170`.
@@ -89,6 +90,7 @@ Densidad baja-moderada (74 líneas de doc/comentario sobre 872) y en general de 
   Nota: hoy `exhausted` solo pasa de `false` a `true`. Asignarlo directamente es equivalente, porque si ya fuera `true` la línea `118` habría retornado antes. Los préstamos (`start`/`end`/`rows` sobre `state`) terminan en el `collect()`, igual que hoy.
 - **Ahorro estimado:** ~14 líneas · **Riesgo:** bajo · **Prioridad:** alta (junto con Q1)
 - **Verificación (2.ª pasada):** ✅ confirmada — `count == 0` y `*rem == 0` sobran: el buffer vacío ya devuelve `None` y la línea 118 corta. Al llegar ahí, `exhausted` solo puede valer `false`. `ScanDirection` es `Copy`, y la tupla `(Bound<&PK>, Bound<&PK>)` ya se usa hoy como rango.
+- **Estado:** ✅ aplicada (paso 2), en `engine::batched_scan`
 
 ### Q3. Helper para el lock envenenado
 - **Dónde:** `mod.rs:49-51`, `68-70`, `88-90`, `200-203`, `219-222`, `239-241`, `302-304`, `313-315`, `380-382` (9 apariciones).

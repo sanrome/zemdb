@@ -68,6 +68,7 @@
   Dentro del helper, las dos ramas `Forward`/`Backward` pueden compartir el cálculo de límites (`let (start, end) = match (&state.cursor, direction) {...}`), lo que ahorra ~6 líneas más. El orden "actualizar `remaining_limit`" / "actualizar `cursor`" difiere entre las dos copias, pero ambas operaciones son independientes, así que no cambia nada.
 - **Ahorro estimado:** ~75 líneas en `disk/mod.rs` (y otras tantas en `memory/mod.rs`, fuera de este alcance) · **Riesgo:** bajo (es un traslado puro, los scans no hacen I/O) · **Prioridad:** alta
 - **Verificación (2.ª pasada):** ✅ confirmada — comparé `memory/mod.rs:102-193` con `disk/mod.rs:298-436`: son idénticos salvo el nombre del struct y el orden cursor/`remaining_limit`, que son independientes (uno depende de `batch_items.last()` y el otro de `count`). En `engine.rs` compila en las dos plataformas: `memory::Table` existe en wasm, el estado es `Send` como hoy y `RowStream<'static>` se convierte en `RowStream<'_>`. Faltaría importar `RangeBounds`/`VecDeque` allí.
+- **Estado:** ✅ aplicada (paso 2): `engine::batched_scan`, con las ramas `Forward`/`Backward` compartiendo el cálculo de límites
 
 ### Q2 — Helper `DiskWal::fail_on_err` para el patrón "marcar la room como fallida y propagar"
 - **Dónde:** `mod.rs:596-599`, `mod.rs:791-794`, `compactor.rs:111-114`, `compactor.rs:222-227`, `compactor.rs:274-278`, `compactor.rs:286-291`.
