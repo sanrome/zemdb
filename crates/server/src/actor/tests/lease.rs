@@ -40,59 +40,46 @@ fn interrupted_roster_save_keeps_previous_roster() {
     let second = ClientId::new("second").unwrap();
 
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
-    tracker.register_client(&first, None, seq(1)).unwrap();
+    tracker.register_client(&first, None, seq(1));
+    tracker.save().unwrap();
+    tracker.register_client(&second, None, seq(1));
 
     fail_point::arm("write_atomic_before_rename", &path);
-    assert!(tracker.register_client(&second, None, seq(1)).is_err());
-    // A failed registration leaves no trace in memory either.
-    assert!(tracker.get_client(&second).is_none());
-
+    assert!(tracker.persist_if_dirty().is_err());
     let reopened = ClientLeaseTracker::open_or_create(&path).unwrap();
     assert!(reopened.get_client(&first).is_some());
     assert!(reopened.get_client(&second).is_none());
+
+    // The change stays pending for the next attempt.
+    tracker.persist_if_dirty().unwrap();
+    let reopened = ClientLeaseTracker::open_or_create(&path).unwrap();
+    assert!(reopened.get_client(&second).is_some());
 }
 
 #[test]
-fn failed_re_registration_keeps_the_previous_entry() {
+fn membership_changes_are_written_only_when_flushed() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("meta_clients_room.json");
-    let client = ClientId::new("client").unwrap();
-
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
-    tracker
-        .register_client(&client, Some(seq(5)), seq(1))
-        .unwrap();
+    let clients: Vec<ClientId> = (0..1000)
+        .map(|i| ClientId::new(format!("client-{i}")).unwrap())
+        .collect();
+    for client in &clients {
+        tracker.register_client(client, None, seq(1));
+    }
+    assert!(!path.exists());
 
-    // Re-registering with a cursor behind the log would make it Bootstrapping at 0.
-    fail_point::arm("write_atomic_before_rename", &path);
-    assert!(tracker.register_client(&client, None, seq(3)).is_err());
+    tracker.persist_if_dirty().unwrap();
+    let reopened = ClientLeaseTracker::open_or_create(&path).unwrap();
+    assert_eq!(reopened.client_counts().4, clients.len());
 
-    let entry = tracker.get_client(&client).unwrap();
-    assert_eq!(entry.state, ClientState::Connected);
-    assert_eq!(entry.last_ack_seq, seq(5));
-}
-
-#[test]
-fn failed_deregistration_keeps_the_client() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("meta_clients_room.json");
-    let client = ClientId::new("client").unwrap();
-
-    let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
-    tracker.register_client(&client, None, seq(1)).unwrap();
-
-    fail_point::arm("write_atomic_before_rename", &path);
-    assert!(tracker.deregister_client(&client).is_err());
-    assert!(tracker.get_client(&client).is_some());
-    assert!(ClientLeaseTracker::open_or_create(&path)
-        .unwrap()
-        .get_client(&client)
-        .is_some());
-
-    // Deregistering a client that is not registered writes nothing and succeeds.
-    assert!(!tracker
-        .deregister_client(&ClientId::new("other").unwrap())
-        .unwrap());
+    tracker.deregister_client(&clients[0]);
+    assert!(tracker.get_client(&clients[0]).is_none());
+    let reopened = ClientLeaseTracker::open_or_create(&path).unwrap();
+    assert!(reopened.get_client(&clients[0]).is_some());
+    tracker.persist_if_dirty().unwrap();
+    let reopened = ClientLeaseTracker::open_or_create(&path).unwrap();
+    assert!(reopened.get_client(&clients[0]).is_none());
 }
 
 #[test]
@@ -114,7 +101,8 @@ fn cursor_updates_are_persisted_only_when_flushed() {
     let client = ClientId::new("client").unwrap();
 
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
-    tracker.register_client(&client, None, seq(1)).unwrap();
+    tracker.register_client(&client, None, seq(1));
+    tracker.save().unwrap();
     tracker.observe(&client, Some(seq(5)), seq(1));
     tracker.observe(&client, Some(seq(7)), seq(1));
 
@@ -131,7 +119,7 @@ fn observe_moves_the_cursor_only_forward() {
     let client = ClientId::new("client").unwrap();
 
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
-    tracker.register_client(&client, None, seq(1)).unwrap();
+    tracker.register_client(&client, None, seq(1));
     tracker.observe(&client, Some(seq(4)), seq(1));
     let state = tracker.observe(&client, Some(seq(2)), seq(1));
 
@@ -147,9 +135,7 @@ fn observe_derives_the_state_from_the_cursor() {
     let tail = seq(10);
 
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
-    tracker
-        .register_client(&client, Some(seq(3)), tail)
-        .unwrap();
+    tracker.register_client(&client, Some(seq(3)), tail);
     assert_eq!(
         tracker.get_client(&client).unwrap().state,
         ClientState::Bootstrapping
@@ -189,12 +175,8 @@ fn observe_reactivates_inactive_clients_according_to_their_cursor() {
     let behind = ClientId::new("behind").unwrap();
 
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
-    tracker
-        .register_client(&inside, Some(seq(8)), seq(1))
-        .unwrap();
-    tracker
-        .register_client(&behind, Some(seq(2)), seq(1))
-        .unwrap();
+    tracker.register_client(&inside, Some(seq(8)), seq(1));
+    tracker.register_client(&behind, Some(seq(2)), seq(1));
     tracker.get_client_mut(&inside).unwrap().state = ClientState::Dormant;
     tracker.get_client_mut(&behind).unwrap().state = ClientState::Disconnected;
 
@@ -216,7 +198,7 @@ fn activity_that_changes_state_is_persisted_on_flush() {
     let client = ClientId::new("client").unwrap();
 
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
-    tracker.register_client(&client, None, seq(10)).unwrap();
+    tracker.register_client(&client, None, seq(10));
     tracker.observe(&client, Some(seq(9)), seq(10));
     tracker.persist_if_dirty().unwrap();
 
@@ -272,9 +254,7 @@ fn disconnected_client_inside_the_log_stays_disconnected_by_default() {
     let client = ClientId::new("client").unwrap();
 
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
-    tracker
-        .register_client(&client, Some(seq(5)), seq(1))
-        .unwrap();
+    tracker.register_client(&client, Some(seq(5)), seq(1));
     set_inactive_for(&mut tracker, &client, 120);
 
     tracker.check_timeouts(Duration::from_secs(5), None, Duration::MAX, seq(1));
@@ -295,9 +275,7 @@ fn disconnected_client_becomes_dormant_once_behind_the_log() {
     let lease = Duration::from_secs(5);
 
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
-    tracker
-        .register_client(&client, Some(seq(5)), seq(1))
-        .unwrap();
+    tracker.register_client(&client, Some(seq(5)), seq(1));
     set_inactive_for(&mut tracker, &client, 6);
 
     tracker.check_timeouts(lease, None, Duration::MAX, seq(6));
@@ -328,9 +306,7 @@ fn configured_dormancy_timeout_makes_a_disconnected_client_dormant() {
     let dormant_after = Some(Duration::from_secs(60));
 
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
-    tracker
-        .register_client(&client, Some(seq(5)), seq(1))
-        .unwrap();
+    tracker.register_client(&client, Some(seq(5)), seq(1));
     set_inactive_for(&mut tracker, &client, 30);
 
     tracker.check_timeouts(lease, dormant_after, Duration::MAX, seq(1));
@@ -359,19 +335,11 @@ fn uploader_is_the_connected_client_with_the_highest_cursor() {
     let newcomer = ClientId::new("newcomer").unwrap();
 
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
-    tracker
-        .register_client(&ahead, Some(seq(9)), seq(5))
-        .unwrap();
-    tracker
-        .register_client(&recent, Some(seq(7)), seq(5))
-        .unwrap();
-    tracker
-        .register_client(&older, Some(seq(7)), seq(5))
-        .unwrap();
-    tracker
-        .register_client(&away, Some(seq(20)), seq(5))
-        .unwrap();
-    tracker.register_client(&newcomer, None, seq(5)).unwrap();
+    tracker.register_client(&ahead, Some(seq(9)), seq(5));
+    tracker.register_client(&recent, Some(seq(7)), seq(5));
+    tracker.register_client(&older, Some(seq(7)), seq(5));
+    tracker.register_client(&away, Some(seq(20)), seq(5));
+    tracker.register_client(&newcomer, None, seq(5));
     tracker.get_client_mut(&away).unwrap().state = ClientState::Disconnected;
     set_inactive_for(&mut tracker, &older, 10);
 
@@ -401,7 +369,7 @@ fn snapshot_demand_is_persisted_on_flush_and_survives_reopening() {
     let renewed_at = wall_time_ms(1_790_000_000_123);
 
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
-    tracker.register_client(&client, None, seq(1)).unwrap();
+    tracker.register_client(&client, None, seq(1));
     tracker.set_snapshot_demand(Some(renewed_at));
     assert_eq!(
         ClientLeaseTracker::open_or_create(&path)
@@ -523,9 +491,7 @@ fn inactivity_survives_reopening_the_roster() {
     let path = dir.path().join("meta_clients_room.json");
     let client = ClientId::new("client").unwrap();
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
-    tracker
-        .register_client(&client, Some(seq(5)), seq(1))
-        .unwrap();
+    tracker.register_client(&client, Some(seq(5)), seq(1));
     set_inactive_for(&mut tracker, &client, 100);
     tracker.save().unwrap();
 
@@ -588,9 +554,7 @@ fn activity_alone_is_written_only_when_the_room_stops() {
     let path = dir.path().join("meta_clients_room.json");
     let client = ClientId::new("client").unwrap();
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
-    tracker
-        .register_client(&client, Some(seq(5)), seq(1))
-        .unwrap();
+    tracker.register_client(&client, Some(seq(5)), seq(1));
     set_inactive_for(&mut tracker, &client, 100);
     tracker.save().unwrap();
 
@@ -626,9 +590,7 @@ fn dormant_client_is_forgotten_after_its_ttl_from_a_compact_roster() {
 
     let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
     for client in [&gone, &active] {
-        tracker
-            .register_client(client, Some(seq(1)), seq(1))
-            .unwrap();
+        tracker.register_client(client, Some(seq(1)), seq(1));
     }
     // Disconnected, then Dormant (its cursor fell behind the log), and kept before its TTL.
     set_inactive_for(&mut tracker, &gone, 59);
@@ -650,4 +612,19 @@ fn dormant_client_is_forgotten_after_its_ttl_from_a_compact_roster() {
     assert!(!saved.contains('\n'), "{saved}");
     let reopened = ClientLeaseTracker::open_or_create(&path).unwrap();
     assert!(reopened.get_client(&gone).is_none() && reopened.get_client(&active).is_some());
+}
+
+#[test]
+fn bootstrapping_clients_do_not_hold_back_pruning() {
+    let dir = tempdir().unwrap();
+    let mut tracker =
+        ClientLeaseTracker::open_or_create(dir.path().join("meta_clients_room.json")).unwrap();
+    let active = ClientId::new("active").unwrap();
+    let newbie = ClientId::new("newbie").unwrap();
+    tracker.register_client(&active, Some(seq(20)), seq(10));
+    assert_eq!(
+        tracker.register_client(&newbie, None, seq(10)),
+        ClientState::Bootstrapping
+    );
+    assert_eq!(tracker.min_connected_ack_seq(), Some(seq(20)));
 }

@@ -3,7 +3,7 @@ use crate::error::ServerError;
 use crate::fail_point;
 use crate::log::budget::ReadBudget;
 use crate::log::io_probe::IoEvent;
-use crate::log::segment_index::{segment_path, Tier};
+use crate::log::segment_index::{encode_mutation_ids, mutation_ids_path, segment_path, Tier};
 use crate::log::segment_reader::{
     classify_in, open_segment, read_frames, FrameRead, RecoveredLogData,
 };
@@ -34,6 +34,8 @@ pub struct WarmDiskLog {
     active_end_seq: Option<SequenceNumber>,
     /// Length of the valid records in `active.wal`, where the next record is written.
     active_len: u64,
+    /// The mutation IDs of `active.wal`, written next to it when it is sealed.
+    active_mutations: Vec<(MutationId, SequenceNumber)>,
 }
 
 impl WarmDiskLog {
@@ -57,9 +59,11 @@ impl WarmDiskLog {
             active_start_seq: None,
             active_end_seq: None,
             active_len: 0,
+            active_mutations: Vec::new(),
         };
 
         let recovered = log.inspect_active_segment()?;
+        log.active_mutations.clone_from(&recovered.1);
         Ok((log, recovered))
     }
 
@@ -97,6 +101,8 @@ impl WarmDiskLog {
         fail_point::check("warm_append_sync", &active_path)?;
         file.sync_data()?;
         self.active_len += encoded.len() as u64;
+        self.active_mutations
+            .extend(mutation_id.map(|id| (id, op.seq)));
 
         // The segment start is tracked independently of when the file handle was opened:
         // an `active.wal` recovered empty already has an open handle but no operations yet.
@@ -144,7 +150,9 @@ impl WarmDiskLog {
         self.segments_dir.join(ACTIVE_SEGMENT)
     }
 
-    /// Rotates and seals `active.wal` into an immutable `segment_{start}_{end}.wal` file.
+    /// Rotates and seals `active.wal` into an immutable `segment_{start}_{end}.wal` file, and
+    /// writes its mutation IDs next to it (see [`mutation_ids_path`]). Failing to write them
+    /// only makes a later open decode the segment instead.
     pub fn rotate_active_segment(&mut self) -> Result<Option<PathBuf>, ServerError> {
         let (Some(start), Some(end)) = (self.active_start_seq, self.active_end_seq) else {
             return Ok(None);
@@ -167,10 +175,20 @@ impl WarmDiskLog {
         self.active_start_seq = None;
         self.active_end_seq = None;
         self.active_len = 0;
+        let mutations = std::mem::take(&mut self.active_mutations);
 
         // Make the rename durable before the sealed segment can be compressed or pruned.
         if renamed {
             durable::sync_dir(&self.segments_dir)?;
+            let ids_path = mutation_ids_path(&self.segments_dir, start, end);
+            let ids = encode_mutation_ids(start, end, &mutations);
+            if let Err(err) = durable::write_atomic(&ids_path, &ids) {
+                tracing::warn!(
+                    path = ?ids_path,
+                    error = %err,
+                    "Failed to write the mutation IDs of a sealed segment"
+                );
+            }
         }
         Ok(Some(sealed_path))
     }

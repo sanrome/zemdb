@@ -98,16 +98,21 @@ impl Fixture {
             token,
         };
 
+        fx.register().await;
+        fx
+    }
+
+    /// Registers the client, which must succeed.
+    async fn register(&self) {
         let register = ClientMessage::RegisterClient {
             correlation_id: CorrelationId::new(1),
-            room_id: fx.room_id.clone(),
-            client_id: fx.client_id.clone(),
-            auth_token: fx.token.clone(),
+            room_id: self.room_id.clone(),
+            client_id: self.client_id.clone(),
+            auth_token: self.token.clone(),
             current_seq: None,
         };
-        let (status, _, _) = fx.post("register", &register).await;
+        let (status, _, _) = self.post("register", &register).await;
         assert_eq!(status, StatusCode::OK);
-        fx
     }
 
     async fn post(
@@ -240,7 +245,9 @@ async fn request_that_makes_the_room_panic_is_internal_and_the_room_recovers() {
     );
     assert!(headers.get(header::RETRY_AFTER).is_none());
 
-    // The next request reopens the room from disk, with the client still registered.
+    // The next request reopens the room from disk. The roster is not saved after a panic, so
+    // the client registers again (its registration may not have reached the disk).
+    fx.register().await;
     let (status, _, reply) = fx.post("heartbeat", &heartbeat).await;
     assert_eq!(status, StatusCode::OK, "{reply:?}");
     assert!(

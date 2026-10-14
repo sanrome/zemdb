@@ -1,12 +1,14 @@
 use crate::blocking::blocking_io;
 use crate::durable;
 use crate::error::ServerError;
-use crate::log::budget::{op_bytes, ReadBudget};
+use crate::log::budget::ReadBudget;
 use crate::log::cold_disk::{read_cold_file, ColdDiskLog, CompressedSegment};
 use crate::log::hot_buffer::HotBuffer;
 use crate::log::policy::RoomLifecyclePolicy;
 use crate::log::retention;
-use crate::log::segment_index::{segment_path, SegmentEntry, SegmentIndex, Tier};
+use crate::log::segment_index::{
+    decode_mutation_ids, mutation_ids_path, segment_path, SegmentEntry, SegmentIndex, Tier,
+};
 use crate::log::segment_reader::RecoveredLogData;
 use crate::log::warm_disk::{read_segment_file, WarmDiskLog};
 use fs2::FileExt;
@@ -137,11 +139,10 @@ impl TieredLog {
     /// Opens an existing room delta log or creates a new one, and returns the last
     /// `dedup_window` mutation IDs in the log, oldest first.
     ///
-    /// The log is read backwards from its newest segment only until it has the last
-    /// operations that fit in RAM (`ram_max_ops` and `ram_max_bytes`) and the last
-    /// `dedup_window` mutation IDs, keeping only those operations, so the cost of opening a
-    /// room does not grow with its retained history. `head_seq` comes from the segment names,
-    /// `active.wal` and `log_meta.json`.
+    /// RAM is filled from `active.wal` only, and the mutation IDs are read from the sidecars
+    /// of the newest segments (see [`read_newest`]), so the cost of opening a room does not
+    /// grow with its retained history. `head_seq` comes from the segment names, `active.wal`
+    /// and `log_meta.json`.
     pub fn open_or_create_with_dedup_window(
         dir: impl AsRef<Path>,
         policy: RoomLifecyclePolicy,
@@ -166,7 +167,7 @@ impl TieredLog {
         .max()
         .unwrap_or(pruned_through_seq);
 
-        let (ops, mutations) = read_newest(&segments, active, &policy, dedup_window)?;
+        let (ops, mutations) = read_newest(&segments, active, dedup_window)?;
         let mutations = newest_distinct(mutations, dedup_window);
 
         let mut hot_buffer = HotBuffer::new();
@@ -507,6 +508,10 @@ impl TieredLog {
 
         let mut deleted = (0, 0);
         let result = doomed.iter().try_for_each(|segment| {
+            // The sidecar first: a crash in between leaves a segment without one, which opens
+            // by decoding it, never a sidecar without its segment.
+            let ids = mutation_ids_path(&self.segments_dir, segment.start_seq, segment.end_seq);
+            durable::remove_file_if_exists(&ids)?;
             durable::remove_file_if_exists(&segment.path)?;
             self.segments.remove(segment.start_seq);
             match segment.tier {
@@ -573,8 +578,9 @@ impl TieredLog {
         self.tail_seq
     }
 
-    /// Bytes the log occupies on disk: its sealed segments and `active.wal`. Kept up to date
-    /// incrementally; checked against `max_room_disk_bytes`.
+    /// Bytes the log occupies on disk: its sealed segments and `active.wal`, without their
+    /// mutation ID sidecars (24 bytes per operation). Kept up to date incrementally; checked
+    /// against `max_room_disk_bytes`.
     pub fn disk_bytes(&self) -> u64 {
         self.segments.total_bytes() + self.warm_disk.active_len()
     }
@@ -583,6 +589,15 @@ impl TieredLog {
     #[cfg(test)]
     pub fn force_rotate_warm(&mut self) -> Result<Option<PathBuf>, ServerError> {
         blocking_io(|| self.seal_active_segment())
+    }
+
+    /// Whether [`prune_older_than`](Self::prune_older_than) with `target_seq` would delete a
+    /// segment.
+    pub fn has_prunable_below(&self, target_seq: SequenceNumber) -> bool {
+        self.segments
+            .iter()
+            .next()
+            .is_some_and(|segment| segment.end_seq < target_seq)
     }
 
     /// Proactively prunes all sealed Warm and Cold segments where `end_seq < target_seq`.
@@ -666,93 +681,55 @@ fn age(segment: &SegmentEntry, now: SystemTime) -> std::time::Duration {
     now.duration_since(segment.since).unwrap_or_default()
 }
 
-/// Reads the log backwards, starting with `active` (the contents of `active.wal`) and then the
-/// sealed segments from the newest, until it holds the newest operations that fit in RAM
-/// (`ram_max_ops` and `ram_max_bytes` of `policy`) and `mutations_wanted` distinct mutation
-/// IDs, or the log is exhausted. Returns them oldest first.
+/// The operations of `active` (the contents of `active.wal`), which are all that RAM is filled
+/// with, and the mutation IDs of `active` and of the sealed segments from the newest, until
+/// there are `mutations_wanted` distinct ones or the log is exhausted, oldest first.
 ///
-/// Segments read only for their mutation IDs keep none of their operations, so memory is
-/// bounded by what RAM holds plus one segment.
-///
-/// A corrupt sealed segment stops the reading there instead of failing the open: what is
-/// older is not loaded, and a read of the damaged range later reports a gap.
+/// A segment's IDs come from its sidecar ([`mutation_ids_path`]); the segment is decoded only
+/// if the sidecar is missing or damaged. A corrupt sealed segment stops the reading there
+/// instead of failing the open: older IDs are not loaded.
 fn read_newest(
     segments: &SegmentIndex,
     active: RecoveredLogData,
-    policy: &RoomLifecyclePolicy,
     mutations_wanted: usize,
 ) -> Result<RecoveredLogData, ServerError> {
-    let mut ram = RamFill::new(policy);
-    let (active_ops, active_mutations) = active;
+    let (ops, active_mutations) = active;
     let mut distinct: HashSet<MutationId> = active_mutations.iter().map(|(id, _)| *id).collect();
-    let mut chunks = vec![(ram.keep_newest(active_ops), active_mutations)];
+    let mut chunks = vec![active_mutations];
     for segment in segments.iter().rev() {
-        if ram.is_full() && distinct.len() >= mutations_wanted {
+        if distinct.len() >= mutations_wanted {
             break;
         }
-        let (chunk_ops, chunk_mutations) = match read_segment(
-            segment,
-            SequenceNumber::new(0),
-            &mut ReadBudget::ops(usize::MAX),
-        ) {
-            Ok(chunk) => chunk,
+        let mutations = match segment_mutations(segment) {
+            Ok(mutations) => mutations,
             Err(ServerError::WalCorruption(reason)) => {
                 tracing::error!(
                     path = ?segment.path,
                     %reason,
-                    "Corrupt log segment; older operations are not loaded"
+                    "Corrupt log segment; older mutation IDs are not loaded"
                 );
                 break;
             }
             Err(err) => return Err(err),
         };
-        distinct.extend(chunk_mutations.iter().map(|(id, _)| *id));
-        chunks.push((ram.keep_newest(chunk_ops), chunk_mutations));
+        distinct.extend(mutations.iter().map(|(id, _)| *id));
+        chunks.push(mutations);
     }
-
-    let mut ops = Vec::new();
-    let mut mutations = Vec::new();
-    for (chunk_ops, chunk_mutations) in chunks.into_iter().rev() {
-        ops.extend(chunk_ops);
-        mutations.extend(chunk_mutations);
-    }
-    Ok((ops, mutations))
+    Ok((ops, chunks.into_iter().rev().flatten().collect()))
 }
 
-/// The operations kept for RAM while the log is read backwards on open.
-struct RamFill {
-    max_ops: usize,
-    max_bytes: u64,
-    ops: usize,
-    bytes: u64,
-}
-
-impl RamFill {
-    fn new(policy: &RoomLifecyclePolicy) -> Self {
-        Self {
-            max_ops: policy.ram_max_ops,
-            max_bytes: policy.ram_max_bytes,
-            ops: 0,
-            bytes: 0,
-        }
+/// The mutation IDs of `segment`, from its sidecar or, failing that, from the segment itself.
+fn segment_mutations(
+    segment: &SegmentEntry,
+) -> Result<Vec<(MutationId, SequenceNumber)>, ServerError> {
+    let (start, end) = (segment.start_seq, segment.end_seq);
+    let dir = segment.path.parent().unwrap_or(Path::new(""));
+    let sidecar = std::fs::read(mutation_ids_path(dir, start, end)).ok();
+    if let Some(mutations) = sidecar.and_then(|bytes| decode_mutation_ids(&bytes, start, end)) {
+        return Ok(mutations);
     }
-
-    fn is_full(&self) -> bool {
-        self.ops >= self.max_ops || self.bytes >= self.max_bytes
-    }
-
-    /// Keeps the newest operations of `chunk`, which is older than everything kept so far,
-    /// while RAM is not full. One operation beyond the byte limit is kept, so that RAM is
-    /// filled up to it; the sliding window trims it afterwards.
-    fn keep_newest(&mut self, mut chunk: Vec<SequencedOperation>) -> Vec<SequencedOperation> {
-        let mut first = chunk.len();
-        while first > 0 && !self.is_full() {
-            first -= 1;
-            self.ops += 1;
-            self.bytes = self.bytes.saturating_add(op_bytes(&chunk[first]));
-        }
-        chunk.split_off(first)
-    }
+    let all = &mut ReadBudget::ops(usize::MAX);
+    Ok(read_segment(segment, SequenceNumber::new(0), all)?.1)
 }
 
 /// The last `window` distinct mutation IDs of `mutations` (oldest first), each with its

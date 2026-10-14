@@ -4,7 +4,7 @@ use crate::log::io_probe::{self, IoEvent};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
-use zemdb_core::id::SequenceNumber;
+use zemdb_core::id::{MutationId, SequenceNumber};
 
 /// Storage tier of a sealed segment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,11 +62,11 @@ pub(crate) struct SegmentIndex {
 impl SegmentIndex {
     /// Lists `segments_dir` once and indexes the sealed segments in it.
     ///
-    /// Also finishes the cleanup of compressions interrupted by a crash: temporary cold files
-    /// (`segment_*.tmp`) are removed, and so is a cold segment whose warm original still
-    /// exists (the crash came between the rename of the cold segment and the removal of the
-    /// warm one; the warm segment is kept and compressed again later). The directory is synced
-    /// after removing anything.
+    /// Also finishes the cleanup of writes interrupted by a crash: temporary files
+    /// (`segment_*.tmp`, from a compression or a sidecar) are removed, and so is a cold segment
+    /// whose warm original still exists (the crash came between the rename of the cold segment
+    /// and the removal of the warm one; the warm segment is kept and compressed again later).
+    /// The directory is synced after removing anything.
     pub(crate) fn scan(segments_dir: &Path) -> Result<Self, ServerError> {
         io_probe::record(IoEvent::Listing, segments_dir);
         let mut warm = Vec::new();
@@ -128,7 +128,7 @@ impl SegmentIndex {
 
         if !leftovers.is_empty() {
             for path in &leftovers {
-                tracing::warn!(path = ?path, "Removing leftover of an interrupted segment compression");
+                tracing::warn!(path = ?path, "Removing leftover of an interrupted segment write");
                 durable::remove_file_if_exists(path)?;
             }
             durable::sync_dir(segments_dir)?;
@@ -176,6 +176,60 @@ impl SegmentIndex {
     pub(crate) fn total_bytes(&self) -> u64 {
         self.total_bytes
     }
+}
+
+/// Path of the sidecar of the segment `start..=end`: the mutation IDs of its operations, so
+/// that opening the room does not decode the segment to rebuild the deduplication window.
+pub(crate) fn mutation_ids_path(
+    segments_dir: &Path,
+    start: SequenceNumber,
+    end: SequenceNumber,
+) -> PathBuf {
+    segments_dir.join(format!("segment_{:016}_{:016}.ids", start.get(), end.get()))
+}
+
+/// Size of one entry of a sidecar: the mutation ID and its sequence, little-endian.
+const MUTATION_ID_ENTRY: usize = 16 + 8;
+
+/// Encodes the sidecar of the segment `start..=end`: the segment's range, its entries, and a
+/// CRC32 of both, so that a sidecar is valid only for its own segment.
+pub(crate) fn encode_mutation_ids(
+    start: SequenceNumber,
+    end: SequenceNumber,
+    ids: &[(MutationId, SequenceNumber)],
+) -> Vec<u8> {
+    let mut bytes = [start.get().to_le_bytes(), end.get().to_le_bytes()].concat();
+    for (id, seq) in ids {
+        bytes.extend_from_slice(id.as_bytes());
+        bytes.extend_from_slice(&seq.get().to_le_bytes());
+    }
+    bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
+    bytes
+}
+
+/// Decodes the sidecar of the segment `start..=end`, or `None` if it is damaged or belongs to
+/// another segment.
+pub(crate) fn decode_mutation_ids(
+    bytes: &[u8],
+    start: SequenceNumber,
+    end: SequenceNumber,
+) -> Option<Vec<(MutationId, SequenceNumber)>> {
+    let (body, crc) = bytes.split_last_chunk::<4>()?;
+    let (range, entries) = body.split_first_chunk::<16>()?;
+    if range[..] != [start.get().to_le_bytes(), end.get().to_le_bytes()].concat()
+        || entries.len() % MUTATION_ID_ENTRY != 0
+        || crc32fast::hash(body) != u32::from_le_bytes(*crc)
+    {
+        return None;
+    }
+    entries
+        .chunks_exact(MUTATION_ID_ENTRY)
+        .map(|entry| {
+            let (id, seq) = entry.split_first_chunk::<16>()?;
+            let seq = u64::from_le_bytes(seq.try_into().ok()?);
+            Some((MutationId::new(*id), SequenceNumber::new(seq)))
+        })
+        .collect()
 }
 
 /// Path of the `tier` segment holding `start..=end` in `segments_dir`.

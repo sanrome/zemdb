@@ -828,12 +828,8 @@ fn client_lease_disconnected_to_dormant_timeout() {
     let tail_seq = SequenceNumber::new(0);
 
     // Register alice and bob as connected
-    let state_alice = tracker
-        .register_client(&alice, Some(SequenceNumber::new(10)), tail_seq)
-        .unwrap();
-    let state_bob = tracker
-        .register_client(&bob, Some(SequenceNumber::new(10)), tail_seq)
-        .unwrap();
+    let state_alice = tracker.register_client(&alice, Some(SequenceNumber::new(10)), tail_seq);
+    let state_bob = tracker.register_client(&bob, Some(SequenceNumber::new(10)), tail_seq);
     assert_eq!(state_alice, ClientState::Connected);
     assert_eq!(state_bob, ClientState::Connected);
     assert_eq!(

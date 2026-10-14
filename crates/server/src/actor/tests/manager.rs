@@ -978,8 +978,10 @@ async fn rooms_shut_down_together_and_save_their_rosters() {
             .await
             .unwrap()
             .unwrap();
-        // Activity alone does not make the roster dirty: only the stop writes it again.
+        // The fast tick writes the registration; once removed, only the stop writes it again
+        // (activity alone does not make the roster dirty).
         let roster = room_dir(&dir, &room_id).join(format!("meta_clients_{room_id}.json"));
+        wait_until("the registration is written", || roster.exists()).await;
         fs::remove_file(&roster).unwrap();
         manager
             .ask(&room_id, |reply| RoomCommand::Heartbeat {

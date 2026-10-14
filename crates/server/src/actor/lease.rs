@@ -61,10 +61,8 @@ pub struct ClientEntry {
 /// Persistent tracker for client leases, cursors, and room membership, which also keeps the
 /// room's snapshot demand on disk.
 ///
-/// Membership changes (register, deregister) are written to disk immediately. Cursor, state
-/// and snapshot demand changes only update memory and mark the roster dirty; the owner flushes
-/// them with `persist_if_dirty`. Losing an unflushed cursor advance only makes the server
-/// retain more log.
+/// Every change only updates memory and marks the roster dirty; the owner flushes it with
+/// `persist_if_dirty`, so a crash loses the changes not flushed yet.
 #[derive(Debug)]
 pub struct ClientLeaseTracker {
     path: PathBuf,
@@ -117,20 +115,11 @@ impl ClientLeaseTracker {
 
     /// Atomically and durably persists the client roster to disk, clearing the dirty mark.
     pub fn save(&mut self) -> Result<(), ServerError> {
-        self.write_roster(self.clients.values().collect())?;
-        self.dirty = false;
-        self.activity_unsaved = false;
-        Ok(())
-    }
-
-    /// Writes `clients`, with the current snapshot demand, as the roster file. Used to persist
-    /// a roster change before applying it in memory, so that a failed write leaves the
-    /// tracker unchanged.
-    fn write_roster(&self, clients: Vec<&ClientEntry>) -> Result<(), ServerError> {
         let (instant_now, wall_now) = (Instant::now(), SystemTime::now());
         let roster = RosterFile {
-            clients: clients
-                .into_iter()
+            clients: self
+                .clients
+                .values()
                 .map(|entry| PersistedClient::new(entry, instant_now, wall_now))
                 .collect(),
             snapshot_demand: self.snapshot_demand.map(PersistedDemand::from_time),
@@ -139,6 +128,8 @@ impl ClientLeaseTracker {
             ServerError::Serialization(format!("Failed to serialize clients roster: {}", e))
         })?;
         durable::write_atomic(&self.path, json.as_bytes())?;
+        self.dirty = false;
+        self.activity_unsaved = false;
         Ok(())
     }
 
@@ -191,37 +182,23 @@ impl ClientLeaseTracker {
 
     /// Registers a client at the cursor `current_seq` (0 if `None`): `Bootstrapping` if that is
     /// behind the retained log (`cursor < tail_seq - 1`), otherwise `Connected`.
-    ///
-    /// The roster is written with the new entry first; only then does the tracker change, so a
-    /// failed write leaves the client as it was (unregistered, or with its previous entry).
     pub fn register_client(
         &mut self,
         client_id: &ClientId,
         current_seq: Option<SequenceNumber>,
         tail_seq: SequenceNumber,
-    ) -> Result<ClientState, ServerError> {
+    ) -> ClientState {
         let last_ack = current_seq.unwrap_or(SequenceNumber::new(0));
-        let initial_state = ClientState::active_for(last_ack, tail_seq);
-
+        let state = ClientState::active_for(last_ack, tail_seq);
         let entry = ClientEntry {
             client_id: client_id.clone(),
-            state: initial_state,
+            state,
             last_ack_seq: last_ack,
             last_heartbeat: Instant::now(),
         };
-        let roster = self
-            .clients
-            .values()
-            .filter(|other| &other.client_id != client_id)
-            .chain(std::iter::once(&entry))
-            .collect();
-        self.write_roster(roster)?;
-
-        // The file now holds the whole in-memory roster, including any pending change.
         self.clients.insert(client_id.clone(), entry);
-        self.dirty = false;
-        self.activity_unsaved = false;
-        Ok(initial_state)
+        self.dirty = true;
+        state
     }
 
     /// Records activity of a registered client and recomputes its lifecycle state from its
@@ -257,23 +234,9 @@ impl ClientLeaseTracker {
         Some(state)
     }
 
-    /// Explicitly deregisters a client from the room roster. As for registration, the roster
-    /// is written before the client is removed from memory. Returns whether it was registered.
-    pub fn deregister_client(&mut self, client_id: &ClientId) -> Result<bool, ServerError> {
-        if !self.clients.contains_key(client_id) {
-            return Ok(false);
-        }
-        let roster = self
-            .clients
-            .values()
-            .filter(|other| &other.client_id != client_id)
-            .collect();
-        self.write_roster(roster)?;
-
-        self.clients.remove(client_id);
-        self.dirty = false;
-        self.activity_unsaved = false;
-        Ok(true)
+    /// Removes a client from the roster, if it is registered.
+    pub fn deregister_client(&mut self, client_id: &ClientId) {
+        self.dirty |= self.clients.remove(client_id).is_some();
     }
 
     /// Evaluates timeouts for all registered clients (changes only mark the roster dirty):

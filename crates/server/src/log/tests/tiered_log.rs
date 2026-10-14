@@ -33,12 +33,15 @@ fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).unwrap().len()
 }
 
-/// Total size of the files in `segments`, read through each file: on Windows a listing can
-/// report a stale size for the open `active.wal`.
+/// Bytes of the segments and `active.wal` in `segments` (not the mutation ID sidecars, which the
+/// quota does not count), read through each file: on Windows a listing can report a stale size
+/// for the open `active.wal`.
 fn bytes_on_disk(segments: &Path) -> u64 {
     std::fs::read_dir(segments)
         .unwrap()
-        .map(|entry| file_len(&entry.unwrap().path()))
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_none_or(|ext| ext != "ids"))
+        .map(|path| file_len(&path))
         .sum()
 }
 
@@ -314,36 +317,95 @@ fn maintenance_fetch_and_pruning_never_list_the_segments_directory() {
     assert_eq!(log.tail_seq().get(), 6);
 }
 
+/// Ten cold segments of five operations each, then 51..=53 in active.wal.
+fn fifty_three_compressed_ops(dir: &Path) {
+    let (mut log, _) = TieredLog::open_or_create(dir, compress_at_once_policy()).unwrap();
+    append_range(&mut log, 1, 50);
+    log.run_maintenance_sync().unwrap();
+    append_range(&mut log, 51, 53);
+}
+
+/// Reopens the log of [`fifty_three_compressed_ops`] in `dir` with a deduplication window of
+/// `window` mutation IDs and checks what it recovered. Returns how many sealed segments it
+/// read.
+fn reopen_with_window(dir: &Path, window: usize) -> usize {
+    let segments = segments_dir(dir);
+    let before = io_probe::count(IoEvent::SegmentRead, &segments);
+    let (log, mutations) =
+        TieredLog::open_or_create_with_dedup_window(dir, compress_at_once_policy(), window)
+            .unwrap();
+    let reads = io_probe::count(IoEvent::SegmentRead, &segments) - before;
+
+    let recovered: Vec<(MutationId, u64)> =
+        mutations.into_iter().map(|(m, s)| (m, s.get())).collect();
+    let first = 54 - window as u64;
+    let expected: Vec<(MutationId, u64)> = (first..=53).map(|s| (mutation_for(s), s)).collect();
+    assert_eq!(recovered, expected, "the newest mutations, oldest first");
+    assert_eq!(log.head_seq().get(), 53);
+    assert_eq!(log.tail_seq().get(), 1);
+    // RAM holds only active.wal.
+    assert_eq!(log.hot_buffer.min_seq().map(|s| s.get()), Some(51));
+    assert_eq!(log.hot_buffer.max_seq().map(|s| s.get()), Some(53));
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    assert_contiguous(&ops, 1, 53);
+    reads
+}
+
 #[test]
-fn reopen_reads_only_the_newest_segments_needed_for_ram_and_dedup() {
+fn reopen_reads_the_mutation_ids_of_sealed_segments_without_decoding_them() {
+    let dir = tempdir().unwrap();
+    // The sidecars were written when the segments were sealed and kept by the compression.
+    fifty_three_compressed_ops(dir.path());
+    // The window spans active.wal and the newest segment (46..=50).
+    assert_eq!(reopen_with_window(dir.path(), 7), 0);
+}
+
+#[test]
+fn reopen_decodes_a_segment_whose_mutation_ids_are_missing_or_invalid() {
+    let dir = tempdir().unwrap();
+    fifty_three_compressed_ops(dir.path());
+    let segments = segments_dir(dir.path());
+    let ids = |first, last| segment_file(&segments, first, last, "ids");
+    // Another segment's sidecar, with a valid CRC; four zero bytes; and none at all.
+    std::fs::copy(ids(41, 45), ids(46, 50)).unwrap();
+    std::fs::write(ids(41, 45), [0u8; 4]).unwrap();
+    std::fs::remove_file(ids(36, 40)).unwrap();
+    // The window spans active.wal and the segments 46..=50, 41..=45 and 36..=40.
+    assert_eq!(reopen_with_window(dir.path(), 18), 3);
+}
+
+#[test]
+fn ids_written_before_a_reopen_reach_the_sidecar() {
     let dir = tempdir().unwrap();
     {
         let (mut log, _) =
             TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
-        // Ten cold segments of five operations each, then 51..=53 in active.wal.
-        append_range(&mut log, 1, 50);
-        log.run_maintenance_sync().unwrap();
-        append_range(&mut log, 51, 53);
+        append_range(&mut log, 1, 3);
+    }
+    {
+        // Seals 1..=5, three of which were written before this open.
+        let (mut log, _) =
+            TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
+        append_range(&mut log, 4, 5);
     }
     let segments = segments_dir(dir.path());
     let before = io_probe::count(IoEvent::SegmentRead, &segments);
-
-    // The last 7 mutation ids span active.wal and the newest cold segment (46..=50).
-    let (log, mutations) =
-        TieredLog::open_or_create_with_dedup_window(dir.path(), compress_at_once_policy(), 7)
+    let (_, mutations) =
+        TieredLog::open_or_create_with_dedup_window(dir.path(), compress_at_once_policy(), 5)
             .unwrap();
+    assert_eq!(io_probe::count(IoEvent::SegmentRead, &segments), before);
+    assert_eq!(mutations.len(), 5);
+}
 
-    assert_eq!(io_probe::count(IoEvent::SegmentRead, &segments) - before, 1);
-    let recovered: Vec<(MutationId, u64)> =
-        mutations.into_iter().map(|(m, s)| (m, s.get())).collect();
-    let expected: Vec<(MutationId, u64)> = (47..=53).map(|s| (mutation_for(s), s)).collect();
-    assert_eq!(recovered, expected, "the newest mutations, oldest first");
-    assert_eq!(log.head_seq().get(), 53);
-    assert_eq!(log.tail_seq().get(), 1);
-    assert_eq!(log.hot_buffer.min_seq().map(|s| s.get()), Some(49));
-    assert_eq!(log.hot_buffer.max_seq().map(|s| s.get()), Some(53));
-    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
-    assert_contiguous(&ops, 1, 53);
+#[test]
+fn pruning_a_segment_deletes_its_mutation_ids() {
+    let dir = tempdir().unwrap();
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
+    append_range(&mut log, 1, 10);
+    let ids = segment_file(&segments_dir(dir.path()), 1, 5, "ids");
+    assert!(ids.exists());
+    log.prune_older_than(SequenceNumber::new(6)).unwrap();
+    assert!(!ids.exists());
 }
 
 #[test]
@@ -760,7 +822,9 @@ fn open_tolerates_a_corrupt_newest_segment() {
         let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
         append_range(&mut log, 1, 12);
     }
+    // Without its sidecar, the segment is decoded on open.
     corrupt_first_record(&segment_file(&segments_dir(dir.path()), 6, 10, "wal"));
+    std::fs::remove_file(segment_file(&segments_dir(dir.path()), 6, 10, "ids")).unwrap();
 
     let (mut log, mutations) =
         TieredLog::open_or_create_with_dedup_window(dir.path(), policy, 100).unwrap();
@@ -955,7 +1019,8 @@ fn reopening_loads_into_ram_only_what_fits() {
     let policy = RoomLifecyclePolicy {
         ram_max_ops: 1_000,
         ram_max_bytes: MIB as u64,
-        segment_max_bytes: MIB as u64,
+        // active.wal holds more than RAM, which the open has to trim.
+        segment_max_bytes: 4 * MIB as u64,
         ..RoomLifecyclePolicy::default()
     };
     {
@@ -974,7 +1039,7 @@ fn reopening_loads_into_ram_only_what_fits() {
 }
 
 #[test]
-fn opening_keeps_only_the_operations_that_fit_in_ram() {
+fn opening_fills_ram_only_from_active_wal() {
     let dir = tempdir().unwrap();
     let policy = RoomLifecyclePolicy {
         ram_max_ops: 1_000,
@@ -993,11 +1058,11 @@ fn opening_keeps_only_the_operations_that_fit_in_ram() {
     let segments = SegmentIndex::scan(&segments_dir(dir.path())).unwrap();
     let (_warm, active) = WarmDiskLog::open_recovering(segments_dir(dir.path())).unwrap();
 
-    let (ops, mutations) = read_newest(&segments, active, &policy, usize::MAX).unwrap();
+    let (ops, mutations) = read_newest(&segments, active, usize::MAX).unwrap();
 
-    // Every mutation ID, but only the newest operations up to the first past 1 MiB.
+    // Every mutation ID, but only the operations of active.wal.
     assert_eq!(mutations.len(), 10);
-    assert_contiguous(&ops, 7, 10);
+    assert_contiguous(&ops, 9, 10);
 }
 
 /// Flips a byte in the payload of the `index`-th frame of the segment open in `file`.

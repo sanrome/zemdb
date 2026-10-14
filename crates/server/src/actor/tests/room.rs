@@ -82,9 +82,10 @@ impl Fixture {
             .join(format!("meta_clients_{}.json", self.room_id.as_str()))
     }
 
+    /// The client's cursor in the roster file, if the file holds the client.
     fn persisted_cursor(&self, client_id: &ClientId) -> Option<SequenceNumber> {
         let roster: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(self.roster_path()).unwrap()).unwrap();
+            serde_json::from_str(&fs::read_to_string(self.roster_path()).ok()?).unwrap();
         let entries: Vec<ClientEntry> = serde_json::from_value(roster["clients"].clone()).unwrap();
         entries
             .into_iter()
@@ -313,8 +314,8 @@ async fn shutdown_persists_pending_roster_changes() {
 
     assert_eq!(
         fx.persisted_cursor(&client),
-        Some(seq(0)),
-        "the cursor must still be pending before Shutdown"
+        None,
+        "the roster must still be pending before Shutdown"
     );
     assert!(fx.manager.shutdown_room(&fx.room_id).await);
 
@@ -433,6 +434,51 @@ async fn pruning_on_ack_persists_cursor_before_deleting_segments() {
         persisted.get() + 1 >= tail.get(),
         "persisted cursor {persisted} is behind the pruned tail {tail}"
     );
+    fx.manager.shutdown_all().await;
+}
+
+// Paused time: no maintenance tick writes the roster.
+#[tokio::test(start_paused = true)]
+async fn acks_that_prune_no_segment_do_not_write_the_roster() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    for n in 1..=50u8 {
+        commit(&sender, &client, mutation(n), seq(0), insert_op(n.into()))
+            .await
+            .unwrap();
+        ack(&sender, &client, seq(n.into())).await.unwrap();
+    }
+    assert!(!fx.roster_path().exists());
+    fx.manager.shutdown_all().await;
+}
+
+// Paused time: no maintenance tick writes the registration before the crash.
+#[tokio::test(start_paused = true)]
+async fn registration_lost_in_a_crash_is_made_again() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let client = ClientId::new("writer").unwrap();
+    register(&fx.sender().await, &client).await;
+
+    // A panic stops the room without saving its roster, as a crash would.
+    fail_point::arm("room_command_panic", &fx.room_dir());
+    let crashed = fx
+        .manager
+        .ask(&fx.room_id, |reply| RoomCommand::Heartbeat {
+            client_id: client.clone(),
+            reply,
+        })
+        .await;
+    assert!(matches!(crashed, Err(ServerError::Internal(_))));
+
+    let sender = fx.sender().await;
+    assert!(matches!(
+        heartbeat(&sender, &client).await,
+        Err(ServerError::ClientNotRegistered(_))
+    ));
+    register(&sender, &client).await;
+    heartbeat(&sender, &client).await.unwrap();
     fx.manager.shutdown_all().await;
 }
 
@@ -722,6 +768,26 @@ async fn prune_with_writer(fx: &Fixture) -> (ClientId, SequenceNumber) {
     let tail = metrics(&sender).await.tail_seq;
     assert!(tail >= seq(5), "the ack must have pruned (tail {tail})");
     (writer, tail)
+}
+
+// Paused time: no maintenance tick changes the lifecycle states under test.
+#[tokio::test(start_paused = true)]
+async fn a_bootstrapping_client_does_not_hold_back_pruning() {
+    let fx = Fixture::new(small_segments()).await;
+    let (writer, tail) = prune_with_writer(&fx).await;
+    let sender = fx.sender().await;
+    let newbie = ClientId::new("newbie").unwrap();
+    register(&sender, &newbie).await;
+    assert_eq!(states(&sender).await.0, 1, "newbie must be Bootstrapping");
+
+    for n in 9..=12u8 {
+        commit(&sender, &writer, mutation(n), seq(8), insert_op(n.into()))
+            .await
+            .unwrap();
+    }
+    ack(&sender, &writer, seq(12)).await.unwrap();
+    assert!(metrics(&sender).await.tail_seq > tail);
+    fx.manager.shutdown_all().await;
 }
 
 // Paused time: no maintenance tick changes the lifecycle states under test.
@@ -1535,6 +1601,8 @@ async fn commands_queued_when_the_room_goes_idle_are_handled() {
         .unwrap();
 
     assert!(actor.drain_for_idle_shutdown().await.is_continue());
+    // As the actor loop does on every exit.
+    actor.persist_roster_at_stop();
 
     // Nothing more is accepted; what was queued was handled normally.
     assert!(sender.is_closed());
@@ -1592,7 +1660,7 @@ async fn disk_maintenance_waits_for_the_slow_tick() {
 }
 
 #[tokio::test]
-async fn reopening_reads_only_the_segments_needed_for_ram_and_dedup() {
+async fn reopening_hydrates_dedup_without_reading_segments() {
     let fx = Fixture::with_options(
         small_segments(),
         |config| config.dedup_lru_capacity = 3,
@@ -1614,10 +1682,11 @@ async fn reopening_reads_only_the_segments_needed_for_ram_and_dedup() {
 
     let sender = fx.sender().await;
 
-    // The last three mutation ids are in the two newest segments.
+    // The last three mutation ids are in the sidecars of the two newest segments, which are
+    // not decoded.
     assert_eq!(
         io_probe::count(IoEvent::SegmentRead, &segments) - reads_before,
-        2
+        0
     );
     // Hydrated oldest first: 8 is the least recently used and the first to be evicted.
     let new = commit(&sender, &client, mutation(11), seq(0), insert_op(11))

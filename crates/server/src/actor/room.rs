@@ -158,8 +158,8 @@ impl RoomActor {
 
         let clients_path = room_dir.join(format!("meta_clients_{}.json", room_id.as_str()));
 
-        // Reads back only the newest segments: those holding the operations kept in RAM and
-        // the mutation IDs the deduplication cache holds.
+        // Fills RAM from active.wal and reads back only the mutation IDs the deduplication
+        // cache holds.
         let mut dedup_cache = DedupLruCache::new(config.dedup_lru_capacity);
         let (tiered_log, recovered_mutations) = TieredLog::open_or_create_with_dedup_window(
             &room_dir,
@@ -342,8 +342,8 @@ impl RoomActor {
             }
 
             RoomCommand::DeregisterClient { client_id, reply } => {
-                let res = self.lease_tracker.deregister_client(&client_id).map(|_| ());
-                let _ = reply.send(res);
+                self.lease_tracker.deregister_client(&client_id);
+                let _ = reply.send(Ok(()));
             }
 
             RoomCommand::GetSchema { reply } => {
@@ -454,7 +454,7 @@ impl RoomActor {
         let tail_seq = self.tiered_log.tail_seq();
         let state = self
             .lease_tracker
-            .register_client(client_id, current_seq, tail_seq)?;
+            .register_client(client_id, current_seq, tail_seq);
         if state == ClientState::Bootstrapping {
             self.request_snapshot();
         }
@@ -835,7 +835,8 @@ impl RoomActor {
     ///
     /// The cursors that justify the prune are persisted before any segment is deleted, so the
     /// roster on disk never falls behind the retained log; otherwise a restart would treat
-    /// those clients as fallen behind and force them to a snapshot.
+    /// those clients as fallen behind and force them to a snapshot. A prune that deletes no
+    /// segment only trims RAM and leaves the roster for the fast tick.
     fn prune_to_retention_floor(&mut self) {
         let Some(min_ack) = self.lease_tracker.min_connected_ack_seq() else {
             return;
@@ -853,13 +854,15 @@ impl RoomActor {
             return;
         }
 
-        if let Err(err) = self.lease_tracker.persist_if_dirty() {
-            warn!(
-                room = %self.room_id,
-                error = %err,
-                "Failed to persist clients roster; skipping proactive log pruning"
-            );
-            return;
+        if self.tiered_log.has_prunable_below(retention_floor) {
+            if let Err(err) = self.lease_tracker.persist_if_dirty() {
+                warn!(
+                    room = %self.room_id,
+                    error = %err,
+                    "Failed to persist clients roster; skipping proactive log pruning"
+                );
+                return;
+            }
         }
         if let Err(err) = self.tiered_log.prune_older_than(retention_floor) {
             warn!(room = %self.room_id, error = %err, "Proactive log pruning failed");
