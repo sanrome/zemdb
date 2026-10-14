@@ -1,7 +1,7 @@
 # Auditoría Post-Fase 3.7
 
 **Fecha:** 14 de Octubre de 2026
-**Commit auditado:** `698e8d6` (`main`). La auditoría se hizo sobre `2a5f7b3`; después entraron 53 commits de refactor (la aplicación de la [auditoría de calidad](2026-10-calidad-codigo.md)), y cada hallazgo se re-verificó en `698e8d6`. Las referencias `ruta:línea` son de `698e8d6`. Ver §1.1.
+**Commit auditado:** `698e8d6` (`main`). La auditoría se hizo sobre `2a5f7b3`; después entraron 53 commits de refactor (la aplicación de la auditoría de calidad de código, cuyos reportes se borraron después; siguen en el historial de git hasta `f7e439b`), y cada hallazgo se re-verificó en `698e8d6`. Las referencias `ruta:línea` son de `698e8d6`. Ver §1.1.
 **Alcance:** `crates/core`, `crates/storage`, `crates/server`, `crates/client`, `README.md`, `ARCHITECTURE.md`, `ROADMAP.md`, `GEMINI.md`, `.github/workflows/ci.yml`
 **Auditoría anterior:** [`2026-10-post-fase3_6-audit.md`](2026-10-post-fase3_6-audit.md) (DEF-87 a DEF-113, resuelta en el [plan de la Fase 3.7](../proposals/2026-10-fase3_7-remediation-plan.md))
 **Plan de resolución:** [`docs/proposals/2026-10-fase3_8-remediation-plan.md`](../proposals/2026-10-fase3_8-remediation-plan.md)
@@ -223,7 +223,7 @@ Un fallo intermitente por tiempos (`http_edge_tests::body_sent_drip_by_drip_fail
 
 #### DEF-134 · Bajo · Confirmado · Nada comprueba que la compresión a cold use `spawn_blocking`
 - **Dónde:** `crates/server/src/log/cold_disk.rs:106-115` (`spawn_blocking` en `:112`).
-- **Cambió con el refactor:** en `2a5f7b3`, `test_tiered_log_async_maintenance_spawn_blocking` prometía comprobarlo y no lo hacía. `b012e1a` lo borró por duplicado de `test_tiered_log_cold_compression_and_read` (`crates/server/src/log/AUDITORIA_CALIDAD.md:32`). Desapareció el test engañoso, pero no el hueco: comprimir inline sigue dejando la suite en verde (408/408).
+- **Cambió con el refactor:** en `2a5f7b3`, `test_tiered_log_async_maintenance_spawn_blocking` prometía comprobarlo y no lo hacía. `b012e1a` lo borró por duplicado de `test_tiered_log_cold_compression_and_read`. Desapareció el test engañoso, pero no el hueco: comprimir inline sigue dejando la suite en verde (408/408).
 - **Solución:** que un fail point registre el `ThreadId` en `compress_warm_segment_sync` y que un test con runtime `current_thread` compruebe que no es el suyo.
 
 #### DEF-140 · Bajo · Confirmado (coordinador) · El test de overrides ya no verifica que la config llegue a la sala
@@ -283,7 +283,7 @@ Un fallo intermitente por tiempos (`http_edge_tests::body_sent_drip_by_drip_fail
 - **DEF-34:** no hay `reload_schema` en storage (DEF-115 es distinto, aunque relacionado).
 - **DEF-81:** un miembro malicioso puede subir un snapshot falso.
 - **Residuo de DEF-95:** una conexión SSE semiabierta retiene el permiso de conexión hasta que TCP falla.
-- **Reportes de calidad:** `mutation/op.rs` ("zero heap pointers"), `wal_frame.rs` ("little-endian" para el magic) y tres comentarios desactualizados en tests.
+- **Residuos de la auditoría de calidad:** `mutation/op.rs` ("zero heap pointers"), `wal_frame.rs` ("little-endian" para el magic) y tres comentarios desactualizados en tests.
 
 ### Observaciones (no son defectos)
 
