@@ -8,7 +8,9 @@ use axum::response::Response;
 use zemdb_core::id::{RoomId, SequenceNumber};
 use zemdb_core::protocol::messages::{ClientMessage, ServerMessage};
 
-use crate::api::data_plane::{binary_error, binary_response, unexpected_message};
+use crate::api::data_plane::{
+    binary_error, binary_response, budgeted_or_unavailable, unexpected_message,
+};
 use crate::api::extract::{ensure_payload_identity, BinaryBody, BinaryMessage, RelayAuth};
 use crate::api::router::AppState;
 use crate::error::ServerError;
@@ -98,7 +100,7 @@ pub async fn request_chunk(
         )
         .await;
     match result {
-        Ok(chunk_msg) => binary_response(StatusCode::OK, &chunk_msg),
+        Ok(chunk_msg) => budgeted_or_unavailable(&state, correlation_id, room_id, &chunk_msg),
         Err(err) => binary_error(Some(correlation_id), Some(room_id), err),
     }
 }

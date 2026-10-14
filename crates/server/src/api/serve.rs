@@ -6,26 +6,28 @@
 use axum::body::{Body, Bytes};
 use axum::extract::Request;
 use axum::{BoxError, Router};
-use http_body::{Frame, SizeHint};
+use http_body::{Body as _, Frame, SizeHint};
 use hyper::body::Incoming;
 use hyper::service::Service as _;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto;
 use hyper_util::service::TowerToHyperService;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{ready, Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 use tracing::{debug, error, info};
 
-use crate::api::router::{build_router, AppState, ShutdownSignal};
+use crate::api::router::{build_router, AppState, ResponseBudget, ShutdownSignal};
 use crate::config::ServerConfig;
 use crate::error::ServerError;
 
@@ -49,17 +51,20 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
 ///
 /// While serving, the limits of `state.config` apply to every connection:
 /// - at most `max_connections` are open at once; at the limit, new connections wait in the
-///   listen backlog until an open one closes. An HTTP/2 connection carries at most 100
+///   listen backlog until an open one closes. An HTTP/2 connection carries at most 32
 ///   requests at once;
 /// - a connection must deliver the headers of each request within `header_read_timeout_secs`,
 ///   counted from its opening or from the end of its previous response; one that does not, or
 ///   that stays open without a request in progress for longer, is closed;
 /// - a request body must arrive in full within `body_read_timeout_secs`, extended by one
-///   second per `body_min_rate_bytes_per_sec` bytes received (see [`build_router`]).
+///   second per `body_min_rate_bytes_per_sec` bytes received (see [`build_router`]);
+/// - a response must not wait longer than `response_stall_timeout_secs` for the client to take
+///   its next frame (at most 64 KiB), nor a write to the socket for the client to accept bytes,
+///   or the connection is closed. A response is waiting only while it has data the client has
+///   not taken, so an SSE stream without events is never cut, and a client reading at least
+///   one frame per timeout gets its whole response.
 ///
-/// A request in progress, including the writing of its whole response at the client's pace
-/// and an open SSE stream, is never cut by these limits. Over HTTP/2, a client that stops
-/// reading the end of a response for longer than the header timeout is disconnected.
+/// The header timeout does not apply while a request is in progress.
 pub async fn serve_until_shutdown<F>(
     listener: TcpListener,
     state: AppState,
@@ -101,6 +106,7 @@ where
 #[derive(Debug, Clone, Copy)]
 struct ConnectionLimits {
     header_read_timeout: Duration,
+    response_stall_timeout: Duration,
     max_connections: usize,
 }
 
@@ -108,6 +114,7 @@ impl ConnectionLimits {
     fn new(config: &ServerConfig) -> Self {
         Self {
             header_read_timeout: Duration::from_secs(config.header_read_timeout_secs),
+            response_stall_timeout: Duration::from_secs(config.response_stall_timeout_secs),
             max_connections: config.max_connections,
         }
     }
@@ -169,7 +176,7 @@ async fn accept_until(
             stream,
             app.clone(),
             builder.clone(),
-            limits.header_read_timeout,
+            *limits,
             shutdown.clone(),
             permit,
         ));
@@ -193,11 +200,11 @@ fn is_connection_error(err: &io::Error) -> bool {
 
 /// Most HTTP/2 streams (requests) a connection may have in progress at once, so that
 /// `max_connections` still bounds the requests in flight.
-const MAX_CONCURRENT_STREAMS: u32 = 100;
+const MAX_CONCURRENT_STREAMS: u32 = 32;
 
-/// Largest frame of a response body handed to hyper. Hyper asks HTTP/2 for send capacity
-/// before taking each frame, so with small frames a body is done only when the client has
-/// accepted all but the last frame, instead of as soon as hyper buffers it whole.
+/// Largest frame of a response body handed to hyper. Over HTTP/2, hyper waits for send
+/// capacity before taking each frame after the first, so with small frames a body is done only
+/// once the client has accepted nearly all of it, instead of as soon as hyper buffers it whole.
 const MAX_RESPONSE_FRAME: usize = 64 * 1024;
 
 /// While the server shuts down, how long a connection that was serving a request may stay
@@ -221,7 +228,8 @@ fn connection_builder(limits: &ConnectionLimits) -> auto::Builder<TokioExecutor>
     builder
 }
 
-/// Serves one connection until it ends, it goes idle for too long, or the server shuts down.
+/// Serves one connection until it ends, it goes idle for too long, one of its responses
+/// stalls for `limits.response_stall_timeout`, or the server shuts down.
 ///
 /// Idle means without a request in progress: a request stays in progress until hyper has
 /// taken the last frame of its response body. The idle limit is `header_read_timeout`; each
@@ -239,7 +247,7 @@ async fn serve_connection(
     stream: TcpStream,
     app: Router,
     builder: auto::Builder<TokioExecutor>,
-    header_read_timeout: Duration,
+    limits: ConnectionLimits,
     shutdown: ShutdownSignal,
     _permit: OwnedSemaphorePermit,
 ) {
@@ -251,15 +259,12 @@ async fn serve_connection(
             let in_progress = activity.begin_request();
             let response = app.call(request);
             async move {
-                let response = response.await?;
+                let mut response = response.await?;
+                let budget = response.extensions_mut().remove::<ResponseBudget>();
                 // The request stays in progress until its response body is done or dropped.
-                Ok::<_, Infallible>(response.map(|body| {
-                    Body::new(TrackedBody {
-                        inner: body,
-                        pending: Bytes::new(),
-                        _in_progress: in_progress,
-                    })
-                }))
+                Ok::<_, Infallible>(
+                    response.map(|body| Body::new(TrackedBody::new(body, in_progress, budget))),
+                )
             }
         })
     };
@@ -275,7 +280,7 @@ async fn serve_connection(
         let idle = if shutting_down {
             activity.idle_for(SHUTDOWN_LINGER, true)
         } else {
-            activity.idle_for(header_read_timeout, false)
+            activity.idle_for(limits.header_read_timeout, false)
         };
         tokio::select! {
             result = connection.as_mut() => {
@@ -295,6 +300,10 @@ async fn serve_connection(
                 debug!("Closing an idle connection");
                 break;
             }
+            () = activity.stalled(limits.response_stall_timeout) => {
+                debug!("Closing a connection whose client stopped taking a response");
+                break;
+            }
         }
     }
 }
@@ -309,7 +318,7 @@ enum Protocol {
 }
 
 /// What [`serve_connection`] needs to know about a connection: requests in progress, writes
-/// waiting for the client, and its protocol.
+/// waiting for the client, its protocol, and responses waiting for the client.
 #[derive(Default)]
 struct Activity {
     in_progress: AtomicUsize,
@@ -319,13 +328,45 @@ struct Activity {
     /// has a single waiter ([`Activity::idle_for`]), so `notify_one` keeps a notification
     /// that arrives while it is not waiting.
     changed: Notify,
+    /// Since when each response that is waiting for the client to take a frame has been
+    /// waiting, by request, and since when a write has been blocked, under [`SOCKET`].
+    waiting: Mutex<HashMap<u64, Instant>>,
+    next_request: AtomicU64,
+    /// Notified when `waiting` changes. Its single waiter is [`Activity::stalled`].
+    waiting_changed: Notify,
 }
 
 impl Activity {
     fn begin_request(self: &Arc<Self>) -> InProgress {
         self.in_progress.fetch_add(1, Ordering::SeqCst);
         self.changed.notify_one();
-        InProgress(Arc::clone(self))
+        InProgress {
+            activity: Arc::clone(self),
+            id: self.next_request.fetch_add(1, Ordering::SeqCst),
+        }
+    }
+
+    fn waiting(&self) -> MutexGuard<'_, HashMap<u64, Instant>> {
+        self.waiting.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Resolves once a response or a blocked write has been waiting for the client for
+    /// `timeout`.
+    async fn stalled(&self, timeout: Duration) {
+        loop {
+            let changed = self.waiting_changed.notified();
+            let oldest = self.waiting().values().min().copied();
+            let Some(since) = oldest else {
+                changed.await;
+                continue;
+            };
+            if tokio::time::timeout_at(since + timeout, changed)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
     }
 
     fn protocol(&self) -> Protocol {
@@ -341,11 +382,26 @@ impl Activity {
         self.changed.notify_one();
     }
 
-    /// Records whether the last write had to wait for the client; a change notifies.
+    /// Records whether the last write had to wait for the client; a change notifies. A blocked
+    /// write waits for the client like a response does, under the key [`SOCKET`], so a socket
+    /// the client stops reading stalls the connection even while hyper holds the data.
     fn set_write_blocked(&self, blocked: bool) {
         if self.write_blocked.swap(blocked, Ordering::SeqCst) != blocked {
             self.changed.notify_one();
+            self.set_waiting(SOCKET, blocked);
         }
+    }
+
+    /// Records whether `id` waits for the client, since now if it does.
+    fn set_waiting(&self, id: u64, waiting: bool) {
+        let mut all = self.waiting();
+        if waiting {
+            all.insert(id, Instant::now());
+        } else if all.remove(&id).is_none() {
+            return;
+        }
+        drop(all);
+        self.waiting_changed.notify_one();
     }
 
     /// Whether no request is in progress and no write is waiting for the client.
@@ -372,12 +428,26 @@ impl Activity {
 }
 
 /// A request in progress, until dropped.
-struct InProgress(Arc<Activity>);
+struct InProgress {
+    activity: Arc<Activity>,
+    id: u64,
+}
+
+/// Key of a blocked write in [`Activity::waiting`]; requests are numbered from 0.
+const SOCKET: u64 = u64::MAX;
+
+impl InProgress {
+    /// Records whether the response of this request is waiting for the client to take a frame.
+    fn set_waiting(&self, waiting: bool) {
+        self.activity.set_waiting(self.id, waiting);
+    }
+}
 
 impl Drop for InProgress {
     fn drop(&mut self) {
-        self.0.in_progress.fetch_sub(1, Ordering::SeqCst);
-        self.0.changed.notify_one();
+        self.set_waiting(false);
+        self.activity.in_progress.fetch_sub(1, Ordering::SeqCst);
+        self.activity.changed.notify_one();
     }
 }
 
@@ -479,11 +549,60 @@ impl AsyncWrite for TrackedIo {
 
 /// Response body that keeps its request in progress while it is being sent, handed to hyper
 /// in frames of at most [`MAX_RESPONSE_FRAME`] bytes.
+///
+/// From its creation, and from each frame it hands over, until hyper asks for the next frame,
+/// the response is waiting for the client: hyper asks only while its buffers (HTTP/1.1) or
+/// HTTP/2 flow control have room for more.
+///
+/// Over HTTP/2 hyper drops the body once it passes the last frame to h2, so the last byte goes
+/// in a frame of its own: by then the client has granted window for the rest. A body that holds
+/// part of the budget hands copies, so the frames that h2 or hyper still hold after the body is
+/// dropped (a client may shrink its window afterwards) do not keep the whole encoding alive.
 struct TrackedBody {
     inner: Body,
     /// The rest of a data frame of `inner` larger than [`MAX_RESPONSE_FRAME`].
     pending: Bytes,
-    _in_progress: InProgress,
+    in_progress: InProgress,
+    budget: Option<ResponseBudget>,
+}
+
+impl TrackedBody {
+    fn new(inner: Body, in_progress: InProgress, budget: Option<ResponseBudget>) -> Self {
+        in_progress.set_waiting(true);
+        Self {
+            inner,
+            pending: Bytes::new(),
+            in_progress,
+            budget,
+        }
+    }
+
+    fn poll_next_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        if self.pending.is_empty() {
+            match ready!(Pin::new(&mut self.inner).poll_frame(cx)) {
+                Some(Ok(frame)) => match frame.into_data() {
+                    Ok(data) => self.pending = data,
+                    Err(frame) => return Poll::Ready(Some(Ok(frame))),
+                },
+                Some(Err(err)) => return Poll::Ready(Some(Err(err.into()))),
+                None => return Poll::Ready(None),
+            }
+        }
+        let len = match self.pending.len() {
+            len @ 2..=MAX_RESPONSE_FRAME if self.inner.is_end_stream() => len - 1,
+            len => len.min(MAX_RESPONSE_FRAME),
+        };
+        let data = self.pending.split_to(len);
+        let data = if self.budget.is_some() {
+            Bytes::copy_from_slice(&data)
+        } else {
+            data
+        };
+        Poll::Ready(Some(Ok(Frame::data(data))))
+    }
 }
 
 impl http_body::Body for TrackedBody {
@@ -494,19 +613,10 @@ impl http_body::Body for TrackedBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
-        let this = &mut *self;
-        if this.pending.is_empty() {
-            match ready!(Pin::new(&mut this.inner).poll_frame(cx)) {
-                Some(Ok(frame)) => match frame.into_data() {
-                    Ok(data) => this.pending = data,
-                    Err(frame) => return Poll::Ready(Some(Ok(frame))),
-                },
-                Some(Err(err)) => return Poll::Ready(Some(Err(err.into()))),
-                None => return Poll::Ready(None),
-            }
-        }
-        let len = this.pending.len().min(MAX_RESPONSE_FRAME);
-        Poll::Ready(Some(Ok(Frame::data(this.pending.split_to(len)))))
+        let frame = self.poll_next_frame(cx);
+        self.in_progress
+            .set_waiting(matches!(frame, Poll::Ready(Some(_))));
+        frame
     }
 
     fn is_end_stream(&self) -> bool {

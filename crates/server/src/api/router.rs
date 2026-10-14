@@ -6,12 +6,13 @@ use axum::routing::{get, post};
 use axum::Router;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use zemdb_core::protocol::codec::MAX_FRAME_SIZE;
 
 use crate::actor::manager::RoomManager;
 use crate::api::body_timeout::{limit_body_read_time, BodyReadLimit};
 use crate::api::data_plane::{binary_response, error_frame};
+use crate::api::sse::SseStreams;
 use crate::api::{control_plane, data_plane, relay, sse};
 use crate::config::ServerConfig;
 use crate::error::ServerError;
@@ -61,6 +62,9 @@ pub struct AppState {
     pub room_manager: Arc<RoomManager>,
     pub snapshot_relay: Arc<SnapshotRelay>,
     pub shutdown: ShutdownSignal,
+    /// Bytes of large responses that may be in flight (`max_inflight_response_bytes`).
+    pub(crate) response_budget: Arc<Semaphore>,
+    pub(crate) sse_streams: Arc<SseStreams>,
 }
 
 impl AppState {
@@ -70,12 +74,33 @@ impl AppState {
         room_manager: Arc<RoomManager>,
         snapshot_relay: Arc<SnapshotRelay>,
     ) -> Self {
+        let budget = usize::try_from(config.max_inflight_response_bytes)
+            .unwrap_or(usize::MAX)
+            .min(Semaphore::MAX_PERMITS);
         Self {
+            response_budget: Arc::new(Semaphore::new(budget)),
+            sse_streams: Arc::new(SseStreams::new(config.sse_stream_limit())),
             config,
             schema_registry,
             room_manager,
             snapshot_relay,
             shutdown: ShutdownSignal::new(),
+        }
+    }
+}
+
+/// Part of the budget of response bytes in flight, held by a response until hyper drops its
+/// body. The handler puts it in the response's extensions, and
+/// [`serve_until_shutdown`](crate::api::serve_until_shutdown) moves it into the body.
+#[derive(Clone)]
+pub(crate) struct ResponseBudget {
+    _permit: Arc<OwnedSemaphorePermit>,
+}
+
+impl ResponseBudget {
+    pub(crate) fn new(permit: OwnedSemaphorePermit) -> Self {
+        Self {
+            _permit: Arc::new(permit),
         }
     }
 }

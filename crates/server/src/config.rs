@@ -5,6 +5,7 @@ use serde::Deserialize;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use zemdb_core::protocol::codec::MAX_FRAME_SIZE;
 
 /// Server configuration with TOML deserialization and environment variable overrides.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -87,7 +88,6 @@ pub struct ServerConfig {
     /// Base time a request body has to arrive in full, counted from the end of its headers
     /// and extended by one second per `body_min_rate_bytes_per_sec` bytes received; a request
     /// whose body is still incomplete at the deadline fails with 408 (seconds, default 60).
-    /// Responses, such as SSE streams, have no time limit.
     pub body_read_timeout_secs: u64,
 
     /// Minimum body rate that extends the deadline (bytes per second, default 32 KiB/s): a body
@@ -99,6 +99,21 @@ pub struct ServerConfig {
     /// Each connection takes a file descriptor, so the process limit of open files
     /// (`ulimit -n`) must be above this value.
     pub max_connections: usize,
+
+    /// Longest a response may wait for the client to take its next frame (at most 64 KiB), or a
+    /// socket write for the client to accept bytes, before the connection is closed (seconds,
+    /// default 60). A response whose body has nothing to send, such as an SSE stream without
+    /// events, is not waiting for the client.
+    pub response_stall_timeout_secs: u64,
+
+    /// Bytes of large responses (`SyncBatch`, `CommitAck`, `SnapshotChunk`) held at once until
+    /// their clients take them (default 256 MiB). Without room left, a sync or a snapshot
+    /// chunk is answered `Unavailable`, and a commit is acknowledged without its catch-up.
+    pub max_inflight_response_bytes: u64,
+
+    /// Most SSE streams open at once (default: half of `max_connections`, at least 1). A
+    /// client keeps at most 2 per room: opening a third closes its oldest.
+    pub max_sse_streams: Option<usize>,
 }
 
 /// Built-in development secrets. They are public, so `validate_secrets` rejects them.
@@ -133,6 +148,9 @@ impl Default for ServerConfig {
             body_read_timeout_secs: 60,
             body_min_rate_bytes_per_sec: 32 * 1024,
             max_connections: 10_000,
+            response_stall_timeout_secs: 60,
+            max_inflight_response_bytes: 256 * 1024 * 1024,
+            max_sse_streams: None,
         }
     }
 }
@@ -155,6 +173,14 @@ const BODY_MIN_RATE_BYTES_PER_SEC_RANGE: std::ops::RangeInclusive<u64> = 1024..=
 
 /// Accepted range of `max_connections`: from 1 to 1,000,000.
 const MAX_CONNECTIONS_RANGE: std::ops::RangeInclusive<usize> = 1..=1_000_000;
+
+/// Accepted range of `response_stall_timeout_secs`: from 5 seconds to 1 hour.
+const RESPONSE_STALL_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u64> = 5..=3600;
+
+/// Accepted range of `max_inflight_response_bytes`: from the largest frame, so that any response
+/// fits, to 64 GiB.
+const MAX_INFLIGHT_RESPONSE_BYTES_RANGE: std::ops::RangeInclusive<u64> =
+    MAX_FRAME_SIZE as u64..=64 * 1024 * 1024 * 1024;
 
 /// Minimum length, in bytes, of the client token secret and the admin secret.
 const MIN_SECRET_LEN: usize = 32;
@@ -223,9 +249,32 @@ impl ServerConfig {
             self.max_connections,
             MAX_CONNECTIONS_RANGE,
         )?;
+        check_range(
+            "response_stall_timeout_secs (ZEMDB_RESPONSE_STALL_TIMEOUT_SECS)",
+            self.response_stall_timeout_secs,
+            RESPONSE_STALL_TIMEOUT_SECS_RANGE,
+        )?;
+        check_range(
+            "max_inflight_response_bytes (ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES)",
+            self.max_inflight_response_bytes,
+            MAX_INFLIGHT_RESPONSE_BYTES_RANGE,
+        )?;
+        if let Some(max) = self.max_sse_streams {
+            check_range(
+                "max_sse_streams (ZEMDB_MAX_SSE_STREAMS)",
+                max,
+                1..=self.max_connections,
+            )?;
+        }
         self.lifecycle_settings()
             .check(|setting| format!("{} ({})", setting.field(), setting.env_var()))
             .map_err(ServerError::Config)
+    }
+
+    /// Most SSE streams open at once: `max_sse_streams`, or half of `max_connections`.
+    pub(crate) fn sse_stream_limit(&self) -> usize {
+        self.max_sse_streams
+            .unwrap_or((self.max_connections / 2).max(1))
     }
 
     /// The server defaults of the room lifecycle policy, as settings in their configured
@@ -328,6 +377,15 @@ impl ServerConfig {
         }
         if let Some(max) = parse_var(&var, "ZEMDB_MAX_CONNECTIONS")? {
             self.max_connections = max;
+        }
+        if let Some(secs) = parse_var(&var, "ZEMDB_RESPONSE_STALL_TIMEOUT_SECS")? {
+            self.response_stall_timeout_secs = secs;
+        }
+        if let Some(bytes) = parse_var(&var, "ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES")? {
+            self.max_inflight_response_bytes = bytes;
+        }
+        if let Some(max) = parse_var(&var, "ZEMDB_MAX_SSE_STREAMS")? {
+            self.max_sse_streams = Some(max);
         }
 
         use PolicySetting::*;

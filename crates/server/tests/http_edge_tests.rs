@@ -1,5 +1,6 @@
 //! Limits of the HTTP edge as served by `serve_until_shutdown`: header and body read
-//! timeouts, the connection limit, and HTTP/2 without TLS.
+//! timeouts, the response stall timeout, the connection limit, the budget of response bytes in
+//! flight, the SSE stream limits, and HTTP/2 without TLS.
 //!
 //! The tests run on the real clock with the shortest timeouts the configuration accepts: a
 //! paused clock jumps to the next timer whenever the runtime waits for socket events, which
@@ -8,7 +9,8 @@
 mod common;
 
 use common::{
-    build, commit, read_sse_until, register, register_msg, Parts, ADMIN_SECRET, AUTH_SECRET,
+    assert_binary_error, build, commit, read_sse_until, register, register_msg, Parts,
+    ADMIN_SECRET, AUTH_SECRET,
 };
 use futures::StreamExt;
 use reqwest::StatusCode;
@@ -18,6 +20,7 @@ use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+use zemdb_core::protocol::codec::MAX_FRAME_SIZE;
 use zemdb_core::*;
 use zemdb_server::{generate_client_token, ServerConfig, ServerError};
 
@@ -383,23 +386,37 @@ async fn body_that_arrives_in_time_is_served() {
     server.shutdown().await;
 }
 
+/// Opens the event stream of `room_id` with `token`, on a connection of its own.
+async fn open_events(server: &TestServer, room_id: &str, token: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .get(server.url(&format!("/rooms/{room_id}/events")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// Token of `client_id` for `room_id`.
+fn client_token(client_id: &str, room_id: &str) -> String {
+    let client_id = ClientId::new(client_id).unwrap();
+    let room_id = RoomId::new(room_id).unwrap();
+    generate_client_token(&client_id, &room_id, Duration::from_secs(3600), AUTH_SECRET)
+}
+
 #[tokio::test]
-async fn open_sse_stream_outlives_both_timeouts() {
+async fn open_sse_stream_outlives_every_timeout() {
     let server = start_server(|config| {
         config.header_read_timeout_secs = 1;
         config.body_read_timeout_secs = 1;
+        config.response_stall_timeout_secs = STALL_TIMEOUT.as_secs();
     })
     .await;
-    let response = reqwest::Client::new()
-        .get(server.url("/rooms/room-edge/events"))
-        .bearer_auth(&server.token)
-        .send()
-        .await
-        .unwrap();
+    let response = open_events(&server, "room-edge", &server.token).await;
     assert_eq!(response.status(), StatusCode::OK);
     let mut events = response.bytes_stream();
 
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Without events, the stream is not waiting for the client: it is not stalled.
+    tokio::time::sleep(STALL_TIMEOUT + Duration::from_secs(1)).await;
 
     // The stream still delivers events: a commit advances the head.
     let sender = server
@@ -490,12 +507,15 @@ const LARGE_ROW_SIZE: usize = 4 * 1024 * 1024;
 /// timeout has passed: the response in progress is completed before the server stops.
 const SHUTDOWN_DURING_RESPONSE: Duration = Duration::from_millis(1500);
 
-/// Sleeps 20 ms for every 64 KiB in `unpaced`, leaving the remainder: about 3 MB/s. Paced by
-/// bytes, not by reads, so the rate does not depend on how much each read returns or on the
-/// resolution of the timer.
-async fn pace(unpaced: &mut usize) {
+/// Pause per 64 KiB read of the slow reader tests: about 3 MB/s.
+const SLOW_READ_PAUSE: Duration = Duration::from_millis(20);
+
+/// Sleeps `pause` for every 64 KiB in `unpaced`, leaving the remainder. Paced by bytes, not by
+/// reads, so the rate does not depend on how much each read returns or on the resolution of
+/// the timer.
+async fn pace(unpaced: &mut usize, pause: Duration) {
     while *unpaced >= 64 * 1024 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(pause).await;
         *unpaced -= 64 * 1024;
     }
 }
@@ -558,34 +578,39 @@ async fn large_response_to_a_slow_http1_reader_is_delivered_in_full() {
                 response.len()
             ),
         }
-        pace(&mut unpaced).await;
+        pace(&mut unpaced, SLOW_READ_PAUSE).await;
     }
     let split = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
     assert_large_sync_batch(&response[split + 4..]);
     server.wait_stopped().await;
 }
 
-#[tokio::test]
-async fn large_response_to_a_slow_http2_reader_is_delivered_in_full() {
-    let mut server = start_server(short_timeouts).await;
-    server.commit_large_rows(LARGE_ROWS, LARGE_ROW_SIZE).await;
-
-    let client = reqwest::Client::builder()
+/// An HTTP/2 client that sends nothing but its requests.
+fn http2_client() -> reqwest::Client {
+    reqwest::Client::builder()
         .http2_prior_knowledge()
         .build()
-        .unwrap();
-    let response = client
-        .post(server.url("/rooms/room-edge/sync"))
-        .bearer_auth(&server.token)
-        .body(server.sync_frame())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    server.shutdown_after(SHUTDOWN_DURING_RESPONSE);
+        .unwrap()
+}
+
+impl TestServer {
+    /// Sends a `Sync` from the start of the log through `client`, returning once the response
+    /// headers arrive, without reading the body.
+    async fn send_sync(&self, client: &reqwest::Client) -> reqwest::Response {
+        client
+            .post(self.url("/rooms/room-edge/sync"))
+            .bearer_auth(&self.token)
+            .body(self.sync_frame())
+            .send()
+            .await
+            .unwrap()
+    }
+}
+
+/// Reads `response` at one 64 KiB frame per `pause`, checking that it arrives in full.
+async fn read_paced(response: reqwest::Response, pause: Duration) -> Vec<u8> {
     let expected = response.content_length().unwrap() as usize;
     let mut chunks = response.bytes_stream();
-    // About 3 MB/s, as for HTTP/1.1.
     let mut body = Vec::new();
     let mut unpaced = 0;
     while let Some(chunk) = chunks.next().await {
@@ -596,12 +621,192 @@ async fn large_response_to_a_slow_http2_reader_is_delivered_in_full() {
             }
             Err(err) => panic!("body cut after {} of {expected} bytes: {err:?}", body.len()),
         }
-        pace(&mut unpaced).await;
+        pace(&mut unpaced, pause).await;
     }
     assert_eq!(body.len(), expected);
-    assert_large_sync_batch(&body);
+    body
+}
+
+#[tokio::test]
+async fn large_response_to_a_slow_http2_reader_is_delivered_in_full() {
+    let mut server = start_server(short_timeouts).await;
+    server.commit_large_rows(LARGE_ROWS, LARGE_ROW_SIZE).await;
+
+    let client = http2_client();
+    let response = server.send_sync(&client).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    server.shutdown_after(SHUTDOWN_DURING_RESPONSE);
+    // About 3 MB/s, as for HTTP/1.1.
+    assert_large_sync_batch(&read_paced(response, SLOW_READ_PAUSE).await);
     drop(client);
     server.wait_stopped().await;
+}
+
+/// Response stall timeout of the tests that exercise it: the shortest accepted.
+const STALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A single connection at a time, with the shortest response stall timeout and the longest
+/// header timeout, so that only the stall timeout can close a connection during the test.
+fn one_connection_short_stall(config: &mut ServerConfig) {
+    config.max_connections = 1;
+    config.response_stall_timeout_secs = STALL_TIMEOUT.as_secs();
+    config.header_read_timeout_secs = 300;
+}
+
+/// Rows of the stall tests: a `SyncBatch` of about 12.6 MB, well over the socket buffers of
+/// both ends and hyper's write buffer.
+const STALL_ROWS: u8 = 3;
+
+/// Asserts that a new connection is served within the stall timeout and a few seconds: the
+/// only connection allowed must have been closed for stalling.
+async fn assert_new_connection_served(server: &TestServer) {
+    tokio::time::timeout(STALL_TIMEOUT + Duration::from_secs(5), async {
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        get_not_found(&mut stream).await;
+    })
+    .await
+    .expect("a stalled connection must be closed, freeing its place");
+}
+
+#[tokio::test]
+async fn http2_client_that_stops_reading_is_disconnected() {
+    let server = start_server(one_connection_short_stall).await;
+    server.commit_large_rows(STALL_ROWS, LARGE_ROW_SIZE).await;
+
+    // Syncs whose bodies are never read: flow control holds most of each one in the server.
+    let client = http2_client();
+    let mut held = Vec::new();
+    for _ in 0..4 {
+        let response = server.send_sync(&client).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        held.push(response);
+    }
+    assert_new_connection_served(&server).await;
+    for response in held {
+        assert!(response.bytes().await.is_err(), "the body must be cut");
+    }
+    drop(client);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn http1_client_that_stops_reading_is_disconnected() {
+    let server = start_server(one_connection_short_stall).await;
+    server.commit_large_rows(STALL_ROWS, LARGE_ROW_SIZE).await;
+
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(64 * 1024).unwrap();
+    let mut stream = socket.connect(server.addr).await.unwrap();
+    let frame = server.sync_frame();
+    let head = format!(
+        "POST /rooms/room-edge/sync HTTP/1.1\r\nHost: zemdb\r\nAuthorization: Bearer {}\r\n\
+         Content-Length: {}\r\n\r\n",
+        server.token,
+        frame.len()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(&frame).await.unwrap();
+
+    assert_new_connection_served(&server).await;
+    let received = read_until_closed(&mut stream).await;
+    assert!(
+        received.len() < usize::from(STALL_ROWS) * LARGE_ROW_SIZE,
+        "the response must be cut"
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn slow_reader_that_keeps_reading_outlasts_the_stall_timeout() {
+    let server = start_server(|config| {
+        config.response_stall_timeout_secs = STALL_TIMEOUT.as_secs();
+    })
+    .await;
+    server.commit_large_rows(LARGE_ROWS, LARGE_ROW_SIZE).await;
+
+    // About 1 MB/s: the response takes well over the stall timeout to read, but every frame
+    // is taken far within it.
+    let client = http2_client();
+    let response = server.send_sync(&client).await;
+    let started = Instant::now();
+    assert_large_sync_batch(&read_paced(response, Duration::from_millis(60)).await);
+    assert!(started.elapsed() > STALL_TIMEOUT);
+    drop(client);
+    server.shutdown().await;
+}
+
+/// Rows whose `SyncBatch` (about 10.5 MB) fits the smallest budget of response bytes in flight
+/// once, but not twice.
+const BUDGET_ROWS: u8 = 2;
+const BUDGET_ROW_SIZE: usize = 5 * 1024 * 1024;
+
+#[tokio::test]
+async fn responses_over_the_budget_in_flight_wait_for_held_bodies() {
+    let server = start_server(|config| {
+        config.max_inflight_response_bytes = MAX_FRAME_SIZE as u64;
+    })
+    .await;
+    server.commit_large_rows(BUDGET_ROWS, BUDGET_ROW_SIZE).await;
+    let held_client = http2_client();
+    let held = server.send_sync(&held_client).await;
+    assert_eq!(held.status(), StatusCode::OK);
+
+    let client = reqwest::Client::new();
+    let refused = server.send_sync(&client).await;
+    assert!(refused.headers().contains_key("retry-after"));
+    assert_binary_error(
+        refused,
+        StatusCode::SERVICE_UNAVAILABLE,
+        ErrorCode::Unavailable,
+    )
+    .await;
+
+    // A commit is durable before its reply, so it is acknowledged, without its catch-up.
+    let commit = ClientMessage::Commit {
+        correlation_id: CorrelationId::new(7),
+        room_id: server.room_id.clone(),
+        client_id: server.client_id.clone(),
+        mutation_id: MutationId::new([0xEE; 16]),
+        last_ack_seq: SequenceNumber::new(0),
+        op: Operation::insert(
+            0,
+            PrimaryKey::single(100i64),
+            CompactRow::new(vec![Value::Int(100), Value::Null]),
+            0,
+        ),
+    };
+    let response = client
+        .post(server.url("/rooms/room-edge/commit"))
+        .bearer_auth(&server.token)
+        .body(encode_message(&commit).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    match decode_message(&response.bytes().await.unwrap()).unwrap() {
+        ServerMessage::CommitAck {
+            assigned_seq,
+            catchup_ops,
+            has_more,
+            ..
+        } => {
+            assert_eq!(assigned_seq, SequenceNumber::new(3));
+            assert!(catchup_ops.is_empty());
+            assert!(has_more);
+        }
+        other => panic!("expected a CommitAck, got {other:?}"),
+    }
+
+    // Once the held body is released, syncs are served again.
+    drop((held, held_client));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while server.send_sync(&client).await.status() != StatusCode::OK {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("a released body must return its bytes to the budget");
+    server.shutdown().await;
 }
 
 #[tokio::test]
@@ -630,4 +835,75 @@ async fn shutdown_closes_connections_without_a_request_in_progress_at_once() {
         elapsed < Duration::from_secs(2),
         "shutdown took {elapsed:?}"
     );
+}
+
+#[tokio::test]
+async fn a_third_sse_stream_of_a_client_ends_its_oldest() {
+    let server = start_server(|_| {}).await;
+    let mut streams = Vec::new();
+    for _ in 0..3 {
+        let response = open_events(&server, "room-edge", &server.token).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        streams.push(response.bytes_stream());
+    }
+    let mut oldest = streams.remove(0);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(chunk) = oldest.next().await {
+            chunk.unwrap();
+        }
+    })
+    .await
+    .expect("the oldest stream must end");
+
+    // The two newest still deliver events.
+    server.commit_large_rows(1, 1).await;
+    for stream in &mut streams {
+        read_sse_until(stream, "event: head_advanced").await;
+    }
+    drop(streams);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn sse_streams_over_their_limit_are_refused_and_leave_connections_for_requests() {
+    let server = start_server(|config| {
+        config.max_connections = 4;
+        config.max_sse_streams = Some(2);
+    })
+    .await;
+    let schema_id = SchemaId::new("tasks").unwrap();
+    server.parts.create_room("room-other", &schema_id).await;
+
+    let first = open_events(&server, "room-edge", &server.token).await;
+    let second = open_events(&server, "room-edge", &client_token("second", "room-edge")).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    let other_token = client_token("other", "room-other");
+    let refused = open_events(&server, "room-other", &other_token).await;
+    assert_binary_error(
+        refused,
+        StatusCode::TOO_MANY_REQUESTS,
+        ErrorCode::RateLimited,
+    )
+    .await;
+
+    // With every SSE stream open, a request still gets a connection.
+    let mut stream = TcpStream::connect(server.addr).await.unwrap();
+    get_not_found(&mut stream).await;
+
+    // Closing a stream frees its place.
+    drop(first);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while open_events(&server, "room-other", &other_token)
+            .await
+            .status()
+            != StatusCode::OK
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("a closed stream must free its place");
+    drop((second, stream));
+    server.shutdown().await;
 }

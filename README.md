@@ -78,9 +78,12 @@ The HTTP edge limits apply to every connection (see [`ARCHITECTURE.md` §7.3](AR
 | Variable | Default | Accepted | |
 |---|---|---|---|
 | `ZEMDB_HEADER_READ_TIMEOUT_SECS` | 10 | 1 – 300 | Time to deliver the headers of each request; slower or idle connections are closed. |
-| `ZEMDB_BODY_READ_TIMEOUT_SECS` | 60 | 1 – 3,600 | Base time for a request body to arrive in full, extended as data arrives; otherwise HTTP 408 (`RequestTimeout`, retryable). SSE streams are not limited. |
+| `ZEMDB_BODY_READ_TIMEOUT_SECS` | 60 | 1 – 3,600 | Base time for a request body to arrive in full, extended as data arrives; otherwise HTTP 408 (`RequestTimeout`, retryable). |
 | `ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC` | 32,768 | 1,024 – 1,073,741,824 | Minimum body rate: every this many bytes received extend the body's deadline by one second, so a body that keeps at least this rate is never cut (a 16 MiB body may take up to 60 s + 512 s with the defaults), while a trickle is cut close to the base time. |
-| `ZEMDB_MAX_CONNECTIONS` | 10,000 | 1 – 1,000,000 | Connections served at once; at the limit new connections wait until one closes. An HTTP/2 connection carries at most 100 requests at once. |
+| `ZEMDB_MAX_CONNECTIONS` | 10,000 | 1 – 1,000,000 | Connections served at once; at the limit new connections wait until one closes. An HTTP/2 connection carries at most 32 requests at once. |
+| `ZEMDB_RESPONSE_STALL_TIMEOUT_SECS` | 60 | 5 – 3,600 | Longest a response may wait for the client to take its next 64 KiB frame, or a socket write for the client to accept bytes; then the connection is closed. An SSE stream without events is not waiting, so it is never cut. |
+| `ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES` | 268,435,456 | 16,777,220 – 68,719,476,736 | Bytes of sync, commit and snapshot chunk responses held at once until their clients take them; over it, a sync or chunk gets HTTP 503 (`Unavailable`, retryable) and a commit is acknowledged without its catch-up. |
+| `ZEMDB_MAX_SSE_STREAMS` | half of `ZEMDB_MAX_CONNECTIONS` | 1 – `ZEMDB_MAX_CONNECTIONS` | SSE streams open at once; over it, HTTP 429 (`RateLimited`). A client keeps at most 2 per room: a third ends its oldest. |
 
 Request bodies are limited to 16 MiB, and registration (`/register`, unauthenticated) to 64 KiB; a larger body is answered with HTTP 413.
 

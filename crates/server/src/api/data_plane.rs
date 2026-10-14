@@ -1,6 +1,8 @@
 use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
+use http_body::Body as _;
+use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::error;
 use zemdb_core::id::{CorrelationId, RoomId};
@@ -12,7 +14,7 @@ use crate::api::auth::verify_client_token_bound;
 use crate::api::extract::{
     ensure_payload_identity, AuthenticatedRoom, BinaryMessage, RegisterMessage, RoomPath,
 };
-use crate::api::router::AppState;
+use crate::api::router::{AppState, ResponseBudget};
 use crate::error::ServerError;
 
 /// Encodes `msg` as a binary frame response. A message that cannot be encoded (a bug: every
@@ -41,6 +43,34 @@ pub(crate) fn binary_response(status: StatusCode, msg: &ServerMessage) -> Respon
         bytes,
     )
         .into_response()
+}
+
+/// 200 with `msg`, if the budget of response bytes in flight has room for its encoding. The
+/// response holds that part of the budget until its body is dropped.
+fn budgeted_response(state: &AppState, msg: &ServerMessage) -> Option<Response> {
+    let mut response = binary_response(StatusCode::OK, msg);
+    let len = u32::try_from(response.body().size_hint().exact()?).ok()?;
+    let permit = Arc::clone(&state.response_budget)
+        .try_acquire_many_owned(len)
+        .ok()?;
+    response
+        .extensions_mut()
+        .insert(ResponseBudget::new(permit));
+    Some(response)
+}
+
+/// 200 with `msg` within the budget of response bytes in flight, or `Unavailable` (503, to be
+/// retried) without room for it.
+pub(crate) fn budgeted_or_unavailable(
+    state: &AppState,
+    correlation_id: CorrelationId,
+    room_id: RoomId,
+    msg: &ServerMessage,
+) -> Response {
+    budgeted_response(state, msg).unwrap_or_else(|| {
+        let err = ServerError::Unavailable("Too many response bytes in flight".to_string());
+        binary_error(Some(correlation_id), Some(room_id), err)
+    })
 }
 
 /// The `ServerMessage::Error` frame reporting `err`.
@@ -179,17 +209,23 @@ pub async fn commit(
         reply,
     })
     .await;
-    respond(correlation_id, room_id, result, |room_id, commit_resp| {
-        ServerMessage::CommitAck {
-            correlation_id,
-            room_id,
-            mutation_id,
-            assigned_seq: commit_resp.assigned_seq,
-            catchup_ops: commit_resp.catchup_ops,
-            has_more: commit_resp.has_more,
-            snapshot_wanted: commit_resp.snapshot_wanted,
-        }
-    })
+    let commit_resp = match result {
+        Ok(commit_resp) => commit_resp,
+        Err(err) => return binary_error(Some(correlation_id), Some(room_id), err),
+    };
+    let ack = |catchup_ops, has_more| ServerMessage::CommitAck {
+        correlation_id,
+        room_id: room_id.clone(),
+        mutation_id,
+        assigned_seq: commit_resp.assigned_seq,
+        catchup_ops,
+        has_more,
+        snapshot_wanted: commit_resp.snapshot_wanted,
+    };
+    // The commit is durable, so it is never answered with an error: without room in the
+    // budget, it is acknowledged without its catch-up, which sends the client to `/sync`.
+    budgeted_response(&state, &ack(commit_resp.catchup_ops, commit_resp.has_more))
+        .unwrap_or_else(|| binary_response(StatusCode::OK, &ack(Vec::new(), true)))
 }
 
 /// `POST /rooms/:room_id/sync`: the next batch of operations after the client's cursor.
@@ -220,16 +256,20 @@ pub async fn sync(
         reply,
     })
     .await;
-    respond(correlation_id, room_id, result, |room_id, sync_resp| {
-        ServerMessage::SyncBatch {
-            correlation_id,
-            room_id,
-            head_seq: sync_resp.head_seq,
-            ops: sync_resp.ops,
-            has_more: sync_resp.has_more,
-            snapshot_wanted: sync_resp.snapshot_wanted,
+    match result {
+        Ok(sync_resp) => {
+            let batch = ServerMessage::SyncBatch {
+                correlation_id,
+                room_id: room_id.clone(),
+                head_seq: sync_resp.head_seq,
+                ops: sync_resp.ops,
+                has_more: sync_resp.has_more,
+                snapshot_wanted: sync_resp.snapshot_wanted,
+            };
+            budgeted_or_unavailable(&state, correlation_id, room_id, &batch)
         }
-    })
+        Err(err) => binary_error(Some(correlation_id), Some(room_id), err),
+    }
 }
 
 /// `POST /rooms/:room_id/ack`: records how far the client has persisted.

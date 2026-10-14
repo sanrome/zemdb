@@ -140,6 +140,9 @@ fn unparsable_environment_values_fail_naming_the_variable() {
         ("ZEMDB_BODY_READ_TIMEOUT_SECS", "-1"),
         ("ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC", "32KiB"),
         ("ZEMDB_MAX_CONNECTIONS", "10k"),
+        ("ZEMDB_RESPONSE_STALL_TIMEOUT_SECS", "1m"),
+        ("ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES", "256MiB"),
+        ("ZEMDB_MAX_SSE_STREAMS", "half"),
     ] {
         let err = with_env(&[(name, value)]).unwrap_err();
         assert!(
@@ -298,6 +301,9 @@ fn empty_environment_values_count_as_unset() {
         "ZEMDB_BODY_READ_TIMEOUT_SECS",
         "ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC",
         "ZEMDB_MAX_CONNECTIONS",
+        "ZEMDB_RESPONSE_STALL_TIMEOUT_SECS",
+        "ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES",
+        "ZEMDB_MAX_SSE_STREAMS",
     ];
     let vars: Vec<(&str, &str)> = names.iter().map(|name| (*name, "")).collect();
     assert_eq!(with_env(&vars).unwrap(), strong_config());
@@ -310,17 +316,36 @@ fn http_limits_have_defaults_and_toml_keys() {
     assert_eq!(config.body_read_timeout_secs, 60);
     assert_eq!(config.body_min_rate_bytes_per_sec, 32 * 1024);
     assert_eq!(config.max_connections, 10_000);
+    assert_eq!(config.response_stall_timeout_secs, 60);
+    assert_eq!(config.max_inflight_response_bytes, 256 * 1024 * 1024);
+    assert_eq!(config.sse_stream_limit(), 5_000);
     assert_eq!(ServerConfig::from_toml_str("").unwrap(), config);
 
     let parsed = ServerConfig::from_toml_str(
         "header_read_timeout_secs = 5\nbody_read_timeout_secs = 120\n\
-         body_min_rate_bytes_per_sec = 4096\nmax_connections = 500\n",
+         body_min_rate_bytes_per_sec = 4096\nmax_connections = 500\n\
+         response_stall_timeout_secs = 30\nmax_inflight_response_bytes = 33554432\n\
+         max_sse_streams = 400\n",
     )
     .unwrap();
     assert_eq!(parsed.header_read_timeout_secs, 5);
     assert_eq!(parsed.body_read_timeout_secs, 120);
     assert_eq!(parsed.body_min_rate_bytes_per_sec, 4096);
     assert_eq!(parsed.max_connections, 500);
+    assert_eq!(parsed.response_stall_timeout_secs, 30);
+    assert_eq!(parsed.max_inflight_response_bytes, 32 * 1024 * 1024);
+    assert_eq!(parsed.sse_stream_limit(), 400);
+}
+
+#[test]
+fn sse_stream_limit_follows_max_connections_unless_set() {
+    let mut config = ServerConfig {
+        max_connections: 1,
+        ..ServerConfig::default()
+    };
+    assert_eq!(config.sse_stream_limit(), 1);
+    config.max_connections = 501;
+    assert_eq!(config.sse_stream_limit(), 250);
 }
 
 #[test]
@@ -330,9 +355,15 @@ fn http_limit_environment_variables_set_the_limits() {
         ("ZEMDB_BODY_READ_TIMEOUT_SECS", "3600"),
         ("ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC", "1024"),
         ("ZEMDB_MAX_CONNECTIONS", "1"),
+        ("ZEMDB_RESPONSE_STALL_TIMEOUT_SECS", "5"),
+        ("ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES", "68719476736"),
+        ("ZEMDB_MAX_SSE_STREAMS", "1"),
     ])
     .unwrap();
     config.validate().unwrap();
+    assert_eq!(config.response_stall_timeout_secs, 5);
+    assert_eq!(config.max_inflight_response_bytes, 64 << 30);
+    assert_eq!(config.max_sse_streams, Some(1));
     assert_eq!(config.header_read_timeout_secs, 5);
     assert_eq!(config.body_read_timeout_secs, 3600);
     assert_eq!(config.body_min_rate_bytes_per_sec, 1024);
@@ -351,6 +382,13 @@ fn http_limits_outside_their_range_fail_naming_the_variable() {
         ("ZEMDB_BODY_MIN_RATE_BYTES_PER_SEC", "1073741825"),
         ("ZEMDB_MAX_CONNECTIONS", "0"),
         ("ZEMDB_MAX_CONNECTIONS", "1000001"),
+        ("ZEMDB_RESPONSE_STALL_TIMEOUT_SECS", "4"),
+        ("ZEMDB_RESPONSE_STALL_TIMEOUT_SECS", "3601"),
+        ("ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES", "1048576"),
+        ("ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES", "68719476737"),
+        ("ZEMDB_MAX_SSE_STREAMS", "0"),
+        // Above `max_connections` (10,000 by default).
+        ("ZEMDB_MAX_SSE_STREAMS", "10001"),
     ] {
         let err = with_env(&[(name, value)]).unwrap().validate().unwrap_err();
         assert!(
