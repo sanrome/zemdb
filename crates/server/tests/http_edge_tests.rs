@@ -186,19 +186,25 @@ async fn send_h2_preface(stream: &mut TcpStream) {
         .unwrap();
 }
 
+/// Reads from `stream` until the end of a response's headers, returning what it read.
+async fn read_head(stream: &mut TcpStream) -> Vec<u8> {
+    let mut received = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !received.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(n > 0, "connection closed before the response");
+        received.extend_from_slice(&buf[..n]);
+    }
+    received
+}
+
 /// Sends a GET request for an unknown path on a keep-alive connection and reads the 404.
 async fn get_not_found(stream: &mut TcpStream) {
     stream
         .write_all(b"GET /nothing HTTP/1.1\r\nHost: zemdb\r\n\r\n")
         .await
         .unwrap();
-    let mut response = Vec::new();
-    let mut buf = [0u8; 1024];
-    while !response.windows(4).any(|w| w == b"\r\n\r\n") {
-        let n = stream.read(&mut buf).await.unwrap();
-        assert!(n > 0, "connection closed before the response");
-        response.extend_from_slice(&buf[..n]);
-    }
+    let response = read_head(stream).await;
     assert!(
         response.starts_with(b"HTTP/1.1 404"),
         "{}",
@@ -594,16 +600,18 @@ fn http2_client() -> reqwest::Client {
 }
 
 impl TestServer {
-    /// Sends a `Sync` from the start of the log through `client`, returning once the response
-    /// headers arrive, without reading the body.
-    async fn send_sync(&self, client: &reqwest::Client) -> reqwest::Response {
+    /// A `Sync` from the start of the log, through `client`.
+    fn sync_request(&self, client: &reqwest::Client) -> reqwest::RequestBuilder {
         client
             .post(self.url("/rooms/room-edge/sync"))
             .bearer_auth(&self.token)
             .body(self.sync_frame())
-            .send()
-            .await
-            .unwrap()
+    }
+
+    /// Sends [`TestServer::sync_request`], returning once the response headers arrive,
+    /// without reading the body.
+    async fn send_sync(&self, client: &reqwest::Client) -> reqwest::Response {
+        self.sync_request(client).send().await.unwrap()
     }
 }
 
@@ -657,10 +665,11 @@ fn one_connection_short_stall(config: &mut ServerConfig) {
 /// both ends and hyper's write buffer.
 const STALL_ROWS: u8 = 3;
 
-/// Asserts that a new connection is served within the stall timeout and a few seconds: the
-/// only connection allowed must have been closed for stalling.
+/// Asserts that a new connection is served within the stall timeout and some slack, counted
+/// once the response that stalls has started: the only connection allowed must have been
+/// closed for stalling.
 async fn assert_new_connection_served(server: &TestServer) {
-    tokio::time::timeout(STALL_TIMEOUT + Duration::from_secs(5), async {
+    tokio::time::timeout(STALL_TIMEOUT + Duration::from_secs(10), async {
         let mut stream = TcpStream::connect(server.addr).await.unwrap();
         get_not_found(&mut stream).await;
     })
@@ -674,13 +683,19 @@ async fn http2_client_that_stops_reading_is_disconnected() {
     server.commit_large_rows(STALL_ROWS, LARGE_ROW_SIZE).await;
 
     // Syncs whose bodies are never read: flow control holds most of each one in the server.
+    // On a loaded machine, the first response may stall the connection before the others get
+    // their headers out; those fail to send.
     let client = http2_client();
-    let mut held = Vec::new();
-    for _ in 0..4 {
-        let response = server.send_sync(&client).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        held.push(response);
-    }
+    let sends = (0..4).map(|_| server.sync_request(&client).send());
+    let held: Vec<_> = futures::future::join_all(sends)
+        .await
+        .into_iter()
+        .filter_map(Result::ok)
+        .collect();
+    assert!(!held.is_empty());
+    assert!(held
+        .iter()
+        .all(|response| response.status() == StatusCode::OK));
     assert_new_connection_served(&server).await;
     for response in held {
         assert!(response.bytes().await.is_err(), "the body must be cut");
@@ -706,9 +721,13 @@ async fn http1_client_that_stops_reading_is_disconnected() {
     );
     stream.write_all(head.as_bytes()).await.unwrap();
     stream.write_all(&frame).await.unwrap();
+    // Wait for the response to start, as the HTTP/2 test does: the stall timeout counts from
+    // there, while building the response can take seconds on a loaded machine.
+    let mut received = read_head(&mut stream).await;
+    assert!(received.starts_with(b"HTTP/1.1 200"));
 
     assert_new_connection_served(&server).await;
-    let received = read_until_closed(&mut stream).await;
+    received.extend(read_until_closed(&mut stream).await);
     assert!(
         received.len() < usize::from(STALL_ROWS) * LARGE_ROW_SIZE,
         "the response must be cut"
@@ -797,9 +816,10 @@ async fn responses_over_the_budget_in_flight_wait_for_held_bodies() {
         other => panic!("expected a CommitAck, got {other:?}"),
     }
 
-    // Once the held body is released, syncs are served again.
+    // Once the held body is released, syncs are served again. Each attempt encodes a whole
+    // batch, which takes a while on a slow machine.
     drop((held, held_client));
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while server.send_sync(&client).await.status() != StatusCode::OK {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
