@@ -1,7 +1,10 @@
 mod common;
 
 use common::*;
-use zemdb_core::{CompactRow, RoomId, SequenceNumber, Value, MAX_MESSAGE_SIZE};
+use zemdb_core::{
+    CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequenceNumber,
+    SequencedOperation, TableSchema, Value, MAX_MESSAGE_SIZE,
+};
 use zemdb_storage::format::{
     decode_wal_batch_from_slice, encode_wal_batch, encode_wal_record, replay_wal_records,
     FileHeader, WalBatchDecodeResult, BATCH_HEADER_SIZE, BATCH_MAGIC, HEADER_SIZE, MAGIC_BYTES,
@@ -131,7 +134,7 @@ async fn test_disk_wal_crc32_corruption_detection() {
     });
 
     // Valid data follows the corrupt record, so it is corruption and not a torn write.
-    let engine2 = DiskStorageEngine::new(options);
+    let engine2 = DiskStorageEngine::new(options).unwrap();
     let err = engine2
         .open_room(&room_id, users_schema())
         .await
@@ -154,7 +157,7 @@ async fn test_disk_wal_crc32_torn_write_at_eof_recovers() {
     });
 
     // Reopening should cleanly recover and treat the terminal corrupted batch as a torn write
-    let engine2 = DiskStorageEngine::new(options);
+    let engine2 = DiskStorageEngine::new(options).unwrap();
     engine2.open_room(&room_id, users_schema()).await.unwrap();
     let head = engine2.get_head_seq(&room_id).await.unwrap();
     assert_eq!(head, SequenceNumber::from(0u64));
@@ -179,7 +182,7 @@ async fn test_disk_torn_write_recovery() {
     });
 
     // Reopening should safely recover valid operations and truncate the damaged tail
-    let engine2 = DiskStorageEngine::new(options);
+    let engine2 = DiskStorageEngine::new(options).unwrap();
     engine2.open_room(&room_id, users_schema()).await.unwrap();
 
     let head = engine2.get_head_seq(&room_id).await.unwrap();
@@ -197,7 +200,7 @@ async fn test_disk_torn_write_recovery() {
 async fn test_disk_room_lifecycle_and_persistence() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
-    let engine = DiskStorageEngine::new(options.clone());
+    let engine = DiskStorageEngine::new(options.clone()).unwrap();
     let room_id = RoomId::new("room-disk-1").unwrap();
 
     engine.open_room(&room_id, users_schema()).await.unwrap();
@@ -215,7 +218,7 @@ async fn test_disk_room_lifecycle_and_persistence() {
 
     engine.close_room(&room_id).await.unwrap();
 
-    let engine2 = DiskStorageEngine::new(options);
+    let engine2 = DiskStorageEngine::new(options).unwrap();
     engine2.open_room(&room_id, users_schema()).await.unwrap();
 
     let head2 = engine2.get_head_seq(&room_id).await.unwrap();
@@ -275,8 +278,8 @@ fn test_wal_batch_framing_roundtrip() {
 async fn test_disk_flock_collision() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
-    let engine1 = DiskStorageEngine::new(options.clone());
-    let engine2 = DiskStorageEngine::new(options);
+    let engine1 = DiskStorageEngine::new(options.clone()).unwrap();
+    let engine2 = DiskStorageEngine::new(options).unwrap();
     let room_id = RoomId::new("locked-room").unwrap();
 
     // engine1 holds the room's exclusive OS file lock, so engine2 cannot open it.
@@ -299,16 +302,16 @@ async fn test_disk_flock_collision() {
 #[tokio::test]
 async fn test_disk_apply_batch_sequence_mismatch() {
     let temp_dir = tempfile::tempdir().unwrap();
-    sequence_gap_is_rejected(&DiskStorageEngine::new(DiskStorageOptions::new(
-        temp_dir.path(),
-    )))
+    sequence_gap_is_rejected(
+        &DiskStorageEngine::new(DiskStorageOptions::new(temp_dir.path())).unwrap(),
+    )
     .await;
 }
 
 #[tokio::test]
 async fn test_disk_blind_update_ignored() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let engine = DiskStorageEngine::new(DiskStorageOptions::new(temp_dir.path()));
+    let engine = DiskStorageEngine::new(DiskStorageOptions::new(temp_dir.path())).unwrap();
     let room_id = RoomId::new("blind-update").unwrap();
 
     engine.open_room(&room_id, users_schema()).await.unwrap();
@@ -326,7 +329,7 @@ async fn test_disk_blind_update_ignored() {
 async fn test_dual_file_storage_layout_and_compaction_truncation() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
-    let engine = DiskStorageEngine::new(options.clone());
+    let engine = DiskStorageEngine::new(options.clone()).unwrap();
     let room_id = RoomId::new("dual-layout").unwrap();
 
     engine.open_room(&room_id, users_schema()).await.unwrap();
@@ -359,7 +362,7 @@ async fn test_dual_file_storage_layout_and_compaction_truncation() {
     // Close and reopen to ensure state persists from .snap
     engine.close_room(&room_id).await.unwrap();
 
-    let engine2 = DiskStorageEngine::new(options);
+    let engine2 = DiskStorageEngine::new(options).unwrap();
     engine2.open_room(&room_id, users_schema()).await.unwrap();
 
     let head = engine2.get_head_seq(&room_id).await.unwrap();
@@ -372,14 +375,14 @@ async fn test_dual_file_storage_layout_and_compaction_truncation() {
 async fn test_dynamic_column_update_resizing_disk_and_wal_recovery() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
-    let engine = DiskStorageEngine::new(options.clone());
+    let engine = DiskStorageEngine::new(options.clone()).unwrap();
     let room_id = RoomId::new("dynamic-disk").unwrap();
 
     let updated = column_update_grows_row(&engine, &room_id).await;
 
     // The row is recovered from the WAL with the evolved schema.
     engine.close_room(&room_id).await.unwrap();
-    let engine_recovered = DiskStorageEngine::new(options);
+    let engine_recovered = DiskStorageEngine::new(options).unwrap();
     engine_recovered
         .open_room(&room_id, evolved_users_schema())
         .await
@@ -416,7 +419,7 @@ async fn test_wal_recovery_truncates_zero_filled_tail_at_eof() {
     );
 
     // Recovery detects the zero-filled tail, truncates it and loads the row.
-    let engine_rec = DiskStorageEngine::new(options.clone());
+    let engine_rec = DiskStorageEngine::new(options.clone()).unwrap();
     engine_rec
         .open_room(&room_id, users_schema())
         .await
@@ -435,7 +438,7 @@ async fn test_wal_recovery_truncates_zero_filled_tail_at_eof() {
         .unwrap();
     engine_rec.close_room(&room_id).await.unwrap();
 
-    let engine_final = DiskStorageEngine::new(options);
+    let engine_final = DiskStorageEngine::new(options).unwrap();
     engine_final
         .open_room(&room_id, users_schema())
         .await
@@ -474,7 +477,7 @@ async fn test_wal_replay_skips_operations_before_snapshot_seq() {
     let options = DiskStorageOptions::new(tmp.path());
     let room_id = RoomId::new("room_skip_snapshot_seq").unwrap();
 
-    let engine = DiskStorageEngine::new(options.clone());
+    let engine = DiskStorageEngine::new(options.clone()).unwrap();
     engine.open_room(&room_id, users_schema()).await.unwrap();
     let op1 = insert(1, 1, row(1, "Initial", 10, true), 100);
     let op2 = update(2, 1, 2, Value::Int(20), 101);
@@ -505,7 +508,7 @@ async fn test_wal_replay_skips_operations_before_snapshot_seq() {
     wal_file.sync_all().unwrap();
 
     // Recovery must skip stale_op (seq 1 <= snapshot_seq 2) and only apply new_op (seq 3).
-    let engine_rec = DiskStorageEngine::new(options);
+    let engine_rec = DiskStorageEngine::new(options).unwrap();
     engine_rec
         .open_room(&room_id, users_schema())
         .await
@@ -537,7 +540,7 @@ async fn test_snapshot_payload_crc_corruption_detected() {
     });
 
     // Reopening the room must fail with SnapshotCorruption due to CRC mismatch
-    let engine_tampered = DiskStorageEngine::new(options);
+    let engine_tampered = DiskStorageEngine::new(options).unwrap();
     let err = engine_tampered
         .open_room(&room_id, users_schema())
         .await
@@ -554,7 +557,7 @@ async fn test_crash_recovery_with_wal_compacting() {
     let engine = seed_interrupted_compaction(tmp.path(), &room_id, 1..=10, 11..=15, 16..=20).await;
     let compacting_path = compacting_wal_path(&engine, &room_id);
 
-    let engine_rec = DiskStorageEngine::new(DiskStorageOptions::new(tmp.path()));
+    let engine_rec = DiskStorageEngine::new(DiskStorageOptions::new(tmp.path())).unwrap();
     engine_rec
         .open_room(&room_id, users_schema())
         .await
@@ -581,7 +584,7 @@ async fn test_multi_thread_flock_concurrency_stress() {
         let r_id = room_id.clone();
 
         handles.push(tokio::spawn(async move {
-            let engine = DiskStorageEngine::new(opts);
+            let engine = DiskStorageEngine::new(opts).unwrap();
             b.wait().await;
             let res = engine.open_room(&r_id, users_schema()).await;
             (engine, res)
@@ -614,7 +617,7 @@ async fn test_multi_thread_flock_concurrency_stress() {
     winner.close_room(&room_id).await.unwrap();
 
     // Now another engine can successfully acquire the lock and write data
-    let next_engine = DiskStorageEngine::new(options);
+    let next_engine = DiskStorageEngine::new(options).unwrap();
     next_engine
         .open_room(&room_id, users_schema())
         .await
@@ -631,7 +634,7 @@ async fn test_multi_thread_flock_concurrency_stress() {
 #[tokio::test]
 async fn test_empty_batch_writes_nothing_to_wal() {
     let tmp = tempfile::tempdir().unwrap();
-    let engine = DiskStorageEngine::new(DiskStorageOptions::new(tmp.path()));
+    let engine = DiskStorageEngine::new(DiskStorageOptions::new(tmp.path())).unwrap();
     let room_id = RoomId::new("empty-batch").unwrap();
     engine.open_room(&room_id, users_schema()).await.unwrap();
     let wal_path = engine.wal_file_path(&room_id);
@@ -676,4 +679,163 @@ async fn test_wal_writer_reports_a_write_that_fails_in_the_background() {
     assert!(WalWriter::write_record(&mut file, &op).await.is_err());
     assert!(WalWriter::write_batch(&mut file, &[op]).await.is_err());
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+}
+
+/// A schema with a table `t{id}`, id `id`, for each id in `ids`: an integer key and value.
+fn tables_schema(ids: &[u16]) -> Schema {
+    ids.iter()
+        .fold(Schema::builder(), |schema, &id| {
+            schema.table(
+                TableSchema::builder(format!("t{id}"))
+                    .table_id(id)
+                    .primary_key("id", DataType::Int)
+                    .column("v", DataType::Int),
+            )
+        })
+        .build()
+}
+
+/// Inserts the row `(key, key)` into table `table` at sequence `seq`.
+fn table_insert(seq: u64, table: u16, key: i64) -> SequencedOperation {
+    let row = CompactRow::new(vec![Value::Int(key), Value::Int(key)]);
+    sequenced(
+        seq,
+        Operation::insert(table, PrimaryKey::single(key), row, 0),
+    )
+}
+
+/// The bytes of the snapshot and WAL of `room`.
+fn room_files(engine: &DiskStorageEngine, room: &RoomId) -> (Vec<u8>, Vec<u8>) {
+    let read = |path| std::fs::read(path).unwrap();
+    (
+        read(engine.snap_file_path(room)),
+        read(engine.wal_file_path(room)),
+    )
+}
+
+/// Writes one row to each of the tables 0 and 1 of a room, closes it, and checks that it does
+/// not reopen with a schema that lacks table 1, without changing its files, and then that it
+/// reopens with both tables and all its rows. With `compact`, the rows are in the snapshot
+/// and the WAL is empty; otherwise they are only in the WAL.
+async fn schema_without_a_table_of_the_room_is_rejected(compact: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("schema-cover").unwrap();
+    let engine = disk_engine(dir.path());
+    engine
+        .open_room(&room, tables_schema(&[0, 1]))
+        .await
+        .unwrap();
+    let batch = vec![table_insert(1, 0, 1), table_insert(2, 1, 7)];
+    engine.apply_batch(&room, batch).await.unwrap();
+    if compact {
+        engine.compact_room(&room).await.unwrap();
+    }
+    engine.close_room(&room).await.unwrap();
+    let files = room_files(&engine, &room);
+
+    let err = engine
+        .open_room(&room, tables_schema(&[0]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StorageError::SchemaMismatch { table_id: 1, .. }),
+        "{err:?}"
+    );
+    assert_eq!(room_files(&engine, &room), files);
+
+    engine
+        .open_room(&room, tables_schema(&[0, 1]))
+        .await
+        .unwrap();
+    assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), 2);
+    let key = PrimaryKey::single(7i64);
+    assert!(engine.get_by_id(&room, 1, &key).await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn reopening_with_a_table_missing_from_the_wal_is_rejected() {
+    schema_without_a_table_of_the_room_is_rejected(false).await;
+}
+
+#[tokio::test]
+async fn reopening_with_a_table_missing_from_the_snapshot_is_rejected() {
+    schema_without_a_table_of_the_room_is_rejected(true).await;
+}
+
+#[tokio::test]
+async fn reopening_with_a_new_table_keeps_the_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("schema-wider").unwrap();
+    let engine = disk_engine(dir.path());
+    engine.open_room(&room, tables_schema(&[0])).await.unwrap();
+    engine
+        .apply_batch(&room, vec![table_insert(1, 0, 1)])
+        .await
+        .unwrap();
+    engine.compact_room(&room).await.unwrap();
+    engine
+        .apply_batch(&room, vec![table_insert(2, 0, 2)])
+        .await
+        .unwrap();
+    engine.close_room(&room).await.unwrap();
+
+    engine
+        .open_room(&room, tables_schema(&[0, 1]))
+        .await
+        .unwrap();
+    assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), 2);
+    for key in [1i64, 2] {
+        let key = PrimaryKey::single(key);
+        assert!(engine.get_by_id(&room, 0, &key).await.unwrap().is_some());
+    }
+    engine
+        .apply_batch(&room, vec![table_insert(3, 1, 9)])
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn reopening_with_a_table_missing_from_the_rotated_wal_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("schema-rotated").unwrap();
+    // The snapshot holds no rows (an empty range).
+    let no_rows = std::ops::RangeInclusive::new(1, 0);
+    let engine = seed_interrupted_compaction(dir.path(), &room, no_rows, 1..=5, 6..=10).await;
+    // Only the rotated WAL holds data: the error must come from replaying it.
+    std::fs::write(engine.wal_file_path(&room), []).unwrap();
+    let rotated = compacting_wal_path(&engine, &room);
+    let files = (room_files(&engine, &room), std::fs::read(&rotated).unwrap());
+
+    let err = engine
+        .open_room(&room, tables_schema(&[5]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, StorageError::SchemaMismatch { table_id: 0, .. }),
+        "{err:?}"
+    );
+    // Not folded: every file is as it was.
+    let after = (room_files(&engine, &room), std::fs::read(&rotated).unwrap());
+    assert!(after == files);
+}
+
+#[tokio::test]
+async fn an_empty_table_of_the_snapshot_does_not_have_to_be_in_the_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("schema-empty-table").unwrap();
+    let engine = disk_engine(dir.path());
+    engine
+        .open_room(&room, tables_schema(&[0, 1]))
+        .await
+        .unwrap();
+    engine
+        .apply_batch(&room, vec![table_insert(1, 0, 1)])
+        .await
+        .unwrap();
+    engine.compact_room(&room).await.unwrap();
+    engine.close_room(&room).await.unwrap();
+
+    engine.open_room(&room, tables_schema(&[0])).await.unwrap();
+    let key = PrimaryKey::single(1i64);
+    assert!(engine.get_by_id(&room, 0, &key).await.unwrap().is_some());
 }

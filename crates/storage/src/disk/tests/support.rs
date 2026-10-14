@@ -45,7 +45,7 @@ pub(crate) fn insert(seq: u64) -> SequencedOperation {
 
 /// A disk engine in `dir` that compacts only when asked to.
 pub(crate) fn engine_at(dir: &Path) -> DiskStorageEngine {
-    DiskStorageEngine::new(DiskStorageOptions::new(dir).auto_compact(false))
+    DiskStorageEngine::new(DiskStorageOptions::new(dir).auto_compact(false)).unwrap()
 }
 
 /// A disk engine in `dir` with `room` open.

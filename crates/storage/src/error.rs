@@ -53,6 +53,16 @@ pub enum StorageError {
     #[error("Schema validation failed: {0}")]
     SchemaValidation(#[from] ValidationError),
 
+    /// The room's files hold data of a table that the schema it was opened with does not have.
+    /// Opening it anyway would drop that table's operations.
+    #[error("Room '{room_id}' holds data of table id {table_id}, which its schema does not have")]
+    SchemaMismatch { room_id: RoomId, table_id: u16 },
+
+    /// Engine options that cannot work, such as a compaction ratio that is not a finite number
+    /// above 0.
+    #[error("Invalid storage options: {0}")]
+    InvalidOptions(String),
+
     /// An I/O failure left the room's files in a state that only recovery can resolve.
     /// Writes and compactions are refused until the room is closed and reopened.
     #[error("Room '{room_id}' must be reopened after an unrecoverable I/O failure: {reason}")]

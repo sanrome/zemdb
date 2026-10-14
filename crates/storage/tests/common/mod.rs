@@ -135,7 +135,7 @@ pub fn pks(ids: impl IntoIterator<Item = i64>) -> Vec<PrimaryKey> {
 
 /// A disk engine in `dir` that compacts only when asked to.
 pub fn disk_engine(dir: &Path) -> DiskStorageEngine {
-    DiskStorageEngine::new(DiskStorageOptions::new(dir).auto_compact(false))
+    DiskStorageEngine::new(DiskStorageOptions::new(dir).auto_compact(false)).unwrap()
 }
 
 /// Opens `room` with `users_schema` and applies each operation in a batch of its own.
@@ -144,7 +144,7 @@ pub async fn open_with_ops(
     room: &RoomId,
     ops: Vec<SequencedOperation>,
 ) -> DiskStorageEngine {
-    let engine = DiskStorageEngine::new(options.clone());
+    let engine = DiskStorageEngine::new(options.clone()).unwrap();
     engine.open_room(room, users_schema()).await.unwrap();
     for op in ops {
         engine.apply_batch(room, vec![op]).await.unwrap();
@@ -175,7 +175,7 @@ pub async fn seed_interrupted_compaction(
     compacting: RangeInclusive<i64>,
     wal: RangeInclusive<i64>,
 ) -> DiskStorageEngine {
-    let engine = DiskStorageEngine::new(DiskStorageOptions::new(dir));
+    let engine = DiskStorageEngine::new(DiskStorageOptions::new(dir)).unwrap();
     engine.open_room(room, users_schema()).await.unwrap();
     engine
         .apply_batch(room, inserts(snapshot, 100))
@@ -191,24 +191,58 @@ pub async fn seed_interrupted_compaction(
     engine
 }
 
-/// Rejects a batch whose sequence does not follow the room's head.
+/// Rejects a batch whose sequence does not follow the room's head, or has a gap inside, with
+/// `SequenceMismatch` even if its operations are invalid too, and applies none of it: the
+/// room reopens at its head.
 pub async fn sequence_gap_is_rejected<E: StorageEngine>(engine: &E) {
     let room = RoomId::new("sequence-gap").unwrap();
     engine.open_room(&room, users_schema()).await.unwrap();
+    let invalid_row = CompactRow::new(vec![Value::Int(1)]);
 
+    for (batch, expected, actual) in [
+        (vec![insert(42, 1, user_row(1), 10)], 1, 42),
+        (vec![insert(42, 1, invalid_row.clone(), 10)], 1, 42),
+        (
+            vec![insert(1, 1, user_row(1), 10), insert(3, 3, user_row(3), 10)],
+            2,
+            3,
+        ),
+        (
+            vec![
+                insert(1, 1, invalid_row.clone(), 10),
+                insert(3, 3, user_row(3), 10),
+            ],
+            2,
+            3,
+        ),
+    ] {
+        let err = engine.apply_batch(&room, batch).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::SequenceMismatch { expected: e, actual: a }
+                    if e.get() == expected && a.get() == actual
+            ),
+            "{err:?}"
+        );
+    }
+
+    // Without the gap, the invalid row is a schema error: the cases above do test the order.
     let err = engine
-        .apply_batch(&room, vec![insert(42, 1, user_row(1), 10)])
+        .apply_batch(&room, vec![insert(1, 1, invalid_row, 10)])
         .await
         .unwrap_err();
+    assert!(matches!(err, StorageError::SchemaValidation(_)), "{err:?}");
 
-    assert!(
-        matches!(
-            err,
-            StorageError::SequenceMismatch { expected, actual }
-                if expected.get() == 1 && actual.get() == 42
-        ),
-        "{err:?}"
-    );
+    let first = PrimaryKey::single(1i64);
+    for reopen in [false, true] {
+        if reopen {
+            engine.close_room(&room).await.unwrap();
+            engine.open_room(&room, users_schema()).await.unwrap();
+        }
+        assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), 0);
+        assert!(engine.get(&room, "users", &first).await.unwrap().is_none());
+    }
 }
 
 /// Inserts a row with two values into `room`, opened with `evolved_users_schema`, and updates

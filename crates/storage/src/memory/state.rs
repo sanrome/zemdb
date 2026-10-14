@@ -72,24 +72,24 @@ pub(crate) fn resolve_table_id(
     })
 }
 
-/// Validates a batch against the room's schema and checks that its sequence numbers continue
-/// `head_seq` without gaps.
+/// Checks that the sequence numbers of a batch continue `head_seq` without gaps, and then that
+/// each operation is valid under the room's schema: a gap is reported before any other error.
 pub(crate) fn validate_batch(
     room_id: &RoomId,
     schema: &Schema,
     head_seq: SequenceNumber,
     ops: &[SequencedOperation],
 ) -> Result<(), StorageError> {
-    for (expected_seq, op) in (head_seq.get() + 1..).zip(ops.iter()) {
-        resolve_table_id(room_id, schema, TableRef::Id(op.op.table_id()))?;
-
+    for (expected_seq, op) in (head_seq.get() + 1..).zip(ops) {
         if op.seq.get() != expected_seq {
             return Err(StorageError::SequenceMismatch {
                 expected: SequenceNumber::from(expected_seq),
                 actual: op.seq,
             });
         }
-
+    }
+    for op in ops {
+        resolve_table_id(room_id, schema, TableRef::Id(op.op.table_id()))?;
         schema.validate_operation(&op.op)?;
     }
     Ok(())

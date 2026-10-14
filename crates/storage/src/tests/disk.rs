@@ -41,6 +41,15 @@ async fn write_until_refused(engine: &DiskStorageEngine, room: &RoomId, count: u
 }
 
 #[tokio::test]
+async fn open_room_syncs_the_data_directory_it_creates() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_at(&dir.path().join("data"));
+    fail_point::arm("sync_dir", dir.path());
+    let room = RoomId::new("new-dir").unwrap();
+    assert!(engine.open_room(&room, schema()).await.is_err());
+}
+
+#[tokio::test]
 async fn failed_wal_sync_marks_room_failed_until_reopened() {
     let dir = tempfile::tempdir().unwrap();
     let room = RoomId::new("sync-failure").unwrap();

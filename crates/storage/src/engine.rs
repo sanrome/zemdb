@@ -40,7 +40,9 @@ pub type RowStream<'a> =
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait StorageEngine: EngineConcurrencyBounds {
-    /// Opens or registers a room with its schema.
+    /// Opens or registers a room with its schema. A disk room whose snapshot or WAL holds data
+    /// of a table that `schema` does not have is not opened (`SchemaMismatch`), and that data
+    /// stays on disk for a later open with a schema that has the table.
     async fn open_room(&self, room_id: &RoomId, schema: Schema) -> Result<(), StorageError>;
 
     /// Closes a room, releasing any associated resources or file handles.
@@ -48,6 +50,11 @@ pub trait StorageEngine: EngineConcurrencyBounds {
 
     /// Applies a batch of sequenced operations to the storage engine.
     /// Returns the new head sequence number.
+    ///
+    /// The whole batch must continue the room's head without gaps; otherwise it is
+    /// `SequenceMismatch`, whatever else is wrong with it, since a gap means the batch does not
+    /// belong on the room's current state. Only then is each operation checked against the
+    /// schema. A batch that fails either check changes nothing.
     async fn apply_batch(
         &self,
         room_id: &RoomId,

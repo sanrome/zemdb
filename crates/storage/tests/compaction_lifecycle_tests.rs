@@ -3,12 +3,12 @@ mod common;
 use common::*;
 use std::sync::Arc;
 use zemdb_core::{RoomId, SequenceNumber, Value};
-use zemdb_storage::{DiskStorageEngine, DiskStorageOptions, StorageEngine};
+use zemdb_storage::{DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError};
 
 #[tokio::test]
 async fn test_disk_zstd_snapshot_and_restore() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let engine = DiskStorageEngine::new(DiskStorageOptions::new(temp_dir.path()));
+    let engine = DiskStorageEngine::new(DiskStorageOptions::new(temp_dir.path())).unwrap();
     let room_a = RoomId::new("room-snap-a").unwrap();
     let room_b = RoomId::new("room-snap-b").unwrap();
 
@@ -37,7 +37,7 @@ async fn test_disk_compaction_and_wal_truncation() {
     let options = DiskStorageOptions::new(temp_dir.path())
         .min_compaction_bytes(200)
         .compaction_ratio(1.5);
-    let engine = DiskStorageEngine::new(options);
+    let engine = DiskStorageEngine::new(options).unwrap();
     let room_id = RoomId::new("room-compact").unwrap();
 
     engine.open_room(&room_id, users_schema()).await.unwrap();
@@ -66,7 +66,7 @@ async fn test_disk_compaction_and_wal_truncation() {
 async fn test_disk_concurrent_readers_and_writers() {
     let temp_dir = tempfile::tempdir().unwrap();
     let options = DiskStorageOptions::new(temp_dir.path());
-    let engine = Arc::new(DiskStorageEngine::new(options));
+    let engine = Arc::new(DiskStorageEngine::new(options).unwrap());
     let room_id = RoomId::new("room-concurrent-disk").unwrap();
 
     engine.open_room(&room_id, users_schema()).await.unwrap();
@@ -146,7 +146,7 @@ async fn test_crash_recovery_during_compaction_window_after_snapshot_rename() {
         seed_interrupted_compaction(temp_dir.path(), &room_id, 1..=10, 1..=10, 11..=15).await;
     let compacting_path = compacting_wal_path(&engine, &room_id);
 
-    let engine_rec = DiskStorageEngine::new(DiskStorageOptions::new(temp_dir.path()));
+    let engine_rec = DiskStorageEngine::new(DiskStorageOptions::new(temp_dir.path())).unwrap();
     engine_rec
         .open_room(&room_id, users_schema())
         .await
@@ -173,7 +173,7 @@ async fn test_crash_recovery_during_compaction_window_before_snapshot_rename() {
         .with_extension("snap.tmp.deadbeef-1234");
     std::fs::write(&tmp_snap_path, b"incomplete-snapshot-bytes").unwrap();
 
-    let engine_rec = DiskStorageEngine::new(DiskStorageOptions::new(temp_dir.path()));
+    let engine_rec = DiskStorageEngine::new(DiskStorageOptions::new(temp_dir.path())).unwrap();
     engine_rec
         .open_room(&room_id, users_schema())
         .await
@@ -186,4 +186,27 @@ async fn test_crash_recovery_during_compaction_window_before_snapshot_rename() {
     // `.wal.compacting` was merged into the active WAL and deleted.
     assert!(!compacting_path.exists(), "wal.compacting must be deleted");
     assert_users_up_to(&engine_rec, &room_id, 15).await;
+}
+
+#[test]
+fn engine_options_that_cannot_work_are_rejected() {
+    // The engine does no I/O until a room is opened.
+    let options = || DiskStorageOptions::new("unused");
+    for ratio in [f64::NAN, 0.0, -1.0, f64::INFINITY] {
+        let result = DiskStorageEngine::new(options().compaction_ratio(ratio));
+        assert!(
+            matches!(result, Err(StorageError::InvalidOptions(_))),
+            "ratio {ratio}"
+        );
+    }
+    let levels = zstd::compression_level_range();
+    for level in [levels.start() - 1, levels.end() + 1] {
+        let result = DiskStorageEngine::new(options().zstd_level(level));
+        assert!(
+            matches!(result, Err(StorageError::InvalidOptions(_))),
+            "level {level}"
+        );
+    }
+    assert!(DiskStorageEngine::new(options()).is_ok());
+    assert!(DiskStorageEngine::new(options().compaction_ratio(0.5).zstd_level(19)).is_ok());
 }

@@ -10,14 +10,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::fs::{create_dir_all, File};
+use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use zemdb_core::{CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation};
 
 use crate::disk::compactor::{
-    compact_room_cow, install_applied_snapshot, rename_staged_snapshot, stage_snapshot, sync_file,
-    SyncKind,
+    compact_room_cow, create_dir_all_synced, install_applied_snapshot, rename_staged_snapshot,
+    stage_snapshot, sync_file, SyncKind,
 };
 use crate::disk::recovery::recover_room;
 use crate::disk::wal::WalWriter;
@@ -36,11 +36,13 @@ use crate::sys::run_blocking;
 pub struct DiskStorageOptions {
     /// Directory where `room_{id}.snap` and `room_{id}.wal` files are stored.
     pub data_dir: PathBuf,
-    /// Ratio of WAL size to snapshot size that triggers automatic compaction (default: 3.0).
+    /// Ratio of WAL size to snapshot size that triggers automatic compaction (default: 3.0). It
+    /// must be a finite number above 0.
     pub compaction_ratio: f64,
     /// Minimum WAL size in bytes before automatic compaction can trigger (default: 64 KB).
     pub min_compaction_bytes: u64,
-    /// Zstandard compression level for base snapshots (default: 3).
+    /// Zstandard compression level for base snapshots (default: 3), within
+    /// `zstd::compression_level_range()`.
     pub zstd_level: i32,
     /// Whether automatic compaction is enabled during write batches (default: true).
     pub auto_compact: bool,
@@ -74,7 +76,7 @@ impl DiskStorageOptions {
         self
     }
 
-    /// Sets the Zstandard compression level (1-22).
+    /// Sets the Zstandard compression level.
     pub fn zstd_level(mut self, level: i32) -> Self {
         self.zstd_level = level;
         self
@@ -238,11 +240,30 @@ pub struct DiskStorageEngine {
 }
 
 impl DiskStorageEngine {
-    pub fn new(options: DiskStorageOptions) -> Self {
-        Self {
+    /// Creates an engine with `options`, or `InvalidOptions` if `compaction_ratio` is not a
+    /// finite number above 0 (with NaN, 0 or a negative ratio, every batch would compact once
+    /// the WAL reaches `min_compaction_bytes`) or `zstd_level` is outside the levels Zstandard
+    /// accepts.
+    pub fn new(options: DiskStorageOptions) -> Result<Self, StorageError> {
+        let ratio = options.compaction_ratio;
+        if !(ratio.is_finite() && ratio > 0.0) {
+            return Err(StorageError::InvalidOptions(format!(
+                "compaction_ratio must be a finite number above 0, got {ratio}"
+            )));
+        }
+        let levels = zstd::compression_level_range();
+        if !levels.contains(&options.zstd_level) {
+            return Err(StorageError::InvalidOptions(format!(
+                "zstd_level must be between {} and {}, got {}",
+                levels.start(),
+                levels.end(),
+                options.zstd_level
+            )));
+        }
+        Ok(Self {
             options,
             rooms: Arc::new(RwLock::new(HashMap::new())),
-        }
+        })
     }
 
     /// Computes the filesystem path for a room's base snapshot file (`room_{id}.snap`).
@@ -380,7 +401,8 @@ impl StorageEngine for DiskStorageEngine {
             return Err(StorageError::RoomAlreadyOpen(room_id.clone()));
         }
 
-        create_dir_all(&self.options.data_dir).await?;
+        let data_dir = self.options.data_dir.clone();
+        run_blocking(move || create_dir_all_synced(&data_dir)).await?;
         let snap_path = self.snap_file_path(room_id);
         let wal_path = self.wal_file_path(room_id);
 

@@ -132,8 +132,10 @@ fn highest_seq_in_valid_frames(
 /// Records at or below `head_seq` are already reflected in the state (from the snapshot or an
 /// earlier file) and are skipped: crash windows during compaction can leave the same records
 /// in more than one file. A record that does not continue the sequence exactly is a gap, which
-/// means lost data, and is reported as corruption.
+/// means lost data, and is reported as corruption. A record of a table that `schema` does not
+/// have is `SchemaMismatch`: skipping it would lose it for good at the next compaction.
 async fn replay_wal_file(
+    room_id: &RoomId,
     file: &mut tokio::fs::File,
     schema: &Schema,
     head_seq: &mut SequenceNumber,
@@ -198,10 +200,8 @@ async fn replay_wal_file(
                 )));
             }
 
-            if schema.has_table_by_id(op.op.table_id()) {
-                apply_operation(tables, schema, op.op);
-            }
-
+            ensure_known_table(room_id, schema, op.op.table_id())?;
+            apply_operation(tables, schema, op.op);
             *head_seq = op.seq;
             applied_count += 1;
         }
@@ -229,8 +229,25 @@ struct BaseSnapshot {
     snapshot_len: u64,
 }
 
+/// `SchemaMismatch` unless `schema` has the table `table_id`, which holds data of the room.
+fn ensure_known_table(
+    room_id: &RoomId,
+    schema: &Schema,
+    table_id: u16,
+) -> Result<(), StorageError> {
+    if schema.has_table_by_id(table_id) {
+        return Ok(());
+    }
+    Err(StorageError::SchemaMismatch {
+        room_id: room_id.clone(),
+        table_id,
+    })
+}
+
 /// Loads the base snapshot from `snap_path` (`room_{id}.snap`), verifying the header and the
-/// CRC32 of the compressed payload before decompressing it.
+/// CRC32 of the compressed payload before decompressing it. A table with rows that `schema`
+/// does not have is `SchemaMismatch`; an empty one is dropped (a snapshot holds every table of
+/// the schema it was compacted with, empty ones included).
 ///
 /// A new room has none: an empty one is staged in a temporary file and renamed into place, so a
 /// failure or crash never leaves a partial snapshot behind.
@@ -317,6 +334,14 @@ async fn load_snapshot(
         run_blocking(move || crate::snapshot::deserialize_zstd(&compressed_snap, u64::MAX, None))
             .await?;
 
+    for (&table_id, table) in &payload.tables {
+        if !table.is_empty() {
+            ensure_known_table(room_id, schema, table_id)?;
+        }
+    }
+    payload
+        .tables
+        .retain(|table_id, _| schema.has_table_by_id(*table_id));
     payload.fill_missing_tables(schema);
     Ok(BaseSnapshot {
         tables: payload.tables,
@@ -365,7 +390,7 @@ async fn replay_compacting_wal(
     tables: &mut HashMap<u16, Table>,
 ) -> Result<(bool, Option<UnconfirmedTail>), StorageError> {
     let mut compacting_file = tokio::fs::File::from_std(std::fs::File::open(wal_compacting_path)?);
-    let outcome = replay_wal_file(&mut compacting_file, schema, head_seq, tables).await?;
+    let outcome = replay_wal_file(room_id, &mut compacting_file, schema, head_seq, tables).await?;
     let has_live_records = outcome.applied_count > 0;
     let unconfirmed_tail = match outcome.end {
         ReplayEnd::Clean => None,
@@ -447,7 +472,8 @@ pub(crate) async fn recover_room(
 
     // 3. Replay append-only WAL batches from wal_path
     let mut wal_file = tokio::fs::File::from_std(wal_file_std);
-    let outcome = replay_wal_file(&mut wal_file, schema, &mut head_seq, &mut tables).await?;
+    let outcome =
+        replay_wal_file(room_id, &mut wal_file, schema, &mut head_seq, &mut tables).await?;
     let torn_write = match outcome.end {
         ReplayEnd::Clean => None,
         ReplayEnd::TornWrite(reason) => Some(reason),

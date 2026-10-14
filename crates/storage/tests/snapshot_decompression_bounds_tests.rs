@@ -87,7 +87,8 @@ async fn disk_engine_applies_its_configured_snapshot_limit() {
     let dir = tempfile::tempdir().unwrap();
     let engine = DiskStorageEngine::new(
         DiskStorageOptions::new(dir.path()).max_snapshot_uncompressed_bytes(1),
-    );
+    )
+    .unwrap();
     engine.open_room(&room_id, schema.clone()).await.unwrap();
     let result = engine
         .apply_snapshot(&room_id, schema, snapshot.into(), 0u64.into())
