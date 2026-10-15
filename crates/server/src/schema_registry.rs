@@ -100,15 +100,23 @@ impl SchemaRegistry {
 
     /// Registers a new schema, persisting it to disk atomically.
     ///
-    /// A schema id is declared once: an id that is already registered is
-    /// `SchemaAlreadyExists`, checked under the write lock, and nothing is written. Replacing a
-    /// schema could renumber its tables or drop and retype columns under rows already in the
-    /// rooms' logs; schemas evolve only through [`SchemaRegistry::add_column`].
+    /// A new schema starts at version 1 (`BadRequest` otherwise). A schema id is declared
+    /// once: an id that is already registered is `SchemaAlreadyExists`, checked under the
+    /// write lock, and nothing is written. Replacing a schema could renumber its tables or
+    /// drop and retype columns under rows already in the rooms' logs; schemas evolve only
+    /// through [`SchemaRegistry::add_column`].
     pub fn register_schema(
         &self,
         id: SchemaId,
         schema: Schema,
     ) -> Result<Arc<Schema>, ServerError> {
+        if schema.version() != Schema::FIRST_VERSION {
+            return Err(ServerError::BadRequest(format!(
+                "A new schema starts at version {}, not {}",
+                Schema::FIRST_VERSION,
+                schema.version()
+            )));
+        }
         // Waiting for another writer is blocking too, so it happens inside `blocking_io`.
         blocking_io(|| {
             let _write = self.lock_writes();

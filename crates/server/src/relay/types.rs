@@ -40,11 +40,16 @@ impl LogBounds {
         retention::is_usable_snapshot(seq, self.tail_seq, self.head_seq)
     }
 
-    pub(super) fn check(&self, seq: SequenceNumber) -> Result<(), ServerError> {
+    /// Rejects `seq` with `error` unless the range admits it.
+    pub(super) fn check(
+        &self,
+        seq: SequenceNumber,
+        error: fn(String) -> ServerError,
+    ) -> Result<(), ServerError> {
         if self.admits(seq) {
             Ok(())
         } else {
-            Err(ServerError::BadRequest(format!(
+            Err(error(format!(
                 "Snapshot sequence {seq} is outside the range the room log can continue from \
                  (tail {}, head {})",
                 self.tail_seq, self.head_seq

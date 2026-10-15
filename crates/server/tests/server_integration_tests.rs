@@ -541,7 +541,11 @@ async fn schema_evolution_cascades_to_active_room() {
         .room_with_schema("evolving-schema", "room-evolution-cascade")
         .await;
     let client_id = client("writer-evo");
-    let (token, _) = server.register(&room_id, &client_id).await;
+    let (token, registered) = server.register(&room_id, &client_id).await;
+    assert!(
+        matches!(&registered, ServerMessage::Registered { schema, .. } if schema.version() == 1),
+        "{registered:?}"
+    );
 
     let add_resp = server
         .admin(Method::POST, &format!("/admin/schemas/{schema_id}/columns"))
@@ -554,6 +558,37 @@ async fn schema_evolution_cascades_to_active_room() {
         .unwrap();
     assert_eq!(add_resp.status(), StatusCode::OK);
     let updated_schema: Schema = add_resp.json().await.unwrap();
+    assert_eq!(updated_schema.version(), 2);
+
+    // Responses carry the new version, which tells a client without SSE to fetch the schema.
+    let heartbeat = ClientMessage::Heartbeat {
+        correlation_id: CorrelationId::new(97),
+        room_id: room_id.clone(),
+        client_id: client_id.clone(),
+    };
+    let sync = ClientMessage::Sync {
+        correlation_id: CorrelationId::new(98),
+        room_id: room_id.clone(),
+        client_id: client_id.clone(),
+        from_seq: SequenceNumber::new(0),
+        max_batch_size: 10,
+    };
+    for (endpoint, msg) in [("heartbeat", heartbeat), ("sync", sync)] {
+        let (_, reply) = server.post_message(&room_id, endpoint, &token, &msg).await;
+        assert!(
+            matches!(
+                reply,
+                ServerMessage::HeartbeatAck {
+                    schema_version: 2,
+                    ..
+                } | ServerMessage::SyncBatch {
+                    schema_version: 2,
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+    }
 
     // The client commits an operation containing the new "notes" column.
     let row_with_notes = RowBuilder::new()
@@ -569,7 +604,7 @@ async fn schema_evolution_cascades_to_active_room() {
     let (status, ack) = server.post_message(&room_id, "commit", &token, &msg).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        matches!(ack, ServerMessage::CommitAck { assigned_seq, .. } if assigned_seq == SequenceNumber::new(1)),
+        matches!(ack, ServerMessage::CommitAck { assigned_seq, schema_version: 2, .. } if assigned_seq == SequenceNumber::new(1)),
         "{ack:?}"
     );
 }
@@ -1072,6 +1107,95 @@ async fn snapshot_demand_signals_over_http_and_sse() {
 }
 
 #[tokio::test]
+async fn recreated_room_resets_the_cursors_of_the_deleted_one() {
+    let server = TestServer::start(|_| {}).await;
+    let (schema_id, room_id) = server
+        .room_with_schema("todo-schema", "room-recreated")
+        .await;
+    let register_incarnation =
+        async |client_id: &ClientId| match server.register(&room_id, client_id).await {
+            (
+                token,
+                ServerMessage::Registered {
+                    room_incarnation, ..
+                },
+            ) => (token, room_incarnation),
+            other => panic!("Expected Registered, got {other:?}"),
+        };
+    let commit_all = async |client_id: &ClientId, token: &str, count: u8| {
+        for n in 1..=count {
+            let msg = commit_msg(&room_id, client_id, n, 0, make_test_op(n.into()));
+            let (status, _) = server.post_message(&room_id, "commit", token, &msg).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+    };
+    let old = client("old");
+    let (old_token, old_incarnation) = register_incarnation(&old).await;
+    commit_all(&old, &old_token, 5).await;
+
+    // The admin deletes the room and creates it again; another client commits 3 operations.
+    let resp = server
+        .admin(Method::DELETE, &format!("/admin/rooms/{room_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    server.create_room(room_id.as_str(), &schema_id).await;
+    let other = client("other");
+    let (other_token, incarnation) = register_incarnation(&other).await;
+    assert_ne!(incarnation, old_incarnation);
+    commit_all(&other, &other_token, 3).await;
+
+    // `old` comes back with its cursor of the deleted room, or without saying which room it
+    // belongs to: it must start over, although the cursor is also above the new room's head.
+    let register = |current_seq, known_incarnation| ClientMessage::RegisterClient {
+        correlation_id: CorrelationId::new(1),
+        room_id: room_id.clone(),
+        client_id: old.clone(),
+        auth_token: old_token.clone(),
+        current_seq,
+        known_incarnation,
+    };
+    let old_cursor = async || {
+        let room = server.room_manager.get_room(&room_id).unwrap();
+        cursor(&room, &old).await
+    };
+    for known in [Some(old_incarnation), None] {
+        let msg = register(Some(SequenceNumber::new(5)), known);
+        let (status, reply) = server
+            .post_message(&room_id, "register", &old_token, &msg)
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            matches!(
+                reply,
+                ServerMessage::Error {
+                    code: ErrorCode::RoomReset,
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        assert_eq!(old_cursor().await, None);
+    }
+
+    // Without a cursor it starts over; with this room's incarnation, its cursor is accepted.
+    for (seq, known) in [(0, None), (3, Some(incarnation))] {
+        let current_seq = (seq > 0).then(|| SequenceNumber::new(seq));
+        let (status, reply) = server
+            .post_message(
+                &room_id,
+                "register",
+                &old_token,
+                &register(current_seq, known),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{reply:?}");
+        assert_eq!(old_cursor().await, Some(SequenceNumber::new(seq)));
+    }
+}
+
+#[tokio::test]
 async fn register_with_a_cursor_beyond_the_head_is_an_invalid_sequence() {
     let server = TestServer::start(|_| {}).await;
     let (_, room_id) = server
@@ -1079,6 +1203,15 @@ async fn register_with_a_cursor_beyond_the_head_is_an_invalid_sequence() {
         .await;
     let client_id = client("ahead");
     let token = token(&client_id, &room_id);
+    let (
+        _,
+        ServerMessage::Registered {
+            room_incarnation, ..
+        },
+    ) = server.register(&room_id, &client("peer")).await
+    else {
+        panic!("Expected Registered");
+    };
 
     let register = ClientMessage::RegisterClient {
         correlation_id: CorrelationId::new(7),
@@ -1086,6 +1219,7 @@ async fn register_with_a_cursor_beyond_the_head_is_an_invalid_sequence() {
         client_id: client_id.clone(),
         auth_token: token.clone(),
         current_seq: Some(SequenceNumber::new(999)),
+        known_incarnation: Some(room_incarnation),
     };
     match server
         .post_message(&room_id, "register", &token, &register)

@@ -50,22 +50,42 @@ impl SchemaBuilder {
 /// [`Schema::add_column`], which keep them consistent: every table is stored under its own
 /// `table_id`, ids and names are unique, and `id_by_name` indexes exactly the stored tables.
 ///
-/// Serialized form (JSON and binary): `{"tables": [table, ...]}`, in ascending `table_id`
-/// order, each table carrying its own `table_id`. Deserialization inserts the tables through
-/// the same strict path: a repeated id or name, a table without an id, or an unknown field is
-/// an error, and no id is ever assigned or changed while reading.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+/// The `version` starts at [`Schema::FIRST_VERSION`] and every [`Schema::add_column`] adds 1,
+/// so a client that sees a version other than its own knows its schema is outdated.
+///
+/// Serialized form (JSON and binary): `{"version": n, "tables": [table, ...]}`, the tables in
+/// ascending `table_id` order, each carrying its own `table_id`; JSON without `version` is
+/// version 1, and version 0 is an error. Deserialization inserts the tables through the same
+/// strict path: a repeated id or name, a table without an id, or an unknown field is an error,
+/// and no id is ever assigned or changed while reading.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Schema {
+    version: u64,
     tables_by_id: BTreeMap<u16, TableSchema>,
     id_by_name: BTreeMap<String, u16>,
 }
 
+impl Default for Schema {
+    fn default() -> Self {
+        Self {
+            version: Self::FIRST_VERSION,
+            tables_by_id: BTreeMap::new(),
+            id_by_name: BTreeMap::new(),
+        }
+    }
+}
+
 impl Serialize for Schema {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("Schema", 1)?;
+        let mut state = serializer.serialize_struct("Schema", 2)?;
+        state.serialize_field("version", &self.version)?;
         state.serialize_field("tables", &self.tables_by_id.values().collect::<Vec<_>>())?;
         state.end()
     }
+}
+
+fn first_version() -> u64 {
+    Schema::FIRST_VERSION
 }
 
 impl<'de> Deserialize<'de> for Schema {
@@ -73,16 +93,31 @@ impl<'de> Deserialize<'de> for Schema {
         #[derive(Deserialize)]
         #[serde(rename = "Schema", deny_unknown_fields)]
         struct SchemaHelper {
+            #[serde(default = "first_version")]
+            version: u64,
             tables: Vec<TableSchema>,
         }
         let helper = SchemaHelper::deserialize(deserializer)?;
-        Schema::try_from_tables(helper.tables).map_err(de::Error::custom)
+        if helper.version == 0 {
+            return Err(de::Error::custom("Schema versions start at 1"));
+        }
+        let mut schema = Schema::try_from_tables(helper.tables).map_err(de::Error::custom)?;
+        schema.version = helper.version;
+        Ok(schema)
     }
 }
 
 impl Schema {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Version of a new schema.
+    pub const FIRST_VERSION: u64 = 1;
+
+    /// The schema's version: [`Schema::FIRST_VERSION`] when created, plus 1 per `add_column`.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     pub fn builder() -> SchemaBuilder {
@@ -136,7 +171,9 @@ impl Schema {
             .get(table_name)
             .and_then(|id| self.tables_by_id.get_mut(id))
             .ok_or_else(|| ValidationError::TableNotFound(table_name.to_string()))?;
-        table.add_column(col)
+        let index = table.add_column(col)?;
+        self.version += 1;
+        Ok(index)
     }
 
     /// The id a table added without an explicit one receives: one past the largest id.

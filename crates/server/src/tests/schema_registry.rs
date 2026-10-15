@@ -51,6 +51,38 @@ fn interrupted_schema_write_keeps_previous_version() {
 }
 
 #[test]
+fn schema_version_counts_every_added_column_and_survives_a_restart() {
+    let (dir, id, registry) = todo_registry();
+    assert_eq!(registry.get_schema(&id).unwrap().version(), 1);
+    registry
+        .add_column(&id, "tasks", nullable_int("priority"))
+        .unwrap();
+    assert!(registry
+        .add_column(&id, "tasks", nullable_int("priority"))
+        .is_err());
+    registry
+        .add_column(&id, "tasks", nullable_int("estimate"))
+        .unwrap();
+    assert_eq!(registry.get_schema(&id).unwrap().version(), 3);
+
+    let reopened = SchemaRegistry::new(dir.path()).unwrap();
+    assert_eq!(reopened.get_schema(&id).unwrap().version(), 3);
+}
+
+#[test]
+fn new_schema_must_start_at_version_one() {
+    let (_dir, _, registry) = todo_registry();
+    let mut evolved = test_schema();
+    evolved
+        .add_column("tasks", nullable_int("priority"))
+        .unwrap();
+    let id = SchemaId::new("evolved").unwrap();
+    let res = registry.register_schema(id.clone(), evolved);
+    assert!(matches!(res, Err(ServerError::BadRequest(_))), "{res:?}");
+    assert!(registry.get_schema(&id).is_none());
+}
+
+#[test]
 fn stale_schema_tmp_is_ignored_and_removed() {
     let (dir, id, _) = todo_registry();
     let tmp = durable::tmp_path_for(&todo_path(&dir));
@@ -133,6 +165,7 @@ fn add_column_waits_for_a_concurrent_add_column_on_the_same_schema() {
     ] {
         assert!(has_column(&schema, "priority"));
         assert!(has_column(&schema, "estimate"));
+        assert_eq!(schema.version(), 3);
     }
 }
 

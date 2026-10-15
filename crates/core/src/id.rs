@@ -267,7 +267,8 @@ impl From<SequenceNumber> for u64 {
     }
 }
 
-/// Unique mutation ID (UUID v4 or 16-byte random) for commit idempotency.
+/// Mutation ID for commit idempotency: 16 random bytes (or a UUID v4). The server deduplicates
+/// commits by client and mutation ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct MutationId([u8; 16]);

@@ -158,7 +158,7 @@ impl SnapshotRelay {
         let _pending = PendingUpload::acquire(&self.pending_single_uploads, room_id)?;
         let slot = self.slot(room_id);
         let bounds = log_bounds.await?;
-        bounds.check(head_seq)?;
+        bounds.check(head_seq, ServerError::BadRequest)?;
 
         // Header, checksum and hash are computed before taking the room lock.
         let validated = data.clone();
@@ -272,7 +272,7 @@ impl SnapshotRelay {
         };
 
         if !continues {
-            bounds.check(head_seq)?;
+            bounds.check(head_seq, ServerError::BadRequest)?;
             self.check_newer_than_active(&room_id, head_seq)?;
             if let Some(replaced) = guard.upload.take() {
                 info!(room = %room_id, old_seq = %replaced.head_seq, new_seq = %head_seq,
@@ -314,8 +314,11 @@ impl SnapshotRelay {
         let Some(session) = guard.upload.take() else {
             return Err(ServerError::Internal("Upload session vanished".to_string()));
         };
+        // The upload anchored the retained range, but the range can still move (TTL and size
+        // compaction, or pruning before the upload started): the snapshot was superseded, and
+        // a new upload may be tried.
         let acceptable = bounds
-            .check(head_seq)
+            .check(head_seq, ServerError::SnapshotSuperseded)
             .and_then(|()| self.check_newer_than_active(&room_id, head_seq));
         if let Err(err) = acceptable {
             self.remove_files(vec![session.path]).await;
@@ -386,29 +389,31 @@ impl SnapshotRelay {
         Ok(())
     }
 
-    /// Whether an upload for the room is under way: a single-request upload being received or
-    /// staged, or a multipart upload that has not gone idle.
+    /// The sequence of the upload under way for the room, if any, below which the room's log
+    /// must not be pruned: that of a multipart upload that has not gone idle, or 0 for a
+    /// single-request upload being validated or staged.
     ///
     /// Reads memory without waiting, so the room actor can call it. A room whose lock is held
-    /// at that moment counts as uploading: the lock is only held briefly, and callers only
+    /// at that moment counts as uploading at 0: the lock is only held briefly, and callers only
     /// postpone a decision on it.
-    pub fn has_upload_in_progress(&self, room_id: &RoomId) -> bool {
+    pub fn upload_in_progress(&self, room_id: &RoomId) -> Option<SequenceNumber> {
+        let whole_log = Some(SequenceNumber::new(0));
         if self
             .pending_single_uploads
             .get(room_id)
             .is_some_and(|count| *count > 0)
         {
-            return true;
+            return whole_log;
         }
-        let Some(slot) = self.slots.get(room_id).map(|slot| Arc::clone(slot.value())) else {
-            return false;
+        let slot = Arc::clone(self.slots.get(room_id)?.value());
+        let Ok(guard) = slot.try_lock() else {
+            return whole_log;
         };
-        slot.try_lock().map_or(true, |guard| {
-            guard
-                .upload
-                .as_ref()
-                .is_some_and(|upload| !upload.is_idle(Instant::now()))
-        })
+        guard
+            .upload
+            .as_ref()
+            .filter(|upload| !upload.is_idle(Instant::now()))
+            .map(|upload| upload.head_seq)
     }
 
     /// Whether the room's active snapshot is exactly `seq` with `hash`.

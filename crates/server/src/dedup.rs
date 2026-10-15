@@ -1,7 +1,20 @@
 use lru::LruCache;
-use zemdb_core::id::{MutationId, SequenceNumber};
+use zemdb_core::id::{ClientId, MutationId, SequenceNumber};
 
-/// Bounded in-memory LRU cache for mutation deduplication and Exactly-Once semantics.
+/// The key under which the mutation `mutation_id` of `client_id` is deduplicated and logged:
+/// 16 bytes of a BLAKE3 hash of both (the client id prefixed by its length), so that the same
+/// id sent by two clients is two different mutations.
+pub(crate) fn dedup_key(client_id: &ClientId, mutation_id: &MutationId) -> MutationId {
+    let hash = blake3::Hasher::new()
+        .update(&(client_id.as_str().len() as u64).to_le_bytes())
+        .update(client_id.as_str().as_bytes())
+        .update(mutation_id.as_bytes())
+        .finalize();
+    MutationId::new(std::array::from_fn(|i| hash.as_bytes()[i]))
+}
+
+/// Bounded in-memory LRU cache for mutation deduplication and Exactly-Once semantics, keyed
+/// by [`dedup_key`].
 ///
 /// Its memory grows with the entries it holds, not with its capacity: an idle room keeps an
 /// almost empty cache however large the capacity is.
@@ -22,17 +35,17 @@ impl DedupLruCache {
         }
     }
 
-    /// Checks if a mutation ID has already been assigned a sequence number.
+    /// Checks if the mutation of `key` has already been assigned a sequence number.
     ///
     /// If present, returns the assigned `SequenceNumber` and refreshes its LRU recency.
-    pub fn is_duplicate(&mut self, mutation_id: &MutationId) -> Option<SequenceNumber> {
-        self.cache.get(mutation_id).copied()
+    pub fn is_duplicate(&mut self, key: &MutationId) -> Option<SequenceNumber> {
+        self.cache.get(key).copied()
     }
 
-    /// Records a new mutation and its assigned sequence number into the cache, evicting the
-    /// least recently used entry when it is full.
-    pub fn record(&mut self, mutation_id: MutationId, seq: SequenceNumber) {
-        self.cache.put(mutation_id, seq);
+    /// Records the key of a new mutation and its assigned sequence number into the cache,
+    /// evicting the least recently used entry when it is full.
+    pub fn record(&mut self, key: MutationId, seq: SequenceNumber) {
+        self.cache.put(key, seq);
         if self.cache.len() > self.capacity {
             self.cache.pop_lru();
         }
@@ -40,8 +53,8 @@ impl DedupLruCache {
 
     /// Hydrates the deduplication cache from recovered log entries.
     pub fn hydrate(&mut self, entries: impl IntoIterator<Item = (MutationId, SequenceNumber)>) {
-        for (mutation_id, seq) in entries {
-            self.record(mutation_id, seq);
+        for (key, seq) in entries {
+            self.record(key, seq);
         }
     }
 

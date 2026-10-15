@@ -30,6 +30,7 @@ fn table_zero_listed_after_another_table_keeps_its_id() {
     }))
     .expect("distinct explicit ids are a valid schema");
 
+    assert_eq!(schema.version(), 1, "JSON without a version is version 1");
     assert_eq!(schema.get_table_id("projects"), Some(1));
     assert_eq!(schema.get_table_id("tasks"), Some(0));
     assert_eq!(schema.get_table_by_id(0).unwrap().name(), "tasks");
@@ -82,11 +83,13 @@ fn table_without_an_id_is_rejected_when_reading() {
 fn binary_schema_with_duplicate_table_ids_is_rejected() {
     #[derive(Serialize)]
     struct RawSchema {
+        version: u64,
         tables: Vec<TableSchema>,
     }
     let projects: TableSchema = serde_json::from_value(table_json(Some(2), "projects")).unwrap();
     let tasks: TableSchema = serde_json::from_value(table_json(Some(2), "tasks")).unwrap();
     let bytes = bincode::serialize(&RawSchema {
+        version: 1,
         tables: vec![projects, tasks],
     })
     .unwrap();
@@ -97,14 +100,19 @@ fn binary_schema_with_duplicate_table_ids_is_rejected() {
 #[test]
 fn valid_schema_round_trips_in_json_and_binary() {
     let schema = from_json(json!({
+        "version": 3,
         "tables": [table_json(Some(4), "projects"), table_json(Some(0), "tasks")]
     }))
     .unwrap();
+    assert_eq!(schema.version(), 3);
 
     let json = serde_json::to_value(&schema).unwrap();
     assert_eq!(
         json,
-        json!({"tables": [table_json(Some(0), "tasks"), table_json(Some(4), "projects")]}),
+        json!({
+            "version": 3,
+            "tables": [table_json(Some(0), "tasks"), table_json(Some(4), "projects")]
+        }),
         "tables are written as a list in ascending id order"
     );
     let from_json: Schema = serde_json::from_value(json).unwrap();
@@ -114,6 +122,8 @@ fn valid_schema_round_trips_in_json_and_binary() {
     let from_binary: Schema = bincode::deserialize(&bytes).unwrap();
     assert_eq!(from_binary, schema);
     assert_eq!(from_binary.get_table_id("projects"), Some(4));
+
+    assert!(serde_json::from_value::<Schema>(json!({"version": 0, "tables": []})).is_err());
 }
 
 fn table(name: &str) -> TableBuilder {
@@ -191,6 +201,7 @@ fn schema_add_column_evolves_the_table_and_keeps_the_indexes() {
         .table(table("projects"))
         .table(table("tasks"))
         .build();
+    assert_eq!(schema.version(), 1);
 
     let idx = schema
         .add_column(
@@ -199,6 +210,7 @@ fn schema_add_column_evolves_the_table_and_keeps_the_indexes() {
         )
         .unwrap();
     assert_eq!(idx, 1);
+    assert_eq!(schema.version(), 2);
     let tasks = schema.get_table_by_id(1).unwrap();
     assert_eq!(tasks.name(), "tasks");
     assert!(tasks.get_column("done").is_some());
@@ -219,4 +231,5 @@ fn schema_add_column_evolves_the_table_and_keeps_the_indexes() {
             column: "required".to_string(),
         })
     );
+    assert_eq!(schema.version(), 2, "a rejected change keeps the version");
 }

@@ -41,12 +41,15 @@ const MAX_SEND_ATTEMPTS: usize = 3;
 /// How many rooms `shutdown_all` closes at once.
 const SHUTDOWN_CONCURRENCY: usize = 64;
 
-/// Persistent room configuration (`meta_room.json`): the room's schema and the lifecycle
-/// settings in which it differs from the server defaults.
+/// Persistent room configuration (`meta_room.json`): the room's schema, its incarnation and the
+/// lifecycle settings in which it differs from the server defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomMetadata {
     pub room_id: RoomId,
     pub schema_id: SchemaId,
+    /// Random id drawn when the room is created: a room deleted and created again with the
+    /// same id gets a new one, so that clients can tell their cursor belongs to another room.
+    pub room_incarnation: u128,
     /// Lifecycle overrides of the room; a file without them has none.
     #[serde(default)]
     pub lifecycle: RoomLifecycleOverrides,
@@ -327,10 +330,15 @@ impl RoomManager {
         let known = self.stored_metadata(room_id)?;
         let meta = match (schema_id, known) {
             (Some(schema_id), known) => {
+                let (room_incarnation, lifecycle) = known.map_or_else(
+                    || (new_incarnation(), Default::default()),
+                    |meta| (meta.room_incarnation, meta.lifecycle),
+                );
                 let meta = RoomMetadata {
                     room_id: room_id.clone(),
                     schema_id: schema_id.clone(),
-                    lifecycle: known.map(|meta| meta.lifecycle).unwrap_or_default(),
+                    room_incarnation,
+                    lifecycle,
                 };
                 write_room_metadata(&room_dir(&self.data_dir, room_id), &meta)?;
                 meta
@@ -370,6 +378,7 @@ impl RoomManager {
         let policy = self.default_policy.with_overrides(&meta.lifecycle);
         let (sender, actor) = RoomActor::open(
             room_id.clone(),
+            meta.room_incarnation,
             meta.schema_id.clone(),
             schema,
             &self.data_dir,
@@ -494,6 +503,7 @@ impl RoomManager {
         let meta = RoomMetadata {
             room_id: room_id.clone(),
             schema_id,
+            room_incarnation: new_incarnation(),
             lifecycle,
         };
         blocking_io(|| write_room_metadata(&room_dir, &meta))?;
@@ -638,6 +648,11 @@ impl RoomManager {
         }
         reloaded
     }
+}
+
+/// A random incarnation for a new room.
+fn new_incarnation() -> u128 {
+    uuid::Uuid::new_v4().as_u128()
 }
 
 /// Atomically and durably writes a room's `meta_room.json`, creating its directory if needed.

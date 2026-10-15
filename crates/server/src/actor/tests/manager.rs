@@ -320,6 +320,38 @@ async fn lifecycle_overrides_survive_a_respawn_and_a_restart() {
 }
 
 #[tokio::test]
+async fn room_incarnation_survives_a_schema_change_and_a_restart() {
+    let dir = tempdir().unwrap();
+    let room_id = RoomId::new("incarnated").unwrap();
+    let manager = new_manager(&dir);
+    let created = manager
+        .create_room(room_id.clone(), SchemaId::new("first").unwrap(), None)
+        .await
+        .unwrap();
+    manager.shutdown_room(&room_id).await;
+    manager
+        .get_or_spawn(&room_id, Some(&SchemaId::new("second").unwrap()))
+        .await
+        .unwrap();
+    manager.shutdown_all().await;
+
+    // A restarted server accepts a cursor of the same room.
+    let manager = new_manager(&dir);
+    let registered = manager
+        .ask(&room_id, |reply| RoomCommand::RegisterClient {
+            client_id: zemdb_core::id::ClientId::new("back").unwrap(),
+            current_seq: Some(SequenceNumber::new(0)),
+            known_incarnation: Some(created.room_incarnation),
+            reply,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(registered.room_incarnation, created.room_incarnation);
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
 async fn meta_room_without_lifecycle_has_no_overrides() {
     let dir = tempdir().unwrap();
     let room_id = RoomId::new("policy-b").unwrap();
@@ -327,7 +359,7 @@ async fn meta_room_without_lifecycle_has_no_overrides() {
     fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
     fs::write(
         &meta_path,
-        br#"{"room_id": "policy-b", "schema_id": "first"}"#,
+        br#"{"room_id": "policy-b", "schema_id": "first", "room_incarnation": 1}"#,
     )
     .unwrap();
 
@@ -483,6 +515,7 @@ async fn requests_racing_an_inactivity_shutdown_are_never_refused() {
                 .ask(&room_id, |reply| RoomCommand::RegisterClient {
                     client_id: client_id.clone(),
                     current_seq: None,
+                    known_incarnation: None,
                     reply,
                 })
                 .await
@@ -619,6 +652,7 @@ async fn spawned_actor_reports_a_panic() {
     );
     let (sender, handle) = RoomActor::spawn(
         room_id.clone(),
+        1,
         SchemaId::new("first").unwrap(),
         Arc::new(test_schema()),
         dir.path(),
@@ -754,6 +788,7 @@ async fn client_inactivity_keeps_counting_across_an_inactivity_shutdown() {
         .ask(&room_id, |reply| RoomCommand::RegisterClient {
             client_id: client.clone(),
             current_seq: None,
+            known_incarnation: None,
             reply,
         })
         .await
@@ -935,7 +970,7 @@ async fn room_that_fails_to_spawn_leaves_no_metadata() {
     fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
     fs::write(
         &meta_path,
-        br#"{"room_id": "no-schema", "schema_id": "missing"}"#,
+        br#"{"room_id": "no-schema", "schema_id": "missing", "room_incarnation": 1}"#,
     )
     .unwrap();
 
@@ -973,6 +1008,7 @@ async fn rooms_shut_down_together_and_save_their_rosters() {
             .ask(&room_id, |reply| RoomCommand::RegisterClient {
                 client_id: client.clone(),
                 current_seq: None,
+                known_incarnation: None,
                 reply,
             })
             .await

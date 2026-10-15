@@ -22,7 +22,7 @@ use crate::actor::lease::{ClientLeaseTracker, ClientState};
 use crate::actor::snapshot_demand::{persistence_granularity, SnapshotDemand, DESIGNATION_TIMEOUT};
 use crate::blocking::blocking_io;
 use crate::config::ServerConfig;
-use crate::dedup::DedupLruCache;
+use crate::dedup::{dedup_key, DedupLruCache};
 use crate::durable;
 use crate::error::ServerError;
 use crate::log::{retention, RoomLifecyclePolicy, TieredLog};
@@ -85,6 +85,8 @@ pub enum ActorExit {
 /// Single-writer actor of one room: sequencing, durability, client leases and snapshot signals.
 pub struct RoomActor {
     room_id: RoomId,
+    /// Tells this room apart from earlier rooms created with the same id.
+    incarnation: u128,
     schema_id: SchemaId,
     schema: Arc<Schema>,
     dedup_cache: DedupLruCache,
@@ -113,9 +115,12 @@ pub struct RoomActor {
 
 impl RoomActor {
     /// Spawns a new RoomActor task, recovering state and initializing durability from disk.
-    /// `lifecycle_policy` is the room's effective policy.
+    /// `incarnation` tells this room apart from earlier rooms created with its id, and
+    /// `lifecycle_policy` is its effective policy.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         room_id: RoomId,
+        incarnation: u128,
         schema_id: SchemaId,
         schema: Arc<Schema>,
         data_dir: impl AsRef<Path>,
@@ -126,6 +131,7 @@ impl RoomActor {
         let (sender, actor) = blocking_io(|| {
             Self::open(
                 room_id,
+                incarnation,
                 schema_id,
                 schema,
                 data_dir,
@@ -145,6 +151,7 @@ impl RoomActor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open(
         room_id: RoomId,
+        incarnation: u128,
         schema_id: SchemaId,
         schema: Arc<Schema>,
         data_dir: impl AsRef<Path>,
@@ -182,6 +189,7 @@ impl RoomActor {
 
         let mut actor = Self {
             room_id: room_id.clone(),
+            incarnation,
             schema_id,
             schema,
             dedup_cache,
@@ -305,7 +313,10 @@ impl RoomActor {
         };
         self.last_command_at.elapsed() >= idle_timeout
             && self.events_tx.receiver_count() == 0
-            && !self.snapshot_relay.has_upload_in_progress(&self.room_id)
+            && self
+                .snapshot_relay
+                .upload_in_progress(&self.room_id)
+                .is_none()
     }
 
     /// Starts the shutdown for inactivity. Closing the mailbox makes `RoomManager` respawn the
@@ -336,9 +347,10 @@ impl RoomActor {
             RoomCommand::RegisterClient {
                 client_id,
                 current_seq,
+                known_incarnation,
                 reply,
             } => {
-                let _ = reply.send(self.register(&client_id, current_seq));
+                let _ = reply.send(self.register(&client_id, current_seq, known_incarnation));
             }
 
             RoomCommand::DeregisterClient { client_id, reply } => {
@@ -445,10 +457,16 @@ impl RoomActor {
         &mut self,
         client_id: &ClientId,
         current_seq: Option<SequenceNumber>,
+        known_incarnation: Option<u128>,
     ) -> Result<RegisterResponse, ServerError> {
-        // Accepting a cursor beyond the head would make the client the preferred snapshot
-        // uploader and could raise the pruning floor above the head.
         if let Some(seq) = current_seq {
+            // A cursor of an earlier room with this id would mix that room's rows with this
+            // one's.
+            if known_incarnation != Some(self.incarnation) {
+                return Err(ServerError::RoomReset(self.room_id.to_string()));
+            }
+            // Accepting a cursor beyond the head would make the client the preferred snapshot
+            // uploader and could raise the pruning floor above the head.
             self.check_within_head(seq)?;
         }
         let tail_seq = self.tiered_log.tail_seq();
@@ -464,6 +482,7 @@ impl RoomActor {
             schema_id: self.schema_id.clone(),
             schema: Arc::clone(&self.schema),
             active_snapshot_seq: self.usable_snapshot_seq(),
+            room_incarnation: self.incarnation,
         })
     }
 
@@ -479,11 +498,12 @@ impl RoomActor {
     ) -> Result<CommitResponse, ServerError> {
         self.ensure_registered(client_id)?;
         self.check_within_head(last_ack_seq)?;
+        let key = dedup_key(client_id, &mutation_id);
 
         // Exactly-once idempotency. Checked before any rejection based on client state:
         // a retried mutation was already committed and replicated, so it must always be
         // acknowledged with its original sequence, never reported as a failure.
-        if let Some(existing_seq) = self.dedup_cache.is_duplicate(&mutation_id) {
+        if let Some(existing_seq) = self.dedup_cache.is_duplicate(&key) {
             // The retry is accepted, so the cursor it reports (already validated against
             // head_seq) is recorded and the client's state recomputed from it.
             self.observe(client_id, Some(last_ack_seq));
@@ -493,6 +513,7 @@ impl RoomActor {
                 catchup_ops,
                 has_more,
                 snapshot_wanted: self.snapshot_wanted_for(client_id),
+                schema_version: self.schema.version(),
             });
         }
 
@@ -516,14 +537,14 @@ impl RoomActor {
         // The operation must fit alone in a log record and in a response frame. A
         // mutation that does not is the client's error: it is rejected here, before any I/O,
         // and the room keeps running unchanged.
-        check_operation_size(&seq_op, Some(mutation_id))
+        check_operation_size(&seq_op, Some(key))
             .map_err(|err| ServerError::BadRequest(err.to_string()))?;
 
         // A failed write or fsync leaves the log in an unknown state: the record may or may
         // not be on disk, and a failed fsync cannot be retried safely. The room stops and is
         // recovered from disk by the next request; if the record survived, deduplication
         // acknowledges a retry of the same mutation with the sequence that reached disk.
-        let outcome = match self.tiered_log.append(seq_op.clone(), Some(mutation_id)) {
+        let outcome = match self.tiered_log.append(seq_op.clone(), Some(key)) {
             Ok(outcome) => outcome,
             Err(err) => {
                 error!(
@@ -545,7 +566,7 @@ impl RoomActor {
         // From here on the mutation is durable: the reply must acknowledge it, so nothing
         // below may return an error.
 
-        self.dedup_cache.record(mutation_id, new_seq);
+        self.dedup_cache.record(key, new_seq);
         self.head_seq = new_seq;
 
         // Refresh the client's lease, record the cursor reported with the commit and make
@@ -579,6 +600,7 @@ impl RoomActor {
             catchup_ops,
             has_more,
             snapshot_wanted: self.snapshot_wanted_for(client_id),
+            schema_version: self.schema.version(),
         })
     }
 
@@ -643,6 +665,7 @@ impl RoomActor {
             ops,
             has_more,
             snapshot_wanted: self.snapshot_wanted_for(client_id),
+            schema_version: self.schema.version(),
         })
     }
 
@@ -684,6 +707,7 @@ impl RoomActor {
             head_seq: self.head_seq,
             snapshot_wanted: self.snapshot_wanted_for(client_id),
             active_snapshot_seq: self.usable_snapshot_seq(),
+            schema_version: self.schema.version(),
         })
     }
 
@@ -788,7 +812,10 @@ impl RoomActor {
     /// designee that timed out or left. Every new designation is announced to SSE subscribers,
     /// who check with a heartbeat whether they are the one.
     fn designate_uploader(&mut self) {
-        let upload_in_progress = self.snapshot_relay.has_upload_in_progress(&self.room_id);
+        let upload_in_progress = self
+            .snapshot_relay
+            .upload_in_progress(&self.room_id)
+            .is_some();
         let tracker = &self.lease_tracker;
         let designated = self.snapshot_demand.designate(
             Instant::now(),
@@ -831,7 +858,8 @@ impl RoomActor {
     }
 
     /// Prunes the log up to the retention floor when every non-dormant client is connected:
-    /// the lowest connected cursor, bounded by the active snapshot (Retention Anchor).
+    /// the lowest connected cursor, bounded by the active snapshot and by a snapshot upload in
+    /// progress (Retention Anchor).
     ///
     /// The cursors that justify the prune are persisted before any segment is deleted, so the
     /// roster on disk never falls behind the retained log; otherwise a restart would treat
@@ -843,10 +871,15 @@ impl RoomActor {
         };
         // The relay only accepts snapshots inside the retained range, but the range moves on
         // (TTL and size compaction ignore the anchor), so a snapshot that fell out of it can no
-        // longer anchor anything and is ignored.
-        let retention_floor = self
-            .usable_snapshot_seq()
-            .map_or(min_ack, |snap_seq| min_ack.min(snap_seq));
+        // longer anchor anything and is ignored. An upload that fell out of it holds pruning
+        // back only until it completes (and fails) or goes idle.
+        let retention_floor = [
+            self.usable_snapshot_seq(),
+            self.snapshot_relay.upload_in_progress(&self.room_id),
+        ]
+        .into_iter()
+        .flatten()
+        .fold(min_ack, SequenceNumber::min);
 
         // Segments are deleted only when they end below the floor, and none ends below the
         // current tail, so a floor at or below the tail deletes nothing.

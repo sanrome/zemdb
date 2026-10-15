@@ -99,6 +99,11 @@ pub enum ServerError {
 
     #[error("Snapshot superseded: {0}")]
     SnapshotSuperseded(String),
+
+    /// The client's cursor belongs to an earlier room with the same id, or came without the
+    /// room incarnation: the client must discard its local state and register without a cursor.
+    #[error("The cursor does not belong to this incarnation of room {0}")]
+    RoomReset(String),
 }
 
 impl From<zemdb_core::InvalidIdError> for ServerError {
@@ -142,6 +147,7 @@ impl ServerError {
             ServerError::InvalidSequence { .. } => ErrorCode::InvalidSequence,
             ServerError::BadRequest(_) => ErrorCode::BadRequest,
             ServerError::SnapshotSuperseded(_) => ErrorCode::SnapshotSuperseded,
+            ServerError::RoomReset(_) => ErrorCode::RoomReset,
             ServerError::Io(_)
             | ServerError::Wal(_)
             | ServerError::WalCorruption(_)
@@ -160,6 +166,7 @@ impl ServerError {
             ServerError::RoomAlreadyExists(_)
             | ServerError::SchemaAlreadyExists(_)
             | ServerError::SnapshotSuperseded(_)
+            | ServerError::RoomReset(_)
             | ServerError::ClientNotRegistered(_) => StatusCode::CONFLICT,
             ServerError::ProtocolVersionMismatch(_)
             | ServerError::SchemaViolation(_)

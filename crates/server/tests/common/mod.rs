@@ -74,6 +74,7 @@ pub fn register_msg(room_id: &RoomId, client_id: &ClientId, auth_token: &str) ->
         client_id: client_id.clone(),
         auth_token: auth_token.to_string(),
         current_seq: None,
+        known_incarnation: None,
     }
 }
 
@@ -446,6 +447,7 @@ pub async fn register(tx: &mpsc::Sender<RoomCommand>, client_id: &ClientId) -> R
     ask(tx, |reply| RoomCommand::RegisterClient {
         client_id: client_id.clone(),
         current_seq: None,
+        known_incarnation: None,
         reply,
     })
     .await

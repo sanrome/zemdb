@@ -226,6 +226,7 @@ pub struct RegisterMessage {
     pub client_id: ClientId,
     pub auth_token: String,
     pub current_seq: Option<SequenceNumber>,
+    pub known_incarnation: Option<u128>,
 }
 
 #[axum::async_trait]
@@ -249,12 +250,14 @@ where
                 client_id,
                 auth_token,
                 current_seq,
+                known_incarnation,
             }) => Ok(RegisterMessage {
                 correlation_id,
                 room_id,
                 client_id,
                 auth_token,
                 current_seq,
+                known_incarnation,
             }),
             Ok(_) => Err(unexpected_message(room_id, "RegisterClient")),
             Err(e) => Err(binary_error(None, room_id, e.into())),

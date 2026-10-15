@@ -110,6 +110,7 @@ impl Fixture {
             client_id: self.client_id.clone(),
             auth_token: self.token.clone(),
             current_seq: None,
+            known_incarnation: None,
         };
         let (status, _, _) = self.post("register", &register).await;
         assert_eq!(status, StatusCode::OK);
@@ -360,6 +361,7 @@ async fn register_with_frame_of(fx: &Fixture, len: usize) -> (StatusCode, Server
         client_id: fx.client_id.clone(),
         auth_token,
         current_seq: None,
+        known_incarnation: None,
     };
     let probe = encode_message(&register("x".repeat(1024))).unwrap().len();
     let frame = encode_message(&register("x".repeat(1024 + len - probe))).unwrap();

@@ -332,13 +332,20 @@ async fn multipart_upload_with_a_corrupted_envelope_is_rejected() {
 }
 
 #[tokio::test]
-async fn multipart_completion_rechecks_the_log_range() {
+async fn multipart_upload_checks_the_log_range_when_it_starts_and_completes() {
     let dir = tempdir().unwrap();
     let relay = open(&dir);
     let snap = three_part_snapshot(1);
-    upload_parts(&relay, 10, [0, 1], &snap, (5, 10)).await;
-    // The log was compacted meanwhile: seq 10 is now below tail - 1.
+    // An upload that starts outside the range is the uploader's error.
     assert_bad_request(
+        relay
+            .stage_chunk(part_of(10, 0, &snap), bounds(12, 30))
+            .await,
+    );
+    upload_parts(&relay, 10, [0, 1], &snap, (5, 10)).await;
+    // TTL or size compaction moved the log meanwhile: seq 10 is now below tail - 1, and
+    // another snapshot may be uploaded.
+    assert_superseded(
         relay
             .stage_chunk(part_of(10, 2, &snap), bounds(12, 30))
             .await,
@@ -515,22 +522,25 @@ async fn multipart_upload_is_in_progress_until_it_completes_or_goes_idle() {
     let dir = tempdir().unwrap();
     let relay = open(&dir);
     let snap = three_part_snapshot(1);
-    assert!(!relay.has_upload_in_progress(&room()));
+    assert_eq!(relay.upload_in_progress(&room()), None);
 
     for index in 0..2 {
         upload_parts(&relay, 10, [index], &snap, (0, 10)).await;
-        assert!(relay.has_upload_in_progress(&room()));
+        assert_eq!(relay.upload_in_progress(&room()), Some(seq(10)));
     }
-    assert!(!relay.has_upload_in_progress(&RoomId::new("other-room").unwrap()));
+    assert_eq!(
+        relay.upload_in_progress(&RoomId::new("other-room").unwrap()),
+        None
+    );
 
     upload_parts(&relay, 10, [2], &snap, (0, 10)).await;
-    assert!(!relay.has_upload_in_progress(&room()));
+    assert_eq!(relay.upload_in_progress(&room()), None);
 
     // An upload that stopped receiving chunks no longer counts.
     upload_parts(&relay, 11, [0], &three_part_snapshot(2), (0, 11)).await;
-    assert!(relay.has_upload_in_progress(&room()));
+    assert_eq!(relay.upload_in_progress(&room()), Some(seq(11)));
     tokio::time::advance(crate::relay::UPLOAD_IDLE_TIMEOUT).await;
-    assert!(!relay.has_upload_in_progress(&room()));
+    assert_eq!(relay.upload_in_progress(&room()), None);
 }
 
 #[tokio::test]
@@ -552,9 +562,9 @@ async fn single_request_upload_is_in_progress_while_it_is_handled() {
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
-    assert!(relay.has_upload_in_progress(&room()));
+    assert_eq!(relay.upload_in_progress(&room()), Some(seq(0)));
 
     gate.send(()).unwrap();
     upload.await.unwrap().unwrap();
-    assert!(!relay.has_upload_in_progress(&room()));
+    assert_eq!(relay.upload_in_progress(&room()), None);
 }

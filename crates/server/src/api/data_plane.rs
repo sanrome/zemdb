@@ -146,6 +146,7 @@ pub async fn register(
         client_id,
         auth_token,
         current_seq,
+        known_incarnation,
     }: RegisterMessage,
 ) -> Response {
     let fail = |room_id: RoomId, err| binary_error(Some(correlation_id), Some(room_id), err);
@@ -162,6 +163,7 @@ pub async fn register(
     let result = ask_room(&state, &room_id, |reply| RoomCommand::RegisterClient {
         client_id,
         current_seq,
+        known_incarnation,
         reply,
     })
     .await;
@@ -174,6 +176,7 @@ pub async fn register(
             schema_id: reg_resp.schema_id,
             schema: (*reg_resp.schema).clone(),
             active_snapshot_seq: reg_resp.active_snapshot_seq,
+            room_incarnation: reg_resp.room_incarnation,
         }
     })
 }
@@ -221,6 +224,7 @@ pub async fn commit(
         catchup_ops,
         has_more,
         snapshot_wanted: commit_resp.snapshot_wanted,
+        schema_version: commit_resp.schema_version,
     };
     // The commit is durable, so it is never answered with an error: without room in the
     // budget, it is acknowledged without its catch-up, which sends the client to `/sync`.
@@ -265,6 +269,7 @@ pub async fn sync(
                 ops: sync_resp.ops,
                 has_more: sync_resp.has_more,
                 snapshot_wanted: sync_resp.snapshot_wanted,
+                schema_version: sync_resp.schema_version,
             };
             budgeted_or_unavailable(&state, correlation_id, room_id, &batch)
         }
@@ -340,6 +345,7 @@ pub async fn heartbeat(
             current_head_seq: hb_resp.head_seq,
             snapshot_wanted: hb_resp.snapshot_wanted,
             active_snapshot_seq: hb_resp.active_snapshot_seq,
+            schema_version: hb_resp.schema_version,
         }
     })
 }

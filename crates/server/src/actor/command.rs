@@ -17,6 +17,7 @@ pub struct RegisterResponse {
     pub schema_id: SchemaId,
     pub schema: Arc<Schema>,
     pub active_snapshot_seq: Option<SequenceNumber>,
+    pub room_incarnation: u128,
 }
 
 /// Response returned to a client upon committing an operation.
@@ -27,6 +28,7 @@ pub struct CommitResponse {
     pub has_more: bool,
     /// Whether this client is the one designated to upload a room snapshot.
     pub snapshot_wanted: bool,
+    pub schema_version: u64,
 }
 
 /// Response returned upon requesting delta operations via Sync.
@@ -37,6 +39,7 @@ pub struct SyncBatchResponse {
     pub has_more: bool,
     /// Whether this client is the one designated to upload a room snapshot.
     pub snapshot_wanted: bool,
+    pub schema_version: u64,
 }
 
 /// Response returned to a client's heartbeat.
@@ -47,6 +50,7 @@ pub struct HeartbeatResponse {
     pub snapshot_wanted: bool,
     /// The relay's active snapshot, only if a client can catch up from it with the retained log.
     pub active_snapshot_seq: Option<SequenceNumber>,
+    pub schema_version: u64,
 }
 
 /// Metrics snapshot for a room actor.
@@ -87,6 +91,8 @@ pub enum RoomCommand {
     RegisterClient {
         client_id: ClientId,
         current_seq: Option<SequenceNumber>,
+        /// The room incarnation the cursor belongs to; required with a cursor.
+        known_incarnation: Option<u128>,
         reply: oneshot::Sender<Result<RegisterResponse, ServerError>>,
     },
 

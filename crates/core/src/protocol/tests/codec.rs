@@ -95,6 +95,7 @@ fn server_responses_are_not_budgeted() {
             .collect(),
         has_more: false,
         snapshot_wanted: false,
+        schema_version: 1,
     };
     let frame = encode_message(&batch).unwrap();
     assert_eq!(decode_message::<ServerMessage>(&frame).unwrap(), batch);

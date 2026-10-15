@@ -42,6 +42,7 @@ fn sample(kind: ClientMessageKind) -> ClientMessage {
             client_id,
             auth_token: "token".to_string(),
             current_seq: None,
+            known_incarnation: None,
         },
         ClientMessageKind::GetSchema => ClientMessage::GetSchema {
             correlation_id,

@@ -68,6 +68,7 @@ fn test_protocol_binary_serialization_roundtrip() {
         ],
         has_more: false,
         snapshot_wanted: true,
+        schema_version: 2,
     });
 
     assert_roundtrip(&ServerMessage::SyncBatch {
@@ -80,6 +81,7 @@ fn test_protocol_binary_serialization_roundtrip() {
         }],
         has_more: false,
         snapshot_wanted: false,
+        schema_version: 3,
     });
 
     for (snapshot_wanted, active_snapshot_seq) in
@@ -91,6 +93,7 @@ fn test_protocol_binary_serialization_roundtrip() {
             current_head_seq: SequenceNumber::new(150),
             snapshot_wanted,
             active_snapshot_seq,
+            schema_version: 4,
         });
     }
 
@@ -146,6 +149,7 @@ fn test_protocol_binary_serialization_roundtrip() {
         client_id: ClientId::new("client-1").unwrap(),
         auth_token: "jwt.signed.token.abc123xyz".to_string(),
         current_seq: Some(SequenceNumber::new(5)),
+        known_incarnation: Some(u128::MAX - 1),
     });
 
     assert_roundtrip(&ClientMessage::GetSchema {
@@ -168,6 +172,7 @@ fn test_protocol_binary_serialization_roundtrip() {
         schema_id: SchemaId::new("schema-workspace-v1").unwrap(),
         schema: test_schema.clone(),
         active_snapshot_seq: Some(SequenceNumber::new(1)),
+        room_incarnation: u128::MAX - 1,
     });
 
     assert_roundtrip(&ServerMessage::Schema {
@@ -396,6 +401,7 @@ fn largest_accepted_operation_fits_alone_in_any_response() {
         catchup_ops: vec![op.clone()],
         has_more: true,
         snapshot_wanted: true,
+        schema_version: u64::MAX,
     };
     let frame = encode_message(&commit_ack).expect("CommitAck with the largest operation");
     assert!(frame.len() <= MAX_FRAME_SIZE);
@@ -406,6 +412,7 @@ fn largest_accepted_operation_fits_alone_in_any_response() {
         ops: vec![op],
         has_more: true,
         snapshot_wanted: true,
+        schema_version: u64::MAX,
     };
     assert!(encode_message(&sync_batch).is_ok());
 
@@ -617,6 +624,7 @@ fn error_codes_keep_their_wire_indexes() {
         ErrorCode::Timeout,
         ErrorCode::SchemaAlreadyExists,
         ErrorCode::RequestTimeout,
+        ErrorCode::RoomReset,
     ];
     for (index, code) in codes.into_iter().enumerate() {
         let frame = encode_message(&code).unwrap();

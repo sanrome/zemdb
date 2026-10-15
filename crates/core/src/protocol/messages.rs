@@ -54,6 +54,10 @@ pub enum ErrorCode {
     /// The request body did not arrive in time (HTTP 408). Transient: retrying with backoff is
     /// safe (commits are deduplicated by `MutationId`).
     RequestTimeout,
+    /// The client's cursor belongs to a room deleted and created again with the same id, or
+    /// came without the room incarnation: the client must discard its local state and register
+    /// without a cursor (HTTP 409). Permanent for that state.
+    RoomReset,
 }
 
 /// An operation ordered by the coordination server with assigned sequence ID.
@@ -118,6 +122,10 @@ pub enum ClientMessage {
         /// Local sequence cursor: `None` for a new client, `Some` when reconnecting or restoring.
         #[serde(default)]
         current_seq: Option<SequenceNumber>,
+        /// The room incarnation the cursor belongs to (from `Registered`). Required with a
+        /// cursor: a missing or different one is `RoomReset`.
+        #[serde(default)]
+        known_incarnation: Option<u128>,
     },
     /// Request current schema for a room under active evolution.
     GetSchema {
@@ -227,6 +235,9 @@ pub enum ServerMessage {
         has_more: bool,
         /// Whether the server chose this client to upload a room snapshot.
         snapshot_wanted: bool,
+        /// Version of the room's schema; a version other than the client's means it must ask for
+        /// the schema (`GetSchema`) before applying operations.
+        schema_version: u64,
     },
     /// Confirmation of client acknowledgment and cursor persistence.
     AckConfirmed {
@@ -244,6 +255,8 @@ pub enum ServerMessage {
         has_more: bool,
         /// Whether the server chose this client to upload a room snapshot.
         snapshot_wanted: bool,
+        /// Version of the room's schema (see `CommitAck`).
+        schema_version: u64,
     },
     /// Chunk of the base room snapshot during multipart bootstrapping.
     SnapshotChunk {
@@ -284,6 +297,8 @@ pub enum ServerMessage {
         /// Sequence number of the relay's active snapshot, if a client can catch up from it
         /// with the retained log.
         active_snapshot_seq: Option<SequenceNumber>,
+        /// Version of the room's schema (see `CommitAck`).
+        schema_version: u64,
     },
     /// Confirmation of client deregistration from the room.
     DeregisterAck {
@@ -302,6 +317,9 @@ pub enum ServerMessage {
         /// Sequence number of the currently active snapshot available in relay, if any.
         #[serde(default)]
         active_snapshot_seq: Option<SequenceNumber>,
+        /// Identifies this room among the rooms ever created with its id; the client sends it
+        /// back with its cursor when it registers again.
+        room_incarnation: u128,
     },
     /// Room schema definition delivered in response to `GetSchema`.
     Schema {

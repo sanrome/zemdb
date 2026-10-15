@@ -39,6 +39,7 @@ fn each_error_maps_to_its_code_and_status() {
         (version, C::ProtocolVersionMismatch, S::BAD_REQUEST),
         (e(BadRequest), C::BadRequest, S::BAD_REQUEST),
         (e(SnapshotSuperseded), C::SnapshotSuperseded, S::CONFLICT),
+        (e(RoomReset), C::RoomReset, S::CONFLICT),
     ];
     for (err, code, status) in cases {
         assert_eq!(err.to_error_code(), code, "{err:?}");

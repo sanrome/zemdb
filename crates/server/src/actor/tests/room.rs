@@ -8,6 +8,7 @@ use crate::fail_point;
 use crate::log::io_probe::{self, IoEvent};
 use crate::log::RoomLifecycleOverrides;
 use std::fs;
+use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use tempfile::{tempdir, TempDir};
 use tokio::sync::oneshot;
@@ -36,6 +37,7 @@ struct Fixture {
     manager: RoomManager,
     relay: Arc<SnapshotRelay>,
     room_id: RoomId,
+    incarnation: u128,
 }
 
 impl Fixture {
@@ -57,19 +59,21 @@ impl Fixture {
             manager.set_timings(timings);
         }
         let room_id = RoomId::new("room").unwrap();
-        manager
+        let incarnation = manager
             .create_room(
                 room_id.clone(),
                 SchemaId::new("todo").unwrap(),
                 Some(policy),
             )
             .await
-            .unwrap();
+            .unwrap()
+            .room_incarnation;
         Self {
             dir,
             manager,
             relay,
             room_id,
+            incarnation,
         }
     }
 
@@ -113,16 +117,7 @@ fn new_manager_with(
 }
 
 async fn register(sender: &mpsc::Sender<RoomCommand>, client_id: &ClientId) {
-    let (tx, rx) = oneshot::channel();
-    sender
-        .send(RoomCommand::RegisterClient {
-            client_id: client_id.clone(),
-            current_seq: None,
-            reply: tx,
-        })
-        .await
-        .unwrap();
-    rx.await.unwrap().unwrap();
+    register_at(sender, client_id, None).await;
 }
 
 async fn commit(
@@ -971,21 +966,13 @@ async fn sync_advances_the_cursor_of_any_client() {
     fx.manager.shutdown_all().await;
 }
 
+/// Registers `client_id` with `cursor`: its sequence and the room incarnation it belongs to.
 async fn register_at(
     sender: &mpsc::Sender<RoomCommand>,
     client_id: &ClientId,
-    current_seq: Option<SequenceNumber>,
+    cursor: Option<(SequenceNumber, u128)>,
 ) {
-    let (tx, rx) = oneshot::channel();
-    sender
-        .send(RoomCommand::RegisterClient {
-            client_id: client_id.clone(),
-            current_seq,
-            reply: tx,
-        })
-        .await
-        .unwrap();
-    rx.await.unwrap().unwrap();
+    register_result(sender, client_id, cursor).await.unwrap();
 }
 
 async fn deregister(sender: &mpsc::Sender<RoomCommand>, client_id: &ClientId) {
@@ -1061,7 +1048,7 @@ async fn client_registering_behind_the_log_gets_one_designated_uploader() {
     let (fx, writer, tail) = pruned_room().await;
     let sender = fx.sender().await;
     let peer = ClientId::new("peer").unwrap();
-    register_at(&sender, &peer, Some(tail)).await;
+    register_at(&sender, &peer, Some((tail, fx.incarnation))).await;
     let mut events = subscribe(&sender).await;
 
     let newcomer = ClientId::new("newcomer").unwrap();
@@ -1185,7 +1172,7 @@ async fn designee_that_leaves_is_replaced() {
     let (fx, writer, tail) = pruned_room().await;
     let sender = fx.sender().await;
     let peer = ClientId::new("peer").unwrap();
-    register_at(&sender, &peer, Some(tail)).await;
+    register_at(&sender, &peer, Some((tail, fx.incarnation))).await;
     let mut events = subscribe(&sender).await;
     register_at(&sender, &ClientId::new("newcomer").unwrap(), None).await;
     assert_eq!(
@@ -1286,7 +1273,7 @@ async fn designee_that_does_not_upload_in_time_is_replaced_but_never_during_an_u
     let (writer, tail) = prune_with_writer(&fx).await;
     let sender = fx.sender().await;
     let peer = ClientId::new("peer").unwrap();
-    register_at(&sender, &peer, Some(tail)).await;
+    register_at(&sender, &peer, Some((tail, fx.incarnation))).await;
     let mut events = subscribe(&sender).await;
     register_at(&sender, &ClientId::new("newcomer").unwrap(), None).await;
     assert_eq!(
@@ -1320,6 +1307,59 @@ async fn designee_that_does_not_upload_in_time_is_replaced_but_never_during_an_u
         RoomEvent::SnapshotAvailable(seq(8))
     );
     assert!(!snapshot_wanted(&sender, &peer).await);
+    fx.manager.shutdown_all().await;
+}
+
+/// Commits `ops` as `writer`, which acknowledged everything before them, and acknowledges
+/// the last one.
+async fn commit_and_ack(
+    sender: &mpsc::Sender<RoomCommand>,
+    writer: &ClientId,
+    ops: RangeInclusive<u8>,
+) {
+    let (acked, last) = (seq(u64::from(*ops.start()) - 1), *ops.end());
+    for n in ops {
+        commit(sender, writer, mutation(n), acked, insert_op(n.into()))
+            .await
+            .unwrap();
+    }
+    ack(sender, writer, seq(last.into())).await.unwrap();
+}
+
+// Paused time: only the ack path prunes, and the clock moves only when the test advances it.
+#[tokio::test(start_paused = true)]
+async fn snapshot_upload_in_progress_anchors_pruning_until_it_goes_idle() {
+    let fx = Fixture::new(RoomLifecycleOverrides {
+        lease_timeout_secs: Some(600),
+        ..small_segments()
+    })
+    .await;
+    let sender = fx.sender().await;
+    let writer = ClientId::new("writer").unwrap();
+    register(&sender, &writer).await;
+
+    // An upload that stops receiving chunks no longer holds back pruning.
+    commit_and_ack(&sender, &writer, 1..=4).await;
+    assert!(!upload_chunk(&fx, 4, 0).await);
+    tokio::time::advance(crate::relay::UPLOAD_IDLE_TIMEOUT).await;
+    commit_and_ack(&sender, &writer, 5..=10).await;
+    let tail = metrics(&sender).await.tail_seq;
+    assert!(
+        tail > seq(5),
+        "an idle upload held back pruning (tail {tail})"
+    );
+
+    // An active upload does: the room moves on and acknowledges, and the upload completes.
+    assert!(!upload_chunk(&fx, 10, 0).await);
+    commit_and_ack(&sender, &writer, 11..=16).await;
+    let tail = metrics(&sender).await.tail_seq;
+    assert!(
+        tail <= seq(11),
+        "pruning passed the upload at 10 (tail {tail})"
+    );
+    assert!(!upload_chunk(&fx, 10, 1).await);
+    assert!(upload_chunk(&fx, 10, 2).await);
+    assert_eq!(fx.relay.active_snapshot_seq(&fx.room_id), Some(seq(10)));
     fx.manager.shutdown_all().await;
 }
 
@@ -1357,7 +1397,7 @@ async fn snapshot_demand_survives_a_room_restart() {
     let (fx, writer, tail) = pruned_room().await;
     let sender = fx.sender().await;
     let peer = ClientId::new("peer").unwrap();
-    register_at(&sender, &peer, Some(tail)).await;
+    register_at(&sender, &peer, Some((tail, fx.incarnation))).await;
     register_at(&sender, &ClientId::new("newcomer").unwrap(), None).await;
     assert!(snapshot_wanted(&sender, &writer).await);
 
@@ -1420,13 +1460,14 @@ async fn snapshot_demand_ended_by_a_snapshot_is_not_restored() {
 async fn register_result(
     sender: &mpsc::Sender<RoomCommand>,
     client_id: &ClientId,
-    current_seq: Option<SequenceNumber>,
+    cursor: Option<(SequenceNumber, u128)>,
 ) -> Result<RegisterResponse, ServerError> {
     let (tx, rx) = oneshot::channel();
     sender
         .send(RoomCommand::RegisterClient {
             client_id: client_id.clone(),
-            current_seq,
+            current_seq: cursor.map(|(seq, _)| seq),
+            known_incarnation: cursor.map(|(_, incarnation)| incarnation),
             reply: tx,
         })
         .await
@@ -1495,7 +1536,7 @@ async fn register_with_a_cursor_beyond_the_head_is_rejected_without_touching_the
     }
     ack(&sender, &client, seq(2)).await.unwrap();
 
-    let res = register_result(&sender, &client, Some(seq(500))).await;
+    let res = register_result(&sender, &client, Some((seq(500), fx.incarnation))).await;
     match res {
         Err(ServerError::InvalidSequence { expected, actual }) => {
             assert_eq!(expected, seq(3));
@@ -1506,7 +1547,7 @@ async fn register_with_a_cursor_beyond_the_head_is_rejected_without_touching_the
     assert_eq!(cursor(&sender, &client).await, Some(seq(2)));
 
     let stranger = ClientId::new("stranger").unwrap();
-    let res = register_result(&sender, &stranger, Some(seq(4))).await;
+    let res = register_result(&sender, &stranger, Some((seq(4), fx.incarnation))).await;
     assert!(
         matches!(res, Err(ServerError::InvalidSequence { .. })),
         "{res:?}"
@@ -1515,7 +1556,7 @@ async fn register_with_a_cursor_beyond_the_head_is_rejected_without_touching_the
     assert_eq!(metrics(&sender).await.total_clients, 1);
 
     // The head itself is a valid cursor.
-    register_result(&sender, &stranger, Some(seq(3)))
+    register_result(&sender, &stranger, Some((seq(3), fx.incarnation)))
         .await
         .unwrap();
     fx.manager.shutdown_all().await;
@@ -1560,6 +1601,7 @@ async fn commands_queued_when_the_room_goes_idle_are_handled() {
     });
     let (sender, mut actor) = RoomActor::open(
         fx.room_id.clone(),
+        fx.incarnation,
         SchemaId::new("todo").unwrap(),
         Arc::new(test_schema()),
         fx.dir.path(),
@@ -1577,6 +1619,7 @@ async fn commands_queued_when_the_room_goes_idle_are_handled() {
         .send(RoomCommand::RegisterClient {
             client_id: client.clone(),
             current_seq: None,
+            known_incarnation: None,
             reply: register_tx,
         })
         .await
@@ -1835,6 +1878,45 @@ async fn retries_are_recognised_after_reopening_with_a_zero_dedup_capacity() {
         .unwrap();
 
     assert_eq!(retry.assigned_seq, seq(1));
+    fx.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn the_same_mutation_id_from_two_clients_is_two_mutations() {
+    let fx = Fixture::new(small_segments()).await;
+    let sender = fx.sender().await;
+    let (alice, bob) = (
+        ClientId::new("alice").unwrap(),
+        ClientId::new("bob").unwrap(),
+    );
+    register(&sender, &alice).await;
+    register(&sender, &bob).await;
+    // (client, mutation, row and expected sequence): 1 and 2 end in a sealed segment, with
+    // their ids in its sidecar, and 3 stays in active.wal.
+    let commits = [(&alice, 1, 1), (&bob, 1, 2), (&alice, 3, 3)];
+    for (client, n, row) in commits {
+        let ack = commit(&sender, client, mutation(n), seq(0), insert_op(row))
+            .await
+            .unwrap();
+        assert_eq!(ack.assigned_seq, seq(row as u64));
+    }
+    let synced = sync_all(&sender, &alice).await.unwrap();
+    let ops: Vec<Operation> = synced.ops.into_iter().map(|op| op.op).collect();
+    assert_eq!(ops, [insert_op(1), insert_op(2), insert_op(3)]);
+
+    // Retries get their original sequences, also once the room is reopened from disk.
+    for reopened in [false, true] {
+        if reopened {
+            fx.manager.shutdown_all().await;
+        }
+        let sender = fx.sender().await;
+        for (client, n, row) in commits {
+            let retry = commit(&sender, client, mutation(n), seq(0), insert_op(row))
+                .await
+                .unwrap();
+            assert_eq!(retry.assigned_seq, seq(row as u64), "reopened: {reopened}");
+        }
+    }
     fx.manager.shutdown_all().await;
 }
 
