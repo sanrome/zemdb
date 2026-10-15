@@ -964,12 +964,12 @@ impl RoomActor {
     }
 }
 
-/// Text of a caught panic payload, when it is a string.
 /// Directory of the room `room_id` under the server's `data_dir`.
 pub(crate) fn room_dir(data_dir: &Path, room_id: &RoomId) -> PathBuf {
     data_dir.join("rooms").join(room_id.as_str())
 }
 
+/// Text of a caught panic payload, when it is a string.
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
     panic
         .downcast_ref::<&str>()

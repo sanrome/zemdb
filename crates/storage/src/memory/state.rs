@@ -139,8 +139,9 @@ pub(crate) struct RoomSnapshotRef<'a> {
     pub(crate) tables: &'a HashMap<u16, Table>,
 }
 
-/// Snapshot payload that owns its tables: serialized by compaction and produced by decoding.
-#[derive(Debug, Serialize, Deserialize)]
+/// Snapshot payload that owns its tables, produced by decoding (compaction writes the same
+/// encoding through [`RoomSnapshotRef`]).
+#[derive(Debug, Deserialize)]
 pub(crate) struct RoomSnapshotPayload {
     pub(crate) head_seq: SequenceNumber,
     #[serde(deserialize_with = "deserialize_tables")]

@@ -1,9 +1,9 @@
 # ROADMAP.md: Hoja de Ruta de Implementación de ZemDB
 
 **Proyecto:** `ZemDB` (Motor de Base de Datos Distribuida Local-First)  
-**Fecha de Actualización:** 12 de Octubre de 2026  
-**Documentos Relacionados:** [README.md](README.md) | [ARCHITECTURE.md](ARCHITECTURE.md) | [Auditoría Fase 2](docs/audits/2026-09-fase2-audit.md) | [Propuesta Técnica Fases 2.5, 3 y 4](docs/proposals/2026-09-fase2_5-hardening-proposal.md) | [Plan Fase 3.6](docs/proposals/2026-10-fase3_6-remediation-plan.md) | [Plan Fase 3.7](docs/proposals/2026-10-fase3_7-remediation-plan.md)  
-**Estado:** Hoja de Ruta Oficial de Desarrollo — Fases 1 a 3.7 Completadas / Fases 4 y 5 Planificadas
+**Fecha de Actualización:** 15 de Octubre de 2026  
+**Documentos Relacionados:** [README.md](README.md) | [ARCHITECTURE.md](ARCHITECTURE.md) | [Auditoría Fase 2](docs/audits/2026-09-fase2-audit.md) | [Propuesta Técnica Fases 2.5, 3 y 4](docs/proposals/2026-09-fase2_5-hardening-proposal.md) | [Plan Fase 3.6](docs/proposals/2026-10-fase3_6-remediation-plan.md) | [Plan Fase 3.7](docs/proposals/2026-10-fase3_7-remediation-plan.md) | [Plan Fase 3.8](docs/proposals/2026-10-fase3_8-remediation-plan.md)  
+**Estado:** Hoja de Ruta Oficial de Desarrollo — Fases 1 a 3.8 Completadas / Fases 4 y 5 Planificadas
 
 ---
 
@@ -70,7 +70,7 @@
 * Erradicación del `clone()` incondicional en `TableBuffer::apply` utilizando `self.pending.get_mut(&op.pk)` para verificar existencia previa antes de clonar la clave primaria.
 * Manejo tipado de incompatibilidades en `TableBuffer::apply` retornando `Result<SquashOutcome, BufferError>` (`BufferError::IncompatibleOperation`), evitando el descarte silencioso de mutaciones incompatibles.
 * Desacoplamiento algorítmico formal de squashing: `server_squash_table_operations` / `server_squash_operations` (orden autoritativo de llegada y asignación monotónica de `SequenceNumber` en el secuenciador) frente a `client_squash_table_operations` / `client_squash_operations` (resolución LWW por timestamp para consolidación previa en cliente).
-* Atribución formal de origen en `SequencedOperation`: incorporación de los campos `client_id: ClientId` y `mutation_id: MutationId` con constructores `new` y `with_default_origin` para soporte determinista de Echo Cancellation en el pipeline de sincronización del cliente.
+* Atribución formal de origen en `SequencedOperation`: incorporación de los campos `client_id: ClientId` y `mutation_id: MutationId` con constructores `new` y `with_default_origin` para soporte determinista de Echo Cancellation en el pipeline de sincronización del cliente. (Histórico: esos campos y `with_default_origin` se eliminaron después; hoy `SequencedOperation` es `{ seq, op }`.)
 * Métodos ergonómicos de conversión en `MutationId` (`from_u128`, `From<u128>`) para simplificar la interoperabilidad de identificadores distribuidos.
 * Extensión del contrato de red con `ClientMessage::DeregisterClient`: permite a clientes notificar su desconexión voluntaria para avanzar el cursor de retención `min_ack_seq` en el servidor sin esperar timeouts.
 * Integración del ecosistema `tracing` en el workspace e instrumentación formal de `encode_message` y `decode_message` en `crates/core/src/protocol/codec.rs`.
@@ -119,7 +119,7 @@ ZemDB ha superado con éxito la **Fase 1 y 1.5 (Reestructuración, Blindaje de C
 - Se implementó `DiskStorageEngine` con persistencia en arquitectura Dual-File (`room_{id}.snap` + `room_{id}.wal`), WAL append-only con CRC32, compactación atómica zstd y tolerancia a fallos.
 - Se implementó el servidor `zemdb-server` con arquitectura de actores Tokio (`RoomManager`, `RoomActor`), log inmutable de 4 niveles (`HotBuffer`, `WarmDiskLog`, `ColdDiskLog`), un único WAL por sala (`active.wal`, que en la Fase 3.5-A.3 reemplazó al Micro-WAL) y deduplicación LRU.
 - Se completó el blindaje criptográfico integral del Data Plane mediante el extractor `ClientAuth`, validación de rutas en 3 vías, tiempo constante y leases activos.
-- Las Fases 3.6 y 3.7 cerraron las auditorías posteriores (ver sus planes en `docs/proposals/`): ciclo de vida de clientes derivado del cursor, política de ciclo de vida por sala, relay de snapshots en disco, borde HTTP con límites propios, header del frame WAL con CRC, log del servidor acotado en bytes, validación de snapshots recibidos y squashing de la outbox por orden de llegada.
+- Las Fases 3.6 y 3.7 cerraron las auditorías posteriores (ver sus planes en `docs/proposals/`): ciclo de vida de clientes derivado del cursor, política de ciclo de vida por sala, relay de snapshots en disco, borde HTTP con límites propios, header del frame WAL con CRC, log del servidor acotado en bytes, validación de snapshots recibidos y squashing de la outbox por orden de llegada. La Fase 3.8 cerró la auditoría posterior: respuestas HTTP acotadas en tiempo y memoria, storage que exige un esquema que cubra sus datos, roster y apertura de salas más baratos, contrato del protocolo (encarnación de la sala, dedup por cliente, versión de esquema en las respuestas) y recuperación ante daño en el log.
 
 El proyecto se encuentra ahora en posición para avanzar a las fases de desacoplamiento CoW e I/O asíncrono y construir la sincronización optimista reactiva en el cliente (Fase 4).
 
@@ -270,6 +270,8 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 
 ### 4.3. Servidor de Coordinación: `zemdb-server` (Fase 3)
 
+> Diseño histórico de la Fase 3. El comportamiento vigente del servidor está en [`ARCHITECTURE.md`](ARCHITECTURE.md) (§5 a §7); las fases 3.5 a 3.8 lo cambiaron en varios puntos.
+
 #### 4.3.1. Modularización Física del Crate `zemdb-server`
 * **Separación Reutilizable (`lib.rs` y `main.rs`):**
   - `src/lib.rs`: Biblioteca reutilizable que exporta los actores, la configuración, el relay de snapshots, el registro de esquemas y los handlers HTTP de Axum, permitiendo levantar servidores en memoria o sobre puertos efímeros en tests de integración multi-cliente sin lanzar procesos externos.
@@ -353,7 +355,7 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
     - **Estados del Cliente (`Connected`, `Disconnected`, `Dormant`):**
       - `Connected`: Cliente activo enviando mutaciones/heartbeats en tiempo real.
       - `Disconnected`: Cliente offline o sin conexión temporal, pero con cursor dentro del rango disponible en disco (`last_ack_seq >= tail_seq - 1`). Al reconectarse, descarga los deltas pendientes vía `/sync` y regresa a `Connected` sin requerir snapshot.
-      - `Dormant`: Cliente desconectado tanto tiempo que sus deltas pendientes fueron físicamente purgados por la política de retención (`last_ack_seq < tail_seq - 1`). No frena ninguna poda de disco. Al volver, recibe `ErrorCode::BehindCompaction` y debe solicitar obligatoriamente un snapshot consolidado.
+      - `Dormant`: Cliente desconectado tanto tiempo que sus deltas pendientes fueron físicamente purgados por la política de retención (`last_ack_seq < tail_seq - 1`). No frena ninguna poda de disco. Al volver, su cursor decide: si sigue detrás del log, sus operaciones reciben `ErrorCode::BehindCompaction` y debe restaurar un snapshot.
     - **Fallback por TTL y Cuota:** Descarte final de mutaciones que superen `cold_disk_ttl` o la cuota `max_room_disk_bytes`.
 * **Política de Ciclo de Vida Configurable (`RoomLifecyclePolicy`):**
   - Permite configurar los parámetros de retención según el entorno: `ram_max_ops`, `ram_ttl`, `warm_disk_ttl`, `cold_disk_ttl` y `max_room_disk_bytes`.
@@ -369,7 +371,7 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
   - Rastrea el estado de cada cliente registrado (`Connected`, `Disconnected`, `Dormant`), su cursor `last_ack_seq` y la marca temporal del último heartbeat.
   - **Transición a `Disconnected`:** Al perderse los heartbeats o cerrarse la conexión, el cliente pasa a `Disconnected`. Sus deltas se preservan en disco según las políticas de retención. Si se reconecta antes de que sus deltas sean purgados, realiza catch-up con `/sync` y regresa a `Connected`.
   - **Transición a `Dormant` (Poda y Dead Man's Switch):** Si un cliente permanece desconectado y sus deltas expiran por TTL o cuota, su cursor queda por detrás de los logs disponibles (`last_ack_seq < tail_seq - 1`) y pasa a `Dormant`. En este estado queda excluido del cómputo de retención de log para evitar que bloquee la truncación de disco a sus pares activos.
-  - **Recuperación desde `Dormant` (`BehindCompaction`):** Al reconectarse un cliente `Dormant`, el servidor responde `ErrorCode::BehindCompaction`. El cliente solicita un snapshot consolidado a un par activo (vía relay o P2P), lo aplica localmente, avanza su cursor a la secuencia del snapshot y vuelve a estado `Connected`.
+  - **Recuperación desde `Dormant` (`BehindCompaction`):** Al volver, un cliente `Dormant` con el cursor dentro del log pasa a `Connected`; con el cursor detrás queda `Bootstrapping` y sus syncs y commits reciben `ErrorCode::BehindCompaction` (el heartbeat nunca falla por retención): descarga del relay el snapshot que subió un par, lo aplica y vuelve a `Connected`.
 * **Soporte para Desregistro Voluntario:**
   - Mediante `ClientMessage::DeregisterClient`, un cliente que abandona la sala de forma definitiva o explícita se elimina del roster de miembros de inmediato.
 
@@ -383,13 +385,13 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
   - `GET /admin/rooms/{room_id}`: Métricas de sala (secuencia actual, uso de disco, leases activos).
   - `DELETE /admin/rooms/{room_id}`: Poda o archivado de sala y su WAL.
 * **Data Plane (Endpoints Binarios HTTP/2 de Alto Rendimiento):**
-  - `POST /rooms/{room_id}/register`: Handshake inicial con verificación stateless de `auth_token` (HMAC-SHA256), retorno de `head_seq` y entrega del `Schema` completo en 1 RTT.
+  - `POST /rooms/{room_id}/register`: Handshake inicial con verificación stateless de `auth_token` (BLAKE3 con clave derivada), retorno de `head_seq` y entrega del `Schema` completo en 1 RTT.
   - `POST /rooms/{room_id}/schema`: Consulta bajo demanda del esquema vigente (`GetSchema` -> `Schema`) para refrescos ante migraciones.
   - `POST /rooms/{room_id}/deregister`: Desconexión voluntaria inmediata.
   - `POST /rooms/{room_id}/commit`: Recepción de mutación binaria con `MutationId`, secuenciación y respuesta `CommitAck`.
   - `POST /rooms/{room_id}/sync`: Pull paginado con backpressure según `max_batch_size` a partir de `last_ack_seq`.
   - `POST /rooms/{room_id}/heartbeat`: Notificación de avance de cursor para retención de buffer.
-  - `POST /rooms/{room_id}/snapshot-chunk`: Transferencia de chunks multipart de snapshot para onboarding de salas $> 16\text{ MB}$.
+  - `POST /rooms/{room_id}/snapshot/upload`, `.../snapshot/upload-chunk` y `.../snapshot/chunk`: subida (en un request o en chunks) y descarga en chunks del snapshot para el onboarding.
 * **Canal Server-Sent Events (Signal-Only SSE):**
   - `GET /rooms/{room_id}/events`: Canal unidireccional que emite únicamente señales livianas `Event::HeadAdvanced(head_seq)`, alertando a clientes activos para que soliciten los deltas mediante `/sync`, evitando enviar payloads voluminosos por la conexión SSE.
 * **Manejo de Clientes Rezagados (`BehindCompaction`):**
@@ -468,8 +470,6 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 * **Configuración en `Cargo.toml`:**
   - `default = ["native"]`: Incluye `tokio` (full), `reqwest`, `zemdb-storage/native`.
   - `wasm = ["web-sys", "wasm-bindgen-futures", "gloo-net", "zemdb-storage/wasm"]`: Permite compilar el cliente hacia `wasm32-unknown-unknown` para su ejecución en navegadores sin arrastrar llamadas bloqueantes de sistema operativo.
-* **Abstracción `CryptoConcurrencyBounds`:**
-  - Condicionamiento del trait `CryptoEngine` para que en entornos nativos exija `Send + Sync`, pero en `wasm32-unknown-unknown` relaje las restricciones a `?Send`, permitiendo vincular implementaciones WebCrypto basadas en referencias de JavaScript (`JsValue`).
 
 #### 4.4.3. Fachada Pública Ergonómica del SDK
 API idiomática, tipada y declarativa para aplicaciones en Rust:
@@ -658,16 +658,17 @@ tokio::spawn(async move {
 │ [x] Relay efímero de chunks multipart para snapshots >16MB.                 │
 │ [x] Batería de pruebas de integración concurrentes con múltiples clientes.  │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ FASES 3.5, 3.6 y 3.7: Auditorías y Remediación [COMPLETADAS]                │
+│ FASES 3.5 a 3.8: Auditorías y Remediación [COMPLETADAS]                     │
 │ [x] 3.5: catchup 1-RTT, auth universal, active.wal único, relay multipart.  │
 │ [x] 3.6: ciclo de vida por cursor, política por sala, relay en disco, CI.   │
 │ [x] 3.7: frame WAL con CRC de header, límites HTTP y en bytes, snapshots    │
 │     validados antes de aplicar, squashing por orden de llegada.             │
+│ [x] 3.8: respuestas HTTP acotadas, encarnación de sala, dedup por cliente,  │
+│     versión de esquema, recuperación ante daño en el log, CI con MSRV.      │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ FASE 4: SDK Local-First Reactivo y Sincronización (zemdb-client)            │
 │ [ ] Modularización de crates/client (lib.rs, api/, sync/, transport/).      │
 │ [ ] Feature flags en Cargo.toml: default = ["native"] y wasm = ["web-sys"]. │
-│ [ ] Abstracción CryptoConcurrencyBounds condicional (?Send en wasm32).      │
 │ [ ] Fachada pública ergonómica: ZemdbClient, RoomHandle y TableHandle.      │
 │ [ ] Operaciones declarativas CRUD (insert, update, delete) y ScanOptions.   │
 │ [ ] Sincronización atómica en 1 RTT (Commit con validación y deltas).       │
@@ -739,7 +740,7 @@ La siguiente tabla mapea el origen de cada requerimiento según la recomendació
 | Router y handlers Axum HTTP/2 binarios (`/commit`, `/sync`, etc.) | Arquitectura / Red | `zemdb-server` | **Alta** | ✅ **Completado** |
 | Canal SSE de señalización liviana (`Event::HeadAdvanced`) | Sist. Distribuidos | `zemdb-server` | **Alta** | ✅ **Completado** |
 | Modularización de `zemdb-client` (`api/`, `sync/`, `transport/`) | Arquitectura | `zemdb-client` | **Alta** | ⏳ **Pendiente (Fase 4)** |
-| Feature flags multi-target (`native` vs `wasm`) y `CryptoConcurrencyBounds` | Arquitectura / Rust | `zemdb-client` | **Alta** | ⏳ **Pendiente (Fase 4)** |
+| Feature flags multi-target (`native` vs `wasm`) | Arquitectura / Rust | `zemdb-client` | **Alta** | ⏳ **Pendiente (Fase 4)** |
 | Fachada pública ergonómica (`ZemdbClient`, `RoomHandle`, `TableHandle`) | Arquitectura / Rust | `zemdb-client` | **Alta** | ⏳ **Pendiente (Fase 4)** |
 | Sincronización atómica en 1 RTT (Commit con validación y deltas integrados) | Sist. Distribuidos / DB | `zemdb-client` | **Alta** | ⏳ **Pendiente (Fase 4)** |
 | Persistencia canónica y aplicación directa de deltas en `StorageEngine` | Base de Datos / Arq. | `zemdb-client` | **Alta** | ⏳ **Pendiente (Fase 4)** |

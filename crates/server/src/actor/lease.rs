@@ -48,7 +48,7 @@ impl ClientState {
 ///
 /// `last_heartbeat` is a monotonic `Instant`, which does not survive a restart: the roster
 /// file stores it as the wall-clock time of the client's last activity (see
-/// [`PersistedClient`]).
+/// `PersistedClient`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientEntry {
     pub client_id: ClientId,

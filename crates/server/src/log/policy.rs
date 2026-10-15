@@ -184,7 +184,7 @@ pub struct RoomLifecycleOverrides {
 }
 
 impl RoomLifecycleOverrides {
-    /// Checks every present setting against its range (see [`PolicySetting`]). An invalid
+    /// Checks every present setting against its range (see `PolicySetting`). An invalid
     /// override is the request's fault: `BadRequest`, naming the field.
     pub fn validate(&self) -> Result<(), ServerError> {
         self.check(|setting| format!("lifecycle.{}", setting.field()))

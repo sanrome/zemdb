@@ -27,7 +27,7 @@ use crate::error::ServerError;
 /// `snapshot_available` (sequence of a new usable snapshot). The replies to heartbeats, syncs
 /// and commits remain the source of truth; these events only let foreground clients react
 /// sooner. The stream ends when the room actor stops, the server begins shutting down, or the
-/// same client opens a newer stream for the room that leaves it over [`STREAMS_PER_CLIENT`].
+/// same client opens a newer stream for the room that leaves it over `STREAMS_PER_CLIENT`.
 /// Over `config.sse_stream_limit()` streams in all, a new one is refused with `RateLimited`.
 pub async fn room_events(
     State(state): State<AppState>,

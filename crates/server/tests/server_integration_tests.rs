@@ -176,7 +176,12 @@ async fn control_plane_room_lifecycle() {
 
 #[tokio::test]
 async fn control_plane_room_lifecycle_overrides() {
-    let server = TestServer::start(|_| {}).await;
+    // Server defaults that differ from those of the policy, so the test tells them apart.
+    let server = TestServer::start(|config| {
+        config.lease_timeout_secs = 60;
+        config.snapshot_demand_ttl_secs = 60;
+    })
+    .await;
     server.register_schema("policy-schema", tasks_schema());
     let create = |body: String| {
         server
@@ -234,14 +239,8 @@ async fn control_plane_room_lifecycle_overrides() {
     let effective = &details["lifecycle"];
     assert_eq!(effective["ram_max_ops"], 7);
     assert_eq!(effective["idle_timeout_secs"], 0);
-    assert_eq!(
-        effective["lease_timeout_secs"],
-        server.config.lease_timeout_secs
-    );
-    assert_eq!(
-        effective["snapshot_demand_ttl_secs"],
-        server.config.snapshot_demand_ttl_secs
-    );
+    assert_eq!(effective["lease_timeout_secs"], 60);
+    assert_eq!(effective["snapshot_demand_ttl_secs"], 60);
     assert_eq!(effective["dormant_after_secs"], serde_json::Value::Null);
     assert_eq!(details["head_seq"], 0);
 }

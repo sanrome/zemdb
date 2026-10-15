@@ -11,7 +11,7 @@ pub const MAGIC_BYTES: [u8; 4] = MAGIC;
 /// Current binary format version.
 pub const FORMAT_VERSION: u16 = 1;
 
-/// Fixed file header size (exactly 64 bytes, L1 cache line aligned).
+/// Fixed file header size (exactly 64 bytes).
 pub const HEADER_SIZE: usize = 64;
 
 /// Header of a `.snap` database room snapshot file.

@@ -55,6 +55,7 @@ Se continúa la numeración del plan de la Fase 3.7 (que termina en D52). Se con
 | **D65** | **`DiskStorageEngine::new` valida sus opciones.** Devuelve `Result<Self, StorageError>`: `compaction_ratio` tiene que ser finito y mayor que 0 y `zstd_level` estar en `zstd::compression_level_range()` (el rango real de la librería, con los niveles negativos rápidos); si no, `StorageError::InvalidOptions` (variante nueva). Se valida en el constructor porque los campos de `DiskStorageOptions` son públicos. El doc del builder que decía "1-22" se corrigió. | 2 | Adoptada |
 | **D66** | **El servidor nunca asigna `u64::MAX`.** Así `head_seq + 1` (el tail de un log podado entero) siempre existe y `SequenceNumber::next` y el `+ 1` de `TieredLog::append` no cambian. Un commit con el head en `u64::MAX - 1` es `Internal` antes de escribir nada, y un log que dice tener `u64::MAX` (solo un archivo dañado) es `WalCorruption` al abrir; en `log_meta.json` se comprueba al leerlo, antes de que `SegmentIndex::scan` borre los segmentos que terminan por debajo. En storage, `validate_batch` usa `checked_add`: sin siguiente número, `SequenceMismatch`. El replay del WAL ya era seguro: salta las operaciones `<= head_seq` antes de calcular `head_seq + 1`, así que nunca suma sobre `u64::MAX`. | 5 | Adoptada |
 | **D67** | **Comprobar si un archivo existe propaga el error.** `durable::exists(path)` (fail point `exists` y `try_exists`) reemplaza a `Path::exists` en los sitios de la auditoría: `cold_disk` (1), `warm_disk` (3) y `manager` (4; `room_exists` pasa a devolver `Result<bool>`). `schema_registry` usa `fs::metadata(&path)?.is_file()` (sigue los symlinks, como antes). En el manager las comprobaciones corren en `blocking_io`, y `delete_room` llama directamente a `remove_dir_all` y traduce `NotFound` a `RoomNotFound`. Sin `disallowed-methods` en clippy: los tests usan `.exists()` decenas de veces y storage tampoco lo tiene. El `is_dir` de `create_dir_all_synced` queda: un error ahí aparece al crear el directorio. | 5 | Adoptada |
+| **D68** | **CI de MSRV, clippy en wasm32 y rustdoc.** Un job en ubuntu con una matriz de dos toolchains, cada uno con su caché: con 1.85.0, `cargo build --workspace --lib --bins`; con 1.88.0, `cargo test --workspace` (verificado antes de adoptarlo: el MSRV declarado, `rust-version` y el README, no cambia; los toolchains se fijan solo en la CI). El job wasm suma `cargo clippy --target wasm32-unknown-unknown -p zemdb-core -p zemdb-storage -p zemdb-client -- -D warnings`. Un job `Docs` corre `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`; los links a ítems privados (8, no 7: el Lote 1 sumó `STREAMS_PER_CLIENT` en `sse.rs`) pierden los corchetes en lugar de volver públicos los ítems. | 6 | Adoptada |
 
 ---
 
@@ -67,9 +68,9 @@ Se continúa la numeración del plan de la Fase 3.7 (que termina en D52). Se con
 | 3 | Costo del roster y de abrir salas | DEF-117, 121, 122, 131 | Alta | ✅ 4/4 |
 | 4 | Contrato del protocolo | DEF-118, 123, 127, 126 | Media (requisito de Fase 4) | ✅ 4/4 |
 | 5 | Huecos del log y robustez del servidor | DEF-119, 120, 128, 125, 132, 143 | Media | ✅ 6/6 |
-| 6 | Tests, documentación y CI | DEF-134, 140, 135, 136, 137, 138, 142, 139 | Baja | ⬜ 0/8 |
+| 6 | Tests, documentación y CI | DEF-134, 140, 135, 136, 137, 138, 142, 139 | Baja | ✅ 8/8 |
 
-**Avance total:** 21 de 29 ítems (DEF-143 surgió en la revisión del Lote 2).
+**Avance total:** 29 de 29 ítems (DEF-143 surgió en la revisión del Lote 2).
 
 **Por qué este orden, en una línea por lote:**
 1. Es el único Alto y afecta al único binario desplegable; lo dispara cualquier miembro con un token válido.
@@ -279,44 +280,52 @@ Se continúa la numeración del plan de la Fase 3.7 (que termina en D52). Se con
 
 > Objetivo: tests que prueben lo que dicen, documentación que coincida con el código después de los lotes anteriores, y una CI que verifique lo que el proyecto declara.
 
-#### DEF-134 · Bajo · ⬜ Pendiente
+#### DEF-134 · Bajo · ✅ Hecho
 **Problema.** Ningún test comprueba que la compresión a cold corra fuera del worker. El refactor de calidad borró el test que lo prometía sin probarlo, pero el hueco sigue.
 **Solución.** Un fail point en `compress_warm_segment_sync` registra el `ThreadId`; un test nuevo, con runtime `current_thread`, comprueba que es distinto del suyo.
+**Hecho.** Hook `compress_warm_segment` en `compress_warm_segment_sync` (con el `arm_hook` existente). Test: `compression_runs_off_the_runtime_thread` (`log/tests/tiered_log.rs`), que corre el mantenimiento en el runtime `current_thread` de `run_maintenance_sync`. Falla con el mutante que comprime inline.
 **Test exigido.** El propio test, que tiene que fallar si se comprime inline (el mutante de la auditoría).
 
-#### DEF-140 · Bajo · ⬜ Pendiente
+#### DEF-140 · Bajo · ✅ Hecho
 **Problema.** `control_plane_room_lifecycle_overrides` compara la política efectiva contra una config igual a los defaults de la política, así que no detecta que la config del servidor se ignore (debilitado por los fixtures compartidos del refactor).
 **Solución.** Arrancar el test con `TestServer::start(|c| { c.lease_timeout_secs = 60; c.snapshot_demand_ttl_secs = 60; })` y comparar contra los literales.
+**Hecho.** `control_plane_room_lifecycle_overrides` arranca con `lease_timeout_secs = 60` y `snapshot_demand_ttl_secs = 60` y compara contra los literales. Falla con `RoomLifecyclePolicy::default()` en `RoomManager::new`.
 **Test exigido.** El propio test, que tiene que fallar si `RoomManager` usa `RoomLifecyclePolicy::default()` en lugar de `config.default_lifecycle_policy()`.
 
-#### DEF-135 · Bajo · ⬜ Pendiente
+#### DEF-135 · Bajo · ✅ Hecho
 **Problema.** `ROADMAP.md` contradice el código (HMAC-SHA256, `/snapshot-chunk`, `Dormant` → `BehindCompaction`, `CryptoConcurrencyBounds` pendiente).
 **Solución.** Corregir esas líneas y marcar §4.3 como diseño histórico que remite a `ARCHITECTURE.md`. Agregar la Fase 3.8 al encabezado y al cronograma.
+**Hecho.** `ROADMAP.md`: la verificación de tokens es BLAKE3 con clave derivada; los endpoints del relay son `/snapshot/upload`, `/snapshot/upload-chunk` y `/snapshot/chunk`; `CryptoConcurrencyBounds` sale de la Fase 4, donde figuraba como pendiente (existe en `zemdb-core` y la Fase 2.8 ya lo daba por hecho); un `Dormant` que vuelve con el cursor detrás queda `Bootstrapping` y restaura el snapshot del relay. §4.3 lleva una nota de diseño histórico que remite a `ARCHITECTURE.md`, y la Fase 3.8 está en el encabezado, el resumen y el cronograma.
 **Test exigido.** Ninguno (documentación). Revisión cruzada contra el código.
 
-#### DEF-136 · Bajo · ⬜ Pendiente
+#### DEF-136 · Bajo · ✅ Hecho
 **Problema.** `ARCHITECTURE.md:355` promete portabilidad total de snapshots sin la salvedad de Zstd en wasm32.
 **Solución.** Agregar la limitación en §8, con referencia a la Fase 4 (DEF-54, diferido).
+**Hecho.** `ARCHITECTURE.md` §8 (*Universal Canonical Snapshot Envelope*): wasm32 escribe snapshots sin comprimir y rechaza los Zstd, con la Fase 4 como plazo; deja de decir "100% portability".
 **Test exigido.** Ninguno.
 
-#### DEF-137 · Bajo · ⬜ Pendiente
+#### DEF-137 · Bajo · ✅ Hecho
 **Problema.** Quedan afirmaciones sobre la línea de caché en `core/src/value/row.rs:12` y `storage/src/disk/format.rs:14`.
 **Solución.** Dejar solo los tamaños. De paso, cerrar los residuos de los reportes de calidad que siguen abiertos: `mutation/op.rs:60` ("zero heap pointers"), `wal_frame.rs:66` ("little-endian" para el magic) y los tres comentarios desactualizados en tests.
+**Hecho.** `row.rs` y `format.rs` dicen solo los tamaños. Los demás residuos ya estaban corregidos: `op.rs` dice "88 bytes" sin "zero heap pointers", el magic de `wal_frame.rs` es `[0xBA, 0x7C]` sin "little-endian", y los comentarios desactualizados de tests que listaban los informes de calidad (`room_actor_tests` con `Unauthorized` y "u64::MAX or 999", el de `spawn_blocking` en `tiered_log_tests`, y los de `storage/tests`) ya no existen. La auditoría no los nombra; son los del informe de calidad de `server/tests`, ya corregidos.
 **Test exigido.** Ninguno.
 
-#### DEF-138 · Bajo · ⬜ Pendiente
+#### DEF-138 · Bajo · ✅ Hecho
 **Problema.** La doc pública enlaza a 7 ítems privados (uno nuevo del refactor: `compactor::compact_room_cow` en `disk/mod.rs`).
 **Solución.** Quitar los corchetes (o hacer públicos los ítems si corresponde) y agregar a la CI `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps`.
+**Hecho.** D68. Los 8 links quedan como nombres en backticks; `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` pasa limpio.
 **Test exigido.** El paso nuevo de la CI en verde.
 
-#### DEF-142 · Bajo · ⬜ Pendiente
+#### DEF-142 · Bajo · ✅ Hecho
 **Problema.** Documentación que el refactor dejó desactualizada: el doc de `RoomSnapshotPayload` (`storage/src/memory/state.rs`) dice que lo serializa la compactación; `ARCHITECTURE.md:26` lista `as_slice()`, que ya no existe; en `server/src/actor/room.rs` el comentario de `panic_message` quedó arriba de `room_dir`; `ROADMAP.md:73` menciona `with_default_origin`.
 **Solución.** Corregir el doc de `RoomSnapshotPayload` y quitarle el `Serialize` que ya no se usa; `as_slice()` → `values()`; devolver el comentario a `panic_message`; anotar en el ROADMAP que `with_default_origin` se eliminó.
+**Hecho.** `RoomSnapshotPayload` solo deriva `Deserialize`, con el doc corregido (la compactación escribe con `RoomSnapshotRef`); `cargo build --workspace --all-targets` compila. `ARCHITECTURE.md` cita `values()` en lugar de `as_slice()`; el comentario volvió a `panic_message`; `ROADMAP.md` anota que `with_default_origin` y los campos de origen de `SequencedOperation` se eliminaron.
 **Test exigido.** Ninguno. `cargo build --workspace --all-targets` verifica que nada serialice `RoomSnapshotPayload`.
 
-#### DEF-139 · Bajo · ⬜ Pendiente
+#### DEF-139 · Bajo · ✅ Hecho
 **Problema.** La CI no verifica el MSRV declarado ni corre clippy sobre wasm32.
 **Solución.** Un job con 1.85 (`cargo build --workspace --lib --bins`) y otro con 1.88 (`cargo test --workspace`); en el job wasm, `cargo clippy --target wasm32-unknown-unknown -p zemdb-core -p zemdb-storage -p zemdb-client -- -D warnings`.
+**Hecho.** D68. Verificado localmente: `cargo +1.85.0 build --workspace --lib --bins` y `cargo +1.88.0 test --workspace` (715 tests) pasan, y clippy en wasm32 está limpio. El README aclara que la CI comprueba las dos versiones.
 **Test exigido.** Los jobs nuevos en verde. Si los lotes anteriores subieron el MSRV real, actualizar `rust-version` y el README en el mismo commit.
 
 ---

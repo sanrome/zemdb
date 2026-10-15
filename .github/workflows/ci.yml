@@ -50,5 +50,38 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p zemdb-core -p zemdb-storage -p zemdb-client --target wasm32-unknown-unknown
+      - run: cargo clippy -p zemdb-core -p zemdb-storage -p zemdb-client --target wasm32-unknown-unknown -- -D warnings
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    name: MSRV (Rust ${{ matrix.toolchain }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # The declared rust-version builds the crates; the tests' dev-dependencies need 1.88.
+        include:
+          - toolchain: 1.85.0
+            command: cargo build --workspace --lib --bins
+          - toolchain: 1.88.0
+            command: cargo test --workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+      - run: ${{ matrix.command }}

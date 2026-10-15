@@ -454,7 +454,7 @@ impl RoomManager {
         true
     }
 
-    /// Gracefully shuts down all active room actors, up to [`SHUTDOWN_CONCURRENCY`] at once,
+    /// Gracefully shuts down all active room actors, up to `SHUTDOWN_CONCURRENCY` at once,
     /// awaiting task terminations.
     pub async fn shutdown_all(&self) {
         let room_ids: Vec<RoomId> = self.rooms.iter().map(|kv| kv.key().clone()).collect();

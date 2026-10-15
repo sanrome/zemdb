@@ -231,7 +231,7 @@ pub(crate) struct DiskRoom {
 /// - `room_{id}.wal`: the append-only WAL of batches since that snapshot, each framed with
 ///   `0xBA7C` and a CRC32.
 ///
-/// See [`DiskRoom`] for the locking of an open room and [`compactor::compact_room_cow`] for how
+/// See `DiskRoom` for the locking of an open room and `compactor::compact_room_cow` for how
 /// the WAL is folded into a new snapshot.
 #[derive(Debug, Clone)]
 pub struct DiskStorageEngine {
@@ -634,7 +634,7 @@ impl StorageEngine for DiskStorageEngine {
     /// writers keep going meanwhile; the head sequence is checked again under the WAL mutex
     /// before the file is installed. The snapshot is made durable before memory changes, so
     /// readers keep seeing the previous state until the new one is on disk. See
-    /// [`install_applied_snapshot`] for the crash windows of replacing the files.
+    /// `install_applied_snapshot` for the crash windows of replacing the files.
     #[tracing::instrument(skip(self, schema, snapshot), fields(room_id = %room_id, snapshot_size = snapshot.len()))]
     async fn apply_snapshot(
         &self,

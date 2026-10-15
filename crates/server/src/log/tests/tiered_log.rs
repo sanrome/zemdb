@@ -724,6 +724,22 @@ fn quota_pruning_stops_at_the_first_segment_it_keeps() {
 }
 
 #[test]
+fn compression_runs_off_the_runtime_thread() {
+    let dir = tempdir().unwrap();
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
+    append_range(&mut log, 1, 7);
+    let warm = segment_file(&segments_dir(dir.path()), 1, 5, "wal");
+    let (tx, rx) = std::sync::mpsc::channel();
+    crate::fail_point::arm_hook("compress_warm_segment", &warm, move || {
+        tx.send(std::thread::current().id()).unwrap();
+    });
+
+    // A current-thread runtime on this thread: compressing inline would run here.
+    assert_eq!(log.run_maintenance_sync().unwrap().warm_compressed_count, 1);
+    assert_ne!(rx.try_recv().unwrap(), std::thread::current().id());
+}
+
+#[test]
 fn failed_compression_does_not_skip_expiry() {
     let dir = tempdir().unwrap();
     let policy = RoomLifecyclePolicy {

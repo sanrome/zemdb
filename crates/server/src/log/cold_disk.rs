@@ -54,6 +54,7 @@ impl ColdDiskLog {
         warm_path: &Path,
         cold_path: &Path,
     ) -> Result<CompressedSegment, ServerError> {
+        fail_point::hook("compress_warm_segment", warm_path);
         if !durable::exists(warm_path)? {
             return Err(ServerError::Wal(format!(
                 "Cannot compress non-existent warm segment: {:?}",

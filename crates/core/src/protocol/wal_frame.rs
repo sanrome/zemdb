@@ -301,7 +301,7 @@ const MAX_PAYLOAD_CHECKS: usize = 16;
 /// Finds the first complete valid frame (magic, header checksum and payload checksum) that
 /// starts at or after `from` and ends at or before `end`, and returns where it starts.
 ///
-/// After [`MAX_PAYLOAD_CHECKS`] payloads that do not match their checksum, the next frame whose
+/// After `MAX_PAYLOAD_CHECKS` payloads that do not match their checksum, the next frame whose
 /// header is valid is returned without checking its payload. That can only turn a torn write
 /// into corruption, which stops recovery without truncating anything.
 ///

@@ -9,7 +9,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 
-/// Primary key values, inline up to one value (40 bytes, fits a cache line).
+/// Primary key values, inline up to one value (40 bytes).
 ///
 /// Deserialization rejects more than [`MAX_COLUMNS`] values, counted as they are decoded.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]

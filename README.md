@@ -46,7 +46,7 @@ zemdb/
 ## 🚀 Quickstart & Verification
 
 ### Prerequisites
-* Rust 1.85+ to build (2021 Edition); 1.88+ to run the tests, whose dev-dependencies need it
+* Rust 1.85+ to build (2021 Edition); 1.88+ to run the tests, whose dev-dependencies need it (CI checks both)
 * Cargo
 
 ### Running the Server
