@@ -116,6 +116,8 @@ pub struct TieredLog {
     failed_compressions: HashMap<SequenceNumber, u64>,
     /// Maintenance passes run since the log was opened.
     maintenance_passes: u64,
+    /// Warm copies of compressed segments whose removal failed; every pass retries it.
+    undeleted_warm: Vec<PathBuf>,
     head_seq: SequenceNumber,
     tail_seq: SequenceNumber,
     pruned_through_seq: SequenceNumber,
@@ -154,7 +156,7 @@ impl TieredLog {
         let lock = lock_log(&dir)?;
 
         let pruned_through_seq = read_pruned_through_seq(&dir)?;
-        let segments = SegmentIndex::scan(&segments_dir)?;
+        let segments = SegmentIndex::scan(&segments_dir, pruned_through_seq)?;
         let (warm_disk, active) = WarmDiskLog::open_recovering(&segments_dir)?;
 
         let head_seq = [
@@ -166,6 +168,13 @@ impl TieredLog {
         .flatten()
         .max()
         .unwrap_or(pruned_through_seq);
+        // No room assigns u64::MAX (see `RoomActor::commit`), so only damaged files claim it
+        // (here a segment name or `active.wal`; `log_meta.json` was checked when it was read).
+        if head_seq.get() == u64::MAX {
+            return Err(ServerError::WalCorruption(
+                "The log claims sequence number u64::MAX".to_string(),
+            ));
+        }
 
         let (ops, mutations) = read_newest(&segments, active, dedup_window)?;
         let mutations = newest_distinct(mutations, dedup_window);
@@ -183,6 +192,7 @@ impl TieredLog {
             segments,
             failed_compressions: HashMap::new(),
             maintenance_passes: 0,
+            undeleted_warm: Vec::new(),
             head_seq,
             tail_seq: head_seq.next(),
             pruned_through_seq,
@@ -419,8 +429,9 @@ impl TieredLog {
             tracing::warn!(
                 path = ?segment.path,
                 error = %err,
-                "Warm segment compressed, but removing it failed; the next open removes the duplicate"
+                "Warm segment compressed, but removing it failed; maintenance retries"
             );
+            self.undeleted_warm.push(segment.path.clone());
         }
         self.mark_compressed(segment, cold_path, compressed.bytes, clock.wall);
         report.warm_compressed_count += 1;
@@ -464,8 +475,9 @@ impl TieredLog {
         });
     }
 
-    /// Applies the RAM TTL window and prunes the oldest cold segments while they are past
-    /// `cold_disk_ttl` or the log is over `max_room_disk_bytes`.
+    /// Applies the RAM TTL window, retries removing the warm copies of compressed segments and
+    /// prunes the oldest cold segments while they are past `cold_disk_ttl` or the log is over
+    /// `max_room_disk_bytes`.
     ///
     /// Every operation in RAM is also on disk, and retention is defined by the disk tiers
     /// alone, so evicting expired operations from RAM never moves `tail_seq`.
@@ -476,6 +488,14 @@ impl TieredLog {
     ) -> Result<(), ServerError> {
         self.hot_buffer
             .apply_sliding_window_at(&self.policy, clock.mono);
+        self.undeleted_warm.retain(|path| {
+            let removed =
+                durable::remove_file_if_exists(path).and_then(|()| durable::sync_parent(path));
+            if let Err(err) = &removed {
+                tracing::warn!(path = ?path, error = %err, "Removing a warm segment failed again");
+            }
+            removed.is_err()
+        });
 
         // Only a prefix of the log is ever pruned, so the retained range stays contiguous.
         let mut disk_bytes = self.disk_bytes();
@@ -831,6 +851,13 @@ fn read_pruned_through_seq(dir: &Path) -> Result<SequenceNumber, ServerError> {
     let meta: LogMeta = serde_json::from_slice(&bytes).map_err(|e| {
         ServerError::WalCorruption(format!("Unreadable log metadata {:?}: {}", path, e))
     })?;
+    // Checked before opening uses it: every segment ends at or below it, so the scan would
+    // delete them all.
+    if meta.pruned_through_seq == u64::MAX {
+        return Err(ServerError::WalCorruption(format!(
+            "Log metadata {path:?} claims sequence number u64::MAX"
+        )));
+    }
     Ok(SequenceNumber::new(meta.pruned_through_seq))
 }
 

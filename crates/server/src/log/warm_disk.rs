@@ -76,7 +76,7 @@ impl WarmDiskLog {
         let active_path = self.active_path();
 
         if self.active_file.is_none() {
-            let created = !active_path.exists();
+            let created = !durable::exists(&active_path)?;
             let file = open_active_locked(&active_path, true)?;
             // A file left behind by a failed rotation still holds its records; append after them.
             self.active_len = file.metadata()?.len();
@@ -167,7 +167,7 @@ impl WarmDiskLog {
         let active_path = self.active_path();
         let sealed_path = segment_path(&self.segments_dir, start, end, Tier::Warm);
 
-        let renamed = active_path.exists();
+        let renamed = durable::exists(&active_path)?;
         if renamed {
             std::fs::rename(&active_path, &sealed_path)?;
         }
@@ -225,7 +225,7 @@ impl WarmDiskLog {
     /// that later appends use, and returns its operations and mutation IDs.
     fn inspect_active_segment(&mut self) -> Result<RecoveredLogData, ServerError> {
         let active_path = self.active_path();
-        if !active_path.exists() {
+        if !durable::exists(&active_path)? {
             return Ok(Default::default());
         }
 

@@ -18,7 +18,7 @@ fn scan_indexes_both_tiers_in_sequence_order_and_ignores_other_files() {
     std::fs::write(dir.path().join("active.wal"), [0u8; 40]).unwrap();
     std::fs::write(dir.path().join("segment_garbage.wal"), [0u8; 80]).unwrap();
 
-    let index = SegmentIndex::scan(dir.path()).unwrap();
+    let index = SegmentIndex::scan(dir.path(), SequenceNumber::new(0)).unwrap();
 
     let segments: Vec<(u64, u64, Tier, u64)> = index
         .iter()
@@ -44,7 +44,7 @@ fn scan_fails_when_removing_a_leftover_is_not_durable() {
     .unwrap();
 
     crate::fail_point::arm("sync_dir", dir.path());
-    assert!(SegmentIndex::scan(dir.path()).is_err());
+    assert!(SegmentIndex::scan(dir.path(), SequenceNumber::new(0)).is_err());
 }
 
 #[test]

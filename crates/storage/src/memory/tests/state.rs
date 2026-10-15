@@ -2,6 +2,7 @@ use super::*;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use zemdb_core::{DataType, TableSchema};
 
 /// The snapshot payload as written while tables were `Arc<BTreeMap>`.
 #[derive(Serialize)]
@@ -52,4 +53,27 @@ fn snapshot_written_with_btree_tables_decodes() {
     assert_eq!(payload.head_seq, SequenceNumber::from(200u64));
     let expected: Table = rows().into_iter().collect();
     assert_eq!(payload.tables[&0], expected);
+}
+
+#[test]
+fn batch_past_the_last_sequence_number_is_a_mismatch() {
+    let room_id = RoomId::new("room").unwrap();
+    let schema = Schema::builder()
+        .table(TableSchema::builder("t").primary_key("id", DataType::Int))
+        .build();
+    let op = |seq: u64| {
+        let row = CompactRow::new(vec![Value::Int(1)]);
+        SequencedOperation::new(seq, Operation::insert(0, PrimaryKey::single(1i64), row, 0))
+    };
+    for (head, seqs) in [
+        (u64::MAX, vec![u64::MAX]),
+        (u64::MAX - 1, vec![u64::MAX, u64::MAX]),
+    ] {
+        let ops: Vec<_> = seqs.into_iter().map(op).collect();
+        let result = validate_batch(&room_id, &schema, SequenceNumber::from(head), &ops);
+        assert!(
+            matches!(result, Err(StorageError::SequenceMismatch { .. })),
+            "{result:?}"
+        );
+    }
 }

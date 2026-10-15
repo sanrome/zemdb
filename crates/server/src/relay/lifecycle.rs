@@ -13,6 +13,7 @@ use super::files::{
 use super::types::EXPIRY_SWEEP_PERIOD;
 use super::{RoomSlot, SnapshotRelay};
 use crate::error::ServerError;
+use crate::fail_point;
 
 impl SnapshotRelay {
     /// Deletes everything the relay holds for a room: its active snapshot and its upload in
@@ -31,6 +32,7 @@ impl SnapshotRelay {
         let room = room_id.clone();
         let (uploads_dir, snapshots_dir) = (self.uploads_dir.clone(), self.snapshots_dir.clone());
         run_blocking(move || {
+            fail_point::hook("relay_purge_room_files", &snapshots_dir);
             remove_room_files(&snapshots_dir, &room, |name| {
                 parse_snapshot_file_name(name).map(|(r, _, _)| r)
             })?;

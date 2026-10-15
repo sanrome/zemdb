@@ -206,7 +206,8 @@ async fn control_plane_room_lifecycle_overrides() {
     }
     assert!(!server
         .room_manager
-        .room_exists(&RoomId::new("room-policy").unwrap()));
+        .room_exists(&RoomId::new("room-policy").unwrap())
+        .unwrap());
 
     let resp = create(
         r#"{"room_id": "room-policy", "schema_id": "policy-schema",
@@ -790,7 +791,8 @@ async fn admin_get_room_non_existent_returns_404_without_spawning() {
     assert!(
         !server
             .room_manager
-            .room_exists(&RoomId::new(ghost_id).unwrap()),
+            .room_exists(&RoomId::new(ghost_id).unwrap())
+            .unwrap(),
         "Room should not exist in room manager"
     );
 }

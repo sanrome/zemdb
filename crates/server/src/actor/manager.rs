@@ -361,7 +361,9 @@ impl RoomManager {
             return Ok(Some(meta.clone()));
         }
         let path = room_dir(&self.data_dir, room_id).join(META_ROOM_FILE);
-        path.exists().then(|| read_room_metadata(&path)).transpose()
+        durable::exists(&path)?
+            .then(|| read_room_metadata(&path))
+            .transpose()
     }
 
     /// Opens the room with its effective lifecycle policy (the server defaults overlaid with
@@ -410,11 +412,11 @@ impl RoomManager {
     }
 
     /// Fast check if a room exists in memory or on disk.
-    pub fn room_exists(&self, room_id: &RoomId) -> bool {
-        self.rooms.contains_key(room_id)
-            || room_dir(&self.data_dir, room_id)
-                .join(META_ROOM_FILE)
-                .exists()
+    pub fn room_exists(&self, room_id: &RoomId) -> Result<bool, ServerError> {
+        Ok(self.rooms.contains_key(room_id)
+            || blocking_io(|| {
+                durable::exists(&room_dir(&self.data_dir, room_id).join(META_ROOM_FILE))
+            })?)
     }
 
     /// The lifecycle overrides of a room, cached or read from its `meta_room.json`, under the
@@ -491,7 +493,7 @@ impl RoomManager {
         let room_dir = room_dir(&self.data_dir, &room_id);
         let meta_room_path = room_dir.join(META_ROOM_FILE);
 
-        if meta_room_path.exists() || self.rooms.contains_key(&room_id) {
+        if self.rooms.contains_key(&room_id) || blocking_io(|| durable::exists(&meta_room_path))? {
             return Err(ServerError::RoomAlreadyExists(room_id.to_string()));
         }
 
@@ -522,6 +524,9 @@ impl RoomManager {
     }
 
     /// Deletes a room: shuts down its actor and removes the room directory from disk.
+    ///
+    /// Not safe to cancel: dropped while the relay purges the room's snapshot, it leaves the
+    /// room in place without it. A caller that may be cancelled runs it in a task of its own.
     pub async fn delete_room(&self, room_id: &RoomId) -> Result<(), ServerError> {
         let _guard = self.lock_room(room_id).await;
 
@@ -531,11 +536,11 @@ impl RoomManager {
         self.snapshot_relay.purge_room(room_id).await?;
 
         let room_dir = room_dir(&self.data_dir, room_id);
-        if room_dir.exists() {
-            blocking_io(|| fs::remove_dir_all(&room_dir))?;
-            Ok(())
-        } else {
-            Err(ServerError::RoomNotFound(room_id.to_string()))
+        match blocking_io(|| fs::remove_dir_all(&room_dir)) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Err(ServerError::RoomNotFound(room_id.to_string()))
+            }
+            result => Ok(result?),
         }
     }
 

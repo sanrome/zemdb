@@ -67,13 +67,33 @@ async fn interrupted_room_creation_leaves_no_room() {
         .create_room(room_id.clone(), SchemaId::new("first").unwrap(), None)
         .await;
     assert!(res.is_err(), "the interrupted metadata write must fail");
-    assert!(!manager.room_exists(&room_id));
+    assert!(!manager.room_exists(&room_id).unwrap());
 
     manager
         .create_room(room_id.clone(), SchemaId::new("first").unwrap(), None)
         .await
         .unwrap();
     manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn failure_to_check_for_meta_room_does_not_create_the_room_again() {
+    let dir = tempdir().unwrap();
+    let room_id = RoomId::new("room-c").unwrap();
+    let first = SchemaId::new("first").unwrap();
+    let manager = new_manager(&dir);
+    manager
+        .create_room(room_id.clone(), first.clone(), None)
+        .await
+        .unwrap();
+    manager.shutdown_all().await;
+    let meta_path = meta_room_path(&dir, &room_id);
+    let stored = fs::read(&meta_path).unwrap();
+
+    let manager = new_manager(&dir);
+    fail_point::arm("exists", &meta_path);
+    assert!(manager.create_room(room_id, first, None).await.is_err());
+    assert_eq!(fs::read(&meta_path).unwrap(), stored);
 }
 
 #[tokio::test]
@@ -413,7 +433,7 @@ async fn invalid_overrides_are_rejected_before_creating_the_room() {
         )
         .await;
     assert!(matches!(res, Err(ServerError::BadRequest(_))), "{res:?}");
-    assert!(!manager.room_exists(&room_id));
+    assert!(!manager.room_exists(&room_id).unwrap());
     assert!(!room_dir(&dir, &room_id).exists());
 }
 

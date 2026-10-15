@@ -32,9 +32,9 @@ pub struct CompressedSegment {
     /// Size of the cold segment.
     pub bytes: u64,
     /// Set when removing the warm original, or making its removal durable, failed. The cold
-    /// segment replaces the warm one all the same. A warm file that is still there (or comes
-    /// back after a crash) is found next to its cold copy the next time the log opens, which
-    /// keeps the warm one and compresses it again.
+    /// segment replaces the warm one all the same, and every maintenance pass retries the
+    /// removal. A warm file still there when the log opens replaces its cold copy (compressed
+    /// again later), or is removed if that range was already pruned.
     pub cleanup_error: Option<ServerError>,
 }
 
@@ -54,7 +54,7 @@ impl ColdDiskLog {
         warm_path: &Path,
         cold_path: &Path,
     ) -> Result<CompressedSegment, ServerError> {
-        if !warm_path.exists() {
+        if !durable::exists(warm_path)? {
             return Err(ServerError::Wal(format!(
                 "Cannot compress non-existent warm segment: {:?}",
                 warm_path
@@ -92,7 +92,7 @@ impl ColdDiskLog {
         }
         let bytes = std::fs::metadata(cold_path)?.len();
 
-        let cleanup = std::fs::remove_file(warm_path)
+        let cleanup = durable::remove_file_if_exists(warm_path)
             .map_err(ServerError::from)
             .and_then(|()| fail_point::check("compress_after_warm_removed", warm_path))
             .and_then(|()| durable::sync_parent(warm_path).map_err(ServerError::from));

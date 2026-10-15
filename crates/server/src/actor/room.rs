@@ -110,6 +110,9 @@ pub struct RoomActor {
     demand_persistence_granularity: Duration,
     /// The last usable snapshot announced to SSE subscribers.
     announced_snapshot: Option<SequenceNumber>,
+    /// A snapshot that cannot be restored because the log has a gap after it: it is no longer
+    /// usable, so it is replaced by a new upload.
+    unrestorable_snapshot: Option<SequenceNumber>,
     timings: ActorTimings,
 }
 
@@ -207,6 +210,7 @@ impl RoomActor {
             snapshot_demand,
             demand_persistence_granularity: persistence_granularity(demand_ttl),
             announced_snapshot: None,
+            unrestorable_snapshot: None,
             timings,
         };
         // A snapshot that was already usable before this actor started is not news.
@@ -530,6 +534,13 @@ impl RoomActor {
             .validate_operation(&op)
             .map_err(|err| ServerError::SchemaViolation(err.to_string()))?;
 
+        // The room never assigns u64::MAX, so that `head_seq + 1` always exists.
+        if self.head_seq.get() >= u64::MAX - 1 {
+            return Err(ServerError::Internal(format!(
+                "Room {} has no sequence numbers left",
+                self.room_id
+            )));
+        }
         // The new sequence stays local until the append succeeds.
         let new_seq = self.head_seq.next();
         let seq_op = SequencedOperation::new(new_seq, op);
@@ -650,8 +661,12 @@ impl RoomActor {
             Err(e) => {
                 // The range starts inside the retained log, yet the log cannot serve it (a
                 // gap). No client can catch up through it, so the client this answer sends
-                // to bootstrap needs a snapshot whatever its cursor says.
+                // to bootstrap needs a snapshot whatever its cursor says, and a snapshot at
+                // or below the cursor, restored, would run into the same gap.
                 if matches!(e, ServerError::BehindCompaction) {
+                    if let Some(seq) = self.usable_snapshot_seq().filter(|seq| *seq <= from_seq) {
+                        self.unrestorable_snapshot = Some(seq);
+                    }
                     self.request_snapshot();
                 }
                 return Err(e);
@@ -762,12 +777,14 @@ impl RoomActor {
     }
 
     /// The relay's active snapshot, only if a client restoring it can catch up from the
-    /// retained log (`tail_seq - 1 <= seq <= head_seq`). The relay checks the range when it
-    /// accepts a snapshot, but TTL and size compaction move the range on afterwards.
+    /// retained log (`tail_seq - 1 <= seq <= head_seq`) and no gap was found after it. The
+    /// relay checks the range when it accepts a snapshot, but TTL and size compaction move the
+    /// range on afterwards.
     fn usable_snapshot_seq(&self) -> Option<SequenceNumber> {
         let tail_seq = self.tiered_log.tail_seq();
         self.snapshot_relay
             .active_snapshot_seq(&self.room_id)
+            .filter(|seq| Some(*seq) != self.unrestorable_snapshot)
             .filter(|seq| retention::is_usable_snapshot(*seq, tail_seq, self.head_seq))
     }
 

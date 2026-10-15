@@ -39,7 +39,7 @@ impl SchemaRegistry {
         // write are discarded; the matching `.json` still holds the last complete version.
         for entry in fs::read_dir(&dir)? {
             let path = entry?.path();
-            if !path.is_file() {
+            if !fs::metadata(&path)?.is_file() {
                 continue;
             }
             match path.extension().and_then(|s| s.to_str()) {

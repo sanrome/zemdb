@@ -61,6 +61,13 @@ pub(crate) fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Whether `path` exists. Unlike `Path::exists`, a failure to check is an error, not a
+/// missing file.
+pub(crate) fn exists(path: &Path) -> std::io::Result<bool> {
+    injected("exists", path)?;
+    path.try_exists()
+}
+
 /// Temporary sibling path used while atomically replacing `path`.
 pub(crate) fn tmp_path_for(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();

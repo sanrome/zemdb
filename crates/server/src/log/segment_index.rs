@@ -66,8 +66,13 @@ impl SegmentIndex {
     /// (`segment_*.tmp`, from a compression or a sidecar) are removed, and so is a cold segment
     /// whose warm original still exists (the crash came between the rename of the cold segment
     /// and the removal of the warm one; the warm segment is kept and compressed again later).
-    /// The directory is synced after removing anything.
-    pub(crate) fn scan(segments_dir: &Path) -> Result<Self, ServerError> {
+    /// Segments ending at or below `pruned_through_seq` are removed with their sidecars too: a
+    /// prune or a removal that failed or was interrupted left them behind. The directory is
+    /// synced after removing anything.
+    pub(crate) fn scan(
+        segments_dir: &Path,
+        pruned_through_seq: SequenceNumber,
+    ) -> Result<Self, ServerError> {
         io_probe::record(IoEvent::Listing, segments_dir);
         let mut warm = Vec::new();
         let mut cold = Vec::new();
@@ -93,6 +98,16 @@ impl SegmentIndex {
             let Some((start, end)) = parse_segment_filename(&name, tier) else {
                 continue;
             };
+            if end <= pruned_through_seq.get() {
+                // The sidecar first, as pruning does: never a sidecar without its segment.
+                leftovers.push(mutation_ids_path(
+                    segments_dir,
+                    SequenceNumber::new(start),
+                    SequenceNumber::new(end),
+                ));
+                leftovers.push(entry.path());
+                continue;
+            }
             // Queried through the file rather than the listing: on Windows the size a
             // directory listing reports can lag behind the file's.
             let metadata = std::fs::metadata(entry.path())?;
@@ -128,7 +143,7 @@ impl SegmentIndex {
 
         if !leftovers.is_empty() {
             for path in &leftovers {
-                tracing::warn!(path = ?path, "Removing leftover of an interrupted segment write");
+                tracing::warn!(path = ?path, "Removing a leftover segment file");
                 durable::remove_file_if_exists(path)?;
             }
             durable::sync_dir(segments_dir)?;

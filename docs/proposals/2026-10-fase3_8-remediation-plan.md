@@ -49,10 +49,12 @@ Se continúa la numeración del plan de la Fase 3.7 (que termina en D52). Se con
 | **D59** | **Dedup por cliente.** La clave del dedup y lo que se guarda en el WAL pasa a ser `blake3(client_id ‖ mutation_id)` truncado a 16 bytes, con `client_id` prefijado por su longitud. El formato del frame no cambia (sigue siendo `Option<[u8; 16]>`). Un reintento del mismo cliente sigue siendo idempotente y un id repetido por otro cliente se secuencia como mutación nueva. El protocolo documenta igual que `MutationId` debe ser aleatorio de 128 bits. Implementación: `dedup_key` en `server/src/dedup.rs` (la longitud como `u64` little-endian, los 16 primeros bytes del hash); `commit` la usa para el dedup, el chequeo de tamaño y el WAL, así que los `.ids` de D57 también la guardan. | 4 | Adoptada |
 | **D60** | **Versión de esquema en las respuestas.** El registry guarda `version: u64` en `schemas/{id}.json` (1 al crearse, +1 por cada `add_column`). `CommitAck`, `SyncBatch`, `HeartbeatAck` y `Registered` llevan `schema_version`. Un cliente que ve una versión mayor que la suya pide `GetSchema` antes de aplicar el batch. SSE sigue avisando, pero deja de ser la única señal. Implementación: la versión es parte del `Schema` de core (`version()`; `add_column` suma 1 solo si tiene éxito) y viaja en su serialización (`{"version", "tables"}`), así que `schemas/{id}.json` y el esquema de `Registered` la llevan sin un campo aparte. Un JSON sin `version` vale 1, la versión 0 es un error de deserialización y `register_schema` rechaza con `BadRequest` un esquema nuevo con otra versión (`Schema::FIRST_VERSION`). La regla del cliente quedó como "una versión distinta de la suya", no "mayor": una sala reasignada a otro esquema (`RoomManager::get_or_spawn` con esquema) puede bajarla. `RESPONSE_ENVELOPE_ALLOWANCE` suma un varint. | 4 | Adoptada |
 | **D61** | **Una subida en curso ancla la retención.** El piso de poda pasa a ser `min(min_ack, snapshot usable, subida en curso no inactiva)`, con la seq de la subida que expone el relay. Si al completar la subida su seq quedó fuera del rango retenido, la respuesta es `SnapshotSuperseded` (reintentable), no `BadRequest`. Implementación: `SnapshotRelay::upload_in_progress` reemplaza a `has_upload_in_progress` y devuelve la seq de la subida por chunks no inactiva, o 0 (no se poda nada) mientras hay una subida de un solo request o el lock del relay está tomado; el cierre por inactividad y la designación siguen mirando solo si hay alguna. `LogBounds::check` recibe el error: `BadRequest` al empezar, `SnapshotSuperseded` al completar. | 4 | Adoptada |
-| **D62** | **El log recuerda su rango ilegible.** `TieredLog` guarda en memoria `unreadable_through: Option<SequenceNumber>`, el fin del último hueco conocido: se calcula al abrir (huecos del índice de segmentos) y se actualiza cuando una lectura encuentra un hueco. `is_usable_snapshot` exige además `seq >= unreadable_through`. En la rama de hueco de `handle_sync`, si el snapshot activo no lo supera, se descarta del relay antes de `request_snapshot()`, así que la demanda se enciende y el ancla deja de retener el hueco. | 5 | Propuesta |
+| **D62** | **Un snapshot por debajo de un hueco deja de ser usable.** Un hueco en el log solo aparece por daño externo (un segmento corrupto o borrado, o DEF-120), así que la solución se limita al camino de error que ya existe. En la rama de hueco de `RoomActor::sync`, si el snapshot usable es `<= from_seq`, el actor lo guarda en `unrestorable_snapshot` (en memoria): restaurarlo lleva al mismo hueco. `usable_snapshot_seq` lo ignora, así que deja de anunciarse y de anclar la poda, la demanda se enciende y una subida nueva (con una seq mayor) lo reemplaza. Al reabrir la marca se pierde y el próximo cliente que choca con el hueco la vuelve a poner. Alternativa descartada (la propuesta original): `unreadable_through` en `TieredLog`, calculado al abrir y al leer, con `fetch_deltas` mutable; más código y estado en el log para un caso que solo existe con daño en disco. Tampoco se borra el snapshot del relay: ya no se usa y lo reemplaza la próxima subida o el TTL. | 5 | Adoptada |
 | **D63** | **El hueco de secuencia se reporta antes que cualquier error de contenido.** `validate_batch` revisa en dos pasadas: primero la continuidad de todo el batch (`SequenceMismatch` ante un hueco, aunque el batch traiga además una tabla desconocida o una fila inválida) y después tabla y esquema de cada operación. Un hueco significa que el batch no corresponde al estado local y el cliente tiene que resincronizar; el error de contenido es secundario. Antes el orden era por operación (tabla, secuencia, fila), así que una operación inválida anterior al hueco lo tapaba. Documentado en el doc de `StorageEngine::apply_batch` y en `ARCHITECTURE.md` §8. | 2 | Adoptada |
 | **D64** | **`create_dir_all_synced` se duplica en storage, no se mueve a core.** Core no hace E/S de archivos (es el crate puro del protocolo, también para wasm), storage ya tiene su `sys::sync_dir` y el servidor no depende de storage. El helper vive en `disk/compactor.rs` junto a `sync_parent`, es bloqueante y `open_room` lo llama por `run_blocking`; cada sync del padre de un directorio creado pasa por el fail point `sync_dir`. | 2 | Adoptada |
 | **D65** | **`DiskStorageEngine::new` valida sus opciones.** Devuelve `Result<Self, StorageError>`: `compaction_ratio` tiene que ser finito y mayor que 0 y `zstd_level` estar en `zstd::compression_level_range()` (el rango real de la librería, con los niveles negativos rápidos); si no, `StorageError::InvalidOptions` (variante nueva). Se valida en el constructor porque los campos de `DiskStorageOptions` son públicos. El doc del builder que decía "1-22" se corrigió. | 2 | Adoptada |
+| **D66** | **El servidor nunca asigna `u64::MAX`.** Así `head_seq + 1` (el tail de un log podado entero) siempre existe y `SequenceNumber::next` y el `+ 1` de `TieredLog::append` no cambian. Un commit con el head en `u64::MAX - 1` es `Internal` antes de escribir nada, y un log que dice tener `u64::MAX` (solo un archivo dañado) es `WalCorruption` al abrir; en `log_meta.json` se comprueba al leerlo, antes de que `SegmentIndex::scan` borre los segmentos que terminan por debajo. En storage, `validate_batch` usa `checked_add`: sin siguiente número, `SequenceMismatch`. El replay del WAL ya era seguro: salta las operaciones `<= head_seq` antes de calcular `head_seq + 1`, así que nunca suma sobre `u64::MAX`. | 5 | Adoptada |
+| **D67** | **Comprobar si un archivo existe propaga el error.** `durable::exists(path)` (fail point `exists` y `try_exists`) reemplaza a `Path::exists` en los sitios de la auditoría: `cold_disk` (1), `warm_disk` (3) y `manager` (4; `room_exists` pasa a devolver `Result<bool>`). `schema_registry` usa `fs::metadata(&path)?.is_file()` (sigue los symlinks, como antes). En el manager las comprobaciones corren en `blocking_io`, y `delete_room` llama directamente a `remove_dir_all` y traduce `NotFound` a `RoomNotFound`. Sin `disallowed-methods` en clippy: los tests usan `.exists()` decenas de veces y storage tampoco lo tiene. El `is_dir` de `create_dir_all_synced` queda: un error ahí aparece al crear el directorio. | 5 | Adoptada |
 
 ---
 
@@ -64,10 +66,10 @@ Se continúa la numeración del plan de la Fase 3.7 (que termina en D52). Se con
 | 2 | Storage: esquema y durabilidad | DEF-115, 129, 130, 133, 141 | Alta (requisito de Fase 4) | ✅ 5/5 |
 | 3 | Costo del roster y de abrir salas | DEF-117, 121, 122, 131 | Alta | ✅ 4/4 |
 | 4 | Contrato del protocolo | DEF-118, 123, 127, 126 | Media (requisito de Fase 4) | ✅ 4/4 |
-| 5 | Huecos del log y robustez del servidor | DEF-119, 120, 128, 125, 132, 143 | Media | ⬜ 0/6 |
+| 5 | Huecos del log y robustez del servidor | DEF-119, 120, 128, 125, 132, 143 | Media | ✅ 6/6 |
 | 6 | Tests, documentación y CI | DEF-134, 140, 135, 136, 137, 138, 142, 139 | Baja | ⬜ 0/8 |
 
-**Avance total:** 15 de 29 ítems (DEF-143 surgió en la revisión del Lote 2).
+**Avance total:** 21 de 29 ítems (DEF-143 surgió en la revisión del Lote 2).
 
 **Por qué este orden, en una línea por lote:**
 1. Es el único Alto y afecta al único binario desplegable; lo dispara cualquier miembro con un token válido.
@@ -232,37 +234,43 @@ Se continúa la numeración del plan de la Fase 3.7 (que termina en D52). Se con
 
 > Objetivo: que un hueco en el log siempre termine en un snapshot nuevo, que un borrado fallido no lo cree, y que los errores de I/O y las cancelaciones no dejen salas a medias.
 
-#### DEF-119 · Medio · ⬜ Pendiente
+#### DEF-119 · Medio · ✅ Hecho
 **Problema.** Un snapshot "usable" por debajo de un hueco del log apaga la demanda de snapshots, y los clientes quedan en bucle hasta que el snapshot vence.
 **Solución.** D62.
+**Hecho.** `unrestorable_snapshot` en `RoomActor`, marcado en la rama de hueco de `sync` y filtrado en `usable_snapshot_seq`. `ARCHITECTURE.md` §5.2 (*Damaged Segments*). Test: `snapshot_below_a_gap_stops_being_usable` (`actor/tests/room.rs`): con un snapshot en 2 y el segmento 3–4 borrado, un cliente en 2 recibe `BehindCompaction`; después el `HeartbeatAck` ya no ofrece el snapshot y el writer (cursor 6) queda designado; un snapshot en 6 se ofrece, también después de que otro `sync` choque con el hueco. Diferencia con el plan: el tercer test (recalcular al abrir) no aplica con D62 reducida. Comprobado con mutantes: sin el filtro de `usable_snapshot_seq`, con `<` en lugar de `<=` y sin la condición `<= from_seq`, falla.
 **Test exigido.**
 - El escenario de la auditoría (`audit_gap_after_usable_snapshot_never_turns_demand_on`): después del `BehindCompaction` por hueco, el snapshot viejo deja de anunciarse, la demanda se enciende y un `Connected` es designado.
 - Un snapshot nuevo por encima del hueco vuelve a ser usable y se sirve.
 - Al reabrir la sala con el hueco en el índice, `unreadable_through` se recalcula.
 
-#### DEF-120 · Bajo · ⬜ Pendiente
+#### DEF-120 · Bajo · ✅ Hecho
 **Problema.** Un segmento warm que no se pudo borrar reaparece después de podar su cold y hace retroceder `tail_seq`.
 **Solución.** `SegmentIndex::scan` descarta (y borra) los segmentos con `end_seq <= pruned_through_seq`; `record_compression` guarda la ruta del warm que no se pudo borrar y el próximo `expire`/`prune_segments` reintenta el borrado.
+**Hecho.** `SegmentIndex::scan(dir, pruned_through_seq)` borra esos segmentos y sus `.ids`; `TieredLog::undeleted_warm` guarda el warm que no se pudo borrar y `expire` lo reintenta en cada pasada. La compresión borra el warm con `durable::remove_file_if_exists`, que tiene el fail point `remove_file`. `ARCHITECTURE.md` §5.2 (Tier 3). Test: `warm_copy_that_could_not_be_removed_is_removed_later` (`log/tests/tiered_log.rs`), con las dos partes. Comprobado con mutantes: sin el filtro de `scan` y sin guardar la ruta, falla.
 **Test exigido.** Con un fail point que hace fallar el `remove_file` del warm: comprimir, podar el cold, reabrir; `tail_seq` no retrocede y el warm ya no está. Sin reinicio, el siguiente mantenimiento borra el warm.
 
-#### DEF-128 · Bajo · ⬜ Pendiente
+#### DEF-128 · Bajo · ✅ Hecho
 **Problema.** `Path::exists()` trata un error de I/O como "no existe" en el log y el manager del servidor.
-**Solución.** `try_exists()?` (o `metadata()` propagando el error) en los 9 sitios de la auditoría, con un fail point que reemplaza su resultado, como el de storage (DEF-108). Evaluar un `disallowed-methods` para `Path::exists` en un `clippy.toml` del servidor, como el de storage.
+**Solución.** D67.
+**Hecho.** `durable::exists` en los sitios con `exists()` (en `delete_room`, `remove_dir_all` directo) y `fs::metadata` en `schema_registry`. `ARCHITECTURE.md` §5.2 (*Atomic Server Metadata*). Tests: `failure_to_check_for_active_wal_fails_the_open` (`log/tests/tiered_log.rs`) y `failure_to_check_for_meta_room_does_not_create_the_room_again` (`actor/tests/manager.rs`). Comprobado con el mutante que toma el error por un archivo inexistente (el comportamiento anterior): fallan los dos.
 **Test exigido.** Con el fail point devolviendo error: abrir una sala con `active.wal` falla en vez de abrir con el log vacío, y `create_room` no sobrescribe `meta_room.json`.
 
-#### DEF-125 · Bajo · ⬜ Pendiente
+#### DEF-125 · Bajo · ✅ Hecho
 **Problema.** Un `DELETE /admin/rooms/:id` cancelado a mitad del purge deja la sala viva pero sin snapshot.
 **Solución.** El handler corre `delete_room` en `tokio::spawn` y espera el `JoinHandle` (como `add_column`); el doc de `RoomManager::delete_room` aclara que no es seguro cancelarla.
+**Hecho.** `control_plane::delete_room` con `tokio::spawn` (un `JoinError` es `Internal`) y el doc de `RoomManager::delete_room`. `ARCHITECTURE.md` §7.1 corrige además la línea de `DELETE /admin/rooms`, que decía "Archives or purges". Test: `room_deletion_finishes_when_the_request_is_dropped` (`api/tests/control_plane.rs`), que suelta la request en un hook nuevo, `relay_purge_room_files`, dentro de `purge_room`. Falla con el handler anterior.
 **Test exigido.** El handler se descarta durante el purge (el test de la auditoría, ahora sobre el handler HTTP): el borrado termina igual, el directorio desaparece y `room_exists` es `false`.
 
-#### DEF-132 · Medio · ⬜ Pendiente
+#### DEF-132 · Medio · ✅ Hecho
 **Problema.** Ningún test cubre que la poda por TTL o cuota se detenga en el primer segmento conservado.
 **Solución.** Solo el test. Va en este lote porque D62 y DEF-120 cambian la poda y el índice de segmentos.
+**Hecho.** `quota_pruning_stops_at_the_first_segment_it_keeps` (`log/tests/tiered_log.rs`). Falla con `break` → `continue`.
 **Test exigido.** El de la auditoría: corromper `segment_1_5.wal`, mantenimiento, `max_room_disk_bytes = 1`, mantenimiento otra vez; `segment_6_10.wal.zst` sigue existiendo. Comprobar que falla con `break` → `continue`.
 
-#### DEF-143 · Bajo · ⬜ Pendiente
+#### DEF-143 · Bajo · ✅ Hecho
 **Problema.** `validate_batch` (`storage/src/memory/state.rs`) y el replay del WAL (`storage/src/disk/recovery.rs`) calculan `head_seq + 1` sin control: con el head en `u64::MAX - 1` un batch válido entra en pánico en debug, y con el head en `u64::MAX` el número da la vuelta a 0 en release. A ese head solo se llega con un snapshot falsificado o un archivo dañado. Lo encontró la revisión del Lote 2; ya existía.
 **Solución.** `checked_add`: sin siguiente número, el batch es `SequenceMismatch` y el replay lo reporta como corrupción. El servidor tiene la misma cuenta en `TieredLog::append` (`head_seq.get() + 1`) y en `SequenceNumber::next` (`core/src/id.rs`).
+**Hecho.** D66. Tests: `batch_past_the_last_sequence_number_is_a_mismatch` (`storage/src/memory/tests/state.rs`, con el head en `u64::MAX` y en `u64::MAX - 1` con dos operaciones; el código anterior entra en pánico por overflow), `log_claiming_the_last_sequence_number_fails_to_open` (en `log_meta.json`, sin borrar el segmento que hay, y en el nombre de un segmento) y `commit_that_would_take_the_last_sequence_number_is_refused`. Diferencia con el plan: el replay del WAL no cambió (ver D66). Comprobado con mutantes: sin cada guarda del servidor, falla su test.
 **Test exigido.** Unitario con el head en `u64::MAX`: un batch da error, sin pánico.
 
 ---

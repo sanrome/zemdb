@@ -98,3 +98,56 @@ async fn concurrent_column_additions_leave_every_room_with_the_latest_schema() {
         assert!(tasks.get_column("estimate").is_some(), "{room_id}");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn room_deletion_finishes_when_the_request_is_dropped() {
+    let dir = tempdir().unwrap();
+    let state = TestState::new(dir.path(), |config| {
+        config.admin_secret = ADMIN_SECRET.to_string();
+    });
+    let schema_id = SchemaId::new("todo").unwrap();
+    state
+        .registry
+        .register_schema(
+            schema_id.clone(),
+            Schema::builder()
+                .table(TableSchema::builder("tasks").primary_key("id", DataType::Int))
+                .build(),
+        )
+        .unwrap();
+    let room_id = RoomId::new("doomed").unwrap();
+    state
+        .manager
+        .create_room(room_id.clone(), schema_id, None)
+        .await
+        .unwrap();
+
+    // The request is dropped while the relay deletes the room's snapshot files.
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+    fail_point::arm_hook(
+        "relay_purge_room_files",
+        &dir.path().join("snapshots"),
+        move || {
+            let _ = reached_tx.send(());
+            let _ = resume_rx.recv();
+        },
+    );
+    let request = Request::delete("/admin/rooms/doomed")
+        .header(header::AUTHORIZATION, format!("Bearer {ADMIN_SECRET}"))
+        .body(Body::empty())
+        .unwrap();
+    tokio::select! {
+        _ = build_router(state.app_state()).oneshot(request) => panic!("the purge did not stop"),
+        _ = reached_rx => {}
+    }
+    resume_tx.send(()).unwrap();
+
+    let room_dir = dir.path().join("rooms").join("doomed");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while room_dir.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!room_dir.exists());
+    assert!(!state.manager.room_exists(&room_id).unwrap());
+}

@@ -6,6 +6,7 @@ use crate::actor::test_support::{
 };
 use crate::fail_point;
 use crate::log::io_probe::{self, IoEvent};
+use crate::log::segment_index::{segment_path, Tier};
 use crate::log::RoomLifecycleOverrides;
 use std::fs;
 use std::ops::RangeInclusive;
@@ -544,6 +545,26 @@ async fn failed_commit_write_restarts_room_and_retry_gets_next_sequence() {
     let synced = sync_all(&recovered, &client).await.unwrap();
     let seqs: Vec<u64> = synced.ops.iter().map(|op| op.seq.get()).collect();
     assert_eq!(seqs, vec![1, 2]);
+    fx.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn commit_that_would_take_the_last_sequence_number_is_refused() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    fx.manager.shutdown_all().await;
+    let last = u64::MAX - 1;
+    fs::write(
+        fx.room_dir().join("log_meta.json"),
+        format!(r#"{{"pruned_through_seq": {last}}}"#),
+    )
+    .unwrap();
+
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    let res = commit(&sender, &client, mutation(1), seq(last), insert_op(1)).await;
+    assert!(matches!(res, Err(ServerError::Internal(_))), "{res:?}");
+    assert_eq!(metrics(&sender).await.head_seq, seq(last));
     fx.manager.shutdown_all().await;
 }
 
@@ -1164,6 +1185,42 @@ async fn behind_compaction_answers_request_a_snapshot() {
         RoomEvent::SnapshotWanted
     );
     assert!(snapshot_wanted(&sender, &writer).await);
+    fx.manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn snapshot_below_a_gap_stops_being_usable() {
+    let fx = Fixture::new(small_segments()).await;
+    let sender = fx.sender().await;
+    let writer = ClientId::new("writer").unwrap();
+    register(&sender, &writer).await;
+    for n in 1..=6u8 {
+        commit(&sender, &writer, mutation(n), seq(0), insert_op(n.into()))
+            .await
+            .unwrap();
+    }
+    // The snapshot anchors the log, so the writer's ack prunes nothing.
+    stage_snapshot_at(&fx, 2).await;
+    ack(&sender, &writer, seq(6)).await.unwrap();
+    let segments = fx.room_dir().join("segments");
+    fs::remove_file(segment_path(&segments, seq(3), seq(4), Tier::Warm)).unwrap();
+
+    // A client restores the snapshot and finds the gap after it: the snapshot is no longer
+    // offered, and the writer is asked for a new one.
+    let restorer = ClientId::new("restorer").unwrap();
+    register_at(&sender, &restorer, Some((seq(2), fx.incarnation))).await;
+    let gap = async || {
+        let res = sync_from(&sender, &restorer, seq(2)).await;
+        assert!(matches!(res, Err(ServerError::BehindCompaction)), "{res:?}");
+        heartbeat(&sender, &writer).await.unwrap()
+    };
+    let hb = gap().await;
+    assert_eq!(hb.active_snapshot_seq, None);
+    assert!(hb.snapshot_wanted);
+
+    // A snapshot above the gap is offered, also after another client runs into the gap.
+    stage_snapshot_at(&fx, 6).await;
+    assert_eq!(gap().await.active_snapshot_seq, Some(seq(6)));
     fx.manager.shutdown_all().await;
 }
 

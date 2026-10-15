@@ -74,19 +74,24 @@ pub(crate) fn resolve_table_id(
 
 /// Checks that the sequence numbers of a batch continue `head_seq` without gaps, and then that
 /// each operation is valid under the room's schema: a gap is reported before any other error.
+/// An operation after `u64::MAX` has no sequence number, so it is a mismatch too (reported as
+/// expecting `u64::MAX`, the last number).
 pub(crate) fn validate_batch(
     room_id: &RoomId,
     schema: &Schema,
     head_seq: SequenceNumber,
     ops: &[SequencedOperation],
 ) -> Result<(), StorageError> {
-    for (expected_seq, op) in (head_seq.get() + 1..).zip(ops) {
-        if op.seq.get() != expected_seq {
+    let mut last = head_seq;
+    for op in ops {
+        let expected = last.get().checked_add(1);
+        if expected != Some(op.seq.get()) {
             return Err(StorageError::SequenceMismatch {
-                expected: SequenceNumber::from(expected_seq),
+                expected: expected.map_or(last, SequenceNumber::from),
                 actual: op.seq,
             });
         }
+        last = op.seq;
     }
     for op in ops {
         resolve_table_id(room_id, schema, TableRef::Id(op.op.table_id()))?;

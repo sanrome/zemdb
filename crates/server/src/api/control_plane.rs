@@ -121,7 +121,7 @@ pub async fn get_room(
     State(state): State<AppState>,
     AdminPath(rid): AdminPath<RoomId>,
 ) -> Result<Json<RoomDetails>, ServerError> {
-    if !state.room_manager.room_exists(&rid) {
+    if !state.room_manager.room_exists(&rid)? {
         return Err(ServerError::RoomNotFound(rid.to_string()));
     }
     let metrics = state
@@ -141,7 +141,11 @@ pub async fn delete_room(
     State(state): State<AppState>,
     AdminPath(rid): AdminPath<RoomId>,
 ) -> Result<StatusCode, ServerError> {
-    state.room_manager.delete_room(&rid).await?;
+    // In its own task, so that a dropped request does not stop it halfway.
+    let room_manager = Arc::clone(&state.room_manager);
+    tokio::spawn(async move { room_manager.delete_room(&rid).await })
+        .await
+        .map_err(|err| ServerError::Internal(format!("Room deletion task failed: {err}")))??;
     Ok(StatusCode::NO_CONTENT)
 }
 

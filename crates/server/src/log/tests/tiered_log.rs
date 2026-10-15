@@ -234,12 +234,55 @@ fn reopen_after_full_prune_continues_sequence() {
 }
 
 #[test]
+fn failure_to_check_for_active_wal_fails_the_open() {
+    let dir = tempdir().unwrap();
+    let active = write_log(dir.path(), 3);
+
+    crate::fail_point::arm("exists", &active);
+    assert!(TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).is_err());
+
+    let (log, _) = TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).unwrap();
+    assert_eq!(log.head_seq().get(), 3);
+}
+
+#[test]
 fn reopen_with_corrupt_log_meta_fails_instead_of_resetting_head() {
     let dir = tempdir().unwrap();
     drop(fully_pruned_log(dir.path()));
     std::fs::write(dir.path().join("log_meta.json"), b"{ not json").unwrap();
 
     assert!(TieredLog::open_or_create(dir.path(), full_prune_policy()).is_err());
+}
+
+#[test]
+fn log_claiming_the_last_sequence_number_fails_to_open() {
+    let dir = tempdir().unwrap();
+    let (mut log, _) =
+        TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).unwrap();
+    append_range(&mut log, 1, 3);
+    let segment = log.force_rotate_warm().unwrap().unwrap();
+    drop(log);
+    let meta = dir.path().join("log_meta.json");
+    std::fs::write(&meta, format!(r#"{{"pruned_through_seq": {}}}"#, u64::MAX)).unwrap();
+    assert!(TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).is_err());
+    assert!(segment.exists(), "the failed open deleted a segment");
+
+    std::fs::write(
+        &meta,
+        format!(r#"{{"pruned_through_seq": {}}}"#, u64::MAX - 1),
+    )
+    .unwrap();
+    let (log, _) = TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).unwrap();
+    assert_eq!(log.tail_seq().get(), u64::MAX);
+    drop(log);
+
+    // A segment name can claim it too.
+    std::fs::write(
+        segment_file(&segments_dir(dir.path()), u64::MAX, u64::MAX, "wal"),
+        b"",
+    )
+    .unwrap();
+    assert!(TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).is_err());
 }
 
 #[test]
@@ -620,6 +663,64 @@ fn failed_cleanup_after_compression_keeps_the_index_on_the_cold_segment() {
     let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
     assert_contiguous(&ops, 1, 7);
     assert_eq!(log.disk_bytes(), bytes_on_disk(&segments));
+}
+
+#[test]
+fn warm_copy_that_could_not_be_removed_is_removed_later() {
+    let policy = RoomLifecyclePolicy {
+        cold_disk_ttl: Duration::from_secs(3600),
+        ..compress_at_once_policy()
+    };
+    let expired = MaintenanceClock::after(Duration::from_secs(7200));
+
+    // Without a restart, the next pass removes it.
+    let dir = tempdir().unwrap();
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+    append_range(&mut log, 1, 7);
+    let warm = segment_file(&segments_dir(dir.path()), 1, 5, "wal");
+    // Once after the compression and once in the retry of the same pass.
+    crate::fail_point::arm("remove_file", &warm);
+    crate::fail_point::arm("remove_file", &warm);
+    log.run_maintenance_sync().unwrap();
+    assert!(warm.exists());
+    log.run_maintenance_sync().unwrap();
+    assert!(!warm.exists());
+
+    // If it is still there when its cold copy is pruned, reopening removes it instead of
+    // indexing it again, which would move the tail back over a range the log lost.
+    let dir = tempdir().unwrap();
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+    append_range(&mut log, 1, 7);
+    let warm = segment_file(&segments_dir(dir.path()), 1, 5, "wal");
+    for _ in 0..3 {
+        crate::fail_point::arm("remove_file", &warm);
+    }
+    log.run_maintenance_sync().unwrap();
+    log.run_maintenance_sync_at(expired).unwrap();
+    assert_eq!(log.tail_seq().get(), 6);
+    assert!(warm.exists());
+    drop(log);
+
+    let (log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    assert_eq!(log.tail_seq().get(), 6);
+    assert!(!warm.exists());
+}
+
+#[test]
+fn quota_pruning_stops_at_the_first_segment_it_keeps() {
+    let dir = tempdir().unwrap();
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
+    append_range(&mut log, 1, 12);
+    let segments = segments_dir(dir.path());
+
+    // Segment 1..=5 cannot be compressed, so it stays warm in front of the cold 6..=10.
+    std::fs::write(segment_file(&segments, 1, 5, "wal"), b"damaged").unwrap();
+    let _ = log.run_maintenance_sync();
+    log.policy.max_room_disk_bytes = 1;
+    let _ = log.run_maintenance_sync();
+
+    assert!(segment_file(&segments, 6, 10, "wal.zst").exists());
+    assert_eq!(log.tail_seq().get(), 1);
 }
 
 #[test]
@@ -1055,7 +1156,7 @@ fn opening_fills_ram_only_from_active_wal() {
                 .unwrap();
         }
     }
-    let segments = SegmentIndex::scan(&segments_dir(dir.path())).unwrap();
+    let segments = SegmentIndex::scan(&segments_dir(dir.path()), SequenceNumber::new(0)).unwrap();
     let (_warm, active) = WarmDiskLog::open_recovering(segments_dir(dir.path())).unwrap();
 
     let (ops, mutations) = read_newest(&segments, active, usize::MAX).unwrap();
