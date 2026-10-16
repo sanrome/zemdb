@@ -8,6 +8,7 @@ use crate::fail_point;
 use crate::log::io_probe::{self, IoEvent};
 use crate::log::segment_index::{segment_path, Tier};
 use crate::log::RoomLifecycleOverrides;
+use crate::test_support::TestRng;
 use std::fs;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
@@ -2010,4 +2011,1156 @@ async fn dormant_client_is_forgotten_after_its_ttl_and_registers_again() {
     heartbeat(&sender, &kept).await.unwrap();
     register(&sender, &gone).await;
     fx.manager.shutdown_all().await;
+}
+
+/// Commits from three clients that report random cursors, each only moving forward as an
+/// honest client's does: every catch-up is a prefix of the operations after the reported
+/// cursor, and all of them when it has no more. Afterwards a `/sync` chain with random batch
+/// sizes from any retained cursor returns its exact suffix, and one from behind the log gets
+/// `BehindCompaction`.
+#[tokio::test(start_paused = true)]
+async fn commit_catchups_and_sync_chains_deliver_the_exact_suffix() {
+    let fx = Fixture::new(RoomLifecycleOverrides {
+        ram_max_ops: Some(3),
+        warm_disk_ttl_secs: Some(0),
+        ..RoomLifecycleOverrides::default()
+    })
+    .await;
+    let sender = fx.sender().await;
+    let clients: Vec<ClientId> = ["a", "b", "c"]
+        .iter()
+        .map(|c| ClientId::new(*c).unwrap())
+        .collect();
+    for c in &clients {
+        register(&sender, c).await;
+    }
+    let mut rng = TestRng::new(0x1234_5678);
+    let mut accepted: Vec<Operation> = Vec::new();
+    let mut cursors = [0u64; 3];
+    for n in 1..=150u64 {
+        let i = rng.below(3) as usize;
+        let head = accepted.len() as u64;
+        let last_ack = cursors[i] + rng.below(head - cursors[i] + 1);
+        cursors[i] = last_ack;
+        let op = insert_op(n as i64);
+        let resp = commit(
+            &sender,
+            &clients[i],
+            MutationId::from_u128(u128::from(n)),
+            seq(last_ack),
+            op.clone(),
+        )
+        .await
+        .unwrap();
+        accepted.push(op);
+        assert_eq!(resp.assigned_seq, seq(n));
+        let expected: Vec<(u64, Operation)> = (last_ack + 1..=n)
+            .map(|s| (s, accepted[(s - 1) as usize].clone()))
+            .collect();
+        let got: Vec<(u64, Operation)> = resp
+            .catchup_ops
+            .iter()
+            .map(|op| (op.seq.get(), op.op.clone()))
+            .collect();
+        assert!(expected.starts_with(&got), "commit {n} from {last_ack}");
+        if !resp.has_more {
+            assert_eq!(got, expected, "commit {n}: complete catch-up");
+        }
+        if n % 50 == 0 {
+            // Lets the slow tick compress sealed segments and prune up to the lowest cursor.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+        }
+    }
+
+    let reader = &clients[0];
+    for c in [0u64, 1, 2, 3, 50, 99, 100, 148, 149, 150] {
+        let tail = metrics(&sender).await.tail_seq.get();
+        if c + 1 < tail {
+            assert!(matches!(
+                sync_from(&sender, reader, seq(c)).await,
+                Err(ServerError::BehindCompaction)
+            ));
+            continue;
+        }
+        let mut at = c;
+        let mut got = Vec::new();
+        loop {
+            let (tx, rx) = oneshot::channel();
+            sender
+                .send(RoomCommand::Sync {
+                    client_id: reader.clone(),
+                    from_seq: seq(at),
+                    max_batch_size: 1 + rng.below(9) as u32,
+                    reply: tx,
+                })
+                .await
+                .unwrap();
+            let batch = rx.await.unwrap().unwrap();
+            if let Some(last) = batch.ops.last() {
+                at = last.seq.get();
+            }
+            got.extend(batch.ops.into_iter().map(|op| (op.seq.get(), op.op)));
+            if !batch.has_more {
+                break;
+            }
+        }
+        let expected: Vec<(u64, Operation)> = (c + 1..=150)
+            .map(|s| (s, accepted[(s - 1) as usize].clone()))
+            .collect();
+        assert_eq!(got, expected, "sync chain from {c}");
+    }
+    fx.manager.shutdown_all().await;
+}
+
+/// With a window of two mutations, mutations 2 and 3 are the last ones when the room
+/// respawns: the deduplication window hydrated from the log recognises a retry of 2.
+#[tokio::test]
+async fn after_a_respawn_a_retry_inside_the_dedup_window_is_recognised() {
+    let fx = Fixture::with_options(
+        RoomLifecycleOverrides::default(),
+        |config| config.dedup_lru_capacity = 2,
+        None,
+    )
+    .await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    for n in 1..=2u8 {
+        commit(&sender, &client, mutation(n), seq(0), insert_op(n.into()))
+            .await
+            .unwrap();
+    }
+    // A lost acknowledgement: the client retries mutation 1.
+    commit(&sender, &client, mutation(1), seq(0), insert_op(1))
+        .await
+        .unwrap();
+    commit(&sender, &client, mutation(3), seq(0), insert_op(3))
+        .await
+        .unwrap();
+    fx.manager.shutdown_all().await;
+
+    let sender = fx.sender().await;
+    let retry = commit(&sender, &client, mutation(2), seq(0), insert_op(2))
+        .await
+        .unwrap();
+    assert_eq!(retry.assigned_seq, seq(2));
+    assert_eq!(metrics(&sender).await.head_seq, seq(3));
+    fx.manager.shutdown_all().await;
+}
+
+/// A commit rejected with `BehindCompaction` changes neither the log, the head, the client's
+/// cursor nor the deduplication window, and never announces a new head. It may only make the
+/// room ask for a snapshot.
+#[tokio::test(start_paused = true)]
+async fn commit_rejected_behind_the_log_leaves_no_trace_but_may_ask_for_a_snapshot() {
+    let (fx, writer, tail) = pruned_room().await;
+    let behind = seq(tail.get() - 2);
+    let stale = ClientId::new("stale").unwrap();
+    let sender = fx
+        .restart_with_roster(&[
+            (&writer, "Connected", 8),
+            (&stale, "Connected", behind.get()),
+        ])
+        .await;
+    let mut events = subscribe(&sender).await;
+    let before = metrics(&sender).await;
+    let retained = sync_from(&sender, &writer, seq(tail.get() - 1))
+        .await
+        .unwrap()
+        .ops;
+
+    let res = commit(&sender, &stale, mutation(42), behind, insert_op(42)).await;
+    assert!(matches!(res, Err(ServerError::BehindCompaction)), "{res:?}");
+
+    let after = metrics(&sender).await;
+    assert_eq!(
+        (after.tail_seq, after.head_seq),
+        (before.tail_seq, before.head_seq)
+    );
+    let still_retained = sync_from(&sender, &writer, seq(tail.get() - 1))
+        .await
+        .unwrap()
+        .ops;
+    assert_eq!(still_retained, retained);
+    assert_eq!(cursor(&sender, &stale).await, Some(behind));
+    let mut emitted = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        emitted.push(event);
+    }
+    assert!(
+        emitted
+            .iter()
+            .all(|event| matches!(event, RoomEvent::SnapshotWanted)),
+        "{emitted:?}"
+    );
+
+    // The rejected mutation id was not recorded: once another commit took the next sequence,
+    // the same id sent again with a cursor inside the log is a new mutation.
+    let next = commit(&sender, &writer, mutation(43), seq(8), insert_op(43))
+        .await
+        .unwrap();
+    assert_eq!(next.assigned_seq, before.head_seq.next());
+    let accepted = commit(&sender, &stale, mutation(42), seq(8), insert_op(42))
+        .await
+        .unwrap();
+    assert_eq!(accepted.assigned_seq, next.assigned_seq.next());
+    fx.manager.shutdown_all().await;
+}
+
+/// Between two registrations a client's cursor never moves back, whatever lower cursor an ack,
+/// a sync, a commit or a deduplicated retry reports, and a heartbeat does not move it. A
+/// registration redefines it: to the cursor it reports, or to 0 without one.
+#[tokio::test(start_paused = true)]
+async fn cursor_never_moves_back_between_registrations_and_a_registration_redefines_it() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    for n in 1..=5u8 {
+        commit(&sender, &client, mutation(n), seq(0), insert_op(n.into()))
+            .await
+            .unwrap();
+    }
+    ack(&sender, &client, seq(4)).await.unwrap();
+    assert_eq!(cursor(&sender, &client).await, Some(seq(4)));
+
+    ack(&sender, &client, seq(2)).await.unwrap();
+    sync_from(&sender, &client, seq(1)).await.unwrap();
+    commit(&sender, &client, mutation(6), seq(3), insert_op(6))
+        .await
+        .unwrap();
+    commit(&sender, &client, mutation(1), seq(0), insert_op(1))
+        .await
+        .unwrap();
+    heartbeat(&sender, &client).await.unwrap();
+    assert_eq!(cursor(&sender, &client).await, Some(seq(4)));
+
+    register_at(&sender, &client, Some((seq(1), fx.incarnation))).await;
+    assert_eq!(cursor(&sender, &client).await, Some(seq(1)));
+    register(&sender, &client).await;
+    assert_eq!(cursor(&sender, &client).await, Some(seq(0)));
+
+    ack(&sender, &client, seq(3)).await.unwrap();
+    ack(&sender, &client, seq(2)).await.unwrap();
+    assert_eq!(cursor(&sender, &client).await, Some(seq(3)));
+    fx.manager.shutdown_all().await;
+}
+
+/// Onboarding under disruption: writers commit, sync and ack; newcomers register behind the
+/// log and wait for a snapshot; designees upload snapshots in one request or in chunks (some
+/// corrupt, abandoned or with a wrong hash) or go away; rooms restart, crash and lose their
+/// relay; relay snapshots expire. Optionally, sealed segments disappear (gaps) and TTL or quota
+/// compaction prunes a prefix regardless of the retention anchors.
+///
+/// Checked throughout: the tail never moves back, cursor-driven pruning never deletes what a
+/// connected or disconnected client, a usable snapshot or an upload in progress needs, only
+/// usable snapshots are announced, a download assembles exactly one uploaded snapshot, and
+/// every sync continues its cursor exactly. Liveness: no client waits for a snapshot longer
+/// than a bounded number of ticks, and once disruptions stop every client catches up.
+mod onboarding_sim {
+    use super::*;
+    use crate::relay::{LogBounds, SnapshotChunkUpload, Uploader, MIN_CHUNK_BYTES};
+    use std::collections::HashMap;
+    use zemdb_core::id::CorrelationId;
+    use zemdb_core::protocol::messages::ServerMessage;
+    use zemdb_core::protocol::snapshot_envelope::{
+        SnapshotCompression, SnapshotEnvelopeHeader, SNAPSHOT_HEADER_LEN,
+    };
+
+    #[derive(Debug)]
+    enum Phase {
+        Live,
+        NeedSnapshot {
+            since: u64,
+        },
+        Downloading {
+            since: u64,
+            seq: u64,
+            hash: [u8; 32],
+            total: u32,
+            next: u32,
+            bytes: Vec<u8>,
+        },
+    }
+
+    #[derive(Debug)]
+    struct ChunkedUpload {
+        seq: u64,
+        data: Vec<u8>,
+        hash: [u8; 32],
+        next: u32,
+        abandon_at: Option<u32>,
+    }
+
+    struct Client {
+        id: ClientId,
+        cursor: u64,
+        phase: Phase,
+        upload: Option<ChunkedUpload>,
+        away_until: u64,
+        writer: bool,
+    }
+
+    /// What a run went through, reported when an assertion fails.
+    #[derive(Default, Debug)]
+    struct Stats {
+        ticks: u64,
+        commits: u64,
+        uploads_ok: u64,
+        uploads_failed: u64,
+        uploads_abandoned: u64,
+        downloads_ok: u64,
+        downloads_superseded: u64,
+        restore_behind: u64,
+        catch_ups: u64,
+        max_catch_up_ticks: u64,
+        restarts: u64,
+        crashes: u64,
+        server_restarts: u64,
+        ttl_events: u64,
+        gaps: u64,
+        designee_away: u64,
+        newcomer_away: u64,
+        chunk0_below_known_gap: u64,
+        prune_checks: u64,
+        prunes: u64,
+        demand_expired_while_waiting: u64,
+    }
+
+    const SEEDS: RangeInclusive<u64> = 1..=3;
+    /// Ticks of disruptions per seed.
+    const TICKS: u64 = 600;
+    const LEASE: Duration = Duration::from_secs(30);
+    const TOKIO_STEP: Duration = Duration::from_secs(4);
+    /// Longest a client may wait for a snapshot while disruptions go on.
+    const MAX_WAIT_TICKS: u64 = 400;
+    /// Ticks without disruptions that every client gets to catch up at the end.
+    const QUIET_TICKS: u64 = 300;
+
+    struct Sim {
+        dir: TempDir,
+        room_id: RoomId,
+        incarnation: u128,
+        relay: Option<Arc<SnapshotRelay>>,
+        actor: Option<RoomActor>,
+        policy: RoomLifecyclePolicy,
+        rng: TestRng,
+        clients: Vec<Client>,
+        uploaded: HashMap<[u8; 32], Vec<u8>>,
+        next_mutation: u64,
+        tick: u64,
+        max_tail: u64,
+        /// The ranges of the segments deleted to inject gaps.
+        lost: Vec<(u64, u64)>,
+        stats: Stats,
+        gap_injection: bool,
+        ttl_injection: bool,
+    }
+
+    fn envelope(body: Vec<u8>) -> Vec<u8> {
+        let header =
+            SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, body.len() as u32, &body);
+        let mut data = header.to_bytes().to_vec();
+        data.extend_from_slice(&body);
+        data
+    }
+
+    /// The range of operations of the segment file `name`
+    /// (`segment_{first}_{last}.wal`, or `.wal.zst`).
+    fn segment_range(name: &str) -> (u64, u64) {
+        let stem = name.strip_prefix("segment_").unwrap();
+        let (first, rest) = stem.split_once('_').unwrap();
+        let last = rest.split_once('.').unwrap().0;
+        (first.parse().unwrap(), last.parse().unwrap())
+    }
+
+    impl Sim {
+        fn new(seed: u64, gap_injection: bool, ttl_injection: bool) -> Self {
+            let dir = tempdir().unwrap();
+            let relay = Self::new_relay(dir.path());
+            let policy = RoomLifecyclePolicy {
+                ram_max_ops: 3,
+                warm_disk_ttl: Duration::ZERO,
+                cold_disk_ttl: Duration::from_secs(10 * 365 * 24 * 3600),
+                lease_timeout: LEASE,
+                snapshot_demand_ttl: Duration::from_millis(100),
+                ..RoomLifecyclePolicy::default()
+            };
+            let mut sim = Self {
+                dir,
+                room_id: RoomId::new("simroom").unwrap(),
+                incarnation: 42,
+                relay: Some(relay),
+                actor: None,
+                policy,
+                rng: TestRng::new(seed),
+                clients: Vec::new(),
+                uploaded: HashMap::new(),
+                next_mutation: 1,
+                tick: 0,
+                max_tail: 0,
+                lost: Vec::new(),
+                stats: Stats::default(),
+                gap_injection,
+                ttl_injection,
+            };
+            sim.open_actor();
+            sim
+        }
+
+        fn new_relay(dir: &std::path::Path) -> Arc<SnapshotRelay> {
+            Arc::new(
+                SnapshotRelay::new(
+                    dir.join("snapshots"),
+                    Duration::from_secs(2000),
+                    ServerConfig::default().max_snapshot_bytes,
+                )
+                .unwrap(),
+            )
+        }
+
+        fn open_actor(&mut self) {
+            let config = Arc::new(ServerConfig {
+                data_dir: self.dir.path().to_path_buf(),
+                ..ServerConfig::default()
+            });
+            let (_sender, actor) = RoomActor::open(
+                self.room_id.clone(),
+                self.incarnation,
+                SchemaId::new("todo").unwrap(),
+                Arc::new(test_schema()),
+                self.dir.path(),
+                config,
+                self.policy.clone(),
+                Arc::clone(self.relay.as_ref().unwrap()),
+                ActorTimings {
+                    designation_timeout: Duration::from_millis(100),
+                    ..TEST_TIMINGS
+                },
+            )
+            .unwrap();
+            self.actor = Some(actor);
+            self.check_tail();
+        }
+
+        fn a(&mut self) -> &mut RoomActor {
+            self.actor.as_mut().unwrap()
+        }
+
+        fn relay(&self) -> Arc<SnapshotRelay> {
+            Arc::clone(self.relay.as_ref().unwrap())
+        }
+
+        fn bounds(&mut self) -> LogBounds {
+            let a = self.a();
+            LogBounds {
+                tail_seq: a.tiered_log.tail_seq(),
+                head_seq: a.head_seq,
+            }
+        }
+
+        /// The tail never moves back, not even across a reopen.
+        fn check_tail(&mut self) {
+            let tail = self.actor.as_ref().unwrap().tiered_log.tail_seq().get();
+            assert!(
+                tail >= self.max_tail,
+                "the tail moved back from {} to {tail} (tick {})",
+                self.max_tail,
+                self.tick
+            );
+            self.max_tail = tail;
+        }
+
+        /// The tail and the usable snapshot before a call that may prune the log.
+        fn before_prune(&mut self) -> (u64, Option<u64>) {
+            let a = self.a();
+            let snapshot = a.usable_snapshot_seq().map(|s| s.get());
+            (a.tiered_log.tail_seq().get(), snapshot)
+        }
+
+        /// The lowest sequence that cursor-driven pruning must keep: the cursors of connected
+        /// and disconnected clients inside the log after the call (the new cursor of a client
+        /// that acked included), the snapshot that was usable before it and an upload in
+        /// progress.
+        fn protected(&mut self, tail_before: u64, snapshot_before: Option<u64>) -> Option<u64> {
+            let ids: Vec<ClientId> = self.clients.iter().map(|c| c.id.clone()).collect();
+            let a = self.actor.as_ref().unwrap();
+            let mut floor = snapshot_before;
+            let mut take = |v: u64| floor = Some(floor.map_or(v, |f: u64| f.min(v)));
+            for id in &ids {
+                if let Some(entry) = a.lease_tracker.get_client(id) {
+                    let c = entry.last_ack_seq.get();
+                    let inside = c + 1 >= tail_before;
+                    if inside
+                        && matches!(
+                            entry.state,
+                            ClientState::Connected | ClientState::Disconnected
+                        )
+                    {
+                        take(c);
+                    }
+                }
+            }
+            if let Some(u) = a.snapshot_relay.upload_in_progress(&a.room_id) {
+                if u.get() + 1 >= tail_before {
+                    take(u.get());
+                }
+            }
+            floor
+        }
+
+        /// A prune by `what`, which started from `before` ([`before_prune`](Self::before_prune)),
+        /// deleted nothing past what someone needs. The tail may still move past it over
+        /// operations whose segment was lost before the prune.
+        fn check_prune(&mut self, before: (u64, Option<u64>), what: &str) {
+            let (tail_before, snapshot_before) = before;
+            self.stats.prune_checks += 1;
+            let tail_after = self.a().tiered_log.tail_seq().get();
+            if tail_after == tail_before {
+                return;
+            }
+            self.stats.prunes += 1;
+            if let Some(p) = self.protected(tail_before, snapshot_before) {
+                let deleted = (tail_before.max(p + 1)..tail_after).find(|s| {
+                    !self
+                        .lost
+                        .iter()
+                        .any(|&(start, end)| (start..=end).contains(s))
+                });
+                assert!(
+                    deleted.is_none(),
+                    "{what} pruned to tail {tail_after}, deleting {deleted:?} past the protected \
+                     {p} (tick {})",
+                    self.tick
+                );
+            }
+            self.check_tail();
+        }
+
+        /// An announced snapshot is inside the retained range and not below a known gap.
+        fn check_announced(&mut self, s: Option<SequenceNumber>, what: &str) {
+            if let Some(s) = s {
+                let b = self.bounds();
+                assert!(
+                    b.tail_seq.get() <= s.get() + 1 && s <= b.head_seq,
+                    "{what} announced the unusable snapshot {s} (tail {}, head {})",
+                    b.tail_seq,
+                    b.head_seq
+                );
+                assert_ne!(
+                    Some(s),
+                    self.a().unrestorable_snapshot,
+                    "{what} announced a snapshot below a known gap"
+                );
+            }
+        }
+
+        fn mutation(&mut self) -> MutationId {
+            let n = self.next_mutation;
+            self.next_mutation += 1;
+            MutationId::from_u128(u128::from(n))
+        }
+
+        fn add_client(&mut self, name: String, writer: bool) {
+            let id = ClientId::new(name).unwrap();
+            let inc = self.incarnation;
+            let reg = self.a().register(&id, None, Some(inc)).unwrap();
+            self.check_announced(reg.active_snapshot_seq, "Registered");
+            let state = self.a().lease_tracker.get_client(&id).unwrap().state;
+            let tick = self.tick;
+            let phase = if state == ClientState::Connected {
+                Phase::Live
+            } else {
+                Phase::NeedSnapshot { since: tick }
+            };
+            self.clients.push(Client {
+                id,
+                cursor: 0,
+                phase,
+                upload: None,
+                away_until: 0,
+                writer,
+            });
+            let i = self.clients.len() - 1;
+            if matches!(self.clients[i].phase, Phase::Live) {
+                self.catch_up(i);
+            }
+        }
+
+        /// Syncs client `i` from its cursor to the head. Returns whether it got there (false if
+        /// it fell behind the log) and whether some reply asked it for a snapshot.
+        fn catch_up(&mut self, i: usize) -> (bool, bool) {
+            let mut wanted = false;
+            for _ in 0..10_000 {
+                let (id, cursor) = (self.clients[i].id.clone(), self.clients[i].cursor);
+                match self.a().sync(&id, seq(cursor), 100) {
+                    Ok(batch) => {
+                        wanted |= batch.snapshot_wanted;
+                        for (k, op) in batch.ops.iter().enumerate() {
+                            assert_eq!(op.seq.get(), cursor + 1 + k as u64, "gap in a sync");
+                        }
+                        if let Some(last) = batch.ops.last() {
+                            self.clients[i].cursor = last.seq.get();
+                        }
+                        if !batch.has_more {
+                            return (true, wanted);
+                        }
+                    }
+                    Err(ServerError::BehindCompaction) => return (false, wanted),
+                    Err(ServerError::ClientNotRegistered(_)) => {
+                        self.reregister(i);
+                        return (matches!(self.clients[i].phase, Phase::Live), wanted);
+                    }
+                    Err(e) => panic!("sync failed: {e:?}"),
+                }
+            }
+            panic!("sync did not converge");
+        }
+
+        fn reregister(&mut self, i: usize) {
+            let id = self.clients[i].id.clone();
+            let inc = self.incarnation;
+            let cursor = match self.clients[i].phase {
+                Phase::Live => Some(seq(self.clients[i].cursor)),
+                _ => None,
+            };
+            let reg = self.a().register(&id, cursor, cursor.map(|_| inc)).unwrap();
+            self.check_announced(reg.active_snapshot_seq, "Registered");
+            let state = self.a().lease_tracker.get_client(&id).unwrap().state;
+            if state == ClientState::Bootstrapping && matches!(self.clients[i].phase, Phase::Live) {
+                let tick = self.tick;
+                self.clients[i].phase = Phase::NeedSnapshot { since: tick };
+            }
+        }
+
+        fn fall_behind(&mut self, i: usize) {
+            let tick = self.tick;
+            self.clients[i].phase = Phase::NeedSnapshot { since: tick };
+            self.clients[i].upload = None;
+        }
+
+        async fn step_live(&mut self, i: usize) {
+            let id = self.clients[i].id.clone();
+            let mut wanted = false;
+            match self.a().heartbeat(&id) {
+                Ok(hb) => {
+                    wanted |= hb.snapshot_wanted;
+                    self.check_announced(hb.active_snapshot_seq, "HeartbeatAck");
+                }
+                Err(ServerError::ClientNotRegistered(_)) => {
+                    self.reregister(i);
+                    if !matches!(self.clients[i].phase, Phase::Live) {
+                        return;
+                    }
+                }
+                Err(e) => panic!("heartbeat: {e:?}"),
+            }
+            // Writers commit more often than readers.
+            let commit_p = if self.clients[i].writer { 300 } else { 50 };
+            if self.rng.permille(commit_p) {
+                let mid = self.mutation();
+                let cursor = self.clients[i].cursor;
+                let op = insert_op((self.next_mutation % 50) as i64);
+                let mut flow = ControlFlow::Continue(());
+                match self.a().commit(&id, mid, seq(cursor), op, &mut flow) {
+                    Ok(resp) => {
+                        self.stats.commits += 1;
+                        wanted |= resp.snapshot_wanted;
+                        for (k, op) in resp.catchup_ops.iter().enumerate() {
+                            assert_eq!(op.seq.get(), cursor + 1 + k as u64, "gap in a catch-up");
+                        }
+                        if let Some(last) = resp.catchup_ops.last() {
+                            self.clients[i].cursor = last.seq.get();
+                        }
+                    }
+                    Err(ServerError::BehindCompaction) => {}
+                    Err(ServerError::ClientNotRegistered(_)) => {
+                        self.reregister(i);
+                        return;
+                    }
+                    Err(e) => panic!("commit: {e:?}"),
+                }
+                assert!(flow.is_continue());
+            }
+            let (ok, w) = self.catch_up(i);
+            wanted |= w;
+            if !ok {
+                self.fall_behind(i);
+                return;
+            }
+            // The ack prunes the log proactively.
+            let before = self.before_prune();
+            let cursor = self.clients[i].cursor;
+            match self.a().ack(&id, seq(cursor)) {
+                Ok(_) => self.check_prune(before, "an ack"),
+                Err(ServerError::BehindCompaction) => {
+                    self.fall_behind(i);
+                    return;
+                }
+                Err(ServerError::ClientNotRegistered(_)) => self.reregister(i),
+                Err(e) => panic!("ack: {e:?}"),
+            }
+            // A designee may go away instead of uploading.
+            if self.clients[i].upload.is_some() {
+                self.continue_upload(i).await;
+            } else if wanted {
+                let id = self.clients[i].id.clone();
+                if self.rng.permille(200) && self.live_writers_present(&id) {
+                    self.stats.designee_away += 1;
+                    let t = 10 + self.rng.below(50);
+                    self.send_away(i, t);
+                    return;
+                }
+                self.start_upload(i).await;
+            }
+        }
+
+        async fn start_upload(&mut self, i: usize) {
+            let s = self.clients[i].cursor;
+            if s == 0 {
+                return;
+            }
+            let tag = self.rng.next_u64();
+            if self.rng.permille(500) {
+                // In a single request, one in five corrupt.
+                let mut data = envelope(format!("{s}:{tag}").into_bytes());
+                if self.rng.permille(200) {
+                    let last = data.len() - 1;
+                    data[last] ^= 0xff;
+                }
+                let bounds = self.bounds();
+                let room = self.room_id.clone();
+                let res = self
+                    .relay()
+                    .stage_snapshot(&room, seq(s), bytes::Bytes::from(data.clone()), async {
+                        Ok(bounds)
+                    })
+                    .await;
+                match res {
+                    Ok(hash) => {
+                        self.stats.uploads_ok += 1;
+                        self.uploaded.insert(hash, data);
+                    }
+                    Err(_) => self.stats.uploads_failed += 1,
+                }
+            } else {
+                let mut body = vec![0u8; 200 * 1024 - SNAPSHOT_HEADER_LEN];
+                body[..16].copy_from_slice(&[s.to_le_bytes(), tag.to_le_bytes()].concat());
+                let data = envelope(body);
+                let mut hash = ServerMessage::compute_snapshot_hash(&data);
+                if self.rng.permille(200) {
+                    // A wrong hash: rejected when the upload completes.
+                    hash[0] ^= 1;
+                }
+                let abandon_at = self.rng.permille(250).then(|| 1 + self.rng.below(2) as u32);
+                self.clients[i].upload = Some(ChunkedUpload {
+                    seq: s,
+                    data,
+                    hash,
+                    next: 0,
+                    abandon_at,
+                });
+                self.continue_upload(i).await;
+            }
+        }
+
+        async fn continue_upload(&mut self, i: usize) {
+            let id = self.clients[i].id.clone();
+            let Some(up) = self.clients[i].upload.as_mut() else {
+                return;
+            };
+            if up.next >= 3 {
+                // Every chunk was sent, but the session that held the first ones was lost
+                // (expired or replaced): the last chunk did not complete it.
+                self.stats.uploads_failed += 1;
+                self.clients[i].upload = None;
+                return;
+            }
+            if up.abandon_at == Some(up.next) {
+                // The uploader keeps running but never sends the rest.
+                self.stats.uploads_abandoned += 1;
+                self.clients[i].upload = None;
+                return;
+            }
+            let chunk_len = up.data.len().div_ceil(3);
+            let start = up.next as usize * chunk_len;
+            let end = (start + chunk_len).min(up.data.len());
+            let chunk = SnapshotChunkUpload {
+                room_id: self.room_id.clone(),
+                uploader: Uploader::Client(id),
+                head_seq: seq(up.seq),
+                chunk_index: up.next,
+                total_chunks: 3,
+                total_bytes: up.data.len() as u64,
+                snapshot_hash: up.hash,
+                data: bytes::Bytes::copy_from_slice(&up.data[start..end]),
+            };
+            let bounds = self.bounds();
+            let res = self.relay().stage_chunk(chunk, async { Ok(bounds) }).await;
+            let up = self.clients[i].upload.as_mut().unwrap();
+            match res {
+                Ok(true) => {
+                    self.stats.uploads_ok += 1;
+                    let up = self.clients[i].upload.take().unwrap();
+                    self.uploaded.insert(up.hash, up.data);
+                }
+                Ok(false) => up.next += 1,
+                Err(_) => {
+                    self.stats.uploads_failed += 1;
+                    self.clients[i].upload = None;
+                }
+            }
+        }
+
+        async fn step_bootstrapping(&mut self, i: usize) {
+            let id = self.clients[i].id.clone();
+            if let Phase::NeedSnapshot { .. } = self.clients[i].phase {
+                let hb = match self.a().heartbeat(&id) {
+                    Ok(hb) => hb,
+                    Err(ServerError::ClientNotRegistered(_)) => {
+                        self.reregister(i);
+                        return;
+                    }
+                    Err(e) => panic!("heartbeat: {e:?}"),
+                };
+                self.check_announced(hb.active_snapshot_seq, "HeartbeatAck");
+                if hb.active_snapshot_seq.is_none() {
+                    return;
+                }
+            }
+            let since = match self.clients[i].phase {
+                Phase::NeedSnapshot { since } | Phase::Downloading { since, .. } => since,
+                Phase::Live => unreachable!(),
+            };
+            let (index, anchor) = match &self.clients[i].phase {
+                Phase::Downloading { next, hash, .. } => (*next, Some(*hash)),
+                _ => (0, None),
+            };
+            let bounds = self.bounds();
+            let room = self.room_id.clone();
+            let res = self
+                .relay()
+                .get_chunk(
+                    CorrelationId::new(1),
+                    &room,
+                    index,
+                    MIN_CHUNK_BYTES,
+                    anchor,
+                    async { Ok(bounds) },
+                )
+                .await;
+            match res {
+                Ok(ServerMessage::SnapshotChunk {
+                    snapshot_head_seq,
+                    total_chunks,
+                    snapshot_hash,
+                    data,
+                    ..
+                }) => {
+                    if index == 0 {
+                        let b = self.bounds();
+                        assert!(
+                            b.tail_seq.get() <= snapshot_head_seq.get() + 1
+                                && snapshot_head_seq <= b.head_seq,
+                            "chunk 0 served a snapshot outside the retained range"
+                        );
+                        // Not checked: the first chunk does not yet know the gaps the room
+                        // found after a snapshot.
+                        if Some(snapshot_head_seq) == self.a().unrestorable_snapshot {
+                            self.stats.chunk0_below_known_gap += 1;
+                        }
+                        self.clients[i].phase = Phase::Downloading {
+                            since,
+                            seq: snapshot_head_seq.get(),
+                            hash: snapshot_hash,
+                            total: total_chunks,
+                            next: 0,
+                            bytes: Vec::new(),
+                        };
+                    }
+                    let Phase::Downloading {
+                        seq: s,
+                        hash,
+                        total,
+                        next,
+                        bytes,
+                        ..
+                    } = &mut self.clients[i].phase
+                    else {
+                        unreachable!()
+                    };
+                    assert_eq!(snapshot_hash, *hash, "a chunk of another snapshot");
+                    assert_eq!(snapshot_head_seq.get(), *s);
+                    bytes.extend_from_slice(&data);
+                    *next += 1;
+                    if *next == *total {
+                        // The assembled bytes are exactly one uploaded snapshot.
+                        assert_eq!(&ServerMessage::compute_snapshot_hash(bytes), hash);
+                        assert_eq!(
+                            self.uploaded.get(hash),
+                            Some(&*bytes),
+                            "a download mixed the bytes of two snapshots"
+                        );
+                        let s = *s;
+                        self.stats.downloads_ok += 1;
+                        self.clients[i].cursor = s;
+                        self.clients[i].phase = Phase::Live;
+                        let (ok, _) = self.catch_up(i);
+                        if ok {
+                            let took = self.tick - since;
+                            self.stats.catch_ups += 1;
+                            self.stats.max_catch_up_ticks = self.stats.max_catch_up_ticks.max(took);
+                        } else {
+                            self.stats.restore_behind += 1;
+                            self.clients[i].phase = Phase::NeedSnapshot { since };
+                        }
+                    }
+                }
+                Ok(other) => panic!("unexpected {other:?}"),
+                Err(ServerError::SnapshotSuperseded(_)) | Err(ServerError::RoomNotFound(_)) => {
+                    if anchor.is_some() {
+                        self.stats.downloads_superseded += 1;
+                    }
+                    self.clients[i].phase = Phase::NeedSnapshot { since };
+                }
+                Err(e) => panic!("get_chunk: {e:?}"),
+            }
+        }
+
+        fn live_writers_present(&self, except: &ClientId) -> bool {
+            self.clients.iter().any(|c| {
+                &c.id != except && matches!(c.phase, Phase::Live) && c.away_until <= self.tick
+            })
+        }
+
+        /// Client `i` stops for `ticks` ticks, its lease already expired.
+        fn send_away(&mut self, i: usize, ticks: u64) {
+            self.clients[i].away_until = self.tick + ticks;
+            self.clients[i].upload = None;
+            let id = self.clients[i].id.clone();
+            if let Some(entry) = self.a().lease_tracker.get_client_mut(&id) {
+                entry.last_heartbeat = std::time::Instant::now()
+                    .checked_sub(LEASE + Duration::from_secs(1))
+                    .unwrap();
+            }
+        }
+
+        async fn events(&mut self, quiet: bool) {
+            if quiet {
+                return;
+            }
+            if self.rng.permille(20) {
+                self.stats.restarts += 1;
+                let mut a = self.actor.take().unwrap();
+                a.persist_roster_at_stop();
+                drop(a);
+                self.open_actor();
+            }
+            if self.rng.permille(10) {
+                self.stats.crashes += 1;
+                drop(self.actor.take());
+                self.open_actor();
+            }
+            if self.rng.permille(5) {
+                self.stats.server_restarts += 1;
+                drop(self.actor.take());
+                self.relay = None;
+                self.relay = Some(Self::new_relay(self.dir.path()));
+                // Uploads in progress were lost.
+                for c in &mut self.clients {
+                    c.upload = None;
+                }
+                self.open_actor();
+            }
+            if self.rng.permille(25) {
+                // The relay snapshot expires.
+                tokio::time::advance(Duration::from_secs(2000)).await;
+            }
+            if self.ttl_injection && self.rng.permille(15) {
+                // TTL or quota compaction: prunes a prefix regardless of the retention anchors.
+                self.stats.ttl_events += 1;
+                let head = self.a().head_seq.get();
+                let target = seq(head.saturating_sub(2));
+                let _ = self.a().tiered_log.prune_older_than(target);
+                self.check_tail();
+            }
+            if self.gap_injection && self.rng.permille(15) {
+                // A sealed segment other than the oldest and the newest disappears.
+                let segments = self.dir.path().join("rooms/simroom/segments");
+                let mut names: Vec<String> = fs::read_dir(&segments)
+                    .unwrap()
+                    .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                    .filter(|n| {
+                        n.ends_with(".wal") && n.starts_with("segment_") || n.ends_with(".wal.zst")
+                    })
+                    .collect();
+                names.sort();
+                if names.len() >= 3 {
+                    let victim = &names[1 + self.rng.below(names.len() as u64 - 2) as usize];
+                    if fs::remove_file(segments.join(victim)).is_ok() {
+                        self.lost.push(segment_range(victim));
+                    }
+                    self.stats.gaps += 1;
+                }
+            }
+            // The designee goes away.
+            if self.rng.permille(30) {
+                if let Some(d) = self.a().snapshot_demand.designee().cloned() {
+                    if self.live_writers_present(&d) {
+                        if let Some(i) = self.clients.iter().position(|c| c.id == d) {
+                            self.stats.designee_away += 1;
+                            let t = 10 + self.rng.below(50);
+                            self.send_away(i, t);
+                        }
+                    }
+                }
+            }
+            // A waiting newcomer goes away; its demand can expire meanwhile.
+            if self.rng.permille(60) {
+                let waiting: Vec<usize> = (0..self.clients.len())
+                    .filter(|&i| {
+                        !self.clients[i].writer
+                            && !matches!(self.clients[i].phase, Phase::Live)
+                            && self.clients[i].away_until <= self.tick
+                    })
+                    .collect();
+                if !waiting.is_empty() {
+                    let i = waiting[self.rng.below(waiting.len() as u64) as usize];
+                    self.stats.newcomer_away += 1;
+                    let t = 30 + self.rng.below(50);
+                    self.send_away(i, t);
+                }
+            }
+            if self.rng.permille(25) && self.clients.len() < 16 {
+                let n = self.clients.len();
+                self.add_client(format!("newcomer-{n}"), false);
+            }
+        }
+
+        async fn run_tick(&mut self, quiet: bool) {
+            self.tick += 1;
+            self.stats.ticks += 1;
+            self.events(quiet).await;
+            let mut order: Vec<usize> = (0..self.clients.len()).collect();
+            for k in (1..order.len()).rev() {
+                let j = self.rng.below(k as u64 + 1) as usize;
+                order.swap(k, j);
+            }
+            for i in order {
+                if self.clients[i].away_until > self.tick {
+                    continue;
+                }
+                match self.clients[i].phase {
+                    Phase::Live => self.step_live(i).await,
+                    _ => self.step_bootstrapping(i).await,
+                }
+            }
+            self.a().run_fast_maintenance();
+            if !self.waiting().is_empty()
+                && !self.a().snapshot_demand.is_active()
+                && self.a().usable_snapshot_seq().is_none()
+            {
+                self.stats.demand_expired_while_waiting += 1;
+            }
+            if self.tick % 3 == 0 {
+                let before = self.before_prune();
+                self.a().run_disk_maintenance().await;
+                self.check_prune(before, "the slow tick");
+            }
+            self.check_tail();
+            tokio::time::advance(TOKIO_STEP).await;
+            // The snapshot demand and the designation expire in real time.
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        /// The clients waiting for a snapshot, with how many ticks they have waited.
+        fn waiting(&self) -> Vec<(String, u64)> {
+            self.clients
+                .iter()
+                .filter_map(|c| match c.phase {
+                    Phase::NeedSnapshot { since } | Phase::Downloading { since, .. } => {
+                        Some((c.id.to_string(), self.tick - since))
+                    }
+                    Phase::Live => None,
+                })
+                .collect()
+        }
+    }
+
+    /// Runs [`TICKS`] ticks of disruptions and then a quiet phase for each of [`SEEDS`]. The
+    /// runs together must complete snapshot downloads and inject the enabled disruptions, so
+    /// that a change in the trajectories cannot leave the simulation checking nothing.
+    ///
+    /// The seeds fix every random choice, but the snapshot demand and the designation expire
+    /// in real time, so how a run unfolds also depends on how fast the machine runs it.
+    async fn run(gaps: bool, ttl: bool) {
+        let mut exercised = [0; 3];
+        for seed in SEEDS {
+            let mut sim = Sim::new(seed, gaps, ttl);
+            sim.add_client("writer-a".into(), true);
+            sim.add_client("writer-b".into(), true);
+            for _ in 0..TICKS {
+                sim.run_tick(false).await;
+                for (id, waited) in sim.waiting() {
+                    assert!(
+                        waited <= MAX_WAIT_TICKS,
+                        "{id} waited {waited} ticks for a snapshot (seed {seed}, tick {}): {:?}",
+                        sim.tick,
+                        sim.stats
+                    );
+                }
+            }
+            for _ in 0..QUIET_TICKS {
+                for c in &mut sim.clients {
+                    c.away_until = c.away_until.min(sim.tick);
+                }
+                sim.run_tick(true).await;
+                if sim.waiting().is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                sim.waiting().is_empty(),
+                "clients never caught up (seed {seed}): {:?} {:?}",
+                sim.waiting(),
+                sim.stats
+            );
+            exercised[0] += sim.stats.downloads_ok;
+            exercised[1] += sim.stats.gaps;
+            exercised[2] += sim.stats.ttl_events;
+        }
+        let [downloads, lost_segments, ttl_prunes] = exercised;
+        assert!(
+            downloads > 0 && (!gaps || lost_segments > 0) && (!ttl || ttl_prunes > 0),
+            "the simulation exercised too little: {downloads} downloads, {lost_segments} lost \
+             segments, {ttl_prunes} TTL prunes"
+        );
+    }
+
+    // Every tick syncs files to disk, so even a short run takes several seconds: these tests
+    // only run on demand.
+
+    #[tokio::test(start_paused = true)]
+    #[ignore = "long-running randomized test; run with --ignored in release"]
+    async fn clients_that_fall_behind_catch_up_through_restarts_and_crashes() {
+        run(false, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[ignore = "long-running randomized test; run with --ignored in release"]
+    async fn clients_that_fall_behind_catch_up_despite_lost_segments() {
+        run(true, false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[ignore = "long-running randomized test; run with --ignored in release"]
+    async fn clients_that_fall_behind_catch_up_despite_ttl_pruning() {
+        run(false, true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[ignore = "long-running randomized test; run with --ignored in release"]
+    async fn clients_that_fall_behind_catch_up_despite_lost_segments_and_ttl_pruning() {
+        run(true, true).await;
+    }
 }

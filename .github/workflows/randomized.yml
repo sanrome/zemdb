@@ -1,0 +1,25 @@
+name: Long randomized tests
+
+# The full simulations, fuzzers and crash-image tests (marked #[ignore]) are too slow for every
+# change; the regular CI runs shorter versions of them. These run weekly, and by hand when a
+# batch of fixes is closed.
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  randomized:
+    name: Long randomized tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --release -- --ignored

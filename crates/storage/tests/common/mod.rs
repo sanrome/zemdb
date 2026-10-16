@@ -3,6 +3,8 @@
 // Each file in `tests/` is a crate of its own and uses only part of these helpers.
 #![allow(dead_code)]
 
+pub mod rng;
+
 use futures::StreamExt;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};

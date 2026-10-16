@@ -2,7 +2,8 @@ use super::*;
 use crate::dedup::DedupLruCache;
 use crate::log::io_probe::{self, IoEvent};
 use crate::log::policy::{MAX_LOG_BYTES_LIMIT, MIN_LOG_BYTES_LIMIT};
-use crate::log::test_support::{make_op, segment_file, seqs};
+use crate::log::test_support::{frames, make_op, segment_file, seqs};
+use crate::test_support::TestRng;
 use std::io::Write;
 use std::thread::sleep;
 use std::time::Duration;
@@ -1756,4 +1757,400 @@ fn test_unified_wal_zero_filled_eof_truncation() {
     assert_eq!(log2.head_seq().get(), 1);
     assert_eq!(recovered_mutations.len(), 1);
     assert_eq!(file_len(&active_path), clean_len);
+}
+
+// ---- Randomized reads checked against every accepted operation ------------------------------
+
+/// An operation of a random size, from a few bytes to a few KiB, so that the byte limits of
+/// RAM and of the active segment cut at varying places.
+fn random_size_op(seq: u64, rng: &mut TestRng) -> SequencedOperation {
+    let len = match rng.below(10) {
+        0 => 3_000 + rng.below(3_000) as usize,
+        1..=3 => 200 + rng.below(800) as usize,
+        _ => rng.below(40) as usize,
+    };
+    let row = zemdb_core::value::CompactRow::new(vec![
+        Value::Int(seq as i64),
+        Value::Bytes(vec![(seq % 251) as u8; len].into()),
+    ]);
+    SequencedOperation::new(
+        SequenceNumber::new(seq),
+        Operation::insert(1, PrimaryKey::single(Value::Int(seq as i64)), row, seq),
+    )
+}
+
+/// Follows `has_more` from `cursor` asking for `batch_size()` operations per page, as a client
+/// does, and returns the concatenation of the pages, or the first error. Every page respects
+/// its size, and none is empty while the cursor is below the head.
+fn read_chain(
+    log: &TieredLog,
+    cursor: u64,
+    mut batch_size: impl FnMut() -> u32,
+) -> Result<Vec<SequencedOperation>, ServerError> {
+    let mut out: Vec<SequencedOperation> = Vec::new();
+    let mut at = cursor;
+    loop {
+        let batch = batch_size();
+        let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(at), batch)?;
+        assert!(ops.len() <= batch as usize, "page over its size from {at}");
+        if at < log.head_seq().get() {
+            assert!(!ops.is_empty(), "empty page below the head from {at}");
+        }
+        let Some(last) = ops.last() else {
+            assert!(!has_more, "has_more without progress from {at}");
+            break;
+        };
+        at = last.seq.get();
+        out.extend(ops);
+        if !has_more {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Checks `log` against `accepted`, every operation appended to it so far: the head is the
+/// number of operations, the tail is within `[1, head + 1]`, a chain from any cursor of the
+/// retained range (the edges of every segment and of RAM among them) returns its exact
+/// suffix, and a cursor below the range gets `BehindCompaction`.
+fn check_reads(log: &TieredLog, accepted: &[SequencedOperation], rng: &mut TestRng, step: &str) {
+    let head = log.head_seq().get();
+    let tail = log.tail_seq().get();
+    assert_eq!(head, accepted.len() as u64, "{step}: head");
+    assert!(
+        tail >= 1 && tail <= head + 1,
+        "{step}: tail {tail}, head {head}"
+    );
+
+    let retained = |c: &&u64| **c + 1 >= tail && **c <= head;
+    let mut cursors = vec![tail - 1, head, head.saturating_sub(1).max(tail - 1)];
+    for segment in log.segments.iter() {
+        let (start, end) = (segment.start_seq.get(), segment.end_seq.get());
+        cursors.extend([start - 1, start, end].iter().filter(retained));
+    }
+    if let Some(min) = log.hot_buffer.min_seq() {
+        let min = min.get();
+        cursors.extend([min.saturating_sub(1), min].iter().filter(retained));
+    }
+    for _ in 0..6 {
+        cursors.push(tail - 1 + rng.below(head + 2 - tail));
+    }
+    for c in cursors {
+        let got = read_chain(log, c, || 1 + rng.below(7) as u32)
+            .unwrap_or_else(|e| panic!("{step}: cursor {c} (tail {tail}, head {head}): {e}"));
+        assert!(
+            got.as_slice() == &accepted[c as usize..],
+            "{step}: cursor {c} (tail {tail}, head {head}) got {:?}",
+            seqs(&got)
+        );
+    }
+
+    if tail >= 2 {
+        let c = rng.below(tail - 1);
+        assert!(
+            matches!(
+                log.fetch_deltas(SequenceNumber::new(c), 5),
+                Err(ServerError::BehindCompaction)
+            ),
+            "{step}: cursor {c} below tail {tail}"
+        );
+    }
+}
+
+/// A clock some time from now: none, past the RAM TTL, or past every disk TTL.
+fn random_clock(rng: &mut TestRng) -> MaintenanceClock {
+    let later = [
+        Duration::ZERO,
+        Duration::from_secs(120),
+        Duration::from_secs(7_200),
+    ];
+    MaintenanceClock::after(later[rng.below(3) as usize])
+}
+
+/// For each seed, `steps` random steps on a log with small random limits (appends, maintenance
+/// at different ages, cursor-driven pruning, forced rotation, reopening), checking every read
+/// after each step against the accepted operations, and that the tail never moves back.
+fn simulate_reads(seeds: std::ops::Range<u64>, steps: usize) {
+    for seed in seeds {
+        let mut rng = TestRng::new(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) + 1);
+        let dir = tempdir().unwrap();
+        let policy = RoomLifecyclePolicy {
+            ram_max_ops: 1 + rng.below(6) as usize,
+            ram_max_bytes: 2_000 + rng.below(10_000),
+            segment_max_bytes: 1_500 + rng.below(8_000),
+            ram_ttl: Duration::from_secs(60),
+            warm_disk_ttl: Duration::from_secs(if rng.below(2) == 0 { 0 } else { 600 }),
+            cold_disk_ttl: Duration::from_secs(3_600),
+            max_room_disk_bytes: if rng.below(3) == 0 {
+                20_000 + rng.below(20_000)
+            } else {
+                u64::MAX / 4
+            },
+            ..RoomLifecyclePolicy::default()
+        };
+        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+        let mut accepted: Vec<SequencedOperation> = Vec::new();
+        let mut last_tail = log.tail_seq().get();
+        for step in 0..steps {
+            match rng.below(10) {
+                0..=4 => {
+                    for _ in 0..1 + rng.below(6) {
+                        let op = random_size_op(accepted.len() as u64 + 1, &mut rng);
+                        let id = mutation_for(op.seq.get());
+                        let outcome = log.append(op.clone(), Some(id)).unwrap();
+                        assert!(outcome.rotation_error.is_none());
+                        accepted.push(op);
+                    }
+                }
+                5 => {
+                    log.run_maintenance_sync_at(random_clock(&mut rng)).unwrap();
+                }
+                6 => {
+                    let target = 1 + rng.below(log.head_seq().get().max(1));
+                    log.prune_older_than(SequenceNumber::new(target)).unwrap();
+                }
+                7 => {
+                    log.force_rotate_warm().unwrap();
+                }
+                _ => {
+                    drop(log);
+                    log = TieredLog::open_or_create(dir.path(), policy.clone())
+                        .unwrap()
+                        .0;
+                }
+            }
+            let step = format!("seed {seed} step {step}");
+            let tail = log.tail_seq().get();
+            assert!(tail >= last_tail, "{step}: tail moved back");
+            last_tail = tail;
+            check_reads(&log, &accepted, &mut rng, &step);
+        }
+    }
+}
+
+#[test]
+fn reads_from_any_cursor_return_its_exact_suffix() {
+    simulate_reads(0..1, 20);
+}
+
+#[test]
+#[ignore = "long-running randomized test; run with --ignored in release"]
+fn reads_from_any_cursor_return_its_exact_suffix_over_many_seeds() {
+    simulate_reads(0..24, 45);
+}
+
+/// Operations of about a third of a response, and two small ones right after a large one in
+/// the next tier: the byte budget cuts pages inside and at the edges of every tier, a page
+/// never continues past an operation it refused even when a later one would fit, and a chain
+/// from any cursor returns its exact suffix. Encoding and decoding some 100 MiB of operations
+/// takes many seconds in a debug build.
+#[test]
+#[ignore = "long-running test; run with --ignored in release"]
+fn byte_budget_cuts_never_skip_an_operation_across_tiers() {
+    // A page from 0 takes 1..=3 and refuses 4; one from 1 refuses 4 and one from 2 refuses 6,
+    // and 5 and 7, in the next tier, would still fit.
+    const SIZES_KIB: [usize; 7] = [5_200, 5_300, 5_100, 6_000, 1, 5_400, 1];
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 2,
+        ram_max_bytes: MAX_LOG_BYTES_LIMIT,
+        warm_disk_ttl: Duration::ZERO,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    let mut accepted = Vec::new();
+    for (seq, kib) in (1..=7).zip(SIZES_KIB) {
+        let op = large_op(seq, kib * KIB);
+        log.append(op.clone(), None).unwrap();
+        accepted.push(op);
+        if seq == 4 {
+            // 1..=2 and 3..=4 sealed and compressed.
+            log.run_maintenance_sync().unwrap();
+        }
+    }
+    // 5..=6 sealed warm, 7 in active.wal and RAM.
+    assert_eq!(count_in(&log, Tier::Cold), 2);
+    assert_eq!(count_in(&log, Tier::Warm), 1);
+    for c in 0..=7u64 {
+        let got = read_chain(&log, c, || 100).unwrap();
+        assert!(
+            got.as_slice() == &accepted[c as usize..],
+            "cursor {c}: {:?}",
+            seqs(&got)
+        );
+    }
+}
+
+/// For each seed, chains of pages from random cursors while the log changes between pages
+/// (appends, maintenance at different ages, cursor-driven pruning, reopening). Every page
+/// continues its cursor exactly with the accepted operations, its `has_more` says whether the
+/// head was reached, and the only error is `BehindCompaction` for a cursor behind the tail.
+fn simulate_pages_while_the_log_changes(seeds: std::ops::Range<u64>, chains: usize) {
+    fn append(log: &mut TieredLog, accepted: &mut Vec<SequencedOperation>, rng: &mut TestRng) {
+        for _ in 0..1 + rng.below(4) {
+            let op = random_size_op(accepted.len() as u64 + 1, rng);
+            log.append(op.clone(), None).unwrap();
+            accepted.push(op);
+        }
+    }
+
+    for seed in seeds {
+        let mut rng = TestRng::new(seed.wrapping_mul(0x9E37_79B9) + 11);
+        let dir = tempdir().unwrap();
+        let policy = RoomLifecyclePolicy {
+            ram_max_ops: 1 + rng.below(5) as usize,
+            ram_max_bytes: 1_500 + rng.below(6_000),
+            segment_max_bytes: 1_200 + rng.below(5_000),
+            ram_ttl: Duration::from_secs(60),
+            warm_disk_ttl: Duration::ZERO,
+            cold_disk_ttl: Duration::from_secs(3_600),
+            max_room_disk_bytes: 30_000 + rng.below(30_000),
+            ..RoomLifecyclePolicy::default()
+        };
+        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+        let mut accepted: Vec<SequencedOperation> = Vec::new();
+        for _ in 0..10 {
+            append(&mut log, &mut accepted, &mut rng);
+        }
+        for chain in 0..chains {
+            let context = format!("seed {seed} chain {chain}");
+            let (tail, head) = (log.tail_seq().get(), log.head_seq().get());
+            let mut at = tail - 1 + rng.below(head + 2 - tail);
+            loop {
+                let batch = 1 + rng.below(5) as u32;
+                let (tail, head) = (log.tail_seq().get(), log.head_seq().get());
+                match log.fetch_deltas(SequenceNumber::new(at), batch) {
+                    Ok((ops, has_more)) => {
+                        let n = ops.len() as u64;
+                        assert!(
+                            ops.as_slice() == &accepted[at as usize..(at + n) as usize],
+                            "{context}: page from {at}"
+                        );
+                        assert_eq!(has_more, at + n < head, "{context}: has_more from {at}");
+                        assert!(at == head || n > 0, "{context}: empty page below the head");
+                        at += n;
+                        if !has_more {
+                            break;
+                        }
+                    }
+                    Err(ServerError::BehindCompaction) => {
+                        assert!(
+                            at + 1 < tail,
+                            "{context}: BehindCompaction from {at}, tail {tail}"
+                        );
+                        break;
+                    }
+                    Err(e) => panic!("{context}: {e}"),
+                }
+                // The log moves on between pages.
+                match rng.below(8) {
+                    0 | 1 => append(&mut log, &mut accepted, &mut rng),
+                    2 => {
+                        log.run_maintenance_sync_at(random_clock(&mut rng)).unwrap();
+                    }
+                    3 => {
+                        let target = 1 + rng.below(log.head_seq().get().max(1));
+                        log.prune_older_than(SequenceNumber::new(target)).unwrap();
+                    }
+                    4 => {
+                        drop(log);
+                        log = TieredLog::open_or_create(dir.path(), policy.clone())
+                            .unwrap()
+                            .0;
+                    }
+                    _ => {}
+                }
+            }
+            append(&mut log, &mut accepted, &mut rng);
+        }
+    }
+}
+
+#[test]
+fn pages_stay_exact_while_the_log_changes_between_them() {
+    simulate_pages_while_the_log_changes(100..101, 10);
+}
+
+#[test]
+#[ignore = "long-running randomized test; run with --ignored in release"]
+fn pages_stay_exact_while_the_log_changes_between_them_over_many_seeds() {
+    simulate_pages_while_the_log_changes(100..116, 30);
+}
+
+/// A cursor-driven prune whose deletion fails in the middle of its prefix keeps the retained
+/// range contiguous, and reopening finishes it without moving the tail back.
+#[test]
+fn prune_failing_mid_prefix_stays_contiguous_and_reopening_finishes_it() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 3,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+    // Segments 1..=3, 4..=6, 7..=9 and 10..=12; 13 in active.wal.
+    append_range(&mut log, 1, 13);
+    let segments = segments_dir(dir.path());
+    crate::fail_point::arm("remove_file", &segment_file(&segments, 4, 6, "wal"));
+
+    assert!(log.prune_older_than(SequenceNumber::new(10)).is_err());
+    let tail = log.tail_seq().get();
+    assert_eq!(tail, 4, "only the first segment went");
+    let (ops, _) = log
+        .fetch_deltas(SequenceNumber::new(tail - 1), 100)
+        .unwrap();
+    assert_contiguous(&ops, tail, 13);
+    drop(log);
+
+    let (log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    assert_eq!(log.tail_seq().get(), 10);
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(9), 100).unwrap();
+    assert_contiguous(&ops, 10, 13);
+}
+
+/// Opens a three-frame `active.wal` with each byte flipped by each of `masks(position)`. Damage
+/// in a frame followed by a valid frame fails the open and leaves the file as it was; damage in
+/// the last frame truncates the file exactly where that frame starts. A damaged frame is never
+/// decoded into an operation.
+fn check_byte_flips_of_active_wal(masks: impl Fn(usize) -> Vec<u8>) {
+    let (clean, offsets) = frames(1..=3);
+    for position in 0..clean.len() {
+        for mask in masks(position) {
+            let dir = tempdir().unwrap();
+            let segments = segments_dir(dir.path());
+            std::fs::create_dir_all(&segments).unwrap();
+            let mut bytes = clean.clone();
+            bytes[position] ^= mask;
+            std::fs::write(segments.join("active.wal"), &bytes).unwrap();
+            let frame = offsets.iter().rposition(|&o| o <= position).unwrap();
+
+            let opened = TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default());
+            let on_disk = std::fs::read(segments.join("active.wal")).unwrap();
+            let flip = format!("flip {mask:#04x} at {position} (frame {frame})");
+            if frame < 2 {
+                assert!(opened.is_err(), "{flip}: corruption must fail the open");
+                assert_eq!(on_disk, bytes, "{flip}: nothing may be truncated");
+            } else {
+                let (log, _) = opened.unwrap_or_else(|e| panic!("{flip}: {e}"));
+                assert_eq!(log.head_seq().get(), 2, "{flip}");
+                assert_eq!(
+                    on_disk.len(),
+                    offsets[2],
+                    "{flip}: truncated from the damage"
+                );
+            }
+        }
+    }
+}
+
+/// Every byte flipped once, by a low bit, a high bit or the whole byte in turn.
+#[test]
+fn every_byte_flip_of_active_wal_is_corruption_or_a_torn_tail() {
+    check_byte_flips_of_active_wal(|position| vec![[0x01, 0x80, 0xFF][position % 3]]);
+}
+
+/// Every byte flipped by a low bit, a high bit and the whole byte.
+#[test]
+#[ignore = "long-running test; run with --ignored in release"]
+fn every_bit_and_byte_flip_of_active_wal_is_corruption_or_a_torn_tail() {
+    check_byte_flips_of_active_wal(|_| vec![0x01, 0x80, 0xFF]);
 }

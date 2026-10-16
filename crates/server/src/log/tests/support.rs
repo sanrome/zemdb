@@ -8,6 +8,8 @@ use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::protocol::wal_frame::encode_wal_record;
 use zemdb_core::value::{PrimaryKey, Value};
 
+pub(super) use crate::test_support::TestRng as Rng;
+
 pub(super) fn seq(n: u64) -> SequenceNumber {
     SequenceNumber::new(n)
 }

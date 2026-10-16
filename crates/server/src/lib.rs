@@ -10,6 +10,10 @@ mod log;
 pub mod relay;
 pub mod schema_registry;
 
+#[cfg(test)]
+#[path = "tests/support.rs"]
+mod test_support;
+
 pub use actor::{
     ActorExit, ClientEntry, ClientLeaseTracker, ClientState, CommitResponse, HeartbeatResponse,
     RegisterResponse, RoomActor, RoomCommand, RoomEvent, RoomManager, RoomMetadata, RoomMetrics,

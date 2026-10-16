@@ -198,3 +198,90 @@ fn concurrent_schema_writes_all_succeed_without_losing_columns() {
     }
     assert!(!durable::tmp_path_for(&todo_path(&dir)).exists());
 }
+
+/// A damaged schema file never panics the registry's startup: it fails with a serialization
+/// error (an I/O error for bytes that are not UTF-8), or loads the file as a valid schema that
+/// survives a round trip. The damage is random, from a fixed seed.
+fn check_damaged_schema_files(seed: u64, cases: u64) {
+    // Two tables, a composite key, an encrypted and a nullable column, and a column added later.
+    let dir = tempdir().unwrap();
+    let id = SchemaId::new("todo").unwrap();
+    let schema = Schema::builder()
+        .table(
+            TableSchema::builder("tasks")
+                .primary_key("id", DataType::Int)
+                .column("title", DataType::String),
+        )
+        .table(
+            TableSchema::builder("tags")
+                .table_id(7)
+                .primary_key("task", DataType::Int)
+                .primary_key("tag", DataType::String)
+                .encrypted_column("note", DataType::Bytes)
+                .nullable_column("weight", DataType::Float),
+        )
+        .build();
+    let registry = SchemaRegistry::new(dir.path()).unwrap();
+    registry.register_schema(id.clone(), schema).unwrap();
+    registry
+        .add_column(&id, "tasks", nullable_int("priority"))
+        .unwrap();
+    let original = fs::read(todo_path(&dir)).unwrap();
+    drop(registry);
+
+    let mut rng = crate::test_support::TestRng::new(seed);
+    let mut next = move || rng.next_u64();
+    for case in 0..cases {
+        let mut damaged = original.clone();
+        for _ in 0..1 + next() % 3 {
+            let at = (next() % (damaged.len() as u64 + 1)) as usize;
+            let len = damaged.len();
+            match next() % 6 {
+                0 if at < len => damaged[at] ^= 1 << (next() % 8),
+                1 if at < len => damaged[at] = next() as u8,
+                // A digit, a quote or a bracket: changes that keep the JSON well-formed more
+                // often than random bytes do.
+                2 if at < len => damaged[at] = b"0123456789\"[]{}:,"[(next() % 17) as usize],
+                3 => damaged.truncate(at),
+                4 => {
+                    let end = (at + 1 + (next() % 24) as usize).min(len);
+                    damaged.drain(at..end);
+                }
+                _ => {
+                    let from = (next() % len.max(1) as u64) as usize;
+                    let end = (from + 1 + (next() % 48) as usize).min(len);
+                    let copied = damaged[from..end].to_vec();
+                    damaged.splice(at..at, copied);
+                }
+            }
+        }
+        fs::write(todo_path(&dir), &damaged).unwrap();
+
+        match SchemaRegistry::new(dir.path()) {
+            Ok(reopened) => {
+                let loaded = reopened
+                    .get_schema(&id)
+                    .expect("a schema file is never skipped");
+                let json = serde_json::to_vec(&*loaded).unwrap();
+                assert_eq!(serde_json::from_slice::<Schema>(&json).unwrap(), *loaded);
+            }
+            Err(ServerError::Serialization(_)) => {}
+            Err(ServerError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidData => {}
+            Err(other) => panic!(
+                "case {case}: {other:?} for {}",
+                String::from_utf8_lossy(&damaged)
+            ),
+        }
+    }
+}
+
+#[test]
+fn damaged_schema_files_never_panic_the_registry() {
+    check_damaged_schema_files(0x5C4E_0001, 300);
+}
+
+#[test]
+#[ignore = "long-running randomized test; run with --ignored in release"]
+fn damaged_schema_files_never_panic_the_registry_long() {
+    check_damaged_schema_files(0x5C4E_0002, 5_000);
+}

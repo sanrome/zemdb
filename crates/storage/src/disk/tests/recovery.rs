@@ -7,7 +7,10 @@ use std::fmt::Debug;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
-use zemdb_core::{PrimaryKey, RoomId, SequencedOperation, Value};
+use zemdb_core::{
+    CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequencedOperation, TableSchema,
+    Value,
+};
 
 async fn name_of(engine: &DiskStorageEngine, room: &RoomId, key: i64) -> Value {
     let row = engine
@@ -421,5 +424,67 @@ async fn crash_while_folding_a_damaged_absorb_recovers_on_the_next_open() {
                 .unwrap_or_else(|e| panic!("{fail_point_name}, {name}: {e:?}"));
             assert_rows(&reopened, &room, 8).await;
         }
+    }
+}
+
+const ITEMS: u16 = 1;
+
+/// `schema()` with an `items` table as well.
+fn schema_with_items() -> Schema {
+    let users = TableSchema::builder("users")
+        .table_id(USERS)
+        .primary_key("id", DataType::Int)
+        .column("name", DataType::String);
+    let items = TableSchema::builder("items")
+        .table_id(ITEMS)
+        .primary_key("id", DataType::Int)
+        .column("data", DataType::Bytes);
+    Schema::builder().table(users).table(items).build()
+}
+
+/// A record of a table the schema lacks is `SchemaMismatch` even if the WAL ends in a torn
+/// write, and no file changes: the torn tail is only truncated once every record replays. The
+/// same holds with that record in `.wal.compacting` and the torn tail in the active WAL.
+#[tokio::test]
+async fn schema_mismatch_is_reported_before_a_torn_tail_is_truncated() {
+    for in_compacting in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let room = RoomId::new("mismatch-before-truncation").unwrap();
+        let engine = engine_at(dir.path());
+        engine.open_room(&room, schema_with_items()).await.unwrap();
+        engine.apply_batch(&room, vec![insert(1)]).await.unwrap();
+        let row = CompactRow::new(vec![Value::Int(7), Value::Bytes(vec![1, 2, 3].into())]);
+        let item = Operation::insert(ITEMS, PrimaryKey::single(7i64), row, 100);
+        engine
+            .apply_batch(&room, vec![sequenced(2, item)])
+            .await
+            .unwrap();
+        let mut head = 2;
+        if in_compacting {
+            fail_compaction_leaving_compacting_wal(&engine, &room).await;
+            engine.apply_batch(&room, vec![insert(3)]).await.unwrap();
+            head = 3;
+        }
+        engine.close_room(&room).await.unwrap();
+        // The start of a header: a torn write.
+        append_raw(&engine.wal_file_path(&room), &[0xBA, 0x7C, 1, 2, 3]);
+        let before = file_contents(dir.path());
+
+        let engine = engine_at(dir.path());
+        let result = engine.open_room(&room, schema()).await;
+        assert!(
+            matches!(
+                result,
+                Err(StorageError::SchemaMismatch {
+                    table_id: ITEMS,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert!(file_contents(dir.path()) == before, "files changed");
+
+        engine.open_room(&room, schema_with_items()).await.unwrap();
+        assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), head);
     }
 }

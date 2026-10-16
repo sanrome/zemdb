@@ -10,6 +10,11 @@ use zemdb_core::{
     SequencedOperation, TableSchema, Value,
 };
 
+/// The deterministic generator of the randomized tests, shared with the integration tests.
+#[path = "../../../tests/common/rng.rs"]
+mod rng;
+pub(crate) use rng::Rng;
+
 pub(crate) const USERS: u16 = 0;
 
 pub(crate) fn schema() -> Schema {
@@ -118,6 +123,21 @@ pub(crate) fn staged_snapshot_files(dir: &Path) -> Vec<String> {
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|name| name.contains(".snap.tmp."))
         .collect()
+}
+
+/// The name and contents of every file in `dir` but the rooms' lock files, sorted by name.
+pub(crate) fn file_contents(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| !entry.file_name().to_string_lossy().ends_with(".lock"))
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name, std::fs::read(entry.path()).unwrap())
+        })
+        .collect();
+    files.sort();
+    files
 }
 
 /// Applies `ops` to `room` in a task of its own.

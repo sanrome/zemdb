@@ -1,7 +1,14 @@
 use crate::disk::compactor::compact_room_cow;
 use crate::fail_point;
+use crate::memory::{RoomSnapshotRef, Table};
+use crate::snapshot::encode_snapshot_envelope;
 use crate::{DiskStorageEngine, MemoryStorageEngine, StorageEngine, StorageError};
 use futures::FutureExt;
+use std::collections::HashMap;
+use std::future::Future;
+use std::ops::RangeInclusive;
+use std::path::Path;
+use std::task::Poll;
 use std::time::Duration;
 use support::*;
 use zemdb_core::{PrimaryKey, RoomId, SequenceNumber};
@@ -9,6 +16,10 @@ use zemdb_core::{PrimaryKey, RoomId, SequenceNumber};
 /// Helpers shared with the tests of the disk engine's submodules.
 #[path = "../disk/tests/support.rs"]
 pub(super) mod support;
+
+/// Randomized simulations of the disk engine against the memory engine.
+#[path = "../disk/tests/simulation.rs"]
+mod simulation;
 
 /// A snapshot whose rows have keys `first_key..first_key + count`, one batch per row, so that its
 /// head sequence is `count`.
@@ -638,4 +649,163 @@ async fn room_stays_locked_while_a_handle_of_its_wal_is_still_open() {
     drop(in_flight);
     other.open_room(&room, schema()).await.unwrap();
     assert_eq!(other.get_head_seq(&room).await.unwrap().get(), 1);
+}
+
+/// A batch at the last sequence number is acknowledged, nothing can follow it, and it survives a
+/// reopen, with or without a compaction before it.
+#[tokio::test]
+async fn batch_at_the_last_sequence_number_survives_reopen_and_compaction() {
+    let last = u64::MAX;
+    let tables = HashMap::from([(USERS, Table::new())]);
+    let raw = bincode::serialize(&RoomSnapshotRef {
+        head_seq: SequenceNumber::from(last - 1),
+        tables: &tables,
+    })
+    .unwrap();
+    let snapshot = encode_snapshot_envelope(&raw, false, 0).unwrap();
+    for compact in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let room = RoomId::new("last-sequence").unwrap();
+        let engine = open_engine(dir.path(), &room).await;
+        let head = SequenceNumber::from(last - 1);
+        engine
+            .apply_snapshot(&room, schema(), snapshot.clone().into(), head)
+            .await
+            .unwrap();
+        let head = engine.apply_batch(&room, vec![insert(last)]).await.unwrap();
+        assert_eq!(head.get(), last);
+        let after_last = engine.apply_batch(&room, vec![insert(last)]).await;
+        assert!(
+            matches!(after_last, Err(StorageError::SequenceMismatch { .. })),
+            "{after_last:?}"
+        );
+        if compact {
+            engine.compact_room(&room).await.unwrap();
+        }
+        let reopened = reopen(engine, dir.path(), &room).await;
+        assert_eq!(reopened.get_head_seq(&room).await.unwrap().get(), last);
+        assert!(has_key(&reopened, &room, last as i64).await);
+    }
+}
+
+/// Polls `operation`, letting the runtime and its blocking pool run between polls, and drops it
+/// after it has returned `Pending` `suspensions` times. Returns whether it completed first.
+async fn poll_then_drop(operation: impl Future, suspensions: usize) -> bool {
+    let mut operation = std::pin::pin!(operation);
+    let mut seen = 0;
+    loop {
+        let ready =
+            std::future::poll_fn(|cx| Poll::Ready(operation.as_mut().poll(cx).is_ready())).await;
+        if ready {
+            return true;
+        }
+        if seen == suspensions {
+            return false;
+        }
+        seen += 1;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// Checks `room` after an operation that would have taken it from the head and rows of `old`
+/// to those of `new` was dropped (`k` names the run): in memory and after a reopen, it holds
+/// one of the two. If it still takes writes, memory and disk agree and the write survives the
+/// reopen; otherwise it is marked failed.
+async fn check_after_drop(
+    engine: DiskStorageEngine,
+    dir: &Path,
+    room: &RoomId,
+    k: usize,
+    old: (u64, RangeInclusive<i64>),
+    new: (u64, RangeInclusive<i64>),
+) {
+    // File operations handed to the blocking pool before the drop complete meanwhile.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let memory_head = engine.get_head_seq(room).await.unwrap().get();
+    let extra = 9_000 + k as i64;
+    let usable = engine
+        .apply_batch(room, vec![insert_key(memory_head + 1, extra)])
+        .await
+        .is_ok();
+    let reopened = reopen(engine, dir, room).await;
+    let head = reopened.get_head_seq(room).await.unwrap().get();
+    let base = if usable {
+        assert_eq!(head, memory_head + 1, "k={k}: memory and disk disagree");
+        assert!(has_key(&reopened, room, extra).await, "k={k}: write lost");
+        head - 1
+    } else {
+        head
+    };
+    let keys = if base == old.0 {
+        old.1
+    } else {
+        assert_eq!(
+            base, new.0,
+            "k={k}: head {base} is neither the old nor the new one"
+        );
+        new.1
+    };
+    for key in keys {
+        assert!(
+            has_key(&reopened, room, key).await,
+            "k={k}: row {key} missing"
+        );
+    }
+}
+
+/// `apply_batch` dropped by its caller after any number of suspensions leaves the room before or
+/// after the batch, or marked failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_batch_dropped_at_any_suspension_point_keeps_the_room_consistent() {
+    for k in 0.. {
+        let dir = tempfile::tempdir().unwrap();
+        let room = RoomId::new("dropped-batch").unwrap();
+        let engine = open_engine(dir.path(), &room).await;
+        apply_range(&engine, &room, 1..=3).await;
+        let batch = engine.apply_batch(&room, vec![insert(4), insert(5)]);
+        let completed = poll_then_drop(batch, k).await;
+        check_after_drop(engine, dir.path(), &room, k, (3, 1..=3), (5, 1..=5)).await;
+        if completed {
+            break;
+        }
+    }
+}
+
+/// `apply_snapshot` dropped by its caller after any number of suspensions leaves the room before
+/// or after the snapshot, or marked failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "long-running test; run with --ignored in release"]
+async fn apply_snapshot_dropped_at_any_suspension_point_keeps_the_room_consistent() {
+    for k in 0.. {
+        let dir = tempfile::tempdir().unwrap();
+        let room = RoomId::new("dropped-snapshot").unwrap();
+        let engine = open_engine(dir.path(), &room).await;
+        apply_range(&engine, &room, 1..=3).await;
+        let snapshot = snapshot_with_rows(&room, 101, 5).await;
+        let head = SequenceNumber::from(5u64);
+        let apply = engine.apply_snapshot(&room, schema(), snapshot.into(), head);
+        let completed = poll_then_drop(apply, k).await;
+        check_after_drop(engine, dir.path(), &room, k, (3, 1..=3), (5, 101..=105)).await;
+        if completed {
+            break;
+        }
+    }
+}
+
+/// `compact_room` dropped by its caller after any number of suspensions loses no row, and leaves
+/// the room usable or marked failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "long-running test; run with --ignored in release"]
+async fn compact_room_dropped_at_any_suspension_point_keeps_the_room_consistent() {
+    for k in 0.. {
+        let dir = tempfile::tempdir().unwrap();
+        let room = RoomId::new("dropped-compaction").unwrap();
+        let engine = open_engine(dir.path(), &room).await;
+        apply_range(&engine, &room, 1..=3).await;
+        let completed = poll_then_drop(engine.compact_room(&room), k).await;
+        check_after_drop(engine, dir.path(), &room, k, (3, 1..=3), (3, 1..=3)).await;
+        if completed {
+            break;
+        }
+    }
 }

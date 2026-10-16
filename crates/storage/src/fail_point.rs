@@ -3,7 +3,9 @@
 //! Production code marks the spots where a test must inject a failure or hold an operation in
 //! the middle. Outside test builds every point does nothing (or returns its input) and the
 //! compiler removes it. A test arms a point for a specific file path, so tests running in
-//! parallel never interfere with each other, and each armed point fires once.
+//! parallel never interfere with each other, and each armed point fires once. A crash plan
+//! instead counts every point reached for the files of a directory, so that a simulation can
+//! crash or fail its scenario at each of them.
 
 use crate::error::StorageError;
 use std::path::Path;
@@ -37,11 +39,128 @@ pub(crate) fn arm(name: &'static str, path: &Path) {
     ARMED.lock().unwrap().push((name, path.to_path_buf()));
 }
 
+/// Disarms the fail point `name` for `path` if no `check` has consumed it, so that an operation
+/// that never reached it does not leave it armed for a later one.
+#[cfg(test)]
+pub(crate) fn disarm(name: &'static str, path: &Path) {
+    take(&ARMED, |(n, p)| *n == name && p == path);
+}
+
+/// What a crash plan does at the points it counts.
+///
+/// Copying the files of an open room reads files its engine holds locked, which Windows refuses,
+/// so only Unix test builds copy them.
+#[cfg(test)]
+pub(crate) enum CrashAction {
+    /// Copies the files of the plan's directory, at the `n`-th point, to the directory `n`
+    /// (counting from 1) inside this one: what the disk would hold if the process crashed there.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    CopyAtEveryPoint(std::path::PathBuf),
+    /// Copies the files of the plan's directory to `to` at the `at`-th point.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    CopyAt { at: usize, to: std::path::PathBuf },
+    /// Makes the `at`-th point fail as if it were armed: an I/O error, or a panic at a panic
+    /// point. A pause point cannot fail, so there it has no effect.
+    FailAt(usize),
+}
+
+/// A crash plan for the files under `root`: counts every fail and pause point reached for a path
+/// there, in order, and takes its action at them.
+#[cfg(test)]
+struct CrashPlan {
+    root: std::path::PathBuf,
+    action: CrashAction,
+    points: Vec<&'static str>,
+}
+
+#[cfg(test)]
+static CRASH_PLANS: std::sync::Mutex<Vec<CrashPlan>> = std::sync::Mutex::new(Vec::new());
+
+/// The crash plans. A panic injected by a plan is raised after the lock is released, and a test
+/// that fails while holding it leaves the plans consistent, so a poisoned lock is used as is.
+#[cfg(test)]
+fn crash_plans() -> std::sync::MutexGuard<'static, Vec<CrashPlan>> {
+    CRASH_PLANS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Arms a crash plan with `action` for the files under `root`, replacing any plan already armed
+/// for it.
+#[cfg(test)]
+pub(crate) fn arm_crash_plan(root: &Path, action: CrashAction) {
+    let mut plans = crash_plans();
+    plans.retain(|plan| plan.root != root);
+    plans.push(CrashPlan {
+        root: root.to_path_buf(),
+        action,
+        points: Vec::new(),
+    });
+}
+
+/// How many points the crash plan of `root` has counted so far.
+#[cfg(test)]
+pub(crate) fn crash_plan_points(root: &Path) -> usize {
+    crash_plans()
+        .iter()
+        .find(|plan| plan.root == root)
+        .map_or(0, |plan| plan.points.len())
+}
+
+/// Disarms the crash plan of `root` and returns the points it counted, in order.
+#[cfg(test)]
+pub(crate) fn disarm_crash_plan(root: &Path) -> Vec<&'static str> {
+    let mut plans = crash_plans();
+    let pos = plans
+        .iter()
+        .position(|plan| plan.root == root)
+        .expect("no crash plan armed for this directory");
+    plans.remove(pos).points
+}
+
+/// Copies the regular files of `from` to `to`, which is created if needed. A file removed while
+/// the copy runs is left out, as it would be from the disk.
+#[cfg(test)]
+pub(crate) fn copy_files(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            let _ = std::fs::copy(entry.path(), to.join(entry.file_name()));
+        }
+    }
+}
+
+/// Counts the point `name`, reached for `path`, in the crash plan armed for a directory holding
+/// `path`, if any, and takes the plan's action there. Returns whether the point must fail.
+#[cfg(test)]
+fn crash_plan_point(name: &'static str, path: &Path) -> bool {
+    let mut plans = crash_plans();
+    let Some(plan) = plans.iter_mut().find(|plan| path.starts_with(&plan.root)) else {
+        return false;
+    };
+    plan.points.push(name);
+    let point = plan.points.len();
+    match &plan.action {
+        CrashAction::CopyAtEveryPoint(images) => {
+            copy_files(&plan.root, &images.join(point.to_string()));
+            false
+        }
+        CrashAction::CopyAt { at, to } => {
+            if point == *at {
+                copy_files(&plan.root, to);
+            }
+            false
+        }
+        CrashAction::FailAt(at) => point == *at,
+    }
+}
+
 /// Returns an injected I/O error if the fail point `name` is armed for `path`.
 #[inline(always)]
 pub(crate) fn check(name: &'static str, path: &Path) -> Result<(), StorageError> {
     #[cfg(test)]
-    if take(&ARMED, |(n, p)| *n == name && p == path).is_some() {
+    if crash_plan_point(name, path) || take(&ARMED, |(n, p)| *n == name && p == path).is_some() {
         return Err(StorageError::Io(std::io::Error::other(format!(
             "injected failure at {name}"
         ))));
@@ -134,6 +253,8 @@ pub(crate) fn arm_pause(name: &'static str, path: &Path) -> Pause {
 #[inline(always)]
 pub(crate) async fn pause(name: &'static str, path: &Path) {
     #[cfg(test)]
+    crash_plan_point(name, path);
+    #[cfg(test)]
     if let Some((_, _, reached, release)) = take(&PAUSES, |(n, p, _, _)| *n == name && p == path) {
         let _ = reached.send(());
         let _ = release.await;
@@ -204,6 +325,8 @@ pub(crate) fn arm_blocking_pause(name: &'static str, path: &Path) -> BlockingPau
 /// what happens when it is reached on the only thread of a current-thread runtime.
 #[inline(always)]
 pub(crate) fn pause_blocking(name: &'static str, path: &Path) {
+    #[cfg(test)]
+    crash_plan_point(name, path);
     #[cfg(test)]
     if let Some((_, _, reached, release)) =
         take(&BLOCKING_PAUSES, |(n, p, _, _)| *n == name && p == path)
