@@ -2124,14 +2124,18 @@ fn check_byte_flips_of_active_wal(masks: impl Fn(usize) -> Vec<u8>) {
             let frame = offsets.iter().rposition(|&o| o <= position).unwrap();
 
             let opened = TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default());
-            let on_disk = std::fs::read(segments.join("active.wal")).unwrap();
             let flip = format!("flip {mask:#04x} at {position} (frame {frame})");
+            // An open log holds the lock on `active.wal`, which on Windows keeps other handles
+            // from reading it, so the file is read once the log is gone.
+            let read_active = || std::fs::read(segments.join("active.wal")).unwrap();
             if frame < 2 {
                 assert!(opened.is_err(), "{flip}: corruption must fail the open");
-                assert_eq!(on_disk, bytes, "{flip}: nothing may be truncated");
+                assert_eq!(read_active(), bytes, "{flip}: nothing may be truncated");
             } else {
                 let (log, _) = opened.unwrap_or_else(|e| panic!("{flip}: {e}"));
                 assert_eq!(log.head_seq().get(), 2, "{flip}");
+                drop(log);
+                let on_disk = read_active();
                 assert_eq!(
                     on_disk.len(),
                     offsets[2],
