@@ -82,7 +82,7 @@ La única excepción son los ítems del backlog marcados **(barato)** que estén
 
 ## 2. Decisiones de diseño
 
-Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las decisiones D69 a D80 son las que se tomaron sobre la auditoría (el número entre paréntesis es el de la conversación). Las D81 a D87 son de implementación y están **propuestas**: se confirman o cambian antes de arrancar el lote correspondiente. D89 salió de la revisión de delta del Lote 3.
+Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las decisiones D69 a D80 son las que se tomaron sobre la auditoría (el número entre paréntesis es el de la conversación). Las D81 a D87 son de implementación y están **propuestas**: se confirman o cambian antes de arrancar el lote correspondiente. D89 salió de la revisión de delta del Lote 3 y se adoptó con ella.
 
 | ID | Decisión | Lote | Estado |
 |---|---|---|---|
@@ -105,7 +105,7 @@ Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las de
 | **D85** | **Absorción atómica en storage.** En lugar de anexar el WAL activo a `.wal.compacting` en el lugar, se arma `room_{id}.wal.compacting.tmp` con `.wal.compacting` más el WAL activo, se sincroniza, se renombra sobre `.wal.compacting`, se sincroniza el directorio y recién después se trunca el WAL activo. `.wal.compacting` nunca queda con una cola rota, así que desaparecen la excepción de corrupción de `.wal.compacting` y `highest_seq_in_valid_frames`. Al adoptarla se fijó: el temporal tiene nombre fijo y la apertura lo borra sin leerlo (se suma a los temporales de INV-S4); una falla al escribirlo, sincronizarlo o renombrarlo lo borra y deja la sala usable; una falla del sync del directorio después del rename la marca `RoomFailed`; un daño que llega al final de `.wal.compacting` sigue siendo una escritura rota. | 3 | Adoptada |
 | **D86** | **`apply_snapshot` instala en su propia tarea.** Desde el staging hasta la instalación (rename, sync, vaciado del WAL, borrado de `.wal.compacting`), `apply_snapshot` corre en una tarea propia, como `compact_room`. Cancelar el future deja de abandonar operaciones de archivo en vuelo, y `close_room` espera a la tarea (comparten el lock de compactación). Al adoptarla se fijó: decodificar y esperar el lock siguen en quien llama; quien suelta el future ya no deja la sala `RoomFailed`, porque el snapshot se aplica entero. | 3 | Adoptada |
 | **D87** | **El apagado espera las tareas de varios pasos.** Un `TaskTracker` registra las tareas que corren por su cuenta (borrado de sala, escrituras del relay, recarga de esquema). `serve_until_shutdown` las espera dentro de la gracia de 10 s, antes de `shutdown_all`. | 5 | Propuesta |
-| **D89** | **`open_room` del storage recupera en su propia tarea.** La recuperación corre en una tarea dueña del lock de la sala y del handle del WAL hasta que terminan sus operaciones de archivo, como `apply_snapshot` (D86). Si quien llama se va, la apertura termina igual y la sala queda abierta. | 3 | Propuesta |
+| **D89** | **`open_room` del storage recupera en su propia tarea.** La recuperación corre en una tarea dueña del lock de la sala y del handle del WAL hasta que terminan sus operaciones de archivo, como `apply_snapshot` (D86). Si quien llama se va, la apertura termina igual y la sala queda abierta. | 3 | Adoptada |
 | **D88** | **Redes de prueba en el repo.** Las simulaciones y proptests de la auditoría entran como tests con semillas fijas. Cada red entra en la suite normal en una versión corta: todas juntas suman como mucho ~30 s en debug. Las versiones largas quedan como `#[ignore]`, así que `cargo test` no las corre, ni en local ni en la CI de cada push o PR. Corren en un workflow aparte (`.github/workflows/randomized.yml`, `cargo test --workspace --release -- --ignored`) una vez por semana y a mano al cerrar cada lote, como parte de la revisión de delta (regla 4). El fuzzer de decoders y los roundtrips usan generadores propios con un PRNG determinista (SplitMix64), sin `proptest`: su versión actual exige exactamente el MSRV de los tests (1.88) y sus dependencias transitivas podrían romper ese job. No hay `cargo fuzz`. Las mediciones de memoria quedan fuera, porque requieren `unsafe`. | 0 | Adoptada |
 
 ---
@@ -117,12 +117,12 @@ Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las de
 | 0 | Contrato y redes de prueba | D70–D72, D78, D79, D88 | Inmediata (las redes viven en copias temporales) | ✅ |
 | 1 | Arreglos chicos de alto valor | DEF-146, 147, 155 | Inmediata | ✅ 3/3 |
 | 2 | Abrir solo lo verificado y sincronizado | DEF-144, 145, 148, 158, 149 | Alta (requisito de Fase 4) | ⬜ 0/5 |
-| 3 | Storage: cancelación y absorción | DEF-150, 151, 165 | Alta (requisito de Fase 4) | 🟡 2/3 |
+| 3 | Storage: cancelación y absorción | DEF-150, 151, 165 | Alta (requisito de Fase 4) | ✅ 3/3 |
 | 4 | Recursos | DEF-152, 159, 153, 163, 162, 164, 154, 157 | Media | ⬜ 0/8 |
 | 5 | Ciclo de vida | DEF-156, 160, 161 | Baja | ⬜ 0/3 |
 | 6 | Documentación | ARCHITECTURE, README, ROADMAP | Baja | ⬜ |
 
-**Avance total:** 5 de 22 ítems (Lotes 0 y 1 cerrados; Lote 3 con DEF-165 pendiente).
+**Avance total:** 6 de 22 ítems (Lotes 0, 1 y 3 cerrados).
 
 **Ítems nuevos de este plan.** Surgen de las invariantes adoptadas (D79) y de hallazgos de la auditoría que no tenían ID:
 - **DEF-159** · Medio · P6: reparto del presupuesto de respuestas.
@@ -399,12 +399,19 @@ Se fueron `append_synced`, `highest_seq_in_valid_frames`, la excepción de corru
     - `failed_background_append_to_compacting_wal_keeps_the_active_wal`, porque la copia se escribe con `std::fs` en el pool bloqueante y no hay escrituras de fondo.
   - **Un `.wal.compacting` dañado con frames válidos después es `WalCorruption`,** aunque el WAL activo tenga esos registros.
 
-#### DEF-165 · Medio · ⬜ Pendiente
+#### DEF-165 · Medio · ✅ Hecho
 **Problema.** La recuperación de `open_room` corre en el future de quien llama. Si ese future se suelta mientras la recuperación borra un `.wal.compacting` ya plegado, el lock de la sala se libera con el borrado todavía en el pool bloqueante. Otra apertura toma la sala y confirma lotes, y una compactación que falla los deja en un `.wal.compacting` nuevo. El borrado tardío se lleva ese archivo, y los lotes se pierden al reabrir (S1, S6, L2). Es preexistente: lo encontró la revisión de delta de este lote.
 **Solución.** D89.
 **Test exigido.**
 - El de la revisión de delta, con una pausa bloqueante en ese borrado: la apertura soltada no borra el `.wal.compacting` de la sala que la sucede. Hoy la reapertura da head 8 en lugar de 10.
 - Además, el barrido de cancelación de `open_room` en cada punto de suspensión.
+
+**Hecho.** Una vez que tiene el mapa de salas del motor, `open_room` corre en un `tokio::spawn` dueño de ese lock, del lock de la sala y del handle del WAL hasta su última operación de archivo.
+- **Tests:**
+  - `open_dropped_during_its_recovery_keeps_the_room_until_it_completes`, con una pausa bloqueante dentro de `remove_if_exists`, que ahora borra con `std::fs` en `run_blocking`: mientras el borrado está en vuelo, otra apertura recibe `RoomLocked`, y los lotes que confirma después sobreviven. En `main` esa otra apertura toma la sala.
+  - `open_room_dropped_at_any_suspension_point_still_opens_the_room`, versión larga: la sala queda abierta con todas sus filas.
+- **Mutación:** el código anterior al fix hace fallar los dos.
+- **Desvío:** el test exige el contrato (nadie más toma la sala hasta que termina la recuperación) en lugar de reproducir la pérdida, que depende de que la otra apertura gane la carrera; así no depende del tiempo. La reproducción de la revisión daba head 8 en lugar de 10.
 
 **Revisión de delta del lote.** La hizo un agente aparte, en modo solo lectura. Conclusión: los dos fixes cierran sus escenarios y el código no rompe otras invariantes.
 - **Hallazgos que entraron al lote:**

@@ -1,4 +1,4 @@
-use crate::disk::compactor::compact_room_cow;
+use crate::disk::compactor::{compact_room_cow, compacting_wal_path};
 use crate::fail_point;
 use crate::memory::{RoomSnapshotRef, Table};
 use crate::snapshot::encode_snapshot_envelope;
@@ -466,6 +466,43 @@ async fn snapshot_dropped_during_its_rename_is_installed_before_the_room_reopens
     }
 }
 
+/// An `open_room` whose caller gives up while its recovery removes a folded `.wal.compacting`
+/// keeps the room until the removal lands. Another open that took the room first could rotate
+/// batches it acknowledges into a new `.wal.compacting`, and the late removal would delete it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_dropped_during_its_recovery_keeps_the_room_until_it_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("late-removal").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    let compacting_path = compacting_wal_path(&engine.wal_file_path(&room));
+    apply_range(&engine, &room, 1..=5).await;
+    fail_compaction_leaving_compacting_wal(&engine, &room).await;
+    apply_range(&engine, &room, 6..=8).await;
+    engine.close_room(&room).await.unwrap();
+
+    let mut removal = fail_point::arm_blocking_pause("remove", &compacting_path);
+    let first = engine_at(dir.path());
+    tokio::select! {
+        _ = first.open_room(&room, schema()) => panic!("open_room finished during its recovery"),
+        _ = removal.reached() => {}
+    }
+    let second = engine_at(dir.path());
+    let early = second.open_room(&room, schema()).await;
+    assert!(
+        matches!(early, Err(StorageError::RoomLocked(_))),
+        "{early:?}"
+    );
+    removal.release();
+
+    // The dropped open completes; once its room is closed, the other open takes it.
+    first.close_room(&room).await.unwrap();
+    second.open_room(&room, schema()).await.unwrap();
+    apply_range(&second, &room, 9..=10).await;
+    fail_compaction_leaving_compacting_wal(&second, &room).await;
+    let reopened = reopen(second, dir.path(), &room).await;
+    assert_rows(&reopened, &room, 10).await;
+}
+
 #[tokio::test]
 async fn panic_while_applying_a_batch_exposes_none_of_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -848,6 +885,29 @@ async fn apply_snapshot_dropped_at_any_suspension_point_keeps_the_room_consisten
         let usable =
             check_after_drop(engine, dir.path(), &room, k, (3, 1..=3), (5, 101..=105)).await;
         assert!(usable, "k={k}: the dropped snapshot marked the room failed");
+        if completed {
+            break;
+        }
+    }
+}
+
+/// `open_room` dropped by its caller after any number of suspensions still opens the room, with
+/// every row: once it has the engine's rooms, it completes in its own task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "long-running test; run with --ignored in release"]
+async fn open_room_dropped_at_any_suspension_point_still_opens_the_room() {
+    for k in 0.. {
+        let dir = tempfile::tempdir().unwrap();
+        let room = RoomId::new("dropped-open").unwrap();
+        let engine = open_engine(dir.path(), &room).await;
+        apply_range(&engine, &room, 1..=5).await;
+        fail_compaction_leaving_compacting_wal(&engine, &room).await;
+        apply_range(&engine, &room, 6..=8).await;
+        drop(engine);
+        let engine = engine_at(dir.path());
+        let completed = poll_then_drop(engine.open_room(&room, schema()), k).await;
+        let reopened = reopen(engine, dir.path(), &room).await;
+        assert_rows(&reopened, &room, 8).await;
         if completed {
             break;
         }

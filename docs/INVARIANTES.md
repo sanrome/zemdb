@@ -96,12 +96,12 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 | **INV-D7** | Nada es visible antes de ser durable en este proceso | ★ | Alto | 🆕 (Lote 2) |
 | **INV-D8** | El piso de secuencia vive fuera del log | ★ | Alto | 🆕 (Lote 2) |
 | **INV-D9** | Los metadatos se verifican antes de usarse | ★ | Alto | 🆕 (Lote 2) |
-| **INV-S1** | `apply_batch`: éxito durable o ningún efecto | ★ | Alto | ❌ (Lote 3, DEF-165) |
+| **INV-S1** | `apply_batch`: éxito durable o ningún efecto | ★ | Alto | ✅ |
 | **INV-S2** | Los lectores ven siempre un prefijo del WAL | | Medio | ✅ |
 | **INV-S3** | Un crash en cualquier paso del storage se recupera al mismo estado | ★ | Alto | ✅ |
 | **INV-S4** | Abrir una sala nunca descarta datos | ★ | Alto | ✅ |
 | **INV-S5** | `apply_snapshot`: valida todo y reemplaza atómicamente, o no cambia nada | | Medio | ✅ |
-| **INV-S6** | Memoria igual a disco | | Medio | ❌ (Lote 3, DEF-165) |
+| **INV-S6** | Memoria igual a disco | | Medio | ✅ |
 | **INV-Y1** | Orden total contiguo por sala | ★ | Alto | ✅ |
 | **INV-Y2** | Entrega exacta: ni huecos, ni duplicados, ni cambios | ★ | Alto | ✅ |
 | **INV-Y3** | Quedarse atrás siempre se señala | ★ | Alto | ✅ |
@@ -128,7 +128,7 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 | **INV-B4** | El costo por request del actor no depende de la historia | | Medio | ❌ (Lote 4) |
 | **INV-B5** | Ningún cliente acapara un recurso global | | Medio | 🆕 (Lote 4) |
 | **INV-L1** | Toda request recibe una respuesta, en tiempo acotado | | Medio | ✅ |
-| **INV-L2** | Cancelar una request nunca deja estado a medias | | Medio | ❌ (Lotes 3 y 5) |
+| **INV-L2** | Cancelar una request nunca deja estado a medias | | Medio | ❌ (Lote 5) |
 | **INV-L3** | Un I/O incierto nunca se confirma como éxito | ★ | Alto | ❌ (Lote 2) |
 | **INV-L4** | Reabrir una sala no cambia ningún estado confirmado | | Medio | ❌ (Lote 2) |
 | **INV-L5** | El apagado no pierde nada confirmado | | Medio | ✅ |
@@ -194,7 +194,7 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 
 #### INV-S1 ★ · `apply_batch`: éxito durable o ningún efecto
 **Enunciado.** Si `apply_batch` devuelve `Ok`, el batch está sincronizado en el WAL y visible en memoria. Si devuelve `Err`, no cambió nada ni en memoria ni en disco, o la sala quedó marcada como fallida (`RoomFailed`) y reabrirla reconstruye el estado desde el disco. Un hueco de secuencia se reporta como `SequenceMismatch` antes que cualquier error de contenido (D63).
-**Sostenida por.** `sync_file` con flush previo (D43); `PendingWrite`; validación del batch entero antes de escribir; `apply_snapshot` y la compactación corren en su propia tarea, así que ninguna de sus operaciones de archivo aterriza después de reabrir la sala (D86) (§8 *Active Storage Schema Validation*, *WAL Mutex*, *Failed Room State*). *Pendiente (Lote 3, D89):* la recuperación de un `open_room` soltado.
+**Sostenida por.** `sync_file` con flush previo (D43); `PendingWrite`; validación del batch entero antes de escribir; `open_room`, `apply_snapshot` y la compactación corren en su propia tarea, así que ninguna de sus operaciones de archivo aterriza después de reabrir la sala (D86, D89) (§8 *Active Storage Schema Validation*, *WAL Mutex*, *Failed Room State*).
 **Cómo intentar romperla.** Falla de escritura de fondo, cancelación del future en cada `.await`, pánico al aplicar, batch con hueco interno, batch al borde de `u64::MAX`.
 
 #### INV-S2 · Los lectores ven siempre un prefijo del WAL
@@ -220,7 +220,7 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 
 #### INV-S6 · Memoria igual a disco
 **Enunciado.** Mientras una sala del storage no esté `RoomFailed`, lo que devuelven `get`, `scan` y `get_head_seq` es exactamente lo que daría cerrarla y reabrirla con el mismo esquema (módulo los `Null` al final de las filas, INV-Y8).
-**Sostenida por.** Solo se aplican batches sincronizados; el camino vivo y el replay usan el mismo `apply_operation`; ninguna operación de archivo de `apply_snapshot` ni de la compactación aterriza después de reabrir (D86) (§8). *Pendiente (Lote 3, D89):* la recuperación de un `open_room` soltado.
+**Sostenida por.** Solo se aplican batches sincronizados; el camino vivo y el replay usan el mismo `apply_operation`; ninguna operación de archivo de `open_room`, `apply_snapshot` ni la compactación aterriza después de reabrir (D86, D89) (§8).
 **Cómo intentar romperla.** Comparar después de cada paso de una secuencia aleatoria de batches, compactaciones, snapshots, cancelaciones y reaperturas.
 **Automatizable.** Las simulaciones de storage del Lote 0 ya lo comprueban en cada paso.
 
@@ -373,8 +373,8 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 
 #### INV-L2 · Cancelar una request nunca deja estado a medias
 **Enunciado.** Si el cliente corta una request en cualquier `.await`, el efecto es "no ocurrió" o "ocurrió entero". Las operaciones de varios pasos (delete de sala, escrituras del relay, `add_column`, compactación y escrituras del storage) corren en su propia tarea, o marcan la sala como fallida.
-**Sostenida por.** `run_to_completion`, `tokio::spawn` en `delete_room` y `add_column`, `compact_room` y `apply_snapshot` del storage en su propia tarea (D86), `PendingWrite` (§7.1, §8).
-**Cómo intentar romperla.** Descartar el future del handler en cada punto de suspensión (el patrón del test de DEF-125); cancelar `compact_room` y `apply_snapshot` del storage y reabrir la sala mientras una operación de archivo sigue en vuelo; apagar el servidor con una tarea de varios pasos en curso. *Pendiente:* la recuperación de `open_room` del storage en su propia tarea (Lote 3, D89) y el apagado que espera esas tareas (Lote 5, D87).
+**Sostenida por.** `run_to_completion`, `tokio::spawn` en `delete_room` y `add_column`, `open_room`, `compact_room` y `apply_snapshot` del storage en su propia tarea (D86, D89), `PendingWrite` (§7.1, §8).
+**Cómo intentar romperla.** Descartar el future del handler en cada punto de suspensión (el patrón del test de DEF-125); cancelar `compact_room` y `apply_snapshot` del storage y reabrir la sala mientras una operación de archivo sigue en vuelo; apagar el servidor con una tarea de varios pasos en curso. *Pendiente:* el apagado que espera esas tareas (Lote 5, D87).
 
 #### INV-L3 ★ · Un I/O incierto nunca se confirma como éxito
 **Enunciado.** Si un write, un fsync o un rename de un archivo durable falla, nunca se responde éxito por una operación que dependía de él. En el servidor, la sala se detiene y se reabre desde disco; en storage, la sala queda `RoomFailed` hasta reabrirse. Un error de I/O nunca se toma por "el archivo no existe".

@@ -394,63 +394,68 @@ fn lock_room_files(
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl StorageEngine for DiskStorageEngine {
+    /// Opens `room_id`, recovering it from its files (see `recover_room`).
+    ///
+    /// Once it has the engine's rooms, it runs in its own task, which keeps the room's locks
+    /// until its last file operation: if the caller stops waiting, the room still opens, and no
+    /// other open takes the room while a file operation of the recovery is in flight.
     #[tracing::instrument(skip(self, schema), fields(room_id = %room_id))]
     async fn open_room(&self, room_id: &RoomId, schema: Schema) -> Result<(), StorageError> {
-        let mut rooms = self.rooms.write().await;
+        let mut rooms = Arc::clone(&self.rooms).write_owned().await;
         if rooms.contains_key(room_id) {
             return Err(StorageError::RoomAlreadyOpen(room_id.clone()));
         }
 
-        let data_dir = self.options.data_dir.clone();
-        run_blocking(move || create_dir_all_synced(&data_dir)).await?;
-        let snap_path = self.snap_file_path(room_id);
-        let wal_path = self.wal_file_path(room_id);
+        let (room_id, data_dir) = (room_id.clone(), self.options.data_dir.clone());
+        let (snap_path, wal_path) = (self.snap_file_path(&room_id), self.wal_file_path(&room_id));
+        let lock_path = self.lock_file_path(&room_id);
+        let zstd_level = self.options.zstd_level;
+        tokio::spawn(async move {
+            run_blocking(move || create_dir_all_synced(&data_dir)).await?;
+            let (lock, std_wal_file) = {
+                let (wal_path, room_id) = (wal_path.clone(), room_id.clone());
+                run_blocking(move || lock_room_files(&lock_path, &wal_path, &room_id)).await?
+            };
 
-        let (lock, std_wal_file) = {
-            let (lock_path, wal_path, room_id) = (
-                self.lock_file_path(room_id),
-                wal_path.clone(),
-                room_id.clone(),
-            );
-            run_blocking(move || lock_room_files(&lock_path, &wal_path, &room_id)).await?
-        };
+            let recovered = recover_room(
+                &room_id,
+                &snap_path,
+                &wal_path,
+                &schema,
+                std_wal_file,
+                zstd_level,
+            )
+            .await?;
 
-        let recovered = recover_room(
-            room_id,
-            &snap_path,
-            &wal_path,
-            &schema,
-            std_wal_file,
-            self.options.zstd_level,
-        )
-        .await?;
-
-        let room = DiskRoom {
-            _lock: lock,
-            room_id: room_id.clone(),
-            snap_path,
-            wal_path,
-            wal: Mutex::new(DiskWal {
+            let room = DiskRoom {
+                _lock: lock,
                 room_id: room_id.clone(),
-                file: recovered.wal_file,
-                len: recovered.wal_len,
-                failure: None,
-            }),
-            state: RwLock::new(DiskRoomState {
-                schema,
-                head_seq: recovered.head_seq,
-                snapshot_seq: recovered.snapshot_seq,
-                snapshot_len: recovered.snapshot_len,
-                tables: recovered.tables,
-            }),
-            is_compacting: Arc::new(AtomicBool::new(false)),
-            compaction: Arc::new(Mutex::new(())),
-        };
+                snap_path,
+                wal_path,
+                wal: Mutex::new(DiskWal {
+                    room_id: room_id.clone(),
+                    file: recovered.wal_file,
+                    len: recovered.wal_len,
+                    failure: None,
+                }),
+                state: RwLock::new(DiskRoomState {
+                    schema,
+                    head_seq: recovered.head_seq,
+                    snapshot_seq: recovered.snapshot_seq,
+                    snapshot_len: recovered.snapshot_len,
+                    tables: recovered.tables,
+                }),
+                is_compacting: Arc::new(AtomicBool::new(false)),
+                compaction: Arc::new(Mutex::new(())),
+            };
 
-        rooms.insert(room_id.clone(), Arc::new(room));
+            rooms.insert(room_id.clone(), Arc::new(room));
 
-        tracing::info!(room_id = %room_id, "Opened disk room (dual-file .snap + .wal)");
-        Ok(())
+            tracing::info!(room_id = %room_id, "Opened disk room (dual-file .snap + .wal)");
+            Ok(())
+        })
+        .await
+        .map_err(|e| StorageError::Other(format!("Open task failed: {e}")))?
     }
 
     #[tracing::instrument(skip(self), fields(room_id = %room_id))]

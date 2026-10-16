@@ -6,7 +6,6 @@ use crate::{DiskStorageEngine, StorageEngine, StorageError};
 use std::fmt::Debug;
 use std::io::Write;
 use std::path::Path;
-use std::time::Duration;
 use zemdb_core::{
     CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequencedOperation, TableSchema,
     Value,
@@ -232,24 +231,12 @@ async fn crash_before_initial_snapshot_rename_is_cleaned_up_on_next_open() {
     let dir = tempfile::tempdir().unwrap();
     let room = RoomId::new("initial-snapshot-crash").unwrap();
     let engine = engine_at(dir.path());
-    let snap_path = engine.snap_file_path(&room);
+    // What a crash between staging the initial snapshot and renaming it leaves behind.
+    let staged = engine
+        .snap_file_path(&room)
+        .with_extension("snap.tmp.crashed");
+    std::fs::write(&staged, b"partial").unwrap();
 
-    // The open stops for good between staging the initial snapshot and renaming it.
-    let mut pause = fail_point::arm_pause("snapshot.install", &snap_path);
-    let open = tokio::spawn({
-        let (engine, room) = (engine.clone(), room.clone());
-        async move { engine.open_room(&room, schema()).await }
-    });
-    // Bounded, so that an open that never reaches the pause fails the test instead of hanging.
-    tokio::time::timeout(Duration::from_secs(10), pause.reached())
-        .await
-        .expect("opening the room never reached the rename of the initial snapshot");
-    open.abort();
-    assert!(open.await.unwrap_err().is_cancelled());
-    drop(pause);
-
-    assert!(!snap_path.exists());
-    assert_eq!(staged_snapshot_files(dir.path()).len(), 1);
     engine.open_room(&room, schema()).await.unwrap();
     assert_rows(&engine, &room, 0).await;
     assert!(staged_snapshot_files(dir.path()).is_empty());

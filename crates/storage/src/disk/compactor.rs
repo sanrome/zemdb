@@ -528,11 +528,15 @@ pub(crate) async fn install_applied_snapshot(
 }
 
 pub(crate) async fn remove_if_exists(path: &Path) -> Result<(), StorageError> {
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
-    }
+    let path = path.to_path_buf();
+    run_blocking(move || {
+        fail_point::pause_blocking("remove", &path);
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    })
+    .await
 }
 
 /// What [`sync_file`] makes durable.
