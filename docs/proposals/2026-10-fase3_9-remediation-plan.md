@@ -22,6 +22,50 @@
 4. **Nueva:** cada lote cierra con una **revisión de delta** contra las invariantes que toca (`INVARIANTES.md` §1.1): para cada fix, la mutación que lo deshace tiene que hacer fallar un test, y el diff no puede romper otra invariante. No se hace una auditoría completa por lote.
 5. **Nueva:** un cambio que agrega, quita o debilita una garantía actualiza `INVARIANTES.md` en el mismo commit (§5 de ese documento).
 
+### 0.1. Procedimiento por lote
+
+Cada lote se ejecuta con el mismo ciclo, idealmente en una sesión propia, siguiendo el orden de §3. Este procedimiento es lo único que hace falta para retomar el trabajo sin el contexto de sesiones anteriores.
+
+**Excepción al orden:** los Lotes 1 (solo servidor) y 3 (solo storage) no se pisan y pueden hacerse en paralelo. El Lote 2 va solo, porque cambia formatos en disco sobre los que se apoyan los demás.
+
+**0. Arranque.**
+- **El árbol:** `git pull`, con el árbol de trabajo limpio y la CI de `main` en verde.
+- **Qué leer:** la sección del lote en este plan, las decisiones que cita (§2), las invariantes que toca en `INVARIANTES.md` y `GEMINI.md`.
+- **Decisiones en estado *Propuesta*:** si el lote tiene alguna, se confirman con el dueño del proyecto antes de escribir código. Al confirmarse pasan a *Adoptada*, con los cambios que hayan surgido.
+
+**1. Primero el test que falla.** Traer el test de ruptura del ítem desde su parche en `docs/audits/2026-10-invariantes-audit/` (ver la regla 1) y adaptarlo a `GEMINI.md`. Después, **comprobar que falla en el `main` actual**: si no falla, no reproduce el defecto y hay que reescribirlo. Para un ítem sin test en los parches, se escribe uno nuevo con la misma exigencia.
+
+**2. El fix mínimo.** Implementar lo que pide la decisión, sin cambios de alcance. Seguir los principios de `GEMINI.md`: validar antes de mutar, guards RAII, persistencia atómica, nada de I/O bloqueante en el runtime.
+
+**3. Verificación.**
+- **Chequeos de la regla 3:** fmt, clippy, tests y doc. Si el lote toca `core` o `storage`, también `cargo build -p zemdb-core -p zemdb-storage -p zemdb-client --target wasm32-unknown-unknown`.
+- **Mutación inversa:** deshacer el fix (o sacar la guarda que agrega) y confirmar que el test nuevo falla. Después, restaurarlo.
+- **Versiones largas, una sola vez al cerrar el lote:** `cargo test -p <crate> --release -- --ignored` de los crates tocados. Nunca se agregan a la CI de cada push (ver `.github/workflows/randomized.yml`).
+
+**4. Revisión de delta (regla 4).** Sobre el diff completo del lote, con un revisor independiente de contexto fresco y en modo solo lectura (un agente aparte); en un lote chico (por ejemplo, el Lote 1) la puede hacer quien lo implementó. El revisor recibe el diff, las invariantes que toca y los "test exigido". Responde tres cosas:
+- si cada fix cierra el escenario de la auditoría;
+- si deshacerlo hace fallar un test;
+- si el diff rompe alguna otra invariante.
+
+Como en la auditoría, sin un test que lo reproduzca no hay hallazgo Alto ni Medio.
+
+**5. Documentos, en el mismo cambio.**
+- **`ARCHITECTURE.md`:** si cambió un comportamiento descrito ahí.
+- **`INVARIANTES.md`:** la columna Estado pasa de ❌ o 🆕 a ✅, y se quita el *Pendiente* de "Sostenida por".
+- **Este plan:** el ítem pasa a ✅, con una nota **Hecho** que lista los tests agregados, la mutación verificada y cualquier desvío respecto de la solución planeada. Se actualizan el resumen (§3) y el avance total.
+
+**6. Alcance.** Lo que aparezca fuera del lote **no se arregla en el momento**:
+- si rompe una invariante, se agrega a este plan como ítem nuevo (DEF-164 en adelante), con su test, en el lote que corresponda;
+- si no rompe ninguna, va al backlog Bajo (`INVARIANTES.md` §1.2).
+
+La única excepción son los ítems del backlog marcados **(barato)** que estén en los mismos archivos que toca el lote.
+
+**7. Entrega.**
+- Los cambios se dejan sin commitear para que el dueño revise el diff.
+- Con su visto bueno, se arma un commit por lote, o pocos (estilo `fix(server): … (Lote N)`), sin trailers de co-autoría, y se pushea a `main`.
+
+**Después del Lote 6.** Una auditoría por invariantes acotada a las invariantes cuyo código cambió más las nuevas, con el método de `INVARIANTES.md` §1. Si sale en verde según §1.4, se cumple el requisito para la Fase 4 (§1).
+
 ---
 
 ## 1. Criterios del orden
