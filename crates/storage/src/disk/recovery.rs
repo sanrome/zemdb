@@ -409,8 +409,11 @@ pub(crate) async fn recover_room(
             "Torn write detected at WAL EOF, truncating damaged bytes to {valid_wal_bytes}"
         );
         wal_file.set_len(valid_wal_bytes).await?;
-        sync_file(&mut wal_file, SyncKind::All).await?;
     }
+    // An earlier open may have written records whose sync failed: none is served before this
+    // process syncs them. What `.wal.compacting` holds is synced below, in the folded snapshot.
+    fail_point::check("recovery.wal_sync", wal_path)?;
+    sync_file(&mut wal_file, SyncKind::All).await?;
 
     // 4. Fold the rotated WAL into a fresh snapshot, then remove it
     if compacting_exists {

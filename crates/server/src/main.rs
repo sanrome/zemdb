@@ -14,6 +14,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config_path = env::args().nth(1);
     let config = Arc::new(ServerConfig::load_with_env(config_path.as_deref())?);
+    let _data_dir_lock = config.lock_data_dir()?;
 
     let schema_registry = Arc::new(SchemaRegistry::new(config.data_dir.join("schemas"))?);
     let snapshot_relay = Arc::new(SnapshotRelay::new(

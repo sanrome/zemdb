@@ -11,10 +11,9 @@ use crate::log::segment_index::{
 };
 use crate::log::segment_reader::RecoveredLogData;
 use crate::log::warm_disk::{read_segment_file, WarmDiskLog};
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 use zemdb_core::id::{MutationId, SequenceNumber};
@@ -28,7 +27,7 @@ use zemdb_core::protocol::messages::SequencedOperation;
 /// so they do not hold back the newer ones.
 const MAX_COMPRESSIONS_PER_PASS: usize = 4;
 
-/// File, inside the room directory, recording the highest sequence ever pruned from disk.
+/// File, inside the room directory, recording the sequence floor of the log ([`LogMeta`]).
 const LOG_META_FILE: &str = "log_meta.json";
 
 /// File, inside the room directory, whose exclusive lock a log holds while it is open. It holds
@@ -36,13 +35,15 @@ const LOG_META_FILE: &str = "log_meta.json";
 /// not synced.
 const LOG_LOCK_FILE: &str = "log.lock";
 
-/// Durable log metadata that must outlive the segments it describes.
-#[derive(Debug, Serialize, Deserialize)]
+/// Durable log metadata that must outlive the segments it describes: recovery derives
+/// `head_seq` from the segments on disk, and once they are pruned or lost this is the only
+/// record of how far the sequence advanced, which keeps sequence numbers from being reused.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 struct LogMeta {
-    /// Highest sequence number whose segment has been deleted. Recovery derives `head_seq`
-    /// from the segments on disk; once all of them are pruned this is the only record of
-    /// how far the sequence advanced, preventing sequence numbers from being reused.
+    /// Highest sequence number whose segment has been deleted.
     pruned_through_seq: u64,
+    /// End of the newest sealed segment.
+    sealed_through_seq: u64,
 }
 
 /// Summary of maintenance operations performed across storage tiers.
@@ -120,7 +121,7 @@ pub struct TieredLog {
     undeleted_warm: Vec<PathBuf>,
     head_seq: SequenceNumber,
     tail_seq: SequenceNumber,
-    pruned_through_seq: SequenceNumber,
+    meta: LogMeta,
     /// Exclusive lock on the room's log, taken before opening touches any file and released
     /// when the log is dropped. `active.wal` has its own lock, but only while it exists, and
     /// opening reads and cleans up other files before it gets to it.
@@ -145,6 +146,10 @@ impl TieredLog {
     /// of the newest segments (see [`read_newest`]), so the cost of opening a room does not
     /// grow with its retained history. `head_seq` comes from the segment names, `active.wal`
     /// and `log_meta.json`.
+    ///
+    /// An earlier actor or process may have written `active.wal` or created the directories of
+    /// the log without a successful sync, so all of them are synced before anything read here
+    /// is served or deduplicated.
     pub fn open_or_create_with_dedup_window(
         dir: impl AsRef<Path>,
         policy: RoomLifecyclePolicy,
@@ -154,13 +159,19 @@ impl TieredLog {
         let segments_dir = dir.join("segments");
         durable::create_dir_all_synced(&segments_dir)?;
         let lock = lock_log(&dir)?;
+        // `segments/`, the room directory, `rooms/` and `data_dir`.
+        for synced in segments_dir.ancestors().take(4) {
+            durable::sync_dir(synced)?;
+        }
 
-        let pruned_through_seq = read_pruned_through_seq(&dir)?;
+        let meta = read_log_meta(&dir)?;
+        let pruned_through_seq = SequenceNumber::new(meta.pruned_through_seq);
         let segments = SegmentIndex::scan(&segments_dir, pruned_through_seq)?;
         let (warm_disk, active) = WarmDiskLog::open_recovering(&segments_dir)?;
 
         let head_seq = [
             Some(pruned_through_seq),
+            Some(SequenceNumber::new(meta.sealed_through_seq)),
             segments.last_end(),
             warm_disk.active_end_seq(),
         ]
@@ -169,7 +180,8 @@ impl TieredLog {
         .max()
         .unwrap_or(pruned_through_seq);
         // No room assigns u64::MAX (see `RoomActor::commit`), so only damaged files claim it
-        // (here a segment name or `active.wal`; `log_meta.json` was checked when it was read).
+        // (here a segment name, `active.wal` or the sealed end; the pruning point was checked
+        // when it was read).
         if head_seq.get() == u64::MAX {
             return Err(ServerError::WalCorruption(
                 "The log claims sequence number u64::MAX".to_string(),
@@ -195,7 +207,7 @@ impl TieredLog {
             undeleted_warm: Vec::new(),
             head_seq,
             tail_seq: head_seq.next(),
-            pruned_through_seq,
+            meta,
             _lock: lock,
         };
         log.tail_seq = log.compute_tail_seq();
@@ -243,7 +255,8 @@ impl TieredLog {
         Ok(outcome)
     }
 
-    /// Seals `active.wal` into a warm segment and indexes it.
+    /// Seals `active.wal` into a warm segment and indexes it. Its end is recorded in
+    /// `log_meta.json` first, so that no segment or sidecar name ever ends above it.
     fn seal_active_segment(&mut self) -> Result<Option<PathBuf>, ServerError> {
         let (Some(start_seq), Some(end_seq)) = (
             self.warm_disk.active_start_seq(),
@@ -251,6 +264,10 @@ impl TieredLog {
         ) else {
             return Ok(None);
         };
+        self.record_meta(LogMeta {
+            sealed_through_seq: end_seq.get(),
+            ..self.meta
+        })?;
         let bytes = self.warm_disk.active_len();
         let sealed = self.warm_disk.rotate_active_segment()?;
         if let Some(path) = &sealed {
@@ -524,7 +541,14 @@ impl TieredLog {
         let Some(pruned_end) = doomed.iter().map(|segment| segment.end_seq).max() else {
             return Ok((0, 0));
         };
-        self.record_pruned_through(pruned_end)?;
+        // Recorded before the segments are removed, so that a crash in between can never
+        // leave the log without any record of its highest sequence.
+        if pruned_end.get() > self.meta.pruned_through_seq {
+            self.record_meta(LogMeta {
+                pruned_through_seq: pruned_end.get(),
+                ..self.meta
+            })?;
+        }
 
         let mut deleted = (0, 0);
         let result = doomed.iter().try_for_each(|segment| {
@@ -550,22 +574,13 @@ impl TieredLog {
         result.map(|()| deleted)
     }
 
-    /// Durably records that every sequence up to `seq` is about to be deleted from disk.
-    ///
-    /// Must complete before the segments are removed, so that a crash in between can never
-    /// leave the log without any record of its highest sequence.
-    fn record_pruned_through(&mut self, seq: SequenceNumber) -> Result<(), ServerError> {
-        if seq.get() <= self.pruned_through_seq.get() {
-            return Ok(());
-        }
-        let meta = LogMeta {
-            pruned_through_seq: seq.get(),
-        };
+    /// Durably replaces `log_meta.json` with `meta`.
+    fn record_meta(&mut self, meta: LogMeta) -> Result<(), ServerError> {
         let bytes = serde_json::to_vec(&meta).map_err(|e| {
             ServerError::Serialization(format!("Failed to encode log metadata: {}", e))
         })?;
-        durable::write_atomic(&self.dir.join(LOG_META_FILE), &bytes)?;
-        self.pruned_through_seq = seq;
+        durable::write_checked(&self.dir.join(LOG_META_FILE), &bytes)?;
+        self.meta = meta;
         Ok(())
     }
 
@@ -706,8 +721,8 @@ fn age(segment: &SegmentEntry, now: SystemTime) -> std::time::Duration {
 /// there are `mutations_wanted` distinct ones or the log is exhausted, oldest first.
 ///
 /// A segment's IDs come from its sidecar ([`mutation_ids_path`]); the segment is decoded only
-/// if the sidecar is missing or damaged. A corrupt sealed segment stops the reading there
-/// instead of failing the open: older IDs are not loaded.
+/// if the sidecar is missing or damaged. A corrupt sealed segment is skipped instead of failing
+/// the open: the older segments are still read.
 fn read_newest(
     segments: &SegmentIndex,
     active: RecoveredLogData,
@@ -726,9 +741,9 @@ fn read_newest(
                 tracing::error!(
                     path = ?segment.path,
                     %reason,
-                    "Corrupt log segment; older mutation IDs are not loaded"
+                    "Corrupt log segment; its mutation IDs are not loaded"
                 );
-                break;
+                continue;
             }
             Err(err) => return Err(err),
         };
@@ -805,22 +820,14 @@ fn unreadable_range(path: &Path, err: ServerError) -> ServerError {
 }
 
 /// Takes the exclusive lock of the log in `dir`, or fails with `RoomLocked` if another log (in
-/// this or another process) holds it. The lock lives on the returned handle; the file is never
-/// read, so the lock being mandatory on Windows does not matter.
-fn lock_log(dir: &Path) -> Result<File, ServerError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dir.join(LOG_LOCK_FILE))?;
-    file.try_lock_exclusive().map_err(|e| {
-        ServerError::RoomLocked(format!(
-            "room log {:?} locked by another process: {}",
-            dir, e
-        ))
-    })?;
-    Ok(file)
+/// this or another process) holds it. The lock lives on the returned handle.
+pub(crate) fn lock_log(dir: &Path) -> Result<File, ServerError> {
+    durable::lock_exclusive(&dir.join(LOG_LOCK_FILE)).map_err(|e| match e.kind() {
+        std::io::ErrorKind::WouldBlock => {
+            ServerError::RoomLocked(format!("room log {dir:?} locked by another process: {e}"))
+        }
+        _ => e.into(),
+    })
 }
 
 /// Handles a gap found while reading a tier: the log claims to retain the range but an
@@ -836,21 +843,24 @@ fn sequence_gap(tier: &str, cursor: SequenceNumber, found: SequenceNumber) -> Se
     ServerError::BehindCompaction
 }
 
-/// Reads the highest pruned sequence recorded for the log in `dir`, or zero if nothing was ever pruned.
+/// Reads the metadata of the log in `dir`, or zeros if the log never sealed a segment.
 ///
-/// An unreadable file is an error rather than zero: silently restarting the sequence would reuse
-/// sequence numbers already delivered to clients.
-fn read_pruned_through_seq(dir: &Path) -> Result<SequenceNumber, ServerError> {
+/// An unreadable file, or one whose checksum does not match, is an error rather than zeros:
+/// silently restarting the sequence would reuse sequence numbers already delivered to clients,
+/// and a damaged pruning point would delete segments that were never pruned.
+fn read_log_meta(dir: &Path) -> Result<LogMeta, ServerError> {
     let path = dir.join(LOG_META_FILE);
     durable::remove_file_if_exists(&durable::tmp_path_for(&path))?;
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SequenceNumber::new(0)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(LogMeta::default()),
         Err(e) => return Err(e.into()),
     };
-    let meta: LogMeta = serde_json::from_slice(&bytes).map_err(|e| {
-        ServerError::WalCorruption(format!("Unreadable log metadata {:?}: {}", path, e))
-    })?;
+    let unreadable = |e: &dyn std::fmt::Display| {
+        ServerError::WalCorruption(format!("Unreadable log metadata {path:?}: {e}"))
+    };
+    let json = durable::verified_json(&bytes).ok_or_else(|| unreadable(&"checksum mismatch"))?;
+    let meta: LogMeta = serde_json::from_str(json).map_err(|e| unreadable(&e))?;
     // Checked before opening uses it: every segment ends at or below it, so the scan would
     // delete them all.
     if meta.pruned_through_seq == u64::MAX {
@@ -858,7 +868,7 @@ fn read_pruned_through_seq(dir: &Path) -> Result<SequenceNumber, ServerError> {
             "Log metadata {path:?} claims sequence number u64::MAX"
         )));
     }
-    Ok(SequenceNumber::new(meta.pruned_through_seq))
+    Ok(meta)
 }
 
 #[cfg(test)]

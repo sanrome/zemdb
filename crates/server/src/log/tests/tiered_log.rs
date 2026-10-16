@@ -4,6 +4,7 @@ use crate::log::io_probe::{self, IoEvent};
 use crate::log::policy::{MAX_LOG_BYTES_LIMIT, MIN_LOG_BYTES_LIMIT};
 use crate::log::test_support::{frames, make_op, segment_file, seqs};
 use crate::test_support::TestRng;
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::thread::sleep;
 use std::time::Duration;
@@ -234,6 +235,62 @@ fn reopen_after_full_prune_continues_sequence() {
     assert_eq!(log.head_seq().get(), 6);
 }
 
+/// Losing the newest sealed segment right after a rotation (no `active.wal` yet) leaves a gap,
+/// never reusable sequences, also once everything before it is pruned.
+#[test]
+fn losing_the_newest_segment_never_reuses_its_sequences() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 5,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+    append_range(&mut log, 1, 10);
+    drop(log);
+    std::fs::remove_file(segment_file(&segments_dir(dir.path()), 6, 10, "wal")).unwrap();
+
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+    assert_eq!(log.head_seq().get(), 10);
+    assert!(matches!(
+        log.fetch_deltas(SequenceNumber::new(5), 100),
+        Err(ServerError::BehindCompaction)
+    ));
+    log.prune_older_than(SequenceNumber::new(11)).unwrap();
+    drop(log);
+
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    assert_eq!(log.head_seq().get(), 10);
+    assert!(log.append(make_op(6), None).is_err());
+    log.append(make_op(11), None).unwrap();
+}
+
+/// A rotation that fails to record its end in `log_meta.json` has not renamed anything yet, so
+/// losing the segment files afterwards cannot take `head_seq` back.
+#[test]
+fn rotation_that_fails_to_record_its_end_seals_nothing() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 5,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+    append_range(&mut log, 1, 4);
+    let meta = dir.path().join("log_meta.json");
+    crate::fail_point::arm("write_atomic_before_rename", &meta);
+    assert!(log
+        .append(make_op(5), None)
+        .unwrap()
+        .rotation_error
+        .is_some());
+    drop(log);
+    for ext in ["wal", "ids"] {
+        let _ = std::fs::remove_file(segment_file(&segments_dir(dir.path()), 1, 5, ext));
+    }
+
+    let (log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    assert_eq!(log.head_seq().get(), 5);
+}
+
 #[test]
 fn failure_to_check_for_active_wal_fails_the_open() {
     let dir = tempdir().unwrap();
@@ -246,13 +303,27 @@ fn failure_to_check_for_active_wal_fails_the_open() {
     assert_eq!(log.head_seq().get(), 3);
 }
 
+/// One bit flipped in `log_meta.json` keeps it valid JSON but raises the recorded pruning point:
+/// the open fails instead of deleting segments that were never pruned.
 #[test]
-fn reopen_with_corrupt_log_meta_fails_instead_of_resetting_head() {
+fn reopen_with_damaged_log_meta_fails_without_deleting_anything() {
     let dir = tempdir().unwrap();
-    drop(fully_pruned_log(dir.path()));
-    std::fs::write(dir.path().join("log_meta.json"), b"{ not json").unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 5,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+    append_range(&mut log, 1, 22);
+    log.prune_older_than(SequenceNumber::new(11)).unwrap();
+    drop(log);
+    let meta = dir.path().join("log_meta.json");
+    let mut bytes = std::fs::read(&meta).unwrap();
+    let at = bytes.windows(2).position(|w| w == b"10").unwrap();
+    bytes[at] ^= 0b10; // "10" -> "30"
+    std::fs::write(&meta, bytes).unwrap();
 
-    assert!(TieredLog::open_or_create(dir.path(), full_prune_policy()).is_err());
+    assert!(TieredLog::open_or_create(dir.path(), policy).is_err());
+    assert!(segment_file(&segments_dir(dir.path()), 11, 15, "wal").exists());
 }
 
 #[test]
@@ -264,15 +335,17 @@ fn log_claiming_the_last_sequence_number_fails_to_open() {
     let segment = log.force_rotate_warm().unwrap().unwrap();
     drop(log);
     let meta = dir.path().join("log_meta.json");
-    std::fs::write(&meta, format!(r#"{{"pruned_through_seq": {}}}"#, u64::MAX)).unwrap();
-    assert!(TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).is_err());
-    assert!(segment.exists(), "the failed open deleted a segment");
+    let write_meta = |pruned: u64, sealed: u64| {
+        let json = format!(r#"{{"pruned_through_seq": {pruned}, "sealed_through_seq": {sealed}}}"#);
+        crate::durable::write_checked(&meta, json.as_bytes()).unwrap();
+    };
+    for (pruned, sealed) in [(u64::MAX, 0), (0, u64::MAX)] {
+        write_meta(pruned, sealed);
+        assert!(TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).is_err());
+        assert!(segment.exists(), "the failed open deleted a segment");
+    }
 
-    std::fs::write(
-        &meta,
-        format!(r#"{{"pruned_through_seq": {}}}"#, u64::MAX - 1),
-    )
-    .unwrap();
+    write_meta(u64::MAX - 1, 0);
     let (log, _) = TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).unwrap();
     assert_eq!(log.tail_seq().get(), u64::MAX);
     drop(log);
@@ -311,6 +384,29 @@ fn open_makes_new_segments_directory_durable() {
     crate::fail_point::arm("sync_dir", dir.path());
 
     assert!(TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).is_err());
+}
+
+/// An earlier actor or process may have written `active.wal` and created the directories of the
+/// log without a successful sync: opening syncs all of them before anything is served.
+#[test]
+fn open_syncs_active_wal_and_every_directory_on_its_path() {
+    let root = tempdir().unwrap();
+    let dir = root.path().join("rooms").join("room");
+    let active = write_log(&dir, 3);
+    let points = [
+        ("warm_open_sync", active),
+        ("sync_dir", segments_dir(&dir)),
+        ("sync_dir", dir.clone()),
+        ("sync_dir", root.path().join("rooms")),
+        ("sync_dir", root.path().to_path_buf()),
+    ];
+    for (point, path) in points {
+        crate::fail_point::arm(point, &path);
+        assert!(
+            TieredLog::open_or_create(&dir, RoomLifecyclePolicy::default()).is_err(),
+            "{point} of {path:?}"
+        );
+    }
 }
 
 /// Five operations per segment; sealed segments are compressed on the next maintenance pass
@@ -948,9 +1044,9 @@ fn open_tolerates_a_corrupt_newest_segment() {
         TieredLog::open_or_create_with_dedup_window(dir.path(), policy, 100).unwrap();
 
     assert_eq!(log.head_seq().get(), 12);
-    // Only what is newer than the damaged segment is hydrated.
+    // The damaged segment is skipped; the older ones still hydrate from their sidecars.
     let recovered: Vec<u64> = mutations.iter().map(|(_, s)| s.get()).collect();
-    assert_eq!(recovered, vec![11, 12]);
+    assert_eq!(recovered, vec![1, 2, 3, 4, 5, 11, 12]);
     assert_eq!(log.hot_buffer.min_seq().map(|s| s.get()), Some(11));
     assert!(matches!(
         log.fetch_deltas(SequenceNumber::new(5), 100),

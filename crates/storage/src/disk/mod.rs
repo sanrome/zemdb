@@ -23,13 +23,14 @@ use crate::disk::recovery::recover_room;
 use crate::disk::wal::WalWriter;
 use crate::engine::{batched_scan, RowStream, StorageEngine};
 use crate::error::StorageError;
+use crate::fail_point;
 use crate::memory::state::{
     apply_operation, decode_received_snapshot, resolve_table_id, validate_batch, TableRef,
 };
 use crate::memory::{RoomSnapshotRef, Table};
 use crate::options::ScanOptions;
 use crate::snapshot::DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES;
-use crate::sys::run_blocking;
+use crate::sys::{run_blocking, sync_dir};
 
 /// Options to configure `DiskStorageEngine`.
 #[derive(Debug, Clone)]
@@ -411,10 +412,23 @@ impl StorageEngine for DiskStorageEngine {
         let lock_path = self.lock_file_path(&room_id);
         let zstd_level = self.options.zstd_level;
         tokio::spawn(async move {
-            run_blocking(move || create_dir_all_synced(&data_dir)).await?;
+            let created = data_dir.clone();
+            run_blocking(move || create_dir_all_synced(&created)).await?;
             let (lock, std_wal_file) = {
                 let (wal_path, room_id) = (wal_path.clone(), room_id.clone());
-                run_blocking(move || lock_room_files(&lock_path, &wal_path, &room_id)).await?
+                // An earlier open may have created the directory, or the room's files, without
+                // a successful sync: their entries are synced before anything in them is served.
+                run_blocking(move || {
+                    let files = lock_room_files(&lock_path, &wal_path, &room_id)?;
+                    [Some(data_dir.as_path()), data_dir.parent()]
+                        .into_iter()
+                        .flatten()
+                        .try_for_each(|dir| {
+                            fail_point::io_result("sync_dir", dir, sync_dir(dir))
+                        })?;
+                    Ok::<_, StorageError>(files)
+                })
+                .await?
             };
 
             let recovered = recover_room(

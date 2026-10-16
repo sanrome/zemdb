@@ -458,3 +458,21 @@ fn toml_settings_load_and_environment_variables_override_them() {
     assert_eq!(policy.dormant_after, Some(Duration::from_secs(7200)));
     assert_eq!(policy.idle_timeout, None);
 }
+
+#[test]
+fn a_second_server_cannot_lock_the_same_data_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = ServerConfig {
+        data_dir: dir.path().join("data"),
+        ..ServerConfig::default()
+    };
+    let lock = config.lock_data_dir().unwrap();
+    assert!(matches!(
+        config.lock_data_dir(),
+        Err(ServerError::Config(_))
+    ));
+    drop(lock);
+    crate::fail_point::arm("sync_dir", &config.data_dir);
+    assert!(config.lock_data_dir().is_err(), "data_dir is synced");
+    config.lock_data_dir().unwrap();
+}

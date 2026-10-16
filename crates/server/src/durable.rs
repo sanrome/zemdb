@@ -97,6 +97,39 @@ fn write_atomic_blocking(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     sync_parent(path)
 }
 
+/// Atomically replaces `path` with `json` followed by a last line `crc32:<8 hex digits>` with
+/// the CRC32 of `json`, so that a damage that keeps the JSON valid is still detected (see
+/// [`verified_json`]). The file stays readable by hand.
+pub(crate) fn write_checked(path: &Path, json: &[u8]) -> std::io::Result<()> {
+    let mut bytes = json.to_vec();
+    bytes.extend_from_slice(format!("\ncrc32:{:08x}\n", crc32fast::hash(json)).as_bytes());
+    write_atomic(path, &bytes)
+}
+
+/// The JSON of a file written by [`write_checked`], or `None` if it is not UTF-8 or its
+/// checksum line is missing or does not match: such a file is unreadable.
+pub(crate) fn verified_json(bytes: &[u8]) -> Option<&str> {
+    let text = std::str::from_utf8(bytes).ok()?.strip_suffix('\n')?;
+    let (json, crc) = text.rsplit_once("\ncrc32:")?;
+    (crc == format!("{:08x}", crc32fast::hash(json.as_bytes()))).then_some(json)
+}
+
+/// Opens `path`, creating it if needed, and takes its exclusive lock, which lives on the
+/// returned handle; a lock held elsewhere is a `WouldBlock` error. The file holds no data and
+/// is never read, so the lock being mandatory on Windows does not matter.
+pub(crate) fn lock_exclusive(path: &Path) -> std::io::Result<File> {
+    use fs2::FileExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    file.try_lock_exclusive()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::WouldBlock, e))?;
+    Ok(file)
+}
+
 /// Surfaces an armed test fail point as the I/O error the caller would have seen.
 pub(crate) fn injected(name: &'static str, path: &Path) -> std::io::Result<()> {
     fail_point::check(name, path).map_err(|e| std::io::Error::other(e.to_string()))

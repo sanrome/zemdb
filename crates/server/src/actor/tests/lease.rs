@@ -13,7 +13,7 @@ fn set_inactive_for(tracker: &mut ClientLeaseTracker, client: &ClientId, secs: u
 
 fn persisted_cursor(path: &Path, client_id: &ClientId) -> Option<SequenceNumber> {
     let roster: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        serde_json::from_str(durable::verified_json(&fs::read(path).unwrap()).unwrap()).unwrap();
     let entries: Vec<ClientEntry> = serde_json::from_value(roster["clients"].clone()).unwrap();
     entries
         .into_iter()
@@ -25,11 +25,31 @@ fn persisted_cursor(path: &Path, client_id: &ClientId) -> Option<SequenceNumber>
 fn unreadable_roster_opens_empty() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("meta_clients_room.json");
-    fs::write(&path, b"[{\"client_id\": \"a\", \"sta").unwrap();
+    let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
+    tracker.register_client(&ClientId::new("a").unwrap(), None, seq(1));
+    tracker.save().unwrap();
+    let saved = fs::read(&path).unwrap();
 
-    let tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
-
-    assert_eq!(tracker.client_counts().4, 0);
+    // Truncated, empty, not UTF-8, and one bit flipped in the cursor, which keeps the JSON valid.
+    let mut not_utf8 = saved.clone();
+    not_utf8[0] ^= 0x80;
+    let mut flipped = saved.clone();
+    let needle = b"\"last_ack_seq\":";
+    flipped[saved
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .unwrap()
+        + needle.len()] ^= 1;
+    for damaged in [
+        saved[..saved.len() / 2].to_vec(),
+        Vec::new(),
+        not_utf8,
+        flipped,
+    ] {
+        fs::write(&path, damaged).unwrap();
+        let tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
+        assert_eq!(tracker.client_counts().4, 0);
+    }
 }
 
 #[test]
@@ -210,7 +230,7 @@ fn activity_that_changes_state_is_persisted_on_flush() {
 fn roster_entry_with_invalid_client_id_is_skipped_and_the_rest_kept() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("meta_clients_room.json");
-    fs::write(
+    durable::write_checked(
         &path,
         br#"[
             {"client_id": "alice", "state": "Connected", "last_ack_seq": 3},
@@ -394,7 +414,7 @@ fn snapshot_demand_is_persisted_on_flush_and_survives_reopening() {
 fn roster_in_the_array_format_still_loads() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("meta_clients_room.json");
-    fs::write(
+    durable::write_checked(
         &path,
         br#"[{"client_id": "alice", "state": "Connected", "last_ack_seq": 3}]"#,
     )
@@ -414,7 +434,7 @@ fn roster_in_the_array_format_still_loads() {
 fn unreadable_snapshot_demand_keeps_the_clients() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("meta_clients_room.json");
-    fs::write(
+    durable::write_checked(
         &path,
         br#"{
             "clients": [
@@ -471,7 +491,7 @@ fn snapshot_demand_renewals_within_the_granularity_do_not_dirty_the_roster() {
 /// How long ago, by the wall clock, the roster on disk says `client_id` was last active.
 fn persisted_inactivity(path: &Path, client_id: &ClientId) -> Duration {
     let roster: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        serde_json::from_str(durable::verified_json(&fs::read(path).unwrap()).unwrap()).unwrap();
     let entry = roster["clients"]
         .as_array()
         .unwrap()
@@ -525,7 +545,7 @@ fn roster_without_last_activity_or_with_a_future_one_loads_clients_as_active() {
     let path = dir.path().join("meta_clients_room.json");
     let tomorrow = SystemTime::now() + Duration::from_secs(86_400);
     let tomorrow_ms = tomorrow.duration_since(UNIX_EPOCH).unwrap().as_millis();
-    fs::write(
+    durable::write_checked(
         &path,
         format!(
             r#"{{"clients": [
@@ -533,7 +553,8 @@ fn roster_without_last_activity_or_with_a_future_one_loads_clients_as_active() {
                 {{"client_id": "future", "state": "Connected", "last_ack_seq": 3,
                   "last_seen_unix_ms": {tomorrow_ms}}}
             ], "snapshot_demand": null}}"#
-        ),
+        )
+        .as_bytes(),
     )
     .unwrap();
 
@@ -608,7 +629,8 @@ fn dormant_client_is_forgotten_after_its_ttl_from_a_compact_roster() {
     assert!(tracker.get_client(&gone).is_none() && tracker.get_client(&active).is_some());
 
     // The roster on disk, one compact line, forgot it too.
-    let saved = fs::read_to_string(&path).unwrap();
+    let saved = fs::read(&path).unwrap();
+    let saved = durable::verified_json(&saved).unwrap();
     assert!(!saved.contains('\n'), "{saved}");
     let reopened = ClientLeaseTracker::open_or_create(&path).unwrap();
     assert!(reopened.get_client(&gone).is_none() && reopened.get_client(&active).is_some());

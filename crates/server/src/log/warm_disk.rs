@@ -256,8 +256,11 @@ impl WarmDiskLog {
         };
         if valid_len < len {
             file.set_len(valid_len)?;
-            file.sync_all()?;
         }
+        // An earlier actor may have written records whose sync failed: none is served or
+        // deduplicated before this process syncs them.
+        fail_point::check("warm_open_sync", &active_path)?;
+        file.sync_all()?;
 
         self.active_file = Some(file);
         self.active_start_seq = read.ops.first().map(|op| op.seq);

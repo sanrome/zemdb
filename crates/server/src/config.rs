@@ -439,6 +439,25 @@ impl ServerConfig {
         config.validate()?;
         Ok(config)
     }
+
+    /// Takes the exclusive lock of `data_dir` (`server.lock`, created with the directory if
+    /// needed), which keeps a second server off the same files, and syncs `data_dir`, whose
+    /// entries an earlier run may have created without a successful sync. A server takes it
+    /// before touching any other file and holds the returned handle until it exits.
+    pub fn lock_data_dir(&self) -> Result<std::fs::File, ServerError> {
+        crate::durable::create_dir_all_synced(&self.data_dir)?;
+        let lock = crate::durable::lock_exclusive(&self.data_dir.join("server.lock")).map_err(
+            |e| match e.kind() {
+                std::io::ErrorKind::WouldBlock => ServerError::Config(format!(
+                    "data_dir {:?} is in use by another server process: {e}",
+                    self.data_dir
+                )),
+                _ => e.into(),
+            },
+        )?;
+        crate::durable::sync_dir(&self.data_dir)?;
+        Ok(lock)
+    }
 }
 
 /// Reads the variable `name` through `var` and parses it as `T`. An unparsable value is an

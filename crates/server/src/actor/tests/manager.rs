@@ -102,12 +102,29 @@ async fn unreadable_meta_room_fails_to_load() {
     let dir = tempdir().unwrap();
     let room_id = RoomId::new("room-c").unwrap();
     let meta_path = meta_room_path(&dir, &room_id);
-    fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
-    fs::write(&meta_path, b"{\"room_id\": \"room-c\", \"schema_").unwrap();
-
     let manager = new_manager(&dir);
-    let res = manager.get_or_spawn(&room_id, None).await;
-    assert!(matches!(res, Err(ServerError::Serialization(_))));
+    manager
+        .create_room(room_id.clone(), SchemaId::new("first").unwrap(), None)
+        .await
+        .unwrap();
+    manager.shutdown_all().await;
+    let stored = fs::read(&meta_path).unwrap();
+
+    // Truncated, and one bit flipped in a digit of the incarnation, which keeps the JSON valid.
+    let needle = b"\"room_incarnation\": ";
+    let at = stored
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .unwrap()
+        + needle.len()
+        + 1;
+    let mut flipped = stored.clone();
+    flipped[at] ^= 1;
+    for damaged in [stored[..stored.len() / 2].to_vec(), flipped] {
+        fs::write(&meta_path, damaged).unwrap();
+        let res = new_manager(&dir).get_or_spawn(&room_id, None).await;
+        assert!(matches!(res, Err(ServerError::Serialization(_))), "{res:?}");
+    }
 }
 
 #[tokio::test]
@@ -331,8 +348,10 @@ async fn lifecycle_overrides_survive_a_respawn_and_a_restart() {
         manager.lifecycle_overrides(&room_id).await.unwrap(),
         custom_overrides()
     );
-    let stored: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(meta_room_path(&dir, &room_id)).unwrap()).unwrap();
+    let stored: serde_json::Value = serde_json::from_str(
+        durable::verified_json(&fs::read(meta_room_path(&dir, &room_id)).unwrap()).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         stored["lifecycle"],
         serde_json::to_value(custom_overrides()).unwrap()
@@ -378,7 +397,7 @@ async fn meta_room_without_lifecycle_has_no_overrides() {
     let room_id = RoomId::new("policy-b").unwrap();
     let meta_path = meta_room_path(&dir, &room_id);
     fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
-    fs::write(
+    durable::write_checked(
         &meta_path,
         br#"{"room_id": "policy-b", "schema_id": "first", "room_incarnation": 1}"#,
     )
@@ -404,9 +423,10 @@ async fn invalid_stored_overrides_fail_to_load() {
         let room_id = RoomId::new(name).unwrap();
         let meta_path = meta_room_path(&dir, &room_id);
         fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
-        fs::write(
+        durable::write_checked(
             &meta_path,
-            format!(r#"{{"room_id": "{name}", "schema_id": "first", "lifecycle": {lifecycle}}}"#),
+            format!(r#"{{"room_id": "{name}", "schema_id": "first", "lifecycle": {lifecycle}}}"#)
+                .as_bytes(),
         )
         .unwrap();
 
@@ -992,7 +1012,7 @@ async fn room_that_fails_to_spawn_leaves_no_metadata() {
     let room_id = RoomId::new("no-schema").unwrap();
     let meta_path = meta_room_path(&dir, &room_id);
     fs::create_dir_all(meta_path.parent().unwrap()).unwrap();
-    fs::write(
+    durable::write_checked(
         &meta_path,
         br#"{"room_id": "no-schema", "schema_id": "missing", "room_incarnation": 1}"#,
     )

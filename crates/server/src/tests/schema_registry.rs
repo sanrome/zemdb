@@ -199,9 +199,9 @@ fn concurrent_schema_writes_all_succeed_without_losing_columns() {
     assert!(!durable::tmp_path_for(&todo_path(&dir)).exists());
 }
 
-/// A damaged schema file never panics the registry's startup: it fails with a serialization
-/// error (an I/O error for bytes that are not UTF-8), or loads the file as a valid schema that
-/// survives a round trip. The damage is random, from a fixed seed.
+/// A damaged schema file fails the registry's startup with a serialization error, without
+/// panicking, even when the damage leaves valid JSON; only a damage that left the file as it
+/// was loads. The damage is random, from a fixed seed.
 fn check_damaged_schema_files(seed: u64, cases: u64) {
     // Two tables, a composite key, an encrypted and a nullable column, and a column added later.
     let dir = tempdir().unwrap();
@@ -258,15 +258,8 @@ fn check_damaged_schema_files(seed: u64, cases: u64) {
         fs::write(todo_path(&dir), &damaged).unwrap();
 
         match SchemaRegistry::new(dir.path()) {
-            Ok(reopened) => {
-                let loaded = reopened
-                    .get_schema(&id)
-                    .expect("a schema file is never skipped");
-                let json = serde_json::to_vec(&*loaded).unwrap();
-                assert_eq!(serde_json::from_slice::<Schema>(&json).unwrap(), *loaded);
-            }
+            Ok(_) => assert_eq!(damaged, original, "case {case}: damage accepted"),
             Err(ServerError::Serialization(_)) => {}
-            Err(ServerError::Io(e)) if e.kind() == std::io::ErrorKind::InvalidData => {}
             Err(other) => panic!(
                 "case {case}: {other:?} for {}",
                 String::from_utf8_lossy(&damaged)
@@ -276,12 +269,12 @@ fn check_damaged_schema_files(seed: u64, cases: u64) {
 }
 
 #[test]
-fn damaged_schema_files_never_panic_the_registry() {
+fn damaged_schema_files_fail_the_startup() {
     check_damaged_schema_files(0x5C4E_0001, 300);
 }
 
 #[test]
 #[ignore = "long-running randomized test; run with --ignored in release"]
-fn damaged_schema_files_never_panic_the_registry_long() {
+fn damaged_schema_files_fail_the_startup_long() {
     check_damaged_schema_files(0x5C4E_0002, 5_000);
 }

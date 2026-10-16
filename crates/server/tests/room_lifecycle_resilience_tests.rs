@@ -7,6 +7,7 @@ use common::{
 };
 use std::sync::Arc;
 use zemdb_core::*;
+use zemdb_server::ServerError;
 
 #[tokio::test]
 async fn concurrent_get_or_spawn_reaches_a_single_actor() {
@@ -63,6 +64,15 @@ async fn deleting_a_room_removes_its_directory() {
 
     let room_dir = parts.data_dir.join("rooms").join(room_id.as_str());
     assert!(room_dir.exists(), "Room directory must exist on disk");
+
+    // Another manager on the same directory, as another process would be, does not own the
+    // room's log: it cannot delete the room.
+    let foreign = parts.restarted_manager().delete_room(&room_id).await;
+    assert!(
+        matches!(foreign, Err(ServerError::RoomLocked(_))),
+        "{foreign:?}"
+    );
+    assert!(room_dir.exists());
 
     // Graceful deletion: shuts down actor, awaits loop termination, and cleans up directory
     parts.room_manager.delete_room(&room_id).await.unwrap();

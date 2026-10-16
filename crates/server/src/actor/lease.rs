@@ -80,7 +80,8 @@ impl ClientLeaseTracker {
     /// Opens an existing client metadata file or creates a new empty tracker.
     ///
     /// An entry that cannot be parsed is skipped with a warning; a roster that cannot be
-    /// parsed at all is discarded with a warning and the tracker starts empty. Dropped
+    /// parsed at all, or whose checksum does not match, is discarded with a warning and the
+    /// tracker starts empty. Dropped
     /// clients register again, and until they do no client cursor allows proactive pruning,
     /// which is the safe direction. An invalid snapshot demand is dropped with a warning (the
     /// next client that needs a snapshot turns it on again). Errors reading the file are
@@ -93,15 +94,10 @@ impl ClientLeaseTracker {
 
         durable::remove_file_if_exists(&durable::tmp_path_for(&path))?;
 
-        let content = match fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        let (clients, snapshot_demand) = match fs::read(&path) {
+            Ok(bytes) => parse_roster(&path, durable::verified_json(&bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (HashMap::new(), None),
             Err(e) => return Err(e.into()),
-        };
-        let (clients, snapshot_demand) = if content.trim().is_empty() {
-            (HashMap::new(), None)
-        } else {
-            parse_roster(&path, &content)
         };
 
         Ok(Self {
@@ -127,7 +123,7 @@ impl ClientLeaseTracker {
         let json = serde_json::to_string(&roster).map_err(|e| {
             ServerError::Serialization(format!("Failed to serialize clients roster: {}", e))
         })?;
-        durable::write_atomic(&self.path, json.as_bytes())?;
+        durable::write_checked(&self.path, json.as_bytes())?;
         self.dirty = false;
         self.activity_unsaved = false;
         Ok(())
@@ -476,16 +472,16 @@ impl PersistedDemand {
     }
 }
 
-/// Parses a roster file: the current object (`clients` and `snapshot_demand`) or the earlier
-/// array of clients.
+/// Parses the verified JSON of a roster file (`None` if it did not verify): the current object
+/// (`clients` and `snapshot_demand`) or the earlier array of clients.
 ///
 /// Entries are parsed one by one so that a single invalid entry (for example a client id that
 /// no longer passes validation) only drops that client, and an invalid snapshot demand only
-/// drops the demand. A file whose clients cannot be found at all yields an empty roster. Each
-/// loss is logged as a warning.
+/// drops the demand. A file that did not verify, or whose clients cannot be found at all,
+/// yields an empty roster. Each loss is logged as a warning.
 fn parse_roster(
     path: &Path,
-    content: &str,
+    content: Option<&str>,
 ) -> (HashMap<ClientId, ClientEntry>, Option<SystemTime>) {
     let unreadable = |error: &dyn std::fmt::Display| {
         warn!(
@@ -494,6 +490,9 @@ fn parse_roster(
             "Unreadable clients roster; starting with an empty roster"
         );
         (HashMap::new(), None)
+    };
+    let Some(content) = content else {
+        return unreadable(&"checksum mismatch");
     };
     let (raw_entries, raw_demand) = match serde_json::from_str::<serde_json::Value>(content) {
         Ok(serde_json::Value::Array(entries)) => (entries, None),

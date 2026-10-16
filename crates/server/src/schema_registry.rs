@@ -67,13 +67,16 @@ impl SchemaRegistry {
                     continue;
                 }
             };
-            let content = fs::read_to_string(&path)?;
-            let schema: Schema = serde_json::from_str(&content).map_err(|e| {
+            let bytes = fs::read(&path)?;
+            let unreadable = |e: &dyn std::fmt::Display| {
                 ServerError::Serialization(format!(
                     "Failed to parse schema JSON from {}: {e}",
                     path.display()
                 ))
-            })?;
+            };
+            let json =
+                durable::verified_json(&bytes).ok_or_else(|| unreadable(&"checksum mismatch"))?;
+            let schema: Schema = serde_json::from_str(json).map_err(|e| unreadable(&e))?;
             schemas.insert(schema_id, Arc::new(schema));
         }
 
@@ -135,7 +138,7 @@ impl SchemaRegistry {
             ServerError::Serialization(format!("Failed to serialize schema {}: {}", id, e))
         })?;
 
-        durable::write_atomic(&path, json.as_bytes())?;
+        durable::write_checked(&path, json.as_bytes())?;
 
         let arc_schema = Arc::new(schema);
         self.schemas.insert(id, Arc::clone(&arc_schema));

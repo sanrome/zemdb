@@ -82,7 +82,7 @@ La única excepción son los ítems del backlog marcados **(barato)** que estén
 
 ## 2. Decisiones de diseño
 
-Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las decisiones D69 a D80 son las que se tomaron sobre la auditoría (el número entre paréntesis es el de la conversación). Las D81 a D87 son de implementación y están **propuestas**: se confirman o cambian antes de arrancar el lote correspondiente. D89 salió de la revisión de delta del Lote 3 y se adoptó con ella.
+Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las decisiones D69 a D80 son las que se tomaron sobre la auditoría (el número entre paréntesis es el de la conversación). Las D81 a D87 son de implementación: se confirman o cambian antes de arrancar el lote correspondiente. D89 salió de la revisión de delta del Lote 3 y se adoptó con ella.
 
 | ID | Decisión | Lote | Estado |
 |---|---|---|---|
@@ -98,9 +98,9 @@ Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las de
 | **D78** | **El último frame dañado de `active.wal` es una excepción de INV-D2 (10a).** Un daño en el último frame sin ningún frame válido después no se distingue de una escritura rota: se trunca y su secuencia puede reutilizarse. El piso de secuencia (D81) lo cubre cuando la secuencia aparece en otro archivo durable. Se documenta en INV-D2. | 0 | Adoptada |
 | **D79** | **Invariantes nuevas y ajustes de enunciado (11, 12, 13).** Se agregan a `INVARIANTES.md`: P1 (un proceso por `data_dir`), P2 (nada visible antes de ser durable en este proceso), P3 (piso de secuencia fuera del log), P4 (metadatos verificados), P5 (ventana de dedup como función del log), P6 (ningún cliente acapara un recurso global), P7 (borrado de sala atómico), P9 (memoria igual a disco en storage), P10 (snapshot atado a la encarnación) y P11 (subida confirmada usable). P12 y P13 se incorporan a los enunciados de INV-B2 e INV-B1. P8 no se adopta: pasa a riesgo aceptado en §4 (un valor que embebe un frame válido puede convertir una escritura rota en corrupción; falla cerrada, sin pérdida). Se aplican los ajustes de enunciado de la auditoría (§5): Y3, Y5, Y6, Y7, Y8, R3, R4, R5, S4, S5, B3, B4 y L1. | 0 | Adoptada |
 | **D80** | **DEF-152 se mantiene en Alto (14a).** | — | Adoptada |
-| **D81** | **Piso de secuencia en `log_meta.json`.** El archivo pasa a guardar `pruned_through_seq` y `sealed_through_seq` (el fin del último segmento sellado). Se reescribe con `write_atomic` en cada rotación, antes de crear el `active.wal` nuevo. Al abrir, `head_seq` es el máximo entre los nombres de segmento, `active.wal`, `pruned_through_seq` y `sealed_through_seq`. Costo: una escritura atómica por rotación (cada 1.000 operaciones o 32 MiB por defecto). | 2 | Propuesta |
-| **D82** | **JSON persistido con checksum.** `log_meta.json`, `meta_room.json`, `schemas/{id}.json` y el roster se escriben como el JSON, un salto de línea y una última línea `crc32:<8 hex>` con el CRC32 de los bytes del JSON. Siguen siendo legibles a mano. Leer un archivo sin esa línea o con un CRC que no coincide equivale a un archivo ilegible: `log_meta.json`, `meta_room.json` y los esquemas hacen fallar la apertura; el roster se descarta con un warning, como hoy. Un roster con UTF-8 inválido también se descarta (hoy falla la apertura, al revés de lo que dice §5.2). Sin compatibilidad con archivos sin checksum (V1). La apertura nunca borra segmentos a partir de un valor que no verificó. | 2 | Propuesta |
-| **D83** | **Lock exclusivo de `data_dir`.** El servidor toma `data_dir/server.lock` (`fs2`, como `log.lock`) al arrancar, antes de recuperar el relay o el registry de esquemas. Si el lock está tomado, se niega a arrancar con un error que lo explica. `delete_room` además toma el `log.lock` de la sala antes de borrarla. | 2 | Propuesta |
+| **D81** | **Piso de secuencia en `log_meta.json`.** El archivo pasa a guardar `pruned_through_seq` y `sealed_through_seq` (el fin del último segmento sellado). Se reescribe con `write_atomic` en cada rotación, antes de crear el `active.wal` nuevo. Al abrir, `head_seq` es el máximo entre los nombres de segmento, `active.wal`, `pruned_through_seq` y `sealed_through_seq`. Costo: una escritura atómica por rotación (cada 1.000 operaciones o 32 MiB por defecto). Al adoptarla se fijó: los dos campos son obligatorios (V1); una falla al escribirlo es un `rotation_error` y la sala se reabre; en la implementación se escribe antes del rename de `active.wal`, así ningún nombre de segmento ni de sidecar termina por encima. | 2 | Adoptada |
+| **D82** | **JSON persistido con checksum.** `log_meta.json`, `meta_room.json`, `schemas/{id}.json` y el roster se escriben como el JSON, un salto de línea y una última línea `crc32:<8 hex>` con el CRC32 de los bytes del JSON. Siguen siendo legibles a mano. Leer un archivo sin esa línea o con un CRC que no coincide equivale a un archivo ilegible: `log_meta.json`, `meta_room.json` y los esquemas hacen fallar la apertura; el roster se descarta con un warning, como hoy. Un roster con UTF-8 inválido también se descarta (hoy falla la apertura, al revés de lo que dice §5.2). Sin compatibilidad con archivos sin checksum (V1). La apertura nunca borra segmentos a partir de un valor que no verificó. Al adoptarla se fijó: el formato es `<json>\ncrc32:<8 hex en minúscula>\n`, con un par de helpers comunes en `durable.rs`; un roster de 0 bytes también se descarta con un warning (cierra ese ítem del backlog). | 2 | Adoptada |
+| **D83** | **Lock exclusivo de `data_dir`.** El servidor toma `data_dir/server.lock` (`fs2`, como `log.lock`) al arrancar, antes de recuperar el relay o el registry de esquemas. Si el lock está tomado, se niega a arrancar con un error que lo explica. `delete_room` además toma el `log.lock` de la sala antes de borrarla. Al adoptarla se fijó: `ServerConfig::lock_data_dir`, que `main.rs` llama antes del registry y del relay; los tests que arman los componentes a mano no lo toman. `delete_room` toma el `log.lock` después de `shutdown_room` y antes de purgar el relay (si está tomado, `RoomLocked` sin borrar nada), y lo suelta justo antes de `remove_dir_all`, porque Windows no borra un archivo bloqueado; mientras tanto, el lock por sala impide reabrirla en este proceso y `server.lock` impide que lo haga otro. | 2 | Adoptada |
 | **D84** | **Borrado de sala con lápida.** `delete_room` renombra `rooms/<id>` a `rooms/.deleted-<uuid>`, sincroniza `rooms/` y recién después borra el directorio renombrado. Al arrancar se borran las lápidas que quedaron. `RoomId` no admite `.`, así que una lápida nunca choca con una sala. `create_room` además purga el relay de ese id (P10). | 5 | Propuesta |
 | **D85** | **Absorción atómica en storage.** En lugar de anexar el WAL activo a `.wal.compacting` en el lugar, se arma `room_{id}.wal.compacting.tmp` con `.wal.compacting` más el WAL activo, se sincroniza, se renombra sobre `.wal.compacting`, se sincroniza el directorio y recién después se trunca el WAL activo. `.wal.compacting` nunca queda con una cola rota, así que desaparecen la excepción de corrupción de `.wal.compacting` y `highest_seq_in_valid_frames`. Al adoptarla se fijó: el temporal tiene nombre fijo y la apertura lo borra sin leerlo (se suma a los temporales de INV-S4); una falla al escribirlo, sincronizarlo o renombrarlo lo borra y deja la sala usable; una falla del sync del directorio después del rename la marca `RoomFailed`; un daño que llega al final de `.wal.compacting` sigue siendo una escritura rota. | 3 | Adoptada |
 | **D86** | **`apply_snapshot` instala en su propia tarea.** Desde el staging hasta la instalación (rename, sync, vaciado del WAL, borrado de `.wal.compacting`), `apply_snapshot` corre en una tarea propia, como `compact_room`. Cancelar el future deja de abandonar operaciones de archivo en vuelo, y `close_room` espera a la tarea (comparten el lock de compactación). Al adoptarla se fijó: decodificar y esperar el lock siguen en quien llama; quien suelta el future ya no deja la sala `RoomFailed`, porque el snapshot se aplica entero. | 3 | Adoptada |
@@ -116,13 +116,13 @@ Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las de
 |---|---|---|---|---|
 | 0 | Contrato y redes de prueba | D70–D72, D78, D79, D88 | Inmediata (las redes viven en copias temporales) | ✅ |
 | 1 | Arreglos chicos de alto valor | DEF-146, 147, 155 | Inmediata | ✅ 3/3 |
-| 2 | Abrir solo lo verificado y sincronizado | DEF-144, 145, 148, 158, 149 | Alta (requisito de Fase 4) | ⬜ 0/5 |
+| 2 | Abrir solo lo verificado y sincronizado | DEF-144, 145, 148, 158, 149 | Alta (requisito de Fase 4) | ✅ 5/5 |
 | 3 | Storage: cancelación y absorción | DEF-150, 151, 165 | Alta (requisito de Fase 4) | ✅ 3/3 |
 | 4 | Recursos | DEF-152, 159, 153, 163, 162, 164, 154, 157 | Media | ⬜ 0/8 |
 | 5 | Ciclo de vida | DEF-156, 160, 161 | Baja | ⬜ 0/3 |
 | 6 | Documentación | ARCHITECTURE, README, ROADMAP | Baja | ⬜ |
 
-**Avance total:** 6 de 22 ítems (Lotes 0, 1 y 3 cerrados).
+**Avance total:** 11 de 22 ítems (Lotes 0 a 3 cerrados).
 
 **Ítems nuevos de este plan.** Surgen de las invariantes adoptadas (D79) y de hallazgos de la auditoría que no tenían ID:
 - **DEF-159** · Medio · P6: reparto del presupuesto de respuestas.
@@ -313,7 +313,7 @@ Falla en `main` en los dos primeros casos. Mutaciones verificadas: sin la guarda
 
 > Objetivo: que abrir una sala nunca confirme lo que ningún `fsync` cubrió, nunca borre a partir de datos sin verificar y nunca reutilice una secuencia. Cambia el formato de los metadatos del servidor.
 
-#### DEF-144 · Alto · ⬜ Pendiente
+#### DEF-144 · Alto · ✅ Hecho
 **Problema.** Reabrir después de un `fsync` fallido confirma registros y entradas de directorio que ningún `fsync` cubrió (P2).
 **Solución.** D77, en el servidor y en storage.
 **Test exigido.**
@@ -321,7 +321,23 @@ Falla en `main` en los dos primeros casos. Mutaciones verificadas: sin la guarda
 - Los tres tests de entradas de directorio de `inv/l` (`active.wal`, `rooms/<id>` y el `data_dir` de storage).
 - `failed_commit_sync_stops_room_and_recovers_from_disk`, ajustado: hoy da por correcto el comportamiento viejo.
 
-#### DEF-145 · Alto · ⬜ Pendiente
+**Hecho.**
+- **Servidor:**
+  - al abrir el log, después del `log.lock`, se sincronizan `segments/`, el directorio de la sala, `rooms/` y `data_dir`;
+  - `inspect_active_segment` hace `sync_all` de `active.wal` siempre, no solo al truncar;
+  - `lock_data_dir` sincroniza `data_dir` al arrancar.
+- **Storage:** `open_room` sincroniza `data_dir` y su padre en cada apertura, después de tomar el lock y el WAL de la sala, y `recover_room` hace `sync_all` del WAL activo siempre.
+- **Tests:**
+  - `failed_commit_sync_stops_room_and_recovers_from_disk` (`actor/tests/room.rs`), extendido: con el fail point nuevo `warm_open_sync`, el respawn falla y el reintento no se confirma. Es el de `inv/d`, comprobado con el fail point en lugar de truncar el archivo.
+  - `open_syncs_active_wal_and_every_directory_on_its_path` (`log/tests/tiered_log.rs`): una tabla con el sync de `active.wal` y los tres directorios. Cubre los tests de `active.wal` y `rooms/<id>` de `inv/l`.
+  - Storage: `open_room_syncs_the_data_directory_and_its_parent` (antes `open_room_syncs_the_data_directory_it_creates`) es el de `data_dir` de `inv/l`, y `failed_wal_sync_marks_room_failed_until_reopened` suma el fail point `recovery.wal_sync`.
+- **Desvíos:**
+  - `.wal.compacting` no se sincroniza por separado. Si tiene registros vivos, la recuperación los pliega en un snapshot que se escribe por el camino atómico, y si no, se borra.
+  - Los syncs de `data_dir` (abrir el log y arrancar el servidor) no estaban en D77; salieron de la revisión de delta. Una entrada de `rooms/`, `schemas/` o `snapshots/` cuyo sync falló no se volvía a sincronizar.
+  - En storage, el sync va después de `lock_room_files`, así que también cubre un WAL recreado en la misma apertura. Eso cierra el ítem del backlog "un WAL que falta con el snapshot presente se recrea sin sincronizar el directorio".
+  - El fail point del sync de `active.wal` (`warm_open_sync`) y el de storage (`recovery.wal_sync`) van al lado del sync, no adentro. Si se borra solo el sync, ningún test falla, como en el resto de los syncs de archivo.
+
+#### DEF-145 · Alto · ✅ Hecho
 **Problema.** Ningún JSON persistido tiene checksum: un bit invertido en `log_meta.json` borra segmentos al abrir, y en un esquema renumera una tabla (P4).
 **Solución.** D82.
 **Test exigido.**
@@ -330,24 +346,66 @@ Falla en `main` en los dos primeros casos. Mutaciones verificadas: sin la guarda
 - Roster con UTF-8 inválido: se descarta.
 - Ajustar `log_claiming_the_last_sequence_number_fails_to_open`.
 
-#### DEF-148 · Alto · ⬜ Pendiente
+**Hecho.** `durable::write_checked` y `durable::verified_json`, usados por los cuatro archivos.
+- **Tests:**
+  - `reopen_with_damaged_log_meta_fails_without_deleting_anything` reemplaza a `reopen_with_corrupt_log_meta_fails_instead_of_resetting_head`. Es el de `inv/delta`: el bit invertido hace fallar la apertura y el segmento 11–15 sigue ahí.
+  - `damaged_schema_files_fail_the_startup` (antes `damaged_schema_files_never_panic_the_registry`) ahora exige que todo daño haga fallar el arranque. Cubre el de `inv/ew`, en sus 300 casos y en la versión larga.
+  - `unreadable_meta_room_fails_to_load`: archivo truncado y un bit invertido en la encarnación.
+  - `unreadable_roster_opens_empty`: roster truncado, vacío, con UTF-8 inválido y con un bit invertido en el cursor.
+  - `log_claiming_the_last_sequence_number_fails_to_open`, ajustado: escribe con checksum y prueba `u64::MAX` en los dos campos.
+- **Ajustados porque escribían o leían los JSON a mano:** los tests de lease, de manager (entre ellos `invalid_stored_overrides_fail_to_load`, que si no fallaba por el checksum antes de validar los overrides) y de room.
+
+#### DEF-148 · Alto · ✅ Hecho
 **Problema.** Perder el segmento sellado más nuevo hace retroceder `head_seq` y reutiliza secuencias (P3).
 **Solución.** D81.
 **Test exigido.** `audit_d2_lost_newest_segment_reuses_sequence_numbers` (`inv/d`): después de perder el segmento, `head_seq` no retrocede y la operación siguiente recibe una secuencia nueva. Lo mismo si se pierde el segmento y después se poda todo.
 
-#### DEF-158 · Bajo · ⬜ Pendiente
+**Hecho.** `LogMeta` reemplaza al campo `pruned_through_seq` de `TieredLog`; `record_meta` escribe los dos campos.
+- **Tests:**
+  - `losing_the_newest_segment_never_reuses_its_sequences`: el de `inv/d`, más la poda posterior.
+  - `rotation_that_fails_to_record_its_end_seals_nothing`: si falla la escritura de `log_meta.json` al rotar, no se renombró nada.
+- **Desvío:** `sealed_through_seq` se escribe antes del rename de `active.wal`, no después de indexar el segmento. Así ningún nombre de segmento ni de sidecar termina por encima (INV-D8). Una falla ahí no sella nada.
+
+#### DEF-158 · Bajo · ✅ Hecho
 **Problema.** Un segmento dañado sin sidecar corta la hidratación del dedup, aunque los segmentos más viejos tengan sidecars válidos.
 **Solución.** Saltear el segmento dañado (con el warning de hoy) y seguir con los anteriores.
 **Test exigido.** Ajustar `open_tolerates_a_corrupt_newest_segment`: se recuperan los ids de los segmentos anteriores con sidecar.
 
-#### DEF-149 · Medio · ⬜ Pendiente
+**Hecho.** `read_newest` hace `continue` en lugar de `break`. El test ajustado recupera 1–5, 11 y 12.
+
+#### DEF-149 · Medio · ✅ Hecho
 **Problema.** Un segundo proceso sobre el mismo `data_dir` puede borrar y recrear una sala que posee el primero (P1).
 **Solución.** D83.
 **Test exigido.**
 - `audit_d5_second_process_deletes_a_room_owned_by_the_first` (`inv/d`), adaptado: el segundo servidor no arranca.
 - Un `delete_room` sobre una sala con `log.lock` tomado falla sin borrar nada.
 
+**Hecho.** `durable::lock_exclusive` es el lock compartido por `log.lock` y `server.lock`; un lock tomado es `WouldBlock`.
+- **Tests:**
+  - `a_second_server_cannot_lock_the_same_data_dir` (`src/tests/config.rs`).
+  - `deleting_a_room_removes_its_directory` (`tests/room_lifecycle_resilience_tests.rs`), extendido: otro manager sobre el mismo directorio recibe `RoomLocked` y la sala sigue ahí.
+  - `room_deletion_finishes_when_the_request_is_dropped` (`api/tests/control_plane.rs`), extendido: mientras el relay purga el snapshot, nadie puede abrir el log de la sala.
+- **Desvíos:**
+  - El de `inv/d` no se trajo tal cual. Simulaba el segundo proceso con dos managers, y ahora lo cubren dos tests: el segundo servidor no arranca, y un manager que no es dueño del log no borra la sala.
+  - Que `main.rs` tome el lock no lo cubre ningún test, porque ningún test arranca el binario.
+
 ---
+
+**Cierre del lote.**
+- **Chequeos:** fmt, clippy, tests, doc y el build de wasm32 en verde, sobre `f441262` (el cierre del Lote 3, con el que se combinó `open_room` de storage). 767 tests pasan y 38 están ignorados. Hay cuatro tests nuevos; los demás escenarios se sumaron a tests que ya existían.
+- **Tests de ruptura:** los 12 fallan en `main`. El del lock de `data_dir` usa una API nueva.
+- **Mutación inversa:** 18 mutaciones, una o más por cada parte de cada fix. Todas hacen fallar algún test.
+- **Versiones largas:** `cargo test -p zemdb-server -p zemdb-storage --release -- --ignored`, 25 de 25 en verde.
+- **Revisión de delta:** la hizo un agente aparte, de contexto fresco y solo lectura. Los cinco fixes cierran su escenario y el diff no rompe ninguna invariante núcleo.
+  - **Lo que entró al lote:**
+    - **Medio:** `delete_room` soltaba el `log.lock` antes de purgar el relay, y durante la purga otro dueño podía abrir el log que después se borraba. Ahora lo retiene hasta justo antes de `remove_dir_all`.
+    - **Bajo:** la entrada de `rooms/` en `data_dir` no se volvía a sincronizar (ver DEF-144).
+    - **Bajo:** `lock_data_dir` decía "en uso por otro proceso" ante cualquier error; ahora lo dice solo si el lock está tomado.
+    - **Notas:** el sync de storage después de `lock_room_files` y un docstring.
+  - **Lo que no entró** (backlog Bajo): la apertura que decodifica todos los segmentos dañados sin sidecar, y el padre de `data_dir` que storage ahora sincroniza siempre.
+- **Documentos:**
+  - `ARCHITECTURE.md`: §5.2 (*Failed append stops the room*, *Damaged Segments*, *Atomic Server Metadata*, *Durable Sequence Floor*, *Room Log Lock*, *Data Directory Lock* nuevo, *Opening a Room*), §7.1 (`DELETE`) y §8 (*Options and Data Directory*). Esto adelanta los puntos de §5.2 del Lote 6.
+  - `INVARIANTES.md`: D1, D2, D3, D5, D6, D7, D8, D9, L3, L4, E1 y W2 en ✅.
 
 ## Lote 3 — Storage: cancelación y absorción
 
@@ -542,7 +600,7 @@ Hallazgos de la auditoría que no rompen ninguna invariante (`INVARIANTES.md` §
 - **(barato)** `create_dir_all_synced` del servidor acepta `AlreadyExists` sin comprobar que sea un directorio (`durable.rs`).
 - `TieredLog::append` acepta cualquier secuencia si `head_seq == 0`, y devuelve `Err` si la HotBuffer falla después de que el registro ya es durable. Las dos cosas son inalcanzables hoy.
 - `rotate_active_segment` indexa un segmento inexistente si `active.wal` desaparece con la sala abierta.
-- Un roster de 0 bytes se carga vacío sin warning.
+- Con muchos segmentos dañados y sin sidecar, la apertura los decodifica todos: solo cuentan para la ventana de dedup los que se leen bien.
 - `ClientLeaseTracker::open_or_create` no acota los cursores del roster a `head_seq`.
 - `SchemaRegistry::persist`: si falla el sync del directorio después del rename, el disco queda adelante de la caché.
 - Un symlink roto en `schemas/` hace fallar el arranque (D67): documentarlo.
@@ -579,8 +637,8 @@ Hallazgos de la auditoría que no rompen ninguna invariante (`INVARIANTES.md` §
 - `run_blocking` convierte un pánico en `StorageError::Other`, que no es un error tipado.
 
 **Storage**
-- Un WAL que falta con el snapshot presente se recrea sin sincronizar el directorio (cubierto en parte por D77).
 - Un batch de más de 16 MiB codificado se rechaza como `WalCorruption`, que es un error engañoso.
+- `open_room` sincroniza siempre el padre de `data_dir`: si ese padre no se puede abrir para leer, o el sistema de archivos rechaza el `fsync` de directorios, toda apertura falla, no solo la que crea el directorio.
 - Un crash entre el rename de `apply_snapshot` y el vaciado del WAL deja registros viejos en el WAL activo hasta la próxima compactación (inocuo; infla `wal_len`).
 
 **Tests**

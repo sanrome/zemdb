@@ -51,13 +51,18 @@ async fn write_until_refused(engine: &DiskStorageEngine, room: &RoomId, count: u
     head
 }
 
+/// The data directory, and its entry in the parent, are synced on every open: an earlier open
+/// may have created them and failed to sync.
 #[tokio::test]
-async fn open_room_syncs_the_data_directory_it_creates() {
+async fn open_room_syncs_the_data_directory_and_its_parent() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = engine_at(&dir.path().join("data"));
-    fail_point::arm("sync_dir", dir.path());
+    let data = dir.path().join("data");
+    let engine = engine_at(&data);
     let room = RoomId::new("new-dir").unwrap();
-    assert!(engine.open_room(&room, schema()).await.is_err());
+    for synced in [dir.path(), data.as_path(), dir.path()] {
+        fail_point::arm("sync_dir", synced);
+        assert!(engine.open_room(&room, schema()).await.is_err());
+    }
 }
 
 #[tokio::test]
@@ -73,7 +78,12 @@ async fn failed_wal_sync_marks_room_failed_until_reopened() {
     // The durability of batch 2 is unknown, so nothing may be written after it.
     assert_room_failed(&engine, &room, 2).await;
 
-    let reopened = reopen(engine, dir.path(), &room).await;
+    // Batch 2 may be only in the page cache: the room opens once this process synced it.
+    engine.close_room(&room).await.unwrap();
+    let reopened = engine_at(dir.path());
+    fail_point::arm("recovery.wal_sync", &reopened.wal_file_path(&room));
+    assert!(reopened.open_room(&room, schema()).await.is_err());
+    reopened.open_room(&room, schema()).await.unwrap();
     let head = reopened.get_head_seq(&room).await.unwrap().get();
     reopened
         .apply_batch(&room, vec![insert(head + 1)])

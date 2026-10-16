@@ -523,7 +523,8 @@ impl RoomManager {
         Ok(meta)
     }
 
-    /// Deletes a room: shuts down its actor and removes the room directory from disk.
+    /// Deletes a room: shuts down its actor and removes the room directory from disk. A room
+    /// whose log is open in another process is `RoomLocked`, and nothing is deleted.
     ///
     /// Not safe to cancel: dropped while the relay purges the room's snapshot, it leaves the
     /// room in place without it. A caller that may be cancelled runs it in a task of its own.
@@ -532,10 +533,19 @@ impl RoomManager {
 
         self.shutdown_room(room_id).await;
         self.room_meta.remove(room_id);
+        let room_dir = room_dir(&self.data_dir, room_id);
+        // A log open elsewhere (another process) keeps the room. The lock is released before
+        // the removal, which on Windows cannot delete a locked file; meanwhile the room lock
+        // keeps this process from reopening the log, and `server.lock` keeps others off.
+        let lock = match blocking_io(|| crate::log::tiered_log::lock_log(&room_dir)) {
+            // No room directory: reported below, once the relay is purged.
+            Err(ServerError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+            lock => Some(lock?),
+        };
         // A room recreated with the same id must not inherit this room's snapshot.
         self.snapshot_relay.purge_room(room_id).await?;
 
-        let room_dir = room_dir(&self.data_dir, room_id);
+        drop(lock);
         match blocking_io(|| fs::remove_dir_all(&room_dir)) {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 Err(ServerError::RoomNotFound(room_id.to_string()))
@@ -663,19 +673,21 @@ fn write_room_metadata(room_dir: &Path, meta: &RoomMetadata) -> Result<(), Serve
     let json = serde_json::to_string_pretty(meta).map_err(|e| {
         ServerError::Serialization(format!("Failed to serialize meta_room.json: {}", e))
     })?;
-    durable::write_atomic(&room_dir.join(META_ROOM_FILE), json.as_bytes())?;
+    durable::write_checked(&room_dir.join(META_ROOM_FILE), json.as_bytes())?;
     Ok(())
 }
 
 /// Reads a room's `meta_room.json`, discarding a temporary file left by an interrupted write.
-/// An unreadable file, or one with invalid lifecycle overrides, is an error: the room cannot
-/// be served without knowing its schema and policy.
+/// An unreadable file, one whose checksum does not match, or one with invalid lifecycle
+/// overrides, is an error: the room cannot be served without knowing its schema and policy.
 fn read_room_metadata(meta_room_path: &Path) -> Result<RoomMetadata, ServerError> {
     durable::remove_file_if_exists(&durable::tmp_path_for(meta_room_path))?;
-    let content = fs::read_to_string(meta_room_path)?;
-    let meta: RoomMetadata = serde_json::from_str(&content).map_err(|e| {
-        ServerError::Serialization(format!("Failed to parse meta_room.json: {}", e))
-    })?;
+    let bytes = fs::read(meta_room_path)?;
+    let unreadable = |e: &dyn std::fmt::Display| {
+        ServerError::Serialization(format!("Failed to parse meta_room.json: {e}"))
+    };
+    let json = durable::verified_json(&bytes).ok_or_else(|| unreadable(&"checksum mismatch"))?;
+    let meta: RoomMetadata = serde_json::from_str(json).map_err(|e| unreadable(&e))?;
     meta.lifecycle
         .check(|setting| format!("lifecycle.{}", setting.field()))
         .map_err(|e| ServerError::Serialization(format!("Invalid meta_room.json: {e}")))?;

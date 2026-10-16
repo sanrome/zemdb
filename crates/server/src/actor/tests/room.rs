@@ -4,6 +4,7 @@ use crate::actor::manager::RoomManager;
 use crate::actor::test_support::{
     seq, test_manager, test_schema, wait_until, wait_until_async, POLL_CEILING, TEST_TIMINGS,
 };
+use crate::durable;
 use crate::fail_point;
 use crate::log::io_probe::{self, IoEvent};
 use crate::log::segment_index::{segment_path, Tier};
@@ -91,7 +92,8 @@ impl Fixture {
     /// The client's cursor in the roster file, if the file holds the client.
     fn persisted_cursor(&self, client_id: &ClientId) -> Option<SequenceNumber> {
         let roster: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(self.roster_path()).ok()?).unwrap();
+            serde_json::from_str(durable::verified_json(&fs::read(self.roster_path()).ok()?)?)
+                .unwrap();
         let entries: Vec<ClientEntry> = serde_json::from_value(roster["clients"].clone()).unwrap();
         entries
             .into_iter()
@@ -370,6 +372,11 @@ async fn failed_commit_sync_stops_room_and_recovers_from_disk() {
     }
     assert!(matches!(failed, Err(ServerError::Unavailable(_))));
 
+    // The record may be only in the page cache: the room reopens once this process synced it.
+    let active = fx.room_dir().join("segments").join("active.wal");
+    fail_point::arm("warm_open_sync", &active);
+    assert!(fx.manager.get_or_spawn(&fx.room_id, None).await.is_err());
+
     // The next request respawns the room from disk.
     let recovered = fx.sender().await;
     assert!(!recovered.same_channel(&sender));
@@ -554,11 +561,8 @@ async fn commit_that_would_take_the_last_sequence_number_is_refused() {
     let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
     fx.manager.shutdown_all().await;
     let last = u64::MAX - 1;
-    fs::write(
-        fx.room_dir().join("log_meta.json"),
-        format!(r#"{{"pruned_through_seq": {last}}}"#),
-    )
-    .unwrap();
+    let meta = format!(r#"{{"pruned_through_seq": {last}, "sealed_through_seq": 0}}"#);
+    durable::write_checked(&fx.room_dir().join("log_meta.json"), meta.as_bytes()).unwrap();
 
     let sender = fx.sender().await;
     let client = ClientId::new("writer").unwrap();
@@ -718,7 +722,7 @@ impl Fixture {
     ) -> mpsc::Sender<RoomCommand> {
         self.manager.shutdown_room(&self.room_id).await;
         let roster = roster_entries(entries);
-        fs::write(self.roster_path(), serde_json::to_string(&roster).unwrap()).unwrap();
+        durable::write_checked(&self.roster_path(), &serde_json::to_vec(&roster).unwrap()).unwrap();
         self.sender().await
     }
 
@@ -738,7 +742,7 @@ impl Fixture {
             "clients": roster_entries(entries),
             "snapshot_demand": { "renewed_at_unix_ms": renewed_at_ms },
         });
-        fs::write(self.roster_path(), serde_json::to_string(&roster).unwrap()).unwrap();
+        durable::write_checked(&self.roster_path(), &serde_json::to_vec(&roster).unwrap()).unwrap();
         self.sender().await
     }
 }
@@ -2027,7 +2031,7 @@ async fn dormant_client_is_forgotten_after_its_ttl_and_registers_again() {
     };
     fx.manager.shutdown_room(&fx.room_id).await;
     let roster = serde_json::json!({ "clients": [dormant("gone", 61), dormant("kept", 30)] });
-    fs::write(fx.roster_path(), roster.to_string()).unwrap();
+    durable::write_checked(&fx.roster_path(), roster.to_string().as_bytes()).unwrap();
     let sender = fx.sender().await;
     // A fast tick forgets the client inactive for longer than its TTL.
     tokio::time::sleep(Duration::from_secs(2)).await;

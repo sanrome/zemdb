@@ -87,15 +87,15 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 
 | ID | Invariante | ★ | Si se rompe | Estado |
 |---|---|---|---|---|
-| **INV-D1** | Un commit confirmado sobrevive a un crash | ★ | Alto | ❌ (Lote 2) |
-| **INV-D2** | Un número de secuencia nunca se reutiliza | ★ | Alto | ❌ (Lote 2) |
-| **INV-D3** | La recuperación nunca descarta datos durables ni acepta basura | ★ | Alto | ❌ (Lote 2) |
+| **INV-D1** | Un commit confirmado sobrevive a un crash | ★ | Alto | ✅ |
+| **INV-D2** | Un número de secuencia nunca se reutiliza | ★ | Alto | ✅ |
+| **INV-D3** | La recuperación nunca descarta datos durables ni acepta basura | ★ | Alto | ✅ |
 | **INV-D4** | Los metadatos se reemplazan atómicamente | | Medio | ✅ |
-| **INV-D5** | Una sala tiene un solo dueño | ★ | Alto | ❌ (Lote 2) |
-| **INV-D6** | Un solo proceso por `data_dir` | ★ | Alto | 🆕 (Lote 2) |
-| **INV-D7** | Nada es visible antes de ser durable en este proceso | ★ | Alto | 🆕 (Lote 2) |
-| **INV-D8** | El piso de secuencia vive fuera del log | ★ | Alto | 🆕 (Lote 2) |
-| **INV-D9** | Los metadatos se verifican antes de usarse | ★ | Alto | 🆕 (Lote 2) |
+| **INV-D5** | Una sala tiene un solo dueño | ★ | Alto | ✅ |
+| **INV-D6** | Un solo proceso por `data_dir` | ★ | Alto | ✅ |
+| **INV-D7** | Nada es visible antes de ser durable en este proceso | ★ | Alto | ✅ |
+| **INV-D8** | El piso de secuencia vive fuera del log | ★ | Alto | ✅ |
+| **INV-D9** | Los metadatos se verifican antes de usarse | ★ | Alto | ✅ |
 | **INV-S1** | `apply_batch`: éxito durable o ningún efecto | ★ | Alto | ✅ |
 | **INV-S2** | Los lectores ven siempre un prefijo del WAL | | Medio | ✅ |
 | **INV-S3** | Un crash en cualquier paso del storage se recupera al mismo estado | ★ | Alto | ✅ |
@@ -129,14 +129,14 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 | **INV-B5** | Ningún cliente acapara un recurso global | | Medio | 🆕 (Lote 4) |
 | **INV-L1** | Toda request recibe una respuesta, en tiempo acotado | | Medio | ✅ |
 | **INV-L2** | Cancelar una request nunca deja estado a medias | | Medio | ❌ (Lote 5) |
-| **INV-L3** | Un I/O incierto nunca se confirma como éxito | ★ | Alto | ❌ (Lote 2) |
-| **INV-L4** | Reabrir una sala no cambia ningún estado confirmado | | Medio | ❌ (Lote 2) |
+| **INV-L3** | Un I/O incierto nunca se confirma como éxito | ★ | Alto | ✅ |
+| **INV-L4** | Reabrir una sala no cambia ningún estado confirmado | | Medio | ✅ |
 | **INV-L5** | El apagado no pierde nada confirmado | | Medio | ✅ |
 | **INV-L6** | Borrar una sala es atómico | | Medio | 🆕 (Lote 5) |
-| **INV-E1** | El esquema solo crece, y toda operación del log sigue siendo válida | ★ | Alto | ❌ (Lote 2) |
+| **INV-E1** | El esquema solo crece, y toda operación del log sigue siendo válida | ★ | Alto | ✅ |
 | **INV-E2** | Un cliente con el esquema viejo siempre puede enterarse | | Bajo | ✅ |
 | **INV-W1** | Ninguna entrada hace entrar en pánico, abortar ni reservar de más | ★ | Alto | ✅ |
-| **INV-W2** | Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum | | Medio | ❌ (Lote 2) |
+| **INV-W2** | Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum | | Medio | ✅ |
 
 ---
 
@@ -172,22 +172,22 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 
 #### INV-D6 ★ · Un solo proceso por `data_dir`
 **Enunciado.** Un segundo proceso servidor sobre un `data_dir` que ya usa otro se niega a arrancar antes de tocar ningún archivo (salas, relay, esquemas). Ningún proceso borra ni recrea los archivos de una sala cuyo log tiene abierto otro.
-**Sostenida por.** *Pendiente (Lote 2, D83):* lock exclusivo de `data_dir` al arrancar; `delete_room` toma el `log.lock` de la sala antes de borrarla.
+**Sostenida por.** D83: lock exclusivo de `data_dir/server.lock` al arrancar, antes de tocar cualquier otro archivo; `delete_room` toma el `log.lock` de la sala antes de purgar el relay o borrar nada (§5.2 *Room Log Lock*, *Data Directory Lock*).
 **Cómo intentar romperla.** Dos servidores sobre el mismo directorio, con arranques solapados; borrado y recreación de una sala desde el segundo proceso.
 
 #### INV-D7 ★ · Nada es visible antes de ser durable en este proceso
 **Enunciado.** Ningún dato leído al abrir (un registro de `active.wal`, una entrada de directorio, el WAL del storage) se sirve, se deduplica ni se confirma antes de que lo cubra un `fsync` exitoso hecho por este proceso, aunque lo haya escrito una encarnación anterior del actor o del proceso.
-**Sostenida por.** *Pendiente (Lote 2, D77):* `sync_all` de `active.wal` y sync de los directorios del camino al abrir el log; lo mismo para el WAL y `data_dir` en `open_room` del storage. Riesgo aceptado: el EIO de Linux (§4).
+**Sostenida por.** D77: `sync_all` de `active.wal` y sync de `segments/`, del directorio de la sala, de `rooms/` y de `data_dir` al abrir el log, y de `data_dir` al arrancar; en `open_room` del storage, sync de `data_dir` y su padre y `sync_all` del WAL activo (lo de `.wal.compacting` se vuelve durable en el snapshot donde se pliega) (§5.2 *Opening a Room*, §8 *Options and Data Directory*). Riesgo aceptado: el EIO de Linux (§4).
 **Cómo intentar romperla.** Un `fsync` que falla, seguido de reapertura y reintento del mismo commit; un sync de directorio que falla y un intento posterior que adopta el archivo; el corte de energía se simula truncando cada archivo a su último largo sincronizado.
 
 #### INV-D8 ★ · El piso de secuencia vive fuera del log
 **Enunciado.** Al abrir, `head_seq` nunca es menor que una secuencia que conste como asignada en cualquier archivo durable del servidor: nombres de segmentos y de sidecars, `active.wal` y `log_meta.json` (que guarda el fin del último segmento sellado y el de la última poda). Perder un segmento deja un hueco, que se reporta como `BehindCompaction` (INV-Y3), nunca secuencias reutilizables.
-**Sostenida por.** *Pendiente (Lote 2, D81).* Hoy: los nombres de segmento, `active.wal` y `pruned_through_seq`.
+**Sostenida por.** D81: `log_meta.json` guarda `pruned_through_seq` (antes de borrar) y `sealed_through_seq` (al sellar, antes del rename de `active.wal`); `head_seq` es el máximo de los dos, los nombres de segmento y `active.wal` (§5.2 *Durable Sequence Floor*). Los nombres de los sidecars no se leen: como `sealed_through_seq` se escribe antes del rename, ningún segmento ni sidecar termina por encima.
 **Cómo intentar romperla.** Perder el segmento sellado más nuevo justo después de una rotación (sin `active.wal`); perder segmentos después de una poda total; una rotación interrumpida entre el sellado y la escritura de `log_meta.json`.
 
 #### INV-D9 ★ · Los metadatos se verifican antes de usarse
 **Enunciado.** Todo JSON persistido que decide algo (`log_meta.json`, `meta_room.json`, `schemas/{id}.json`, el roster) se verifica con un checksum antes de usarse. Si no verifica, cuenta como ilegible: falla la apertura, o el roster se descarta con un warning. Abrir un log nunca borra un archivo a partir de un valor que no verificó.
-**Sostenida por.** *Pendiente (Lote 2, D82).* Los sidecars, los frames del WAL, el `.snap` y el envelope `ZMSN` ya tienen CRC.
+**Sostenida por.** D82: los cuatro JSON llevan una última línea `crc32:<hex>` con el CRC32 del JSON, que se verifica antes de parsear (§5.2 *Atomic Server Metadata*). Los sidecars, los frames del WAL, el `.snap` y el envelope `ZMSN` tienen su propio CRC.
 **Cómo intentar romperla.** Un bit invertido en cada campo de cada JSON que lo deje válido; un archivo truncado; la línea del checksum faltante o con otro valor.
 
 ### 3.2. Durabilidad del storage (cliente)
@@ -417,7 +417,7 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 
 #### INV-W2 · Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum
 **Enunciado.** Para todo mensaje, frame WAL, sidecar, snapshot y esquema válidos, decodificar lo codificado devuelve el mismo valor (con -0.0 canonicalizado). Todo byte persistido que se usa para decidir algo (operaciones, ids de dedup, longitudes, headers) está cubierto por un CRC o un hash antes de usarse.
-**Sostenida por.** Opciones de bincode únicas, CRC de header y payload, CRC de sidecars, envelope `ZMSN`, BLAKE3 del relay. *Pendiente (Lote 2):* los JSON persistidos (INV-D9).
+**Sostenida por.** Opciones de bincode únicas, CRC de header y payload, CRC de sidecars, envelope `ZMSN`, BLAKE3 del relay, CRC32 de los JSON persistidos (INV-D9).
 **Automatizable.** Roundtrip con generadores aleatorios para cada formato. En el repo desde el Lote 0.
 
 ---
