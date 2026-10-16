@@ -635,6 +635,10 @@ impl StorageEngine for DiskStorageEngine {
     /// before the file is installed. The snapshot is made durable before memory changes, so
     /// readers keep seeing the previous state until the new one is on disk. See
     /// `install_applied_snapshot` for the crash windows of replacing the files.
+    ///
+    /// Once it has the compaction lock, it runs in its own task, like `compact_room`: if the
+    /// caller stops waiting, it still completes, so no file operation is left in flight when the
+    /// room is closed (closing waits for the lock).
     #[tracing::instrument(skip(self, schema, snapshot), fields(room_id = %room_id, snapshot_size = snapshot.len()))]
     async fn apply_snapshot(
         &self,
@@ -658,63 +662,68 @@ impl StorageEngine for DiskStorageEngine {
 
         let lock = self.compaction_lock(room_id).await?;
         crate::fail_point::pause("apply_snapshot.lock", &self.wal_file_path(room_id)).await;
-        let (room, _compaction_guard) = self.lock_compaction(room_id, lock).await?;
+        let (room, compaction_guard) = self.lock_compaction(room_id, lock).await?;
+        let zstd_level = self.options.zstd_level;
+        tokio::spawn(async move {
+            let _compaction_guard = compaction_guard;
+            // A first check spares staging a snapshot that cannot be applied. Writers may still
+            // advance the head until the WAL mutex is taken.
+            let current = room.state.read().await.head_seq;
+            if let Some(outcome) = snapshot_head_outcome(current, payload.head_seq) {
+                return outcome;
+            }
 
-        // A first check spares staging a snapshot that cannot be applied. Writers may still
-        // advance the head until the WAL mutex is taken.
-        let current = room.state.read().await.head_seq;
-        if let Some(outcome) = snapshot_head_outcome(current, payload.head_seq) {
-            return outcome;
-        }
+            // Nothing visible changes until the staged snapshot is renamed into place.
+            let staged = stage_snapshot(
+                &room.snap_path,
+                payload.head_seq,
+                &payload.tables,
+                zstd_level,
+                &room.room_id,
+            )
+            .await?;
+            crate::fail_point::pause("apply_snapshot.staged", &room.wal_path).await;
 
-        // Nothing visible changes until the staged snapshot is renamed into place.
-        let staged = stage_snapshot(
-            &room.snap_path,
-            payload.head_seq,
-            &payload.tables,
-            self.options.zstd_level,
-            room_id,
-        )
-        .await?;
-        crate::fail_point::pause("apply_snapshot.staged", &room.wal_path).await;
+            let mut wal = room.wal.lock().await;
+            let current = room.state.read().await.head_seq;
+            let refusal = match wal.ensure_usable() {
+                Err(err) => Some(Err(err)),
+                Ok(()) => snapshot_head_outcome(current, payload.head_seq),
+            };
+            if let Some(outcome) = refusal {
+                staged.discard().await;
+                return outcome;
+            }
 
-        let mut wal = room.wal.lock().await;
-        let current = room.state.read().await.head_seq;
-        let refusal = match wal.ensure_usable() {
-            Err(err) => Some(Err(err)),
-            Ok(()) => snapshot_head_outcome(current, payload.head_seq),
-        };
-        if let Some(outcome) = refusal {
-            staged.discard().await;
-            return outcome;
-        }
+            // Armed before the rename: an installed snapshot whose WAL was not emptied would have
+            // later batches replayed on top of it, so an error or a panic from here on marks the
+            // room as failed. A failed rename changes nothing, so it leaves the room usable.
+            let mut pending = PendingWrite::begin(&mut wal);
+            if let Err(err) = rename_staged_snapshot(&room, &staged).await {
+                pending.complete();
+                staged.discard().await;
+                return Err(err);
+            }
+            let installed = install_applied_snapshot(&room, pending.wal()).await;
+            pending
+                .wal()
+                .fail_on_err("Persisting an applied snapshot failed", installed)?;
 
-        // Armed before the rename, which completes on the blocking pool even if this future is
-        // dropped: an installed snapshot whose WAL was not emptied would have later batches
-        // replayed on top of it. A failed rename changes nothing, so it leaves the room usable.
-        let mut pending = PendingWrite::begin(&mut wal);
-        if let Err(err) = rename_staged_snapshot(&room, &staged).await {
+            {
+                let mut state = room.state.write().await;
+                state.schema = schema;
+                state.head_seq = payload.head_seq;
+                state.tables = payload.tables;
+                state.snapshot_seq = payload.head_seq;
+                state.snapshot_len = staged.compressed_len;
+            }
             pending.complete();
-            staged.discard().await;
-            return Err(err);
-        }
-        let installed = install_applied_snapshot(&room, pending.wal()).await;
-        pending
-            .wal()
-            .fail_on_err("Persisting an applied snapshot failed", installed)?;
 
-        {
-            let mut state = room.state.write().await;
-            state.schema = schema;
-            state.head_seq = payload.head_seq;
-            state.tables = payload.tables;
-            state.snapshot_seq = payload.head_seq;
-            state.snapshot_len = staged.compressed_len;
-        }
-        pending.complete();
-
-        tracing::info!(room_id = %room_id, head_seq = %payload.head_seq, "Applied snapshot to disk room");
-        Ok(payload.head_seq)
+            tracing::info!(room_id = %room.room_id, head_seq = %payload.head_seq, "Applied snapshot to disk room");
+            Ok(payload.head_seq)
+        })
+        .await
+        .map_err(|e| StorageError::Other(format!("Snapshot task failed: {e}")))?
     }
 }
 

@@ -1,4 +1,4 @@
-use super::{compacting_wal_path, sync_file, SyncKind};
+use super::{absorbing_wal_path, compacting_wal_path, sync_file, SyncKind};
 use crate::disk::tests::support::*;
 use crate::fail_point;
 use crate::{DiskStorageEngine, StorageEngine, StorageError};
@@ -83,6 +83,48 @@ async fn compaction_absorbs_orphan_from_failed_attempt() {
     assert_rows(&reopened, &room, 10).await;
 }
 
+/// A crash at any point of a compaction that absorbs the active WAL leaves `.wal.compacting`
+/// whole, as it was or with the active WAL appended, and the room reopens with every row.
+#[cfg(unix)]
+#[tokio::test]
+async fn crash_at_any_point_of_an_absorption_leaves_the_rotated_wal_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, images) = (dir.path().join("data"), dir.path().join("images"));
+    let room = RoomId::new("absorb-images").unwrap();
+    let engine = open_engine(&data, &room).await;
+    let wal_path = engine.wal_file_path(&room);
+    let compacting_path = compacting_wal_path(&wal_path);
+    apply_range(&engine, &room, 1..=5).await;
+    fail_compaction_leaving_compacting_wal(&engine, &room).await;
+    apply_range(&engine, &room, 6..=10).await;
+    let before = std::fs::read(&compacting_path).unwrap();
+    let absorbed = [before.clone(), std::fs::read(&wal_path).unwrap()].concat();
+    // Opened before the compaction: it keeps reading the same file, which is never written in
+    // place, however few fail points the writes cross.
+    let mut held = std::fs::File::open(&compacting_path).unwrap();
+
+    fail_point::arm_crash_plan(
+        &data,
+        fail_point::CrashAction::CopyAtEveryPoint(images.clone()),
+    );
+    engine.compact_room(&room).await.unwrap();
+    let mut read = Vec::new();
+    std::io::Read::read_to_end(&mut held, &mut read).unwrap();
+    assert!(read == before, "`.wal.compacting` was written in place");
+    for (n, point) in fail_point::disarm_crash_plan(&data).iter().enumerate() {
+        let image = images.join((n + 1).to_string());
+        let compacting = std::fs::read(image.join(compacting_path.file_name().unwrap()));
+        if let Ok(compacting) = compacting {
+            assert!(
+                compacting == before || compacting == absorbed,
+                "{point}: partly written"
+            );
+        }
+        let engine = open_engine(&image, &room).await;
+        assert_rows(&engine, &room, 10).await;
+    }
+}
+
 #[tokio::test]
 async fn crash_between_absorbing_and_truncating_wal_recovers_without_duplicates() {
     let dir = tempfile::tempdir().unwrap();
@@ -104,33 +146,40 @@ async fn crash_between_absorbing_and_truncating_wal_recovers_without_duplicates(
     apply_range(&reopened, &room, 11..=11).await;
 }
 
-#[tokio::test]
-async fn failed_absorb_leaves_no_partial_batch_in_compacting_wal() {
+/// Fails the absorption of the active WAL into an orphan `.wal.compacting` at `fail_point_name`,
+/// before the copy is in place, and checks that the active WAL is kept, no copy is left behind
+/// and the room stays usable.
+async fn failed_absorb_keeps_the_active_wal(room_name: &str, fail_point_name: &'static str) {
     let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("partial-absorb").unwrap();
+    let room = RoomId::new(room_name).unwrap();
     let engine = open_engine(dir.path(), &room).await;
     let wal_path = engine.wal_file_path(&room);
-    let compacting_path = compacting_wal_path(&wal_path);
-
     apply_range(&engine, &room, 1..=5).await;
     fail_compaction_leaving_compacting_wal(&engine, &room).await;
-    let compacting_len = std::fs::metadata(&compacting_path).unwrap().len();
     apply_range(&engine, &room, 6..=10).await;
+    let wal_len = std::fs::metadata(&wal_path).unwrap().len();
 
-    // The append to `.wal.compacting` stops halfway through, as with a full disk.
-    fail_point::arm("compaction.absorb_write", &wal_path);
+    fail_point::arm(fail_point_name, &wal_path);
     assert!(engine.compact_room(&room).await.is_err());
-    assert_eq!(
-        std::fs::metadata(&compacting_path).unwrap().len(),
-        compacting_len
-    );
+    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_len);
+    assert!(!absorbing_wal_path(&wal_path).exists());
 
-    // A later compaction appends after it and also fails; recovery must still read everything.
+    // A later compaction that also fails absorbs everything.
     apply_range(&engine, &room, 11..=12).await;
     fail_compaction_leaving_compacting_wal(&engine, &room).await;
-
     let reopened = reopen(engine, dir.path(), &room).await;
     assert_rows(&reopened, &room, 12).await;
+}
+
+/// Writing the copy stops halfway through, as with a full disk.
+#[tokio::test]
+async fn failed_write_of_the_absorbed_copy_keeps_the_active_wal() {
+    failed_absorb_keeps_the_active_wal("absorb-write", "compaction.absorb_write").await;
+}
+
+#[tokio::test]
+async fn failed_rename_of_the_absorbed_copy_keeps_the_active_wal() {
+    failed_absorb_keeps_the_active_wal("absorb-rename", "compaction.absorb_rename").await;
 }
 
 /// Fails a compaction of rows 1..=5 at every fail point in `fail_points`, and checks that the
@@ -179,6 +228,27 @@ async fn failed_directory_sync_after_wal_rotation_marks_room_failed_until_reopen
     failed_step_marks_room_failed("rotation-dir-sync", &["compaction.rotate_sync_dir"]).await;
 }
 
+/// The rename over `.wal.compacting` may not be durable: the active WAL must not be emptied.
+#[tokio::test]
+async fn failed_directory_sync_after_absorbing_marks_room_failed_until_reopened() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("absorb-dir-sync").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    let wal_path = engine.wal_file_path(&room);
+    apply_range(&engine, &room, 1..=5).await;
+    fail_compaction_leaving_compacting_wal(&engine, &room).await;
+    apply_range(&engine, &room, 6..=10).await;
+    let wal_len = std::fs::metadata(&wal_path).unwrap().len();
+
+    fail_point::arm("compaction.absorb_sync_dir", &wal_path);
+    assert!(engine.compact_room(&room).await.is_err());
+
+    assert_room_failed(&engine, &room, 11).await;
+    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_len);
+    let reopened = reopen(engine, dir.path(), &room).await;
+    assert_rows(&reopened, &room, 10).await;
+}
+
 #[tokio::test]
 async fn sync_file_reports_a_write_that_failed_in_the_background() {
     for kind in [SyncKind::Data, SyncKind::All] {
@@ -202,30 +272,6 @@ async fn sync_file_reports_a_write_that_failed_in_the_background() {
         );
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
     }
-}
-
-#[tokio::test]
-async fn failed_background_append_to_compacting_wal_keeps_the_active_wal() {
-    let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("absorb-background-failure").unwrap();
-    let engine = open_engine(dir.path(), &room).await;
-    let wal_path = engine.wal_file_path(&room);
-
-    apply_range(&engine, &room, 1..=5).await;
-    fail_compaction_leaving_compacting_wal(&engine, &room).await;
-    apply_range(&engine, &room, 6..=10).await;
-    let wal_len = std::fs::metadata(&wal_path).unwrap().len();
-
-    // The last write of the append to `.wal.compacting` fails after `write_all` returned.
-    fail_point::arm("compaction.absorb_append", &wal_path);
-    assert!(engine.compact_room(&room).await.is_err());
-
-    // Records 6..=10 never reached `.wal.compacting`: emptying the active WAL would lose them.
-    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_len);
-    drop(engine);
-    let reopened = open_engine(dir.path(), &room).await;
-    assert_rows(&reopened, &room, 10).await;
-    apply_range(&reopened, &room, 11..=11).await;
 }
 
 /// Name of every row a room holds after `failed_phase3_step_loses_no_batch`, by key: batches

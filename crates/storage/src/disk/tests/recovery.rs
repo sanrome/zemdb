@@ -1,4 +1,4 @@
-use crate::disk::compactor::compacting_wal_path;
+use crate::disk::compactor::{absorbing_wal_path, compacting_wal_path};
 use crate::disk::format::encode_wal_batch;
 use crate::disk::tests::support::*;
 use crate::fail_point;
@@ -347,13 +347,19 @@ async fn compacting_wal_with_a_torn_tail_is_folded() {
     assert!(!compacting.exists());
 }
 
-/// Leaves the room as a crash while a retried compaction absorbs the active WAL would: the
-/// orphan `.wal.compacting` (1..=5) followed by an unsynced copy of the active WAL (6..=8)
-/// whose first frame did not reach the disk intact. The active WAL still holds 6..=8.
-fn leave_damaged_absorb(engine: &DiskStorageEngine, room: &RoomId, damage: HeaderDamage) {
-    let mut copy = std::fs::read(engine.wal_file_path(room)).unwrap();
+/// Writes to `path` the orphan `.wal.compacting` (1..=5) followed by a copy of the active WAL
+/// (6..=8) whose first frame `damage` breaks, as an absorption cut short by a crash would.
+fn write_damaged_absorb(
+    engine: &DiskStorageEngine,
+    room: &RoomId,
+    damage: HeaderDamage,
+    path: &Path,
+) {
+    let wal_path = engine.wal_file_path(room);
+    let mut copy = std::fs::read(&wal_path).unwrap();
     damage(&mut copy);
-    append_raw(&compacting_wal_path(&engine.wal_file_path(room)), &copy);
+    let compacting = std::fs::read(compacting_wal_path(&wal_path)).unwrap();
+    std::fs::write(path, [compacting, copy].concat()).unwrap();
 }
 
 const ABSORB_DAMAGE: [(&str, HeaderDamage); 2] = [
@@ -365,65 +371,42 @@ const ABSORB_DAMAGE: [(&str, HeaderDamage); 2] = [
     }),
 ];
 
+/// A crash while absorbing leaves the copy in a temporary file, whatever it holds: recovery
+/// removes it, and `.wal.compacting` and the active WAL still hold every record.
 #[tokio::test]
-async fn crash_while_absorbing_recovers_the_damaged_copy_from_the_active_wal() {
+async fn crash_while_absorbing_leaves_a_copy_that_recovery_discards() {
     for (name, damage) in ABSORB_DAMAGE {
         let dir = tempfile::tempdir().unwrap();
         let room = RoomId::new(name).unwrap();
         leave_orphan_compacting(dir.path(), &room).await;
         let engine = engine_at(dir.path());
-        leave_damaged_absorb(&engine, &room, damage);
+        let absorbing = absorbing_wal_path(&engine.wal_file_path(&room));
+        write_damaged_absorb(&engine, &room, damage, &absorbing);
 
         engine.open_room(&room, schema()).await.unwrap();
 
         assert_rows(&engine, &room, 8).await;
-        let compacting = compacting_wal_path(&engine.wal_file_path(&room));
-        assert!(!compacting.exists(), "{name}");
+        assert!(!absorbing.exists(), "{name}");
     }
 }
 
+/// `.wal.compacting` is only ever replaced whole, so a damaged frame followed by valid ones is
+/// corruption there as well, even if the active WAL holds the same records.
 #[tokio::test]
-async fn damaged_rotated_wal_is_corruption_when_the_active_wal_does_not_cover_it() {
+async fn damaged_rotated_wal_followed_by_valid_frames_is_corruption() {
     for (name, damage) in ABSORB_DAMAGE {
         let dir = tempfile::tempdir().unwrap();
         let room = RoomId::new(name).unwrap();
         leave_orphan_compacting(dir.path(), &room).await;
         let engine = engine_at(dir.path());
-        leave_damaged_absorb(&engine, &room, damage);
-        // As after an absorb that completed: the active WAL was emptied.
-        std::fs::write(engine.wal_file_path(&room), b"").unwrap();
         let compacting = compacting_wal_path(&engine.wal_file_path(&room));
-        let before = std::fs::read(&compacting).unwrap();
+        write_damaged_absorb(&engine, &room, damage, &compacting);
+        let before = file_contents(dir.path());
 
         let result = engine.open_room(&room, schema()).await;
 
         assert_wal_corruption(&result, name);
-        assert_eq!(std::fs::read(&compacting).unwrap(), before, "{name}");
-    }
-}
-
-#[tokio::test]
-async fn crash_while_folding_a_damaged_absorb_recovers_on_the_next_open() {
-    for fail_point_name in ["recovery.fold", "recovery.fold_cleanup"] {
-        for (name, damage) in ABSORB_DAMAGE {
-            let dir = tempfile::tempdir().unwrap();
-            let room = RoomId::new(name).unwrap();
-            leave_orphan_compacting(dir.path(), &room).await;
-            let engine = engine_at(dir.path());
-            leave_damaged_absorb(&engine, &room, damage);
-
-            // The snapshot already holds 1..=8 when the fold fails, and the damaged
-            // `.wal.compacting` is still there.
-            fail_point::arm(fail_point_name, &engine.wal_file_path(&room));
-            assert!(engine.open_room(&room, schema()).await.is_err());
-
-            let reopened = engine_at(dir.path());
-            reopened
-                .open_room(&room, schema())
-                .await
-                .unwrap_or_else(|e| panic!("{fail_point_name}, {name}: {e:?}"));
-            assert_rows(&reopened, &room, 8).await;
-        }
+        assert!(file_contents(dir.path()) == before, "{name}: files changed");
     }
 }
 

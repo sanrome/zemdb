@@ -56,7 +56,7 @@ Cada lote que cierra una ruptura actualiza esta columna en el mismo commit (§5)
 
 ### 1.6. Reparto sugerido
 
-Un auditor por grupo (§3.1 a §3.9). Cada uno recibe este documento, `ARCHITECTURE.md`, la lista de riesgos aceptados (§4) y las decisiones de los planes de remediación (D1 a D88), y responde solo con veredictos.
+Un auditor por grupo (§3.1 a §3.9). Cada uno recibe este documento, `ARCHITECTURE.md`, la lista de riesgos aceptados (§4) y las decisiones de los planes de remediación (D1 a D89), y responde solo con veredictos.
 
 ---
 
@@ -96,12 +96,12 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 | **INV-D7** | Nada es visible antes de ser durable en este proceso | ★ | Alto | 🆕 (Lote 2) |
 | **INV-D8** | El piso de secuencia vive fuera del log | ★ | Alto | 🆕 (Lote 2) |
 | **INV-D9** | Los metadatos se verifican antes de usarse | ★ | Alto | 🆕 (Lote 2) |
-| **INV-S1** | `apply_batch`: éxito durable o ningún efecto | ★ | Alto | ❌ (Lote 3) |
+| **INV-S1** | `apply_batch`: éxito durable o ningún efecto | ★ | Alto | ❌ (Lote 3, DEF-165) |
 | **INV-S2** | Los lectores ven siempre un prefijo del WAL | | Medio | ✅ |
-| **INV-S3** | Un crash en cualquier paso del storage se recupera al mismo estado | ★ | Alto | ❌ (Lote 3) |
+| **INV-S3** | Un crash en cualquier paso del storage se recupera al mismo estado | ★ | Alto | ✅ |
 | **INV-S4** | Abrir una sala nunca descarta datos | ★ | Alto | ✅ |
 | **INV-S5** | `apply_snapshot`: valida todo y reemplaza atómicamente, o no cambia nada | | Medio | ✅ |
-| **INV-S6** | Memoria igual a disco | | Medio | 🆕 (Lote 3) |
+| **INV-S6** | Memoria igual a disco | | Medio | ❌ (Lote 3, DEF-165) |
 | **INV-Y1** | Orden total contiguo por sala | ★ | Alto | ✅ |
 | **INV-Y2** | Entrega exacta: ni huecos, ni duplicados, ni cambios | ★ | Alto | ✅ |
 | **INV-Y3** | Quedarse atrás siempre se señala | ★ | Alto | ✅ |
@@ -157,7 +157,7 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 #### INV-D3 ★ · La recuperación nunca descarta datos durables ni acepta basura
 **Enunciado.** Al abrir un log (servidor o storage), un daño seguido de un frame válido es corrupción y no se trunca nada; un daño sin frames válidos después es *torn write* y se trunca solo desde el daño. Ningún frame cuyo header o payload no pase su CRC se interpreta como operación.
 **Sostenida por.** Header con CRC propio (D46), `find_valid_frame`, clasificación compartida en `zemdb-core` (§8 *Physical WAL Framing*).
-**Cómo intentar romperla.** Daño en cada byte del header y del payload, cola de ceros, frame válido embebido como valor dentro de un payload (un frame embebido puede convertir una escritura rota en corrupción: es un riesgo aceptado, §4), más de 16 payloads dañados seguidos, lectores con buffers que cortan en cualquier punto, la excepción de `.wal.compacting`. Un `log_meta.json` dañado que haga borrar segmentos al abrir (ver INV-D9).
+**Cómo intentar romperla.** Daño en cada byte del header y del payload, cola de ceros, frame válido embebido como valor dentro de un payload (un frame embebido puede convertir una escritura rota en corrupción: es un riesgo aceptado, §4), más de 16 payloads dañados seguidos, lectores con buffers que cortan en cualquier punto, daño en `.wal.compacting`. Un `log_meta.json` dañado que haga borrar segmentos al abrir (ver INV-D9).
 **Automatizable.** Logs aleatorios con un corte o un daño en una posición aleatoria; oráculo = el prefijo de frames anteriores al daño.
 
 #### INV-D4 · Los metadatos se reemplazan atómicamente
@@ -194,7 +194,7 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 
 #### INV-S1 ★ · `apply_batch`: éxito durable o ningún efecto
 **Enunciado.** Si `apply_batch` devuelve `Ok`, el batch está sincronizado en el WAL y visible en memoria. Si devuelve `Err`, no cambió nada ni en memoria ni en disco, o la sala quedó marcada como fallida (`RoomFailed`) y reabrirla reconstruye el estado desde el disco. Un hueco de secuencia se reporta como `SequenceMismatch` antes que cualquier error de contenido (D63).
-**Sostenida por.** `sync_file` con flush previo (D43); `PendingWrite`; validación del batch entero antes de escribir (§8 *Active Storage Schema Validation*, *WAL Mutex*, *Failed Room State*).
+**Sostenida por.** `sync_file` con flush previo (D43); `PendingWrite`; validación del batch entero antes de escribir; `apply_snapshot` y la compactación corren en su propia tarea, así que ninguna de sus operaciones de archivo aterriza después de reabrir la sala (D86) (§8 *Active Storage Schema Validation*, *WAL Mutex*, *Failed Room State*). *Pendiente (Lote 3, D89):* la recuperación de un `open_room` soltado.
 **Cómo intentar romperla.** Falla de escritura de fondo, cancelación del future en cada `.await`, pánico al aplicar, batch con hueco interno, batch al borde de `u64::MAX`.
 
 #### INV-S2 · Los lectores ven siempre un prefijo del WAL
@@ -204,12 +204,12 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 
 #### INV-S3 ★ · Un crash en cualquier paso del storage se recupera al mismo estado
 **Enunciado.** Un crash en cualquier punto de la compactación (fases 1 a 3), de la absorción de `.wal.compacting`, de `apply_snapshot` o de la propia recuperación deja archivos que, al reabrir, dan el estado del último batch confirmado (o del snapshot aplicado, si `apply_snapshot` devolvió `Ok`).
-**Sostenida por.** §8 *CoW Compaction*, *Crash-Safe apply_snapshot*, *Crash-Safe Recovery of an Interrupted Compaction*.
+**Sostenida por.** §8 *CoW Compaction*, *Crash-Safe apply_snapshot*, *Crash-Safe Recovery of an Interrupted Compaction*; la absorción reemplaza `.wal.compacting` entero y nunca lo escribe en el lugar (D85).
 **Cómo intentar romperla.** Fail points en cada paso; crash durante la recuperación de un crash anterior; `.wal.compacting` dañado.
 **Automatizable.** Simulación: secuencia aleatoria de batches, compactaciones y snapshots con un crash aleatorio; oráculo = un `MemoryStorageEngine` con las mismas operaciones confirmadas.
 
 #### INV-S4 ★ · Abrir una sala nunca descarta datos
-**Enunciado.** `open_room` con un esquema que no cubre los datos de la sala falla con `SchemaMismatch` antes de modificar cualquier archivo que tenga datos de la sala (antes del chequeo puede crear el lock y un WAL o `.snap` vacíos, y borrar temporales `.snap.tmp.*`). Ninguna operación del WAL ni fila del snapshot se descarta en silencio.
+**Enunciado.** `open_room` con un esquema que no cubre los datos de la sala falla con `SchemaMismatch` antes de modificar cualquier archivo que tenga datos de la sala (antes del chequeo puede crear el lock y un WAL o `.snap` vacíos, y borrar temporales `.snap.tmp.*` y `.wal.compacting.tmp`). Ninguna operación del WAL ni fila del snapshot se descarta en silencio.
 **Sostenida por.** D55 (§8 *Opening Requires a Schema That Covers the Room's Data*).
 **Cómo intentar romperla.** Tabla presente solo en `.wal.compacting`; tabla vacía en el snapshot; esquema con la tabla pero con otro id; torn write en el mismo WAL que trae la tabla desconocida.
 
@@ -220,7 +220,7 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 
 #### INV-S6 · Memoria igual a disco
 **Enunciado.** Mientras una sala del storage no esté `RoomFailed`, lo que devuelven `get`, `scan` y `get_head_seq` es exactamente lo que daría cerrarla y reabrirla con el mismo esquema (módulo los `Null` al final de las filas, INV-Y8).
-**Sostenida por.** Solo se aplican batches sincronizados; el camino vivo y el replay usan el mismo `apply_operation` (§8). *Pendiente (Lote 3, D86):* una operación de archivo que aterriza después de reabrir.
+**Sostenida por.** Solo se aplican batches sincronizados; el camino vivo y el replay usan el mismo `apply_operation`; ninguna operación de archivo de `apply_snapshot` ni de la compactación aterriza después de reabrir (D86) (§8). *Pendiente (Lote 3, D89):* la recuperación de un `open_room` soltado.
 **Cómo intentar romperla.** Comparar después de cada paso de una secuencia aleatoria de batches, compactaciones, snapshots, cancelaciones y reaperturas.
 **Automatizable.** Las simulaciones de storage del Lote 0 ya lo comprueban en cada paso.
 
@@ -373,8 +373,8 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 
 #### INV-L2 · Cancelar una request nunca deja estado a medias
 **Enunciado.** Si el cliente corta una request en cualquier `.await`, el efecto es "no ocurrió" o "ocurrió entero". Las operaciones de varios pasos (delete de sala, escrituras del relay, `add_column`, compactación y escrituras del storage) corren en su propia tarea, o marcan la sala como fallida.
-**Sostenida por.** `run_to_completion`, `tokio::spawn` en `delete_room` y `add_column`, `PendingWrite` (§7.1, §8).
-**Cómo intentar romperla.** Descartar el future del handler en cada punto de suspensión (el patrón del test de DEF-125); cancelar `compact_room` y `apply_snapshot` del storage y reabrir la sala mientras una operación de archivo sigue en vuelo; apagar el servidor con una tarea de varios pasos en curso. *Pendiente:* `apply_snapshot` en su propia tarea (Lote 3, D86) y el apagado que espera esas tareas (Lote 5, D87).
+**Sostenida por.** `run_to_completion`, `tokio::spawn` en `delete_room` y `add_column`, `compact_room` y `apply_snapshot` del storage en su propia tarea (D86), `PendingWrite` (§7.1, §8).
+**Cómo intentar romperla.** Descartar el future del handler en cada punto de suspensión (el patrón del test de DEF-125); cancelar `compact_room` y `apply_snapshot` del storage y reabrir la sala mientras una operación de archivo sigue en vuelo; apagar el servidor con una tarea de varios pasos en curso. *Pendiente:* la recuperación de `open_room` del storage en su propia tarea (Lote 3, D89) y el apagado que espera esas tareas (Lote 5, D87).
 
 #### INV-L3 ★ · Un I/O incierto nunca se confirma como éxito
 **Enunciado.** Si un write, un fsync o un rename de un archivo durable falla, nunca se responde éxito por una operación que dependía de él. En el servidor, la sala se detiene y se reabre desde disco; en storage, la sala queda `RoomFailed` hasta reabrirse. Un error de I/O nunca se toma por "el archivo no existe".

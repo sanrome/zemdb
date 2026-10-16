@@ -20,6 +20,12 @@ pub(crate) fn compacting_wal_path(wal_path: &Path) -> PathBuf {
     wal_path.with_extension("wal.compacting")
 }
 
+/// Path of the copy of `.wal.compacting` and the active WAL that an absorption renames over
+/// `.wal.compacting`.
+pub(crate) fn absorbing_wal_path(wal_path: &Path) -> PathBuf {
+    wal_path.with_extension("wal.compacting.tmp")
+}
+
 /// Holds a room's compaction flag and releases it when dropped, including on early returns
 /// through `?` and on panics.
 struct CompactionFlag(Arc<AtomicBool>);
@@ -47,7 +53,7 @@ pub(crate) struct StagedSnapshot {
 
 impl StagedSnapshot {
     /// Removes the temporary file of a snapshot that will not be installed. A file left
-    /// behind (because this fails, or because the caller was dropped before) is removed when
+    /// behind (because this fails, or because of a crash) is removed when
     /// the room is next opened.
     pub(crate) async fn discard(self) {
         if let Err(err) = remove_if_exists(&self.tmp_path).await {
@@ -61,10 +67,11 @@ impl StagedSnapshot {
 /// 1. Phase 1 (WAL mutex):
 ///    Moves the current WAL contents into `room_{id}.wal.compacting` and leaves an empty
 ///    `room_{id}.wal` for incoming concurrent writes. Normally this is a rename plus a fresh
-///    WAL file. If a previous compaction failed and left `.wal.compacting` behind, the current
-///    WAL is appended to it instead, so its records are never overwritten. Holding the WAL
-///    mutex keeps writers out while the WAL moves, and guarantees that every batch in the
-///    rotated segment is already applied in memory. Captures the cut sequence and O(1) clones
+///    WAL file. If a previous compaction failed and left `.wal.compacting` behind, a copy of it
+///    with the current WAL appended replaces it instead, so its records are never overwritten
+///    (see `absorb_wal_into_compacting`). Holding the WAL mutex keeps writers out while the WAL
+///    moves, and guarantees that every batch in the rotated segment is already applied in
+///    memory. Captures the cut sequence and O(1) clones
 ///    of the tables under a brief shared lock of the state; readers are never blocked.
 ///
 /// 2. Phase 2 (background blocking worker):
@@ -238,14 +245,16 @@ fn open_fresh_wal(wal_path: &Path, room_id: &RoomId) -> Result<std::fs::File, St
     Ok(file)
 }
 
-/// Appends the active WAL to a `.wal.compacting` left by a failed compaction, then empties
+/// Absorbs the active WAL into a `.wal.compacting` left by a failed compaction, then empties
 /// the active WAL.
 ///
-/// The append is synced before the active WAL is truncated, so a crash in between only
-/// duplicates records, which recovery skips. The active WAL is read through its own locked
+/// `.wal.compacting` is never written in place: a copy of it followed by the active WAL is
+/// written to a temporary file, synced and renamed over it, and the directory is synced. Only then
+/// is the active WAL emptied, so a crash at any step leaves `.wal.compacting` whole, as it was or
+/// with the active WAL appended, and every record in it or in the active WAL (recovery skips the
+/// duplicates and removes the temporary file). The active WAL is read through its own locked
 /// handle (a second handle cannot read a file locked on Windows), and that handle and its lock
-/// are kept. If the append fails, `.wal.compacting` is truncated back to its previous length so
-/// that a partially written batch never sits in front of records appended later.
+/// are kept.
 async fn absorb_wal_into_compacting(
     room: &DiskRoom,
     wal: &mut DiskWal,
@@ -262,7 +271,19 @@ async fn absorb_wal_into_compacting(
     wal.fail_on_err("Reading the active WAL failed", read_result)?;
 
     if !wal_bytes.is_empty() {
-        append_synced(wal_compacting_path, &wal_bytes, &room.wal_path, wal).await?;
+        let (compacting, key) = (wal_compacting_path.to_path_buf(), room.wal_path.clone());
+        run_blocking(move || replace_with_absorbed_copy(&compacting, &wal_bytes, &key)).await?;
+        // The rename may not be durable, and a failed directory sync cannot be retried: emptying
+        // the active WAL could lose its records.
+        let synced = async {
+            fail_point::check("compaction.absorb_sync_dir", &room.wal_path)?;
+            sync_parent(wal_compacting_path).await
+        }
+        .await;
+        wal.fail_on_err(
+            "Syncing the directory after absorbing the WAL failed",
+            synced,
+        )?;
     }
 
     fail_point::check("compaction.absorb", &room.wal_path)?;
@@ -283,46 +304,37 @@ async fn truncate_wal(wal: &mut DiskWal, wal_path: &Path) -> Result<(), StorageE
     Ok(())
 }
 
-/// Appends `bytes` to `path` and syncs it, restoring the previous length if anything fails.
-///
-/// The file is opened for writing and positioned at its end rather than in append mode: on
-/// Windows an append-only handle lacks the write access that truncating it back requires.
-async fn append_synced(
-    path: &Path,
-    bytes: &[u8],
+/// Writes `compacting_path` followed by `wal_bytes` to `absorbing_wal_path`, syncs it and
+/// renames it over `compacting_path`. Blocking. On failure nothing visible changed: the temporary
+/// file is removed, and one left behind by a crash is removed when the room is next opened.
+fn replace_with_absorbed_copy(
+    compacting_path: &Path,
+    wal_bytes: &[u8],
     wal_path: &Path,
-    wal: &mut DiskWal,
 ) -> Result<(), StorageError> {
-    let mut file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
-    let original_len = file.seek(SeekFrom::End(0)).await?;
+    use std::io::Write;
 
-    let append_result = async {
-        let (first, rest) = bytes.split_at(bytes.len() / 2);
-        file.write_all(first).await?;
+    let tmp_path = absorbing_wal_path(wal_path);
+    let replaced = (|| {
+        let mut tmp = std::fs::File::create(&tmp_path)?;
+        std::io::copy(&mut std::fs::File::open(compacting_path)?, &mut tmp)?;
         fail_point::check("compaction.absorb_write", wal_path)?;
-        fail_point::read_only_handle("compaction.absorb_append", wal_path, &mut file, path).await;
-        file.write_all(rest).await?;
-        sync_file(&mut file, SyncKind::All).await?;
+        tmp.write_all(wal_bytes)?;
+        tmp.sync_all()?;
+        drop(tmp);
+        let renamed = std::fs::rename(&tmp_path, compacting_path);
+        fail_point::io_result("compaction.absorb_rename", wal_path, renamed)?;
         Ok::<(), StorageError>(())
-    }
-    .await;
-
-    if let Err(err) = append_result {
-        let restore_result = async {
-            file.set_len(original_len).await?;
-            sync_file(&mut file, SyncKind::All).await?;
-            Ok::<(), StorageError>(())
+    })();
+    if replaced.is_err() {
+        match std::fs::remove_file(&tmp_path) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                tracing::warn!(path = ?tmp_path, error = %err, "Could not remove an absorbed WAL copy");
+            }
+            _ => {}
         }
-        .await;
-        if let Err(restore_err) = restore_result {
-            wal.mark_failed(format!(
-                "Appending to {path:?} failed ({err}) and its length could not be restored \
-                 ({restore_err})"
-            ));
-        }
-        return Err(err);
     }
-    Ok(())
+    replaced
 }
 
 /// Compresses an already serialized snapshot payload and writes it, with its header, to a
@@ -468,8 +480,16 @@ pub(crate) async fn rename_staged_snapshot(
     staged: &StagedSnapshot,
 ) -> Result<(), StorageError> {
     fail_point::check("apply_snapshot.rename", &room.wal_path)?;
-    rename(&staged.tmp_path, &room.snap_path).await?;
-    Ok(())
+    let (from, to, key) = (
+        staged.tmp_path.clone(),
+        room.snap_path.clone(),
+        room.wal_path.clone(),
+    );
+    run_blocking(move || {
+        fail_point::pause_blocking("apply_snapshot.rename", &key);
+        std::fs::rename(from, to)
+    })
+    .await
 }
 
 /// Completes the installation of a snapshot renamed by [`rename_staged_snapshot`]: syncs the

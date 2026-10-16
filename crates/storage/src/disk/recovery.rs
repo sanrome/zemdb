@@ -5,12 +5,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, BufReader};
 
 use zemdb_core::{
     decode_batch_payload, find_valid_frame, parse_batch_header, BatchPayloadDecode, FrameAnomaly,
-    RoomId, Schema, SequenceNumber, WalFrameError, BATCH_HEADER_SIZE,
+    RoomId, Schema, SequenceNumber, BATCH_HEADER_SIZE,
 };
 
 use crate::disk::compactor::{
-    compacting_wal_path, remove_if_exists, sync_file, sync_parent, write_empty_snapshot_file,
-    write_snapshot_file, SyncKind,
+    absorbing_wal_path, compacting_wal_path, remove_if_exists, sync_file, sync_parent,
+    write_empty_snapshot_file, write_snapshot_file, SyncKind,
 };
 use crate::disk::format::{FileHeader, HEADER_SIZE};
 use crate::error::StorageError;
@@ -32,23 +32,10 @@ pub(crate) struct RecoveredRoom {
 
 struct WalReplayOutcome {
     valid_bytes: u64,
-    end: ReplayEnd,
+    /// Why the replay stopped before the end of the file, at a frame that could not be read and
+    /// has no valid frame after it: a torn write.
+    torn_write: Option<String>,
     applied_count: usize,
-}
-
-/// Where the replay of a WAL file stopped.
-enum ReplayEnd {
-    /// At the end of the file.
-    Clean,
-    /// At a frame that could not be read and has no valid frame after it.
-    TornWrite(String),
-    /// At a frame that could not be read and has a valid frame after it, at `following`:
-    /// corruption, unless the records after it are recovered from elsewhere (see
-    /// `recover_room`).
-    FollowedByFrame {
-        corruption: WalFrameError,
-        following: u64,
-    },
 }
 
 /// Reads until `buf` is full or the reader reaches its end, and returns the bytes read. A single
@@ -67,13 +54,14 @@ async fn read_full<R: AsyncRead + Unpin>(reader: &mut R, buf: &mut [u8]) -> std:
 }
 
 /// Classifies an anomaly found at `frame_start` of `file` (see [`FrameAnomaly`]), searching
-/// the rest of the file for a valid frame on a blocking thread.
+/// the rest of the file for a valid frame on a blocking thread. Returns the reason of a torn
+/// write, or the corruption as an error.
 async fn classify_anomaly(
     file: &tokio::fs::File,
     frame_start: u64,
     file_len: u64,
     anomaly: FrameAnomaly,
-) -> Result<ReplayEnd, StorageError> {
+) -> Result<String, StorageError> {
     let from = frame_start.saturating_add(anomaly.search_offset());
     let following = if file_len.saturating_sub(from) < BATCH_HEADER_SIZE as u64 {
         None
@@ -82,43 +70,7 @@ async fn classify_anomaly(
         let mut search_file = file.try_clone().await?.into_std().await;
         run_blocking(move || find_valid_frame(&mut search_file, from, file_len)).await?
     };
-    Ok(match (anomaly.classify(following), following) {
-        (Err(corruption), Some(following)) => ReplayEnd::FollowedByFrame {
-            corruption,
-            following,
-        },
-        (Err(corruption), None) => return Err(corruption.into()),
-        (Ok(reason), _) => ReplayEnd::TornWrite(reason),
-    })
-}
-
-/// Highest sequence number in the valid frames of `file` from `from` to `end`, skipping any
-/// damage between them as [`find_valid_frame`] does. A frame taken as valid without checking
-/// its payload yields `u64::MAX`: its records are unknown, so nothing can cover them.
-fn highest_seq_in_valid_frames(
-    file: &mut std::fs::File,
-    mut from: u64,
-    end: u64,
-) -> Result<Option<SequenceNumber>, StorageError> {
-    use std::io::{Read, Seek};
-
-    let mut highest = None;
-    while let Some(position) = find_valid_frame(file, from, end)? {
-        let mut header = [0u8; BATCH_HEADER_SIZE];
-        file.seek(SeekFrom::Start(position))?;
-        file.read_exact(&mut header)?;
-        let header = parse_batch_header(&header)
-            .map_err(|e| StorageError::WalCorruption(format!("Invalid WAL batch header: {e}")))?;
-        let mut payload = vec![0u8; header.payload_len()];
-        file.read_exact(&mut payload)?;
-        let frame_highest = match decode_batch_payload(&header, &payload)? {
-            BatchPayloadDecode::Batch { ops, .. } => ops.iter().map(|op| op.seq).max(),
-            BatchPayloadDecode::ChecksumMismatch { .. } => Some(SequenceNumber::from(u64::MAX)),
-        };
-        highest = highest.max(frame_highest);
-        from = position + header.frame_len() as u64;
-    }
-    Ok(highest)
+    Ok(anomaly.classify(following)?)
 }
 
 /// Replays the framed batches of one WAL file on top of `tables`, advancing `head_seq`.
@@ -209,14 +161,14 @@ async fn replay_wal_file(
         valid_bytes += header.frame_len() as u64;
     };
 
-    let end = match anomaly {
-        Some(anomaly) => classify_anomaly(file, valid_bytes, file_len, anomaly).await?,
-        None => ReplayEnd::Clean,
+    let torn_write = match anomaly {
+        Some(anomaly) => Some(classify_anomaly(file, valid_bytes, file_len, anomaly).await?),
+        None => None,
     };
 
     Ok(WalReplayOutcome {
         valid_bytes,
-        end,
+        torn_write,
         applied_count,
     })
 }
@@ -375,60 +327,33 @@ async fn remove_staged_snapshots(snap_path: &Path) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// A damaged frame of `.wal.compacting` followed by valid frames, and the highest sequence
-/// number in those frames, which the recovered state must reach for the damage to be accepted.
-type UnconfirmedTail = (WalFrameError, Option<SequenceNumber>);
-
 /// Replays the records of a rotated WAL (`room_{id}.wal.compacting`) left by an interrupted
-/// compaction beyond the state recovered so far. Returns whether it held any such record, and
-/// its damaged tail, if any (see [`UnconfirmedTail`]).
+/// compaction beyond the state recovered so far, and returns whether it held any such record.
 async fn replay_compacting_wal(
     room_id: &RoomId,
     wal_compacting_path: &Path,
     schema: &Schema,
     head_seq: &mut SequenceNumber,
     tables: &mut HashMap<u16, Table>,
-) -> Result<(bool, Option<UnconfirmedTail>), StorageError> {
+) -> Result<bool, StorageError> {
     let mut compacting_file = tokio::fs::File::from_std(std::fs::File::open(wal_compacting_path)?);
     let outcome = replay_wal_file(room_id, &mut compacting_file, schema, head_seq, tables).await?;
-    let has_live_records = outcome.applied_count > 0;
-    let unconfirmed_tail = match outcome.end {
-        ReplayEnd::Clean => None,
-        ReplayEnd::TornWrite(reason) => {
-            tracing::warn!(
-                room_id = %room_id,
-                reason = %reason,
-                "Torn write at the end of the rotated WAL, which is removed once folded"
-            );
-            None
-        }
-        // Absorbing the active WAL appends all of it with a single sync and only empties it
-        // afterwards, so a crash before that sync can leave a damaged frame followed by valid
-        // ones, all of whose records are still in the active WAL. A crash while folding them
-        // leaves the same file, with its records in the snapshot instead. The damage is accepted
-        // only if the recovered state ends up covering every record of the valid frames after
-        // it.
-        ReplayEnd::FollowedByFrame {
-            corruption,
-            following,
-        } => {
-            let end = compacting_file.metadata().await?.len();
-            let mut search_file = compacting_file.try_clone().await?.into_std().await;
-            let highest =
-                run_blocking(move || highest_seq_in_valid_frames(&mut search_file, following, end))
-                    .await?;
-            Some((corruption, highest))
-        }
-    };
-    Ok((has_live_records, unconfirmed_tail))
+    if let Some(reason) = outcome.torn_write {
+        tracing::warn!(
+            room_id = %room_id,
+            reason = %reason,
+            "Torn write at the end of the rotated WAL, which is removed once folded"
+        );
+    }
+    Ok(outcome.applied_count > 0)
 }
 
 /// Recovers a room from its files:
 /// 1. Loads the base snapshot (`room_{id}.snap`), or creates an empty one for a new room, and
-///    removes the temporary snapshot files left behind.
+///    removes the temporary snapshot files and the copy of an interrupted absorption
+///    (`room_{id}.wal.compacting.tmp`) left behind.
 /// 2. If a pre-crash rotated WAL (`room_{id}.wal.compacting`) exists, replays the records it
-///    holds beyond the snapshot. A damaged frame there followed by valid ones is accepted only
-///    if the active WAL holds the records after it, as a crash while absorbing leaves.
+///    holds beyond the snapshot.
 /// 3. Streams and replays all framed WAL batches from `wal_path` (`room_{id}.wal`),
 ///    applying mutations on top of tables and advancing `head_seq`, and truncates any
 ///    incomplete torn write at WAL EOF.
@@ -452,51 +377,32 @@ pub(crate) async fn recover_room(
         mut head_seq,
         mut snapshot_len,
     } = load_snapshot(room_id, snap_path, schema).await?;
+    fail_point::pause("recovery.snapshot_loaded", wal_path).await;
     remove_staged_snapshots(snap_path).await?;
+    // Its records are all in `.wal.compacting` and the active WAL, which it never replaced.
+    remove_if_exists(&absorbing_wal_path(wal_path)).await?;
 
     // 2. Replay a pre-crash rotated WAL (`room_{id}.wal.compacting`), if any
     let wal_compacting_path = compacting_wal_path(wal_path);
     let compacting_exists = tokio::fs::try_exists(&wal_compacting_path).await?;
-    let (compacting_has_live_records, unconfirmed_compacting_tail) = if compacting_exists {
-        replay_compacting_wal(
+    let compacting_has_live_records = compacting_exists
+        && replay_compacting_wal(
             room_id,
             &wal_compacting_path,
             schema,
             &mut head_seq,
             &mut tables,
         )
-        .await?
-    } else {
-        (false, None)
-    };
+        .await?;
 
     // 3. Replay append-only WAL batches from wal_path
     let mut wal_file = tokio::fs::File::from_std(wal_file_std);
     let outcome =
         replay_wal_file(room_id, &mut wal_file, schema, &mut head_seq, &mut tables).await?;
-    let torn_write = match outcome.end {
-        ReplayEnd::Clean => None,
-        ReplayEnd::TornWrite(reason) => Some(reason),
-        ReplayEnd::FollowedByFrame { corruption, .. } => return Err(corruption.into()),
-    };
-
-    // The replay rejects a gap, so reaching the highest record after the damage means every
-    // record up to it, the damaged ones included, came from the snapshot or the active WAL.
-    if let Some((corruption, highest)) = unconfirmed_compacting_tail {
-        if highest.is_some_and(|highest| highest > head_seq) {
-            return Err(corruption.into());
-        }
-        tracing::warn!(
-            room_id = %room_id,
-            reason = %corruption,
-            "Damaged tail of the rotated WAL is covered by the snapshot and the active WAL"
-        );
-    }
-
     let mut valid_wal_bytes = outcome.valid_bytes;
 
     // Truncate torn write at WAL EOF if detected
-    if let Some(ref reason) = torn_write {
+    if let Some(ref reason) = outcome.torn_write {
         tracing::warn!(
             room_id = %room_id,
             reason = %reason,

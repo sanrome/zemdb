@@ -13,6 +13,7 @@
 //! steps of a scenario.
 
 use super::support::{engine_at, file_contents, Rng};
+use crate::disk::compactor::compacting_wal_path;
 use crate::fail_point::{self, CrashAction};
 use crate::{DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, ScanOptions};
 use crate::{StorageEngine, StorageError};
@@ -976,15 +977,19 @@ impl Damage {
 /// corruption, and neither is damage in the payload of the last frame; a damaged header of the
 /// last frame may be (it hides where the frame ends, so a frame stored in its value can pass for
 /// a later one).
+///
+/// If `rotated`, the damaged file is instead the room's `.wal.compacting`, whose records the
+/// active WAL continues: any damage must be `WalCorruption`, without changing any file.
 async fn check_damaged_wal(
     rng: &mut Rng,
     base: &Path,
     trial: &Path,
     events: &[Event],
     frames: &[(usize, usize, u64)],
+    rotated: bool,
 ) -> Result<(), String> {
     let engine = engine_at(trial);
-    let wal_path = engine.wal_file_path(&room());
+    let wal_path = damaged_file(&engine, rotated);
     fail_point::copy_files(base, trial);
     let wal = std::fs::read(&wal_path).unwrap();
     let damage = match rng.below(4) {
@@ -1027,7 +1032,7 @@ async fn check_damaged_wal(
 
     match engine.open_room(&room(), schema()).await {
         Ok(()) => {
-            if intact_frame_follows {
+            if intact_frame_follows || rotated {
                 return Err(format!(
                     "{described}: accepted, with intact frames after it"
                 ));
@@ -1053,7 +1058,7 @@ async fn check_damaged_wal(
                 ));
             }
             let in_the_last_frame = damaged_frame == frames.len() - 1;
-            if damage.reaches_the_end() || (in_the_last_frame && !header_damaged) {
+            if !rotated && (damage.reaches_the_end() || (in_the_last_frame && !header_damaged)) {
                 return Err(format!("{described}: reported as corruption"));
             }
         }
@@ -1062,9 +1067,24 @@ async fn check_damaged_wal(
     Ok(())
 }
 
+/// The WAL of the room in `engine`, or its `.wal.compacting` if `rotated`.
+fn damaged_file(engine: &DiskStorageEngine, rotated: bool) -> PathBuf {
+    let wal_path = engine.wal_file_path(&room());
+    if rotated {
+        compacting_wal_path(&wal_path)
+    } else {
+        wal_path
+    }
+}
+
 /// For each of `seeds`, builds a room from 2 to 9 random batches and checks `damages` damaged
-/// copies of its WAL (see [`check_damaged_wal`]).
-async fn damaged_wals_recover_a_prefix_or_fail_untouched(seeds: Range<u64>, damages: u64) {
+/// copies of its WAL (see [`check_damaged_wal`]). If `rotated`, a failed compaction leaves those
+/// batches in `.wal.compacting` and one more batch goes to the active WAL.
+async fn damaged_wals_recover_a_prefix_or_fail_untouched(
+    seeds: Range<u64>,
+    damages: u64,
+    rotated: bool,
+) {
     let mut failures = Vec::new();
     let mut runs = 0;
     for seed in seeds {
@@ -1079,15 +1099,21 @@ async fn damaged_wals_recover_a_prefix_or_fail_untouched(seeds: Range<u64>, dama
             engine.apply_batch(&room(), batch.clone()).await.unwrap();
             events.push(Event::Batch(batch));
         }
+        if rotated {
+            fail_point::arm("compaction.phase2", &engine.snap_file_path(&room()));
+            assert!(engine.compact_room(&room()).await.is_err());
+            let batch = random_batch(&mut rng, head_of(&events));
+            engine.apply_batch(&room(), batch).await.unwrap();
+        }
         engine.close_room(&room()).await.unwrap();
-        let wal = std::fs::read(engine.wal_file_path(&room())).unwrap();
-        let frames = frames_of(&wal);
+        let frames = frames_of(&std::fs::read(damaged_file(&engine, rotated)).unwrap());
         assert_eq!(frames.len(), events.len());
 
         for damage in 0..damages {
             runs += 1;
             let trial = tmp.path().join(format!("trial-{damage}"));
-            let checked = check_damaged_wal(&mut rng, &base, &trial, &events, &frames).await;
+            let checked =
+                check_damaged_wal(&mut rng, &base, &trial, &events, &frames, rotated).await;
             if let Err(e) = checked {
                 failures.push(format!("seed {seed} damage {damage}: {e}"));
             }
@@ -1098,11 +1124,22 @@ async fn damaged_wals_recover_a_prefix_or_fail_untouched(seeds: Range<u64>, dama
 
 #[tokio::test]
 async fn damaged_wal_recovers_a_prefix_or_fails_untouched() {
-    damaged_wals_recover_a_prefix_or_fail_untouched(seeds(1000, 2), 8).await;
+    damaged_wals_recover_a_prefix_or_fail_untouched(seeds(1000, 2), 8, false).await;
 }
 
 #[tokio::test]
 #[ignore = "long-running randomized test; run with --ignored in release"]
 async fn damaged_wal_recovers_a_prefix_or_fails_untouched_over_many_wals() {
-    damaged_wals_recover_a_prefix_or_fail_untouched(seeds(1000, 100), 20).await;
+    damaged_wals_recover_a_prefix_or_fail_untouched(seeds(1000, 100), 20, false).await;
+}
+
+#[tokio::test]
+async fn damaged_rotated_wal_fails_untouched() {
+    damaged_wals_recover_a_prefix_or_fail_untouched(seeds(2000, 2), 8, true).await;
+}
+
+#[tokio::test]
+#[ignore = "long-running randomized test; run with --ignored in release"]
+async fn damaged_rotated_wal_fails_untouched_over_many_wals() {
+    damaged_wals_recover_a_prefix_or_fail_untouched(seeds(2000, 100), 20, true).await;
 }

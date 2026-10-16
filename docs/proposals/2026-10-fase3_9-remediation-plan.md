@@ -82,7 +82,7 @@ La única excepción son los ítems del backlog marcados **(barato)** que estén
 
 ## 2. Decisiones de diseño
 
-Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las decisiones D69 a D80 son las que se tomaron sobre la auditoría (el número entre paréntesis es el de la conversación). Las D81 a D87 son de implementación y están **propuestas**: se confirman o cambian antes de arrancar el lote correspondiente.
+Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las decisiones D69 a D80 son las que se tomaron sobre la auditoría (el número entre paréntesis es el de la conversación). Las D81 a D87 son de implementación y están **propuestas**: se confirman o cambian antes de arrancar el lote correspondiente. D89 salió de la revisión de delta del Lote 3.
 
 | ID | Decisión | Lote | Estado |
 |---|---|---|---|
@@ -102,9 +102,10 @@ Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las de
 | **D82** | **JSON persistido con checksum.** `log_meta.json`, `meta_room.json`, `schemas/{id}.json` y el roster se escriben como el JSON, un salto de línea y una última línea `crc32:<8 hex>` con el CRC32 de los bytes del JSON. Siguen siendo legibles a mano. Leer un archivo sin esa línea o con un CRC que no coincide equivale a un archivo ilegible: `log_meta.json`, `meta_room.json` y los esquemas hacen fallar la apertura; el roster se descarta con un warning, como hoy. Un roster con UTF-8 inválido también se descarta (hoy falla la apertura, al revés de lo que dice §5.2). Sin compatibilidad con archivos sin checksum (V1). La apertura nunca borra segmentos a partir de un valor que no verificó. | 2 | Propuesta |
 | **D83** | **Lock exclusivo de `data_dir`.** El servidor toma `data_dir/server.lock` (`fs2`, como `log.lock`) al arrancar, antes de recuperar el relay o el registry de esquemas. Si el lock está tomado, se niega a arrancar con un error que lo explica. `delete_room` además toma el `log.lock` de la sala antes de borrarla. | 2 | Propuesta |
 | **D84** | **Borrado de sala con lápida.** `delete_room` renombra `rooms/<id>` a `rooms/.deleted-<uuid>`, sincroniza `rooms/` y recién después borra el directorio renombrado. Al arrancar se borran las lápidas que quedaron. `RoomId` no admite `.`, así que una lápida nunca choca con una sala. `create_room` además purga el relay de ese id (P10). | 5 | Propuesta |
-| **D85** | **Absorción atómica en storage.** En lugar de anexar el WAL activo a `.wal.compacting` en el lugar, se arma `room_{id}.wal.compacting.tmp` con `.wal.compacting` más el WAL activo, se sincroniza, se renombra sobre `.wal.compacting`, se sincroniza el directorio y recién después se trunca el WAL activo. `.wal.compacting` nunca queda con una cola rota, así que desaparecen la excepción de corrupción de `.wal.compacting` y `highest_seq_in_valid_frames`. | 3 | Propuesta |
-| **D86** | **`apply_snapshot` instala en su propia tarea.** Desde el staging hasta la instalación (rename, sync, vaciado del WAL, borrado de `.wal.compacting`), `apply_snapshot` corre en una tarea propia, como `compact_room`. Cancelar el future deja de abandonar operaciones de archivo en vuelo, y `close_room` espera a la tarea (comparten el lock de compactación). | 3 | Propuesta |
+| **D85** | **Absorción atómica en storage.** En lugar de anexar el WAL activo a `.wal.compacting` en el lugar, se arma `room_{id}.wal.compacting.tmp` con `.wal.compacting` más el WAL activo, se sincroniza, se renombra sobre `.wal.compacting`, se sincroniza el directorio y recién después se trunca el WAL activo. `.wal.compacting` nunca queda con una cola rota, así que desaparecen la excepción de corrupción de `.wal.compacting` y `highest_seq_in_valid_frames`. Al adoptarla se fijó: el temporal tiene nombre fijo y la apertura lo borra sin leerlo (se suma a los temporales de INV-S4); una falla al escribirlo, sincronizarlo o renombrarlo lo borra y deja la sala usable; una falla del sync del directorio después del rename la marca `RoomFailed`; un daño que llega al final de `.wal.compacting` sigue siendo una escritura rota. | 3 | Adoptada |
+| **D86** | **`apply_snapshot` instala en su propia tarea.** Desde el staging hasta la instalación (rename, sync, vaciado del WAL, borrado de `.wal.compacting`), `apply_snapshot` corre en una tarea propia, como `compact_room`. Cancelar el future deja de abandonar operaciones de archivo en vuelo, y `close_room` espera a la tarea (comparten el lock de compactación). Al adoptarla se fijó: decodificar y esperar el lock siguen en quien llama; quien suelta el future ya no deja la sala `RoomFailed`, porque el snapshot se aplica entero. | 3 | Adoptada |
 | **D87** | **El apagado espera las tareas de varios pasos.** Un `TaskTracker` registra las tareas que corren por su cuenta (borrado de sala, escrituras del relay, recarga de esquema). `serve_until_shutdown` las espera dentro de la gracia de 10 s, antes de `shutdown_all`. | 5 | Propuesta |
+| **D89** | **`open_room` del storage recupera en su propia tarea.** La recuperación corre en una tarea dueña del lock de la sala y del handle del WAL hasta que terminan sus operaciones de archivo, como `apply_snapshot` (D86). Si quien llama se va, la apertura termina igual y la sala queda abierta. | 3 | Propuesta |
 | **D88** | **Redes de prueba en el repo.** Las simulaciones y proptests de la auditoría entran como tests con semillas fijas. Cada red entra en la suite normal en una versión corta: todas juntas suman como mucho ~30 s en debug. Las versiones largas quedan como `#[ignore]`, así que `cargo test` no las corre, ni en local ni en la CI de cada push o PR. Corren en un workflow aparte (`.github/workflows/randomized.yml`, `cargo test --workspace --release -- --ignored`) una vez por semana y a mano al cerrar cada lote, como parte de la revisión de delta (regla 4). El fuzzer de decoders y los roundtrips usan generadores propios con un PRNG determinista (SplitMix64), sin `proptest`: su versión actual exige exactamente el MSRV de los tests (1.88) y sus dependencias transitivas podrían romper ese job. No hay `cargo fuzz`. Las mediciones de memoria quedan fuera, porque requieren `unsafe`. | 0 | Adoptada |
 
 ---
@@ -116,12 +117,12 @@ Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las de
 | 0 | Contrato y redes de prueba | D70–D72, D78, D79, D88 | Inmediata (las redes viven en copias temporales) | ✅ |
 | 1 | Arreglos chicos de alto valor | DEF-146, 147, 155 | Inmediata | ✅ 3/3 |
 | 2 | Abrir solo lo verificado y sincronizado | DEF-144, 145, 148, 158, 149 | Alta (requisito de Fase 4) | ⬜ 0/5 |
-| 3 | Storage: cancelación y absorción | DEF-150, 151 | Alta (requisito de Fase 4) | ⬜ 0/2 |
+| 3 | Storage: cancelación y absorción | DEF-150, 151, 165 | Alta (requisito de Fase 4) | 🟡 2/3 |
 | 4 | Recursos | DEF-152, 159, 153, 163, 162, 164, 154, 157 | Media | ⬜ 0/8 |
 | 5 | Ciclo de vida | DEF-156, 160, 161 | Baja | ⬜ 0/3 |
 | 6 | Documentación | ARCHITECTURE, README, ROADMAP | Baja | ⬜ |
 
-**Avance total:** 3 de 21 ítems (Lote 0 cerrado: contrato y redes de prueba; Lote 1 cerrado).
+**Avance total:** 5 de 22 ítems (Lotes 0 y 1 cerrados; Lote 3 con DEF-165 pendiente).
 
 **Ítems nuevos de este plan.** Surgen de las invariantes adoptadas (D79) y de hallazgos de la auditoría que no tenían ID:
 - **DEF-159** · Medio · P6: reparto del presupuesto de respuestas.
@@ -130,6 +131,7 @@ Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las de
 - **DEF-162** · Bajo · P11: subida de un chunk confirmada fuera de rango.
 - **DEF-163** · Bajo · Designación congelada por una subida ajena.
 - **DEF-164** · Bajo · R5: la marca de hueco no cubre los snapshots por debajo del cursor que lo encontró (revisión de delta del Lote 1).
+- **DEF-165** · Medio · S1, S6 y L2: un `open_room` soltado borra tarde un `.wal.compacting` ajeno (revisión de delta del Lote 3).
 
 **Por qué este orden, en una línea por lote:**
 0. Sin las redes de prueba en el repo, cada lote se revisa a mano. Las redes viven en copias que se pueden perder.
@@ -351,12 +353,21 @@ Falla en `main` en los dos primeros casos. Mutaciones verificadas: sin la guarda
 
 > Objetivo: que el motor de disco del cliente no pierda lotes confirmados por una cancelación y que un crash durante la absorción no deje una sala que no abre.
 
-#### DEF-150 · Medio · ⬜ Pendiente
+#### DEF-150 · Medio · ✅ Hecho
 **Problema.** El `rename` de un `apply_snapshot` cancelado aterriza después de reabrir y hace perder lotes que la sala reabierta confirmó.
 **Solución.** D86. Incluye el borrado de `.wal.compacting` de `install_applied_snapshot`, que tiene la misma carrera.
 **Test exigido.** `audit_l2_rename_of_a_dropped_apply_snapshot_lands_in_the_reopened_room` (`inv/l`, con sus dos puntos de pausa). Además, el barrido de cancelación en cada punto de suspensión de `apply_snapshot` (`audit_l2_apply_snapshot_dropped_at_every_suspension_point`), que pasa hoy y tiene que seguir pasando.
 
-#### DEF-151 · Medio · ⬜ Pendiente
+**Hecho.** Desde el primer chequeo del head hasta reemplazar la memoria, `apply_snapshot` corre en un `tokio::spawn` que retiene el lock de compactación.
+- **Tests:**
+  - `snapshot_dropped_during_its_rename_is_installed_before_the_room_reopens` (`src/tests/disk.rs`) es el de la auditoría, con sus dos pausas: `apply_snapshot.rename`, bloqueante dentro del rename, y `recovery.snapshot_loaded`. En `main`, la reapertura carga el snapshot viejo (head 3) con el rename en vuelo.
+  - El barrido sigue en verde y ahora además exige que la sala quede usable. Para eso, `check_after_drop` espera el lock de compactación antes de mirar la sala.
+- **Mutación:** correr la instalación otra vez en el future de quien llama hace fallar los dos tests. El primero lo detecta si la reapertura llega a cargar el snapshot en 200 ms; el barrido no depende del tiempo.
+- **Desvíos:**
+  - `rename_staged_snapshot` usa `std::fs::rename` en `run_blocking`, que es lo que hace `tokio::fs::rename`, para poder pausar dentro del pool bloqueante.
+  - Quien suelta el future ya no deja la sala `RoomFailed`: el snapshot se aplica entero.
+
+#### DEF-151 · Medio · ✅ Hecho
 **Problema.** Un crash durante la absorción en `.wal.compacting` deja una sala que no reabre (falla cerrada).
 **Solución.** D85.
 **Test exigido.**
@@ -364,7 +375,45 @@ Falla en `main` en los dos primeros casos. Mutaciones verificadas: sin la guarda
 - `crash_while_absorbing_recovers_the_damaged_copy_from_the_active_wal`, adaptado a la nueva forma de absorber.
 - La simulación de imágenes de crash del Lote 0 en verde.
 
----
+**Hecho.** La absorción escribe `.wal.compacting` más el WAL activo en `room_{id}.wal.compacting.tmp`, lo sincroniza, lo renombra sobre `.wal.compacting` y sincroniza el directorio. Recién después vacía el WAL activo. La recuperación borra el `.tmp` sin leerlo.
+
+Se fueron `append_synced`, `highest_seq_in_valid_frames`, la excepción de corrupción y `ReplayEnd`: la clasificación devuelve el error de corrupción directamente. El código de producción del lote suma −65 líneas netas.
+- **Tests:**
+  - `crash_at_any_point_of_an_absorption_leaves_the_rotated_wal_whole` toma imágenes de crash en cada punto de una absorción real (solo en Unix). En todas, `.wal.compacting` está entero, y un handle abierto antes de compactar sigue leyendo el archivo viejo. En `main` falla en `compaction.absorb_write`, a medio escribir.
+  - `crash_while_absorbing_leaves_a_copy_that_recovery_discards` es el adaptado de `crash_while_absorbing_recovers_...`. Junto con `damaged_rotated_wal_followed_by_valid_frames_is_corruption`, falla en `main`.
+  - Fallas antes y después del rename: `failed_write_of_the_absorbed_copy_keeps_the_active_wal`, `failed_rename_of_the_absorbed_copy_keeps_the_active_wal` y `failed_directory_sync_after_absorbing_marks_room_failed_until_reopened`.
+  - El daño de `.wal.compacting` que había quedado del Lote 0 entra como variante `rotated` de la simulación de WAL dañado: `damaged_rotated_wal_fails_untouched`, más su versión larga.
+  - La simulación de imágenes de crash del Lote 0 sigue en verde.
+- **Mutaciones:** cada una de estas hace fallar un test:
+  - el código de `main`;
+  - escribir en el lugar con una sola escritura;
+  - vaciar el WAL activo antes del rename;
+  - ignorar el error del rename o del sync del directorio;
+  - no borrar el `.tmp`, al fallar o al abrir.
+
+  Sacar un `fsync` no se detecta, como en el resto del crate: las imágenes copian la caché de páginas.
+- **Desvíos:**
+  - **Los tres `inv_s3_torn_absorb_*` no entran tal cual,** porque su estado de crash ya no existe. La copia rota queda en el `.tmp`, que la recuperación borra sin leer, así que su contenido (un frame embebido, payloads dañados) no influye. Los cubren el test de imágenes y el de la copia descartada.
+  - **Dos tests se borraron:**
+    - `crash_while_folding_a_damaged_absorb_recovers_on_the_next_open`, porque su estado de partida ahora es corrupción;
+    - `failed_background_append_to_compacting_wal_keeps_the_active_wal`, porque la copia se escribe con `std::fs` en el pool bloqueante y no hay escrituras de fondo.
+  - **Un `.wal.compacting` dañado con frames válidos después es `WalCorruption`,** aunque el WAL activo tenga esos registros.
+
+#### DEF-165 · Medio · ⬜ Pendiente
+**Problema.** La recuperación de `open_room` corre en el future de quien llama. Si ese future se suelta mientras la recuperación borra un `.wal.compacting` ya plegado, el lock de la sala se libera con el borrado todavía en el pool bloqueante. Otra apertura toma la sala y confirma lotes, y una compactación que falla los deja en un `.wal.compacting` nuevo. El borrado tardío se lleva ese archivo, y los lotes se pierden al reabrir (S1, S6, L2). Es preexistente: lo encontró la revisión de delta de este lote.
+**Solución.** D89.
+**Test exigido.**
+- El de la revisión de delta, con una pausa bloqueante en ese borrado: la apertura soltada no borra el `.wal.compacting` de la sala que la sucede. Hoy la reapertura da head 8 en lugar de 10.
+- Además, el barrido de cancelación de `open_room` en cada punto de suspensión.
+
+**Revisión de delta del lote.** La hizo un agente aparte, en modo solo lectura. Conclusión: los dos fixes cierran sus escenarios y el código no rompe otras invariantes.
+- **Hallazgos que entraron al lote:**
+  - un test leía el WAL activo con su lock tomado, lo que falla en Windows;
+  - dos mutaciones no tenían test: la escritura en el lugar de una sola vez y el error del rename ignorado;
+  - el barrido de snapshots aceptaba `RoomFailed`;
+  - faltaba un timeout en un test;
+  - dos enunciados de `INVARIANTES.md` decían de más.
+- **Hallazgo fuera del lote:** DEF-165.
 
 ## Lote 4 — Recursos
 

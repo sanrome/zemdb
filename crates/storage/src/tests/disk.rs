@@ -411,6 +411,61 @@ async fn failed_snapshot_rename_leaves_room_usable() {
     failed_snapshot_install_step_leaves_room_usable("apply_snapshot.rename").await;
 }
 
+/// An `apply_snapshot` whose caller gives up while its rename is in flight completes before the
+/// room can be reopened. A reopen that loaded the previous snapshot first would have the rename
+/// land under it, and lose the batches it acknowledges at the next open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_dropped_during_its_rename_is_installed_before_the_room_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("late-rename").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    let wal_path = engine.wal_file_path(&room);
+    apply_range(&engine, &room, 1..=3).await;
+    let snapshot = snapshot_with_rows(&room, 101, 5).await;
+
+    let mut rename = fail_point::arm_blocking_pause("apply_snapshot.rename", &wal_path);
+    tokio::select! {
+        _ = engine.apply_snapshot(&room, schema(), snapshot.into(), SequenceNumber::from(5u64)) => {
+            panic!("apply_snapshot finished during its rename")
+        }
+        _ = rename.reached() => {}
+    }
+
+    // The room is closed and reopened. If the reopen loads a snapshot before the rename lands,
+    // the rename lands right then.
+    let mut loaded = fail_point::arm_pause("recovery.snapshot_loaded", &wal_path);
+    let reopening = tokio::spawn({
+        let (dir, room) = (dir.path().to_path_buf(), room.clone());
+        async move { reopen(engine, &dir, &room).await }
+    });
+    let loaded_first = tokio::time::timeout(Duration::from_millis(200), loaded.reached())
+        .await
+        .is_ok();
+    rename.release();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !staged_snapshot_files(dir.path()).is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the rename never landed");
+    if !loaded_first {
+        tokio::time::timeout(Duration::from_secs(10), loaded.reached())
+            .await
+            .expect("the reopen never loaded the snapshot");
+    }
+    loaded.release();
+    let reopened = reopening.await.unwrap();
+    assert_eq!(reopened.get_head_seq(&room).await.unwrap().get(), 5);
+
+    apply_range(&reopened, &room, 6..=7).await;
+    let reopened = reopen(reopened, dir.path(), &room).await;
+    assert_eq!(reopened.get_head_seq(&room).await.unwrap().get(), 7);
+    for key in (101..=105).chain(6..=7) {
+        assert!(has_key(&reopened, &room, key).await, "row {key} lost");
+    }
+}
+
 #[tokio::test]
 async fn panic_while_applying_a_batch_exposes_none_of_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -710,7 +765,7 @@ async fn poll_then_drop(operation: impl Future, suspensions: usize) -> bool {
 /// Checks `room` after an operation that would have taken it from the head and rows of `old`
 /// to those of `new` was dropped (`k` names the run): in memory and after a reopen, it holds
 /// one of the two. If it still takes writes, memory and disk agree and the write survives the
-/// reopen; otherwise it is marked failed.
+/// reopen; otherwise it is marked failed. Returns whether it still took writes.
 async fn check_after_drop(
     engine: DiskStorageEngine,
     dir: &Path,
@@ -718,9 +773,12 @@ async fn check_after_drop(
     k: usize,
     old: (u64, RangeInclusive<i64>),
     new: (u64, RangeInclusive<i64>),
-) {
-    // File operations handed to the blocking pool before the drop complete meanwhile.
+) -> bool {
+    // File operations handed to the blocking pool before the drop complete meanwhile, and so do
+    // the tasks that a dropped snapshot or compaction left running with the compaction lock.
     tokio::time::sleep(Duration::from_millis(50)).await;
+    let compaction = engine.compaction_lock(room).await.unwrap();
+    drop(compaction.lock().await);
     let memory_head = engine.get_head_seq(room).await.unwrap().get();
     let extra = 9_000 + k as i64;
     let usable = engine
@@ -751,6 +809,7 @@ async fn check_after_drop(
             "k={k}: row {key} missing"
         );
     }
+    usable
 }
 
 /// `apply_batch` dropped by its caller after any number of suspensions leaves the room before or
@@ -772,7 +831,8 @@ async fn apply_batch_dropped_at_any_suspension_point_keeps_the_room_consistent()
 }
 
 /// `apply_snapshot` dropped by its caller after any number of suspensions leaves the room before
-/// or after the snapshot, or marked failed.
+/// or after the snapshot, and never marked failed: once it has the compaction lock it completes
+/// in its own task.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "long-running test; run with --ignored in release"]
 async fn apply_snapshot_dropped_at_any_suspension_point_keeps_the_room_consistent() {
@@ -785,7 +845,9 @@ async fn apply_snapshot_dropped_at_any_suspension_point_keeps_the_room_consisten
         let head = SequenceNumber::from(5u64);
         let apply = engine.apply_snapshot(&room, schema(), snapshot.into(), head);
         let completed = poll_then_drop(apply, k).await;
-        check_after_drop(engine, dir.path(), &room, k, (3, 1..=3), (5, 101..=105)).await;
+        let usable =
+            check_after_drop(engine, dir.path(), &room, k, (3, 1..=3), (5, 101..=105)).await;
+        assert!(usable, "k={k}: the dropped snapshot marked the room failed");
         if completed {
             break;
         }
