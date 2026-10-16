@@ -321,12 +321,10 @@ async fn retention_anchor_protects_the_deltas_after_a_snapshot() {
     room.relay
         .stage_snapshot(
             &room.room_id,
+            &zemdb_server::relay::Uploader::Admin,
             SequenceNumber::new(5),
             bytes::Bytes::from(envelope(1000, 5)),
-            async {
-                let (tail_seq, head_seq) = room.room_manager.log_bounds(&room.room_id).await?;
-                Ok(zemdb_server::relay::LogBounds { tail_seq, head_seq })
-            },
+            room.room_manager.log_bounds(&room.room_id),
         )
         .await
         .unwrap();

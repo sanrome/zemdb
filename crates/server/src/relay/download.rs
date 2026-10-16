@@ -17,8 +17,8 @@ impl SnapshotRelay {
     /// `chunk_size` is clamped to [`MIN_CHUNK_BYTES`]..=[`MAX_CHUNK_BYTES`]. Only the first
     /// chunk may be requested without `snapshot_hash`; that request also checks, through
     /// `log_bounds`, that the room log can still continue from the snapshot, and drops a
-    /// snapshot that fell below the retained range. With `snapshot_hash`, the request is
-    /// anchored to that snapshot: if it is no longer the active one the result is
+    /// snapshot that fell below the retained range or below a gap. With `snapshot_hash`, the
+    /// request is anchored to that snapshot: if it is no longer the active one the result is
     /// `SnapshotSuperseded`.
     pub async fn get_chunk(
         &self,
@@ -114,7 +114,7 @@ impl SnapshotRelay {
             .remove_if(room_id, |_, s| s.snapshot_hash == stale.snapshot_hash);
         if let Some((_, removed)) = removed {
             info!(room = %room_id, seq = %removed.head_seq,
-                "Dropping snapshot that fell below the retained log range");
+                "Dropping snapshot that the room log cannot continue from");
             self.remove_files(vec![removed.path]).await;
         }
     }

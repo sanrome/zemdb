@@ -21,7 +21,7 @@ use crate::relay::{LogBounds, SnapshotChunkUpload};
 /// header; success is answered with `ServerMessage::SnapshotStaged`.
 pub async fn upload_snapshot(
     State(state): State<AppState>,
-    RelayAuth { room_id, .. }: RelayAuth,
+    RelayAuth { room_id, uploader }: RelayAuth,
     headers: HeaderMap,
     BinaryBody(body): BinaryBody,
 ) -> Response {
@@ -33,7 +33,13 @@ pub async fn upload_snapshot(
     let staged = run_to_completion(async move {
         state
             .snapshot_relay
-            .stage_snapshot(&task_room, head_seq, body, log_bounds(&state, &task_room))
+            .stage_snapshot(
+                &task_room,
+                &uploader,
+                head_seq,
+                body,
+                log_bounds(&state, &task_room),
+            )
             .await
     })
     .await;
@@ -173,9 +179,8 @@ async fn run_to_completion<T: Send + 'static>(
         .map_err(|e| ServerError::Internal(format!("Snapshot relay task failed: {e}")))?
 }
 
-/// Retained log range of the room, asked to its actor when the relay awaits it. A room that
-/// does not exist is `RoomNotFound`.
+/// Retained log range of the room and the snapshot it found below a gap, asked to its actor
+/// when the relay awaits it. A room that does not exist is `RoomNotFound`.
 async fn log_bounds(state: &AppState, room_id: &RoomId) -> Result<LogBounds, ServerError> {
-    let (tail_seq, head_seq) = state.room_manager.log_bounds(room_id).await?;
-    Ok(LogBounds { tail_seq, head_seq })
+    state.room_manager.log_bounds(room_id).await
 }

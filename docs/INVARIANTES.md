@@ -83,7 +83,7 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 
 ### Resumen
 
-Estado en `50fe195` (ver §1.5). Los lotes son los del [plan de la Fase 3.9](proposals/2026-10-fase3_9-remediation-plan.md).
+Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes son los del [plan de la Fase 3.9](proposals/2026-10-fase3_9-remediation-plan.md).
 
 | ID | Invariante | ★ | Si se rompe | Estado |
 |---|---|---|---|---|
@@ -105,22 +105,22 @@ Estado en `50fe195` (ver §1.5). Los lotes son los del [plan de la Fase 3.9](pro
 | **INV-Y1** | Orden total contiguo por sala | ★ | Alto | ✅ |
 | **INV-Y2** | Entrega exacta: ni huecos, ni duplicados, ni cambios | ★ | Alto | ✅ |
 | **INV-Y3** | Quedarse atrás siempre se señala | ★ | Alto | ✅ |
-| **INV-Y4** | Idempotencia por cliente dentro de la ventana | | Medio | ❌ (Lote 1) |
+| **INV-Y4** | Idempotencia por cliente dentro de la ventana | | Medio | ✅ |
 | **INV-Y5** | Un commit rechazado no deja rastro | | Medio | ✅ |
 | **INV-Y6** | Los cursores solo avanzan por lo que el cliente confirmó | | Medio | ✅ |
 | **INV-Y7** | Un registro con cursor de otra encarnación nunca se acepta | | Medio | ✅ |
 | **INV-Y8** | Réplicas con el mismo prefijo convergen | ★ | Alto | ✅ |
-| **INV-Y9** | La ventana de dedup es función del log | | Medio | 🆕 (Lote 1) |
+| **INV-Y9** | La ventana de dedup es función del log | | Medio | ✅ |
 | **INV-R1** | La poda por cursores nunca borra lo que alguien necesita | ★ | Alto | ✅ |
 | **INV-R2** | El rango retenido es contiguo y su cola no retrocede | | Medio | ✅ |
 | **INV-R3** | Perder estado volátil del roster solo cuesta retención o re-registro | | Medio | ✅ |
 | **INV-R4** | Todo cliente que se queda atrás termina pudiendo ponerse al día | | Medio | ✅ |
-| **INV-R5** | Solo se anuncian y sirven snapshots usables, y una descarga es de un solo snapshot | | Medio | ❌ (Lote 1) |
+| **INV-R5** | Solo se anuncian y sirven snapshots usables, y una descarga es de un solo snapshot | | Medio | ❌ (Lote 4) |
 | **INV-R6** | Un snapshot solo se ofrece a la encarnación que lo aceptó | | Medio | 🆕 (Lote 5) |
 | **INV-R7** | Una subida confirmada es usable | | Bajo | 🆕 (Lote 4) |
 | **INV-A1** | Nadie actúa sobre otra sala ni como otro cliente | ★ | Alto | ✅ |
 | **INV-A2** | Nada se decodifica antes de autenticar, salvo lo acotado de `/register` | | Alto | ✅ |
-| **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio | ❌ (Lote 1) |
+| **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio | ✅ |
 | **INV-A4** | Ningún identificador produce rutas fuera de `data_dir` | ★ | Alto | ✅ |
 | **INV-B1** | La memoria por request está acotada | ★ | Alto | ❌ (Lote 4) |
 | **INV-B2** | Nada se retiene sin plazo | | Medio | ❌ (Lote 4) |
@@ -130,7 +130,7 @@ Estado en `50fe195` (ver §1.5). Los lotes son los del [plan de la Fase 3.9](pro
 | **INV-L1** | Toda request recibe una respuesta, en tiempo acotado | | Medio | ✅ |
 | **INV-L2** | Cancelar una request nunca deja estado a medias | | Medio | ❌ (Lotes 3 y 5) |
 | **INV-L3** | Un I/O incierto nunca se confirma como éxito | ★ | Alto | ❌ (Lote 2) |
-| **INV-L4** | Reabrir una sala no cambia ningún estado confirmado | | Medio | ❌ (Lotes 1 y 2) |
+| **INV-L4** | Reabrir una sala no cambia ningún estado confirmado | | Medio | ❌ (Lote 2) |
 | **INV-L5** | El apagado no pierde nada confirmado | | Medio | ✅ |
 | **INV-L6** | Borrar una sala es atómico | | Medio | 🆕 (Lote 5) |
 | **INV-E1** | El esquema solo crece, y toda operación del log sigue siendo válida | ★ | Alto | ❌ (Lote 2) |
@@ -250,7 +250,7 @@ Estado en `50fe195` (ver §1.5). Los lotes son los del [plan de la Fase 3.9](pro
 
 #### INV-Y9 · La ventana de dedup es función del log
 **Enunciado.** La ventana de dedup de una sala son las claves de las últimas `dedup_lru_capacity` mutaciones distintas del log retenido, por orden de secuencia. Consultarla no la cambia, y es la misma antes y después de un respawn.
-**Sostenida por.** Hidratación por orden del log (§5.2 *Opening a Room*). *Pendiente (Lote 1):* hoy consultar la caché refresca la recencia de la clave.
+**Sostenida por.** Hidratación por orden del log (§5.2 *Opening a Room*), y una consulta que no cambia el orden de la ventana: reconocer un reintento no lo deja más tiempo en ella (§5.1 punto 4).
 **Cómo intentar romperla.** Reintentos de mutaciones viejas con la ventana llena; un respawn entre reintentos; un sidecar faltante o un segmento dañado.
 
 #### INV-Y5 · Un commit rechazado no deja rastro
@@ -300,7 +300,7 @@ Estado en `50fe195` (ver §1.5). Los lotes son los del [plan de la Fase 3.9](pro
 
 #### INV-R5 · Solo se anuncian y sirven snapshots usables, y una descarga es de un solo snapshot
 **Enunciado.** `Registered`, `HeartbeatAck`, `snapshot_available` y el chunk 0 solo ofrecen un snapshot con `tail_seq - 1 ≤ S ≤ head_seq` que no esté por debajo de un hueco conocido. Una descarga anclada por hash recibe chunks de un único snapshot, o `SnapshotSuperseded`; nunca bytes mezclados de dos. Mientras un snapshot está activo, el relay no lo reemplaza por uno de secuencia menor (después de que vence, o si al arrancar su archivo es ilegible, puede activarse otro menor).
-**Sostenida por.** §6 *Multipart Chunked Snapshot Transfer*, *Snapshot Relay*.
+**Sostenida por.** §6 *Multipart Chunked Snapshot Transfer*, *Snapshot Relay*; la marca de hueco que el actor le informa al relay (§5.2 *Damaged Segments*). *Pendiente (Lote 4):* la marca no cubre los snapshots por debajo del cursor que encontró el hueco.
 **Cómo intentar romperla.** Reemplazo del snapshot durante una descarga; reemplazo con la misma secuencia y otro contenido; reinicio con archivos `.snap` de distintas secuencias, vencidos o ilegibles; borrado y recreación de la sala durante una descarga; un snapshot marcado por un hueco que se pide desde el chunk 0.
 
 #### INV-R6 · Un snapshot solo se ofrece a la encarnación que lo aceptó
@@ -327,7 +327,7 @@ Estado en `50fe195` (ver §1.5). Los lotes son los del [plan de la Fase 3.9](pro
 
 #### INV-A3 · Los efectos de un miembro quedan confinados a su sala
 **Enunciado.** Un miembro hostil de una sala no puede degradar otras salas más allá de lo que acotan los límites globales (INV-B1 a INV-B3), ni alterar el estado de otro cliente de su sala (cursor, lease, registro, subida en curso ajena con la misma secuencia).
-**Sostenida por.** Dedup por cliente (D59), reglas del relay sobre quién reemplaza una subida, topes de SSE (D54) (§6, §7.2, §7.3).
+**Sostenida por.** Dedup por cliente (D59), reglas del relay sobre quién reemplaza una subida (las mismas para un chunk y para una subida en un solo request), topes de SSE (D54) (§6, §7.2, §7.3).
 **Cómo intentar romperla.** Commits con `mutation_id` ajenos; subidas que reemplazan la de otro; muchos streams SSE; registro y deregistro en bucle.
 **Límite aceptado.** Reemplazar una subida con una secuencia mayor, o subir un snapshot falso (DEF-81, §4). La subida de un miembro que no es el designado ancla la poda pero no congela la designación (D76, Lote 4).
 

@@ -8,6 +8,7 @@ use zemdb_core::schema::Schema;
 
 use crate::error::ServerError;
 use crate::log::RoomLifecyclePolicy;
+use crate::relay::LogBounds;
 
 /// Response returned to a client upon successful room registration.
 #[derive(Debug, Clone)]
@@ -153,11 +154,11 @@ pub enum RoomCommand {
         reply: oneshot::Sender<Result<RoomMetrics, ServerError>>,
     },
 
-    /// Query the retained log range as `(tail_seq, head_seq)`: the oldest retained sequence
-    /// and the highest committed one. The snapshot relay uses it to accept only snapshots a
-    /// client can catch up from.
+    /// Query the retained log range (the oldest retained sequence and the highest committed
+    /// one) and the snapshot sequence found to lie below a gap, if any. The snapshot relay
+    /// uses it to accept and serve only snapshots a client can catch up from.
     GetLogBounds {
-        reply: oneshot::Sender<Result<(SequenceNumber, SequenceNumber), ServerError>>,
+        reply: oneshot::Sender<Result<LogBounds, ServerError>>,
     },
 
     /// Query the confirmed cursor (last_ack_seq) for a registered client.

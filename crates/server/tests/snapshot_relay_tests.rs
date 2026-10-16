@@ -4,7 +4,7 @@
 mod common;
 
 use common::{
-    assert_binary_error, commit, envelope, make_test_op, register, TestServer, ADMIN_SECRET,
+    assert_binary_error, commit, envelope, make_test_op, register, token, TestServer, ADMIN_SECRET,
 };
 use reqwest::StatusCode;
 use zemdb_core::*;
@@ -36,14 +36,41 @@ fn room() -> RoomId {
 
 impl TestServer {
     async fn upload(&self, room_id: &RoomId, seq: u64, data: Vec<u8>) -> reqwest::Response {
+        self.upload_as(room_id, ADMIN_SECRET, seq, data).await
+    }
+
+    async fn upload_as(
+        &self,
+        room_id: &RoomId,
+        bearer: &str,
+        seq: u64,
+        data: Vec<u8>,
+    ) -> reqwest::Response {
         self.client
             .post(self.url(&format!("/rooms/{room_id}/snapshot/upload")))
-            .bearer_auth(ADMIN_SECRET)
+            .bearer_auth(bearer)
             .header("x-snapshot-head-seq", seq.to_string())
             .body(data)
             .send()
             .await
             .unwrap()
+    }
+
+    /// Uploads chunk `index` of `snapshot`, made of three 64 KiB chunks, at sequence 2.
+    async fn upload_chunk_as(&self, bearer: &str, snapshot: &[u8], index: u32) -> StatusCode {
+        let len = 64 * 1024;
+        let msg = ClientMessage::UploadSnapshotChunk {
+            correlation_id: CorrelationId::new(1),
+            room_id: room(),
+            snapshot_head_seq: SequenceNumber::new(2),
+            chunk_index: index,
+            total_chunks: 3,
+            total_bytes: snapshot.len() as u64,
+            snapshot_hash: ServerMessage::compute_snapshot_hash(snapshot),
+            data: snapshot[index as usize * len..][..len].to_vec().into(),
+        };
+        let path = "snapshot/upload-chunk";
+        self.post_message(&room(), path, bearer, &msg).await.0
     }
 
     async fn upload_ok(&self, seq: u64, data: Vec<u8>) {
@@ -104,6 +131,46 @@ async fn upload_not_newer_than_the_active_snapshot_is_superseded() {
     server.upload_ok(2, envelope(1000, 1)).await;
     let resp = server.upload(&room(), 1, envelope(1000, 2)).await;
     assert_binary_error(resp, StatusCode::CONFLICT, ErrorCode::SnapshotSuperseded).await;
+}
+
+/// A single-request upload replaces an upload in progress at the same sequence only where a
+/// chunk of its own could: the same member's, or any for the snapshot worker. Otherwise it is
+/// superseded and the upload in progress completes. Any upload at a higher sequence replaces it.
+#[tokio::test]
+async fn single_request_upload_replaces_an_upload_at_the_same_seq_only_where_a_chunk_could() {
+    let member = |id| token(&ClientId::new(id).unwrap(), &room());
+    let (alice, mallory) = (member("alice"), member("mallory"));
+    let (chunked, single) = (envelope(3 * 64 * 1024, 1), envelope(1000, 2));
+    for (chunked_by, single_by, single_seq, replaces) in [
+        (alice.as_str(), mallory.as_str(), 2, false),
+        (ADMIN_SECRET, mallory.as_str(), 2, false),
+        (alice.as_str(), alice.as_str(), 2, true),
+        (alice.as_str(), ADMIN_SECRET, 2, true),
+        (alice.as_str(), mallory.as_str(), 3, true),
+    ] {
+        let server = start_server(3).await;
+        let status = server.upload_chunk_as(chunked_by, &chunked, 0).await;
+        assert_eq!(status, StatusCode::OK);
+        let resp = server
+            .upload_as(&room(), single_by, single_seq, single.clone())
+            .await;
+        if replaces {
+            assert_eq!(resp.status(), StatusCode::OK);
+        } else {
+            assert_binary_error(resp, StatusCode::CONFLICT, ErrorCode::SnapshotSuperseded).await;
+            for index in [1, 2] {
+                let status = server.upload_chunk_as(chunked_by, &chunked, index).await;
+                assert_eq!(status, StatusCode::OK);
+            }
+        }
+        let served = if replaces { &single } else { &chunked };
+        let (_, reply) = server.request_chunk(0, None).await;
+        assert!(
+            matches!(reply, ServerMessage::SnapshotChunk { snapshot_hash, .. }
+                if snapshot_hash == ServerMessage::compute_snapshot_hash(served)),
+            "{reply:?}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -34,7 +34,13 @@ async fn snapshot_outside_the_log_range_is_rejected() {
     for n in [8, 21] {
         assert_bad_request(
             relay
-                .stage_snapshot(&room(), seq(n), data.clone(), bounds(10, 20))
+                .stage_snapshot(
+                    &room(),
+                    &Uploader::Admin,
+                    seq(n),
+                    data.clone(),
+                    bounds(10, 20),
+                )
                 .await,
         );
     }
@@ -42,11 +48,17 @@ async fn snapshot_outside_the_log_range_is_rejected() {
     assert!(files_in(&snapshots_dir(&dir)).is_empty());
 
     relay
-        .stage_snapshot(&room(), seq(9), data.clone(), bounds(10, 20))
+        .stage_snapshot(
+            &room(),
+            &Uploader::Admin,
+            seq(9),
+            data.clone(),
+            bounds(10, 20),
+        )
         .await
         .unwrap();
     relay
-        .stage_snapshot(&room(), seq(20), data, bounds(10, 20))
+        .stage_snapshot(&room(), &Uploader::Admin, seq(20), data, bounds(10, 20))
         .await
         .unwrap();
     assert_eq!(relay.active_snapshot_seq(&room()), Some(seq(20)));
@@ -108,6 +120,7 @@ async fn concurrent_stages_never_move_the_active_snapshot_backwards() {
                 let result = relay
                     .stage_snapshot(
                         &room(),
+                        &Uploader::Admin,
                         seq(n),
                         Bytes::from(envelope(4096, n as u8)),
                         bounds(0, 100),
@@ -399,6 +412,7 @@ async fn single_request_uploads_waiting_per_room_are_bounded() {
             relay
                 .stage_snapshot(
                     &room(),
+                    &Uploader::Admin,
                     seq(n),
                     Bytes::from(envelope(100, n as u8)),
                     async {
@@ -417,6 +431,7 @@ async fn single_request_uploads_waiting_per_room_are_bounded() {
         Duration::from_secs(5),
         relay.stage_snapshot(
             &room(),
+            &Uploader::Admin,
             seq(3),
             Bytes::from(envelope(100, 3)),
             bounds(0, 10),
@@ -429,7 +444,13 @@ async fn single_request_uploads_waiting_per_room_are_bounded() {
     // Other rooms are not affected, and the limit frees up once uploads finish.
     let other = RoomId::new("other-room").unwrap();
     relay
-        .stage_snapshot(&other, seq(1), Bytes::from(envelope(100, 1)), bounds(0, 10))
+        .stage_snapshot(
+            &other,
+            &Uploader::Admin,
+            seq(1),
+            Bytes::from(envelope(100, 1)),
+            bounds(0, 10),
+        )
         .await
         .unwrap();
     drop(gates);
@@ -552,10 +573,16 @@ async fn single_request_upload_is_in_progress_while_it_is_handled() {
         let relay = Arc::clone(&relay);
         async move {
             relay
-                .stage_snapshot(&room(), seq(5), Bytes::from(envelope(100, 1)), async {
-                    gate_rx.await.ok();
-                    Ok(log_bounds(0, 10))
-                })
+                .stage_snapshot(
+                    &room(),
+                    &Uploader::Admin,
+                    seq(5),
+                    Bytes::from(envelope(100, 1)),
+                    async {
+                        gate_rx.await.ok();
+                        Ok(log_bounds(0, 10))
+                    },
+                )
                 .await
         }
     });

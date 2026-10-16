@@ -53,6 +53,7 @@ async fn purge_removes_the_snapshot_the_upload_and_their_files() {
     relay
         .stage_snapshot(
             &neighbour,
+            &Uploader::Admin,
             seq(1),
             Bytes::from(envelope(100, 2)),
             bounds(0, 10),
@@ -77,10 +78,16 @@ async fn stage_that_was_under_way_when_the_room_was_deleted_is_dropped() {
     // The room is deleted while the upload waits for the log range, after it was tied to the
     // room's state.
     let result = relay
-        .stage_snapshot(&room(), seq(1), Bytes::from(envelope(100, 1)), async {
-            relay.purge_room(&room()).await.unwrap();
-            Ok(log_bounds(0, 10))
-        })
+        .stage_snapshot(
+            &room(),
+            &Uploader::Admin,
+            seq(1),
+            Bytes::from(envelope(100, 1)),
+            async {
+                relay.purge_room(&room()).await.unwrap();
+                Ok(log_bounds(0, 10))
+            },
+        )
         .await;
     assert_room_not_found(result);
     assert_eq!(relay.active_snapshot_seq(&room()), None);

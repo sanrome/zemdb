@@ -199,11 +199,13 @@ fn room_deletion_whose_client_disconnects_over_tcp_removes_the_room_and_its_snap
         let bounds = LogBounds {
             tail_seq: SequenceNumber::new(1),
             head_seq: SequenceNumber::new(1),
+            unrestorable_snapshot: None,
         };
         state
             .relay
             .stage_snapshot(
                 &room_id,
+                &crate::relay::Uploader::Admin,
                 SequenceNumber::new(1),
                 bytes::Bytes::from(envelope),
                 std::future::ready(Ok(bounds)),

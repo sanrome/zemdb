@@ -36,6 +36,7 @@ pub(super) fn log_bounds(tail: u64, head: u64) -> LogBounds {
     LogBounds {
         tail_seq: seq(tail),
         head_seq: seq(head),
+        unrestorable_snapshot: None,
     }
 }
 
@@ -61,6 +62,7 @@ pub(super) async fn stage(
     relay
         .stage_snapshot(
             &room(),
+            &Uploader::Admin,
             seq(n),
             Bytes::copy_from_slice(data),
             bounds(0, 100),

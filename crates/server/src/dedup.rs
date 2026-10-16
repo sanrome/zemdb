@@ -13,8 +13,9 @@ pub(crate) fn dedup_key(client_id: &ClientId, mutation_id: &MutationId) -> Mutat
     MutationId::new(std::array::from_fn(|i| hash.as_bytes()[i]))
 }
 
-/// Bounded in-memory LRU cache for mutation deduplication and Exactly-Once semantics, keyed
-/// by [`dedup_key`].
+/// Bounded in-memory cache for mutation deduplication and Exactly-Once semantics, keyed by
+/// [`dedup_key`]. Keys are evicted in the order they were recorded, and looking one up does not
+/// change that order, so the window is a function of the log, as rebuilt when the room reopens.
 ///
 /// Its memory grows with the entries it holds, not with its capacity: an idle room keeps an
 /// almost empty cache however large the capacity is.
@@ -37,13 +38,13 @@ impl DedupLruCache {
 
     /// Checks if the mutation of `key` has already been assigned a sequence number.
     ///
-    /// If present, returns the assigned `SequenceNumber` and refreshes its LRU recency.
-    pub fn is_duplicate(&mut self, key: &MutationId) -> Option<SequenceNumber> {
-        self.cache.get(key).copied()
+    /// If present, returns the assigned `SequenceNumber`, without making the key more recent.
+    pub fn is_duplicate(&self, key: &MutationId) -> Option<SequenceNumber> {
+        self.cache.peek(key).copied()
     }
 
     /// Records the key of a new mutation and its assigned sequence number into the cache,
-    /// evicting the least recently used entry when it is full.
+    /// evicting the oldest one when it is full.
     pub fn record(&mut self, key: MutationId, seq: SequenceNumber) {
         self.cache.put(key, seq);
         if self.cache.len() > self.capacity {

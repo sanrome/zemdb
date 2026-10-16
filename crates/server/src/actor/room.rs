@@ -26,7 +26,7 @@ use crate::dedup::{dedup_key, DedupLruCache};
 use crate::durable;
 use crate::error::ServerError;
 use crate::log::{retention, RoomLifecyclePolicy, TieredLog};
-use crate::relay::SnapshotRelay;
+use crate::relay::{LogBounds, SnapshotRelay};
 
 /// Period of the fast maintenance tick, which only touches memory (and the roster file when
 /// it changed): lease timeouts and state transitions, snapshot signals, roster persistence and
@@ -177,7 +177,7 @@ impl RoomActor {
             dedup_cache.capacity(),
         )?;
 
-        // Oldest first, so that recency is kept.
+        // Oldest first, so that the window evicts in log order, as it did before the reopen.
         dedup_cache.hydrate(recovered_mutations);
 
         let head_seq = tiered_log.head_seq();
@@ -439,7 +439,11 @@ impl RoomActor {
             }
 
             RoomCommand::GetLogBounds { reply } => {
-                let _ = reply.send(Ok((self.tiered_log.tail_seq(), self.head_seq)));
+                let _ = reply.send(Ok(LogBounds {
+                    tail_seq: self.tiered_log.tail_seq(),
+                    head_seq: self.head_seq,
+                    unrestorable_snapshot: self.unrestorable_snapshot,
+                }));
             }
 
             RoomCommand::GetClientCursor { client_id, reply } => {

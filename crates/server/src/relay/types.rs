@@ -31,13 +31,16 @@ pub struct LogBounds {
     pub tail_seq: SequenceNumber,
     /// Highest committed sequence number.
     pub head_seq: SequenceNumber,
+    /// Sequence of a snapshot the room found to lie below a gap of its log.
+    pub unrestorable_snapshot: Option<SequenceNumber>,
 }
 
 impl LogBounds {
     /// Whether a client restoring a snapshot at `seq` can catch up from the retained log:
-    /// `tail - 1 <= seq <= head`.
+    /// `tail - 1 <= seq <= head`, and the room found no gap after it.
     pub(super) fn admits(&self, seq: SequenceNumber) -> bool {
         retention::is_usable_snapshot(seq, self.tail_seq, self.head_seq)
+            && self.unrestorable_snapshot != Some(seq)
     }
 
     /// Rejects `seq` with `error` unless the range admits it.
@@ -50,8 +53,8 @@ impl LogBounds {
             Ok(())
         } else {
             Err(error(format!(
-                "Snapshot sequence {seq} is outside the range the room log can continue from \
-                 (tail {}, head {})",
+                "The room log cannot continue from snapshot sequence {seq} (tail {}, head {}, \
+                 or a gap after it)",
                 self.tail_seq, self.head_seq
             )))
         }

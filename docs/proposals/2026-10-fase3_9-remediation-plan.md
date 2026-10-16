@@ -114,14 +114,14 @@ Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las de
 | Orden | Lote | Ítems | Prioridad | Progreso |
 |---|---|---|---|---|
 | 0 | Contrato y redes de prueba | D70–D72, D78, D79, D88 | Inmediata (las redes viven en copias temporales) | ✅ |
-| 1 | Arreglos chicos de alto valor | DEF-146, 147, 155 | Inmediata | ⬜ 0/3 |
+| 1 | Arreglos chicos de alto valor | DEF-146, 147, 155 | Inmediata | ✅ 3/3 |
 | 2 | Abrir solo lo verificado y sincronizado | DEF-144, 145, 148, 158, 149 | Alta (requisito de Fase 4) | ⬜ 0/5 |
 | 3 | Storage: cancelación y absorción | DEF-150, 151 | Alta (requisito de Fase 4) | ⬜ 0/2 |
-| 4 | Recursos | DEF-152, 159, 153, 163, 162, 154, 157 | Media | ⬜ 0/7 |
+| 4 | Recursos | DEF-152, 159, 153, 163, 162, 164, 154, 157 | Media | ⬜ 0/8 |
 | 5 | Ciclo de vida | DEF-156, 160, 161 | Baja | ⬜ 0/3 |
 | 6 | Documentación | ARCHITECTURE, README, ROADMAP | Baja | ⬜ |
 
-**Avance total:** 0 de 20 ítems (Lote 0 cerrado: contrato y redes de prueba).
+**Avance total:** 3 de 21 ítems (Lote 0 cerrado: contrato y redes de prueba; Lote 1 cerrado).
 
 **Ítems nuevos de este plan.** Surgen de las invariantes adoptadas (D79) y de hallazgos de la auditoría que no tenían ID:
 - **DEF-159** · Medio · P6: reparto del presupuesto de respuestas.
@@ -129,6 +129,7 @@ Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las de
 - **DEF-161** · Bajo · P10: el relay de una sala recreada.
 - **DEF-162** · Bajo · P11: subida de un chunk confirmada fuera de rango.
 - **DEF-163** · Bajo · Designación congelada por una subida ajena.
+- **DEF-164** · Bajo · R5: la marca de hueco no cubre los snapshots por debajo del cursor que lo encontró (revisión de delta del Lote 1).
 
 **Por qué este orden, en una línea por lote:**
 0. Sin las redes de prueba en el repo, cada lote se revisa a mano. Las redes viven en copias que se pueden perder.
@@ -237,7 +238,7 @@ Los tests de ruptura (los que fallan en `50fe195`) no entran acá: entran con su
 
 > Objetivo: cerrar los defectos más probables en uso real, que además son los más baratos.
 
-#### DEF-146 · Medio · ⬜ Pendiente
+#### DEF-146 · Medio · ✅ Hecho
 **Problema.** `is_duplicate` usa `LruCache::get`, que refresca la recencia: el reintento de una mutación que está entre las últimas N puede secuenciarse otra vez, con o sin reapertura.
 **Solución.** P5: `peek` en lugar de `get`. Ajustar `full_cache_evicts_the_least_recently_used_entry`, que fija el comportamiento actual, y el doc de `is_duplicate`.
 **Test exigido.** Los de la auditoría:
@@ -246,15 +247,63 @@ Los tests de ruptura (los que fallan en `50fe195`) no entran acá: entran con su
 
 Además, que el mismo reintento reciba la misma respuesta antes y después de un respawn.
 
-#### DEF-147 · Medio · ⬜ Pendiente
+**Hecho.** `is_duplicate` usa `peek` y toma `&self`. Tests:
+- `full_cache_evicts_the_oldest_recorded_entry_even_if_it_was_just_found` (`src/tests/dedup.rs`) reemplaza a `full_cache_evicts_the_least_recently_used_entry`.
+- `after_a_respawn_a_retry_inside_the_dedup_window_is_recognised` (Lote 0, `actor/tests/room.rs`) pasa a llamarse `a_retry_inside_the_dedup_window_is_recognised_before_and_after_a_respawn`. Con la misma historia (1, 2, reintento de 1, 3), el reintento de 2 recibe la seq 2 antes y después del respawn, sin mover el head. Es el test de `inv/y`, y cubre "la misma respuesta antes y después de un respawn".
+
+**Desvío.** El de `inv/l` no se trajo: afirmaba que la mutación 1 seguía en la ventana antes de reabrir, y con P5 no sigue. Lo que quería probar (la misma ventana antes y después de reabrir) queda cubierto por el test anterior.
+
+Los dos tests fallan en `main`. Mutación verificada: con `get` fallan los dos.
+
+#### DEF-147 · Medio · ✅ Hecho
 **Problema.** El chunk 0 sirve un snapshot que la sala ya marcó como por debajo de un hueco.
 **Solución.** `GetLogBounds` devuelve también si el snapshot activo es usable (la marca de D62). El chunk 0 sin anclar lo trata como no usable: lo descarta y responde `RoomNotFound`, igual que a un snapshot fuera de rango.
 **Test exigido.** `audit_r5_chunk_zero_serves_a_snapshot_below_a_known_gap` (`inv/r`, o su gemelo en `inv/delta`).
 
-#### DEF-155 · Bajo · ⬜ Pendiente
+**Hecho.** `GetLogBounds` y `RoomManager::log_bounds` responden con `relay::LogBounds`, que suma `unrestorable_snapshot` (la marca de D62). `LogBounds::admits` la excluye. Así, el chunk 0 sin anclar descarta el snapshot marcado, y una subida nueva en esa secuencia se rechaza:
+- con `BadRequest` al empezar o en un solo request;
+- con `SnapshotSuperseded` al completarse.
+
+**Test.** `snapshot_below_a_gap_stops_being_usable` (`actor/tests/room.rs`), extendido con el escenario de `inv/r`:
+- después del hueco, el chunk 0 responde `RoomNotFound` y el relay se queda sin snapshot;
+- volver a subir en 2 recibe `BadRequest`;
+- el snapshot nuevo en 6 se sirve, porque una marca en otra secuencia no lo descarta.
+
+Falla en `main`. La simulación de onboarding ahora afirma que el chunk 0 nunca sirve el snapshot marcado; antes solo lo contaba.
+
+**Mutaciones verificadas:**
+- `admits` sin la marca;
+- solo el chunk 0 mirando la marca;
+- el actor informando `None`.
+
+**Desvíos.**
+- **La marca es la secuencia, no un booleano.** El chunk 0 la compara con la del snapshot que leyó del relay. Si ese snapshot se reemplaza entre las dos lecturas, no se descarta el nuevo por un booleano que hablaba del anterior.
+- **El snapshot se borra y su secuencia se rechaza.** D62 dejaba el snapshot marcado en el relay hasta que lo reemplazara otra subida o el TTL, y eso impedía volver a subir en la misma secuencia. Al descartarlo, una subida en esa secuencia se confirmaría sin ser usable (INV-R7), así que `admits` la rechaza.
+
+#### DEF-155 · Bajo · ✅ Hecho
 **Problema.** Una subida en un solo request de otro miembro, con la misma seq, descarta una subida por chunks en curso.
 **Solución.** `stage_snapshot` recibe el uploader. Si hay una subida con la misma seq que no le cede el lugar (`yields_to`), responde `SnapshotSuperseded`, la misma regla que ya rige para los chunks. Hay un prototipo validado en `inv/a/fix`.
 **Test exigido.** `inv_a3_foreign_upload_at_the_same_seq_survives_a_single_request_upload` (`inv/a`), contra la subida de otro miembro y contra la del worker.
+
+**Hecho.** `stage_snapshot` recibe el `Uploader` (el handler lo toma de `RelayAuth`). La regla se chequea bajo el lock del slot, después de vencer las subidas inactivas y del reintento idempotente.
+
+**Test.** `single_request_upload_replaces_an_upload_at_the_same_seq_only_where_a_chunk_could` (`tests/snapshot_relay_tests.rs`), el de `inv/a`, en una tabla:
+- **Contra otro miembro y contra el worker:** 409, y la subida por chunks termina y es la que se sirve.
+- **Control, lo que la regla sigue dejando pasar:** la subida del mismo miembro y la del worker reemplazan a la que estaba en curso, y la de otro miembro también si su secuencia es mayor.
+
+Falla en `main` en los dos primeros casos. Mutaciones verificadas: sin la guarda, con una guarda que ignora `yields_to` y con una que ignora la secuencia.
+
+**Cierre del lote.**
+- **Chequeos:** fmt, clippy, tests y doc en verde. 759 tests pasan y 36 están ignorados; antes del lote eran 758. Los tests nuevos se sumaron casi todos a tests existentes que ya tenían el mismo escenario.
+- **Versiones largas:** `cargo test -p zemdb-server --release -- --ignored`, 11 de 11 en verde.
+- **Revisión de delta:** la hizo un agente aparte, de contexto fresco y solo lectura.
+  - Los tres fixes cierran su escenario, y deshacer cada uno hace fallar un test.
+  - El diff no rompe ninguna invariante núcleo.
+  - Lo que encontró y entró en el lote: la subida en la secuencia marcada (ver DEF-147); el caso de otra secuencia en el test de DEF-155; la aserción en la simulación; y retoques de documentación.
+  - Lo que no entró: DEF-164 (preexistente, Lote 4) y una nota para los tests de DEF-153.
+- **Documentos:**
+  - `ARCHITECTURE.md`: §5.1 punto 4 y §5.2 (*Opening a Room* y *Damaged Segments*) para la ventana de dedup y la marca de hueco, y §6 para el chunk 0 y las subidas en un solo request. Esto adelanta el punto de §5.1 del Lote 6.
+  - `INVARIANTES.md`: Y4, Y9 y A3 en ✅; R5 queda ❌ por DEF-164 (Lote 4); L4 queda solo para el Lote 2.
 
 ---
 
@@ -347,6 +396,7 @@ Además, que el mismo reintento reciba la misma respuesta antes y después de un
 - `inv_b2_upload_resending_the_same_chunk_is_retained_without_deadline` (`inv/b`), adaptado: el reenvío no renueva el plazo y a los 2 minutos la subida se descarta.
 - Una subida que progresa pero supera `snapshot_upload_max_secs` se descarta.
 - Los dos casos con tiempo pausado.
+- Un miembro que reenvía un chunk retiene la secuencia también contra las subidas en un solo request de los demás (desde el Lote 1 siguen la misma regla): con D74, a los 2 minutos la secuencia queda libre.
 
 #### DEF-163 · Bajo · ⬜ Pendiente
 **Problema.** Cualquier subida en curso, de cualquier miembro, congela la designación del uploader.
@@ -359,6 +409,11 @@ Además, que el mismo reintento reciba la misma respuesta antes y después de un
 **Problema.** Una subida de un solo chunk no queda anclada entre la consulta del rango y el lock del slot, y se completa validando contra ese rango viejo. Puede responder `staged: true` con un snapshot que ya no es usable (P11).
 **Solución.** Validar el rango bajo el lock del slot con un rango leído después de tomarlo (o anclar la subida antes de pedir el rango, como la de un solo request). Si el snapshot ya no es usable, `SnapshotSuperseded`.
 **Test exigido.** `audit_one_chunk_upload_staged_after_pruning_passed_it` (`inv/r`), adaptado: responde `SnapshotSuperseded`.
+
+#### DEF-164 · Bajo · ⬜ Pendiente
+**Problema.** La marca de D62 guarda la secuencia del snapshot activo cuando un sync encuentra el hueco, no el cursor del sync. Un snapshot que se sube después con una secuencia entre la marca y ese cursor se anuncia y se sirve, aunque restaurarlo lleve al mismo hueco (INV-R5). Se corrige solo: el próximo cliente que choca con el hueco marca el nuevo. Bajo, y no Medio como la invariante, porque además hace falta un daño externo del log.
+**Solución.** Guardar como marca el mayor `from_seq` de los syncs que encontraron un hueco, y tratar como no usable todo snapshot con S ≤ marca: en `usable_snapshot_seq` y en `LogBounds::admits`.
+**Test exigido.** Con `small_segments`: commits 1 a 8, snapshot en 2, ack 8, se borra el segmento 5–6. Un cliente en 4 hace sync y recibe `BehindCompaction` (marca en 2). Un snapshot en 3 se acepta, `Registered` lo anuncia y el chunk 0 lo sirve, pero un sync desde 3 recibe `BehindCompaction`. Reproducido sobre el Lote 1 con un test temporal. Con el fix, la subida en 3 se rechaza.
 
 #### DEF-154 · Medio · ⬜ Pendiente
 **Problema.** La cuota no acota el disco de una sala: solo poda cold, la compresión está topada y los sidecars no cuentan.

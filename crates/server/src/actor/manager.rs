@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch, Mutex, OwnedMutexGuard};
 use tracing::info;
-use zemdb_core::id::{RoomId, SchemaId, SequenceNumber};
+use zemdb_core::id::{RoomId, SchemaId};
 use zemdb_core::schema::Schema;
 
 use crate::actor::command::RoomCommand;
@@ -21,7 +21,7 @@ use crate::durable;
 use crate::error::ServerError;
 use crate::fail_point;
 use crate::log::{RoomLifecycleOverrides, RoomLifecyclePolicy};
-use crate::relay::SnapshotRelay;
+use crate::relay::{LogBounds, SnapshotRelay};
 use crate::schema_registry::SchemaRegistry;
 
 /// File, inside the room directory, recording the room's schema assignment and lifecycle
@@ -544,12 +544,9 @@ impl RoomManager {
         }
     }
 
-    /// Retained log range of a room as `(tail_seq, head_seq)`, spawning its actor if needed.
-    /// A room that does not exist is `RoomNotFound`.
-    pub async fn log_bounds(
-        &self,
-        room_id: &RoomId,
-    ) -> Result<(SequenceNumber, SequenceNumber), ServerError> {
+    /// Retained log range of a room, and the snapshot it found to lie below a gap, spawning
+    /// its actor if needed. A room that does not exist is `RoomNotFound`.
+    pub async fn log_bounds(&self, room_id: &RoomId) -> Result<LogBounds, ServerError> {
         self.ask(room_id, |reply| RoomCommand::GetLogBounds { reply })
             .await?
     }

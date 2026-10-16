@@ -587,9 +587,9 @@ async fn log_bounds_report_the_retained_range() {
         .unwrap();
     }
 
-    let (tail_seq, head_seq) = fx.manager.log_bounds(&fx.room_id).await.unwrap();
-    assert_eq!(head_seq, seq(3));
-    assert_eq!(tail_seq, metrics(&sender).await.tail_seq);
+    let bounds = fx.manager.log_bounds(&fx.room_id).await.unwrap();
+    assert_eq!(bounds.head_seq, seq(3));
+    assert_eq!(bounds.tail_seq, metrics(&sender).await.tail_seq);
 
     let missing = RoomId::new("missing").unwrap();
     assert!(matches!(
@@ -638,11 +638,13 @@ async fn snapshot_below_the_retained_range_does_not_anchor_pruning() {
     fx.relay
         .stage_snapshot(
             &fx.room_id,
+            &crate::relay::Uploader::Admin,
             seq(1),
             snapshot_envelope(),
             std::future::ready(Ok(crate::relay::LogBounds {
                 tail_seq: seq(0),
                 head_seq: seq(100),
+                unrestorable_snapshot: None,
             })),
         )
         .await
@@ -1057,10 +1059,13 @@ async fn snapshot_wanted(sender: &mpsc::Sender<RoomCommand>, client_id: &ClientI
 /// Stages a snapshot at `n` in the relay, accepted against the room's current log range.
 async fn stage_snapshot_at(fx: &Fixture, n: u64) {
     fx.relay
-        .stage_snapshot(&fx.room_id, seq(n), snapshot_envelope(), async {
-            let (tail_seq, head_seq) = fx.manager.log_bounds(&fx.room_id).await?;
-            Ok(crate::relay::LogBounds { tail_seq, head_seq })
-        })
+        .stage_snapshot(
+            &fx.room_id,
+            &crate::relay::Uploader::Admin,
+            seq(n),
+            snapshot_envelope(),
+            fx.manager.log_bounds(&fx.room_id),
+        )
         .await
         .unwrap();
 }
@@ -1218,10 +1223,34 @@ async fn snapshot_below_a_gap_stops_being_usable() {
     let hb = gap().await;
     assert_eq!(hb.active_snapshot_seq, None);
     assert!(hb.snapshot_wanted);
+    // Nor is it served to a client that saw it announced and starts a download now.
+    let first_chunk = async || {
+        let bounds = fx.manager.log_bounds(&fx.room_id);
+        let correlation_id = zemdb_core::id::CorrelationId::new(1);
+        fx.relay
+            .get_chunk(correlation_id, &fx.room_id, 0, 0, None, bounds)
+            .await
+    };
+    let res = first_chunk().await;
+    assert!(matches!(res, Err(ServerError::RoomNotFound(_))), "{res:?}");
+    assert_eq!(fx.relay.active_snapshot_seq(&fx.room_id), None);
+    // Nor is a new upload at its sequence accepted.
+    let res = fx
+        .relay
+        .stage_snapshot(
+            &fx.room_id,
+            &crate::relay::Uploader::Admin,
+            seq(2),
+            snapshot_envelope(),
+            fx.manager.log_bounds(&fx.room_id),
+        )
+        .await;
+    assert!(matches!(res, Err(ServerError::BadRequest(_))), "{res:?}");
 
-    // A snapshot above the gap is offered, also after another client runs into the gap.
+    // A snapshot above the gap is offered and served, also after another client runs into it.
     stage_snapshot_at(&fx, 6).await;
     assert_eq!(gap().await.active_snapshot_seq, Some(seq(6)));
+    first_chunk().await.unwrap();
     fx.manager.shutdown_all().await;
 }
 
@@ -1308,10 +1337,7 @@ async fn upload_chunk(fx: &Fixture, n: u64, index: u32) -> bool {
                 snapshot_hash: hash,
                 data: bytes::Bytes::copy_from_slice(&data[start..end]),
             },
-            async {
-                let (tail_seq, head_seq) = fx.manager.log_bounds(&fx.room_id).await?;
-                Ok(crate::relay::LogBounds { tail_seq, head_seq })
-            },
+            fx.manager.log_bounds(&fx.room_id),
         )
         .await
         .unwrap()
@@ -1562,11 +1588,13 @@ async fn register_reports_only_a_usable_snapshot() {
     fx.relay
         .stage_snapshot(
             &fx.room_id,
+            &crate::relay::Uploader::Admin,
             seq(1),
             snapshot_envelope(),
             std::future::ready(Ok(crate::relay::LogBounds {
                 tail_seq: seq(0),
                 head_seq: seq(100),
+                unrestorable_snapshot: None,
             })),
         )
         .await
@@ -1789,7 +1817,7 @@ async fn reopening_hydrates_dedup_without_reading_segments() {
         io_probe::count(IoEvent::SegmentRead, &segments) - reads_before,
         0
     );
-    // Hydrated oldest first: 8 is the least recently used and the first to be evicted.
+    // Hydrated oldest first: 8 is the oldest and the first to be evicted.
     let new = commit(&sender, &client, mutation(11), seq(0), insert_op(11))
         .await
         .unwrap();
@@ -2112,10 +2140,10 @@ async fn commit_catchups_and_sync_chains_deliver_the_exact_suffix() {
     fx.manager.shutdown_all().await;
 }
 
-/// With a window of two mutations, mutations 2 and 3 are the last ones when the room
-/// respawns: the deduplication window hydrated from the log recognises a retry of 2.
+/// With a window of two mutations, mutations 2 and 3 are the last ones: a retry of 2 is
+/// recognised before and after a respawn, although the recognised retry of 1 came later.
 #[tokio::test]
-async fn after_a_respawn_a_retry_inside_the_dedup_window_is_recognised() {
+async fn a_retry_inside_the_dedup_window_is_recognised_before_and_after_a_respawn() {
     let fx = Fixture::with_options(
         RoomLifecycleOverrides::default(),
         |config| config.dedup_lru_capacity = 2,
@@ -2137,14 +2165,18 @@ async fn after_a_respawn_a_retry_inside_the_dedup_window_is_recognised() {
     commit(&sender, &client, mutation(3), seq(0), insert_op(3))
         .await
         .unwrap();
-    fx.manager.shutdown_all().await;
 
-    let sender = fx.sender().await;
-    let retry = commit(&sender, &client, mutation(2), seq(0), insert_op(2))
-        .await
-        .unwrap();
-    assert_eq!(retry.assigned_seq, seq(2));
-    assert_eq!(metrics(&sender).await.head_seq, seq(3));
+    for respawned in [false, true] {
+        if respawned {
+            fx.manager.shutdown_all().await;
+        }
+        let sender = fx.sender().await;
+        let retry = commit(&sender, &client, mutation(2), seq(0), insert_op(2))
+            .await
+            .unwrap();
+        assert_eq!(retry.assigned_seq, seq(2), "respawned: {respawned}");
+        assert_eq!(metrics(&sender).await.head_seq, seq(3));
+    }
     fx.manager.shutdown_all().await;
 }
 
@@ -2321,7 +2353,6 @@ mod onboarding_sim {
         gaps: u64,
         designee_away: u64,
         newcomer_away: u64,
-        chunk0_below_known_gap: u64,
         prune_checks: u64,
         prunes: u64,
         demand_expired_while_waiting: u64,
@@ -2456,6 +2487,7 @@ mod onboarding_sim {
             LogBounds {
                 tail_seq: a.tiered_log.tail_seq(),
                 head_seq: a.head_seq,
+                unrestorable_snapshot: a.unrestorable_snapshot,
             }
         }
 
@@ -2730,11 +2762,16 @@ mod onboarding_sim {
                 }
                 let bounds = self.bounds();
                 let room = self.room_id.clone();
+                let uploader = Uploader::Client(self.clients[i].id.clone());
                 let res = self
                     .relay()
-                    .stage_snapshot(&room, seq(s), bytes::Bytes::from(data.clone()), async {
-                        Ok(bounds)
-                    })
+                    .stage_snapshot(
+                        &room,
+                        &uploader,
+                        seq(s),
+                        bytes::Bytes::from(data.clone()),
+                        async { Ok(bounds) },
+                    )
                     .await;
                 match res {
                     Ok(hash) => {
@@ -2864,11 +2901,11 @@ mod onboarding_sim {
                                 && snapshot_head_seq <= b.head_seq,
                             "chunk 0 served a snapshot outside the retained range"
                         );
-                        // Not checked: the first chunk does not yet know the gaps the room
-                        // found after a snapshot.
-                        if Some(snapshot_head_seq) == self.a().unrestorable_snapshot {
-                            self.stats.chunk0_below_known_gap += 1;
-                        }
+                        assert_ne!(
+                            Some(snapshot_head_seq),
+                            self.a().unrestorable_snapshot,
+                            "chunk 0 served a snapshot below a known gap"
+                        );
                         self.clients[i].phase = Phase::Downloading {
                             since,
                             seq: snapshot_head_seq.get(),

@@ -140,7 +140,8 @@ impl Drop for PendingUpload<'_> {
 }
 
 impl SnapshotRelay {
-    /// Stages a complete snapshot uploaded in one request and returns its BLAKE3 hash.
+    /// Stages a complete snapshot uploaded in one request and returns its BLAKE3 hash. An
+    /// upload in progress at the same sequence is replaced only if it yields to `uploader`.
     ///
     /// `log_bounds` resolves to the room's retained log range; it is awaited after the request
     /// is tied to the room's current state, so a room deleted meanwhile is reported as not
@@ -148,6 +149,7 @@ impl SnapshotRelay {
     pub async fn stage_snapshot(
         &self,
         room_id: &RoomId,
+        uploader: &Uploader,
         head_seq: SequenceNumber,
         data: Bytes,
         log_bounds: impl Future<Output = Result<LogBounds, ServerError>>,
@@ -177,6 +179,11 @@ impl SnapshotRelay {
         if self.is_active(room_id, head_seq, &snapshot_hash) {
             // A retry of an upload that already succeeded.
             return Ok(snapshot_hash);
+        }
+        if matches!(&guard.upload, Some(u) if u.head_seq == head_seq && !u.yields_to(uploader)) {
+            return Err(ServerError::SnapshotSuperseded(format!(
+                "Another upload for sequence {head_seq} of room {room_id} is in progress"
+            )));
         }
         self.check_newer_than_active(room_id, head_seq)?;
 

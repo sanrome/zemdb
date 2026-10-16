@@ -17,18 +17,18 @@ fn new_cache_does_not_reserve_its_capacity() {
 }
 
 #[test]
-fn full_cache_evicts_the_least_recently_used_entry() {
+fn full_cache_evicts_the_oldest_recorded_entry_even_if_it_was_just_found() {
     let mut cache = DedupLruCache::new(2);
     cache.record(id(1), SequenceNumber::new(1));
     cache.record(id(2), SequenceNumber::new(2));
-    // Using 1 makes 2 the least recently used.
+    // Finding 1 does not make it more recent than 2.
     assert_eq!(cache.is_duplicate(&id(1)), Some(SequenceNumber::new(1)));
 
     cache.record(id(3), SequenceNumber::new(3));
 
     assert_eq!(cache.len(), 2);
-    assert_eq!(cache.is_duplicate(&id(2)), None);
-    assert_eq!(cache.is_duplicate(&id(1)), Some(SequenceNumber::new(1)));
+    assert_eq!(cache.is_duplicate(&id(1)), None);
+    assert_eq!(cache.is_duplicate(&id(2)), Some(SequenceNumber::new(2)));
     assert_eq!(cache.is_duplicate(&id(3)), Some(SequenceNumber::new(3)));
 }
 

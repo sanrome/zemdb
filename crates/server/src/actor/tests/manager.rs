@@ -4,6 +4,7 @@ use crate::durable;
 use crate::fail_point;
 use std::time::Duration;
 use tempfile::{tempdir, TempDir};
+use zemdb_core::id::SequenceNumber;
 use zemdb_core::value::DataType;
 
 fn new_manager(dir: &TempDir) -> RoomManager {
@@ -592,8 +593,8 @@ async fn requests_racing_an_inactivity_shutdown_are_never_refused() {
     let actors = manager.next_actor_id.load(Ordering::Relaxed);
     assert!(actors >= 3, "the room restarted only {} times", actors - 1);
     // Every acknowledged commit is in the log exactly once.
-    let (_, head_seq) = manager.log_bounds(&room_id).await.unwrap();
-    assert_eq!(head_seq, SequenceNumber::new(commits));
+    let bounds = manager.log_bounds(&room_id).await.unwrap();
+    assert_eq!(bounds.head_seq, SequenceNumber::new(commits));
     manager.shutdown_all().await;
 }
 
@@ -625,7 +626,10 @@ async fn panic_while_handling_a_command_is_internal_and_queued_commands_are_unav
 
     // The next request reopens the room from disk.
     let bounds = manager.log_bounds(&room_id).await.unwrap();
-    assert_eq!(bounds, (SequenceNumber::new(1), SequenceNumber::new(0)));
+    assert_eq!(
+        (bounds.tail_seq, bounds.head_seq),
+        (SequenceNumber::new(1), SequenceNumber::new(0))
+    );
     manager.shutdown_all().await;
 }
 
@@ -780,9 +784,9 @@ async fn command_refused_by_a_closing_mailbox_goes_to_the_respawned_room() {
     drop(receiver);
     exit_tx.send_replace(Some(ActorExit::Stopped));
 
-    let bounds = request.await.unwrap();
+    let bounds = request.await.unwrap().unwrap();
     assert_eq!(
-        bounds.unwrap(),
+        (bounds.tail_seq, bounds.head_seq),
         (SequenceNumber::new(1), SequenceNumber::new(0))
     );
     manager.shutdown_all().await;

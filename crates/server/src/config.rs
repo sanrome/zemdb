@@ -63,7 +63,7 @@ pub struct ServerConfig {
     /// (seconds, default 30 days).
     pub forget_dormant_after_secs: u64,
 
-    /// Maximum number of mutation IDs retained in the deduplication LRU cache per room.
+    /// Maximum number of mutation IDs retained in the deduplication cache per room.
     pub dedup_lru_capacity: usize,
 
     /// TTL duration for staged snapshots in the relay before eviction (seconds, default 7 days).
