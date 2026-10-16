@@ -1,6 +1,6 @@
 # Invariantes de ZemDB
 
-**Estado:** Borrador para revisión (15 de Octubre de 2026, sobre `6485f46`, después del plan de la Fase 3.8)
+**Estado:** Vigente. Versión 2 (16 de Octubre de 2026): incorpora las decisiones de la [Fase 3.9](proposals/2026-10-fase3_9-remediation-plan.md) (D70–D72, D77–D79) tomadas sobre la [primera auditoría por invariantes](audits/2026-10-invariantes-audit.md). La versión 1 (15 de Octubre, sobre `6485f46`) es la que se auditó.
 **Uso:** base de las auditorías por invariantes y de los tests de propiedades. Reemplaza a las auditorías abiertas por perspectiva ("buscá errores desde X").
 **Contrato de referencia:** [`ARCHITECTURE.md`](../ARCHITECTURE.md). Las invariantes se enuncian sobre el comportamiento observable y remiten a la sección que lo describe; no citan líneas de código, para que el documento no envejezca con cada refactor.
 
@@ -45,9 +45,18 @@ Una auditoría por invariantes está **en verde** cuando:
 
 Con dos auditorías seguidas en verde, el código auditado se considera estable y las rondas siguientes se limitan a revisar el delta de cada cambio contra esta lista.
 
-### 1.5. Reparto sugerido
+### 1.5. Estado de cada invariante
 
-Un auditor por grupo (§3.1 a §3.9). Cada uno recibe este documento, `ARCHITECTURE.md`, la lista de riesgos aceptados (§4) y las decisiones de los planes de remediación (D1 a D68), y responde solo con veredictos.
+La columna **Estado** del resumen (§3) dice cómo quedó cada invariante en la última auditoría y qué lote del plan vigente la cierra:
+- ✅ se sostuvo;
+- ❌ se rompió, y entre paréntesis va el lote que la arregla;
+- 🆕 es nueva y todavía no se auditó, y entre paréntesis va el lote que la implementa, si hace falta código.
+
+Cada lote que cierra una ruptura actualiza esta columna en el mismo commit (§5).
+
+### 1.6. Reparto sugerido
+
+Un auditor por grupo (§3.1 a §3.9). Cada uno recibe este documento, `ARCHITECTURE.md`, la lista de riesgos aceptados (§4) y las decisiones de los planes de remediación (D1 a D88), y responde solo con veredictos.
 
 ---
 
@@ -74,48 +83,60 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 
 ### Resumen
 
-| ID | Invariante | ★ | Si se rompe |
-|---|---|---|---|
-| **INV-D1** | Un commit confirmado sobrevive a un crash | ★ | Alto |
-| **INV-D2** | Un número de secuencia nunca se reutiliza | ★ | Alto |
-| **INV-D3** | La recuperación nunca descarta datos durables ni acepta basura | ★ | Alto |
-| **INV-D4** | Los metadatos se reemplazan atómicamente | | Medio |
-| **INV-D5** | Una sala tiene un solo dueño | ★ | Alto |
-| **INV-S1** | `apply_batch`: éxito durable o ningún efecto | ★ | Alto |
-| **INV-S2** | Los lectores ven siempre un prefijo del WAL | | Medio |
-| **INV-S3** | Un crash en cualquier paso del storage se recupera al mismo estado | ★ | Alto |
-| **INV-S4** | Abrir una sala nunca descarta datos | ★ | Alto |
-| **INV-S5** | `apply_snapshot`: valida todo y reemplaza atómicamente, o no cambia nada | | Medio |
-| **INV-Y1** | Orden total contiguo por sala | ★ | Alto |
-| **INV-Y2** | Entrega exacta: ni huecos, ni duplicados, ni cambios | ★ | Alto |
-| **INV-Y3** | Quedarse atrás siempre se señala | ★ | Alto |
-| **INV-Y4** | Idempotencia por cliente dentro de la ventana | | Medio |
-| **INV-Y5** | Un commit rechazado no deja rastro | | Medio |
-| **INV-Y6** | Los cursores solo avanzan por lo que el cliente confirmó | | Medio |
-| **INV-Y7** | Un cursor de otra encarnación nunca se acepta | | Medio |
-| **INV-Y8** | Réplicas con el mismo prefijo convergen | ★ | Alto |
-| **INV-R1** | La poda por cursores nunca borra lo que alguien necesita | ★ | Alto |
-| **INV-R2** | El rango retenido es contiguo y su cola no retrocede | | Medio |
-| **INV-R3** | Perder estado volátil del roster solo cuesta retención o re-registro | | Medio |
-| **INV-R4** | Todo cliente que se queda atrás termina pudiendo ponerse al día | | Medio |
-| **INV-R5** | Solo se anuncian y sirven snapshots usables, y una descarga es de un solo snapshot | | Medio |
-| **INV-A1** | Nadie actúa sobre otra sala ni como otro cliente | ★ | Alto |
-| **INV-A2** | Nada se decodifica antes de autenticar, salvo lo acotado de `/register` | | Alto |
-| **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio |
-| **INV-A4** | Ningún identificador produce rutas fuera de `data_dir` | ★ | Alto |
-| **INV-B1** | La memoria por request está acotada | ★ | Alto |
-| **INV-B2** | Nada se retiene sin plazo | | Medio |
-| **INV-B3** | La memoria, el disco y los FDs del servidor están acotados por la configuración | | Medio |
-| **INV-B4** | El costo por request del actor no depende de la historia ni del roster | | Medio |
-| **INV-L1** | Toda request recibe una respuesta, en tiempo acotado | | Medio |
-| **INV-L2** | Cancelar una request nunca deja estado a medias | | Medio |
-| **INV-L3** | Un I/O incierto nunca se confirma como éxito | ★ | Alto |
-| **INV-L4** | Reabrir una sala no cambia ningún estado confirmado | | Medio |
-| **INV-L5** | El apagado no pierde nada confirmado | | Medio |
-| **INV-E1** | El esquema solo crece, y toda operación del log sigue siendo válida | ★ | Alto |
-| **INV-E2** | Un cliente con el esquema viejo siempre puede enterarse | | Bajo |
-| **INV-W1** | Ninguna entrada hace entrar en pánico, abortar ni reservar de más | ★ | Alto |
-| **INV-W2** | Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum | | Medio |
+Estado en `50fe195` (ver §1.5). Los lotes son los del [plan de la Fase 3.9](proposals/2026-10-fase3_9-remediation-plan.md).
+
+| ID | Invariante | ★ | Si se rompe | Estado |
+|---|---|---|---|---|
+| **INV-D1** | Un commit confirmado sobrevive a un crash | ★ | Alto | ❌ (Lote 2) |
+| **INV-D2** | Un número de secuencia nunca se reutiliza | ★ | Alto | ❌ (Lote 2) |
+| **INV-D3** | La recuperación nunca descarta datos durables ni acepta basura | ★ | Alto | ❌ (Lote 2) |
+| **INV-D4** | Los metadatos se reemplazan atómicamente | | Medio | ✅ |
+| **INV-D5** | Una sala tiene un solo dueño | ★ | Alto | ❌ (Lote 2) |
+| **INV-D6** | Un solo proceso por `data_dir` | ★ | Alto | 🆕 (Lote 2) |
+| **INV-D7** | Nada es visible antes de ser durable en este proceso | ★ | Alto | 🆕 (Lote 2) |
+| **INV-D8** | El piso de secuencia vive fuera del log | ★ | Alto | 🆕 (Lote 2) |
+| **INV-D9** | Los metadatos se verifican antes de usarse | ★ | Alto | 🆕 (Lote 2) |
+| **INV-S1** | `apply_batch`: éxito durable o ningún efecto | ★ | Alto | ❌ (Lote 3) |
+| **INV-S2** | Los lectores ven siempre un prefijo del WAL | | Medio | ✅ |
+| **INV-S3** | Un crash en cualquier paso del storage se recupera al mismo estado | ★ | Alto | ❌ (Lote 3) |
+| **INV-S4** | Abrir una sala nunca descarta datos | ★ | Alto | ✅ |
+| **INV-S5** | `apply_snapshot`: valida todo y reemplaza atómicamente, o no cambia nada | | Medio | ✅ |
+| **INV-S6** | Memoria igual a disco | | Medio | 🆕 (Lote 3) |
+| **INV-Y1** | Orden total contiguo por sala | ★ | Alto | ✅ |
+| **INV-Y2** | Entrega exacta: ni huecos, ni duplicados, ni cambios | ★ | Alto | ✅ |
+| **INV-Y3** | Quedarse atrás siempre se señala | ★ | Alto | ✅ |
+| **INV-Y4** | Idempotencia por cliente dentro de la ventana | | Medio | ❌ (Lote 1) |
+| **INV-Y5** | Un commit rechazado no deja rastro | | Medio | ✅ |
+| **INV-Y6** | Los cursores solo avanzan por lo que el cliente confirmó | | Medio | ✅ |
+| **INV-Y7** | Un registro con cursor de otra encarnación nunca se acepta | | Medio | ✅ |
+| **INV-Y8** | Réplicas con el mismo prefijo convergen | ★ | Alto | ✅ |
+| **INV-Y9** | La ventana de dedup es función del log | | Medio | 🆕 (Lote 1) |
+| **INV-R1** | La poda por cursores nunca borra lo que alguien necesita | ★ | Alto | ✅ |
+| **INV-R2** | El rango retenido es contiguo y su cola no retrocede | | Medio | ✅ |
+| **INV-R3** | Perder estado volátil del roster solo cuesta retención o re-registro | | Medio | ✅ |
+| **INV-R4** | Todo cliente que se queda atrás termina pudiendo ponerse al día | | Medio | ✅ |
+| **INV-R5** | Solo se anuncian y sirven snapshots usables, y una descarga es de un solo snapshot | | Medio | ❌ (Lote 1) |
+| **INV-R6** | Un snapshot solo se ofrece a la encarnación que lo aceptó | | Medio | 🆕 (Lote 5) |
+| **INV-R7** | Una subida confirmada es usable | | Bajo | 🆕 (Lote 4) |
+| **INV-A1** | Nadie actúa sobre otra sala ni como otro cliente | ★ | Alto | ✅ |
+| **INV-A2** | Nada se decodifica antes de autenticar, salvo lo acotado de `/register` | | Alto | ✅ |
+| **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio | ❌ (Lote 1) |
+| **INV-A4** | Ningún identificador produce rutas fuera de `data_dir` | ★ | Alto | ✅ |
+| **INV-B1** | La memoria por request está acotada | ★ | Alto | ❌ (Lote 4) |
+| **INV-B2** | Nada se retiene sin plazo | | Medio | ❌ (Lote 4) |
+| **INV-B3** | La memoria, el disco y los FDs del servidor están acotados por la configuración | | Medio | ❌ (Lote 4) |
+| **INV-B4** | El costo por request del actor no depende de la historia | | Medio | ❌ (Lote 4) |
+| **INV-B5** | Ningún cliente acapara un recurso global | | Medio | 🆕 (Lote 4) |
+| **INV-L1** | Toda request recibe una respuesta, en tiempo acotado | | Medio | ✅ |
+| **INV-L2** | Cancelar una request nunca deja estado a medias | | Medio | ❌ (Lotes 3 y 5) |
+| **INV-L3** | Un I/O incierto nunca se confirma como éxito | ★ | Alto | ❌ (Lote 2) |
+| **INV-L4** | Reabrir una sala no cambia ningún estado confirmado | | Medio | ❌ (Lotes 1 y 2) |
+| **INV-L5** | El apagado no pierde nada confirmado | | Medio | ✅ |
+| **INV-L6** | Borrar una sala es atómico | | Medio | 🆕 (Lote 5) |
+| **INV-E1** | El esquema solo crece, y toda operación del log sigue siendo válida | ★ | Alto | ❌ (Lote 2) |
+| **INV-E2** | Un cliente con el esquema viejo siempre puede enterarse | | Bajo | ✅ |
+| **INV-W1** | Ninguna entrada hace entrar en pánico, abortar ni reservar de más | ★ | Alto | ✅ |
+| **INV-W2** | Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum | | Medio | ❌ (Lote 2) |
 
 ---
 
@@ -124,19 +145,20 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 #### INV-D1 ★ · Un commit confirmado sobrevive a un crash
 **Enunciado.** Si el servidor envió un `CommitAck` con la secuencia `s`, después de un crash o corte de energía en cualquier punto, al reabrir la sala la operación está en el log con la secuencia `s` y el mismo contenido, o `s < tail_seq` porque una poda legítima la borró (INV-R1).
 **Sostenida por.** `sync_data` de `active.wal` antes de responder; sync del directorio al crear `active.wal` y al sellar segmentos; compresión a cold con tmp, sync, rename, sync y verificación antes de borrar el warm (`ARCHITECTURE.md` §5.2).
-**Cómo intentar romperla.** Crash (fail point) entre cada paso de: append, rotación, escritura del sidecar `.ids`, compresión, borrado del warm, poda, escritura de `log_meta.json`. Una sala que se apaga por inactividad durante la rotación. Un `fsync` que falla y una request reintentada.
+**Cómo intentar romperla.** Crash (fail point) entre cada paso de: append, rotación, escritura del sidecar `.ids`, compresión, borrado del warm, poda, escritura de `log_meta.json`. Una sala que se apaga por inactividad durante la rotación. Un `fsync` que falla y una request reintentada (ver INV-D7).
 **Automatizable.** Simulación con fail points en cada paso y comparación contra el conjunto de `CommitAck` enviados.
 
 #### INV-D2 ★ · Un número de secuencia nunca se reutiliza
 **Enunciado.** Una secuencia que la sala asignó (y que pudo haberse entregado) nunca se asigna a otra operación: tampoco después de podar todo, de reiniciar, de perder o dañar segmentos, ni de recrear el `active.wal`. Nunca se asigna `u64::MAX`.
-**Sostenida por.** `head_seq` sale del máximo entre los nombres de segmento, `active.wal` y `log_meta.json`; `log_meta.json` se escribe antes de borrar; `checked_add` y rechazo de `u64::MAX` (D66) (§5.1, §5.2 *Durable Sequence Floor*, *Damaged Segments*).
-**Cómo intentar romperla.** Podar todos los segmentos y reiniciar; borrar a mano el último segmento; `active.wal` con cola rota; error de `stat` en `active.wal` (D67); crash entre el rename de rotación y el sync del directorio.
+**Sostenida por.** `head_seq` sale del máximo entre los nombres de segmento, `active.wal` y `log_meta.json`; `log_meta.json` se escribe antes de borrar; `checked_add` y rechazo de `u64::MAX` (D66) (§5.1, §5.2 *Durable Sequence Floor*, *Damaged Segments*); el piso de secuencia de INV-D8; INV-D7 para lo que se confirma al reabrir.
+**Excepción (D78).** Si se daña el último frame de `active.wal` y no hay ningún frame válido después, no se distingue de una escritura rota (INV-D3): se trunca, y su secuencia puede reutilizarse si no aparece en ningún otro archivo durable (INV-D8).
+**Cómo intentar romperla.** Podar todos los segmentos y reiniciar; perder el último segmento sellado; `active.wal` con cola rota; error de `stat` en `active.wal` (D67); crash entre el rename de rotación y el sync del directorio; un `fsync` fallido seguido de un corte de energía.
 
 #### INV-D3 ★ · La recuperación nunca descarta datos durables ni acepta basura
 **Enunciado.** Al abrir un log (servidor o storage), un daño seguido de un frame válido es corrupción y no se trunca nada; un daño sin frames válidos después es *torn write* y se trunca solo desde el daño. Ningún frame cuyo header o payload no pase su CRC se interpreta como operación.
 **Sostenida por.** Header con CRC propio (D46), `find_valid_frame`, clasificación compartida en `zemdb-core` (§8 *Physical WAL Framing*).
-**Cómo intentar romperla.** Daño en cada byte del header y del payload, cola de ceros, frame válido embebido como valor dentro de un payload, más de 16 payloads dañados seguidos, lectores con buffers que cortan en cualquier punto, la excepción de `.wal.compacting`.
-**Automatizable.** proptest: logs aleatorios con un corte o un daño en una posición aleatoria; oráculo = el prefijo de frames anteriores al daño.
+**Cómo intentar romperla.** Daño en cada byte del header y del payload, cola de ceros, frame válido embebido como valor dentro de un payload (un frame embebido puede convertir una escritura rota en corrupción: es un riesgo aceptado, §4), más de 16 payloads dañados seguidos, lectores con buffers que cortan en cualquier punto, la excepción de `.wal.compacting`. Un `log_meta.json` dañado que haga borrar segmentos al abrir (ver INV-D9).
+**Automatizable.** Logs aleatorios con un corte o un daño en una posición aleatoria; oráculo = el prefijo de frames anteriores al daño.
 
 #### INV-D4 · Los metadatos se reemplazan atómicamente
 **Enunciado.** Después de un crash, `meta_room.json`, el roster, `schemas/{id}.json`, `log_meta.json` y los sidecars `.ids` están en su versión anterior completa o en la nueva completa; nunca mezclados ni vacíos. Un archivo ilegible hace fallar la apertura (o, en el roster y los sidecars, se descarta con las consecuencias documentadas), nunca se lo toma por vacío o inexistente.
@@ -146,7 +168,27 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 #### INV-D5 ★ · Una sala tiene un solo dueño
 **Enunciado.** En ningún momento dos actores, dos procesos ni dos instancias del storage escriben los archivos de la misma sala. Un respawn empieza recién cuando el actor anterior soltó los archivos.
 **Sostenida por.** `log.lock` y el lock de `active.wal` (servidor), `room_{id}.lock` y el lock del WAL (storage), spawn lock por sala y aviso de fin del actor (§5.2 *Room Log Lock*, §5.4, §8 *Room Lock*).
-**Cómo intentar romperla.** Respawn mientras el actor viejo drena su cola o comprime al apagarse; `delete_room` concurrente con `get_or_spawn`; un `tokio::fs` en vuelo después de soltar la sala; la ventana de la rotación de compactación.
+**Cómo intentar romperla.** Respawn mientras el actor viejo drena su cola o comprime al apagarse; `delete_room` concurrente con `get_or_spawn`; un `tokio::fs` en vuelo después de soltar la sala (ver INV-L2); la ventana de la rotación de compactación; un segundo proceso que borra la sala (ver INV-D6).
+
+#### INV-D6 ★ · Un solo proceso por `data_dir`
+**Enunciado.** Un segundo proceso servidor sobre un `data_dir` que ya usa otro se niega a arrancar antes de tocar ningún archivo (salas, relay, esquemas). Ningún proceso borra ni recrea los archivos de una sala cuyo log tiene abierto otro.
+**Sostenida por.** *Pendiente (Lote 2, D83):* lock exclusivo de `data_dir` al arrancar; `delete_room` toma el `log.lock` de la sala antes de borrarla.
+**Cómo intentar romperla.** Dos servidores sobre el mismo directorio, con arranques solapados; borrado y recreación de una sala desde el segundo proceso.
+
+#### INV-D7 ★ · Nada es visible antes de ser durable en este proceso
+**Enunciado.** Ningún dato leído al abrir (un registro de `active.wal`, una entrada de directorio, el WAL del storage) se sirve, se deduplica ni se confirma antes de que lo cubra un `fsync` exitoso hecho por este proceso, aunque lo haya escrito una encarnación anterior del actor o del proceso.
+**Sostenida por.** *Pendiente (Lote 2, D77):* `sync_all` de `active.wal` y sync de los directorios del camino al abrir el log; lo mismo para el WAL y `data_dir` en `open_room` del storage. Riesgo aceptado: el EIO de Linux (§4).
+**Cómo intentar romperla.** Un `fsync` que falla, seguido de reapertura y reintento del mismo commit; un sync de directorio que falla y un intento posterior que adopta el archivo; el corte de energía se simula truncando cada archivo a su último largo sincronizado.
+
+#### INV-D8 ★ · El piso de secuencia vive fuera del log
+**Enunciado.** Al abrir, `head_seq` nunca es menor que una secuencia que conste como asignada en cualquier archivo durable del servidor: nombres de segmentos y de sidecars, `active.wal` y `log_meta.json` (que guarda el fin del último segmento sellado y el de la última poda). Perder un segmento deja un hueco, que se reporta como `BehindCompaction` (INV-Y3), nunca secuencias reutilizables.
+**Sostenida por.** *Pendiente (Lote 2, D81).* Hoy: los nombres de segmento, `active.wal` y `pruned_through_seq`.
+**Cómo intentar romperla.** Perder el segmento sellado más nuevo justo después de una rotación (sin `active.wal`); perder segmentos después de una poda total; una rotación interrumpida entre el sellado y la escritura de `log_meta.json`.
+
+#### INV-D9 ★ · Los metadatos se verifican antes de usarse
+**Enunciado.** Todo JSON persistido que decide algo (`log_meta.json`, `meta_room.json`, `schemas/{id}.json`, el roster) se verifica con un checksum antes de usarse. Si no verifica, cuenta como ilegible: falla la apertura, o el roster se descarta con un warning. Abrir un log nunca borra un archivo a partir de un valor que no verificó.
+**Sostenida por.** *Pendiente (Lote 2, D82).* Los sidecars, los frames del WAL, el `.snap` y el envelope `ZMSN` ya tienen CRC.
+**Cómo intentar romperla.** Un bit invertido en cada campo de cada JSON que lo deje válido; un archivo truncado; la línea del checksum faltante o con otro valor.
 
 ### 3.2. Durabilidad del storage (cliente)
 
@@ -167,14 +209,20 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 **Automatizable.** Simulación: secuencia aleatoria de batches, compactaciones y snapshots con un crash aleatorio; oráculo = un `MemoryStorageEngine` con las mismas operaciones confirmadas.
 
 #### INV-S4 ★ · Abrir una sala nunca descarta datos
-**Enunciado.** `open_room` con un esquema que no cubre los datos de la sala falla con `SchemaMismatch` antes de modificar cualquier archivo. Ninguna operación del WAL ni fila del snapshot se descarta en silencio.
+**Enunciado.** `open_room` con un esquema que no cubre los datos de la sala falla con `SchemaMismatch` antes de modificar cualquier archivo que tenga datos de la sala (antes del chequeo puede crear el lock y un WAL o `.snap` vacíos, y borrar temporales `.snap.tmp.*`). Ninguna operación del WAL ni fila del snapshot se descarta en silencio.
 **Sostenida por.** D55 (§8 *Opening Requires a Schema That Covers the Room's Data*).
 **Cómo intentar romperla.** Tabla presente solo en `.wal.compacting`; tabla vacía en el snapshot; esquema con la tabla pero con otro id; torn write en el mismo WAL que trae la tabla desconocida.
 
 #### INV-S5 · `apply_snapshot` valida todo y reemplaza atómicamente, o no cambia nada
-**Enunciado.** Un snapshot con otra `head_seq` que la anunciada, una tabla fuera del esquema o una fila inválida se rechaza sin tocar la sala. Uno aceptado reemplaza esquema, head y tablas de una vez. La sala nunca retrocede. Ninguna declaración interna del snapshot reserva más memoria que la que ocupan sus bytes.
+**Enunciado.** Un snapshot con otra `head_seq` que la anunciada, una tabla fuera del esquema o una fila inválida se rechaza sin tocar la sala. Uno aceptado reemplaza esquema, head y tablas de una vez. Si la E/S falla después del rename, la llamada devuelve error, la sala queda `RoomFailed` y al reabrirla aparece el snapshot nuevo. La sala nunca retrocede. Ninguna declaración interna del snapshot reserva más memoria que una constante más lo que ocupan sus bytes.
 **Sostenida por.** D48 (§8 *apply_snapshot Rules*, *Bounded Snapshot Decompression*).
 **Cómo intentar romperla.** Snapshots fabricados (longitudes declaradas enormes, cuentas de filas falsas, filas con clave distinta de la columna PK, compresión que no termina en la longitud declarada); cierre de la sala durante la decodificación.
+
+#### INV-S6 · Memoria igual a disco
+**Enunciado.** Mientras una sala del storage no esté `RoomFailed`, lo que devuelven `get`, `scan` y `get_head_seq` es exactamente lo que daría cerrarla y reabrirla con el mismo esquema (módulo los `Null` al final de las filas, INV-Y8).
+**Sostenida por.** Solo se aplican batches sincronizados; el camino vivo y el replay usan el mismo `apply_operation` (§8). *Pendiente (Lote 3, D86):* una operación de archivo que aterriza después de reabrir.
+**Cómo intentar romperla.** Comparar después de cada paso de una secuencia aleatoria de batches, compactaciones, snapshots, cancelaciones y reaperturas.
+**Automatizable.** Las simulaciones de storage del Lote 0 ya lo comprueban en cada paso.
 
 ### 3.3. Secuencia y entrega
 
@@ -190,7 +238,7 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 **Automatizable.** Simulación: oráculo = vector de operaciones aceptadas; cualquier cursor válido reconstruye su sufijo exacto.
 
 #### INV-Y3 ★ · Quedarse atrás siempre se señala
-**Enunciado.** Si el cursor de un cliente ya no se puede servir desde el log (`c < tail_seq - 1`, o un hueco en el rango), la próxima operación del cliente que lleva ese cursor recibe `BehindCompaction`. Ninguna poda, TTL, cuota ni daño deja a un cliente atrás sin que se entere.
+**Enunciado.** Si el cursor de un cliente ya no se puede servir desde el log (`c < tail_seq - 1`, o un hueco en el rango), la próxima operación del cliente que lleva ese cursor recibe `BehindCompaction`, o una respuesta que lo obliga a un sync que lo recibe: el registro (que informa `tail_seq`), un reintento deduplicado (catch-up vacío con `has_more`) y un ack o commit con un cursor válido y un hueco después (`head_seq` mayor que el cursor, o `has_more`). Ninguna poda, TTL, cuota ni daño deja a un cliente atrás sin que se entere.
 **Sostenida por.** `log::retention`, chequeos en sync, ack y commit (§7.2 *Retention Contract*).
 **Cómo intentar romperla.** Poda por TTL entre el registro y el primer sync; cliente `Dormant` que vuelve; ack con un cursor más viejo que el guardado; heartbeat (que no falla por diseño: verificar que el cliente igual se entere en su próxima operación con cursor).
 
@@ -198,28 +246,33 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 **Enunciado.** Un reintento del mismo `(client_id, mutation_id)` mientras su clave esté en la ventana de dedup devuelve la secuencia original y no se secuencia otra vez, también después de un respawn o reinicio (ventana hidratada desde `active.wal` y los sidecars). El mismo `mutation_id` de otro cliente es una mutación nueva.
 **Sostenida por.** D59, D57 (§5.1 punto 4, §5.2 *Opening a Room*).
 **Cómo intentar romperla.** Reintento después de un fallo de append, de un respawn, con un sidecar dañado o faltante, con un segmento sellado dañado; reintento concurrente con el original.
-**Límite aceptado.** Fuera de la ventana un reintento se aplica de nuevo (DEF-85, §4).
+**Límite aceptado.** Fuera de la ventana un reintento se aplica de nuevo (DEF-85, §4). Qué es la ventana lo define INV-Y9.
+
+#### INV-Y9 · La ventana de dedup es función del log
+**Enunciado.** La ventana de dedup de una sala son las claves de las últimas `dedup_lru_capacity` mutaciones distintas del log retenido, por orden de secuencia. Consultarla no la cambia, y es la misma antes y después de un respawn.
+**Sostenida por.** Hidratación por orden del log (§5.2 *Opening a Room*). *Pendiente (Lote 1):* hoy consultar la caché refresca la recencia de la clave.
+**Cómo intentar romperla.** Reintentos de mutaciones viejas con la ventana llena; un respawn entre reintentos; un sidecar faltante o un segmento dañado.
 
 #### INV-Y5 · Un commit rechazado no deja rastro
-**Enunciado.** Un commit que recibe cualquier error que no sea "el actor se detuvo después de escribir" (`InvalidSequence`, `BehindCompaction`, `SchemaViolation`, `BadRequest`, `ClientNotRegistered`) no cambia el log, el head, el cursor del cliente, el dedup ni emite eventos SSE.
+**Enunciado.** Un commit que recibe cualquier error que no sea "el actor se detuvo después de escribir" (`InvalidSequence`, `BehindCompaction`, `SchemaViolation`, `BadRequest`, `ClientNotRegistered`) no cambia el log, el head, el cursor del cliente ni el dedup, y no emite `head_advanced`. Un rechazo por `BehindCompaction` puede dejar al cliente `Bootstrapping` y hacer que la sala pida un snapshot (con el evento `snapshot_wanted`): eso no es rastro de la mutación.
 **Sostenida por.** El orden de chequeos de `handle_commit` (§7.2 *Ordering*, *Size of a single mutation*).
 **Cómo intentar romperla.** Cada causa de rechazo combinada con un `mutation_id` repetido; operación justo por encima de cada límite de tamaño.
 
 #### INV-Y6 · Los cursores solo avanzan por lo que el cliente confirmó
-**Enunciado.** El cursor de un cliente nunca retrocede, nunca supera `head_seq` y solo avanza hasta un valor que el cliente reportó (`ack_seq`, el `from_seq` de un sync servido, el `last_ack_seq` de un commit aceptado o de un reintento deduplicado). Un heartbeat no lo mueve.
+**Enunciado.** Entre dos registros, el cursor de un cliente nunca retrocede, nunca supera `head_seq` y solo avanza hasta un valor que el cliente reportó (`ack_seq`, el `from_seq` de un sync servido, el `last_ack_seq` de un commit aceptado o de un reintento deduplicado). Un heartbeat no lo mueve. Un registro lo redefine al `current_seq` que reporta el cliente (o lo deja sin cursor): un valor más bajo solo hace retener más log.
 **Sostenida por.** `ClientLeaseTracker::observe` (§5.2 *Client Lifecycle States*).
 **Cómo intentar romperla.** Acks desordenados o repetidos; sync rechazado; commit rechazado; registro con cursor sobre un cliente existente.
 
-#### INV-Y7 · Un cursor de otra encarnación nunca se acepta
-**Enunciado.** Un registro con `current_seq` y una encarnación distinta (o ausente) recibe `RoomReset` sin tocar el roster. La encarnación sobrevive a reinicios, reaperturas y reasignaciones de esquema, y una sala recreada tiene otra.
-**Sostenida por.** D58 (§6 *Room incarnation*).
-**Cómo intentar romperla.** Sala sin `meta_room.json` creada por `get_or_spawn`; delete y create concurrentes; un cliente que se registra sin cursor y después opera con uno viejo (sync, ack o commit con un cursor de la sala anterior).
+#### INV-Y7 · Un registro con cursor de otra encarnación nunca se acepta
+**Enunciado.** Un registro con `current_seq` y una encarnación distinta (o ausente) recibe `RoomReset` sin tocar el roster. La encarnación sobrevive a reinicios, reaperturas y reasignaciones de esquema, y una sala recreada tiene otra. La garantía cubre el registro (D70). Que un cliente que se registró sin cursor no use después un cursor guardado (en sync, ack o commit) es una regla del SDK: arranca de 0 o de un snapshot.
+**Sostenida por.** D58, D70 (§6 *Room incarnation*).
+**Cómo intentar romperla.** Sala sin `meta_room.json` creada por `get_or_spawn`; delete y create concurrentes; registros con y sin cursor, con encarnaciones viejas, nuevas y ausentes.
 
 #### INV-Y8 ★ · Réplicas con el mismo prefijo convergen
-**Enunciado.** Dos réplicas honestas que aplican el mismo prefijo del log, en cualquier combinación de "aplicar operaciones" y "restaurar un snapshot tomado en `S` y aplicar desde `S`", terminan con el mismo estado. Aplicar una operación es una función determinista del estado y la operación (upsert del `Insert`, merge por campo del `Update`, tombstone del `Delete`).
+**Enunciado.** Dos réplicas honestas que aplican el mismo prefijo del log, en cualquier combinación de "aplicar operaciones" y "restaurar un snapshot tomado en `S` y aplicar desde `S`", terminan con el mismo estado. "Mismo estado" quiere decir las mismas filas módulo los `Null` al final (D71): un `Update` ensancha la fila hasta el ancho del esquema con que se aplica, y `compact_into_row` completa con `Null`. Aplicar una operación es una función determinista del estado y la operación (upsert del `Insert`, merge por campo del `Update`, tombstone del `Delete`).
 **Sostenida por.** `apply_operation` en storage, `Schema::validate_operation` (§4, §10.1).
 **Cómo intentar romperla.** `Update` sobre una fila inexistente o borrada; `Update` de una columna agregada después (filas cortas); snapshot de un motor aplicado en el otro; -0.0 y NaN en claves.
-**Automatizable.** proptest: log aleatorio; oráculo = aplicar todo desde cero contra snapshot en un punto aleatorio + resto, en los dos motores.
+**Automatizable.** Log aleatorio; oráculo = aplicar todo desde cero contra snapshot en un punto aleatorio + resto, en los dos motores.
 **Fuera de alcance.** Un snapshot falso de un miembro hostil (DEF-81).
 
 ### 3.4. Retención y onboarding
@@ -235,20 +288,30 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 **Cómo intentar romperla.** Warm que no se pudo comprimir delante de colds vencidos; borrado de warm fallido; segmentos con rangos solapados en disco.
 
 #### INV-R3 · Perder estado volátil del roster solo cuesta retención o re-registro
-**Enunciado.** Un crash o un pánico pierde como mucho ~1 s de cambios del roster, y eso solo puede causar más retención, un `ClientNotRegistered` seguido de un re-registro, o un snapshot de más. Nunca una entrega incorrecta ni la poda de algo que un cliente `Connected` necesitaba.
+**Enunciado.** Un crash o un pánico pierde como mucho ~1 s de cambios del roster (cursores, registros y estados; la última actividad, `last_seen`, puede perder más, ver §5.2 *Client Roster Persistence*), y eso solo puede causar más retención, un `ClientNotRegistered` seguido de un re-registro, o un snapshot de más. Nunca una entrega incorrecta ni la poda de algo que un cliente `Connected` necesitaba.
 **Sostenida por.** D56, persistencia antes de cualquier poda que borre (§5.2 *Client Roster Persistence*).
 **Cómo intentar romperla.** Crash entre un registro y el tick; crash entre un ack y la poda que dispara; roster ilegible al abrir.
 
 #### INV-R4 · Todo cliente que se queda atrás termina pudiendo ponerse al día
-**Enunciado.** Mientras exista al menos un cliente `Connected` que siga el protocolo, todo cliente `Bootstrapping` termina viendo un snapshot usable anunciado, puede descargarlo y ponerse al día desde él. No hay estados sin salida: snapshot por debajo de un hueco, subida que falla al completarse, designado que se va, snapshot vencido, demanda vencida.
+**Enunciado.** Mientras exista al menos un cliente `Connected` que siga el protocolo y cuyo estado esté más allá de todo hueco del log, todo cliente `Bootstrapping` termina viendo un snapshot usable anunciado, puede descargarlo y ponerse al día desde él. No hay estados sin salida: snapshot por debajo de un hueco, subida que falla al completarse, designado que se va, snapshot vencido, demanda vencida.
 **Sostenida por.** Demanda de snapshot y designación (§5.2 *Snapshot Demand*), D61, D62.
 **Cómo intentar romperla.** Cada transición de la demanda combinada con reinicios; el único `Connected` es el designado y se desconecta; la subida completa justo cuando TTL mueve la cola; hueco que aparece después de anunciar el snapshot.
-**Automatizable.** Simulación con muchos clientes y crashes: propiedad de liveness acotada ("en N ticks").
+**Automatizable.** Simulación con muchos clientes y crashes: propiedad de liveness acotada ("en N ticks"). Está en el repo desde el Lote 0.
 
 #### INV-R5 · Solo se anuncian y sirven snapshots usables, y una descarga es de un solo snapshot
-**Enunciado.** `Registered`, `HeartbeatAck`, `snapshot_available` y el chunk 0 solo ofrecen un snapshot con `tail_seq - 1 ≤ S ≤ head_seq` que no esté por debajo de un hueco conocido. Una descarga anclada por hash recibe chunks de un único snapshot, o `SnapshotSuperseded`; nunca bytes mezclados de dos. El snapshot activo nunca retrocede.
+**Enunciado.** `Registered`, `HeartbeatAck`, `snapshot_available` y el chunk 0 solo ofrecen un snapshot con `tail_seq - 1 ≤ S ≤ head_seq` que no esté por debajo de un hueco conocido. Una descarga anclada por hash recibe chunks de un único snapshot, o `SnapshotSuperseded`; nunca bytes mezclados de dos. Mientras un snapshot está activo, el relay no lo reemplaza por uno de secuencia menor (después de que vence, o si al arrancar su archivo es ilegible, puede activarse otro menor).
 **Sostenida por.** §6 *Multipart Chunked Snapshot Transfer*, *Snapshot Relay*.
-**Cómo intentar romperla.** Reemplazo del snapshot durante una descarga; reemplazo con la misma secuencia y otro contenido; reinicio con archivos `.snap` de distintas secuencias, vencidos o ilegibles; borrado y recreación de la sala durante una descarga.
+**Cómo intentar romperla.** Reemplazo del snapshot durante una descarga; reemplazo con la misma secuencia y otro contenido; reinicio con archivos `.snap` de distintas secuencias, vencidos o ilegibles; borrado y recreación de la sala durante una descarga; un snapshot marcado por un hueco que se pide desde el chunk 0.
+
+#### INV-R6 · Un snapshot solo se ofrece a la encarnación que lo aceptó
+**Enunciado.** Un snapshot que el relay aceptó para una encarnación de una sala nunca se anuncia, ancla ni sirve en otra encarnación con el mismo id, aunque la sala se haya recreado sin pasar por `delete_room`.
+**Sostenida por.** `delete_room` purga el relay (§6 *Room deletion*). *Pendiente (Lote 5, D84):* `create_room` también lo purga.
+**Cómo intentar romperla.** Recrear una sala cuyo directorio se perdió, con un snapshot viejo todavía en el relay; reinicio del servidor entre medio.
+
+#### INV-R7 · Una subida confirmada es usable
+**Enunciado.** Si el relay confirma una subida (`SnapshotStaged` o `staged: true`), el snapshot es usable en ese momento (INV-R5). Si el rango retenido se movió y ya no lo es, la respuesta es `SnapshotSuperseded`.
+**Sostenida por.** D61 para las subidas de varios chunks. *Pendiente (Lote 4):* las de un solo chunk.
+**Cómo intentar romperla.** Podas por cursores, TTL y cuota entre la consulta del rango y la instalación, en subidas de un request, de un chunk y de varios.
 
 ### 3.5. Aislamiento y autorización
 
@@ -266,7 +329,7 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 **Enunciado.** Un miembro hostil de una sala no puede degradar otras salas más allá de lo que acotan los límites globales (INV-B1 a INV-B3), ni alterar el estado de otro cliente de su sala (cursor, lease, registro, subida en curso ajena con la misma secuencia).
 **Sostenida por.** Dedup por cliente (D59), reglas del relay sobre quién reemplaza una subida, topes de SSE (D54) (§6, §7.2, §7.3).
 **Cómo intentar romperla.** Commits con `mutation_id` ajenos; subidas que reemplazan la de otro; muchos streams SSE; registro y deregistro en bucle.
-**Límite aceptado.** Reemplazar una subida con una secuencia mayor, o subir un snapshot falso (DEF-81, §4).
+**Límite aceptado.** Reemplazar una subida con una secuencia mayor, o subir un snapshot falso (DEF-81, §4). La subida de un miembro que no es el designado ancla la poda pero no congela la designación (D76, Lote 4).
 
 #### INV-A4 ★ · Ningún identificador produce rutas fuera de `data_dir`
 **Enunciado.** Ningún `RoomId`, `SchemaId`, `ClientId`, secuencia ni hash produce una ruta fuera de `data_dir`, ni dos identificadores distintos producen el mismo archivo (incluidos sistemas de archivos que no distinguen mayúsculas).
@@ -276,37 +339,42 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 ### 3.6. Recursos acotados
 
 #### INV-B1 ★ · La memoria por request está acotada
-**Enunciado.** Ninguna request reserva más memoria que una cota fija por request (body ≤ `MAX_FRAME_SIZE`, ≤ `MAX_MESSAGE_VALUES` valores decodificados, respuesta ≤ `MAX_FRAME_SIZE`), y la memoria de respuestas retenidas en todo el servidor está acotada por `max_inflight_response_bytes`.
-**Sostenida por.** D44, D53 (§7.2 *Defensive Bounding*, §7.3).
-**Cómo intentar romperla.** Longitudes declaradas enormes; cuerpos que se descomprimen; muchos streams HTTP/2 con respuestas grandes sin leer; commits cuyo catch-up se queda sin presupuesto.
-**Automatizable.** Fuzzing del decoder con un asignador que cuente bytes.
+**Enunciado.** Ninguna request reserva más memoria que una cota fija por request: un body de hasta `MAX_FRAME_SIZE`, hasta `MAX_MESSAGE_VALUES` valores decodificados y una respuesta de hasta `MAX_FRAME_SIZE`. Ninguna respuesta materializa más de `MAX_MESSAGE_VALUES` valores, y lo que retienen las lecturas (presupuesto de lectura, HotBuffer) se cuenta por lo que ocupa en memoria, no por su tamaño de wire. La memoria de todas las respuestas retenidas en el servidor, incluidas `Schema` y `Registered` y los buffers de HTTP/2, está acotada por `max_inflight_response_bytes`.
+**Sostenida por.** D44, D53 (§7.2 *Defensive Bounding*, §7.3). *Pendiente (Lote 4, D73):* cobrar la memoria real, pedir el presupuesto antes de codificar, `Schema`/`Registered` bajo presupuesto, `max_send_buf_size`.
+**Cómo intentar romperla.** Longitudes declaradas enormes; cuerpos que se descomprimen; muchos streams HTTP/2 con respuestas grandes sin leer; commits cuyo catch-up se queda sin presupuesto; tablas de miles de columnas con filas de `Null`; respuestas `/schema` sin leer.
+**Automatizable.** Fuzzing de los decoders (en el repo desde el Lote 0) y conteo de los valores que materializa cada respuesta.
 
 #### INV-B2 · Nada se retiene sin plazo
-**Enunciado.** Ninguna conexión, body, respuesta, permiso de conexión, subida ni designación se retiene más que un plazo configurado sin progreso del cliente: headers, body por tasa mínima, *stall* de respuesta, inactividad de subidas, designación de 60 s. La única excepción es un stream SSE sano, acotado en cantidad por cliente y en total.
-**Sostenida por.** D45, D53, D54 (§7.3).
-**Cómo intentar romperla.** Cliente que lee un byte por plazo; ventana HTTP/2 que se achica; stream SSE semiabierto (residuo aceptado, §4).
+**Enunciado.** Ninguna conexión, body, respuesta, permiso de conexión, subida ni designación se retiene más que un plazo configurado sin progreso del cliente: headers, body por tasa mínima, *stall* de respuesta, inactividad de subidas, designación de 60 s. En una subida, solo un chunk que todavía no se había recibido cuenta como progreso, y además tiene un tope total de duración (D74). La única excepción es un stream SSE sano, acotado en cantidad por cliente y en total.
+**Sostenida por.** D45, D53, D54 (§7.3). *Pendiente (Lote 4, D74, D76):* el progreso y el tope de las subidas, y la designación que solo congela la subida del designado o del worker.
+**Cómo intentar romperla.** Cliente que lee un byte por plazo; ventana HTTP/2 que se achica; reenviar un chunk ya recibido; subir un chunk por plazo; stream SSE semiabierto (residuo aceptado, §4).
 
 #### INV-B3 · La memoria, el disco y los FDs del servidor están acotados por la configuración
-**Enunciado.** Con salas, clientes y tiempo ilimitados, la memoria del servidor está acotada por la configuración y la cantidad de salas abiertas: HotBuffer por bytes, dedup por capacidad, roster que olvida `Dormant`, `room_meta` y spawn locks solo de salas vivas, relay con un snapshot por sala, subidas pendientes y SSE con tope. El disco por sala está acotado por la cuota más un snapshot. Los FDs, por las conexiones más dos por sala abierta.
-**Sostenida por.** D47, D50 (§5.2, §5.3, §7.3).
+**Enunciado.** Con salas, clientes y tiempo ilimitados, la memoria del servidor está acotada por la configuración y la cantidad de salas abiertas: HotBuffer por lo que ocupa en memoria (INV-B1), dedup por capacidad, roster que olvida `Dormant`, `room_meta` y spawn locks solo de salas vivas, relay con un snapshot por sala, subidas pendientes y SSE con tope. El disco del log de una sala está acotado por la cuota (que cuenta los sidecars) más `active.wal` y lo escrito durante una pasada de mantenimiento; el relay suma el snapshot activo y, durante una subida, el archivo parcial. Los FDs, por las conexiones más dos por sala abierta más los transitorios del pool bloqueante, que también están acotados.
+**Sostenida por.** D47, D50 (§5.2, §5.3, §7.3). *Pendiente (Lote 4, D69, D73):* la cuota sobre warm y sidecars; la HotBuffer por memoria.
 **Cómo intentar romperla.** Miles de salas abiertas y cerradas; clientes que nunca se deregistran; cientos de miles de `mutation_id` distintos; subidas abandonadas.
 
-#### INV-B4 · El costo por request del actor no depende de la historia ni del roster
-**Enunciado.** Ninguna request (commit, ack, registro, heartbeat, sync) ni la apertura de una sala hace trabajo O(historia retenida) ni O(clientes) × fsync en el actor. La compresión corre fuera del worker. La apertura cuesta O(`dedup_lru_capacity` + `active.wal`).
-**Sostenida por.** D56, D57, D47 (§5.2 *Opening a Room*, *Blocking I/O in the Actor*, *Client Roster Persistence*).
-**Cómo intentar romperla.** Medir con 10⁵ operaciones retenidas, 10³ clientes y operaciones de 20 KB: tormenta de registros, acks dentro de `active.wal`, reaperturas por heartbeat.
+#### INV-B4 · El costo por request del actor no depende de la historia
+**Enunciado.** Ninguna request (commit, ack, registro, heartbeat, sync) hace trabajo O(historia retenida) ni O(clientes) × fsync en el actor; recorrer el roster en memoria (O(clientes) sin E/S) está permitido. La compresión corre fuera del worker. La apertura cuesta O(`dedup_lru_capacity` + `active.wal` + roster) más un listado de los segmentos, que la cuota acota (INV-B3).
+**Sostenida por.** D56, D57, D47 (§5.2 *Opening a Room*, *Blocking I/O in the Actor*, *Client Roster Persistence*). *Pendiente (Lote 4):* que el sync no recorra el índice de segmentos desde el inicio.
+**Cómo intentar romperla.** Medir con 10⁵ operaciones retenidas, 10³ clientes y operaciones de 20 KB: tormenta de registros, acks dentro de `active.wal`, reaperturas por heartbeat, decenas de miles de segmentos.
+
+#### INV-B5 · Ningún cliente acapara un recurso global
+**Enunciado.** Ningún cliente (un par sala y `client_id`, o el admin secret en el relay) retiene más que una parte configurada de un recurso que comparten todas las salas: el presupuesto de respuestas en vuelo y los streams SSE. Lo que excede su parte se le rechaza a él (`Unavailable`, `RateLimited`), no a las demás salas.
+**Sostenida por.** D54 para SSE. *Pendiente (Lote 4, D75):* el tope por cliente del presupuesto de respuestas.
+**Cómo intentar romperla.** Un miembro de una sala que no lee sus respuestas en muchos streams y conexiones, mientras otra sala hace `/sync`; muchos streams SSE del mismo cliente.
 
 ### 3.7. Disponibilidad y ciclo de vida
 
 #### INV-L1 · Toda request recibe una respuesta, en tiempo acotado
-**Enunciado.** Toda request del data plane recibe exactamente una respuesta (salvo un stream SSE abierto), del código documentado, dentro de `ACTOR_TIMEOUT` más el tiempo de escritura: nunca se cuelga, ni siquiera si el actor entra en pánico, se detiene o se reinicia en el medio.
+**Enunciado.** Toda request del data plane recibe exactamente una respuesta (salvo un stream SSE abierto), del código documentado, en tiempo acotado: nunca se cuelga, ni siquiera si el actor entra en pánico, se detiene o se reinicia en el medio. La cota es `ACTOR_TIMEOUT` más `ACTOR_EXIT_WAIT` por cada pedido al actor (la suscripción SSE hace hasta tres), más la apertura de la sala cuando la dispara la request, más la E/S del relay y el tiempo de escritura de la respuesta.
 **Sostenida por.** `RoomManager::ask` con timeout, `catch_unwind`, cierre del mailbox antes de responder (§5.4, §7.2 *Error Handling*).
 **Cómo intentar romperla.** Pánico en cada handler; actor que se apaga por inactividad con la cola llena; append fallido con comandos detrás; spawn que falla.
 
 #### INV-L2 · Cancelar una request nunca deja estado a medias
 **Enunciado.** Si el cliente corta una request en cualquier `.await`, el efecto es "no ocurrió" o "ocurrió entero". Las operaciones de varios pasos (delete de sala, escrituras del relay, `add_column`, compactación y escrituras del storage) corren en su propia tarea, o marcan la sala como fallida.
 **Sostenida por.** `run_to_completion`, `tokio::spawn` en `delete_room` y `add_column`, `PendingWrite` (§7.1, §8).
-**Cómo intentar romperla.** Descartar el future del handler en cada punto de suspensión (el patrón del test de DEF-125); cancelar `compact_room` y `apply_snapshot` del storage.
+**Cómo intentar romperla.** Descartar el future del handler en cada punto de suspensión (el patrón del test de DEF-125); cancelar `compact_room` y `apply_snapshot` del storage y reabrir la sala mientras una operación de archivo sigue en vuelo; apagar el servidor con una tarea de varios pasos en curso. *Pendiente:* `apply_snapshot` en su propia tarea (Lote 3, D86) y el apagado que espera esas tareas (Lote 5, D87).
 
 #### INV-L3 ★ · Un I/O incierto nunca se confirma como éxito
 **Enunciado.** Si un write, un fsync o un rename de un archivo durable falla, nunca se responde éxito por una operación que dependía de él. En el servidor, la sala se detiene y se reabre desde disco; en storage, la sala queda `RoomFailed` hasta reabrirse. Un error de I/O nunca se toma por "el archivo no existe".
@@ -323,12 +391,17 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 **Sostenida por.** §7.2 *Graceful Shutdown*.
 **Cómo intentar romperla.** Señal durante una compresión, una subida o un `add_column`; tareas del relay que reabren una sala después de que `shutdown_all` la enumeró.
 
+#### INV-L6 · Borrar una sala es atómico
+**Enunciado.** Después de cualquier interrupción (crash, apagado, cancelación) durante el borrado de una sala, la sala existe entera o no existe, y una sala recreada con el mismo id empieza vacía: sin log, roster ni snapshot de la anterior.
+**Sostenida por.** `delete_room` en su propia tarea (§7.1). *Pendiente (Lote 5, D84, D87):* el borrado con lápida y el apagado que lo espera.
+**Cómo intentar romperla.** Crash en cada paso del borrado (después del purge del relay, a mitad de `remove_dir_all`); recrear la sala después de cada uno.
+
 ### 3.8. Esquema
 
 #### INV-E1 ★ · El esquema solo crece, y toda operación del log sigue siendo válida
 **Enunciado.** Un esquema registrado nunca pierde, renumera ni cambia el tipo de una tabla o columna. Las columnas nuevas son nullable, y la versión sube con cada cambio. Por eso toda operación aceptada en una sala sigue siendo válida bajo cualquier versión posterior de su esquema, y una réplica siempre puede aplicar el log.
 **Sostenida por.** `Schema::add_column`, `SchemaAlreadyExists`, deserialización estricta (§3.1, §7.1).
-**Cómo intentar romperla.** `add_column` concurrentes; reinicio a mitad de una escritura del registry; JSON de esquema con ids repetidos, faltantes o campos desconocidos; filas cortas de antes de una columna nueva.
+**Cómo intentar romperla.** `add_column` concurrentes; reinicio a mitad de una escritura del registry; JSON de esquema con ids repetidos, faltantes o campos desconocidos; filas cortas de antes de una columna nueva; un bit invertido en `schemas/{id}.json` (ver INV-D9).
 
 #### INV-E2 · Un cliente con el esquema viejo siempre puede enterarse
 **Enunciado.** Después de un `add_column`, toda respuesta de `Registered`, `HeartbeatAck`, `SyncBatch` y `CommitAck` de una sala con ese esquema lleva la versión nueva, sin depender de SSE.
@@ -340,12 +413,12 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 #### INV-W1 ★ · Ninguna entrada hace entrar en pánico, abortar ni reservar de más
 **Enunciado.** Ningún byte de red, de disco (WAL, segmentos, sidecars, snapshots, JSON) ni de un snapshot de otro peer provoca un pánico, un abort o una reserva de memoria desproporcionada a su tamaño. Todo error es tipado.
 **Sostenida por.** `decode_budget`, `Deserialize` propios, `PayloadReader`, CRC antes de decodificar (§7.2 *Defensive Bounding*, §8 *Bounded Snapshot Decompression*).
-**Automatizable.** Fuzzing (`cargo fuzz`) de `decode_client_message`, `decode_message`, el decoder de frames WAL, el de sidecars, `SnapshotEnvelopeHeader::parse` y `apply_snapshot`.
+**Automatizable.** Fuzzing con generadores propios (sin `cargo fuzz`, D88) de `decode_client_message`, `decode_message`, el decoder de frames WAL, el de sidecars, `SnapshotEnvelopeHeader::parse` y `apply_snapshot`. En el repo desde el Lote 0.
 
 #### INV-W2 · Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum
 **Enunciado.** Para todo mensaje, frame WAL, sidecar, snapshot y esquema válidos, decodificar lo codificado devuelve el mismo valor (con -0.0 canonicalizado). Todo byte persistido que se usa para decidir algo (operaciones, ids de dedup, longitudes, headers) está cubierto por un CRC o un hash antes de usarse.
-**Sostenida por.** Opciones de bincode únicas, CRC de header y payload, CRC de sidecars, envelope `ZMSN`, BLAKE3 del relay.
-**Automatizable.** proptest de roundtrip para cada formato.
+**Sostenida por.** Opciones de bincode únicas, CRC de header y payload, CRC de sidecars, envelope `ZMSN`, BLAKE3 del relay. *Pendiente (Lote 2):* los JSON persistidos (INV-D9).
+**Automatizable.** Roundtrip con generadores aleatorios para cada formato. En el repo desde el Lote 0.
 
 ---
 
@@ -367,6 +440,10 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 | Un crash pierde hasta ~1 s del roster. | Solo cuesta retención, re-registros o snapshots de más (INV-R3). | D56 |
 | La designación del uploader y la marca de hueco viven en memoria. | Se recalculan al reabrir. | §5.2 *Damaged Segments*, *Snapshot Demand* |
 | En Windows el sync de directorios es un no-op. | NTFS registra los cambios de directorio en su journal. | §5.2 *Durable directory entries* |
+| Un stream SSE sigue recibiendo eventos después de que vence su token, y mientras tanto mantiene la sala abierta. | SSE solo notifica; cualquier dato se pide con un token vigente. | D72 |
+| En Linux, después de un EIO en un `fsync`, el kernel puede marcar las páginas como limpias sin haberlas escrito, y un `fsync` desde un descriptor nuevo devuelve éxito igual: INV-D7 no cubre ese caso. | La solución completa (reescribir `active.wal` cuando el actor anterior se detuvo por una escritura fallida) queda para el futuro. | D77 |
+| Un valor escrito por un miembro que embebe un frame WAL válido puede hacer que una escritura rota se clasifique como corrupción: la sala no abre, pero no se pierde ni se inventa nada. | Evitarlo exige rediseñar el framing. La absorción atómica (D85) quita el caso más expuesto. | D79, `ARCHITECTURE.md` §8 |
+| Un daño en el último frame de `active.wal`, sin frames válidos después, se trunca como una escritura rota y su secuencia puede reutilizarse. | No se distingue de una escritura rota; INV-D8 lo cubre cuando la secuencia consta en otro archivo. | D78 |
 
 ---
 
