@@ -1,0 +1,1002 @@
+diff --git a/crates/server/Cargo.toml b/crates/server/Cargo.toml
+index e561726..d442e04 100644
+--- a/crates/server/Cargo.toml
++++ b/crates/server/Cargo.toml
+@@ -5,8 +5,8 @@ edition.workspace = true
+ rust-version.workspace = true
+ license.workspace = true
+ 
+-[lints]
+-workspace = true
++[lints.rust]
++unsafe_code = "allow"
+ 
+ [dependencies]
+ zemdb-core = { workspace = true }
+diff --git a/crates/server/src/actor/room.rs b/crates/server/src/actor/room.rs
+index 2dbe235..d8dfb2a 100644
+--- a/crates/server/src/actor/room.rs
++++ b/crates/server/src/actor/room.rs
+@@ -1005,3 +1005,7 @@ fn fit_in_response(
+ #[cfg(test)]
+ #[path = "tests/room.rs"]
+ mod tests;
++
++#[cfg(test)]
++#[path = "tests/inv_b4.rs"]
++mod inv_b4;
+diff --git a/crates/server/src/actor/tests/inv_b4.rs b/crates/server/src/actor/tests/inv_b4.rs
+new file mode 100644
+index 0000000..9eff64b
+--- /dev/null
++++ b/crates/server/src/actor/tests/inv_b4.rs
+@@ -0,0 +1,345 @@
++//! Auditoría INV-B4: costo por request del actor y de la apertura frente a la historia
++//! retenida y al roster. Mediciones manuales (`#[ignore]`), sin runtime (blocking_io corre en el
++//! lugar). Los segmentos se fabrican directamente en disco (frames + sidecars), sin fsync.
++
++use super::*;
++use crate::actor::test_support::test_schema;
++use crate::log::segment_index::{encode_mutation_ids, mutation_ids_path, segment_path, Tier};
++use std::io::Write as _;
++use std::time::Instant as StdInstant;
++use tempfile::tempdir;
++use zemdb_core::protocol::wal_frame::encode_wal_record;
++use zemdb_core::value::{RowBuilder, Value};
++
++fn op_with(payload: usize, id: i64) -> Operation {
++    let title: String = "x".repeat(payload);
++    let row = RowBuilder::new()
++        .set("id", id)
++        .set("title", Value::String(title.into_boxed_str()))
++        .build();
++    test_schema()
++        .to_operation_insert("tasks", &row, 1000)
++        .unwrap()
++}
++
++fn mid(i: u64) -> MutationId {
++    let mut b = [0u8; 16];
++    b[..8].copy_from_slice(&i.to_le_bytes());
++    b[8] = 0x5A;
++    MutationId::new(b)
++}
++
++/// Writes a room log with `sealed` operations in segments of `seg_ops` (cold if `cold`), and
++/// `active` more operations in `active.wal`, every operation with a title of `payload` bytes.
++fn write_log(room_dir: &Path, sealed: u64, seg_ops: u64, active: u64, payload: usize, cold: bool) {
++    let segs = room_dir.join("segments");
++    std::fs::create_dir_all(&segs).unwrap();
++    let template = op_with(payload, 1);
++    let mut start = 1u64;
++    while start <= sealed {
++        let end = (start + seg_ops - 1).min(sealed);
++        let mut frames = Vec::new();
++        let mut ids = Vec::new();
++        for s in start..=end {
++            let op = SequencedOperation::new(SequenceNumber::new(s), template.clone());
++            frames.extend(encode_wal_record(&op, Some(mid(s))).unwrap());
++            ids.push((mid(s), SequenceNumber::new(s)));
++        }
++        let (a, b) = (SequenceNumber::new(start), SequenceNumber::new(end));
++        if cold {
++            let z = zstd::stream::encode_all(&frames[..], 3).unwrap();
++            std::fs::write(segment_path(&segs, a, b, Tier::Cold), z).unwrap();
++        } else {
++            std::fs::write(segment_path(&segs, a, b, Tier::Warm), &frames).unwrap();
++        }
++        std::fs::write(mutation_ids_path(&segs, a, b), encode_mutation_ids(a, b, &ids)).unwrap();
++        start = end + 1;
++    }
++    let mut f = std::fs::File::create(segs.join("active.wal")).unwrap();
++    for s in sealed + 1..=sealed + active {
++        let op = SequencedOperation::new(SequenceNumber::new(s), template.clone());
++        f.write_all(&encode_wal_record(&op, Some(mid(s))).unwrap()).unwrap();
++    }
++}
++
++/// Writes a roster of `clients` connected clients at cursor `cursor`.
++fn write_roster(room_dir: &Path, room: &RoomId, clients: usize, cursor: u64) {
++    let path = room_dir.join(format!("meta_clients_{}.json", room.as_str()));
++    let mut t = ClientLeaseTracker::open_or_create(&path).unwrap();
++    for i in 0..clients {
++        let c = ClientId::new(format!("client-{i:06}")).unwrap();
++        t.register_client(&c, Some(SequenceNumber::new(cursor)), SequenceNumber::new(1));
++    }
++    t.save().unwrap();
++}
++
++struct Env {
++    _dir: tempfile::TempDir,
++    data_dir: PathBuf,
++    room: RoomId,
++    relay: Arc<SnapshotRelay>,
++    config: Arc<ServerConfig>,
++}
++
++fn env() -> Env {
++    let dir = tempdir().unwrap();
++    let data_dir = dir.path().to_path_buf();
++    let relay = Arc::new(
++        SnapshotRelay::new(data_dir.join("snapshots"), Duration::from_secs(60), 1 << 30).unwrap(),
++    );
++    let config = Arc::new(ServerConfig {
++        data_dir: data_dir.clone(),
++        ..ServerConfig::default()
++    });
++    Env {
++        _dir: dir,
++        data_dir,
++        room: RoomId::new("room").unwrap(),
++        relay,
++        config,
++    }
++}
++
++impl Env {
++    fn room_dir(&self) -> PathBuf {
++        room_dir(&self.data_dir, &self.room)
++    }
++    fn open(&self) -> (mpsc::Sender<RoomCommand>, RoomActor) {
++        RoomActor::open(
++            self.room.clone(),
++            7,
++            SchemaId::new("todo").unwrap(),
++            Arc::new(test_schema()),
++            &self.data_dir,
++            Arc::clone(&self.config),
++            RoomLifecyclePolicy::default(),
++            Arc::clone(&self.relay),
++            ActorTimings::default(),
++        )
++        .unwrap()
++    }
++    /// Median open time of `n` opens, in ms.
++    fn open_ms(&self, n: usize) -> f64 {
++        let mut t = Vec::new();
++        for _ in 0..n {
++            let s = StdInstant::now();
++            let (tx, actor) = self.open();
++            t.push(s.elapsed().as_secs_f64() * 1e3);
++            drop(actor);
++            drop(tx);
++        }
++        t.sort_by(|a, b| a.partial_cmp(b).unwrap());
++        t[t.len() / 2]
++    }
++}
++
++fn median_us(mut v: Vec<f64>) -> f64 {
++    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
++    v[v.len() / 2]
++}
++
++#[test]
++#[ignore]
++fn inv_b4_open_cost_vs_history() {
++    println!("== open cost vs retained history (segments of 1000 ops + 500 ops in active.wal)");
++    for (sealed, payload, cold) in [
++        (0u64, 16usize, false),
++        (1_000, 16, false),
++        (10_000, 16, false),
++        (100_000, 16, false),
++        (1_000_000, 16, false),
++        (1_000, 20_000, true),
++        (10_000, 20_000, true),
++        (100_000, 20_000, true),
++    ] {
++        let e = env();
++        let s = StdInstant::now();
++        write_log(&e.room_dir(), sealed, 1000, 500, payload, cold);
++        let gen = s.elapsed();
++        let files = std::fs::read_dir(e.room_dir().join("segments")).unwrap().count();
++        let ms = e.open_ms(5);
++        println!(
++            "   sealed={sealed:>8} payload={payload:>6} cold={cold:<5} files={files:>5} gen={gen:>8.1?} open median={ms:.2} ms"
++        );
++    }
++}
++
++#[test]
++#[ignore]
++fn inv_b4_open_cost_vs_roster() {
++    println!("== open cost vs roster size (10^4 ops retained)");
++    for clients in [0usize, 10, 1_000, 10_000] {
++        let e = env();
++        write_log(&e.room_dir(), 10_000, 1000, 500, 16, false);
++        write_roster(&e.room_dir(), &e.room, clients, 10_000);
++        let ms = e.open_ms(5);
++        println!("   clients={clients:>6} open median={ms:.2} ms");
++    }
++}
++
++/// Per-request costs with `sealed` retained 20 KB operations (cold) and `clients` connected
++/// clients plus one lagging client at cursor 0 that keeps the history from being pruned.
++fn per_request(sealed: u64, clients: usize) {
++    let e = env();
++    write_log(&e.room_dir(), sealed, 1000, 200, 20_000, true);
++    let head = sealed + 200;
++    write_roster(&e.room_dir(), &e.room, clients, head - 100);
++    let (_tx, mut a) = e.open();
++    let lag = ClientId::new("lagging").unwrap();
++    a.register(&lag, Some(SequenceNumber::new(0)), Some(7)).unwrap();
++    let roster = e.room_dir().join(format!("meta_clients_{}.json", e.room.as_str()));
++    let roster_before = std::fs::metadata(&roster).unwrap().modified().unwrap();
++    let me = ClientId::new("client-000000").unwrap();
++
++    // Acks inside active.wal (the lagging client keeps the floor at 0).
++    let mut t = Vec::new();
++    for k in 0..100u64 {
++        let s = StdInstant::now();
++        a.ack(&me, SequenceNumber::new(head - 100 + k)).unwrap();
++        t.push(s.elapsed().as_secs_f64() * 1e6);
++    }
++    let ack_us = median_us(t);
++
++    // Heartbeats.
++    let mut t = Vec::new();
++    for _ in 0..100 {
++        let s = StdInstant::now();
++        a.heartbeat(&me).unwrap();
++        t.push(s.elapsed().as_secs_f64() * 1e6);
++    }
++    let hb_us = median_us(t);
++
++    // Registration storm: 1000 new connected clients.
++    let s = StdInstant::now();
++    for i in 0..1000 {
++        let c = ClientId::new(format!("storm-{i:06}")).unwrap();
++        a.register(&c, Some(SequenceNumber::new(head)), Some(7)).unwrap();
++    }
++    let reg_us = s.elapsed().as_secs_f64() * 1e6 / 1000.0;
++    let roster_after = std::fs::metadata(&roster).unwrap().modified().unwrap();
++
++    // Sync from the middle of the history (a cold segment) and from the newest sealed segment.
++    let mid_cursor = (sealed / 2).max(1);
++    let s = StdInstant::now();
++    let r = a.sync(&me, SequenceNumber::new(mid_cursor), 10);
++    let sync_mid_ms = s.elapsed().as_secs_f64() * 1e3;
++    let mid_ok = r.map(|r| r.ops.len()).unwrap_or(0);
++    let s = StdInstant::now();
++    let r = a.sync(&me, SequenceNumber::new(sealed.saturating_sub(5)), 10);
++    let sync_last_ms = s.elapsed().as_secs_f64() * 1e3;
++    let last_ok = r.map(|r| r.ops.len()).unwrap_or(0);
++
++    // Commits of 20 KB (append + fsync), with the client up to date.
++    let mut t = Vec::new();
++    for k in 0..20u64 {
++        let mut flow = ControlFlow::Continue(());
++        let h = a.head_seq;
++        let s = StdInstant::now();
++        a.commit(&me, mid(10_000_000 + k), h, op_with(20_000, 5_000_000 + k as i64), &mut flow)
++            .unwrap();
++        t.push(s.elapsed().as_secs_f64() * 1e3);
++    }
++    let commit_ms = median_us(t);
++    println!(
++        "   sealed={sealed:>7} clients={clients:>6}: ack={ack_us:>7.1} us  heartbeat={hb_us:>6.1} us  register={reg_us:>6.1} us/op  \
++         sync(mid, {mid_ok} ops)={sync_mid_ms:>7.2} ms  sync(last sealed, {last_ok} ops)={sync_last_ms:>6.2} ms  commit={commit_ms:.2} ms  \
++         roster written during acks/storm: {}",
++        roster_after != roster_before
++    );
++}
++
++#[test]
++#[ignore]
++fn inv_b4_per_request_costs() {
++    println!("== per-request costs (20 KB ops; 1 lagging client keeps the history)");
++    per_request(1_000, 10);
++    per_request(1_000, 1_000);
++    per_request(100_000, 10);
++    per_request(100_000, 1_000);
++    per_request(100_000, 10_000);
++}
++
++#[test]
++#[ignore]
++fn inv_b4_bootstrapping_registration_storm() {
++    // A pruned room (tail > 1) with no connected client: every registration without a cursor
++    // is Bootstrapping, turns the demand on and looks for an uploader among the clients.
++    println!("== bootstrapping registration storm (no connected client, tail > 1)");
++    for n in [1_000usize, 10_000] {
++        let e = env();
++        write_log(&e.room_dir(), 0, 1000, 10, 16, false);
++        std::fs::write(e.room_dir().join("log_meta.json"), br#"{"pruned_through_seq":100}"#)
++            .unwrap();
++        // active.wal starts at 1 in write_log: rewrite it to start after the pruned range.
++        let segs = e.room_dir().join("segments");
++        let mut f = std::fs::File::create(segs.join("active.wal")).unwrap();
++        for s in 101..=110u64 {
++            let op = SequencedOperation::new(SequenceNumber::new(s), op_with(16, 1));
++            f.write_all(&encode_wal_record(&op, Some(mid(s))).unwrap()).unwrap();
++        }
++        drop(f);
++        let (_tx, mut a) = e.open();
++        let mut first = Vec::new();
++        let mut last = Vec::new();
++        let s0 = StdInstant::now();
++        for i in 0..n {
++            let c = ClientId::new(format!("boot-{i:06}")).unwrap();
++            let s = StdInstant::now();
++            a.register(&c, None, None).unwrap();
++            let us = s.elapsed().as_secs_f64() * 1e6;
++            if i < 100 {
++                first.push(us);
++            } else if i >= n - 100 {
++                last.push(us);
++            }
++        }
++        println!(
++            "   n={n:>6}: total {:?}; median register first100={:.1} us, last100={:.1} us",
++            s0.elapsed(),
++            median_us(first),
++            median_us(last)
++        );
++    }
++}
++
++#[test]
++#[ignore]
++fn inv_b4_open_and_sync_cost_vs_segment_count() {
++    // Segments of 10 operations (as with ram_max_ops = 10, or large operations that seal a
++    // segment every few commits): the same history in many files.
++    println!("== open / sync cost vs number of sealed segments (10 ops each)");
++    for segments in [100u64, 1_000, 10_000, 50_000] {
++        let e = env();
++        write_log(&e.room_dir(), segments * 10, 10, 5, 16, false);
++        // Warm the page cache, then time the segment index scan alone and the whole open.
++        let segs = e.room_dir().join("segments");
++        let _ = e.open_ms(1);
++        let mut scan = Vec::new();
++        for _ in 0..5 {
++            let s = StdInstant::now();
++            let idx = crate::log::segment_index::SegmentIndex::scan(&segs, SequenceNumber::new(0)).unwrap();
++            scan.push(s.elapsed().as_secs_f64() * 1e3);
++            assert_eq!(idx.iter().count() as u64, segments);
++        }
++        let open = e.open_ms(5);
++        let (_tx, mut a) = e.open();
++        let c = ClientId::new("c").unwrap();
++        a.register(&c, Some(SequenceNumber::new(0)), Some(7)).unwrap();
++        // Evict RAM so that a sync near the head reads the newest sealed segment from disk.
++        let near_head = segments * 10 - 3;
++        a.tiered_log.prune_older_than(SequenceNumber::new(0)).unwrap();
++        let mut t = Vec::new();
++        for _ in 0..20 {
++            let s = StdInstant::now();
++            let r = a.sync(&c, SequenceNumber::new(near_head), 2).unwrap();
++            t.push(s.elapsed().as_secs_f64() * 1e6);
++            assert_eq!(r.ops.len(), 2);
++        }
++        println!(
++            "   segments={segments:>6}: SegmentIndex::scan median={:.2} ms, open median={open:.2} ms, \
++             sync near head (disk) median={:.1} us",
++            median_us(scan),
++            median_us(t)
++        );
++    }
++}
+diff --git a/crates/server/src/log/tests/inv_b3.rs b/crates/server/src/log/tests/inv_b3.rs
+new file mode 100644
+index 0000000..2c3a48a
+--- /dev/null
++++ b/crates/server/src/log/tests/inv_b3.rs
+@@ -0,0 +1,162 @@
++//! Auditoría INV-B3: el disco de la sala frente a `max_room_disk_bytes`.
++
++use super::*;
++use std::time::Duration;
++use tempfile::tempdir;
++use zemdb_core::mutation::Operation;
++use zemdb_core::value::{CompactRow, PrimaryKey, Value};
++
++/// An insert of ~`size` bytes of incompressible data at `seq`.
++fn big_op(seq: u64, size: usize) -> SequencedOperation {
++    let mut x = seq.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
++    let data: Vec<u8> = (0..size)
++        .map(|_| {
++            x ^= x << 13;
++            x ^= x >> 7;
++            x ^= x << 17;
++            x as u8
++        })
++        .collect();
++    let pk = PrimaryKey::single(Value::Int(seq as i64));
++    let row = CompactRow::new(vec![Value::Int(seq as i64), Value::Bytes(data.into_boxed_slice())]);
++    SequencedOperation::new(SequenceNumber::new(seq), Operation::insert(1, pk, row, 0))
++}
++
++fn mid(seq: u64) -> MutationId {
++    MutationId::from_u128(u128::from(seq) | (7u128 << 100))
++}
++
++const MIB: u64 = 1024 * 1024;
++
++fn policy(warm_ttl: Duration) -> RoomLifecyclePolicy {
++    RoomLifecyclePolicy {
++        ram_max_ops: 1_000,
++        segment_max_bytes: MIB,     // minimum accepted
++        max_room_disk_bytes: MIB,   // minimum accepted
++        warm_disk_ttl: warm_ttl,
++        ..RoomLifecyclePolicy::default()
++    }
++}
++
++/// Default warm TTL (24 h): a burst of 8 MiB is never pruned by the 1 MiB quota until the
++/// segments are compressed a day later.
++#[test]
++#[ignore]
++fn inv_b3_quota_does_not_bound_warm_segments_default_warm_ttl() {
++    let dir = tempdir().unwrap();
++    let policy = policy(RoomLifecyclePolicy::default().warm_disk_ttl);
++    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
++    for seq in 1..=80u64 {
++        log.append(big_op(seq, 100 * 1024), Some(mid(seq))).unwrap();
++    }
++    let report = log.run_maintenance_sync().unwrap();
++    let segments = dir.path().join("segments");
++    let on_disk: u64 = std::fs::read_dir(&segments)
++        .unwrap()
++        .map(|e| e.unwrap().metadata().unwrap().len())
++        .sum();
++    println!(
++        "warm_ttl=24h quota={} MiB: after maintenance disk_bytes={:.1} MiB (files {:.1} MiB), \
++         compressed={}, pruned={}, tail={}",
++        MIB / MIB,
++        log.disk_bytes() as f64 / MIB as f64,
++        on_disk as f64 / MIB as f64,
++        report.warm_compressed_count,
++        report.cold_pruned_count,
++        log.tail_seq()
++    );
++    assert!(log.disk_bytes() > 4 * log.policy.max_room_disk_bytes);
++}
++
++/// Warm TTL 0 (compress at once): with a sustained write rate above 4 sealed segments per
++/// maintenance pass, the warm backlog (which the quota cannot prune) grows every pass.
++#[test]
++#[ignore]
++fn inv_b3_quota_does_not_bound_a_sustained_writer_warm_ttl_zero() {
++    let dir = tempdir().unwrap();
++    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy(Duration::ZERO)).unwrap();
++    let mut seq = 0u64;
++    for round in 1..=6 {
++        // ~6 sealed segments of ~1 MiB between two slow ticks (6 MiB per 30 s ≈ 0.2 MiB/s).
++        for _ in 0..60 {
++            seq += 1;
++            log.append(big_op(seq, 100 * 1024), Some(mid(seq))).unwrap();
++        }
++        let report = log.run_maintenance_sync().unwrap();
++        let warm = log
++            .segments
++            .iter()
++            .filter(|s| s.tier == crate::log::segment_index::Tier::Warm)
++            .count();
++        println!(
++            "round {round}: disk_bytes={:.1} MiB (quota 1 MiB), warm segments={warm}, \
++             compressed={}, pruned={}, tail={}",
++            log.disk_bytes() as f64 / MIB as f64,
++            report.warm_compressed_count,
++            report.cold_pruned_count,
++            log.tail_seq()
++        );
++    }
++    assert!(log.disk_bytes() > 8 * log.policy.max_room_disk_bytes);
++}
++
++/// Small operations with realistic (hash-like) mutation IDs, already compressed: the quota
++/// counts the cold segments but not their mutation ID sidecars (24 bytes per operation).
++#[test]
++#[ignore]
++fn inv_b3_sidecars_are_outside_the_quota() {
++    use crate::log::segment_index::{encode_mutation_ids, mutation_ids_path, segment_path, Tier};
++    use zemdb_core::protocol::wal_frame::encode_wal_record;
++    let dir = tempdir().unwrap();
++    let segs = dir.path().join("segments");
++    std::fs::create_dir_all(&segs).unwrap();
++    let hash_mid = |s: u64| {
++        let h = blake3::hash(&s.to_le_bytes());
++        MutationId::new(std::array::from_fn(|i| h.as_bytes()[i]))
++    };
++    let total_ops = 400_000u64;
++    let mut start = 1u64;
++    while start <= total_ops {
++        let end = start + 999;
++        let mut frames = Vec::new();
++        let mut ids = Vec::new();
++        for s in start..=end {
++            let pk = PrimaryKey::single(Value::Int(s as i64 % 1000));
++            let op = SequencedOperation::new(SequenceNumber::new(s), Operation::delete(1, pk, 0));
++            frames.extend(encode_wal_record(&op, Some(hash_mid(s))).unwrap());
++            ids.push((hash_mid(s), SequenceNumber::new(s)));
++        }
++        let (a, b) = (SequenceNumber::new(start), SequenceNumber::new(end));
++        let z = zstd::stream::encode_all(&frames[..], 3).unwrap();
++        std::fs::write(segment_path(&segs, a, b, Tier::Cold), z).unwrap();
++        std::fs::write(mutation_ids_path(&segs, a, b), encode_mutation_ids(a, b, &ids)).unwrap();
++        start = end + 1;
++    }
++    let policy = RoomLifecyclePolicy {
++        max_room_disk_bytes: 4 * MIB,
++        ..RoomLifecyclePolicy::default()
++    };
++    let (mut log, _) = TieredLog::open_or_create_with_dedup_window(dir.path(), policy, 10_000).unwrap();
++    let report = log.run_maintenance_sync().unwrap();
++    let (mut ids_bytes, mut seg_bytes) = (0u64, 0u64);
++    for e in std::fs::read_dir(&segs).unwrap() {
++        let e = e.unwrap();
++        let len = e.metadata().unwrap().len();
++        if e.file_name().to_str().unwrap().ends_with(".ids") {
++            ids_bytes += len;
++        } else {
++            seg_bytes += len;
++        }
++    }
++    println!(
++        "quota=4 MiB: pruned={} tail={} disk_bytes(counted)={:.2} MiB, segments on disk={:.2} MiB, \
++         sidecars on disk={:.2} MiB, total={:.2} MiB ({:.2}x quota)",
++        report.cold_pruned_count,
++        log.tail_seq(),
++        log.disk_bytes() as f64 / MIB as f64,
++        seg_bytes as f64 / MIB as f64,
++        ids_bytes as f64 / MIB as f64,
++        (seg_bytes + ids_bytes) as f64 / MIB as f64,
++        (seg_bytes + ids_bytes) as f64 / (4 * MIB) as f64
++    );
++}
+diff --git a/crates/server/src/log/tiered_log.rs b/crates/server/src/log/tiered_log.rs
+index 0d199e1..363480d 100644
+--- a/crates/server/src/log/tiered_log.rs
++++ b/crates/server/src/log/tiered_log.rs
+@@ -864,3 +864,7 @@ fn read_pruned_through_seq(dir: &Path) -> Result<SequenceNumber, ServerError> {
+ #[cfg(test)]
+ #[path = "tests/tiered_log.rs"]
+ mod tests;
++
++#[cfg(test)]
++#[path = "tests/inv_b3.rs"]
++mod inv_b3;
+diff --git a/crates/server/src/relay/lifecycle.rs b/crates/server/src/relay/lifecycle.rs
+index 7e6aece..71d3e69 100644
+--- a/crates/server/src/relay/lifecycle.rs
++++ b/crates/server/src/relay/lifecycle.rs
+@@ -110,3 +110,7 @@ impl SnapshotRelay {
+ #[cfg(test)]
+ #[path = "tests/lifecycle.rs"]
+ mod tests;
++
++#[cfg(test)]
++#[path = "tests/inv_b2.rs"]
++mod inv_b2;
+diff --git a/crates/server/src/relay/tests/inv_b2.rs b/crates/server/src/relay/tests/inv_b2.rs
+new file mode 100644
+index 0000000..2fa9fc9
+--- /dev/null
++++ b/crates/server/src/relay/tests/inv_b2.rs
+@@ -0,0 +1,45 @@
++//! Auditoría INV-B2: una subida por chunks que no progresa se retiene sin plazo.
++
++use super::*;
++use crate::relay::test_common::*;
++use crate::relay::UPLOAD_IDLE_TIMEOUT;
++
++#[tokio::test(start_paused = true)]
++#[ignore]
++async fn inv_b2_upload_resending_the_same_chunk_is_retained_without_deadline() {
++    let dir = tempdir().unwrap();
++    let relay = open(&dir);
++    let snap = three_part_snapshot(1);
++    // One chunk of three; the upload can never complete without the other two.
++    upload_parts(&relay, 10, [0], &snap, (0, 10)).await;
++
++    // Resend the chunk already received every 119 s for 24 h, while the sweeper runs.
++    let period = UPLOAD_IDLE_TIMEOUT - Duration::from_secs(1);
++    let mut elapsed = Duration::ZERO;
++    let mut resends = 0u32;
++    while elapsed < Duration::from_secs(24 * 3600) {
++        tokio::time::advance(period).await;
++        elapsed += period;
++        relay.cleanup_expired().await;
++        upload_parts(&relay, 10, [0], &snap, (0, 10)).await;
++        resends += 1;
++    }
++    relay.cleanup_expired().await;
++
++    let in_progress = relay.upload_in_progress(&room());
++    let files = files_in(&uploads_dir(&dir));
++    println!(
++        "after {elapsed:?} ({resends} resends of chunk 0, no new chunk): upload_in_progress={in_progress:?}, \
++         uploads dir={files:?} (idle timeout {UPLOAD_IDLE_TIMEOUT:?})"
++    );
++    assert_eq!(in_progress, Some(seq(10)));
++    assert_eq!(files, vec!["relay-room_10.part"]);
++
++    // Meanwhile another member cannot upload a snapshot at the same sequence.
++    let other = three_part_snapshot(2);
++    let refused = relay
++        .stage_chunk(part_by(member("honest"), 10, 0, &other), bounds(0, 10))
++        .await;
++    println!("another member's upload at seq 10: {refused:?}");
++    assert_superseded(refused);
++}
+diff --git a/crates/server/tests/inv_b_memory.rs b/crates/server/tests/inv_b_memory.rs
+new file mode 100644
+index 0000000..df485e9
+--- /dev/null
++++ b/crates/server/tests/inv_b_memory.rs
+@@ -0,0 +1,375 @@
++//! Auditoría INV-B1/INV-B3: memoria que materializa una respuesta de sync / catch-up.
++//! Mediciones manuales (#[ignore]) con un asignador que cuenta bytes vivos y el pico.
++#![allow(unsafe_code)]
++
++mod common;
++
++use axum::body::Body;
++use axum::http::Request;
++use common::*;
++use std::alloc::{GlobalAlloc, Layout, System};
++use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
++use std::time::Instant;
++use tower::ServiceExt;
++use zemdb_core::*;
++use zemdb_server::build_router;
++
++struct Counting;
++static CUR: AtomicUsize = AtomicUsize::new(0);
++static PEAK: AtomicUsize = AtomicUsize::new(0);
++
++unsafe impl GlobalAlloc for Counting {
++    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
++        let p = System.alloc(l);
++        if !p.is_null() {
++            let c = CUR.fetch_add(l.size(), Relaxed) + l.size();
++            PEAK.fetch_max(c, Relaxed);
++        }
++        p
++    }
++    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
++        let p = System.alloc_zeroed(l);
++        if !p.is_null() {
++            let c = CUR.fetch_add(l.size(), Relaxed) + l.size();
++            PEAK.fetch_max(c, Relaxed);
++        }
++        p
++    }
++    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
++        System.dealloc(p, l);
++        CUR.fetch_sub(l.size(), Relaxed);
++    }
++    unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
++        let q = System.realloc(p, l, new);
++        if !q.is_null() {
++            if new >= l.size() {
++                let c = CUR.fetch_add(new - l.size(), Relaxed) + (new - l.size());
++                PEAK.fetch_max(c, Relaxed);
++            } else {
++                CUR.fetch_sub(l.size() - new, Relaxed);
++            }
++        }
++        q
++    }
++}
++
++#[global_allocator]
++static A: Counting = Counting;
++
++fn mib(b: usize) -> f64 {
++    b as f64 / (1024.0 * 1024.0)
++}
++
++/// Resets the peak to the current live bytes and returns them.
++fn start() -> usize {
++    let c = CUR.load(Relaxed);
++    PEAK.store(c, Relaxed);
++    c
++}
++
++fn wide_schema(cols: usize) -> Schema {
++    let mut table = TableSchema::builder("wide").primary_key("id", DataType::Int);
++    for i in 1..cols {
++        table = table.nullable_column(format!("c{i}"), DataType::Int);
++    }
++    Schema::builder().table(table).build()
++}
++
++fn null_row_op(table_id: u16, cols: usize, id: i64) -> Operation {
++    let mut vals = vec![Value::Null; cols];
++    vals[0] = Value::Int(id);
++    Operation::insert(table_id, PrimaryKey::single(Value::Int(id)), CompactRow::new(vals), 0)
++}
++
++fn mid(i: u64) -> MutationId {
++    let mut b = [0u8; 16];
++    b[..8].copy_from_slice(&i.to_le_bytes());
++    b[8] = 0xAB;
++    MutationId::new(b)
++}
++
++async fn run(cols: usize, commits: u64) {
++    let base0 = CUR.load(Relaxed);
++    let schema = wide_schema(cols);
++    let parts = build(|_| {});
++    let schema_id = parts.register_schema("wide", schema.clone());
++    let room_id = parts.create_room("wide-room", &schema_id).await;
++    let sender = parts
++        .room_manager
++        .get_or_spawn(&room_id, None)
++        .await
++        .unwrap();
++    let client = ClientId::new("w").unwrap();
++    register(&sender, &client).await;
++    let table_id = schema.get_table_id("wide").unwrap();
++    let after_open = CUR.load(Relaxed);
++
++    let probe = SequencedOperation::new(SequenceNumber::new(1), null_row_op(table_id, cols, 1));
++    let wire = bincode::Options::serialized_size(bincode::DefaultOptions::new(), &probe).unwrap();
++    println!("== cols={cols} commits={commits}: wire bytes per op = {wire}");
++
++    let t = Instant::now();
++    for i in 1..=commits {
++        commit(&sender, &client, mid(i), i - 1, null_row_op(table_id, cols, i as i64))
++            .await
++            .unwrap();
++    }
++    println!("   commits took {:?}", t.elapsed());
++    let resident = CUR.load(Relaxed);
++    println!(
++        "   live after open: {:.1} MiB; live after commits (HotBuffer etc.): {:.1} MiB (delta {:.1} MiB)",
++        mib(after_open - base0),
++        mib(resident - base0),
++        mib(resident - after_open)
++    );
++
++    // (B) Sync from 0 at the actor.
++    let before = start();
++    let resp = sync(&sender, &client, 0, 1000).await.unwrap();
++    let peak = PEAK.load(Relaxed) - before;
++    let n = resp.ops.len();
++    let enc: u64 = resp
++        .ops
++        .iter()
++        .map(|o| bincode::Options::serialized_size(bincode::DefaultOptions::new(), o).unwrap())
++        .sum();
++    let values: usize = resp
++        .ops
++        .iter()
++        .map(|o| match o.op.kind() {
++            OperationKind::Insert { row } => row.len() + o.op.pk().len(),
++            _ => o.op.pk().len(),
++        })
++        .sum();
++    println!(
++        "   [actor sync from 0] ops={n} has_more={} wire={:.1} MiB values={} ({}x MAX_MESSAGE_VALUES) peak alloc={:.1} MiB (ratio {:.1}x wire)",
++        resp.has_more,
++        mib(enc as usize),
++        values,
++        values as u64 / MAX_MESSAGE_VALUES.max(1),
++        mib(peak),
++        peak as f64 / enc as f64
++    );
++    drop(resp);
++
++    // (C) Commit with a stale cursor: catch-up of up to 100 ops.
++    let before = start();
++    let c = commit(&sender, &client, mid(10_000_000), 0, null_row_op(table_id, cols, 9_999_999))
++        .await
++        .unwrap();
++    let peak = PEAK.load(Relaxed) - before;
++    let enc: u64 = c
++        .catchup_ops
++        .iter()
++        .map(|o| bincode::Options::serialized_size(bincode::DefaultOptions::new(), o).unwrap())
++        .sum();
++    println!(
++        "   [actor commit catch-up from 0] ops={} wire={:.1} MiB peak alloc={:.1} MiB",
++        c.catchup_ops.len(),
++        mib(enc as usize),
++        mib(peak)
++    );
++    drop(c);
++
++    // (D) Same sync through the HTTP router (decode, actor, encode, budget).
++    let app = build_router(parts.state());
++    let tok = token(&client, &room_id);
++    let body = encode_message(&ClientMessage::Sync {
++        correlation_id: CorrelationId::new(7),
++        room_id: room_id.clone(),
++        client_id: client.clone(),
++        from_seq: SequenceNumber::new(0),
++        max_batch_size: 1000,
++    })
++    .unwrap();
++    let before = start();
++    let req = Request::post(format!("/rooms/{room_id}/sync"))
++        .header("authorization", format!("Bearer {tok}"))
++        .header("content-type", "application/octet-stream")
++        .body(Body::from(body.clone()))
++        .unwrap();
++    let resp = app.clone().oneshot(req).await.unwrap();
++    let status = resp.status();
++    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
++    let peak = PEAK.load(Relaxed) - before;
++    println!(
++        "   [HTTP /sync] status={status} response={:.1} MiB peak alloc={:.1} MiB",
++        mib(bytes.len()),
++        mib(peak)
++    );
++    drop(bytes);
++
++    // (E) Two concurrent HTTP syncs of the same room.
++    let before = start();
++    let mut handles = Vec::new();
++    for _ in 0..2 {
++        let app = app.clone();
++        let req = Request::post(format!("/rooms/{room_id}/sync"))
++            .header("authorization", format!("Bearer {tok}"))
++            .header("content-type", "application/octet-stream")
++            .body(Body::from(body.clone()))
++            .unwrap();
++        handles.push(tokio::spawn(async move {
++            let resp = app.oneshot(req).await.unwrap();
++            let s = resp.status();
++            // Hold the response without reading it, as a client that has not read it yet.
++            (s, resp)
++        }));
++    }
++    let mut held = Vec::new();
++    for h in handles {
++        held.push(h.await.unwrap());
++    }
++    let peak = PEAK.load(Relaxed) - before;
++    let live = CUR.load(Relaxed) - before;
++    println!(
++        "   [2 concurrent HTTP /sync] statuses={:?} peak alloc={:.1} MiB, live while held={:.1} MiB (budget 256 MiB)",
++        held.iter().map(|(s, _)| s.as_u16()).collect::<Vec<_>>(),
++        mib(peak),
++        mib(live)
++    );
++    drop(held);
++    parts.room_manager.shutdown_all().await;
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++#[ignore]
++async fn inv_b1_sync_materializes_far_beyond_its_frame_65535_cols() {
++    run(65535, 300).await;
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++#[ignore]
++async fn inv_b1_sync_materializes_far_beyond_its_frame_4096_cols() {
++    run(4096, 1000).await;
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++#[ignore]
++async fn inv_b1_sync_baseline_tasks_schema() {
++    // Baseline: the 3-column `tasks` schema of the other tests.
++    let base0 = CUR.load(Relaxed);
++    let room = TestRoom::spawn(None).await;
++    let client = ClientId::new("w").unwrap();
++    register(&room.sender, &client).await;
++    for i in 1..=1000u64 {
++        commit(&room.sender, &client, mid(i), i - 1, make_test_op(i as i64))
++            .await
++            .unwrap();
++    }
++    let before = start();
++    let resp = sync(&room.sender, &client, 0, 1000).await.unwrap();
++    let peak = PEAK.load(Relaxed) - before;
++    let enc: u64 = resp
++        .ops
++        .iter()
++        .map(|o| bincode::Options::serialized_size(bincode::DefaultOptions::new(), o).unwrap())
++        .sum();
++    println!(
++        "== tasks schema: ops={} wire={:.2} MiB peak={:.2} MiB ratio {:.1}x; live total {:.1} MiB",
++        resp.ops.len(),
++        mib(enc as usize),
++        mib(peak),
++        peak as f64 / enc as f64,
++        mib(CUR.load(Relaxed) - base0)
++    );
++}
++
++/// Responses that carry the schema (`Schema`, `Registered`) do not take the budget of response
++/// bytes in flight: held unread, they add up past `max_inflight_response_bytes`.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++#[ignore]
++async fn inv_b1_schema_responses_are_outside_the_budget() {
++    let schema = wide_schema(65535);
++    let parts = build(|c| c.max_inflight_response_bytes = MAX_FRAME_SIZE as u64);
++    let schema_id = parts.register_schema("wide", schema);
++    let room_id = parts.create_room("wide-room", &schema_id).await;
++    let client = ClientId::new("w").unwrap();
++    let tok = token(&client, &room_id);
++    let app = build_router(parts.state());
++    // Warm up: open the room.
++    let msg = encode_message(&ClientMessage::GetSchema {
++        correlation_id: CorrelationId::new(1),
++        room_id: room_id.clone(),
++    })
++    .unwrap();
++    let mk = || {
++        Request::post(format!("/rooms/{room_id}/schema"))
++            .header("authorization", format!("Bearer {tok}"))
++            .header("content-type", "application/octet-stream")
++            .body(Body::from(msg.clone()))
++            .unwrap()
++    };
++    let first = app.clone().oneshot(mk()).await.unwrap();
++    let size = axum::body::to_bytes(first.into_body(), usize::MAX).await.unwrap().len();
++    let before = start();
++    let mut held = Vec::new();
++    for _ in 0..64 {
++        held.push(app.clone().oneshot(mk()).await.unwrap());
++    }
++    let live = CUR.load(Relaxed) - before;
++    println!(
++        "== 64 unread /schema responses of {:.2} MiB each: live {:.1} MiB with max_inflight_response_bytes={:.1} MiB; statuses all 200: {}",
++        mib(size),
++        mib(live),
++        mib(MAX_FRAME_SIZE),
++        held.iter().all(|r| r.status() == 200)
++    );
++    drop(held);
++}
++
++/// Unauthenticated: a request to an unknown Data Plane path is answered with a frame that
++/// echoes the whole path, outside the budget. Held unread by many connections.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++#[ignore]
++async fn inv_b1_unknown_path_echo_is_outside_the_budget() {
++    use tokio::io::{AsyncReadExt, AsyncWriteExt};
++    let parts = build(|c| c.max_inflight_response_bytes = MAX_FRAME_SIZE as u64);
++    let (addr, stop, server) = parts.serve_until_stopped().await;
++    async fn send(addr: std::net::SocketAddr, path_len: usize) -> tokio::net::TcpStream {
++        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
++        let req = format!(
++            "GET /rooms/a/{} HTTP/1.1\r\nhost: x\r\n\r\n",
++            "b".repeat(path_len)
++        );
++        s.write_all(req.as_bytes()).await.unwrap();
++        s
++    }
++    // One full response, to see its size.
++    let mut s = send(addr, 65_000).await;
++    let mut head = Vec::new();
++    let mut buf = vec![0u8; 1 << 20];
++    let deadline = Instant::now();
++    while deadline.elapsed() < std::time::Duration::from_secs(5) {
++        match tokio::time::timeout(std::time::Duration::from_millis(500), s.read(&mut buf)).await {
++            Ok(Ok(0)) | Err(_) => break,
++            Ok(Ok(n)) => head.extend_from_slice(&buf[..n]),
++            Ok(Err(_)) => break,
++        }
++    }
++    let text = String::from_utf8_lossy(&head[..head.len().min(200)]).to_string();
++    println!(
++        "== unknown path of 65 000 bytes: {} response bytes; starts with {:?}",
++        head.len(),
++        text.lines().next()
++    );
++    drop(s);
++    for (label, len) in [("short path", 10usize), ("65 000-byte path", 65_000)] {
++        let before = start();
++        let mut conns = Vec::new();
++        for _ in 0..200 {
++            conns.push(send(addr, len).await);
++        }
++        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
++        let live = CUR.load(Relaxed) as isize - before as isize;
++        println!(
++            "   200 unread connections, {label}: server live delta {:.1} MiB (budget {:.1} MiB)",
++            live as f64 / (1024.0 * 1024.0),
++            mib(MAX_FRAME_SIZE)
++        );
++        drop(conns);
++        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
++    }
++    stop.send(()).unwrap();
++    let _ = server.await;
++}

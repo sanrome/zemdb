@@ -1,0 +1,2305 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 3365424..57efac4 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -5,6 +5,7 @@ members = [
+     "crates/server",
+     "crates/client",
+     "crates/storage",
++    "crates/fuzzw",
+ ]
+ 
+ [workspace.package]
+diff --git a/crates/fuzzw/Cargo.toml b/crates/fuzzw/Cargo.toml
+new file mode 100644
+index 0000000..e6e26b3
+--- /dev/null
++++ b/crates/fuzzw/Cargo.toml
+@@ -0,0 +1,22 @@
++[package]
++name = "fuzzw"
++version = "0.0.0"
++edition = "2021"
++publish = false
++
++[dependencies]
++
++[dev-dependencies]
++zemdb-core = { path = "../core" }
++zemdb-storage = { path = "../storage" }
++serde = { workspace = true }
++serde_json = { workspace = true }
++bincode = { workspace = true }
++bytes = { workspace = true }
++zstd = { workspace = true }
++crc32fast = { workspace = true }
++tokio = { workspace = true }
++tempfile = { workspace = true }
++futures = { workspace = true }
++smallvec = { workspace = true }
++proptest = "1"
+diff --git a/crates/fuzzw/src/lib.rs b/crates/fuzzw/src/lib.rs
+new file mode 100644
+index 0000000..8b13789
+--- /dev/null
++++ b/crates/fuzzw/src/lib.rs
+@@ -0,0 +1 @@
++
+diff --git a/crates/fuzzw/tests/common/mod.rs b/crates/fuzzw/tests/common/mod.rs
+new file mode 100644
+index 0000000..3327a7d
+--- /dev/null
++++ b/crates/fuzzw/tests/common/mod.rs
+@@ -0,0 +1,548 @@
++#![allow(dead_code)]
++//! Shared fuzzing support: a byte-counting global allocator, a PRNG, libFuzzer-like mutators
++//! and valid sample inputs for every format.
++
++use std::alloc::{GlobalAlloc, Layout, System};
++use std::panic::{catch_unwind, AssertUnwindSafe};
++use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
++
++use zemdb_core::mutation::{ColumnUpdate, Operation, OperationKind};
++use zemdb_core::schema::{ColumnDef, Schema, TableBuilder};
++use zemdb_core::value::{CompactRow, DataType, PrimaryKey, Value};
++use zemdb_core::{
++    ClientId, ClientMessage, CorrelationId, ErrorCode, MutationId, RoomId, SchemaId,
++    SequenceNumber, SequencedOperation, ServerMessage,
++};
++
++// ---------------------------------------------------------------------------------------------
++// Counting allocator
++// ---------------------------------------------------------------------------------------------
++
++pub struct Counting;
++
++pub static CURRENT: AtomicUsize = AtomicUsize::new(0);
++pub static PEAK: AtomicUsize = AtomicUsize::new(0);
++pub static MAX_SINGLE: AtomicUsize = AtomicUsize::new(0);
++
++fn grow(n: usize, single: usize) {
++    let now = CURRENT.fetch_add(n, Relaxed) + n;
++    PEAK.fetch_max(now, Relaxed);
++    MAX_SINGLE.fetch_max(single, Relaxed);
++}
++
++unsafe impl GlobalAlloc for Counting {
++    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
++        let p = unsafe { System.alloc(layout) };
++        if !p.is_null() {
++            grow(layout.size(), layout.size());
++        }
++        p
++    }
++    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
++        let p = unsafe { System.alloc_zeroed(layout) };
++        if !p.is_null() {
++            grow(layout.size(), layout.size());
++        }
++        p
++    }
++    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
++        unsafe { System.dealloc(ptr, layout) };
++        CURRENT.fetch_sub(layout.size(), Relaxed);
++    }
++    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
++        let q = unsafe { System.realloc(ptr, layout, new_size) };
++        if !q.is_null() {
++            if new_size >= layout.size() {
++                grow(new_size - layout.size(), new_size);
++            } else {
++                CURRENT.fetch_sub(layout.size() - new_size, Relaxed);
++            }
++        }
++        q
++    }
++}
++
++#[global_allocator]
++static GLOBAL: Counting = Counting;
++
++/// Peak bytes allocated above the starting level while `f` ran, and the largest single
++/// allocation request.
++pub fn measure<R>(f: impl FnOnce() -> R) -> (R, usize, usize) {
++    let base = CURRENT.load(Relaxed);
++    PEAK.store(base, Relaxed);
++    MAX_SINGLE.store(0, Relaxed);
++    let r = f();
++    let peak = PEAK.load(Relaxed).saturating_sub(base);
++    (r, peak, MAX_SINGLE.load(Relaxed))
++}
++
++/// Statistics of a fuzzing campaign.
++#[derive(Debug, Default)]
++pub struct Stats {
++    pub iterations: u64,
++    pub ok: u64,
++    pub errors: u64,
++    pub max_peak: usize,
++    pub max_peak_input_len: usize,
++    pub max_single: usize,
++    pub worst_ratio: f64,
++    pub worst_ratio_peak: usize,
++    pub worst_ratio_len: usize,
++    pub worst_ratio_input: Vec<u8>,
++}
++
++impl Stats {
++    pub fn record(&mut self, input: &[u8], ok: bool, peak: usize, single: usize) {
++        self.iterations += 1;
++        if ok {
++            self.ok += 1
++        } else {
++            self.errors += 1
++        }
++        if peak > self.max_peak {
++            self.max_peak = peak;
++            self.max_peak_input_len = input.len();
++        }
++        self.max_single = self.max_single.max(single);
++        let ratio = peak as f64 / (input.len().max(1)) as f64;
++        if ratio > self.worst_ratio {
++            self.worst_ratio = ratio;
++            self.worst_ratio_peak = peak;
++            self.worst_ratio_len = input.len();
++            self.worst_ratio_input = input.to_vec();
++        }
++    }
++
++    pub fn report(&self, name: &str) {
++        eprintln!(
++            "[{name}] iters={} ok={} err={} max_peak={}B (input {}B) max_single_alloc={}B worst_ratio={:.1}x (peak {}B / input {}B) worst_input_prefix={}",
++            self.iterations,
++            self.ok,
++            self.errors,
++            self.max_peak,
++            self.max_peak_input_len,
++            self.max_single,
++            self.worst_ratio,
++            self.worst_ratio_peak,
++            self.worst_ratio_len,
++            hex(&self.worst_ratio_input[..self.worst_ratio_input.len().min(64)]),
++        );
++    }
++}
++
++pub fn hex(b: &[u8]) -> String {
++    b.iter().map(|x| format!("{x:02x}")).collect()
++}
++
++/// Runs `f` catching panics; on a panic, fails the test printing the input.
++pub fn no_panic<R>(name: &str, input: &[u8], f: impl FnOnce() -> R) -> R {
++    match catch_unwind(AssertUnwindSafe(f)) {
++        Ok(r) => r,
++        Err(e) => {
++            let msg = e
++                .downcast_ref::<String>()
++                .cloned()
++                .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
++                .unwrap_or_default();
++            panic!("[{name}] PANIC on input {} : {msg}", hex(input));
++        }
++    }
++}
++
++pub fn iterations(default: u64) -> u64 {
++    std::env::var("FUZZ_ITERS")
++        .ok()
++        .and_then(|s| s.parse().ok())
++        .unwrap_or(default)
++}
++
++// ---------------------------------------------------------------------------------------------
++// PRNG and mutators
++// ---------------------------------------------------------------------------------------------
++
++pub struct Rng(u64);
++
++impl Rng {
++    pub fn new(seed: u64) -> Self {
++        Rng(seed ^ 0x9E37_79B9_7F4A_7C15)
++    }
++    pub fn next(&mut self) -> u64 {
++        // splitmix64
++        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
++        let mut z = self.0;
++        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
++        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
++        z ^ (z >> 31)
++    }
++    pub fn below(&mut self, n: usize) -> usize {
++        if n == 0 {
++            0
++        } else {
++            (self.next() % n as u64) as usize
++        }
++    }
++    pub fn chance(&mut self, num: u64, den: u64) -> bool {
++        self.next() % den < num
++    }
++    pub fn bytes(&mut self, n: usize) -> Vec<u8> {
++        (0..n).map(|_| self.next() as u8).collect()
++    }
++}
++
++const INTERESTING_U8: [u8; 12] = [0, 1, 0x7F, 0x80, 0xFA, 0xFB, 0xFC, 0xFD, 0xFE, 0xFF, 0x10, 0x40];
++const INTERESTING_U64: [u64; 14] = [
++    0,
++    1,
++    0xFF,
++    0xFFFF,
++    0x1_0000,
++    65_535,
++    65_536,
++    1 << 20,
++    (1 << 20) + 1,
++    16 * 1024 * 1024,
++    0x7FFF_FFFF,
++    0xFFFF_FFFF,
++    1 << 40,
++    u64::MAX,
++];
++
++/// Applies 1-4 random mutations to `data`, never touching the first `keep` bytes unless
++/// `rng` decides to (with low probability).
++pub fn mutate(rng: &mut Rng, data: &mut Vec<u8>, keep: usize, pool: &[Vec<u8>]) {
++    let rounds = 1 + rng.below(4);
++    for _ in 0..rounds {
++        let lo = if rng.chance(1, 20) { 0 } else { keep.min(data.len()) };
++        let len = data.len();
++        match rng.below(11) {
++            0 if len > lo => {
++                let i = lo + rng.below(len - lo);
++                data[i] ^= 1 << rng.below(8);
++            }
++            1 if len > lo => {
++                let i = lo + rng.below(len - lo);
++                data[i] = rng.next() as u8;
++            }
++            2 if len > lo => {
++                let i = lo + rng.below(len - lo);
++                data[i] = INTERESTING_U8[rng.below(INTERESTING_U8.len())];
++            }
++            3 => {
++                let i = lo + rng.below(len - lo + 1);
++                let n = 1 + rng.below(16);
++                let ins = rng.bytes(n);
++                data.splice(i..i, ins);
++            }
++            4 if len > lo => {
++                let i = lo + rng.below(len - lo);
++                let n = 1 + rng.below((len - i).min(32));
++                data.drain(i..i + n);
++            }
++            5 if len > lo => {
++                // bincode varint marker followed by an interesting value
++                let i = lo + rng.below(len - lo);
++                let v = INTERESTING_U64[rng.below(INTERESTING_U64.len())];
++                let mut enc = Vec::new();
++                match rng.below(4) {
++                    0 => {
++                        enc.push(0xFB);
++                        enc.extend_from_slice(&(v as u16).to_le_bytes());
++                    }
++                    1 => {
++                        enc.push(0xFC);
++                        enc.extend_from_slice(&(v as u32).to_le_bytes());
++                    }
++                    2 => {
++                        enc.push(0xFD);
++                        enc.extend_from_slice(&v.to_le_bytes());
++                    }
++                    _ => enc.extend_from_slice(&v.to_le_bytes()), // fixint
++                }
++                let end = (i + enc.len()).min(data.len());
++                data.splice(i..end, enc);
++            }
++            6 if len > lo => {
++                let i = lo + rng.below(len - lo);
++                data.truncate(i);
++            }
++            7 if len > lo + 1 => {
++                // duplicate a range
++                let a = lo + rng.below(len - lo);
++                let n = 1 + rng.below((len - a).min(64));
++                let chunk = data[a..a + n].to_vec();
++                let at = lo + rng.below(data.len() - lo + 1);
++                data.splice(at..at, chunk);
++            }
++            8 if !pool.is_empty() => {
++                // splice from another sample
++                let other = &pool[rng.below(pool.len())];
++                if !other.is_empty() {
++                    let a = rng.below(other.len());
++                    let n = 1 + rng.below((other.len() - a).min(64));
++                    let at = lo + rng.below(data.len() - lo + 1);
++                    let end = (at + n).min(data.len());
++                    data.splice(at..end, other[a..a + n].iter().copied());
++                }
++            }
++            9 if len > lo => {
++                // overwrite a random u32 / u64 little endian
++                let i = lo + rng.below(len - lo);
++                let v = INTERESTING_U64[rng.below(INTERESTING_U64.len())];
++                let bytes = v.to_le_bytes();
++                for (k, b) in bytes.iter().enumerate().take(if rng.chance(1, 2) { 4 } else { 8 }) {
++                    if i + k < data.len() {
++                        data[i + k] = *b;
++                    }
++                }
++            }
++            _ => {
++                if len > lo {
++                    let i = lo + rng.below(len - lo);
++                    data[i] = data[i].wrapping_add(1 + rng.below(4) as u8);
++                }
++            }
++        }
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// Sample inputs
++// ---------------------------------------------------------------------------------------------
++
++pub fn room() -> RoomId {
++    RoomId::new("room-1").unwrap()
++}
++
++pub fn values() -> Vec<Value> {
++    vec![
++        Value::Null,
++        Value::Int(-5),
++        Value::Int(i64::MAX),
++        Value::Float(-0.0),
++        Value::Float(f64::NAN),
++        Value::Float(1.5),
++        Value::Timestamp(1_700_000_000),
++        Value::String("héllo".into()),
++        Value::Bool(true),
++        Value::Bytes(vec![1, 2, 3, 0xFF].into_boxed_slice()),
++        Value::Uuid([7u8; 16]),
++    ]
++}
++
++pub fn sample_ops() -> Vec<SequencedOperation> {
++    vec![
++        SequencedOperation::new(
++            1u64,
++            Operation::insert(
++                0,
++                PrimaryKey::single(1i64),
++                CompactRow::new(vec![Value::Int(1), Value::String("a".into()), Value::Null]),
++                10,
++            ),
++        ),
++        SequencedOperation::new(
++            2u64,
++            Operation::update(
++                0,
++                PrimaryKey::single(1i64),
++                vec![ColumnUpdate::new(1, "b"), ColumnUpdate::new(2, Value::Float(2.0))],
++                11,
++            ),
++        ),
++        SequencedOperation::new(
++            3u64,
++            Operation::delete(1, PrimaryKey::composite([Value::Int(1), Value::Uuid([1; 16])]), 12),
++        ),
++        SequencedOperation::new(
++            4u64,
++            Operation::insert(1, PrimaryKey::single(Value::Bytes(vec![9; 3].into())), CompactRow::new(values()), 13),
++        ),
++    ]
++}
++
++pub fn sample_schema() -> Schema {
++    let mut s = Schema::builder()
++        .table(
++            TableBuilder::new("items")
++                .table_id(0)
++                .primary_key("id", DataType::Int)
++                .column("name", DataType::String)
++                .nullable_column("price", DataType::Float),
++        )
++        .table(
++            TableBuilder::new("links")
++                .table_id(1)
++                .primary_key("a", DataType::Int)
++                .primary_key("b", DataType::Uuid)
++                .encrypted_column("secret", DataType::String)
++                .nullable_column("flag", DataType::Bool),
++        )
++        .build();
++    s.add_column("items", ColumnDef::new("extra", DataType::Bytes).nullable(true))
++        .unwrap();
++    s
++}
++
++pub fn client_messages() -> Vec<ClientMessage> {
++    let ops = sample_ops();
++    let cid = ClientId::new("client-ä").unwrap();
++    let mut out = vec![];
++    for op in &ops {
++        out.push(ClientMessage::Commit {
++            correlation_id: CorrelationId::new(7),
++            room_id: room(),
++            client_id: cid.clone(),
++            mutation_id: MutationId::from_u128(99),
++            last_ack_seq: SequenceNumber::new(300),
++            op: op.op.clone(),
++        });
++    }
++    out.extend([
++        ClientMessage::Ack {
++            correlation_id: CorrelationId::new(1),
++            room_id: room(),
++            client_id: cid.clone(),
++            ack_seq: SequenceNumber::new(u64::MAX),
++        },
++        ClientMessage::Sync {
++            correlation_id: CorrelationId::new(1),
++            room_id: room(),
++            client_id: cid.clone(),
++            from_seq: SequenceNumber::new(70_000),
++            max_batch_size: 1000,
++        },
++        ClientMessage::Heartbeat {
++            correlation_id: CorrelationId::new(1),
++            room_id: room(),
++            client_id: cid.clone(),
++        },
++        ClientMessage::RegisterClient {
++            correlation_id: CorrelationId::new(1),
++            room_id: room(),
++            client_id: cid.clone(),
++            auth_token: "v1.abc.def.123.ff".into(),
++            current_seq: Some(SequenceNumber::new(5)),
++            known_incarnation: Some(u128::MAX - 3),
++        },
++        ClientMessage::GetSchema {
++            correlation_id: CorrelationId::new(1),
++            room_id: room(),
++        },
++        ClientMessage::DeregisterClient {
++            correlation_id: CorrelationId::new(1),
++            room_id: room(),
++            client_id: cid.clone(),
++        },
++        ClientMessage::RequestSnapshotChunk {
++            correlation_id: CorrelationId::new(1),
++            room_id: room(),
++            chunk_index: 3,
++            chunk_size: 65536,
++            snapshot_hash: Some([5; 32]),
++        },
++        ClientMessage::UploadSnapshotChunk {
++            correlation_id: CorrelationId::new(1),
++            room_id: room(),
++            snapshot_head_seq: SequenceNumber::new(9),
++            chunk_index: 0,
++            total_chunks: 2,
++            total_bytes: 100,
++            snapshot_hash: [1; 32],
++            data: bytes::Bytes::from_static(b"some snapshot bytes"),
++        },
++    ]);
++    out
++}
++
++pub fn server_messages() -> Vec<ServerMessage> {
++    let ops = sample_ops();
++    vec![
++        ServerMessage::CommitAck {
++            correlation_id: CorrelationId::new(1),
++            room_id: room(),
++            mutation_id: MutationId::from_u128(5),
++            assigned_seq: SequenceNumber::new(5),
++            catchup_ops: ops.clone(),
++            has_more: true,
++            snapshot_wanted: false,
++            schema_version: 3,
++        },
++        ServerMessage::AckConfirmed {
++            correlation_id: CorrelationId::new(1),
++            room_id: room(),
++            ack_seq: SequenceNumber::new(4),
++            head_seq: SequenceNumber::new(5),
++        },
++        ServerMessage::SyncBatch {
++            correlation_id: CorrelationId::new(1),
++            room_id: room(),
++            head_seq: SequenceNumber::new(5),
++            ops,
++            has_more: false,
++            snapshot_wanted: true,
++            schema_version: 2,
++        },
++        ServerMessage::SnapshotChunk {
++            correlation_id: CorrelationId::new(1),
++            room_id: room(),
++            snapshot_head_seq: SequenceNumber::new(5),
++            chunk_index: 0,
++            total_chunks: 1,
++            total_bytes: 5,
++            snapshot_hash: [3; 32],
++            data: bytes::Bytes::from_static(b"hello"),
++        },
++        ServerMessage::SnapshotUploadChunkAck {
++            correlation_id: CorrelationId::new(1),
++            room_id: room(),
++            chunk_index: 0,
++            total_chunks: 1,
++            staged: true,
++        },
++        ServerMessage::SnapshotStaged {
++            room_id: room(),
++            snapshot_head_seq: SequenceNumber::new(5),
++            snapshot_hash: [4; 32],
++        },
++        ServerMessage::HeartbeatAck {
++            correlation_id: CorrelationId::new(1),
++            room_id: room(),
++            current_head_seq: SequenceNumber::new(5),
++            snapshot_wanted: false,
++            active_snapshot_seq: Some(SequenceNumber::new(3)),
++            schema_version: 2,
++        },
++        ServerMessage::DeregisterAck {
++            correlation_id: CorrelationId::new(1),
++            room_id: room(),
++            client_id: ClientId::new("x").unwrap(),
++        },
++        ServerMessage::Registered {
++            correlation_id: CorrelationId::new(1),
++            room_id: room(),
++            head_seq: SequenceNumber::new(5),
++            tail_seq: SequenceNumber::new(1),
++            schema_id: SchemaId::new("todo").unwrap(),
++            schema: sample_schema(),
++            active_snapshot_seq: None,
++            room_incarnation: 77,
++        },
++        ServerMessage::Schema {
++            correlation_id: CorrelationId::new(1),
++            room_id: room(),
++            schema_id: SchemaId::new("todo").unwrap(),
++            schema: sample_schema(),
++        },
++        ServerMessage::Error {
++            correlation_id: None,
++            room_id: Some(room()),
++            code: ErrorCode::RoomReset,
++            message: "boom".into(),
++        },
++    ]
++}
++
++/// Keeps `OperationKind` referenced for samples built elsewhere.
++pub fn is_update(op: &Operation) -> bool {
++    matches!(op.kind(), OperationKind::Update { .. })
++}
+diff --git a/crates/fuzzw/tests/crafted.rs b/crates/fuzzw/tests/crafted.rs
+new file mode 100644
+index 0000000..5e16ca4
+--- /dev/null
++++ b/crates/fuzzw/tests/crafted.rs
+@@ -0,0 +1,153 @@
++//! Hand-crafted worst cases for INV-W1, measured with the counting allocator.
++
++mod common;
++
++use common::*;
++use zemdb_core::mutation::Operation;
++use zemdb_core::value::{CompactRow, PrimaryKey, Value};
++use zemdb_core::{
++    decode_client_message, decode_message, encode_message, ClientId, ClientMessage, CorrelationId,
++    DecodeError, MutationId, SequenceNumber, SequencedOperation, ServerMessage, MAX_FRAME_SIZE,
++};
++
++fn report(name: &str, input: usize, peak: usize, single: usize, ok: bool) {
++    eprintln!(
++        "[{name}] input={input}B ok={ok} peak={peak}B ({:.1}x) max_single={single}B",
++        peak as f64 / input as f64
++    );
++}
++
++#[test]
++fn widest_commit_the_server_accepts() {
++    let pk = PrimaryKey::composite(vec![Value::Null; 65_535]);
++    let op = Operation::insert(0, pk, CompactRow::new(vec![Value::Null; 65_535]), 0);
++    let msg = ClientMessage::Commit {
++        correlation_id: CorrelationId::new(1),
++        room_id: room(),
++        client_id: ClientId::new("c").unwrap(),
++        mutation_id: MutationId::from_u128(1),
++        last_ack_seq: SequenceNumber::new(0),
++        op,
++    };
++    let frame = encode_message(&msg).unwrap();
++    let (r, peak, single) = measure(|| decode_client_message(&frame));
++    report("commit 2x65535 nulls", frame.len(), peak, single, r.is_ok());
++    assert!(r.is_ok());
++    assert!(peak < 4 << 20);
++}
++
++#[test]
++fn row_over_the_column_limit_is_rejected_before_decoding() {
++    let op = Operation::insert(0, PrimaryKey::single(1i64), CompactRow::new(vec![Value::Null; 65_536]), 0);
++    let msg = ClientMessage::Commit {
++        correlation_id: CorrelationId::new(1),
++        room_id: room(),
++        client_id: ClientId::new("c").unwrap(),
++        mutation_id: MutationId::from_u128(1),
++        last_ack_seq: SequenceNumber::new(0),
++        op,
++    };
++    let frame = encode_message(&msg).unwrap();
++    let (r, peak, single) = measure(|| decode_client_message(&frame));
++    report("row of 65536 nulls", frame.len(), peak, single, r.is_ok());
++    assert!(matches!(r, Err(DecodeError::Malformed(_))));
++}
++
++#[test]
++fn largest_sync_batch_of_tiny_operations_decoded_by_a_client() {
++    // As many single-null-key deletes as fit in one frame: the documented unbudgeted path.
++    let one = SequencedOperation::new(1u64, Operation::delete(0, PrimaryKey::single(Value::Null), 0));
++    let per = zemdb_core::protocol::encoded_len(&one).unwrap() as usize;
++    let n = (MAX_FRAME_SIZE - 64) / per;
++    let msg = ServerMessage::SyncBatch {
++        correlation_id: CorrelationId::new(1),
++        room_id: room(),
++        head_seq: SequenceNumber::new(1),
++        ops: vec![one; n],
++        has_more: false,
++        snapshot_wanted: false,
++        schema_version: 1,
++    };
++    let frame = encode_message(&msg).unwrap();
++    let (r, peak, single) = measure(|| decode_message::<ServerMessage>(&frame).map(|_| ()));
++    report("SyncBatch of tiny ops", frame.len(), peak, single, r.is_ok());
++    assert!(r.is_ok());
++}
++
++#[test]
++fn declared_lengths_far_beyond_the_frame() {
++    // Commit whose row declares u64::MAX values, and SyncBatch declaring u64::MAX ops.
++    let mut commit = vec![0x5A, 0x4D, 1, 0, 0, 1, 6];
++    commit.extend_from_slice(b"room-1");
++    commit.extend_from_slice(&[1, b'c']);
++    commit.extend_from_slice(&[0u8; 16]);
++    commit.extend_from_slice(&[0, 0, 0, 0, 0]); // last_ack, table, ts, pk len, kind Insert
++    commit.push(0xFD);
++    commit.extend_from_slice(&u64::MAX.to_le_bytes());
++    let (r, peak, single) = measure(|| decode_client_message(&commit));
++    report("row declaring u64::MAX values", commit.len(), peak, single, r.is_ok());
++    assert!(r.is_err());
++
++    let mut sync = vec![0x5A, 0x4D, 1, 0, 2, 1, 6];
++    sync.extend_from_slice(b"room-1");
++    sync.push(1);
++    sync.push(0xFD);
++    sync.extend_from_slice(&u64::MAX.to_le_bytes());
++    let (r, peak, single) = measure(|| decode_message::<ServerMessage>(&sync).map(|_| ()));
++    report("SyncBatch declaring u64::MAX ops", sync.len(), peak, single, r.is_ok());
++    assert!(r.is_err());
++    assert!(single <= 1 << 20);
++}
++
++#[test]
++fn unknown_fields_inside_a_column_are_ignored() {
++    use zemdb_core::schema::Schema;
++    let json = r#"{"version":1,"tables":[{"table_id":0,"name":"t","primary_key":["id"],
++        "columns":[{"name":"id","data_type":"Int","nullable":false,"encrypted":false,"primary_key":true,"default":7}]}]}"#;
++    let parsed = serde_json::from_str::<Schema>(json);
++    eprintln!("[column unknown fields] accepted: {}", parsed.is_ok());
++    let at_table = r#"{"version":1,"tables":[{"table_id":0,"name":"t","primary_key":["id"],"extra":1,
++        "columns":[{"name":"id","data_type":"Int","nullable":false,"encrypted":false}]}]}"#;
++    eprintln!("[table unknown fields] accepted: {}", serde_json::from_str::<Schema>(at_table).is_ok());
++    let dup_pk = r#"{"version":1,"tables":[{"table_id":0,"name":"t","primary_key":["id","id"],
++        "columns":[{"name":"id","data_type":"Int","nullable":false,"encrypted":false}]}]}"#;
++    eprintln!("[repeated primary key column] accepted: {}", serde_json::from_str::<Schema>(dup_pk).is_ok());
++    let dup_key = r#"{"version":1,"version":5,"tables":[]}"#;
++    eprintln!("[repeated JSON key] accepted: {:?}", serde_json::from_str::<Schema>(dup_key).map(|s| s.version()));
++}
++
++#[test]
++fn apply_snapshot_memory_per_payload_byte() {
++    use bytes::Bytes;
++    use zemdb_core::schema::{Schema, TableBuilder};
++    use zemdb_core::value::DataType;
++    use zemdb_core::RoomId;
++    use zemdb_storage::{MemoryStorageEngine, StorageEngine};
++    let schema = Schema::builder()
++        .table(TableBuilder::new("t").table_id(0).primary_key("id", DataType::Int))
++        .build();
++    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
++    let room = RoomId::new("big").unwrap();
++    let n = 300_000u64;
++    let snap = rt.block_on(async {
++        let src = MemoryStorageEngine::new();
++        src.open_room(&room, schema.clone()).await.unwrap();
++        let ops: Vec<_> = (1..=n)
++            .map(|k| SequencedOperation::new(k, Operation::insert(0, PrimaryKey::single(k as i64), CompactRow::new(vec![Value::Int(k as i64)]), 0)))
++            .collect();
++        src.apply_batch(&room, ops).await.unwrap();
++        src.create_snapshot(&room).await.unwrap()
++    });
++    let compressed = zstd::encode_all(&snap[14..], 19).unwrap();
++    let dst = MemoryStorageEngine::new();
++    rt.block_on(dst.open_room(&room, schema.clone())).unwrap();
++    let len = snap.len();
++    let (r, peak, single) = measure(|| rt.block_on(dst.apply_snapshot(&room, schema.clone(), Bytes::from(snap), SequenceNumber::new(n))));
++    assert!(r.is_ok());
++    eprintln!(
++        "[apply_snapshot {n} rows] raw payload={len}B zstd19={}B peak={peak}B ({:.2}x raw, {:.1}x zstd) max_single={single}B",
++        compressed.len(),
++        peak as f64 / len as f64,
++        peak as f64 / compressed.len() as f64
++    );
++}
+diff --git a/crates/fuzzw/tests/fuzz_decoders.rs b/crates/fuzzw/tests/fuzz_decoders.rs
+new file mode 100644
+index 0000000..ffb53a5
+--- /dev/null
++++ b/crates/fuzzw/tests/fuzz_decoders.rs
+@@ -0,0 +1,279 @@
++//! Homemade fuzzing of every decoder of INV-W1, with a byte-counting allocator.
++//!
++//! Run in release, one thread: `cargo test -p fuzzw --release --test fuzz_decoders -- --test-threads=1 --nocapture`.
++
++mod common;
++
++use common::*;
++use std::io::Cursor;
++use zemdb_core::protocol::wal_frame::{decode_batch_payload, parse_batch_header, BATCH_HEADER_SIZE};
++use zemdb_core::schema::Schema;
++use zemdb_core::{
++    decode_client_message, decode_message, decode_wal_batch_from_slice, encode_message,
++    encode_wal_batch, find_valid_frame, peek_client_message_kind, replay_wal_records,
++    validate_snapshot_envelope, ClientMessage, MutationId, ServerMessage, SnapshotEnvelopeHeader,
++    SnapshotEnvelopeValidator,
++};
++
++fn wire_pool_client() -> Vec<Vec<u8>> {
++    client_messages()
++        .iter()
++        .map(|m| encode_message(m).unwrap())
++        .collect()
++}
++
++fn wire_pool_server() -> Vec<Vec<u8>> {
++    server_messages()
++        .iter()
++        .map(|m| encode_message(m).unwrap())
++        .collect()
++}
++
++fn next_input(rng: &mut Rng, pool: &[Vec<u8>], header: &[u8]) -> Vec<u8> {
++    let mut data = if rng.chance(1, 10) {
++        let mut d = header.to_vec();
++        let n = rng.below(96);
++        d.extend(rng.bytes(n));
++        d
++    } else {
++        pool[rng.below(pool.len())].clone()
++    };
++    mutate(rng, &mut data, header.len(), pool);
++    data
++}
++
++#[test]
++fn fuzz_decode_client_message() {
++    let pool = wire_pool_client();
++    let mut rng = Rng::new(1);
++    let mut stats = Stats::default();
++    let mut peek = Stats::default();
++    let n = iterations(3_000_000);
++    for _ in 0..n {
++        let input = next_input(&mut rng, &pool, b"ZM\x01\x00");
++        let (r, peak, single) = measure(|| {
++            no_panic("decode_client_message", &input, || decode_client_message(&input))
++        });
++        stats.record(&input, r.is_ok(), peak, single);
++        let (r, peak, single) = measure(|| {
++            no_panic("peek_client_message_kind", &input, || peek_client_message_kind(&input))
++        });
++        peek.record(&input, r.is_ok(), peak, single);
++    }
++    stats.report("decode_client_message");
++    peek.report("peek_client_message_kind");
++}
++
++#[test]
++fn fuzz_decode_message_server_and_client_types() {
++    let pool = wire_pool_server();
++    let mut rng = Rng::new(2);
++    let mut stats = Stats::default();
++    let n = iterations(3_000_000);
++    for _ in 0..n {
++        let input = next_input(&mut rng, &pool, b"ZM\x01\x00");
++        let (r, peak, single) = measure(|| {
++            no_panic("decode_message<ServerMessage>", &input, || {
++                decode_message::<ServerMessage>(&input)
++            })
++        });
++        stats.record(&input, r.is_ok(), peak, single);
++    }
++    stats.report("decode_message<ServerMessage>");
++
++    // decode_message<ClientMessage> (the unbudgeted path a client SDK could use) over the client pool.
++    let pool = wire_pool_client();
++    let mut stats = Stats::default();
++    for _ in 0..n / 3 {
++        let input = next_input(&mut rng, &pool, b"ZM\x01\x00");
++        let (r, peak, single) = measure(|| {
++            no_panic("decode_message<ClientMessage>", &input, || {
++                decode_message::<ClientMessage>(&input)
++            })
++        });
++        stats.record(&input, r.is_ok(), peak, single);
++    }
++    stats.report("decode_message<ClientMessage>");
++}
++
++/// A log of several frames, with and without mutation ids and an empty frame.
++fn sample_log() -> Vec<u8> {
++    let ops = sample_ops();
++    let mut log = Vec::new();
++    log.extend(encode_wal_batch(&ops[..1], Some(MutationId::from_u128(1))).unwrap());
++    log.extend(encode_wal_batch(&ops[1..3], None).unwrap());
++    log.extend(encode_wal_batch(&[], None).unwrap());
++    log.extend(encode_wal_batch(&ops[3..], Some(MutationId::from_u128(9))).unwrap());
++    log
++}
++
++/// Rewrites the CRCs of the frame starting at `at` (payload CRC, then header CRC), if a header
++/// fits there and declares a payload that fits.
++fn fix_frame_crcs(data: &mut [u8], at: usize) {
++    if data.len() < at + BATCH_HEADER_SIZE {
++        return;
++    }
++    let len = u32::from_le_bytes(data[at + 2..at + 6].try_into().unwrap()) as usize;
++    let start = at + BATCH_HEADER_SIZE;
++    if start + len <= data.len() {
++        let crc = crc32fast::hash(&data[start..start + len]);
++        data[at + 6..at + 10].copy_from_slice(&crc.to_le_bytes());
++    }
++    let hcrc = crc32fast::hash(&data[at..at + 14]);
++    data[at + 14..at + 18].copy_from_slice(&hcrc.to_le_bytes());
++}
++
++#[test]
++fn fuzz_wal_frames() {
++    let log = sample_log();
++    // Offsets of the frames in the sample log.
++    let mut offsets = vec![];
++    let mut at = 0;
++    while at < log.len() {
++        offsets.push(at);
++        let len = u32::from_le_bytes(log[at + 2..at + 6].try_into().unwrap()) as usize;
++        at += BATCH_HEADER_SIZE + len;
++    }
++    let pool = vec![log.clone()];
++    let mut rng = Rng::new(3);
++    let mut replay = Stats::default();
++    let mut single_frame = Stats::default();
++    let mut payload_stats = Stats::default();
++    let n = iterations(2_000_000);
++    for i in 0..n {
++        let mut data = log.clone();
++        mutate(&mut rng, &mut data, 0, &pool);
++        // Two thirds of the inputs get their CRCs fixed so that the payload decoder is reached.
++        if i % 3 != 0 {
++            let frame = offsets[rng.below(offsets.len())];
++            let at = frame.min(data.len());
++            fix_frame_crcs(&mut data, at);
++        }
++        let (r, peak, single) = measure(|| {
++            no_panic("replay_wal_records", &data, || replay_wal_records(&data))
++        });
++        replay.record(&data, r.is_ok(), peak, single);
++
++        let off = offsets[rng.below(offsets.len())].min(data.len());
++        let slice = &data[off..];
++        let (r, peak, single) = measure(|| {
++            no_panic("decode_wal_batch_from_slice", slice, || {
++                let r = decode_wal_batch_from_slice(slice);
++                let _ = find_valid_frame(&mut Cursor::new(slice), rng_offset(slice.len()), slice.len() as u64);
++                if let Some(h) = slice.first_chunk::<BATCH_HEADER_SIZE>() {
++                    let _ = parse_batch_header(h);
++                }
++                r
++            })
++        });
++        single_frame.record(slice, r.is_ok(), peak, single);
++    }
++    // Arbitrary payloads under a matching header: the bincode payload decoder alone.
++    let payloads: Vec<Vec<u8>> = offsets
++        .iter()
++        .map(|&o| {
++            let len = u32::from_le_bytes(log[o + 2..o + 6].try_into().unwrap()) as usize;
++            log[o + BATCH_HEADER_SIZE..o + BATCH_HEADER_SIZE + len].to_vec()
++        })
++        .collect();
++    for _ in 0..n {
++        let mut p = payloads[rng.below(payloads.len())].clone();
++        mutate(&mut rng, &mut p, 0, &payloads);
++        let mut frame = encode_wal_batch(&[], None).unwrap()[..BATCH_HEADER_SIZE].to_vec();
++        frame[2..6].copy_from_slice(&(p.len() as u32).to_le_bytes());
++        frame[10..14].copy_from_slice(&((rng.next() % 4) as u32).to_le_bytes());
++        frame.extend_from_slice(&p);
++        fix_frame_crcs(&mut frame, 0);
++        let header = parse_batch_header(frame[..BATCH_HEADER_SIZE].try_into().unwrap()).unwrap();
++        let (r, peak, single) = measure(|| {
++            no_panic("decode_batch_payload", &p, || decode_batch_payload(&header, &p))
++        });
++        payload_stats.record(&p, r.is_ok(), peak, single);
++    }
++    replay.report("replay_wal_records");
++    single_frame.report("decode_wal_batch_from_slice+find_valid_frame+parse_batch_header");
++    payload_stats.report("decode_batch_payload(valid CRC, arbitrary payload)");
++}
++
++fn rng_offset(len: usize) -> u64 {
++    (len / 3) as u64
++}
++
++#[test]
++fn fuzz_snapshot_envelope_header() {
++    let body = b"payload bytes of a raw snapshot".to_vec();
++    let header = SnapshotEnvelopeHeader::for_body(
++        zemdb_core::SnapshotCompression::Raw,
++        body.len() as u32,
++        &body,
++    );
++    let mut env = header.to_bytes().to_vec();
++    env.extend_from_slice(&body);
++    let pool = vec![env.clone()];
++    let mut rng = Rng::new(4);
++    let mut stats = Stats::default();
++    let n = iterations(3_000_000);
++    for _ in 0..n {
++        let mut data = if rng.chance(1, 10) {
++            let k = rng.below(40);
++            rng.bytes(k)
++        } else {
++            env.clone()
++        };
++        mutate(&mut rng, &mut data, 0, &pool);
++        let (r, peak, single) = measure(|| {
++            no_panic("SnapshotEnvelopeHeader::parse", &data, || {
++                let parsed = SnapshotEnvelopeHeader::parse(&data);
++                let whole = validate_snapshot_envelope(&data);
++                // The incremental validator must agree with the whole one, whatever the split.
++                let mut v = SnapshotEnvelopeValidator::new();
++                let mut rest: &[u8] = &data;
++                while !rest.is_empty() {
++                    let k = (1 + (rest.len() % 7)).min(rest.len());
++                    v.update(&rest[..k]);
++                    rest = &rest[k..];
++                }
++                let inc = v.finish();
++                assert_eq!(whole.is_ok(), inc.is_ok(), "incremental validator disagrees");
++                if let (Ok(a), Ok(b)) = (&whole, &inc) {
++                    assert_eq!(a, b);
++                }
++                parsed
++            })
++        });
++        stats.record(&data, r.is_ok(), peak, single);
++    }
++    stats.report("SnapshotEnvelopeHeader::parse+validate");
++}
++
++#[test]
++fn fuzz_schema_json() {
++    let schema = sample_schema();
++    let pretty = serde_json::to_vec_pretty(&schema).unwrap();
++    let compact = serde_json::to_vec(&schema).unwrap();
++    let pool = vec![pretty.clone(), compact.clone()];
++    let mut rng = Rng::new(5);
++    let mut stats = Stats::default();
++    let mut accepted_different = 0u64;
++    let n = iterations(2_000_000);
++    for _ in 0..n {
++        let mut data = pool[rng.below(2)].clone();
++        mutate(&mut rng, &mut data, 0, &pool);
++        let (r, peak, single) = measure(|| {
++            no_panic("serde_json::from_slice::<Schema>", &data, || {
++                serde_json::from_slice::<Schema>(&data)
++            })
++        });
++        if let Ok(s) = &r {
++            if *s != schema {
++                accepted_different += 1;
++            }
++        }
++        stats.record(&data, r.is_ok(), peak, single);
++    }
++    stats.report("serde_json::from_slice::<Schema>");
++    eprintln!("[schema json] mutated inputs accepted as a DIFFERENT valid schema: {accepted_different}");
++    // Deep nesting must be rejected, not overflow the stack.
++    let deep = format!("{}{}", "[".repeat(100_000), "]".repeat(100_000));
++    assert!(serde_json::from_str::<Schema>(&deep).is_err());
++}
+diff --git a/crates/fuzzw/tests/fuzz_storage.rs b/crates/fuzzw/tests/fuzz_storage.rs
+new file mode 100644
+index 0000000..b515a17
+--- /dev/null
++++ b/crates/fuzzw/tests/fuzz_storage.rs
+@@ -0,0 +1,276 @@
++//! Homemade fuzzing of the storage snapshot decoders (`apply_snapshot`, `decode_snapshot_envelope`)
++//! and of opening a disk room from damaged files.
++
++mod common;
++
++use bytes::Bytes;
++use common::*;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::Mutex;
++use zemdb_core::mutation::{ColumnUpdate, Operation};
++use zemdb_core::value::{CompactRow, PrimaryKey, Value};
++use zemdb_core::{
++    RoomId, SequenceNumber, SequencedOperation, SnapshotCompression, SnapshotEnvelopeHeader,
++    SNAPSHOT_HEADER_LEN,
++};
++use zemdb_storage::snapshot::decode_snapshot_envelope;
++use zemdb_storage::{
++    DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, ScanOptions, StorageEngine,
++    StorageError,
++};
++
++static PANICS: AtomicU64 = AtomicU64::new(0);
++static LAST_PANIC: Mutex<String> = Mutex::new(String::new());
++
++fn install_panic_counter() {
++    std::panic::set_hook(Box::new(|info| {
++        PANICS.fetch_add(1, Ordering::SeqCst);
++        let msg = info.to_string();
++        eprintln!("PANIC HOOK: {}", &msg[..msg.len().min(4000)]);
++        *LAST_PANIC.lock().unwrap() = msg;
++    }));
++}
++
++fn check_no_panic(name: &str, input: &[u8], res: &Result<SequenceNumber, StorageError>) {
++    if PANICS.load(Ordering::SeqCst) > 0 {
++        panic!(
++            "[{name}] panic inside the engine: {} ; input {}",
++            LAST_PANIC.lock().unwrap(),
++            hex(input)
++        );
++    }
++    if let Err(StorageError::Other(msg)) = res {
++        assert!(!msg.contains("Join error"), "[{name}] {msg} input {}", hex(input));
++    }
++}
++
++fn source_ops() -> Vec<SequencedOperation> {
++    let mut ops = vec![
++        Operation::insert(
++            0,
++            PrimaryKey::single(1i64),
++            CompactRow::new(vec![Value::Int(1), "a".into(), Value::Null, Value::Null]),
++            1,
++        ),
++        Operation::update(0, PrimaryKey::single(1i64), vec![ColumnUpdate::new(2, Value::Float(-0.0))], 2),
++        Operation::insert(
++            1,
++            PrimaryKey::composite([Value::Int(1), Value::Uuid([3; 16])]),
++            CompactRow::new(vec![Value::Int(1), Value::Uuid([3; 16]), Value::Bytes(vec![1, 2].into()), Value::Null]),
++            3,
++        ),
++        // A short row, from before the column `extra` was added.
++        Operation::insert(0, PrimaryKey::single(2i64), CompactRow::new(vec![Value::Int(2), "b".into(), Value::Float(f64::NAN)]), 4),
++        Operation::delete(0, PrimaryKey::single(3i64), 5),
++    ];
++    for k in 10..40i64 {
++        ops.push(Operation::insert(
++            0,
++            PrimaryKey::single(k),
++            CompactRow::new(vec![Value::Int(k), format!("row {k}").into(), Value::Float(k as f64), Value::Bytes(vec![k as u8; 5].into())]),
++            k as u64,
++        ));
++    }
++    ops.into_iter()
++        .enumerate()
++        .map(|(i, op)| SequencedOperation::new(i as u64 + 1, op))
++        .collect()
++}
++
++fn rt() -> tokio::runtime::Runtime {
++    tokio::runtime::Builder::new_current_thread()
++        .enable_all()
++        .build()
++        .unwrap()
++}
++
++fn rebuild_raw(payload: &[u8]) -> Vec<u8> {
++    let h = SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, payload.len() as u32, payload);
++    let mut v = h.to_bytes().to_vec();
++    v.extend_from_slice(payload);
++    v
++}
++
++fn rebuild_zstd(body: &[u8], declared: u32) -> Vec<u8> {
++    let h = SnapshotEnvelopeHeader::for_body(SnapshotCompression::Zstd, declared, body);
++    let mut v = h.to_bytes().to_vec();
++    v.extend_from_slice(body);
++    v
++}
++
++#[test]
++fn fuzz_apply_snapshot_and_envelopes() {
++    install_panic_counter();
++    let rt = rt();
++    let schema = sample_schema();
++    let src_room = RoomId::new("src").unwrap();
++    let ops = source_ops();
++    let head = SequenceNumber::new(ops.len() as u64);
++
++    // A raw envelope (memory engine) and a Zstandard one (disk engine) of the same state.
++    let (raw, zst) = rt.block_on(async {
++        let mem = MemoryStorageEngine::new();
++        mem.open_room(&src_room, schema.clone()).await.unwrap();
++        mem.apply_batch(&src_room, ops.clone()).await.unwrap();
++        let raw = mem.create_snapshot(&src_room).await.unwrap();
++        let dir = tempfile::tempdir().unwrap();
++        let disk = DiskStorageEngine::new(DiskStorageOptions::new(dir.path())).unwrap();
++        disk.open_room(&src_room, schema.clone()).await.unwrap();
++        disk.apply_batch(&src_room, ops.clone()).await.unwrap();
++        let zst = disk.create_snapshot(&src_room).await.unwrap();
++        (raw, zst)
++    });
++    let raw_payload = raw[SNAPSHOT_HEADER_LEN..].to_vec();
++    let zst_body = zst[SNAPSHOT_HEADER_LEN..].to_vec();
++    let zst_payload = decode_snapshot_envelope(&zst).unwrap();
++    // The table map is a HashMap: the two engines may write the tables in different orders.
++    eprintln!("[snapshot] memory and disk payload bytes identical: {}", zst_payload == raw_payload);
++    let pool = vec![raw_payload.clone()];
++
++    let target = MemoryStorageEngine::new();
++    let room = RoomId::new("dst").unwrap();
++    rt.block_on(target.open_room(&room, schema.clone())).unwrap();
++
++    let mut rng = Rng::new(11);
++    let mut apply_stats = Stats::default();
++    let mut env_stats = Stats::default();
++    let n = iterations(400_000);
++    let mut accepted = 0u64;
++    for i in 0..n {
++        let env: Vec<u8> = match i % 4 {
++            0 => {
++                let mut e = if rng.chance(1, 2) { raw.clone() } else { zst.clone() };
++                mutate(&mut rng, &mut e, 0, &pool);
++                e
++            }
++            1 => {
++                let mut p = raw_payload.clone();
++                mutate(&mut rng, &mut p, 0, &pool);
++                rebuild_raw(&p)
++            }
++            2 => {
++                let mut p = raw_payload.clone();
++                mutate(&mut rng, &mut p, 0, &pool);
++                let body = zstd::encode_all(&p[..], 1).unwrap();
++                let declared = if rng.chance(1, 4) { rng.next() as u32 % (1 << 22) } else { p.len() as u32 };
++                rebuild_zstd(&body, declared)
++            }
++            _ => {
++                let mut b = zst_body.clone();
++                mutate(&mut rng, &mut b, 0, &[]);
++                let declared = if rng.chance(1, 4) { rng.next() as u32 } else { raw_payload.len() as u32 };
++                rebuild_zstd(&b, declared)
++            }
++        };
++        let (r, peak, single) = measure(|| {
++            no_panic("decode_snapshot_envelope", &env, || decode_snapshot_envelope(&env).map(|_| ()))
++        });
++        env_stats.record(&env, r.is_ok(), peak, single);
++
++        let bytes = Bytes::from(env.clone());
++        let (res, peak, single) = measure(|| {
++            no_panic("apply_snapshot", &env, || {
++                rt.block_on(target.apply_snapshot(&room, schema.clone(), bytes, head))
++            })
++        });
++        check_no_panic("apply_snapshot", &env, &res);
++        apply_stats.record(&env, res.is_ok(), peak, single);
++        if res.is_ok() {
++            accepted += 1;
++            // Start from an empty room again, so that the next snapshot is not a no-op.
++            rt.block_on(async {
++                target.close_room(&room).await.unwrap();
++                target.open_room(&room, schema.clone()).await.unwrap();
++            });
++        }
++    }
++    env_stats.report("decode_snapshot_envelope");
++    apply_stats.report("MemoryStorageEngine::apply_snapshot");
++    eprintln!("[apply_snapshot] accepted {accepted} mutated snapshots");
++}
++
++/// Opening a disk room from a damaged snapshot file or WAL (with and without fixed CRCs).
++#[test]
++fn fuzz_disk_open_from_damaged_files() {
++    install_panic_counter();
++    let rt = rt();
++    let schema = sample_schema();
++    let room = RoomId::new("r").unwrap();
++    let ops = source_ops();
++    let base = tempfile::tempdir().unwrap();
++    let (snap, wal) = rt.block_on(async {
++        let disk = DiskStorageEngine::new(DiskStorageOptions::new(base.path()).auto_compact(false)).unwrap();
++        disk.open_room(&room, schema.clone()).await.unwrap();
++        disk.apply_batch(&room, ops[..20].to_vec()).await.unwrap();
++        disk.compact_room(&room).await.unwrap();
++        for op in &ops[20..] {
++            disk.apply_batch(&room, vec![op.clone()]).await.unwrap();
++        }
++        disk.close_room(&room).await.unwrap();
++        let snap = std::fs::read(disk.snap_file_path(&room)).unwrap();
++        let wal = std::fs::read(disk.wal_file_path(&room)).unwrap();
++        (snap, wal)
++    });
++    assert!(snap.len() > 64 && !wal.is_empty());
++
++    let mut rng = Rng::new(12);
++    let mut stats = Stats::default();
++    let n = iterations(20_000).min(60_000);
++    let mut opened = 0u64;
++    for i in 0..n {
++        let dir = tempfile::tempdir().unwrap();
++        let mut s = snap.clone();
++        let mut w = wal.clone();
++        let which = i % 4;
++        if which == 0 || which == 3 {
++            mutate(&mut rng, &mut s, 0, &[]);
++            if rng.chance(2, 3) && s.len() >= 64 {
++                // Fix the payload CRC and the header CRC so that the decoder is reached.
++                let len = u64::from_le_bytes(s[24..32].try_into().unwrap());
++                if (64 + len) as usize <= s.len() {
++                    let crc = crc32fast::hash(&s[64..64 + len as usize]);
++                    s[32..36].copy_from_slice(&crc.to_le_bytes());
++                }
++                let h = crc32fast::hash(&s[..36]);
++                s[36..40].copy_from_slice(&h.to_le_bytes());
++            }
++        }
++        if which == 1 || which == 3 {
++            mutate(&mut rng, &mut w, 0, &[]);
++        }
++        let compacting = which == 2;
++        if compacting {
++            mutate(&mut rng, &mut w, 0, &[]);
++        }
++        let engine = DiskStorageEngine::new(DiskStorageOptions::new(dir.path()).auto_compact(false)).unwrap();
++        std::fs::write(engine.snap_file_path(&room), &s).unwrap();
++        if compacting {
++            let mut p = engine.wal_file_path(&room).into_os_string();
++            p.push(".compacting");
++            std::fs::write(p, &w).unwrap();
++            std::fs::write(engine.wal_file_path(&room), b"").unwrap();
++        } else {
++            std::fs::write(engine.wal_file_path(&room), &w).unwrap();
++        }
++        let input = [s.as_slice(), w.as_slice()].concat();
++        let (res, peak, single) = measure(|| {
++            no_panic("disk open_room", &input, || {
++                rt.block_on(async {
++                    let r = engine.open_room(&room, schema.clone()).await;
++                    if r.is_ok() {
++                        let _ = engine.scan_by_id(&room, 0, ScanOptions::default()).await.map(|_| ());
++                        let _ = engine.close_room(&room).await;
++                    }
++                    r.map(|_| SequenceNumber::new(0))
++                })
++            })
++        });
++        check_no_panic("disk open_room", &input, &res);
++        if res.is_ok() {
++            opened += 1;
++        }
++        stats.record(&input, res.is_ok(), peak, single);
++    }
++    stats.report("DiskStorageEngine::open_room (damaged .snap/.wal/.wal.compacting)");
++    eprintln!("[disk open] opened {opened} of {n}");
++}
+diff --git a/crates/fuzzw/tests/roundtrip.rs b/crates/fuzzw/tests/roundtrip.rs
+new file mode 100644
+index 0000000..86d18b2
+--- /dev/null
++++ b/crates/fuzzw/tests/roundtrip.rs
+@@ -0,0 +1,454 @@
++//! INV-W2: decode(encode(x)) == x for every format, with proptest.
++
++use bytes::Bytes;
++use proptest::collection::vec;
++use proptest::prelude::*;
++use smallvec::SmallVec;
++use std::collections::BTreeSet;
++use zemdb_core::mutation::{ColumnUpdate, Operation, OperationKind};
++use zemdb_core::protocol::encoded_len;
++use zemdb_core::protocol::wal_frame::{parse_batch_header, wal_record_payload_len, BATCH_HEADER_SIZE};
++use zemdb_core::schema::{ColumnDef, Schema, TableSchema, ValidationError};
++use zemdb_core::value::{CompactRow, DataType, PrimaryKey, Value};
++use zemdb_core::{
++    decode_client_message, decode_message, decode_wal_batch_from_slice, encode_message,
++    encode_wal_batch, replay_wal_records, ClientId, ClientMessage, CorrelationId, ErrorCode,
++    MutationId, RoomId, SchemaId, SequenceNumber, SequencedOperation, ServerMessage,
++    SnapshotCompression, SnapshotEnvelopeHeader, WalBatchDecodeResult,
++};
++use zemdb_storage::snapshot::{decode_snapshot_envelope, encode_snapshot_envelope};
++use zemdb_storage::{
++    DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, ScanOptions, StorageEngine,
++};
++
++fn cases(default: u32) -> u32 {
++    std::env::var("PROP_CASES")
++        .ok()
++        .and_then(|s| s.parse().ok())
++        .unwrap_or(default)
++}
++
++// ------------------------------------------------------------------------------------------
++// Strategies
++// ------------------------------------------------------------------------------------------
++
++fn float() -> impl Strategy<Value = f64> {
++    prop_oneof![
++        any::<f64>(),
++        Just(-0.0),
++        Just(0.0),
++        Just(f64::NAN),
++        Just(-f64::NAN),
++        Just(f64::INFINITY),
++        Just(f64::NEG_INFINITY),
++        Just(f64::MIN_POSITIVE),
++        any::<u64>().prop_map(f64::from_bits),
++    ]
++}
++
++fn value() -> impl Strategy<Value = Value> {
++    prop_oneof![
++        Just(Value::Null),
++        any::<i64>().prop_map(Value::Int),
++        float().prop_map(Value::Float),
++        any::<i64>().prop_map(Value::Timestamp),
++        ".{0,12}".prop_map(|s: String| Value::String(s.into())),
++        any::<bool>().prop_map(Value::Bool),
++        vec(any::<u8>(), 0..24).prop_map(|b| Value::Bytes(b.into())),
++        any::<[u8; 16]>().prop_map(Value::Uuid),
++    ]
++}
++
++fn pk() -> impl Strategy<Value = PrimaryKey> {
++    vec(value(), 0..4).prop_map(|v| PrimaryKey::from_smallvec(SmallVec::from_vec(v)))
++}
++
++fn row() -> impl Strategy<Value = CompactRow> {
++    vec(value(), 0..6).prop_map(CompactRow::new)
++}
++
++fn kind() -> impl Strategy<Value = OperationKind> {
++    prop_oneof![
++        row().prop_map(|row| OperationKind::Insert { row }),
++        vec((any::<u16>(), value()), 0..5).prop_map(|u| OperationKind::Update {
++            updates: u.into_iter().map(|(i, v)| ColumnUpdate::new(i, v)).collect()
++        }),
++        Just(OperationKind::Delete),
++    ]
++}
++
++fn operation() -> impl Strategy<Value = Operation> {
++    (any::<u16>(), pk(), any::<u64>(), kind()).prop_map(|(t, pk, ts, k)| Operation::new(t, pk, ts, k))
++}
++
++fn seq_op() -> impl Strategy<Value = SequencedOperation> {
++    (any::<u64>(), operation()).prop_map(|(s, op)| SequencedOperation::new(s, op))
++}
++
++fn path_id() -> impl Strategy<Value = String> {
++    "[a-z0-9_-]{1,64}".prop_filter("not a reserved name", |s| RoomId::new(s.clone()).is_ok())
++}
++
++fn room_id() -> impl Strategy<Value = RoomId> {
++    path_id().prop_map(|s| RoomId::new(s).unwrap())
++}
++
++fn schema_id() -> impl Strategy<Value = SchemaId> {
++    path_id().prop_map(|s| SchemaId::new(s).unwrap())
++}
++
++fn client_id() -> impl Strategy<Value = ClientId> {
++    prop_oneof!["[a-zA-Z0-9 _.@-]{1,40}", ".{1,20}"]
++        .prop_filter_map("valid client id", |s| ClientId::new(s).ok())
++}
++
++fn seq() -> impl Strategy<Value = SequenceNumber> {
++    any::<u64>().prop_map(SequenceNumber::new)
++}
++
++fn corr() -> impl Strategy<Value = CorrelationId> {
++    any::<u64>().prop_map(CorrelationId::new)
++}
++
++fn mid() -> impl Strategy<Value = MutationId> {
++    any::<[u8; 16]>().prop_map(MutationId::new)
++}
++
++fn data_type() -> impl Strategy<Value = DataType> {
++    prop_oneof![
++        Just(DataType::Int),
++        Just(DataType::Float),
++        Just(DataType::Timestamp),
++        Just(DataType::String),
++        Just(DataType::Bool),
++        Just(DataType::Bytes),
++        Just(DataType::Uuid),
++    ]
++}
++
++/// A random valid schema, including evolutions with `add_column`.
++fn schema() -> impl Strategy<Value = Schema> {
++    let table = (
++        any::<u16>(),
++        "[a-z]{1,6}",
++        vec(("[a-z]{1,5}", data_type(), any::<bool>(), any::<bool>()), 1..6),
++        1usize..3,
++    );
++    (vec(table, 0..4), vec(("[a-z]{1,6}", data_type(), any::<bool>()), 0..4)).prop_map(
++        |(tables, additions)| {
++            let mut out = Vec::new();
++            let mut ids = BTreeSet::new();
++            let mut names = BTreeSet::new();
++            for (id, name, cols, pk_n) in tables {
++                if !ids.insert(id) || !names.insert(name.clone()) {
++                    continue;
++                }
++                let mut seen = BTreeSet::new();
++                let cols: Vec<ColumnDef> = cols
++                    .into_iter()
++                    .filter(|(n, ..)| seen.insert(n.clone()))
++                    .enumerate()
++                    .map(|(i, (n, t, nullable, enc))| {
++                        let is_pk = i < pk_n;
++                        ColumnDef::new(n, t).nullable(nullable && !is_pk).encrypted(enc && !is_pk)
++                    })
++                    .collect();
++                let pk: Vec<String> = cols.iter().take(pk_n).map(|c| c.name().to_string()).collect();
++                if let Ok(t) = TableSchema::try_new(id, name, pk, cols) {
++                    out.push(t);
++                }
++            }
++            let mut s = Schema::try_from_tables(out).unwrap();
++            let names: Vec<String> = s.tables().map(|t| t.name().to_string()).collect();
++            for (i, (col, t, enc)) in additions.into_iter().enumerate() {
++                if names.is_empty() {
++                    break;
++                }
++                let table = &names[i % names.len()];
++                let r = s.add_column(table, ColumnDef::new(col, t).nullable(true).encrypted(enc));
++                assert!(matches!(r, Ok(_) | Err(ValidationError::DuplicateColumn { .. })));
++            }
++            s
++        },
++    )
++}
++
++fn client_message() -> impl Strategy<Value = ClientMessage> {
++    prop_oneof![
++        (corr(), room_id(), client_id(), mid(), seq(), operation()).prop_map(|(c, r, cl, m, s, op)| {
++            ClientMessage::Commit { correlation_id: c, room_id: r, client_id: cl, mutation_id: m, last_ack_seq: s, op }
++        }),
++        (corr(), room_id(), client_id(), seq()).prop_map(|(c, r, cl, s)| ClientMessage::Ack {
++            correlation_id: c, room_id: r, client_id: cl, ack_seq: s
++        }),
++        (corr(), room_id(), client_id(), seq(), any::<u32>()).prop_map(|(c, r, cl, s, m)| ClientMessage::Sync {
++            correlation_id: c, room_id: r, client_id: cl, from_seq: s, max_batch_size: m
++        }),
++        (corr(), room_id(), client_id()).prop_map(|(c, r, cl)| ClientMessage::Heartbeat {
++            correlation_id: c, room_id: r, client_id: cl
++        }),
++        (corr(), room_id(), client_id(), ".{0,40}", proptest::option::of(seq()), proptest::option::of(any::<u128>()))
++            .prop_map(|(c, r, cl, t, s, k)| ClientMessage::RegisterClient {
++                correlation_id: c, room_id: r, client_id: cl, auth_token: t, current_seq: s, known_incarnation: k
++            }),
++        (corr(), room_id()).prop_map(|(c, r)| ClientMessage::GetSchema { correlation_id: c, room_id: r }),
++        (corr(), room_id(), client_id()).prop_map(|(c, r, cl)| ClientMessage::DeregisterClient {
++            correlation_id: c, room_id: r, client_id: cl
++        }),
++        (corr(), room_id(), any::<u32>(), any::<u32>(), proptest::option::of(any::<[u8; 32]>()))
++            .prop_map(|(c, r, i, s, h)| ClientMessage::RequestSnapshotChunk {
++                correlation_id: c, room_id: r, chunk_index: i, chunk_size: s, snapshot_hash: h
++            }),
++        (corr(), room_id(), seq(), any::<u32>(), any::<u32>(), any::<u64>(), any::<[u8; 32]>(), vec(any::<u8>(), 0..64))
++            .prop_map(|(c, r, s, i, t, b, h, d)| ClientMessage::UploadSnapshotChunk {
++                correlation_id: c, room_id: r, snapshot_head_seq: s, chunk_index: i, total_chunks: t,
++                total_bytes: b, snapshot_hash: h, data: Bytes::from(d)
++            }),
++    ]
++}
++
++fn error_code() -> impl Strategy<Value = ErrorCode> {
++    (0u32..21).prop_map(|i| {
++        let frame = [&[0x5A, 0x4D, 1, 0][..], &[i as u8]].concat();
++        decode_message::<ErrorCode>(&frame).unwrap()
++    })
++}
++
++fn server_message() -> impl Strategy<Value = ServerMessage> {
++    prop_oneof![
++        (corr(), room_id(), mid(), seq(), vec(seq_op(), 0..6), any::<bool>(), any::<bool>(), any::<u64>())
++            .prop_map(|(c, r, m, s, ops, h, w, v)| ServerMessage::CommitAck {
++                correlation_id: c, room_id: r, mutation_id: m, assigned_seq: s, catchup_ops: ops,
++                has_more: h, snapshot_wanted: w, schema_version: v
++            }),
++        (corr(), room_id(), seq(), seq()).prop_map(|(c, r, a, h)| ServerMessage::AckConfirmed {
++            correlation_id: c, room_id: r, ack_seq: a, head_seq: h
++        }),
++        (corr(), room_id(), seq(), vec(seq_op(), 0..6), any::<bool>(), any::<bool>(), any::<u64>())
++            .prop_map(|(c, r, hs, ops, h, w, v)| ServerMessage::SyncBatch {
++                correlation_id: c, room_id: r, head_seq: hs, ops, has_more: h, snapshot_wanted: w, schema_version: v
++            }),
++        (corr(), room_id(), seq(), any::<u32>(), any::<u32>(), any::<u64>(), any::<[u8; 32]>(), vec(any::<u8>(), 0..64))
++            .prop_map(|(c, r, s, i, t, b, h, d)| ServerMessage::SnapshotChunk {
++                correlation_id: c, room_id: r, snapshot_head_seq: s, chunk_index: i, total_chunks: t,
++                total_bytes: b, snapshot_hash: h, data: Bytes::from(d)
++            }),
++        (corr(), room_id(), any::<u32>(), any::<u32>(), any::<bool>()).prop_map(|(c, r, i, t, s)| {
++            ServerMessage::SnapshotUploadChunkAck { correlation_id: c, room_id: r, chunk_index: i, total_chunks: t, staged: s }
++        }),
++        (room_id(), seq(), any::<[u8; 32]>()).prop_map(|(r, s, h)| ServerMessage::SnapshotStaged {
++            room_id: r, snapshot_head_seq: s, snapshot_hash: h
++        }),
++        (corr(), room_id(), seq(), any::<bool>(), proptest::option::of(seq()), any::<u64>()).prop_map(
++            |(c, r, h, w, a, v)| ServerMessage::HeartbeatAck {
++                correlation_id: c, room_id: r, current_head_seq: h, snapshot_wanted: w, active_snapshot_seq: a, schema_version: v
++            }
++        ),
++        (corr(), room_id(), client_id()).prop_map(|(c, r, cl)| ServerMessage::DeregisterAck {
++            correlation_id: c, room_id: r, client_id: cl
++        }),
++        (corr(), room_id(), seq(), seq(), schema_id(), schema(), proptest::option::of(seq()), any::<u128>())
++            .prop_map(|(c, r, h, t, si, s, a, inc)| ServerMessage::Registered {
++                correlation_id: c, room_id: r, head_seq: h, tail_seq: t, schema_id: si, schema: s,
++                active_snapshot_seq: a, room_incarnation: inc
++            }),
++        (corr(), room_id(), schema_id(), schema()).prop_map(|(c, r, si, s)| ServerMessage::Schema {
++            correlation_id: c, room_id: r, schema_id: si, schema: s
++        }),
++        (proptest::option::of(corr()), proptest::option::of(room_id()), error_code(), ".{0,30}")
++            .prop_map(|(c, r, code, m)| ServerMessage::Error { correlation_id: c, room_id: r, code, message: m }),
++    ]
++}
++
++// ------------------------------------------------------------------------------------------
++// Properties
++// ------------------------------------------------------------------------------------------
++
++proptest! {
++    #![proptest_config(ProptestConfig { cases: cases(20_000), .. ProptestConfig::default() })]
++
++    #[test]
++    fn client_messages_round_trip(m in client_message()) {
++        let frame = encode_message(&m).unwrap();
++        prop_assert_eq!(frame.len() as u64, encoded_len(&m).unwrap() + 4);
++        let back = decode_client_message(&frame).unwrap();
++        prop_assert_eq!(&back, &m);
++        prop_assert_eq!(decode_message::<ClientMessage>(&frame).unwrap(), m.clone());
++        prop_assert_eq!(zemdb_core::peek_client_message_kind(&frame).unwrap(), m.kind());
++        // Same bytes again: encoding is a function of the value.
++        prop_assert_eq!(encode_message(&back).unwrap(), frame);
++    }
++
++    #[test]
++    fn server_messages_round_trip(m in server_message()) {
++        let frame = encode_message(&m).unwrap();
++        prop_assert_eq!(frame.len() as u64, encoded_len(&m).unwrap() + 4);
++        let back: ServerMessage = decode_message(&frame).unwrap();
++        prop_assert_eq!(&back, &m);
++        prop_assert_eq!(encode_message(&back).unwrap(), frame);
++    }
++
++    #[test]
++    fn wal_frames_round_trip(batches in vec((vec(seq_op(), 0..5), proptest::option::of(mid())), 1..5)) {
++        let mut log = Vec::new();
++        let mut all = Vec::new();
++        for (ops, m) in &batches {
++            let frame = encode_wal_batch(ops, *m).unwrap();
++            let header = parse_batch_header(frame[..BATCH_HEADER_SIZE].try_into().unwrap()).unwrap();
++            prop_assert_eq!(header.ops_count(), ops.len());
++            prop_assert_eq!(header.frame_len(), frame.len());
++            if ops.len() == 1 {
++                prop_assert_eq!(wal_record_payload_len(&ops[0], *m).unwrap() as usize, frame.len() - BATCH_HEADER_SIZE);
++            }
++            match decode_wal_batch_from_slice(&frame).unwrap() {
++                WalBatchDecodeResult::Ok { ops: back, mutation_id, bytes_consumed } => {
++                    prop_assert_eq!(&back, ops);
++                    prop_assert_eq!(mutation_id, *m);
++                    prop_assert_eq!(bytes_consumed, frame.len());
++                }
++                other => prop_assert!(false, "{other:?}"),
++            }
++            log.extend(frame);
++            all.extend(ops.iter().cloned());
++        }
++        let (ops, valid, torn) = replay_wal_records(&log).unwrap();
++        prop_assert_eq!(ops, all);
++        prop_assert_eq!(valid, log.len());
++        prop_assert!(torn.is_none());
++    }
++
++    #[test]
++    fn schemas_round_trip_in_json_and_binary(s in schema()) {
++        let json = serde_json::to_string(&s).unwrap();
++        let back: Schema = serde_json::from_str(&json).unwrap();
++        prop_assert_eq!(&back, &s);
++        prop_assert_eq!(back.version(), s.version());
++        let pretty = serde_json::to_string_pretty(&s).unwrap();
++        prop_assert_eq!(&serde_json::from_str::<Schema>(&pretty).unwrap(), &s);
++        let frame = encode_message(&s).unwrap();
++        prop_assert_eq!(decode_message::<Schema>(&frame).unwrap(), s);
++    }
++
++    #[test]
++    fn envelopes_round_trip(payload in vec(any::<u8>(), 0..4096), zstd in any::<bool>()) {
++        let env = encode_snapshot_envelope(&payload, zstd, 3).unwrap();
++        prop_assert_eq!(decode_snapshot_envelope(&env).unwrap(), payload.clone());
++        let header = SnapshotEnvelopeHeader::parse(&env).unwrap();
++        prop_assert_eq!(SnapshotEnvelopeHeader::parse(&header.to_bytes()).unwrap(), header);
++        prop_assert_eq!(header.compression() == SnapshotCompression::Zstd, zstd);
++    }
++}
++
++// ------------------------------------------------------------------------------------------
++// Snapshot state round trip (both engines, both directions)
++// ------------------------------------------------------------------------------------------
++
++fn state_schema() -> Schema {
++    let mut s = Schema::builder()
++        .table(
++            TableSchema::builder("items")
++                .table_id(3)
++                .primary_key("id", DataType::Int)
++                .column("name", DataType::String)
++                .nullable_column("price", DataType::Float),
++        )
++        .table(
++            TableSchema::builder("pairs")
++                .table_id(0)
++                .primary_key("a", DataType::Float)
++                .primary_key("b", DataType::Bytes)
++                .nullable_column("u", DataType::Uuid),
++        )
++        .build();
++    s.add_column("items", ColumnDef::new("blob", DataType::Bytes).nullable(true)).unwrap();
++    s
++}
++
++fn state_op() -> impl Strategy<Value = Operation> {
++    let opt = |s: BoxedStrategy<Value>| prop_oneof![Just(Value::Null), s];
++    let item_key = 0i64..20;
++    let items = prop_oneof![
++        (item_key.clone(), ".{0,6}", opt(float().prop_map(Value::Float).boxed()), opt(vec(any::<u8>(), 0..6).prop_map(|b| Value::Bytes(b.into())).boxed()), any::<bool>())
++            .prop_map(|(k, n, p, b, short)| {
++                let mut v = vec![Value::Int(k), Value::String(n.into()), p, b];
++                if short { v.truncate(3) }
++                Operation::insert(3, PrimaryKey::single(k), CompactRow::new(v), 1)
++            }),
++        (item_key.clone(), opt(float().prop_map(Value::Float).boxed()))
++            .prop_map(|(k, p)| Operation::update(3, PrimaryKey::single(k), vec![ColumnUpdate::new(2, p)], 1)),
++        (item_key.clone(), vec(any::<u8>(), 0..4))
++            .prop_map(|(k, b)| Operation::update(3, PrimaryKey::single(k), vec![ColumnUpdate::new(3, Value::Bytes(b.into()))], 1)),
++        item_key.prop_map(|k| Operation::delete(3, PrimaryKey::single(k), 1)),
++    ];
++    let pair_key = (prop_oneof![Just(0.0f64), Just(-0.0f64), Just(f64::NAN), Just(1.5), Just(-2.0)], vec(any::<u8>(), 0..3));
++    let pairs = prop_oneof![
++        (pair_key.clone(), opt(any::<[u8; 16]>().prop_map(Value::Uuid).boxed())).prop_map(|((a, b), u)| {
++            let key = PrimaryKey::composite([Value::Float(a), Value::Bytes(b.clone().into())]);
++            Operation::insert(0, key, CompactRow::new(vec![Value::Float(a), Value::Bytes(b.into()), u]), 1)
++        }),
++        pair_key.prop_map(|(a, b)| Operation::delete(0, PrimaryKey::composite([Value::Float(a), Value::Bytes(b.into())]), 1)),
++    ];
++    prop_oneof![items, pairs]
++}
++
++async fn dump<E: StorageEngine>(e: &E, room: &RoomId) -> Vec<(u16, Vec<(PrimaryKey, CompactRow)>)> {
++    use futures::StreamExt;
++    let mut out = vec![];
++    for t in [0u16, 3] {
++        let mut s = e.scan_by_id(room, t, ScanOptions::default()).await.unwrap();
++        let mut rows = vec![];
++        while let Some(r) = s.next().await {
++            rows.push(r.unwrap());
++        }
++        out.push((t, rows));
++    }
++    out
++}
++
++proptest! {
++    #![proptest_config(ProptestConfig { cases: cases(20_000) / 40, .. ProptestConfig::default() })]
++
++    #[test]
++    fn snapshots_round_trip_between_engines(ops in vec(state_op(), 1..40)) {
++        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
++        rt.block_on(async {
++            let schema = state_schema();
++            let room = RoomId::new("r").unwrap();
++            let seqd: Vec<_> = ops.into_iter().enumerate().map(|(i, op)| SequencedOperation::new(i as u64 + 1, op)).collect();
++            let head = SequenceNumber::new(seqd.len() as u64);
++
++            let mem = MemoryStorageEngine::new();
++            mem.open_room(&room, schema.clone()).await.unwrap();
++            mem.apply_batch(&room, seqd.clone()).await.unwrap();
++            let expected = dump(&mem, &room).await;
++
++            let dir = tempfile::tempdir().unwrap();
++            let disk = DiskStorageEngine::new(DiskStorageOptions::new(dir.path())).unwrap();
++            disk.open_room(&room, schema.clone()).await.unwrap();
++            disk.apply_batch(&room, seqd.clone()).await.unwrap();
++            assert_eq!(dump(&disk, &room).await, expected, "engines disagree after the same log");
++
++            for snap in [mem.create_snapshot(&room).await.unwrap(), disk.create_snapshot(&room).await.unwrap()] {
++                let m2 = MemoryStorageEngine::new();
++                m2.open_room(&room, schema.clone()).await.unwrap();
++                assert_eq!(m2.apply_snapshot(&room, schema.clone(), Bytes::from(snap.clone()), head).await.unwrap(), head);
++                assert_eq!(dump(&m2, &room).await, expected);
++
++                let d2dir = tempfile::tempdir().unwrap();
++                let d2 = DiskStorageEngine::new(DiskStorageOptions::new(d2dir.path())).unwrap();
++                d2.open_room(&room, schema.clone()).await.unwrap();
++                assert_eq!(d2.apply_snapshot(&room, schema.clone(), Bytes::from(snap), head).await.unwrap(), head);
++                assert_eq!(dump(&d2, &room).await, expected);
++                // And through the engine's own file: compact, close, reopen.
++                d2.compact_room(&room).await.unwrap();
++                d2.close_room(&room).await.unwrap();
++                d2.open_room(&room, schema.clone()).await.unwrap();
++                assert_eq!(dump(&d2, &room).await, expected, "disk file round trip");
++            }
++            // The disk WAL alone: close and reopen without compaction.
++            disk.close_room(&room).await.unwrap();
++            disk.open_room(&room, schema.clone()).await.unwrap();
++            assert_eq!(dump(&disk, &room).await, expected, "WAL replay round trip");
++        });
++    }
++}
+diff --git a/crates/fuzzw/tests/schema_evolution.proptest-regressions b/crates/fuzzw/tests/schema_evolution.proptest-regressions
+new file mode 100644
+index 0000000..a0beae5
+--- /dev/null
++++ b/crates/fuzzw/tests/schema_evolution.proptest-regressions
+@@ -0,0 +1,7 @@
++# Seeds for failure cases proptest has generated in the past. It is
++# automatically read and these particular cases re-run before any
++# novel cases are generated.
++#
++# It is recommended to check this file in to source control so that
++# everyone who runs the test benefits from these saved cases.
++cc 4ee8c36ffe8a525cc59d6284151c9f394cf0fd6b77aed9c1a178cf9473ee0e09 # shrinks to specs = [(0, [(Int, false, false), (Int, false, false)], 1)], seeds = [(0, 14822749083394190377, 150), (0, 18040384226490305559, 43)], additions = [(0, Int, false)]
+diff --git a/crates/fuzzw/tests/schema_evolution.rs b/crates/fuzzw/tests/schema_evolution.rs
+new file mode 100644
+index 0000000..8253a8a
+--- /dev/null
++++ b/crates/fuzzw/tests/schema_evolution.rs
+@@ -0,0 +1,206 @@
++//! INV-E1: every operation valid under a schema stays valid under any later version of it,
++//! and a replica opened with the evolved schema replays the log written under the old one.
++
++use proptest::collection::vec;
++use proptest::prelude::*;
++use zemdb_core::mutation::{ColumnUpdate, Operation};
++use zemdb_core::schema::{ColumnDef, Schema, TableSchema};
++use zemdb_core::value::{CompactRow, DataType, PrimaryKey, Value};
++use zemdb_core::{RoomId, SequenceNumber, SequencedOperation};
++use zemdb_storage::{DiskStorageEngine, DiskStorageOptions, ScanOptions, StorageEngine};
++
++fn cases(default: u32) -> u32 {
++    std::env::var("PROP_CASES").ok().and_then(|s| s.parse().ok()).unwrap_or(default)
++}
++
++fn ty() -> impl Strategy<Value = DataType> {
++    prop_oneof![
++        Just(DataType::Int),
++        Just(DataType::Float),
++        Just(DataType::Timestamp),
++        Just(DataType::String),
++        Just(DataType::Bool),
++        Just(DataType::Bytes),
++        Just(DataType::Uuid),
++    ]
++}
++
++fn value_of(t: DataType, seed: u64) -> Value {
++    match t {
++        DataType::Int => Value::Int(seed as i64),
++        DataType::Float => Value::Float(if seed % 3 == 0 { -0.0 } else { seed as f64 / 3.0 }),
++        DataType::Timestamp => Value::Timestamp(seed as i64),
++        DataType::String => Value::String(format!("s{seed}").into()),
++        DataType::Bool => Value::Bool(seed % 2 == 0),
++        DataType::Bytes => Value::Bytes(seed.to_le_bytes().to_vec().into()),
++        DataType::Uuid => Value::Uuid([seed as u8; 16]),
++        DataType::Null => Value::Null,
++    }
++}
++
++/// A value valid for `col` (encrypted columns travel as bytes); `None` for a null if allowed.
++fn cell(col: &ColumnDef, seed: u64) -> Value {
++    if col.is_nullable() && seed % 4 == 0 {
++        return Value::Null;
++    }
++    if col.is_encrypted() {
++        return Value::Bytes(vec![seed as u8; 3].into());
++    }
++    value_of(col.data_type(), seed)
++}
++
++/// Random table definitions: (id, columns as (type, nullable, encrypted), pk width).
++type TableSpec = (u16, Vec<(DataType, bool, bool)>, usize);
++
++fn build_schema(specs: &[TableSpec]) -> Schema {
++    let mut tables = vec![];
++    let mut ids = std::collections::BTreeSet::new();
++    for (i, (id, cols, pk_n)) in specs.iter().enumerate() {
++        if !ids.insert(*id) {
++            continue;
++        }
++        let pk_n = (*pk_n).min(cols.len());
++        let defs: Vec<ColumnDef> = cols
++            .iter()
++            .enumerate()
++            .map(|(c, (t, n, e))| {
++                let is_pk = c < pk_n;
++                ColumnDef::new(format!("c{c}"), *t).nullable(*n && !is_pk).encrypted(*e && !is_pk)
++            })
++            .collect();
++        let pk = (0..pk_n).map(|c| format!("c{c}")).collect();
++        tables.push(TableSchema::try_new(*id, format!("t{i}"), pk, defs).unwrap());
++    }
++    Schema::try_from_tables(tables).unwrap()
++}
++
++fn ops_for(schema: &Schema, seeds: &[(u8, u64, u8)]) -> Vec<Operation> {
++    let tables: Vec<&TableSchema> = schema.tables().collect();
++    seeds
++        .iter()
++        .map(|&(t, seed, kind)| {
++            let table = tables[t as usize % tables.len()];
++            let key_seed = seed % 7;
++            let pk: Vec<Value> = table
++                .primary_key()
++                .iter()
++                .map(|name| value_of(table.get_column(name).unwrap().data_type(), key_seed))
++                .collect();
++            let pk = PrimaryKey::composite(pk.clone());
++            let cols = table.columns();
++            match kind % 3 {
++                0 => {
++                    // A full row, or one cut short after its non-null columns.
++                    let mut row: Vec<Value> = cols
++                        .iter()
++                        .enumerate()
++                        .map(|(i, c)| {
++                            if i < table.primary_key().len() {
++                                pk[i].clone()
++                            } else {
++                                cell(c, seed.wrapping_add(i as u64))
++                            }
++                        })
++                        .collect();
++                    while row.len() > 1 && seed % 2 == 0 && cols[row.len() - 1].is_nullable() {
++                        row.pop();
++                    }
++                    Operation::insert(table.table_id(), pk, CompactRow::new(row), seed)
++                }
++                1 => {
++                    let updates: Vec<ColumnUpdate> = cols
++                        .iter()
++                        .enumerate()
++                        .skip(table.primary_key().len())
++                        .filter(|(i, _)| (seed >> i) & 1 == 1)
++                        .map(|(i, c)| ColumnUpdate::new(i as u16, cell(c, seed ^ i as u64)))
++                        .collect();
++                    if updates.is_empty() {
++                        Operation::delete(table.table_id(), pk, seed)
++                    } else {
++                        Operation::update(table.table_id(), pk, updates, seed)
++                    }
++                }
++                _ => Operation::delete(table.table_id(), pk, seed),
++            }
++        })
++        .collect()
++}
++
++proptest! {
++    #![proptest_config(ProptestConfig { cases: cases(3_000), .. ProptestConfig::default() })]
++
++    #[test]
++    fn operations_stay_valid_under_every_later_version(
++        specs in vec((0u16..6, vec((ty(), any::<bool>(), any::<bool>()), 1..6), 1usize..3), 1..4),
++        seeds in vec((any::<u8>(), any::<u64>(), any::<u8>()), 1..30),
++        additions in vec((any::<u8>(), ty(), any::<bool>()), 1..6),
++    ) {
++        let v1 = build_schema(&specs);
++        let ops = ops_for(&v1, &seeds);
++        for op in &ops {
++            prop_assert!(v1.validate_operation(op).is_ok(), "generator: {:?}", v1.validate_operation(op));
++        }
++        let mut evolved = v1.clone();
++        let names: Vec<String> = v1.tables().map(|t| t.name().to_string()).collect();
++        for (k, (t, dt, enc)) in additions.iter().enumerate() {
++            let name = &names[*t as usize % names.len()];
++            let before = evolved.version();
++            evolved.add_column(name, ColumnDef::new(format!("added{k}"), *dt).nullable(true).encrypted(*enc)).unwrap();
++            prop_assert_eq!(evolved.version(), before + 1);
++            // Nothing is lost, renumbered or retyped.
++            for old in v1.tables() {
++                let new = evolved.get_table_by_id(old.table_id()).unwrap();
++                prop_assert_eq!(new.name(), old.name());
++                prop_assert_eq!(new.primary_key(), old.primary_key());
++                prop_assert_eq!(&new.columns()[..old.columns().len()], old.columns());
++            }
++            for op in &ops {
++                prop_assert!(evolved.validate_operation(op).is_ok(), "{:?}", evolved.validate_operation(op));
++            }
++            // A non-nullable addition is refused and changes nothing.
++            let mut refused = evolved.clone();
++            prop_assert!(refused.add_column(name, ColumnDef::new("strict", *dt)).is_err());
++            prop_assert_eq!(&refused, &evolved);
++        }
++        // The evolved schema survives JSON and comes back with the same version.
++        let json = serde_json::to_string(&evolved).unwrap();
++        prop_assert_eq!(serde_json::from_str::<Schema>(&json).unwrap(), evolved.clone());
++
++        // A disk replica written under v1 reopens under the evolved schema with the same rows.
++        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
++        rt.block_on(async {
++            let dir = tempfile::tempdir().unwrap();
++            let room = RoomId::new("evo").unwrap();
++            let seqd: Vec<_> = ops.iter().cloned().enumerate()
++                .map(|(i, op)| SequencedOperation::new(i as u64 + 1, op)).collect();
++            let engine = DiskStorageEngine::new(DiskStorageOptions::new(dir.path()).auto_compact(false)).unwrap();
++            engine.open_room(&room, v1.clone()).await.unwrap();
++            engine.apply_batch(&room, seqd).await.unwrap();
++            let before = dump(&engine, &room, &v1).await;
++            engine.close_room(&room).await.unwrap();
++            engine.open_room(&room, evolved.clone()).await.unwrap();
++            assert_eq!(engine.get_head_seq(&room).await.unwrap(), SequenceNumber::new(ops.len() as u64));
++            assert_eq!(dump(&engine, &room, &v1).await, before);
++        });
++    }
++}
++
++async fn dump(e: &DiskStorageEngine, room: &RoomId, schema: &Schema) -> Vec<(PrimaryKey, CompactRow)> {
++    use futures::StreamExt;
++    let mut out = vec![];
++    for t in schema.table_ids() {
++        let mut s = e.scan_by_id(room, t, ScanOptions::default()).await.unwrap();
++        while let Some(r) = s.next().await {
++            // Compared without trailing nulls: an update widens a row to the width of the schema
++            // it is applied with (see the audit notes), which is not a change of content.
++            let (pk, row) = r.unwrap();
++            let mut v = row.into_values();
++            while v.last() == Some(&Value::Null) {
++                v.pop();
++            }
++            out.push((pk, CompactRow::new(v)));
++        }
++    }
++    out
++}
+diff --git a/crates/server/src/log/tests/segment_index.rs b/crates/server/src/log/tests/segment_index.rs
+index 8877bf5..5585c3d 100644
+--- a/crates/server/src/log/tests/segment_index.rs
++++ b/crates/server/src/log/tests/segment_index.rs
+@@ -68,3 +68,66 @@ fn total_bytes_follow_inserts_replacements_and_removals() {
+     assert_eq!(index.total_bytes(), 0);
+     assert!(index.remove(seq(1)).is_none());
+ }
++
++/// AUDIT INV-W1/INV-W2: the sidecar codec round-trips, a sidecar of another segment is
++/// rejected, and no damaged sidecar panics; every single-bit flip is detected.
++#[test]
++fn audit_sidecar_round_trips_and_never_panics() {
++    let mut state = 0x1234_5678u64;
++    let mut next = move || {
++        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
++        let mut z = state;
++        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
++        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
++        z ^ (z >> 31)
++    };
++    let iters: u64 = std::env::var("FUZZ_ITERS")
++        .ok()
++        .and_then(|s| s.parse().ok())
++        .unwrap_or(2_000_000);
++    let (mut flips, mut flips_accepted, mut other_accepted) = (0u64, 0u64, 0u64);
++    for _ in 0..iters {
++        let start = if next() % 8 == 0 { next() } else { next() % 10_000 };
++        let n = (next() % 10) as usize;
++        let end = start.saturating_add(n as u64);
++        let ids: Vec<(MutationId, SequenceNumber)> = (0..n)
++            .map(|k| {
++                let id = u128::from(next()) | (u128::from(next()) << 64);
++                (MutationId::from_u128(id), seq(start.wrapping_add(k as u64)))
++            })
++            .collect();
++        let bytes = encode_mutation_ids(seq(start), seq(end), &ids);
++        assert_eq!(bytes.len(), 16 + 24 * n + 4);
++        assert_eq!(decode_mutation_ids(&bytes, seq(start), seq(end)), Some(ids.clone()));
++        assert_eq!(decode_mutation_ids(&bytes, seq(start ^ 1), seq(end)), None);
++        assert_eq!(decode_mutation_ids(&bytes, seq(start), seq(end ^ 1)), None);
++
++        let mut m = bytes.clone();
++        let kind = next() % 5;
++        match kind {
++            0 => {
++                let i = (next() as usize) % m.len();
++                m[i] ^= 1 << (next() % 8);
++            }
++            1 => m.truncate((next() as usize) % m.len()),
++            2 => m.extend((0..1 + next() % 30).map(|_| next() as u8)),
++            3 => {
++                let i = (next() as usize) % m.len();
++                m[i] = next() as u8;
++            }
++            _ => m = (0..(next() % 80)).map(|_| next() as u8).collect(),
++        }
++        let decoded = std::panic::catch_unwind(|| decode_mutation_ids(&m, seq(start), seq(end)))
++            .unwrap_or_else(|_| panic!("decode_mutation_ids panicked on {m:02x?}"));
++        if kind == 0 {
++            flips += 1;
++            flips_accepted += u64::from(decoded.is_some());
++        } else if m != bytes && decoded.is_some() {
++            other_accepted += 1;
++        }
++    }
++    eprintln!(
++        "[sidecar] iters={iters} single-bit flips={flips} accepted={flips_accepted} other damaged accepted={other_accepted}"
++    );
++    assert_eq!(flips_accepted, 0);
++}
+diff --git a/crates/server/src/log/tests/segment_reader.rs b/crates/server/src/log/tests/segment_reader.rs
+index 309ba5c..f2e9482 100644
+--- a/crates/server/src/log/tests/segment_reader.rs
++++ b/crates/server/src/log/tests/segment_reader.rs
+@@ -104,3 +104,92 @@ fn a_zstd_stream_skips_frames_too() {
+ 
+     assert_eq!(seqs(&read.ops), vec![8, 9, 10]);
+ }
++
++/// AUDIT INV-W1: the server's streaming frame reader and the anomaly classification never
++/// panic on damaged logs, read from a seekable source or a zstd stream, whatever the cursor.
++#[test]
++fn audit_streaming_reader_never_panics_on_damaged_logs() {
++    let mut state = 0xC0FFEEu64;
++    let mut next = move || {
++        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
++        let mut z = state;
++        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
++        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
++        z ^ (z >> 31)
++    };
++    let iters: u64 = std::env::var("FUZZ_ITERS")
++        .ok()
++        .and_then(|s| s.parse().ok())
++        .unwrap_or(300_000);
++    let (log, offsets) = frames(1..=12);
++    let fix = |data: &mut Vec<u8>, at: usize| {
++        if data.len() < at + 18 {
++            return;
++        }
++        let len = u32::from_le_bytes(data[at + 2..at + 6].try_into().unwrap()) as usize;
++        if at + 18 + len <= data.len() {
++            let crc = crc32fast::hash(&data[at + 18..at + 18 + len]);
++            data[at + 6..at + 10].copy_from_slice(&crc.to_le_bytes());
++        }
++        let h = crc32fast::hash(&data[at..at + 14]);
++        data[at + 14..at + 18].copy_from_slice(&h.to_le_bytes());
++    };
++    let mut outcomes = [0u64; 3];
++    for i in 0..iters {
++        let mut data = log.clone();
++        for _ in 0..1 + next() % 3 {
++            if data.is_empty() {
++                break;
++            }
++            let p = (next() as usize) % data.len();
++            match next() % 5 {
++                0 => data[p] ^= 1 << (next() % 8),
++                1 => data[p] = next() as u8,
++                2 => data.truncate(p),
++                3 => {
++                    let v = [0u32, 1, 0xFFFF_FFFF, 16 << 20, (16 << 20) + 1][(next() % 5) as usize];
++                    for (k, b) in v.to_le_bytes().iter().enumerate() {
++                        if p + k < data.len() {
++                            data[p + k] = *b;
++                        }
++                    }
++                }
++                _ => data.splice(p..p, (0..next() % 40).map(|_| next() as u8)).for_each(drop),
++            }
++        }
++        if i % 2 == 0 {
++            let at = offsets[(next() as usize) % offsets.len()];
++            fix(&mut data, at);
++        }
++        let start = if next() % 4 == 0 { None } else { Some(SequenceNumber::new(1 + next() % 3)) };
++        let from = SequenceNumber::new(next() % 16);
++        let budget_ops = 1 + (next() % 20) as usize;
++        let result = std::panic::catch_unwind(|| {
++            let mut source = BufReader::new(Cursor::new(&data[..]));
++            let mut budget = ReadBudget::new(budget_ops, 1 + next_u64(&data) % 4096);
++            let read = read_frames(&mut source, Some(data.len() as u64), start, from, &mut budget);
++            if let Ok(FrameRead { anomaly: Some((at, anomaly)), .. }) = &read {
++                let _ = classify_in(&mut source, *at, anomaly.clone(), data.len() as u64);
++            }
++            // The same bytes through a zstd stream (no known end, as for cold segments).
++            let compressed = zstd::encode_all(&data[..], 1).unwrap();
++            let mut decoder = zstd::stream::read::Decoder::new(&compressed[..]).unwrap();
++            let mut budget = ReadBudget::ops(budget_ops);
++            let streamed = read_frames(&mut decoder, None, start, from, &mut budget);
++            (read.is_ok(), streamed.is_ok())
++        });
++        match result {
++            Ok((true, _)) => outcomes[0] += 1,
++            Ok((false, _)) => outcomes[1] += 1,
++            Err(_) => {
++                outcomes[2] += 1;
++                panic!("read_frames panicked on {data:02x?} start={start:?} from={from:?}");
++            }
++        }
++    }
++    eprintln!("[segment_reader] iters={iters} ok={} err={} panics={}", outcomes[0], outcomes[1], outcomes[2]);
++}
++
++fn next_u64(data: &[u8]) -> u64 {
++    data.len() as u64
++}
+diff --git a/crates/server/src/log/tests/tiered_log.rs b/crates/server/src/log/tests/tiered_log.rs
+index 9c597f3..947f815 100644
+--- a/crates/server/src/log/tests/tiered_log.rs
++++ b/crates/server/src/log/tests/tiered_log.rs
+@@ -1757,3 +1757,41 @@ fn test_unified_wal_zero_filled_eof_truncation() {
+     assert_eq!(recovered_mutations.len(), 1);
+     assert_eq!(file_len(&active_path), clean_len);
+ }
++
++/// AUDIT INV-W2: `log_meta.json` is not under a checksum. One flipped bit that keeps the JSON
++/// valid raises the recorded pruning point, and opening the log then deletes, without any
++/// error, sealed segments that were never pruned.
++#[test]
++fn audit_single_bit_flip_in_log_meta_deletes_retained_segments() {
++    let dir = tempdir().unwrap();
++    let policy = || RoomLifecyclePolicy {
++        ram_max_ops: 5,
++        ..RoomLifecyclePolicy::default()
++    };
++    {
++        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy()).unwrap();
++        append_range(&mut log, 1, 40);
++        log.prune_older_than(SequenceNumber::new(11)).unwrap();
++        assert_eq!(log.tail_seq().get(), 11);
++        let (ops, _) = log.fetch_deltas(SequenceNumber::new(10), 100).unwrap();
++        assert_contiguous(&ops, 11, 40);
++    }
++    let segments = segments_dir(dir.path());
++    assert!(segment_file(&segments, 11, 15, "wal").exists());
++
++    let meta = dir.path().join("log_meta.json");
++    let mut bytes = std::fs::read(&meta).unwrap();
++    eprintln!("[audit] log_meta.json before: {}", String::from_utf8_lossy(&bytes));
++    let at = bytes.windows(2).position(|w| w == b"10").unwrap();
++    bytes[at] ^= 0b10; // "10" -> "30": one bit.
++    std::fs::write(&meta, &bytes).unwrap();
++    eprintln!("[audit] log_meta.json after:  {}", String::from_utf8_lossy(&bytes));
++
++    let (log, _) = TieredLog::open_or_create(dir.path(), policy()).expect("opens without error");
++    eprintln!("[audit] reopened: tail_seq={} head_seq={}", log.tail_seq(), log.head_seq());
++    assert_eq!(log.tail_seq().get(), 31);
++    for (a, b) in [(11, 15), (16, 20), (21, 25), (26, 30)] {
++        assert!(!segment_file(&segments, a, b, "wal").exists(), "segment {a}..={b} deleted");
++    }
++    assert!(log.fetch_deltas(SequenceNumber::new(10), 100).is_err());
++}
+diff --git a/crates/server/src/tests/schema_registry.rs b/crates/server/src/tests/schema_registry.rs
+index 5a1a709..749c2e4 100644
+--- a/crates/server/src/tests/schema_registry.rs
++++ b/crates/server/src/tests/schema_registry.rs
+@@ -198,3 +198,74 @@ fn concurrent_schema_writes_all_succeed_without_losing_columns() {
+     }
+     assert!(!durable::tmp_path_for(&todo_path(&dir)).exists());
+ }
++
++/// AUDIT INV-W2 (and its consequence on INV-E1): a single flipped bit in `schemas/{id}.json`
++/// that keeps the JSON valid is not detected. The registry restarts with a schema in which a
++/// table has another id, so every operation of that table in the rooms' logs refers to a
++/// table the schema no longer has.
++#[test]
++fn audit_single_bit_flip_in_a_schema_file_renumbers_a_table() {
++    let dir = tempdir().unwrap();
++    let id = SchemaId::new("todo").unwrap();
++    let registry = SchemaRegistry::new(dir.path()).unwrap();
++    let schema = Schema::builder()
++        .table(
++            TableSchema::builder("tasks")
++                .table_id(0)
++                .primary_key("id", DataType::Int)
++                .column("title", DataType::String),
++        )
++        .table(
++            TableSchema::builder("notes")
++                .table_id(1)
++                .primary_key("id", DataType::Int),
++        )
++        .build();
++    registry.register_schema(id.clone(), schema).unwrap();
++    drop(registry);
++
++    let path = dir.path().join("todo.json");
++    let mut bytes = std::fs::read(&path).unwrap();
++    let needle = b"\"table_id\": 1";
++    let at = bytes
++        .windows(needle.len())
++        .position(|w| w == needle)
++        .unwrap()
++        + needle.len()
++        - 1;
++    bytes[at] ^= 0b10; // '1' (0x31) -> '3' (0x33): one bit.
++    std::fs::write(&path, &bytes).unwrap();
++
++    let reopened = SchemaRegistry::new(dir.path()).expect("the damaged file is accepted");
++    let schema = reopened.get_schema(&id).unwrap();
++    assert_eq!(schema.get_table_id("notes"), Some(3));
++    assert!(!schema.has_table_by_id(1));
++    eprintln!("[audit] table 'notes' reloaded with id 3 instead of 1, no error");
++}
++
++/// AUDIT (backlog): a failed directory sync after the rename leaves the new version on disk
++/// but the previous one in the registry; the next write overwrites the disk from the cache.
++#[test]
++fn audit_failed_directory_sync_leaves_the_disk_ahead_of_the_registry() {
++    let (dir, id, registry) = todo_registry();
++    fail_point::arm("sync_dir", dir.path());
++    assert!(registry
++        .add_column(&id, "tasks", nullable_int("priority"))
++        .is_err());
++    assert!(!has_column(&registry.get_schema(&id).unwrap(), "priority"));
++    let on_disk: Schema =
++        serde_json::from_slice(&std::fs::read(todo_path(&dir)).unwrap()).unwrap();
++    assert!(has_column(&on_disk, "priority"), "the rename already happened");
++    // A restart now would serve `priority`; without one, the next column takes its index.
++    registry
++        .add_column(
++            &id,
++            "tasks",
++            ColumnDef::new("estimate", DataType::String).nullable(true),
++        )
++        .unwrap();
++    let on_disk: Schema =
++        serde_json::from_slice(&std::fs::read(todo_path(&dir)).unwrap()).unwrap();
++    assert!(!has_column(&on_disk, "priority"));
++    assert!(has_column(&on_disk, "estimate"));
++}

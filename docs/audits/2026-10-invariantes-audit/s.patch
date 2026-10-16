@@ -1,0 +1,1410 @@
+diff --git a/crates/storage/src/disk/tests/sim_inv.rs b/crates/storage/src/disk/tests/sim_inv.rs
+new file mode 100644
+index 0000000..2fb826d
+--- /dev/null
++++ b/crates/storage/src/disk/tests/sim_inv.rs
+@@ -0,0 +1,1312 @@
++//! Audit simulation (INV-S1, INV-S2, INV-S3, INV-D3): random batches, compactions, snapshots and
++//! reopens, with a crash image or an injected I/O error at the k-th fail/pause point, checked
++//! against a `MemoryStorageEngine` oracle.
++
++use crate::disk::compactor::compacting_wal_path;
++use crate::fail_point::{CrashPlan, CRASH};
++use crate::{
++    DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, ScanOptions, StorageEngine,
++    StorageError,
++};
++use futures::StreamExt;
++use std::path::{Path, PathBuf};
++use zemdb_core::protocol::wal_frame::{decode_wal_batch_from_slice, encode_wal_batch};
++use zemdb_core::{
++    ColumnUpdate, CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequenceNumber,
++    SequencedOperation, TableSchema, Value, WalBatchDecodeResult,
++};
++
++// ---------------------------------------------------------------------------------------------
++// Infrastructure
++
++struct Rng(u64);
++impl Rng {
++    fn next(&mut self) -> u64 {
++        self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
++        let mut z = self.0;
++        z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
++        z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
++        z ^ (z >> 31)
++    }
++    fn below(&mut self, n: u64) -> u64 {
++        self.next() % n.max(1)
++    }
++    fn pct(&mut self, p: u64) -> bool {
++        self.below(100) < p
++    }
++}
++
++const USERS: u16 = 0;
++const ITEMS: u16 = 1;
++
++fn schema() -> Schema {
++    let users = TableSchema::builder("users")
++        .table_id(USERS)
++        .primary_key("id", DataType::Int)
++        .column("name", DataType::String);
++    let items = TableSchema::builder("items")
++        .table_id(ITEMS)
++        .primary_key("id", DataType::Int)
++        .column("data", DataType::Bytes);
++    Schema::builder().table(users).table(items).build()
++}
++
++fn room() -> RoomId {
++    RoomId::new("sim").unwrap()
++}
++
++fn engine(dir: &Path) -> DiskStorageEngine {
++    DiskStorageEngine::new(DiskStorageOptions::new(dir).auto_compact(false)).unwrap()
++}
++
++#[derive(Clone, Debug)]
++enum Event {
++    Batch(Vec<SequencedOperation>),
++    Snapshot(Vec<u8>, u64),
++}
++
++type Dump = (u64, Vec<String>);
++
++async fn dump<E: StorageEngine>(e: &E, room: &RoomId) -> Dump {
++    let head = e.get_head_seq(room).await.unwrap().get();
++    let mut rows = Vec::new();
++    for t in [USERS, ITEMS] {
++        let mut s = e.scan_by_id(room, t, ScanOptions::default()).await.unwrap();
++        while let Some(item) = s.next().await {
++            let (pk, row) = item.unwrap();
++            rows.push(format!("{t}:{pk:?}={row:?}"));
++        }
++    }
++    (head, rows)
++}
++
++async fn oracle_engine(events: &[Event]) -> MemoryStorageEngine {
++    let m = MemoryStorageEngine::new();
++    m.open_room(&room(), schema()).await.unwrap();
++    for ev in events {
++        match ev {
++            Event::Batch(ops) => {
++                m.apply_batch(&room(), ops.clone()).await.unwrap();
++            }
++            Event::Snapshot(bytes, seq) => {
++                m.apply_snapshot(
++                    &room(),
++                    schema(),
++                    bytes.clone().into(),
++                    SequenceNumber::from(*seq),
++                )
++                .await
++                .unwrap();
++            }
++        }
++    }
++    m
++}
++
++async fn oracle(events: &[Event]) -> Dump {
++    dump(&oracle_engine(events).await, &room()).await
++}
++
++fn head_of(events: &[Event]) -> u64 {
++    let mut head = 0;
++    for ev in events {
++        match ev {
++            Event::Batch(ops) => head = ops.last().map_or(head, |o| o.seq.get()),
++            Event::Snapshot(_, s) => head = *s,
++        }
++    }
++    head
++}
++
++fn random_value(rng: &mut Rng, table: u16) -> Value {
++    if table == USERS {
++        let len = if rng.pct(10) { 2000 + rng.below(3000) } else { 1 + rng.below(30) };
++        let s: String = (0..len).map(|i| (b'a' + ((i + rng.below(26)) % 26) as u8) as char).collect();
++        Value::String(s.into())
++    } else if rng.pct(30) {
++        // A valid WAL frame stored as a value.
++        let fake = SequencedOperation::new(
++            1 + rng.below(1_000_000),
++            Operation::delete(USERS, PrimaryKey::single(rng.below(50) as i64), 1),
++        );
++        Value::Bytes(encode_wal_batch(&[fake], None).unwrap().into())
++    } else {
++        let len = rng.below(64);
++        Value::Bytes((0..len).map(|_| rng.below(256) as u8).collect::<Vec<_>>().into())
++    }
++}
++
++fn random_op(rng: &mut Rng, seq: u64) -> SequencedOperation {
++    let table = if rng.pct(50) { USERS } else { ITEMS };
++    let key = rng.below(12) as i64;
++    let pk = PrimaryKey::single(key);
++    let roll = rng.below(100);
++    let op = if roll < 60 {
++        let row = CompactRow::new(vec![Value::Int(key), random_value(rng, table)]);
++        Operation::insert(table, pk, row, seq)
++    } else if roll < 85 {
++        Operation::update(table, pk, vec![ColumnUpdate::new(1, random_value(rng, table))], seq)
++    } else {
++        Operation::delete(table, pk, seq)
++    };
++    SequencedOperation::new(seq, op)
++}
++
++fn random_batch(rng: &mut Rng, head: u64) -> Vec<SequencedOperation> {
++    let n = 1 + rng.below(4);
++    (0..n).map(|i| random_op(rng, head + 1 + i)).collect()
++}
++
++/// A snapshot of the state reached from `events` plus `extra` random batches, and its head.
++async fn snapshot_ahead(rng: &mut Rng, events: &[Event], extra: u64) -> (Vec<u8>, u64) {
++    let m = oracle_engine(events).await;
++    let mut head = head_of(events);
++    for _ in 0..extra {
++        let b = random_batch(rng, head);
++        head = b.last().unwrap().seq.get();
++        m.apply_batch(&room(), b).await.unwrap();
++    }
++    (m.create_snapshot(&room()).await.unwrap(), head)
++}
++
++#[derive(Clone, Debug)]
++enum Op {
++    Batch(Vec<SequencedOperation>),
++    GapBatch(Vec<SequencedOperation>),
++    InvalidBatch(Vec<SequencedOperation>),
++    Compact,
++    SnapshotAhead(Vec<u8>, u64),
++    SnapshotBehindOrEqual(Vec<u8>, u64),
++    SnapshotWrongHead(Vec<u8>, u64),
++    Reopen,
++    FailedCompact(&'static str),
++}
++
++const COMPACTION_FAILURES: [&str; 5] = [
++    "compaction.phase2",
++    "snapshot.stage_write",
++    "compaction.phase3_rename",
++    "compaction.phase3_sync",
++    "compaction.cleanup",
++];
++
++async fn random_step(rng: &mut Rng, events: &[Event]) -> Op {
++    let head = head_of(events);
++    let roll = rng.below(100);
++    if roll < 50 {
++        Op::Batch(random_batch(rng, head))
++    } else if roll < 54 {
++        let mut b = random_batch(rng, head);
++        for o in &mut b {
++            *o = SequencedOperation::new(o.seq.get() + 1, o.op.clone());
++        }
++        Op::GapBatch(b)
++    } else if roll < 57 {
++        let mut b = random_batch(rng, head);
++        let last = b.len() - 1;
++        let seq = b[last].seq;
++        b[last] = SequencedOperation::new(seq, Operation::delete(9, PrimaryKey::single(1i64), 1));
++        Op::InvalidBatch(b)
++    } else if roll < 66 {
++        Op::Compact
++    } else if roll < 75 {
++        Op::FailedCompact(COMPACTION_FAILURES[rng.below(5) as usize])
++    } else if roll < 84 {
++        let extra = 1 + rng.below(3);
++        let (bytes, seq) = snapshot_ahead(rng, events, extra).await;
++        Op::SnapshotAhead(bytes, seq)
++    } else if roll < 88 {
++        // At the head (or behind it, from a prefix).
++        let cut = rng.below(events.len() as u64 + 1) as usize;
++        let prefix = &events[..cut];
++        let (bytes, seq) = snapshot_ahead(rng, prefix, 0).await;
++        Op::SnapshotBehindOrEqual(bytes, seq)
++    } else if roll < 90 {
++        let extra = 1 + rng.below(3);
++        let (bytes, seq) = snapshot_ahead(rng, events, extra).await;
++        Op::SnapshotWrongHead(bytes, seq)
++    } else {
++        Op::Reopen
++    }
++}
++
++fn arm(root: &Path, target: usize, dest: Option<PathBuf>, inject_error: bool) {
++    let mut g = CRASH.lock().unwrap_or_else(|e| e.into_inner());
++    g.retain(|p| p.root != root);
++    g.push(CrashPlan {
++        root: root.to_path_buf(),
++        target,
++        dest,
++        inject_error,
++        hits: Vec::new(),
++        taken: None,
++    });
++}
++
++fn disarm(root: &Path) -> Option<CrashPlan> {
++    let mut g = CRASH.lock().unwrap_or_else(|e| e.into_inner());
++    let pos = g.iter().position(|p| p.root == root)?;
++    Some(g.remove(pos))
++}
++
++fn taken(root: &Path) -> Option<&'static str> {
++    CRASH.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|p| p.root == root).and_then(|p| p.taken)
++}
++
++/// Runs `op` on `engine`. Returns the result as a string-ish outcome.
++async fn run_op(
++    engine: &DiskStorageEngine,
++    op: &Op,
++) -> Result<Result<u64, StorageError>, String> {
++    let (e, r, op) = (engine.clone(), room(), op.clone());
++    let handle = tokio::spawn(async move {
++        match op {
++            Op::Batch(b) | Op::GapBatch(b) | Op::InvalidBatch(b) => {
++                e.apply_batch(&r, b).await.map(|s| s.get())
++            }
++            Op::Compact => e.compact_room(&r).await.map(|_| 0),
++            Op::FailedCompact(point) => {
++                let path = if point == "compaction.phase2" || point == "snapshot.stage_write" {
++                    e.snap_file_path(&r)
++                } else {
++                    e.wal_file_path(&r)
++                };
++                crate::fail_point::arm(point, &path);
++                let res = e.compact_room(&r).await.map(|_| 0);
++                // Disarm if the point was never reached.
++                let _ = crate::fail_point::check(point, &path);
++                res
++            }
++            Op::SnapshotAhead(bytes, seq) | Op::SnapshotBehindOrEqual(bytes, seq) => e
++                .apply_snapshot(&r, schema(), bytes.into(), SequenceNumber::from(seq))
++                .await
++                .map(|s| s.get()),
++            Op::SnapshotWrongHead(bytes, seq) => e
++                .apply_snapshot(&r, schema(), bytes.into(), SequenceNumber::from(seq + 1))
++                .await
++                .map(|s| s.get()),
++            Op::Reopen => unreachable!(),
++        }
++    });
++    match handle.await {
++        Ok(r) => Ok(r),
++        Err(e) => Err(format!("task: {e}")),
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++// INV-S3: crash images at every fail/pause point
++
++static STATS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
++fn stat(s: String) {
++    STATS.lock().unwrap().push(s);
++}
++fn print_stats() {
++    let mut m = std::collections::BTreeMap::<String, usize>::new();
++    for s in STATS.lock().unwrap().drain(..) {
++        *m.entry(s).or_default() += 1;
++    }
++    for (k, v) in m {
++        eprintln!("    {v:5} {k}");
++    }
++}
++
++struct CrashCase {
++    seed: u64,
++    target: usize,
++}
++
++/// Runs the scenario of `seed` with a crash image at the `target`-th point. Returns the number
++/// of points hit (when `target` is 0, only counts) and an error description on violation.
++async fn crash_trial(case: &CrashCase, steps: usize, nested: Option<usize>) -> Result<usize, String> {
++    let tmp = tempfile::tempdir().unwrap();
++    let data = tmp.path().join("data");
++    let image = tmp.path().join("image");
++    let image2 = tmp.path().join("image2");
++    let mut rng = Rng(case.seed);
++
++    arm(&data, case.target, Some(image.clone()), false);
++    let mut eng = engine(&data);
++    let mut events: Vec<Event> = Vec::new();
++    let mut candidates: Option<(Vec<Vec<Event>>, String)> = None;
++    if let Err(e) = eng.open_room(&room(), schema()).await {
++        disarm(&data);
++        return Err(format!("initial open failed: {e}"));
++    }
++    if taken(&data).is_some() {
++        candidates = Some((vec![vec![]], "initial open".into()));
++    }
++    for step in 0..steps {
++        if candidates.is_some() {
++            break;
++        }
++        let op = random_step(&mut rng, &events).await;
++        let before = events.clone();
++        let mut after: Option<Vec<Event>> = None;
++        match &op {
++            Op::Reopen => {
++                eng.close_room(&room()).await.map_err(|e| format!("close: {e}"))?;
++                eng = engine(&data);
++                eng.open_room(&room(), schema()).await.map_err(|e| format!("reopen: {e}"))?;
++            }
++            _ => {
++                let res = run_op(&eng, &op).await?;
++                let head = head_of(&events);
++                match (&op, res) {
++                    (Op::Batch(b), Ok(h)) => {
++                        assert_eq!(h, b.last().unwrap().seq.get());
++                        let mut a = events.clone();
++                        a.push(Event::Batch(b.clone()));
++                        after = Some(a.clone());
++                        events = a;
++                    }
++                    (Op::SnapshotAhead(bytes, seq), Ok(h)) => {
++                        assert_eq!(h, *seq);
++                        let mut a = events.clone();
++                        a.push(Event::Snapshot(bytes.clone(), *seq));
++                        after = Some(a.clone());
++                        events = a;
++                    }
++                    (Op::Compact, Ok(_)) => {}
++                    (Op::FailedCompact(_), _) => {}
++                    (Op::GapBatch(_), Err(StorageError::SequenceMismatch { .. })) => {}
++                    (Op::InvalidBatch(_), Err(StorageError::TableNotFound { .. }))
++                    | (Op::InvalidBatch(_), Err(StorageError::SchemaValidation(_))) => {}
++                    (Op::SnapshotBehindOrEqual(_, seq), Ok(h)) if *seq == head && h == head => {}
++                    (Op::SnapshotBehindOrEqual(_, seq), Err(StorageError::SnapshotBehind { .. }))
++                        if *seq < head => {}
++                    (Op::SnapshotWrongHead(..), Err(StorageError::SnapshotHeadMismatch { .. })) => {}
++                    (op, res) => {
++                        disarm(&data);
++                        return Err(format!("step {step}: unexpected {res:?} for {:?}", short(op)));
++                    }
++                }
++            }
++        }
++        if let Some(name) = taken(&data) {
++            let mut c = vec![before];
++            if let Some(a) = after {
++                c.push(a);
++            }
++            let kind = short(&op).split('(').next().unwrap().to_string();
++            stat(format!("{kind} @ {name}"));
++            candidates = Some((c, format!("step {step} {:?} at {name}", short(&op))));
++        }
++        // In-memory state always equals the oracle of confirmed events (INV-S2/S1).
++        let mem = dump(&eng, &room()).await;
++        if mem != oracle(&events).await {
++            disarm(&data);
++            return Err(format!("step {step}: in-memory state differs from oracle"));
++        }
++    }
++    let plan = disarm(&data).unwrap();
++    let hits = plan.hits.len();
++    let _ = eng.close_room(&room()).await;
++    drop(eng);
++    let Some((cands, where_)) = candidates else {
++        return Ok(hits);
++    };
++
++    // Optionally crash again during the recovery of the image.
++    let mut target_dir = image.clone();
++    if let Some(k2) = nested {
++        arm(&image, k2, Some(image2.clone()), false);
++        let e2 = engine(&image);
++        let _ = e2.open_room(&room(), schema()).await;
++        let p = disarm(&image).unwrap();
++        let _ = e2.close_room(&room()).await;
++        drop(e2);
++        if let Some(n) = p.taken {
++            stat(format!("nested recovery crash @ {n}"));
++            target_dir = image2.clone();
++        }
++    }
++
++    let rec = engine(&target_dir);
++    rec.open_room(&room(), schema())
++        .await
++        .map_err(|e| format!("recovery of crash image ({where_}) failed: {e}"))?;
++    let got = dump(&rec, &room()).await;
++    let mut ok = false;
++    for c in &cands {
++        if oracle(c).await == got {
++            ok = true;
++        }
++    }
++    if !ok {
++        let want: Vec<u64> = cands.iter().map(|c| head_of(c)).collect();
++        return Err(format!(
++            "crash image ({where_}, nested={nested:?}) recovered head {} rows {}, expected one of heads {want:?}",
++            got.0,
++            got.1.len()
++        ));
++    }
++    // The recovered room keeps working and stays durable.
++    let head = got.0;
++    let b = random_batch(&mut rng, head);
++    rec.apply_batch(&room(), b.clone()).await.map_err(|e| format!("write after recovery: {e}"))?;
++    let _ = rec.compact_room(&room()).await;
++    rec.close_room(&room()).await.unwrap();
++    let rec2 = engine(&target_dir);
++    rec2.open_room(&room(), schema()).await.map_err(|e| format!("reopen after recovery: {e}"))?;
++    assert_eq!(rec2.get_head_seq(&room()).await.unwrap().get(), b.last().unwrap().seq.get());
++    Ok(hits)
++}
++
++fn short(op: &Op) -> String {
++    match op {
++        Op::Batch(b) => format!("Batch({}..={})", b[0].seq.get(), b.last().unwrap().seq.get()),
++        Op::GapBatch(_) => "GapBatch".into(),
++        Op::InvalidBatch(_) => "InvalidBatch".into(),
++        Op::Compact => "Compact".into(),
++        Op::SnapshotAhead(_, s) => format!("SnapshotAhead({s})"),
++        Op::SnapshotBehindOrEqual(_, s) => format!("SnapshotBehindOrEqual({s})"),
++        Op::SnapshotWrongHead(_, s) => format!("SnapshotWrongHead({s})"),
++        Op::Reopen => "Reopen".into(),
++        Op::FailedCompact(p) => format!("FailedCompact({p})"),
++    }
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn sim_crash_images_recover_a_confirmed_state() {
++    let seeds: u64 = std::env::var("SIM_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
++    let steps: usize = std::env::var("SIM_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
++    let mut failures = Vec::new();
++    let mut trials = 0;
++    for seed in 1..=seeds {
++        let hits = crash_trial(&CrashCase { seed, target: 0 }, steps, None).await;
++        let hits = match hits {
++            Ok(h) => h,
++            Err(e) => {
++                failures.push(format!("seed {seed} dry run: {e}"));
++                continue;
++            }
++        };
++        let mut nrng = Rng(seed * 7919);
++        let mut set = tokio::task::JoinSet::new();
++        for target in 1..=hits {
++            let nested = if nrng.pct(50) { Some(1 + nrng.below(14) as usize) } else { None };
++            trials += 1;
++            while set.len() >= 12 {
++                if let Some(Ok(Err(e))) = set.join_next().await { failures.push(e); }
++            }
++            set.spawn(async move {
++                crash_trial(&CrashCase { seed, target }, steps, nested)
++                    .await
++                    .map(|_| ())
++                    .map_err(|e| format!("seed {seed} target {target} nested {nested:?}: {e}"))
++            });
++        }
++        while let Some(r) = set.join_next().await {
++            match r { Ok(Err(e)) => failures.push(e), Err(e) => failures.push(format!("seed {seed}: join {e}")), _ => {} }
++        }
++    }
++    eprintln!("crash trials: {trials}, failures: {}", failures.len());
++    print_stats();
++    for f in failures.iter().take(30) {
++        eprintln!("  {f}");
++    }
++    assert!(failures.is_empty());
++}
++
++// ---------------------------------------------------------------------------------------------
++// INV-S1 / INV-L3: an injected I/O error (or panic) at the k-th point
++
++async fn reopen_and_reconcile(
++    eng: &mut DiskStorageEngine,
++    data: &Path,
++    cands: &[Vec<Event>],
++) -> Result<Vec<Event>, String> {
++    let _ = eng.close_room(&room()).await;
++    *eng = engine(data);
++    let mut tries = 0;
++    loop {
++        match eng.open_room(&room(), schema()).await {
++            Ok(()) => break,
++            Err(e) if tries < 2 => {
++                tries += 1;
++                let _ = e;
++                *eng = engine(data);
++            }
++            Err(e) => return Err(format!("reopen failed: {e}")),
++        }
++    }
++    let got = dump(eng, &room()).await;
++    for c in cands {
++        if oracle(c).await == got {
++            return Ok(c.clone());
++        }
++    }
++    let want: Vec<u64> = cands.iter().map(|c| head_of(c)).collect();
++    Err(format!("after reopen head {} not in candidates {want:?}", got.0))
++}
++
++async fn error_trial(seed: u64, target: usize, steps: usize) -> Result<(usize, Option<&'static str>), String> {
++    let r = error_trial_inner(seed, target, steps).await;
++    if let Ok((_, Some(n))) = &r { stat(format!("injected @ {n}")); }
++    r
++}
++
++async fn error_trial_inner(seed: u64, target: usize, steps: usize) -> Result<(usize, Option<&'static str>), String> {
++    let tmp = tempfile::tempdir().unwrap();
++    let data = tmp.path().join("data");
++    let mut rng = Rng(seed);
++    arm(&data, target, None, true);
++    let mut eng = engine(&data);
++    if eng.open_room(&room(), schema()).await.is_err() {
++        let _ = reopen_and_reconcile(&mut eng, &data, &[vec![]]).await?;
++    }
++    let mut events: Vec<Event> = Vec::new();
++    for step in 0..steps {
++        let op = random_step(&mut rng, &events).await;
++        let head = head_of(&events);
++        if let Op::Reopen = op {
++            events = reopen_and_reconcile(&mut eng, &data, &[events.clone()]).await
++                .map_err(|e| format!("step {step} reopen: {e}"))?;
++            continue;
++        }
++        let res = run_op(&eng, &op).await;
++        let mut ambiguous: Option<Vec<Vec<Event>>> = None;
++        match (&op, res) {
++            (Op::Batch(b), Ok(Ok(h))) => {
++                if h != b.last().unwrap().seq.get() {
++                    return Err(format!("step {step}: batch Ok with head {h}"));
++                }
++                events.push(Event::Batch(b.clone()));
++            }
++            (Op::SnapshotAhead(bytes, seq), Ok(Ok(h))) if h == *seq => {
++                events.push(Event::Snapshot(bytes.clone(), *seq));
++            }
++            (Op::Compact, Ok(Ok(_))) => {}
++            (Op::FailedCompact(_), Ok(Err(StorageError::RoomFailed { .. }))) => {
++                ambiguous = Some(vec![events.clone()]);
++            }
++            (Op::FailedCompact(_), _) => {}
++            (Op::GapBatch(_), Ok(Err(StorageError::SequenceMismatch { .. }))) => {}
++            (Op::InvalidBatch(_), Ok(Err(StorageError::TableNotFound { .. })))
++            | (Op::InvalidBatch(_), Ok(Err(StorageError::SchemaValidation(_)))) => {}
++            (Op::SnapshotBehindOrEqual(_, seq), Ok(Ok(h))) if *seq == head && h == head => {}
++            (Op::SnapshotBehindOrEqual(_, seq), Ok(Err(StorageError::SnapshotBehind { .. })))
++                if *seq < head => {}
++            (Op::SnapshotWrongHead(..), Ok(Err(StorageError::SnapshotHeadMismatch { .. }))) => {}
++            (Op::Batch(b), _) => {
++                let mut a = events.clone();
++                a.push(Event::Batch(b.clone()));
++                ambiguous = Some(vec![events.clone(), a]);
++            }
++            (Op::SnapshotAhead(bytes, seq), _) => {
++                let mut a = events.clone();
++                a.push(Event::Snapshot(bytes.clone(), *seq));
++                ambiguous = Some(vec![events.clone(), a]);
++            }
++            (Op::Compact, _) if rng.pct(50) => {
++                // Keep going on the same room; a later RoomFailed is handled below.
++            }
++            (_, Ok(Err(StorageError::RoomFailed { .. }))) | (Op::Compact, _) => {
++                ambiguous = Some(vec![events.clone()]);
++            }
++            (op, res) => {
++                // An injected error turned a deterministic rejection into an I/O error.
++                if taken(&data).is_some() {
++                    ambiguous = Some(vec![events.clone()]);
++                } else {
++                    return Err(format!("step {step}: unexpected {res:?} for {}", short(op)));
++                }
++            }
++        }
++        if let Some(c) = ambiguous {
++            events = reopen_and_reconcile(&mut eng, &data, &c)
++                .await
++                .map_err(|e| format!("step {step} {} (point {:?}): {e}", short(&op), taken(&data)))?;
++        } else {
++            let mem = dump(&eng, &room()).await;
++            if mem != oracle(&events).await {
++                return Err(format!("step {step}: in-memory state differs from oracle after {}", short(&op)));
++            }
++        }
++    }
++    let plan = disarm(&data).unwrap();
++    let final_events = reopen_and_reconcile(&mut eng, &data, &[events.clone()])
++        .await
++        .map_err(|e| format!("final reopen (point {:?}): {e}", plan.taken))?;
++    let _ = final_events;
++    Ok((plan.hits.len(), plan.taken))
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn sim_injected_errors_never_lose_a_confirmed_state() {
++    let seeds: u64 = std::env::var("SIM_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
++    let steps: usize = std::env::var("SIM_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
++    let mut failures = Vec::new();
++    let mut trials = 0;
++    for seed in 100..100 + seeds {
++        let hits = match error_trial(seed, 0, steps).await {
++            Ok((h, _)) => h,
++            Err(e) => {
++                failures.push(format!("seed {seed} dry: {e}"));
++                continue;
++            }
++        };
++        let mut set = tokio::task::JoinSet::new();
++        for target in 1..=hits {
++            trials += 1;
++            while set.len() >= 12 {
++                if let Some(Ok(Err(e))) = set.join_next().await { failures.push(e); }
++            }
++            set.spawn(async move {
++                error_trial(seed, target, steps)
++                    .await
++                    .map(|_| ())
++                    .map_err(|e| format!("seed {seed} target {target}: {e}"))
++            });
++        }
++        while let Some(r) = set.join_next().await {
++            match r { Ok(Err(e)) => failures.push(e), Err(e) => failures.push(format!("seed {seed}: join {e}")), _ => {} }
++        }
++    }
++    eprintln!("error trials: {trials}, failures: {}", failures.len());
++    print_stats();
++    for f in failures.iter().take(30) {
++        eprintln!("  {f}");
++    }
++    assert!(failures.is_empty());
++}
++
++// ---------------------------------------------------------------------------------------------
++// INV-D3: damaged WALs recover exactly a prefix, or fail without touching anything
++
++fn frame_bounds(bytes: &[u8]) -> Vec<(usize, usize, u64)> {
++    let mut out = Vec::new();
++    let mut off = 0;
++    while off < bytes.len() {
++        match decode_wal_batch_from_slice(&bytes[off..]).unwrap() {
++            WalBatchDecodeResult::Ok { ops, bytes_consumed, .. } => {
++                let last = ops.last().map_or(0, |o| o.seq.get());
++                out.push((off, off + bytes_consumed, last));
++                off += bytes_consumed;
++            }
++            other => panic!("unexpected {other:?}"),
++        }
++    }
++    out
++}
++
++fn files_of(dir: &Path) -> Vec<(String, Vec<u8>)> {
++    let mut v: Vec<_> = std::fs::read_dir(dir)
++        .unwrap()
++        .map(|e| e.unwrap())
++        .filter(|e| !e.file_name().to_string_lossy().ends_with(".lock"))
++        .map(|e| (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).unwrap()))
++        .collect();
++    v.sort();
++    v
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn sim_damaged_active_wal_recovers_a_prefix_or_fails_untouched() {
++    let trials: u64 = std::env::var("SIM_DAMAGE").ok().and_then(|s| s.parse().ok()).unwrap_or(400);
++    let mut failures = Vec::new();
++    for seed in 0..trials {
++        let mut rng = Rng(1000 + seed);
++        let tmp = tempfile::tempdir().unwrap();
++        let base = tmp.path().join("base");
++        let eng = engine(&base);
++        eng.open_room(&room(), schema()).await.unwrap();
++        let mut events = Vec::new();
++        let n = 2 + rng.below(8);
++        for _ in 0..n {
++            let b = random_batch(&mut rng, head_of(&events));
++            eng.apply_batch(&room(), b.clone()).await.unwrap();
++            events.push(Event::Batch(b));
++        }
++        eng.close_room(&room()).await.unwrap();
++        drop(eng);
++        let wal_path = base.join("room_sim.wal");
++        let wal = std::fs::read(&wal_path).unwrap();
++        let frames = frame_bounds(&wal);
++        assert_eq!(frames.len() as u64, n);
++
++        let trial = tmp.path().join("trial");
++        crate::fail_point::copy_dir(&base, &trial);
++        let twal = trial.join("room_sim.wal");
++        let kind = rng.below(4);
++        let p = rng.below(wal.len() as u64) as usize;
++        let mut damaged = wal.clone();
++        match kind {
++            0 => damaged.truncate(p),
++            1 => damaged[p..].iter_mut().for_each(|b| *b = 0),
++            2 => damaged[p] ^= 1 << rng.below(8),
++            _ => {
++                let end = (p + 1 + rng.below(40) as usize).min(damaged.len());
++                damaged[p..end].iter_mut().for_each(|b| *b = 0)
++            }
++        }
++        // First byte actually changed (a truncation changes the length at p).
++        let p = if kind == 0 {
++            if p == wal.len() { continue; }
++            p
++        } else {
++            match (0..wal.len()).find(|&i| damaged[i] != wal[i]) {
++                Some(i) => i,
++                None => continue,
++            }
++        };
++        std::fs::write(&twal, &damaged).unwrap();
++        let before = files_of(&trial);
++        // Frame holding p and whether valid frames follow it.
++        let idx = frames.iter().position(|(s, e, _)| p >= *s && p < *e).unwrap();
++        let rec = engine(&trial);
++        let res = rec.open_room(&room(), schema()).await;
++        let prefix_state = {
++            let mut ev = events.clone();
++            ev.truncate(idx);
++            oracle(&ev).await
++        };
++        match res {
++            Ok(()) => {
++                let got = dump(&rec, &room()).await;
++                // Last byte actually changed: frames starting after it are intact.
++                let last_changed = if kind == 0 || kind == 1 {
++                    wal.len() - 1
++                } else {
++                    (0..wal.len()).rev().find(|&i| damaged[i] != wal[i]).unwrap()
++                };
++                let last_frame_damaged = !frames.iter().any(|(s, _, _)| *s > last_changed);
++                let damage_reaches_end = kind == 0 || kind == 1;
++                if !(last_frame_damaged || damage_reaches_end) {
++                    failures.push(format!("seed {seed} kind {kind} p {p}: damage in frame {idx}/{} followed by valid frames was accepted (head {})", frames.len(), got.0));
++                } else if prefix_state != got {
++                    failures.push(format!("seed {seed} kind {kind} p {p}: recovered head {} is not the prefix before frame {idx}", got.0));
++                }
++                rec.close_room(&room()).await.unwrap();
++                let after_len = std::fs::metadata(&twal).unwrap().len() as usize;
++                if after_len != frames[idx].0 {
++                    failures.push(format!("seed {seed} kind {kind} p {p}: truncated to {after_len}, expected {}", frames[idx].0));
++                }
++            }
++            Err(StorageError::WalCorruption(_)) => {
++                if files_of(&trial) != before {
++                    failures.push(format!("seed {seed} kind {kind} p {p}: corruption changed files"));
++                }
++                let damage_reaches_end = kind == 0 || kind == 1;
++                if damage_reaches_end {
++                    failures.push(format!("seed {seed} kind {kind} p {p}: tail damage reported as corruption"));
++                } else if idx == frames.len() - 1 {
++                    // Allowed only if the damaged header hides an embedded frame.
++                    let (s, _, _) = frames[idx];
++                    if p >= s + 18 {
++                        failures.push(format!("seed {seed} kind {kind} p {p}: payload damage in the last frame reported as corruption"));
++                    }
++                }
++            }
++            Err(e) => failures.push(format!("seed {seed} kind {kind} p {p}: unexpected error {e}")),
++        }
++    }
++    eprintln!("damage trials: {trials}, failures: {}", failures.len());
++    for f in failures.iter().take(30) {
++        eprintln!("  {f}");
++    }
++    assert!(failures.is_empty());
++}
++
++/// `.wal.compacting` damaged after an interrupted absorb: accepted only when the active WAL
++/// covers it; damage in its own (older) records is corruption.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn sim_damaged_compacting_wal() {
++    let trials: u64 = std::env::var("SIM_DAMAGE").ok().and_then(|s| s.parse().ok()).unwrap_or(300);
++    let mut failures = Vec::new();
++    for seed in 0..trials {
++        let mut rng = Rng(5000 + seed);
++        let tmp = tempfile::tempdir().unwrap();
++        let base = tmp.path().join("base");
++        let eng = engine(&base);
++        eng.open_room(&room(), schema()).await.unwrap();
++        let mut events = Vec::new();
++        for _ in 0..(1 + rng.below(5)) {
++            let b = random_batch(&mut rng, head_of(&events));
++            eng.apply_batch(&room(), b.clone()).await.unwrap();
++            events.push(Event::Batch(b));
++        }
++        // Leave `.wal.compacting` with these records.
++        crate::fail_point::arm("compaction.phase2", &eng.snap_file_path(&room()));
++        assert!(eng.compact_room(&room()).await.is_err());
++        let old_frames = events.len();
++        for _ in 0..(1 + rng.below(5)) {
++            let b = random_batch(&mut rng, head_of(&events));
++            eng.apply_batch(&room(), b.clone()).await.unwrap();
++            events.push(Event::Batch(b));
++        }
++        eng.close_room(&room()).await.unwrap();
++        drop(eng);
++        let wal = std::fs::read(base.join("room_sim.wal")).unwrap();
++        let cpath = compacting_wal_path(&base.join("room_sim.wal"));
++        let compacting = std::fs::read(&cpath).unwrap();
++        // The interrupted absorb: the active WAL appended, with damage somewhere in the file.
++        let mut combined = compacting.clone();
++        let absorb = rng.pct(70);
++        if absorb {
++            combined.extend_from_slice(&wal);
++        }
++        let original_combined = combined.clone();
++        let p = rng.below(combined.len() as u64) as usize;
++        let kind = rng.below(3);
++        match kind {
++            0 => combined[p] ^= 1 << rng.below(8),
++            1 => {
++                let end = (p + 1 + rng.below(40) as usize).min(combined.len());
++                combined[p..end].iter_mut().for_each(|b| *b = 0)
++            }
++            _ => combined.truncate(p),
++        }
++        let p = if kind == 2 {
++            p
++        } else {
++            match (0..combined.len()).find(|&i| combined[i] != original_combined[i]) {
++                Some(i) => i,
++                None => continue,
++            }
++        };
++        let trial = tmp.path().join("trial");
++        crate::fail_point::copy_dir(&base, &trial);
++        std::fs::write(compacting_wal_path(&trial.join("room_sim.wal")), &combined).unwrap();
++        let before = files_of(&trial);
++        let rec = engine(&trial);
++        let res = rec.open_room(&room(), schema()).await;
++        let in_old = p < compacting.len();
++        match res {
++            Ok(()) => {
++                let got = dump(&rec, &room()).await;
++                if got != oracle(&events).await {
++                    failures.push(format!(
++                        "seed {seed} kind {kind} p {p} (old part: {in_old}, absorb {absorb}): recovered head {} != {} ",
++                        got.0,
++                        head_of(&events)
++                    ));
++                }
++                let _ = old_frames;
++            }
++            Err(StorageError::WalCorruption(msg)) => {
++                if std::env::var("SIM_DEBUG").is_ok() && !in_old {
++                    let cf = frame_bounds(&original_combined);
++                    let idx = cf.iter().position(|(s, e, _)| p >= *s && p < *e);
++                    eprintln!("seed {seed} kind {kind} p {p} compacting_len {} combined_len {} frames {:?} damaged frame {:?} msg {msg}",
++                        compacting.len(), original_combined.len(), cf, idx);
++                    if let Some(i) = idx {
++                        let (s0, e0, _) = cf[i];
++                        let payload = &original_combined[s0 + 18..e0];
++                        let embedded = payload.windows(2).filter(|w| *w == [0xBA, 0x7C]).count();
++                        eprintln!("   in header: {}, magic occurrences in payload: {embedded}", p < s0 + 18);
++                    }
++                }
++                if files_of(&trial) != before {
++                    failures.push(format!("seed {seed}: corruption changed files"));
++                }
++                if !in_old && kind != 2 {
++                    // Damage in the absorbed copy is covered by the active WAL.
++                    failures.push(format!("seed {seed} kind {kind} p {p}: damage in the absorbed copy rejected"));
++                }
++                if kind == 2 && !in_old {
++                    failures.push(format!("seed {seed} p {p}: truncated absorbed copy rejected"));
++                }
++            }
++            Err(e) => failures.push(format!("seed {seed} kind {kind} p {p}: unexpected error {e}")),
++        }
++    }
++    eprintln!("compacting damage trials: {trials}, failures: {}", failures.len());
++    for f in failures.iter().take(30) {
++        eprintln!("  {f}");
++    }
++    assert!(failures.is_empty());
++}
++
++// ---------------------------------------------------------------------------------------------
++// INV-S3 break: a crash while absorbing leaves `.wal.compacting` torn in a way recovery refuses,
++// although the active WAL still holds every record of the damaged copy.
++
++/// An `items` row whose value holds `padding` bytes and then a complete, valid WAL frame (a
++/// value any room member can write).
++fn item_with_embedded_frame(seq: u64, key: i64, padding: usize, fake_seq: u64) -> SequencedOperation {
++    let fake = SequencedOperation::new(fake_seq, Operation::delete(USERS, PrimaryKey::single(1i64), 1));
++    let mut data = vec![b'x'; padding];
++    data.extend_from_slice(&encode_wal_batch(&[fake], None).unwrap());
++    let row = CompactRow::new(vec![Value::Int(key), Value::Bytes(data.into())]);
++    SequencedOperation::new(seq, Operation::insert(ITEMS, PrimaryKey::single(key), row, seq))
++}
++
++fn user(seq: u64, name_len: usize) -> SequencedOperation {
++    let row = CompactRow::new(vec![Value::Int(seq as i64), Value::String("u".repeat(name_len).into())]);
++    SequencedOperation::new(seq, Operation::insert(USERS, PrimaryKey::single(seq as i64), row, seq))
++}
++
++/// Builds a room whose `.wal.compacting` holds batches `1..=old` (a compaction failed before
++/// staging) and whose active WAL holds `later`, closes it, and returns the directory, the bytes
++/// of `.wal.compacting` and of the active WAL.
++async fn room_with_orphan(
++    dir: &Path,
++    old: u64,
++    later: Vec<Vec<SequencedOperation>>,
++) -> (Vec<u8>, Vec<u8>, u64) {
++    let eng = engine(dir);
++    eng.open_room(&room(), schema()).await.unwrap();
++    for seq in 1..=old {
++        eng.apply_batch(&room(), vec![user(seq, 10)]).await.unwrap();
++    }
++    crate::fail_point::arm("compaction.phase2", &eng.snap_file_path(&room()));
++    assert!(eng.compact_room(&room()).await.is_err());
++    let mut head = old;
++    for b in later {
++        head = eng.apply_batch(&room(), b).await.unwrap().get();
++    }
++    eng.close_room(&room()).await.unwrap();
++    let wal = std::fs::read(dir.join("room_sim.wal")).unwrap();
++    let compacting = std::fs::read(compacting_wal_path(&dir.join("room_sim.wal"))).unwrap();
++    (compacting, wal, head)
++}
++
++/// The `.wal.compacting` a crash leaves while `absorb_wal_into_compacting` appends `wal` to
++/// `compacting` (one write, one sync at the end): the appended copy with `damage` applied.
++fn torn_absorb(dir: &Path, compacting: &[u8], wal: &[u8], damage: impl Fn(&mut [u8])) {
++    let mut copy = wal.to_vec();
++    damage(&mut copy);
++    let mut torn = compacting.to_vec();
++    torn.extend_from_slice(&copy);
++    std::fs::write(compacting_wal_path(&dir.join("room_sim.wal")), torn).unwrap();
++}
++
++/// Crash while absorbing; the first appended sector (the bytes of the header of the first
++/// absorbed batch) did not reach the disk, later sectors did. The batch holds a value that
++/// embeds a valid frame.
++#[tokio::test]
++async fn inv_s3_torn_absorb_header_with_embedded_frame_refuses_to_open() {
++    let tmp = tempfile::tempdir().unwrap();
++    let dir = tmp.path().join("data");
++    let (compacting, wal, head) = room_with_orphan(
++        &dir,
++        3,
++        vec![vec![item_with_embedded_frame(4, 1, 1200, 1_000_000)], vec![user(5, 10)]],
++    )
++    .await;
++    // Bytes of the copy that share the 512-byte sector of the copy's first byte.
++    let in_first_sector = 512 - compacting.len() % 512;
++    torn_absorb(&dir, &compacting, &wal, |copy| copy[..in_first_sector].fill(0));
++
++    let eng = engine(&dir);
++    let res = eng.open_room(&room(), schema()).await;
++    eprintln!("open after a torn absorb: {res:?}");
++    // INV-S3: every record of the damaged copy is in the active WAL (4 and 5), so recovery
++    // should reach head 5.
++    assert!(res.is_ok(), "room does not reopen after a crash while absorbing: {res:?}");
++    assert_eq!(eng.get_head_seq(&room()).await.unwrap().get(), head);
++}
++
++/// Control: the same torn absorb without the embedded frame recovers.
++#[tokio::test]
++async fn inv_s3_control_torn_absorb_without_embedded_frame_recovers() {
++    let tmp = tempfile::tempdir().unwrap();
++    let dir = tmp.path().join("data");
++    let big_user = |seq| {
++        let mut op = user(seq, 1300);
++        let _ = &mut op;
++        op
++    };
++    let (compacting, wal, head) =
++        room_with_orphan(&dir, 3, vec![vec![big_user(4)], vec![user(5, 10)]]).await;
++    let in_first_sector = 512 - compacting.len() % 512;
++    torn_absorb(&dir, &compacting, &wal, |copy| copy[..in_first_sector].fill(0));
++    let eng = engine(&dir);
++    eng.open_room(&room(), schema()).await.unwrap();
++    assert_eq!(eng.get_head_seq(&room()).await.unwrap().get(), head);
++}
++
++/// Crash while absorbing; the header of every absorbed batch survived, but a sector inside the
++/// payload of batches 4 and 6 did not. Batch 6 holds a value that embeds a valid frame after the
++/// lost sector. `highest_seq_in_valid_frames` scans the payload of batch 6 byte by byte (its
++/// header was valid), unlike the classification of the first anomaly.
++#[tokio::test]
++async fn inv_s3_torn_absorb_payload_with_embedded_frame_refuses_to_open() {
++    let tmp = tempfile::tempdir().unwrap();
++    let dir = tmp.path().join("data");
++    let later = vec![
++        vec![user(4, 1500)],
++        vec![user(5, 10)],
++        vec![item_with_embedded_frame(6, 1, 1500, 1_000_000)],
++        vec![user(7, 10)],
++    ];
++    let (compacting, wal, head) = room_with_orphan(&dir, 3, later).await;
++    let frames = frame_bounds(&wal);
++    torn_absorb(&dir, &compacting, &wal, |copy| {
++        for &i in &[0usize, 2] {
++            let (start, _, _) = frames[i];
++            // Inside the payload, before the embedded frame of batch 6.
++            copy[start + 100..start + 600].fill(0);
++        }
++    });
++    let eng = engine(&dir);
++    let res = eng.open_room(&room(), schema()).await;
++    eprintln!("open after a torn absorb (payload damage): {res:?}");
++    assert!(res.is_ok(), "room does not reopen after a crash while absorbing: {res:?}");
++    assert_eq!(eng.get_head_seq(&room()).await.unwrap().get(), head);
++}
++
++/// No hostile value: a crash while absorbing a WAL of large batches leaves one lost sector in
++/// the payload of each of 19 consecutive absorbed batches (headers intact). After 16 failed
++/// payload checks, the next valid header is taken unchecked, its payload fails, and recovery
++/// counts it as `u64::MAX`.
++#[tokio::test]
++async fn inv_s3_torn_absorb_of_many_large_batches_refuses_to_open() {
++    let tmp = tempfile::tempdir().unwrap();
++    let dir = tmp.path().join("data");
++    let later: Vec<_> = (4..=25).map(|seq| vec![user(seq, 3000)]).collect();
++    let (compacting, wal, head) = room_with_orphan(&dir, 3, later).await;
++    let frames = frame_bounds(&wal);
++    torn_absorb(&dir, &compacting, &wal, |copy| {
++        // Batch 4 damaged, batch 5 intact, batches 6..=24 damaged, batch 25 intact.
++        for (i, &(start, _, _)) in frames.iter().enumerate() {
++            if i == 1 || i == frames.len() - 1 {
++                continue;
++            }
++            copy[start + 1000..start + 1512].fill(0);
++        }
++    });
++    let eng = engine(&dir);
++    let res = eng.open_room(&room(), schema()).await;
++    eprintln!("open after a torn absorb of large batches: {res:?}");
++    assert!(res.is_ok(), "room does not reopen after a crash while absorbing: {res:?}");
++    assert_eq!(eng.get_head_seq(&room()).await.unwrap().get(), head);
++}
++
++/// The same pattern in the active WAL: a crash while appending a batch (before its sync) whose
++/// value embeds a frame, with the first sector of the append lost.
++#[tokio::test]
++async fn inv_s3_torn_append_header_with_embedded_frame_refuses_to_open() {
++    let tmp = tempfile::tempdir().unwrap();
++    let dir = tmp.path().join("data");
++    let eng = engine(&dir);
++    eng.open_room(&room(), schema()).await.unwrap();
++    for seq in 1..=3 {
++        eng.apply_batch(&room(), vec![user(seq, 10)]).await.unwrap();
++    }
++    eng.close_room(&room()).await.unwrap();
++    drop(eng);
++    let wal_path = dir.join("room_sim.wal");
++    let mut wal = std::fs::read(&wal_path).unwrap();
++    let confirmed = wal.len();
++    // The batch being appended when the process crashed (never acknowledged).
++    let mut frame = encode_wal_batch(&[item_with_embedded_frame(4, 1, 1200, 1_000_000)], None).unwrap();
++    let in_first_sector = 512 - confirmed % 512;
++    frame[..in_first_sector].fill(0);
++    wal.extend_from_slice(&frame);
++    std::fs::write(&wal_path, &wal).unwrap();
++    let eng = engine(&dir);
++    let res = eng.open_room(&room(), schema()).await;
++    eprintln!("open after a torn append: {res:?}");
++    assert!(res.is_ok(), "room does not reopen after a crash while appending: {res:?}");
++    assert_eq!(eng.get_head_seq(&room()).await.unwrap().get(), 3);
++}
++
++/// INV-S1 at the edge of the sequence space, across a reopen and a compaction.
++#[tokio::test]
++async fn inv_s1_batch_at_u64_max_survives_reopen_and_compaction() {
++    let tmp = tempfile::tempdir().unwrap();
++    let dir = tmp.path().join("data");
++    let tables = std::collections::HashMap::from([
++        (USERS, crate::memory::Table::new()),
++        (ITEMS, crate::memory::Table::new()),
++    ]);
++    let raw = bincode::serialize(&crate::memory::RoomSnapshotRef {
++        head_seq: SequenceNumber::from(u64::MAX - 1),
++        tables: &tables,
++    })
++    .unwrap();
++    let snap = crate::snapshot::encode_snapshot_envelope(&raw, false, 0).unwrap();
++    for compact in [false, true] {
++        let _ = std::fs::remove_dir_all(&dir);
++        let eng = engine(&dir);
++        eng.open_room(&room(), schema()).await.unwrap();
++        eng.apply_snapshot(&room(), schema(), snap.clone().into(), SequenceNumber::from(u64::MAX - 1))
++            .await
++            .unwrap();
++        assert_eq!(eng.apply_batch(&room(), vec![user(u64::MAX, 3)]).await.unwrap().get(), u64::MAX);
++        let past = eng.apply_batch(&room(), vec![user(u64::MAX, 3)]).await;
++        assert!(matches!(past, Err(StorageError::SequenceMismatch { .. })), "{past:?}");
++        if compact {
++            eng.compact_room(&room()).await.unwrap();
++        }
++        eng.close_room(&room()).await.unwrap();
++        let eng = engine(&dir);
++        eng.open_room(&room(), schema()).await.unwrap();
++        assert_eq!(eng.get_head_seq(&room()).await.unwrap().get(), u64::MAX);
++    }
++}
++
++/// INV-S2: while one writer applies batches and snapshots and another task compacts, every scan
++/// of a table equals that table after some prefix of the confirmed events, and prefixes never go
++/// back.
++#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
++async fn sim_readers_see_a_prefix_under_concurrent_writes_compactions_and_snapshots() {
++    let rounds: u64 = std::env::var("SIM_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
++    for seed in 0..rounds {
++        let mut rng = Rng(9000 + seed);
++        // The events, decided up front, and the USERS table after each prefix.
++        let mut events = Vec::new();
++        for _ in 0..60 {
++            if rng.pct(8) {
++                let extra = 1 + rng.below(3);
++                let (b, s) = snapshot_ahead(&mut rng, &events, extra).await;
++                events.push(Event::Snapshot(b, s));
++            } else {
++                events.push(Event::Batch(random_batch(&mut rng, head_of(&events))));
++            }
++        }
++        let mut prefixes = Vec::new();
++        for k in 0..=events.len() {
++            let d = oracle(&events[..k]).await;
++            let users: Vec<String> = d.1.into_iter().filter(|r| r.starts_with("0:")).collect();
++            prefixes.push((d.0, users));
++        }
++        let tmp = tempfile::tempdir().unwrap();
++        let eng = DiskStorageEngine::new(
++            DiskStorageOptions::new(tmp.path()).auto_compact(true).min_compaction_bytes(512).compaction_ratio(0.5),
++        )
++        .unwrap();
++        eng.open_room(&room(), schema()).await.unwrap();
++        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
++        let prefixes = std::sync::Arc::new(prefixes);
++        let mut readers = Vec::new();
++        for _ in 0..3 {
++            let (eng, done, prefixes) = (eng.clone(), done.clone(), prefixes.clone());
++            readers.push(tokio::spawn(async move {
++                let mut last = 0usize;
++                let mut scans = 0;
++                while !done.load(std::sync::atomic::Ordering::Acquire) {
++                    let mut s = eng.scan_by_id(&room(), USERS, ScanOptions::default()).await.unwrap();
++                    let mut rows = Vec::new();
++                    while let Some(item) = s.next().await {
++                        let (pk, row) = item.unwrap();
++                        rows.push(format!("0:{pk:?}={row:?}"));
++                        tokio::task::yield_now().await;
++                    }
++                    let found = (last..prefixes.len()).find(|&k| prefixes[k].1 == rows);
++                    match found {
++                        Some(k) => last = k,
++                        None => return Err(format!("scan matches no prefix at or after {last}")),
++                    }
++                    scans += 1;
++                }
++                Ok(scans)
++            }));
++        }
++        let compactor = {
++            let (eng, done) = (eng.clone(), done.clone());
++            tokio::spawn(async move {
++                while !done.load(std::sync::atomic::Ordering::Acquire) {
++                    let _ = eng.compact_room(&room()).await;
++                    tokio::task::yield_now().await;
++                }
++            })
++        };
++        for ev in &events {
++            match ev {
++                Event::Batch(b) => {
++                    eng.apply_batch(&room(), b.clone()).await.unwrap();
++                }
++                Event::Snapshot(bytes, s) => {
++                    eng.apply_snapshot(&room(), schema(), bytes.clone().into(), SequenceNumber::from(*s))
++                        .await
++                        .unwrap();
++                }
++            }
++        }
++        done.store(true, std::sync::atomic::Ordering::Release);
++        compactor.await.unwrap();
++        for r in readers {
++            let scans = r.await.unwrap().unwrap_or_else(|e| panic!("seed {seed}: {e}"));
++            assert!(scans > 0);
++        }
++        assert_eq!(dump(&eng, &room()).await, oracle(&events).await);
++        eng.close_room(&room()).await.unwrap();
++        let eng2 = engine(tmp.path());
++        eng2.open_room(&room(), schema()).await.unwrap();
++        assert_eq!(dump(&eng2, &room()).await, oracle(&events).await);
++    }
++}
++
++/// INV-S4: a torn tail in the WAL that holds the unknown table is not truncated before
++/// `SchemaMismatch`, and the same applies with the table only in `.wal.compacting`.
++#[tokio::test]
++async fn inv_s4_schema_mismatch_before_truncating_a_torn_tail() {
++    let only_users = || {
++        Schema::builder()
++            .table(
++                TableSchema::builder("users")
++                    .table_id(USERS)
++                    .primary_key("id", DataType::Int)
++                    .column("name", DataType::String),
++            )
++            .build()
++    };
++    for in_compacting in [false, true] {
++        let tmp = tempfile::tempdir().unwrap();
++        let dir = tmp.path().join("data");
++        let eng = engine(&dir);
++        eng.open_room(&room(), schema()).await.unwrap();
++        eng.apply_batch(&room(), vec![user(1, 5)]).await.unwrap();
++        eng.apply_batch(&room(), vec![item_with_embedded_frame(2, 7, 3, 9)]).await.unwrap();
++        if in_compacting {
++            crate::fail_point::arm("compaction.phase2", &eng.snap_file_path(&room()));
++            assert!(eng.compact_room(&room()).await.is_err());
++            eng.apply_batch(&room(), vec![user(3, 5)]).await.unwrap();
++        }
++        eng.close_room(&room()).await.unwrap();
++        drop(eng);
++        let wal_path = dir.join("room_sim.wal");
++        let mut wal = std::fs::read(&wal_path).unwrap();
++        wal.extend_from_slice(&[0xBA, 0x7C, 1, 2, 3]); // torn header
++        std::fs::write(&wal_path, &wal).unwrap();
++        let before = files_of(&dir);
++        let eng = engine(&dir);
++        let err = eng.open_room(&room(), only_users()).await.unwrap_err();
++        assert!(matches!(err, StorageError::SchemaMismatch { table_id: ITEMS, .. }), "{err:?}");
++        assert!(files_of(&dir) == before, "files changed before SchemaMismatch");
++        eng.open_room(&room(), schema()).await.unwrap();
++        assert_eq!(
++            eng.get_head_seq(&room()).await.unwrap().get(),
++            if in_compacting { 3 } else { 2 }
++        );
++    }
++}
++
++/// Observation for INV-Y8/INV-E1: the width of a row after a reopen depends on the schema given
++/// to the reopen, not on the one the update was applied with.
++#[tokio::test]
++async fn note_row_width_after_reopen_with_a_wider_schema() {
++    let wider = || {
++        Schema::builder()
++            .table(
++                TableSchema::builder("users")
++                    .table_id(USERS)
++                    .primary_key("id", DataType::Int)
++                    .column("name", DataType::String)
++                    .nullable_column("extra", DataType::Int),
++            )
++            .table(
++                TableSchema::builder("items")
++                    .table_id(ITEMS)
++                    .primary_key("id", DataType::Int)
++                    .column("data", DataType::Bytes),
++            )
++            .build()
++    };
++    let tmp = tempfile::tempdir().unwrap();
++    let eng = engine(tmp.path());
++    eng.open_room(&room(), schema()).await.unwrap();
++    eng.apply_batch(&room(), vec![user(1, 3)]).await.unwrap();
++    let upd = Operation::update(USERS, PrimaryKey::single(1i64), vec![ColumnUpdate::new(1, Value::String("b".into()))], 2);
++    eng.apply_batch(&room(), vec![SequencedOperation::new(2, upd)]).await.unwrap();
++    let live = eng.get_by_id(&room(), USERS, &PrimaryKey::single(1i64)).await.unwrap().unwrap();
++    eng.close_room(&room()).await.unwrap();
++    let eng = engine(tmp.path());
++    eng.open_room(&room(), wider()).await.unwrap();
++    let replayed = eng.get_by_id(&room(), USERS, &PrimaryKey::single(1i64)).await.unwrap().unwrap();
++    eprintln!("live {live:?} replayed {replayed:?}");
++}
+diff --git a/crates/storage/src/fail_point.rs b/crates/storage/src/fail_point.rs
+index f276906..55a367a 100644
+--- a/crates/storage/src/fail_point.rs
++++ b/crates/storage/src/fail_point.rs
+@@ -31,6 +31,49 @@ fn take<T>(list: &std::sync::Mutex<Vec<T>>, hit: impl Fn(&T) -> bool) -> Option<
+     list.iter().position(hit).map(|pos| list.remove(pos))
+ }
+ 
++
++/// Audit hook: counts every fail/pause point reached under `root` and, at the `target`-th one,
++/// either copies `root` to `dest` (a crash image) or makes that point fail (an injected error).
++#[cfg(test)]
++pub(crate) struct CrashPlan {
++    pub root: std::path::PathBuf,
++    pub target: usize,
++    pub dest: Option<std::path::PathBuf>,
++    pub inject_error: bool,
++    pub hits: Vec<&'static str>,
++    pub taken: Option<&'static str>,
++}
++
++#[cfg(test)]
++pub(crate) static CRASH: std::sync::Mutex<Vec<CrashPlan>> = std::sync::Mutex::new(Vec::new());
++
++#[cfg(test)]
++pub(crate) fn copy_dir(from: &Path, to: &Path) {
++    std::fs::create_dir_all(to).unwrap();
++    for entry in std::fs::read_dir(from).unwrap() {
++        let entry = entry.unwrap();
++        if entry.file_type().unwrap().is_file() {
++            let _ = std::fs::copy(entry.path(), to.join(entry.file_name()));
++        }
++    }
++}
++
++/// Returns true if this hit must fail (error injection mode).
++#[cfg(test)]
++fn crash_point(name: &'static str, path: &Path) -> bool {
++    let mut guard = CRASH.lock().unwrap_or_else(|e| e.into_inner());
++    let Some(plan) = guard.iter_mut().find(|p| path.starts_with(&p.root)) else { return false };
++    plan.hits.push(name);
++    if plan.taken.is_none() && plan.hits.len() == plan.target {
++        plan.taken = Some(name);
++        if let Some(dest) = &plan.dest {
++            copy_dir(&plan.root, dest);
++        }
++        return plan.inject_error;
++    }
++    false
++}
++
+ /// Arms the fail point `name` for `path`; the next `check` with the same pair fails.
+ #[cfg(test)]
+ pub(crate) fn arm(name: &'static str, path: &Path) {
+@@ -41,7 +84,7 @@ pub(crate) fn arm(name: &'static str, path: &Path) {
+ #[inline(always)]
+ pub(crate) fn check(name: &'static str, path: &Path) -> Result<(), StorageError> {
+     #[cfg(test)]
+-    if take(&ARMED, |(n, p)| *n == name && p == path).is_some() {
++    if crash_point(name, path) || take(&ARMED, |(n, p)| *n == name && p == path).is_some() {
+         return Err(StorageError::Io(std::io::Error::other(format!(
+             "injected failure at {name}"
+         ))));
+@@ -133,6 +176,8 @@ pub(crate) fn arm_pause(name: &'static str, path: &Path) -> Pause {
+ /// Waits for the test to release the pause point `name` if it is armed for `path`.
+ #[inline(always)]
+ pub(crate) async fn pause(name: &'static str, path: &Path) {
++    #[cfg(test)]
++    let _ = crash_point(name, path);
+     #[cfg(test)]
+     if let Some((_, _, reached, release)) = take(&PAUSES, |(n, p, _, _)| *n == name && p == path) {
+         let _ = reached.send(());
+@@ -204,6 +249,8 @@ pub(crate) fn arm_blocking_pause(name: &'static str, path: &Path) -> BlockingPau
+ /// what happens when it is reached on the only thread of a current-thread runtime.
+ #[inline(always)]
+ pub(crate) fn pause_blocking(name: &'static str, path: &Path) {
++    #[cfg(test)]
++    let _ = crash_point(name, path);
+     #[cfg(test)]
+     if let Some((_, _, reached, release)) =
+         take(&BLOCKING_PAUSES, |(n, p, _, _)| *n == name && p == path)
+diff --git a/crates/storage/src/tests/disk.rs b/crates/storage/src/tests/disk.rs
+index 1480712..fb7e395 100644
+--- a/crates/storage/src/tests/disk.rs
++++ b/crates/storage/src/tests/disk.rs
+@@ -639,3 +639,6 @@ async fn room_stays_locked_while_a_handle_of_its_wal_is_still_open() {
+     other.open_room(&room, schema()).await.unwrap();
+     assert_eq!(other.get_head_seq(&room).await.unwrap().get(), 1);
+ }
++
++#[path = "../disk/tests/sim_inv.rs"]
++mod sim_inv;

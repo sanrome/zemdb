@@ -1,0 +1,799 @@
+diff --git a/crates/server/src/actor/tests/manager.rs b/crates/server/src/actor/tests/manager.rs
+index 161409a..c1c66a6 100644
+--- a/crates/server/src/actor/tests/manager.rs
++++ b/crates/server/src/actor/tests/manager.rs
+@@ -1076,3 +1076,127 @@ async fn rooms_shut_down_together_and_save_their_rosters() {
+         assert!(roster.exists(), "{} was not saved", roster.display());
+     }
+ }
++
++/// Audit §3.7, INV-L3 (fails on `50fe195`): the sync that makes a new room's directory entry
++/// durable fails; a retried creation finds the directory already there and never syncs its
++/// parent again, yet answers 201 and the room acknowledges commits.
++#[tokio::test]
++async fn audit_l3_room_directory_whose_sync_failed_is_never_synced_again() {
++    let dir = tempdir().unwrap();
++    let manager = new_manager(&dir);
++    let room_id = RoomId::new("room-l3").unwrap();
++    let rooms_dir = dir.path().join("rooms");
++
++    fail_point::arm("sync_dir", &rooms_dir);
++    let failed = manager
++        .create_room(room_id.clone(), SchemaId::new("first").unwrap(), None)
++        .await;
++    assert!(failed.is_err(), "{failed:?}");
++    assert!(rooms_dir.join(room_id.as_str()).is_dir());
++
++    // Armed again: any later sync of rooms/ consumes it.
++    fail_point::arm("sync_dir", &rooms_dir);
++    manager
++        .create_room(room_id.clone(), SchemaId::new("first").unwrap(), None)
++        .await
++        .expect("the retried creation succeeds");
++    let client = zemdb_core::id::ClientId::new("writer").unwrap();
++    manager
++        .ask(&room_id, |reply| RoomCommand::RegisterClient {
++            client_id: client.clone(),
++            current_seq: None,
++            known_incarnation: None,
++            reply,
++        })
++        .await
++        .unwrap()
++        .unwrap();
++    let row = zemdb_core::value::RowBuilder::new()
++        .set("id", 1i64)
++        .set("title", "task")
++        .build();
++    let op = crate::actor::test_support::test_schema()
++        .to_operation_insert("tasks", &row, 1000)
++        .unwrap();
++    let ack = manager
++        .ask(&room_id, |reply| RoomCommand::Commit {
++            client_id: client.clone(),
++            mutation_id: zemdb_core::id::MutationId::new([1; 16]),
++            last_ack_seq: SequenceNumber::new(0),
++            op,
++            reply,
++        })
++        .await
++        .unwrap()
++        .unwrap();
++    assert_eq!(ack.assigned_seq, SequenceNumber::new(1));
++    let never_synced = fail_point::is_armed("sync_dir", &rooms_dir);
++    manager.shutdown_all().await;
++    assert!(
++        !never_synced,
++        "INV-L3: the room was created (201) and acknowledged seq 1 while its directory entry in \
++         rooms/ had never been synced; a power loss can drop the whole room"
++    );
++}
++
++/// Audit §3.7, evidence for a proposed invariant (room deletion is atomic): a deletion cut while
++/// `remove_dir_all` runs (a crash, or the `exit(1)` of a shutdown past its grace) can leave the
++/// room's log without its `meta_room.json`; a room created again with the same id then inherits
++/// the deleted room's log under its new incarnation.
++#[tokio::test]
++async fn audit_proposal_room_recreated_after_a_partial_deletion_inherits_the_old_log() {
++    let dir = tempdir().unwrap();
++    let manager = new_manager(&dir);
++    let room_id = RoomId::new("reborn").unwrap();
++    manager
++        .create_room(room_id.clone(), SchemaId::new("first").unwrap(), None)
++        .await
++        .unwrap();
++    let client = zemdb_core::id::ClientId::new("writer").unwrap();
++    manager
++        .ask(&room_id, |reply| RoomCommand::RegisterClient {
++            client_id: client.clone(),
++            current_seq: None,
++            known_incarnation: None,
++            reply,
++        })
++        .await
++        .unwrap()
++        .unwrap();
++    for n in 1..=3u8 {
++        let row = zemdb_core::value::RowBuilder::new()
++            .set("id", i64::from(n))
++            .set("title", "old room")
++            .build();
++        let op = crate::actor::test_support::test_schema()
++            .to_operation_insert("tasks", &row, 1000)
++            .unwrap();
++        manager
++            .ask(&room_id, |reply| RoomCommand::Commit {
++                client_id: client.clone(),
++                mutation_id: zemdb_core::id::MutationId::new([n; 16]),
++                last_ack_seq: SequenceNumber::new(0),
++                op,
++                reply,
++            })
++            .await
++            .unwrap()
++            .unwrap();
++    }
++    manager.shutdown_all().await;
++    // `remove_dir_all` removed meta_room.json before it was cut.
++    fs::remove_file(meta_room_path(&dir, &room_id)).unwrap();
++
++    let manager = new_manager(&dir);
++    manager
++        .create_room(room_id.clone(), SchemaId::new("first").unwrap(), None)
++        .await
++        .unwrap();
++    let (_, head_seq) = manager.log_bounds(&room_id).await.unwrap();
++    manager.shutdown_all().await;
++    assert_eq!(
++        head_seq,
++        SequenceNumber::new(0),
++        "a room created after a partial deletion starts with the deleted room's log"
++    );
++}
+diff --git a/crates/server/src/actor/tests/room.rs b/crates/server/src/actor/tests/room.rs
+index 0425f78..90b02ee 100644
+--- a/crates/server/src/actor/tests/room.rs
++++ b/crates/server/src/actor/tests/room.rs
+@@ -2011,3 +2011,190 @@ async fn dormant_client_is_forgotten_after_its_ttl_and_registers_again() {
+     register(&sender, &gone).await;
+     fx.manager.shutdown_all().await;
+ }
++
++// ---------------------------------------------------------------------------------------------
++// Audit §3.7 (INV-L3, INV-L4). These tests assert the invariant and fail on `50fe195`.
++// ---------------------------------------------------------------------------------------------
++
++/// INV-L3: a record whose `sync_data` failed is read back from the page cache when the room
++/// reopens, and a retry of it is acknowledged, without any successful sync of `active.wal` in
++/// between. A power loss may then drop everything after the last successful sync.
++#[tokio::test]
++async fn audit_l3_retry_after_a_failed_sync_is_acknowledged_without_any_successful_sync() {
++    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
++    let sender = fx.sender().await;
++    let client = ClientId::new("writer").unwrap();
++    register(&sender, &client).await;
++    let active = fx.room_dir().join("segments").join("active.wal");
++
++    // Record 1 is durable (sync_data succeeded).
++    commit(&sender, &client, mutation(1), seq(0), insert_op(1))
++        .await
++        .unwrap();
++    let last_synced_len = fs::metadata(&active).unwrap().len();
++
++    // Record 2 reaches the file, but its sync_data fails: the room stops.
++    fail_point::arm("warm_append_sync", &active);
++    let failed = commit(&sender, &client, mutation(2), seq(1), insert_op(2)).await;
++    assert!(matches!(failed, Err(ServerError::Unavailable(_))), "{failed:?}");
++
++    // The reopened room reads record 2 back (page cache) and acknowledges the retry.
++    let recovered = fx.sender().await;
++    let retry = commit(&recovered, &client, mutation(2), seq(1), insert_op(2))
++        .await
++        .unwrap();
++    assert_eq!(retry.assigned_seq, seq(2), "CommitAck sent for mutation 2 at seq 2");
++
++    // Neither the reopen nor the deduplicated retry synced active.wal, so a power loss now can
++    // leave it at its last synced length.
++    fx.manager.shutdown_all().await;
++    let file = fs::OpenOptions::new().write(true).open(&active).unwrap();
++    file.set_len(last_synced_len).unwrap();
++    drop(file);
++
++    let reopened = fx.sender().await;
++    let other = commit(&reopened, &client, mutation(3), seq(1), insert_op(3))
++        .await
++        .unwrap();
++    assert_ne!(
++        other.assigned_seq,
++        seq(2),
++        "INV-L3: seq 2 was acknowledged for mutation 2 although no sync of it ever succeeded; \
++         after a power loss the mutation is gone and seq 2 is assigned to mutation 3"
++    );
++    fx.manager.shutdown_all().await;
++}
++
++/// INV-L3: the directory sync that makes a new `active.wal` durable fails; the reopened room
++/// finds the file already there and never syncs its directory entry again, yet acknowledges
++/// commits stored in it.
++#[tokio::test]
++async fn audit_l3_active_wal_whose_directory_sync_failed_is_never_synced_again() {
++    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
++    let sender = fx.sender().await;
++    let client = ClientId::new("writer").unwrap();
++    register(&sender, &client).await;
++    let segments = fx.room_dir().join("segments");
++
++    // The first commit creates active.wal; making its directory entry durable fails.
++    fail_point::arm("sync_dir", &segments);
++    let failed = commit(&sender, &client, mutation(1), seq(0), insert_op(1)).await;
++    assert!(matches!(failed, Err(ServerError::Unavailable(_))), "{failed:?}");
++    assert!(segments.join("active.wal").exists());
++
++    // Armed again: any later sync of the segments directory consumes it.
++    fail_point::arm("sync_dir", &segments);
++    let recovered = fx.sender().await;
++    for (n, last_ack) in [(1u8, 0u64), (2, 1)] {
++        let ack = commit(&recovered, &client, mutation(n), seq(last_ack), insert_op(n.into()))
++            .await
++            .unwrap();
++        assert_eq!(ack.assigned_seq, seq(n.into()));
++    }
++    // Still armed means no sync of the segments directory ran; checking also disarms it.
++    let never_synced = fail_point::check("sync_dir", &segments).is_err();
++    fx.manager.shutdown_all().await;
++
++    // A power loss may drop the directory entry no sync ever covered.
++    let mut reused = None;
++    if never_synced {
++        fs::remove_file(segments.join("active.wal")).unwrap();
++        let reopened = fx.sender().await;
++        reused = Some(
++            commit(&reopened, &client, mutation(9), seq(0), insert_op(9))
++                .await
++                .unwrap()
++                .assigned_seq,
++        );
++        fx.manager.shutdown_all().await;
++    }
++    assert!(
++        !never_synced,
++        "INV-L3: CommitAcks for seqs 1 and 2 were sent while the directory entry of active.wal \
++         had never been synced (its sync failed and nothing retried it); after a power loss \
++         that drops the entry, the next commit gets seq {reused:?}"
++    );
++}
++
++/// INV-L4: a key in the deduplication window before a reopen is not in it after the reopen,
++/// because a recognized retry refreshes the key's LRU recency while the reopen hydrates the
++/// last `dedup_lru_capacity` keys in log order. The retry is then applied a second time.
++#[tokio::test]
++async fn audit_l4_a_key_in_the_dedup_window_is_dropped_by_the_reopen() {
++    let fx = Fixture::with_options(
++        RoomLifecycleOverrides::default(),
++        |config| config.dedup_lru_capacity = 2,
++        None,
++    )
++    .await;
++    let sender = fx.sender().await;
++    let client = ClientId::new("writer").unwrap();
++    register(&sender, &client).await;
++
++    commit(&sender, &client, mutation(1), seq(0), insert_op(1))
++        .await
++        .unwrap();
++    commit(&sender, &client, mutation(2), seq(1), insert_op(2))
++        .await
++        .unwrap();
++    // A retry of mutation 1 is recognized (and refreshes it).
++    let first_retry = commit(&sender, &client, mutation(1), seq(2), insert_op(1))
++        .await
++        .unwrap();
++    assert_eq!(first_retry.assigned_seq, seq(1));
++    commit(&sender, &client, mutation(3), seq(2), insert_op(3))
++        .await
++        .unwrap();
++    // Mutation 1 is in the window right before the reopen.
++    let before = commit(&sender, &client, mutation(1), seq(3), insert_op(1))
++        .await
++        .unwrap();
++    assert_eq!(before.assigned_seq, seq(1), "in the window before the reopen");
++
++    assert!(fx.manager.shutdown_room(&fx.room_id).await);
++    let reopened = fx.sender().await;
++    let after = commit(&reopened, &client, mutation(1), seq(3), insert_op(1))
++        .await
++        .unwrap();
++    assert_eq!(
++        after.assigned_seq,
++        seq(1),
++        "INV-L4: the reopen dropped mutation 1 from the dedup window; its retry was sequenced \
++         again as a new operation"
++    );
++    fx.manager.shutdown_all().await;
++}
++
++/// Note for §3.3 (INV-Y4), same root cause as the INV-L4 test above: without any reopen, a
++/// recognized retry of an older mutation evicts one of the last `dedup_lru_capacity` mutations,
++/// whose own retry is then sequenced again.
++#[tokio::test]
++async fn audit_note_y4_a_refreshed_retry_evicts_a_newer_mutation_from_the_window() {
++    let fx = Fixture::with_options(
++        RoomLifecycleOverrides::default(),
++        |config| config.dedup_lru_capacity = 2,
++        None,
++    )
++    .await;
++    let sender = fx.sender().await;
++    let client = ClientId::new("writer").unwrap();
++    register(&sender, &client).await;
++    commit(&sender, &client, mutation(1), seq(0), insert_op(1))
++        .await
++        .unwrap();
++    commit(&sender, &client, mutation(2), seq(1), insert_op(2))
++        .await
++        .unwrap();
++    commit(&sender, &client, mutation(1), seq(2), insert_op(1))
++        .await
++        .unwrap();
++    commit(&sender, &client, mutation(3), seq(2), insert_op(3))
++        .await
++        .unwrap();
++    // Mutation 2 is one of the last 2 committed mutations (seqs 2 and 3).
++    let retry = commit(&sender, &client, mutation(2), seq(3), insert_op(2))
++        .await
++        .unwrap();
++    assert_eq!(retry.assigned_seq, seq(2), "the retry of mutation 2 was sequenced again");
++    fx.manager.shutdown_all().await;
++}
+diff --git a/crates/server/src/api/tests/control_plane.rs b/crates/server/src/api/tests/control_plane.rs
+index 0fa24bd..320f95b 100644
+--- a/crates/server/src/api/tests/control_plane.rs
++++ b/crates/server/src/api/tests/control_plane.rs
+@@ -151,3 +151,161 @@ async fn room_deletion_finishes_when_the_request_is_dropped() {
+     assert!(!room_dir.exists());
+     assert!(!state.manager.room_exists(&room_id).unwrap());
+ }
++
++/// Audit §3.7, INV-L2. Runs a `DELETE /admin/rooms/doomed` over TCP whose client disconnects
++/// while the relay purges the room's snapshot. With `shutdown`, an orderly shutdown follows
++/// right away and `main` returns (the runtime is dropped); without it, the server keeps running
++/// until the room directory is gone. Returns, at the next start, whether the room exists and
++/// its active snapshot.
++fn audit_l2_dropped_delete(shutdown: bool) -> (bool, Option<zemdb_core::id::SequenceNumber>) {
++    use crate::api::serve::{serve_until_shutdown, SHUTDOWN_GRACE_PERIOD};
++    use crate::relay::LogBounds;
++    use tokio::io::AsyncWriteExt;
++    use zemdb_core::id::SequenceNumber;
++    use zemdb_core::protocol::snapshot_envelope::{SnapshotCompression, SnapshotEnvelopeHeader};
++
++    let dir = tempdir().unwrap();
++    let snapshots = dir.path().join("snapshots");
++    let room_dir = dir.path().join("rooms").join("doomed");
++    let room_id = RoomId::new("doomed").unwrap();
++    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
++    let runtime = tokio::runtime::Builder::new_multi_thread()
++        .worker_threads(2)
++        .enable_all()
++        .build()
++        .unwrap();
++
++    let resume_tx = runtime.block_on(async {
++        let state = TestState::new(dir.path(), |config| {
++            config.admin_secret = ADMIN_SECRET.to_string();
++        });
++        let schema_id = SchemaId::new("todo").unwrap();
++        state
++            .registry
++            .register_schema(
++                schema_id.clone(),
++                Schema::builder()
++                    .table(TableSchema::builder("tasks").primary_key("id", DataType::Int))
++                    .build(),
++            )
++            .unwrap();
++        state
++            .manager
++            .create_room(room_id.clone(), schema_id, None)
++            .await
++            .unwrap();
++        // The room has a staged snapshot.
++        let body = vec![7u8; 1024];
++        let header =
++            SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, body.len() as u32, &body);
++        let mut envelope = header.to_bytes().to_vec();
++        envelope.extend_from_slice(&body);
++        let bounds = LogBounds {
++            tail_seq: SequenceNumber::new(1),
++            head_seq: SequenceNumber::new(1),
++        };
++        state
++            .relay
++            .stage_snapshot(
++                &room_id,
++                SequenceNumber::new(1),
++                bytes::Bytes::from(envelope),
++                std::future::ready(Ok(bounds)),
++            )
++            .await
++            .unwrap();
++        assert_eq!(
++            state.relay.active_snapshot_seq(&room_id),
++            Some(SequenceNumber::new(1))
++        );
++
++        // The deletion stops while the relay purges the room's snapshot files.
++        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
++        fail_point::arm_hook("relay_purge_room_files", &snapshots, move || {
++            let _ = reached_tx.send(());
++            let _ = resume_rx.recv();
++        });
++
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let addr = listener.local_addr().unwrap();
++        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
++        let server = tokio::spawn(serve_until_shutdown(
++            listener,
++            state.app_state(),
++            async move {
++                let _ = stop_rx.await;
++            },
++            SHUTDOWN_GRACE_PERIOD,
++        ));
++
++        // The admin sends the DELETE and goes away while the purge runs.
++        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
++        let request = format!(
++            "DELETE /admin/rooms/doomed HTTP/1.1\r\nHost: zemdb\r\nAuthorization: Bearer \
++             {ADMIN_SECRET}\r\nContent-Length: 0\r\n\r\n"
++        );
++        stream.write_all(request.as_bytes()).await.unwrap();
++        tokio::time::timeout(Duration::from_secs(10), reached_rx)
++            .await
++            .expect("the purge was not reached")
++            .unwrap();
++        drop(stream);
++
++        if !shutdown {
++            // Control: the detached deletion finishes on its own.
++            resume_tx.send(()).unwrap();
++            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
++            while room_dir.exists() && tokio::time::Instant::now() < deadline {
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        }
++        // Orderly shutdown (SIGTERM): it does not wait for the detached deletion.
++        stop_tx.send(()).unwrap();
++        tokio::time::timeout(Duration::from_secs(5), server)
++            .await
++            .expect("serve_until_shutdown waited for the deletion")
++            .unwrap()
++            .expect("orderly shutdown");
++        resume_tx
++    });
++
++    // `main` returns and the runtime is dropped: tasks are cancelled at their next poll and
++    // blocking work is waited for. The parked purge resumes shortly after the drop starts.
++    std::thread::spawn(move || {
++        std::thread::sleep(Duration::from_millis(300));
++        let _ = resume_tx.send(());
++    });
++    drop(runtime);
++
++    // Next start.
++    let restarted = tokio::runtime::Builder::new_current_thread()
++        .enable_all()
++        .build()
++        .unwrap();
++    restarted.block_on(async {
++        let state = TestState::new(dir.path(), |_| {});
++        (
++            state.manager.room_exists(&room_id).unwrap(),
++            state.relay.active_snapshot_seq(&room_id),
++        )
++    })
++}
++
++/// Control: without a shutdown, the deletion whose client went away completes.
++#[test]
++fn audit_l2_dropped_room_deletion_completes_without_a_shutdown() {
++    let (exists, snapshot) = audit_l2_dropped_delete(false);
++    assert!(!exists && snapshot.is_none(), "exists={exists} snapshot={snapshot:?}");
++}
++
++/// Fails on `50fe195`: an orderly shutdown cuts the detached deletion between purging the
++/// room's snapshot and removing its directory.
++#[test]
++fn audit_l2_dropped_room_deletion_is_cut_halfway_by_an_orderly_shutdown() {
++    let (exists, snapshot) = audit_l2_dropped_delete(true);
++    assert!(
++        !exists || snapshot.is_some(),
++        "INV-L2: the dropped DELETE was cut halfway by the orderly shutdown: the room still \
++         exists ({exists}) but its staged snapshot is gone ({snapshot:?})"
++    );
++}
+diff --git a/crates/server/src/fail_point.rs b/crates/server/src/fail_point.rs
+index 4da6755..5e860b0 100644
+--- a/crates/server/src/fail_point.rs
++++ b/crates/server/src/fail_point.rs
+@@ -23,6 +23,17 @@ pub(crate) fn arm(name: &'static str, path: &Path) {
+     ARMED.lock().unwrap().push((name, path.to_path_buf()));
+ }
+ 
++/// Whether the fail point `name` is still armed for `path` (audit instrumentation: a point that
++/// is still armed was never reached).
++#[cfg(test)]
++pub(crate) fn is_armed(name: &'static str, path: &Path) -> bool {
++    ARMED
++        .lock()
++        .unwrap()
++        .iter()
++        .any(|(n, p)| *n == name && p == path)
++}
++
+ /// Returns an injected I/O error if the fail point `name` is armed for `path`.
+ #[inline(always)]
+ pub(crate) fn check(name: &'static str, path: &Path) -> Result<(), ServerError> {
+diff --git a/crates/server/src/log/tests/tiered_log.rs b/crates/server/src/log/tests/tiered_log.rs
+index 9c597f3..14dfb9e 100644
+--- a/crates/server/src/log/tests/tiered_log.rs
++++ b/crates/server/src/log/tests/tiered_log.rs
+@@ -1757,3 +1757,4 @@ fn test_unified_wal_zero_filled_eof_truncation() {
+     assert_eq!(recovered_mutations.len(), 1);
+     assert_eq!(file_len(&active_path), clean_len);
+ }
++
+diff --git a/crates/storage/src/disk/compactor.rs b/crates/storage/src/disk/compactor.rs
+index cfddb7c..eb9e5f7 100644
+--- a/crates/storage/src/disk/compactor.rs
++++ b/crates/storage/src/disk/compactor.rs
+@@ -468,7 +468,18 @@ pub(crate) async fn rename_staged_snapshot(
+     staged: &StagedSnapshot,
+ ) -> Result<(), StorageError> {
+     fail_point::check("apply_snapshot.rename", &room.wal_path)?;
+-    rename(&staged.tmp_path, &room.snap_path).await?;
++    // AUDIT instrumentation: what `tokio::fs::rename` does (`std::fs::rename` on the blocking
++    // pool), with a pause point inside the blocking closure.
++    let (from, to, key) = (
++        staged.tmp_path.clone(),
++        room.snap_path.clone(),
++        room.wal_path.clone(),
++    );
++    run_blocking(move || {
++        fail_point::pause_blocking("audit.apply_snapshot.rename_blocking", &key);
++        std::fs::rename(&from, &to)
++    })
++    .await?;
+     Ok(())
+ }
+ 
+diff --git a/crates/storage/src/disk/recovery.rs b/crates/storage/src/disk/recovery.rs
+index 4b80989..a523e27 100644
+--- a/crates/storage/src/disk/recovery.rs
++++ b/crates/storage/src/disk/recovery.rs
+@@ -452,6 +452,9 @@ pub(crate) async fn recover_room(
+         mut head_seq,
+         mut snapshot_len,
+     } = load_snapshot(room_id, snap_path, schema).await?;
++    // AUDIT instrumentation: lets a test hold the open between loading the snapshot and
++    // removing the staged snapshot files.
++    fail_point::pause("audit.recovery.snapshot_loaded", wal_path).await;
+     remove_staged_snapshots(snap_path).await?;
+ 
+     // 2. Replay a pre-crash rotated WAL (`room_{id}.wal.compacting`), if any
+diff --git a/crates/storage/src/fail_point.rs b/crates/storage/src/fail_point.rs
+index f276906..bb1661d 100644
+--- a/crates/storage/src/fail_point.rs
++++ b/crates/storage/src/fail_point.rs
+@@ -37,6 +37,17 @@ pub(crate) fn arm(name: &'static str, path: &Path) {
+     ARMED.lock().unwrap().push((name, path.to_path_buf()));
+ }
+ 
++/// Whether the fail point `name` is still armed for `path` (audit instrumentation: a point that
++/// is still armed was never reached).
++#[cfg(test)]
++pub(crate) fn is_armed(name: &'static str, path: &Path) -> bool {
++    ARMED
++        .lock()
++        .unwrap()
++        .iter()
++        .any(|(n, p)| *n == name && p == path)
++}
++
+ /// Returns an injected I/O error if the fail point `name` is armed for `path`.
+ #[inline(always)]
+ pub(crate) fn check(name: &'static str, path: &Path) -> Result<(), StorageError> {
+diff --git a/crates/storage/src/tests/disk.rs b/crates/storage/src/tests/disk.rs
+index 1480712..8724fc6 100644
+--- a/crates/storage/src/tests/disk.rs
++++ b/crates/storage/src/tests/disk.rs
+@@ -639,3 +639,210 @@ async fn room_stays_locked_while_a_handle_of_its_wal_is_still_open() {
+     other.open_room(&room, schema()).await.unwrap();
+     assert_eq!(other.get_head_seq(&room).await.unwrap().get(), 1);
+ }
++
++// ---------------------------------------------------------------------------------------------
++// Audit §3.7, INV-L2: the operation is polled by hand and dropped after its k-th suspension,
++// for every k until it completes. After each drop the room must be either untouched or fully
++// changed, or marked failed; if it still takes writes, memory and disk must agree.
++// ---------------------------------------------------------------------------------------------
++
++/// Polls `fut`, letting the runtime (and the blocking pool) run between polls, and drops it
++/// after it has returned `Pending` `suspensions` times. Returns whether it completed first.
++async fn audit_poll_then_drop<F: std::future::Future>(fut: F, suspensions: usize) -> bool {
++    let mut fut = std::pin::pin!(fut);
++    let mut seen = 0;
++    loop {
++        let ready =
++            std::future::poll_fn(|cx| std::task::Poll::Ready(fut.as_mut().poll(cx).is_ready()))
++                .await;
++        if ready {
++            return true;
++        }
++        if seen == suspensions {
++            return false;
++        }
++        seen += 1;
++        tokio::time::sleep(Duration::from_millis(2)).await;
++    }
++}
++
++/// After dropping an operation that would have moved `room` from the rows of `old_keys` to the
++/// rows of `new_keys`: the room is consistent with one of them, in memory and after a reopen.
++async fn audit_check_after_drop(
++    engine: DiskStorageEngine,
++    dir: &std::path::Path,
++    room: &RoomId,
++    k: usize,
++    old: (u64, std::ops::RangeInclusive<i64>),
++    new: (u64, std::ops::RangeInclusive<i64>),
++) {
++    // Blocking work handed off before the drop lands.
++    tokio::time::sleep(Duration::from_millis(50)).await;
++    let memory_head = engine.get_head_seq(room).await.unwrap().get();
++    let extra = 9_000 + k as i64;
++    let files: Vec<String> = std::fs::read_dir(dir)
++        .unwrap()
++        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
++        .collect();
++    let snap_head = std::fs::read(dir.join(format!("room_{room}.snap")))
++        .ok()
++        .and_then(|b| crate::disk::format::FileHeader::decode(b[..64].try_into().unwrap()).ok())
++        .map(|h| h.head_seq);
++    eprintln!("k={k}: before reopen files={files:?} snap_head={snap_head:?}");
++    let usable = engine
++        .apply_batch(room, vec![insert_key(memory_head + 1, extra)])
++        .await
++        .is_ok();
++    let reopened = reopen(engine, dir, room).await;
++    let head = reopened.get_head_seq(room).await.unwrap().get();
++    let base = if usable { head - 1 } else { head };
++    eprintln!("k={k}: memory_head={memory_head} usable={usable} reopened_head={head}");
++    if usable {
++        assert_eq!(head, memory_head + 1, "k={k}: memory and disk disagree after the drop");
++        assert!(has_key(&reopened, room, extra).await, "k={k}: acknowledged write lost");
++    }
++    let keys = if base == old.0 {
++        old.1
++    } else {
++        assert_eq!(base, new.0, "k={k}: head {base} is neither the old nor the new state");
++        new.1
++    };
++    for key in keys {
++        assert!(has_key(&reopened, room, key).await, "k={k}: row {key} missing at head {base}");
++    }
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn audit_l2_apply_snapshot_dropped_at_every_suspension_point() {
++    for k in 0.. {
++        let dir = tempfile::tempdir().unwrap();
++        let room = RoomId::new("audit-snapshot").unwrap();
++        let engine = open_engine(dir.path(), &room).await;
++        apply_range(&engine, &room, 1..=3).await;
++        let snapshot = snapshot_with_rows(&room, 101, 5).await;
++        let completed = audit_poll_then_drop(
++            engine.apply_snapshot(&room, schema(), snapshot.into(), SequenceNumber::from(5u64)),
++            k,
++        )
++        .await;
++        audit_check_after_drop(engine, dir.path(), &room, k, (3, 1..=3), (5, 101..=105)).await;
++        if completed {
++            eprintln!("apply_snapshot: {k} suspension points checked");
++            break;
++        }
++    }
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn audit_l2_apply_batch_dropped_at_every_suspension_point() {
++    for k in 0.. {
++        let dir = tempfile::tempdir().unwrap();
++        let room = RoomId::new("audit-batch").unwrap();
++        let engine = open_engine(dir.path(), &room).await;
++        apply_range(&engine, &room, 1..=3).await;
++        let completed =
++            audit_poll_then_drop(engine.apply_batch(&room, vec![insert(4), insert(5)]), k).await;
++        audit_check_after_drop(engine, dir.path(), &room, k, (3, 1..=3), (5, 1..=5)).await;
++        if completed {
++            eprintln!("apply_batch: {k} suspension points checked");
++            break;
++        }
++    }
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn audit_l2_compact_room_dropped_at_every_suspension_point() {
++    for k in 0.. {
++        let dir = tempfile::tempdir().unwrap();
++        let room = RoomId::new("audit-compact").unwrap();
++        let engine = open_engine(dir.path(), &room).await;
++        apply_range(&engine, &room, 1..=3).await;
++        let completed = audit_poll_then_drop(engine.compact_room(&room), k).await;
++        audit_check_after_drop(engine, dir.path(), &room, k, (3, 1..=3), (3, 1..=3)).await;
++        if completed {
++            eprintln!("compact_room: {k} suspension points checked");
++            break;
++        }
++    }
++}
++
++/// Audit §3.7, INV-L3 (fails on `50fe195`): syncing the parent of a new data directory fails, so
++/// `open_room` fails; the next `open_room` finds the directory already there and never syncs its
++/// entry again, yet acknowledges batches stored under it.
++#[tokio::test]
++async fn audit_l3_data_directory_whose_sync_failed_is_never_synced_again() {
++    let dir = tempfile::tempdir().unwrap();
++    let engine = engine_at(&dir.path().join("data"));
++    let room = RoomId::new("audit-data-dir").unwrap();
++    fail_point::arm("sync_dir", dir.path());
++    assert!(engine.open_room(&room, schema()).await.is_err());
++
++    // Armed again: any later sync of the data directory's parent consumes it.
++    fail_point::arm("sync_dir", dir.path());
++    engine.open_room(&room, schema()).await.unwrap();
++    engine.apply_batch(&room, vec![insert(1)]).await.unwrap();
++    assert!(
++        !fail_point::is_armed("sync_dir", dir.path()),
++        "INV-L3: apply_batch acknowledged seq 1 under a data directory whose entry was never \
++         synced after its sync failed; a power loss can drop the whole directory"
++    );
++}
++
++/// Audit §3.7, INV-L2 (fails on `50fe195`; needs the two `audit.*` pause points added to this
++/// copy). `apply_snapshot` is dropped while its rename waits on the blocking pool: the room is
++/// marked failed and, as `RoomFailed` asks, closed and reopened. Nothing keeps the reopen from
++/// running before that rename: here it lands after the reopen loaded the previous snapshot, so
++/// the reopened room serves (and acknowledges writes on) a state its files no longer hold.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn audit_l2_rename_of_a_dropped_apply_snapshot_lands_in_the_reopened_room() {
++    let dir = tempfile::tempdir().unwrap();
++    let room = RoomId::new("audit-late-rename").unwrap();
++    let engine = open_engine(dir.path(), &room).await;
++    let wal_path = engine.wal_file_path(&room);
++    apply_range(&engine, &room, 1..=3).await;
++    let snapshot = snapshot_with_rows(&room, 101, 5).await;
++
++    let mut rename =
++        fail_point::arm_blocking_pause("audit.apply_snapshot.rename_blocking", &wal_path);
++    {
++        let apply =
++            engine.apply_snapshot(&room, schema(), snapshot.into(), SequenceNumber::from(5u64));
++        let mut apply = std::pin::pin!(apply);
++        tokio::select! {
++            _ = &mut apply => panic!("apply_snapshot finished"),
++            _ = rename.reached() => {}
++        }
++    } // The caller gives up: the future is dropped while the rename is in flight.
++    assert_room_failed(&engine, &room, 4).await;
++    engine.close_room(&room).await.unwrap();
++
++    let mut loaded = fail_point::arm_pause("audit.recovery.snapshot_loaded", &wal_path);
++    let reopened = engine_at(dir.path());
++    let open = tokio::spawn({
++        let (engine, room) = (reopened.clone(), room.clone());
++        async move { engine.open_room(&room, schema()).await }
++    });
++    loaded.reached().await; // The reopen has loaded the previous snapshot...
++    rename.release(); // ...when the late rename lands.
++    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
++    while !staged_snapshot_files(dir.path()).is_empty() {
++        assert!(tokio::time::Instant::now() < deadline, "rename did not land");
++        tokio::time::sleep(Duration::from_millis(10)).await;
++    }
++    loaded.release();
++    open.await.unwrap().unwrap();
++
++    assert_eq!(reopened.get_head_seq(&room).await.unwrap().get(), 3);
++    reopened.apply_batch(&room, vec![insert(4)]).await.unwrap();
++    reopened.apply_batch(&room, vec![insert(5)]).await.unwrap();
++
++    let again = reopen(reopened, dir.path(), &room).await;
++    let head = again.get_head_seq(&room).await.unwrap().get();
++    let (has4, has5) = (has_key(&again, &room, 4).await, has_key(&again, &room, 5).await);
++    assert!(
++        has4 && has5,
++        "INV-L2: batches 4 and 5, acknowledged by the reopened room, are gone after the next \
++         reopen (head {head}, row 4: {has4}, row 5: {has5}): the abandoned apply_snapshot's \
++         rename replaced the snapshot under the reopened room"
++    );
++}

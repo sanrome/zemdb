@@ -1,0 +1,1016 @@
+diff --git a/crates/server/src/actor/tests/room.rs b/crates/server/src/actor/tests/room.rs
+index 0425f78..32f38c5 100644
+--- a/crates/server/src/actor/tests/room.rs
++++ b/crates/server/src/actor/tests/room.rs
+@@ -2011,3 +2011,974 @@ async fn dormant_client_is_forgotten_after_its_ttl_and_registers_again() {
+     register(&sender, &gone).await;
+     fx.manager.shutdown_all().await;
+ }
++
++// ---- AUDIT (INV-R5) -------------------------------------------------------------------------
++
++/// INV-R5: chunk 0 must only offer a snapshot that is not below a known gap. The room actor
++/// already knows the snapshot at 2 is unrestorable (it stops announcing it in `Registered` and
++/// `HeartbeatAck`), but the unanchored first chunk only checks `tail - 1 <= S <= head`.
++#[tokio::test]
++async fn audit_r5_chunk_zero_serves_a_snapshot_below_a_known_gap() {
++    let fx = Fixture::new(small_segments()).await;
++    let sender = fx.sender().await;
++    let writer = ClientId::new("writer").unwrap();
++    register(&sender, &writer).await;
++    for n in 1..=6u8 {
++        commit(&sender, &writer, mutation(n), seq(0), insert_op(n.into()))
++            .await
++            .unwrap();
++    }
++    stage_snapshot_at(&fx, 2).await;
++    ack(&sender, &writer, seq(6)).await.unwrap();
++    let segments = fx.room_dir().join("segments");
++    fs::remove_file(segment_path(&segments, seq(3), seq(4), Tier::Warm)).unwrap();
++
++    // A client restores the snapshot and runs into the gap: the room marks it unrestorable.
++    let restorer = ClientId::new("restorer").unwrap();
++    register_at(&sender, &restorer, Some((seq(2), fx.incarnation))).await;
++    let res = sync_from(&sender, &restorer, seq(2)).await;
++    assert!(matches!(res, Err(ServerError::BehindCompaction)), "{res:?}");
++    assert_eq!(
++        heartbeat(&sender, &writer).await.unwrap().active_snapshot_seq,
++        None
++    );
++    let newcomer = ClientId::new("newcomer").unwrap();
++    let reg = register_result(&sender, &newcomer, None).await.unwrap();
++    assert_eq!(reg.active_snapshot_seq, None);
++
++    // ...yet the first chunk of a download still serves it.
++    let chunk = fx
++        .relay
++        .get_chunk(
++            zemdb_core::id::CorrelationId::new(1),
++            &fx.room_id,
++            0,
++            0,
++            None,
++            async {
++                let (tail_seq, head_seq) = fx.manager.log_bounds(&fx.room_id).await?;
++                Ok(crate::relay::LogBounds { tail_seq, head_seq })
++            },
++        )
++        .await;
++    let served = match &chunk {
++        Ok(zemdb_core::protocol::messages::ServerMessage::SnapshotChunk {
++            snapshot_head_seq,
++            ..
++        }) => Some(*snapshot_head_seq),
++        _ => None,
++    };
++    fx.manager.shutdown_all().await;
++    assert!(
++        matches!(chunk, Err(ServerError::RoomNotFound(_))),
++        "chunk 0 served the snapshot at {served:?}, which the room knows lies below a gap"
++    );
++}
++
++// ---- AUDIT (INV-R1, R2, R4, R5): onboarding simulation ----------------------------------------
++
++mod audit_sim {
++    use super::*;
++    use crate::relay::{LogBounds, SnapshotChunkUpload, Uploader, MIN_CHUNK_BYTES};
++    use std::collections::HashMap;
++    use zemdb_core::id::CorrelationId;
++    use zemdb_core::protocol::messages::ServerMessage;
++    use zemdb_core::protocol::snapshot_envelope::{
++        SnapshotCompression, SnapshotEnvelopeHeader, SNAPSHOT_HEADER_LEN,
++    };
++
++    struct Rng(u64);
++    impl Rng {
++        fn next(&mut self) -> u64 {
++            self.0 ^= self.0 >> 12;
++            self.0 ^= self.0 << 25;
++            self.0 ^= self.0 >> 27;
++            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
++        }
++        fn permille(&mut self, p: u64) -> bool {
++            self.next() % 1000 < p
++        }
++        fn below(&mut self, n: u64) -> u64 {
++            self.next() % n
++        }
++    }
++
++    #[derive(Debug)]
++    enum Phase {
++        Live,
++        NeedSnapshot { since: u64 },
++        Downloading {
++            since: u64,
++            seq: u64,
++            hash: [u8; 32],
++            total: u32,
++            next: u32,
++            bytes: Vec<u8>,
++        },
++    }
++
++    #[derive(Debug)]
++    struct ChunkedUpload {
++        seq: u64,
++        data: Vec<u8>,
++        hash: [u8; 32],
++        next: u32,
++        abandon_at: Option<u32>,
++    }
++
++    struct Client {
++        id: ClientId,
++        cursor: u64,
++        phase: Phase,
++        upload: Option<ChunkedUpload>,
++        away_until: u64,
++        writer: bool,
++    }
++
++    #[derive(Default, Debug)]
++    struct Stats {
++        ticks: u64,
++        commits: u64,
++        uploads_ok: u64,
++        uploads_failed: u64,
++        uploads_abandoned: u64,
++        downloads_ok: u64,
++        downloads_superseded: u64,
++        restore_behind: u64,
++        catch_ups: u64,
++        max_catch_up_ticks: u64,
++        restarts: u64,
++        crashes: u64,
++        server_restarts: u64,
++        ttl_events: u64,
++        gaps: u64,
++        designee_away: u64,
++        newcomer_away: u64,
++        r5_chunk0_below_known_gap: u64,
++        r1_checks: u64,
++        r1_prunes: u64,
++        demand_expired_while_waiting: u64,
++    }
++
++    const LEASE: Duration = Duration::from_secs(30);
++    const TOKIO_STEP: Duration = Duration::from_secs(4);
++
++    struct Sim {
++        dir: TempDir,
++        room_id: RoomId,
++        incarnation: u128,
++        relay: Option<Arc<SnapshotRelay>>,
++        actor: Option<RoomActor>,
++        policy: RoomLifecyclePolicy,
++        rng: Rng,
++        clients: Vec<Client>,
++        uploaded: HashMap<[u8; 32], Vec<u8>>,
++        next_mutation: u64,
++        tick: u64,
++        max_tail: u64,
++        stats: Stats,
++        gap_injection: bool,
++        ttl_injection: bool,
++    }
++
++    fn envelope(body: Vec<u8>) -> Vec<u8> {
++        let header =
++            SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, body.len() as u32, &body);
++        let mut data = header.to_bytes().to_vec();
++        data.extend_from_slice(&body);
++        data
++    }
++
++    impl Sim {
++        fn new(seed: u64, gap_injection: bool, ttl_injection: bool) -> Self {
++            let dir = tempdir().unwrap();
++            let relay = Self::new_relay(dir.path());
++            let policy = RoomLifecyclePolicy {
++                ram_max_ops: 3,
++                warm_disk_ttl: Duration::ZERO,
++                cold_disk_ttl: Duration::from_secs(10 * 365 * 24 * 3600),
++                lease_timeout: LEASE,
++                snapshot_demand_ttl: Duration::from_millis(100),
++                ..RoomLifecyclePolicy::default()
++            };
++            let mut sim = Self {
++                dir,
++                room_id: RoomId::new("simroom").unwrap(),
++                incarnation: 42,
++                relay: Some(relay),
++                actor: None,
++                policy,
++                rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
++                clients: Vec::new(),
++                uploaded: HashMap::new(),
++                next_mutation: 1,
++                tick: 0,
++                max_tail: 0,
++                stats: Stats::default(),
++                gap_injection,
++                ttl_injection,
++            };
++            sim.open_actor();
++            sim
++        }
++
++        fn new_relay(dir: &std::path::Path) -> Arc<SnapshotRelay> {
++            Arc::new(
++                SnapshotRelay::new(
++                    dir.join("snapshots"),
++                    Duration::from_secs(2000),
++                    ServerConfig::default().max_snapshot_bytes,
++                )
++                .unwrap(),
++            )
++        }
++
++        fn open_actor(&mut self) {
++            let config = Arc::new(ServerConfig {
++                data_dir: self.dir.path().to_path_buf(),
++                ..ServerConfig::default()
++            });
++            let (_sender, actor) = RoomActor::open(
++                self.room_id.clone(),
++                self.incarnation,
++                SchemaId::new("todo").unwrap(),
++                Arc::new(test_schema()),
++                self.dir.path(),
++                config,
++                self.policy.clone(),
++                Arc::clone(self.relay.as_ref().unwrap()),
++                ActorTimings {
++                    designation_timeout: Duration::from_millis(100),
++                    ..TEST_TIMINGS
++                },
++            )
++            .unwrap();
++            self.actor = Some(actor);
++            self.check_tail();
++        }
++
++        fn a(&mut self) -> &mut RoomActor {
++            self.actor.as_mut().unwrap()
++        }
++        fn relay(&self) -> Arc<SnapshotRelay> {
++            Arc::clone(self.relay.as_ref().unwrap())
++        }
++
++        fn bounds(&mut self) -> LogBounds {
++            let a = self.a();
++            LogBounds {
++                tail_seq: a.tiered_log.tail_seq(),
++                head_seq: a.head_seq,
++            }
++        }
++
++        /// INV-R2: the tail never moves back, not even across a reopen.
++        fn check_tail(&mut self) {
++            let tail = self.actor.as_ref().unwrap().tiered_log.tail_seq().get();
++            assert!(
++                tail >= self.max_tail,
++                "INV-R2: tail moved back from {} to {tail} (tick {})",
++                self.max_tail,
++                self.tick
++            );
++            self.max_tail = tail;
++        }
++
++        /// INV-R1: the lowest sequence a proactive prune must keep after it, computed from the
++        /// state after the call (the acking client's new cursor included).
++        fn protected(&mut self, tail_before: u64) -> Option<u64> {
++            let ids: Vec<ClientId> = self.clients.iter().map(|c| c.id.clone()).collect();
++            let a = self.actor.as_ref().unwrap();
++            let mut floor: Option<u64> = None;
++            let mut take = |v: u64| floor = Some(floor.map_or(v, |f: u64| f.min(v)));
++            for id in &ids {
++                if let Some(entry) = a.lease_tracker.get_client(id) {
++                    let c = entry.last_ack_seq.get();
++                    let inside = c + 1 >= tail_before;
++                    if inside
++                        && matches!(
++                            entry.state,
++                            ClientState::Connected | ClientState::Disconnected
++                        )
++                    {
++                        take(c);
++                    }
++                }
++            }
++            if let Some(s) = a.usable_snapshot_seq() {
++                take(s.get());
++            }
++            if let Some(u) = a.snapshot_relay.upload_in_progress(&a.room_id) {
++                if u.get() + 1 >= tail_before {
++                    take(u.get());
++                }
++            }
++            floor
++        }
++
++        fn check_r1(&mut self, tail_before: u64, what: &str) {
++            self.stats.r1_checks += 1;
++            let tail_after = self.a().tiered_log.tail_seq().get();
++            if tail_after == tail_before {
++                return;
++            }
++            self.stats.r1_prunes += 1;
++            if let Some(p) = self.protected(tail_before) {
++                assert!(
++                    tail_after <= p + 1,
++                    "INV-R1: {what} pruned to tail {tail_after} past protected {p} (tick {})",
++                    self.tick
++                );
++            }
++            self.check_tail();
++        }
++
++        fn check_announced(&mut self, s: Option<SequenceNumber>, what: &str) {
++            if let Some(s) = s {
++                let b = self.bounds();
++                assert!(
++                    b.tail_seq.get() <= s.get() + 1 && s <= b.head_seq,
++                    "INV-R5: {what} announced unusable snapshot {s} (tail {}, head {})",
++                    b.tail_seq,
++                    b.head_seq
++                );
++                assert_ne!(Some(s), self.a().unrestorable_snapshot, "INV-R5: {what}");
++            }
++        }
++
++        fn mutation(&mut self) -> MutationId {
++            let n = self.next_mutation;
++            self.next_mutation += 1;
++            let mut bytes = [0u8; 16];
++            bytes[..8].copy_from_slice(&n.to_le_bytes());
++            MutationId::new(bytes)
++        }
++
++        fn add_client(&mut self, name: String, writer: bool) {
++            let id = ClientId::new(name).unwrap();
++            let inc = self.incarnation;
++            let reg = self.a().register(&id, None, Some(inc)).unwrap();
++            self.check_announced(reg.active_snapshot_seq, "Registered");
++            let state = self.a().lease_tracker.get_client(&id).unwrap().state;
++            let tick = self.tick;
++            let phase = if state == ClientState::Connected {
++                Phase::Live
++            } else {
++                Phase::NeedSnapshot { since: tick }
++            };
++            self.clients.push(Client {
++                id,
++                cursor: 0,
++                phase,
++                upload: None,
++                away_until: 0,
++                writer,
++            });
++            let i = self.clients.len() - 1;
++            if matches!(self.clients[i].phase, Phase::Live) {
++                self.catch_up(i);
++            }
++        }
++
++        /// Syncs client `i` from its cursor to the head. False if it fell behind.
++        fn catch_up(&mut self, i: usize) -> (bool, bool) {
++            let mut wanted = false;
++            for _ in 0..10_000 {
++                let (id, cursor) = (self.clients[i].id.clone(), self.clients[i].cursor);
++                match self.a().sync(&id, seq(cursor), 100) {
++                    Ok(batch) => {
++                        wanted |= batch.snapshot_wanted;
++                        for (k, op) in batch.ops.iter().enumerate() {
++                            assert_eq!(op.seq.get(), cursor + 1 + k as u64, "INV-Y2 gap in sync");
++                        }
++                        if let Some(last) = batch.ops.last() {
++                            self.clients[i].cursor = last.seq.get();
++                        }
++                        if !batch.has_more {
++                            return (true, wanted);
++                        }
++                    }
++                    Err(ServerError::BehindCompaction) => return (false, wanted),
++                    Err(ServerError::ClientNotRegistered(_)) => {
++                        self.reregister(i);
++                        return (
++                            matches!(self.clients[i].phase, Phase::Live),
++                            wanted,
++                        );
++                    }
++                    Err(e) => panic!("sync failed: {e:?}"),
++                }
++            }
++            panic!("sync did not converge");
++        }
++
++        fn reregister(&mut self, i: usize) {
++            let id = self.clients[i].id.clone();
++            let inc = self.incarnation;
++            let cursor = match self.clients[i].phase {
++                Phase::Live => Some((seq(self.clients[i].cursor), inc)),
++                _ => None,
++            };
++            let reg = self
++                .a()
++                .register(&id, cursor.map(|c| c.0), cursor.map(|c| c.1))
++                .unwrap();
++            self.check_announced(reg.active_snapshot_seq, "Registered");
++            let state = self.a().lease_tracker.get_client(&id).unwrap().state;
++            if state == ClientState::Bootstrapping && matches!(self.clients[i].phase, Phase::Live) {
++                let tick = self.tick;
++                self.clients[i].phase = Phase::NeedSnapshot { since: tick };
++            }
++        }
++
++        fn fall_behind(&mut self, i: usize) {
++            let tick = self.tick;
++            self.clients[i].phase = Phase::NeedSnapshot { since: tick };
++            self.clients[i].upload = None;
++        }
++
++        async fn step_live(&mut self, i: usize) {
++            let id = self.clients[i].id.clone();
++            let mut wanted = false;
++            // Heartbeat.
++            match self.a().heartbeat(&id) {
++                Ok(hb) => {
++                    wanted |= hb.snapshot_wanted;
++                    self.check_announced(hb.active_snapshot_seq, "HeartbeatAck");
++                }
++                Err(ServerError::ClientNotRegistered(_)) => {
++                    self.reregister(i);
++                    if !matches!(self.clients[i].phase, Phase::Live) {
++                        return;
++                    }
++                }
++                Err(e) => panic!("heartbeat: {e:?}"),
++            }
++            // Commit (writers mostly).
++            let commit_p = if self.clients[i].writer { 300 } else { 50 };
++            if self.rng.permille(commit_p) {
++                let mid = self.mutation();
++                let cursor = self.clients[i].cursor;
++                let op = insert_op((self.next_mutation % 50) as i64);
++                let mut flow = ControlFlow::Continue(());
++                match self.a().commit(&id, mid, seq(cursor), op, &mut flow) {
++                    Ok(resp) => {
++                        self.stats.commits += 1;
++                        wanted |= resp.snapshot_wanted;
++                        for (k, op) in resp.catchup_ops.iter().enumerate() {
++                            assert_eq!(op.seq.get(), cursor + 1 + k as u64);
++                        }
++                        if let Some(last) = resp.catchup_ops.last() {
++                            self.clients[i].cursor = last.seq.get();
++                        }
++                    }
++                    Err(ServerError::BehindCompaction) => {}
++                    Err(ServerError::ClientNotRegistered(_)) => {
++                        self.reregister(i);
++                        return;
++                    }
++                    Err(e) => panic!("commit: {e:?}"),
++                }
++                assert!(flow.is_continue());
++            }
++            let (ok, w) = self.catch_up(i);
++            wanted |= w;
++            if !ok {
++                self.fall_behind(i);
++                return;
++            }
++            // Ack (proactive pruning).
++            let tail_before = self.a().tiered_log.tail_seq().get();
++            let cursor = self.clients[i].cursor;
++            match self.a().ack(&id, seq(cursor)) {
++                Ok(_) => self.check_r1(tail_before, "ack"),
++                Err(ServerError::BehindCompaction) => {
++                    self.fall_behind(i);
++                    return;
++                }
++                Err(ServerError::ClientNotRegistered(_)) => self.reregister(i),
++                Err(e) => panic!("ack: {e:?}"),
++            }
++            // Upload. A designee may leave instead of uploading.
++            if self.clients[i].upload.is_some() {
++                self.continue_upload(i).await;
++            } else if wanted {
++                let id = self.clients[i].id.clone();
++                if self.rng.permille(200) && self.live_writers_present(&id) {
++                    self.stats.designee_away += 1;
++                    let t = 10 + self.rng.below(50);
++                    self.send_away(i, t);
++                    return;
++                }
++                self.start_upload(i).await;
++            }
++        }
++
++        async fn start_upload(&mut self, i: usize) {
++            let s = self.clients[i].cursor;
++            if s == 0 {
++                return;
++            }
++            let tag = self.rng.next();
++            if self.rng.permille(500) {
++                // Single request; 10% corrupt.
++                let mut data = envelope(format!("{s}:{tag}").into_bytes());
++                if self.rng.permille(200) {
++                    let last = data.len() - 1;
++                    data[last] ^= 0xff;
++                }
++                let bounds = self.bounds();
++                let room = self.room_id.clone();
++                let res = self
++                    .relay()
++                    .stage_snapshot(&room, seq(s), bytes::Bytes::from(data.clone()), async {
++                        Ok(bounds)
++                    })
++                    .await;
++                match res {
++                    Ok(hash) => {
++                        self.stats.uploads_ok += 1;
++                        self.uploaded.insert(hash, data);
++                    }
++                    Err(_) => self.stats.uploads_failed += 1,
++                }
++            } else {
++                let mut body = vec![0u8; 200 * 1024 - SNAPSHOT_HEADER_LEN];
++                body[..16].copy_from_slice(&[s.to_le_bytes(), tag.to_le_bytes()].concat());
++                let data = envelope(body);
++                let mut hash = ServerMessage::compute_snapshot_hash(&data);
++                if self.rng.permille(200) {
++                    hash[0] ^= 1; // wrong hash: rejected when it completes
++                }
++                let abandon_at = self.rng.permille(250).then(|| 1 + self.rng.below(2) as u32);
++                self.clients[i].upload = Some(ChunkedUpload {
++                    seq: s,
++                    data,
++                    hash,
++                    next: 0,
++                    abandon_at,
++                });
++                self.continue_upload(i).await;
++            }
++        }
++
++        async fn continue_upload(&mut self, i: usize) {
++            let id = self.clients[i].id.clone();
++            let Some(up) = self.clients[i].upload.as_mut() else {
++                return;
++            };
++            if up.next >= 3 {
++                // Every chunk was sent, but the session that held the first ones was lost
++                // (expired or replaced): the last chunk was not the one that completed it.
++                self.stats.uploads_failed += 1;
++                self.clients[i].upload = None;
++                return;
++            }
++            if up.abandon_at == Some(up.next) {
++                // The uploader keeps running but never sends the rest.
++                self.stats.uploads_abandoned += 1;
++                self.clients[i].upload = None;
++                return;
++            }
++            let chunk_len = up.data.len().div_ceil(3);
++            let start = up.next as usize * chunk_len;
++            let end = (start + chunk_len).min(up.data.len());
++            let chunk = SnapshotChunkUpload {
++                room_id: self.room_id.clone(),
++                uploader: Uploader::Client(id),
++                head_seq: seq(up.seq),
++                chunk_index: up.next,
++                total_chunks: 3,
++                total_bytes: up.data.len() as u64,
++                snapshot_hash: up.hash,
++                data: bytes::Bytes::copy_from_slice(&up.data[start..end]),
++            };
++            let bounds = self.bounds();
++            let res = self.relay().stage_chunk(chunk, async { Ok(bounds) }).await;
++            let up = self.clients[i].upload.as_mut().unwrap();
++            match res {
++                Ok(true) => {
++                    self.stats.uploads_ok += 1;
++                    let up = self.clients[i].upload.take().unwrap();
++                    self.uploaded.insert(up.hash, up.data);
++                }
++                Ok(false) => up.next += 1,
++                Err(_) => {
++                    self.stats.uploads_failed += 1;
++                    self.clients[i].upload = None;
++                }
++            }
++        }
++
++        async fn step_bootstrapping(&mut self, i: usize) {
++            let id = self.clients[i].id.clone();
++            if let Phase::NeedSnapshot { .. } = self.clients[i].phase {
++                let hb = match self.a().heartbeat(&id) {
++                    Ok(hb) => hb,
++                    Err(ServerError::ClientNotRegistered(_)) => {
++                        self.reregister(i);
++                        return;
++                    }
++                    Err(e) => panic!("heartbeat: {e:?}"),
++                };
++                self.check_announced(hb.active_snapshot_seq, "HeartbeatAck");
++                if hb.active_snapshot_seq.is_none() {
++                    return;
++                }
++            }
++            let since = match self.clients[i].phase {
++                Phase::NeedSnapshot { since } | Phase::Downloading { since, .. } => since,
++                Phase::Live => unreachable!(),
++            };
++            let (index, anchor) = match &self.clients[i].phase {
++                Phase::Downloading { next, hash, .. } => (*next, Some(*hash)),
++                _ => (0, None),
++            };
++            let bounds = self.bounds();
++            let room = self.room_id.clone();
++            let res = self
++                .relay()
++                .get_chunk(CorrelationId::new(1), &room, index, MIN_CHUNK_BYTES, anchor, async {
++                    Ok(bounds)
++                })
++                .await;
++            match res {
++                Ok(ServerMessage::SnapshotChunk {
++                    snapshot_head_seq,
++                    total_chunks,
++                    snapshot_hash,
++                    data,
++                    ..
++                }) => {
++                    if index == 0 {
++                        let b = self.bounds();
++                        assert!(
++                            b.tail_seq.get() <= snapshot_head_seq.get() + 1
++                                && snapshot_head_seq <= b.head_seq,
++                            "INV-R5: chunk 0 served an unusable snapshot"
++                        );
++                        if Some(snapshot_head_seq) == self.a().unrestorable_snapshot {
++                            self.stats.r5_chunk0_below_known_gap += 1;
++                        }
++                        self.clients[i].phase = Phase::Downloading {
++                            since,
++                            seq: snapshot_head_seq.get(),
++                            hash: snapshot_hash,
++                            total: total_chunks,
++                            next: 0,
++                            bytes: Vec::new(),
++                        };
++                    }
++                    let Phase::Downloading {
++                        seq: s,
++                        hash,
++                        total,
++                        next,
++                        bytes,
++                        ..
++                    } = &mut self.clients[i].phase
++                    else {
++                        unreachable!()
++                    };
++                    assert_eq!(snapshot_hash, *hash, "INV-R5: chunk of another snapshot");
++                    assert_eq!(snapshot_head_seq.get(), *s);
++                    bytes.extend_from_slice(&data);
++                    *next += 1;
++                    if *next == *total {
++                        // INV-R5: the assembled bytes are exactly one uploaded snapshot.
++                        assert_eq!(&ServerMessage::compute_snapshot_hash(bytes), hash);
++                        assert_eq!(self.uploaded.get(hash), Some(&*bytes), "INV-R5: mixed bytes");
++                        let s = *s;
++                        self.stats.downloads_ok += 1;
++                        self.clients[i].cursor = s;
++                        self.clients[i].phase = Phase::Live;
++                        let (ok, _) = self.catch_up(i);
++                        if ok {
++                            let took = self.tick - since;
++                            self.stats.catch_ups += 1;
++                            self.stats.max_catch_up_ticks = self.stats.max_catch_up_ticks.max(took);
++                        } else {
++                            self.stats.restore_behind += 1;
++                            self.clients[i].phase = Phase::NeedSnapshot { since };
++                        }
++                    }
++                }
++                Ok(other) => panic!("unexpected {other:?}"),
++                Err(ServerError::SnapshotSuperseded(_)) | Err(ServerError::RoomNotFound(_)) => {
++                    if anchor.is_some() {
++                        self.stats.downloads_superseded += 1;
++                    }
++                    self.clients[i].phase = Phase::NeedSnapshot { since };
++                }
++                Err(e) => panic!("get_chunk: {e:?}"),
++            }
++        }
++
++        fn live_writers_present(&self, except: &ClientId) -> bool {
++            self.clients.iter().any(|c| {
++                &c.id != except && matches!(c.phase, Phase::Live) && c.away_until <= self.tick
++            })
++        }
++
++        fn send_away(&mut self, i: usize, ticks: u64) {
++            self.clients[i].away_until = self.tick + ticks;
++            self.clients[i].upload = None;
++            let id = self.clients[i].id.clone();
++            if let Some(entry) = self.a().lease_tracker.get_client_mut(&id) {
++                entry.last_heartbeat = std::time::Instant::now()
++                    .checked_sub(LEASE + Duration::from_secs(1))
++                    .unwrap();
++            }
++        }
++
++        async fn events(&mut self, quiet: bool) {
++            if quiet {
++                return;
++            }
++            if self.rng.permille(20) {
++                self.stats.restarts += 1;
++                let mut a = self.actor.take().unwrap();
++                a.persist_roster_at_stop();
++                drop(a);
++                self.open_actor();
++            }
++            if self.rng.permille(10) {
++                self.stats.crashes += 1;
++                drop(self.actor.take());
++                self.open_actor();
++            }
++            if self.rng.permille(5) {
++                self.stats.server_restarts += 1;
++                drop(self.actor.take());
++                self.relay = None;
++                self.relay = Some(Self::new_relay(self.dir.path()));
++                // Uploads in progress were lost.
++                for c in &mut self.clients {
++                    c.upload = None;
++                }
++                self.open_actor();
++            }
++            if self.rng.permille(25) {
++                // The relay snapshot expires.
++                tokio::time::advance(Duration::from_secs(2000)).await;
++            }
++            if self.ttl_injection && self.rng.permille(15) {
++                // TTL or quota compaction: prunes a prefix ignoring the anchors (accepted).
++                self.stats.ttl_events += 1;
++                let head = self.a().head_seq.get();
++                let target = seq(head.saturating_sub(2));
++                let _ = self.a().tiered_log.prune_older_than(target);
++                self.check_tail();
++            }
++            if self.gap_injection && self.rng.permille(15) {
++                let segments = self.dir.path().join("rooms/simroom/segments");
++                let mut names: Vec<String> = fs::read_dir(&segments)
++                    .unwrap()
++                    .filter_map(|e| e.ok()?.file_name().into_string().ok())
++                    .filter(|n| n.ends_with(".wal") && n.starts_with("segment_") || n.ends_with(".wal.zst"))
++                    .collect();
++                names.sort();
++                if names.len() >= 3 {
++                    let victim = &names[1 + self.rng.below(names.len() as u64 - 2) as usize];
++                    let _ = fs::remove_file(segments.join(victim));
++                    self.stats.gaps += 1;
++                }
++            }
++            // The designee goes away.
++            if self.rng.permille(30) {
++                if let Some(d) = self.a().snapshot_demand.designee().cloned() {
++                    if self.live_writers_present(&d) {
++                        if let Some(i) = self.clients.iter().position(|c| c.id == d) {
++                            self.stats.designee_away += 1;
++                            let t = 10 + self.rng.below(50);
++                            self.send_away(i, t);
++                        }
++                    }
++                }
++            }
++            // A waiting newcomer goes away (its demand can expire meanwhile).
++            if self.rng.permille(60) {
++                let waiting: Vec<usize> = (0..self.clients.len())
++                    .filter(|&i| {
++                        !self.clients[i].writer
++                            && !matches!(self.clients[i].phase, Phase::Live)
++                            && self.clients[i].away_until <= self.tick
++                    })
++                    .collect();
++                if !waiting.is_empty() {
++                    let i = waiting[self.rng.below(waiting.len() as u64) as usize];
++                    self.stats.newcomer_away += 1;
++                    let t = 30 + self.rng.below(50);
++                    self.send_away(i, t);
++                }
++            }
++            if self.rng.permille(25) && self.clients.len() < 16 {
++                let n = self.clients.len();
++                self.add_client(format!("newcomer-{n}"), false);
++            }
++        }
++
++        async fn run_tick(&mut self, quiet: bool) {
++            self.tick += 1;
++            self.stats.ticks += 1;
++            self.events(quiet).await;
++            let mut order: Vec<usize> = (0..self.clients.len()).collect();
++            for k in (1..order.len()).rev() {
++                let j = self.rng.below(k as u64 + 1) as usize;
++                order.swap(k, j);
++            }
++            for i in order {
++                if self.clients[i].away_until > self.tick {
++                    continue;
++                }
++                match self.clients[i].phase {
++                    Phase::Live => self.step_live(i).await,
++                    _ => self.step_bootstrapping(i).await,
++                }
++            }
++            self.a().run_fast_maintenance();
++            if !self.waiting().is_empty()
++                && !self.a().snapshot_demand.is_active()
++                && self.a().usable_snapshot_seq().is_none()
++            {
++                self.stats.demand_expired_while_waiting += 1;
++            }
++            if self.tick % 3 == 0 {
++                let tail_before = self.a().tiered_log.tail_seq().get();
++                self.a().run_disk_maintenance().await;
++                self.check_r1(tail_before, "slow tick");
++            }
++            self.check_tail();
++            tokio::time::advance(TOKIO_STEP).await;
++            std::thread::sleep(Duration::from_millis(5));
++        }
++
++        fn waiting(&self) -> Vec<(String, u64)> {
++            self.clients
++                .iter()
++                .filter_map(|c| match c.phase {
++                    Phase::NeedSnapshot { since } | Phase::Downloading { since, .. } => {
++                        Some((c.id.to_string(), self.tick - since))
++                    }
++                    Phase::Live => None,
++                })
++                .collect()
++        }
++    }
++
++    async fn run(seed: u64, gaps: bool, ttl: bool) -> Stats {
++        let mut sim = Sim::new(seed, gaps, ttl);
++        sim.add_client("writer-a".into(), true);
++        sim.add_client("writer-b".into(), true);
++        for _ in 0..600 {
++            sim.run_tick(false).await;
++            // Bounded liveness while disruptions go on.
++            for (id, waited) in sim.waiting() {
++                assert!(
++                    waited <= 400,
++                    "INV-R4: {id} waiting for {waited} ticks (seed {seed}, tick {}): {:?}",
++                    sim.tick,
++                    sim.stats
++                );
++            }
++        }
++        // Quiet phase: every client catches up.
++        for _ in 0..300 {
++            for c in &mut sim.clients {
++                c.away_until = c.away_until.min(sim.tick);
++            }
++            sim.run_tick(true).await;
++            if sim.waiting().is_empty() {
++                break;
++            }
++        }
++        assert!(
++            sim.waiting().is_empty(),
++            "INV-R4: clients never caught up (seed {seed}): {:?} {:?}",
++            sim.waiting(),
++            sim.stats
++        );
++        sim.stats
++    }
++
++    fn seeds() -> Vec<u64> {
++        std::env::var("AUDIT_SEEDS")
++            .ok()
++            .map(|s| s.split(',').map(|x| x.parse().unwrap()).collect())
++            .unwrap_or_else(|| (1..=6).collect())
++    }
++
++    async fn run_all(gaps: bool, ttl: bool) {
++        for seed in seeds() {
++            let stats = run(seed, gaps, ttl).await;
++            eprintln!("seed {seed} gaps {gaps} ttl {ttl}: {stats:?}");
++        }
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn audit_r4_sim_plain() {
++        run_all(false, false).await;
++    }
++    #[tokio::test(start_paused = true)]
++    async fn audit_r4_sim_gaps() {
++        run_all(true, false).await;
++    }
++    #[tokio::test(start_paused = true)]
++    async fn audit_r4_sim_ttl() {
++        run_all(false, true).await;
++    }
++    #[tokio::test(start_paused = true)]
++    async fn audit_r4_sim_gaps_and_ttl() {
++        run_all(true, true).await;
++    }
++}
++
++/// AUDIT (backlog): a one-chunk upload is not anchored while the relay waits for the log bounds,
++/// unlike a single-request upload, and its completion is checked against those same bounds. A
++/// prune between the two installs a snapshot that is already outside the range and answers
++/// `staged: true` (D61 says completing outside the range is `SnapshotSuperseded`).
++#[tokio::test(start_paused = true)]
++async fn audit_one_chunk_upload_staged_after_pruning_passed_it() {
++    let fx = Fixture::new(RoomLifecycleOverrides {
++        lease_timeout_secs: Some(600),
++        ..small_segments()
++    })
++    .await;
++    let sender = fx.sender().await;
++    let writer = ClientId::new("writer").unwrap();
++    register(&sender, &writer).await;
++    commit_and_ack(&sender, &writer, 1..=4).await;
++    let (tail, _) = fx.manager.log_bounds(&fx.room_id).await.unwrap();
++    assert!(tail.get() <= 4, "tail {tail}");
++
++    let data = snapshot_envelope();
++    let hash = zemdb_core::protocol::messages::ServerMessage::compute_snapshot_hash(&data);
++    let res = fx
++        .relay
++        .stage_chunk(
++            crate::relay::SnapshotChunkUpload {
++                room_id: fx.room_id.clone(),
++                uploader: crate::relay::Uploader::Admin,
++                head_seq: seq(3),
++                chunk_index: 0,
++                total_chunks: 1,
++                total_bytes: data.len() as u64,
++                snapshot_hash: hash,
++                data,
++            },
++            async {
++                let (tail_seq, head_seq) = fx.manager.log_bounds(&fx.room_id).await?;
++                // The room moves on before the relay takes its lock.
++                commit_and_ack(&sender, &writer, 5..=10).await;
++                Ok(crate::relay::LogBounds { tail_seq, head_seq })
++            },
++        )
++        .await;
++    let (tail, head) = fx.manager.log_bounds(&fx.room_id).await.unwrap();
++    let active = fx.relay.active_snapshot_seq(&fx.room_id);
++    fx.manager.shutdown_all().await;
++    assert!(
++        matches!(res, Err(ServerError::SnapshotSuperseded(_))),
++        "one-chunk upload at 3 answered {res:?}; active snapshot {active:?}, log now {tail}..={head}"
++    );
++}
+diff --git a/crates/server/src/log/tests/tiered_log.rs b/crates/server/src/log/tests/tiered_log.rs
+index 9c597f3..e286ed5 100644
+--- a/crates/server/src/log/tests/tiered_log.rs
++++ b/crates/server/src/log/tests/tiered_log.rs
+@@ -1757,3 +1757,32 @@ fn test_unified_wal_zero_filled_eof_truncation() {
+     assert_eq!(recovered_mutations.len(), 1);
+     assert_eq!(file_len(&active_path), clean_len);
+ }
++
++/// AUDIT (INV-R2): a cursor-driven prune whose deletion fails in the middle of its prefix keeps
++/// the range contiguous, and reopening finishes it without moving the tail back.
++#[test]
++fn audit_r2_prune_failing_mid_prefix_stays_contiguous_and_reopen_finishes_it() {
++    let dir = tempdir().unwrap();
++    let policy = RoomLifecyclePolicy {
++        ram_max_ops: 3,
++        ..RoomLifecyclePolicy::default()
++    };
++    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++    append_range(&mut log, 1, 13);
++    let segments = segments_dir(dir.path());
++    crate::fail_point::arm("remove_file", &segment_file(&segments, 4, 6, "wal"));
++
++    assert!(log.prune_older_than(SequenceNumber::new(10)).is_err());
++    let tail = log.tail_seq().get();
++    assert_eq!(tail, 4, "only the first segment went");
++    let (ops, _) = log.fetch_deltas(SequenceNumber::new(tail - 1), 100).unwrap();
++    assert_contiguous(&ops, tail, 13);
++    drop(log);
++
++    let (log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
++    let reopened = log.tail_seq().get();
++    assert!(reopened >= tail, "tail moved back from {tail} to {reopened}");
++    assert_eq!(reopened, 10);
++    let (ops, _) = log.fetch_deltas(SequenceNumber::new(reopened - 1), 100).unwrap();
++    assert_contiguous(&ops, reopened, 13);
++}

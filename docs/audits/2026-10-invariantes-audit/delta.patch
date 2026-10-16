@@ -1,0 +1,100 @@
+diff --git a/crates/server/src/actor/tests/room.rs b/crates/server/src/actor/tests/room.rs
+index 0425f78..5ada2b6 100644
+--- a/crates/server/src/actor/tests/room.rs
++++ b/crates/server/src/actor/tests/room.rs
+@@ -2011,3 +2011,57 @@ async fn dormant_client_is_forgotten_after_its_ttl_and_registers_again() {
+     register(&sender, &gone).await;
+     fx.manager.shutdown_all().await;
+ }
++
++// AUDIT (delta 3.8): once a sync finds the gap after the active snapshot, the snapshot is no
++// longer announced, but chunk 0 (the request that starts a download, without a hash) still
++// serves it: `get_chunk` checks only `LogBounds::admits`, not the unrestorable mark.
++#[tokio::test]
++async fn audit_chunk_zero_serves_a_snapshot_below_a_known_gap() {
++    let fx = Fixture::new(small_segments()).await;
++    let sender = fx.sender().await;
++    let writer = ClientId::new("writer").unwrap();
++    register(&sender, &writer).await;
++    for n in 1..=6u8 {
++        commit(&sender, &writer, mutation(n), seq(0), insert_op(n.into()))
++            .await
++            .unwrap();
++    }
++    stage_snapshot_at(&fx, 2).await;
++    ack(&sender, &writer, seq(6)).await.unwrap();
++    let segments = fx.room_dir().join("segments");
++    fs::remove_file(segment_path(&segments, seq(3), seq(4), Tier::Warm)).unwrap();
++
++    let restorer = ClientId::new("restorer").unwrap();
++    register_at(&sender, &restorer, Some((seq(2), fx.incarnation))).await;
++    let res = sync_from(&sender, &restorer, seq(2)).await;
++    assert!(matches!(res, Err(ServerError::BehindCompaction)), "{res:?}");
++    let hb = heartbeat(&sender, &writer).await.unwrap();
++    assert_eq!(hb.active_snapshot_seq, None, "no longer announced");
++
++    // A new client (or one with a stale `snapshot_available`) starts a download.
++    let chunk = fx
++        .relay
++        .get_chunk(
++            zemdb_core::id::CorrelationId::new(1),
++            &fx.room_id,
++            0,
++            1024,
++            None,
++            async {
++                let (tail_seq, head_seq) = fx.manager.log_bounds(&fx.room_id).await?;
++                Ok(crate::relay::LogBounds { tail_seq, head_seq })
++            },
++        )
++        .await;
++    let served = match &chunk {
++        Ok(zemdb_core::protocol::messages::ServerMessage::SnapshotChunk {
++            snapshot_head_seq, ..
++        }) => Some(*snapshot_head_seq),
++        _ => None,
++    };
++    fx.manager.shutdown_all().await;
++    assert_eq!(
++        served, None,
++        "chunk 0 served the snapshot below the gap ({chunk:?})"
++    );
++}
+diff --git a/crates/server/src/log/tests/tiered_log.rs b/crates/server/src/log/tests/tiered_log.rs
+index 9c597f3..a001ca1 100644
+--- a/crates/server/src/log/tests/tiered_log.rs
++++ b/crates/server/src/log/tests/tiered_log.rs
+@@ -1757,3 +1757,33 @@ fn test_unified_wal_zero_filled_eof_truncation() {
+     assert_eq!(recovered_mutations.len(), 1);
+     assert_eq!(file_len(&active_path), clean_len);
+ }
++
++// AUDIT (delta 3.8): a damaged `log_meta.json` that is still valid JSON (one bit flipped in a
++// digit: "10" -> "18") makes the open delete retained segments that nothing pruned.
++#[test]
++fn audit_damaged_log_meta_deletes_retained_segments() {
++    let dir = tempdir().unwrap();
++    let policy = RoomLifecyclePolicy {
++        ram_max_ops: 5,
++        ..RoomLifecyclePolicy::default()
++    };
++    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++    // Sealed [1..=5], [6..=10], [11..=15], [16..=20]; 21..=22 in active.wal.
++    append_range(&mut log, 1, 22);
++    // A legitimate prune of [1..=5] and [6..=10]: log_meta.json says 10.
++    log.prune_older_than(SequenceNumber::new(11)).unwrap();
++    assert_eq!(log.tail_seq().get(), 11);
++    drop(log);
++    let meta = dir.path().join("log_meta.json");
++    let text = std::fs::read_to_string(&meta).unwrap();
++    assert!(text.contains("10"), "{text}");
++    // One bit flipped: '0' (0x30) -> '8' (0x38).
++    std::fs::write(&meta, text.replace("10", "18")).unwrap();
++
++    let kept = segment_file(&segments_dir(dir.path()), 11, 15, "wal");
++    assert!(kept.exists());
++    let (log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
++    // Operations 11..=15 were never pruned; the open must not discard them.
++    assert!(kept.exists(), "the open deleted the retained segment 11..=15");
++    assert_eq!(log.tail_seq().get(), 11, "tail moved past retained operations");
++}
