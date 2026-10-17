@@ -37,7 +37,8 @@ pub struct RoomLifecyclePolicy {
     /// and evicting older deltas from memory.
     pub ram_max_ops: usize,
 
-    /// Maximum encoded size of the operations retained in RAM. Whichever of this and
+    /// Maximum size of the operations retained in RAM, each counted by its encoding or by 24
+    /// bytes per value, whichever is more. Whichever of this and
     /// `ram_max_ops` is reached first evicts the oldest; an operation larger than this on its
     /// own is not kept in RAM.
     pub ram_max_bytes: u64,

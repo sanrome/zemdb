@@ -1,13 +1,25 @@
+use zemdb_core::mutation::OperationKind;
 use zemdb_core::protocol::codec::encoded_len;
 use zemdb_core::protocol::messages::SequencedOperation;
+use zemdb_core::value::Value;
 
-/// Encoded size of `op`, as measured against a response's byte budget.
+/// What `op` is charged against a read budget and the RAM window: its encoded size, or what
+/// its values take in memory if that is more (a `Null` takes 1 byte on the wire and 24 in
+/// memory).
 pub(crate) fn op_bytes(op: &SequencedOperation) -> u64 {
-    encoded_len(op).unwrap_or(u64::MAX)
+    let values = op.op.pk().len()
+        + match op.op.kind() {
+            OperationKind::Insert { row } => row.len(),
+            OperationKind::Update { updates } => updates.len(),
+            OperationKind::Delete => 0,
+        };
+    let in_memory = (values * std::mem::size_of::<Value>()) as u64;
+    encoded_len(op).unwrap_or(u64::MAX).max(in_memory)
 }
 
-/// What one read of the log may still return: at most a number of operations and of encoded
-/// bytes. The first operation is always admitted, so a read makes progress even when one
+/// What one read of the log may still return: at most a number of operations and of bytes,
+/// as [`op_bytes`] charges them. The first operation is always admitted, so a read makes
+/// progress even when one
 /// operation is larger than the byte budget (every accepted operation fits in a response on
 /// its own).
 ///

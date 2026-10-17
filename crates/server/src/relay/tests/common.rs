@@ -20,6 +20,8 @@ pub(super) const TTL: Duration = Duration::from_secs(600);
 
 pub(super) const MAX_BYTES: u64 = 16 * 1024 * 1024;
 
+pub(super) const UPLOAD_MAX: Duration = Duration::from_secs(2 * 60 * 60);
+
 pub(super) fn room() -> RoomId {
     RoomId::new("relay-room").unwrap()
 }
@@ -29,14 +31,14 @@ pub(super) fn seq(n: u64) -> SequenceNumber {
 }
 
 pub(super) fn open(dir: &TempDir) -> SnapshotRelay {
-    SnapshotRelay::new(snapshots_dir(dir), TTL, MAX_BYTES).unwrap()
+    SnapshotRelay::new(snapshots_dir(dir), TTL, MAX_BYTES, UPLOAD_MAX).unwrap()
 }
 
 pub(super) fn log_bounds(tail: u64, head: u64) -> LogBounds {
     LogBounds {
         tail_seq: seq(tail),
         head_seq: seq(head),
-        unrestorable_snapshot: None,
+        unrestorable_through: None,
     }
 }
 

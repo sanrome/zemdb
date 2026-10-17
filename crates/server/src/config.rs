@@ -30,8 +30,8 @@ pub struct ServerConfig {
     /// before the active segment is sealed.
     pub ram_max_ops: usize,
 
-    /// Server default of the room lifecycle setting `ram_max_bytes`: encoded size of the
-    /// operations kept in RAM.
+    /// Server default of the room lifecycle setting `ram_max_bytes`: size of the operations
+    /// kept in RAM (encoded, or 24 bytes per value if that is more).
     pub ram_max_bytes: u64,
 
     /// Server default of the room lifecycle setting `segment_max_bytes`: size at which the
@@ -80,6 +80,10 @@ pub struct ServerConfig {
     /// Largest snapshot the relay accepts, in bytes (default 512 MiB).
     pub max_snapshot_bytes: u64,
 
+    /// Longest a multipart snapshot upload may take from its first chunk, even if it keeps
+    /// receiving new chunks; then it is discarded like an idle one (seconds, default 2 hours).
+    pub snapshot_upload_max_secs: u64,
+
     /// Time a connection has to deliver the headers of its next request: a client that does
     /// not complete them in time, or that keeps a connection open without a request in
     /// progress for longer, is disconnected (seconds, default 10).
@@ -106,10 +110,17 @@ pub struct ServerConfig {
     /// events, is not waiting for the client.
     pub response_stall_timeout_secs: u64,
 
-    /// Bytes of large responses (`SyncBatch`, `CommitAck`, `SnapshotChunk`) held at once until
-    /// their clients take them (default 256 MiB). Without room left, a sync or a snapshot
-    /// chunk is answered `Unavailable`, and a commit is acknowledged without its catch-up.
+    /// Bytes of large responses (`SyncBatch`, `CommitAck`, `SnapshotChunk`, `Registered`,
+    /// `Schema`) held at once until their clients take them (default 256 MiB); each reserves a
+    /// whole frame while it is built. Without room left, a sync, a snapshot chunk, a
+    /// registration or a schema request is answered `Unavailable`, and a commit is acknowledged
+    /// without its catch-up.
     pub max_inflight_response_bytes: u64,
+
+    /// Part of `max_inflight_response_bytes` one client (a room and `client_id`, or the admin
+    /// secret in the relay) may hold (default: two frames). Above it, that client's responses
+    /// are treated as if the whole budget were taken.
+    pub max_inflight_response_bytes_per_client: u64,
 
     /// Most SSE streams open at once (default: half of `max_connections`, at least 1). A
     /// client keeps at most 2 per room: opening a third closes its oldest.
@@ -144,12 +155,14 @@ impl Default for ServerConfig {
             snapshot_demand_ttl_secs: policy.snapshot_demand_ttl.as_secs(),
             idle_timeout_secs: policy.idle_timeout.map_or(0, |idle| idle.as_secs()),
             max_snapshot_bytes: 512 * 1024 * 1024,
+            snapshot_upload_max_secs: 2 * 60 * 60,
             header_read_timeout_secs: 10,
             body_read_timeout_secs: 60,
             body_min_rate_bytes_per_sec: 32 * 1024,
             max_connections: 10_000,
             response_stall_timeout_secs: 60,
             max_inflight_response_bytes: 256 * 1024 * 1024,
+            max_inflight_response_bytes_per_client: 2 * MAX_FRAME_SIZE as u64,
             max_sse_streams: None,
         }
     }
@@ -160,6 +173,9 @@ const MIN_MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024;
 
 /// Largest accepted `max_snapshot_bytes` (64 GiB).
 const MAX_MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// Accepted range of `snapshot_upload_max_secs`: from 1 minute to 1 day.
+const SNAPSHOT_UPLOAD_MAX_SECS_RANGE: std::ops::RangeInclusive<u64> = 60..=86_400;
 
 /// Accepted range of `header_read_timeout_secs`: from 1 second to 5 minutes.
 const HEADER_READ_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=300;
@@ -230,6 +246,11 @@ impl ServerConfig {
             )));
         }
         check_range(
+            "snapshot_upload_max_secs (ZEMDB_SNAPSHOT_UPLOAD_MAX_SECS)",
+            self.snapshot_upload_max_secs,
+            SNAPSHOT_UPLOAD_MAX_SECS_RANGE,
+        )?;
+        check_range(
             "header_read_timeout_secs (ZEMDB_HEADER_READ_TIMEOUT_SECS)",
             self.header_read_timeout_secs,
             HEADER_READ_TIMEOUT_SECS_RANGE,
@@ -258,6 +279,11 @@ impl ServerConfig {
             "max_inflight_response_bytes (ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES)",
             self.max_inflight_response_bytes,
             MAX_INFLIGHT_RESPONSE_BYTES_RANGE,
+        )?;
+        check_range(
+            "max_inflight_response_bytes_per_client (ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES_PER_CLIENT)",
+            self.max_inflight_response_bytes_per_client,
+            MAX_FRAME_SIZE as u64..=self.max_inflight_response_bytes,
         )?;
         if let Some(max) = self.max_sse_streams {
             check_range(
@@ -366,6 +392,9 @@ impl ServerConfig {
         if let Some(max_bytes) = parse_var(&var, "ZEMDB_MAX_SNAPSHOT_BYTES")? {
             self.max_snapshot_bytes = max_bytes;
         }
+        if let Some(secs) = parse_var(&var, "ZEMDB_SNAPSHOT_UPLOAD_MAX_SECS")? {
+            self.snapshot_upload_max_secs = secs;
+        }
         if let Some(secs) = parse_var(&var, "ZEMDB_HEADER_READ_TIMEOUT_SECS")? {
             self.header_read_timeout_secs = secs;
         }
@@ -383,6 +412,9 @@ impl ServerConfig {
         }
         if let Some(bytes) = parse_var(&var, "ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES")? {
             self.max_inflight_response_bytes = bytes;
+        }
+        if let Some(bytes) = parse_var(&var, "ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES_PER_CLIENT")? {
+            self.max_inflight_response_bytes_per_client = bytes;
         }
         if let Some(max) = parse_var(&var, "ZEMDB_MAX_SSE_STREAMS")? {
             self.max_sse_streams = Some(max);

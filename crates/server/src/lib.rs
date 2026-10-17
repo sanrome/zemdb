@@ -8,6 +8,7 @@ pub mod error;
 mod fail_point;
 mod log;
 pub mod relay;
+mod response_budget;
 pub mod schema_registry;
 
 #[cfg(test)]

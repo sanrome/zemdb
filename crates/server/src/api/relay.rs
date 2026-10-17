@@ -5,11 +5,13 @@
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
+use futures::future::Either;
+use std::future::ready;
 use zemdb_core::id::{RoomId, SequenceNumber};
 use zemdb_core::protocol::messages::{ClientMessage, ServerMessage};
 
 use crate::api::data_plane::{
-    binary_error, binary_response, budgeted_or_unavailable, unexpected_message,
+    binary_error, binary_response, budgeted_response, no_budget, reserve_frame, unexpected_message,
 };
 use crate::api::extract::{ensure_payload_identity, BinaryBody, BinaryMessage, RelayAuth};
 use crate::api::router::AppState;
@@ -77,7 +79,7 @@ fn parse_snapshot_head_seq(headers: &HeaderMap) -> Result<SequenceNumber, Server
 /// and streams the requested binary `ServerMessage::SnapshotChunk`.
 pub async fn request_chunk(
     State(state): State<AppState>,
-    RelayAuth { room_id, .. }: RelayAuth,
+    RelayAuth { room_id, uploader }: RelayAuth,
     BinaryMessage(msg): BinaryMessage,
 ) -> Response {
     let ClientMessage::RequestSnapshotChunk {
@@ -94,6 +96,15 @@ pub async fn request_chunk(
     if let Err(err) = ensure_payload_identity(&room_id, None, &msg_room_id, None) {
         return binary_error(Some(correlation_id), Some(room_id), err);
     }
+    // The chunk is read from its file once its frame is reserved, and the frame is not held
+    // while the first chunk waits for the room's log range (later chunks never ask for it).
+    let bounds = match snapshot_hash {
+        None => Either::Left(ready(log_bounds(&state, &room_id).await)),
+        Some(_) => Either::Right(log_bounds(&state, &room_id)),
+    };
+    let Some(reservation) = reserve_frame(&state, (room_id.clone(), uploader)) else {
+        return no_budget(correlation_id, room_id.clone());
+    };
     let result = state
         .snapshot_relay
         .get_chunk(
@@ -102,11 +113,11 @@ pub async fn request_chunk(
             chunk_index,
             chunk_size,
             snapshot_hash,
-            log_bounds(&state, &room_id),
+            bounds,
         )
         .await;
     match result {
-        Ok(chunk_msg) => budgeted_or_unavailable(&state, correlation_id, room_id, &chunk_msg),
+        Ok(chunk_msg) => budgeted_response(reservation, &chunk_msg),
         Err(err) => binary_error(Some(correlation_id), Some(room_id), err),
     }
 }
@@ -179,8 +190,8 @@ async fn run_to_completion<T: Send + 'static>(
         .map_err(|e| ServerError::Internal(format!("Snapshot relay task failed: {e}")))?
 }
 
-/// Retained log range of the room and the snapshot it found below a gap, asked to its actor
-/// when the relay awaits it. A room that does not exist is `RoomNotFound`.
+/// Retained log range of the room and the highest cursor from which it found a gap, asked to
+/// its actor when the future is awaited. A room that does not exist is `RoomNotFound`.
 async fn log_bounds(state: &AppState, room_id: &RoomId) -> Result<LogBounds, ServerError> {
     state.room_manager.log_bounds(room_id).await
 }

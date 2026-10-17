@@ -691,10 +691,11 @@ async fn spawned_actor_reports_a_panic() {
             dir.path().join("snapshots"),
             Duration::from_secs(60),
             config.max_snapshot_bytes,
+            Duration::from_secs(config.snapshot_upload_max_secs),
         )
         .unwrap(),
     );
-    let (sender, handle) = RoomActor::spawn(
+    let (sender, actor) = RoomActor::open(
         room_id.clone(),
         1,
         SchemaId::new("first").unwrap(),
@@ -703,8 +704,11 @@ async fn spawned_actor_reports_a_panic() {
         config,
         RoomLifecyclePolicy::default(),
         relay,
+        Arc::new(InflightBudget::new(u64::MAX, u64::MAX)),
+        ActorTimings::default(),
     )
     .unwrap();
+    let handle = tokio::spawn(actor.run());
 
     fail_point::arm("room_command_panic", &room_dir(&dir, &room_id));
     let (tx, rx) = oneshot::channel();

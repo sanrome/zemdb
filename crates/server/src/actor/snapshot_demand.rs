@@ -25,8 +25,8 @@ pub(crate) fn persistence_granularity(ttl: Duration) -> Duration {
 /// new request renews it; without renewals it expires after `ttl`. While it is on, exactly one
 /// `Connected` client at a time is designated to upload. A designee that has not started an
 /// upload within `designation_timeout`, or that stops being `Connected`, is replaced and
-/// excluded for the rest of the demand episode. Designations never change while an upload is
-/// in progress.
+/// excluded for the rest of the demand episode. Designations never change while the designee
+/// or the snapshot worker is uploading.
 #[derive(Debug)]
 pub(crate) struct SnapshotDemand {
     ttl: Duration,
@@ -127,19 +127,19 @@ impl SnapshotDemand {
     /// Keeps a client designated while the demand is on, replacing a designee that timed out
     /// or is no longer connected. `is_connected` tells whether a client is still `Connected`;
     /// `pick` chooses among the `Connected` clients outside the given exclusion set. Nothing
-    /// changes while `upload_in_progress`.
+    /// changes while `designee_uploading` (the designee or the snapshot worker is uploading).
     ///
     /// Returns the client designated by this call, if any; a designee that keeps its role is
     /// not returned again.
     pub(crate) fn designate(
         &mut self,
         now: Instant,
-        upload_in_progress: bool,
+        designee_uploading: bool,
         is_connected: impl Fn(&ClientId) -> bool,
         pick: impl Fn(&HashSet<ClientId>) -> Option<ClientId>,
     ) -> Option<ClientId> {
         let demand = self.active.as_mut()?;
-        if upload_in_progress {
+        if designee_uploading {
             return None;
         }
 

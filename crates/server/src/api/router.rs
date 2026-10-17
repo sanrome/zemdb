@@ -6,7 +6,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::watch;
 use zemdb_core::protocol::codec::MAX_FRAME_SIZE;
 
 use crate::actor::manager::RoomManager;
@@ -17,6 +17,7 @@ use crate::api::{control_plane, data_plane, relay, sse};
 use crate::config::ServerConfig;
 use crate::error::ServerError;
 use crate::relay::SnapshotRelay;
+use crate::response_budget::Reservation;
 use crate::schema_registry::SchemaRegistry;
 
 /// Server-wide shutdown notification shared by every handler.
@@ -62,8 +63,6 @@ pub struct AppState {
     pub room_manager: Arc<RoomManager>,
     pub snapshot_relay: Arc<SnapshotRelay>,
     pub shutdown: ShutdownSignal,
-    /// Bytes of large responses that may be in flight (`max_inflight_response_bytes`).
-    pub(crate) response_budget: Arc<Semaphore>,
     pub(crate) sse_streams: Arc<SseStreams>,
 }
 
@@ -74,11 +73,7 @@ impl AppState {
         room_manager: Arc<RoomManager>,
         snapshot_relay: Arc<SnapshotRelay>,
     ) -> Self {
-        let budget = usize::try_from(config.max_inflight_response_bytes)
-            .unwrap_or(usize::MAX)
-            .min(Semaphore::MAX_PERMITS);
         Self {
-            response_budget: Arc::new(Semaphore::new(budget)),
             sse_streams: Arc::new(SseStreams::new(config.sse_stream_limit())),
             config,
             schema_registry,
@@ -89,18 +84,18 @@ impl AppState {
     }
 }
 
-/// Part of the budget of response bytes in flight, held by a response until hyper drops its
-/// body. The handler puts it in the response's extensions, and
-/// [`serve_until_shutdown`](crate::api::serve_until_shutdown) moves it into the body.
+/// The reservation of a response, held until hyper drops its body. The handler puts it in the
+/// response's extensions, and [`serve_until_shutdown`](crate::api::serve_until_shutdown) moves
+/// it into the body.
 #[derive(Clone)]
 pub(crate) struct ResponseBudget {
-    _permit: Arc<OwnedSemaphorePermit>,
+    _reservation: Arc<Reservation>,
 }
 
 impl ResponseBudget {
-    pub(crate) fn new(permit: OwnedSemaphorePermit) -> Self {
+    pub(crate) fn new(reservation: Reservation) -> Self {
         Self {
-            _permit: Arc::new(permit),
+            _reservation: Arc::new(reservation),
         }
     }
 }

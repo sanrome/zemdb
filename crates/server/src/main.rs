@@ -21,6 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.data_dir.join("snapshots"),
         Duration::from_secs(config.snapshot_ttl_secs),
         config.max_snapshot_bytes,
+        Duration::from_secs(config.snapshot_upload_max_secs),
     )?);
     snapshot_relay.spawn_expiry_sweeper();
     let room_manager = Arc::new(RoomManager::new(

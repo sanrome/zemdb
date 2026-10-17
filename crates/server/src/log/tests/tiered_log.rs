@@ -35,15 +35,13 @@ fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).unwrap().len()
 }
 
-/// Bytes of the segments and `active.wal` in `segments` (not the mutation ID sidecars, which the
-/// quota does not count), read through each file: on Windows a listing can report a stale size
-/// for the open `active.wal`.
+/// Bytes of the files in `segments` (segments, their mutation ID sidecars and `active.wal`),
+/// read through each file: on Windows a listing can report a stale size for the open
+/// `active.wal`.
 fn bytes_on_disk(segments: &Path) -> u64 {
     std::fs::read_dir(segments)
         .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.extension().is_none_or(|ext| ext != "ids"))
-        .map(|path| file_len(&path))
+        .map(|entry| file_len(&entry.unwrap().path()))
         .sum()
 }
 
@@ -650,20 +648,20 @@ fn cold_segment_is_pruned_once_its_ttl_has_passed() {
         .run_maintenance_sync_at(MaintenanceClock::after(compressed_at))
         .unwrap();
     assert_eq!(report.warm_compressed_count, 1);
-    assert_eq!(report.cold_pruned_count, 0);
+    assert_eq!(report.pruned_count, 0);
 
     let just_before = compressed_at + Duration::from_secs(3599);
     let report = log
         .run_maintenance_sync_at(MaintenanceClock::after(just_before))
         .unwrap();
-    assert_eq!(report.cold_pruned_count, 0);
+    assert_eq!(report.pruned_count, 0);
     assert_eq!(log.tail_seq().get(), 1);
 
     let past_ttl = compressed_at + Duration::from_secs(3601);
     let report = log
         .run_maintenance_sync_at(MaintenanceClock::after(past_ttl))
         .unwrap();
-    assert_eq!(report.cold_pruned_count, 1);
+    assert_eq!(report.pruned_count, 1);
     assert_eq!(log.tail_seq().get(), 6);
     assert!(matches!(
         log.fetch_deltas(SequenceNumber::new(2), 10),
@@ -699,15 +697,42 @@ fn quota_prunes_the_oldest_cold_segments_until_the_log_fits() {
     append_range(&mut log, 1, 15);
     log.run_maintenance_sync().unwrap();
     let total = log.disk_bytes();
-    let oldest_cold = log.segments.iter().next().unwrap().bytes;
+    let oldest_cold = log.segments.iter().next().unwrap().disk_bytes();
 
     // One byte under the current size: dropping the oldest cold segment is enough.
     log.policy.max_room_disk_bytes = total - 1;
     let report = log.run_maintenance_sync().unwrap();
 
-    assert_eq!(report.cold_pruned_count, 1);
+    assert_eq!(report.pruned_count, 1);
     assert_eq!(log.tail_seq().get(), 6);
     assert_eq!(log.disk_bytes(), total - oldest_cold);
+}
+
+#[test]
+fn quota_bounds_the_disk_of_a_sustained_writer() {
+    // Warm segments not due for compression yet, and due at once; either way more of them per
+    // pass than a pass compresses. Over the quota, a pass compresses as many as it can.
+    for warm_disk_ttl in [RoomLifecyclePolicy::default().warm_disk_ttl, Duration::ZERO] {
+        let dir = tempdir().unwrap();
+        let policy = RoomLifecyclePolicy {
+            warm_disk_ttl,
+            ..compress_at_once_policy()
+        };
+        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+        append_range(&mut log, 1, 5);
+        let quota = 3 * log.disk_bytes();
+        log.policy.max_room_disk_bytes = quota;
+        for round in 0..5 {
+            append_range(&mut log, round * 30 + 6, round * 30 + 35);
+            let report = log.run_maintenance_sync().unwrap();
+            assert_eq!(report.warm_compressed_count, MAX_COMPRESSIONS_PER_PASS);
+            let on_disk = bytes_on_disk(&segments_dir(dir.path()));
+            assert!(
+                on_disk <= quota + log.warm_disk.active_len(),
+                "warm TTL {warm_disk_ttl:?}, round {round}: {on_disk} bytes over a quota of {quota}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -804,7 +829,7 @@ fn warm_copy_that_could_not_be_removed_is_removed_later() {
 }
 
 #[test]
-fn quota_pruning_stops_at_the_first_segment_it_keeps() {
+fn quota_prunes_a_prefix_even_with_a_warm_segment_that_cannot_be_compressed() {
     let dir = tempdir().unwrap();
     let (mut log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
     append_range(&mut log, 1, 12);
@@ -813,11 +838,13 @@ fn quota_pruning_stops_at_the_first_segment_it_keeps() {
     // Segment 1..=5 cannot be compressed, so it stays warm in front of the cold 6..=10.
     std::fs::write(segment_file(&segments, 1, 5, "wal"), b"damaged").unwrap();
     let _ = log.run_maintenance_sync();
-    log.policy.max_room_disk_bytes = 1;
+    log.policy.max_room_disk_bytes = log.disk_bytes() - 1;
     let _ = log.run_maintenance_sync();
 
+    // Pruning the warm segment is enough; the cold one behind it stays.
+    assert!(!segment_file(&segments, 1, 5, "wal").exists());
     assert!(segment_file(&segments, 6, 10, "wal.zst").exists());
-    assert_eq!(log.tail_seq().get(), 1);
+    assert_eq!(log.tail_seq().get(), 6);
 }
 
 #[test]
@@ -979,6 +1006,20 @@ fn segment_shorter_than_its_name_leaves_ram_empty_and_commits_continue() {
         log.fetch_deltas(SequenceNumber::new(8), 100),
         Err(ServerError::BehindCompaction)
     ));
+
+    // A name that claims an absurd range: the size of its sidecar, counted from the range,
+    // saturates instead of overflowing. The segment cannot be compressed, and the quota prunes it.
+    let dir = tempdir().unwrap();
+    drop(TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap());
+    shorten_warm_segment(dir.path(), 1, u64::MAX / 2, 2);
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
+    log.append(large_op(u64::MAX / 2 + 1, 1), None).unwrap();
+    let maintenance = log.run_maintenance_sync();
+    assert!(
+        matches!(maintenance, Err(ServerError::WalCorruption(_))),
+        "{maintenance:?}"
+    );
+    assert_eq!(log.tail_seq().get(), u64::MAX / 2 + 1);
 }
 
 #[test]
@@ -1070,6 +1111,43 @@ fn large_op(seq: u64, bytes: usize) -> SequencedOperation {
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
 
+/// Values of [`null_row_op`]: its key and a row of 4,096 columns.
+const NULL_ROW_VALUES: usize = 1 + 4_096;
+
+/// An operation whose row is all `Null` but its key: 1 byte per value on the wire, 24 in
+/// memory.
+fn null_row_op(seq: u64) -> SequencedOperation {
+    let mut values = vec![Value::Null; NULL_ROW_VALUES - 1];
+    values[0] = Value::Int(seq as i64);
+    let pk = PrimaryKey::single(Value::Int(seq as i64));
+    let row = zemdb_core::value::CompactRow::new(values);
+    SequencedOperation::new(SequenceNumber::new(seq), Operation::insert(1, pk, row, seq))
+}
+
+/// 300 operations of [`null_row_op`]: they take 1.2 MiB on the wire, and over a million values.
+fn null_rows_log(dir: &Path, ram_max_bytes: u64) -> TieredLog {
+    let policy = RoomLifecyclePolicy {
+        ram_max_bytes,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir, policy).unwrap();
+    for seq in 1..=300 {
+        log.append(null_row_op(seq), None).unwrap();
+    }
+    log
+}
+
+/// Asserts that `ops`, of [`null_row_op`], hold at most `MAX_MESSAGE_VALUES` values and are
+/// not the whole log.
+fn assert_within_the_values_of_a_message((ops, has_more): (Vec<SequencedOperation>, bool)) {
+    let values = (ops.len() * NULL_ROW_VALUES) as u64;
+    assert!(
+        values <= zemdb_core::protocol::limits::MAX_MESSAGE_VALUES,
+        "{values} values"
+    );
+    assert!(has_more);
+}
+
 fn count_in(log: &TieredLog, tier: Tier) -> usize {
     log.segments.iter().filter(|s| s.tier == tier).count()
 }
@@ -1095,6 +1173,11 @@ fn hot_buffer_evicts_by_bytes_below_its_operation_limit() {
     let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
     assert_contiguous(&ops, 1, 10);
     assert!(!has_more);
+
+    // Rows of `Null`s count what their values take in memory.
+    let dir = tempdir().unwrap();
+    let log = null_rows_log(dir.path(), MIB as u64);
+    assert!(log.hot_buffer.len() * NULL_ROW_VALUES * 24 <= MIB);
 }
 
 #[test]
@@ -1159,6 +1242,13 @@ fn fetch_returns_what_fits_in_a_response_from_ram() {
 
     assert_contiguous(&ops, 1, 2);
     assert!(has_more);
+
+    // However little its values take on the wire, a response does not materialize more than
+    // a client message could.
+    let dir = tempdir().unwrap();
+    let log = null_rows_log(dir.path(), MAX_LOG_BYTES_LIMIT);
+    assert_eq!(log.hot_buffer.len(), 300);
+    assert_within_the_values_of_a_message(log.fetch_deltas(SequenceNumber::new(0), 1000).unwrap());
 }
 
 #[test]
@@ -1171,6 +1261,11 @@ fn fetch_returns_what_fits_in_a_response_from_disk() {
 
     assert_contiguous(&ops, 3, 4);
     assert!(has_more);
+
+    let dir = tempdir().unwrap();
+    let log = null_rows_log(dir.path(), MIN_LOG_BYTES_LIMIT);
+    assert!(log.hot_buffer.len() < 300);
+    assert_within_the_values_of_a_message(log.fetch_deltas(SequenceNumber::new(0), 1000).unwrap());
 }
 
 #[test]
@@ -1667,7 +1762,7 @@ async fn test_tiered_log_disk_quota_saturation_pruning() {
     let report = log.run_maintenance().await.unwrap();
     assert_eq!(report.warm_compressed_count, 2);
     assert!(
-        report.cold_pruned_count >= 1,
+        report.pruned_count >= 1,
         "Quota saturation must prune at least one cold segment"
     );
 
@@ -2253,4 +2348,30 @@ fn every_byte_flip_of_active_wal_is_corruption_or_a_torn_tail() {
 #[ignore = "long-running test; run with --ignored in release"]
 fn every_bit_and_byte_flip_of_active_wal_is_corruption_or_a_torn_tail() {
     check_byte_flips_of_active_wal(|_| vec![0x01, 0x80, 0xFF]);
+}
+
+/// Measurement (release, with `--ignored`): a read near the head costs the same whatever the
+/// number of sealed segments before it.
+#[test]
+#[ignore]
+fn fetch_cost_does_not_grow_with_the_number_of_segments() {
+    let cost = |segments: u64| {
+        let dir = tempdir().unwrap();
+        let segs = segments_dir(dir.path());
+        std::fs::create_dir_all(&segs).unwrap();
+        for start in (1..=segments * 2).step_by(2) {
+            let (bytes, _) = frames(start..=start + 1);
+            std::fs::write(segment_file(&segs, start, start + 1, "wal"), bytes).unwrap();
+        }
+        let (log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
+        let cursor = SequenceNumber::new(segments * 2 - 1);
+        let started = std::time::Instant::now();
+        for _ in 0..1_000 {
+            log.fetch_deltas(cursor, 10).unwrap();
+        }
+        started.elapsed()
+    };
+    let (few, many) = (cost(100), cost(50_000));
+    println!("1,000 reads near the head: {few:?} with 100 segments, {many:?} with 50,000");
+    assert!(many < 3 * few, "{many:?} against {few:?}");
 }

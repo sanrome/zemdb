@@ -60,6 +60,7 @@ pub(super) fn test_manager(
             dir.join("snapshots"),
             Duration::from_secs(60),
             ServerConfig::default().max_snapshot_bytes,
+            Duration::from_secs(ServerConfig::default().snapshot_upload_max_secs),
         )
         .unwrap(),
     );

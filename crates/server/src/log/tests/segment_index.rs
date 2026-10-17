@@ -28,7 +28,8 @@ fn scan_indexes_both_tiers_in_sequence_order_and_ignores_other_files() {
         segments,
         vec![(1, 5, Tier::Cold, 10), (6, 10, Tier::Warm, 20)]
     );
-    assert_eq!(index.total_bytes(), 30);
+    // Each segment of 5 operations counts a sidecar of 20 + 5 * 24 bytes.
+    assert_eq!(index.total_bytes(), 30 + 2 * 140);
     assert_eq!(index.first_start(), Some(seq(1)));
     assert_eq!(index.last_end(), Some(seq(10)));
 }
@@ -59,11 +60,12 @@ fn total_bytes_follow_inserts_replacements_and_removals() {
         since: SystemTime::UNIX_EPOCH,
     };
 
+    // With the sidecar of 5 operations: 20 + 5 * 24 bytes.
     index.insert(entry(Tier::Warm, 100));
-    assert_eq!(index.total_bytes(), 100);
+    assert_eq!(index.total_bytes(), 100 + 140);
     // Compression replaces the warm entry with its smaller cold copy.
     index.insert(entry(Tier::Cold, 30));
-    assert_eq!(index.total_bytes(), 30);
+    assert_eq!(index.total_bytes(), 30 + 140);
     assert_eq!(index.remove(seq(1)).map(|e| e.tier), Some(Tier::Cold));
     assert_eq!(index.total_bytes(), 0);
     assert!(index.remove(seq(1)).is_none());

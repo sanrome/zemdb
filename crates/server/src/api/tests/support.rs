@@ -33,6 +33,7 @@ impl TestState {
                 dir.join("snapshots"),
                 Duration::from_secs(60),
                 config.max_snapshot_bytes,
+                Duration::from_secs(config.snapshot_upload_max_secs),
             )
             .unwrap(),
         );

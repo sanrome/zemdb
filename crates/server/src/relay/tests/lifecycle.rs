@@ -9,10 +9,11 @@ async fn idle_upload_expires_and_its_file_is_deleted() {
     let snap = three_part_snapshot(1);
     upload_parts(&relay, 10, [0], &snap, (0, 10)).await;
 
-    // Idle time counts from the last chunk, not from the start.
+    // Idle time counts from the last new chunk: not from the start, nor from a chunk resent.
     tokio::time::advance(UPLOAD_IDLE_TIMEOUT - Duration::from_secs(1)).await;
     upload_parts(&relay, 10, [1], &snap, (0, 10)).await;
     tokio::time::advance(UPLOAD_IDLE_TIMEOUT - Duration::from_secs(1)).await;
+    upload_parts(&relay, 10, [1], &snap, (0, 10)).await;
     relay.cleanup_expired().await;
     assert_eq!(files_in(&uploads_dir(&dir)), vec!["relay-room_10.part"]);
 
@@ -21,11 +22,38 @@ async fn idle_upload_expires_and_its_file_is_deleted() {
     assert!(files_in(&uploads_dir(&dir)).is_empty());
     assert!(relay.slots.is_empty(), "idle room locks are forgotten");
 
-    // The upload is gone: the last chunk starts a new upload that cannot complete alone.
-    assert!(!relay
-        .stage_chunk(part_of(10, 2, &snap), bounds(0, 10))
+    // The upload is gone, and its sequence is free for the other members.
+    relay
+        .stage_snapshot(
+            &room(),
+            &member("other"),
+            seq(10),
+            Bytes::from(envelope(100, 2)),
+            bounds(0, 10),
+        )
         .await
-        .unwrap());
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn upload_that_keeps_progressing_or_restarts_expires_at_its_deadline() {
+    let dir = tempdir().unwrap();
+    let max = Duration::from_secs(300);
+    let relay = SnapshotRelay::new(snapshots_dir(&dir), TTL, MAX_BYTES, max).unwrap();
+    let snap = three_part_snapshot(1);
+    upload_parts(&relay, 10, [0], &snap, (0, 10)).await;
+    let step = UPLOAD_IDLE_TIMEOUT - Duration::from_secs(1);
+    tokio::time::advance(step).await;
+    upload_parts(&relay, 10, [1], &snap, (0, 10)).await;
+    // The uploader restarts its upload with another snapshot: the deadline stays.
+    tokio::time::advance(step).await;
+    upload_parts(&relay, 10, [0], &three_part_snapshot(2), (0, 10)).await;
+    assert_eq!(relay.upload_in_progress(&room()), Some(seq(10)));
+
+    tokio::time::advance(max - 2 * step).await;
+    assert_eq!(relay.upload_in_progress(&room()), None);
+    relay.cleanup_expired().await;
+    assert!(files_in(&uploads_dir(&dir)).is_empty());
 }
 
 #[tokio::test(start_paused = true)]

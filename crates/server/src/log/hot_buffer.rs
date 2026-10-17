@@ -10,11 +10,11 @@ use zemdb_core::protocol::messages::SequencedOperation;
 #[derive(Debug, Default)]
 pub struct HotBuffer {
     entries: VecDeque<Entry>,
-    /// Encoded size of the operations in `entries`.
+    /// What the operations in `entries` are charged ([`op_bytes`]).
     bytes: u64,
 }
 
-/// An operation in the buffer, with when it arrived and its encoded size.
+/// An operation in the buffer, with when it arrived and what it is charged.
 #[derive(Debug)]
 struct Entry {
     op: SequencedOperation,
@@ -147,7 +147,7 @@ impl HotBuffer {
         self.entries.len()
     }
 
-    /// Encoded size of the operations currently resident in the buffer.
+    /// What the operations currently resident in the buffer are charged.
     #[cfg(test)]
     pub fn bytes(&self) -> u64 {
         self.bytes

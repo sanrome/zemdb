@@ -2,10 +2,9 @@ use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use http_body::Body as _;
-use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::error;
-use zemdb_core::id::{CorrelationId, RoomId};
+use zemdb_core::id::{ClientId, CorrelationId, RoomId};
 use zemdb_core::protocol::codec::encode_message;
 use zemdb_core::protocol::messages::{ClientMessage, ErrorCode, ServerMessage};
 
@@ -16,6 +15,8 @@ use crate::api::extract::{
 };
 use crate::api::router::{AppState, ResponseBudget};
 use crate::error::ServerError;
+use crate::relay::Uploader;
+use crate::response_budget::{no_room, BudgetHolder, Reservation};
 
 /// Encodes `msg` as a binary frame response. A message that cannot be encoded (a bug: every
 /// response is sized to fit a frame) is logged and answered with a small `Internal` error
@@ -45,32 +46,31 @@ pub(crate) fn binary_response(status: StatusCode, msg: &ServerMessage) -> Respon
         .into_response()
 }
 
-/// 200 with `msg`, if the budget of response bytes in flight has room for its encoding. The
-/// response holds that part of the budget until its body is dropped.
-fn budgeted_response(state: &AppState, msg: &ServerMessage) -> Option<Response> {
-    let mut response = binary_response(StatusCode::OK, msg);
-    let len = u32::try_from(response.body().size_hint().exact()?).ok()?;
-    let permit = Arc::clone(&state.response_budget)
-        .try_acquire_many_owned(len)
-        .ok()?;
-    response
-        .extensions_mut()
-        .insert(ResponseBudget::new(permit));
-    Some(response)
+/// Reserves a frame of `holder`'s part of the budget of response bytes in flight, before the
+/// response is materialized and encoded (see
+/// [`InflightBudget::reserve_frame`](crate::response_budget::InflightBudget::reserve_frame)).
+pub(crate) fn reserve_frame(state: &AppState, holder: BudgetHolder) -> Option<Reservation> {
+    state.room_manager.response_budget().reserve_frame(holder)
 }
 
-/// 200 with `msg` within the budget of response bytes in flight, or `Unavailable` (503, to be
-/// retried) without room for it.
-pub(crate) fn budgeted_or_unavailable(
-    state: &AppState,
-    correlation_id: CorrelationId,
-    room_id: RoomId,
-    msg: &ServerMessage,
-) -> Response {
-    budgeted_response(state, msg).unwrap_or_else(|| {
-        let err = ServerError::Unavailable("Too many response bytes in flight".to_string());
-        binary_error(Some(correlation_id), Some(room_id), err)
-    })
+/// The budget holder of a room's client.
+fn client_holder(room_id: &RoomId, client_id: &ClientId) -> BudgetHolder {
+    (room_id.clone(), Uploader::Client(client_id.clone()))
+}
+
+/// 200 with `msg`, holding as much of `reservation` as its encoding takes.
+pub(crate) fn budgeted_response(mut reservation: Reservation, msg: &ServerMessage) -> Response {
+    let mut response = binary_response(StatusCode::OK, msg);
+    reservation.shrink_to(response.body().size_hint().exact().unwrap_or(u64::MAX));
+    response
+        .extensions_mut()
+        .insert(ResponseBudget::new(reservation));
+    response
+}
+
+/// `Unavailable` (503, to be retried): the budget of response bytes in flight has no room.
+pub(crate) fn no_budget(correlation_id: CorrelationId, room_id: RoomId) -> Response {
+    binary_error(Some(correlation_id), Some(room_id), no_room())
 }
 
 /// The `ServerMessage::Error` frame reporting `err`.
@@ -118,6 +118,23 @@ async fn ask_room<R>(
     state.room_manager.ask(room_id, command).await?
 }
 
+/// 200 with the frame `ok` builds from the room's reply within `holder`'s budget, or the error
+/// frame of the request.
+fn respond_budgeted<R>(
+    state: &AppState,
+    holder: BudgetHolder,
+    correlation_id: CorrelationId,
+    result: Result<R, ServerError>,
+    ok: impl FnOnce(RoomId, R) -> ServerMessage,
+) -> Response {
+    let room_id = holder.0.clone();
+    match (result, reserve_frame(state, holder)) {
+        (Ok(value), Some(reservation)) => budgeted_response(reservation, &ok(room_id, value)),
+        (Ok(_), None) => no_budget(correlation_id, room_id),
+        (Err(err), _) => binary_error(Some(correlation_id), Some(room_id), err),
+    }
+}
+
 /// 200 with the frame `ok` builds from the room's reply, or the error frame of the request.
 fn respond<R>(
     correlation_id: CorrelationId,
@@ -160,6 +177,7 @@ pub async fn register(
         return fail(room_id, err);
     }
 
+    let holder = client_holder(&room_id, &client_id);
     let result = ask_room(&state, &room_id, |reply| RoomCommand::RegisterClient {
         client_id,
         current_seq,
@@ -167,8 +185,12 @@ pub async fn register(
         reply,
     })
     .await;
-    respond(correlation_id, room_id, result, |room_id, reg_resp| {
-        ServerMessage::Registered {
+    respond_budgeted(
+        &state,
+        holder,
+        correlation_id,
+        result,
+        |room_id, reg_resp| ServerMessage::Registered {
             correlation_id,
             room_id,
             head_seq: reg_resp.head_seq,
@@ -177,8 +199,8 @@ pub async fn register(
             schema: (*reg_resp.schema).clone(),
             active_snapshot_seq: reg_resp.active_snapshot_seq,
             room_incarnation: reg_resp.room_incarnation,
-        }
-    })
+        },
+    )
 }
 
 /// `POST /rooms/:room_id/commit`: sequences one mutation and returns its sequence with the
@@ -216,20 +238,22 @@ pub async fn commit(
         Ok(commit_resp) => commit_resp,
         Err(err) => return binary_error(Some(correlation_id), Some(room_id), err),
     };
-    let ack = |catchup_ops, has_more| ServerMessage::CommitAck {
+    let ack = ServerMessage::CommitAck {
         correlation_id,
-        room_id: room_id.clone(),
+        room_id,
         mutation_id,
         assigned_seq: commit_resp.assigned_seq,
-        catchup_ops,
-        has_more,
+        catchup_ops: commit_resp.catchup_ops,
+        has_more: commit_resp.has_more,
         snapshot_wanted: commit_resp.snapshot_wanted,
         schema_version: commit_resp.schema_version,
     };
     // The commit is durable, so it is never answered with an error: without room in the
-    // budget, it is acknowledged without its catch-up, which sends the client to `/sync`.
-    budgeted_response(&state, &ack(commit_resp.catchup_ops, commit_resp.has_more))
-        .unwrap_or_else(|| binary_response(StatusCode::OK, &ack(Vec::new(), true)))
+    // budget, the room acknowledged it without its catch-up, which sends the client to `/sync`.
+    match commit_resp.reservation {
+        Some(reservation) => budgeted_response(reservation, &ack),
+        None => binary_response(StatusCode::OK, &ack),
+    }
 }
 
 /// `POST /rooms/:room_id/sync`: the next batch of operations after the client's cursor.
@@ -271,7 +295,7 @@ pub async fn sync(
                 snapshot_wanted: sync_resp.snapshot_wanted,
                 schema_version: sync_resp.schema_version,
             };
-            budgeted_or_unavailable(&state, correlation_id, room_id, &batch)
+            budgeted_response(sync_resp.reservation, &batch)
         }
         Err(err) => binary_error(Some(correlation_id), Some(room_id), err),
     }
@@ -368,10 +392,12 @@ pub async fn get_schema(
         return binary_error(Some(correlation_id), Some(room_id), err);
     }
 
+    let holder = client_holder(&room_id, &auth.client_id);
     let result = ask_room(&state, &room_id, |reply| RoomCommand::GetSchema { reply }).await;
-    respond(
+    respond_budgeted(
+        &state,
+        holder,
         correlation_id,
-        room_id,
         result,
         |room_id, (schema_id, schema)| ServerMessage::Schema {
             correlation_id,

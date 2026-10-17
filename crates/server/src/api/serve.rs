@@ -224,7 +224,9 @@ fn connection_builder(limits: &ConnectionLimits) -> auto::Builder<TokioExecutor>
     builder
         .http2()
         .timer(TokioTimer::new())
-        .max_concurrent_streams(MAX_CONCURRENT_STREAMS);
+        .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
+        // What h2 buffers per stream beyond the client's window: one response frame.
+        .max_send_buf_size(MAX_RESPONSE_FRAME);
     builder
 }
 

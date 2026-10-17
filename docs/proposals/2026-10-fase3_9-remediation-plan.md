@@ -90,9 +90,9 @@ Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las de
 | **D70** | **La encarnación se chequea solo en el registro (2a).** Regla del SDK, documentada en ARCHITECTURE §6 y en INV-Y7: después de registrarse sin cursor, el cliente arranca de 0 o de un snapshot; nunca reusa un cursor guardado. El SDK guarda cursor y encarnación juntos. | 0 | Adoptada |
 | **D71** | **"Mismo estado" es igualdad módulo `Null` al final de las filas (3a).** Un `Update` sigue ensanchando la fila hasta el ancho del esquema con que se aplica; `compact_into_row` ya completa con `Null`. Se corrige el enunciado de INV-Y8. | 0 | Adoptada |
 | **D72** | **Un stream SSE vive más allá del vencimiento de su token: riesgo aceptado (4a).** SSE solo notifica, y cualquier dato se pide con un token vigente. Se documenta en `INVARIANTES.md` §4. | 0 | Adoptada |
-| **D73** | **La memoria de las respuestas se cobra por lo que ocupan, no por su tamaño de wire (5a).** (a) `ReadBudget` y la HotBuffer cobran `max(encoded_len, 24 × valores)` por operación: con tablas anchas se pagina más (`has_more`), lo que el contrato ya permite. Una operación sola sigue entrando siempre: tiene como mucho `MAX_COLUMNS` × 2 valores, unos 3 MiB. (b) El presupuesto de bytes en vuelo se pide **antes** de materializar y codificar, con una estimación del tamaño a partir del presupuesto de lectura. (c) Las respuestas `Schema` y `Registered` también toman presupuesto. Su tamaño depende del esquema, y con el tope por cliente (D75) dejan de poder acumularse. Sin presupuesto disponible responden `Unavailable` (503), que el cliente ya tiene que tolerar en cualquier request. Esto reemplaza la idea de "codificar el esquema una vez": cada respuesta lleva campos propios del request (`correlation_id`) y el frame no se puede compartir sin codificar a mano. (d) `max_send_buf_size` de hyper para HTTP/2 se fija en el tamaño de frame del cuerpo (64 KiB), para que se cumpla lo que dice §7.3 sobre los buffers por stream (hoy es de 400 KiB). (e) Los chunks del relay se leen después de tomar el presupuesto. | 4 | Adoptada |
+| **D73** | **La memoria de las respuestas se cobra por lo que ocupan, no por su tamaño de wire (5a).** (a) `ReadBudget` y la HotBuffer cobran `max(encoded_len, 24 × valores)` por operación: con tablas anchas se pagina más (`has_more`), lo que el contrato ya permite. Una operación sola sigue entrando siempre: tiene como mucho `MAX_COLUMNS` × 2 valores, unos 3 MiB. (b) El presupuesto de bytes en vuelo se pide **antes** de materializar y codificar, con una estimación del tamaño a partir del presupuesto de lectura. (c) Las respuestas `Schema` y `Registered` también toman presupuesto. Su tamaño depende del esquema, y con el tope por cliente (D75) dejan de poder acumularse. Sin presupuesto disponible responden `Unavailable` (503), que el cliente ya tiene que tolerar en cualquier request. Esto reemplaza la idea de "codificar el esquema una vez": cada respuesta lleva campos propios del request (`correlation_id`) y el frame no se puede compartir sin codificar a mano. (d) `max_send_buf_size` de hyper para HTTP/2 se fija en el tamaño de frame del cuerpo (64 KiB), para que se cumpla lo que dice §7.3 sobre los buffers por stream (hoy es de 400 KiB). (e) Los chunks del relay se leen después de tomar el presupuesto. Al implementarla se fijó: la estimación es un frame entero (`MAX_FRAME_SIZE`), que se achica a la codificación; sin reserva, el commit le pide al actor que no arme el catch-up. | 4 | Adoptada |
 | **D74** | **Una subida tiene que progresar, y tiene un tope total (6a).** (a) Solo un chunk que todavía no se había recibido renueva el plazo de inactividad de 2 minutos; reenviar uno ya recibido se responde igual que hoy, pero no renueva nada. (b) Tope total `snapshot_upload_max_secs` (`ZEMDB_SNAPSHOT_UPLOAD_MAX_SECS`, 7.200 s por defecto, de 60 s a 1 día): pasado ese tiempo desde el primer chunk, la subida se descarta como una inactiva. 512 MiB a 1 Mbit/s tardan ~72 min. | 4 | Adoptada |
-| **D75** | **El presupuesto de respuestas tiene un tope por cliente (7a).** `max_inflight_response_bytes_per_client` (`ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES_PER_CLIENT`, por defecto 2 × `MAX_FRAME_SIZE`, de `MAX_FRAME_SIZE` al global). Se cuenta por `(sala, client_id)` dentro del semáforo global. Superado el tope, `Unavailable`. Las respuestas al admin secret del relay cuentan como un cliente más. Un miembro que no lee sus respuestas ya no deja sin presupuesto a las demás salas. | 4 | Adoptada |
+| **D75** | **El presupuesto de respuestas tiene un tope por cliente (7a).** `max_inflight_response_bytes_per_client` (`ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES_PER_CLIENT`, por defecto 2 × `MAX_FRAME_SIZE`, de `MAX_FRAME_SIZE` al global). Se cuenta por `(sala, client_id)` dentro del semáforo global. Superado el tope, `Unavailable`. Las respuestas al admin secret del relay cuentan como un cliente más. Un miembro que no lee sus respuestas ya no deja sin presupuesto a las demás salas. Al implementarla se fijó: el cliente es el par `(sala, Uploader)`. | 4 | Adoptada |
 | **D76** | **Solo la subida del designado o del worker congela la designación (8a).** La subida de otro miembro sigue anclando la poda (D61), pero no impide reemplazar al designado al vencer su plazo de 60 s. | 4 | Adoptada |
 | **D77** | **`fsync` al abrir; el hueco de Linux queda como riesgo (9b).** Servidor: al abrir el log, `sync_all` de `active.wal` y `sync_dir` de `segments/`, del directorio de la sala y de `rooms/`, antes de servir o deduplicar. Storage: en `open_room`, `sync_all` del WAL activo (y de `.wal.compacting` si existe) y sync de `data_dir` y su padre. Riesgo aceptado en `INVARIANTES.md` §4: en Linux, después de un EIO, el kernel puede marcar las páginas como limpias sin haberlas escrito, y un `fsync` desde un descriptor nuevo devuelve éxito igual. La solución completa (reescribir `active.wal` cuando el actor anterior se detuvo por una escritura fallida) queda anotada para el futuro. | 2 | Adoptada |
 | **D78** | **El último frame dañado de `active.wal` es una excepción de INV-D2 (10a).** Un daño en el último frame sin ningún frame válido después no se distingue de una escritura rota: se trunca y su secuencia puede reutilizarse. El piso de secuencia (D81) lo cubre cuando la secuencia aparece en otro archivo durable. Se documenta en INV-D2. | 0 | Adoptada |
@@ -118,11 +118,11 @@ Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las de
 | 1 | Arreglos chicos de alto valor | DEF-146, 147, 155 | Inmediata | ✅ 3/3 |
 | 2 | Abrir solo lo verificado y sincronizado | DEF-144, 145, 148, 158, 149 | Alta (requisito de Fase 4) | ✅ 5/5 |
 | 3 | Storage: cancelación y absorción | DEF-150, 151, 165 | Alta (requisito de Fase 4) | ✅ 3/3 |
-| 4 | Recursos | DEF-152, 159, 153, 163, 162, 164, 154, 157 | Media | ⬜ 0/8 |
-| 5 | Ciclo de vida | DEF-156, 160, 161 | Baja | ⬜ 0/3 |
+| 4 | Recursos | DEF-152, 159, 153, 163, 162, 164, 154, 157 | Media | ✅ 8/8 |
+| 5 | Ciclo de vida | DEF-156, 160, 161, 166 | Baja | ⬜ 0/4 |
 | 6 | Documentación | ARCHITECTURE, README, ROADMAP | Baja | ⬜ |
 
-**Avance total:** 11 de 22 ítems (Lotes 0 a 3 cerrados).
+**Avance total:** 19 de 23 ítems (Lotes 0 a 4 cerrados).
 
 **Ítems nuevos de este plan.** Surgen de las invariantes adoptadas (D79) y de hallazgos de la auditoría que no tenían ID:
 - **DEF-159** · Medio · P6: reparto del presupuesto de respuestas.
@@ -132,6 +132,7 @@ Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las de
 - **DEF-163** · Bajo · Designación congelada por una subida ajena.
 - **DEF-164** · Bajo · R5: la marca de hueco no cubre los snapshots por debajo del cursor que lo encontró (revisión de delta del Lote 1).
 - **DEF-165** · Medio · S1, S6 y L2: un `open_room` soltado borra tarde un `.wal.compacting` ajeno (revisión de delta del Lote 3).
+- **DEF-166** · Bajo · R7: la poda por TTL o cuota entre la lectura del rango y la instalación de una subida (revisión de delta del Lote 4).
 
 **Por qué este orden, en una línea por lote:**
 0. Sin las redes de prueba en el repo, cada lote se revisa a mano. Las redes viven en copias que se pueden perder.
@@ -484,7 +485,7 @@ Se fueron `append_synced`, `highest_seq_in_valid_frames`, la excepción de corru
 
 > Objetivo: que ningún cliente pueda retener memoria, disco ni la designación más allá de cotas configuradas.
 
-#### DEF-152 · Alto · ⬜ Pendiente
+#### DEF-152 · Alto · ✅ Hecho
 **Problema.** Una respuesta materializa hasta ~32 veces su tamaño de wire, la HotBuffer ocupa ~24 veces `ram_max_bytes`, y `Schema` y `Registered` no toman presupuesto.
 **Solución.** D73.
 **Test exigido.**
@@ -496,14 +497,55 @@ Se fueron `append_synced`, `highest_seq_in_valid_frames`, la excepción de corru
 - 64 respuestas `/schema` sin leer no superan el presupuesto: las de más reciben `Unavailable`.
 - El presupuesto se pide antes de codificar.
 
-#### DEF-159 · Medio · ⬜ Pendiente
+**Hecho.**
+- **Cobro por memoria:** `op_bytes` cobra `max(encoded_len, 24 × valores)`. Lo usan el presupuesto de lectura y la HotBuffer.
+- **Reserva previa:** `InflightBudget` (`src/response_budget.rs`, dueño el `RoomManager`) reserva un frame entero (`MAX_FRAME_SIZE`) antes de armar la respuesta, y `budgeted_response` la achica a lo que ocupa la codificación (`OwnedSemaphorePermit::split`).
+  - `/sync` y `/commit`: reserva el actor al atender el comando, justo antes de leer el log, y la `Reservation` viaja en `SyncBatchResponse` o `CommitResponse`. Sin lugar, el sync responde `Unavailable` sin mover el cursor, y el commit sale sin catch-up y con `has_more`.
+  - Chunks del relay: el handler reserva antes de leer el archivo. El chunk 0 primero pide el rango al actor, y recién después reserva.
+  - `Registered` y `Schema` reservan después de la respuesta del actor, antes de copiar y codificar el esquema; sin lugar, `Unavailable`.
+- **HTTP/2:** `max_send_buf_size` de un frame de respuesta (64 KiB).
+- **Tests:**
+  - `hot_buffer_evicts_by_bytes_below_its_operation_limit`, `fetch_returns_what_fits_in_a_response_from_ram` y `..._from_disk` (`log/tests/tiered_log.rs`), extendidos con filas de 4.096 `Null`. La HotBuffer no pasa `ram_max_bytes` contando 24 bytes por valor, y una lectura de 1.000 operaciones desde RAM o desde disco no materializa más de `MAX_MESSAGE_VALUES` valores.
+  - `responses_take_a_frame_of_the_clients_budget_before_they_are_built` (`api/tests/data_plane.rs`), con una parte por cliente de un frame más 1 MiB:
+    - las respuestas `/schema` sin leer entran mientras alcanza ese MiB;
+    - después, `/schema`, `/register`, `/sync` y el chunk 0 reciben `Unavailable`; el chunk sin snapshot no recibe 404, así que la reserva va antes de leer;
+    - un commit y su reintento se confirman sin catch-up;
+    - al soltarlas, `/schema` vuelve a responder.
+  - `a_request_waiting_for_its_room_holds_none_of_the_budget` (`api/tests/data_plane.rs`), de la revisión de delta. Con un frame por cliente y el actor de la sala detenido, un `/sync` y un chunk 0 esperan a la sala; mientras tanto, un chunk anclado del mismo cliente, que el relay responde sin la sala, recibe su frame (409, no 503).
+- **Mutaciones:** cada una hace fallar un test:
+  - cobrar solo el tamaño de wire;
+  - no achicar la reserva;
+  - reservar en el handler de `/sync`, antes de que el comando espere en el mailbox;
+  - reservar el chunk 0 antes de pedir el rango;
+  - `Schema` sin presupuesto;
+  - el catch-up del commit, o el de su reintento, sin reserva;
+  - el actor sin presupuesto;
+  - leer el chunk antes de reservar.
+- **Desvíos:**
+  - **Se reserva un frame entero, no una estimación más fina** (decisión del dueño al arrancar el lote). Con el default de 256 MiB pueden estar armándose 15 respuestas a la vez, y 2 por cliente con el tope de D75. Como el actor reserva al atender el pedido, un comando en cola no ocupa lugar.
+  - **`RoomActor::spawn` se fue:** no tenía uso fuera de un test, que ahora usa `open`.
+  - **El test de 64 `/schema`:** se reemplazó por el de la parte por cliente de un frame más 1 MiB, que llega al rechazo sin un esquema de 65.535 columnas.
+  - **Sin test de `max_send_buf_size`:** medirlo pide un cliente h2 a medida (la auditoría lo dejó indeterminado por lo mismo). Tampoco tiene test que `Schema` y `Registered` reserven antes de copiar el esquema: no se ve sin un asignador.
+
+#### DEF-159 · Medio · ✅ Hecho
 **Problema.** El presupuesto de bytes de respuesta en vuelo es un único semáforo global: un miembro de una sala que no lee sus respuestas deja con 503 los `/sync` de todas las demás (P6).
 **Solución.** D75.
 **Test exigido.**
 - Un cliente que retiene respuestas hasta su tope recibe `Unavailable`, mientras otro cliente de otra sala sigue recibiendo sus `/sync`.
 - Al soltar los cuerpos, el tope se libera.
 
-#### DEF-153 · Medio · ⬜ Pendiente
+**Hecho.** `InflightBudget` cuenta lo que retiene cada `(RoomId, Uploader)`, dentro del semáforo global: el admin secret del relay es `Uploader::Admin`, un cliente más. `max_inflight_response_bytes_per_client` (`ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES_PER_CLIENT`) vale por defecto 2 × `MAX_FRAME_SIZE`, de `MAX_FRAME_SIZE` al total.
+- **Tests:**
+  - `client_over_its_part_of_the_budget_leaves_the_rest_to_other_rooms` (`tests/http_edge_tests.rs`): con un total de 4 frames y uno por cliente, el que retiene un `SyncBatch` recibe 503 en su próximo `/sync`, mientras un cliente de otra sala recibe 200; al soltar el cuerpo, vuelve a recibir 200.
+  - `responses_take_a_frame_of_the_clients_budget_before_they_are_built` (DEF-152) llega al tope de la parte por cliente, con el total libre.
+  - Config: los tests de defaults, TOML, variables y rangos suman el setting.
+- **Mutación:** sin el chequeo de la parte por cliente fallan los dos tests.
+- **Ajustes:**
+  - `http2_client_that_stops_reading_is_disconnected` retiene 4 respuestas del mismo cliente, así que su config sube la parte por cliente al total.
+  - `responses_over_the_budget_in_flight_wait_for_held_bodies` la fija en un frame, porque no puede superar al total.
+  - `failed_commit_sync_stops_room_and_recovers_from_disk` y `rotation_failure_after_durable_commit_is_acknowledged_and_restarts_room` soltaban tarde dos `CommitResponse`, que llamando al actor directo conservan el frame entero.
+
+#### DEF-153 · Medio · ✅ Hecho
 **Problema.** Reenviar un chunk ya recibido renueva el plazo de una subida: la subida, la designación y el ancla quedan retenidas sin plazo (P12).
 **Solución.** D74.
 **Test exigido.**
@@ -512,32 +554,106 @@ Se fueron `append_synced`, `highest_seq_in_valid_frames`, la excepción de corru
 - Los dos casos con tiempo pausado.
 - Un miembro que reenvía un chunk retiene la secuencia también contra las subidas en un solo request de los demás (desde el Lote 1 siguen la misma regla): con D74, a los 2 minutos la secuencia queda libre.
 
-#### DEF-163 · Bajo · ⬜ Pendiente
+**Hecho.**
+- **Plazo de inactividad:** solo un chunk nuevo mueve `last_chunk_at`.
+- **Tope total:** la subida guarda un `deadline` desde su primer chunk, y `is_idle` la vence por inactividad o por ese plazo. Si el mismo uploader reinicia su subida, la nueva hereda el `deadline`. `snapshot_upload_max_secs` (`ZEMDB_SNAPSHOT_UPLOAD_MAX_SECS`, 7.200 s, de 60 s a 1 día) llega al relay como un parámetro nuevo de `SnapshotRelay::new`.
+- **Tests (tiempo pausado, `relay/tests/lifecycle.rs`):**
+  - `idle_upload_expires_and_its_file_is_deleted`, extendido: reenviar el chunk 1 a los 238 s no renueva nada, así que a los 239 s la subida se descarta. Después, otro miembro sube en un solo request en esa secuencia. Es el de `inv/b`, más el caso de la subida en un solo request de otro miembro.
+  - `upload_that_keeps_progressing_or_restarts_expires_at_its_deadline` (nuevo): con un tope de 300 s, una subida recibe un chunk nuevo a los 119 s, y a los 238 s su uploader la reinicia con otro snapshot; igual se descarta a los 300 s.
+- **Mutaciones:** cada una hace fallar su test: renovar con cualquier chunk, sacar el tope, y no heredar el `deadline` al reiniciar.
+
+#### DEF-163 · Bajo · ✅ Hecho
 **Problema.** Cualquier subida en curso, de cualquier miembro, congela la designación del uploader.
 **Solución.** D76.
 **Test exigido.**
 - Con una subida en curso de un miembro que no es el designado, el designado que no sube a tiempo se reemplaza a los 60 s.
 - Con una subida en curso del designado, la designación no cambia (`designee_that_does_not_upload_in_time_is_replaced_but_never_during_an_upload`, ajustado).
 
-#### DEF-162 · Bajo · ⬜ Pendiente
+**Hecho.** `SnapshotRelay::upload_in_progress_by` dice si la subida por chunks en curso es del worker o de un cliente dado (un lock tomado cuenta como tal, igual que en `upload_in_progress`). `designate` solo se congela con eso. La subida de otro miembro sigue anclando la poda.
+- **Test:** `designee_that_does_not_upload_in_time_is_replaced_but_never_during_its_upload` (antes `..._never_during_an_upload`).
+  - Durante la subida del writer, el peer designado, que no sube, se reemplaza: todos los candidatos ya tuvieron su turno, así que la designación vuelve al writer.
+  - Como ahora el que sube es el designado, la designación no cambia en 2,5 plazos.
+- **Mutaciones:** que cualquier subida congele, y que la del designado no congele; cada una hace fallar el test.
+
+#### DEF-162 · Bajo · ✅ Hecho
 **Problema.** Una subida de un solo chunk no queda anclada entre la consulta del rango y el lock del slot, y se completa validando contra ese rango viejo. Puede responder `staged: true` con un snapshot que ya no es usable (P11).
 **Solución.** Validar el rango bajo el lock del slot con un rango leído después de tomarlo (o anclar la subida antes de pedir el rango, como la de un solo request). Si el snapshot ya no es usable, `SnapshotSuperseded`.
 **Test exigido.** `audit_one_chunk_upload_staged_after_pruning_passed_it` (`inv/r`), adaptado: responde `SnapshotSuperseded`.
 
-#### DEF-164 · Bajo · ⬜ Pendiente
+**Hecho.** Se aplicó la segunda opción, por decisión del dueño al arrancar el lote. Una subida de un solo chunk toma el contador de las subidas en un solo request (`PendingUpload`) antes de pedir el rango. Mientras tanto, `upload_in_progress` la reporta en 0 y la poda espera, así que se confirma usable.
+- **Test:** `uploads_completed_in_one_request_are_in_progress_while_they_are_handled` (`relay/tests/upload.rs`, antes `single_request_upload_is_in_progress_while_it_is_handled`) suma la subida de un chunk: mientras el relay espera el rango, la subida ancla la poda. Que un ancla frena la poda ya lo prueba `snapshot_upload_in_progress_anchors_pruning_until_it_goes_idle`.
+- **Mutación:** sin el ancla, el test falla.
+- **Desvíos:**
+  - El test de la auditoría no se trajo tal cual: con el ancla la poda no pasa, así que no hay `SnapshotSuperseded` que esperar.
+  - Releer el rango bajo el lock del slot se descartó: `delete_room` espera ese lock con el de la sala tomado, y la consulta al actor podía quedar trabada hasta `ACTOR_TIMEOUT`.
+  - Las subidas de un chunk cuentan para el tope de 2 subidas en un solo request por sala (`RateLimited`).
+
+#### DEF-164 · Bajo · ✅ Hecho
 **Problema.** La marca de D62 guarda la secuencia del snapshot activo cuando un sync encuentra el hueco, no el cursor del sync. Un snapshot que se sube después con una secuencia entre la marca y ese cursor se anuncia y se sirve, aunque restaurarlo lleve al mismo hueco (INV-R5). Se corrige solo: el próximo cliente que choca con el hueco marca el nuevo. Bajo, y no Medio como la invariante, porque además hace falta un daño externo del log.
 **Solución.** Guardar como marca el mayor `from_seq` de los syncs que encontraron un hueco, y tratar como no usable todo snapshot con S ≤ marca: en `usable_snapshot_seq` y en `LogBounds::admits`.
 **Test exigido.** Con `small_segments`: commits 1 a 8, snapshot en 2, ack 8, se borra el segmento 5–6. Un cliente en 4 hace sync y recibe `BehindCompaction` (marca en 2). Un snapshot en 3 se acepta, `Registered` lo anuncia y el chunk 0 lo sirve, pero un sync desde 3 recibe `BehindCompaction`. Reproducido sobre el Lote 1 con un test temporal. Con el fix, la subida en 3 se rechaza.
 
-#### DEF-154 · Medio · ⬜ Pendiente
+**Hecho.** La marca pasa a llamarse `unrestorable_through` (en el actor y en `LogBounds`) y guarda el mayor `from_seq` de los syncs que encontraron un hueco. `usable_snapshot_seq` y `LogBounds::admits` descartan todo snapshot con S ≤ marca. La marca se pone aunque no haya un snapshot activo, lo que cierra el ítem del backlog "la marca de hueco solo se pone si S ≤ `from_seq`".
+- **Test:** `snapshot_below_a_gap_stops_being_usable`, extendido con el escenario de la auditoría en la forma más corta:
+  - el cliente que encuentra el hueco está en 3, por encima del snapshot en 2;
+  - el snapshot en 2 deja de anunciarse y servirse;
+  - un sync desde 2 no baja la marca;
+  - una subida en 2 o en 3 recibe `BadRequest`;
+  - la de 6 se acepta.
+- **Simulación de onboarding:** sus dos aserciones sobre la marca pasan a comparar con `<`.
+- **Mutaciones:** cada una hace fallar el test: la marca vieja, la marca sin `max`, y `admits` o `usable_snapshot_seq` comparando por igualdad.
+
+#### DEF-154 · Medio · ✅ Hecho
 **Problema.** La cuota no acota el disco de una sala: solo poda cold, la compresión está topada y los sidecars no cuentan.
 **Solución.** D69, o su opción de respaldo si supera el tamaño estimado.
 **Test exigido.** Los tres casos de `inv_b3` (`inv/b`): con cuota de 1 MiB y un escritor sostenido, `disk_bytes` (que ahora incluye los sidecars) se estabiliza por debajo de la cuota más `active.wal` y lo escrito en una pasada. Además, que la poda por cuota sea siempre un prefijo, incluso con un warm que no se pudo comprimir delante (el test de DEF-132, ajustado).
 
-#### DEF-157 · Bajo · ⬜ Pendiente
+**Hecho.** D69 sin la opción de respaldo, con unas 20 líneas de producción:
+- (a) `SegmentEntry::disk_bytes` suma el sidecar calculado por rango (20 + 24 × operaciones, una cota superior), y el índice lo acumula.
+- (b) Por encima de la cuota, todo warm es elegible para comprimir.
+- (c) La poda por cuota corta el prefijo más viejo, warm o cold. La de TTL sigue siendo de cold.
+
+`MaintenanceReport::cold_pruned_count` pasa a `pruned_count`.
+- **Tests (`log/tests/tiered_log.rs`):**
+  - `quota_bounds_the_disk_of_a_sustained_writer` (nuevo): los casos de `inv_b3` en miniatura. Cinco pasadas, con el TTL warm por defecto y con 0, y más segmentos sellados por pasada de los que una pasada comprime. Después de cada pasada, lo que hay en disco (con los sidecars) no pasa de la cuota más `active.wal`, y cada pasada comprime 4.
+  - `disk_bytes_track_the_files_of_the_log`: ahora cuenta los sidecars, porque `bytes_on_disk` ya no los excluye. Cubre el tercer caso de `inv_b3`.
+  - `quota_prunes_a_prefix_even_with_a_warm_segment_that_cannot_be_compressed` (antes `quota_pruning_stops_at_the_first_segment_it_keeps`, el test de DEF-132): con una cuota un byte por debajo, se poda el warm dañado de adelante y el cold de atrás queda.
+- **Mutaciones:** cada una hace fallar un test: no contar los sidecars, no adelantar la compresión, podar por cuota solo cold.
+- **Desbordamiento:** el sidecar se calcula a partir del nombre, así que `disk_bytes` suma saturando (hallazgo de la revisión de delta). `segment_shorter_than_its_name_leaves_ram_empty_and_commits_continue`, extendido con un segmento que dice ir de 1 a `u64::MAX / 2`: la pasada de mantenimiento no entra en pánico y la cuota lo poda.
+- **Desvío:** los casos de `inv_b3` usan cuotas de pocos KiB fijadas en la política del log, en lugar de 1 MiB con operaciones de 100 KiB, para entrar en la suite normal.
+
+#### DEF-157 · Bajo · ✅ Hecho
 **Problema.** `fetch_from_disk` recorre el índice de segmentos desde el inicio.
 **Solución.** Buscar el primer segmento con `BTreeMap::range`. La apertura sigue siendo O(segmentos): se acepta en el enunciado de INV-B4 (D79). Con la cuota de D69, la cantidad de segmentos queda acotada.
 **Test exigido.** El de `inv/b` (`inv_b4_open_and_sync_cost_vs_segment_count`) como medición `#[ignore]`: el costo del sync no crece con la cantidad de segmentos.
+
+**Hecho.** `SegmentIndex::iter_from` arranca en el último segmento que empieza en o antes del cursor + 1, con `BTreeMap::range`.
+- **Test:** `fetch_cost_does_not_grow_with_the_number_of_segments` (`#[ignore]`, release). Mil lecturas cerca del head con 100 y con 50.000 segmentos fabricados en disco: con 50.000 tienen que costar menos de 3 veces lo de 100. Medido: 3,4 ms y 3,5 ms.
+- **Mutación:** con el recorrido lineal, el test falla.
+- **Desvío:** la medición es del log, no del actor entero como la de `inv/b`. La apertura sigue siendo O(segmentos), como acepta INV-B4.
+
+**Cierre del lote.**
+- **Decisiones:** el lote no tenía decisiones en *Propuesta*. Al arrancar, el dueño fijó dos detalles: la reserva de un frame entero (D73) y el ancla para DEF-162.
+- **Chequeos:** fmt, clippy, tests y doc en verde. 772 tests pasan y 39 están ignorados; antes del lote eran 767 y 38. Hay cinco tests nuevos y una medición `#[ignore]`; los demás escenarios se sumaron a tests que ya existían. El lote no toca `core` ni `storage`, así que no hace falta el build de wasm32.
+- **Tests de ruptura:** comprobados con la mutación inversa, restaurando en cada parte el código de `main`. Los del tope de las subidas y del presupuesto por cliente usan settings nuevos y no compilan sobre `main`.
+- **Mutación inversa:** 25 mutaciones, una o más por cada parte de cada fix. Todas hacen fallar algún test.
+- **Versiones largas:** `cargo test -p zemdb-server --release -- --ignored`, 12 de 12 en verde, después de los arreglos de la revisión.
+- **Revisión de delta:** la hizo un agente aparte, de contexto fresco y solo lectura, con tests propios en una copia. Los ocho fixes cierran su escenario (DEF-162, frente a la poda por cursores, que es el de la auditoría).
+  - **Lo que entró al lote:**
+    - **Medio:** la reserva de `/sync` y `/commit` se tomaba en el handler y se retenía mientras el comando esperaba en el mailbox. Con el default, 15 pedidos esperando a una sala lenta dejaban sin `/sync` a las demás. Ahora reserva el actor al atender el comando, y el chunk 0 reserva después de pedir el rango (ver DEF-152).
+    - **Medio:** D74(b) se esquivaba reiniciando la propia subida, que arrancaba con un plazo nuevo. Ahora hereda el `deadline` (ver DEF-153).
+    - **Bajo:** `disk_bytes` podía desbordar con un nombre de segmento absurdo (ver DEF-154).
+    - **Tests que faltaban:** el `max` de la marca de hueco y el reintento deduplicado sin catch-up.
+    - **Notas:** comentarios que seguían hablando del tamaño codificado y del snapshot marcado.
+  - **Lo que no entró:**
+    - **DEF-166** (Bajo, Lote 5): la poda por TTL o cuota entre la lectura del rango y la instalación de una subida. INV-R7 vuelve a ❌.
+    - **Límite documentado en INV-R4 y §5.2:** con la cuota podando warm recientes, una cuota que no retiene lo que se escribe durante una subida y una restauración puede dejar no usable cada snapshot.
+    - **Sin test:** `max_send_buf_size`, que un slot bloqueado y la subida del worker congelen la designación, y el orden de la reserva de `Schema` y `Registered` frente a la copia del esquema.
+    - **Nota sobre D76:** las subidas en un solo request (y las de un chunk) del designado no congelan la designación, salvo mientras tienen el lock. Duran segundos; es inocuo.
+- **Documentos:**
+  - `ARCHITECTURE.md`: §5.2 (la ventana de RAM, *Bounded responses*, *Damaged Segments*, *Snapshot Retention Anchor*, la designación y *TTL & Quota Compaction*), §6 (el plazo, el tope y el reinicio de las subidas, la aceptación y los límites), §7.2 (`Unavailable`) y §7.3 (los settings nuevos, el presupuesto y `max_send_buf_size`). Esto adelanta los puntos de §5.2, §6, §7.2 y §7.3 del Lote 6 que corresponden a este lote.
+  - README: la variable del presupuesto por cliente, y el presupuesto de respuestas, que ahora incluye `Schema` y `Registered`.
+  - `INVARIANTES.md`: B1, B2, B3, B4, B5 y R5 en ✅; R7 en ❌ (Lote 5, DEF-166); el límite de R4.
 
 ---
 
@@ -556,6 +672,11 @@ Se fueron `append_synced`, `highest_seq_in_valid_frames`, la excepción de corru
 **Test exigido.**
 - El test de `inv/l` (`actor/tests/manager.rs`, borrado parcial): con un crash en cada paso del borrado, la sala existe entera o no existe.
 - Una sala recreada después de un borrado interrumpido empieza vacía.
+
+#### DEF-166 · Bajo · ⬜ Pendiente
+**Problema.** Una subida que el relay confirma (`SnapshotStaged` o `staged: true`) puede no ser usable: la poda por TTL o cuota, que ignora el ancla, corre entre la lectura del rango y la instalación, y ninguna de las tres clases de subida vuelve a mirar el rango con el lock tomado (INV-R7). Es preexistente. Lo encontró la revisión de delta del Lote 4: D69 lo agranda, porque la cuota ahora también poda warm recientes. El snapshot no se anuncia ni se sirve (INV-R5), así que el costo es que la demanda sigue y se pide otra subida.
+**Solución.** Que el actor publique `tail_seq` y la marca de hueco en un valor atómico que el relay lea con el lock del slot tomado, justo antes de instalar; si el snapshot ya no es usable, `SnapshotSuperseded`.
+**Test exigido.** Con un fail point entre la lectura del rango y la instalación, una pasada de cuota que poda más allá de S: la subida responde `SnapshotSuperseded`, en las tres clases de subida.
 
 #### DEF-161 · Bajo · ⬜ Pendiente
 **Problema.** Si una sala se recrea sin pasar por `delete_room` (por ejemplo, porque se perdió su directorio), el snapshot viejo del relay se vuelve usable cuando el head nuevo alcanza su secuencia (P10).
@@ -615,7 +736,6 @@ Hallazgos de la auditoría que no rompen ninguna invariante (`INVARIANTES.md` §
 - Un reinicio del servidor durante una subida por chunks hace que el último chunk responda `staged: false`, sin forma de saber qué chunks faltan.
 - Un `Connected` que choca con un hueco en `sync` sigue `Connected` (no se llama a `observe`).
 - `check_newer_than_active` compara contra el snapshot activo aunque ya no sea usable.
-- La marca de hueco solo se pone si S ≤ `from_seq`.
 - Los 404/405 binarios hacen eco del path completo (hasta 65 KB).
 - No hay presupuesto global para los bodies de request, y `Bytes::from_request` copia el body (pico de 2×).
 
@@ -643,4 +763,4 @@ Hallazgos de la auditoría que no rompen ninguna invariante (`INVARIANTES.md` §
 
 **Tests**
 - `concurrent_commits_are_all_sequenced_and_signalled` solo cuenta las operaciones; la simulación del Lote 0 cubre el contenido.
-- Faltan tests de un ack con un hueco después de un cursor válido, y de un sync servido que el presupuesto convierte en `Unavailable` (el cursor avanza igual).
+- Faltan tests de un ack con un hueco después de un cursor válido.

@@ -115,18 +115,18 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 | **INV-R2** | El rango retenido es contiguo y su cola no retrocede | | Medio | ✅ |
 | **INV-R3** | Perder estado volátil del roster solo cuesta retención o re-registro | | Medio | ✅ |
 | **INV-R4** | Todo cliente que se queda atrás termina pudiendo ponerse al día | | Medio | ✅ |
-| **INV-R5** | Solo se anuncian y sirven snapshots usables, y una descarga es de un solo snapshot | | Medio | ❌ (Lote 4) |
+| **INV-R5** | Solo se anuncian y sirven snapshots usables, y una descarga es de un solo snapshot | | Medio | ✅ |
 | **INV-R6** | Un snapshot solo se ofrece a la encarnación que lo aceptó | | Medio | 🆕 (Lote 5) |
-| **INV-R7** | Una subida confirmada es usable | | Bajo | 🆕 (Lote 4) |
+| **INV-R7** | Una subida confirmada es usable | | Bajo | ❌ (Lote 5) |
 | **INV-A1** | Nadie actúa sobre otra sala ni como otro cliente | ★ | Alto | ✅ |
 | **INV-A2** | Nada se decodifica antes de autenticar, salvo lo acotado de `/register` | | Alto | ✅ |
 | **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio | ✅ |
 | **INV-A4** | Ningún identificador produce rutas fuera de `data_dir` | ★ | Alto | ✅ |
-| **INV-B1** | La memoria por request está acotada | ★ | Alto | ❌ (Lote 4) |
-| **INV-B2** | Nada se retiene sin plazo | | Medio | ❌ (Lote 4) |
-| **INV-B3** | La memoria, el disco y los FDs del servidor están acotados por la configuración | | Medio | ❌ (Lote 4) |
-| **INV-B4** | El costo por request del actor no depende de la historia | | Medio | ❌ (Lote 4) |
-| **INV-B5** | Ningún cliente acapara un recurso global | | Medio | 🆕 (Lote 4) |
+| **INV-B1** | La memoria por request está acotada | ★ | Alto | ✅ |
+| **INV-B2** | Nada se retiene sin plazo | | Medio | ✅ |
+| **INV-B3** | La memoria, el disco y los FDs del servidor están acotados por la configuración | | Medio | ✅ |
+| **INV-B4** | El costo por request del actor no depende de la historia | | Medio | ✅ |
+| **INV-B5** | Ningún cliente acapara un recurso global | | Medio | ✅ |
 | **INV-L1** | Toda request recibe una respuesta, en tiempo acotado | | Medio | ✅ |
 | **INV-L2** | Cancelar una request nunca deja estado a medias | | Medio | ❌ (Lote 5) |
 | **INV-L3** | Un I/O incierto nunca se confirma como éxito | ★ | Alto | ✅ |
@@ -297,10 +297,11 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 **Sostenida por.** Demanda de snapshot y designación (§5.2 *Snapshot Demand*), D61, D62.
 **Cómo intentar romperla.** Cada transición de la demanda combinada con reinicios; el único `Connected` es el designado y se desconecta; la subida completa justo cuando TTL mueve la cola; hueco que aparece después de anunciar el snapshot.
 **Automatizable.** Simulación con muchos clientes y crashes: propiedad de liveness acotada ("en N ticks"). Está en el repo desde el Lote 0.
+**Límite aceptado.** La cuota tiene que retener lo que la sala escribe mientras se sube y se restaura un snapshot: como desde D69 también poda warm recientes, con menos cada snapshot puede salir del rango retenido antes de que alguien se ponga al día desde él (§5.2 *TTL & Quota Compaction*).
 
 #### INV-R5 · Solo se anuncian y sirven snapshots usables, y una descarga es de un solo snapshot
-**Enunciado.** `Registered`, `HeartbeatAck`, `snapshot_available` y el chunk 0 solo ofrecen un snapshot con `tail_seq - 1 ≤ S ≤ head_seq` que no esté por debajo de un hueco conocido. Una descarga anclada por hash recibe chunks de un único snapshot, o `SnapshotSuperseded`; nunca bytes mezclados de dos. Mientras un snapshot está activo, el relay no lo reemplaza por uno de secuencia menor (después de que vence, o si al arrancar su archivo es ilegible, puede activarse otro menor).
-**Sostenida por.** §6 *Multipart Chunked Snapshot Transfer*, *Snapshot Relay*; la marca de hueco que el actor le informa al relay (§5.2 *Damaged Segments*). *Pendiente (Lote 4):* la marca no cubre los snapshots por debajo del cursor que encontró el hueco.
+**Enunciado.** `Registered`, `HeartbeatAck`, `snapshot_available` y el chunk 0 solo ofrecen un snapshot con `tail_seq - 1 ≤ S ≤ head_seq` que no esté por debajo de un hueco conocido (en o por debajo de un cursor desde el que un sync encontró un hueco). Una descarga anclada por hash recibe chunks de un único snapshot, o `SnapshotSuperseded`; nunca bytes mezclados de dos. Mientras un snapshot está activo, el relay no lo reemplaza por uno de secuencia menor (después de que vence, o si al arrancar su archivo es ilegible, puede activarse otro menor).
+**Sostenida por.** §6 *Multipart Chunked Snapshot Transfer*, *Snapshot Relay*; la marca de hueco que el actor le informa al relay: el mayor cursor desde el que un sync encontró un hueco (§5.2 *Damaged Segments*).
 **Cómo intentar romperla.** Reemplazo del snapshot durante una descarga; reemplazo con la misma secuencia y otro contenido; reinicio con archivos `.snap` de distintas secuencias, vencidos o ilegibles; borrado y recreación de la sala durante una descarga; un snapshot marcado por un hueco que se pide desde el chunk 0.
 
 #### INV-R6 · Un snapshot solo se ofrece a la encarnación que lo aceptó
@@ -310,7 +311,7 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 
 #### INV-R7 · Una subida confirmada es usable
 **Enunciado.** Si el relay confirma una subida (`SnapshotStaged` o `staged: true`), el snapshot es usable en ese momento (INV-R5). Si el rango retenido se movió y ya no lo es, la respuesta es `SnapshotSuperseded`.
-**Sostenida por.** D61 para las subidas de varios chunks. *Pendiente (Lote 4):* las de un solo chunk.
+**Sostenida por.** D61 para las subidas de varios chunks; las de un solo chunk anclan la poda mientras se lee el rango, como las de un solo request (§5.2 *Snapshot Retention Anchor*). *Pendiente (Lote 5):* la poda por TTL o cuota, que ignora el ancla, entre la lectura del rango y la instalación.
 **Cómo intentar romperla.** Podas por cursores, TTL y cuota entre la consulta del rango y la instalación, en subidas de un request, de un chunk y de varios.
 
 ### 3.5. Aislamiento y autorización
@@ -329,7 +330,7 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 **Enunciado.** Un miembro hostil de una sala no puede degradar otras salas más allá de lo que acotan los límites globales (INV-B1 a INV-B3), ni alterar el estado de otro cliente de su sala (cursor, lease, registro, subida en curso ajena con la misma secuencia).
 **Sostenida por.** Dedup por cliente (D59), reglas del relay sobre quién reemplaza una subida (las mismas para un chunk y para una subida en un solo request), topes de SSE (D54) (§6, §7.2, §7.3).
 **Cómo intentar romperla.** Commits con `mutation_id` ajenos; subidas que reemplazan la de otro; muchos streams SSE; registro y deregistro en bucle.
-**Límite aceptado.** Reemplazar una subida con una secuencia mayor, o subir un snapshot falso (DEF-81, §4). La subida de un miembro que no es el designado ancla la poda pero no congela la designación (D76, Lote 4).
+**Límite aceptado.** Reemplazar una subida con una secuencia mayor, o subir un snapshot falso (DEF-81, §4). La subida de un miembro que no es el designado ancla la poda pero no congela la designación (D76).
 
 #### INV-A4 ★ · Ningún identificador produce rutas fuera de `data_dir`
 **Enunciado.** Ningún `RoomId`, `SchemaId`, `ClientId`, secuencia ni hash produce una ruta fuera de `data_dir`, ni dos identificadores distintos producen el mismo archivo (incluidos sistemas de archivos que no distinguen mayúsculas).
@@ -340,28 +341,28 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 
 #### INV-B1 ★ · La memoria por request está acotada
 **Enunciado.** Ninguna request reserva más memoria que una cota fija por request: un body de hasta `MAX_FRAME_SIZE`, hasta `MAX_MESSAGE_VALUES` valores decodificados y una respuesta de hasta `MAX_FRAME_SIZE`. Ninguna respuesta materializa más de `MAX_MESSAGE_VALUES` valores, y lo que retienen las lecturas (presupuesto de lectura, HotBuffer) se cuenta por lo que ocupa en memoria, no por su tamaño de wire. La memoria de todas las respuestas retenidas en el servidor, incluidas `Schema` y `Registered` y los buffers de HTTP/2, está acotada por `max_inflight_response_bytes`.
-**Sostenida por.** D44, D53 (§7.2 *Defensive Bounding*, §7.3). *Pendiente (Lote 4, D73):* cobrar la memoria real, pedir el presupuesto antes de codificar, `Schema`/`Registered` bajo presupuesto, `max_send_buf_size`.
+**Sostenida por.** D44, D53, D73: las lecturas y la HotBuffer cobran `max(wire, 24 × valores)`; cada respuesta presupuestada reserva un frame antes de materializarse (el sync y el catch-up, cuando el actor los atiende) y se queda con su codificación; `Schema` y `Registered` también; `max_send_buf_size` de un frame (§5.2 *Bounded responses*, §7.2 *Defensive Bounding*, §7.3).
 **Cómo intentar romperla.** Longitudes declaradas enormes; cuerpos que se descomprimen; muchos streams HTTP/2 con respuestas grandes sin leer; commits cuyo catch-up se queda sin presupuesto; tablas de miles de columnas con filas de `Null`; respuestas `/schema` sin leer.
 **Automatizable.** Fuzzing de los decoders (en el repo desde el Lote 0) y conteo de los valores que materializa cada respuesta.
 
 #### INV-B2 · Nada se retiene sin plazo
 **Enunciado.** Ninguna conexión, body, respuesta, permiso de conexión, subida ni designación se retiene más que un plazo configurado sin progreso del cliente: headers, body por tasa mínima, *stall* de respuesta, inactividad de subidas, designación de 60 s. En una subida, solo un chunk que todavía no se había recibido cuenta como progreso, y además tiene un tope total de duración (D74). La única excepción es un stream SSE sano, acotado en cantidad por cliente y en total.
-**Sostenida por.** D45, D53, D54 (§7.3). *Pendiente (Lote 4, D74, D76):* el progreso y el tope de las subidas, y la designación que solo congela la subida del designado o del worker.
+**Sostenida por.** D45, D53, D54 (§7.3); D74, el progreso y el tope de las subidas (`snapshot_upload_max_secs`), y D76, la designación que solo congela la subida del designado o del worker (§6).
 **Cómo intentar romperla.** Cliente que lee un byte por plazo; ventana HTTP/2 que se achica; reenviar un chunk ya recibido; subir un chunk por plazo; stream SSE semiabierto (residuo aceptado, §4).
 
 #### INV-B3 · La memoria, el disco y los FDs del servidor están acotados por la configuración
 **Enunciado.** Con salas, clientes y tiempo ilimitados, la memoria del servidor está acotada por la configuración y la cantidad de salas abiertas: HotBuffer por lo que ocupa en memoria (INV-B1), dedup por capacidad, roster que olvida `Dormant`, `room_meta` y spawn locks solo de salas vivas, relay con un snapshot por sala, subidas pendientes y SSE con tope. El disco del log de una sala está acotado por la cuota (que cuenta los sidecars) más `active.wal` y lo escrito durante una pasada de mantenimiento; el relay suma el snapshot activo y, durante una subida, el archivo parcial. Los FDs, por las conexiones más dos por sala abierta más los transitorios del pool bloqueante, que también están acotados.
-**Sostenida por.** D47, D50 (§5.2, §5.3, §7.3). *Pendiente (Lote 4, D69, D73):* la cuota sobre warm y sidecars; la HotBuffer por memoria.
+**Sostenida por.** D47, D50 (§5.2, §5.3, §7.3); D69, la cuota que cuenta los sidecars y poda warm y cold (§5.2 *TTL & Quota Compaction*); D73, la HotBuffer por lo que ocupa.
 **Cómo intentar romperla.** Miles de salas abiertas y cerradas; clientes que nunca se deregistran; cientos de miles de `mutation_id` distintos; subidas abandonadas.
 
 #### INV-B4 · El costo por request del actor no depende de la historia
 **Enunciado.** Ninguna request (commit, ack, registro, heartbeat, sync) hace trabajo O(historia retenida) ni O(clientes) × fsync en el actor; recorrer el roster en memoria (O(clientes) sin E/S) está permitido. La compresión corre fuera del worker. La apertura cuesta O(`dedup_lru_capacity` + `active.wal` + roster) más un listado de los segmentos, que la cuota acota (INV-B3).
-**Sostenida por.** D56, D57, D47 (§5.2 *Opening a Room*, *Blocking I/O in the Actor*, *Client Roster Persistence*). *Pendiente (Lote 4):* que el sync no recorra el índice de segmentos desde el inicio.
+**Sostenida por.** D56, D57, D47 (§5.2 *Opening a Room*, *Blocking I/O in the Actor*, *Client Roster Persistence*); el sync busca su primer segmento en el índice, sin recorrerlo desde el inicio.
 **Cómo intentar romperla.** Medir con 10⁵ operaciones retenidas, 10³ clientes y operaciones de 20 KB: tormenta de registros, acks dentro de `active.wal`, reaperturas por heartbeat, decenas de miles de segmentos.
 
 #### INV-B5 · Ningún cliente acapara un recurso global
 **Enunciado.** Ningún cliente (un par sala y `client_id`, o el admin secret en el relay) retiene más que una parte configurada de un recurso que comparten todas las salas: el presupuesto de respuestas en vuelo y los streams SSE. Lo que excede su parte se le rechaza a él (`Unavailable`, `RateLimited`), no a las demás salas.
-**Sostenida por.** D54 para SSE. *Pendiente (Lote 4, D75):* el tope por cliente del presupuesto de respuestas.
+**Sostenida por.** D54 para SSE; D75, el tope por cliente del presupuesto de respuestas (`max_inflight_response_bytes_per_client`, §7.3).
 **Cómo intentar romperla.** Un miembro de una sala que no lee sus respuestas en muchos streams y conexiones, mientras otra sala hace `/sync`; muchos streams SSE del mismo cliente.
 
 ### 3.7. Disponibilidad y ciclo de vida

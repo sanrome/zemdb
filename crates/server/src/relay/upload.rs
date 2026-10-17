@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::time::Instant;
 use tracing::{info, warn};
-use zemdb_core::id::{RoomId, SequenceNumber};
+use zemdb_core::id::{ClientId, RoomId, SequenceNumber};
 use zemdb_core::protocol::messages::ServerMessage;
 use zemdb_core::protocol::snapshot_envelope::validate_snapshot_envelope;
 
@@ -93,7 +93,10 @@ pub(super) struct UploadSession {
     snapshot_hash: [u8; 32],
     received: Vec<bool>,
     received_count: u32,
+    /// When the last chunk not received before arrived.
     last_chunk_at: Instant,
+    /// When the upload is discarded even if it keeps receiving new chunks.
+    deadline: Instant,
     pub(super) path: PathBuf,
 }
 
@@ -104,8 +107,11 @@ impl UploadSession {
         *uploader == Uploader::Admin || self.uploader == *uploader
     }
 
+    /// Whether the upload stopped progressing: no new chunk for [`UPLOAD_IDLE_TIMEOUT`] (a
+    /// chunk resent is no progress), or past its deadline.
     pub(super) fn is_idle(&self, now: Instant) -> bool {
         now.saturating_duration_since(self.last_chunk_at) >= UPLOAD_IDLE_TIMEOUT
+            || now >= self.deadline
     }
 }
 
@@ -242,6 +248,11 @@ impl SnapshotRelay {
             )));
         }
 
+        // An upload of one chunk starts and completes here: like a single-request upload, it
+        // holds back pruning while the range is read, or it could complete outside the range.
+        let _pending = (total_chunks == 1)
+            .then(|| PendingUpload::acquire(&self.pending_single_uploads, &room_id))
+            .transpose()?;
         let slot = self.slot(&room_id);
         let bounds = log_bounds.await?;
 
@@ -281,9 +292,14 @@ impl SnapshotRelay {
         if !continues {
             bounds.check(head_seq, ServerError::BadRequest)?;
             self.check_newer_than_active(&room_id, head_seq)?;
+            let mut deadline = Instant::now() + self.max_upload_duration;
             if let Some(replaced) = guard.upload.take() {
                 info!(room = %room_id, old_seq = %replaced.head_seq, new_seq = %head_seq,
                     "Replacing snapshot upload in progress");
+                // Restarting its own upload gives the uploader no more time.
+                if replaced.uploader == uploader {
+                    deadline = replaced.deadline;
+                }
                 self.remove_files(vec![replaced.path]).await;
             }
             guard.upload = Some(UploadSession {
@@ -294,6 +310,7 @@ impl SnapshotRelay {
                 received: vec![false; total_chunks as usize],
                 received_count: 0,
                 last_chunk_at: Instant::now(),
+                deadline,
                 path: self
                     .uploads_dir
                     .join(upload_file_name(&room_id, head_seq, PART_EXTENSION)),
@@ -311,8 +328,8 @@ impl SnapshotRelay {
         if !session.received[chunk_index as usize] {
             session.received[chunk_index as usize] = true;
             session.received_count += 1;
+            session.last_chunk_at = Instant::now();
         }
-        session.last_chunk_at = Instant::now();
         if session.received_count < total_chunks {
             return Ok(false);
         }
@@ -421,6 +438,26 @@ impl SnapshotRelay {
             .as_ref()
             .filter(|upload| !upload.is_idle(Instant::now()))
             .map(|upload| upload.head_seq)
+    }
+
+    /// Whether the room's multipart upload in progress is the snapshot worker's or `client`'s.
+    /// Like [`upload_in_progress`](Self::upload_in_progress), reads memory without waiting, and
+    /// a room whose lock is held at that moment counts as such an upload.
+    pub fn upload_in_progress_by(&self, room_id: &RoomId, client: Option<&ClientId>) -> bool {
+        let Some(slot) = self.slots.get(room_id).map(|slot| Arc::clone(slot.value())) else {
+            return false;
+        };
+        let Ok(guard) = slot.try_lock() else {
+            return true;
+        };
+        guard
+            .upload
+            .as_ref()
+            .filter(|upload| !upload.is_idle(Instant::now()))
+            .is_some_and(|upload| match &upload.uploader {
+                Uploader::Admin => true,
+                Uploader::Client(id) => Some(id) == client,
+            })
     }
 
     /// Whether the room's active snapshot is exactly `seq` with `hash`.

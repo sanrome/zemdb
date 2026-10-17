@@ -23,6 +23,7 @@ const AUTH_SECRET: &str = "data_plane_cluster_secret_key_1234";
 struct Fixture {
     dir: TempDir,
     app: axum::Router,
+    manager: std::sync::Arc<crate::RoomManager>,
     room_id: RoomId,
     client_id: ClientId,
     token: String,
@@ -72,9 +73,15 @@ fn wide_row(id: i64, text_len: usize) -> Operation {
 impl Fixture {
     /// A router over a room with one registered client.
     async fn new() -> Self {
+        Self::with(|_| {}).await
+    }
+
+    /// [`Fixture::new`] with the configuration adjusted by `configure`.
+    async fn with(configure: impl FnOnce(&mut crate::config::ServerConfig)) -> Self {
         let dir = tempdir().unwrap();
         let state = TestState::new(dir.path(), |config| {
             config.auth_secret = AUTH_SECRET.to_string();
+            configure(config);
         });
         let schema_id = SchemaId::new("tasks").unwrap();
         state
@@ -92,6 +99,7 @@ impl Fixture {
             generate_client_token(&client_id, &room_id, Duration::from_secs(300), AUTH_SECRET);
         let fx = Self {
             app: build_router(state.app_state()),
+            manager: state.manager,
             dir,
             room_id,
             client_id,
@@ -104,16 +112,28 @@ impl Fixture {
 
     /// Registers the client, which must succeed.
     async fn register(&self) {
-        let register = ClientMessage::RegisterClient {
+        let (status, _, _) = self.post("register", &self.register_msg()).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    fn register_msg(&self) -> ClientMessage {
+        ClientMessage::RegisterClient {
             correlation_id: CorrelationId::new(1),
             room_id: self.room_id.clone(),
             client_id: self.client_id.clone(),
             auth_token: self.token.clone(),
             current_seq: None,
             known_incarnation: None,
-        };
-        let (status, _, _) = self.post("register", &register).await;
-        assert_eq!(status, StatusCode::OK);
+        }
+    }
+
+    /// Posts `msg`, returning the response without reading its body.
+    async fn send(&self, endpoint: &str, msg: &ClientMessage) -> Response {
+        let request = Request::post(format!("/rooms/{}/{endpoint}", self.room_id))
+            .header(header::AUTHORIZATION, format!("Bearer {}", self.token))
+            .body(Body::from(encode_message(msg).unwrap()))
+            .unwrap();
+        self.app.clone().oneshot(request).await.unwrap()
     }
 
     async fn post(
@@ -121,11 +141,7 @@ impl Fixture {
         endpoint: &str,
         msg: &ClientMessage,
     ) -> (StatusCode, axum::http::HeaderMap, ServerMessage) {
-        let request = Request::post(format!("/rooms/{}/{endpoint}", self.room_id))
-            .header(header::AUTHORIZATION, format!("Bearer {}", self.token))
-            .body(Body::from(encode_message(msg).unwrap()))
-            .unwrap();
-        let response = self.app.clone().oneshot(request).await.unwrap();
+        let response = self.send(endpoint, msg).await;
         let status = response.status();
         let headers = response.headers().clone();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -471,6 +487,118 @@ async fn large_operations_are_split_across_catch_up_and_sync_batches() {
         }
     }
     assert_eq!(pages, vec![vec![1, 2], vec![3, 4]]);
+}
+
+#[tokio::test]
+async fn responses_take_a_frame_of_the_clients_budget_before_they_are_built() {
+    // A frame per client, and 1 MiB more.
+    let fx = Fixture::with(|config| {
+        config.max_inflight_response_bytes_per_client = MAX_FRAME_SIZE as u64 + 1024 * 1024;
+    })
+    .await;
+    let get_schema = ClientMessage::GetSchema {
+        correlation_id: CorrelationId::new(2),
+        room_id: fx.room_id.clone(),
+    };
+    // Unread responses hold what their encoding takes, so as many fit as the 1 MiB holds,
+    // plus the one that reserved the last frame.
+    let mut held = vec![fx.send("schema", &get_schema).await];
+    let len = held[0].body().size_hint().exact().unwrap();
+    while held.len() as u64 <= 1024 * 1024 / len {
+        held.push(fx.send("schema", &get_schema).await);
+    }
+    assert!(held
+        .iter()
+        .all(|response| response.status() == StatusCode::OK));
+
+    // Then nothing is: a snapshot chunk, before the relay is asked (it has none to read).
+    let chunk = ClientMessage::RequestSnapshotChunk {
+        correlation_id: CorrelationId::new(3),
+        room_id: fx.room_id.clone(),
+        chunk_index: 0,
+        chunk_size: 0,
+        snapshot_hash: None,
+    };
+    for (endpoint, msg) in [
+        ("schema", get_schema.clone()),
+        ("register", fx.register_msg()),
+        ("sync", fx.sync(0)),
+        ("snapshot/chunk", chunk),
+    ] {
+        let (status, _, reply) = fx.post(endpoint, &msg).await;
+        let expected = StatusCode::SERVICE_UNAVAILABLE;
+        assert_error(status, expected, ErrorCode::Unavailable, &reply);
+    }
+    // A commit, durable, is acknowledged without its catch-up, and so is its retry.
+    for _ in 0..2 {
+        let (status, _, reply) = fx.post("commit", &fx.commit(1, 0)).await;
+        assert_eq!(status, StatusCode::OK);
+        let ServerMessage::CommitAck {
+            catchup_ops,
+            has_more,
+            ..
+        } = reply
+        else {
+            panic!("expected CommitAck, got {reply:?}");
+        };
+        assert!(catchup_ops.is_empty() && has_more);
+    }
+
+    drop(held);
+    let (status, _, reply) = fx.post("schema", &get_schema).await;
+    assert_eq!(status, StatusCode::OK, "{reply:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_waiting_for_its_room_holds_none_of_the_budget() {
+    // One frame per client.
+    let fx = Fixture::with(|config| {
+        config.max_inflight_response_bytes_per_client = MAX_FRAME_SIZE as u64;
+    })
+    .await;
+    // The room's actor stalls, as on a slow fsync.
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let room_dir = crate::actor::room::room_dir(fx.dir.path(), &fx.room_id);
+    fail_point::arm_hook("room_shutdown", &room_dir, move || {
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    let sender = fx.manager.get_or_spawn(&fx.room_id, None).await.unwrap();
+    let (reply, _) = tokio::sync::oneshot::channel();
+    sender.send(RoomCommand::Shutdown { reply }).await.unwrap();
+    tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+        .await
+        .unwrap();
+
+    // A sync and a first chunk, which asks the room for its log range, wait for it.
+    let chunk = |chunk_index, snapshot_hash| ClientMessage::RequestSnapshotChunk {
+        correlation_id: CorrelationId::new(3),
+        room_id: fx.room_id.clone(),
+        chunk_index,
+        chunk_size: 0,
+        snapshot_hash,
+    };
+    let (sync, first_chunk) = (fx.sync(0), chunk(0, None));
+    let waiting = futures::future::join(
+        fx.send("sync", &sync),
+        fx.send("snapshot/chunk", &first_chunk),
+    );
+    tokio::pin!(waiting);
+    let wait = tokio::time::timeout(Duration::from_millis(200), &mut waiting).await;
+    assert!(wait.is_err());
+
+    // Without holding the client's part: an anchored chunk, which the relay answers without
+    // the room, still gets its frame.
+    let (status, _, reply) = fx.post("snapshot/chunk", &chunk(1, Some([0; 32]))).await;
+    assert_error(
+        status,
+        StatusCode::CONFLICT,
+        ErrorCode::SnapshotSuperseded,
+        &reply,
+    );
+    release_tx.send(()).unwrap();
+    waiting.await;
 }
 
 #[test]

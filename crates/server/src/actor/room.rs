@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{broadcast, mpsc};
-use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use zemdb_core::id::{ClientId, MutationId, RoomId, SchemaId, SequenceNumber};
 use zemdb_core::mutation::Operation;
@@ -20,13 +19,13 @@ use crate::actor::command::{
 };
 use crate::actor::lease::{ClientLeaseTracker, ClientState};
 use crate::actor::snapshot_demand::{persistence_granularity, SnapshotDemand, DESIGNATION_TIMEOUT};
-use crate::blocking::blocking_io;
 use crate::config::ServerConfig;
 use crate::dedup::{dedup_key, DedupLruCache};
 use crate::durable;
 use crate::error::ServerError;
 use crate::log::{retention, RoomLifecyclePolicy, TieredLog};
-use crate::relay::{LogBounds, SnapshotRelay};
+use crate::relay::{LogBounds, SnapshotRelay, Uploader};
+use crate::response_budget::{no_room, InflightBudget, Reservation};
 
 /// Period of the fast maintenance tick, which only touches memory (and the roster file when
 /// it changed): lease timeouts and state transitions, snapshot signals, roster persistence and
@@ -105,52 +104,25 @@ pub struct RoomActor {
     /// Set once the actor closed its mailbox to shut down for inactivity.
     stopping_idle: bool,
     snapshot_relay: Arc<SnapshotRelay>,
+    response_budget: Arc<InflightBudget>,
     snapshot_demand: SnapshotDemand,
     /// How stale the persisted renewal time of the snapshot demand may get.
     demand_persistence_granularity: Duration,
     /// The last usable snapshot announced to SSE subscribers.
     announced_snapshot: Option<SequenceNumber>,
-    /// A snapshot that cannot be restored because the log has a gap after it: it is no longer
-    /// usable, so it is replaced by a new upload.
-    unrestorable_snapshot: Option<SequenceNumber>,
+    /// The highest cursor from which a sync found a gap of the log: a snapshot at or below it
+    /// cannot be restored, so it is not usable and a new upload replaces it.
+    unrestorable_through: Option<SequenceNumber>,
     timings: ActorTimings,
 }
 
 impl RoomActor {
-    /// Spawns a new RoomActor task, recovering state and initializing durability from disk.
-    /// `incarnation` tells this room apart from earlier rooms created with its id, and
-    /// `lifecycle_policy` is its effective policy.
-    #[allow(clippy::too_many_arguments)]
-    pub fn spawn(
-        room_id: RoomId,
-        incarnation: u128,
-        schema_id: SchemaId,
-        schema: Arc<Schema>,
-        data_dir: impl AsRef<Path>,
-        config: Arc<ServerConfig>,
-        lifecycle_policy: RoomLifecyclePolicy,
-        snapshot_relay: Arc<SnapshotRelay>,
-    ) -> Result<(mpsc::Sender<RoomCommand>, JoinHandle<ActorExit>), ServerError> {
-        let (sender, actor) = blocking_io(|| {
-            Self::open(
-                room_id,
-                incarnation,
-                schema_id,
-                schema,
-                data_dir,
-                config,
-                lifecycle_policy,
-                snapshot_relay,
-                ActorTimings::default(),
-            )
-        })?;
-        Ok((sender, tokio::spawn(actor.run())))
-    }
-
     /// Recovers the room from disk and builds its actor without starting it, with the given
-    /// `timings`.
+    /// `timings`. `incarnation` tells this room apart from earlier rooms created with its id,
+    /// and `lifecycle_policy` is its effective policy.
     ///
-    /// Reads the room's files: async callers run it through [`blocking_io`].
+    /// Reads the room's files: async callers run it through
+    /// [`blocking_io`](crate::blocking::blocking_io).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open(
         room_id: RoomId,
@@ -161,6 +133,7 @@ impl RoomActor {
         config: Arc<ServerConfig>,
         lifecycle_policy: RoomLifecyclePolicy,
         snapshot_relay: Arc<SnapshotRelay>,
+        response_budget: Arc<InflightBudget>,
         timings: ActorTimings,
     ) -> Result<(mpsc::Sender<RoomCommand>, Self), ServerError> {
         let room_dir = room_dir(data_dir.as_ref(), &room_id);
@@ -207,10 +180,11 @@ impl RoomActor {
             last_command_at: tokio::time::Instant::now(),
             stopping_idle: false,
             snapshot_relay,
+            response_budget,
             snapshot_demand,
             demand_persistence_granularity: persistence_granularity(demand_ttl),
             announced_snapshot: None,
-            unrestorable_snapshot: None,
+            unrestorable_through: None,
             timings,
         };
         // A snapshot that was already usable before this actor started is not news.
@@ -442,7 +416,7 @@ impl RoomActor {
                 let _ = reply.send(Ok(LogBounds {
                     tail_seq: self.tiered_log.tail_seq(),
                     head_seq: self.head_seq,
-                    unrestorable_snapshot: self.unrestorable_snapshot,
+                    unrestorable_through: self.unrestorable_through,
                 }));
             }
 
@@ -515,13 +489,16 @@ impl RoomActor {
             // The retry is accepted, so the cursor it reports (already validated against
             // head_seq) is recorded and the client's state recomputed from it.
             self.observe(client_id, Some(last_ack_seq));
-            let (catchup_ops, has_more) = self.catchup_after_commit(last_ack_seq);
+            let reservation = self.reserve_frame(client_id);
+            let (catchup_ops, has_more) =
+                self.catchup_after_commit(last_ack_seq, reservation.is_some());
             return Ok(CommitResponse {
                 assigned_seq: existing_seq,
                 catchup_ops,
                 has_more,
                 snapshot_wanted: self.snapshot_wanted_for(client_id),
                 schema_version: self.schema.version(),
+                reservation,
             });
         }
 
@@ -591,10 +568,12 @@ impl RoomActor {
         let _ = self.events_tx.send(RoomEvent::HeadAdvanced(new_seq));
 
         // Catch-up for 1-RTT synchronization.
-        let (catchup_ops, has_more) = if last_ack_seq.get() + 1 == new_seq.get() {
+        let reservation = self.reserve_frame(client_id);
+        let with_catchup = reservation.is_some();
+        let (catchup_ops, has_more) = if with_catchup && last_ack_seq.get() + 1 == new_seq.get() {
             (vec![seq_op], false)
         } else {
-            self.catchup_after_commit(last_ack_seq)
+            self.catchup_after_commit(last_ack_seq, with_catchup)
         };
 
         // A failed segment rotation after a durable append leaves the segment files in an
@@ -616,19 +595,33 @@ impl RoomActor {
             has_more,
             snapshot_wanted: self.snapshot_wanted_for(client_id),
             schema_version: self.schema.version(),
+            reservation,
         })
     }
 
+    /// A frame of `client_id`'s part of the budget of response bytes in flight, reserved right
+    /// before a response is read from the log, so that a command waiting in the mailbox holds
+    /// none. The response carries it to its encoding.
+    fn reserve_frame(&self, client_id: &ClientId) -> Option<Reservation> {
+        let holder = (self.room_id.clone(), Uploader::Client(client_id.clone()));
+        self.response_budget.reserve_frame(holder)
+    }
+
     /// Builds the catch-up batch returned with an acknowledged commit, starting after the
-    /// client's cursor.
+    /// client's cursor, unless the budget had no room for it (`with_catchup` unset).
     ///
     /// The commit itself is already durable, so a failure here must not turn into an error
-    /// reply. It degrades to an empty batch flagged `has_more`, which sends the client to
-    /// `/sync`, where the underlying error (for example `BehindCompaction`) is reported.
+    /// reply. Without a catch-up, the batch is empty and flagged `has_more`, which sends the
+    /// client to `/sync`, where any underlying error (for example `BehindCompaction`) is
+    /// reported.
     fn catchup_after_commit(
         &self,
         last_ack_seq: SequenceNumber,
+        with_catchup: bool,
     ) -> (Vec<SequencedOperation>, bool) {
+        if !with_catchup {
+            return (Vec::new(), true);
+        }
         match self
             .tiered_log
             .fetch_deltas(last_ack_seq, COMMIT_CATCHUP_BATCH)
@@ -659,6 +652,7 @@ impl RoomActor {
             return Err(ServerError::BehindCompaction);
         }
 
+        let reservation = self.reserve_frame(client_id).ok_or_else(no_room)?;
         let bounded_batch_size = max_batch_size.clamp(1, MAX_SYNC_BATCH);
         let (ops, has_more) = match self.tiered_log.fetch_deltas(from_seq, bounded_batch_size) {
             Ok((ops, has_more)) => fit_in_response(ops, has_more),
@@ -668,9 +662,7 @@ impl RoomActor {
                 // to bootstrap needs a snapshot whatever its cursor says, and a snapshot at
                 // or below the cursor, restored, would run into the same gap.
                 if matches!(e, ServerError::BehindCompaction) {
-                    if let Some(seq) = self.usable_snapshot_seq().filter(|seq| *seq <= from_seq) {
-                        self.unrestorable_snapshot = Some(seq);
-                    }
+                    self.unrestorable_through = self.unrestorable_through.max(Some(from_seq));
                     self.request_snapshot();
                 }
                 return Err(e);
@@ -685,6 +677,7 @@ impl RoomActor {
             has_more,
             snapshot_wanted: self.snapshot_wanted_for(client_id),
             schema_version: self.schema.version(),
+            reservation,
         })
     }
 
@@ -788,7 +781,10 @@ impl RoomActor {
         let tail_seq = self.tiered_log.tail_seq();
         self.snapshot_relay
             .active_snapshot_seq(&self.room_id)
-            .filter(|seq| Some(*seq) != self.unrestorable_snapshot)
+            .filter(|seq| {
+                self.unrestorable_through
+                    .is_none_or(|through| *seq > through)
+            })
             .filter(|seq| retention::is_usable_snapshot(*seq, tail_seq, self.head_seq))
     }
 
@@ -830,17 +826,17 @@ impl RoomActor {
     }
 
     /// Keeps a `Connected` client designated to upload while the demand is on, replacing a
-    /// designee that timed out or left. Every new designation is announced to SSE subscribers,
-    /// who check with a heartbeat whether they are the one.
+    /// designee that timed out or left; an upload by another member does not keep a designee
+    /// that does not upload. Every new designation is announced to SSE subscribers, who check
+    /// with a heartbeat whether they are the one.
     fn designate_uploader(&mut self) {
-        let upload_in_progress = self
+        let designee_uploading = self
             .snapshot_relay
-            .upload_in_progress(&self.room_id)
-            .is_some();
+            .upload_in_progress_by(&self.room_id, self.snapshot_demand.designee());
         let tracker = &self.lease_tracker;
         let designated = self.snapshot_demand.designate(
             Instant::now(),
-            upload_in_progress,
+            designee_uploading,
             |client_id| tracker.is_connected(client_id),
             |excluded| tracker.pick_uploader(excluded),
         );

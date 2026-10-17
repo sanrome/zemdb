@@ -78,12 +78,15 @@ pub struct SnapshotRelay {
     uploads_dir: PathBuf,
     ttl: Duration,
     max_snapshot_bytes: u64,
+    /// Longest a multipart upload may take, from its first chunk.
+    max_upload_duration: Duration,
     /// Single-request uploads in progress per room, bounded by [`MAX_PENDING_SINGLE_UPLOADS`].
     pending_single_uploads: DashMap<RoomId, usize>,
 }
 
 impl SnapshotRelay {
-    /// Opens the relay on `snapshots_dir`, creating it if needed.
+    /// Opens the relay on `snapshots_dir`, creating it if needed. A multipart upload is discarded
+    /// `max_upload_duration` after its first chunk, even if it is still progressing.
     ///
     /// Startup recovery deletes every partial upload, and for each room keeps only the
     /// highest-sequence snapshot file that is within `ttl` and intact (valid envelope and a
@@ -92,6 +95,7 @@ impl SnapshotRelay {
         snapshots_dir: impl AsRef<Path>,
         ttl: Duration,
         max_snapshot_bytes: u64,
+        max_upload_duration: Duration,
     ) -> std::io::Result<Self> {
         let snapshots_dir = snapshots_dir.as_ref().to_path_buf();
         let uploads_dir = snapshots_dir.join(UPLOADS_DIR);
@@ -104,6 +108,7 @@ impl SnapshotRelay {
             uploads_dir,
             ttl,
             max_snapshot_bytes,
+            max_upload_duration,
             pending_single_uploads: DashMap::new(),
         };
         relay.clear_uploads()?;

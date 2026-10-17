@@ -101,7 +101,7 @@ async fn snapshot_with_an_invalid_header_or_checksum_is_rejected() {
 #[tokio::test]
 async fn snapshot_above_the_size_limit_is_rejected() {
     let dir = tempdir().unwrap();
-    let relay = SnapshotRelay::new(snapshots_dir(&dir), TTL, 1000).unwrap();
+    let relay = SnapshotRelay::new(snapshots_dir(&dir), TTL, 1000, UPLOAD_MAX).unwrap();
     assert_bad_request(stage(&relay, 1, &envelope(1001, 1)).await);
     stage(&relay, 1, &envelope(1000, 1)).await.unwrap();
 }
@@ -228,7 +228,7 @@ async fn upload_for_a_higher_seq_replaces_the_current_one_and_deletes_its_file()
 #[tokio::test]
 async fn upload_sizes_are_bounded() {
     let dir = tempdir().unwrap();
-    let relay = SnapshotRelay::new(snapshots_dir(&dir), TTL, 8 * 1024 * 1024).unwrap();
+    let relay = SnapshotRelay::new(snapshots_dir(&dir), TTL, 8 * 1024 * 1024, UPLOAD_MAX).unwrap();
     let hash = [0u8; 32];
     let chunk_of = |len: usize| vec![0u8; len];
 
@@ -565,33 +565,46 @@ async fn multipart_upload_is_in_progress_until_it_completes_or_goes_idle() {
 }
 
 #[tokio::test]
-async fn single_request_upload_is_in_progress_while_it_is_handled() {
+async fn uploads_completed_in_one_request_are_in_progress_while_they_are_handled() {
     let dir = tempdir().unwrap();
     let relay = Arc::new(open(&dir));
-    let (gate, gate_rx) = tokio::sync::oneshot::channel::<()>();
-    let upload = tokio::spawn({
-        let relay = Arc::clone(&relay);
-        async move {
-            relay
-                .stage_snapshot(
-                    &room(),
-                    &Uploader::Admin,
-                    seq(5),
-                    Bytes::from(envelope(100, 1)),
-                    async {
-                        gate_rx.await.ok();
-                        Ok(log_bounds(0, 10))
-                    },
-                )
-                .await
+    // A single-request upload at 5, then an upload of one chunk at 6.
+    for n in [5u64, 6] {
+        let (gate, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let upload = tokio::spawn({
+            let relay = Arc::clone(&relay);
+            async move {
+                let range = async {
+                    gate_rx.await.ok();
+                    Ok(log_bounds(0, 10))
+                };
+                let data = envelope(100, n as u8);
+                if n == 5 {
+                    relay
+                        .stage_snapshot(&room(), &Uploader::Admin, seq(n), data.into(), range)
+                        .await
+                        .map(drop)
+                } else {
+                    let hash = ServerMessage::compute_snapshot_hash(&data);
+                    let layout = (data.len() as u64, 1);
+                    relay
+                        .stage_chunk(part(n, 0, layout, hash, &data), range)
+                        .await
+                        .map(drop)
+                }
+            }
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
         }
-    });
-    for _ in 0..10 {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(relay.upload_in_progress(&room()), Some(seq(0)));
+        assert_eq!(
+            relay.upload_in_progress(&room()),
+            Some(seq(0)),
+            "upload at {n}"
+        );
 
-    gate.send(()).unwrap();
-    upload.await.unwrap().unwrap();
-    assert_eq!(relay.upload_in_progress(&room()), None);
+        gate.send(()).unwrap();
+        upload.await.unwrap().unwrap();
+        assert_eq!(relay.upload_in_progress(&room()), None);
+    }
 }

@@ -657,6 +657,8 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// header timeout, so that only the stall timeout can close a connection during the test.
 fn one_connection_short_stall(config: &mut ServerConfig) {
     config.max_connections = 1;
+    // Room for the several responses of one client that the tests hold.
+    config.max_inflight_response_bytes_per_client = config.max_inflight_response_bytes;
     config.response_stall_timeout_secs = STALL_TIMEOUT.as_secs();
     config.header_read_timeout_secs = 300;
 }
@@ -763,6 +765,7 @@ const BUDGET_ROW_SIZE: usize = 5 * 1024 * 1024;
 async fn responses_over_the_budget_in_flight_wait_for_held_bodies() {
     let server = start_server(|config| {
         config.max_inflight_response_bytes = MAX_FRAME_SIZE as u64;
+        config.max_inflight_response_bytes_per_client = MAX_FRAME_SIZE as u64;
     })
     .await;
     server.commit_large_rows(BUDGET_ROWS, BUDGET_ROW_SIZE).await;
@@ -826,6 +829,65 @@ async fn responses_over_the_budget_in_flight_wait_for_held_bodies() {
     })
     .await
     .expect("a released body must return its bytes to the budget");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn client_over_its_part_of_the_budget_leaves_the_rest_to_other_rooms() {
+    let server = start_server(|config| {
+        config.max_inflight_response_bytes = 4 * MAX_FRAME_SIZE as u64;
+        config.max_inflight_response_bytes_per_client = MAX_FRAME_SIZE as u64;
+    })
+    .await;
+    server.commit_large_rows(BUDGET_ROWS, BUDGET_ROW_SIZE).await;
+    let held_client = http2_client();
+    let held = server.send_sync(&held_client).await;
+    assert_eq!(held.status(), StatusCode::OK);
+
+    // The client's next response does not fit in its part...
+    let client = reqwest::Client::new();
+    assert_binary_error(
+        server.send_sync(&client).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+        ErrorCode::Unavailable,
+    )
+    .await;
+
+    // ...while a client of another room is served.
+    let schema_id = SchemaId::new("tasks").unwrap();
+    let other_room = server.parts.create_room("room-other", &schema_id).await;
+    let other = ClientId::new("other-client").unwrap();
+    let sender = server
+        .parts
+        .room_manager
+        .get_or_spawn(&other_room, None)
+        .await;
+    register(&sender.unwrap(), &other).await;
+    let sync = ClientMessage::Sync {
+        correlation_id: CorrelationId::new(1),
+        room_id: other_room,
+        client_id: other,
+        from_seq: SequenceNumber::new(0),
+        max_batch_size: 100,
+    };
+    let response = client
+        .post(server.url("/rooms/room-other/sync"))
+        .bearer_auth(client_token("other-client", "room-other"))
+        .body(encode_message(&sync).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Releasing the held body frees the client's part.
+    drop((held, held_client));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while server.send_sync(&client).await.status() != StatusCode::OK {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("a released body must return its bytes to the client's part");
     server.shutdown().await;
 }
 

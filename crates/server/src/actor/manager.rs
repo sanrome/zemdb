@@ -22,6 +22,7 @@ use crate::error::ServerError;
 use crate::fail_point;
 use crate::log::{RoomLifecycleOverrides, RoomLifecyclePolicy};
 use crate::relay::{LogBounds, SnapshotRelay};
+use crate::response_budget::InflightBudget;
 use crate::schema_registry::SchemaRegistry;
 
 /// File, inside the room directory, recording the room's schema assignment and lifecycle
@@ -163,6 +164,8 @@ pub struct RoomManager {
     config: Arc<ServerConfig>,
     schema_registry: Arc<SchemaRegistry>,
     snapshot_relay: Arc<SnapshotRelay>,
+    /// Bytes of large responses in flight, which the room actors and the handlers reserve.
+    response_budget: Arc<InflightBudget>,
     data_dir: PathBuf,
     /// Lifecycle policy of a room without overrides.
     default_policy: RoomLifecyclePolicy,
@@ -181,6 +184,10 @@ impl RoomManager {
         let data_dir = config.data_dir.clone();
         let default_policy = config.default_lifecycle_policy();
         Self {
+            response_budget: Arc::new(InflightBudget::new(
+                config.max_inflight_response_bytes,
+                config.max_inflight_response_bytes_per_client,
+            )),
             rooms: Arc::new(DashMap::new()),
             room_meta: Arc::new(DashMap::new()),
             spawn_locks: DashMap::new(),
@@ -192,6 +199,11 @@ impl RoomManager {
             default_policy,
             timings: ActorTimings::default(),
         }
+    }
+
+    /// The budget of response bytes in flight that the room actors reserve from.
+    pub(crate) fn response_budget(&self) -> &Arc<InflightBudget> {
+        &self.response_budget
     }
 
     /// Replaces the server defaults of the room lifecycle policy, which [`new`](Self::new)
@@ -387,6 +399,7 @@ impl RoomManager {
             Arc::clone(&self.config),
             policy,
             Arc::clone(&self.snapshot_relay),
+            Arc::clone(&self.response_budget),
             self.timings,
         )?;
         let actor_id = self.next_actor_id.fetch_add(1, Ordering::Relaxed);
@@ -554,7 +567,7 @@ impl RoomManager {
         }
     }
 
-    /// Retained log range of a room, and the snapshot it found to lie below a gap, spawning
+    /// Retained log range of a room, and the highest cursor from which it found a gap, spawning
     /// its actor if needed. A room that does not exist is `RoomNotFound`.
     pub async fn log_bounds(&self, room_id: &RoomId) -> Result<LogBounds, ServerError> {
         self.ask(room_id, |reply| RoomCommand::GetLogBounds { reply })

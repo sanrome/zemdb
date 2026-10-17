@@ -50,7 +50,8 @@ struct LogMeta {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MaintenanceReport {
     pub warm_compressed_count: usize,
-    pub cold_pruned_count: usize,
+    /// Segments pruned by the cold TTL or the disk quota.
+    pub pruned_count: usize,
     pub new_tail_seq: SequenceNumber,
 }
 
@@ -287,8 +288,9 @@ impl TieredLog {
     /// run, or `BehindCompaction` if the cursor is past retention.
     ///
     /// Returns at most `max_batch_size` operations that fit in one response
-    /// ([`MAX_RESPONSE_OPS_BYTES`]), and at least one: operations beyond the budget are neither
-    /// decoded into the batch nor cloned.
+    /// ([`MAX_RESPONSE_OPS_BYTES`], as [`op_bytes`](crate::log::budget::op_bytes) charges them),
+    /// and at least one: operations beyond the budget are neither decoded into the batch nor
+    /// cloned.
     pub fn fetch_deltas(
         &self,
         from_seq: SequenceNumber,
@@ -344,7 +346,7 @@ impl TieredLog {
 
     /// Fills `batch` from the sealed segments and `active.wal`.
     fn fetch_from_disk(&self, batch: &mut DeltaBatch) -> Result<(), ServerError> {
-        for segment in self.segments.iter() {
+        for segment in self.segments.iter_from(batch.cursor.next()) {
             if batch.is_full() {
                 return Ok(());
             }
@@ -367,8 +369,8 @@ impl TieredLog {
 
     /// Disk maintenance: compresses aged warm segments into cold Zstd segments (at most
     /// [`MAX_COMPRESSIONS_PER_PASS`]), delegating the compression to `spawn_blocking`, applies
-    /// the RAM TTL window, and prunes cold segments past their TTL or over the room's disk
-    /// quota.
+    /// the RAM TTL window, and prunes cold segments past their TTL and any segment over the
+    /// room's disk quota.
     ///
     /// A failed compression does not stop the other passes: the remaining segments are still
     /// compressed and the TTL and quota still apply. The first error is returned at the end.
@@ -456,16 +458,18 @@ impl TieredLog {
     }
 
     /// The warm segments to compress in this pass: those sealed for at least `warm_disk_ttl`
-    /// at `now`, at most [`MAX_COMPRESSIONS_PER_PASS`]. Those that never failed go first,
+    /// at `now`, or all of them while the log is over `max_room_disk_bytes`, at most
+    /// [`MAX_COMPRESSIONS_PER_PASS`]. Those that never failed go first,
     /// oldest first; then those whose last failure is oldest, so that retries rotate through
     /// every failed segment instead of always retrying the same ones.
     fn warm_segments_due(&mut self, now: SystemTime) -> Vec<SegmentEntry> {
         self.maintenance_passes += 1;
+        let over_quota = self.disk_bytes() > self.policy.max_room_disk_bytes;
         let mut due: Vec<SegmentEntry> = self
             .segments
             .iter()
             .filter(|segment| segment.tier == Tier::Warm)
-            .filter(|segment| age(segment, now) >= self.policy.warm_disk_ttl)
+            .filter(|segment| over_quota || age(segment, now) >= self.policy.warm_disk_ttl)
             .cloned()
             .collect();
         self.failed_compressions
@@ -493,8 +497,8 @@ impl TieredLog {
     }
 
     /// Applies the RAM TTL window, retries removing the warm copies of compressed segments and
-    /// prunes the oldest cold segments while they are past `cold_disk_ttl` or the log is over
-    /// `max_room_disk_bytes`.
+    /// prunes the oldest segments while they are cold and past `cold_disk_ttl`, or the log
+    /// (warm or cold) is over `max_room_disk_bytes`.
     ///
     /// Every operation in RAM is also on disk, and retention is defined by the disk tiers
     /// alone, so evicting expired operations from RAM never moves `tail_seq`.
@@ -518,16 +522,16 @@ impl TieredLog {
         let mut disk_bytes = self.disk_bytes();
         let mut doomed = Vec::new();
         for segment in self.segments.iter() {
-            let expired = segment.tier == Tier::Cold
-                && (age(segment, clock.wall) >= self.policy.cold_disk_ttl
-                    || disk_bytes > self.policy.max_room_disk_bytes);
+            let expired = (segment.tier == Tier::Cold
+                && age(segment, clock.wall) >= self.policy.cold_disk_ttl)
+                || disk_bytes > self.policy.max_room_disk_bytes;
             if !expired {
                 break;
             }
-            disk_bytes = disk_bytes.saturating_sub(segment.bytes);
+            disk_bytes = disk_bytes.saturating_sub(segment.disk_bytes());
             doomed.push(segment.clone());
         }
-        report.cold_pruned_count += doomed.len();
+        report.pruned_count += doomed.len();
 
         self.prune_segments(&doomed)?;
         report.new_tail_seq = self.tail_seq;
@@ -613,11 +617,12 @@ impl TieredLog {
         self.tail_seq
     }
 
-    /// Bytes the log occupies on disk: its sealed segments and `active.wal`, without their
-    /// mutation ID sidecars (24 bytes per operation). Kept up to date incrementally; checked
-    /// against `max_room_disk_bytes`.
+    /// Bytes the log occupies on disk: its sealed segments with their mutation ID sidecars, and
+    /// `active.wal`. Kept up to date incrementally; checked against `max_room_disk_bytes`.
     pub fn disk_bytes(&self) -> u64 {
-        self.segments.total_bytes() + self.warm_disk.active_len()
+        self.segments
+            .total_bytes()
+            .saturating_add(self.warm_disk.active_len())
     }
 
     /// Seals `active.wal` now, without evicting RAM.

@@ -380,14 +380,10 @@ async fn failed_commit_sync_stops_room_and_recovers_from_disk() {
     // The next request respawns the room from disk.
     let recovered = fx.sender().await;
     assert!(!recovered.same_channel(&sender));
-    let retry = commit(&recovered, &client, mutation(2), seq(1), insert_op(2))
-        .await
-        .unwrap();
-    assert_eq!(retry.assigned_seq, seq(2));
-    let next = commit(&recovered, &client, mutation(3), seq(2), insert_op(3))
-        .await
-        .unwrap();
-    assert_eq!(next.assigned_seq, seq(3));
+    let retry = commit(&recovered, &client, mutation(2), seq(1), insert_op(2)).await;
+    assert_eq!(retry.unwrap().assigned_seq, seq(2));
+    let next = commit(&recovered, &client, mutation(3), seq(2), insert_op(3)).await;
+    assert_eq!(next.unwrap().assigned_seq, seq(3));
 
     let synced = sync_all(&recovered, &client).await.unwrap();
     let seqs: Vec<u64> = synced.ops.iter().map(|op| op.seq.get()).collect();
@@ -512,14 +508,10 @@ async fn rotation_failure_after_durable_commit_is_acknowledged_and_restarts_room
     );
 
     let recovered = fx.sender().await;
-    let retry = commit(&recovered, &client, mutation(2), seq(1), insert_op(2))
-        .await
-        .unwrap();
-    assert_eq!(retry.assigned_seq, seq(2));
-    let next = commit(&recovered, &client, mutation(3), seq(2), insert_op(3))
-        .await
-        .unwrap();
-    assert_eq!(next.assigned_seq, seq(3));
+    let retry = commit(&recovered, &client, mutation(2), seq(1), insert_op(2)).await;
+    assert_eq!(retry.unwrap().assigned_seq, seq(2));
+    let next = commit(&recovered, &client, mutation(3), seq(2), insert_op(3)).await;
+    assert_eq!(next.unwrap().assigned_seq, seq(3));
     let synced = sync_all(&recovered, &client).await.unwrap();
     let seqs: Vec<u64> = synced.ops.iter().map(|op| op.seq.get()).collect();
     assert_eq!(seqs, vec![1, 2, 3]);
@@ -648,7 +640,7 @@ async fn snapshot_below_the_retained_range_does_not_anchor_pruning() {
             std::future::ready(Ok(crate::relay::LogBounds {
                 tail_seq: seq(0),
                 head_seq: seq(100),
-                unrestorable_snapshot: None,
+                unrestorable_through: None,
             })),
         )
         .await
@@ -1215,12 +1207,12 @@ async fn snapshot_below_a_gap_stops_being_usable() {
     let segments = fx.room_dir().join("segments");
     fs::remove_file(segment_path(&segments, seq(3), seq(4), Tier::Warm)).unwrap();
 
-    // A client restores the snapshot and finds the gap after it: the snapshot is no longer
+    // A client past the snapshot finds the gap after its cursor: the snapshot is no longer
     // offered, and the writer is asked for a new one.
     let restorer = ClientId::new("restorer").unwrap();
-    register_at(&sender, &restorer, Some((seq(2), fx.incarnation))).await;
+    register_at(&sender, &restorer, Some((seq(3), fx.incarnation))).await;
     let gap = async || {
-        let res = sync_from(&sender, &restorer, seq(2)).await;
+        let res = sync_from(&sender, &restorer, seq(3)).await;
         assert!(matches!(res, Err(ServerError::BehindCompaction)), "{res:?}");
         heartbeat(&sender, &writer).await.unwrap()
     };
@@ -1238,18 +1230,26 @@ async fn snapshot_below_a_gap_stops_being_usable() {
     let res = first_chunk().await;
     assert!(matches!(res, Err(ServerError::RoomNotFound(_))), "{res:?}");
     assert_eq!(fx.relay.active_snapshot_seq(&fx.room_id), None);
-    // Nor is a new upload at its sequence accepted.
-    let res = fx
-        .relay
-        .stage_snapshot(
-            &fx.room_id,
-            &crate::relay::Uploader::Admin,
-            seq(2),
-            snapshot_envelope(),
-            fx.manager.log_bounds(&fx.room_id),
-        )
-        .await;
-    assert!(matches!(res, Err(ServerError::BadRequest(_))), "{res:?}");
+    // Nor is a new upload at its sequence, or at any other up to the cursor: restored, it
+    // would run into the same gap. A sync from further down does not lower that bound.
+    let res = sync_from(&sender, &restorer, seq(2)).await;
+    assert!(matches!(res, Err(ServerError::BehindCompaction)), "{res:?}");
+    for n in [2, 3] {
+        let res = fx
+            .relay
+            .stage_snapshot(
+                &fx.room_id,
+                &crate::relay::Uploader::Admin,
+                seq(n),
+                snapshot_envelope(),
+                fx.manager.log_bounds(&fx.room_id),
+            )
+            .await;
+        assert!(
+            matches!(res, Err(ServerError::BadRequest(_))),
+            "{n}: {res:?}"
+        );
+    }
 
     // A snapshot above the gap is offered and served, also after another client runs into it.
     stage_snapshot_at(&fx, 6).await;
@@ -1348,7 +1348,7 @@ async fn upload_chunk(fx: &Fixture, n: u64, index: u32) -> bool {
 }
 
 #[tokio::test]
-async fn designee_that_does_not_upload_in_time_is_replaced_but_never_during_an_upload() {
+async fn designee_that_does_not_upload_in_time_is_replaced_but_never_during_its_upload() {
     let fx = Fixture::with_options(
         small_segments(),
         |_| {},
@@ -1378,14 +1378,21 @@ async fn designee_that_does_not_upload_in_time_is_replaced_but_never_during_an_u
     assert!(snapshot_wanted(&sender, &peer).await);
     assert!(!snapshot_wanted(&sender, &writer).await);
 
-    // An upload starts: however long it takes, the role stays put.
+    // The writer's upload does not keep the peer, which does not upload: every candidate had
+    // its turn, so the role goes back to the writer.
     assert!(!upload_chunk(&fx, 8, 0).await);
-    let _ = pending_snapshot_events(&mut events);
-    // Well past the designation timeout, with several maintenance ticks.
+    assert_eq!(
+        next_snapshot_event(&mut events).await,
+        RoomEvent::SnapshotWanted
+    );
+    assert!(snapshot_wanted(&sender, &writer).await);
+
+    // The designee's upload does: however long it takes, the role stays put. Well past the
+    // designation timeout, with several maintenance ticks.
     tokio::time::sleep(DESIGNATION_TIMEOUT_IN_TESTS * 5 / 2).await;
     let during_upload = pending_snapshot_events(&mut events);
     assert!(during_upload.is_empty(), "{during_upload:?}");
-    assert!(snapshot_wanted(&sender, &peer).await);
+    assert!(snapshot_wanted(&sender, &writer).await);
 
     // The upload completes: the demand ends.
     assert!(!upload_chunk(&fx, 8, 1).await);
@@ -1394,7 +1401,7 @@ async fn designee_that_does_not_upload_in_time_is_replaced_but_never_during_an_u
         next_snapshot_event(&mut events).await,
         RoomEvent::SnapshotAvailable(seq(8))
     );
-    assert!(!snapshot_wanted(&sender, &peer).await);
+    assert!(!snapshot_wanted(&sender, &writer).await);
     fx.manager.shutdown_all().await;
 }
 
@@ -1598,7 +1605,7 @@ async fn register_reports_only_a_usable_snapshot() {
             std::future::ready(Ok(crate::relay::LogBounds {
                 tail_seq: seq(0),
                 head_seq: seq(100),
-                unrestorable_snapshot: None,
+                unrestorable_through: None,
             })),
         )
         .await
@@ -1698,6 +1705,7 @@ async fn commands_queued_when_the_room_goes_idle_are_handled() {
         config,
         RoomLifecyclePolicy::default(),
         Arc::clone(&fx.relay),
+        Arc::new(InflightBudget::new(u64::MAX, u64::MAX)),
         ActorTimings::default(),
     )
     .unwrap();
@@ -2449,6 +2457,7 @@ mod onboarding_sim {
                     dir.join("snapshots"),
                     Duration::from_secs(2000),
                     ServerConfig::default().max_snapshot_bytes,
+                    Duration::from_secs(ServerConfig::default().snapshot_upload_max_secs),
                 )
                 .unwrap(),
             )
@@ -2468,6 +2477,7 @@ mod onboarding_sim {
                 config,
                 self.policy.clone(),
                 Arc::clone(self.relay.as_ref().unwrap()),
+                Arc::new(InflightBudget::new(u64::MAX, u64::MAX)),
                 ActorTimings {
                     designation_timeout: Duration::from_millis(100),
                     ..TEST_TIMINGS
@@ -2491,7 +2501,7 @@ mod onboarding_sim {
             LogBounds {
                 tail_seq: a.tiered_log.tail_seq(),
                 head_seq: a.head_seq,
-                unrestorable_snapshot: a.unrestorable_snapshot,
+                unrestorable_through: a.unrestorable_through,
             }
         }
 
@@ -2583,9 +2593,8 @@ mod onboarding_sim {
                     b.tail_seq,
                     b.head_seq
                 );
-                assert_ne!(
-                    Some(s),
-                    self.a().unrestorable_snapshot,
+                assert!(
+                    self.a().unrestorable_through < Some(s),
                     "{what} announced a snapshot below a known gap"
                 );
             }
@@ -2905,9 +2914,8 @@ mod onboarding_sim {
                                 && snapshot_head_seq <= b.head_seq,
                             "chunk 0 served a snapshot outside the retained range"
                         );
-                        assert_ne!(
-                            Some(snapshot_head_seq),
-                            self.a().unrestorable_snapshot,
+                        assert!(
+                            self.a().unrestorable_through < Some(snapshot_head_seq),
                             "chunk 0 served a snapshot below a known gap"
                         );
                         self.clients[i].phase = Phase::Downloading {

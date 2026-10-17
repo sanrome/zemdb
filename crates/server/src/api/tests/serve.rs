@@ -182,8 +182,14 @@ async fn one_stalled_response_is_not_hidden_by_another_that_progresses() {
 
 /// The frames of `data` as a body, holding part of a budget if `budgeted`.
 async fn frames_of(data: &Bytes, budgeted: bool) -> Vec<Bytes> {
-    let budget = budgeted
-        .then(|| ResponseBudget::new(Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap()));
+    let budget = budgeted.then(|| {
+        let budget = Arc::new(crate::response_budget::InflightBudget::new(1, 1));
+        let holder = (
+            zemdb_core::id::RoomId::new("room").unwrap(),
+            crate::relay::Uploader::Admin,
+        );
+        ResponseBudget::new(budget.reserve(holder, 1).unwrap())
+    });
     let activity = Arc::new(Activity::default());
     let mut body = Box::pin(TrackedBody::new(
         Body::from(data.clone()),

@@ -31,8 +31,9 @@ pub struct LogBounds {
     pub tail_seq: SequenceNumber,
     /// Highest committed sequence number.
     pub head_seq: SequenceNumber,
-    /// Sequence of a snapshot the room found to lie below a gap of its log.
-    pub unrestorable_snapshot: Option<SequenceNumber>,
+    /// A cursor from which the room found a gap of its log: no snapshot at or below it can be
+    /// restored.
+    pub unrestorable_through: Option<SequenceNumber>,
 }
 
 impl LogBounds {
@@ -40,7 +41,9 @@ impl LogBounds {
     /// `tail - 1 <= seq <= head`, and the room found no gap after it.
     pub(super) fn admits(&self, seq: SequenceNumber) -> bool {
         retention::is_usable_snapshot(seq, self.tail_seq, self.head_seq)
-            && self.unrestorable_snapshot != Some(seq)
+            && self
+                .unrestorable_through
+                .is_none_or(|through| seq > through)
     }
 
     /// Rejects `seq` with `error` unless the range admits it.
@@ -62,7 +65,7 @@ impl LogBounds {
 }
 
 /// Who is uploading a snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Uploader {
     /// The holder of the admin secret (the automated snapshot worker).
     Admin,

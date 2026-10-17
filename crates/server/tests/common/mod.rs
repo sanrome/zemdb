@@ -146,6 +146,7 @@ fn new_relay(config: &ServerConfig) -> Arc<SnapshotRelay> {
             config.data_dir.join("snapshots"),
             Duration::from_secs(config.snapshot_ttl_secs),
             config.max_snapshot_bytes,
+            Duration::from_secs(config.snapshot_upload_max_secs),
         )
         .unwrap(),
     )

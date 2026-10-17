@@ -9,6 +9,7 @@ use zemdb_core::schema::Schema;
 use crate::error::ServerError;
 use crate::log::RoomLifecyclePolicy;
 use crate::relay::LogBounds;
+use crate::response_budget::Reservation;
 
 /// Response returned to a client upon successful room registration.
 #[derive(Debug, Clone)]
@@ -22,7 +23,7 @@ pub struct RegisterResponse {
 }
 
 /// Response returned to a client upon committing an operation.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CommitResponse {
     pub assigned_seq: SequenceNumber,
     pub catchup_ops: Vec<SequencedOperation>,
@@ -30,10 +31,13 @@ pub struct CommitResponse {
     /// Whether this client is the one designated to upload a room snapshot.
     pub snapshot_wanted: bool,
     pub schema_version: u64,
+    /// The frame of the budget of response bytes in flight that the catch-up was read within;
+    /// without one, the catch-up is empty and flagged `has_more`.
+    pub(crate) reservation: Option<Reservation>,
 }
 
 /// Response returned upon requesting delta operations via Sync.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SyncBatchResponse {
     pub head_seq: SequenceNumber,
     pub ops: Vec<SequencedOperation>,
@@ -41,6 +45,8 @@ pub struct SyncBatchResponse {
     /// Whether this client is the one designated to upload a room snapshot.
     pub snapshot_wanted: bool,
     pub schema_version: u64,
+    /// The frame of the budget of response bytes in flight that the batch was read within.
+    pub(crate) reservation: Reservation,
 }
 
 /// Response returned to a client's heartbeat.
@@ -155,7 +161,7 @@ pub enum RoomCommand {
     },
 
     /// Query the retained log range (the oldest retained sequence and the highest committed
-    /// one) and the snapshot sequence found to lie below a gap, if any. The snapshot relay
+    /// one) and the highest cursor from which a sync found a gap, if any. The snapshot relay
     /// uses it to accept and serve only snapshots a client can catch up from.
     GetLogBounds {
         reply: oneshot::Sender<Result<LogBounds, ServerError>>,

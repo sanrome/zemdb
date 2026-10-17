@@ -47,12 +47,23 @@ pub(crate) struct SegmentEntry {
     pub(crate) since: SystemTime,
 }
 
+impl SegmentEntry {
+    /// Bytes of the segment and of its sidecar, whose size follows from the range: a sidecar
+    /// holds at most one entry per operation.
+    pub(crate) fn disk_bytes(&self) -> u64 {
+        let ops = (self.end_seq.get().saturating_sub(self.start_seq.get())).saturating_add(1);
+        let sidecar = ops.saturating_mul(MUTATION_ID_ENTRY as u64);
+        self.bytes
+            .saturating_add(sidecar.saturating_add(SIDECAR_FRAMING))
+    }
+}
+
 /// In-memory index of the sealed segments of a room log, in sequence order.
 ///
 /// Built with a single listing of the segments directory when the log opens and kept up to
 /// date by the log itself on every rotation, compression and prune, so that serving deltas and
 /// running maintenance never list the directory. It also keeps the total size of the sealed
-/// segments, for the room's disk quota.
+/// segments and their sidecars, for the room's disk quota.
 #[derive(Debug, Default)]
 pub(crate) struct SegmentIndex {
     segments: BTreeMap<u64, SegmentEntry>,
@@ -153,22 +164,29 @@ impl SegmentIndex {
 
     /// Adds `segment`, replacing the one with the same `start_seq`.
     pub(crate) fn insert(&mut self, segment: SegmentEntry) {
-        self.total_bytes += segment.bytes;
+        self.total_bytes = self.total_bytes.saturating_add(segment.disk_bytes());
         if let Some(replaced) = self.segments.insert(segment.start_seq.get(), segment) {
-            self.total_bytes -= replaced.bytes;
+            self.total_bytes = self.total_bytes.saturating_sub(replaced.disk_bytes());
         }
     }
 
     /// Removes the segment starting at `start_seq`.
     pub(crate) fn remove(&mut self, start_seq: SequenceNumber) -> Option<SegmentEntry> {
         let removed = self.segments.remove(&start_seq.get())?;
-        self.total_bytes -= removed.bytes;
+        self.total_bytes = self.total_bytes.saturating_sub(removed.disk_bytes());
         Some(removed)
     }
 
     /// The segments in sequence order.
     pub(crate) fn iter(&self) -> impl DoubleEndedIterator<Item = &SegmentEntry> {
         self.segments.values()
+    }
+
+    /// The segments in sequence order, from the last one starting at or before `seq`.
+    pub(crate) fn iter_from(&self, seq: SequenceNumber) -> impl Iterator<Item = &SegmentEntry> {
+        let first = self.segments.range(..=seq.get()).next_back();
+        let start = first.map_or(0, |(start, _)| *start);
+        self.segments.range(start..).map(|(_, segment)| segment)
     }
 
     /// First sequence of the oldest segment.
@@ -187,7 +205,7 @@ impl SegmentIndex {
             .map(|segment| segment.end_seq)
     }
 
-    /// Total size of the indexed segment files.
+    /// Total size of the indexed segment files and their sidecars.
     pub(crate) fn total_bytes(&self) -> u64 {
         self.total_bytes
     }
@@ -205,6 +223,9 @@ pub(crate) fn mutation_ids_path(
 
 /// Size of one entry of a sidecar: the mutation ID and its sequence, little-endian.
 const MUTATION_ID_ENTRY: usize = 16 + 8;
+
+/// Size of a sidecar without its entries: the segment's range and the CRC32.
+const SIDECAR_FRAMING: u64 = 16 + 4;
 
 /// Encodes the sidecar of the segment `start..=end`: the segment's range, its entries, and a
 /// CRC32 of both, so that a sidecar is valid only for its own segment.
