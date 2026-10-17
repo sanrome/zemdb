@@ -122,18 +122,17 @@ async fn room_deletion_finishes_when_the_request_is_dropped() {
         .await
         .unwrap();
 
-    // The request is dropped while the relay deletes the room's snapshot files. Until the
-    // directory is removed, nobody else can open the room's log.
+    // The request is dropped while the relay deletes the room's snapshot files. By then the
+    // room's directory has been renamed away.
     let room_dir = dir.path().join("rooms").join("doomed");
-    let locked_dir = room_dir.clone();
+    let moved_dir = room_dir.clone();
     let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
     fail_point::arm_hook(
         "relay_purge_room_files",
         &dir.path().join("snapshots"),
         move || {
-            let opened = crate::log::TieredLog::open_or_create(&locked_dir, Default::default());
-            let _ = reached_tx.send(matches!(opened, Err(ServerError::RoomLocked(_))));
+            let _ = reached_tx.send(!moved_dir.exists());
             let _ = resume_rx.recv();
         },
     );
@@ -143,23 +142,30 @@ async fn room_deletion_finishes_when_the_request_is_dropped() {
         .unwrap();
     tokio::select! {
         _ = build_router(state.app_state()).oneshot(request) => panic!("the purge did not stop"),
-        locked = reached_rx => assert!(locked.unwrap(), "the log was opened during the purge"),
+        moved = reached_rx => assert!(moved.unwrap(), "the room was in place during the purge"),
     }
     resume_tx.send(()).unwrap();
 
+    let rooms_left = || std::fs::read_dir(dir.path().join("rooms")).unwrap().count();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while room_dir.exists() && tokio::time::Instant::now() < deadline {
+    while rooms_left() > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(!room_dir.exists());
+    assert_eq!(rooms_left(), 0);
     assert!(!state.manager.room_exists(&room_id).unwrap());
 }
 
 /// A `DELETE /admin/rooms/doomed` over TCP whose client disconnects while the relay purges the
-/// room's snapshot: without a shutdown, the detached deletion finishes, and the next start of
-/// the server finds neither the room nor its snapshot.
+/// room's snapshot. Without a shutdown, the detached deletion finishes; an orderly shutdown
+/// right away cuts it once the runtime is dropped. Either way, the next start of the server
+/// finds neither the room, nor its directory, nor its snapshot.
 #[test]
 fn room_deletion_whose_client_disconnects_over_tcp_removes_the_room_and_its_snapshot() {
+    disconnected_deletion_over_tcp(false);
+    disconnected_deletion_over_tcp(true);
+}
+
+fn disconnected_deletion_over_tcp(shutdown: bool) {
     use crate::api::serve::{serve_until_shutdown, SHUTDOWN_GRACE_PERIOD};
     use crate::relay::LogBounds;
     use tokio::io::AsyncWriteExt;
@@ -175,7 +181,7 @@ fn room_deletion_whose_client_disconnects_over_tcp_removes_the_room_and_its_snap
         .build()
         .unwrap();
 
-    runtime.block_on(async {
+    let resume_tx = runtime.block_on(async {
         let state = TestState::new(dir.path(), |config| {
             config.admin_secret = ADMIN_SECRET.to_string();
         });
@@ -256,19 +262,28 @@ fn room_deletion_whose_client_disconnects_over_tcp_removes_the_room_and_its_snap
             .expect("the purge was not reached")
             .unwrap();
         drop(stream);
-        resume_tx.send(()).unwrap();
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        while room_dir.exists() && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        if !shutdown {
+            resume_tx.send(()).unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            while room_dir.exists() && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(!room_dir.exists());
         }
-        assert!(!room_dir.exists());
+        // The shutdown does not wait for a deletion whose client went away.
         stop_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .expect("the server did not shut down")
             .unwrap()
             .expect("orderly shutdown");
+        resume_tx
+    });
+    // `main` returns and the runtime is dropped: tasks are cancelled at their next poll, and
+    // blocking work is waited for. The parked purge resumes once the drop has started.
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = resume_tx.send(());
     });
     drop(runtime);
 
@@ -279,7 +294,13 @@ fn room_deletion_whose_client_disconnects_over_tcp_removes_the_room_and_its_snap
         .unwrap();
     restarted.block_on(async {
         let state = TestState::new(dir.path(), |_| {});
-        assert!(!state.manager.room_exists(&room_id).unwrap());
-        assert_eq!(state.relay.active_snapshot_seq(&room_id), None);
+        assert!(!state.manager.room_exists(&room_id).unwrap(), "{shutdown}");
+        let rooms = std::fs::read_dir(dir.path().join("rooms")).unwrap().count();
+        assert_eq!(rooms, 0, "{shutdown}");
+        assert_eq!(
+            state.relay.active_snapshot_seq(&room_id),
+            None,
+            "{shutdown}"
+        );
     });
 }

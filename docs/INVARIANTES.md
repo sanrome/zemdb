@@ -116,8 +116,8 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 | **INV-R3** | Perder estado volátil del roster solo cuesta retención o re-registro | | Medio | ✅ |
 | **INV-R4** | Todo cliente que se queda atrás termina pudiendo ponerse al día | | Medio | ✅ |
 | **INV-R5** | Solo se anuncian y sirven snapshots usables, y una descarga es de un solo snapshot | | Medio | ✅ |
-| **INV-R6** | Un snapshot solo se ofrece a la encarnación que lo aceptó | | Medio | 🆕 (Lote 5) |
-| **INV-R7** | Una subida confirmada es usable | | Bajo | ❌ (Lote 5) |
+| **INV-R6** | Un snapshot solo se ofrece a la encarnación que lo aceptó | | Medio | ✅ |
+| **INV-R7** | Una subida confirmada es usable | | Bajo | ✅ |
 | **INV-A1** | Nadie actúa sobre otra sala ni como otro cliente | ★ | Alto | ✅ |
 | **INV-A2** | Nada se decodifica antes de autenticar, salvo lo acotado de `/register` | | Alto | ✅ |
 | **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio | ✅ |
@@ -128,11 +128,11 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 | **INV-B4** | El costo por request del actor no depende de la historia | | Medio | ✅ |
 | **INV-B5** | Ningún cliente acapara un recurso global | | Medio | ✅ |
 | **INV-L1** | Toda request recibe una respuesta, en tiempo acotado | | Medio | ✅ |
-| **INV-L2** | Cancelar una request nunca deja estado a medias | | Medio | ❌ (Lote 5) |
+| **INV-L2** | Cancelar una request nunca deja estado a medias | | Medio | ✅ |
 | **INV-L3** | Un I/O incierto nunca se confirma como éxito | ★ | Alto | ✅ |
 | **INV-L4** | Reabrir una sala no cambia ningún estado confirmado | | Medio | ✅ |
 | **INV-L5** | El apagado no pierde nada confirmado | | Medio | ✅ |
-| **INV-L6** | Borrar una sala es atómico | | Medio | 🆕 (Lote 5) |
+| **INV-L6** | Borrar una sala es atómico | | Medio | ✅ |
 | **INV-E1** | El esquema solo crece, y toda operación del log sigue siendo válida | ★ | Alto | ✅ |
 | **INV-E2** | Un cliente con el esquema viejo siempre puede enterarse | | Bajo | ✅ |
 | **INV-W1** | Ninguna entrada hace entrar en pánico, abortar ni reservar de más | ★ | Alto | ✅ |
@@ -306,13 +306,14 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 
 #### INV-R6 · Un snapshot solo se ofrece a la encarnación que lo aceptó
 **Enunciado.** Un snapshot que el relay aceptó para una encarnación de una sala nunca se anuncia, ancla ni sirve en otra encarnación con el mismo id, aunque la sala se haya recreado sin pasar por `delete_room`.
-**Sostenida por.** `delete_room` purga el relay (§6 *Room deletion*). *Pendiente (Lote 5, D84):* `create_room` también lo purga.
+**Sostenida por.** `delete_room` y `create_room` purgan el relay (D84, §6 *Room deletion*).
 **Cómo intentar romperla.** Recrear una sala cuyo directorio se perdió, con un snapshot viejo todavía en el relay; reinicio del servidor entre medio.
 
 #### INV-R7 · Una subida confirmada es usable
 **Enunciado.** Si el relay confirma una subida (`SnapshotStaged` o `staged: true`), el snapshot es usable en ese momento (INV-R5). Si el rango retenido se movió y ya no lo es, la respuesta es `SnapshotSuperseded`.
-**Sostenida por.** D61 para las subidas de varios chunks; las de un solo chunk anclan la poda mientras se lee el rango, como las de un solo request (§5.2 *Snapshot Retention Anchor*). *Pendiente (Lote 5):* la poda por TTL o cuota, que ignora el ancla, entre la lectura del rango y la instalación.
+**Sostenida por.** D61 para las subidas de varios chunks; las de un solo chunk anclan la poda mientras se lee el rango, como las de un solo request (§5.2 *Snapshot Retention Anchor*). Contra la poda por TTL o cuota, que ignora el ancla, el piso que el actor publica al abrirse, después de cada pasada de mantenimiento y al encontrar un hueco: el relay lo compara justo antes de instalar (§6 *Acceptance*).
 **Cómo intentar romperla.** Podas por cursores, TTL y cuota entre la consulta del rango y la instalación, en subidas de un request, de un chunk y de varios.
+**Límite aceptado.** Una pasada de TTL o cuota publica el piso después de borrar los segmentos, así que una instalación que cae en esos milisegundos puede confirmar un snapshot que ya no es usable. Tampoco se mira el piso al reenviar un chunk de una subida ya instalada, que responde `staged: true`. En los dos casos el snapshot no se anuncia ni se sirve (INV-R5); el costo es que la demanda sigue y se pide otra subida.
 
 ### 3.5. Aislamiento y autorización
 
@@ -374,8 +375,8 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 
 #### INV-L2 · Cancelar una request nunca deja estado a medias
 **Enunciado.** Si el cliente corta una request en cualquier `.await`, el efecto es "no ocurrió" o "ocurrió entero". Las operaciones de varios pasos (delete de sala, escrituras del relay, `add_column`, compactación y escrituras del storage) corren en su propia tarea, o marcan la sala como fallida.
-**Sostenida por.** `run_to_completion`, `tokio::spawn` en `delete_room` y `add_column`, `open_room`, `compact_room` y `apply_snapshot` del storage en su propia tarea (D86, D89), `PendingWrite` (§7.1, §8).
-**Cómo intentar romperla.** Descartar el future del handler en cada punto de suspensión (el patrón del test de DEF-125); cancelar `compact_room` y `apply_snapshot` del storage y reabrir la sala mientras una operación de archivo sigue en vuelo; apagar el servidor con una tarea de varios pasos en curso. *Pendiente:* el apagado que espera esas tareas (Lote 5, D87).
+**Sostenida por.** `run_to_completion`, `tokio::spawn` en `delete_room` y `add_column`, `open_room`, `compact_room` y `apply_snapshot` del storage en su propia tarea (D86, D89), `PendingWrite` (§7.1, §8). El apagado no espera esas tareas (D87 se descartó): cortar una equivale a un crash, y el borrado con lápida (D84) y los archivos atómicos del relay dejan solo lo que el próximo arranque completa o descarta (§7.2 *Graceful Shutdown*).
+**Cómo intentar romperla.** Descartar el future del handler en cada punto de suspensión (el patrón del test de DEF-125); cancelar `compact_room` y `apply_snapshot` del storage y reabrir la sala mientras una operación de archivo sigue en vuelo; apagar el servidor con una tarea de varios pasos en curso.
 
 #### INV-L3 ★ · Un I/O incierto nunca se confirma como éxito
 **Enunciado.** Si un write, un fsync o un rename de un archivo durable falla, nunca se responde éxito por una operación que dependía de él. En el servidor, la sala se detiene y se reabre desde disco; en storage, la sala queda `RoomFailed` hasta reabrirse. Un error de I/O nunca se toma por "el archivo no existe".
@@ -394,7 +395,7 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 
 #### INV-L6 · Borrar una sala es atómico
 **Enunciado.** Después de cualquier interrupción (crash, apagado, cancelación) durante el borrado de una sala, la sala existe entera o no existe, y una sala recreada con el mismo id empieza vacía: sin log, roster ni snapshot de la anterior.
-**Sostenida por.** `delete_room` en su propia tarea (§7.1). *Pendiente (Lote 5, D84, D87):* el borrado con lápida y el apagado que lo espera.
+**Sostenida por.** El borrado con lápida (D84): el directorio de la sala se renombra a un nombre que ninguna sala puede tener, y `rooms/` se sincroniza, antes de tocar el relay o borrar un archivo; el arranque borra las lápidas que quedaron, y `create_room` purga el relay (§6 *Room deletion*).
 **Cómo intentar romperla.** Crash en cada paso del borrado (después del purge del relay, a mitad de `remove_dir_all`); recrear la sala después de cada uno.
 
 ### 3.8. Esquema

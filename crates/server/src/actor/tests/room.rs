@@ -2,7 +2,8 @@ use super::*;
 use crate::actor::lease::ClientEntry;
 use crate::actor::manager::RoomManager;
 use crate::actor::test_support::{
-    seq, test_manager, test_schema, wait_until, wait_until_async, POLL_CEILING, TEST_TIMINGS,
+    seq, snapshot_envelope, test_manager, test_schema, wait_until, wait_until_async, POLL_CEILING,
+    TEST_TIMINGS,
 };
 use crate::durable;
 use crate::fail_point;
@@ -593,16 +594,6 @@ async fn log_bounds_report_the_retained_range() {
         Err(ServerError::RoomNotFound(_))
     ));
     fx.manager.shutdown_all().await;
-}
-
-/// A valid raw snapshot envelope.
-fn snapshot_envelope() -> bytes::Bytes {
-    use zemdb_core::protocol::snapshot_envelope::{SnapshotCompression, SnapshotEnvelopeHeader};
-    let body = b"snapshot";
-    let header = SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, 8, body);
-    let mut out = header.to_bytes().to_vec();
-    out.extend_from_slice(body);
-    bytes::Bytes::from(out)
 }
 
 // Paused time: no maintenance tick runs, so only the ack path prunes.
@@ -1211,6 +1202,7 @@ async fn snapshot_below_a_gap_stops_being_usable() {
     // offered, and the writer is asked for a new one.
     let restorer = ClientId::new("restorer").unwrap();
     register_at(&sender, &restorer, Some((seq(3), fx.incarnation))).await;
+    let before_gap = fx.manager.log_bounds(&fx.room_id).await.unwrap();
     let gap = async || {
         let res = sync_from(&sender, &restorer, seq(3)).await;
         assert!(matches!(res, Err(ServerError::BehindCompaction)), "{res:?}");
@@ -1250,6 +1242,21 @@ async fn snapshot_below_a_gap_stops_being_usable() {
             "{n}: {res:?}"
         );
     }
+    // Nor one whose range was read before the gap was found.
+    let res = fx
+        .relay
+        .stage_snapshot(
+            &fx.room_id,
+            &crate::relay::Uploader::Admin,
+            seq(3),
+            snapshot_envelope(),
+            std::future::ready(Ok(before_gap)),
+        )
+        .await;
+    assert!(
+        matches!(res, Err(ServerError::SnapshotSuperseded(_))),
+        "{res:?}"
+    );
 
     // A snapshot above the gap is offered and served, also after another client runs into it.
     stage_snapshot_at(&fx, 6).await;

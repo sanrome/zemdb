@@ -23,7 +23,7 @@ use crate::config::ServerConfig;
 use crate::dedup::{dedup_key, DedupLruCache};
 use crate::durable;
 use crate::error::ServerError;
-use crate::log::{retention, RoomLifecyclePolicy, TieredLog};
+use crate::log::{RoomLifecyclePolicy, TieredLog};
 use crate::relay::{LogBounds, SnapshotRelay, Uploader};
 use crate::response_budget::{no_room, InflightBudget, Reservation};
 
@@ -190,6 +190,7 @@ impl RoomActor {
         // A snapshot that was already usable before this actor started is not news.
         actor.announced_snapshot = actor.usable_snapshot_seq();
         actor.restore_snapshot_demand();
+        actor.publish_snapshot_floor();
 
         info!(room = %room_id, head_seq = %head_seq, "Opened RoomActor");
 
@@ -413,11 +414,7 @@ impl RoomActor {
             }
 
             RoomCommand::GetLogBounds { reply } => {
-                let _ = reply.send(Ok(LogBounds {
-                    tail_seq: self.tiered_log.tail_seq(),
-                    head_seq: self.head_seq,
-                    unrestorable_through: self.unrestorable_through,
-                }));
+                let _ = reply.send(Ok(self.log_bounds()));
             }
 
             RoomCommand::GetClientCursor { client_id, reply } => {
@@ -663,6 +660,7 @@ impl RoomActor {
                 // or below the cursor, restored, would run into the same gap.
                 if matches!(e, ServerError::BehindCompaction) {
                     self.unrestorable_through = self.unrestorable_through.max(Some(from_seq));
+                    self.publish_snapshot_floor();
                     self.request_snapshot();
                 }
                 return Err(e);
@@ -778,14 +776,27 @@ impl RoomActor {
     /// relay checks the range when it accepts a snapshot, but TTL and size compaction move the
     /// range on afterwards.
     fn usable_snapshot_seq(&self) -> Option<SequenceNumber> {
-        let tail_seq = self.tiered_log.tail_seq();
+        let bounds = self.log_bounds();
         self.snapshot_relay
             .active_snapshot_seq(&self.room_id)
-            .filter(|seq| {
-                self.unrestorable_through
-                    .is_none_or(|through| *seq > through)
-            })
-            .filter(|seq| retention::is_usable_snapshot(*seq, tail_seq, self.head_seq))
+            .filter(|seq| bounds.admits(*seq))
+    }
+
+    /// The retained range of the log, and the highest cursor from which a sync found a gap.
+    fn log_bounds(&self) -> LogBounds {
+        LogBounds {
+            tail_seq: self.tiered_log.tail_seq(),
+            head_seq: self.head_seq,
+            unrestorable_through: self.unrestorable_through,
+        }
+    }
+
+    /// Tells the relay the lowest sequence of a usable snapshot when the actor opens, after the
+    /// log moved and when a gap is found, so that it does not install an upload checked against
+    /// an older range.
+    fn publish_snapshot_floor(&self) {
+        let floor = self.log_bounds().snapshot_floor();
+        self.snapshot_relay.set_snapshot_floor(&self.room_id, floor);
     }
 
     /// Some client needs a snapshot: unless a usable one exists, turns the snapshot demand on
@@ -961,6 +972,7 @@ impl RoomActor {
         // Backup pass of the cursor-driven pruning, which normally runs on every Ack: a floor
         // can also move without an Ack (cursors reported by commits, clients becoming Dormant).
         self.prune_to_retention_floor();
+        self.publish_snapshot_floor();
     }
 }
 

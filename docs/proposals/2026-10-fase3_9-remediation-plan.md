@@ -101,10 +101,10 @@ Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las de
 | **D81** | **Piso de secuencia en `log_meta.json`.** El archivo pasa a guardar `pruned_through_seq` y `sealed_through_seq` (el fin del último segmento sellado). Se reescribe con `write_atomic` en cada rotación, antes de crear el `active.wal` nuevo. Al abrir, `head_seq` es el máximo entre los nombres de segmento, `active.wal`, `pruned_through_seq` y `sealed_through_seq`. Costo: una escritura atómica por rotación (cada 1.000 operaciones o 32 MiB por defecto). Al adoptarla se fijó: los dos campos son obligatorios (V1); una falla al escribirlo es un `rotation_error` y la sala se reabre; en la implementación se escribe antes del rename de `active.wal`, así ningún nombre de segmento ni de sidecar termina por encima. | 2 | Adoptada |
 | **D82** | **JSON persistido con checksum.** `log_meta.json`, `meta_room.json`, `schemas/{id}.json` y el roster se escriben como el JSON, un salto de línea y una última línea `crc32:<8 hex>` con el CRC32 de los bytes del JSON. Siguen siendo legibles a mano. Leer un archivo sin esa línea o con un CRC que no coincide equivale a un archivo ilegible: `log_meta.json`, `meta_room.json` y los esquemas hacen fallar la apertura; el roster se descarta con un warning, como hoy. Un roster con UTF-8 inválido también se descarta (hoy falla la apertura, al revés de lo que dice §5.2). Sin compatibilidad con archivos sin checksum (V1). La apertura nunca borra segmentos a partir de un valor que no verificó. Al adoptarla se fijó: el formato es `<json>\ncrc32:<8 hex en minúscula>\n`, con un par de helpers comunes en `durable.rs`; un roster de 0 bytes también se descarta con un warning (cierra ese ítem del backlog). | 2 | Adoptada |
 | **D83** | **Lock exclusivo de `data_dir`.** El servidor toma `data_dir/server.lock` (`fs2`, como `log.lock`) al arrancar, antes de recuperar el relay o el registry de esquemas. Si el lock está tomado, se niega a arrancar con un error que lo explica. `delete_room` además toma el `log.lock` de la sala antes de borrarla. Al adoptarla se fijó: `ServerConfig::lock_data_dir`, que `main.rs` llama antes del registry y del relay; los tests que arman los componentes a mano no lo toman. `delete_room` toma el `log.lock` después de `shutdown_room` y antes de purgar el relay (si está tomado, `RoomLocked` sin borrar nada), y lo suelta justo antes de `remove_dir_all`, porque Windows no borra un archivo bloqueado; mientras tanto, el lock por sala impide reabrirla en este proceso y `server.lock` impide que lo haga otro. | 2 | Adoptada |
-| **D84** | **Borrado de sala con lápida.** `delete_room` renombra `rooms/<id>` a `rooms/.deleted-<uuid>`, sincroniza `rooms/` y recién después borra el directorio renombrado. Al arrancar se borran las lápidas que quedaron. `RoomId` no admite `.`, así que una lápida nunca choca con una sala. `create_room` además purga el relay de ese id (P10). | 5 | Propuesta |
+| **D84** | **Borrado de sala con lápida.** `delete_room` renombra `rooms/<id>` a `rooms/.deleted-<uuid>`, sincroniza `rooms/` y recién después borra el directorio renombrado. Al arrancar se borran las lápidas que quedaron. `RoomId` no admite `.`, así que una lápida nunca choca con una sala. `create_room` además purga el relay de ese id (P10). Al adoptarla se fijó: la lápida va antes de la purga del relay, así un corte deja la sala entera, con su snapshot, o ninguna sala; el `log.lock` se suelta justo antes del rename, que en Windows falla sobre un directorio con un archivo bloqueado, y no antes de `remove_dir_all` como fijó D83; `RoomManager::new` borra las lápidas y un fallo solo se loguea; con la lápida durable, un fallo de la purga o de `remove_dir_all` se loguea y el `DELETE` responde 204, mientras que un fallo del sync de `rooms/` es un error y no se purga nada; `create_room` purga después de validar el esquema. | 5 | Adoptada |
 | **D85** | **Absorción atómica en storage.** En lugar de anexar el WAL activo a `.wal.compacting` en el lugar, se arma `room_{id}.wal.compacting.tmp` con `.wal.compacting` más el WAL activo, se sincroniza, se renombra sobre `.wal.compacting`, se sincroniza el directorio y recién después se trunca el WAL activo. `.wal.compacting` nunca queda con una cola rota, así que desaparecen la excepción de corrupción de `.wal.compacting` y `highest_seq_in_valid_frames`. Al adoptarla se fijó: el temporal tiene nombre fijo y la apertura lo borra sin leerlo (se suma a los temporales de INV-S4); una falla al escribirlo, sincronizarlo o renombrarlo lo borra y deja la sala usable; una falla del sync del directorio después del rename la marca `RoomFailed`; un daño que llega al final de `.wal.compacting` sigue siendo una escritura rota. | 3 | Adoptada |
 | **D86** | **`apply_snapshot` instala en su propia tarea.** Desde el staging hasta la instalación (rename, sync, vaciado del WAL, borrado de `.wal.compacting`), `apply_snapshot` corre en una tarea propia, como `compact_room`. Cancelar el future deja de abandonar operaciones de archivo en vuelo, y `close_room` espera a la tarea (comparten el lock de compactación). Al adoptarla se fijó: decodificar y esperar el lock siguen en quien llama; quien suelta el future ya no deja la sala `RoomFailed`, porque el snapshot se aplica entero. | 3 | Adoptada |
-| **D87** | **El apagado espera las tareas de varios pasos.** Un `TaskTracker` registra las tareas que corren por su cuenta (borrado de sala, escrituras del relay, recarga de esquema). `serve_until_shutdown` las espera dentro de la gracia de 10 s, antes de `shutdown_all`. | 5 | Propuesta |
+| **D87** | **El apagado espera las tareas de varios pasos.** Un `TaskTracker` registra las tareas que corren por su cuenta (borrado de sala, escrituras del relay, recarga de esquema). `serve_until_shutdown` las espera dentro de la gracia de 10 s, antes de `shutdown_all`. Se descartó al arrancar el lote: con la lápida primero (D84), cortar un borrado deja la sala entera o ya borrada, y en el segundo caso el próximo arranque termina el trabajo. Las escrituras del relay y la recarga del esquema ya toleran el corte (archivos atómicos y recuperación; una sala lee el esquema del registry al abrirse), y un crash o la salida por gracia vencida, que D87 no cubre, las cortan igual. DEF-156 se cierra con D84. | 5 | Descartada |
 | **D89** | **`open_room` del storage recupera en su propia tarea.** La recuperación corre en una tarea dueña del lock de la sala y del handle del WAL hasta que terminan sus operaciones de archivo, como `apply_snapshot` (D86). Si quien llama se va, la apertura termina igual y la sala queda abierta. | 3 | Adoptada |
 | **D88** | **Redes de prueba en el repo.** Las simulaciones y proptests de la auditoría entran como tests con semillas fijas. Cada red entra en la suite normal en una versión corta: todas juntas suman como mucho ~30 s en debug. Las versiones largas quedan como `#[ignore]`, así que `cargo test` no las corre, ni en local ni en la CI de cada push o PR. Corren en un workflow aparte (`.github/workflows/randomized.yml`, `cargo test --workspace --release -- --ignored`) una vez por semana y a mano al cerrar cada lote, como parte de la revisión de delta (regla 4). El fuzzer de decoders y los roundtrips usan generadores propios con un PRNG determinista (SplitMix64), sin `proptest`: su versión actual exige exactamente el MSRV de los tests (1.88) y sus dependencias transitivas podrían romper ese job. No hay `cargo fuzz`. Las mediciones de memoria quedan fuera, porque requieren `unsafe`. | 0 | Adoptada |
 
@@ -119,10 +119,10 @@ Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las de
 | 2 | Abrir solo lo verificado y sincronizado | DEF-144, 145, 148, 158, 149 | Alta (requisito de Fase 4) | ✅ 5/5 |
 | 3 | Storage: cancelación y absorción | DEF-150, 151, 165 | Alta (requisito de Fase 4) | ✅ 3/3 |
 | 4 | Recursos | DEF-152, 159, 153, 163, 162, 164, 154, 157 | Media | ✅ 8/8 |
-| 5 | Ciclo de vida | DEF-156, 160, 161, 166 | Baja | ⬜ 0/4 |
+| 5 | Ciclo de vida | DEF-156, 160, 161, 166 | Baja | ✅ 4/4 |
 | 6 | Documentación | ARCHITECTURE, README, ROADMAP | Baja | ⬜ |
 
-**Avance total:** 19 de 23 ítems (Lotes 0 a 4 cerrados).
+**Avance total:** 23 de 23 ítems (Lotes 0 a 5 cerrados).
 
 **Ítems nuevos de este plan.** Surgen de las invariantes adoptadas (D79) y de hallazgos de la auditoría que no tenían ID:
 - **DEF-159** · Medio · P6: reparto del presupuesto de respuestas.
@@ -661,27 +661,101 @@ Se fueron `append_synced`, `highest_seq_in_valid_frames`, la excepción de corru
 
 > Objetivo: que borrar una sala y apagar el servidor nunca dejen estados a medias.
 
-#### DEF-156 · Bajo · ⬜ Pendiente
+#### DEF-156 · Bajo · ✅ Hecho
 **Problema.** El apagado ordenado corta a la mitad un `DELETE` que corre en su propia tarea.
 **Solución.** D87.
 **Test exigido.** `audit_l2_dropped_room_deletion_is_cut_halfway_by_an_orderly_shutdown` (`inv/l`): el borrado termina antes del apagado. El test de control tiene que seguir pasando.
 
-#### DEF-160 · Bajo · ⬜ Pendiente
+**Hecho.** Lo cierra D84, no D87, que se descartó al arrancar el lote (ver §2). Con la lápida primero, un apagado que corta el borrado antes del rename deja la sala entera, y uno que lo corta después la deja borrada: el próximo arranque borra la lápida.
+- **Test:** `room_deletion_whose_client_disconnects_over_tcp_removes_the_room_and_its_snapshot` (`api/tests/control_plane.rs`), el de control del Lote 0, suma la variante de `inv/l`: un apagado ordenado mientras el relay purga el snapshot, y el runtime soltado como al salir de `main`. En el próximo arranque no queda la sala, ni su directorio, ni su snapshot. En `main` falla: la sala sigue, sin su snapshot.
+- **Mutaciones:** purgar el relay antes del rename, y no borrar las lápidas al arrancar. Cada una hace fallar el test.
+- **Desvío:** el test de la auditoría exigía que el borrado terminara antes del apagado. Sin D87, exige que el próximo arranque no encuentre nada de la sala.
+
+#### DEF-160 · Bajo · ✅ Hecho
 **Problema.** Un `remove_dir_all` interrumpido deja salas a medias. Si queda el log sin `meta_room.json`, la sala recreada hereda el log viejo bajo una encarnación nueva (P7).
 **Solución.** D84.
 **Test exigido.**
 - El test de `inv/l` (`actor/tests/manager.rs`, borrado parcial): con un crash en cada paso del borrado, la sala existe entera o no existe.
 - Una sala recreada después de un borrado interrumpido empieza vacía.
 
-#### DEF-166 · Bajo · ⬜ Pendiente
+**Hecho.** `delete_room` renombra `rooms/<id>` a `rooms/.deleted-<uuid>` y sincroniza `rooms/` antes de purgar el relay; después borra la lápida. Con la lápida durable la sala ya está borrada, así que un fallo de la purga o del borrado solo se loguea. `RoomManager::new` borra las lápidas que quedaron.
+- **Test:** `room_recreated_after_an_interrupted_deletion_starts_empty` (`actor/tests/manager.rs`) es el de `inv/l`, en una tabla de cuatro cortes:
+  - el directorio perdido, sin borrado (es el de DEF-161);
+  - un crash justo después del rename, con el sync de `rooms/` fallado: el `DELETE` falla y el relay sigue con el snapshot;
+  - una purga del relay que falla: el `DELETE` responde bien igual;
+  - un crash a mitad del borrado, con el fail point nuevo `room_removal`.
+
+  Lo que quedó pierde además su `meta_room.json`, como puede pasar con `remove_dir_all`. Después de reiniciar, `rooms/` está vacío y la sala recreada empieza en 0, sin snapshot. En `main`, el corte a mitad del borrado deja `rooms/reborn` sin metadatos, y la sala recreada hereda su log.
+- **Ajuste:** `room_deletion_finishes_when_the_request_is_dropped` (Lote 2) exigía que nadie pudiera abrir el log de la sala durante la purga. Ahora exige que para entonces la sala ya no esté en su lugar, y que al final tampoco quede la lápida.
+- **Mutaciones:** cada una hace fallar el test:
+  - borrar en el lugar, sin lápida;
+  - no sincronizar `rooms/` después del rename;
+  - purgar el relay aunque el rename o su sync fallen;
+  - no borrar las lápidas al arrancar;
+  - responder error si falla la purga o el borrado de la lápida.
+- **Desvíos:**
+  - "La sala existe entera" corresponde al corte antes del rename, que no toca nada. El caso del lock tomado (`RoomLocked`) ya lo prueba `deleting_a_room_removes_its_directory`.
+  - El fallo de la purga después del rename se loguea en lugar de responder error: la revisión de delta encontró que el `DELETE` respondía error por una sala que ya no existía.
+  - Que el `log.lock` se suelte antes del rename y no después lo verifica solo la CI en Windows, donde el rename falla sobre un directorio con un archivo bloqueado.
+
+#### DEF-166 · Bajo · ✅ Hecho
 **Problema.** Una subida que el relay confirma (`SnapshotStaged` o `staged: true`) puede no ser usable: la poda por TTL o cuota, que ignora el ancla, corre entre la lectura del rango y la instalación, y ninguna de las tres clases de subida vuelve a mirar el rango con el lock tomado (INV-R7). Es preexistente. Lo encontró la revisión de delta del Lote 4: D69 lo agranda, porque la cuota ahora también poda warm recientes. El snapshot no se anuncia ni se sirve (INV-R5), así que el costo es que la demanda sigue y se pide otra subida.
 **Solución.** Que el actor publique `tail_seq` y la marca de hueco en un valor atómico que el relay lea con el lock del slot tomado, justo antes de instalar; si el snapshot ya no es usable, `SnapshotSuperseded`.
 **Test exigido.** Con un fail point entre la lectura del rango y la instalación, una pasada de cuota que poda más allá de S: la subida responde `SnapshotSuperseded`, en las tres clases de subida.
 
-#### DEF-161 · Bajo · ⬜ Pendiente
+**Hecho.** `LogBounds::snapshot_floor` es la menor secuencia que el rango admite: `tail - 1`, y por encima de la marca de hueco. El actor la publica con `SnapshotRelay::set_snapshot_floor` al abrirse, al final de cada pasada de mantenimiento de disco y al marcar un hueco; la tarea del actor la olvida cuando el actor termina, antes de reportar su salida. El relay la compara después del promote y antes de instalar; por debajo, borra el archivo y responde `SnapshotSuperseded`.
+- **Tests:**
+  - `upload_that_the_log_pruned_past_after_its_range_was_read_is_superseded` (`relay/tests/upload.rs`, nuevo): el future del rango publica, al resolverse, un piso por encima de S, como el actor después de una pasada. En las tres clases de subida (un solo request, un chunk, y el último chunk de una de tres), la respuesta es `SnapshotSuperseded` y no queda ningún archivo. Una subida justo en el piso se instala.
+  - `commit_behind_retention_is_rejected_without_side_effects` (`tests/commit_semantics_tests.rs`), extendido: después de que la pasada de TTL poda, una subida en 1 con el rango de antes recibe `SnapshotSuperseded`.
+  - `snapshot_below_a_gap_stops_being_usable`, extendido: una subida en 3 con el rango de antes del hueco recibe `SnapshotSuperseded`.
+  - `inactive_room_shuts_down_and_reopens_with_its_overrides`, extendido: el piso existe mientras el actor vive, y después de cada cierre por inactividad no queda.
+
+  Los tres primeros fallan sin el fix; el del relay usa la API nueva, así que se comprobó con el piso guardado pero sin el chequeo.
+- **Mutaciones:** cada una hace fallar al menos un test:
+  - el relay sin el chequeo del piso (fallan los tres primeros);
+  - el actor sin publicar al abrirse, después del mantenimiento, o al marcar un hueco;
+  - el piso sin la marca o sin el tail;
+  - el piso que sobrevive al actor;
+  - comparar con `<=`. Esta no la detectaba ningún test, así que el del relay suma el borde: una subida justo en el piso se instala.
+
+  Comparar el piso antes del promote en lugar de después no la detecta ningún test: los tres publican el piso dentro del future del rango. Compararlo al final achica la ventana del límite de abajo, porque el promote sincroniza y relee la subida entera.
+- **Límite aceptado** (decisión del dueño, después de la revisión de delta): una pasada de TTL o cuota publica el piso recién después de borrar sus segmentos. Una instalación que cae en esos milisegundos se confirma aunque el snapshot ya no sea usable; el revisor lo reprodujo con un hook después de la pasada. Lo mismo pasa con un chunk reenviado de una subida ya instalada (preexistente), que responde `staged: true` sin mirar ni el rango ni el piso. En los dos casos el snapshot no se anuncia ni se sirve (INV-R5). Queda en el enunciado de INV-R7 y en §6 *Acceptance*.
+- **Desvíos:**
+  - **Un solo número, no `tail_seq` y la marca por separado** (decisión del dueño al arrancar el lote).
+  - **El piso vive lo que el actor** (decisión del dueño, después de la revisión): así el mapa del relay queda acotado por las salas abiertas (INV-B3), y el piso es tan volátil como la marca de hueco. Por eso el actor lo publica también al abrirse. La purga del relay ya no lo toca, porque cuando purga no hay actor.
+  - **Sin fail point:** el future del rango mueve el piso al resolverse, que es el mismo punto. Los tests usan una pasada de TTL y no de cuota: las dos podan en el mismo `expire`.
+  - **`usable_snapshot_seq` usa `LogBounds::admits`** en lugar de repetir la regla, con el mismo `log_bounds()` del actor que responde `GetLogBounds`.
+
+#### DEF-161 · Bajo · ✅ Hecho
 **Problema.** Si una sala se recrea sin pasar por `delete_room` (por ejemplo, porque se perdió su directorio), el snapshot viejo del relay se vuelve usable cuando el head nuevo alcanza su secuencia (P10).
 **Solución.** D84 (`create_room` purga el relay de ese id).
 **Test exigido.** Crear una sala con un snapshot del relay de una sala anterior del mismo id: el snapshot no se ofrece nunca.
+
+**Hecho.** `create_room` purga el relay de ese id después de comprobar que la sala no existe y de validar el esquema.
+- **Test:** el caso del directorio perdido de `room_recreated_after_an_interrupted_deletion_starts_empty` (DEF-160). La sala pierde su directorio con un snapshot en el relay, y después de reiniciar, la recreada no lo tiene. En `main` falla: el relay conserva el snapshot en 1. El caso del crash después del rename, antes de la purga, también lo cubre. El mismo test comprueba que crear otra vez una sala que existe no toca su snapshot.
+- **Mutaciones:** sin la purga de `create_room`, y con la purga antes del chequeo de existencia; cada una hace fallar el test.
+
+**Cierre del lote.**
+- **Decisiones:**
+  - **Al arrancar,** el dueño adoptó D84 con la lápida antes de la purga del relay, descartó D87 (DEF-156 lo cierra D84) y eligió publicar un solo piso por sala para DEF-166.
+  - **Después de la revisión de delta:** documentar la ventana de R7 como límite aceptado, y que el piso viva lo que el actor.
+- **Chequeos:** fmt, clippy, tests y doc en verde. 774 tests pasan y 39 están ignorados; antes del lote eran 772 y 39. Hay dos tests nuevos; los demás escenarios se sumaron a tests que ya existían. El lote no toca `core` ni `storage`, así que no hace falta el build de wasm32.
+- **Tests de ruptura:** todos fallan en `main`. Los de DEF-166 se comprobaron con el piso guardado y sin el chequeo, porque usan la API nueva; el del borrado, con el fail point `room_removal` agregado al borrado de `main`.
+- **Mutación inversa:** 17 mutaciones, una o más por cada parte de cada fix, incluidas las que sumó la revisión de delta. Todas hacen fallar algún test. La comparación con `<=` y tres mutaciones que encontró el revisor (la purga antes del chequeo del rename, la purga antes del chequeo de existencia y el fallo de la purga como error) pedían los tests que se agregaron.
+- **Versiones largas:** `cargo test -p zemdb-server --release -- --ignored`, 12 de 12 en verde sobre el código final. En una corrida anterior, la medición de DEF-157 falló una vez mientras el revisor compilaba en paralelo (20,9 ms contra 6,7 ms), y pasó sola tres veces seguidas.
+- **Revisión de delta:** la hizo un agente aparte, de contexto fresco y solo lectura, con tests propios en una copia. Los cuatro fixes cierran su escenario; no hay hallazgos Altos ni Medios.
+  - **Lo que entró al lote:**
+    - **Bajo:** una purga del relay que fallaba después del rename hacía responder error al `DELETE` de una sala que ya no existía. Ahora se loguea (ver DEF-160).
+    - **Bajo:** el mapa de pisos del relay guardaba una entrada por cada sala abierta desde el arranque (INV-B3). Ahora el piso vive lo que el actor (ver DEF-166).
+    - **Tests que faltaban:** la purga solo después de un rename durable; crear una sala existente no toca su snapshot.
+    - **Notas:** frases del plan que decían que el apagado solo podía cortar después del rename, y que publicar después de la pasada no dejaba ventana.
+  - **Lo que no entró:**
+    - **Límite aceptado en INV-R7:** la ventana entre la poda y la publicación del piso, y el chunk reenviado de una subida ya instalada (ver DEF-166).
+    - **Sin test:** comparar el piso antes del promote; soltar el `log.lock` antes del rename (solo la CI en Windows).
+    - **Notas:** si el sync de `rooms/` falla y un reintento del `DELETE` encuentra el directorio ausente, purga el relay sin volver a sincronizar `rooms/`. Si después se corta la energía antes de que el rename llegue a disco, la sala vuelve entera sin su snapshot, y eso cuesta solo una subida. Además, un archivo promovido que el piso rechaza y que no se puede borrar se activa en el próximo arranque, pero no se ofrece porque no es usable.
+- **Documentos:**
+  - `ARCHITECTURE.md`: §5.2 (*Room Log Lock*), §6 (*Acceptance* y *Room deletion*), §7.1 (`DELETE`) y §7.2 (*Graceful Shutdown*). Esto adelanta el punto de §6 del Lote 6 sobre el borrado con lápida.
+  - `INVARIANTES.md`: R6, R7, L2 y L6 en ✅, R7 con su límite aceptado; L2 deja de citar D87.
 
 ---
 

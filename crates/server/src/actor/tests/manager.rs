@@ -1,5 +1,7 @@
 use super::*;
-use crate::actor::test_support::{test_manager, test_schema, wait_until, POLL_CEILING};
+use crate::actor::test_support::{
+    snapshot_envelope, test_manager, test_schema, wait_until, POLL_CEILING,
+};
 use crate::durable;
 use crate::fail_point;
 use std::time::Duration;
@@ -184,6 +186,121 @@ async fn first_room_creation_makes_rooms_directory_durable() {
         .await;
 
     assert!(res.is_err(), "creating rooms/ must sync the data directory");
+}
+
+/// Wherever the deletion of a room stops (its directory lost without one, a crash right after
+/// it is renamed away, a failure to purge the relay, or a crash halfway through removing its
+/// files), after a restart the room is gone and a room created again with the same id starts
+/// empty, without the old room's snapshot.
+#[tokio::test]
+async fn room_recreated_after_an_interrupted_deletion_starts_empty() {
+    let (room_id, schema_id) = (
+        RoomId::new("reborn").unwrap(),
+        SchemaId::new("first").unwrap(),
+    );
+    let client_id = zemdb_core::id::ClientId::new("writer").unwrap();
+    for cut in [
+        "directory lost",
+        "after the rename",
+        "while purging",
+        "while removing",
+    ] {
+        let dir = tempdir().unwrap();
+        let (rooms, room_dir) = (dir.path().join("rooms"), room_dir(&dir, &room_id));
+        let (manager, relay) = test_manager(dir.path(), &["first"], |_| {});
+        manager
+            .create_room(room_id.clone(), schema_id.clone(), None)
+            .await
+            .unwrap();
+        manager
+            .ask(&room_id, |reply| RoomCommand::RegisterClient {
+                client_id: client_id.clone(),
+                current_seq: None,
+                known_incarnation: None,
+                reply,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let row = zemdb_core::value::RowBuilder::new()
+            .set("id", 1)
+            .set("title", "old")
+            .build();
+        let op = test_schema()
+            .to_operation_insert("tasks", &row, 1000)
+            .unwrap();
+        manager
+            .ask(&room_id, |reply| RoomCommand::Commit {
+                client_id: client_id.clone(),
+                mutation_id: zemdb_core::id::MutationId::new([1; 16]),
+                last_ack_seq: SequenceNumber::new(0),
+                op,
+                reply,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        relay
+            .stage_snapshot(
+                &room_id,
+                &crate::relay::Uploader::Admin,
+                SequenceNumber::new(1),
+                snapshot_envelope(),
+                manager.log_bounds(&room_id),
+            )
+            .await
+            .unwrap();
+        // Creating the room again fails without touching its snapshot.
+        let again = manager
+            .create_room(room_id.clone(), schema_id.clone(), None)
+            .await;
+        assert!(
+            matches!(again, Err(ServerError::RoomAlreadyExists(_))),
+            "{again:?}"
+        );
+        assert_eq!(
+            relay.active_snapshot_seq(&room_id),
+            Some(SequenceNumber::new(1))
+        );
+
+        match cut {
+            "directory lost" => {
+                manager.shutdown_all().await;
+                fs::remove_dir_all(&room_dir).unwrap();
+            }
+            "after the rename" => {
+                fail_point::arm("sync_dir", &rooms);
+                assert!(manager.delete_room(&room_id).await.is_err());
+                assert_eq!(
+                    relay.active_snapshot_seq(&room_id),
+                    Some(SequenceNumber::new(1))
+                );
+            }
+            "while purging" => {
+                fail_point::arm("sync_dir", &dir.path().join("snapshots"));
+                manager.delete_room(&room_id).await.unwrap();
+            }
+            _ => {
+                fail_point::arm("room_removal", &room_dir);
+                manager.delete_room(&room_id).await.unwrap();
+            }
+        }
+        // Whatever is left lost its metadata first, as `remove_dir_all` may do.
+        for entry in fs::read_dir(&rooms).unwrap() {
+            durable::remove_file_if_exists(&entry.unwrap().path().join("meta_room.json")).unwrap();
+        }
+
+        let (manager, relay) = test_manager(dir.path(), &["first"], |_| {});
+        assert_eq!(fs::read_dir(&rooms).unwrap().count(), 0, "{cut}");
+        manager
+            .create_room(room_id.clone(), schema_id.clone(), None)
+            .await
+            .unwrap();
+        let head_seq = manager.log_bounds(&room_id).await.unwrap().head_seq;
+        assert_eq!(head_seq, SequenceNumber::new(0), "{cut}");
+        assert_eq!(relay.active_snapshot_seq(&room_id), None, "{cut}");
+        manager.shutdown_all().await;
+    }
 }
 
 /// Runs `scenario` in its own thread and waits up to `limit` for it to finish. A panic in the
@@ -479,14 +596,16 @@ async fn inactive_room_shuts_down_and_reopens_with_its_overrides() {
 
     for _ in 0..2 {
         assert!(manager.get_room(&room_id).is_some());
-        // Once the actor has exited, the manager keeps nothing for the room; its overrides are
-        // read from disk.
+        assert!(manager.snapshot_relay.snapshot_floor(&room_id).is_some());
+        // Once the actor has exited, the manager keeps nothing for the room, nor the relay its
+        // snapshot floor; its overrides are read from disk.
         wait_until("the inactive room shuts down", || {
             !manager.rooms.contains_key(&room_id)
         })
         .await;
         assert!(manager.spawn_locks.is_empty());
         assert!(manager.room_meta.is_empty());
+        assert_eq!(manager.snapshot_relay.snapshot_floor(&room_id), None);
         assert_eq!(
             manager.lifecycle_overrides(&room_id).await.unwrap(),
             overrides

@@ -369,7 +369,8 @@ impl SnapshotRelay {
     }
 
     /// Runs `prepare` on the upload file `src`, promotes it and installs it as the room's
-    /// active snapshot. On any error `src` is deleted.
+    /// active snapshot, unless it is below the room's snapshot floor (`SnapshotSuperseded`). On
+    /// any error the upload's file is deleted.
     #[allow(clippy::too_many_arguments)]
     async fn promote_and_install(
         &self,
@@ -398,6 +399,18 @@ impl SnapshotRelay {
         })
         .await?;
 
+        // Checked last: TTL and size compaction ignore the anchor of an upload, so the log may
+        // have moved past the snapshot since its range was read.
+        if self
+            .snapshot_floors
+            .get(room_id)
+            .is_some_and(|floor| head_seq < *floor)
+        {
+            self.remove_files(vec![final_path]).await;
+            return Err(ServerError::SnapshotSuperseded(format!(
+                "The log of room {room_id} moved past snapshot sequence {head_seq}"
+            )));
+        }
         self.install(
             room_id,
             slot,

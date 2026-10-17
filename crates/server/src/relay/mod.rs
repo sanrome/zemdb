@@ -82,6 +82,9 @@ pub struct SnapshotRelay {
     max_upload_duration: Duration,
     /// Single-request uploads in progress per room, bounded by [`MAX_PENDING_SINGLE_UPLOADS`].
     pending_single_uploads: DashMap<RoomId, usize>,
+    /// Lowest sequence a usable snapshot of each open room may have, as its actor last
+    /// published it.
+    snapshot_floors: DashMap<RoomId, SequenceNumber>,
 }
 
 impl SnapshotRelay {
@@ -110,6 +113,7 @@ impl SnapshotRelay {
             max_snapshot_bytes,
             max_upload_duration,
             pending_single_uploads: DashMap::new(),
+            snapshot_floors: DashMap::new(),
         };
         relay.clear_uploads()?;
         relay.recover_snapshots()?;
@@ -120,6 +124,24 @@ impl SnapshotRelay {
     /// can call it.
     pub fn active_snapshot_seq(&self, room_id: &RoomId) -> Option<SequenceNumber> {
         self.active(room_id).map(|s| s.head_seq)
+    }
+
+    /// Records the lowest sequence a usable snapshot of the room may have now, which only its
+    /// actor knows: TTL and size compaction move the log on without asking the relay. An upload
+    /// below it is not installed, even if the range it read admitted it.
+    pub fn set_snapshot_floor(&self, room_id: &RoomId, floor: SequenceNumber) {
+        self.snapshot_floors.insert(room_id.clone(), floor);
+    }
+
+    /// Forgets the room's snapshot floor once its actor has stopped. The next actor of the room
+    /// publishes its own when it opens.
+    pub fn clear_snapshot_floor(&self, room_id: &RoomId) {
+        self.snapshot_floors.remove(room_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snapshot_floor(&self, room_id: &RoomId) -> Option<SequenceNumber> {
+        self.snapshot_floors.get(room_id).map(|floor| *floor)
     }
 
     /// Unexpired active snapshot of a room. The map guard is released before returning.

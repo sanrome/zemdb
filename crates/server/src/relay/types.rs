@@ -39,11 +39,19 @@ pub struct LogBounds {
 impl LogBounds {
     /// Whether a client restoring a snapshot at `seq` can catch up from the retained log:
     /// `tail - 1 <= seq <= head`, and the room found no gap after it.
-    pub(super) fn admits(&self, seq: SequenceNumber) -> bool {
+    pub(crate) fn admits(&self, seq: SequenceNumber) -> bool {
         retention::is_usable_snapshot(seq, self.tail_seq, self.head_seq)
             && self
                 .unrestorable_through
                 .is_none_or(|through| seq > through)
+    }
+
+    /// The lowest sequence of a snapshot the range admits: `tail - 1`, and above the gap mark.
+    pub(crate) fn snapshot_floor(&self) -> SequenceNumber {
+        let past_gap = self
+            .unrestorable_through
+            .map_or(0, |s| s.get().saturating_add(1));
+        SequenceNumber::new(self.tail_seq.get().saturating_sub(1).max(past_gap))
     }
 
     /// Rejects `seq` with `error` unless the range admits it.

@@ -35,6 +35,16 @@ pub(super) fn test_schema() -> Schema {
     Schema::builder().table(table).build()
 }
 
+/// A valid raw snapshot envelope.
+pub(super) fn snapshot_envelope() -> bytes::Bytes {
+    use zemdb_core::protocol::snapshot_envelope::{SnapshotCompression, SnapshotEnvelopeHeader};
+    let body = b"snapshot";
+    let header = SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, 8, body);
+    let mut out = header.to_bytes().to_vec();
+    out.extend_from_slice(body);
+    bytes::Bytes::from(out)
+}
+
 /// A manager on `dir` with [`TEST_TIMINGS`], whose registry holds `test_schema` under each of
 /// `schemas` (registered only if missing, so that a manager reopened on the same directory
 /// finds them already there), and whose configuration is adjusted by `configure`.

@@ -91,6 +91,26 @@ async fn commit_behind_retention_is_rejected_without_side_effects() {
 
     assert!(matches!(result, Err(ServerError::BehindCompaction)));
     assert_eq!(room.metrics().await.head_seq.get(), 5);
+    // Nor is a snapshot at 1 accepted against the range read before the TTL pass.
+    let range = zemdb_server::relay::LogBounds {
+        tail_seq: SequenceNumber::new(1),
+        head_seq: SequenceNumber::new(5),
+        unrestorable_through: None,
+    };
+    let staged = room
+        .relay
+        .stage_snapshot(
+            &room.room_id,
+            &zemdb_server::relay::Uploader::Admin,
+            SequenceNumber::new(1),
+            common::envelope(100, 1).into(),
+            std::future::ready(Ok(range)),
+        )
+        .await;
+    assert!(
+        matches!(staged, Err(ServerError::SnapshotSuperseded(_))),
+        "{staged:?}"
+    );
 }
 
 #[tokio::test(start_paused = true)]

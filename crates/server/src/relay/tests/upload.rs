@@ -368,6 +368,49 @@ async fn multipart_upload_checks_the_log_range_when_it_starts_and_completes() {
 }
 
 #[tokio::test]
+async fn upload_that_the_log_pruned_past_after_its_range_was_read_is_superseded() {
+    let dir = tempdir().unwrap();
+    let relay = open(&dir);
+    // Right after answering with the range, TTL or size compaction prunes past the snapshot,
+    // and the room's actor publishes the new floor.
+    let pruned_past = |n: u64| {
+        let relay = &relay;
+        async move {
+            relay.set_snapshot_floor(&room(), seq(n + 1));
+            Ok(log_bounds(0, 10))
+        }
+    };
+    let data = envelope(100, 1);
+    let hash = ServerMessage::compute_snapshot_hash(&data);
+    let snap = three_part_snapshot(2);
+    // A single-request upload, an upload of one chunk and the last chunk of an upload of three.
+    assert_superseded(
+        relay
+            .stage_snapshot(
+                &room(),
+                &Uploader::Admin,
+                seq(5),
+                data.clone().into(),
+                pruned_past(5),
+            )
+            .await,
+    );
+    let one_chunk = part(6, 0, (data.len() as u64, 1), hash, &data);
+    assert_superseded(relay.stage_chunk(one_chunk, pruned_past(6)).await);
+    upload_parts(&relay, 7, [0, 1], &snap, (0, 10)).await;
+    assert_superseded(
+        relay
+            .stage_chunk(part_of(7, 2, &snap), pruned_past(7))
+            .await,
+    );
+    assert_eq!(relay.active_snapshot_seq(&room()), None);
+    assert!(files_in(&snapshots_dir(&dir)).is_empty());
+    assert!(files_in(&uploads_dir(&dir)).is_empty());
+    // A snapshot at the floor is still usable.
+    stage(&relay, 8, &data).await.unwrap();
+}
+
+#[tokio::test]
 async fn newer_snapshot_discards_the_upload_in_progress() {
     let dir = tempdir().unwrap();
     let relay = open(&dir);

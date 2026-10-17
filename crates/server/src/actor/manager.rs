@@ -9,7 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch, Mutex, OwnedMutexGuard};
-use tracing::info;
+use tracing::{info, warn};
+use uuid::Uuid;
 use zemdb_core::id::{RoomId, SchemaId};
 use zemdb_core::schema::Schema;
 
@@ -28,6 +29,10 @@ use crate::schema_registry::SchemaRegistry;
 /// File, inside the room directory, recording the room's schema assignment and lifecycle
 /// overrides.
 const META_ROOM_FILE: &str = "meta_room.json";
+
+/// Prefix of the name a room's directory is renamed to when the room is deleted. No room id
+/// contains `.`, so it never names a room.
+const DELETED_ROOM_PREFIX: &str = ".deleted-";
 
 /// How long a request waits for a room actor to take its command and reply.
 pub const ACTOR_TIMEOUT: Duration = Duration::from_secs(5);
@@ -176,6 +181,9 @@ pub struct RoomManager {
 impl RoomManager {
     /// Creates a new RoomManager with the given configuration, schema registry, and snapshot
     /// relay. The configuration provides the server defaults of the room lifecycle policy.
+    /// Removes what the deletions of rooms left behind in `data_dir` ([`delete_room`]).
+    ///
+    /// [`delete_room`]: Self::delete_room
     pub fn new(
         config: Arc<ServerConfig>,
         schema_registry: Arc<SchemaRegistry>,
@@ -183,6 +191,10 @@ impl RoomManager {
     ) -> Self {
         let data_dir = config.data_dir.clone();
         let default_policy = config.default_lifecycle_policy();
+        // A deletion cut short leaves its renamed directory behind; the room is already gone.
+        if let Err(err) = remove_deleted_rooms(&data_dir.join("rooms")) {
+            warn!(error = %err, "Failed to remove the directories of deleted rooms");
+        }
         Self {
             response_budget: Arc::new(InflightBudget::new(
                 config.max_inflight_response_bytes,
@@ -412,12 +424,15 @@ impl RoomManager {
         self.rooms.insert(room_id.clone(), slot.clone());
 
         let (rooms, room_meta) = (Arc::clone(&self.rooms), Arc::clone(&self.room_meta));
+        let relay = Arc::clone(&self.snapshot_relay);
         let room_id = room_id.clone();
         tokio::spawn(async move {
             let exit = actor.run().await;
             // Before the exit is reported: a respawn waits for it, under the spawn lock, before
-            // adding the room's metadata again. Taking the spawn lock here would deadlock.
+            // adding the room's metadata and snapshot floor again. Taking the spawn lock here
+            // would deadlock.
             room_meta.remove(&room_id);
+            relay.clear_snapshot_floor(&room_id);
             rooms.remove_if(&room_id, |_, slot| slot.actor_id == actor_id);
             exit_tx.send_replace(Some(exit));
         });
@@ -514,6 +529,9 @@ impl RoomManager {
             .schema_registry
             .get_schema(&schema_id)
             .ok_or_else(|| ServerError::SchemaNotFound(schema_id.to_string()))?;
+        // Not even a room whose directory was lost, or whose deletion was cut short, may pass
+        // its snapshot on to this one.
+        self.snapshot_relay.purge_room(&room_id).await?;
 
         let meta = RoomMetadata {
             room_id: room_id.clone(),
@@ -536,35 +554,53 @@ impl RoomManager {
         Ok(meta)
     }
 
-    /// Deletes a room: shuts down its actor and removes the room directory from disk. A room
-    /// whose log is open in another process is `RoomLocked`, and nothing is deleted.
+    /// Deletes a room: shuts down its actor, renames its directory to a name no room can have,
+    /// purges the room from the relay and removes the renamed directory. A room whose log is
+    /// open in another process is `RoomLocked`, and nothing is deleted.
     ///
-    /// Not safe to cancel: dropped while the relay purges the room's snapshot, it leaves the
-    /// room in place without it. A caller that may be cancelled runs it in a task of its own.
+    /// The room is gone once the rename is durable, and failures afterwards are only logged. A
+    /// purge or removal that fails or is cut short (a crash, or the future dropped) leaves the
+    /// renamed directory, which the next start removes ([`new`](Self::new)), and possibly the
+    /// room's snapshot in the relay, which no room offers and [`create_room`](Self::create_room)
+    /// purges.
     pub async fn delete_room(&self, room_id: &RoomId) -> Result<(), ServerError> {
         let _guard = self.lock_room(room_id).await;
 
         self.shutdown_room(room_id).await;
         self.room_meta.remove(room_id);
         let room_dir = room_dir(&self.data_dir, room_id);
+        let deleted = room_dir.with_file_name(format!("{DELETED_ROOM_PREFIX}{}", Uuid::new_v4()));
         // A log open elsewhere (another process) keeps the room. The lock is released before
-        // the removal, which on Windows cannot delete a locked file; meanwhile the room lock
-        // keeps this process from reopening the log, and `server.lock` keeps others off.
-        let lock = match blocking_io(|| crate::log::tiered_log::lock_log(&room_dir)) {
-            // No room directory: reported below, once the relay is purged.
-            Err(ServerError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
-            lock => Some(lock?),
-        };
-        // A room recreated with the same id must not inherit this room's snapshot.
-        self.snapshot_relay.purge_room(room_id).await?;
-
-        drop(lock);
-        match blocking_io(|| fs::remove_dir_all(&room_dir)) {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Err(ServerError::RoomNotFound(room_id.to_string()))
-            }
-            result => Ok(result?),
+        // the rename, which on Windows fails on a directory holding a locked file; meanwhile
+        // the room lock keeps this process from reopening the log, and `server.lock` keeps
+        // others off.
+        let moved = blocking_io(|| {
+            drop(crate::log::tiered_log::lock_log(&room_dir)?);
+            fs::rename(&room_dir, &deleted)?;
+            Ok::<_, ServerError>(durable::sync_parent(&room_dir)?)
+        });
+        // No room directory: reported once the relay is purged.
+        let missing =
+            matches!(&moved, Err(ServerError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound);
+        if !missing {
+            moved?;
         }
+        // A room recreated with the same id must not inherit this room's snapshot.
+        let purged = self.snapshot_relay.purge_room(room_id).await;
+        if missing {
+            purged?;
+            return Err(ServerError::RoomNotFound(room_id.to_string()));
+        }
+        // The room is gone. What a failure leaves is removed at the next start, or purged when
+        // a room with this id is created again.
+        let removed = blocking_io(|| {
+            fail_point::check("room_removal", &room_dir)?;
+            Ok::<_, ServerError>(fs::remove_dir_all(&deleted)?)
+        });
+        for err in [purged.err(), removed.err()].into_iter().flatten() {
+            warn!(room = %room_id, error = %err, "Failed to remove what a deleted room left");
+        }
+        Ok(())
     }
 
     /// Retained log range of a room, and the highest cursor from which it found a gap, spawning
@@ -673,6 +709,24 @@ impl RoomManager {
         }
         reloaded
     }
+}
+
+/// Removes the directories that deleted rooms left in `rooms_dir` (see [`DELETED_ROOM_PREFIX`]).
+fn remove_deleted_rooms(rooms_dir: &Path) -> std::io::Result<()> {
+    let entries = match fs::read_dir(rooms_dir) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        entries => entries?,
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(DELETED_ROOM_PREFIX))
+        {
+            fs::remove_dir_all(path)?;
+        }
+    }
+    Ok(())
 }
 
 /// A random incarnation for a new room.
