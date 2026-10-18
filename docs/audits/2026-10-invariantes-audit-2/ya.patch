@@ -1,0 +1,510 @@
+diff --git a/crates/server/src/actor/tests/room.rs b/crates/server/src/actor/tests/room.rs
+index 6247439..83069d4 100644
+--- a/crates/server/src/actor/tests/room.rs
++++ b/crates/server/src/actor/tests/room.rs
+@@ -3220,3 +3220,334 @@ mod onboarding_sim {
+         run(true, true).await;
+     }
+ }
++
++// Second invariant audit (group ya): idempotency and isolation inside the room.
++
++/// The outcome of a retry of `mutation_id` by `client_id` with cursor `last_ack_seq`: its
++/// sequence (or the error) and the head right after.
++async fn retry_outcome(
++    sender: &mpsc::Sender<RoomCommand>,
++    client_id: &ClientId,
++    mutation_id: MutationId,
++    last_ack_seq: SequenceNumber,
++) -> (Result<u64, String>, u64) {
++    let retried = commit(sender, client_id, mutation_id, last_ack_seq, insert_op(1)).await;
++    let assigned = retried
++        .map(|ack| ack.assigned_seq.get())
++        .map_err(|err| err.to_string());
++    (assigned, metrics(sender).await.head_seq.get())
++}
++
++/// INV-Y9: the window is a function of the retained log and the same before and after a
++/// respawn. The only client's cursor prunes mutation 1 out of the retained log: a retry of it
++/// must get the same answer before and after the room respawns.
++// Paused time: no maintenance tick runs, so only the ack prunes.
++#[tokio::test(start_paused = true)]
++async fn audit_y9_a_pruned_mutation_is_recognised_only_until_the_room_respawns() {
++    let (fx, writer, tail) = pruned_room().await;
++    assert!(tail > seq(1), "mutation 1 must be out of the retained log");
++
++    let before = retry_outcome(&fx.sender().await, &writer, mutation(1), seq(8)).await;
++    fx.manager.shutdown_all().await;
++    let after = retry_outcome(&fx.sender().await, &writer, mutation(1), seq(8)).await;
++
++    assert_eq!(
++        before, after,
++        "with the retained log {tail}..=8, a retry of mutation 1 got (sequence, head) {before:?} \
++         before a respawn and {after:?} after it: the window in memory is not the one the log \
++         gives"
++    );
++    fx.manager.shutdown_all().await;
++}
++
++/// INV-Y9 (since D69): a pass over the quota prunes recent warm segments that no cursor
++/// confirmed. The retry of a mutation the quota pruned, by a client whose cursor is inside the
++/// log, must get the same answer before and after a respawn.
++#[tokio::test(start_paused = true)]
++async fn audit_y9_a_mutation_pruned_by_the_quota_is_recognised_only_until_the_room_respawns() {
++    let fx = Fixture::new(RoomLifecycleOverrides {
++        max_room_disk_bytes: Some(crate::log::policy::MIN_ROOM_DISK_BYTES),
++        lease_timeout_secs: Some(3600),
++        ..small_segments()
++    })
++    .await;
++    let sender = fx.sender().await;
++    let (writer, slow) = (
++        ClientId::new("writer").unwrap(),
++        ClientId::new("slow").unwrap(),
++    );
++    register(&sender, &writer).await;
++    // A connected client at 0 holds back pruning by cursors: only the quota prunes.
++    register_at(&sender, &slow, Some((seq(0), fx.incarnation))).await;
++    let mut rng = TestRng::new(7);
++    let big = |id: i64, rng: &mut TestRng| {
++        let title: String = (0..160 * 1024)
++            .map(|_| char::from(b'a' + (rng.next_u64() % 26) as u8))
++            .collect();
++        let row = RowBuilder::new().set("id", id).set("title", title).build();
++        test_schema()
++            .to_operation_insert("tasks", &row, 1000)
++            .unwrap()
++    };
++    for n in 1..=12u8 {
++        commit(
++            &sender,
++            &writer,
++            mutation(n),
++            seq(0),
++            big(n.into(), &mut rng),
++        )
++        .await
++        .unwrap();
++    }
++    ack(&sender, &writer, seq(12)).await.unwrap();
++    // The slow tick (500 ms) runs the pass over the quota.
++    let started = tokio::time::Instant::now();
++    while metrics(&sender).await.tail_seq <= seq(2) {
++        assert!(
++            started.elapsed() < Duration::from_secs(60),
++            "the quota never pruned"
++        );
++        tokio::time::sleep(Duration::from_millis(100)).await;
++    }
++    let tail = metrics(&sender).await.tail_seq;
++
++    let before = retry_outcome(&sender, &writer, mutation(1), seq(12)).await;
++    fx.manager.shutdown_all().await;
++    let after = retry_outcome(&fx.sender().await, &writer, mutation(1), seq(12)).await;
++
++    assert_eq!(
++        before, after,
++        "with the retained log {tail}..=12 (pruned by the quota), a retry of mutation 1 got \
++         (sequence, head) {before:?} before a respawn and {after:?} after it"
++    );
++    fx.manager.shutdown_all().await;
++}
++
++/// INV-Y9 with a damaged sealed segment whose sidecar is missing (disk damage plus a crash
++/// before the sidecar was written): opening skips it and reads older segments (DEF-158), so
++/// the window after the respawn holds mutation 2, which had left the window, and not 4, which
++/// is among the last three.
++#[tokio::test(start_paused = true)]
++async fn audit_y9_a_damaged_segment_without_sidecar_changes_the_window_at_the_respawn() {
++    let fx = Fixture::with_options(
++        small_segments(),
++        |config| config.dedup_lru_capacity = 3,
++        None,
++    )
++    .await;
++    let sender = fx.sender().await;
++    let writer = ClientId::new("writer").unwrap();
++    register(&sender, &writer).await;
++    // Segments 1-2, 3-4 and 5-6; the window holds 4, 5 and 6.
++    for n in 1..=6u8 {
++        commit(&sender, &writer, mutation(n), seq(0), insert_op(n.into()))
++            .await
++            .unwrap();
++    }
++    let segments = fx.room_dir().join("segments");
++    let damaged = segment_path(&segments, seq(3), seq(4), Tier::Warm);
++    let mut bytes = fs::read(&damaged).unwrap();
++    bytes[20] ^= 0xFF;
++    fs::write(&damaged, bytes).unwrap();
++    fs::remove_file(crate::log::segment_index::mutation_ids_path(
++        &segments,
++        seq(3),
++        seq(4),
++    ))
++    .unwrap();
++
++    let before = retry_outcome(&sender, &writer, mutation(4), seq(0)).await;
++    fx.manager.shutdown_all().await;
++    let after = retry_outcome(&fx.sender().await, &writer, mutation(4), seq(0)).await;
++
++    assert_eq!(
++        before, after,
++        "with the segment 3-4 damaged and without its sidecar, a retry of mutation 4 got \
++         (sequence, head) {before:?} before a respawn and {after:?} after it"
++    );
++    fx.manager.shutdown_all().await;
++}
++
++/// INV-Y4: retries of every mutation in the window are recognised after a respawn although one
++/// sidecar is missing, another is damaged and a sealed segment with an intact sidecar is
++/// damaged.
++#[tokio::test(start_paused = true)]
++async fn audit_y4_retries_survive_a_respawn_with_damaged_sidecars_and_segments() {
++    let fx = Fixture::with_options(
++        small_segments(),
++        |config| config.dedup_lru_capacity = 100,
++        None,
++    )
++    .await;
++    let sender = fx.sender().await;
++    let writer = ClientId::new("writer").unwrap();
++    register(&sender, &writer).await;
++    // Segments 1-2, 3-4, 5-6 and 7-8; 9 stays in active.wal.
++    for n in 1..=9u8 {
++        commit(&sender, &writer, mutation(n), seq(0), insert_op(n.into()))
++            .await
++            .unwrap();
++    }
++    fx.manager.shutdown_all().await;
++    let segments = fx.room_dir().join("segments");
++    let ids =
++        |start, end| crate::log::segment_index::mutation_ids_path(&segments, seq(start), seq(end));
++    fs::remove_file(ids(3, 4)).unwrap();
++    let mut sidecar = fs::read(ids(5, 6)).unwrap();
++    sidecar[17] ^= 0xFF;
++    fs::write(ids(5, 6), sidecar).unwrap();
++    let damaged = segment_path(&segments, seq(7), seq(8), Tier::Warm);
++    let mut bytes = fs::read(&damaged).unwrap();
++    bytes[20] ^= 0xFF;
++    fs::write(&damaged, bytes).unwrap();
++
++    let sender = fx.sender().await;
++    for n in 1..=9u8 {
++        let retry = retry_outcome(&sender, &writer, mutation(n), seq(0)).await;
++        assert_eq!(retry, (Ok(n.into()), 9), "retry of mutation {n}");
++    }
++    fx.manager.shutdown_all().await;
++}
++
++/// INV-Y4: copies of the same commit sent at once, through the manager and across a respawn,
++/// are sequenced once.
++#[tokio::test]
++async fn audit_y4_concurrent_copies_of_a_commit_are_sequenced_once() {
++    let fx = Fixture::new(small_segments()).await;
++    let writer = ClientId::new("writer").unwrap();
++    register(&fx.sender().await, &writer).await;
++    let manager = &fx.manager;
++    let room_id = &fx.room_id;
++    for round in 0..4u8 {
++        let copies = (0..5).map(|_| {
++            manager.ask(room_id, |reply| RoomCommand::Commit {
++                client_id: writer.clone(),
++                mutation_id: mutation(round + 1),
++                last_ack_seq: seq(0),
++                op: insert_op(round.into()),
++                reply,
++            })
++        });
++        let assigned: Vec<u64> = futures::future::join_all(copies)
++            .await
++            .into_iter()
++            .map(|reply| reply.unwrap().unwrap().assigned_seq.get())
++            .collect();
++        assert_eq!(assigned, vec![u64::from(round) + 1; 5], "round {round}");
++        if round % 2 == 1 {
++            manager.shutdown_all().await;
++        }
++    }
++    assert_eq!(metrics(&fx.sender().await).await.head_seq, seq(4));
++    fx.manager.shutdown_all().await;
++}
++
++/// INV-A3 / D76: an upload by a member that is not the designee does not keep a designee that
++/// does not upload. Mallory keeps two uploads of one small chunk with a wrong hash in flight
++/// (the most the room admits at once): each holds the relay's lock of the room while its file
++/// is synced and checked, and the actor takes a busy lock as an upload of the designee.
++#[tokio::test]
++async fn audit_a3_a_member_failing_small_uploads_keeps_a_designee_that_does_not_upload() {
++    let fx = Fixture::with_options(
++        small_segments(),
++        |_| {},
++        Some(ActorTimings {
++            designation_timeout: DESIGNATION_TIMEOUT_IN_TESTS,
++            ..TEST_TIMINGS
++        }),
++    )
++    .await;
++    let (writer, tail) = prune_with_writer(&fx).await;
++    let sender = fx.sender().await;
++    let mallory = ClientId::new("mallory").unwrap();
++    register_at(&sender, &mallory, Some((tail, fx.incarnation))).await;
++    let mut events = subscribe(&sender).await;
++    register_at(&sender, &ClientId::new("newcomer").unwrap(), None).await;
++    assert_eq!(
++        next_snapshot_event(&mut events).await,
++        RoomEvent::SnapshotWanted
++    );
++    assert!(snapshot_wanted(&sender, &writer).await);
++
++    let data = snapshot_envelope();
++    let failing_upload = || crate::relay::SnapshotChunkUpload {
++        room_id: fx.room_id.clone(),
++        uploader: crate::relay::Uploader::Client(mallory.clone()),
++        head_seq: seq(8),
++        chunk_index: 0,
++        total_chunks: 1,
++        total_bytes: data.len() as u64,
++        snapshot_hash: [0xEE; 32],
++        data: data.clone(),
++    };
++    let flood_until = tokio::time::Instant::now() + DESIGNATION_TIMEOUT_IN_TESTS * 3;
++    let counts = std::sync::Mutex::new((0u32, 0u32));
++    let floods = (0..crate::relay::MAX_PENDING_SINGLE_UPLOADS).map(|_| async {
++        while tokio::time::Instant::now() < flood_until {
++            let result = fx
++                .relay
++                .stage_chunk(failing_upload(), fx.manager.log_bounds(&fx.room_id))
++                .await;
++            {
++                let mut counts = counts.lock().unwrap();
++                match result {
++                    Err(ServerError::RateLimited) => counts.1 += 1,
++                    _ => counts.0 += 1,
++                }
++            }
++            // A refused upload returns without yielding; the next request comes later.
++            tokio::task::yield_now().await;
++        }
++    });
++    futures::future::join_all(floods).await;
++    let (held, limited) = *counts.lock().unwrap();
++
++    // Three designation timeouts later, the writer must have been replaced at least once.
++    let during_flood = pending_snapshot_events(&mut events);
++    assert!(
++        during_flood.contains(&RoomEvent::SnapshotWanted),
++        "in {:?} the writer, which never uploaded, was never replaced as the designee (snapshot \
++         events meanwhile: {during_flood:?}; Mallory's failed uploads: {held}, rate limited: \
++         {limited})",
++        DESIGNATION_TIMEOUT_IN_TESTS * 3
++    );
++    fx.manager.shutdown_all().await;
++}
++
++/// INV-A3: a member that registers and deregisters in a loop, with and without a cursor,
++/// changes nothing of another client of its room: cursor, state or designation.
++// Paused time: no maintenance tick changes the states under test.
++#[tokio::test(start_paused = true)]
++async fn audit_a3_registering_and_deregistering_in_a_loop_leaves_other_clients_alone() {
++    let fx = Fixture::new(small_segments()).await;
++    let (writer, tail) = prune_with_writer(&fx).await;
++    let sender = fx.sender().await;
++    let mut events = subscribe(&sender).await;
++    register_at(&sender, &ClientId::new("newcomer").unwrap(), None).await;
++    assert_eq!(
++        next_snapshot_event(&mut events).await,
++        RoomEvent::SnapshotWanted
++    );
++    assert!(snapshot_wanted(&sender, &writer).await);
++    let before = (cursor(&sender, &writer).await, states(&sender).await);
++
++    let mallory = ClientId::new("mallory").unwrap();
++    for round in 0..50u64 {
++        let at = match round % 3 {
++            0 => None,
++            1 => Some((tail, fx.incarnation)),
++            _ => Some((seq(8), fx.incarnation)),
++        };
++        register_at(&sender, &mallory, at).await;
++        deregister(&sender, &mallory).await;
++    }
++
++    assert_eq!(
++        (cursor(&sender, &writer).await, states(&sender).await),
++        before
++    );
++    assert!(pending_snapshot_events(&mut events).is_empty());
++    assert!(snapshot_wanted(&sender, &writer).await);
++    fx.manager.shutdown_all().await;
++}
+diff --git a/crates/server/src/relay/tests/upload.rs b/crates/server/src/relay/tests/upload.rs
+index 4225bb1..a2b87f7 100644
+--- a/crates/server/src/relay/tests/upload.rs
++++ b/crates/server/src/relay/tests/upload.rs
+@@ -651,3 +651,105 @@ async fn uploads_completed_in_one_request_are_in_progress_while_they_are_handled
+         assert_eq!(relay.upload_in_progress(&room()), None);
+     }
+ }
++
++// Second invariant audit (group ya): isolation inside the room.
++
++/// INV-A3: an upload in progress at sequence S that another member started is replaced, at S,
++/// only by its uploader or by the snapshot worker, whatever the kind of the new upload: chunked,
++/// of one chunk or in one request.
++#[tokio::test]
++async fn audit_a3_an_upload_at_the_same_seq_yields_alike_to_every_kind_of_upload() {
++    let one_chunk = |uploader: Uploader, fill: u8| {
++        let data = envelope(100, fill);
++        let hash = ServerMessage::compute_snapshot_hash(&data);
++        SnapshotChunkUpload {
++            uploader,
++            ..part(10, 0, (data.len() as u64, 1), hash, &data)
++        }
++    };
++    for kind in ["chunked", "one chunk", "one request"] {
++        for (who, replaces) in [
++            (member("mallory"), false),
++            (member("alice"), true),
++            (Uploader::Admin, true),
++        ] {
++            let dir = tempdir().unwrap();
++            let relay = open(&dir);
++            let alice = three_part_snapshot(1);
++            relay
++                .stage_chunk(part_by(member("alice"), 10, 0, &alice), bounds(0, 10))
++                .await
++                .unwrap();
++
++            let other = three_part_snapshot(2);
++            let result = match kind {
++                "chunked" => relay
++                    .stage_chunk(part_by(who.clone(), 10, 0, &other), bounds(0, 10))
++                    .await
++                    .map(drop),
++                "one chunk" => relay
++                    .stage_chunk(one_chunk(who.clone(), 3), bounds(0, 10))
++                    .await
++                    .map(drop),
++                _ => relay
++                    .stage_snapshot(
++                        &room(),
++                        &who,
++                        seq(10),
++                        Bytes::from(envelope(100, 4)),
++                        bounds(0, 10),
++                    )
++                    .await
++                    .map(drop),
++            };
++            let alices_upload_survives = relay
++                .slot(&room())
++                .lock()
++                .await
++                .upload
++                .as_ref()
++                .is_some_and(|upload| {
++                    upload.uploader == member("alice") && upload.snapshot_hash == alice.2
++                });
++            assert_eq!(
++                (result.is_ok(), alices_upload_survives),
++                (replaces, !replaces),
++                "{kind} upload by {who:?} at Alice's sequence: {result:?}"
++            );
++        }
++    }
++}
++
++/// INV-A3: a member cannot alter another member's upload in progress at the same sequence.
++/// Mallory sends a chunk with the parameters of Alice's upload (sequence, layout and hash) and
++/// other bytes; the relay takes it as part of Alice's upload, which then fails.
++#[tokio::test]
++async fn audit_a3_a_chunk_with_the_parameters_of_another_members_upload_breaks_it() {
++    let dir = tempdir().unwrap();
++    let relay = open(&dir);
++    let alice = three_part_snapshot(1);
++    relay
++        .stage_chunk(part_by(member("alice"), 10, 0, &alice), bounds(0, 10))
++        .await
++        .unwrap();
++
++    // Mallory knows the sequence, the layout and the hash, not the bytes.
++    let mut forged = alice.clone();
++    forged.0 = vec![0xAB; alice.0.len()];
++    let mallory = relay
++        .stage_chunk(part_by(member("mallory"), 10, 0, &forged), bounds(0, 10))
++        .await;
++
++    let mut last = Ok(false);
++    for index in 1..3 {
++        last = relay
++            .stage_chunk(part_by(member("alice"), 10, index, &alice), bounds(0, 10))
++            .await;
++    }
++    assert!(
++        matches!(last, Ok(true)) && relay.active_snapshot_seq(&room()) == Some(seq(10)),
++        "Mallory's chunk ({mallory:?}) went into Alice's upload at the same sequence: Alice's \
++         last chunk got {last:?}, and the active snapshot is {:?}",
++        relay.active_snapshot_seq(&room())
++    );
++}
+diff --git a/crates/server/src/response_budget.rs b/crates/server/src/response_budget.rs
+index 5891b97..462d0fe 100644
+--- a/crates/server/src/response_budget.rs
++++ b/crates/server/src/response_budget.rs
+@@ -104,3 +104,7 @@ impl Drop for Reservation {
+         self.release(self.permit.num_permits());
+     }
+ }
++
++#[cfg(test)]
++#[path = "tests/response_budget.rs"]
++mod tests;
+diff --git a/crates/server/src/tests/response_budget.rs b/crates/server/src/tests/response_budget.rs
+new file mode 100644
+index 0000000..8aa9f42
+--- /dev/null
++++ b/crates/server/src/tests/response_budget.rs
+@@ -0,0 +1,43 @@
++use super::*;
++use zemdb_core::id::ClientId;
++
++fn holder(room: &str, client: Option<&str>) -> BudgetHolder {
++    let uploader = client.map_or(Uploader::Admin, |id| {
++        Uploader::Client(ClientId::new(id).unwrap())
++    });
++    (RoomId::new(room).unwrap(), uploader)
++}
++
++/// INV-A3 / D75: what a client holds counts against its own part only. Another client of its
++/// room, the same client id in another room and the admin secret keep theirs, and its part
++/// frees up when its responses are dropped or shrink.
++#[test]
++fn audit_a3_a_client_cannot_take_the_part_of_another_client_of_its_room() {
++    let frame = MAX_FRAME_SIZE as u64;
++    let budget = Arc::new(InflightBudget::new(8 * frame, 2 * frame));
++    let alice = holder("room", Some("alice"));
++    let held: Vec<_> = (0..2)
++        .map(|_| budget.reserve_frame(alice.clone()).unwrap())
++        .collect();
++    assert!(budget.reserve_frame(alice.clone()).is_none());
++
++    for other in [
++        holder("room", Some("bob")),
++        holder("other-room", Some("alice")),
++        holder("room", None),
++    ] {
++        let reserved: Vec<_> = (0..2)
++            .map(|_| budget.reserve_frame(other.clone()))
++            .collect();
++        assert!(reserved.iter().all(Option::is_some), "{other:?}");
++    }
++
++    // Shrinking one of Alice's responses gives back the rest of its frame to her part.
++    let mut held = held;
++    held[0].shrink_to(1024);
++    assert!(budget
++        .reserve(alice.clone(), (frame - 1024) as u32)
++        .is_some());
++    drop(held);
++    assert!(budget.reserve_frame(alice).is_some());
++}

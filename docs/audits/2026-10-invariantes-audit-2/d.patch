@@ -1,0 +1,729 @@
+diff --git a/crates/server/src/actor/tests/room.rs b/crates/server/src/actor/tests/room.rs
+index 6247439..607c135 100644
+--- a/crates/server/src/actor/tests/room.rs
++++ b/crates/server/src/actor/tests/room.rs
+@@ -3220,3 +3220,84 @@ mod onboarding_sim {
+         run(true, true).await;
+     }
+ }
++
++/// Flips a payload byte of the `index`-th frame of the WAL file at `path`.
++fn audit_damage_frame(path: &std::path::Path, index: usize) {
++    use zemdb_core::protocol::wal_frame::{parse_batch_header, BATCH_HEADER_SIZE};
++    let mut bytes = fs::read(path).unwrap();
++    let mut offset = 0;
++    for _ in 0..index {
++        let header = parse_batch_header(bytes[offset..].first_chunk().unwrap()).unwrap();
++        offset += header.frame_len();
++    }
++    bytes[offset + BATCH_HEADER_SIZE] ^= 0xFF;
++    fs::write(path, bytes).unwrap();
++}
++
++/// INV-D1: commit 3 is acknowledged and its rotation stops after recording its end in
++/// `log_meta.json`, before the rename (a crash at that point leaves the same files). The last
++/// frame of `active.wal` (commit 3, synced) is then damaged by accident. The respawn truncates it
++/// as a torn write and keeps `head_seq` at 3 (INV-D8), so commit 4 is acknowledged with sequence
++/// 4, but it goes into the same `active.wal`, after a hole: sealed as `1..=4`, it is read as
++/// sequence 3, and no read can return it.
++// Paused time: no maintenance tick runs.
++#[tokio::test(start_paused = true)]
++async fn audit_d1_commit_acknowledged_after_a_truncated_frame_below_the_sealed_end_is_served() {
++    let policy = RoomLifecycleOverrides {
++        ram_max_ops: Some(3),
++        ..RoomLifecycleOverrides::default()
++    };
++    let fx = Fixture::new(policy).await;
++    let sender = fx.sender().await;
++    let client = ClientId::new("writer").unwrap();
++    register(&sender, &client).await;
++    for i in 1..=2u8 {
++        commit(
++            &sender,
++            &client,
++            mutation(i),
++            seq(u64::from(i) - 1),
++            insert_op(i64::from(i)),
++        )
++        .await
++        .unwrap();
++    }
++    let active = fx.room_dir().join("segments").join("active.wal");
++    fail_point::arm("exists", &active);
++    let acked = commit(&sender, &client, mutation(3), seq(2), insert_op(3)).await;
++    assert_eq!(acked.unwrap().assigned_seq, seq(3));
++    assert!(
++        sender.is_closed(),
++        "the room restarts after the failed rotation"
++    );
++    fx.manager.shutdown_all().await;
++    audit_damage_frame(&active, 2);
++
++    let recovered = fx.sender().await;
++    assert_eq!(
++        metrics(&recovered).await.head_seq,
++        seq(3),
++        "3 is not reused"
++    );
++    let acked = commit(&recovered, &client, mutation(4), seq(3), insert_op(4)).await;
++    assert_eq!(acked.unwrap().assigned_seq, seq(4));
++    fx.manager.shutdown_all().await;
++
++    let reopened = fx.sender().await;
++    let (tx, rx) = oneshot::channel();
++    reopened
++        .send(RoomCommand::Sync {
++            client_id: client.clone(),
++            from_seq: seq(3),
++            max_batch_size: 100,
++            reply: tx,
++        })
++        .await
++        .unwrap();
++    let synced = rx.await.unwrap().unwrap_or_else(|e| {
++        panic!("INV-D1: CommitAck 4 was sent, and a sync from 3 after a reopen fails: {e}")
++    });
++    let seqs: Vec<u64> = synced.ops.iter().map(|op| op.seq.get()).collect();
++    assert_eq!(seqs, vec![4], "INV-D1: the acknowledged commit 4");
++    fx.manager.shutdown_all().await;
++}
+diff --git a/crates/server/src/log/tests/tiered_log.rs b/crates/server/src/log/tests/tiered_log.rs
+index 0fca1d0..5e8458f 100644
+--- a/crates/server/src/log/tests/tiered_log.rs
++++ b/crates/server/src/log/tests/tiered_log.rs
+@@ -2375,3 +2375,510 @@ fn fetch_cost_does_not_grow_with_the_number_of_segments() {
+     println!("1,000 reads near the head: {few:?} with 100 segments, {many:?} with 50,000");
+     assert!(many < 3 * few, "{many:?} against {few:?}");
+ }
++
++// ---------------------------------------------------------------------------------------------
++// Audit (second invariants audit, group d): durability of the server log.
++// ---------------------------------------------------------------------------------------------
++
++/// Flips a payload byte of the `index`-th frame of the file at `path`.
++fn audit_damage_frame_at(path: &Path, index: usize) {
++    let file = OpenOptions::new()
++        .read(true)
++        .write(true)
++        .open(path)
++        .unwrap();
++    damage_payload(&file, index);
++}
++
++/// INV-D1: a crash between recording the end of a rotation in `log_meta.json` and renaming
++/// `active.wal` leaves `sealed_through_seq` at the end of `active.wal`. If the last frame of
++/// `active.wal` is then damaged (accidental corruption of a synced frame), the open truncates it
++/// as a torn write while `head_seq` stays at the recorded end (INV-D8). The next commit is then
++/// appended to the same `active.wal` after the missing sequence, and the open after it fails:
++/// that acknowledged commit is no longer reachable.
++#[test]
++fn audit_d1_commit_after_a_damaged_last_frame_below_the_sealed_end_survives_a_reopen() {
++    let dir = tempdir().unwrap();
++    let policy = RoomLifecyclePolicy::default();
++    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++    append_range(&mut log, 1, 5);
++    let active = segments_dir(dir.path()).join("active.wal");
++    // The rotation records 5 as the sealed end, then stops before the rename.
++    crate::fail_point::arm("exists", &active);
++    assert!(log.force_rotate_warm().is_err());
++    drop(log);
++    audit_damage_frame_at(&active, 4);
++
++    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++    assert_eq!(
++        log.head_seq().get(),
++        5,
++        "5 is in log_meta.json, so it is not reused"
++    );
++    // Commit 6 is acknowledged.
++    let outcome = log.append(make_op(6), Some(mutation_for(6))).unwrap();
++    assert!(outcome.rotation_error.is_none());
++    drop(log);
++
++    let (log, mutations) = TieredLog::open_or_create(dir.path(), policy).unwrap_or_else(|e| {
++        panic!("INV-D1: commit 6 was acknowledged, and the room no longer opens: {e}")
++    });
++    assert_eq!(log.head_seq().get(), 6);
++    assert!(mutations.contains(&(mutation_for(6), SequenceNumber::new(6))));
++    let (ops, _) = log
++        .fetch_deltas(SequenceNumber::new(5), 10)
++        .unwrap_or_else(|e| panic!("INV-D1: commit 6 was acknowledged and cannot be read: {e}"));
++    assert_eq!(seqs(&ops), vec![6]);
++}
++
++/// INV-D1, the same with a rotation by count right after commit 6: the open succeeds, but the
++/// sealed segment holds 1..=4 and 6 under the name 1..=6. Reads count sequences from the name,
++/// so a read from 5 skips commit 6 as if it were 5 and finds nothing: `BehindCompaction`.
++#[test]
++fn audit_d1_commit_after_a_damaged_last_frame_below_the_sealed_end_is_readable() {
++    let dir = tempdir().unwrap();
++    let policy = RoomLifecyclePolicy {
++        ram_max_ops: 5,
++        ..RoomLifecyclePolicy::default()
++    };
++    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++    append_range(&mut log, 1, 4);
++    let active = segments_dir(dir.path()).join("active.wal");
++    crate::fail_point::arm("exists", &active);
++    let outcome = log.append(make_op(5), Some(mutation_for(5))).unwrap();
++    assert!(outcome.rotation_error.is_some());
++    drop(log);
++    audit_damage_frame_at(&active, 4);
++
++    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++    assert_eq!(log.head_seq().get(), 5);
++    // Commit 6 is acknowledged; it fills active.wal, which is sealed as 1..=6.
++    let outcome = log.append(make_op(6), Some(mutation_for(6))).unwrap();
++    assert!(outcome.rotation_error.is_none());
++    drop(log);
++
++    let (log, mutations) = TieredLog::open_or_create(dir.path(), policy).unwrap();
++    assert_eq!(log.head_seq().get(), 6);
++    assert!(mutations.contains(&(mutation_for(6), SequenceNumber::new(6))));
++    // 5 is a gap (the damaged frame): a read from 5 must return commit 6.
++    let (ops, _) = log
++        .fetch_deltas(SequenceNumber::new(5), 10)
++        .unwrap_or_else(|e| {
++            panic!("INV-D1: commit 6 was acknowledged and a read from 5 fails: {e}")
++        });
++    assert_eq!(seqs(&ops), vec![6], "INV-D1: the acknowledged commit 6");
++}
++
++/// INV-D8: a rotation interrupted at any of its steps (recording its end, the rename, the sync
++/// of `segments/`, the sidecar, the creation of the next `active.wal`), followed by a crash and
++/// the loss of the newest segment and its sidecar, never takes `head_seq` below 5, and the next
++/// commit gets 6.
++#[test]
++fn audit_d8_rotation_interrupted_at_any_step_never_lowers_the_head() {
++    let policy = RoomLifecyclePolicy {
++        ram_max_ops: 5,
++        ..RoomLifecyclePolicy::default()
++    };
++    let steps: [(&str, fn(&Path) -> PathBuf); 6] = [
++        ("write_atomic_before_rename", |d| d.join("log_meta.json")),
++        ("sync_dir", |d| d.to_path_buf()),
++        ("exists", |d| segments_dir(d).join("active.wal")),
++        ("sync_dir", segments_dir),
++        ("write_atomic_before_rename", |d| {
++            segment_file(&segments_dir(d), 1, 5, "ids")
++        }),
++        ("none", |d| d.to_path_buf()),
++    ];
++    for (point, path) in steps {
++        for next_append_fails in [false, true] {
++            let dir = tempdir().unwrap();
++            let case = format!(
++                "{point} of {:?}, next append fails: {next_append_fails}",
++                path(dir.path())
++            );
++            let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++            append_range(&mut log, 1, 4);
++            if point != "none" {
++                crate::fail_point::arm(point, &path(dir.path()));
++            }
++            // Commit 5 is durable whatever the rotation does.
++            let _ = log.append(make_op(5), Some(mutation_for(5))).unwrap();
++            if next_append_fails {
++                // The new active.wal cannot be made durable: commit 6 is not acknowledged.
++                crate::fail_point::arm("sync_dir", &segments_dir(dir.path()));
++                let _ = log.append(make_op(6), Some(mutation_for(6)));
++            }
++            drop(log);
++            let segments = segments_dir(dir.path());
++            for ext in ["wal", "ids"] {
++                let _ = std::fs::remove_file(segment_file(&segments, 1, 5, ext));
++            }
++
++            let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone())
++                .unwrap_or_else(|e| panic!("{case}: {e}"));
++            assert!(log.head_seq().get() >= 5, "{case}: head {}", log.head_seq());
++            assert!(log.append(make_op(5), None).is_err(), "{case}: 5 reused");
++            let next = log.head_seq().get() + 1;
++            log.append(make_op(next), None)
++                .unwrap_or_else(|e| panic!("{case}: {e}"));
++        }
++    }
++}
++
++/// INV-D8: a prune whose write of `log_meta.json` fails (before or after its rename) deletes
++/// nothing, and the log keeps going: a later rotation rewrites `log_meta.json` from the values in
++/// memory, a later prune succeeds, and reopening keeps the head and every retained operation.
++/// The three prunes: by cursors, by the cold TTL and by the quota.
++#[test]
++fn audit_d8_prune_that_fails_to_record_its_floor_deletes_nothing() {
++    #[derive(Clone, Copy, Debug)]
++    enum Prune {
++        Cursor,
++        Ttl,
++        Quota,
++    }
++    let policy = RoomLifecyclePolicy {
++        ram_max_ops: 5,
++        warm_disk_ttl: Duration::ZERO,
++        cold_disk_ttl: Duration::from_secs(3600),
++        ..RoomLifecyclePolicy::default()
++    };
++    let expired = MaintenanceClock::after(Duration::from_secs(7200));
++    for prune in [Prune::Cursor, Prune::Ttl, Prune::Quota] {
++        for (point, after_rename) in [("write_atomic_before_rename", false), ("sync_dir", true)] {
++            let dir = tempdir().unwrap();
++            let case = format!("{prune:?} prune, {point}");
++            let meta = dir.path().join("log_meta.json");
++            let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++            // Segments 1..=5, 6..=10 and 11..=15, compressed; 16..=17 in active.wal.
++            append_range(&mut log, 1, 17);
++            log.run_maintenance_sync().unwrap();
++            let before: Vec<PathBuf> = log.segments.iter().map(|s| s.path.clone()).collect();
++            assert_eq!(before.len(), 3);
++
++            let fail_at = if after_rename {
++                dir.path().to_path_buf()
++            } else {
++                meta.clone()
++            };
++            crate::fail_point::arm(point, &fail_at);
++            let result = match prune {
++                Prune::Cursor => log.prune_older_than(SequenceNumber::new(11)).map(|_| ()),
++                Prune::Ttl => log.run_maintenance_sync_at(expired).map(|_| ()),
++                Prune::Quota => {
++                    log.policy.max_room_disk_bytes = 1;
++                    log.run_maintenance_sync().map(|_| ())
++                }
++            };
++            assert!(result.is_err(), "{case}: the failure was not reported");
++            for path in &before {
++                assert!(
++                    path.exists(),
++                    "{case}: {path:?} deleted without a durable floor"
++                );
++            }
++            assert_eq!(log.tail_seq().get(), 1, "{case}");
++            log.policy.max_room_disk_bytes = u64::MAX / 4;
++
++            // The room keeps going: a rotation (which writes log_meta.json from memory), then a
++            // successful prune.
++            append_range(&mut log, 18, 20);
++            log.prune_older_than(SequenceNumber::new(6)).unwrap();
++            assert_eq!(log.tail_seq().get(), 6, "{case}");
++            drop(log);
++
++            let (log, mutations) = TieredLog::open_or_create(dir.path(), policy.clone())
++                .unwrap_or_else(|e| panic!("{case}: {e}"));
++            assert_eq!(log.head_seq().get(), 20, "{case}");
++            let tail = log.tail_seq().get();
++            assert!(tail == 6, "{case}: tail {tail}");
++            let (ops, _) = log
++                .fetch_deltas(SequenceNumber::new(tail - 1), 100)
++                .unwrap();
++            assert_contiguous(&ops, tail, 20);
++            assert_eq!(mutations.len(), (21 - tail) as usize, "{case}");
++        }
++    }
++}
++
++/// INV-D8 and INV-D1: a prune whose floor was renamed into place but whose directory sync
++/// failed, followed by a crash, is finished by the open (it was a legitimate prune), and the
++/// head and the operations above the floor stay.
++#[test]
++fn audit_d8_prune_interrupted_after_recording_its_floor_is_finished_by_the_open() {
++    let policy = RoomLifecyclePolicy {
++        ram_max_ops: 5,
++        ..RoomLifecyclePolicy::default()
++    };
++    let dir = tempdir().unwrap();
++    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++    append_range(&mut log, 1, 12);
++    crate::fail_point::arm("sync_dir", dir.path());
++    assert!(log.prune_older_than(SequenceNumber::new(11)).is_err());
++    drop(log);
++
++    let (log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
++    assert_eq!(log.head_seq().get(), 12);
++    assert_eq!(log.tail_seq().get(), 11);
++    let (ops, _) = log.fetch_deltas(SequenceNumber::new(10), 100).unwrap();
++    assert_contiguous(&ops, 11, 12);
++}
++
++/// INV-D1 and INV-D8 under D69: the quota prunes warm segments (one that cannot be compressed
++/// and recent ones) in the same pass that compresses others, and fails between deleting a
++/// sidecar and its segment, or between a segment and the next. Reopening finishes the prune and
++/// keeps the head and every operation above the floor; nothing below it comes back.
++#[test]
++fn audit_d1_quota_prune_of_warm_segments_interrupted_keeps_the_rest() {
++    let policy = RoomLifecyclePolicy {
++        ram_max_ops: 5,
++        ..RoomLifecyclePolicy::default()
++    };
++    for (index, ext) in [
++        (0, "ids"),
++        (0, "wal"),
++        (1, "ids"),
++        (1, "wal.zst"),
++        (2, "wal.zst"),
++    ] {
++        let dir = tempdir().unwrap();
++        let case = format!("removal of segment {index}'s {ext} fails");
++        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++        // Six warm segments of five; 31..=32 in active.wal.
++        append_range(&mut log, 1, 32);
++        let segments = segments_dir(dir.path());
++        // The first segment cannot be compressed, so it stays warm in front of the others.
++        audit_damage_frame_at(&segment_file(&segments, 1, 5, "wal"), 2);
++        let start = 1 + 5 * index as u64;
++        let doomed = segment_file(&segments, start, start + 4, ext);
++        crate::fail_point::arm("remove_file", &doomed);
++
++        // Over the quota: every warm is due, so this pass compresses 2..=4 (1 fails), and the
++        // quota then prunes the oldest prefix, warm 1 and cold 2..=4, keeping the last two.
++        let keep = log
++            .segments
++            .iter()
++            .skip(4)
++            .map(|s| s.disk_bytes())
++            .sum::<u64>();
++        log.policy.max_room_disk_bytes = keep + log.warm_disk.active_len();
++        let _ = log.run_maintenance_sync();
++        assert!(
++            count_in(&log, Tier::Cold) >= 1,
++            "{case}: nothing compressed"
++        );
++        drop(log);
++
++        let (log, mutations) = TieredLog::open_or_create(dir.path(), policy.clone())
++            .unwrap_or_else(|e| panic!("{case}: {e}"));
++        assert_eq!(log.head_seq().get(), 32, "{case}");
++        let tail = log.tail_seq().get();
++        assert!(tail <= 21 + 1, "{case}: tail {tail} over the quota's floor");
++        let (ops, _) = log
++            .fetch_deltas(SequenceNumber::new(tail - 1), 100)
++            .unwrap_or_else(|e| panic!("{case}: tail {tail}: {e}"));
++        assert_contiguous(&ops, tail, 32);
++        for seq in tail..=32 {
++            assert!(
++                mutations.contains(&(mutation_for(seq), SequenceNumber::new(seq))),
++                "{case}: mutation {seq} missing"
++            );
++        }
++        for path in std::fs::read_dir(&segments).unwrap() {
++            let name = path.unwrap().file_name().into_string().unwrap();
++            if let Some(end) = name
++                .strip_prefix("segment_")
++                .and_then(|rest| rest.split('_').nth(1))
++                .and_then(|end| end.split('.').next())
++                .and_then(|end| end.parse::<u64>().ok())
++            {
++                assert!(end >= tail, "{case}: {name} left below the tail {tail}");
++            }
++        }
++    }
++}
++
++/// Where a fail point can be armed in the log at `dir` right now: the files every step touches,
++/// the files of each indexed segment, and those of the next rotation.
++fn audit_fail_points(log: &TieredLog, dir: &Path) -> Vec<(&'static str, PathBuf)> {
++    let segments = segments_dir(dir);
++    let active = segments.join("active.wal");
++    let mut points = vec![
++        ("warm_append_write", active.clone()),
++        ("warm_append_sync", active.clone()),
++        ("warm_open_sync", active.clone()),
++        ("exists", active.clone()),
++        ("sync_dir", segments.clone()),
++        ("sync_dir", dir.to_path_buf()),
++        ("write_atomic_before_rename", dir.join("log_meta.json")),
++    ];
++    for segment in log.segments.iter() {
++        let (start, end) = (segment.start_seq.get(), segment.end_seq.get());
++        points.push(("remove_file", segment.path.clone()));
++        points.push(("remove_file", segment_file(&segments, start, end, "ids")));
++        if segment.tier == Tier::Warm {
++            points.push(("compress_after_warm_removed", segment.path.clone()));
++            points.push((
++                "remove_file",
++                segment_file(&segments, start, end, "wal.zst.tmp"),
++            ));
++        }
++    }
++    if let (Some(start), Some(end)) = (
++        log.warm_disk.active_start_seq(),
++        log.warm_disk.active_end_seq(),
++    ) {
++        for end in [end.get(), start.get() + log.policy.ram_max_ops as u64 - 1] {
++            points.push((
++                "write_atomic_before_rename",
++                segment_file(&segments, start.get(), end, "ids"),
++            ));
++        }
++    }
++    points
++}
++
++/// Opens the log at `dir`, retrying while an armed fail point makes the open fail (a crash
++/// during the recovery of a crash).
++fn audit_reopen(
++    dir: &Path,
++    policy: &RoomLifecyclePolicy,
++    step: &str,
++) -> (TieredLog, Vec<(MutationId, SequenceNumber)>) {
++    let mut last = None;
++    for _ in 0..20 {
++        match TieredLog::open_or_create(dir, policy.clone()) {
++            Ok(opened) => return opened,
++            Err(e) => last = Some(e),
++        }
++    }
++    panic!("{step}: the log no longer opens: {last:?}");
++}
++
++/// INV-D1, INV-D2 and INV-D8 (and INV-D7 for deduplication): random appends, rotations,
++/// maintenance at random ages and over the quota, cursor-driven prunes and reopens, with a
++/// random fail point armed before about a third of the steps. The room reacts as the actor does:
++/// a failed append or rotation stops it (reopen), a failed maintenance pass or prune is only
++/// logged. After every step: the head is the number of acknowledged commits (an append whose
++/// error came after its record reached the file counts once the reopen synced it), the tail
++/// never moves back, every acknowledged commit at or above the tail is read back exactly from
++/// any cursor, and after a reopen the mutation IDs are exactly those of the retained commits.
++fn audit_simulate_failures(seeds: std::ops::Range<u64>, steps: usize) {
++    for seed in seeds {
++        let mut rng = TestRng::new(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) + 7);
++        let dir = tempdir().unwrap();
++        let policy = RoomLifecyclePolicy {
++            ram_max_ops: 1 + rng.below(6) as usize,
++            ram_max_bytes: 2_000 + rng.below(10_000),
++            segment_max_bytes: 1_500 + rng.below(8_000),
++            ram_ttl: Duration::from_secs(60),
++            warm_disk_ttl: Duration::from_secs(if rng.below(2) == 0 { 0 } else { 600 }),
++            cold_disk_ttl: Duration::from_secs(3_600),
++            max_room_disk_bytes: if rng.below(2) == 0 {
++                15_000 + rng.below(20_000)
++            } else {
++                u64::MAX / 4
++            },
++            ..RoomLifecyclePolicy::default()
++        };
++        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++        let mut acked: Vec<SequencedOperation> = Vec::new();
++        let mut last_tail = log.tail_seq().get();
++        for step in 0..steps {
++            let context = format!("seed {seed} step {step}");
++            if rng.below(3) == 0 {
++                let points = audit_fail_points(&log, dir.path());
++                let (point, path) = &points[rng.index(points.len())];
++                crate::fail_point::arm(point, path);
++            }
++            let mut pending: Option<SequencedOperation> = None;
++            let mut stop = false;
++            match rng.below(12) {
++                0..=5 => {
++                    for _ in 0..1 + rng.below(6) {
++                        let op = random_size_op(acked.len() as u64 + 1, &mut rng);
++                        let id = mutation_for(op.seq.get());
++                        match log.append(op.clone(), Some(id)) {
++                            Ok(outcome) => {
++                                acked.push(op);
++                                if outcome.rotation_error.is_some() {
++                                    stop = true;
++                                    break;
++                                }
++                            }
++                            Err(_) => {
++                                pending = Some(op);
++                                stop = true;
++                                break;
++                            }
++                        }
++                    }
++                }
++                6 | 7 => {
++                    let _ = log.run_maintenance_sync_at(random_clock(&mut rng));
++                }
++                8 => {
++                    let target = 1 + rng.below(log.head_seq().get().max(1));
++                    let _ = log.prune_older_than(SequenceNumber::new(target));
++                }
++                9 => {
++                    stop = log.force_rotate_warm().is_err();
++                }
++                _ => stop = true,
++            }
++
++            let mut reopened = None;
++            if stop {
++                drop(log);
++                let (opened, mutations) = audit_reopen(dir.path(), &policy, &context);
++                log = opened;
++                if let Some(op) = pending.take() {
++                    if log.head_seq().get() == op.seq.get() {
++                        // The record reached the file before the error; the reopen synced it, so a
++                        // retry is acknowledged with this sequence.
++                        acked.push(op);
++                    }
++                }
++                reopened = Some(mutations);
++            }
++
++            let head = log.head_seq().get();
++            assert_eq!(head, acked.len() as u64, "{context}: head (INV-D2/INV-D8)");
++            let tail = log.tail_seq().get();
++            assert!(
++                tail >= last_tail,
++                "{context}: tail moved back from {last_tail} to {tail}"
++            );
++            last_tail = tail;
++            check_reads(&log, &acked, &mut rng, &context);
++            if let Some(mutations) = reopened {
++                for (id, seq) in &mutations {
++                    assert_eq!(
++                        *id,
++                        mutation_for(seq.get()),
++                        "{context}: mutation id of {seq} is not the acknowledged one"
++                    );
++                    assert!(
++                        seq.get() >= 1 && seq.get() <= head,
++                        "{context}: mutation at {seq}"
++                    );
++                }
++                let found: HashSet<u64> = mutations.iter().map(|(_, seq)| seq.get()).collect();
++                for seq in tail..=head {
++                    assert!(found.contains(&seq), "{context}: mutation {seq} lost");
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn audit_d1_d2_d8_random_failures_and_reopens_keep_every_acknowledged_commit() {
++    audit_simulate_failures(0..3, 50);
++}
++
++#[test]
++#[ignore = "long-running randomized test; run with --ignored in release"]
++fn audit_d1_d2_d8_random_failures_and_reopens_keep_every_acknowledged_commit_over_many_seeds() {
++    audit_simulate_failures(0..100, 120);
++}
+diff --git a/crates/server/src/tests/schema_registry.rs b/crates/server/src/tests/schema_registry.rs
+index 7e6f455..9bfcf85 100644
+--- a/crates/server/src/tests/schema_registry.rs
++++ b/crates/server/src/tests/schema_registry.rs
+@@ -278,3 +278,55 @@ fn damaged_schema_files_fail_the_startup() {
+ fn damaged_schema_files_fail_the_startup_long() {
+     check_damaged_schema_files(0x5C4E_0002, 5_000);
+ }
++
++/// INV-D7: a schema write whose directory sync failed leaves `schemas/{id}.json` renamed into
++/// place but with an entry no `fsync` covered; the registration fails. After a restart the
++/// registry reads that entry back and serves the schema (rooms can be created on it and accept
++/// commits), yet no `fsync` of this process covered it, so a power loss can still take it away.
++/// The same holds for the version an `add_column` whose sync failed wrote.
++#[test]
++fn audit_d7_schema_left_unsynced_by_a_failed_write_is_not_served_unsynced_after_a_restart() {
++    // A registration whose directory sync failed.
++    let dir = tempdir().unwrap();
++    let id = SchemaId::new("todo").unwrap();
++    let registry = SchemaRegistry::new(dir.path()).unwrap();
++    fail_point::arm("sync_dir", dir.path());
++    assert!(registry.register_schema(id.clone(), test_schema()).is_err());
++    assert!(registry.get_schema(&id).is_none());
++    drop(registry);
++
++    // The restart: if it syncs `schemas/`, this sync fails and so does the startup.
++    fail_point::arm("sync_dir", dir.path());
++    let restarted = SchemaRegistry::new(dir.path());
++    let served = restarted
++        .as_ref()
++        .ok()
++        .and_then(|registry| registry.get_schema(&id));
++    // Consume the point if the restart did not.
++    let _ = durable::sync_dir(dir.path());
++    assert!(
++        served.is_none(),
++        "INV-D7: schema {id} is served after a restart, but no fsync of this process covered its \
++         directory entry (the only sync of it failed)"
++    );
++
++    // An `add_column` whose directory sync failed.
++    let (dir, id, registry) = todo_registry();
++    fail_point::arm("sync_dir", dir.path());
++    assert!(registry
++        .add_column(&id, "tasks", nullable_int("priority"))
++        .is_err());
++    drop(registry);
++    fail_point::arm("sync_dir", dir.path());
++    let restarted = SchemaRegistry::new(dir.path());
++    let served = restarted
++        .as_ref()
++        .ok()
++        .and_then(|registry| registry.get_schema(&id));
++    let _ = durable::sync_dir(dir.path());
++    assert!(
++        !served.is_some_and(|schema| has_column(&schema, "priority")),
++        "INV-D7: version 2 of {id} is served after a restart, but no fsync of this process \
++         covered the rename that installed it"
++    );
++}
+diff --git a/crates/storage/src/disk/tests/recovery.rs b/crates/storage/src/disk/tests/recovery.rs
+index 62f5c6d..ea250dc 100644
+--- a/crates/storage/src/disk/tests/recovery.rs
++++ b/crates/storage/src/disk/tests/recovery.rs
+@@ -458,3 +458,60 @@ async fn schema_mismatch_is_reported_before_a_torn_tail_is_truncated() {
+         assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), head);
+     }
+ }
++
++/// Offset of the last frame of the WAL file `bytes`.
++fn audit_last_frame_offset(bytes: &[u8]) -> usize {
++    let mut offset = 0;
++    let mut last = 0;
++    while offset < bytes.len() {
++        let header =
++            zemdb_core::parse_batch_header(bytes[offset..].first_chunk().unwrap()).unwrap();
++        last = offset;
++        offset += header.frame_len();
++    }
++    last
++}
++
++/// INV-D3 and INV-D7 with the atomic absorption (D85): an absorption renamed its copy over
++/// `.wal.compacting` and stopped before emptying the active WAL (a crash there leaves the same
++/// files), and then the last frame of `.wal.compacting` was damaged. That frame is the copy of a
++/// batch the active WAL still holds: recovery takes the damage as a torn tail of `.wal.compacting`
++/// and replays the batch from the active WAL, so no confirmed batch is lost, and the recovered
++/// state is durable (folded into a synced snapshot) before the room is served.
++#[tokio::test]
++async fn audit_d3_damaged_tail_of_an_absorbed_copy_is_recovered_from_the_active_wal() {
++    for damage in ["payload", "zeroed-to-the-end"] {
++        let dir = tempfile::tempdir().unwrap();
++        let room = RoomId::new("absorbed").unwrap();
++        let engine = open_engine(dir.path(), &room).await;
++        apply_range(&engine, &room, 1..=5).await;
++        fail_compaction_leaving_compacting_wal(&engine, &room).await;
++        apply_range(&engine, &room, 6..=8).await;
++        let wal_path = engine.wal_file_path(&room);
++        fail_point::arm("compaction.absorb", &wal_path);
++        assert!(engine.compact_room(&room).await.is_err());
++        drop(engine);
++
++        let compacting = compacting_wal_path(&wal_path);
++        let mut bytes = std::fs::read(&compacting).unwrap();
++        let last = audit_last_frame_offset(&bytes);
++        match damage {
++            "payload" => bytes[last + zemdb_core::BATCH_HEADER_SIZE + 2] ^= 0xFF,
++            _ => bytes[last..].fill(0),
++        }
++        std::fs::write(&compacting, bytes).unwrap();
++
++        let engine = engine_at(dir.path());
++        engine.open_room(&room, schema()).await.unwrap();
++        assert_rows(&engine, &room, 8).await;
++        assert!(
++            !compacting.exists(),
++            "{damage}: .wal.compacting is folded away"
++        );
++        // What was served came from a snapshot this open wrote and synced.
++        engine.close_room(&room).await.unwrap();
++        let engine = engine_at(dir.path());
++        engine.open_room(&room, schema()).await.unwrap();
++        assert_rows(&engine, &room, 8).await;
++    }
++}

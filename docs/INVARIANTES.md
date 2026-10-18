@@ -83,22 +83,22 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 
 ### Resumen
 
-Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes son los del [plan de la Fase 3.9](proposals/2026-10-fase3_9-remediation-plan.md).
+Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md) (ver §1.5). Hasta que un plan de remediación les asigne lote, las ❌ llevan entre paréntesis el defecto que las rompe.
 
 | ID | Invariante | ★ | Si se rompe | Estado |
 |---|---|---|---|---|
-| **INV-D1** | Un commit confirmado sobrevive a un crash | ★ | Alto | ✅ |
+| **INV-D1** | Un commit confirmado sobrevive a un crash | ★ | Alto | ❌ (DEF-167) |
 | **INV-D2** | Un número de secuencia nunca se reutiliza | ★ | Alto | ✅ |
-| **INV-D3** | La recuperación nunca descarta datos durables ni acepta basura | ★ | Alto | ✅ |
+| **INV-D3** | La recuperación nunca descarta datos durables ni acepta basura | ★ | Alto | ❌ (DEF-168) |
 | **INV-D4** | Los metadatos se reemplazan atómicamente | | Medio | ✅ |
 | **INV-D5** | Una sala tiene un solo dueño | ★ | Alto | ✅ |
-| **INV-D6** | Un solo proceso por `data_dir` | ★ | Alto | ✅ |
-| **INV-D7** | Nada es visible antes de ser durable en este proceso | ★ | Alto | ✅ |
+| **INV-D6** | Un solo proceso por `data_dir` | ★ | Alto | ❌ (DEF-172) |
+| **INV-D7** | Nada es visible antes de ser durable en este proceso | ★ | Alto | ❌ (DEF-169) |
 | **INV-D8** | El piso de secuencia vive fuera del log | ★ | Alto | ✅ |
-| **INV-D9** | Los metadatos se verifican antes de usarse | ★ | Alto | ✅ |
-| **INV-S1** | `apply_batch`: éxito durable o ningún efecto | ★ | Alto | ✅ |
+| **INV-D9** | Los metadatos se verifican antes de usarse | ★ | Alto | ❌ (DEF-171) |
+| **INV-S1** | `apply_batch`: éxito durable o ningún efecto | ★ | Alto | ❌ (DEF-173) |
 | **INV-S2** | Los lectores ven siempre un prefijo del WAL | | Medio | ✅ |
-| **INV-S3** | Un crash en cualquier paso del storage se recupera al mismo estado | ★ | Alto | ✅ |
+| **INV-S3** | Un crash en cualquier paso del storage se recupera al mismo estado | ★ | Alto | ❌ (DEF-173) |
 | **INV-S4** | Abrir una sala nunca descarta datos | ★ | Alto | ✅ |
 | **INV-S5** | `apply_snapshot`: valida todo y reemplaza atómicamente, o no cambia nada | | Medio | ✅ |
 | **INV-S6** | Memoria igual a disco | | Medio | ✅ |
@@ -110,25 +110,25 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 | **INV-Y6** | Los cursores solo avanzan por lo que el cliente confirmó | | Medio | ✅ |
 | **INV-Y7** | Un registro con cursor de otra encarnación nunca se acepta | | Medio | ✅ |
 | **INV-Y8** | Réplicas con el mismo prefijo convergen | ★ | Alto | ✅ |
-| **INV-Y9** | La ventana de dedup es función del log | | Medio | ✅ |
+| **INV-Y9** | La ventana de dedup es función del log | | Medio | ❌ (DEF-179) |
 | **INV-R1** | La poda por cursores nunca borra lo que alguien necesita | ★ | Alto | ✅ |
 | **INV-R2** | El rango retenido es contiguo y su cola no retrocede | | Medio | ✅ |
 | **INV-R3** | Perder estado volátil del roster solo cuesta retención o re-registro | | Medio | ✅ |
-| **INV-R4** | Todo cliente que se queda atrás termina pudiendo ponerse al día | | Medio | ✅ |
-| **INV-R5** | Solo se anuncian y sirven snapshots usables, y una descarga es de un solo snapshot | | Medio | ✅ |
+| **INV-R4** | Todo cliente que se queda atrás termina pudiendo ponerse al día | | Medio | ❌ (DEF-174) |
+| **INV-R5** | Solo se anuncian y sirven snapshots usables, y una descarga es de un solo snapshot | | Medio | ❌ (DEF-176) |
 | **INV-R6** | Un snapshot solo se ofrece a la encarnación que lo aceptó | | Medio | ✅ |
-| **INV-R7** | Una subida confirmada es usable | | Bajo | ✅ |
+| **INV-R7** | Una subida confirmada es usable | | Bajo | ❌ (DEF-177, DEF-178) |
 | **INV-A1** | Nadie actúa sobre otra sala ni como otro cliente | ★ | Alto | ✅ |
 | **INV-A2** | Nada se decodifica antes de autenticar, salvo lo acotado de `/register` | | Alto | ✅ |
-| **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio | ✅ |
+| **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio | ❌ (DEF-180, DEF-181) |
 | **INV-A4** | Ningún identificador produce rutas fuera de `data_dir` | ★ | Alto | ✅ |
-| **INV-B1** | La memoria por request está acotada | ★ | Alto | ✅ |
-| **INV-B2** | Nada se retiene sin plazo | | Medio | ✅ |
+| **INV-B1** | La memoria por request está acotada | ★ | Alto | ❌ (DEF-170) |
+| **INV-B2** | Nada se retiene sin plazo | | Medio | ❌ (DEF-174) |
 | **INV-B3** | La memoria, el disco y los FDs del servidor están acotados por la configuración | | Medio | ✅ |
 | **INV-B4** | El costo por request del actor no depende de la historia | | Medio | ✅ |
 | **INV-B5** | Ningún cliente acapara un recurso global | | Medio | ✅ |
 | **INV-L1** | Toda request recibe una respuesta, en tiempo acotado | | Medio | ✅ |
-| **INV-L2** | Cancelar una request nunca deja estado a medias | | Medio | ✅ |
+| **INV-L2** | Cancelar una request nunca deja estado a medias | | Medio | ❌ (DEF-175) |
 | **INV-L3** | Un I/O incierto nunca se confirma como éxito | ★ | Alto | ✅ |
 | **INV-L4** | Reabrir una sala no cambia ningún estado confirmado | | Medio | ✅ |
 | **INV-L5** | El apagado no pierde nada confirmado | | Medio | ✅ |
@@ -136,7 +136,7 @@ Estado en `50fe195`, actualizado por los lotes cerrados (ver §1.5). Los lotes s
 | **INV-E1** | El esquema solo crece, y toda operación del log sigue siendo válida | ★ | Alto | ✅ |
 | **INV-E2** | Un cliente con el esquema viejo siempre puede enterarse | | Bajo | ✅ |
 | **INV-W1** | Ninguna entrada hace entrar en pánico, abortar ni reservar de más | ★ | Alto | ✅ |
-| **INV-W2** | Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum | | Medio | ✅ |
+| **INV-W2** | Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum | | Medio | ❌ (DEF-171) |
 
 ---
 

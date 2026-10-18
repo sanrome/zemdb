@@ -1,0 +1,334 @@
+diff --git a/crates/server/src/actor/tests/room.rs b/crates/server/src/actor/tests/room.rs
+index 6247439..b4282b3 100644
+--- a/crates/server/src/actor/tests/room.rs
++++ b/crates/server/src/actor/tests/room.rs
+@@ -3220,3 +3220,147 @@ mod onboarding_sim {
+         run(true, true).await;
+     }
+ }
++
++/// Chunk `index` of a snapshot of `chunks` chunks of 64 KiB filled with `fill`, uploaded by
++/// `uploader` at `n` against the room's current log range. Returns whether it completed.
++async fn upload_chunk_of(
++    fx: &Fixture,
++    uploader: &ClientId,
++    n: u64,
++    (chunks, fill): (u32, u8),
++    index: u32,
++) -> bool {
++    use zemdb_core::protocol::messages::ServerMessage;
++    use zemdb_core::protocol::snapshot_envelope::{
++        SnapshotCompression, SnapshotEnvelopeHeader, SNAPSHOT_HEADER_LEN,
++    };
++    let chunk_len = crate::relay::MIN_CHUNK_BYTES as usize;
++    let body = vec![fill; chunks as usize * chunk_len - SNAPSHOT_HEADER_LEN];
++    let header =
++        SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, body.len() as u32, &body);
++    let mut data = header.to_bytes().to_vec();
++    data.extend_from_slice(&body);
++    let hash = ServerMessage::compute_snapshot_hash(&data);
++    let range = index as usize * chunk_len..(index as usize + 1) * chunk_len;
++    fx.relay
++        .stage_chunk(
++            crate::relay::SnapshotChunkUpload {
++                room_id: fx.room_id.clone(),
++                uploader: crate::relay::Uploader::Client(uploader.clone()),
++                head_seq: seq(n),
++                chunk_index: index,
++                total_chunks: chunks,
++                total_bytes: data.len() as u64,
++                snapshot_hash: hash,
++                data: bytes::Bytes::copy_from_slice(&data[range]),
++            },
++            fx.manager.log_bounds(&fx.room_id),
++        )
++        .await
++        .unwrap()
++}
++
++/// A room with the writer designated to upload, a connected peer that could take the role and
++/// a bootstrapping newcomer, whose relay discards a chunked upload `cap` after its first chunk.
++/// Returns the fixture, the actor, the writer, the peer, the events and when the designation
++/// was announced: the actor's maintenance ticks fall a whole number of periods after it.
++async fn designated_writer(
++    cap: Duration,
++) -> (
++    Fixture,
++    mpsc::Sender<RoomCommand>,
++    ClientId,
++    ClientId,
++    broadcast::Receiver<RoomEvent>,
++    tokio::time::Instant,
++) {
++    let fx = Fixture::with_options(
++        small_segments(),
++        |config| config.snapshot_upload_max_secs = cap.as_secs(),
++        Some(ActorTimings {
++            designation_timeout: DESIGNATION_TIMEOUT_IN_TESTS,
++            ..TEST_TIMINGS
++        }),
++    )
++    .await;
++    let (writer, tail) = prune_with_writer(&fx).await;
++    let sender = fx.sender().await;
++    let peer = ClientId::new("peer").unwrap();
++    register_at(&sender, &peer, Some((tail, fx.incarnation))).await;
++    let mut events = subscribe(&sender).await;
++    register_at(&sender, &ClientId::new("newcomer").unwrap(), None).await;
++    assert_eq!(
++        next_snapshot_event(&mut events).await,
++        RoomEvent::SnapshotWanted
++    );
++    let tick = tokio::time::Instant::now();
++    assert!(snapshot_wanted(&sender, &writer).await);
++    (fx, sender, writer, peer, events, tick)
++}
++
++/// An upload by `writer` at 8 that receives a new chunk every second and never its last one,
++/// until the relay discards it at its deadline, `cap` after its first chunk.
++async fn upload_until_its_deadline(
++    fx: &Fixture,
++    sender: &mpsc::Sender<RoomCommand>,
++    (writer, peer): (&ClientId, &ClientId),
++    cap: Duration,
++    fill: u8,
++) {
++    let started = tokio::time::Instant::now();
++    let mut index = 0;
++    while started.elapsed() < cap - Duration::from_millis(200) {
++        assert!(!upload_chunk_of(fx, writer, 8, (6, fill), index).await);
++        index += 1;
++        heartbeat(sender, writer).await.unwrap();
++        heartbeat(sender, peer).await.unwrap();
++        tokio::time::sleep(Duration::from_secs(1)).await;
++    }
++    while fx.relay.upload_in_progress_by(&fx.room_id, Some(writer)) {
++        tokio::time::sleep(Duration::from_millis(1)).await;
++    }
++}
++
++/// Audit (INV-B2): the designee's upload freezes the designation (D76), and the upload has a
++/// cap on its duration (D74), so a designee that never completes should lose the role once the
++/// cap and the designation timeout have passed. A designee that keeps sending new chunks and
++/// starts a new upload as soon as the previous one reaches its deadline keeps it for good.
++/// The deadlines fall halfway between two maintenance ticks; a tick that fell between a
++/// deadline and the next upload (a few milliseconds) would replace the designee.
++#[tokio::test]
++async fn audit_b2_designee_restarting_its_upload_at_the_deadline_keeps_the_role() {
++    let cap = Duration::from_secs(3);
++    let (fx, sender, writer, peer, mut events, tick) = designated_writer(cap).await;
++    tokio::time::sleep_until(tick + TEST_TIMINGS.fast_tick * 3 / 2).await;
++    let first_chunk = tokio::time::Instant::now();
++    for round in 1..=3u8 {
++        upload_until_its_deadline(&fx, &sender, (&writer, &peer), cap, round).await;
++    }
++
++    let held = first_chunk.elapsed();
++    let designations = pending_snapshot_events(&mut events);
++    assert!(
++        !snapshot_wanted(&sender, &writer).await,
++        "the designee kept its role for {held:?} with uploads it never completes \
++         (snapshot_upload_max_secs {cap:?}, designation timeout {DESIGNATION_TIMEOUT_IN_TESTS:?}); \
++         designations meanwhile: {designations:?}"
++    );
++    fx.manager.shutdown_all().await;
++}
++
++/// Control of the audit test above: a designee whose upload reaches its deadline and that does
++/// not start another loses the role.
++#[tokio::test]
++async fn audit_b2_designee_whose_upload_reaches_the_deadline_loses_the_role() {
++    let cap = Duration::from_secs(3);
++    let (fx, sender, writer, peer, mut events, tick) = designated_writer(cap).await;
++    tokio::time::sleep_until(tick + TEST_TIMINGS.fast_tick * 3 / 2).await;
++    upload_until_its_deadline(&fx, &sender, (&writer, &peer), cap, 1).await;
++    assert_eq!(
++        next_snapshot_event(&mut events).await,
++        RoomEvent::SnapshotWanted
++    );
++    assert!(!snapshot_wanted(&sender, &writer).await);
++    assert!(snapshot_wanted(&sender, &peer).await);
++    fx.manager.shutdown_all().await;
++}
+diff --git a/crates/server/src/actor/tests/support.rs b/crates/server/src/actor/tests/support.rs
+index ae1ccf2..6973050 100644
+--- a/crates/server/src/actor/tests/support.rs
++++ b/crates/server/src/actor/tests/support.rs
+@@ -70,7 +70,7 @@ pub(super) fn test_manager(
+             dir.join("snapshots"),
+             Duration::from_secs(60),
+             ServerConfig::default().max_snapshot_bytes,
+-            Duration::from_secs(ServerConfig::default().snapshot_upload_max_secs),
++            Duration::from_secs(config.snapshot_upload_max_secs),
+         )
+         .unwrap(),
+     );
+diff --git a/crates/server/src/log/tests/tiered_log.rs b/crates/server/src/log/tests/tiered_log.rs
+index 0fca1d0..7633c59 100644
+--- a/crates/server/src/log/tests/tiered_log.rs
++++ b/crates/server/src/log/tests/tiered_log.rs
+@@ -2375,3 +2375,27 @@ fn fetch_cost_does_not_grow_with_the_number_of_segments() {
+     println!("1,000 reads near the head: {few:?} with 100 segments, {many:?} with 50,000");
+     assert!(many < 3 * few, "{many:?} against {few:?}");
+ }
++
++/// Audit (INV-B1): opening a room decodes all of `active.wal` at once (`inspect_active_segment`
++/// reads it with an unlimited budget, `tiered_log.rs:171`), before the RAM window trims it. Here
++/// the 300 rows of `null_rows_log` (1.2 MiB on the wire, well within the default
++/// `segment_max_bytes` of 32 MiB and `ram_max_ops` of 1,000) are what the open of the room holds.
++#[test]
++fn audit_b1_opening_a_room_decodes_all_of_active_wal() {
++    let dir = tempdir().unwrap();
++    let policy = RoomLifecyclePolicy::default();
++    drop(null_rows_log(dir.path(), policy.ram_max_bytes));
++
++    let (_warm, (ops, _)) = WarmDiskLog::open_recovering(segments_dir(dir.path())).unwrap();
++    let values = (ops.len() * NULL_ROW_VALUES) as u64;
++    let in_memory = values * std::mem::size_of::<Value>() as u64;
++    assert!(
++        values <= zemdb_core::protocol::limits::MAX_MESSAGE_VALUES
++            && in_memory <= policy.ram_max_bytes,
++        "opening the room decoded {} operations: {values} values, {in_memory} bytes in memory \
++         (MAX_MESSAGE_VALUES {}, ram_max_bytes {})",
++        ops.len(),
++        zemdb_core::protocol::limits::MAX_MESSAGE_VALUES,
++        policy.ram_max_bytes
++    );
++}
+diff --git a/crates/server/src/relay/tests/lifecycle.rs b/crates/server/src/relay/tests/lifecycle.rs
+index 6da7df6..7414cb6 100644
+--- a/crates/server/src/relay/tests/lifecycle.rs
++++ b/crates/server/src/relay/tests/lifecycle.rs
+@@ -1,6 +1,6 @@
+ use super::*;
+ use crate::relay::test_common::*;
+-use crate::relay::UPLOAD_IDLE_TIMEOUT;
++use crate::relay::{MIN_CHUNK_BYTES, UPLOAD_IDLE_TIMEOUT};
+ 
+ #[tokio::test(start_paused = true)]
+ async fn idle_upload_expires_and_its_file_is_deleted() {
+@@ -156,3 +156,49 @@ async fn expiry_sweeper_deletes_expired_snapshots() {
+     assert!(files_in(&snapshots_dir(&dir)).is_empty());
+     sweeper.abort();
+ }
++
++/// Audit (INV-B2): the cap on an upload's duration (D74) is per upload. An uploader that keeps
++/// progressing (a chunk it had not sent within every idle timeout) and starts a new upload as
++/// soon as the previous one reaches its deadline keeps an upload in progress, which freezes its
++/// designation (`upload_in_progress_by`) and anchors pruning, for as long as it likes.
++#[tokio::test(start_paused = true)]
++async fn audit_b2_upload_restarted_at_its_deadline_outlives_the_cap() {
++    let dir = tempdir().unwrap();
++    let max = Duration::from_secs(300);
++    let relay = SnapshotRelay::new(snapshots_dir(&dir), TTL, MAX_BYTES, max).unwrap();
++    let uploader = ClientId::new("uploader").unwrap();
++    // Six chunks of 64 KiB: the uploader sends one new chunk per idle timeout and never the last.
++    const CHUNKS: u32 = 6;
++    let chunk_len = MIN_CHUNK_BYTES as usize;
++    let step = UPLOAD_IDLE_TIMEOUT - Duration::from_secs(1);
++    let first_chunk = tokio::time::Instant::now();
++    for round in 1..=3u8 {
++        let data = envelope(CHUNKS as usize * chunk_len, round);
++        let hash = ServerMessage::compute_snapshot_hash(&data);
++        let layout = (data.len() as u64, CHUNKS);
++        let started = tokio::time::Instant::now();
++        let mut index = 0;
++        // Right at the previous deadline, a new upload; then a new chunk every `step`.
++        while started.elapsed() < max - Duration::from_secs(1) {
++            let range = index * chunk_len..(index + 1) * chunk_len;
++            let staged = relay
++                .stage_chunk(
++                    part(10, index as u32, layout, hash, &data[range]),
++                    bounds(0, 10),
++                )
++                .await
++                .unwrap();
++            assert!(!staged);
++            index += 1;
++            let wait = step.min(max - Duration::from_secs(1) - started.elapsed());
++            tokio::time::advance(wait).await;
++        }
++        let held = first_chunk.elapsed();
++        assert!(
++            !relay.upload_in_progress_by(&room(), Some(&uploader)) || held < max,
++            "round {round}: the uploader has held an upload in progress for {held:?}, \
++             past snapshot_upload_max_secs ({max:?})"
++        );
++        tokio::time::advance(Duration::from_secs(1)).await;
++    }
++}
+diff --git a/crates/server/src/response_budget.rs b/crates/server/src/response_budget.rs
+index 5891b97..462d0fe 100644
+--- a/crates/server/src/response_budget.rs
++++ b/crates/server/src/response_budget.rs
+@@ -104,3 +104,7 @@ impl Drop for Reservation {
+         self.release(self.permit.num_permits());
+     }
+ }
++
++#[cfg(test)]
++#[path = "tests/response_budget.rs"]
++mod tests;
+diff --git a/crates/server/src/tests/response_budget.rs b/crates/server/src/tests/response_budget.rs
+new file mode 100644
+index 0000000..a144a10
+--- /dev/null
++++ b/crates/server/src/tests/response_budget.rs
+@@ -0,0 +1,57 @@
++use super::*;
++use zemdb_core::id::ClientId;
++
++fn holder(room: &str, client: &str) -> BudgetHolder {
++    (
++        RoomId::new(room).unwrap(),
++        Uploader::Client(ClientId::new(client).unwrap()),
++    )
++}
++
++fn held(budget: &InflightBudget) -> usize {
++    budget.held.lock().unwrap().len()
++}
++
++/// Audit (INV-B5, INV-B3): a holder at its part is refused while the others still get theirs,
++/// shrinking returns what a response does not use, and the map of parts forgets every holder
++/// once it holds nothing, however many there were.
++#[test]
++fn audit_b5_parts_are_per_holder_and_forgotten_when_empty() {
++    let frame = MAX_FRAME_SIZE as u64;
++    let budget = Arc::new(InflightBudget::new(4 * frame, 2 * frame));
++    let greedy = holder("room-a", "greedy");
++    let first = budget.reserve_frame(greedy.clone()).unwrap();
++    let mut second = budget.reserve_frame(greedy.clone()).unwrap();
++    assert!(budget.reserve_frame(greedy.clone()).is_none());
++    // The same client in another room, and another client of the room, are other holders.
++    let other_room = budget.reserve_frame(holder("room-b", "greedy")).unwrap();
++    let other_client = budget.reserve_frame(holder("room-a", "other")).unwrap();
++    // The total is now spent.
++    assert!(budget.reserve_frame(holder("room-c", "late")).is_none());
++    drop((other_room, other_client));
++
++    // A response that encodes to 1 KiB keeps only that: the rest of its frame is free again.
++    second.shrink_to(1024);
++    assert!(budget.reserve_frame(greedy.clone()).is_none());
++    let third = budget
++        .reserve(greedy.clone(), (frame - 1024) as u32)
++        .unwrap();
++    assert!(budget.reserve(greedy.clone(), 1).is_none());
++    drop((first, second, third));
++    assert_eq!(held(&budget), 0);
++
++    // Many holders, each with a small response: once dropped, nothing is left.
++    let many: Vec<_> = (0..1_000)
++        .map(|n| {
++            let mut r = budget
++                .reserve_frame(holder("room-a", &format!("c{n}")))
++                .unwrap();
++            r.shrink_to(100);
++            r
++        })
++        .collect();
++    assert_eq!(held(&budget), 1_000);
++    drop(many);
++    assert_eq!(held(&budget), 0);
++    assert_eq!(budget.total.available_permits(), (4 * frame) as usize);
++}

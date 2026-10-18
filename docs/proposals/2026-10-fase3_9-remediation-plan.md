@@ -122,7 +122,7 @@ Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las de
 | 5 | Ciclo de vida | DEF-156, 160, 161, 166 | Baja | ✅ 4/4 |
 | 6 | Documentación | ARCHITECTURE, README, ROADMAP | Baja | ✅ |
 
-**Avance total:** 23 de 23 ítems; los siete lotes cerrados. Falta la auditoría por invariantes acotada que pide §1 para empezar la Fase 4.
+**Avance total:** 23 de 23 ítems; los siete lotes cerrados. La auditoría por invariantes acotada que pide §1 se hizo sobre `b4cb390` ([2ª auditoría](../audits/2026-10-invariantes-audit-2.md)) y no está en verde (DEF-167 a DEF-181), así que el requisito para la Fase 4 sigue abierto.
 
 **Ítems nuevos de este plan.** Surgen de las invariantes adoptadas (D79) y de hallazgos de la auditoría que no tenían ID:
 - **DEF-159** · Medio · P6: reparto del presupuesto de respuestas.

@@ -1,0 +1,290 @@
+diff --git a/crates/server/src/log/tests/tiered_log.rs b/crates/server/src/log/tests/tiered_log.rs
+index 0fca1d0..80ee4a4 100644
+--- a/crates/server/src/log/tests/tiered_log.rs
++++ b/crates/server/src/log/tests/tiered_log.rs
+@@ -2375,3 +2375,285 @@ fn fetch_cost_does_not_grow_with_the_number_of_segments() {
+     println!("1,000 reads near the head: {few:?} with 100 segments, {many:?} with 50,000");
+     assert!(many < 3 * few, "{many:?} against {few:?}");
+ }
++
++// ---------------------------------------------------------------------------------------------
++// Second invariants audit, challenge of the durability of the server log (INV-D2, INV-D3,
++// INV-D8).
++// ---------------------------------------------------------------------------------------------
++
++/// Flips a payload byte of the `index`-th frame of the segment file at `path`.
++fn audit2_damage_frame(path: &Path, index: usize) {
++    let file = OpenOptions::new()
++        .read(true)
++        .write(true)
++        .open(path)
++        .unwrap();
++    damage_payload(&file, index);
++}
++
++/// INV-D3: a compression whose cold copy is durably in place and verified, but whose removal of
++/// the warm original fails (once in the pass and once in its retry), leaves both copies. If the
++/// process stops before the next retry and the warm copy is then damaged by accident, opening
++/// the log must not throw the intact cold copy away and keep the damaged warm one: every
++/// operation of the segment is still on disk, in a file whose frames were all verified.
++#[test]
++fn audit2_d3_open_never_drops_a_verified_cold_copy_for_a_damaged_warm_one() {
++    for damaged_frame in [1, 4] {
++        let dir = tempdir().unwrap();
++        let (mut log, _) =
++            TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
++        append_range(&mut log, 1, 7);
++        let segments = segments_dir(dir.path());
++        let warm = segment_file(&segments, 1, 5, "wal");
++        let cold = segment_file(&segments, 1, 5, "wal.zst");
++        // The removal after the compression, and its retry in the same pass.
++        crate::fail_point::arm("remove_file", &warm);
++        crate::fail_point::arm("remove_file", &warm);
++        log.run_maintenance_sync().unwrap();
++        assert!(cold.exists() && warm.exists());
++        // The cold copy is the one in use, and it holds the whole segment.
++        let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
++        assert_contiguous(&ops, 1, 7);
++        drop(log);
++
++        // Accidental damage of the warm copy, which the log no longer reads.
++        audit2_damage_frame(&warm, damaged_frame);
++
++        let (log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
++        let read = log.fetch_deltas(SequenceNumber::new(0), 100);
++        assert!(
++            matches!(&read, Ok((ops, _)) if seqs(ops) == (1..=7).collect::<Vec<_>>()),
++            "INV-D3 (damaged frame {damaged_frame}): the open deleted the verified cold copy \
++             (still there: {}) and kept the damaged warm one; a read from 0 gives {:?}",
++            cold.exists(),
++            read.map(|(ops, has_more)| (seqs(&ops), has_more))
++        );
++    }
++}
++
++/// The highest sequence that a name in `segments` (segments, cold copies and sidecars) or
++/// `log_meta.json` in `dir` claims, read from the files themselves.
++fn audit2_floor_on_disk(dir: &Path) -> u64 {
++    let names = std::fs::read_dir(segments_dir(dir))
++        .unwrap()
++        .filter_map(|entry| {
++            let name = entry.unwrap().file_name().into_string().unwrap();
++            let end = name.strip_prefix("segment_")?.split('_').nth(1)?;
++            end.split('.').next()?.parse::<u64>().ok()
++        })
++        .max()
++        .unwrap_or(0);
++    let meta = std::fs::read(dir.join(LOG_META_FILE))
++        .ok()
++        .map(|bytes| {
++            let json = durable::verified_json(&bytes).unwrap().to_owned();
++            let meta: LogMeta = serde_json::from_str(&json).unwrap();
++            meta.pruned_through_seq.max(meta.sealed_through_seq)
++        })
++        .unwrap_or(0);
++    names.max(meta)
++}
++
++/// INV-D8 and INV-D2: after a rotation that did rename `active.wal` (so the sealed end is
++/// recorded and named), the last frames of the next `active.wal` are damaged and truncated as a
++/// torn write (D78), alone or together with the loss of the sealed segment and its sidecar, or
++/// after a prune of every sealed segment. The head never goes below what any name or
++/// `log_meta.json` records, the next commit gets the next sequence, and a read from the floor
++/// never returns a truncated operation.
++#[test]
++fn audit2_d8_damaged_tail_after_a_rotation_that_renamed_never_lowers_the_floor() {
++    let policy = RoomLifecyclePolicy {
++        ram_max_ops: 5,
++        ..RoomLifecyclePolicy::default()
++    };
++    // (last appended, damaged frame of active.wal, lose segment 1..=5, prune it first)
++    let cases = [
++        (8, 2, false, false),
++        (6, 0, false, false),
++        (6, 0, true, false),
++        (7, 1, true, false),
++        (6, 0, false, true),
++        (8, 2, false, true),
++    ];
++    for (last, damaged, lose_segment, prune_first) in cases {
++        let case =
++            format!("last {last}, frame {damaged}, lost {lose_segment}, pruned {prune_first}");
++        let dir = tempdir().unwrap();
++        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++        append_range(&mut log, 1, last);
++        if prune_first {
++            log.prune_older_than(SequenceNumber::new(6)).unwrap();
++        }
++        drop(log);
++        let segments = segments_dir(dir.path());
++        audit2_damage_frame(&segments.join("active.wal"), damaged);
++        if lose_segment {
++            for ext in ["wal", "ids"] {
++                let _ = std::fs::remove_file(segment_file(&segments, 1, 5, ext));
++            }
++        }
++        let floor = audit2_floor_on_disk(dir.path());
++        assert!(floor >= 5, "{case}: floor {floor}");
++
++        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone())
++            .unwrap_or_else(|e| panic!("{case}: {e}"));
++        let head = log.head_seq().get();
++        assert!(
++            head >= floor,
++            "INV-D8 ({case}): head {head} below the floor {floor}"
++        );
++        assert_eq!(
++            head,
++            last - 1,
++            "{case}: only the damaged last frame is lost (D78)"
++        );
++        // The truncated sequence is never served with the old content.
++        if let Ok((ops, _)) = log.fetch_deltas(SequenceNumber::new(floor), 100) {
++            assert!(
++                seqs(&ops).iter().all(|seq| *seq <= head),
++                "{case}: {:?}",
++                seqs(&ops)
++            );
++        }
++        log.append(make_op(head + 1), Some(mutation_for(head + 1)))
++            .unwrap_or_else(|e| panic!("{case}: {e}"));
++        drop(log);
++        let (log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++        assert_eq!(log.head_seq().get(), head + 1, "{case}");
++    }
++}
++
++/// INV-D2 and INV-D8 under D69: a pass over the quota compresses every warm segment (at most
++/// four), applies the RAM window and prunes every sealed segment, the newest included, in the
++/// same pass; one compression leaves its warm copy behind (its removal fails twice). The head
++/// stays, the pruning point is recorded before anything is deleted, the leftover warm copy is
++/// removed by the next open instead of coming back, and the next commit continues the head.
++/// Losing every file of `segments/` afterwards still leaves the floor of `log_meta.json`.
++#[test]
++fn audit2_d2_quota_pass_that_compresses_and_prunes_every_segment_keeps_the_head() {
++    let policy = RoomLifecyclePolicy {
++        ram_max_ops: 5,
++        ram_ttl: Duration::from_millis(1),
++        warm_disk_ttl: Duration::from_secs(3600),
++        ..RoomLifecyclePolicy::default()
++    };
++    for leftover in [false, true] {
++        let case = format!("leftover warm copy: {leftover}");
++        let dir = tempdir().unwrap();
++        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++        append_range(&mut log, 1, 22);
++        let segments = segments_dir(dir.path());
++        let warm = segment_file(&segments, 6, 10, "wal");
++        if leftover {
++            crate::fail_point::arm("remove_file", &warm);
++            crate::fail_point::arm("remove_file", &warm);
++        }
++        log.policy.max_room_disk_bytes = 1;
++        sleep(Duration::from_millis(5));
++        let report = log.run_maintenance_sync().unwrap();
++        assert_eq!(report.warm_compressed_count, 4, "{case}");
++        assert_eq!(report.pruned_count, 4, "{case}");
++        assert_eq!(log.head_seq().get(), 22, "{case}");
++        assert_eq!(log.tail_seq().get(), 21, "{case}");
++        assert_eq!(warm.exists(), leftover, "{case}");
++        let (ops, _) = log.fetch_deltas(SequenceNumber::new(20), 100).unwrap();
++        assert_contiguous(&ops, 21, 22);
++        assert!(matches!(
++            log.fetch_deltas(SequenceNumber::new(19), 100),
++            Err(ServerError::BehindCompaction)
++        ));
++        drop(log);
++
++        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++        assert!(!warm.exists(), "{case}: the leftover warm copy came back");
++        assert_eq!(log.head_seq().get(), 22, "{case}");
++        assert_eq!(log.tail_seq().get(), 21, "{case}");
++        log.append(make_op(23), None).unwrap();
++        // Rotations after the prune keep the pruning point in log_meta.json.
++        append_range(&mut log, 24, 27);
++        drop(log);
++        for entry in std::fs::read_dir(&segments).unwrap() {
++            std::fs::remove_file(entry.unwrap().path()).unwrap();
++        }
++        let (log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++        assert_eq!(
++            log.head_seq().get(),
++            25,
++            "{case}: the sealed end 21..=25 is the floor"
++        );
++    }
++}
++
++/// INV-D8 and INV-Y3 at the edges of the segment index (`iter_from`): with any subset of the
++/// sealed segments lost (warm or cold), every cursor in the retained range gets exactly the
++/// operations after it, or `BehindCompaction` if a lost one is in the way; never an empty answer
++/// below the head, an operation out of order, or a lost sequence reused.
++#[test]
++fn audit2_d8_lost_segments_at_any_position_read_as_gaps_from_every_cursor() {
++    let policy = RoomLifecyclePolicy {
++        ram_max_ops: 3,
++        warm_disk_ttl: Duration::ZERO,
++        ..RoomLifecyclePolicy::default()
++    };
++    // Segments 1..=3, 4..=6, 7..=9 and 10..=12; 13..=14 in active.wal.
++    let ranges = [(1u64, 3u64), (4, 6), (7, 9), (10, 12)];
++    for compressed in [false, true] {
++        for lost in 0u32..16 {
++            let case = format!("compressed {compressed}, lost mask {lost:04b}");
++            let dir = tempdir().unwrap();
++            let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++            append_range(&mut log, 1, 14);
++            if compressed {
++                log.run_maintenance_sync().unwrap();
++            }
++            drop(log);
++            let segments = segments_dir(dir.path());
++            let mut present = [true; 15];
++            for (i, (start, end)) in ranges.iter().enumerate() {
++                if lost & (1 << i) != 0 {
++                    for ext in ["wal", "wal.zst", "ids"] {
++                        let _ = std::fs::remove_file(segment_file(&segments, *start, *end, ext));
++                    }
++                    for seq in *start..=*end {
++                        present[seq as usize] = false;
++                    }
++                }
++            }
++            let (log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++            assert_eq!(log.head_seq().get(), 14, "{case}");
++            let tail = log.tail_seq().get();
++            for cursor in tail - 1..14 {
++                let reachable = (cursor + 1..=14).all(|seq| present[seq as usize]);
++                let mut got = Vec::new();
++                let mut at = cursor;
++                let outcome = loop {
++                    match log.fetch_deltas(SequenceNumber::new(at), 2) {
++                        Ok((ops, has_more)) => {
++                            assert!(!ops.is_empty(), "{case}: empty answer from {at}");
++                            got.extend(seqs(&ops));
++                            at = *got.last().unwrap();
++                            if !has_more {
++                                break Ok(());
++                            }
++                        }
++                        Err(err) => break Err(err),
++                    }
++                };
++                let delivered_in_order = got
++                    .iter()
++                    .copied()
++                    .eq(cursor + 1..cursor + 1 + got.len() as u64);
++                assert!(delivered_in_order, "{case}: from {cursor} got {got:?}");
++                if reachable {
++                    assert!(outcome.is_ok(), "{case}: from {cursor}: {outcome:?}");
++                    assert_eq!(at, 14, "{case}: from {cursor}");
++                } else {
++                    assert!(
++                        matches!(outcome, Err(ServerError::BehindCompaction)),
++                        "{case}: from {cursor} past a lost segment: {got:?} {outcome:?}"
++                    );
++                }
++            }
++        }
++    }
++}

@@ -1,0 +1,932 @@
+diff --git a/crates/server/src/actor/room.rs b/crates/server/src/actor/room.rs
+index 92dfba2..2734168 100644
+--- a/crates/server/src/actor/room.rs
++++ b/crates/server/src/actor/room.rs
+@@ -972,6 +972,8 @@ impl RoomActor {
+         // Backup pass of the cursor-driven pruning, which normally runs on every Ack: a floor
+         // can also move without an Ack (cursors reported by commits, clients becoming Dormant).
+         self.prune_to_retention_floor();
++        #[cfg(test)]
++        crate::fail_point::hook("room_disk_maintenance_before_floor", &self.room_dir);
+         self.publish_snapshot_floor();
+     }
+ }
+diff --git a/crates/server/src/actor/tests/manager.rs b/crates/server/src/actor/tests/manager.rs
+index 631a067..475b1cc 100644
+--- a/crates/server/src/actor/tests/manager.rs
++++ b/crates/server/src/actor/tests/manager.rs
+@@ -1223,3 +1223,283 @@ async fn rooms_shut_down_together_and_save_their_rosters() {
+         assert!(roster.exists(), "{} was not saved", roster.display());
+     }
+ }
++
++/// Registers `client` in the room and commits `count` operations from it.
++async fn audit_commit(
++    manager: &RoomManager,
++    room_id: &RoomId,
++    client: &zemdb_core::id::ClientId,
++    count: u8,
++) {
++    manager
++        .ask(room_id, |reply| RoomCommand::RegisterClient {
++            client_id: client.clone(),
++            current_seq: None,
++            known_incarnation: None,
++            reply,
++        })
++        .await
++        .unwrap()
++        .unwrap();
++    for n in 1..=count {
++        let row = zemdb_core::value::RowBuilder::new()
++            .set("id", i64::from(n))
++            .set("title", "task")
++            .build();
++        let op = test_schema()
++            .to_operation_insert("tasks", &row, 1000)
++            .unwrap();
++        manager
++            .ask(room_id, |reply| RoomCommand::Commit {
++                client_id: client.clone(),
++                mutation_id: zemdb_core::id::MutationId::new([n; 16]),
++                last_ack_seq: SequenceNumber::new(u64::from(n) - 1),
++                op,
++                reply,
++            })
++            .await
++            .unwrap()
++            .unwrap();
++    }
++}
++
++/// What the room offers: the snapshot its `Registered` reports to a new client, and what the
++/// first chunk of a download (no anchor) gets.
++async fn audit_offered(
++    manager: &RoomManager,
++    relay: &SnapshotRelay,
++    room_id: &RoomId,
++) -> (Option<SequenceNumber>, Result<SequenceNumber, ServerError>) {
++    let registered = manager
++        .ask(room_id, |reply| RoomCommand::RegisterClient {
++            client_id: zemdb_core::id::ClientId::new("newcomer").unwrap(),
++            current_seq: None,
++            known_incarnation: None,
++            reply,
++        })
++        .await
++        .unwrap()
++        .unwrap();
++    let first_chunk = relay
++        .get_chunk(
++            zemdb_core::id::CorrelationId::new(1),
++            room_id,
++            0,
++            0,
++            None,
++            manager.log_bounds(room_id),
++        )
++        .await
++        .map(|chunk| match chunk {
++            zemdb_core::protocol::messages::ServerMessage::SnapshotChunk {
++                snapshot_head_seq,
++                ..
++            } => snapshot_head_seq,
++            other => panic!("{other:?}"),
++        });
++    (registered.active_snapshot_seq, first_chunk)
++}
++
++/// A 200 KiB snapshot envelope cut in three upload chunks, with its hash.
++fn audit_three_chunks() -> (Vec<bytes::Bytes>, u64, [u8; 32]) {
++    use zemdb_core::protocol::snapshot_envelope::{
++        SnapshotCompression, SnapshotEnvelopeHeader, SNAPSHOT_HEADER_LEN,
++    };
++    let body = vec![7u8; 200 * 1024 - SNAPSHOT_HEADER_LEN];
++    let header =
++        SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, body.len() as u32, &body);
++    let mut data = header.to_bytes().to_vec();
++    data.extend_from_slice(&body);
++    let hash = zemdb_core::protocol::messages::ServerMessage::compute_snapshot_hash(&data);
++    let chunk_len = data.len().div_ceil(3);
++    let chunks = data
++        .chunks(chunk_len)
++        .map(bytes::Bytes::copy_from_slice)
++        .collect();
++    (chunks, data.len() as u64, hash)
++}
++
++/// A room whose directory is lost while the server keeps running, created again with the same
++/// id: the old room's snapshot is never offered, served or anchored, not even once the new room
++/// reaches its sequence.
++#[tokio::test]
++async fn audit_r6_room_recreated_without_deletion_while_running_never_offers_the_old_snapshot() {
++    let dir = tempdir().unwrap();
++    let (manager, relay) = test_manager(dir.path(), &["first"], |_| {});
++    let (room_id, schema_id) = (
++        RoomId::new("reborn").unwrap(),
++        SchemaId::new("first").unwrap(),
++    );
++    let writer = zemdb_core::id::ClientId::new("writer").unwrap();
++    let first = manager
++        .create_room(room_id.clone(), schema_id.clone(), None)
++        .await
++        .unwrap();
++    audit_commit(&manager, &room_id, &writer, 3).await;
++    let old = relay
++        .stage_snapshot(
++            &room_id,
++            &crate::relay::Uploader::Admin,
++            SequenceNumber::new(2),
++            snapshot_envelope(),
++            manager.log_bounds(&room_id),
++        )
++        .await
++        .unwrap();
++    let (announced, served) = audit_offered(&manager, &relay, &room_id).await;
++    assert_eq!(announced, Some(SequenceNumber::new(2)));
++    assert_eq!(served.unwrap(), SequenceNumber::new(2));
++
++    // The room's actor stops (for inactivity, say) and its directory disappears.
++    manager.shutdown_room(&room_id).await;
++    fs::remove_dir_all(room_dir(&dir, &room_id)).unwrap();
++    let created = manager
++        .create_room(room_id.clone(), schema_id, None)
++        .await
++        .unwrap();
++    assert_eq!(relay.active_snapshot_seq(&room_id), None);
++    audit_commit(&manager, &room_id, &writer, 3).await;
++    let (announced, served) = audit_offered(&manager, &relay, &room_id).await;
++    assert_eq!(announced, None);
++    assert!(
++        matches!(served, Err(ServerError::RoomNotFound(_))),
++        "{served:?}"
++    );
++    // A download anchored to the old snapshot does not go on either.
++    let anchored = relay
++        .get_chunk(
++            zemdb_core::id::CorrelationId::new(2),
++            &room_id,
++            0,
++            0,
++            Some(old),
++            manager.log_bounds(&room_id),
++        )
++        .await;
++    assert!(
++        matches!(anchored, Err(ServerError::SnapshotSuperseded(_))),
++        "{anchored:?}"
++    );
++    // Nor does it anchor the new room's pruning, which is another room.
++    assert_eq!(relay.upload_in_progress(&room_id), None);
++    assert_ne!(created.room_incarnation, first.room_incarnation);
++    manager.shutdown_all().await;
++}
++
++/// Uploads under way when the room is deleted and created again with the same id: the range
++/// they read is the old room's, and the room is recreated (and moves past their sequence) before
++/// they take the relay's lock. None of them is installed in the new room, which offers nothing.
++#[tokio::test]
++async fn audit_r6_upload_under_way_across_a_deletion_and_recreation_is_not_installed() {
++    let (chunks, total_bytes, hash) = audit_three_chunks();
++    for case in [
++        "single request",
++        "one chunk",
++        "last of three chunks",
++        "last chunk sent after the recreation",
++    ] {
++        let dir = tempdir().unwrap();
++        let (manager, relay) = test_manager(dir.path(), &["first"], |_| {});
++        let (room_id, schema_id) = (
++            RoomId::new("reborn").unwrap(),
++            SchemaId::new("first").unwrap(),
++        );
++        let writer = zemdb_core::id::ClientId::new("writer").unwrap();
++        manager
++            .create_room(room_id.clone(), schema_id.clone(), None)
++            .await
++            .unwrap();
++        audit_commit(&manager, &room_id, &writer, 3).await;
++        let part = |index: usize, total: u32, data: bytes::Bytes, bytes: u64| {
++            crate::relay::SnapshotChunkUpload {
++                room_id: room_id.clone(),
++                uploader: crate::relay::Uploader::Client(writer.clone()),
++                head_seq: SequenceNumber::new(2),
++                chunk_index: index as u32,
++                total_chunks: total,
++                total_bytes: bytes,
++                snapshot_hash: if total == 1 {
++                    zemdb_core::protocol::messages::ServerMessage::compute_snapshot_hash(&data)
++                } else {
++                    hash
++                },
++                data,
++            }
++        };
++        if case.starts_with("last") {
++            for (index, chunk) in chunks.iter().enumerate().take(2) {
++                let staged = relay
++                    .stage_chunk(
++                        part(index, 3, chunk.clone(), total_bytes),
++                        manager.log_bounds(&room_id),
++                    )
++                    .await
++                    .unwrap();
++                assert!(!staged, "{case}");
++            }
++        }
++        // The range is read from the old room; before the upload goes on, the room is deleted,
++        // created again, and its log passes the upload's sequence.
++        let recreate = || async {
++            manager.delete_room(&room_id).await.unwrap();
++            manager
++                .create_room(room_id.clone(), schema_id.clone(), None)
++                .await
++                .unwrap();
++            audit_commit(&manager, &room_id, &writer, 3).await;
++        };
++        let old_range = async {
++            let bounds = manager.log_bounds(&room_id).await;
++            recreate().await;
++            bounds
++        };
++        let outcome = match case {
++            "single request" => relay
++                .stage_snapshot(
++                    &room_id,
++                    &crate::relay::Uploader::Client(writer.clone()),
++                    SequenceNumber::new(2),
++                    snapshot_envelope(),
++                    old_range,
++                )
++                .await
++                .map(|_| true),
++            "one chunk" => {
++                let data = snapshot_envelope();
++                let bytes = data.len() as u64;
++                relay.stage_chunk(part(0, 1, data, bytes), old_range).await
++            }
++            "last of three chunks" => {
++                relay
++                    .stage_chunk(part(2, 3, chunks[2].clone(), total_bytes), old_range)
++                    .await
++            }
++            _ => {
++                recreate().await;
++                relay
++                    .stage_chunk(
++                        part(2, 3, chunks[2].clone(), total_bytes),
++                        manager.log_bounds(&room_id),
++                    )
++                    .await
++            }
++        };
++        if case == "last chunk sent after the recreation" {
++            // The new room has no upload under way: the chunk starts one.
++            assert!(matches!(outcome, Ok(false)), "{case}: {outcome:?}");
++        } else {
++            assert!(
++                matches!(outcome, Err(ServerError::RoomNotFound(_))),
++                "{case}: {outcome:?}"
++            );
++        }
++        assert_eq!(relay.active_snapshot_seq(&room_id), None, "{case}");
++        let (announced, served) = audit_offered(&manager, &relay, &room_id).await;
++        assert_eq!(announced, None, "{case}");
++        assert!(
++            matches!(served, Err(ServerError::RoomNotFound(_))),
++            "{case}: {served:?}"
++        );
++        manager.shutdown_all().await;
++    }
++}
+diff --git a/crates/server/src/actor/tests/room.rs b/crates/server/src/actor/tests/room.rs
+index 6247439..22ad9bc 100644
+--- a/crates/server/src/actor/tests/room.rs
++++ b/crates/server/src/actor/tests/room.rs
+@@ -2297,6 +2297,148 @@ async fn cursor_never_moves_back_between_registrations_and_a_registration_redefi
+     fx.manager.shutdown_all().await;
+ }
+ 
++/// A room whose disk maintenance pass (the slow tick, every 30 s of paused time) compresses and
++/// prunes every sealed segment, whose `writer` committed 1..=6 (segments 1..=2, 3..=4 and
++/// 5..=6). Nothing is pruned before the first pass.
++async fn audit_room_pruned_by_every_pass() -> (Fixture, mpsc::Sender<RoomCommand>, ClientId) {
++    let fx = Fixture::with_options(
++        RoomLifecycleOverrides {
++            ram_max_ops: Some(2),
++            warm_disk_ttl_secs: Some(0),
++            cold_disk_ttl_secs: Some(0),
++            ..RoomLifecycleOverrides::default()
++        },
++        |_| {},
++        Some(ActorTimings::default()),
++    )
++    .await;
++    let sender = fx.sender().await;
++    let writer = ClientId::new("writer").unwrap();
++    register(&sender, &writer).await;
++    for n in 1..=6u8 {
++        commit(
++            &sender,
++            &writer,
++            mutation(n),
++            seq(u64::from(n) - 1),
++            insert_op(n.into()),
++        )
++        .await
++        .unwrap();
++    }
++    assert_eq!(metrics(&sender).await.tail_seq, seq(1));
++    (fx, sender, writer)
++}
++
++/// An upload reads the range, a TTL pass prunes past it and the actor publishes the floor, and
++/// then the actor stops (here, a commit whose write fails) before the upload installs. If the
++/// room reopens first, its new actor publishes the floor again and the upload is superseded.
++/// If the upload installs first, there is no floor: the floor lives only as long as the actor,
++/// so the relay installs the upload without checking it and confirms a snapshot that the room
++/// does not offer once it reopens.
++#[tokio::test(start_paused = true)]
++async fn audit_r7_upload_installed_after_its_actor_stopped_is_confirmed_below_the_floor() {
++    for reopened in [true, false] {
++        let (fx, sender, writer) = audit_room_pruned_by_every_pass().await;
++        let active_wal = fx.room_dir().join("segments").join("active.wal");
++        let range = async {
++            let bounds = fx.manager.log_bounds(&fx.room_id).await?;
++            assert!(bounds.admits(seq(2)), "{bounds:?}");
++            // While the upload is under way, the slow tick's TTL pass prunes past 2 and the
++            // actor publishes the new floor ...
++            tokio::time::sleep(SLOW_TICK_PERIOD + Duration::from_secs(1)).await;
++            let floor = fx.relay.snapshot_floor(&fx.room_id);
++            assert!(floor.is_some_and(|floor| floor > seq(2)), "{floor:?}");
++            // ... and then the actor stops.
++            fail_point::arm("warm_append_write", &active_wal);
++            let failed = commit(&sender, &writer, mutation(7), seq(6), insert_op(7)).await;
++            assert!(
++                matches!(failed, Err(ServerError::Unavailable(_))),
++                "{failed:?}"
++            );
++            wait_until("the stopped actor's floor is forgotten", || {
++                fx.relay.snapshot_floor(&fx.room_id).is_none()
++            })
++            .await;
++            if reopened {
++                fx.sender().await;
++            }
++            Ok(bounds)
++        };
++        let staged = fx
++            .relay
++            .stage_snapshot(
++                &fx.room_id,
++                &crate::relay::Uploader::Admin,
++                seq(2),
++                snapshot_envelope(),
++                range,
++            )
++            .await;
++
++        let sender = fx.sender().await;
++        let tail = metrics(&sender).await.tail_seq;
++        let offered = heartbeat(&sender, &writer)
++            .await
++            .unwrap()
++            .active_snapshot_seq;
++        assert!(
++            matches!(staged, Err(ServerError::SnapshotSuperseded(_))),
++            "reopened before the install: {reopened}; the relay answered {:?} to the upload \
++             at 2, but the log's tail is {tail} and the room offers {offered:?}",
++            staged.map(|_| "SnapshotStaged")
++        );
++        fx.manager.shutdown_all().await;
++    }
++}
++
++/// The uploader of the active snapshot did not get its acknowledgment and sends the same
++/// snapshot again in one request. A TTL pass prunes past it while the retry is under way, and
++/// the actor publishes the floor; the retry is confirmed without looking at it.
++#[tokio::test(start_paused = true)]
++async fn audit_r7_retried_single_request_upload_is_confirmed_below_the_floor() {
++    let (fx, sender, writer) = audit_room_pruned_by_every_pass().await;
++    stage_snapshot_at(&fx, 2).await;
++    assert_eq!(
++        heartbeat(&sender, &writer)
++            .await
++            .unwrap()
++            .active_snapshot_seq,
++        Some(seq(2))
++    );
++
++    let range = async {
++        let bounds = fx.manager.log_bounds(&fx.room_id).await?;
++        assert!(bounds.admits(seq(2)), "{bounds:?}");
++        // Well within the relay's snapshot TTL (60 s).
++        tokio::time::sleep(SLOW_TICK_PERIOD + Duration::from_secs(1)).await;
++        Ok(bounds)
++    };
++    let retried = fx
++        .relay
++        .stage_snapshot(
++            &fx.room_id,
++            &crate::relay::Uploader::Admin,
++            seq(2),
++            snapshot_envelope(),
++            range,
++        )
++        .await;
++
++    let floor = fx.relay.snapshot_floor(&fx.room_id);
++    let offered = heartbeat(&sender, &writer)
++        .await
++        .unwrap()
++        .active_snapshot_seq;
++    assert!(
++        matches!(retried, Err(ServerError::SnapshotSuperseded(_))),
++        "the relay answered {:?} to the retry at 2 with the room's floor at {floor:?}; the \
++         room offers {offered:?}",
++        retried.map(|_| "SnapshotStaged")
++    );
++    fx.manager.shutdown_all().await;
++}
++
+ /// Onboarding under disruption: writers commit, sync and ack; newcomers register behind the
+ /// log and wait for a snapshot; designees upload snapshots in one request or in chunks (some
+ /// corrupt, abandoned or with a wrong hash) or go away; rooms restart, crash and lose their
+diff --git a/crates/server/src/api/relay.rs b/crates/server/src/api/relay.rs
+index bc31414..5612bca 100644
+--- a/crates/server/src/api/relay.rs
++++ b/crates/server/src/api/relay.rs
+@@ -99,7 +99,15 @@ pub async fn request_chunk(
+     // The chunk is read from its file once its frame is reserved, and the frame is not held
+     // while the first chunk waits for the room's log range (later chunks never ask for it).
+     let bounds = match snapshot_hash {
+-        None => Either::Left(ready(log_bounds(&state, &room_id).await)),
++        None => {
++            let bounds = log_bounds(&state, &room_id).await;
++            #[cfg(test)]
++            crate::fail_point::hook(
++                "first_chunk_range_read",
++                &crate::actor::room::room_dir(&state.config.data_dir, &room_id),
++            );
++            Either::Left(ready(bounds))
++        }
+         Some(_) => Either::Right(log_bounds(&state, &room_id)),
+     };
+     let Some(reservation) = reserve_frame(&state, (room_id.clone(), uploader)) else {
+@@ -195,3 +203,7 @@ async fn run_to_completion<T: Send + 'static>(
+ async fn log_bounds(state: &AppState, room_id: &RoomId) -> Result<LogBounds, ServerError> {
+     state.room_manager.log_bounds(room_id).await
+ }
++
++#[cfg(test)]
++#[path = "tests/relay.rs"]
++mod tests;
+diff --git a/crates/server/src/api/tests/relay.rs b/crates/server/src/api/tests/relay.rs
+new file mode 100644
+index 0000000..96e8c1a
+--- /dev/null
++++ b/crates/server/src/api/tests/relay.rs
+@@ -0,0 +1,381 @@
++//! The snapshot handlers against a room whose log moves on while a request is under way.
++
++use super::*;
++use crate::actor::room::{room_dir, ActorTimings};
++use crate::actor::RoomCommand;
++use crate::config::ServerConfig;
++use crate::fail_point;
++use crate::log::RoomLifecycleOverrides;
++use crate::relay::{SnapshotRelay, Uploader};
++use crate::schema_registry::SchemaRegistry;
++use crate::RoomManager;
++use std::path::{Path, PathBuf};
++use std::sync::{mpsc, Arc, Mutex};
++use std::time::Duration;
++use tempfile::{tempdir, TempDir};
++use zemdb_core::id::{ClientId, CorrelationId, MutationId, SchemaId};
++use zemdb_core::protocol::codec::decode_message;
++use zemdb_core::protocol::messages::ErrorCode;
++use zemdb_core::protocol::snapshot_envelope::{SnapshotCompression, SnapshotEnvelopeHeader};
++use zemdb_core::schema::{Schema, TableSchema};
++use zemdb_core::value::{DataType, RowBuilder};
++
++/// Longest a test waits for a pause point or a condition.
++const CEILING: Duration = Duration::from_secs(20);
++
++fn schema() -> Schema {
++    let tasks = TableSchema::builder("tasks")
++        .primary_key("id", DataType::Int)
++        .nullable_column("title", DataType::String);
++    Schema::builder().table(tasks).build()
++}
++
++fn seq(n: u64) -> SequenceNumber {
++    SequenceNumber::new(n)
++}
++
++fn envelope() -> bytes::Bytes {
++    let body = b"snapshot";
++    let header = SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, 8, body);
++    let mut out = header.to_bytes().to_vec();
++    out.extend_from_slice(body);
++    bytes::Bytes::from(out)
++}
++
++/// A room with two operations per segment and maintenance ticks every 100 ms, served by the
++/// handlers of `state`, whose `writer` committed 1..=6 (segments 1..=2, 3..=4 and 5..=6).
++struct Room {
++    _dir: TempDir,
++    state: AppState,
++    manager: Arc<RoomManager>,
++    relay: Arc<SnapshotRelay>,
++    room_id: RoomId,
++    room_dir: PathBuf,
++    writer: ClientId,
++}
++
++impl Room {
++    async fn new(overrides: RoomLifecycleOverrides) -> Self {
++        let dir = tempdir().unwrap();
++        let config = Arc::new(ServerConfig {
++            data_dir: dir.path().to_path_buf(),
++            idle_timeout_secs: 0,
++            ..ServerConfig::default()
++        });
++        let registry = Arc::new(SchemaRegistry::new(dir.path().join("schemas")).unwrap());
++        let schema_id = SchemaId::new("tasks").unwrap();
++        registry
++            .register_schema(schema_id.clone(), schema())
++            .unwrap();
++        let relay = Arc::new(
++            SnapshotRelay::new(
++                dir.path().join("snapshots"),
++                Duration::from_secs(600),
++                config.max_snapshot_bytes,
++                Duration::from_secs(config.snapshot_upload_max_secs),
++            )
++            .unwrap(),
++        );
++        let mut manager = RoomManager::new(
++            Arc::clone(&config),
++            Arc::clone(&registry),
++            Arc::clone(&relay),
++        );
++        manager.set_timings(ActorTimings {
++            fast_tick: Duration::from_millis(50),
++            slow_tick: Duration::from_millis(100),
++            ..ActorTimings::default()
++        });
++        let manager = Arc::new(manager);
++        let state = AppState::new(config, registry, Arc::clone(&manager), Arc::clone(&relay));
++        let room_id = RoomId::new("room").unwrap();
++        manager
++            .create_room(
++                room_id.clone(),
++                schema_id,
++                Some(RoomLifecycleOverrides {
++                    ram_max_ops: Some(2),
++                    ..overrides
++                }),
++            )
++            .await
++            .unwrap();
++        let room = Self {
++            room_dir: room_dir(dir.path(), &room_id),
++            _dir: dir,
++            state,
++            manager,
++            relay,
++            room_id,
++            writer: ClientId::new("writer").unwrap(),
++        };
++        room.manager
++            .ask(&room.room_id, |reply| RoomCommand::RegisterClient {
++                client_id: room.writer.clone(),
++                current_seq: None,
++                known_incarnation: None,
++                reply,
++            })
++            .await
++            .unwrap()
++            .unwrap();
++        for n in 1..=6 {
++            room.commit(n).await;
++        }
++        room
++    }
++
++    async fn commit(&self, n: u8) {
++        let row = RowBuilder::new().set("id", i64::from(n)).build();
++        let op = schema().to_operation_insert("tasks", &row, 1000).unwrap();
++        self.manager
++            .ask(&self.room_id, |reply| RoomCommand::Commit {
++                client_id: self.writer.clone(),
++                mutation_id: MutationId::new([n; 16]),
++                last_ack_seq: seq(u64::from(n) - 1),
++                op,
++                reply,
++            })
++            .await
++            .unwrap()
++            .unwrap();
++    }
++
++    /// The snapshot the writer's heartbeat reports, as `Registered` and `HeartbeatAck` offer it.
++    async fn offered_snapshot(&self) -> Option<SequenceNumber> {
++        self.manager
++            .ask(&self.room_id, |reply| RoomCommand::Heartbeat {
++                client_id: self.writer.clone(),
++                reply,
++            })
++            .await
++            .unwrap()
++            .unwrap()
++            .active_snapshot_seq
++    }
++
++    /// Whether segment 1..=2 is gone from disk, warm and cold.
++    fn first_segment_pruned(&self) -> impl Fn() -> bool + Send + Sync + 'static {
++        let segments = self.room_dir.join("segments");
++        move || {
++            let name = "segment_0000000000000001_0000000000000002";
++            !segments.join(format!("{name}.wal")).exists()
++                && !segments.join(format!("{name}.wal.zst")).exists()
++        }
++    }
++}
++
++/// The first chunk of a download (no anchor) asked through the handler by a newcomer.
++async fn first_chunk(state: AppState, room_id: RoomId) -> ServerMessage {
++    let msg = ClientMessage::RequestSnapshotChunk {
++        correlation_id: CorrelationId::new(1),
++        room_id: room_id.clone(),
++        chunk_index: 0,
++        chunk_size: 0,
++        snapshot_hash: None,
++    };
++    let auth = RelayAuth {
++        room_id,
++        uploader: Uploader::Client(ClientId::new("newcomer").unwrap()),
++    };
++    let response = request_chunk(State(state), auth, BinaryMessage(msg)).await;
++    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
++        .await
++        .unwrap();
++    decode_message(&body).unwrap()
++}
++
++/// What a reply to the first chunk offered: the snapshot's sequence, or the error.
++fn offered(reply: &ServerMessage) -> String {
++    match reply {
++        ServerMessage::SnapshotChunk {
++            snapshot_head_seq, ..
++        } => format!("the snapshot at {snapshot_head_seq}"),
++        other => format!("{other:?}"),
++    }
++}
++
++/// A thread stopped at a hook point until the test lets it go on.
++struct Pause {
++    reached: mpsc::Receiver<()>,
++    resume: mpsc::Sender<()>,
++}
++
++type Ready = Arc<dyn Fn() -> bool + Send + Sync>;
++
++impl Pause {
++    /// Stops the first thread that reaches the hook point `name` for `path` once `ready` holds;
++    /// until then, every thread that reaches it goes on.
++    fn at(
++        name: &'static str,
++        path: &Path,
++        ready: impl Fn() -> bool + Send + Sync + 'static,
++    ) -> Self {
++        let (reached_tx, reached) = mpsc::channel();
++        let (resume, resume_rx) = mpsc::channel();
++        arm(
++            name,
++            path.to_path_buf(),
++            Arc::new(ready),
++            reached_tx,
++            Arc::new(Mutex::new(resume_rx)),
++        );
++        Self { reached, resume }
++    }
++
++    async fn reached(&self, what: &str) {
++        let deadline = tokio::time::Instant::now() + CEILING;
++        while self.reached.try_recv().is_err() {
++            assert!(
++                tokio::time::Instant::now() < deadline,
++                "never reached: {what}"
++            );
++            tokio::time::sleep(Duration::from_millis(10)).await;
++        }
++    }
++
++    fn resume(&self) {
++        self.resume.send(()).unwrap();
++    }
++}
++
++fn arm(
++    name: &'static str,
++    path: PathBuf,
++    ready: Ready,
++    reached: mpsc::Sender<()>,
++    resume: Arc<Mutex<mpsc::Receiver<()>>>,
++) {
++    let again = path.clone();
++    fail_point::arm_hook(name, &path, move || {
++        if !ready() {
++            arm(name, again, ready, reached, resume);
++            return;
++        }
++        let _ = reached.send(());
++        // The thread is a runtime worker: its other tasks move to another worker meanwhile.
++        let _ = tokio::task::block_in_place(|| resume.lock().unwrap().recv_timeout(CEILING));
++    });
++}
++
++/// The first chunk of a download checks the snapshot it serves against the log range read
++/// before it picks the snapshot. An upload confirmed in the window that INV-R7 accepts (after a
++/// TTL pass deleted the segments, before the actor published the new floor) lands in between:
++/// the first chunk serves it, although the log no longer retains what follows it. The same
++/// request, with the range read after the snapshot is picked, finds it unusable and drops it.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn audit_r5_first_chunk_serves_a_snapshot_installed_after_it_read_the_range() {
++    // Sealed segments are compressed and pruned 2 s after they are sealed.
++    let room = Room::new(RoomLifecycleOverrides {
++        warm_disk_ttl_secs: Some(2),
++        cold_disk_ttl_secs: Some(0),
++        ..RoomLifecycleOverrides::default()
++    })
++    .await;
++
++    // An upload at 2 reads the range now, while the log retains 1..=6.
++    let (range_tx, range_rx) = tokio::sync::oneshot::channel();
++    let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
++    let upload = tokio::spawn({
++        let (relay, manager, room_id) = (
++            Arc::clone(&room.relay),
++            Arc::clone(&room.manager),
++            room.room_id.clone(),
++        );
++        async move {
++            let range = async {
++                let bounds = manager.log_bounds(&room_id).await;
++                let _ = range_tx.send(bounds.as_ref().ok().copied());
++                let _ = go_rx.await;
++                bounds
++            };
++            relay
++                .stage_snapshot(&room_id, &Uploader::Admin, seq(2), envelope(), range)
++                .await
++        }
++    });
++    let range = range_rx.await.unwrap().unwrap();
++    assert!(range.admits(seq(2)), "{range:?}");
++
++    // A newcomer asks for the first chunk; its handler reads the range, while the log still
++    // retains 1..=6, and stops there.
++    let first_chunk_paused = Pause::at("first_chunk_range_read", &room.room_dir, || true);
++    let download = tokio::spawn(first_chunk(room.state.clone(), room.room_id.clone()));
++    first_chunk_paused
++        .reached("the first chunk read the range")
++        .await;
++
++    // A TTL pass prunes the log past 2; the actor stops before publishing the new floor.
++    let pass_paused = Pause::at(
++        "room_disk_maintenance_before_floor",
++        &room.room_dir,
++        room.first_segment_pruned(),
++    );
++    pass_paused.reached("a TTL pass pruned segment 1..=2").await;
++    // The upload completes in that window and is confirmed (INV-R7's accepted limit).
++    go_tx.send(()).unwrap();
++    let staged = upload.await.unwrap();
++    assert!(staged.is_ok(), "{staged:?}");
++    pass_paused.resume();
++
++    // INV-R7's limit relies on INV-R5: the snapshot is neither announced nor served.
++    let bounds = room.manager.log_bounds(&room.room_id).await.unwrap();
++    assert!(!bounds.admits(seq(2)), "{bounds:?}");
++    assert_eq!(room.offered_snapshot().await, None);
++    first_chunk_paused.resume();
++    let reply = download.await.unwrap();
++    room.manager.shutdown_all().await;
++    assert!(
++        matches!(
++            reply,
++            ServerMessage::Error {
++                code: ErrorCode::RoomNotFound,
++                ..
++            }
++        ),
++        "the first chunk offered {} while the room's log has tail {} and head {}",
++        offered(&reply),
++        bounds.tail_seq,
++        bounds.head_seq
++    );
++}
++
++/// A snapshot that becomes active while the first chunk waits between reading the log range and
++/// picking the snapshot is checked against that older range: one above its head is taken for
++/// one the log cannot continue from, and dropped, although it is the usable snapshot of the
++/// room.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn audit_r5_first_chunk_drops_a_newer_usable_snapshot_against_the_range_it_read_before() {
++    let room = Room::new(RoomLifecycleOverrides::default()).await;
++
++    let first_chunk_paused = Pause::at("first_chunk_range_read", &room.room_dir, || true);
++    let download = tokio::spawn(first_chunk(room.state.clone(), room.room_id.clone()));
++    first_chunk_paused
++        .reached("the first chunk read the range")
++        .await;
++
++    // Meanwhile the room moves on to 7 and a snapshot at 7 is staged against that range.
++    room.commit(7).await;
++    let manager = Arc::clone(&room.manager);
++    room.relay
++        .stage_snapshot(
++            &room.room_id,
++            &Uploader::Admin,
++            seq(7),
++            envelope(),
++            manager.log_bounds(&room.room_id),
++        )
++        .await
++        .unwrap();
++    assert_eq!(room.offered_snapshot().await, Some(seq(7)));
++
++    first_chunk_paused.resume();
++    let reply = download.await.unwrap();
++    room.manager.shutdown_all().await;
++    assert!(
++        matches!(&reply, ServerMessage::SnapshotChunk { snapshot_head_seq, .. } if *snapshot_head_seq == seq(7)),
++        "the first chunk answered {} and the relay kept {:?}, with the usable snapshot at 7",
++        offered(&reply),
++        room.relay.active_snapshot_seq(&room.room_id)
++    );
++}
+diff --git a/crates/server/src/relay/tests/download.rs b/crates/server/src/relay/tests/download.rs
+index 97b5e2b..fa756f9 100644
+--- a/crates/server/src/relay/tests/download.rs
++++ b/crates/server/src/relay/tests/download.rs
+@@ -100,3 +100,57 @@ async fn failed_read_of_a_replaced_snapshot_is_superseded() {
+     let result = relay.read_chunk(&room(), &current, 0, 10).await;
+     assert!(matches!(result, Err(ServerError::Io(_))), "{result:?}");
+ }
++
++/// A first chunk that carries the anchor (a client that already knows the hash, from an earlier
++/// download or from its own upload) is served without asking for the log range: the snapshot
++/// at 5 is served although the log retains only from 8. Only the unanchored first chunk checks
++/// the range.
++#[tokio::test]
++async fn audit_r5_anchored_first_chunk_is_served_without_checking_the_range() {
++    let dir = tempdir().unwrap();
++    let relay = open(&dir);
++    let hash = stage(&relay, 5, &envelope(100, 1)).await.unwrap();
++    let anchored = relay
++        .get_chunk(
++            CorrelationId::new(1),
++            &room(),
++            0,
++            0,
++            Some(hash),
++            bounds(8, 20),
++        )
++        .await;
++    assert!(
++        matches!(anchored, Ok(ServerMessage::SnapshotChunk { snapshot_head_seq, .. }) if snapshot_head_seq == seq(5))
++    );
++    assert_room_not_found(
++        relay
++            .get_chunk(CorrelationId::new(1), &room(), 0, 0, None, bounds(8, 20))
++            .await,
++    );
++}
++
++/// Once the snapshot at 5 expires, another one at the same sequence, with other bytes, may be
++/// staged: a download anchored to the first gets `SnapshotSuperseded`, never chunks of the
++/// second, and a new download gets the second whole.
++#[tokio::test(start_paused = true)]
++async fn audit_r5_replacement_at_the_same_seq_supersedes_an_anchored_download() {
++    let dir = tempdir().unwrap();
++    let relay = open(&dir);
++    let first = envelope(200 * 1024, 1);
++    stage(&relay, 5, &first).await.unwrap();
++    let (total, anchor, data) = chunk(&relay, 0, 0, None).await.unwrap();
++    assert_eq!((total, &data[..]), (4, &first[..64 * 1024]));
++
++    tokio::time::sleep(TTL).await;
++    let second = envelope(200 * 1024, 2);
++    stage(&relay, 5, &second).await.unwrap();
++    assert_superseded(chunk(&relay, 1, 0, Some(anchor)).await);
++    let (_, hash, _) = chunk(&relay, 0, 0, None).await.unwrap();
++    assert_eq!(hash, ServerMessage::compute_snapshot_hash(&second));
++    let mut assembled = Vec::new();
++    for index in 0..4 {
++        assembled.extend_from_slice(&chunk(&relay, index, 0, Some(hash)).await.unwrap().2);
++    }
++    assert_eq!(assembled, second);
++}

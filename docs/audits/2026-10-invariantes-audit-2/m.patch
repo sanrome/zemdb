@@ -1,0 +1,864 @@
+diff --git a/crates/server/src/actor/tests/lease.rs b/crates/server/src/actor/tests/lease.rs
+index 2411d05..08bccef 100644
+--- a/crates/server/src/actor/tests/lease.rs
++++ b/crates/server/src/actor/tests/lease.rs
+@@ -650,3 +650,40 @@ fn bootstrapping_clients_do_not_hold_back_pruning() {
+     );
+     assert_eq!(tracker.min_connected_ack_seq(), Some(seq(20)));
+ }
++
++/// Every single bit flip and every truncation of a roster (two clients and a snapshot demand)
++/// discards it whole: no client, no cursor and no demand from a file that did not verify.
++#[test]
++fn audit_d9_every_damage_to_the_roster_discards_it() {
++    let dir = tempdir().unwrap();
++    let path = dir.path().join("meta_clients_room.json");
++    let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
++    tracker.register_client(&ClientId::new("a").unwrap(), None, seq(7));
++    tracker.register_client(&ClientId::new("b").unwrap(), None, seq(9));
++    tracker.set_snapshot_demand(Some(SystemTime::now()));
++    tracker.save().unwrap();
++    let saved = fs::read(&path).unwrap();
++    let reopened = ClientLeaseTracker::open_or_create(&path).unwrap();
++    assert_eq!(reopened.clients.len(), 2);
++    assert!(reopened.snapshot_demand().is_some());
++
++    let mut damages: Vec<(String, Vec<u8>)> = (0..saved.len())
++        .map(|len| (format!("truncated to {len}"), saved[..len].to_vec()))
++        .collect();
++    for bit in 0..saved.len() * 8 {
++        let mut damaged = saved.clone();
++        damaged[bit / 8] ^= 1 << (bit % 8);
++        damages.push((format!("bit {bit} flipped"), damaged));
++    }
++    for (damage, bytes) in damages {
++        fs::write(&path, &bytes).unwrap();
++        let tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
++        assert!(
++            tracker.clients.is_empty() && tracker.snapshot_demand().is_none(),
++            "a roster {damage} kept {} clients and demand {:?}: {:?}",
++            tracker.clients.len(),
++            tracker.snapshot_demand(),
++            String::from_utf8_lossy(&bytes)
++        );
++    }
++}
+diff --git a/crates/server/src/actor/tests/manager.rs b/crates/server/src/actor/tests/manager.rs
+index 631a067..772ac30 100644
+--- a/crates/server/src/actor/tests/manager.rs
++++ b/crates/server/src/actor/tests/manager.rs
+@@ -1223,3 +1223,58 @@ async fn rooms_shut_down_together_and_save_their_rosters() {
+         assert!(roster.exists(), "{} was not saved", roster.display());
+     }
+ }
++
++/// Every single bit flip and every truncation of a `meta_room.json` (with lifecycle overrides)
++/// makes reading it fail, through the same function that spawning the room and the admin
++/// `GET` of its overrides use.
++#[tokio::test]
++async fn audit_d9_every_damage_to_meta_room_fails_to_load() {
++    let dir = tempdir().unwrap();
++    let room_id = RoomId::new("room-x").unwrap();
++    let meta_path = meta_room_path(&dir, &room_id);
++    let manager = new_manager(&dir);
++    let lifecycle = RoomLifecycleOverrides {
++        max_room_disk_bytes: Some(64 * 1024 * 1024),
++        idle_timeout_secs: Some(60),
++        ..Default::default()
++    };
++    manager
++        .create_room(
++            room_id.clone(),
++            SchemaId::new("first").unwrap(),
++            Some(lifecycle),
++        )
++        .await
++        .unwrap();
++    manager.shutdown_all().await;
++    let stored = fs::read(&meta_path).unwrap();
++    assert!(read_room_metadata(&meta_path).is_ok());
++
++    let mut damages: Vec<(String, Vec<u8>)> = (0..stored.len())
++        .map(|len| (format!("truncated to {len}"), stored[..len].to_vec()))
++        .collect();
++    for bit in 0..stored.len() * 8 {
++        let mut damaged = stored.clone();
++        damaged[bit / 8] ^= 1 << (bit % 8);
++        damages.push((format!("bit {bit} flipped"), damaged));
++    }
++    for (damage, bytes) in damages {
++        fs::write(&meta_path, &bytes).unwrap();
++        let read = read_room_metadata(&meta_path);
++        assert!(
++            read.is_err(),
++            "meta_room.json {damage} loaded as {read:?}: {:?}",
++            String::from_utf8_lossy(&bytes)
++        );
++    }
++    fs::write(&meta_path, &stored).unwrap();
++    let manager = new_manager(&dir);
++    assert_eq!(
++        manager
++            .lifecycle_overrides(&room_id)
++            .await
++            .unwrap()
++            .idle_timeout_secs,
++        Some(60)
++    );
++}
+diff --git a/crates/server/src/log/tests/tiered_log.rs b/crates/server/src/log/tests/tiered_log.rs
+index 0fca1d0..eeacd41 100644
+--- a/crates/server/src/log/tests/tiered_log.rs
++++ b/crates/server/src/log/tests/tiered_log.rs
+@@ -2375,3 +2375,242 @@ fn fetch_cost_does_not_grow_with_the_number_of_segments() {
+     println!("1,000 reads near the head: {few:?} with 100 segments, {many:?} with 50,000");
+     assert!(many < 3 * few, "{many:?} against {few:?}");
+ }
++
++/// Every file of `segments` (segments, sidecars and `active.wal`), by name.
++fn audit_segment_files(segments: &Path) -> Vec<String> {
++    let mut names: Vec<String> = std::fs::read_dir(segments)
++        .unwrap()
++        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
++        .collect();
++    names.sort();
++    names
++}
++
++/// A log that sealed 1..=20 in segments of five, holds 21..=22 in `active.wal` and pruned
++/// everything below 11, so that both fields of `log_meta.json` are set (10 and 20).
++fn audit_pruned_log(dir: &Path) -> RoomLifecyclePolicy {
++    let policy = RoomLifecyclePolicy {
++        ram_max_ops: 5,
++        ..RoomLifecyclePolicy::default()
++    };
++    let (mut log, _) = TieredLog::open_or_create(dir, policy.clone()).unwrap();
++    append_range(&mut log, 1, 22);
++    log.prune_older_than(SequenceNumber::new(11)).unwrap();
++    policy
++}
++
++/// Every single bit flip and every truncation of `log_meta.json` makes the open fail, and the
++/// failed open deletes nothing: not even a flip that keeps the JSON valid and raises
++/// `pruned_through_seq` above the retained segments.
++#[test]
++fn audit_d9_every_damage_to_log_meta_fails_the_open_without_deleting_anything() {
++    let dir = tempdir().unwrap();
++    let policy = audit_pruned_log(dir.path());
++    let segments = segments_dir(dir.path());
++    let meta = dir.path().join("log_meta.json");
++    let original = std::fs::read(&meta).unwrap();
++    let files = audit_segment_files(&segments);
++    assert!(files.contains(&"segment_0000000000000011_0000000000000015.wal".to_string()));
++
++    let mut damages: Vec<(String, Vec<u8>)> = (0..original.len())
++        .map(|len| (format!("truncated to {len}"), original[..len].to_vec()))
++        .collect();
++    for bit in 0..original.len() * 8 {
++        let mut damaged = original.clone();
++        damaged[bit / 8] ^= 1 << (bit % 8);
++        damages.push((format!("bit {bit} flipped"), damaged));
++    }
++    for (damage, bytes) in damages {
++        std::fs::write(&meta, &bytes).unwrap();
++        let opened = TieredLog::open_or_create(dir.path(), policy.clone());
++        assert!(
++            opened.is_err(),
++            "log_meta.json {damage} ({:?}) opened",
++            String::from_utf8_lossy(&bytes)
++        );
++        assert_eq!(
++            audit_segment_files(&segments),
++            files,
++            "{damage} deleted files"
++        );
++    }
++
++    // Verified, but missing a field or holding the wrong type: no default fills it in.
++    for json in [
++        r#"{"pruned_through_seq":10}"#,
++        r#"{"sealed_through_seq":20}"#,
++        r#"{"pruned_through_seq":"10","sealed_through_seq":20}"#,
++        r#"{"pruned_through_seq":-1,"sealed_through_seq":20}"#,
++    ] {
++        crate::durable::write_checked(&meta, json.as_bytes()).unwrap();
++        assert!(
++            TieredLog::open_or_create(dir.path(), policy.clone()).is_err(),
++            "{json} opened"
++        );
++        assert_eq!(
++            audit_segment_files(&segments),
++            files,
++            "{json} deleted files"
++        );
++    }
++
++    std::fs::write(&meta, &original).unwrap();
++    let (log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
++    assert_eq!((log.tail_seq().get(), log.head_seq().get()), (11, 22));
++}
++
++/// A damaged directory entry: one bit of a retained segment's name flipped ("..._0015.wal" to
++/// "..._0005.wal", '1' to '0') puts its end below the pruning point, and opening the log
++/// deletes the segment, whose frames were never checked.
++#[test]
++fn audit_d9_damaged_segment_name_makes_the_open_delete_a_retained_segment() {
++    let dir = tempdir().unwrap();
++    let policy = audit_pruned_log(dir.path());
++    let segments = segments_dir(dir.path());
++    let retained = segment_file(&segments, 11, 15, "wal");
++    let damaged = segment_file(&segments, 11, 5, "wal");
++    let (a, b) = (
++        retained.file_name().unwrap().as_encoded_bytes(),
++        damaged.file_name().unwrap().as_encoded_bytes(),
++    );
++    let flipped: u32 = a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum();
++    assert_eq!(flipped, 1, "the two names differ in one bit");
++    std::fs::rename(&retained, &damaged).unwrap();
++
++    let opened = TieredLog::open_or_create(dir.path(), policy)
++        .map(|(log, _)| (log.tail_seq().get(), log.head_seq().get()));
++    assert!(
++        damaged.exists(),
++        "opening the log deleted segment 11..=15 (operations 11 to 15 of the retained range) \
++         because its damaged name ends at 5, below the pruning point 10; open: {opened:?}, \
++         files left: {:?}",
++        audit_segment_files(&segments)
++    );
++}
++
++/// A damaged directory entry: one bit of a warm segment's name flipped ('0' to '8' in the
++/// first digit of its end) makes the quota count a sidecar of 8 * 10^15 entries. The next
++/// maintenance pass prunes it, records that end as the pruning point in `log_meta.json`, with
++/// its checksum, and the next open deletes every segment of the log and jumps `head_seq`.
++#[test]
++fn audit_w2_damaged_segment_name_makes_maintenance_delete_the_whole_log() {
++    let dir = tempdir().unwrap();
++    let policy = RoomLifecyclePolicy {
++        ram_max_ops: 5,
++        ..RoomLifecyclePolicy::default()
++    };
++    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++    append_range(&mut log, 1, 20);
++    drop(log);
++    let segments = segments_dir(dir.path());
++    let end = 8_000_000_000_000_010;
++    let (original, damaged) = (
++        segment_file(&segments, 6, 10, "wal"),
++        segment_file(&segments, 6, end, "wal"),
++    );
++    let (a, b) = (
++        original.file_name().unwrap().as_encoded_bytes(),
++        damaged.file_name().unwrap().as_encoded_bytes(),
++    );
++    let flipped: u32 = a.iter().zip(b).map(|(x, y)| (x ^ y).count_ones()).sum();
++    assert_eq!(flipped, 1, "the two names differ in one bit");
++    std::fs::rename(&original, &damaged).unwrap();
++
++    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++    assert_eq!(log.head_seq().get(), 20);
++    let disk_bytes = log.disk_bytes();
++    let _ = log.run_maintenance_sync();
++    drop(log);
++
++    let (log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
++    let left = audit_segment_files(&segments);
++    assert!(
++        left.iter()
++            .any(|name| name.starts_with("segment_0000000000000016_0000000000000020")),
++        "one maintenance pass (the log counted {disk_bytes} bytes against a quota of 500 MB) \
++         and a reopen deleted segments 11..=15 and 16..=20, which no prune reached: files \
++         left {left:?}, tail {} and head {} (was 20)",
++        log.tail_seq().get(),
++        log.head_seq().get()
++    );
++}
++
++/// A damaged directory entry: one bit of a retained segment's name flipped ("..._0015.wal" to
++/// "..._0005.wal") gives it an end below its start, and a prune by cursors at 11 (every client
++/// has 10) deletes it, although the clients still need operations 11 to 15. (With the end
++/// flipped to 0 instead, the open itself deletes it: 0 is at or below the pruning point of a
++/// log that never pruned.)
++#[test]
++fn audit_w2_damaged_segment_name_lets_a_cursor_prune_delete_a_needed_segment() {
++    let dir = tempdir().unwrap();
++    let policy = RoomLifecyclePolicy {
++        ram_max_ops: 5,
++        ..RoomLifecyclePolicy::default()
++    };
++    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++    append_range(&mut log, 1, 17);
++    drop(log);
++    let segments = segments_dir(dir.path());
++    std::fs::rename(
++        segment_file(&segments, 11, 15, "wal"),
++        segment_file(&segments, 11, 5, "wal"),
++    )
++    .unwrap();
++
++    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
++    assert!(segment_file(&segments, 11, 5, "wal").exists());
++    let report = log.prune_older_than(SequenceNumber::new(11)).unwrap();
++    let fetched = log.fetch_deltas(SequenceNumber::new(10), 100);
++    assert!(
++        fetched.is_ok(),
++        "a prune for cursors at 10 deleted {} segments, among them 11..=15, and the cursor 10 \
++         now gets {fetched:?}; files left {:?}",
++        report.warm_deleted_count + report.cold_deleted_count,
++        audit_segment_files(&segments)
++    );
++}
++
++/// A damaged directory entry: one bit of the oldest cold segment's name flipped ("..._0005"
++/// to "..._0025", '0' to '2'). When the cold TTL prunes that segment, its damaged end becomes
++/// the pruning point in `log_meta.json`, with a valid checksum, and the next open deletes the
++/// three younger segments, which no TTL reached.
++#[test]
++fn audit_d9_ttl_prune_of_a_damaged_name_makes_the_next_open_delete_younger_segments() {
++    let dir = tempdir().unwrap();
++    let policy = RoomLifecyclePolicy {
++        ram_max_ops: 5,
++        warm_disk_ttl: Duration::ZERO,
++        cold_disk_ttl: Duration::from_secs(3_600),
++        ..RoomLifecyclePolicy::default()
++    };
++    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++    append_range(&mut log, 1, 20);
++    log.run_maintenance_sync().unwrap();
++    drop(log);
++    let segments = segments_dir(dir.path());
++    let damaged = segment_file(&segments, 1, 25, "wal.zst");
++    std::fs::rename(segment_file(&segments, 1, 5, "wal.zst"), &damaged).unwrap();
++    std::fs::File::options()
++        .write(true)
++        .open(&damaged)
++        .unwrap()
++        .set_modified(std::time::SystemTime::now() - Duration::from_secs(7_200))
++        .unwrap();
++
++    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
++    assert_eq!(log.head_seq().get(), 20);
++    let report = log.run_maintenance_sync().unwrap();
++    drop(log);
++    let (log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
++    let left = audit_segment_files(&segments);
++    assert!(
++        left.iter()
++            .any(|name| name.starts_with("segment_0000000000000006_0000000000000010")),
++        "the TTL pruned {} segment (the one named 1..=25, holding 1..=5) and the next open \
++         deleted 6..=10, 11..=15 and 16..=20, an hour younger than the TTL: files left {left:?}, \
++         tail {} and head {}",
++        report.pruned_count,
++        log.tail_seq().get(),
++        log.head_seq().get()
++    );
++}
+diff --git a/crates/server/src/relay/tests/recovery.rs b/crates/server/src/relay/tests/recovery.rs
+index c42ac4e..07c7b18 100644
+--- a/crates/server/src/relay/tests/recovery.rs
++++ b/crates/server/src/relay/tests/recovery.rs
+@@ -116,3 +116,33 @@ async fn startup_drops_snapshots_older_than_the_ttl() {
+     assert_eq!(relay.active_snapshot_seq(&room()), None);
+     assert!(!path.exists());
+ }
++
++/// A damaged directory entry: one bit of a staged snapshot's name flipped in the room id
++/// ("room-a" to "room-c", 'a' to 'c') hands room-a's snapshot to room-c. The BLAKE3 hash in the
++/// name covers the file, not the room id or the sequence next to it, so recovery accepts it.
++#[tokio::test]
++async fn audit_w2_damaged_snapshot_name_hands_the_snapshot_to_another_room() {
++    let dir = tempdir().unwrap();
++    let (room_a, room_c) = (
++        RoomId::new("room-a").unwrap(),
++        RoomId::new("room-c").unwrap(),
++    );
++    fs::create_dir_all(snapshots_dir(&dir)).unwrap();
++    let staged = write_snapshot_file(&dir, &room_a, 5, &envelope(100, 7));
++    let hash = ServerMessage::compute_snapshot_hash(&envelope(100, 7));
++    let damaged = snapshots_dir(&dir).join(snapshot_file_name(&room_c, seq(5), &hash));
++    let flipped: u32 = name_of(&staged)
++        .bytes()
++        .zip(name_of(&damaged).bytes())
++        .map(|(x, y)| (x ^ y).count_ones())
++        .sum();
++    assert_eq!(flipped, 1, "the two names differ in one bit");
++    fs::rename(&staged, &damaged).unwrap();
++
++    let relay = open(&dir);
++    assert_eq!(
++        relay.active_snapshot_seq(&room_c),
++        None,
++        "after a restart the relay offers room-a's snapshot (seq 5) as room-c's"
++    );
++}
+diff --git a/crates/server/src/tests/durable.rs b/crates/server/src/tests/durable.rs
+index e2620e4..31a654c 100644
+--- a/crates/server/src/tests/durable.rs
++++ b/crates/server/src/tests/durable.rs
+@@ -54,3 +54,140 @@ fn create_dir_all_synced_fails_when_syncing_a_new_parent_fails() {
+     crate::fail_point::arm("sync_dir", &first);
+     assert!(create_dir_all_synced(&first.join("b")).is_err());
+ }
++
++/// The bytes `write_checked` leaves on disk for `json`.
++fn audit_checked_bytes(json: &str) -> Vec<u8> {
++    let dir = tempdir().unwrap();
++    let path = dir.path().join("checked.json");
++    write_checked(&path, json.as_bytes()).unwrap();
++    fs::read(&path).unwrap()
++}
++
++/// Every file `write_checked` writes is accepted by `verified_json`, which returns exactly the
++/// JSON written: compact and pretty JSON, an empty document, non-ASCII text, and JSON whose
++/// strings mention the checksum line (escaped, as serde_json always writes a newline inside a
++/// string).
++#[test]
++fn audit_d9_checked_file_round_trips_any_json() {
++    let pretty = serde_json::to_string_pretty(&serde_json::json!({
++        "a": [1, 2, {"b": "c"}],
++        "crc32": "\ncrc32:00000000\n",
++        "ñandú": -0.0,
++    }))
++    .unwrap();
++    for json in [
++        r#"{"pruned_through_seq":10,"sealed_through_seq":22}"#,
++        pretty.as_str(),
++        "",
++        "{}",
++        "\n",
++        "crc32:00000000",
++        "{\"x\":\"\\ncrc32:deadbeef\"}",
++    ] {
++        let bytes = audit_checked_bytes(json);
++        assert_eq!(
++            verified_json(&bytes),
++            Some(json),
++            "write_checked wrote {:?}, which verified_json does not give back",
++            String::from_utf8_lossy(&bytes)
++        );
++    }
++}
++
++/// `verified_json` accepts only the exact format `write_checked` produces: no CRLF, exactly
++/// one final newline, lowercase hex of exactly 8 digits, nothing after the checksum line.
++#[test]
++fn audit_d9_checked_file_rejects_every_variant_of_its_format() {
++    let json = r#"{"pruned_through_seq":10,"sealed_through_seq":22}"#;
++    let crc = format!("{:08x}", crc32fast::hash(json.as_bytes()));
++    let canonical = format!("{json}\ncrc32:{crc}\n");
++    assert_eq!(audit_checked_bytes(json), canonical.as_bytes());
++    assert_eq!(verified_json(canonical.as_bytes()), Some(json));
++
++    let variants = [
++        ("no checksum line", json.to_string()),
++        ("no final newline", format!("{json}\ncrc32:{crc}")),
++        ("two final newlines", format!("{json}\ncrc32:{crc}\n\n")),
++        ("CRLF", format!("{json}\r\ncrc32:{crc}\r\n")),
++        (
++            "CR before the final newline",
++            format!("{json}\ncrc32:{crc}\r\n"),
++        ),
++        (
++            "uppercase hex",
++            format!("{json}\ncrc32:{}\n", crc.to_uppercase()),
++        ),
++        ("7 hex digits", format!("{json}\ncrc32:{}\n", &crc[1..])),
++        ("9 hex digits", format!("{json}\ncrc32:0{crc}\n")),
++        ("0x prefix", format!("{json}\ncrc32:0x{crc}\n")),
++        ("space after the colon", format!("{json}\ncrc32: {crc}\n")),
++        ("trailing space", format!("{json}\ncrc32:{crc} \n")),
++        ("leading space", format!("{json}\n crc32:{crc}\n")),
++        ("other label", format!("{json}\nCRC32:{crc}\n")),
++        (
++            "two checksum lines",
++            format!("{json}\ncrc32:{crc}\ncrc32:{crc}\n"),
++        ),
++        (
++            "a line after the checksum",
++            format!("{json}\ncrc32:{crc}\n{{}}\n"),
++        ),
++        (
++            "a space added to the JSON",
++            format!("{json} \ncrc32:{crc}\n"),
++        ),
++        (
++            "a BOM before the JSON",
++            format!("\u{feff}{json}\ncrc32:{crc}\n"),
++        ),
++        ("checksum line first", format!("crc32:{crc}\n{json}\n")),
++        ("checksum of 0", format!("{json}\ncrc32:00000000\n")),
++    ];
++    for (variant, text) in variants {
++        assert_eq!(
++            verified_json(text.as_bytes()),
++            None,
++            "verified_json accepted a file with {variant}: {text:?}"
++        );
++    }
++    let mut not_utf8 = canonical.clone().into_bytes();
++    not_utf8.insert(1, 0xff);
++    assert_eq!(verified_json(&not_utf8), None, "accepted invalid UTF-8");
++}
++
++/// No single bit flip and no truncation of a checked file passes verification, wherever it
++/// lands: in the JSON, in the checksum line or in the newlines.
++#[test]
++fn audit_d9_every_bit_flip_and_truncation_of_a_checked_file_is_rejected() {
++    let pretty = serde_json::to_string_pretty(&serde_json::json!({
++        "room_id": "room-a",
++        "schema_id": "todo",
++        "room_incarnation": 123_456_789_u128,
++        "lifecycle": {"ram_max_ops": 1000},
++    }))
++    .unwrap();
++    for json in [
++        r#"{"pruned_through_seq":10,"sealed_through_seq":22}"#,
++        &pretty,
++    ] {
++        let bytes = audit_checked_bytes(json);
++        for len in 0..bytes.len() {
++            assert_eq!(
++                verified_json(&bytes[..len]),
++                None,
++                "a file truncated to {len} of {} bytes verified",
++                bytes.len()
++            );
++        }
++        for bit in 0..bytes.len() * 8 {
++            let mut damaged = bytes.clone();
++            damaged[bit / 8] ^= 1 << (bit % 8);
++            assert_eq!(
++                verified_json(&damaged),
++                None,
++                "flipping bit {bit} gave a file that verifies: {:?}",
++                String::from_utf8_lossy(&damaged)
++            );
++        }
++    }
++}
+diff --git a/crates/server/src/tests/schema_registry.rs b/crates/server/src/tests/schema_registry.rs
+index 7e6f455..3af36a6 100644
+--- a/crates/server/src/tests/schema_registry.rs
++++ b/crates/server/src/tests/schema_registry.rs
+@@ -278,3 +278,215 @@ fn damaged_schema_files_fail_the_startup() {
+ fn damaged_schema_files_fail_the_startup_long() {
+     check_damaged_schema_files(0x5C4E_0002, 5_000);
+ }
++
++/// Every single bit flip and every truncation of a schema file (two tables, a composite key,
++/// an encrypted column and a column added later) fails the startup: no damaged schema is ever
++/// loaded, whatever it would have renumbered or retyped.
++#[test]
++fn audit_e1_every_damage_to_a_schema_file_fails_the_startup() {
++    let (dir, id, registry) = todo_registry();
++    registry
++        .add_column(&id, "tasks", nullable_int("priority"))
++        .unwrap();
++    let table = TableSchema::builder("tags")
++        .table_id(7)
++        .primary_key("task", DataType::Int)
++        .primary_key("tag", DataType::String)
++        .encrypted_column("note", DataType::Bytes);
++    registry
++        .register_schema(
++            SchemaId::new("other").unwrap(),
++            Schema::builder().table(table).build(),
++        )
++        .unwrap();
++    drop(registry);
++    let original = fs::read(todo_path(&dir)).unwrap();
++
++    let mut damages: Vec<(String, Vec<u8>)> = (0..original.len())
++        .map(|len| (format!("truncated to {len}"), original[..len].to_vec()))
++        .collect();
++    for bit in 0..original.len() * 8 {
++        let mut damaged = original.clone();
++        damaged[bit / 8] ^= 1 << (bit % 8);
++        damages.push((format!("bit {bit} flipped"), damaged));
++    }
++    for (damage, bytes) in damages {
++        fs::write(todo_path(&dir), &bytes).unwrap();
++        let opened = SchemaRegistry::new(dir.path());
++        assert!(
++            matches!(opened, Err(ServerError::Serialization(_))),
++            "a schema file {damage} gave {:?}: {:?}",
++            opened.map(|r| r.get_schema(&id)),
++            String::from_utf8_lossy(&bytes)
++        );
++    }
++    fs::write(todo_path(&dir), &original).unwrap();
++    let reopened = SchemaRegistry::new(dir.path()).unwrap();
++    assert_eq!(reopened.get_schema(&id).unwrap().version(), 2);
++}
++
++/// A schema file whose checksum matches but whose JSON breaks a rule of the schema (written
++/// by hand, or by an older version) fails the startup too: the strict deserialization runs
++/// after the checksum, and nothing in the file is renumbered or defaulted.
++#[test]
++fn audit_e1_verified_schema_file_with_repeated_or_missing_ids_fails_the_startup() {
++    let table = |id: &str, name: &str| {
++        format!(
++            r#"{{{id}"name":"{name}","primary_key":["id"],"columns":[{{"name":"id","data_type":"Int","nullable":false,"encrypted":false}}]}}"#
++        )
++    };
++    let cases = [
++        (
++            "a repeated table id",
++            format!(
++                r#"{{"version":1,"tables":[{},{}]}}"#,
++                table(r#""table_id":0,"#, "a"),
++                table(r#""table_id":0,"#, "b")
++            ),
++        ),
++        (
++            "a repeated table name",
++            format!(
++                r#"{{"version":1,"tables":[{},{}]}}"#,
++                table(r#""table_id":0,"#, "a"),
++                table(r#""table_id":1,"#, "a")
++            ),
++        ),
++        (
++            "a table without an id",
++            format!(r#"{{"version":1,"tables":[{}]}}"#, table("", "a")),
++        ),
++        (
++            "an unknown field in the schema",
++            format!(
++                r#"{{"version":1,"tables":[{}],"extra":1}}"#,
++                table(r#""table_id":0,"#, "a")
++            ),
++        ),
++        (
++            "an unknown field in a table",
++            format!(
++                r#"{{"version":1,"tables":[{}]}}"#,
++                table(r#""table_id":0,"extra":1,"#, "a")
++            ),
++        ),
++        (
++            "version 0",
++            format!(
++                r#"{{"version":0,"tables":[{}]}}"#,
++                table(r#""table_id":0,"#, "a")
++            ),
++        ),
++        (
++            "a repeated column",
++            r#"{"version":1,"tables":[{"table_id":0,"name":"a","primary_key":["id"],"columns":[{"name":"id","data_type":"Int","nullable":false,"encrypted":false},{"name":"id","data_type":"String","nullable":true,"encrypted":false}]}]}"#.to_string(),
++        ),
++        (
++            "a column without its nullable flag",
++            r#"{"version":1,"tables":[{"table_id":0,"name":"a","primary_key":["id"],"columns":[{"name":"id","data_type":"Int","encrypted":false}]}]}"#.to_string(),
++        ),
++    ];
++    let dir = tempdir().unwrap();
++    let valid = format!(
++        r#"{{"version":3,"tables":[{}]}}"#,
++        table(r#""table_id":4,"#, "a")
++    );
++    durable::write_checked(&dir.path().join("todo.json"), valid.as_bytes()).unwrap();
++    let schema = SchemaRegistry::new(dir.path())
++        .unwrap()
++        .get_schema(&SchemaId::new("todo").unwrap())
++        .unwrap();
++    assert_eq!(
++        (schema.version(), schema.table_ids().collect::<Vec<_>>()),
++        (3, vec![4])
++    );
++    for (case, json) in cases {
++        durable::write_checked(&dir.path().join("todo.json"), json.as_bytes()).unwrap();
++        let opened = SchemaRegistry::new(dir.path());
++        assert!(
++            matches!(opened, Err(ServerError::Serialization(_))),
++            "a verified schema file with {case} loaded: {:?}",
++            opened.map(|r| r.get_schema(&SchemaId::new("todo").unwrap()))
++        );
++    }
++}
++
++/// Concurrent column additions to one schema, watched by a reader: every published version
++/// has exactly one more column than the previous one, no version is published with two
++/// different contents, and each one extends the one before it (nothing lost, renumbered or
++/// retyped). The file left on disk is the last version.
++#[test]
++fn audit_e1_concurrent_add_columns_publish_one_growing_version_per_column() {
++    const WRITERS: usize = 6;
++    const PER_WRITER: usize = 5;
++    let (dir, id, registry) = todo_registry();
++    let done = std::sync::atomic::AtomicBool::new(false);
++    let mut seen: std::collections::BTreeMap<u64, Arc<Schema>> = Default::default();
++
++    std::thread::scope(|scope| {
++        for w in 0..WRITERS {
++            let (registry, id) = (&registry, &id);
++            scope.spawn(move || {
++                for k in 0..PER_WRITER {
++                    registry
++                        .add_column(id, "tasks", nullable_int(format!("w{w}_{k}")))
++                        .unwrap();
++                }
++            });
++        }
++        let reader = scope.spawn(|| {
++            let mut seen: Vec<Arc<Schema>> = Vec::new();
++            while !done.load(std::sync::atomic::Ordering::Acquire) {
++                seen.push(registry.get_schema(&id).unwrap());
++            }
++            seen
++        });
++        // The writers are joined when the scope ends; stop the reader once they are done.
++        while registry.get_schema(&id).unwrap().version() < (1 + WRITERS * PER_WRITER) as u64 {
++            std::thread::yield_now();
++        }
++        done.store(true, std::sync::atomic::Ordering::Release);
++        for schema in reader.join().unwrap() {
++            if let Some(previous) = seen.insert(schema.version(), Arc::clone(&schema)) {
++                assert_eq!(
++                    *previous,
++                    *schema,
++                    "version {} published twice",
++                    schema.version()
++                );
++            }
++        }
++    });
++
++    let last = registry.get_schema(&id).unwrap();
++    seen.insert(last.version(), Arc::clone(&last));
++    seen.insert(1, Arc::new(test_schema()));
++    let columns = |schema: &Schema| {
++        schema
++            .get_table_by_name("tasks")
++            .unwrap()
++            .columns()
++            .to_vec()
++    };
++    let mut previous: Option<(u64, Vec<ColumnDef>)> = None;
++    for (version, schema) in &seen {
++        let cols = columns(schema);
++        assert_eq!(
++            cols.len() as u64,
++            1 + *version,
++            "version {version}: {cols:?}"
++        );
++        if let Some((prev_version, prev_cols)) = &previous {
++            assert!(prev_version < version);
++            assert_eq!(
++                &cols[..prev_cols.len()],
++                &prev_cols[..],
++                "version {version} rewrote a column"
++            );
++        }
++        previous = Some((*version, cols));
++    }
++    assert_eq!(last.version(), (1 + WRITERS * PER_WRITER) as u64);
++    let reopened = SchemaRegistry::new(dir.path()).unwrap();
++    assert_eq!(*reopened.get_schema(&id).unwrap(), *last);
++}
+diff --git a/crates/storage/tests/snapshot_portability_tests.rs b/crates/storage/tests/snapshot_portability_tests.rs
+index a3b8919..ed39920 100644
+--- a/crates/storage/tests/snapshot_portability_tests.rs
++++ b/crates/storage/tests/snapshot_portability_tests.rs
+@@ -186,3 +186,101 @@ async fn disk_rejects_a_row_missing_columns() {
+     let temp_dir = tempfile::tempdir().unwrap();
+     row_missing_columns_is_rejected(&disk_engine(temp_dir.path())).await;
+ }
++
++/// `sample_schema` with a nullable column added after it, as `add_column` produces it.
++fn audit_evolved_schema() -> Schema {
++    let mut schema = sample_schema();
++    schema
++        .add_column(
++            "items",
++            ColumnDef::new("note", DataType::String).nullable(true),
++        )
++        .unwrap();
++    schema
++}
++
++/// A snapshot taken under a schema version, holding rows written before a column existed
++/// (two values, and a row cut short after its last non-null value), is applied by a replica
++/// that already has a later version, in both engines; the replica then keeps applying the log
++/// written under the older version, and the new column reads as null.
++async fn audit_old_snapshot_applies_under_a_later_version<E: StorageEngine>(
++    source: &MemoryStorageEngine,
++    replica: &E,
++) {
++    let room_id = RoomId::new("evolving-room").unwrap();
++    let rows = [
++        CompactRow::new(vec![
++            Value::Int(1),
++            Value::String("a".into()),
++            Value::Int(5),
++        ]),
++        CompactRow::new(vec![Value::Int(2), Value::String("b".into())]),
++    ];
++    source.open_room(&room_id, sample_schema()).await.unwrap();
++    let ops = vec![
++        insert_item(1, 1, rows[0].clone(), 10),
++        insert_item(2, 2, rows[1].clone(), 20),
++    ];
++    source.apply_batch(&room_id, ops).await.unwrap();
++    let snapshot = source.create_snapshot(&room_id).await.unwrap();
++
++    replica
++        .open_room(&room_id, audit_evolved_schema())
++        .await
++        .unwrap();
++    let head = replica
++        .apply_snapshot(
++            &room_id,
++            audit_evolved_schema(),
++            snapshot.into(),
++            2u64.into(),
++        )
++        .await
++        .unwrap();
++    assert_eq!(head, SequenceNumber::from(2u64));
++    let later = vec![
++        insert_item(
++            3,
++            3,
++            CompactRow::new(vec![Value::Int(3), Value::String("c".into())]),
++            30,
++        ),
++        sequenced(
++            4,
++            Operation::update(
++                1,
++                PrimaryKey::single(2i64),
++                vec![ColumnUpdate::new(2, Value::Int(7))],
++                40,
++            ),
++        ),
++    ];
++    replica.apply_batch(&room_id, later).await.unwrap();
++    let row = replica
++        .get_by_id(&room_id, 1, &PrimaryKey::single(2i64))
++        .await
++        .unwrap()
++        .expect("row 2 is in the snapshot");
++    assert_eq!(row.get(1), Some(&Value::String("b".into())));
++    assert_eq!(row.get(2), Some(&Value::Int(7)));
++    assert!(matches!(row.get(3), None | Some(Value::Null)));
++}
++
++#[tokio::test]
++async fn audit_e1_old_snapshot_applies_under_a_later_version_in_memory() {
++    audit_old_snapshot_applies_under_a_later_version(
++        &MemoryStorageEngine::new(),
++        &MemoryStorageEngine::new(),
++    )
++    .await;
++}
++
++#[tokio::test]
++async fn audit_e1_old_snapshot_applies_under_a_later_version_on_disk() {
++    let temp_dir = tempfile::tempdir().unwrap();
++    audit_old_snapshot_applies_under_a_later_version(
++        &MemoryStorageEngine::new(),
++        &disk_engine(temp_dir.path()),
++    )
++    .await;
++}
