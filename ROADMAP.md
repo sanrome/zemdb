@@ -1,9 +1,9 @@
 # ROADMAP.md: Hoja de Ruta de Implementación de ZemDB
 
 **Proyecto:** `ZemDB` (Motor de Base de Datos Distribuida Local-First)  
-**Fecha de Actualización:** 15 de Octubre de 2026  
-**Documentos Relacionados:** [README.md](README.md) | [ARCHITECTURE.md](ARCHITECTURE.md) | [Auditoría Fase 2](docs/audits/2026-09-fase2-audit.md) | [Propuesta Técnica Fases 2.5, 3 y 4](docs/proposals/2026-09-fase2_5-hardening-proposal.md) | [Plan Fase 3.6](docs/proposals/2026-10-fase3_6-remediation-plan.md) | [Plan Fase 3.7](docs/proposals/2026-10-fase3_7-remediation-plan.md) | [Plan Fase 3.8](docs/proposals/2026-10-fase3_8-remediation-plan.md)  
-**Estado:** Hoja de Ruta Oficial de Desarrollo — Fases 1 a 3.8 Completadas / Fases 4 y 5 Planificadas
+**Fecha de Actualización:** 18 de Octubre de 2026  
+**Documentos Relacionados:** [README.md](README.md) | [ARCHITECTURE.md](ARCHITECTURE.md) | [Auditoría Fase 2](docs/audits/2026-09-fase2-audit.md) | [Propuesta Técnica Fases 2.5, 3 y 4](docs/proposals/2026-09-fase2_5-hardening-proposal.md) | [Plan Fase 3.6](docs/proposals/2026-10-fase3_6-remediation-plan.md) | [Plan Fase 3.7](docs/proposals/2026-10-fase3_7-remediation-plan.md) | [Plan Fase 3.8](docs/proposals/2026-10-fase3_8-remediation-plan.md) | [Plan Fase 3.9](docs/proposals/2026-10-fase3_9-remediation-plan.md) | [Invariantes](docs/INVARIANTES.md)  
+**Estado:** Hoja de Ruta Oficial de Desarrollo — Fases 1 a 3.9 Completadas / Fases 4 y 5 Planificadas
 
 ---
 
@@ -119,9 +119,9 @@ ZemDB ha superado con éxito la **Fase 1 y 1.5 (Reestructuración, Blindaje de C
 - Se implementó `DiskStorageEngine` con persistencia en arquitectura Dual-File (`room_{id}.snap` + `room_{id}.wal`), WAL append-only con CRC32, compactación atómica zstd y tolerancia a fallos.
 - Se implementó el servidor `zemdb-server` con arquitectura de actores Tokio (`RoomManager`, `RoomActor`), log inmutable de 4 niveles (`HotBuffer`, `WarmDiskLog`, `ColdDiskLog`), un único WAL por sala (`active.wal`, que en la Fase 3.5-A.3 reemplazó al Micro-WAL) y deduplicación LRU.
 - Se completó el blindaje criptográfico integral del Data Plane mediante el extractor `ClientAuth`, validación de rutas en 3 vías, tiempo constante y leases activos.
-- Las Fases 3.6 y 3.7 cerraron las auditorías posteriores (ver sus planes en `docs/proposals/`): ciclo de vida de clientes derivado del cursor, política de ciclo de vida por sala, relay de snapshots en disco, borde HTTP con límites propios, header del frame WAL con CRC, log del servidor acotado en bytes, validación de snapshots recibidos y squashing de la outbox por orden de llegada. La Fase 3.8 cerró la auditoría posterior: respuestas HTTP acotadas en tiempo y memoria, storage que exige un esquema que cubra sus datos, roster y apertura de salas más baratos, contrato del protocolo (encarnación de la sala, dedup por cliente, versión de esquema en las respuestas) y recuperación ante daño en el log.
+- Las Fases 3.6 y 3.7 cerraron las auditorías posteriores (ver sus planes en `docs/proposals/`): ciclo de vida de clientes derivado del cursor, política de ciclo de vida por sala, relay de snapshots en disco, borde HTTP con límites propios, header del frame WAL con CRC, log del servidor acotado en bytes, validación de snapshots recibidos y squashing de la outbox por orden de llegada. La Fase 3.8 cerró la auditoría posterior: respuestas HTTP acotadas en tiempo y memoria, storage que exige un esquema que cubra sus datos, roster y apertura de salas más baratos, contrato del protocolo (encarnación de la sala, dedup por cliente, versión de esquema en las respuestas) y recuperación ante daño en el log. La Fase 3.9 cerró la primera auditoría por invariantes, contra el contrato de [`docs/INVARIANTES.md`](docs/INVARIANTES.md), y dejó sus simulaciones y fuzzers en el repo. Cambió: ventana de dedup en orden del log; apertura que solo confía en lo verificado y sincronizado (metadatos con checksum, piso de secuencia, un servidor por `data_dir`); absorción atómica y operaciones de storage en su propia tarea; recursos acotados (respuestas por cliente, subidas con plazo y tope, cuota de la sala sobre warm y sidecars); y borrado de sala con lápida.
 
-El proyecto se encuentra ahora en posición para avanzar a las fases de desacoplamiento CoW e I/O asíncrono y construir la sincronización optimista reactiva en el cliente (Fase 4).
+Antes de construir la sincronización optimista reactiva en el cliente (Fase 4) falta una auditoría por invariantes acotada a las invariantes cuyo código cambió en la Fase 3.9 y a las nuevas, en verde según `INVARIANTES.md` §1.4 (ver el §1 del plan de la Fase 3.9).
 
 ---
 
@@ -270,7 +270,7 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 
 ### 4.3. Servidor de Coordinación: `zemdb-server` (Fase 3)
 
-> Diseño histórico de la Fase 3. El comportamiento vigente del servidor está en [`ARCHITECTURE.md`](ARCHITECTURE.md) (§5 a §7); las fases 3.5 a 3.8 lo cambiaron en varios puntos.
+> Diseño histórico de la Fase 3. El comportamiento vigente del servidor está en [`ARCHITECTURE.md`](ARCHITECTURE.md) (§5 a §7); las fases 3.5 a 3.9 lo cambiaron en varios puntos.
 
 #### 4.3.1. Modularización Física del Crate `zemdb-server`
 * **Separación Reutilizable (`lib.rs` y `main.rs`):**
@@ -658,13 +658,15 @@ tokio::spawn(async move {
 │ [x] Relay efímero de chunks multipart para snapshots >16MB.                 │
 │ [x] Batería de pruebas de integración concurrentes con múltiples clientes.  │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ FASES 3.5 a 3.8: Auditorías y Remediación [COMPLETADAS]                     │
+│ FASES 3.5 a 3.9: Auditorías y Remediación [COMPLETADAS]                     │
 │ [x] 3.5: catchup 1-RTT, auth universal, active.wal único, relay multipart.  │
 │ [x] 3.6: ciclo de vida por cursor, política por sala, relay en disco, CI.   │
 │ [x] 3.7: frame WAL con CRC de header, límites HTTP y en bytes, snapshots    │
 │     validados antes de aplicar, squashing por orden de llegada.             │
 │ [x] 3.8: respuestas HTTP acotadas, encarnación de sala, dedup por cliente,  │
 │     versión de esquema, recuperación ante daño en el log, CI con MSRV.      │
+│ [x] 3.9: auditoría por invariantes, simulaciones en el repo, metadatos con  │
+│     checksum, piso de secuencia, recursos por cliente, borrado con lápida.  │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ FASE 4: SDK Local-First Reactivo y Sincronización (zemdb-client)            │
 │ [ ] Modularización de crates/client (lib.rs, api/, sync/, transport/).      │
@@ -767,6 +769,7 @@ La siguiente tabla mapea el origen de cada requerimiento según la recomendació
 | Evaluación de política CRDT celular (`FieldMutation`) | Base de Datos | `zemdb-core` | Baja | 💤 **Diferido (Post-v0.1)** |
 | Índices secundarios no primarios (`BTreeMap<Value, BTreeSet<PK>>`) | Base de Datos | `zemdb-storage` | Baja | 💤 **Diferido (Post-v0.1)** |
 | Borradores Offline Explícitos (Opción B: Staged Drafts) | Sist. Distribuidos / DB | `zemdb-client` | Baja | 💤 **Diferido (Post-v0.1)** |
+| Reescritura de `active.wal` después de un EIO en `fsync` (D77) | Base de Datos / Sist. | `zemdb-server` | Baja | 💤 **Diferido (Post-v0.1)** |
 
 ---
 
@@ -792,5 +795,7 @@ Para optimizar la velocidad de desarrollo y evitar sobre-ingeniería prematura e
    - *Razón de diferimiento:* Para la v0.1 se garantiza la integridad estricta del motor de almacenamiento mediante el modelo *Server-Authoritative Write-Through con Sync en 1 RTT*: toda mutación se valida y secuencia primero en el servidor antes de ingresar al almacenamiento canónico (`StorageEngine`). Esto erradica de raíz el riesgo de inconsistencias locales por validaciones fallidas o estados huérfanos. El soporte para retener borradores no confirmados mientras el cliente esté offline es 100% aditivo y se incorporará como un gestor de borradores segregado (`DraftManager` o tabla de staging `__zemdb_drafts`), sin alterar el motor de persistencia canónico ni el protocolo del servidor.
 9. **SDK de Administración Dedicado para Clientes (Admin SDK):**
    - *Razón de diferimiento:* El Control Plane opera sobre HTTP REST estándar con payloads JSON (`/admin/...`), permitiendo aprovisionar esquemas y salas desde cualquier herramienta (`curl`, scripts bash, Postman, o backends en Node/Python/Go/Rust). Si el backend de aplicación está escrito en Rust, puede utilizar directamente la biblioteca del servidor (`zemdb_server::lib`) en modo embebido sin costo de red. Construir un SDK cliente tipado dedicado es un wrapper de conveniencia que se implementará de forma aditiva una vez estabilizados los endpoints HTTP.
+10. **Reescritura de `active.wal` después de un EIO (riesgo aceptado, D77):**
+    - *Razón de diferimiento:* Al abrir una sala, el servidor hace `fsync` de `active.wal` y de los directorios antes de servir nada, y el storage hace lo mismo con su WAL. En Linux, después de un EIO, el kernel puede marcar las páginas como limpias sin haberlas escrito, y un `fsync` desde un descriptor nuevo devuelve éxito igual: un commit cuyo `fsync` falló podría confirmarse al reintentarlo después de reabrir la sala. La solución completa es reescribir `active.wal` (copiarlo a un temporal, sincronizarlo y renombrarlo) cuando el actor anterior se detuvo por una escritura fallida. Requiere un disco que ya devolvió errores, y está en los riesgos aceptados de `docs/INVARIANTES.md` §4.
 
 

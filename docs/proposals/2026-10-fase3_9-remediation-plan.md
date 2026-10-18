@@ -120,9 +120,9 @@ Se continúa la numeración del plan de la Fase 3.8 (que termina en D68). Las de
 | 3 | Storage: cancelación y absorción | DEF-150, 151, 165 | Alta (requisito de Fase 4) | ✅ 3/3 |
 | 4 | Recursos | DEF-152, 159, 153, 163, 162, 164, 154, 157 | Media | ✅ 8/8 |
 | 5 | Ciclo de vida | DEF-156, 160, 161, 166 | Baja | ✅ 4/4 |
-| 6 | Documentación | ARCHITECTURE, README, ROADMAP | Baja | ⬜ |
+| 6 | Documentación | ARCHITECTURE, README, ROADMAP | Baja | ✅ |
 
-**Avance total:** 23 de 23 ítems (Lotes 0 a 5 cerrados).
+**Avance total:** 23 de 23 ítems; los siete lotes cerrados. Falta la auditoría por invariantes acotada que pide §1 para empezar la Fase 4.
 
 **Ítems nuevos de este plan.** Surgen de las invariantes adoptadas (D79) y de hallazgos de la auditoría que no tenían ID:
 - **DEF-159** · Medio · P6: reparto del presupuesto de respuestas.
@@ -776,6 +776,33 @@ Se fueron `append_synced`, `highest_seq_in_valid_frames`, la excepción de corru
 
 **Test exigido.** Ninguno. Revisión cruzada de cada afirmación cambiada contra el código.
 
+**Hecho.** Casi toda la lista ya la habían adelantado los Lotes 1 a 5, cada uno en su cierre. Este lote sumó lo que faltaba:
+- **`ARCHITECTURE.md`:**
+  - §7.2 y §7.3: el tope de `max_sse_streams` admite el tercer stream de un cliente, que reemplaza al más viejo, así que mientras arranca el total puede pasarse en uno por cliente.
+  - §5.3: `snapshot_upload_max_secs` entre las variables de parseo estricto y entre los settings globales.
+- **README:** las variables del relay, entre ellas `ZEMDB_SNAPSHOT_UPLOAD_MAX_SECS`. La del presupuesto por cliente ya estaba desde el Lote 4.
+- **ROADMAP:**
+  - la Fase 3.9 en el encabezado, en el resumen de §2 y en el diagrama de fases;
+  - el riesgo de D77 como ítem diferido de §7, con su fila en la matriz de §6;
+  - lo que falta para la Fase 4.
+
+**Cierre del lote.**
+- **Decisiones:** el lote no tenía decisiones en *Propuesta*.
+- **Chequeos:** el lote solo toca documentos. La CI de `main` estaba en verde al arrancar (el cierre del Lote 5, Windows incluido).
+- **Revisión cruzada:** la hizo un agente aparte, de contexto fresco y solo lectura, punto por punto contra el código. Los puntos de la lista están descritos y son ciertos. Encontró y entró al lote:
+  - **Falso:**
+    - §5.2 decía que un roster en el formato de antes (un array suelto) seguía cargando. Desde D82 se descarta, porque no tiene la línea del checksum.
+    - El resumen del ROADMAP llamaba "por cliente" a la cuota (que es de la sala) y a los límites de las subidas.
+    - El ROADMAP describía mal el alcance de la auditoría que falta.
+  - **Faltaba:**
+    - las subidas de un chunk en el ancla de §6 y en `RateLimited` (§6 y §7.2);
+    - el cuarto stream SSE de un cliente en `RateLimited`;
+    - que el plazo de una subida también se hereda al reemplazarla por una de secuencia mayor;
+    - `snapshot_upload_max_secs` en *Limits* de §6;
+    - "las fases 3.5 a 3.9" en el ROADMAP;
+    - la sangría del ítem 10 de §7 del ROADMAP.
+- **Backlog:** la rama de `lease.rs` que acepta un roster como array suelto quedó sin uso (ver *Backlog Bajo*).
+
 ---
 
 ## Fuera de este plan
@@ -797,6 +824,7 @@ Hallazgos de la auditoría que no rompen ninguna invariante (`INVARIANTES.md` §
 - `rotate_active_segment` indexa un segmento inexistente si `active.wal` desaparece con la sala abierta.
 - Con muchos segmentos dañados y sin sidecar, la apertura los decodifica todos: solo cuentan para la ventana de dedup los que se leen bien.
 - `ClientLeaseTracker::open_or_create` no acota los cursores del roster a `head_seq`.
+- **(barato)** `lease.rs` sigue aceptando un roster que es un array suelto de clientes, el formato de antes del checksum: con D82 un archivo así ya no pasa la verificación, así que la rama no se usa.
 - `SchemaRegistry::persist`: si falla el sync del directorio después del rename, el disco queda adelante de la caché.
 - Un symlink roto en `schemas/` hace fallar el arranque (D67): documentarlo.
 
