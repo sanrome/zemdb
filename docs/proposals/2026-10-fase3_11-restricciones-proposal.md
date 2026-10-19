@@ -78,13 +78,36 @@ En los dos casos todas las réplicas terminan iguales, y cada cliente se entera 
 |---|---|---|
 | `ON DELETE CASCADE` y `SET NULL` | Producen efectos que no están en el log (borrados o updates derivados). El reporte y el `ChangeStream` tendrían que propagarlos, y un borrado puede tocar muchas filas. | Sí, como acción nueva. Usa el mismo índice inverso que `RESTRICT`. |
 | `CHECK` | Los de una sola columna no dependen del estado: los podría validar el servidor, como hoy valida tipos. Los de varias columnas necesitan la fila entera, que un `Update` parcial no trae. | Sí. Los de una columna, en el servidor. |
-| Restricciones sobre columnas que ya existen | Se aplicarían también a operaciones secuenciadas antes de crearlas. Hace falta anclar el cambio de esquema en el log (DR3). | Sí, con un marcador de cambio de esquema en el log de cada sala. Es el cambio caro. |
+| Restricciones sobre columnas que ya existen | Se aplicarían también a operaciones secuenciadas antes de crearlas. Hace falta anclar el cambio de esquema en el log (DR3). | Sí, anclando el esquema en el log (§2.3). Queda para después de la v0.1. |
 | Anonimato frente al operador del servidor | El seudónimo (DR15) oculta el `ClientId` a los demás miembros, pero quien tiene el secreto del servidor puede recalcularlo para cada cliente. | No con este modelo. Haría falta criptografía como firmas ciegas o pruebas de conocimiento cero. |
 | Restricciones diferidas y transacciones de varias operaciones | Cada commit lleva una sola operación (`ClientMessage::Commit`). | Requiere commits de varias operaciones. |
 | Collations, comparación sin distinguir mayúsculas, normalización Unicode | El resultado depende de la versión de Unicode de cada cliente: no es determinista entre réplicas. | No con este modelo. La aplicación puede guardar una columna ya normalizada. |
 | Restricciones sobre columnas cifradas | El texto cifrado es aleatorio, y ni el storage ni el servidor tienen las claves. | No. |
 | Consultas por índice secundario | Los índices de esta fase son internos. | Sí (backlog 7 de `ROADMAP.md` §7). |
 | Detección de divergencia entre réplicas | Ver DR13. | Sí, con un digest del estado por secuencia. |
+
+### 2.3. Trabajo futuro: el esquema anclado en el log
+Se decidió dejarlo para después de la v0.1: la v0.1 no va a correr en producción con esquemas que evolucionan, y hacerlo ahora retrasa el cliente una fase entera. Queda acá el análisis para retomarlo.
+
+**Qué resuelve.** Hoy un cambio de esquema no tiene posición en el log (§3.2). Si la tuviera, cada operación se validaría y aplicaría con la versión vigente en su secuencia. Eso permitiría:
+- agregar o quitar restricciones sobre columnas existentes;
+- DDL más rico: borrar o renombrar columnas, o agregar `CHECK` después;
+- reemplazar DR3 por "una restricción rige desde la secuencia en que se agrega", y dejar de depender de que el cliente baje el esquema antes de aplicar una respuesta (INV-E2).
+
+**Dos formas:**
+1. **Entradas de esquema en el log.** El log pasa de operaciones a un enum: operación o cambio de esquema (por ejemplo, el `add_column` entero). Snapshot y log reconstruyen datos y esquema sin nada más.
+2. **Un puntero por sala.** El log no cambia. Cada sala guarda una tabla durable `(versión, desde_seq)`, escrita antes de aceptar commits con la versión nueva. Los clientes la reciben, y el storage la guarda para el replay.
+
+**Qué hay que resolver:**
+- **Alcance:** el log del servidor (buffer en RAM, segmentos, sidecars, retención, catch-up), el sync, el WAL del storage y su replay, los snapshots y el relay. Implica volver a revisar las invariantes de durabilidad, entrega y retención.
+- **El registry** guarda hoy solo la última versión de cada esquema. Necesita el historial, o el log tiene que llevar los cambios.
+- **Un snapshot** tiene que decir con qué versión se tomó.
+- **El storage** no recarga el esquema de una sala abierta (DEF-34). Pasaría a cambiarlo en medio de un batch.
+- **Los datos existentes.** El esquema es una plantilla compartida por muchas salas, y el servidor no ve los datos. Una restricción agregada sobre una columna existente puede encontrar violaciones en una sala. Hay que elegir entre dos semánticas, con o sin log:
+  - que valga solo para filas nuevas (como `NOT VALID` en Postgres), lo que debilita INV-C2;
+  - que quede inactiva en esa sala: es determinista, pero el administrador no se entera.
+
+**Compatibilidad.** DR3 es compatible hacia adelante: cuando el esquema se ancle en el log, DR3 solo se relaja, y ningún esquema creado bajo DR3 queda inválido. El costo de diferirlo aparece si se publica un release antes: entonces cambiar el formato del log requiere subir `PROTOCOL_VERSION` y migrar logs y WAL (`GEMINI.md`).
 
 ---
 
@@ -96,7 +119,7 @@ Se numeran DR1, DR2, etc. para no chocar con la numeración D de los planes de r
 |---|---|---|---|
 | **DR1** | **`UNIQUE`, `FOREIGN KEY` e inmutabilidad: las verifica cada réplica.** Las restricciones son parte del esquema. El servidor valida su definición y las guarda, distribuye y recarga como hoy. No verifica filas ni rechaza commits por ellas, así que no hay `ErrorCode` nuevo para estas tres. Cada réplica decide al aplicar cada operación en orden de secuencia, en `apply_batch` y en el replay del WAL, en los dos motores. Una operación que viola una restricción se rechaza entera, nunca a medias: no cambia tablas ni índices, y `head_seq` avanza igual porque la operación se consumió. Una operación inválida para el esquema (tipo, aridad) sigue siendo un error de `apply_batch`: es un log dañado, no un rechazo. | 1–5 | Propuesta |
 | **DR2** | **Alcance.** El de §2.1. Lo de §2.2 queda afuera. | 0 | Propuesta |
-| **DR3** | **Una restricción nunca cambia la decisión sobre el pasado.** Una restricción nace con el esquema (`POST /admin/schemas`), o con la columna nueva que agrega `add_column`. En ese caso tiene que incluirla: entre sus columnas para `UNIQUE`, y entre las columnas de la tabla hija para una FK. Nunca se agrega sobre columnas existentes, ni se quita ni modifica. El dueño y la inmutabilidad se declaran solo al crear el esquema. Una sala existente solo se reasigna a otro esquema (`RoomManager::get_or_spawn` con esquema) si ese esquema tiene las mismas restricciones. El porqué está en §3.2. **Alternativa descartada para esta fase:** un marcador de cambio de esquema en el log de cada sala. Permitiría restricciones sobre columnas existentes, a cambio de tocar el log, el sync y el replay. | 0, 1, 2 | Propuesta |
+| **DR3** | **Una restricción nunca cambia la decisión sobre el pasado.** Una restricción nace con el esquema (`POST /admin/schemas`), o con la columna nueva que agrega `add_column`. En ese caso tiene que incluirla: entre sus columnas para `UNIQUE`, y entre las columnas de la tabla hija para una FK. Nunca se agrega sobre columnas existentes, ni se quita ni modifica. El dueño y la inmutabilidad se declaran solo al crear el esquema. Una sala existente solo se reasigna a otro esquema (`RoomManager::get_or_spawn` con esquema) si ese esquema tiene las mismas restricciones. El porqué está en §3.2. **Alternativa diferida a después de la v0.1:** anclar el esquema en el log (§2.3). Permitiría restricciones sobre columnas existentes, a cambio de tocar el log, el sync y el replay. | 0, 1, 2 | Propuesta |
 | **DR4** | **Semántica de la verificación.** Ver §3.1. En resumen:<br>- Se verifican las restricciones cuyas columnas toca la operación (todas, en un `Insert`).<br>- La igualdad es la de `Value`.<br>- Una clave con algún `NULL` no se verifica.<br>- Las columnas que faltan en una fila corta son `NULL`.<br>- El motivo informado es el de la primera restricción que falla, en un orden fijo. | 4 | Propuesta |
 | **DR5** | **El resultado se informa.** `apply_batch` devuelve `ApplyReport { head_seq, rejected }`, con un elemento `(seq, motivo)` por cada operación no aplicada.<br>- **Motivos:** `Unique`, `ForeignKey` y `Restrict`, con el nombre de la restricción; `Duplicate` (un `Insert` en una tabla inmutable sobre una clave existente); `NotOwner` (la fila existente es de otro dueño); y `MissingRow` (un `Update` sobre una fila que no existe, que hoy se ignora sin aviso).<br>- Solo se listan las excepciones, para no reservar un resultado por operación.<br>- En la recuperación, el reporte se descarta.<br>Los nombres son tentativos. | 3, 4 | Propuesta |
 | **DR6** | **Índices derivados en memoria, sin cambio de formato en disco.**<br>- Un índice por restricción: para `UNIQUE`, clave → PK; para una FK, clave foránea → PK hija. Los dos son multimapas ordenados y persistentes (`imbl`, con clon O(1) como `Table`), para que el motor de disco los clone y los publique junto con las tablas.<br>- Solo se indexan claves sin `NULL`.<br>- No se persisten. Se construyen al abrir (desde el snapshot, antes del replay) y al aplicar un snapshot, y se actualizan con cada operación aplicada.<br>- El `.snap`, el WAL y el envelope `ZMSN` no cambian. | 3 | Propuesta |
@@ -409,7 +432,8 @@ El revisor lo recorre en cada lote de storage:
   - insertar la Fase 3.11 en §4 y en el cronograma de §5;
   - agregar el requisito de su cierre para empezar la Fase 4;
   - reescribir el paso 2 de §4.4.4 y los errores del cliente según DR12;
-  - anotar en el backlog 7 (índices secundarios) que los índices de las restricciones existen pero son internos.
+  - anotar en el backlog 7 (índices secundarios) que los índices de las restricciones existen pero son internos;
+  - agregar al backlog el esquema anclado en el log (§2.3), con un enlace a este análisis.
 - `ARCHITECTURE.md` no cambia en este lote: describe comportamiento implementado. Cada lote lo actualiza con lo suyo.
 
 **Enunciados propuestos:**
