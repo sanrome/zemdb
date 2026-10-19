@@ -44,10 +44,14 @@ async fn upload_that_keeps_progressing_or_restarts_expires_at_its_deadline() {
     let max = Duration::from_secs(300);
     let relay = SnapshotRelay::new(snapshots_dir(&dir), TTL, MAX_BYTES, max).unwrap();
     let snap = three_part_snapshot(1);
-    upload_parts(&relay, 10, [0], &snap, (0, 10)).await;
+    upload_parts(&relay, 8, [0], &snap, (0, 10)).await;
     let step = UPLOAD_IDLE_TIMEOUT - Duration::from_secs(1);
     tokio::time::advance(step).await;
-    upload_parts(&relay, 10, [1], &snap, (0, 10)).await;
+    // Another member replaces the upload, and the uploader replaces that one: the deadline
+    // stays.
+    let accomplice = part_by(member("accomplice"), 9, 0, &snap);
+    relay.stage_chunk(accomplice, bounds(0, 10)).await.unwrap();
+    upload_parts(&relay, 10, [0, 1], &snap, (0, 10)).await;
     // The uploader restarts its upload with another snapshot: the deadline stays. So does
     // completing it with a chunk that does not verify, and starting over.
     tokio::time::advance(step).await;

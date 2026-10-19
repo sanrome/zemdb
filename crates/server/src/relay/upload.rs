@@ -334,6 +334,7 @@ impl SnapshotRelay {
             if let Some(replaced) = guard.upload.take() {
                 info!(room = %room_id, old_seq = %replaced.head_seq, new_seq = %head_seq,
                     "Replacing snapshot upload in progress");
+                guard.expired = Some(replaced.expired());
                 self.remove_files(vec![replaced.path], ()).await;
             }
             guard.upload = Some(UploadSession {

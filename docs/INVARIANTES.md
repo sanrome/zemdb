@@ -46,7 +46,7 @@ Una auditoría por invariantes está **en verde** cuando:
 **Doble disparador raro (D91).** Una ruptura que necesita dos disparadores (c) independientes a la vez y falla cerrada es Media como máximo, y no cuenta como ★ rota para la condición 1. "Falla cerrada" quiere decir que la sala no abre o se responde un error o `BehindCompaction`, y que nada se pierde ni se inventa sin aviso. Si algo se pierde o se inventa sin aviso, la ruptura conserva la severidad de la invariante.
 
 **Después de la 2ª auditoría (D90).** No hay más rondas amplias periódicas:
-- La Fase 3.10 cierra con una **revisión de cierre** de su delta: las mismas tres condiciones, sobre lo que la fase tocó y los mecanismos con los que eso interactúa. En verde, el código auditado se considera estable. Salió en verde sobre `d2c1406`, con una Media de origen (b) al backlog (DEF-182).
+- La Fase 3.10 cierra con una **revisión de cierre** de su delta: las mismas tres condiciones, sobre lo que la fase tocó y los mecanismos con los que eso interactúa. En verde, el código auditado se considera estable. Salió en verde sobre `d2c1406`, con una Media de origen (b), DEF-182, que se arregló después.
 - Desde entonces, cada cambio se revisa por su delta contra esta lista y contra los mecanismos con los que interactúa. Lo que aparezca de origen (b) o (c), Medio o Bajo, va al backlog, no a un plan nuevo.
 - Una auditoría amplia vuelve a hacer falta solo si cambia el modelo de amenaza (§2), o si entra código fuera del alcance actual, como el SDK de la Fase 4. En ese caso se audita una vez, con este método, contra las invariantes nuevas de ese código.
 
@@ -57,7 +57,6 @@ La columna **Estado** del resumen (§3) dice cómo quedó cada invariante en la 
 - ✅ (Dnn): la auditoría la rompió, pero la decisión Dnn la deja sostenida sin código (un supuesto de §2, un riesgo aceptado de §4 o un enunciado ajustado);
 - ❌ se rompió, y entre paréntesis va el lote que la arregla;
 - ❌ Bajo (backlog): todas sus rupturas abiertas son Bajas y no entran en ningún lote; no bloquea el corte (§1.4);
-- ❌ Medio (backlog): tiene una ruptura Media abierta de origen (b) o (c) que, por D90, va al backlog; no bloquea el corte (§1.4);
 - 🆕 es nueva y todavía no se auditó, y entre paréntesis va el lote que la implementa, si hace falta código.
 
 Cada lote que cierra una ruptura actualiza esta columna en el mismo commit (§5).
@@ -124,7 +123,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-R1** | La poda por cursores nunca borra lo que alguien necesita | ★ | Alto | ✅ |
 | **INV-R2** | El rango retenido es contiguo y su cola no retrocede | | Medio | ✅ |
 | **INV-R3** | Perder estado volátil del roster solo cuesta retención o re-registro | | Medio | ✅ |
-| **INV-R4** | Todo cliente que se queda atrás termina pudiendo ponerse al día | | Medio | ❌ Medio (backlog) |
+| **INV-R4** | Todo cliente que se queda atrás termina pudiendo ponerse al día | | Medio | ❌ Bajo (backlog) |
 | **INV-R5** | Solo se anuncian y sirven snapshots usables, y una descarga es de un solo snapshot | | Medio | ✅ |
 | **INV-R6** | Un snapshot solo se ofrece a la encarnación que lo aceptó | | Medio | ✅ |
 | **INV-R7** | Una subida confirmada es usable | | Bajo | ❌ Bajo (backlog) |
@@ -133,7 +132,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio | ❌ Bajo (backlog) |
 | **INV-A4** | Ningún identificador produce rutas fuera de `data_dir` | ★ | Alto | ✅ |
 | **INV-B1** | La memoria por request está acotada | ★ | Alto | ✅ |
-| **INV-B2** | Nada se retiene sin plazo | | Medio | ❌ Medio (backlog) |
+| **INV-B2** | Nada se retiene sin plazo | | Medio | ✅ |
 | **INV-B3** | La memoria, el disco y los FDs del servidor están acotados por la configuración | | Medio | ✅ |
 | **INV-B4** | El costo por request del actor no depende de la historia | | Medio | ✅ |
 | **INV-B5** | Ningún cliente acapara un recurso global | | Medio | ✅ |
@@ -314,7 +313,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 #### INV-R4 · Todo cliente que se queda atrás termina pudiendo ponerse al día
 **Enunciado.** Mientras exista al menos un cliente `Connected` que siga el protocolo y cuyo estado esté más allá de todo hueco del log, todo cliente `Bootstrapping` termina viendo un snapshot usable anunciado, puede descargarlo y ponerse al día desde él. No hay estados sin salida: snapshot por debajo de un hueco, subida que falla al completarse, designado que se va, snapshot vencido, demanda vencida.
 **Sostenida por.** Demanda de snapshot y designación (§5.2 *Snapshot Demand*), D61, D62. El relay solo descarta un snapshot activo si no es usable, si venció o si su sala se borró o se recreó (D96). Reiniciar una subida al vencer su tope no conserva la designación (D102), y el chunk 0 compara el snapshot con un rango leído después de elegirlo.
-**Rupturas abiertas.** Media: el designado y un cómplice que se reemplazan las subidas con secuencias crecientes le renuevan el tope en cada vuelta, y el designado retiene la designación sin límite (DEF-182, backlog). Baja: las subidas chicas fallidas de un miembro pueden congelar la designación (DEF-181, backlog).
+**Ruptura Baja abierta.** Las subidas chicas fallidas de un miembro pueden congelar la designación (DEF-181, backlog).
 **Cómo intentar romperla.** Cada transición de la demanda combinada con reinicios; el único `Connected` es el designado y se desconecta; la subida completa justo cuando TTL mueve la cola; hueco que aparece después de anunciar el snapshot.
 **Automatizable.** Simulación con muchos clientes y crashes: propiedad de liveness acotada ("en N ticks"). Está en el repo desde el Lote 0 de la Fase 3.9.
 **Límite aceptado.** La cuota tiene que retener lo que la sala escribe mientras se sube y se restaura un snapshot: como desde D69 también poda warm recientes, con menos cada snapshot puede salir del rango retenido antes de que alguien se ponga al día desde él (§5.2 *TTL & Quota Compaction*).
@@ -370,8 +369,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-B2 · Nada se retiene sin plazo
 **Enunciado.** Ninguna conexión, body, respuesta, permiso de conexión, subida ni designación se retiene más que un plazo configurado sin progreso del cliente: headers, body por tasa mínima, *stall* de respuesta, inactividad de subidas, designación de 60 s. En una subida, solo un chunk que todavía no se había recibido cuenta como progreso, y además tiene un tope total de duración por uploader (D74, D102): reiniciar la subida al vencer no lo renueva. La única excepción es un stream SSE sano, acotado en cantidad por cliente y en total.
-**Sostenida por.** D45, D53, D54 (§7.3); D74, el progreso y el tope de las subidas (`snapshot_upload_max_secs`), y D76, la designación que solo congela la subida del designado o del worker (§6). D102: el slot recuerda el uploader y el tope de la última subida que quedó inactiva o cuyo último chunk no la instaló, y una subida nueva de ese uploader que empieza dentro de `UPLOAD_IDLE_TIMEOUT` hereda el tope, o se rechaza si ya pasó.
-**Ruptura Media abierta.** Solo se recuerda la última subida que quedó inactiva o no se instaló, no la reemplazada por otro uploader: dos miembros que se reemplazan las subidas con secuencias crecientes renuevan su tope en cada vuelta (DEF-182, backlog).
+**Sostenida por.** D45, D53, D54 (§7.3); D74, el progreso y el tope de las subidas (`snapshot_upload_max_secs`), y D76, la designación que solo congela la subida del designado o del worker (§6). D102: el slot recuerda el uploader y el tope de la última subida que quedó inactiva, cuyo último chunk no la instaló o que otro uploader reemplazó, y una subida nueva de ese uploader que empieza dentro de `UPLOAD_IDLE_TIMEOUT` hereda el tope, o se rechaza si ya pasó.
 **Cómo intentar romperla.** Cliente que lee un byte por plazo; ventana HTTP/2 que se achica; reenviar un chunk ya recibido; subir un chunk por plazo; stream SSE semiabierto (residuo aceptado, §4).
 
 #### INV-B3 · La memoria, el disco y los FDs del servidor están acotados por la configuración
