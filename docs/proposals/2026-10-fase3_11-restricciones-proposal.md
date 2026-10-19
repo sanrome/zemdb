@@ -762,7 +762,9 @@ Positivos:
 - **El dueño lo completa el SDK.** La aplicación no lo escribe:
   - el SDK pone el `ClientId`, o el seudónimo derivado de la clave de dueño de `Registered` (Lote 2b), en la columna dueño;
   - con el dueño fuera de la clave, agrega el delta del dueño a cada `Update` y el `owner` a cada `Delete`;
-  - con seudónimo, el SDK también lo usa para reconocer las filas propias.
+  - con seudónimo, el SDK también lo usa para reconocer las filas propias;
+  - si el dueño está en la clave primaria, la aplicación da el resto de la clave y el SDK completa la columna dueño;
+  - si la aplicación escribe la columna dueño a mano, el SDK rechaza la llamada localmente con un error claro, sin mandar nada. No la pisa en silencio: un valor distinto del propio es un error de la aplicación, y el servidor lo rechazaría igual (`SchemaViolation`).
 - **Pre-chequeo local.** Opcional y activado por defecto: verifica contra el estado local antes de mandar. Es solo un aviso temprano, porque la réplica local puede estar atrasada. La decisión es la de la aplicación en orden.
 - **`ChangeStream` y `watch`:** no emiten nada por operaciones rechazadas.
 - **Crash entre el commit y la aplicación.** El cliente conoce el resultado al volver a sincronizar solo si guardó la secuencia asignada de su mutación pendiente; si no, lo ve solo en el estado. Lo decide el diseño de la outbox, como DEF-85.
