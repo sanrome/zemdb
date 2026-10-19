@@ -91,20 +91,20 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 
 ### Resumen
 
-Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md) (ver §1.5), con los lotes del [plan de la Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) y las decisiones D92 a D97.
+Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md) (ver §1.5), con los lotes del [plan de la Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (cerrados: 0 y 1) y las decisiones D92 a D98.
 
 | ID | Invariante | ★ | Si se rompe | Estado |
 |---|---|---|---|---|
-| **INV-D1** | Un commit confirmado sobrevive a un crash | ★ | Alto | ❌ (Lote 1) |
+| **INV-D1** | Un commit confirmado sobrevive a un crash | ★ | Alto | ✅ |
 | **INV-D2** | Un número de secuencia nunca se reutiliza | ★ | Alto | ✅ |
-| **INV-D3** | La recuperación nunca descarta datos durables ni acepta basura | ★ | Alto | ❌ (Lote 1) |
+| **INV-D3** | La recuperación nunca descarta datos durables ni acepta basura | ★ | Alto | ✅ |
 | **INV-D4** | Los metadatos se reemplazan atómicamente | | Medio | ✅ |
 | **INV-D5** | Una sala tiene un solo dueño | ★ | Alto | ✅ |
 | **INV-D6** | Un solo proceso por `data_dir` | ★ | Alto | ❌ (Lote 3) |
-| **INV-D7** | Nada es visible antes de ser durable en este proceso | ★ | Alto | ❌ (Lote 1) |
+| **INV-D7** | Nada es visible antes de ser durable en este proceso | ★ | Alto | ✅ |
 | **INV-D8** | El piso de secuencia vive fuera del log | ★ | Alto | ✅ |
 | **INV-D9** | Los metadatos se verifican antes de usarse | ★ | Alto | ✅ (D92) |
-| **INV-D10** | Cada archivo del log es contiguo por construcción | | Medio | 🆕 (Lote 1) |
+| **INV-D10** | Cada archivo del log es contiguo por construcción | | Medio | ✅ |
 | **INV-S1** | `apply_batch`: éxito durable o ningún efecto | ★ | Alto | ✅ (D93) |
 | **INV-S2** | Los lectores ven siempre un prefijo del WAL | | Medio | ✅ |
 | **INV-S3** | Un crash en cualquier paso del storage se recupera al mismo estado | ★ | Alto | ✅ (D93) |
@@ -154,7 +154,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-D1 ★ · Un commit confirmado sobrevive a un crash
 **Enunciado.** Si el servidor envió un `CommitAck` con la secuencia `s`, después de un crash o corte de energía en cualquier punto, al reabrir la sala la operación está en el log con la secuencia `s` y el mismo contenido, o `s < tail_seq` porque una poda legítima la borró (INV-R1).
-**Sostenida por.** `sync_data` de `active.wal` antes de responder; sync del directorio al crear `active.wal` y al sellar segmentos; compresión a cold con tmp, sync, rename, sync y verificación antes de borrar el warm (`ARCHITECTURE.md` §5.2). *Pendiente (Lote 1):* que un commit nunca se escriba detrás de un hueco de `active.wal` (INV-D10, D98).
+**Sostenida por.** `sync_data` de `active.wal` antes de responder; sync del directorio al crear `active.wal` y al sellar segmentos; compresión a cold con tmp, sync, rename, sync y verificación antes de borrar el warm (`ARCHITECTURE.md` §5.2); ningún commit se escribe detrás de un hueco de `active.wal` (INV-D10, D98).
 **Cómo intentar romperla.** Crash (fail point) entre cada paso de: append, rotación, escritura del sidecar `.ids`, compresión, borrado del warm, poda, escritura de `log_meta.json`. Una sala que se apaga por inactividad durante la rotación. Un `fsync` que falla y una request reintentada (ver INV-D7).
 **Automatizable.** Simulación con fail points en cada paso y comparación contra el conjunto de `CommitAck` enviados.
 
@@ -166,7 +166,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-D3 ★ · La recuperación nunca descarta datos durables ni acepta basura
 **Enunciado.** Al abrir un log (servidor o storage), un daño seguido de un frame válido es corrupción y no se trunca nada; un daño sin frames válidos después es *torn write* y se trunca solo desde el daño. Ningún frame cuyo header o payload no pase su CRC se interpreta como operación.
-**Sostenida por.** Header con CRC propio (D46), `find_valid_frame`, clasificación compartida en `zemdb-core` (§8 *Physical WAL Framing*). *Pendiente (Lote 1):* que la apertura del servidor nunca borre una copia cold verificada para quedarse con su warm (DEF-168).
+**Sostenida por.** Header con CRC propio (D46), `find_valid_frame`, clasificación compartida en `zemdb-core` (§8 *Physical WAL Framing*). Ante una copia cold y su warm, la apertura del servidor lee la cold y borra el warm si la cold tiene exactamente el rango de su nombre; si no, borra la cold. Un error de E/S al leerla hace fallar la apertura (§5.2).
 **Excepción (D95).** En storage, `.wal.compacting` se escribe entero y sincronizado antes de tomar su nombre (en la rotación y en la absorción, D85), así que un daño en su último frame solo puede ser accidental. Igual se trata como escritura rota: si el WAL activo no tiene lotes posteriores, el lote de ese frame se pierde sin aviso; si los tiene, la apertura falla por el hueco (§4).
 **Cómo intentar romperla.** Daño en cada byte del header y del payload, cola de ceros, frame válido embebido como valor dentro de un payload (un frame embebido puede convertir una escritura rota en corrupción: es un riesgo aceptado, §4), más de 16 payloads dañados seguidos, lectores con buffers que cortan en cualquier punto, daño en `.wal.compacting`. Un `log_meta.json` dañado que haga borrar segmentos al abrir (ver INV-D9).
 **Automatizable.** Logs aleatorios con un corte o un daño en una posición aleatoria; oráculo = el prefijo de frames anteriores al daño.
@@ -188,12 +188,12 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-D7 ★ · Nada es visible antes de ser durable en este proceso
 **Enunciado.** Ningún dato leído al abrir (un registro de `active.wal`, una entrada de directorio, el WAL del storage) se sirve, se deduplica ni se confirma antes de que lo cubra un `fsync` exitoso hecho por este proceso, aunque lo haya escrito una encarnación anterior del actor o del proceso. Para un archivo que solo toma su nombre definitivo después de un `fsync` exitoso de quien lo escribió (segmentos sellados, sidecars, colds, JSON, `.snap`), alcanza con que este proceso sincronice su directorio antes de usarlo.
-**Sostenida por.** D77: `sync_all` de `active.wal` y sync de `segments/`, del directorio de la sala, de `rooms/` y de `data_dir` al abrir el log, y de `data_dir` al arrancar; en `open_room` del storage, sync de `data_dir` y su padre y `sync_all` del WAL activo (lo de `.wal.compacting` se vuelve durable en el snapshot donde se pliega) (§5.2 *Opening a Room*, §8 *Options and Data Directory*). *Pendiente (Lote 1):* sync de `schemas/` al arrancar y de `snapshots/` al recuperar el relay (DEF-169). Riesgo aceptado: el EIO de Linux (§4).
+**Sostenida por.** D77: `sync_all` de `active.wal` y sync de `segments/`, del directorio de la sala, de `rooms/` y de `data_dir` al abrir el log, y de `data_dir`, `schemas/` (antes de leer el registro) y `snapshots/` (antes de recuperar el relay) al arrancar; en `open_room` del storage, sync de `data_dir` y su padre y `sync_all` del WAL activo (lo de `.wal.compacting` se vuelve durable en el snapshot donde se pliega) (§5.2 *Opening a Room*, §8 *Options and Data Directory*). Riesgo aceptado: el EIO de Linux (§4).
 **Cómo intentar romperla.** Un `fsync` que falla, seguido de reapertura y reintento del mismo commit; un sync de directorio que falla y un intento posterior que adopta el archivo; el corte de energía se simula truncando cada archivo a su último largo sincronizado.
 
 #### INV-D8 ★ · El piso de secuencia vive fuera del log
 **Enunciado.** Al abrir, `head_seq` nunca es menor que una secuencia que conste como asignada en cualquier archivo del log: nombres de segmentos y de sidecars, `active.wal` y `log_meta.json` (que guarda el fin del último segmento sellado y el de la última poda). Perder un segmento deja un hueco, que se reporta como `BehindCompaction` (INV-Y3), nunca secuencias reutilizables. La lista es cerrada (D95): el roster y el relay también registran secuencias asignadas, pero no entran en el piso (§4, fila D78).
-**Sostenida por.** D81: `log_meta.json` guarda `pruned_through_seq` (antes de borrar) y `sealed_through_seq` (al sellar, antes del rename de `active.wal`); `head_seq` es el máximo de los dos, los nombres de segmento y `active.wal` (§5.2 *Durable Sequence Floor*). Los nombres de los sidecars no se leen: como `sealed_through_seq` se escribe antes del rename, ningún segmento ni sidecar termina por encima.
+**Sostenida por.** D81: `log_meta.json` guarda `pruned_through_seq` (antes de borrar) y `sealed_through_seq` (al sellar, antes del rename de `active.wal`); `head_seq` es el máximo de los dos, los nombres de segmento y `active.wal` (§5.2 *Durable Sequence Floor*). Los nombres de los sidecars no se leen: como `sealed_through_seq` se escribe antes del rename, ningún segmento ni sidecar termina por encima. Sellar nunca baja `sealed_through_seq` (D98).
 **Cómo intentar romperla.** Perder el segmento sellado más nuevo justo después de una rotación (sin `active.wal`); perder segmentos después de una poda total; una rotación interrumpida entre el sellado y la escritura de `log_meta.json`.
 
 #### INV-D9 ★ · Los metadatos se verifican antes de usarse
@@ -203,7 +203,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-D10 · Cada archivo del log es contiguo por construcción
 **Enunciado.** Ni `active.wal`, ni un segmento sellado, ni su copia cold tienen huecos ni operaciones fuera del rango que indican su nombre o el inicio de `active.wal`. Un registro que no continúa el último de `active.wal` nunca se escribe.
-**Sostenida por.** La compresión contrasta el nombre del segmento con su contenido (§5.2). *Pendiente (Lote 1):* sellar `active.wal` al abrir si quedó por debajo del piso, y que `append` rechace un registro que no continúa `active.wal` (D98, DEF-167).
+**Sostenida por.** La compresión contrasta el nombre del segmento con su contenido (§5.2). D98: al abrir, `active.wal` se sella con su rango real si quedó por debajo del piso, y `append` rechaza, antes de escribir, un registro que no continúa `active.wal` (lo que detiene la sala).
 **Cómo intentar romperla.** Un crash entre la escritura de `log_meta.json` y el rename de la rotación, más un daño en el último frame de `active.wal`; un commit después de truncar una escritura rota.
 
 ### 3.2. Durabilidad del storage (cliente)

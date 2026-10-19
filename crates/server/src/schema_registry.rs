@@ -28,10 +28,12 @@ pub struct SchemaRegistry {
 
 impl SchemaRegistry {
     /// Opens or creates the schema registry at the given directory, loading any existing
-    /// schema files.
+    /// schema files. The directory is synced first: a write whose sync failed may have left
+    /// an entry that no `fsync` covered, and nothing is served before one does.
     pub fn new(dir: impl Into<PathBuf>) -> Result<Self, ServerError> {
         let dir = dir.into();
         durable::create_dir_all_synced(&dir)?;
+        durable::sync_dir(&dir)?;
 
         let schemas = DashMap::new();
 

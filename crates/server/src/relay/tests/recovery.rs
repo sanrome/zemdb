@@ -91,6 +91,10 @@ async fn crash_between_promotion_and_install_recovers_the_newest_snapshot() {
         stage(&relay, 5, &envelope(100, 1)).await.unwrap();
         write_snapshot_file(&dir, &room(), 6, &envelope(100, 2))
     };
+    // The promotion's directory sync may have failed: startup syncs `snapshots/` before
+    // serving anything in it, and fails if it cannot.
+    fail_point::arm("sync_dir", &snapshots_dir(&dir));
+    assert!(SnapshotRelay::new(snapshots_dir(&dir), TTL, MAX_BYTES, UPLOAD_MAX).is_err());
     let relay = open(&dir);
     assert_eq!(relay.active_snapshot_seq(&room()), Some(seq(6)));
     assert_eq!(files_in(&snapshots_dir(&dir)), vec![name_of(&newer)]);

@@ -36,7 +36,10 @@ impl SnapshotRelay {
     }
 
     /// Indexes the newest valid snapshot of each room and deletes every other snapshot file.
+    /// The directory is synced first: a promotion whose sync failed may have left an entry that
+    /// no `fsync` covered, and nothing is served before one does.
     pub(super) fn recover_snapshots(&self) -> std::io::Result<()> {
+        durable::sync_dir(&self.snapshots_dir)?;
         let now = SystemTime::now();
         let mut candidates: HashMap<RoomId, Vec<RecoveredFile>> = HashMap::new();
         let mut doomed = Vec::new();

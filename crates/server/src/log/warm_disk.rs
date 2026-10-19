@@ -67,12 +67,19 @@ impl WarmDiskLog {
         Ok((log, recovered))
     }
 
-    /// Appends `op` and its mutation ID to `active.wal`, synced with `sync_data`.
+    /// Appends `op` and its mutation ID to `active.wal`, synced with `sync_data`. A record
+    /// that does not continue the last one is rejected before anything is written.
     pub fn append_record(
         &mut self,
         op: &SequencedOperation,
         mutation_id: Option<MutationId>,
     ) -> Result<(), ServerError> {
+        if let Some(end) = self.active_end_seq.filter(|end| end.next() != op.seq) {
+            return Err(ServerError::WalCorruption(format!(
+                "Record {} does not continue active.wal, which ends at {end}",
+                op.seq
+            )));
+        }
         let active_path = self.active_path();
 
         if self.active_file.is_none() {

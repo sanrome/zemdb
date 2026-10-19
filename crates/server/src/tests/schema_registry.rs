@@ -50,6 +50,30 @@ fn interrupted_schema_write_keeps_previous_version() {
     assert!(!has_column(&reopened.get_schema(&id).unwrap(), "priority"));
 }
 
+/// A registration or an `add_column` whose directory sync failed leaves a file that no `fsync`
+/// covered: the next startup syncs `schemas/` before serving it, and fails if it cannot.
+#[test]
+fn startup_syncs_schemas_left_unsynced_by_a_failed_write_before_serving_them() {
+    let dir = tempdir().unwrap();
+    let id = SchemaId::new("todo").unwrap();
+    let registry = SchemaRegistry::new(dir.path()).unwrap();
+    fail_point::arm("sync_dir", dir.path());
+    assert!(registry.register_schema(id.clone(), test_schema()).is_err());
+    fail_point::arm("sync_dir", dir.path());
+    assert!(SchemaRegistry::new(dir.path()).is_err());
+
+    let registry = SchemaRegistry::new(dir.path()).unwrap();
+    assert!(registry.get_schema(&id).is_some());
+    fail_point::arm("sync_dir", dir.path());
+    assert!(registry
+        .add_column(&id, "tasks", nullable_int("priority"))
+        .is_err());
+    fail_point::arm("sync_dir", dir.path());
+    assert!(SchemaRegistry::new(dir.path()).is_err());
+    let restarted = SchemaRegistry::new(dir.path()).unwrap();
+    assert!(has_column(&restarted.get_schema(&id).unwrap(), "priority"));
+}
+
 #[test]
 fn schema_version_counts_every_added_column_and_survives_a_restart() {
     let (dir, id, registry) = todo_registry();

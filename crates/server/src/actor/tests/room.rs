@@ -519,6 +519,62 @@ async fn rotation_failure_after_durable_commit_is_acknowledged_and_restarts_room
     fx.manager.shutdown_all().await;
 }
 
+/// A rotation that recorded its end and stopped before the rename, then damage to the last
+/// frame of `active.wal` (commit 3): the respawn truncates it, and the commit acknowledged
+/// after it (4) is still served after another reopen.
+// Paused time: no maintenance tick runs.
+#[tokio::test(start_paused = true)]
+async fn commit_acknowledged_after_a_truncated_frame_below_the_sealed_end_is_served() {
+    let policy = RoomLifecycleOverrides {
+        ram_max_ops: Some(3),
+        ..RoomLifecycleOverrides::default()
+    };
+    let fx = Fixture::new(policy).await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    for i in 1..=2u8 {
+        let last_ack = seq(u64::from(i) - 1);
+        commit(
+            &sender,
+            &client,
+            mutation(i),
+            last_ack,
+            insert_op(i64::from(i)),
+        )
+        .await
+        .unwrap();
+    }
+    let active = fx.room_dir().join("segments").join("active.wal");
+    fail_point::arm("exists", &active);
+    let acked = commit(&sender, &client, mutation(3), seq(2), insert_op(3)).await;
+    assert_eq!(acked.unwrap().assigned_seq, seq(3));
+    fx.manager.shutdown_all().await;
+    let mut bytes = fs::read(&active).unwrap();
+    *bytes.last_mut().unwrap() ^= 0xFF;
+    fs::write(&active, bytes).unwrap();
+
+    let recovered = fx.sender().await;
+    assert_eq!(metrics(&recovered).await.head_seq, seq(3));
+    let acked = commit(&recovered, &client, mutation(4), seq(3), insert_op(4)).await;
+    assert_eq!(acked.unwrap().assigned_seq, seq(4));
+    fx.manager.shutdown_all().await;
+
+    let reopened = fx.sender().await;
+    let (tx, rx) = oneshot::channel();
+    let sync = RoomCommand::Sync {
+        client_id: client.clone(),
+        from_seq: seq(3),
+        max_batch_size: 100,
+        reply: tx,
+    };
+    reopened.send(sync).await.unwrap();
+    let synced = rx.await.unwrap().unwrap();
+    let seqs: Vec<u64> = synced.ops.iter().map(|op| op.seq.get()).collect();
+    assert_eq!(seqs, vec![4]);
+    fx.manager.shutdown_all().await;
+}
+
 #[tokio::test]
 async fn failed_commit_write_restarts_room_and_retry_gets_next_sequence() {
     let fx = Fixture::new(RoomLifecycleOverrides::default()).await;

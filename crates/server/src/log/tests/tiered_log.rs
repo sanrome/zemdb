@@ -289,6 +289,58 @@ fn rotation_that_fails_to_record_its_end_seals_nothing() {
     assert_eq!(log.head_seq().get(), 5);
 }
 
+/// A rotation that recorded its end and stopped before the rename, followed by damage to the
+/// last frame of `active.wal`, leaves `active.wal` ending below `head_seq` once the open
+/// truncates that frame. The next commit must still be readable after a reopen, whether a
+/// rotation by count seals it (`ram_max_ops` 6) or not (7), and the lost operation is a gap.
+#[test]
+fn commit_after_a_damaged_last_frame_below_the_sealed_end_survives_a_reopen() {
+    for ram_max_ops in [6, 7] {
+        let dir = tempdir().unwrap();
+        let policy = RoomLifecyclePolicy {
+            ram_max_ops,
+            ..RoomLifecyclePolicy::default()
+        };
+        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+        append_range(&mut log, 1, 5);
+        let active = segments_dir(dir.path()).join("active.wal");
+        crate::fail_point::arm("exists", &active);
+        assert!(log.force_rotate_warm().is_err());
+        drop(log);
+        let active_file = File::options()
+            .read(true)
+            .write(true)
+            .open(&active)
+            .unwrap();
+        damage_payload(&active_file, 4);
+        drop(active_file);
+
+        // An open whose sealing fails seals nothing; the next one seals `active.wal`, without
+        // lowering the recorded floor, as the open after it shows.
+        crate::fail_point::arm(
+            "write_atomic_before_rename",
+            &dir.path().join(LOG_META_FILE),
+        );
+        assert!(TieredLog::open_or_create(dir.path(), policy.clone()).is_err());
+        drop(TieredLog::open_or_create(dir.path(), policy.clone()).unwrap());
+        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+        assert_eq!(log.head_seq().get(), 5, "5 is in log_meta.json");
+        let outcome = log.append(make_op(6), Some(mutation_for(6))).unwrap();
+        assert!(outcome.rotation_error.is_none());
+        drop(log);
+
+        let (log, mutations) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+        assert_eq!(log.head_seq().get(), 6);
+        assert!(mutations.contains(&(mutation_for(6), SequenceNumber::new(6))));
+        let (ops, _) = log.fetch_deltas(SequenceNumber::new(5), 10).unwrap();
+        assert_eq!(seqs(&ops), vec![6], "ram_max_ops {ram_max_ops}");
+        assert!(matches!(
+            log.fetch_deltas(SequenceNumber::new(3), 10),
+            Err(ServerError::BehindCompaction)
+        ));
+    }
+}
+
 #[test]
 fn failure_to_check_for_active_wal_fails_the_open() {
     let dir = tempdir().unwrap();
@@ -805,22 +857,20 @@ fn quota_bounds_the_disk_of_a_sustained_writer() {
 }
 
 #[test]
-fn open_keeps_the_warm_original_of_an_interrupted_compression() {
+fn open_keeps_the_warm_original_when_its_cold_copy_does_not_verify() {
     let dir = tempdir().unwrap();
     {
         let (mut log, _) =
             TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
         append_range(&mut log, 1, 5);
     }
-    // A crash after the cold segment was renamed into place, before the warm one was removed.
+    // A cold copy next to its warm original, damaged so that it lacks the last operation.
     let segments = segments_dir(dir.path());
     let warm = segment_file(&segments, 1, 5, "wal");
     let cold = segment_file(&segments, 1, 5, "wal.zst");
-    std::fs::write(
-        &cold,
-        zstd::stream::encode_all(&std::fs::read(&warm).unwrap()[..], 3).unwrap(),
-    )
-    .unwrap();
+    let warm_bytes = std::fs::read(&warm).unwrap();
+    let torn = &warm_bytes[..warm_bytes.len() - 1];
+    std::fs::write(&cold, zstd::stream::encode_all(torn, 3).unwrap()).unwrap();
 
     let (mut log, mutations) =
         TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
@@ -832,6 +882,38 @@ fn open_keeps_the_warm_original_of_an_interrupted_compression() {
     assert!(cold.exists());
     let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
     assert_contiguous(&ops, 1, 5);
+}
+
+/// A compression whose removal of the warm original fails twice leaves both copies; if the
+/// warm one is then damaged, opening keeps the verified cold copy and removes the warm one.
+#[test]
+fn open_never_drops_a_verified_cold_copy_for_a_damaged_warm_one() {
+    for damaged_frame in [1, 4] {
+        let dir = tempdir().unwrap();
+        let (mut log, _) =
+            TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
+        append_range(&mut log, 1, 7);
+        let segments = segments_dir(dir.path());
+        let warm = segment_file(&segments, 1, 5, "wal");
+        let cold = segment_file(&segments, 1, 5, "wal.zst");
+        // The removal after the compression, and its retry in the same pass.
+        crate::fail_point::arm("remove_file", &warm);
+        crate::fail_point::arm("remove_file", &warm);
+        log.run_maintenance_sync().unwrap();
+        drop(log);
+        let warm_file = File::options().read(true).write(true).open(&warm).unwrap();
+        damage_payload(&warm_file, damaged_frame);
+        drop(warm_file);
+        // An I/O error reading the cold copy proves nothing: the open fails and removes neither.
+        crate::fail_point::arm("open_segment", &cold);
+        assert!(TieredLog::open_or_create(dir.path(), compress_at_once_policy()).is_err());
+        assert!(cold.exists() && warm.exists());
+
+        let (log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
+        assert!(cold.exists() && !warm.exists(), "frame {damaged_frame}");
+        let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+        assert_contiguous(&ops, 1, 7);
+    }
 }
 
 #[test]

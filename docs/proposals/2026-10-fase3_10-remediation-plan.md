@@ -121,13 +121,13 @@ Se continúa la numeración del plan de la Fase 3.9 (que termina en D89). Las de
 | Orden | Lote | Ítems | Prioridad | Progreso |
 |---|---|---|---|---|
 | 0 | Contrato y redes de prueba | D90–D97 | Inmediata (las redes viven en parches) | ✅ |
-| 1 | Log del servidor: abrir sin perder ni borrar de más | DEF-167, 168, 169 | Alta | ⬜ 0/3 |
+| 1 | Log del servidor: abrir sin perder ni borrar de más | DEF-167, 168, 169 | Alta | ✅ 3/3 |
 | 2 | Apertura acotada | DEF-170 | Alta | ⬜ 0/1 |
 | 3 | Locks y ciclo de vida | DEF-172, 175 | Media | ⬜ 0/2 |
 | 4 | Subidas | DEF-174, 176, 180 | Media | ⬜ 0/3 |
 | 5 | Cierre | Documentación y revisión de cierre (D90) | Requisito de la Fase 4 | ⬜ |
 
-**Avance total:** Lote 0 cerrado; 0 de 9 ítems.
+**Avance total:** Lotes 0 y 1 cerrados; 3 de 9 ítems.
 
 **Por qué este orden, en una línea por lote:**
 0. Sin el contrato actualizado, cada lote se revisa contra enunciados viejos; sin las redes en el repo, se pierden.
@@ -283,7 +283,7 @@ Mover el borrado de `.wal.compacting` antes del rename no lo detecta la simulaci
 
 > Objetivo: que la apertura del log nunca deje un commit detrás de un hueco, nunca borre la copia buena de un segmento y nunca sirva un archivo que ningún `fsync` de este proceso cubrió.
 
-#### DEF-167 · Alto · ⬜ Pendiente
+#### DEF-167 · Alto · ✅ Hecho
 **Problema.** Con `sealed_through_seq` por encima del fin real de `active.wal`, la apertura trunca el último frame dañado y el commit siguiente se escribe detrás de un hueco: la sala no vuelve a abrir, o las lecturas responden `BehindCompaction`. Hacen falta un crash entre `record_meta` y el rename de la rotación y, además, un daño en ese frame. Es una regresión de D81.
 **Solución.** D98.
 **Test exigido.**
@@ -298,7 +298,28 @@ Mover el borrado de `.wal.compacting` antes del rename no lo detecta la simulaci
 - la hidratación de la ventana de dedup;
 - la simulación de fallas y reaperturas del Lote 0.
 
-#### DEF-168 · Alto · ⬜ Pendiente
+**Hecho.** Como dice D98: la apertura sella `active.wal` si `active_end_seq < head_seq`, `seal_active_segment` graba el máximo con el `sealed_through_seq` anterior, y `append_record` rechaza con `WalCorruption`, antes de escribir, un registro que no continúa `active_end_seq` (el actor detiene la sala ante cualquier error de `append`). Si `active.wal` quedó vacío no hace falta nada: el próximo registro ya arranca en `head_seq + 1`.
+
+**Tests:**
+- `commit_after_a_damaged_last_frame_below_the_sealed_end_survives_a_reopen` (`log/tests/tiered_log.rs`): junta los dos `audit_d1_commit_*` del log en un bucle con `ram_max_ops` 6 (el commit siguiente sella por cantidad) y 7 (no sella). Suma una apertura cuyo sellado falla (en `log_meta.json`) y otra después, que muestra que el sellado no baja el piso. También comprueba que la operación perdida queda como un hueco (`BehindCompaction` desde 3).
+- `commit_acknowledged_after_a_truncated_frame_below_the_sealed_end_is_served` (`actor/tests/room.rs`): el de punta a punta con `CommitAck`. Daña el último frame invirtiendo el último byte del archivo.
+- La guarda de `append`: se extendió `append_into_empty_existing_active_wal_tracks_its_range_and_continues_it` (`log/tests/warm_disk.rs`, antes `..._tracks_start_seq`).
+
+**Mutaciones** (cada una restaurada después):
+- sacar el sellado al abrir: fallan los dos primeros tests;
+- grabar `end` sin el máximo: falla el primero;
+- sacar la guarda: falla el de `warm_disk`.
+
+**Interacciones:**
+- **Truncado de una escritura rota (D78):** sin un piso por encima, una cola rota deja `active_end_seq == head_seq` y no se sella nada. Los tests de escrituras rotas siguen pasando.
+- **Rotación y `record_meta` (D81):** el sellado al abrir es la misma `seal_active_segment`. Si falla, la apertura falla sin sellar y la siguiente lo reintenta (está en el test). Los pasos posteriores al rename son los de una rotación común, y ya los cubren la simulación y `rotation_that_fails_to_record_its_end_seals_nothing`.
+- **Compresión, cuota y poda:** el segmento sellado lleva su rango real, así que su nombre coincide con su contenido y el sidecar se dimensiona bien.
+- **Ventana de dedup:** los ids de `active.wal` se leen antes de sellar, y el sidecar del segmento nuevo se escribe con ellos. El test comprueba el id del commit 6 después de reabrir.
+- **HotBuffer y `tail_seq`:** `contiguous_suffix` deja la RAM vacía, porque el último de `active.wal` no es `head_seq`. `tail_seq` se calcula después de sellar.
+- **Simulación del Lote 0:** no daña frames, así que nunca llega al sellado. Sigue pasando, también en su versión larga.
+- **Tests de evidencia de `inv2/d` y `inv2/c-log`** (`audit_d8_*`, `audit2_d8_*`): no se trajeron. Ejercitan el piso después de rotaciones que sí renombraron, o con fallas en cada paso de una rotación; ahí `active_end_seq` nunca queda por debajo de `head_seq`, así que el sellado nuevo no corre, y la simulación ya cubre esos pasos.
+
+#### DEF-168 · Alto · ✅ Hecho
 **Problema.** Ante un cold y un warm del mismo rango, la apertura borra el cold sin leer ninguna de las dos copias, aunque el warm esté dañado y el cold verificado.
 **Solución.** En `SegmentIndex::scan`, verificar el cold con `read_cold_file`, exigiendo exactamente `start..=end`. Si verifica, se borra el warm; si no, el cold, como hoy. Ajustar `open_keeps_the_warm_original_of_an_interrupted_compression`, que fija la regla vieja, la frase de `ARCHITECTURE.md` §5.2 y el doc de `CompressedSegment::cleanup_error`.
 **Test exigido.** `audit2_d3_open_never_drops_a_verified_cold_copy_for_a_damaged_warm_one` (`inv2/c-log`), con daño en el frame 1 y en el 4.
@@ -310,7 +331,27 @@ Mover el borrado de `.wal.compacting` antes del rename no lo detecta la simulaci
 - la compresión siguiente, que hoy vuelve a comprimir el warm conservado;
 - el costo de la apertura: el cold solo se lee cuando hay un duplicado.
 
-#### DEF-169 · Alto · ⬜ Pendiente
+**Hecho.** `scan` lee el cold duplicado con `read_cold_file` (`holds_its_range`). Si su última operación es `end`, se queda: `SegmentIndex::insert` ahora devuelve la entrada reemplazada, y el warm pasa a los restos que se borran. Si es corrupto o le faltan operaciones, se borra el cold, como antes. **Desvío, confirmado con el dueño:** un error de E/S al leer el cold hace fallar la apertura en lugar de borrarlo, porque no prueba que esté dañado. Se ajustaron el doc de `scan`, el de `CompressedSegment::cleanup_error` y `ARCHITECTURE.md` §5.2.
+
+**Tests:**
+- `open_never_drops_a_verified_cold_copy_for_a_damaged_warm_one` (`inv2/c-log`), con daño en los frames 1 y 4.
+- `open_keeps_the_warm_original_of_an_interrupted_compression` pasó a `open_keeps_the_warm_original_when_its_cold_copy_does_not_verify`: el cold al que le falta la última operación se borra y el warm se vuelve a comprimir.
+
+- La rama de E/S, en el primero: con un fail point nuevo de una línea en `open_segment` (bajo `cfg(test)`, como los demás), la apertura falla y no borra ninguna de las dos copias.
+
+**Mutaciones:**
+- sin la verificación (la regla vieja), falla el primero;
+- con un error de E/S tratado como cold dañado, también falla el primero.
+
+**Interacciones:**
+- **`undeleted_warm` y `record_compression`:** al abrir, la lista está vacía. El warm se borra por los restos de `scan`, con el sync del directorio.
+- **Cuota:** `insert` descuenta el warm reemplazado de `total_bytes`.
+- **Sidecar `.ids`:** lo comparten las dos copias por el rango, y se conserva.
+- **Compresión siguiente:** si queda el cold, no hay nada que recomprimir. Si queda el warm, se recomprime (está en el test ajustado).
+- **Costo:** el cold se decodifica entero solo cuando hay un duplicado. Retiene todas sus operaciones, que es el patrón de DEF-170 (con un esquema ancho, un segmento no es una cota). Queda como interacción del Lote 2 (D99), que es donde se resuelve ese patrón.
+- **Poda:** los segmentos que terminan en `pruned_through_seq` o por debajo se descartan antes de llegar a la comparación, así que no se leen.
+
+#### DEF-169 · Alto · ✅ Hecho
 **Problema.** `SchemaRegistry::new` sirve `schemas/*.json` sin sincronizar `schemas/`. Una entrada que dejó un sync fallido se sirve después de reiniciar sin que ningún `fsync` de este proceso la haya cubierto.
 **Solución.**
 - `durable::sync_dir(schemas/)` en `SchemaRegistry::new`, antes de leer.
@@ -326,7 +367,32 @@ Mover el borrado de `.wal.compacting` antes del rename no lo detecta la simulaci
 - la recarga del registry;
 - el arranque con un symlink roto en `schemas/` (D67).
 
+**Hecho.** `durable::sync_dir` de `schemas/` en `SchemaRegistry::new` y de `snapshots/` al principio de `recover_snapshots`, antes de leer. **Desvío, confirmado con el dueño:** si falla el sync de `snapshots/`, falla el arranque, como con `schemas/` y con la apertura del log. El sync posterior al borrado sigue con un warning. D7 y `ARCHITECTURE.md` §5.2 (*Data Directory Lock*) suman los dos directorios.
+
+**Tests:**
+- `startup_syncs_schemas_left_unsynced_by_a_failed_write_before_serving_them` (`tests/schema_registry.rs`), para la registración y para `add_column`. Comprueba que el arranque falla si falla el sync, y que el siguiente sirve el esquema.
+- Para `snapshots/` se extendió `crash_between_promotion_and_install_recovers_the_newest_snapshot` (`relay/tests/recovery.rs`): con el sync armado, el arranque falla. Sin el fix, el sync posterior al borrado consumía el fail point con solo un warning.
+
+**Mutaciones:** sacar cada sync hace fallar su test.
+
+**Interacciones:**
+- **`lock_data_dir`:** sincroniza la entrada `schemas/` dentro de `data_dir`, y esto, lo que hay adentro. Los dos corren después de tomar `server.lock` (`main.rs`).
+- **Recarga del registry:** no hay recarga desde disco. `reload_schema_for_rooms` recarga las salas desde el registry en memoria.
+- **Symlink roto (D67):** el sync abre solo el directorio, y la lectura de cada entrada no cambia.
+- **Windows:** `sync_dir` no hace nada ahí, pero el fail point se mira antes, así que los tests corren igual.
+
 **Barato del mismo archivo (D92).** `parse_segment_filename` rechaza `start > end` (`segment_index.rs`, que este lote ya toca por DEF-168).
+
+**Hecho (barato).** Un nombre con `start > end` se ignora como cualquier nombre que no se puede interpretar. Se extendió `scan_indexes_both_tiers_in_sequence_order_and_ignores_other_files`. Mutación: sin la comparación, falla.
+
+**Cierre del lote:**
+- **Chequeos:** fmt, clippy del workspace, `cargo test --workspace` y `cargo doc` con `-D warnings`, en verde (Linux). No toca `core` ni `storage`, así que no hace falta el build de wasm32.
+- **Versiones largas del servidor** (`--release -- --ignored`): 13 tests en verde, en 374 s (Linux).
+- **Líneas de producción:** +67 −19.
+
+**Revisión de delta.** La hizo un agente aparte, de contexto fresco y solo lectura, que repitió cada mutación con la suite de la lib completa. No encontró hallazgos Altos ni Medios, ni otra invariante rota; tampoco violaciones de `GEMINI.md`. Probó además el caso de D98 en el que `active.wal` queda vacío, y pasa. Encontró dos Bajos:
+- ningún test cubría la rama de E/S de DEF-168: se agregó el fail point y el caso en el test;
+- la interacción con la cota de memoria de la apertura (INV-B1) faltaba en la lista: se sumó arriba y al Lote 2.
 
 ---
 
@@ -347,7 +413,8 @@ Mover el borrado de `.wal.compacting` antes del rename no lo detecta la simulaci
 - la validación de frames y el truncado de una escritura rota (D78): la ventana deslizante no puede saltear la validación de ningún frame;
 - el sellado al abrir del Lote 1 (D98), que usa `active_end_seq`;
 - el cobro de la HotBuffer (D73);
-- la lectura desde disco de lo que quedó fuera de la ventana.
+- la lectura desde disco de lo que quedó fuera de la ventana;
+- la verificación del cold duplicado del Lote 1 (DEF-168), que decodifica un segmento entero al abrir.
 
 ---
 

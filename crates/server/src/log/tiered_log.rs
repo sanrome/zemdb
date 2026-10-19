@@ -211,6 +211,16 @@ impl TieredLog {
             meta,
             _lock: lock,
         };
+        // Opening truncated a damaged last frame of `active.wal` below a recorded floor: the
+        // next record would not continue it, so it is sealed with its real range, and the lost
+        // operations are a gap.
+        if log
+            .warm_disk
+            .active_end_seq()
+            .is_some_and(|end| end < head_seq)
+        {
+            log.seal_active_segment()?;
+        }
         log.tail_seq = log.compute_tail_seq();
 
         Ok((log, mutations))
@@ -257,7 +267,8 @@ impl TieredLog {
     }
 
     /// Seals `active.wal` into a warm segment and indexes it. Its end is recorded in
-    /// `log_meta.json` first, so that no segment or sidecar name ever ends above it.
+    /// `log_meta.json` first, so that no segment or sidecar name ever ends above it, without
+    /// lowering a higher sealed end already recorded.
     fn seal_active_segment(&mut self) -> Result<Option<PathBuf>, ServerError> {
         let (Some(start_seq), Some(end_seq)) = (
             self.warm_disk.active_start_seq(),
@@ -266,7 +277,7 @@ impl TieredLog {
             return Ok(None);
         };
         self.record_meta(LogMeta {
-            sealed_through_seq: end_seq.get(),
+            sealed_through_seq: end_seq.get().max(self.meta.sealed_through_seq),
             ..self.meta
         })?;
         let bytes = self.warm_disk.active_len();

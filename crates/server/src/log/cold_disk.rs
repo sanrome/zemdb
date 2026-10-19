@@ -33,8 +33,9 @@ pub struct CompressedSegment {
     pub bytes: u64,
     /// Set when removing the warm original, or making its removal durable, failed. The cold
     /// segment replaces the warm one all the same, and every maintenance pass retries the
-    /// removal. A warm file still there when the log opens replaces its cold copy (compressed
-    /// again later), or is removed if that range was already pruned.
+    /// removal. A warm file still there when the log opens is removed if its cold copy holds
+    /// the whole segment or that range was already pruned; otherwise it replaces the cold copy
+    /// and is compressed again later.
     pub cleanup_error: Option<ServerError>,
 }
 

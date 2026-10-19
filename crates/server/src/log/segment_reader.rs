@@ -19,6 +19,7 @@ use zemdb_core::protocol::wal_frame::{
 };
 
 use crate::error::ServerError;
+use crate::fail_point;
 use crate::log::budget::{op_bytes, ReadBudget};
 use crate::log::io_probe::{self, IoEvent};
 
@@ -68,6 +69,7 @@ pub(crate) fn open_segment(
         return Ok(None);
     }
     io_probe::record(event, path.parent().unwrap_or_else(|| Path::new("")));
+    fail_point::check("open_segment", path)?;
     match File::open(path) {
         Ok(file) => Ok(Some(file)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),

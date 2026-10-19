@@ -17,6 +17,9 @@ fn scan_indexes_both_tiers_in_sequence_order_and_ignores_other_files() {
     .unwrap();
     std::fs::write(dir.path().join("active.wal"), [0u8; 40]).unwrap();
     std::fs::write(dir.path().join("segment_garbage.wal"), [0u8; 80]).unwrap();
+    // A name whose range ends before it starts.
+    let backwards = segment_path(dir.path(), seq(12), seq(11), Tier::Warm);
+    std::fs::write(backwards, [0u8; 80]).unwrap();
 
     let index = SegmentIndex::scan(dir.path(), SequenceNumber::new(0)).unwrap();
 

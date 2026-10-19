@@ -1,9 +1,9 @@
 use super::*;
-use crate::log::test_support::{frames, make_op, segment_file};
+use crate::log::test_support::{frames, make_op, segment_file, seq};
 use tempfile::tempdir;
 
 #[test]
-fn append_into_empty_existing_active_wal_tracks_start_seq() {
+fn append_into_empty_existing_active_wal_tracks_its_range_and_continues_it() {
     let dir = tempdir().unwrap();
     // A crash, or a torn write truncated to zero bytes, can leave an empty `active.wal` behind.
     std::fs::write(dir.path().join("active.wal"), b"").unwrap();
@@ -17,6 +17,14 @@ fn append_into_empty_existing_active_wal_tracks_start_seq() {
     assert_eq!(log.active_start_seq().map(|s| s.get()), Some(1));
     assert_eq!(log.active_end_seq().map(|s| s.get()), Some(2));
     assert_eq!(log.active_ops_count(), 2);
+
+    // A record that does not continue the last one is never written.
+    let len = log.active_len();
+    assert!(log.append_record(&make_op(4), None).is_err());
+    assert_eq!(
+        (log.active_end_seq(), log.active_len()),
+        (Some(seq(2)), len)
+    );
 }
 
 #[test]

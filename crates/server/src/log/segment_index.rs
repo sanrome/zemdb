@@ -1,5 +1,7 @@
 use crate::durable;
 use crate::error::ServerError;
+use crate::log::budget::ReadBudget;
+use crate::log::cold_disk::read_cold_file;
 use crate::log::io_probe::{self, IoEvent};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -74,9 +76,11 @@ impl SegmentIndex {
     /// Lists `segments_dir` once and indexes the sealed segments in it.
     ///
     /// Also finishes the cleanup of writes interrupted by a crash: temporary files
-    /// (`segment_*.tmp`, from a compression or a sidecar) are removed, and so is a cold segment
-    /// whose warm original still exists (the crash came between the rename of the cold segment
-    /// and the removal of the warm one; the warm segment is kept and compressed again later).
+    /// (`segment_*.tmp`, from a compression or a sidecar) are removed. When a cold segment and
+    /// its warm original both exist (the crash came between the rename of the cold segment and
+    /// the removal of the warm one), the warm one is removed if the cold one holds exactly its
+    /// range, every frame verified; otherwise the cold one is, and the warm one is compressed
+    /// again later.
     /// Segments ending at or below `pruned_through_seq` are removed with their sidecars too: a
     /// prune or a removal that failed or was interrupted left them behind. The directory is
     /// synced after removing anything.
@@ -145,10 +149,10 @@ impl SegmentIndex {
                 .segments
                 .get(&segment.start_seq.get())
                 .is_some_and(|warm| warm.end_seq == segment.end_seq);
-            if duplicate {
+            if duplicate && !holds_its_range(&segment)? {
                 leftovers.push(segment.path);
-            } else {
-                index.insert(segment);
+            } else if let Some(warm) = index.insert(segment).filter(|_| duplicate) {
+                leftovers.push(warm.path);
             }
         }
 
@@ -162,12 +166,12 @@ impl SegmentIndex {
         Ok(index)
     }
 
-    /// Adds `segment`, replacing the one with the same `start_seq`.
-    pub(crate) fn insert(&mut self, segment: SegmentEntry) {
+    /// Adds `segment`, replacing and returning the one with the same `start_seq`.
+    pub(crate) fn insert(&mut self, segment: SegmentEntry) -> Option<SegmentEntry> {
         self.total_bytes = self.total_bytes.saturating_add(segment.disk_bytes());
-        if let Some(replaced) = self.segments.insert(segment.start_seq.get(), segment) {
-            self.total_bytes = self.total_bytes.saturating_sub(replaced.disk_bytes());
-        }
+        let replaced = self.segments.insert(segment.start_seq.get(), segment)?;
+        self.total_bytes = self.total_bytes.saturating_sub(replaced.disk_bytes());
+        Some(replaced)
     }
 
     /// Removes the segment starting at `start_seq`.
@@ -208,6 +212,22 @@ impl SegmentIndex {
     /// Total size of the indexed segment files and their sidecars.
     pub(crate) fn total_bytes(&self) -> u64 {
         self.total_bytes
+    }
+}
+
+/// Whether the cold `segment` holds exactly the operations of its name, every frame verified.
+/// An I/O error is returned instead: it does not prove the copy damaged.
+fn holds_its_range(segment: &SegmentEntry) -> Result<bool, ServerError> {
+    let all = &mut ReadBudget::ops(usize::MAX);
+    match read_cold_file(
+        &segment.path,
+        Some(segment.start_seq),
+        SequenceNumber::new(0),
+        all,
+    ) {
+        Ok((ops, _)) => Ok(ops.last().map(|op| op.seq) == Some(segment.end_seq)),
+        Err(ServerError::WalCorruption(_)) => Ok(false),
+        Err(err) => Err(err),
     }
 }
 
@@ -283,13 +303,15 @@ pub(crate) fn segment_path(
     ))
 }
 
-/// `(start, end)` of a `tier` segment file name, the inverse of [`segment_path`].
+/// `(start, end)` of a `tier` segment file name, the inverse of [`segment_path`], or `None` if
+/// the name does not parse or its range ends before it starts.
 pub(crate) fn parse_segment_filename(name: &str, tier: Tier) -> Option<(u64, u64)> {
     let core = name
         .strip_prefix("segment_")?
         .strip_suffix(tier.extension())?;
     let (start, end) = core.split_once('_')?;
-    Some((start.parse().ok()?, end.parse().ok()?))
+    let (start, end) = (start.parse().ok()?, end.parse().ok()?);
+    (start <= end).then_some((start, end))
 }
 
 #[cfg(test)]
