@@ -5,8 +5,6 @@
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use futures::future::Either;
-use std::future::ready;
 use zemdb_core::id::{RoomId, SequenceNumber};
 use zemdb_core::protocol::messages::{ClientMessage, ServerMessage};
 
@@ -96,27 +94,21 @@ pub async fn request_chunk(
     if let Err(err) = ensure_payload_identity(&room_id, None, &msg_room_id, None) {
         return binary_error(Some(correlation_id), Some(room_id), err);
     }
-    // The chunk is read from its file once its frame is reserved, and the frame is not held
-    // while the first chunk waits for the room's log range (later chunks never ask for it).
-    let bounds = match snapshot_hash {
-        None => Either::Left(ready(log_bounds(&state, &room_id).await)),
-        Some(_) => Either::Right(log_bounds(&state, &room_id)),
+    // The first chunk asks for the room's log range after picking the snapshot, and before its
+    // frame is reserved; the chunk is read from its file once the frame is reserved.
+    let relay = &state.snapshot_relay;
+    let bounds = log_bounds(&state, &room_id);
+    let picked = match relay
+        .pick_chunk(&room_id, chunk_index, chunk_size, snapshot_hash, bounds)
+        .await
+    {
+        Ok(picked) => picked,
+        Err(err) => return binary_error(Some(correlation_id), Some(room_id), err),
     };
     let Some(reservation) = reserve_frame(&state, (room_id.clone(), uploader)) else {
         return no_budget(correlation_id, room_id.clone());
     };
-    let result = state
-        .snapshot_relay
-        .get_chunk(
-            correlation_id,
-            &room_id,
-            chunk_index,
-            chunk_size,
-            snapshot_hash,
-            bounds,
-        )
-        .await;
-    match result {
+    match relay.read_picked(correlation_id, &room_id, picked).await {
         Ok(chunk_msg) => budgeted_response(reservation, &chunk_msg),
         Err(err) => binary_error(Some(correlation_id), Some(room_id), err),
     }

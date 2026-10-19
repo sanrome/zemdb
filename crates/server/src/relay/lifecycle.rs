@@ -72,13 +72,13 @@ impl SnapshotRelay {
             }
         }
 
-        // Forget the locks of rooms with nothing in progress. A lock that some request holds
-        // a reference to is kept, so every request of a room shares one lock.
+        // Forget the locks of rooms with nothing in progress or remembered. A lock that some
+        // request holds a reference to is kept, so every request of a room shares one lock.
         self.slots.retain(|_, slot| {
             Arc::strong_count(slot) > 1
                 || slot
                     .try_lock()
-                    .map(|guard| guard.upload.is_some())
+                    .map(|guard| guard.upload.is_some() || guard.expired.is_some())
                     .unwrap_or(true)
         });
     }
@@ -98,7 +98,8 @@ impl SnapshotRelay {
         })
     }
 
-    /// Drops the room's expired snapshot and idle upload.
+    /// Drops the room's expired snapshot and idle upload, and forgets an idle upload's
+    /// deadline once its uploader may start over.
     pub(super) async fn expire_locked(&self, room_id: &RoomId, slot: &mut RoomSlot) {
         let now = Instant::now();
         let mut doomed = Vec::new();
@@ -108,8 +109,10 @@ impl SnapshotRelay {
         {
             doomed.push(expired.path);
         }
+        slot.expired.take_if(|e| now >= e.forget_at);
         if let Some(idle) = slot.upload.take_if(|u| u.is_idle(now)) {
             info!(room = %room_id, seq = %idle.head_seq, "Discarding idle snapshot upload");
+            slot.expired = Some(idle.expired());
             doomed.push(idle.path);
         }
         self.remove_files(doomed, ()).await;

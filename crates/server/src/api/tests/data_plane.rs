@@ -24,6 +24,7 @@ struct Fixture {
     dir: TempDir,
     app: axum::Router,
     manager: std::sync::Arc<crate::RoomManager>,
+    relay: std::sync::Arc<crate::relay::SnapshotRelay>,
     room_id: RoomId,
     client_id: ClientId,
     token: String,
@@ -100,6 +101,7 @@ impl Fixture {
         let fx = Self {
             app: build_router(state.app_state()),
             manager: state.manager,
+            relay: state.relay,
             dir,
             room_id,
             client_id,
@@ -178,6 +180,42 @@ impl Fixture {
             from_seq: SequenceNumber::new(from_seq),
             max_batch_size: 100,
         }
+    }
+
+    /// The first chunk of a download, anchored to `snapshot_hash` if given.
+    fn first_chunk(&self, snapshot_hash: Option<[u8; 32]>) -> ClientMessage {
+        ClientMessage::RequestSnapshotChunk {
+            correlation_id: CorrelationId::new(3),
+            room_id: self.room_id.clone(),
+            chunk_index: 0,
+            chunk_size: 0,
+            snapshot_hash,
+        }
+    }
+
+    /// Has the snapshot worker stage a snapshot at `seq` against `bounds`.
+    async fn stage_snapshot(
+        &self,
+        seq: u64,
+        bounds: impl std::future::Future<Output = Result<crate::relay::LogBounds, ServerError>>,
+    ) -> [u8; 32] {
+        let body = b"snapshot";
+        let header = zemdb_core::protocol::snapshot_envelope::SnapshotEnvelopeHeader::for_body(
+            zemdb_core::protocol::snapshot_envelope::SnapshotCompression::Raw,
+            body.len() as u32,
+            body,
+        );
+        let data = [&header.to_bytes()[..], body].concat();
+        self.relay
+            .stage_snapshot(
+                &self.room_id,
+                &Uploader::Admin,
+                SequenceNumber::new(seq),
+                data.into(),
+                bounds,
+            )
+            .await
+            .unwrap()
     }
 
     /// Posts a commit, expecting it to be acknowledged.
@@ -511,14 +549,23 @@ async fn responses_take_a_frame_of_the_clients_budget_before_they_are_built() {
         .iter()
         .all(|response| response.status() == StatusCode::OK));
 
-    // Then nothing is: a snapshot chunk, before the relay is asked (it has none to read).
-    let chunk = ClientMessage::RequestSnapshotChunk {
-        correlation_id: CorrelationId::new(3),
-        room_id: fx.room_id.clone(),
-        chunk_index: 0,
-        chunk_size: 0,
-        snapshot_hash: None,
+    // Then nothing is: a snapshot chunk, before the relay reads it.
+    let bounds = crate::relay::LogBounds {
+        tail_seq: SequenceNumber::new(1),
+        head_seq: SequenceNumber::new(1),
+        unrestorable_through: None,
     };
+    let hash = fx.stage_snapshot(1, std::future::ready(Ok(bounds))).await;
+    let read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let read_flag = std::sync::Arc::clone(&read);
+    fail_point::arm_hook(
+        "relay_read_chunk",
+        &fx.dir.path().join("snapshots"),
+        move || {
+            read_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        },
+    );
+    let chunk = fx.first_chunk(Some(hash));
     for (endpoint, msg) in [
         ("schema", get_schema.clone()),
         ("register", fx.register_msg()),
@@ -529,6 +576,7 @@ async fn responses_take_a_frame_of_the_clients_budget_before_they_are_built() {
         let expected = StatusCode::SERVICE_UNAVAILABLE;
         assert_error(status, expected, ErrorCode::Unavailable, &reply);
     }
+    assert!(!read.load(std::sync::atomic::Ordering::SeqCst));
     // A commit, durable, is acknowledged without its catch-up, and so is its retry.
     for _ in 0..2 {
         let (status, _, reply) = fx.post("commit", &fx.commit(1, 0)).await;
@@ -674,4 +722,65 @@ fn response_that_cannot_be_encoded_is_an_internal_error_frame() {
         ErrorCode::Internal,
         &decode_message(&body).unwrap(),
     );
+}
+
+/// Posts the first chunk of a download, unanchored, with `meanwhile` run to completion right
+/// after the relay picks the snapshot to serve, before it asks for the log range.
+async fn first_chunk_while(
+    fx: &std::sync::Arc<Fixture>,
+    meanwhile: impl std::future::Future<Output = ()> + Send + 'static,
+) -> ServerMessage {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let runtime = tokio::runtime::Handle::current();
+    let snapshots = fx.dir.path().join("snapshots");
+    fail_point::arm_hook("first_chunk_picked", &snapshots, move || {
+        runtime.spawn(async move {
+            meanwhile.await;
+            let _ = done_tx.send(());
+        });
+        let done = tokio::task::block_in_place(|| done_rx.recv_timeout(Duration::from_secs(10)));
+        assert!(done.is_ok());
+    });
+    fx.post("snapshot/chunk", &fx.first_chunk(None)).await.2
+}
+
+/// The first chunk checks the snapshot it serves against the log range read after picking it:
+/// one below a gap that a sync found in between is dropped instead of served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_chunk_does_not_serve_a_snapshot_below_a_gap_found_after_it_was_picked() {
+    let fx = std::sync::Arc::new(Fixture::with(|config| config.ram_max_ops = 2).await);
+    for n in 1..=6u8 {
+        fx.commit_ok(&fx.commit(n, u64::from(n) - 1)).await;
+    }
+    fx.stage_snapshot(2, fx.manager.log_bounds(&fx.room_id))
+        .await;
+    let other = std::sync::Arc::clone(&fx);
+    let reply = first_chunk_while(&fx, async move {
+        let room = crate::actor::room::room_dir(other.dir.path(), &other.room_id);
+        std::fs::remove_file(room.join("segments/segment_0000000000000003_0000000000000004.wal"))
+            .unwrap();
+        let (_, _, reply) = other.post("sync", &other.sync(2)).await;
+        assert!(
+            matches!(
+                reply,
+                ServerMessage::Error {
+                    code: ErrorCode::BehindCompaction,
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+    })
+    .await;
+    assert!(
+        matches!(
+            reply,
+            ServerMessage::Error {
+                code: ErrorCode::RoomNotFound,
+                ..
+            }
+        ),
+        "{reply:?}"
+    );
+    assert_eq!(fx.relay.active_snapshot_seq(&fx.room_id), None);
 }

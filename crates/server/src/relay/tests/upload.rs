@@ -515,13 +515,15 @@ async fn snapshot_worker_preempts_a_member_upload_at_the_same_seq() {
         .await
         .unwrap();
 
-    // Another member cannot replace it at the same seq...
+    // Another member cannot replace it at the same seq, nor send a chunk into it...
     let honest = three_part_snapshot(2);
-    assert_superseded(
-        relay
-            .stage_chunk(part_by(member("alice"), 10, 0, &honest), bounds(0, 10))
-            .await,
-    );
+    for snapshot in [&honest, &bogus] {
+        assert_superseded(
+            relay
+                .stage_chunk(part_by(member("alice"), 10, 1, snapshot), bounds(0, 10))
+                .await,
+        );
+    }
 
     // ...but the snapshot worker can, and completes its upload.
     for index in 0..3 {

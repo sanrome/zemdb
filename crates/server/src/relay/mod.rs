@@ -41,7 +41,7 @@ use crate::durable::{self, remove_file_if_exists};
 use crate::error::ServerError;
 use crate::fail_point;
 use files::{run_blocking, UPLOADS_DIR};
-use upload::UploadSession;
+use upload::{ExpiredUpload, UploadSession};
 
 /// Metadata of the active snapshot of a room. The bytes stay in the file.
 #[derive(Debug, Clone)]
@@ -64,6 +64,9 @@ impl StagedSnapshot {
 struct RoomSlot {
     /// The single multipart upload allowed per room.
     upload: Option<UploadSession>,
+    /// The last upload that went idle, while its uploader may not restart it with a new
+    /// deadline.
+    expired: Option<ExpiredUpload>,
     /// Set when the room is deleted. A request that obtained this slot before the deletion
     /// must not stage anything once it gets the lock.
     purged: bool,

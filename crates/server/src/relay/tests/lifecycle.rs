@@ -20,6 +20,9 @@ async fn idle_upload_expires_and_its_file_is_deleted() {
     tokio::time::advance(Duration::from_secs(1)).await;
     relay.cleanup_expired().await;
     assert!(files_in(&uploads_dir(&dir)).is_empty());
+    // The room keeps the uploader's deadline for another idle timeout, then forgets its lock.
+    tokio::time::advance(UPLOAD_IDLE_TIMEOUT).await;
+    relay.cleanup_expired().await;
     assert!(relay.slots.is_empty(), "idle room locks are forgotten");
 
     // The upload is gone, and its sequence is free for the other members.
@@ -45,15 +48,38 @@ async fn upload_that_keeps_progressing_or_restarts_expires_at_its_deadline() {
     let step = UPLOAD_IDLE_TIMEOUT - Duration::from_secs(1);
     tokio::time::advance(step).await;
     upload_parts(&relay, 10, [1], &snap, (0, 10)).await;
-    // The uploader restarts its upload with another snapshot: the deadline stays.
+    // The uploader restarts its upload with another snapshot: the deadline stays. So does
+    // completing it with a chunk that does not verify, and starting over.
     tokio::time::advance(step).await;
-    upload_parts(&relay, 10, [0], &three_part_snapshot(2), (0, 10)).await;
+    let second = three_part_snapshot(2);
+    let mut corrupt = second.clone();
+    corrupt.0[corrupt.3[2].start] ^= 0xFF;
+    upload_parts(&relay, 10, [0, 1], &second, (0, 10)).await;
+    assert!(relay
+        .stage_chunk(part_of(10, 2, &corrupt), bounds(0, 10))
+        .await
+        .is_err());
+    upload_parts(&relay, 10, [0], &second, (0, 10)).await;
     assert_eq!(relay.upload_in_progress(&room()), Some(seq(10)));
 
     tokio::time::advance(max - 2 * step).await;
     assert_eq!(relay.upload_in_progress(&room()), None);
     relay.cleanup_expired().await;
     assert!(files_in(&uploads_dir(&dir)).is_empty());
+
+    // Nor does restarting it once it expired, until it has been idle for the idle timeout.
+    for wait in [Duration::ZERO, UPLOAD_IDLE_TIMEOUT - Duration::from_secs(1)] {
+        tokio::time::advance(wait).await;
+        assert_superseded(
+            relay
+                .stage_chunk(part_of(10, 0, &snap), bounds(0, 10))
+                .await,
+        );
+        assert_eq!(relay.upload_in_progress(&room()), None);
+    }
+    tokio::time::advance(Duration::from_secs(1)).await;
+    upload_parts(&relay, 10, [0], &snap, (0, 10)).await;
+    assert_eq!(relay.upload_in_progress(&room()), Some(seq(10)));
 }
 
 #[tokio::test(start_paused = true)]

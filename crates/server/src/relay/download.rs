@@ -10,17 +10,27 @@ use super::files::{read_range, run_blocking};
 use super::types::{LogBounds, MAX_CHUNK_BYTES, MIN_CHUNK_BYTES};
 use super::{bad_request, SnapshotRelay, StagedSnapshot};
 use crate::error::ServerError;
+use crate::fail_point;
+
+/// A chunk of the active snapshot that [`SnapshotRelay::pick_chunk`] picked, to be read with
+/// [`SnapshotRelay::read_picked`].
+#[derive(Debug)]
+pub(crate) struct PickedChunk {
+    staged: StagedSnapshot,
+    chunk_index: u32,
+    total_chunks: u32,
+    offset: u64,
+    len: u64,
+}
 
 impl SnapshotRelay {
-    /// Retrieves one chunk of the active snapshot, read from its file.
+    /// Retrieves one chunk of the active snapshot, read from its file: [`pick_chunk`] followed
+    /// by [`read_picked`].
     ///
-    /// `chunk_size` is clamped to [`MIN_CHUNK_BYTES`]..=[`MAX_CHUNK_BYTES`]. Only the first
-    /// chunk may be requested without `snapshot_hash`; that request also checks, through
-    /// `log_bounds`, that the room log can still continue from the snapshot, and drops a
-    /// snapshot that fell below the retained range or below a known gap. With `snapshot_hash`, the
-    /// request is anchored to that snapshot: if it is no longer the active one the result is
-    /// `SnapshotSuperseded`.
-    pub async fn get_chunk(
+    /// [`pick_chunk`]: Self::pick_chunk
+    /// [`read_picked`]: Self::read_picked
+    #[cfg(test)]
+    pub(crate) async fn get_chunk(
         &self,
         correlation_id: CorrelationId,
         room_id: &RoomId,
@@ -29,6 +39,28 @@ impl SnapshotRelay {
         snapshot_hash: Option<[u8; 32]>,
         log_bounds: impl Future<Output = Result<LogBounds, ServerError>>,
     ) -> Result<ServerMessage, ServerError> {
+        let picked = self
+            .pick_chunk(room_id, chunk_index, chunk_size, snapshot_hash, log_bounds)
+            .await?;
+        self.read_picked(correlation_id, room_id, picked).await
+    }
+
+    /// Picks one chunk of the active snapshot, without reading it.
+    ///
+    /// `chunk_size` is clamped to [`MIN_CHUNK_BYTES`]..=[`MAX_CHUNK_BYTES`]. Only the first
+    /// chunk may be requested without `snapshot_hash`; that request also checks, through
+    /// `log_bounds` (awaited once the snapshot is picked), that the room log can still continue
+    /// from the snapshot, and drops a snapshot that fell below the retained range or below a
+    /// known gap. With `snapshot_hash`, the request is anchored to that snapshot: if it is no
+    /// longer the active one the result is `SnapshotSuperseded`.
+    pub(crate) async fn pick_chunk(
+        &self,
+        room_id: &RoomId,
+        chunk_index: u32,
+        chunk_size: u32,
+        snapshot_hash: Option<[u8; 32]>,
+        log_bounds: impl Future<Output = Result<LogBounds, ServerError>>,
+    ) -> Result<PickedChunk, ServerError> {
         if chunk_index > 0 && snapshot_hash.is_none() {
             return Err(bad_request(
                 "snapshot_hash is required after the first chunk; take it from the reply to chunk 0",
@@ -49,6 +81,7 @@ impl SnapshotRelay {
         };
 
         if snapshot_hash.is_none() {
+            fail_point::hook("first_chunk_picked", &self.snapshots_dir);
             let bounds = log_bounds.await?;
             if !bounds.admits(staged.head_seq) {
                 self.drop_stale(room_id, &staged).await;
@@ -63,11 +96,31 @@ impl SnapshotRelay {
                 "Requested chunk index {chunk_index} exceeds total chunks {total_chunks}"
             )));
         }
-
         let offset = u64::from(chunk_index) * chunk_size;
-        let len = chunk_size.min(staged.total_bytes - offset);
-        let data = self.read_chunk(room_id, &staged, offset, len).await?;
+        Ok(PickedChunk {
+            len: chunk_size.min(staged.total_bytes - offset),
+            staged,
+            chunk_index,
+            total_chunks,
+            offset,
+        })
+    }
 
+    /// Reads the chunk that [`pick_chunk`](Self::pick_chunk) picked.
+    pub(crate) async fn read_picked(
+        &self,
+        correlation_id: CorrelationId,
+        room_id: &RoomId,
+        picked: PickedChunk,
+    ) -> Result<ServerMessage, ServerError> {
+        let PickedChunk {
+            staged,
+            chunk_index,
+            total_chunks,
+            offset,
+            len,
+        } = picked;
+        let data = self.read_chunk(room_id, &staged, offset, len).await?;
         Ok(ServerMessage::SnapshotChunk {
             correlation_id,
             room_id: room_id.clone(),
@@ -90,6 +143,7 @@ impl SnapshotRelay {
         offset: u64,
         len: u64,
     ) -> Result<Vec<u8>, ServerError> {
+        fail_point::hook("relay_read_chunk", &self.snapshots_dir);
         let path = staged.path.clone();
         match run_blocking(move || Ok(read_range(&path, offset, len))).await? {
             Ok(data) => Ok(data),

@@ -107,12 +107,34 @@ impl UploadSession {
         *uploader == Uploader::Admin || self.uploader == *uploader
     }
 
-    /// Whether the upload stopped progressing: no new chunk for [`UPLOAD_IDLE_TIMEOUT`] (a
-    /// chunk resent is no progress), or past its deadline.
-    pub(super) fn is_idle(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.last_chunk_at) >= UPLOAD_IDLE_TIMEOUT
-            || now >= self.deadline
+    /// When the upload stops progressing: after [`UPLOAD_IDLE_TIMEOUT`] without a new chunk (a
+    /// chunk resent is no progress), or at its deadline.
+    fn idle_at(&self) -> Instant {
+        self.deadline.min(self.last_chunk_at + UPLOAD_IDLE_TIMEOUT)
     }
+
+    /// Whether the upload stopped progressing (see [`idle_at`](Self::idle_at)).
+    pub(super) fn is_idle(&self, now: Instant) -> bool {
+        now >= self.idle_at()
+    }
+
+    /// What the room remembers of this upload once it is discarded for going idle.
+    pub(super) fn expired(&self) -> ExpiredUpload {
+        ExpiredUpload {
+            uploader: self.uploader.clone(),
+            deadline: self.deadline,
+            forget_at: self.idle_at() + UPLOAD_IDLE_TIMEOUT,
+        }
+    }
+}
+
+/// The uploader and deadline of a room's last upload that went idle, remembered until
+/// [`UPLOAD_IDLE_TIMEOUT`] after it did: a new upload of that uploader keeps the deadline.
+#[derive(Debug)]
+pub(super) struct ExpiredUpload {
+    uploader: Uploader,
+    deadline: Instant,
+    pub(super) forget_at: Instant,
 }
 
 /// Counts one single-request upload of a room for as long as it lives.
@@ -271,7 +293,8 @@ impl SnapshotRelay {
             Some(current)
                 if current.head_seq == head_seq
                     && current.layout == layout
-                    && current.snapshot_hash == snapshot_hash =>
+                    && current.snapshot_hash == snapshot_hash
+                    && current.yields_to(&uploader) =>
             {
                 true
             }
@@ -292,14 +315,25 @@ impl SnapshotRelay {
         if !continues {
             bounds.check(head_seq, ServerError::BadRequest)?;
             self.check_newer_than_active(&room_id, head_seq)?;
-            let mut deadline = Instant::now() + self.max_upload_duration;
+            // Restarting its own upload, even one that went idle, gives the uploader no more
+            // time.
+            let own_deadline = [
+                guard.upload.as_ref().map(|u| (&u.uploader, u.deadline)),
+                guard.expired.as_ref().map(|e| (&e.uploader, e.deadline)),
+            ]
+            .into_iter()
+            .flatten()
+            .find_map(|(by, deadline)| (*by == uploader).then_some(deadline));
+            if own_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(ServerError::SnapshotSuperseded(format!(
+                    "This uploader's upload for room {room_id} reached its deadline; it may \
+                     start another one once {UPLOAD_IDLE_TIMEOUT:?} have passed"
+                )));
+            }
+            let deadline = own_deadline.unwrap_or(Instant::now() + self.max_upload_duration);
             if let Some(replaced) = guard.upload.take() {
                 info!(room = %room_id, old_seq = %replaced.head_seq, new_seq = %head_seq,
                     "Replacing snapshot upload in progress");
-                // Restarting its own upload gives the uploader no more time.
-                if replaced.uploader == uploader {
-                    deadline = replaced.deadline;
-                }
                 self.remove_files(vec![replaced.path], ()).await;
             }
             guard.upload = Some(UploadSession {
@@ -334,10 +368,12 @@ impl SnapshotRelay {
             return Ok(false);
         }
 
-        // Last chunk: the session ends here, whatever the outcome.
+        // Last chunk: the session ends here, whatever the outcome. Unless it installs, the
+        // uploader keeps its deadline as if the upload had gone idle.
         let Some(session) = guard.upload.take() else {
             return Err(ServerError::Internal("Upload session vanished".to_string()));
         };
+        guard.expired = Some(session.expired());
         // The upload anchored the retained range, but the range can still move (TTL and size
         // compaction, or pruning before the upload started): the snapshot was superseded, and
         // a new upload may be tried.
@@ -365,6 +401,7 @@ impl SnapshotRelay {
             },
         )
         .await?;
+        guard.expired = None;
         Ok(true)
     }
 

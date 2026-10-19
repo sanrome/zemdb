@@ -91,7 +91,7 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 
 ### Resumen
 
-Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md) (ver §1.5), con los lotes del [plan de la Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (cerrados: 0 a 3) y las decisiones D92 a D101.
+Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md) (ver §1.5), con los lotes del [plan de la Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (cerrados: 0 a 4) y las decisiones D92 a D102.
 
 | ID | Invariante | ★ | Si se rompe | Estado |
 |---|---|---|---|---|
@@ -123,16 +123,16 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-R1** | La poda por cursores nunca borra lo que alguien necesita | ★ | Alto | ✅ |
 | **INV-R2** | El rango retenido es contiguo y su cola no retrocede | | Medio | ✅ |
 | **INV-R3** | Perder estado volátil del roster solo cuesta retención o re-registro | | Medio | ✅ |
-| **INV-R4** | Todo cliente que se queda atrás termina pudiendo ponerse al día | | Medio | ❌ (Lote 4; DEF-181 al backlog) |
-| **INV-R5** | Solo se anuncian y sirven snapshots usables, y una descarga es de un solo snapshot | | Medio | ❌ (Lote 4) |
+| **INV-R4** | Todo cliente que se queda atrás termina pudiendo ponerse al día | | Medio | ❌ Bajo (backlog) |
+| **INV-R5** | Solo se anuncian y sirven snapshots usables, y una descarga es de un solo snapshot | | Medio | ✅ |
 | **INV-R6** | Un snapshot solo se ofrece a la encarnación que lo aceptó | | Medio | ✅ |
 | **INV-R7** | Una subida confirmada es usable | | Bajo | ❌ Bajo (backlog) |
 | **INV-A1** | Nadie actúa sobre otra sala ni como otro cliente | ★ | Alto | ✅ |
 | **INV-A2** | Nada se decodifica antes de autenticar, salvo lo acotado de `/register` | | Alto | ✅ |
-| **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio | ❌ (Lote 4; DEF-181 al backlog) |
+| **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio | ❌ Bajo (backlog) |
 | **INV-A4** | Ningún identificador produce rutas fuera de `data_dir` | ★ | Alto | ✅ |
 | **INV-B1** | La memoria por request está acotada | ★ | Alto | ✅ |
-| **INV-B2** | Nada se retiene sin plazo | | Medio | ❌ (Lote 4) |
+| **INV-B2** | Nada se retiene sin plazo | | Medio | ✅ |
 | **INV-B3** | La memoria, el disco y los FDs del servidor están acotados por la configuración | | Medio | ✅ |
 | **INV-B4** | El costo por request del actor no depende de la historia | | Medio | ✅ |
 | **INV-B5** | Ningún cliente acapara un recurso global | | Medio | ✅ |
@@ -312,7 +312,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-R4 · Todo cliente que se queda atrás termina pudiendo ponerse al día
 **Enunciado.** Mientras exista al menos un cliente `Connected` que siga el protocolo y cuyo estado esté más allá de todo hueco del log, todo cliente `Bootstrapping` termina viendo un snapshot usable anunciado, puede descargarlo y ponerse al día desde él. No hay estados sin salida: snapshot por debajo de un hueco, subida que falla al completarse, designado que se va, snapshot vencido, demanda vencida.
-**Sostenida por.** Demanda de snapshot y designación (§5.2 *Snapshot Demand*), D61, D62. El relay solo descarta un snapshot activo si no es usable, si venció o si su sala se borró o se recreó (D96). *Pendiente (Lote 4):* que reiniciar una subida al vencer su tope no conserve la designación (D102, DEF-174), y que el chunk 0 no descarte un snapshot usable comparándolo con un rango leído antes de elegirlo (DEF-176).
+**Sostenida por.** Demanda de snapshot y designación (§5.2 *Snapshot Demand*), D61, D62. El relay solo descarta un snapshot activo si no es usable, si venció o si su sala se borró o se recreó (D96). Reiniciar una subida al vencer su tope no conserva la designación (D102), y el chunk 0 compara el snapshot con un rango leído después de elegirlo.
 **Ruptura Baja abierta.** Las subidas chicas fallidas de un miembro pueden congelar la designación (DEF-181, backlog).
 **Cómo intentar romperla.** Cada transición de la demanda combinada con reinicios; el único `Connected` es el designado y se desconecta; la subida completa justo cuando TTL mueve la cola; hueco que aparece después de anunciar el snapshot.
 **Automatizable.** Simulación con muchos clientes y crashes: propiedad de liveness acotada ("en N ticks"). Está en el repo desde el Lote 0 de la Fase 3.9.
@@ -320,7 +320,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-R5 · Solo se anuncian y sirven snapshots usables, y una descarga es de un solo snapshot
 **Enunciado.** `Registered`, `HeartbeatAck`, `snapshot_available` y el chunk 0 sin ancla (uno anclado se sirve sin mirar el rango) solo ofrecen un snapshot con `tail_seq - 1 ≤ S ≤ head_seq` que no esté por debajo de un hueco conocido (en o por debajo de un cursor desde el que un sync encontró un hueco). Una descarga anclada por hash recibe chunks de un único snapshot, o `SnapshotSuperseded`; nunca bytes mezclados de dos. Mientras un snapshot está activo, el relay no lo reemplaza por uno de secuencia menor (después de que vence, si al arrancar su archivo es ilegible, o después de la purga de `delete_room` o `create_room`, puede activarse otro menor).
-**Sostenida por.** §6 *Multipart Chunked Snapshot Transfer*, *Snapshot Relay*; la marca de hueco que el actor le informa al relay: el mayor cursor desde el que un sync encontró un hueco (§5.2 *Damaged Segments*). *Pendiente (Lote 4):* que el chunk 0 compare con un rango leído después de elegir el snapshot (DEF-176).
+**Sostenida por.** §6 *Multipart Chunked Snapshot Transfer*, *Snapshot Relay*; la marca de hueco que el actor le informa al relay: el mayor cursor desde el que un sync encontró un hueco (§5.2 *Damaged Segments*). El chunk 0 sin ancla pide el rango después de elegir el snapshot.
 **Cómo intentar romperla.** Reemplazo del snapshot durante una descarga; reemplazo con la misma secuencia y otro contenido; reinicio con archivos `.snap` de distintas secuencias, vencidos o ilegibles; borrado y recreación de la sala durante una descarga; un snapshot marcado por un hueco que se pide desde el chunk 0.
 
 #### INV-R6 · Un snapshot solo se ofrece a la encarnación que lo aceptó
@@ -332,7 +332,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 **Enunciado.** Si el relay confirma una subida (`SnapshotStaged` o `staged: true`), el snapshot es usable en ese momento (INV-R5). Si el rango retenido se movió y ya no lo es, la respuesta es `SnapshotSuperseded`.
 **Sostenida por.** D61 para las subidas de varios chunks; las de un solo chunk anclan la poda mientras se lee el rango, como las de un solo request (§5.2 *Snapshot Retention Anchor*). Contra la poda por TTL o cuota, que ignora el ancla, el piso que el actor publica al abrirse, después de cada pasada de mantenimiento y al encontrar un hueco: el relay lo compara justo antes de instalar (§6 *Acceptance*).
 **Cómo intentar romperla.** Podas por cursores, TTL y cuota entre la consulta del rango y la instalación, en subidas de un request, de un chunk y de varios.
-**Límite aceptado.** Una pasada de TTL o cuota publica el piso después de borrar los segmentos, así que una instalación que cae en esos milisegundos puede confirmar un snapshot que ya no es usable. Tampoco se mira el piso al reenviar un chunk de una subida ya instalada, que responde `staged: true`. En los dos casos el snapshot no se anuncia ni se sirve (INV-R5, desde el Lote 4 de la Fase 3.10: hasta entonces el chunk 0 puede servirlo, DEF-176); el costo es que la demanda sigue y se pide otra subida.
+**Límite aceptado.** Una pasada de TTL o cuota publica el piso después de borrar los segmentos, así que una instalación que cae en esos milisegundos puede confirmar un snapshot que ya no es usable. Tampoco se mira el piso al reenviar un chunk de una subida ya instalada, que responde `staged: true`. En los dos casos el snapshot no se anuncia ni se sirve (INV-R5); el costo es que la demanda sigue y se pide otra subida.
 **Rupturas Bajas abiertas.** El piso se olvida cuando el actor se detiene, y una subida en vuelo se confirma sin chequearlo (DEF-177); el reintento de una subida en un solo request no mira el piso (DEF-178). Las dos, en el backlog.
 
 ### 3.5. Aislamiento y autorización
@@ -349,7 +349,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-A3 · Los efectos de un miembro quedan confinados a su sala
 **Enunciado.** Un miembro hostil de una sala no puede degradar otras salas más allá de lo que acotan los límites globales (INV-B1 a INV-B3), ni alterar el estado de otro cliente de su sala (cursor, lease, registro, subida en curso ajena con la misma secuencia).
-**Sostenida por.** Dedup por cliente (D59), reglas del relay sobre quién reemplaza una subida (las mismas para un chunk y para una subida en un solo request), topes de SSE (D54) (§6, §7.2, §7.3). *Pendiente (Lote 4):* que un chunk de otro miembro no entre en una subida ajena con los mismos parámetros (DEF-180).
+**Sostenida por.** Dedup por cliente (D59), reglas del relay sobre quién reemplaza una subida (las mismas para un chunk y para una subida en un solo request), topes de SSE (D54) (§6, §7.2, §7.3). Un chunk con los parámetros de una subida ajena (secuencia, layout y hash) solo la continúa si viene de quien la empezó o del worker.
 **Cómo intentar romperla.** Commits con `mutation_id` ajenos; subidas que reemplazan la de otro; muchos streams SSE; registro y deregistro en bucle.
 **Límite aceptado.** Reemplazar una subida con una secuencia mayor, o subir un snapshot falso (DEF-81, §4). La subida de un miembro que no es el designado ancla la poda pero no congela la designación (D76). Los commits de un miembro pueden sacar claves ajenas de la ventana compartida (DEF-85) y, con la cuota (D69), dejar atrás a otros clientes: las dos cosas pasan por el log de la sala, no por el estado del otro cliente.
 **Ruptura Baja abierta.** Las subidas chicas fallidas de un miembro pueden congelar la designación (DEF-181, backlog).
@@ -369,7 +369,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-B2 · Nada se retiene sin plazo
 **Enunciado.** Ninguna conexión, body, respuesta, permiso de conexión, subida ni designación se retiene más que un plazo configurado sin progreso del cliente: headers, body por tasa mínima, *stall* de respuesta, inactividad de subidas, designación de 60 s. En una subida, solo un chunk que todavía no se había recibido cuenta como progreso, y además tiene un tope total de duración por uploader (D74, D102): reiniciar la subida al vencer no lo renueva. La única excepción es un stream SSE sano, acotado en cantidad por cliente y en total.
-**Sostenida por.** D45, D53, D54 (§7.3); D74, el progreso y el tope de las subidas (`snapshot_upload_max_secs`), y D76, la designación que solo congela la subida del designado o del worker (§6). *Pendiente (Lote 4):* el tope por uploader (D102, DEF-174).
+**Sostenida por.** D45, D53, D54 (§7.3); D74, el progreso y el tope de las subidas (`snapshot_upload_max_secs`), y D76, la designación que solo congela la subida del designado o del worker (§6). D102: el slot recuerda el uploader y el tope de la última subida que quedó inactiva o cuyo último chunk no la instaló, y una subida nueva de ese uploader que empieza dentro de `UPLOAD_IDLE_TIMEOUT` hereda el tope, o se rechaza si ya pasó.
 **Cómo intentar romperla.** Cliente que lee un byte por plazo; ventana HTTP/2 que se achica; reenviar un chunk ya recibido; subir un chunk por plazo; stream SSE semiabierto (residuo aceptado, §4).
 
 #### INV-B3 · La memoria, el disco y los FDs del servidor están acotados por la configuración
