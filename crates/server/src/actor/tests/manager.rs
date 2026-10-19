@@ -129,6 +129,53 @@ async fn unreadable_meta_room_fails_to_load() {
     }
 }
 
+/// Every single bit flip and every truncation of a `meta_room.json` (with lifecycle overrides)
+/// makes reading it fail, through the same function that spawning the room and the admin `GET`
+/// of its overrides use.
+#[tokio::test]
+async fn every_damage_to_meta_room_fails_to_load() {
+    let dir = tempdir().unwrap();
+    let room_id = RoomId::new("room-x").unwrap();
+    let meta_path = meta_room_path(&dir, &room_id);
+    let manager = new_manager(&dir);
+    let lifecycle = RoomLifecycleOverrides {
+        max_room_disk_bytes: Some(64 * 1024 * 1024),
+        idle_timeout_secs: Some(60),
+        ..RoomLifecycleOverrides::default()
+    };
+    manager
+        .create_room(
+            room_id.clone(),
+            SchemaId::new("first").unwrap(),
+            Some(lifecycle),
+        )
+        .await
+        .unwrap();
+    manager.shutdown_all().await;
+    let stored = fs::read(&meta_path).unwrap();
+    assert!(read_room_metadata(&meta_path).is_ok());
+
+    for (damage, bytes) in crate::test_support::every_truncation_and_bit_flip(&stored) {
+        fs::write(&meta_path, &bytes).unwrap();
+        let read = read_room_metadata(&meta_path);
+        assert!(
+            read.is_err(),
+            "a meta_room.json {damage} loaded as {read:?}: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+    fs::write(&meta_path, &stored).unwrap();
+    let manager = new_manager(&dir);
+    assert_eq!(
+        manager
+            .lifecycle_overrides(&room_id)
+            .await
+            .unwrap()
+            .idle_timeout_secs,
+        Some(60)
+    );
+}
+
 #[tokio::test]
 async fn cancelled_respawn_keeps_waiting_for_the_previous_actor() {
     let dir = tempdir().unwrap();

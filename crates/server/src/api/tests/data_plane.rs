@@ -601,6 +601,57 @@ async fn a_request_waiting_for_its_room_holds_none_of_the_budget() {
     waiting.await;
 }
 
+/// A sync answered `Unavailable` because the client's part of the budget is taken leaves no
+/// trace: its cursor stays where the client's last commit left it, and once the held response
+/// is released the same sync is served and only then moves it.
+#[tokio::test]
+async fn sync_without_budget_does_not_move_the_cursor() {
+    // One frame per client.
+    let fx = Fixture::with(|config| {
+        config.max_inflight_response_bytes_per_client = MAX_FRAME_SIZE as u64;
+    })
+    .await;
+    for n in 1..=3u8 {
+        fx.commit_ok(&fx.commit(n, u64::from(n) - 1)).await;
+    }
+    let cursor = || async {
+        fx.manager
+            .ask(&fx.room_id, |reply| RoomCommand::GetClientCursor {
+                client_id: fx.client_id.clone(),
+                reply,
+            })
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(cursor().await, Some(SequenceNumber::new(2)));
+
+    // An unread response holds the client's part.
+    let get_schema = ClientMessage::GetSchema {
+        correlation_id: CorrelationId::new(2),
+        room_id: fx.room_id.clone(),
+    };
+    let held = fx.send("schema", &get_schema).await;
+    assert_eq!(held.status(), StatusCode::OK);
+    let (status, _, reply) = fx.post("sync", &fx.sync(3)).await;
+    assert_error(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        ErrorCode::Unavailable,
+        &reply,
+    );
+    assert_eq!(
+        cursor().await,
+        Some(SequenceNumber::new(2)),
+        "a sync answered Unavailable moved the cursor"
+    );
+
+    drop(held);
+    let (status, _, reply) = fx.post("sync", &fx.sync(3)).await;
+    assert_eq!(status, StatusCode::OK, "{reply:?}");
+    assert_eq!(cursor().await, Some(SequenceNumber::new(3)));
+}
+
 #[test]
 fn response_that_cannot_be_encoded_is_an_internal_error_frame() {
     let oversized = ServerMessage::SnapshotChunk {

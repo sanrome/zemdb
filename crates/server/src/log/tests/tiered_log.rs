@@ -301,19 +301,36 @@ fn failure_to_check_for_active_wal_fails_the_open() {
     assert_eq!(log.head_seq().get(), 3);
 }
 
+/// Writes a log that sealed 1..=20 in segments of five, holds 21..=22 in `active.wal` and pruned
+/// everything below 11, so that both fields of `log_meta.json` are set (10 and 20), closes it and
+/// returns its policy.
+fn write_pruned_log(dir: &Path) -> RoomLifecyclePolicy {
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 5,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir, policy.clone()).unwrap();
+    append_range(&mut log, 1, 22);
+    log.prune_older_than(SequenceNumber::new(11)).unwrap();
+    policy
+}
+
+/// The names of the files in `segments` (segments, sidecars and `active.wal`), sorted.
+fn segment_file_names(segments: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(segments)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
 /// One bit flipped in `log_meta.json` keeps it valid JSON but raises the recorded pruning point:
 /// the open fails instead of deleting segments that were never pruned.
 #[test]
 fn reopen_with_damaged_log_meta_fails_without_deleting_anything() {
     let dir = tempdir().unwrap();
-    let policy = RoomLifecyclePolicy {
-        ram_max_ops: 5,
-        ..RoomLifecyclePolicy::default()
-    };
-    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
-    append_range(&mut log, 1, 22);
-    log.prune_older_than(SequenceNumber::new(11)).unwrap();
-    drop(log);
+    let policy = write_pruned_log(dir.path());
     let meta = dir.path().join("log_meta.json");
     let mut bytes = std::fs::read(&meta).unwrap();
     let at = bytes.windows(2).position(|w| w == b"10").unwrap();
@@ -322,6 +339,58 @@ fn reopen_with_damaged_log_meta_fails_without_deleting_anything() {
 
     assert!(TieredLog::open_or_create(dir.path(), policy).is_err());
     assert!(segment_file(&segments_dir(dir.path()), 11, 15, "wal").exists());
+}
+
+/// Every single bit flip and every truncation of `log_meta.json` makes the open fail, and the
+/// failed open deletes nothing: not even a flip that keeps the JSON valid and raises
+/// `pruned_through_seq` above the retained segments.
+#[test]
+fn every_damage_to_log_meta_fails_the_open_without_deleting_anything() {
+    let dir = tempdir().unwrap();
+    let policy = write_pruned_log(dir.path());
+    let segments = segments_dir(dir.path());
+    let meta = dir.path().join("log_meta.json");
+    let original = std::fs::read(&meta).unwrap();
+    let files = segment_file_names(&segments);
+    assert!(files.contains(&"segment_0000000000000011_0000000000000015.wal".to_string()));
+
+    for (damage, bytes) in crate::test_support::every_truncation_and_bit_flip(&original) {
+        std::fs::write(&meta, &bytes).unwrap();
+        let opened = TieredLog::open_or_create(dir.path(), policy.clone());
+        assert!(
+            opened.is_err(),
+            "a log_meta.json {damage} ({:?}) opened",
+            String::from_utf8_lossy(&bytes)
+        );
+        assert_eq!(
+            segment_file_names(&segments),
+            files,
+            "an open with a log_meta.json {damage} deleted files"
+        );
+    }
+
+    // Verified, but missing a field or holding the wrong type: no default fills it in.
+    for json in [
+        r#"{"pruned_through_seq":10}"#,
+        r#"{"sealed_through_seq":20}"#,
+        r#"{"pruned_through_seq":"10","sealed_through_seq":20}"#,
+        r#"{"pruned_through_seq":-1,"sealed_through_seq":20}"#,
+    ] {
+        crate::durable::write_checked(&meta, json.as_bytes()).unwrap();
+        assert!(
+            TieredLog::open_or_create(dir.path(), policy.clone()).is_err(),
+            "a log_meta.json holding {json} opened"
+        );
+        assert_eq!(
+            segment_file_names(&segments),
+            files,
+            "an open with a log_meta.json holding {json} deleted files"
+        );
+    }
+
+    std::fs::write(&meta, &original).unwrap();
+    let (log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    assert_eq!((log.tail_seq().get(), log.head_seq().get()), (11, 22));
 }
 
 #[test]
@@ -2130,6 +2199,68 @@ fn reads_from_any_cursor_return_its_exact_suffix_over_many_seeds() {
     simulate_reads(0..24, 45);
 }
 
+/// A read starts at the right sealed segment at every edge of the index (the segment that holds
+/// `cursor + 1`): a cursor at the end of a segment, at the edges of and inside a lost segment,
+/// at the tail and at the head. Every read from disk is the exact suffix, or `BehindCompaction`
+/// when the suffix crosses the lost segment.
+#[test]
+fn reads_start_at_the_right_segment_at_every_edge() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 5,
+        ..RoomLifecyclePolicy::default()
+    };
+    {
+        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+        append_range(&mut log, 1, 23);
+    }
+    let accepted: Vec<SequencedOperation> = (1..=23).map(make_op).collect();
+    let starts =
+        |log: &TieredLog| -> Vec<u64> { log.segments.iter().map(|s| s.start_seq.get()).collect() };
+
+    // Reopened, RAM holds only `active.wal` (21..=23): every other read goes to disk.
+    let (log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+    assert_eq!(starts(&log), vec![1, 6, 11, 16]);
+    for c in 0..=23u64 {
+        for batch in [1, 3, 100] {
+            let got = read_chain(&log, c, || batch).unwrap();
+            assert!(
+                got.as_slice() == &accepted[c as usize..],
+                "a read from cursor {c} in pages of {batch} is not its exact suffix: {:?}",
+                seqs(&got)
+            );
+        }
+    }
+    drop(log);
+
+    // Segment 11..=15 is lost.
+    let segments = segments_dir(dir.path());
+    std::fs::remove_file(segment_file(&segments, 11, 15, "wal")).unwrap();
+    std::fs::remove_file(segment_file(&segments, 11, 15, "ids")).unwrap();
+    let (log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    assert_eq!(starts(&log), vec![1, 6, 16]);
+    assert_eq!((log.tail_seq().get(), log.head_seq().get()), (1, 23));
+    for c in 0..=23u64 {
+        for batch in [1, 3, 100] {
+            let got = read_chain(&log, c, || batch);
+            if c < 15 {
+                assert!(
+                    matches!(got, Err(ServerError::BehindCompaction)),
+                    "a read from cursor {c} in pages of {batch} crosses the lost segment and \
+                     must be BehindCompaction: {got:?}"
+                );
+            } else {
+                let got = got.unwrap();
+                assert!(
+                    got.as_slice() == &accepted[c as usize..],
+                    "a read from cursor {c} in pages of {batch} is not its exact suffix: {:?}",
+                    seqs(&got)
+                );
+            }
+        }
+    }
+}
+
 /// Operations of about a third of a response, and two small ones right after a large one in
 /// the next tier: the byte budget cuts pages inside and at the edges of every tier, a page
 /// never continues past an operation it refused even when a later one would fit, and a chain
@@ -2266,6 +2397,199 @@ fn pages_stay_exact_while_the_log_changes_between_them() {
 #[ignore = "long-running randomized test; run with --ignored in release"]
 fn pages_stay_exact_while_the_log_changes_between_them_over_many_seeds() {
     simulate_pages_while_the_log_changes(100..116, 30);
+}
+
+/// Where a fail point can be armed in the log at `dir` right now: the files every step touches,
+/// the files of each indexed segment, and those of the next rotation.
+fn fail_points_of(log: &TieredLog, dir: &Path) -> Vec<(&'static str, PathBuf)> {
+    let segments = segments_dir(dir);
+    let active = segments.join("active.wal");
+    let mut points = vec![
+        ("warm_append_write", active.clone()),
+        ("warm_append_sync", active.clone()),
+        ("warm_open_sync", active.clone()),
+        ("exists", active.clone()),
+        ("sync_dir", segments.clone()),
+        ("sync_dir", dir.to_path_buf()),
+        ("write_atomic_before_rename", dir.join("log_meta.json")),
+    ];
+    for segment in log.segments.iter() {
+        let (start, end) = (segment.start_seq.get(), segment.end_seq.get());
+        points.push(("remove_file", segment.path.clone()));
+        points.push(("remove_file", segment_file(&segments, start, end, "ids")));
+        if segment.tier == Tier::Warm {
+            points.push(("compress_after_warm_removed", segment.path.clone()));
+            points.push((
+                "remove_file",
+                segment_file(&segments, start, end, "wal.zst.tmp"),
+            ));
+        }
+    }
+    if let (Some(start), Some(end)) = (
+        log.warm_disk.active_start_seq(),
+        log.warm_disk.active_end_seq(),
+    ) {
+        for end in [end.get(), start.get() + log.policy.ram_max_ops as u64 - 1] {
+            points.push((
+                "write_atomic_before_rename",
+                segment_file(&segments, start.get(), end, "ids"),
+            ));
+        }
+    }
+    points
+}
+
+/// Opens the log at `dir`, retrying while an armed fail point makes the open fail (a crash
+/// during the recovery of a crash).
+fn open_retrying(
+    dir: &Path,
+    policy: &RoomLifecyclePolicy,
+    step: &str,
+) -> (TieredLog, Vec<(MutationId, SequenceNumber)>) {
+    let mut last = None;
+    for _ in 0..20 {
+        match TieredLog::open_or_create(dir, policy.clone()) {
+            Ok(opened) => return opened,
+            Err(e) => last = Some(e),
+        }
+    }
+    panic!("{step}: the log no longer opens: {last:?}");
+}
+
+/// For each seed, `steps` random steps on a log with small random limits (appends, rotations,
+/// maintenance at random ages and over the quota, cursor-driven prunes and reopens), with a
+/// random fail point armed before about a third of the steps. The room reacts as the actor
+/// does: a failed append or rotation stops it (reopen), a failed maintenance pass or prune is
+/// only logged. After every step: the head is the number of acknowledged commits (an append
+/// whose error came after its record reached the file counts once the reopen synced it), the
+/// tail never moves back, every acknowledged commit at or above the tail is read back exactly
+/// from any cursor, and after a reopen the mutation IDs are exactly those of the retained
+/// commits.
+fn simulate_failures(seeds: std::ops::Range<u64>, steps: usize) {
+    for seed in seeds {
+        let mut rng = TestRng::new(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) + 7);
+        let dir = tempdir().unwrap();
+        let policy = RoomLifecyclePolicy {
+            ram_max_ops: 1 + rng.below(6) as usize,
+            ram_max_bytes: 2_000 + rng.below(10_000),
+            segment_max_bytes: 1_500 + rng.below(8_000),
+            ram_ttl: Duration::from_secs(60),
+            warm_disk_ttl: Duration::from_secs(if rng.below(2) == 0 { 0 } else { 600 }),
+            cold_disk_ttl: Duration::from_secs(3_600),
+            max_room_disk_bytes: if rng.below(2) == 0 {
+                15_000 + rng.below(20_000)
+            } else {
+                u64::MAX / 4
+            },
+            ..RoomLifecyclePolicy::default()
+        };
+        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+        let mut acked: Vec<SequencedOperation> = Vec::new();
+        let mut last_tail = log.tail_seq().get();
+        for step in 0..steps {
+            let context = format!("seed {seed} step {step}");
+            if rng.below(3) == 0 {
+                let points = fail_points_of(&log, dir.path());
+                let (point, path) = &points[rng.index(points.len())];
+                crate::fail_point::arm(point, path);
+            }
+            let mut pending: Option<SequencedOperation> = None;
+            let mut stop = false;
+            match rng.below(12) {
+                0..=5 => {
+                    for _ in 0..1 + rng.below(6) {
+                        let op = random_size_op(acked.len() as u64 + 1, &mut rng);
+                        let id = mutation_for(op.seq.get());
+                        match log.append(op.clone(), Some(id)) {
+                            Ok(outcome) => {
+                                acked.push(op);
+                                if outcome.rotation_error.is_some() {
+                                    stop = true;
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                pending = Some(op);
+                                stop = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                6 | 7 => {
+                    let _ = log.run_maintenance_sync_at(random_clock(&mut rng));
+                }
+                8 => {
+                    let target = 1 + rng.below(log.head_seq().get().max(1));
+                    let _ = log.prune_older_than(SequenceNumber::new(target));
+                }
+                9 => {
+                    stop = log.force_rotate_warm().is_err();
+                }
+                _ => stop = true,
+            }
+
+            let mut reopened = None;
+            if stop {
+                drop(log);
+                let (opened, mutations) = open_retrying(dir.path(), &policy, &context);
+                log = opened;
+                if let Some(op) = pending.take() {
+                    if log.head_seq().get() == op.seq.get() {
+                        // The record reached the file before the error and the reopen synced
+                        // it, so a retry is acknowledged with this sequence.
+                        acked.push(op);
+                    }
+                }
+                reopened = Some(mutations);
+            }
+
+            let head = log.head_seq().get();
+            assert_eq!(
+                head,
+                acked.len() as u64,
+                "{context}: the head is not the number of acknowledged commits"
+            );
+            let tail = log.tail_seq().get();
+            assert!(
+                tail >= last_tail,
+                "{context}: tail moved back from {last_tail} to {tail}"
+            );
+            last_tail = tail;
+            check_reads(&log, &acked, &mut rng, &context);
+            if let Some(mutations) = reopened {
+                for (id, seq) in &mutations {
+                    assert_eq!(
+                        *id,
+                        mutation_for(seq.get()),
+                        "{context}: the mutation id at {seq} is not the acknowledged one"
+                    );
+                    assert!(
+                        seq.get() >= 1 && seq.get() <= head,
+                        "{context}: a mutation id at {seq}, outside 1..={head}"
+                    );
+                }
+                let found: HashSet<u64> = mutations.iter().map(|(_, seq)| seq.get()).collect();
+                for seq in tail..=head {
+                    assert!(
+                        found.contains(&seq),
+                        "{context}: the mutation id of retained commit {seq} was lost"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn random_failures_and_reopens_keep_every_acknowledged_commit() {
+    simulate_failures(0..2, 25);
+}
+
+#[test]
+#[ignore = "long-running randomized test; run with --ignored in release"]
+fn random_failures_and_reopens_keep_every_acknowledged_commit_over_many_seeds() {
+    simulate_failures(0..100, 120);
 }
 
 /// A cursor-driven prune whose deletion fails in the middle of its prefix keeps the retained

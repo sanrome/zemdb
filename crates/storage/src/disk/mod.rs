@@ -727,6 +727,7 @@ impl StorageEngine for DiskStorageEngine {
             pending
                 .wal()
                 .fail_on_err("Persisting an applied snapshot failed", installed)?;
+            crate::fail_point::panic_point("apply_snapshot.installed", &room.wal_path);
 
             {
                 let mut state = room.state.write().await;

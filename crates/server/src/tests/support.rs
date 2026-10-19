@@ -32,3 +32,19 @@ impl TestRng {
         self.below(len as u64) as usize
     }
 }
+
+/// Every truncation of `bytes` (to each shorter length, down to empty) and every copy of it with
+/// a single bit flipped, each with a description of the damage. A file checked as a whole must
+/// reject all of them.
+pub(crate) fn every_truncation_and_bit_flip(
+    bytes: &[u8],
+) -> impl Iterator<Item = (String, Vec<u8>)> + '_ {
+    let truncations =
+        (0..bytes.len()).map(|len| (format!("truncated to {len} bytes"), bytes[..len].to_vec()));
+    let flips = (0..bytes.len() * 8).map(|bit| {
+        let mut damaged = bytes.to_vec();
+        damaged[bit / 8] ^= 1 << (bit % 8);
+        (format!("with bit {bit} flipped"), damaged)
+    });
+    truncations.chain(flips)
+}

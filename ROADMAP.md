@@ -121,7 +121,7 @@ ZemDB ha superado con éxito la **Fase 1 y 1.5 (Reestructuración, Blindaje de C
 - Se completó el blindaje criptográfico integral del Data Plane mediante el extractor `ClientAuth`, validación de rutas en 3 vías, tiempo constante y leases activos.
 - Las Fases 3.6 y 3.7 cerraron las auditorías posteriores (ver sus planes en `docs/proposals/`): ciclo de vida de clientes derivado del cursor, política de ciclo de vida por sala, relay de snapshots en disco, borde HTTP con límites propios, header del frame WAL con CRC, log del servidor acotado en bytes, validación de snapshots recibidos y squashing de la outbox por orden de llegada. La Fase 3.8 cerró la auditoría posterior: respuestas HTTP acotadas en tiempo y memoria, storage que exige un esquema que cubra sus datos, roster y apertura de salas más baratos, contrato del protocolo (encarnación de la sala, dedup por cliente, versión de esquema en las respuestas) y recuperación ante daño en el log. La Fase 3.9 cerró la primera auditoría por invariantes, contra el contrato de [`docs/INVARIANTES.md`](docs/INVARIANTES.md), y dejó sus simulaciones y fuzzers en el repo. Cambió: ventana de dedup en orden del log; apertura que solo confía en lo verificado y sincronizado (metadatos con checksum, piso de secuencia, un servidor por `data_dir`); absorción atómica y operaciones de storage en su propia tarea; recursos acotados (respuestas por cliente, subidas con plazo y tope, cuota de la sala sobre warm y sidecars); y borrado de sala con lápida.
 
-Antes de construir la sincronización optimista reactiva en el cliente (Fase 4) hace falta una auditoría por invariantes en verde según `INVARIANTES.md` §1.4 (ver el §1 del plan de la Fase 3.9). La auditoría acotada sobre `b4cb390` ([`docs/audits/2026-10-invariantes-audit-2.md`](docs/audits/2026-10-invariantes-audit-2.md)) no salió en verde: rompe 8 invariantes núcleo (DEF-167 a DEF-181), que hay que remediar antes.
+Antes de construir la sincronización optimista reactiva en el cliente (Fase 4) hace falta cerrar el [plan de la Fase 3.10](docs/proposals/2026-10-fase3_10-remediation-plan.md). La auditoría acotada sobre `b4cb390` ([`docs/audits/2026-10-invariantes-audit-2.md`](docs/audits/2026-10-invariantes-audit-2.md)) no salió en verde (DEF-167 a DEF-181). El plan arregla sus rupturas Altas, las Medias DEF-172, DEF-174 y DEF-175 y dos Bajas; DEF-171, DEF-173 y DEF-179 se resuelven por decisión (un supuesto, un riesgo aceptado y un enunciado ajustado). Cierra con una revisión de su delta en lugar de otra auditoría (D90, `INVARIANTES.md` §1.4).
 
 ---
 
@@ -447,6 +447,8 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 ---
 
 ### 4.4. Biblioteca Cliente y Sincronización Canónica: `zemdb-client` (Fase 4)
+
+> **Requisito de diseño (D93, Fase 3.10):** antes de apagar su runtime de Tokio, el SDK cierra sus salas del storage con `close_room`, que espera a las aperturas, instalaciones de snapshot y compactaciones en curso. Si no, una sala que reabre en el mismo proceso puede perder lotes confirmados (riesgo aceptado, `docs/INVARIANTES.md` §4).
 
 #### 4.4.1. Modularización Física del Crate `zemdb-client`
 * **Organización Modular:**

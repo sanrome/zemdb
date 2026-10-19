@@ -5,10 +5,8 @@ use crate::snapshot::encode_snapshot_envelope;
 use crate::{DiskStorageEngine, MemoryStorageEngine, StorageEngine, StorageError};
 use futures::FutureExt;
 use std::collections::HashMap;
-use std::future::Future;
 use std::ops::RangeInclusive;
 use std::path::Path;
-use std::task::Poll;
 use std::time::Duration;
 use support::*;
 use zemdb_core::{PrimaryKey, RoomId, SequenceNumber};
@@ -513,6 +511,152 @@ async fn open_dropped_during_its_recovery_keeps_the_room_until_it_completes() {
     assert_rows(&reopened, &room, 10).await;
 }
 
+/// An `apply_snapshot` dropped by its caller while its task is staged (before it takes the WAL
+/// mutex) still completes: `close_room` waits for it, another engine cannot open the room
+/// meanwhile, and the reopened room holds the snapshot and keeps the writes made after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_waits_for_the_task_of_a_dropped_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("close-during-snapshot").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    let wal_path = engine.wal_file_path(&room);
+    apply_range(&engine, &room, 1..=3).await;
+    let snapshot = snapshot_with_rows(&room, 101, 5).await;
+
+    let mut staged = fail_point::arm_pause("apply_snapshot.staged", &wal_path);
+    tokio::select! {
+        _ = engine.apply_snapshot(&room, schema(), snapshot.into(), SequenceNumber::from(5u64)) => {
+            panic!("apply_snapshot finished while staged")
+        }
+        _ = staged.reached() => {}
+    }
+    // The caller is gone; the task holds the compaction lock.
+    assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), 3);
+    let closing = tokio::spawn({
+        let (engine, room) = (engine.clone(), room.clone());
+        async move { engine.close_room(&room).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !closing.is_finished(),
+        "close did not wait for the snapshot"
+    );
+    let other = engine_at(dir.path());
+    let early = other.open_room(&room, schema()).await;
+    assert!(
+        matches!(early, Err(StorageError::RoomLocked(_))),
+        "{early:?}"
+    );
+
+    staged.release();
+    tokio::time::timeout(Duration::from_secs(10), closing)
+        .await
+        .expect("close never finished")
+        .unwrap()
+        .unwrap();
+    other.open_room(&room, schema()).await.unwrap();
+    assert_eq!(other.get_head_seq(&room).await.unwrap().get(), 5);
+    apply_range(&other, &room, 6..=7).await;
+    let reopened = reopen(other, dir.path(), &room).await;
+    assert_eq!(reopened.get_head_seq(&room).await.unwrap().get(), 7);
+    for key in (101..=105).chain(6..=7) {
+        assert!(has_key(&reopened, &room, key).await, "row {key} lost");
+    }
+}
+
+/// An engine dropped (without closing the room) while the task of a dropped `apply_snapshot`
+/// waits to install it keeps the room locked until the task is done: another engine opens the
+/// room only afterwards, with the snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_dropped_during_a_snapshot_task_keeps_the_room_until_it_completes() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("drop-during-snapshot").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    let wal_path = engine.wal_file_path(&room);
+    apply_range(&engine, &room, 1..=3).await;
+    let snapshot = snapshot_with_rows(&room, 101, 5).await;
+
+    let mut rename = fail_point::arm_blocking_pause("apply_snapshot.rename", &wal_path);
+    tokio::select! {
+        _ = engine.apply_snapshot(&room, schema(), snapshot.into(), SequenceNumber::from(5u64)) => {
+            panic!("apply_snapshot finished during its rename")
+        }
+        _ = rename.reached() => {}
+    }
+    drop(engine);
+    let other = engine_at(dir.path());
+    let early = other.open_room(&room, schema()).await;
+    assert!(
+        matches!(early, Err(StorageError::RoomLocked(_))),
+        "{early:?}"
+    );
+
+    rename.release();
+    open_when_unlocked(&other, &room, schema()).await.unwrap();
+    assert_eq!(other.get_head_seq(&room).await.unwrap().get(), 5);
+    apply_range(&other, &room, 6..=7).await;
+    let reopened = reopen(other, dir.path(), &room).await;
+    assert_eq!(reopened.get_head_seq(&room).await.unwrap().get(), 7);
+}
+
+/// Two opens of the same room at once: in one engine, one opens it and the other gets
+/// `RoomAlreadyOpen`; in two engines, one gets `RoomLocked`. A dropped open that completes in
+/// its task leaves the room registered, and it can be closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_and_dropped_opens_of_a_room_open_it_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("concurrent-open").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    apply_range(&engine, &room, 1..=5).await;
+    fail_compaction_leaving_compacting_wal(&engine, &room).await;
+    apply_range(&engine, &room, 6..=8).await;
+    engine.close_room(&room).await.unwrap();
+
+    let (first, second) = tokio::join!(
+        engine.open_room(&room, schema()),
+        engine.open_room(&room, schema())
+    );
+    assert!(
+        matches!(
+            (&first, &second),
+            (Ok(()), Err(StorageError::RoomAlreadyOpen(_)))
+                | (Err(StorageError::RoomAlreadyOpen(_)), Ok(()))
+        ),
+        "{first:?} {second:?}"
+    );
+    assert_rows(&engine, &room, 8).await;
+    engine.close_room(&room).await.unwrap();
+
+    let (one, two) = (engine_at(dir.path()), engine_at(dir.path()));
+    let (first, second) = tokio::join!(
+        one.open_room(&room, schema()),
+        two.open_room(&room, schema())
+    );
+    assert!(
+        matches!(
+            (&first, &second),
+            (Ok(()), Err(StorageError::RoomLocked(_))) | (Err(StorageError::RoomLocked(_)), Ok(()))
+        ),
+        "{first:?} {second:?}"
+    );
+    let opened = if first.is_ok() { one } else { two };
+    assert_rows(&opened, &room, 8).await;
+    opened.close_room(&room).await.unwrap();
+
+    // Dropped right after its first poll: the task opens the room all the same.
+    let dropped = engine_at(dir.path());
+    let completed = poll_then_drop(dropped.open_room(&room, schema()), 0).await;
+    assert!(completed.is_none(), "the open completed at its first poll");
+    let again = dropped.open_room(&room, schema()).await;
+    assert!(
+        matches!(again, Err(StorageError::RoomAlreadyOpen(_))),
+        "{again:?}"
+    );
+    assert_rows(&dropped, &room, 8).await;
+    let reopened = reopen(dropped, dir.path(), &room).await;
+    assert_rows(&reopened, &room, 8).await;
+}
+
 #[tokio::test]
 async fn panic_while_applying_a_batch_exposes_none_of_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -528,6 +672,116 @@ async fn panic_while_applying_a_batch_exposes_none_of_it() {
     assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), 1);
     assert!(!has_key(&engine, &room, 2).await);
     assert_room_failed(&engine, &room, 2).await;
+}
+
+/// Whether `result` is the error a task that panicked is reported as.
+fn is_panicked_task<T: std::fmt::Debug>(result: &Result<T, StorageError>) -> bool {
+    matches!(result, Err(StorageError::Other(message)) if message.contains("panicked"))
+}
+
+/// A panic in the snapshot task after the snapshot is installed on disk, but before memory is
+/// replaced, marks the room as failed and releases its compaction lock: closing works, and the
+/// reopened room holds the snapshot and keeps the writes made after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panic_in_the_snapshot_task_after_installing_marks_the_room_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("panic-after-snapshot-install").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    apply_range(&engine, &room, 1..=3).await;
+    let snapshot = snapshot_with_rows(&room, 101, 5).await;
+
+    fail_point::arm("apply_snapshot.installed", &engine.wal_file_path(&room));
+    let applied = engine
+        .apply_snapshot(&room, schema(), snapshot.into(), SequenceNumber::from(5u64))
+        .await;
+    assert!(is_panicked_task(&applied), "{applied:?}");
+    // Memory still holds the previous state, and the room refuses writes until reopened.
+    assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), 3);
+    assert_room_failed(&engine, &room, 4).await;
+
+    let reopened = tokio::time::timeout(Duration::from_secs(10), reopen(engine, dir.path(), &room))
+        .await
+        .expect("the panic left the compaction lock held, and closing waited for it");
+    assert_eq!(reopened.get_head_seq(&room).await.unwrap().get(), 5);
+    apply_range(&reopened, &room, 6..=7).await;
+    let reopened = reopen(reopened, dir.path(), &room).await;
+    assert_eq!(reopened.get_head_seq(&room).await.unwrap().get(), 7);
+    for key in (101..=105).chain(6..=7) {
+        assert!(has_key(&reopened, &room, key).await, "row {key} lost");
+    }
+}
+
+/// A panic in the open task, after the WALs are replayed and before `.wal.compacting` is
+/// folded, registers nothing and releases the engine's rooms and the room's locks: the next open
+/// of the same engine recovers every row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panic_in_the_open_task_releases_the_room_and_its_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("panic-during-open").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    apply_range(&engine, &room, 1..=5).await;
+    fail_compaction_leaving_compacting_wal(&engine, &room).await;
+    apply_range(&engine, &room, 6..=8).await;
+    engine.close_room(&room).await.unwrap();
+
+    let engine = engine_at(dir.path());
+    fail_point::arm("recovery.replayed", &engine.wal_file_path(&room));
+    let opened = tokio::time::timeout(Duration::from_secs(10), engine.open_room(&room, schema()))
+        .await
+        .expect("the open never returned");
+    assert!(is_panicked_task(&opened), "{opened:?}");
+    assert!(matches!(
+        engine.get_head_seq(&room).await,
+        Err(StorageError::RoomNotFound(_))
+    ));
+
+    // Another engine can take the room's files, and so can this one.
+    let other = open_engine(dir.path(), &room).await;
+    assert_rows(&other, &room, 8).await;
+    other.close_room(&room).await.unwrap();
+    engine.open_room(&room, schema()).await.unwrap();
+    assert_rows(&engine, &room, 8).await;
+    apply_range(&engine, &room, 9..=10).await;
+    let reopened = reopen(engine, dir.path(), &room).await;
+    assert_rows(&reopened, &room, 10).await;
+}
+
+/// A panic in the compaction task while it rotates the WAL marks the room as failed (the WAL
+/// handle points at the renamed file); one after the snapshot rename, outside the WAL mutex,
+/// leaves the room usable. Either way no row is lost and the room compacts again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panic_in_the_compaction_task_loses_no_row() {
+    for (point, marks_failed) in [("compaction.rotated", true), ("compaction.renamed", false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let room = RoomId::new("panic-during-compaction").unwrap();
+        let engine = open_engine(dir.path(), &room).await;
+        apply_range(&engine, &room, 1..=3).await;
+
+        fail_point::arm(point, &engine.wal_file_path(&room));
+        let compacted = engine.compact_room(&room).await;
+        assert!(is_panicked_task(&compacted), "{point}: {compacted:?}");
+        let written = engine.apply_batch(&room, vec![insert(4)]).await;
+        let last = if marks_failed {
+            assert!(
+                matches!(written, Err(StorageError::RoomFailed { .. })),
+                "{point}: {written:?}"
+            );
+            3
+        } else {
+            assert_eq!(written.unwrap().get(), 4, "{point}");
+            engine.compact_room(&room).await.unwrap();
+            4
+        };
+        let reopened = reopen(engine, dir.path(), &room).await;
+        assert_rows(&reopened, &room, last).await;
+        reopened
+            .apply_batch(&room, vec![insert(last + 1)])
+            .await
+            .unwrap();
+        reopened.compact_room(&room).await.unwrap();
+        let reopened = reopen(reopened, dir.path(), &room).await;
+        assert_rows(&reopened, &room, last + 1).await;
+    }
 }
 
 /// How a test goes on after aborting a compaction.
@@ -790,25 +1044,6 @@ async fn batch_at_the_last_sequence_number_survives_reopen_and_compaction() {
     }
 }
 
-/// Polls `operation`, letting the runtime and its blocking pool run between polls, and drops it
-/// after it has returned `Pending` `suspensions` times. Returns whether it completed first.
-async fn poll_then_drop(operation: impl Future, suspensions: usize) -> bool {
-    let mut operation = std::pin::pin!(operation);
-    let mut seen = 0;
-    loop {
-        let ready =
-            std::future::poll_fn(|cx| Poll::Ready(operation.as_mut().poll(cx).is_ready())).await;
-        if ready {
-            return true;
-        }
-        if seen == suspensions {
-            return false;
-        }
-        seen += 1;
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-}
-
 /// Checks `room` after an operation that would have taken it from the head and rows of `old`
 /// to those of `new` was dropped (`k` names the run): in memory and after a reopen, it holds
 /// one of the two. If it still takes writes, memory and disk agree and the write survives the
@@ -869,7 +1104,7 @@ async fn apply_batch_dropped_at_any_suspension_point_keeps_the_room_consistent()
         let engine = open_engine(dir.path(), &room).await;
         apply_range(&engine, &room, 1..=3).await;
         let batch = engine.apply_batch(&room, vec![insert(4), insert(5)]);
-        let completed = poll_then_drop(batch, k).await;
+        let completed = poll_then_drop(batch, k).await.is_some();
         check_after_drop(engine, dir.path(), &room, k, (3, 1..=3), (5, 1..=5)).await;
         if completed {
             break;
@@ -881,7 +1116,6 @@ async fn apply_batch_dropped_at_any_suspension_point_keeps_the_room_consistent()
 /// or after the snapshot, and never marked failed: once it has the compaction lock it completes
 /// in its own task.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "long-running test; run with --ignored in release"]
 async fn apply_snapshot_dropped_at_any_suspension_point_keeps_the_room_consistent() {
     for k in 0.. {
         let dir = tempfile::tempdir().unwrap();
@@ -891,7 +1125,7 @@ async fn apply_snapshot_dropped_at_any_suspension_point_keeps_the_room_consisten
         let snapshot = snapshot_with_rows(&room, 101, 5).await;
         let head = SequenceNumber::from(5u64);
         let apply = engine.apply_snapshot(&room, schema(), snapshot.into(), head);
-        let completed = poll_then_drop(apply, k).await;
+        let completed = poll_then_drop(apply, k).await.is_some();
         let usable =
             check_after_drop(engine, dir.path(), &room, k, (3, 1..=3), (5, 101..=105)).await;
         assert!(usable, "k={k}: the dropped snapshot marked the room failed");
@@ -904,7 +1138,6 @@ async fn apply_snapshot_dropped_at_any_suspension_point_keeps_the_room_consisten
 /// `open_room` dropped by its caller after any number of suspensions still opens the room, with
 /// every row: once it has the engine's rooms, it completes in its own task.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "long-running test; run with --ignored in release"]
 async fn open_room_dropped_at_any_suspension_point_still_opens_the_room() {
     for k in 0.. {
         let dir = tempfile::tempdir().unwrap();
@@ -915,7 +1148,9 @@ async fn open_room_dropped_at_any_suspension_point_still_opens_the_room() {
         apply_range(&engine, &room, 6..=8).await;
         drop(engine);
         let engine = engine_at(dir.path());
-        let completed = poll_then_drop(engine.open_room(&room, schema()), k).await;
+        let completed = poll_then_drop(engine.open_room(&room, schema()), k)
+            .await
+            .is_some();
         let reopened = reopen(engine, dir.path(), &room).await;
         assert_rows(&reopened, &room, 8).await;
         if completed {
@@ -927,14 +1162,15 @@ async fn open_room_dropped_at_any_suspension_point_still_opens_the_room() {
 /// `compact_room` dropped by its caller after any number of suspensions loses no row, and leaves
 /// the room usable or marked failed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "long-running test; run with --ignored in release"]
 async fn compact_room_dropped_at_any_suspension_point_keeps_the_room_consistent() {
     for k in 0.. {
         let dir = tempfile::tempdir().unwrap();
         let room = RoomId::new("dropped-compaction").unwrap();
         let engine = open_engine(dir.path(), &room).await;
         apply_range(&engine, &room, 1..=3).await;
-        let completed = poll_then_drop(engine.compact_room(&room), k).await;
+        let completed = poll_then_drop(engine.compact_room(&room), k)
+            .await
+            .is_some();
         check_after_drop(engine, dir.path(), &room, k, (3, 1..=3), (3, 1..=3)).await;
         if completed {
             break;

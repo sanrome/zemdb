@@ -4,8 +4,8 @@
 //! A scenario applies random batches (some with a sequence gap or an unknown table), compactions
 //! (some failing at a fail point), snapshots ahead of, at or behind the room, and reopens. The
 //! simulations crash it, or fail it, at every fail or pause point it reaches in turn, read it
-//! while it runs, or damage its WAL at random. Seeds are fixed, so a failure names the seed (and
-//! the point) that reproduces it.
+//! while it runs, drop its operations halfway, or damage its WAL at random. Seeds are fixed, so a
+//! failure names the seed (and the point) that reproduces it.
 //!
 //! The short runs take a few seconds in debug builds. The long ones are ignored by default; run
 //! them with `cargo test -p zemdb-storage --release -- --ignored`. The environment variables
@@ -13,6 +13,8 @@
 //! steps of a scenario.
 
 use super::support::{engine_at, file_contents, Rng};
+#[cfg(unix)]
+use super::support::{open_when_unlocked, poll_then_drop};
 use crate::disk::compactor::compacting_wal_path;
 use crate::fail_point::{self, CrashAction};
 use crate::{DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, ScanOptions};
@@ -399,6 +401,21 @@ async fn check_memory(engine: &DiskStorageEngine, events: &[Event]) -> Result<()
     Ok(())
 }
 
+/// The first of `candidates` whose room is `got`.
+async fn matching(candidates: &[Vec<Event>], got: &Dump) -> Option<Vec<Event>> {
+    for candidate in candidates {
+        if oracle(candidate).await == *got {
+            return Some(candidate.clone());
+        }
+    }
+    None
+}
+
+/// The head of each of `candidates`, for failure messages.
+fn heads(candidates: &[Vec<Event>]) -> Vec<u64> {
+    candidates.iter().map(|c| head_of(c)).collect()
+}
+
 // ---------------------------------------------------------------------------------------------
 // A crash at every point
 //
@@ -656,17 +673,14 @@ async fn reopen_and_match(
         opened.map_err(|e| format!("reopen failed twice: {e}"))?;
     }
     let got = dump(engine).await;
-    for candidate in candidates {
-        if oracle(candidate).await == got {
-            return Ok(candidate.clone());
-        }
-    }
-    let heads: Vec<u64> = candidates.iter().map(|c| head_of(c)).collect();
-    Err(format!(
-        "the room reopened at head {} with {} rows, expected one of the heads {heads:?}",
-        got.0,
-        got.1.len()
-    ))
+    matching(candidates, &got).await.ok_or_else(|| {
+        format!(
+            "the room reopened at head {} with {} rows, expected one of the heads {:?}",
+            got.0,
+            got.1.len(),
+            heads(candidates)
+        )
+    })
 }
 
 /// Runs the scenario of `seed` for `steps` steps in `data`, under a crash plan that fails its
@@ -1142,4 +1156,510 @@ async fn damaged_rotated_wal_fails_untouched() {
 #[ignore = "long-running randomized test; run with --ignored in release"]
 async fn damaged_rotated_wal_fails_untouched_over_many_wals() {
     damaged_wals_recover_a_prefix_or_fail_untouched(seeds(2000, 100), 20, true).await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Dropped operations, and operations racing the tasks they leave running
+//
+// The other simulations always wait for every operation. This one drops batches, snapshots,
+// compactions and opens after a random number of suspensions and, without waiting for the tasks
+// they leave behind, goes on at once with a write, a close and reopen, a compaction or a read.
+// Once those tasks are done, the room must hold one of the states the operations could have
+// left, and an operation that returned `Ok` must be in it; if the room still takes writes, its
+// memory must equal what a fresh engine opens from a copy of its files (taken with the
+// compaction lock and the WAL mutex held, so that no task changes them meanwhile).
+//
+// Copying the files of an open room reads files its engine holds locked, which Windows refuses,
+// so this simulation runs on Unix only.
+
+/// A disk engine in `dir` that compacts on its own once the WAL holds a few hundred bytes, so
+/// that compaction tasks spawned by batches run alongside the scenario.
+#[cfg(unix)]
+fn auto_compacting_engine_at(dir: &Path) -> DiskStorageEngine {
+    let options = DiskStorageOptions::new(dir)
+        .min_compaction_bytes(256)
+        .compaction_ratio(0.5);
+    DiskStorageEngine::new(options).unwrap()
+}
+
+/// What runs right after an operation is dropped, while its task may still be running.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum Follow {
+    Nothing,
+    /// A batch at the head the confirmed changes have before the dropped operation.
+    Racing,
+    /// The room closed and opened in a new engine.
+    Reopen,
+    Compact,
+    /// A read of the head and the rows, whatever it returns.
+    Read,
+    /// Another open of the room (after a dropped open).
+    OpenAgain,
+}
+
+/// One step of a scenario of dropped operations.
+#[cfg(unix)]
+#[derive(Clone)]
+enum DropStep {
+    Batch(Vec<SequencedOperation>),
+    FailedCompact(&'static str),
+    Reopen,
+    /// A batch dropped after a number of suspensions, and what follows it.
+    DroppedBatch(Vec<SequencedOperation>, usize, Follow),
+    /// A snapshot ahead, whose log continues the confirmed changes with `racing`.
+    DroppedSnapshot {
+        bytes: Vec<u8>,
+        head: u64,
+        racing: Vec<SequencedOperation>,
+        k: usize,
+        follow: Follow,
+    },
+    /// A compaction, failing at a fail point if given, dropped after a number of suspensions.
+    DroppedCompact(Option<&'static str>, usize, Follow),
+    /// An open in a new engine dropped after a number of suspensions.
+    DroppedOpen(usize, Follow),
+}
+
+#[cfg(unix)]
+impl DropStep {
+    fn describe(&self) -> String {
+        match self {
+            DropStep::Batch(ops) => format!("batch to {}", ops.last().unwrap().seq.get()),
+            DropStep::FailedCompact(point) => format!("compaction failing at {point}"),
+            DropStep::Reopen => "reopen".into(),
+            DropStep::DroppedBatch(ops, k, follow) => format!(
+                "batch to {} dropped after {k}, then {follow:?}",
+                ops.last().unwrap().seq.get()
+            ),
+            DropStep::DroppedSnapshot {
+                head, k, follow, ..
+            } => format!("snapshot at {head} dropped after {k}, then {follow:?}"),
+            DropStep::DroppedCompact(fail, k, follow) => {
+                format!("compaction (failing at {fail:?}) dropped after {k}, then {follow:?}")
+            }
+            DropStep::DroppedOpen(k, follow) => format!("open dropped after {k}, then {follow:?}"),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn random_follow(rng: &mut Rng, choices: &[Follow]) -> Follow {
+    choices[rng.below(choices.len() as u64) as usize]
+}
+
+/// The next step of a scenario of dropped operations whose room holds `events`.
+#[cfg(unix)]
+async fn random_drop_step(rng: &mut Rng, events: &[Event]) -> DropStep {
+    let head = head_of(events);
+    let roll = rng.below(100);
+    if roll < 35 {
+        DropStep::Batch(random_batch(rng, head))
+    } else if roll < 42 {
+        DropStep::FailedCompact(COMPACTION_FAILURES[rng.below(5) as usize])
+    } else if roll < 47 {
+        DropStep::Reopen
+    } else if roll < 60 {
+        let follow = random_follow(
+            rng,
+            &[
+                Follow::Nothing,
+                Follow::Reopen,
+                Follow::Compact,
+                Follow::Read,
+            ],
+        );
+        DropStep::DroppedBatch(random_batch(rng, head), rng.below(6) as usize, follow)
+    } else if roll < 78 {
+        let racing = random_batch(rng, head);
+        let base = with(events, Event::Batch(racing.clone()));
+        let extra = rng.below(3);
+        let (bytes, head) = snapshot_ahead(rng, &base, extra).await;
+        let follow = random_follow(
+            rng,
+            &[
+                Follow::Nothing,
+                Follow::Racing,
+                Follow::Racing,
+                Follow::Reopen,
+                Follow::Compact,
+                Follow::Read,
+            ],
+        );
+        DropStep::DroppedSnapshot {
+            bytes,
+            head,
+            racing,
+            k: rng.below(10) as usize,
+            follow,
+        }
+    } else if roll < 90 {
+        let fail = rng
+            .chance(40)
+            .then(|| COMPACTION_FAILURES[rng.below(5) as usize]);
+        let follow = random_follow(
+            rng,
+            &[
+                Follow::Nothing,
+                Follow::Racing,
+                Follow::Reopen,
+                Follow::Compact,
+                Follow::Read,
+            ],
+        );
+        DropStep::DroppedCompact(fail, rng.below(8) as usize, follow)
+    } else {
+        let follow = random_follow(
+            rng,
+            &[
+                Follow::Nothing,
+                Follow::Racing,
+                Follow::Reopen,
+                Follow::Read,
+                Follow::OpenAgain,
+            ],
+        );
+        DropStep::DroppedOpen(rng.below(4) as usize, follow)
+    }
+}
+
+/// Closes the room (if open) and opens it in a new auto-compacting engine.
+///
+/// The `fsync` of a batch dropped during its sync keeps running on the blocking pool with a handle
+/// of the WAL, and so its lock, which `close_room` does not wait for: until it ends, the open
+/// gets `RoomLocked`, and is retried for a few seconds.
+#[cfg(unix)]
+async fn reopen_auto(engine: &mut DiskStorageEngine, data: &Path) -> Result<(), String> {
+    match engine.close_room(&room()).await {
+        Ok(()) | Err(StorageError::RoomNotFound(_)) => {}
+        Err(e) => return Err(format!("close: {e}")),
+    }
+    *engine = auto_compacting_engine_at(data);
+    open_retrying(engine).await
+}
+
+/// Opens the room, retrying for a few seconds while it is `RoomLocked` (see [`reopen_auto`]).
+#[cfg(unix)]
+async fn open_retrying(engine: &DiskStorageEngine) -> Result<(), String> {
+    let opened = open_when_unlocked(engine, &room(), schema()).await;
+    opened.map_err(|e| format!("open: {e}"))
+}
+
+/// Reads the head and every row, accepting any outcome.
+#[cfg(unix)]
+async fn read_anything(engine: &DiskStorageEngine) {
+    let _ = engine.get_head_seq(&room()).await;
+    for table in [USERS, ITEMS] {
+        if let Ok(mut scan) = engine
+            .scan_by_id(&room(), table, ScanOptions::default())
+            .await
+        {
+            while scan.next().await.is_some() {}
+        }
+    }
+}
+
+/// Memory of the open room against a fresh engine opened on a copy of its files, taken with the
+/// room's compaction lock and WAL mutex held.
+#[cfg(unix)]
+async fn memory_equals_disk(
+    engine: &DiskStorageEngine,
+    data: &Path,
+    copy: &Path,
+) -> Result<(), String> {
+    let room_handle = engine.get_room(&room()).await.map_err(|e| e.to_string())?;
+    let compaction = Arc::clone(&room_handle.compaction).lock_owned().await;
+    let wal = room_handle.wal.lock().await;
+    let memory = dump(engine).await;
+    let _ = std::fs::remove_dir_all(copy);
+    fail_point::copy_files(data, copy);
+    drop(wal);
+    drop(compaction);
+    drop(room_handle);
+    let fresh = engine_at(copy);
+    fresh
+        .open_room(&room(), schema())
+        .await
+        .map_err(|e| format!("the copy does not open: {e}"))?;
+    let disk = dump(&fresh).await;
+    fresh.close_room(&room()).await.unwrap();
+    if memory != disk {
+        return Err(format!(
+            "memory holds head {} with {} rows, its files head {} with {} rows",
+            memory.0,
+            memory.1.len(),
+            disk.0,
+            disk.1.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Waits for the tasks of dropped operations, opens the room if no open left it open, and
+/// checks it against `candidates`: a write tells whether it is usable; if so, memory must hold
+/// one of them and equal its files; if it is marked failed, the reopened room must hold one of
+/// them. Returns the confirmed changes, including that write.
+#[cfg(unix)]
+async fn settle_and_check(
+    rng: &mut Rng,
+    engine: &mut DiskStorageEngine,
+    data: &Path,
+    copy: &Path,
+    candidates: &[Vec<Event>],
+) -> Result<Vec<Event>, String> {
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    if let Ok(lock) = engine.compaction_lock(&room()).await {
+        drop(lock.lock().await);
+    }
+    if let Err(StorageError::RoomNotFound(_)) = engine.get_head_seq(&room()).await {
+        open_retrying(engine)
+            .await
+            .map_err(|e| format!("after the step: {e}"))?;
+    }
+    let memory = dump(engine).await;
+    let probe = random_batch(rng, memory.0);
+    let matched = match engine.apply_batch(&room(), probe.clone()).await {
+        Ok(_) => matching(candidates, &memory).await.ok_or_else(|| {
+            format!(
+                "memory holds head {} with {} rows, expected one of the heads {:?}",
+                memory.0,
+                memory.1.len(),
+                heads(candidates)
+            )
+        })?,
+        Err(StorageError::RoomFailed { .. }) => {
+            reopen_auto(engine, data).await?;
+            let disk = dump(engine).await;
+            let matched = matching(candidates, &disk).await.ok_or_else(|| {
+                format!(
+                    "the failed room reopened at head {} with {} rows, expected one of the heads {:?}",
+                    disk.0,
+                    disk.1.len(),
+                    heads(candidates)
+                )
+            })?;
+            return Box::pin(settle_and_check(rng, engine, data, copy, &[matched])).await;
+        }
+        Err(e) => return Err(format!("write after the step: {e}")),
+    };
+    let confirmed = with(&matched, Event::Batch(probe));
+    memory_equals_disk(engine, data, copy).await?;
+    Ok(confirmed)
+}
+
+/// Runs the follow-up `follow` of a dropped operation, with `racing` as its batch. Returns the
+/// result of that batch, if it ran.
+#[cfg(unix)]
+async fn run_follow(
+    engine: &mut DiskStorageEngine,
+    data: &Path,
+    follow: Follow,
+    racing: &[SequencedOperation],
+) -> Result<Option<Result<SequenceNumber, StorageError>>, String> {
+    match follow {
+        Follow::Nothing => {}
+        Follow::Racing => {
+            return Ok(Some(engine.apply_batch(&room(), racing.to_vec()).await));
+        }
+        Follow::Reopen => reopen_auto(engine, data).await?,
+        Follow::Compact => match engine.compact_room(&room()).await {
+            Ok(()) | Err(StorageError::RoomFailed { .. }) | Err(StorageError::Io(_)) => {}
+            Err(e) => return Err(format!("compaction after the drop: {e}")),
+        },
+        Follow::Read => read_anything(engine).await,
+        Follow::OpenAgain => match engine.open_room(&room(), schema()).await {
+            Ok(()) | Err(StorageError::RoomAlreadyOpen(_)) | Err(StorageError::RoomLocked(_)) => {}
+            Err(e) => return Err(format!("second open: {e}")),
+        },
+    }
+    Ok(None)
+}
+
+/// Runs the scenario of dropped operations of `seed` for `steps` steps, checking the room after
+/// every step (see [`settle_and_check`]), and reopens it at the end, which must hold exactly the
+/// confirmed changes.
+#[cfg(unix)]
+async fn run_dropped_scenario(seed: u64, steps: usize) -> Result<(), String> {
+    let tmp = tempfile::tempdir().unwrap();
+    let (data, copy) = (tmp.path().join("data"), tmp.path().join("copy"));
+    let mut rng = Rng::new(seed);
+    let mut engine = auto_compacting_engine_at(&data);
+    engine
+        .open_room(&room(), schema())
+        .await
+        .map_err(|e| format!("initial open: {e}"))?;
+    let mut events: Vec<Event> = Vec::new();
+    for step_no in 0..steps {
+        let step = random_drop_step(&mut rng, &events).await;
+        let place = format!("step {step_no} ({})", step.describe());
+        let fail = |e: String| format!("{place}: {e}");
+        let before = events.clone();
+        let mut armed = None;
+        let candidates = match &step {
+            DropStep::Batch(ops) => {
+                let head = engine.apply_batch(&room(), ops.clone()).await;
+                head.map_err(|e| fail(format!("batch: {e}")))?;
+                vec![with(&before, Event::Batch(ops.clone()))]
+            }
+            DropStep::FailedCompact(point) => {
+                let path = compaction_fail_path(&engine, point);
+                fail_point::arm(point, &path);
+                armed = Some((*point, path));
+                if engine.compact_room(&room()).await.is_ok() {
+                    return Err(fail("the compaction did not fail".into()));
+                }
+                vec![before]
+            }
+            DropStep::Reopen => {
+                reopen_auto(&mut engine, &data).await.map_err(fail)?;
+                vec![before]
+            }
+            DropStep::DroppedBatch(ops, k, follow) => {
+                let done = poll_then_drop(engine.apply_batch(&room(), ops.clone()), *k).await;
+                let after = with(&before, Event::Batch(ops.clone()));
+                if let Some(result) = done {
+                    result.map_err(|e| fail(format!("batch: {e}")))?;
+                    run_follow(&mut engine, &data, *follow, &[])
+                        .await
+                        .map_err(fail)?;
+                    vec![after]
+                } else {
+                    run_follow(&mut engine, &data, *follow, &[])
+                        .await
+                        .map_err(fail)?;
+                    vec![before, after]
+                }
+            }
+            DropStep::DroppedSnapshot {
+                bytes,
+                head,
+                racing,
+                k,
+                follow,
+            } => {
+                let room_id = room();
+                let apply = engine.apply_snapshot(
+                    &room_id,
+                    schema(),
+                    bytes.clone().into(),
+                    SequenceNumber::from(*head),
+                );
+                let done = poll_then_drop(apply, *k).await;
+                let with_racing = with(&before, Event::Batch(racing.clone()));
+                let with_snapshot = with(&with_racing, Event::Snapshot(bytes.clone(), *head));
+                let raced = run_follow(&mut engine, &data, *follow, racing)
+                    .await
+                    .map_err(fail)?;
+                match (done, raced) {
+                    (Some(Ok(_)), Some(Ok(_))) => {
+                        return Err(fail("the batch after the snapshot was accepted".into()))
+                    }
+                    (Some(Ok(_)), _) => vec![with_snapshot],
+                    (Some(Err(e)), _) => return Err(fail(format!("snapshot: {e}"))),
+                    (None, Some(Ok(_))) => vec![with_racing, with_snapshot],
+                    (None, Some(Err(StorageError::SequenceMismatch { .. }))) => {
+                        vec![with_snapshot]
+                    }
+                    (None, Some(Err(e))) => return Err(fail(format!("racing batch: {e}"))),
+                    (None, None) => vec![before, with_snapshot],
+                }
+            }
+            DropStep::DroppedCompact(point, k, follow) => {
+                if let Some(point) = point {
+                    let path = compaction_fail_path(&engine, point);
+                    fail_point::arm(point, &path);
+                    armed = Some((*point, path));
+                }
+                let _ = poll_then_drop(engine.compact_room(&room()), *k).await;
+                let racing = random_batch(&mut rng, head_of(&before));
+                let raced = run_follow(&mut engine, &data, *follow, &racing)
+                    .await
+                    .map_err(fail)?;
+                let with_racing = with(&before, Event::Batch(racing));
+                match raced {
+                    Some(Ok(_)) => vec![with_racing],
+                    Some(Err(StorageError::RoomFailed { .. })) | None => vec![before],
+                    Some(Err(e)) => return Err(fail(format!("racing batch: {e}"))),
+                }
+            }
+            DropStep::DroppedOpen(k, follow) => {
+                engine
+                    .close_room(&room())
+                    .await
+                    .map_err(|e| fail(format!("close: {e}")))?;
+                engine = auto_compacting_engine_at(&data);
+                match poll_then_drop(engine.open_room(&room(), schema()), *k).await {
+                    None | Some(Ok(())) | Some(Err(StorageError::RoomLocked(_))) => {}
+                    Some(Err(e)) => return Err(fail(format!("open: {e}"))),
+                }
+                let racing = random_batch(&mut rng, head_of(&before));
+                let raced = run_follow(&mut engine, &data, *follow, &racing)
+                    .await
+                    .map_err(fail)?;
+                let with_racing = with(&before, Event::Batch(racing));
+                match raced {
+                    Some(Ok(_)) => vec![with_racing],
+                    Some(Err(StorageError::RoomNotFound(_))) | None => vec![before],
+                    Some(Err(e)) => return Err(fail(format!("racing batch: {e}"))),
+                }
+            }
+        };
+        let checked = settle_and_check(&mut rng, &mut engine, &data, &copy, &candidates).await;
+        if let Some((point, path)) = armed {
+            fail_point::disarm(point, &path);
+        }
+        events = checked.map_err(fail)?;
+    }
+    reopen_auto(&mut engine, &data).await?;
+    let (got, want) = (dump(&engine).await, oracle(&events).await);
+    if got != want {
+        return Err(format!(
+            "final reopen: head {} with {} rows, the confirmed changes head {} with {} rows",
+            got.0,
+            got.1.len(),
+            want.0,
+            want.1.len()
+        ));
+    }
+    engine.close_room(&room()).await.unwrap();
+    Ok(())
+}
+
+/// Runs the scenario of dropped operations of each of `seeds`.
+#[cfg(unix)]
+async fn dropped_operations(seeds: Range<u64>, steps: usize) {
+    let mut failures = Vec::new();
+    let mut runs = 0;
+    let mut set = JoinSet::new();
+    for seed in seeds {
+        runs += 1;
+        while set.len() >= PARALLEL_RUNS {
+            collect_run(set.join_next().await, &mut failures);
+        }
+        set.spawn(async move {
+            run_dropped_scenario(seed, steps)
+                .await
+                .map_err(|e| format!("seed {seed}: {e}"))
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        collect_run(Some(joined), &mut failures);
+    }
+    assert_no_failures(&failures, runs);
+}
+
+/// Batches, snapshots, compactions and opens dropped by their callers halfway, and the
+/// operations that race the tasks they leave running, leave the room in a state they could have
+/// left, with every change that returned `Ok`, and with its memory equal to its files.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dropped_and_racing_operations_keep_memory_equal_to_disk() {
+    dropped_operations(seeds(7000, 4), setting("SIM_STEPS", 25)).await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "long-running randomized test; run with --ignored in release"]
+async fn dropped_and_racing_operations_keep_memory_equal_to_disk_over_many_scenarios() {
+    dropped_operations(seeds(7000, 64), setting("SIM_STEPS", 80)).await;
 }

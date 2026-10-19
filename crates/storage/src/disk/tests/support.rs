@@ -2,8 +2,11 @@
 
 use crate::fail_point;
 use crate::{DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError};
+use std::future::Future;
 use std::ops::RangeInclusive;
 use std::path::Path;
+use std::task::Poll;
+use std::time::Duration;
 use tokio::task::JoinHandle;
 use zemdb_core::{
     CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequenceNumber,
@@ -68,6 +71,22 @@ pub(crate) async fn reopen(
 ) -> DiskStorageEngine {
     engine.close_room(room).await.unwrap();
     open_engine(dir, room).await
+}
+
+/// Opens `room` with `schema`, retrying for a few seconds while it is `RoomLocked`: a task left
+/// running by a dropped operation, or by a dropped engine, may still hold the room's files.
+pub(crate) async fn open_when_unlocked(
+    engine: &DiskStorageEngine,
+    room: &RoomId,
+    schema: Schema,
+) -> Result<(), StorageError> {
+    for _ in 0..500 {
+        match engine.open_room(room, schema.clone()).await {
+            Err(StorageError::RoomLocked(_)) => tokio::time::sleep(Duration::from_millis(10)).await,
+            result => return result,
+        }
+    }
+    engine.open_room(room, schema).await
 }
 
 /// Applies `insert(seq)` for every `seq`, one batch each.
@@ -157,4 +176,25 @@ pub(crate) fn spawn_compaction(
 ) -> JoinHandle<Result<(), StorageError>> {
     let (engine, room) = (engine.clone(), room.clone());
     tokio::spawn(async move { engine.compact_room(&room).await })
+}
+
+/// Polls `operation`, letting the runtime and its blocking pool run between polls, and drops it
+/// after it has returned `Pending` `suspensions` times. Returns its output if it completed first.
+pub(crate) async fn poll_then_drop<F: Future>(
+    operation: F,
+    suspensions: usize,
+) -> Option<F::Output> {
+    let mut operation = std::pin::pin!(operation);
+    let mut seen = 0;
+    loop {
+        let polled = std::future::poll_fn(|cx| Poll::Ready(operation.as_mut().poll(cx))).await;
+        if let Poll::Ready(output) = polled {
+            return Some(output);
+        }
+        if seen == suspensions {
+            return None;
+        }
+        seen += 1;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
 }

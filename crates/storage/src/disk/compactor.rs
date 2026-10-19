@@ -158,6 +158,7 @@ pub(crate) async fn compact_room_cow(
         staged.discard().await;
         return Err(err);
     }
+    fail_point::panic_point("compaction.renamed", &room.wal_path);
     fail_point::check("compaction.phase3_sync", &room.wal_path)?;
     sync_parent(&room.snap_path).await?;
     {
@@ -188,6 +189,7 @@ async fn rotate_wal_to_compacting(
 ) -> Result<(), StorageError> {
     rename(&room.wal_path, wal_compacting_path).await?;
     fail_point::pause("compaction.rotate_renamed", &room.wal_path).await;
+    fail_point::panic_point("compaction.rotated", &room.wal_path);
 
     match open_fresh_wal(&room.wal_path, &room.room_id) {
         Ok(new_wal) => {

@@ -414,6 +414,7 @@ pub(crate) async fn recover_room(
     // process syncs them. What `.wal.compacting` holds is synced below, in the folded snapshot.
     fail_point::check("recovery.wal_sync", wal_path)?;
     sync_file(&mut wal_file, SyncKind::All).await?;
+    fail_point::panic_point("recovery.replayed", wal_path);
 
     // 4. Fold the rotated WAL into a fresh snapshot, then remove it
     if compacting_exists {

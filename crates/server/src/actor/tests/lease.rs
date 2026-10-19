@@ -52,6 +52,35 @@ fn unreadable_roster_opens_empty() {
     }
 }
 
+/// Every single bit flip and every truncation of a roster (two clients and a snapshot demand)
+/// discards it whole: no client, no cursor and no demand from a file that did not verify.
+#[test]
+fn every_damage_to_the_roster_discards_it() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("meta_clients_room.json");
+    let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
+    tracker.register_client(&ClientId::new("a").unwrap(), None, seq(7));
+    tracker.register_client(&ClientId::new("b").unwrap(), None, seq(9));
+    tracker.set_snapshot_demand(Some(SystemTime::now()));
+    tracker.save().unwrap();
+    let saved = fs::read(&path).unwrap();
+    let reopened = ClientLeaseTracker::open_or_create(&path).unwrap();
+    assert_eq!(reopened.clients.len(), 2);
+    assert!(reopened.snapshot_demand().is_some());
+
+    for (damage, bytes) in crate::test_support::every_truncation_and_bit_flip(&saved) {
+        fs::write(&path, &bytes).unwrap();
+        let tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
+        assert!(
+            tracker.clients.is_empty() && tracker.snapshot_demand().is_none(),
+            "a roster {damage} kept {} clients and the demand {:?}: {:?}",
+            tracker.clients.len(),
+            tracker.snapshot_demand(),
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+}
+
 #[test]
 fn interrupted_roster_save_keeps_previous_roster() {
     let dir = tempdir().unwrap();

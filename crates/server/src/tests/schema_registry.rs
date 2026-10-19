@@ -199,11 +199,9 @@ fn concurrent_schema_writes_all_succeed_without_losing_columns() {
     assert!(!durable::tmp_path_for(&todo_path(&dir)).exists());
 }
 
-/// A damaged schema file fails the registry's startup with a serialization error, without
-/// panicking, even when the damage leaves valid JSON; only a damage that left the file as it
-/// was loads. The damage is random, from a fixed seed.
-fn check_damaged_schema_files(seed: u64, cases: u64) {
-    // Two tables, a composite key, an encrypted and a nullable column, and a column added later.
+/// A registry directory holding the schema `todo` at version 2, with two tables, a composite
+/// key, an encrypted and a nullable column, and a column added later, and the bytes of its file.
+fn two_table_schema_file() -> (TempDir, SchemaId, Vec<u8>) {
     let dir = tempdir().unwrap();
     let id = SchemaId::new("todo").unwrap();
     let schema = Schema::builder()
@@ -227,8 +225,14 @@ fn check_damaged_schema_files(seed: u64, cases: u64) {
         .add_column(&id, "tasks", nullable_int("priority"))
         .unwrap();
     let original = fs::read(todo_path(&dir)).unwrap();
-    drop(registry);
+    (dir, id, original)
+}
 
+/// A damaged schema file fails the registry's startup with a serialization error, without
+/// panicking, even when the damage leaves valid JSON; only a damage that left the file as it
+/// was loads. The damage is random, from a fixed seed.
+fn check_damaged_schema_files(seed: u64, cases: u64) {
+    let (dir, _, original) = two_table_schema_file();
     let mut rng = crate::test_support::TestRng::new(seed);
     let mut next = move || rng.next_u64();
     for case in 0..cases {
@@ -277,4 +281,24 @@ fn damaged_schema_files_fail_the_startup() {
 #[ignore = "long-running randomized test; run with --ignored in release"]
 fn damaged_schema_files_fail_the_startup_long() {
     check_damaged_schema_files(0x5C4E_0002, 5_000);
+}
+
+/// Every single bit flip and every truncation of a schema file fails the startup: no damaged
+/// schema is ever loaded, whatever it would have renumbered or retyped.
+#[test]
+fn every_damage_to_a_schema_file_fails_the_startup() {
+    let (dir, id, original) = two_table_schema_file();
+    for (damage, bytes) in crate::test_support::every_truncation_and_bit_flip(&original) {
+        fs::write(todo_path(&dir), &bytes).unwrap();
+        let opened = SchemaRegistry::new(dir.path());
+        assert!(
+            matches!(opened, Err(ServerError::Serialization(_))),
+            "a schema file {damage} gave {:?}: {:?}",
+            opened.map(|registry| registry.get_schema(&id)),
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+    fs::write(todo_path(&dir), &original).unwrap();
+    let reopened = SchemaRegistry::new(dir.path()).unwrap();
+    assert_eq!(reopened.get_schema(&id).unwrap().version(), 2);
 }

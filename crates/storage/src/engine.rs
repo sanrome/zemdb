@@ -37,6 +37,14 @@ pub type RowStream<'a> =
 /// Implementations must be thread-safe (or single-thread compatible on wasm32)
 /// and handle room lifecycle, sequenced operation batches, point lookups,
 /// range scans with pushdowns, and full state snapshots.
+///
+/// `DiskStorageEngine` (not built for WebAssembly) runs `open_room` once it has the engine's
+/// rooms, `apply_snapshot` once it has the compaction lock, and its compaction in tasks of
+/// their own: dropping the future that awaits one does not cancel it, and `close_room` waits
+/// for an open, a snapshot install or a compaction in progress. Shutting the Tokio runtime
+/// down does stop those tasks, but not the file operations they already handed to the
+/// blocking pool, and a room reopened in the same process before those land can lose
+/// acknowledged batches. Close the rooms before shutting the runtime down.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait StorageEngine: EngineConcurrencyBounds {
