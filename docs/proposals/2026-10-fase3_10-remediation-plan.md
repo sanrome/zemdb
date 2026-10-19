@@ -112,7 +112,7 @@ Se continúa la numeración del plan de la Fase 3.9 (que termina en D89). Las de
 | **D99** | **La apertura del log retiene solo la ventana de RAM (DEF-170).** `inspect_active_segment` valida todos los frames y junta los ids de mutación, pero mientras lee retiene solo una ventana deslizante acotada por `ram_max_ops` y `ram_max_bytes`, con el cobro de D73. `segment_mutations` (un segmento sin sidecar) junta solo los ids. La memoria de la apertura queda acotada por la ventana de RAM más un frame, además de los ids de la ventana de dedup. Al adoptarla se precisó: la ventana es un modo de `ReadBudget` que siempre conserva la última operación (dice dónde terminó la lectura), y vale también para la verificación del cold duplicado del Lote 1 (DEF-168). | 2 | Adoptada |
 | **D100** | **`main` síncrono (DEF-172).** `main` deja de ser `#[tokio::main]`: toma `server.lock`, arma el runtime, hace `block_on` del servidor, suelta el runtime (que espera a los `spawn_blocking` en curso) y recién después suelta el lock. No se usa `shutdown_timeout`, que soltaría el lock con tareas todavía corriendo. Se descarta filtrar el handle: depende de que el sistema operativo lo suelte al salir y deja el orden implícito. | 3 | Adoptada |
 | **D101** | **La purga del relay retiene el lock del slot (DEF-175).** La purga (`relay/lifecycle.rs`) toma el lock del slot de la sala como guard propio (*owned*) y lo mueve a la closure de `run_blocking`, que lo suelta después de su última operación de archivo (INV-L7). Una purga cortada termina antes de que la sala recreada pueda instalar un snapshot. Vale para `create_room` y `delete_room`, que comparten la purga, y para `drop_stale` (`relay/download.rs`), que borra el snapshot descartado con el mismo patrón y es la otra ruptura de INV-L7 en el relay. La alternativa, correr `create_room` en su propia tarea, cierra este caso pero no el patrón. Al implementarla se precisó: como la purga sacaba el slot del mapa, retener su guard no frenaba a nadie; ahora deja en el mapa un slot nuevo, ya tomado, y es ese guard el que mueve a la closure. | 3 | Adoptada |
-| **D102** | **El tope total de una subida se cuenta por uploader (DEF-174).** Completa el fix de DEF-153: hoy el tope se hereda cuando el uploader reinicia con la sesión viva, pero no a través de un vencimiento. El slot recuerda el uploader y el tope de la última sesión vencida, y una sesión nueva del mismo uploader que arranca dentro de `UPLOAD_IDLE_TIMEOUT` desde ese vencimiento hereda el tope: si ya pasó, se rechaza como una subida vencida. Así una subida, su ancla de poda (D61) y la designación que congela (D76) quedan acotadas por `snapshot_upload_max_secs`, y entre dos ciclos hay al menos un plazo de inactividad en el que la designación se reemplaza. Cumple el ajuste de INV-B2 ("por uploader") y hace pasar los cuatro tests de `inv2/b` e `inv2/delta`. La alternativa, que `designate` deje de congelar después de `designation_timeout + snapshot_upload_max_secs`, cierra R4 pero no el tope de la subida ni el ancla. Al adoptarla se precisó: (a) el vencimiento de una sesión es el instante en que quedó inactiva, `min(deadline, last_chunk_at + UPLOAD_IDLE_TIMEOUT)`; `expire_locked` olvida el tope recordado pasado el vencimiento más `UPLOAD_IDLE_TIMEOUT`, y `cleanup_expired` no suelta un slot mientras lo recuerde; (b) vale también para el worker con sus propias subidas, pero el tope recordado de un cliente nunca lo afecta; (c) solo se recuerda la última sesión vencida, así que dos miembros que se alternan pueden seguir anclando la poda, pero ninguno retiene su designación; (d) el chunk rechazado recibe `SnapshotSuperseded`; (e) sumada por la revisión de delta: una sesión cuyo último chunk no termina instalado (el rango se movió o el archivo no verifica) se recuerda igual que una que quedó inactiva, porque si no, mandar el último chunk con basura renueva el tope en cada ciclo. | 4 | Adoptada |
+| **D102** | **El tope total de una subida se cuenta por uploader (DEF-174).** Completa el fix de DEF-153: hoy el tope se hereda cuando el uploader reinicia con la sesión viva, pero no a través de un vencimiento. El slot recuerda el uploader y el tope de la última sesión vencida, y una sesión nueva del mismo uploader que arranca dentro de `UPLOAD_IDLE_TIMEOUT` desde ese vencimiento hereda el tope: si ya pasó, se rechaza como una subida vencida. Así una subida, su ancla de poda (D61) y la designación que congela (D76) quedan acotadas por `snapshot_upload_max_secs`, y entre dos ciclos hay al menos un plazo de inactividad en el que la designación se reemplaza. Cumple el ajuste de INV-B2 ("por uploader") y hace pasar los cuatro tests de `inv2/b` e `inv2/delta`. La alternativa, que `designate` deje de congelar después de `designation_timeout + snapshot_upload_max_secs`, cierra R4 pero no el tope de la subida ni el ancla. Al adoptarla se precisó: (a) el vencimiento de una sesión es el instante en que quedó inactiva, `min(deadline, last_chunk_at + UPLOAD_IDLE_TIMEOUT)`; `expire_locked` olvida el tope recordado pasado el vencimiento más `UPLOAD_IDLE_TIMEOUT`, y `cleanup_expired` no suelta un slot mientras lo recuerde; (b) vale también para el worker con sus propias subidas, pero el tope recordado de un cliente nunca lo afecta; (c) solo se recuerda la última sesión vencida, así que dos miembros que se alternan pueden seguir anclando la poda, pero ninguno retiene su designación (la revisión de cierre mostró que no es así si cada uno reemplaza la subida del otro con una secuencia mayor: DEF-182, al backlog); (d) el chunk rechazado recibe `SnapshotSuperseded`; (e) sumada por la revisión de delta: una sesión cuyo último chunk no termina instalado (el rango se movió o el archivo no verifica) se recuerda igual que una que quedó inactiva, porque si no, mandar el último chunk con basura renueva el tope en cada ciclo. | 4 | Adoptada |
 
 ---
 
@@ -125,9 +125,9 @@ Se continúa la numeración del plan de la Fase 3.9 (que termina en D89). Las de
 | 2 | Apertura acotada | DEF-170 | Alta | ✅ 1/1 |
 | 3 | Locks y ciclo de vida | DEF-172, 175 | Media | ✅ 2/2 |
 | 4 | Subidas | DEF-174, 176, 180 | Media | ✅ 3/3 |
-| 5 | Cierre | Documentación y revisión de cierre (D90) | Requisito de la Fase 4 | ⬜ |
+| 5 | Cierre | Documentación y revisión de cierre (D90) | Requisito de la Fase 4 | ✅ |
 
-**Avance total:** Lotes 0 a 4 cerrados; 9 de 9 ítems.
+**Avance total:** Lotes 0 a 5 cerrados; 9 de 9 ítems. La revisión de cierre salió en verde: el requisito para la Fase 4 está cumplido.
 
 **Por qué este orden, en una línea por lote:**
 0. Sin el contrato actualizado, cada lote se revisa contra enunciados viejos; sin las redes en el repo, se pierden.
@@ -572,7 +572,7 @@ El test de `inv2/delta` sobre el actor (`designee_keeps_the_role…`) no se traj
 - **La subida en un solo request:** no cambia. No tiene tope total; la acotan los plazos del body.
 - **Un `.await` nuevo:** no hay. El rechazo vuelve antes de cualquier `.await` y de cualquier cambio.
 - **La completación fallida** (sumada en la revisión): precisión (e). Si el future se suelta durante la promoción, el tope queda recordado, que es lo conservador.
-- **El reemplazo por otro uploader con una secuencia mayor, y el del worker** (sumadas en la revisión): la sesión reemplazada no se recuerda. Solo sirve con dos miembros que se alternan o depende del worker, así que entra en lo aceptado por la precisión (c).
+- **El reemplazo por otro uploader con una secuencia mayor, y el del worker** (sumadas en la revisión): la sesión reemplazada no se recuerda. Solo sirve con dos miembros que se alternan o depende del worker, así que entra en lo aceptado por la precisión (c). La revisión de cierre mostró que así el designado sí retiene la designación (DEF-182, al backlog).
 
 #### DEF-176 · Bajo · ✅ Hecho
 **Problema.** El chunk 0 sin ancla compara el snapshot que elige con un rango del log leído antes de elegirlo. Puede servir uno por debajo de la cola, si en el medio se instaló una subida, o descartar uno más nuevo y usable. Es una regresión del orden que introdujo el fix de DEF-152.
@@ -645,14 +645,21 @@ Los cambios posteriores a la revisión (la precisión e y el hook) no volvieron 
 
 > Objetivo: que los documentos describan lo que cambió la fase, y la revisión de cierre que reemplaza a la tercera auditoría (D90).
 
-#### Documentación · ⬜ Pendiente
+#### Documentación · ✅ Hecho
 **Solución.** Cada lote actualiza sus documentos al cerrar; este lote verifica que no falte nada y suma:
 - **`ARCHITECTURE.md`:** la salvedad de la línea 234 sobre el reintento de una subida en un solo request (DEF-178, **(barato)**) y la corrección de la línea 245 sobre la subida en curso durante un borrado (backlog).
 - **ROADMAP:** la Fase 3.10 y el estado del requisito para la Fase 4.
 
 **Test exigido.** Ninguno. Revisión cruzada de cada afirmación cambiada contra el código.
 
-#### Revisión de cierre (D90) · ⬜ Pendiente
+**Hecho.** En `ARCHITECTURE.md`:
+- La salvedad de DEF-178: ni el reintento en un solo request ni el reenvío de un chunk se comparan otra vez con el piso.
+- La corrección del borrado: una subida que ya tiene el lock del slot cuando arranca la purga se confirma, y la purga borra su snapshot enseguida (`purge_room` espera ese lock).
+- La salvedad de DEF-182 sobre el tope por uploader.
+
+En `INVARIANTES.md`: el resultado de la revisión de cierre (§1.4), DEF-182 en B2 y R4, y el estado ❌ Medio (backlog) en §1.5. En el ROADMAP: la Fase 3.10 y el requisito para la Fase 4. No quedaba ningún *Pendiente* de los Lotes 1 a 4.
+
+#### Revisión de cierre (D90) · ✅ Hecho
 **Qué es.** Un agente aparte, de contexto fresco y en modo solo lectura, revisa el delta completo de la fase (`a2f6806..HEAD`) contra `INVARIANTES.md`, con los riesgos de §4 y la regla de severidad de D91. Usa los veredictos de §1.1, pero solo sobre lo que la fase tocó. Responde:
 - si cada ítem cierra su escenario y si su mutación inversa hace fallar un test;
 - si las interacciones listadas en cada nota **Hecho** están completas y probadas;
@@ -664,6 +671,15 @@ Un hallazgo trae su test, como en la auditoría. Antes de la revisión, todos lo
 - **Sin una ★ rota, una ruptura Alta ni una Media de origen (a):** `INVARIANTES.md` §1.4 queda en verde y el ROADMAP marca cumplido el requisito para la Fase 4.
 - **Con alguna:** se agrega a este plan como ítem nuevo (DEF-182 en adelante) en un Lote 6, y la revisión de cierre se repite **solo sobre el delta de ese lote**.
 - **Lo de origen (b) o (c), Medio o Bajo:** al backlog.
+
+**Hecho.** Sobre `d2c1406`, con la CI de `main` en verde en las tres plataformas y las versiones largas en verde a mano (`cargo test --workspace --release -- --ignored`, 38 tests, Linux). La hizo un agente aparte, de contexto fresco, en un worktree aislado.
+
+**Veredicto: verde.** No hay ninguna ★ rota, ninguna ruptura Alta ni ninguna Media de origen (a).
+- Cada ítem cierra su escenario.
+- El agente aplicó la mutación inversa de cada uno, y cada una hace fallar un test.
+- La de DEF-172 (`main.rs`) se verificó solo leyendo el código, como en la revisión del Lote 3.
+
+**Encontró una Media de origen (b), con disparador hostil: DEF-182, al backlog.** Es la interacción que faltaba en DEF-174. El designado y un cómplice se reemplazan las subidas con secuencias crecientes, antes de que queden inactivas. La sesión reemplazada no se recuerda, así que el designado arranca con un tope nuevo en cada vuelta y retiene la designación sin límite (INV-B2, INV-R4). Contradice la precisión (c) de D102, que se corrigió. El test de la revisión (reproducido: 476 s con el designado en curso, contra un tope de 300 s más 120 s de inactividad) quedó anotado en el backlog.
 
 ---
 
@@ -698,6 +714,11 @@ Sigue vigente el [backlog de la Fase 3.9](2026-10-fase3_9-remediation-plan.md#ba
 **Nuevo en el Lote 3 (revisión de delta), Bajo:** el test del binario (`server_binary_tests.rs`) puede pasar sin probar nada si el último chunk no se procesa entero en los 300 ms antes del corte, y deja el proceso hijo corriendo si falla un assert antes de `server.wait()`. Solución: esperar a que el upload llegue a la promoción (por ejemplo, con un `.part` del tamaño total), y matar el hijo con un guard.
 
 **Nuevo en el Lote 2 (revisión de delta), Bajo:** ante una anomalía en un cold, `read_cold_file` descomprime en memoria el resto del segmento (hasta `segment_max_bytes`) para clasificarla. La apertura lo hace si un cold duplicado o un cold sin sidecar están dañados, y eso retiene más que la ventana de RAM y un frame. Necesita un daño accidental y son bytes de wire. Solución: clasificar recorriendo el stream sin juntarlo, o acotar lo que se lee al frame siguiente.
+
+**Nuevo en la revisión de cierre, Medio (b), disparador hostil:**
+- **DEF-182** (B2, R4): una subida reemplazada por otro uploader con una secuencia mayor no se recuerda. Así, el designado y un cómplice que se alternan renuevan el tope del designado en cada vuelta, y este retiene la designación sin límite.
+- **Test:** en `relay/tests/lifecycle.rs`, se sube un chunk como el designado. Después, diez veces: se avanza `UPLOAD_IDLE_TIMEOUT - 1s`, el cómplice sube `n + 1` y el designado `n + 2`. Se comprueba que `upload_in_progress_by(designado)` es falso pasados `snapshot_upload_max_secs + UPLOAD_IDLE_TIMEOUT`.
+- **Solución:** recordar también, por uploader, la sesión reemplazada; o que `designate` deje de congelar pasado `designation_timeout + snapshot_upload_max_secs`.
 
 Más los tres Bajos que no entran (D97):
 - **DEF-177** (R7): el piso se olvida cuando el actor se detiene, y una subida en vuelo se confirma sin chequearlo. Solución: que la tarea del actor no borre el piso mientras haya una subida en curso, y que `cleanup_expired` lo borre junto con el slot.

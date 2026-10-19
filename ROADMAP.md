@@ -1,9 +1,9 @@
 # ROADMAP.md: Hoja de Ruta de Implementación de ZemDB
 
 **Proyecto:** `ZemDB` (Motor de Base de Datos Distribuida Local-First)  
-**Fecha de Actualización:** 18 de Octubre de 2026  
-**Documentos Relacionados:** [README.md](README.md) | [ARCHITECTURE.md](ARCHITECTURE.md) | [Auditoría Fase 2](docs/audits/2026-09-fase2-audit.md) | [Propuesta Técnica Fases 2.5, 3 y 4](docs/proposals/2026-09-fase2_5-hardening-proposal.md) | [Plan Fase 3.6](docs/proposals/2026-10-fase3_6-remediation-plan.md) | [Plan Fase 3.7](docs/proposals/2026-10-fase3_7-remediation-plan.md) | [Plan Fase 3.8](docs/proposals/2026-10-fase3_8-remediation-plan.md) | [Plan Fase 3.9](docs/proposals/2026-10-fase3_9-remediation-plan.md) | [Invariantes](docs/INVARIANTES.md)  
-**Estado:** Hoja de Ruta Oficial de Desarrollo — Fases 1 a 3.9 Completadas / Fases 4 y 5 Planificadas
+**Fecha de Actualización:** 19 de Octubre de 2026  
+**Documentos Relacionados:** [README.md](README.md) | [ARCHITECTURE.md](ARCHITECTURE.md) | [Auditoría Fase 2](docs/audits/2026-09-fase2-audit.md) | [Propuesta Técnica Fases 2.5, 3 y 4](docs/proposals/2026-09-fase2_5-hardening-proposal.md) | [Plan Fase 3.6](docs/proposals/2026-10-fase3_6-remediation-plan.md) | [Plan Fase 3.7](docs/proposals/2026-10-fase3_7-remediation-plan.md) | [Plan Fase 3.8](docs/proposals/2026-10-fase3_8-remediation-plan.md) | [Plan Fase 3.9](docs/proposals/2026-10-fase3_9-remediation-plan.md) | [Plan Fase 3.10](docs/proposals/2026-10-fase3_10-remediation-plan.md) | [Invariantes](docs/INVARIANTES.md)  
+**Estado:** Hoja de Ruta Oficial de Desarrollo — Fases 1 a 3.10 Completadas / Fases 4 y 5 Planificadas
 
 ---
 
@@ -121,7 +121,7 @@ ZemDB ha superado con éxito la **Fase 1 y 1.5 (Reestructuración, Blindaje de C
 - Se completó el blindaje criptográfico integral del Data Plane mediante el extractor `ClientAuth`, validación de rutas en 3 vías, tiempo constante y leases activos.
 - Las Fases 3.6 y 3.7 cerraron las auditorías posteriores (ver sus planes en `docs/proposals/`): ciclo de vida de clientes derivado del cursor, política de ciclo de vida por sala, relay de snapshots en disco, borde HTTP con límites propios, header del frame WAL con CRC, log del servidor acotado en bytes, validación de snapshots recibidos y squashing de la outbox por orden de llegada. La Fase 3.8 cerró la auditoría posterior: respuestas HTTP acotadas en tiempo y memoria, storage que exige un esquema que cubra sus datos, roster y apertura de salas más baratos, contrato del protocolo (encarnación de la sala, dedup por cliente, versión de esquema en las respuestas) y recuperación ante daño en el log. La Fase 3.9 cerró la primera auditoría por invariantes, contra el contrato de [`docs/INVARIANTES.md`](docs/INVARIANTES.md), y dejó sus simulaciones y fuzzers en el repo. Cambió: ventana de dedup en orden del log; apertura que solo confía en lo verificado y sincronizado (metadatos con checksum, piso de secuencia, un servidor por `data_dir`); absorción atómica y operaciones de storage en su propia tarea; recursos acotados (respuestas por cliente, subidas con plazo y tope, cuota de la sala sobre warm y sidecars); y borrado de sala con lápida.
 
-Antes de construir la sincronización optimista reactiva en el cliente (Fase 4) hace falta cerrar el [plan de la Fase 3.10](docs/proposals/2026-10-fase3_10-remediation-plan.md). La auditoría acotada sobre `b4cb390` ([`docs/audits/2026-10-invariantes-audit-2.md`](docs/audits/2026-10-invariantes-audit-2.md)) no salió en verde (DEF-167 a DEF-181). El plan arregla sus rupturas Altas, las Medias DEF-172, DEF-174 y DEF-175 y dos Bajas; DEF-171, DEF-173 y DEF-179 se resuelven por decisión (un supuesto, un riesgo aceptado y un enunciado ajustado). Cierra con una revisión de su delta en lugar de otra auditoría (D90, `INVARIANTES.md` §1.4).
+La Fase 3.10 cerró el [plan](docs/proposals/2026-10-fase3_10-remediation-plan.md) de la segunda auditoría por invariantes, y con eso se cumple el requisito para empezar la Fase 4. La auditoría acotada sobre `b4cb390` ([`docs/audits/2026-10-invariantes-audit-2.md`](docs/audits/2026-10-invariantes-audit-2.md)) no salió en verde (DEF-167 a DEF-181). El plan arregla sus rupturas Altas, las Medias DEF-172, DEF-174 y DEF-175 y dos Bajas; DEF-171, DEF-173 y DEF-179 se resuelven por decisión (un supuesto, un riesgo aceptado y un enunciado ajustado). Cerró con una revisión de su delta en lugar de otra auditoría (D90, `INVARIANTES.md` §1.4). La revisión salió en verde y dejó una Media de origen (b) en el backlog (DEF-182). Cambió: la apertura del log, que sella `active.wal` por debajo del piso, conserva el cold verificado y retiene solo la ventana de RAM; `server.lock` y el lock del relay, que viven hasta la última operación de archivo; y las subidas, con tope por uploader, el chunk 0 comparado con un rango posterior y chunks ajenos fuera de una subida.
 
 ---
 
@@ -660,7 +660,7 @@ tokio::spawn(async move {
 │ [x] Relay efímero de chunks multipart para snapshots >16MB.                 │
 │ [x] Batería de pruebas de integración concurrentes con múltiples clientes.  │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│ FASES 3.5 a 3.9: Auditorías y Remediación [COMPLETADAS]                     │
+│ FASES 3.5 a 3.10: Auditorías y Remediación [COMPLETADAS]                    │
 │ [x] 3.5: catchup 1-RTT, auth universal, active.wal único, relay multipart.  │
 │ [x] 3.6: ciclo de vida por cursor, política por sala, relay en disco, CI.   │
 │ [x] 3.7: frame WAL con CRC de header, límites HTTP y en bytes, snapshots    │
@@ -669,6 +669,8 @@ tokio::spawn(async move {
 │     versión de esquema, recuperación ante daño en el log, CI con MSRV.      │
 │ [x] 3.9: auditoría por invariantes, simulaciones en el repo, metadatos con  │
 │     checksum, piso de secuencia, recursos por cliente, borrado con lápida.  │
+│ [x] 3.10: apertura acotada y sin pérdidas, locks hasta la última escritura, │
+│     subidas con tope por uploader; cierre por revisión del delta (D90).     │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ FASE 4: SDK Local-First Reactivo y Sincronización (zemdb-client)            │
 │ [ ] Modularización de crates/client (lib.rs, api/, sync/, transport/).      │
