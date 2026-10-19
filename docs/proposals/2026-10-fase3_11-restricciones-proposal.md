@@ -13,11 +13,12 @@
 - **Qué.** Los esquemas pueden declarar:
   - restricciones `UNIQUE` de una o varias columnas;
   - claves foráneas (`FOREIGN KEY`) hacia la clave primaria de una tabla del mismo esquema, incluida la propia, con `ON DELETE RESTRICT`;
-  - un **dueño de fila** (`owner`): una columna que tiene que ser el `ClientId` de quien escribe la operación;
+  - un **dueño de fila** (`owner`): una columna que identifica al cliente dueño de la fila, con su `ClientId` o con un seudónimo; solo el dueño puede insertarla, modificarla o borrarla;
   - **tablas inmutables** (`immutable`): una fila se inserta una vez y nunca se reemplaza, modifica ni borra.
 - **Quién las verifica.**
   - `UNIQUE`, `FOREIGN KEY` y la regla de inmutabilidad sobre un `Insert` dependen del estado: las verifica cada réplica al aplicar el log, en orden de secuencia. Una operación que viola una de ellas se secuencia y queda en el log como cualquier otra. Cada réplica la convierte en un NOP: no cambia nada y se informa como rechazada.
-  - El dueño de fila, y que una tabla inmutable no reciba `Update` ni `Delete`, no dependen del estado. Los verifica el servidor al recibir el commit, como hoy verifica tipos y nulabilidad.
+  - Que el dueño que declara una operación sea quien la envía, y que una tabla inmutable no reciba `Update` ni `Delete`, no dependen del estado. Los verifica el servidor al recibir el commit, como hoy verifica tipos y nulabilidad.
+  - Que ese dueño sea también el de la fila existente sí depende del estado. Lo verifican las réplicas, salvo cuando el dueño está en la clave primaria: ahí no hace falta.
 - **El servidor.** Guarda y distribuye las restricciones como parte del esquema y valida su definición. No mira filas: sus validaciones siguen siendo livianas y sin estado.
 - **Por qué funciona.** Aplicar el log ya es una función determinista del estado y la operación (INV-Y8), y el mecanismo ya existe: un `Update` sobre una fila inexistente se secuencia y cada réplica lo ignora. Las restricciones agregan condiciones a esa función.
 - **El riesgo.** Hoy el servidor es la única autoridad sobre qué es válido. Con esto, cada réplica tiene que tomar exactamente la misma decisión, o los datos divergen sin aviso. Casi todas las decisiones de §3 existen para eso. La más importante es DR3: una restricción solo puede nacer con el esquema, o con una columna nueva que la incluya, porque hoy un cambio de esquema no tiene posición en el log.
@@ -26,7 +27,7 @@
   - Core: el esquema.
   - Storage: es el grueso. Índices en memoria, la verificación y el resultado por operación de `apply_batch`.
   - Cliente: todavía no existe; se diseña con esto desde el principio (§7).
-- **Plan.** Siete lotes (§6): contrato, core, servidor, tres de storage y cierre. La metodología está en §5.
+- **Plan.** Siete lotes, más uno opcional (§6): contrato, core, servidor (con un 2b opcional de seudónimos), tres de storage y cierre. La metodología está en §5.
 
 ---
 
@@ -66,7 +67,7 @@ En los dos casos todas las réplicas terminan iguales, y cada cliente se entera 
 ### 2.1. Entra
 - `UNIQUE` sobre una o varias columnas de una tabla.
 - `FOREIGN KEY` de una o varias columnas hacia la clave primaria completa de una tabla del mismo esquema, incluida la propia (árboles, jerarquías). `ON DELETE RESTRICT` es la única acción al borrar un padre.
-- **Dueño de fila:** una columna `String` cuyo valor tiene que ser el `ClientId` autenticado del commit. Va en la clave primaria, o en una tabla inmutable (DR10).
+- **Dueño de fila:** una columna cuyo valor identifica al cliente dueño (DR10). Puede ser su `ClientId`, o un seudónimo que no lo revela a los demás miembros (DR15, opcional). Solo el dueño puede insertar, modificar o borrar la fila, esté la columna en la clave primaria o no.
 - **Tabla inmutable:** solo admite `Insert`, y un `Insert` sobre una clave primaria que ya existe se rechaza (DR11).
 - Restricciones declaradas al crear el esquema. `UNIQUE` y `FOREIGN KEY` también se pueden declarar al agregar una columna, si la incluyen (DR3).
 - El resultado de cada operación (aplicada o rechazada, y por qué), observable a través de `apply_batch`.
@@ -78,7 +79,7 @@ En los dos casos todas las réplicas terminan iguales, y cada cliente se entera 
 | `ON DELETE CASCADE` y `SET NULL` | Producen efectos que no están en el log (borrados o updates derivados). El reporte y el `ChangeStream` tendrían que propagarlos, y un borrado puede tocar muchas filas. | Sí, como acción nueva. Usa el mismo índice inverso que `RESTRICT`. |
 | `CHECK` | Los de una sola columna no dependen del estado: los podría validar el servidor, como hoy valida tipos. Los de varias columnas necesitan la fila entera, que un `Update` parcial no trae. | Sí. Los de una columna, en el servidor. |
 | Restricciones sobre columnas que ya existen | Se aplicarían también a operaciones secuenciadas antes de crearlas. Hace falta anclar el cambio de esquema en el log (DR3). | Sí, con un marcador de cambio de esquema en el log de cada sala. Es el cambio caro. |
-| Dueño de fila fuera de la clave primaria, en una tabla mutable | Para impedir que B modifique o borre una fila de A hay que saber de quién es la fila existente: eso depende del estado. Las réplicas no pueden verificarlo, porque el log no guarda quién escribió cada operación (solo un hash del cliente y la mutación, para el dedup). | Sí, pero requiere registrar el autor de cada operación en el log, el WAL, el `SyncBatch` y el storage del cliente. Es un cambio de formato y de protocolo, y expone a la sala quién escribió cada operación. |
+| Anonimato frente al operador del servidor | El seudónimo (DR15) oculta el `ClientId` a los demás miembros, pero quien tiene el secreto del servidor puede recalcularlo para cada cliente. | No con este modelo. Haría falta criptografía como firmas ciegas o pruebas de conocimiento cero. |
 | Restricciones diferidas y transacciones de varias operaciones | Cada commit lleva una sola operación (`ClientMessage::Commit`). | Requiere commits de varias operaciones. |
 | Collations, comparación sin distinguir mayúsculas, normalización Unicode | El resultado depende de la versión de Unicode de cada cliente: no es determinista entre réplicas. | No con este modelo. La aplicación puede guardar una columna ya normalizada. |
 | Restricciones sobre columnas cifradas | El texto cifrado es aleatorio, y ni el storage ni el servidor tienen las claves. | No. |
@@ -97,16 +98,17 @@ Se numeran DR1, DR2, etc. para no chocar con la numeración D de los planes de r
 | **DR2** | **Alcance.** El de §2.1. Lo de §2.2 queda afuera. | 0 | Propuesta |
 | **DR3** | **Una restricción nunca cambia la decisión sobre el pasado.** Una restricción nace con el esquema (`POST /admin/schemas`), o con la columna nueva que agrega `add_column`. En ese caso tiene que incluirla: entre sus columnas para `UNIQUE`, y entre las columnas de la tabla hija para una FK. Nunca se agrega sobre columnas existentes, ni se quita ni modifica. El dueño y la inmutabilidad se declaran solo al crear el esquema. Una sala existente solo se reasigna a otro esquema (`RoomManager::get_or_spawn` con esquema) si ese esquema tiene las mismas restricciones. El porqué está en §3.2. **Alternativa descartada para esta fase:** un marcador de cambio de esquema en el log de cada sala. Permitiría restricciones sobre columnas existentes, a cambio de tocar el log, el sync y el replay. | 0, 1, 2 | Propuesta |
 | **DR4** | **Semántica de la verificación.** Ver §3.1. En resumen:<br>- Se verifican las restricciones cuyas columnas toca la operación (todas, en un `Insert`).<br>- La igualdad es la de `Value`.<br>- Una clave con algún `NULL` no se verifica.<br>- Las columnas que faltan en una fila corta son `NULL`.<br>- El motivo informado es el de la primera restricción que falla, en un orden fijo. | 4 | Propuesta |
-| **DR5** | **El resultado se informa.** `apply_batch` devuelve `ApplyReport { head_seq, rejected }`, con un elemento `(seq, motivo)` por cada operación no aplicada.<br>- **Motivos:** `Unique`, `ForeignKey` y `Restrict`, con el nombre de la restricción; `Duplicate` (un `Insert` en una tabla inmutable sobre una clave existente); y `MissingRow` (un `Update` sobre una fila que no existe, que hoy se ignora sin aviso).<br>- Solo se listan las excepciones, para no reservar un resultado por operación.<br>- En la recuperación, el reporte se descarta.<br>Los nombres son tentativos. | 3, 4 | Propuesta |
+| **DR5** | **El resultado se informa.** `apply_batch` devuelve `ApplyReport { head_seq, rejected }`, con un elemento `(seq, motivo)` por cada operación no aplicada.<br>- **Motivos:** `Unique`, `ForeignKey` y `Restrict`, con el nombre de la restricción; `Duplicate` (un `Insert` en una tabla inmutable sobre una clave existente); `NotOwner` (la fila existente es de otro dueño); y `MissingRow` (un `Update` sobre una fila que no existe, que hoy se ignora sin aviso).<br>- Solo se listan las excepciones, para no reservar un resultado por operación.<br>- En la recuperación, el reporte se descarta.<br>Los nombres son tentativos. | 3, 4 | Propuesta |
 | **DR6** | **Índices derivados en memoria, sin cambio de formato en disco.**<br>- Un índice por restricción: para `UNIQUE`, clave → PK; para una FK, clave foránea → PK hija. Los dos son multimapas ordenados y persistentes (`imbl`, con clon O(1) como `Table`), para que el motor de disco los clone y los publique junto con las tablas.<br>- Solo se indexan claves sin `NULL`.<br>- No se persisten. Se construyen al abrir (desde el snapshot, antes del replay) y al aplicar un snapshot, y se actualizan con cada operación aplicada.<br>- El `.snap`, el WAL y el envelope `ZMSN` no cambian. | 3 | Propuesta |
 | **DR7** | **El estado siempre cumple las restricciones.**<br>- `apply_snapshot` verifica que el snapshot cumpla las restricciones del esquema con que se aplica. Lo hace al construir los índices, en el pool bloqueante. Si no las cumple, responde `SnapshotCorruption` y la sala no cambia (INV-S5).<br>- `open_room` hace lo mismo con el snapshot local. Una violación es un error y no se descarta nada (INV-S4). | 5 | Propuesta |
 | **DR8** | **Formato estricto y semántica congelada.**<br>- Las restricciones, el dueño y la inmutabilidad viven en `TableSchema`, que ya rechaza campos desconocidos.<br>- `ColumnDef` y los cuerpos de `POST /admin/schemas` y `.../columns` pasan a rechazarlos. Hoy un `"unique": true` dentro de una columna se ignoraría sin aviso.<br>- Los campos nuevos se serializan siempre, porque bincode es posicional. En JSON tienen default vacío.<br>- `PROTOCOL_VERSION` queda en `0x01` (`GEMINI.md`).<br>- La semántica de un tipo de restricción no cambia nunca: otro comportamiento es otro tipo. Un cliente viejo no puede decodificar un tipo nuevo, así que falla cerrado en vez de aplicar el log sin la regla. | 1, 2 | Propuesta |
 | **DR9** | **Límites.**<br>- Un tope de restricciones por tabla y de columnas por restricción, para acotar el costo de cada operación (INV-W1). Propuesta: 32 y 16.<br>- Los nombres de restricción son únicos en el esquema. | 1 | Propuesta |
-| **DR10** | **Dueño de fila: lo verifica el servidor.**<br>- Una tabla declara `owner: "<columna>"`. La columna es `String` y no está cifrada. Tiene que ser parte de la clave primaria, salvo en una tabla inmutable.<br>- Al recibir un commit, después de `validate_operation` y antes de secuenciar, el servidor compara el valor de esa columna con el `ClientId` autenticado, byte a byte. Ese `ClientId` es el del token: INV-A1 ya impide que un mensaje nombre a otro cliente.<br>  - **Columna en la clave:** se compara la de la clave de la operación, en `Insert`, `Update` y `Delete`.<br>  - **Tabla inmutable:** se compara la de la fila del `Insert`.<br>- Si no coincide, responde `SchemaViolation`, permanente para esa mutación, y no queda rastro (INV-Y5). No responde `Forbidden`, que el SDK interpreta como un problema del token.<br>- No necesita estado ni cambia el log, y las réplicas no hacen nada. El porqué está en §3.4. | 2 | Propuesta |
+| **DR10** | **Dueño de fila: el servidor verifica quién declara, las réplicas de quién es la fila.**<br>- Una tabla declara `owner: { column, identity }`. La columna no está cifrada. Es `String` si la identidad es el `ClientId`, y `Bytes` si es un seudónimo (DR15).<br>- **Toda operación declara el dueño:**<br>  - **Columna en la clave primaria:** la clave ya lo trae, en `Insert`, `Update` y `Delete`.<br>  - **Columna fuera de la clave:** el `Insert` lo trae en la fila; un `Update` tiene que incluir un delta de esa columna con el dueño; un `Delete` lo lleva en un campo nuevo, `Delete { owner }` (hoy `Delete` no lleva datos).<br>  - `validate_operation` rechaza una operación que no lo declara, y una que lo declara donde no corresponde.<br>- **Servidor:** al recibir el commit, después de `validate_operation` y antes de secuenciar, compara el dueño declarado con el del cliente autenticado (INV-A1), byte a byte. Si no coincide, responde `SchemaViolation`, permanente para esa mutación, y no queda rastro (INV-Y5). No responde `Forbidden`, que el SDK interpreta como un problema del token.<br>- **Réplicas:** si la columna está fuera de la clave y la fila existe, su dueño tiene que ser el declarado; si no, rechazan la operación (`NotOwner`). Así nadie modifica, borra ni reemplaza una fila ajena, y un `Update` no puede transferir una fila.<br>- El servidor no modifica la operación ni guarda estado, y el log no necesita registrar quién escribió cada operación. Ver §3.4. | 2, 4 | Propuesta |
 | **DR11** | **Tabla inmutable.** `immutable: true` en la tabla.<br>- `validate_operation` rechaza `Update` y `Delete` sobre ella, sin estado: el servidor responde `SchemaViolation` y el storage la trata como cualquier operación inválida.<br>- Las réplicas rechazan un `Insert` cuya clave primaria ya existe (motivo `Duplicate`), en vez del upsert habitual. | 2, 4 | Propuesta |
 | **DR12** | **Requisitos para la Fase 4.** Ver §7.<br>- El cliente resuelve cada escritura cuando su réplica aplicó hasta la secuencia asignada, con el resultado de DR5.<br>- Hay un pre-chequeo local opcional.<br>- El `ChangeStream` no emite nada por operaciones rechazadas.<br>- `ROADMAP.md` §4.4.4 se reescribe. | 0, 6 | Propuesta |
 | **DR13** | **Sin detección de divergencia en esta fase.** Es un riesgo aceptado (`INVARIANTES.md` §4): una réplica que decide distinto diverge sin aviso.<br>- **Mitigación:** el oráculo diferencial y los tests de convergencia (§5.3).<br>- **Backlog:** un digest del estado por secuencia, que las réplicas comparen a través del servidor (por ejemplo, en el heartbeat). | 0 | Propuesta |
 | **DR14** | **Cierre por revisión de delta, sin auditoría amplia.** Core, storage y servidor están dentro del alcance auditado, y el modelo de amenaza no cambia en lo que importa a D90: un miembro hostil sigue pudiendo secuenciar operaciones válidas, y las réplicas honestas las rechazan. Cada lote cierra con su revisión de delta (§5.2, paso 4), y la fase con una revisión de cierre del delta completo. Esa revisión también audita por primera vez las invariantes nuevas. | 6 | Propuesta |
+| **DR15** | **Dueño seudónimo (opcional).** Con `identity: "Pseudonym"`, la columna dueño guarda un seudónimo de 32 bytes en vez del `ClientId`.<br>- **Derivación:** el servidor deriva una clave de dueño con BLAKE3 en modo con clave. Las entradas son un secreto propio (`ZEMDB_OWNER_SECRET`, distinto de los otros dos), la sala y el cliente. Se la da al cliente en `Registered`. El seudónimo de una tabla es el hash con clave de su `table_id` bajo la clave de dueño: el cliente lo calcula, y el servidor lo recalcula para verificar.<br>- **El cliente escribe el seudónimo y el servidor lo verifica,** en vez de que el servidor lo inserte al confirmar la operación. El servidor no modifica operaciones (`ARCHITECTURE.md` §4.1), la copia local del cliente es igual a la del log, los reintentos deduplicados no cambian, y el cliente necesita su seudónimo igual, para reconocer sus propias filas.<br>- **Lo que garantiza:** los demás miembros no ven el `ClientId`, ni pueden vincular las filas de un cliente entre tablas distintas. Conocer el seudónimo de otro no permite escribir en su nombre: el servidor lo recalcula desde el cliente autenticado.<br>- **Lo que no garantiza:** quien tiene el secreto puede recalcular el seudónimo de cada cliente (§2.2); las filas de un cliente en la misma tabla comparten seudónimo; y el orden y el momento de los commits pueden delatar a quien escribe.<br>- **El secreto no se rota:** cambiarlo deja todas las filas sin un dueño que pueda modificarlas. Sin el secreto configurado, se rechaza un esquema que use seudónimos, y el servidor no arranca si alguno ya registrado los usa. | 2b | Propuesta |
 
 ### 3.1. Reglas de verificación en las réplicas (DR4)
 
@@ -119,9 +121,9 @@ Se numeran DR1, DR2, etc. para no chocar con la numeración D de los planes de r
 
 | Operación | Qué se verifica | Se rechaza si |
 |---|---|---|
-| `Insert` (upsert) | Todas las `UNIQUE` y FK de `T`. Si `T` es inmutable, también que `p` no exista. | **Inmutable:** ya existe una fila con PK `p` (`Duplicate`).<br>**`UNIQUE`:** otra fila, con PK distinta de `p`, tiene la misma clave.<br>**FK:** no existe en la tabla referida una fila cuya PK sea la clave. La excepción es una FK de `T` a `T` cuya clave es `p`: una fila puede apuntarse a sí misma. |
-| `Update` | Las `UNIQUE` y FK de `T` con alguna columna entre las que el `Update` cambia. | Las mismas condiciones que en `Insert`, sobre `r`. Si la fila `p` no existe, no se aplica y se informa `MissingRow`, antes de cualquier otra verificación. |
-| `Delete` | Las FK de cualquier tabla, `T` incluida, que apuntan a `T`. | **`RESTRICT`:** alguna fila hija tiene `p` como clave foránea. Si es la misma tabla, no cuenta la propia fila `p`. Si la fila `p` no existe, no cambia nada y no se informa: el resultado es el mismo. |
+| `Insert` (upsert) | Todas las `UNIQUE` y FK de `T`. Si `T` es inmutable, también que `p` no exista. Si `T` tiene el dueño fuera de la clave y `p` existe, que la fila existente sea del dueño declarado. | **Inmutable:** ya existe una fila con PK `p` (`Duplicate`).<br>**Dueño:** la fila existente con PK `p` es de otro dueño (`NotOwner`).<br>**`UNIQUE`:** otra fila, con PK distinta de `p`, tiene la misma clave.<br>**FK:** no existe en la tabla referida una fila cuya PK sea la clave. La excepción es una FK de `T` a `T` cuya clave es `p`: una fila puede apuntarse a sí misma. |
+| `Update` | Si `T` tiene el dueño fuera de la clave, que la fila existente sea del dueño declarado. Las `UNIQUE` y FK de `T` con alguna columna entre las que el `Update` cambia. | Si la fila `p` no existe, no se aplica y se informa `MissingRow`, antes de cualquier otra verificación.<br>**Dueño:** la fila es de otro dueño (`NotOwner`).<br>Después, las mismas condiciones que en `Insert`, sobre `r`. |
+| `Delete` | Si `T` tiene el dueño fuera de la clave, que la fila sea del dueño declarado. Las FK de cualquier tabla, `T` incluida, que apuntan a `T`. | Si la fila `p` no existe, no cambia nada y no se informa: el resultado es el mismo.<br>**Dueño:** la fila es de otro dueño (`NotOwner`).<br>**`RESTRICT`:** alguna fila hija tiene `p` como clave foránea. Si es la misma tabla, no cuenta la propia fila `p`. |
 
 Además:
 - **Claves con `NULL`:** si alguna columna de la clave es `NULL`, la restricción no aplica a esa fila. `UNIQUE` admite varias, y la FK no se verifica; es el `MATCH SIMPLE` de SQL. Las columnas que faltan en una fila corta (escrita antes de agregarse la columna) leen `NULL`.
@@ -130,11 +132,13 @@ Además:
 - **Qué columnas "toca" un `Update`:** las de sus deltas, aunque el valor nuevo sea igual al anterior. Se define así, y no comparando contra el estado, para que la regla sea simple. Mientras el estado cumpla las restricciones (INV-C2), el resultado es el mismo que comparando; si no las cumpliera por un error, sigue siendo determinista.
 - **Todo o nada:** si alguna verificación falla, no se aplica nada de la operación.
 - **Orden del motivo:**
-  1. `Duplicate`;
-  2. las `UNIQUE`, en orden de declaración;
-  3. las FK de `T`, en orden de declaración.
+  1. `MissingRow`;
+  2. `Duplicate`;
+  3. `NotOwner`;
+  4. las `UNIQUE`, en orden de declaración;
+  5. las FK de `T`, en orden de declaración.
 
-  En un `Delete`, las FK que apuntan a `T` se recorren por id de la tabla hija y, dentro de cada una, en orden de declaración.
+  En un `Delete`, después de `NotOwner`, las FK que apuntan a `T` se recorren por id de la tabla hija y, dentro de cada una, en orden de declaración.
 - **Dentro de un batch:** cada operación se verifica contra el estado que dejó la anterior, incluidas las del mismo batch.
 
 ### 3.2. Por qué DR3 alcanza
@@ -157,9 +161,7 @@ Con DR3, toda restricción agregada después incluye una columna nueva `c`:
 
 La decisión sobre cada operación es, entonces, la misma bajo cualquier versión del esquema desde la que esa operación es válida. Eso es INV-C1 (§6, Lote 0).
 
-El dueño y la inmutabilidad no tienen este problema:
-- **El dueño** lo decide solo el servidor, una vez, antes de secuenciar.
-- **La inmutabilidad** solo se declara al crear el esquema. Además, `add_column` no puede agregar columnas a la clave primaria.
+El dueño y la inmutabilidad no tienen este problema. Solo se declaran al crear el esquema, así que rigen desde la primera operación de cada sala. Además, `add_column` no puede agregar columnas a la clave primaria.
 
 ### 3.3. Formato
 
@@ -185,7 +187,7 @@ Las tablas se referencian por nombre, como las columnas de la clave primaria, y 
         {"name": "poll_id", "data_type": "Uuid", "nullable": false, "encrypted": false},
         {"name": "choice", "data_type": "Int", "nullable": false, "encrypted": false}
       ],
-      "owner": "voter",
+      "owner": {"column": "voter", "identity": "ClientId"},
       "immutable": true,
       "unique": [],
       "foreign_keys": [
@@ -195,6 +197,8 @@ Las tablas se referencian por nombre, como las columnas de la clave primaria, y 
   ]
 }
 ```
+
+Con `"identity": "Pseudonym"`, la columna `voter` es `Bytes` y guarda el seudónimo del cliente (DR15).
 
 Agregar una columna con una restricción que la incluye:
 ```json
@@ -210,20 +214,31 @@ Una restricción que no incluye la columna nueva, como `{"columns": ["slug"]}`, 
 
 **Objetivo:** cada cliente vota una sola vez por encuesta, y nadie vota a nombre de otro.
 
-**Por qué el dueño va en la clave primaria.**
-- **El servidor sabe quién envía cada commit,** porque el token liga el `ClientId`. Con la columna dueño en la clave primaria, toda operación (`Insert`, `Update`, `Delete`) trae el dueño en su clave. El servidor puede rechazar, sin mirar ninguna fila, cualquier operación de B sobre una fila de A. Es una validación liviana, como las de hoy, y las réplicas no hacen nada.
-- **Fuera de la clave no alcanza.** El servidor podría verificar el `Insert`, pero no un `Update` ni un `Delete` de B sobre una fila de A: para eso hay que saber de quién es la fila existente. Las réplicas tampoco pueden verificarlo, porque el log no guarda quién escribió cada operación (§2.2).
-- **La excepción es una tabla inmutable.** No admite `Update` ni `Delete`, y un `Insert` sobre una clave existente lo rechazan las réplicas. Así, alcanza con que el servidor verifique la columna dueño en la fila del `Insert`, esté o no en la clave.
+**El dueño se declara y se verifica en dos partes (DR10).** El servidor sabe quién envía cada commit, porque el token liga el `ClientId`, pero no sabe de quién es una fila, porque no guarda filas. Por eso:
+- **Toda operación declara su dueño.** El servidor verifica, sin estado, que el declarado sea quien la envía.
+- **Las réplicas verifican** que la fila existente sea de ese dueño. Tienen la fila, así que no necesitan saber quién envió la operación: les alcanza con el dueño declarado, que el servidor ya verificó.
+
+Con la columna dueño en la clave primaria, la segunda parte sobra: la clave de la operación ya identifica la fila y su dueño, y el servidor rechaza cualquier operación de B sobre una clave de A. Fuera de la clave, `Update` y `Delete` tienen que declarar el dueño (un delta de la columna dueño, y el campo nuevo de `Delete`). Las réplicas rechazan con `NotOwner` la operación sobre una fila ajena.
+
+**Por qué no hace falta registrar el autor en el log.** Sería la alternativa: que el log guarde quién envió cada operación, y que las réplicas comparen. Pero hoy el log guarda solo un hash del cliente y la mutación, para el dedup. Agregar el autor cambia el log, el WAL, el `SyncBatch` y el storage del cliente, y expone a la sala quién escribió cada operación. Con el dueño declarado, la información viaja en la operación misma y el servidor no la modifica.
 
 **Cómo se modela.**
-- **`votes(voter, poll_id, choice)`, con clave `(voter, poll_id)` y `owner: "voter"`:** un voto por cliente y encuesta, y nadie escribe el voto de otro. No hace falta `UNIQUE`.
-  - Sin `immutable`, un segundo voto del mismo cliente reemplaza al primero: es un cambio de voto.
-  - Con `immutable`, el segundo voto se rechaza en todas las réplicas (`Duplicate`).
-- **Una clave propia del voto (`vote_id`), con `UNIQUE(voter, poll_id)`:** también funciona, pero el dueño queda fuera de la clave y la tabla tiene que ser inmutable (DR10).
+- **`votes(voter, poll_id, choice)`, con clave `(voter, poll_id)` y `owner` en `voter`:** un voto por cliente y encuesta, y nadie escribe el voto de otro. No hace falta `UNIQUE`.
+  - Sin `immutable`, el dueño puede cambiar o retirar su voto: un segundo `Insert` reemplaza al primero, y puede hacer `Update` y `Delete`.
+  - Con `immutable`, el voto es definitivo. El segundo se rechaza en todas las réplicas (`Duplicate`), y `Update` y `Delete` los rechaza el servidor.
+- **Una clave propia del voto (`vote_id`), con `UNIQUE(voter, poll_id)` y `owner` en `voter`:** también funciona, y el dueño puede modificar o borrar su voto declarándose dueño.
+
+**Votos anónimos (DR15, opcional).** Con `identity: "Pseudonym"`, la columna dueño guarda un seudónimo en vez del `ClientId`:
+- el cliente lo recibe en `Registered` y lo escribe;
+- el servidor lo recalcula desde el cliente autenticado para verificarlo;
+- las réplicas comparan valores como siempre.
+
+Los demás miembros ven que un mismo seudónimo votó, pero no quién es. El costo es chico: un secreto más, un campo en `Registered` y el cálculo en el commit, sin estado en el servidor.
 
 **Lo que la garantía es y no es.**
 - **Es por `ClientId`, no por persona.** Si el backend emite un id por dispositivo, una persona con dos dispositivos vota dos veces. Con un id por usuario, es un voto por usuario.
-- **Los `ClientId` quedan visibles para toda la sala,** porque están en las filas. No sirve para votos anónimos.
+- **Sin seudónimo, los `ClientId` quedan visibles para toda la sala,** porque están en las filas.
+- **Con seudónimo, es seudonimato frente a los demás miembros, no anonimato.** El operador del servidor puede recalcular el seudónimo de cada cliente. Las filas de un cliente en la misma tabla comparten seudónimo. El orden y el momento de los commits pueden delatar a quien vota.
 - **No protege contra un snapshot falso** que un miembro hostil suba con filas ajenas (riesgo aceptado DEF-81).
 
 **Nombre.** Se propone `owner` y no `signed`: la garantía viene de la autenticación del servidor, no de una firma criptográfica que una réplica pueda verificar sola.
@@ -235,18 +250,19 @@ Una restricción que no incluye la columna nueva, como `{"columns": ["slug"]}`, 
 | Componente | Cambio | Lote | Producción estimada |
 |---|---|---|---|
 | `zemdb-core` | Tipos de `UNIQUE` y FK, validación estructural, evolución con `add_column`, serde estricta | 1 | ~250 líneas |
-| `zemdb-core` + `zemdb-server` | Dueño e inmutabilidad (definición, `validate_operation`, verificación del dueño en el commit), API de administración, cuerpos estrictos, reasignación | 2 | ~150 líneas |
+| `zemdb-core` + `zemdb-server` | Dueño e inmutabilidad (definición, dueño declarado y `Delete { owner }`, `validate_operation`, verificación del dueño en el commit), API de administración, cuerpos estrictos, reasignación | 2 | ~200 líneas |
+| `zemdb-core` + `zemdb-server` | Dueño seudónimo (secreto, clave de dueño en `Registered`, verificación) | 2b (opcional) | ~100 líneas |
 | `zemdb-storage` | Índices derivados y `ApplyReport` | 3 | ~250 líneas |
-| `zemdb-storage` | Verificación en las réplicas (`UNIQUE`, FK, `RESTRICT`, `Duplicate`) | 4 | ~200 líneas |
+| `zemdb-storage` | Verificación en las réplicas (`UNIQUE`, FK, `RESTRICT`, `Duplicate`, `NotOwner`) | 4 | ~230 líneas |
 | `zemdb-storage` | Snapshots recibidos, apertura y evolución | 5 | ~120 líneas |
 | `zemdb-client` | Nada en esta fase. Deja requisitos para la Fase 4 (§7) | — | — |
 | Documentos | `INVARIANTES.md` y `ROADMAP.md` en el Lote 0; `ARCHITECTURE.md` en cada lote, junto con el comportamiento | 0–6 | — |
 
 **Lo que no cambia:**
-- los mensajes del protocolo (solo el contenido del esquema que llevan);
-- el log del servidor y su formato;
+- los mensajes del protocolo, salvo el contenido del esquema que llevan, `Delete { owner }` y, con el Lote 2b, la clave de dueño en `Registered`;
+- la estructura del log del servidor y de los frames del WAL: `Delete { owner }` viaja dentro de la operación, que ya se serializa entera;
 - el camino del commit, salvo la verificación del dueño;
-- los formatos en disco del storage (`.snap`, WAL, `ZMSN`);
+- los formatos de archivo del storage (`.snap`, WAL, `ZMSN`), con la misma salvedad de `Delete`;
 - el relay de snapshots.
 
 ---
@@ -278,6 +294,7 @@ Este procedimiento, junto con `GEMINI.md`, alcanza para retomar el trabajo sin e
 - **El Lote 0** solo toca documentos y se puede adelantar.
 - **El Lote 1** arranca cuando cierra la Fase 3.10, para no mezclar su delta con la revisión de cierre de esa fase (D90).
 - **El Lote 2** depende del 1 y es independiente del 3 al 5.
+- **El Lote 2b** es opcional, va después del 2 y se puede diferir sin afectar al resto.
 - **Los Lotes 3, 4 y 5** van en ese orden: tocan los mismos archivos del storage.
 - **El Lote 6** va al final.
 
@@ -364,13 +381,14 @@ El revisor lo recorre en cada lote de storage:
 |---|---|---|---|---|---|
 | 0 | Contrato | Documentos | Todas | Nuevas: C1, C2, C3, A5. Ajuste: Y8 | ⬜ |
 | 1 | `UNIQUE` y FK en el esquema | core | DR3, DR8, DR9 | E1, W1, W2 | ⬜ |
-| 2 | Servidor: dueño, inmutabilidad y API de administración | core, server | DR3, DR8, DR10, DR11 | A1, A5, Y5, E1, E2, D9 | ⬜ |
+| 2 | Servidor: dueño, inmutabilidad y API de administración | core, server | DR3, DR8, DR10, DR11 | A1, A5, Y5, E1, E2, D9, W1, W2 | ⬜ |
+| 2b | Dueño seudónimo (opcional) | core, server | DR15 | A1, A5, Y5 | ⬜ |
 | 3 | Índices derivados y `ApplyReport` | storage | DR5, DR6 | S1, S3, S6, C3 | ⬜ |
-| 4 | Verificación en las réplicas | storage | DR1, DR4, DR5, DR11 | Y8, S1, C2, C3, W1 | ⬜ |
+| 4 | Verificación en las réplicas | storage | DR1, DR4, DR5, DR10, DR11 | Y8, S1, A5, C2, C3, W1 | ⬜ |
 | 5 | Snapshots, apertura y evolución | storage | DR3, DR7 | S4, S5, C1, C2, W1 | ⬜ |
 | 6 | Cierre | Documentos | DR12, DR14 | Todas las tocadas | ⬜ |
 
-**Requisito para empezar la Fase 4:** Lotes 0 a 6 cerrados, con la revisión de cierre en verde. El diseño del cliente, no su código, puede empezar cuando cierre el Lote 3, que fija el contrato de `apply_batch`.
+**Requisito para empezar la Fase 4:** Lotes 0 a 6 cerrados, con la revisión de cierre en verde. El 2b, solo si se decidió hacerlo en esta fase. El diseño del cliente, no su código, puede empezar cuando cierre el Lote 3, que fija el contrato de `apply_batch`.
 
 ### Lote 0 · Contrato · ⬜ Pendiente
 **Objetivo:** dejar el contrato contra el que se revisa cada lote. Solo documentos.
@@ -385,7 +403,8 @@ El revisor lo recorre en cada lote de storage:
   - **En §4, riesgos aceptados:**
     - una réplica que decide distinto (por un error o por otra semántica) diverge sin aviso (DR13);
     - las operaciones rechazadas ocupan el log, la retención y la ventana de dedup;
-    - el dueño de fila es por `ClientId` y queda visible para toda la sala (§3.4).
+    - el dueño de fila es por `ClientId`, y queda visible para toda la sala salvo con seudónimo;
+    - el seudónimo lo puede recalcular quien tiene el secreto del servidor, y vincula las filas de un cliente dentro de la misma tabla (§3.4).
 - **`ROADMAP.md`:**
   - insertar la Fase 3.11 en §4 y en el cronograma de §5;
   - agregar el requisito de su cierre para empezar la Fase 4;
@@ -411,9 +430,16 @@ El revisor lo recorre en cada lote de storage:
   - **Enunciado:** una operación rechazada no cambia tablas ni índices, y avanza `head_seq`. El estado queda igual que si se aplicara el log sin ella. En todo estado publicado, los índices son exactamente los que se construirían desde las tablas, en los dos motores.
   - **Sostenida por:** DR1, DR6 y "validar primero, mutar después" (`GEMINI.md`).
 - **INV-A5 ★ · Nadie escribe una fila ajena.**
-  - **Enunciado:** en una tabla con dueño, toda operación secuenciada fue enviada por el cliente cuyo `ClientId` está en la columna dueño. Es la de su clave primaria; en una tabla inmutable con el dueño fuera de la clave, la de la fila que inserta.
-  - **Sostenida por:** DR10, DR11 e INV-A1.
-  - **Cómo intentar romperla:** un `Insert`, `Update` o `Delete` de B sobre una clave con el `ClientId` de A; un `Insert` de B que reemplaza la fila de A en una tabla inmutable; un reintento deduplicado.
+  - **Enunciado:** en una tabla con dueño:
+    - toda operación secuenciada declara como dueño al cliente que la envió (su `ClientId`, o su seudónimo);
+    - ninguna operación aplicada inserta, reemplaza, modifica ni borra una fila cuyo dueño es otro.
+  - **Sostenida por:** la verificación del servidor en el commit (DR10, DR15), la de las réplicas (DR4, DR10) e INV-A1.
+  - **Cómo intentar romperla:**
+    - un `Insert`, `Update` o `Delete` de B que declara a A como dueño;
+    - uno de B que se declara dueño sobre una fila de A, con el dueño dentro y fuera de la clave;
+    - un `Update` que intenta transferir la fila;
+    - un reintento deduplicado;
+    - un seudónimo de A copiado por B.
   - **Fuera de alcance:** un snapshot falso (DEF-81).
 
 **Entrega:** `docs(plan): adopt the integrity constraints decisions and contract (Fase 3.11, Lote 0)`.
@@ -475,14 +501,27 @@ Positivos:
 ### Lote 2 · Servidor: dueño, inmutabilidad y API de administración · ⬜ Pendiente
 **Objetivo:** lo que verifica el servidor (DR10 y DR11) y la administración de los esquemas con restricciones.
 
-**Archivos:** `crates/core/src/schema/` (dueño e inmutabilidad), `crates/server/src/api/control_plane.rs`, `crates/server/src/schema_registry.rs`, `crates/server/src/actor/room.rs` (commit) y `crates/server/src/actor/manager.rs` (reasignación).
+**Archivos:**
+- `crates/core/src/schema/` (dueño e inmutabilidad);
+- `crates/core/src/mutation/` (`Delete { owner }` y el squashing);
+- `crates/server/src/api/control_plane.rs`;
+- `crates/server/src/schema_registry.rs`;
+- `crates/server/src/actor/room.rs` (commit);
+- `crates/server/src/actor/manager.rs` (reasignación).
 
 **Qué se hace:**
 - **Core.**
-  - `owner: Option<String>` e `immutable: bool` en `TableSchema`, con su validación estructural: la columna existe, es `String`, no está cifrada, y está en la clave primaria salvo que la tabla sea inmutable.
-  - `validate_operation` rechaza `Update` y `Delete` en una tabla inmutable.
-  - Una función de core verifica el dueño de una operación contra un `ClientId`.
-- **Commit.** El actor llama a esa función después de `validate_operation` y antes de secuenciar. Si falla, responde `SchemaViolation`.
+  - `owner: Option<OwnerDef>` (columna e identidad) e `immutable: bool` en `TableSchema`, con su validación estructural:
+    - la columna existe y no está cifrada;
+    - es `String` para `ClientId` y `Bytes` para `Pseudonym`;
+    - el seudónimo se rechaza hasta el Lote 2b.
+  - `OperationKind::Delete` pasa a llevar `owner: Option<Value>`.
+  - `validate_operation`:
+    - rechaza `Update` y `Delete` en una tabla inmutable;
+    - en una tabla con el dueño fuera de la clave, exige el dueño declarado (un delta de la columna dueño en el `Update`, `owner` en el `Delete`);
+    - en cualquier otra tabla, rechaza un `Delete` con `owner`.
+  - Una función de core devuelve el dueño que declara una operación, y otra lo compara con un `ClientId`.
+- **Commit.** El actor verifica el dueño después de `validate_operation` y antes de secuenciar. Si no coincide, responde `SchemaViolation`.
 - **API de administración.**
   - `AddColumnRequest` acepta las restricciones de la columna nueva.
   - `CreateSchemaRequest` y `AddColumnRequest` pasan a `deny_unknown_fields`.
@@ -490,10 +529,16 @@ Positivos:
 
 **Tests exigidos:**
 - **Dueño:**
-  - B no puede insertar, actualizar ni borrar una fila con el `ClientId` de A en la clave: `SchemaViolation`, sin secuencia nueva, sin evento SSE y sin cambio en el head (INV-Y5).
+  - B no puede insertar, actualizar ni borrar declarando a A como dueño, con el dueño dentro o fuera de la clave. Responde `SchemaViolation`, sin secuencia nueva, sin evento SSE y sin cambio en el head (INV-Y5).
   - A puede hacer las tres cosas.
-  - Tabla inmutable con el dueño fuera de la clave: B no puede insertar una fila con el dueño de A.
+  - Con el dueño fuera de la clave, un `Update` sin el delta de la columna dueño, o un `Delete` sin `owner`, es `SchemaViolation`.
+  - Un `Delete` con `owner` en una tabla sin dueño fuera de la clave, también.
+  - B que se declara dueño sobre una fila de A se secuencia: lo rechazan las réplicas (Lote 4).
   - Un reintento deduplicado de un commit aceptado sigue respondiendo su secuencia original.
+- **Formato:**
+  - roundtrip de `Delete { owner }` en los mensajes, en los frames WAL y en `TableBuffer`;
+  - el tamaño de `Operation` en `types_memory_tests` (debería seguir en 88 bytes);
+  - squashing: un `Delete` que reemplaza una operación pendiente conserva su `owner`, y un `Update` consolidado conserva el delta del dueño.
 - **Inmutable:**
   - `Update` y `Delete` dan `SchemaViolation`.
   - Dos `Insert` con la misma clave se secuencian los dos: el servidor no lo decide.
@@ -512,12 +557,54 @@ Positivos:
 - `reload_schema_for_rooms` y `ReloadSchema`.
 - `Registered` y `GetSchema` con esquemas más grandes, frente a la reserva de 16 MiB por respuesta.
 - `ClientId` contra `Value::String`: la comparación es byte a byte, sin normalizar.
+- `Delete { owner }` toca todo lo que codifica operaciones:
+  - el codec del protocolo y sus fuzzers;
+  - los frames WAL del servidor y del storage;
+  - `check_operation_size`;
+  - las reglas de squashing de `ARCHITECTURE.md` §4.1, incluida la anti-zombi.
+- El storage valida cada operación con `validate_operation`, así que exige lo mismo que el servidor. Un `Delete` sin `owner` en una tabla que lo pide es un log dañado.
 
 **Documentos:** `ARCHITECTURE.md`:
 - §3.1: dueño e inmutabilidad;
+- §4: `Delete { owner }` y el dueño declarado;
 - §5.1: el servidor verifica el dueño;
 - §7.1: los cuerpos de `/admin/schemas` y `.../columns`, y el rechazo de campos desconocidos;
 - §7.2: `SchemaViolation` por dueño o inmutabilidad.
+
+### Lote 2b · Dueño seudónimo (opcional) · ⬜ Pendiente
+**Objetivo:** DR15. Se puede diferir sin afectar al resto de la fase.
+
+**Archivos:**
+- `crates/server/src/config.rs` (el secreto);
+- `crates/server/src/actor/room.rs` (verificación y `Registered`);
+- `crates/core/src/protocol/messages.rs` (`Registered`);
+- `crates/core/src/schema/` (aceptar `Pseudonym`);
+- una función de core que deriva el seudónimo de una tabla desde la clave de dueño, compartida por el servidor y el SDK.
+
+**Qué se hace:**
+- **El secreto.** `ZEMDB_OWNER_SECRET`: opcional, de al menos 32 bytes, distinto de los otros dos y validado al arrancar como ellos.
+  - Sin él, `POST /admin/schemas` rechaza un esquema con seudónimos (`BadRequest`).
+  - Si ya hay uno registrado que los usa, el servidor no arranca.
+- **La clave de dueño.**
+  - Se deriva con BLAKE3 en modo con clave, a partir del secreto, la sala y el cliente.
+  - `Registered` la lleva, siempre que el servidor tenga el secreto.
+- **El commit.** En una tabla con seudónimo, el dueño declarado se compara con el seudónimo recalculado desde el cliente autenticado.
+
+**Tests exigidos:**
+- B no puede escribir con el seudónimo de A, aunque lo copie de una fila.
+- El seudónimo de un cliente es el mismo después de reiniciar el servidor y después de reabrir la sala.
+- Es distinto para otro cliente, para otra sala y para otra tabla.
+- Sin el secreto: el esquema con seudónimos es 400, y el arranque con uno ya registrado falla con un error que nombra la variable.
+- Registro sin cursor y con cursor: los dos devuelven la misma clave.
+
+**Interacciones a revisar:**
+- **La encarnación de la sala.** Si una sala recreada debe dar otros seudónimos, la encarnación entra en la derivación.
+- **Los logs (`tracing`):** nunca imprimen la clave de dueño.
+- **El orden de las verificaciones del commit**, igual que en el Lote 2.
+
+**Documentos:**
+- `ARCHITECTURE.md`: §3.1, §6 (`Registered`) y §7.2.
+- `README.md`: la variable nueva.
 
 ### Lote 3 · Índices derivados y `ApplyReport` (`zemdb-storage`) · ⬜ Pendiente
 **Objetivo:** que todo camino que cambia tablas mantenga los índices de las restricciones, y que `apply_batch` informe su resultado. Todavía no se rechaza nada por restricciones.
@@ -586,6 +673,7 @@ Positivos:
   - padre e hijo en el mismo batch, en los dos órdenes;
   - el ejemplo concurrente de §1.2, en los dos órdenes;
   - `Duplicate` en una tabla inmutable;
+  - `NotOwner`: B se declara dueño y hace `Insert` sobre la clave de una fila de A (dueño fuera de la clave), `Update` o `Delete` sobre ella; A sobre su propia fila sí puede;
   - el orden del motivo cuando fallan dos restricciones.
 - **INV-C3:** el estado con una operación rechazada es igual al estado sin esa operación.
 - **Oráculo diferencial** y su versión larga.
@@ -593,7 +681,7 @@ Positivos:
 - **Crash:** un crash en cada paso, con reapertura, coincide con el oráculo.
 - **Sin pánicos:** operaciones aleatorias, incluidas las que violan restricciones, nunca hacen entrar en pánico al verificador.
 
-**Mutación inversa:** sacar, una por vez, `UNIQUE`, FK, `RESTRICT`, `Duplicate`, el salto por `NULL` y la excepción de la auto-referencia. En cada caso, algún test falla.
+**Mutación inversa:** sacar, una por vez, `UNIQUE`, FK, `RESTRICT`, `Duplicate`, `NotOwner`, el salto por `NULL` y la excepción de la auto-referencia. En cada caso, algún test falla.
 
 **Interacciones a revisar:**
 - **El WAL ya está escrito cuando se decide.** El replay vuelve a decidir con la misma función y, por DR3, con un esquema que da lo mismo.
@@ -670,11 +758,15 @@ Positivos:
   3. Toma el resultado de esa secuencia del `ApplyReport`.
 
   `insert`, `update` y `delete` devuelven `Ok`, o un error con el motivo: `ConstraintViolation { constraint, kind }` o `RowMissing`. El nombre `ConflictError` del plan actual se reemplaza.
-- **Rechazos del servidor.** El dueño y la inmutabilidad llegan como `SchemaViolation` en el commit, como cualquier otra validación del servidor.
+- **Rechazos del servidor.** Un dueño declarado que no es el del cliente, y un `Update` o `Delete` sobre una tabla inmutable, llegan como `SchemaViolation` en el commit, como cualquier otra validación del servidor.
+- **El dueño lo completa el SDK.** La aplicación no lo escribe:
+  - el SDK pone el `ClientId`, o el seudónimo derivado de la clave de dueño de `Registered` (Lote 2b), en la columna dueño;
+  - con el dueño fuera de la clave, agrega el delta del dueño a cada `Update` y el `owner` a cada `Delete`;
+  - con seudónimo, el SDK también lo usa para reconocer las filas propias.
 - **Pre-chequeo local.** Opcional y activado por defecto: verifica contra el estado local antes de mandar. Es solo un aviso temprano, porque la réplica local puede estar atrasada. La decisión es la de la aplicación en orden.
 - **`ChangeStream` y `watch`:** no emiten nada por operaciones rechazadas.
 - **Crash entre el commit y la aplicación.** El cliente conoce el resultado al volver a sincronizar solo si guardó la secuencia asignada de su mutación pendiente; si no, lo ve solo en el estado. Lo decide el diseño de la outbox, como DEF-85.
-- **`ROADMAP.md` §4.4.4.** El paso 2 deja de decir que el servidor valida las restricciones. El servidor valida lo liviano (incluido el dueño), y la réplica decide `UNIQUE`, FK e inmutabilidad.
+- **`ROADMAP.md` §4.4.4.** El paso 2 deja de decir que el servidor valida las restricciones. El servidor valida lo liviano, incluido el dueño declarado. La réplica decide `UNIQUE`, FK, `Duplicate` y `NotOwner`.
 - **Borradores offline (post-v0.1).** Con restricciones, mandar lo consolidado deja de ser equivalente a mandar en orden. Por ejemplo, `Insert(u = 1)` seguido de `Update(u = 2)` puede dar otro resultado que un único `Insert(u = 2)` si una de las dos claves choca. El gestor de borradores tiene que elegir entre no consolidar las columnas con restricciones o aceptar esa diferencia, y documentarla.
 
 ---
@@ -686,8 +778,10 @@ Positivos:
 2. ¿Se informa `MissingRow`? Propuesta: sí; hoy el `Update` se pierde sin aviso.
 3. Los topes de DR9 (32 restricciones por tabla y 16 columnas por restricción).
 4. Reasignación de esquema: ¿solo con las mismas restricciones, o prohibida para una sala con log? Propuesta: con las mismas restricciones.
-5. Dueño fuera de la clave en tablas mutables: ¿queda fuera de esta fase (§2.2)? Propuesta: sí.
-6. El nombre de la fase (3.11) y de los campos (`owner`, `immutable`).
+5. Seudónimos (Lote 2b): ¿entran en esta fase o se difieren? Propuesta: entran si hay un caso de uso para la v0.1 (votos anónimos); si no, se difieren, porque no afectan al resto.
+6. Alcance del seudónimo: ¿por tabla, o también por fila? Por fila sería, por ejemplo, incluir `poll_id` en la derivación, para que los votos de un cliente en encuestas distintas no se puedan vincular. El servidor lo podría calcular sin estado, porque esos valores vienen en la operación. Propuesta: por tabla en esta fase.
+7. ¿La encarnación de la sala entra en la derivación del seudónimo? Propuesta: sí; una sala recreada es otra sala.
+8. El nombre de la fase (3.11) y de los campos (`owner`, `identity`, `immutable`).
 
 **Riesgos:**
 - **Divergencia por un error de implementación** (DR13): la mitigan el oráculo, la convergencia y la revisión de cierre, y la detectaría un digest de estado (backlog).
