@@ -8,14 +8,21 @@ use zemdb_server::{
     SHUTDOWN_GRACE_PERIOD,
 };
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let config_path = env::args().nth(1);
     let config = Arc::new(ServerConfig::load_with_env(config_path.as_deref())?);
     let _data_dir_lock = config.lock_data_dir()?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let served = runtime.block_on(serve(config));
+    // Dropping the runtime waits for the blocking work still in flight, so the lock is only
+    // released once nothing writes to data_dir.
+    drop(runtime);
+    served
+}
 
+async fn serve(config: Arc<ServerConfig>) -> Result<(), Box<dyn std::error::Error>> {
     let schema_registry = Arc::new(SchemaRegistry::new(config.data_dir.join("schemas"))?);
     let snapshot_relay = Arc::new(SnapshotRelay::new(
         config.data_dir.join("snapshots"),

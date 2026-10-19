@@ -91,7 +91,7 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 
 ### Resumen
 
-Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md) (ver §1.5), con los lotes del [plan de la Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (cerrados: 0, 1 y 2) y las decisiones D92 a D99.
+Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md) (ver §1.5), con los lotes del [plan de la Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (cerrados: 0 a 3) y las decisiones D92 a D101.
 
 | ID | Invariante | ★ | Si se rompe | Estado |
 |---|---|---|---|---|
@@ -100,7 +100,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-D3** | La recuperación nunca descarta datos durables ni acepta basura | ★ | Alto | ✅ |
 | **INV-D4** | Los metadatos se reemplazan atómicamente | | Medio | ✅ |
 | **INV-D5** | Una sala tiene un solo dueño | ★ | Alto | ✅ |
-| **INV-D6** | Un solo proceso por `data_dir` | ★ | Alto | ❌ (Lote 3) |
+| **INV-D6** | Un solo proceso por `data_dir` | ★ | Alto | ✅ |
 | **INV-D7** | Nada es visible antes de ser durable en este proceso | ★ | Alto | ✅ |
 | **INV-D8** | El piso de secuencia vive fuera del log | ★ | Alto | ✅ |
 | **INV-D9** | Los metadatos se verifican antes de usarse | ★ | Alto | ✅ (D92) |
@@ -137,12 +137,12 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-B4** | El costo por request del actor no depende de la historia | | Medio | ✅ |
 | **INV-B5** | Ningún cliente acapara un recurso global | | Medio | ✅ |
 | **INV-L1** | Toda request recibe una respuesta, en tiempo acotado | | Medio | ✅ |
-| **INV-L2** | Cancelar una request nunca deja estado a medias | | Medio | ❌ (Lote 3) |
+| **INV-L2** | Cancelar una request nunca deja estado a medias | | Medio | ✅ |
 | **INV-L3** | Un I/O incierto nunca se confirma como éxito | ★ | Alto | ✅ |
 | **INV-L4** | Reabrir una sala no cambia ningún estado confirmado | | Medio | ✅ |
 | **INV-L5** | El apagado no pierde nada confirmado | | Medio | ✅ |
 | **INV-L6** | Borrar una sala es atómico | | Medio | ✅ |
-| **INV-L7** | Ningún efecto en disco sobrevive al lock que lo serializa | | Medio | 🆕 (Lote 3) |
+| **INV-L7** | Ningún efecto en disco sobrevive al lock que lo serializa | | Medio | ✅ |
 | **INV-E1** | El esquema solo crece, y toda operación del log sigue siendo válida | ★ | Alto | ✅ |
 | **INV-E2** | Un cliente con el esquema viejo siempre puede enterarse | | Bajo | ✅ |
 | **INV-W1** | Ninguna entrada hace entrar en pánico, abortar ni reservar de más | ★ | Alto | ✅ |
@@ -183,7 +183,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-D6 ★ · Un solo proceso por `data_dir`
 **Enunciado.** Un segundo proceso servidor sobre un `data_dir` que ya usa otro se niega a arrancar antes de tocar ningún archivo (salas, relay, esquemas). Ningún proceso borra ni recrea los archivos de una sala cuyo log tiene abierto otro. Un proceso retiene el lock hasta después de su última operación de archivo, incluidas las del pool bloqueante (INV-L7).
-**Sostenida por.** D83: lock exclusivo de `data_dir/server.lock` al arrancar, antes de tocar cualquier otro archivo; `delete_room` toma el `log.lock` de la sala antes de purgar el relay o borrar nada (§5.2 *Room Log Lock*, *Data Directory Lock*). *Pendiente (Lote 3):* soltar `server.lock` recién después de soltar el runtime (D100, DEF-172).
+**Sostenida por.** D83: lock exclusivo de `data_dir/server.lock` al arrancar, antes de tocar cualquier otro archivo; `delete_room` toma el `log.lock` de la sala antes de purgar el relay o borrar nada (§5.2 *Room Log Lock*, *Data Directory Lock*). `main` es síncrono y suelta `server.lock` recién después de soltar el runtime, que espera al pool bloqueante (D100).
 **Cómo intentar romperla.** Dos servidores sobre el mismo directorio, con arranques solapados; borrado y recreación de una sala desde el segundo proceso.
 
 #### INV-D7 ★ · Nada es visible antes de ser durable en este proceso
@@ -397,7 +397,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-L2 · Cancelar una request nunca deja estado a medias
 **Enunciado.** Si el cliente corta una request en cualquier `.await`, el efecto es "no ocurrió" o "ocurrió entero". Las operaciones de varios pasos (borrado y creación de sala, escrituras del relay, `add_column`, compactación y escrituras del storage) corren en su propia tarea, retienen el lock que las serializa hasta su última operación de archivo (INV-L7), o marcan la sala como fallida.
-**Sostenida por.** `run_to_completion`, `tokio::spawn` en `delete_room` y `add_column`, `open_room`, `compact_room` y `apply_snapshot` del storage en su propia tarea (D86, D89), `PendingWrite` (§7.1, §8). El apagado no espera esas tareas (D87 se descartó). Cortar una equivale a un crash en lo que hace la tarea, pero lo que ya está en el pool bloqueante sigue corriendo hasta terminar: por eso los locks que serializan esas operaciones viven hasta su última operación de archivo (INV-L7). El borrado con lápida (D84) y los archivos atómicos del relay dejan solo lo que el próximo arranque completa o descarta (§7.2 *Graceful Shutdown*). *Pendiente (Lote 3):* la purga del relay de una creación de sala cortada (D101, DEF-175). Riesgo aceptado en el storage: D93 (§4).
+**Sostenida por.** `run_to_completion`, `tokio::spawn` en `delete_room` y `add_column`, `open_room`, `compact_room` y `apply_snapshot` del storage en su propia tarea (D86, D89), `PendingWrite` (§7.1, §8). El apagado no espera esas tareas (D87 se descartó). Cortar una equivale a un crash en lo que hace la tarea, pero lo que ya está en el pool bloqueante sigue corriendo hasta terminar: por eso los locks que serializan esas operaciones viven hasta su última operación de archivo (INV-L7). El borrado con lápida (D84) y los archivos atómicos del relay dejan solo lo que el próximo arranque completa o descarta (§7.2 *Graceful Shutdown*). La purga del relay de una creación de sala cortada retiene el lock del slot (D101). Riesgo aceptado en el storage: D93 (§4).
 **Cómo intentar romperla.** Descartar el future del handler en cada punto de suspensión (el patrón del test de DEF-125); cancelar `compact_room` y `apply_snapshot` del storage y reabrir la sala mientras una operación de archivo sigue en vuelo; apagar el servidor con una tarea de varios pasos en curso.
 
 #### INV-L3 ★ · Un I/O incierto nunca se confirma como éxito
@@ -423,7 +423,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-L7 · Ningún efecto en disco sobrevive al lock que lo serializa
 **Enunciado.** Una operación de archivo lanzada bajo un lock (el spawn lock de una sala, el lock del slot del relay, `server.lock`, el lock de una sala del storage) termina antes de que el lock se suelte, o corre en una tarea que lo retiene hasta su última operación, aunque quien la lanzó se cancele.
-**Sostenida por.** D86 y D89 en el storage; `delete_room` en su propia tarea (D84). *Pendiente (Lote 3):* `server.lock` hasta después de soltar el runtime (D100, DEF-172), y la purga del relay y `drop_stale` con el lock del slot (D101, DEF-175).
+**Sostenida por.** D86 y D89 en el storage; `delete_room` en su propia tarea (D84); `server.lock` hasta después de soltar el runtime (D100); la purga del relay y `drop_stale` mueven el lock del slot a la closure que borra los archivos, y la purga deja la sala con un slot nuevo tomado hasta que termina (D101).
 **Riesgo aceptado (D93).** Si el runtime se apaga con una tarea del storage en curso, la tarea suelta su referencia a la sala, y cuando el motor también la suelta (se lo descarta, o un `close_room` posterior ya no espera), el lock de la sala se libera con la operación de archivo todavía en el pool bloqueante (§4).
 **Cómo intentar romperla.** Cortar la request, o apagar el runtime, con una operación en el pool bloqueante, y tomar el mismo lock enseguida.
 

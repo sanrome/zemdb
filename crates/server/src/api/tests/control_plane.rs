@@ -99,8 +99,46 @@ async fn concurrent_column_additions_leave_every_room_with_the_latest_schema() {
     }
 }
 
+/// Has the relay confirm a snapshot of room `doomed` at sequence 1.
+async fn stage_doomed_snapshot(state: &TestState) {
+    use crate::relay::LogBounds;
+    use zemdb_core::id::SequenceNumber;
+    use zemdb_core::protocol::snapshot_envelope::{SnapshotCompression, SnapshotEnvelopeHeader};
+
+    let body = vec![7u8; 1024];
+    let header =
+        SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, body.len() as u32, &body);
+    let mut envelope = header.to_bytes().to_vec();
+    envelope.extend_from_slice(&body);
+    let bounds = LogBounds {
+        tail_seq: SequenceNumber::new(1),
+        head_seq: SequenceNumber::new(1),
+        unrestorable_through: None,
+    };
+    state
+        .relay
+        .stage_snapshot(
+            &RoomId::new("doomed").unwrap(),
+            &crate::relay::Uploader::Admin,
+            SequenceNumber::new(1),
+            bytes::Bytes::from(envelope),
+            std::future::ready(Ok(bounds)),
+        )
+        .await
+        .unwrap();
+}
+
+/// `POST /admin/rooms` for room `doomed`.
+fn create_doomed_request() -> Request<Body> {
+    Request::post("/admin/rooms")
+        .header(header::AUTHORIZATION, format!("Bearer {ADMIN_SECRET}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"room_id": "doomed", "schema_id": "todo"}"#))
+        .unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn room_deletion_finishes_when_the_request_is_dropped() {
+async fn room_deletion_and_creation_finish_when_the_request_is_dropped() {
     let dir = tempdir().unwrap();
     let state = TestState::new(dir.path(), |config| {
         config.admin_secret = ADMIN_SECRET.to_string();
@@ -153,6 +191,42 @@ async fn room_deletion_finishes_when_the_request_is_dropped() {
     }
     assert_eq!(rooms_left(), 0);
     assert!(!state.manager.room_exists(&room_id).unwrap());
+
+    // A creation dropped while the relay purges the room. Its purge waits up to 2 s, so that
+    // a retry that waits for it is not blocked for good.
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+    fail_point::arm_hook(
+        "relay_purge_room_files",
+        &dir.path().join("snapshots"),
+        move || {
+            let _ = reached_tx.send(());
+            let _ = resume_rx.recv_timeout(Duration::from_secs(2));
+        },
+    );
+    let app = build_router(state.app_state());
+    tokio::select! {
+        _ = app.clone().oneshot(create_doomed_request()) => panic!("the purge did not stop"),
+        _ = reached_rx => {}
+    }
+
+    // The retry creates the room, and the relay confirms a snapshot for it. The purge of the
+    // dropped creation, if still running, resumes afterwards: it must not delete that file.
+    let retry = app.oneshot(create_doomed_request()).await.unwrap();
+    assert_eq!(retry.status(), StatusCode::CREATED);
+    stage_doomed_snapshot(&state).await;
+    let _ = resume_tx.send(());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let snapshots = std::fs::read_dir(dir.path().join("snapshots")).unwrap();
+    let staged = snapshots.filter(|entry| {
+        let name = entry.as_ref().unwrap().file_name();
+        name.to_string_lossy().starts_with("doomed_")
+    });
+    assert_eq!(
+        staged.count(),
+        1,
+        "the dropped creation purged the next room"
+    );
 }
 
 /// A `DELETE /admin/rooms/doomed` over TCP whose client disconnects while the relay purges the
@@ -167,10 +241,8 @@ fn room_deletion_whose_client_disconnects_over_tcp_removes_the_room_and_its_snap
 
 fn disconnected_deletion_over_tcp(shutdown: bool) {
     use crate::api::serve::{serve_until_shutdown, SHUTDOWN_GRACE_PERIOD};
-    use crate::relay::LogBounds;
     use tokio::io::AsyncWriteExt;
     use zemdb_core::id::SequenceNumber;
-    use zemdb_core::protocol::snapshot_envelope::{SnapshotCompression, SnapshotEnvelopeHeader};
 
     let dir = tempdir().unwrap();
     let room_dir = dir.path().join("rooms").join("doomed");
@@ -200,27 +272,7 @@ fn disconnected_deletion_over_tcp(shutdown: bool) {
             .create_room(room_id.clone(), schema_id, None)
             .await
             .unwrap();
-        let body = vec![7u8; 1024];
-        let header =
-            SnapshotEnvelopeHeader::for_body(SnapshotCompression::Raw, body.len() as u32, &body);
-        let mut envelope = header.to_bytes().to_vec();
-        envelope.extend_from_slice(&body);
-        let bounds = LogBounds {
-            tail_seq: SequenceNumber::new(1),
-            head_seq: SequenceNumber::new(1),
-            unrestorable_through: None,
-        };
-        state
-            .relay
-            .stage_snapshot(
-                &room_id,
-                &crate::relay::Uploader::Admin,
-                SequenceNumber::new(1),
-                bytes::Bytes::from(envelope),
-                std::future::ready(Ok(bounds)),
-            )
-            .await
-            .unwrap();
+        stage_doomed_snapshot(&state).await;
         assert_eq!(
             state.relay.active_snapshot_seq(&room_id),
             Some(SequenceNumber::new(1))

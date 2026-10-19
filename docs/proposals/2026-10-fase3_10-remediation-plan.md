@@ -96,7 +96,7 @@ La única excepción son los ítems del backlog marcados **(barato)** que estén
 
 ## 2. Decisiones de diseño
 
-Se continúa la numeración del plan de la Fase 3.9 (que termina en D89). Las decisiones D90 a D97 son las que se tomaron sobre la auditoría (el número entre paréntesis es el de la conversación). Las D98 a D102 son de implementación: se confirman o cambian antes de arrancar el lote correspondiente. D98 se adoptó al cerrar el Lote 0, y D99 al empezar el Lote 2.
+Se continúa la numeración del plan de la Fase 3.9 (que termina en D89). Las decisiones D90 a D97 son las que se tomaron sobre la auditoría (el número entre paréntesis es el de la conversación). Las D98 a D102 son de implementación: se confirman o cambian antes de arrancar el lote correspondiente. D98 se adoptó al cerrar el Lote 0, D99 al empezar el Lote 2, y D100 y D101 al empezar el Lote 3.
 
 | ID | Decisión | Lote | Estado |
 |---|---|---|---|
@@ -110,8 +110,8 @@ Se continúa la numeración del plan de la Fase 3.9 (que termina en D89). Las de
 | **D97** | **Alcance de las Medias y Bajas (8a).** Entran DEF-174 (la única Media sin disparador raro), DEF-176 (regresión (a); el límite aceptado de R7 se apoya en R5) y DEF-180 (una línea). DEF-177, DEF-178 y DEF-181 van al backlog: R4, R7 y A3 quedan con rupturas Bajas abiertas, marcadas así en la columna Estado (§1.5). DEF-179 se resuelve con D94. | — | Adoptada |
 | **D98** | **Sellar `active.wal` al abrir si quedó por debajo del piso (DEF-167).** Al abrir, si `active_end_seq < head_seq`, `active.wal` se sella enseguida con su rango real (o, si quedó vacío, el `active.wal` nuevo arranca en `head_seq + 1`), y `seal_active_segment` graba `sealed_through_seq = max(end, meta.sealed_through_seq)`. La secuencia perdida queda como un hueco (`BehindCompaction`), como prevé D8. Como defensa, `append` rechaza un registro que no continúa `active_end_seq` con un error que detiene la sala (falla cerrada); con el sellado al abrir, es inalcanzable. Al adoptarla se descartó la alternativa de sellar en el `append` y seguir: oculta un estado que no debería existir. | 1 | Adoptada |
 | **D99** | **La apertura del log retiene solo la ventana de RAM (DEF-170).** `inspect_active_segment` valida todos los frames y junta los ids de mutación, pero mientras lee retiene solo una ventana deslizante acotada por `ram_max_ops` y `ram_max_bytes`, con el cobro de D73. `segment_mutations` (un segmento sin sidecar) junta solo los ids. La memoria de la apertura queda acotada por la ventana de RAM más un frame, además de los ids de la ventana de dedup. Al adoptarla se precisó: la ventana es un modo de `ReadBudget` que siempre conserva la última operación (dice dónde terminó la lectura), y vale también para la verificación del cold duplicado del Lote 1 (DEF-168). | 2 | Adoptada |
-| **D100** | **`main` síncrono (DEF-172).** `main` deja de ser `#[tokio::main]`: toma `server.lock`, arma el runtime, hace `block_on` del servidor, suelta el runtime (que espera a los `spawn_blocking` en curso) y recién después suelta el lock. No se usa `shutdown_timeout`, que soltaría el lock con tareas todavía corriendo. Se descarta filtrar el handle: depende de que el sistema operativo lo suelte al salir y deja el orden implícito. | 3 | Propuesta |
-| **D101** | **La purga del relay retiene el lock del slot (DEF-175).** La purga (`relay/lifecycle.rs`) toma el lock del slot de la sala como guard propio (*owned*) y lo mueve a la closure de `run_blocking`, que lo suelta después de su última operación de archivo (INV-L7). Una purga cortada termina antes de que la sala recreada pueda instalar un snapshot. Vale para `create_room` y `delete_room`, que comparten la purga, y para `drop_stale` (`relay/download.rs`), que borra el snapshot descartado con el mismo patrón y es la otra ruptura de INV-L7 en el relay. La alternativa, correr `create_room` en su propia tarea, cierra este caso pero no el patrón. | 3 | Propuesta |
+| **D100** | **`main` síncrono (DEF-172).** `main` deja de ser `#[tokio::main]`: toma `server.lock`, arma el runtime, hace `block_on` del servidor, suelta el runtime (que espera a los `spawn_blocking` en curso) y recién después suelta el lock. No se usa `shutdown_timeout`, que soltaría el lock con tareas todavía corriendo. Se descarta filtrar el handle: depende de que el sistema operativo lo suelte al salir y deja el orden implícito. | 3 | Adoptada |
+| **D101** | **La purga del relay retiene el lock del slot (DEF-175).** La purga (`relay/lifecycle.rs`) toma el lock del slot de la sala como guard propio (*owned*) y lo mueve a la closure de `run_blocking`, que lo suelta después de su última operación de archivo (INV-L7). Una purga cortada termina antes de que la sala recreada pueda instalar un snapshot. Vale para `create_room` y `delete_room`, que comparten la purga, y para `drop_stale` (`relay/download.rs`), que borra el snapshot descartado con el mismo patrón y es la otra ruptura de INV-L7 en el relay. La alternativa, correr `create_room` en su propia tarea, cierra este caso pero no el patrón. Al implementarla se precisó: como la purga sacaba el slot del mapa, retener su guard no frenaba a nadie; ahora deja en el mapa un slot nuevo, ya tomado, y es ese guard el que mueve a la closure. | 3 | Adoptada |
 | **D102** | **El tope total de una subida se cuenta por uploader (DEF-174).** Completa el fix de DEF-153: hoy el tope se hereda cuando el uploader reinicia con la sesión viva, pero no a través de un vencimiento. El slot recuerda el uploader y el tope de la última sesión vencida, y una sesión nueva del mismo uploader que arranca dentro de `UPLOAD_IDLE_TIMEOUT` desde ese vencimiento hereda el tope: si ya pasó, se rechaza como una subida vencida. Así una subida, su ancla de poda (D61) y la designación que congela (D76) quedan acotadas por `snapshot_upload_max_secs`, y entre dos ciclos hay al menos un plazo de inactividad en el que la designación se reemplaza. Cumple el ajuste de INV-B2 ("por uploader") y hace pasar los cuatro tests de `inv2/b` e `inv2/delta`. La alternativa, que `designate` deje de congelar después de `designation_timeout + snapshot_upload_max_secs`, cierra R4 pero no el tope de la subida ni el ancla. | 4 | Propuesta |
 
 ---
@@ -123,11 +123,11 @@ Se continúa la numeración del plan de la Fase 3.9 (que termina en D89). Las de
 | 0 | Contrato y redes de prueba | D90–D97 | Inmediata (las redes viven en parches) | ✅ |
 | 1 | Log del servidor: abrir sin perder ni borrar de más | DEF-167, 168, 169 | Alta | ✅ 3/3 |
 | 2 | Apertura acotada | DEF-170 | Alta | ✅ 1/1 |
-| 3 | Locks y ciclo de vida | DEF-172, 175 | Media | ⬜ 0/2 |
+| 3 | Locks y ciclo de vida | DEF-172, 175 | Media | ✅ 2/2 |
 | 4 | Subidas | DEF-174, 176, 180 | Media | ⬜ 0/3 |
 | 5 | Cierre | Documentación y revisión de cierre (D90) | Requisito de la Fase 4 | ⬜ |
 
-**Avance total:** Lotes 0 a 2 cerrados; 4 de 9 ítems.
+**Avance total:** Lotes 0 a 3 cerrados; 6 de 9 ítems.
 
 **Por qué este orden, en una línea por lote:**
 0. Sin el contrato actualizado, cada lote se revisa contra enunciados viejos; sin las redes en el repo, se pierden.
@@ -460,7 +460,7 @@ Producción: +45 −12 líneas.
 
 > Objetivo: que ningún lock se suelte antes de la última operación de archivo que serializa (INV-L7).
 
-#### DEF-172 · Medio · ⬜ Pendiente
+#### DEF-172 · Medio · ✅ Hecho
 **Problema.** `server.lock` es una variable local del cuerpo de `#[tokio::main]` y se suelta antes de que `Runtime::drop` espere a los `spawn_blocking` en curso. Un segundo servidor puede arrancar mientras el primero todavía promueve una subida o purga el relay. Es una regresión de D83.
 **Solución.** D100.
 **Test exigido.** `audit_d6_server_binary_releases_the_data_dir_lock_before_it_stops_writing` (`inv2/l`). Corre el binario real y es solo para Unix; va a `crates/server/tests/` con un nombre que siga `GEMINI.md`.
@@ -471,7 +471,19 @@ Producción: +45 −12 líneas.
 - `lock_data_dir` y los tests que arman los componentes sin tomar el lock;
 - Windows y el lock de `fs2`.
 
-#### DEF-175 · Medio · ⬜ Pendiente
+**Hecho.** Como dice D100. `main` toma el lock, arma el `Runtime`, hace `block_on(serve(config))` y suelta el runtime con un `drop` explícito antes de devolver, así que el lock se suelta después. El resto del cuerpo de `main` pasó tal cual a `serve`.
+
+**Test.** `server_binary_holds_the_data_dir_lock_until_it_stops_writing`, en `crates/server/tests/server_binary_tests.rs` (solo Unix), es el test de `inv2/l` adaptado. Una subida de 256 MiB cuyo cliente corta después del último chunk sigue promoviéndose en el pool bloqueante cuando llega el SIGTERM. El test sondea `server.lock` y comprueba que, si el snapshot terminó en `snapshots/`, ya estaba ahí cuando el lock quedó libre. El otro test del parche (un segundo binario se niega a arrancar) no se trajo: pasa sin el fix y no cubre ninguna interacción de la lista. Que un segundo servidor no pueda tomar el lock ya lo prueba `a_second_server_cannot_lock_the_same_data_dir`, y que `main` lo tome antes de tocar cualquier archivo no cambió.
+
+**Mutación:** con el `#[tokio::main]` de antes, el test falla.
+
+**Interacciones:**
+- **La gracia de 10 s:** no cambia. Si se agota, `serve` devuelve el error y `process::exit(1)` sale sin soltar el runtime: es un crash (INV-S3), y el sistema operativo suelta el lock al terminar el proceso. El ítem de backlog "soltar el runtime no está acotado a 10 s" sigue abierto: ahora el lock se retiene durante esa espera, que es lo que pide INV-D6. Un segundo servidor se niega a arrancar en lugar de pisarse con el primero.
+- **El arranque** (`clear_uploads`, `recover_snapshots`, el borrado de lápidas): corre dentro de `serve`, con el lock ya tomado.
+- **`lock_data_dir` y los tests que arman los componentes sin el lock:** no cambian.
+- **Windows y `fs2`:** el handle vive en el hilo de `main` y se suelta después del runtime, igual en las tres plataformas. El test es solo para Unix porque manda SIGTERM.
+
+#### DEF-175 · Medio · ✅ Hecho
 **Problema.** Un `POST /admin/rooms` cortado deja la purga del relay corriendo sin el spawn lock ni el lock del slot. Si el admin reintenta y la sala recibe un snapshot, la purga vieja borra su archivo, y el relay lo sigue dando por activo hasta su TTL. Es una regresión de D84.
 **Solución.** D101.
 **Test exigido.**
@@ -483,6 +495,37 @@ Producción: +45 −12 líneas.
 - una subida que tiene el lock del slot cuando arranca la purga (backlog: `ARCHITECTURE.md`, línea 245);
 - `drop_stale`, que entra con el mismo fix;
 - el lock por sala de `RoomManager` y el orden de D84 (la lápida antes de la purga).
+
+**Hecho.** Como dice D101, con la precisión anotada al adoptarla. `purge_room` marca el slot viejo como purgado, pone en el mapa uno nuevo tomado con `try_lock_owned` y mueve ese guard a la closure de `run_blocking`, que lo suelta después de borrar los archivos. Las requests que ya tenían el slot viejo responden `RoomNotFound` como antes, y las que llegan después esperan a que termine el borrado. `remove_files` recibe un `held` que suelta al final de su closure: `drop_stale` le pasa su guard (`lock_owned`), y los demás llamadores, `()`. Producción de los dos ítems: +32 −13 líneas.
+
+**Tests.** Se extendieron dos tests que ya tenían el escenario, en lugar de traer el de `inv2/l` como test aparte:
+- `room_deletion_and_creation_finish_when_the_request_is_dropped` (antes `room_deletion_finishes_when_the_request_is_dropped`) suma el test de `inv2/l` adaptado. Una creación se corta con su purga detenida (espera hasta 2 s), el reintento crea la sala, el relay confirma un snapshot, la purga sigue, y el archivo tiene que quedar. Comparte con `disconnected_deletion_over_tcp` el helper nuevo `stage_doomed_snapshot`.
+- `first_chunk_drops_a_snapshot_below_the_retained_range` corta el chunk 0 mientras `drop_stale` borra el snapshot (hook nuevo `relay_remove_file`). Comprueba que el lock del slot sigue tomado hasta que el borrado termina.
+
+**Mutaciones** (cada una restaurada después):
+- la purga suelta el guard del slot nuevo antes de borrar: falla el primero;
+- `drop_stale` pasa `()` en lugar de su guard: falla el segundo.
+
+**Interacciones:**
+- **La purga de `delete_room`:** es la misma función. Los dos tests de borrado cortado siguen pasando; en el que apaga el servidor, el `drop` del runtime espera a la closure que retiene el slot.
+- **Una subida con el lock del slot cuando arranca la purga:** la purga espera el slot viejo como antes. Después, la subida ve `purged` en sus pasos siguientes.
+- **`drop_stale`:** entra con el fix.
+- **El lock por sala de `RoomManager` y el orden de D84:** no cambian. Los dos llamadores de `purge_room` lo hacen bajo `lock_room`, así que el slot del mapa es el que tomó la purga, y el `remove_if` condicional pasó a ser un `insert`. Una purga cortada ya instaló su slot nuevo; la siguiente toma ese.
+- **`cleanup_expired`:** el slot nuevo se conserva mientras la closure lo retiene (`strong_count > 1`), y el barrido siguiente lo descarta una vez libre. Un barrido que tomó el slot viejo lo encuentra purgado y no hace nada. Antes, la purga sacaba el slot del mapa; ahora queda uno vacío hasta ese barrido.
+- **Los demás llamadores de `remove_files`** (`install`, `expire_locked`, las de `upload.rs`): no cambian.
+- **`upload_in_progress` y `upload_in_progress_by`** (sumada en la revisión): mientras dura el borrado, ven tomado el slot nuevo, y lo cuentan como una subida en curso. No tiene efecto: durante la purga la sala no tiene actor. `delete_room` lo apaga antes, `create_room` lo crea después, y el reintento de una creación cortada espera en el slot antes de crearlo.
+- **Dos purgas de la misma sala** (sumada en la revisión): el `insert` no vuelve a mirar `purged`. Para que dos purgas tomen el mismo slot, las dos tienen que tener `lock_room` a la vez. De una purga cortada sigue viva solo la closure, que no inserta nada.
+
+**Revisión de delta.** La hizo un agente aparte, de contexto fresco y solo lectura. Corrió las mutaciones en un worktree propio y confirmó que cada una hace fallar su test. No encontró hallazgos Altos ni Medios, ni otra invariante rota, ni violaciones de `GEMINI.md`. Verificó que los llamadores que pasan `()` a `remove_files` corren en su propia tarea (`run_to_completion` o el sweeper). Señaló:
+- las dos interacciones que faltaban, sumadas arriba;
+- en el test del binario, si el último chunk no se procesa entero antes del corte, la subida no se completa y el test pasa sin probar nada (nunca da un falso fallo);
+- en el mismo test, si falla un assert antes de `server.wait()`, el proceso hijo queda corriendo.
+
+Los dos últimos son Bajos y van al backlog.
+
+**Cierre del lote:**
+- **Chequeos:** fmt, clippy del workspace, `cargo test --workspace` y `cargo doc` con `-D warnings`, en verde (Linux). No toca `core` ni `storage`, así que no hace falta el build de wasm32.
+- **Versiones largas del servidor** (`--release -- --ignored`): 13 tests en verde, en 358 s (Linux).
 
 ---
 
@@ -582,6 +625,8 @@ Sigue vigente el [backlog de la Fase 3.9](2026-10-fase3_9-remediation-plan.md#ba
 | `drop_stale` borra en el future de la request | Lote 3 (D101) |
 
 **Tests:** `register_reports_only_a_usable_snapshot` (`actor/tests/room.rs`) corre en tiempo real y falla bajo carga: 4 de 15 corridas con otros tests pesados en paralelo, 0 de 15 sin otra carga. Hay que pasarlo a tiempo pausado.
+
+**Nuevo en el Lote 3 (revisión de delta), Bajo:** el test del binario (`server_binary_tests.rs`) puede pasar sin probar nada si el último chunk no se procesa entero en los 300 ms antes del corte, y deja el proceso hijo corriendo si falla un assert antes de `server.wait()`. Solución: esperar a que el upload llegue a la promoción (por ejemplo, con un `.part` del tamaño total), y matar el hijo con un guard.
 
 **Nuevo en el Lote 2 (revisión de delta), Bajo:** ante una anomalía en un cold, `read_cold_file` descomprime en memoria el resto del segmento (hasta `segment_max_bytes`) para clasificarla. La apertura lo hace si un cold duplicado o un cold sin sidecar están dañados, y eso retiene más que la ventana de RAM y un frame. Necesita un daño accidental y son bytes de wire. Solución: clasificar recorriendo el stream sin juntarlo, o acotar lo que se lee al frame siguiente.
 

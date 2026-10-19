@@ -3,6 +3,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Weak};
+use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::info;
 use zemdb_core::id::RoomId;
@@ -19,13 +20,20 @@ impl SnapshotRelay {
     /// Deletes everything the relay holds for a room: its active snapshot and its upload in
     /// progress, in memory and on disk. Requests that were already under way for the room
     /// fail with `RoomNotFound` instead of staging anything afterwards.
+    ///
+    /// The room gets a new slot, held until the files are gone even if the caller is dropped:
+    /// a request that comes after the purge waits for it.
     pub async fn purge_room(&self, room_id: &RoomId) -> Result<(), ServerError> {
         let slot = self.slot(room_id);
         let mut guard = slot.lock().await;
         guard.purged = true;
         guard.upload = None;
         self.snapshots.remove(room_id);
-        self.slots.remove_if(room_id, |_, s| Arc::ptr_eq(s, &slot));
+        let next = Arc::<Mutex<RoomSlot>>::default();
+        let held = Arc::clone(&next)
+            .try_lock_owned()
+            .expect("a new slot is free");
+        self.slots.insert(room_id.clone(), next);
 
         // The directories are scanned rather than trusting the paths in memory, so that a
         // retry after a failed deletion still finds every file of the room.
@@ -39,6 +47,7 @@ impl SnapshotRelay {
             remove_room_files(&uploads_dir, &room, |name| {
                 parse_upload_file_name(name).map(|(r, _)| r)
             })?;
+            drop(held);
             Ok(())
         })
         .await
@@ -103,7 +112,7 @@ impl SnapshotRelay {
             info!(room = %room_id, seq = %idle.head_seq, "Discarding idle snapshot upload");
             doomed.push(idle.path);
         }
-        self.remove_files(doomed).await;
+        self.remove_files(doomed, ()).await;
     }
 }
 

@@ -300,7 +300,7 @@ impl SnapshotRelay {
                 if replaced.uploader == uploader {
                     deadline = replaced.deadline;
                 }
-                self.remove_files(vec![replaced.path]).await;
+                self.remove_files(vec![replaced.path], ()).await;
             }
             guard.upload = Some(UploadSession {
                 head_seq,
@@ -345,7 +345,7 @@ impl SnapshotRelay {
             .check(head_seq, ServerError::SnapshotSuperseded)
             .and_then(|()| self.check_newer_than_active(&room_id, head_seq));
         if let Err(err) = acceptable {
-            self.remove_files(vec![session.path]).await;
+            self.remove_files(vec![session.path], ()).await;
             return Err(err);
         }
 
@@ -406,7 +406,7 @@ impl SnapshotRelay {
             .get(room_id)
             .is_some_and(|floor| head_seq < *floor)
         {
-            self.remove_files(vec![final_path]).await;
+            self.remove_files(vec![final_path], ()).await;
             return Err(ServerError::SnapshotSuperseded(format!(
                 "The log of room {room_id} moved past snapshot sequence {head_seq}"
             )));

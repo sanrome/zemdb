@@ -70,14 +70,35 @@ async fn first_chunk_drops_a_snapshot_below_the_retained_range() {
         .await
         .unwrap();
 
-    // The log moved on: tail - 1 = 6 > 5.
+    // The log moved on: tail - 1 = 6 > 5. The request is dropped while the file is deleted,
+    // and the room's lock is held until the deletion ends.
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel::<()>();
+    fail_point::arm_hook("relay_remove_file", &path, move || {
+        let _ = reached_tx.send(());
+        let _ = resume_rx.recv();
+    });
+    let room_id = room();
+    let dropped = relay.get_chunk(CorrelationId::new(1), &room_id, 0, 0, None, bounds(7, 20));
+    tokio::select! {
+        res = dropped => {
+            panic!("the deletion did not stop: {res:?}")
+        }
+        _ = reached_rx => {}
+    }
+    assert!(
+        relay.slot(&room()).try_lock().is_err(),
+        "the room's lock was released while its snapshot file was being deleted"
+    );
+    resume_tx.send(()).unwrap();
+    drop(relay.slot(&room()).lock_owned().await);
+    assert!(!path.exists());
     assert_room_not_found(
         relay
             .get_chunk(CorrelationId::new(1), &room(), 0, 0, None, bounds(7, 20))
             .await,
     );
     assert_eq!(relay.active_snapshot_seq(&room()), None);
-    assert!(!path.exists());
 }
 
 #[tokio::test]

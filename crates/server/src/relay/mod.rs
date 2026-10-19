@@ -39,6 +39,7 @@ use zemdb_core::id::{RoomId, SequenceNumber};
 
 use crate::durable::{self, remove_file_if_exists};
 use crate::error::ServerError;
+use crate::fail_point;
 use files::{run_blocking, UPLOADS_DIR};
 use upload::UploadSession;
 
@@ -169,17 +170,19 @@ impl SnapshotRelay {
                 obsolete.push(previous.path);
             }
         }
-        self.remove_files(obsolete).await;
+        self.remove_files(obsolete, ()).await;
     }
 
-    /// Deletes files off the async runtime. A failure is logged: startup recovery removes
+    /// Deletes files off the async runtime, then drops `held` (a lock that must outlive the
+    /// deletion even if the caller is dropped). A failure is logged: startup recovery removes
     /// whatever is left.
-    async fn remove_files(&self, paths: Vec<PathBuf>) {
+    async fn remove_files(&self, paths: Vec<PathBuf>, held: impl Send + 'static) {
         if paths.is_empty() {
             return;
         }
         let result = run_blocking(move || {
             for path in &paths {
+                fail_point::hook("relay_remove_file", path);
                 if let Err(err) = remove_file_if_exists(path) {
                     warn!(path = ?path, error = %err, "Failed to delete snapshot relay file");
                 }
@@ -195,6 +198,7 @@ impl SnapshotRelay {
                     warn!(dir = ?dir, error = %err, "Failed to sync snapshots directory");
                 }
             }
+            drop(held);
             Ok(())
         })
         .await;

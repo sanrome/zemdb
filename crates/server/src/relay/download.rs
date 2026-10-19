@@ -104,8 +104,7 @@ impl SnapshotRelay {
 
     /// Drops `stale` if it is still the room's active snapshot, deleting its file.
     async fn drop_stale(&self, room_id: &RoomId, stale: &StagedSnapshot) {
-        let slot = self.slot(room_id);
-        let guard = slot.lock().await;
+        let guard = self.slot(room_id).lock_owned().await;
         if guard.purged {
             return;
         }
@@ -115,7 +114,7 @@ impl SnapshotRelay {
         if let Some((_, removed)) = removed {
             info!(room = %room_id, seq = %removed.head_seq,
                 "Dropping snapshot that the room log cannot continue from");
-            self.remove_files(vec![removed.path]).await;
+            self.remove_files(vec![removed.path], guard).await;
         }
     }
 }
