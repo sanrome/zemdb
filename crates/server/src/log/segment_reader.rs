@@ -53,6 +53,8 @@ impl<R: io::BufRead> FrameSource for zstd::stream::read::Decoder<'_, R> {
 pub(crate) struct FrameRead {
     pub(crate) ops: Vec<SequencedOperation>,
     pub(crate) mutations: Vec<(MutationId, SequenceNumber)>,
+    /// The first operation read, which a window may no longer keep.
+    pub(crate) first_seq: Option<SequenceNumber>,
     /// The frame that could not be read and its offset, if the reading stopped at one.
     pub(crate) anomaly: Option<(u64, FrameAnomaly)>,
 }
@@ -200,8 +202,10 @@ pub(crate) fn read_frames<S: FrameSource>(
             if let Some(mutation_id) = mutation_id {
                 read.mutations.push((mutation_id, op.seq));
             }
+            read.first_seq.get_or_insert(op.seq);
             read.ops.push(op);
         }
+        budget.slide(&mut read.ops);
     }
 
     Ok(read)

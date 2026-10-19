@@ -32,6 +32,15 @@ pub struct ReadBudget {
     ops: usize,
     bytes: u64,
     exhausted: bool,
+    /// The operations and bytes a window keeps ([`window`](Self::window)).
+    window: Option<(usize, u64)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The most that a read on this thread has kept at once, as [`op_bytes`] charges it, since
+    /// a test last reset it.
+    pub(crate) static PEAK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl ReadBudget {
@@ -43,6 +52,17 @@ impl ReadBudget {
             ops: 0,
             bytes: 0,
             exhausted: max_ops == 0,
+            window: None,
+        }
+    }
+
+    /// A window over a whole read: every operation is read, and only the newest that fit in
+    /// `max_ops` and `max_bytes` are kept, and always the last one, which tells where the read
+    /// ended.
+    pub(crate) fn window(max_ops: usize, max_bytes: u64) -> Self {
+        Self {
+            window: Some((max_ops, max_bytes)),
+            ..Self::ops(usize::MAX)
         }
     }
 
@@ -64,6 +84,20 @@ impl ReadBudget {
             self.exhausted = true;
         }
         fits
+    }
+
+    /// Ends a frame of the read that kept `ops`: a window drops the oldest that no longer fit.
+    pub(crate) fn slide(&mut self, ops: &mut Vec<SequencedOperation>) {
+        if let Some((max_ops, max_bytes)) = self.window {
+            let mut gone = 0;
+            while ops.len() - gone > 1 && (ops.len() - gone > max_ops || self.bytes > max_bytes) {
+                self.bytes = self.bytes.saturating_sub(op_bytes(&ops[gone]));
+                gone += 1;
+            }
+            ops.drain(..gone);
+        }
+        #[cfg(test)]
+        PEAK.with(|peak| peak.set(peak.get().max(self.bytes)));
     }
 
     /// Whether the read must stop: the operation count is reached or an operation was refused.

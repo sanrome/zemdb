@@ -91,7 +91,7 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 
 ### Resumen
 
-Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md) (ver §1.5), con los lotes del [plan de la Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (cerrados: 0 y 1) y las decisiones D92 a D98.
+Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md) (ver §1.5), con los lotes del [plan de la Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (cerrados: 0, 1 y 2) y las decisiones D92 a D99.
 
 | ID | Invariante | ★ | Si se rompe | Estado |
 |---|---|---|---|---|
@@ -131,7 +131,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-A2** | Nada se decodifica antes de autenticar, salvo lo acotado de `/register` | | Alto | ✅ |
 | **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio | ❌ (Lote 4; DEF-181 al backlog) |
 | **INV-A4** | Ningún identificador produce rutas fuera de `data_dir` | ★ | Alto | ✅ |
-| **INV-B1** | La memoria por request está acotada | ★ | Alto | ❌ (Lote 2) |
+| **INV-B1** | La memoria por request está acotada | ★ | Alto | ✅ |
 | **INV-B2** | Nada se retiene sin plazo | | Medio | ❌ (Lote 4) |
 | **INV-B3** | La memoria, el disco y los FDs del servidor están acotados por la configuración | | Medio | ✅ |
 | **INV-B4** | El costo por request del actor no depende de la historia | | Medio | ✅ |
@@ -363,7 +363,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-B1 ★ · La memoria por request está acotada
 **Enunciado.** Ninguna request reserva más memoria que una cota fija por request: un body de hasta `MAX_FRAME_SIZE`, hasta `MAX_MESSAGE_VALUES` valores decodificados y una respuesta de hasta `MAX_FRAME_SIZE`. La apertura de una sala que dispara una request retiene como mucho la ventana de RAM (`ram_max_ops`, `ram_max_bytes`) más un frame, además de los ids de la ventana de dedup. Ninguna respuesta materializa más de `MAX_MESSAGE_VALUES` valores, y lo que retienen las lecturas (presupuesto de lectura, HotBuffer) se cuenta por lo que ocupa en memoria, no por su tamaño de wire. La memoria de todas las respuestas retenidas en el servidor, incluidas `Schema` y `Registered` y los buffers de HTTP/2, está acotada por `max_inflight_response_bytes`.
-**Sostenida por.** D44, D53, D73: las lecturas y la HotBuffer cobran `max(wire, 24 × valores)`; cada respuesta presupuestada reserva un frame antes de materializarse (el sync y el catch-up, cuando el actor los atiende) y se queda con su codificación; `Schema` y `Registered` también; `max_send_buf_size` de un frame (§5.2 *Bounded responses*, §7.2 *Defensive Bounding*, §7.3). `max(wire, 24 × valores)` es una estimación: con `Text` o `Bytes` cortos la memoria real llega a 2 o 2,5 veces eso, y las copias de hasta 64 KiB que se entregan a h2 quedan fuera del presupuesto. *Pendiente (Lote 2):* la apertura acotada a la ventana de RAM (D99, DEF-170).
+**Sostenida por.** D44, D53, D73: las lecturas y la HotBuffer cobran `max(wire, 24 × valores)`; cada respuesta presupuestada reserva un frame antes de materializarse (el sync y el catch-up, cuando el actor los atiende) y se queda con su codificación; `Schema` y `Registered` también; `max_send_buf_size` de un frame (§5.2 *Bounded responses*, §7.2 *Defensive Bounding*, §7.3). `max(wire, 24 × valores)` es una estimación: con `Text` o `Bytes` cortos la memoria real llega a 2 o 2,5 veces eso, y las copias de hasta 64 KiB que se entregan a h2 quedan fuera del presupuesto. D99: la apertura verifica todos los frames de `active.wal`, pero retiene solo las operaciones más nuevas que entran en la ventana de RAM (y siempre la última); de un segmento sin sidecar y del cold duplicado que verifica, solo los ids y la última operación.
 **Cómo intentar romperla.** Longitudes declaradas enormes; cuerpos que se descomprimen; muchos streams HTTP/2 con respuestas grandes sin leer; commits cuyo catch-up se queda sin presupuesto; tablas de miles de columnas con filas de `Null`; respuestas `/schema` sin leer.
 **Automatizable.** Fuzzing de los decoders (en el repo desde el Lote 0 de la Fase 3.9) y conteo de los valores que materializa cada respuesta.
 

@@ -168,7 +168,7 @@ impl TieredLog {
         let meta = read_log_meta(&dir)?;
         let pruned_through_seq = SequenceNumber::new(meta.pruned_through_seq);
         let segments = SegmentIndex::scan(&segments_dir, pruned_through_seq)?;
-        let (warm_disk, active) = WarmDiskLog::open_recovering(&segments_dir)?;
+        let (warm_disk, active) = WarmDiskLog::open_recovering(&segments_dir, &policy)?;
 
         let head_seq = [
             Some(pruned_through_seq),
@@ -732,7 +732,7 @@ fn age(segment: &SegmentEntry, now: SystemTime) -> std::time::Duration {
     now.duration_since(segment.since).unwrap_or_default()
 }
 
-/// The operations of `active` (the contents of `active.wal`), which are all that RAM is filled
+/// The operations of `active` (the newest of `active.wal`), which are all that RAM is filled
 /// with, and the mutation IDs of `active` and of the sealed segments from the newest, until
 /// there are `mutations_wanted` distinct ones or the log is exhausted, oldest first.
 ///
@@ -769,7 +769,8 @@ fn read_newest(
     Ok((ops, chunks.into_iter().rev().flatten().collect()))
 }
 
-/// The mutation IDs of `segment`, from its sidecar or, failing that, from the segment itself.
+/// The mutation IDs of `segment`, from its sidecar or, failing that, from the segment itself,
+/// read without keeping its operations.
 fn segment_mutations(
     segment: &SegmentEntry,
 ) -> Result<Vec<(MutationId, SequenceNumber)>, ServerError> {
@@ -779,8 +780,8 @@ fn segment_mutations(
     if let Some(mutations) = sidecar.and_then(|bytes| decode_mutation_ids(&bytes, start, end)) {
         return Ok(mutations);
     }
-    let all = &mut ReadBudget::ops(usize::MAX);
-    Ok(read_segment(segment, SequenceNumber::new(0), all)?.1)
+    let ids_only = &mut ReadBudget::window(0, 0);
+    Ok(read_segment(segment, SequenceNumber::new(0), ids_only)?.1)
 }
 
 /// The last `window` distinct mutation IDs of `mutations` (oldest first), each with its

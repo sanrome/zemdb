@@ -1,5 +1,6 @@
 use super::*;
 use crate::dedup::DedupLruCache;
+use crate::log::budget::PEAK;
 use crate::log::io_probe::{self, IoEvent};
 use crate::log::policy::{MAX_LOG_BYTES_LIMIT, MIN_LOG_BYTES_LIMIT};
 use crate::log::test_support::{frames, make_op, segment_file, seqs};
@@ -909,8 +910,11 @@ fn open_never_drops_a_verified_cold_copy_for_a_damaged_warm_one() {
         assert!(TieredLog::open_or_create(dir.path(), compress_at_once_policy()).is_err());
         assert!(cold.exists() && warm.exists());
 
+        PEAK.set(0);
         let (log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
         assert!(cold.exists() && !warm.exists(), "frame {damaged_frame}");
+        // Verifying the cold copy keeps no more at once than the open keeps in RAM.
+        assert!(PEAK.get() <= log.hot_buffer.bytes());
         let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
         assert_contiguous(&ops, 1, 7);
     }
@@ -1473,29 +1477,47 @@ async fn async_maintenance_compresses_a_bounded_number_of_segments_per_pass() {
     assert_eq!(count_in(&log, Tier::Warm), 2);
 }
 
+/// Reopening keeps at once no more than the RAM window, charged as RAM charges it (a `Null`
+/// takes 24 times its wire size): of `active.wal` it keeps only the newest operations, and of a
+/// segment whose sidecar is missing, only its mutation IDs.
 #[test]
 fn reopening_loads_into_ram_only_what_fits() {
-    let dir = tempdir().unwrap();
-    let policy = RoomLifecyclePolicy {
-        ram_max_ops: 1_000,
-        ram_max_bytes: MIB as u64,
-        // active.wal holds more than RAM, which the open has to trim.
-        segment_max_bytes: 4 * MIB as u64,
-        ..RoomLifecyclePolicy::default()
-    };
-    {
-        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
-        for seq in 1..=10 {
-            log.append(large_op(seq, 300 * KIB), Some(mutation_for(seq)))
-                .unwrap();
+    for sidecars in [true, false] {
+        let dir = tempdir().unwrap();
+        let policy = RoomLifecyclePolicy {
+            // Segment 1..=30, and 31..=50 in active.wal: each takes more than RAM.
+            ram_max_ops: 30,
+            ram_max_bytes: MIB as u64,
+            ..RoomLifecyclePolicy::default()
+        };
+        {
+            let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+            for seq in 1..=50 {
+                log.append(null_row_op(seq), Some(mutation_for(seq)))
+                    .unwrap();
+            }
         }
+        if !sidecars {
+            let (start, end) = (SequenceNumber::new(1), SequenceNumber::new(30));
+            std::fs::remove_file(mutation_ids_path(&segments_dir(dir.path()), start, end)).unwrap();
+        }
+
+        PEAK.set(0);
+        let (log, mutations) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+
+        assert!(
+            PEAK.get() <= MIB as u64,
+            "sidecars {sidecars}: {}",
+            PEAK.get()
+        );
+        assert!(log.hot_buffer.bytes() <= MIB as u64);
+        assert_eq!(log.hot_buffer.max_seq(), Some(SequenceNumber::new(50)));
+        assert_eq!(
+            log.warm_disk.active_start_seq(),
+            Some(SequenceNumber::new(31))
+        );
+        assert_eq!(mutations.len(), 50);
     }
-
-    let (log, mutations) = TieredLog::open_or_create(dir.path(), policy).unwrap();
-
-    assert!(log.hot_buffer.bytes() <= MIB as u64);
-    assert_eq!(log.hot_buffer.max_seq(), Some(SequenceNumber::new(10)));
-    assert_eq!(mutations.len(), 10);
 }
 
 #[test]
@@ -1516,7 +1538,7 @@ fn opening_fills_ram_only_from_active_wal() {
         }
     }
     let segments = SegmentIndex::scan(&segments_dir(dir.path()), SequenceNumber::new(0)).unwrap();
-    let (_warm, active) = WarmDiskLog::open_recovering(segments_dir(dir.path())).unwrap();
+    let (_warm, active) = WarmDiskLog::open_recovering(segments_dir(dir.path()), &policy).unwrap();
 
     let (ops, mutations) = read_newest(&segments, active, usize::MAX).unwrap();
 

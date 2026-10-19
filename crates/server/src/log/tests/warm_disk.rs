@@ -102,7 +102,7 @@ fn damaged_length_in_the_middle_is_corruption_and_leaves_the_segment_intact() {
         let active = dir.path().join(ACTIVE_SEGMENT);
         std::fs::write(&active, &wal).unwrap();
 
-        let result = WarmDiskLog::open_recovering(dir.path());
+        let result = WarmDiskLog::open_recovering(dir.path(), &RoomLifecyclePolicy::default());
 
         assert!(
             matches!(result, Err(ServerError::WalCorruption(_))),
@@ -134,7 +134,8 @@ fn zeroed_header_followed_by_garbage_is_a_torn_write() {
     let active = dir.path().join(ACTIVE_SEGMENT);
     std::fs::write(&active, &wal).unwrap();
 
-    let (log, (ops, _)) = WarmDiskLog::open_recovering(dir.path()).unwrap();
+    let (log, (ops, _)) =
+        WarmDiskLog::open_recovering(dir.path(), &RoomLifecyclePolicy::default()).unwrap();
 
     assert_eq!(ops.len(), 2);
     assert_eq!(log.active_len(), valid_len);
@@ -150,7 +151,7 @@ fn zeroed_header_followed_by_a_valid_frame_is_corruption() {
     let active = dir.path().join(ACTIVE_SEGMENT);
     std::fs::write(&active, &wal).unwrap();
 
-    let result = WarmDiskLog::open_recovering(dir.path());
+    let result = WarmDiskLog::open_recovering(dir.path(), &RoomLifecyclePolicy::default());
 
     assert!(matches!(result, Err(ServerError::WalCorruption(_))));
     assert_eq!(std::fs::read(&active).unwrap(), wal);

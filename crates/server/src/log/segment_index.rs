@@ -216,14 +216,15 @@ impl SegmentIndex {
 }
 
 /// Whether the cold `segment` holds exactly the operations of its name, every frame verified.
-/// An I/O error is returned instead: it does not prove the copy damaged.
+/// Only its last operation is kept. An I/O error is returned instead: it does not prove the
+/// copy damaged.
 fn holds_its_range(segment: &SegmentEntry) -> Result<bool, ServerError> {
-    let all = &mut ReadBudget::ops(usize::MAX);
+    let last = &mut ReadBudget::window(0, 0);
     match read_cold_file(
         &segment.path,
         Some(segment.start_seq),
         SequenceNumber::new(0),
-        all,
+        last,
     ) {
         Ok((ops, _)) => Ok(ops.last().map(|op| op.seq) == Some(segment.end_seq)),
         Err(ServerError::WalCorruption(_)) => Ok(false),

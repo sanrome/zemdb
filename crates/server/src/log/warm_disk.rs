@@ -3,6 +3,7 @@ use crate::error::ServerError;
 use crate::fail_point;
 use crate::log::budget::ReadBudget;
 use crate::log::io_probe::IoEvent;
+use crate::log::policy::RoomLifecyclePolicy;
 use crate::log::segment_index::{encode_mutation_ids, mutation_ids_path, segment_path, Tier};
 use crate::log::segment_reader::{
     classify_in, open_segment, read_frames, FrameRead, RecoveredLogData,
@@ -42,13 +43,15 @@ impl WarmDiskLog {
     /// Opens or creates the Warm Disk directory.
     #[cfg(test)]
     pub fn open_or_create(segments_dir: impl AsRef<Path>) -> Result<Self, ServerError> {
-        Self::open_recovering(segments_dir).map(|(log, _)| log)
+        Self::open_recovering(segments_dir, &RoomLifecyclePolicy::default()).map(|(log, _)| log)
     }
 
-    /// Opens or creates the Warm Disk directory, and returns the operations and mutation IDs
-    /// recovered from `active.wal` in order. A torn write at its end is truncated.
+    /// Opens or creates the Warm Disk directory, and returns the newest operations of
+    /// `active.wal` that fit in the RAM window of `policy` and all its mutation IDs, in order.
+    /// A torn write at its end is truncated.
     pub(crate) fn open_recovering(
         segments_dir: impl AsRef<Path>,
+        policy: &RoomLifecyclePolicy,
     ) -> Result<(Self, RecoveredLogData), ServerError> {
         let segments_dir = segments_dir.as_ref().to_path_buf();
         durable::create_dir_all_synced(&segments_dir)?;
@@ -62,7 +65,7 @@ impl WarmDiskLog {
             active_mutations: Vec::new(),
         };
 
-        let recovered = log.inspect_active_segment()?;
+        let recovered = log.inspect_active_segment(policy)?;
         log.active_mutations.clone_from(&recovered.1);
         Ok((log, recovered))
     }
@@ -229,8 +232,12 @@ impl WarmDiskLog {
     }
 
     /// Inspects and repairs `active.wal` upon opening, reading it through the locked handle
-    /// that later appends use, and returns its operations and mutation IDs.
-    fn inspect_active_segment(&mut self) -> Result<RecoveredLogData, ServerError> {
+    /// that later appends use, and returns its mutation IDs and, of its operations, only the
+    /// newest that fit in the RAM window of `policy`: every frame is still verified.
+    fn inspect_active_segment(
+        &mut self,
+        policy: &RoomLifecyclePolicy,
+    ) -> Result<RecoveredLogData, ServerError> {
         let active_path = self.active_path();
         if !durable::exists(&active_path)? {
             return Ok(Default::default());
@@ -244,7 +251,7 @@ impl WarmDiskLog {
             Some(len),
             None,
             SequenceNumber::new(0),
-            &mut ReadBudget::ops(usize::MAX),
+            &mut ReadBudget::window(policy.ram_max_ops, policy.ram_max_bytes),
         )?;
         drop(reader);
 
@@ -270,7 +277,7 @@ impl WarmDiskLog {
         file.sync_all()?;
 
         self.active_file = Some(file);
-        self.active_start_seq = read.ops.first().map(|op| op.seq);
+        self.active_start_seq = read.first_seq;
         self.active_end_seq = read.ops.last().map(|op| op.seq);
         self.active_len = valid_len;
 

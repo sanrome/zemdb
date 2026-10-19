@@ -96,7 +96,7 @@ La única excepción son los ítems del backlog marcados **(barato)** que estén
 
 ## 2. Decisiones de diseño
 
-Se continúa la numeración del plan de la Fase 3.9 (que termina en D89). Las decisiones D90 a D97 son las que se tomaron sobre la auditoría (el número entre paréntesis es el de la conversación). Las D98 a D102 son de implementación: se confirman o cambian antes de arrancar el lote correspondiente. D98 se adoptó al cerrar el Lote 0.
+Se continúa la numeración del plan de la Fase 3.9 (que termina en D89). Las decisiones D90 a D97 son las que se tomaron sobre la auditoría (el número entre paréntesis es el de la conversación). Las D98 a D102 son de implementación: se confirman o cambian antes de arrancar el lote correspondiente. D98 se adoptó al cerrar el Lote 0, y D99 al empezar el Lote 2.
 
 | ID | Decisión | Lote | Estado |
 |---|---|---|---|
@@ -109,7 +109,7 @@ Se continúa la numeración del plan de la Fase 3.9 (que termina en D89). Las de
 | **D96** | **Invariantes nuevas y ajustes de enunciado (7a, 9a).** Se agregan, ninguna núcleo: **INV-L7** (ningún efecto en disco sobrevive al lock que lo serializa, con la excepción de D93) e **INV-D10** (cada archivo del log es contiguo por construcción). No se adoptan: INV-W3 (por D92); INV-S7, que pasa a §4 como riesgo hasta la Fase 4 (si se pierde el `.snap` después de una compactación que vació el WAL, la sala abre vacía en la secuencia 0: el cliente vuelve a bajar todo del servidor, y cómo lo detecta lo decide el SDK); INV-R8, que queda como nota en "Sostenida por" de R4; INV-R9, que se decide cuando se construya el worker (hoy la rompería el escenario de DEF-181, que ocupa el tope de subidas de la sala). Se aplican en bloque los ajustes de enunciado de la auditoría (§5); los de D2, D3, D8, D9, W2 e Y9 siguen D92, D94 y D95. | 0 | Adoptada |
 | **D97** | **Alcance de las Medias y Bajas (8a).** Entran DEF-174 (la única Media sin disparador raro), DEF-176 (regresión (a); el límite aceptado de R7 se apoya en R5) y DEF-180 (una línea). DEF-177, DEF-178 y DEF-181 van al backlog: R4, R7 y A3 quedan con rupturas Bajas abiertas, marcadas así en la columna Estado (§1.5). DEF-179 se resuelve con D94. | — | Adoptada |
 | **D98** | **Sellar `active.wal` al abrir si quedó por debajo del piso (DEF-167).** Al abrir, si `active_end_seq < head_seq`, `active.wal` se sella enseguida con su rango real (o, si quedó vacío, el `active.wal` nuevo arranca en `head_seq + 1`), y `seal_active_segment` graba `sealed_through_seq = max(end, meta.sealed_through_seq)`. La secuencia perdida queda como un hueco (`BehindCompaction`), como prevé D8. Como defensa, `append` rechaza un registro que no continúa `active_end_seq` con un error que detiene la sala (falla cerrada); con el sellado al abrir, es inalcanzable. Al adoptarla se descartó la alternativa de sellar en el `append` y seguir: oculta un estado que no debería existir. | 1 | Adoptada |
-| **D99** | **La apertura del log retiene solo la ventana de RAM (DEF-170).** `inspect_active_segment` valida todos los frames y junta los ids de mutación, pero mientras lee retiene solo una ventana deslizante acotada por `ram_max_ops` y `ram_max_bytes`, con el cobro de D73. `segment_mutations` (un segmento sin sidecar) junta solo los ids. La memoria de la apertura queda acotada por la ventana de RAM más un frame, además de los ids de la ventana de dedup. | 2 | Propuesta |
+| **D99** | **La apertura del log retiene solo la ventana de RAM (DEF-170).** `inspect_active_segment` valida todos los frames y junta los ids de mutación, pero mientras lee retiene solo una ventana deslizante acotada por `ram_max_ops` y `ram_max_bytes`, con el cobro de D73. `segment_mutations` (un segmento sin sidecar) junta solo los ids. La memoria de la apertura queda acotada por la ventana de RAM más un frame, además de los ids de la ventana de dedup. Al adoptarla se precisó: la ventana es un modo de `ReadBudget` que siempre conserva la última operación (dice dónde terminó la lectura), y vale también para la verificación del cold duplicado del Lote 1 (DEF-168). | 2 | Adoptada |
 | **D100** | **`main` síncrono (DEF-172).** `main` deja de ser `#[tokio::main]`: toma `server.lock`, arma el runtime, hace `block_on` del servidor, suelta el runtime (que espera a los `spawn_blocking` en curso) y recién después suelta el lock. No se usa `shutdown_timeout`, que soltaría el lock con tareas todavía corriendo. Se descarta filtrar el handle: depende de que el sistema operativo lo suelte al salir y deja el orden implícito. | 3 | Propuesta |
 | **D101** | **La purga del relay retiene el lock del slot (DEF-175).** La purga (`relay/lifecycle.rs`) toma el lock del slot de la sala como guard propio (*owned*) y lo mueve a la closure de `run_blocking`, que lo suelta después de su última operación de archivo (INV-L7). Una purga cortada termina antes de que la sala recreada pueda instalar un snapshot. Vale para `create_room` y `delete_room`, que comparten la purga, y para `drop_stale` (`relay/download.rs`), que borra el snapshot descartado con el mismo patrón y es la otra ruptura de INV-L7 en el relay. La alternativa, correr `create_room` en su propia tarea, cierra este caso pero no el patrón. | 3 | Propuesta |
 | **D102** | **El tope total de una subida se cuenta por uploader (DEF-174).** Completa el fix de DEF-153: hoy el tope se hereda cuando el uploader reinicia con la sesión viva, pero no a través de un vencimiento. El slot recuerda el uploader y el tope de la última sesión vencida, y una sesión nueva del mismo uploader que arranca dentro de `UPLOAD_IDLE_TIMEOUT` desde ese vencimiento hereda el tope: si ya pasó, se rechaza como una subida vencida. Así una subida, su ancla de poda (D61) y la designación que congela (D76) quedan acotadas por `snapshot_upload_max_secs`, y entre dos ciclos hay al menos un plazo de inactividad en el que la designación se reemplaza. Cumple el ajuste de INV-B2 ("por uploader") y hace pasar los cuatro tests de `inv2/b` e `inv2/delta`. La alternativa, que `designate` deje de congelar después de `designation_timeout + snapshot_upload_max_secs`, cierra R4 pero no el tope de la subida ni el ancla. | 4 | Propuesta |
@@ -122,12 +122,12 @@ Se continúa la numeración del plan de la Fase 3.9 (que termina en D89). Las de
 |---|---|---|---|---|
 | 0 | Contrato y redes de prueba | D90–D97 | Inmediata (las redes viven en parches) | ✅ |
 | 1 | Log del servidor: abrir sin perder ni borrar de más | DEF-167, 168, 169 | Alta | ✅ 3/3 |
-| 2 | Apertura acotada | DEF-170 | Alta | ⬜ 0/1 |
+| 2 | Apertura acotada | DEF-170 | Alta | ✅ 1/1 |
 | 3 | Locks y ciclo de vida | DEF-172, 175 | Media | ⬜ 0/2 |
 | 4 | Subidas | DEF-174, 176, 180 | Media | ⬜ 0/3 |
 | 5 | Cierre | Documentación y revisión de cierre (D90) | Requisito de la Fase 4 | ⬜ |
 
-**Avance total:** Lotes 0 y 1 cerrados; 3 de 9 ítems.
+**Avance total:** Lotes 0 a 2 cerrados; 4 de 9 ítems.
 
 **Por qué este orden, en una línea por lote:**
 0. Sin el contrato actualizado, cada lote se revisa contra enunciados viejos; sin las redes en el repo, se pierden.
@@ -400,7 +400,7 @@ Mover el borrado de `.wal.compacting` antes del rename no lo detecta la simulaci
 
 > Objetivo: que abrir una sala retenga como mucho la ventana de RAM, sea cual sea el ancho del esquema.
 
-#### DEF-170 · Alto · ⬜ Pendiente
+#### DEF-170 · Alto · ✅ Hecho
 **Problema.** Abrir una sala decodifica entero `active.wal` antes de recortarlo a la ventana de RAM. Con un esquema ancho legal y filas de `Null` son ~30 MB medidos con 4.096 columnas y ~800 MB estimados con 65.535, por apertura, y varias aperturas concurrentes se suman. Lo mismo pasa con un segmento sin sidecar.
 **Solución.** D99.
 **Test exigido.**
@@ -415,6 +415,44 @@ Mover el borrado de `.wal.compacting` antes del rename no lo detecta la simulaci
 - el cobro de la HotBuffer (D73);
 - la lectura desde disco de lo que quedó fuera de la ventana;
 - la verificación del cold duplicado del Lote 1 (DEF-168), que decodifica un segmento entero al abrir.
+
+**Hecho.** Como dice D99. `ReadBudget::window(max_ops, max_bytes)` admite todas las operaciones, y `read_frames`, al terminar cada frame, llama a `slide`: suelta las más viejas que no entran, cobradas con `op_bytes` (D73), y conserva siempre la última. `FrameRead.first_seq` da el inicio de `active.wal`, que la ventana puede ya no tener. Se usa en tres lugares:
+- `inspect_active_segment`, con la ventana de RAM de la política (`open_recovering` ahora la recibe);
+- `segment_mutations`, con `window(0, 0)`: de un segmento sin sidecar quedan los ids;
+- `holds_its_range` (DEF-168), con `window(0, 0)`: queda la última operación para compararla con `end`. **Desvío, confirmado con el dueño:** D99 no lo nombraba, pero el Lote 1 lo dejó como interacción de este lote.
+
+Producción: +45 −12 líneas.
+
+**Tests.** Un pico bajo `cfg(test)` (`budget::PEAK`, thread-local) anota lo que retiene cada lectura después de cada frame, medido en bytes como los cobra la RAM. Se extendieron dos tests, en lugar de traer `audit_b1_*` como test aparte:
+- `reopening_loads_into_ram_only_what_fits` es el test de `inv2/b` adaptado. Usa filas de `Null` (un segmento `1..=30` y `31..=50` en `active.wal`, cada uno más grande que 1 MiB de RAM) y corre con y sin el sidecar del segmento. Comprueba que el pico de la reapertura no pasa de `ram_max_bytes`, que `active.wal` arranca en 31, y la HotBuffer y los ids como antes. Sin el fix, el pico es de 1,97 MB.
+- `open_never_drops_a_verified_cold_copy_for_a_damaged_warm_one`: el pico de la apertura que verifica el cold no pasa de lo que queda en la HotBuffer.
+
+**Mutaciones** (cada una restaurada después):
+- sin ventana en `inspect_active_segment`: falla el primero;
+- el inicio tomado de `ops.first()`: falla el primero (por la línea de `active_start_seq`, que se sumó para esto);
+- sin ventana en `segment_mutations`: falla el primero, sin sidecar;
+- sin ventana en `holds_its_range`: falla el segundo;
+- la ventana sin conservar la última operación: falla el segundo.
+
+**Interacciones:**
+- **Ventana de dedup (Y4, Y9):** `read.mutations` nunca se recorta. La apertura sigue juntando todos los ids de `active.wal` y de los segmentos, y `active_mutations` (el sidecar de la rotación) los recibe todos. Lo comprueba el primer test (50 ids).
+- **Validación de frames y truncado (D78):** la ventana nunca agota el presupuesto (`max_ops` es `usize::MAX`), y con `from_seq` 0 no se saltea ningún frame por su header, así que todos se leen y se verifican. Los tests de escrituras rotas y de corrupción de `warm_disk` siguen pasando.
+- **Sellado al abrir (D98):** usa `active_end_seq`, la última operación, que la ventana siempre conserva.
+- **Cobro de la HotBuffer (D73):** la ventana cobra con el mismo `op_bytes`; `contiguous_suffix` y `apply_sliding_window` no cambian.
+- **Lectura desde disco de lo que quedó afuera:** `read_active_range` lee el archivo, igual que antes.
+- **Cold duplicado (DEF-168):** solo necesita la última operación, y la verificación de cada frame no cambia.
+- **Las demás lecturas:** con un presupuesto común, `slide` solo anota el pico en los tests.
+- **Quienes leen `active_start_seq`**, que ahora sale de `first_seq`: `active_ops_count` (cuándo sella `append`), `compute_tail_seq` (la cola cuando no hay segmentos), y `seal_active_segment` y `rotate_active_segment` (el rango del `SegmentEntry` y los nombres del segmento y su sidecar). Los cubre la línea de `active_start_seq` del primer test.
+
+**Revisión de delta.** La hizo un agente aparte, de contexto fresco y solo lectura, que corrió la suite del log. No encontró hallazgos Altos ni Medios, ni otra invariante rota, ni violaciones de `GEMINI.md`. Confirmó que cada mutación hace fallar un test. Señaló:
+- la interacción con quienes leen `active_start_seq`, que faltaba en la lista: se sumó arriba;
+- el doc de `read_newest`, que decía que RAM se llena con todo `active.wal`: se corrigió;
+- que el pico se mide después de `slide`, así que prueba la ventana pero no el frame de más que admite D99;
+- un Bajo previo, fuera del lote: va al backlog.
+
+**Cierre del lote:**
+- **Chequeos:** fmt, clippy del workspace, `cargo test --workspace` y `cargo doc` con `-D warnings`, en verde (Linux). No toca `core` ni `storage`, así que no hace falta el build de wasm32.
+- **Versiones largas del servidor** (`--release -- --ignored`): 13 tests en verde, en 337 s (Linux).
 
 ---
 
@@ -544,6 +582,8 @@ Sigue vigente el [backlog de la Fase 3.9](2026-10-fase3_9-remediation-plan.md#ba
 | `drop_stale` borra en el future de la request | Lote 3 (D101) |
 
 **Tests:** `register_reports_only_a_usable_snapshot` (`actor/tests/room.rs`) corre en tiempo real y falla bajo carga: 4 de 15 corridas con otros tests pesados en paralelo, 0 de 15 sin otra carga. Hay que pasarlo a tiempo pausado.
+
+**Nuevo en el Lote 2 (revisión de delta), Bajo:** ante una anomalía en un cold, `read_cold_file` descomprime en memoria el resto del segmento (hasta `segment_max_bytes`) para clasificarla. La apertura lo hace si un cold duplicado o un cold sin sidecar están dañados, y eso retiene más que la ventana de RAM y un frame. Necesita un daño accidental y son bytes de wire. Solución: clasificar recorriendo el stream sin juntarlo, o acotar lo que se lee al frame siguiente.
 
 Más los tres Bajos que no entran (D97):
 - **DEF-177** (R7): el piso se olvida cuando el actor se detiene, y una subida en vuelo se confirma sin chequearlo. Solución: que la tarea del actor no borre el piso mientras haya una subida en curso, y que `cleanup_expired` lo borre junto con el slot.
