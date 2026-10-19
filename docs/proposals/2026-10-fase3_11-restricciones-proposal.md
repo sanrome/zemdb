@@ -108,7 +108,7 @@ Se numeran DR1, DR2, etc. para no chocar con la numeración D de los planes de r
 | **DR12** | **Requisitos para la Fase 4.** Ver §7.<br>- El cliente resuelve cada escritura cuando su réplica aplicó hasta la secuencia asignada, con el resultado de DR5.<br>- Hay un pre-chequeo local opcional.<br>- El `ChangeStream` no emite nada por operaciones rechazadas.<br>- `ROADMAP.md` §4.4.4 se reescribe. | 0, 6 | Propuesta |
 | **DR13** | **Sin detección de divergencia en esta fase.** Es un riesgo aceptado (`INVARIANTES.md` §4): una réplica que decide distinto diverge sin aviso.<br>- **Mitigación:** el oráculo diferencial y los tests de convergencia (§5.3).<br>- **Backlog:** un digest del estado por secuencia, que las réplicas comparen a través del servidor (por ejemplo, en el heartbeat). | 0 | Propuesta |
 | **DR14** | **Cierre por revisión de delta, sin auditoría amplia.** Core, storage y servidor están dentro del alcance auditado, y el modelo de amenaza no cambia en lo que importa a D90: un miembro hostil sigue pudiendo secuenciar operaciones válidas, y las réplicas honestas las rechazan. Cada lote cierra con su revisión de delta (§5.2, paso 4), y la fase con una revisión de cierre del delta completo. Esa revisión también audita por primera vez las invariantes nuevas. | 6 | Propuesta |
-| **DR15** | **Dueño seudónimo (opcional).** Con `identity: "Pseudonym"`, la columna dueño guarda un seudónimo de 32 bytes en vez del `ClientId`.<br>- **Derivación:** el servidor deriva una clave de dueño con BLAKE3 en modo con clave. Las entradas son un secreto propio (`ZEMDB_OWNER_SECRET`, distinto de los otros dos), la sala y el cliente. Se la da al cliente en `Registered`. El seudónimo de una tabla es el hash con clave de su `table_id` bajo la clave de dueño: el cliente lo calcula, y el servidor lo recalcula para verificar.<br>- **El cliente escribe el seudónimo y el servidor lo verifica,** en vez de que el servidor lo inserte al confirmar la operación. El servidor no modifica operaciones (`ARCHITECTURE.md` §4.1), la copia local del cliente es igual a la del log, los reintentos deduplicados no cambian, y el cliente necesita su seudónimo igual, para reconocer sus propias filas.<br>- **Lo que garantiza:** los demás miembros no ven el `ClientId`, ni pueden vincular las filas de un cliente entre tablas distintas. Conocer el seudónimo de otro no permite escribir en su nombre: el servidor lo recalcula desde el cliente autenticado.<br>- **Lo que no garantiza:** quien tiene el secreto puede recalcular el seudónimo de cada cliente (§2.2); las filas de un cliente en la misma tabla comparten seudónimo; y el orden y el momento de los commits pueden delatar a quien escribe.<br>- **El secreto no se rota:** cambiarlo deja todas las filas sin un dueño que pueda modificarlas. Sin el secreto configurado, se rechaza un esquema que use seudónimos, y el servidor no arranca si alguno ya registrado los usa. | 2b | Propuesta |
+| **DR15** | **Dueño seudónimo (opcional).** Con `identity: "Pseudonym"`, la columna dueño guarda un seudónimo de 32 bytes en vez del `ClientId`.<br>- **Derivación:** el servidor deriva una clave de dueño con BLAKE3 en modo con clave. Las entradas son un secreto propio (`ZEMDB_OWNER_SECRET`, distinto de los otros dos), la sala y el cliente. Se la da al cliente en `Registered`. El seudónimo de una tabla es el hash con clave de su `table_id` bajo la clave de dueño: el cliente lo calcula, y el servidor lo recalcula para verificar.<br>- **El cliente escribe el seudónimo y el servidor lo verifica,** en vez de que el servidor lo inserte al confirmar la operación. El servidor no modifica operaciones (`ARCHITECTURE.md` §4.1), la copia local del cliente es igual a la del log, los reintentos deduplicados no cambian, y el cliente necesita su seudónimo igual, para reconocer sus propias filas.<br>- **Lo que garantiza:** los demás miembros no ven el `ClientId`, ni pueden vincular las filas de un cliente entre tablas distintas. Conocer el seudónimo de otro no permite escribir en su nombre: el servidor lo recalcula desde el cliente autenticado.<br>- **Lo que no garantiza:** quien tiene el secreto puede recalcular el seudónimo de cada cliente (§2.2); las filas de un cliente en la misma tabla comparten seudónimo; y el orden y el momento de los commits pueden delatar a quien escribe.<br>- **El secreto no se rota:** cambiarlo deja todas las filas sin un dueño que pueda modificarlas. Sin el secreto configurado, se rechaza un esquema que use seudónimos, y el servidor no arranca si alguno ya registrado los usa. | 2b | ⏸ Diferida (post-v0.1) |
 
 ### 3.1. Reglas de verificación en las réplicas (DR4)
 
@@ -294,7 +294,7 @@ Este procedimiento, junto con `GEMINI.md`, alcanza para retomar el trabajo sin e
 - **El Lote 0** solo toca documentos y se puede adelantar.
 - **El Lote 1** arranca cuando cierra la Fase 3.10, para no mezclar su delta con la revisión de cierre de esa fase (D90).
 - **El Lote 2** depende del 1 y es independiente del 3 al 5.
-- **El Lote 2b** es opcional, va después del 2 y se puede diferir sin afectar al resto.
+- **El Lote 2b** está diferido a después de la v0.1.
 - **Los Lotes 3, 4 y 5** van en ese orden: tocan los mismos archivos del storage.
 - **El Lote 6** va al final.
 
@@ -382,13 +382,13 @@ El revisor lo recorre en cada lote de storage:
 | 0 | Contrato | Documentos | Todas | Nuevas: C1, C2, C3, A5. Ajuste: Y8 | ⬜ |
 | 1 | `UNIQUE` y FK en el esquema | core | DR3, DR8, DR9 | E1, W1, W2 | ⬜ |
 | 2 | Servidor: dueño, inmutabilidad y API de administración | core, server | DR3, DR8, DR10, DR11 | A1, A5, Y5, E1, E2, D9, W1, W2 | ⬜ |
-| 2b | Dueño seudónimo (opcional) | core, server | DR15 | A1, A5, Y5 | ⬜ |
+| 2b | Dueño seudónimo (diferido) | core, server | DR15 | A1, A5, Y5 | ⏸ |
 | 3 | Índices derivados y `ApplyReport` | storage | DR5, DR6 | S1, S3, S6, C3 | ⬜ |
 | 4 | Verificación en las réplicas | storage | DR1, DR4, DR5, DR10, DR11 | Y8, S1, A5, C2, C3, W1 | ⬜ |
 | 5 | Snapshots, apertura y evolución | storage | DR3, DR7 | S4, S5, C1, C2, W1 | ⬜ |
 | 6 | Cierre | Documentos | DR12, DR14 | Todas las tocadas | ⬜ |
 
-**Requisito para empezar la Fase 4:** Lotes 0 a 6 cerrados, con la revisión de cierre en verde. El 2b, solo si se decidió hacerlo en esta fase. El diseño del cliente, no su código, puede empezar cuando cierre el Lote 3, que fija el contrato de `apply_batch`.
+**Requisito para empezar la Fase 4:** Lotes 0 a 6 cerrados, con la revisión de cierre en verde. El 2b está diferido y no es requisito. El diseño del cliente, no su código, puede empezar cuando cierre el Lote 3, que fija el contrato de `apply_batch`.
 
 ### Lote 0 · Contrato · ⬜ Pendiente
 **Objetivo:** dejar el contrato contra el que se revisa cada lote. Solo documentos.
@@ -571,8 +571,8 @@ Positivos:
 - §7.1: los cuerpos de `/admin/schemas` y `.../columns`, y el rechazo de campos desconocidos;
 - §7.2: `SchemaViolation` por dueño o inmutabilidad.
 
-### Lote 2b · Dueño seudónimo (opcional) · ⬜ Pendiente
-**Objetivo:** DR15. Se puede diferir sin afectar al resto de la fase.
+### Lote 2b · Dueño seudónimo · ⏸ Diferido
+**Objetivo:** DR15. Se difirió a después de la v0.1 (los votos anónimos no son un requisito); no afecta al resto de la fase. Queda especificado para retomarlo.
 
 **Archivos:**
 - `crates/server/src/config.rs` (el secreto);
@@ -778,7 +778,7 @@ Positivos:
 2. ¿Se informa `MissingRow`? Propuesta: sí; hoy el `Update` se pierde sin aviso.
 3. Los topes de DR9 (32 restricciones por tabla y 16 columnas por restricción).
 4. Reasignación de esquema: ¿solo con las mismas restricciones, o prohibida para una sala con log? Propuesta: con las mismas restricciones.
-5. Seudónimos (Lote 2b): ¿entran en esta fase o se difieren? Propuesta: entran si hay un caso de uso para la v0.1 (votos anónimos); si no, se difieren, porque no afectan al resto.
+5. ~~Seudónimos (Lote 2b): ¿entran en esta fase o se difieren?~~ Resuelta: se difieren a después de la v0.1.
 6. Alcance del seudónimo: ¿por tabla, o también por fila? Por fila sería, por ejemplo, incluir `poll_id` en la derivación, para que los votos de un cliente en encuestas distintas no se puedan vincular. El servidor lo podría calcular sin estado, porque esos valores vienen en la operación. Propuesta: por tabla en esta fase.
 7. ¿La encarnación de la sala entra en la derivación del seudónimo? Propuesta: sí; una sala recreada es otra sala.
 8. El nombre de la fase (3.11) y de los campos (`owner`, `identity`, `immutable`).
