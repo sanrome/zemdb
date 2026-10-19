@@ -1,6 +1,6 @@
 # Invariantes de ZemDB
 
-**Estado:** Vigente. Versión 3 (18 de Octubre de 2026): incorpora las decisiones de la [Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (D90–D97) tomadas sobre la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md). La versión 2 (16 de Octubre) incorporó las de la [Fase 3.9](proposals/2026-10-fase3_9-remediation-plan.md) (D70–D72, D77–D79) y es la que auditó la 2ª ronda; la versión 1 (15 de Octubre, sobre `6485f46`), la que auditó la [primera](audits/2026-10-invariantes-audit.md).
+**Estado:** Vigente. Versión 4 (19 de Octubre de 2026): agrega las invariantes de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md) (DR1–DR14): INV-A5 e INV-C1 a C3, nuevas, y el enunciado ampliado de INV-Y8. La versión 3 (18 de Octubre) incorpora las decisiones de la [Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (D90–D97) tomadas sobre la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md). La versión 2 (16 de Octubre) incorporó las de la [Fase 3.9](proposals/2026-10-fase3_9-remediation-plan.md) (D70–D72, D77–D79) y es la que auditó la 2ª ronda; la versión 1 (15 de Octubre, sobre `6485f46`), la que auditó la [primera](audits/2026-10-invariantes-audit.md).
 **Uso:** base de las auditorías por invariantes y de los tests de propiedades. Reemplaza a las auditorías abiertas por perspectiva ("buscá errores desde X").
 **Contrato de referencia:** [`ARCHITECTURE.md`](../ARCHITECTURE.md). Las invariantes se enuncian sobre el comportamiento observable y remiten a la sección que lo describe; no citan líneas de código, para que el documento no envejezca con cada refactor.
 
@@ -63,7 +63,7 @@ Cada lote que cierra una ruptura actualiza esta columna en el mismo commit (§5)
 
 ### 1.6. Reparto sugerido
 
-Un auditor por grupo (§3.1 a §3.9). Cada uno recibe este documento, `ARCHITECTURE.md`, la lista de riesgos aceptados (§4) y las decisiones de los planes de remediación (D1 a D102), y responde solo con veredictos.
+Un auditor por grupo (§3.1 a §3.10). Cada uno recibe este documento, `ARCHITECTURE.md`, la lista de riesgos aceptados (§4), las decisiones de los planes de remediación (D1 a D102) y las de la Fase 3.11 (DR1 a DR15), y responde solo con veredictos.
 
 ---
 
@@ -80,7 +80,7 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 
 **No se confía en:**
 - **La red y quien no tiene token:** puede mandar cualquier byte, a cualquier ritmo, abrir y abandonar conexiones.
-- **Un miembro con token válido de una sala:** puede ser hostil dentro de su sala (mandar mensajes válidos en cualquier orden, no leer respuestas, reintentar, abrir streams). No puede afectar a otras salas ni actuar como otro cliente. Que suba un snapshot bien formado pero falso está fuera de alcance (§4).
+- **Un miembro con token válido de una sala:** puede ser hostil dentro de su sala (mandar mensajes válidos en cualquier orden, no leer respuestas, reintentar, abrir streams). No puede afectar a otras salas ni actuar como otro cliente. Puede secuenciar operaciones que violan las restricciones del esquema: las réplicas honestas las rechazan (INV-C2). No puede escribir filas ajenas en una tabla con dueño (INV-A5). Que suba un snapshot bien formado pero falso está fuera de alcance (§4).
 - **El reloj de pared:** puede saltar hacia atrás o adelante. El orden lo define solo `SequenceNumber`.
 
 **Fuera de alcance de la v0.1:** TLS (lo termina el proxy), revocación de tokens, defensa contra snapshots envenenados, el SDK del cliente (Fase 4) salvo `zemdb-storage` y `zemdb-core`.
@@ -91,7 +91,7 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 
 ### Resumen
 
-Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md) (ver §1.5), con los lotes del [plan de la Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (cerrados: 0 a 5, con la revisión de cierre) y las decisiones D92 a D102.
+Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md) (ver §1.5), con los lotes del [plan de la Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (cerrados: 0 a 5, con la revisión de cierre) y las decisiones D92 a D102. Las invariantes de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md) son nuevas (🆕): entre paréntesis va el lote que las implementa, y se auditan por primera vez en su revisión de cierre (DR14).
 
 | ID | Invariante | ★ | Si se rompe | Estado |
 |---|---|---|---|---|
@@ -118,7 +118,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-Y5** | Un commit rechazado no deja rastro | | Medio | ✅ |
 | **INV-Y6** | Los cursores solo avanzan por lo que el cliente confirmó | | Medio | ✅ |
 | **INV-Y7** | Un registro con cursor de otra encarnación nunca se acepta | | Medio | ✅ |
-| **INV-Y8** | Réplicas con el mismo prefijo convergen | ★ | Alto | ✅ |
+| **INV-Y8** | Réplicas con el mismo prefijo convergen | ★ | Alto | ✅ (ampliada en la Fase 3.11: Lote 4) |
 | **INV-Y9** | La ventana de dedup es función del log | | Medio | ✅ (D94) |
 | **INV-R1** | La poda por cursores nunca borra lo que alguien necesita | ★ | Alto | ✅ |
 | **INV-R2** | El rango retenido es contiguo y su cola no retrocede | | Medio | ✅ |
@@ -131,6 +131,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-A2** | Nada se decodifica antes de autenticar, salvo lo acotado de `/register` | | Alto | ✅ |
 | **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio | ❌ Bajo (backlog) |
 | **INV-A4** | Ningún identificador produce rutas fuera de `data_dir` | ★ | Alto | ✅ |
+| **INV-A5** | Nadie escribe una fila ajena | ★ | Alto | 🆕 (Fase 3.11, Lotes 2 y 4) |
 | **INV-B1** | La memoria por request está acotada | ★ | Alto | ✅ |
 | **INV-B2** | Nada se retiene sin plazo | | Medio | ✅ |
 | **INV-B3** | La memoria, el disco y los FDs del servidor están acotados por la configuración | | Medio | ✅ |
@@ -147,6 +148,9 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-E2** | Un cliente con el esquema viejo siempre puede enterarse | | Bajo | ✅ |
 | **INV-W1** | Ninguna entrada hace entrar en pánico, abortar ni reservar de más | ★ | Alto | ✅ |
 | **INV-W2** | Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum | | Medio | ✅ (D92) |
+| **INV-C1** | Ninguna versión posterior del esquema cambia la decisión sobre una operación ya secuenciada | ★ | Alto | 🆕 (Fase 3.11, Lotes 1 y 5) |
+| **INV-C2** | El estado de una réplica cumple las restricciones de su esquema | ★ | Alto | 🆕 (Fase 3.11, Lotes 4 y 5) |
+| **INV-C3** | Un rechazo no deja rastro, y los índices son función de las tablas | | Medio | 🆕 (Fase 3.11, Lotes 3 y 4) |
 
 ---
 
@@ -287,9 +291,9 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 **Cómo intentar romperla.** Sala sin `meta_room.json` creada por `get_or_spawn`; delete y create concurrentes; registros con y sin cursor, con encarnaciones viejas, nuevas y ausentes.
 
 #### INV-Y8 ★ · Réplicas con el mismo prefijo convergen
-**Enunciado.** Dos réplicas honestas que aplican el mismo prefijo del log, en cualquier combinación de "aplicar operaciones" y "restaurar un snapshot tomado en `S` y aplicar desde `S`", terminan con el mismo estado. "Mismo estado" quiere decir las mismas filas módulo los `Null` al final (D71): un `Update` ensancha la fila hasta el ancho del esquema con que se aplica, y `compact_into_row` completa con `Null`. Aplicar una operación es una función determinista del estado y la operación (upsert del `Insert`, merge por campo del `Update`, tombstone del `Delete`).
-**Sostenida por.** `apply_operation` en storage, `Schema::validate_operation` (§4, §10.1).
-**Cómo intentar romperla.** `Update` sobre una fila inexistente o borrada; `Update` de una columna agregada después (filas cortas); snapshot de un motor aplicado en el otro; -0.0 y NaN en claves.
+**Enunciado.** Dos réplicas honestas que aplican el mismo prefijo del log, en cualquier combinación de "aplicar operaciones" y "restaurar un snapshot tomado en `S` y aplicar desde `S`", terminan con el mismo estado. "Mismo estado" quiere decir las mismas filas módulo los `Null` al final (D71): un `Update` ensancha la fila hasta el ancho del esquema con que se aplica, y `compact_into_row` completa con `Null`. Aplicar una operación es una función determinista del estado, la operación y las restricciones del esquema (upsert del `Insert`, merge por campo del `Update`, tombstone del `Delete`, y el rechazo de la operación que viola una restricción). Por eso las dos réplicas también toman la misma decisión sobre cada operación: aplicada, o rechazada con el mismo motivo (Fase 3.11, DR4).
+**Sostenida por.** `apply_operation` en storage, `Schema::validate_operation` (§4, §10.1); la verificación de restricciones (DR4).
+**Cómo intentar romperla.** `Update` sobre una fila inexistente o borrada; `Update` de una columna agregada después (filas cortas); snapshot de un motor aplicado en el otro; -0.0 y NaN en claves; operaciones que violan restricciones, en batches y en el replay del WAL.
 **Automatizable.** Log aleatorio; oráculo = aplicar todo desde cero contra snapshot en un punto aleatorio + resto, en los dos motores.
 **Fuera de alcance.** Un snapshot falso de un miembro hostil (DEF-81).
 
@@ -358,6 +362,12 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 **Enunciado.** Ningún `RoomId`, `SchemaId`, `ClientId`, secuencia ni hash produce una ruta fuera de `data_dir`, ni dos identificadores distintos producen el mismo archivo (incluidos sistemas de archivos que no distinguen mayúsculas).
 **Sostenida por.** Validación por construcción de los ids (§3.1), nombres de archivo inyectivos del relay.
 **Cómo intentar romperla.** Ids por URL, por payload binario, por JSON admin y por nombres de archivo encontrados en disco; nombres reservados de Windows.
+
+#### INV-A5 ★ · Nadie escribe una fila ajena
+**Enunciado.** En una tabla con dueño, toda operación secuenciada declara como dueño al cliente que la envió, y ninguna operación aplicada inserta, reemplaza, modifica ni borra una fila cuyo dueño es otro.
+**Sostenida por.** La verificación del dueño declarado en el commit, antes de secuenciar (DR10), la verificación de las réplicas sobre la fila existente (DR4, DR10) e INV-A1.
+**Cómo intentar romperla.** Un `Insert`, `Update` o `Delete` de B que declara a A como dueño; uno de B que se declara dueño sobre una fila de A, con el dueño dentro y fuera de la clave; un `Update` que intenta transferir la fila; un reintento deduplicado.
+**Fuera de alcance.** Un snapshot falso de un miembro hostil (DEF-81).
 
 ### 3.6. Recursos acotados
 
@@ -451,6 +461,28 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 **Sostenida por.** Opciones de bincode únicas, CRC de header y payload, CRC de sidecars, envelope `ZMSN`, BLAKE3 del relay, CRC32 de los JSON persistidos (INV-D9).
 **Automatizable.** Roundtrip con generadores aleatorios para cada formato. En el repo desde el Lote 0 de la Fase 3.9.
 
+### 3.10. Restricciones
+
+Las de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md): `UNIQUE`, claves foráneas con `RESTRICT` y tablas inmutables, verificadas por cada réplica al aplicar el log. Una operación que viola una restricción se secuencia y cada réplica la rechaza (DR1).
+
+#### INV-C1 ★ · Ninguna versión posterior del esquema cambia la decisión sobre una operación ya secuenciada
+**Enunciado.** Aplicar el log de una sala con cualquier versión del esquema bajo la que cada operación es válida da el mismo estado y la misma decisión (aplicada o rechazada, con el mismo motivo) para cada operación, al recibirla, al reabrir y al reaplicar el WAL.
+**Sostenida por.** Las restricciones solo nacen con el esquema o con una columna nueva que incluyen (DR3); INV-E1 e INV-E2.
+**Cómo intentar romperla.** Agregar una columna con `UNIQUE` o FK en medio de un log; réplicas que conocen la versión nueva en momentos distintos; reabrir con la versión nueva un WAL y un snapshot escritos con la vieja; reasignar la sala a otro esquema.
+**Automatizable.** Log aleatorio con columnas agregadas en puntos aleatorios; oráculo = aplicar cada operación con la versión que se conocía al recibirla contra aplicar todo con la última.
+
+#### INV-C2 ★ · El estado de una réplica cumple las restricciones de su esquema
+**Enunciado.** Después de cada `apply_batch`, de abrir una sala y de aplicar un snapshot, ninguna clave `UNIQUE` sin `NULL` se repite, toda clave foránea sin `NULL` tiene su fila padre y ninguna fila de una tabla inmutable fue reemplazada. Un snapshot (local o de otro peer) que no las cumple no se abre ni se instala.
+**Sostenida por.** La verificación al aplicar (DR4, DR11) y la de los snapshots (DR7).
+**Cómo intentar romperla.** Violaciones concurrentes en los dos órdenes; un padre y su hijo en el mismo batch, en los dos órdenes; un snapshot con duplicados o con FK colgantes; una fila que se apunta a sí misma.
+**Automatizable.** Oráculo diferencial: un modelo de referencia que verifica recorriendo tablas, sin índices, contra los dos motores.
+
+#### INV-C3 · Un rechazo no deja rastro, y los índices son función de las tablas
+**Enunciado.** Una operación rechazada no cambia tablas ni índices y avanza `head_seq`: el estado queda igual que si se aplicara el log sin ella. En todo estado publicado, los índices de las restricciones son exactamente los que se construirían desde las tablas, en los dos motores.
+**Sostenida por.** Validar antes de mutar (`GEMINI.md`); índices derivados que se publican junto con las tablas (DR1, DR6).
+**Cómo intentar romperla.** Un rechazo en medio de un batch; un pánico después de escribir el WAL; reabrir, compactar y aplicar un snapshot con índices construidos.
+**Automatizable.** Después de batches aleatorios, comparar los índices con los reconstruidos desde las tablas.
+
 ---
 
 ## 4. Riesgos aceptados (no se reportan)
@@ -478,6 +510,9 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | En storage, un daño en el último frame de `.wal.compacting` se trunca como una escritura rota: si el WAL activo no tiene lotes posteriores, ese lote se pierde sin aviso (si los tiene, la apertura falla por el hueco). | Como `.wal.compacting` toma su nombre después de sincronizarse, solo puede venir de un daño accidental en un lugar preciso. Es el gemelo de D78 en el storage. | D95 |
 | Si el runtime de Tokio se apaga con un `open_room`, un `apply_snapshot` o una compactación del storage en vuelo, y la misma sala se reabre en el mismo proceso antes de que termine su hilo bloqueante, ese hilo puede pisar archivos de la sala reabierta y perder lotes confirmados sin aviso. No pasa en wasm32, ni al salir del proceso (es un crash), ni al soltar un future (D86, D89). | Quien maneja el runtime cierra las salas con `close_room`, que espera a esas tareas, antes de apagarlo. Es un requisito de diseño del SDK de la Fase 4. | D93, `ARCHITECTURE.md` §8 *Room Lock* |
 | En storage, si se pierde el `.snap` después de una compactación que vació el WAL, la sala abre vacía en la secuencia 0. | El cliente vuelve a bajar todo del servidor; cómo detecta la pérdida lo decide el SDK de la Fase 4. | D96 (propuesta S7 de la 2ª auditoría) |
+| Una réplica que decide distinto sobre una restricción (por un error de implementación o por otra semántica) diverge sin aviso. | No hay comparación de estado entre réplicas; lo mitigan el oráculo diferencial y los tests de convergencia. Un digest de estado por secuencia queda en el backlog. | DR13 (Fase 3.11) |
+| Las operaciones que las réplicas rechazan ocupan el log, la retención y la ventana de dedup como cualquier otra. | El servidor no ve filas y no puede saber que se van a rechazar. | DR1 (Fase 3.11) |
+| El dueño de una fila es por `ClientId`, no por persona, y queda visible para toda la sala. | Lo define el backend que emite los tokens. El dueño seudónimo se difirió a después de la v0.1. | DR10, DR15 (Fase 3.11) |
 
 ---
 

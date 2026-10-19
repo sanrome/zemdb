@@ -2,8 +2,8 @@
 
 **Proyecto:** `ZemDB` (Motor de Base de Datos Distribuida Local-First)  
 **Fecha de Actualización:** 19 de Octubre de 2026  
-**Documentos Relacionados:** [README.md](README.md) | [ARCHITECTURE.md](ARCHITECTURE.md) | [Auditoría Fase 2](docs/audits/2026-09-fase2-audit.md) | [Propuesta Técnica Fases 2.5, 3 y 4](docs/proposals/2026-09-fase2_5-hardening-proposal.md) | [Plan Fase 3.6](docs/proposals/2026-10-fase3_6-remediation-plan.md) | [Plan Fase 3.7](docs/proposals/2026-10-fase3_7-remediation-plan.md) | [Plan Fase 3.8](docs/proposals/2026-10-fase3_8-remediation-plan.md) | [Plan Fase 3.9](docs/proposals/2026-10-fase3_9-remediation-plan.md) | [Plan Fase 3.10](docs/proposals/2026-10-fase3_10-remediation-plan.md) | [Invariantes](docs/INVARIANTES.md)  
-**Estado:** Hoja de Ruta Oficial de Desarrollo — Fases 1 a 3.10 Completadas / Fases 4 y 5 Planificadas
+**Documentos Relacionados:** [README.md](README.md) | [ARCHITECTURE.md](ARCHITECTURE.md) | [Auditoría Fase 2](docs/audits/2026-09-fase2-audit.md) | [Propuesta Técnica Fases 2.5, 3 y 4](docs/proposals/2026-09-fase2_5-hardening-proposal.md) | [Plan Fase 3.6](docs/proposals/2026-10-fase3_6-remediation-plan.md) | [Plan Fase 3.7](docs/proposals/2026-10-fase3_7-remediation-plan.md) | [Plan Fase 3.8](docs/proposals/2026-10-fase3_8-remediation-plan.md) | [Plan Fase 3.9](docs/proposals/2026-10-fase3_9-remediation-plan.md) | [Plan Fase 3.10](docs/proposals/2026-10-fase3_10-remediation-plan.md) | [Propuesta Fase 3.11](docs/proposals/2026-10-fase3_11-restricciones-proposal.md) | [Invariantes](docs/INVARIANTES.md)  
+**Estado:** Hoja de Ruta Oficial de Desarrollo — Fases 1 a 3.10 Completadas / Fase 3.11 en Curso / Fases 4 y 5 Planificadas
 
 ---
 
@@ -121,7 +121,9 @@ ZemDB ha superado con éxito la **Fase 1 y 1.5 (Reestructuración, Blindaje de C
 - Se completó el blindaje criptográfico integral del Data Plane mediante el extractor `ClientAuth`, validación de rutas en 3 vías, tiempo constante y leases activos.
 - Las Fases 3.6 y 3.7 cerraron las auditorías posteriores (ver sus planes en `docs/proposals/`): ciclo de vida de clientes derivado del cursor, política de ciclo de vida por sala, relay de snapshots en disco, borde HTTP con límites propios, header del frame WAL con CRC, log del servidor acotado en bytes, validación de snapshots recibidos y squashing de la outbox por orden de llegada. La Fase 3.8 cerró la auditoría posterior: respuestas HTTP acotadas en tiempo y memoria, storage que exige un esquema que cubra sus datos, roster y apertura de salas más baratos, contrato del protocolo (encarnación de la sala, dedup por cliente, versión de esquema en las respuestas) y recuperación ante daño en el log. La Fase 3.9 cerró la primera auditoría por invariantes, contra el contrato de [`docs/INVARIANTES.md`](docs/INVARIANTES.md), y dejó sus simulaciones y fuzzers en el repo. Cambió: ventana de dedup en orden del log; apertura que solo confía en lo verificado y sincronizado (metadatos con checksum, piso de secuencia, un servidor por `data_dir`); absorción atómica y operaciones de storage en su propia tarea; recursos acotados (respuestas por cliente, subidas con plazo y tope, cuota de la sala sobre warm y sidecars); y borrado de sala con lápida.
 
-La Fase 3.10 cerró el [plan](docs/proposals/2026-10-fase3_10-remediation-plan.md) de la segunda auditoría por invariantes, y con eso se cumple el requisito para empezar la Fase 4. La auditoría acotada sobre `b4cb390` ([`docs/audits/2026-10-invariantes-audit-2.md`](docs/audits/2026-10-invariantes-audit-2.md)) no salió en verde (DEF-167 a DEF-181). El plan arregla sus rupturas Altas, las Medias DEF-172, DEF-174 y DEF-175 y dos Bajas; DEF-171, DEF-173 y DEF-179 se resuelven por decisión (un supuesto, un riesgo aceptado y un enunciado ajustado). Cerró con una revisión de su delta en lugar de otra auditoría (D90, `INVARIANTES.md` §1.4). La revisión salió en verde y encontró una Media de origen (b), DEF-182, que se arregló después. Cambió: la apertura del log, que sella `active.wal` por debajo del piso, conserva el cold verificado y retiene solo la ventana de RAM; `server.lock` y el lock del relay, que viven hasta la última operación de archivo; y las subidas, con tope por uploader, el chunk 0 comparado con un rango posterior y chunks ajenos fuera de una subida.
+La Fase 3.10 cerró el [plan](docs/proposals/2026-10-fase3_10-remediation-plan.md) de la segunda auditoría por invariantes, y con eso se cumple el primero de los dos requisitos para empezar la Fase 4; el segundo es cerrar la Fase 3.11. La auditoría acotada sobre `b4cb390` ([`docs/audits/2026-10-invariantes-audit-2.md`](docs/audits/2026-10-invariantes-audit-2.md)) no salió en verde (DEF-167 a DEF-181). El plan arregla sus rupturas Altas, las Medias DEF-172, DEF-174 y DEF-175 y dos Bajas; DEF-171, DEF-173 y DEF-179 se resuelven por decisión (un supuesto, un riesgo aceptado y un enunciado ajustado). Cerró con una revisión de su delta en lugar de otra auditoría (D90, `INVARIANTES.md` §1.4). La revisión salió en verde y encontró una Media de origen (b), DEF-182, que se arregló después. Cambió: la apertura del log, que sella `active.wal` por debajo del piso, conserva el cold verificado y retiene solo la ventana de RAM; `server.lock` y el lock del relay, que viven hasta la última operación de archivo; y las subidas, con tope por uploader, el chunk 0 comparado con un rango posterior y chunks ajenos fuera de una subida.
+
+La Fase 3.11 ([propuesta](docs/proposals/2026-10-fase3_11-restricciones-proposal.md)) agrega restricciones de integridad sin darle estado al servidor: `UNIQUE`, claves foráneas con `RESTRICT` y tablas inmutables, que cada réplica verifica al aplicar el log (una operación que las viola se secuencia y todas las réplicas la rechazan igual), y un dueño de fila que verifica el servidor en el commit. Se ejecuta en lotes antes de la Fase 4 (ver §4.3.C).
 
 ---
 
@@ -446,15 +448,29 @@ A partir de los informes técnicos emitidos por los 4 subagentes especialistas, 
 
 ---
 
+### 4.3.C. Restricciones de Integridad Verificadas por las Réplicas (Fase 3.11)
+
+Plan completo, decisiones (DR1 a DR15) y procedimiento por lote en la [propuesta](docs/proposals/2026-10-fase3_11-restricciones-proposal.md).
+
+* **`UNIQUE` y claves foráneas (`RESTRICT`), y tablas inmutables:** se declaran en el esquema; el servidor solo valida su definición. Cada réplica las verifica al aplicar el log en orden de secuencia: una operación que viola una restricción se secuencia como cualquier otra, y todas las réplicas la convierten en un NOP y la informan como rechazada.
+* **Dueño de fila:** una columna con el `ClientId` del dueño. Toda operación declara su dueño; el servidor verifica en el commit que sea quien la envía, y las réplicas, que la fila existente sea suya. El SDK lo completa solo.
+* **Una restricción solo nace con el esquema o con una columna nueva que la incluye (DR3):** hoy un cambio de esquema no tiene posición en el log, y esto garantiza que ninguna versión posterior cambie la decisión sobre una operación ya secuenciada. Anclar el esquema en el log queda para después de la v0.1 (§7).
+* **Lotes:** 0 contrato · 1 core (`UNIQUE` y FK en el esquema) · 2 servidor (dueño, inmutabilidad, API de administración) · 3 storage (índices derivados y resultado por operación) · 4 storage (verificación) · 5 storage (snapshots, apertura y evolución) · 6 cierre con revisión del delta. El 2b (dueño seudónimo) se difirió.
+* **Requisito para empezar la Fase 4:** lotes 0 a 6 cerrados, con la revisión de cierre en verde.
+
+---
+
 ### 4.4. Biblioteca Cliente y Sincronización Canónica: `zemdb-client` (Fase 4)
 
 > **Requisito de diseño (D93, Fase 3.10):** antes de apagar su runtime de Tokio, el SDK cierra sus salas del storage con `close_room`, que espera a las aperturas, instalaciones de snapshot y compactaciones en curso. Si no, una sala que reabre en el mismo proceso puede perder lotes confirmados (riesgo aceptado, `docs/INVARIANTES.md` §4).
+
+> **Requisito de diseño (Fase 3.11):** el SDK informa el resultado de cada escritura según lo que decide su réplica, completa el dueño de fila y cumple el resto de los requisitos del §7 de la [propuesta](docs/proposals/2026-10-fase3_11-restricciones-proposal.md).
 
 #### 4.4.1. Modularización Física del Crate `zemdb-client`
 * **Organización Modular:**
   - `src/lib.rs`: Punto de entrada público del SDK, re-exportando facades ergonómicas y tipos esenciales.
   - `src/config.rs`: `ClientConfig` con builders tipados para endpoints de servidor, intervals de heartbeat, estrategias de retry y credenciales.
-  - `src/error.rs`: Enum tipado `ClientError` (ValidationError, NetworkError, StorageError, ConflictError, OfflineError).
+  - `src/error.rs`: Enum tipado `ClientError` (ValidationError, NetworkError, StorageError, ConstraintViolation, RowMissing, OfflineError).
   - `src/api/`: Facade pública de alto nivel:
     - `client.rs`: `ZemdbClient` (gestor global de conexión y catálogo de salas abiertas).
     - `room.rs`: `RoomHandle` (ámbito de sala activa, schemas y despacho de mutaciones).
@@ -504,10 +520,10 @@ tokio::spawn(async move {
   - Esto erradica de raíz el riesgo de inconsistencias locales, tuplas zombi o estados corruptos ante rechazos de validación (aridad, esquemas, tipos o reglas de integridad).
 * **Pipeline de Escritura y Sincronización en 1 RTT:**
   1. **Envío con Cursor Actual:** Al invocar `insert`, `update` o `delete`, el cliente envía la mutación al endpoint `/commit` del servidor junto con su identificador `MutationId` y su cursor actual `last_ack_seq`.
-  2. **Validación Server-Side:** El servidor valida esquema y restricciones. Si alguna validación falla, retorna un error tipado (`ErrorCode::SchemaViolation`) y el almacenamiento local **permanece intacto y consistente**.
+  2. **Validación Server-Side (liviana):** El servidor valida lo que no depende del estado: esquema, tipos, nulabilidad, el dueño declarado y que una tabla inmutable no reciba `Update` ni `Delete`. Si alguna validación falla, retorna un error tipado (`ErrorCode::SchemaViolation`) y el almacenamiento local **permanece intacto y consistente**. `UNIQUE`, claves foráneas, la inmutabilidad de un `Insert` y el dueño de la fila existente no los valida el servidor: los decide la réplica (paso 4).
   3. **Secuenciación y Catch-Up Atómico:** Si la mutación es válida, el servidor asigna el `SequenceNumber` canónico y devuelve `CommitAck` conteniendo dicho número junto con cualquier delta remoto pendiente acumulado desde `last_ack_seq`.
-  4. **Aplicación Atómica en Storage:** El cliente aplica el lote completo de deltas canónicos directamente sobre `StorageEngine::apply_batch`.
-  5. **Notificación Reactiva:** Se notifican los cambios confirmados a los streams activos (`watch`).
+  4. **Aplicación Atómica en Storage:** El cliente aplica el lote completo de deltas canónicos directamente sobre `StorageEngine::apply_batch`, que informa las operaciones rechazadas por una restricción (Fase 3.11). La escritura se resuelve cuando la réplica aplicó hasta la secuencia asignada (siguiendo con `/sync` si el catch-up no llegó hasta ahí): devuelve `Ok`, o `ConstraintViolation` / `RowMissing` si su propia operación fue rechazada.
+  5. **Notificación Reactiva:** Se notifican los cambios confirmados a los streams activos (`watch`); una operación rechazada no notifica nada.
 * **Cero Complejidad de Rebase / Rollback:**
   - Al no aplicar escrituras optimistas sin confirmar sobre las tablas canónicas, se elimina la necesidad de motores de rollback/rebase en el cliente.
 * **Comportamiento Offline (Modo Solo Lectura):**
@@ -672,6 +688,15 @@ tokio::spawn(async move {
 │ [x] 3.10: apertura acotada y sin pérdidas, locks hasta la última escritura, │
 │     subidas con tope por uploader; cierre por revisión del delta (D90).     │
 ├─────────────────────────────────────────────────────────────────────────────┤
+│ FASE 3.11: Restricciones de Integridad (core, storage, server) [EN CURSO]   │
+│ [x] Lote 0: contrato (INVARIANTES v4, decisiones DR1 a DR14).               │
+│ [ ] Lote 1: UNIQUE y FK en el esquema, validación y serde estrictas.        │
+│ [ ] Lote 2: dueño de fila, tablas inmutables y API de administración.       │
+│ [ ] Lote 3: índices derivados y resultado por operación (ApplyReport).      │
+│ [ ] Lote 4: verificación en las réplicas y oráculo diferencial.             │
+│ [ ] Lote 5: snapshots, apertura y evolución del esquema.                    │
+│ [ ] Lote 6: cierre con revisión del delta (DR14).                           │
+├─────────────────────────────────────────────────────────────────────────────┤
 │ FASE 4: SDK Local-First Reactivo y Sincronización (zemdb-client)            │
 │ [ ] Modularización de crates/client (lib.rs, api/, sync/, transport/).      │
 │ [ ] Feature flags en Cargo.toml: default = ["native"] y wasm = ["web-sys"]. │
@@ -794,12 +819,16 @@ Para optimizar la velocidad de desarrollo y evitar sobre-ingeniería prematura e
 6. **CRDT Celular (`FieldMutation` con timestamps por columna):**
    - *Razón de diferimiento:* La arquitectura adopta formalmente la autoridad del `sequence_id` del servidor como único árbitro determinista para orden total y resolución Last-Write-Wins (LWW) a nivel de mutación.
 7. **Índices Secundarios No Primarios (`BTreeMap<Value, BTreeSet<PrimaryKey>>`):**
-   - *Razón de diferimiento:* Para la v0.1 el almacenamiento indexa eficientemente por clave primaria (`PrimaryKey`) mediante `BTreeMap<PrimaryKey, CompactRow>` directo por tabla, soportando búsquedas en $O(1)$ amortizado y escaneos de rangos (`KeyRange`). La gestión de índices secundarios en memoria y su mantenimiento atómico durante compactación y replay de WAL es 100% aditiva y se abordará tras estabilizar la sincronización cliente-servidor.
+   - *Razón de diferimiento:* Para la v0.1 el almacenamiento indexa eficientemente por clave primaria (`PrimaryKey`) mediante `BTreeMap<PrimaryKey, CompactRow>` directo por tabla, soportando búsquedas en $O(1)$ amortizado y escaneos de rangos (`KeyRange`). La gestión de índices secundarios en memoria y su mantenimiento atómico durante compactación y replay de WAL es 100% aditiva y se abordará tras estabilizar la sincronización cliente-servidor. *Nota (Fase 3.11): los índices de las restricciones `UNIQUE` y de las claves foráneas ya existen en el storage, pero son internos; exponer consultas por esos índices es lo que queda en el backlog.*
 8. **Borradores Offline Explícitos (Opción B: Staged Drafts):**
    - *Razón de diferimiento:* Para la v0.1 se garantiza la integridad estricta del motor de almacenamiento mediante el modelo *Server-Authoritative Write-Through con Sync en 1 RTT*: toda mutación se valida y secuencia primero en el servidor antes de ingresar al almacenamiento canónico (`StorageEngine`). Esto erradica de raíz el riesgo de inconsistencias locales por validaciones fallidas o estados huérfanos. El soporte para retener borradores no confirmados mientras el cliente esté offline es 100% aditivo y se incorporará como un gestor de borradores segregado (`DraftManager` o tabla de staging `__zemdb_drafts`), sin alterar el motor de persistencia canónico ni el protocolo del servidor.
 9. **SDK de Administración Dedicado para Clientes (Admin SDK):**
    - *Razón de diferimiento:* El Control Plane opera sobre HTTP REST estándar con payloads JSON (`/admin/...`), permitiendo aprovisionar esquemas y salas desde cualquier herramienta (`curl`, scripts bash, Postman, o backends en Node/Python/Go/Rust). Si el backend de aplicación está escrito en Rust, puede utilizar directamente la biblioteca del servidor (`zemdb_server::lib`) en modo embebido sin costo de red. Construir un SDK cliente tipado dedicado es un wrapper de conveniencia que se implementará de forma aditiva una vez estabilizados los endpoints HTTP.
 10. **Reescritura de `active.wal` después de un EIO (riesgo aceptado, D77):**
     - *Razón de diferimiento:* Al abrir una sala, el servidor hace `fsync` de `active.wal` y de los directorios antes de servir nada, y el storage hace lo mismo con su WAL. En Linux, después de un EIO, el kernel puede marcar las páginas como limpias sin haberlas escrito, y un `fsync` desde un descriptor nuevo devuelve éxito igual: un commit cuyo `fsync` falló podría confirmarse al reintentarlo después de reabrir la sala. La solución completa es reescribir `active.wal` (copiarlo a un temporal, sincronizarlo y renombrarlo) cuando el actor anterior se detuvo por una escritura fallida. Requiere un disco que ya devolvió errores, y está en los riesgos aceptados de `docs/INVARIANTES.md` §4.
-
-
+11. **Esquema anclado en el log (Fase 3.11, §2.3 de la [propuesta](docs/proposals/2026-10-fase3_11-restricciones-proposal.md)):**
+    - *Razón de diferimiento:* Darle a cada cambio de esquema una posición en el log de la sala permitiría agregar restricciones sobre columnas existentes y DDL más rico (borrar o renombrar columnas). Toca el log del servidor, el sync, el WAL del storage, los snapshots y el relay, y retrasaría el cliente una fase entera; la v0.1 no corre en producción con esquemas que evolucionan. DR3 es compatible hacia adelante. Antes de un release es gratis; después, requiere subir `PROTOCOL_VERSION` y migrar logs y WAL.
+12. **Dueño de fila seudónimo (Fase 3.11, DR15 y Lote 2b de la [propuesta](docs/proposals/2026-10-fase3_11-restricciones-proposal.md)):**
+    - *Razón de diferimiento:* Los votos anónimos no son un requisito de la v0.1. Está especificado: un seudónimo por tabla derivado de un secreto del servidor, que el cliente escribe y el servidor verifica. Es seudonimato frente a los demás miembros, no anonimato frente al operador.
+13. **Detección de divergencia entre réplicas (Fase 3.11, DR13):**
+    - *Razón de diferimiento:* Con restricciones verificadas por las réplicas, una réplica que decide distinto diverge sin aviso (riesgo aceptado en `docs/INVARIANTES.md` §4). Un digest del estado por secuencia, comparado a través del servidor (por ejemplo, en el heartbeat), lo detectaría.
