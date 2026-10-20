@@ -1655,7 +1655,8 @@ async fn stale_cursor_of_a_client_inside_the_log_does_not_request_a_snapshot() {
     fx.manager.shutdown_all().await;
 }
 
-#[tokio::test]
+// Paused time: the slow tick would publish the room's snapshot floor and reject the staging.
+#[tokio::test(start_paused = true)]
 async fn register_reports_only_a_usable_snapshot() {
     let (fx, _writer, tail) = pruned_room().await;
     // A snapshot that fell behind the retained range (staged with bounds that admit it).
