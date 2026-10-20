@@ -839,3 +839,93 @@ async fn an_empty_table_of_the_snapshot_does_not_have_to_be_in_the_schema() {
     let key = PrimaryKey::single(1i64);
     assert!(engine.get_by_id(&room, 0, &key).await.unwrap().is_some());
 }
+
+/// `staff`: an integer key, a nullable name and the nullable key of another member, its boss;
+/// with `constrained`, also `UNIQUE (name)` and a foreign key from `boss` to `staff`.
+fn staff_schema(constrained: bool) -> Schema {
+    let mut staff = TableSchema::builder("staff")
+        .table_id(0)
+        .primary_key("id", DataType::Int)
+        .nullable_column("name", DataType::String)
+        .nullable_column("boss", DataType::Int);
+    if constrained {
+        staff = staff
+            .unique("staff_name", ["name"])
+            .foreign_key("staff_boss", ["boss"], "staff");
+    }
+    Schema::builder().table(staff).build()
+}
+
+/// An insert into `staff` at sequence `seq`.
+fn member(seq: u64, id: i64, name: &str, boss: Option<i64>) -> SequencedOperation {
+    let boss = boss.map_or(Value::Null, Value::Int);
+    let row = CompactRow::new(vec![Value::Int(id), Value::String(name.into()), boss]);
+    sequenced(seq, Operation::insert(0, PrimaryKey::single(id), row, 0))
+}
+
+/// Writes `rows`, which break `constraint`, into a disk room without constraints and compacts
+/// them into its snapshot, which the engine seals with a valid checksum. A `.wal.compacting`
+/// and an active WAL with a torn write at its end follow. Opening the room with the constraints
+/// fails naming the constraint before anything is truncated, folded or rewritten: every file
+/// keeps its bytes, and the room still opens without the constraints, with all its data.
+async fn local_snapshot_that_breaks_a_constraint_is_not_opened(
+    constraint: &str,
+    rows: Vec<SequencedOperation>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("local-snapshot-breaks").unwrap();
+    let engine = disk_engine(dir.path());
+    engine.open_room(&room, staff_schema(false)).await.unwrap();
+    let head = rows.len() as u64;
+    let report = engine.apply_batch(&room, rows).await.unwrap();
+    assert!(report.rejected().is_empty());
+    engine.compact_room(&room).await.unwrap();
+    engine.close_room(&room).await.unwrap();
+
+    let compacting = compacting_wal_path(&engine, &room);
+    let rotated = vec![member(head + 1, 10, "rotated", None)];
+    std::fs::write(&compacting, encode_wal_batch(&rotated, None).unwrap()).unwrap();
+    let active = vec![member(head + 2, 11, "active", None)];
+    let mut wal = encode_wal_batch(&active, None).unwrap();
+    wal.extend_from_slice(&[0x20, 0x00, 0x00, 0x00, 0xAA]);
+    std::fs::write(engine.wal_file_path(&room), wal).unwrap();
+    let files = || {
+        (
+            room_files(&engine, &room),
+            std::fs::read(&compacting).unwrap(),
+        )
+    };
+    let before = files();
+
+    let err = engine
+        .open_room(&room, staff_schema(true))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, StorageError::SnapshotCorruption(message) if message.contains(constraint)),
+        "{err:?}"
+    );
+    assert!(files() == before, "a file changed");
+
+    engine.open_room(&room, staff_schema(false)).await.unwrap();
+    assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), head + 2);
+    for id in [10i64, 11] {
+        let key = PrimaryKey::single(id);
+        assert!(engine.get_by_id(&room, 0, &key).await.unwrap().is_some());
+    }
+}
+
+#[tokio::test]
+async fn opening_a_snapshot_with_a_repeated_unique_key_is_refused() {
+    let rows = vec![member(1, 1, "dup", None), member(2, 2, "dup", None)];
+    local_snapshot_that_breaks_a_constraint_is_not_opened("staff_name", rows).await;
+}
+
+#[tokio::test]
+async fn opening_a_snapshot_with_a_dangling_foreign_key_is_refused() {
+    let rows = vec![
+        member(1, 1, "boss", Some(1)),
+        member(2, 2, "staff", Some(3)),
+    ];
+    local_snapshot_that_breaks_a_constraint_is_not_opened("staff_boss", rows).await;
+}

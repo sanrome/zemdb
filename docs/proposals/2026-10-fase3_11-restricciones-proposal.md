@@ -408,7 +408,7 @@ El revisor lo recorre en cada lote de storage:
 | 2b | Dueño seudónimo (diferido) | core, server | DR15 | A1, A5, Y5 | ⏸ |
 | 3 | Índices derivados y `ApplyReport` | storage | DR5, DR6 | S1, S3, S6, C3 | ✅ |
 | 4 | Verificación en las réplicas | storage | DR1, DR4, DR5, DR10, DR11 | Y8, S1, A5, C2, C3, W1 | ✅ |
-| 5 | Snapshots, apertura y evolución | storage | DR3, DR7 | S4, S5, C1, C2, W1 | ⬜ |
+| 5 | Snapshots, apertura y evolución | storage | DR3, DR7 | S4, S5, C1, C2, W1 | ✅ |
 | 6 | Cierre | Documentos | DR12, DR14 | Todas las tocadas | ⬜ |
 
 **Requisito para empezar la Fase 4:** Lotes 0 a 6 cerrados, con la revisión de cierre en verde. El 2b está diferido y no es requisito. El diseño del cliente, no su código, puede empezar cuando cierre el Lote 3, que fija el contrato de `apply_batch`.
@@ -938,7 +938,8 @@ Positivos:
   - **La simulación del disco** movió `users` e `items` a los ids 8 y 9 para hacer lugar a las tablas del oráculo, y el batch inválido de la simulación, que borraba de la tabla 9 como tabla inexistente, pasó a ser válido. Solo lo sortean las versiones largas, que fallaron en la primera corrida ("unexpected Ok" para el batch inválido); ahora usa una constante `UNKNOWN_TABLE` (99), y las 15 versiones largas pasan.
   - **Tamaño:** unas 140 líneas de producción agregadas sin comentarios ni blancos (9 quitadas), por debajo de las ~230 estimadas.
 - **Fuera del lote:** ninguno nuevo para el backlog; la interacción entre dueños quedó como requisito de la Fase 4 (§7).
- · Snapshots, apertura y evolución (`zemdb-storage`) · ⬜ Pendiente
+
+### Lote 5 · Snapshots, apertura y evolución (`zemdb-storage`) · ✅ Hecho
 **Objetivo:** DR7 e INV-C1.
 
 **Archivos:**
@@ -974,6 +975,79 @@ Positivos:
 - `INVARIANTES.md`:
   - "Sostenida por" de INV-S4 e INV-S5;
   - INV-C1 pierde el lote pendiente en su estado, y sigue 🆕 hasta la revisión de cierre.
+
+**Hecho.**
+- **API.**
+  - **`RoomData::build_checked`** (`memory/state.rs`): construye los índices (`RoomData::build`) y enseguida verifica las filas con `RoomData::check` (privada). Una violación es `SnapshotCorruption`, con el nombre de la tabla y el motivo (`Unique` o `ForeignKey` con la restricción).
+  - **`check`** verifica cada fila con `check_row(.., None)`, es decir con las reglas de un `Insert` de esa fila sobre las filas del snapshot. Así hereda el salto por `NULL`, la lectura como `NULL` de las columnas que faltan en una fila corta, la igualdad de `Value` y la auto-referencia. Recorre las tablas en orden de id (`Schema::tables`, un `BTreeMap`) y las filas en orden de clave (`OrdMap`), así que la restricción nombrada es siempre la misma. Alcanza el punto de hilo `room_data.build`, como la construcción.
+  - **Dónde corre:** `decode_received_snapshot` (los dos motores, dentro del closure de `run_blocking`, inline en wasm32) y `load_snapshot` (la apertura del disco, en el pool bloqueante), en lugar de `RoomData::build`. En la apertura sale en el mismo punto que `SchemaMismatch`: antes de limpiar temporales, reaplicar, truncar, absorber o reescribir nada.
+  - **Contrato:** el rustdoc de `open_room` y `apply_snapshot` (`engine.rs`) lo describe.
+  - **Inmutabilidad:** no hay nada que verificar. Que una fila de una tabla inmutable no se reemplazó es una propiedad de la historia, no del estado, y un snapshot guarda una fila por clave primaria. Lo que sí puede repetir una clave es el payload bincode: el decoder se queda con la última, en forma determinista. Eso no se cambió en el lote (ver desvíos y backlog).
+- **Tests agregados** (14, cuatro de ellos `#[ignore]`):
+  - **Unitarios, en los dos motores** (escenarios en `memory/tests/index.rs`, corridos desde `src/tests/memory.rs` y `src/tests/disk.rs`):
+    - `a_snapshot_that_breaks_a_constraint_changes_nothing`: snapshots adelante que repiten una clave `UNIQUE` (de una columna de la tabla y de una agregada después) o tienen una FK colgante (a otra tabla y a la propia, compuesta) dan `SnapshotCorruption` que nombra esa restricción y ninguna otra. Dejan head, esquema, filas e índices como estaban; en el disco, también al reabrir. Dos casos fijan el motivo cuando hay varias violaciones: la primera tabla por id y, dentro de ella, la primera fila por clave.
+    - `a_snapshot_that_meets_the_constraints_is_installed`: se instalan claves con `NULL` (repetidas, sin padre y compuestas con un solo `NULL`), una fila que se apunta a sí misma por una FK compuesta declarada en otro orden, y filas cortas escritas con `constrained_schema` e instaladas con `evolved_schema`, cuya `UNIQUE (tag)` lee `NULL`. En el disco, también al reabrir.
+    - Los snapshots que violan se fabrican con un motor abierto con las mismas tablas sin restricciones; ni el oráculo ni la implementación intervienen.
+  - **Apertura** (`disk_wal_resilience_tests.rs`, 2): un `.snap` con una `UNIQUE` repetida y otro con una FK colgante, escritos por el motor sin restricciones (CRC válido), con un `.wal.compacting` y un WAL activo con un torn write al final. Abrir con las restricciones falla nombrando la restricción, los tres archivos quedan byte a byte iguales, y la sala abre después con el esquema original, con todos sus datos.
+  - **Evolución** (`schema_evolution_tests.rs`, nuevo; 1 y uno `#[ignore]` con 300 logs):
+    - Cada log agrega de 1 a 4 columnas en puntos aleatorios de su primera mitad, con `oracle::add_random_column`: ninguna restricción, `UNIQUE` de la columna sola o con otra, una FK a una tabla de clave entera, o una FK compuesta a `children`.
+    - Las réplicas que conocen cada versión desde el primer batch que la necesita: una de memoria, que pasa a la versión nueva con un snapshot de sí misma tomado con la vieja; una de disco, que reabre con la nueva; y el modelo.
+    - Las réplicas que aplican todo con la última versión: una de memoria y una de disco, que compacta y reabre al azar.
+    - Una réplica tardía instala, con la última versión, un snapshot de la réplica de disco tomado con una versión vieja, y aplica el resto.
+    - Todas dan los mismos reportes en cada batch y terminan con las mismas filas, también las de disco reabiertas con la última versión sobre WAL y snapshots escritos con versiones viejas.
+    - Exige rechazos por `Unique` y `ForeignKey` de las restricciones agregadas; la versión larga, también por `Restrict`.
+  - **Fuzzers** (`randomized_engine_tests.rs`; 3 y tres `#[ignore]`):
+    - los de snapshots dañados y de archivos de sala dañados, parametrizados por esquema, con `constrained_sample_schema` (una `UNIQUE`, una FK y una `UNIQUE` sobre una columna agregada). Un estado aceptado o abierto tiene que cumplir las restricciones, según un chequeo ingenuo propio del test (`broken_constraints`, que recorre tablas enteras);
+    - uno diferencial nuevo, `unchecked_states_are_installed_only_if_they_meet_the_constraints`: estados aleatorios escritos sin restricciones sobre dominios chicos, aplicados con ellas a los dos motores, se instalan si y solo si `broken_constraints` no encuentra nada; si no, son `SnapshotCorruption` que nombra una restricción rota y el head no se mueve.
+  - **Contra el esqueleto** (`build_checked` y `check` existían y se llamaban, pero `check` no verificaba nada): fallaban por aserción 6. Eran los dos de snapshots que violan (memoria y disco), los dos de apertura, el diferencial y el fuzzer de snapshots dañados con restricciones; este último no siempre (ver backlog). Pasaban 4:
+    - los dos de snapshots válidos, que son positivos y detectan las mutaciones del salto por `NULL` y de la auto-referencia;
+    - el de evolución, que es una propiedad que DR3 ya sostenía y que este lote no debía romper; detecta, por ejemplo, que una columna que falta lea un valor (mutación del revisor);
+    - el fuzzer de archivos dañados con restricciones, cuyo objetivo es "nunca un pánico".
+
+    Los dos casos del motivo con varias violaciones y la aserción de restricciones del fuzzer de archivos se agregaron por la revisión.
+  - **Generador:** `oracle::add_random_column` (solo tipos de `zemdb-core`) excluye columnas de la clave en la FK compuesta. Si las incluyera, la auto-referencia del generador pisaría la clave, y la versión larga lo encontró (`PrimaryKeyMismatch`). Cada operación generada se valida con su versión, como en `random_log`.
+- **Mutaciones verificadas** (14 propias, en una copia del repo, una por vez y restauradas; todas detectadas, ninguna dejó de compilar):
+  - **M1 y M2:** sin verificación en el snapshot recibido (4 tests) y en el local (los 2 de apertura).
+  - **M3 y M4:** `check` ignora `UNIQUE` y las FK. Cada una la detectan 4 tests, en los dos caminos: los escenarios de los dos motores, el diferencial y el test de apertura correspondiente.
+  - **M5a y M5b:** la verificación no saltea `NULL` en las FK (16 tests) ni en las `UNIQUE` (14).
+  - **M6a:** sacar la excepción de auto-referencia de `check_row`, compartida con `apply_operation`. Solo la detectan tests del Lote 4 (11): en un snapshot es equivalente, porque la fila ya está en su tabla y la búsqueda del padre la encuentra.
+  - **M6b:** la variante realista para la verificación, que rechaza una fila que se apunta a sí misma: 6 tests, entre ellos los de snapshots válidos.
+  - **M7:** la verificación de la apertura al final de `recover_room`, después de truncar y plegar: los 2 de apertura y el del punto de hilo.
+  - **M8a, M8b y M8c:** la verificación en el runtime, en la apertura y en el snapshot recibido de cada motor: `indexes_are_built_off_the_runtime` y `snapshot_indexes_are_built_without_blocking_the_runtime`.
+  - **Sobrevivientes, y cómo se cerraron:** M9 y M10, recorrer las tablas o las filas en orden inverso, sobrevivían porque cada caso violaba una sola restricción (revisión, Bajo 2). Se agregaron los dos casos con varias violaciones, y los escenarios exigen que el mensaje nombre solo la restricción esperada.
+  - **Las del revisor** (16, en su copia): coinciden con las de arriba. Además, `check` solo en la primera tabla, `check` que rechaza filas cortas, y una columna que falta que lee `Int(0)`, que el test de evolución detecta por sí solo. Una más es equivalente: verificar después del replay y antes de truncar, que solo detecta el punto de hilo, porque el replay no escribe archivos.
+- **Interacciones revisadas:**
+  - **`NotOwner` con el dueño en la clave:** sin cambios. `validate_keyed_row` sigue corriendo sobre los snapshots recibidos, y el `.snap` local no se valida fila por fila (lo escribió el motor). El lote no verifica dueños en snapshots: un dueño fuera de la clave puede ser cualquier valor.
+  - **El oráculo no lee snapshots:** los que violan se fabrican con motores sin restricciones, y los fuzzers usan su propio chequeo ingenuo. El oráculo solo suma `add_random_column`.
+  - **Un snapshot de otro peer escrito con una versión vieja** pasa bajo la nueva: el caso de filas cortas, la réplica de memoria y la tardía del test de evolución.
+  - **La apertura** sale antes de tocar archivos: los tests byte a byte y M7.
+  - **La compactación y el pliegue** escriben snapshots que la apertura siguiente verifica (revisión, 3.a). Pasan porque son estados que `apply_operation` produjo desde una base verificada, bajo el mismo esquema o una versión posterior (DR3). Tests: `indexes_follow_the_rows_through_reopens_and_compactions`, las reaperturas del test de evolución y la simulación. Un corolario: una sala de disco que recibió `apply_snapshot` con un esquema de otras restricciones puede no abrir después con el registrado, y elegir el esquema sigue a cargo del llamador.
+  - **El WAL no se verifica:** el replay decide cada operación con el esquema con que se abre, como en el Lote 4.
+  - **El relay:** los clientes honestos rechazan un snapshot hostil que viola las restricciones. Mejora DEF-81 sin cerrarlo, porque un snapshot falso que las cumple se sigue instalando. Se agregó a §6 de `ARCHITECTURE.md` (revisión, Bajo 4).
+  - **Snapshots en el head y atrasados** (revisión, 3.b): el snapshot se decodifica y verifica antes de compararlo con el head. Uno que viola es `SnapshotCorruption` en lugar del no-op del head o de `SnapshotBehind`, como ya pasaba con una fila inválida. No tiene llamadores hoy.
+  - **El error en la apertura** (revisión, Bajo 3): es `SnapshotCorruption`, la misma variante que un CRC roto, aunque es un problema de esquema. Se agregó a §7.
+  - **El costo:** O(N log N) por restricción, como la construcción, en el pool bloqueante; inline en wasm32 (build y clippy en verde).
+  - **La memoria:** la de los índices de un snapshot de otro peer quedó en INV-S5 e INV-W1.
+  - **Liberación:** el `RoomData` de un snapshot rechazado se suelta dentro del closure del pool bloqueante.
+  - **El motivo del error** es determinista (M9 y M10), aunque no es una decisión.
+  - **`an_update_checks_only_the_constraints_of_the_columns_it_sets`** arma su estado con `RoomData::build`, que no verifica, y sigue en verde.
+  - **Pánicos:** `check` lee con `get` y búsquedas que devuelven `Option`, como `check_row`. Los fuzzers con restricciones corrieron en versión larga.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura, que probó en su propia copia y corrió en release las cuatro versiones largas nuevas): sin hallazgos Altos ni Medios. El lote implementa DR7 y el test de INV-C1 y nada más; no rompe ninguna invariante (S3, S4, S5, S6, C1, C2, C3, W1); el checklist de §5.4 se cumple punto por punto; el oráculo no comparte código con la implementación. Se atendieron:
+  - **Bajo 1:** la interpretación de "sin claves repetidas", que figura en los desvíos.
+  - **Bajo 2:** el motivo sin test (M9 y M10, arriba).
+  - **Bajo 3:** el error de la apertura, en §7.
+  - **Bajo 4:** §6 de `ARCHITECTURE.md`.
+  - **Notas:** el encabezado de este lote, que faltaba desde el Lote 4; el enunciado de INV-S5, que ahora nombra las restricciones; la aserción de restricciones en el fuzzer de archivos dañados; el rustdoc de `load_snapshot`; un comentario cortado en el test de evolución. Las interacciones 3.a y 3.b están arriba.
+- **Chequeos** (después de atender la revisión): fmt, clippy, test y doc de §5.1, y el build y clippy wasm32, en verde; los dos jobs MSRV (`cargo +1.88.0 test --workspace` y `cargo +1.85.0 build --workspace --lib --bins`, con un `CARGO_TARGET_DIR` aparte); y `cargo test -p zemdb-storage --release -- --ignored` (19, con las cuatro largas nuevas).
+- **Desvíos:**
+  - **"Inmutabilidad (sin claves repetidas)"** se interpretó como "nada que verificar en el estado". Rechazar un payload que repite una clave sería barato (`RowsAsRead::visit_map`), pero no cambia ninguna decisión y vale para todas las tablas, así que va al backlog. A confirmar con el dueño del proyecto.
+  - **Dónde están los tests:** los de `apply_snapshot` son unitarios (escenarios en `memory/tests/index.rs`) y no van en `apply_snapshot_tests.rs`, porque comparan índices y esquema. Los de apertura están en `disk_wal_resilience_tests.rs`, junto a los de `SchemaMismatch`. El de evolución tiene un archivo propio, porque usa el modelo y el generador del oráculo.
+  - **Un fuzzer diferencial nuevo**, porque las mutaciones de bytes casi nunca producen un snapshot bien formado que viole una restricción.
+  - **`dump`** de `randomized_engine_tests.rs` acepta `?Sized`, para recorrer los dos motores como `&dyn StorageEngine`.
+  - **Tamaño:** unas 27 líneas de producción agregadas sin comentarios ni blancos (4 quitadas), por debajo de las ~120 estimadas.
+- **Fuera del lote (backlog):**
+  - **Los bytes de un snapshot dependen del orden de un `HashMap`.** `RoomSnapshotRef` serializa `&HashMap<u16, Table>`, así que dos réplicas con el mismo estado (o la misma, en dos procesos) producen snapshots con distintos bytes. Los fuzzers de snapshots, entonces, no se reproducen por semilla. No cambia ninguna decisión. Es preexistente y Bajo: se podría serializar las tablas en orden de id.
+  - **Un payload de snapshot que repite una clave primaria** (o un id de tabla) se decodifica quedándose con la última. Es determinista, y no le da a un peer hostil nada que no pueda mandar con un snapshot bien formado. Es preexistente y Bajo: se podría rechazar en el decoder, como `SnapshotCorruption`.
 
 ### Lote 6 · Cierre · ⬜ Pendiente
 **Objetivo:** que los documentos describan lo que quedó, y la revisión de cierre (DR14).
@@ -1013,6 +1087,7 @@ Positivos:
   - Guardar la secuencia no alcanza si el crash (o un pánico, o un future soltado) llega después de que la réplica hizo durable el batch y antes de que entregara el `ApplyReport`: la reapertura aplica el batch y decide igual, pero el reporte se descarta, reenviar el batch es `SequenceMismatch` y un sync no lo vuelve a entregar (revisión del Lote 3). El SDK necesita otra fuente para esa decisión, por ejemplo guardar los rechazos en el storage junto con el batch, o recalcularla.
 - **`ROADMAP.md` §4.4.4.** El paso 2 deja de decir que el servidor valida las restricciones. El servidor valida lo liviano, incluido el dueño declarado. La réplica decide `UNIQUE`, FK, `Duplicate` y `NotOwner`.
 - **Restricciones entre dueños distintos** (revisión del Lote 4). Las reglas valen igual para todos los miembros: uno puede ocupar primero una clave `UNIQUE`, y una fila propia que referencia la fila de otro (que ese otro no puede borrar, `NotOwner`) le impide borrar la suya (`RESTRICT`). No rompe INV-A5, que habla de escribir filas ajenas, pero limita lo que §1.1 promete. El diseño de la Fase 4 decide si alcanza con documentarlo para quien escribe el esquema (por ejemplo, que una FK hacia una tabla con dueño incluya la columna dueño) o si hace falta una regla nueva.
+- **Un snapshot local que no cumple las restricciones** (revisión del Lote 5). `open_room` lo rechaza con `SnapshotCorruption`, la misma variante que un CRC roto o un archivo truncado, pero no es daño en el archivo: solo pasa si la sala se abre con restricciones con las que sus datos no se escribieron, y vuelve a abrir con el esquema con que se escribieron. El SDK no debe reaccionar a ese error descartando la réplica local para resincronizar, porque perdería datos intactos y escrituras pendientes. El diseño de la Fase 4 decide si alcanza con distinguirlo por el mensaje o si hace falta una variante propia del error.
 - **Borradores offline (post-v0.1).** Con restricciones, mandar lo consolidado deja de ser equivalente a mandar en orden. Por ejemplo, `Insert(u = 1)` seguido de `Update(u = 2)` puede dar otro resultado que un único `Insert(u = 2)` si una de las dos claves choca. El gestor de borradores tiene que elegir entre no consolidar las columnas con restricciones o aceptar esa diferencia, y documentarla.
 
 ---

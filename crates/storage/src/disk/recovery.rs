@@ -200,7 +200,9 @@ fn ensure_known_table(
 /// CRC32 of the compressed payload before decompressing it. A table with rows that `schema`
 /// does not have is `SchemaMismatch`; an empty one is dropped (a snapshot holds every table of
 /// the schema it was compacted with, empty ones included). The indexes of the constraints of
-/// `schema` are then built from its rows, on the blocking pool.
+/// `schema` are then built from its rows, and the rows checked against those constraints, on
+/// the blocking pool: rows that break one are `SnapshotCorruption`. Both errors come before
+/// any file that holds data of the room changes.
 ///
 /// A new room has none: an empty one is staged in a temporary file and renamed into place, so a
 /// failure or crash never leaves a partial snapshot behind.
@@ -281,8 +283,9 @@ async fn load_snapshot(
     }
 
     // Decompressed and decoded together on the blocking pool. The file was written by this
-    // engine from a validated state, and its CRC matched, so its rows are not checked again and
-    // its size is not limited.
+    // engine from a validated state, and its CRC matched, so its rows are not validated again
+    // and its size is not limited. They are still checked against the constraints of `schema`
+    // below, which may not be those it was written under.
     let mut payload: RoomSnapshotPayload =
         run_blocking(move || crate::snapshot::deserialize_zstd(&compressed_snap, u64::MAX, None))
             .await?;
@@ -297,9 +300,7 @@ async fn load_snapshot(
         .retain(|table_id, _| schema.has_table_by_id(*table_id));
     payload.fill_missing_tables(schema);
     let schema = schema.clone();
-    let data =
-        run_blocking(move || Ok::<_, StorageError>(RoomData::build(&schema, payload.tables)))
-            .await?;
+    let data = run_blocking(move || RoomData::build_checked(&schema, payload.tables)).await?;
     Ok(BaseSnapshot {
         data,
         snapshot_seq: payload.head_seq,

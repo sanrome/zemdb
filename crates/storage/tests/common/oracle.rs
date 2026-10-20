@@ -544,3 +544,65 @@ pub fn random_log(rng: &mut Rng, schema: &Schema, first: u64, len: u64) -> Vec<S
         })
         .collect()
 }
+
+/// `schema` with a nullable column `e{n}` added to a random table, together with the
+/// constraints it may come with, which include it: none, a `UNIQUE` of the column alone or with
+/// another column of the table, a foreign key from it to a table keyed by one integer, or from
+/// it and an integer column of the table outside its key to `children`, keyed by two. (The
+/// generator makes a row reference itself by copying its key into such columns.)
+pub fn add_random_column(rng: &mut Rng, schema: &Schema, n: usize) -> Schema {
+    let tables: Vec<&TableSchema> = schema.tables().collect();
+    let table = tables[rng.below(tables.len() as u64) as usize];
+    let name = format!("e{n}");
+    let int_keyed: Vec<&TableSchema> = tables
+        .iter()
+        .copied()
+        .filter(|t| {
+            let key = t.primary_key();
+            key.len() == 1
+                && t.column_index(&key[0])
+                    .is_some_and(|i| t.columns()[i].data_type() == DataType::Int)
+        })
+        .collect();
+    let int_columns: Vec<&str> = table
+        .columns()
+        .iter()
+        .filter(|c| c.data_type() == DataType::Int)
+        .map(|c| c.name())
+        .filter(|name| !table.primary_key().iter().any(|key| key == name))
+        .collect();
+    let any_column = table.columns()[rng.below(table.columns().len() as u64) as usize].name();
+    let mut unique = Vec::new();
+    let mut foreign = Vec::new();
+    let roll = rng.below(6);
+    if roll == 1 || roll == 5 {
+        unique.push(UniqueConstraint::new(format!("{name}_u"), [name.as_str()]));
+    }
+    if roll == 2 {
+        let columns = [name.as_str(), any_column];
+        unique.push(UniqueConstraint::new(format!("{name}_u2"), columns));
+    }
+    if roll == 3 || roll == 5 {
+        let parent = int_keyed[rng.below(int_keyed.len() as u64) as usize];
+        foreign.push(ForeignKey::new(
+            format!("{name}_f"),
+            [name.as_str()],
+            parent.name(),
+        ));
+    }
+    if roll == 4 && !int_columns.is_empty() {
+        let other = int_columns[rng.below(int_columns.len() as u64) as usize];
+        let columns: [&str; 2] = if rng.chance(50) {
+            [name.as_str(), other]
+        } else {
+            [other, name.as_str()]
+        };
+        foreign.push(ForeignKey::new(format!("{name}_f2"), columns, "children"));
+    }
+    let mut evolved = schema.clone();
+    let column = ColumnDef::new(name.as_str(), DataType::Int).nullable(true);
+    evolved
+        .add_column_with_constraints(table.name(), column, unique, foreign)
+        .expect("a column with constraints that include it");
+    evolved
+}

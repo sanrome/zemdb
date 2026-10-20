@@ -1,7 +1,9 @@
 use crate::fail_point;
 use crate::memory::index::tests::{
     apply_random_batches, constrained_schema, evolved_schema, refused_batches_change_nothing,
-    snapshot_indexes_are_built_off_the_runtime, snapshots_replace_the_indexes, RandomLog,
+    snapshot_indexes_are_built_off_the_runtime, snapshots_replace_the_indexes,
+    snapshots_that_break_a_constraint_change_nothing,
+    snapshots_that_meet_the_constraints_are_installed, RandomLog,
 };
 use crate::{MemoryStorageEngine, StorageEngine};
 use std::path::Path;
@@ -180,4 +182,20 @@ async fn snapshot_indexes_are_built_without_blocking_the_runtime() {
     let room = RoomId::new("snapshot-indexes-off-the-runtime").unwrap();
     engine.open_room(&room, constrained_schema()).await.unwrap();
     snapshot_indexes_are_built_off_the_runtime(&engine, &room).await;
+}
+
+#[tokio::test]
+async fn a_snapshot_that_breaks_a_constraint_changes_nothing() {
+    let engine = MemoryStorageEngine::new();
+    let room = RoomId::new("snapshot-breaks").unwrap();
+    engine.open_room(&room, constrained_schema()).await.unwrap();
+    snapshots_that_break_a_constraint_change_nothing(&engine, &room).await;
+}
+
+#[tokio::test]
+async fn a_snapshot_that_meets_the_constraints_is_installed() {
+    let engine = MemoryStorageEngine::new();
+    let room = RoomId::new("snapshot-meets").unwrap();
+    engine.open_room(&room, constrained_schema()).await.unwrap();
+    snapshots_that_meet_the_constraints_are_installed(&engine, &room).await;
 }

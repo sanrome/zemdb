@@ -148,8 +148,8 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-E2** | Un cliente con el esquema viejo siempre puede enterarse | | Bajo | ✅ |
 | **INV-W1** | Ninguna entrada hace entrar en pánico, abortar ni reservar de más | ★ | Alto | ✅ |
 | **INV-W2** | Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum | | Medio | ✅ (D92) |
-| **INV-C1** | Ninguna versión posterior del esquema cambia la decisión sobre una operación ya secuenciada | ★ | Alto | 🆕 (Fase 3.11, Lote 5) |
-| **INV-C2** | El estado de una réplica cumple las restricciones de su esquema | ★ | Alto | 🆕 (Fase 3.11, Lote 5) |
+| **INV-C1** | Ninguna versión posterior del esquema cambia la decisión sobre una operación ya secuenciada | ★ | Alto | 🆕 (Fase 3.11) |
+| **INV-C2** | El estado de una réplica cumple las restricciones de su esquema | ★ | Alto | 🆕 (Fase 3.11) |
 | **INV-C3** | Un rechazo no deja rastro, y los índices son función de las tablas | | Medio | 🆕 (Fase 3.11) |
 
 ---
@@ -232,13 +232,13 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-S4 ★ · Abrir una sala nunca descarta datos
 **Enunciado.** `open_room` con un esquema que no cubre los datos de la sala falla con `SchemaMismatch` antes de modificar cualquier archivo que tenga datos de la sala (antes del chequeo puede crear el lock y un WAL o `.snap` vacíos, y borrar temporales `.snap.tmp.*` y `.wal.compacting.tmp`). Ninguna operación del WAL ni fila del snapshot se descarta en silencio.
-**Sostenida por.** D55 (§8 *Opening Requires a Schema That Covers the Room's Data*).
+**Sostenida por.** D55 (§8 *Opening Requires a Schema That Covers the Room's Data*). Un snapshot local cuyas filas no cumplen las restricciones del esquema con que se abre la sala también es un error (`SnapshotCorruption`, Fase 3.11, DR7), y sale al construir sus índices, en el mismo punto que `SchemaMismatch`: antes de truncar, absorber o reescribir nada.
 **Cómo intentar romperla.** Tabla presente solo en `.wal.compacting`; tabla vacía en el snapshot; esquema con la tabla pero con otro id; torn write en el mismo WAL que trae la tabla desconocida.
 
 #### INV-S5 · `apply_snapshot` valida todo y reemplaza atómicamente, o no cambia nada
-**Enunciado.** Un snapshot con otra `head_seq` que la anunciada, una tabla fuera del esquema o una fila inválida se rechaza sin tocar la sala. Uno aceptado reemplaza esquema, head y tablas de una vez. Si la E/S falla después del rename, la llamada devuelve error, la sala queda `RoomFailed` y al reabrirla aparece el snapshot nuevo. La sala nunca retrocede. Ninguna declaración interna del snapshot reserva más memoria que una constante más lo que ocupan sus bytes.
-**Sostenida por.** D48 (§8 *apply_snapshot Rules*, *Bounded Snapshot Decompression*).
-**Cómo intentar romperla.** Snapshots fabricados (longitudes declaradas enormes, cuentas de filas falsas, filas con clave distinta de la columna PK, compresión que no termina en la longitud declarada); cierre de la sala durante la decodificación.
+**Enunciado.** Un snapshot con otra `head_seq` que la anunciada, una tabla fuera del esquema, una fila inválida o filas que no cumplen las restricciones del esquema se rechaza sin tocar la sala. Uno aceptado reemplaza esquema, head y tablas de una vez. Si la E/S falla después del rename, la llamada devuelve error, la sala queda `RoomFailed` y al reabrirla aparece el snapshot nuevo. La sala nunca retrocede. Ninguna declaración interna del snapshot reserva más memoria que una constante más lo que ocupan sus bytes.
+**Sostenida por.** D48 (§8 *apply_snapshot Rules*, *Bounded Snapshot Decompression*). Las filas también tienen que cumplir las restricciones del esquema que llega con el snapshot (Fase 3.11, DR7): se verifican al construir sus índices, en el pool bloqueante y antes de reemplazar nada, y si no las cumplen el snapshot es `SnapshotCorruption`. Esos índices no salen de una declaración del snapshot sino de sus filas: suman, por fila, hasta una entrada por restricción de su tabla (32 como máximo, de 167 a 221 bytes cada una según lo medido, §8 *Derived Constraint Indexes*). Es proporcional a las filas que trae, con la misma constante que una sala legítima, y la acota el tope de restricciones por tabla (DR9).
+**Cómo intentar romperla.** Snapshots fabricados (longitudes declaradas enormes, cuentas de filas falsas, filas con clave distinta de la columna PK, compresión que no termina en la longitud declarada, filas que repiten una clave `UNIQUE` o con una clave foránea sin su fila padre); cierre de la sala durante la decodificación.
 
 #### INV-S6 · Memoria igual a disco
 **Enunciado.** Mientras una sala del storage no esté `RoomFailed`, lo que devuelven `get`, `scan` y `get_head_seq` es exactamente lo que daría cerrarla y reabrirla con el mismo esquema (módulo los `Null` al final de las filas, INV-Y8). Los índices de las restricciones también son los que la reapertura construiría (INV-C3), y el replay toma las mismas decisiones que informó `apply_batch`. Vale en los puntos sin una operación en curso: mientras corre la tarea de una operación soltada, la memoria puede ir detrás del disco, y `close_room` espera a esa tarea.
@@ -453,7 +453,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-W1 ★ · Ninguna entrada hace entrar en pánico, abortar ni reservar de más
 **Enunciado.** Ningún byte de red, de disco (WAL, segmentos, sidecars, snapshots, JSON) ni de un snapshot de otro peer provoca un pánico, un abort o una reserva de memoria desproporcionada a su tamaño. Todo error es tipado.
-**Sostenida por.** `decode_budget`, `Deserialize` propios, `PayloadReader`, CRC antes de decodificar (§7.2 *Defensive Bounding*, §8 *Bounded Snapshot Decompression*).
+**Sostenida por.** `decode_budget`, `Deserialize` propios, `PayloadReader`, CRC antes de decodificar (§7.2 *Defensive Bounding*, §8 *Bounded Snapshot Decompression*). Un snapshot de otro peer que no cumple las restricciones del esquema es un error tipado (`SnapshotCorruption`), y la verificación no entra en pánico: usa la misma función que decide cada operación del log (Fase 3.11). Los índices de sus restricciones ocupan, por fila, hasta una entrada por restricción de su tabla (32 como máximo, de 167 a 221 bytes cada una según lo medido): proporcional a las filas que trae, con la constante de una sala legítima (ver INV-S5).
 **Automatizable.** Fuzzing con generadores propios (sin `cargo fuzz`, D88) de `decode_client_message`, `decode_message`, el decoder de frames WAL, el de sidecars, `SnapshotEnvelopeHeader::parse` y `apply_snapshot`. En el repo desde el Lote 0 de la Fase 3.9.
 
 #### INV-W2 · Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum
@@ -467,13 +467,13 @@ Las de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md): `UN
 
 #### INV-C1 ★ · Ninguna versión posterior del esquema cambia la decisión sobre una operación ya secuenciada
 **Enunciado.** Aplicar el log de una sala con cualquier versión del esquema bajo la que cada operación es válida da el mismo estado y la misma decisión (aplicada o rechazada, con el mismo motivo) para cada operación, al recibirla, al reabrir y al reaplicar el WAL.
-**Sostenida por.** Las restricciones solo nacen con el esquema o con una columna nueva que incluyen (DR3); INV-E1 e INV-E2.
+**Sostenida por.** Las restricciones solo nacen con el esquema o con una columna nueva que incluyen (DR3); INV-E1 e INV-E2. Un snapshot (local o de otro peer) escrito con una versión anterior se verifica con la que se abre o aplica, y sus filas cortas leen `NULL` en las columnas que les faltan, así que pasa igual (DR7).
 **Cómo intentar romperla.** Agregar una columna con `UNIQUE` o FK en medio de un log; réplicas que conocen la versión nueva en momentos distintos; reabrir con la versión nueva un WAL y un snapshot escritos con la vieja; reasignar la sala a otro esquema.
 **Automatizable.** Log aleatorio con columnas agregadas en puntos aleatorios; oráculo = aplicar cada operación con la versión que se conocía al recibirla contra aplicar todo con la última.
 
 #### INV-C2 ★ · El estado de una réplica cumple las restricciones de su esquema
 **Enunciado.** Después de cada `apply_batch`, de abrir una sala y de aplicar un snapshot, ninguna clave `UNIQUE` sin `NULL` se repite, toda clave foránea sin `NULL` tiene su fila padre y ninguna fila de una tabla inmutable fue reemplazada. Un snapshot (local o de otro peer) que no las cumple no se abre ni se instala.
-**Sostenida por.** La verificación al aplicar (DR4, DR11: `apply_operation`, en los dos motores y en el replay, §8 *Integrity Rules on the Replicas*) y la de los snapshots (DR7, Lote 5: hasta entonces, un snapshot que no las cumple se instala).
+**Sostenida por.** La verificación al aplicar (DR4, DR11: `apply_operation`, en los dos motores y en el replay, §8 *Integrity Rules on the Replicas*) y la de los snapshots (DR7: `apply_snapshot` y `open_room` verifican cada fila con las reglas de un `Insert`, al construir los índices, y un snapshot que no las cumple es `SnapshotCorruption`, §8 *apply_snapshot Rules* y *Opening Requires a Schema That Covers the Room's Data*). Que ninguna fila de una tabla inmutable fue reemplazada es una propiedad de la historia, no del estado: un snapshot guarda una fila por clave primaria, así que no hay nada que verificar en él.
 **Cómo intentar romperla.** Violaciones concurrentes en los dos órdenes; un padre y su hijo en el mismo batch, en los dos órdenes; un snapshot con duplicados o con FK colgantes; una fila que se apunta a sí misma.
 **Automatizable.** Oráculo diferencial: un modelo de referencia que verifica recorriendo tablas, sin índices, contra los dos motores.
 

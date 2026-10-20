@@ -386,6 +386,322 @@ pub(crate) async fn snapshot_indexes_are_built_off_the_runtime<E: RoomContents>(
 }
 
 // ---------------------------------------------------------------------------------------------
+// Snapshots checked against the constraints
+
+/// The tables of [`evolved_schema`] without any constraint, to write rows that break them.
+fn unconstrained_schema() -> Schema {
+    let parents = TableSchema::builder("parents")
+        .table_id(PARENTS)
+        .primary_key("id", DataType::Int)
+        .nullable_column("code", DataType::String)
+        .nullable_column("score", DataType::Float)
+        .nullable_column("tag", DataType::String);
+    let children = TableSchema::builder("children")
+        .table_id(CHILDREN)
+        .primary_key("a", DataType::Int)
+        .primary_key("b", DataType::Int)
+        .nullable_column("parent", DataType::Int)
+        .nullable_column("up_a", DataType::Int)
+        .nullable_column("up_b", DataType::Int)
+        .nullable_column("x", DataType::Int);
+    let plain = TableSchema::builder("plain")
+        .table_id(PLAIN)
+        .primary_key("id", DataType::Int)
+        .nullable_column("v", DataType::Int);
+    Schema::builder()
+        .table(parents)
+        .table(children)
+        .table(plain)
+        .build()
+}
+
+/// A row as the id of its table and its values.
+type TableRow = (u16, Vec<Value>);
+
+/// A row of `table` from its values; its key is its first value, or its first two in
+/// `children`.
+fn keyed(table: u16, values: Vec<Value>) -> (PrimaryKey, CompactRow) {
+    let width = if table == CHILDREN { 2 } else { 1 };
+    let pk = PrimaryKey::composite(values[..width].to_vec());
+    (pk, CompactRow::new(values))
+}
+
+/// A snapshot at sequence `head` of a room written under `schema`, which holds `rows` as
+/// `(table, values)`: they are inserted first, and deletes of keys of `plain` that do not
+/// exist take the head to `head`. Returns the source engine too, to compare with.
+async fn snapshot_with(
+    schema: &Schema,
+    rows: Vec<TableRow>,
+    head: u64,
+) -> (MemoryStorageEngine, Vec<u8>) {
+    let room = RoomId::new("snapshot-source").unwrap();
+    let source = MemoryStorageEngine::new();
+    source.open_room(&room, schema.clone()).await.unwrap();
+    let count = rows.len() as u64;
+    assert!(count <= head);
+    let mut ops: Vec<SequencedOperation> = rows
+        .into_iter()
+        .zip(1..)
+        .map(|((table, values), seq)| {
+            let (pk, row) = keyed(table, values);
+            SequencedOperation::new(seq, Operation::insert(table, pk, row, 0))
+        })
+        .collect();
+    for seq in count + 1..=head {
+        let pk = PrimaryKey::single(1000 + seq as i64);
+        ops.push(SequencedOperation::new(
+            seq,
+            Operation::delete(PLAIN, pk, 0),
+        ));
+    }
+    let report = source.apply_batch(&room, ops).await.unwrap();
+    assert!(report.rejected().is_empty(), "{report:?}");
+    let snapshot = source.create_snapshot(&room).await.unwrap();
+    (source, snapshot)
+}
+
+fn int(value: i64) -> Value {
+    Value::Int(value)
+}
+
+/// Rows that break each constraint of [`evolved_schema`] that can be broken alone, with the
+/// name of the constraint the error must give: a repeated `UNIQUE` key, in a column of the
+/// table and in one added later, and a foreign key without its parent row, to another table and
+/// to the table itself. Where several constraints are broken, the first table by id and, within
+/// it, the first row by key is named.
+fn rows_that_break_a_constraint() -> Vec<(&'static str, Vec<TableRow>)> {
+    let null = Value::Null;
+    vec![
+        (
+            "parents_code",
+            vec![
+                (PARENTS, vec![int(1), s("dup"), null.clone()]),
+                (PARENTS, vec![int(2), s("dup"), null.clone()]),
+            ],
+        ),
+        (
+            "parents_tag",
+            vec![
+                (PARENTS, vec![int(1), s("a"), null.clone(), s("t")]),
+                (PARENTS, vec![int(2), s("b"), null.clone(), s("t")]),
+            ],
+        ),
+        (
+            "children_x",
+            vec![
+                (
+                    CHILDREN,
+                    vec![
+                        int(1),
+                        int(1),
+                        null.clone(),
+                        null.clone(),
+                        null.clone(),
+                        int(5),
+                    ],
+                ),
+                (
+                    CHILDREN,
+                    vec![
+                        int(1),
+                        int(2),
+                        null.clone(),
+                        null.clone(),
+                        null.clone(),
+                        int(5),
+                    ],
+                ),
+            ],
+        ),
+        (
+            "children_parent",
+            vec![
+                (PARENTS, vec![int(1)]),
+                (CHILDREN, vec![int(1), int(1), int(7)]),
+            ],
+        ),
+        // `(up_b, up_a)` is `(3, 2)`: the child `a = 3, b = 2`, which does not exist.
+        (
+            "children_up",
+            vec![
+                (CHILDREN, vec![int(2), int(3), null.clone(), int(2), int(3)]),
+                (CHILDREN, vec![int(1), int(1), null.clone(), int(2), int(3)]),
+            ],
+        ),
+        // Two tables break a constraint: the first by id is named.
+        (
+            "parents_code",
+            vec![
+                (
+                    CHILDREN,
+                    vec![
+                        int(1),
+                        int(1),
+                        null.clone(),
+                        null.clone(),
+                        null.clone(),
+                        int(5),
+                    ],
+                ),
+                (
+                    CHILDREN,
+                    vec![
+                        int(1),
+                        int(2),
+                        null.clone(),
+                        null.clone(),
+                        null.clone(),
+                        int(5),
+                    ],
+                ),
+                (PARENTS, vec![int(1), s("dup")]),
+                (PARENTS, vec![int(2), s("dup")]),
+            ],
+        ),
+        // Two rows break a constraint each: the first by key is named.
+        (
+            "children_parent",
+            vec![
+                (CHILDREN, vec![int(2), int(2), null.clone(), int(2), int(3)]),
+                (CHILDREN, vec![int(1), int(1), int(7)]),
+            ],
+        ),
+    ]
+}
+
+/// The names of every `UNIQUE` constraint and foreign key of `schema`.
+fn constraint_names(schema: &Schema) -> Vec<String> {
+    schema
+        .tables()
+        .flat_map(|table| {
+            let unique = table
+                .unique_constraints()
+                .iter()
+                .map(UniqueConstraint::name);
+            unique.chain(table.foreign_keys().iter().map(ForeignKey::name))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Applies to `room`, open with [`constrained_schema`] and holding random batches, snapshots
+/// ahead of it that break a constraint of [`evolved_schema`], the schema passed with them. Each
+/// is `SnapshotCorruption` naming the constraint, and only it, and leaves the head, the schema,
+/// the rows and the indexes as they were. Returns the room's contents.
+pub(crate) async fn snapshots_that_break_a_constraint_change_nothing<E: RoomContents>(
+    engine: &E,
+    room: &RoomId,
+) -> (Schema, RoomData) {
+    let mut log = RandomLog::new(19, constrained_schema());
+    apply_random_batches(engine, room, &mut log, 5).await;
+    let head = log.head();
+    let (schema, before) = checked_contents(engine, room).await;
+
+    for (constraint, rows) in rows_that_break_a_constraint() {
+        let (_, snapshot) = snapshot_with(&unconstrained_schema(), rows, head + 3).await;
+        let err = engine
+            .apply_snapshot(room, evolved_schema(), snapshot.into(), (head + 3).into())
+            .await
+            .unwrap_err();
+        let StorageError::SnapshotCorruption(message) = &err else {
+            panic!("{constraint}: {err:?}");
+        };
+        let named: Vec<String> = constraint_names(&evolved_schema())
+            .into_iter()
+            .filter(|name| message.contains(&format!("{name:?}")))
+            .collect();
+        assert_eq!(named, [constraint], "{message}");
+        assert_eq!(engine.get_head_seq(room).await.unwrap().get(), head);
+        let (after_schema, after) = checked_contents(engine, room).await;
+        assert_eq!(after_schema, schema, "{constraint}");
+        assert_same_contents(&before, &after);
+    }
+    (schema, before)
+}
+
+/// Applies to `room`, open with [`constrained_schema`] and empty, snapshots that meet the
+/// constraints of the schema passed with them, and checks that each is installed with its rows
+/// and their indexes:
+/// - keys with a `NULL`, repeated or without a parent, also in composite keys with a single
+///   `NULL`;
+/// - a row that references itself, through a composite foreign key that names its columns in
+///   another order than the table;
+/// - short rows written under [`constrained_schema`], installed under [`evolved_schema`], whose
+///   `UNIQUE (tag)` reads the column they lack as `NULL`.
+pub(crate) async fn snapshots_that_meet_the_constraints_are_installed<E: RoomContents>(
+    engine: &E,
+    room: &RoomId,
+) {
+    let null = Value::Null;
+    let with_null = vec![
+        (PARENTS, vec![int(1), null.clone(), Value::Float(1.5)]),
+        (PARENTS, vec![int(2), null.clone(), Value::Float(1.5)]),
+        (
+            CHILDREN,
+            vec![
+                int(1),
+                int(1),
+                null.clone(),
+                int(4),
+                null.clone(),
+                null.clone(),
+            ],
+        ),
+        (
+            CHILDREN,
+            vec![
+                int(1),
+                int(2),
+                null.clone(),
+                null.clone(),
+                int(4),
+                null.clone(),
+            ],
+        ),
+    ];
+    let referencing_itself = vec![
+        (CHILDREN, vec![int(2), int(1), null.clone(), int(1), int(2)]),
+        (CHILDREN, vec![int(3), int(1), null.clone(), int(1), int(2)]),
+    ];
+    let short_rows = vec![
+        (PARENTS, vec![int(1), s("a")]),
+        (PARENTS, vec![int(2), s("b"), Value::Float(1.5)]),
+    ];
+    let cases = [
+        (
+            "keys with NULL",
+            unconstrained_schema(),
+            with_null,
+            constrained_schema(),
+        ),
+        (
+            "a row that references itself",
+            unconstrained_schema(),
+            referencing_itself,
+            constrained_schema(),
+        ),
+        (
+            "short rows of an older version",
+            constrained_schema(),
+            short_rows,
+            evolved_schema(),
+        ),
+    ];
+    for (head, (case, written_under, rows, schema)) in (5u64..).step_by(5).zip(cases) {
+        let (source, snapshot) = snapshot_with(&written_under, rows, head).await;
+        let applied = engine
+            .apply_snapshot(room, schema.clone(), snapshot.into(), head.into())
+            .await;
+        assert_eq!(applied.unwrap().get(), head, "{case}");
+        let (installed_schema, installed) = checked_contents(engine, room).await;
+        assert_eq!(installed_schema, schema, "{case}");
+        let source_room = RoomId::new("snapshot-source").unwrap();
+        let (_, expected) = source.contents(&source_room).await;
+        assert_eq!(installed.tables(), expected.tables(), "{case}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // The indexes of one table
 
 /// `parents`, as [`constrained_schema`] declares it.

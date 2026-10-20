@@ -80,6 +80,40 @@ impl RoomData {
         Self { tables, indexes }
     }
 
+    /// [`RoomData::build`], for rows that must meet the constraints of `schema`: a snapshot,
+    /// received from another peer or opened from disk. Otherwise `SnapshotCorruption`.
+    pub(crate) fn build_checked(
+        schema: &Schema,
+        tables: HashMap<u16, Table>,
+    ) -> Result<Self, StorageError> {
+        let data = Self::build(schema, tables);
+        data.check(schema)?;
+        Ok(data)
+    }
+
+    /// `SnapshotCorruption` if the rows break a constraint of `schema`: a `UNIQUE` key that
+    /// another row repeats, or a foreign key without its parent row. Each row is checked as
+    /// [`apply_operation`] checks an insert of it on these rows, so a key with a `NULL` is not
+    /// checked and a row may reference itself. Tables go in id order and rows in key order, so
+    /// the constraint named is always the same. O(N log N) per constraint, like
+    /// [`RoomData::build`], so it reaches the same thread point.
+    fn check(&self, schema: &Schema) -> Result<(), StorageError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::fail_point::thread_point("room_data.build");
+        for table in schema.tables() {
+            let rows = self.tables.get(&table.table_id()).into_iter().flatten();
+            for (pk, row) in rows {
+                if let Some(reason) = check_row(self, schema, table, pk, row, None) {
+                    return Err(StorageError::SnapshotCorruption(format!(
+                        "Snapshot table '{}' breaks a constraint: {reason:?}",
+                        table.name()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn tables(&self) -> &HashMap<u16, Table> {
         &self.tables
     }
@@ -419,9 +453,9 @@ impl RoomSnapshotPayload {
 /// Decodes a snapshot envelope that `apply_snapshot` received and checks it before anything is
 /// replaced: its head sequence must be `expected_head_seq`, and every table and row must be
 /// valid under `schema` (a known table, a valid key and row, and the row's key columns equal to
-/// the key it is stored under). Tables of `schema` the snapshot does not contain are added
-/// empty. Returns the snapshot's head sequence and its rows, with the indexes of the
-/// constraints of `schema` built from them.
+/// the key it is stored under), and the rows must meet the constraints of `schema`. Tables of
+/// `schema` the snapshot does not contain are added empty. Returns the snapshot's head sequence
+/// and its rows, with the indexes of the constraints of `schema` built from them.
 ///
 /// Every row is decoded and checked, and every index built, so outside WebAssembly the engines
 /// run it on the blocking pool.
@@ -455,7 +489,8 @@ pub(crate) fn decode_received_snapshot(
         }
     }
     payload.fill_missing_tables(schema);
-    Ok((payload.head_seq, RoomData::build(schema, payload.tables)))
+    let data = RoomData::build_checked(schema, payload.tables)?;
+    Ok((payload.head_seq, data))
 }
 
 #[cfg(test)]

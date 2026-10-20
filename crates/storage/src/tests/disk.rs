@@ -3,8 +3,9 @@ use crate::fail_point;
 use crate::memory::index::tests::{
     apply_checked, apply_random_batches, assert_same_contents, checked_contents,
     constrained_schema, evolved_schema, refused_batches_change_nothing,
-    snapshot_indexes_are_built_off_the_runtime, snapshots_replace_the_indexes, RandomLog,
-    RoomContents, BUILD_POINT,
+    snapshot_indexes_are_built_off_the_runtime, snapshots_replace_the_indexes,
+    snapshots_that_break_a_constraint_change_nothing,
+    snapshots_that_meet_the_constraints_are_installed, RandomLog, RoomContents, BUILD_POINT,
 };
 use crate::memory::{RoomSnapshotRef, Table};
 use crate::snapshot::encode_snapshot_envelope;
@@ -1351,6 +1352,38 @@ async fn indexes_are_built_off_the_runtime() {
     let room = RoomId::new("snapshot-indexes-off-the-runtime").unwrap();
     engine.open_room(&room, constrained_schema()).await.unwrap();
     snapshot_indexes_are_built_off_the_runtime(&engine, &room).await;
+}
+
+/// A snapshot that breaks a constraint changes nothing, in memory or on disk: the reopened room
+/// holds what it held before.
+#[tokio::test]
+async fn a_snapshot_that_breaks_a_constraint_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("snapshot-breaks").unwrap();
+    let engine = engine_at(dir.path());
+    engine.open_room(&room, constrained_schema()).await.unwrap();
+    let (schema, before) = snapshots_that_break_a_constraint_change_nothing(&engine, &room).await;
+    let head = engine.get_head_seq(&room).await.unwrap();
+
+    let engine = reopen_with(engine, dir.path(), &room, schema).await;
+    assert_eq!(engine.get_head_seq(&room).await.unwrap(), head);
+    let (_, after) = checked_contents(&engine, &room).await;
+    assert_same_contents(&before, &after);
+}
+
+/// A snapshot that meets the constraints is installed, and the room reopens with it.
+#[tokio::test]
+async fn a_snapshot_that_meets_the_constraints_is_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("snapshot-meets").unwrap();
+    let engine = engine_at(dir.path());
+    engine.open_room(&room, constrained_schema()).await.unwrap();
+    snapshots_that_meet_the_constraints_are_installed(&engine, &room).await;
+    let (schema, before) = engine.contents(&room).await;
+
+    let engine = reopen_with(engine, dir.path(), &room, schema).await;
+    let (_, after) = checked_contents(&engine, &room).await;
+    assert_same_contents(&before, &after);
 }
 
 /// A `.wal.compacting` whose only live record is a rejected update is folded too: the head moves

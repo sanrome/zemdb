@@ -3,7 +3,10 @@
 //!   the disk engine's own files;
 //! - a disk replica written under a schema reopens under any later version of it;
 //! - damaged snapshots never panic `apply_snapshot`, and damaged room files never panic
-//!   `open_room`: both fail with a corruption error or accept a valid state.
+//!   `open_room`, also under a schema with constraints: both fail with a corruption error or
+//!   accept a valid state;
+//! - snapshots of random states written without constraints are installed under a schema with
+//!   constraints only if they meet them.
 //!
 //! The ignored variants run many more cases: `cargo test --release -- --ignored`.
 
@@ -14,7 +17,8 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use zemdb_core::{
     validate_snapshot_envelope, ColumnDef, ColumnUpdate, CompactRow, DataType, Operation, OwnerDef,
     OwnerIdentity, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation,
-    SnapshotCompression, SnapshotEnvelopeHeader, TableSchema, Value, SNAPSHOT_HEADER_LEN,
+    SnapshotCompression, SnapshotEnvelopeHeader, TableSchema, UniqueConstraint, Value,
+    SNAPSHOT_HEADER_LEN,
 };
 use zemdb_storage::format::HEADER_SIZE;
 use zemdb_storage::snapshot::{decode_snapshot_envelope, encode_snapshot_envelope};
@@ -209,7 +213,7 @@ fn sequenced(ops: impl IntoIterator<Item = Operation>) -> Vec<SequencedOperation
 }
 
 /// Every row of the tables `table_ids`, in key order.
-async fn dump<E: StorageEngine>(
+async fn dump<E: StorageEngine + ?Sized>(
     engine: &E,
     room: &RoomId,
     table_ids: &[u16],
@@ -822,6 +826,91 @@ fn sample_schema() -> Schema {
     schema
 }
 
+/// [`sample_schema`] with constraints that its rows meet: `UNIQUE (name)` in `items`, a foreign
+/// key from `links.a` to `items`, and `UNIQUE (extra)` with the column added later, which the
+/// row written before it lacks.
+fn constrained_sample_schema() -> Schema {
+    let mut schema = Schema::builder()
+        .table(
+            TableSchema::builder("items")
+                .table_id(0)
+                .primary_key("id", DataType::Int)
+                .column("name", DataType::String)
+                .nullable_column("price", DataType::Float)
+                .unique("items_name", ["name"]),
+        )
+        .table(
+            TableSchema::builder("links")
+                .table_id(1)
+                .primary_key("a", DataType::Int)
+                .primary_key("b", DataType::Uuid)
+                .encrypted_column("secret", DataType::String)
+                .nullable_column("flag", DataType::Bool)
+                .foreign_key("links_item", ["a"], "items"),
+        )
+        .build();
+    let unique = vec![UniqueConstraint::new("items_extra", ["extra"])];
+    schema
+        .add_column_with_constraints(
+            "items",
+            ColumnDef::new("extra", DataType::Bytes).nullable(true),
+            unique,
+            Vec::new(),
+        )
+        .unwrap();
+    schema
+}
+
+/// The names of the `UNIQUE` constraints and foreign keys of `schema` that `tables` break,
+/// found by walking whole tables: a key without `NULL` that repeats, or one of a foreign key
+/// that is not the key of a row of the referenced table.
+fn broken_constraints(
+    schema: &Schema,
+    tables: &[(u16, Vec<(PrimaryKey, CompactRow)>)],
+) -> BTreeSet<String> {
+    let rows_of = |table_id: u16| {
+        tables
+            .iter()
+            .find(|(id, _)| *id == table_id)
+            .map_or(&[][..], |(_, rows)| rows.as_slice())
+    };
+    let key = |table: &TableSchema, row: &CompactRow, columns: &[String]| {
+        let values: Option<Vec<Value>> = columns
+            .iter()
+            .map(|name| {
+                let value = row.get(table.column_index(name).unwrap())?;
+                (!value.is_null()).then(|| value.clone())
+            })
+            .collect();
+        values.map(PrimaryKey::composite)
+    };
+    let mut broken = BTreeSet::new();
+    for table in schema.tables() {
+        let rows = rows_of(table.table_id());
+        for unique in table.unique_constraints() {
+            let mut seen = BTreeSet::new();
+            for (_, row) in rows {
+                if let Some(key) = key(table, row, unique.columns()) {
+                    if !seen.insert(key) {
+                        broken.insert(unique.name().to_string());
+                    }
+                }
+            }
+        }
+        for foreign_key in table.foreign_keys() {
+            let parent = schema.get_table_id(foreign_key.references()).unwrap();
+            for (_, row) in rows {
+                if let Some(key) = key(table, row, foreign_key.columns()) {
+                    if !rows_of(parent).iter().any(|(pk, _)| *pk == key) {
+                        broken.insert(foreign_key.name().to_string());
+                    }
+                }
+            }
+        }
+    }
+    broken
+}
+
 /// Rows of every value type in both tables of `sample_schema`, a row from before the column
 /// added later, an update and a delete.
 fn sample_ops() -> Vec<SequencedOperation> {
@@ -882,9 +971,8 @@ fn sealed_envelope(compression: SnapshotCompression, body: &[u8], declared: u32)
     envelope
 }
 
-fn check_damaged_snapshots(seed: u64, cases: u64) {
+fn check_damaged_snapshots(seed: u64, cases: u64, schema: Schema) {
     let rt = runtime();
-    let schema = sample_schema();
     let source = RoomId::new("source").unwrap();
     let ops = sample_ops();
     let head = SequenceNumber::new(ops.len() as u64);
@@ -972,13 +1060,18 @@ fn check_damaged_snapshots(seed: u64, cases: u64) {
                 assert_eq!(applied, head);
                 assert!(validate_snapshot_envelope(&envelope).is_ok());
                 rt.block_on(async {
-                    // Every row accepted is valid under the schema.
-                    for table in schema.tables() {
-                        for (pk, row) in dump(&target, &room, &[table.table_id()]).await.remove(0).1
-                        {
-                            table.validate_keyed_row(&pk, &row).unwrap();
+                    // Every row accepted is valid under the schema, and the rows meet its
+                    // constraints.
+                    let tables: Vec<u16> = schema.table_ids().collect();
+                    let rows = dump(&target, &room, &tables).await;
+                    for (table_id, table_rows) in &rows {
+                        let table = schema.get_table_by_id(*table_id).unwrap();
+                        for (pk, row) in table_rows {
+                            table.validate_keyed_row(pk, row).unwrap();
                         }
                     }
+                    let broken = broken_constraints(&schema, &rows);
+                    assert!(broken.is_empty(), "accepted rows break {broken:?}");
                     // Start again from an empty room, so that the next snapshot is not a no-op.
                     target.close_room(&room).await.unwrap();
                     target.open_room(&room, schema.clone()).await.unwrap();
@@ -998,13 +1091,128 @@ fn check_damaged_snapshots(seed: u64, cases: u64) {
 
 #[test]
 fn damaged_snapshots_never_panic_apply_snapshot() {
-    check_damaged_snapshots(0xDA5_0001, 2_000);
+    check_damaged_snapshots(0xDA5_0001, 2_000, sample_schema());
 }
 
 #[test]
 #[ignore = "long-running randomized test; run with --ignored in release"]
 fn damaged_snapshots_never_panic_apply_snapshot_long() {
-    check_damaged_snapshots(0xDA5_0002, 400_000);
+    check_damaged_snapshots(0xDA5_0002, 400_000, sample_schema());
+}
+
+/// Damaged snapshots checked against a schema with constraints: a snapshot whose rows break one
+/// is a corruption error too, never a panic, and one accepted meets them.
+#[test]
+fn damaged_snapshots_with_constraints_never_panic_apply_snapshot() {
+    check_damaged_snapshots(0xDA5_0003, 2_000, constrained_sample_schema());
+}
+
+#[test]
+#[ignore = "long-running randomized test; run with --ignored in release"]
+fn damaged_snapshots_with_constraints_never_panic_apply_snapshot_long() {
+    check_damaged_snapshots(0xDA5_0004, 400_000, constrained_sample_schema());
+}
+
+/// A random state of the tables of [`constrained_sample_schema`], written without its
+/// constraints (under [`sample_schema`]) over a few values, so that it breaks them often: items
+/// with repeated names or extras, some rows short, and links to items that may not exist.
+fn unchecked_state(rng: &mut Rng) -> Vec<SequencedOperation> {
+    let mut ops = Vec::new();
+    for _ in 0..rng.between(0, 12) {
+        let id = rng.between(1, 5) as i64;
+        let name = Value::String(format!("n{}", rng.below(4)).into());
+        let op = match rng.below(4) {
+            0 => {
+                let pk = PrimaryKey::composite([Value::Int(rng.between(0, 6) as i64), uuid(rng)]);
+                let mut row = pk.values().to_vec();
+                row.extend([Value::Bytes(vec![1].into()), Value::Null]);
+                Operation::insert(1, pk, CompactRow::new(row), 0)
+            }
+            1 => Operation::delete(0, PrimaryKey::single(id), 0),
+            _ => {
+                let mut row = vec![Value::Int(id), name, Value::Null];
+                if rng.coin() {
+                    row.push(match rng.below(3) {
+                        0 => Value::Null,
+                        n => Value::Bytes(vec![n as u8].into()),
+                    });
+                }
+                Operation::insert(0, PrimaryKey::single(id), CompactRow::new(row), 0)
+            }
+        };
+        ops.push(op);
+    }
+    sequenced(ops)
+}
+
+fn uuid(rng: &mut Rng) -> Value {
+    Value::Uuid([rng.below(2) as u8; 16])
+}
+
+/// Snapshots of random states written without constraints, applied to both engines with
+/// [`constrained_sample_schema`]: each is installed if and only if a walk of its tables finds
+/// that it meets the constraints, and is otherwise a corruption error that names one it breaks.
+fn check_unchecked_states(seed: u64, cases: u64) {
+    let rt = runtime();
+    let room = RoomId::new("unchecked").unwrap();
+    let schema = constrained_sample_schema();
+    let tables: Vec<u16> = schema.table_ids().collect();
+    let (mut accepted, mut refused) = (0, 0);
+    for_each_case(seed, cases, |rng| {
+        let ops = unchecked_state(rng);
+        let head = SequenceNumber::new(ops.len() as u64);
+        rt.block_on(async {
+            let source = MemoryStorageEngine::new();
+            source.open_room(&room, sample_schema()).await.unwrap();
+            source.apply_batch(&room, ops).await.unwrap();
+            let rows = dump(&source, &room, &tables).await;
+            let broken = broken_constraints(&schema, &rows);
+            let snapshot = source.create_snapshot(&room).await.unwrap();
+
+            let memory = MemoryStorageEngine::new();
+            let dir = tempfile::tempdir().unwrap();
+            let disk = disk_engine(dir.path());
+            let targets: [&dyn StorageEngine; 2] = [&memory, &disk];
+            for target in targets {
+                target.open_room(&room, schema.clone()).await.unwrap();
+                let applied = target
+                    .apply_snapshot(&room, schema.clone(), Bytes::from(snapshot.clone()), head)
+                    .await;
+                match applied {
+                    Ok(applied) => {
+                        assert!(broken.is_empty(), "installed, breaking {broken:?}");
+                        assert_eq!(applied, head);
+                        assert_eq!(dump(target, &room, &tables).await, rows);
+                        accepted += 1;
+                    }
+                    Err(StorageError::SnapshotCorruption(message)) => {
+                        assert!(
+                            broken.iter().any(|name| message.contains(name.as_str())),
+                            "refused for {message}, breaking {broken:?}"
+                        );
+                        assert_eq!(target.get_head_seq(&room).await.unwrap().get(), 0);
+                        refused += 1;
+                    }
+                    Err(error) => panic!("{error:?}"),
+                }
+            }
+        });
+    });
+    assert!(
+        accepted > 0 && refused > 0,
+        "{accepted} accepted, {refused} refused"
+    );
+}
+
+#[test]
+fn unchecked_states_are_installed_only_if_they_meet_the_constraints() {
+    check_unchecked_states(0xC0_5001, 300);
+}
+
+#[test]
+#[ignore = "long-running randomized test; run with --ignored in release"]
+fn unchecked_states_are_installed_only_if_they_meet_the_constraints_long() {
+    check_unchecked_states(0xC0_5002, 20_000);
 }
 
 /// Rewrites the checksums of a damaged `.snap` file (the payload's, if the length it declares
@@ -1027,9 +1235,8 @@ fn seal_snapshot_file(file: &mut [u8]) {
     file[36..40].copy_from_slice(&header_crc.to_le_bytes());
 }
 
-fn check_damaged_room_files(seed: u64, cases: u64) {
+fn check_damaged_room_files(seed: u64, cases: u64, schema: Schema) {
     let rt = runtime();
-    let schema = sample_schema();
     let room = RoomId::new("room").unwrap();
     let ops = sample_ops();
 
@@ -1082,9 +1289,11 @@ fn check_damaged_room_files(seed: u64, cases: u64) {
         rt.block_on(async {
             match engine.open_room(&room, schema.clone()).await {
                 Ok(()) => {
-                    for table_id in schema.table_ids() {
-                        dump(&engine, &room, &[table_id]).await;
-                    }
+                    // The state opened meets the constraints of the schema.
+                    let tables: Vec<u16> = schema.table_ids().collect();
+                    let rows = dump(&engine, &room, &tables).await;
+                    let broken = broken_constraints(&schema, &rows);
+                    assert!(broken.is_empty(), "opened rows break {broken:?}");
                     engine.close_room(&room).await.unwrap();
                 }
                 // A panic while decoding on the blocking pool would come back as `Other`.
@@ -1104,11 +1313,24 @@ fn check_damaged_room_files(seed: u64, cases: u64) {
 
 #[test]
 fn damaged_room_files_never_panic_open_room() {
-    check_damaged_room_files(0xDA5_1001, 100);
+    check_damaged_room_files(0xDA5_1001, 100, sample_schema());
 }
 
 #[test]
 #[ignore = "long-running randomized test; run with --ignored in release"]
 fn damaged_room_files_never_panic_open_room_long() {
-    check_damaged_room_files(0xDA5_1002, 2_000);
+    check_damaged_room_files(0xDA5_1002, 2_000, sample_schema());
+}
+
+/// Damaged room files opened with a schema with constraints: a snapshot whose rows break one is
+/// a corruption error too, never a panic, and a room opened meets them.
+#[test]
+fn damaged_room_files_with_constraints_never_panic_open_room() {
+    check_damaged_room_files(0xDA5_1003, 100, constrained_sample_schema());
+}
+
+#[test]
+#[ignore = "long-running randomized test; run with --ignored in release"]
+fn damaged_room_files_with_constraints_never_panic_open_room_long() {
+    check_damaged_room_files(0xDA5_1004, 2_000, constrained_sample_schema());
 }

@@ -97,7 +97,9 @@ impl ApplyReport {
 pub trait StorageEngine: EngineConcurrencyBounds {
     /// Opens or registers a room with its schema. A disk room whose snapshot or WAL holds data
     /// of a table that `schema` does not have is not opened (`SchemaMismatch`), and that data
-    /// stays on disk for a later open with a schema that has the table.
+    /// stays on disk for a later open with a schema that has the table. Neither is one whose
+    /// snapshot breaks a constraint of `schema` (`SnapshotCorruption`), and its files stay as
+    /// they were.
     async fn open_room(&self, room_id: &RoomId, schema: Schema) -> Result<(), StorageError>;
 
     /// Closes a room, releasing any associated resources or file handles.
@@ -184,6 +186,10 @@ pub trait StorageEngine: EngineConcurrencyBounds {
     /// - Every table must be in `schema` and every row valid under it, with its key columns
     ///   equal to the key it is stored under; otherwise `StorageError::SnapshotCorruption`.
     ///   Whether `schema` is the room's registered schema is up to the caller.
+    /// - The rows must meet the constraints of `schema`, as applying the log leaves them: no
+    ///   `UNIQUE` key without a `NULL` repeats, and every foreign key without a `NULL` has its
+    ///   parent row (a row may reference itself); otherwise `StorageError::SnapshotCorruption`,
+    ///   naming the table and the constraint.
     ///
     /// Outside WebAssembly the snapshot is decoded and checked on the blocking pool. Then:
     /// - A snapshot behind the room's head sequence is rejected with
