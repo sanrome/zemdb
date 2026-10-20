@@ -514,7 +514,7 @@ pub fn schema(rng: &mut Rng) -> Schema {
                 if candidates.is_empty() {
                     break;
                 }
-                chosen.push(rng.pick(&candidates));
+                chosen.push(*rng.pick(&candidates));
             }
             if chosen.len() == target_key.len() {
                 foreign_keys.push(ForeignKey::new(constraint_name(), chosen, target.clone()));
