@@ -12,9 +12,9 @@ use futures::StreamExt;
 use std::collections::BTreeSet;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use zemdb_core::{
-    validate_snapshot_envelope, ColumnDef, ColumnUpdate, CompactRow, DataType, Operation,
-    PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation, SnapshotCompression,
-    SnapshotEnvelopeHeader, TableSchema, Value, SNAPSHOT_HEADER_LEN,
+    validate_snapshot_envelope, ColumnDef, ColumnUpdate, CompactRow, DataType, Operation, OwnerDef,
+    OwnerIdentity, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation,
+    SnapshotCompression, SnapshotEnvelopeHeader, TableSchema, Value, SNAPSHOT_HEADER_LEN,
 };
 use zemdb_storage::format::HEADER_SIZE;
 use zemdb_storage::snapshot::{decode_snapshot_envelope, encode_snapshot_envelope};
@@ -467,9 +467,20 @@ fn random_snapshot_envelopes_round_trip_long() {
 // A disk replica reopens under every later schema version
 // ---------------------------------------------------------------------------------------------
 
-/// A table as its id, its columns as (type, nullable, encrypted) and its key width: the key is
-/// its first columns. Columns are named `c0`, `c1`, ...
-type TableSpec = (u16, Vec<(DataType, bool, bool)>, usize);
+/// A table as its id, its columns as (type, nullable, encrypted), its key width (the key is its
+/// first columns), where its owner is and whether it is immutable. Columns are named `c0`,
+/// `c1`, ...
+type TableSpec = (u16, Vec<(DataType, bool, bool)>, usize, Owner, bool);
+
+/// Where a table's owner column is.
+#[derive(Debug, Clone, Copy)]
+enum Owner {
+    None,
+    /// The first column, a string of the key.
+    InKey,
+    /// A string column `owner` after the others.
+    OutsideKey,
+}
 
 fn data_type(rng: &mut Rng) -> DataType {
     *rng.pick(&[
@@ -489,35 +500,67 @@ fn table_specs(rng: &mut Rng) -> Vec<TableSpec> {
             let columns = (0..rng.between(1, 6))
                 .map(|_| (data_type(rng), rng.coin(), rng.coin()))
                 .collect();
-            (rng.below(6) as u16, columns, rng.between(1, 3))
+            let owner = *rng.pick(&[Owner::None, Owner::None, Owner::InKey, Owner::OutsideKey]);
+            let immutable = rng.chance(1, 4);
+            (
+                rng.below(6) as u16,
+                columns,
+                rng.between(1, 3),
+                owner,
+                immutable,
+            )
         })
         .collect()
 }
 
 /// The schema of `specs`, skipping a table whose id is taken. Key columns are neither nullable
-/// nor encrypted.
+/// nor encrypted, and neither is an owner column, which holds strings.
 fn build_schema(specs: &[TableSpec]) -> Schema {
     let mut tables = vec![];
     let mut ids = BTreeSet::new();
-    for (i, (id, columns, key_len)) in specs.iter().enumerate() {
+    for (i, (id, columns, key_len, owner, immutable)) in specs.iter().enumerate() {
         if !ids.insert(*id) {
             continue;
         }
         let key_len = (*key_len).min(columns.len());
-        let columns = columns
+        let mut columns: Vec<ColumnDef> = columns
             .iter()
             .enumerate()
             .map(|(c, (data_type, nullable, encrypted))| {
                 let in_key = c < key_len;
-                ColumnDef::new(format!("c{c}"), *data_type)
+                let data_type = match owner {
+                    Owner::InKey if c == 0 => DataType::String,
+                    _ => *data_type,
+                };
+                ColumnDef::new(format!("c{c}"), data_type)
                     .nullable(*nullable && !in_key)
                     .encrypted(*encrypted && !in_key)
             })
             .collect();
+        let owner = match owner {
+            Owner::None => None,
+            Owner::InKey => Some(OwnerDef::new("c0", OwnerIdentity::ClientId)),
+            Owner::OutsideKey => {
+                columns.push(ColumnDef::new("owner", DataType::String));
+                Some(OwnerDef::new("owner", OwnerIdentity::ClientId))
+            }
+        };
         let key = (0..key_len).map(|c| format!("c{c}")).collect();
-        tables.push(TableSchema::try_new(*id, format!("t{i}"), key, columns).unwrap());
+        let table = TableSchema::try_new(*id, format!("t{i}"), key, columns)
+            .and_then(|table| table.try_with_owner(owner))
+            .unwrap()
+            .with_immutable(*immutable);
+        tables.push(table);
     }
     Schema::try_from_tables(tables).unwrap()
+}
+
+/// The position of the owner column of `table` if it is outside the key.
+fn owner_outside_key(table: &TableSchema) -> Option<usize> {
+    let owner = table.owner()?.column();
+    (!table.primary_key().iter().any(|column| column == owner))
+        .then(|| table.column_index(owner))
+        .flatten()
 }
 
 fn value_of(data_type: DataType, seed: u64) -> Value {
@@ -551,7 +594,9 @@ fn cell(column: &ColumnDef, seed: u64) -> Value {
 
 /// One operation per (table, seed, kind) of `seeds`, valid under `schema`: inserts of whole
 /// rows or of rows cut short after their last non-null column, updates of some columns, and
-/// deletes. Keys repeat often, so later operations hit rows written by earlier ones.
+/// deletes. Keys repeat often, so later operations hit rows written by earlier ones. An
+/// immutable table only gets inserts; with the owner outside the key, updates and deletes
+/// declare one of two owners, which may not be the row's.
 fn operations_for(schema: &Schema, seeds: &[(u8, u64, u8)]) -> Vec<Operation> {
     let tables: Vec<&TableSchema> = schema.tables().collect();
     seeds
@@ -566,6 +611,9 @@ fn operations_for(schema: &Schema, seeds: &[(u8, u64, u8)]) -> Vec<Operation> {
             let pk = PrimaryKey::composite(key.clone());
             let columns = table.columns();
             let key_len = table.primary_key().len();
+            let owner = owner_outside_key(table);
+            let declared = Value::String(format!("s{}", seed % 2).into());
+            let kind = if table.is_immutable() { 0 } else { kind };
             match kind % 3 {
                 0 => {
                     let mut row: Vec<Value> = columns
@@ -582,25 +630,43 @@ fn operations_for(schema: &Schema, seeds: &[(u8, u64, u8)]) -> Vec<Operation> {
                     Operation::insert(table.table_id(), pk, CompactRow::new(row), seed)
                 }
                 1 => {
-                    let updates: Vec<ColumnUpdate> = columns
+                    let mut updates: Vec<ColumnUpdate> = columns
                         .iter()
                         .enumerate()
                         .skip(key_len)
-                        .filter(|(i, _)| (seed >> i) & 1 == 1)
+                        .filter(|(i, _)| (seed >> i) & 1 == 1 && Some(*i) != owner)
                         .map(|(i, column)| {
                             ColumnUpdate::new(i as u16, cell(column, seed ^ i as u64))
                         })
                         .collect();
+                    if let (Some(owner), false) = (owner, updates.is_empty()) {
+                        updates.push(ColumnUpdate::new(owner as u16, declared.clone()));
+                    }
                     if updates.is_empty() {
-                        Operation::delete(table.table_id(), pk, seed)
+                        delete(table, pk, owner, declared, seed)
                     } else {
                         Operation::update(table.table_id(), pk, updates, seed)
                     }
                 }
-                _ => Operation::delete(table.table_id(), pk, seed),
+                _ => delete(table, pk, owner, declared, seed),
             }
         })
         .collect()
+}
+
+/// A delete of `pk` from `table`, declaring `declared` as the owner if the table's owner is
+/// outside the key.
+fn delete(
+    table: &TableSchema,
+    pk: PrimaryKey,
+    owner: Option<usize>,
+    declared: Value,
+    seed: u64,
+) -> Operation {
+    match owner {
+        Some(_) => Operation::delete_with_owner(table.table_id(), pk, declared, seed),
+        None => Operation::delete(table.table_id(), pk, seed),
+    }
 }
 
 /// `v1` with a nullable column `added{k}` added to the table `table` for each (table, type,
@@ -674,6 +740,35 @@ fn a_disk_replica_reopens_under_every_later_schema_version_long() {
     check_evolution(0xE1_2002, 600);
 }
 
+/// The random schemas have owners inside and outside the key and immutable tables, and their
+/// random operations include deletes that declare an owner, so the evolution test replays the
+/// replicas' decisions on them.
+#[test]
+fn random_schemas_have_owners_and_immutable_tables() {
+    let (mut in_key, mut outside_key, mut immutable, mut owned_deletes) = (0, 0, 0, 0);
+    for_each_case(0xE1_2003, 40, |rng| {
+        let schema = build_schema(&table_specs(rng));
+        for table in schema.tables() {
+            match (table.owner(), owner_outside_key(table)) {
+                (Some(_), Some(_)) => outside_key += 1,
+                (Some(_), None) => in_key += 1,
+                _ => {}
+            }
+            immutable += usize::from(table.is_immutable());
+        }
+        let seeds: Vec<(u8, u64, u8)> = (0..30)
+            .map(|_| (rng.next_u64() as u8, rng.next_u64(), rng.next_u64() as u8))
+            .collect();
+        for op in operations_for(&schema, &seeds) {
+            schema.validate_operation(&op).unwrap();
+            if let zemdb_core::OperationKind::Delete { owner: Some(_) } = op.kind() {
+                owned_deletes += 1;
+            }
+        }
+    });
+    assert!(in_key > 0 && outside_key > 0 && immutable > 0 && owned_deletes > 0);
+}
+
 #[test]
 fn an_update_replayed_under_a_wider_schema_keeps_the_row() {
     // A row inserted and then updated under a table of two columns, replayed under the table
@@ -682,6 +777,8 @@ fn an_update_replayed_under_a_wider_schema_keeps_the_row() {
         0,
         vec![(DataType::Int, false, false), (DataType::Int, false, false)],
         1,
+        Owner::None,
+        false,
     )]);
     let seeds = [
         (0, 14_822_749_083_394_190_377, 150),

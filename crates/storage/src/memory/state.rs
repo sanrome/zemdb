@@ -4,12 +4,12 @@ use std::collections::HashMap;
 use std::fmt;
 use zemdb_core::{
     CompactRow, Operation, OperationKind, PrimaryKey, RoomId, Schema, SequenceNumber,
-    SequencedOperation, Value,
+    SequencedOperation, TableSchema, Value,
 };
 
 use crate::engine::RejectReason;
 use crate::error::StorageError;
-use crate::memory::index::TableIndexes;
+use crate::memory::index::{constraint_key, TableIndexes};
 
 /// Rows of one table, ordered by primary key.
 ///
@@ -158,9 +158,21 @@ pub(crate) fn validate_batch(
 /// Applies one operation to `data`, its rows and their indexes, or rejects it and changes
 /// nothing. The operation must already be validated against `schema`.
 ///
-/// The decision is taken before anything changes. An update of a row that does not exist is
-/// rejected (`MissingRow`); one of a row that does exist widens a row written under an older
-/// schema to the table's current width. A delete of a row that does not exist changes nothing.
+/// The decision is taken before anything changes, from the rows and indexes before the
+/// operation, the operation and the rules of `schema`. The first rule that fails gives the
+/// reason, in this order:
+/// - an update of a row that does not exist (`MissingRow`); a delete of one changes nothing and
+///   is not reported;
+/// - an insert of an existing key of an immutable table (`Duplicate`);
+/// - an existing row whose owner is not the one the operation declares (`NotOwner`);
+/// - for the row an insert or an update leaves, the `UNIQUE` constraints and then the foreign
+///   keys of its table, in declaration order (an update checks only those with a column among
+///   its deltas);
+/// - for a delete, the foreign keys that reference the row (`Restrict`), by id of the
+///   referencing table and in declaration order.
+///
+/// An update widens a row written under an older schema to the table's current width before
+/// its keys are computed.
 pub(crate) fn apply_operation(
     data: &mut RoomData,
     schema: &Schema,
@@ -168,15 +180,32 @@ pub(crate) fn apply_operation(
 ) -> Option<RejectReason> {
     let table_id = op.table_id();
     let table_schema = schema.get_table_by_id(table_id);
+    let old = data
+        .tables
+        .get(&table_id)
+        .and_then(|table| table.get(op.pk()));
+    match (op.kind(), old) {
+        (OperationKind::Update { .. }, None) => return Some(RejectReason::MissingRow),
+        (OperationKind::Delete { .. }, None) => return None,
+        _ => {}
+    }
+    if let Some(reason) = table_schema.and_then(|table| check_existing_row(table, &op, old)) {
+        return Some(reason);
+    }
+    let set_columns: Option<Vec<usize>> = match op.kind() {
+        OperationKind::Update { updates } => Some(
+            updates
+                .iter()
+                .map(|update| usize::from(update.column_idx()))
+                .collect(),
+        ),
+        _ => None,
+    };
     let (pk, kind) = op.into_pk_and_kind();
-    let old = data.tables.get(&table_id).and_then(|table| table.get(&pk));
     let row = match kind {
         OperationKind::Insert { row } => Some(row),
         OperationKind::Update { updates } => {
-            let Some(existing) = old else {
-                return Some(RejectReason::MissingRow);
-            };
-            let mut row = existing.clone();
+            let mut row = old.cloned().unwrap_or_default();
             let target_len = table_schema.map_or(0, |t| t.columns().len());
             for col_up in updates {
                 let idx = col_up.column_idx() as usize;
@@ -190,6 +219,15 @@ pub(crate) fn apply_operation(
         }
         OperationKind::Delete { .. } => None,
     };
+    if let Some(table) = table_schema {
+        let reason = match &row {
+            Some(row) => check_row(data, schema, table, &pk, row, set_columns.as_deref()),
+            None => check_references(data, schema, table_id, &pk),
+        };
+        if reason.is_some() {
+            return reason;
+        }
+    }
 
     if let (Some(table_schema), Some(indexes)) = (table_schema, data.indexes.get_mut(&table_id)) {
         indexes.update(table_schema, &pk, old, row.as_ref());
@@ -205,6 +243,94 @@ pub(crate) fn apply_operation(
         }
     }
     None
+}
+
+/// The rules on the row that `op` replaces, updates or deletes, `old`, if it exists: an
+/// immutable table takes each key once, and the row's owner must be the owner `op` declares.
+/// With the owner column in the primary key, the key `op` names already holds the row's owner,
+/// so only an owner outside the key can differ.
+fn check_existing_row(
+    table: &TableSchema,
+    op: &Operation,
+    old: Option<&CompactRow>,
+) -> Option<RejectReason> {
+    let old = old?;
+    if table.is_immutable() && op.is_insert() {
+        return Some(RejectReason::Duplicate);
+    }
+    let owner = table.owner_column_index()?;
+    (old.get(owner) != table.declared_owner(op)).then_some(RejectReason::NotOwner)
+}
+
+/// The `UNIQUE` constraints and foreign keys of `table` on `row`, the row with key `pk` that an
+/// insert or an update leaves. An update checks only the constraints with a column among
+/// `set_columns`, its deltas; an insert (`None`) checks them all. A key with a `NULL` is not
+/// checked, and a foreign key of the table to itself may reference the row itself.
+fn check_row(
+    data: &RoomData,
+    schema: &Schema,
+    table: &TableSchema,
+    pk: &PrimaryKey,
+    row: &CompactRow,
+    set_columns: Option<&[usize]>,
+) -> Option<RejectReason> {
+    // Every table of the schema has its indexes (`RoomData` builds them all); the foreign keys
+    // do not use them.
+    let indexes = data.indexes.get(&table.table_id());
+    let checked = |columns: &[usize]| {
+        set_columns.is_none_or(|set| columns.iter().any(|column| set.contains(column)))
+    };
+    let unique = table.unique_constraints().iter();
+    for (position, (constraint, columns)) in unique.zip(table.unique_column_indices()).enumerate() {
+        let Some(key) = constraint_key(row, columns).filter(|_| checked(columns)) else {
+            continue;
+        };
+        if indexes.is_some_and(|indexes| indexes.has_other_row(position, &key, pk)) {
+            return Some(RejectReason::Unique {
+                constraint: constraint.name().to_string(),
+            });
+        }
+    }
+    let foreign = table.foreign_keys().iter();
+    for (foreign_key, columns) in foreign.zip(table.foreign_key_column_indices()) {
+        let Some(key) = constraint_key(row, columns).filter(|_| checked(columns)) else {
+            continue;
+        };
+        let parent = schema.get_table_id(foreign_key.references());
+        if parent == Some(table.table_id()) && key == *pk {
+            continue;
+        }
+        let rows = parent.and_then(|parent| data.tables.get(&parent));
+        if !rows.is_some_and(|rows| rows.contains_key(&key)) {
+            return Some(RejectReason::ForeignKey {
+                constraint: foreign_key.name().to_string(),
+            });
+        }
+    }
+    None
+}
+
+/// The foreign keys through which another row references the row `pk` of the table
+/// `table_id`, which a delete would leave dangling: the first one, by id of the referencing
+/// table and in declaration order. The row itself does not count.
+fn check_references(
+    data: &RoomData,
+    schema: &Schema,
+    table_id: u16,
+    pk: &PrimaryKey,
+) -> Option<RejectReason> {
+    schema
+        .foreign_keys_referencing(table_id)
+        .find_map(|(child, position)| {
+            let indexes = data.indexes.get(&child.table_id())?;
+            let foreign_key = child.foreign_keys().get(position)?;
+            let except = (child.table_id() == table_id).then_some(pk);
+            indexes
+                .is_referenced(position, pk, except)
+                .then(|| RejectReason::Restrict {
+                    constraint: foreign_key.name().to_string(),
+                })
+        })
 }
 
 /// In-memory snapshot payload serialized by reference to avoid copying tables during snapshot creation.

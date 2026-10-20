@@ -118,7 +118,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-Y5** | Un commit rechazado no deja rastro | | Medio | ✅ |
 | **INV-Y6** | Los cursores solo avanzan por lo que el cliente confirmó | | Medio | ✅ |
 | **INV-Y7** | Un registro con cursor de otra encarnación nunca se acepta | | Medio | ✅ |
-| **INV-Y8** | Réplicas con el mismo prefijo convergen | ★ | Alto | ✅ (ampliada en la Fase 3.11: Lote 4) |
+| **INV-Y8** | Réplicas con el mismo prefijo convergen | ★ | Alto | ✅ (ampliada en la Fase 3.11) |
 | **INV-Y9** | La ventana de dedup es función del log | | Medio | ✅ (D94) |
 | **INV-R1** | La poda por cursores nunca borra lo que alguien necesita | ★ | Alto | ✅ |
 | **INV-R2** | El rango retenido es contiguo y su cola no retrocede | | Medio | ✅ |
@@ -131,7 +131,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-A2** | Nada se decodifica antes de autenticar, salvo lo acotado de `/register` | | Alto | ✅ |
 | **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio | ❌ Bajo (backlog) |
 | **INV-A4** | Ningún identificador produce rutas fuera de `data_dir` | ★ | Alto | ✅ |
-| **INV-A5** | Nadie escribe una fila ajena | ★ | Alto | 🆕 (Fase 3.11, Lote 4) |
+| **INV-A5** | Nadie escribe una fila ajena | ★ | Alto | 🆕 (Fase 3.11) |
 | **INV-B1** | La memoria por request está acotada | ★ | Alto | ✅ |
 | **INV-B2** | Nada se retiene sin plazo | | Medio | ✅ |
 | **INV-B3** | La memoria, el disco y los FDs del servidor están acotados por la configuración | | Medio | ✅ |
@@ -149,8 +149,8 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-W1** | Ninguna entrada hace entrar en pánico, abortar ni reservar de más | ★ | Alto | ✅ |
 | **INV-W2** | Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum | | Medio | ✅ (D92) |
 | **INV-C1** | Ninguna versión posterior del esquema cambia la decisión sobre una operación ya secuenciada | ★ | Alto | 🆕 (Fase 3.11, Lote 5) |
-| **INV-C2** | El estado de una réplica cumple las restricciones de su esquema | ★ | Alto | 🆕 (Fase 3.11, Lotes 4 y 5) |
-| **INV-C3** | Un rechazo no deja rastro, y los índices son función de las tablas | | Medio | 🆕 (Fase 3.11, Lote 4; los índices, Lote 3) |
+| **INV-C2** | El estado de una réplica cumple las restricciones de su esquema | ★ | Alto | 🆕 (Fase 3.11, Lote 5) |
+| **INV-C3** | Un rechazo no deja rastro, y los índices son función de las tablas | | Medio | 🆕 (Fase 3.11) |
 
 ---
 
@@ -228,7 +228,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 **Sostenida por.** §8 *CoW Compaction*, *Crash-Safe apply_snapshot*, *Crash-Safe Recovery of an Interrupted Compaction*; la absorción reemplaza `.wal.compacting` entero y nunca lo escribe en el lugar (D85). Los índices de las restricciones no se persisten: se reconstruyen desde el snapshot al abrir, antes del replay (Fase 3.11, §8 *Derived Constraint Indexes*).
 **Riesgo aceptado (D93).** El mismo de INV-S1: apagar el runtime con una tarea del storage en vuelo y reabrir la sala en el mismo proceso (§4).
 **Cómo intentar romperla.** Fail points en cada paso; crash durante la recuperación de un crash anterior; `.wal.compacting` dañado.
-**Automatizable.** Simulación: secuencia aleatoria de batches, compactaciones y snapshots con un crash aleatorio; oráculo = un `MemoryStorageEngine` con las mismas operaciones confirmadas.
+**Automatizable.** Simulación: secuencia aleatoria de batches, compactaciones y snapshots con un crash aleatorio; oráculo = el modelo de referencia de los tests del storage (sin código compartido con los motores) con las mismas operaciones confirmadas, sobre un esquema con restricciones.
 
 #### INV-S4 ★ · Abrir una sala nunca descarta datos
 **Enunciado.** `open_room` con un esquema que no cubre los datos de la sala falla con `SchemaMismatch` antes de modificar cualquier archivo que tenga datos de la sala (antes del chequeo puede crear el lock y un WAL o `.snap` vacíos, y borrar temporales `.snap.tmp.*` y `.wal.compacting.tmp`). Ninguna operación del WAL ni fila del snapshot se descarta en silencio.
@@ -292,7 +292,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-Y8 ★ · Réplicas con el mismo prefijo convergen
 **Enunciado.** Dos réplicas honestas que aplican el mismo prefijo del log, en cualquier combinación de "aplicar operaciones" y "restaurar un snapshot tomado en `S` y aplicar desde `S`", terminan con el mismo estado. "Mismo estado" quiere decir las mismas filas módulo los `Null` al final (D71): un `Update` ensancha la fila hasta el ancho del esquema con que se aplica, y `compact_into_row` completa con `Null`. Aplicar una operación es una función determinista del estado, la operación y las restricciones del esquema (upsert del `Insert`, merge por campo del `Update`, tombstone del `Delete`, y el rechazo de la operación que viola una restricción). Por eso las dos réplicas también toman la misma decisión sobre cada operación: aplicada, o rechazada con el mismo motivo (Fase 3.11, DR4).
-**Sostenida por.** `apply_operation` en storage, `Schema::validate_operation` (§4, §10.1); la verificación de restricciones (DR4).
+**Sostenida por.** `apply_operation` en storage, `Schema::validate_operation` (§4, §10.1); la verificación de restricciones (DR4): `apply_operation` decide con las filas y los índices de antes de la operación, la operación y las reglas del esquema, con búsquedas por `Ord`/`Eq` de `Value`, y la misma función decide en los dos motores y en el replay (§8 *Integrity Rules on the Replicas*). Lo contrasta un modelo de referencia que no comparte código con los motores.
 **Cómo intentar romperla.** `Update` sobre una fila inexistente o borrada; `Update` de una columna agregada después (filas cortas); snapshot de un motor aplicado en el otro; -0.0 y NaN en claves; operaciones que violan restricciones, en batches y en el replay del WAL.
 **Automatizable.** Log aleatorio; oráculo = aplicar todo desde cero contra snapshot en un punto aleatorio + resto, en los dos motores.
 **Fuera de alcance.** Un snapshot falso de un miembro hostil (DEF-81).
@@ -365,7 +365,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-A5 ★ · Nadie escribe una fila ajena
 **Enunciado.** En una tabla con dueño, toda operación secuenciada declara como dueño al cliente que la envió, y ninguna operación aplicada inserta, reemplaza, modifica ni borra una fila cuyo dueño es otro.
-**Sostenida por.** La verificación del dueño declarado en el commit, antes de secuenciar (DR10: `validate_operation` exige que la operación declare el dueño y `Schema::check_owner` lo compara byte a byte con el `ClientId` del token), la verificación de las réplicas sobre la fila existente (DR4, DR10) e INV-A1.
+**Sostenida por.** La verificación del dueño declarado en el commit, antes de secuenciar (DR10: `validate_operation` exige que la operación declare el dueño y `Schema::check_owner` lo compara byte a byte con el `ClientId` del token), la verificación de las réplicas sobre la fila existente (DR4, DR10: `apply_operation` rechaza con `NotOwner` un `Insert`, `Update` o `Delete` cuya fila existente es de otro dueño, y con `Duplicate` un segundo `Insert` de una clave inmutable) e INV-A1.
 **Cómo intentar romperla.** Un `Insert`, `Update` o `Delete` de B que declara a A como dueño; uno de B que se declara dueño sobre una fila de A, con el dueño dentro y fuera de la clave; un `Update` que intenta transferir la fila; un reintento deduplicado.
 **Fuera de alcance.** Un snapshot falso de un miembro hostil (DEF-81).
 
@@ -473,13 +473,13 @@ Las de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md): `UN
 
 #### INV-C2 ★ · El estado de una réplica cumple las restricciones de su esquema
 **Enunciado.** Después de cada `apply_batch`, de abrir una sala y de aplicar un snapshot, ninguna clave `UNIQUE` sin `NULL` se repite, toda clave foránea sin `NULL` tiene su fila padre y ninguna fila de una tabla inmutable fue reemplazada. Un snapshot (local o de otro peer) que no las cumple no se abre ni se instala.
-**Sostenida por.** La verificación al aplicar (DR4, DR11) y la de los snapshots (DR7).
+**Sostenida por.** La verificación al aplicar (DR4, DR11: `apply_operation`, en los dos motores y en el replay, §8 *Integrity Rules on the Replicas*) y la de los snapshots (DR7, Lote 5: hasta entonces, un snapshot que no las cumple se instala).
 **Cómo intentar romperla.** Violaciones concurrentes en los dos órdenes; un padre y su hijo en el mismo batch, en los dos órdenes; un snapshot con duplicados o con FK colgantes; una fila que se apunta a sí misma.
 **Automatizable.** Oráculo diferencial: un modelo de referencia que verifica recorriendo tablas, sin índices, contra los dos motores.
 
 #### INV-C3 · Un rechazo no deja rastro, y los índices son función de las tablas
 **Enunciado.** Una operación rechazada no cambia tablas ni índices y avanza `head_seq`: el estado queda igual que si se aplicara el log sin ella. En todo estado publicado, los índices de las restricciones son exactamente los que se construirían desde las tablas, en los dos motores.
-**Sostenida por.** Validar antes de mutar (`GEMINI.md`); índices derivados que se publican junto con las tablas (DR1, DR6).
+**Sostenida por.** Validar antes de mutar (`GEMINI.md`): `apply_operation` decide antes de tocar la fila y sus entradas de índice; índices derivados que se publican junto con las tablas (DR1, DR6).
 **Cómo intentar romperla.** Un rechazo en medio de un batch; un pánico después de escribir el WAL; reabrir, compactar y aplicar un snapshot con índices construidos.
 **Automatizable.** Después de batches aleatorios, comparar los índices con los reconstruidos desde las tablas.
 

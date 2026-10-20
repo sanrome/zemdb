@@ -1,6 +1,7 @@
 //! Tests of the constraint indexes, and the helpers that the tests of both engines share to check
 //! that the indexes of a room are always those its rows give: a schema with constraints, a random
-//! log with the report each of its batches must give, and the scenarios run on either engine.
+//! log with the report each of its batches must give (from the reference model of the
+//! integration tests), and the scenarios run on either engine.
 
 use super::*;
 use crate::engine::{ApplyReport, RejectReason};
@@ -8,14 +9,32 @@ use crate::memory::state::RoomData;
 use crate::{DiskStorageEngine, MemoryStorageEngine, StorageEngine, StorageError};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use zemdb_core::{
-    ColumnDef, ColumnUpdate, DataType, ForeignKey, Operation, OperationKind, RoomId, Schema,
-    SequenceNumber, SequencedOperation, UniqueConstraint, Value,
+    ColumnDef, DataType, ForeignKey, Operation, RoomId, Schema, SequenceNumber, SequencedOperation,
+    UniqueConstraint, Value,
 };
 
 /// The deterministic generator of the randomized tests, shared with the integration tests.
 #[path = "../../../tests/common/rng.rs"]
 mod rng;
 pub(crate) use rng::Rng;
+
+/// The reference model of a replica, shared with the integration tests. It shares no code with
+/// the engines, so it also gives the report each batch of a random log must give.
+#[path = "../../../tests/common/oracle.rs"]
+#[allow(dead_code)]
+pub(crate) mod oracle;
+
+/// The reason an engine gives for an operation the reference model rejected for `reason`.
+pub(crate) fn reject_reason(reason: oracle::Reason) -> RejectReason {
+    match reason {
+        oracle::Reason::MissingRow => RejectReason::MissingRow,
+        oracle::Reason::Duplicate => RejectReason::Duplicate,
+        oracle::Reason::NotOwner => RejectReason::NotOwner,
+        oracle::Reason::Unique(constraint) => RejectReason::Unique { constraint },
+        oracle::Reason::ForeignKey(constraint) => RejectReason::ForeignKey { constraint },
+        oracle::Reason::Restrict(constraint) => RejectReason::Restrict { constraint },
+    }
+}
 
 pub(crate) const PARENTS: u16 = 0;
 pub(crate) const CHILDREN: u16 = 1;
@@ -73,126 +92,43 @@ pub(crate) fn evolved_schema() -> Schema {
     schema
 }
 
-/// A value for `column`: `NULL` a quarter of the time if it is nullable, else one of a few
-/// integers or strings, or a float whose bits matter (both zeros and two NaNs).
-fn random_value(rng: &mut Rng, column: &ColumnDef) -> Value {
-    if column.is_nullable() && rng.chance(25) {
-        return Value::Null;
-    }
-    match column.data_type() {
-        DataType::Int => Value::Int(rng.below(4) as i64),
-        DataType::String => Value::String(format!("s{}", rng.below(3)).into()),
-        DataType::Float => Value::Float(match rng.below(5) {
-            0 => 0.0,
-            1 => -0.0,
-            2 => f64::NAN,
-            3 => f64::from_bits(f64::NAN.to_bits() | 1),
-            _ => 1.5,
-        }),
-        other => panic!("no random values of type {other:?}"),
-    }
-}
-
-/// An insert (of a row that may be short), an update of one or two columns, or a delete, of one
-/// of a few keys of a random table of `schema`.
-pub(crate) fn random_operation(rng: &mut Rng, schema: &Schema) -> Operation {
-    let tables: Vec<&TableSchema> = schema.tables().collect();
-    let table = tables[rng.below(tables.len() as u64) as usize];
-    let columns = table.columns();
-    let key_columns: Vec<usize> = table
-        .primary_key()
-        .iter()
-        .map(|name| table.column_index(name).unwrap())
-        .collect();
-    let key: Vec<Value> = key_columns
-        .iter()
-        .map(|_| Value::Int(rng.below(4) as i64))
-        .collect();
-    let pk = PrimaryKey::composite(key.clone());
-    let others: Vec<usize> = (0..columns.len())
-        .filter(|i| !key_columns.contains(i))
-        .collect();
-    match rng.below(10) {
-        0..=4 => {
-            let min_width = key_columns.iter().max().unwrap() + 1;
-            let width = min_width + rng.below((columns.len() - min_width + 1) as u64) as usize;
-            let values = (0..width)
-                .map(|i| match key_columns.iter().position(|&k| k == i) {
-                    Some(k) => key[k].clone(),
-                    None => random_value(rng, &columns[i]),
-                })
-                .collect();
-            Operation::insert(table.table_id(), pk, CompactRow::new(values), 0)
-        }
-        5..=7 => {
-            let mut chosen = BTreeSet::new();
-            for _ in 0..=rng.below(2) {
-                chosen.insert(others[rng.below(others.len() as u64) as usize]);
-            }
-            let updates = chosen
-                .into_iter()
-                .map(|i| ColumnUpdate::new(i as u16, random_value(rng, &columns[i])))
-                .collect();
-            Operation::update(table.table_id(), pk, updates, 0)
-        }
-        _ => Operation::delete(table.table_id(), pk, 0),
-    }
-}
-
-/// A random log of batches over a schema, with the report each one must give. It keeps which
-/// rows exist: an update of a row that does not is the only operation rejected.
+/// A random log of batches over a schema, with the report each one must give, which the
+/// reference model decides.
 pub(crate) struct RandomLog {
     rng: Rng,
-    schema: Schema,
-    head: u64,
-    rows: BTreeSet<(u16, PrimaryKey)>,
+    model: oracle::Oracle,
 }
 
 impl RandomLog {
     pub(crate) fn new(seed: u64, schema: Schema) -> Self {
         Self {
             rng: Rng::new(seed),
-            schema,
-            head: 0,
-            rows: BTreeSet::new(),
+            model: oracle::Oracle::new(schema),
         }
     }
 
     /// Writes the next batches under `schema`, which must be a later version of the current one.
     pub(crate) fn evolve(&mut self, schema: Schema) {
-        self.schema = schema;
+        self.model.evolve(schema);
     }
 
     pub(crate) fn head(&self) -> u64 {
-        self.head
+        self.model.head()
     }
 
     /// The next batch, of one to eight operations, and the report it must give.
     pub(crate) fn next_batch(&mut self) -> (Vec<SequencedOperation>, ApplyReport) {
-        let mut ops = Vec::new();
-        let mut rejected = Vec::new();
-        for _ in 0..=self.rng.below(8) {
-            self.head += 1;
-            let op = random_operation(&mut self.rng, &self.schema);
-            let row = (op.table_id(), op.pk().clone());
-            match op.kind() {
-                OperationKind::Insert { .. } => {
-                    self.rows.insert(row);
-                }
-                OperationKind::Update { .. } if !self.rows.contains(&row) => {
-                    rejected.push((SequenceNumber::from(self.head), RejectReason::MissingRow));
-                }
-                OperationKind::Update { .. } => {}
-                OperationKind::Delete { .. } => {
-                    self.rows.remove(&row);
-                }
-            }
-            ops.push(SequencedOperation::new(self.head, op));
-        }
-        (
-            ops,
-            ApplyReport::new(SequenceNumber::from(self.head), rejected),
-        )
+        let len = 1 + self.rng.below(8);
+        let first = self.model.head() + 1;
+        let ops = oracle::random_log(&mut self.rng, self.model.schema(), first, len);
+        let rejected = self
+            .model
+            .apply_batch(&ops)
+            .into_iter()
+            .map(|(seq, reason)| (SequenceNumber::from(seq), reject_reason(reason)))
+            .collect();
+        let head = SequenceNumber::from(self.model.head());
+        (ops, ApplyReport::new(head, rejected))
     }
 }
 

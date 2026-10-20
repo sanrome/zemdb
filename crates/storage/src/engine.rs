@@ -38,6 +38,16 @@ pub type RowStream<'a> =
 pub enum RejectReason {
     /// An `UPDATE` of a row that does not exist: it was never inserted, or it was deleted.
     MissingRow,
+    /// An `INSERT` into an immutable table of a primary key that already has a row.
+    Duplicate,
+    /// An operation on an existing row whose owner is not the owner the operation declares.
+    NotOwner,
+    /// The row would have the same key for this `UNIQUE` constraint as another row.
+    Unique { constraint: String },
+    /// The row would reference, through this foreign key, a row that does not exist.
+    ForeignKey { constraint: String },
+    /// A `DELETE` of a row that other rows reference through this foreign key.
+    Restrict { constraint: String },
 }
 
 /// What [`StorageEngine::apply_batch`] did with a batch: the room's head sequence after it, and
@@ -104,9 +114,23 @@ pub trait StorageEngine: EngineConcurrencyBounds {
     /// An operation that passes both checks is either applied or rejected: a rejected one
     /// changes nothing, but it is consumed, so the head sequence moves past it, and the report
     /// lists it with its reason. Each operation is decided on the state the previous one left,
-    /// including those of the same batch. An `UPDATE` of a row that does not exist is rejected
-    /// as [`RejectReason::MissingRow`]; a `DELETE` of one changes nothing and is not reported.
-    /// Reopening a room replays its operations with the same decisions, and discards them.
+    /// including those of the same batch, and only from the rows, the operation and the rules
+    /// of the schema, so every replica that applies the same log decides the same:
+    /// - an `UPDATE` of a row that does not exist is rejected as [`RejectReason::MissingRow`];
+    ///   a `DELETE` of one changes nothing and is not reported;
+    /// - an `INSERT` of an existing key of an immutable table, as [`RejectReason::Duplicate`];
+    /// - an operation on an existing row whose owner is not the owner it declares, as
+    ///   [`RejectReason::NotOwner`];
+    /// - a row with the same key as another row for a `UNIQUE` constraint, or whose key for a
+    ///   foreign key has no referenced row, as [`RejectReason::Unique`] or
+    ///   [`RejectReason::ForeignKey`], and a `DELETE` of a row that other rows reference, as
+    ///   [`RejectReason::Restrict`].
+    ///
+    /// A key with a `NULL` is not checked, an `UPDATE` checks only the constraints with a column
+    /// among its deltas, and a row may reference itself. When several rules fail, the reason is
+    /// the first one in the order above, `UNIQUE` constraints before foreign keys, each in
+    /// declaration order (for a `DELETE`, the referencing tables by id). Reopening a room
+    /// replays its operations with the same decisions, and discards them.
     async fn apply_batch(
         &self,
         room_id: &RoomId,

@@ -1,5 +1,6 @@
-//! Randomized simulations of the disk engine, checked against a `MemoryStorageEngine` that
-//! applies the same confirmed changes.
+//! Randomized simulations of the disk engine, checked against the reference model of a replica
+//! (which shares no code with the engines) applied to the same confirmed changes. The room's
+//! schema has integrity constraints, owners and immutable tables, so batches reject operations.
 //!
 //! A scenario applies random batches (some with a sequence gap or an unknown table), compactions
 //! (some failing at a fail point), snapshots ahead of, at or behind the room, and reopens. The
@@ -17,6 +18,7 @@ use super::support::{engine_at, file_contents, Rng};
 use super::support::{open_when_unlocked, poll_then_drop};
 use crate::disk::compactor::compacting_wal_path;
 use crate::fail_point::{self, CrashAction};
+use crate::memory::index::tests::oracle::{self, Oracle};
 use crate::{DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, ScanOptions};
 use crate::{StorageEngine, StorageError};
 use futures::StreamExt;
@@ -61,11 +63,14 @@ fn assert_no_failures(failures: &[String], runs: usize) {
 // ---------------------------------------------------------------------------------------------
 // The model
 
-const USERS: u16 = 0;
-const ITEMS: u16 = 1;
+const USERS: u16 = 8;
+const ITEMS: u16 = 9;
+/// A table id that no table of [`schema`] has.
+const UNKNOWN_TABLE: u16 = 99;
 
-/// `users`, keyed by an integer, with a name; `items`, keyed by an integer, with bytes that
-/// sometimes hold a complete WAL frame, as any client can write.
+/// The tables of the reference model's schema, with their constraints, owners and immutable
+/// tables, and two more: `users`, keyed by an integer, with a name; `items`, keyed by an
+/// integer, with bytes that sometimes hold a complete WAL frame, as any client can write.
 fn schema() -> Schema {
     let users = TableSchema::builder("users")
         .table_id(USERS)
@@ -75,7 +80,11 @@ fn schema() -> Schema {
         .table_id(ITEMS)
         .primary_key("id", DataType::Int)
         .column("data", DataType::Bytes);
-    Schema::builder().table(users).table(items).build()
+    let mut schema = oracle::schema();
+    for table in [users, items] {
+        schema.insert_table(table.build().unwrap()).unwrap();
+    }
+    schema
 }
 
 fn room() -> RoomId {
@@ -86,8 +95,8 @@ fn room() -> RoomId {
 #[derive(Clone)]
 enum Event {
     Batch(Vec<SequencedOperation>),
-    /// A snapshot and its head.
-    Snapshot(Vec<u8>, u64),
+    /// A snapshot, its head, and the reference model of the room it holds.
+    Snapshot(Vec<u8>, u64, Box<Oracle>),
 }
 
 /// `events` followed by `event`.
@@ -100,20 +109,33 @@ fn with(events: &[Event], event: Event) -> Vec<Event> {
 /// The head of the room and every row of its tables, in order.
 type Dump = (u64, Vec<String>);
 
-async fn dump<E: StorageEngine>(engine: &E) -> Dump {
-    let head = engine.get_head_seq(&room()).await.unwrap().get();
-    let mut rows = Vec::new();
-    for table in [USERS, ITEMS] {
+/// Every row of `rows` as a line `table:key=row`, floats as bits.
+fn lines(rows: &oracle::Rows) -> Vec<String> {
+    oracle::dump(rows)
+        .into_iter()
+        .map(|(table, key, row)| format!("{table}:{}={}", key.join(","), row.join(",")))
+        .collect()
+}
+
+/// The rows of `tables` in the room of `engine`.
+async fn rows_of<E: StorageEngine>(engine: &E, tables: impl Iterator<Item = u16>) -> oracle::Rows {
+    let mut rows = oracle::Rows::new();
+    for table in tables {
         let mut scan = engine
             .scan_by_id(&room(), table, ScanOptions::default())
             .await
             .unwrap();
         while let Some(item) = scan.next().await {
             let (pk, row) = item.unwrap();
-            rows.push(format!("{table}:{pk:?}={row:?}"));
+            rows.entry(table).or_default().insert(pk, row);
         }
     }
-    (head, rows)
+    rows
+}
+
+async fn dump<E: StorageEngine>(engine: &E) -> Dump {
+    let head = engine.get_head_seq(&room()).await.unwrap().get();
+    (head, lines(&rows_of(engine, schema().table_ids()).await))
 }
 
 /// A memory engine whose room holds `events`.
@@ -125,7 +147,7 @@ async fn oracle_engine(events: &[Event]) -> MemoryStorageEngine {
             Event::Batch(ops) => {
                 engine.apply_batch(&room(), ops.clone()).await.unwrap();
             }
-            Event::Snapshot(bytes, head) => {
+            Event::Snapshot(bytes, head, _) => {
                 let (bytes, head) = (bytes.clone().into(), SequenceNumber::from(*head));
                 engine
                     .apply_snapshot(&room(), schema(), bytes, head)
@@ -137,16 +159,31 @@ async fn oracle_engine(events: &[Event]) -> MemoryStorageEngine {
     engine
 }
 
-/// The room after `events`.
+/// The reference model of the room after `events`.
+fn model(events: &[Event]) -> Oracle {
+    let mut model = Oracle::new(schema());
+    for event in events {
+        match event {
+            Event::Batch(ops) => {
+                model.apply_batch(ops);
+            }
+            Event::Snapshot(_, _, snapshot) => model = (**snapshot).clone(),
+        }
+    }
+    model
+}
+
+/// The room after `events`, as the reference model holds it.
 async fn oracle(events: &[Event]) -> Dump {
-    dump(&oracle_engine(events).await).await
+    let model = model(events);
+    (model.head(), lines(model.rows()))
 }
 
 /// The head of the room after `events`.
 fn head_of(events: &[Event]) -> u64 {
     events.iter().fold(0, |head, event| match event {
         Event::Batch(ops) => ops.last().map_or(head, |op| op.seq.get()),
-        Event::Snapshot(_, seq) => *seq,
+        Event::Snapshot(_, seq, _) => *seq,
     })
 }
 
@@ -175,8 +212,12 @@ fn random_value(rng: &mut Rng, table: u16) -> Value {
     }
 }
 
-/// An insert, update or delete of one of a few keys of either table, at `seq`.
+/// An insert, update or delete of one of a few keys of `users` or `items`, or a random
+/// operation of the reference model's tables, at `seq`.
 fn random_op(rng: &mut Rng, seq: u64) -> SequencedOperation {
+    if rng.chance(50) {
+        return SequencedOperation::new(seq, oracle::random_operation(rng, &schema()));
+    }
     let table = if rng.chance(50) { USERS } else { ITEMS };
     let key = rng.below(12) as i64;
     let pk = PrimaryKey::single(key);
@@ -199,16 +240,24 @@ fn random_batch(rng: &mut Rng, head: u64) -> Vec<SequencedOperation> {
     (0..len).map(|i| random_op(rng, head + 1 + i)).collect()
 }
 
-/// A snapshot of the room after `events` and `extra` more random batches, and its head.
-async fn snapshot_ahead(rng: &mut Rng, events: &[Event], extra: u64) -> (Vec<u8>, u64) {
+/// A snapshot of the room after `events` and `extra` more random batches, its head, and the
+/// reference model of the room it holds.
+async fn snapshot_ahead(
+    rng: &mut Rng,
+    events: &[Event],
+    extra: u64,
+) -> (Vec<u8>, u64, Box<Oracle>) {
     let engine = oracle_engine(events).await;
+    let mut model = model(events);
     let mut head = head_of(events);
     for _ in 0..extra {
         let batch = random_batch(rng, head);
         head = batch.last().unwrap().seq.get();
+        model.apply_batch(&batch);
         engine.apply_batch(&room(), batch).await.unwrap();
     }
-    (engine.create_snapshot(&room()).await.unwrap(), head)
+    let bytes = engine.create_snapshot(&room()).await.unwrap();
+    (bytes, head, Box::new(model))
 }
 
 /// One step of a scenario.
@@ -222,8 +271,8 @@ enum Step {
     Compact,
     /// A compaction that fails at this fail point.
     FailedCompact(&'static str),
-    /// A snapshot ahead of the room, and its head.
-    SnapshotAhead(Vec<u8>, u64),
+    /// A snapshot ahead of the room, its head, and the reference model of the room it holds.
+    SnapshotAhead(Vec<u8>, u64, Box<Oracle>),
     /// A snapshot of a prefix of the confirmed changes: at the room's head it changes nothing,
     /// behind it it is `SnapshotBehind`.
     SnapshotNotAhead(Vec<u8>, u64),
@@ -245,7 +294,7 @@ impl Step {
             Step::InvalidBatch(_) => "invalid batch".into(),
             Step::Compact => "compaction".into(),
             Step::FailedCompact(point) => format!("compaction failing at {point}"),
-            Step::SnapshotAhead(_, seq) => format!("snapshot at {seq}"),
+            Step::SnapshotAhead(_, seq, _) => format!("snapshot at {seq}"),
             Step::SnapshotNotAhead(_, seq) => format!("snapshot not ahead at {seq}"),
             Step::SnapshotWrongHead(_, seq) => format!("snapshot at {seq} with a wrong head"),
             Step::Reopen => "reopen".into(),
@@ -283,7 +332,7 @@ async fn random_step(rng: &mut Rng, events: &[Event]) -> Step {
     } else if roll < 57 {
         let mut batch = random_batch(rng, head);
         let last = batch.last_mut().unwrap();
-        let unknown_table = Operation::delete(9, PrimaryKey::single(1i64), 1);
+        let unknown_table = Operation::delete(UNKNOWN_TABLE, PrimaryKey::single(1i64), 1);
         *last = SequencedOperation::new(last.seq.get(), unknown_table);
         Step::InvalidBatch(batch)
     } else if roll < 66 {
@@ -292,15 +341,15 @@ async fn random_step(rng: &mut Rng, events: &[Event]) -> Step {
         Step::FailedCompact(COMPACTION_FAILURES[rng.below(5) as usize])
     } else if roll < 84 {
         let extra = 1 + rng.below(3);
-        let (bytes, seq) = snapshot_ahead(rng, events, extra).await;
-        Step::SnapshotAhead(bytes, seq)
+        let (bytes, seq, model) = snapshot_ahead(rng, events, extra).await;
+        Step::SnapshotAhead(bytes, seq, model)
     } else if roll < 88 {
         let prefix = rng.below(events.len() as u64 + 1) as usize;
-        let (bytes, seq) = snapshot_ahead(rng, &events[..prefix], 0).await;
+        let (bytes, seq, _) = snapshot_ahead(rng, &events[..prefix], 0).await;
         Step::SnapshotNotAhead(bytes, seq)
     } else if roll < 90 {
         let extra = 1 + rng.below(3);
-        let (bytes, seq) = snapshot_ahead(rng, events, extra).await;
+        let (bytes, seq, _) = snapshot_ahead(rng, events, extra).await;
         Step::SnapshotWrongHead(bytes, seq)
     } else {
         Step::Reopen
@@ -332,7 +381,7 @@ async fn run_step(
                 result?;
                 return Ok(0);
             }
-            Step::SnapshotAhead(bytes, seq) | Step::SnapshotNotAhead(bytes, seq) => {
+            Step::SnapshotAhead(bytes, seq, _) | Step::SnapshotNotAhead(bytes, seq) => {
                 let head = SequenceNumber::from(seq);
                 engine
                     .apply_snapshot(&room, schema(), bytes.into(), head)
@@ -362,8 +411,8 @@ fn check_outcome(
         (Step::Batch(ops), Ok(new_head)) if *new_head == ops.last().unwrap().seq.get() => {
             Ok(Some(Event::Batch(ops.clone())))
         }
-        (Step::SnapshotAhead(bytes, seq), Ok(new_head)) if new_head == seq => {
-            Ok(Some(Event::Snapshot(bytes.clone(), *seq)))
+        (Step::SnapshotAhead(bytes, seq, model), Ok(new_head)) if new_head == seq => {
+            Ok(Some(Event::Snapshot(bytes.clone(), *seq, model.clone())))
         }
         (Step::Compact, Ok(_))
         | (Step::FailedCompact(_), Err(_))
@@ -732,8 +781,8 @@ async fn run_with_failure(
                     let after = with(&events, Event::Batch(ops.clone()));
                     Some(vec![events.clone(), after])
                 }
-                Step::SnapshotAhead(bytes, seq) => {
-                    let after = with(&events, Event::Snapshot(bytes.clone(), *seq));
+                Step::SnapshotAhead(bytes, seq, model) => {
+                    let after = with(&events, Event::Snapshot(bytes.clone(), *seq, model.clone()));
                     Some(vec![events.clone(), after])
                 }
                 Step::Compact | Step::FailedCompact(_) => {
@@ -835,8 +884,8 @@ async fn readers_see_a_prefix(seeds: Range<u64>, steps: usize) {
         for _ in 0..steps {
             let event = if rng.chance(8) {
                 let extra = 1 + rng.below(3);
-                let (bytes, seq) = snapshot_ahead(&mut rng, &events, extra).await;
-                Event::Snapshot(bytes, seq)
+                let (bytes, seq, model) = snapshot_ahead(&mut rng, &events, extra).await;
+                Event::Snapshot(bytes, seq, model)
             } else {
                 Event::Batch(random_batch(&mut rng, head_of(&events)))
             };
@@ -872,12 +921,13 @@ async fn readers_see_a_prefix(seeds: Range<u64>, steps: usize) {
                         .scan_by_id(&room(), USERS, ScanOptions::default())
                         .await
                         .unwrap();
-                    let mut rows = Vec::new();
+                    let mut users = oracle::Rows::new();
                     while let Some(item) = scan.next().await {
                         let (pk, row) = item.unwrap();
-                        rows.push(format!("{USERS}:{pk:?}={row:?}"));
+                        users.entry(USERS).or_default().insert(pk, row);
                         tokio::task::yield_now().await;
                     }
+                    let rows = lines(&users);
                     last = (last..prefixes.len())
                         .find(|&len| prefixes[len] == rows)
                         .ok_or_else(|| format!("a scan matches no prefix of {last} or more"))?;
@@ -901,7 +951,7 @@ async fn readers_see_a_prefix(seeds: Range<u64>, steps: usize) {
                 Event::Batch(ops) => {
                     engine.apply_batch(&room(), ops.clone()).await.unwrap();
                 }
-                Event::Snapshot(bytes, seq) => {
+                Event::Snapshot(bytes, seq, _) => {
                     let (bytes, head) = (bytes.clone().into(), SequenceNumber::from(*seq));
                     engine
                         .apply_snapshot(&room(), schema(), bytes, head)
@@ -1211,6 +1261,7 @@ enum DropStep {
     DroppedSnapshot {
         bytes: Vec<u8>,
         head: u64,
+        model: Box<Oracle>,
         racing: Vec<SequencedOperation>,
         k: usize,
         follow: Follow,
@@ -1274,7 +1325,7 @@ async fn random_drop_step(rng: &mut Rng, events: &[Event]) -> DropStep {
         let racing = random_batch(rng, head);
         let base = with(events, Event::Batch(racing.clone()));
         let extra = rng.below(3);
-        let (bytes, head) = snapshot_ahead(rng, &base, extra).await;
+        let (bytes, head, model) = snapshot_ahead(rng, &base, extra).await;
         let follow = random_follow(
             rng,
             &[
@@ -1289,6 +1340,7 @@ async fn random_drop_step(rng: &mut Rng, events: &[Event]) -> DropStep {
         DropStep::DroppedSnapshot {
             bytes,
             head,
+            model,
             racing,
             k: rng.below(10) as usize,
             follow,
@@ -1349,7 +1401,7 @@ async fn open_retrying(engine: &DiskStorageEngine) -> Result<(), String> {
 #[cfg(unix)]
 async fn read_anything(engine: &DiskStorageEngine) {
     let _ = engine.get_head_seq(&room()).await;
-    for table in [USERS, ITEMS] {
+    for table in schema().table_ids() {
         if let Ok(mut scan) = engine
             .scan_by_id(&room(), table, ScanOptions::default())
             .await
@@ -1534,6 +1586,7 @@ async fn run_dropped_scenario(seed: u64, steps: usize) -> Result<(), String> {
             DropStep::DroppedSnapshot {
                 bytes,
                 head,
+                model,
                 racing,
                 k,
                 follow,
@@ -1547,7 +1600,10 @@ async fn run_dropped_scenario(seed: u64, steps: usize) -> Result<(), String> {
                 );
                 let done = poll_then_drop(apply, *k).await;
                 let with_racing = with(&before, Event::Batch(racing.clone()));
-                let with_snapshot = with(&with_racing, Event::Snapshot(bytes.clone(), *head));
+                let with_snapshot = with(
+                    &with_racing,
+                    Event::Snapshot(bytes.clone(), *head, model.clone()),
+                );
                 let raced = run_follow(&mut engine, &data, *follow, racing)
                     .await
                     .map_err(fail)?;

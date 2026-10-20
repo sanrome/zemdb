@@ -1,7 +1,7 @@
 //! Indexes of the `UNIQUE` constraints and foreign keys of a room's tables, derived from their
 //! rows.
 
-use zemdb_core::{CompactRow, PrimaryKey, TableSchema};
+use zemdb_core::{CompactRow, PrimaryKey, TableSchema, Value};
 
 use crate::memory::Table;
 
@@ -74,10 +74,47 @@ impl TableIndexes {
     }
 }
 
+impl TableIndexes {
+    /// Whether a row other than `pk` has `key` for the `UNIQUE` constraint at `position`, in
+    /// declaration order.
+    pub(crate) fn has_other_row(&self, position: usize, key: &PrimaryKey, pk: &PrimaryKey) -> bool {
+        self.unique
+            .get(position)
+            .is_some_and(|index| rows_with_key(index, key).any(|other| other != pk))
+    }
+
+    /// Whether a row other than `except` references `key` through the foreign key at
+    /// `position`, in declaration order.
+    pub(crate) fn is_referenced(
+        &self,
+        position: usize,
+        key: &PrimaryKey,
+        except: Option<&PrimaryKey>,
+    ) -> bool {
+        self.foreign_keys
+            .get(position)
+            .is_some_and(|index| rows_with_key(index, key).any(|other| Some(other) != except))
+    }
+}
+
+/// The primary keys of the rows whose key in `index` is `key`, in order.
+fn rows_with_key<'a>(
+    index: &'a ConstraintIndex,
+    key: &'a PrimaryKey,
+) -> impl Iterator<Item = &'a PrimaryKey> + 'a {
+    // No primary key is smaller than the empty one, so the range starts at the first entry of
+    // `key`.
+    let first = (key.clone(), PrimaryKey::composite(Vec::<Value>::new()));
+    index
+        .range(first..)
+        .take_while(move |(entry, _)| entry == key)
+        .map(|(_, pk)| pk)
+}
+
 /// The key of a constraint over the columns at `columns` in `row`, or `None` if any of its
 /// values is `NULL`. A column missing from a short row, written before the column was added,
 /// reads `NULL`.
-fn constraint_key(row: &CompactRow, columns: &[usize]) -> Option<PrimaryKey> {
+pub(crate) fn constraint_key(row: &CompactRow, columns: &[usize]) -> Option<PrimaryKey> {
     let value = |&column: &usize| row.get(column).filter(|value| !value.is_null());
     columns
         .iter()

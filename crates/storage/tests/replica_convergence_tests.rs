@@ -1,17 +1,22 @@
 //! Replicas that apply the same prefix of the log converge, bit for bit, whether they apply every
 //! operation or restore a snapshot taken at any point of it, by either engine, and apply the
-//! rest; a disk replica holds the same after a compaction and a reopen.
+//! rest; a disk replica holds the same after a compaction and a reopen. With integrity
+//! constraints, they also reject the same operations for the same reasons, as the reference
+//! model does.
 
 mod common;
 
+use common::oracle::{self, Oracle};
 use common::rng::Rng;
+use common::{reject_reasons, room_rows};
 use futures::StreamExt;
 use zemdb_core::{
     ColumnUpdate, CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequenceNumber,
     SequencedOperation, TableSchema, Value,
 };
 use zemdb_storage::{
-    DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, ScanOptions, StorageEngine,
+    DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, RejectReason, ScanOptions,
+    StorageEngine,
 };
 
 const ITEMS: u16 = 0;
@@ -128,20 +133,37 @@ fn random_note_op(rng: &mut Rng) -> Operation {
     }
 }
 
-/// A value with its floats spelled as bits, so that 0.0 and -0.0, or two NaNs, differ.
-fn bits(value: &Value) -> String {
-    match value {
-        Value::Float(f) => format!("F{:016x}", f.to_bits()),
-        other => format!("{other:?}"),
-    }
+/// A random log of 20 to 79 operations on `items` and `notes`.
+fn random_log(rng: &mut Rng) -> Vec<SequencedOperation> {
+    let len = 20 + rng.below(60);
+    (1..=len)
+        .map(|seq| {
+            let op = if rng.below(2) == 0 {
+                random_item_op(rng)
+            } else {
+                random_note_op(rng)
+            };
+            SequencedOperation::new(seq, op)
+        })
+        .collect()
 }
 
-/// Every row of both tables, in order, as `(table, key, row)`.
+/// A random log of 20 to 79 operations under the reference model's schema with constraints,
+/// owners and immutable tables.
+fn random_constrained_log(rng: &mut Rng) -> Vec<SequencedOperation> {
+    let len = 20 + rng.below(60);
+    oracle::random_log(rng, &oracle::schema(), 1, len)
+}
+
+use oracle::bits;
+
+/// Every row of every table of `schema`, in order, as `(table, key, row)`, keys included bit
+/// for bit.
 type Dump = Vec<(u16, Vec<String>, Vec<String>)>;
 
-async fn dump(engine: &dyn StorageEngine, room: &RoomId) -> Dump {
+async fn dump(engine: &dyn StorageEngine, room: &RoomId, schema: &Schema) -> Dump {
     let mut rows = Vec::new();
-    for table in [ITEMS, NOTES] {
+    for table in schema.table_ids() {
         let mut scan = engine
             .scan_by_id(room, table, ScanOptions::new())
             .await
@@ -158,20 +180,23 @@ async fn dump(engine: &dyn StorageEngine, room: &RoomId) -> Dump {
     rows
 }
 
-/// Applies `ops` in batches of one to five operations.
+/// Applies `ops` in batches of one to five operations, and returns the operations it rejected.
 async fn apply_in_batches(
     engine: &dyn StorageEngine,
     room: &RoomId,
     ops: &[SequencedOperation],
     rng: &mut Rng,
-) {
+) -> Vec<(SequenceNumber, RejectReason)> {
+    let mut rejected = Vec::new();
     let mut start = 0;
     while start < ops.len() {
         let len = (1 + rng.below(5) as usize).min(ops.len() - start);
         let batch = ops[start..start + len].to_vec();
-        engine.apply_batch(room, batch).await.unwrap();
+        let report = engine.apply_batch(room, batch).await.unwrap();
+        rejected.extend_from_slice(report.rejected());
         start += len;
     }
+    rejected
 }
 
 /// A disk engine in `dir` that compacts only when asked to.
@@ -179,50 +204,68 @@ fn disk(dir: &std::path::Path) -> DiskStorageEngine {
     DiskStorageEngine::new(DiskStorageOptions::new(dir).auto_compact(false)).unwrap()
 }
 
-/// For each of `seeds`, a random log of 20 to 79 operations, applied whole by a memory engine,
-/// is the reference. A disk engine applies it with a compaction halfway and must hold the same,
-/// before and after a reopen. Then each engine applies a prefix of random length and takes a
-/// snapshot, which each engine restores before applying the rest of the log: every replica must
-/// hold the same, and a disk replica again after a reopen.
-async fn replicas_converge(seeds: std::ops::Range<u64>) {
+/// For each of `seeds`, a random log from `make_log` under `schema`, applied whole by a memory
+/// engine, is the reference; the reference model must reject the same operations for the same
+/// reasons and hold the same rows. A disk engine applies it with a compaction halfway and must
+/// hold the same and reject the same, before and after a reopen. Then each engine applies a
+/// prefix of random length and takes a snapshot, which each engine restores before applying the
+/// rest of the log: every replica must hold the same, reject the same operations of the rest,
+/// and a disk replica hold the same again after a reopen.
+async fn replicas_converge(
+    seeds: std::ops::Range<u64>,
+    schema: fn() -> Schema,
+    make_log: fn(&mut Rng) -> Vec<SequencedOperation>,
+) {
     let room = RoomId::new("convergence").unwrap();
     for seed in seeds {
         let mut rng = Rng::new(seed.wrapping_mul(7919) + 3);
-        let len = 20 + rng.below(60);
-        let log: Vec<SequencedOperation> = (1..=len)
-            .map(|seq| {
-                let op = if rng.below(2) == 0 {
-                    random_item_op(&mut rng)
-                } else {
-                    random_note_op(&mut rng)
-                };
-                SequencedOperation::new(seq, op)
-            })
-            .collect();
+        let log = make_log(&mut rng);
+        let len = log.len() as u64;
         for op in &log {
             schema().validate_operation(&op.op).unwrap();
         }
 
         let reference_engine = MemoryStorageEngine::new();
         reference_engine.open_room(&room, schema()).await.unwrap();
-        apply_in_batches(&reference_engine, &room, &log, &mut rng).await;
-        let reference = dump(&reference_engine, &room).await;
+        let rejected = apply_in_batches(&reference_engine, &room, &log, &mut rng).await;
+        let reference = dump(&reference_engine, &room, &schema()).await;
+        let mut model = Oracle::new(schema());
+        assert_eq!(
+            rejected,
+            reject_reasons(model.apply_batch(&log)),
+            "seed {seed}: model"
+        );
+        assert_eq!(
+            oracle::dump(&room_rows(&reference_engine, &room, &schema()).await),
+            oracle::dump(model.rows()),
+            "seed {seed}: model"
+        );
 
         let dir = tempfile::tempdir().unwrap();
         let full = disk(dir.path());
         full.open_room(&room, schema()).await.unwrap();
         let half = log.len() / 2;
-        apply_in_batches(&full, &room, &log[..half], &mut rng).await;
+        let mut full_rejected = apply_in_batches(&full, &room, &log[..half], &mut rng).await;
         full.compact_room(&room).await.unwrap();
-        apply_in_batches(&full, &room, &log[half..], &mut rng).await;
-        assert_eq!(dump(&full, &room).await, reference, "seed {seed}: disk");
+        full_rejected.extend(apply_in_batches(&full, &room, &log[half..], &mut rng).await);
+        assert_eq!(full_rejected, rejected, "seed {seed}: disk");
+        assert_eq!(
+            dump(&full, &room, &schema()).await,
+            reference,
+            "seed {seed}: disk"
+        );
         full.close_room(&room).await.unwrap();
         let full = disk(dir.path());
         full.open_room(&room, schema()).await.unwrap();
-        let reopened = dump(&full, &room).await;
+        let reopened = dump(&full, &room, &schema()).await;
         assert_eq!(reopened, reference, "seed {seed}: disk reopened");
 
         let cut = rng.below(len + 1) as usize;
+        let rest_rejected: Vec<_> = rejected
+            .iter()
+            .filter(|(seq, _)| seq.get() > cut as u64)
+            .cloned()
+            .collect();
         for source_on_disk in [false, true] {
             let source_dir = tempfile::tempdir().unwrap();
             let (source_disk, source_memory) =
@@ -256,13 +299,14 @@ async fn replicas_converge(seeds: std::ops::Range<u64>) {
                     .apply_snapshot(&room, schema(), snapshot.clone().into(), head)
                     .await
                     .unwrap_or_else(|e| panic!("{case}: restore: {e}"));
-                apply_in_batches(target, &room, &log[cut..], &mut rng).await;
-                assert_eq!(dump(target, &room).await, reference, "{case}");
+                let target_rejected = apply_in_batches(target, &room, &log[cut..], &mut rng).await;
+                assert_eq!(target_rejected, rest_rejected, "{case}");
+                assert_eq!(dump(target, &room, &schema()).await, reference, "{case}");
                 if target_on_disk {
                     target_disk.close_room(&room).await.unwrap();
                     let reopened = disk(target_dir.path());
                     reopened.open_room(&room, schema()).await.unwrap();
-                    let rows = dump(&reopened, &room).await;
+                    let rows = dump(&reopened, &room, &schema()).await;
                     assert_eq!(rows, reference, "{case}, reopened");
                 }
             }
@@ -272,11 +316,24 @@ async fn replicas_converge(seeds: std::ops::Range<u64>) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn replicas_converge_from_a_snapshot_at_any_point_in_both_engines() {
-    replicas_converge(0..1).await;
+    replicas_converge(0..1, schema, random_log).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "long-running randomized test; run with --ignored in release"]
 async fn replicas_converge_from_a_snapshot_at_any_point_in_both_engines_over_many_logs() {
-    replicas_converge(0..40).await;
+    replicas_converge(0..40, schema, random_log).await;
+}
+
+/// With constraints, owners and immutable tables, replicas also reject the same operations, for
+/// the same reasons, whichever way they reached the state each one was decided on.
+#[tokio::test(flavor = "multi_thread")]
+async fn replicas_with_constraints_converge_and_reject_the_same() {
+    replicas_converge(0..4, oracle::schema, random_constrained_log).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "long-running randomized test; run with --ignored in release"]
+async fn replicas_with_constraints_converge_and_reject_the_same_over_many_logs() {
+    replicas_converge(0..100, oracle::schema, random_constrained_log).await;
 }

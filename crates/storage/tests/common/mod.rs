@@ -3,18 +3,19 @@
 // Each file in `tests/` is a crate of its own and uses only part of these helpers.
 #![allow(dead_code)]
 
+pub mod oracle;
 pub mod rng;
 
 use futures::StreamExt;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use zemdb_core::{
-    ColumnUpdate, CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequencedOperation,
-    TableSchema, Value,
+    ColumnUpdate, CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequenceNumber,
+    SequencedOperation, TableSchema, Value,
 };
 use zemdb_storage::format::encode_wal_batch;
 use zemdb_storage::{
-    DiskStorageEngine, DiskStorageOptions, ScanOptions, StorageEngine, StorageError,
+    DiskStorageEngine, DiskStorageOptions, RejectReason, ScanOptions, StorageEngine, StorageError,
 };
 
 pub const USERS_TABLE: u16 = 0;
@@ -274,4 +275,63 @@ pub async fn column_update_grows_row<E: StorageEngine>(engine: &E, room: &RoomId
     ]);
     assert_eq!(get_user(engine, room, 1).await, Some(expected.clone()));
     expected
+}
+
+/// The reason an engine gives for an operation the reference model rejected for `reason`.
+pub fn reject_reason(reason: oracle::Reason) -> RejectReason {
+    match reason {
+        oracle::Reason::MissingRow => RejectReason::MissingRow,
+        oracle::Reason::Duplicate => RejectReason::Duplicate,
+        oracle::Reason::NotOwner => RejectReason::NotOwner,
+        oracle::Reason::Unique(constraint) => RejectReason::Unique { constraint },
+        oracle::Reason::ForeignKey(constraint) => RejectReason::ForeignKey { constraint },
+        oracle::Reason::Restrict(constraint) => RejectReason::Restrict { constraint },
+    }
+}
+
+/// The rejections an engine reports for operations the reference model rejected.
+pub fn reject_reasons(rejected: Vec<(u64, oracle::Reason)>) -> Vec<(SequenceNumber, RejectReason)> {
+    rejected
+        .into_iter()
+        .map(|(seq, reason)| (SequenceNumber::from(seq), reject_reason(reason)))
+        .collect()
+}
+
+/// Every row of every table of `schema` in `room`, as the reference model keeps them.
+pub async fn room_rows<E: StorageEngine + ?Sized>(
+    engine: &E,
+    room: &RoomId,
+    schema: &Schema,
+) -> oracle::Rows {
+    let mut rows = oracle::Rows::new();
+    for table_id in schema.table_ids() {
+        let mut scan = engine
+            .scan_by_id(room, table_id, ScanOptions::new())
+            .await
+            .unwrap();
+        let mut table = std::collections::BTreeMap::new();
+        while let Some(item) = scan.next().await {
+            let (pk, row) = item.unwrap();
+            table.insert(pk, row);
+        }
+        if !table.is_empty() {
+            rows.insert(table_id, table);
+        }
+    }
+    rows
+}
+
+/// [`oracle::dump`] of `rows` without empty tables and without the nulls at the end of each
+/// row: an update widens a row to the width of the schema it is applied with, so replicas that
+/// apply the same log under different versions of the schema can differ only there.
+pub fn trimmed_dump(rows: &oracle::Rows) -> Vec<(u16, Vec<String>, Vec<String>)> {
+    oracle::dump(rows)
+        .into_iter()
+        .map(|(table, key, mut row)| {
+            while row.last().is_some_and(|value| value == "Null") {
+                row.pop();
+            }
+            (table, key, row)
+        })
+        .collect()
 }
