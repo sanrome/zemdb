@@ -1,7 +1,7 @@
 //! Helpers shared by the unit tests of the disk engine.
 
 use crate::fail_point;
-use crate::{DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError};
+use crate::{ApplyReport, DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError};
 use std::future::Future;
 use std::ops::RangeInclusive;
 use std::path::Path;
@@ -9,14 +9,11 @@ use std::task::Poll;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use zemdb_core::{
-    CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequenceNumber,
-    SequencedOperation, TableSchema, Value,
+    CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequencedOperation, TableSchema,
+    Value,
 };
 
-/// The deterministic generator of the randomized tests, shared with the integration tests.
-#[path = "../../../tests/common/rng.rs"]
-mod rng;
-pub(crate) use rng::Rng;
+pub(crate) use crate::memory::index::tests::Rng;
 
 pub(crate) const USERS: u16 = 0;
 
@@ -164,7 +161,7 @@ pub(crate) fn spawn_batch(
     engine: &DiskStorageEngine,
     room: &RoomId,
     ops: Vec<SequencedOperation>,
-) -> JoinHandle<Result<SequenceNumber, StorageError>> {
+) -> JoinHandle<Result<ApplyReport, StorageError>> {
     let (engine, room) = (engine.clone(), room.clone());
     tokio::spawn(async move { engine.apply_batch(&room, ops).await })
 }

@@ -318,7 +318,7 @@ async fn run_step(
     let task = tokio::spawn(async move {
         let head = match step {
             Step::Batch(ops) | Step::GapBatch(ops) | Step::InvalidBatch(ops) => {
-                engine.apply_batch(&room, ops).await?
+                engine.apply_batch(&room, ops).await?.head_seq()
             }
             Step::Compact => {
                 engine.compact_room(&room).await?;
@@ -1459,7 +1459,8 @@ async fn run_follow(
     match follow {
         Follow::Nothing => {}
         Follow::Racing => {
-            return Ok(Some(engine.apply_batch(&room(), racing.to_vec()).await));
+            let written = engine.apply_batch(&room(), racing.to_vec()).await;
+            return Ok(Some(written.map(|report| report.head_seq())));
         }
         Follow::Reopen => reopen_auto(engine, data).await?,
         Follow::Compact => match engine.compact_room(&room()).await {

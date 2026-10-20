@@ -7,7 +7,9 @@ use zemdb_core::{
     SequencedOperation, Value,
 };
 
+use crate::engine::RejectReason;
 use crate::error::StorageError;
+use crate::memory::index::TableIndexes;
 
 /// Rows of one table, ordered by primary key.
 ///
@@ -22,16 +24,69 @@ pub type Table = imbl::OrdMap<PrimaryKey, CompactRow>;
 pub(crate) struct RoomState {
     pub(crate) schema: Schema,
     pub(crate) head_seq: SequenceNumber,
-    pub(crate) tables: HashMap<u16, Table>,
+    pub(crate) data: RoomData,
 }
 
 impl RoomState {
     pub(crate) fn new(schema: Schema) -> Self {
         Self {
-            tables: empty_tables(&schema),
+            data: RoomData::empty(&schema),
             schema,
             head_seq: SequenceNumber::from(0u64),
         }
+    }
+}
+
+/// The rows of a room's tables and the indexes of their constraints under the room's schema.
+///
+/// The indexes are derived from the rows: they are built from them, change only with them (in
+/// [`apply_operation`]) and are cloned and replaced with them. A clone takes O(1) per table and
+/// per constraint.
+#[derive(Debug, Clone)]
+pub(crate) struct RoomData {
+    tables: HashMap<u16, Table>,
+    indexes: HashMap<u16, TableIndexes>,
+}
+
+impl RoomData {
+    /// An empty table, with empty indexes, for every table of `schema`.
+    pub(crate) fn empty(schema: &Schema) -> Self {
+        let indexes = schema
+            .tables()
+            .map(|table| (table.table_id(), TableIndexes::new(table)))
+            .collect();
+        Self {
+            tables: empty_tables(schema),
+            indexes,
+        }
+    }
+
+    /// `tables` with the indexes of the constraints of `schema` built from their rows, in
+    /// O(N log N) per constraint: outside WebAssembly, callers run it on the blocking pool.
+    pub(crate) fn build(schema: &Schema, tables: HashMap<u16, Table>) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::fail_point::thread_point("room_data.build");
+        let indexes = schema
+            .tables()
+            .map(|table| {
+                let rows = tables.get(&table.table_id());
+                let indexes = rows.map_or_else(
+                    || TableIndexes::new(table),
+                    |rows| TableIndexes::build(table, rows),
+                );
+                (table.table_id(), indexes)
+            })
+            .collect();
+        Self { tables, indexes }
+    }
+
+    pub(crate) fn tables(&self) -> &HashMap<u16, Table> {
+        &self.tables
+    }
+
+    #[cfg(test)]
+    pub(crate) fn indexes(&self) -> &HashMap<u16, TableIndexes> {
+        &self.indexes
     }
 }
 
@@ -100,36 +155,56 @@ pub(crate) fn validate_batch(
     Ok(())
 }
 
-/// Applies one operation to `tables`. The operation must already be validated against `schema`.
+/// Applies one operation to `data`, its rows and their indexes, or rejects it and changes
+/// nothing. The operation must already be validated against `schema`.
 ///
-/// An update widens a row written under an older schema to the table's current width.
-pub(crate) fn apply_operation(tables: &mut HashMap<u16, Table>, schema: &Schema, op: Operation) {
+/// The decision is taken before anything changes. An update of a row that does not exist is
+/// rejected (`MissingRow`); one of a row that does exist widens a row written under an older
+/// schema to the table's current width. A delete of a row that does not exist changes nothing.
+pub(crate) fn apply_operation(
+    data: &mut RoomData,
+    schema: &Schema,
+    op: Operation,
+) -> Option<RejectReason> {
     let table_id = op.table_id();
-    let table = tables.entry(table_id).or_default();
+    let table_schema = schema.get_table_by_id(table_id);
     let (pk, kind) = op.into_pk_and_kind();
-    match kind {
-        OperationKind::Insert { row } => {
-            table.insert(pk, row);
-        }
+    let old = data.tables.get(&table_id).and_then(|table| table.get(&pk));
+    let row = match kind {
+        OperationKind::Insert { row } => Some(row),
         OperationKind::Update { updates } => {
-            if let Some(existing) = table.get_mut(&pk) {
-                let target_len = schema
-                    .get_table_by_id(table_id)
-                    .map_or(0, |t| t.columns().len());
-                for col_up in updates {
-                    let idx = col_up.column_idx() as usize;
-                    let min_len = target_len.max(idx + 1);
-                    if existing.len() < min_len {
-                        existing.resize(min_len, Value::Null);
-                    }
-                    existing[idx] = col_up.into_value();
+            let Some(existing) = old else {
+                return Some(RejectReason::MissingRow);
+            };
+            let mut row = existing.clone();
+            let target_len = table_schema.map_or(0, |t| t.columns().len());
+            for col_up in updates {
+                let idx = col_up.column_idx() as usize;
+                let min_len = target_len.max(idx + 1);
+                if row.len() < min_len {
+                    row.resize(min_len, Value::Null);
                 }
+                row[idx] = col_up.into_value();
+            }
+            Some(row)
+        }
+        OperationKind::Delete { .. } => None,
+    };
+
+    if let (Some(table_schema), Some(indexes)) = (table_schema, data.indexes.get_mut(&table_id)) {
+        indexes.update(table_schema, &pk, old, row.as_ref());
+    }
+    match row {
+        Some(row) => {
+            data.tables.entry(table_id).or_default().insert(pk, row);
+        }
+        None => {
+            if let Some(table) = data.tables.get_mut(&table_id) {
+                table.remove(&pk);
             }
         }
-        OperationKind::Delete { .. } => {
-            table.remove(&pk);
-        }
     }
+    None
 }
 
 /// In-memory snapshot payload serialized by reference to avoid copying tables during snapshot creation.
@@ -219,16 +294,17 @@ impl RoomSnapshotPayload {
 /// replaced: its head sequence must be `expected_head_seq`, and every table and row must be
 /// valid under `schema` (a known table, a valid key and row, and the row's key columns equal to
 /// the key it is stored under). Tables of `schema` the snapshot does not contain are added
-/// empty.
+/// empty. Returns the snapshot's head sequence and its rows, with the indexes of the
+/// constraints of `schema` built from them.
 ///
-/// Every row is decoded and checked, so outside WebAssembly the engines run it on the blocking
-/// pool.
+/// Every row is decoded and checked, and every index built, so outside WebAssembly the engines
+/// run it on the blocking pool.
 pub(crate) fn decode_received_snapshot(
     envelope: &[u8],
     max_uncompressed_bytes: u64,
     schema: &Schema,
     expected_head_seq: SequenceNumber,
-) -> Result<RoomSnapshotPayload, StorageError> {
+) -> Result<(SequenceNumber, RoomData), StorageError> {
     let mut payload: RoomSnapshotPayload =
         crate::snapshot::decode_snapshot_payload(envelope, max_uncompressed_bytes)?;
     if payload.head_seq != expected_head_seq {
@@ -253,7 +329,7 @@ pub(crate) fn decode_received_snapshot(
         }
     }
     payload.fill_missing_tables(schema);
-    Ok(payload)
+    Ok((payload.head_seq, RoomData::build(schema, payload.tables)))
 }
 
 #[cfg(test)]

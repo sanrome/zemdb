@@ -130,7 +130,7 @@ pub(crate) async fn compact_room_cow(
         moved?;
 
         let state = room.state.read().await;
-        (flag, state.head_seq, state.tables.clone())
+        (flag, state.head_seq, state.data.tables().clone())
     }; // WAL mutex and state lock released here; the flag lives until the end
     fail_point::pause("compaction.staging", &room.wal_path).await;
 

@@ -1,8 +1,8 @@
 //! Test infrastructure: fault injection points for crash and I/O failure tests.
 //!
 //! Production code marks the spots where a test must inject a failure or hold an operation in
-//! the middle. Outside test builds every point does nothing (or returns its input) and the
-//! compiler removes it. A test arms a point for a specific file path, so tests running in
+//! the middle, or check which thread runs some work. Outside test builds every point does
+//! nothing (or returns its input) and the compiler removes it. A test arms a point for a specific file path, so tests running in
 //! parallel never interfere with each other, and each armed point fires once. A crash plan
 //! instead counts every point reached for the files of a directory, so that a simulation can
 //! crash or fail its scenario at each of them.
@@ -338,4 +338,32 @@ pub(crate) fn pause_blocking(name: &'static str, path: &Path) {
     }
     #[cfg(not(test))]
     let _ = (name, path);
+}
+
+/// The thread points reached, each with a thread that reached it.
+#[cfg(test)]
+static THREAD_POINTS: std::sync::Mutex<Vec<(&'static str, std::thread::ThreadId)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Records that the current thread reached the point `name`, so that a test can check that some
+/// work never runs on the thread of its runtime.
+#[inline(always)]
+pub(crate) fn thread_point(name: &'static str) {
+    #[cfg(test)]
+    {
+        let reached = (name, std::thread::current().id());
+        let mut points = THREAD_POINTS.lock().unwrap();
+        if !points.contains(&reached) {
+            points.push(reached);
+        }
+    }
+    #[cfg(not(test))]
+    let _ = name;
+}
+
+/// Whether the current thread ever reached the thread point `name`.
+#[cfg(test)]
+pub(crate) fn reached_on_this_thread(name: &'static str) -> bool {
+    let reached = (name, std::thread::current().id());
+    THREAD_POINTS.lock().unwrap().contains(&reached)
 }

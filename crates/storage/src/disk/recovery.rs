@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::Path;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, BufReader};
@@ -15,8 +14,7 @@ use crate::disk::compactor::{
 use crate::disk::format::{FileHeader, HEADER_SIZE};
 use crate::error::StorageError;
 use crate::fail_point;
-use crate::memory::state::{apply_operation, empty_tables, RoomSnapshotPayload};
-use crate::memory::Table;
+use crate::memory::state::{apply_operation, RoomData, RoomSnapshotPayload};
 use crate::sys::run_blocking;
 
 /// Recovery result containing the reconstructed in-memory state and the open WAL file handle.
@@ -27,7 +25,7 @@ pub(crate) struct RecoveredRoom {
     pub snapshot_seq: SequenceNumber,
     pub snapshot_len: u64,
     pub wal_len: u64,
-    pub tables: HashMap<u16, Table>,
+    pub data: RoomData,
 }
 
 struct WalReplayOutcome {
@@ -73,7 +71,7 @@ async fn classify_anomaly(
     Ok(anomaly.classify(following)?)
 }
 
-/// Replays the framed batches of one WAL file on top of `tables`, advancing `head_seq`.
+/// Replays the framed batches of one WAL file on top of `data`, advancing `head_seq`.
 ///
 /// The file is streamed rather than read into memory, and each frame is decoded with the
 /// primitives of `zemdb_core::protocol::wal_frame`, so a torn write at the end of the file is
@@ -85,13 +83,15 @@ async fn classify_anomaly(
 /// earlier file) and are skipped: crash windows during compaction can leave the same records
 /// in more than one file. A record that does not continue the sequence exactly is a gap, which
 /// means lost data, and is reported as corruption. A record of a table that `schema` does not
-/// have is `SchemaMismatch`: skipping it would lose it for good at the next compaction.
+/// have is `SchemaMismatch`: skipping it would lose it for good at the next compaction. Each
+/// record is decided as when its batch was applied, and the decision is discarded: rejected
+/// records are consumed too.
 async fn replay_wal_file(
     room_id: &RoomId,
     file: &mut tokio::fs::File,
     schema: &Schema,
     head_seq: &mut SequenceNumber,
-    tables: &mut HashMap<u16, Table>,
+    data: &mut RoomData,
 ) -> Result<WalReplayOutcome, StorageError> {
     let mut valid_bytes: u64 = 0;
     let mut applied_count: usize = 0;
@@ -153,7 +153,7 @@ async fn replay_wal_file(
             }
 
             ensure_known_table(room_id, schema, op.op.table_id())?;
-            apply_operation(tables, schema, op.op);
+            apply_operation(data, schema, op.op);
             *head_seq = op.seq;
             applied_count += 1;
         }
@@ -175,7 +175,7 @@ async fn replay_wal_file(
 
 /// A room's base snapshot, as loaded by `load_snapshot`.
 struct BaseSnapshot {
-    tables: HashMap<u16, Table>,
+    data: RoomData,
     snapshot_seq: SequenceNumber,
     head_seq: SequenceNumber,
     snapshot_len: u64,
@@ -199,7 +199,8 @@ fn ensure_known_table(
 /// Loads the base snapshot from `snap_path` (`room_{id}.snap`), verifying the header and the
 /// CRC32 of the compressed payload before decompressing it. A table with rows that `schema`
 /// does not have is `SchemaMismatch`; an empty one is dropped (a snapshot holds every table of
-/// the schema it was compacted with, empty ones included).
+/// the schema it was compacted with, empty ones included). The indexes of the constraints of
+/// `schema` are then built from its rows, on the blocking pool.
 ///
 /// A new room has none: an empty one is staged in a temporary file and renamed into place, so a
 /// failure or crash never leaves a partial snapshot behind.
@@ -209,7 +210,7 @@ async fn load_snapshot(
     schema: &Schema,
 ) -> Result<BaseSnapshot, StorageError> {
     let mut base = BaseSnapshot {
-        tables: empty_tables(schema),
+        data: RoomData::empty(schema),
         snapshot_seq: SequenceNumber::from(0u64),
         head_seq: SequenceNumber::from(0u64),
         snapshot_len: 0,
@@ -295,8 +296,12 @@ async fn load_snapshot(
         .tables
         .retain(|table_id, _| schema.has_table_by_id(*table_id));
     payload.fill_missing_tables(schema);
+    let schema = schema.clone();
+    let data =
+        run_blocking(move || Ok::<_, StorageError>(RoomData::build(&schema, payload.tables)))
+            .await?;
     Ok(BaseSnapshot {
-        tables: payload.tables,
+        data,
         snapshot_seq: payload.head_seq,
         head_seq: payload.head_seq,
         snapshot_len: base.snapshot_len,
@@ -334,10 +339,10 @@ async fn replay_compacting_wal(
     wal_compacting_path: &Path,
     schema: &Schema,
     head_seq: &mut SequenceNumber,
-    tables: &mut HashMap<u16, Table>,
+    data: &mut RoomData,
 ) -> Result<bool, StorageError> {
     let mut compacting_file = tokio::fs::File::from_std(std::fs::File::open(wal_compacting_path)?);
-    let outcome = replay_wal_file(room_id, &mut compacting_file, schema, head_seq, tables).await?;
+    let outcome = replay_wal_file(room_id, &mut compacting_file, schema, head_seq, data).await?;
     if let Some(reason) = outcome.torn_write {
         tracing::warn!(
             room_id = %room_id,
@@ -372,7 +377,7 @@ pub(crate) async fn recover_room(
 ) -> Result<RecoveredRoom, StorageError> {
     // 1. Load the base snapshot
     let BaseSnapshot {
-        mut tables,
+        mut data,
         mut snapshot_seq,
         mut head_seq,
         mut snapshot_len,
@@ -391,14 +396,13 @@ pub(crate) async fn recover_room(
             &wal_compacting_path,
             schema,
             &mut head_seq,
-            &mut tables,
+            &mut data,
         )
         .await?;
 
     // 3. Replay append-only WAL batches from wal_path
     let mut wal_file = tokio::fs::File::from_std(wal_file_std);
-    let outcome =
-        replay_wal_file(room_id, &mut wal_file, schema, &mut head_seq, &mut tables).await?;
+    let outcome = replay_wal_file(room_id, &mut wal_file, schema, &mut head_seq, &mut data).await?;
     let mut valid_wal_bytes = outcome.valid_bytes;
 
     // Truncate torn write at WAL EOF if detected
@@ -420,7 +424,8 @@ pub(crate) async fn recover_room(
     if compacting_exists {
         if compacting_has_live_records {
             snapshot_len =
-                write_snapshot_file(snap_path, head_seq, &tables, zstd_level, room_id).await?;
+                write_snapshot_file(snap_path, head_seq, data.tables(), zstd_level, room_id)
+                    .await?;
             snapshot_seq = head_seq;
             fail_point::check("recovery.fold", wal_path)?;
 
@@ -450,7 +455,7 @@ pub(crate) async fn recover_room(
         snapshot_seq,
         snapshot_len,
         wal_len: valid_wal_bytes,
-        tables,
+        data,
     })
 }
 

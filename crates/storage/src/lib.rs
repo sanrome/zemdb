@@ -17,7 +17,7 @@ pub mod format {
     pub use crate::disk::format::*;
 }
 
-pub use engine::{EngineConcurrencyBounds, RowStream, StorageEngine};
+pub use engine::{ApplyReport, EngineConcurrencyBounds, RejectReason, RowStream, StorageEngine};
 pub use error::StorageError;
 pub use memory::MemoryStorageEngine;
 pub use options::{KeyRange, ScanDirection, ScanOptions};

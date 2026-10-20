@@ -1,5 +1,11 @@
 use crate::disk::compactor::{compact_room_cow, compacting_wal_path};
 use crate::fail_point;
+use crate::memory::index::tests::{
+    apply_checked, apply_random_batches, assert_same_contents, checked_contents,
+    constrained_schema, evolved_schema, refused_batches_change_nothing,
+    snapshot_indexes_are_built_off_the_runtime, snapshots_replace_the_indexes, RandomLog,
+    RoomContents, BUILD_POINT,
+};
 use crate::memory::{RoomSnapshotRef, Table};
 use crate::snapshot::encode_snapshot_envelope;
 use crate::{DiskStorageEngine, MemoryStorageEngine, StorageEngine, StorageError};
@@ -9,7 +15,7 @@ use std::ops::RangeInclusive;
 use std::path::Path;
 use std::time::Duration;
 use support::*;
-use zemdb_core::{PrimaryKey, RoomId, SequenceNumber};
+use zemdb_core::{ColumnUpdate, Operation, PrimaryKey, RoomId, Schema, SequenceNumber, Value};
 
 /// Helpers shared with the tests of the disk engine's submodules.
 #[path = "../disk/tests/support.rs"]
@@ -138,7 +144,7 @@ async fn reads_are_not_blocked_while_a_batch_syncs() {
     assert!(row.is_none());
 
     pause.release();
-    assert_eq!(writer.await.unwrap().unwrap().get(), 2);
+    assert_eq!(writer.await.unwrap().unwrap().head_seq().get(), 2);
     assert!(has_key(&engine, &room, 2).await);
 }
 
@@ -161,8 +167,8 @@ async fn concurrent_writers_apply_in_sequence_order() {
     assert!(!second.is_finished());
 
     pause.release();
-    assert_eq!(first.await.unwrap().unwrap().get(), 2);
-    assert_eq!(second.await.unwrap().unwrap().get(), 3);
+    assert_eq!(first.await.unwrap().unwrap().head_seq().get(), 2);
+    assert_eq!(second.await.unwrap().unwrap().head_seq().get(), 3);
 
     let reopened = reopen(engine, dir.path(), &room).await;
     assert_rows(&reopened, &room, 3).await;
@@ -188,7 +194,7 @@ async fn wal_rotation_holds_the_wal_mutex() {
 
     pause.release();
     compaction.await.unwrap().unwrap();
-    assert_eq!(writer.await.unwrap().unwrap().get(), 4);
+    assert_eq!(writer.await.unwrap().unwrap().head_seq().get(), 4);
 
     let reopened = reopen(engine, dir.path(), &room).await;
     assert_rows(&reopened, &room, 4).await;
@@ -206,12 +212,12 @@ async fn write_during_scan_shares_untouched_rows() {
 
     // A scan or a compaction keeps its own reference to the table while writes continue.
     let room_handle = engine.get_room(&room).await.unwrap();
-    let held = room_handle.state.read().await.tables[&USERS].clone();
+    let held = room_handle.state.read().await.data.tables()[&USERS].clone();
     engine
         .apply_batch(&room, vec![insert_key(1001, 5000)])
         .await
         .unwrap();
-    let current = room_handle.state.read().await.tables[&USERS].clone();
+    let current = room_handle.state.read().await.data.tables()[&USERS].clone();
 
     // A row far from the written key is not copied: both versions share it.
     let key = PrimaryKey::single(0i64);
@@ -768,7 +774,7 @@ async fn panic_in_the_compaction_task_loses_no_row() {
             );
             3
         } else {
-            assert_eq!(written.unwrap().get(), 4, "{point}");
+            assert_eq!(written.unwrap().head_seq().get(), 4, "{point}");
             engine.compact_room(&room).await.unwrap();
             4
         };
@@ -960,7 +966,7 @@ async fn write_completes_while_a_compaction_stages_its_snapshot() {
     )
     .await;
     assert!(
-        matches!(write, Ok(Ok(head)) if head.get() == 4),
+        matches!(&write, Ok(Ok(report)) if report.head_seq().get() == 4),
         "the write waited for the compaction: {write:?}"
     );
     assert!(has_key(&engine, &room, 4).await);
@@ -1028,8 +1034,8 @@ async fn batch_at_the_last_sequence_number_survives_reopen_and_compaction() {
             .apply_snapshot(&room, schema(), snapshot.clone().into(), head)
             .await
             .unwrap();
-        let head = engine.apply_batch(&room, vec![insert(last)]).await.unwrap();
-        assert_eq!(head.get(), last);
+        let report = engine.apply_batch(&room, vec![insert(last)]).await.unwrap();
+        assert_eq!(report.head_seq().get(), last);
         let after_last = engine.apply_batch(&room, vec![insert(last)]).await;
         assert!(
             matches!(after_last, Err(StorageError::SequenceMismatch { .. })),
@@ -1176,4 +1182,340 @@ async fn compact_room_dropped_at_any_suspension_point_keeps_the_room_consistent(
             break;
         }
     }
+}
+
+/// Closes `room` and opens it with `schema` in a new engine, as a restart would.
+async fn reopen_with(
+    engine: DiskStorageEngine,
+    dir: &Path,
+    room: &RoomId,
+    schema: Schema,
+) -> DiskStorageEngine {
+    engine.close_room(room).await.unwrap();
+    let engine = engine_at(dir);
+    engine.open_room(room, schema).await.unwrap();
+    engine
+}
+
+/// Applies the next `batches` batches of `log` to `room` in the disk engine and in a memory
+/// replica, checking each one, and checks that both end with the same rows and indexes.
+async fn apply_to_both(
+    disk: &DiskStorageEngine,
+    memory: &MemoryStorageEngine,
+    room: &RoomId,
+    log: &mut RandomLog,
+    batches: usize,
+) {
+    for _ in 0..batches {
+        let (ops, expected) = log.next_batch();
+        apply_checked(disk, room, ops.clone(), &expected).await;
+        apply_checked(memory, room, ops, &expected).await;
+    }
+    assert_same_as_memory(disk, memory, room).await;
+}
+
+/// Checks that the indexes of `room` follow its rows in the disk engine, and that it holds the
+/// same rows and indexes as in the memory replica.
+async fn assert_same_as_memory(
+    disk: &DiskStorageEngine,
+    memory: &MemoryStorageEngine,
+    room: &RoomId,
+) {
+    let (_, on_disk) = checked_contents(disk, room).await;
+    let (_, in_memory) = memory.contents(room).await;
+    assert_same_contents(&on_disk, &in_memory);
+}
+
+/// The indexes follow the rows after random batches; after reopening, built from the replayed
+/// WAL alone, from a compacted snapshot and the WAL after it, and under a later version of the
+/// schema, whose new column the earlier rows lack; and after replaying the WAL that a failed
+/// compaction left rotated. They are always those of a memory replica of the same log.
+#[tokio::test]
+async fn indexes_follow_the_rows_through_reopens_and_compactions() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("indexes-reopened").unwrap();
+    let mut engine = engine_at(dir.path());
+    engine.open_room(&room, constrained_schema()).await.unwrap();
+    let mut memory = MemoryStorageEngine::new();
+    memory.open_room(&room, constrained_schema()).await.unwrap();
+    let mut log = RandomLog::new(3, constrained_schema());
+
+    apply_to_both(&engine, &memory, &room, &mut log, 15).await;
+    engine = reopen_with(engine, dir.path(), &room, constrained_schema()).await;
+    assert_same_as_memory(&engine, &memory, &room).await;
+
+    apply_to_both(&engine, &memory, &room, &mut log, 10).await;
+    engine.compact_room(&room).await.unwrap();
+    apply_to_both(&engine, &memory, &room, &mut log, 5).await;
+    engine = reopen_with(engine, dir.path(), &room, constrained_schema()).await;
+    assert_same_as_memory(&engine, &memory, &room).await;
+
+    // The memory replica moves to the later schema through a snapshot of the disk room.
+    engine = reopen_with(engine, dir.path(), &room, evolved_schema()).await;
+    let head = engine.get_head_seq(&room).await.unwrap();
+    let snapshot = engine.create_snapshot(&room).await.unwrap();
+    memory = MemoryStorageEngine::new();
+    memory.open_room(&room, evolved_schema()).await.unwrap();
+    memory
+        .apply_snapshot(&room, evolved_schema(), snapshot.into(), head)
+        .await
+        .unwrap();
+    assert_same_as_memory(&engine, &memory, &room).await;
+    log.evolve(evolved_schema());
+    apply_to_both(&engine, &memory, &room, &mut log, 10).await;
+
+    fail_compaction_leaving_compacting_wal(&engine, &room).await;
+    apply_to_both(&engine, &memory, &room, &mut log, 5).await;
+    assert!(compacting_wal_path(&engine.wal_file_path(&room)).exists());
+    engine = reopen_with(engine, dir.path(), &room, evolved_schema()).await;
+    assert_same_as_memory(&engine, &memory, &room).await;
+    apply_to_both(&engine, &memory, &room, &mut log, 5).await;
+}
+
+#[tokio::test]
+async fn refused_batches_change_neither_rows_nor_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("refused-batches").unwrap();
+    let engine = engine_at(dir.path());
+    engine.open_room(&room, constrained_schema()).await.unwrap();
+    let before = refused_batches_change_nothing(&engine, &room).await;
+
+    let engine = reopen_with(engine, dir.path(), &room, constrained_schema()).await;
+    let (_, after) = checked_contents(&engine, &room).await;
+    assert_same_contents(&before, &after);
+}
+
+/// Applied snapshots replace rows and indexes together, and the installed snapshot is what a
+/// reopen builds them from.
+#[tokio::test]
+async fn snapshots_replace_rows_and_indexes_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("snapshot-indexes").unwrap();
+    let engine = engine_at(dir.path());
+    engine.open_room(&room, constrained_schema()).await.unwrap();
+    snapshots_replace_the_indexes(&engine, &room).await;
+    let (_, before) = engine.contents(&room).await;
+
+    let engine = reopen_with(engine, dir.path(), &room, evolved_schema()).await;
+    let (_, after) = checked_contents(&engine, &room).await;
+    assert_same_contents(&before, &after);
+}
+
+/// A panic while applying a batch publishes neither its rows nor its indexes; the reopened room
+/// replays it from the WAL, with indexes that follow its rows.
+#[tokio::test]
+async fn panic_while_applying_a_batch_publishes_neither_rows_nor_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("panic-indexes").unwrap();
+    let engine = engine_at(dir.path());
+    engine.open_room(&room, constrained_schema()).await.unwrap();
+    let memory = MemoryStorageEngine::new();
+    memory.open_room(&room, constrained_schema()).await.unwrap();
+    let mut log = RandomLog::new(5, constrained_schema());
+    apply_to_both(&engine, &memory, &room, &mut log, 10).await;
+    let (_, before) = engine.contents(&room).await;
+
+    // The panic comes after the batch's first operation is applied.
+    let (ops, expected) = log.next_batch();
+    fail_point::arm("apply_batch.apply", &engine.wal_file_path(&room));
+    let writer = spawn_batch(&engine, &room, ops.clone());
+    assert!(writer.await.unwrap_err().is_panic());
+    let (_, after) = checked_contents(&engine, &room).await;
+    assert_same_contents(&before, &after);
+
+    apply_checked(&memory, &room, ops, &expected).await;
+    let engine = reopen_with(engine, dir.path(), &room, constrained_schema()).await;
+    assert_same_as_memory(&engine, &memory, &room).await;
+}
+
+/// Opening a room builds the indexes of its snapshot's rows off the runtime, and so does
+/// applying a snapshot: on a current-thread runtime, the test's thread never builds them.
+#[tokio::test(flavor = "current_thread")]
+async fn indexes_are_built_off_the_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("indexes-off-the-runtime").unwrap();
+    let engine = engine_at(dir.path());
+    engine.open_room(&room, constrained_schema()).await.unwrap();
+    let mut log = RandomLog::new(9, constrained_schema());
+    apply_random_batches(&engine, &room, &mut log, 5).await;
+    engine.compact_room(&room).await.unwrap();
+
+    let engine = reopen_with(engine, dir.path(), &room, constrained_schema()).await;
+    let (_, data) = checked_contents(&engine, &room).await;
+    assert!(data.tables().values().any(|table| !table.is_empty()));
+    assert!(
+        !fail_point::reached_on_this_thread(BUILD_POINT),
+        "the indexes were built on the runtime"
+    );
+
+    let room = RoomId::new("snapshot-indexes-off-the-runtime").unwrap();
+    engine.open_room(&room, constrained_schema()).await.unwrap();
+    snapshot_indexes_are_built_off_the_runtime(&engine, &room).await;
+}
+
+/// A `.wal.compacting` whose only live record is a rejected update is folded too: the head moves
+/// past it and survives a second reopen, and the next batch continues it.
+#[tokio::test]
+async fn compacting_wal_with_only_rejected_records_keeps_the_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("rejected-compacting").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    apply_range(&engine, &room, 1..=2).await;
+    engine.compact_room(&room).await.unwrap();
+    let name = vec![ColumnUpdate::new(1, Value::String("missing".into()))];
+    let update = Operation::update(USERS, PrimaryKey::single(99i64), name, 100);
+    let report = engine
+        .apply_batch(&room, vec![sequenced(3, update)])
+        .await
+        .unwrap();
+    assert_eq!(report.rejected().len(), 1);
+    fail_compaction_leaving_compacting_wal(&engine, &room).await;
+    assert!(compacting_wal_path(&engine.wal_file_path(&room)).exists());
+
+    let engine = reopen(engine, dir.path(), &room).await;
+    assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), 3);
+    assert!(!compacting_wal_path(&engine.wal_file_path(&room)).exists());
+    let engine = reopen(engine, dir.path(), &room).await;
+    assert_eq!(
+        engine.get_head_seq(&room).await.unwrap().get(),
+        3,
+        "the head moved back after the rotated WAL was removed"
+    );
+    engine.apply_batch(&room, vec![insert(4)]).await.unwrap();
+    let engine = reopen(engine, dir.path(), &room).await;
+    assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), 4);
+    assert!(has_key(&engine, &room, 4).await);
+}
+
+/// `apply_batch` dropped by its caller after any number of suspensions leaves indexes that
+/// follow the rows, in memory and after a reopen, and equal those of a memory replica of
+/// whatever reached the WAL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_batch_dropped_at_any_suspension_point_keeps_the_indexes_on_the_rows() {
+    for k in 0.. {
+        let dir = tempfile::tempdir().unwrap();
+        let room = RoomId::new("dropped-batch-indexes").unwrap();
+        let engine = engine_at(dir.path());
+        engine.open_room(&room, constrained_schema()).await.unwrap();
+        let memory = MemoryStorageEngine::new();
+        memory.open_room(&room, constrained_schema()).await.unwrap();
+        let mut log = RandomLog::new(21, constrained_schema());
+        apply_to_both(&engine, &memory, &room, &mut log, 6).await;
+        let before = log.head();
+        let (ops, expected) = log.next_batch();
+        let completed = poll_then_drop(engine.apply_batch(&room, ops.clone()), k)
+            .await
+            .is_some();
+        // File operations handed to the blocking pool before the drop complete meanwhile.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (_, in_memory_now) = checked_contents(&engine, &room).await;
+        let head_now = engine.get_head_seq(&room).await.unwrap().get();
+        assert!(head_now == before || head_now == log.head(), "k={k}");
+
+        let engine = reopen_with(engine, dir.path(), &room, constrained_schema()).await;
+        let (_, reopened) = checked_contents(&engine, &room).await;
+        let head = engine.get_head_seq(&room).await.unwrap().get();
+        if head == log.head() {
+            apply_checked(&memory, &room, ops, &expected).await;
+        } else {
+            assert_eq!(head, before, "k={k}");
+        }
+        let (_, replica) = memory.contents(&room).await;
+        assert_same_contents(&reopened, &replica);
+        if head_now == head {
+            assert_same_contents(&in_memory_now, &reopened);
+        }
+        if completed {
+            break;
+        }
+    }
+}
+
+/// `apply_snapshot` dropped by its caller after any number of suspensions leaves the room with
+/// the old schema, rows and indexes or with the snapshot's, never a mix, in memory and after a
+/// reopen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_snapshot_dropped_at_any_suspension_point_keeps_the_indexes_on_the_rows() {
+    for k in 0.. {
+        let dir = tempfile::tempdir().unwrap();
+        let room = RoomId::new("dropped-snapshot-indexes").unwrap();
+        let engine = engine_at(dir.path());
+        engine.open_room(&room, constrained_schema()).await.unwrap();
+        let mut log = RandomLog::new(23, constrained_schema());
+        apply_random_batches(&engine, &room, &mut log, 4).await;
+        let (_, old) = checked_contents(&engine, &room).await;
+
+        let source = MemoryStorageEngine::new();
+        source.open_room(&room, evolved_schema()).await.unwrap();
+        let mut source_log = RandomLog::new(29, evolved_schema());
+        while source_log.head() <= log.head() {
+            apply_random_batches(&source, &room, &mut source_log, 1).await;
+        }
+        let ahead = SequenceNumber::from(source_log.head());
+        let snapshot = source.create_snapshot(&room).await.unwrap();
+        let (_, new) = checked_contents(&source, &room).await;
+
+        let apply = engine.apply_snapshot(&room, evolved_schema(), snapshot.into(), ahead);
+        let completed = poll_then_drop(apply, k).await.is_some();
+        // File operations handed to the blocking pool before the drop complete meanwhile, and so
+        // does the task that a dropped snapshot left running with the compaction lock.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let compaction = engine.compaction_lock(&room).await.unwrap();
+        drop(compaction.lock().await);
+        let (schema, now) = checked_contents(&engine, &room).await;
+        if schema == evolved_schema() {
+            assert_same_contents(&now, &new);
+        } else {
+            assert_same_contents(&now, &old);
+        }
+        let engine = reopen_with(engine, dir.path(), &room, evolved_schema()).await;
+        let (_, reopened) = checked_contents(&engine, &room).await;
+        if engine.get_head_seq(&room).await.unwrap() == ahead {
+            assert_same_contents(&reopened, &new);
+        } else {
+            assert_eq!(reopened.tables(), old.tables(), "k={k}");
+        }
+        if completed {
+            break;
+        }
+    }
+}
+
+/// The long version of the tests above: many random logs, each reopened and compacted at
+/// random points. Run it with `cargo test -p zemdb-storage --release -- --ignored`.
+#[tokio::test]
+#[ignore]
+async fn indexes_follow_the_rows_of_many_logs() {
+    for seed in 0..200u64 {
+        let outcome = std::panic::AssertUnwindSafe(indexes_follow_the_rows_of_log(seed))
+            .catch_unwind()
+            .await;
+        if let Err(panic) = outcome {
+            eprintln!("the log of seed {seed} failed");
+            std::panic::resume_unwind(panic);
+        }
+    }
+}
+
+/// Applies the random log of `seed` to a disk room and a memory replica, reopening or
+/// compacting the disk room at random points.
+async fn indexes_follow_the_rows_of_log(seed: u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("many-logs").unwrap();
+    let mut engine = engine_at(dir.path());
+    engine.open_room(&room, evolved_schema()).await.unwrap();
+    let memory = MemoryStorageEngine::new();
+    memory.open_room(&room, evolved_schema()).await.unwrap();
+    let mut log = RandomLog::new(seed, evolved_schema());
+    let mut rng = Rng::new(seed);
+    for _ in 0..40 {
+        apply_to_both(&engine, &memory, &room, &mut log, 1).await;
+        match rng.below(8) {
+            0 => engine = reopen_with(engine, dir.path(), &room, evolved_schema()).await,
+            1 => engine.compact_room(&room).await.unwrap(),
+            _ => {}
+        }
+    }
+    let engine = reopen_with(engine, dir.path(), &room, evolved_schema()).await;
+    assert_same_as_memory(&engine, &memory, &room).await;
 }

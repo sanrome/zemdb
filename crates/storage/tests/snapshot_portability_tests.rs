@@ -42,8 +42,8 @@ async fn test_cross_engine_snapshot_portability() {
         Value::Int(200),
     ]);
     let ops = vec![insert_item(1, 1, row1, 10), insert_item(2, 2, row2, 20)];
-    let head = mem_engine.apply_batch(&room_id, ops).await.unwrap();
-    assert_eq!(head, SequenceNumber::from(2u64));
+    let report = mem_engine.apply_batch(&room_id, ops).await.unwrap();
+    assert_eq!(report.head_seq(), SequenceNumber::from(2u64));
 
     // The memory engine writes a raw, uncompressed envelope.
     let mem_snapshot = mem_engine.create_snapshot(&room_id).await.unwrap();

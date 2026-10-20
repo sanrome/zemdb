@@ -150,7 +150,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-W2** | Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum | | Medio | ✅ (D92) |
 | **INV-C1** | Ninguna versión posterior del esquema cambia la decisión sobre una operación ya secuenciada | ★ | Alto | 🆕 (Fase 3.11, Lote 5) |
 | **INV-C2** | El estado de una réplica cumple las restricciones de su esquema | ★ | Alto | 🆕 (Fase 3.11, Lotes 4 y 5) |
-| **INV-C3** | Un rechazo no deja rastro, y los índices son función de las tablas | | Medio | 🆕 (Fase 3.11, Lotes 3 y 4) |
+| **INV-C3** | Un rechazo no deja rastro, y los índices son función de las tablas | | Medio | 🆕 (Fase 3.11, Lote 4; los índices, Lote 3) |
 
 ---
 
@@ -213,10 +213,10 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 ### 3.2. Durabilidad del storage (cliente)
 
 #### INV-S1 ★ · `apply_batch`: éxito durable o ningún efecto
-**Enunciado.** Si `apply_batch` devuelve `Ok`, el batch está sincronizado en el WAL y visible en memoria. Si devuelve `Err`, no cambió nada ni en memoria ni en disco, o la sala quedó marcada como fallida (`RoomFailed`) y reabrirla reconstruye el estado desde el disco. Un hueco de secuencia se reporta como `SequenceMismatch` antes que cualquier error de contenido (D63).
-**Sostenida por.** `sync_file` con flush previo (D43); `PendingWrite`; validación del batch entero antes de escribir; `open_room`, `apply_snapshot` y la compactación corren en su propia tarea, así que, mientras el runtime siga sondeando esa tarea, ninguna de sus operaciones de archivo aterriza después de reabrir la sala (D86, D89) (§8 *Active Storage Schema Validation*, *WAL Mutex*, *Failed Room State*). `apply_batch` no corre en una tarea: lo que impide que su E/S en vuelo aterrice después de reabrir es el lock del handle del WAL más el `flush` de `close_room`.
+**Enunciado.** Si `apply_batch` devuelve `Ok` (con su `ApplyReport`), el batch está sincronizado en el WAL y visible en memoria. Si devuelve `Err`, no cambió nada ni en memoria (tablas e índices de las restricciones) ni en disco, o la sala quedó marcada como fallida (`RoomFailed`) y reabrirla reconstruye el estado desde el disco. Un hueco de secuencia se reporta como `SequenceMismatch` antes que cualquier error de contenido (D63).
+**Sostenida por.** `sync_file` con flush previo (D43); `PendingWrite`; validación del batch entero antes de escribir; las tablas y sus índices se clonan, cambian y publican juntos (Fase 3.11); `open_room`, `apply_snapshot` y la compactación corren en su propia tarea, así que, mientras el runtime siga sondeando esa tarea, ninguna de sus operaciones de archivo aterriza después de reabrir la sala (D86, D89) (§8 *Active Storage Schema Validation*, *WAL Mutex*, *Failed Room State*). `apply_batch` no corre en una tarea: lo que impide que su E/S en vuelo aterrice después de reabrir es el lock del handle del WAL más el `flush` de `close_room`.
 **Riesgo aceptado (D93).** Apagar el runtime con un `open_room`, un `apply_snapshot` o una compactación en vuelo y reabrir la sala en el mismo proceso antes de que termine su hilo bloqueante (§4).
-**Cómo intentar romperla.** Falla de escritura de fondo, cancelación del future en cada `.await`, pánico al aplicar, batch con hueco interno, batch al borde de `u64::MAX`.
+**Cómo intentar romperla.** Falla de escritura de fondo, cancelación del future en cada `.await`, pánico al aplicar, batch con hueco interno, batch al borde de `u64::MAX`; todos sobre un esquema con restricciones, mirando también los índices.
 
 #### INV-S2 · Los lectores ven siempre un prefijo del WAL
 **Enunciado.** Un `get` o un `scan` ve el estado después de un batch completo, nunca medio batch, y nunca un batch que no esté sincronizado. Un `scan` largo no ve estados de batches distintos mezclados en una misma tabla.
@@ -225,7 +225,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-S3 ★ · Un crash en cualquier paso del storage se recupera al mismo estado
 **Enunciado.** Un crash en cualquier punto de la compactación (fases 1 a 3), de la absorción de `.wal.compacting`, de `apply_snapshot` o de la propia recuperación deja archivos que, al reabrir, dan el estado del último batch confirmado (o el del snapshot, si `apply_snapshot` devolvió `Ok`, falló después del rename o se soltó con su tarea en curso).
-**Sostenida por.** §8 *CoW Compaction*, *Crash-Safe apply_snapshot*, *Crash-Safe Recovery of an Interrupted Compaction*; la absorción reemplaza `.wal.compacting` entero y nunca lo escribe en el lugar (D85).
+**Sostenida por.** §8 *CoW Compaction*, *Crash-Safe apply_snapshot*, *Crash-Safe Recovery of an Interrupted Compaction*; la absorción reemplaza `.wal.compacting` entero y nunca lo escribe en el lugar (D85). Los índices de las restricciones no se persisten: se reconstruyen desde el snapshot al abrir, antes del replay (Fase 3.11, §8 *Derived Constraint Indexes*).
 **Riesgo aceptado (D93).** El mismo de INV-S1: apagar el runtime con una tarea del storage en vuelo y reabrir la sala en el mismo proceso (§4).
 **Cómo intentar romperla.** Fail points en cada paso; crash durante la recuperación de un crash anterior; `.wal.compacting` dañado.
 **Automatizable.** Simulación: secuencia aleatoria de batches, compactaciones y snapshots con un crash aleatorio; oráculo = un `MemoryStorageEngine` con las mismas operaciones confirmadas.
@@ -241,8 +241,8 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 **Cómo intentar romperla.** Snapshots fabricados (longitudes declaradas enormes, cuentas de filas falsas, filas con clave distinta de la columna PK, compresión que no termina en la longitud declarada); cierre de la sala durante la decodificación.
 
 #### INV-S6 · Memoria igual a disco
-**Enunciado.** Mientras una sala del storage no esté `RoomFailed`, lo que devuelven `get`, `scan` y `get_head_seq` es exactamente lo que daría cerrarla y reabrirla con el mismo esquema (módulo los `Null` al final de las filas, INV-Y8). Vale en los puntos sin una operación en curso: mientras corre la tarea de una operación soltada, la memoria puede ir detrás del disco, y `close_room` espera a esa tarea.
-**Sostenida por.** Solo se aplican batches sincronizados; el camino vivo y el replay usan el mismo `apply_operation`; ninguna operación de archivo de `open_room`, `apply_snapshot` ni la compactación aterriza después de reabrir (D86, D89) (§8).
+**Enunciado.** Mientras una sala del storage no esté `RoomFailed`, lo que devuelven `get`, `scan` y `get_head_seq` es exactamente lo que daría cerrarla y reabrirla con el mismo esquema (módulo los `Null` al final de las filas, INV-Y8). Los índices de las restricciones también son los que la reapertura construiría (INV-C3), y el replay toma las mismas decisiones que informó `apply_batch`. Vale en los puntos sin una operación en curso: mientras corre la tarea de una operación soltada, la memoria puede ir detrás del disco, y `close_room` espera a esa tarea.
+**Sostenida por.** Solo se aplican batches sincronizados; el camino vivo y el replay usan el mismo `apply_operation`, que decide cada operación y mantiene tablas e índices; ninguna operación de archivo de `open_room`, `apply_snapshot` ni la compactación aterriza después de reabrir (D86, D89) (§8).
 **Cómo intentar romperla.** Comparar después de cada paso de una secuencia aleatoria de batches, compactaciones, snapshots, cancelaciones y reaperturas.
 **Automatizable.** Las simulaciones de storage del Lote 0 de la Fase 3.9 ya lo comprueban en cada paso.
 

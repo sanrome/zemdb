@@ -212,8 +212,8 @@ async fn test_disk_room_lifecycle_and_persistence() {
         insert(2, 2, bob.clone(), 20),
     ];
 
-    let head = engine.apply_batch(&room_id, ops).await.unwrap();
-    assert_eq!(head, SequenceNumber::from(2u64));
+    let report = engine.apply_batch(&room_id, ops).await.unwrap();
+    assert_eq!(report.head_seq(), SequenceNumber::from(2u64));
     assert_eq!(get_user(&engine, &room_id, 1).await, Some(alice.clone()));
 
     engine.close_room(&room_id).await.unwrap();
@@ -318,8 +318,8 @@ async fn test_disk_blind_update_ignored() {
 
     // An update of a row that does not exist.
     let update_op = update(1, 999, 1, Value::String("NonExistent".into()), 100);
-    let head = engine.apply_batch(&room_id, vec![update_op]).await.unwrap();
-    assert_eq!(head, SequenceNumber::from(1u64));
+    let report = engine.apply_batch(&room_id, vec![update_op]).await.unwrap();
+    assert_eq!(report.head_seq(), SequenceNumber::from(1u64));
 
     // Must NOT have created an invalid row with nulls
     assert_eq!(get_user(&engine, &room_id, 999).await, None);
@@ -640,9 +640,9 @@ async fn test_empty_batch_writes_nothing_to_wal() {
     let wal_path = engine.wal_file_path(&room_id);
     let len_before = std::fs::metadata(&wal_path).unwrap().len();
 
-    let head = engine.apply_batch(&room_id, Vec::new()).await.unwrap();
+    let report = engine.apply_batch(&room_id, Vec::new()).await.unwrap();
 
-    assert_eq!(head, SequenceNumber::from(0u64));
+    assert_eq!(report.head_seq(), SequenceNumber::from(0u64));
     assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), len_before);
 }
 

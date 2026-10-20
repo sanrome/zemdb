@@ -41,8 +41,8 @@ async fn test_point_lookup_and_batch_mutation() {
         insert(2, 2, bob.clone(), 20),
     ];
 
-    let head = engine.apply_batch(&room_id, ops).await.unwrap();
-    assert_eq!(head, SequenceNumber::from(2u64));
+    let report = engine.apply_batch(&room_id, ops).await.unwrap();
+    assert_eq!(report.head_seq(), SequenceNumber::from(2u64));
 
     assert_eq!(get_user(&engine, &room_id, 1).await, Some(alice));
     assert_eq!(get_user(&engine, &room_id, 2).await, Some(bob));

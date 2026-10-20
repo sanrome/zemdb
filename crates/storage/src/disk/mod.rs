@@ -21,13 +21,13 @@ use crate::disk::compactor::{
 };
 use crate::disk::recovery::recover_room;
 use crate::disk::wal::WalWriter;
-use crate::engine::{batched_scan, RowStream, StorageEngine};
+use crate::engine::{batched_scan, ApplyReport, RowStream, StorageEngine};
 use crate::error::StorageError;
 use crate::fail_point;
 use crate::memory::state::{
-    apply_operation, decode_received_snapshot, resolve_table_id, validate_batch, TableRef,
+    apply_operation, decode_received_snapshot, resolve_table_id, validate_batch, RoomData, TableRef,
 };
-use crate::memory::{RoomSnapshotRef, Table};
+use crate::memory::RoomSnapshotRef;
 use crate::options::ScanOptions;
 use crate::snapshot::DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES;
 use crate::sys::{run_blocking, sync_dir};
@@ -189,7 +189,7 @@ pub(crate) struct DiskRoomState {
     pub(crate) head_seq: SequenceNumber,
     pub(crate) snapshot_seq: SequenceNumber,
     pub(crate) snapshot_len: u64,
-    pub(crate) tables: HashMap<u16, Table>,
+    pub(crate) data: RoomData,
 }
 
 /// An open room on disk.
@@ -293,7 +293,11 @@ impl DiskStorageEngine {
         let room = self.get_room(room_id).await?;
         let state = room.state.read().await;
         let table_id = resolve_table_id(room_id, &state.schema, table)?;
-        Ok(state.tables.get(&table_id).and_then(|t| t.get(pk).cloned()))
+        Ok(state
+            .data
+            .tables()
+            .get(&table_id)
+            .and_then(|t| t.get(pk).cloned()))
     }
 
     /// Scan behind `scan` and `scan_by_id`: resolves the table and takes its rows under a
@@ -310,7 +314,12 @@ impl DiskStorageEngine {
             let table_id = resolve_table_id(room_id, &state.schema, table)?;
             // An O(1) clone that shares the table's nodes; writes during the scan copy only the
             // nodes they change.
-            state.tables.get(&table_id).cloned().unwrap_or_default()
+            state
+                .data
+                .tables()
+                .get(&table_id)
+                .cloned()
+                .unwrap_or_default()
         };
 
         Ok(batched_scan(table_data, options))
@@ -457,7 +466,7 @@ impl StorageEngine for DiskStorageEngine {
                     head_seq: recovered.head_seq,
                     snapshot_seq: recovered.snapshot_seq,
                     snapshot_len: recovered.snapshot_len,
-                    tables: recovered.tables,
+                    data: recovered.data,
                 }),
                 is_compacting: Arc::new(AtomicBool::new(false)),
                 compaction: Arc::new(Mutex::new(())),
@@ -492,7 +501,7 @@ impl StorageEngine for DiskStorageEngine {
         &self,
         room_id: &RoomId,
         ops: Vec<SequencedOperation>,
-    ) -> Result<SequenceNumber, StorageError> {
+    ) -> Result<ApplyReport, StorageError> {
         let room = self.get_room(room_id).await?;
         // Held until the batch is applied in memory, so batches reach memory in WAL order and
         // the head read below is that of the last batch in the WAL.
@@ -504,7 +513,7 @@ impl StorageEngine for DiskStorageEngine {
             let state = room.state.read().await;
             // An empty batch changes nothing; writing it would only add an empty frame to the WAL.
             if ops.is_empty() {
-                return Ok(state.head_seq);
+                return Ok(ApplyReport::new(state.head_seq, Vec::new()));
             }
             validate_batch(room_id, &state.schema, state.head_seq, &ops)?;
         }
@@ -537,23 +546,27 @@ impl StorageEngine for DiskStorageEngine {
             .fail_on_err("WAL append failed", write_result)?;
         pending.wal().len += wal_batch_bytes.len() as u64;
 
-        // Apply operations to O(1) clones of the in-memory tables, then publish them at once:
-        // readers see all of the batch or none of it, even if applying it panics. Nothing else
-        // changes the tables meanwhile, since that needs the WAL mutex.
-        let (tables, head_seq) = {
+        // Apply operations to O(1) clones of the in-memory tables and their indexes, then
+        // publish them at once: readers see all of the batch or none of it, and never tables and
+        // indexes of different moments, even if applying it panics. Nothing else changes them
+        // meanwhile, since that needs the WAL mutex.
+        let (data, head_seq, rejected) = {
             let state = room.state.read().await;
-            let mut tables = state.tables.clone();
+            let mut data = state.data.clone();
             let mut head_seq = state.head_seq;
+            let mut rejected = Vec::new();
             for SequencedOperation { seq, op } in ops {
-                apply_operation(&mut tables, &state.schema, op);
+                if let Some(reason) = apply_operation(&mut data, &state.schema, op) {
+                    rejected.push((seq, reason));
+                }
                 crate::fail_point::panic_point("apply_batch.apply", &room.wal_path);
                 head_seq = head_seq.max(seq);
             }
-            (tables, head_seq)
+            (data, head_seq, rejected)
         };
         let snapshot_len = {
             let mut state = room.state.write().await;
-            state.tables = tables;
+            state.data = data;
             state.head_seq = head_seq;
             state.snapshot_len
         };
@@ -577,7 +590,7 @@ impl StorageEngine for DiskStorageEngine {
         }
 
         tracing::debug!(room_id = %room_id, head_seq = head_seq.get(), "Applied batch to disk room");
-        Ok(head_seq)
+        Ok(ApplyReport::new(head_seq, rejected))
     }
 
     async fn get(
@@ -630,7 +643,7 @@ impl StorageEngine for DiskStorageEngine {
         // O(1) clones of the tables: serialization and compression run without the lock.
         let (head_seq, tables) = {
             let state = room.state.read().await;
-            (state.head_seq, state.tables.clone())
+            (state.head_seq, state.data.tables().clone())
         };
 
         let zstd_level = self.options.zstd_level;
@@ -671,11 +684,11 @@ impl StorageEngine for DiskStorageEngine {
 
         let max_uncompressed = self.options.max_snapshot_uncompressed_bytes;
         let fail_key = self.wal_file_path(room_id);
-        let (schema, payload) = run_blocking(move || {
+        let (schema, (snapshot_head, data)) = run_blocking(move || {
             crate::fail_point::pause_blocking("apply_snapshot.decode", &fail_key);
-            let payload =
+            let received =
                 decode_received_snapshot(&snapshot, max_uncompressed, &schema, expected_head_seq)?;
-            Ok::<_, StorageError>((schema, payload))
+            Ok::<_, StorageError>((schema, received))
         })
         .await?;
 
@@ -688,15 +701,15 @@ impl StorageEngine for DiskStorageEngine {
             // A first check spares staging a snapshot that cannot be applied. Writers may still
             // advance the head until the WAL mutex is taken.
             let current = room.state.read().await.head_seq;
-            if let Some(outcome) = snapshot_head_outcome(current, payload.head_seq) {
+            if let Some(outcome) = snapshot_head_outcome(current, snapshot_head) {
                 return outcome;
             }
 
             // Nothing visible changes until the staged snapshot is renamed into place.
             let staged = stage_snapshot(
                 &room.snap_path,
-                payload.head_seq,
-                &payload.tables,
+                snapshot_head,
+                data.tables(),
                 zstd_level,
                 &room.room_id,
             )
@@ -707,7 +720,7 @@ impl StorageEngine for DiskStorageEngine {
             let current = room.state.read().await.head_seq;
             let refusal = match wal.ensure_usable() {
                 Err(err) => Some(Err(err)),
-                Ok(()) => snapshot_head_outcome(current, payload.head_seq),
+                Ok(()) => snapshot_head_outcome(current, snapshot_head),
             };
             if let Some(outcome) = refusal {
                 staged.discard().await;
@@ -732,15 +745,15 @@ impl StorageEngine for DiskStorageEngine {
             {
                 let mut state = room.state.write().await;
                 state.schema = schema;
-                state.head_seq = payload.head_seq;
-                state.tables = payload.tables;
-                state.snapshot_seq = payload.head_seq;
+                state.head_seq = snapshot_head;
+                state.data = data;
+                state.snapshot_seq = snapshot_head;
                 state.snapshot_len = staged.compressed_len;
             }
             pending.complete();
 
-            tracing::info!(room_id = %room.room_id, head_seq = %payload.head_seq, "Applied snapshot to disk room");
-            Ok(payload.head_seq)
+            tracing::info!(room_id = %room.room_id, head_seq = %snapshot_head, "Applied snapshot to disk room");
+            Ok(snapshot_head)
         })
         .await
         .map_err(|e| StorageError::Other(format!("Snapshot task failed: {e}")))?

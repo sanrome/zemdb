@@ -32,6 +32,43 @@ pub type RowStream<'a> =
 pub type RowStream<'a> =
     Pin<Box<dyn Stream<Item = Result<(PrimaryKey, CompactRow), StorageError>> + 'a>>;
 
+/// Why an operation of a batch was not applied. The operation is consumed all the same: the
+/// room's head sequence moves past it, and it changes nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RejectReason {
+    /// An `UPDATE` of a row that does not exist: it was never inserted, or it was deleted.
+    MissingRow,
+}
+
+/// What [`StorageEngine::apply_batch`] did with a batch: the room's head sequence after it, and
+/// the operations it did not apply, with the reason, in sequence order. Only those are listed:
+/// every other operation of the batch was applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyReport {
+    head_seq: SequenceNumber,
+    rejected: Vec<(SequenceNumber, RejectReason)>,
+}
+
+impl ApplyReport {
+    pub(crate) fn new(
+        head_seq: SequenceNumber,
+        rejected: Vec<(SequenceNumber, RejectReason)>,
+    ) -> Self {
+        Self { head_seq, rejected }
+    }
+
+    /// The room's head sequence after the batch.
+    pub fn head_seq(&self) -> SequenceNumber {
+        self.head_seq
+    }
+
+    /// The sequence and the reason of each operation of the batch that was not applied, in
+    /// sequence order.
+    pub fn rejected(&self) -> &[(SequenceNumber, RejectReason)] {
+        &self.rejected
+    }
+}
+
 /// Storage engine contract for ZemDB local persistence.
 ///
 /// Implementations must be thread-safe (or single-thread compatible on wasm32)
@@ -56,18 +93,25 @@ pub trait StorageEngine: EngineConcurrencyBounds {
     /// Closes a room, releasing any associated resources or file handles.
     async fn close_room(&self, room_id: &RoomId) -> Result<(), StorageError>;
 
-    /// Applies a batch of sequenced operations to the storage engine.
-    /// Returns the new head sequence number.
+    /// Applies a batch of sequenced operations to the storage engine, in sequence order, and
+    /// reports the new head sequence and the operations it did not apply.
     ///
     /// The whole batch must continue the room's head without gaps; otherwise it is
     /// `SequenceMismatch`, whatever else is wrong with it, since a gap means the batch does not
     /// belong on the room's current state. Only then is each operation checked against the
     /// schema. A batch that fails either check changes nothing.
+    ///
+    /// An operation that passes both checks is either applied or rejected: a rejected one
+    /// changes nothing, but it is consumed, so the head sequence moves past it, and the report
+    /// lists it with its reason. Each operation is decided on the state the previous one left,
+    /// including those of the same batch. An `UPDATE` of a row that does not exist is rejected
+    /// as [`RejectReason::MissingRow`]; a `DELETE` of one changes nothing and is not reported.
+    /// Reopening a room replays its operations with the same decisions, and discards them.
     async fn apply_batch(
         &self,
         room_id: &RoomId,
         ops: Vec<SequencedOperation>,
-    ) -> Result<SequenceNumber, StorageError>;
+    ) -> Result<ApplyReport, StorageError>;
 
     /// Fetches a single row by primary key from a table.
     async fn get(

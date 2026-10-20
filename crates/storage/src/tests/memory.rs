@@ -1,4 +1,8 @@
 use crate::fail_point;
+use crate::memory::index::tests::{
+    apply_random_batches, constrained_schema, evolved_schema, refused_batches_change_nothing,
+    snapshot_indexes_are_built_off_the_runtime, snapshots_replace_the_indexes, RandomLog,
+};
 use crate::{MemoryStorageEngine, StorageEngine};
 use std::path::Path;
 use std::time::Duration;
@@ -51,12 +55,12 @@ async fn write_during_scan_shares_untouched_rows() {
 
     // A scan keeps its own reference to the table while writes continue.
     let room_handle = engine.get_room(&room).unwrap();
-    let held = room_handle.read().unwrap().tables[&USERS].clone();
+    let held = room_handle.read().unwrap().data.tables()[&USERS].clone();
     engine
         .apply_batch(&room, vec![insert(1001, 5000)])
         .await
         .unwrap();
-    let current = room_handle.read().unwrap().tables[&USERS].clone();
+    let current = room_handle.read().unwrap().data.tables()[&USERS].clone();
 
     // A row far from the written key is not copied: both versions share it.
     let key = PrimaryKey::single(0i64);
@@ -84,7 +88,7 @@ async fn snapshot_is_visible_through_room_handle_taken_before() {
 
     let state = handle.read().unwrap();
     assert_eq!(state.head_seq.get(), 3);
-    assert!(state.tables[&USERS]
+    assert!(state.data.tables()[&USERS]
         .get(&PrimaryKey::single(12i64))
         .is_some());
 }
@@ -139,4 +143,41 @@ async fn snapshot_goes_to_the_room_open_when_decoding_ends() {
 
     assert_eq!(apply.await.unwrap().unwrap().get(), 3);
     assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), 3);
+}
+
+/// After every batch of a random log, the room's indexes are those its rows give, and the batch
+/// reports the updates of rows that do not exist.
+#[tokio::test]
+async fn indexes_follow_the_rows_of_random_batches() {
+    let engine = MemoryStorageEngine::new();
+    let room = RoomId::new("random-batches").unwrap();
+    engine.open_room(&room, evolved_schema()).await.unwrap();
+    let mut log = RandomLog::new(1, evolved_schema());
+    apply_random_batches(&engine, &room, &mut log, 60).await;
+}
+
+#[tokio::test]
+async fn refused_batches_change_neither_rows_nor_indexes() {
+    let engine = MemoryStorageEngine::new();
+    let room = RoomId::new("refused-batches").unwrap();
+    engine.open_room(&room, constrained_schema()).await.unwrap();
+    refused_batches_change_nothing(&engine, &room).await;
+}
+
+#[tokio::test]
+async fn snapshots_replace_rows_and_indexes_together() {
+    let engine = MemoryStorageEngine::new();
+    let room = RoomId::new("snapshot-indexes").unwrap();
+    engine.open_room(&room, constrained_schema()).await.unwrap();
+    snapshots_replace_the_indexes(&engine, &room).await;
+}
+
+/// Applying a snapshot builds its indexes off the runtime: on a current-thread runtime, the
+/// test's thread never builds them.
+#[tokio::test(flavor = "current_thread")]
+async fn snapshot_indexes_are_built_without_blocking_the_runtime() {
+    let engine = MemoryStorageEngine::new();
+    let room = RoomId::new("snapshot-indexes-off-the-runtime").unwrap();
+    engine.open_room(&room, constrained_schema()).await.unwrap();
+    snapshot_indexes_are_built_off_the_runtime(&engine, &room).await;
 }
