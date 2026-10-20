@@ -8,4 +8,4 @@ pub use row::*;
 pub use scalar::*;
 
 pub(crate) use decode_budget::ValueBudget;
-pub(crate) use row::deserialize_columns;
+pub(crate) use row::{deserialize_columns, deserialize_owner};

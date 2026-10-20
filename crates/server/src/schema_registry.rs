@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use zemdb_core::schema::{ColumnDef, Schema};
+use zemdb_core::schema::{ColumnDef, ForeignKey, Schema, UniqueConstraint};
 use zemdb_core::SchemaId;
 
 use crate::blocking::blocking_io;
@@ -159,6 +159,19 @@ impl SchemaRegistry {
         table_name: &str,
         column: ColumnDef,
     ) -> Result<Arc<Schema>, ServerError> {
+        self.add_column_with_constraints(id, table_name, column, Vec::new(), Vec::new())
+    }
+
+    /// Adds a nullable column to an existing table, like [`SchemaRegistry::add_column`],
+    /// together with `UNIQUE` constraints and foreign keys that include it.
+    pub fn add_column_with_constraints(
+        &self,
+        id: &SchemaId,
+        table_name: &str,
+        column: ColumnDef,
+        unique: Vec<UniqueConstraint>,
+        foreign_keys: Vec<ForeignKey>,
+    ) -> Result<Arc<Schema>, ServerError> {
         blocking_io(|| {
             let _write = self.lock_writes();
             let existing = self
@@ -167,10 +180,11 @@ impl SchemaRegistry {
 
             let mut evolved_schema = (*existing).clone();
             fail_point::hook("schema_add_column_after_read", &self.schema_path(id));
-            // Rejects an unknown table, a duplicate column name and a non-nullable column.
+            // Rejects an unknown table, a duplicate column name, a non-nullable column and a
+            // constraint that is invalid or does not include the new column, changing nothing.
             evolved_schema
-                .add_column(table_name, column)
-                .map_err(|e| ServerError::SchemaViolation(e.to_string()))?;
+                .add_column_with_constraints(table_name, column, unique, foreign_keys)
+                .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
             self.persist(id.clone(), evolved_schema)
         })

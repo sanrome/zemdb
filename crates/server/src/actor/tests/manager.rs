@@ -7,6 +7,7 @@ use crate::fail_point;
 use std::time::Duration;
 use tempfile::{tempdir, TempDir};
 use zemdb_core::id::SequenceNumber;
+use zemdb_core::schema::{OwnerIdentity, TableBuilder, TableSchema};
 use zemdb_core::value::DataType;
 
 fn new_manager(dir: &TempDir) -> RoomManager {
@@ -1269,4 +1270,83 @@ async fn rooms_shut_down_together_and_save_their_rosters() {
     for (roster, _) in &rooms {
         assert!(roster.exists(), "{} was not saved", roster.display());
     }
+}
+
+/// The test schema with its table changed by `change`.
+fn variant_of_test_schema(change: impl FnOnce(TableBuilder) -> TableBuilder) -> Schema {
+    let table = TableSchema::builder("tasks")
+        .primary_key("id", DataType::Int)
+        .column("title", DataType::String);
+    Schema::builder().table(change(table)).build()
+}
+
+#[tokio::test]
+async fn a_room_moves_only_to_a_schema_with_the_same_constraints_owners_and_immutability() {
+    let dir = tempdir().unwrap();
+    let manager = new_manager(&dir);
+    let variants = [
+        (
+            "unique",
+            variant_of_test_schema(|t| t.unique("tasks_title", ["title"])),
+        ),
+        (
+            "owned",
+            variant_of_test_schema(|t| t.owner("title", OwnerIdentity::ClientId)),
+        ),
+        ("immutable", variant_of_test_schema(TableBuilder::immutable)),
+    ];
+    for (id, schema) in &variants {
+        manager
+            .schema_registry
+            .register_schema(SchemaId::new(*id).unwrap(), schema.clone())
+            .unwrap();
+    }
+    let plain = RoomId::new("plain-room").unwrap();
+    let strict = RoomId::new("strict-room").unwrap();
+    for (room_id, schema) in [(&plain, "first"), (&strict, "unique")] {
+        manager
+            .create_room(room_id.clone(), SchemaId::new(schema).unwrap(), None)
+            .await
+            .unwrap();
+        manager.shutdown_room(room_id).await;
+    }
+
+    let moves = [
+        (&plain, "unique"),
+        (&plain, "owned"),
+        (&plain, "immutable"),
+        (&strict, "first"),
+        (&strict, "owned"),
+    ];
+    for (room_id, target) in moves {
+        let meta = fs::read(meta_room_path(&dir, room_id)).unwrap();
+        let res = manager
+            .get_or_spawn(room_id, Some(&SchemaId::new(target).unwrap()))
+            .await;
+        assert!(
+            matches!(res, Err(ServerError::BadRequest(_))),
+            "{room_id} to {target}: {res:?}"
+        );
+        assert_eq!(fs::read(meta_room_path(&dir, room_id)).unwrap(), meta);
+    }
+
+    // Both rooms still open with their own schema, and a schema with the same constraints
+    // is still accepted.
+    let sender = manager.get_or_spawn(&strict, None).await.unwrap();
+    assert_eq!(schema_of(&sender).await, SchemaId::new("unique").unwrap());
+    // A running room is never reassigned: its actor keeps its schema and its metadata.
+    let meta = fs::read(meta_room_path(&dir, &strict)).unwrap();
+    let running = manager
+        .get_or_spawn(&strict, Some(&SchemaId::new("first").unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(schema_of(&running).await, SchemaId::new("unique").unwrap());
+    assert_eq!(fs::read(meta_room_path(&dir, &strict)).unwrap(), meta);
+    manager.shutdown_room(&plain).await;
+    let sender = manager
+        .get_or_spawn(&plain, Some(&SchemaId::new("second").unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(schema_of(&sender).await, SchemaId::new("second").unwrap());
+    manager.shutdown_all().await;
 }

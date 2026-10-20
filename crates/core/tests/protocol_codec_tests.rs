@@ -635,3 +635,38 @@ fn error_codes_keep_their_wire_indexes() {
         assert_eq!(decode_message::<ErrorCode>(&frame).unwrap(), code);
     }
 }
+
+#[test]
+fn a_delete_carrying_its_owner_round_trips_in_every_message() {
+    let delete = Operation::delete_with_owner(2, PrimaryKey::single(7i64), "alice", 900);
+    let commit = ClientMessage::Commit {
+        correlation_id: CorrelationId::new(5),
+        room_id: room(),
+        client_id: ClientId::new("alice").unwrap(),
+        mutation_id: MutationId::new([5u8; 16]),
+        last_ack_seq: SequenceNumber::new(3),
+        op: delete.clone(),
+    };
+    assert_roundtrip(&commit);
+    // As the server decodes it, with the value budget.
+    assert_eq!(
+        decode_client_message(&encode_message(&commit).unwrap()).unwrap(),
+        commit
+    );
+    let sequenced = vec![
+        SequencedOperation::new(4u64, delete.clone()),
+        SequencedOperation::new(5u64, Operation::delete(2, PrimaryKey::single(8i64), 901)),
+    ];
+    assert_roundtrip(&ServerMessage::SyncBatch {
+        correlation_id: CorrelationId::new(6),
+        room_id: room(),
+        head_seq: SequenceNumber::new(5),
+        ops: sequenced,
+        has_more: false,
+        snapshot_wanted: false,
+        schema_version: 1,
+    });
+    // The owner is part of the operation, so of its size.
+    let without = encoded_len(&Operation::delete(2, PrimaryKey::single(7i64), 900)).unwrap();
+    assert!(encoded_len(&delete).unwrap() > without);
+}

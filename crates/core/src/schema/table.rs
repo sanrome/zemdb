@@ -1,6 +1,7 @@
 use super::column::ColumnDef;
 use super::constraint::{
-    ForeignKey, UniqueConstraint, MAX_CONSTRAINTS_PER_TABLE, MAX_CONSTRAINT_COLUMNS,
+    ForeignKey, OwnerDef, OwnerIdentity, UniqueConstraint, MAX_CONSTRAINTS_PER_TABLE,
+    MAX_CONSTRAINT_COLUMNS,
 };
 use super::validation::ValidationError;
 use crate::mutation::{ColumnUpdate, Operation};
@@ -87,6 +88,8 @@ pub struct TableBuilder {
     columns: Vec<ColumnDef>,
     unique: Vec<UniqueConstraint>,
     foreign_keys: Vec<ForeignKey>,
+    owner: Option<OwnerDef>,
+    immutable: bool,
 }
 
 impl TableBuilder {
@@ -98,6 +101,8 @@ impl TableBuilder {
             columns: Vec::new(),
             unique: Vec::new(),
             foreign_keys: Vec::new(),
+            owner: None,
+            immutable: false,
         }
     }
 
@@ -167,6 +172,20 @@ impl TableBuilder {
         self
     }
 
+    /// Declares `column` as the owner column, identifying each row's owner by `identity`. It is
+    /// validated when the table is built.
+    pub fn owner(mut self, column: impl Into<String>, identity: OwnerIdentity) -> Self {
+        self.owner = Some(OwnerDef::new(column, identity));
+        self
+    }
+
+    /// Makes the table immutable: its rows are inserted once and never replaced, updated or
+    /// deleted.
+    pub fn immutable(mut self) -> Self {
+        self.immutable = true;
+        self
+    }
+
     /// The column `name` with its type set to `data_type`, appended (neither nullable nor
     /// encrypted) if it was not declared yet. An existing column keeps its flags.
     fn upsert_column(&mut self, name: String, data_type: DataType) -> &mut ColumnDef {
@@ -194,14 +213,17 @@ impl TableBuilder {
     }
 
     pub(crate) fn build_with_id(self, table_id: u16) -> Result<TableSchema, ValidationError> {
-        TableSchema::try_with_constraints(
+        let table = TableSchema::try_with_constraints(
             table_id,
             self.name,
             self.primary_key,
             self.columns,
             self.unique,
             self.foreign_keys,
-        )
+        )?;
+        Ok(table
+            .try_with_owner(self.owner)?
+            .with_immutable(self.immutable))
     }
 }
 
@@ -214,7 +236,7 @@ impl TableBuilder {
 /// The `UNIQUE` constraints and foreign keys are kept in declaration order, which is the
 /// order in which they are checked. Their column positions are precomputed like
 /// `column_indices`; like it, they are derived from the serialized fields and never
-/// serialized themselves.
+/// serialized themselves. So is the position of the owner column, if the table has one.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct TableSchema {
     table_id: u16,
@@ -223,20 +245,25 @@ pub struct TableSchema {
     columns: Vec<ColumnDef>,
     unique: Vec<UniqueConstraint>,
     foreign_keys: Vec<ForeignKey>,
+    owner: Option<OwnerDef>,
+    immutable: bool,
     #[serde(skip)]
     column_indices: BTreeMap<String, usize>,
     #[serde(skip)]
     unique_column_indices: Vec<Vec<usize>>,
     #[serde(skip)]
     foreign_key_column_indices: Vec<Vec<usize>>,
+    #[serde(skip)]
+    owner_column: Option<usize>,
 }
 
 impl<'de> Deserialize<'de> for TableSchema {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         // `table_id` has no default: a table read from JSON or disk keeps exactly the id it was
         // written with, and one without an id is rejected rather than numbered on the fly.
-        // The constraint lists default to empty in JSON, so a table written before they
-        // existed still reads; the binary encoding is positional and always carries them.
+        // The constraint lists default to empty in JSON, and the owner and immutability to
+        // none, so a table written before they existed still reads; the binary encoding is
+        // positional and always carries them.
         #[derive(Deserialize)]
         #[serde(rename = "TableSchema", deny_unknown_fields)]
         struct TableSchemaHelper {
@@ -248,6 +275,10 @@ impl<'de> Deserialize<'de> for TableSchema {
             unique: Vec<UniqueConstraint>,
             #[serde(default)]
             foreign_keys: Vec<ForeignKey>,
+            #[serde(default)]
+            owner: Option<OwnerDef>,
+            #[serde(default)]
+            immutable: bool,
         }
         let TableSchemaHelper {
             table_id,
@@ -256,6 +287,8 @@ impl<'de> Deserialize<'de> for TableSchema {
             columns,
             unique,
             foreign_keys,
+            owner,
+            immutable,
         } = TableSchemaHelper::deserialize(deserializer)?;
         TableSchema::try_with_constraints(
             table_id,
@@ -265,6 +298,8 @@ impl<'de> Deserialize<'de> for TableSchema {
             unique,
             foreign_keys,
         )
+        .and_then(|table| table.try_with_owner(owner))
+        .map(|table| table.with_immutable(immutable))
         .map_err(serde::de::Error::custom)
     }
 }
@@ -318,6 +353,25 @@ impl TableSchema {
     #[inline]
     pub fn foreign_key_column_indices(&self) -> &[Vec<usize>] {
         &self.foreign_key_column_indices
+    }
+
+    /// The owner of the table's rows, if it has one.
+    #[inline]
+    pub fn owner(&self) -> Option<&OwnerDef> {
+        self.owner.as_ref()
+    }
+
+    /// The position of the owner column, if the table has an owner.
+    #[inline]
+    pub fn owner_column_index(&self) -> Option<usize> {
+        self.owner_column
+    }
+
+    /// Whether the table is immutable: its rows are inserted once and never replaced, updated
+    /// or deleted.
+    #[inline]
+    pub fn is_immutable(&self) -> bool {
+        self.immutable
     }
 
     /// Validates all structural schema invariants and constructs a `TableSchema` without
@@ -434,10 +488,69 @@ impl TableSchema {
             columns,
             unique,
             foreign_keys,
+            owner: None,
+            immutable: false,
             column_indices,
             unique_column_indices,
             foreign_key_column_indices,
+            owner_column: None,
         })
+    }
+
+    /// This table with its rows owned by the client that `owner`'s column identifies, or
+    /// without an owner. The column exists, is neither nullable nor encrypted, and is a
+    /// `String`, the owner's `ClientId`; pseudonymous owners are not supported yet.
+    pub fn try_with_owner(mut self, owner: Option<OwnerDef>) -> Result<Self, ValidationError> {
+        self.owner_column = match &owner {
+            None => None,
+            Some(owner) if owner.identity != OwnerIdentity::ClientId => {
+                return Err(ValidationError::UnsupportedOwnerIdentity { table: self.name });
+            }
+            Some(owner) => {
+                let Some(col) = self.get_column(&owner.column) else {
+                    return Err(ValidationError::UnknownColumn {
+                        table: self.name,
+                        column: owner.column.clone(),
+                    });
+                };
+                if col.nullable || col.encrypted || col.data_type != DataType::String {
+                    return Err(ValidationError::InvalidOwnerColumn {
+                        table: self.name,
+                        column: owner.column.clone(),
+                    });
+                }
+                self.column_index(&owner.column)
+            }
+        };
+        self.owner = owner;
+        Ok(self)
+    }
+
+    /// Whether the table declares a constraint, an owner or immutability.
+    pub(crate) fn has_constraints(&self) -> bool {
+        !self.unique.is_empty()
+            || !self.foreign_keys.is_empty()
+            || self.owner.is_some()
+            || self.immutable
+    }
+
+    /// Whether `other` has this table's id and the same constraints, owner and immutability,
+    /// over the same column positions.
+    pub(crate) fn same_constraints(&self, other: &TableSchema) -> bool {
+        self.table_id == other.table_id
+            && self.unique == other.unique
+            && self.unique_column_indices == other.unique_column_indices
+            && self.foreign_keys == other.foreign_keys
+            && self.foreign_key_column_indices == other.foreign_key_column_indices
+            && self.owner == other.owner
+            && self.owner_column == other.owner_column
+            && self.immutable == other.immutable
+    }
+
+    /// This table, immutable if `immutable` is set.
+    pub fn with_immutable(mut self, immutable: bool) -> Self {
+        self.immutable = immutable;
+        self
     }
 
     pub fn builder(name: impl Into<String>) -> TableBuilder {
@@ -510,6 +623,7 @@ impl TableSchema {
         }
         next.unique.extend(unique);
         next.foreign_keys.extend(foreign_keys);
+        let (owner, immutable) = (next.owner, next.immutable);
         TableSchema::try_with_constraints(
             next.table_id,
             next.name,
@@ -517,7 +631,9 @@ impl TableSchema {
             next.columns,
             next.unique,
             next.foreign_keys,
-        )
+        )?
+        .try_with_owner(owner)
+        .map(|table| table.with_immutable(immutable))
     }
 
     pub fn extract_pk(&self, row: &Row) -> Result<PrimaryKey, ValidationError> {
@@ -634,7 +750,8 @@ impl TableSchema {
         Ok(Operation::insert(self.table_id, pk, compact, timestamp))
     }
 
-    /// Validates an update payload and compiles it into an `Operation::update`.
+    /// Validates an update payload and compiles it into an `Operation::update`, which must be
+    /// valid for the table as a whole (see [`TableSchema::validate_operation`]).
     pub fn to_operation_update(
         &self,
         pk: PrimaryKey,
@@ -643,17 +760,22 @@ impl TableSchema {
     ) -> Result<Operation, ValidationError> {
         self.validate_pk(&pk)?;
         let updates = self.compact_update_fields(fields)?;
-        Ok(Operation::update(self.table_id, pk, updates, timestamp))
+        let op = Operation::update(self.table_id, pk, updates, timestamp);
+        self.validate_operation(&op)?;
+        Ok(op)
     }
 
-    /// Validates a PK and compiles it into an `Operation::delete`.
+    /// Validates a PK and compiles it into an `Operation::delete` that declares no owner,
+    /// which a table with its owner outside the primary key rejects (see
+    /// [`Operation::delete_with_owner`]).
     pub fn to_operation_delete(
         &self,
         pk: PrimaryKey,
         timestamp: u64,
     ) -> Result<Operation, ValidationError> {
-        self.validate_pk(&pk)?;
-        Ok(Operation::delete(self.table_id, pk, timestamp))
+        let op = Operation::delete(self.table_id, pk, timestamp);
+        self.validate_operation(&op)?;
+        Ok(op)
     }
 
     /// Creates a fluent update builder for this table using column names.

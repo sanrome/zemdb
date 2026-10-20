@@ -354,6 +354,9 @@ impl RoomManager {
         let known = self.stored_metadata(room_id)?;
         let meta = match (schema_id, known) {
             (Some(schema_id), known) => {
+                if let Some(known) = &known {
+                    self.check_reassignment(room_id, &known.schema_id, schema_id)?;
+                }
                 let (room_incarnation, lifecycle) = known.map_or_else(
                     || (new_incarnation(), Default::default()),
                     |meta| (meta.room_incarnation, meta.lifecycle),
@@ -377,6 +380,32 @@ impl RoomManager {
         };
         self.room_meta.insert(room_id.clone(), meta.clone());
         Ok(meta)
+    }
+
+    /// Rejects reassigning `room_id` from the schema `from` to the schema `to` unless both
+    /// declare the same constraints, owners and immutable tables: the room's log was sequenced,
+    /// and its replicas decide on its operations, under those of `from`.
+    fn check_reassignment(
+        &self,
+        room_id: &RoomId,
+        from: &SchemaId,
+        to: &SchemaId,
+    ) -> Result<(), ServerError> {
+        if from == to {
+            return Ok(());
+        }
+        let schema = |id: &SchemaId| {
+            self.schema_registry
+                .get_schema(id)
+                .ok_or_else(|| ServerError::SchemaNotFound(id.to_string()))
+        };
+        if schema(from)?.has_same_constraints(&*schema(to)?) {
+            return Ok(());
+        }
+        Err(ServerError::BadRequest(format!(
+            "Room '{room_id}' cannot move from schema '{from}' to '{to}': their constraints, \
+             owners or immutable tables differ"
+        )))
     }
 
     /// The metadata of `room_id`, cached or read from its `meta_room.json`, if it has any.

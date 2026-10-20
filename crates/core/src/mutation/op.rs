@@ -1,4 +1,4 @@
-use crate::value::deserialize_columns;
+use crate::value::{deserialize_columns, deserialize_owner};
 use crate::value::{CompactRow, PrimaryKey, Value};
 use serde::{Deserialize, Serialize};
 
@@ -51,8 +51,13 @@ pub enum OperationKind {
         #[serde(deserialize_with = "deserialize_columns")]
         updates: Vec<ColumnUpdate>,
     },
-    /// Deletes a tuple by PK.
-    Delete,
+    /// Deletes a tuple by PK. `owner` is the owner the delete declares, required in a table
+    /// whose owner column is outside the primary key and absent in any other table (see
+    /// [`TableSchema::declared_owner`](crate::schema::TableSchema::declared_owner)).
+    Delete {
+        #[serde(deserialize_with = "deserialize_owner")]
+        owner: Option<Value>,
+    },
 }
 
 /// Fully self-describing mutation operation with table ID.
@@ -103,8 +108,26 @@ impl Operation {
         Self::new(table_id, pk, timestamp, OperationKind::Update { updates })
     }
 
+    /// A delete that declares no owner.
     pub fn delete(table_id: u16, pk: PrimaryKey, timestamp: u64) -> Self {
-        Self::new(table_id, pk, timestamp, OperationKind::Delete)
+        Self::new(
+            table_id,
+            pk,
+            timestamp,
+            OperationKind::Delete { owner: None },
+        )
+    }
+
+    /// A delete that declares `owner` as the owner of the row, for a table whose owner column
+    /// is outside the primary key.
+    pub fn delete_with_owner(
+        table_id: u16,
+        pk: PrimaryKey,
+        owner: impl Into<Value>,
+        timestamp: u64,
+    ) -> Self {
+        let owner = Some(owner.into());
+        Self::new(table_id, pk, timestamp, OperationKind::Delete { owner })
     }
 
     #[inline]
@@ -135,7 +158,7 @@ impl Operation {
 
     #[inline]
     pub fn is_delete(&self) -> bool {
-        matches!(self.kind, OperationKind::Delete)
+        matches!(self.kind, OperationKind::Delete { .. })
     }
 
     #[inline]

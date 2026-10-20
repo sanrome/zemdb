@@ -324,7 +324,13 @@ pub fn operation_kind(rng: &mut Rng) -> OperationKind {
                 .map(|_| ColumnUpdate::new(rng.u16(), value(rng)))
                 .collect(),
         },
-        _ => OperationKind::Delete,
+        _ => OperationKind::Delete {
+            owner: if rng.below(2) == 0 {
+                Some(value(rng))
+            } else {
+                None
+            },
+        },
     }
 }
 
@@ -424,8 +430,8 @@ pub fn all_error_codes() -> Vec<ErrorCode> {
 
 /// A random valid schema: up to 3 tables of up to 5 columns with a key of 1 or 2 of them, up to
 /// 2 `UNIQUE` constraints and up to 2 foreign keys each (to any of the tables, itself
-/// included), then up to 3 columns added with `add_column`, some with a `UNIQUE` constraint or
-/// a foreign key over them.
+/// included), some owned by one of their `String` columns and some immutable, then up to 3
+/// columns added with `add_column`, some with a `UNIQUE` constraint or a foreign key over them.
 pub fn schema(rng: &mut Rng) -> Schema {
     let mut shapes: Vec<(u16, String, Vec<String>, Vec<ColumnDef>)> = Vec::new();
     let mut ids = BTreeSet::new();
@@ -520,6 +526,17 @@ pub fn schema(rng: &mut Rng) -> Schema {
                 foreign_keys.push(ForeignKey::new(constraint_name(), chosen, target.clone()));
             }
         }
+        let owners: Vec<&str> = columns
+            .iter()
+            .filter(|c| c.data_type() == DataType::String)
+            .filter(|c| !c.is_nullable() && !c.is_encrypted())
+            .map(|c| c.name())
+            .collect();
+        let owner = if !owners.is_empty() && rng.coin() {
+            Some(OwnerDef::new(*rng.pick(&owners), OwnerIdentity::ClientId))
+        } else {
+            None
+        };
         tables.push(
             TableSchema::try_with_constraints(
                 *id,
@@ -529,7 +546,9 @@ pub fn schema(rng: &mut Rng) -> Schema {
                 unique,
                 foreign_keys,
             )
-            .unwrap(),
+            .and_then(|table| table.try_with_owner(owner))
+            .unwrap()
+            .with_immutable(rng.coin()),
         );
     }
     let mut schema = Schema::try_from_tables(tables).unwrap();
@@ -740,7 +759,7 @@ pub fn within_column_limit(op: &Operation) -> bool {
     let kind_len = match op.kind() {
         OperationKind::Insert { row } => row.len(),
         OperationKind::Update { updates } => updates.len(),
-        OperationKind::Delete => 0,
+        OperationKind::Delete { .. } => 0,
     };
     op.pk().len() <= MAX_COLUMNS && kind_len <= MAX_COLUMNS
 }
@@ -770,7 +789,8 @@ pub fn sample_values() -> Vec<Value> {
     ]
 }
 
-/// An insert, an update, a delete with a composite key and an insert of every value type.
+/// An insert, an update, a delete with a composite key, an insert of every value type and a
+/// delete that declares its owner.
 pub fn sample_ops() -> Vec<SequencedOperation> {
     vec![
         SequencedOperation::new(
@@ -811,12 +831,16 @@ pub fn sample_ops() -> Vec<SequencedOperation> {
                 13,
             ),
         ),
+        SequencedOperation::new(
+            5u64,
+            Operation::delete_with_owner(2, PrimaryKey::single(3i64), "owner-ä", 14),
+        ),
     ]
 }
 
 /// Two tables, one with a composite key and an encrypted column, with `UNIQUE` constraints and
 /// foreign keys (one to a table with a larger id, one to its own table), and a column added
-/// later with a constraint over it.
+/// later with a constraint over it; and an immutable table owned by a column outside its key.
 pub fn sample_schema() -> Schema {
     let mut schema = Schema::builder()
         .table(
@@ -838,6 +862,15 @@ pub fn sample_schema() -> Schema {
                 .nullable_column("flag", DataType::Bool)
                 .unique("links_b_flag", ["b", "flag"])
                 .foreign_key("links_item", ["a"], "items"),
+        )
+        .table(
+            TableBuilder::new("notes")
+                .table_id(2)
+                .primary_key("id", DataType::Int)
+                .column("author", DataType::String)
+                .nullable_column("body", DataType::String)
+                .owner("author", OwnerIdentity::ClientId)
+                .immutable(),
         )
         .build();
     schema

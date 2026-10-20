@@ -115,6 +115,8 @@ async fn control_plane_schema_crud_and_auth() {
         .json(&AddColumnRequest {
             table_name: "tasks".to_string(),
             column: ColumnDef::new("priority", DataType::Int).nullable(true),
+            unique: Vec::new(),
+            foreign_keys: Vec::new(),
         })
         .send()
         .await
@@ -552,6 +554,8 @@ async fn schema_evolution_cascades_to_active_room() {
         .json(&AddColumnRequest {
             table_name: "tasks".to_string(),
             column: ColumnDef::new("notes", DataType::String).nullable(true),
+            unique: Vec::new(),
+            foreign_keys: Vec::new(),
         })
         .send()
         .await
@@ -835,6 +839,8 @@ async fn sse_signals_schema_reloaded() {
         .json(&AddColumnRequest {
             table_name: "tasks".to_string(),
             column: ColumnDef::new("priority", DataType::Int).nullable(true),
+            unique: Vec::new(),
+            foreign_keys: Vec::new(),
         })
         .send()
         .await

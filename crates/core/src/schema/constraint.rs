@@ -105,3 +105,45 @@ impl ForeignKey {
         self.on_delete
     }
 }
+
+/// What the owner column of a table holds to identify the client that owns each row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OwnerIdentity {
+    /// The owner's `ClientId`, in a `String` column.
+    ClientId,
+    /// A pseudonym derived from the owner's identity, in a `Bytes` column. Not supported yet:
+    /// a table declaring it is rejected.
+    Pseudonym,
+}
+
+/// The owner of the rows of a table: the client identified by the value of `column`.
+///
+/// Every operation on the table declares its owner, which the server compares with the
+/// client that sends it, so that only the owner inserts, updates or deletes a row. The column
+/// is validated when its table is built: it exists, is neither nullable nor encrypted, and
+/// holds the owner's `ClientId`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerDef {
+    pub(crate) column: String,
+    pub(crate) identity: OwnerIdentity,
+}
+
+impl OwnerDef {
+    pub fn new(column: impl Into<String>, identity: OwnerIdentity) -> Self {
+        Self {
+            column: column.into(),
+            identity,
+        }
+    }
+
+    #[inline]
+    pub fn column(&self) -> &str {
+        &self.column
+    }
+
+    #[inline]
+    pub fn identity(&self) -> OwnerIdentity {
+        self.identity
+    }
+}

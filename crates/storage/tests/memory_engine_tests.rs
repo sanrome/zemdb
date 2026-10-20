@@ -157,3 +157,112 @@ async fn test_dynamic_column_update_resizing_memory() {
     let room_id = RoomId::new("room-dynamic-col").unwrap();
     column_update_grows_row(&MemoryStorageEngine::new(), &room_id).await;
 }
+
+/// `notes(id, author, body)` owned by `author`, outside the key, and `votes(voter, choice)` owned by
+/// `voter`, its key, and immutable.
+fn owned_schema() -> zemdb_core::Schema {
+    use zemdb_core::{DataType, OwnerIdentity, Schema, TableSchema};
+    Schema::builder()
+        .table(
+            TableSchema::builder("notes")
+                .primary_key("id", DataType::Int)
+                .column("author", DataType::String)
+                .nullable_column("body", DataType::String)
+                .owner("author", OwnerIdentity::ClientId),
+        )
+        .table(
+            TableSchema::builder("votes")
+                .primary_key("voter", DataType::String)
+                .column("choice", DataType::Int)
+                .owner("voter", OwnerIdentity::ClientId)
+                .immutable(),
+        )
+        .build()
+}
+
+/// What the server rejects before sequencing (an update or delete of an immutable table, or an
+/// operation that does not declare the owner of a table whose owner is outside the key) can
+/// only reach a replica in a damaged log: the whole batch is rejected and nothing changes.
+async fn operations_the_server_rejects_are_a_damaged_batch<E: StorageEngine>(engine: &E) {
+    use zemdb_core::{ColumnUpdate, CompactRow, Operation, ValidationError};
+    let room = RoomId::new("owned").unwrap();
+    engine.open_room(&room, owned_schema()).await.unwrap();
+    let note = sequenced(
+        1,
+        Operation::insert(
+            0,
+            PrimaryKey::single(1i64),
+            CompactRow::new(vec![1i64.into(), "alice".into()]),
+            1,
+        ),
+    );
+    let vote_key = || PrimaryKey::single("alice");
+    let damaged = [
+        sequenced(2, Operation::delete(0, PrimaryKey::single(1i64), 1)),
+        sequenced(
+            2,
+            Operation::update(
+                0,
+                PrimaryKey::single(1i64),
+                vec![ColumnUpdate::new(2, "x")],
+                1,
+            ),
+        ),
+        sequenced(
+            2,
+            Operation::update(1, vote_key(), vec![ColumnUpdate::new(1, 2i64)], 1),
+        ),
+        sequenced(2, Operation::delete(1, vote_key(), 1)),
+    ];
+    for op in damaged {
+        let err = engine
+            .apply_batch(&room, vec![note.clone(), op.clone()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StorageError::SchemaValidation(
+                    ValidationError::MissingOwner { .. } | ValidationError::ImmutableTable { .. }
+                )
+            ),
+            "{op:?}: {err:?}"
+        );
+        assert_eq!(engine.get_head_seq(&room).await.unwrap(), 0u64.into());
+        assert_eq!(
+            engine
+                .get(&room, "notes", &PrimaryKey::single(1i64))
+                .await
+                .unwrap(),
+            None
+        );
+    }
+    let delete = Operation::delete_with_owner(0, PrimaryKey::single(1i64), "alice", 1);
+    engine
+        .apply_batch(&room, vec![note, sequenced(2, delete)])
+        .await
+        .unwrap();
+    assert_eq!(engine.get_head_seq(&room).await.unwrap(), 2u64.into());
+}
+
+#[tokio::test]
+async fn memory_rejects_a_batch_with_an_operation_the_server_rejects() {
+    operations_the_server_rejects_are_a_damaged_batch(&MemoryStorageEngine::new()).await;
+}
+
+#[tokio::test]
+async fn disk_rejects_a_batch_with_an_operation_the_server_rejects() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = disk_engine(dir.path());
+    operations_the_server_rejects_are_a_damaged_batch(&engine).await;
+    let room = RoomId::new("owned").unwrap();
+    engine.close_room(&room).await.unwrap();
+    drop(engine);
+
+    // The delete that declares its owner is read back from the WAL and applied again.
+    let engine = disk_engine(dir.path());
+    engine.open_room(&room, owned_schema()).await.unwrap();
+    assert_eq!(engine.get_head_seq(&room).await.unwrap(), 2u64.into());
+    let key = PrimaryKey::single(1i64);
+    assert_eq!(engine.get(&room, "notes", &key).await.unwrap(), None);
+}

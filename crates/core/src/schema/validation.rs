@@ -202,6 +202,33 @@ pub enum ValidationError {
         constraint: String,
         column: String,
     },
+
+    #[error(
+        "Owner column '{column}' of table '{table}' must be a String column, neither nullable \
+         nor encrypted, holding the owner's client id"
+    )]
+    InvalidOwnerColumn { table: String, column: String },
+
+    #[error("Table '{table}' declares a pseudonymous owner, which is not supported")]
+    UnsupportedOwnerIdentity { table: String },
+
+    #[error("Table '{table}' is immutable: its rows cannot be updated or deleted")]
+    ImmutableTable { table: String },
+
+    #[error(
+        "Operation on table '{table}' does not declare its owner: an update must set the \
+         owner column and a delete must carry the owner"
+    )]
+    MissingOwner { table: String },
+
+    #[error(
+        "A delete on table '{table}' cannot declare an owner: the table has none outside its \
+         primary key"
+    )]
+    UnexpectedOwner { table: String },
+
+    #[error("Operation on table '{table}' declares an owner other than the client that sends it")]
+    OwnerMismatch { table: String },
 }
 
 fn validate_field_value(
@@ -447,6 +474,12 @@ impl TableSchema {
     }
 
     /// Validates an Operation against this table.
+    ///
+    /// An immutable table only takes inserts. In a table whose owner column is outside the
+    /// primary key, every operation declares its owner: an insert in its row, an update with a
+    /// delta of the owner column and a delete in its `owner`; a delete on any other table
+    /// declares none. Whether the declared owner is the sender, or the owner of the row, is
+    /// not checked here.
     pub fn validate_operation(&self, op: &Operation) -> Result<(), ValidationError> {
         if op.table_id != self.table_id() {
             return Err(ValidationError::TableIdMismatch {
@@ -455,15 +488,61 @@ impl TableSchema {
                 actual: op.table_id,
             });
         }
+        let table = || self.name().to_string();
+        if self.is_immutable() && !op.is_insert() {
+            return Err(ValidationError::ImmutableTable { table: table() });
+        }
 
+        let owner_outside_key = self.owner_outside_key();
         match &op.kind {
             OperationKind::Insert { row } => self.validate_keyed_row(&op.pk, row),
             OperationKind::Update { updates } => {
                 self.validate_pk(&op.pk)?;
-                self.validate_column_updates(updates)
+                self.validate_column_updates(updates)?;
+                match owner_outside_key {
+                    Some(col) if !updates.iter().any(|u| usize::from(u.column_idx) == col) => {
+                        Err(ValidationError::MissingOwner { table: table() })
+                    }
+                    _ => Ok(()),
+                }
             }
-            // A delete only names its key.
-            OperationKind::Delete => self.validate_pk(&op.pk),
+            OperationKind::Delete { owner } => {
+                self.validate_pk(&op.pk)?;
+                match (owner_outside_key, owner) {
+                    (Some(col), Some(owner)) => {
+                        let col_def = &self.columns()[col];
+                        validate_field_value(self.name(), &col_def.name, col_def, owner)
+                    }
+                    (Some(_), None) => Err(ValidationError::MissingOwner { table: table() }),
+                    (None, Some(_)) => Err(ValidationError::UnexpectedOwner { table: table() }),
+                    (None, None) => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// The position of the owner column, if the table has one outside its primary key.
+    fn owner_outside_key(&self) -> Option<usize> {
+        self.owner_column_index()
+            .filter(|&col| !self.primary_key().contains(&self.columns()[col].name))
+    }
+
+    /// The owner that `op`, valid for this table, declares: its value of the owner column, read
+    /// from the primary key if the column is part of it, and otherwise from the inserted row,
+    /// the update's delta or the delete's `owner`. `None` if the table has no owner.
+    pub fn declared_owner<'a>(&self, op: &'a Operation) -> Option<&'a Value> {
+        let col = self.owner_column_index()?;
+        let column = &self.columns()[col].name;
+        if let Some(key_idx) = self.primary_key().iter().position(|c| c == column) {
+            return op.pk.get(key_idx);
+        }
+        match &op.kind {
+            OperationKind::Insert { row } => row.get(col),
+            OperationKind::Update { updates } => updates
+                .iter()
+                .find(|u| usize::from(u.column_idx) == col)
+                .map(ColumnUpdate::value),
+            OperationKind::Delete { owner } => owner.as_ref(),
         }
     }
 }

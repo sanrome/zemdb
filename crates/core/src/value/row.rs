@@ -237,10 +237,10 @@ const MAX_COLUMNS_PREALLOC_BYTES: usize = 64 * 1024;
 /// rejected before decoding anything, the preallocation is capped, and the elements are counted
 /// as they arrive. The serialized form is that of a plain sequence.
 ///
-/// These sequences are the only place a client message carries values (one per element), so
-/// they charge the value budget of the decode, if any (see `decode_budget`): the declared
-/// length up front, then one by one any element beyond it, so at most one value is
-/// materialized past the budget.
+/// These sequences are where a client message carries values (one per element; the owner of
+/// a delete is the only other, see [`deserialize_owner`]), so they charge the value budget of
+/// the decode, if any (see `decode_budget`): the declared length up front, then one by one any
+/// element beyond it, so at most one value is materialized past the budget.
 ///
 /// Rows are the hot path of log and snapshot reads: without `#[inline]` the visitor is not
 /// inlined into the derived decoders, and decoding rows gets about a third slower.
@@ -293,6 +293,18 @@ where
     }
 
     deserializer.deserialize_seq(ColumnsVisitor(PhantomData))
+}
+
+/// Deserializes the owner of a delete, the one value an operation carries outside its column
+/// sequences, charging it against the value budget of the decode, if any.
+pub(crate) fn deserialize_owner<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Value>, D::Error> {
+    let owner = Option::<Value>::deserialize(deserializer)?;
+    if owner.is_some() {
+        charge(1)?;
+    }
+    Ok(owner)
 }
 
 /// Charges `count` values against the value budget of the decode, if any.

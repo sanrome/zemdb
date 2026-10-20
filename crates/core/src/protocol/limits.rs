@@ -51,9 +51,9 @@ pub const MAX_RESPONSE_OPS_BYTES: u64 = MAX_MESSAGE_SIZE - RESPONSE_ENVELOPE_ALL
 /// clients are not budgeted.
 ///
 /// The budget is charged where client messages carry values: the sequences of column values
-/// (primary keys, rows and update deltas), when they are deserialized. A future message that
-/// carries a `Value` outside those collections must charge it explicitly, or it escapes the
-/// budget.
+/// (primary keys, rows and update deltas), when they are deserialized, and the owner of a
+/// delete. A future message that carries a `Value` elsewhere must charge it explicitly, or it
+/// escapes the budget.
 pub const MAX_MESSAGE_VALUES: u64 = 1 << 20;
 
 /// Why an operation cannot be accepted.

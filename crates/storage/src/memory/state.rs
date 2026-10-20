@@ -126,7 +126,7 @@ pub(crate) fn apply_operation(tables: &mut HashMap<u16, Table>, schema: &Schema,
                 }
             }
         }
-        OperationKind::Delete => {
+        OperationKind::Delete { .. } => {
             table.remove(&pk);
         }
     }

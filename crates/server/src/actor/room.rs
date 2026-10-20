@@ -508,8 +508,11 @@ impl RoomActor {
             return Err(ServerError::BehindCompaction);
         }
 
+        // The owner an operation declares must be the client sending it. Checked against the
+        // validated operation, before anything is sequenced.
         self.schema
             .validate_operation(&op)
+            .and_then(|()| self.schema.check_owner(&op, client_id))
             .map_err(|err| ServerError::SchemaViolation(err.to_string()))?;
 
         // The room never assigns u64::MAX, so that `head_seq + 1` always exists.

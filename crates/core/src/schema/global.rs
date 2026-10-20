@@ -2,6 +2,7 @@ use super::column::ColumnDef;
 use super::constraint::{ForeignKey, UniqueConstraint};
 use super::table::{TableBuilder, TableSchema};
 use super::validation::ValidationError;
+use crate::id::ClientId;
 use crate::mutation::Operation;
 use crate::value::{PrimaryKey, Row, Value};
 use serde::de;
@@ -391,19 +392,22 @@ impl Schema {
         t.extract_pk(row)
     }
 
+    /// Validates an update of `table` as the operation that [`Schema::to_operation_update`]
+    /// builds from it, so with the table's rules (immutability, the declared owner) included.
     pub fn validate_update(
         &self,
         table: &str,
         pk: &PrimaryKey,
         fields: &BTreeMap<String, Value>,
     ) -> Result<(), ValidationError> {
-        let t = self.require_table(table)?;
-        t.validate_pk(pk)?;
-        t.validate_update(fields)
+        self.to_operation_update(table, pk.clone(), fields, 0)
+            .map(drop)
     }
 
+    /// Validates a delete of `table` that declares no owner, as the operation that
+    /// [`Schema::to_operation_delete`] builds.
     pub fn validate_delete(&self, table: &str, pk: &PrimaryKey) -> Result<(), ValidationError> {
-        self.require_table(table)?.validate_pk(pk)
+        self.to_operation_delete(table, pk.clone(), 0).map(drop)
     }
 
     /// Validates an Operation against the corresponding TableSchema by table_id.
@@ -412,6 +416,39 @@ impl Schema {
             .get_table_by_id(op.table_id)
             .ok_or_else(|| ValidationError::TableNotFound(format!("id:{}", op.table_id)))?;
         t.validate_operation(op)
+    }
+
+    /// Checks that `op`, valid for this schema, declares `client` as its owner if its table
+    /// has one: the declared owner is the client's id, compared byte for byte without any
+    /// normalization. `OwnerMismatch` otherwise.
+    pub fn check_owner(&self, op: &Operation, client: &ClientId) -> Result<(), ValidationError> {
+        let Some(table) = self.get_table_by_id(op.table_id) else {
+            return Ok(());
+        };
+        if table.owner().is_none() {
+            return Ok(());
+        }
+        match table.declared_owner(op) {
+            Some(Value::String(owner)) if **owner == *client.as_str() => Ok(()),
+            _ => Err(ValidationError::OwnerMismatch {
+                table: table.name().to_string(),
+            }),
+        }
+    }
+
+    /// Whether `other` declares the same constraints, owners and immutable tables as this
+    /// schema, table by table: the same `UNIQUE` constraints and foreign keys in the same
+    /// order, over the same column positions and referencing the same tables, and the same
+    /// owner column and immutability. A room's log is decided under these, so a room is only
+    /// reassigned to a schema that has the same.
+    pub fn has_same_constraints(&self, other: &Schema) -> bool {
+        fn constrained(schema: &Schema) -> Vec<&TableSchema> {
+            schema.tables().filter(|t| t.has_constraints()).collect()
+        }
+        let (mine, theirs) = (constrained(self), constrained(other));
+        mine.len() == theirs.len()
+            && mine.iter().zip(&theirs).all(|(a, b)| a.same_constraints(b))
+            && self.referenced_by == other.referenced_by
     }
 
     pub fn to_operation_insert(

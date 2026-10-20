@@ -739,7 +739,9 @@ fn votes_json() -> Json {
                 "table_id": 0, "name": "polls", "primary_key": ["id"],
                 "columns": [column_json("id", "Uuid", false), column_json("slug", "String", false)],
                 "unique": [{"name": "polls_slug", "columns": ["slug"]}],
-                "foreign_keys": []
+                "foreign_keys": [],
+                "owner": null,
+                "immutable": false
             },
             {
                 "table_id": 1, "name": "votes", "primary_key": ["voter", "poll_id"],
@@ -751,7 +753,9 @@ fn votes_json() -> Json {
                 "unique": [],
                 "foreign_keys": [
                     {"name": "votes_poll", "columns": ["poll_id"], "references": "polls", "on_delete": "Restrict"}
-                ]
+                ],
+                "owner": {"column": "voter", "identity": "ClientId"},
+                "immutable": true
             }
         ]
     })

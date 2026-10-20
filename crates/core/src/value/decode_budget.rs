@@ -5,9 +5,9 @@
 //! bound it opens a [`ValueBudget`] for the duration of a synchronous decode. Meanwhile, the
 //! sequences of column values deserialized on the thread (rows, primary keys and update
 //! deltas, see [`deserialize_columns`](super::row::deserialize_columns)) charge their values
-//! against it before decoding them. Outside a budget (snapshots, log records, responses
-//! decoded by clients) nothing is counted, and charging costs one thread-local read per
-//! sequence.
+//! against it before decoding them, and the owner of a delete charges itself once decoded.
+//! Outside a budget (snapshots, log records, responses decoded by clients) nothing is counted,
+//! and charging costs one thread-local read per sequence.
 
 use std::cell::Cell;
 

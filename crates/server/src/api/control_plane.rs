@@ -4,7 +4,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use zemdb_core::id::{RoomId, SchemaId};
-use zemdb_core::schema::{ColumnDef, Schema};
+use zemdb_core::schema::{ColumnDef, ForeignKey, Schema, UniqueConstraint};
 
 use crate::actor::command::{RoomCommand, RoomMetrics};
 use crate::actor::manager::RoomMetadata;
@@ -14,18 +14,26 @@ use crate::api::router::AppState;
 use crate::error::ServerError;
 use crate::log::RoomLifecycleOverrides;
 
-/// Request payload for declaring or registering a new schema.
+/// Request payload for declaring or registering a new schema. Unknown fields are rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateSchemaRequest {
     pub schema_id: SchemaId,
     pub schema: Schema,
 }
 
-/// Request payload for DDL append-only column evolution.
+/// Request payload for DDL append-only column evolution: a nullable column, with the
+/// `UNIQUE` constraints and foreign keys that come with it, each of which includes it.
+/// Unknown fields are rejected, so a constraint sent under another name is never dropped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AddColumnRequest {
     pub table_name: String,
     pub column: ColumnDef,
+    #[serde(default)]
+    pub unique: Vec<UniqueConstraint>,
+    #[serde(default)]
+    pub foreign_keys: Vec<ForeignKey>,
 }
 
 /// Request payload for provisioning a new room.
@@ -86,9 +94,13 @@ pub async fn add_column(
     AdminPath(sid): AdminPath<SchemaId>,
     AdminJson(req): AdminJson<AddColumnRequest>,
 ) -> Result<Json<Schema>, ServerError> {
-    let updated = state
-        .schema_registry
-        .add_column(&sid, &req.table_name, req.column)?;
+    let updated = state.schema_registry.add_column_with_constraints(
+        &sid,
+        &req.table_name,
+        req.column,
+        req.unique,
+        req.foreign_keys,
+    )?;
 
     let room_manager = Arc::clone(&state.room_manager);
     let reload = tokio::spawn(async move { room_manager.reload_schema_for_rooms(&sid).await });

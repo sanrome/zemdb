@@ -40,7 +40,7 @@ pub fn squash_operations(existing: &mut Operation, incoming: Operation) -> Squas
     }
     let outcome = match (&mut existing.kind, incoming.kind) {
         // An update cannot resurrect a row with a pending delete.
-        (OperationKind::Delete, OperationKind::Update { .. }) => {
+        (OperationKind::Delete { .. }, OperationKind::Update { .. }) => {
             return SquashOutcome::Incompatible
         }
         (OperationKind::Insert { row }, OperationKind::Update { updates }) => {

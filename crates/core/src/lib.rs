@@ -28,7 +28,7 @@ pub use protocol::{
     SNAPSHOT_MAGIC, SNAPSHOT_VERSION,
 };
 pub use schema::{
-    ColumnDef, ForeignKey, OnDelete, Schema, SchemaBuilder, SchemaUpdateBuilder, TableBuilder,
-    TableSchema, UniqueConstraint, ValidationError,
+    ColumnDef, ForeignKey, OnDelete, OwnerDef, OwnerIdentity, Schema, SchemaBuilder,
+    SchemaUpdateBuilder, TableBuilder, TableSchema, UniqueConstraint, ValidationError,
 };
 pub use value::{CompactRow, DataType, PrimaryKey, Row, RowBuilder, Value};

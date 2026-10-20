@@ -89,6 +89,24 @@ fn test_wal_frame_roundtrip() {
 }
 
 #[test]
+fn a_delete_carrying_its_owner_round_trips_in_a_wal_frame() {
+    let batch = vec![
+        SequencedOperation::new(
+            1,
+            Operation::delete_with_owner(0, PrimaryKey::single(1i64), "alice", 100),
+        ),
+        SequencedOperation::new(2, Operation::delete(0, PrimaryKey::single(2i64), 100)),
+    ];
+    let encoded = encode_wal_batch(&batch, Some(MutationId::new([3u8; 16]))).expect("encode ok");
+    let WalBatchDecodeResult::Ok { ops, .. } =
+        decode_wal_batch_from_slice(&encoded).expect("decode ok")
+    else {
+        panic!("expected a decoded batch");
+    };
+    assert_eq!(ops, batch);
+}
+
+#[test]
 fn test_wal_frame_crc_mismatch_at_eof_treated_as_torn_write() {
     let mut frame = delete_frame(1);
     *frame.last_mut().unwrap() ^= 0xFF;

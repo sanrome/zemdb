@@ -44,7 +44,7 @@ async fn schema_registry_adds_only_nullable_columns_and_persists_them() {
             ColumnDef::new("deadline", DataType::Int).nullable(false),
         )
         .unwrap_err();
-    assert!(matches!(err, ServerError::SchemaViolation(_)));
+    assert!(matches!(err, ServerError::BadRequest(_)));
 
     let reloaded = SchemaRegistry::new(dir.path()).unwrap();
     let loaded_schema = reloaded.get_schema(&schema_id).expect("schema persisted");

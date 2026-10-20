@@ -107,11 +107,14 @@ fn valid_schema_round_trips_in_json_and_binary() {
     assert_eq!(schema.version(), 3);
 
     let json = serde_json::to_value(&schema).unwrap();
-    // Every table is written with its constraint lists, even when empty.
+    // Every table is written with its constraint lists, even when empty, its owner and its
+    // immutability.
     let written = |table_id, name| {
         let mut table = table_json(Some(table_id), name);
         table["unique"] = json!([]);
         table["foreign_keys"] = json!([]);
+        table["owner"] = Json::Null;
+        table["immutable"] = json!(false);
         table
     };
     assert_eq!(

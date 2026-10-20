@@ -131,7 +131,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-A2** | Nada se decodifica antes de autenticar, salvo lo acotado de `/register` | | Alto | ✅ |
 | **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio | ❌ Bajo (backlog) |
 | **INV-A4** | Ningún identificador produce rutas fuera de `data_dir` | ★ | Alto | ✅ |
-| **INV-A5** | Nadie escribe una fila ajena | ★ | Alto | 🆕 (Fase 3.11, Lotes 2 y 4) |
+| **INV-A5** | Nadie escribe una fila ajena | ★ | Alto | 🆕 (Fase 3.11, Lote 4) |
 | **INV-B1** | La memoria por request está acotada | ★ | Alto | ✅ |
 | **INV-B2** | Nada se retiene sin plazo | | Medio | ✅ |
 | **INV-B3** | La memoria, el disco y los FDs del servidor están acotados por la configuración | | Medio | ✅ |
@@ -365,7 +365,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-A5 ★ · Nadie escribe una fila ajena
 **Enunciado.** En una tabla con dueño, toda operación secuenciada declara como dueño al cliente que la envió, y ninguna operación aplicada inserta, reemplaza, modifica ni borra una fila cuyo dueño es otro.
-**Sostenida por.** La verificación del dueño declarado en el commit, antes de secuenciar (DR10), la verificación de las réplicas sobre la fila existente (DR4, DR10) e INV-A1.
+**Sostenida por.** La verificación del dueño declarado en el commit, antes de secuenciar (DR10: `validate_operation` exige que la operación declare el dueño y `Schema::check_owner` lo compara byte a byte con el `ClientId` del token), la verificación de las réplicas sobre la fila existente (DR4, DR10) e INV-A1.
 **Cómo intentar romperla.** Un `Insert`, `Update` o `Delete` de B que declara a A como dueño; uno de B que se declara dueño sobre una fila de A, con el dueño dentro y fuera de la clave; un `Update` que intenta transferir la fila; un reintento deduplicado.
 **Fuera de alcance.** Un snapshot falso de un miembro hostil (DEF-81).
 

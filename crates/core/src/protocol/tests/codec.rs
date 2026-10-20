@@ -62,6 +62,13 @@ fn key_values_and_update_deltas_count_against_the_budget() {
 }
 
 #[test]
+fn the_owner_of_a_delete_counts_against_the_budget() {
+    // 2 key values and the owner: 3 values.
+    let op = Operation::delete_with_owner(0, PrimaryKey::composite([1i64, 2]), "alice", 0);
+    assert_budget_is_exact(&op, 3);
+}
+
+#[test]
 fn rows_within_the_column_limit_still_exceed_the_message_budget() {
     // Each row is within the column limit; together they carry more than the budget, in a
     // frame far below the size limit (1 byte per Null on the wire).

@@ -44,7 +44,7 @@ fn value_of(table: &TableSchema, op: &Operation, column: &str) -> Option<Value> 
             .unwrap()
             .get(column)
             .cloned(),
-        OperationKind::Delete => None,
+        OperationKind::Delete { .. } => None,
     }
 }
 
@@ -341,4 +341,101 @@ fn table_buffer_deserialization_rejects_inconsistent_buffers() {
     for (case, raw) in invalid.iter().enumerate() {
         assert!(decode_buffer(raw).is_err(), "case {case}");
     }
+}
+
+/// `notes(id Int, author String, body String?)`, owned by `author`, outside the key.
+fn notes() -> TableSchema {
+    TableSchema::builder("notes")
+        .table_id(3)
+        .primary_key("id", DataType::Int)
+        .column("author", DataType::String)
+        .nullable_column("body", DataType::String)
+        .owner("author", OwnerIdentity::ClientId)
+        .build()
+        .unwrap()
+}
+
+fn note_update(table: &TableSchema, fields: &[(&str, &str)], timestamp: u64) -> Operation {
+    fields
+        .iter()
+        .fold(
+            table.update_builder(PrimaryKey::single(1i64)),
+            |builder, (column, value)| builder.set(*column, *value),
+        )
+        .timestamp(timestamp)
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn squashing_keeps_the_owner_an_operation_declares() {
+    let table = &notes();
+    let key = PrimaryKey::single(1i64);
+    let owned_delete = Operation::delete_with_owner(3, key.clone(), "alice", 30);
+    let owner = |buffer: &TableBuffer| {
+        let op = buffer.get(&PrimaryKey::single(1i64)).unwrap();
+        table.declared_owner(op).cloned()
+    };
+
+    // A delete that replaces a pending update keeps its owner.
+    let mut buffer = TableBuffer::new(3);
+    buffer
+        .apply(
+            table,
+            note_update(table, &[("author", "alice"), ("body", "a")], 10),
+        )
+        .unwrap();
+    buffer.apply(table, owned_delete.clone()).unwrap();
+    assert_eq!(buffer.get(&key), Some(&owned_delete));
+    assert_eq!(owner(&buffer), Some(Value::from("alice")));
+
+    // Consolidated updates keep the owner's delta.
+    let mut buffer = TableBuffer::new(3);
+    buffer
+        .apply(
+            table,
+            note_update(table, &[("author", "alice"), ("body", "a")], 10),
+        )
+        .unwrap();
+    buffer
+        .apply(
+            table,
+            note_update(table, &[("author", "alice"), ("body", "b")], 20),
+        )
+        .unwrap();
+    assert_eq!(
+        buffer.get(&key),
+        Some(&note_update(
+            table,
+            &[("author", "alice"), ("body", "b")],
+            20
+        ))
+    );
+    assert_eq!(owner(&buffer), Some(Value::from("alice")));
+
+    // An update without the owner's delta is not valid for the table, and is not queued.
+    let before = buffer.clone();
+    let without_owner = Operation::update(3, key, vec![ColumnUpdate::new(2, "c")], 30);
+    assert_eq!(
+        buffer.apply(table, without_owner),
+        Err(BufferError::Invalid(ValidationError::MissingOwner {
+            table: "notes".to_string()
+        }))
+    );
+    assert_eq!(buffer, before);
+}
+
+#[test]
+fn a_buffer_with_a_delete_carrying_its_owner_round_trips() {
+    let table = &notes();
+    let mut buffer = TableBuffer::new(3);
+    let delete = Operation::delete_with_owner(3, PrimaryKey::single(2i64), "alice", 5);
+    buffer.apply(table, delete.clone()).unwrap();
+
+    let decoded: TableBuffer = bincode::deserialize(&bincode::serialize(&buffer).unwrap()).unwrap();
+    assert_eq!(decoded, buffer);
+    let decoded: TableBuffer =
+        serde_json::from_str(&serde_json::to_string(&buffer).unwrap()).unwrap();
+    assert_eq!(decoded, buffer);
+    assert_eq!(decoded.get(&PrimaryKey::single(2i64)), Some(&delete));
 }

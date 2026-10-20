@@ -497,7 +497,7 @@ fn check_schema_json(seed: u64, cases: u64) {
         assert!(decoded.version() >= Schema::FIRST_VERSION);
         let tables: Vec<TableSchema> = decoded.tables().cloned().collect();
         for table in &tables {
-            TableSchema::try_with_constraints(
+            let rebuilt = TableSchema::try_with_constraints(
                 table.table_id(),
                 table.name(),
                 table.primary_key().to_vec(),
@@ -505,7 +505,10 @@ fn check_schema_json(seed: u64, cases: u64) {
                 table.unique_constraints().to_vec(),
                 table.foreign_keys().to_vec(),
             )
-            .unwrap();
+            .and_then(|rebuilt| rebuilt.try_with_owner(table.owner().cloned()))
+            .unwrap()
+            .with_immutable(table.is_immutable());
+            assert_eq!(&rebuilt, table);
         }
         Schema::try_from_tables(tables).unwrap();
         let again = serde_json::to_vec(&decoded).unwrap();

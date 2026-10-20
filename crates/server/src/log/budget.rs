@@ -11,7 +11,7 @@ pub(crate) fn op_bytes(op: &SequencedOperation) -> u64 {
         + match op.op.kind() {
             OperationKind::Insert { row } => row.len(),
             OperationKind::Update { updates } => updates.len(),
-            OperationKind::Delete => 0,
+            OperationKind::Delete { owner } => usize::from(owner.is_some()),
         };
     let in_memory = (values * std::mem::size_of::<Value>()) as u64;
     encoded_len(op).unwrap_or(u64::MAX).max(in_memory)
