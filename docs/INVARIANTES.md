@@ -148,7 +148,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-E2** | Un cliente con el esquema viejo siempre puede enterarse | | Bajo | ✅ |
 | **INV-W1** | Ninguna entrada hace entrar en pánico, abortar ni reservar de más | ★ | Alto | ✅ |
 | **INV-W2** | Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum | | Medio | ✅ (D92) |
-| **INV-C1** | Ninguna versión posterior del esquema cambia la decisión sobre una operación ya secuenciada | ★ | Alto | 🆕 (Fase 3.11, Lotes 1 y 5) |
+| **INV-C1** | Ninguna versión posterior del esquema cambia la decisión sobre una operación ya secuenciada | ★ | Alto | 🆕 (Fase 3.11, Lote 5) |
 | **INV-C2** | El estado de una réplica cumple las restricciones de su esquema | ★ | Alto | 🆕 (Fase 3.11, Lotes 4 y 5) |
 | **INV-C3** | Un rechazo no deja rastro, y los índices son función de las tablas | | Medio | 🆕 (Fase 3.11, Lotes 3 y 4) |
 
@@ -441,7 +441,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-E1 ★ · El esquema solo crece, y toda operación del log sigue siendo válida
 **Enunciado.** Un esquema registrado nunca pierde, renumera ni cambia el tipo de una tabla o columna. Las columnas nuevas son nullable, y la versión sube con cada cambio. Por eso toda operación aceptada en una sala sigue siendo válida bajo cualquier versión posterior de su esquema, y una réplica siempre puede aplicar el log.
-**Sostenida por.** `Schema::add_column`, `SchemaAlreadyExists`, deserialización estricta (§3.1, §7.1); el checksum de `schemas/{id}.json` (D82), el lock del registry y el orden de la recarga.
+**Sostenida por.** `Schema::add_column` y `Schema::add_column_with_constraints`, `SchemaAlreadyExists`, deserialización estricta (§3.1, §7.1); el checksum de `schemas/{id}.json` (D82), el lock del registry y el orden de la recarga.
 **Cómo intentar romperla.** `add_column` concurrentes; reinicio a mitad de una escritura del registry; JSON de esquema con ids repetidos, faltantes o campos desconocidos; filas cortas de antes de una columna nueva; un bit invertido en `schemas/{id}.json` (ver INV-D9).
 
 #### INV-E2 · Un cliente con el esquema viejo siempre puede enterarse

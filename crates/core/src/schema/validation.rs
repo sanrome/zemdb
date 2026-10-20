@@ -117,6 +117,91 @@ pub enum ValidationError {
 
     #[error("Table '{table}' would have more than {max} columns")]
     TooManyColumns { table: String, max: usize },
+
+    #[error("Table '{table}' would have more than {max} constraints")]
+    TooManyConstraints { table: String, max: usize },
+
+    #[error("Constraint '{constraint}' of table '{table}' has more than {max} columns")]
+    TooManyConstraintColumns {
+        table: String,
+        constraint: String,
+        max: usize,
+    },
+
+    #[error("Constraint '{constraint}' of table '{table}' has no columns")]
+    EmptyConstraint { table: String, constraint: String },
+
+    #[error("Constraint '{constraint}' of table '{table}' names unknown column '{column}'")]
+    UnknownConstraintColumn {
+        table: String,
+        constraint: String,
+        column: String,
+    },
+
+    #[error("Constraint '{constraint}' of table '{table}' repeats column '{column}'")]
+    DuplicateConstraintColumn {
+        table: String,
+        constraint: String,
+        column: String,
+    },
+
+    #[error(
+        "Constraint '{constraint}' of table '{table}' cannot include encrypted column '{column}'"
+    )]
+    EncryptedConstraintColumn {
+        table: String,
+        constraint: String,
+        column: String,
+    },
+
+    #[error("Unique constraint '{constraint}' of table '{table}' is the primary key")]
+    UniqueIsPrimaryKey { table: String, constraint: String },
+
+    #[error("Constraint name '{constraint}' is used more than once in the schema")]
+    DuplicateConstraintName { constraint: String },
+
+    #[error(
+        "Foreign key '{constraint}' of table '{table}' references table '{references}', \
+         which does not exist in schema"
+    )]
+    ForeignKeyTableNotFound {
+        table: String,
+        constraint: String,
+        references: String,
+    },
+
+    #[error(
+        "Foreign key '{constraint}' of table '{table}' has {actual} columns, but the primary \
+         key it references has {expected}"
+    )]
+    ForeignKeyArityMismatch {
+        table: String,
+        constraint: String,
+        expected: usize,
+        actual: usize,
+    },
+
+    #[error(
+        "Column '{column}' of foreign key '{constraint}' in table '{table}' has type {actual}, \
+         but the primary key column it references has type {expected}"
+    )]
+    ForeignKeyTypeMismatch {
+        table: String,
+        constraint: String,
+        column: String,
+        expected: DataType,
+        actual: DataType,
+    },
+
+    #[error(
+        "Constraint '{constraint}' added to table '{table}' does not include the new column \
+         '{column}'"
+    )]
+    ConstraintOmitsNewColumn {
+        table: String,
+        constraint: String,
+        column: String,
+    },
 }
 
 fn validate_field_value(

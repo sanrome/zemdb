@@ -403,7 +403,7 @@ El revisor lo recorre en cada lote de storage:
 | Orden | Lote | Crates | Decisiones | Invariantes | Progreso |
 |---|---|---|---|---|---|
 | 0 | Contrato | Documentos | Todas | Nuevas: C1, C2, C3, A5. Ajuste: Y8 | ✅ |
-| 1 | `UNIQUE` y FK en el esquema | core | DR3, DR8, DR9 | E1, W1, W2 | ⬜ |
+| 1 | `UNIQUE` y FK en el esquema | core | DR3, DR8, DR9 | E1, W1, W2 | ✅ |
 | 2 | Servidor: dueño, inmutabilidad y API de administración | core, server | DR3, DR8, DR10, DR11 | A1, A5, Y5, E1, E2, D9, W1, W2 | ⬜ |
 | 2b | Dueño seudónimo (diferido) | core, server | DR15 | A1, A5, Y5 | ⏸ |
 | 3 | Índices derivados y `ApplyReport` | storage | DR5, DR6 | S1, S3, S6, C3 | ⬜ |
@@ -474,7 +474,7 @@ El revisor lo recorre en cada lote de storage:
 - **`ROADMAP.md`:** la fase en §2, en §4.3.C y en el cronograma de §5; su cierre como requisito de la Fase 4; §4.4.4 con la validación liviana del servidor y el resultado decidido por la réplica; errores del cliente (`ConstraintViolation`, `RowMissing`); nota en el backlog 7 y backlog nuevo 11 (esquema anclado en el log), 12 (dueño seudónimo) y 13 (detección de divergencia).
 - **Desvío:** ninguno. `ARCHITECTURE.md` no cambia en este lote, como estaba previsto.
 
-### Lote 1 · `UNIQUE` y FK en el esquema (`zemdb-core`) · ⬜ Pendiente
+### Lote 1 · `UNIQUE` y FK en el esquema (`zemdb-core`) · ✅ Hecho
 **Objetivo:** que un esquema pueda declarar `UNIQUE` y FK, validadas estructuralmente, serializadas de forma estricta y evolucionables solo según DR3.
 
 **Archivos:** `crates/core/src/schema/` (`table.rs`, `global.rs`, `column.rs`, `validation.rs`, un `constraint.rs` nuevo y `mod.rs`) y los re-exports de `lib.rs`.
@@ -527,6 +527,37 @@ Positivos:
 - Los fuzzers de decodificación de `zemdb-core` (INV-W1).
 
 **Documentos:** `ARCHITECTURE.md` §3.1, donde *Soft Foreign Keys* pasa a describir las restricciones declarables. Se aclara que la verificación llega en los lotes de storage.
+
+**Hecho.**
+- **API.** `constraint.rs` con `UniqueConstraint`, `ForeignKey`, `OnDelete::Restrict` y los topes `MAX_CONSTRAINTS_PER_TABLE` (32, `UNIQUE` y FK juntas) y `MAX_CONSTRAINT_COLUMNS` (16). `TableSchema` guarda `unique` y `foreign_keys` y precalcula `unique_column_indices` y `foreign_key_column_indices`; `TableBuilder::unique` y `::foreign_key`. `Schema` precalcula `referenced_by` y lo expone con `foreign_keys_referencing(table_id)`, en el orden de §3.1 (id de la tabla hija y declaración). `Schema::add_column_with_constraints` agrega la columna y sus restricciones y sube la versión una vez. Doce variantes nuevas de `ValidationError`.
+- **Tests agregados** (`crates/core/tests/schema_constraint_tests.rs`, 24): un negativo por regla (columna inexistente, repetida y cifrada; `UNIQUE` igual a la PK, en cualquier orden; FK a una tabla inexistente; FK con otra cantidad y con otros tipos, también en otro orden; nombre repetido en la tabla, entre `UNIQUE` y FK y entre tablas; los dos topes; restricción sin columnas; restricción agregada que no incluye la columna nueva, con versión y esquema intactos; otros rechazos de `add_column_with_constraints` sin cambios; el tope contando las restricciones existentes; campo desconocido en una columna, en una `UNIQUE` y en una FK; `on_delete` faltante o desconocido) y los positivos (FK a sí misma; FK a una tabla de id mayor y ciclo entre dos tablas, por builder, `try_from_tables` y JSON; columna nueva con `UNIQUE` y con FK; el JSON de §3.3 ida y vuelta; esquema sin los campos nuevos; roundtrip binario; posiciones precalculadas y `foreign_keys_referencing`; identidad). Antes de implementar, contra un esqueleto que compilaba, fallaban 22 de 24 por comportamiento; los dos que pasaban son positivos que el esqueleto ya cumplía (leer un esquema sin los campos nuevos e identidad).
+- **Tests extendidos:** el generador aleatorio de esquemas (`tests/common`) declara `UNIQUE` y FK, también al agregar columnas, y `random_schemas_round_trip_in_json_and_binary` exige que aparezcan; `sample_schema` (fuzzer de JSON de esquema y mensajes `Registered`/`Schema` del fuzzer de mensajes) tiene restricciones, una FK a una tabla de id mayor, una a sí misma y una columna agregada con restricciones; `protocol_codec_tests` con `Registered` de un esquema con restricciones; el formato esperado de `schema_table_ids_tests` incluye las dos listas vacías.
+- **Mutaciones verificadas** (todas ejecutadas, cada una detectada por algún test): cada regla de la tabla (vacía, tope de columnas, columna inexistente, repetida y cifrada, tope de restricciones, `UNIQUE` = PK, la columna nueva incluida), las posiciones precalculadas, cada regla cruzada (nombre repetido, tabla referida, cantidad, tipo), la validación cruzada en `insert_table`, `try_from_tables` y `try_build`, la asignación de `referenced_by` en esos tres caminos y en `add_column_with_constraints`, la tabla candidata en la validación cruzada, validar antes de mutar en `add_column_with_constraints`, el orden de las `UNIQUE` agregadas después de las existentes, la subida de versión (y que sea una sola aunque lleguen `UNIQUE` y FK juntas), `deny_unknown_fields` de `ColumnDef`, `UniqueConstraint` y `ForeignKey`, y los dos `#[serde(default)]`.
+- **Interacciones revisadas:**
+  - `Schema::insert_table`: la deserialización, `try_from_tables` y `SchemaBuilder` insertan sin la validación cruzada y la corren una vez, con todas las tablas (así una FK puede apuntar a una tabla de id mayor o formar un ciclo). `insert_table`, público, ahora también la corre después de agregar su tabla y la saca si falla: una tabla suelta entra solo después de las que referencia. Tests: `a_foreign_key_to_a_missing_table_is_rejected`, `a_foreign_key_may_reference_a_table_with_a_larger_id`, `a_constraint_name_is_unique_in_the_whole_schema`.
+  - `schemas/{id}.json` ya escritos: el CRC32 se verifica sobre los bytes tal como se escribieron (`durable::verified_json`) antes de parsear, y las listas faltantes leen vacías. Test: `a_schema_without_constraint_fields_still_reads`. El registry solo reescribe en `add_column`, con un checksum nuevo.
+  - `TableBuffer::apply` y `validate_operation`: no cambian ni miran las restricciones (`cargo test --workspace` en verde).
+  - `PartialEq` y `Hash`: siguen derivados. Los datos precalculados (`column_indices`, las posiciones, `id_by_name`, `referenced_by`) son función de los campos serializados, así que no cambian la igualdad; las restricciones sí son parte de la identidad. Tests: `constraints_are_part_of_the_schema_identity` y los roundtrips, que comparan también lo reconstruido.
+  - Fuzzers de decodificación (INV-W1): el de JSON de esquema reconstruye cada tabla con `try_with_constraints`, y los de mensajes llevan esquemas con restricciones. Los topes se chequean antes de recorrer cada restricción, y la validación cruzada es O(restricciones · log).
+  - `SchemaBuilder::build` ahora entra en pánico si la validación cruzada falla, como ya lo hacía `table`; `try_build` es la variante que devuelve el error. Los usos de servidor, storage y cliente no declaran restricciones.
+  - **Servidor, sin cambio de código:** `POST /admin/schemas` ya acepta restricciones, porque deserializa `Schema` con su validación (una inválida es 400), y la columna de `POST .../columns` rechaza campos desconocidos porque es un `ColumnDef`. `.../columns` sigue usando `add_column`, sin restricciones. Los tests de la API y `§7.1` quedan para el Lote 2.
+  - Storage: recibe esquemas con restricciones y todavía las ignora (Lotes 3 a 5). El `.snap` no guarda el esquema, y la apertura solo verifica que existan las tablas.
+  - **Ventana hasta el Lote 2** (revisión de delta, L1): `AddColumnRequest` no rechaza campos desconocidos, así que `POST .../columns` con el cuerpo de §3.3 responde 200 y agrega la columna **sin** la restricción, en silencio, y por DR3 ya no se le puede agregar después. `ARCHITECTURE.md` §3.1 lo aclara: hasta el Lote 2, las restricciones solo se declaran al crear el esquema. El Lote 2 lo cierra (`deny_unknown_fields` y restricciones en `AddColumnRequest`); conviene no publicar un release entre los dos lotes.
+  - **Reasignación de una sala** (`RoomManager::get_or_spawn` con esquema): hoy acepta un esquema con otras restricciones. Es inocuo mientras el storage no las verifica, y lo cierra el Lote 2.
+  - **`Registered`, `Schema` y `ReloadSchema`** llevan esquemas más grandes: acotados por los topes (32 restricciones de hasta 16 columnas por tabla). El tamaño frente a la reserva de 16 MiB por respuesta se revisa en el Lote 2, como ya estaba previsto.
+- **Revisión de delta** (agente aparte, contexto fresco, solo lectura): sin hallazgos Altos ni Medios. Se atendieron:
+  - **L2 y L3:** el test de evolución agrega en una sola llamada una `UNIQUE` y una FK sobre una tabla que ya tenía una `UNIQUE`, y verifica la versión, el orden y las posiciones. Las dos mutaciones que sobrevivían ahora se detectan.
+  - **N4:** `insert_table` y `add_column_with_constraints` mutaban y revertían ante un error. Ahora la validación cruzada no muta: valida el esquema con la tabla candidata y devuelve el `referenced_by` nuevo, y recién entonces se escribe.
+  - **L1, N2 y N3:** en las interacciones.
+  - **N1:** el estado de INV-C1 en `INVARIANTES.md` pasa de "Lotes 1 y 5" a "Lote 5" (ver desvíos).
+- **Chequeos:** fmt, clippy, test, doc y el build wasm32 de §5.1 en verde, y `cargo test -p zemdb-core --release -- --ignored`.
+- **Desvíos:**
+  - **Regla agregada:** una restricción sin columnas es un error (`EmptyConstraint`). Su clave sería la tupla vacía, nunca `NULL`, así que todas las filas chocarían.
+  - **`TableSchema::try_new` conserva su firma** (tabla sin restricciones) y la validación vive en `TableSchema::try_with_constraints`, al que delega. Se agregó `SchemaBuilder::try_build`.
+  - **`insert_table` valida lo cruzado** (ver interacciones). El plan solo pedía no ponerlo en el camino de la deserialización.
+  - **`INVARIANTES.md`:** el plan no lo listaba para este lote. INV-C1 deja de esperar al Lote 1, porque la regla de DR3 en la que se apoya ya está, y su "Sostenida por" en INV-E1 suma `add_column_with_constraints`. Sigue 🆕 hasta el Lote 5 y la revisión de cierre.
+  - **Tamaño:** ~470 líneas de producción sin comentarios, por encima del tope de ~300 de §5.1. La mayor parte son las doce variantes de error y los literales que expande rustfmt. No se partió el lote.
+- **Fuera del lote (backlog):** `TableSchema::try_new` acepta una columna repetida en la clave primaria (por ejemplo, `"primary_key": ["id", "id"]` en JSON; `TableBuilder` la deduplica). Es preexistente y de severidad baja: la clave queda con aridad 2 y se valida igual en todos lados. Con el Lote 1, además, una `UNIQUE` `["id"]` sobre esa tabla no se reconoce como igual a la PK.
 
 ### Lote 2 · Servidor: dueño, inmutabilidad y API de administración · ⬜ Pendiente
 **Objetivo:** lo que verifica el servidor (DR10 y DR11) y la administración de los esquemas con restricciones.

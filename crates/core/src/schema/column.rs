@@ -7,7 +7,11 @@ use serde::{Deserialize, Serialize};
 /// part of the primary key, whether it may be appended later) depends on the table, which
 /// checks it when the table is built, deserialized or evolved with `add_column`. The fields
 /// are read through accessors so that a column cannot change once it belongs to a table.
+///
+/// Deserialization rejects unknown fields: a field this version does not know, such as a
+/// `"unique": true` meant as a constraint, would otherwise be ignored without notice.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ColumnDef {
     pub(crate) name: String,
     pub(crate) data_type: DataType,

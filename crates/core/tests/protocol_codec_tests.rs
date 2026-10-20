@@ -161,7 +161,10 @@ fn test_protocol_binary_serialization_roundtrip() {
         .table(
             TableSchema::builder("tasks")
                 .primary_key("id", DataType::Uuid)
-                .column("title", DataType::String),
+                .column("title", DataType::String)
+                .nullable_column("parent", DataType::Uuid)
+                .unique("tasks_title", ["title"])
+                .foreign_key("tasks_parent", ["parent"], "tasks"),
         )
         .build();
     assert_roundtrip(&ServerMessage::Registered {

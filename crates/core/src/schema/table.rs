@@ -1,4 +1,7 @@
 use super::column::ColumnDef;
+use super::constraint::{
+    ForeignKey, UniqueConstraint, MAX_CONSTRAINTS_PER_TABLE, MAX_CONSTRAINT_COLUMNS,
+};
 use super::validation::ValidationError;
 use crate::mutation::{ColumnUpdate, Operation};
 use crate::value::{CompactRow, DataType, PrimaryKey, Row, Value};
@@ -21,6 +24,57 @@ fn check_column_type(table: &str, col: &ColumnDef) -> Result<(), ValidationError
     Ok(())
 }
 
+/// The positions of the columns of the constraint `constraint`, in its order. Rejects an empty
+/// constraint, one over too many columns, and one with an unknown, repeated or encrypted
+/// column: a ciphertext is random, so no replica could compare it.
+fn constraint_column_indices(
+    table: &str,
+    constraint: &str,
+    names: &[String],
+    columns: &[ColumnDef],
+    column_indices: &BTreeMap<String, usize>,
+) -> Result<Vec<usize>, ValidationError> {
+    if names.is_empty() {
+        return Err(ValidationError::EmptyConstraint {
+            table: table.to_string(),
+            constraint: constraint.to_string(),
+        });
+    }
+    if names.len() > MAX_CONSTRAINT_COLUMNS {
+        return Err(ValidationError::TooManyConstraintColumns {
+            table: table.to_string(),
+            constraint: constraint.to_string(),
+            max: MAX_CONSTRAINT_COLUMNS,
+        });
+    }
+    let mut positions = Vec::with_capacity(names.len());
+    for column in names {
+        let Some(&idx) = column_indices.get(column) else {
+            return Err(ValidationError::UnknownConstraintColumn {
+                table: table.to_string(),
+                constraint: constraint.to_string(),
+                column: column.clone(),
+            });
+        };
+        if positions.contains(&idx) {
+            return Err(ValidationError::DuplicateConstraintColumn {
+                table: table.to_string(),
+                constraint: constraint.to_string(),
+                column: column.clone(),
+            });
+        }
+        if columns[idx].encrypted {
+            return Err(ValidationError::EncryptedConstraintColumn {
+                table: table.to_string(),
+                constraint: constraint.to_string(),
+                column: column.clone(),
+            });
+        }
+        positions.push(idx);
+    }
+    Ok(positions)
+}
+
 /// Builder for constructing TableSchema instances declaratively.
 ///
 /// The table id is explicit ([`TableBuilder::table_id`]) or, when the builder is handed to
@@ -31,6 +85,8 @@ pub struct TableBuilder {
     name: String,
     primary_key: Vec<String>,
     columns: Vec<ColumnDef>,
+    unique: Vec<UniqueConstraint>,
+    foreign_keys: Vec<ForeignKey>,
 }
 
 impl TableBuilder {
@@ -40,6 +96,8 @@ impl TableBuilder {
             name: name.into(),
             primary_key: Vec::new(),
             columns: Vec::new(),
+            unique: Vec::new(),
+            foreign_keys: Vec::new(),
         }
     }
 
@@ -84,6 +142,31 @@ impl TableBuilder {
         self
     }
 
+    /// Declares a `UNIQUE` constraint named `name` over `columns`, after the ones declared so
+    /// far. It is validated when the table is built.
+    pub fn unique(
+        mut self,
+        name: impl Into<String>,
+        columns: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.unique.push(UniqueConstraint::new(name, columns));
+        self
+    }
+
+    /// Declares a foreign key named `name` from `columns` to the primary key of the table
+    /// named `references`, after the ones declared so far. It is validated when the table is
+    /// built, and its reference when the schema is built.
+    pub fn foreign_key(
+        mut self,
+        name: impl Into<String>,
+        columns: impl IntoIterator<Item = impl Into<String>>,
+        references: impl Into<String>,
+    ) -> Self {
+        self.foreign_keys
+            .push(ForeignKey::new(name, columns, references));
+        self
+    }
+
     /// The column `name` with its type set to `data_type`, appended (neither nullable nor
     /// encrypted) if it was not declared yet. An existing column keeps its flags.
     fn upsert_column(&mut self, name: String, data_type: DataType) -> &mut ColumnDef {
@@ -111,7 +194,14 @@ impl TableBuilder {
     }
 
     pub(crate) fn build_with_id(self, table_id: u16) -> Result<TableSchema, ValidationError> {
-        TableSchema::try_new(table_id, self.name, self.primary_key, self.columns)
+        TableSchema::try_with_constraints(
+            table_id,
+            self.name,
+            self.primary_key,
+            self.columns,
+            self.unique,
+            self.foreign_keys,
+        )
     }
 }
 
@@ -120,20 +210,33 @@ impl TableBuilder {
 /// Preserves physical column order (DDL definition order) in `columns`
 /// to guarantee stable binary positional serialization and schema evolution,
 /// while providing O(log C) column lookups via `column_indices`.
+///
+/// The `UNIQUE` constraints and foreign keys are kept in declaration order, which is the
+/// order in which they are checked. Their column positions are precomputed like
+/// `column_indices`; like it, they are derived from the serialized fields and never
+/// serialized themselves.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct TableSchema {
     table_id: u16,
     name: String,
     primary_key: Vec<String>,
     columns: Vec<ColumnDef>,
+    unique: Vec<UniqueConstraint>,
+    foreign_keys: Vec<ForeignKey>,
     #[serde(skip)]
     column_indices: BTreeMap<String, usize>,
+    #[serde(skip)]
+    unique_column_indices: Vec<Vec<usize>>,
+    #[serde(skip)]
+    foreign_key_column_indices: Vec<Vec<usize>>,
 }
 
 impl<'de> Deserialize<'de> for TableSchema {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         // `table_id` has no default: a table read from JSON or disk keeps exactly the id it was
         // written with, and one without an id is rejected rather than numbered on the fly.
+        // The constraint lists default to empty in JSON, so a table written before they
+        // existed still reads; the binary encoding is positional and always carries them.
         #[derive(Deserialize)]
         #[serde(rename = "TableSchema", deny_unknown_fields)]
         struct TableSchemaHelper {
@@ -141,14 +244,28 @@ impl<'de> Deserialize<'de> for TableSchema {
             name: String,
             primary_key: Vec<String>,
             columns: Vec<ColumnDef>,
+            #[serde(default)]
+            unique: Vec<UniqueConstraint>,
+            #[serde(default)]
+            foreign_keys: Vec<ForeignKey>,
         }
         let TableSchemaHelper {
             table_id,
             name,
             primary_key,
             columns,
+            unique,
+            foreign_keys,
         } = TableSchemaHelper::deserialize(deserializer)?;
-        TableSchema::try_new(table_id, name, primary_key, columns).map_err(serde::de::Error::custom)
+        TableSchema::try_with_constraints(
+            table_id,
+            name,
+            primary_key,
+            columns,
+            unique,
+            foreign_keys,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -178,12 +295,55 @@ impl TableSchema {
         &self.column_indices
     }
 
-    /// Validates all structural schema invariants and constructs a `TableSchema`.
+    /// The `UNIQUE` constraints, in declaration order.
+    #[inline]
+    pub fn unique_constraints(&self) -> &[UniqueConstraint] {
+        &self.unique
+    }
+
+    /// The foreign keys, in declaration order.
+    #[inline]
+    pub fn foreign_keys(&self) -> &[ForeignKey] {
+        &self.foreign_keys
+    }
+
+    /// The column positions of each `UNIQUE` constraint, aligned with
+    /// [`Self::unique_constraints`].
+    #[inline]
+    pub fn unique_column_indices(&self) -> &[Vec<usize>] {
+        &self.unique_column_indices
+    }
+
+    /// The column positions of each foreign key, aligned with [`Self::foreign_keys`].
+    #[inline]
+    pub fn foreign_key_column_indices(&self) -> &[Vec<usize>] {
+        &self.foreign_key_column_indices
+    }
+
+    /// Validates all structural schema invariants and constructs a `TableSchema` without
+    /// constraints.
     pub fn try_new(
         table_id: u16,
         name: impl Into<String>,
         primary_key: Vec<String>,
         columns: Vec<ColumnDef>,
+    ) -> Result<Self, ValidationError> {
+        Self::try_with_constraints(table_id, name, primary_key, columns, Vec::new(), Vec::new())
+    }
+
+    /// Validates all structural schema invariants, those of the constraints included, and
+    /// constructs a `TableSchema`.
+    ///
+    /// What depends on other tables (that a foreign key's table exists and matches it, and
+    /// that constraint names are unique in the schema) is checked when the table joins a
+    /// [`Schema`](super::Schema).
+    pub fn try_with_constraints(
+        table_id: u16,
+        name: impl Into<String>,
+        primary_key: Vec<String>,
+        columns: Vec<ColumnDef>,
+        unique: Vec<UniqueConstraint>,
+        foreign_keys: Vec<ForeignKey>,
     ) -> Result<Self, ValidationError> {
         let name = name.into();
         if primary_key.is_empty() {
@@ -233,12 +393,50 @@ impl TableSchema {
             }
         }
 
+        if unique.len() + foreign_keys.len() > MAX_CONSTRAINTS_PER_TABLE {
+            return Err(ValidationError::TooManyConstraints {
+                table: name,
+                max: MAX_CONSTRAINTS_PER_TABLE,
+            });
+        }
+        let mut unique_column_indices = Vec::with_capacity(unique.len());
+        for constraint in &unique {
+            let positions = constraint_column_indices(
+                &name,
+                &constraint.name,
+                &constraint.columns,
+                &columns,
+                &column_indices,
+            )?;
+            // The primary key is already unique: the same columns, in any order, would only
+            // duplicate it. The columns are distinct, so equal length and inclusion suffice.
+            if constraint.columns.len() == primary_key.len()
+                && constraint.columns.iter().all(|c| primary_key.contains(c))
+            {
+                return Err(ValidationError::UniqueIsPrimaryKey {
+                    table: name,
+                    constraint: constraint.name.clone(),
+                });
+            }
+            unique_column_indices.push(positions);
+        }
+        let foreign_key_column_indices = foreign_keys
+            .iter()
+            .map(|fk| {
+                constraint_column_indices(&name, &fk.name, &fk.columns, &columns, &column_indices)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(TableSchema {
             table_id,
             name,
             primary_key,
             columns,
+            unique,
+            foreign_keys,
             column_indices,
+            unique_column_indices,
+            foreign_key_column_indices,
         })
     }
 
@@ -283,6 +481,43 @@ impl TableSchema {
         self.column_indices.insert(col.name.clone(), new_idx);
         self.columns.push(col);
         Ok(new_idx as u16)
+    }
+
+    /// This table with `col` appended (as [`Self::add_column`]) and the constraints added
+    /// after its own, each of which must include the new column. What depends on other tables
+    /// is left to the schema.
+    pub(crate) fn with_added_column(
+        &self,
+        col: ColumnDef,
+        unique: Vec<UniqueConstraint>,
+        foreign_keys: Vec<ForeignKey>,
+    ) -> Result<TableSchema, ValidationError> {
+        let mut next = self.clone();
+        let index = usize::from(next.add_column(col)?);
+        let column = &next.columns[index].name;
+        let added = unique
+            .iter()
+            .map(|c| (&c.name, &c.columns))
+            .chain(foreign_keys.iter().map(|fk| (&fk.name, &fk.columns)));
+        for (constraint, columns) in added {
+            if !columns.contains(column) {
+                return Err(ValidationError::ConstraintOmitsNewColumn {
+                    table: next.name.clone(),
+                    constraint: constraint.clone(),
+                    column: column.clone(),
+                });
+            }
+        }
+        next.unique.extend(unique);
+        next.foreign_keys.extend(foreign_keys);
+        TableSchema::try_with_constraints(
+            next.table_id,
+            next.name,
+            next.primary_key,
+            next.columns,
+            next.unique,
+            next.foreign_keys,
+        )
     }
 
     pub fn extract_pk(&self, row: &Row) -> Result<PrimaryKey, ValidationError> {

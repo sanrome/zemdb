@@ -107,11 +107,18 @@ fn valid_schema_round_trips_in_json_and_binary() {
     assert_eq!(schema.version(), 3);
 
     let json = serde_json::to_value(&schema).unwrap();
+    // Every table is written with its constraint lists, even when empty.
+    let written = |table_id, name| {
+        let mut table = table_json(Some(table_id), name);
+        table["unique"] = json!([]);
+        table["foreign_keys"] = json!([]);
+        table
+    };
     assert_eq!(
         json,
         json!({
             "version": 3,
-            "tables": [table_json(Some(0), "tasks"), table_json(Some(4), "projects")]
+            "tables": [written(0, "tasks"), written(4, "projects")]
         }),
         "tables are written as a list in ascending id order"
     );

@@ -116,8 +116,13 @@ fn random_wal_logs_round_trip_long() {
 }
 
 fn check_schemas(seed: u64, cases: u64) {
+    let (mut unique, mut foreign_keys) = (0, 0);
     for_each_case(seed, cases, |rng| {
         let schema = schema(rng);
+        for table in schema.tables() {
+            unique += table.unique_constraints().len();
+            foreign_keys += table.foreign_keys().len();
+        }
         let json = serde_json::to_string(&schema).unwrap();
         let back: Schema = serde_json::from_str(&json).unwrap();
         assert_eq!(back, schema);
@@ -127,6 +132,10 @@ fn check_schemas(seed: u64, cases: u64) {
         let frame = encode_message(&schema).unwrap();
         assert_eq!(decode_message::<Schema>(&frame).unwrap(), schema);
     });
+    assert!(
+        unique > 0 && foreign_keys > 0,
+        "the generator declares constraints"
+    );
 }
 
 #[test]

@@ -422,10 +422,12 @@ pub fn all_error_codes() -> Vec<ErrorCode> {
         .collect()
 }
 
-/// A random valid schema: up to 3 tables of up to 5 columns with a key of 1 or 2 of them, then
-/// up to 3 columns added with `add_column`.
+/// A random valid schema: up to 3 tables of up to 5 columns with a key of 1 or 2 of them, up to
+/// 2 `UNIQUE` constraints and up to 2 foreign keys each (to any of the tables, itself
+/// included), then up to 3 columns added with `add_column`, some with a `UNIQUE` constraint or
+/// a foreign key over them.
 pub fn schema(rng: &mut Rng) -> Schema {
-    let mut tables = Vec::new();
+    let mut shapes: Vec<(u16, String, Vec<String>, Vec<ColumnDef>)> = Vec::new();
     let mut ids = BTreeSet::new();
     let mut names = BTreeSet::new();
     for _ in 0..rng.below(4) {
@@ -458,7 +460,77 @@ pub fn schema(rng: &mut Rng) -> Schema {
             .take(key_len)
             .map(|c| c.name().to_string())
             .collect();
-        tables.push(TableSchema::try_new(id, name, key, columns).unwrap());
+        shapes.push((id, name, key, columns));
+    }
+
+    // Constraint names are unique in the whole schema.
+    let mut constraints = 0;
+    let mut constraint_name = || {
+        constraints += 1;
+        format!("k{constraints}")
+    };
+    let mut tables = Vec::new();
+    for (id, name, key, columns) in &shapes {
+        let plain: Vec<&str> = columns
+            .iter()
+            .filter(|c| !c.is_encrypted())
+            .map(|c| c.name())
+            .collect();
+        let mut unique = Vec::new();
+        for _ in 0..rng.below(3) {
+            let mut chosen: Vec<&str> = Vec::new();
+            for _ in 0..rng.between(1, 4) {
+                let column = *rng.pick(&plain);
+                if !chosen.contains(&column) {
+                    chosen.push(column);
+                }
+            }
+            let is_key =
+                chosen.len() == key.len() && chosen.iter().all(|c| key.iter().any(|k| k == c));
+            if !is_key {
+                unique.push(UniqueConstraint::new(constraint_name(), chosen));
+            }
+        }
+        let mut foreign_keys = Vec::new();
+        for _ in 0..rng.below(3) {
+            let (_, target, target_key, target_columns) = rng.pick(&shapes);
+            let mut chosen: Vec<&str> = Vec::new();
+            for key_column in target_key {
+                let data_type = target_columns
+                    .iter()
+                    .find(|c| c.name() == key_column)
+                    .unwrap()
+                    .data_type();
+                let candidates: Vec<&str> = plain
+                    .iter()
+                    .copied()
+                    .filter(|c| !chosen.contains(c))
+                    .filter(|c| {
+                        columns
+                            .iter()
+                            .any(|d| d.name() == *c && d.data_type() == data_type)
+                    })
+                    .collect();
+                if candidates.is_empty() {
+                    break;
+                }
+                chosen.push(rng.pick(&candidates));
+            }
+            if chosen.len() == target_key.len() {
+                foreign_keys.push(ForeignKey::new(constraint_name(), chosen, target.clone()));
+            }
+        }
+        tables.push(
+            TableSchema::try_with_constraints(
+                *id,
+                name.clone(),
+                key.clone(),
+                columns.clone(),
+                unique,
+                foreign_keys,
+            )
+            .unwrap(),
+        );
     }
     let mut schema = Schema::try_from_tables(tables).unwrap();
     let names: Vec<String> = schema.tables().map(|t| t.name().to_string()).collect();
@@ -467,12 +539,36 @@ pub fn schema(rng: &mut Rng) -> Schema {
             break;
         }
         let table = rng.pick(&names).clone();
-        let column = ColumnDef::new(word(rng, b"abcdefghijklmnopqrstuvwxyz", 6), data_type(rng))
+        let column_name = word(rng, b"abcdefghijklmnopqrstuvwxyz", 6);
+        let encrypted = rng.coin();
+        let mut data_type = data_type(rng);
+        let mut unique = Vec::new();
+        let mut foreign_keys = Vec::new();
+        // A constraint added with a column includes it, and never an encrypted one.
+        if !encrypted && rng.coin() {
+            unique.push(UniqueConstraint::new(constraint_name(), [&column_name]));
+        }
+        if !encrypted && rng.coin() {
+            let targets: Vec<(String, DataType)> = schema
+                .tables()
+                .filter(|t| t.primary_key().len() == 1)
+                .map(|t| {
+                    let key = t.get_column(&t.primary_key()[0]).unwrap();
+                    (t.name().to_string(), key.data_type())
+                })
+                .collect();
+            if !targets.is_empty() {
+                let (target, key_type) = rng.pick(&targets).clone();
+                data_type = key_type;
+                foreign_keys.push(ForeignKey::new(constraint_name(), [&column_name], target));
+            }
+        }
+        let column = ColumnDef::new(column_name, data_type)
             .nullable(true)
-            .encrypted(rng.coin());
-        match schema.add_column(&table, column) {
+            .encrypted(encrypted);
+        match schema.add_column_with_constraints(&table, column, unique, foreign_keys) {
             Ok(_) | Err(ValidationError::DuplicateColumn { .. }) => {}
-            Err(other) => panic!("a nullable column is always accepted: {other}"),
+            Err(other) => panic!("a nullable column with its own constraints is accepted: {other}"),
         }
     }
     schema
@@ -718,7 +814,9 @@ pub fn sample_ops() -> Vec<SequencedOperation> {
     ]
 }
 
-/// Two tables, one with a composite key and an encrypted column, and a column added later.
+/// Two tables, one with a composite key and an encrypted column, with `UNIQUE` constraints and
+/// foreign keys (one to a table with a larger id, one to its own table), and a column added
+/// later with a constraint over it.
 pub fn sample_schema() -> Schema {
     let mut schema = Schema::builder()
         .table(
@@ -726,7 +824,10 @@ pub fn sample_schema() -> Schema {
                 .table_id(0)
                 .primary_key("id", DataType::Int)
                 .column("name", DataType::String)
-                .nullable_column("price", DataType::Float),
+                .nullable_column("price", DataType::Float)
+                .nullable_column("link_b", DataType::Uuid)
+                .unique("items_name", ["name"])
+                .foreign_key("items_link", ["id", "link_b"], "links"),
         )
         .table(
             TableBuilder::new("links")
@@ -734,13 +835,26 @@ pub fn sample_schema() -> Schema {
                 .primary_key("a", DataType::Int)
                 .primary_key("b", DataType::Uuid)
                 .encrypted_column("secret", DataType::String)
-                .nullable_column("flag", DataType::Bool),
+                .nullable_column("flag", DataType::Bool)
+                .unique("links_b_flag", ["b", "flag"])
+                .foreign_key("links_item", ["a"], "items"),
         )
         .build();
     schema
         .add_column(
             "items",
             ColumnDef::new("extra", DataType::Bytes).nullable(true),
+        )
+        .unwrap();
+    schema
+        .add_column_with_constraints(
+            "items",
+            ColumnDef::new("parent", DataType::Int).nullable(true),
+            vec![UniqueConstraint::new(
+                "items_parent_name",
+                ["parent", "name"],
+            )],
+            vec![ForeignKey::new("items_parent", ["parent"], "items")],
         )
         .unwrap();
     schema

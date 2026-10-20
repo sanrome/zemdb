@@ -497,11 +497,13 @@ fn check_schema_json(seed: u64, cases: u64) {
         assert!(decoded.version() >= Schema::FIRST_VERSION);
         let tables: Vec<TableSchema> = decoded.tables().cloned().collect();
         for table in &tables {
-            TableSchema::try_new(
+            TableSchema::try_with_constraints(
                 table.table_id(),
                 table.name(),
                 table.primary_key().to_vec(),
                 table.columns().to_vec(),
+                table.unique_constraints().to_vec(),
+                table.foreign_keys().to_vec(),
             )
             .unwrap();
         }
