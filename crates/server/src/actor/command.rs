@@ -149,8 +149,10 @@ pub enum RoomCommand {
         reply: oneshot::Sender<Result<broadcast::Receiver<RoomEvent>, ServerError>>,
     },
 
-    /// Reload the active schema in this room (e.g. after schema evolution).
+    /// Reload the active schema in this room (e.g. after schema evolution) with `schema`, the
+    /// current version of the schema `schema_id`.
     ReloadSchema {
+        schema_id: SchemaId,
         schema: Arc<Schema>,
         reply: oneshot::Sender<Result<(), ServerError>>,
     },

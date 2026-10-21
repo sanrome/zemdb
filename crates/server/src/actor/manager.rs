@@ -701,7 +701,12 @@ impl RoomManager {
     }
 
     /// Sends the registry's current version of `schema_id` to every running room that uses
-    /// it, and returns the rooms that applied it.
+    /// it, and returns the rooms it was sent to.
+    ///
+    /// A room is listed first and checked again under its spawn lock: one that moved to
+    /// another schema meanwhile, or was deleted and created again with one, is skipped, so a
+    /// room never runs a schema other than its own (and its actor ignores a reload of another
+    /// schema as well).
     ///
     /// Each room gets the version the registry holds when the command is sent, read under the
     /// room's spawn lock, not a version chosen by the caller. The registry only moves forward
@@ -731,6 +736,15 @@ impl RoomManager {
             // reads the registry, which already holds the new schema.
             let reply = {
                 let _guard = self.lock_room(&room_id).await;
+                // The room was listed before its lock was taken: it may have moved to another
+                // schema since, or been deleted and created again with one.
+                let same_schema = self
+                    .room_meta
+                    .get(&room_id)
+                    .is_some_and(|meta| &meta.schema_id == schema_id);
+                if !same_schema {
+                    continue;
+                }
                 let Some(sender) = self.get_room(&room_id) else {
                     continue;
                 };
@@ -738,7 +752,11 @@ impl RoomManager {
                     continue;
                 };
                 let (tx, rx) = oneshot::channel();
-                let cmd = RoomCommand::ReloadSchema { schema, reply: tx };
+                let cmd = RoomCommand::ReloadSchema {
+                    schema_id: schema_id.clone(),
+                    schema,
+                    reply: tx,
+                };
                 if sender.send(cmd).await.is_err() {
                     continue;
                 }

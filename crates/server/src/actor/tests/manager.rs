@@ -6,8 +6,8 @@ use crate::durable;
 use crate::fail_point;
 use std::time::Duration;
 use tempfile::{tempdir, TempDir};
-use zemdb_core::id::SequenceNumber;
-use zemdb_core::schema::{OwnerIdentity, TableBuilder, TableSchema};
+use zemdb_core::id::{ClientId, MutationId, SequenceNumber};
+use zemdb_core::schema::{ColumnDef, OwnerIdentity, TableBuilder, TableSchema, UniqueConstraint};
 use zemdb_core::value::DataType;
 
 fn new_manager(dir: &TempDir) -> RoomManager {
@@ -1450,5 +1450,358 @@ async fn a_room_moves_only_to_a_schema_that_extends_its_own() {
         .await
         .unwrap();
     assert_eq!(schema_of(&sender).await, SchemaId::new("wider").unwrap());
+    manager.shutdown_all().await;
+}
+
+/// Holds the spawn locks of `a` and `b` and starts a reload of `schema_id`, which lists both
+/// rooms and then waits for one of them. Returns that room, the other one, their guards and
+/// the reload.
+async fn reload_stalled_at_one_of<'m>(
+    manager: &'m Arc<RoomManager>,
+    a: &RoomId,
+    b: &RoomId,
+    schema_id: &SchemaId,
+) -> (
+    RoomId,
+    RoomId,
+    SpawnGuard<'m>,
+    SpawnGuard<'m>,
+    tokio::task::JoinHandle<Vec<RoomId>>,
+) {
+    let guard_a = manager.lock_room(a).await;
+    let guard_b = manager.lock_room(b).await;
+    let reload = tokio::spawn({
+        let manager = Arc::clone(manager);
+        let schema_id = schema_id.clone();
+        async move { manager.reload_schema_for_rooms(&schema_id).await }
+    });
+    let waiting = |room: &RoomId| {
+        manager
+            .spawn_locks
+            .get(room)
+            .is_some_and(|lock| Arc::strong_count(&lock) > 2)
+    };
+    wait_until("the reload waits for a room", || waiting(a) || waiting(b)).await;
+    if waiting(a) {
+        (a.clone(), b.clone(), guard_a, guard_b, reload)
+    } else {
+        (b.clone(), a.clone(), guard_b, guard_a, reload)
+    }
+}
+
+async fn served_schema(manager: &RoomManager, room_id: &RoomId) -> (SchemaId, Arc<Schema>) {
+    manager
+        .ask(room_id, |reply| RoomCommand::GetSchema { reply })
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// `first` with a nullable `tag` column added, so that a reload of it has something to send.
+fn add_tag_to_first(manager: &RoomManager) {
+    manager
+        .schema_registry
+        .add_column(
+            &SchemaId::new("first").unwrap(),
+            "tasks",
+            ColumnDef::new("tag", DataType::String).nullable(true),
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_reload_does_not_reach_a_room_that_moved_to_another_schema() {
+    let dir = tempdir().unwrap();
+    let manager = Arc::new(new_manager(&dir));
+    let first = SchemaId::new("first").unwrap();
+    let (x, y) = (
+        RoomId::new("room-x").unwrap(),
+        RoomId::new("room-y").unwrap(),
+    );
+    for room in [&x, &y] {
+        manager
+            .create_room(room.clone(), first.clone(), None)
+            .await
+            .unwrap();
+    }
+    add_tag_to_first(&manager);
+    // `target` extends `first` with `note` where `first` will add a `UNIQUE` column.
+    let target = SchemaId::new("target").unwrap();
+    let target_schema = Schema::builder()
+        .table(
+            TableSchema::builder("tasks")
+                .primary_key("id", DataType::Int)
+                .column("title", DataType::String)
+                .nullable_column("tag", DataType::String)
+                .nullable_column("note", DataType::Int),
+        )
+        .build();
+    manager
+        .schema_registry
+        .register_schema(target.clone(), target_schema)
+        .unwrap();
+
+    // A reload of `first` listed both rooms and waits for one of them; the other one stops
+    // and moves to `target`, and then `first` grows a `UNIQUE` column.
+    let (busy, moved, busy_guard, moved_guard, reload) =
+        reload_stalled_at_one_of(&manager, &x, &y, &first).await;
+    drop(moved_guard);
+    manager.shutdown_room(&moved).await;
+    manager.get_or_spawn(&moved, Some(&target)).await.unwrap();
+    manager
+        .schema_registry
+        .add_column_with_constraints(
+            &first,
+            "tasks",
+            ColumnDef::new("code", DataType::Int).nullable(true),
+            vec![UniqueConstraint::new("tasks_code", ["code"])],
+            Vec::new(),
+        )
+        .unwrap();
+    drop(busy_guard);
+
+    // The reload reaches only the room still on `first`, and the moved room keeps `target`.
+    assert_eq!(reload.await.unwrap(), vec![busy.clone()]);
+    let (served_id, served) = served_schema(&manager, &moved).await;
+    assert_eq!(served_id, target);
+    assert_eq!(
+        *served,
+        *manager.schema_registry.get_schema(&target).unwrap()
+    );
+    let (_, busy_schema) = served_schema(&manager, &busy).await;
+    assert_eq!(
+        *busy_schema,
+        *manager.schema_registry.get_schema(&first).unwrap()
+    );
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn a_reload_does_not_reach_a_room_created_again_with_another_schema() {
+    let dir = tempdir().unwrap();
+    let manager = Arc::new(new_manager(&dir));
+    let first = SchemaId::new("first").unwrap();
+    let unique = SchemaId::new("unique").unwrap();
+    manager
+        .schema_registry
+        .register_schema(
+            unique.clone(),
+            variant_of_test_schema(|t| t.unique("tasks_title", ["title"])),
+        )
+        .unwrap();
+    let (x, y) = (
+        RoomId::new("room-x").unwrap(),
+        RoomId::new("room-y").unwrap(),
+    );
+    for room in [&x, &y] {
+        manager
+            .create_room(room.clone(), first.clone(), None)
+            .await
+            .unwrap();
+    }
+    add_tag_to_first(&manager);
+
+    // While the reload waits for one room, the other one is deleted and created again with
+    // another schema, through the admin operations only.
+    let (busy, recreated, busy_guard, other_guard, reload) =
+        reload_stalled_at_one_of(&manager, &x, &y, &first).await;
+    drop(other_guard);
+    manager.delete_room(&recreated).await.unwrap();
+    manager
+        .create_room(recreated.clone(), unique.clone(), None)
+        .await
+        .unwrap();
+    drop(busy_guard);
+
+    assert_eq!(reload.await.unwrap(), vec![busy]);
+    let (served_id, served) = served_schema(&manager, &recreated).await;
+    assert_eq!(served_id, unique);
+    assert_eq!(
+        *served,
+        *manager.schema_registry.get_schema(&unique).unwrap()
+    );
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn a_room_created_again_with_an_owner_keeps_checking_it_after_a_reload_of_its_old_schema() {
+    let dir = tempdir().unwrap();
+    let manager = Arc::new(new_manager(&dir));
+    let first = SchemaId::new("first").unwrap();
+    let owned = SchemaId::new("owned").unwrap();
+    let owned_schema = variant_of_test_schema(|t| {
+        t.column("owner", DataType::String)
+            .owner("owner", OwnerIdentity::ClientId)
+    });
+    manager
+        .schema_registry
+        .register_schema(owned.clone(), owned_schema)
+        .unwrap();
+    let (x, y) = (
+        RoomId::new("room-x").unwrap(),
+        RoomId::new("room-y").unwrap(),
+    );
+    for room in [&x, &y] {
+        manager
+            .create_room(room.clone(), first.clone(), None)
+            .await
+            .unwrap();
+    }
+    add_tag_to_first(&manager);
+    let (_, recreated, busy_guard, other_guard, reload) =
+        reload_stalled_at_one_of(&manager, &x, &y, &first).await;
+    drop(other_guard);
+    manager.delete_room(&recreated).await.unwrap();
+    manager
+        .create_room(recreated.clone(), owned.clone(), None)
+        .await
+        .unwrap();
+    drop(busy_guard);
+    reload.await.unwrap();
+
+    // "attacker" inserts a row whose owner is "victim" (`first` with `tag` would read that
+    // column as `tag`, without an owner): the commit is refused and nothing is sequenced.
+    let schema = manager.schema_registry.get_schema(&owned).unwrap();
+    let row = zemdb_core::value::RowBuilder::new()
+        .set("id", 1)
+        .set("title", "t")
+        .set("owner", "victim")
+        .build();
+    let op = schema.to_operation_insert("tasks", &row, 1000).unwrap();
+    let attacker = ClientId::new("attacker").unwrap();
+    manager
+        .ask(&recreated, |reply| RoomCommand::RegisterClient {
+            client_id: attacker.clone(),
+            current_seq: None,
+            known_incarnation: None,
+            reply,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let res = manager
+        .ask(&recreated, |reply| RoomCommand::Commit {
+            client_id: attacker.clone(),
+            mutation_id: MutationId::new([1; 16]),
+            last_ack_seq: SequenceNumber::new(0),
+            op,
+            reply,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(res, Err(ServerError::SchemaViolation(_))),
+        "{res:?}"
+    );
+    let bounds = manager.log_bounds(&recreated).await.unwrap();
+    assert_eq!(bounds.head_seq, SequenceNumber::new(0));
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn a_reload_waiting_for_a_rooms_lock_skips_it_if_it_moves_meanwhile() {
+    let dir = tempdir().unwrap();
+    let manager = Arc::new(new_manager(&dir));
+    let first = SchemaId::new("first").unwrap();
+    let room = RoomId::new("room-z").unwrap();
+    manager
+        .create_room(room.clone(), first.clone(), None)
+        .await
+        .unwrap();
+    add_tag_to_first(&manager);
+    let target = SchemaId::new("target").unwrap();
+    let target_schema = Schema::builder()
+        .table(
+            TableSchema::builder("tasks")
+                .primary_key("id", DataType::Int)
+                .column("title", DataType::String)
+                .nullable_column("tag", DataType::String)
+                .nullable_column("note", DataType::Int),
+        )
+        .build();
+    manager
+        .schema_registry
+        .register_schema(target.clone(), target_schema)
+        .unwrap();
+
+    // The reload lists the room and waits for its spawn lock, under which the room moves to
+    // `target`, as a reassignment does: the room is checked again once the lock is taken.
+    let guard = manager.lock_room(&room).await;
+    let reload = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        let first = first.clone();
+        async move { manager.reload_schema_for_rooms(&first).await }
+    });
+    wait_until("the reload waits for the room", || {
+        manager
+            .spawn_locks
+            .get(&room)
+            .is_some_and(|lock| Arc::strong_count(&lock) > 2)
+    })
+    .await;
+    manager.shutdown_room(&room).await;
+    let meta = manager.resolve_metadata(&room, Some(&target)).unwrap();
+    let schema = manager.schema_registry.get_schema(&target).unwrap();
+    manager.spawn_actor(&room, &meta, schema).unwrap();
+    drop(guard);
+
+    assert!(reload.await.unwrap().is_empty());
+    let (served_id, served) = served_schema(&manager, &room).await;
+    assert_eq!(served_id, target);
+    assert_eq!(
+        *served,
+        *manager.schema_registry.get_schema(&target).unwrap()
+    );
+    manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn a_room_created_again_with_the_same_schema_gets_its_newest_version() {
+    let dir = tempdir().unwrap();
+    let manager = Arc::new(new_manager(&dir));
+    let first = SchemaId::new("first").unwrap();
+    let (x, y) = (
+        RoomId::new("room-x").unwrap(),
+        RoomId::new("room-y").unwrap(),
+    );
+    for room in [&x, &y] {
+        manager
+            .create_room(room.clone(), first.clone(), None)
+            .await
+            .unwrap();
+    }
+    add_tag_to_first(&manager);
+    // While a reload of `first` v2 waits for one room, the other one is deleted, `first` gets
+    // to v3, and the room is created again with it: the reload reaches both rooms, each with
+    // the version the registry holds when it is sent, never an older one.
+    let (busy, recreated, busy_guard, other_guard, reload) =
+        reload_stalled_at_one_of(&manager, &x, &y, &first).await;
+    drop(other_guard);
+    manager.delete_room(&recreated).await.unwrap();
+    let newest = manager
+        .schema_registry
+        .add_column(
+            &first,
+            "tasks",
+            ColumnDef::new("code", DataType::Int).nullable(true),
+        )
+        .unwrap();
+    manager
+        .create_room(recreated.clone(), first.clone(), None)
+        .await
+        .unwrap();
+    drop(busy_guard);
+
+    let reloaded = reload.await.unwrap();
+    assert!(reloaded.contains(&busy) && reloaded.contains(&recreated));
+    for room in [&busy, &recreated] {
+        let (served_id, served) = served_schema(&manager, room).await;
+        assert_eq!(served_id, first);
+        assert!(
+            Arc::ptr_eq(&served, &newest),
+            "{room} serves v{}",
+            served.version()
+        );
+    }
     manager.shutdown_all().await;
 }

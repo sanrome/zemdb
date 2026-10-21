@@ -3277,3 +3277,68 @@ mod onboarding_sim {
         run(true, true).await;
     }
 }
+
+async fn reload(sender: &mpsc::Sender<RoomCommand>, schema_id: &str, schema: Schema) {
+    let (tx, rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::ReloadSchema {
+            schema_id: SchemaId::new(schema_id).unwrap(),
+            schema: Arc::new(schema),
+            reply: tx,
+        })
+        .await
+        .unwrap();
+    rx.await.unwrap().unwrap();
+}
+
+async fn schema_of(sender: &mpsc::Sender<RoomCommand>) -> (SchemaId, Arc<Schema>) {
+    let (tx, rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::GetSchema { reply: tx })
+        .await
+        .unwrap();
+    rx.await.unwrap().unwrap()
+}
+
+#[tokio::test]
+async fn a_room_reloads_only_its_own_schema() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let (_, original) = schema_of(&sender).await;
+    let (tx, rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::SubscribeEvents { reply: tx })
+        .await
+        .unwrap();
+    let mut events = rx.await.unwrap().unwrap();
+    let mut evolved = test_schema();
+    evolved
+        .add_column(
+            "tasks",
+            zemdb_core::schema::ColumnDef::new("tag", zemdb_core::value::DataType::String)
+                .nullable(true),
+        )
+        .unwrap();
+
+    // A reload of another schema is ignored: the room keeps the one it was opened with, and
+    // tells no one of a reload.
+    reload(&sender, "other", evolved.clone()).await;
+    let (id, schema) = schema_of(&sender).await;
+    assert_eq!(id, SchemaId::new("todo").unwrap());
+    assert!(Arc::ptr_eq(&schema, &original));
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+
+    // A reload of its own schema takes effect.
+    reload(&sender, "todo", evolved.clone()).await;
+    let (id, schema) = schema_of(&sender).await;
+    assert_eq!(id, SchemaId::new("todo").unwrap());
+    assert_eq!(*schema, evolved);
+    assert_eq!(
+        events.try_recv().unwrap(),
+        RoomEvent::SchemaReloaded(SchemaId::new("todo").unwrap())
+    );
+    fx.manager.shutdown_all().await;
+}

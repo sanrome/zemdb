@@ -341,11 +341,19 @@ impl RoomActor {
                 let _ = reply.send(Ok((self.schema_id.clone(), Arc::clone(&self.schema))));
             }
 
-            RoomCommand::ReloadSchema { schema, reply } => {
-                self.schema = schema;
-                let _ = self
-                    .events_tx
-                    .send(RoomEvent::SchemaReloaded(self.schema_id.clone()));
+            RoomCommand::ReloadSchema {
+                schema_id,
+                schema,
+                reply,
+            } => {
+                // A reload of another schema is not for this room: it was sent to a room that
+                // used it before moving to its current one.
+                if schema_id == self.schema_id {
+                    self.schema = schema;
+                    let _ = self
+                        .events_tx
+                        .send(RoomEvent::SchemaReloaded(self.schema_id.clone()));
+                }
                 let _ = reply.send(Ok(()));
             }
 
