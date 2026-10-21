@@ -158,6 +158,9 @@ fn check_evolution(seed: u64, cases: u64) {
                 .encrypted(rng.coin());
             evolved.add_column(&table, column).unwrap();
             assert_eq!(evolved.version(), before + 1);
+            // A room may move from a version to a later one, never back.
+            assert!(evolved.extends(&v1));
+            assert!(!v1.extends(&evolved));
 
             // Nothing is lost, renumbered or retyped.
             for old in v1.tables() {
@@ -196,4 +199,167 @@ fn operations_stay_valid_under_every_later_schema_version() {
 #[ignore = "long-running randomized test; run with --ignored in release"]
 fn operations_stay_valid_under_every_later_schema_version_long() {
     check_evolution(0xE1_0002, 200_000);
+}
+
+/// `tasks` with `columns` as (name, type, nullable, encrypted) and `key`, at `id`.
+fn tasks_table(
+    id: u16,
+    name: &str,
+    key: &[&str],
+    columns: &[(&str, DataType, bool, bool)],
+) -> TableSchema {
+    let columns = columns
+        .iter()
+        .map(|&(name, data_type, nullable, encrypted)| {
+            ColumnDef::new(name, data_type)
+                .nullable(nullable)
+                .encrypted(encrypted)
+        })
+        .collect();
+    let key = key.iter().map(|k| k.to_string()).collect();
+    TableSchema::try_new(id, name, key, columns).unwrap()
+}
+
+fn notes_table(id: u16) -> TableSchema {
+    tasks_table(
+        id,
+        "notes",
+        &["id"],
+        &[
+            ("id", DataType::Int, false, false),
+            ("body", DataType::String, false, false),
+        ],
+    )
+}
+
+/// `tasks (id, title, note?)` at id 0 with `columns` instead, and `notes (id, body)` at id 1.
+fn schema_with_tasks(columns: &[(&str, DataType, bool, bool)]) -> Schema {
+    Schema::try_from_tables(vec![
+        tasks_table(0, "tasks", &["id"], columns),
+        notes_table(1),
+    ])
+    .unwrap()
+}
+
+const ID: (&str, DataType, bool, bool) = ("id", DataType::Int, false, false);
+const TITLE: (&str, DataType, bool, bool) = ("title", DataType::String, false, false);
+const NOTE: (&str, DataType, bool, bool) = ("note", DataType::Int, true, false);
+
+#[test]
+fn a_schema_extends_another_only_with_nullable_columns_and_tables_added() {
+    let base = schema_with_tasks(&[ID, TITLE, NOTE]);
+    assert!(base.extends(&base));
+
+    // What adding columns and tables can make of it.
+    let mut added = base.clone();
+    added
+        .add_column(
+            "tasks",
+            ColumnDef::new("tag", DataType::String).nullable(true),
+        )
+        .unwrap();
+    added
+        .add_column(
+            "notes",
+            ColumnDef::new("sealed", DataType::Bytes)
+                .nullable(true)
+                .encrypted(true),
+        )
+        .unwrap();
+    added
+        .add_column_with_constraints(
+            "tasks",
+            ColumnDef::new("code", DataType::Int).nullable(true),
+            vec![UniqueConstraint::new("tasks_code", ["code"])],
+            Vec::new(),
+        )
+        .unwrap();
+    assert!(added.extends(&base));
+    let more_tables = Schema::try_from_tables(vec![
+        tasks_table(0, "tasks", &["id"], &[ID, TITLE, NOTE]),
+        notes_table(1),
+        tasks_table(2, "labels", &["id"], &[ID]),
+    ])
+    .unwrap();
+    assert!(more_tables.extends(&base));
+    // A narrower schema is extended by the base, but does not extend it.
+    let narrow = schema_with_tasks(&[ID, TITLE]);
+    assert!(base.extends(&narrow));
+    assert!(!narrow.extends(&base));
+
+    let mut refused: Vec<(&str, Schema)> = vec![
+        ("a dropped column", narrow),
+        ("a dropped middle column", schema_with_tasks(&[ID, NOTE])),
+        (
+            "a renamed column",
+            schema_with_tasks(&[ID, TITLE, ("memo", DataType::Int, true, false)]),
+        ),
+        (
+            "a retyped column",
+            schema_with_tasks(&[ID, TITLE, ("note", DataType::Float, true, false)]),
+        ),
+        (
+            "a column made nullable",
+            schema_with_tasks(&[ID, ("title", DataType::String, true, false), NOTE]),
+        ),
+        (
+            "a column made required",
+            schema_with_tasks(&[ID, TITLE, ("note", DataType::Int, false, false)]),
+        ),
+        (
+            "a column made encrypted",
+            schema_with_tasks(&[ID, TITLE, ("note", DataType::Int, true, true)]),
+        ),
+        ("reordered columns", schema_with_tasks(&[ID, NOTE, TITLE])),
+        (
+            "a column inserted before the old ones",
+            schema_with_tasks(&[ID, ("tag", DataType::String, true, false), TITLE, NOTE]),
+        ),
+        (
+            "a required column added after them",
+            schema_with_tasks(&[ID, TITLE, NOTE, ("tag", DataType::String, false, false)]),
+        ),
+        (
+            "a required column added before a nullable one",
+            schema_with_tasks(&[
+                ID,
+                TITLE,
+                NOTE,
+                ("tag", DataType::String, false, false),
+                ("memo", DataType::Int, true, false),
+            ]),
+        ),
+    ];
+    let other_tables = [
+        (
+            "another primary key",
+            tasks_table(0, "tasks", &["id", "title"], &[ID, TITLE, NOTE]),
+        ),
+        (
+            "a primary key of the same width over another column",
+            tasks_table(0, "tasks", &["title"], &[ID, TITLE, NOTE]),
+        ),
+        (
+            "a renamed table",
+            tasks_table(0, "todos", &["id"], &[ID, TITLE, NOTE]),
+        ),
+        (
+            "the table at another id",
+            tasks_table(2, "tasks", &["id"], &[ID, TITLE, NOTE]),
+        ),
+    ];
+    for (case, tasks) in other_tables {
+        refused.push((
+            case,
+            Schema::try_from_tables(vec![tasks, notes_table(1)]).unwrap(),
+        ));
+    }
+    refused.push((
+        "a missing table",
+        Schema::try_from_tables(vec![tasks_table(0, "tasks", &["id"], &[ID, TITLE, NOTE])])
+            .unwrap(),
+    ));
+    for (case, schema) in &refused {
+        assert!(!schema.extends(&base), "{case}");
+    }
 }

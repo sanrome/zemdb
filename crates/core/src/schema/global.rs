@@ -440,7 +440,7 @@ impl Schema {
     /// schema, table by table: the same `UNIQUE` constraints and foreign keys in the same
     /// order, over the same column positions and referencing the same tables, and the same
     /// owner column and immutability. A room's log is decided under these, so a room is only
-    /// reassigned to a schema that has the same.
+    /// reassigned to a schema that has the same and extends its own (see `extends`).
     pub fn has_same_constraints(&self, other: &Schema) -> bool {
         fn constrained(schema: &Schema) -> Vec<&TableSchema> {
             schema.tables().filter(|t| t.has_constraints()).collect()
@@ -449,6 +449,19 @@ impl Schema {
         mine.len() == theirs.len()
             && mine.iter().zip(&theirs).all(|(a, b)| a.same_constraints(b))
             && self.referenced_by == other.referenced_by
+    }
+
+    /// Whether this schema is `older` with nullable columns and tables added: every table of
+    /// `older` is here with the same id, name and primary key, its columns are the first columns
+    /// of this table, with the same names, types, nullability and encryption, and any column
+    /// after them is nullable. An operation valid under `older` then writes the same columns
+    /// here, and is valid here too if both declare the same owners and immutable tables (see
+    /// `has_same_constraints`), so a room's log means the same under both.
+    pub fn extends(&self, older: &Schema) -> bool {
+        older.tables().all(|old| {
+            self.get_table_by_id(old.table_id())
+                .is_some_and(|new| new.extends(old))
+        })
     }
 
     pub fn to_operation_insert(

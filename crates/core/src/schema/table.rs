@@ -547,6 +547,18 @@ impl TableSchema {
             && self.immutable == other.immutable
     }
 
+    /// Whether this table, the one with the id of `older`, is `older` with columns added after
+    /// its own: the same name and primary key, the columns of `older` as its first ones (same
+    /// names, types, nullability and encryption), and every further column nullable.
+    pub(crate) fn extends(&self, older: &TableSchema) -> bool {
+        self.name == older.name
+            && self.primary_key == older.primary_key
+            && self.columns.starts_with(&older.columns)
+            && self.columns[older.columns.len()..]
+                .iter()
+                .all(ColumnDef::is_nullable)
+    }
+
     /// This table, immutable if `immutable` is set.
     pub fn with_immutable(mut self, immutable: bool) -> Self {
         self.immutable = immutable;

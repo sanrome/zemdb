@@ -1350,3 +1350,105 @@ async fn a_room_moves_only_to_a_schema_with_the_same_constraints_owners_and_immu
     assert_eq!(schema_of(&sender).await, SchemaId::new("second").unwrap());
     manager.shutdown_all().await;
 }
+
+#[tokio::test]
+async fn a_room_moves_only_to_a_schema_that_extends_its_own() {
+    let dir = tempdir().unwrap();
+    let manager = new_manager(&dir);
+    let tasks = || TableSchema::builder("tasks").primary_key("id", DataType::Int);
+    let one = |table: TableBuilder| Schema::builder().table(table).build();
+    let variants = [
+        ("fewer", one(tasks())),
+        ("renamed", one(tasks().column("name", DataType::String))),
+        ("retyped", one(tasks().column("title", DataType::Int))),
+        (
+            "loose",
+            one(tasks().nullable_column("title", DataType::String)),
+        ),
+        (
+            "sealed",
+            one(tasks().encrypted_column("title", DataType::String)),
+        ),
+        (
+            "strict-extra",
+            one(tasks()
+                .column("title", DataType::String)
+                .column("extra", DataType::Int)),
+        ),
+        (
+            "other-key",
+            one(tasks().primary_key("title", DataType::String)),
+        ),
+        (
+            "other-name",
+            one(TableSchema::builder("todos")
+                .primary_key("id", DataType::Int)
+                .column("title", DataType::String)),
+        ),
+        (
+            "other-id",
+            one(tasks().table_id(1).column("title", DataType::String)),
+        ),
+        (
+            "wider",
+            Schema::builder()
+                .table(
+                    tasks()
+                        .column("title", DataType::String)
+                        .nullable_column("note", DataType::Int),
+                )
+                .table(TableSchema::builder("notes").primary_key("id", DataType::Int))
+                .build(),
+        ),
+    ];
+    for (id, schema) in &variants {
+        manager
+            .schema_registry
+            .register_schema(SchemaId::new(*id).unwrap(), schema.clone())
+            .unwrap();
+    }
+    let plain = RoomId::new("plain-room").unwrap();
+    let wide = RoomId::new("wide-room").unwrap();
+    for (room_id, schema) in [(&plain, "first"), (&wide, "wider")] {
+        manager
+            .create_room(room_id.clone(), SchemaId::new(schema).unwrap(), None)
+            .await
+            .unwrap();
+        manager.shutdown_room(room_id).await;
+    }
+
+    let moves = [
+        (&plain, "fewer"),
+        (&plain, "renamed"),
+        (&plain, "retyped"),
+        (&plain, "loose"),
+        (&plain, "sealed"),
+        (&plain, "strict-extra"),
+        (&plain, "other-key"),
+        (&plain, "other-name"),
+        (&plain, "other-id"),
+        (&wide, "first"),
+    ];
+    for (room_id, target) in moves {
+        let meta = fs::read(meta_room_path(&dir, room_id)).unwrap();
+        let res = manager
+            .get_or_spawn(room_id, Some(&SchemaId::new(target).unwrap()))
+            .await;
+        assert!(
+            matches!(res, Err(ServerError::BadRequest(_))),
+            "{room_id} to {target}: {res:?}"
+        );
+        assert_eq!(fs::read(meta_room_path(&dir, room_id)).unwrap(), meta);
+    }
+
+    // The rooms still open with their own schema, and a schema that only adds a nullable
+    // column and a table is accepted.
+    let sender = manager.get_or_spawn(&wide, None).await.unwrap();
+    assert_eq!(schema_of(&sender).await, SchemaId::new("wider").unwrap());
+    let sender = manager
+        .get_or_spawn(&plain, Some(&SchemaId::new("wider").unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(schema_of(&sender).await, SchemaId::new("wider").unwrap());
+    manager.shutdown_all().await;
+}

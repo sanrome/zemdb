@@ -382,9 +382,12 @@ impl RoomManager {
         Ok(meta)
     }
 
-    /// Rejects reassigning `room_id` from the schema `from` to the schema `to` unless both
-    /// declare the same constraints, owners and immutable tables: the room's log was sequenced,
-    /// and its replicas decide on its operations, under those of `from`.
+    /// Rejects reassigning `room_id` from the schema `from` to the schema `to` unless `to`
+    /// extends `from` (it keeps its tables, keys and columns and only adds nullable columns and
+    /// tables) and both declare the same constraints, owners and immutable tables: the room's
+    /// log was sequenced, and its replicas decide on its operations, under `from`. A schema with
+    /// other columns would give the old operations' values to other columns, which a constraint
+    /// added over them later would judge.
     fn check_reassignment(
         &self,
         room_id: &RoomId,
@@ -399,7 +402,15 @@ impl RoomManager {
                 .get_schema(id)
                 .ok_or_else(|| ServerError::SchemaNotFound(id.to_string()))
         };
-        if schema(from)?.has_same_constraints(&*schema(to)?) {
+        let (old, new) = (schema(from)?, schema(to)?);
+        if !new.extends(&old) {
+            return Err(ServerError::BadRequest(format!(
+                "Room '{room_id}' cannot move from schema '{from}' to '{to}': '{to}' does not \
+                 keep the tables, keys and columns of '{from}', adding only nullable columns \
+                 and tables"
+            )));
+        }
+        if old.has_same_constraints(&new) {
             return Ok(());
         }
         Err(ServerError::BadRequest(format!(
