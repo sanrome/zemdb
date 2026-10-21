@@ -2,7 +2,7 @@
 
 **Fecha:** 19 de Octubre de 2026
 **Tipo:** Feature, no remediación. Documento vivo: propuesta, plan por lotes y seguimiento.
-**Estado:** En ejecución. Las decisiones de §3 se adoptaron en el Lote 0 (19 de Octubre de 2026), salvo DR15, que se difirió.
+**Estado:** Cerrada (21 de Octubre de 2026). Las decisiones de §3 se adoptaron en el Lote 0 (19 de Octubre de 2026), salvo DR15, que se difirió. Se ejecutaron los Lotes 0 a 6, más el 6b, que pidió la revisión de cierre, y el 6c, que pidió la revisión de delta del 6b; el 2b quedó diferido.
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md).
 **Lugar en el roadmap:** después del cierre de la [Fase 3.10](2026-10-fase3_10-remediation-plan.md) y antes de la Fase 4 (SDK del cliente).
 
@@ -27,7 +27,7 @@
   - Core: el esquema.
   - Storage: es el grueso. Índices en memoria, la verificación y el resultado por operación de `apply_batch`.
   - Cliente: todavía no existe; se diseña con esto desde el principio (§7).
-- **Plan.** Siete lotes, más uno opcional (§6): contrato, core, servidor (con un 2b opcional de seudónimos), tres de storage y cierre. La metodología está en §5.
+- **Plan.** Siete lotes, más uno opcional (§6): contrato, core, servidor (con un 2b opcional de seudónimos), tres de storage y cierre. La revisión de cierre agregó un 6b, sobre la reasignación de salas, y la revisión de delta del 6b, un 6c, sobre la recarga del esquema. La metodología está en §5.
 
 ---
 
@@ -119,7 +119,7 @@ Se numeran DR1, DR2, etc. para no chocar con la numeración D de los planes de r
 |---|---|---|---|
 | **DR1** | **`UNIQUE`, `FOREIGN KEY` e inmutabilidad: las verifica cada réplica.** Las restricciones son parte del esquema. El servidor valida su definición y las guarda, distribuye y recarga como hoy. No verifica filas ni rechaza commits por ellas, así que no hay `ErrorCode` nuevo para estas tres. Cada réplica decide al aplicar cada operación en orden de secuencia, en `apply_batch` y en el replay del WAL, en los dos motores. Una operación que viola una restricción se rechaza entera, nunca a medias: no cambia tablas ni índices, y `head_seq` avanza igual porque la operación se consumió. Una operación inválida para el esquema (tipo, aridad) sigue siendo un error de `apply_batch`: es un log dañado, no un rechazo. | 1–5 | Adoptada |
 | **DR2** | **Alcance.** El de §2.1. Lo de §2.2 queda afuera. | 0 | Adoptada |
-| **DR3** | **Una restricción nunca cambia la decisión sobre el pasado.** Una restricción nace con el esquema (`POST /admin/schemas`), o con la columna nueva que agrega `add_column`. En ese caso tiene que incluirla: entre sus columnas para `UNIQUE`, y entre las columnas de la tabla hija para una FK. Nunca se agrega sobre columnas existentes, ni se quita ni modifica. El dueño y la inmutabilidad se declaran solo al crear el esquema. Una sala existente solo se reasigna a otro esquema (`RoomManager::get_or_spawn` con esquema) si ese esquema tiene las mismas restricciones, el mismo dueño y la misma inmutabilidad. El porqué está en §3.2. **Alternativa diferida a después de la v0.1:** anclar el esquema en el log (§2.3). Permitiría restricciones sobre columnas existentes, a cambio de tocar el log, el sync y el replay. | 0, 1, 2 | Adoptada |
+| **DR3** | **Una restricción nunca cambia la decisión sobre el pasado.** Una restricción nace con el esquema (`POST /admin/schemas`), o con la columna nueva que agrega `add_column`. En ese caso tiene que incluirla: entre sus columnas para `UNIQUE`, y entre las columnas de la tabla hija para una FK. Nunca se agrega sobre columnas existentes, ni se quita ni modifica. El dueño y la inmutabilidad se declaran solo al crear el esquema. Una sala existente solo se reasigna a otro esquema (`RoomManager::get_or_spawn` con esquema) si ese esquema extiende el suyo (las mismas tablas, claves y columnas, más columnas nullable y tablas nuevas; Lote 6b) y tiene las mismas restricciones, el mismo dueño y la misma inmutabilidad. El porqué está en §3.2. **Alternativa diferida a después de la v0.1:** anclar el esquema en el log (§2.3). Permitiría restricciones sobre columnas existentes, a cambio de tocar el log, el sync y el replay. | 0, 1, 2, 6b | Adoptada |
 | **DR4** | **Semántica de la verificación.** Ver §3.1. En resumen:<br>- Se verifican las restricciones cuyas columnas toca la operación (todas, en un `Insert`).<br>- La igualdad es la de `Value`.<br>- Una clave con algún `NULL` no se verifica.<br>- Las columnas que faltan en una fila corta son `NULL`.<br>- El motivo informado es el de la primera restricción que falla, en un orden fijo. | 4 | Adoptada |
 | **DR5** | **El resultado se informa.** `apply_batch` devuelve `ApplyReport { head_seq, rejected }`, con un elemento `(seq, motivo)` por cada operación no aplicada.<br>- **Motivos:** `Unique`, `ForeignKey` y `Restrict`, con el nombre de la restricción; `Duplicate` (un `Insert` en una tabla inmutable sobre una clave existente); `NotOwner` (la fila existente es de otro dueño); y `MissingRow` (un `Update` sobre una fila que no existe, que hoy se ignora sin aviso).<br>- Solo se listan las excepciones, para no reservar un resultado por operación.<br>- En la recuperación, el reporte se descarta.<br>Los nombres son tentativos. | 3, 4 | Adoptada |
 | **DR6** | **Índices derivados en memoria, sin cambio de formato en disco.**<br>- Un índice por restricción: para `UNIQUE`, clave → PK; para una FK, clave foránea → PK hija. Los dos son multimapas ordenados y persistentes (`imbl`, con clon O(1) como `Table`), para que el motor de disco los clone y los publique junto con las tablas.<br>- Solo se indexan claves sin `NULL`.<br>- No se persisten. Se construyen al abrir (desde el snapshot, antes del replay) y al aplicar un snapshot, y se actualizan con cada operación aplicada.<br>- El `.snap`, el WAL y el envelope `ZMSN` no cambian. | 3 | Adoptada |
@@ -183,6 +183,8 @@ Con DR3, toda restricción agregada después incluye una columna nueva `c`:
 - **Las operaciones posteriores que escriben `c` llegan en una respuesta con la versión nueva,** y el cliente baja ese esquema antes de aplicarlas (INV-E2).
 
 La decisión sobre cada operación es, entonces, la misma bajo cualquier versión del esquema desde la que esa operación es válida. Eso es INV-C1 (§6, Lote 0).
+
+**La reasignación** (revisión de cierre, Lote 6b). El argumento supone que el esquema de la sala desciende, por `add_column`, del esquema bajo el que se secuenció su log. Una reasignación a un esquema con las mismas restricciones pero con otras columnas lo rompe: los valores de las operaciones viejas caen en otras columnas, y una restricción agregada después sobre una de ellas las juzga distinto que antes. Por eso la reasignación exige, además, que el esquema nuevo extienda al viejo.
 
 El dueño y la inmutabilidad no tienen este problema. Solo se declaran al crear el esquema, así que rigen desde la primera operación de cada sala. Además, `add_column` no puede agregar columnas a la clave primaria.
 
@@ -409,9 +411,11 @@ El revisor lo recorre en cada lote de storage:
 | 3 | Índices derivados y `ApplyReport` | storage | DR5, DR6 | S1, S3, S6, C3 | ✅ |
 | 4 | Verificación en las réplicas | storage | DR1, DR4, DR5, DR10, DR11 | Y8, S1, A5, C2, C3, W1 | ✅ |
 | 5 | Snapshots, apertura y evolución | storage | DR3, DR7 | S4, S5, C1, C2, W1 | ✅ |
-| 6 | Cierre | Documentos | DR12, DR14 | Todas las tocadas | ⬜ |
+| 6 | Cierre | Documentos | DR12, DR14 | Todas las tocadas | ✅ |
+| 6b | Reasignación solo a un esquema que extiende el suyo (de la revisión de cierre) | core, server | DR3 | C1, E1 | ✅ |
+| 6c | Recarga del esquema solo a las salas que siguen en él (de la revisión de delta del 6b) | server | DR3, DR10 | C1, A5, E2 | ✅ |
 
-**Requisito para empezar la Fase 4:** Lotes 0 a 6 cerrados, con la revisión de cierre en verde. El 2b está diferido y no es requisito. El diseño del cliente, no su código, puede empezar cuando cierre el Lote 3, que fija el contrato de `apply_batch`.
+**Requisito para empezar la Fase 4:** Lotes 0 a 6 cerrados, con la revisión de cierre en verde. El 2b está diferido y no es requisito. Cumplido el 21 de Octubre de 2026: la revisión de cierre rompió INV-C1 y la revisión de delta del 6b, INV-C1 e INV-A5; los Lotes 6b y 6c las arreglaron, y la fase cerró con todas sus invariantes sostenidas (nota **Hecho** del Lote 6). El diseño del cliente, no su código, puede empezar cuando cierre el Lote 3, que fija el contrato de `apply_batch`.
 
 ### Lote 0 · Contrato · ✅ Hecho
 **Objetivo:** dejar el contrato contra el que se revisa cada lote. Solo documentos.
@@ -1049,7 +1053,7 @@ Positivos:
   - **Los bytes de un snapshot dependen del orden de un `HashMap`.** `RoomSnapshotRef` serializa `&HashMap<u16, Table>`, así que dos réplicas con el mismo estado (o la misma, en dos procesos) producen snapshots con distintos bytes. Los fuzzers de snapshots, entonces, no se reproducen por semilla. No cambia ninguna decisión. Es preexistente y Bajo: se podría serializar las tablas en orden de id.
   - **Un payload de snapshot que repite una clave primaria** (o un id de tabla) se decodifica quedándose con la última. Es determinista, y no le da a un peer hostil nada que no pueda mandar con un snapshot bien formado. Es preexistente y Bajo: se podría rechazar en el decoder, como `SnapshotCorruption`.
 
-### Lote 6 · Cierre · ⬜ Pendiente
+### Lote 6 · Cierre · ✅ Hecho
 **Objetivo:** que los documentos describan lo que quedó, y la revisión de cierre (DR14).
 
 **Qué se hace:**
@@ -1064,6 +1068,111 @@ Positivos:
   - una ★ rota o una ruptura Alta se arregla antes de la Fase 4, en un lote 6b;
   - una Media o Baja de origen (b) o (c) va al backlog.
 - **`INVARIANTES.md`:** las invariantes nuevas pasan a ✅ si la revisión las sostiene.
+
+**Hecho.**
+- **Documentos.**
+  - **`ARCHITECTURE.md`**, pasada de consistencia de §3.1, §4, §5.1, §7 y §8 contra `main` (los nombres de tipos y funciones coinciden con el código):
+    - §3.1: `validate_operation` corre en el servidor antes de secuenciar y en los motores antes de escribir el WAL, y el replay no revalida (revisión, N2); un `Update` ensancha la fila al ancho del esquema con que se aplica (N4); el dueño seudónimo, "diferido después de la v0.1" en lugar de "until it is supported"; la interacción entre dueños, sin "This phase"; *Reassignment* y *Schema Version*, con la regla del Lote 6b.
+    - §4.1: la regla anti-zombi (las réplicas rechazan ese `Update` como `MissingRow`; decía que el servidor lo ignoraba) y *Deletes Are Always Sent* (la fila puede existir en las réplicas; decía "en el servidor").
+    - §6: el relay ya no dice que el cliente "debe" validar el snapshot en la Fase 4: lo hace `apply_snapshot`.
+    - §8: el header `ZEM1` no tiene "schema fingerprint" (N3); el costo de un `Delete`, que mira las FK de todo el esquema que apuntan a su tabla; `SnapshotBehind` y el no-op del head, que se evalúan después de verificar el snapshot; las cifras de memoria de los índices con claves anchas (N1).
+  - **`README.md`:** la fila de la Fase 3.11 en la tabla de estado.
+  - **`ROADMAP.md`:**
+    - fecha y estado, §2 y §4.3.C con la fase cerrada;
+    - §4.4.4 reescrito según §7: la validación liviana del servidor (tipos, dueño declarado, inmutabilidad sobre `Update` y `Delete`); `UNIQUE`, FK, `Duplicate` y `NotOwner` que decide la réplica; el resultado de cada escritura desde el `ApplyReport` del lote de su secuencia; el `ChangeStream`, que no emite nada por rechazos; el dueño que completa el SDK; el pre-chequeo local; y los requisitos abiertos (el reporte perdido ante un crash, las restricciones entre dueños distintos, el `.snap` local que no cumple las restricciones y los borradores offline);
+    - §4.4.7, el cronograma (Lotes 1 a 6 y el 6b, y un ítem en el checklist de la Fase 4) y la matriz de trazabilidad;
+    - en el backlog, una nota de squashing en el punto 8 y un punto 14 nuevo con los Bajos de la fase.
+  - **`INVARIANTES.md`** (versión 5): C1, C2, C3 y A5 pasan a ✅; Y8 confirma su ampliación; §1.4 registra la revisión de cierre y los dos lotes que pidió; C1, A5, E1 y E2 suman las reglas del 6b y el 6c a "Sostenida por" y "Cómo intentar romperla"; S5 y W1, las cifras de memoria.
+- **Revisión de cierre** (agente aparte, de contexto fresco y solo lectura, que probó en su propia copia de `77ca57b`):
+  - **Qué revisó:** el delta `ef2fed0..77ca57b` (el código desde `449aa73`) y los mecanismos con los que interactúa (el commit y el log del servidor, el sync, el WAL y el replay del storage, los snapshots y su relay, el registry de esquemas y la reasignación de salas, el squashing), contra C1, C2, C3 y A5, auditadas por primera vez, Y8, Y5, E1, E2, A1, S1, S3, S4, S5, S6, D9, W1 y W2, y el checklist de §5.4, con las interacciones de las notas de los Lotes 1 a 5.
+  - **Veredictos:** se sostienen C2, C3, A5, Y8 (con un mismo esquema), Y5, E1 (salvo la reasignación), E2, A1, S1, S3, S4, S5, S6, D9, W1 y W2, cada una con su evidencia en archivo y línea y sus tests. **Se rompe C1** (H1). El checklist de §5.4 se cumple, salvo el punto 5 después de una reasignación (H1). No hay códigos `DR`, `INV-` ni `DEF-` en `crates/`.
+  - **Corridas en su copia:** `cargo test --workspace` (920) y las versiones largas de core (13), storage (19) y server (13), en verde. Dos tests de ataque no rompieron nada: un `Update` con dos deltas del dueño para transferir la fila (lo rechaza `validate_operation`, por deltas repetidos o desordenados) y la reapertura de un WAL bajo un dueño, una inmutabilidad y una `UNIQUE` con las que no se escribió (sin pánicos y con decisiones deterministas).
+  - **H1 · INV-C1 ★ · se rompe.** `check_reassignment` solo miraba `has_same_constraints`, así que una sala se movía a un esquema con las mismas restricciones pero con otras columnas. Una restricción agregada después sobre una columna nueva del destino juzgaba entonces las operaciones viejas, cuyos valores habían caído en ella: una réplica nueva diverge sin aviso, y una de disco que reabre pierde una fila (sin compactar) o no abre (`SnapshotCorruption`, compactada). Lo reproducían tres tests en la copia del revisor (dos de storage y uno de servidor), y los de storage, también en una copia propia. El revisor propuso Media, porque solo se llega por la API de librería y con dos acciones del operador; se trató como ★ rota, porque el chequeo de la reasignación aceptaba los dos pasos, el resultado es divergencia o pérdida sin aviso y no es un doble disparador raro (§1.4). Origen: (b), la reasignación con otras columnas es anterior a la fase, y el chequeo del Lote 2 la dejó pasar. **Se arregló en el Lote 6b**, por decisión del dueño del proyecto. La revisión de delta del 6b encontró otro camino, preexistente, que rompía C1 y A5 (F1: una recarga del esquema llegaba a una sala reasignada o recreada con otro), y lo arregló el **Lote 6c**.
+  - **Bajos y notas:**
+    - **N1 (a):** las cifras de memoria de los índices no cubrían claves anchas: el revisor midió unos 620 bytes por entrada con una clave de 16 enteros, y unos 19,9 KB de índices por fila con una tabla al tope (32 `UNIQUE` de 16 columnas), unas 85 veces su fila en un snapshot. Se corrigieron `ARCHITECTURE.md` §8, INV-S5, INV-W1 y §8 de este plan; el dimensionamiento va al backlog.
+    - **N2, N3 y N4 (b):** frases de `ARCHITECTURE.md` que no coincidían con el código. Corregidas (arriba).
+    - **N5 (b):** `create_room` también llega al caso de la sala sin `meta_room.json`. Se sumó a ese ítem del backlog.
+    - **N6 (b):** el mensaje de `SnapshotCorruption` por una fila inválida nombra una tabla según el orden de un `HashMap`. Backlog, Bajo.
+    - **N7 (a):** una línea de comentario de 129 columnas en `fail_point.rs`. Backlog: no entró al 6b, que solo arregla H1.
+    - **N8:** la versión del esquema después de una reasignación. Con el 6b el destino solo agrega columnas y tablas, y un cliente que no baja el esquema falla cerrado; sigue Bajo en el backlog. *Reassignment* de `ARCHITECTURE.md` se corrigió con el 6b.
+- **Backlog** (`ROADMAP.md` §7, punto 14): los Bajos que dejaron los Lotes 1 a 5 en sus notas y los de esta revisión, cada uno con su severidad, su origen y el lote que lo encontró.
+- **Chequeos:** fmt, clippy, test (928) y doc de §5.1, en verde con los documentos, el 6b y el 6c; los de cada uno, en su nota.
+- **Desvíos:**
+  - **Hubo código en el cierre:** los Lotes 6b y 6c, por las ★ rotas, cada uno con su propio procedimiento y su revisión de delta.
+  - **`ARCHITECTURE.md` §6** también se tocó (una frase en futuro sobre la validación de un snapshot), aunque no estaba entre las secciones de la pasada.
+  - **Los Bajos de los lotes** se juntaron en el backlog de `ROADMAP.md`; antes solo estaban en la nota de cada lote.
+
+### Lote 6b · Reasignación solo a un esquema que extiende el suyo (`zemdb-core`, `zemdb-server`) · ✅ Hecho
+**Objetivo:** cerrar H1 de la revisión de cierre (INV-C1 ★).
+
+**Decisión** (del dueño del proyecto, entre esta, prohibir la reasignación de una sala con log, o mandar H1 al backlog como Media): la reasignación exige, además de las mismas restricciones, dueño e inmutabilidad, que el esquema nuevo extienda al viejo. Cada tabla del viejo existe en el nuevo con el mismo id, nombre y clave primaria; sus columnas son las primeras de la tabla nueva, con el mismo nombre, tipo, nulabilidad y cifrado; y las de más son nullable. Se permiten tablas nuevas. DR3 y §3.2 lo dicen.
+
+**Hecho.**
+- **API.** `Schema::extends(&self, older)` (`crates/core/src/schema/global.rs`) busca cada tabla de `older` por id y delega en `TableSchema::extends` (`table.rs`, `pub(crate)`): el mismo nombre y la misma PK, `columns.starts_with(older.columns)` (la igualdad de `ColumnDef` cubre nombre, tipo, nulabilidad y cifrado) y el resto nullable. `RoomManager::check_reassignment` (`crates/server/src/actor/manager.rs`) exige `extends`, con su propio mensaje de `BadRequest`, y después `has_same_constraints`, antes de escribir `meta_room.json`, como antes.
+- **Tests agregados** (2, y dos aserciones en un test aleatorio):
+  - `a_schema_extends_another_only_with_nullable_columns_and_tables_added` (`crates/core/tests/schema_evolution_tests.rs`): un esquema se extiende a sí mismo, y lo extienden él mismo con columnas agregadas por `add_column` y `add_column_with_constraints` (una cifrada) y con una tabla más. Uno más angosto es extendido por él, pero no lo extiende. No lo extienden: una columna quitada (al final y en el medio), renombrada, de otro tipo, que pasa a nullable, a requerida o a cifrada, columnas reordenadas, una columna insertada antes de las viejas, una requerida agregada después, una requerida seguida de una nullable, otra PK (compuesta, y del mismo ancho sobre otra columna), la tabla renombrada, la tabla en otro id y una tabla faltante.
+  - `operations_stay_valid_under_every_later_schema_version` (y su versión larga): cada versión posterior extiende a la anterior, y no al revés.
+  - `a_room_moves_only_to_a_schema_that_extends_its_own` (`crates/server/src/actor/tests/manager.rs`): reasignar a un esquema con una columna menos, renombrada, de otro tipo, nullable, cifrada, con una requerida de más, con otra PK (compuesta), con la tabla renombrada o en otro id, y el caso de H1 (de un esquema con `note` a uno sin ella), es `BadRequest` con `meta_room.json` igual byte a byte. Después, las salas abren con su esquema, y una se mueve a uno que agrega una columna nullable y una tabla.
+  - **Contra el esqueleto** (`extends` siempre `true`, ya llamado en la reasignación): fallaban por aserción los tres.
+- **Mutaciones verificadas** (10, una por vez y restauradas; todas detectadas): sin el nombre de la tabla; sin la PK; la PK comparada solo por largo; columnas comparadas solo por largo; solo por nombre; sin la nulabilidad de las agregadas; nullable solo la última agregada; una tabla faltante aceptada; sin `extends` en la reasignación; y `extends` al revés. **Equivalente, y se quitó:** comparar también el `table_id` en `TableSchema::extends`, porque la tabla ya se busca por id. **Sobrevivientes, y cómo se cerraron:** la PK solo por largo y la nulabilidad solo de la última agregada (revisión, B1 y B2): se agregaron una PK del mismo ancho sobre otra columna y una columna requerida seguida de una nullable.
+- **Interacciones revisadas:**
+  - **El momento de la reasignación:** solo al abrir una sala cuyo actor no corre, y antes de escribir `meta_room.json`; `from == to` sale antes y un esquema faltante sigue siendo `SchemaNotFound`. Test: el nuevo y `a_room_moves_only_to_a_schema_with_the_same_constraints_owners_and_immutability`.
+  - **Los tests existentes** reasignan entre esquemas idénticos (`first` y `second`) y siguen en verde.
+  - **El orden:** primero `extends` y después `has_same_constraints`. Con el prefijo, las posiciones que compara `has_same_constraints` son las mismas columnas.
+  - **Un `add_column` posterior sobre el destino** solo lo extiende, y DR3 vuelve a valer: las operaciones viejas no escribieron más allá del ancho del origen.
+  - **El storage del cliente:** con `extends`, todas las tablas del origen están en el destino (no hay `SchemaMismatch` al abrir) y, con las mismas restricciones, el `.snap` local verifica igual.
+  - **La versión del esquema después de una reasignación** (backlog del Lote 2): si el número coincide y el destino tiene más columnas, el cliente no baja el esquema, y una operación que escriba una columna nueva falla su validación local: falla cerrado. Sigue Bajo.
+  - **`create_room` y una sala sin `meta_room.json`** no son reasignaciones (backlog).
+  - **wasm32:** core compila (build y clippy en verde).
+  - **Un snapshot del relay escrito bajo el esquema de origen** y aplicado con el destino (revisión): con `extends` y las mismas restricciones equivale a una versión posterior, que DR7 y el test de evolución del Lote 5 ya cubren.
+  - **Reasignaciones encadenadas o de ida y vuelta** (revisión): `extends` es transitivo, y se compara contra la versión actual del origen, que extiende a todas las anteriores.
+  - **Una consecuencia conservadora** (revisión): `has_same_constraints` rechaza un destino con una tabla nueva con restricciones, o con una `UNIQUE` sobre una columna nueva de una tabla vieja, aunque DR3 lo haría seguro. Es lo que dice la respuesta 4 de §8.
+  - **La recarga del esquema de origen** en curso mientras la sala se reasigna (revisión): no estaba en la lista y rompía; ver la revisión y el Lote 6c.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura, que probó en su propia copia): sin hallazgos Altos ni Medios en el delta. El lote implementa la decisión y nada más; las 8 mutaciones listadas entonces se detectan, y de 12 propias del revisor sobrevivían 2 (B1 y B2, arriba); el escenario de H1 ahora es `BadRequest` sin reescribir `meta_room.json`, y sobre `77ca57b` se aceptaba. Se atendieron:
+  - **B1 y B2:** los dos casos que faltaban (arriba), y la nota, que decía "otra PK" para el caso compuesto del servidor.
+  - **Interacciones** que faltaban: el snapshot del relay, las reasignaciones encadenadas, la consecuencia conservadora y la recarga (arriba).
+  - **F1 · INV-C1 ★ e INV-A5 ★ · Alto, origen (b):** una recarga del esquema viejo llegaba a una sala que ya estaba en otro. Lo reproducían tres tests en la copia del revisor, y también en una copia propia; es preexistente (pasa igual en `77ca57b`) y el 6b no lo empeora. Se arregló en el **Lote 6c**, por decisión del dueño del proyecto.
+  - **`open_room` y `apply_snapshot` con otro esquema** (Bajo, preexistente): solo por la API del storage, que controla el SDK. Se agregó a §7 como requisito de la Fase 4.
+- **Chequeos:** fmt, clippy, test (922 tests) y doc de §5.1, y el build y clippy wasm32, en verde; los dos jobs MSRV (`cargo +1.88.0 test --workspace` y `cargo +1.85.0 build --workspace --lib --bins`, con un `CARGO_TARGET_DIR` aparte); y `cargo test -p <crate> --release -- --ignored` de core y server.
+- **Desvíos:**
+  - **DR3 y §3.2 cambiaron su texto** (la reasignación) y la respuesta 4 de §8 suma la condición. La reasignación sigue permitida, como se decidió en el Lote 0.
+  - **Tamaño:** unas 20 líneas de producción sin comentarios ni blancos.
+
+### Lote 6c · Recarga del esquema solo a las salas que siguen en él (`zemdb-server`) · ✅ Hecho
+**Objetivo:** cerrar F1 de la revisión de delta del 6b (INV-C1 ★ e INV-A5 ★).
+
+**El problema.** `reload_schema_for_rooms` lista primero las salas que usan el esquema y después, sala por sala, toma su spawn lock y le manda la versión actual, sin volver a mirar si la sala sigue en ese esquema; el actor la instalaba sin comparar ids, y el commit valida con ella. La recarga corre en su propia tarea y espera a cada actor sin timeout: mientras está trabada en una sala, otra de la lista puede reasignarse, o borrarse y recrearse con otro esquema (solo con la API HTTP de administración), y recibir el esquema viejo. Esa sala sirve y valida sus commits con un esquema que no es el suyo hasta que su actor reinicia: juzga su log con restricciones que no tiene (C1) y puede secuenciar una operación que declara dueño a otro cliente (A5). Lo abre solo el operador, pero el efecto es silencioso y queda en el log, y no falla cerrado.
+
+**Decisión** (del dueño del proyecto, entre esta, la misma sin la segunda defensa, o mandar F1 al backlog como Media): con el spawn lock tomado, la recarga vuelve a comprobar que la sala siga en el esquema y, si no, la saltea; y `RoomCommand::ReloadSchema` lleva el `schema_id`, y el actor ignora la recarga de un esquema que no es el suyo.
+
+**Hecho.**
+- **API.** `reload_schema_for_rooms` (`crates/server/src/actor/manager.rs`) compara, bajo el spawn lock, el `schema_id` de `room_meta` de la sala con el de la recarga antes de mandarla, y saltea la sala si no coincide o no tiene metadatos. `RoomCommand::ReloadSchema { schema_id, schema, reply }` (`command.rs`); el actor (`room.rs`) solo instala el esquema, y emite `SchemaReloaded`, si `schema_id` es el suyo, y responde `Ok` en los dos casos.
+- **Tests agregados** (6):
+  - `a_reload_does_not_reach_a_room_that_moved_to_another_schema` (`crates/server/src/actor/tests/manager.rs`): una recarga de `first` lista dos salas y queda trabada en una (con sus spawn locks tomados, como `schema_reload_racing_a_respawn_reaches_the_new_actor`); la otra se reasigna a un esquema que extiende `first`, y `first` suma una columna con `UNIQUE` en la posición de una columna del destino. La recarga llega solo a la sala que sigue en `first`, que recibe su última versión, y la reasignada sirve exactamente su esquema.
+  - `a_reload_does_not_reach_a_room_created_again_with_another_schema`: lo mismo con una sala borrada y creada de nuevo con otro esquema, solo con las operaciones de administración.
+  - `a_room_created_again_with_an_owner_keeps_checking_it_after_a_reload_of_its_old_schema`: la sala recreada con dueño rechaza con `SchemaViolation` un `Insert` de un cliente que declara dueño a otro, y no secuencia nada.
+  - `a_room_reloads_only_its_own_schema` (`crates/server/src/actor/tests/room.rs`): el actor ignora una recarga de otro esquema, sin emitir `SchemaReloaded`, y aplica una del suyo, emitiéndolo.
+  - `a_reload_waiting_for_a_rooms_lock_skips_it_if_it_moves_meanwhile` (revisión, B2): la recarga espera el spawn lock de la sala mientras, con ese lock, la sala se mueve a otro esquema; la saltea, porque vuelve a mirar con el lock tomado.
+  - `a_room_created_again_with_the_same_schema_gets_its_newest_version` (revisión): una sala borrada y creada de nuevo con el mismo esquema, mientras la recarga está trabada, la recibe con la versión que el registry tiene al mandarla, nunca una anterior.
+  - **Contra el esqueleto** (`ReloadSchema` ya llevaba el `schema_id`, pero ni el manager ni el actor lo usaban): fallaban por aserción los cuatro primeros; los dos últimos y la aserción del evento se agregaron por la revisión.
+- **Mutaciones verificadas** (8, una por vez y restauradas): sin el re-chequeo en el manager (lo detectan los dos primeros, porque la sala aparece entre las recargadas aunque el actor la ignore); el re-chequeo al revés (cuatro tests, también los dos de recarga que ya existían); el actor que aplica cualquier recarga (el del actor); el actor al revés (tres tests); el re-chequeo antes de tomar el lock (el de la sala movida bajo su lock); el evento emitido aunque se ignore la recarga (el del actor); y, de la regla previa, la versión leída antes de recorrer las salas (dos tests). **Sobrevivientes, y cómo se cerraron:** el re-chequeo antes del lock y el evento (revisión, B1 y B2): los dos tests y la aserción nuevos. **Equivalente:** aceptar en el re-chequeo una sala sin metadatos. El actor saca su entrada de `room_meta` justo antes de salir, así que una sala sin metadatos no corre o se está cerrando, y el chequeo del actor cubre igual ese caso; se dejó la forma conservadora.
+- **Interacciones revisadas:**
+  - **La recarga y el respawn** (`schema_reload_racing_a_respawn_reaches_the_new_actor`): el respawn resuelve los metadatos antes de que la recarga tome el lock, así que la sala sigue listada y recibe la versión nueva. Sigue en verde.
+  - **La creación concurrente** (`schema_reload_does_not_block_concurrent_room_creation`): sin cambios; el re-chequeo es una lectura de `room_meta` sin retener la guarda.
+  - **La lista que devuelve la recarga** ya no incluye una sala salteada; el handler de `add_column` no la usa (solo espera a la tarea).
+  - **`SchemaReloaded`:** solo se emite si el actor instaló el esquema.
+  - **El orden de los comandos:** el actor aplica los comandos en orden, así que una recarga de su esquema que llega después de otra más nueva no lo atrasa (como antes: cada recarga lee el registry al mandarse).
+  - **Una sala recreada con el mismo esquema** (revisión): sigue en la lista y recibe la versión que el registry tiene al mandarse; el registry solo avanza. Test: `a_room_created_again_with_the_same_schema_gets_its_newest_version`.
+  - **No hay ventana entre el re-chequeo y el envío** (revisión): los dos van bajo el mismo spawn lock, que toman `delete_room`, `create_room` y la reasignación y el respawn (`slot`); la única que escribe `room_meta` sin él es la tarea del actor al salir, y solo saca su entrada. Test: `a_reload_waiting_for_a_rooms_lock_skips_it_if_it_moves_meanwhile`.
+  - **No hay otro emisor del esquema a un actor vivo** (revisión): `ReloadSchema` solo lo arma la recarga; `get_or_spawn` con un esquema sobre una sala viva devuelve el actor sin reasignarlo, y `create_room` sobre ella es `RoomAlreadyExists`. El rechazo de comandos al cerrar (`command.rs`) no cambia.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura, que probó en su propia copia): en verde, sin hallazgos Altos ni Medios. El lote implementa la decisión y nada más; no rompe C1, A5, E2, Y5, L1, L2, D5 ni A1; F1 ya no se reproduce (sin el delta, los tres tests de la revisión del 6b reproducen el defecto; con él, fallan en su aserción del defecto); `cargo test --workspace` (926) y las largas de server, en verde. Se atendieron:
+  - **B1 y B2:** sobrevivían el evento emitido aunque se ignore la recarga y el re-chequeo antes del lock. Se agregaron la aserción y el test (arriba).
+  - **B3:** `ARCHITECTURE.md` §7.1 decía que `SchemaReloaded` se emite "across all active rooms"; ahora, en las que usan el esquema.
+  - **Nota:** el docstring de `reload_schema_for_rooms` decía que devuelve las salas que aplicaron el esquema; ahora, las salas a las que se mandó.
+  - **Interacciones** que faltaban: la sala recreada con el mismo esquema, la ventana y los otros emisores (arriba).
+- **Chequeos** (después de atender la revisión): fmt, clippy, test (928 tests) y doc de §5.1, y el build y clippy wasm32, en verde; los dos jobs MSRV (`cargo +1.88.0 test --workspace` y `cargo +1.85.0 build --workspace --lib --bins`, con un `CARGO_TARGET_DIR` aparte); y `cargo test -p <crate> --release -- --ignored` de core y server.
+- **Documentos:** `ARCHITECTURE.md` §7.1 (la recarga solo llega a las salas que siguen en el esquema); `INVARIANTES.md`: C1 y A5 en "Sostenida por", y C1, A5 y E2 en "Cómo intentar romperla".
+- **Desvíos:** ninguno respecto de la decisión. **Tamaño:** unas 20 líneas de producción sin comentarios ni blancos.
 
 ---
 
@@ -1088,6 +1197,7 @@ Positivos:
 - **`ROADMAP.md` §4.4.4.** El paso 2 deja de decir que el servidor valida las restricciones. El servidor valida lo liviano, incluido el dueño declarado. La réplica decide `UNIQUE`, FK, `Duplicate` y `NotOwner`.
 - **Restricciones entre dueños distintos** (revisión del Lote 4). Las reglas valen igual para todos los miembros: uno puede ocupar primero una clave `UNIQUE`, y una fila propia que referencia la fila de otro (que ese otro no puede borrar, `NotOwner`) le impide borrar la suya (`RESTRICT`). No rompe INV-A5, que habla de escribir filas ajenas, pero limita lo que §1.1 promete. El diseño de la Fase 4 decide si alcanza con documentarlo para quien escribe el esquema (por ejemplo, que una FK hacia una tabla con dueño incluya la columna dueño) o si hace falta una regla nueva.
 - **Un snapshot local que no cumple las restricciones** (revisión del Lote 5). `open_room` lo rechaza con `SnapshotCorruption`, la misma variante que un CRC roto o un archivo truncado, pero no es daño en el archivo: solo pasa si la sala se abre con restricciones con las que sus datos no se escribieron, y vuelve a abrir con el esquema con que se escribieron. El SDK no debe reaccionar a ese error descartando la réplica local para resincronizar, porque perdería datos intactos y escrituras pendientes. El diseño de la Fase 4 decide si alcanza con distinguirlo por el mensaje o si hace falta una variante propia del error.
+- **El esquema con que el SDK abre y aplica** (revisión de delta del Lote 6b). `open_room` y `apply_snapshot` aceptan cualquier esquema que tenga las tablas de la sala: las columnas no se verifican. El SDK abre la sala solo con el esquema que le sirve el servidor y, ante un cambio (una versión nueva o una reasignación), exige que el nuevo extienda al viejo con las mismas restricciones (`Schema::extends` y `Schema::has_same_constraints`), y si no, falla cerrado. Opcionalmente, `apply_snapshot` podría rechazar un esquema que no extienda el actual.
 - **Borradores offline (post-v0.1).** Con restricciones, mandar lo consolidado deja de ser equivalente a mandar en orden. Por ejemplo, `Insert(u = 1)` seguido de `Update(u = 2)` puede dar otro resultado que un único `Insert(u = 2)` si una de las dos claves choca. El gestor de borradores tiene que elegir entre no consolidar las columnas con restricciones o aceptar esa diferencia, y documentarla.
 
 ---
@@ -1099,7 +1209,7 @@ Todas resueltas en el Lote 0:
 1. ¿`RESTRICT`, o que el borrado de un padre deje a los hijos colgando? Resuelta: `RESTRICT`.
 2. ¿Se informa `MissingRow`? Resuelta: sí.
 3. Los topes de DR9. Resuelta: 32 restricciones por tabla y 16 columnas por restricción.
-4. Reasignación de esquema: ¿solo con las mismas restricciones, o prohibida para una sala con log? Resuelta: solo con las mismas restricciones, dueño e inmutabilidad.
+4. Reasignación de esquema: ¿solo con las mismas restricciones, o prohibida para una sala con log? Resuelta: solo con las mismas restricciones, dueño e inmutabilidad; desde el Lote 6b, además, solo a un esquema que extiende el suyo.
 5. ~~Seudónimos (Lote 2b): ¿entran en esta fase o se difieren?~~ Resuelta: se difieren a después de la v0.1.
 6. Alcance del seudónimo: ¿por tabla, o también por fila? Por fila sería, por ejemplo, incluir `poll_id` en la derivación, para que los votos de un cliente en encuestas distintas no se puedan vincular. El servidor lo podría calcular sin estado, porque esos valores vienen en la operación. Diferida con el Lote 2b; la propuesta es por tabla.
 7. ¿La encarnación de la sala entra en la derivación del seudónimo? Diferida con el Lote 2b; la propuesta es que sí, porque una sala recreada es otra sala.
@@ -1108,5 +1218,5 @@ Todas resueltas en el Lote 0:
 **Riesgos:**
 - **Divergencia por un error de implementación** (DR13): la mitigan el oráculo, la convergencia y la revisión de cierre, y la detectaría un digest de estado (backlog).
 - **Operación veneno:** un pánico del verificador después de escribir el WAL deja la sala sin poder abrir (§5.3, capa 4).
-- **Memoria:** cada restricción indexa, por fila, su clave y la PK. Medido en el Lote 3: entre 167 y 221 bytes por fila y por restricción, contra 264 de una fila de cuatro columnas (nota **Hecho** del Lote 3). Con filas como las medidas, una sala de 100 MB de filas y tres restricciones por tabla ocupa unos 330 MB en RAM. Si resultara mucho para el cliente, queda buscar una representación más compacta.
+- **Memoria:** cada restricción indexa, por fila, su clave y la PK. Medido en el Lote 3: entre 167 y 221 bytes por fila y por restricción, contra 264 de una fila de cuatro columnas (nota **Hecho** del Lote 3). La revisión de cierre midió unos 620 bytes con una clave de 16 columnas: una tabla al tope (32 `UNIQUE` de 16 columnas) suma unos 19,9 KB de índices por fila, unas 85 veces lo que ocupa su fila en un snapshot. Con filas como las medidas, una sala de 100 MB de filas y tres restricciones por tabla ocupa unos 330 MB en RAM. Si resultara mucho para el cliente, queda buscar una representación más compacta.
 - **Costo de abrir una sala:** construir los índices es O(N log N) por restricción, en el pool bloqueante.

@@ -1,6 +1,6 @@
 # Invariantes de ZemDB
 
-**Estado:** Vigente. Versión 4 (19 de Octubre de 2026): agrega las invariantes de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md) (DR1–DR14): INV-A5 e INV-C1 a C3, nuevas, y el enunciado ampliado de INV-Y8. La versión 3 (18 de Octubre) incorpora las decisiones de la [Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (D90–D97) tomadas sobre la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md). La versión 2 (16 de Octubre) incorporó las de la [Fase 3.9](proposals/2026-10-fase3_9-remediation-plan.md) (D70–D72, D77–D79) y es la que auditó la 2ª ronda; la versión 1 (15 de Octubre, sobre `6485f46`), la que auditó la [primera](audits/2026-10-invariantes-audit.md).
+**Estado:** Vigente. Versión 5 (21 de Octubre de 2026): cierra la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md). Sus invariantes nuevas, INV-A5 e INV-C1 a C3, pasan a ✅ después de su revisión de cierre (DR14) y de los Lotes 6b y 6c, que arreglaron las dos rupturas que encontró el cierre (ver §1.4); INV-Y8 confirma su enunciado ampliado. La versión 4 (19 de Octubre) agrega las invariantes de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md) (DR1–DR14): INV-A5 e INV-C1 a C3, nuevas, y el enunciado ampliado de INV-Y8. La versión 3 (18 de Octubre) incorpora las decisiones de la [Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (D90–D97) tomadas sobre la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md). La versión 2 (16 de Octubre) incorporó las de la [Fase 3.9](proposals/2026-10-fase3_9-remediation-plan.md) (D70–D72, D77–D79) y es la que auditó la 2ª ronda; la versión 1 (15 de Octubre, sobre `6485f46`), la que auditó la [primera](audits/2026-10-invariantes-audit.md).
 **Uso:** base de las auditorías por invariantes y de los tests de propiedades. Reemplaza a las auditorías abiertas por perspectiva ("buscá errores desde X").
 **Contrato de referencia:** [`ARCHITECTURE.md`](../ARCHITECTURE.md). Las invariantes se enuncian sobre el comportamiento observable y remiten a la sección que lo describe; no citan líneas de código, para que el documento no envejezca con cada refactor.
 
@@ -47,6 +47,7 @@ Una auditoría por invariantes está **en verde** cuando:
 
 **Después de la 2ª auditoría (D90).** No hay más rondas amplias periódicas:
 - La Fase 3.10 cierra con una **revisión de cierre** de su delta: las mismas tres condiciones, sobre lo que la fase tocó y los mecanismos con los que eso interactúa. En verde, el código auditado se considera estable. Salió en verde sobre `d2c1406`, con una Media de origen (b), DEF-182, que se arregló después.
+- La Fase 3.11 cerró igual, con una revisión de cierre de su delta (DR14) sobre `77ca57b`, que auditó por primera vez sus invariantes nuevas. Rompió INV-C1 ★: una sala se podía reasignar a un esquema con otras columnas, y una restricción agregada después juzgaba de otro modo su log. El Lote 6b lo arregló. Su revisión de delta encontró otro camino, preexistente, que rompía INV-C1 ★ e INV-A5 ★: una recarga del esquema, trabada en otra sala, llegaba a una sala que mientras tanto se había reasignado o recreado con otro esquema, que pasaba a validar sus commits con el viejo (también el dueño). Lo arregló el Lote 6c. Los dos tuvieron su propia revisión de delta, antes del cierre.
 - Desde entonces, cada cambio se revisa por su delta contra esta lista y contra los mecanismos con los que interactúa. Lo que aparezca de origen (b) o (c), Medio o Bajo, va al backlog, no a un plan nuevo.
 - Una auditoría amplia vuelve a hacer falta solo si cambia el modelo de amenaza (§2), o si entra código fuera del alcance actual, como el SDK de la Fase 4. En ese caso se audita una vez, con este método, contra las invariantes nuevas de ese código.
 
@@ -91,7 +92,7 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 
 ### Resumen
 
-Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md) (ver §1.5), con los lotes del [plan de la Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (cerrados: 0 a 5, con la revisión de cierre) y las decisiones D92 a D102. Las invariantes de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md) son nuevas (🆕): entre paréntesis va el lote que las implementa, y se auditan por primera vez en su revisión de cierre (DR14).
+Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md) (ver §1.5), con los lotes del [plan de la Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (cerrados: 0 a 5, con la revisión de cierre) y las decisiones D92 a D102. Las invariantes de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md) se auditaron por primera vez en su revisión de cierre (DR14, sobre `77ca57b`), y quedan sostenidas con los Lotes 6b y 6c.
 
 | ID | Invariante | ★ | Si se rompe | Estado |
 |---|---|---|---|---|
@@ -131,7 +132,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-A2** | Nada se decodifica antes de autenticar, salvo lo acotado de `/register` | | Alto | ✅ |
 | **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio | ❌ Bajo (backlog) |
 | **INV-A4** | Ningún identificador produce rutas fuera de `data_dir` | ★ | Alto | ✅ |
-| **INV-A5** | Nadie escribe una fila ajena | ★ | Alto | 🆕 (Fase 3.11) |
+| **INV-A5** | Nadie escribe una fila ajena | ★ | Alto | ✅ |
 | **INV-B1** | La memoria por request está acotada | ★ | Alto | ✅ |
 | **INV-B2** | Nada se retiene sin plazo | | Medio | ✅ |
 | **INV-B3** | La memoria, el disco y los FDs del servidor están acotados por la configuración | | Medio | ✅ |
@@ -148,9 +149,9 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-E2** | Un cliente con el esquema viejo siempre puede enterarse | | Bajo | ✅ |
 | **INV-W1** | Ninguna entrada hace entrar en pánico, abortar ni reservar de más | ★ | Alto | ✅ |
 | **INV-W2** | Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum | | Medio | ✅ (D92) |
-| **INV-C1** | Ninguna versión posterior del esquema cambia la decisión sobre una operación ya secuenciada | ★ | Alto | 🆕 (Fase 3.11) |
-| **INV-C2** | El estado de una réplica cumple las restricciones de su esquema | ★ | Alto | 🆕 (Fase 3.11) |
-| **INV-C3** | Un rechazo no deja rastro, y los índices son función de las tablas | | Medio | 🆕 (Fase 3.11) |
+| **INV-C1** | Ninguna versión posterior del esquema cambia la decisión sobre una operación ya secuenciada | ★ | Alto | ✅ |
+| **INV-C2** | El estado de una réplica cumple las restricciones de su esquema | ★ | Alto | ✅ |
+| **INV-C3** | Un rechazo no deja rastro, y los índices son función de las tablas | | Medio | ✅ |
 
 ---
 
@@ -237,7 +238,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-S5 · `apply_snapshot` valida todo y reemplaza atómicamente, o no cambia nada
 **Enunciado.** Un snapshot con otra `head_seq` que la anunciada, una tabla fuera del esquema, una fila inválida o filas que no cumplen las restricciones del esquema se rechaza sin tocar la sala. Uno aceptado reemplaza esquema, head y tablas de una vez. Si la E/S falla después del rename, la llamada devuelve error, la sala queda `RoomFailed` y al reabrirla aparece el snapshot nuevo. La sala nunca retrocede. Ninguna declaración interna del snapshot reserva más memoria que una constante más lo que ocupan sus bytes.
-**Sostenida por.** D48 (§8 *apply_snapshot Rules*, *Bounded Snapshot Decompression*). Las filas también tienen que cumplir las restricciones del esquema que llega con el snapshot (Fase 3.11, DR7): se verifican al construir sus índices, en el pool bloqueante y antes de reemplazar nada, y si no las cumplen el snapshot es `SnapshotCorruption`. Esos índices no salen de una declaración del snapshot sino de sus filas: suman, por fila, hasta una entrada por restricción de su tabla (32 como máximo, de 167 a 221 bytes cada una según lo medido, §8 *Derived Constraint Indexes*). Es proporcional a las filas que trae, con la misma constante que una sala legítima, y la acota el tope de restricciones por tabla (DR9).
+**Sostenida por.** D48 (§8 *apply_snapshot Rules*, *Bounded Snapshot Decompression*). Las filas también tienen que cumplir las restricciones del esquema que llega con el snapshot (Fase 3.11, DR7): se verifican al construir sus índices, en el pool bloqueante y antes de reemplazar nada, y si no las cumplen el snapshot es `SnapshotCorruption`. Esos índices no salen de una declaración del snapshot sino de sus filas: suman, por fila, hasta una entrada por restricción de su tabla (32 como máximo; de 167 bytes con una clave entera a unos 620 con una de 16 columnas, según lo medido, §8 *Derived Constraint Indexes*). Es proporcional a las filas que trae, con la misma constante que una sala legítima, y la acota el tope de restricciones por tabla (DR9).
 **Cómo intentar romperla.** Snapshots fabricados (longitudes declaradas enormes, cuentas de filas falsas, filas con clave distinta de la columna PK, compresión que no termina en la longitud declarada, filas que repiten una clave `UNIQUE` o con una clave foránea sin su fila padre); cierre de la sala durante la decodificación.
 
 #### INV-S6 · Memoria igual a disco
@@ -365,8 +366,8 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-A5 ★ · Nadie escribe una fila ajena
 **Enunciado.** En una tabla con dueño, toda operación secuenciada declara como dueño al cliente que la envió, y ninguna operación aplicada inserta, reemplaza, modifica ni borra una fila cuyo dueño es otro.
-**Sostenida por.** La verificación del dueño declarado en el commit, antes de secuenciar (DR10: `validate_operation` exige que la operación declare el dueño y `Schema::check_owner` lo compara byte a byte con el `ClientId` del token), la verificación de las réplicas sobre la fila existente (DR4, DR10: `apply_operation` rechaza con `NotOwner` un `Insert`, `Update` o `Delete` cuya fila existente es de otro dueño, y con `Duplicate` un segundo `Insert` de una clave inmutable) e INV-A1.
-**Cómo intentar romperla.** Un `Insert`, `Update` o `Delete` de B que declara a A como dueño; uno de B que se declara dueño sobre una fila de A, con el dueño dentro y fuera de la clave; un `Update` que intenta transferir la fila; un reintento deduplicado.
+**Sostenida por.** La verificación del dueño declarado en el commit, antes de secuenciar (DR10: `validate_operation` exige que la operación declare el dueño y `Schema::check_owner` lo compara byte a byte con el `ClientId` del token), la verificación de las réplicas sobre la fila existente (DR4, DR10: `apply_operation` rechaza con `NotOwner` un `Insert`, `Update` o `Delete` cuya fila existente es de otro dueño, y con `Duplicate` un segundo `Insert` de una clave inmutable) e INV-A1. El servidor verifica con el esquema de la sala: una recarga de otro esquema no le llega (Lote 6c).
+**Cómo intentar romperla.** Un `Insert`, `Update` o `Delete` de B que declara a A como dueño; uno de B que se declara dueño sobre una fila de A, con el dueño dentro y fuera de la clave; un `Update` que intenta transferir la fila; un reintento deduplicado; una sala recreada con dueño mientras una recarga de su esquema anterior está trabada en otra sala.
 **Fuera de alcance.** Un snapshot falso de un miembro hostil (DEF-81).
 
 ### 3.6. Recursos acotados
@@ -441,19 +442,19 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 
 #### INV-E1 ★ · El esquema solo crece, y toda operación del log sigue siendo válida
 **Enunciado.** Un esquema registrado nunca pierde, renumera ni cambia el tipo de una tabla o columna. Las columnas nuevas son nullable, y la versión sube con cada cambio. Por eso toda operación aceptada en una sala sigue siendo válida bajo cualquier versión posterior de su esquema, y una réplica siempre puede aplicar el log.
-**Sostenida por.** `Schema::add_column` y `Schema::add_column_with_constraints`, `SchemaAlreadyExists`, deserialización estricta (§3.1, §7.1); el checksum de `schemas/{id}.json` (D82), el lock del registry y el orden de la recarga.
-**Cómo intentar romperla.** `add_column` concurrentes; reinicio a mitad de una escritura del registry; JSON de esquema con ids repetidos, faltantes o campos desconocidos; filas cortas de antes de una columna nueva; un bit invertido en `schemas/{id}.json` (ver INV-D9).
+**Sostenida por.** `Schema::add_column` y `Schema::add_column_with_constraints`, `SchemaAlreadyExists`, deserialización estricta (§3.1, §7.1); la reasignación de una sala solo a un esquema que extiende el suyo (`Schema::extends`, Fase 3.11); el checksum de `schemas/{id}.json` (D82), el lock del registry y el orden de la recarga.
+**Cómo intentar romperla.** `add_column` concurrentes; reinicio a mitad de una escritura del registry; JSON de esquema con ids repetidos, faltantes o campos desconocidos; reasignar una sala a un esquema con otras columnas; filas cortas de antes de una columna nueva; un bit invertido en `schemas/{id}.json` (ver INV-D9).
 
 #### INV-E2 · Un cliente con el esquema viejo siempre puede enterarse
 **Enunciado.** Después de un `add_column`, toda respuesta de `Registered`, `HeartbeatAck`, `SyncBatch` y `CommitAck` de una sala con ese esquema lleva la versión nueva, sin depender de SSE.
 **Sostenida por.** D60 (§7.2).
-**Cómo intentar romperla.** Sala abierta durante la recarga; respawn concurrente con la recarga; reinicio del registry.
+**Cómo intentar romperla.** Sala abierta durante la recarga; respawn concurrente con la recarga; reinicio del registry; una sala que se reasigna o se recrea con otro esquema durante la recarga (no la recibe, Lote 6c).
 
 ### 3.9. Formatos y decodificación
 
 #### INV-W1 ★ · Ninguna entrada hace entrar en pánico, abortar ni reservar de más
 **Enunciado.** Ningún byte de red, de disco (WAL, segmentos, sidecars, snapshots, JSON) ni de un snapshot de otro peer provoca un pánico, un abort o una reserva de memoria desproporcionada a su tamaño. Todo error es tipado.
-**Sostenida por.** `decode_budget`, `Deserialize` propios, `PayloadReader`, CRC antes de decodificar (§7.2 *Defensive Bounding*, §8 *Bounded Snapshot Decompression*). Un snapshot de otro peer que no cumple las restricciones del esquema es un error tipado (`SnapshotCorruption`), y la verificación no entra en pánico: usa la misma función que decide cada operación del log (Fase 3.11). Los índices de sus restricciones ocupan, por fila, hasta una entrada por restricción de su tabla (32 como máximo, de 167 a 221 bytes cada una según lo medido): proporcional a las filas que trae, con la constante de una sala legítima (ver INV-S5).
+**Sostenida por.** `decode_budget`, `Deserialize` propios, `PayloadReader`, CRC antes de decodificar (§7.2 *Defensive Bounding*, §8 *Bounded Snapshot Decompression*). Un snapshot de otro peer que no cumple las restricciones del esquema es un error tipado (`SnapshotCorruption`), y la verificación no entra en pánico: usa la misma función que decide cada operación del log (Fase 3.11). Los índices de sus restricciones ocupan, por fila, hasta una entrada por restricción de su tabla (32 como máximo; de 167 bytes con una clave entera a unos 620 con una de 16 columnas, según lo medido): proporcional a las filas que trae, con la constante de una sala legítima (ver INV-S5).
 **Automatizable.** Fuzzing con generadores propios (sin `cargo fuzz`, D88) de `decode_client_message`, `decode_message`, el decoder de frames WAL, el de sidecars, `SnapshotEnvelopeHeader::parse` y `apply_snapshot`. En el repo desde el Lote 0 de la Fase 3.9.
 
 #### INV-W2 · Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum
@@ -467,8 +468,8 @@ Las de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md): `UN
 
 #### INV-C1 ★ · Ninguna versión posterior del esquema cambia la decisión sobre una operación ya secuenciada
 **Enunciado.** Aplicar el log de una sala con cualquier versión del esquema bajo la que cada operación es válida da el mismo estado y la misma decisión (aplicada o rechazada, con el mismo motivo) para cada operación, al recibirla, al reabrir y al reaplicar el WAL.
-**Sostenida por.** Las restricciones solo nacen con el esquema o con una columna nueva que incluyen (DR3); INV-E1 e INV-E2. Un snapshot (local o de otro peer) escrito con una versión anterior se verifica con la que se abre o aplica, y sus filas cortas leen `NULL` en las columnas que les faltan, así que pasa igual (DR7).
-**Cómo intentar romperla.** Agregar una columna con `UNIQUE` o FK en medio de un log; réplicas que conocen la versión nueva en momentos distintos; reabrir con la versión nueva un WAL y un snapshot escritos con la vieja; reasignar la sala a otro esquema.
+**Sostenida por.** Las restricciones solo nacen con el esquema o con una columna nueva que incluyen (DR3); INV-E1 e INV-E2. Una sala solo se reasigna a un esquema que extiende el suyo (`Schema::extends`: las mismas tablas, claves y columnas, más columnas nullable y tablas nuevas) y que tiene las mismas restricciones, dueños e inmutabilidad (`Schema::has_same_constraints`), así que su log se sigue leyendo igual y una restricción agregada después cae siempre sobre una columna que sus operaciones no escribieron (Lote 6b). Una recarga del esquema solo llega a las salas que siguen en él cuando se toma su spawn lock, y el actor ignora la de otro esquema (Lote 6c). Un snapshot (local o de otro peer) escrito con una versión anterior se verifica con la que se abre o aplica, y sus filas cortas leen `NULL` en las columnas que les faltan, así que pasa igual (DR7).
+**Cómo intentar romperla.** Agregar una columna con `UNIQUE` o FK en medio de un log; réplicas que conocen la versión nueva en momentos distintos; reabrir con la versión nueva un WAL y un snapshot escritos con la vieja; reasignar la sala a otro esquema, con las mismas restricciones pero con menos columnas, o con otras en las mismas posiciones, y agregarle después una columna con `UNIQUE`; una recarga del esquema viejo, trabada en otra sala, mientras la sala se reasigna o se borra y se recrea con otro esquema.
 **Automatizable.** Log aleatorio con columnas agregadas en puntos aleatorios; oráculo = aplicar cada operación con la versión que se conocía al recibirla contra aplicar todo con la última.
 
 #### INV-C2 ★ · El estado de una réplica cumple las restricciones de su esquema
