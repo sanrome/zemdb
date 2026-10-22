@@ -383,7 +383,7 @@ El plan de corrección se estructurará en tres fases incrementales antes de dar
 Habiendo remediado los 48 defectos de los motores de persistencia y red, se procederá con la arquitectura limpia de `zemdb-client`:
 1. **Configuración y Dependencias**: Sincronizar `crates/client/Cargo.toml` con `zemdb-core`, `zemdb-storage`, `tokio`, `reqwest`, `bytes`, `bincode`.
 2. **Fachada `ZemdbClient`**: Gestión de conexiones HTTP/2, pooling de sesiones y manejo transparente de autenticación Bearer con renovación.
-3. **Manejadores `RoomHandle` y `TableHandle`**: Interfaz ergonómica para transacciones locales Write-Through, integración con `TableBuffer` para outbox queue local y deduplicación.
+3. **Manejadores `RoomHandle` y `TableHandle`**: Interfaz ergonómica para transacciones locales Write-Through, integración con `TableBuffer` para outbox queue local y deduplicación. *(Nota posterior: la outbox quedó diferida para después de la v0.1; ver `ROADMAP.md` §4.4 y §7.)*
 4. **Worker de Sincronización y Stream SSE**: Receptor reactivo de señales `head_advanced` que despierte peticiones `/sync` con backpressure y aplique deltas sobre el `StorageEngine` local.
 
 ---

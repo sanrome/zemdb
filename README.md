@@ -16,7 +16,7 @@ It is designed for small-to-medium collaborative groups (2 to 50 clients per roo
 | **Phase 3: Coordination Server** | ✅ **Completed** | Tokio room actor model (`RoomActor` with bounded channels), single atomic WAL with Exactly-Once idempotency, 4-tier immutable log (Hot RAM -> Warm Disk -> Cold Disk), and Axum binary HTTP endpoints (HTTP/1.1 and HTTP/2 without TLS, behind a TLS-terminating reverse proxy) with signal-only SSE. |
 | **Phase 3.5: Hardening, Resiliencia y Contratos** | ✅ **Completed** | Framing de wire protocol (`ZM`, ver `0x01`), snapshots universales `ZMSN` con CRC32, concurrencia CoW sin bloqueos, Snapshot Isolation, relay multipart con BLAKE3, consultas directas `get_by_id`/`scan_by_id`, validación en almacenamiento, LWW estricto, encapsulación de modelos centrales y desregistro binario `DeregisterAck`. |
 | **Phase 3.11: Integrity Constraints** | ✅ **Completed** | `UNIQUE` constraints, foreign keys with `ON DELETE RESTRICT`, row owners and immutable tables declared in the schema, with no state on the server: it checks only the declared owner and immutability at commit, and every replica decides the rest while applying the log, in sequence order, rejecting the same operations with the same reason (`ApplyReport`). In-memory constraint indexes, snapshots checked before they are installed or opened, and a reference model that checks both engines without sharing code with them. |
-| **Phase 4: Client SDK & 1-RTT Sync** | ⏳ **Planned** | Ergonomic public facade (`ZemdbClient` -> `RoomHandle` -> `TableHandle`), server-authoritative 1-RTT commit-and-sync, strictly canonical storage via `zemdb-storage`, dual transport (native Reqwest / browser WebFetch), and real-time live queries (`watch`). Offline draft queue deferred to post-v0.1. |
+| **Phase 4: Client SDK & 1-RTT Sync** | ⏳ **Planned** | Ergonomic public facade (`ZemdbClient` -> `RoomHandle` -> `TableHandle`), server-authoritative 1-RTT commit-and-sync, strictly canonical storage via `zemdb-storage`, dual transport (native Reqwest / browser WebFetch), a JavaScript API with TypeScript types for the browser over the same SDK compiled to WebAssembly, and real-time live queries (`watch`). No outbox: offline writes are deferred to post-v0.1, so a client without network is read-only. |
 | **Phase 5: E2E Verification & Universality** | ⏳ **Planned** | End-to-end integration test suites with network partition simulation and stress testing. Core, storage and client already build for WebAssembly (`wasm32-unknown-unknown`) in CI. |
 
 ---
@@ -34,7 +34,7 @@ zemdb/
 │   └── client/         # [zemdb-client] Local-First client SDK, reactive synchronization, and dual transport (Phase 4)
 │
 ├── ARCHITECTURE.md     # Living architectural specification: topology, models, protocol, and ADRs
-├── ROADMAP.md          # Agile development board: active phases, detailed task checklists, and backlog
+├── ROADMAP.md          # Phase index (linking each phase plan) and post-v0.1 backlog
 ├── README.md           # Project entry point and navigation guide
 │
 └── docs/               # Historical archives and deep technical proposals
@@ -113,7 +113,7 @@ Quick navigation depending on your goal:
   👉 See **[`ARCHITECTURE.md`](ARCHITECTURE.md)** for room topology, server total-order authority, on-disk file formats, and Architectural Decision Records (ADRs).
 
 * **Current Implementation Progress & Checklists:**  
-  👉 See **[`ROADMAP.md`](ROADMAP.md)** for milestone progress, Phase 3 and Phase 4 actionable task checklists, and deferred backlog items.
+  👉 See **[`ROADMAP.md`](ROADMAP.md)** for the phase index, with a link to each phase plan (Phase 4: [`docs/proposals/2026-10-fase4-plan.md`](docs/proposals/2026-10-fase4-plan.md)), and the post-v0.1 backlog. How phases are planned, reviewed and audited: [`docs/METODOLOGIA.md`](docs/METODOLOGIA.md).
 
 * **Technical Audits & In-Depth Proposals:**  
   👉 Explore the **[`docs/`](docs/)** directory:

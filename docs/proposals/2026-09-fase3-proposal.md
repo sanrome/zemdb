@@ -207,6 +207,8 @@ zemdb/
 │       └── tests/                  # Tests de cliente y sincronización reactiva
 ```
 
+*(Nota posterior: la outbox de este diagrama y del anterior quedó diferida para después de la v0.1; ver `ROADMAP.md` §4.4 y §7.)*
+
 ---
 
 ## 3. LISTADO CANÓNICO DE BUENAS PRÁCTICAS Y ESTÁNDARES DE DESARROLLO

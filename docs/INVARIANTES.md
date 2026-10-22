@@ -490,7 +490,7 @@ Las de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md): `UN
 
 | Riesgo | Por qué se acepta | Referencia |
 |---|---|---|
-| Un reintento fuera de la ventana de dedup se aplica de nuevo (también el de una operación podada, después de un respawn: INV-Y9), y un cliente no puede reconocer su propio commit en un sync. | Ventana acotada por diseño; se decide con la outbox de la Fase 4. | DEF-85 |
+| Un reintento fuera de la ventana de dedup se aplica de nuevo (también el de una operación podada, después de un respawn: INV-Y9), y un cliente no puede reconocer su propio commit en un sync. | Ventana acotada por diseño; se decide al diseñar el SDK de la Fase 4 (la outbox está diferida para después de la v0.1). | DEF-85 |
 | Un miembro puede subir un snapshot bien formado pero falso, o reemplazar una subida con una secuencia mayor. | Defensa fuera de alcance de la v0.1. | DEF-81, §6 *What the server does not check* |
 | Un cliente wasm32 no puede restaurar snapshots Zstd. | Diferido a la Fase 4. | DEF-54 |
 | `zemdb-storage` no recarga el esquema de una sala abierta. | Diferido; D55 al menos impide perder datos. | DEF-34 |
