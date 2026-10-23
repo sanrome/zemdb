@@ -419,8 +419,8 @@ impl Schema {
     }
 
     /// Checks that `op`, valid for this schema, declares `client` as its owner if its table
-    /// has one: the declared owner is the client's id, compared byte for byte without any
-    /// normalization. `OwnerMismatch` otherwise.
+    /// has one: the declared owner is the client's owner ([`ClientId::owner`]), compared byte
+    /// for byte without any normalization. `OwnerMismatch` otherwise.
     pub fn check_owner(&self, op: &Operation, client: &ClientId) -> Result<(), ValidationError> {
         let Some(table) = self.get_table_by_id(op.table_id) else {
             return Ok(());
@@ -429,7 +429,7 @@ impl Schema {
             return Ok(());
         }
         match table.declared_owner(op) {
-            Some(Value::String(owner)) if **owner == *client.as_str() => Ok(()),
+            Some(Value::String(owner)) if **owner == *client.owner() => Ok(()),
             _ => Err(ValidationError::OwnerMismatch {
                 table: table.name().to_string(),
             }),
@@ -461,6 +461,24 @@ impl Schema {
         older.tables().all(|old| {
             self.get_table_by_id(old.table_id())
                 .is_some_and(|new| new.extends(old))
+        })
+    }
+
+    /// Whether a replica holding a room under `older` may switch it to this schema: this schema
+    /// extends `older` (see `extends`), every table of `older` keeps its constraints, in the
+    /// same order and over the same columns, its owner and its immutability, and every
+    /// constraint added to one of those tables includes a column it did not have.
+    ///
+    /// The rows of the room have that column `NULL`, so an added constraint judges none of the
+    /// operations already applied, and the room decides its log as it did. New tables may bring
+    /// any constraint, foreign keys into the old tables included. The relation is reflexive
+    /// and transitive, so a replica that missed some changes of the schema may still take the
+    /// last one. It is wider than the rule for reassigning a room (`extends` and
+    /// `has_same_constraints`), which implies it.
+    pub fn evolves_from(&self, older: &Schema) -> bool {
+        older.tables().all(|old| {
+            self.get_table_by_id(old.table_id())
+                .is_some_and(|new| new.evolves_from(old))
         })
     }
 

@@ -228,6 +228,22 @@ validated_string_id!(
     validate_client_id
 );
 
+impl ClientId {
+    /// The owner this client writes rows as: the part before the first `#`, or the whole id if
+    /// it has no `#` or if either part would be empty.
+    ///
+    /// A client id has the form `person#device`, one per device of a person, so the devices
+    /// of a person are separate clients that write the same rows. The backend that issues the
+    /// tokens keeps `#` out of the person part; the device part may hold anything, `#`
+    /// included, without changing the owner.
+    pub fn owner(&self) -> &str {
+        match self.0.split_once('#') {
+            Some((person, device)) if !person.is_empty() && !device.is_empty() => person,
+            _ => &self.0,
+        }
+    }
+}
+
 /// Strictly monotonic sequence number per Room assigned by the server coordinator.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,

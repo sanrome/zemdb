@@ -106,22 +106,23 @@ impl ForeignKey {
     }
 }
 
-/// What the owner column of a table holds to identify the client that owns each row.
+/// What the owner column of a table holds to identify the owner of each row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OwnerIdentity {
-    /// The owner's `ClientId`, in a `String` column.
+    /// The owner part of a `ClientId` (see [`ClientId::owner`](crate::ClientId::owner)), in a
+    /// `String` column: the person, shared by the clients of its devices.
     ClientId,
     /// A pseudonym derived from the owner's identity, in a `Bytes` column. Not supported yet:
     /// a table declaring it is rejected.
     Pseudonym,
 }
 
-/// The owner of the rows of a table: the client identified by the value of `column`.
+/// The owner of the rows of a table: the owner identified by the value of `column`.
 ///
-/// Every operation on the table declares its owner, which the server compares with the
-/// client that sends it, so that only the owner inserts, updates or deletes a row. The column
-/// is validated when its table is built: it exists, is neither nullable nor encrypted, and
-/// holds the owner's `ClientId`.
+/// Every operation on the table declares its owner, which the server compares with the owner
+/// of the client that sends it, so that only the owner inserts, updates or deletes a row. The
+/// column is validated when its table is built: it exists, is neither nullable nor encrypted,
+/// and holds the owner part of a `ClientId`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OwnerDef {

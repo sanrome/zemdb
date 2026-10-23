@@ -497,9 +497,10 @@ impl TableSchema {
         })
     }
 
-    /// This table with its rows owned by the client that `owner`'s column identifies, or
+    /// This table with its rows owned by the owner that `owner`'s column identifies, or
     /// without an owner. The column exists, is neither nullable nor encrypted, and is a
-    /// `String`, the owner's `ClientId`; pseudonymous owners are not supported yet.
+    /// `String`, the owner part of a `ClientId` (`ClientId::owner`); pseudonymous owners are
+    /// not supported yet.
     pub fn try_with_owner(mut self, owner: Option<OwnerDef>) -> Result<Self, ValidationError> {
         self.owner_column = match &owner {
             None => None,
@@ -557,6 +558,28 @@ impl TableSchema {
             && self.columns[older.columns.len()..]
                 .iter()
                 .all(ColumnDef::is_nullable)
+    }
+
+    /// Whether this table, the one with the id of `older`, extends it (see `extends`), keeps its
+    /// constraints as the first ones, and its owner and immutability, and adds only constraints
+    /// that include one of the columns after those of `older`.
+    ///
+    /// Constraints and owners name their columns, and a table that extends `older` has the
+    /// columns of `older` at the same positions, so equal ones are over the same positions.
+    pub(crate) fn evolves_from(&self, older: &TableSchema) -> bool {
+        let new_column =
+            |positions: &Vec<usize>| positions.iter().any(|&p| p >= older.columns.len());
+        self.extends(older)
+            && self.unique.starts_with(&older.unique)
+            && self.foreign_keys.starts_with(&older.foreign_keys)
+            && self.owner == older.owner
+            && self.immutable == older.immutable
+            && self.unique_column_indices[older.unique.len()..]
+                .iter()
+                .all(new_column)
+            && self.foreign_key_column_indices[older.foreign_keys.len()..]
+                .iter()
+                .all(new_column)
     }
 
     /// This table, immutable if `immutable` is set.

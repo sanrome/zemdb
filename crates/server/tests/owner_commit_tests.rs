@@ -340,3 +340,67 @@ async fn a_foreign_owner_is_a_schema_violation_over_http() {
         .await;
     assert_eq!(status, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn the_devices_of_a_person_write_as_the_person_before_the_first_hash() {
+    let mut room = Room::new().await;
+    for id in ["alice#phone", "alice#laptop", "bob#alice"] {
+        register(&room.sender, &client(id)).await;
+    }
+    // Both devices of alice write her rows, also the rows the other one wrote.
+    assert_eq!(
+        room.commit("alice#phone", note(7, "alice")).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        room.commit("alice#laptop", edit_note(7, "alice"))
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        room.commit("alice#laptop", vote(VOTES, "alice", 1, 2))
+            .await
+            .unwrap(),
+        3
+    );
+    // No device writes as itself, and a device part that names someone else changes nothing.
+    room.assert_rejected_without_trace("alice#phone", vote(VOTES, "alice#phone", 2, 1))
+        .await;
+    room.assert_rejected_without_trace("alice#phone", note(8, "alice#phone"))
+        .await;
+    room.assert_rejected_without_trace("bob#alice", vote(VOTES, "alice", 2, 1))
+        .await;
+    room.assert_rejected_without_trace("bob#alice", delete_note(7, "alice"))
+        .await;
+    let head = room.head().await;
+    assert_eq!(
+        room.commit("bob#alice", vote(VOTES, "bob", 2, 1))
+            .await
+            .unwrap(),
+        head + 1
+    );
+}
+
+#[tokio::test]
+async fn the_devices_of_a_person_are_deduplicated_apart() {
+    // The same mutation id from two devices of the same person is two mutations.
+    let room = Room::new().await;
+    for id in ["alice#phone", "alice#laptop"] {
+        register(&room.sender, &client(id)).await;
+    }
+    let mutation = MutationId::new([7; 16]);
+    let phone = room
+        .commit_as("alice#phone", mutation, vote(VOTES, "alice", 1, 2))
+        .await
+        .unwrap();
+    let laptop = room
+        .commit_as("alice#laptop", mutation, vote(VOTES, "alice", 2, 2))
+        .await
+        .unwrap();
+    assert_eq!((phone, laptop), (1, 2));
+    let retry = room
+        .commit_as("alice#phone", mutation, vote(VOTES, "alice", 1, 2))
+        .await;
+    assert_eq!(retry.unwrap(), phone);
+}

@@ -2,7 +2,7 @@
 
 **Fecha:** 23 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 cerrado; Lote 1 en curso.
+**Estado:** En curso: Lotes 0 y 1 cerrados; el próximo es el 2.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.1. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -61,7 +61,7 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 | Orden | Lote | Crates | Decisiones | Invariantes | Progreso |
 |---|---|---|---|---|---|
 | 0 | Contrato | Documentos | DC5, DC9, DC12, DC15, DC16, DC17 | Nueva: S7. Ajustes: S4, S5, S6, C1, C2, E2, W1, W2, A5, K3, K6, K12 | ✅ |
-| 1 | El dueño como prefijo del `ClientId` y `Schema::evolves_from` | core, server | DC15, DC5 | A5, K6, C1 | ⬜ |
+| 1 | El dueño como prefijo del `ClientId` y `Schema::evolves_from` | core, server | DC15, DC5 | A5, K6, C1 | ✅ |
 | 2 | El `schema_id` en `CommitAck`, `SyncBatch` y `HeartbeatAck` | core, server | DC5 | E2, W1, W2, B1, K6 | ⬜ |
 | 3 | Los plazos del servidor con el reloj de Tokio | server | DC16 | B2, R3, L1 | ⬜ |
 | 4 | Los errores de la apertura y de `apply_snapshot` | storage | DC12 | S4, S5, C2, W1, K3 | ⬜ |
@@ -120,7 +120,7 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
   5. **Verde,** con 4 menores de redacción, corregidos.
 - **Desvíos:** INV-S6 y la precisión de DC5 (adoptada) no estaban en la lista inicial del lote; las dos salieron de la revisión cruzada.
 
-### Lote 1 · El dueño como prefijo del `ClientId` y `Schema::evolves_from` (`zemdb-core`, `zemdb-server`) · ⬜
+### Lote 1 · El dueño como prefijo del `ClientId` y `Schema::evolves_from` (`zemdb-core`, `zemdb-server`) · ✅ Hecho
 **Objetivo:** las dos reglas de `zemdb-core` que el resto de 4.1 y el SDK usan: quién es el dueño de un cliente (DC15) y cuándo un esquema puede reemplazar a otro en una réplica (DC5).
 
 **Archivos:** `crates/core/src/id.rs`, `crates/core/src/schema/global.rs` y `table.rs`; tests de `zemdb-core` y de `zemdb-server` (el commit con un dueño). `ARCHITECTURE.md` §3.1.
@@ -148,6 +148,28 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 - `has_same_constraints`, `extends` y `same_constraints`: `evolves_from` se apoya en ellos sin cambiarlos.
 
 **Documentos:** `ARCHITECTURE.md` §3.1 (el dueño como prefijo, y `evolves_from` junto a la evolución del esquema); `INVARIANTES.md`: INV-A5 sin 🆕, y en INV-C1 e INV-K6 la parte de `evolves_from`.
+
+**Hecho.**
+- **API.** `ClientId::owner` (`split_once('#')`, con las dos partes no vacías; si no, el id entero), y `Schema::check_owner` compara con él. `Schema::evolves_from` y `TableSchema::evolves_from` (`pub(crate)`): `extends`, las `UNIQUE` y las FK de la tabla vieja como prefijo (`starts_with`; la igualdad incluye nombre, columnas, `references` y `on_delete`), el mismo `OwnerDef` y la misma inmutabilidad, y toda restricción posterior con alguna posición mayor o igual que la cantidad de columnas viejas.
+- **Tests agregados:**
+  - `crates/core/tests/schema_owner_tests.rs`: `a_device_writes_as_the_person_before_the_first_hash` (dispositivos de `alice`, `bob#alice`, `bob#y#z`, `#x`, `x#`, `#`, NFC contra NFD en la parte de persona).
+  - `crates/core/tests/schema_replica_evolution_tests.rs`, nuevo: un negativo por regla (tabla o columna quitada, columna con otro tipo, `UNIQUE` quitada, sobre otras columnas, renombrada o en otro orden, FK quitada, en otro orden o sobre otras columnas, otro dueño, dueño quitado o agregado, inmutabilidad en los dos sentidos, `UNIQUE` y FK nuevas solo sobre columnas viejas, también al lado de una columna nueva); positivos (el mismo esquema, `add_column` y `add_column_with_constraints`, una tabla nueva con FK hacia las viejas, que agranda `foreign_keys_referencing`); y cadenas aleatorias de evoluciones: cada esquema evoluciona de todos los anteriores, ninguno vuelve atrás, y la regla de la reasignación implica `evolves_from` (300 casos; 20.000 en la versión `#[ignore]`).
+  - `crates/server/tests/owner_commit_tests.rs`: `the_devices_of_a_person_write_as_the_person_before_the_first_hash` y `the_devices_of_a_person_are_deduplicated_apart`.
+  - Contra el esqueleto (`owner` devolvía el id entero y `evolves_from` era `extends`) fallaban por comportamiento los dos del servidor, el de dispositivos de core y los dos negativos de restricciones; los positivos y las cadenas pasaban, como corresponde a un esqueleto que ya cumple `extends`.
+- **Mutaciones verificadas** (todas detectadas): `extends` en `true`; sacar el prefijo de las `UNIQUE`, el de las FK, la igualdad del dueño, la de la inmutabilidad y cada una de las dos reglas de "columna nueva"; comparar las `UNIQUE` sin orden (la detectó el negativo de `UNIQUE` en otro orden, agregado por la revisión de delta); cada una de las dos condiciones de no vacío de `owner()`; y `check_owner` con el id entero. La revisión de delta probó además, también detectadas: las FK sin orden, `>` en lugar de `>=`, contra el largo de la clave, saltear las tablas viejas sin restricciones, aceptar también el id entero y el dedup por dueño.
+- **Interacciones revisadas:**
+  - `check_owner` en el commit del actor: el dedup por `(ClientId, MutationId)` va antes, así que un reintento reconocido se confirma sin volver a pasar por el chequeo, como antes, y sin secuenciar nada; dos dispositivos son dos clientes para el dedup (test).
+  - `apply_operation` en las réplicas compara el dueño de la fila con el que declara la operación: no cambia (`cargo test --workspace` en verde).
+  - Tokens y autenticación atan el `ClientId` entero: no cambian.
+  - Roster, cursor, lease, designación, subidas, el tope de dos streams SSE y la parte del presupuesto de respuestas siguen por `ClientId`, así que son por dispositivo y una persona los suma: DC15 lo acepta (INV-B5), sin cambio de código.
+  - Los tests y fixtures del servidor con un `ClientId` con `#`: no había ninguno fuera de los nuevos.
+  - `extends`, `has_same_constraints` y `same_constraints`: `evolves_from` se apoya en `extends` sin cambiarlo, y la implicación desde la regla de la reasignación está probada en las cadenas. Las posiciones no se comparan: bajo `extends`, las columnas viejas están en las mismas posiciones, así que restricciones y dueños iguales por nombre son iguales por posición (una mutación sobre esa comparación no se podía detectar, y se sacó).
+  - `evolves_from` no tiene todavía un consumidor de producción (el Lote 5 y el SDK).
+  - `OwnerIdentity::ClientId` conserva su nombre; sus docstrings, las de `OwnerDef` y `try_with_owner`, el mensaje de `OwnerMismatch` y el comentario del commit en el actor dicen ahora que es el dueño del cliente.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura): sin hallazgos Altos ni Medios. Se atendieron los Bajos (el negativo de `UNIQUE` en otro orden; los textos viejos sobre el dueño) y las notas (el SDK "will check" en `ARCHITECTURE.md`; el paso 5 de los documentos; las interacciones de arriba). Queda como nota que un id `alice #x` tiene el dueño `alice ` con el espacio: lo cuida el backend.
+- **Chequeos:** fmt, clippy, test, doc y el build de wasm32 en verde; `cargo test --release -- --ignored` de `zemdb-core` y de `zemdb-server`.
+- **Tamaño:** unas 60 líneas de producción, más docstrings.
+- **Desvíos:** ninguno.
 
 ### Lote 2 · El `schema_id` en `CommitAck`, `SyncBatch` y `HeartbeatAck` (`zemdb-core`, `zemdb-server`) · ⬜
 **Objetivo:** que el cliente se entere de una reasignación por cualquier respuesta, no solo por el registro (DC5). Las versiones son por esquema, y dos esquemas pueden tener la misma.

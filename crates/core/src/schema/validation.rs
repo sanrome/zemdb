@@ -227,7 +227,7 @@ pub enum ValidationError {
     )]
     UnexpectedOwner { table: String },
 
-    #[error("Operation on table '{table}' declares an owner other than the client that sends it")]
+    #[error("Operation on table '{table}' declares an owner other than the owner of the client that sends it")]
     OwnerMismatch { table: String },
 }
 

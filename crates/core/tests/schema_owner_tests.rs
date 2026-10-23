@@ -539,6 +539,47 @@ fn only_the_declared_owner_may_send_an_operation() {
     assert_eq!(schema.check_owner(&poll, &client("bob")), Ok(()));
 }
 
+#[test]
+fn a_device_writes_as_the_person_before_the_first_hash() {
+    let schema = schema([polls(), votes(), notes()]);
+    // The devices of `alice` write her rows, and none of them writes as itself.
+    for device in ["alice#phone", "alice#laptop", "alice#a#b", "alice##"] {
+        let device = client(device);
+        assert_eq!(device.owner(), "alice");
+        assert_eq!(schema.check_owner(&vote("alice", 1, 2), &device), Ok(()));
+        assert_eq!(schema.check_owner(&note(7, "alice"), &device), Ok(()));
+        assert!(schema
+            .check_owner(&vote(device.as_str(), 1, 2), &device)
+            .is_err());
+    }
+    // The device part may hold anything without changing the owner: `bob#alice` is a device
+    // of `bob`, and `bob#y#z` too.
+    for device in ["bob#alice", "bob#y#z"] {
+        let device = client(device);
+        assert_eq!(device.owner(), "bob");
+        assert!(schema.check_owner(&vote("alice", 1, 2), &device).is_err());
+        assert!(schema.check_owner(&vote("bob#y", 1, 2), &device).is_err());
+        assert_eq!(schema.check_owner(&vote("bob", 1, 2), &device), Ok(()));
+    }
+    // Without a `#`, or with an empty part on either side, the whole id is the owner.
+    for id in ["alice", "#x", "x#", "#", "\u{e9}l\u{e9}a"] {
+        let whole = client(id);
+        assert_eq!(whole.owner(), id);
+        assert_eq!(schema.check_owner(&vote(id, 1, 2), &whole), Ok(()));
+    }
+    assert!(schema.check_owner(&vote("", 1, 2), &client("#x")).is_err());
+    // A person part with characters outside ASCII is compared byte for byte too.
+    let device = client("jos\u{e9}#tablet");
+    assert_eq!(device.owner(), "jos\u{e9}");
+    assert_eq!(
+        schema.check_owner(&vote("jos\u{e9}", 1, 2), &device),
+        Ok(())
+    );
+    assert!(schema
+        .check_owner(&vote("jose\u{301}", 1, 2), &device)
+        .is_err());
+}
+
 // ---------------------------------------------------------------------------------------------
 // Reassigning a room to another schema
 // ---------------------------------------------------------------------------------------------
