@@ -247,6 +247,7 @@ pub async fn commit(
         has_more: commit_resp.has_more,
         snapshot_wanted: commit_resp.snapshot_wanted,
         schema_version: commit_resp.schema_version,
+        schema_id: commit_resp.schema_id,
     };
     // The commit is durable, so it is never answered with an error: without room in the
     // budget, the room acknowledged it without its catch-up, which sends the client to `/sync`.
@@ -294,6 +295,7 @@ pub async fn sync(
                 has_more: sync_resp.has_more,
                 snapshot_wanted: sync_resp.snapshot_wanted,
                 schema_version: sync_resp.schema_version,
+                schema_id: sync_resp.schema_id,
             };
             budgeted_response(sync_resp.reservation, &batch)
         }
@@ -370,6 +372,7 @@ pub async fn heartbeat(
             snapshot_wanted: hb_resp.snapshot_wanted,
             active_snapshot_seq: hb_resp.active_snapshot_seq,
             schema_version: hb_resp.schema_version,
+            schema_id: hb_resp.schema_id,
         }
     })
 }

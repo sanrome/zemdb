@@ -185,7 +185,8 @@ fn lengths_declared_far_beyond_the_frame_are_rejected() {
         ));
     }
 
-    // A batch of operations: two flags and a one-byte schema version follow the operations.
+    // A batch of operations: two flags, a one-byte schema version and a schema id of one byte
+    // (two with its length) follow the operations.
     let batch = encode_message(&ServerMessage::SyncBatch {
         correlation_id: CorrelationId::new(1),
         room_id: sample_room(),
@@ -194,9 +195,10 @@ fn lengths_declared_far_beyond_the_frame_are_rejected() {
         has_more: false,
         snapshot_wanted: false,
         schema_version: 1,
+        schema_id: SchemaId::new("s").unwrap(),
     })
     .unwrap();
-    let damaged = declaring_u64_max_at(&batch, batch.len() - 4);
+    let damaged = declaring_u64_max_at(&batch, batch.len() - 6);
     assert!(matches!(
         decode_message::<ServerMessage>(&damaged),
         Err(DecodeError::Malformed(_))
@@ -221,6 +223,7 @@ fn the_largest_batch_of_tiny_operations_decodes() {
         has_more: false,
         snapshot_wanted: false,
         schema_version: 1,
+        schema_id: SchemaId::new("s").unwrap(),
     };
     let frame = encode_message(&message).unwrap();
     assert!(frame.len() > MAX_FRAME_SIZE - 64 - per_op);

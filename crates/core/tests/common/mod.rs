@@ -673,6 +673,7 @@ pub fn server_message(rng: &mut Rng, error_codes: &[ErrorCode]) -> ServerMessage
             has_more: rng.coin(),
             snapshot_wanted: rng.coin(),
             schema_version: rng.u64(),
+            schema_id: schema_id(rng),
         },
         1 => ServerMessage::AckConfirmed {
             correlation_id,
@@ -688,6 +689,7 @@ pub fn server_message(rng: &mut Rng, error_codes: &[ErrorCode]) -> ServerMessage
             has_more: rng.coin(),
             snapshot_wanted: rng.coin(),
             schema_version: rng.u64(),
+            schema_id: schema_id(rng),
         },
         3 => ServerMessage::SnapshotChunk {
             correlation_id,
@@ -718,6 +720,7 @@ pub fn server_message(rng: &mut Rng, error_codes: &[ErrorCode]) -> ServerMessage
             snapshot_wanted: rng.coin(),
             active_snapshot_seq: option(rng, seq),
             schema_version: rng.u64(),
+            schema_id: schema_id(rng),
         },
         7 => ServerMessage::DeregisterAck {
             correlation_id,
@@ -978,6 +981,7 @@ pub fn sample_server_messages() -> Vec<ServerMessage> {
             has_more: true,
             snapshot_wanted: false,
             schema_version: 3,
+            schema_id: SchemaId::new("todo").unwrap(),
         },
         ServerMessage::AckConfirmed {
             correlation_id,
@@ -993,6 +997,7 @@ pub fn sample_server_messages() -> Vec<ServerMessage> {
             has_more: false,
             snapshot_wanted: true,
             schema_version: 2,
+            schema_id: SchemaId::new("todo").unwrap(),
         },
         ServerMessage::SnapshotChunk {
             correlation_id,
@@ -1023,6 +1028,7 @@ pub fn sample_server_messages() -> Vec<ServerMessage> {
             snapshot_wanted: false,
             active_snapshot_seq: Some(SequenceNumber::new(3)),
             schema_version: 2,
+            schema_id: SchemaId::new("todo").unwrap(),
         },
         ServerMessage::DeregisterAck {
             correlation_id,

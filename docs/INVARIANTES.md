@@ -152,7 +152,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-L6** | Borrar una sala es atómico | | Medio | ✅ |
 | **INV-L7** | Ningún efecto en disco sobrevive al lock que lo serializa | | Medio | ✅ |
 | **INV-E1** | El esquema solo crece, y toda operación del log sigue siendo válida | ★ | Alto | ✅ |
-| **INV-E2** | Un cliente con el esquema viejo siempre puede enterarse | | Bajo | ✅; el `schema_id`, 🆕 (4.1, Lote 2) |
+| **INV-E2** | Un cliente con el esquema viejo siempre puede enterarse | | Bajo | ✅ |
 | **INV-W1** | Ninguna entrada hace entrar en pánico, abortar ni reservar de más | ★ | Alto | ✅; la variante de DC12 y `ruzstd`, 🆕 (4.1, Lotes 4 y 6) |
 | **INV-W2** | Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum | | Medio | ✅ (D92); `ruzstd`, 🆕 (4.1, Lote 6) |
 | **INV-C1** | Ninguna versión posterior del esquema cambia la decisión sobre una operación ya secuenciada | ★ | Alto | ✅; la recarga en el storage, 🆕 (4.1, Lote 5) |
@@ -163,7 +163,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-K3** | El SDK nunca descarta una réplica local sana | ★ | Alto | 🆕 (4.1 Lote 4, 4.2, 4.4) |
 | **INV-K4** | Las réplicas de clientes que siguen el protocolo convergen | ★ | Alto | 🆕 (4.2) |
 | **INV-K5** | El cursor que presenta el cliente es siempre el head de su réplica | | Alto | 🆕 (4.2) |
-| **INV-K6** | La réplica solo cambia a un esquema que evoluciona del suyo | ★ | Alto | 🆕 (4.1 Lotes 2 y 5, 4.2; `evolves_from`, en el Lote 1) |
+| **INV-K6** | La réplica solo cambia a un esquema que evoluciona del suyo | ★ | Alto | 🆕 (4.1 Lote 5, 4.2; `evolves_from`, en el Lote 1, y el `schema_id` de las respuestas, en el Lote 2) |
 | **INV-K7** | Un cliente atrasado termina al día, también si es el designado | | Medio | 🆕 (4.2, 4.3) |
 | **INV-K8** | El SDK nunca manda una operación con un dueño ajeno | | Medio | 🆕 (4.4) |
 | **INV-K9** | Una columna cifrada nunca sale en claro | | Alto | 🆕 (4.4, 4.5, 4.6) |
@@ -473,8 +473,8 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 **Cómo intentar romperla.** `add_column` concurrentes; reinicio a mitad de una escritura del registry; JSON de esquema con ids repetidos, faltantes o campos desconocidos; reasignar una sala a un esquema con otras columnas; filas cortas de antes de una columna nueva; un bit invertido en `schemas/{id}.json` (ver INV-D9).
 
 #### INV-E2 · Un cliente con el esquema viejo siempre puede enterarse
-**Enunciado.** Después de un `add_column`, toda respuesta de `Registered`, `HeartbeatAck`, `SyncBatch` y `CommitAck` de una sala con ese esquema lleva la versión nueva, sin depender de SSE. Las cuatro llevan además el `schema_id` de la sala, así que una reasignación a otro esquema, aunque tenga la misma versión, también se ve en cualquiera de ellas (DC5; en `HeartbeatAck`, `SyncBatch` y `CommitAck`, 🆕, 4.1, Lote 2).
-**Sostenida por.** D60 (§7.2); desde el Lote 2 de 4.1, el `schema_id` en las tres respuestas, que entra en el margen de cada frame (`RESPONSE_ENVELOPE_ALLOWANCE`).
+**Enunciado.** Después de un `add_column`, toda respuesta de `Registered`, `HeartbeatAck`, `SyncBatch` y `CommitAck` de una sala con ese esquema lleva la versión nueva, sin depender de SSE. Las cuatro llevan además el `schema_id` de la sala, así que una reasignación a otro esquema, aunque tenga la misma versión, también se ve en cualquiera de ellas (DC5; en `HeartbeatAck`, `SyncBatch` y `CommitAck`, desde el Lote 2 de 4.1).
+**Sostenida por.** D60 (§7.2); desde el Lote 2 de 4.1, el `schema_id` en las tres respuestas, que entra en el margen de cada frame (`RESPONSE_ENVELOPE_ALLOWANCE`, con lo que el tope de una operación en un commit baja 73 bytes).
 **Cómo intentar romperla.** Sala abierta durante la recarga; respawn concurrente con la recarga; reinicio del registry; una sala que se reasigna o se recrea con otro esquema durante la recarga (no la recibe, Lote 6c); una reasignación a un esquema con la misma versión; un `CommitAck` o un `SyncBatch` al tope de operaciones con un `schema_id` de 64 bytes.
 
 ### 3.9. Formatos y decodificación
@@ -547,7 +547,7 @@ Las del SDK (`zemdb-client`) de la [Fase 4](proposals/2026-10-fase4-plan.md) (DC
 
 #### INV-K6 ★ · La réplica solo cambia a un esquema que evoluciona del suyo
 **Enunciado.** El SDK abre y aplica solo con el esquema que el servidor sirve para esa sala, guardado entre sus metadatos antes de usarse. Ante un cambio, sea una versión nueva o una reasignación, exige que el nuevo evolucione del anterior (DC5, `Schema::evolves_from`: `Schema::extends`; cada restricción del actual sigue en el nuevo, igual y en la misma posición; los dueños y las tablas inmutables no cambian; y toda restricción nueva incluye alguna columna nueva de su tabla, la regla DR3. Las FK que entran a una tabla pueden crecer: la columna nueva vale `NULL` en las filas existentes, así que no cambia ninguna decisión ya tomada). Como la regla es transitiva, la cumple cualquier cadena de cambios válidos, aunque el cliente no haya visto los intermedios. Si no, falla cerrado y sigue con el anterior. Se entera del cambio por el `schema_id` y la versión de cada respuesta, y pide el esquema ante una operación que no valida contra el local y ante cualquier error al aplicar el snapshot de otro miembro: pide el esquema una vez y, si cambió, vuelve a intentar con el mismo snapshot. Ante un esquema que no conoce, decide contra el que le devuelve `GetSchema`, no contra la respuesta; y como `GetSchema` no está atado a la encarnación, antes de fallar cerrado se vuelve a registrar con su cursor (un `RoomReset` lo lleva a descartar la réplica). Fallar cerrado frena las escrituras y la aplicación de lotes, no los heartbeats ni el registro. Nunca aplica las operaciones de una respuesta con un esquema más nuevo que el local sin antes cambiar de esquema (INV-E2); una respuesta con una versión anterior del mismo esquema no es un cambio, y sus operaciones se aplican con el local (INV-C1).
-**Sostenida por.** `Schema::evolves_from` (4.1, Lote 1). A implementar en 4.1 (el `schema_id` en `CommitAck`, `SyncBatch` y `HeartbeatAck`, Lote 2; `reload_schema`, Lote 5, INV-S7; DC5) y en 4.2 (detectar el cambio, y el orden: guardar el esquema, recargarlo, aplicar). Sin ella, INV-C1 no vale en el cliente.
+**Sostenida por.** `Schema::evolves_from` (4.1, Lote 1) y el `schema_id` en `CommitAck`, `SyncBatch` y `HeartbeatAck` (4.1, Lote 2; DC5). A implementar en 4.1 (`reload_schema`, Lote 5, INV-S7) y en 4.2 (detectar el cambio, y el orden: guardar el esquema, recargarlo, aplicar). Sin ella, INV-C1 no vale en el cliente.
 **Cómo intentar romperla.** Un `CommitAck` o un `SyncBatch` con otra `schema_version`; `schema_reloaded` perdido; una columna agregada con un `UNIQUE` o una FK; una reasignación a un esquema con otras restricciones, o a uno con la misma versión; un cliente desconectado mientras la sala evoluciona y después se reasigna; una columna agregada con una FK hacia otra tabla; un `SyncBatch` demorado con la versión anterior; un cliente que se incorpora desde un snapshot hecho con una versión más nueva; un crash entre guardar el esquema nuevo y recargarlo.
 
 #### INV-K7 · Un cliente atrasado termina al día, también si es el designado

@@ -556,6 +556,113 @@ async fn room_incarnation_survives_a_schema_change_and_a_restart() {
     manager.shutdown_all().await;
 }
 
+/// The schema id and version that `client_id`'s registration, commit, retried commit, sync and
+/// heartbeat in `room_id` report, each as `(schema_id, version)`; the commit inserts the row
+/// `id`.
+async fn schemas_reported(
+    manager: &RoomManager,
+    room_id: &RoomId,
+    client_id: &ClientId,
+    id: i64,
+) -> [(SchemaId, u64); 5] {
+    let registered = manager
+        .ask(room_id, |reply| RoomCommand::RegisterClient {
+            client_id: client_id.clone(),
+            current_seq: None,
+            known_incarnation: None,
+            reply,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    let row = zemdb_core::value::RowBuilder::new()
+        .set("id", id)
+        .set("title", "reported")
+        .build();
+    let op = registered
+        .schema
+        .to_operation_insert("tasks", &row, 1000)
+        .unwrap();
+    let commit = |op| {
+        manager.ask(room_id, |reply| RoomCommand::Commit {
+            client_id: client_id.clone(),
+            mutation_id: MutationId::from_u128(id as u128),
+            last_ack_seq: registered.head_seq,
+            op,
+            reply,
+        })
+    };
+    // Each response is reduced to what it reports at once, so that it gives its frame of the
+    // budget of response bytes in flight back.
+    let reported = |response: crate::actor::command::CommitResponse| {
+        (
+            response.assigned_seq,
+            response.schema_id,
+            response.schema_version,
+        )
+    };
+    let fresh = reported(commit(op.clone()).await.unwrap().unwrap());
+    let retried = reported(commit(op).await.unwrap().unwrap());
+    assert_eq!(retried.0, fresh.0);
+    let sync = manager
+        .ask(room_id, |reply| RoomCommand::Sync {
+            client_id: client_id.clone(),
+            from_seq: SequenceNumber::new(0),
+            max_batch_size: 10,
+            reply,
+        })
+        .await
+        .unwrap()
+        .map(|response| (response.schema_id, response.schema_version))
+        .unwrap();
+    let heartbeat = manager
+        .ask(room_id, |reply| RoomCommand::Heartbeat {
+            client_id: client_id.clone(),
+            reply,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    [
+        (registered.schema_id, registered.schema.version()),
+        (fresh.1, fresh.2),
+        (retried.1, retried.2),
+        sync,
+        (heartbeat.schema_id, heartbeat.schema_version),
+    ]
+}
+
+#[tokio::test]
+async fn every_response_reports_the_schema_a_room_was_reassigned_to() {
+    let dir = tempdir().unwrap();
+    let room_id = RoomId::new("reassigned").unwrap();
+    let client_id = ClientId::new("watcher").unwrap();
+    let (first, second) = (
+        SchemaId::new("first").unwrap(),
+        SchemaId::new("second").unwrap(),
+    );
+    let manager = new_manager(&dir);
+    manager
+        .create_room(room_id.clone(), first.clone(), None)
+        .await
+        .unwrap();
+    for (schema_id, version) in schemas_reported(&manager, &room_id, &client_id, 1).await {
+        assert_eq!((schema_id, version), (first.clone(), 1));
+    }
+
+    // Both schemas are at version 1: only the id tells the client that the schema changed.
+    manager.shutdown_room(&room_id).await;
+    manager.get_or_spawn(&room_id, Some(&second)).await.unwrap();
+    for (schema_id, version) in schemas_reported(&manager, &room_id, &client_id, 2).await {
+        assert_eq!((schema_id, version), (second.clone(), 1));
+    }
+    assert_eq!(
+        schema_of(&manager.get_or_spawn(&room_id, None).await.unwrap()).await,
+        second
+    );
+    manager.shutdown_all().await;
+}
+
 #[tokio::test]
 async fn meta_room_without_lifecycle_has_no_overrides() {
     let dir = tempdir().unwrap();

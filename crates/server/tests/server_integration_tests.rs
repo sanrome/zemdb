@@ -545,7 +545,7 @@ async fn schema_evolution_cascades_to_active_room() {
     let client_id = client("writer-evo");
     let (token, registered) = server.register(&room_id, &client_id).await;
     assert!(
-        matches!(&registered, ServerMessage::Registered { schema, .. } if schema.version() == 1),
+        matches!(&registered, ServerMessage::Registered { schema_id: id, schema, .. } if *id == schema_id && schema.version() == 1),
         "{registered:?}"
     );
 
@@ -564,7 +564,8 @@ async fn schema_evolution_cascades_to_active_room() {
     let updated_schema: Schema = add_resp.json().await.unwrap();
     assert_eq!(updated_schema.version(), 2);
 
-    // Responses carry the new version, which tells a client without SSE to fetch the schema.
+    // Responses carry the new version of the same schema id, which tells a client without SSE
+    // to fetch the schema.
     let heartbeat = ClientMessage::Heartbeat {
         correlation_id: CorrelationId::new(97),
         room_id: room_id.clone(),
@@ -577,18 +578,31 @@ async fn schema_evolution_cascades_to_active_room() {
         from_seq: SequenceNumber::new(0),
         max_batch_size: 10,
     };
+    let get_schema = ClientMessage::GetSchema {
+        correlation_id: CorrelationId::new(96),
+        room_id: room_id.clone(),
+    };
+    let (_, reply) = server
+        .post_message(&room_id, "schema", &token, &get_schema)
+        .await;
+    assert!(
+        matches!(&reply, ServerMessage::Schema { schema_id: id, schema, .. } if *id == schema_id && schema.version() == 2),
+        "{reply:?}"
+    );
     for (endpoint, msg) in [("heartbeat", heartbeat), ("sync", sync)] {
         let (_, reply) = server.post_message(&room_id, endpoint, &token, &msg).await;
         assert!(
             matches!(
-                reply,
+                &reply,
                 ServerMessage::HeartbeatAck {
                     schema_version: 2,
+                    schema_id: id,
                     ..
                 } | ServerMessage::SyncBatch {
                     schema_version: 2,
+                    schema_id: id,
                     ..
-                }
+                } if *id == schema_id
             ),
             "{reply:?}"
         );
@@ -608,7 +622,11 @@ async fn schema_evolution_cascades_to_active_room() {
     let (status, ack) = server.post_message(&room_id, "commit", &token, &msg).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        matches!(ack, ServerMessage::CommitAck { assigned_seq, schema_version: 2, .. } if assigned_seq == SequenceNumber::new(1)),
+        matches!(
+            &ack,
+            ServerMessage::CommitAck { assigned_seq, schema_version: 2, schema_id: id, .. }
+                if *assigned_seq == SequenceNumber::new(1) && *id == schema_id
+        ),
         "{ack:?}"
     );
 }

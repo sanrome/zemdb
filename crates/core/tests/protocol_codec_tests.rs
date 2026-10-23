@@ -1,6 +1,7 @@
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fmt::Debug;
+use zemdb_core::protocol::limits::RESPONSE_ENVELOPE_ALLOWANCE;
 use zemdb_core::protocol::{encoded_len, PROTOCOL_MAGIC};
 use zemdb_core::*;
 
@@ -69,6 +70,7 @@ fn test_protocol_binary_serialization_roundtrip() {
         has_more: false,
         snapshot_wanted: true,
         schema_version: 2,
+        schema_id: SchemaId::new("todo").unwrap(),
     });
 
     assert_roundtrip(&ServerMessage::SyncBatch {
@@ -82,6 +84,7 @@ fn test_protocol_binary_serialization_roundtrip() {
         has_more: false,
         snapshot_wanted: false,
         schema_version: 3,
+        schema_id: SchemaId::new("todo-v2").unwrap(),
     });
 
     for (snapshot_wanted, active_snapshot_seq) in
@@ -94,6 +97,7 @@ fn test_protocol_binary_serialization_roundtrip() {
             snapshot_wanted,
             active_snapshot_seq,
             schema_version: 4,
+            schema_id: SchemaId::new("todo").unwrap(),
         });
     }
 
@@ -386,9 +390,51 @@ fn op_with_wire_len(seq: u64, len: u64) -> SequencedOperation {
     result
 }
 
+/// What the largest schema id adds to a response: its length and 64 bytes.
+const LARGEST_SCHEMA_ID_LEN: u64 = 9 + 64;
+
+/// A `CommitAck` with `ops` and every other field at its largest encoding.
+fn largest_commit_ack(ops: Vec<SequencedOperation>) -> ServerMessage {
+    ServerMessage::CommitAck {
+        correlation_id: CorrelationId::new(u64::MAX),
+        room_id: RoomId::new("r".repeat(64)).unwrap(),
+        mutation_id: MutationId::new([0xFF; 16]),
+        assigned_seq: SequenceNumber::new(u64::MAX),
+        catchup_ops: ops,
+        has_more: true,
+        snapshot_wanted: true,
+        schema_version: u64::MAX,
+        schema_id: SchemaId::new("s".repeat(64)).unwrap(),
+    }
+}
+
+/// A `SyncBatch` with `ops` and every other field at its largest encoding.
+fn largest_sync_batch(ops: Vec<SequencedOperation>) -> ServerMessage {
+    ServerMessage::SyncBatch {
+        correlation_id: CorrelationId::new(u64::MAX),
+        room_id: RoomId::new("r".repeat(64)).unwrap(),
+        head_seq: SequenceNumber::new(u64::MAX),
+        ops,
+        has_more: true,
+        snapshot_wanted: true,
+        schema_version: u64::MAX,
+        schema_id: SchemaId::new("s".repeat(64)).unwrap(),
+    }
+}
+
+#[test]
+fn response_envelope_allowance_covers_every_field_but_the_operations() {
+    for response in [largest_commit_ack(vec![]), largest_sync_batch(vec![])] {
+        let envelope = encoded_len(&response).unwrap();
+        assert!(
+            envelope <= RESPONSE_ENVELOPE_ALLOWANCE,
+            "{envelope} bytes over an allowance of {RESPONSE_ENVELOPE_ALLOWANCE}: {response:?}"
+        );
+    }
+}
+
 #[test]
 fn largest_accepted_operation_fits_alone_in_any_response() {
-    let max_room = RoomId::new("r".repeat(64)).unwrap();
     let op = op_with_wire_len(u64::MAX, MAX_RESPONSE_OPS_BYTES);
     assert_eq!(
         check_operation_size(&op, Some(MutationId::new([0xFF; 16]))),
@@ -396,28 +442,17 @@ fn largest_accepted_operation_fits_alone_in_any_response() {
     );
 
     // With every other field at its largest encoding, both responses still encode.
-    let commit_ack = ServerMessage::CommitAck {
-        correlation_id: CorrelationId::new(u64::MAX),
-        room_id: max_room.clone(),
-        mutation_id: MutationId::new([0xFF; 16]),
-        assigned_seq: SequenceNumber::new(u64::MAX),
-        catchup_ops: vec![op.clone()],
-        has_more: true,
-        snapshot_wanted: true,
-        schema_version: u64::MAX,
-    };
-    let frame = encode_message(&commit_ack).expect("CommitAck with the largest operation");
+    let frame = encode_message(&largest_commit_ack(vec![op.clone()]))
+        .expect("CommitAck with the largest operation");
     assert!(frame.len() <= MAX_FRAME_SIZE);
-    let sync_batch = ServerMessage::SyncBatch {
-        correlation_id: CorrelationId::new(u64::MAX),
-        room_id: max_room,
-        head_seq: SequenceNumber::new(u64::MAX),
-        ops: vec![op],
-        has_more: true,
-        snapshot_wanted: true,
-        schema_version: u64::MAX,
-    };
-    assert!(encode_message(&sync_batch).is_ok());
+    assert!(encode_message(&largest_sync_batch(vec![op])).is_ok());
+
+    // The allowance does not leave room for a schema id by overestimating the other fields:
+    // with an operation as large as it would be without the schema id, neither response fits.
+    let without_schema_id =
+        op_with_wire_len(u64::MAX, MAX_RESPONSE_OPS_BYTES + LARGEST_SCHEMA_ID_LEN);
+    assert!(encode_message(&largest_commit_ack(vec![without_schema_id.clone()])).is_err());
+    assert!(encode_message(&largest_sync_batch(vec![without_schema_id])).is_err());
 
     // One byte more is rejected before it could ever be accepted.
     let too_large = op_with_wire_len(u64::MAX, MAX_RESPONSE_OPS_BYTES + 1);
@@ -425,6 +460,28 @@ fn largest_accepted_operation_fits_alone_in_any_response() {
         check_operation_size(&too_large, None),
         Err(OperationSizeError::Response { .. })
     ));
+}
+
+#[test]
+fn a_response_with_an_invalid_schema_id_is_malformed() {
+    let frame = encode_message(&ServerMessage::HeartbeatAck {
+        correlation_id: CorrelationId::new(1),
+        room_id: room(),
+        current_head_seq: SequenceNumber::new(1),
+        snapshot_wanted: false,
+        active_snapshot_seq: None,
+        schema_version: 1,
+        schema_id: SchemaId::new("s").unwrap(),
+    })
+    .unwrap();
+    // The schema id is the last field: its one byte becomes a character no id may hold.
+    let mut damaged = frame.clone();
+    *damaged.last_mut().unwrap() = b'.';
+    assert!(matches!(
+        decode_message::<ServerMessage>(&damaged),
+        Err(DecodeError::Malformed(_))
+    ));
+    assert!(decode_message::<ServerMessage>(&frame).is_ok());
 }
 
 #[test]
@@ -665,6 +722,7 @@ fn a_delete_carrying_its_owner_round_trips_in_every_message() {
         has_more: false,
         snapshot_wanted: false,
         schema_version: 1,
+        schema_id: SchemaId::new("owned").unwrap(),
     });
     // The owner is part of the operation, so of its size.
     let without = encoded_len(&Operation::delete(2, PrimaryKey::single(7i64), 900)).unwrap();

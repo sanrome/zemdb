@@ -1,5 +1,5 @@
 use super::*;
-use crate::id::{CorrelationId, RoomId, SequenceNumber};
+use crate::id::{CorrelationId, RoomId, SchemaId, SequenceNumber};
 use crate::mutation::{ColumnUpdate, Operation};
 use crate::protocol::messages::{SequencedOperation, ServerMessage};
 use crate::schema::MAX_COLUMNS;
@@ -103,6 +103,7 @@ fn server_responses_are_not_budgeted() {
         has_more: false,
         snapshot_wanted: false,
         schema_version: 1,
+        schema_id: SchemaId::new("schema").unwrap(),
     };
     let frame = encode_message(&batch).unwrap();
     assert_eq!(decode_message::<ServerMessage>(&frame).unwrap(), batch);

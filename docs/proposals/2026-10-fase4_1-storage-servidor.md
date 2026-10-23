@@ -2,7 +2,7 @@
 
 **Fecha:** 23 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lotes 0 y 1 cerrados; el próximo es el 2.
+**Estado:** En curso: Lotes 0 a 2 cerrados; el próximo es el 3.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.1. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -66,7 +66,7 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 |---|---|---|---|---|---|
 | 0 | Contrato | Documentos | DC5, DC9, DC12, DC15, DC16, DC17 | Nueva: S7. Ajustes: S4, S5, S6, C1, C2, E2, W1, W2, A5, K3, K6, K12 | ✅ |
 | 1 | El dueño como prefijo del `ClientId` y `Schema::evolves_from` | core, server | DC15, DC5 | A5, K6, C1 | ✅ |
-| 2 | El `schema_id` en `CommitAck`, `SyncBatch` y `HeartbeatAck` | core, server | DC5 | E2, W1, W2, B1, K6 | ⬜ |
+| 2 | El `schema_id` en `CommitAck`, `SyncBatch` y `HeartbeatAck` | core, server | DC5 | E2, W1, W2, B1, K6 | ✅ |
 | 3 | Los plazos del servidor con el reloj de Tokio | server | DC16 | B2, R3, L1 | ⬜ |
 | 4 | Los errores de la apertura y de `apply_snapshot` | storage | DC12 | S4, S5, C2, W1, K3 | ⬜ |
 | 5 | `reload_schema` | storage | DC5 | S7, C1, C2, C3, S6, K6 | ⬜ |
@@ -175,7 +175,7 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 - **Tamaño:** unas 60 líneas de producción, más docstrings.
 - **Desvíos:** ninguno.
 
-### Lote 2 · El `schema_id` en `CommitAck`, `SyncBatch` y `HeartbeatAck` (`zemdb-core`, `zemdb-server`) · ⬜
+### Lote 2 · El `schema_id` en `CommitAck`, `SyncBatch` y `HeartbeatAck` (`zemdb-core`, `zemdb-server`) · ✅ Hecho
 **Objetivo:** que el cliente se entere de una reasignación por cualquier respuesta, no solo por el registro (DC5). Las versiones son por esquema, y dos esquemas pueden tener la misma.
 
 **Archivos:** `crates/core/src/protocol/messages.rs` y `limits.rs`; `crates/server/src/actor/command.rs`, `room.rs` y `api/data_plane.rs`; los tests de codificación y los fuzzers de mensajes.
@@ -200,6 +200,30 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 - INV-E2: la versión sigue llegando por las mismas respuestas.
 
 **Documentos:** `ARCHITECTURE.md` §7.2 (los campos de las tres respuestas y el tope de una operación) y §3.1 (*Schema Version*); `INVARIANTES.md`: INV-E2 sin 🆕, y en INV-K6 la parte del `schema_id`.
+
+**Hecho.**
+- **Wire.** `schema_id: SchemaId` al final de `CommitAck`, `SyncBatch` y `HeartbeatAck`, con docstrings que dicen que las versiones son por esquema y que un id o una versión distintos de los del cliente son un cambio de esquema. `RESPONSE_ENVELOPE_ALLOWANCE` suma el largo y los 64 bytes del `schema_id` (de 132 a 205 bytes), así que `MAX_RESPONSE_OPS_BYTES`, y con él el tope de `check_operation_size`, baja 73 bytes.
+- **Servidor.** `CommitResponse` (el commit nuevo y el reintento deduplicado), `SyncBatchResponse` y `HeartbeatResponse` llevan el `schema_id` del actor, el mismo que da a `Registered` y `Schema`; `api/data_plane.rs` lo copia a los mensajes.
+- **Tests agregados o ampliados:**
+  - `crates/core/tests/protocol_codec_tests.rs`: las idas y vueltas de las tres variantes con `schema_id`; `response_envelope_allowance_covers_every_field_but_the_operations` (un `CommitAck` y un `SyncBatch` sin operaciones y con todo lo demás al máximo, ids de 64 bytes incluidos, codifican en a lo sumo el margen); `largest_accepted_operation_fits_alone_in_any_response`, con un id de sala y un `schema_id` de 64 bytes y `correlation_id`, secuencias y versión en `u64::MAX`, y el negativo: con una operación del tamaño que permitiría el margen sin el `schema_id`, ninguna de las dos respuestas entra; una operación de `MAX_RESPONSE_OPS_BYTES` más un byte sigue rechazada; y `a_response_with_an_invalid_schema_id_is_malformed`.
+  - Los generadores de mensajes de `crates/core/tests/common` traen un `schema_id` aleatorio, así que los fuzzers del decoder y las idas y vueltas aleatorias lo cubren (INV-W1, INV-W2); el test de largos declarados de `decoder_fuzz_tests.rs` ajusta su offset.
+  - `crates/server/src/actor/tests/manager.rs`: `every_response_reports_the_schema_a_room_was_reassigned_to`, una sala reasignada entre dos esquemas con la misma versión: el registro, el commit, su reintento, el sync y el heartbeat dan el id nuevo.
+  - `crates/server/tests/server_integration_tests.rs`: `schema_evolution_cascades_to_active_room` comprueba por HTTP, después de un `add_column`, el mismo id con la versión nueva en `Registered`, `Schema`, `HeartbeatAck`, `SyncBatch` y `CommitAck`.
+  - Contra el esqueleto (los campos sin el cambio del margen, y el actor con un id fijo) fallaban por comportamiento los dos tests de tamaño de core y los dos del servidor.
+- **Mutaciones verificadas** (detectadas): el margen sin el término del `schema_id`; cada uno de los cuatro lugares del actor (commit nuevo, reintento, sync, heartbeat) con otro id; cada una de las tres copias de `data_plane.rs` con otro id. Sobrevive sacar solo los 9 bytes del largo (dejando los 64): el margen sobreestima los varints (el tag de la variante, el largo de los dos ids y la cuenta de operaciones), así que el sobre más grande real mide 177 bytes contra 205; la revisión de delta midió que una rebaja de hasta 28 bytes, de cualquier término, sobrevive, y de 29 la detectan los dos tests de tamaño. Esa holgura no se puede detectar sin fijar la constante.
+- **Interacciones revisadas:**
+  - El presupuesto de respuestas: cada respuesta presupuestada reserva `MAX_FRAME_SIZE`, y la más grande sigue entrando (test de tamaño). `HeartbeatAck` no se presupuesta: crece a lo sumo 65 bytes.
+  - `check_operation_size` y el tope de una operación en un commit, que baja 73 bytes; el presupuesto de lectura de `tiered_log` y el catch-up del actor usan `MAX_RESPONSE_OPS_BYTES` y siguen en verde, también los tests de respuestas grandes de `http_edge_tests.rs`.
+  - `Registered` y `Schema`: el `schema_id` del actor no cambia mientras vive (una reasignación pasa con el actor detenido, en `RoomManager::get_or_spawn`), así que los cinco mensajes dicen lo mismo (tests del manager y de integración).
+  - La recarga del Lote 6c de la Fase 3.11: ignora la de otro esquema y no cambia el id; después de un `add_column` el id es el mismo con la versión nueva (test de integración).
+  - INV-E2: la versión sigue llegando por las mismas respuestas.
+  - Decodificar una respuesta: `SchemaId` se valida al deserializarse, así que un id inválido es `Malformed` (test).
+  - El reintento de un commit secuenciado antes de una reasignación devuelve el `assigned_seq` original con el id nuevo: es lo correcto (el cliente se entera del cambio), y lo arma el mismo código del reintento que cubre el test del manager.
+  - Los logs escritos antes de este cambio: con el tope anterior se pudo aceptar una operación de entre `MAX_MESSAGE_SIZE − 205` y `MAX_MESSAGE_SIZE − 132` bytes de wire, y ninguna lectura vuelve a pasar `check_operation_size`. Con ids de sala y de esquema de 64 bytes y secuencias grandes, esa operación ya no entra sola en una respuesta, y el sync de esa secuencia no se podría codificar. Antes del primer release no hay logs que conservar (`GEMINI.md`), así que no lleva código.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura): en verde, sin hallazgos Altos ni Medios. Probó además mutaciones propias, todas detectadas (el id del reintento y el del `HeartbeatAck` de `data_plane.rs`, y el margen 44 y 46 bytes de más o 29 de menos). Su Bajo (los logs anteriores al cambio) y sus notas (el reintento a través de una reasignación; la holgura de 28 bytes) quedan en esta nota.
+- **Chequeos:** fmt, clippy, test, doc y el build de wasm32 en verde; `cargo test --release -- --ignored` de `zemdb-core` y de `zemdb-server`.
+- **Tamaño:** unas 15 líneas de producción, más docstrings.
+- **Desvíos:** ninguno.
 
 ### Lote 3 · Los plazos del servidor con el reloj de Tokio (`zemdb-server`) · ⬜
 **Objetivo:** que el arnés de 4.2 controle todos los plazos del servidor con el reloj pausado (DC16, plan de la fase §5.3).
@@ -328,4 +352,4 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 
 ## 3. Seguimiento
 
-**Avance:** Lote 0 cerrado el 23 de Octubre de 2026, con la revisión cruzada en verde en su quinta ronda; Lote 1 cerrado el mismo día. DC17 adoptada el 23 de Octubre, con renombrar un archivo abierto como operación del trait (el refactor de los Lotes 7 a 9 queda sin cambio de comportamiento). El próximo es el Lote 2.
+**Avance:** Lote 0 cerrado el 23 de Octubre de 2026, con la revisión cruzada en verde en su quinta ronda; Lote 1 cerrado el mismo día. DC17 adoptada el 23 de Octubre, con renombrar un archivo abierto como operación del trait (el refactor de los Lotes 7 a 9 queda sin cambio de comportamiento). Lote 2 cerrado el 23 de Octubre. El próximo es el Lote 3.

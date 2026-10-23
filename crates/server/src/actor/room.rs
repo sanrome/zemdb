@@ -503,6 +503,7 @@ impl RoomActor {
                 has_more,
                 snapshot_wanted: self.snapshot_wanted_for(client_id),
                 schema_version: self.schema.version(),
+                schema_id: self.schema_id.clone(),
                 reservation,
             });
         }
@@ -603,6 +604,7 @@ impl RoomActor {
             has_more,
             snapshot_wanted: self.snapshot_wanted_for(client_id),
             schema_version: self.schema.version(),
+            schema_id: self.schema_id.clone(),
             reservation,
         })
     }
@@ -686,6 +688,7 @@ impl RoomActor {
             has_more,
             snapshot_wanted: self.snapshot_wanted_for(client_id),
             schema_version: self.schema.version(),
+            schema_id: self.schema_id.clone(),
             reservation,
         })
     }
@@ -729,6 +732,7 @@ impl RoomActor {
             snapshot_wanted: self.snapshot_wanted_for(client_id),
             active_snapshot_seq: self.usable_snapshot_seq(),
             schema_version: self.schema.version(),
+            schema_id: self.schema_id.clone(),
         })
     }
 

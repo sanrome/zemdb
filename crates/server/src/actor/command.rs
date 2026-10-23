@@ -31,6 +31,7 @@ pub struct CommitResponse {
     /// Whether this client is the one designated to upload a room snapshot.
     pub snapshot_wanted: bool,
     pub schema_version: u64,
+    pub schema_id: SchemaId,
     /// The frame of the budget of response bytes in flight that the catch-up was read within;
     /// without one, the catch-up is empty and flagged `has_more`.
     pub(crate) reservation: Option<Reservation>,
@@ -45,6 +46,7 @@ pub struct SyncBatchResponse {
     /// Whether this client is the one designated to upload a room snapshot.
     pub snapshot_wanted: bool,
     pub schema_version: u64,
+    pub schema_id: SchemaId,
     /// The frame of the budget of response bytes in flight that the batch was read within.
     pub(crate) reservation: Reservation,
 }
@@ -58,6 +60,7 @@ pub struct HeartbeatResponse {
     /// The relay's active snapshot, only if a client can catch up from it with the retained log.
     pub active_snapshot_seq: Option<SequenceNumber>,
     pub schema_version: u64,
+    pub schema_id: SchemaId,
 }
 
 /// Metrics snapshot for a room actor.

@@ -27,8 +27,8 @@ const MUTATION_ID_LEN: u64 = 16;
 /// Largest wire encoding of everything in a `CommitAck` or `SyncBatch` payload except its
 /// operations, with every variable-length field at its maximum. `CommitAck` is the larger:
 /// variant tag, correlation id, room id (length and bytes), mutation id, assigned sequence,
-/// operation count, the two flags and the schema version. `SyncBatch` has the same fields
-/// minus the mutation id.
+/// operation count, the two flags, the schema version and the schema id (length and bytes).
+/// `SyncBatch` has the same fields minus the mutation id.
 pub const RESPONSE_ENVELOPE_ALLOWANCE: u64 = MAX_VARIANT_TAG_LEN
     + MAX_VARINT_U64_LEN
     + (MAX_VARINT_U64_LEN + MAX_PATH_ID_LEN as u64)
@@ -36,7 +36,8 @@ pub const RESPONSE_ENVELOPE_ALLOWANCE: u64 = MAX_VARIANT_TAG_LEN
     + MAX_VARINT_U64_LEN
     + MAX_VARINT_U64_LEN
     + 2
-    + MAX_VARINT_U64_LEN;
+    + MAX_VARINT_U64_LEN
+    + (MAX_VARINT_U64_LEN + MAX_PATH_ID_LEN as u64);
 
 /// Byte budget for the operations of one response (`CommitAck::catchup_ops`,
 /// `SyncBatch::ops`), as measured by [`encoded_len`] of each `SequencedOperation`.

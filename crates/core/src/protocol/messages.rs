@@ -235,9 +235,12 @@ pub enum ServerMessage {
         has_more: bool,
         /// Whether the server chose this client to upload a room snapshot.
         snapshot_wanted: bool,
-        /// Version of the room's schema; a version other than the client's means it must ask for
-        /// the schema (`GetSchema`) before applying operations.
+        /// Version of the room's schema. Versions count per schema, so the client compares it
+        /// together with `schema_id`.
         schema_version: u64,
+        /// Id of the room's schema. An id or a version other than the client's is a schema
+        /// change: the client asks for the schema (`GetSchema`) before applying operations.
+        schema_id: SchemaId,
     },
     /// Confirmation of client acknowledgment and cursor persistence.
     AckConfirmed {
@@ -257,6 +260,8 @@ pub enum ServerMessage {
         snapshot_wanted: bool,
         /// Version of the room's schema (see `CommitAck`).
         schema_version: u64,
+        /// Id of the room's schema (see `CommitAck`).
+        schema_id: SchemaId,
     },
     /// Chunk of the base room snapshot during multipart bootstrapping.
     SnapshotChunk {
@@ -299,6 +304,8 @@ pub enum ServerMessage {
         active_snapshot_seq: Option<SequenceNumber>,
         /// Version of the room's schema (see `CommitAck`).
         schema_version: u64,
+        /// Id of the room's schema (see `CommitAck`).
+        schema_id: SchemaId,
     },
     /// Confirmation of client deregistration from the room.
     DeregisterAck {
