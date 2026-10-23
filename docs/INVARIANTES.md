@@ -1,6 +1,6 @@
 # Invariantes de ZemDB
 
-**Estado:** Vigente. Versión 5 (21 de Octubre de 2026): cierra la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md). Sus invariantes nuevas, INV-A5 e INV-C1 a C3, pasan a ✅ después de su revisión de cierre (DR14) y de los Lotes 6b y 6c, que arreglaron las dos rupturas que encontró el cierre (ver §1.4); INV-Y8 confirma su enunciado ampliado. La versión 4 (19 de Octubre) agrega las invariantes de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md) (DR1–DR14): INV-A5 e INV-C1 a C3, nuevas, y el enunciado ampliado de INV-Y8. La versión 3 (18 de Octubre) incorpora las decisiones de la [Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (D90–D97) tomadas sobre la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md). La versión 2 (16 de Octubre) incorporó las de la [Fase 3.9](proposals/2026-10-fase3_9-remediation-plan.md) (D70–D72, D77–D79) y es la que auditó la 2ª ronda; la versión 1 (15 de Octubre, sobre `6485f46`), la que auditó la [primera](audits/2026-10-invariantes-audit.md).
+**Estado:** Vigente. Versión 6 (22 de Octubre de 2026): agrega el contrato del SDK de la [Fase 4](proposals/2026-10-fase4-plan.md), de su sub-fase 4.0: el modelo de amenaza del cliente en §2 (DC11) y las invariantes INV-K1 a K15 en §3.11 (DC10), todas 🆕; el dueño de INV-A5 pasa a ser el prefijo del `ClientId` desde 4.1 (DC15), y el §4 anota cómo el SDK cierra o acota D93, D96, DEF-34, DEF-54 y DEF-85. La versión 5 (21 de Octubre de 2026): cierra la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md). Sus invariantes nuevas, INV-A5 e INV-C1 a C3, pasan a ✅ después de su revisión de cierre (DR14) y de los Lotes 6b y 6c, que arreglaron las dos rupturas que encontró el cierre (ver §1.4); INV-Y8 confirma su enunciado ampliado. La versión 4 (19 de Octubre) agrega las invariantes de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md) (DR1–DR14): INV-A5 e INV-C1 a C3, nuevas, y el enunciado ampliado de INV-Y8. La versión 3 (18 de Octubre) incorpora las decisiones de la [Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (D90–D97) tomadas sobre la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md). La versión 2 (16 de Octubre) incorporó las de la [Fase 3.9](proposals/2026-10-fase3_9-remediation-plan.md) (D70–D72, D77–D79) y es la que auditó la 2ª ronda; la versión 1 (15 de Octubre, sobre `6485f46`), la que auditó la [primera](audits/2026-10-invariantes-audit.md).
 **Uso:** base de las auditorías por invariantes y de los tests de propiedades. Reemplaza a las auditorías abiertas por perspectiva ("buscá errores desde X").
 **Contrato de referencia:** [`ARCHITECTURE.md`](../ARCHITECTURE.md). Las invariantes se enuncian sobre el comportamiento observable y remiten a la sección que lo describe; no citan líneas de código, para que el documento no envejezca con cada refactor.
 
@@ -49,7 +49,7 @@ Una auditoría por invariantes está **en verde** cuando:
 - La Fase 3.10 cierra con una **revisión de cierre** de su delta: las mismas tres condiciones, sobre lo que la fase tocó y los mecanismos con los que eso interactúa. En verde, el código auditado se considera estable. Salió en verde sobre `d2c1406`, con una Media de origen (b), DEF-182, que se arregló después.
 - La Fase 3.11 cerró igual, con una revisión de cierre de su delta (DR14) sobre `77ca57b`, que auditó por primera vez sus invariantes nuevas. Rompió INV-C1 ★: una sala se podía reasignar a un esquema con otras columnas, y una restricción agregada después juzgaba de otro modo su log. El Lote 6b lo arregló. Su revisión de delta encontró otro camino, preexistente, que rompía INV-C1 ★ e INV-A5 ★: una recarga del esquema, trabada en otra sala, llegaba a una sala que mientras tanto se había reasignado o recreado con otro esquema, que pasaba a validar sus commits con el viejo (también el dueño). Lo arregló el Lote 6c. Los dos tuvieron su propia revisión de delta, antes del cierre.
 - Desde entonces, cada cambio se revisa por su delta contra esta lista y contra los mecanismos con los que interactúa. Lo que aparezca de origen (b) o (c), Medio o Bajo, va al backlog, no a un plan nuevo.
-- Una auditoría amplia vuelve a hacer falta solo si cambia el modelo de amenaza (§2), o si entra código fuera del alcance actual, como el SDK de la Fase 4. En ese caso se audita una vez, con este método, contra las invariantes nuevas de ese código.
+- Una auditoría amplia vuelve a hacer falta solo si cambia el modelo de amenaza (§2), o si entra código fuera del alcance actual, como el SDK de la Fase 4. En ese caso se audita una vez, con este método, contra las invariantes nuevas de ese código. El SDK se audita así al cerrar la sub-fase 4.2, contra §3.11 (DC3).
 
 ### 1.5. Estado de cada invariante
 
@@ -58,13 +58,13 @@ La columna **Estado** del resumen (§3) dice cómo quedó cada invariante en la 
 - ✅ (Dnn): la auditoría la rompió, pero la decisión Dnn la deja sostenida sin código (un supuesto de §2, un riesgo aceptado de §4 o un enunciado ajustado);
 - ❌ se rompió, y entre paréntesis va el lote que la arregla;
 - ❌ Bajo (backlog): todas sus rupturas abiertas son Bajas y no entran en ningún lote; no bloquea el corte (§1.4);
-- 🆕 es nueva y todavía no se auditó, y entre paréntesis va el lote que la implementa, si hace falta código.
+- 🆕 es nueva y todavía no se auditó, y entre paréntesis va el lote (o, en la Fase 4, la sub-fase) que la implementa, si hace falta código.
 
 Cada lote que cierra una ruptura actualiza esta columna en el mismo commit (§5).
 
 ### 1.6. Reparto sugerido
 
-Un auditor por grupo (§3.1 a §3.10). Cada uno recibe este documento, `ARCHITECTURE.md`, la lista de riesgos aceptados (§4), las decisiones de los planes de remediación (D1 a D102) y las de la Fase 3.11 (DR1 a DR15), y responde solo con veredictos.
+Un auditor por grupo (§3.1 a §3.11). Cada uno recibe este documento, `ARCHITECTURE.md`, la lista de riesgos aceptados (§4), las decisiones de los planes de remediación (D1 a D102), las de la Fase 3.11 (DR1 a DR15) y las de la Fase 4 (DC1 a DC16), y responde solo con veredictos. Cuántos auditores tiene el grupo del cliente (§3.11) en la auditoría que cierra 4.2 lo decide el plan de esa sub-fase.
 
 ---
 
@@ -78,13 +78,18 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 - **Los nombres de las entradas de directorio** (D92): la corrupción accidental afecta el contenido de los archivos, no los nombres con que figuran en su directorio (ext4 con `metadata_csum`, XFS v5, btrfs y ZFS verifican los bloques de directorio y devuelven EIO antes que un nombre alterado). Por eso el rango de un segmento, o la sala y la secuencia de un snapshot, se leen de su nombre sin checksum.
 - **El poseedor del admin secret** es de confianza total.
 - **El proceso es el único dueño de su `data_dir`**; los locks lo hacen cumplir, y que lo cumplan es parte de las invariantes.
+- **Del lado del cliente** (DC11 de la [Fase 4](proposals/2026-10-fase4-plan.md)):
+  - **La aplicación que usa el SDK.** En el navegador es todo el origen: otras pestañas y cualquier script de la página. La aplicación maneja las claves de las columnas cifradas, y su backend emite los tokens.
+  - **El servidor, como secuenciador:** lo que secuencia, su orden y la encarnación de la sala. No para la confidencialidad: las columnas cifradas se protegen del servidor y del proxy (INV-K9).
+  - **El disco local**, con los mismos supuestos que el del servidor. En el navegador, el *Origin Private File System*: lo escrito con `flush()` sobrevive como lo sincronizado con `fsync`. Es un supuesto que no se puede verificar desde el navegador (S1, en DC8).
 
 **No se confía en:**
-- **La red y quien no tiene token:** puede mandar cualquier byte, a cualquier ritmo, abrir y abandonar conexiones.
+- **La red y quien no tiene token:** puede mandar cualquier byte, a cualquier ritmo, abrir y abandonar conexiones. Del lado del cliente, una respuesta puede perderse, cortarse, demorarse o traer cualquier byte (INV-K12), y un evento SSE puede perderse (INV-K7).
 - **Un miembro con token válido de una sala:** puede ser hostil dentro de su sala (mandar mensajes válidos en cualquier orden, no leer respuestas, reintentar, abrir streams). No puede afectar a otras salas ni actuar como otro cliente. Puede secuenciar operaciones que violan las restricciones del esquema: las réplicas honestas las rechazan (INV-C2). No puede escribir filas ajenas en una tabla con dueño (INV-A5). Que suba un snapshot bien formado pero falso está fuera de alcance (§4).
-- **El reloj de pared:** puede saltar hacia atrás o adelante. El orden lo define solo `SequenceNumber`.
+- **El reloj de pared:** puede saltar hacia atrás o adelante. El orden lo define solo `SequenceNumber`. Los plazos del SDK (backoff, heartbeat, reintentos) usan un reloj monotónico.
+- **La persistencia del navegador:** sin `persist()`, que sin interacción del usuario suele dar `false` (S1), el navegador puede borrar todo el almacenamiento del origen. No es un daño sino una pérdida total: el cliente la detecta y vuelve a bajar el estado (INV-K5).
 
-**Fuera de alcance de la v0.1:** TLS (lo termina el proxy), revocación de tokens, defensa contra snapshots envenenados, el SDK del cliente (Fase 4) salvo `zemdb-storage` y `zemdb-core`.
+**Fuera de alcance de la v0.1:** TLS (lo termina el proxy), revocación de tokens, defensa contra snapshots envenenados, un servidor malicioso (que reordena o fabrica operaciones, o muestra historias distintas a distintos clientes), la gestión de las claves de cifrado, y un script hostil dentro del origen de la aplicación.
 
 ---
 
@@ -92,7 +97,7 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 
 ### Resumen
 
-Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md) (ver §1.5), con los lotes del [plan de la Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (cerrados: 0 a 5, con la revisión de cierre) y las decisiones D92 a D102. Las invariantes de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md) se auditaron por primera vez en su revisión de cierre (DR14, sobre `77ca57b`), y quedan sostenidas con los Lotes 6b y 6c.
+Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md) (ver §1.5), con los lotes del [plan de la Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (cerrados: 0 a 5, con la revisión de cierre) y las decisiones D92 a D102. Las invariantes de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md) se auditaron por primera vez en su revisión de cierre (DR14, sobre `77ca57b`), y quedan sostenidas con los Lotes 6b y 6c. Las del cliente (§3.11) son de la sub-fase 4.0 de la [Fase 4](proposals/2026-10-fase4-plan.md): todas 🆕, con la sub-fase que las implementa.
 
 | ID | Invariante | ★ | Si se rompe | Estado |
 |---|---|---|---|---|
@@ -132,7 +137,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-A2** | Nada se decodifica antes de autenticar, salvo lo acotado de `/register` | | Alto | ✅ |
 | **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio | ❌ Bajo (backlog) |
 | **INV-A4** | Ningún identificador produce rutas fuera de `data_dir` | ★ | Alto | ✅ |
-| **INV-A5** | Nadie escribe una fila ajena | ★ | Alto | ✅ |
+| **INV-A5** | Nadie escribe una fila ajena | ★ | Alto | ✅; el dueño como prefijo del `ClientId`, 🆕 (4.1) |
 | **INV-B1** | La memoria por request está acotada | ★ | Alto | ✅ |
 | **INV-B2** | Nada se retiene sin plazo | | Medio | ✅ |
 | **INV-B3** | La memoria, el disco y los FDs del servidor están acotados por la configuración | | Medio | ✅ |
@@ -152,6 +157,21 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-C1** | Ninguna versión posterior del esquema cambia la decisión sobre una operación ya secuenciada | ★ | Alto | ✅ |
 | **INV-C2** | El estado de una réplica cumple las restricciones de su esquema | ★ | Alto | ✅ |
 | **INV-C3** | Un rechazo no deja rastro, y los índices son función de las tablas | | Medio | ✅ |
+| **INV-K1** | La réplica local es siempre un prefijo del log de la sala | ★ | Alto | 🆕 (4.2) |
+| **INV-K2** | Cada escritura se resuelve una sola vez, con la decisión de la réplica o como incierta | ★ | Alto | 🆕 (4.2, 4.4, 4.6) |
+| **INV-K3** | El SDK nunca descarta una réplica local sana | ★ | Alto | 🆕 (4.1, 4.2, 4.4) |
+| **INV-K4** | Las réplicas de clientes que siguen el protocolo convergen | ★ | Alto | 🆕 (4.2) |
+| **INV-K5** | El cursor que presenta el cliente es siempre el head de su réplica | | Alto | 🆕 (4.2) |
+| **INV-K6** | La réplica solo cambia a un esquema que evoluciona del suyo | ★ | Alto | 🆕 (4.1, 4.2) |
+| **INV-K7** | Un cliente atrasado termina al día, también si es el designado | | Medio | 🆕 (4.2, 4.3) |
+| **INV-K8** | El SDK nunca manda una operación con un dueño ajeno | | Medio | 🆕 (4.4) |
+| **INV-K9** | Una columna cifrada nunca sale en claro | | Alto | 🆕 (4.4, 4.5, 4.6) |
+| **INV-K10** | `watch` refleja la réplica | | Medio | 🆕 (4.4) |
+| **INV-K11** | Cerrar o apagar el cliente no pierde nada confirmado | | Medio | 🆕 (4.2, 4.5) |
+| **INV-K12** | Ninguna respuesta del servidor ni snapshot de un par hace entrar en pánico al SDK | ★ | Alto | 🆕 (4.1, 4.2, 4.3, 4.5) |
+| **INV-K13** | En el navegador, una sola instancia del SDK escribe cada sala | | Alto | 🆕 (4.5) |
+| **INV-K14** | La API de JavaScript no cambia ningún valor al cruzar el límite del Worker | | Medio | 🆕 (4.6) |
+| **INV-K15** | La memoria del SDK está acotada | | Medio | 🆕 (4.2, 4.4) |
 
 ---
 
@@ -287,7 +307,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 **Cómo intentar romperla.** Acks desordenados o repetidos; sync rechazado; commit rechazado; registro con cursor sobre un cliente existente.
 
 #### INV-Y7 · Un registro con cursor de otra encarnación nunca se acepta
-**Enunciado.** Un registro con `current_seq` y una encarnación distinta (o ausente) recibe `RoomReset` sin tocar el roster. La encarnación sobrevive a reinicios, reaperturas y reasignaciones de esquema, y una sala recreada tiene otra. La garantía cubre el registro (D70). Que un cliente que se registró sin cursor no use después un cursor guardado (en sync, ack o commit) es una regla del SDK: arranca de 0 o de un snapshot.
+**Enunciado.** Un registro con `current_seq` y una encarnación distinta (o ausente) recibe `RoomReset` sin tocar el roster. La encarnación sobrevive a reinicios, reaperturas y reasignaciones de esquema, y una sala recreada tiene otra. La garantía cubre el registro (D70). Que un cliente que se registró sin cursor no use después un cursor guardado (en sync, ack o commit) es una regla del SDK: arranca de 0 o de un snapshot (INV-K5).
 **Sostenida por.** D58, D70 (§6 *Room incarnation*).
 **Cómo intentar romperla.** Sala sin `meta_room.json` creada por `get_or_spawn`; delete y create concurrentes; registros con y sin cursor, con encarnaciones viejas, nuevas y ausentes.
 
@@ -365,9 +385,9 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 **Cómo intentar romperla.** Ids por URL, por payload binario, por JSON admin y por nombres de archivo encontrados en disco; nombres reservados de Windows.
 
 #### INV-A5 ★ · Nadie escribe una fila ajena
-**Enunciado.** En una tabla con dueño, toda operación secuenciada declara como dueño al cliente que la envió, y ninguna operación aplicada inserta, reemplaza, modifica ni borra una fila cuyo dueño es otro.
-**Sostenida por.** La verificación del dueño declarado en el commit, antes de secuenciar (DR10: `validate_operation` exige que la operación declare el dueño y `Schema::check_owner` lo compara byte a byte con el `ClientId` del token), la verificación de las réplicas sobre la fila existente (DR4, DR10: `apply_operation` rechaza con `NotOwner` un `Insert`, `Update` o `Delete` cuya fila existente es de otro dueño, y con `Duplicate` un segundo `Insert` de una clave inmutable) e INV-A1. El servidor verifica con el esquema de la sala: una recarga de otro esquema no le llega (Lote 6c).
-**Cómo intentar romperla.** Un `Insert`, `Update` o `Delete` de B que declara a A como dueño; uno de B que se declara dueño sobre una fila de A, con el dueño dentro y fuera de la clave; un `Update` que intenta transferir la fila; un reintento deduplicado; una sala recreada con dueño mientras una recarga de su esquema anterior está trabada en otra sala.
+**Enunciado.** En una tabla con dueño, toda operación secuenciada declara como dueño al cliente que la envió, y ninguna operación aplicada inserta, reemplaza, modifica ni borra una fila cuyo dueño es otro. Desde el lote de 4.1 que implementa DC15 (Fase 4), el dueño de un cliente es la parte de su `ClientId` anterior al primer `#` (el `ClientId` entero si no tiene `#` o si alguna de las dos partes queda vacía): los dispositivos de una persona son clientes distintos con el mismo dueño. El backend que emite los tokens no pone `#` en el id de persona; el id de dispositivo puede traer cualquier carácter sin cambiar el dueño.
+**Sostenida por.** La verificación del dueño declarado en el commit, antes de secuenciar (DR10: `validate_operation` exige que la operación declare el dueño y `Schema::check_owner` lo compara byte a byte con el `ClientId` del token; desde 4.1, con su prefijo de dueño, 🆕), la verificación de las réplicas sobre la fila existente (DR4, DR10: `apply_operation` rechaza con `NotOwner` un `Insert`, `Update` o `Delete` cuya fila existente es de otro dueño, y con `Duplicate` un segundo `Insert` de una clave inmutable) e INV-A1. El servidor verifica con el esquema de la sala: una recarga de otro esquema no le llega (Lote 6c).
+**Cómo intentar romperla.** Un `Insert`, `Update` o `Delete` de B que declara a A como dueño; uno de B que se declara dueño sobre una fila de A, con el dueño dentro y fuera de la clave; un `Update` que intenta transferir la fila; un reintento deduplicado; una sala recreada con dueño mientras una recarga de su esquema anterior está trabada en otra sala; desde 4.1, un `ClientId` cuyo id de dispositivo trae `#`, y uno con una de las dos partes vacía.
 **Fuera de alcance.** Un snapshot falso de un miembro hostil (DEF-81).
 
 ### 3.6. Recursos acotados
@@ -397,7 +417,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 **Enunciado.** Ningún cliente (un par sala y `client_id`, o el admin secret en el relay) retiene más que una parte configurada de un recurso que comparten todas las salas: el presupuesto de respuestas en vuelo y los streams SSE. Lo que excede su parte se le rechaza a él (`Unavailable`, `RateLimited`), no a las demás salas.
 **Sostenida por.** D54 para SSE; D75, el tope por cliente del presupuesto de respuestas (`max_inflight_response_bytes_per_client`, §7.3).
 **Cómo intentar romperla.** Un miembro de una sala que no lee sus respuestas en muchos streams y conexiones, mientras otra sala hace `/sync`; muchos streams SSE del mismo cliente.
-**Límite aceptado.** El tope es por cliente: con la parte por defecto (2 frames sobre unos 16 en total), 8 clientes que cooperan agotan el total.
+**Límite aceptado.** El tope es por cliente: con la parte por defecto (2 frames sobre unos 16 en total), 8 clientes que cooperan agotan el total. Con un `ClientId` por dispositivo (DC15, Fase 4), el tope es por dispositivo: una persona con muchos dispositivos suma sus partes, y lo acota el backend, que limita los dispositivos por persona.
 
 ### 3.7. Disponibilidad y ciclo de vida
 
@@ -484,19 +504,108 @@ Las de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md): `UN
 **Cómo intentar romperla.** Un rechazo en medio de un batch; un pánico después de escribir el WAL; reabrir, compactar y aplicar un snapshot con índices construidos.
 **Automatizable.** Después de batches aleatorios, comparar los índices con los reconstruidos desde las tablas.
 
+### 3.11. Cliente
+
+Las del SDK (`zemdb-client`) de la [Fase 4](proposals/2026-10-fase4-plan.md) (DC10), escritas en su sub-fase 4.0, antes del código. Todas son 🆕: entre paréntesis, en el resumen, va la sub-fase que las implementa. Se auditan por primera vez en la auditoría amplia que cierra 4.2 (DC3), y las que 4.2 todavía no implementa, en la revisión de cierre de la sub-fase que las implementa. Valen con el modelo de amenaza de §2, incluido el lado del cliente (DC11), y cada dispositivo es un cliente propio, con su `ClientId` (DC15). "Escritura" es un `insert`, `update` o `delete`: un commit de una sola operación.
+
+#### INV-K1 ★ · La réplica local es siempre un prefijo del log de la sala
+**Enunciado.** El estado de una réplica es siempre el de aplicar en orden las operaciones `(0, h]` del log de la encarnación a la que pertenece, o un snapshot en `S` y después `(S, h]`, donde `h` es su head. Nunca aplica una operación fuera de orden, dos veces, de otra encarnación o que el servidor no secuenció. Un lote con hueco, o una respuesta que viola el protocolo (un head menor que el cursor que mandó el pedido, una operación distinta en una secuencia ya aplicada que el cliente pueda detectar), no se aplica: el cliente falla cerrado o vuelve a sincronizar. Una respuesta demorada (con un head menor que el local) o de una época anterior de la réplica, pedida antes de descartarla, se ignora. Sin outbox, la réplica no guarda escrituras sin secuenciar (DC1).
+**Sostenida por.** A implementar en 4.2: el aplicador único por sala (DC7), que descarta el prefijo ya aplicado y no aplica un lote con hueco; `apply_batch`, que rechaza un hueco con `SequenceMismatch` (INV-S1); el cursor y la encarnación guardados juntos (INV-K5); la época de la réplica, que cambia al descartarla y que lleva cada pedido, porque las respuestas que traen operaciones o snapshots (`CommitAck`, `SyncBatch`, `SnapshotChunk`) no traen la encarnación (DC7).
+**Riesgo aceptado.** Si el servidor pierde y reutiliza una secuencia (D78, §4), una réplica que la aplicó tiene otra operación en ella. Se detecta solo si el cliente presenta su cursor antes de que el head del servidor lo vuelva a alcanzar: un `InvalidSequence` en un sync, commit o ack lleva a un nuevo registro, y el `InvalidSequence` del registro, a descartar la réplica (INV-K3). Si el head del servidor alcanza al cursor antes, en cualquiera de los dos pasos, la réplica diverge sin aviso.
+**Cómo intentar romperla.** Un sync y el catch-up de un commit que se solapan; `head_advanced` por SSE en medio de un commit; una respuesta repetida, con un hueco o con un head menor; `RoomReset` en medio de un sync; un snapshot en una secuencia menor que el head local.
+**Automatizable.** Simulación con varios clientes contra el servidor real en proceso (§5.2 del plan): oráculo = el log que secuenció el servidor.
+
+#### INV-K2 ★ · Cada escritura se resuelve una sola vez, con la decisión de la réplica o como incierta
+**Enunciado.** Cada escritura termina exactamente una vez, con una de estas respuestas: un error local sin mandar nada (validación, columna dueño escrita por la aplicación, sin red, rango de DC14, el pre-chequeo local con `PrecheckFailed`); un rechazo del servidor, solo si ningún intento anterior quedó incierto (DC6); un error sin efecto (vence el plazo de DC6, falta un token nuevo, llega `RoomReset` u otro error final, siempre que ningún intento haya quedado incierto ni llegado un `CommitAck`; la tabla de §A.4 del plan); la decisión de la réplica sobre la secuencia asignada (`Ok`, `ConstraintViolation` o `RowMissing`), solo después de que la réplica aplicó esa secuencia; o el error de resultado incierto, solo en uno de estos cuatro casos: (a) algún intento quedó incierto (DC6) y nunca llegó un `CommitAck`; (b) la réplica nunca aplica la secuencia asignada, porque queda dentro de un snapshot instalado, porque la sala recibe `RoomReset` o porque la réplica se descarta (`InvalidSequence` en el registro, pérdida); (c) se perdió el reporte del lote que la contenía (DC7); (d) el cliente o la sala se cierran con la secuencia asignada sin aplicar. Con un `CommitAck`, la escritura espera sin plazo mientras la sala siga abierta. Con un `CommitAck` y la secuencia aplicada con su reporte, la respuesta es la decisión de la réplica. Nunca `Ok` antes de que la réplica aplique la secuencia, nunca la decisión de otra secuencia, y nunca un reenvío con otro `MutationId` ni con otro `ClientId` (para el dedup sería otra mutación, INV-Y4). La decisión que devuelve es la que toma toda réplica honesta (INV-Y8).
+**Sostenida por.** A implementar en 4.2: los reintentos con el mismo `MutationId` y el resultado incierto (DC6); el aplicador único, que entrega la decisión de cada secuencia y conserva los rechazos recientes, y que resuelve como incierta una escritura cuyo reporte se perdió (DC7); `MutationId` aleatorio de 128 bits y la verificación del `ClientId` de un token renovado (DC15); la época de la réplica (INV-K1). En 4.4, el dueño completado por el SDK y el pre-chequeo local; en 4.6, los errores de rango de DC14.
+**Cómo intentar romperla.** Una respuesta perdida y un reintento que recibe `BehindCompaction` o `ClientNotRegistered` (que no es un rechazo: el SDK se vuelve a registrar y sigue reintentando, DC6); un `CommitAck` con `has_more`, un `BehindCompaction` en el sync siguiente y un snapshot que cubre la secuencia asignada; un `RoomReset` con una escritura en vuelo; un sync que aplica la secuencia antes de que llegue el `CommitAck`; un `CommitAck` sin catch-up (`has_more`); la sala que queda fallida después de que el lote es durable; dos dispositivos del mismo dueño que escriben a la vez; cancelar la llamada en cada `.await`.
+**Límite aceptado.** Un reintento que cae fuera de la ventana de dedup recibe una secuencia nueva (DEF-85, §4): la escritura se aplica dos veces, y la decisión que informa el SDK es la de la segunda secuencia, que puede ser un rechazo de una escritura que ya se aplicó. Un miembro hostil puede provocarlo llenando la ventana mientras se pierde una respuesta. Y si el servidor pierde y reutiliza una secuencia (D78), una escritura con `CommitAck` en ella puede recibir la decisión de otra operación, salvo que el cliente lo detecte antes (INV-K1).
+**Automatizable.** La simulación de INV-K1, con respuestas perdidas y cortes en cada `.await`: oráculo = la decisión de una réplica de referencia sobre cada secuencia.
+
+#### INV-K3 ★ · El SDK nunca descarta una réplica local sana
+**Enunciado.** El SDK descarta el estado local de una sala solo ante `RoomReset`, ante `InvalidSequence` en el registro (el servidor perdió secuencias, D78), ante un daño en sus archivos locales al abrir la sala (`SnapshotCorruption`, `WalCorruption` de `open_room`) o cuando la réplica se perdió (INV-K5), además de cuando la aplicación lo pide explícitamente. Nunca, por su cuenta, ante un error al aplicar el snapshot de otro miembro (se descarta ese snapshot), `RoomLocked`, `Io`, `SchemaMismatch`, un snapshot local que no cumple las restricciones (DC12), un error de red ni otro error del servidor. Descartar no pierde escrituras confirmadas: sin outbox, todo lo que la réplica tenía lo vuelve a servir la sala, salvo lo que el servidor perdió (D78, §4) y lo de una sala borrada (`RoomReset`).
+**Sostenida por.** A implementar en 4.1 (la variante de error de DC12, y que un error de lectura de E/S al abrir salga como `Io`, no como corrupción), en 4.4 (el descarte a pedido de la aplicación) y en 4.2 (la reacción del SDK a cada error, según su origen); el modelo *write-through* (DC1).
+**Cómo intentar romperla.** Abrir la sala con un esquema con otras restricciones; un `.snap` con un bit invertido; el archivo de la sala tomado por otra pestaña o proceso; un error de E/S al leer el `.snap` al abrir; un snapshot de otro miembro con el BLAKE3 correcto y una fila inválida; un `Unavailable` o un `Internal` del servidor al registrarse.
+
+#### INV-K4 ★ · Las réplicas de clientes que siguen el protocolo convergen
+**Enunciado.** Dos clientes de la misma sala y encarnación que siguen el protocolo, con cualquier combinación de fallas de red, cortes del cliente en cualquier `.await`, reinicios, poda y reinicios del servidor, cuando quedan al día en el mismo head tienen el mismo estado y tomaron la misma decisión sobre cada operación que aplicaron los dos. Vale también si uno arrancó de un snapshot, si los dos son dispositivos del mismo dueño y si el esquema cambió en el medio. Es INV-Y8 de punta a punta.
+**Sostenida por.** A implementar en 4.2: INV-K1 e INV-K6 en cada cliente, sobre INV-Y2 (entrega exacta) e INV-Y8 (aplicar es determinista).
+**Cómo intentar romperla.** La simulación de INV-K1 con un cambio de esquema en un punto aleatorio, un cliente que se incorpora desde un snapshot y dos dispositivos del mismo dueño.
+**Automatizable.** Al final de cada ejecución de la simulación, todas las réplicas comparadas con una réplica de referencia que aplica el log entero.
+
+#### INV-K5 · El cursor que presenta el cliente es siempre el head de su réplica
+**Enunciado.** El cursor que el SDK presenta (en el registro, en un sync, un ack o un commit) es siempre un head que su réplica de esa encarnación ya alcanzó, y en el registro va con esa encarnación. Nunca presenta un cursor de otra encarnación ni uno mayor que el head de su réplica. Después de registrarse sin cursor, arranca de 0 o de un snapshot. Si la réplica abre por detrás de lo que dicen sus metadatos (un `.snap` perdido, D96) o ya no existe (el navegador borró el origen), el cliente lo detecta y vuelve a bajar el estado sin presentar el cursor viejo.
+**Sostenida por.** A implementar en 4.2: los metadatos durables por sala (`client_id`, encarnación, cursor, esquema y `schema_id`, §A.9 del plan), escritos con la réplica; INV-Y7 en el servidor.
+**Cómo intentar romperla.** Un `.snap` perdido después de una compactación que vació el WAL; el almacenamiento del origen borrado con los metadatos o sin ellos; un crash entre aplicar un lote y guardar los metadatos; `RoomReset` y un nuevo registro.
+
+#### INV-K6 ★ · La réplica solo cambia a un esquema que evoluciona del suyo
+**Enunciado.** El SDK abre y aplica solo con el esquema que el servidor sirve para esa sala, guardado entre sus metadatos antes de usarse. Ante un cambio, sea una versión nueva o una reasignación, exige que el nuevo evolucione del anterior (DC5, `Schema::evolves_from`: `Schema::extends`; cada restricción del actual sigue en el nuevo, igual y en la misma posición; los dueños y las tablas inmutables no cambian; y toda restricción nueva incluye alguna columna nueva de su tabla, la regla DR3. Las FK que entran a una tabla pueden crecer: la columna nueva vale `NULL` en las filas existentes, así que no cambia ninguna decisión ya tomada). Como la regla es transitiva, la cumple cualquier cadena de cambios válidos, aunque el cliente no haya visto los intermedios. Si no, falla cerrado y sigue con el anterior. Se entera del cambio por el `schema_id` y la versión de cada respuesta, y pide el esquema ante una operación que no valida contra el local y ante cualquier error al aplicar el snapshot de otro miembro: pide el esquema una vez y, si cambió, vuelve a intentar con el mismo snapshot. Ante un esquema que no conoce, decide contra el que le devuelve `GetSchema`, no contra la respuesta; y como `GetSchema` no está atado a la encarnación, antes de fallar cerrado se vuelve a registrar con su cursor (un `RoomReset` lo lleva a descartar la réplica). Fallar cerrado frena las escrituras y la aplicación de lotes, no los heartbeats ni el registro. Nunca aplica las operaciones de una respuesta con un esquema más nuevo que el local sin antes cambiar de esquema (INV-E2); una respuesta con una versión anterior del mismo esquema no es un cambio, y sus operaciones se aplican con el local (INV-C1).
+**Sostenida por.** A implementar en 4.1 (`Schema::evolves_from`, `reload_schema` y el `schema_id` en `CommitAck`, `SyncBatch` y `HeartbeatAck`, DC5) y en 4.2 (detectar el cambio, y el orden: guardar el esquema, recargarlo, aplicar). Sin ella, INV-C1 no vale en el cliente.
+**Cómo intentar romperla.** Un `CommitAck` o un `SyncBatch` con otra `schema_version`; `schema_reloaded` perdido; una columna agregada con un `UNIQUE` o una FK; una reasignación a un esquema con otras restricciones, o a uno con la misma versión; un cliente desconectado mientras la sala evoluciona y después se reasigna; una columna agregada con una FK hacia otra tabla; un `SyncBatch` demorado con la versión anterior; un cliente que se incorpora desde un snapshot hecho con una versión más nueva; un crash entre guardar el esquema nuevo y recargarlo.
+
+#### INV-K7 · Un cliente atrasado termina al día, también si es el designado
+**Enunciado.** Mientras tenga red y la sala lo permita (INV-R4), un cliente que se queda atrás (recibe `BehindCompaction`, `SnapshotSuperseded` o `ClientNotRegistered`, o queda `Bootstrapping`) termina al día. Si el servidor lo designa para subir un snapshot, lo sube en su head local dentro del plazo, aunque esté sincronizando o se esté poniendo al día él mismo. Ninguna reacción a un código o a un evento deja un estado sin salida, y sin SSE alcanzan los heartbeats y los syncs.
+**Sostenida por.** A implementar en 4.2 (onboarding, bajada y subida de snapshots, §A.6 y §A.8 del plan) y en 4.3 (`SyncWorker`, §A.5).
+**Cómo intentar romperla.** Poda por TTL entre el registro y el primer sync; un snapshot reemplazado durante la descarga; el único `Connected` es el designado; un servidor que se reinicia y pierde el roster; SSE cortado.
+**Automatizable.** Simulación con poda y reinicios del servidor: liveness acotada ("al día en N pasos").
+**Fuera de alcance.** Un snapshot falso o envenenado de un miembro hostil (DEF-81): el cliente lo descarta (INV-K3), pero el servidor no pide otro mientras ese siga usable, así que un cliente que se incorpora espera hasta que venza (`snapshot_ttl_secs`, 7 días por defecto).
+
+#### INV-K8 · El SDK nunca manda una operación con un dueño ajeno
+**Enunciado.** En una tabla con dueño, toda operación que manda el SDK declara como dueño la parte de dueño de su `ClientId` (DC15). Si la aplicación escribe la columna dueño, la llamada falla localmente sin mandar nada.
+**Sostenida por.** A implementar en 4.4: el dueño lo completa el SDK (§A.4 del plan). El servidor lo verifica igual (INV-A5): si se rompe, la escritura recibe `SchemaViolation`.
+**Cómo intentar romperla.** El dueño dentro y fuera de la clave; un `Update` que incluye la columna dueño; un `Delete` de una tabla con el dueño fuera de la clave; un `ClientId` sin `#`, con varios `#` o con una de las dos partes vacía.
+
+#### INV-K9 · Una columna cifrada nunca sale en claro
+**Enunciado.** El valor de una columna cifrada sale del SDK (a la red, al servidor o en un snapshot que sube) y se guarda en el storage local solo cifrado con el `CryptoEngine` de la aplicación, con `(room_id, table_id, pk, column_idx)` como datos adicionales. Se descifra al leer. Un valor que no se descifra (otra clave, o un texto cifrado de otra celda, también de otra sala) es un error tipado, nunca un valor inventado.
+**Sostenida por.** A implementar en 4.4 (§A.10 del plan), y en 4.5 y 4.6 (cómo le llegan al Worker las claves de la aplicación). El servidor solo acepta `Value::Bytes` en una columna cifrada (`ARCHITECTURE.md` §3.1).
+**Cómo intentar romperla.** Escrituras por cada camino (`insert`, `update`, pre-chequeo local, errores que repiten la fila); un snapshot subido; un texto cifrado copiado de otra fila, columna o sala por un miembro hostil.
+
+#### INV-K10 · `watch` refleja la réplica
+**Enunciado.** Un `watch` emite solo después de que el cambio es visible en la réplica (y durable, con un motor persistente), nunca por una operación rechazada, y su último valor es siempre el estado actual de la réplica: puede saltear estados intermedios, nunca quedarse con uno viejo.
+**Sostenida por.** A implementar en 4.4: el aplicador único avisa a `watch` después de `apply_batch` (DC7), con el `ApplyReport`.
+**Cómo intentar romperla.** Lotes con operaciones rechazadas; un snapshot aplicado; muchas actualizaciones seguidas con un consumidor lento; un cambio de esquema.
+
+#### INV-K11 · Cerrar o apagar el cliente no pierde nada confirmado
+**Enunciado.** Cerrar el cliente o una sala espera las operaciones del storage en curso y cierra las salas antes de que se apague el runtime (D93), así que, con un motor persistente, todo lo que la réplica aplicó está al reabrir. En el navegador, el Worker suelta los archivos de la sala en `pagehide`, y cerrar la pestaña equivale a un crash: lo aplicado sobrevive (§2).
+**Sostenida por.** A implementar en 4.2 (cierre ordenado, D93) y en 4.5 (el Worker y `pagehide`, S1).
+**Cómo intentar romperla.** Apagar el runtime con una compactación o un `apply_snapshot` en curso y reabrir en el mismo proceso; cerrar la pestaña en medio de un lote; navegar a otra página sin cerrar el Worker (S1, Safari).
+
+#### INV-K12 ★ · Ninguna respuesta del servidor ni snapshot de un par hace entrar en pánico al SDK
+**Enunciado.** Ningún byte de una respuesta (frames, eventos SSE, chunks de snapshot) ni de un snapshot de otro miembro provoca un pánico, un abort o una reserva desproporcionada a su tamaño en el SDK. Una respuesta bien formada que viola el protocolo (un lote con hueco, una secuencia asignada fuera de rango, un chunk de otro snapshot) es un error tipado y no se aplica. Es INV-W1 del lado del cliente.
+**Sostenida por.** A implementar en 4.1 (el decodificador `ruzstd` de wasm32, con su tope de memoria, DC9), en 4.2 y 4.3, y en 4.5 (el transporte del navegador y `EventSource`): los decoders de `zemdb-core` (INV-W1), `apply_snapshot` (INV-S5) y la verificación de cada respuesta antes de usarla.
+**Cómo intentar romperla.** Respuestas fabricadas por el transporte de la simulación; un snapshot con el BLAKE3 correcto pero contenido inválido, también con Zstd decodificado por `ruzstd`; eventos SSE con datos que no parsean.
+**Automatizable.** Fuzzing de las respuestas del servidor y de los snapshots recibidos (§5.2 del plan, capa 4).
+
+#### INV-K13 · En el navegador, una sola instancia del SDK escribe cada sala
+**Enunciado.** En cada momento, en un origen, como mucho una instancia del SDK (una pestaña y su Worker) abre una sala y escribe sus archivos. Las demás pestañas no la abren, o esperan a que se libere, y nunca reintentan tomar los archivos uno por uno.
+**Sostenida por.** A implementar en 4.5: la coordinación entre pestañas con `navigator.locks` (S1, en DC8); el handle exclusivo del OPFS por archivo, que la respalda.
+**Cómo intentar romperla.** Dos pestañas que abren la misma sala a la vez; cerrar la pestaña dueña en medio de un lote; una página en el *back/forward cache* con los archivos tomados.
+
+#### INV-K14 · La API de JavaScript no cambia ningún valor al cruzar el límite del Worker
+**Enunciado.** Todo valor que cruza el límite entre la página y el Worker, en cualquier dirección, llega igual, con las representaciones de DC14, o la operación falla con un error tipado (un `Int` o un `Timestamp` fuera de rango, un string con surrogates sueltos). Nunca llega un valor redondeado, reemplazado o truncado. Las excepciones: un `-0` escrito desde JavaScript se guarda como `0`, porque `zemdb-core` lo canonicaliza al convertir desde un `f64` (un `-0` que llega por la red se lee como `-0`), y un `NaN` llega como `NaN`, sin garantizar su payload. Por eso, al escribir, un `NaN` en una columna de la clave se rechaza: el orden de `Value` distingue los `NaN` por su payload, y la fila podría cambiar de clave.
+**Sostenida por.** A implementar en 4.6 (DC14).
+**Cómo intentar romperla.** Enteros en ±2⁵³ y en los extremos de i64, en los dos modos; fechas fuera del rango de `Date`; strings con surrogates; `-0` y `NaN` con distintos payloads; `Uuid` en mayúsculas; `Bytes` vacíos; filas cortas.
+**Automatizable.** Ida y vuelta de cada tipo de valor, con generadores aleatorios, en navegadores headless.
+
+#### INV-K15 · La memoria del SDK está acotada
+**Enunciado.** La memoria que el SDK retiene además de la réplica está acotada así: los rechazos que conserva el aplicador (DC7), por lo que la réplica aplica mientras hay una escritura en vuelo, y desde 4.2, después del `CommitAck`, por la secuencia asignada a cada escritura, y antes, por lo que la sala secuencia durante el plazo de DC6 (con la regla de DC7 tal como está, para una réplica atrasada pueden ser todo su atraso: acotarlos es un requisito de diseño de §4.2 del plan); un valor pendiente por suscripción de `watch`, que puede saltear estados intermedios (INV-K10); una descarga de snapshot, hasta un tope configurable del cliente; y lo que reservan las respuestas y los snapshots recibidos (INV-K12). Los índices de las restricciones crecen con la réplica y no cuentan (`ARCHITECTURE.md` §8 *Derived Constraint Indexes*).
+**Sostenida por.** A implementar en 4.2 (el aplicador y la descarga de snapshots) y en 4.4 (`watch`).
+**Cómo intentar romperla.** Una réplica muy atrasada con una escritura en vuelo; un `watch` cuyo consumidor no lee; muchas escrituras en vuelo mientras no llega ningún sync; un snapshot anunciado enorme; muchas suscripciones a la misma fila.
+**Automatizable.** La simulación de §5.3 del plan, midiendo lo que retiene cada cliente al final de cada paso.
+
 ---
 
 ## 4. Riesgos aceptados (no se reportan)
 
 | Riesgo | Por qué se acepta | Referencia |
 |---|---|---|
-| Un reintento fuera de la ventana de dedup se aplica de nuevo (también el de una operación podada, después de un respawn: INV-Y9), y un cliente no puede reconocer su propio commit en un sync. | Ventana acotada por diseño; se decide al diseñar el SDK de la Fase 4 (la outbox está diferida para después de la v0.1). | DEF-85 |
+| Un reintento fuera de la ventana de dedup se aplica de nuevo (también el de una operación podada, después de un respawn: INV-Y9), y un cliente no puede reconocer su propio commit en un sync. | Ventana acotada por diseño. El SDK reintenta solo con el mismo `MutationId`, durante unos 30 s, y después devuelve un resultado incierto (DC6, INV-K2): un reintento que cae fuera de la ventana todavía se aplica de nuevo y puede pisar cambios posteriores. Un miembro hostil puede provocarlo llenando la ventana mientras se pierde una respuesta, y entonces la decisión que informa el SDK puede ser un rechazo de una escritura que ya se aplicó (INV-K2). Reconocer el commit propio en un sync va con la outbox, diferida para después de la v0.1. | DEF-85, DC6 |
 | Un miembro puede subir un snapshot bien formado pero falso, o reemplazar una subida con una secuencia mayor. | Defensa fuera de alcance de la v0.1. | DEF-81, §6 *What the server does not check* |
-| Un cliente wasm32 no puede restaurar snapshots Zstd. | Diferido a la Fase 4. | DEF-54 |
-| `zemdb-storage` no recarga el esquema de una sala abierta. | Diferido; D55 al menos impide perder datos. | DEF-34 |
+| Un cliente wasm32 no puede restaurar snapshots Zstd. | Se cierra en la sub-fase 4.1 con `ruzstd` (DC9). | DEF-54 |
+| `zemdb-storage` no recarga el esquema de una sala abierta. | Se cierra en la sub-fase 4.1 con `reload_schema` (DC5); D55 al menos impide perder datos. | DEF-34 |
 | Una conexión SSE semiabierta retiene su permiso hasta que TCP falla. | El keep-alive tarda en llenar el buffer; D54 la acota a 2 por cliente y sala. | Residuo de DEF-95 |
 | La poda por TTL y cuota ignora el ancla de retención. | Sin eso un cliente abandonado retendría el log para siempre; se señala con `BehindCompaction`. | §5.2 *Snapshot Retention Anchor* |
-| Un cliente `Disconnected` sin `dormant_after_secs` frena la poda proactiva hasta el TTL. | Decisión de configuración. | §5.2 *Dormant* |
+| Un cliente `Disconnected` sin `dormant_after_secs` frena la poda proactiva hasta el TTL. Con un `ClientId` por dispositivo (DC15) es más común: un navegador que borra su almacenamiento, o una app reinstalada, es un dispositivo nuevo, y la entrada del viejo queda `Disconnected`. | Decisión de configuración. | §5.2 *Dormant*, DC15 |
 | Los tokens no se pueden revocar y valen para una sala recreada con el mismo id. | Tokens stateless; la encarnación (D58) protege los cursores. | §6 |
 | El token se acepta en la query de `/events`. | `EventSource` no puede mandar headers. | D15, §7.2 |
 | Sin TLS propio. | Lo termina el reverse proxy. | D45, §7.3 |
@@ -506,14 +615,15 @@ Las de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md): `UN
 | En Windows el sync de directorios es un no-op. | NTFS registra los cambios de directorio en su journal. | §5.2 *Durable directory entries* |
 | Un stream SSE sigue recibiendo eventos después de que vence su token, y mientras tanto mantiene la sala abierta. | SSE solo notifica; cualquier dato se pide con un token vigente. | D72 |
 | En Linux, después de un EIO en un `fsync`, el kernel puede marcar las páginas como limpias sin haberlas escrito, y un `fsync` desde un descriptor nuevo devuelve éxito igual: INV-D7 no cubre ese caso. | La solución completa (reescribir `active.wal` cuando el actor anterior se detuvo por una escritura fallida) queda para el futuro. | D77 |
-| Un valor escrito por un miembro que embebe un frame WAL válido puede hacer que una escritura rota se clasifique como corrupción: la sala no abre, pero no se pierde ni se inventa nada. | Evitarlo exige rediseñar el framing. La absorción atómica (D85) quita el caso más expuesto. | D79, `ARCHITECTURE.md` §8 |
+| Un valor escrito por un miembro que embebe un frame WAL válido puede hacer que una escritura rota se clasifique como corrupción: la sala no abre, pero no se pierde ni se inventa nada. | Evitarlo exige rediseñar el framing. La absorción atómica (D85) quita el caso más expuesto. Con el SDK, una sala que no abre por esto es un daño al abrir: el SDK descarta la réplica y vuelve a bajar todo (INV-K3). No se pierde nada, pero un miembro hostil puede forzar esa descarga después de una escritura rota. | D79, `ARCHITECTURE.md` §8 |
 | Un daño en el último frame de `active.wal`, sin frames válidos después, se trunca como una escritura rota y su secuencia puede reutilizarse, aunque el roster (`last_ack_seq`) o el relay (la secuencia del snapshot activo) la tengan: un snapshot en esa secuencia vuelve a ser usable con el efecto viejo, y un cliente con ese cursor no recibe la operación nueva. | No se distingue de una escritura rota. INV-D8 lo cubre cuando la secuencia consta en otro archivo del log, y su lista de archivos es cerrada. | D78, D95 |
 | En storage, un daño en el último frame de `.wal.compacting` se trunca como una escritura rota: si el WAL activo no tiene lotes posteriores, ese lote se pierde sin aviso (si los tiene, la apertura falla por el hueco). | Como `.wal.compacting` toma su nombre después de sincronizarse, solo puede venir de un daño accidental en un lugar preciso. Es el gemelo de D78 en el storage. | D95 |
-| Si el runtime de Tokio se apaga con un `open_room`, un `apply_snapshot` o una compactación del storage en vuelo, y la misma sala se reabre en el mismo proceso antes de que termine su hilo bloqueante, ese hilo puede pisar archivos de la sala reabierta y perder lotes confirmados sin aviso. No pasa en wasm32, ni al salir del proceso (es un crash), ni al soltar un future (D86, D89). | Quien maneja el runtime cierra las salas con `close_room`, que espera a esas tareas, antes de apagarlo. Es un requisito de diseño del SDK de la Fase 4. | D93, `ARCHITECTURE.md` §8 *Room Lock* |
-| En storage, si se pierde el `.snap` después de una compactación que vació el WAL, la sala abre vacía en la secuencia 0. | El cliente vuelve a bajar todo del servidor; cómo detecta la pérdida lo decide el SDK de la Fase 4. | D96 (propuesta S7 de la 2ª auditoría) |
+| Si el runtime de Tokio se apaga con un `open_room`, un `apply_snapshot` o una compactación del storage en vuelo, y la misma sala se reabre en el mismo proceso antes de que termine su hilo bloqueante, ese hilo puede pisar archivos de la sala reabierta y perder lotes confirmados sin aviso. No pasa en wasm32, ni al salir del proceso (es un crash), ni al soltar un future (D86, D89). | Quien maneja el runtime cierra las salas con `close_room`, que espera a esas tareas, antes de apagarlo. El SDK lo hará al cerrar (INV-K11, 🆕 4.2). | D93, `ARCHITECTURE.md` §8 *Room Lock* |
+| En storage, si se pierde el `.snap` después de una compactación que vació el WAL, la sala abre vacía en la secuencia 0. | El SDK lo detectará con sus metadatos y volverá a bajar todo del servidor (INV-K5, 🆕 4.2). | D96 (propuesta S7 de la 2ª auditoría) |
+| Sin `persist()`, el navegador puede borrar las réplicas de un origen cuando le falta espacio. | Solo cuesta volver a bajar el estado (INV-K5). `persist()` sin interacción del usuario suele dar `false` (S1). | DC8, DC11 |
 | Una réplica que decide distinto sobre una restricción (por un error de implementación o por otra semántica) diverge sin aviso. | No hay comparación de estado entre réplicas; lo mitigan el oráculo diferencial y los tests de convergencia. Un digest de estado por secuencia queda en el backlog. | DR13 (Fase 3.11) |
 | Las operaciones que las réplicas rechazan ocupan el log, la retención y la ventana de dedup como cualquier otra. | El servidor no ve filas y no puede saber que se van a rechazar. | DR1 (Fase 3.11) |
-| El dueño de una fila es por `ClientId`, no por persona, y queda visible para toda la sala. | Lo define el backend que emite los tokens. El dueño seudónimo se difirió a después de la v0.1. | DR10, DR15 (Fase 3.11) |
+| El dueño de una fila es el `ClientId` y, desde 4.1 (DC15), su prefijo de dueño: la persona, no el dispositivo. Queda visible para toda la sala. | Lo define el backend que emite los tokens. El dueño seudónimo se difirió a después de la v0.1. | DR10, DR15 (Fase 3.11) |
 
 ---
 

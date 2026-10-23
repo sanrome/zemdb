@@ -17,7 +17,7 @@
 
 - **Lote 0.** Toda fase, y toda sub-fase que agrega garantías, arranca con un lote que solo toca documentos: las invariantes nuevas o ajustadas en `INVARIANTES.md`, las decisiones del plan y, si cambia, el modelo de amenaza (§2 de `INVARIANTES.md`). Las invariantes se escriben antes que el código, para que el código se revise contra lo que tiene que garantizar y no al revés.
 - **Decisiones.** Cada una tiene un id con el prefijo de su plan (DR en la Fase 3.11, DC en la Fase 4) y un estado: *Propuesta*, *Adoptada* o *Diferida*. Una *Propuesta* se confirma con el dueño del proyecto antes de escribir código que dependa de ella.
-- **Revisión cruzada.** El Lote 0 cierra con una revisión hecha por un agente aparte, de contexto fresco y solo lectura, que contrasta cada enunciado nuevo con el código actual. Una invariante que todavía no se cumple se marca con el lote que la va a cumplir (estado 🆕 de `INVARIANTES.md` §1.5).
+- **Revisión cruzada.** El Lote 0 cierra con una revisión hecha por un agente aparte, de contexto fresco y solo lectura, que contrasta cada enunciado nuevo con el código actual. Una invariante que todavía no se cumple se marca con el lote (o la sub-fase) que la va a cumplir (estado 🆕 de `INVARIANTES.md` §1.5).
 
 ## 3. Spikes
 
