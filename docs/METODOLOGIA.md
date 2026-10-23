@@ -26,7 +26,7 @@
 
 ## 4. Reglas de trabajo
 
-1. **Tamaño:** un lote es una unidad revisable de **~300 líneas de producción como máximo**; los tests no cuentan. Si se pasa, se parte. Idealmente, cada lote es una sesión propia.
+1. **Tamaño:** un lote es una unidad revisable de **~300 líneas de producción como máximo**; los tests no cuentan. Si se pasa, se parte. Idealmente, cada lote es una sesión propia; si no, se compacta el contexto al cerrar cada lote (con la nota **Hecho** escrita, el commit en `main` y la CI de `main` en verde en las tres plataformas) y el siguiente arranca por el paso 0 de §5, como una sesión nueva: el resumen del contexto no reemplaza leer lo que el paso 0 pide.
 2. **Tests:** siguen la estructura de dos niveles de `GEMINI.md`. Cada regla de comportamiento nueva tiene al menos un test negativo.
 3. **Sin códigos** (`DC`, `DR`, `INV-`, `DEF-`) en código, tests ni docstrings (`GEMINI.md`).
 4. **Chequeos de cierre:** cada lote cierra con:
