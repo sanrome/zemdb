@@ -2,7 +2,7 @@
 
 **Fecha:** 23 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lotes 0 a 2 cerrados; el próximo es el 3.
+**Estado:** En curso: Lotes 0 a 3 cerrados; el próximo es el 4.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.1. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -225,7 +225,7 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 - **Tamaño:** unas 15 líneas de producción, más docstrings.
 - **Desvíos:** ninguno.
 
-### Lote 3 · Los plazos del servidor con el reloj de Tokio (`zemdb-server`) · ⬜
+### Lote 3 · Los plazos del servidor con el reloj de Tokio (`zemdb-server`) · ✅
 **Objetivo:** que el arnés de 4.2 controle todos los plazos del servidor con el reloj pausado (DC16, plan de la fase §5.3).
 
 **Archivos:** `crates/server/src/actor/lease.rs`, `snapshot_demand.rs` y `room.rs`; `crates/server/src/log/hot_buffer.rs` y `tiered_log.rs`.
@@ -241,6 +241,29 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 - En producción, `tokio::time::Instant` es el `Instant` del sistema: ningún plazo cambia.
 
 **Documentos:** ninguno, salvo que `ARCHITECTURE.md` §5 nombre el reloj de algún plazo.
+
+**Hecho.**
+- **Servidor.** `tokio::time::Instant` en lugar de `std::time::Instant` en `lease.rs` (`ClientEntry::last_heartbeat`, el registro, la actividad, los timeouts y la conversión del roster entre `Instant` y hora de pared al guardarlo y al leerlo), `snapshot_demand.rs`, `room.rs` (la renovación, la restauración y el vencimiento de la demanda, y la designación), `hot_buffer.rs` (la llegada de cada operación y la ventana que aplica cada append) y `tiered_log.rs` (`MaintenanceClock::mono`, la ventana que aplica el mantenimiento). En `crates/server/src` no queda ningún plazo con `std::time::Instant`: los únicos usos son cronómetros de tests que miden tiempo real. Nada de lo que mide la hora de pared cambia. `ClientEntry::last_heartbeat` es público y cambia de tipo, lo que antes del primer release no requiere compatibilidad (`GEMINI.md`).
+- **Tests agregados**, todos con el reloj pausado y `tokio::time::advance`, sin dormir de verdad. Cada uno empieza adelantando el reloj de Tokio una hora, así que un plazo medido con el reloj del sistema vencería enseguida o nunca:
+  - `crates/server/src/actor/tests/room.rs`, sobre un actor abierto sin correr su loop, cuyos ticks corre el test: `a_client_without_heartbeats_disconnects_when_its_lease_expires_on_the_tokio_clock` (el lease cuenta desde el último heartbeat: el cliente sigue `Connected` al cumplirse y pasa a `Disconnected` 1 ms después); `a_designation_expires_after_60_seconds_on_the_tokio_clock_and_passes_to_another_client` (1 ms antes de los 60 s sigue el mismo designado; a los 60 s, otro); `a_snapshot_demand_expires_on_the_tokio_clock_also_after_the_room_reopens` (vence a su TTL y no 1 ms antes, y una demanda restaurada al reabrir vence a lo que le quedaba y no 1 s antes).
+  - `crates/server/src/actor/tests/lease.rs`: `inactivity_survives_a_save_and_a_reopen_on_the_tokio_clock` (60 s de inactividad guardados y restaurados: el lease de 90 s no vence a los 89 s y vence a los 91 s).
+  - `crates/server/src/log/tests/tiered_log.rs`: `the_ram_window_expires_on_the_tokio_clock` (un append y el mantenimiento conservan lo que estuvo en RAM 1 ms menos que la ventana y sueltan lo que estuvo la ventana entera).
+  - Contra el esqueleto (el código anterior), los cinco fallaban por comportamiento, en su parte positiva; los negativos pasaban.
+- **Mutaciones verificadas** (todas detectadas): cada uno de los doce usos, de a uno, devuelto al reloj del sistema (`Instant::from_std(std::time::Instant::now())`): el guardado, el registro, la actividad, los timeouts y la lectura del roster; la renovación, la restauración y el vencimiento de la demanda, y la designación; la llegada a la HotBuffer, la ventana del append y la del mantenimiento. El default de serde de `last_heartbeat` no se puede observar (`LoadedClient::into_entry` lo pisa), así que no lleva test.
+- **Interacciones revisadas:**
+  - La persistencia del roster: el guardado y la lectura convierten con el mismo reloj (test del roster). `instant_before`, con una edad mayor que lo que el reloj puede representar hacia atrás, sigue saturando: el `checked_sub` de Tokio delega en el de `std` (`activity_before_the_clock_can_reach_saturates`).
+  - La restauración de la demanda: el plazo se calcula hacia adelante desde el `now` de Tokio (test de la demanda).
+  - `apply_sliding_window_at`, `MaintenanceClock::after` y los tests que arman un `Instant` a mano: fuera de un runtime, el `now` de Tokio es el del sistema, y siguen en verde.
+  - Los tests del servidor que ya usaban el reloj pausado: avanzarlo ahora mueve también los leases, la designación, la demanda y la ventana de RAM, y todos siguen en verde, también los de integración que avanzan el reloj con `sleep`. La simulación de onboarding tenía la demanda y la designación en 100 ms de tiempo real, con un `sleep` real de 5 ms por tick: pasan a 40 s del reloj de Tokio (diez ticks) y el `sleep` se va. Su evento que vence el snapshot del relay (`advance` de 2000 s) ahora vence también esos plazos; la simulación sigue cubriendo descargas, huecos y podas por TTL, y la revisión de delta comprobó que dos corridas dan las mismas estadísticas.
+  - El relay y la designación, ahora en el mismo reloj: la inactividad y el tope de las subidas y el TTL del snapshot ya usaban el de Tokio, y la designación, que no cambia mientras el designado sube (INV-B2), ahora también.
+  - El trabajo bloqueante (`blocking_io`, `spawn_blocking`) lee el mismo reloj que el runtime, porque el de Tokio lo busca por `Handle::try_current`; `RoomActor::open` corre dentro de `blocking_io`.
+  - `pick_uploader` compara actividades, todas del mismo reloj.
+  - En producción, sin el reloj pausado, el `Instant` de Tokio es el del sistema (`test-util` es una feature de las dev-dependencies, y el resolver 2 no la lleva al binario): ningún plazo cambia.
+- **Para el arnés de 4.2** (§5.3 del plan de la fase, corregido en este lote): del roster, solo el tiempo entre que se guarda y la sala se reabre cuenta en hora de pared; la demanda se guarda como la hora de su última renovación, así que con el reloj pausado vuelve de una reapertura con casi todo su TTL. Y mientras corre una tarea de `spawn_blocking`, el reloj pausado no avanza solo: Tokio 1.53 inhibe el avance automático (`runtime/blocking/schedule.rs`), lo que responde la duda que §5.3 dejaba para el comienzo de 4.2.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura, con sus propias corridas en una copia): en verde, sin hallazgos Altos ni Medios. Probó además mutaciones propias en la restauración de la demanda y en los timeouts, detectadas. Su Bajo (dos comentarios de la simulación que quedaban cortos) está corregido; sus notas quedan en esta nota.
+- **Chequeos:** fmt, clippy, test, doc y el build de wasm32 en verde; `cargo test --release -- --ignored` de `zemdb-server`, con las cuatro simulaciones de onboarding.
+- **Tamaño:** unas 15 líneas de producción, más docstrings.
+- **Desvíos:** ninguno, salvo la corrección de §5.3 del plan de la fase, que el lote no listaba entre sus documentos.
 
 ### Lote 4 · Los errores de la apertura y de `apply_snapshot` (`zemdb-storage`) · ⬜
 **Objetivo:** que el SDK pueda decidir por el error si descarta la réplica (DC12, INV-K3): un snapshot que no cumple las restricciones y un error de E/S no son un daño.
@@ -352,4 +375,4 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 
 ## 3. Seguimiento
 
-**Avance:** Lote 0 cerrado el 23 de Octubre de 2026, con la revisión cruzada en verde en su quinta ronda; Lote 1 cerrado el mismo día. DC17 adoptada el 23 de Octubre, con renombrar un archivo abierto como operación del trait (el refactor de los Lotes 7 a 9 queda sin cambio de comportamiento). Lote 2 cerrado el 23 de Octubre. El próximo es el Lote 3.
+**Avance:** Lote 0 cerrado el 23 de Octubre de 2026, con la revisión cruzada en verde en su quinta ronda; Lote 1 cerrado el mismo día. DC17 adoptada el 23 de Octubre, con renombrar un archivo abierto como operación del trait (el refactor de los Lotes 7 a 9 queda sin cambio de comportamiento). Lote 2 cerrado el 23 de Octubre. Lote 3 cerrado el 24 de Octubre. El próximo es el Lote 4.

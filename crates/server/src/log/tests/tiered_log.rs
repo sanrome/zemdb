@@ -724,6 +724,37 @@ fn open_removes_leftover_temporary_cold_segments() {
     }
 }
 
+// Paused time: the Tokio clock runs ahead of the system's monotonic clock once the test
+// advances it, so a window measured on the system clock would expire at once or never.
+#[tokio::test(start_paused = true)]
+async fn the_ram_window_expires_on_the_tokio_clock() {
+    let ttl = Duration::from_secs(60);
+    let just_before = ttl - Duration::from_millis(1);
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_ttl: ttl,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    append_range(&mut log, 1, 5);
+
+    // Maintenance and appends keep what has not been in RAM for the whole window...
+    tokio::time::advance(just_before).await;
+    log.run_maintenance().await.unwrap();
+    append_range(&mut log, 6, 6);
+    assert_eq!(log.hot_buffer.len(), 6);
+
+    // ...and drop it once it has: an append, then maintenance with no append.
+    tokio::time::advance(Duration::from_millis(1)).await;
+    append_range(&mut log, 7, 7);
+    assert_eq!(log.hot_buffer.min_seq(), Some(SequenceNumber::new(6)));
+    tokio::time::advance(just_before).await;
+    log.run_maintenance().await.unwrap();
+    assert_eq!(log.hot_buffer.min_seq(), Some(SequenceNumber::new(7)));
+    assert_eq!(log.hot_buffer.len(), 1);
+}
+
 #[test]
 fn maintenance_applies_the_ram_ttl_window_without_appends() {
     let dir = tempdir().unwrap();

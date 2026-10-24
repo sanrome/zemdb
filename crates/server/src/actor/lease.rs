@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::time::Instant;
 use tracing::warn;
 use zemdb_core::id::{ClientId, SequenceNumber};
 
@@ -46,7 +47,7 @@ impl ClientState {
 
 /// Metadata entry tracked for each registered client in a room.
 ///
-/// `last_heartbeat` is a monotonic `Instant`, which does not survive a restart: the roster
+/// `last_heartbeat` is an `Instant` of the Tokio clock, which does not survive a restart: the roster
 /// file stores it as the wall-clock time of the client's last activity (see
 /// `PersistedClient`).
 #[derive(Debug, Clone, Serialize, Deserialize)]

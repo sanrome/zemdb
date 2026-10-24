@@ -3,8 +3,9 @@ use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 use tokio::sync::{broadcast, mpsc};
+use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use zemdb_core::id::{ClientId, MutationId, RoomId, SchemaId, SequenceNumber};
 use zemdb_core::mutation::Operation;
@@ -100,7 +101,7 @@ pub struct RoomActor {
     #[cfg(test)]
     room_dir: PathBuf,
     /// When the last command arrived; drives the shutdown for inactivity.
-    last_command_at: tokio::time::Instant,
+    last_command_at: Instant,
     /// Set once the actor closed its mailbox to shut down for inactivity.
     stopping_idle: bool,
     snapshot_relay: Arc<SnapshotRelay>,
@@ -177,7 +178,7 @@ impl RoomActor {
             policy: lifecycle_policy,
             #[cfg(test)]
             room_dir,
-            last_command_at: tokio::time::Instant::now(),
+            last_command_at: Instant::now(),
             stopping_idle: false,
             snapshot_relay,
             response_budget,
@@ -230,7 +231,7 @@ impl RoomActor {
     /// Primary actor loop running sequentially on Tokio.
     async fn run_loop(&mut self) {
         // The first ticks fire one period after start, not immediately.
-        let start = tokio::time::Instant::now();
+        let start = Instant::now();
         let mut fast_timer =
             tokio::time::interval_at(start + self.timings.fast_tick, self.timings.fast_tick);
         let mut slow_timer =
@@ -239,7 +240,7 @@ impl RoomActor {
         loop {
             tokio::select! {
                 cmd = self.receiver.recv() => {
-                    self.last_command_at = tokio::time::Instant::now();
+                    self.last_command_at = Instant::now();
                     match cmd {
                         Some(RoomCommand::Shutdown { reply }) => {
                             debug!(room = %self.room_id, "Shutdown command received, terminating actor loop");

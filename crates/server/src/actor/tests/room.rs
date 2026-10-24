@@ -1521,6 +1521,172 @@ async fn snapshot_upload_in_progress_anchors_pruning_until_it_goes_idle() {
     fx.manager.shutdown_all().await;
 }
 
+/// A relay for the rooms of [`stopped_actor`] on `dir`.
+fn relay_on(dir: &TempDir) -> Arc<SnapshotRelay> {
+    Arc::new(
+        SnapshotRelay::new(
+            dir.path().join("snapshots"),
+            Duration::from_secs(60),
+            ServerConfig::default().max_snapshot_bytes,
+            Duration::from_secs(ServerConfig::default().snapshot_upload_max_secs),
+        )
+        .unwrap(),
+    )
+}
+
+/// The room `room` on `dir`, opened with `policy` and `timings` but without running its loop:
+/// the test runs its ticks itself, at the instants it chooses.
+fn stopped_actor(
+    dir: &TempDir,
+    relay: &Arc<SnapshotRelay>,
+    policy: RoomLifecyclePolicy,
+    timings: ActorTimings,
+) -> RoomActor {
+    let config = Arc::new(ServerConfig {
+        data_dir: dir.path().to_path_buf(),
+        ..ServerConfig::default()
+    });
+    let (_sender, actor) = RoomActor::open(
+        RoomId::new("room").unwrap(),
+        1,
+        SchemaId::new("todo").unwrap(),
+        Arc::new(test_schema()),
+        dir.path(),
+        config,
+        policy,
+        Arc::clone(relay),
+        Arc::new(InflightBudget::new(u64::MAX, u64::MAX)),
+        timings,
+    )
+    .unwrap();
+    actor
+}
+
+/// Registers `writer` and `peer` in `actor`, whose policy seals a segment every two
+/// operations; `writer` commits 1..=8 and acknowledges 8, which prunes the log, and `peer`
+/// registers at 8. Both are `Connected`.
+fn prune_stopped_actor(actor: &mut RoomActor, writer: &ClientId, peer: &ClientId) {
+    actor.register(writer, None, None).unwrap();
+    let mut flow = ControlFlow::Continue(());
+    for n in 1..=8u8 {
+        actor
+            .commit(writer, mutation(n), seq(0), insert_op(n.into()), &mut flow)
+            .unwrap();
+    }
+    actor.ack(writer, seq(8)).unwrap();
+    assert!(actor.tiered_log.tail_seq() > seq(1), "the ack must prune");
+    actor.register(peer, Some(seq(8)), Some(1)).unwrap();
+}
+
+fn state_of(actor: &RoomActor, client: &ClientId) -> ClientState {
+    actor.lease_tracker.get_client(client).unwrap().state
+}
+
+/// How far the tests of the deadlines move the Tokio clock before they start, so that it runs
+/// ahead of the system's monotonic clock: a deadline measured on the system clock would then
+/// expire at once or never.
+const CLOCK_AHEAD: Duration = Duration::from_secs(3600);
+
+// Paused time: the test moves the Tokio clock and runs the fast tick itself.
+#[tokio::test(start_paused = true)]
+async fn a_client_without_heartbeats_disconnects_when_its_lease_expires_on_the_tokio_clock() {
+    const LEASE: Duration = Duration::from_secs(90);
+    tokio::time::advance(CLOCK_AHEAD).await;
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        lease_timeout: LEASE,
+        ..RoomLifecyclePolicy::default()
+    };
+    let mut actor = stopped_actor(&dir, &relay_on(&dir), policy, TEST_TIMINGS);
+    let client = ClientId::new("client").unwrap();
+    actor.register(&client, None, None).unwrap();
+    tokio::time::advance(LEASE / 2).await;
+    actor.heartbeat(&client).unwrap();
+
+    // The lease counts from the heartbeat, and expires once it has passed whole.
+    tokio::time::advance(LEASE).await;
+    actor.run_fast_maintenance();
+    assert_eq!(state_of(&actor, &client), ClientState::Connected);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    actor.run_fast_maintenance();
+    assert_eq!(state_of(&actor, &client), ClientState::Disconnected);
+}
+
+// Paused time: the test moves the Tokio clock and runs the fast tick itself.
+#[tokio::test(start_paused = true)]
+async fn a_designation_expires_after_60_seconds_on_the_tokio_clock_and_passes_to_another_client() {
+    tokio::time::advance(CLOCK_AHEAD).await;
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 2,
+        lease_timeout: Duration::from_secs(3600),
+        ..RoomLifecyclePolicy::default()
+    };
+    let mut actor = stopped_actor(&dir, &relay_on(&dir), policy, ActorTimings::default());
+    let (writer, peer) = (
+        ClientId::new("writer").unwrap(),
+        ClientId::new("peer").unwrap(),
+    );
+    prune_stopped_actor(&mut actor, &writer, &peer);
+    actor
+        .register(&ClientId::new("newcomer").unwrap(), None, None)
+        .unwrap();
+    let first = actor.snapshot_demand.designee().cloned().unwrap();
+
+    tokio::time::advance(DESIGNATION_TIMEOUT - Duration::from_millis(1)).await;
+    actor.run_fast_maintenance();
+    assert_eq!(actor.snapshot_demand.designee(), Some(&first));
+    tokio::time::advance(Duration::from_millis(1)).await;
+    actor.run_fast_maintenance();
+    let second = actor.snapshot_demand.designee().cloned().unwrap();
+    assert_ne!(second, first, "the designation must pass to another client");
+    assert!([&writer, &peer].contains(&&second));
+}
+
+// Paused time: the test moves the Tokio clock and runs the fast tick itself.
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_demand_expires_on_the_tokio_clock_also_after_the_room_reopens() {
+    const TTL: Duration = Duration::from_secs(600);
+    tokio::time::advance(CLOCK_AHEAD).await;
+    let dir = tempdir().unwrap();
+    let relay = relay_on(&dir);
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 2,
+        lease_timeout: Duration::from_secs(3600),
+        snapshot_demand_ttl: TTL,
+        ..RoomLifecyclePolicy::default()
+    };
+    let mut actor = stopped_actor(&dir, &relay, policy.clone(), ActorTimings::default());
+    let (writer, peer) = (
+        ClientId::new("writer").unwrap(),
+        ClientId::new("peer").unwrap(),
+    );
+    prune_stopped_actor(&mut actor, &writer, &peer);
+    let newcomer = ClientId::new("newcomer").unwrap();
+    actor.register(&newcomer, None, None).unwrap();
+
+    tokio::time::advance(TTL - Duration::from_millis(1)).await;
+    actor.run_fast_maintenance();
+    assert!(actor.snapshot_demand.is_active());
+    tokio::time::advance(Duration::from_millis(1)).await;
+    actor.run_fast_maintenance();
+    assert!(!actor.snapshot_demand.is_active());
+
+    // Renewed, and restored when the room reopens. The wall clock hardly moved, so it has
+    // almost a whole TTL left.
+    actor.heartbeat(&newcomer).unwrap();
+    actor.persist_roster_at_stop();
+    drop(actor);
+    let mut actor = stopped_actor(&dir, &relay, policy, ActorTimings::default());
+    assert!(actor.snapshot_demand.is_active());
+    tokio::time::advance(TTL - Duration::from_secs(1)).await;
+    actor.run_fast_maintenance();
+    assert!(actor.snapshot_demand.is_active());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    actor.run_fast_maintenance();
+    assert!(!actor.snapshot_demand.is_active());
+}
+
 #[tokio::test]
 async fn demand_that_is_not_renewed_expires() {
     let fx = Fixture::with_options(
@@ -2439,6 +2605,9 @@ mod onboarding_sim {
     const TICKS: u64 = 600;
     const LEASE: Duration = Duration::from_secs(30);
     const TOKIO_STEP: Duration = Duration::from_secs(4);
+    /// The TTL of the snapshot demand and the time a designee has to start uploading: ten
+    /// ticks.
+    const SNAPSHOT_DEADLINE: Duration = Duration::from_secs(40);
     /// Longest a client may wait for a snapshot while disruptions go on.
     const MAX_WAIT_TICKS: u64 = 400;
     /// Ticks without disruptions that every client gets to catch up at the end.
@@ -2490,7 +2659,7 @@ mod onboarding_sim {
                 warm_disk_ttl: Duration::ZERO,
                 cold_disk_ttl: Duration::from_secs(10 * 365 * 24 * 3600),
                 lease_timeout: LEASE,
-                snapshot_demand_ttl: Duration::from_millis(100),
+                snapshot_demand_ttl: SNAPSHOT_DEADLINE,
                 ..RoomLifecyclePolicy::default()
             };
             let mut sim = Self {
@@ -2543,7 +2712,7 @@ mod onboarding_sim {
                 Arc::clone(self.relay.as_ref().unwrap()),
                 Arc::new(InflightBudget::new(u64::MAX, u64::MAX)),
                 ActorTimings {
-                    designation_timeout: Duration::from_millis(100),
+                    designation_timeout: SNAPSHOT_DEADLINE,
                     ..TEST_TIMINGS
                 },
             )
@@ -3052,7 +3221,7 @@ mod onboarding_sim {
             self.clients[i].upload = None;
             let id = self.clients[i].id.clone();
             if let Some(entry) = self.a().lease_tracker.get_client_mut(&id) {
-                entry.last_heartbeat = std::time::Instant::now()
+                entry.last_heartbeat = Instant::now()
                     .checked_sub(LEASE + Duration::from_secs(1))
                     .unwrap();
             }
@@ -3086,7 +3255,8 @@ mod onboarding_sim {
                 self.open_actor();
             }
             if self.rng.permille(25) {
-                // The relay snapshot expires.
+                // The relay snapshot expires, and with it every deadline of the room: the
+                // snapshot demand, the designation, the RAM window and the leases.
                 tokio::time::advance(Duration::from_secs(2000)).await;
             }
             if self.ttl_injection && self.rng.permille(15) {
@@ -3182,8 +3352,6 @@ mod onboarding_sim {
             }
             self.check_tail();
             tokio::time::advance(TOKIO_STEP).await;
-            // The snapshot demand and the designation expire in real time.
-            std::thread::sleep(Duration::from_millis(5));
         }
 
         /// The clients waiting for a snapshot, with how many ticks they have waited.
@@ -3204,8 +3372,10 @@ mod onboarding_sim {
     /// runs together must complete snapshot downloads and inject the enabled disruptions, so
     /// that a change in the trajectories cannot leave the simulation checking nothing.
     ///
-    /// The seeds fix every random choice, but the snapshot demand and the designation expire
-    /// in real time, so how a run unfolds also depends on how fast the machine runs it.
+    /// The seeds fix every random choice, and the deadlines of the room run on the Tokio
+    /// clock, which only the ticks and the events move. Only what a reopen restores (the
+    /// clients' inactivity and the snapshot demand) also counts the few milliseconds of wall
+    /// time the run took, far below a tick.
     async fn run(gaps: bool, ttl: bool) {
         let mut exercised = [0; 3];
         for seed in SEEDS {

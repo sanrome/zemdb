@@ -617,6 +617,37 @@ fn activity_alone_is_written_only_when_the_room_stops() {
     assert!(persisted_inactivity(&path, &client) < Duration::from_secs(5));
 }
 
+// Paused time: the Tokio clock runs ahead of the system's monotonic clock once the test
+// advances it, so activity saved or restored on the system clock would come out wrong.
+#[tokio::test(start_paused = true)]
+async fn inactivity_survives_a_save_and_a_reopen_on_the_tokio_clock() {
+    let lease = Duration::from_secs(90);
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("meta_clients_room.json");
+    let client = ClientId::new("client").unwrap();
+    let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
+    tracker.register_client(&client, Some(seq(1)), seq(1));
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tracker.save().unwrap();
+    drop(tracker);
+
+    // 60 s of the lease had passed, and the wall clock hardly moved since.
+    let mut tracker = ClientLeaseTracker::open_or_create(&path).unwrap();
+    tokio::time::advance(Duration::from_secs(29)).await;
+    tracker.check_timeouts(lease, None, Duration::MAX, seq(1));
+    assert_eq!(
+        tracker.get_client(&client).unwrap().state,
+        ClientState::Connected
+    );
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tracker.check_timeouts(lease, None, Duration::MAX, seq(1));
+    assert_eq!(
+        tracker.get_client(&client).unwrap().state,
+        ClientState::Disconnected
+    );
+}
+
 #[test]
 fn activity_before_the_clock_can_reach_saturates() {
     let now = Instant::now();

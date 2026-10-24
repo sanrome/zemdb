@@ -6,7 +6,8 @@
 //! the designation is kept in memory only and recomputed after a restart.
 
 use std::collections::HashSet;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
+use tokio::time::Instant;
 use zemdb_core::id::ClientId;
 
 /// How long a designated client has to start uploading before another one is designated.

@@ -2,7 +2,7 @@ use crate::error::ServerError;
 use crate::log::budget::{op_bytes, ReadBudget};
 use crate::log::policy::RoomLifecyclePolicy;
 use std::collections::VecDeque;
-use std::time::Instant;
+use tokio::time::Instant;
 use zemdb_core::id::SequenceNumber;
 use zemdb_core::protocol::messages::SequencedOperation;
 

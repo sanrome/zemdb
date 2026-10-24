@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::SystemTime;
+use tokio::time::Instant;
 use zemdb_core::id::{MutationId, SequenceNumber};
 use zemdb_core::protocol::limits::MAX_RESPONSE_OPS_BYTES;
 use zemdb_core::protocol::messages::SequencedOperation;
@@ -74,7 +75,7 @@ pub struct PruneReport {
 
 /// The current time as maintenance sees it. Segment ages are wall-clock durations, because
 /// after a reopen they come from file modification times; the ages of operations in RAM are
-/// monotonic.
+/// measured on the Tokio clock, which a test with the clock paused moves at will.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MaintenanceClock {
     pub(crate) wall: SystemTime,

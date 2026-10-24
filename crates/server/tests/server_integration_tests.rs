@@ -875,7 +875,7 @@ async fn sse_signals_schema_reloaded() {
 
 #[test]
 fn client_lease_disconnected_to_dormant_timeout() {
-    use std::time::Instant;
+    use tokio::time::Instant;
     use zemdb_server::actor::lease::{ClientLeaseTracker, ClientState};
 
     let dir = tempdir().unwrap();
