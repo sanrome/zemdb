@@ -1,41 +1,38 @@
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
 use zemdb_core::SequencedOperation;
 
 use crate::disk::format::{decode_wal_batch_from_slice, encode_wal_batch, WalBatchDecodeResult};
 use crate::error::StorageError;
+use crate::files::RoomFile;
 
-/// Sequential writer and encoder for append-only WAL records.
+/// Encoder of append-only WAL records, and their writer to a file of the file layer.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WalWriter;
 
 impl WalWriter {
-    /// Encodes and appends a single sequenced operation (see [`Self::write_batch`]).
+    /// Encodes a single sequenced operation and writes it at `offset` (see
+    /// [`Self::write_batch`]).
     pub async fn write_record(
-        file: &mut File,
+        file: &impl RoomFile,
+        offset: u64,
         op: &SequencedOperation,
     ) -> Result<usize, StorageError> {
-        Self::write_batch(file, std::slice::from_ref(op)).await
+        Self::write_batch(file, offset, std::slice::from_ref(op)).await
     }
 
-    /// Encodes and appends a batch of sequenced operations to the given WAL file.
+    /// Encodes a batch of sequenced operations and writes it to the given WAL file at `offset`,
+    /// its end for an append. Returns the number of bytes written.
     ///
     /// The write is complete when this returns, and its error, if any, is returned here; making
     /// it durable is up to the caller.
     pub async fn write_batch(
-        file: &mut File,
+        file: &impl RoomFile,
+        offset: u64,
         ops: &[SequencedOperation],
     ) -> Result<usize, StorageError> {
         let buffer = Self::encode_batch(ops)?;
-        Self::write_flushed(file, &buffer).await?;
-        Ok(buffer.len())
-    }
-
-    /// Writes `bytes` and waits for the write: Tokio's `write_all` returns once the bytes are
-    /// handed to the blocking pool, and only a `flush` (or a later write) reports its error.
-    async fn write_flushed(file: &mut File, bytes: &[u8]) -> std::io::Result<()> {
-        file.write_all(bytes).await?;
-        file.flush().await
+        let len = buffer.len();
+        file.write_at(offset, buffer).await?;
+        Ok(len)
     }
 
     /// Encodes a batch of sequenced operations into an atomically framed contiguous byte buffer.

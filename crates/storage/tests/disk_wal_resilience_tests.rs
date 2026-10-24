@@ -5,6 +5,7 @@ use zemdb_core::{
     CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequenceNumber,
     SequencedOperation, TableSchema, Value, MAX_MESSAGE_SIZE,
 };
+use zemdb_storage::files::{NativeFiles, RoomFiles};
 use zemdb_storage::format::{
     decode_wal_batch_from_slice, encode_wal_batch, encode_wal_record, replay_wal_records,
     FileHeader, WalBatchDecodeResult, BATCH_HEADER_SIZE, BATCH_MAGIC, HEADER_SIZE, MAGIC_BYTES,
@@ -668,17 +669,34 @@ fn wal_reader_skips_empty_frames() {
 }
 
 #[tokio::test]
-async fn test_wal_writer_reports_a_write_that_fails_in_the_background() {
+async fn test_wal_writer_writes_at_its_offset_and_reports_a_failed_write() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("read-only.wal");
-    std::fs::write(&path, b"").unwrap();
-    // Writes through a read-only handle are accepted by `write_all` and fail on the blocking pool.
-    let mut file = tokio::fs::File::open(&path).await.unwrap();
+    let path = dir.path().join("room.wal");
     let op = delete(1, 1, 1);
+    let frame = WalWriter::encode_batch(std::slice::from_ref(&op)).unwrap();
 
-    assert!(WalWriter::write_record(&mut file, &op).await.is_err());
-    assert!(WalWriter::write_batch(&mut file, &[op]).await.is_err());
-    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    let file = NativeFiles.create(&path).await.unwrap();
+    let first = WalWriter::write_record(&file, 0, &op).await.unwrap();
+    assert_eq!(first, frame.len());
+    let second = WalWriter::write_batch(&file, first as u64, std::slice::from_ref(&op))
+        .await
+        .unwrap();
+    assert_eq!(second, frame.len());
+    drop(file);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        [frame.clone(), frame].concat()
+    );
+
+    // A write through a read-only handle fails in the same call, and writes nothing.
+    let len = std::fs::metadata(&path).unwrap().len();
+    let read_only = NativeFiles.open_read(&path).await.unwrap();
+    assert!(WalWriter::write_record(&read_only, len, &op).await.is_err());
+    assert!(WalWriter::write_batch(&read_only, len, &[op])
+        .await
+        .is_err());
+    drop(read_only);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
 }
 
 /// A schema with a table `t{id}`, id `id`, for each id in `ids`: an integer key and value.

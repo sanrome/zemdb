@@ -5,33 +5,29 @@ pub mod wal;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use fs2::FileExt;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use zemdb_core::{CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation};
 
 use crate::disk::compactor::{
-    compact_room_cow, install_applied_snapshot, rename_staged_snapshot, stage_snapshot, sync_file,
-    SyncKind,
+    compact_room_cow, install_applied_snapshot, rename_staged_snapshot, stage_snapshot,
 };
 use crate::disk::recovery::recover_room;
 use crate::disk::wal::WalWriter;
 use crate::engine::{batched_scan, ApplyReport, RowStream, StorageEngine};
 use crate::error::StorageError;
 use crate::fail_point;
-use crate::files::native::create_dir_all_synced;
+use crate::files::{NativeFiles, RoomFile, RoomFiles};
 use crate::memory::state::{
     apply_operation, decode_received_snapshot, resolve_table_id, validate_batch, RoomData, TableRef,
 };
 use crate::memory::RoomSnapshotRef;
 use crate::options::ScanOptions;
 use crate::snapshot::DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES;
-use crate::sys::{run_blocking, sync_dir};
+use crate::sys::run_blocking;
 
 /// Options to configure `DiskStorageEngine`.
 #[derive(Debug, Clone)]
@@ -99,16 +95,17 @@ impl DiskStorageOptions {
 
 /// The append-only WAL of an open room. Lives behind the room's WAL mutex.
 #[derive(Debug)]
-pub(crate) struct DiskWal {
+pub(crate) struct DiskWal<F: RoomFiles> {
     room_id: RoomId,
-    pub(crate) file: File,
+    /// The WAL's handle, with its exclusive lock. Batches are appended at `len`.
+    pub(crate) file: F::File,
     pub(crate) len: u64,
     /// Set when an I/O failure leaves the files in a state only recovery can resolve, such as
     /// a WAL write whose durability is unknown. Writes and compactions are then refused.
     failure: Option<String>,
 }
 
-impl DiskWal {
+impl<F: RoomFiles> DiskWal<F> {
     /// Marks the room as failed; it must be closed and reopened to recover from disk.
     pub(crate) fn mark_failed(&mut self, reason: String) {
         tracing::error!(room_id = %self.room_id, reason = %reason, "Room marked as failed");
@@ -144,26 +141,26 @@ impl DiskWal {
 /// WAL byte until it is applied in memory, a snapshot from its rename until it is applied in
 /// memory, or a WAL rotation, absorption or truncation from its first step to its last.
 ///
-/// File operations run on the blocking pool and complete even if the future awaiting them is
-/// dropped, so a change abandoned halfway (an error the change does not handle, a panic, or
+/// File operations complete even if the future awaiting them is dropped (see
+/// [`RoomFile`]), so a change abandoned halfway (an error the change does not handle, a panic, or
 /// the caller dropping the future) can leave the WAL handle, the files and the in-memory state
 /// disagreeing, and a later write would land in the wrong file, at the wrong offset, or be
 /// validated against a stale head. The room is therefore marked as failed when the guard drops
 /// without `complete`.
-pub(crate) struct PendingWrite<'a> {
-    wal: &'a mut DiskWal,
+pub(crate) struct PendingWrite<'a, F: RoomFiles> {
+    wal: &'a mut DiskWal<F>,
     completed: bool,
 }
 
-impl<'a> PendingWrite<'a> {
-    pub(crate) fn begin(wal: &'a mut DiskWal) -> Self {
+impl<'a, F: RoomFiles> PendingWrite<'a, F> {
+    pub(crate) fn begin(wal: &'a mut DiskWal<F>) -> Self {
         Self {
             wal,
             completed: false,
         }
     }
 
-    pub(crate) fn wal(&mut self) -> &mut DiskWal {
+    pub(crate) fn wal(&mut self) -> &mut DiskWal<F> {
         self.wal
     }
 
@@ -174,7 +171,7 @@ impl<'a> PendingWrite<'a> {
     }
 }
 
-impl Drop for PendingWrite<'_> {
+impl<F: RoomFiles> Drop for PendingWrite<'_, F> {
     fn drop(&mut self) {
         if !self.completed && self.wal.failure.is_none() {
             self.wal
@@ -211,16 +208,19 @@ pub(crate) struct DiskRoomState {
 ///    shared and never wait for an `fsync`; they only see durable changes, applied in WAL
 ///    order, so what they observe is always a prefix of the WAL.
 #[derive(Debug)]
-pub(crate) struct DiskRoom {
+pub(crate) struct DiskRoom<F: RoomFiles> {
     /// Handle of `room_{id}.lock`, whose exclusive lock keeps any other engine, in this process
     /// or another, from opening the room (see [`lock_room_files`]). It is released when the room
     /// is dropped.
-    _lock: std::fs::File,
+    _lock: F::File,
+    /// The engine's data directory, through which the room's files are opened, renamed and
+    /// removed.
+    pub(crate) files: Arc<F>,
     pub(crate) room_id: RoomId,
     pub(crate) snap_path: PathBuf,
     pub(crate) wal_path: PathBuf,
     pub(crate) compaction: Arc<Mutex<()>>,
-    pub(crate) wal: Mutex<DiskWal>,
+    pub(crate) wal: Mutex<DiskWal<F>>,
     pub(crate) state: RwLock<DiskRoomState>,
     /// Set while a compaction runs. Atomic so that a guard can release it on drop without
     /// awaiting a lock.
@@ -233,20 +233,43 @@ pub(crate) struct DiskRoom {
 /// - `room_{id}.wal`: the append-only WAL of batches since that snapshot, each framed with
 ///   `0xBA7C` and a CRC32.
 ///
+/// The room's files are opened and locked, its WAL written, read, truncated and synced, and its
+/// directory changed through the file layer `F` (see [`crate::files`]), by default the file
+/// system of the process.
+///
 /// See `DiskRoom` for the locking of an open room and `compactor::compact_room_cow` for how
 /// the WAL is folded into a new snapshot.
-#[derive(Debug, Clone)]
-pub struct DiskStorageEngine {
+#[derive(Debug)]
+pub struct DiskStorageEngine<F: RoomFiles = NativeFiles> {
     options: DiskStorageOptions,
-    rooms: Arc<RwLock<HashMap<RoomId, Arc<DiskRoom>>>>,
+    files: Arc<F>,
+    rooms: Arc<RwLock<HashMap<RoomId, Arc<DiskRoom<F>>>>>,
+}
+
+impl<F: RoomFiles> Clone for DiskStorageEngine<F> {
+    fn clone(&self) -> Self {
+        Self {
+            options: self.options.clone(),
+            files: Arc::clone(&self.files),
+            rooms: Arc::clone(&self.rooms),
+        }
+    }
 }
 
 impl DiskStorageEngine {
-    /// Creates an engine with `options`, or `InvalidOptions` if `compaction_ratio` is not a
-    /// finite number above 0 (with NaN, 0 or a negative ratio, every batch would compact once
-    /// the WAL reaches `min_compaction_bytes`) or `zstd_level` is outside the levels Zstandard
-    /// accepts.
+    /// Creates an engine with `options` on the file system of the process (see
+    /// [`Self::with_files`]).
     pub fn new(options: DiskStorageOptions) -> Result<Self, StorageError> {
+        Self::with_files(options, NativeFiles)
+    }
+}
+
+impl<F: RoomFiles> DiskStorageEngine<F> {
+    /// Creates an engine with `options` whose files go through `files`, or `InvalidOptions` if
+    /// `compaction_ratio` is not a finite number above 0 (with NaN, 0 or a negative ratio, every
+    /// batch would compact once the WAL reaches `min_compaction_bytes`) or `zstd_level` is
+    /// outside the levels Zstandard accepts.
+    pub fn with_files(options: DiskStorageOptions, files: F) -> Result<Self, StorageError> {
         let ratio = options.compaction_ratio;
         if !(ratio.is_finite() && ratio > 0.0) {
             return Err(StorageError::InvalidOptions(format!(
@@ -264,6 +287,7 @@ impl DiskStorageEngine {
         }
         Ok(Self {
             options,
+            files: Arc::new(files),
             rooms: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -326,7 +350,10 @@ impl DiskStorageEngine {
         Ok(batched_scan(table_data, options))
     }
 
-    pub(crate) async fn get_room(&self, room_id: &RoomId) -> Result<Arc<DiskRoom>, StorageError> {
+    pub(crate) async fn get_room(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Arc<DiskRoom<F>>, StorageError> {
         let rooms = self.rooms.read().await;
         rooms
             .get(room_id)
@@ -346,7 +373,7 @@ impl DiskStorageEngine {
         &self,
         room_id: &RoomId,
         lock: Arc<Mutex<()>>,
-    ) -> Result<(Arc<DiskRoom>, OwnedMutexGuard<()>), StorageError> {
+    ) -> Result<(Arc<DiskRoom<F>>, OwnedMutexGuard<()>), StorageError> {
         let guard = lock.lock_owned().await;
         let room = self.get_room(room_id).await?;
         if !Arc::ptr_eq(&room.compaction, OwnedMutexGuard::mutex(&guard)) {
@@ -378,33 +405,30 @@ impl DiskStorageEngine {
 /// The first lock is on `room_{id}.lock`, taken before any other file of the room is touched.
 /// That file is never renamed or removed, so no other engine can open the room at any moment
 /// while it is open, not even while a compaction has moved the WAL aside and its replacement
-/// does not exist yet. The WAL keeps its own exclusive lock as well, on its handle: Tokio's file
-/// operations still in flight on the blocking pool hold that handle after the room is dropped
-/// (for example by an engine dropped without closing the room), so the room cannot be opened
-/// again until a write still landing in the WAL has finished.
-fn lock_room_files(
-    lock_path: &std::path::Path,
-    wal_path: &std::path::Path,
+/// does not exist yet. The WAL keeps its own exclusive lock as well, on its handle: a file
+/// operation of the layer still running after its caller stopped waiting keeps the file and its
+/// lock open after the room is dropped (for example by an engine dropped without closing the
+/// room), so the room cannot be opened again until a write still landing in the WAL has
+/// finished.
+async fn lock_room_files<F: RoomFiles>(
+    files: &F,
+    lock_path: &Path,
+    wal_path: &Path,
     room_id: &RoomId,
-) -> Result<(std::fs::File, std::fs::File), StorageError> {
-    let open_locked = |path: &std::path::Path| -> Result<std::fs::File, StorageError> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(path)?;
-        file.try_lock_exclusive()
-            .map_err(|_| StorageError::RoomLocked(room_id.clone()))?;
-        Ok(file)
+) -> Result<(F::File, F::File), StorageError> {
+    let open_locked = |path| async move {
+        files
+            .open_locked(path)
+            .await?
+            .ok_or_else(|| StorageError::RoomLocked(room_id.clone()))
     };
-    let lock = open_locked(lock_path)?;
-    Ok((lock, open_locked(wal_path)?))
+    let lock = open_locked(lock_path).await?;
+    Ok((lock, open_locked(wal_path).await?))
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-impl StorageEngine for DiskStorageEngine {
+impl<F: RoomFiles> StorageEngine for DiskStorageEngine<F> {
     /// Opens `room_id`, recovering it from its files (see `recover_room`).
     ///
     /// Once it has the engine's rooms, it runs in its own task, which keeps the room's locks
@@ -421,38 +445,28 @@ impl StorageEngine for DiskStorageEngine {
         let (snap_path, wal_path) = (self.snap_file_path(&room_id), self.wal_file_path(&room_id));
         let lock_path = self.lock_file_path(&room_id);
         let zstd_level = self.options.zstd_level;
+        let files = Arc::clone(&self.files);
         tokio::spawn(async move {
-            let created = data_dir.clone();
-            run_blocking(move || create_dir_all_synced(&created)).await?;
-            let (lock, std_wal_file) = {
-                let (wal_path, room_id) = (wal_path.clone(), room_id.clone());
-                // An earlier open may have created the directory, or the room's files, without
-                // a successful sync: their entries are synced before anything in them is served.
-                run_blocking(move || {
-                    let files = lock_room_files(&lock_path, &wal_path, &room_id)?;
-                    [Some(data_dir.as_path()), data_dir.parent()]
-                        .into_iter()
-                        .flatten()
-                        .try_for_each(|dir| {
-                            fail_point::io_result("sync_dir", dir, sync_dir(dir))
-                        })?;
-                    Ok::<_, StorageError>(files)
-                })
-                .await?
-            };
+            files.create_dir_all(&data_dir).await?;
+            let (lock, wal_file) =
+                lock_room_files(&*files, &lock_path, &wal_path, &room_id).await?;
+            // An earlier open may have created the directory, or the room's files, without a
+            // successful sync: their entries are synced before anything in them is served.
+            for dir in [Some(data_dir.as_path()), data_dir.parent()]
+                .into_iter()
+                .flatten()
+            {
+                fail_point::io_result("sync_dir", dir, files.sync_dir(dir).await)?;
+            }
 
             let recovered = recover_room(
-                &room_id,
-                &snap_path,
-                &wal_path,
-                &schema,
-                std_wal_file,
-                zstd_level,
+                &*files, &room_id, &snap_path, &wal_path, &schema, wal_file, zstd_level,
             )
             .await?;
 
             let room = DiskRoom {
                 _lock: lock,
+                files,
                 room_id: room_id.clone(),
                 snap_path,
                 wal_path,
@@ -490,9 +504,10 @@ impl StorageEngine for DiskStorageEngine {
 
         // Still registered: closing needs the compaction lock, which this call holds.
         self.rooms.write().await.remove(room_id);
-        // Waits for a write in progress to finish.
-        let mut wal = room.wal.lock().await;
-        sync_file(&mut wal.file, SyncKind::All).await?;
+        // Waits for a write in progress to finish. The sync also waits for a write whose caller
+        // stopped waiting, and returns its error if it failed.
+        let wal = room.wal.lock().await;
+        wal.file.sync_all().await?;
         tracing::info!(room_id = %room_id, "Closed disk room");
         Ok(())
     }
@@ -564,6 +579,7 @@ impl StorageEngine for DiskStorageEngine {
         }
 
         let wal_batch_bytes = WalWriter::encode_batch(&ops)?;
+        let batch_len = wal_batch_bytes.len() as u64;
 
         // Write to the append-only WAL file and fsync data, without holding the state lock, so
         // that readers do not wait for the sync. A failure here leaves an unknown amount of the
@@ -575,21 +591,22 @@ impl StorageEngine for DiskStorageEngine {
             crate::fail_point::read_only_handle(
                 "apply_batch.write",
                 &room.wal_path,
+                &*room.files,
                 &mut wal.file,
                 &room.wal_path,
             )
             .await;
-            wal.file.write_all(&wal_batch_bytes).await?;
+            wal.file.write_at(wal.len, wal_batch_bytes).await?;
             crate::fail_point::check("apply_batch.sync", &room.wal_path)?;
             crate::fail_point::pause("apply_batch.sync", &room.wal_path).await;
-            sync_file(&mut wal.file, SyncKind::Data).await?;
+            wal.file.sync_data().await?;
             Ok::<(), StorageError>(())
         }
         .await;
         pending
             .wal()
             .fail_on_err("WAL append failed", write_result)?;
-        pending.wal().len += wal_batch_bytes.len() as u64;
+        pending.wal().len += batch_len;
 
         // Apply operations to O(1) clones of the in-memory tables and their indexes, then
         // publish them at once: readers see all of the batch or none of it, and never tables and
@@ -768,7 +785,7 @@ impl StorageEngine for DiskStorageEngine {
                 Ok(()) => snapshot_head_outcome(current, snapshot_head),
             };
             if let Some(outcome) = refusal {
-                staged.discard().await;
+                staged.discard(&*room.files).await;
                 return outcome;
             }
 
@@ -778,7 +795,7 @@ impl StorageEngine for DiskStorageEngine {
             let mut pending = PendingWrite::begin(&mut wal);
             if let Err(err) = rename_staged_snapshot(&room, &staged).await {
                 pending.complete();
-                staged.discard().await;
+                staged.discard(&*room.files).await;
                 return Err(err);
             }
             let installed = install_applied_snapshot(&room, pending.wal()).await;

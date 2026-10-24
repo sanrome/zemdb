@@ -1,19 +1,17 @@
 use fs2::FileExt;
 use std::collections::HashMap;
-use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::fs::{rename, File};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use zemdb_core::{RoomId, SequenceNumber};
 
 use crate::disk::format::FileHeader;
 use crate::disk::{DiskRoom, DiskStorageOptions, DiskWal, PendingWrite};
 use crate::error::StorageError;
 use crate::fail_point;
+use crate::files::{RoomFile, RoomFiles};
 use crate::memory::{RoomSnapshotRef, Table};
-use crate::sys::{run_blocking, sync_dir};
+use crate::sys::run_blocking;
 
 /// Path of the WAL segment rotated out by an in-progress (or interrupted) compaction.
 pub(crate) fn compacting_wal_path(wal_path: &Path) -> PathBuf {
@@ -55,8 +53,8 @@ impl StagedSnapshot {
     /// Removes the temporary file of a snapshot that will not be installed. A file left
     /// behind (because this fails, or because of a crash) is removed when
     /// the room is next opened.
-    pub(crate) async fn discard(self) {
-        if let Err(err) = remove_if_exists(&self.tmp_path).await {
+    pub(crate) async fn discard(self, files: &impl RoomFiles) {
+        if let Err(err) = remove_if_exists(files, &self.tmp_path).await {
             tracing::warn!(path = ?self.tmp_path, error = %err, "Could not remove a staged snapshot");
         }
     }
@@ -93,10 +91,11 @@ impl StagedSnapshot {
 /// `.wal.compacting` may already be gone, or may come back after a crash; either way its records
 /// are in the new snapshot and recovery skips them.
 #[tracing::instrument(skip(room, options), fields(room_id = %room.room_id))]
-pub(crate) async fn compact_room_cow(
-    room: Arc<DiskRoom>,
+pub(crate) async fn compact_room_cow<F: RoomFiles>(
+    room: Arc<DiskRoom<F>>,
     options: &DiskStorageOptions,
 ) -> Result<(), StorageError> {
+    let files = &*room.files;
     let wal_compacting_path = compacting_wal_path(&room.wal_path);
 
     // Phase 1
@@ -110,14 +109,14 @@ pub(crate) async fn compact_room_cow(
         // A failed sync leaves the durability of earlier writes unknown, and cannot be retried.
         let sync_result = async {
             fail_point::check("compaction.sync", &room.wal_path)?;
-            sync_file(&mut wal.file, SyncKind::All).await?;
+            wal.file.sync_all().await?;
             Ok::<(), StorageError>(())
         }
         .await;
         wal.fail_on_err("WAL sync before compaction failed", sync_result)?;
 
         fail_point::pause("compaction.rotate", &room.wal_path).await;
-        let absorb = tokio::fs::try_exists(&wal_compacting_path).await?;
+        let absorb = files.exists(&wal_compacting_path).await?;
         // Both paths handle their own errors (undoing the step or marking the room as failed);
         // the guard covers a rotation abandoned halfway, which neither can see.
         let mut change = PendingWrite::begin(&mut wal);
@@ -150,17 +149,17 @@ pub(crate) async fn compact_room_cow(
     // Phase 3
     let renamed = async {
         fail_point::check("compaction.phase3_rename", &room.wal_path)?;
-        rename(&staged.tmp_path, &room.snap_path).await?;
+        files.rename(&staged.tmp_path, &room.snap_path).await?;
         Ok::<(), StorageError>(())
     }
     .await;
     if let Err(err) = renamed {
-        staged.discard().await;
+        staged.discard(files).await;
         return Err(err);
     }
     fail_point::panic_point("compaction.renamed", &room.wal_path);
     fail_point::check("compaction.phase3_sync", &room.wal_path)?;
-    sync_parent(&room.snap_path).await?;
+    sync_parent(files, &room.snap_path).await?;
     {
         let mut state = room.state.write().await;
         state.snapshot_seq = cut_seq;
@@ -168,8 +167,8 @@ pub(crate) async fn compact_room_cow(
     }
 
     fail_point::check("compaction.cleanup", &room.wal_path)?;
-    remove_if_exists(&wal_compacting_path).await?;
-    sync_parent(&wal_compacting_path).await?;
+    remove_if_exists(files, &wal_compacting_path).await?;
+    sync_parent(files, &wal_compacting_path).await?;
 
     tracing::info!(
         snap_path = ?room.snap_path,
@@ -182,24 +181,28 @@ pub(crate) async fn compact_room_cow(
 }
 
 /// Moves the active WAL to `.wal.compacting` and installs a fresh, locked, empty WAL.
-async fn rotate_wal_to_compacting(
-    room: &DiskRoom,
-    wal: &mut DiskWal,
+async fn rotate_wal_to_compacting<F: RoomFiles>(
+    room: &DiskRoom<F>,
+    wal: &mut DiskWal<F>,
     wal_compacting_path: &Path,
 ) -> Result<(), StorageError> {
-    rename(&room.wal_path, wal_compacting_path).await?;
+    let files = &*room.files;
+    // The WAL is renamed by path with its handle open, which the native layer allows; a layer
+    // that refuses it fails here, before anything changed.
+    files.rename(&room.wal_path, wal_compacting_path).await?;
     fail_point::pause("compaction.rotate_renamed", &room.wal_path).await;
     fail_point::panic_point("compaction.rotated", &room.wal_path);
 
-    match open_fresh_wal(&room.wal_path, &room.room_id) {
+    match open_fresh_wal(files, &room.wal_path, &room.room_id).await {
         Ok(new_wal) => {
-            wal.file = File::from_std(new_wal);
+            wal.file = new_wal;
             wal.len = 0;
         }
         Err(err) => {
             // The open handle still points at the renamed file. Move it back so that
             // subsequent writes keep landing in the file recovery reads as the active WAL.
-            if let Err(rollback_err) = roll_back_rotation(&room.wal_path, wal_compacting_path).await
+            if let Err(rollback_err) =
+                roll_back_rotation(files, &room.wal_path, wal_compacting_path).await
             {
                 // Writes would now land in `.wal.compacting`, and a later compaction would
                 // absorb that file into itself. Only recovery can sort this out safely.
@@ -215,7 +218,7 @@ async fn rotate_wal_to_compacting(
     // is acknowledged; a failed directory sync cannot be retried safely.
     let sync_result = async {
         fail_point::check("compaction.rotate_sync_dir", &room.wal_path)?;
-        sync_parent(&room.wal_path).await
+        sync_parent(files, &room.wal_path).await
     }
     .await;
     wal.fail_on_err(
@@ -225,26 +228,27 @@ async fn rotate_wal_to_compacting(
 }
 
 async fn roll_back_rotation(
+    files: &impl RoomFiles,
     wal_path: &Path,
     wal_compacting_path: &Path,
 ) -> Result<(), StorageError> {
     fail_point::check("compaction.rotate_rollback", wal_path)?;
-    rename(wal_compacting_path, wal_path).await?;
-    sync_parent(wal_path).await
+    files.rename(wal_compacting_path, wal_path).await?;
+    sync_parent(files, wal_path).await
 }
 
 /// Creates and locks the WAL that replaces the one just renamed. It must not exist: a file
 /// found there is never truncated or adopted.
-fn open_fresh_wal(wal_path: &Path, room_id: &RoomId) -> Result<std::fs::File, StorageError> {
+async fn open_fresh_wal<F: RoomFiles>(
+    files: &F,
+    wal_path: &Path,
+    room_id: &RoomId,
+) -> Result<F::File, StorageError> {
     fail_point::check("compaction.rotate_open", wal_path)?;
-    let file = std::fs::OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(wal_path)?;
-    file.try_lock_exclusive()
-        .map_err(|_| StorageError::RoomLocked(room_id.clone()))?;
-    Ok(file)
+    files
+        .create_locked(wal_path)
+        .await?
+        .ok_or_else(|| StorageError::RoomLocked(room_id.clone()))
 }
 
 /// Absorbs the active WAL into a `.wal.compacting` left by a failed compaction, then empties
@@ -257,20 +261,25 @@ fn open_fresh_wal(wal_path: &Path, room_id: &RoomId) -> Result<std::fs::File, St
 /// duplicates and removes the temporary file). The active WAL is read through its own locked
 /// handle (a second handle cannot read a file locked on Windows), and that handle and its lock
 /// are kept.
-async fn absorb_wal_into_compacting(
-    room: &DiskRoom,
-    wal: &mut DiskWal,
+async fn absorb_wal_into_compacting<F: RoomFiles>(
+    room: &DiskRoom<F>,
+    wal: &mut DiskWal<F>,
     wal_compacting_path: &Path,
 ) -> Result<(), StorageError> {
-    let mut wal_bytes = Vec::new();
+    let files = &*room.files;
     let read_result = async {
-        wal.file.seek(SeekFrom::Start(0)).await?;
-        wal.file.read_to_end(&mut wal_bytes).await?;
-        Ok::<(), StorageError>(())
+        let len = wal.file.size().await?;
+        let len = usize::try_from(len).map_err(|_| {
+            StorageError::Other(format!(
+                "The active WAL is too large to absorb: {len} bytes"
+            ))
+        })?;
+        Ok::<_, StorageError>(wal.file.read_at(0, len).await?)
     }
     .await;
-    // On failure the handle position is unknown; appending from there could overwrite records.
-    wal.fail_on_err("Reading the active WAL failed", read_result)?;
+    // A WAL that cannot be read is not written to again: only recovery, which reads it from
+    // the start, can tell which of its records are whole.
+    let wal_bytes = wal.fail_on_err("Reading the active WAL failed", read_result)?;
 
     if !wal_bytes.is_empty() {
         let (compacting, key) = (wal_compacting_path.to_path_buf(), room.wal_path.clone());
@@ -279,7 +288,7 @@ async fn absorb_wal_into_compacting(
         // the active WAL could lose its records.
         let synced = async {
             fail_point::check("compaction.absorb_sync_dir", &room.wal_path)?;
-            sync_parent(wal_compacting_path).await
+            sync_parent(files, wal_compacting_path).await
         }
         .await;
         wal.fail_on_err(
@@ -290,18 +299,20 @@ async fn absorb_wal_into_compacting(
 
     fail_point::check("compaction.absorb", &room.wal_path)?;
 
-    // On failure the handle's length and position are unknown; appending from there could
-    // overwrite or misplace records.
+    // On failure the WAL's length is unknown; appending at `len` could overwrite or misplace
+    // records.
     let truncated = truncate_wal(wal, &room.wal_path).await;
     wal.fail_on_err("Emptying the active WAL failed", truncated)
 }
 
 /// Empties the active WAL through its own locked handle and syncs it.
-async fn truncate_wal(wal: &mut DiskWal, wal_path: &Path) -> Result<(), StorageError> {
+async fn truncate_wal<F: RoomFiles>(
+    wal: &mut DiskWal<F>,
+    wal_path: &Path,
+) -> Result<(), StorageError> {
     wal.file.set_len(0).await?;
     fail_point::pause("wal.truncate", wal_path).await;
-    wal.file.seek(SeekFrom::Start(0)).await?;
-    sync_file(&mut wal.file, SyncKind::All).await?;
+    wal.file.sync_all().await?;
     wal.len = 0;
     Ok(())
 }
@@ -434,6 +445,7 @@ pub(crate) async fn stage_snapshot(
 /// Writes a synced temporary file, renames it over the destination and syncs the directory.
 /// Returns the compressed payload length.
 pub(crate) async fn write_snapshot_file(
+    files: &impl RoomFiles,
     snap_path: &Path,
     head_seq: SequenceNumber,
     tables: &HashMap<u16, Table>,
@@ -441,13 +453,14 @@ pub(crate) async fn write_snapshot_file(
     room_id: &RoomId,
 ) -> Result<u64, StorageError> {
     let staged = stage_snapshot(snap_path, head_seq, tables, zstd_level, room_id).await?;
-    install_staged(snap_path, staged).await
+    install_staged(files, snap_path, staged).await
 }
 
 /// Creates the empty snapshot of a new room (a header without payload) at `snap_path`, through
 /// a synced temporary file renamed into place, so that a failure or a crash never leaves a
 /// partial `room_{id}.snap` that would keep the room from opening.
 pub(crate) async fn write_empty_snapshot_file(
+    files: &impl RoomFiles,
     snap_path: &Path,
     room_id: &RoomId,
 ) -> Result<(), StorageError> {
@@ -458,40 +471,41 @@ pub(crate) async fn write_empty_snapshot_file(
         })
         .await?
     };
-    install_staged(snap_path, staged).await?;
+    install_staged(files, snap_path, staged).await?;
     Ok(())
 }
 
 /// Renames a staged snapshot over `snap_path` and syncs the directory. Returns the compressed
 /// payload length. If the rename fails, the staged file is removed.
-async fn install_staged(snap_path: &Path, staged: StagedSnapshot) -> Result<u64, StorageError> {
+async fn install_staged(
+    files: &impl RoomFiles,
+    snap_path: &Path,
+    staged: StagedSnapshot,
+) -> Result<u64, StorageError> {
     fail_point::pause("snapshot.install", snap_path).await;
-    if let Err(err) = rename(&staged.tmp_path, snap_path).await {
-        staged.discard().await;
+    if let Err(err) = files.rename(&staged.tmp_path, snap_path).await {
+        staged.discard(files).await;
         return Err(err.into());
     }
-    sync_parent(snap_path).await?;
+    sync_parent(files, snap_path).await?;
     Ok(staged.compressed_len)
 }
 
 /// Renames a staged snapshot that replaces the whole room (see `apply_snapshot`) over
 /// `room_{id}.snap`. Must run under the room's WAL mutex, followed by
 /// [`install_applied_snapshot`]. A failed rename changes nothing on disk.
-pub(crate) async fn rename_staged_snapshot(
-    room: &DiskRoom,
+pub(crate) async fn rename_staged_snapshot<F: RoomFiles>(
+    room: &DiskRoom<F>,
     staged: &StagedSnapshot,
 ) -> Result<(), StorageError> {
     fail_point::check("apply_snapshot.rename", &room.wal_path)?;
-    let (from, to, key) = (
-        staged.tmp_path.clone(),
-        room.snap_path.clone(),
-        room.wal_path.clone(),
-    );
+    let key = room.wal_path.clone();
     run_blocking(move || {
         fail_point::pause_blocking("apply_snapshot.rename", &key);
-        std::fs::rename(from, to)
+        Ok::<_, StorageError>(())
     })
-    .await
+    .await?;
+    Ok(room.files.rename(&staged.tmp_path, &room.snap_path).await?)
 }
 
 /// Completes the installation of a snapshot renamed by [`rename_staged_snapshot`]: syncs the
@@ -508,18 +522,19 @@ pub(crate) async fn rename_staged_snapshot(
 ///
 /// A snapshot behind the room would break the second window (records between the two
 /// sequence numbers would be replayed on top of it), which is why `apply_snapshot` rejects it.
-pub(crate) async fn install_applied_snapshot(
-    room: &DiskRoom,
-    wal: &mut DiskWal,
+pub(crate) async fn install_applied_snapshot<F: RoomFiles>(
+    room: &DiskRoom<F>,
+    wal: &mut DiskWal<F>,
 ) -> Result<(), StorageError> {
-    sync_parent(&room.snap_path).await?;
+    let files = &*room.files;
+    sync_parent(files, &room.snap_path).await?;
     fail_point::check("apply_snapshot.truncate", &room.wal_path)?;
 
     truncate_wal(wal, &room.wal_path).await?;
 
     let wal_compacting_path = compacting_wal_path(&room.wal_path);
-    remove_if_exists(&wal_compacting_path).await?;
-    sync_parent(&wal_compacting_path).await?;
+    remove_if_exists(files, &wal_compacting_path).await?;
+    sync_parent(files, &wal_compacting_path).await?;
 
     tracing::info!(
         snap_path = ?room.snap_path,
@@ -529,51 +544,24 @@ pub(crate) async fn install_applied_snapshot(
     Ok(())
 }
 
-pub(crate) async fn remove_if_exists(path: &Path) -> Result<(), StorageError> {
-    let path = path.to_path_buf();
-    run_blocking(move || {
-        fail_point::pause_blocking("remove", &path);
-        match std::fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        }
-    })
-    .await
-}
-
-/// What [`sync_file`] makes durable.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum SyncKind {
-    /// The file's data (`fdatasync`), enough for an append.
-    Data,
-    /// The file's data and metadata (`fsync`).
-    All,
-}
-
-/// Makes what was written through `file` durable, and reports any error of those writes.
-///
-/// Tokio's `write_all` returns once the bytes are handed to the blocking pool. Its `sync_data`
-/// and `sync_all` wait for that write, but keep its error for a later `flush` or write and sync
-/// successfully, so a batch could be acknowledged without being on disk. `flush` reports the
-/// error. Every sync of a Tokio file in this crate goes through here.
-#[allow(clippy::disallowed_methods)]
-pub(crate) async fn sync_file(file: &mut File, kind: SyncKind) -> std::io::Result<()> {
-    file.flush().await?;
-    match kind {
-        SyncKind::Data => file.sync_data().await,
-        SyncKind::All => file.sync_all().await,
+/// Removes the file `path`, if there is one.
+pub(crate) async fn remove_if_exists(
+    files: &impl RoomFiles,
+    path: &Path,
+) -> Result<(), StorageError> {
+    match files.remove(path).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
     }
 }
 
 /// Syncs the directory holding `path`, so that a rename, creation or removal in it is
-/// durable. The directory sync blocks, so it runs on Tokio's blocking pool, like the
-/// `tokio::fs` operations around it, instead of stalling a worker thread.
-pub(crate) async fn sync_parent(path: &Path) -> Result<(), StorageError> {
+/// durable.
+pub(crate) async fn sync_parent(files: &impl RoomFiles, path: &Path) -> Result<(), StorageError> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    let parent = parent.to_path_buf();
-    run_blocking(move || sync_dir(&parent)).await
+    Ok(files.sync_dir(parent).await?)
 }
 
 #[cfg(test)]

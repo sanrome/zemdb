@@ -192,24 +192,22 @@ pub(crate) fn io_result<T>(
     result
 }
 
-/// Replaces `file`, open on `file_path`, with a read-only handle of the same file if the fail
-/// point `name` is armed for `path`. The writes that follow are accepted by `write_all` and then
-/// fail on the blocking pool, as on a full disk. Writes already issued through `file` complete
-/// first.
+/// Replaces `file`, open on `file_path`, with a handle of the same file opened for reading
+/// through `files` if the fail point `name` is armed for `path`: the writes that follow fail, as
+/// on a full disk.
 ///
 /// Dropping the replaced handle releases any lock it held, such as the room's exclusive lock on
 /// its WAL; only tests that arm this point are affected.
 #[inline(always)]
-pub(crate) async fn read_only_handle(
+pub(crate) async fn read_only_handle<F: crate::files::RoomFiles>(
     name: &'static str,
     path: &Path,
-    file: &mut tokio::fs::File,
+    files: &F,
+    file: &mut F::File,
     file_path: &Path,
 ) {
     if check(name, path).is_err() {
-        use tokio::io::AsyncWriteExt;
-        file.flush().await.unwrap();
-        *file = tokio::fs::File::from_std(std::fs::File::open(file_path).unwrap());
+        *file = files.open_read(file_path).await.unwrap();
     }
 }
 

@@ -1,8 +1,7 @@
-use super::{absorbing_wal_path, compacting_wal_path, sync_file, SyncKind};
+use super::{absorbing_wal_path, compacting_wal_path};
 use crate::disk::tests::support::*;
 use crate::fail_point;
 use crate::{DiskStorageEngine, StorageEngine, StorageError};
-use tokio::io::AsyncWriteExt;
 use zemdb_core::{ColumnUpdate, Operation, PrimaryKey, RoomId, SequenceNumber, Value};
 
 async fn snapshot_seq(engine: &DiskStorageEngine, room: &RoomId) -> SequenceNumber {
@@ -59,6 +58,32 @@ async fn writes_after_failed_wal_rotation_stay_durable() {
     assert!(engine.compact_room(&room).await.is_err());
     apply_range(&engine, &room, 6..=10).await;
 
+    let reopened = reopen(engine, dir.path(), &room).await;
+    assert_rows(&reopened, &room, 10).await;
+}
+
+/// A file found where the rotation creates the fresh WAL is never adopted: the rotation fails and
+/// is rolled back, and every write before and after it survives.
+#[tokio::test]
+async fn rotation_never_adopts_a_file_in_place_of_the_fresh_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("rotation-finds-a-file").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    let wal_path = engine.wal_file_path(&room);
+    apply_range(&engine, &room, 1..=5).await;
+
+    let mut renamed = fail_point::arm_pause("compaction.rotate_renamed", &wal_path);
+    let compaction = spawn_compaction(&engine, &room);
+    renamed.reached().await;
+    std::fs::write(&wal_path, vec![0xFF; 4096]).unwrap();
+    renamed.release();
+    let result = compaction.await.unwrap();
+    assert!(
+        matches!(&result, Err(StorageError::Io(err)) if err.kind() == std::io::ErrorKind::AlreadyExists),
+        "{result:?}"
+    );
+
+    apply_range(&engine, &room, 6..=10).await;
     let reopened = reopen(engine, dir.path(), &room).await;
     assert_rows(&reopened, &room, 10).await;
 }
@@ -247,31 +272,6 @@ async fn failed_directory_sync_after_absorbing_marks_room_failed_until_reopened(
     assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_len);
     let reopened = reopen(engine, dir.path(), &room).await;
     assert_rows(&reopened, &room, 10).await;
-}
-
-#[tokio::test]
-async fn sync_file_reports_a_write_that_failed_in_the_background() {
-    for kind in [SyncKind::Data, SyncKind::All] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("read-only");
-        std::fs::write(&path, b"").unwrap();
-        let mut file = tokio::fs::File::open(&path).await.unwrap();
-
-        // `write_all` returns before the write runs; the write then fails on the blocking pool.
-        // On Windows the sync of a read-only handle fails by itself, flush or not; the failed
-        // write is only what reaches the sync on the other platforms.
-        let result = async {
-            file.write_all(b"hello").await?;
-            sync_file(&mut file, kind).await
-        }
-        .await;
-
-        assert!(
-            result.is_err(),
-            "{kind:?} sync reported a failed write as durable"
-        );
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
-    }
 }
 
 /// Name of every row a room holds after `failed_phase3_step_loses_no_batch`, by key: batches

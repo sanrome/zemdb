@@ -5,8 +5,9 @@ use zemdb_core::mutation::Operation;
 use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::protocol::wal_frame::{
     decode_batch_payload, decode_wal_batch_from_slice, encode_wal_batch, find_valid_frame,
-    parse_batch_header, replay_wal_records, BatchPayloadDecode, FrameAnomaly, InvalidHeader,
-    WalBatchDecodeResult, WalFrameError, BATCH_HEADER_SIZE, BATCH_MAGIC,
+    parse_batch_header, replay_wal_records, BatchPayloadDecode, FrameAnomaly, FrameSearch,
+    FrameSearchStep, InvalidHeader, WalBatchDecodeResult, WalFrameError, BATCH_HEADER_SIZE,
+    BATCH_MAGIC,
 };
 use zemdb_core::value::{CompactRow, PrimaryKey, Value};
 
@@ -237,6 +238,75 @@ fn search_finds_frames_across_window_edges() {
         let found = find_valid_frame(&mut Cursor::new(&log), 0, log.len() as u64).unwrap();
         assert_eq!(found, Some(start as u64), "frame at {start}");
     }
+}
+
+/// Runs a [`FrameSearch`] over `log`, checking that each read it asks for lies within
+/// `from..end`, and returns its result and how many reads it asked for.
+fn search_by_steps(log: &[u8], from: u64, end: u64) -> (Option<u64>, usize) {
+    let mut search = FrameSearch::new(from, end);
+    let mut reads = 0;
+    loop {
+        match search.step() {
+            FrameSearchStep::Read { offset, len } => {
+                assert!(
+                    offset >= from && offset + len as u64 <= end,
+                    "{offset}+{len}"
+                );
+                search.feed(&log[offset as usize..][..len]);
+                reads += 1;
+            }
+            FrameSearchStep::Done(found) => return (found, reads),
+        }
+    }
+}
+
+#[test]
+fn search_by_steps_finds_what_the_reader_search_finds() {
+    let small = delete_frame(2);
+    // A payload of several chunks, valid and damaged.
+    let large = bytes_frame(3, &vec![0x33; 200 * 1024]);
+    let mut damaged_large = large.clone();
+    *damaged_large.last_mut().unwrap() ^= 0xFF;
+    let mut logs = Vec::new();
+    for start in [0, 7, 64 * 1024 - 5, 64 * 1024, 64 * 1024 + 3, 3 * 64 * 1024] {
+        for frame in [&small, &large, &damaged_large] {
+            let mut log = vec![0x55u8; start];
+            log.extend_from_slice(frame);
+            logs.push(log.clone());
+            log.extend_from_slice(&small);
+            logs.push(log);
+        }
+    }
+    for log in &logs {
+        let end = log.len() as u64;
+        for from in [
+            0,
+            1,
+            end / 2,
+            end.saturating_sub(BATCH_HEADER_SIZE as u64),
+            end,
+        ] {
+            let expected = find_valid_frame(&mut Cursor::new(log), from, end).unwrap();
+            let (found, _) = search_by_steps(log, from, end);
+            assert_eq!(found, expected, "log of {end} bytes from {from}");
+        }
+    }
+
+    // The large payload is checksummed a chunk at a time: one window and four chunks.
+    let (found, reads) = search_by_steps(&large, 0, large.len() as u64);
+    assert_eq!(found, Some(0));
+    assert_eq!(reads, 5);
+    let (found, _) = search_by_steps(&damaged_large, 0, damaged_large.len() as u64);
+    assert_eq!(found, None);
+}
+
+#[test]
+#[should_panic(expected = "fed a window of the wrong length")]
+fn search_by_steps_refuses_bytes_of_another_length() {
+    let frame = delete_frame(2);
+    let mut search = FrameSearch::new(0, frame.len() as u64);
+    assert!(matches!(search.step(), FrameSearchStep::Read { .. }));
+    search.feed(&frame[1..]);
 }
 
 #[test]

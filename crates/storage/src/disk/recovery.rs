@@ -1,26 +1,26 @@
-use std::io::SeekFrom;
 use std::path::Path;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, BufReader};
+use tokio::io::{AsyncReadExt, BufReader};
 
 use zemdb_core::{
-    decode_batch_payload, find_valid_frame, parse_batch_header, BatchPayloadDecode, FrameAnomaly,
-    RoomId, Schema, SequenceNumber, BATCH_HEADER_SIZE,
+    decode_batch_payload, parse_batch_header, BatchPayloadDecode, FrameAnomaly, FrameSearch,
+    FrameSearchStep, RoomId, Schema, SequenceNumber, BATCH_HEADER_SIZE,
 };
 
 use crate::disk::compactor::{
-    absorbing_wal_path, compacting_wal_path, remove_if_exists, sync_file, sync_parent,
-    write_empty_snapshot_file, write_snapshot_file, SyncKind,
+    absorbing_wal_path, compacting_wal_path, remove_if_exists, sync_parent,
+    write_empty_snapshot_file, write_snapshot_file,
 };
 use crate::disk::format::{FileHeader, HEADER_SIZE};
 use crate::error::StorageError;
 use crate::fail_point;
+use crate::files::{RoomFile, RoomFiles};
 use crate::memory::state::{apply_operation, RoomData, RoomSnapshotPayload};
 use crate::sys::run_blocking;
 
 /// Recovery result containing the reconstructed in-memory state and the open WAL file handle.
 #[derive(Debug)]
-pub(crate) struct RecoveredRoom {
-    pub wal_file: tokio::fs::File,
+pub(crate) struct RecoveredRoom<W> {
+    pub wal_file: W,
     pub head_seq: SequenceNumber,
     pub snapshot_seq: SequenceNumber,
     pub snapshot_len: u64,
@@ -36,45 +36,78 @@ struct WalReplayOutcome {
     applied_count: usize,
 }
 
-/// Reads until `buf` is full or the reader reaches its end, and returns the bytes read. A single
-/// `read` may return fewer bytes than are left (for example at the edge of a buffer), so a short
-/// read alone does not mean the end of the file.
-async fn read_full<R: AsyncRead + Unpin>(reader: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        let n = reader.read(&mut buf[filled..]).await?;
-        if n == 0 {
-            break;
+/// Bytes a replay reads from a WAL at a time, at least.
+const REPLAY_WINDOW: usize = 64 * 1024;
+
+/// Reads a file of the layer from the start, a window of at least [`REPLAY_WINDOW`] bytes at a
+/// time, so that the replay of a WAL of small frames does not take a file operation per frame.
+struct WindowedReader<'a, W> {
+    file: &'a W,
+    file_len: u64,
+    window: Vec<u8>,
+    window_start: u64,
+}
+
+impl<'a, W: RoomFile> WindowedReader<'a, W> {
+    fn new(file: &'a W, file_len: u64) -> Self {
+        Self {
+            file,
+            file_len,
+            window: Vec::new(),
+            window_start: 0,
         }
-        filled += n;
     }
-    Ok(filled)
+
+    /// The `len` bytes at `offset`, which end at or before `file_len`.
+    async fn read(&mut self, offset: u64, len: usize) -> std::io::Result<&[u8]> {
+        let window_end = self.window_start + self.window.len() as u64;
+        if offset < self.window_start || offset + len as u64 > window_end {
+            let wanted = (len.max(REPLAY_WINDOW) as u64).min(self.file_len - offset);
+            self.window = self.file.read_at(offset, wanted as usize).await?;
+            self.window_start = offset;
+        }
+        let start = (offset - self.window_start) as usize;
+        Ok(&self.window[start..start + len])
+    }
+}
+
+/// Finds the first complete valid frame of `file` that starts at or after `from` and ends at or
+/// before `end` (see [`find_valid_frame`]), reading what the search asks for with `read_at`: a
+/// window, or a chunk of a payload, at a time.
+///
+/// [`find_valid_frame`]: zemdb_core::find_valid_frame
+async fn find_valid_frame_in(
+    file: &impl RoomFile,
+    from: u64,
+    end: u64,
+) -> std::io::Result<Option<u64>> {
+    let mut search = FrameSearch::new(from, end);
+    loop {
+        match search.step() {
+            FrameSearchStep::Read { offset, len } => search.feed(&file.read_at(offset, len).await?),
+            FrameSearchStep::Done(found) => return Ok(found),
+        }
+    }
 }
 
 /// Classifies an anomaly found at `frame_start` of `file` (see [`FrameAnomaly`]), searching
-/// the rest of the file for a valid frame on a blocking thread. Returns the reason of a torn
-/// write, or the corruption as an error.
+/// the rest of the file for a valid frame. Returns the reason of a torn write, or the
+/// corruption as an error.
 async fn classify_anomaly(
-    file: &tokio::fs::File,
+    file: &impl RoomFile,
     frame_start: u64,
     file_len: u64,
     anomaly: FrameAnomaly,
 ) -> Result<String, StorageError> {
     let from = frame_start.saturating_add(anomaly.search_offset());
-    let following = if file_len.saturating_sub(from) < BATCH_HEADER_SIZE as u64 {
-        None
-    } else {
-        // The clone shares the file position, which the caller sets again before any other use.
-        let mut search_file = file.try_clone().await?.into_std().await;
-        run_blocking(move || find_valid_frame(&mut search_file, from, file_len)).await?
-    };
+    let following = find_valid_frame_in(file, from, file_len).await?;
     Ok(anomaly.classify(following)?)
 }
 
 /// Replays the framed batches of one WAL file on top of `data`, advancing `head_seq`.
 ///
-/// The file is streamed rather than read into memory, and each frame is decoded with the
-/// primitives of `zemdb_core::protocol::wal_frame`, so a torn write at the end of the file is
+/// The file is read a window at a time rather than all at once, and each frame is decoded with
+/// the primitives of `zemdb_core::protocol::wal_frame`, so a torn write at the end of the file is
 /// told apart from corruption exactly as `decode_wal_batch_from_slice` does: a frame that
 /// cannot be read ends the valid part of the file, unless a valid frame follows it, which is
 /// corruption.
@@ -88,7 +121,7 @@ async fn classify_anomaly(
 /// records are consumed too.
 async fn replay_wal_file(
     room_id: &RoomId,
-    file: &mut tokio::fs::File,
+    file: &impl RoomFile,
     schema: &Schema,
     head_seq: &mut SequenceNumber,
     data: &mut RoomData,
@@ -96,29 +129,30 @@ async fn replay_wal_file(
     let mut valid_bytes: u64 = 0;
     let mut applied_count: usize = 0;
 
-    let file_len = file.metadata().await?.len();
-    file.seek(SeekFrom::Start(0)).await?;
-    let mut reader = BufReader::with_capacity(64 * 1024, &mut *file);
+    let file_len = file.size().await?;
+    let mut reader = WindowedReader::new(file, file_len);
 
     let anomaly = loop {
-        let mut header_buf = [0u8; BATCH_HEADER_SIZE];
-        let header_read = read_full(&mut reader, &mut header_buf).await?;
-        if header_read == 0 {
+        let available = file_len - valid_bytes;
+        if available == 0 {
             break None;
         }
-        if header_read < BATCH_HEADER_SIZE {
+        if available < BATCH_HEADER_SIZE as u64 {
             break Some(FrameAnomaly::IncompleteHeader {
-                available: header_read,
+                available: available as usize,
             });
         }
 
-        let header = match parse_batch_header(&header_buf) {
+        let header_buf = reader.read(valid_bytes, BATCH_HEADER_SIZE).await?;
+        let header_buf = header_buf
+            .try_into()
+            .expect("the reader returns the length asked for");
+        let header = match parse_batch_header(header_buf) {
             Ok(header) => header,
             Err(invalid) => break Some(FrameAnomaly::InvalidHeader(invalid)),
         };
 
         // Checked before reading so that a frame cut short does not allocate its whole length.
-        let available = file_len - valid_bytes;
         if available < header.frame_len() as u64 {
             break Some(FrameAnomaly::TruncatedPayload {
                 available,
@@ -126,10 +160,11 @@ async fn replay_wal_file(
             });
         }
 
-        let mut payload = vec![0u8; header.payload_len()];
-        reader.read_exact(&mut payload).await?;
+        let payload = reader
+            .read(valid_bytes + BATCH_HEADER_SIZE as u64, header.payload_len())
+            .await?;
 
-        let ops = match decode_batch_payload(&header, &payload)? {
+        let ops = match decode_batch_payload(&header, payload)? {
             BatchPayloadDecode::Batch { ops, .. } => ops,
             BatchPayloadDecode::ChecksumMismatch { expected, actual } => {
                 break Some(FrameAnomaly::ChecksumMismatch {
@@ -209,6 +244,7 @@ fn ensure_known_table(
 /// A new room has none: an empty one is staged in a temporary file and renamed into place, so a
 /// failure or crash never leaves a partial snapshot behind.
 async fn load_snapshot(
+    files: &impl RoomFiles,
     room_id: &RoomId,
     snap_path: &Path,
     schema: &Schema,
@@ -225,12 +261,12 @@ async fn load_snapshot(
     let snap_exists = fail_point::io_result(
         "recovery.snapshot_exists",
         snap_path,
-        tokio::fs::try_exists(snap_path).await,
+        files.exists(snap_path).await,
     )?;
     if !snap_exists {
-        // The rename would replace a snapshot, but there is none: `try_exists` said so, and the
+        // The rename would replace a snapshot, but there is none: `exists` said so, and the
         // room's lock keeps out any other engine that could create one.
-        write_empty_snapshot_file(snap_path, room_id).await?;
+        write_empty_snapshot_file(files, snap_path, room_id).await?;
         return Ok(base);
     }
 
@@ -308,21 +344,20 @@ async fn load_snapshot(
 ///
 /// The cleanup is best effort: if the directory cannot be listed, the files stay until a later
 /// open removes them. Failing to remove a file that was found is an error.
-async fn remove_staged_snapshots(snap_path: &Path) -> Result<(), StorageError> {
+async fn remove_staged_snapshots(
+    files: &impl RoomFiles,
+    snap_path: &Path,
+) -> Result<(), StorageError> {
     let Some(parent) = snap_path.parent() else {
-        return Ok(());
-    };
-    let Ok(mut entries) = tokio::fs::read_dir(parent).await else {
         return Ok(());
     };
     let snap_file_name = snap_path.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let tmp_prefix = format!("{snap_file_name}.tmp.");
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if let Ok(name) = entry.file_name().into_string() {
-            if name.starts_with(&tmp_prefix) {
-                remove_if_exists(&entry.path()).await?;
-            }
-        }
+    let Ok(staged) = files.list(parent, &tmp_prefix).await else {
+        return Ok(());
+    };
+    for path in staged {
+        remove_if_exists(files, &path).await?;
     }
     Ok(())
 }
@@ -330,14 +365,15 @@ async fn remove_staged_snapshots(snap_path: &Path) -> Result<(), StorageError> {
 /// Replays the records of a rotated WAL (`room_{id}.wal.compacting`) left by an interrupted
 /// compaction beyond the state recovered so far, and returns whether it held any such record.
 async fn replay_compacting_wal(
+    files: &impl RoomFiles,
     room_id: &RoomId,
     wal_compacting_path: &Path,
     schema: &Schema,
     head_seq: &mut SequenceNumber,
     data: &mut RoomData,
 ) -> Result<bool, StorageError> {
-    let mut compacting_file = tokio::fs::File::from_std(std::fs::File::open(wal_compacting_path)?);
-    let outcome = replay_wal_file(room_id, &mut compacting_file, schema, head_seq, data).await?;
+    let compacting_file = files.open_read(wal_compacting_path).await?;
+    let outcome = replay_wal_file(room_id, &compacting_file, schema, head_seq, data).await?;
     if let Some(reason) = outcome.torn_write {
         tracing::warn!(
             room_id = %room_id,
@@ -354,39 +390,41 @@ async fn replay_compacting_wal(
 ///    (`room_{id}.wal.compacting.tmp`) left behind.
 /// 2. If a pre-crash rotated WAL (`room_{id}.wal.compacting`) exists, replays the records it
 ///    holds beyond the snapshot.
-/// 3. Streams and replays all framed WAL batches from `wal_path` (`room_{id}.wal`),
+/// 3. Reads and replays all framed WAL batches from `wal_path` (`room_{id}.wal`),
 ///    applying mutations on top of tables and advancing `head_seq`, and truncates any
 ///    incomplete torn write at WAL EOF.
 /// 4. Folds `.wal.compacting` away without ever rewriting a file in place: if it held live
 ///    records, writes a fresh snapshot of the recovered state through the atomic path, then
 ///    empties the active WAL; only then removes `.wal.compacting`. A crash at any step leaves
 ///    files that a later recovery replays to the same state.
-#[tracing::instrument(skip(schema, wal_file_std), fields(room_id = %room_id, snap_path = ?snap_path, wal_path = ?wal_path))]
-pub(crate) async fn recover_room(
+#[tracing::instrument(skip(files, schema, wal_file), fields(room_id = %room_id, snap_path = ?snap_path, wal_path = ?wal_path))]
+pub(crate) async fn recover_room<F: RoomFiles>(
+    files: &F,
     room_id: &RoomId,
     snap_path: &Path,
     wal_path: &Path,
     schema: &Schema,
-    wal_file_std: std::fs::File,
+    wal_file: F::File,
     zstd_level: i32,
-) -> Result<RecoveredRoom, StorageError> {
+) -> Result<RecoveredRoom<F::File>, StorageError> {
     // 1. Load the base snapshot
     let BaseSnapshot {
         mut data,
         mut snapshot_seq,
         mut head_seq,
         mut snapshot_len,
-    } = load_snapshot(room_id, snap_path, schema).await?;
+    } = load_snapshot(files, room_id, snap_path, schema).await?;
     fail_point::pause("recovery.snapshot_loaded", wal_path).await;
-    remove_staged_snapshots(snap_path).await?;
+    remove_staged_snapshots(files, snap_path).await?;
     // Its records are all in `.wal.compacting` and the active WAL, which it never replaced.
-    remove_if_exists(&absorbing_wal_path(wal_path)).await?;
+    remove_if_exists(files, &absorbing_wal_path(wal_path)).await?;
 
     // 2. Replay a pre-crash rotated WAL (`room_{id}.wal.compacting`), if any
     let wal_compacting_path = compacting_wal_path(wal_path);
-    let compacting_exists = tokio::fs::try_exists(&wal_compacting_path).await?;
+    let compacting_exists = files.exists(&wal_compacting_path).await?;
     let compacting_has_live_records = compacting_exists
         && replay_compacting_wal(
+            files,
             room_id,
             &wal_compacting_path,
             schema,
@@ -396,8 +434,7 @@ pub(crate) async fn recover_room(
         .await?;
 
     // 3. Replay append-only WAL batches from wal_path
-    let mut wal_file = tokio::fs::File::from_std(wal_file_std);
-    let outcome = replay_wal_file(room_id, &mut wal_file, schema, &mut head_seq, &mut data).await?;
+    let outcome = replay_wal_file(room_id, &wal_file, schema, &mut head_seq, &mut data).await?;
     let mut valid_wal_bytes = outcome.valid_bytes;
 
     // Truncate torn write at WAL EOF if detected
@@ -412,30 +449,34 @@ pub(crate) async fn recover_room(
     // An earlier open may have written records whose sync failed: none is served before this
     // process syncs them. What `.wal.compacting` holds is synced below, in the folded snapshot.
     fail_point::check("recovery.wal_sync", wal_path)?;
-    sync_file(&mut wal_file, SyncKind::All).await?;
+    wal_file.sync_all().await?;
     fail_point::panic_point("recovery.replayed", wal_path);
 
     // 4. Fold the rotated WAL into a fresh snapshot, then remove it
     if compacting_exists {
         if compacting_has_live_records {
-            snapshot_len =
-                write_snapshot_file(snap_path, head_seq, data.tables(), zstd_level, room_id)
-                    .await?;
+            snapshot_len = write_snapshot_file(
+                files,
+                snap_path,
+                head_seq,
+                data.tables(),
+                zstd_level,
+                room_id,
+            )
+            .await?;
             snapshot_seq = head_seq;
             fail_point::check("recovery.fold", wal_path)?;
 
             // The snapshot now holds every record of the active WAL as well.
             wal_file.set_len(0).await?;
-            sync_file(&mut wal_file, SyncKind::All).await?;
+            wal_file.sync_all().await?;
             valid_wal_bytes = 0;
         }
 
         fail_point::check("recovery.fold_cleanup", wal_path)?;
-        remove_if_exists(&wal_compacting_path).await?;
-        sync_parent(&wal_compacting_path).await?;
+        remove_if_exists(files, &wal_compacting_path).await?;
+        sync_parent(files, &wal_compacting_path).await?;
     }
-
-    wal_file.seek(SeekFrom::End(0)).await?;
 
     tracing::info!(
         room_id = %room_id,

@@ -2,7 +2,7 @@
 
 **Fecha:** 23 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lotes 0 a 7 cerrados; el próximo es el 8.
+**Estado:** En curso: Lotes 0 a 8 cerrados; el próximo es el 9.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.1. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -72,7 +72,7 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 | 5 | `reload_schema` | storage | DC5 | S7, C1, C2, C3, S6, K6 | ✅ |
 | 6 | Zstd en wasm32 con `ruzstd` | storage | DC9 | W1, W2, S5, K12 | ✅ |
 | 7 | Capa de archivos: el trait y su implementación nativa | storage | DC17 | L7 (el mecanismo de la capa) | ✅ |
-| 8 | Capa de archivos: el motor sobre ella, el WAL y el directorio | storage (y core, si cambia `find_valid_frame`) | DC8, DC17 | S1 a S6, L7 | ⬜ |
+| 8 | Capa de archivos: el motor sobre ella, el WAL y el directorio | storage, core (`FrameSearch`) | DC8, DC17 | S1 a S6, L7 | ✅ |
 | 9 | Capa de archivos: los snapshots y la rotación | storage | DC17 | S1, S3, S5 | ⬜ |
 | 10 | Cierre | Documentos | Todas | Todas las tocadas | ⬜ |
 
@@ -542,7 +542,7 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
   - Los chequeos comunes del cuerpo (un frame, sin saltables, diccionario ni datos después) no estaban en el plan: sin ellos los dos decodificadores aceptaban cuerpos distintos (libzstd, varios frames; `ruzstd`, datos después del suyo), y `ruzstd` no verifica el checksum ni el tamaño declarado. En nativo rechazan cuerpos que libzstd aceptaba, que ningún codificador del repo escribe.
   - La función de compresión es `ZstdCodec::compress` y no una función suelta: los tests eligen el códec por su tipo.
 
-### Lotes 7 a 9 · La capa de archivos (`zemdb-storage`) · Lote 7 ✅
+### Lotes 7 a 9 · La capa de archivos (`zemdb-storage`) · Lotes 7 y 8 ✅
 **Requisito para empezar:** DC17, adoptada el 23 de Octubre de 2026.
 
 **Objetivo:** que ninguna parte de `crates/storage/src/disk/` fuera de la implementación nativa del trait use `std::fs`, `tokio::fs` ni `fs2`, sin cambiar el comportamiento del motor en disco.
@@ -551,7 +551,7 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 
 **Corte** (lo fijó el Lote 7; el tentativo ponía en el 7 también el motor genérico, el append, `close_room` y el directorio, en el 8 la recuperación y en el 9 la compactación):
 - **Lote 7 · El trait y su implementación nativa.** ✅ El trait de DC17 y su implementación sobre `std::fs` y `fs2` en el pool bloqueante, con el `Arc` del archivo y el permiso del handle, en `crates/storage/src/files/`. El motor todavía no la usa. El corte cambió porque el handle del WAL es el mismo objeto en `disk/mod.rs`, `compactor.rs` y `recovery.rs`: pasar solo el append a la capa cambia su tipo, así que el replay del WAL, el truncado, la lectura de la absorción y el WAL nuevo de la rotación van con él. El trait y la nativa son unas 325 líneas de código (sin comentarios ni líneas en blanco), y el motor sobre ellas unas 250: juntos pasaban las ~300 de un lote (`docs/METODOLOGIA.md` §4).
-- **Lote 8 · El motor sobre la capa: el WAL y el directorio.** `DiskStorageEngine<F = NativeFiles>`, con `new` en el `impl` de la nativa y otro constructor que recibe la capa; `DiskRoom` y `DiskWal` guardan el archivo de la capa. Pasan a la capa: abrir y bloquear los archivos de la sala; toda operación sobre el handle del WAL (el append de `apply_batch`, el sync de `close_room` y el de antes de compactar, la lectura de la absorción, el truncado, el WAL nuevo de la rotación y, en la recuperación, el replay del WAL y de `.wal.compacting` con `read_at` en lugar de un `BufReader` con posición, su truncado y su sync), y las operaciones de directorio (crear el directorio, sincronizarlo, ver si existe un archivo, borrar, renombrar por ruta y listar). `WalWriter::write_batch` y `write_record` dejan de tomar un `tokio::fs::File`; el fail point `read_only_handle` se adapta; `sync_file` y el `clippy.toml` de los syncs de `tokio::fs` se van. Las pausas bloqueantes que hoy corren dentro de una operación de archivo en el pool (`remove`, que `NativeFiles::remove` ya conserva, y `apply_snapshot.rename`, con la ruta del WAL como clave) siguen en el mismo paso y con el mismo nombre. La búsqueda de un frame válido después de una anomalía usa `find_valid_frame` de `zemdb-core`, que toma un `Read + Seek` síncrono y hoy corre en el pool bloqueante sobre un clon del handle: o un adaptador en `zemdb-storage`, o `find_valid_frame` pasa a un lector posicional en `zemdb-core` (y el lote toca `core`). Lo decide el lote, con su revisión de delta.
+- **Lote 8 · El motor sobre la capa: el WAL y el directorio.** ✅ `DiskStorageEngine<F = NativeFiles>`, con `new` en el `impl` de la nativa y otro constructor que recibe la capa; `DiskRoom` y `DiskWal` guardan el archivo de la capa. Pasan a la capa: abrir y bloquear los archivos de la sala; toda operación sobre el handle del WAL (el append de `apply_batch`, el sync de `close_room` y el de antes de compactar, la lectura de la absorción, el truncado, el WAL nuevo de la rotación y, en la recuperación, el replay del WAL y de `.wal.compacting` con `read_at` en lugar de un `BufReader` con posición, su truncado y su sync), y las operaciones de directorio (crear el directorio, sincronizarlo, ver si existe un archivo, borrar, renombrar por ruta y listar). `WalWriter::write_batch` y `write_record` dejan de tomar un `tokio::fs::File`; el fail point `read_only_handle` se adapta; `sync_file` y el `clippy.toml` de los syncs de `tokio::fs` se van. Las pausas bloqueantes que hoy corren dentro de una operación de archivo en el pool (`remove`, que `NativeFiles::remove` ya conserva, y `apply_snapshot.rename`, con la ruta del WAL como clave) siguen en el mismo paso y con el mismo nombre. La búsqueda de un frame válido después de una anomalía usa `find_valid_frame` de `zemdb-core`, que toma un `Read + Seek` síncrono y hoy corre en el pool bloqueante sobre un clon del handle: o un adaptador en `zemdb-storage`, o `find_valid_frame` pasa a un lector posicional en `zemdb-core` (y el lote toca `core`). Lo decide el lote, con su revisión de delta: fue la búsqueda posicional en `zemdb-core`, después de que la revisión mostrara que el adaptador anidaba hilos del pool (ver su nota **Hecho**).
 - **Lote 9 · Los archivos de los snapshots y la rotación.** `load_snapshot` (abrir para leer), el staging de snapshots (`.snap.tmp.*`, creados con su lock), la copia de una absorción (`.wal.compacting.tmp`, creada truncando), el snapshot vacío, la rotación del WAL y su vuelta atrás con el renombrar de un archivo abierto (sin cambiar su orden ni su lógica), y la compresión del `.snap` con la función del Lote 6. Con el test de la implementación que falla como el OPFS.
 
 **Tests exigidos** (los fija cada lote; como mínimo):
@@ -640,6 +640,91 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
   - `list` falla si no puede leer alguna entrada, en lugar de devolver lo leído hasta ahí. La limpieza de temporales del Lote 8 sigue siendo best effort.
   - Las operaciones toman rutas, como `std::fs`, y no nombres dentro del directorio: así los fail points siguen identificados por ruta. La implementación del OPFS las resuelve desde su raíz.
 
+**Lote 8 · Hecho** (24 de Octubre de 2026). El motor sobre la capa: todo lo que toca el handle del WAL y el directorio.
+- **storage:**
+  - `DiskStorageEngine<F: RoomFiles = NativeFiles>`: `new` en el `impl` de la nativa y `with_files`, que recibe la capa, con las mismas validaciones. `DiskRoom` guarda la capa (un `Arc`) y el archivo del `.lock`; `DiskWal` y `PendingWrite`, el archivo del WAL.
+  - Pasan a la capa:
+    - abrir y bloquear el `.lock` y el WAL (`open_locked`; `None` es `RoomLocked`);
+    - crear el directorio de datos y sincronizarlo con su padre;
+    - el append de `apply_batch`, con `write_at` en `len` (sin posición), y su `sync_data`;
+    - el `sync_all` de `close_room`, que espera la escritura de un `apply_batch` soltado y devuelve su error, y el de antes de compactar;
+    - en la rotación, ver si existe `.wal.compacting`, renombrar el WAL por ruta (el Lote 9 lo pasa al renombrar del handle), el WAL nuevo con `create_locked` y la vuelta atrás;
+    - la lectura de la absorción (`size` y `read_at`) y el vaciado del WAL (`set_len` y `sync_all`);
+    - los renames del `.snap` (fase 3, la instalación de un snapshot en staging y la de `apply_snapshot`), los borrados (`remove_if_exists`, `NotFound` incluido) y los syncs del directorio (`sync_parent`);
+    - en la recuperación: ver si existen el `.snap` y `.wal.compacting`; listar los `.snap.tmp.*` (sigue siendo best effort si no se puede listar); el replay del WAL y de `.wal.compacting` (abierto con `open_read`) con `read_at`, una ventana de al menos 64 KiB por vez (`WindowedReader`), para no hacer una operación por frame; el truncado del WAL, su sync y el del pliegue.
+  - **core:** la búsqueda de `find_valid_frame` pasa a `FrameSearch`, que no hace E/S: pide los bytes que necesita (`FrameSearchStep::Read`, una ventana del log o un trozo de un payload, que ahora es de 64 KiB en lugar de 8) y su llamador los lee como pueda (`feed`). `find_valid_frame` la maneja sobre un `Read + Seek`, con el mismo resultado, así que el log del servidor no cambia. La recuperación del storage la maneja con `read_at` en su propia tarea (`find_valid_frame_in`), sin pasar por el pool más que en cada lectura. Así tampoco depende de un pool bloqueante en wasm32 (4.5). La primera versión del lote era un adaptador `Read + Seek` en el storage que esperaba cada `read_at` con `Handle::block_on` desde el pool: cada búsqueda ocupaba dos hilos del pool a la vez, y con un solo hilo libre la apertura no terminaba (la revisión, ronda 1).
+  - `WalWriter::write_batch` y `write_record` toman un `&impl RoomFile` y el offset donde escribir.
+  - El fail point `read_only_handle` reemplaza el handle por uno de solo lectura abierto con la capa (`open_read`): la escritura que sigue falla en la misma llamada, en el mismo paso y con el mismo nombre.
+  - La pausa `apply_snapshot.rename` sigue entre su fail point y el rename, en el pool bloqueante y con la ruta del WAL como clave, ahora en una operación propia antes de `RoomFiles::rename`; `remove` sigue en `NativeFiles::remove`.
+  - Se van `sync_file`, `SyncKind` y `crates/storage/clippy.toml`, con el test de `sync_file` (su caso, un error en la misma llamada, lo prueba la capa desde el Lote 7).
+  - Siguen con `std::fs` y `fs2` hasta el Lote 9: abrir el `.snap`, el staging de snapshots y la copia de una absorción.
+  - **La capa (Lote 7), corregida:** `NativeFile::run` mandaba el resultado antes de soltar su referencia al archivo, así que quien soltaba el handle apenas recibía el resultado (`close_room` y una reapertura enseguida) podía encontrar el archivo todavía abierto, con su lock: `RoomLocked` en dos tests del motor. Ahora `Reply` guarda la referencia y la suelta antes de mandar el resultado, también cuando la operación entra en pánico.
+- **Tests:**
+  - `damaged_tail_recovers_with_a_single_blocking_thread`: la recuperación de una cola rota en un runtime con un solo hilo bloqueante termina (con el adaptador de la primera versión se colgaba).
+  - En core, `search_by_steps_finds_what_the_reader_search_finds` (con frames a los dos lados de las ventanas, un payload de varios trozos, entero y dañado, y varios puntos de partida; cada lectura pedida cae dentro del rango) y `search_by_steps_refuses_bytes_of_another_length`.
+  - INV-S1, en `tests/disk.rs`, con la escritura de un `apply_batch` soltado retenida en el pool (la pausa `file.write_at` de la capa, con la ruta del WAL): soltar el motor deja la sala en `RoomLocked` hasta que la escritura aterriza, y la reapertura la lee (`engine_dropped_during_a_write_keeps_the_room_until_the_write_lands`); `close_room` la espera, con la sala bloqueada mientras tanto (`close_waits_for_the_write_of_a_dropped_batch`); y devuelve su error si falló, y la sala reabre sin ella (`close_reports_the_failed_write_of_a_dropped_batch`). Reemplazan a `room_stays_locked_while_a_handle_of_its_wal_is_still_open`, que duplicaba el handle de `tokio::fs`.
+  - En la capa: `a_handle_dropped_once_its_operations_returned_releases_its_lock`, con una operación que termina y una que entra en pánico.
+  - `test_wal_writer_writes_at_its_offset_and_reports_a_failed_write` (integración) reemplaza al de la escritura de fondo de `WalWriter`.
+  - `windowed_reader_reads_across_the_edge_of_its_window`: lecturas dentro de la ventana, hasta su último byte, un byte más allá y más largas que una ventana.
+  - Tres reglas que ya estaban, sin test, y que ahora dependen de la capa (las encontró la mutación inversa): el WAL nuevo de la rotación nunca adopta un archivo que encuentra en su lugar (`rotation_never_adopts_a_file_in_place_of_the_fresh_wal`); el pliegue de `.wal.compacting` deja el WAL vacío en disco, como `len` en memoria, y un batch de otro tamaño no cae sobre registros viejos (`folding_a_rotated_wal_empties_the_active_wal`); y un WAL de varias ventanas de lectura, con un frame más grande que una ventana, se reproduce entero (`wal_of_many_read_windows_replays_every_batch`).
+  - `failed_background_wal_write_marks_room_failed_until_reopened` pasa a llamarse `failed_wal_write_marks_room_failed_until_reopened`: la escritura falla en la misma llamada.
+  - El resto de la suite del storage, sin cambios en sus expectativas: las imágenes de crash, la simulación del disco y las versiones largas.
+- **Mutaciones** (26; cada árbol compiló y algún test falló, salvo las dos anotadas abajo):
+  - `close_room` sin su sync;
+  - el append en el offset 0 en lugar de `len`;
+  - el fail point `read_only_handle` como no-op;
+  - el WAL nuevo de la rotación con `open_locked`, que adopta un archivo existente;
+  - la absorción que no lee el WAL, y el vaciado sin `set_len`;
+  - `remove_if_exists` sin tolerar `NotFound`;
+  - sin la pausa `apply_snapshot.rename`;
+  - `.wal.compacting` que nunca existe, en la compactación (la suite se cuelga y se corta por tiempo) y en la recuperación;
+  - los temporales de snapshot listados con otro prefijo;
+  - la ventana de lectura que no se recarga, una corrida un byte, y una más chica que el frame;
+  - la búsqueda de un frame válido desde el principio del archivo, en lugar de después de la anomalía;
+  - en `FrameSearch`: el trozo de payload que no avanza, la ventana siguiente que saltea las últimas posiciones, los chequeos de payload que nunca se agotan, sin exigir que el frame termine antes del final, y sin chequear el payload;
+  - la recuperación sin truncar la cola rota, y el pliegue sin vaciar el WAL;
+  - la capa que suelta el archivo después del resultado;
+  - sin el `Arc` del archivo en la operación de la capa (reabriéndolo por ruta): mueren `engine_dropped_during_a_write_keeps_the_room_until_the_write_lands` y `close_reports_the_failed_write_of_a_dropped_batch` (este porque el archivo reabierto se puede escribir); `close_waits_for_the_write_of_a_dropped_batch` pasa, porque lo sostiene el permiso.
+
+  Sin test determinista: el append sin su `sync_data`, la apertura sin los syncs del directorio (dejando su fail point) y esos syncs antes de tomar los locks (como en `main`), que solo se ven en un corte de luz.
+- **Checklist de crash-safety:**
+  - ninguna operación de archivo cambia de orden respecto de las demás ni de lugar respecto de los locks: la apertura toma los dos locks y sincroniza los directorios en el mismo orden, ahora en operaciones separadas de la misma tarea; el resto, uno a uno;
+  - una operación soltada nunca aterriza después de cerrar o reabrir la sala: los tres tests de INV-S1, y su mutación sin el `Arc` del archivo;
+  - cada sync sigue sobre el mismo archivo o directorio: `sync_data` del append, `sync_all` de `close_room`, de antes de compactar, del vaciado y de la recuperación (antes `sync_file`, que hacía `flush` primero; ahora la escritura ya terminó y su error vuelve en la misma llamada), y `sync_dir` en los mismos lugares; ningún resultado de E/S se descarta;
+  - cada fail point sigue en el mismo paso y con el mismo nombre, incluidas las pausas bloqueantes `remove` y `apply_snapshot.rename`, contadas en los planes de crash; las de la capa (`hold_blocking`) no se cuentan;
+  - las imágenes de crash y la simulación pasan sin cambios.
+- **Interacciones:**
+  - INV-S1 e INV-L7: la escritura de un `apply_batch` soltado retiene el archivo del WAL y su lock hasta que termina, y el sync de `close_room` la espera y devuelve su error (los tests de arriba). Lo que antes hacían el handle de `tokio::fs` y su `flush`.
+  - D86, D89 y D93: `open_room`, `apply_snapshot` y la compactación siguen en su propia tarea, con la capa en un `Arc` de la sala; sus tests de soltar el future en cada `.await` siguen pasando.
+  - `PendingWrite` y `RoomFailed`: la lectura fallida de la absorción y el vaciado fallido siguen marcando la sala, aunque sin posición ya no haya un cursor perdido (el comentario dice ahora por qué).
+  - El largo del WAL en memoria (`len`) es ahora el offset del append: la recuperación lo deja en los bytes válidos (truncando la cola rota), la rotación y el vaciado en 0, y un append fallido marca la sala.
+  - Los fail points por ruta: los de la capa usan la ruta del handle como clave, y el de `read_only_handle` reabre por la capa.
+  - `WalWriter` y `WalReader`, públicos: `WalWriter` cambia de firma (`GEMINI.md`: antes del primer release no hay compatibilidad que conservar); `WalReader` no cambia.
+  - La búsqueda de un frame válido usa un hilo del pool por lectura, como el resto de la recuperación, y ninguno mientras escanea: anda con un solo hilo bloqueante (el test de arriba). El escaneo y los CRC de los payloads corren en la tarea, de a una ventana o un trozo de 64 KiB por vez, como ya corría el CRC de cada frame del replay.
+  - `find_valid_frame` y el log del servidor (`segment_reader.rs`): el mismo resultado sobre la misma búsqueda; sus tests y los fuzzers de core pasan sin cambios.
+  - El `sync_data` fallido de un `apply_batch` soltado: su error lo devuelve ahora el `sync_all` de `close_room`, que no corre, así que `close_room` da `Err`. Antes el error del sync de Tokio se perdía y `close_room` podía dar `Ok`. La sala ya estaba fallida, y un `fsync` fallido no se reintenta.
+  - La rotación renombra por ruta el WAL abierto (hasta el Lote 9): la ruta que guarda el permiso del handle queda vieja hasta que el handle se reemplaza por el WAL nuevo, o la vuelta atrás lo devuelve a su nombre; solo la usan como clave los fail points de la capa.
+  - Windows: la absorción sigue leyendo el WAL con su propio handle bloqueado; ningún test nuevo lee un archivo que la sala tiene abierto.
+- **Chequeos:**
+  - fmt;
+  - clippy con `-D warnings`, nativo y de wasm32;
+  - test del workspace (1008);
+  - doc con `-D warnings`;
+  - el build de wasm32 de core, storage y client;
+  - `cargo test -p zemdb-core -p zemdb-storage -p zemdb-server --release -- --ignored`, en verde (48: el server, porque su log usa `find_valid_frame`).
+  - Windows no se chequea localmente (`zstd-sys` no compila sin mingw); lo corre la CI.
+- **Revisión de delta:** dos rondas.
+  1. **ROJO**, por un Medio y cuatro Bajos.
+     - El Medio: el adaptador de `find_valid_frame` anidaba dos hilos del pool por búsqueda, y la apertura de una sala con la cola rota no terminaba con un solo hilo bloqueante libre (un cambio de comportamiento). Se reemplazó por `FrameSearch` en core, con el test del revisor como regresión.
+     - Los Bajos: `ARCHITECTURE.md` decía que toda operación de archivo pasa por la capa, y que nada se renombra por ruta con un handle abierto, cuando hasta el Lote 9 la rotación lo hace (aclarado, y anotado en el código de la rotación); el `sync_data` fallido de un `apply_batch` soltado, que ahora devuelve `close_room`, y el temporal ilegible de `remove_staged_snapshots` (las dos anotadas arriba). También anotó que la búsqueda leía de a 8 KiB por ida y vuelta al pool, ahora de a 64 KiB.
+  2. **VERDE**, con cuatro Bajos. Comparó `FrameSearch` con el `find_valid_frame` de `main` en 4000 logs aleatorios (frames dañados, más de 16 payloads malos seguidos, payloads vacíos, bordes de ventana, `from > end` y `end` más allá del archivo), con el mismo resultado; mató nueve mutaciones de `FrameSearch` y las del storage de la nota, y confirmó que el test del pool de un hilo falla con la versión de la ronda 1. Los Bajos: el doc de `DiskStorageEngine`, que decía que todo pasa por la capa (corregido); `ARCHITECTURE.md`, que decía que una rotación rechazada se deshace, cuando falla antes de cambiar nada (corregido); el borde de `WindowedReader` sin test (`windowed_reader_reads_across_the_edge_of_its_window`, que mata la mutación de una lectura que termina un byte después de la ventana); y el orden de los syncs del directorio en la apertura, después de tomar los locks, sin test (anotado abajo).
+- **Desvíos:**
+  - La corrección de la capa del Lote 7 (arriba).
+  - El rename del WAL en la rotación pasa a la capa por ruta en este lote; el renombrar del handle queda para el 9, como estaba en el corte.
+  - `with_files` es el nombre del constructor que recibe la capa.
+  - `zemdb-core` cambia (`FrameSearch`), una de las dos opciones del corte.
+  - `remove_staged_snapshots`: como `list` falla si no puede leer alguna entrada (Lote 7), una entrada ilegible deja todos los temporales para la próxima apertura, en lugar de borrar los que se leyeron antes; la limpieza sigue siendo best effort.
+
 ### Lote 10 · Cierre · ⬜
 - La revisión de cierre de 4.1 (`docs/METODOLOGIA.md` §6), con las tres condiciones de `INVARIANTES.md` §1.4, sobre todo lo que tocó la sub-fase y los mecanismos con que interactúa. Si no sale en verde, sus rupturas se arreglan en lotes nuevos de 4.1 antes de abrir 4.2.
 - `INVARIANTES.md`: el estado de cada invariante tocada. El plan de la fase: 4.1 cerrada. `ROADMAP.md`: "Lo que sigue", 4.2.
@@ -649,4 +734,4 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 
 ## 3. Seguimiento
 
-**Avance:** Lote 0 cerrado el 23 de Octubre de 2026, con la revisión cruzada en verde en su quinta ronda; Lote 1 cerrado el mismo día. DC17 adoptada el 23 de Octubre, con renombrar un archivo abierto como operación del trait (el refactor de los Lotes 7 a 9 queda sin cambio de comportamiento). Lote 2 cerrado el 23 de Octubre. Lote 3 cerrado el 24 de Octubre, y los Lotes 4, 5, 6 y 7 el mismo día. El próximo es el Lote 8.
+**Avance:** Lote 0 cerrado el 23 de Octubre de 2026, con la revisión cruzada en verde en su quinta ronda; Lote 1 cerrado el mismo día. DC17 adoptada el 23 de Octubre, con renombrar un archivo abierto como operación del trait (el refactor de los Lotes 7 a 9 queda sin cambio de comportamiento). Lote 2 cerrado el 23 de Octubre. Lote 3 cerrado el 24 de Octubre, y los Lotes 4, 5, 6, 7 y 8 el mismo día. El próximo es el Lote 9.

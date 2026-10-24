@@ -298,6 +298,9 @@ const SEARCH_WINDOW: usize = 64 * 1024;
 /// make the search quadratic in the length of the log.
 const MAX_PAYLOAD_CHECKS: usize = 16;
 
+/// Bytes of a payload that a [`FrameSearch`] checksums at a time.
+const PAYLOAD_CHUNK: usize = 64 * 1024;
+
 /// Finds the first complete valid frame (magic, header checksum and payload checksum) that
 /// starts at or after `from` and ends at or before `end`, and returns where it starts.
 ///
@@ -310,66 +313,207 @@ const MAX_PAYLOAD_CHECKS: usize = 16;
 /// the header that was lost.
 ///
 /// The reader is scanned in windows and each payload is checksummed in chunks, so memory does
-/// not grow with the log or the frame. Its position afterwards is unspecified.
+/// not grow with the log or the frame. Its position afterwards is unspecified. A reader that
+/// cannot be read synchronously drives a [`FrameSearch`] instead.
 pub fn find_valid_frame<R: Read + Seek>(
     reader: &mut R,
     from: u64,
     end: u64,
 ) -> std::io::Result<Option<u64>> {
-    let mut window = vec![0u8; SEARCH_WINDOW + BATCH_HEADER_SIZE - 1];
-    let mut failed_checks = 0;
-    let mut start = from;
-    while end.saturating_sub(start) >= BATCH_HEADER_SIZE as u64 {
-        let len = (end - start).min(window.len() as u64) as usize;
-        reader.seek(SeekFrom::Start(start))?;
-        reader.read_exact(&mut window[..len])?;
+    let mut search = FrameSearch::new(from, end);
+    let mut buf = Vec::new();
+    loop {
+        match search.step() {
+            FrameSearchStep::Read { offset, len } => {
+                buf.resize(len, 0);
+                reader.seek(SeekFrom::Start(offset))?;
+                reader.read_exact(&mut buf)?;
+                search.feed(&buf);
+            }
+            FrameSearchStep::Done(found) => return Ok(found),
+        }
+    }
+}
 
+/// What a [`FrameSearch`] needs next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameSearchStep {
+    /// The `len` bytes of the log at `offset`, to hand over with [`FrameSearch::feed`]. They
+    /// end at or before the end of the search.
+    Read { offset: u64, len: usize },
+    /// The search is over: where the first complete valid frame starts, if there is one.
+    Done(Option<u64>),
+}
+
+/// The search of [`find_valid_frame`] without its reads: it asks for the bytes of the log it
+/// needs, a window or a chunk of a payload at a time, and its caller reads them however it can,
+/// for example asynchronously.
+#[derive(Debug)]
+pub struct FrameSearch {
+    end: u64,
+    failed_checks: usize,
+    /// Where `window` starts in the log.
+    start: u64,
+    window: Vec<u8>,
+    /// The next position of `window` that may start a frame.
+    next: usize,
+    state: SearchState,
+}
+
+#[derive(Debug)]
+enum SearchState {
+    /// The search needs the window at `start`.
+    NeedWindow,
+    /// The search scans `window` from `next`.
+    Scanning,
+    /// The search checksums the payload of the frame whose header is at `position`.
+    Checking {
+        position: u64,
+        expected: u32,
+        hasher: crc32fast::Hasher,
+        offset: u64,
+        remaining: usize,
+    },
+    Done(Option<u64>),
+}
+
+impl FrameSearch {
+    /// A search for the first complete valid frame that starts at or after `from` and ends at or
+    /// before `end`.
+    pub fn new(from: u64, end: u64) -> Self {
+        Self {
+            end,
+            failed_checks: 0,
+            start: from,
+            window: Vec::new(),
+            next: 0,
+            state: SearchState::NeedWindow,
+        }
+    }
+
+    /// The bytes the search needs next, or its result.
+    pub fn step(&mut self) -> FrameSearchStep {
+        loop {
+            match &mut self.state {
+                SearchState::NeedWindow => {
+                    if self.end.saturating_sub(self.start) < BATCH_HEADER_SIZE as u64 {
+                        self.state = SearchState::Done(None);
+                        continue;
+                    }
+                    let len = (self.end - self.start)
+                        .min((SEARCH_WINDOW + BATCH_HEADER_SIZE - 1) as u64)
+                        as usize;
+                    return FrameSearchStep::Read {
+                        offset: self.start,
+                        len,
+                    };
+                }
+                SearchState::Scanning => self.scan(),
+                SearchState::Checking {
+                    offset, remaining, ..
+                } if *remaining > 0 => {
+                    return FrameSearchStep::Read {
+                        offset: *offset,
+                        len: (*remaining).min(PAYLOAD_CHUNK),
+                    };
+                }
+                SearchState::Checking { .. } => {
+                    let SearchState::Checking {
+                        position,
+                        expected,
+                        hasher,
+                        ..
+                    } = std::mem::replace(&mut self.state, SearchState::Scanning)
+                    else {
+                        unreachable!("the state was checked above");
+                    };
+                    if hasher.finalize() == expected {
+                        self.state = SearchState::Done(Some(position));
+                    } else {
+                        self.failed_checks += 1;
+                    }
+                }
+                SearchState::Done(found) => return FrameSearchStep::Done(*found),
+            }
+        }
+    }
+
+    /// Hands over the bytes asked for by the last [`FrameSearchStep::Read`].
+    ///
+    /// # Panics
+    ///
+    /// If `bytes` is not as long as the read asked for, or no read was asked for.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        match &mut self.state {
+            SearchState::NeedWindow => {
+                assert_eq!(
+                    bytes.len() as u64,
+                    (self.end - self.start).min((SEARCH_WINDOW + BATCH_HEADER_SIZE - 1) as u64),
+                    "fed a window of the wrong length"
+                );
+                self.window.clear();
+                self.window.extend_from_slice(bytes);
+                self.next = 0;
+                self.state = SearchState::Scanning;
+            }
+            SearchState::Checking {
+                hasher,
+                offset,
+                remaining,
+                ..
+            } => {
+                assert_eq!(
+                    bytes.len(),
+                    (*remaining).min(PAYLOAD_CHUNK),
+                    "fed a chunk of the wrong length"
+                );
+                hasher.update(bytes);
+                *offset += bytes.len() as u64;
+                *remaining -= bytes.len();
+            }
+            SearchState::Scanning | SearchState::Done(_) => panic!("fed bytes nobody asked for"),
+        }
+    }
+
+    /// Scans the window from `next` for a valid header of a frame that ends before `end`: on one,
+    /// starts checking its payload (or takes it without a check once the checks are spent); at
+    /// the end of the window, moves to the next one.
+    fn scan(&mut self) {
         // Headers starting in the last `BATCH_HEADER_SIZE - 1` bytes are scanned with the next
         // window.
-        let candidates = len - BATCH_HEADER_SIZE + 1;
-        for i in 0..candidates {
-            if window[i..i + 2] != BATCH_MAGIC {
+        let candidates = self.window.len() - BATCH_HEADER_SIZE + 1;
+        while self.next < candidates {
+            let i = self.next;
+            self.next += 1;
+            if self.window[i..i + 2] != BATCH_MAGIC {
                 continue;
             }
-            let header_bytes = window[i..i + BATCH_HEADER_SIZE]
+            let header_bytes = self.window[i..i + BATCH_HEADER_SIZE]
                 .try_into()
                 .expect("a candidate has a whole header in the window");
             let Ok(header) = parse_batch_header(header_bytes) else {
                 continue;
             };
-            let position = start + i as u64;
-            if end - position < header.frame_len() as u64 {
+            let position = self.start + i as u64;
+            if self.end - position < header.frame_len() as u64 {
                 continue;
             }
-            if failed_checks == MAX_PAYLOAD_CHECKS
-                || payload_matches(reader, position + BATCH_HEADER_SIZE as u64, &header)?
-            {
-                return Ok(Some(position));
-            }
-            failed_checks += 1;
+            self.state = if self.failed_checks == MAX_PAYLOAD_CHECKS {
+                SearchState::Done(Some(position))
+            } else {
+                SearchState::Checking {
+                    position,
+                    expected: header.payload_crc32,
+                    hasher: crc32fast::Hasher::new(),
+                    offset: position + BATCH_HEADER_SIZE as u64,
+                    remaining: header.payload_len,
+                }
+            };
+            return;
         }
-        start += candidates as u64;
+        self.start += candidates as u64;
+        self.state = SearchState::NeedWindow;
     }
-    Ok(None)
-}
-
-/// Whether the payload at `position` matches the checksum in `header`.
-fn payload_matches<R: Read + Seek>(
-    reader: &mut R,
-    position: u64,
-    header: &BatchHeader,
-) -> std::io::Result<bool> {
-    reader.seek(SeekFrom::Start(position))?;
-    let mut hasher = crc32fast::Hasher::new();
-    let mut chunk = [0u8; 8 * 1024];
-    let mut remaining = header.payload_len;
-    while remaining > 0 {
-        let n = remaining.min(chunk.len());
-        reader.read_exact(&mut chunk[..n])?;
-        hasher.update(&chunk[..n]);
-        remaining -= n;
-    }
-    Ok(hasher.finalize() == header.payload_crc32)
 }
 
 /// Decodes the next framed WAL batch from a byte slice: `Ok` for a complete batch, `CleanEof`

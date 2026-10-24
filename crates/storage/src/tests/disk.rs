@@ -103,13 +103,13 @@ async fn failed_wal_sync_marks_room_failed_until_reopened() {
 }
 
 #[tokio::test]
-async fn failed_background_wal_write_marks_room_failed_until_reopened() {
+async fn failed_wal_write_marks_room_failed_until_reopened() {
     let dir = tempfile::tempdir().unwrap();
     let room = RoomId::new("background-write-failure").unwrap();
     let engine = open_engine(dir.path(), &room).await;
     engine.apply_batch(&room, vec![insert(1)]).await.unwrap();
 
-    // The WAL write fails on the blocking pool, after `write_all` has returned.
+    // The WAL write fails.
     fail_point::arm("apply_batch.write", &engine.wal_file_path(&room));
     assert!(engine.apply_batch(&room, vec![insert(2)]).await.is_err());
 
@@ -984,40 +984,99 @@ async fn write_completes_while_a_compaction_stages_its_snapshot() {
     assert_rows(&reopened, &room, 4).await;
 }
 
-// On Unix a duplicated handle shares the lock of the handle it was duplicated from.
-#[cfg(unix)]
-#[tokio::test]
-async fn room_stays_locked_while_a_handle_of_its_wal_is_still_open() {
+/// Drops an `apply_batch` of `insert(4)` on a room at head 3 once its WAL write is held on the
+/// blocking pool, and returns the handle that holds it.
+async fn drop_batch_during_its_write(
+    engine: &DiskStorageEngine,
+    room: &RoomId,
+) -> fail_point::BlockingPause {
+    let mut write = fail_point::arm_blocking_pause("file.write_at", &engine.wal_file_path(room));
+    tokio::select! {
+        _ = engine.apply_batch(room, vec![insert(4)]) => panic!("apply_batch finished during its write"),
+        _ = write.reached() => {}
+    }
+    write
+}
+
+/// An engine dropped (without closing the room) while the write of a dropped `apply_batch` is
+/// still on the blocking pool keeps the room locked until the write lands: another engine opens
+/// the room only afterwards, and its recovery reads the write instead of having it land on top of
+/// the batches it acknowledges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_dropped_during_a_write_keeps_the_room_until_the_write_lands() {
     let dir = tempfile::tempdir().unwrap();
-    let room = RoomId::new("wal-still-open").unwrap();
+    let room = RoomId::new("drop-during-write").unwrap();
     let engine = open_engine(dir.path(), &room).await;
-    engine.apply_batch(&room, vec![insert(1)]).await.unwrap();
+    apply_range(&engine, &room, 1..=3).await;
 
-    // A write of `tokio::fs` still in flight on the blocking pool holds a duplicate of the WAL's
-    // handle, like this one, after the engine is dropped without closing the room.
-    let in_flight = engine
-        .get_room(&room)
-        .await
-        .unwrap()
-        .wal
-        .lock()
-        .await
-        .file
-        .try_clone()
-        .await
-        .unwrap();
+    let write = drop_batch_during_its_write(&engine, &room).await;
     drop(engine);
-
     let other = engine_at(dir.path());
-    let result = other.open_room(&room, schema()).await;
+    let early = other.open_room(&room, schema()).await;
     assert!(
-        matches!(result, Err(StorageError::RoomLocked(_))),
-        "{result:?}"
+        matches!(early, Err(StorageError::RoomLocked(_))),
+        "{early:?}"
     );
 
-    drop(in_flight);
+    write.release();
+    open_when_unlocked(&other, &room, schema()).await.unwrap();
+    assert_rows(&other, &room, 4).await;
+    apply_range(&other, &room, 5..=6).await;
+    let reopened = reopen(other, dir.path(), &room).await;
+    assert_rows(&reopened, &room, 6).await;
+}
+
+/// `close_room` waits for the write of a dropped `apply_batch` still on the blocking pool, and
+/// the room can be opened again only once it is closed, with the write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_waits_for_the_write_of_a_dropped_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("close-during-write").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    apply_range(&engine, &room, 1..=3).await;
+
+    let write = drop_batch_during_its_write(&engine, &room).await;
+    let closing = tokio::spawn({
+        let (engine, room) = (engine.clone(), room.clone());
+        async move { engine.close_room(&room).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!closing.is_finished(), "close did not wait for the write");
+    let other = engine_at(dir.path());
+    let early = other.open_room(&room, schema()).await;
+    assert!(
+        matches!(early, Err(StorageError::RoomLocked(_))),
+        "{early:?}"
+    );
+
+    write.release();
+    tokio::time::timeout(Duration::from_secs(10), closing)
+        .await
+        .expect("close never finished")
+        .unwrap()
+        .unwrap();
     other.open_room(&room, schema()).await.unwrap();
-    assert_eq!(other.get_head_seq(&room).await.unwrap().get(), 1);
+    assert_rows(&other, &room, 4).await;
+}
+
+/// `close_room` returns the error of a failed write of a dropped `apply_batch`, which nobody saw,
+/// and the room opens again without it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_reports_the_failed_write_of_a_dropped_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("close-after-failed-write").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    apply_range(&engine, &room, 1..=3).await;
+
+    fail_point::arm("apply_batch.write", &engine.wal_file_path(&room));
+    let write = drop_batch_during_its_write(&engine, &room).await;
+    write.release();
+    let closed = engine.close_room(&room).await;
+    assert!(matches!(closed, Err(StorageError::Io(_))), "{closed:?}");
+
+    let reopened = open_engine(dir.path(), &room).await;
+    assert_rows(&reopened, &room, 3).await;
+    reopened.apply_batch(&room, vec![insert(4)]).await.unwrap();
 }
 
 /// A batch at the last sequence number is acknowledged, nothing can follow it, and it survives a

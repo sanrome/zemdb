@@ -195,16 +195,20 @@ impl<T> Drop for Outcome<T> {
 /// The end of an operation on the blocking pool: it sends the operation's result to its caller,
 /// or keeps its error for the next operation if nobody awaits it. Dropped without a result (the
 /// operation panicked, or the runtime shut down before it ran), it reports that the operation did
-/// not complete in the same way. It holds the handle's permit, released after the result.
+/// not complete in the same way. It holds the operation's reference to the file, released before
+/// the result, so that a caller that drops the handle once it has the result closes the file;
+/// and the handle's permit, released after the result.
 struct Reply<T> {
     sender: Option<oneshot::Sender<io::Result<T>>>,
     unseen: UnseenError,
     name: &'static str,
+    file: Option<Arc<File>>,
     permit: OwnedMutexGuard<PathBuf>,
 }
 
 impl<T> Reply<T> {
     fn send(&mut self, result: io::Result<T>) {
+        self.file = None;
         if let Some(sender) = self.sender.take() {
             if let Err(Err(err)) = sender.send(result) {
                 keep_unseen(&self.unseen, err);
@@ -251,16 +255,17 @@ impl NativeFile {
             sender: Some(sender),
             unseen: Arc::clone(&self.unseen),
             name,
+            file: Some(Arc::clone(&self.file)),
             permit,
         };
         let mut outcome = Outcome {
             receiver,
             unseen: Arc::clone(&self.unseen),
         };
-        let file = Arc::clone(&self.file);
         tokio::task::spawn_blocking(move || {
             fail_point::hold_blocking(name, &reply.permit);
-            let result = op(&file, &mut reply.permit);
+            let file = reply.file.as_ref().expect("released only with the result");
+            let result = op(file, &mut reply.permit);
             reply.send(result);
         });
         (&mut outcome.receiver)

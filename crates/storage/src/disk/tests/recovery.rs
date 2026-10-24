@@ -1,7 +1,9 @@
+use super::{WindowedReader, REPLAY_WINDOW};
 use crate::disk::compactor::{absorbing_wal_path, compacting_wal_path};
 use crate::disk::format::encode_wal_batch;
 use crate::disk::tests::support::*;
 use crate::fail_point;
+use crate::files::{NativeFiles, RoomFiles};
 use crate::{DiskStorageEngine, StorageEngine, StorageError};
 use std::fmt::Debug;
 use std::io::Write;
@@ -92,6 +94,123 @@ async fn recovered_compacting_wal_is_folded_and_removed() {
     drop(room_handle);
     let reopened = reopen(engine, dir.path(), &room).await;
     assert_rows(&reopened, &room, 8).await;
+}
+
+/// Once recovery folds a rotated WAL into the snapshot, the active WAL is empty on disk, as in
+/// memory: a batch of another size appended next lands at its start, not over older records.
+#[tokio::test]
+async fn folding_a_rotated_wal_empties_the_active_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("fold-empties").unwrap();
+    leave_orphan_compacting(dir.path(), &room).await;
+
+    let engine = open_engine(dir.path(), &room).await;
+    let wal_path = engine.wal_file_path(&room);
+    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), 0);
+    let long_name = "a name longer than the others".repeat(4);
+    engine
+        .apply_batch(&room, vec![insert_named(9, 9, &long_name)])
+        .await
+        .unwrap();
+
+    let reopened = reopen(engine, dir.path(), &room).await;
+    assert_rows(&reopened, &room, 9).await;
+    assert_eq!(
+        name_of(&reopened, &room, 9).await,
+        Value::String(long_name.into())
+    );
+}
+
+/// A WAL of many read windows, with a frame larger than a window, replays every batch.
+#[tokio::test]
+async fn wal_of_many_read_windows_replays_every_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("many-windows").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    let name = "x".repeat(1000);
+    for seq in 1..=200 {
+        let op = insert_named(seq, seq as i64, &name);
+        engine.apply_batch(&room, vec![op]).await.unwrap();
+    }
+    let large = "y".repeat(200 * 1024);
+    engine
+        .apply_batch(&room, vec![insert_named(201, 201, &large)])
+        .await
+        .unwrap();
+    let wal_len = std::fs::metadata(engine.wal_file_path(&room))
+        .unwrap()
+        .len();
+    assert!(wal_len > 400 * 1024, "{wal_len}");
+
+    let reopened = reopen(engine, dir.path(), &room).await;
+    assert_rows(&reopened, &room, 201).await;
+    assert_eq!(
+        name_of(&reopened, &room, 1).await,
+        Value::String(name.as_str().into())
+    );
+    assert_eq!(
+        name_of(&reopened, &room, 200).await,
+        Value::String(name.into())
+    );
+    assert_eq!(
+        name_of(&reopened, &room, 201).await,
+        Value::String(large.into())
+    );
+}
+
+/// The windowed reader returns the bytes asked for whether they lie inside its window, end at
+/// its last byte, or end one byte past it, and for a read longer than a window.
+#[tokio::test]
+async fn windowed_reader_reads_across_the_edge_of_its_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("room.wal");
+    let bytes: Vec<u8> = (0..3 * REPLAY_WINDOW as u32)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    std::fs::write(&path, &bytes).unwrap();
+    let file = NativeFiles.open_read(&path).await.unwrap();
+    let mut reader = WindowedReader::new(&file, bytes.len() as u64);
+
+    let edge = REPLAY_WINDOW;
+    for (offset, len) in [
+        (0, 18),
+        (edge - 18, 18),
+        (edge - 17, 18),
+        (edge + 1, 2 * REPLAY_WINDOW - 1),
+        (bytes.len() - 1, 1),
+    ] {
+        let read = reader.read(offset as u64, len).await.unwrap();
+        assert_eq!(read, &bytes[offset..offset + len], "{offset}+{len}");
+    }
+}
+
+/// The search for a valid frame after a damaged tail needs one thread of the blocking pool at
+/// most: a recovery on a runtime whose pool has a single thread completes.
+#[test]
+fn damaged_tail_recovers_with_a_single_blocking_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    let (done, finished) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let room = RoomId::new("one-blocking-thread").unwrap();
+            let engine = open_engine(&path, &room).await;
+            apply_range(&engine, &room, 1..=3).await;
+            engine.close_room(&room).await.unwrap();
+            append_raw(&engine.wal_file_path(&room), &[0; 64]);
+            let reopened = open_engine(&path, &room).await;
+            assert_rows(&reopened, &room, 3).await;
+        });
+        done.send(()).unwrap();
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the recovery of a damaged tail did not complete");
 }
 
 #[tokio::test]

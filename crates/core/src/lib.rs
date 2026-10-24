@@ -20,12 +20,12 @@ pub use protocol::{
     decode_wal_batch_from_slice, encode_message, encode_wal_batch, encode_wal_record,
     find_valid_frame, parse_batch_header, peek_client_message_kind, peek_version,
     replay_wal_records, validate_snapshot_envelope, BatchHeader, BatchPayloadDecode, ClientMessage,
-    ClientMessageKind, DecodeError, ErrorCode, FrameAnomaly, InvalidHeader, OperationSizeError,
-    SequencedOperation, ServerMessage, SnapshotCompression, SnapshotEnvelopeError,
-    SnapshotEnvelopeHeader, SnapshotEnvelopeValidator, WalBatchDecodeResult, WalFrameError,
-    BATCH_HEADER_SIZE, BATCH_MAGIC, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE, MAX_MESSAGE_VALUES,
-    MAX_RESPONSE_OPS_BYTES, PROTOCOL_HEADER_LEN, PROTOCOL_VERSION, SNAPSHOT_HEADER_LEN,
-    SNAPSHOT_MAGIC, SNAPSHOT_VERSION,
+    ClientMessageKind, DecodeError, ErrorCode, FrameAnomaly, FrameSearch, FrameSearchStep,
+    InvalidHeader, OperationSizeError, SequencedOperation, ServerMessage, SnapshotCompression,
+    SnapshotEnvelopeError, SnapshotEnvelopeHeader, SnapshotEnvelopeValidator, WalBatchDecodeResult,
+    WalFrameError, BATCH_HEADER_SIZE, BATCH_MAGIC, MAX_FRAME_SIZE, MAX_MESSAGE_SIZE,
+    MAX_MESSAGE_VALUES, MAX_RESPONSE_OPS_BYTES, PROTOCOL_HEADER_LEN, PROTOCOL_VERSION,
+    SNAPSHOT_HEADER_LEN, SNAPSHOT_MAGIC, SNAPSHOT_VERSION,
 };
 pub use schema::{
     ColumnDef, ForeignKey, OnDelete, OwnerDef, OwnerIdentity, Schema, SchemaBuilder,

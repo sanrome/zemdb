@@ -243,6 +243,39 @@ async fn a_locked_file_cannot_be_locked_again() {
     assert!(NativeFiles.open_locked(&fresh).await.unwrap().is_some());
 }
 
+/// Once an operation returned, it no longer holds the file: dropping the handle closes it and
+/// releases its lock, so the file can be locked again right away, as a room closed and reopened
+/// is. An operation that panics releases it before its error too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handle_dropped_once_its_operations_returned_releases_its_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("room.wal");
+    for _ in 0..1000 {
+        let file = NativeFiles.open_locked(&path).await.unwrap().unwrap();
+        file.sync_data().await.unwrap();
+        assert_eq!(
+            Arc::strong_count(&file.file),
+            1,
+            "the operation holds the file"
+        );
+        drop(file);
+        assert!(NativeFiles.open_locked(&path).await.unwrap().is_some());
+    }
+
+    let file = NativeFiles.open_locked(&path).await.unwrap().unwrap();
+    for _ in 0..100 {
+        let panicked = file.run("test.panic", |_, _| -> io::Result<()> {
+            panic!("injected")
+        });
+        assert!(panicked.await.is_err());
+        assert_eq!(
+            Arc::strong_count(&file.file),
+            1,
+            "a panicked operation holds the file"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_renamed_open_file_keeps_its_handle_and_its_lock() {
     let dir = tempfile::tempdir().unwrap();
