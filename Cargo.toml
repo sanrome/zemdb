@@ -34,6 +34,7 @@ hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
 http-body = "1"
 bytes = { version = "1.6", features = ["serde"] }
 zstd = "0.13"
+ruzstd = "0.9.1"
 smallvec = { version = "1.13", features = ["serde"] }
 async-trait = "0.1"
 futures = "0.3"

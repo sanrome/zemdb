@@ -2,7 +2,7 @@
 
 **Fecha:** 23 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lotes 0 a 5 cerrados; el próximo es el 6.
+**Estado:** En curso: Lotes 0 a 6 cerrados; el próximo es el 7.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.1. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -70,7 +70,7 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 | 3 | Los plazos del servidor con el reloj de Tokio | server | DC16 | B2, R3, L1 | ✅ |
 | 4 | Los errores de la apertura y de `apply_snapshot` | storage | DC12 | S4, S5, C2, W1, K3 | ✅ |
 | 5 | `reload_schema` | storage | DC5 | S7, C1, C2, C3, S6, K6 | ✅ |
-| 6 | Zstd en wasm32 con `ruzstd` | storage | DC9 | W1, W2, S5, K12 | ⬜ |
+| 6 | Zstd en wasm32 con `ruzstd` | storage | DC9 | W1, W2, S5, K12 | ✅ |
 | 7 | Capa de archivos: el trait y su implementación nativa | storage | DC8, DC17 | S1 a S6, L7 | ⬜ |
 | 8 | Capa de archivos: la recuperación | storage (y core, si cambia `find_valid_frame`) | DC17 | S3, S4, S6 | ⬜ |
 | 9 | Capa de archivos: la compactación y `apply_snapshot` | storage | DC17 | S1, S3, S5 | ⬜ |
@@ -447,7 +447,7 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
   - **Una precisión del contrato,** que encontró la versión larga del test de reaperturas más angostas. Después de compactar con filas que no cumplen una restricción de una versión posterior, y de recargarla cuando las filas ya la cumplían, reabrir con esa versión es `SnapshotConstraints`: la apertura verifica el `.snap` antes del replay que lo arregló. Es la excepción de INV-S6 (la sala se abrió con un esquema más angosto) y falla cerrada, sin descartar nada (INV-S4). La excepción de INV-S6 en `INVARIANTES.md` y la entrada de `ARCHITECTURE.md` ahora lo dicen, y el test reabre en ese caso con una versión anterior.
   - El negativo de "otro dueño" usa un esquema con una tabla con dueño (`owned_schema`): en `constrained_schema` ninguna columna puede ser dueña (todas son nullable) y una columna nueva tampoco. Agrega además el de la inmutabilidad, que `evolves_from` también exige.
 
-### Lote 6 · Zstd en wasm32 con `ruzstd` (`zemdb-storage`) · ⬜
+### Lote 6 · Zstd en wasm32 con `ruzstd` (`zemdb-storage`) · ✅
 **Objetivo:** que un navegador restaure los snapshots que suben los clientes nativos, y que comprima los suyos (DC9, DEF-54).
 
 **Archivos:** `crates/storage/Cargo.toml`, `src/snapshot.rs` y sus tests.
@@ -470,6 +470,77 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 - El BLAKE3 de una subida se calcula sobre los bytes del envelope: un snapshot comprimido en el navegador tiene otros bytes que el mismo estado comprimido en nativo, como ya pasa entre niveles.
 
 **Documentos:** `ARCHITECTURE.md` §8 (Zstd en wasm32); `INVARIANTES.md`: INV-W1, W2 y K12 sin 🆕 en lo de este lote, y DEF-54 cerrado en §4; la medición en DC9.
+
+**Hecho.**
+- **Storage** (`crates/storage/src/snapshot.rs`).
+  - **Un códec por plataforma.** El trait privado `ZstdCodec` tiene `compress(payload, level)` y `decoder(body)`. `Libzstd` es el crate `zstd`, en nativo; `Ruzstd` es `ruzstd` 0.9.1, en wasm32 y en los tests unitarios; `PlatformZstd` elige uno. `encode_snapshot_envelope`, `decode_snapshot_envelope_with_limit`, `decode_snapshot_payload`, `deserialize_zstd` y `decompress_bounded` pasan a ser genéricos sobre el códec, así que los dos van por el mismo camino acotado, con el mismo tope.
+  - **El codificador.** En wasm32, `encode_snapshot_envelope` con compresión usa el nivel `Fastest` de `ruzstd` (ignora el nivel) y marca el envelope `Zstd`; antes escribía `Raw`. Sus frames terminan con un checksum del contenido. La función de compresión del lote es `ZstdCodec::compress`: el Lote 9 la usa, con `PlatformZstd`, para el `.snap`.
+  - **Los chequeos del cuerpo, iguales en los dos.**
+    - Antes de decodificar, `check_frame_header`: un frame Zstandard (no uno saltable), sin bit reservado, sin diccionario, y con una ventana de hasta el límite por defecto de libzstd al decodificar (2^27 bytes más uno; en un frame de un solo segmento, su tamaño declarado). `ruzstd` recibe el mismo límite.
+    - Mientras decodifica, un bloque produce a lo sumo el menor entre su ventana y 128 KiB (RFC 8878). libzstd lo hace cumplir; `ruzstd`, en los bloques raw y RLE y en lo que producen las secuencias de un bloque comprimido, no en los literales después de la última (un bloque de solo literales puede producir hasta 1 MiB, el tope del formato, que libzstd rechaza).
+    - Al terminar el frame: nada después, y el tamaño declarado y el checksum, si están. libzstd verifica esos dos solo; para `ruzstd` lo hace `RuzstdFrame`.
+    - Todo error es `SnapshotCorruption`.
+  - **La memoria de `ruzstd`.** Decodifica de a un bloque y solo hasta tener salida más allá de la última ventana, así que retiene a lo sumo una ventana y un bloque: hasta 128 KiB de sus secuencias (más la secuencia con que un bloque hostil pasa el límite antes de que lo rechace, de unos 128 KiB de literales y 128 KiB de copia como mucho) y hasta 1 MiB de literales después. Con la ventana en el límite: unos 128 MiB con un frame válido (192 MiB mientras su buffer crece) y unos 256 MiB a lo sumo con uno hostil (384 MiB mientras crece).
+  - **Cambio en nativo.** Un cuerpo con un frame saltable, varios frames, datos después del frame o un diccionario, que libzstd aceptaba, ahora se rechaza, también al leer el `.snap` de una sala en disco. Ninguno de los dos codificadores los escribe, y la compactación escribe un frame que los cumple en todo nivel aceptado (el 22 declara la ventana del límite, 2^27; un test lo fija).
+- **Dependencias.** `ruzstd` 0.9.1 en el workspace; en `zemdb-storage`, de wasm32 y de desarrollo. Necesita Rust 1.87, y el workspace declara 1.85: solo afecta el build de wasm32 y los tests del crate. El job de MSRV de 1.85 compila las libs nativas, que no lo usan, y el de 1.88 corre los tests.
+- **Tests** (`crates/storage/src/tests/snapshot.rs`, unitarios: `Ruzstd` es privado y en nativo solo se compila para los tests).
+  - **INV-W2:**
+    - payloads vacíos, de un byte, alrededor del bloque de 128 KiB, incompresibles y repetitivos (hasta 3,5 MB), comprimidos con `zstd` en los niveles -7, 1, 3 y 19 y con `ruzstd`, y decodificados por los dos a los mismos bytes;
+    - lo mismo con cada biblioteca sola, sin los chequeos del módulo;
+    - un snapshot real del motor en memoria, por los dos caminos (los bytes y el payload deserializado), con los dos códecs;
+    - todo nivel de `zstd` que acepta el motor en disco (el mínimo, 1 y de 19 a 22) pasa el chequeo de cabecera y lo decodifica `ruzstd`.
+  - **Negativos,** con cada códec y su control positivo:
+    - más que lo declarado, menos, cada prefijo truncado, basura, y un tamaño declarado sobre el tope;
+    - datos después del frame (un byte, y otro frame) y un frame saltable;
+    - ventanas sobre el límite, con su borde: 2^27 pasa y 2^27·9/8 no; un solo segmento de 2^27+1 pasa y de 2^27+2 no;
+    - el bit reservado y un diccionario, con un id de uno, dos y cuatro bytes, cero o no;
+    - el tamaño de contenido declarado, también en el campo de un byte de un frame de un solo segmento y en el de dos bytes, que cuenta desde 256;
+    - el checksum, con cada bit del último byte;
+    - un bloque comprimido hecho a mano cuyas secuencias producen 1,3 MB (una sola pasa, con 65.540 bytes);
+    - las tres pruebas de strings de `PayloadReader`.
+  - **La diferencia que queda en el bloque:** un bloque de 2^20 - 1 literales y ninguna secuencia lo acepta `ruzstd` y lo rechaza libzstd; el test lo fija, para que se note si una versión de `ruzstd` la cierra.
+  - **Que el límite de ventana es el de libzstd:** libzstd solo, sin el chequeo, rechaza por memoria justo las ventanas que el chequeo rechaza: todas las de 2^10 a 2^41 con cada mantisa, y tamaños de un solo segmento alrededor del límite.
+  - **Que `ruzstd` tiene sus chequeos propios:** los mensajes del tamaño declarado (también al deserializar un payload) y del checksum son los de `RuzstdFrame`.
+  - **Que una lectura de `ruzstd` retiene a lo sumo una ventana:** con una ventana de 1 MiB y una lectura de 4 MiB, consume a lo sumo una ventana y dos bloques de entrada.
+  - **El fuzzer:** envelopes de un snapshot real comprimido con `ruzstd`, dañados al azar (el envelope, el cuerpo resellado, la cabecera del frame, o el payload antes de comprimir), decodificados con `ruzstd` por los dos caminos. Nunca un pánico, todo error es `SnapshotCorruption`, y donde los dos códecs aceptan un frame con checksum, dan los mismos bytes. 1.500 casos, y 200.000 en la versión larga.
+  - Contra el esqueleto (el trait, `Libzstd` sin los chequeos nuevos y `Ruzstd` que siempre fallaba), los 19 tests nuevos de entonces fallaban por comportamiento. Los que vinieron después (el de los niveles, el de los chequeos propios de `ruzstd`, los dos del bloque y los casos nuevos del diccionario y del tamaño) los pidieron un borde del motor en disco, mutaciones sobrevivientes y las dos rondas de la revisión de delta.
+- **Mutaciones verificadas,** las 19 detectadas, cada una compilando (sobre la 0.9.1):
+  - sin el tope de ventana, sin su mantisa, con la ventana de un solo segmento en 0, o con el límite propio de `ruzstd` en lugar del común;
+  - sin el bit reservado, sin el diccionario (o solo con su primer bit) o sin el magic;
+  - un frame de un solo segmento sin el campo de tamaño de un byte;
+  - `ruzstd` sin el chequeo de cabecera;
+  - sin el checksum o sin el tamaño declarado;
+  - el campo de dos bytes sin los 256;
+  - sin el chequeo de datos después del frame, en cada códec, y libzstd con varios frames;
+  - el camino de los bytes, o el del payload, con el códec de la plataforma en lugar del pedido (la del payload sobrevivía, y por ella el test de los chequeos propios de `ruzstd` también mira ese camino);
+  - el codificador que ignora la compresión.
+- **Interacciones revisadas:**
+  - El tope (`DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES`, `max_snapshot_uncompressed_bytes`) es el mismo en los dos: `checked_envelope` lo aplica antes de elegir el códec.
+  - El relay solo valida el envelope (cabecera, CRC y BLAKE3 de sus bytes, en `relay/upload.rs` y `relay/files.rs`), sin descomprimir.
+  - El BLAKE3 de una subida es sobre los bytes del envelope: un snapshot comprimido en el navegador tiene otros bytes, y otro hash, que el mismo estado comprimido en nativo, como entre dos niveles.
+  - **El checklist de determinismo**, sobre lo que acepta una réplica:
+    - los dos códecs aceptan los mismos frames bien formados y dan los mismos bytes;
+    - con un frame dañado a propósito pueden no coincidir. Un fuzzer diferencial de prueba (con la 0.8.3) lo mostró: libzstd rechaza campos reservados que `ruzstd` ignora (con la salida correcta, por su checksum), `ruzstd` rechaza algunas secciones de literales inconsistentes que libzstd acepta, y sin checksum los dos pueden aceptar con bytes distintos. La segunda ronda de la revisión lo repitió con la 0.9.1: en 150.000 casos, unos 1.300 los aceptó solo libzstd, entre 10 y 15 los dos con bytes distintos, y hasta 3 solo `ruzstd`; a eso se suma el bloque de literales de arriba. Es un snapshot falso de un miembro, ya fuera de alcance (DEF-81), y un snapshot no decide operaciones: la réplica que lo rechaza sigue como estaba;
+    - nada depende del reloj, del azar ni de un `HashMap`.
+  - El `.snap` de una sala en disco se lee con el códec de la plataforma (`deserialize_zstd`) y los chequeos nuevos.
+- **Medición de DC9:** en Chromium 153 headless, el codificador comprime un payload de 103,9 MB en 0,99 a 1,47 s, a 23,4 MB (el `zstd` nativo de nivel 3: 8,8 MB), y el `zstd` nativo lo decodifica a los mismos bytes. Suma 73,0 KB al wasm (20,2 KB con brotli). El detalle está en DC9; la medición de Safari queda pendiente para 4.5.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura, con sus propias corridas y 13 mutaciones en una copia): en rojo, con un hallazgo Alto, arreglado.
+  - **A1. `ruzstd` 0.8.3 no acotaba lo que produce un bloque comprimido.** Sus secuencias se ejecutan sin comparar el total con el máximo de bloque del RFC, y su decodificador por streaming decodifica bloques enteros: un bloque de 128 KiB con secuencias de copia larga lo hace crecer a gigabytes, y en wasm32 una reserva fallida aborta. La cota de INV-W1 que decían los documentos ("una ventana, 64 KiB y un bloque") era falsa. **Arreglo:** `ruzstd` 0.9.1, que limita el bloque al menor entre la ventana y 128 KiB, aplica un tope de ventana también al primer frame (se le pasa el común, `new_with_max_window_size`) y decodifica de a un bloque. Con eso sobra el tope de 64 KiB por lectura, que se sacó. Un test nuevo, con un bloque hecho a mano que produce 1,3 MB, lo rechazan las dos bibliotecas (libzstd: *Destination buffer is too small*; `ruzstd`: `TooManyBytesGenerated`). La cota de los documentos ahora es la de la 0.9.1, incluida la secuencia con que un bloque hostil pasa el límite.
+  - **B1 (Bajo). INV-W2 y §8 definían los frames que aceptan los dos por la cabecera,** y un frame con la cabecera bien y un bloque demasiado grande lo aceptaba `ruzstd` y no libzstd. El texto ahora dice "válidos según RFC 8878 que pasan sus chequeos comunes". Con la 0.9.1 queda el caso de los literales (ver la segunda ronda).
+  - Lo demás lo verificó en verde: los chequeos y el largo exacto en los dos caminos, todo error `SnapshotCorruption`, el tope común, que el relay no descomprime, el cambio en nativo sin regresión para lo que escribe el código, los tests exigidos y GEMINI.md.
+- **Revisión de delta, segunda ronda** (otro agente de contexto fresco, con un fuzzer propio de 300.000 casos de semillas de libzstd y de `ruzstd`, sin pánicos, y la lectura de la 0.9.1): sin Altos, con un Medio y cuatro Bajos, atendidos.
+  - **M1. `ruzstd` 0.9.1 no acota del todo lo que produce un bloque.** Compara el máximo de bloque solo entre secuencias: los literales después de la última, o un bloque sin secuencias, pasan sin control (hasta 2^20 - 1 bytes de literales RLE, en un bloque de 8 bytes). La memoria queda dentro de la cota documentada, pero los documentos decían que las dos bibliotecas hacen cumplir el máximo. **Arreglo:** `ARCHITECTURE.md` §8, INV-W1, DC9, el docstring de `RuzstdFrame` y esta nota dicen lo que hace cada una, con la cota descompuesta por secuencias y literales, y un test fija la diferencia (`ruzstd` acepta, libzstd rechaza).
+  - **B1. Dos chequeos sin test:** el diccionario con su segundo bit y el campo de tamaño de un byte. Hay casos nuevos para los dos, y las dos mutaciones que sobrevivían ahora se detectan (la del campo de un byte pedía un tamaño mayor que el bloque: con uno menor, la ventana, que es ese tamaño, ya rechazaba el bloque).
+  - **B2. La divergencia en la otra dirección estaba descrita a medias** (y en pasado, como si fuera solo de la 0.8.3): §8, el docstring del trait y esta nota nombran las dos direcciones.
+  - **B3. El MSRV:** la 1.87 también la necesitan los tests del crate, no solo wasm32.
+  - **B4. Redondeo:** "unos 256 MiB" en lugar de "a lo sumo 256 MiB".
+- **Revisión de delta, tercera ronda** (otro agente de contexto fresco, con un fuzzer diferencial propio de 60.000 casos, sus mutaciones y las fuentes de libzstd 1.5.7 y `ruzstd` 0.9.1): **en verde**, sin Altos ni Medios. Confirmó M1 y las cifras de memoria, y dejó cuatro Bajos de redacción, atendidos: `ruzstd` también acota los bloques raw y RLE (no solo las secuencias); la regla de redondeo del buffer, que redondea lo que pasa de 256 KiB; un ítem de la lista de tests que había quedado en otro lugar; y el tamaño del bloque de literales (8 bytes, no 5).
+- **Chequeos:** fmt, clippy (nativo y wasm32), test del workspace, doc con `-D warnings` y el build de wasm32 en verde; `cargo test --release -- --ignored` de `zemdb-storage`.
+- **Tamaño:** unas 270 líneas nuevas en `snapshot.rs`, con sus docstrings; unas 780 de tests.
+- **Desvíos:**
+  - `ruzstd` 0.9.1 en lugar de la 0.8 que decía el plan, por A1 (DC9 lo anota).
+  - Los chequeos comunes del cuerpo (un frame, sin saltables, diccionario ni datos después) no estaban en el plan: sin ellos los dos decodificadores aceptaban cuerpos distintos (libzstd, varios frames; `ruzstd`, datos después del suyo), y `ruzstd` no verifica el checksum ni el tamaño declarado. En nativo rechazan cuerpos que libzstd aceptaba, que ningún codificador del repo escribe.
+  - La función de compresión es `ZstdCodec::compress` y no una función suelta: los tests eligen el códec por su tipo.
 
 ### Lotes 7 a 9 · La capa de archivos (`zemdb-storage`) · ⬜
 **Requisito para empezar:** DC17, adoptada el 23 de Octubre de 2026.
@@ -503,4 +574,4 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 
 ## 3. Seguimiento
 
-**Avance:** Lote 0 cerrado el 23 de Octubre de 2026, con la revisión cruzada en verde en su quinta ronda; Lote 1 cerrado el mismo día. DC17 adoptada el 23 de Octubre, con renombrar un archivo abierto como operación del trait (el refactor de los Lotes 7 a 9 queda sin cambio de comportamiento). Lote 2 cerrado el 23 de Octubre. Lote 3 cerrado el 24 de Octubre, y los Lotes 4 y 5 el mismo día. El próximo es el Lote 6.
+**Avance:** Lote 0 cerrado el 23 de Octubre de 2026, con la revisión cruzada en verde en su quinta ronda; Lote 1 cerrado el mismo día. DC17 adoptada el 23 de Octubre, con renombrar un archivo abierto como operación del trait (el refactor de los Lotes 7 a 9 queda sin cambio de comportamiento). Lote 2 cerrado el 23 de Octubre. Lote 3 cerrado el 24 de Octubre, y los Lotes 4, 5 y 6 el mismo día. El próximo es el Lote 7.

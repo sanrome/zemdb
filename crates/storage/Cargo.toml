@@ -28,6 +28,9 @@ uuid = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1.38", default-features = false, features = ["sync"] }
+ruzstd = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The unit tests check the WebAssembly Zstandard codec natively, against `zstd`.
+ruzstd = { workspace = true }
