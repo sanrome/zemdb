@@ -28,6 +28,13 @@ pub enum StorageError {
     #[error("Snapshot corruption detected: {0}")]
     SnapshotCorruption(String),
 
+    /// A snapshot, received from another peer or opened from disk, whose rows break a
+    /// constraint of the schema it is applied or opened with: a `UNIQUE` key that another row
+    /// repeats, or a foreign key without its parent row. Its bytes are not damaged: the rows
+    /// were written under other constraints.
+    #[error("Snapshot rows of table id {table_id} break the constraint '{constraint}'")]
+    SnapshotConstraints { table_id: u16, constraint: String },
+
     #[error("Sequence number mismatch: expected {expected}, actual {actual}")]
     SequenceMismatch {
         expected: SequenceNumber,

@@ -866,7 +866,8 @@ fn member(seq: u64, id: i64, name: &str, boss: Option<i64>) -> SequencedOperatio
 /// Writes `rows`, which break `constraint`, into a disk room without constraints and compacts
 /// them into its snapshot, which the engine seals with a valid checksum. A `.wal.compacting`
 /// and an active WAL with a torn write at its end follow. Opening the room with the constraints
-/// fails naming the constraint before anything is truncated, folded or rewritten: every file
+/// is `SnapshotConstraints`, naming the table and the constraint, not a corruption, and comes
+/// before anything is truncated, folded or rewritten: every file
 /// keeps its bytes, and the room still opens without the constraints, with all its data.
 async fn local_snapshot_that_breaks_a_constraint_is_not_opened(
     constraint: &str,
@@ -902,7 +903,10 @@ async fn local_snapshot_that_breaks_a_constraint_is_not_opened(
         .await
         .unwrap_err();
     assert!(
-        matches!(&err, StorageError::SnapshotCorruption(message) if message.contains(constraint)),
+        matches!(
+            &err,
+            StorageError::SnapshotConstraints { table_id: 0, constraint: named } if named == constraint
+        ),
         "{err:?}"
     );
     assert!(files() == before, "a file changed");

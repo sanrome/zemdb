@@ -2,7 +2,7 @@
 
 **Fecha:** 23 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lotes 0 a 3 cerrados; el próximo es el 4.
+**Estado:** En curso: Lotes 0 a 4 cerrados; el próximo es el 5.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.1. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -67,8 +67,8 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 | 0 | Contrato | Documentos | DC5, DC9, DC12, DC15, DC16, DC17 | Nueva: S7. Ajustes: S4, S5, S6, C1, C2, E2, W1, W2, A5, K3, K6, K12 | ✅ |
 | 1 | El dueño como prefijo del `ClientId` y `Schema::evolves_from` | core, server | DC15, DC5 | A5, K6, C1 | ✅ |
 | 2 | El `schema_id` en `CommitAck`, `SyncBatch` y `HeartbeatAck` | core, server | DC5 | E2, W1, W2, B1, K6 | ✅ |
-| 3 | Los plazos del servidor con el reloj de Tokio | server | DC16 | B2, R3, L1 | ⬜ |
-| 4 | Los errores de la apertura y de `apply_snapshot` | storage | DC12 | S4, S5, C2, W1, K3 | ⬜ |
+| 3 | Los plazos del servidor con el reloj de Tokio | server | DC16 | B2, R3, L1 | ✅ |
+| 4 | Los errores de la apertura y de `apply_snapshot` | storage | DC12 | S4, S5, C2, W1, K3 | ✅ |
 | 5 | `reload_schema` | storage | DC5 | S7, C1, C2, C3, S6, K6 | ⬜ |
 | 6 | Zstd en wasm32 con `ruzstd` | storage | DC9 | W1, W2, S5, K12 | ⬜ |
 | 7 | Capa de archivos: el trait y su implementación nativa | storage | DC8, DC17 | S1 a S6, L7 | ⬜ |
@@ -265,7 +265,7 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 - **Tamaño:** unas 15 líneas de producción, más docstrings.
 - **Desvíos:** ninguno, salvo la corrección de §5.3 del plan de la fase, que el lote no listaba entre sus documentos.
 
-### Lote 4 · Los errores de la apertura y de `apply_snapshot` (`zemdb-storage`) · ⬜
+### Lote 4 · Los errores de la apertura y de `apply_snapshot` (`zemdb-storage`) · ✅
 **Objetivo:** que el SDK pueda decidir por el error si descarta la réplica (DC12, INV-K3): un snapshot que no cumple las restricciones y un error de E/S no son un daño.
 
 **Archivos:** `crates/storage/src/error.rs`, `memory/state.rs`, `disk/recovery.rs`, `engine.rs` (la documentación del trait) y `fail_point.rs`.
@@ -286,6 +286,44 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 - El checklist de determinismo: la restricción nombrada es la misma en los dos motores (tablas por id, filas por clave).
 
 **Documentos:** `ARCHITECTURE.md` §8 (*apply_snapshot Rules*, *Opening Requires a Schema That Covers the Room's Data*) y §3.1 (*Enforcement*); `INVARIANTES.md`: INV-S4, S5, C2 y W1 sin 🆕 en lo de este lote, y en INV-K3 la parte de 4.1.
+
+**Hecho.**
+- **Storage.**
+  - **La variante nueva.** `StorageError::SnapshotConstraints { table_id, constraint }` la devuelve `RoomData::check` (`memory/state.rs`), con el id de la tabla y el nombre de la primera restricción que se rompe. Llega a los tres caminos que verifican un snapshot: `load_snapshot` (el `.snap` local, en `open_room`) y `decode_received_snapshot` (el `apply_snapshot` de los dos motores). Una tabla fuera del esquema, una fila inválida y un contenido dañado siguen siendo `SnapshotCorruption`, y un `.snap` más corto que el header, `WalCorruption`, como antes.
+  - **`Io` al leer el `.snap`.** En `load_snapshot`, un error al leer el header o el cuerpo es `Io`. Antes era `WalCorruption` y `SnapshotCorruption`. El largo del archivo se verifica antes de cada lectura, así que el error no es un archivo corto.
+  - **Los fail points.** Dos nuevos, solo en tests (`recovery.snapshot_header`, `recovery.snapshot_body`), en esas dos lecturas.
+  - **La documentación.** La del trait (`open_room` y `apply_snapshot`) dice qué errores son un daño de los archivos y cuáles no.
+- **Tests agregados y cambiados:**
+  - `crates/storage/src/disk/tests/recovery.rs`: `snapshot_header_read_error_is_io_and_keeps_the_files` y `snapshot_body_read_error_is_io_and_keeps_the_files`. Usan una sala con un `.snap` compactado y un WAL detrás: la apertura es `Io`, el `.snap` y el WAL conservan sus bytes, y la próxima apertura lee todas las filas.
+  - `snapshots_that_break_a_constraint_change_nothing` (`memory/tests/index.rs`, en los dos motores): cada caso de `rows_that_break_a_constraint` lleva ahora su tabla, y el error tiene que ser `SnapshotConstraints` con esa tabla y esa restricción. Cubre una `UNIQUE` repetida en una columna vieja y en una nueva, una FK colgante a otra tabla y a la misma, y que se nombran la primera tabla por id y la primera fila por clave.
+  - `local_snapshot_that_breaks_a_constraint_is_not_opened` (`disk_wal_resilience_tests.rs`): la apertura es `SnapshotConstraints` con la tabla y la restricción, y los archivos quedan intactos.
+  - `check_unchecked_states` (`randomized_engine_tests.rs`): un rechazo es `SnapshotConstraints` y nombra una restricción que el recorrido de las tablas encuentra rota.
+  - Los fuzzers de snapshots dañados y de archivos de sala dañados suman `SnapshotConstraints` a su lista cerrada de errores.
+  - Los negativos ya estaban y siguen en verde: en `apply_snapshot_tests.rs`, una tabla fuera del esquema y una fila inválida son `SnapshotCorruption` en los dos motores; en `disk_wal_resilience_tests.rs`, un byte invertido en el cuerpo del `.snap` es `SnapshotCorruption` (CRC).
+  - Contra el esqueleto (la variante declarada sin usar, y los fail points con los errores de antes), los siete tests nuevos o cambiados fallaban por comportamiento; los dos fuzzers, que aceptan una lista más amplia, pasaban.
+- **Mutaciones verificadas,** todas detectadas, cada una compilando:
+  - la verificación devuelve `SnapshotCorruption`;
+  - nombra la tabla 0 o la 1;
+  - el nombre de la restricción va en su forma `Debug` o alterado;
+  - el header vuelve a `WalCorruption`, y el cuerpo a `SnapshotCorruption`;
+  - una tabla desconocida o una fila inválida pasan a ser `SnapshotConstraints`.
+
+  La revisión de delta probó además, también detectadas: verificar solo las `UNIQUE`, abrir sin verificar y quitar el fail point del cuerpo.
+- **Interacciones revisadas:**
+  - Los tests que esperaban `SnapshotCorruption` por las restricciones, cambiados como arriba. `snapshot_portability_tests.rs` y `snapshot_decompression_bounds_tests.rs` lo esperan por un contenido dañado (y en wasm32, por Zstd), y no cambian.
+  - Ni el servidor ni el cliente dependen de `zemdb-storage` (ni en dependencias ni en dev-dependencies); el relay solo valida el envelope.
+  - Ningún otro camino de la apertura hace de un error de E/S una corrupción: los errores de lectura del WAL ya eran `Io`, y la descompresión y la decodificación trabajan sobre bytes en memoria.
+  - Las simulaciones con crash plan (`disk/tests/simulation.rs`) cuentan los dos puntos nuevos de la apertura. En `CopyAtEveryPoint` agregan imágenes iguales a la anterior, porque son lecturas. En `FailAt`, la apertura fallida con `Io` la resuelve la reapertura que la simulación ya hace. Ningún test fija la lista de puntos de la apertura.
+  - El checklist de determinismo: la misma función verifica en los dos motores y en los dos caminos. Recorre las tablas por id (`schema.tables()`), las filas por clave y las restricciones de cada fila en su orden de declaración (`check_row`), así que la tabla y la restricción nombradas son las mismas en toda réplica.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura, con sus propias corridas en una copia): en verde, sin hallazgos Altos ni Medios. Sus Bajos:
+  - **La nota Hecho que faltaba:** es esta.
+  - **Dos brazos inalcanzables en `RoomData::check`:** `check_row` solo devuelve `Unique` o `ForeignKey`. Se acepta el brazo de respaldo en lugar de un `unreachable!`, porque la entrada viene de otro peer y no debe entrar en pánico (INV-W1).
+  - **Dos preexistentes, que no son de este lote:**
+    - con filas de dos tablas desconocidas en el `.snap`, el `table_id` de `SchemaMismatch` depende del orden de un `HashMap`, aunque la variante, que es lo que decide el SDK, es la misma;
+    - `FileHeader::decode` y el largo mínimo del `.snap` dan `WalCorruption` por un daño del `.snap`, que como todo daño lleva a descartar la réplica, y el lote lo deja así.
+- **Chequeos:** fmt, clippy, test, doc y el build de wasm32 en verde; `cargo test --release -- --ignored` de `zemdb-storage`, con los fuzzers con restricciones.
+- **Tamaño:** unas 20 líneas de producción, más docstrings.
+- **Desvíos:** `fail_point.rs` no cambia. El plan lo listaba entre los archivos, pero los puntos se nombran con strings y alcanza `io_result`. La fila del Lote 3 en la tabla de lotes había quedado en ⬜, y se corrigió en este lote.
 
 ### Lote 5 · `reload_schema` (`zemdb-storage`) · ⬜
 **Objetivo:** cambiar el esquema de una sala abierta sin cerrarla (DC5, DEF-34), con INV-S7.
@@ -375,4 +413,4 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 
 ## 3. Seguimiento
 
-**Avance:** Lote 0 cerrado el 23 de Octubre de 2026, con la revisión cruzada en verde en su quinta ronda; Lote 1 cerrado el mismo día. DC17 adoptada el 23 de Octubre, con renombrar un archivo abierto como operación del trait (el refactor de los Lotes 7 a 9 queda sin cambio de comportamiento). Lote 2 cerrado el 23 de Octubre. Lote 3 cerrado el 24 de Octubre. El próximo es el Lote 4.
+**Avance:** Lote 0 cerrado el 23 de Octubre de 2026, con la revisión cruzada en verde en su quinta ronda; Lote 1 cerrado el mismo día. DC17 adoptada el 23 de Octubre, con renombrar un archivo abierto como operación del trait (el refactor de los Lotes 7 a 9 queda sin cambio de comportamiento). Lote 2 cerrado el 23 de Octubre. Lote 3 cerrado el 24 de Octubre, y el Lote 4 el mismo día. El próximo es el Lote 5.

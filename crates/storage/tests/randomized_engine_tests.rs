@@ -1081,7 +1081,9 @@ fn check_damaged_snapshots(seed: u64, cases: u64, schema: Schema) {
             Err(error) => assert!(
                 matches!(
                     error,
-                    StorageError::SnapshotCorruption(_) | StorageError::SnapshotHeadMismatch { .. }
+                    StorageError::SnapshotCorruption(_)
+                        | StorageError::SnapshotConstraints { .. }
+                        | StorageError::SnapshotHeadMismatch { .. }
                 ),
                 "{error:?}"
             ),
@@ -1101,7 +1103,7 @@ fn damaged_snapshots_never_panic_apply_snapshot_long() {
 }
 
 /// Damaged snapshots checked against a schema with constraints: a snapshot whose rows break one
-/// is a corruption error too, never a panic, and one accepted meets them.
+/// is a typed error too (`SnapshotConstraints`), never a panic, and one accepted meets them.
 #[test]
 fn damaged_snapshots_with_constraints_never_panic_apply_snapshot() {
     check_damaged_snapshots(0xDA5_0003, 2_000, constrained_sample_schema());
@@ -1151,7 +1153,7 @@ fn uuid(rng: &mut Rng) -> Value {
 
 /// Snapshots of random states written without constraints, applied to both engines with
 /// [`constrained_sample_schema`]: each is installed if and only if a walk of its tables finds
-/// that it meets the constraints, and is otherwise a corruption error that names one it breaks.
+/// that it meets the constraints, and is otherwise `SnapshotConstraints`, naming one it breaks.
 fn check_unchecked_states(seed: u64, cases: u64) {
     let rt = runtime();
     let room = RoomId::new("unchecked").unwrap();
@@ -1185,10 +1187,10 @@ fn check_unchecked_states(seed: u64, cases: u64) {
                         assert_eq!(dump(target, &room, &tables).await, rows);
                         accepted += 1;
                     }
-                    Err(StorageError::SnapshotCorruption(message)) => {
+                    Err(StorageError::SnapshotConstraints { constraint, .. }) => {
                         assert!(
-                            broken.iter().any(|name| message.contains(name.as_str())),
-                            "refused for {message}, breaking {broken:?}"
+                            broken.contains(&constraint),
+                            "refused for {constraint}, breaking {broken:?}"
                         );
                         assert_eq!(target.get_head_seq(&room).await.unwrap().get(), 0);
                         refused += 1;
@@ -1301,6 +1303,7 @@ fn check_damaged_room_files(seed: u64, cases: u64, schema: Schema) {
                     matches!(
                         error,
                         StorageError::SnapshotCorruption(_)
+                            | StorageError::SnapshotConstraints { .. }
                             | StorageError::WalCorruption(_)
                             | StorageError::SchemaMismatch { .. }
                     ),
@@ -1323,7 +1326,7 @@ fn damaged_room_files_never_panic_open_room_long() {
 }
 
 /// Damaged room files opened with a schema with constraints: a snapshot whose rows break one is
-/// a corruption error too, never a panic, and a room opened meets them.
+/// a typed error too (`SnapshotConstraints`), never a panic, and a room opened meets them.
 #[test]
 fn damaged_room_files_with_constraints_never_panic_open_room() {
     check_damaged_room_files(0xDA5_1003, 100, constrained_sample_schema());

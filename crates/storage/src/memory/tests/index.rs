@@ -465,14 +465,15 @@ fn int(value: i64) -> Value {
 }
 
 /// Rows that break each constraint of [`evolved_schema`] that can be broken alone, with the
-/// name of the constraint the error must give: a repeated `UNIQUE` key, in a column of the
-/// table and in one added later, and a foreign key without its parent row, to another table and
-/// to the table itself. Where several constraints are broken, the first table by id and, within
-/// it, the first row by key is named.
-fn rows_that_break_a_constraint() -> Vec<(&'static str, Vec<TableRow>)> {
+/// table and the name of the constraint the error must give: a repeated `UNIQUE` key, in a
+/// column of the table and in one added later, and a foreign key without its parent row, to
+/// another table and to the table itself. Where several constraints are broken, the first table
+/// by id and, within it, the first row by key is named.
+fn rows_that_break_a_constraint() -> Vec<(u16, &'static str, Vec<TableRow>)> {
     let null = Value::Null;
     vec![
         (
+            PARENTS,
             "parents_code",
             vec![
                 (PARENTS, vec![int(1), s("dup"), null.clone()]),
@@ -480,6 +481,7 @@ fn rows_that_break_a_constraint() -> Vec<(&'static str, Vec<TableRow>)> {
             ],
         ),
         (
+            PARENTS,
             "parents_tag",
             vec![
                 (PARENTS, vec![int(1), s("a"), null.clone(), s("t")]),
@@ -487,6 +489,7 @@ fn rows_that_break_a_constraint() -> Vec<(&'static str, Vec<TableRow>)> {
             ],
         ),
         (
+            CHILDREN,
             "children_x",
             vec![
                 (
@@ -514,6 +517,7 @@ fn rows_that_break_a_constraint() -> Vec<(&'static str, Vec<TableRow>)> {
             ],
         ),
         (
+            CHILDREN,
             "children_parent",
             vec![
                 (PARENTS, vec![int(1)]),
@@ -522,6 +526,7 @@ fn rows_that_break_a_constraint() -> Vec<(&'static str, Vec<TableRow>)> {
         ),
         // `(up_b, up_a)` is `(3, 2)`: the child `a = 3, b = 2`, which does not exist.
         (
+            CHILDREN,
             "children_up",
             vec![
                 (CHILDREN, vec![int(2), int(3), null.clone(), int(2), int(3)]),
@@ -530,6 +535,7 @@ fn rows_that_break_a_constraint() -> Vec<(&'static str, Vec<TableRow>)> {
         ),
         // Two tables break a constraint: the first by id is named.
         (
+            PARENTS,
             "parents_code",
             vec![
                 (
@@ -560,6 +566,7 @@ fn rows_that_break_a_constraint() -> Vec<(&'static str, Vec<TableRow>)> {
         ),
         // Two rows break a constraint each: the first by key is named.
         (
+            CHILDREN,
             "children_parent",
             vec![
                 (CHILDREN, vec![int(2), int(2), null.clone(), int(2), int(3)]),
@@ -569,25 +576,10 @@ fn rows_that_break_a_constraint() -> Vec<(&'static str, Vec<TableRow>)> {
     ]
 }
 
-/// The names of every `UNIQUE` constraint and foreign key of `schema`.
-fn constraint_names(schema: &Schema) -> Vec<String> {
-    schema
-        .tables()
-        .flat_map(|table| {
-            let unique = table
-                .unique_constraints()
-                .iter()
-                .map(UniqueConstraint::name);
-            unique.chain(table.foreign_keys().iter().map(ForeignKey::name))
-        })
-        .map(str::to_string)
-        .collect()
-}
-
 /// Applies to `room`, open with [`constrained_schema`] and holding random batches, snapshots
 /// ahead of it that break a constraint of [`evolved_schema`], the schema passed with them. Each
-/// is `SnapshotCorruption` naming the constraint, and only it, and leaves the head, the schema,
-/// the rows and the indexes as they were. Returns the room's contents.
+/// is `SnapshotConstraints` naming the table and the constraint, and leaves the head, the
+/// schema, the rows and the indexes as they were. Returns the room's contents.
 pub(crate) async fn snapshots_that_break_a_constraint_change_nothing<E: RoomContents>(
     engine: &E,
     room: &RoomId,
@@ -597,20 +589,20 @@ pub(crate) async fn snapshots_that_break_a_constraint_change_nothing<E: RoomCont
     let head = log.head();
     let (schema, before) = checked_contents(engine, room).await;
 
-    for (constraint, rows) in rows_that_break_a_constraint() {
+    for (table, constraint, rows) in rows_that_break_a_constraint() {
         let (_, snapshot) = snapshot_with(&unconstrained_schema(), rows, head + 3).await;
         let err = engine
             .apply_snapshot(room, evolved_schema(), snapshot.into(), (head + 3).into())
             .await
             .unwrap_err();
-        let StorageError::SnapshotCorruption(message) = &err else {
+        let StorageError::SnapshotConstraints {
+            table_id,
+            constraint: named,
+        } = &err
+        else {
             panic!("{constraint}: {err:?}");
         };
-        let named: Vec<String> = constraint_names(&evolved_schema())
-            .into_iter()
-            .filter(|name| message.contains(&format!("{name:?}")))
-            .collect();
-        assert_eq!(named, [constraint], "{message}");
+        assert_eq!((*table_id, named.as_str()), (table, constraint));
         assert_eq!(engine.get_head_seq(room).await.unwrap().get(), head);
         let (after_schema, after) = checked_contents(engine, room).await;
         assert_eq!(after_schema, schema, "{constraint}");

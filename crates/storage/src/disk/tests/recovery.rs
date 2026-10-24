@@ -208,6 +208,51 @@ async fn failed_snapshot_existence_check_fails_open_and_keeps_the_snapshot() {
     assert_rows(&engine, &room, 3).await;
 }
 
+/// An error reading the snapshot's header or body, at `point`, fails the open with `Io`, not
+/// as a damaged snapshot: its length was checked before the read, so the error is not a short
+/// file. The room's files keep their bytes, and the next open reads them.
+async fn snapshot_read_error_is_io_and_keeps_the_files(point: &'static str) {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("snapshot-read-failure").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    let snap_path = engine.snap_file_path(&room);
+    let wal_path = engine.wal_file_path(&room);
+    apply_range(&engine, &room, 1..=3).await;
+    engine.compact_room(&room).await.unwrap();
+    apply_range(&engine, &room, 4..=5).await;
+    engine.close_room(&room).await.unwrap();
+    let files = || {
+        (
+            std::fs::read(&snap_path).unwrap(),
+            std::fs::read(&wal_path).unwrap(),
+        )
+    };
+    let before = files();
+
+    let engine = engine_at(dir.path());
+    fail_point::arm(point, &snap_path);
+    let result = engine.open_room(&room, schema()).await;
+    fail_point::disarm(point, &snap_path);
+    assert!(
+        matches!(result, Err(StorageError::Io(_))),
+        "{point}: {result:?}"
+    );
+    assert!(files() == before, "{point}: a file changed");
+
+    engine.open_room(&room, schema()).await.unwrap();
+    assert_rows(&engine, &room, 5).await;
+}
+
+#[tokio::test]
+async fn snapshot_header_read_error_is_io_and_keeps_the_files() {
+    snapshot_read_error_is_io_and_keeps_the_files("recovery.snapshot_header").await;
+}
+
+#[tokio::test]
+async fn snapshot_body_read_error_is_io_and_keeps_the_files() {
+    snapshot_read_error_is_io_and_keeps_the_files("recovery.snapshot_body").await;
+}
+
 #[tokio::test]
 async fn failed_initial_snapshot_write_leaves_no_snapshot() {
     let dir = tempfile::tempdir().unwrap();

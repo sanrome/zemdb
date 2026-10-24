@@ -81,7 +81,7 @@ impl RoomData {
     }
 
     /// [`RoomData::build`], for rows that must meet the constraints of `schema`: a snapshot,
-    /// received from another peer or opened from disk. Otherwise `SnapshotCorruption`.
+    /// received from another peer or opened from disk. Otherwise `SnapshotConstraints`.
     pub(crate) fn build_checked(
         schema: &Schema,
         tables: HashMap<u16, Table>,
@@ -91,7 +91,7 @@ impl RoomData {
         Ok(data)
     }
 
-    /// `SnapshotCorruption` if the rows break a constraint of `schema`: a `UNIQUE` key that
+    /// `SnapshotConstraints` if the rows break a constraint of `schema`: a `UNIQUE` key that
     /// another row repeats, or a foreign key without its parent row. Each row is checked as
     /// [`apply_operation`] checks an insert of it on these rows, so a key with a `NULL` is not
     /// checked and a row may reference itself. Tables go in id order and rows in key order, so
@@ -104,10 +104,17 @@ impl RoomData {
             let rows = self.tables.get(&table.table_id()).into_iter().flatten();
             for (pk, row) in rows {
                 if let Some(reason) = check_row(self, schema, table, pk, row, None) {
-                    return Err(StorageError::SnapshotCorruption(format!(
-                        "Snapshot table '{}' breaks a constraint: {reason:?}",
-                        table.name()
-                    )));
+                    // `check_row` only gives the reasons of a constraint.
+                    let constraint = match reason {
+                        RejectReason::Unique { constraint }
+                        | RejectReason::ForeignKey { constraint }
+                        | RejectReason::Restrict { constraint } => constraint,
+                        other => format!("{other:?}"),
+                    };
+                    return Err(StorageError::SnapshotConstraints {
+                        table_id: table.table_id(),
+                        constraint,
+                    });
                 }
             }
         }
@@ -453,7 +460,8 @@ impl RoomSnapshotPayload {
 /// Decodes a snapshot envelope that `apply_snapshot` received and checks it before anything is
 /// replaced: its head sequence must be `expected_head_seq`, and every table and row must be
 /// valid under `schema` (a known table, a valid key and row, and the row's key columns equal to
-/// the key it is stored under), and the rows must meet the constraints of `schema`. Tables of
+/// the key it is stored under; otherwise `SnapshotCorruption`), and the rows must meet the
+/// constraints of `schema` (otherwise `SnapshotConstraints`). Tables of
 /// `schema` the snapshot does not contain are added empty. Returns the snapshot's head sequence
 /// and its rows, with the indexes of the constraints of `schema` built from them.
 ///

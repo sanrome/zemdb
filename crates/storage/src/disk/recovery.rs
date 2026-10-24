@@ -197,12 +197,14 @@ fn ensure_known_table(
 }
 
 /// Loads the base snapshot from `snap_path` (`room_{id}.snap`), verifying the header and the
-/// CRC32 of the compressed payload before decompressing it. A table with rows that `schema`
-/// does not have is `SchemaMismatch`; an empty one is dropped (a snapshot holds every table of
-/// the schema it was compacted with, empty ones included). The indexes of the constraints of
-/// `schema` are then built from its rows, and the rows checked against those constraints, on
-/// the blocking pool: rows that break one are `SnapshotCorruption`. Both errors come before
-/// any file that holds data of the room changes.
+/// CRC32 of the compressed payload before decompressing it. The file's length is checked
+/// before each read, so an error reading the header or the payload is `Io`, not a damaged
+/// snapshot. A table with rows that `schema` does not have is `SchemaMismatch`; an empty one is
+/// dropped (a snapshot holds every table of the schema it was compacted with, empty ones
+/// included). The indexes of the constraints of `schema` are then built from its rows, and the
+/// rows checked against those constraints, on the blocking pool: rows that break one are
+/// `SnapshotConstraints`. Every error comes before any file that holds data of the room
+/// changes.
 ///
 /// A new room has none: an empty one is staged in a temporary file and renamed into place, so a
 /// failure or crash never leaves a partial snapshot behind.
@@ -243,12 +245,8 @@ async fn load_snapshot(
 
     let mut snap_reader = BufReader::with_capacity(64 * 1024, snap_file);
     let mut header_bytes = [0u8; HEADER_SIZE];
-    snap_reader
-        .read_exact(&mut header_bytes)
-        .await
-        .map_err(|e| {
-            StorageError::WalCorruption(format!("Failed to read snapshot file header: {e}"))
-        })?;
+    let read = snap_reader.read_exact(&mut header_bytes).await;
+    fail_point::io_result("recovery.snapshot_header", snap_path, read)?;
 
     let header = FileHeader::decode(&header_bytes)?;
     base.snapshot_len = header.snapshot_compressed_len;
@@ -266,12 +264,8 @@ async fn load_snapshot(
     }
 
     let mut compressed_snap = vec![0u8; base.snapshot_len as usize];
-    snap_reader
-        .read_exact(&mut compressed_snap)
-        .await
-        .map_err(|e| {
-            StorageError::SnapshotCorruption(format!("Failed to read snapshot bytes: {e}"))
-        })?;
+    let read = snap_reader.read_exact(&mut compressed_snap).await;
+    fail_point::io_result("recovery.snapshot_body", snap_path, read)?;
 
     // Validate compressed snapshot payload CRC32 before decompression
     let actual_payload_crc = crc32fast::hash(&compressed_snap);

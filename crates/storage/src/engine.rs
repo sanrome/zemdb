@@ -98,8 +98,13 @@ pub trait StorageEngine: EngineConcurrencyBounds {
     /// Opens or registers a room with its schema. A disk room whose snapshot or WAL holds data
     /// of a table that `schema` does not have is not opened (`SchemaMismatch`), and that data
     /// stays on disk for a later open with a schema that has the table. Neither is one whose
-    /// snapshot breaks a constraint of `schema` (`SnapshotCorruption`), and its files stay as
+    /// snapshot breaks a constraint of `schema` (`SnapshotConstraints`), and its files stay as
     /// they were.
+    ///
+    /// The error tells whether the room's files are damaged: `SnapshotCorruption` and
+    /// `WalCorruption` are a damaged content. `SchemaMismatch` and `SnapshotConstraints` are
+    /// not (the files hold data the schema does not cover, or rows written under other
+    /// constraints), and neither is an I/O error reading the files (`Io`).
     async fn open_room(&self, room_id: &RoomId, schema: Schema) -> Result<(), StorageError>;
 
     /// Closes a room, releasing any associated resources or file handles.
@@ -188,8 +193,9 @@ pub trait StorageEngine: EngineConcurrencyBounds {
     ///   Whether `schema` is the room's registered schema is up to the caller.
     /// - The rows must meet the constraints of `schema`, as applying the log leaves them: no
     ///   `UNIQUE` key without a `NULL` repeats, and every foreign key without a `NULL` has its
-    ///   parent row (a row may reference itself); otherwise `StorageError::SnapshotCorruption`,
-    ///   naming the table and the constraint.
+    ///   parent row (a row may reference itself); otherwise
+    ///   `StorageError::SnapshotConstraints`, naming the table and the constraint. The
+    ///   snapshot is not damaged: its rows were written under other constraints.
     ///
     /// Outside WebAssembly the snapshot is decoded and checked on the blocking pool. Then:
     /// - A snapshot behind the room's head sequence is rejected with
