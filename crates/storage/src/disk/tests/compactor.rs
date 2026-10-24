@@ -1,7 +1,8 @@
 use super::{absorbing_wal_path, compacting_wal_path};
+use crate::disk::format::HEADER_SIZE;
 use crate::disk::tests::support::*;
 use crate::fail_point;
-use crate::{DiskStorageEngine, StorageEngine, StorageError};
+use crate::{DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError};
 use zemdb_core::{ColumnUpdate, Operation, PrimaryKey, RoomId, SequenceNumber, Value};
 
 async fn snapshot_seq(engine: &DiskStorageEngine, room: &RoomId) -> SequenceNumber {
@@ -169,6 +170,52 @@ async fn crash_between_absorbing_and_truncating_wal_recovers_without_duplicates(
     let reopened = reopen(engine, dir.path(), &room).await;
     assert_rows(&reopened, &room, 10).await;
     apply_range(&reopened, &room, 11..=11).await;
+}
+
+/// The snapshot of a compaction is compressed at the engine's `zstd_level`, and the room records
+/// its compressed length.
+#[tokio::test]
+async fn compaction_compresses_the_snapshot_at_its_zstd_level() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("zstd-level").unwrap();
+    let options = DiskStorageOptions::new(dir.path())
+        .auto_compact(false)
+        .zstd_level(19);
+    let engine = DiskStorageEngine::new(options).unwrap();
+    engine.open_room(&room, schema()).await.unwrap();
+    apply_range(&engine, &room, 1..=200).await;
+    engine.compact_room(&room).await.unwrap();
+
+    let snap = std::fs::read(engine.snap_file_path(&room)).unwrap();
+    let body = &snap[HEADER_SIZE..];
+    let payload = zstd::decode_all(body).unwrap();
+    assert_eq!(zstd::encode_all(&payload[..], 19).unwrap(), body);
+    assert_ne!(zstd::encode_all(&payload[..], 1).unwrap(), body);
+    let room = engine.get_room(&room).await.unwrap();
+    assert_eq!(room.state.read().await.snapshot_len, body.len() as u64);
+}
+
+/// An absorption copies `.wal.compacting` a chunk at a time: a copy of several chunks keeps every
+/// record of it, in order.
+#[tokio::test]
+async fn absorbing_a_rotated_wal_of_several_copy_chunks_keeps_every_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("absorb-chunks").unwrap();
+    let engine = open_engine(dir.path(), &room).await;
+    let compacting_path = compacting_wal_path(&engine.wal_file_path(&room));
+    let name = "x".repeat(300 * 1024);
+    for seq in 1..=8 {
+        let row = insert_named(seq, seq as i64, &name);
+        engine.apply_batch(&room, vec![row]).await.unwrap();
+    }
+    fail_compaction_leaving_compacting_wal(&engine, &room).await;
+    let len = std::fs::metadata(&compacting_path).unwrap().len();
+    assert!(len > 2 * super::COPY_CHUNK as u64, "{len}");
+
+    apply_range(&engine, &room, 9..=10).await;
+    fail_compaction_leaving_compacting_wal(&engine, &room).await;
+    let reopened = reopen(engine, dir.path(), &room).await;
+    assert_rows(&reopened, &room, 10).await;
 }
 
 /// Fails the absorption of the active WAL into an orphan `.wal.compacting` at `fail_point_name`,

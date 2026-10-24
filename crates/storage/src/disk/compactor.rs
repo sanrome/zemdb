@@ -1,11 +1,10 @@
-use fs2::FileExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use zemdb_core::{RoomId, SequenceNumber};
 
-use crate::disk::format::FileHeader;
+use crate::disk::format::{FileHeader, HEADER_SIZE};
 use crate::disk::{DiskRoom, DiskStorageOptions, DiskWal, PendingWrite};
 use crate::error::StorageError;
 use crate::fail_point;
@@ -136,6 +135,7 @@ pub(crate) async fn compact_room_cow<F: RoomFiles>(
     // Phase 2
     fail_point::check("compaction.phase2", &room.snap_path)?;
     let staged = stage_snapshot(
+        files,
         &room.snap_path,
         cut_seq,
         &snapshot_tables,
@@ -187,9 +187,9 @@ async fn rotate_wal_to_compacting<F: RoomFiles>(
     wal_compacting_path: &Path,
 ) -> Result<(), StorageError> {
     let files = &*room.files;
-    // The WAL is renamed by path with its handle open, which the native layer allows; a layer
-    // that refuses it fails here, before anything changed.
-    files.rename(&room.wal_path, wal_compacting_path).await?;
+    // The only file renamed with its handle open, so through its handle, which follows it: a
+    // failed rename leaves the WAL where it was.
+    wal.file.rename(wal_compacting_path).await?;
     fail_point::pause("compaction.rotate_renamed", &room.wal_path).await;
     fail_point::panic_point("compaction.rotated", &room.wal_path);
 
@@ -201,9 +201,7 @@ async fn rotate_wal_to_compacting<F: RoomFiles>(
         Err(err) => {
             // The open handle still points at the renamed file. Move it back so that
             // subsequent writes keep landing in the file recovery reads as the active WAL.
-            if let Err(rollback_err) =
-                roll_back_rotation(files, &room.wal_path, wal_compacting_path).await
-            {
+            if let Err(rollback_err) = roll_back_rotation(files, wal, &room.wal_path).await {
                 // Writes would now land in `.wal.compacting`, and a later compaction would
                 // absorb that file into itself. Only recovery can sort this out safely.
                 wal.mark_failed(format!(
@@ -227,13 +225,14 @@ async fn rotate_wal_to_compacting<F: RoomFiles>(
     )
 }
 
-async fn roll_back_rotation(
-    files: &impl RoomFiles,
+/// Renames the rotated WAL, still open in `wal`, back to `wal_path`.
+async fn roll_back_rotation<F: RoomFiles>(
+    files: &F,
+    wal: &mut DiskWal<F>,
     wal_path: &Path,
-    wal_compacting_path: &Path,
 ) -> Result<(), StorageError> {
     fail_point::check("compaction.rotate_rollback", wal_path)?;
-    files.rename(wal_compacting_path, wal_path).await?;
+    wal.file.rename(wal_path).await?;
     sync_parent(files, wal_path).await
 }
 
@@ -282,8 +281,7 @@ async fn absorb_wal_into_compacting<F: RoomFiles>(
     let wal_bytes = wal.fail_on_err("Reading the active WAL failed", read_result)?;
 
     if !wal_bytes.is_empty() {
-        let (compacting, key) = (wal_compacting_path.to_path_buf(), room.wal_path.clone());
-        run_blocking(move || replace_with_absorbed_copy(&compacting, &wal_bytes, &key)).await?;
+        replace_with_absorbed_copy(files, wal_compacting_path, wal_bytes, &room.wal_path).await?;
         // The rename may not be durable, and a failed directory sync cannot be retried: emptying
         // the active WAL could lose its records.
         let synced = async {
@@ -317,30 +315,46 @@ async fn truncate_wal<F: RoomFiles>(
     Ok(())
 }
 
+/// Bytes an absorption copies from `.wal.compacting` at a time.
+const COPY_CHUNK: usize = 1024 * 1024;
+
 /// Writes `compacting_path` followed by `wal_bytes` to `absorbing_wal_path`, syncs it and
-/// renames it over `compacting_path`. Blocking. On failure nothing visible changed: the temporary
-/// file is removed, and one left behind by a crash is removed when the room is next opened.
-fn replace_with_absorbed_copy(
+/// renames it over `compacting_path`. On failure nothing visible changed: the temporary file is
+/// removed, and one left behind by a crash is removed when the room is next opened.
+async fn replace_with_absorbed_copy(
+    files: &impl RoomFiles,
     compacting_path: &Path,
-    wal_bytes: &[u8],
+    wal_bytes: Vec<u8>,
     wal_path: &Path,
 ) -> Result<(), StorageError> {
-    use std::io::Write;
-
     let tmp_path = absorbing_wal_path(wal_path);
-    let replaced = (|| {
-        let mut tmp = std::fs::File::create(&tmp_path)?;
-        std::io::copy(&mut std::fs::File::open(compacting_path)?, &mut tmp)?;
+    // `.wal.compacting` is closed once copied and the copy before its rename (neither may be
+    // open then); on an error, each is closed when the block ends, before the removal.
+    let replaced = async {
+        let tmp = files.create(&tmp_path).await?;
+        let copied = {
+            let compacting = files.open_read(compacting_path).await?;
+            let len = compacting.size().await?;
+            let mut copied = 0;
+            while copied < len {
+                let chunk = (len - copied).min(COPY_CHUNK as u64) as usize;
+                tmp.write_at(copied, compacting.read_at(copied, chunk).await?)
+                    .await?;
+                copied += chunk as u64;
+            }
+            copied
+        };
         fail_point::check("compaction.absorb_write", wal_path)?;
-        tmp.write_all(wal_bytes)?;
-        tmp.sync_all()?;
+        tmp.write_at(copied, wal_bytes).await?;
+        tmp.sync_all().await?;
         drop(tmp);
-        let renamed = std::fs::rename(&tmp_path, compacting_path);
+        let renamed = files.rename(&tmp_path, compacting_path).await;
         fail_point::io_result("compaction.absorb_rename", wal_path, renamed)?;
         Ok::<(), StorageError>(())
-    })();
+    }
+    .await;
     if replaced.is_err() {
-        match std::fs::remove_file(&tmp_path) {
+        match files.remove(&tmp_path).await {
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
                 tracing::warn!(path = ?tmp_path, error = %err, "Could not remove an absorbed WAL copy");
             }
@@ -350,61 +364,32 @@ fn replace_with_absorbed_copy(
     replaced
 }
 
-/// Compresses an already serialized snapshot payload and writes it, with its header, to a
-/// unique temporary file next to `snap_path`, synced to disk.
-fn stage_snapshot_blocking(
-    snap_path: &Path,
-    head_seq: SequenceNumber,
-    serialized: &[u8],
-    zstd_level: i32,
-    room_id: &RoomId,
-) -> Result<StagedSnapshot, StorageError> {
-    let compressed = zstd::encode_all(serialized, zstd_level)
-        .map_err(|e| StorageError::Other(format!("Zstd compression failed: {e}")))?;
-
-    let header = FileHeader::new(
-        head_seq.get(),
-        head_seq.get(),
-        compressed.len() as u64,
-        crc32fast::hash(&compressed),
-    );
-    stage_file_blocking(snap_path, &header, &compressed, room_id)
-}
-
-/// Writes `header` followed by `payload` to a unique temporary file next to `snap_path`, synced
-/// to disk. On failure the temporary file is removed; one left behind by a crash is removed when
-/// the room is next opened.
-fn stage_file_blocking(
+/// Writes `header` followed by `payload` to a unique temporary file next to `snap_path`, created
+/// with its lock, and syncs it. On failure the temporary file is removed; one left behind by a
+/// crash is removed when the room is next opened.
+async fn stage_file(
+    files: &impl RoomFiles,
     snap_path: &Path,
     header: &FileHeader,
-    payload: &[u8],
+    payload: Vec<u8>,
     room_id: &RoomId,
 ) -> Result<StagedSnapshot, StorageError> {
-    use std::io::Write;
-
     let tmp_path = snap_path.with_extension(format!("snap.tmp.{}", uuid::Uuid::new_v4()));
+    let compressed_len = payload.len() as u64;
 
-    let std_tmp = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&tmp_path)?;
-
-    let written = (|| {
-        std_tmp
-            .try_lock_exclusive()
-            .map_err(|_| StorageError::RoomLocked(room_id.clone()))?;
+    let tmp = files.create_locked(&tmp_path).await?;
+    // The handle is closed when the block ends, before the removal.
+    let written = async {
+        let tmp = tmp.ok_or_else(|| StorageError::RoomLocked(room_id.clone()))?;
         fail_point::check("snapshot.stage_write", snap_path)?;
-        let mut writer = std::io::BufWriter::new(&std_tmp);
-        writer.write_all(&header.encode())?;
-        writer.write_all(payload)?;
-        writer.flush()?;
-        drop(writer);
-        std_tmp.sync_all()?;
+        tmp.write_at(0, header.encode().to_vec()).await?;
+        tmp.write_at(HEADER_SIZE as u64, payload).await?;
+        tmp.sync_all().await?;
         Ok::<(), StorageError>(())
-    })();
+    }
+    .await;
     if let Err(err) = written {
-        drop(std_tmp);
-        if let Err(remove_err) = std::fs::remove_file(&tmp_path) {
+        if let Err(remove_err) = files.remove(&tmp_path).await {
             tracing::warn!(path = ?tmp_path, error = %remove_err, "Could not remove a staged snapshot");
         }
         return Err(err);
@@ -412,32 +397,39 @@ fn stage_file_blocking(
 
     Ok(StagedSnapshot {
         tmp_path,
-        compressed_len: payload.len() as u64,
+        compressed_len,
     })
 }
 
 /// Serializes a snapshot of `tables` at `head_seq` and writes it to a synced temporary file
 /// next to `snap_path`. Nothing visible changes until the file is renamed into place.
 pub(crate) async fn stage_snapshot(
+    files: &impl RoomFiles,
     snap_path: &Path,
     head_seq: SequenceNumber,
     tables: &HashMap<u16, Table>,
     zstd_level: i32,
     room_id: &RoomId,
 ) -> Result<StagedSnapshot, StorageError> {
-    let snap_path = snap_path.to_path_buf();
-    let room_id = room_id.clone();
     // O(1) clones of the tables, serialized on the blocking pool with the compression.
     let tables = tables.clone();
-    run_blocking(move || {
+    let (header, compressed) = run_blocking(move || {
         let serialized = bincode::serialize(&RoomSnapshotRef {
             head_seq,
             tables: &tables,
         })
         .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        stage_snapshot_blocking(&snap_path, head_seq, &serialized, zstd_level, &room_id)
+        let compressed = crate::snapshot::compress_zstd(&serialized, zstd_level)?;
+        let header = FileHeader::new(
+            head_seq.get(),
+            head_seq.get(),
+            compressed.len() as u64,
+            crc32fast::hash(&compressed),
+        );
+        Ok::<_, StorageError>((header, compressed))
     })
-    .await
+    .await?;
+    stage_file(files, snap_path, &header, compressed, room_id).await
 }
 
 /// Atomically replaces `snap_path` with a snapshot of `tables` at `head_seq`.
@@ -452,7 +444,7 @@ pub(crate) async fn write_snapshot_file(
     zstd_level: i32,
     room_id: &RoomId,
 ) -> Result<u64, StorageError> {
-    let staged = stage_snapshot(snap_path, head_seq, tables, zstd_level, room_id).await?;
+    let staged = stage_snapshot(files, snap_path, head_seq, tables, zstd_level, room_id).await?;
     install_staged(files, snap_path, staged).await
 }
 
@@ -464,13 +456,14 @@ pub(crate) async fn write_empty_snapshot_file(
     snap_path: &Path,
     room_id: &RoomId,
 ) -> Result<(), StorageError> {
-    let staged = {
-        let (snap_path, room_id) = (snap_path.to_path_buf(), room_id.clone());
-        run_blocking(move || {
-            stage_file_blocking(&snap_path, &FileHeader::new(0, 0, 0, 0), &[], &room_id)
-        })
-        .await?
-    };
+    let staged = stage_file(
+        files,
+        snap_path,
+        &FileHeader::new(0, 0, 0, 0),
+        Vec::new(),
+        room_id,
+    )
+    .await?;
     install_staged(files, snap_path, staged).await?;
     Ok(())
 }

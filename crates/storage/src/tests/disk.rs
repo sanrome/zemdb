@@ -32,6 +32,10 @@ pub(super) mod support;
 #[path = "../disk/tests/simulation.rs"]
 mod simulation;
 
+/// The disk engine on a file layer that fails like the Origin Private File System.
+#[path = "../disk/tests/opfs_like.rs"]
+mod opfs_like;
+
 /// A snapshot whose rows have keys `first_key..first_key + count`, one batch per row, so that its
 /// head sequence is `count`.
 async fn snapshot_with_rows(room: &RoomId, first_key: i64, count: u64) -> Vec<u8> {

@@ -233,9 +233,8 @@ pub(crate) struct DiskRoom<F: RoomFiles> {
 /// - `room_{id}.wal`: the append-only WAL of batches since that snapshot, each framed with
 ///   `0xBA7C` and a CRC32.
 ///
-/// The room's files are opened and locked, its WAL written, read, truncated and synced, and its
-/// directory changed through the file layer `F` (see [`crate::files`]), by default the file
-/// system of the process.
+/// Every operation on the room's files goes through the file layer `F` (see [`crate::files`]),
+/// by default the file system of the process.
 ///
 /// See `DiskRoom` for the locking of an open room and `compactor::compact_room_cow` for how
 /// the WAL is folded into a new snapshot.
@@ -769,6 +768,7 @@ impl<F: RoomFiles> StorageEngine for DiskStorageEngine<F> {
 
             // Nothing visible changes until the staged snapshot is renamed into place.
             let staged = stage_snapshot(
+                &*room.files,
                 &room.snap_path,
                 snapshot_head,
                 data.tables(),

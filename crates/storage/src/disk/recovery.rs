@@ -1,5 +1,4 @@
 use std::path::Path;
-use tokio::io::{AsyncReadExt, BufReader};
 
 use zemdb_core::{
     decode_batch_payload, parse_batch_header, BatchPayloadDecode, FrameAnomaly, FrameSearch,
@@ -270,8 +269,9 @@ async fn load_snapshot(
         return Ok(base);
     }
 
-    let snap_file = tokio::fs::File::from_std(std::fs::File::open(snap_path)?);
-    let snap_file_len = snap_file.metadata().await?.len();
+    // Closed when the payload is read, before anything renames a snapshot over it.
+    let snap_file = files.open_read(snap_path).await?;
+    let snap_file_len = snap_file.size().await?;
 
     if snap_file_len < HEADER_SIZE as u64 {
         return Err(StorageError::WalCorruption(format!(
@@ -279,10 +279,11 @@ async fn load_snapshot(
         )));
     }
 
-    let mut snap_reader = BufReader::with_capacity(64 * 1024, snap_file);
-    let mut header_bytes = [0u8; HEADER_SIZE];
-    let read = snap_reader.read_exact(&mut header_bytes).await;
-    fail_point::io_result("recovery.snapshot_header", snap_path, read)?;
+    let read = snap_file.read_at(0, HEADER_SIZE).await;
+    let header_bytes = fail_point::io_result("recovery.snapshot_header", snap_path, read)?;
+    let header_bytes: [u8; HEADER_SIZE] = header_bytes.try_into().map_err(|_| {
+        std::io::Error::other("the file layer read a snapshot header of another length")
+    })?;
 
     let header = FileHeader::decode(&header_bytes)?;
     base.snapshot_len = header.snapshot_compressed_len;
@@ -299,9 +300,11 @@ async fn load_snapshot(
         )));
     }
 
-    let mut compressed_snap = vec![0u8; base.snapshot_len as usize];
-    let read = snap_reader.read_exact(&mut compressed_snap).await;
-    fail_point::io_result("recovery.snapshot_body", snap_path, read)?;
+    let read = snap_file
+        .read_at(HEADER_SIZE as u64, base.snapshot_len as usize)
+        .await;
+    let compressed_snap = fail_point::io_result("recovery.snapshot_body", snap_path, read)?;
+    drop(snap_file);
 
     // Validate compressed snapshot payload CRC32 before decompression
     let actual_payload_crc = crc32fast::hash(&compressed_snap);

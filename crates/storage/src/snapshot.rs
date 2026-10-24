@@ -181,6 +181,14 @@ pub(crate) fn deserialize_zstd<T: DeserializeOwned>(
     deserialize_zstd_with::<PlatformZstd, T>(compressed, limit, exact_len)
 }
 
+/// Compresses `payload` into one Zstandard frame, as [`encode_snapshot_envelope`] compresses its
+/// body: with `zstd` at `level`. Its only user, the disk engine, does not build in WebAssembly
+/// yet; there it will be `ruzstd`'s `Fastest` level, as for the envelope.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn compress_zstd(payload: &[u8], level: i32) -> Result<Vec<u8>, StorageError> {
+    PlatformZstd::compress(payload, level)
+}
+
 /// [`deserialize_zstd`], decompressing with `Z`.
 fn deserialize_zstd_with<Z: ZstdCodec, T: DeserializeOwned>(
     compressed: &[u8],

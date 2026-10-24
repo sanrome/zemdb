@@ -1,6 +1,7 @@
 //! Helpers shared by the unit tests of the disk engine.
 
 use crate::fail_point;
+use crate::files::RoomFiles;
 use crate::{ApplyReport, DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError};
 use std::future::Future;
 use std::ops::RangeInclusive;
@@ -87,8 +88,8 @@ pub(crate) async fn open_when_unlocked(
 }
 
 /// Applies `insert(seq)` for every `seq`, one batch each.
-pub(crate) async fn apply_range(
-    engine: &DiskStorageEngine,
+pub(crate) async fn apply_range<F: RoomFiles>(
+    engine: &DiskStorageEngine<F>,
     room: &RoomId,
     seqs: RangeInclusive<u64>,
 ) {
@@ -97,7 +98,11 @@ pub(crate) async fn apply_range(
     }
 }
 
-pub(crate) async fn has_key(engine: &DiskStorageEngine, room: &RoomId, key: i64) -> bool {
+pub(crate) async fn has_key<F: RoomFiles>(
+    engine: &DiskStorageEngine<F>,
+    room: &RoomId,
+    key: i64,
+) -> bool {
     engine
         .get(room, "users", &PrimaryKey::single(key))
         .await
@@ -106,7 +111,11 @@ pub(crate) async fn has_key(engine: &DiskStorageEngine, room: &RoomId, key: i64)
 }
 
 /// Checks that the head of `room` is `last` and that every key in `1..=last` has its row.
-pub(crate) async fn assert_rows(engine: &DiskStorageEngine, room: &RoomId, last: u64) {
+pub(crate) async fn assert_rows<F: RoomFiles>(
+    engine: &DiskStorageEngine<F>,
+    room: &RoomId,
+    last: u64,
+) {
     assert_eq!(engine.get_head_seq(room).await.unwrap().get(), last);
     for key in 1..=last as i64 {
         assert!(has_key(engine, room, key).await, "row {key} lost");
@@ -114,7 +123,11 @@ pub(crate) async fn assert_rows(engine: &DiskStorageEngine, room: &RoomId, last:
 }
 
 /// Checks that `room` refuses the batch `insert(seq)` because it is marked as failed.
-pub(crate) async fn assert_room_failed(engine: &DiskStorageEngine, room: &RoomId, seq: u64) {
+pub(crate) async fn assert_room_failed<F: RoomFiles>(
+    engine: &DiskStorageEngine<F>,
+    room: &RoomId,
+    seq: u64,
+) {
     let result = engine.apply_batch(room, vec![insert(seq)]).await;
     assert!(
         matches!(result, Err(StorageError::RoomFailed { .. })),
@@ -124,8 +137,8 @@ pub(crate) async fn assert_room_failed(engine: &DiskStorageEngine, room: &RoomId
 
 /// Fails a compaction of `room` before its snapshot is staged, which leaves the rotated WAL
 /// behind as `.wal.compacting`.
-pub(crate) async fn fail_compaction_leaving_compacting_wal(
-    engine: &DiskStorageEngine,
+pub(crate) async fn fail_compaction_leaving_compacting_wal<F: RoomFiles>(
+    engine: &DiskStorageEngine<F>,
     room: &RoomId,
 ) {
     fail_point::arm("compaction.phase2", &engine.snap_file_path(room));
