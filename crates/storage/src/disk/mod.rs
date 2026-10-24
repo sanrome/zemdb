@@ -16,14 +16,15 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use zemdb_core::{CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation};
 
 use crate::disk::compactor::{
-    compact_room_cow, create_dir_all_synced, install_applied_snapshot, rename_staged_snapshot,
-    stage_snapshot, sync_file, SyncKind,
+    compact_room_cow, install_applied_snapshot, rename_staged_snapshot, stage_snapshot, sync_file,
+    SyncKind,
 };
 use crate::disk::recovery::recover_room;
 use crate::disk::wal::WalWriter;
 use crate::engine::{batched_scan, ApplyReport, RowStream, StorageEngine};
 use crate::error::StorageError;
 use crate::fail_point;
+use crate::files::native::create_dir_all_synced;
 use crate::memory::state::{
     apply_operation, decode_received_snapshot, resolve_table_id, validate_batch, RoomData, TableRef,
 };

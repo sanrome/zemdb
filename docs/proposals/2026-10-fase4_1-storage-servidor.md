@@ -2,7 +2,7 @@
 
 **Fecha:** 23 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lotes 0 a 6 cerrados; el próximo es el 7.
+**Estado:** En curso: Lotes 0 a 7 cerrados; el próximo es el 8.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.1. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -34,14 +34,14 @@ Las de la fase que implementa esta sub-fase, todas adoptadas: DC5, DC8, DC9, DC1
   - saber si existe un archivo; listar los nombres con un prefijo (los `.snap.tmp.*` que deja una compactación interrumpida); renombrar reemplazando el destino; borrar; crear el directorio de datos; y sincronizar el directorio (no-op donde no existe, como hoy en Windows).
 - **Operaciones de un archivo abierto:** leer y escribir en un offset (`read_at`, `write_at`), su largo, truncarlo (`set_len`), `sync_data` y `sync_all`. E/S posicional, sin cursor: es la forma del `FileSystemSyncAccessHandle` (`{ at }`) y evita la posición compartida de los handles clonados que hoy usa la recuperación para buscar frames.
 - **Por qué asíncrono:** en el OPFS, obtener un handle, renombrar (`move()`), borrar y listar son promesas; solo leer, escribir, truncar y `flush()` son síncronos. En nativo, cada operación corre en el pool bloqueante (`run_blocking`), como hoy `tokio::fs`, pero devuelve su error en la misma llamada: desaparece la sutileza de `write_all` de Tokio, que entrega los bytes al pool y reporta el error recién en el próximo `flush` (hoy, `sync_file` y `WalWriter::write_flushed`).
-- **Una operación soltada no aterriza después de reabrir (INV-S1, INV-L7).** `apply_batch` no corre en una tarea propia: si se suelta su future con una escritura en el pool bloqueante, `PendingWrite` marca la sala fallida, y quien la cierra y la reabre corre contra esa escritura. Hoy lo impiden el lock del handle del WAL, que retiene la operación en vuelo hasta que termina (una reapertura da `RoomLocked`), y el `flush` del `tokio::fs::File` en `close_room`, que la espera. La implementación nativa de la capa conserva los dos mecanismos: cada operación lleva al pool bloqueante un `Arc` del archivo, con su lock, y un permiso del handle, así que el lock se suelta recién cuando termina la última operación, aunque nadie la espere; y cerrar el handle (o el `sync` de `close_room`) espera ese permiso. El permiso guarda el error de la operación que nadie esperó y lo devuelve el próximo `sync` o el cierre del handle, como hoy el `flush` de Tokio: `close_room` sigue devolviendo el error de una escritura de un `apply_batch` soltado. El Lote 7 lo prueba.
+- **Una operación soltada no aterriza después de reabrir (INV-S1, INV-L7).** `apply_batch` no corre en una tarea propia: si se suelta su future con una escritura en el pool bloqueante, `PendingWrite` marca la sala fallida, y quien la cierra y la reabre corre contra esa escritura. Hoy lo impiden el lock del handle del WAL, que retiene la operación en vuelo hasta que termina (una reapertura da `RoomLocked`), y el `flush` del `tokio::fs::File` en `close_room`, que la espera. La implementación nativa de la capa conserva los dos mecanismos: cada operación lleva al pool bloqueante un `Arc` del archivo, con su lock, y un permiso del handle, así que el lock se suelta recién cuando termina la última operación, aunque nadie la espere; y toda operación siguiente sobre el handle (como el `sync` de `close_room`) espera ese permiso. El handle guarda el error de la operación que nadie esperó y lo devuelve la próxima operación sobre él (por ejemplo, el `sync` de `close_room`), que entonces no corre, como hoy el `flush` de Tokio: `close_room` sigue devolviendo el error de una escritura de un `apply_batch` soltado. El Lote 7 lo prueba.
 - **Renombrar un archivo abierto (S3).** En el OPFS, `move()` y `removeEntry()` fallan con `NoModificationAllowedError` si el origen o el destino tienen un `FileSystemSyncAccessHandle` abierto. Hoy el motor renombra un solo archivo con su handle abierto, el WAL, en dos lugares y con el mismo handle: la rotación de la compactación pasa `room_{id}.wal` a `.wal.compacting` y sigue con el handle viejo, que apunta al archivo renombrado; y si abrir el WAL nuevo falla, la vuelta atrás (`roll_back_rotation`) renombra `.wal.compacting` de vuelta, con ese handle todavía abierto. Todo lo demás (los snapshots en staging, la absorción, los borrados de `.wal.compacting` y de los temporales, la instalación de un snapshot) ya se hace sin handles abiertos en el origen ni en el destino (`compactor.rs`, `recovery.rs`). Por eso el trait tiene dos formas de renombrar:
   - **renombrar por ruta,** del directorio, sobre archivos sin handles abiertos ni en el origen ni en el destino, que es como el motor ya renombra y borra todo lo que no es el WAL;
   - **renombrar un archivo abierto,** sobre el handle, que lo sigue después del rename: la rotación y su vuelta atrás, que pasa a recibir el handle del WAL en lugar de solo las rutas. En nativo es el `rename` de hoy. En el OPFS, la implementación cierra el handle de acceso, hace `move()` y lo reabre sobre el mismo `FileSystemFileHandle`, que sigue siendo válido después de su `move()` (S3, pregunta 4); el lock de la sala impide que otra pestaña tome el archivo en el medio.
 
   Así la rotación y su vuelta atrás tienen la misma lógica en las dos plataformas, y la capa no cambia ningún comportamiento del motor en nativo. Lo que difiere es el error: en nativo, `rename` es todo o nada y el handle sigue válido, por eso la rotación propaga el error de su rename sin marcar la sala fallida (la marca si después falla la vuelta atrás o el sync del directorio); en el OPFS, cerrar, mover y reabrir tiene estados intermedios (el `move()` hecho y la reapertura fallida, o al revés), que pueden dejar un handle muerto. Es un requisito de la implementación del OPFS, en 4.5: un handle muerto hace fallar toda operación siguiente y nunca escribe en otro archivo, así que la próxima operación que escriba en el WAL (un `apply_batch`, una compactación o el truncado de un `apply_snapshot`) marca la sala fallida y la recuperación pliega `.wal.compacting`.
-- **Lo que no cambia:** el formato (`ZEM1`, frames `0xBA7C` con CRC32, `ZMSN`), el protocolo de instalación de snapshots (temporal, sync, rename, sync del directorio, purga), la recuperación y sus decisiones, los locks del motor (`compaction`, `wal`, `state`) y el de la sala, las tareas propias de `open_room`, `apply_snapshot` y la compactación, y los fail points, que siguen identificados por ruta (el de `read_only_handle`, que hoy reproduce el error diferido de un `tokio::fs::File`, conserva su nombre y su paso, pero no su mecanismo: el Lote 7 lo adapta). No cambia ningún comportamiento: lo único que se reimplementa es el mecanismo del lock del handle del WAL (y el error diferido de una escritura que nadie esperó), con el mismo efecto.
-- **Lo que queda para 4.5:** la implementación sobre el OPFS, con el renombrar de un archivo abierto (cerrar, `move()` y reabrir); cómo corren en wasm32 las tareas propias del motor (hoy `tokio::spawn`) y el trabajo de CPU que hoy va al pool bloqueante; compilar en wasm32 el motor en disco, con la compresión del `.snap` (que desde el Lote 9 pasa por la función del Lote 6, y en wasm32 es `ruzstd` `Fastest`, DC9) y la validación de `zstd_level`, que hoy usa `zstd::compression_level_range()`; y los supuestos del OPFS en `INVARIANTES.md` §2 (`flush()` vale como `fsync`, ya en DC11; que `move()` sobre un destino existente sea atómico ante un corte, sin especificar, como `flush()`). En el Lote 9, la compactación comprime con la función de compresión del Lote 6 en lugar de llamar a `zstd::encode_all`, para que en 4.5 no haya otro camino.
+- **Lo que no cambia:** el formato (`ZEM1`, frames `0xBA7C` con CRC32, `ZMSN`), el protocolo de instalación de snapshots (temporal, sync, rename, sync del directorio, purga), la recuperación y sus decisiones, los locks del motor (`compaction`, `wal`, `state`) y el de la sala, las tareas propias de `open_room`, `apply_snapshot` y la compactación, y los fail points, que siguen identificados por ruta (el de `read_only_handle`, que hoy reproduce el error diferido de un `tokio::fs::File`, conserva su nombre y su paso, pero no su mecanismo: el Lote 8 lo adapta). No cambia ningún comportamiento: lo único que se reimplementa es el mecanismo del lock del handle del WAL (y el error diferido de una escritura que nadie esperó), con el mismo efecto.
+- **Lo que queda para 4.5:** la implementación sobre el OPFS, con el renombrar de un archivo abierto (cerrar, `move()` y reabrir); cómo corren en wasm32 las tareas propias del motor (hoy `tokio::spawn`) y el trabajo de CPU que hoy va al pool bloqueante; compilar en wasm32 el motor en disco (con la capa en `async_trait(?Send)`, como `StorageEngine`, porque los handles del OPFS no son `Send`), con la compresión del `.snap` (que desde el Lote 9 pasa por la función del Lote 6, y en wasm32 es `ruzstd` `Fastest`, DC9) y la validación de `zstd_level`, que hoy usa `zstd::compression_level_range()`; y los supuestos del OPFS en `INVARIANTES.md` §2 (`flush()` vale como `fsync`, ya en DC11; que `move()` sobre un destino existente sea atómico ante un corte, sin especificar, como `flush()`). En el Lote 9, la compactación comprime con la función de compresión del Lote 6 en lugar de llamar a `zstd::encode_all`, para que en 4.5 no haya otro camino.
 - **Alternativas descartadas:** que la rotación cierre el handle antes de renombrar y lo reabra (la primera versión de esta decisión), que cambiaba la rotación y su vuelta atrás en nativo sin necesidad, porque en el OPFS la misma operación se puede resolver dentro de la implementación; un trait síncrono, que no puede abrir ni renombrar en el OPFS sin bloquear el Worker sobre una promesa; y un motor del navegador escrito aparte, que duplicaría la recuperación y la compactación, la parte con más casos de crash del storage.
 
 **S3 (spike de DC17, 23 de Octubre de 2026).** Preguntas, desde un Worker dedicado y sin Rust:
@@ -71,16 +71,16 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 | 4 | Los errores de la apertura y de `apply_snapshot` | storage | DC12 | S4, S5, C2, W1, K3 | ✅ |
 | 5 | `reload_schema` | storage | DC5 | S7, C1, C2, C3, S6, K6 | ✅ |
 | 6 | Zstd en wasm32 con `ruzstd` | storage | DC9 | W1, W2, S5, K12 | ✅ |
-| 7 | Capa de archivos: el trait y su implementación nativa | storage | DC8, DC17 | S1 a S6, L7 | ⬜ |
-| 8 | Capa de archivos: la recuperación | storage (y core, si cambia `find_valid_frame`) | DC17 | S3, S4, S6 | ⬜ |
-| 9 | Capa de archivos: la compactación y `apply_snapshot` | storage | DC17 | S1, S3, S5 | ⬜ |
+| 7 | Capa de archivos: el trait y su implementación nativa | storage | DC17 | L7 (el mecanismo de la capa) | ✅ |
+| 8 | Capa de archivos: el motor sobre ella, el WAL y el directorio | storage (y core, si cambia `find_valid_frame`) | DC8, DC17 | S1 a S6, L7 | ⬜ |
+| 9 | Capa de archivos: los snapshots y la rotación | storage | DC17 | S1, S3, S5 | ⬜ |
 | 10 | Cierre | Documentos | Todas | Todas las tocadas | ⬜ |
 
 **Orden.**
 - El Lote 0 va primero: solo documentos, con su revisión cruzada (`docs/METODOLOGIA.md` §2).
 - Los Lotes 1 a 3 tocan `core` y `server`; el 4 en adelante, `storage`. El 1 va antes del 5, que usa `evolves_from`, y el 4 antes del 5, que en disco usa la variante de DC12. El 2 y el 3 son independientes del resto.
 - El 6 es independiente de los demás, pero va antes de la capa de archivos para no mezclar su delta con ella.
-- Los Lotes 7 a 9 dependen de DC17 y van en ese orden: tocan los mismos archivos de `crates/storage/src/disk/`. Son un refactor sin cambio de comportamiento: unas 105 líneas de `disk/` tocan hoy el sistema de archivos, en unas 20 funciones, así que el cambio es de unas 200 a 250 líneas nuevas (el trait y la implementación nativa) y unas 150 a 250 cambiadas. El corte es tentativo: lo fija el Lote 7 con la forma final del trait, y si el 8 y el 9 juntos entran en ~300 líneas, van en un solo lote.
+- Los Lotes 7 a 9 dependen de DC17 y van en ese orden: tocan los mismos archivos de `crates/storage/src/disk/`. Son un refactor sin cambio de comportamiento: unas 105 líneas de `disk/` tocan hoy el sistema de archivos, en unas 20 funciones, así que el cambio es de unas 200 a 250 líneas nuevas (el trait y la implementación nativa) y unas 150 a 250 cambiadas. El corte lo fijó el Lote 7, con la forma final del trait (ver la sección de los Lotes 7 a 9): el 7 es el trait y la implementación nativa, el 8 el motor sobre la capa con todo lo que toca el handle del WAL y el directorio, y el 9 lo que queda.
 - El 10 va al final: la revisión de cierre de la sub-fase (plan de la fase, §5.1).
 
 **Checklist propio.** Los Lotes 1, 4, 5 y 6 tocan cómo decide o qué acepta una réplica: el revisor de delta recorre además el checklist de determinismo de la Fase 3.11 (§5.4 de su [propuesta](2026-10-fase3_11-restricciones-proposal.md)). Los Lotes 7 a 9 recorren, en su lugar, este checklist de crash-safety:
@@ -542,28 +542,103 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
   - Los chequeos comunes del cuerpo (un frame, sin saltables, diccionario ni datos después) no estaban en el plan: sin ellos los dos decodificadores aceptaban cuerpos distintos (libzstd, varios frames; `ruzstd`, datos después del suyo), y `ruzstd` no verifica el checksum ni el tamaño declarado. En nativo rechazan cuerpos que libzstd aceptaba, que ningún codificador del repo escribe.
   - La función de compresión es `ZstdCodec::compress` y no una función suelta: los tests eligen el códec por su tipo.
 
-### Lotes 7 a 9 · La capa de archivos (`zemdb-storage`) · ⬜
+### Lotes 7 a 9 · La capa de archivos (`zemdb-storage`) · Lote 7 ✅
 **Requisito para empezar:** DC17, adoptada el 23 de Octubre de 2026.
 
 **Objetivo:** que ninguna parte de `crates/storage/src/disk/` fuera de la implementación nativa del trait use `std::fs`, `tokio::fs` ni `fs2`, sin cambiar el comportamiento del motor en disco.
 
 **Archivos:** un módulo nuevo de la capa en `crates/storage/src/` (el trait y la implementación nativa); `disk/mod.rs`, `disk/wal.rs`, `disk/recovery.rs`, `disk/compactor.rs`, `fail_point.rs` y `sys.rs`; los tests del motor en disco que toman un `tokio::fs::File` (`disk_wal_resilience_tests.rs` usa `WalWriter`).
 
-**Corte tentativo:**
-- **Lote 7 · El trait y su implementación nativa.** El trait de DC17, su implementación sobre `std::fs` y `fs2` en el pool bloqueante (con el `Arc` del archivo y el permiso del handle de DC17), y el motor genérico sobre él (`DiskStorageEngine<F = …>`, con `new` en el `impl` de la nativa). Pasan a la capa: abrir y bloquear los archivos de la sala, el append del WAL en `apply_batch` (hoy `wal.file.write_all` y `sync_file`; `WalWriter::write_batch` y `write_record` dejan de tomar un `tokio::fs::File`), `close_room`, las operaciones de directorio (crear el directorio, `sync_dir`, borrar, renombrar y listar) y el fail point `read_only_handle`.
-- **Lote 8 · La recuperación.** `load_snapshot`, el replay del WAL y de `.wal.compacting` (con `read_at` en lugar de un `BufReader` con posición), la limpieza de temporales y la escritura del snapshot vacío. La búsqueda de un frame válido después de una anomalía usa `find_valid_frame` de `zemdb-core`, que toma un `Read + Seek` síncrono y hoy corre en el pool bloqueante sobre un clon del handle: o un adaptador en `zemdb-storage`, o `find_valid_frame` pasa a un lector posicional en `zemdb-core` (y el lote toca `core`). Lo decide el lote, con su revisión de delta.
-- **Lote 9 · La compactación y `apply_snapshot`.** La rotación del WAL y su vuelta atrás, con el renombrar de un archivo abierto (sin cambiar su orden ni su lógica), la absorción, el staging y la instalación de snapshots, y la compresión del `.snap` con la función del Lote 6.
+**Corte** (lo fijó el Lote 7; el tentativo ponía en el 7 también el motor genérico, el append, `close_room` y el directorio, en el 8 la recuperación y en el 9 la compactación):
+- **Lote 7 · El trait y su implementación nativa.** ✅ El trait de DC17 y su implementación sobre `std::fs` y `fs2` en el pool bloqueante, con el `Arc` del archivo y el permiso del handle, en `crates/storage/src/files/`. El motor todavía no la usa. El corte cambió porque el handle del WAL es el mismo objeto en `disk/mod.rs`, `compactor.rs` y `recovery.rs`: pasar solo el append a la capa cambia su tipo, así que el replay del WAL, el truncado, la lectura de la absorción y el WAL nuevo de la rotación van con él. El trait y la nativa son unas 325 líneas de código (sin comentarios ni líneas en blanco), y el motor sobre ellas unas 250: juntos pasaban las ~300 de un lote (`docs/METODOLOGIA.md` §4).
+- **Lote 8 · El motor sobre la capa: el WAL y el directorio.** `DiskStorageEngine<F = NativeFiles>`, con `new` en el `impl` de la nativa y otro constructor que recibe la capa; `DiskRoom` y `DiskWal` guardan el archivo de la capa. Pasan a la capa: abrir y bloquear los archivos de la sala; toda operación sobre el handle del WAL (el append de `apply_batch`, el sync de `close_room` y el de antes de compactar, la lectura de la absorción, el truncado, el WAL nuevo de la rotación y, en la recuperación, el replay del WAL y de `.wal.compacting` con `read_at` en lugar de un `BufReader` con posición, su truncado y su sync), y las operaciones de directorio (crear el directorio, sincronizarlo, ver si existe un archivo, borrar, renombrar por ruta y listar). `WalWriter::write_batch` y `write_record` dejan de tomar un `tokio::fs::File`; el fail point `read_only_handle` se adapta; `sync_file` y el `clippy.toml` de los syncs de `tokio::fs` se van. Las pausas bloqueantes que hoy corren dentro de una operación de archivo en el pool (`remove`, que `NativeFiles::remove` ya conserva, y `apply_snapshot.rename`, con la ruta del WAL como clave) siguen en el mismo paso y con el mismo nombre. La búsqueda de un frame válido después de una anomalía usa `find_valid_frame` de `zemdb-core`, que toma un `Read + Seek` síncrono y hoy corre en el pool bloqueante sobre un clon del handle: o un adaptador en `zemdb-storage`, o `find_valid_frame` pasa a un lector posicional en `zemdb-core` (y el lote toca `core`). Lo decide el lote, con su revisión de delta.
+- **Lote 9 · Los archivos de los snapshots y la rotación.** `load_snapshot` (abrir para leer), el staging de snapshots (`.snap.tmp.*`, creados con su lock), la copia de una absorción (`.wal.compacting.tmp`, creada truncando), el snapshot vacío, la rotación del WAL y su vuelta atrás con el renombrar de un archivo abierto (sin cambiar su orden ni su lógica), y la compresión del `.snap` con la función del Lote 6. Con el test de la implementación que falla como el OPFS.
 
 **Tests exigidos** (los fija cada lote; como mínimo):
 - toda la suite del storage sin cambios en sus expectativas, incluidas las imágenes de crash, la simulación del disco y las versiones largas (`cargo test -p zemdb-storage --release -- --ignored`);
 - un test de que renombrar por ruta y borrar no se hacen con handles abiertos: una implementación de prueba del trait que falla como el OPFS (S3), también por los handles de solo lectura (`.snap`, `.wal.compacting`), y que renombra un archivo abierto cerrando, moviendo y reabriendo, corre la compactación con y sin absorción (con sus dos vueltas atrás), la instalación de un snapshot y la recuperación de una compactación interrumpida;
 - un test por cada error de E/S que la capa ahora devuelve en la misma llamada (el caso que hoy cubre `sync_file`);
-- en el Lote 7, el caso de INV-S1: soltar el future de `apply_batch` con su escritura retenida en el pool bloqueante (un fail point que pausa), cerrar la sala o soltar el motor, y reabrir: la reapertura da `RoomLocked` hasta que la escritura termina, o `close_room` la espera, y nunca aterriza después de la recuperación (negativo: sin el `Arc` del archivo en la operación, aterriza después);
+- en el Lote 8 (el 7 lo prueba sobre la capa sola), el caso de INV-S1: soltar el future de `apply_batch` con su escritura retenida en el pool bloqueante (un fail point que pausa), cerrar la sala o soltar el motor, y reabrir: la reapertura da `RoomLocked` hasta que la escritura termina, o `close_room` la espera, y nunca aterriza después de la recuperación (negativo: sin el `Arc` del archivo en la operación, aterriza después);
 - en el Lote 9, las vueltas atrás de la rotación de hoy (abrir el WAL nuevo falla; renombrar de vuelta falla), sin cambios en sus expectativas.
 
 **Interacciones a revisar:** INV-S1 e INV-L7 (una escritura de `apply_batch` soltada, el lock del handle del WAL y el `flush` de `close_room`, que DC17 reimplementa); D86 y D89 (ninguna operación de archivo de `open_room`, `apply_snapshot` ni la compactación aterriza después de reabrir); D93; `PendingWrite` y `RoomFailed`; los fail points por ruta; `WalWriter` y `WalReader`, públicos; Windows (un test no lee un archivo que la sala tiene abierto).
 
 **Documentos:** `ARCHITECTURE.md` §8 (la capa de archivos, *Room Lock and WAL Lock* y la rotación); `INVARIANTES.md`: el "Sostenida por" de INV-S1, que nombra el lock del handle del WAL y el `flush` de `close_room`, y el de INV-L7, que suma el mecanismo de DC17; el plan de la fase, DC8 y DC17.
+
+**Lote 7 · Hecho** (24 de Octubre de 2026). El trait y la implementación nativa; el motor todavía no los usa.
+- **storage:** `crates/storage/src/files/`, público y fuera de wasm32.
+  - `RoomFiles` (el directorio): abrir con lock, creando el archivo si falta (`None` si no se puede tomar el lock); crear con lock un archivo que no existe (`AlreadyExists` si existe); crear truncando; abrir para leer; saber si existe (un error no es un archivo que falta); listar por prefijo; renombrar y borrar por ruta; crear el directorio con sus ancestros, cada entrada nueva sincronizada; y sincronizar un directorio.
+  - `RoomFile` (un archivo abierto, sin posición): `read_at`, `write_at`, `size`, `set_len`, `sync_data`, `sync_all` y `rename`, que el handle sigue y que, si falla, no lo mueve.
+  - `NativeFiles` y `NativeFile`, sobre `std::fs` y `fs2` en el pool bloqueante. Cada operación lleva al pool el permiso del handle (un mutex de Tokio que guarda la ruta) y un `Arc` del archivo, así que las siguientes la esperan y el archivo y su lock siguen abiertos hasta que termina, aunque se suelte el handle. El error de una operación que nadie esperó lo guarda su `Reply` si no pudo mandarlo, o `Outcome` si se mandó y nadie lo recibió; una operación que no terminó (un pánico, o el runtime apagado antes de que corra) se informa igual, como un error. Lo devuelve la próxima operación sobre el handle.
+  - `create_dir_all_synced` pasa de `compactor.rs` a `native.rs`, y sus tests con él. `fail_point::hold_blocking` es una pausa bloqueante que los planes de crash no cuentan: la usan las operaciones de `NativeFile`, que los puntos del motor alrededor ya ubican.
+- **Tests** (17, `files/tests/native.rs`):
+  - la E/S posicional;
+  - los errores en la misma llamada (lo que hoy cubre `sync_file` para `tokio::fs`);
+  - el lock retenido por una operación que nadie espera, antes de empezar y mientras corre, que aterriza antes de que otro handle lo tome;
+  - una operación siguiente que espera a la que nadie espera;
+  - el error no visto, soltando el caller antes y después de que la operación termine, y la operación que lo devuelve, que no corre;
+  - la operación que no termina, con su caller esperándola (el error es solo suyo) y sin él;
+  - el doble lock y `create_locked` sobre un archivo existente;
+  - el renombrar de un archivo abierto, y uno fallido;
+  - `exists` con un error (solo en Unix: en Windows esa ruta da `NotFound`);
+  - las operaciones de directorio;
+  - `create_dir_all`, con el sync del padre de cada directorio nuevo.
+- **Mutaciones** (20; cada árbol compiló y algún test falló):
+  - el cierre sin el `Arc`, desde el principio y después de la pausa (reabriendo el archivo con el mismo modo);
+  - el permiso soltado antes de la operación;
+  - sin guardar el error al fallar el envío, ni en `Outcome::drop`;
+  - sin informar una operación que no terminó, o guardando su error aunque su caller la espere;
+  - sin devolver primero el error guardado, o devolviéndolo después de correr la operación;
+  - la lectura y la escritura ignorando el offset;
+  - `create_locked` adoptando un archivo existente;
+  - `open_locked` sin lock;
+  - `list` ignorando el prefijo;
+  - el rename de un archivo abierto que no actualiza la ruta, o que la actualiza antes de renombrar;
+  - `create` sin truncar;
+  - `open_read` abriendo para escribir;
+  - `exists` leyendo un error como un archivo que falta;
+  - `create_dir_all` sin los syncs.
+
+  Sin test determinista, anotadas por la revisión: sacar el `close` de `Outcome::drop`, o soltar el permiso antes de guardar el error, abre una carrera de nanosegundos; con `replace` en lugar de `get_or_insert` en `keep_unseen` no cambia nada observable; `sync_data`, `sync_all` y `sync_dir` como no-op solo se ven en un corte de luz; `list` ignorando las entradas con error; la pausa `remove` de `NativeFiles::remove` y que `hold_blocking` no cuente en los planes de crash, que se ven recién cuando el motor use la capa (Lote 8).
+- **Interacciones:**
+  - `pause_blocking` cuenta en los planes de crash como antes, y `hold_blocking` no cuenta.
+  - `create_dir_all_synced` cambia de lugar: `open_room` lo usa igual, con el fail point `sync_dir` en el mismo paso. Una implementación de prueba del trait no lo cuenta, porque vive en la nativa.
+  - `NativeFiles::remove` conserva la pausa contada `remove` de `remove_if_exists`.
+  - API pública nueva: `zemdb_storage::files`.
+  - `NativeFile` necesita un runtime de Tokio, como `tokio::fs`. Con el runtime apagándose, una operación todavía en cola se cancela sin correr: su `Reply` lo informa como un error y el archivo se cierra (D93).
+  - Windows: E/S posicional con `seek_read` y `seek_write`, y ningún test lee un archivo que otro handle tiene bloqueado.
+  - La pausa bloqueante `apply_snapshot.rename`, que hoy corre dentro del rename del snapshot en el pool, con la ruta del WAL como clave, va con el Lote 8, como `remove` (anotado en su corte).
+  - El motor no cambia: los mecanismos de INV-S1 e INV-L7 son los de antes hasta el Lote 8.
+- **Revisión de delta:** cinco rondas.
+  1. **ROJO**, por un Medio y siete Bajos.
+     - El Medio: dos reglas sin test negativo (`exists` con un error, y un rename fallido que no mueve el handle). Agregué los dos tests.
+     - Los Bajos:
+       - las mutaciones sin test determinista (anotadas arriba);
+       - el apagado del runtime: la operación cancelada no dejaba error, y ahora `Reply` lo informa;
+       - la pausa `apply_snapshot.rename`, anotada para el Lote 8;
+       - dos referencias del plan al Lote 7 que eran del 8;
+       - el doc de `open_locked`, que ahora dice que `None` es no poder tomar el lock;
+       - los tests largos, que sí corrieron;
+       - `?Send` para el OPFS, anotado en lo que queda para 4.5.
+  2. **ROJO**, por un Medio y cinco Bajos. El Medio: sin test para una operación que entra en pánico con su caller esperándola (guardar su error en lugar de mandárselo pasaba los tests, y el error se repetía en la operación siguiente); se agregó el test y su mutación. Los Bajos: dos textos con la redacción vieja de `None` (`ARCHITECTURE.md` y el doc de `locked`); el tamaño del lote en el corte; `hold_blocking` sin contar, anotado arriba; el conteo de mutaciones; y el plan sin cerrar el lote. Todos atendidos.
+  3. **ROJO**, por dos Medios y dos Bajos. Los Medios: el lock solo se probaba hasta la pausa, antes de la operación (una mutación que soltaba el `Arc` después de la pausa y reabría el archivo con el mismo modo pasaba los tests), y `NativeFiles::create_dir_all` no tenía test de sus syncs (el test llamaba a la función directamente). Se agregó un test que bloquea dentro de la operación, y el de los syncs pasa por el trait; las dos mutaciones fallan. Los Bajos: `sync_dir` entre las mutaciones sin test, y el conteo de rondas. Atendidos.
+  4. **ROJO**, por un Medio y tres Bajos. El Medio: la operación que devuelve un error guardado no corre (como hoy un `write` de `tokio::fs` después de uno fallido), pero ningún test lo veía, porque todos miraban el error con `size`, y el doc de `RoomFile` no lo decía. Se agregó el test, su mutación y la frase. Los Bajos: soltar el permiso antes de guardar el error (anotado arriba); una carrera aceptable, en la que el error lo devuelve una operación posterior y no la próxima, solo con operaciones concurrentes sobre el mismo handle (el motor las serializa con el mutex del WAL); y que soltar un `NativeFile` sin operaciones en vuelo cierra el archivo en el hilo del runtime, como `tokio::fs::File`.
+  5. **VERDE**, con dos Bajos de redacción: esta nota sin la ronda 5, y DC17 sin decir que la operación que devuelve el error guardado no corre. Atendidos.
+- **Chequeos:**
+  - fmt;
+  - clippy con `-D warnings`, nativo y de wasm32;
+  - test del workspace;
+  - doc con `-D warnings`;
+  - el build de wasm32 de core, storage y client;
+  - `cargo test -p zemdb-storage --release -- --ignored`, en verde;
+  - los helpers de Windows, compilados aparte para `x86_64-pc-windows-gnu`, porque `zstd-sys` no compila sin mingw (la CI corre Windows).
+- **Desvíos:**
+  - El corte de los Lotes 7 a 9 (arriba).
+  - El error que nadie vio lo devuelve la próxima operación de cualquier tipo sobre el handle, no solo el próximo sync o el cierre, y DC17 se ajustó en ese sentido.
+  - No hay una operación de cierre: en nativo cerrar es soltar el handle, y la operación siguiente espera el permiso.
+  - `size` en lugar de "su largo", por la lint `len_without_is_empty`.
+  - `list` falla si no puede leer alguna entrada, en lugar de devolver lo leído hasta ahí. La limpieza de temporales del Lote 8 sigue siendo best effort.
+  - Las operaciones toman rutas, como `std::fs`, y no nombres dentro del directorio: así los fail points siguen identificados por ruta. La implementación del OPFS las resuelve desde su raíz.
 
 ### Lote 10 · Cierre · ⬜
 - La revisión de cierre de 4.1 (`docs/METODOLOGIA.md` §6), con las tres condiciones de `INVARIANTES.md` §1.4, sobre todo lo que tocó la sub-fase y los mecanismos con que interactúa. Si no sale en verde, sus rupturas se arreglan en lotes nuevos de 4.1 antes de abrir 4.2.
@@ -574,4 +649,4 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 
 ## 3. Seguimiento
 
-**Avance:** Lote 0 cerrado el 23 de Octubre de 2026, con la revisión cruzada en verde en su quinta ronda; Lote 1 cerrado el mismo día. DC17 adoptada el 23 de Octubre, con renombrar un archivo abierto como operación del trait (el refactor de los Lotes 7 a 9 queda sin cambio de comportamiento). Lote 2 cerrado el 23 de Octubre. Lote 3 cerrado el 24 de Octubre, y los Lotes 4, 5 y 6 el mismo día. El próximo es el Lote 7.
+**Avance:** Lote 0 cerrado el 23 de Octubre de 2026, con la revisión cruzada en verde en su quinta ronda; Lote 1 cerrado el mismo día. DC17 adoptada el 23 de Octubre, con renombrar un archivo abierto como operación del trait (el refactor de los Lotes 7 a 9 queda sin cambio de comportamiento). Lote 2 cerrado el 23 de Octubre. Lote 3 cerrado el 24 de Octubre, y los Lotes 4, 5, 6 y 7 el mismo día. El próximo es el Lote 8.

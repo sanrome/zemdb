@@ -364,25 +364,3 @@ async fn failed_compacting_wal_cleanup_loses_no_batch() {
     failed_phase3_step_loses_no_batch("compaction.cleanup", true).await;
     failed_phase3_step_loses_no_batch("compaction.cleanup", false).await;
 }
-
-#[test]
-fn create_dir_all_synced_creates_missing_components() {
-    let dir = tempfile::tempdir().unwrap();
-    let target = dir.path().join("a").join("b");
-    super::create_dir_all_synced(&target).unwrap();
-    super::create_dir_all_synced(&target).unwrap();
-    assert!(target.is_dir());
-}
-
-#[test]
-fn create_dir_all_synced_syncs_the_parent_of_every_new_directory() {
-    let dir = tempfile::tempdir().unwrap();
-    let a = dir.path().join("a");
-    let target = a.join("b");
-    // The parent of each new directory: failing its sync fails the call.
-    for parent in [dir.path(), a.as_path()] {
-        fail_point::arm("sync_dir", parent);
-        assert!(super::create_dir_all_synced(&target).is_err());
-        std::fs::remove_dir_all(&a).unwrap();
-    }
-}

@@ -327,6 +327,13 @@ pub(crate) fn arm_blocking_pause(name: &'static str, path: &Path) -> BlockingPau
 pub(crate) fn pause_blocking(name: &'static str, path: &Path) {
     #[cfg(test)]
     crash_plan_point(name, path);
+    hold_blocking(name, path);
+}
+
+/// Blocks like [`pause_blocking`], but crash plans do not count it: it holds the file operations
+/// of the native file layer, which the points of the engine around them already place.
+#[inline(always)]
+pub(crate) fn hold_blocking(name: &'static str, path: &Path) {
     #[cfg(test)]
     if let Some((_, _, reached, release)) =
         take(&BLOCKING_PAUSES, |(n, p, _, _)| *n == name && p == path)

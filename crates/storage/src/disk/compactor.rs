@@ -576,28 +576,6 @@ pub(crate) async fn sync_parent(path: &Path) -> Result<(), StorageError> {
     run_blocking(move || sync_dir(&parent)).await
 }
 
-/// Creates `path` and any missing parent directories, syncing the parent of every directory it
-/// creates so that the new entries survive a power loss. Blocking. A sync that fails is not
-/// retried by a later call, which finds the directory already there.
-pub(crate) fn create_dir_all_synced(path: &Path) -> std::io::Result<()> {
-    let missing: Vec<&Path> = path
-        .ancestors()
-        .take_while(|dir| !dir.as_os_str().is_empty() && !dir.is_dir())
-        .collect();
-    for dir in missing.into_iter().rev() {
-        match std::fs::create_dir(dir) {
-            Ok(()) => {}
-            // Created concurrently; its parent is synced below all the same.
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
-            Err(e) => return Err(e),
-        }
-        if let Some(parent) = dir.parent() {
-            fail_point::io_result("sync_dir", parent, sync_dir(parent))?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 #[path = "tests/compactor.rs"]
 mod tests;
