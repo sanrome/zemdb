@@ -4,8 +4,10 @@
 //! A random log adds such columns at random points. Replicas that learn of each new version when
 //! a batch first needs it, and replicas that apply the whole log under the latest version, must
 //! report the same rejections and hold the same rows. So must a disk replica that reopens with
-//! the latest version a WAL and a snapshot written under older ones, and a replica that installs,
-//! under the latest version, a snapshot taken under an older one and applies the rest of the log.
+//! the latest version a WAL and a snapshot written under older ones, a replica that installs,
+//! under the latest version, a snapshot taken under an older one and applies the rest of the log,
+//! and replicas that reload each version into the open room (`reload_schema`), in memory and on
+//! disk, the disk one reopened at the end with the latest version.
 //!
 //! The ignored variant runs many more logs: `cargo test --release -- --ignored`.
 
@@ -69,6 +71,18 @@ async fn check_evolution(seed: u64) -> BTreeSet<String> {
         .open_room(&room, versions[0].clone())
         .await
         .unwrap();
+    // The replicas that reload each version when the knowing ones learn it.
+    let reloading_memory = MemoryStorageEngine::new();
+    reloading_memory
+        .open_room(&room, versions[0].clone())
+        .await
+        .unwrap();
+    let reloading_dir = tempfile::tempdir().unwrap();
+    let reloading_disk = disk_engine(reloading_dir.path());
+    reloading_disk
+        .open_room(&room, versions[0].clone())
+        .await
+        .unwrap();
     // The replicas that apply everything under the latest version.
     let latest_memory = MemoryStorageEngine::new();
     latest_memory
@@ -116,6 +130,9 @@ async fn check_evolution(seed: u64) -> BTreeSet<String> {
                 .apply_snapshot(&room, schema.clone(), snapshot.into(), head)
                 .await
                 .unwrap();
+            for engine in [&reloading_memory as &dyn StorageEngine, &reloading_disk] {
+                engine.reload_schema(&room, schema.clone()).await.unwrap();
+            }
             knowing_disk = reopen(knowing_disk, knowing_dir.path(), &room, schema).await;
         }
         if rng.chance(10) {
@@ -123,6 +140,9 @@ async fn check_evolution(seed: u64) -> BTreeSet<String> {
         }
         if rng.chance(10) {
             latest_disk.compact_room(&room).await.unwrap();
+        }
+        if rng.chance(10) {
+            reloading_disk.compact_room(&room).await.unwrap();
         }
         if rng.chance(5) {
             latest_disk = reopen(latest_disk, latest_dir.path(), &room, latest.clone()).await;
@@ -147,6 +167,8 @@ async fn check_evolution(seed: u64) -> BTreeSet<String> {
             ("knowing disk", &knowing_disk),
             ("latest memory", &latest_memory),
             ("latest disk", &latest_disk),
+            ("reloading memory", &reloading_memory),
+            ("reloading disk", &reloading_disk),
         ];
         if let Some(late) = &late {
             replicas.push(("late", late));
@@ -170,13 +192,16 @@ async fn check_evolution(seed: u64) -> BTreeSet<String> {
     let want = trimmed_dump(model.rows());
     let knowing_disk = reopen(knowing_disk, knowing_dir.path(), &room, latest.clone()).await;
     let latest_disk = reopen(latest_disk, latest_dir.path(), &room, latest.clone()).await;
+    let reloading_disk = reopen(reloading_disk, reloading_dir.path(), &room, latest.clone()).await;
     let late = late.expect("a late replica");
-    let replicas: [(&str, &dyn StorageEngine); 5] = [
+    let replicas: [(&str, &dyn StorageEngine); 7] = [
         ("knowing memory", &knowing_memory),
         ("knowing disk, reopened", &knowing_disk),
         ("latest memory", &latest_memory),
         ("latest disk, reopened", &latest_disk),
         ("late", &late),
+        ("reloading memory", &reloading_memory),
+        ("reloading disk, reopened", &reloading_disk),
     ];
     for (name, engine) in replicas {
         assert_eq!(

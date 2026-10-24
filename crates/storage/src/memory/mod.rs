@@ -129,6 +129,28 @@ impl StorageEngine for MemoryStorageEngine {
         Ok(())
     }
 
+    /// Changes the room's schema (see the trait) under the room's write lock, in O(tables and
+    /// constraints): the rows of a room in memory are never wider than its schema (every batch
+    /// and every snapshot is validated against it), so they hold `NULL` in every new column, and
+    /// the indexes of the new constraints are empty.
+    #[tracing::instrument(skip(self, schema), fields(room_id = %room_id))]
+    async fn reload_schema(&self, room_id: &RoomId, schema: Schema) -> Result<(), StorageError> {
+        let room_arc = self.get_room(room_id)?;
+        let mut room = room_arc.write().map_err(poisoned("Room"))?;
+        if room.schema == schema {
+            return Ok(());
+        }
+        if !schema.evolves_from(&room.schema) {
+            return Err(StorageError::SchemaNotEvolving {
+                room_id: room_id.clone(),
+            });
+        }
+        room.data = room.data.evolved(&schema, false);
+        room.schema = schema;
+        tracing::info!(room_id = %room_id, "Reloaded the schema of an in-memory room");
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self, ops), fields(room_id = %room_id, ops_count = ops.len()))]
     async fn apply_batch(
         &self,

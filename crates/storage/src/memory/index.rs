@@ -39,6 +39,22 @@ impl TableIndexes {
         indexes
     }
 
+    /// The indexes of `table`, a later version of the table these are of that keeps its
+    /// constraints first, in the same order and over the same columns (`Schema::evolves_from`):
+    /// those indexes are kept as they are, and the ones of the constraints it adds are built
+    /// from `rows`, or left empty without them.
+    pub(crate) fn evolved(&self, table: &TableSchema, rows: Option<&Table>) -> Self {
+        let extend = |kept: &[ConstraintIndex], all: &[Vec<usize>]| {
+            let added = all.get(kept.len()..).unwrap_or_default();
+            let built = added.iter().map(|columns| build_index(columns, rows));
+            kept.iter().cloned().chain(built).collect()
+        };
+        Self {
+            unique: extend(&self.unique, table.unique_column_indices()),
+            foreign_keys: extend(&self.foreign_keys, table.foreign_key_column_indices()),
+        }
+    }
+
     /// Replaces the entries of the row with key `pk` as it was (`old`) with those of the row as
     /// it is (`new`). `None` is a row that does not exist.
     pub(crate) fn update(
@@ -95,6 +111,14 @@ impl TableIndexes {
             .get(position)
             .is_some_and(|index| rows_with_key(index, key).any(|other| Some(other) != except))
     }
+}
+
+/// The index of a constraint over the columns at `columns`, built from `rows` (empty without
+/// them).
+fn build_index(columns: &[usize], rows: Option<&Table>) -> ConstraintIndex {
+    let rows = rows.into_iter().flatten();
+    rows.filter_map(|(pk, row)| constraint_key(row, columns).map(|key| (key, pk.clone())))
+        .collect()
 }
 
 /// The primary keys of the rows whose key in `index` is `key`, in order.

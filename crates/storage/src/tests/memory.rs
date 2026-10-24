@@ -1,11 +1,13 @@
 use crate::fail_point;
 use crate::memory::index::tests::{
-    apply_random_batches, constrained_schema, evolved_schema, refused_batches_change_nothing,
-    snapshot_indexes_are_built_off_the_runtime, snapshots_replace_the_indexes,
-    snapshots_that_break_a_constraint_change_nothing,
-    snapshots_that_meet_the_constraints_are_installed, RandomLog,
+    apply_random_batches, constrained_schema, evolved_schema, owned_schema,
+    refused_batches_change_nothing, reloads_at_random_points_decide_as_the_new_schema,
+    reloads_race_batches_and_readers, reloads_that_do_not_evolve_change_nothing,
+    reloads_that_evolve_decide_as_the_new_schema, snapshot_indexes_are_built_off_the_runtime,
+    snapshots_replace_the_indexes, snapshots_that_break_a_constraint_change_nothing,
+    snapshots_that_meet_the_constraints_are_installed, RandomLog, BUILD_POINT,
 };
-use crate::{MemoryStorageEngine, StorageEngine};
+use crate::{MemoryStorageEngine, StorageEngine, StorageError};
 use std::path::Path;
 use std::time::Duration;
 use zemdb_core::{
@@ -198,4 +200,54 @@ async fn a_snapshot_that_meets_the_constraints_is_installed() {
     let room = RoomId::new("snapshot-meets").unwrap();
     engine.open_room(&room, constrained_schema()).await.unwrap();
     snapshots_that_meet_the_constraints_are_installed(&engine, &room).await;
+}
+
+#[tokio::test]
+async fn reloads_to_a_schema_that_does_not_evolve_change_nothing() {
+    let engine = MemoryStorageEngine::new();
+    let room = RoomId::new("reload-refused").unwrap();
+    engine.open_room(&room, owned_schema()).await.unwrap();
+    reloads_that_do_not_evolve_change_nothing(&engine, &room).await;
+}
+
+#[tokio::test]
+async fn reload_of_an_unopened_room_is_room_not_found() {
+    let engine = MemoryStorageEngine::new();
+    let room = RoomId::new("reload-unopened").unwrap();
+    let err = engine
+        .reload_schema(&room, evolved_schema())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorageError::RoomNotFound(_)), "{err:?}");
+}
+
+/// A reload decides from then on as the new schema, and adds the indexes of its new
+/// constraints without building them from the rows, which never hold the new columns.
+#[tokio::test(flavor = "current_thread")]
+async fn reloads_decide_as_the_new_schema() {
+    let engine = MemoryStorageEngine::new();
+    let room = RoomId::new("reload-evolves").unwrap();
+    engine.open_room(&room, constrained_schema()).await.unwrap();
+    reloads_that_evolve_decide_as_the_new_schema(&engine, &room).await;
+    assert!(!fail_point::reached_on_this_thread(BUILD_POINT));
+}
+
+#[tokio::test]
+async fn reloads_at_random_points_decide_as_a_room_open_with_the_new_schema() {
+    for seed in 0..10 {
+        let engine = MemoryStorageEngine::new();
+        let room = RoomId::new("reload-random").unwrap();
+        engine.open_room(&room, constrained_schema()).await.unwrap();
+        reloads_at_random_points_decide_as_the_new_schema(&engine, &room, seed).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reloads_racing_batches_and_readers_apply_each_batch_under_one_schema() {
+    for seed in 0..20 {
+        let engine = MemoryStorageEngine::new();
+        let room = RoomId::new("reload-race").unwrap();
+        engine.open_room(&room, constrained_schema()).await.unwrap();
+        reloads_race_batches_and_readers(&engine, &room, seed).await;
+    }
 }

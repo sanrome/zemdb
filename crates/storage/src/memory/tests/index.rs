@@ -6,11 +6,13 @@
 use super::*;
 use crate::engine::{ApplyReport, RejectReason};
 use crate::memory::state::RoomData;
+use crate::options::ScanOptions;
 use crate::{DiskStorageEngine, MemoryStorageEngine, StorageEngine, StorageError};
+use futures::StreamExt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use zemdb_core::{
-    ColumnDef, DataType, ForeignKey, Operation, RoomId, Schema, SequenceNumber, SequencedOperation,
-    UniqueConstraint, Value,
+    ColumnDef, DataType, ForeignKey, Operation, OwnerIdentity, RoomId, Schema, SequenceNumber,
+    SequencedOperation, TableBuilder, UniqueConstraint, Value,
 };
 
 /// The deterministic generator of the randomized tests, shared with the integration tests.
@@ -51,14 +53,27 @@ pub(crate) const PLAIN: u16 = 2;
 /// Every column but the keys is nullable, so rows may be short. The composite constraints name
 /// their columns in another order than the table's, so the keys must follow the declaration.
 pub(crate) fn constrained_schema() -> Schema {
-    let parents = TableSchema::builder("parents")
+    Schema::builder()
+        .table(parents_table())
+        .table(children_table())
+        .table(plain_table())
+        .build()
+}
+
+/// `parents`, as [`constrained_schema`] declares it.
+fn parents_table() -> TableBuilder {
+    TableSchema::builder("parents")
         .table_id(PARENTS)
         .primary_key("id", DataType::Int)
         .nullable_column("code", DataType::String)
         .nullable_column("score", DataType::Float)
         .unique("parents_code", ["code"])
-        .unique("parents_score_code", ["score", "code"]);
-    let children = TableSchema::builder("children")
+        .unique("parents_score_code", ["score", "code"])
+}
+
+/// `children`, as [`constrained_schema`] declares it.
+fn children_table() -> TableBuilder {
+    TableSchema::builder("children")
         .table_id(CHILDREN)
         .primary_key("a", DataType::Int)
         .primary_key("b", DataType::Int)
@@ -68,16 +83,15 @@ pub(crate) fn constrained_schema() -> Schema {
         .nullable_column("x", DataType::Int)
         .foreign_key("children_parent", ["parent"], "parents")
         .foreign_key("children_up", ["up_b", "up_a"], "children")
-        .unique("children_x", ["x"]);
-    let plain = TableSchema::builder("plain")
+        .unique("children_x", ["x"])
+}
+
+/// `plain`, as [`constrained_schema`] declares it.
+fn plain_table() -> TableBuilder {
+    TableSchema::builder("plain")
         .table_id(PLAIN)
         .primary_key("id", DataType::Int)
-        .nullable_column("v", DataType::Int);
-    Schema::builder()
-        .table(parents)
-        .table(children)
-        .table(plain)
-        .build()
+        .nullable_column("v", DataType::Int)
 }
 
 /// [`constrained_schema`] with a column `tag` added to `parents` together with `UNIQUE (tag)`,
@@ -121,14 +135,20 @@ impl RandomLog {
         let len = 1 + self.rng.below(8);
         let first = self.model.head() + 1;
         let ops = oracle::random_log(&mut self.rng, self.model.schema(), first, len);
+        let report = self.decide(&ops);
+        (ops, report)
+    }
+
+    /// Takes `ops`, which must continue the log and be valid under its schema, as its next
+    /// batch, and returns the report it must give.
+    pub(crate) fn decide(&mut self, ops: &[SequencedOperation]) -> ApplyReport {
         let rejected = self
             .model
-            .apply_batch(&ops)
+            .apply_batch(ops)
             .into_iter()
             .map(|(seq, reason)| (SequenceNumber::from(seq), reject_reason(reason)))
             .collect();
-        let head = SequenceNumber::from(self.model.head());
-        (ops, ApplyReport::new(head, rejected))
+        ApplyReport::new(SequenceNumber::from(self.model.head()), rejected)
     }
 }
 
@@ -225,6 +245,29 @@ pub(crate) fn assert_same_contents(a: &RoomData, b: &RoomData) {
     assert_eq!(entries(a.indexes()), entries(b.indexes()));
 }
 
+/// Checks that `a` and `b` hold the same rows but for the `NULL`s at the end of a row, and the
+/// same indexes. A row updated under an older version of the schema is as wide as that version,
+/// so a room that reloads a schema and one open with it from the start can differ in those.
+pub(crate) fn assert_equivalent_contents(a: &RoomData, b: &RoomData) {
+    let trimmed = |data: &RoomData| -> BTreeMap<u16, Vec<(PrimaryKey, Vec<Value>)>> {
+        let tables = data.tables().iter();
+        tables
+            .map(|(&table_id, rows)| {
+                let rows = rows.iter().map(|(pk, row)| {
+                    let mut values = row.values().to_vec();
+                    while values.last().is_some_and(Value::is_null) {
+                        values.pop();
+                    }
+                    (pk.clone(), values)
+                });
+                (table_id, rows.collect())
+            })
+            .collect()
+    };
+    assert_eq!(trimmed(a), trimmed(b));
+    assert_eq!(entries(a.indexes()), entries(b.indexes()));
+}
+
 /// Checks that the indexes of `room` follow its rows under its schema, and returns its schema
 /// and contents.
 pub(crate) async fn checked_contents<E: RoomContents>(
@@ -264,7 +307,7 @@ pub(crate) async fn apply_random_batches<E: RoomContents>(
 }
 
 /// An insert into `parents` of the key 9, which the random logs never write, with `code`.
-fn insert_parent(seq: u64, code: &str) -> SequencedOperation {
+pub(crate) fn insert_parent(seq: u64, code: &str) -> SequencedOperation {
     let row = CompactRow::new(vec![Value::Int(9), Value::String(code.into())]);
     let op = Operation::insert(PARENTS, PrimaryKey::single(9i64), row, 0);
     SequencedOperation::new(seq, op)
@@ -691,6 +734,377 @@ pub(crate) async fn snapshots_that_meet_the_constraints_are_installed<E: RoomCon
         let (_, expected) = source.contents(&source_room).await;
         assert_eq!(installed.tables(), expected.tables(), "{case}");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Reloading the schema
+
+pub(crate) const EXTRA: u16 = 3;
+pub(crate) const OWNED: u16 = 3;
+
+/// [`evolved_schema`] with a column `alt` added to `children` together with a foreign key to
+/// `parents`, and a new table `extra` (an integer key and a parent, with a foreign key to
+/// `parents` and `UNIQUE (parent)`). It evolves from [`constrained_schema`] and from
+/// [`evolved_schema`].
+pub(crate) fn reloaded_schema() -> Schema {
+    let mut schema = evolved_schema();
+    let alt = ColumnDef::new("alt", DataType::Int).nullable(true);
+    let foreign = vec![ForeignKey::new("children_alt", ["alt"], "parents")];
+    schema
+        .add_column_with_constraints("children", alt, Vec::new(), foreign)
+        .unwrap();
+    let extra = TableSchema::builder("extra")
+        .table_id(EXTRA)
+        .primary_key("id", DataType::Int)
+        .nullable_column("parent", DataType::Int)
+        .foreign_key("extra_parent", ["parent"], "parents")
+        .unique("extra_parent_once", ["parent"])
+        .build()
+        .unwrap();
+    schema.insert_table(extra).unwrap();
+    schema
+}
+
+/// `owned`: an integer key and a string `who`, which owns the row, and a nullable integer.
+fn owned_table() -> TableBuilder {
+    TableSchema::builder("owned")
+        .table_id(OWNED)
+        .primary_key("id", DataType::Int)
+        .column("who", DataType::String)
+        .nullable_column("n", DataType::Int)
+        .owner("who", OwnerIdentity::ClientId)
+}
+
+/// [`constrained_schema`] with the table `owned`.
+pub(crate) fn owned_schema() -> Schema {
+    Schema::builder()
+        .table(parents_table())
+        .table(children_table())
+        .table(plain_table())
+        .table(owned_table())
+        .build()
+}
+
+/// Schemas that extend [`owned_schema`] or take something from it but do not evolve from it,
+/// one per rule of `Schema::evolves_from`, with what each one changes.
+fn schemas_that_do_not_evolve() -> Vec<(&'static str, Schema)> {
+    let schema = |parents: TableBuilder, plain: TableBuilder, owned: TableBuilder| {
+        Schema::builder()
+            .table(parents)
+            .table(children_table())
+            .table(plain)
+            .table(owned)
+            .build()
+    };
+    let reordered_parents = TableSchema::builder("parents")
+        .table_id(PARENTS)
+        .primary_key("id", DataType::Int)
+        .nullable_column("code", DataType::String)
+        .nullable_column("score", DataType::Float)
+        .unique("parents_code", ["code"])
+        .unique("parents_score_code", ["code", "score"]);
+    let unowned = TableSchema::builder("owned")
+        .table_id(OWNED)
+        .primary_key("id", DataType::Int)
+        .column("who", DataType::String)
+        .nullable_column("n", DataType::Int);
+    let narrower_plain = TableSchema::builder("plain")
+        .table_id(PLAIN)
+        .primary_key("id", DataType::Int);
+    vec![
+        (
+            "a constraint over columns it had",
+            schema(
+                parents_table().unique("parents_score", ["score"]),
+                plain_table(),
+                owned_table(),
+            ),
+        ),
+        (
+            "a constraint over other columns",
+            schema(reordered_parents, plain_table(), owned_table()),
+        ),
+        (
+            "another owner",
+            schema(parents_table(), plain_table(), unowned),
+        ),
+        (
+            "another immutability",
+            schema(parents_table(), plain_table(), owned_table().immutable()),
+        ),
+        (
+            "a column less",
+            schema(parents_table(), narrower_plain, owned_table()),
+        ),
+    ]
+}
+
+/// Refuses, after random batches, a reload to each schema of [`schemas_that_do_not_evolve`]
+/// (`SchemaNotEvolving`), and checks that none changes the room: its schema, its rows, its
+/// indexes and how the next batches are decided. `room` is open, empty, with [`owned_schema`].
+pub(crate) async fn reloads_that_do_not_evolve_change_nothing<E: RoomContents>(
+    engine: &E,
+    room: &RoomId,
+) {
+    let mut log = RandomLog::new(31, owned_schema());
+    apply_random_batches(engine, room, &mut log, 10).await;
+    let (_, before) = checked_contents(engine, room).await;
+    for (change, schema) in schemas_that_do_not_evolve() {
+        assert!(!schema.evolves_from(&owned_schema()), "{change}");
+        let err = engine.reload_schema(room, schema).await.unwrap_err();
+        assert!(
+            matches!(&err, StorageError::SchemaNotEvolving { room_id } if room_id == room),
+            "{change}: {err:?}"
+        );
+        let (schema, after) = checked_contents(engine, room).await;
+        assert_eq!(schema, owned_schema(), "{change}");
+        assert_same_contents(&before, &after);
+    }
+    apply_random_batches(engine, room, &mut log, 5).await;
+}
+
+/// A row of `parents` with key `id`, code `code` and tag `tag`, which only a schema with the
+/// column `tag` accepts.
+pub(crate) fn tagged_parent(seq: u64, id: i64, code: &str, tag: &str) -> SequencedOperation {
+    let row = CompactRow::new(vec![int(id), s(code), Value::Null, s(tag)]);
+    let op = Operation::insert(PARENTS, PrimaryKey::single(id), row, 0);
+    SequencedOperation::new(seq, op)
+}
+
+/// A row of `children` with key `(a, b)` and `alt`, which only [`reloaded_schema`] accepts.
+pub(crate) fn child_with_alt(seq: u64, (a, b): (i64, i64), alt: i64) -> SequencedOperation {
+    let null = Value::Null;
+    let values = vec![
+        int(a),
+        int(b),
+        null.clone(),
+        null.clone(),
+        null.clone(),
+        null,
+        int(alt),
+    ];
+    let pk = PrimaryKey::composite([int(a), int(b)]);
+    let op = Operation::insert(CHILDREN, pk, CompactRow::new(values), 0);
+    SequencedOperation::new(seq, op)
+}
+
+/// A row of `extra` with key `id` and parent `parent`.
+fn extra_row(seq: u64, id: i64, parent: i64) -> SequencedOperation {
+    let row = CompactRow::new(vec![int(id), int(parent)]);
+    let op = Operation::insert(EXTRA, PrimaryKey::single(id), row, 0);
+    SequencedOperation::new(seq, op)
+}
+
+/// The reasons of the rejections of `report`, as they print.
+fn rejected_constraints(report: &ApplyReport) -> Vec<String> {
+    report
+        .rejected()
+        .iter()
+        .map(|(_, reason)| format!("{reason:?}"))
+        .collect()
+}
+
+/// Reloads `room`, open with [`constrained_schema`], to [`reloaded_schema`] after random
+/// batches, and checks that from then on it decides as a room open with that schema from the
+/// start, a memory replica that applies the same log: right after the reload, the rows are the
+/// same, with an empty `extra`, and the indexes are those the rows give and those of the
+/// replica; a batch that repeats the `UNIQUE` key of a new column, writes a foreign key of one
+/// without its parent row, writes the new table and deletes a parent that a new foreign key
+/// references gives the replica's report; and so do random batches over the new columns.
+/// Reloading the same schema again changes nothing, and a scan begun before the reload keeps
+/// the rows it started with.
+pub(crate) async fn reloads_that_evolve_decide_as_the_new_schema<E: RoomContents>(
+    engine: &E,
+    room: &RoomId,
+) {
+    let replica = MemoryStorageEngine::new();
+    replica.open_room(room, reloaded_schema()).await.unwrap();
+    let mut log = RandomLog::new(37, constrained_schema());
+    for _ in 0..10 {
+        let (ops, expected) = log.next_batch();
+        apply_checked(engine, room, ops.clone(), &expected).await;
+        apply_checked(&replica, room, ops, &expected).await;
+    }
+    let (_, before) = checked_contents(engine, room).await;
+    let scan = engine
+        .scan_by_id(room, PARENTS, ScanOptions::default())
+        .await
+        .unwrap();
+
+    engine.reload_schema(room, reloaded_schema()).await.unwrap();
+    let (schema, after) = checked_contents(engine, room).await;
+    assert_eq!(schema, reloaded_schema());
+    let mut tables = before.tables().clone();
+    tables.insert(EXTRA, Table::new());
+    assert_eq!(after.tables(), &tables);
+    let (_, in_replica) = replica.contents(room).await;
+    assert_same_contents(&after, &in_replica);
+
+    log.evolve(reloaded_schema());
+    let head = log.head();
+    let batch = vec![
+        tagged_parent(head + 1, 100, "c100", "t"),
+        tagged_parent(head + 2, 101, "c101", "t"),
+        child_with_alt(head + 3, (100, 1), 999),
+        child_with_alt(head + 4, (100, 2), 100),
+        extra_row(head + 5, 1, 100),
+        extra_row(head + 6, 2, 100),
+        extra_row(head + 7, 3, 999),
+        SequencedOperation::new(
+            head + 8,
+            Operation::delete(PARENTS, PrimaryKey::single(100i64), 0),
+        ),
+    ];
+    let expected = log.decide(&batch);
+    assert_eq!(
+        rejected_constraints(&expected),
+        [
+            r#"Unique { constraint: "parents_tag" }"#,
+            r#"ForeignKey { constraint: "children_alt" }"#,
+            r#"Unique { constraint: "extra_parent_once" }"#,
+            r#"ForeignKey { constraint: "extra_parent" }"#,
+            r#"Restrict { constraint: "children_alt" }"#,
+        ]
+    );
+    apply_checked(engine, room, batch.clone(), &expected).await;
+    apply_checked(&replica, room, batch, &expected).await;
+    for _ in 0..20 {
+        let (ops, expected) = log.next_batch();
+        apply_checked(engine, room, ops.clone(), &expected).await;
+        apply_checked(&replica, room, ops, &expected).await;
+    }
+    let (_, now) = checked_contents(engine, room).await;
+    let (_, in_replica) = replica.contents(room).await;
+    assert_equivalent_contents(&now, &in_replica);
+
+    engine.reload_schema(room, reloaded_schema()).await.unwrap();
+    let (schema, again) = checked_contents(engine, room).await;
+    assert_eq!(schema, reloaded_schema());
+    assert_same_contents(&again, &now);
+
+    let scanned: Vec<_> = scan.map(Result::unwrap).collect().await;
+    let rows: Vec<_> = before.tables()[&PARENTS]
+        .iter()
+        .map(|(pk, row)| (pk.clone(), row.clone()))
+        .collect();
+    assert_eq!(scanned, rows);
+}
+
+/// Applies the random log of `seed` to `room`, open with [`constrained_schema`], reloading it
+/// to [`evolved_schema`] and then to [`reloaded_schema`] at random points, and checks that it
+/// gives the reports and ends with the rows and indexes of a memory replica that applies the
+/// whole log under [`reloaded_schema`]; right after each reload, the indexes are those the rows
+/// give.
+pub(crate) async fn reloads_at_random_points_decide_as_the_new_schema<E: RoomContents>(
+    engine: &E,
+    room: &RoomId,
+    seed: u64,
+) {
+    let replica = MemoryStorageEngine::new();
+    replica.open_room(room, reloaded_schema()).await.unwrap();
+    let mut log = RandomLog::new(seed, constrained_schema());
+    let mut rng = Rng::new(seed ^ 0x5EED);
+    let mut versions = vec![reloaded_schema(), evolved_schema()];
+    let mut at = [rng.below(15), 15 + rng.below(15)];
+    at.sort_unstable();
+    for batch in 0..40 {
+        if at.first() == Some(&batch) && !versions.is_empty() {
+            at.rotate_left(1);
+            let schema = versions.pop().unwrap();
+            engine.reload_schema(room, schema.clone()).await.unwrap();
+            let (reloaded, _) = checked_contents(engine, room).await;
+            assert_eq!(reloaded, schema, "seed {seed}, batch {batch}");
+            log.evolve(schema);
+        }
+        let (ops, expected) = log.next_batch();
+        apply_checked(engine, room, ops.clone(), &expected).await;
+        apply_checked(&replica, room, ops, &expected).await;
+    }
+    assert!(versions.is_empty(), "seed {seed}");
+    let (_, now) = checked_contents(engine, room).await;
+    let (_, in_replica) = replica.contents(room).await;
+    assert_equivalent_contents(&now, &in_replica);
+}
+
+/// Races, on `room` (open with [`constrained_schema`], empty), a writer, a reload to
+/// [`evolved_schema`] once the head reaches a random point, and a reader. Every batch of the
+/// writer ends with an insert that writes the new column `tag`: until the reload, the whole
+/// batch is refused (`SchemaValidation`) and changes nothing, and the writer sends it again
+/// without that insert; once a batch with the insert is applied, no later one is refused. Every
+/// applied batch gives the report it gives under [`evolved_schema`], every state the reader
+/// sees has indexes that follow its rows, and the room ends with the rows and indexes of a
+/// memory replica that applies the same batches under [`evolved_schema`].
+pub(crate) async fn reloads_race_batches_and_readers<E: RoomContents>(
+    engine: &E,
+    room: &RoomId,
+    seed: u64,
+) {
+    let mut rng = Rng::new(seed);
+    let reload_at = rng.below(12);
+    let mut log = RandomLog::new(seed, evolved_schema());
+    let replica = MemoryStorageEngine::new();
+    replica.open_room(room, evolved_schema()).await.unwrap();
+    let writing = std::sync::atomic::AtomicBool::new(true);
+
+    let writer = async {
+        let mut tagged_applied = false;
+        for batch in 0..30u64 {
+            let len = 1 + rng.below(4);
+            let mut ops = oracle::random_log(&mut rng, &constrained_schema(), log.head() + 1, len);
+            let tag = format!("t{}", batch / 2);
+            let code = format!("c{batch}");
+            ops.push(tagged_parent(
+                log.head() + 1 + len,
+                1000 + batch as i64,
+                &code,
+                &tag,
+            ));
+            let head = engine.get_head_seq(room).await.unwrap();
+            let applied = match engine.apply_batch(room, ops.clone()).await {
+                Ok(report) => {
+                    tagged_applied = true;
+                    (ops, report)
+                }
+                Err(StorageError::SchemaValidation(_)) => {
+                    assert!(!tagged_applied, "seed {seed}, batch {batch}");
+                    assert_eq!(engine.get_head_seq(room).await.unwrap(), head);
+                    ops.pop();
+                    let report = engine.apply_batch(room, ops.clone()).await.unwrap();
+                    (ops, report)
+                }
+                Err(err) => panic!("seed {seed}, batch {batch}: {err:?}"),
+            };
+            let (ops, report) = applied;
+            assert_eq!(report, log.decide(&ops), "seed {seed}, batch {batch}");
+            replica.apply_batch(room, ops).await.unwrap();
+            tokio::task::yield_now().await;
+        }
+        assert!(tagged_applied, "seed {seed}: the reload never came");
+        writing.store(false, std::sync::atomic::Ordering::Release);
+    };
+    let reloader = async {
+        while engine.get_head_seq(room).await.unwrap().get() < reload_at {
+            tokio::task::yield_now().await;
+        }
+        engine.reload_schema(room, evolved_schema()).await.unwrap();
+    };
+    let reader = async {
+        let mut seen = 0;
+        while writing.load(std::sync::atomic::Ordering::Acquire) {
+            checked_contents(engine, room).await;
+            let scan = engine.scan_by_id(room, PARENTS, ScanOptions::default());
+            let _: Vec<_> = scan.await.unwrap().map(Result::unwrap).collect().await;
+            seen += 1;
+            tokio::task::yield_now().await;
+        }
+        seen
+    };
+    let ((), (), seen) = tokio::join!(writer, reloader, reader);
+    assert!(seen > 0);
+    let (schema, now) = checked_contents(engine, room).await;
+    assert_eq!(schema, evolved_schema());
+    let (_, in_replica) = replica.contents(room).await;
+    assert_equivalent_contents(&now, &in_replica);
 }
 
 // ---------------------------------------------------------------------------------------------

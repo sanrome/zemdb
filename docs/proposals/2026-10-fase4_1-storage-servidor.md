@@ -2,7 +2,7 @@
 
 **Fecha:** 23 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lotes 0 a 4 cerrados; el próximo es el 5.
+**Estado:** En curso: Lotes 0 a 5 cerrados; el próximo es el 6.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.1. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -69,7 +69,7 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 | 2 | El `schema_id` en `CommitAck`, `SyncBatch` y `HeartbeatAck` | core, server | DC5 | E2, W1, W2, B1, K6 | ✅ |
 | 3 | Los plazos del servidor con el reloj de Tokio | server | DC16 | B2, R3, L1 | ✅ |
 | 4 | Los errores de la apertura y de `apply_snapshot` | storage | DC12 | S4, S5, C2, W1, K3 | ✅ |
-| 5 | `reload_schema` | storage | DC5 | S7, C1, C2, C3, S6, K6 | ⬜ |
+| 5 | `reload_schema` | storage | DC5 | S7, C1, C2, C3, S6, K6 | ✅ |
 | 6 | Zstd en wasm32 con `ruzstd` | storage | DC9 | W1, W2, S5, K12 | ⬜ |
 | 7 | Capa de archivos: el trait y su implementación nativa | storage | DC8, DC17 | S1 a S6, L7 | ⬜ |
 | 8 | Capa de archivos: la recuperación | storage (y core, si cambia `find_valid_frame`) | DC17 | S3, S4, S6 | ⬜ |
@@ -325,7 +325,7 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 - **Tamaño:** unas 20 líneas de producción, más docstrings.
 - **Desvíos:** `fail_point.rs` no cambia. El plan lo listaba entre los archivos, pero los puntos se nombran con strings y alcanza `io_result`. La fila del Lote 3 en la tabla de lotes había quedado en ⬜, y se corrigió en este lote.
 
-### Lote 5 · `reload_schema` (`zemdb-storage`) · ⬜
+### Lote 5 · `reload_schema` (`zemdb-storage`) · ✅
 **Objetivo:** cambiar el esquema de una sala abierta sin cerrarla (DC5, DEF-34), con INV-S7.
 
 **Archivos:** `crates/storage/src/engine.rs`, `error.rs`, `memory/mod.rs`, `memory/state.rs`, `memory/index.rs` (los campos de `TableIndexes` son privados: agregar índices vacíos necesita un método ahí) y `disk/mod.rs`.
@@ -356,6 +356,96 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 - Abrir una sala en disco con un esquema más angosto que el de sus filas (`ARCHITECTURE.md` §8: las columnas no se verifican al abrir).
 
 **Documentos:** `ARCHITECTURE.md` §8 (*Active Storage Schema Validation* y una entrada para la recarga); `INVARIANTES.md`: INV-S7 sin 🆕, la excepción de INV-S6 sin 🆕, en INV-C1 e INV-K6 la parte de la recarga, y DEF-34 cerrado en §4.
+
+**Hecho.**
+- **Storage.**
+  - **El método y el error.** `StorageEngine::reload_schema(room_id, schema)` está en los dos motores. `StorageError::SchemaNotEvolving { room_id }` es nuevo. Valida todo antes de cambiar nada, en este orden:
+    - la sala abierta (`RoomNotFound`);
+    - en disco, no fallida (`RoomFailed`);
+    - el mismo esquema, que es un `Ok` sin cambios;
+    - `schema.evolves_from(&actual)`, y si no, `SchemaNotEvolving`.
+  - **Los índices.**
+    - `TableIndexes::evolved` (`memory/index.rs`) conserva los índices de las restricciones viejas. Son un prefijo, por `evolves_from`. Agrega los de las nuevas, construidos desde las filas o vacíos.
+    - `RoomData::evolved(schema, from_rows)` (`memory/state.rs`) hace lo mismo por tabla y agrega vacías las tablas nuevas.
+    - `RoomData::check_added(older, schema)` verifica cada fila de una tabla vieja contra las restricciones nuevas, como una actualización de sus columnas nuevas. Toda restricción nueva incluye una columna nueva (DR3), así que `check_row` revisa justo esas. La verificación de antes (`check`) pasa por la misma función, `check_constraints`, sin filtro.
+  - **En memoria,** bajo el lock de escritura de la sala, sin construir desde las filas: `evolved(schema, false)`, en O(tablas y restricciones).
+  - **En disco,** bajo el mutex del WAL:
+    - construye y verifica en el pool bloqueante (`evolved(schema, true)` y `check_added`), con un fail point nuevo de pausa, solo en tests (`reload_schema.build`);
+    - publica solo el esquema y los datos bajo el lock de escritura del estado;
+    - no toca archivos, así que soltar su future no cambia nada y no marca la sala fallida.
+  - **La documentación del trait** dice las reglas, los errores y que nada se escribe en disco.
+- **Tests,** en `crates/storage/src/memory/tests/index.rs`. Los escenarios corren en los dos motores (`tests/memory.rs` y `tests/disk.rs`):
+  - `reloads_that_do_not_evolve_change_nothing`: un negativo por cada regla de `evolves_from`, sobre un esquema con una tabla con dueño (`owned_schema`):
+    - una restricción sobre columnas viejas;
+    - una restricción cambiada;
+    - otro dueño;
+    - otra inmutabilidad;
+    - una columna menos.
+
+    Cada uno es `SchemaNotEvolving`, y el esquema, las filas, los índices y cómo se deciden los lotes siguientes quedan igual. En disco, la reapertura da lo mismo.
+  - `reloads_that_evolve_decide_as_the_new_schema`: recargar `reloaded_schema` después de lotes al azar, con columnas nuevas con `UNIQUE` y FK y una tabla nueva con FK a una vieja.
+    - Justo después, las filas son las mismas, con la tabla nueva vacía, y los índices son los que dan las filas y los de una réplica abierta con el esquema nuevo desde el principio.
+    - Un lote con una `UNIQUE` nueva repetida, una FK nueva colgante, escrituras en la tabla nueva y un `DELETE` que una FK nueva impide da los mismos reportes que esa réplica (`Unique`, `ForeignKey`, `Restrict`). Lo mismo con 20 lotes al azar que usan las columnas nuevas.
+    - Recargar el mismo esquema no cambia nada.
+    - Un scan empezado antes conserva sus filas.
+    - En memoria no construye desde las filas: no llega al thread point de la construcción. En disco construye fuera del runtime, en un runtime de un solo hilo. Reabrir con el esquema nuevo da lo mismo.
+  - `reloads_at_random_points_decide_as_the_new_schema`: dos recargas en puntos al azar de un log aleatorio, con los mismos reportes, filas e índices que la réplica, e índices construidos desde las tablas justo después de cada recarga. En disco, reabrir con el esquema nuevo, desde el WAL o desde un `.snap` compactado, da lo mismo.
+  - `reloads_race_batches_and_readers`: una recarga en un punto al azar compite con un escritor y un lector (estado e índices, y scans).
+    - Cada lote del escritor termina con un insert de la columna nueva: hasta la recarga, el lote entero se rechaza por esquema y no cambia el head; después de que se aplica uno, ninguno más se rechaza.
+    - Cada lote aplicado da el reporte del modelo.
+    - Todo estado que ve el lector tiene índices que siguen sus filas.
+  - Solo en disco (`tests/disk.rs`):
+    - las filas más anchas, desde el WAL y desde un `.snap` compactado: abrir con v1, recargar v2, insertar `tag = "1"`, reabrir con v1 (la fila conserva el valor) y recargar v2. El índice de `UNIQUE (tag)` tiene la fila, y un insert con el mismo valor es `Unique`;
+    - las filas que violan una restricción nueva, una `UNIQUE` y una FK, escritas bajo otra extensión de v1: `SnapshotConstraints` con la tabla y la restricción, y la sala sigue igual y aplicando lotes;
+    - una sala fallida: `RoomFailed`, sin cambios;
+    - con una compactación en curso, que hizo su fase 1 antes de la recarga y su fase 3 mientras la recarga construye: la recarga no pisa `snapshot_seq` ni `snapshot_len`, y el `.snap`, escrito con las tablas de antes, reabre con el esquema nuevo;
+    - con un `apply_snapshot` en curso, en los dos órdenes (una recarga mientras el snapshot está en staging, y un snapshot que espera la construcción de la recarga): queda el esquema, las filas y los índices del snapshot, y la reapertura da lo mismo;
+    - `reload_schema` soltado en cualquier punto de suspensión: el esquema viejo o el nuevo, las mismas filas, índices que las siguen, y la sala usable;
+    - reaperturas más angostas (`narrower_reopens_then_reloads`): un log aleatorio bajo versiones con columnas al azar (`oracle::add_random_column`), con reaperturas con una versión anterior, la mitad de las veces después de una compactación, y recargas a una posterior. Una recarga aceptada deja filas que cumplen el esquema nuevo (`RoomData::build_checked`) e índices que las siguen. Una rechazada (`SnapshotConstraints`) no cambia nada. Hay 8 logs en el test corto y 200 en el largo, que exige los dos desenlaces.
+  - `schema_evolution_tests.rs`, de integración: una réplica en memoria y otra en disco recargan cada versión cuando la necesitan. La de disco compacta en puntos al azar. Las dos dan los reportes del modelo y terminan con sus filas; la de disco, también después de reabrir con la última versión.
+  - Contra el esqueleto (el método declarado, que solo buscaba la sala), los 16 tests nuevos fallaban por comportamiento; los dos de `RoomNotFound` pasaban, como corresponde.
+- **Mutaciones verificadas,** todas detectadas, cada una compilando:
+  - no verificar `evolves_from`;
+  - en memoria, no cambiar los datos;
+  - en memoria, construir desde las filas;
+  - en disco, no construir desde las filas;
+  - no llamar a `check_added`;
+  - verificar las columnas viejas en lugar de las nuevas;
+  - publicar también `snapshot_seq` y `snapshot_len` leídos antes;
+  - soltar el mutex del WAL antes de construir;
+  - no verificar que la sala esté fallida;
+  - vaciar los índices viejos;
+  - construir en el runtime;
+  - no agregar las tablas nuevas.
+- **Interacciones revisadas:**
+  - La compactación:
+    - su fase 1 toma las tablas bajo el mutex del WAL, que la recarga tiene, así que nunca captura un estado a medias;
+    - su fase 3 escribe `snapshot_seq` y `snapshot_len` sin ese mutex, y la recarga publica solo el esquema y los datos (el test de arriba);
+    - un `.snap` escrito con las tablas de antes de la recarga abre igual, porque la apertura completa las tablas que faltan.
+  - `apply_snapshot` reemplaza el esquema por el que recibe, bajo el mutex del WAL: una recarga y un snapshot quedan en el orden de ese mutex (el test de arriba). En memoria, los dos van bajo el lock de la sala.
+  - `scan` y `get` resuelven la tabla con el esquema del estado bajo el mismo lock de lectura: un scan empezado antes de la recarga sigue con su clon. `get_head_seq` no cambia, porque la recarga no mueve el head. `create_snapshot` sí: después de una recarga que agrega tablas, el snapshot las lleva vacías, como el de una sala abierta con el esquema nuevo, y un peer con el esquema viejo lo rechaza (`SnapshotCorruption`, por una tabla fuera de su esquema). DC5 y DC12 lo cubren: el SDK pide el esquema y reintenta, sin descartar la réplica.
+  - `close_room` espera el mutex del WAL, así que espera a una recarga en curso. Una recarga que tomó la sala antes de que `close_room` la sacara termina sobre esa instancia y devuelve `Ok`: no toca archivos, y el esquema de la reapertura lo da quien abre.
+  - Dos recargas concurrentes se serializan bajo el lock de la sala en memoria y bajo el mutex del WAL en disco, y la segunda valida contra el esquema que dejó la primera. En memoria, una recarga y un `apply_snapshot` también se ordenan bajo el lock de la sala, sin un `.await` en el medio, así que el test de los dos órdenes queda solo en disco.
+  - El checklist de determinismo de la Fase 3.11:
+    - después de recargar, cada operación la decide `apply_operation`, en los dos motores, sobre índices iguales a los de una sala abierta con ese esquema (los tests de equivalencia comparan las entradas de los índices);
+    - `check_added` recorre las tablas por id, las filas por clave y las restricciones en su orden de declaración, como `check`, así que la restricción que nombra `SnapshotConstraints` es la misma en toda réplica;
+    - nada depende del orden de un `HashMap`: `evolved` recorre `schema.tables()`.
+  - Abrir una sala en disco con un esquema más angosto (`ARCHITECTURE.md` §8): las columnas no se verifican al abrir, y una recarga posterior las indexa y verifica.
+  - Las filas de una sala recargada pueden ser más cortas que las de una abierta con el esquema nuevo: un `UPDATE` ensancha la fila al ancho del esquema con que se aplica. Es la diferencia en los `NULL` del final que ya admite INV-S6 (INV-Y8). Los tests de equivalencia las comparan así (`assert_equivalent_contents`), y los índices, exactos.
+  - Ni el servidor ni el cliente implementan `StorageEngine`: el método nuevo del trait no rompe ningún otro crate.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura, con sus propias corridas en una copia): en verde, sin hallazgos Altos ni Medios. Probó cinco mutaciones propias: una detectada, tres equivalentes y una que sobrevivió (L1). Sus Bajos:
+  - **L1. Que la recarga publique con el mutex del WAL tomado no lo fija ningún test.** Soltarlo después de construir y antes de publicar sobrevive: el test de la carrera corre el escritor, la recarga y el lector en una tarea, con `tokio::join!`, así que se intercalan pero no corren en paralelo. Se acepta con el argumento: con el mutex suelto, un lote se validaría con el esquema viejo y se aplicaría con el nuevo, que evoluciona del viejo, así que lo decidiría igual. El mutex sigue tomado, y el revisor no encontró un test determinista.
+  - **L2. `create_snapshot` cambia después de una recarga.** La nota decía lo contrario, y se corrigió arriba. La asimetría es preexistente: `decode_received_snapshot` rechaza una tabla vacía fuera del esquema, y `load_snapshot` la descarta.
+  - **L3. Código defensivo sin camino que lo alcance:** construir desde las filas los índices de una tabla nueva, y verificarla entera en `check_added`. En disco una tabla nueva nunca tiene filas, porque la apertura y `apply_snapshot` rechazan las de una tabla fuera del esquema. El atajo del mismo esquema da el mismo resultado que el camino completo, solo más rápido. Se dejan.
+  - **L4. Reabrir con el esquema recargado puede ser `SnapshotConstraints`** después de reaperturas más angostas (ver *Desvíos*). Falla cerrado, dentro de la excepción de INV-S6, y el SDK no reabre así. Una opción, que no se toma: compactar después de una recarga que encontró valores en las columnas nuevas.
+  - **L5. Huecos de tests contra lo exigido:** la carrera con un `apply_snapshot` en memoria, dos recargas concurrentes y una recarga contra `close_room`. Cada uno tiene su argumento en *Interacciones revisadas*.
+  - **L6. Preexistente:** la recarga verifica restricciones, no tipos. En disco, un valor de una columna nueva escrito bajo otra extensión del esquema, con otro tipo, no se verifica. Es coherente con que las columnas no se verifican al abrir, y entra en la excepción de INV-S6.
+- **Chequeos:** fmt, clippy, test, doc y el build de wasm32 en verde; `cargo test --release -- --ignored` de `zemdb-storage`.
+- **Tamaño:** unas 80 líneas de producción nuevas (y unas 25 movidas de `check` a `check_constraints`), más docstrings; unas 1000 de tests.
+- **Desvíos:**
+  - `INVARIANTES.md` §4: la fila de DEF-34 sale de los riesgos aceptados, porque ya no es un riesgo.
+  - **Una precisión del contrato,** que encontró la versión larga del test de reaperturas más angostas. Después de compactar con filas que no cumplen una restricción de una versión posterior, y de recargarla cuando las filas ya la cumplían, reabrir con esa versión es `SnapshotConstraints`: la apertura verifica el `.snap` antes del replay que lo arregló. Es la excepción de INV-S6 (la sala se abrió con un esquema más angosto) y falla cerrada, sin descartar nada (INV-S4). La excepción de INV-S6 en `INVARIANTES.md` y la entrada de `ARCHITECTURE.md` ahora lo dicen, y el test reabre en ese caso con una versión anterior.
+  - El negativo de "otro dueño" usa un esquema con una tabla con dueño (`owned_schema`): en `constrained_schema` ninguna columna puede ser dueña (todas son nullable) y una columna nueva tampoco. Agrega además el de la inmutabilidad, que `evolves_from` también exige.
 
 ### Lote 6 · Zstd en wasm32 con `ruzstd` (`zemdb-storage`) · ⬜
 **Objetivo:** que un navegador restaure los snapshots que suben los clientes nativos, y que comprima los suyos (DC9, DEF-54).
@@ -413,4 +503,4 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 
 ## 3. Seguimiento
 
-**Avance:** Lote 0 cerrado el 23 de Octubre de 2026, con la revisión cruzada en verde en su quinta ronda; Lote 1 cerrado el mismo día. DC17 adoptada el 23 de Octubre, con renombrar un archivo abierto como operación del trait (el refactor de los Lotes 7 a 9 queda sin cambio de comportamiento). Lote 2 cerrado el 23 de Octubre. Lote 3 cerrado el 24 de Octubre, y el Lote 4 el mismo día. El próximo es el Lote 5.
+**Avance:** Lote 0 cerrado el 23 de Octubre de 2026, con la revisión cruzada en verde en su quinta ronda; Lote 1 cerrado el mismo día. DC17 adoptada el 23 de Octubre, con renombrar un archivo abierto como operación del trait (el refactor de los Lotes 7 a 9 queda sin cambio de comportamiento). Lote 2 cerrado el 23 de Octubre. Lote 3 cerrado el 24 de Octubre, y los Lotes 4 y 5 el mismo día. El próximo es el Lote 6.

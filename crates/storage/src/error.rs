@@ -65,6 +65,12 @@ pub enum StorageError {
     #[error("Room '{room_id}' holds data of table id {table_id}, which its schema does not have")]
     SchemaMismatch { room_id: RoomId, table_id: u16 },
 
+    /// A schema that `reload_schema` refused because it does not evolve from the room's
+    /// (`Schema::evolves_from`): it would judge differently the operations the room already
+    /// decided. The room keeps its schema.
+    #[error("The schema does not evolve from the schema of room '{room_id}'")]
+    SchemaNotEvolving { room_id: RoomId },
+
     /// Engine options that cannot work, such as a compaction ratio that is not a finite number
     /// above 0.
     #[error("Invalid storage options: {0}")]

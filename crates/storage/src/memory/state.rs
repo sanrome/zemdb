@@ -91,6 +91,33 @@ impl RoomData {
         Ok(data)
     }
 
+    /// These rows under `schema`, which evolves from the schema they are under
+    /// (`Schema::evolves_from`): an empty table for each table it adds, the indexes of the
+    /// constraints they had as they are (their columns do not change), and those of the
+    /// constraints it adds, built from the rows if `from_rows`, or empty otherwise. Without
+    /// `from_rows` it takes O(tables and constraints), and is only right for rows that hold
+    /// `NULL` in every column their schema lacks, which every new constraint includes.
+    pub(crate) fn evolved(&self, schema: &Schema, from_rows: bool) -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        if from_rows {
+            crate::fail_point::thread_point("room_data.build");
+        }
+        let mut tables = self.tables.clone();
+        let indexes = schema
+            .tables()
+            .map(|table| {
+                let rows = &*tables.entry(table.table_id()).or_default();
+                let indexes = match (self.indexes.get(&table.table_id()), from_rows) {
+                    (Some(kept), _) => kept.evolved(table, from_rows.then_some(rows)),
+                    (None, true) => TableIndexes::build(table, rows),
+                    (None, false) => TableIndexes::new(table),
+                };
+                (table.table_id(), indexes)
+            })
+            .collect();
+        Self { tables, indexes }
+    }
+
     /// `SnapshotConstraints` if the rows break a constraint of `schema`: a `UNIQUE` key that
     /// another row repeats, or a foreign key without its parent row. Each row is checked as
     /// [`apply_operation`] checks an insert of it on these rows, so a key with a `NULL` is not
@@ -98,12 +125,37 @@ impl RoomData {
     /// the constraint named is always the same. O(N log N) per constraint, like
     /// [`RoomData::build`], so it reaches the same thread point.
     fn check(&self, schema: &Schema) -> Result<(), StorageError> {
+        self.check_constraints(schema, |_| None)
+    }
+
+    /// [`RoomData::check`], for the constraints that `schema` adds to `older`, the schema it
+    /// evolves from (`Schema::evolves_from`): each of them includes a column that its table
+    /// lacks in `older`, so a row of a table of `older` is checked as an update of those
+    /// columns, and a table that `older` lacks is checked whole. Only the disk engine, which is
+    /// not built for WebAssembly, needs it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn check_added(&self, older: &Schema, schema: &Schema) -> Result<(), StorageError> {
+        self.check_constraints(schema, |table| {
+            let old = older.get_table_by_id(table.table_id())?;
+            Some((old.columns().len()..table.columns().len()).collect())
+        })
+    }
+
+    /// Checks each row of each table of `schema` as [`check_row`] checks a row whose
+    /// `new_columns` of its table are set (all of them, with `None`).
+    fn check_constraints(
+        &self,
+        schema: &Schema,
+        new_columns: impl Fn(&TableSchema) -> Option<Vec<usize>>,
+    ) -> Result<(), StorageError> {
         #[cfg(not(target_arch = "wasm32"))]
         crate::fail_point::thread_point("room_data.build");
         for table in schema.tables() {
+            let set_columns = new_columns(table);
             let rows = self.tables.get(&table.table_id()).into_iter().flatten();
             for (pk, row) in rows {
-                if let Some(reason) = check_row(self, schema, table, pk, row, None) {
+                let checked = check_row(self, schema, table, pk, row, set_columns.as_deref());
+                if let Some(reason) = checked {
                     // `check_row` only gives the reasons of a constraint.
                     let constraint = match reason {
                         RejectReason::Unique { constraint }

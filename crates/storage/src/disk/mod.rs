@@ -496,6 +496,50 @@ impl StorageEngine for DiskStorageEngine {
         Ok(())
     }
 
+    /// Changes the room's schema (see the trait) under the WAL mutex, so no batch, snapshot
+    /// install or WAL rotation runs meanwhile. A room opened with a schema narrower than the one
+    /// its files were written under keeps the values of the columns it lacks, so the indexes of
+    /// the new constraints are built from the rows and the rows checked against them, on the
+    /// blocking pool; readers keep reading the old state meanwhile. Only the schema and the rows
+    /// are published, under the state lock: the last phase of a compaction records the
+    /// snapshot's sequence and size under that lock without the WAL mutex. Nothing touches the
+    /// files, so a reload dropped by its caller changes nothing.
+    #[tracing::instrument(skip(self, schema), fields(room_id = %room_id))]
+    async fn reload_schema(&self, room_id: &RoomId, schema: Schema) -> Result<(), StorageError> {
+        let room = self.get_room(room_id).await?;
+        let wal = room.wal.lock().await;
+        wal.ensure_usable()?;
+        let (older, data) = {
+            let state = room.state.read().await;
+            if state.schema == schema {
+                return Ok(());
+            }
+            if !schema.evolves_from(&state.schema) {
+                return Err(StorageError::SchemaNotEvolving {
+                    room_id: room_id.clone(),
+                });
+            }
+            (state.schema.clone(), state.data.clone())
+        };
+
+        let fail_key = room.wal_path.clone();
+        let (schema, data) = run_blocking(move || {
+            fail_point::pause_blocking("reload_schema.build", &fail_key);
+            let data = data.evolved(&schema, true);
+            data.check_added(&older, &schema)?;
+            Ok::<_, StorageError>((schema, data))
+        })
+        .await?;
+        {
+            let mut state = room.state.write().await;
+            state.schema = schema;
+            state.data = data;
+        }
+        drop(wal);
+        tracing::info!(room_id = %room_id, "Reloaded the schema of a disk room");
+        Ok(())
+    }
+
     #[tracing::instrument(skip(self, ops), fields(room_id = %room_id, ops_count = ops.len()))]
     async fn apply_batch(
         &self,

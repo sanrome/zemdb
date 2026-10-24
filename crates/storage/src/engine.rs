@@ -107,6 +107,26 @@ pub trait StorageEngine: EngineConcurrencyBounds {
     /// constraints), and neither is an I/O error reading the files (`Io`).
     async fn open_room(&self, room_id: &RoomId, schema: Schema) -> Result<(), StorageError>;
 
+    /// Changes the schema of an open room to `schema`, without closing it. Nothing is written
+    /// to disk: the schema a room is reopened with is the one its opener passes.
+    ///
+    /// `schema` must evolve from the room's schema (`Schema::evolves_from`); otherwise
+    /// `StorageError::SchemaNotEvolving`. The same schema changes nothing and succeeds. A disk
+    /// room marked as failed is `StorageError::RoomFailed`. Every new constraint includes a new
+    /// column, which the room's rows hold as `NULL`, and every new table is empty, so the
+    /// operations already applied are judged as they were. A disk room opened with a schema
+    /// narrower than the one its files were written under keeps the values of the columns that
+    /// schema lacks, and its rows are checked against the new constraints: rows that break one
+    /// are `StorageError::SnapshotConstraints`, naming the table and the constraint. Any error
+    /// changes nothing.
+    ///
+    /// The schema, the new tables and the indexes of the new constraints are published at once,
+    /// under the lock the batches are applied under: no batch is applied with two schemas, and
+    /// no reader sees the new schema without its indexes.
+    ///
+    /// The room must be open; otherwise `StorageError::RoomNotFound` is returned.
+    async fn reload_schema(&self, room_id: &RoomId, schema: Schema) -> Result<(), StorageError>;
+
     /// Closes a room, releasing any associated resources or file handles.
     async fn close_room(&self, room_id: &RoomId) -> Result<(), StorageError>;
 
