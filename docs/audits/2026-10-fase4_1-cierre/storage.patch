@@ -1,0 +1,233 @@
+diff --git a/crates/core/tests/review_frame_search_oracle.rs b/crates/core/tests/review_frame_search_oracle.rs
+new file mode 100644
+index 0000000..3073c98
+--- /dev/null
++++ b/crates/core/tests/review_frame_search_oracle.rs
+@@ -0,0 +1,126 @@
++//! Closing review of 4.1: FrameSearch against the search of 9b90d1d (copied here as the oracle).
++use std::io::{Cursor, Read, Seek, SeekFrom};
++use zemdb_core::protocol::wal_frame::{
++    encode_wal_batch, find_valid_frame, parse_batch_header, FrameSearch, FrameSearchStep,
++    BATCH_HEADER_SIZE, BATCH_MAGIC,
++};
++use zemdb_core::mutation::Operation;
++use zemdb_core::protocol::messages::SequencedOperation;
++use zemdb_core::value::{CompactRow, PrimaryKey, Value};
++
++const SEARCH_WINDOW: usize = 64 * 1024;
++const MAX_PAYLOAD_CHECKS: usize = 16;
++
++fn old_find_valid_frame<R: Read + Seek>(reader: &mut R, from: u64, end: u64) -> std::io::Result<Option<u64>> {
++    let mut window = vec![0u8; SEARCH_WINDOW + BATCH_HEADER_SIZE - 1];
++    let mut failed_checks = 0;
++    let mut start = from;
++    while end.saturating_sub(start) >= BATCH_HEADER_SIZE as u64 {
++        let len = (end - start).min(window.len() as u64) as usize;
++        reader.seek(SeekFrom::Start(start))?;
++        reader.read_exact(&mut window[..len])?;
++        let candidates = len - BATCH_HEADER_SIZE + 1;
++        for i in 0..candidates {
++            if window[i..i + 2] != BATCH_MAGIC {
++                continue;
++            }
++            let header_bytes: &[u8; BATCH_HEADER_SIZE] = window[i..i + BATCH_HEADER_SIZE].try_into().unwrap();
++            let Ok(header) = parse_batch_header(header_bytes) else { continue };
++            let position = start + i as u64;
++            if end - position < header.frame_len() as u64 {
++                continue;
++            }
++            let crc = u32::from_le_bytes(header_bytes[6..10].try_into().unwrap());
++            if failed_checks == MAX_PAYLOAD_CHECKS || payload_matches(reader, position + BATCH_HEADER_SIZE as u64, header.payload_len(), crc)? {
++                return Ok(Some(position));
++            }
++            failed_checks += 1;
++        }
++        start += candidates as u64;
++    }
++    Ok(None)
++}
++
++fn payload_matches<R: Read + Seek>(reader: &mut R, position: u64, len: usize, crc: u32) -> std::io::Result<bool> {
++    reader.seek(SeekFrom::Start(position))?;
++    let mut hasher = crc32fast::Hasher::new();
++    let mut chunk = [0u8; 8 * 1024];
++    let mut remaining = len;
++    while remaining > 0 {
++        let n = remaining.min(chunk.len());
++        reader.read_exact(&mut chunk[..n])?;
++        hasher.update(&chunk[..n]);
++        remaining -= n;
++    }
++    Ok(hasher.finalize() == crc)
++}
++
++fn by_steps(log: &[u8], from: u64, end: u64) -> Option<u64> {
++    let mut s = FrameSearch::new(from, end);
++    loop {
++        match s.step() {
++            FrameSearchStep::Read { offset, len } => {
++                assert!(offset >= from && offset + len as u64 <= end);
++                s.feed(&log[offset as usize..][..len]);
++            }
++            FrameSearchStep::Done(f) => return f,
++        }
++    }
++}
++
++struct Rng(u64);
++impl Rng {
++    fn next(&mut self) -> u64 { self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; self.0 }
++    fn below(&mut self, n: u64) -> u64 { self.next() % n.max(1) }
++}
++
++fn frame(seq: u64, size: usize) -> Vec<u8> {
++    let row = CompactRow::new(vec![Value::Int(1), Value::Bytes(vec![0x5A; size].into())]);
++    let op = SequencedOperation::new(seq, Operation::insert(0, PrimaryKey::single(1i64), row, 100));
++    encode_wal_batch(&[op], None).unwrap()
++}
++
++/// A header whose own CRC is right, declaring `len` payload bytes with a wrong payload CRC.
++fn lying_header(len: u32) -> Vec<u8> {
++    let mut h = [0u8; BATCH_HEADER_SIZE];
++    h[..2].copy_from_slice(&BATCH_MAGIC);
++    h[2..6].copy_from_slice(&len.to_le_bytes());
++    h[6..10].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
++    h[10..14].copy_from_slice(&1u32.to_le_bytes());
++    let crc = crc32fast::hash(&h[..BATCH_HEADER_SIZE - 4]);
++    h[14..].copy_from_slice(&crc.to_le_bytes());
++    h.to_vec()
++}
++
++#[test]
++fn frame_search_matches_the_search_of_9b90d1d() {
++    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
++    for case in 0..3000 {
++        let mut log = Vec::new();
++        let parts = 1 + rng.below(12);
++        for _ in 0..parts {
++            match rng.below(9) {
++                0 => log.extend(frame(rng.below(100), rng.below(40) as usize)),
++                1 => log.extend(frame(rng.below(100), (rng.below(3) as usize) * 70_000 + rng.below(2000) as usize)),
++                2 => { let mut f = frame(1, rng.below(300) as usize); let i = rng.below(f.len() as u64) as usize; f[i] ^= 1 << rng.below(8); log.extend(f); }
++                3 => { let n = rng.below(20) as usize; for _ in 0..n { log.extend(lying_header(rng.below(64) as u32)); log.extend(vec![0u8; rng.below(64) as usize]); } }
++                4 => log.extend(vec![0u8; rng.below(70_000) as usize]),
++                5 => { for _ in 0..rng.below(200) { log.push(rng.next() as u8); } }
++                6 => { for _ in 0..rng.below(50) { log.extend_from_slice(&BATCH_MAGIC); } }
++                7 => log.extend(lying_header(rng.below(200_000) as u32)),
++                _ => { let pad = SEARCH_WINDOW - (log.len() % SEARCH_WINDOW); let back = rng.below(BATCH_HEADER_SIZE as u64 + 3) as usize; log.extend(vec![0x77; pad.saturating_sub(back)]); log.extend(frame(5, rng.below(50) as usize)); }
++            }
++        }
++        let len = log.len() as u64;
++        let mut points = vec![0, 1, len / 3, len / 2, len.saturating_sub(BATCH_HEADER_SIZE as u64), len.saturating_sub(1), len, len + 5];
++        for _ in 0..4 { points.push(rng.below(len + 1)); }
++        for &from in &points {
++            for end in [len, rng.below(len + 1).max(from.min(len)), from.min(len)] {
++                if end > len { continue; }
++                let expected = old_find_valid_frame(&mut Cursor::new(&log), from, end).unwrap();
++                assert_eq!(by_steps(&log, from, end), expected, "case {case} from {from} end {end} len {len}");
++                assert_eq!(find_valid_frame(&mut Cursor::new(&log), from, end).unwrap(), expected, "case {case}");
++            }
++        }
++    }
++}
+diff --git a/crates/storage/src/disk/tests/opfs_like.rs b/crates/storage/src/disk/tests/opfs_like.rs
+index 754844f..1814df1 100644
+--- a/crates/storage/src/disk/tests/opfs_like.rs
++++ b/crates/storage/src/disk/tests/opfs_like.rs
+@@ -42,6 +42,7 @@ struct OpfsLikeFiles {
+     virtual_root: PathBuf,
+     real_root: PathBuf,
+     handles: Arc<Mutex<Handles>>,
++    fail_reopen: Arc<std::sync::atomic::AtomicBool>,
+ }
+ 
+ impl OpfsLikeFiles {
+@@ -54,6 +55,7 @@ impl OpfsLikeFiles {
+             virtual_root: dir.join("virtual"),
+             real_root,
+             handles: Arc::default(),
++            fail_reopen: Arc::default(),
+         }
+     }
+ 
+@@ -97,6 +99,9 @@ impl OpfsLikeFiles {
+     /// Opens the real file of `path` again as `mode` opened it.
+     async fn reopen(&self, path: &Path, mode: Mode) -> io::Result<NativeFile> {
+         let real = self.real(path);
++        if self.fail_reopen.swap(false, std::sync::atomic::Ordering::SeqCst) {
++            return Err(io::Error::other("review: the handle could not be opened again"));
++        }
+         match mode {
+             Mode::Locked => self
+                 .native
+@@ -582,3 +587,70 @@ async fn recovery_of_interrupted_compactions_runs_on_a_layer_that_fails_like_the
+     assert_rows(&engine, &room, 12).await;
+     assert_clean(engine, &layer, &room).await;
+ }
++
++/// Review of 4.1: a rotation whose move succeeds and whose reopening fails leaves a dead handle
++/// (as the OPFS can, DC17). The room is not failed by the rotation; the next write fails and marks
++/// it, nothing acknowledged is lost, and the room reopens with every row.
++#[tokio::test]
++async fn review_rotation_that_leaves_a_dead_handle_loses_nothing() {
++    use std::sync::atomic::Ordering;
++    let dir = tempfile::tempdir().unwrap();
++    let layer = OpfsLikeFiles::new(dir.path());
++    let room = RoomId::new("opfs-dead-handle").unwrap();
++    let engine = open_on(&layer, &room).await;
++    let wal_path = engine.wal_file_path(&room);
++    apply_range(&engine, &room, 1..=5).await;
++
++    layer.fail_reopen.store(true, Ordering::SeqCst);
++    let compacted = engine.compact_room(&room).await;
++    assert!(compacted.is_err(), "{compacted:?}");
++    assert!(layer.real(&compacting_wal_path(&wal_path)).exists());
++    assert!(!layer.real(&wal_path).exists());
++    // Readers still see every acknowledged row.
++    assert_rows(&engine, &room, 5).await;
++    // The next write fails on the dead handle and marks the room failed.
++    let write = engine.apply_batch(&room, vec![insert(6)]).await;
++    assert!(write.is_err(), "{write:?}");
++    assert_room_failed(&engine, &room, 6).await;
++    let closed = engine.close_room(&room).await;
++    eprintln!("close_room after a dead handle: {closed:?}");
++    drop(engine);
++
++    let engine = open_on(&layer, &room).await;
++    assert_rows(&engine, &room, 5).await;
++    apply_range(&engine, &room, 6..=7).await;
++    engine.compact_room(&room).await.unwrap();
++    let engine = reopen_on(engine, &layer, &room).await;
++    assert_rows(&engine, &room, 7).await;
++    assert!(layer.refused().is_empty(), "{:?}", layer.refused());
++}
++
++/// Review of 4.1: the same with an absorption pending: nothing renames the WAL, so no dead handle.
++/// A rollback whose reopening fails leaves the room failed.
++#[tokio::test]
++async fn review_rollback_that_leaves_a_dead_handle_marks_the_room_failed() {
++    use std::sync::atomic::Ordering;
++    let dir = tempfile::tempdir().unwrap();
++    let layer = OpfsLikeFiles::new(dir.path());
++    let room = RoomId::new("opfs-dead-rollback").unwrap();
++    let engine = open_on(&layer, &room).await;
++    let wal_path = engine.wal_file_path(&room);
++    apply_range(&engine, &room, 1..=5).await;
++
++    fail_point::arm("compaction.rotate_open", &wal_path);
++    // The rotation moves and reopens fine; the rollback moves back and fails to reopen.
++    let mut renamed = fail_point::arm_pause("compaction.rotate_renamed", &wal_path);
++    let compaction = {
++        let (engine, room) = (engine.clone(), room.clone());
++        tokio::spawn(async move { engine.compact_room(&room).await })
++    };
++    tokio::time::timeout(Duration::from_secs(10), renamed.reached()).await.unwrap();
++    layer.fail_reopen.store(true, Ordering::SeqCst);
++    renamed.release();
++    assert!(compaction.await.unwrap().is_err());
++    assert_room_failed(&engine, &room, 6).await;
++    let _ = engine.close_room(&room).await;
++    drop(engine);
++    let engine = open_on(&layer, &room).await;
++    assert_rows(&engine, &room, 5).await;
++}

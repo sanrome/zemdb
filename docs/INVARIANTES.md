@@ -48,6 +48,7 @@ Una auditoría por invariantes está **en verde** cuando:
 **Después de la 2ª auditoría (D90).** No hay más rondas amplias periódicas:
 - La Fase 3.10 cierra con una **revisión de cierre** de su delta: las mismas tres condiciones, sobre lo que la fase tocó y los mecanismos con los que eso interactúa. En verde, el código auditado se considera estable. Salió en verde sobre `d2c1406`, con una Media de origen (b), DEF-182, que se arregló después.
 - La Fase 3.11 cerró igual, con una revisión de cierre de su delta (DR14) sobre `77ca57b`, que auditó por primera vez sus invariantes nuevas. Rompió INV-C1 ★: una sala se podía reasignar a un esquema con otras columnas, y una restricción agregada después juzgaba de otro modo su log. El Lote 6b lo arregló. Su revisión de delta encontró otro camino, preexistente, que rompía INV-C1 ★ e INV-A5 ★: una recarga del esquema, trabada en otra sala, llegaba a una sala que mientras tanto se había reasignado o recreado con otro esquema, que pasaba a validar sus commits con el viejo (también el dueño). Lo arregló el Lote 6c. Los dos tuvieron su propia revisión de delta, antes del cierre.
+- La sub-fase 4.1 cerró con una revisión de cierre sobre `977837f`, con dos revisores (core y servidor; storage): en verde, sin rupturas Altas ni Medias, con Bajos de documentos (corregidos) y de tests y de código (al backlog, con sus tests en [`audits/2026-10-fase4_1-cierre/`](audits/2026-10-fase4_1-cierre/README.md)). Auditó por primera vez INV-S7 y los ajustes de 4.1 a INV-S4, S5, S6, A5, E2, W1, W2, C1, C2, K3, K6 y K12.
 - Desde entonces, cada cambio se revisa por su delta contra esta lista y contra los mecanismos con los que interactúa. Lo que aparezca de origen (b) o (c), Medio o Bajo, va al backlog, no a un plan nuevo.
 - Una auditoría amplia vuelve a hacer falta solo si cambia el modelo de amenaza (§2), o si entra código fuera del alcance actual, como el SDK de la Fase 4. En ese caso se audita una vez, con este método, contra las invariantes nuevas de ese código. El SDK se audita así al cerrar la sub-fase 4.2, contra §3.11 (DC3).
 
@@ -97,7 +98,7 @@ Las invariantes valen **bajo estos supuestos**. Una ruptura que solo existe viol
 
 ### Resumen
 
-Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md) (ver §1.5), con los lotes del [plan de la Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (cerrados: 0 a 5, con la revisión de cierre) y las decisiones D92 a D102. Las invariantes de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md) se auditaron por primera vez en su revisión de cierre (DR14, sobre `77ca57b`), y quedan sostenidas con los Lotes 6b y 6c. Las del cliente (§3.11) son de la sub-fase 4.0 de la [Fase 4](proposals/2026-10-fase4-plan.md): todas 🆕, con la sub-fase que las implementa. La sub-fase 4.1 ([plan](proposals/2026-10-fase4_1-storage-servidor.md)) agrega INV-S7 y ajusta otras del storage, el protocolo y el esquema: lo que todavía no implementa queda 🆕, con su lote.
+Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-invariantes-audit-2.md) (ver §1.5), con los lotes del [plan de la Fase 3.10](proposals/2026-10-fase3_10-remediation-plan.md) (cerrados: 0 a 5, con la revisión de cierre) y las decisiones D92 a D102. Las invariantes de la [Fase 3.11](proposals/2026-10-fase3_11-restricciones-proposal.md) se auditaron por primera vez en su revisión de cierre (DR14, sobre `77ca57b`), y quedan sostenidas con los Lotes 6b y 6c. Las del cliente (§3.11) son de la sub-fase 4.0 de la [Fase 4](proposals/2026-10-fase4-plan.md): todas 🆕, con la sub-fase que las implementa. La sub-fase 4.1 ([plan](proposals/2026-10-fase4_1-storage-servidor.md)) agrega INV-S7 y ajusta otras del storage, el protocolo y el esquema; su revisión de cierre (Lote 10, sobre `977837f`) las auditó y salió en verde. Lo que el SDK todavía no implementa sigue 🆕, con su sub-fase.
 
 | ID | Invariante | ★ | Si se rompe | Estado |
 |---|---|---|---|---|
@@ -114,10 +115,10 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-S1** | `apply_batch`: éxito durable o ningún efecto | ★ | Alto | ✅ (D93) |
 | **INV-S2** | Los lectores ven siempre un prefijo del WAL | | Medio | ✅ |
 | **INV-S3** | Un crash en cualquier paso del storage se recupera al mismo estado | ★ | Alto | ✅ (D93) |
-| **INV-S4** | Abrir una sala nunca descarta datos | ★ | Alto | ✅; la variante de DC12 y `Io` al abrir (4.1, Lote 4), sin auditar todavía |
-| **INV-S5** | `apply_snapshot`: valida todo y reemplaza atómicamente, o no cambia nada | | Medio | ✅; la variante de DC12 (4.1, Lote 4), sin auditar todavía |
-| **INV-S6** | Memoria igual a disco | | Medio | ✅; la excepción de la recarga (4.1, Lote 5), sin auditar todavía |
-| **INV-S7** | `reload_schema` solo cambia a un esquema que evoluciona del de la sala, y de una vez | | Medio | ✅ (4.1, Lote 5), sin auditar todavía |
+| **INV-S4** | Abrir una sala nunca descarta datos | ★ | Alto | ✅; la variante de DC12 y `Io` al abrir (4.1, Lote 4) |
+| **INV-S5** | `apply_snapshot`: valida todo y reemplaza atómicamente, o no cambia nada | | Medio | ✅; la variante de DC12 (4.1, Lote 4) |
+| **INV-S6** | Memoria igual a disco | | Medio | ✅; la excepción de la recarga (4.1, Lote 5) |
+| **INV-S7** | `reload_schema` solo cambia a un esquema que evoluciona del de la sala, y de una vez | | Medio | ✅ (4.1, Lote 5) |
 | **INV-Y1** | Orden total contiguo por sala | ★ | Alto | ✅ |
 | **INV-Y2** | Entrega exacta: ni huecos, ni duplicados, ni cambios | ★ | Alto | ✅ |
 | **INV-Y3** | Quedarse atrás siempre se señala | ★ | Alto | ✅ |
@@ -138,7 +139,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-A2** | Nada se decodifica antes de autenticar, salvo lo acotado de `/register` | | Alto | ✅ |
 | **INV-A3** | Los efectos de un miembro quedan confinados a su sala | | Medio | ❌ Bajo (backlog) |
 | **INV-A4** | Ningún identificador produce rutas fuera de `data_dir` | ★ | Alto | ✅ |
-| **INV-A5** | Nadie escribe una fila ajena | ★ | Alto | ✅; el dueño como prefijo del `ClientId` (4.1, Lote 1), sin auditar todavía |
+| **INV-A5** | Nadie escribe una fila ajena | ★ | Alto | ✅; el dueño como prefijo del `ClientId` (4.1, Lote 1) |
 | **INV-B1** | La memoria por request está acotada | ★ | Alto | ✅ |
 | **INV-B2** | Nada se retiene sin plazo | | Medio | ✅ |
 | **INV-B3** | La memoria, el disco y los FDs del servidor están acotados por la configuración | | Medio | ✅ |
@@ -153,10 +154,10 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-L7** | Ningún efecto en disco sobrevive al lock que lo serializa | | Medio | ✅ |
 | **INV-E1** | El esquema solo crece, y toda operación del log sigue siendo válida | ★ | Alto | ✅ |
 | **INV-E2** | Un cliente con el esquema viejo siempre puede enterarse | | Bajo | ✅ |
-| **INV-W1** | Ninguna entrada hace entrar en pánico, abortar ni reservar de más | ★ | Alto | ✅; la variante de DC12 (4.1, Lote 4) y `ruzstd` (4.1, Lote 6), sin auditar todavía |
-| **INV-W2** | Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum | | Medio | ✅ (D92); `ruzstd` (4.1, Lote 6), sin auditar todavía |
-| **INV-C1** | Ninguna versión posterior del esquema cambia la decisión sobre una operación ya secuenciada | ★ | Alto | ✅; la recarga en el storage (4.1, Lote 5), sin auditar todavía |
-| **INV-C2** | El estado de una réplica cumple las restricciones de su esquema | ★ | Alto | ✅; la variante de DC12 (4.1, Lote 4), sin auditar todavía |
+| **INV-W1** | Ninguna entrada hace entrar en pánico, abortar ni reservar de más | ★ | Alto | ✅; la variante de DC12 (4.1, Lote 4) y `ruzstd` (4.1, Lote 6) |
+| **INV-W2** | Codificar y decodificar es la identidad, y todo byte persistido está bajo un checksum | | Medio | ✅ (D92); `ruzstd` (4.1, Lote 6) |
+| **INV-C1** | Ninguna versión posterior del esquema cambia la decisión sobre una operación ya secuenciada | ★ | Alto | ✅; la recarga en el storage (4.1, Lote 5) |
+| **INV-C2** | El estado de una réplica cumple las restricciones de su esquema | ★ | Alto | ✅; la variante de DC12 (4.1, Lote 4) |
 | **INV-C3** | Un rechazo no deja rastro, y los índices son función de las tablas | | Medio | ✅ |
 | **INV-K1** | La réplica local es siempre un prefijo del log de la sala | ★ | Alto | 🆕 (4.2) |
 | **INV-K2** | Cada escritura se resuelve una sola vez, con la decisión de la réplica o como incierta | ★ | Alto | 🆕 (4.2, 4.4, 4.6) |
@@ -169,7 +170,7 @@ Estado en `b4cb390`, según la [2ª auditoría por invariantes](audits/2026-10-i
 | **INV-K9** | Una columna cifrada nunca sale en claro | | Alto | 🆕 (4.4, 4.5, 4.6) |
 | **INV-K10** | `watch` refleja la réplica | | Medio | 🆕 (4.4) |
 | **INV-K11** | Cerrar o apagar el cliente no pierde nada confirmado | | Medio | 🆕 (4.2, 4.5) |
-| **INV-K12** | Ninguna respuesta del servidor ni snapshot de un par hace entrar en pánico al SDK | ★ | Alto | 🆕 (4.2, 4.3, 4.5); el decodificador `ruzstd`, ✅ (4.1, Lote 6), sin auditar todavía |
+| **INV-K12** | Ninguna respuesta del servidor ni snapshot de un par hace entrar en pánico al SDK | ★ | Alto | 🆕 (4.2, 4.3, 4.5); el decodificador `ruzstd`, ✅ (4.1, Lote 6) |
 | **INV-K13** | En el navegador, una sola instancia del SDK escribe cada sala | | Alto | 🆕 (4.5) |
 | **INV-K14** | La API de JavaScript no cambia ningún valor al cruzar el límite del Worker | | Medio | 🆕 (4.6) |
 | **INV-K15** | La memoria del SDK está acotada | | Medio | 🆕 (4.2, 4.4) |
@@ -547,7 +548,7 @@ Las del SDK (`zemdb-client`) de la [Fase 4](proposals/2026-10-fase4-plan.md) (DC
 
 #### INV-K6 ★ · La réplica solo cambia a un esquema que evoluciona del suyo
 **Enunciado.** El SDK abre y aplica solo con el esquema que el servidor sirve para esa sala, guardado entre sus metadatos antes de usarse. Ante un cambio, sea una versión nueva o una reasignación, exige que el nuevo evolucione del anterior (DC5, `Schema::evolves_from`: `Schema::extends`; cada restricción del actual sigue en el nuevo, igual y en la misma posición; los dueños y las tablas inmutables no cambian; y toda restricción nueva incluye alguna columna nueva de su tabla, la regla DR3. Las FK que entran a una tabla pueden crecer: la columna nueva vale `NULL` en las filas existentes, así que no cambia ninguna decisión ya tomada). Como la regla es transitiva, la cumple cualquier cadena de cambios válidos, aunque el cliente no haya visto los intermedios. Si no, falla cerrado y sigue con el anterior. Se entera del cambio por el `schema_id` y la versión de cada respuesta, y pide el esquema ante una operación que no valida contra el local y ante cualquier error al aplicar el snapshot de otro miembro: pide el esquema una vez y, si cambió, vuelve a intentar con el mismo snapshot. Ante un esquema que no conoce, decide contra el que le devuelve `GetSchema`, no contra la respuesta; y como `GetSchema` no está atado a la encarnación, antes de fallar cerrado se vuelve a registrar con su cursor (un `RoomReset` lo lleva a descartar la réplica). Fallar cerrado frena las escrituras y la aplicación de lotes, no los heartbeats ni el registro. Nunca aplica las operaciones de una respuesta con un esquema más nuevo que el local sin antes cambiar de esquema (INV-E2); una respuesta con una versión anterior del mismo esquema no es un cambio, y sus operaciones se aplican con el local (INV-C1).
-**Sostenida por.** `Schema::evolves_from` (4.1, Lote 1) el `schema_id` en `CommitAck`, `SyncBatch` y `HeartbeatAck` (4.1, Lote 2; DC5) y `reload_schema` (4.1, Lote 5, INV-S7). A implementar en 4.2 (detectar el cambio, y el orden: guardar el esquema, recargarlo, aplicar). Sin ella, INV-C1 no vale en el cliente.
+**Sostenida por.** `Schema::evolves_from` (4.1, Lote 1), el `schema_id` en `CommitAck`, `SyncBatch` y `HeartbeatAck` (4.1, Lote 2; DC5) y `reload_schema` (4.1, Lote 5, INV-S7). A implementar en 4.2 (detectar el cambio, y el orden: guardar el esquema, recargarlo, aplicar). Sin ella, INV-C1 no vale en el cliente.
 **Cómo intentar romperla.** Un `CommitAck` o un `SyncBatch` con otra `schema_version`; `schema_reloaded` perdido; una columna agregada con un `UNIQUE` o una FK; una reasignación a un esquema con otras restricciones, o a uno con la misma versión; un cliente desconectado mientras la sala evoluciona y después se reasigna; una columna agregada con una FK hacia otra tabla; un `SyncBatch` demorado con la versión anterior; un cliente que se incorpora desde un snapshot hecho con una versión más nueva; un crash entre guardar el esquema nuevo y recargarlo.
 
 #### INV-K7 · Un cliente atrasado termina al día, también si es el designado

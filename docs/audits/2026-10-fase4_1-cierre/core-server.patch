@@ -1,0 +1,81 @@
+diff --git a/crates/server/src/actor/tests/manager.rs b/crates/server/src/actor/tests/manager.rs
+index 6e29121..6026fdf 100644
+--- a/crates/server/src/actor/tests/manager.rs
++++ b/crates/server/src/actor/tests/manager.rs
+@@ -1912,3 +1912,76 @@ async fn a_room_created_again_with_the_same_schema_gets_its_newest_version() {
+     }
+     manager.shutdown_all().await;
+ }
++
++// Closing review of 4.1 (probe): concurrent evolutions of one schema reach every open room in
++// order, so the version an actor reports (and puts in its responses) never goes back and ends
++// at the registry's. The SDK of 4.2 relies on it: a response with an older version of the
++// same schema is not a change, and its operations are applied with the local schema.
++#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++async fn review_concurrent_evolutions_reach_every_room_in_order() {
++    let dir = tempdir().unwrap();
++    let schema_id = SchemaId::new("first").unwrap();
++    let manager = Arc::new(new_manager(&dir));
++    let rooms: Vec<RoomId> = (0..4)
++        .map(|i| RoomId::new(format!("evolving-{i}")).unwrap())
++        .collect();
++    for room in &rooms {
++        manager
++            .create_room(room.clone(), schema_id.clone(), None)
++            .await
++            .unwrap();
++    }
++    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
++    let watchers: Vec<_> = rooms
++        .iter()
++        .map(|room| {
++            let (manager, room, stop) = (Arc::clone(&manager), room.clone(), Arc::clone(&stop));
++            tokio::spawn(async move {
++                let mut last = 0;
++                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
++                    let (_, schema) = manager
++                        .ask(&room, |reply| RoomCommand::GetSchema { reply })
++                        .await
++                        .unwrap()
++                        .unwrap();
++                    assert!(schema.version() >= last, "{room}: {} after {last}", schema.version());
++                    last = schema.version();
++                    tokio::task::yield_now().await;
++                }
++            })
++        })
++        .collect();
++    let evolutions: Vec<_> = (0..24)
++        .map(|i| {
++            let (manager, schema_id) = (Arc::clone(&manager), schema_id.clone());
++            tokio::spawn(async move {
++                manager
++                    .schema_registry
++                    .add_column(
++                        &schema_id,
++                        "tasks",
++                        ColumnDef::new(format!("added{i}"), DataType::Int).nullable(true),
++                    )
++                    .unwrap();
++                manager.reload_schema_for_rooms(&schema_id).await
++            })
++        })
++        .collect();
++    for evolution in evolutions {
++        evolution.await.unwrap();
++    }
++    stop.store(true, std::sync::atomic::Ordering::Relaxed);
++    for watcher in watchers {
++        watcher.await.unwrap();
++    }
++    let latest = manager.schema_registry.get_schema(&schema_id).unwrap();
++    for room in &rooms {
++        let (_, schema) = manager
++            .ask(room, |reply| RoomCommand::GetSchema { reply })
++            .await
++            .unwrap()
++            .unwrap();
++        assert_eq!(schema.version(), latest.version(), "{room}");
++    }
++    manager.shutdown_all().await;
++}

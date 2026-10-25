@@ -2,7 +2,7 @@
 
 **Fecha:** 23 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lotes 0 a 9 cerrados; el próximo es el 10.
+**Estado:** Cerrada el 25 de Octubre de 2026: Lotes 0 a 10, con la revisión de cierre en verde sobre `977837f`.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.1. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -42,6 +42,10 @@ Las de la fase que implementa esta sub-fase, todas adoptadas: DC5, DC8, DC9, DC1
   Así la rotación y su vuelta atrás tienen la misma lógica en las dos plataformas, y la capa no cambia ningún comportamiento del motor en nativo. Lo que difiere es el error: en nativo, `rename` es todo o nada y el handle sigue válido, por eso la rotación propaga el error de su rename sin marcar la sala fallida (la marca si después falla la vuelta atrás o el sync del directorio); en el OPFS, cerrar, mover y reabrir tiene estados intermedios (el `move()` hecho y la reapertura fallida, o al revés), que pueden dejar un handle muerto. Es un requisito de la implementación del OPFS, en 4.5: un handle muerto hace fallar toda operación siguiente y nunca escribe en otro archivo, así que la próxima operación que escriba en el WAL (un `apply_batch`, una compactación o el truncado de un `apply_snapshot`) marca la sala fallida y la recuperación pliega `.wal.compacting`.
 - **Lo que no cambia:** el formato (`ZEM1`, frames `0xBA7C` con CRC32, `ZMSN`), el protocolo de instalación de snapshots (temporal, sync, rename, sync del directorio, purga), la recuperación y sus decisiones, los locks del motor (`compaction`, `wal`, `state`) y el de la sala, las tareas propias de `open_room`, `apply_snapshot` y la compactación, y los fail points, que siguen identificados por ruta (el de `read_only_handle`, que hoy reproduce el error diferido de un `tokio::fs::File`, conserva su nombre y su paso, pero no su mecanismo: el Lote 8 lo adapta). No cambia ningún comportamiento: lo único que se reimplementa es el mecanismo del lock del handle del WAL (y el error diferido de una escritura que nadie esperó), con el mismo efecto.
 - **Lo que queda para 4.5:** la implementación sobre el OPFS, con el renombrar de un archivo abierto (cerrar, `move()` y reabrir); cómo corren en wasm32 las tareas propias del motor (hoy `tokio::spawn`) y el trabajo de CPU que hoy va al pool bloqueante; compilar en wasm32 el motor en disco (con la capa en `async_trait(?Send)`, como `StorageEngine`, porque los handles del OPFS no son `Send`), con la compresión del `.snap` (que desde el Lote 9 pasa por la función del Lote 6, y en wasm32 es `ruzstd` `Fastest`, DC9) y la validación de `zstd_level`, que hoy usa `zstd::compression_level_range()`; y los supuestos del OPFS en `INVARIANTES.md` §2 (`flush()` vale como `fsync`, ya en DC11; que `move()` sobre un destino existente sea atómico ante un corte, sin especificar, como `flush()`). En el Lote 9, la compactación comprime con la función de compresión del Lote 6 en lugar de llamar a `zstd::encode_all`, para que en 4.5 no haya otro camino.
+- **Requisitos de la implementación del OPFS** (de la revisión de cierre de 4.1, en el Lote 10):
+  - `read_at` devuelve exactamente los bytes pedidos, o un error. El `read()` del `FileSystemSyncAccessHandle` devuelve cuántos leyó, que pueden ser menos: la implementación repite la lectura o falla. La recuperación no admite una lectura corta (la búsqueda de frames y la lectura por ventanas del replay entran en pánico), y en wasm32 un pánico aborta el módulo.
+  - Crear con lock un archivo que no existe tiene que fallar si existe, y el OPFS no tiene un *create-new* atómico: `getFileHandle({ create: true })` adopta el archivo existente. La implementación verifica que no exista y después lo crea, lo que es seguro solo porque el lock de la sala impide que otra pestaña cree el mismo archivo en el medio.
+  - Con un handle muerto (el `move()` hecho y la reapertura fallida), la sala sigue legible, la escritura siguiente falla y la marca fallida, y la reapertura pliega `.wal.compacting` sin perder nada; si queda muerto en la vuelta atrás, la sala queda fallida enseguida (la revisión de cierre lo probó con dos tests, uno para cada caso, en su parche). En ese estado, `close_room` devuelve `Io`, aunque saca la sala: el SDK (4.2) lo trata como cualquier error de cerrar.
 - **Alternativas descartadas:** que la rotación cierre el handle antes de renombrar y lo reabra (la primera versión de esta decisión), que cambiaba la rotación y su vuelta atrás en nativo sin necesidad, porque en el OPFS la misma operación se puede resolver dentro de la implementación; un trait síncrono, que no puede abrir ni renombrar en el OPFS sin bloquear el Worker sobre una promesa; y un motor del navegador escrito aparte, que duplicaría la recuperación y la compactación, la parte con más casos de crash del storage.
 
 **S3 (spike de DC17, 23 de Octubre de 2026).** Preguntas, desde un Worker dedicado y sin Rust:
@@ -74,7 +78,7 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
 | 7 | Capa de archivos: el trait y su implementación nativa | storage | DC17 | L7 (el mecanismo de la capa) | ✅ |
 | 8 | Capa de archivos: el motor sobre ella, el WAL y el directorio | storage, core (`FrameSearch`) | DC8, DC17 | S1 a S6, L7 | ✅ |
 | 9 | Capa de archivos: los snapshots y la rotación | storage | DC17 | S1, S3, S5 | ✅ |
-| 10 | Cierre | Documentos | Todas | Todas las tocadas | ⬜ |
+| 10 | Cierre | Documentos | Todas | Todas las tocadas | ✅ |
 
 **Orden.**
 - El Lote 0 va primero: solo documentos, con su revisión cruzada (`docs/METODOLOGIA.md` §2).
@@ -821,13 +825,44 @@ No se probó qué deja `move()` si el navegador se corta en el medio. **Pendient
   - La copia de la absorción va de a trozos de 1 MiB en lugar de leer `.wal.compacting` entero.
   - `compress_zstd` es el nombre de la función de compresión del `.snap`.
 
-### Lote 10 · Cierre · ⬜
+### Lote 10 · Cierre · ✅
 - La revisión de cierre de 4.1 (`docs/METODOLOGIA.md` §6), con las tres condiciones de `INVARIANTES.md` §1.4, sobre todo lo que tocó la sub-fase y los mecanismos con que interactúa. Si no sale en verde, sus rupturas se arreglan en lotes nuevos de 4.1 antes de abrir 4.2.
 - `INVARIANTES.md`: el estado de cada invariante tocada. El plan de la fase: 4.1 cerrada. `ROADMAP.md`: "Lo que sigue", 4.2.
 - Los pendientes que pasan de 4.1 a 4.5, anotados en sus decisiones: la medición del codificador `ruzstd` en Safari (DC9), y S3 en Safari y Firefox (DC17).
+
+**Hecho.**
+- **Revisión de cierre** sobre `977837f` (`docs/METODOLOGIA.md` §6), con dos revisores en paralelo, de contexto fresco y solo lectura, cada uno con sus corridas en una copia: uno para core y servidor (Lotes 1 a 3), otro para el storage (Lotes 4 a 9, con `FrameSearch`). Los dos **en verde** por las tres condiciones de `INVARIANTES.md` §1.4: ninguna ★ rota, ni rupturas Altas ni Medias. No hizo falta ningún lote nuevo.
+  - **Core y servidor:** se sostienen A5, C1 (en su parte), E1, E2, B1, W1 y W2 (en lo que agregan los lotes), B2, R3, L1, y sin cambios Y4, Y9, A1, A3 y B5. Verificó que no queda ningún plazo con `std::time::Instant` en el servidor, y con un sondeo propio (24 evoluciones concurrentes sobre 4 salas abiertas, 30 de 30 corridas) que la versión que anuncia una sala nunca retrocede.
+  - **Storage:** se sostienen S1 a S7, L2, L3, L7, D3, D5 y D7 (en lo del storage), C1 a C3, W1, W2, y K3, K6 y K12 en la parte de 4.1. Comparó función por función el orden de las operaciones de archivo y su lugar respecto de los locks con `9b90d1d`; comparó `FrameSearch` con la búsqueda de `9b90d1d`, copiada tal cual, en 3000 logs aleatorios; endureció la capa de prueba del OPFS para que rechace un segundo handle (el motor nunca abre dos); y probó el handle muerto de DC17 en la rotación y en su vuelta atrás.
+  - Sus tests quedan como parches en [`docs/audits/2026-10-fase4_1-cierre/`](../audits/2026-10-fase4_1-cierre/README.md).
+- **Bajos corregidos en este lote** (documentos):
+  - `ARCHITECTURE.md` §7.2: el orden del commit y `SchemaViolation` decían que el dueño declarado es el cliente que manda, y es su dueño (`ClientId::owner`).
+  - `ARCHITECTURE.md` §8, *Room Lock and WAL Lock*: describía la capa nativa (`fs2`, el pool bloqueante) en una sección genérica sobre la capa.
+  - `INVARIANTES.md`, INV-K6: una coma.
+  - DC17 (§1): los requisitos de la implementación del OPFS. `read_at` devuelve exactamente los bytes pedidos o un error, porque una lectura corta hace entrar en pánico a la recuperación; el revisor lo propuso como requisito de la capa o como chequeo en el código, y queda como requisito. También: crear con lock sin un *create-new* atómico, y `close_room` con un handle muerto.
+- **Al backlog** (Bajos, tests débiles y código, que no entran en un lote: `INVARIANTES.md` §1.2):
+  - **DEF-183 · Bajo · (a) · D3.** El test de `FrameSearch` lo compara con `find_valid_frame`, que desde el Lote 8 corre sobre `FrameSearch`, así que los dos lados se mueven juntos. Fix: la búsqueda de `9b90d1d` como oráculo (test en `storage.patch`).
+  - **DEF-184 · Bajo · (a) · S3, K13.** La capa de prueba del OPFS no rechaza un segundo handle sobre un archivo abierto, como `createSyncAccessHandle`. Fix: rechazarlo en `open_locked`, `create_locked`, `create` y `open_read`, y ajustar su test propio, que abre dos a propósito.
+  - **DEF-185 · Bajo · (a) · S1, S3.** El handle muerto de DC17 no se ejercita en los tests del motor. Fix: los dos tests de `storage.patch`.
+  - **DEF-186 · Bajo · (b) · E2, K6.** Ningún test cubre evoluciones concurrentes sobre salas abiertas: que la versión que anuncia una sala no retroceda depende solo del orden en que el manager envía la cascada (la lee del registry y la envía bajo el spawn lock, y el canal es FIFO). Fix: el test de `core-server.patch`; opcional, que el actor ignore una recarga a una versión menor que la suya.
+  - **DEF-187 · Bajo · (a).** `rename_staged_snapshot` hace en producción una ida y vuelta al pool bloqueante solo para alojar la pausa `apply_snapshot.rename`, que fuera de los tests no hace nada. Inocuo. Fix: hacerla solo en los tests.
+- **Propuesta de invariante** (§1.2, del revisor de core y servidor), para que la decida el dueño del proyecto: en §3.8, "las operaciones de una respuesta (`CommitAck`, `SyncBatch`) son válidas bajo el esquema que anuncia (`schema_id`, `schema_version`), y la versión que anuncia una sala no retrocede mientras su esquema no cambie". La regla del SDK de DC5 e INV-K6 lo da por hecho (una versión igual o menor del mismo esquema no es un cambio), y hoy solo está implícito en INV-E1 e INV-E2. La sostienen el actor, que valida con su esquema y lo pone en la misma respuesta, la cascada bajo el spawn lock, y la reasignación, que solo pasa con el actor detenido. Su test sería el de DEF-186.
+- **Notas para 4.2,** sin defecto: con el reloj pausado del arnés, el TTL del log, los tokens y la demanda restaurada al reabrir siguen midiéndose en hora de pared (ya en §5.3 del plan de la fase, desde el Lote 3).
+- **Documentos:**
+  - `INVARIANTES.md`: el resultado de la revisión en §1.4 y en el resumen, y el estado de S4, S5, S6, S7, A5, W1, W2, C1, C2 y K12 sin la marca de sin auditar.
+  - El plan de la fase: 4.1 ✅, DC9 y DC17 con sus pendientes para 4.5, y 4.5 con esos pendientes y los requisitos del OPFS.
+  - `ROADMAP.md`: "Lo que sigue", 4.2.
+- **Pendientes que pasan a 4.5:** la medición del codificador `ruzstd` en Safari (DC9), que corre el dueño del proyecto con el programa del Lote 6, que no se mergea, y S3 en Safari y Firefox (DC17), los dos antes de cerrar 4.5.
+- **Revisión de delta** de este lote (agente aparte, de contexto fresco y solo lectura): **VERDE**, con ocho Bajos de redacción, atendidos. Verificó contra `977837f` cada corrección de documento y cada requisito del OPFS (corrió el `close_room` con un handle muerto: `Io`), aplicó los parches en una copia y corrió sus cuatro tests (pasan), y comprobó los números DEF, los enlaces, las fechas y los pendientes. Los Bajos:
+  - el README de los parches citaba DEF-184, que no tiene parche, y no avisaba de los códigos ni de la versión larga del oráculo;
+  - el requisito del handle muerto atribuía el pliegue de `.wal.compacting` a los dos tests;
+  - §1.4 de `INVARIANTES.md` decía "Bajos de tests" (DEF-187 es de código) y no listaba E2, K3 y K6 entre los ajustes auditados;
+  - esta nota remitía a la revisión de delta sin su resultado, y ponía S3 a cargo del dueño, que DC17 no dice;
+  - la fecha de `ROADMAP.md`;
+  - dos menciones del pool bloqueante en `ARCHITECTURE.md` §8, *Room Lock and WAL Lock*, que ahora dicen que es lo nativo.
 
 ---
 
 ## 3. Seguimiento
 
-**Avance:** Lote 0 cerrado el 23 de Octubre de 2026, con la revisión cruzada en verde en su quinta ronda; Lote 1 cerrado el mismo día. DC17 adoptada el 23 de Octubre, con renombrar un archivo abierto como operación del trait (el refactor de los Lotes 7 a 9 queda sin cambio de comportamiento). Lote 2 cerrado el 23 de Octubre. Lote 3 cerrado el 24 de Octubre, y los Lotes 4, 5, 6, 7, 8 y 9 el mismo día. El próximo es el Lote 10.
+**Avance:** Lote 0 cerrado el 23 de Octubre de 2026, con la revisión cruzada en verde en su quinta ronda; Lote 1 cerrado el mismo día. DC17 adoptada el 23 de Octubre, con renombrar un archivo abierto como operación del trait (el refactor de los Lotes 7 a 9 queda sin cambio de comportamiento). Lote 2 cerrado el 23 de Octubre. Lote 3 cerrado el 24 de Octubre, y los Lotes 4, 5, 6, 7, 8 y 9 el mismo día. Lote 10 cerrado el 25 de Octubre, con la revisión de cierre en verde: 4.1 cerrada.
