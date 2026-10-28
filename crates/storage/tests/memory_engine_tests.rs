@@ -28,6 +28,30 @@ async fn test_room_lifecycle() {
     assert!(matches!(err, StorageError::RoomNotFound(_)));
 }
 
+/// `delete_room` refuses an open room and changes nothing; a closed one opens again empty.
+#[tokio::test]
+async fn delete_room_refuses_an_open_room_and_a_closed_one_opens_empty() {
+    let engine = MemoryStorageEngine::new();
+    let room_id = RoomId::new("room-delete").unwrap();
+    engine.open_room(&room_id, users_schema()).await.unwrap();
+    let alice = row(1, "Alice", 100, true);
+    engine
+        .apply_batch(&room_id, vec![insert(1, 1, alice.clone(), 10)])
+        .await
+        .unwrap();
+
+    let err = engine.delete_room(&room_id).await.unwrap_err();
+    assert!(matches!(err, StorageError::RoomAlreadyOpen(_)), "{err:?}");
+    assert_eq!(get_user(&engine, &room_id, 1).await, Some(alice));
+
+    engine.close_room(&room_id).await.unwrap();
+    engine.delete_room(&room_id).await.unwrap();
+    engine.open_room(&room_id, users_schema()).await.unwrap();
+    let head = engine.get_head_seq(&room_id).await.unwrap();
+    assert_eq!(head, SequenceNumber::from(0u64));
+    assert_eq!(get_user(&engine, &room_id, 1).await, None);
+}
+
 #[tokio::test]
 async fn test_point_lookup_and_batch_mutation() {
     let engine = MemoryStorageEngine::new();

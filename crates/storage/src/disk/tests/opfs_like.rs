@@ -582,3 +582,59 @@ async fn recovery_of_interrupted_compactions_runs_on_a_layer_that_fails_like_the
     assert_rows(&engine, &room, 12).await;
     assert_clean(engine, &layer, &room).await;
 }
+
+/// `delete_room` removes the files of a room by path with no handle open on them, those of an
+/// interrupted compaction too, and the room opens again empty.
+#[tokio::test]
+async fn delete_room_runs_on_a_layer_that_fails_like_the_opfs() {
+    let dir = tempfile::tempdir().unwrap();
+    let layer = OpfsLikeFiles::new(dir.path());
+    let room = RoomId::new("opfs-delete").unwrap();
+    let engine = open_on(&layer, &room).await;
+    let (snap_path, wal_path) = (engine.snap_file_path(&room), engine.wal_file_path(&room));
+    apply_range(&engine, &room, 1..=5).await;
+    engine.compact_room(&room).await.unwrap();
+    apply_range(&engine, &room, 6..=8).await;
+    fail_compaction_leaving_compacting_wal(&engine, &room).await;
+    apply_range(&engine, &room, 9..=10).await;
+    engine.close_room(&room).await.unwrap();
+    std::fs::write(
+        layer.real(&snap_path).with_extension("snap.tmp.crashed"),
+        b"partial",
+    )
+    .unwrap();
+    std::fs::write(layer.real(&absorbing_wal_path(&wal_path)), b"partial").unwrap();
+
+    engine.delete_room(&room).await.unwrap();
+    let data_dir = layer.real(&layer.virtual_root.join("data"));
+    let left: Vec<PathBuf> = std::fs::read_dir(data_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(left, [layer.real(&engine.lock_file_path(&room))]);
+    engine.open_room(&room, schema()).await.unwrap();
+    assert_rows(&engine, &room, 0).await;
+    assert_clean(engine, &layer, &room).await;
+}
+
+/// A removal the layer refuses, as the OPFS refuses that of a file with a handle open, is returned
+/// by `delete_room`, and the room opens at a prefix of its log.
+#[tokio::test]
+async fn delete_room_returns_a_removal_the_layer_refuses() {
+    let dir = tempfile::tempdir().unwrap();
+    let layer = OpfsLikeFiles::new(dir.path());
+    let room = RoomId::new("opfs-refused-delete").unwrap();
+    let engine = open_on(&layer, &room).await;
+    apply_range(&engine, &room, 1..=5).await;
+    fail_compaction_leaving_compacting_wal(&engine, &room).await;
+    apply_range(&engine, &room, 6..=8).await;
+    engine.close_room(&room).await.unwrap();
+
+    let compacting_path = compacting_wal_path(&engine.wal_file_path(&room));
+    let held = layer.open_read(&compacting_path).await.unwrap();
+    let result = engine.delete_room(&room).await;
+    assert!(matches!(result, Err(StorageError::Io(_))), "{result:?}");
+    drop(held);
+    engine.open_room(&room, schema()).await.unwrap();
+    assert_rows(&engine, &room, 5).await;
+}

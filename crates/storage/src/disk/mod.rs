@@ -13,7 +13,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use zemdb_core::{CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation};
 
 use crate::disk::compactor::{
-    compact_room_cow, install_applied_snapshot, rename_staged_snapshot, stage_snapshot,
+    absorbing_wal_path, compact_room_cow, compacting_wal_path, install_applied_snapshot,
+    remove_if_exists, rename_staged_snapshot, stage_snapshot,
 };
 use crate::disk::recovery::recover_room;
 use crate::disk::wal::WalWriter;
@@ -509,6 +510,49 @@ impl<F: RoomFiles> StorageEngine for DiskStorageEngine<F> {
         wal.file.sync_all().await?;
         tracing::info!(room_id = %room_id, "Closed disk room");
         Ok(())
+    }
+
+    /// Removes the room's files (see the trait) with its locks taken as `open_room` takes them.
+    /// The WAL's lock is released before the removals, which go by path with no handle open; the
+    /// lock file stays locked until the last one. Once it has the engine's rooms, it runs in its
+    /// own task, which keeps them and the lock file: if the caller stops waiting, the removals
+    /// still complete before the room can be opened again.
+    #[tracing::instrument(skip(self), fields(room_id = %room_id))]
+    async fn delete_room(&self, room_id: &RoomId) -> Result<(), StorageError> {
+        let rooms = Arc::clone(&self.rooms).write_owned().await;
+        if rooms.contains_key(room_id) {
+            return Err(StorageError::RoomAlreadyOpen(room_id.clone()));
+        }
+
+        let (room_id, data_dir) = (room_id.clone(), self.options.data_dir.clone());
+        let (snap_path, wal_path) = (self.snap_file_path(&room_id), self.wal_file_path(&room_id));
+        let lock_path = self.lock_file_path(&room_id);
+        let files = Arc::clone(&self.files);
+        tokio::spawn(async move {
+            let _rooms = rooms;
+            files.create_dir_all(&data_dir).await?;
+            let (_lock, wal_file) =
+                lock_room_files(&*files, &lock_path, &wal_path, &room_id).await?;
+            drop(wal_file);
+            let staged_prefix = format!("room_{room_id}.snap.tmp.");
+            let staged = files.list(&data_dir, &staged_prefix).await?;
+            // Each removal leaves the snapshot with the WALs that follow it, or fewer: a prefix
+            // of the room's log.
+            let wals = [
+                wal_path.clone(),
+                compacting_wal_path(&wal_path),
+                absorbing_wal_path(&wal_path),
+            ];
+            for path in wals.into_iter().chain(staged).chain([snap_path]) {
+                fail_point::check("delete_room.remove", &path)?;
+                remove_if_exists(&*files, &path).await?;
+                fail_point::io_result("sync_dir", &data_dir, files.sync_dir(&data_dir).await)?;
+            }
+            tracing::info!(room_id = %room_id, "Deleted disk room");
+            Ok(())
+        })
+        .await
+        .map_err(|e| StorageError::Other(format!("Delete task failed: {e}")))?
     }
 
     /// Changes the room's schema (see the trait) under the WAL mutex, so no batch, snapshot

@@ -2,7 +2,7 @@
 
 **Fecha:** 26 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 cerrado (el contrato). DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 1.
+**Estado:** En curso: Lotes 0 (el contrato) y 1 (`delete_room`) cerrados. DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 2.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.2. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -125,7 +125,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 | Orden | Lote | Crates | Decisiones | Invariantes | Progreso |
 |---|---|---|---|---|---|
 | 0 | Contrato | Documentos | DC18 a DC23 | Nueva: S8. Ajustes: R6, K1, K2, K3, K5, K6, K7, K11, K15 | ✅ |
-| 1 | `delete_room` | storage | DC19 | S8, S3, L7 | ⬜ |
+| 1 | `delete_room` | storage | DC19 | S8, S3, L7 | ✅ |
 | 2 | La encarnación en los chunks del relay | core, server | DC23 | R6, R5, W1, W2 | ⬜ |
 | 3 | El esqueleto: comandos, transporte y metadatos | client | DC18, DC19, DC15 | W1, W2 (metadatos) | ⬜ |
 | 4 | Apertura, registro, descarte y cierre | client | DC19, DC12 | K3, K5, K11 | ⬜ |
@@ -191,7 +191,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
   4. **Verde,** con 3 menores: tres resúmenes que no decían la excepción del mismo hash, el test del Lote 8 sin fijar el contenido del snapshot de la sala nueva, y que `room_incarnation` vaya como campo propio de `RoomDetails` (`#[serde(flatten)]` no admite un `u128`). Corregidos.
 - **Desvíos:** DC23, el Lote 2 y el ajuste de INV-R6 no estaban en el plan de la fase; salieron de la revisión cruzada. Los lotes son 13 en lugar de los 10 del primer borrador.
 
-### Lote 1 · `delete_room` (`zemdb-storage`)
+### Lote 1 · `delete_room` (`zemdb-storage`) · ✅ Hecho
 **Objetivo:** que el SDK pueda descartar una réplica en disco (DC19).
 
 **Archivos:** `crates/storage/src/engine.rs`, `memory/mod.rs` y `disk/mod.rs` (con lo que haga falta de `disk/`), y sus tests. `ARCHITECTURE.md` §8.
@@ -207,6 +207,59 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 **Interacciones a revisar:** las tareas de compactación y de `apply_snapshot` de una sala cerrada (`close_room` las espera; D93, INV-L7); los locks de la sala y `RoomLocked`; la recuperación de `.snap.tmp.*` y `.wal.compacting`; los fail points por ruta; la capa de archivos del OPFS (borrar por ruta sin handles abiertos: la sala está cerrada, el del WAL se suelta y el `.lock` no se borra).
 
 **Documentos:** `ARCHITECTURE.md` §8; `INVARIANTES.md`: INV-S8 con su test.
+
+**Hecho.**
+- **API.** `StorageEngine::delete_room(&self, room_id) -> Result<(), StorageError>`, en los dos motores.
+  - En memoria: `RoomAlreadyOpen` si la sala está abierta; si no, no hace nada.
+  - En disco, con las salas del motor tomadas (`write_owned`, como `open_room`): `RoomAlreadyOpen` si está abierta. Si no, corre en una tarea propia que retiene las salas y el `.lock` hasta el último borrado, y hace, en orden:
+    1. `create_dir_all` del directorio;
+    2. `lock_room_files`, con los dos locks (`RoomLocked` si alguno está tomado);
+    3. suelta el WAL y lista los `.snap.tmp.*`;
+    4. borra con `remove_if_exists` el WAL activo, `.wal.compacting`, `.wal.compacting.tmp`, los `.snap.tmp.*` y el `.snap`.
+
+    Cada borrado lleva antes el fail point `delete_room.remove`, por ruta, y después un `sync_dir` del directorio, con el fail point `sync_dir` de `open_room`. Un error de E/S, también al listar, se devuelve y corta los borrados.
+- **Tests agregados:**
+  - `crates/storage/src/disk/tests/delete.rs`, nuevo:
+    - `delete_room_leaves_only_the_lock_file_and_the_room_opens_empty`: con una compactación interrumpida, temporales y otra sala abierta en el mismo motor, que queda igual.
+    - `delete_room_of_a_room_never_opened_leaves_only_its_lock_file`: en un directorio que todavía no existe, como en la primera apertura de una instalación nueva.
+    - `delete_room_refuses_an_open_room`: `RoomAlreadyOpen` y, desde otro motor, `RoomLocked` por el `.lock`.
+    - `delete_room_refuses_a_room_whose_wal_a_dropped_write_holds`: `RoomLocked` por el WAL con el `.lock` libre, y la sala borrada cuando la escritura aterriza.
+    - `crash_at_any_point_of_delete_room_leaves_a_prefix_of_the_log`: en Unix, imágenes en cada punto, que abren en 15, 10, 5 y 0.
+    - `failed_removal_of_delete_room_leaves_a_prefix_of_the_log`: la secuencia exacta de puntos (borrado y `sync_dir` por archivo) y un error de E/S en cada uno, con la sala abierta en el prefijo que corresponde y borrada al repetir.
+    - `delete_room_dropped_during_a_removal_completes_before_the_room_reopens`: otro motor da `RoomLocked` mientras tanto, y en el mismo motor otro `delete_room` y la reapertura esperan.
+  - `disk/tests/opfs_like.rs`:
+    - `delete_room_runs_on_a_layer_that_fails_like_the_opfs`: sin rechazos ni handles abiertos, y solo el `.lock` después de borrar.
+    - `delete_room_returns_a_removal_the_layer_refuses`: un borrado que la capa rechaza por un handle abierto se devuelve, y la sala abre en un prefijo.
+  - `crates/storage/tests/memory_engine_tests.rs`: `delete_room_refuses_an_open_room_and_a_closed_one_opens_empty`.
+  - Contra el esqueleto (`delete_room` devolvía `Ok` sin hacer nada) fallan por comportamiento los diez. La revisión de delta agregó `delete_room_of_a_room_never_opened_leaves_only_its_lock_file` y `delete_room_returns_a_removal_the_layer_refuses`, y reforzó el del `delete_room` soltado.
+- **Mutaciones verificadas** (17, todas detectadas):
+  - sacar `RoomAlreadyOpen` en cada motor;
+  - soltar antes de los borrados las salas del motor o el `.lock`, o tomar las salas con un lock de lectura;
+  - no soltar el WAL antes de borrar (lo rechaza la capa que falla como el OPFS);
+  - no tomar ningún lock, o solo el `.lock`;
+  - sin `create_dir_all`;
+  - `.wal.compacting` antes que el WAL activo, o el `.snap` antes que los temporales;
+  - no borrar el `.snap` o los `.snap.tmp.*`;
+  - sin `sync_dir`, o uno solo al final;
+  - ignorar el error del fail point o el del borrado.
+- **Interacciones revisadas:**
+  - **Las tareas de compactación y de `apply_snapshot` de una sala cerrada.** `close_room` las espera, y mientras corren retienen el `Arc<DiskRoom>` y con él el `.lock`, así que `delete_room` da `RoomLocked`. Una operación de archivo que sigue en el pool bloqueante después de soltar el motor retiene el WAL y su lock: también `RoomLocked` (test). El riesgo aceptado D93, un runtime apagado con una tarea del storage en curso, no cambia (INV-L7).
+  - **Los locks.** Son los de `open_room`, en el mismo orden, y el `.lock` no se borra. Una apertura en otro motor da `RoomLocked` durante los borrados, y en el mismo motor espera a la tarea (test).
+  - **La recuperación.** Cada estado intermedio es uno que la recuperación ya conoce, sin cambiar su código:
+    - el `.snap` con `.wal.compacting` y sin WAL activo, que `open_room` crea vacío;
+    - el `.snap` con temporales, que borra sin leer;
+    - ninguno.
+
+    La revisión de delta lo verificó en cada ventana de crash existente: una compactación cortada después del rename, con `.wal.compacting` por debajo del snapshot; una absorción con duplicados; un `apply_snapshot` cortado después del rename; una vuelta atrás de la rotación que falló.
+  - **Los fail points por ruta.** `delete_room.remove` es nuevo y lleva la ruta del archivo; el sync usa el nombre `sync_dir` de `open_room`, con la ruta del directorio. Los demás puntos no cambian, y las imágenes de crash y la simulación del disco pasan sin cambiar sus expectativas (`cargo test -p zemdb-storage --release -- --ignored` en verde).
+  - **El OPFS.** Borra por ruta sin handles abiertos, con el WAL soltado y el `.lock` sin borrar (tests en la capa que falla como el OPFS).
+- **Desvíos:**
+  - El `sync_dir` sigue a cada intento de borrado, también si el archivo no existía. DC19 dice "los archivos que existen": así es más corto, y un sync de más no cambia nada.
+  - Un error al listar los `.snap.tmp.*` se devuelve antes de borrar nada, mientras que la recuperación lo deja pasar y los borra en la próxima apertura. Ningún test lo ejercita, porque la capa de archivos no tiene un fail point para `list`; si se tragara, la consecuencia sería benigna, porque la próxima apertura los borra.
+  - `ARCHITECTURE.md` §8 suma también `reload_schema` a la lista del contrato, donde faltaba.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura), en dos rondas:
+  1. **Sin bloqueantes; 4 ajustes y 3 menores.** El código de producción estaba bien. Faltaban tres tests, porque sobrevivían tres mutaciones: soltar el `.lock` antes de borrar, ignorar el error real de un borrado y quitar `create_dir_all`. También faltaba esta nota. Los menores: el bucle de reintento, ahora con la forma acotada de `open_when_unlocked`; el prefijo de los temporales, que se deriva igual que en `snap_file_path` y que el test de "solo queda el `.lock`" cubre; y el error de `list`, anotado arriba.
+  2. **En verde, sin bloqueantes ni ajustes; 4 menores, atendidos.** Sobrevivía tomar las salas del motor con un lock de lectura (un segundo `delete_room` concurrente del mismo motor daba `RoomLocked` en lugar de esperar; las dos cosas son seguras para INV-S8): ahora el test del `delete_room` soltado exige que espere. Los otros: esta nota decía que contra el esqueleto fallaban "los ocho primeros"; el bucle de reintento termina con el error que lo frenó; y en INV-L2, el `delete_room` del servidor y el del storage, que la misma oración nombraba sin distinguirlos. Corrió además los tests de `delete_room` 120 veces, en seis bucles en paralelo, sin fallas.
 
 ### Lote 2 · La encarnación en los chunks del relay (`zemdb-core`, `zemdb-server`)
 **Objetivo:** que un cliente de otra encarnación de la sala nunca baje otro snapshot que el de su encarnación ni suba nada (DC23).
@@ -388,4 +441,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. El próximo es el Lote 1.
+**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. Lote 1 cerrado el 28 de Octubre (`delete_room`), con la revisión de delta en verde. El próximo es el Lote 2.

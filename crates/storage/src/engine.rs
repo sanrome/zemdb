@@ -130,6 +130,19 @@ pub trait StorageEngine: EngineConcurrencyBounds {
     /// Closes a room, releasing any associated resources or file handles.
     async fn close_room(&self, room_id: &RoomId) -> Result<(), StorageError>;
 
+    /// Removes the data of a closed room, so that opening it again gives an empty room at
+    /// sequence 0. Other rooms are not touched.
+    ///
+    /// A room open in this engine is `StorageError::RoomAlreadyOpen`. A disk room taken by
+    /// another engine, or by a file operation of this one still running after its room was
+    /// closed, is `StorageError::RoomLocked`. Either error removes nothing.
+    ///
+    /// A disk room's files are removed one at a time, the active WAL first and the snapshot
+    /// last, each removal synced, so a crash or an I/O error at any step leaves a room that
+    /// opens at a prefix of its log, or empty. Its lock file stays. A memory room holds nothing
+    /// once closed, so there it removes nothing.
+    async fn delete_room(&self, room_id: &RoomId) -> Result<(), StorageError>;
+
     /// Applies a batch of sequenced operations to the storage engine, in sequence order, and
     /// reports the new head sequence and the operations it did not apply.
     ///

@@ -129,6 +129,15 @@ impl StorageEngine for MemoryStorageEngine {
         Ok(())
     }
 
+    /// A closed room holds nothing in memory: there is nothing to remove.
+    async fn delete_room(&self, room_id: &RoomId) -> Result<(), StorageError> {
+        let rooms = self.rooms.read().map_err(poisoned("Engine"))?;
+        if rooms.contains_key(room_id) {
+            return Err(StorageError::RoomAlreadyOpen(room_id.clone()));
+        }
+        Ok(())
+    }
+
     /// Changes the room's schema (see the trait) under the room's write lock, in O(tables and
     /// constraints): the rows of a room in memory are never wider than its schema (every batch
     /// and every snapshot is validated against it), so they hold `NULL` in every new column, and

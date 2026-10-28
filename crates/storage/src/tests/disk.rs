@@ -36,6 +36,10 @@ mod simulation;
 #[path = "../disk/tests/opfs_like.rs"]
 mod opfs_like;
 
+/// Removing the files of a room.
+#[path = "../disk/tests/delete.rs"]
+mod delete;
+
 /// A snapshot whose rows have keys `first_key..first_key + count`, one batch per row, so that its
 /// head sequence is `count`.
 async fn snapshot_with_rows(room: &RoomId, first_key: i64, count: u64) -> Vec<u8> {
