@@ -2,7 +2,7 @@
 
 **Fecha:** 26 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 cerrado (el contrato), con DC18 a DC23 como *Propuestas*, que el dueño del proyecto confirma antes del Lote 1.
+**Estado:** En curso: Lote 0 cerrado (el contrato). DC18 adoptada; DC19 a DC23, *Propuestas*, que el dueño del proyecto confirma antes del Lote 1.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.2. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -13,7 +13,7 @@
 - **Qué.** El núcleo de `zemdb-client`: una réplica por sala contra un transporte abstracto (`TransportClient`), sin red real. Abre la sala desde sus metadatos durables, se registra, aplica los lotes por un único aplicador, resuelve cada escritura con la decisión de la réplica o como incierta, baja y sube snapshots, cambia de esquema solo a uno que evoluciona del suyo, descarta la réplica solo en los casos de INV-K3 y cierra las salas antes de apagar el runtime. Se prueba contra el servidor real en proceso, con un transporte que inyecta fallas.
 - **Dónde.** En `zemdb-client`, salvo dos lotes en código auditado: `delete_room` en `zemdb-storage` (DC19), con el checklist de crash-safety de 4.1, y la encarnación en los chunks del relay, en `zemdb-core` y `zemdb-server` (DC23).
 - **Qué no.** El `SyncWorker`, SSE, el transporte `reqwest` y la renovación del token (4.3); la fachada de Rust, lecturas, `watch`, el dueño completado por el SDK, el pre-chequeo, `Offline` y el cifrado (4.4); el navegador (4.5). En wasm32 el crate compila vacío hasta 4.5 (DC18).
-- **Decisiones nuevas:** DC18 a DC23 (§1), *Propuestas*: se confirman con el dueño del proyecto antes del código que depende de ellas. DC19 ajusta DC12, DC20 ajusta DC5, y DC21 precisa DC6, DC7 y DC11.
+- **Decisiones nuevas:** DC18 a DC23 (§1). DC18 está adoptada; las demás son *Propuestas* y se confirman con el dueño del proyecto antes del código que depende de ellas. DC19 ajusta DC12, DC20 ajusta DC5, y DC21 precisa DC6, DC7 y DC11.
 - **Cómo cierra:** con la auditoría amplia del SDK (DC3), con tres auditores (§3).
 
 ---
@@ -24,7 +24,7 @@ Las de la fase que implementa esta sub-fase: DC1, DC5, DC6, DC7, DC11, DC12, DC1
 
 | ID | Decisión | Lotes | Estado |
 |---|---|---|---|
-| **DC18** | La forma del núcleo: comandos y respuestas, el transporte, sin worker | 3 a 9 | Propuesta |
+| **DC18** | La forma del núcleo: métodos con datos serializables, el transporte, los pasos sin worker | 3 a 9 | Adoptada (28 de Octubre de 2026) |
 | **DC19** | Metadatos durables, el cursor como head del storage, y el descarte con `delete_room` | 1, 3, 4 | Propuesta (ajusta DC12) |
 | **DC20** | El esquema se aprende solo de `Registered`, y fallar cerrado da de baja al cliente | 6 a 8 | Propuesta (ajusta DC5) |
 | **DC21** | El aplicador, lo retenido y los reintentos | 5, 7 | Propuesta (precisa DC6, DC7 y DC11) |
@@ -32,18 +32,19 @@ Las de la fase que implementa esta sub-fase: DC1, DC5, DC6, DC7, DC11, DC12, DC1
 | **DC23** | Los chunks del relay llevan la encarnación de la sala | 2 | Propuesta |
 
 ### DC18 · La forma del núcleo
-- **API (DC14).** `Client` se abre sobre un `StorageEngine`, un almacén de metadatos (DC19) y un `TransportClient`, con un `ClientConfig` (la persona, el plazo de DC6, el backoff y el tope de DC22). Todo pasa por `execute(Command) -> Result<Reply, ClientError>`, con datos propios (sin referencias ni callbacks) y `serde`:
-  - `OpenRoom { room_id, token }`: abre la réplica local (DC19) y se registra (DC20). Sin red, una sala con metadatos abre igual, para leer, y se registra en el próximo comando que necesite al servidor; una sala sin metadatos necesita al servidor.
-  - `Write { room_id, op }`: un commit con su resultado (DC21). En 4.4 se le suman, antes, el dueño y el pre-chequeo.
-  - `Sync { room_id }`: ponerse al día con el head del servidor (con un snapshot si hace falta, DC22) y mandar `Ack`.
-  - `Heartbeat { room_id }`: el heartbeat y su reacción (subir el snapshot si es el designado, bajarlo si lo espera, cambiar de esquema).
-  - `Status { room_id }`: el diagnóstico de la sala: head, época (cuántas veces el SDK borró la réplica desde que abrió la sala, contando el borrado al abrirla sin metadatos), si está registrada, si falla cerrada, cuántas escrituras hay en vuelo y cuánto retiene el aplicador (DC21). Sirve a la aplicación (un panel de depuración) y le permite al arnés verificar INV-K3 e INV-K15 sin hacer `pub` nada interno. Los búferes de snapshot viven dentro de un comando y no figuran: su tope lo prueban los tests de sus lotes.
-  - `CloseRoom { room_id }` y `Shutdown`.
+- **API (DC14).** `Client` se abre sobre un `StorageEngine`, un almacén de metadatos (DC19) y un `TransportClient`, con un `ClientConfig` (la persona, el plazo de DC6, el backoff y el tope de DC22), y expone métodos asíncronos, cada uno con su resultado tipado:
+  - `open_room(room_id, token)`: abre la réplica local (DC19) y se registra (DC20). Sin red, una sala con metadatos abre igual, para leer, y se registra en la próxima llamada que necesite al servidor; una sala sin metadatos necesita al servidor.
+  - `write(room_id, op)`: un commit con su resultado (DC21). En 4.4 se le suman, antes, el dueño y el pre-chequeo.
+  - `sync(room_id)`: ponerse al día con el head del servidor (con un snapshot si hace falta, DC22) y mandar `Ack`.
+  - `heartbeat(room_id)`: el heartbeat y su reacción (subir el snapshot si es el designado, bajarlo si lo espera, cambiar de esquema).
+  - `status(room_id)`: el diagnóstico de la sala: head, época (cuántas veces el SDK borró la réplica desde que abrió la sala, contando el borrado al abrirla sin metadatos), si está registrada, si falla cerrada, cuántas escrituras hay en vuelo y cuánto retiene el aplicador (DC21). Sirve a la aplicación (un panel de depuración) y le permite al arnés verificar INV-K3 e INV-K15 sin hacer `pub` nada interno. Los búferes de snapshot viven dentro de una llamada y no figuran: su tope lo prueban los tests de sus lotes.
+  - `close_room(room_id)` y `shutdown()`.
 
-  Las lecturas y `watch` llegan en 4.4; los tests de 4.2 leen el motor que le pasan al cliente, por la API pública de `zemdb-storage`. Los comandos corren concurrentes (varias escrituras en vuelo); cada sala serializa sus cambios en el storage en el aplicador (DC21).
-- **Sin worker.** `Sync` y `Heartbeat` son los pasos que el `SyncWorker` de 4.3 programa (SSE, timers, backoff); en 4.2 los llaman los tests. Un `snapshot_wanted` se atiende con un heartbeat (DC22).
+  Las lecturas y `watch` llegan en 4.4; los tests de 4.2 leen el motor que le pasan al cliente, por la API pública de `zemdb-storage`. Las llamadas corren concurrentes (varias escrituras en vuelo); cada sala serializa sus cambios en el storage en el aplicador (DC21).
+- **Datos serializables, comandos en 4.5.** Los argumentos y los resultados de estos métodos son datos propios, sin referencias, callbacks ni streams, y con `serde`: es lo que pide DC14 para cruzar el límite del Worker. El enum de comandos y respuestas aparece recién en 4.5, en el runtime del Worker, que traduce cada mensaje en una llamada a uno de estos métodos; la fachada de 4.4 los llama directamente. Así cada método conserva su resultado tipado y no se escribe un dispatcher antes de que haga falta. Que todo sea serializable lo cuida el checklist de cada lote (§2), no el compilador.
+- **Pasos sin worker.** `sync` y `heartbeat` son los pasos que el `SyncWorker` de 4.3 programa (SSE, timers, backoff); en 4.2 los llaman los tests. Mantener el heartbeat no es responsabilidad de la aplicación: la fachada de 4.4 arranca el worker y no expone estos pasos. Quedan públicos en el núcleo como API de bajo nivel, para quien programe su propio ciclo (por ejemplo, una app móvil que el sistema despierta unos segundos en segundo plano). Un `snapshot_wanted` se atiende con un heartbeat (DC22).
 - **`TransportClient`.** Un método: mandar un `ClientMessage` con un token y devolver los bytes de la respuesta, sea cual sea su estado HTTP (en el Data Plane toda respuesta es un frame), o un `TransportError` si no hubo respuesta. El transporte elige el endpoint por el tipo del mensaje; el registro lleva el token adentro. El núcleo decodifica (`decode_message`, con la regla de la versión de `ARCHITECTURE.md` §7.2) y valida (DC21, INV-K12). Los snapshots se suben siempre por chunks (DC22), así que todo pedido es un `ClientMessage`. El transporte no devuelve los headers: el backoff no usa `Retry-After`.
-- **Token.** El de `OpenRoom`. En 4.2, `Unauthorized` es "sin token nuevo" (tabla de §A.4 del plan de la fase); la renovación es de 4.3, y la verificación del `ClientId` de un token renovado, de 4.4.
+- **Token.** El de `open_room`. En 4.2, `Unauthorized` es "sin token nuevo" (tabla de §A.4 del plan de la fase); la renovación es de 4.3, y la verificación del `ClientId` de un token renovado, de 4.4.
 - **Sin red.** En 4.2 una escritura sin red reintenta hasta el plazo de DC6 y termina con `Network` (o `OutcomeUnknown`, si algún intento quedó incierto). El `Offline` inmediato de §A.4 necesita el estado de la conexión, que lleva el `SyncWorker` (4.3), y llega en 4.4.
 - **Identificadores (DC15).** El `ClientId` es `persona#dispositivo`: la persona viene de la configuración (sin `#` y no vacía) y el id de dispositivo lo genera y guarda DC19 (128 bits al azar, en hexadecimal). Cada `MutationId` es aleatorio de 128 bits (`uuid` v4), y cada `CorrelationId`, un contador del cliente.
 - **`ClientError` en 4.2:** las variantes que produce el núcleo (§A.1 del plan de la fase): `ConstraintViolation`, `RowMissing`, `OutcomeUnknown`, `Validation` (un rechazo permanente del servidor), `Network` (un error sin efecto), `Storage`, y la sala cerrada o fallida. 4.4 lo completa.
@@ -71,7 +72,7 @@ Las de la fase que implementa esta sub-fase: DC1, DC5, DC6, DC7, DC11, DC12, DC1
 - **Por qué.** Un camino en lugar de dos (`GetSchema` y, antes de fallar cerrado, el registro), y el esquema es siempre el de la encarnación (requisito 3). Cuesta un registro en lugar de un `GetSchema` por cambio: reemplaza la entrada del roster con el mismo cursor y renueva el lease; el dedup es por `MutationId` y no cambia.
 
 ### DC21 · El aplicador y las escrituras
-- **El aplicador (DC7).** Por sala, un lock bajo el que pasa todo cambio del storage: `apply_batch`, `apply_snapshot`, `reload_schema`, abrir, cerrar y descartar (y `create_snapshot` para subirlo, DC22). Cada cambio de varios pasos (aplicar un lote y entregar sus decisiones; guardar un esquema y recargarlo; instalar un snapshot; descartar) corre en una tarea propia que retiene el lock, como `open_room` y `apply_snapshot` del motor en disco: soltar el comando que lo espera no lo corta a la mitad. Un lote cuya época no es la actual se ignora; se descarta el prefijo ya aplicado; uno que no empieza en head + 1 no se aplica (quien lo pidió sincroniza); después, `apply_batch`, la entrega de cada decisión y el head nuevo. Ante un error del storage después del cual la sala pudo cambiar (`Io` o `RoomFailed`, del motor en disco), cierra y reabre la sala del storage con el esquema de los metadatos, y las secuencias entre el head anterior y el reabierto quedan sin reporte; un daño al reabrir lleva a descartar (INV-K3). Si no reabre por otro error, la sala se cierra en el cliente y el error llega a quien la usa.
+- **El aplicador (DC7).** Por sala, un lock bajo el que pasa todo cambio del storage: `apply_batch`, `apply_snapshot`, `reload_schema`, abrir, cerrar y descartar (y `create_snapshot` para subirlo, DC22). Cada cambio de varios pasos (aplicar un lote y entregar sus decisiones; guardar un esquema y recargarlo; instalar un snapshot; descartar) corre en una tarea propia que retiene el lock, como `open_room` y `apply_snapshot` del motor en disco: soltar la llamada que lo espera no lo corta a la mitad. Un lote cuya época no es la actual se ignora; se descarta el prefijo ya aplicado; uno que no empieza en head + 1 no se aplica (quien lo pidió sincroniza); después, `apply_batch`, la entrega de cada decisión y el head nuevo. Ante un error del storage después del cual la sala pudo cambiar (`Io` o `RoomFailed`, del motor en disco), cierra y reabre la sala del storage con el esquema de los metadatos, y las secuencias entre el head anterior y el reabierto quedan sin reporte; un daño al reabrir lleva a descartar (INV-K3). Si no reabre por otro error, la sala se cierra en el cliente y el error llega a quien la usa.
 - **El head visto.** El cliente guarda el mayor head del servidor que informaron las respuestas de la época actual: `Registered`, `SyncBatch`, `HeartbeatAck`, `AckConfirmed` y, de un `CommitAck`, su secuencia asignada o la última de su catch-up (la de un reintento deduplicado puede ser menor). Cada escritura, después de registrarse en la época, anota antes de su primer intento `seen`: el mayor entre el head visto y el head local (requisito 13). El head visto de una respuesta se actualiza antes de que sus operaciones lleguen al aplicador, y `seen` y la entrada de la escritura se toman bajo el mismo lock con que el aplicador entrega las decisiones y mueve el head, así que ninguna secuencia mayor que `seen` se entrega sin que la escritura la retenga.
 - **Lo retenido (requisitos 4, 9 y 14).** Mientras haya escrituras sin `CommitAck`, el aplicador retiene, de las secuencias mayores que el menor `seen` de ellas: los rechazos, y los rangos que la réplica pasó sin reporte (los que cubrió un snapshot y los de una reapertura después de un error del storage). Si no hay, no retiene nada, y descartar lo vacía. Al llegar el `CommitAck` con la secuencia `s`:
   - si `s` es mayor que el head local, la escritura espera esa secuencia;
@@ -110,12 +111,12 @@ Los de §4.2 del plan de la fase, en su orden:
 | 8 | Un `HeartbeatAck` o un `AckConfirmed` con un head menor que el local | Registro con el cursor si es menor que el head al mandar (DC21) | 5, 8 |
 | 9 | Acotar los rechazos retenidos por la secuencia asignada | DC21 | 7 |
 | 10 | `InvalidSequence` en un sync o un ack | Registro con el cursor (DC21) | 5 |
-| 11 | Cotas calculables para INV-K15, y cómo las mide el arnés | INV-K15 con sus cotas (versión 9); el arnés las mide con `Status` (DC18) | 0, 10 |
+| 11 | Cotas calculables para INV-K15, y cómo las mide el arnés | INV-K15 con sus cotas (versión 9); el arnés las mide con `status` (DC18) | 0, 10 |
 | 12 | El pedido de esquema ante un error de `apply_snapshot` | Solo ante `SnapshotCorruption` y `SnapshotConstraints` (DC20) | 8 |
 | 13 | El head visto antes del primer intento, no de cada reintento | `seen` (DC21) | 7 |
 | 14 | La secuencia asignada por debajo del head visto | `OutcomeUnknown`, nunca `Ok` (DC21) | 7 |
 
-Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés las tareas sueltas al reiniciar el servidor (el transporte en proceso corre cada pedido en una tarea propia, que cortar al cliente no cancela, y el arnés espera esas tareas antes de rearmar el servidor; Lote 10) y cómo observa los descartes (la época de `Status`, DC18). Del cierre de 4.1: un `close_room` que falla (por ejemplo, con el handle muerto de DC17) se informa y la sala sale igual del cliente (Lote 4).
+Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés las tareas sueltas al reiniciar el servidor (el transporte en proceso corre cada pedido en una tarea propia, que cortar al cliente no cancela, y el arnés espera esas tareas antes de rearmar el servidor; Lote 10) y cómo observa los descartes (la época de `status`, DC18). Del cierre de 4.1: un `close_room` que falla (por ejemplo, con el handle muerto de DC17) se informa y la sala sale igual del cliente (Lote 4).
 
 ---
 
@@ -128,10 +129,10 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 | 2 | La encarnación en los chunks del relay | core, server | DC23 | R6, R5, W1, W2 | ⬜ |
 | 3 | El esqueleto: comandos, transporte y metadatos | client | DC18, DC19, DC15 | W1, W2 (metadatos) | ⬜ |
 | 4 | Apertura, registro, descarte y cierre | client | DC19, DC12 | K3, K5, K11 | ⬜ |
-| 5 | El aplicador y `Sync` | client | DC7, DC21 | K1, K12 | ⬜ |
+| 5 | El aplicador y `sync` | client | DC7, DC21 | K1, K12 | ⬜ |
 | 6 | El esquema | client | DC5, DC20 | K6, C1 | ⬜ |
 | 7 | Escrituras | client | DC6, DC7, DC21 | K2, K15 | ⬜ |
-| 8 | `Heartbeat` y la bajada de snapshots | client | DC20, DC22, DC23 | K7, K2, K12, K15 | ⬜ |
+| 8 | `heartbeat` y la bajada de snapshots | client | DC20, DC22, DC23 | K7, K2, K12, K15 | ⬜ |
 | 9 | La subida de snapshots | client | DC22, DC23 | K7, K4 | ⬜ |
 | 10 | El arnés de simulación | client (tests) | §5.3 del plan de la fase | K1, K2, K3, K4, K7, K15 | ⬜ |
 | 11 | Robustez: fuzzing de respuestas y snapshots | client (tests) | — | K12 | ⬜ |
@@ -150,6 +151,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 **Checklist propio.** Los Lotes 3 a 9 recorren este checklist del cliente; el 1, el de crash-safety de 4.1 (§2 de su [plan](2026-10-fase4_1-storage-servidor.md)); y los que tocan cómo decide o qué acepta una réplica (5, 6 y 8), además, el de determinismo de la Fase 3.11 (§5.4 de su [propuesta](2026-10-fase3_11-restricciones-proposal.md)).
 - Cada `.await` es un punto de corte: el estado compartido (esperas, lo retenido) se limpia con guards RAII, ningún lock síncrono cruza un `.await`, y un cambio de varios pasos del aplicador corre en su propia tarea (DC21).
 - Ninguna respuesta se usa antes de validarla (DC21) y de comparar su época (DC7).
+- Los argumentos y los resultados de los métodos públicos del núcleo son datos propios y serializables, sin referencias, callbacks ni streams (DC18, DC14).
 - Todo cambio del storage pasa por el aplicador, bajo su lock.
 - Los metadatos se escriben antes que los datos que describen, y un error al escribirlos detiene el paso (DC19).
 - Ningún resultado de E/S se descarta, y un error de lectura nunca se toma como un archivo que falta.
@@ -228,7 +230,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 
 **Archivos:** `crates/client/Cargo.toml`, `src/` (los módulos que hagan falta: comandos y errores, configuración, transporte, metadatos, el cliente); `tests/common/` (el servidor en proceso y el transporte de prueba); se borra el test del stub. `ARCHITECTURE.md` §11, nueva.
 
-**Qué se hace:** `Command`, `Reply`, `ClientError` y `ClientConfig`; `TransportClient` y `TransportError`; el almacén de metadatos en archivos y en memoria, con `client.lock`, el id de dispositivo y `room_{id}.meta`; `Client::open` (el lock, el id de dispositivo, el `ClientId`) y `execute`, con `Status` y `Shutdown` sobre un cliente sin salas. En wasm32, el crate vacío (DC18).
+**Qué se hace:** `ClientError` y `ClientConfig`; `TransportClient` y `TransportError`; el almacén de metadatos en archivos y en memoria, con `client.lock`, el id de dispositivo y `room_{id}.meta`; `Client::open` (el lock, el id de dispositivo, el `ClientId`), con `status` y `shutdown` sobre un cliente sin salas. En wasm32, el crate vacío (DC18).
 
 **Tests exigidos.**
 - Ida y vuelta de los metadatos y del id de dispositivo; un bit invertido, un archivo truncado o un temporal que quedó cuentan como que falta, sin pánico. Negativo: un error de E/S al leerlos (con una capa de archivos de prueba) es un error, no un archivo que falta, y el id de dispositivo no cambia.
@@ -243,11 +245,11 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 **Objetivo:** abrir una sala, registrarse con la encarnación correcta, descartar solo en los casos de INV-K3 y cerrar ordenado.
 
 **Qué se hace:**
-- `OpenRoom`: con metadatos, abre el storage con su esquema (un daño al abrir, `SnapshotCorruption` o `WalCorruption`, lleva a descartar; `RoomLocked`, `Io`, `SchemaMismatch` y `SnapshotConstraints` son un error y la réplica queda); sin metadatos, `delete_room`, y el storage se abre recién con el esquema de `Registered`.
+- `open_room`: con metadatos, abre el storage con su esquema (un daño al abrir, `SnapshotCorruption` o `WalCorruption`, lleva a descartar; `RoomLocked`, `Io`, `SchemaMismatch` y `SnapshotConstraints` son un error y la réplica queda); sin metadatos, `delete_room`, y el storage se abre recién con el esquema de `Registered`.
 - El registro: con el head del storage como cursor y la encarnación de los metadatos, o sin ninguno de los dos. `Registered` sin metadatos guarda la encarnación y el esquema y abre el storage; con metadatos y el mismo esquema, sigue (el cambio de esquema es del Lote 6). `RoomReset` y un `InvalidSequence` en el registro llevan a descartar y registrarse sin cursor; sin red, la sala queda abierta sin registrar (si tiene metadatos). Varios pedidos que necesitan registrarse a la vez hacen un solo registro.
 - Los errores de DC19: un paso que no puede escribir los metadatos o borrar se detiene y la sala sale del cliente.
-- `CloseRoom` y `Shutdown` (D93, INV-K11): bajo el aplicador, que espera lo que esté en curso, cierran la sala del storage; un error al cerrar se informa y la sala sale igual del cliente.
-- `Status`, con la época.
+- `close_room` y `shutdown` (D93, INV-K11): bajo el aplicador, que espera lo que esté en curso, cierran la sala del storage; un error al cerrar se informa y la sala sale igual del cliente.
+- `status`, con la época.
 
 **Tests exigidos.**
 - Un cliente nuevo abre una sala, recibe el esquema y guarda sus metadatos; al reabrir en disco presenta el cursor con la encarnación y no descarta nada.
@@ -255,23 +257,23 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 - Negativos de INV-K3: `RoomLocked`, `Io` (con el motor de prueba), `SchemaMismatch` y `SnapshotConstraints` al abrir no descartan; un error de E/S al leer los metadatos tampoco. Los metadatos que faltan con datos en el storage, sí; un `.snap` con un byte cambiado, sí.
 - `delete_room` que falla (`RoomLocked`) en un descarte y en una apertura sin metadatos: la sala sale del cliente sin registrarse, y la próxima apertura vuelve a borrar.
 - Sin red: abre con metadatos y queda sin registrar; sin metadatos es un error.
-- `Shutdown` con una compactación en curso cierra la sala, y al reabrir en el mismo proceso no falta nada (D93).
+- `shutdown` con una compactación en curso cierra la sala, y al reabrir en el mismo proceso no falta nada (D93).
 
 **Interacciones a revisar:** INV-Y7 en el servidor (el cursor con la encarnación); la recuperación del storage al reabrir; el roster del servidor ante un registro repetido; la regla de DC12 por el origen de cada error.
 
 **Documentos:** `ARCHITECTURE.md` §11 (la apertura, el registro y el descarte); `INVARIANTES.md`: el estado de K3, K5 y K11.
 
-### Lote 5 · El aplicador y `Sync` (`zemdb-client`)
+### Lote 5 · El aplicador y `sync` (`zemdb-client`)
 **Objetivo:** el único camino de los lotes al storage (DC7, DC21) y ponerse al día.
 
-**Qué se hace:** el aplicador con su época, el prefijo, el hueco, la tarea propia de cada cambio, la reapertura ante un error del storage y el head visto; `Sync` (pull paginado hasta `has_more: false` y `Ack`); la validación de `SyncBatch` y `AckConfirmed`; el registro ante un head menor o `InvalidSequence` (DC21); `BehindCompaction` deja la sala esperando un snapshot (que baja el Lote 8).
+**Qué se hace:** el aplicador con su época, el prefijo, el hueco, la tarea propia de cada cambio, la reapertura ante un error del storage y el head visto; `sync` (pull paginado hasta `has_more: false` y `Ack`); la validación de `SyncBatch` y `AckConfirmed`; el registro ante un head menor o `InvalidSequence` (DC21); `BehindCompaction` deja la sala esperando un snapshot (que baja el Lote 8).
 
 **Tests exigidos.** Las operaciones las manda al servidor un cliente crudo, por el transporte de prueba.
-- `Sync` con lotes chicos (`has_more`) llega al head y manda `Ack`.
+- `sync` con lotes chicos (`has_more`) llega al head y manda `Ack`.
 - Negativos: un lote con hueco, uno no contiguo y uno de una época anterior (pedido antes de un descarte) no se aplican; uno demorado aplica solo lo que falta.
 - Un head menor que el del pedido, y un `InvalidSequence` en un sync o un ack: se vuelve a registrar.
 - Un error del storage en `apply_batch` (con el motor de prueba): reabre la sala y sigue.
-- Soltar `Sync` en cada `.await`: la réplica queda en un head que el aplicador alcanzó entero, con sus decisiones entregadas.
+- Soltar `sync` en cada `.await`: la réplica queda en un head que el aplicador alcanzó entero, con sus decisiones entregadas.
 
 **Interacciones a revisar:** `apply_batch` (`SequenceMismatch`, INV-S1); el registro del Lote 4; el presupuesto de respuestas del servidor (`Unavailable` en un sync).
 
@@ -292,7 +294,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 **Documentos:** `ARCHITECTURE.md` §11 (el esquema); `INVARIANTES.md`: K6.
 
 ### Lote 7 · Escrituras (`zemdb-client`)
-**Objetivo:** `Write` con su resultado: la decisión de la réplica o el error que corresponde (DC6, DC7, DC21).
+**Objetivo:** `write` con su resultado: la decisión de la réplica o el error que corresponde (DC6, DC7, DC21).
 
 **Qué se hace:** el `MutationId`, el plazo y el backoff; la reacción a cada respuesta (tabla de §A.4); `seen`, los rechazos y los rangos sin reporte retenidos; las esperas con guards RAII; el sync después del `CommitAck`; las resoluciones de DC21; la señal de esquema de `CommitAck`. El comentario de `ErrorCode::Internal` en `zemdb-core` dice que el SDK lo reintenta.
 
@@ -304,17 +306,17 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 - Un `CommitAck` con `has_more`: sincroniza hasta la secuencia. Un sync que aplica la secuencia antes de que llegue el `CommitAck`, con un rechazo: la decisión retenida. Un `CommitAck` demorado: lo mismo.
 - Negativos: un `CommitAck` con una secuencia no mayor que `seen` (fabricado): `OutcomeUnknown`, nunca `Ok`; un `CommitAck` sin el sync que aplica la secuencia: la escritura no termina antes.
 - Con `CommitAck`: `RoomReset`, cerrar la sala y fallar cerrado con la escritura esperando, y un `CommitAck` que llega después de fallar cerrado: `OutcomeUnknown`. Sin `CommitAck`, en los mismos casos: `Network` si ningún intento quedó incierto.
-- Soltar la llamada en cada `.await`: `Status` da cero escrituras en vuelo y nada retenido al terminar. Con una réplica atrasada y una escritura sin `CommitAck`, solo se retiene lo de las secuencias mayores que `seen`.
+- Soltar la llamada en cada `.await`: `status` da cero escrituras en vuelo y nada retenido al terminar. Con una réplica atrasada y una escritura sin `CommitAck`, solo se retiene lo de las secuencias mayores que `seen`.
 - Dos escrituras concurrentes.
 
 **Interacciones a revisar:** el dedup del servidor (INV-Y4) y el orden del commit (el dedup antes de la retención); el aplicador del Lote 5 y el esquema del Lote 6; el registro y el descarte del Lote 4; `check_operation_size` (lo rechaza el servidor con `BadRequest`).
 
 **Documentos:** `ARCHITECTURE.md` §11 (las escrituras); `INVARIANTES.md`: K2 y K15.
 
-### Lote 8 · `Heartbeat` y la bajada de snapshots (`zemdb-client`)
+### Lote 8 · `heartbeat` y la bajada de snapshots (`zemdb-client`)
 **Objetivo:** que un cliente atrasado termine al día (DC22, INV-K7).
 
-**Qué se hace:** `Heartbeat` y su reacción (la señal de esquema, el head menor, la bajada si la espera, y el `snapshot_wanted` que confirma, que sube el Lote 9); la bajada por chunks, con su validación, el tope, `SnapshotSuperseded`, `RoomNotFound` en el chunk 0, el BLAKE3 y `apply_snapshot` en una tarea propia del aplicador, con DC20 ante sus errores; el commit que recibe `BehindCompaction` se pone al día y reintenta dentro del plazo; una sala que falla cerrada no manda heartbeats.
+**Qué se hace:** `heartbeat` y su reacción (la señal de esquema, el head menor, la bajada si la espera, y el `snapshot_wanted` que confirma, que sube el Lote 9); la bajada por chunks, con su validación, el tope, `SnapshotSuperseded`, `RoomNotFound` en el chunk 0, el BLAKE3 y `apply_snapshot` en una tarea propia del aplicador, con DC20 ante sus errores; el commit que recibe `BehindCompaction` se pone al día y reintenta dentro del plazo; una sala que falla cerrada no manda heartbeats.
 
 **Tests exigidos.**
 - Un cliente que entra a una sala podada baja el snapshot activo, lo aplica y sincroniza; sin snapshot usable (`RoomNotFound`), espera y lo baja cuando un heartbeat lo anuncia.
@@ -345,10 +347,10 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 **Objetivo:** el arnés de §5.3 del plan de la fase, las capas 2 y 3 de su §5.2.
 
 **Qué se hace:** lo que dice §5.3, salvo SSE, que llega con el `SyncWorker` (4.3), y con estas decisiones:
-- El transporte que inyecta fallas envuelve al de prueba; el reloj pausado, los clientes en memoria y en disco (algunos dispositivos del mismo dueño), los cortes (soltar el comando en un `.await` al azar) y los crashes (reabrir el cliente desde su directorio); el archivista, que llama a `Sync` después de cada paso.
+- El transporte que inyecta fallas envuelve al de prueba; el reloj pausado, los clientes en memoria y en disco (algunos dispositivos del mismo dueño), los cortes (soltar la llamada en un `.await` al azar) y los crashes (reabrir el cliente desde su directorio); el archivista, que llama a `sync` después de cada paso.
 - El oráculo es el del storage (`crates/storage/tests/common/oracle.rs`), incluido con `#[path]` para no duplicarlo.
 - Reiniciar el servidor: como el transporte corre cada pedido en una tarea propia, el arnés espera esas tareas y las del Control Plane, apaga las salas (`shutdown_all`) y vuelve a armar el servidor sobre el mismo directorio. Un `RoomLocked` que quede es reintentable para el cliente. Una reasignación repite `shutdown_room` y `get_or_spawn` hasta que `GET /admin/rooms/{id}` da el `schema_id` nuevo (requisito 7).
-- Los descartes se observan por la época de `Status`, y la memoria, por sus contadores (DC18).
+- Los descartes se observan por la época de `status`, y la memoria, por sus contadores (DC18).
 - La app de referencia (§6 del plan de la fase) es uno de los esquemas, con sus escenarios que no dependen de 4.4: la tabla de posiciones que converge, los rechazos (`Duplicate`, `ForeignKey`, `Unique`, `Restrict`), dos dispositivos del mismo dueño y un miembro que entra a un ranking podado.
 
 **Verificaciones:** las de §5.3: en cada paso, cada réplica igual al oráculo en su head (INV-K1); al final, todas al día e iguales, con las mismas decisiones (INV-K4, K7); cada escritura terminó una vez, con una respuesta válida por INV-K2; los descartes, solo por las causas de INV-K3; lo retenido, dentro de las cotas de INV-K15.
@@ -386,4 +388,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 a DC23 quedan *Propuestas* hasta que el dueño del proyecto las confirme; el Lote 1 empieza después.
+**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 quedan *Propuestas* hasta que el dueño del proyecto las confirme; el Lote 1 empieza después.
