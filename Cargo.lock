@@ -2018,6 +2018,21 @@ dependencies = [
 [[package]]
 name = "zemdb-client"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "crc32fast",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower 0.4.13",
+ "uuid",
+ "zemdb-core",
+ "zemdb-server",
+ "zemdb-storage",
+]
 
 [[package]]
 name = "zemdb-core"

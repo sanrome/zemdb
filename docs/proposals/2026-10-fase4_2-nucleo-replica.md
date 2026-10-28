@@ -2,7 +2,7 @@
 
 **Fecha:** 26 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lotes 0 (el contrato), 1 (`delete_room`) y 2 (la encarnación en los chunks del relay) cerrados. DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 3.
+**Estado:** En curso: Lotes 0 (el contrato), 1 (`delete_room`), 2 (la encarnación en los chunks del relay) y 3 (el esqueleto del cliente) cerrados. DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 4.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.2. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -127,7 +127,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 | 0 | Contrato | Documentos | DC18 a DC23 | Nueva: S8. Ajustes: R6, K1, K2, K3, K5, K6, K7, K11, K15 | ✅ |
 | 1 | `delete_room` | storage | DC19 | S8, S3, L7 | ✅ |
 | 2 | La encarnación en los chunks del relay | core, server | DC23 | R6, R5, W1, W2 | ✅ |
-| 3 | El esqueleto: comandos, transporte y metadatos | client | DC18, DC19, DC15 | W1, W2 (metadatos) | ⬜ |
+| 3 | El esqueleto: comandos, transporte y metadatos | client | DC18, DC19, DC15 | W1, W2 (metadatos) | ✅ |
 | 4 | Apertura, registro, descarte y cierre | client | DC19, DC12 | K3, K5, K11 | ⬜ |
 | 5 | El aplicador y `sync` | client | DC7, DC21 | K1, K12 | ⬜ |
 | 6 | El esquema | client | DC5, DC20 | K6, C1 | ⬜ |
@@ -341,7 +341,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 - **Al backlog** (Bajo, previo al lote; `INVARIANTES.md` §1.4):
   - **DEF-188 · Bajo · (b) · R6, L6.** `RoomManager::get_or_spawn` con un esquema, para una sala sin `meta_room.json`, le da una encarnación nueva sin purgar el relay, a diferencia de `create_room`. Si el relay todavía tiene un snapshot de una sala anterior con ese id (su directorio se perdió, o su `delete_room` se cortó o no pudo borrar los archivos antes de un reinicio), la sala nueva puede ofrecerlo cuando su head lo alcance, ya con su propia encarnación. INV-R6 pasa a ❌ Bajo (backlog). Solo se llega por la API de biblioteca, no por HTTP. Fix: purgar el relay cuando `get_or_spawn` escribe los metadatos de una sala nueva, como `create_room`.
 
-### Lote 3 · El esqueleto: comandos, transporte y metadatos (`zemdb-client`)
+### Lote 3 · El esqueleto: comandos, transporte y metadatos (`zemdb-client`) · ✅ Hecho
 **Objetivo:** los tipos de DC18, el transporte, los metadatos de DC19 y la prueba contra el servidor en proceso, sin la lógica de las salas.
 
 **Archivos:** `crates/client/Cargo.toml`, `src/` (los módulos que hagan falta: comandos y errores, configuración, transporte, metadatos, el cliente); `tests/common/` (el servidor en proceso y el transporte de prueba); se borra el test del stub. `ARCHITECTURE.md` §11, nueva.
@@ -356,6 +356,81 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 **Interacciones a revisar:** la capa de archivos (`NativeFiles`) y sus locks; los nombres de los archivos del motor en disco en el mismo directorio; `ClientId::owner` (DC15); el `ServerConfig` y los secretos del servidor en proceso.
 
 **Documentos:** `ARCHITECTURE.md` §11 (la forma del núcleo y los metadatos).
+
+**Hecho.**
+- **API** (`zemdb-client`; en wasm32 el crate es vacío, con `#![cfg(not(target_arch = "wasm32"))]` en la raíz y las dependencias solo fuera de wasm32):
+  - `Client::open(config, metadata)`:
+    1. valida la persona antes de tocar los metadatos: vacía, con `#` o que no da un `ClientId` válido es `ClientError::Config`;
+    2. abre el almacén, que toma el lock y da el id de dispositivo (un error es `Storage`);
+    3. arma el `ClientId` `persona#dispositivo`, con el id en 32 dígitos hexadecimales en minúsculas.
+
+    `client_id()` lo devuelve, `status(room_id)` da `RoomClosed` (todavía no hay salas) y `shutdown()` suelta los metadatos.
+  - `ClientConfig { person }`; `ClientError` con `Config`, `Storage` y `RoomClosed`; `RoomStatus` con los campos de DC18. Los resultados son serializables (`serde`).
+  - `TransportClient::send(&ClientMessage, token) -> Result<Vec<u8>, TransportError>`, y `endpoint(&ClientMessage)`, la ruta del Data Plane de cada mensaje, para los transportes de 4.3 y 4.5.
+  - `MetadataStore` (`open`, `close`, `room`, `save_room`) y `RoomMetadata` (la encarnación, el `schema_id` y el esquema), con dos almacenes:
+    - `FileMetadata<F: RoomFiles = NativeFiles>`, sobre la capa de archivos del motor: `client.lock`, `client.meta` (el id de dispositivo) y `room_{id}.meta`. Cada `.meta` es JSON con la última línea `crc32:` de los JSON del servidor, reemplazado con un `.meta.tmp` escrito, sincronizado, cerrado y renombrado, con un `sync_dir` después. Cada operación corre en una tarea propia, que sigue hasta el final aunque el llamador la suelte, después de las anteriores y con el lock del almacén, que guarda el handle de `client.lock`: `close` lo suelta recién cuando terminó la última.
+    - `MemoryMetadata`, con un id de dispositivo nuevo en cada apertura.
+- **Tests agregados** (20; se borró el del stub):
+  - `crates/client/tests/metadata_tests.rs`:
+    - `room_metadata_survive_reopening_and_each_save_replaces_them`: con una encarnación cerca de `u128::MAX`.
+    - `a_file_is_replaced_by_a_synced_temporary_file_renamed_with_no_handle_open`: la secuencia exacta de operaciones de archivo de una apertura y un guardado.
+    - `memory_metadata_keep_the_rooms_and_have_a_device_id_of_their_own`.
+    - `damaged_room_metadata_count_as_missing` y `a_damaged_device_id_counts_as_missing_and_is_replaced`: un bit invertido en cada byte y cada truncado, sin pánico; el id nuevo queda guardado.
+    - `a_temporary_file_left_by_a_cut_is_not_read`: un `.meta.tmp` con contenido válido no se lee, ni solo ni junto a metadatos anteriores, y uno de `client.meta` tampoco da su id.
+    - `metadata_of_another_kind_count_as_missing`: cada archivo con el contenido del otro, y un `schema_id` que no valida bajo un CRC32 que sí.
+    - `an_error_in_any_step_of_reading_or_saving_room_metadata_is_returned` y `an_error_in_any_step_of_an_open_is_returned_and_keeps_the_device_id`: con la capa de prueba, un error en cada operación de una lectura, un guardado y una apertura. Hasta el rename quedan los metadatos anteriores, y el id de dispositivo no cambia.
+    - `an_open_cut_by_its_caller_holds_the_directory_until_its_device_id_is_saved`, `a_save_cut_by_its_caller_ends_before_the_next_operation` y `a_close_waits_for_a_cut_save_and_then_releases_the_directory`: con una escritura lenta que sigue después del corte, que se hace cuando el log de la capa muestra la escritura en curso.
+    - `a_second_store_over_the_same_directory_fails_until_the_first_closes`.
+    - `metadata_share_the_directory_of_a_disk_engine_without_touching_its_files`: el motor abre, aplica, cierra y borra la sala en el mismo directorio; la sala reabre vacía y los metadatos quedan.
+  - `crates/client/tests/client_tests.rs`:
+    - `the_client_id_is_the_person_and_the_device_id_of_the_directory`: el dueño es la persona; el mismo id al reabrir, otro en otro directorio.
+    - `a_second_client_over_the_same_directory_fails_until_the_first_shuts_down`: con `Storage`.
+    - `a_person_that_is_empty_or_holds_a_hash_is_a_configuration_error`: también con un espacio adelante o un control, y sin crear el directorio.
+    - `an_error_reading_the_device_id_is_a_storage_error`, sin cambiar el id.
+    - `a_client_without_rooms_has_every_room_closed`, antes y después de `shutdown`.
+    - `every_message_reaches_the_endpoint_of_its_kind_through_the_test_transport`: el `ClientId` del cliente se registra (`Registered`) y cada uno de los otros ocho mensajes recibe la respuesta de su endpoint.
+  - `crates/client/tests/common/`:
+    - `TestServer`: las piezas del servidor sobre un directorio temporal, armadas como en los tests del servidor (sin el lock del directorio ni el barrido de vencimientos de `main`), con los secretos de prueba.
+    - `TestTransport`: llama a `build_router` como servicio de `tower`, con cada pedido y la lectura de su respuesta en una tarea propia.
+    - `TestFiles`: registra lo que se hace con cada archivo, hace fallar a pedido una operación sobre un archivo y puede demorar la primera escritura, que sigue aunque el llamador la suelte; `logged` espera una entrada del log.
+  - Contra el esqueleto (cada función sin hacer nada, con un `ClientId` y una ruta fijos) fallan por comportamiento los 20.
+- **Mutaciones verificadas** (41, todas detectadas):
+  - un error de `open_read`, `size` o `read_at` tomado como un archivo que falta; un JSON válido de otro tipo como un error; no verificar el CRC32;
+  - escribir sin el temporal; no sincronizarlo; descartar el error de `write_at` o de `sync_all`; tenerlo abierto al renombrar; no sincronizar el directorio, o descartar su error; no crearlo, o descartar su error;
+  - un lock por apertura; `close` que no suelta el lock, o que no espera a las operaciones en curso;
+  - las operaciones en el lugar, sin una tarea propia, o soltando el lock del almacén antes de terminar;
+  - un id de dispositivo nuevo en cada apertura; sin guardarlo, o descartando el error al guardarlo;
+  - los metadatos de la sala con el nombre del `.snap` del motor;
+  - el almacén en memoria sin guardar, o con un id fijo;
+  - validar la persona después de abrir los metadatos; aceptar una persona vacía o con `#`; el id de dispositivo en mayúsculas;
+  - un error de los metadatos como `Config`; `shutdown` sin soltar los metadatos; `status` sin error para una sala que no está abierta;
+  - cada uno de los nueve endpoints con otra ruta.
+- **Interacciones revisadas:**
+  - **La capa de archivos (`NativeFiles`) y sus locks.** `client.lock` se toma con `open_locked` (el lock exclusivo de `fs2`), que falla también entre dos handles del mismo proceso (test). El handle vive en el almacén hasta `close` (test).
+  - **Las operaciones que siguen después de un corte.** Una operación de la capa de archivos cuyo llamador la suelta sigue hasta el final (`ARCHITECTURE.md` §8). Por eso cada operación del almacén corre en una tarea propia, con el lock del almacén: una apertura cortada retiene `client.lock` hasta que su id de dispositivo es durable, y un guardado cortado termina antes que la operación siguiente, así que no aterriza sobre un guardado posterior, y `close` espera a las operaciones en curso antes de soltar `client.lock` (tests con una escritura lenta). Apagar el runtime de Tokio corta la tarea en su próximo `.await`, y una escritura que ya pasó al pool bloqueante aterriza sin el lock: es el riesgo aceptado del motor (`ARCHITECTURE.md` §8, D93), y lo evita cerrar el cliente antes de apagar el runtime, porque `shutdown` espera.
+  - **El OPFS.** Los `.meta` se renombran por ruta con el temporal ya cerrado (test de la secuencia), y como las operaciones del almacén no se solapan, ninguna lectura tiene abierto el destino de un rename.
+  - **Los nombres de los archivos del motor en disco en el mismo directorio.** El motor usa `room_{id}.snap`, `.wal`, `.lock`, `.wal.compacting`, `.wal.compacting.tmp` y `.snap.tmp.*`, y solo lista con el prefijo `room_{id}.snap.tmp.`. Un id de sala no tiene `.`, así que `room_{id}.meta` y `.meta.tmp` no coinciden con un archivo de ninguna sala, y `client.*` no empieza con `room_` (test con el motor).
+  - **`ClientId::owner` (DC15).** La persona no es vacía ni tiene `#`, y el dispositivo no es vacío: el dueño es la persona (test), y el servidor registra ese `ClientId` (test del transporte).
+  - **El `ServerConfig` y los secretos del servidor en proceso.** `TestServer` arma las piezas como los tests del servidor, con los mismos secretos, y los tokens se firman con `generate_client_token` y el de clientes. El transporte manda el token como bearer en todos los pedidos; `/register` no lee el header y verifica el del mensaje.
+  - **El presupuesto de respuestas.** Llamado como servicio, sin `serve_until_shutdown`, la reserva de una respuesta queda en sus extensiones y se suelta al tomar el cuerpo, que ya está en memoria. Alcanza para estos tests; uno que mida el presupuesto tiene que servir por HTTP.
+  - **Un motor, un cliente (DC19).** `client.lock` protege el directorio de los metadatos, no el motor: nada ata ese directorio al `data_dir` del motor, y `MemoryMetadata` no tiene lock. Va a las interacciones del Lote 4, cuando `Client::open` recibe el motor.
+- **Desvíos:**
+  - `ClientError` y `ClientConfig` llevan lo que usa este lote. Las variantes de DC18 (`Network`, `Validation`, `ConstraintViolation`, `RowMissing`, `OutcomeUnknown`, la sala que falla cerrada) y los campos del plazo, el backoff y el tope llegan con el lote que los produce o los usa. `RoomStatus` lleva ya los campos de DC18, porque `status` necesita su tipo.
+  - `Client::open` toma la configuración y los metadatos. El `StorageEngine` y el `TransportClient` se suman en el Lote 4, con `open_room`, el primero que los usa. Como el almacén no es serializable, `open` queda fuera de la regla de los datos serializables, que vale para los métodos de las salas; `client_id()` devuelve el `ClientId` por valor.
+  - `endpoint`, público, no figura en DC18: es la elección del endpoint por el tipo del mensaje que DC18 deja al transporte, en una función que comparten los transportes.
+  - `MetadataStore::open` toma el lock y da el id de dispositivo en una sola llamada. Borrar los metadatos de una sala es del descarte (Lote 4).
+  - El id de dispositivo es un uuid v4 (122 de sus 128 bits al azar), como el `MutationId` de DC18, y `client.meta` lo guarda como número; el `ClientId` lo lleva en hexadecimal.
+  - Un temporal que quedó no se borra, aunque el principio 3 de `GEMINI.md` pide limpiarlos al arrancar: nunca se lee, y lo reemplaza el próximo guardado del mismo archivo. El de `client.meta` siempre, porque solo queda si el primero no terminó; el de una sala, lo borra el descarte del Lote 4.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura):
+  1. **No en verde: 3 ajustes y 5 menores.** El ajuste principal, reproducido: una apertura o un guardado cortados en un `.await` dejaban una escritura en curso en el pool bloqueante, sin el lock. Otro cliente podía abrir el directorio y usar un id que no quedaba guardado, y un guardado cortado aterrizaba sobre uno posterior, con metadatos viejos bajo un CRC32 válido. Ahora cada operación del almacén corre en una tarea propia, con dos tests. Los otros dos ajustes: sobrevivían ocho mutaciones (los errores de `size`, `read_at`, `write_at`, `sync_all`, `sync_dir`, `create_dir_all` y del guardado del id, y un JSON válido de otro tipo), ahora con tests en tabla y uno de contenido de otro tipo. Los menores, atendidos:
+     - `client_id()` devolvía una referencia;
+     - faltaban tres interacciones;
+     - el temporal no citaba `GEMINI.md`;
+     - inexactitudes en §11, INV-W1 y esta nota (los 128 bits, "como en `main`", la lista de mutaciones, `endpoint`).
+
+     Las líneas de estado de los dos planes dan el lote por cerrado: van en el mismo commit que la nota, como en los Lotes 1 y 2, y el cierre lo confirma la CI de `main`.
+  2. **No en verde: 1 ajuste y 2 menores.** Las correcciones de la ronda 1 estaban bien: sus ocho mutaciones y las de las tareas fallan. El ajuste: sobrevivía un `close` que no espera a las operaciones en curso (con `try_lock`, que con una en curso nunca soltaba `client.lock`); ahora lo detecta `a_close_waits_for_a_cut_save_and_then_releases_the_directory`. Los menores, atendidos: el riesgo aceptado del apagado del runtime, en §11 y en las interacciones, y `run` más corto. Por una observación de la ronda, los tests de corte cortan cuando el log muestra la escritura en curso, no a los 100 ms.
+  3. **En verde, sin bloqueantes, ajustes ni menores.** El test de `close` mata la mutación con `try_lock`; las de las tareas (en el lugar, o soltando el guard antes de terminar) y la del handle sin guardar fallan, y los tests de corte ya no dependen del tiempo. Corrió además los tests de corte 20 veces, sin fallas.
 
 ### Lote 4 · Apertura, registro, descarte y cierre (`zemdb-client`)
 **Objetivo:** abrir una sala, registrarse con la encarnación correcta, descartar solo en los casos de INV-K3 y cerrar ordenado.
@@ -375,7 +450,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 - Sin red: abre con metadatos y queda sin registrar; sin metadatos es un error.
 - `shutdown` con una compactación en curso cierra la sala, y al reabrir en el mismo proceso no falta nada (D93).
 
-**Interacciones a revisar:** INV-Y7 en el servidor (el cursor con la encarnación); la recuperación del storage al reabrir; el roster del servidor ante un registro repetido; la regla de DC12 por el origen de cada error.
+**Interacciones a revisar:** INV-Y7 en el servidor (el cursor con la encarnación); la recuperación del storage al reabrir; el roster del servidor ante un registro repetido; la regla de DC12 por el origen de cada error; un motor con un solo cliente (DC19: `client.lock` protege el directorio de los metadatos, que nada ata al del motor, y `MemoryMetadata` no tiene lock); el `.meta.tmp` que dejó un corte, que el descarte borra junto con los metadatos (Lote 3).
 
 **Documentos:** `ARCHITECTURE.md` §11 (la apertura, el registro y el descarte); `INVARIANTES.md`: el estado de K3, K5 y K11.
 
@@ -504,4 +579,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. Lote 1 cerrado el 28 de Octubre (`delete_room`), con la revisión de delta en verde. Lote 2 cerrado el mismo día (la encarnación en los chunks del relay), con la revisión de delta en verde. El próximo es el Lote 3.
+**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. Lote 1 cerrado el 28 de Octubre (`delete_room`), con la revisión de delta en verde. Lote 2 cerrado el mismo día (la encarnación en los chunks del relay), con la revisión de delta en verde. Lote 3 cerrado el mismo día (el esqueleto del cliente: transporte, metadatos y `Client::open`), con la revisión de delta en verde. El próximo es el Lote 4.

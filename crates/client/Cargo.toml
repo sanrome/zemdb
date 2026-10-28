@@ -7,3 +7,21 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+# The core uses Tokio's tasks and the native file layer: in WebAssembly the crate is empty.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zemdb-core = { workspace = true }
+zemdb-storage = { workspace = true }
+async-trait = { workspace = true }
+crc32fast = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+zemdb-server = { path = "../server" }
+axum = { workspace = true }
+tempfile = { workspace = true }
+tower = { version = "0.4", features = ["util"] }
