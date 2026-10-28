@@ -2,7 +2,7 @@
 
 **Fecha:** 26 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 cerrado (el contrato). DC18 y DC19 adoptadas; DC20 a DC23, *Propuestas*, que el dueño del proyecto confirma antes del Lote 1.
+**Estado:** En curso: Lote 0 cerrado (el contrato). DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 1.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.2. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -13,7 +13,7 @@
 - **Qué.** El núcleo de `zemdb-client`: una réplica por sala contra un transporte abstracto (`TransportClient`), sin red real. Abre la sala desde sus metadatos durables, se registra, aplica los lotes por un único aplicador, resuelve cada escritura con la decisión de la réplica o como incierta, baja y sube snapshots, cambia de esquema solo a uno que evoluciona del suyo, descarta la réplica solo en los casos de INV-K3 y cierra las salas antes de apagar el runtime. Se prueba contra el servidor real en proceso, con un transporte que inyecta fallas.
 - **Dónde.** En `zemdb-client`, salvo dos lotes en código auditado: `delete_room` en `zemdb-storage` (DC19), con el checklist de crash-safety de 4.1, y la encarnación en los chunks del relay, en `zemdb-core` y `zemdb-server` (DC23).
 - **Qué no.** El `SyncWorker`, SSE, el transporte `reqwest` y la renovación del token (4.3); la fachada de Rust, lecturas, `watch`, el dueño completado por el SDK, el pre-chequeo, `Offline` y el cifrado (4.4); el navegador (4.5). En wasm32 el crate compila vacío hasta 4.5 (DC18).
-- **Decisiones nuevas:** DC18 a DC23 (§1). DC18 y DC19 están adoptadas; las demás son *Propuestas* y se confirman con el dueño del proyecto antes del código que depende de ellas. DC19 ajusta DC12, DC20 ajusta DC5, y DC21 precisa DC6, DC7 y DC11.
+- **Decisiones nuevas:** DC18 a DC23 (§1). Todas adoptadas por el dueño del proyecto el 28 de Octubre de 2026. DC19 ajusta DC12, DC20 ajusta DC5, y DC21 precisa DC6, DC7 y DC11.
 - **Cómo cierra:** con la auditoría amplia del SDK (DC3), con tres auditores (§3).
 
 ---
@@ -26,10 +26,10 @@ Las de la fase que implementa esta sub-fase: DC1, DC5, DC6, DC7, DC11, DC12, DC1
 |---|---|---|---|
 | **DC18** | La forma del núcleo: métodos con datos serializables, el transporte, los pasos sin worker | 3 a 9 | Adoptada (28 de Octubre de 2026) |
 | **DC19** | Metadatos durables, el cursor como head del storage, y el descarte con `delete_room` | 1, 3, 4 | Adoptada (28 de Octubre de 2026; ajusta DC12) |
-| **DC20** | El esquema se aprende solo de `Registered`, y fallar cerrado da de baja al cliente | 6 a 8 | Propuesta (ajusta DC5) |
-| **DC21** | El aplicador, lo retenido y los reintentos | 5, 7 | Propuesta (precisa DC6, DC7 y DC11) |
-| **DC22** | Snapshots en el cliente: la bajada con tope, la subida por chunks y la memoria | 8, 9 | Propuesta |
-| **DC23** | Los chunks del relay llevan la encarnación de la sala | 2 | Propuesta |
+| **DC20** | El esquema se aprende solo de `Registered`, y fallar cerrado da de baja al cliente | 6 a 8 | Adoptada (28 de Octubre de 2026; ajusta DC5) |
+| **DC21** | El aplicador, lo retenido y los reintentos | 5, 7 | Adoptada (28 de Octubre de 2026; precisa DC6, DC7 y DC11) |
+| **DC22** | Snapshots en el cliente: la bajada con tope, la subida por chunks y la memoria | 8, 9 | Adoptada (28 de Octubre de 2026) |
+| **DC23** | Los chunks del relay llevan la encarnación de la sala | 2 | Adoptada (28 de Octubre de 2026) |
 
 ### DC18 · La forma del núcleo
 - **API (DC14).** `Client` se abre sobre un `StorageEngine`, un almacén de metadatos (DC19) y un `TransportClient`, con un `ClientConfig` (la persona, el plazo de DC6, el backoff y el tope de DC22), y expone métodos asíncronos, cada uno con su resultado tipado:
@@ -388,4 +388,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 adoptada el mismo día. DC20 a DC23 quedan *Propuestas* hasta que el dueño del proyecto las confirme; el Lote 1 empieza después.
+**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. El próximo es el Lote 1.
