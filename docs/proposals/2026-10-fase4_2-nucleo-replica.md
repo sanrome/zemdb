@@ -2,7 +2,7 @@
 
 **Fecha:** 26 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lotes 0 (el contrato), 1 (`delete_room`), 2 (la encarnación en los chunks del relay) y 3 (el esqueleto del cliente) cerrados. DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 4.
+**Estado:** En curso: Lotes 0 (el contrato), 1 (`delete_room`), 2 (la encarnación en los chunks del relay), 3 (el esqueleto del cliente) y 4 (apertura, registro, descarte y cierre) cerrados. DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 5.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.2. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -128,7 +128,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 | 1 | `delete_room` | storage | DC19 | S8, S3, L7 | ✅ |
 | 2 | La encarnación en los chunks del relay | core, server | DC23 | R6, R5, W1, W2 | ✅ |
 | 3 | El esqueleto: comandos, transporte y metadatos | client | DC18, DC19, DC15 | W1, W2 (metadatos) | ✅ |
-| 4 | Apertura, registro, descarte y cierre | client | DC19, DC12 | K3, K5, K11 | ⬜ |
+| 4 | Apertura, registro, descarte y cierre | client | DC19, DC12 | K3, K5, K11 | ✅ |
 | 5 | El aplicador y `sync` | client | DC7, DC21 | K1, K12 | ⬜ |
 | 6 | El esquema | client | DC5, DC20 | K6, C1 | ⬜ |
 | 7 | Escrituras | client | DC6, DC7, DC21 | K2, K15 | ⬜ |
@@ -432,7 +432,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
   2. **No en verde: 1 ajuste y 2 menores.** Las correcciones de la ronda 1 estaban bien: sus ocho mutaciones y las de las tareas fallan. El ajuste: sobrevivía un `close` que no espera a las operaciones en curso (con `try_lock`, que con una en curso nunca soltaba `client.lock`); ahora lo detecta `a_close_waits_for_a_cut_save_and_then_releases_the_directory`. Los menores, atendidos: el riesgo aceptado del apagado del runtime, en §11 y en las interacciones, y `run` más corto. Por una observación de la ronda, los tests de corte cortan cuando el log muestra la escritura en curso, no a los 100 ms.
   3. **En verde, sin bloqueantes, ajustes ni menores.** El test de `close` mata la mutación con `try_lock`; las de las tareas (en el lugar, o soltando el guard antes de terminar) y la del handle sin guardar fallan, y los tests de corte ya no dependen del tiempo. Corrió además los tests de corte 20 veces, sin fallas.
 
-### Lote 4 · Apertura, registro, descarte y cierre (`zemdb-client`)
+### Lote 4 · Apertura, registro, descarte y cierre (`zemdb-client`) · ✅ Hecho
 **Objetivo:** abrir una sala, registrarse con la encarnación correcta, descartar solo en los casos de INV-K3 y cerrar ordenado.
 
 **Qué se hace:**
@@ -453,6 +453,97 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 **Interacciones a revisar:** INV-Y7 en el servidor (el cursor con la encarnación); la recuperación del storage al reabrir; el roster del servidor ante un registro repetido; la regla de DC12 por el origen de cada error; un motor con un solo cliente (DC19: `client.lock` protege el directorio de los metadatos, que nada ata al del motor, y `MemoryMetadata` no tiene lock); el `.meta.tmp` que dejó un corte, que el descarte borra junto con los metadatos (Lote 3).
 
 **Documentos:** `ARCHITECTURE.md` §11 (la apertura, el registro y el descarte); `INVARIANTES.md`: el estado de K3, K5 y K11.
+
+**Hecho.**
+- **API** (`zemdb-client`):
+  - `Client::open(config, storage, metadata, transport)` suma el `StorageEngine` y el `TransportClient` (el desvío del Lote 3). Los metadatos son los del motor, que no usa otro cliente: un motor en disco con `FileMetadata` en su directorio de datos, o uno en memoria con `MemoryMetadata`.
+  - `open_room(room_id, token)`:
+    1. Una sala cerrada abre su sala del storage con el esquema de sus metadatos. Sin metadatos (nueva, o con metadatos que faltan o no verifican), o con `SnapshotCorruption` o `WalCorruption` al abrir, descarta la réplica. Cualquier otro error al abrir (`RoomLocked`, `Io`, `SchemaMismatch`, `SnapshotConstraints`) o al leer los metadatos es `Storage`, no borra nada y la sala queda cerrada.
+    2. Se registra: una réplica abierta, con el head del storage como cursor y la encarnación de los metadatos; una vacía, sin ninguno de los dos. La respuesta se valida antes de usarla: `Registered` o un error, con la correlación y la sala del pedido (un error puede venir sin ellas), y `Registered` con la encarnación del cursor. `Registered` en una réplica vacía guarda sus metadatos y después abre la sala del storage con su esquema; en una abierta, la marca registrada. `RoomReset` o `InvalidSequence` al cursor descartan la réplica, que se vuelve a registrar sin cursor. Cualquier otra respuesta, o ninguna, es `Network`: una réplica abierta queda abierta sin registrar, para leer; una vacía falla, y su próxima apertura la registra sin volver a borrar.
+    3. Abrir una sala abierta la registra si no lo está, con el token nuevo, que cambia ya con el lock de los registros. Un registro a la vez por sala, así que varias aperturas a la vez hacen uno solo.
+  - El descarte, en el orden de DC19: borra los metadatos con `remove_room` (también el `.meta.tmp`), cierra la sala del storage, la borra con `delete_room` y suma uno a la época; la réplica queda vacía hasta `Registered`. Un error en cualquier paso lo detiene, y la sala queda cerrada con `Storage`, sin registrarse.
+  - Cada cambio de la réplica (abrirla, descartarla, tomar `Registered`, cerrarla) corre bajo el aplicador de la sala, en una tarea propia, después de los anteriores: soltar la llamada no lo corta a la mitad.
+  - `close_room(room_id)` cierra la sala del storage después de los cambios en curso (cerrar una réplica vacía también la cierra); un error al cerrar es `Storage`, y la sala queda cerrada igual. `shutdown()` cierra todas las salas, informa el primer error una vez cerradas todas, suelta los metadatos y después no abre ninguna (`RoomClosed`).
+  - `status(room_id)`: el head del storage, la época y si está registrada, de una sala con la réplica abierta; cualquier otra es `RoomClosed`.
+  - `ClientError::Network`: sin respuesta válida, o el servidor rechazó el pedido. `From<io::Error>` y `From<StorageError>` dan `Storage`.
+  - El head de la sala del storage se lee fuera del aplicador (el cursor del registro, `status`): si la sala del storage se cerró en el medio, es `RoomClosed`. Otro error al leerlo para el cursor es `Storage`, y la réplica queda abierta sin registrar.
+  - `MetadataStore::remove_room`: en `FileMetadata`, borra `room_{id}.meta` y `room_{id}.meta.tmp` (uno que falta no es un error) y sincroniza el directorio; en `MemoryMetadata`, los saca del mapa.
+- **Tests agregados** (21, y uno ampliado):
+  - `crates/client/tests/room_tests.rs` (20), contra el servidor en proceso y el motor en disco, salvo el del motor en memoria:
+    - `a_new_client_keeps_the_metadata_of_registered_and_reopens_with_its_cursor`: los metadatos guardados son los de `Registered` (la encarnación del servidor, `tasks` y su esquema), la época es 1 y, al reabrir en disco, el registro lleva el cursor 3 con la encarnación, la época es 0 y las filas están.
+    - `a_replica_that_opens_behind_presents_its_head_and_is_kept`: sin el `.snap` que llenó una compactación, la sala abre en 0, se registra con el cursor 0 y no se descarta.
+    - `a_room_created_again_resets_the_replica_which_registers_without_a_cursor` y `an_invalid_sequence_to_the_cursor_discards_the_replica` (con el transporte que fabrica la respuesta): la época sube, la réplica queda vacía y el segundo registro va sin cursor.
+    - `missing_metadata_and_damaged_data_discard_the_replica`: los metadatos borrados o con un byte cambiado, un `.snap` y un WAL con un byte cambiado (en el primero de tres lotes).
+    - `errors_other_than_damage_keep_the_replica`: `RoomLocked` (otro motor tiene la sala), `Io` (con el motor de prueba), `SchemaMismatch` (un esquema sin la tabla), `SnapshotConstraints` (un `UNIQUE` que las filas del `.snap` repiten) y un error al leer los metadatos, cada uno con su mensaje: no se registra y, sin la causa, la réplica reabre como estaba.
+    - `a_discard_removes_the_metadata_before_it_touches_the_storage_room`: con la capa de archivos de prueba compartida por el motor y los metadatos, el orden exacto del borrado de los metadatos y del `.meta.tmp`, con su `sync_dir`, antes que la sala del storage, y los metadatos de `Registered` guardados antes de abrirla.
+    - `a_failed_step_of_a_discard_leaves_the_room_out_and_its_next_open_deletes_again`: un `delete_room` que falla en una apertura sin metadatos y en un descarte por `RoomReset`, y un cierre que falla en ese descarte; la próxima apertura borra y se registra sin cursor.
+    - `a_failed_save_of_the_metadata_of_registered_leaves_the_room_out`: la sala del storage no abre, y la próxima apertura, con una capa sana, borra y se registra sin cursor.
+    - `a_discard_whose_metadata_are_not_removed_keeps_the_data`.
+    - `without_network_a_room_with_metadata_opens_unregistered_and_one_without_fails`: con la red, volver a abrir registra, y la réplica que quedó vacía no se vuelve a borrar (la época sigue en 1); un token que el servidor rechaza deja la sala abierta sin registrar, y uno válido la registra.
+    - `a_memory_replica_reopens_empty_with_its_metadata_and_its_cursor`: con `MemoryStorageEngine` y `MemoryMetadata`, una sala cerrada reabre vacía y se registra con el cursor 0 y su encarnación.
+    - `concurrent_opens_of_a_room_register_it_once`.
+    - `a_room_closed_while_it_registers_stays_closed_and_keeps_its_replica`: un `close_room` mientras espera la respuesta (con el transporte lento), sin metadatos y con un `RoomReset`: `Registered` no la abre, el `RoomReset` no la descarta y la apertura es `RoomClosed`.
+    - `a_reply_that_does_not_answer_the_registration_changes_nothing`: un `Registered` correcto fabricado y siete que no responden (otra correlación, otra sala, otra encarnación, un `RoomReset` de otra correlación o de otra sala, otro tipo, bytes que no decodifican).
+    - `without_metadata_a_registration_without_registered_fails_the_open`: también un `RoomReset` o un `InvalidSequence` sin cursor, que no descartan otra vez.
+    - `closing_a_room_closes_its_storage_room_even_if_the_close_fails`: cerrar dos veces es `RoomClosed`; un error al leer el head para el cursor falla la apertura sin registrar, y la réplica queda abierta; al reabrir la sala conserva su época y se registra con el cursor; un head que encuentra la sala del storage cerrada es `RoomClosed`.
+    - `shutting_down_closes_every_room_and_reports_a_failed_close`: con dos salas, y los metadatos quedan libres.
+    - `shutting_down_with_a_compaction_in_progress_closes_the_room_and_loses_nothing`: la compactación (con una escritura lenta, cortada por su llamador) termina antes de que `shutdown` vuelva, y al reabrir en el mismo proceso están las filas.
+    - `closing_waits_for_a_change_of_the_replica_cut_by_its_caller`: una apertura cortada mientras guarda los metadatos de `Registered` (con una escritura lenta); `close_room` y `shutdown` esperan el cambio, que abre la sala del storage antes de que se cierre. Con la capa de archivos compartida, `shutdown` suelta `client.lock` después de cerrar la sala del storage, y después no abre ninguna.
+  - `crates/client/tests/metadata_tests.rs`: `removing_room_metadata_removes_them_and_a_temporary_file_durably` (la secuencia exacta, borrar lo que falta, un error en cada paso); el de `MemoryMetadata` suma el borrado.
+  - `crates/client/tests/common/`:
+    - `TestTransport` registra lo que manda (`sent`, `registrations`) y puede no responder sin llegar al servidor (`offline`), responder el próximo registro con lo que fabrique el test (`answer_next_registration`) y demorar los pedidos (`slow`); `error_reply` arma un error.
+    - `TestEngine` envuelve un motor y hace fallar la próxima llamada a un método; un cierre que falla cierra igual, como el del motor en disco cuando falla su último sync.
+    - `TestServer` recrea una sala, da su encarnación y confirma inserciones desde un cliente propio.
+    - `TestFiles::slow` arma la próxima escritura, y `logged` busca por prefijo.
+  - Los tests del Lote 3 abren el cliente con un motor en memoria y un transporte que no usan.
+  - Contra el esqueleto (cada función nueva vuelve sin hacer nada) fallan los 22.
+- **Mutaciones verificadas** (66, todas detectadas):
+  - en `open_room`: sin el lock de los registros; el token de la primera apertura; una sala con metadatos que falla sin red, una sin metadatos que abre, y una con metadatos que abre ante cualquier error del registro;
+  - en el registro: una sala registrada que se vuelve a registrar; otro cursor que el head del storage; el cursor sin la encarnación, o uno sin metadatos; tomar un `Registered` de otra correlación, otra sala u otra encarnación, o un error de otra correlación o de otra sala; no descartar ante `RoomReset` o `InvalidSequence` al cursor, o descartar sin cursor; un rechazo, una respuesta inválida, ninguna o una que no decodifica que no son `Network`;
+  - en el aplicador: los cambios en el lugar, sin una tarea propia, o soltando el lock antes de terminar;
+  - en `status`: el head en 0, toda sala registrada, la época en 0; un head de una sala del storage cerrada en el medio que no es `RoomClosed`;
+  - en `shutdown`: sin marcar el cliente, sin cerrar las salas, ocultando un cierre que falla, deteniéndose en él, soltando los metadatos antes de cerrar las salas, o sin soltarlos;
+  - al abrir: volver a abrir una sala abierta, o volver a borrar una vacía; abrir después de `shutdown`; no descartar sin metadatos, con un `.snap` dañado o con un WAL dañado; descartar ante cualquier error al abrir, o ante un error al leer los metadatos;
+  - en `Registered`: abrir una sala cerrada mientras tanto; no marcar registrada una abierta; no guardar los metadatos, ignorar el error al guardarlos, guardarlos después de abrir la sala del storage, o no abrirla;
+  - en el descarte: descartar una sala cerrada mientras tanto; no borrar los metadatos, o ignorar el error al borrarlos; no cerrar la sala del storage, o ignorar el error al cerrarla; no borrarla, o ignorar el error de `delete_room`; dejar la sala cerrada en lugar de vacía; no sumar la época;
+  - al cerrar: cerrar dos veces sin error; no cerrar la sala del storage;
+  - en `remove_room`: no borrar el `.meta` o el `.meta.tmp`; un archivo que falta como error; ignorar un error al borrar; no sincronizar el directorio; `MemoryMetadata` sin borrar;
+  - un error de E/S o del storage que no es `Storage`.
+- **Interacciones revisadas:**
+  - **INV-Y7 en el servidor.** El cursor va siempre con la encarnación de los metadatos, y sin metadatos no hay cursor: sin ella el servidor respondería `RoomReset` y la réplica se descartaría (mutación). Una sala recreada responde `RoomReset` al cursor viejo (test).
+  - **La recuperación del storage al reabrir.** El cursor es el head con que abre la sala: sin el `.snap`, abre por detrás y se pone al día desde ahí, sin descartar (test). Un WAL con un lote dañado al que siguen otros es `WalCorruption` y se descarta (test); un corte al final lo recupera el motor y no es daño.
+  - **El roster del servidor ante un registro repetido.** Reabrir una sala cerrada se vuelve a registrar con el cursor, y el servidor reemplaza la entrada (test). Una sala registrada no se vuelve a registrar al abrirla, y las aperturas a la vez se registran una vez (test).
+  - **La regla de DC12 por el origen de cada error.** Descartan solo los casos de INV-K3 (un test por cada uno, y por cada error que no descarta), y solo con una respuesta validada: un `RoomReset` de otra correlación o de otra sala no descarta (test).
+  - **Un motor, un cliente (DC19).** Sigue sin atarse en código: `Client::open` y §11 lo documentan, y la fachada de 4.4 arma el motor y los metadatos sobre el mismo directorio. Si no se cumple, dos clientes no pueden tener abierta la misma sala del motor en disco (`RoomLocked`, y `delete_room` falla igual), y una sala que uno borra mientras el otro guarda sus metadatos reabre vacía en el otro, que presenta el cursor 0 y vuelve a bajar todo (INV-K5).
+  - **El `.meta.tmp` que dejó un corte.** El descarte lo borra con los metadatos y sincroniza el directorio antes de tocar la sala del storage (test).
+  - **Las respuestas que llegan para una sala cerrada.** Un `close_room` no espera al registro en curso: la respuesta que llega después no abre la sala ni la descarta (test). `close_room` sí espera los cambios de la réplica en curso, y `shutdown` también; después de `shutdown`, ninguna sala abre (test).
+  - **D93.** `shutdown` con una compactación en curso vuelve cuando terminó (`close_room` del motor la espera) y con la sala cerrada, así que el runtime se puede apagar después y reabrir en el mismo proceso no pierde nada (test). Suelta `client.lock` recién después de cerrar todas las salas, así que otro cliente no toma el directorio con una sala abierta (test).
+  - **El motor en memoria con `MemoryMetadata`.** Cerrar una sala suelta sus datos, y los metadatos quedan: al reabrir se registra con el cursor 0 y su encarnación y se pone al día, como un origen borrado (INV-K5); `delete_room` no borra nada (test).
+  - **Las lecturas del head fuera del aplicador.** El cursor del registro y `status` leen el head sin el aplicador, para no esperar detrás de un cambio: un cierre que gana esa lectura da `RoomClosed`, no `Storage` (test con el motor de prueba). No daña nada: reabrir necesita el lock de los registros.
+- **Desvíos:**
+  - La época no se reinicia al cerrar y volver a abrir una sala: cuenta los descartes desde que el cliente la abrió por primera vez, no desde la última apertura como dice DC18. Reiniciarla dejaría pasar una respuesta de una época anterior (DC7). Por eso cada sala que el cliente abrió queda en él mientras vive, con una entrada chica.
+  - `status` de una sala sin réplica abierta (vacía hasta `Registered`) es `RoomClosed`.
+  - Un registro que el servidor rechaza es `Network`, como uno sin respuesta; los rechazos permanentes (`Validation`) y el error sin efecto de las escrituras llegan con el Lote 7. Con metadatos la sala abre igual, sin registrar, como sin red: el error aparece en la próxima llamada que necesita al servidor, y `status` dice si está registrada.
+  - Abrir una sala abierta la registra si no lo está, con el token nuevo: en este lote es la forma de registrar una sala que abrió sin red.
+  - `Registered` con metadatos y otro esquema sigue con el local: el cambio es del Lote 6. Su head, su cola y su snapshot todavía no se usan (Lotes 5 y 8).
+  - La época de `Registered` no se compara: en este lote ningún descarte corre fuera del lock de los registros, así que no cambia mientras uno espera su respuesta, y un cierre lo detecta el estado de la réplica. La comparación llega con el Lote 5, cuando el aplicador descarta por su cuenta.
+  - `shutdown` marca el cliente: después, `open_room` es `RoomClosed`.
+  - Un error al cerrar la sala del storage dentro de un descarte también lo detiene (DC19 nombra escribir los metadatos y `delete_room`): sin metadatos, la próxima apertura vuelve a borrar.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura):
+  1. **No en verde: 3 ajustes y 8 menores.** Los ajustes: sobrevivían tres mutaciones (ignorar el error al guardar los metadatos de `Registered`, soltar los metadatos antes de cerrar las salas en `shutdown`, y volver a borrar una réplica vacía al reabrirla), ahora con tests. Los menores, atendidos:
+     - un cierre que ganaba la lectura del head daba `Storage` en lugar de `RoomClosed` (reproducido con un motor demorado): ahora la lectura pasa por `head`, con test;
+     - sobrevivía abrir una sala con metadatos ante cualquier error del registro: ahora con test;
+     - el docstring de `Network` decía "sin efecto", que no vale para un registro;
+     - faltaban las interacciones del motor en memoria y de las lecturas del head fuera del aplicador: ahora están, con test;
+     - INV-K3 no decía que un error puede venir sin la correlación y la sala;
+     - el token cambiaba antes de tomar el lock de los registros;
+     - el cierre de una réplica vacía no estaba documentado;
+     - las líneas de estado de los planes, que van en el mismo commit que esta nota.
+
+     Corrió además los tests de salas 15 veces, sin fallas.
+  2. **En verde, sin bloqueantes ni ajustes.** Las mutaciones de la ronda 1 fallan con los tests nuevos, la carrera del head da `RoomClosed`, y corrió los tests de salas 10 veces sin fallas. Dos menores opcionales:
+     - que la réplica queda abierta sin registrar cuando falla la lectura del head para el cursor: ahora lo dicen §11 y esta nota, y lo fija el test;
+     - que `head` convierte en `RoomClosed` también un `RoomNotFound` con la réplica abierta: solo pasa si alguien cierra la sala en el motor por fuera del cliente, contra "un motor, un cliente", y es inocuo (el próximo `close_room` la deja cerrada). Queda así.
 
 ### Lote 5 · El aplicador y `sync` (`zemdb-client`)
 **Objetivo:** el único camino de los lotes al storage (DC7, DC21) y ponerse al día.
@@ -579,4 +670,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. Lote 1 cerrado el 28 de Octubre (`delete_room`), con la revisión de delta en verde. Lote 2 cerrado el mismo día (la encarnación en los chunks del relay), con la revisión de delta en verde. Lote 3 cerrado el mismo día (el esqueleto del cliente: transporte, metadatos y `Client::open`), con la revisión de delta en verde. El próximo es el Lote 4.
+**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. Lote 1 cerrado el 28 de Octubre (`delete_room`), con la revisión de delta en verde. Lote 2 cerrado el mismo día (la encarnación en los chunks del relay), con la revisión de delta en verde. Lote 3 cerrado el mismo día (el esqueleto del cliente: transporte, metadatos y `Client::open`), con la revisión de delta en verde. Lote 4 cerrado el mismo día (apertura, registro, descarte y cierre de las salas), con la revisión de delta en verde. El próximo es el Lote 5.

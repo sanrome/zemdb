@@ -6,12 +6,23 @@ use common::*;
 use std::path::Path;
 use tempfile::tempdir;
 use zemdb_client::{
-    Client, ClientConfig, ClientError, FileMetadata, MemoryMetadata, TransportClient,
+    Client, ClientConfig, ClientError, FileMetadata, MemoryMetadata, MetadataStore, TransportClient,
 };
 use zemdb_core::*;
+use zemdb_storage::MemoryStorageEngine;
+
+/// A client of `person` over `metadata`, with a memory engine and a server it does not reach.
+async fn open_with(
+    person: &str,
+    metadata: impl MetadataStore + 'static,
+) -> Result<Client, ClientError> {
+    let transport = TestServer::new().transport();
+    let storage = MemoryStorageEngine::default();
+    Client::open(ClientConfig::new(person), storage, metadata, transport).await
+}
 
 async fn open(dir: &Path) -> Result<Client, ClientError> {
-    Client::open(ClientConfig::new("ana"), FileMetadata::new(dir)).await
+    open_with("ana", FileMetadata::new(dir)).await
 }
 
 #[tokio::test]
@@ -49,7 +60,7 @@ async fn a_person_that_is_empty_or_holds_a_hash_is_a_configuration_error() {
     let dir = tempdir().unwrap();
     let data_dir = dir.path().join("data");
     for person in ["", "ana#phone", "#", " ana", "a\nb"] {
-        let opened = Client::open(ClientConfig::new(person), FileMetadata::new(&data_dir)).await;
+        let opened = open_with(person, FileMetadata::new(&data_dir)).await;
         assert!(matches!(opened, Err(ClientError::Config(_))), "{person:?}");
     }
     // Rejected before the metadata are touched.
@@ -62,16 +73,14 @@ async fn an_error_reading_the_device_id_is_a_storage_error() {
     let client_id = open(dir.path()).await.unwrap().client_id();
     let flaky =
         FileMetadata::with_files(dir.path(), TestFiles::failing("open_read", "client.meta"));
-    let opened = Client::open(ClientConfig::new("ana"), flaky).await;
+    let opened = open_with("ana", flaky).await;
     assert!(matches!(opened, Err(ClientError::Storage(_))));
     assert_eq!(open(dir.path()).await.unwrap().client_id(), client_id);
 }
 
 #[tokio::test]
 async fn a_client_without_rooms_has_every_room_closed() {
-    let client = Client::open(ClientConfig::new("ana"), MemoryMetadata::default())
-        .await
-        .unwrap();
+    let client = open_with("ana", MemoryMetadata::default()).await.unwrap();
     let room_id = RoomId::new("room-a").unwrap();
     let closed = Err(ClientError::RoomClosed(room_id.clone()));
     assert_eq!(client.status(room_id.clone()).await, closed);
@@ -84,9 +93,7 @@ async fn every_message_reaches_the_endpoint_of_its_kind_through_the_test_transpo
     let server = TestServer::new();
     let transport = server.transport();
     let room_id = server.create_room("room-a").await;
-    let client = Client::open(ClientConfig::new("ana"), MemoryMetadata::default())
-        .await
-        .unwrap();
+    let client = open_with("ana", MemoryMetadata::default()).await.unwrap();
     let client_id = client.client_id();
     let token = token(&client_id, &room_id);
     let send = |message: ClientMessage| {

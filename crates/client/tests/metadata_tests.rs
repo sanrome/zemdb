@@ -100,6 +100,9 @@ async fn memory_metadata_keep_the_rooms_and_have_a_device_id_of_their_own() {
     assert_eq!(store.room(&room()).await.unwrap(), None);
     store.save_room(&room(), &metadata(3)).await.unwrap();
     assert_eq!(store.room(&room()).await.unwrap(), Some(metadata(3)));
+    store.remove_room(&room()).await.unwrap();
+    assert_eq!(store.room(&room()).await.unwrap(), None);
+    store.remove_room(&room()).await.unwrap();
     assert_ne!(MemoryMetadata::default().open().await.unwrap(), device_id);
 }
 
@@ -222,6 +225,44 @@ async fn an_error_in_any_step_of_reading_or_saving_room_metadata_is_returned() {
 }
 
 #[tokio::test]
+async fn removing_room_metadata_removes_them_and_a_temporary_file_durably() {
+    let dir = tempdir().unwrap();
+    let data = dir.path().join("data");
+    let files = TestFiles::default();
+    let store = FileMetadata::with_files(&data, files.clone());
+    store.open().await.unwrap();
+    store.save_room(&room(), &metadata(5)).await.unwrap();
+    let tmp = data.join("room_room-a.meta.tmp");
+    std::fs::write(&tmp, "cut").unwrap();
+    let before = files.log().len();
+    store.remove_room(&room()).await.unwrap();
+    let removal = [
+        "remove room_room-a.meta",
+        "remove room_room-a.meta.tmp",
+        "sync_dir data",
+    ];
+    assert_eq!(files.log()[before..], removal);
+    assert_eq!(store.room(&room()).await.unwrap(), None);
+    assert!(!tmp.exists());
+    // Removing missing metadata succeeds, and syncs the directory all the same.
+    store.remove_room(&room()).await.unwrap();
+    assert_eq!(
+        files.log().last().map(String::as_str),
+        Some("sync_dir data")
+    );
+
+    // An error in any step is returned.
+    for (operation, name) in removal.map(|entry| entry.split_once(' ').unwrap()) {
+        store.save_room(&room(), &metadata(5)).await.unwrap();
+        let flaky = FileMetadata::with_files(&data, TestFiles::failing(operation, name));
+        assert!(
+            flaky.remove_room(&room()).await.is_err(),
+            "{operation} {name}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn an_error_in_any_step_of_an_open_is_returned_and_keeps_the_device_id() {
     let dir = tempdir().unwrap();
     let data = dir.path().join("data");
@@ -258,7 +299,8 @@ async fn an_error_in_any_step_of_an_open_is_returned_and_keeps_the_device_id() {
 #[tokio::test]
 async fn an_open_cut_by_its_caller_holds_the_directory_until_its_device_id_is_saved() {
     let dir = tempdir().unwrap();
-    let files = TestFiles::slow(Duration::from_millis(500));
+    let files = TestFiles::default();
+    files.slow(Duration::from_millis(500));
     let slow = FileMetadata::with_files(dir.path(), files.clone());
     tokio::select! {
         _ = slow.open() => panic!("the write is slow"),
@@ -284,7 +326,8 @@ async fn an_open_cut_by_its_caller_holds_the_directory_until_its_device_id_is_sa
 #[tokio::test]
 async fn a_save_cut_by_its_caller_ends_before_the_next_operation() {
     let dir = tempdir().unwrap();
-    let files = TestFiles::slow(Duration::from_millis(300));
+    let files = TestFiles::default();
+    files.slow(Duration::from_millis(300));
     let store = FileMetadata::with_files(dir.path(), files.clone());
     let (room_id, cut) = (room(), metadata(5));
     tokio::select! {
@@ -302,7 +345,8 @@ async fn a_close_waits_for_a_cut_save_and_then_releases_the_directory() {
     let dir = tempdir().unwrap();
     // With the device id saved, the first write of the store is that of the save.
     FileMetadata::new(dir.path()).open().await.unwrap();
-    let files = TestFiles::slow(Duration::from_millis(300));
+    let files = TestFiles::default();
+    files.slow(Duration::from_millis(300));
     let store = FileMetadata::with_files(dir.path(), files.clone());
     store.open().await.unwrap();
     let (room_id, cut) = (room(), metadata(5));

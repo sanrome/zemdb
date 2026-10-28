@@ -1,5 +1,6 @@
-//! Fixtures shared by the integration tests: the server in process, with a transport to it, and
-//! a file layer that logs what is done to the files and fails on demand.
+//! Fixtures shared by the integration tests: the server in process, with a transport to it that
+//! logs what is sent and answers on demand, a file layer that logs what is done to the files and
+//! fails on demand, and a storage engine that fails on demand.
 
 // Every file in `tests/` is a crate of its own that uses only part of this module.
 #![allow(dead_code)]
@@ -9,6 +10,8 @@ use axum::body::{to_bytes, Body};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::Request;
 use axum::Router;
+use bytes::Bytes;
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -22,6 +25,7 @@ use zemdb_server::{
     SnapshotRelay,
 };
 use zemdb_storage::files::{NativeFile, NativeFiles, RoomFile, RoomFiles};
+use zemdb_storage::{ApplyReport, RowStream, ScanOptions, StorageEngine, StorageError};
 
 pub const AUTH_SECRET: &str = "test_cluster_secret_key_1234567890";
 pub const ADMIN_SECRET: &str = "test_admin_secret_key_12345678901";
@@ -103,31 +107,190 @@ impl TestServer {
         room_id
     }
 
+    /// Deletes `room_id` and creates it again, with another incarnation.
+    pub async fn recreate_room(&self, room_id: &RoomId) {
+        self.state.room_manager.delete_room(room_id).await.unwrap();
+        self.create_room(room_id.as_str()).await;
+    }
+
+    /// The incarnation of `room_id`.
+    pub async fn incarnation(&self, room_id: &RoomId) -> u128 {
+        let metadata = self.state.room_manager.room_metadata(room_id).await;
+        metadata.unwrap().room_incarnation
+    }
+
+    /// Commits an insert of each of `ids` into `room_id`, as a client of its own, and returns
+    /// them with the sequences they got.
+    pub async fn commit(
+        &self,
+        room_id: &RoomId,
+        ids: impl IntoIterator<Item = i64>,
+    ) -> Vec<SequencedOperation> {
+        let transport = self.transport();
+        let client_id = ClientId::new("bob#writer").unwrap();
+        let token = token(&client_id, room_id);
+        let correlation_id = CorrelationId::new(1);
+        let send = |message: ClientMessage| {
+            let (transport, token) = (transport.clone(), token.clone());
+            async move {
+                let reply = transport.send(&message, &token).await.unwrap();
+                decode_message::<ServerMessage>(&reply).unwrap()
+            }
+        };
+        let registered = send(ClientMessage::RegisterClient {
+            correlation_id,
+            room_id: room_id.clone(),
+            client_id: client_id.clone(),
+            auth_token: token.clone(),
+            current_seq: None,
+            known_incarnation: None,
+        })
+        .await;
+        assert!(matches!(registered, ServerMessage::Registered { .. }));
+        let mut ops = Vec::new();
+        for id in ids {
+            let op = insert_task(id);
+            let reply = send(ClientMessage::Commit {
+                correlation_id,
+                room_id: room_id.clone(),
+                client_id: client_id.clone(),
+                mutation_id: MutationId::from(uuid::Uuid::new_v4().as_u128()),
+                last_ack_seq: SequenceNumber::new(0),
+                op: op.clone(),
+            })
+            .await;
+            let ServerMessage::CommitAck { assigned_seq, .. } = reply else {
+                panic!("{reply:?}");
+            };
+            ops.push(SequencedOperation::new(assigned_seq, op));
+        }
+        ops
+    }
+
     /// A transport to this server's router, called as a `tower` service.
     pub fn transport(&self) -> TestTransport {
         TestTransport {
             router: build_router(self.state.clone()),
+            sent: Arc::default(),
+            answer: Arc::default(),
+            delay: Arc::default(),
         }
     }
 }
 
-/// A transport to a [`TestServer`]. Each request runs in a task of its own, as over a network,
-/// where the server goes on with a request whose client stopped waiting.
-#[derive(Debug, Clone)]
+/// The encoding of an error with `code` for the request `correlation_id` of `room_id`.
+pub fn error_reply(correlation_id: CorrelationId, room_id: &RoomId, code: ErrorCode) -> Vec<u8> {
+    encode_message(&ServerMessage::Error {
+        correlation_id: Some(correlation_id),
+        room_id: Some(room_id.clone()),
+        code,
+        message: "Fabricated".to_string(),
+    })
+    .unwrap()
+}
+
+/// What a [`TestTransport`] answers a message with instead of the server, if anything.
+type Answer = dyn FnMut(&ClientMessage) -> Option<Result<Vec<u8>, TransportError>> + Send;
+
+/// A transport to a [`TestServer`], which logs the messages it sends and can answer them itself.
+/// Each request runs in a task of its own, as over a network, where the server goes on with a
+/// request whose client stopped waiting.
+#[derive(Clone)]
 pub struct TestTransport {
     router: Router,
+    sent: Arc<Mutex<Vec<ClientMessage>>>,
+    answer: Arc<Mutex<Option<Box<Answer>>>>,
+    delay: Arc<Mutex<Duration>>,
+}
+
+impl TestTransport {
+    /// The messages sent so far, in order.
+    pub fn sent(&self) -> Vec<ClientMessage> {
+        self.sent.lock().unwrap().clone()
+    }
+
+    /// The registrations sent so far, as their cursor and incarnation.
+    pub fn registrations(&self) -> Vec<(Option<u64>, Option<u128>)> {
+        let registration = |message: ClientMessage| match message {
+            ClientMessage::RegisterClient {
+                current_seq,
+                known_incarnation,
+                ..
+            } => Some((current_seq.map(|seq| seq.get()), known_incarnation)),
+            _ => None,
+        };
+        self.sent().into_iter().filter_map(registration).collect()
+    }
+
+    /// Gets no response to any message, which does not reach the server.
+    pub fn offline(&self) {
+        self.answer(|_| Some(Err(TransportError("Offline".to_string()))));
+    }
+
+    /// Makes every message reach the server `delay` after it is sent.
+    pub fn slow(&self, delay: Duration) {
+        *self.delay.lock().unwrap() = delay;
+    }
+
+    /// Lets every message reach the server.
+    pub fn online(&self) {
+        *self.answer.lock().unwrap() = None;
+    }
+
+    /// Answers the next registration with the bytes `reply` gives for its correlation id and
+    /// room, without reaching the server.
+    pub fn answer_next_registration(
+        &self,
+        reply: impl FnOnce(CorrelationId, &RoomId) -> Vec<u8> + Send + 'static,
+    ) {
+        let mut reply = Some(reply);
+        self.answer(move |message| match message {
+            ClientMessage::RegisterClient {
+                correlation_id,
+                room_id,
+                ..
+            } => reply
+                .take()
+                .map(|reply| Ok(reply(*correlation_id, room_id))),
+            _ => None,
+        });
+    }
+
+    fn answer(
+        &self,
+        answer: impl FnMut(&ClientMessage) -> Option<Result<Vec<u8>, TransportError>> + Send + 'static,
+    ) {
+        *self.answer.lock().unwrap() = Some(Box::new(answer));
+    }
+}
+
+impl fmt::Debug for TestTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TestTransport").finish_non_exhaustive()
+    }
 }
 
 #[async_trait]
 impl TransportClient for TestTransport {
     async fn send(&self, message: &ClientMessage, token: &str) -> Result<Vec<u8>, TransportError> {
+        self.sent.lock().unwrap().push(message.clone());
+        let answered = self
+            .answer
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|answer| answer(message));
+        if let Some(answer) = answered {
+            return answer;
+        }
         let request = Request::post(endpoint(message))
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(Body::from(encode_message(message).unwrap()))
             .unwrap();
-        let router = self.router.clone();
+        let (router, delay) = (self.router.clone(), *self.delay.lock().unwrap());
         let response = tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
             let response = router.oneshot(request).await.unwrap();
             to_bytes(response.into_body(), usize::MAX).await
         });
@@ -139,11 +302,11 @@ impl TransportClient for TestTransport {
 
 /// The file system of the process through a layer that logs what is done to each file (by its
 /// name, without its reads), and where one operation on one file can fail with an I/O error (not
-/// a missing file) and the first write can be slow.
+/// a missing file) and a write can be slow.
 #[derive(Debug, Clone, Default)]
 pub struct TestFiles {
     failing: Option<(&'static str, &'static str)>,
-    first_write_delay: Arc<Mutex<Option<Duration>>>,
+    next_write_delay: Arc<Mutex<Option<Duration>>>,
     log: Arc<Mutex<Vec<String>>>,
 }
 
@@ -157,13 +320,10 @@ impl TestFiles {
         }
     }
 
-    /// A layer where the first write lands `delay` after it is called, even if its caller
-    /// stopped waiting, as a write handed to a slow disk.
-    pub fn slow(delay: Duration) -> Self {
-        Self {
-            first_write_delay: Arc::new(Mutex::new(Some(delay))),
-            ..Self::default()
-        }
+    /// Makes the next write land `delay` after it is called, even if its caller stopped
+    /// waiting, as a write handed to a slow disk.
+    pub fn slow(&self, delay: Duration) {
+        *self.next_write_delay.lock().unwrap() = Some(delay);
     }
 
     /// What was done to the files so far, in order, as `operation name`.
@@ -171,9 +331,9 @@ impl TestFiles {
         self.log.lock().unwrap().clone()
     }
 
-    /// Waits until `entry` is in the log.
+    /// Waits until an entry that starts with `entry` is in the log.
     pub async fn logged(&self, entry: &str) {
-        while !self.log().iter().any(|logged| logged == entry) {
+        while !self.log().iter().any(|logged| logged.starts_with(entry)) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
@@ -285,7 +445,7 @@ impl RoomFile for TestFile {
 
     async fn write_at(&self, offset: u64, bytes: Vec<u8>) -> io::Result<()> {
         self.files.run("write_at", &[&self.name])?;
-        let Some(delay) = self.files.first_write_delay.lock().unwrap().take() else {
+        let Some(delay) = self.files.next_write_delay.lock().unwrap().take() else {
             return self.file.write_at(offset, bytes).await;
         };
         let file = Arc::clone(&self.file);
@@ -320,5 +480,133 @@ impl RoomFile for TestFile {
         self.files.run("rename", &[&self.name])?;
         let file = Arc::get_mut(&mut self.file).expect("no write in flight");
         file.rename(to).await
+    }
+}
+
+/// A storage engine that wraps `E` and fails on demand: [`fail_next`](Self::fail_next) makes the
+/// next call of a method return an error. A close that fails still closes the room, as a disk
+/// engine's does when its last sync fails.
+#[derive(Clone)]
+pub struct TestEngine<E> {
+    inner: E,
+    failing: Arc<Mutex<Vec<(&'static str, StorageError)>>>,
+}
+
+impl<E> TestEngine<E> {
+    pub fn new(inner: E) -> Self {
+        Self {
+            inner,
+            failing: Arc::default(),
+        }
+    }
+
+    /// Makes the next call of `method` (a method of `StorageEngine`) return `error`.
+    pub fn fail_next(&self, method: &'static str, error: StorageError) {
+        self.failing.lock().unwrap().push((method, error));
+    }
+
+    fn check(&self, method: &str) -> Result<(), StorageError> {
+        let mut failing = self.failing.lock().unwrap();
+        match failing.iter().position(|(failing, _)| *failing == method) {
+            Some(index) => Err(failing.remove(index).1),
+            None => Ok(()),
+        }
+    }
+}
+
+#[async_trait]
+impl<E: StorageEngine> StorageEngine for TestEngine<E> {
+    async fn open_room(&self, room_id: &RoomId, schema: Schema) -> Result<(), StorageError> {
+        self.check("open_room")?;
+        self.inner.open_room(room_id, schema).await
+    }
+
+    async fn reload_schema(&self, room_id: &RoomId, schema: Schema) -> Result<(), StorageError> {
+        self.check("reload_schema")?;
+        self.inner.reload_schema(room_id, schema).await
+    }
+
+    async fn close_room(&self, room_id: &RoomId) -> Result<(), StorageError> {
+        let closed = self.inner.close_room(room_id).await;
+        self.check("close_room")?;
+        closed
+    }
+
+    async fn delete_room(&self, room_id: &RoomId) -> Result<(), StorageError> {
+        self.check("delete_room")?;
+        self.inner.delete_room(room_id).await
+    }
+
+    async fn apply_batch(
+        &self,
+        room_id: &RoomId,
+        ops: Vec<SequencedOperation>,
+    ) -> Result<ApplyReport, StorageError> {
+        self.check("apply_batch")?;
+        self.inner.apply_batch(room_id, ops).await
+    }
+
+    async fn get(
+        &self,
+        room_id: &RoomId,
+        table: &str,
+        pk: &PrimaryKey,
+    ) -> Result<Option<CompactRow>, StorageError> {
+        self.check("get")?;
+        self.inner.get(room_id, table, pk).await
+    }
+
+    async fn get_by_id(
+        &self,
+        room_id: &RoomId,
+        table_id: u16,
+        pk: &PrimaryKey,
+    ) -> Result<Option<CompactRow>, StorageError> {
+        self.check("get_by_id")?;
+        self.inner.get_by_id(room_id, table_id, pk).await
+    }
+
+    async fn scan<'a>(
+        &'a self,
+        room_id: &RoomId,
+        table: &str,
+        options: ScanOptions,
+    ) -> Result<RowStream<'a>, StorageError> {
+        self.check("scan")?;
+        self.inner.scan(room_id, table, options).await
+    }
+
+    async fn scan_by_id<'a>(
+        &'a self,
+        room_id: &RoomId,
+        table_id: u16,
+        options: ScanOptions,
+    ) -> Result<RowStream<'a>, StorageError> {
+        self.check("scan_by_id")?;
+        self.inner.scan_by_id(room_id, table_id, options).await
+    }
+
+    async fn get_head_seq(&self, room_id: &RoomId) -> Result<SequenceNumber, StorageError> {
+        self.check("get_head_seq")?;
+        self.inner.get_head_seq(room_id).await
+    }
+
+    async fn create_snapshot(&self, room_id: &RoomId) -> Result<Vec<u8>, StorageError> {
+        self.check("create_snapshot")?;
+        self.inner.create_snapshot(room_id).await
+    }
+
+    async fn apply_snapshot(
+        &self,
+        room_id: &RoomId,
+        schema: Schema,
+        snapshot: Bytes,
+        expected_head_seq: SequenceNumber,
+    ) -> Result<SequenceNumber, StorageError> {
+        self.check("apply_snapshot")?;
+        let applied = self
+            .inner
+            .apply_snapshot(room_id, schema, snapshot, expected_head_seq);
+        applied.await
     }
 }

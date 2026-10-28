@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
+use std::io;
 use zemdb_core::RoomId;
+use zemdb_storage::StorageError;
 
 /// The error of a call to the client.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
@@ -9,12 +11,29 @@ pub enum ClientError {
     #[error("Invalid configuration: {0}")]
     Config(String),
 
-    /// The local storage of the client failed: its metadata could not be read or written, or
-    /// another client holds them.
+    /// The local storage of the client failed: its metadata or its storage engine could not be
+    /// read or written, or another client holds them.
     #[error("Storage error: {0}")]
     Storage(String),
 
-    /// The room is not open in this client.
+    /// The room is not open in this client, or the client is shut down.
     #[error("Room '{0}' is not open")]
     RoomClosed(RoomId),
+
+    /// An error of the network or of the server: no valid reply came, or the server refused
+    /// the request.
+    #[error("Network error: {0}")]
+    Network(String),
+}
+
+impl From<io::Error> for ClientError {
+    fn from(err: io::Error) -> Self {
+        Self::Storage(err.to_string())
+    }
+}
+
+impl From<StorageError> for ClientError {
+    fn from(err: StorageError) -> Self {
+        Self::Storage(err.to_string())
+    }
 }

@@ -39,6 +39,10 @@ pub trait MetadataStore: Debug + Send + Sync {
 
     /// Replaces the metadata of `room_id`, durably and atomically.
     async fn save_room(&self, room_id: &RoomId, metadata: &RoomMetadata) -> io::Result<()>;
+
+    /// Removes the metadata of `room_id`, durably, with what a cut save left. Removing missing
+    /// metadata succeeds.
+    async fn remove_room(&self, room_id: &RoomId) -> io::Result<()>;
 }
 
 /// The metadata in files of a directory, through a file layer: the data directory of a disk
@@ -50,7 +54,8 @@ pub trait MetadataStore: Debug + Send + Sync {
 ///
 /// A `.meta` file is JSON followed by a line with its CRC32, and is replaced atomically through
 /// a temporary file (`.meta.tmp`), synced before it is renamed over the file. A file that does
-/// not verify counts as missing. A temporary file is never read: the next save replaces it.
+/// not verify counts as missing. A temporary file is never read: the next save replaces it, and
+/// removing the metadata of its room removes it.
 ///
 /// Each operation runs in a task of its own, which runs to its end even if its caller stops
 /// waiting, after the operations before it: none lands after a later one, and the lock of
@@ -186,6 +191,20 @@ impl<F: RoomFiles> MetadataStore for FileMetadata<F> {
         self.run(|files, dir| async move { write(&*files, &dir, &name, &metadata).await })
             .await
     }
+
+    async fn remove_room(&self, room_id: &RoomId) -> io::Result<()> {
+        let name = room_file(room_id);
+        self.run(|files, dir| async move {
+            for path in [dir.join(&name), dir.join(format!("{name}.tmp"))] {
+                match files.remove(&path).await {
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    removed => removed?,
+                }
+            }
+            files.sync_dir(&dir).await
+        })
+        .await
+    }
 }
 
 /// The JSON of a file written by [`FileMetadata`], or `None` if it is not UTF-8 or its CRC32
@@ -219,6 +238,12 @@ impl MetadataStore for MemoryMetadata {
     async fn save_room(&self, room_id: &RoomId, metadata: &RoomMetadata) -> io::Result<()> {
         let mut rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
         rooms.insert(room_id.clone(), metadata.clone());
+        Ok(())
+    }
+
+    async fn remove_room(&self, room_id: &RoomId) -> io::Result<()> {
+        let mut rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
+        rooms.remove(room_id);
         Ok(())
     }
 }
