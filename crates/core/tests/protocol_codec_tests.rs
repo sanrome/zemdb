@@ -113,6 +113,7 @@ fn test_protocol_binary_serialization_roundtrip() {
         chunk_index: 2,
         chunk_size: 4 * 1024 * 1024,
         snapshot_hash: Some([9u8; 32]),
+        room_incarnation: u128::MAX - 1,
     });
 
     let dummy_payload = b"snapshot payload chunk 2 data...";
@@ -137,6 +138,7 @@ fn test_protocol_binary_serialization_roundtrip() {
         total_bytes: 5 * 1024 * 1024,
         snapshot_hash: expected_hash,
         data: bytes::Bytes::from_static(dummy_payload),
+        room_incarnation: u128::MAX - 2,
     });
 
     assert_roundtrip(&ServerMessage::SnapshotUploadChunkAck {

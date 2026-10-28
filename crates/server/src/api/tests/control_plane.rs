@@ -114,6 +114,7 @@ async fn stage_doomed_snapshot(state: &TestState) {
         tail_seq: SequenceNumber::new(1),
         head_seq: SequenceNumber::new(1),
         unrestorable_through: None,
+        room_incarnation: 0,
     };
     state
         .relay

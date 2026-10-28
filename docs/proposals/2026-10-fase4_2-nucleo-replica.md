@@ -2,7 +2,7 @@
 
 **Fecha:** 26 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lotes 0 (el contrato) y 1 (`delete_room`) cerrados. DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 2.
+**Estado:** En curso: Lotes 0 (el contrato), 1 (`delete_room`) y 2 (la encarnación en los chunks del relay) cerrados. DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 3.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.2. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -126,7 +126,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 |---|---|---|---|---|---|
 | 0 | Contrato | Documentos | DC18 a DC23 | Nueva: S8. Ajustes: R6, K1, K2, K3, K5, K6, K7, K11, K15 | ✅ |
 | 1 | `delete_room` | storage | DC19 | S8, S3, L7 | ✅ |
-| 2 | La encarnación en los chunks del relay | core, server | DC23 | R6, R5, W1, W2 | ⬜ |
+| 2 | La encarnación en los chunks del relay | core, server | DC23 | R6, R5, W1, W2 | ✅ |
 | 3 | El esqueleto: comandos, transporte y metadatos | client | DC18, DC19, DC15 | W1, W2 (metadatos) | ⬜ |
 | 4 | Apertura, registro, descarte y cierre | client | DC19, DC12 | K3, K5, K11 | ⬜ |
 | 5 | El aplicador y `sync` | client | DC7, DC21 | K1, K12 | ⬜ |
@@ -261,7 +261,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
   1. **Sin bloqueantes; 4 ajustes y 3 menores.** El código de producción estaba bien. Faltaban tres tests, porque sobrevivían tres mutaciones: soltar el `.lock` antes de borrar, ignorar el error real de un borrado y quitar `create_dir_all`. También faltaba esta nota. Los menores: el bucle de reintento, ahora con la forma acotada de `open_when_unlocked`; el prefijo de los temporales, que se deriva igual que en `snap_file_path` y que el test de "solo queda el `.lock`" cubre; y el error de `list`, anotado arriba.
   2. **En verde, sin bloqueantes ni ajustes; 4 menores, atendidos.** Sobrevivía tomar las salas del motor con un lock de lectura (un segundo `delete_room` concurrente del mismo motor daba `RoomLocked` en lugar de esperar; las dos cosas son seguras para INV-S8): ahora el test del `delete_room` soltado exige que espere. Los otros: esta nota decía que contra el esqueleto fallaban "los ocho primeros"; el bucle de reintento termina con el error que lo frenó; y en INV-L2, el `delete_room` del servidor y el del storage, que la misma oración nombraba sin distinguirlos. Corrió además los tests de `delete_room` 120 veces, en seis bucles en paralelo, sin fallas.
 
-### Lote 2 · La encarnación en los chunks del relay (`zemdb-core`, `zemdb-server`)
+### Lote 2 · La encarnación en los chunks del relay (`zemdb-core`, `zemdb-server`) · ✅ Hecho
 **Objetivo:** que un cliente de otra encarnación de la sala nunca baje otro snapshot que el de su encarnación ni suba nada (DC23).
 
 **Archivos:** `crates/core/src/protocol/messages.rs` (los dos mensajes y el comentario de `ErrorCode::RoomReset`) y los generadores de mensajes de sus tests; `crates/server/src/actor/room.rs` (`log_bounds`) y `command.rs`, `src/relay/` (`LogBounds`, `pick_chunk`, `stage_chunk`), `src/api/relay.rs` y `control_plane.rs` (la encarnación en `GET /admin/rooms/{id}`), y el mensaje del error `RoomReset`; los tests del relay, del Control Plane y de codificación. `ARCHITECTURE.md` §6, §7.1 y §7.2.
@@ -277,6 +277,69 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 **Interacciones a revisar:** la purga del relay al crear y al borrar una sala; el ancla de retención de una subida en curso y la designación; los chunks anclados de una bajada; el presupuesto de respuestas; el tope del cuerpo de un pedido (los dos mensajes crecen hasta 17 bytes, lejos del tope con un chunk de 4 MiB); `RoomDetails` incrusta `RoomMetrics` con `#[serde(flatten)]`, que no admite un `u128` al deserializar, así que `room_incarnation` va como campo propio de `RoomDetails`, y los tests la leen con un tipo, no como `serde_json::Value` (que la pasaría a `f64`).
 
 **Documentos:** `ARCHITECTURE.md` §6 (*Multipart Chunked Snapshot Transfer*, *Snapshot Relay*), §7.1 (`GET /admin/rooms/{id}`) y §7.2 (`RoomReset` en el relay); `INVARIANTES.md`: INV-R6.
+
+**Hecho.**
+- **API.**
+  - `zemdb-core`: `room_incarnation: u128` al final de `ClientMessage::RequestSnapshotChunk` y de `UploadSnapshotChunk`, y el comentario de `ErrorCode::RoomReset`, que cubre también los chunks.
+  - `zemdb-server`:
+    - `LogBounds` suma `room_incarnation`, que el actor llena con la suya en `GetLogBounds`.
+    - La API del relay (`api/relay.rs`) arma el futuro de los límites con la encarnación del pedido. Al resolverse, compara la del actor y responde `RoomReset` si no coincide. El relay espera ese futuro donde ya lo hacía:
+      - en el chunk 0 sin ancla, después de elegir el snapshot y antes de mirar el rango (`pick_chunk`);
+      - en cada chunk de una subida, después de tomar el slot de la sala y antes de su lock (`stage_chunk`).
+    - La subida en un request pasa sin encarnación.
+    - `RoomDetails` suma `room_incarnation` como campo propio, que `GET /admin/rooms/{id}` toma de los metadatos de la sala. `RoomManager::lifecycle_overrides` pasa a ser `room_metadata`, que devuelve todos los metadatos.
+    - El mensaje de `ServerError::RoomReset` deja de hablar del cursor.
+- **Tests agregados:**
+  - `crates/server/tests/snapshot_relay_tests.rs`:
+    - `relay_chunks_of_another_incarnation_are_room_reset_and_change_nothing`: la encarnación de `GET /admin/rooms/{id}` es la de `Registered`. Con otra, como miembro y con el secreto de administración, reciben `RoomReset` el chunk 0 sin ancla, un chunk de la subida en curso y el primero de una más nueva que la reemplazaría. Después se sirve el mismo snapshot, y la subida en curso se completa.
+    - `a_member_of_a_room_created_again_gets_nothing_from_the_new_one`: con un snapshot y una subida en curso en la vieja, sin snapshot activo en la nueva el chunk 0 da `RoomNotFound`. Con uno de otro contenido, antes y después de volver a registrarse con el mismo `ClientId`:
+      - el chunk 0 da `RoomReset`;
+      - el anclado al snapshot viejo da `SnapshotSuperseded`;
+      - los tres chunks de la subida vieja dan `RoomReset`, y la nueva conserva su snapshot.
+  - `crates/server/src/api/tests/data_plane.rs`: `first_chunk_of_a_room_created_again_after_its_snapshot_was_picked_is_room_reset`. La sala se borra y se recrea entre que el relay elige el snapshot y pide el rango.
+  - `crates/server/src/relay/tests/lifecycle.rs`: `chunk_that_was_under_way_when_the_room_was_deleted_is_dropped`, el gemelo del que ya existía para la subida en un request. Un chunk atado a la sala antes de que se purgue, mientras espera el rango, da `RoomNotFound` y no deja snapshot, subida ni archivos: una subida de un chunk y el primero de tres.
+  - `crates/server/tests/server_integration_tests.rs` (`control_plane_room_lifecycle`): `GET /admin/rooms/{id}`, leído con `RoomDetails`, da la encarnación de `POST /admin/rooms`.
+  - Los dos mensajes, con una encarnación de más de 64 bits, en el ida y vuelta de `protocol_codec_tests.rs` y en los generadores de los fuzzers (`crates/core/tests/common`).
+  - Los tests que ya armaban esos mensajes suman el campo: con la encarnación de `Registered`, la de `create_room` o la de `GET /admin/rooms/{id}` (el helper `TestServer::incarnation`, también en el del binario) cuando el pedido llega al relay, y 0 donde la respuesta del relay no importa: un pedido que se rechaza antes, o el de `credential_matrix_tests.rs` con el secreto de administración, que llega al relay y solo exige que no sea 401 ni 403.
+  - Contra el esqueleto (los campos, sin comparar, y `GET` con 0) fallan por comportamiento los cuatro: los tres de `RoomReset` y el de `control_plane_room_lifecycle`. El del relay lo agregó la revisión de delta: cubre un orden que el lote no cambia pero del que ahora depende, y pasa también contra el esqueleto.
+- **Mutaciones verificadas** (10, todas detectadas):
+  - no comparar, o comparar al revés;
+  - el chunk 0 o los de una subida sin la encarnación;
+  - otro error que `RoomReset`;
+  - leer los límites antes de elegir el snapshot del chunk 0, o los de un chunk de subida antes de atarlo a la sala;
+  - descartar el snapshot del chunk 0 ante un error de los límites;
+  - `GET /admin/rooms/{id}` o los límites del actor con la encarnación 0.
+- **Interacciones revisadas:**
+  - **La purga del relay al crear y al borrar una sala.** Cubre los chunks anclados de la vieja (`SnapshotSuperseded`, test) y la subida en curso de la vieja, que ya no existe en la nueva. Un pedido atado a la vieja antes de la purga recibe `RoomNotFound` al tomar el lock, como antes (test). Uno que pide el rango a la nueva recibe `RoomReset`, también si eligió el snapshot antes de la recreación (test).
+  - **El ancla de retención de una subida en curso y la designación.** Un chunk de otra encarnación no llega al lock de la sala, así que no crea, reemplaza ni completa una subida, y no mueve su plazo (test con la subida en curso). Una subida de un chunk toma su lugar entre las que se completan en un pedido (`PendingUpload`, 2 por sala) antes de pedir el rango, así que mientras lo espera ancla el log en 0 y ocupa ese lugar. Es transitorio, acotado por el timeout del actor, y pasa igual con cualquier chunk que se rechaza.
+  - **Los reinicios.** La encarnación es durable en `meta_room.json`, la recuperación del relay descarta las subidas parciales, y `create_room` purga lo que la recuperación vuelva a activar. La excepción, previa al lote, es DEF-188 (abajo).
+  - **Los chunks anclados de una bajada.** No consultan al actor, como dice DC23. Si la sala nueva activa un snapshot con el mismo hash, son los mismos bytes que el chunk 0 validó en la vieja.
+  - **El presupuesto de respuestas.** El chunk 0 compara antes de reservar su frame, así que un `RoomReset` no reserva nada. Un chunk anclado sigue sin esperar a la sala (el test del presupuesto pasa igual).
+  - **El tope del cuerpo de un pedido.** Los dos mensajes crecen hasta 17 bytes (varint de un `u128`), lejos del tope con un chunk de 4 MiB.
+  - **`RoomDetails`.** `room_incarnation` es campo propio porque `RoomMetrics` va con `#[serde(flatten)]`, que pasa por `Content`, sin variante para un `u128`. Los tests la leen con el tipo, y `serde_json` la da entera. Las métricas salen del actor y la encarnación de los metadatos, en dos lecturas, como ya pasaba con `lifecycle_overrides`: un borrado y recreación en el medio mezcla las métricas de una sala con la encarnación de la otra. Para el relay es inofensivo, porque la encarnación devuelta es la vigente y sale del mismo `meta_room.json` que la del actor.
+- **Desvíos:**
+  - DC23 dice que el relay compara. Lo hace la API del relay, en el futuro de los límites que el relay espera donde ya lo hacía, así que el código de `pick_chunk`, `stage_chunk` y `SnapshotChunkUpload` no cambia. El momento de la comparación es el de DC23, y es más corto: la comparación entra en una sola función. La garantía pasa a depender de que el relay espere ese futuro después de atar el pedido a la sala y antes de cambiar nada: lo dicen los docstrings de `pick_chunk` y `stage_chunk`, y lo cubren el test del relay con la purga (subida) y los de `RoomReset` que exigen el mismo snapshot activo después (bajada).
+  - `RoomManager::lifecycle_overrides` (en `actor/manager.rs`, que no estaba en *Archivos*) pasa a ser `room_metadata`, que devuelve todos los metadatos, para que `GET /admin/rooms/{id}` tome la encarnación sin otra lectura del archivo.
+  - El mensaje de `RoomReset` dice "The request does not belong to this incarnation of room …", para un registro y para un chunk.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura):
+  1. **Sin bloqueantes; 1 ajuste y 9 menores.** El código de producción estaba bien, y el desvío es correcto: los únicos llamadores de producción de `pick_chunk` y `stage_chunk` pasan la encarnación, y la comparación queda antes de cualquier cambio. El ajuste: sobrevivía esperar los límites de un chunk de subida antes de tomar el slot de la sala, con lo que una subida de un chunk de la encarnación vieja se instalaba en la nueva si la sala se recreaba en el medio. Ahora lo detecta el test del relay con la purga, y el docstring de `stage_chunk` dice el orden. Los menores, atendidos:
+     - el plan no marcaba el cierre (la copia era anterior);
+     - tres inexactitudes de esta nota;
+     - dos interacciones sin su argumento, los reinicios y `PendingUpload`;
+     - docstrings que no nombraban la encarnación (`RoomManager::log_bounds`, `get_room`, el campo de `RequestSnapshotChunk`);
+     - *Acceptance* en `ARCHITECTURE.md` §6;
+     - INV-K1, que daba el lado del servidor como pendiente;
+     - las dos lecturas de `GET /admin/rooms/{id}`, anotadas arriba;
+     - una línea de más en un helper de los tests;
+     - un hallazgo previo al lote, al backlog.
+  2. **En verde, sin bloqueantes ni ajustes; 5 menores, atendidos.** El test nuevo mata la mutación del ajuste, y los dos HTTP de `RoomReset`, la de descartar el snapshot ante un error de los límites. Los menores:
+     - DEF-188 nombraba menos disparadores que los reales;
+     - la fila de INV-R6 en el resumen no reflejaba la ruptura abierta;
+     - una línea larga en el docstring de `pick_chunk`;
+     - "los cuatro primeros" en esta nota;
+     - faltaba esta ronda.
+- **Al backlog** (Bajo, previo al lote; `INVARIANTES.md` §1.4):
+  - **DEF-188 · Bajo · (b) · R6, L6.** `RoomManager::get_or_spawn` con un esquema, para una sala sin `meta_room.json`, le da una encarnación nueva sin purgar el relay, a diferencia de `create_room`. Si el relay todavía tiene un snapshot de una sala anterior con ese id (su directorio se perdió, o su `delete_room` se cortó o no pudo borrar los archivos antes de un reinicio), la sala nueva puede ofrecerlo cuando su head lo alcance, ya con su propia encarnación. INV-R6 pasa a ❌ Bajo (backlog). Solo se llega por la API de biblioteca, no por HTTP. Fix: purgar el relay cuando `get_or_spawn` escribe los metadatos de una sala nueva, como `create_room`.
 
 ### Lote 3 · El esqueleto: comandos, transporte y metadatos (`zemdb-client`)
 **Objetivo:** los tipos de DC18, el transporte, los metadatos de DC19 y la prueba contra el servidor en proceso, sin la lógica de las salas.
@@ -441,4 +504,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. Lote 1 cerrado el 28 de Octubre (`delete_room`), con la revisión de delta en verde. El próximo es el Lote 2.
+**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. Lote 1 cerrado el 28 de Octubre (`delete_room`), con la revisión de delta en verde. Lote 2 cerrado el mismo día (la encarnación en los chunks del relay), con la revisión de delta en verde. El próximo es el Lote 3.

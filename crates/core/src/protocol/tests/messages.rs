@@ -59,6 +59,7 @@ fn sample(kind: ClientMessageKind) -> ClientMessage {
             chunk_index: 0,
             chunk_size: 1024,
             snapshot_hash: None,
+            room_incarnation: 1,
         },
         ClientMessageKind::UploadSnapshotChunk => ClientMessage::UploadSnapshotChunk {
             correlation_id,
@@ -69,6 +70,7 @@ fn sample(kind: ClientMessageKind) -> ClientMessage {
             total_bytes: 3,
             snapshot_hash: [0u8; 32],
             data: bytes::Bytes::from_static(b"abc"),
+            room_incarnation: 1,
         },
     }
 }

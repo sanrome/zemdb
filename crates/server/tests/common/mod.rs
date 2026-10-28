@@ -17,6 +17,7 @@ use tempfile::{tempdir, TempDir};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use zemdb_core::*;
+use zemdb_server::api::control_plane::RoomDetails;
 use zemdb_server::{
     build_router, generate_client_token, serve_until_shutdown, AppState, CommitResponse,
     RegisterResponse, RoomCommand, RoomLifecyclePolicy, RoomManager, RoomMetrics, SchemaRegistry,
@@ -326,6 +327,19 @@ impl TestServer {
         let reply: ServerMessage = decode_message(&resp.bytes().await.unwrap()).unwrap();
         assert_eq!(status, StatusCode::OK, "{reply:?}");
         (token, reply)
+    }
+
+    /// The incarnation of `room_id`, as `GET /admin/rooms/{room_id}` returns it to the snapshot
+    /// worker.
+    pub async fn incarnation(&self, room_id: &RoomId) -> u128 {
+        let resp = self
+            .admin(Method::GET, &format!("/admin/rooms/{room_id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let details: RoomDetails = resp.json().await.unwrap();
+        details.room_incarnation
     }
 
     /// Opens the event stream of `room_id`, with `token` in the `Authorization` header.

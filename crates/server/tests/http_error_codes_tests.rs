@@ -133,6 +133,7 @@ async fn valid_token_for_another_room_is_forbidden_on_every_extractor() {
         chunk_index: 0,
         chunk_size: 64 * 1024,
         snapshot_hash: None,
+        room_incarnation: 0,
     };
     let resp = server
         .post(

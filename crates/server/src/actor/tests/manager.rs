@@ -169,9 +169,10 @@ async fn every_damage_to_meta_room_fails_to_load() {
     let manager = new_manager(&dir);
     assert_eq!(
         manager
-            .lifecycle_overrides(&room_id)
+            .room_metadata(&room_id)
             .await
             .unwrap()
+            .lifecycle
             .idle_timeout_secs,
         Some(60)
     );
@@ -510,7 +511,7 @@ async fn lifecycle_overrides_survive_a_respawn_and_a_restart() {
     let manager = new_manager(&dir);
     assert_eq!(effective_policy(&manager, &room_id).await, expected);
     assert_eq!(
-        manager.lifecycle_overrides(&room_id).await.unwrap(),
+        manager.room_metadata(&room_id).await.unwrap().lifecycle,
         custom_overrides()
     );
     let stored: serde_json::Value = serde_json::from_str(
@@ -679,7 +680,7 @@ async fn meta_room_without_lifecycle_has_no_overrides() {
     let defaults = manager.default_policy.clone();
     assert_eq!(effective_policy(&manager, &room_id).await, defaults);
     assert_eq!(
-        manager.lifecycle_overrides(&room_id).await.unwrap(),
+        manager.room_metadata(&room_id).await.unwrap().lifecycle,
         RoomLifecycleOverrides::default()
     );
     manager.shutdown_all().await;
@@ -762,7 +763,7 @@ async fn inactive_room_shuts_down_and_reopens_with_its_overrides() {
         assert!(manager.room_meta.is_empty());
         assert_eq!(manager.snapshot_relay.snapshot_floor(&room_id), None);
         assert_eq!(
-            manager.lifecycle_overrides(&room_id).await.unwrap(),
+            manager.room_metadata(&room_id).await.unwrap().lifecycle,
             overrides
         );
 

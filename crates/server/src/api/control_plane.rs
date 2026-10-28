@@ -48,13 +48,17 @@ pub struct CreateRoomRequest {
 }
 
 /// Response of `GET /admin/rooms/:room_id`: the room's metrics, including the effective
-/// lifecycle policy its actor runs with (`lifecycle`), plus the room's stored overrides.
+/// lifecycle policy its actor runs with (`lifecycle`), plus the room's stored overrides and its
+/// incarnation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomDetails {
     #[serde(flatten)]
     pub metrics: RoomMetrics,
     /// The settings in which the room differs from the server defaults.
     pub lifecycle_overrides: RoomLifecycleOverrides,
+    /// The room's incarnation, as `POST /admin/rooms` returns it, which the snapshot relay's
+    /// chunks carry. Outside `metrics`, because a flattened struct cannot deserialize a `u128`.
+    pub room_incarnation: u128,
 }
 
 /// `POST /admin/schemas`: registers a new schema.
@@ -126,8 +130,8 @@ pub async fn create_room(
     Ok((StatusCode::CREATED, Json(meta)))
 }
 
-/// `GET /admin/rooms/:room_id`: Retrieves operational metrics and the lifecycle policy of a
-/// room.
+/// `GET /admin/rooms/:room_id`: Retrieves operational metrics, the lifecycle policy and the
+/// incarnation of a room.
 pub async fn get_room(
     _auth: AdminAuth,
     State(state): State<AppState>,
@@ -140,10 +144,11 @@ pub async fn get_room(
         .room_manager
         .ask(&rid, |reply| RoomCommand::GetMetrics { reply })
         .await??;
-    let lifecycle_overrides = state.room_manager.lifecycle_overrides(&rid).await?;
+    let meta = state.room_manager.room_metadata(&rid).await?;
     Ok(Json(RoomDetails {
         metrics,
-        lifecycle_overrides,
+        lifecycle_overrides: meta.lifecycle,
+        room_incarnation: meta.room_incarnation,
     }))
 }
 

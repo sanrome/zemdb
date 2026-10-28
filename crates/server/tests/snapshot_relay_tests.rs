@@ -12,8 +12,14 @@ use zemdb_core::*;
 /// Starts a server with room `room` created and `ops` operations committed to it.
 async fn start_server(ops: u64) -> TestServer {
     let server = TestServer::start(|_| {}).await;
-    let (_, room_id) = server.room_with_schema("tasks", room().as_str()).await;
-    let sender = server.room_manager.get_room(&room_id).unwrap();
+    server.room_with_schema("tasks", room().as_str()).await;
+    commit_ops(&server, ops).await;
+    server
+}
+
+/// Commits `ops` operations to room `room`.
+async fn commit_ops(server: &TestServer, ops: u64) {
+    let sender = server.room_manager.get_room(&room()).unwrap();
     let writer = ClientId::new("writer").unwrap();
     register(&sender, &writer).await;
     for i in 1..=ops {
@@ -27,7 +33,6 @@ async fn start_server(ops: u64) -> TestServer {
         .await
         .unwrap();
     }
-    server
 }
 
 fn room() -> RoomId {
@@ -56,21 +61,39 @@ impl TestServer {
             .unwrap()
     }
 
-    /// Uploads chunk `index` of `snapshot`, made of three 64 KiB chunks, at sequence 2.
+    /// Uploads chunk `index` of `snapshot`, made of three 64 KiB chunks, at sequence 2, with the
+    /// room's incarnation.
     async fn upload_chunk_as(&self, bearer: &str, snapshot: &[u8], index: u32) -> StatusCode {
+        let incarnation = self.incarnation(&room()).await;
+        self.upload_chunk_in(bearer, incarnation, 2, snapshot, index)
+            .await
+            .0
+    }
+
+    /// Uploads chunk `index` of `snapshot`, made of three 64 KiB chunks, at sequence `seq`, as a
+    /// chunk of the room's `incarnation`.
+    async fn upload_chunk_in(
+        &self,
+        bearer: &str,
+        incarnation: u128,
+        seq: u64,
+        snapshot: &[u8],
+        index: u32,
+    ) -> (StatusCode, ServerMessage) {
         let len = 64 * 1024;
         let msg = ClientMessage::UploadSnapshotChunk {
             correlation_id: CorrelationId::new(1),
             room_id: room(),
-            snapshot_head_seq: SequenceNumber::new(2),
+            snapshot_head_seq: SequenceNumber::new(seq),
             chunk_index: index,
             total_chunks: 3,
             total_bytes: snapshot.len() as u64,
             snapshot_hash: ServerMessage::compute_snapshot_hash(snapshot),
             data: snapshot[index as usize * len..][..len].to_vec().into(),
+            room_incarnation: incarnation,
         };
         let path = "snapshot/upload-chunk";
-        self.post_message(&room(), path, bearer, &msg).await.0
+        self.post_message(&room(), path, bearer, &msg).await
     }
 
     async fn upload_ok(&self, seq: u64, data: Vec<u8>) {
@@ -84,8 +107,22 @@ impl TestServer {
         self.post_message(&room(), path, ADMIN_SECRET, msg).await
     }
 
+    /// Requests a chunk as the snapshot worker, with the room's incarnation.
     async fn request_chunk(
         &self,
+        chunk_index: u32,
+        snapshot_hash: Option<[u8; 32]>,
+    ) -> (StatusCode, ServerMessage) {
+        let incarnation = self.incarnation(&room()).await;
+        self.request_chunk_in(ADMIN_SECRET, incarnation, chunk_index, snapshot_hash)
+            .await
+    }
+
+    /// Requests a chunk of 64 KiB as a download of the room's `incarnation`.
+    async fn request_chunk_in(
+        &self,
+        bearer: &str,
+        incarnation: u128,
         chunk_index: u32,
         snapshot_hash: Option<[u8; 32]>,
     ) -> (StatusCode, ServerMessage) {
@@ -95,8 +132,10 @@ impl TestServer {
             chunk_index,
             chunk_size: 64 * 1024,
             snapshot_hash,
+            room_incarnation: incarnation,
         };
-        self.post_binary("snapshot/chunk", &msg).await
+        self.post_message(&room(), "snapshot/chunk", bearer, &msg)
+            .await
     }
 }
 
@@ -223,6 +262,7 @@ async fn anchored_download_of_a_replaced_snapshot_returns_409() {
 #[tokio::test]
 async fn relay_client_mistakes_are_not_server_errors() {
     let server = start_server(3).await;
+    let room_incarnation = server.incarnation(&room()).await;
 
     // No snapshot staged yet.
     expect_error(
@@ -249,6 +289,7 @@ async fn relay_client_mistakes_are_not_server_errors() {
         total_bytes: 200 * 1024,
         snapshot_hash: [0; 32],
         data: bytes::Bytes::from(vec![0u8; 10]),
+        room_incarnation,
     };
     expect_error(
         server
@@ -268,6 +309,7 @@ async fn relay_client_mistakes_are_not_server_errors() {
         total_bytes: 1 << 40,
         snapshot_hash: [0; 32],
         data: bytes::Bytes::from(vec![0u8; 1024]),
+        room_incarnation,
     };
     expect_error(
         server
@@ -281,6 +323,7 @@ async fn relay_client_mistakes_are_not_server_errors() {
 #[tokio::test]
 async fn deleting_a_room_purges_its_snapshot() {
     let server = start_server(3).await;
+    let incarnation = server.incarnation(&room()).await;
     let snapshots_dir = server.data_dir.join("snapshots");
     server.upload_ok(2, envelope(1000, 1)).await;
     assert_eq!(std::fs::read_dir(&snapshots_dir).unwrap().count(), 2);
@@ -294,7 +337,9 @@ async fn deleting_a_room_purges_its_snapshot() {
         .collect();
     assert!(leftover.is_empty(), "snapshot files left: {leftover:?}");
     expect_error(
-        server.request_chunk(0, None).await,
+        server
+            .request_chunk_in(ADMIN_SECRET, incarnation, 0, None)
+            .await,
         StatusCode::NOT_FOUND,
         ErrorCode::RoomNotFound,
     );
@@ -347,6 +392,7 @@ fn wrong_kind_frame_of_len(frame_len: usize) -> Vec<u8> {
         total_bytes: 1,
         snapshot_hash: [0; 32],
         data: bytes::Bytes::from(vec![0u8; data_len]),
+        room_incarnation: 0,
     };
     let probe_len = 1 << 20;
     let overhead = encode_message(&message(probe_len)).unwrap().len() - probe_len;
@@ -381,4 +427,117 @@ async fn frame_of_the_maximum_size_passes_the_body_limit_and_one_byte_more_does_
     oversized.push(0);
     let resp = post(oversized).await;
     assert_binary_error(resp, StatusCode::PAYLOAD_TOO_LARGE, ErrorCode::BadRequest).await;
+}
+
+/// The incarnation of `registered`, a `Registered` reply.
+fn incarnation_of(registered: ServerMessage) -> u128 {
+    match registered {
+        ServerMessage::Registered {
+            room_incarnation, ..
+        } => room_incarnation,
+        other => panic!("expected Registered, got {other:?}"),
+    }
+}
+
+/// The snapshot worker takes the room's incarnation from the room's details, the same that
+/// `Registered` gives a member. Declaring another one, the first chunk of a download and every
+/// chunk of an upload are `RoomReset` and change nothing: the active snapshot is still served,
+/// and the upload in progress completes.
+#[tokio::test]
+async fn relay_chunks_of_another_incarnation_are_room_reset_and_change_nothing() {
+    let server = start_server(3).await;
+    let (alice, registered) = server
+        .register(&room(), &ClientId::new("alice").unwrap())
+        .await;
+    let incarnation = incarnation_of(registered);
+    assert_eq!(server.incarnation(&room()).await, incarnation);
+    let other = incarnation.wrapping_add(1);
+    server.upload_ok(1, envelope(1000, 1)).await;
+    let chunked = envelope(3 * 64 * 1024, 2);
+    assert_eq!(
+        server.upload_chunk_as(&alice, &chunked, 0).await,
+        StatusCode::OK
+    );
+
+    for bearer in [alice.as_str(), ADMIN_SECRET] {
+        let reset = |reply| expect_error(reply, StatusCode::CONFLICT, ErrorCode::RoomReset);
+        reset(server.request_chunk_in(bearer, other, 0, None).await);
+        // A chunk of the upload in progress, and the first one of a newer upload that would
+        // replace it.
+        reset(server.upload_chunk_in(bearer, other, 2, &chunked, 1).await);
+        reset(server.upload_chunk_in(bearer, other, 3, &chunked, 0).await);
+    }
+
+    let served_seq = |reply| match reply {
+        (
+            StatusCode::OK,
+            ServerMessage::SnapshotChunk {
+                snapshot_head_seq, ..
+            },
+        ) => snapshot_head_seq.get(),
+        other => panic!("expected a snapshot chunk, got {other:?}"),
+    };
+    assert_eq!(served_seq(server.request_chunk(0, None).await), 1);
+    for index in [1, 2] {
+        let status = server.upload_chunk_as(&alice, &chunked, index).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(served_seq(server.request_chunk(0, None).await), 2);
+}
+
+/// A member of a room deleted and created again with the same id, whose chunks still declare the
+/// old incarnation, gets nothing from the new room and gives it nothing, also once it registered
+/// again in it with the same `ClientId`. While the new room has no snapshot, its first chunk is
+/// `RoomNotFound`; once it has one, of other content, its first chunk and its upload are
+/// `RoomReset`, its anchored chunk `SnapshotSuperseded`, and the new room keeps its snapshot.
+#[tokio::test]
+async fn a_member_of_a_room_created_again_gets_nothing_from_the_new_one() {
+    let server = start_server(3).await;
+    let alice = ClientId::new("alice").unwrap();
+    let (token, registered) = server.register(&room(), &alice).await;
+    let old = incarnation_of(registered);
+    let old_snapshot = envelope(1000, 1);
+    server.upload_ok(1, old_snapshot.clone()).await;
+    let chunked = envelope(3 * 64 * 1024, 2);
+    let (status, _) = server.upload_chunk_in(&token, old, 2, &chunked, 0).await;
+    assert_eq!(status, StatusCode::OK);
+
+    server.room_manager.delete_room(&room()).await.unwrap();
+    let schema_id = SchemaId::new("tasks").unwrap();
+    server.create_room(room().as_str(), &schema_id).await;
+    commit_ops(&server, 3).await;
+    expect_error(
+        server.request_chunk_in(&token, old, 0, None).await,
+        StatusCode::NOT_FOUND,
+        ErrorCode::RoomNotFound,
+    );
+    let new_snapshot = envelope(1000, 3);
+    server.upload_ok(1, new_snapshot.clone()).await;
+
+    for registered_again in [false, true] {
+        if registered_again {
+            server.register(&room(), &alice).await;
+        }
+        let old_chunk = |index, anchor| server.request_chunk_in(&token, old, index, anchor);
+        let (status, code) = (StatusCode::CONFLICT, ErrorCode::RoomReset);
+        expect_error(old_chunk(0, None).await, status, code);
+        let anchor = Some(ServerMessage::compute_snapshot_hash(&old_snapshot));
+        expect_error(
+            old_chunk(0, anchor).await,
+            status,
+            ErrorCode::SnapshotSuperseded,
+        );
+        for index in 0..3 {
+            let reply = server
+                .upload_chunk_in(&token, old, 2, &chunked, index)
+                .await;
+            expect_error(reply, status, code);
+        }
+    }
+    let (_, reply) = server.request_chunk(0, None).await;
+    assert!(
+        matches!(reply, ServerMessage::SnapshotChunk { snapshot_hash, .. }
+            if snapshot_hash == ServerMessage::compute_snapshot_hash(&new_snapshot)),
+        "{reply:?}"
+    );
 }

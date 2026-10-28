@@ -96,6 +96,7 @@ async fn commit_behind_retention_is_rejected_without_side_effects() {
         tail_seq: SequenceNumber::new(1),
         head_seq: SequenceNumber::new(5),
         unrestorable_through: None,
+        room_incarnation: 0,
     };
     let staged = room
         .relay

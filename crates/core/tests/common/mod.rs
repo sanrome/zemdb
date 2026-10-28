@@ -646,6 +646,7 @@ pub fn client_message(rng: &mut Rng) -> ClientMessage {
             chunk_index: rng.u32(),
             chunk_size: rng.u32(),
             snapshot_hash: option(rng, Rng::array),
+            room_incarnation: rng.u128(),
         },
         _ => ClientMessage::UploadSnapshotChunk {
             correlation_id,
@@ -656,6 +657,7 @@ pub fn client_message(rng: &mut Rng) -> ClientMessage {
             total_bytes: rng.u64(),
             snapshot_hash: rng.array(),
             data: Bytes::from(rng.bytes_below(64)),
+            room_incarnation: rng.u128(),
         },
     }
 }
@@ -953,6 +955,7 @@ pub fn sample_client_messages() -> Vec<ClientMessage> {
             chunk_index: 3,
             chunk_size: 65536,
             snapshot_hash: Some([5; 32]),
+            room_incarnation: u128::MAX - 5,
         },
         ClientMessage::UploadSnapshotChunk {
             correlation_id,
@@ -963,6 +966,7 @@ pub fn sample_client_messages() -> Vec<ClientMessage> {
             total_bytes: 100,
             snapshot_hash: [1; 32],
             data: Bytes::from_static(b"some snapshot bytes"),
+            room_incarnation: u128::MAX - 7,
         },
     ]);
     messages

@@ -39,6 +39,7 @@ pub(super) fn log_bounds(tail: u64, head: u64) -> LogBounds {
         tail_seq: seq(tail),
         head_seq: seq(head),
         unrestorable_through: None,
+        room_incarnation: 0,
     }
 }
 

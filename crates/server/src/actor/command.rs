@@ -166,8 +166,9 @@ pub enum RoomCommand {
     },
 
     /// Query the retained log range (the oldest retained sequence and the highest committed
-    /// one) and the highest cursor from which a sync found a gap, if any. The snapshot relay
-    /// uses it to accept and serve only snapshots a client can catch up from.
+    /// one), the highest cursor from which a sync found a gap, if any, and the room's
+    /// incarnation. The snapshot relay uses it to accept and serve only snapshots a client can
+    /// catch up from, and only to and from clients of this incarnation.
     GetLogBounds {
         reply: oneshot::Sender<Result<LogBounds, ServerError>>,
     },

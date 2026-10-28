@@ -798,12 +798,14 @@ impl RoomActor {
             .filter(|seq| bounds.admits(*seq))
     }
 
-    /// The retained range of the log, and the highest cursor from which a sync found a gap.
+    /// The retained range of the log, the highest cursor from which a sync found a gap, and the
+    /// room's incarnation.
     fn log_bounds(&self) -> LogBounds {
         LogBounds {
             tail_seq: self.tiered_log.tail_seq(),
             head_seq: self.head_seq,
             unrestorable_through: self.unrestorable_through,
+            room_incarnation: self.incarnation,
         }
     }
 

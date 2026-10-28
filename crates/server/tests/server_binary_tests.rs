@@ -11,6 +11,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use zemdb_core::*;
+use zemdb_server::api::control_plane::RoomDetails;
 
 /// Starts the server binary on `data_dir` and waits until it listens. Returns the process and
 /// its base URL.
@@ -111,7 +112,18 @@ async fn server_binary_holds_the_data_dir_lock_until_it_stops_writing() {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    // A 256 MiB snapshot in 64 chunks, all but the last one acknowledged.
+    // A 256 MiB snapshot in 64 chunks, all but the last one acknowledged, with the incarnation
+    // the snapshot worker takes from the room's details.
+    let room_incarnation = client
+        .get(format!("{base}/admin/rooms/big"))
+        .bearer_auth(ADMIN_SECRET)
+        .send()
+        .await
+        .unwrap()
+        .json::<RoomDetails>()
+        .await
+        .unwrap()
+        .room_incarnation;
     const CHUNK: usize = 4 * 1024 * 1024;
     const CHUNKS: u32 = 64;
     let snapshot = envelope(CHUNK * CHUNKS as usize, 9);
@@ -124,6 +136,7 @@ async fn server_binary_holds_the_data_dir_lock_until_it_stops_writing() {
         total_bytes: snapshot.len() as u64,
         snapshot_hash: ServerMessage::compute_snapshot_hash(&snapshot),
         data: snapshot[index as usize * CHUNK..][..CHUNK].to_vec().into(),
+        room_incarnation,
     };
     for index in 0..CHUNKS - 1 {
         let resp = post_frame("snapshot/upload-chunk", ADMIN_SECRET, &chunk(index))

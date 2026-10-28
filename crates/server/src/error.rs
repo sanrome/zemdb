@@ -100,9 +100,10 @@ pub enum ServerError {
     #[error("Snapshot superseded: {0}")]
     SnapshotSuperseded(String),
 
-    /// The client's cursor belongs to an earlier room with the same id, or came without the
-    /// room incarnation: the client must discard its local state and register without a cursor.
-    #[error("The cursor does not belong to this incarnation of room {0}")]
+    /// The request belongs to an earlier room with the same id (the cursor of a registration, or
+    /// a snapshot chunk), or a cursor came without the room incarnation: the client must discard
+    /// its local state and register without a cursor.
+    #[error("The request does not belong to this incarnation of room {0}")]
     RoomReset(String),
 }
 

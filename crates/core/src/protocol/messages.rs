@@ -54,9 +54,10 @@ pub enum ErrorCode {
     /// The request body did not arrive in time (HTTP 408). Transient: retrying with backoff is
     /// safe (commits are deduplicated by `MutationId`).
     RequestTimeout,
-    /// The client's cursor belongs to a room deleted and created again with the same id, or
-    /// came without the room incarnation: the client must discard its local state and register
-    /// without a cursor (HTTP 409). Permanent for that state.
+    /// The request belongs to a room deleted and created again with the same id (the cursor of
+    /// a registration, or the `room_incarnation` of a snapshot chunk), or a cursor came without
+    /// the room incarnation: the client must discard its local state and register without a
+    /// cursor (HTTP 409). Permanent for that state.
     RoomReset,
 }
 
@@ -151,6 +152,10 @@ pub enum ClientMessage {
         chunk_index: u32,
         chunk_size: u32,
         snapshot_hash: Option<[u8; 32]>,
+        /// The room incarnation the download belongs to: that of `Registered`, or for the
+        /// snapshot worker that of the room's details. The first request without
+        /// `snapshot_hash` of another one is `ErrorCode::RoomReset`.
+        room_incarnation: u128,
     },
     /// Upload a chunk of the room base snapshot for multipart staging of large datasets.
     UploadSnapshotChunk {
@@ -162,6 +167,9 @@ pub enum ClientMessage {
         total_bytes: u64,
         snapshot_hash: [u8; 32],
         data: bytes::Bytes,
+        /// The room incarnation the snapshot was created in. A chunk of another one is
+        /// `ErrorCode::RoomReset`.
+        room_incarnation: u128,
     },
 }
 

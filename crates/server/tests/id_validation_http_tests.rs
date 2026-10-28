@@ -155,6 +155,7 @@ async fn snapshot_relay_with_a_traversal_room_id_is_rejected_and_writes_nothing(
         total_bytes: 64,
         snapshot_hash: ServerMessage::compute_snapshot_hash(&[1u8; 64]),
         data: vec![1u8; 64].into(),
+        room_incarnation: 0,
     };
     let upload_chunk = server
         .post(

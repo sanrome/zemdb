@@ -24,7 +24,7 @@ pub const EXPIRY_SWEEP_PERIOD: Duration = Duration::from_secs(30);
 /// body in memory while it waits for the room lock.
 pub const MAX_PENDING_SINGLE_UPLOADS: usize = 2;
 
-/// Retained range of a room's log, as reported by its actor.
+/// Retained range of a room's log, and the room's incarnation, as reported by its actor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogBounds {
     /// Oldest retained sequence number.
@@ -34,6 +34,8 @@ pub struct LogBounds {
     /// A cursor from which the room found a gap of its log: no snapshot at or below it can be
     /// restored.
     pub unrestorable_through: Option<SequenceNumber>,
+    /// The incarnation of the room (see `RoomMetadata::room_incarnation`).
+    pub room_incarnation: u128,
 }
 
 impl LogBounds {

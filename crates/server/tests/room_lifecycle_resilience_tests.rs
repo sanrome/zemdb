@@ -187,7 +187,7 @@ async fn multipart_snapshot_upload_is_staged_and_verified() {
         .await;
     let client_token = common::token(&client_id, &room_id);
     let sender = server.room_manager.get_room(&room_id).unwrap();
-    register(&sender, &client_id).await;
+    let room_incarnation = register(&sender, &client_id).await.room_incarnation;
     for i in 1..=11u64 {
         commit(
             &sender,
@@ -214,6 +214,7 @@ async fn multipart_snapshot_upload_is_staged_and_verified() {
         total_bytes,
         snapshot_hash,
         data: Bytes::copy_from_slice(data),
+        room_incarnation,
     };
     let upload_path = format!("{room_id}/snapshot/upload-chunk");
 
@@ -254,6 +255,7 @@ async fn multipart_snapshot_upload_is_staged_and_verified() {
         chunk_index: 0,
         chunk_size: 100 * 1024,
         snapshot_hash: None,
+        room_incarnation,
     };
     let (status, chunk_msg) = server
         .post_message(&room_id, "snapshot/chunk", &client_token, &req_chunk)
@@ -284,6 +286,7 @@ async fn multipart_snapshot_upload_is_staged_and_verified() {
         total_bytes: tampered.len() as u64,
         snapshot_hash: [0xFF; 32], // incorrect hash
         data: Bytes::from(tampered),
+        room_incarnation,
     };
     let corrupt_resp = server
         .post_frame(&upload_path, Some(&client_token), &single_chunk_tampered)

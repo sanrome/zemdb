@@ -10,10 +10,11 @@ use reqwest::Method;
 use std::time::Duration;
 use tempfile::tempdir;
 use zemdb_core::*;
-use zemdb_server::actor::command::RoomMetrics;
 use zemdb_server::actor::manager::RoomMetadata;
 use zemdb_server::api::auth::generate_client_token;
-use zemdb_server::api::control_plane::{AddColumnRequest, CreateRoomRequest, CreateSchemaRequest};
+use zemdb_server::api::control_plane::{
+    AddColumnRequest, CreateRoomRequest, CreateSchemaRequest, RoomDetails,
+};
 
 fn client(id: &str) -> ClientId {
     ClientId::new(id).unwrap()
@@ -162,8 +163,9 @@ async fn control_plane_room_lifecycle() {
 
     let resp = server.admin(Method::GET, &room_path).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let metrics: RoomMetrics = resp.json().await.unwrap();
-    assert_eq!(metrics.head_seq, SequenceNumber::new(0));
+    let details: RoomDetails = resp.json().await.unwrap();
+    assert_eq!(details.metrics.head_seq, SequenceNumber::new(0));
+    assert_eq!(details.room_incarnation, meta.room_incarnation);
 
     // The first delete removes the room; the second one finds nothing.
     for expected in [StatusCode::NO_CONTENT, StatusCode::NOT_FOUND] {
@@ -489,8 +491,10 @@ async fn snapshot_relay_chunked_transfer_and_blake3() {
         .unwrap();
     assert_eq!(upload_resp.status(), StatusCode::OK);
 
-    // Download in chunks of 128 KB (4 chunks in all).
+    // Download in chunks of 128 KB (4 chunks in all), with the incarnation the snapshot worker
+    // takes from the room's details.
     let chunk_size = 128 * 1024;
+    let room_incarnation = server.incarnation(&room_id).await;
     let mut assembled_data = Vec::new();
     for chunk_idx in 0..4 {
         let req_msg = ClientMessage::RequestSnapshotChunk {
@@ -499,6 +503,7 @@ async fn snapshot_relay_chunked_transfer_and_blake3() {
             chunk_index: chunk_idx,
             chunk_size,
             snapshot_hash: (chunk_idx > 0).then_some(expected_hash),
+            room_incarnation,
         };
         let (status, chunk_msg) = server
             .post_message(

@@ -688,6 +688,7 @@ async fn snapshot_below_the_retained_range_does_not_anchor_pruning() {
                 tail_seq: seq(0),
                 head_seq: seq(100),
                 unrestorable_through: None,
+                room_incarnation: 0,
             })),
         )
         .await
@@ -1836,6 +1837,7 @@ async fn register_reports_only_a_usable_snapshot() {
                 tail_seq: seq(0),
                 head_seq: seq(100),
                 unrestorable_through: None,
+                room_incarnation: 0,
             })),
         )
         .await
@@ -2735,6 +2737,7 @@ mod onboarding_sim {
                 tail_seq: a.tiered_log.tail_seq(),
                 head_seq: a.head_seq,
                 unrestorable_through: a.unrestorable_through,
+                room_incarnation: a.incarnation,
             }
         }
 

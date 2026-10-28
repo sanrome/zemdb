@@ -49,10 +49,11 @@ impl SnapshotRelay {
     ///
     /// `chunk_size` is clamped to [`MIN_CHUNK_BYTES`]..=[`MAX_CHUNK_BYTES`]. Only the first
     /// chunk may be requested without `snapshot_hash`; that request also checks, through
-    /// `log_bounds` (awaited once the snapshot is picked), that the room log can still continue
-    /// from the snapshot, and drops a snapshot that fell below the retained range or below a
-    /// known gap. With `snapshot_hash`, the request is anchored to that snapshot: if it is no
-    /// longer the active one the result is `SnapshotSuperseded`.
+    /// `log_bounds` (awaited once the snapshot is picked, and whose error is returned before
+    /// anything changes), that the room log can still continue from the snapshot, and drops a
+    /// snapshot that fell below the retained range or below a known gap. With `snapshot_hash`,
+    /// the request is anchored to that snapshot: if it is no longer the active one the result is
+    /// `SnapshotSuperseded`.
     pub(crate) async fn pick_chunk(
         &self,
         room_id: &RoomId,

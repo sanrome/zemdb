@@ -487,15 +487,11 @@ impl RoomManager {
             })?)
     }
 
-    /// The lifecycle overrides of a room, cached or read from its `meta_room.json`, under the
-    /// spawn lock that every writer of that file holds.
-    pub async fn lifecycle_overrides(
-        &self,
-        room_id: &RoomId,
-    ) -> Result<RoomLifecycleOverrides, ServerError> {
+    /// The metadata of a room, cached or read from its `meta_room.json`, under the spawn lock
+    /// that every writer of that file holds.
+    pub async fn room_metadata(&self, room_id: &RoomId) -> Result<RoomMetadata, ServerError> {
         let _guard = self.lock_room(room_id).await;
         blocking_io(|| self.stored_metadata(room_id))?
-            .map(|meta| meta.lifecycle)
             .ok_or_else(|| ServerError::RoomNotFound(room_id.to_string()))
     }
 
@@ -643,8 +639,8 @@ impl RoomManager {
         Ok(())
     }
 
-    /// Retained log range of a room, and the highest cursor from which it found a gap, spawning
-    /// its actor if needed. A room that does not exist is `RoomNotFound`.
+    /// Retained log range of a room, the highest cursor from which it found a gap, and its
+    /// incarnation, spawning its actor if needed. A room that does not exist is `RoomNotFound`.
     pub async fn log_bounds(&self, room_id: &RoomId) -> Result<LogBounds, ServerError> {
         self.ask(room_id, |reply| RoomCommand::GetLogBounds { reply })
             .await?

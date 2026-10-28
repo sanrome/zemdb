@@ -152,6 +152,34 @@ async fn stage_that_was_under_way_when_the_room_was_deleted_is_dropped() {
     assert!(files_in(&snapshots_dir(&dir)).is_empty());
 }
 
+/// Like a single-request upload, a chunk tied to the room's state before the room is deleted,
+/// while it waits for the log range, stages nothing: neither an upload of one chunk nor the
+/// first chunk of a longer one.
+#[tokio::test]
+async fn chunk_that_was_under_way_when_the_room_was_deleted_is_dropped() {
+    let dir = tempdir().unwrap();
+    let relay = open(&dir);
+    let single = envelope(100, 1);
+    let hash = ServerMessage::compute_snapshot_hash(&single);
+    let three_parts = three_part_snapshot(2);
+    for chunk in [
+        part(1, 0, (100, 1), hash, &single),
+        part_of(1, 0, &three_parts),
+    ] {
+        let result = relay
+            .stage_chunk(chunk, async {
+                relay.purge_room(&room()).await.unwrap();
+                Ok(log_bounds(0, 10))
+            })
+            .await;
+        assert_room_not_found(result);
+        assert_eq!(relay.active_snapshot_seq(&room()), None);
+        assert_eq!(relay.upload_in_progress(&room()), None);
+    }
+    assert!(files_in(&snapshots_dir(&dir)).is_empty());
+    assert!(files_in(&uploads_dir(&dir)).is_empty());
+}
+
 #[tokio::test(start_paused = true)]
 async fn cleanup_keeps_room_locks_that_requests_still_hold() {
     let dir = tempdir().unwrap();

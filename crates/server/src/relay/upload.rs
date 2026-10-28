@@ -237,8 +237,10 @@ impl SnapshotRelay {
     ///
     /// A room holds at most one upload: a chunk for a higher sequence replaces the upload in
     /// progress, one for a lower sequence (or for the same sequence with different
-    /// parameters) is rejected. `log_bounds` is awaited for every chunk; the bounds are checked
-    /// when the upload starts and again when it completes.
+    /// parameters) is rejected. `log_bounds` is awaited for every chunk, after the request is
+    /// tied to the room's current state and before anything changes: its error is returned, and
+    /// a room deleted meanwhile is reported as not found. The bounds are checked when the upload
+    /// starts and again when it completes.
     pub async fn stage_chunk(
         &self,
         chunk: SnapshotChunkUpload,

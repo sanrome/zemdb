@@ -26,6 +26,8 @@ struct Fixture {
     manager: std::sync::Arc<crate::RoomManager>,
     relay: std::sync::Arc<crate::relay::SnapshotRelay>,
     room_id: RoomId,
+    /// The incarnation of the room, which the snapshot chunks carry.
+    incarnation: u128,
     client_id: ClientId,
     token: String,
 }
@@ -90,11 +92,12 @@ impl Fixture {
             .register_schema(schema_id.clone(), schema())
             .unwrap();
         let room_id = RoomId::new("room").unwrap();
-        state
+        let incarnation = state
             .manager
             .create_room(room_id.clone(), schema_id, None)
             .await
-            .unwrap();
+            .unwrap()
+            .room_incarnation;
         let client_id = ClientId::new("writer").unwrap();
         let token =
             generate_client_token(&client_id, &room_id, Duration::from_secs(300), AUTH_SECRET);
@@ -104,6 +107,7 @@ impl Fixture {
             relay: state.relay,
             dir,
             room_id,
+            incarnation,
             client_id,
             token,
         };
@@ -190,6 +194,7 @@ impl Fixture {
             chunk_index: 0,
             chunk_size: 0,
             snapshot_hash,
+            room_incarnation: self.incarnation,
         }
     }
 
@@ -554,6 +559,7 @@ async fn responses_take_a_frame_of_the_clients_budget_before_they_are_built() {
         tail_seq: SequenceNumber::new(1),
         head_seq: SequenceNumber::new(1),
         unrestorable_through: None,
+        room_incarnation: 0,
     };
     let hash = fx.stage_snapshot(1, std::future::ready(Ok(bounds))).await;
     let read = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -626,6 +632,7 @@ async fn a_request_waiting_for_its_room_holds_none_of_the_budget() {
         chunk_index,
         chunk_size: 0,
         snapshot_hash,
+        room_incarnation: fx.incarnation,
     };
     let (sync, first_chunk) = (fx.sync(0), chunk(0, None));
     let waiting = futures::future::join(
@@ -742,6 +749,35 @@ async fn first_chunk_while(
         assert!(done.is_ok());
     });
     fx.post("snapshot/chunk", &fx.first_chunk(None)).await.2
+}
+
+/// The first chunk checks its incarnation against the room it asks for the log range after
+/// picking the snapshot: if the room was deleted and created again in between, it is
+/// `RoomReset`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_chunk_of_a_room_created_again_after_its_snapshot_was_picked_is_room_reset() {
+    let fx = std::sync::Arc::new(Fixture::new().await);
+    fx.commit_ok(&fx.commit(1, 0)).await;
+    fx.stage_snapshot(1, fx.manager.log_bounds(&fx.room_id))
+        .await;
+    let other = std::sync::Arc::clone(&fx);
+    let reply = first_chunk_while(&fx, async move {
+        let (manager, room_id) = (&other.manager, other.room_id.clone());
+        manager.delete_room(&room_id).await.unwrap();
+        let schema_id = SchemaId::new("tasks").unwrap();
+        manager.create_room(room_id, schema_id, None).await.unwrap();
+    })
+    .await;
+    assert!(
+        matches!(
+            reply,
+            ServerMessage::Error {
+                code: ErrorCode::RoomReset,
+                ..
+            }
+        ),
+        "{reply:?}"
+    );
 }
 
 /// The first chunk checks the snapshot it serves against the log range read after picking it:

@@ -118,6 +118,7 @@ impl Ep {
                 chunk_index: 0,
                 chunk_size: 64 * 1024,
                 snapshot_hash: None,
+                room_incarnation: 0,
             },
             Ep::UploadChunk => ClientMessage::UploadSnapshotChunk {
                 correlation_id,
@@ -128,6 +129,7 @@ impl Ep {
                 total_bytes: snap.len() as u64,
                 snapshot_hash: ServerMessage::compute_snapshot_hash(&snap),
                 data: snap.into(),
+                room_incarnation: 0,
             },
             Ep::Register => ClientMessage::RegisterClient {
                 correlation_id,

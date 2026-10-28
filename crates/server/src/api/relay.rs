@@ -1,6 +1,7 @@
 //! HTTP endpoints of the snapshot relay. The relay itself (storage, acceptance rules) lives in
 //! [`crate::relay`]; these handlers decode requests, ask the room actor for the retained log
-//! range, and encode responses. Every error is a binary `ServerMessage::Error` frame.
+//! range and its incarnation, and encode responses. Every error is a binary
+//! `ServerMessage::Error` frame.
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -38,7 +39,7 @@ pub async fn upload_snapshot(
                 &uploader,
                 head_seq,
                 body,
-                log_bounds(&state, &task_room),
+                log_bounds(&state, &task_room, None),
             )
             .await
     })
@@ -86,6 +87,7 @@ pub async fn request_chunk(
         chunk_index,
         chunk_size,
         snapshot_hash,
+        room_incarnation,
     } = msg
     else {
         return unexpected_message(Some(room_id), "RequestSnapshotChunk");
@@ -97,7 +99,7 @@ pub async fn request_chunk(
     // The first chunk asks for the room's log range after picking the snapshot, and before its
     // frame is reserved; the chunk is read from its file once the frame is reserved.
     let relay = &state.snapshot_relay;
-    let bounds = log_bounds(&state, &room_id);
+    let bounds = log_bounds(&state, &room_id, Some(room_incarnation));
     let picked = match relay
         .pick_chunk(&room_id, chunk_index, chunk_size, snapshot_hash, bounds)
         .await
@@ -130,6 +132,7 @@ pub async fn upload_chunk(
         total_bytes,
         snapshot_hash,
         data,
+        room_incarnation,
     } = msg
     else {
         return unexpected_message(Some(room_id), "UploadSnapshotChunk");
@@ -153,7 +156,10 @@ pub async fn upload_chunk(
         let room_id = chunk_upload.room_id.clone();
         state
             .snapshot_relay
-            .stage_chunk(chunk_upload, log_bounds(&state, &room_id))
+            .stage_chunk(
+                chunk_upload,
+                log_bounds(&state, &room_id, Some(room_incarnation)),
+            )
             .await
     })
     .await;
@@ -183,7 +189,16 @@ async fn run_to_completion<T: Send + 'static>(
 }
 
 /// Retained log range of the room and the highest cursor from which it found a gap, asked to
-/// its actor when the future is awaited. A room that does not exist is `RoomNotFound`.
-async fn log_bounds(state: &AppState, room_id: &RoomId) -> Result<LogBounds, ServerError> {
-    state.room_manager.log_bounds(room_id).await
+/// its actor when the future is awaited. A room that does not exist is `RoomNotFound`, and one
+/// of another incarnation than the request's, if it carries one, is `RoomReset`.
+async fn log_bounds(
+    state: &AppState,
+    room_id: &RoomId,
+    incarnation: Option<u128>,
+) -> Result<LogBounds, ServerError> {
+    let bounds = state.room_manager.log_bounds(room_id).await?;
+    if incarnation.is_some_and(|incarnation| incarnation != bounds.room_incarnation) {
+        return Err(ServerError::RoomReset(room_id.to_string()));
+    }
+    Ok(bounds)
 }
