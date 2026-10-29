@@ -246,8 +246,9 @@ pub enum ServerMessage {
         /// Version of the room's schema. Versions count per schema, so the client compares it
         /// together with `schema_id`.
         schema_version: u64,
-        /// Id of the room's schema. An id or a version other than the client's is a schema
-        /// change: the client asks for the schema (`GetSchema`) before applying operations.
+        /// Id of the room's schema. Another id than the client's, or a later version of its
+        /// own, is a schema change: the client registers again to learn the schema from
+        /// `Registered` before applying operations.
         schema_id: SchemaId,
     },
     /// Confirmation of client acknowledgment and cursor persistence.

@@ -5,8 +5,8 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use zemdb_core::{
-    decode_message, ClientId, ClientMessage, CorrelationId, ErrorCode, RoomId, SequenceNumber,
-    SequencedOperation, ServerMessage,
+    decode_message, ClientId, ClientMessage, CorrelationId, ErrorCode, RoomId, SchemaId,
+    SequenceNumber, SequencedOperation, ServerMessage,
 };
 use zemdb_storage::{StorageEngine, StorageError};
 
@@ -33,7 +33,7 @@ pub struct RoomStatus {
     /// Whether the client is registered in the room.
     pub registered: bool,
     /// Whether the room fails closed: its schema changed to one that does not evolve from the
-    /// replica's.
+    /// replica's, or the server sent an operation that does not validate against it.
     pub failed_closed: bool,
     /// The writes in flight.
     pub writes_in_flight: usize,
@@ -89,6 +89,10 @@ struct OpenReplica {
     registered: bool,
     /// Behind the log of the server, it waits for a snapshot.
     awaits_snapshot: bool,
+    /// Its schema changed to one that does not evolve from its own, or the server sent an
+    /// operation that does not validate against it: it applies nothing more, and neither
+    /// registers nor syncs, until it opens again.
+    failed_closed: bool,
 }
 
 impl OpenReplica {
@@ -97,8 +101,21 @@ impl OpenReplica {
             metadata,
             registered,
             awaits_snapshot: false,
+            failed_closed: false,
         }
     }
+
+    fn fail_closed(&mut self) {
+        self.failed_closed = true;
+        self.registered = false;
+    }
+}
+
+/// Whether a reply that announces the version `version` of the schema `schema_id` changes the
+/// schema of a replica with `metadata`: another schema, or a later version of its own. An
+/// earlier version of its own comes in a delayed reply.
+fn changes(metadata: &RoomMetadata, schema_id: &SchemaId, version: u64) -> bool {
+    *schema_id != metadata.schema_id || version > metadata.schema.version()
 }
 
 impl Room {
@@ -142,6 +159,18 @@ struct Request {
     cursor: Option<(SequenceNumber, u128)>,
     registered: bool,
     awaits_snapshot: bool,
+    failed_closed: bool,
+}
+
+/// What the applier did with a batch.
+enum Applied {
+    /// The replica is at this head after it.
+    Head(SequenceNumber),
+    /// Nothing: the replica is closed, fails closed or is no longer of the epoch of the request.
+    Stale,
+    /// Nothing: its reply announces a change of the schema, or one of its operations does not
+    /// validate against the schema of the replica, which registers again to learn the schema.
+    Schema,
 }
 
 /// Whether `ops`, of a batch with `head_seq` and `has_more` in reply to a sync after `from_seq`,
@@ -231,6 +260,12 @@ impl Client {
     /// all the same, unregistered, to be read; one without them fails, and its next open
     /// registers it. A step that cannot write or remove the metadata, or delete the data, stops:
     /// the room is left out of the client with the error, and the next open resumes it.
+    ///
+    /// The schema comes from `Registered`: an open replica takes another schema, or a later
+    /// version of its own, only if it evolves from its own, saving it before its storage room
+    /// reloads it. If it does not, the room fails closed (`FailedClosed`), and stays open, to be
+    /// read: the client leaves the roster of the room, and the room neither registers nor syncs
+    /// until it is closed and opened again.
     pub async fn open_room(&self, room_id: RoomId, token: String) -> Result<(), ClientError> {
         let room = {
             let mut rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
@@ -264,10 +299,13 @@ impl Client {
     /// its storage room as its cursor and the incarnation of its metadata, or without them if it
     /// has none. `RoomReset` or `InvalidSequence` to a cursor discard the replica, which
     /// registers again without one. A reply for a replica discarded meanwhile changes nothing,
-    /// and the replica registers again.
+    /// and the replica registers again. A replica that fails closed does not register.
     async fn register(&self, room: &Arc<Room>) -> Result<(), ClientError> {
         loop {
             let request = self.change(room, Local::request).await?;
+            if request.failed_closed {
+                return Err(ClientError::FailedClosed(room.id.clone()));
+            }
             if request.registered {
                 return Ok(());
             }
@@ -303,7 +341,14 @@ impl Client {
                     };
                     let registered =
                         move |local: Local, room| local.registered(room, epoch, cursor, metadata);
-                    self.change(room, registered).await?;
+                    match self.change(room, registered).await {
+                        // Its schema failed the replica closed.
+                        Err(err @ ClientError::FailedClosed(_)) => {
+                            self.deregister(room, &token).await;
+                            return Err(err);
+                        }
+                        registered => registered?,
+                    }
                 }
                 ServerMessage::Error {
                     correlation_id: reply_id,
@@ -332,6 +377,25 @@ impl Client {
                 }
             }
         }
+    }
+
+    /// Takes the client out of the roster of `room`, whose replica failed closed, so that the
+    /// client neither holds the pruning of the log back nor is chosen to upload a snapshot. Its
+    /// caller holds the registration lock, so it goes after a registration in flight, and
+    /// nothing is sent if the replica opened again meanwhile, and no longer fails closed. Its
+    /// reply is not used: a lost deregistration, or one that a cut call never sent, leaves the
+    /// entry until its lease ends.
+    async fn deregister(&self, room: &Room, token: &str) {
+        let reopened = matches!(&room.state().replica, Replica::Open(open) if !open.failed_closed);
+        if reopened {
+            return;
+        }
+        let message = ClientMessage::DeregisterClient {
+            correlation_id: self.correlation_id(),
+            room_id: room.id.clone(),
+            client_id: self.client_id.clone(),
+        };
+        let _ = self.send(&message, token).await;
     }
 
     fn correlation_id(&self) -> CorrelationId {
@@ -434,6 +498,13 @@ impl Client {
     /// cursor, and the sync goes on; a second time in a sync is `Network`. `BehindCompaction`
     /// leaves the replica waiting for a snapshot, and the sync of a replica that waits is
     /// `Network`, without sending anything.
+    ///
+    /// A batch is applied only with the schema it announces or a later version of it: one that
+    /// announces another schema, or a later version, is not applied, and the replica registers
+    /// again to take the schema of `Registered`, as an open does. So does a batch with an
+    /// operation that does not validate against the schema of the replica; once the sync
+    /// registered again for a signal, it fails the room closed. The sync of a room that fails
+    /// closed is `FailedClosed`, without sending anything.
     pub async fn sync(&self, room_id: RoomId) -> Result<(), ClientError> {
         let room = self.room(&room_id)?;
         let mut again = false;
@@ -459,15 +530,19 @@ impl Client {
                 // As many as the server serves in a reply.
                 max_batch_size: u32::MAX,
             };
-            let (head_seq, ops, has_more) = match self.send(&message, &token).await? {
+            let (head_seq, ops, has_more, schema) = match self.send(&message, &token).await? {
                 ServerMessage::SyncBatch {
                     correlation_id: reply_id,
                     room_id,
                     head_seq,
                     ops,
                     has_more,
+                    schema_version,
+                    schema_id,
                     ..
-                } if reply_id == correlation_id && room_id == room.id => (head_seq, ops, has_more),
+                } if reply_id == correlation_id && room_id == room.id => {
+                    (head_seq, ops, has_more, (schema_id, schema_version))
+                }
                 reply => {
                     self.refused(&room, epoch, from_seq, correlation_id, reply)
                         .await?;
@@ -485,10 +560,24 @@ impl Client {
                     "Invalid batch in reply to a sync".to_string(),
                 ));
             }
-            let applied = self.change(&room, move |local, room| local.apply(room, epoch, ops));
-            let Some(head) = applied.await?.filter(|head| !has_more && *head >= head_seq) else {
-                continue;
+            let applied = move |local: Local, room| local.apply(room, epoch, ops, schema, again);
+            let head = match self.change(&room, applied).await {
+                Ok(Applied::Head(head)) => head,
+                Ok(Applied::Stale) => continue,
+                Ok(Applied::Schema) => {
+                    room.register_again(epoch, &mut again)?;
+                    continue;
+                }
+                Err(err @ ClientError::FailedClosed(_)) => {
+                    let _registration = room.registration.lock().await;
+                    self.deregister(&room, &token).await;
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
             };
+            if has_more || head < head_seq {
+                continue;
+            }
 
             let correlation_id = self.correlation_id();
             let message = ClientMessage::Ack {
@@ -527,18 +616,23 @@ impl Client {
     /// The diagnosis of `room_id`; `RoomClosed` if its replica is not open in the client.
     pub async fn status(&self, room_id: RoomId) -> Result<RoomStatus, ClientError> {
         let room = self.room(&room_id)?;
-        let (registered, epoch) = {
+        let (registered, failed_closed, epoch) = {
             let state = room.state();
-            let Replica::Open(OpenReplica { registered, .. }) = state.replica else {
+            let Replica::Open(OpenReplica {
+                registered,
+                failed_closed,
+                ..
+            }) = state.replica
+            else {
                 return Err(ClientError::RoomClosed(room_id));
             };
-            (registered, state.epoch)
+            (registered, failed_closed, state.epoch)
         };
         Ok(RoomStatus {
             head_seq: self.head(&room_id).await?,
             epoch,
             registered,
-            failed_closed: false,
+            failed_closed,
             writes_in_flight: 0,
             retained: 0,
         })
@@ -599,6 +693,7 @@ impl Local {
                 cursor: None,
                 registered: open.is_some_and(|open| open.registered),
                 awaits_snapshot: open.is_some_and(|open| open.awaits_snapshot),
+                failed_closed: open.is_some_and(|open| open.failed_closed),
             };
             (request, open.map(|open| open.metadata.room_incarnation))
         };
@@ -641,7 +736,12 @@ impl Local {
     /// it gives: an empty replica saves them before its data, and opens its storage room with
     /// their schema; an open one is registered, unless its head went back below the cursor (a
     /// memory room that opened again at 0), and then it registers again with its head. A
-    /// replica of another epoch is left as it is.
+    /// replica of another epoch is left as it is, and so is one that fails closed.
+    ///
+    /// An open replica takes another schema, or a later version of its own, only if it evolves
+    /// from its own: it saves the metadata before its storage room reloads the schema, and an
+    /// error at either step leaves the room out of the client, to open next with the metadata
+    /// saved. If the schema does not evolve, the replica fails closed (`FailedClosed`).
     async fn registered(
         self,
         room: Arc<Room>,
@@ -649,53 +749,86 @@ impl Local {
         cursor: Option<SequenceNumber>,
         metadata: RoomMetadata,
     ) -> Result<(), ClientError> {
-        let open = match &mut *room.state() {
+        let local = match &mut *room.state() {
             State {
                 replica: Replica::Closed,
                 ..
             } => return Err(ClientError::RoomClosed(room.id.clone())),
             state if state.epoch != epoch => return Ok(()),
             State {
-                replica: Replica::Open(_),
+                replica: Replica::Open(open),
                 ..
-            } => true,
+            } if open.failed_closed => return Ok(()),
+            State {
+                replica: Replica::Open(open),
+                ..
+            } => Some(open.metadata.clone()),
             // Out of the client until it opens.
             State { replica, .. } => {
                 *replica = Replica::Closed;
-                false
+                None
             }
         };
-        if open {
-            let head = self.storage.get_head_seq(&room.id).await?;
-            if cursor.is_none_or(|cursor| cursor <= head) {
-                room.update(epoch, |open| open.registered = true);
-            }
+        let Some(local) = local else {
+            self.metadata.save_room(&room.id, &metadata).await?;
+            self.storage
+                .open_room(&room.id, metadata.schema.clone())
+                .await?;
+            room.state().replica = Replica::Open(OpenReplica::new(metadata, true));
+            return Ok(());
+        };
+        let head = self.storage.get_head_seq(&room.id).await?;
+        if cursor.is_some_and(|cursor| cursor > head) {
             return Ok(());
         }
-        self.metadata.save_room(&room.id, &metadata).await?;
-        self.storage
-            .open_room(&room.id, metadata.schema.clone())
-            .await?;
-        room.state().replica = Replica::Open(OpenReplica::new(metadata, true));
+        if changes(&local, &metadata.schema_id, metadata.schema.version()) {
+            if !metadata.schema.evolves_from(&local.schema) {
+                room.update(epoch, OpenReplica::fail_closed);
+                return Err(ClientError::FailedClosed(room.id.clone()));
+            }
+            let switched = async {
+                self.metadata.save_room(&room.id, &metadata).await?;
+                let schema = metadata.schema.clone();
+                Ok::<_, ClientError>(self.storage.reload_schema(&room.id, schema).await?)
+            };
+            if let Err(err) = switched.await {
+                self.close(room).await?;
+                return Err(err);
+            }
+            room.update(epoch, |open| open.metadata = metadata);
+        }
+        room.update(epoch, |open| open.registered = true);
         Ok(())
     }
 
-    /// Applies `ops`, a batch in reply to a request of `epoch`, after dropping those the replica
-    /// holds, and returns its head after them. A batch for a replica that is closed or no longer
-    /// that of `epoch` is not applied (`None`), and neither is one that does not start right
-    /// after the head. An error after which the storage room may have changed (`Io`,
-    /// `RoomFailed`) is returned once the storage room is closed and opened again from its
-    /// files, as an open does.
+    /// Applies `ops`, a batch in reply to a request of `epoch` that announces the version of the
+    /// schema `schema`, after dropping those the replica holds, and returns its head after them.
+    /// A batch for a replica that is closed, fails closed or is no longer that of `epoch` is not
+    /// applied (`Stale`), and neither is one that does not start right after the head. Nor is
+    /// one that announces a change of the schema (`Schema`), or one with an operation that does
+    /// not validate against the schema of the replica: `Schema`, and once the sync registered
+    /// again for a signal (`again`), which gave the replica the schema of the room, it fails the
+    /// replica closed (`FailedClosed`). An error after which the storage room may have changed
+    /// (`Io`, `RoomFailed`) is returned once the storage room is closed and opened again from
+    /// its files, as an open does.
     async fn apply(
         self,
         room: Arc<Room>,
         epoch: u64,
         ops: Vec<SequencedOperation>,
-    ) -> Result<Option<SequenceNumber>, ClientError> {
+        (schema_id, version): (SchemaId, u64),
+        again: bool,
+    ) -> Result<Applied, ClientError> {
         {
             let state = room.state();
-            if state.epoch != epoch || !matches!(state.replica, Replica::Open(_)) {
-                return Ok(None);
+            let Replica::Open(open) = &state.replica else {
+                return Ok(Applied::Stale);
+            };
+            if state.epoch != epoch || open.failed_closed {
+                return Ok(Applied::Stale);
+            }
+            if changes(&open.metadata, &schema_id, version) {
+                return Ok(Applied::Schema);
             }
         }
         let head = self.storage.get_head_seq(&room.id).await?;
@@ -704,10 +837,15 @@ impl Local {
             .first()
             .is_none_or(|op| op.seq.get().checked_sub(1) != Some(head.get()))
         {
-            return Ok(Some(head));
+            return Ok(Applied::Head(head));
         }
         match self.storage.apply_batch(&room.id, ops).await {
-            Ok(report) => Ok(Some(report.head_seq())),
+            Ok(report) => Ok(Applied::Head(report.head_seq())),
+            Err(StorageError::SchemaValidation(_)) if again => {
+                room.update(epoch, OpenReplica::fail_closed);
+                Err(ClientError::FailedClosed(room.id.clone()))
+            }
+            Err(StorageError::SchemaValidation(_)) => Ok(Applied::Schema),
             Err(err @ (StorageError::Io(_) | StorageError::RoomFailed { .. })) => {
                 self.clone().close(Arc::clone(&room)).await?;
                 self.open(room).await?;

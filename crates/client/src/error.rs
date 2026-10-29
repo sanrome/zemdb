@@ -24,6 +24,12 @@ pub enum ClientError {
     /// the request.
     #[error("Network error: {0}")]
     Network(String),
+
+    /// The room fails closed: the server's schema for it does not evolve from the replica's, or
+    /// the server sent an operation that does not validate against the schema of the room. The
+    /// replica stays open, to be read; closing the room and opening it again tries again.
+    #[error("Room '{0}' fails closed")]
+    FailedClosed(RoomId),
 }
 
 impl From<io::Error> for ClientError {

@@ -2,7 +2,7 @@
 
 **Fecha:** 26 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lotes 0 (el contrato), 1 (`delete_room`), 2 (la encarnación en los chunks del relay), 3 (el esqueleto del cliente), 4 (apertura, registro, descarte y cierre) y 5 (el aplicador y `sync`) cerrados. DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 6.
+**Estado:** En curso: Lotes 0 (el contrato), 1 (`delete_room`), 2 (la encarnación en los chunks del relay), 3 (el esqueleto del cliente), 4 (apertura, registro, descarte y cierre), 5 (el aplicador y `sync`) y 6 (el esquema) cerrados. DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 7.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.2. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -130,7 +130,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 | 3 | El esqueleto: comandos, transporte y metadatos | client | DC18, DC19, DC15 | W1, W2 (metadatos) | ✅ |
 | 4 | Apertura, registro, descarte y cierre | client | DC19, DC12 | K3, K5, K11 | ✅ |
 | 5 | El aplicador y `sync` | client | DC7, DC21 | K1, K12 | ✅ |
-| 6 | El esquema | client | DC5, DC20 | K6, C1 | ⬜ |
+| 6 | El esquema | client | DC5, DC20 | K6, C1 | ✅ |
 | 7 | Escrituras | client | DC6, DC7, DC21 | K2, K15 | ⬜ |
 | 8 | `heartbeat` y la bajada de snapshots | client | DC20, DC22, DC23 | K7, K2, K12, K15 | ⬜ |
 | 9 | La subida de snapshots | client | DC22, DC23 | K7, K4 | ⬜ |
@@ -721,7 +721,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 
      Probó dos mutaciones más, y las dos fallan. Corrió los tests de sync 30 veces seguidas y 15 rondas de a dos en paralelo, sin fallas. Un menor opcional, atendido: INV-K5 nombra la réplica que volvió atrás también en *Sostenida por*.
 
-### Lote 6 · El esquema (`zemdb-client`)
+### Lote 6 · El esquema (`zemdb-client`) · ✅ Hecho
 **Objetivo:** cambiar solo a un esquema que evoluciona del local, en el orden de DC5, y fallar cerrado si no (DC20).
 
 **Qué se hace:** la decisión sobre el esquema de `Registered`, con los metadatos antes de `reload_schema` en una tarea propia; las señales de `SyncBatch` y de `apply_batch` (`SchemaValidation`), con un registro por señal (las de `CommitAck` y `HeartbeatAck` las suman los Lotes 7 y 8 con la misma función); fallar cerrado, con la baja, sin registros y con las esperas resueltas. El comentario de `schema_id` en `CommitAck` de `zemdb-core` deja de mencionar `GetSchema`.
@@ -734,6 +734,101 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 **Interacciones a revisar:** `reload_schema` bajo el mismo lock que los lotes (INV-S7) y `evolves_from`; INV-E3 (la versión que anuncia una respuesta); `DeregisterClient` y el roster.
 
 **Documentos:** `ARCHITECTURE.md` §11 (el esquema); `INVARIANTES.md`: K6.
+
+**Hecho.**
+- **API** (`zemdb-client`):
+  - **`ClientError::FailedClosed(room_id)`**, nueva: la sala falla cerrada. DC18 la nombraba como "la sala fallida".
+  - **El esquema de `Registered`.** El esquema sale solo de `Registered`, nunca de `GetSchema`. Con el esquema de la réplica, o una versión anterior del mismo, `Registered` no cambia nada. Con otro esquema, o con una versión posterior, la réplica lo toma solo si evoluciona del suyo (`evolves_from`), en el mismo cambio del aplicador que toma `Registered`, en su tarea:
+    1. guarda los metadatos con el esquema nuevo;
+    2. la sala del storage lo recarga (`reload_schema`);
+    3. la réplica pasa a los metadatos nuevos y queda registrada.
+
+    Un error al guardar o al recargar saca la sala del cliente con `Storage`, y la próxima apertura abre con los metadatos que hayan quedado (DC19). Un `Registered` para un cursor mayor que el head (Lote 5) no decide nada: la réplica se vuelve a registrar con su head.
+  - **Las señales de un sync.** El aplicador no aplica:
+    - un `SyncBatch` que anuncia otro `schema_id` o una versión posterior del mismo (una anterior es una respuesta demorada, y se aplica con el esquema local);
+    - un lote con una operación que no valida contra el esquema de la réplica (`SchemaValidation` de `apply_batch`).
+
+    En los dos casos la réplica se vuelve a registrar con su cursor, con el tope de una señal por sync del Lote 5, y el sync vuelve a pedir desde el head. Una operación que no valida después de volver a registrarse por una señal en el mismo sync, que le dio a la réplica el esquema de la sala, hace fallar cerrada la sala: el servidor mandó una operación que no vale con el esquema que sirve.
+  - **Fallar cerrado.** Un esquema que no evoluciona, o la operación que no valida, dejan la réplica abierta, para leer, con su esquema y sin registrar (`status`: `failed_closed`). No aplica más lotes, tampoco los de un pedido anterior, y no se registra, tampoco ante `ClientNotRegistered`: `open_room` y `sync` dan `FailedClosed` sin mandar nada. Quien la hace fallar manda `DeregisterClient` a lo sumo una vez, bajo el lock de los registros, así que va después de un registro en vuelo, que ya no cambia nada; y no se manda si mientras tanto la sala se volvió a abrir y no falla cerrada. La respuesta no se usa: una baja perdida, o una que la llamada cortada antes no llegó a mandar, deja la entrada hasta que vence su lease (DC20). Cerrar la sala y volver a abrirla vuelve a intentar.
+  - **`zemdb-core`:** el comentario de `schema_id` en `CommitAck` ya no menciona `GetSchema`.
+- **Tests agregados** (13), en `crates/client/tests/schema_tests.rs`, contra el servidor en proceso:
+  - `a_column_added_in_the_middle_of_the_log_is_saved_and_reloaded_before_its_operations`: un `add_column` con `UNIQUE` después de 3 operaciones. El sync se registra con el cursor 3, y los metadatos tienen el esquema nuevo cuando la sala del storage lo recarga (se leen en ese momento). Las cinco operaciones de la versión nueva dan las decisiones del oráculo del storage (incluido con `#[path]`), tres rechazos por `UNIQUE` incluidos.
+  - `a_cut_between_saving_a_new_schema_and_reloading_it_opens_with_the_new_one` (en Unix): la imagen de los archivos en el momento de la recarga, como la deja un corte del proceso, abre con el esquema nuevo, sin recargarlo, desde el cursor 3, y aplica operaciones de la versión nueva.
+  - `a_reply_with_an_earlier_version_of_the_schema_applies_with_the_local_one`: un lote que anuncia la versión 1 a una réplica en la 2 se aplica con la local, sin registrarse. Un `Registered` con la versión 1 tampoco cambia nada: no recarga, y los metadatos siguen en la 2.
+  - `a_reply_that_announces_another_schema_registers_again_and_decides_with_registered`: una versión posterior o otro id llevan a un registro con el cursor. `Registered` trae el esquema de la réplica, así que nada cambia, y el lote pedido otra vez se aplica.
+  - `a_server_that_keeps_announcing_another_schema_ends_the_sync`: `Network` después de un registro.
+  - `a_room_reassigned_to_a_schema_that_extends_its_own_moves_the_replica_to_it`: una reasignación real del servidor (`shutdown_room` y `get_or_spawn` con otro esquema). Los metadatos pasan al id y al esquema nuevos, y la operación con la columna nueva se aplica.
+  - `a_schema_that_does_not_evolve_from_the_replicas_fails_the_room_closed`: un `Registered` fabricado que cambia el tipo de una columna, con otro esquema o con una versión posterior del mismo. `open_room` es `FailedClosed`, el cliente se da de baja una vez y el servidor ya no lo tiene (un sync suyo recibe `ClientNotRegistered`). La réplica sigue legible con su esquema; `sync` y `open_room` no mandan nada. Cerrada y abierta otra vez, vuelve a intentar y se pone al día.
+  - `a_reply_that_comes_after_the_room_failed_closed_neither_applies_nor_registers`: la respuesta a un sync que llega después de que otro sync hizo fallar cerrada la sala. Un lote con operaciones nuevas no se aplica, y `ClientNotRegistered` no registra.
+  - `a_registration_answered_after_the_room_failed_closed_changes_nothing`: un registro en vuelo (llega tarde al servidor) cuando un sync hace fallar cerrada la sala. El sync manda la baja después de él, así que el servidor ya no tiene al cliente, y el `Registered` no registra la réplica.
+  - `a_deregistration_is_not_sent_once_the_room_opened_again`: la sala se cierra después de fallar cerrada, mientras el sync que la hizo fallar espera el lock de los registros. Si una apertura que esperaba antes la vuelve a abrir, la registra, y el sync ya no manda la baja; si solo se cerró, la baja sale.
+  - `an_operation_that_does_not_validate_with_the_schema_of_registered_fails_closed`: con cada lote fabricado con una operación de la versión siguiente, se registra una vez y falla cerrado.
+  - `an_operation_that_does_not_validate_registers_again_and_applies_with_the_new_schema`: un lote que anuncia la versión de la réplica con una operación de la siguiente. Se registra, toma el esquema nuevo de `Registered` y la aplica.
+  - `a_failed_save_or_reload_of_a_new_schema_leaves_the_room_out`: la sala queda fuera del cliente, con los metadatos viejos (falla el `rename`) o los nuevos (falla la recarga). La próxima apertura se pone al día con el esquema nuevo, sin darse de baja.
+- **Fixtures** (`crates/client/tests/common/`):
+  - `TestTransport::slow_next` demora el próximo mensaje de un tipo;
+  - `TestEngine::before_next_reload` corre un closure al empezar la próxima recarga;
+  - `TestServer::commit_ops` confirma operaciones cualquiera;
+  - `deregistrations`;
+  - `setup`, `tasks`, `request`, `answer_next` y `requests` pasan de `sync_tests.rs` a `common`.
+  - El test de los errores del storage del Lote 5 exige además que no haya bajas.
+- Contra el esqueleto (`ClientError::FailedClosed` sin usar) fallan por comportamiento 9 de los 10 del primer borrador. El de la versión anterior pasa: es el negativo de una regla que el esqueleto no tiene, y lo fija la mutación de tomar una versión anterior como un cambio. Los dos de las respuestas tardías y el del servidor que insiste llegaron con la verificación de mutaciones; el de la baja después de reabrir, y los casos nuevos de dos tests, con la revisión de delta.
+- **Mutaciones verificadas** (34, todas detectadas; tres dejan un ciclo sin fin y las corta el timeout):
+  - la comparación del esquema anunciado:
+    - una versión igual o una anterior como un cambio;
+    - otro id, o una versión posterior, sin cambio;
+  - el aplicador:
+    - aplicar un lote que anuncia un cambio;
+    - aplicarlo en una réplica que falla cerrada;
+    - una operación que no valida falla cerrado sin registrarse antes, o es un error del storage;
+  - `Registered`:
+    - tomar un esquema que no evoluciona, comparar `evolves_from` al revés, o exigirlo solo ante otro id;
+    - recargar también sin cambio, o tomar como cambio una versión anterior;
+    - recargar antes de guardar, no guardar, no recargar o no pasar a los metadatos nuevos;
+    - un error al guardar o al recargar deja la sala en el cliente;
+    - cambiar una réplica que falla cerrada;
+  - fallar cerrado:
+    - sin dejar la réplica sin registrar, o sin marcarla (desde `Registered` y desde el aplicador);
+    - registrarse igual (ciclo);
+    - `status` sin el estado, o lo que presenta un pedido (ciclo);
+  - la baja:
+    - no darse de baja (desde el registro o desde el sync);
+    - darse de baja ante cualquier error (desde el registro o desde el sync);
+    - darse de baja sin el lock de los registros, o aunque la sala ya se haya vuelto a abrir, o no darse de baja con la sala cerrada;
+  - la señal en el sync: no registrarse, o registrarse sin tope (ciclo).
+- **Interacciones revisadas:**
+  - **`reload_schema` (INV-S7) y el aplicador.** La recarga corre en el cambio que toma `Registered`, bajo el aplicador: ningún lote se aplica entre guardar y recargar, y el motor además recarga bajo el lock de sus lotes, así que ninguno se aplica con dos esquemas. `reload_schema` no escribe en disco, así que un corte entre guardar y recargar deja lo mismo que después de recargar, y la apertura usa el esquema de los metadatos (test con la imagen). Un error al recargar cierra la sala, porque los metadatos ya tienen el esquema nuevo y la sala del storage no (test).
+  - **`evolves_from`.** Se compara contra el esquema de los metadatos, que es siempre el de la sala del storage: los dos cambian juntos, en el mismo cambio, y si algo falla en el medio la sala sale del cliente. Un esquema que no evoluciona falla cerrado (test); una reasignación real a uno que lo extiende pasa (test). El motor vuelve a verificarlo en `reload_schema` (`SchemaNotEvolving`).
+  - **INV-E3, la versión que anuncia una respuesta.** Una versión anterior del mismo esquema es una respuesta demorada, y sus operaciones valen con el local (test). Otro id o una versión posterior llevan a registrarse, y se decide contra `Registered` (test). Las operaciones de un lote que anuncia un cambio no se aplican nunca con el esquema viejo, ni aunque `Registered` no traiga cambio: el sync las vuelve a pedir.
+  - **Las señales y el registro del Lote 5.** La señal de esquema usa el mismo `register_again` y el mismo tope de una por sync (test del servidor que insiste). Con un servidor que cumple INV-E3, una operación que no valida no puede llegar, porque el lote que la trae anuncia un esquema que no es posterior al local, y el local evoluciona del anunciado. Por eso fallar cerrado por una operación después de volver a registrarse por una señal en el mismo sync no confunde un esquema que cambió dos veces.
+  - **`DeregisterClient` y el roster.** El servidor saca al cliente (`lease_tracker.deregister_client`), y un sync suyo recibe `ClientNotRegistered` (test). La baja va bajo el lock de los registros: espera un registro en vuelo (test con el registro demorado al llegar al servidor). Si se pierde, o si un registro anterior llega después, la entrada vence con su lease (DC20).
+  - **Una llamada cortada antes de la baja.** El sync que hace fallar cerrada la sala espera el lock de los registros para mandar la baja, y en `register` la baja va después del cambio que toma `Registered`. Si el llamador suelta la llamada antes, la baja no sale, y después nadie la manda: la sala ya no se registra ni sincroniza. La entrada vence con su lease, como una baja perdida (DC20). La revisión lo reprodujo con un test temporal.
+  - **Una baja después de reabrir.** Si la sala se cierra y se vuelve a abrir antes de que salga la baja, la apertura la registra, y la baja ya no se manda (test). Antes, la baja sacaba del roster a la réplica nueva.
+  - **El motor en memoria.** Una recarga que falla cierra la sala, que suelta sus datos: la próxima apertura se pone al día desde 0 con el esquema nuevo (la revisión lo comprobó con un test temporal: cursor 0, head 5).
+  - **Las respuestas que llegan después de fallar cerrado.** Un lote no se aplica, `ClientNotRegistered` no registra, y un `Registered` no registra ni decide (tests).
+  - **El descarte y la época (Lotes 4 y 5).** Fallar cerrado no descarta (INV-K3): la réplica sigue legible (test). El chequeo de la época va antes que el del esquema en `Registered` y en el aplicador. Cerrar y volver a abrir crea la réplica sin fallar cerrado (test).
+  - **Los metadatos (DC19).** El esquema nuevo se guarda antes de recargarlo (test que lee el archivo en ese momento). Una réplica vacía sigue guardando los metadatos de `Registered` sin decidir nada, porque no tiene datos.
+- **Desvíos:**
+  - La señal de un `SyncBatch` no aplica el lote cuando `Registered` no trae cambio: el sync lo vuelve a pedir. Si el lote pedido otra vez sigue anunciando un cambio, es la segunda señal del sync, y el sync es `Network`. Así nunca se aplican las operaciones de una respuesta que anuncia un esquema más nuevo que el local (INV-K6). DC20 decía que una señal sin cambio "se trata como sin cambio de esquema".
+  - Una operación que no valida hace fallar cerrado después de volver a registrarse por cualquier señal en el mismo sync, no solo por esa. Por INV-E3, ese registro ya le dio a la réplica el esquema de la sala. El registro inicial de una réplica sin registrar no cuenta: cuesta un registro de más.
+  - `open_room` de una sala que falla cerrada es `FailedClosed`, con la réplica abierta para leer.
+  - Un error al recargar el esquema saca la sala del cliente, como uno al guardarlo (DC19): los metadatos ya tienen el esquema nuevo, y la próxima apertura lo usa.
+  - El test del corte es solo de Unix, como las imágenes de crash del Lote 1: copia archivos que la sala tiene abiertos.
+  - Dejar los heartbeats al fallar cerrado llega con el Lote 8, que trae los heartbeats, y resolver las escrituras que esperan (requisito 1 de §1.1), con el Lote 7, que trae las escrituras.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura):
+  1. **No en verde: 2 ajustes y 8 menores.** Corrió los tests de esquema y de sync 25 veces seguidas, 15 rondas de 3 procesos en paralelo y 12 de 6, sin fallas. Todo quedó atendido:
+     - **La decisión de `Registered` tenía dos reglas sin test.** Sobrevivían exigir `evolves_from` solo ante otro id (un `Registered` de la misma id, con una versión posterior que no evoluciona, se guardaba) y tomar como cambio una versión anterior en `Registered`. Ahora hay tests.
+     - **`cargo fmt --check` fallaba** en un test.
+     - **Una baja después de reabrir sacaba del roster a la réplica nueva.** Ahora la baja solo sale si la sala sigue fallando cerrada. Hay test.
+     - **Faltaban interacciones:** la llamada cortada antes de la baja (documentada como "a lo sumo una vez"), la baja después de reabrir y el motor en memoria.
+     - **Redacción:** fallar cerrado es después de volver a registrarse por una señal, no después de cualquier registro; §3.1 decía que se aplican las operaciones de la respuesta; faltaba el desvío de las escrituras; la fila de INV-C1; el comentario de `deregister`.
+     - **Más corto:** guardar y recargar, en un bloque con `?`.
+     - **Opcional:** el test del registro tardío dependía de una ventana de 300 ms (ver la ronda 2).
+  2. **En verde, sin bloqueantes ni ajustes; 4 menores, atendidos.** Los arreglos de la ronda 1 están bien, y la salida temprana de `deregister` se lee bajo el lock de los registros, así que entre la lectura y la baja solo puede entrar un cierre. Corrió los tests de esquema y de sync 25 veces seguidas y 12 rondas de 6 procesos en paralelo, sin fallas. Los menores:
+     - **Los dos tests del registro tardío necesitaban la ventana de 300 ms también para pasar,** no solo para detectar sus mutaciones: sin demora, uno fallaba 4 de 20 veces y el otro siempre. Ahora retienen la respuesta del registro hasta que la sala falla cerrada, y con 0 ms pasan 20 de 20. La demora del pedido queda solo para detectar la baja sin el lock.
+     - **La salida temprana de `deregister` también se salteaba la baja de una sala que solo se cerró.** Ahora se la saltea solo si la réplica volvió a abrirse sin fallar cerrada. El test cubre los dos casos.
+     - Una redacción vieja en las interacciones, y dos de estilo (una línea de 102 columnas y un mensaje de `assert_eq!` que faltaba).
+  3. **En verde, sin bloqueantes ni ajustes.** Los arreglos de la ronda 2 están bien: las mutaciones de la salida temprana de `deregister` fallan en los dos casos del test, y con 0 ms los dos tests del registro tardío pasan 30 de 30 veces. Corrió los tests de esquema y de sync 20 veces seguidas y 10 rondas de 6 procesos en paralelo, sin fallas. Un menor opcional, atendido: la baja tampoco se saltea si la réplica reabierta vuelve a fallar cerrada (salen dos bajas, inocuas), así que los documentos dicen "se volvió a abrir y no falla cerrada".
 
 ### Lote 7 · Escrituras (`zemdb-client`)
 **Objetivo:** `write` con su resultado: la decisión de la réplica o el error que corresponde (DC6, DC7, DC21).
@@ -830,4 +925,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. Lote 1 cerrado el 28 de Octubre (`delete_room`), con la revisión de delta en verde. Lote 2 cerrado el mismo día (la encarnación en los chunks del relay), con la revisión de delta en verde. Lote 3 cerrado el mismo día (el esqueleto del cliente: transporte, metadatos y `Client::open`), con la revisión de delta en verde. Lote 4 cerrado el mismo día (apertura, registro, descarte y cierre de las salas), con la revisión de delta en verde. Lote 5 cerrado el 29 de Octubre (el aplicador y `sync`), con la revisión de delta en verde. El próximo es el Lote 6.
+**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. Lote 1 cerrado el 28 de Octubre (`delete_room`), con la revisión de delta en verde. Lote 2 cerrado el mismo día (la encarnación en los chunks del relay), con la revisión de delta en verde. Lote 3 cerrado el mismo día (el esqueleto del cliente: transporte, metadatos y `Client::open`), con la revisión de delta en verde. Lote 4 cerrado el mismo día (apertura, registro, descarte y cierre de las salas), con la revisión de delta en verde. Lote 5 cerrado el 29 de Octubre (el aplicador y `sync`), con la revisión de delta en verde. Lote 6 cerrado el mismo día (el esquema), con la revisión de delta en verde. El próximo es el Lote 7.

@@ -100,6 +100,81 @@ pub fn status(head_seq: u64, epoch: u64, registered: bool) -> RoomStatus {
     }
 }
 
+/// Which of the tasks 1 to 9 `room_id` of `storage` holds.
+pub async fn tasks(storage: &impl StorageEngine, room_id: &RoomId) -> Vec<i64> {
+    let mut tasks = Vec::new();
+    for id in 1..=9 {
+        let row = storage.get(room_id, "tasks", &PrimaryKey::single(id)).await;
+        if row.unwrap().is_some() {
+            tasks.push(id);
+        }
+    }
+    tasks
+}
+
+/// A server with `room-a`, and a client over `storage` with its metadata in `dir`, with the room
+/// open.
+pub async fn setup<S: StorageEngine + Clone + 'static>(
+    dir: &Path,
+    storage: S,
+) -> (TestServer, RoomId, TestTransport, S, Client) {
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let transport = server.transport();
+    let client = open_client(dir, storage.clone(), &transport).await;
+    open_room(&client, &room_id).await.unwrap();
+    (server, room_id, transport, storage, client)
+}
+
+/// The correlation id and the room of `message`, a sync or an ack.
+pub fn request(message: &ClientMessage) -> (CorrelationId, RoomId) {
+    match message {
+        ClientMessage::Sync {
+            correlation_id,
+            room_id,
+            ..
+        }
+        | ClientMessage::Ack {
+            correlation_id,
+            room_id,
+            ..
+        } => (*correlation_id, room_id.clone()),
+        message => panic!("{message:?}"),
+    }
+}
+
+/// Answers the next message of `kind`, a sync or an ack, with what `reply` gives for its
+/// correlation id and room.
+pub fn answer_next(
+    transport: &TestTransport,
+    kind: ClientMessageKind,
+    reply: impl FnOnce(CorrelationId, &RoomId) -> Vec<u8> + Send + 'static,
+) {
+    transport.answer_next(kind, move |message| {
+        let (correlation_id, room_id) = request(message);
+        reply(correlation_id, &room_id)
+    });
+}
+
+/// The syncs sent through `transport`, with their `from_seq`, and the acks, with their
+/// `ack_seq`, in order.
+pub fn requests(transport: &TestTransport) -> Vec<(&'static str, u64)> {
+    let request = |message: ClientMessage| match message {
+        ClientMessage::Sync { from_seq, .. } => Some(("sync", from_seq.get())),
+        ClientMessage::Ack { ack_seq, .. } => Some(("ack", ack_seq.get())),
+        _ => None,
+    };
+    transport.sent().into_iter().filter_map(request).collect()
+}
+
+/// How many deregistrations went through `transport`.
+pub fn deregistrations(transport: &TestTransport) -> usize {
+    let sent = transport.sent();
+    let deregistration =
+        |message: &&ClientMessage| matches!(message, ClientMessage::DeregisterClient { .. });
+    sent.iter().filter(deregistration).count()
+}
+
 /// The pieces of a server keeping its data in a temporary directory, built as the server's tests
 /// build them (without the lock of the data directory and the expiry sweeper of `main`), with the
 /// test secrets.
@@ -175,6 +250,17 @@ impl TestServer {
         room_id: &RoomId,
         ids: impl IntoIterator<Item = i64>,
     ) -> Vec<SequencedOperation> {
+        self.commit_ops(room_id, ids.into_iter().map(insert_task))
+            .await
+    }
+
+    /// Commits each of `ops` to `room_id`, as a client of its own, and returns them with the
+    /// sequences they got.
+    pub async fn commit_ops(
+        &self,
+        room_id: &RoomId,
+        ops: impl IntoIterator<Item = Operation>,
+    ) -> Vec<SequencedOperation> {
         let transport = self.transport();
         let client_id = ClientId::new("bob#writer").unwrap();
         let token = token(&client_id, room_id);
@@ -196,9 +282,8 @@ impl TestServer {
         })
         .await;
         assert!(matches!(registered, ServerMessage::Registered { .. }));
-        let mut ops = Vec::new();
-        for id in ids {
-            let op = insert_task(id);
+        let mut sequenced = Vec::new();
+        for op in ops {
             let reply = send(ClientMessage::Commit {
                 correlation_id,
                 room_id: room_id.clone(),
@@ -211,9 +296,9 @@ impl TestServer {
             let ServerMessage::CommitAck { assigned_seq, .. } = reply else {
                 panic!("{reply:?}");
             };
-            ops.push(SequencedOperation::new(assigned_seq, op));
+            sequenced.push(SequencedOperation::new(assigned_seq, op));
         }
-        ops
+        sequenced
     }
 
     /// A transport to this server's router, called as a `tower` service.
@@ -223,6 +308,7 @@ impl TestServer {
             sent: Arc::default(),
             answer: Arc::default(),
             delay: Arc::default(),
+            delay_next: Arc::default(),
             hold: Arc::default(),
             sync_batch_size: Arc::default(),
         }
@@ -278,6 +364,7 @@ pub struct TestTransport {
     sent: Arc<Mutex<Vec<ClientMessage>>>,
     answer: Arc<Mutex<Option<Box<Answer>>>>,
     delay: Arc<Mutex<Duration>>,
+    delay_next: Arc<Mutex<Option<(ClientMessageKind, Duration)>>>,
     hold: Arc<Mutex<Vec<Hold>>>,
     sync_batch_size: Arc<Mutex<Option<u32>>>,
 }
@@ -309,6 +396,11 @@ impl TestTransport {
     /// Makes every message reach the server `delay` after it is sent.
     pub fn slow(&self, delay: Duration) {
         *self.delay.lock().unwrap() = delay;
+    }
+
+    /// Makes the next message of `kind` reach the server `delay` after it is sent.
+    pub fn slow_next(&self, kind: ClientMessageKind, delay: Duration) {
+        *self.delay_next.lock().unwrap() = Some((kind, delay));
     }
 
     /// Lets every message reach the server.
@@ -434,7 +526,9 @@ impl TestTransport {
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(Body::from(encode_message(&message).unwrap()))
             .unwrap();
-        let (router, delay) = (self.router.clone(), *self.delay.lock().unwrap());
+        let (router, mut delay) = (self.router.clone(), *self.delay.lock().unwrap());
+        let next = (self.delay_next.lock().unwrap()).take_if(|(kind, _)| *kind == message.kind());
+        delay += next.map_or(Duration::ZERO, |(_, next)| next);
         let response = tokio::spawn(async move {
             tokio::time::sleep(delay).await;
             let response = router.oneshot(request).await.unwrap();
@@ -641,6 +735,9 @@ impl RoomFile for TestFile {
     }
 }
 
+/// What a [`TestEngine`] runs before its next `reload_schema`.
+type BeforeReload = Box<dyn FnOnce() + Send>;
+
 /// A storage engine that wraps `E` and fails on demand: [`fail_next`](Self::fail_next) makes the
 /// next call of a method return an error. A close that fails still closes the room, as a disk
 /// engine's does when its last sync fails.
@@ -649,6 +746,7 @@ pub struct TestEngine<E> {
     inner: E,
     failing: Arc<Mutex<Vec<(&'static str, StorageError)>>>,
     slow_open: Arc<Mutex<Option<Duration>>>,
+    before_reload: Arc<Mutex<Option<BeforeReload>>>,
 }
 
 impl<E> TestEngine<E> {
@@ -657,7 +755,13 @@ impl<E> TestEngine<E> {
             inner,
             failing: Arc::default(),
             slow_open: Arc::default(),
+            before_reload: Arc::default(),
         }
+    }
+
+    /// Runs `before` when `reload_schema` is called next, before anything else.
+    pub fn before_next_reload(&self, before: impl FnOnce() + Send + 'static) {
+        *self.before_reload.lock().unwrap() = Some(Box::new(before));
     }
 
     /// Makes the next call of `method` (a method of `StorageEngine`) return `error`.
@@ -689,6 +793,10 @@ impl<E: StorageEngine> StorageEngine for TestEngine<E> {
     }
 
     async fn reload_schema(&self, room_id: &RoomId, schema: Schema) -> Result<(), StorageError> {
+        let before = self.before_reload.lock().unwrap().take();
+        if let Some(before) = before {
+            before();
+        }
         self.check("reload_schema")?;
         self.inner.reload_schema(room_id, schema).await
     }

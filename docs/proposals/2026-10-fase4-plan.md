@@ -308,7 +308,7 @@ Escenarios:
 
 ## 8. Seguimiento
 
-**Avance:** 4.0 cerrada el 23 de Octubre de 2026, con la revisión cruzada en verde. 4.1 cerrada el 25 de Octubre, con la revisión de cierre en verde sobre `977837f`; su [plan por lotes](2026-10-fase4_1-storage-servidor.md) lleva su seguimiento. 4.2 en curso desde el 26 de Octubre, con su [plan por lotes](2026-10-fase4_2-nucleo-replica.md): Lote 0 cerrado el 27 de Octubre, con la revisión cruzada en verde; DC18 a DC23 adoptadas el 28 de Octubre; Lotes 1 (`delete_room`), 2 (la encarnación en los chunks del relay), 3 (el esqueleto del cliente) y 4 (apertura, registro, descarte y cierre) cerrados el mismo día, y 5 (el aplicador y `sync`) el 29 de Octubre. El plan de 4.0 fue este documento más el Lote 0 de `docs/METODOLOGIA.md` §2, en estos pasos:
+**Avance:** 4.0 cerrada el 23 de Octubre de 2026, con la revisión cruzada en verde. 4.1 cerrada el 25 de Octubre, con la revisión de cierre en verde sobre `977837f`; su [plan por lotes](2026-10-fase4_1-storage-servidor.md) lleva su seguimiento. 4.2 en curso desde el 26 de Octubre, con su [plan por lotes](2026-10-fase4_2-nucleo-replica.md): Lote 0 cerrado el 27 de Octubre, con la revisión cruzada en verde; DC18 a DC23 adoptadas el 28 de Octubre; Lotes 1 (`delete_room`), 2 (la encarnación en los chunks del relay), 3 (el esqueleto del cliente) y 4 (apertura, registro, descarte y cierre) cerrados el mismo día, y 5 (el aplicador y `sync`) y 6 (el esquema) el 29 de Octubre. El plan de 4.0 fue este documento más el Lote 0 de `docs/METODOLOGIA.md` §2, en estos pasos:
 
 | Paso | Qué | Estado |
 |---|---|---|

@@ -6,7 +6,6 @@ mod common;
 use common::*;
 use std::future::Future;
 use std::io;
-use std::path::Path;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
@@ -17,49 +16,6 @@ use zemdb_client::{
 use zemdb_core::ClientMessageKind::{Ack, Sync};
 use zemdb_core::*;
 use zemdb_storage::{DiskStorageEngine, MemoryStorageEngine, StorageEngine, StorageError};
-
-/// Which of the tasks 1 to 9 `room_id` of `storage` holds.
-async fn tasks(storage: &impl StorageEngine, room_id: &RoomId) -> Vec<i64> {
-    let mut tasks = Vec::new();
-    for id in 1..=9 {
-        let row = storage.get(room_id, "tasks", &PrimaryKey::single(id)).await;
-        if row.unwrap().is_some() {
-            tasks.push(id);
-        }
-    }
-    tasks
-}
-
-/// A server with `room-a`, and a client over `storage` with its metadata in `dir`, with the room
-/// open.
-async fn setup<S: StorageEngine + Clone + 'static>(
-    dir: &Path,
-    storage: S,
-) -> (TestServer, RoomId, TestTransport, S, Client) {
-    let server = TestServer::new();
-    let room_id = server.create_room("room-a").await;
-    let transport = server.transport();
-    let client = open_client(dir, storage.clone(), &transport).await;
-    open_room(&client, &room_id).await.unwrap();
-    (server, room_id, transport, storage, client)
-}
-
-/// The correlation id and the room of `message`, a sync or an ack.
-fn request(message: &ClientMessage) -> (CorrelationId, RoomId) {
-    match message {
-        ClientMessage::Sync {
-            correlation_id,
-            room_id,
-            ..
-        }
-        | ClientMessage::Ack {
-            correlation_id,
-            room_id,
-            ..
-        } => (*correlation_id, room_id.clone()),
-        message => panic!("{message:?}"),
-    }
-}
 
 fn next(correlation_id: CorrelationId) -> CorrelationId {
     CorrelationId::new(correlation_id.get() + 1)
@@ -102,30 +58,6 @@ fn confirmed(
         head_seq: SequenceNumber::new(head_seq),
     })
     .unwrap()
-}
-
-/// Answers the next message of `kind`, a sync or an ack, with what `reply` gives for its
-/// correlation id and room.
-fn answer_next(
-    transport: &TestTransport,
-    kind: ClientMessageKind,
-    reply: impl FnOnce(CorrelationId, &RoomId) -> Vec<u8> + Send + 'static,
-) {
-    transport.answer_next(kind, move |message| {
-        let (correlation_id, room_id) = request(message);
-        reply(correlation_id, &room_id)
-    });
-}
-
-/// The syncs sent through `transport`, with their `from_seq`, and the acks, with their
-/// `ack_seq`, in order.
-fn requests(transport: &TestTransport) -> Vec<(&'static str, u64)> {
-    let request = |message: ClientMessage| match message {
-        ClientMessage::Sync { from_seq, .. } => Some(("sync", from_seq.get())),
-        ClientMessage::Ack { ack_seq, .. } => Some(("ack", ack_seq.get())),
-        _ => None,
-    };
-    transport.sent().into_iter().filter_map(request).collect()
 }
 
 #[tokio::test]
@@ -655,7 +587,7 @@ async fn only_a_storage_error_after_which_the_room_may_have_changed_reopens_it()
     ] {
         let dir = tempdir().unwrap();
         let storage = TestEngine::new(engine(dir.path()));
-        let (server, room_id, _, storage, client) = setup(dir.path(), storage).await;
+        let (server, room_id, transport, storage, client) = setup(dir.path(), storage).await;
         server.commit(&room_id, 1..=3).await;
         let error = match case {
             "Io" => StorageError::Io(io::Error::other("injected")),
@@ -686,6 +618,7 @@ async fn only_a_storage_error_after_which_the_room_may_have_changed_reopens_it()
             true => assert_eq!(status_now, Err(ClientError::RoomClosed(room_id.clone()))),
             false => assert_eq!(status_now, Ok(status(0, 1, true)), "{case}"),
         }
+        assert_eq!(deregistrations(&transport), 0, "{case}");
     }
 }
 
