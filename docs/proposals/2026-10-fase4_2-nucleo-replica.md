@@ -2,7 +2,7 @@
 
 **Fecha:** 26 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lotes 0 (el contrato), 1 (`delete_room`), 2 (la encarnación en los chunks del relay), 3 (el esqueleto del cliente), 4 (apertura, registro, descarte y cierre), 5 (el aplicador y `sync`) y 6 (el esquema) cerrados. DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 7.
+**Estado:** En curso: Lotes 0 (el contrato), 1 (`delete_room`), 2 (la encarnación en los chunks del relay), 3 (el esqueleto del cliente), 4 (apertura, registro, descarte y cierre), 5 (el aplicador y `sync`), 6 (el esquema) y 7 (las escrituras) cerrados. DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 8.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.2. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -131,7 +131,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 | 4 | Apertura, registro, descarte y cierre | client | DC19, DC12 | K3, K5, K11 | ✅ |
 | 5 | El aplicador y `sync` | client | DC7, DC21 | K1, K12 | ✅ |
 | 6 | El esquema | client | DC5, DC20 | K6, C1 | ✅ |
-| 7 | Escrituras | client | DC6, DC7, DC21 | K2, K15 | ⬜ |
+| 7 | Escrituras | client | DC6, DC7, DC21 | K2, K15 | ✅ |
 | 8 | `heartbeat` y la bajada de snapshots | client | DC20, DC22, DC23 | K7, K2, K12, K15 | ⬜ |
 | 9 | La subida de snapshots | client | DC22, DC23 | K7, K4 | ⬜ |
 | 10 | El arnés de simulación | client (tests) | §5.3 del plan de la fase | K1, K2, K3, K4, K7, K15 | ⬜ |
@@ -830,7 +830,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
      - Una redacción vieja en las interacciones, y dos de estilo (una línea de 102 columnas y un mensaje de `assert_eq!` que faltaba).
   3. **En verde, sin bloqueantes ni ajustes.** Los arreglos de la ronda 2 están bien: las mutaciones de la salida temprana de `deregister` fallan en los dos casos del test, y con 0 ms los dos tests del registro tardío pasan 30 de 30 veces. Corrió los tests de esquema y de sync 20 veces seguidas y 10 rondas de 6 procesos en paralelo, sin fallas. Un menor opcional, atendido: la baja tampoco se saltea si la réplica reabierta vuelve a fallar cerrada (salen dos bajas, inocuas), así que los documentos dicen "se volvió a abrir y no falla cerrada".
 
-### Lote 7 · Escrituras (`zemdb-client`)
+### Lote 7 · Escrituras (`zemdb-client`) · ✅ Hecho
 **Objetivo:** `write` con su resultado: la decisión de la réplica o el error que corresponde (DC6, DC7, DC21).
 
 **Qué se hace:** el `MutationId`, el plazo y el backoff; la reacción a cada respuesta (tabla de §A.4); el head visto (DC21; pasó del Lote 5, que no tenía quien lo leyera), `seen`, los rechazos y los rangos sin reporte retenidos; las esperas con guards RAII; el sync después del `CommitAck`; las resoluciones de DC21; la señal de esquema de `CommitAck`. El comentario de `ErrorCode::Internal` en `zemdb-core` dice que el SDK lo reintenta.
@@ -850,10 +850,177 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 
 **Documentos:** `ARCHITECTURE.md` §11 (las escrituras); `INVARIANTES.md`: K2 y K15.
 
+**Hecho.**
+- **API** (`zemdb-client`):
+  - **`write(room_id, op)`**: un commit de una operación, con un `MutationId` nuevo (aleatorio, de 128 bits). Termina una sola vez, con:
+    - la decisión de la réplica sobre la secuencia asignada, una vez que la aplicó: `Ok`, `ConstraintViolation` o `RowMissing`;
+    - un rechazo del servidor (`Validation`);
+    - un error sin efecto (`Network`);
+    - o `OutcomeUnknown`.
+  - **`ClientError`**, variantes nuevas:
+    - `ConstraintViolation(Violation)`, con la restricción (`Unique`, `ForeignKey` y `Restrict`, con su nombre; `Duplicate` y `NotOwner`);
+    - `RowMissing`;
+    - `OutcomeUnknown`;
+    - `Validation(mensaje)`.
+
+    `From<RejectReason>` da la de cada rechazo de `apply_batch`.
+  - **`ClientConfig`**, campos nuevos: el plazo (`write_timeout`, 30 s) y el backoff (`backoff_base`, 100 ms, y `backoff_max`, 5 s). `Client::open` rechaza con `Config` un backoff que arranca en cero o cuyo tope es menor, y `write`, un plazo que no entra en el reloj.
+  - **Los intentos** (la tabla de §A.4):
+    - Una sala sin registrar se registra antes, bajo el lock de los registros. Un registro sin respuesta válida (sin red, o rechazado por el servidor) se reintenta hasta el plazo.
+    - Cada intento presenta como cursor el head del storage, leído bajo el aplicador, siempre con el mismo `MutationId` y el mismo `ClientId`.
+    - Entre intentos, backoff exponencial con *full jitter*: al azar hasta `backoff_base`, que se duplica en cada reintento hasta `backoff_max`. Con el reloj de Tokio, no se manda ningún intento después del plazo, y en el plazo se cortan un intento, un registro o la espera del aplicador.
+    - Un intento sin respuesta válida, o con `Unavailable`, `Timeout` o `Internal`, queda incierto. Desde ahí, todo final sin `CommitAck` es `OutcomeUnknown`.
+    - `ClientNotRegistered` e `InvalidSequence` dejan la réplica sin registrar, y el intento siguiente se registra con el cursor (que descarta ante `RoomReset` o `InvalidSequence`). `RequestTimeout`, `RoomLocked` y `BehindCompaction` no tuvieron efecto: se reintenta.
+    - `SchemaViolation`, `BadRequest` y `Forbidden` son `Validation`. Cualquier otro error, y el plazo, son `Network`.
+  - **El `CommitAck`** se valida antes de usarlo: su correlación, su sala, su `MutationId` y un catch-up contiguo desde el cursor que, sin `has_more`, llega a la secuencia asignada (vacío, una secuencia no mayor que el cursor: la de un reintento deduplicado). Si no valida, el intento queda incierto. El catch-up pasa por el aplicador como el lote de un sync; si el `CommitAck` anuncia otro esquema o una versión posterior, no se aplica y la réplica se vuelve a registrar (la señal de DC20).
+  - **Después del `CommitAck`,** la escritura sincroniza con `sync` hasta que la réplica aplica su secuencia, con backoff y sin plazo, mientras la sala siga abierta.
+  - **El head visto y `seen`** (DC21; pasaron del Lote 5):
+    - El head visto es el mayor head del servidor que informaron las respuestas de la época, una vez validadas: `Registered` (antes del cambio que lo toma), `SyncBatch`, `AckConfirmed` y, de un `CommitAck`, la mayor entre la secuencia asignada y la última del catch-up.
+    - Antes de su primer intento, con la réplica registrada, la escritura entra en su sala bajo el aplicador con `seen`: el mayor entre el head del storage y el head visto. No se vuelve a tomar en los reintentos (requisito 13).
+  - **Lo retenido.** Mientras haya escrituras sin `CommitAck`, el aplicador retiene, de las secuencias mayores que el menor `seen` de ellas, los rechazos y los rangos que la réplica pasó sin reporte (los de una reapertura). Si no hay, no retiene nada. Al llegar el `CommitAck` con la secuencia `s`, bajo el aplicador:
+    - si `s ≤ seen`, `OutcomeUnknown`: el servidor la había asignado antes del primer intento, así que perdió secuencias y las volvió a asignar (requisito 14);
+    - si `s` es mayor que el head, la escritura espera que el aplicador le entregue la decisión de `s`;
+    - si no, la decisión es la retenida (un rechazo, o `OutcomeUnknown` en un rango sin reporte) u `Ok` (requisito 4).
+  - **El aplicador** entrega, después de cada `apply_batch`, la decisión de cada secuencia a la escritura que la espera y la retiene para las que no tienen `CommitAck`. Una reapertura después de un error del storage deja sin reporte las secuencias entre el head anterior y el reabierto (todas, si el head reabierto no se puede leer).
+  - **Las entradas.** Cada escritura en vuelo es una entrada de su sala, bajo el lock síncrono del estado (ningún `.await` lo cruza). Un guard (`InFlight`) la quita al terminar o al soltar la llamada, y poda lo retenido que ya nadie necesita.
+  - **Las resoluciones** (requisito 1). Cerrar la sala, descartar la réplica o fallar cerrada terminan todas las escrituras en vuelo y vacían lo retenido: lo hace el cambio del aplicador que deja la réplica así. Una escritura con `CommitAck`, o cuyo `CommitAck` llega después, termina con `OutcomeUnknown`; una sin `CommitAck`, con `Network`, o `OutcomeUnknown` si algún intento quedó incierto, también si fue su propio registro el que hizo fallar cerrada la sala. Una reapertura conserva las escrituras: las que esperan una secuencia que la sala reabierta ya tiene sin reporte terminan con `OutcomeUnknown`, y las demás siguen.
+  - **`status`** cuenta las escrituras en vuelo y lo retenido.
+  - **`zemdb-core`:** el comentario de `ErrorCode::Internal` dice que el SDK reintenta un commit con el mismo `MutationId`.
+- **Tests agregados** (33), en `crates/client/tests/write_tests.rs`, contra el servidor en proceso y con el reloj pausado:
+  - `a_write_ends_with_the_decision_of_the_replica_on_its_sequence`: una escritura aceptada (la réplica aplica el catch-up hasta su secuencia), un `Update` de una fila que no existe (`RowMissing`) y una fila con el tag de otra, en una sala con un `UNIQUE` (`ConstraintViolation` con el nombre `tasks_tag`).
+  - `a_lost_reply_is_retried_with_the_same_mutation_id_and_gets_its_sequence`: la respuesta perdida de una escritura aceptada y de una rechazada. El reintento lleva el mismo `MutationId` y recibe la misma secuencia: la sala tiene una operación por escritura.
+  - `a_refusal_after_an_uncertain_attempt_is_an_unknown_outcome`: un primer intento con `Unavailable`, `Timeout`, `Internal` o sin respuesta, y el segundo con `SchemaViolation`: `OutcomeUnknown`. Con `RoomLocked`, `RequestTimeout`, `BehindCompaction` o `ClientNotRegistered` antes, `Validation`. Y `RoomNotFound` después de `Unavailable`, `OutcomeUnknown`.
+  - `an_error_of_the_storage_after_an_uncertain_attempt_is_an_unknown_outcome`: con el motor de prueba, falla leer el head después de un intento incierto.
+  - `a_write_registers_in_the_epoch_of_the_room_before_its_first_attempt`: la sala se recrea mientras la réplica está abierta sin registrar. El registro de la escritura descarta la réplica, y la escritura sigue en la época nueva.
+  - `each_rejection_of_the_replica_is_its_error`: cada `RejectReason`.
+  - `a_refusal_of_the_server_ends_the_write`: una operación con una columna que la sala no tiene (`SchemaViolation` del servidor), y `BadRequest` y `Forbidden` fabricados, son `Validation`; `Unauthorized`, `RoomNotFound`, `SchemaNotFound`, `ProtocolVersionMismatch` y `RoomReset`, `Network`. Un solo intento cada una.
+  - `a_write_without_a_commit_ack_ends_at_its_deadline`: con todo commit respondido con `Unavailable` o sin respuesta, `OutcomeUnknown`; con `RequestTimeout` o `RoomLocked`, `Network`. Termina a los 30 s, con varios intentos y ninguno después del plazo. Sin red, una sala abierta sin registrar reintenta el registro y no manda ningún commit. Un registro y un intento cuya respuesta nunca llega se cortan a los 30 s: `Network` sin ningún commit, y `OutcomeUnknown`.
+  - `a_server_that_asks_to_register_again_gets_the_same_mutation_id_after_it`: `ClientNotRegistered` e `InvalidSequence` fabricados llevan a un registro con el cursor 1 y su encarnación, y a un reintento con el mismo `MutationId` y el mismo cursor. También con el cliente sacado de verdad del roster (`DeregisterClient`).
+  - `a_commit_ack_with_more_syncs_up_to_its_sequence`: con 150 operaciones antes, el catch-up llega a la 100 (`has_more`), y la escritura sincroniza desde 100 hasta 151.
+  - `a_write_does_not_end_before_the_sync_that_applies_its_sequence`: un `CommitAck` fabricado sin catch-up y con `has_more`. Con la respuesta al sync retenida, la escritura sigue en vuelo; al soltarla, termina con la decisión de la secuencia, que un lote siguiente no cambia.
+  - `a_sequence_applied_before_its_commit_ack_comes_takes_the_retained_decision`: con dos rechazos antes del head que la réplica vio al abrir, un sync aplica la secuencia de la escritura mientras su `CommitAck` está retenido. Solo se retiene lo posterior a `seen`: el rechazo de la escritura, o nada si fue aceptada. Con la respuesta del primer intento perdida y la del reintento retenida, lo mismo.
+  - `the_head_seen_comes_from_every_reply_of_the_epoch`: un `SyncBatch`, un `AckConfirmed`, el `CommitAck` de una escritura que se suelta, o la última operación de un catch-up que no se aplica (anuncia otra versión), informan el head 9, y una escritura con la secuencia 5 es `OutcomeUnknown`. No cuentan un `SyncBatch` con un hueco, después del cual una escritura con la secuencia 5 la espera y se aplica, ni uno con el head 9 que llega a un sync de antes de un descarte: una escritura de la época nueva con la secuencia 1 se aplica.
+  - `what_a_write_saw_is_never_below_the_head_of_its_replica`: un `Registered` fabricado con un head menor que el cursor, al reabrir la sala, y un `CommitAck` con la secuencia del head de la réplica: `OutcomeUnknown`.
+  - `a_write_waits_for_a_change_of_the_replica_in_progress`: una escritura que empieza mientras la sala del storage se reabre despacio la espera, se registra y se aplica.
+  - `a_write_with_its_commit_ack_retains_nothing`: un rechazo retenido mientras la escritura espera su `CommitAck` deja de retenerse cuando llega, aunque la escritura siga esperando su secuencia.
+  - `a_sequence_in_a_range_without_a_report_is_an_unknown_outcome`: un sync aplica las secuencias 1 y 2 en un lote que pierde su reporte mientras el `CommitAck` de la 2 está retenido.
+  - `a_write_keeps_what_it_retains_while_a_later_one_waits`: dos escrituras sin `CommitAck` que vieron heads distintos. Lo que retiene la primera, rechazada, sigue mientras la segunda espera.
+  - `a_write_sends_nothing_after_its_deadline_while_the_applier_is_busy`: un sync retiene el aplicador 40 s escribiendo su lote. Una escritura que empieza después termina a los 30 s con `Network`, sin mandar ningún commit.
+  - `a_registration_that_fails_the_room_closed_ends_the_write_without_effect`: el commit recibe `ClientNotRegistered` y el registro de la escritura, un esquema que no evoluciona: `Network`, u `OutcomeUnknown` con un `Unavailable` antes.
+  - `a_reopened_head_that_cannot_be_read_leaves_every_sequence_without_a_report`: con el motor de prueba sobre la capa de archivos, el lote con el rechazo de la escritura pierde su reporte, y el head de la sala reabierta no se puede leer: `OutcomeUnknown`, nunca `Ok`.
+  - `a_write_waiting_for_its_sequence_syncs_with_a_backoff`: con todo sync respondido con `Unavailable`, la escritura sigue esperando su secuencia, con entre 5 y 100 syncs en 60 s.
+  - `the_backoff_is_random_up_to_its_longest_delay`: con el backoff de 100 ms a 100 ms, más de 300 intentos en 30 s, ninguno a más de 100 ms del anterior, y no todos al tope. Un backoff que arranca en cero o con el tope menor es `Config` al abrir, y un plazo de `Duration::MAX` es `Config` al escribir.
+  - `a_write_and_a_sync_of_a_room_that_is_not_registered_register_it_once`: los dos esperan el mismo registro.
+  - `a_commit_ack_at_or_below_the_head_seen_is_an_unknown_outcome`: un `CommitAck` fabricado con la secuencia del head de la réplica, y otro con una secuencia mayor que el head de la réplica pero no que el head del servidor que vio al abrir: `OutcomeUnknown`, sin esperar.
+  - `a_reply_that_does_not_answer_the_commit_leaves_the_attempt_uncertain`: un `CommitAck` de otra mutación, de otra correlación o de otra sala (que, tomado, aplicaría su operación), un rechazo de otra correlación o de otra sala, un catch-up con un hueco, fuera de orden o que no llega a la secuencia sin `has_more`, y bytes que no decodifican. El reintento recibe la respuesta del servidor, y la operación fabricada no se aplica.
+  - `a_commit_ack_that_announces_another_schema_registers_again_before_applying`: un `CommitAck` con la versión 2, con la operación en el catch-up. No se aplica: la réplica se registra, `Registered` no trae cambio, y el sync la aplica.
+  - `with_a_commit_ack_a_reset_a_close_or_failing_closed_end_the_write_unknown`: con el `CommitAck` y la respuesta al sync retenida, la sala recreada (el sync recibe `ClientNotRegistered`, se registra y recibe `RoomReset`) o cerrada; un `CommitAck` con otro esquema, y un `Registered` con uno que no evoluciona (se da de baja una vez); y un `CommitAck` real que llega después de fallar cerrada, que no se aplica. Todas `OutcomeUnknown`.
+  - `without_a_commit_ack_a_reset_a_close_or_failing_closed_end_the_write_without_effect`: con un `RoomLocked` retenido, los mismos casos: `Network`, u `OutcomeUnknown` con un intento perdido antes. Ningún intento después.
+  - `a_write_whose_batch_lost_its_report_is_an_unknown_outcome`: con la capa de archivos de prueba, falla el `sync_data` del WAL al aplicar el catch-up: la sala reabre con la secuencia y la escritura es `OutcomeUnknown`. Con lotes de 1, una escritura que espera la secuencia 3 sigue después de una reapertura en 2, y termina con la decisión de la 3.
+  - `two_writes_at_once_end_with_the_decisions_of_their_sequences`: dos a la vez, y dos con el mismo tag: la primera del log lo tiene y la otra es `ConstraintViolation`.
+  - `a_write_to_a_room_that_is_closed_or_fails_closed_sends_nothing`: `RoomClosed` y `FailedClosed`.
+  - `a_write_cut_at_any_point_leaves_nothing_in_flight_or_retained`: una escritura y un sync a la vez, cortados después de 1, 2, … polls (unos 15 puntos, 9 con un rechazo retenido): no queda nada en vuelo ni retenido, y la escritura siguiente se aplica.
+- **Fixtures** (`crates/client/tests/common/`):
+  - `TestTransport::lose_next_reply` hace llegar el próximo mensaje de un tipo al servidor y pierde su respuesta;
+  - `TestServer::create_room_with` crea una sala con otro esquema;
+  - `commits` (los commits mandados, con su `MutationId` y su cursor) y `update_task`;
+  - `request` y `answer_next` toman también un commit.
+  - `tokio` con `test-util` en las dev-dependencies, para el reloj pausado.
+- Contra el esqueleto (`write` devolvía `Ok` sin mandar nada) fallaban por comportamiento los 18 tests del primer borrador; el de los cortes, después de exigir que la escritura siguiente se aplique. Los demás llegaron con la verificación de mutaciones y con la revisión de delta.
+- **Mutaciones verificadas** (77, todas detectadas; ocho dejan una escritura en un ciclo sin fin y las corta el timeout):
+  - los intentos:
+    - otro `MutationId` en cada intento;
+    - sin plazo (ciclo); sin cortar en el plazo un intento, un registro o la espera del aplicador; o mandar después del plazo, una vez libre el aplicador;
+    - un backoff que no se acota al plazo, que no se duplica, sin tope, sin *jitter*, o ninguno (ciclo); ninguno después del `CommitAck`;
+    - aceptar cualquier backoff, o un plazo que no entra en el reloj (pánico);
+    - registrarse sin el lock de los registros;
+  - la reacción a cada respuesta:
+    - `Unavailable`, `Timeout` e `Internal` sin dejar el intento incierto, o terminando la escritura; una respuesta inválida, o ninguna, que no lo deja incierto;
+    - después de un intento incierto: un rechazo, otro error final, el plazo, una escritura terminada por su sala, un error del storage o del registro que no son `OutcomeUnknown`;
+    - el error del registro de una escritura que su sala terminó, tal cual;
+    - `SchemaViolation`, `BadRequest` y `Forbidden` sin `Validation`;
+    - `ClientNotRegistered` e `InvalidSequence` sin registrarse, o terminando la escritura; `RequestTimeout`, `RoomLocked` y `BehindCompaction` terminando la escritura;
+    - tomar un rechazo de otra correlación o de otra sala;
+    - terminar una escritura sin red en lugar de reintentar el registro;
+  - el `CommitAck`:
+    - tomar uno de otra correlación, de otra sala o de otra mutación (ciclo);
+    - no validar su catch-up (ciclo), tomar una secuencia que el catch-up no alcanza, o exigirla también con `has_more`;
+    - no aplicar el catch-up, o ignorar el esquema que anuncia;
+  - el head visto y `seen`:
+    - no tomarlo de `Registered`, `SyncBatch`, `AckConfirmed` o `CommitAck` (o de un `CommitAck` sin la última del catch-up), tomarlo de otra época, o de un lote antes de validarlo;
+    - `seen` solo con el head de la réplica, o solo con el head visto; tomarlo fuera del aplicador, en cada intento o antes de registrarse;
+    - una escritura terminada por su sala que sigue;
+  - la decisión al llegar el `CommitAck`:
+    - `Ok` para una secuencia mayor que el head, o sin compararla antes con `seen`;
+    - `Ok` sin lo retenido para una no mayor que el head, o lo retenido para una no mayor que `seen`;
+    - no podar al pasar a esperar;
+    - la decisión retenida de un rango, solo en su primera secuencia;
+  - el aplicador:
+    - no entregar las decisiones de un lote (ciclo), o no retenerlas;
+    - entregarlas a una escritura que espera una secuencia posterior, o pisar una decisión ya entregada;
+    - una reapertura sin rango sin reporte (ciclo), o sin él cuando el head reabierto no se puede leer;
+  - lo retenido: no podar nunca, podar por el `seen` más alto, o retener también la secuencia vista;
+  - las entradas:
+    - un guard que no quita la entrada, o que no poda;
+    - cerrar, descartar o fallar cerrado sin terminar las escrituras, o fallar cerrado sin terminarlas;
+    - una escritura sin entrada que termina con `Ok`;
+    - no sincronizar después del `CommitAck`, o no mirar la decisión antes;
+  - `status` sin las escrituras o sin lo retenido;
+  - un rechazo por una clave foránea como un `Restrict`.
+- **Interacciones revisadas:**
+  - **El dedup del servidor (INV-Y4) y el orden del commit.** El servidor busca el `MutationId` en el dedup antes de la retención y de validar la operación, y después de verificar el registro y el cursor (`ensure_registered`, `check_within_head`). Así un reintento después de `ClientNotRegistered` o de `InvalidSequence`, que no secuenciaron nada, recibe la secuencia del primer intento si ese llegó (test con el cliente sacado del roster), y un reintento después de una respuesta perdida, la misma secuencia (test). Un reintento de una mutación ya secuenciada que quedó detrás del log recibe su secuencia con un catch-up vacío y `has_more` (el test del servidor lo fija): la escritura espera su secuencia con syncs, y hasta el Lote 8 el sync espera un snapshot.
+  - **El aplicador (Lote 5).** El catch-up de un `CommitAck` pasa por `apply`, con su época, el prefijo, el hueco y la reapertura. La entrada de una escritura pasa a esperar su secuencia bajo el aplicador antes de aplicar el catch-up, así que la entrega la alcanza; y `seen` se toma bajo el aplicador, así que toda secuencia mayor que `seen` que se entrega después queda retenida. Un sync que aplica la secuencia antes del `CommitAck` la retiene (test).
+  - **El esquema (Lote 6).** La señal de `CommitAck` usa `changes` en el mismo `apply`. El catch-up nunca hace fallar cerrado por sí mismo: una operación que no valida deja la réplica sin registrar, y es el sync de la escritura el que aplica la regla de DC20. Fallar cerrado termina las escrituras (tests).
+  - **El registro y el descarte (Lote 4).** La escritura se registra bajo el lock de los registros, como un sync. Un descarte termina las escrituras en vuelo, y un registro que descarta antes del primer intento deja a la escritura seguir en la época nueva (test).
+  - **`check_operation_size`.** El servidor rechaza con `BadRequest` una operación que no entra en el log o en una respuesta, antes de secuenciar: es `Validation`, como un `BadRequest` fabricado (test). Una operación real de ese tamaño queda en una ventana de pocos bytes bajo el tope del frame, y no se armó.
+  - **El presupuesto de respuestas del servidor.** Sin lugar, el servidor confirma el commit sin catch-up y con `has_more`: es un `CommitAck` válido, y la escritura sincroniza (test con un `CommitAck` fabricado así).
+  - **Escrituras y syncs a la vez.** Las entregas y las entradas van bajo el aplicador y el lock del estado, y `status` lee sin esperar el aplicador. Dos escrituras a la vez terminan cada una con la decisión de su secuencia (test).
+  - **El motor en memoria.** Una reapertura en 0 vuelve a aplicar las secuencias con su reporte, y las decisiones son las mismas (INV-Y8): una escritura que espera sigue, y lo retenido se reescribe igual. No hay un rango sin reporte, porque la sala reabre por detrás.
+  - **El aplicador retenido más allá del plazo.** Un cambio largo del aplicador (un lote que escribe despacio; en el Lote 8, la instalación de un snapshot) no deja que una escritura mande después del plazo: la espera del aplicador se corta en el plazo, y el plazo se mira otra vez antes de registrarse o de mandar (test).
+  - **Un registro y un sync a la vez.** La escritura se registra bajo el mismo lock que el sync y la apertura, así que una sala sin registrar se registra una vez (test), y la baja de DC20 va después de un registro en vuelo de una escritura, como de uno de un sync.
+  - **Un commit demorado de antes de un descarte.** El commit no lleva la encarnación: si llega al servidor después de que el cliente se registró en la sala recreada, se secuencia ahí. La escritura termina como incierta (el descarte la termina), pero su operación queda en la sala nueva (la revisión lo reprodujo con un commit demorado 5 s). Queda como límite aceptado en INV-K2; cerrarlo pediría la encarnación en el commit, como DC23 en los chunks.
+  - **El reloj pausado.** Los tests corren con `start_paused`; el motor en disco hace su E/S en `spawn_blocking`, que frena el avance automático del reloj, así que un plazo no vence mientras el storage trabaja.
+- **Desvíos:**
+  - Una secuencia asignada no mayor que `seen` es `OutcomeUnknown` aunque sea mayor que el head de la réplica. DC21 primero comparaba con el head, y una así esperaba la decisión de esa secuencia, de otra operación. Con un servidor que no pierde secuencias, nunca pasa.
+  - `BehindCompaction` en un commit es un intento sin efecto, que se reintenta. Dejar la réplica esperando un snapshot y ponerse al día dentro del plazo llegan con el Lote 8. Hasta entonces, una escritura detrás del log termina con `Network` en el plazo.
+  - Hasta el Lote 8, una escritura con `CommitAck` cuya réplica espera un snapshot sigue esperando hasta que la sala se cierre.
+  - `ConstraintViolation` lleva un `Violation` con la restricción de cada clase, con su nombre cuando lo tiene, en lugar de `{ constraint, kind }` (§7 de la Fase 3.11).
+  - La reacción a cada código es la de §A.4, con el error de 4.2 que corresponde: `Forbidden` es `Validation` (§A.1: permanente para ese token), y `Unauthorized` sin token nuevo, `RoomNotFound`, `SchemaNotFound`, `ProtocolVersionMismatch`, `RoomReset` y los demás, `Network`.
+  - Un registro de la escritura que el servidor rechaza se reintenta hasta el plazo, como uno sin red: el registro del Lote 4 da `Network` en los dos casos.
+  - La validación de la configuración (el backoff al abrir, el plazo al escribir) no estaba en el plan: sin ella, un backoff en cero deja girando sin pausa a una escritura que espera su secuencia, y un plazo enorme hace entrar en pánico a `write`.
+  - El head visto de `HeartbeatAck` llega con el Lote 8, que trae los heartbeats.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura):
+  1. **No en verde: 5 ajustes y varios menores.** Corrió los tests de escritura, de sync y de esquema 125 veces cada uno (20 seguidas, 15 rondas de 3 procesos en paralelo y 10 de 6), sin fallas. Todo quedó atendido:
+     - **Se mandaba un intento después del plazo.** Lo reprodujo con un sync que retiene el aplicador 40 s: la escritura mandaba su commit a los 39,95 s. Ahora la espera del aplicador se corta en el plazo, y el plazo se mira otra vez antes de registrarse o de mandar. Hay test.
+     - **El error del registro de la escritura pasaba tal cual.** Un registro que hacía fallar cerrada la sala terminaba la escritura con `FailedClosed`, y sin `OutcomeUnknown` después de un intento incierto. Ahora, si la sala terminó la escritura, es `Network`, u `OutcomeUnknown` después de un intento incierto. Hay tests, también del otro error del registro (el del storage).
+     - **Un head reabierto que no se puede leer se descartaba.** Una escritura rechazada terminaba con `Ok` (con fallas inyectadas). Ahora todo queda sin reporte. Hay test.
+     - **Siete reglas sin test:**
+       - el head visto de la última del catch-up, y no tomarlo de un lote antes de validarlo;
+       - el backoff después del `CommitAck`, su tope y su *jitter*;
+       - el lock de los registros;
+       - el error del registro de la escritura.
+
+       Ahora hay tests.
+     - **Faltaba una interacción:** el commit demorado de antes de un descarte, que se secuencia en la sala nueva. Queda como límite aceptado en INV-K2.
+     - **Menores:**
+       - el head visto de `Registered` va antes del cambio (argumentado, sin test: la carrera es estrecha y solo debilita la detección de D78);
+       - la configuración se valida;
+       - el registro rechazado que se reintenta queda como desvío;
+       - el head visto de `HeartbeatAck`, nombrado en el Lote 8;
+       - el anidado de §11;
+       - `status` más corto.
+
+     Queda sin test, por conservador, empezar el rango de una reapertura en el head anterior: una decisión con su reporte pasaría a incierta.
+  2. **En verde, sin bloqueantes ni ajustes.** Los arreglos de la ronda 1 están bien y tienen test, y las mutaciones de cada uno fallan (dos por timeout). Corrió los tests de escritura, de sync y de esquema 98 veces cada uno (20 seguidas, 10 rondas de 3 procesos en paralelo y 8 de 6), sin fallas. Cuatro menores, atendidos:
+     - el head visto de `Registered` antes del cambio queda argumentado, sin test (su mutación sobrevive);
+     - §11 dice que un head reabierto que no se puede leer deja sin reporte todas las secuencias posteriores, y nombra los `Config` del backoff y del plazo;
+     - lo que garantiza el plazo es que no sale ningún intento después (un registro en curso se corta), no que no salga nada;
+     - con un head reabierto que no se lee, mientras una escritura vieja sin `CommitAck` retiene el rango hasta `u64::MAX`, una posterior que se aplicó con su reporte termina `OutcomeUnknown` en lugar de `Ok`. Nunca da un `Ok` falso, solo pasa con fallas inyectadas y dura a lo sumo el plazo de la vieja: queda así.
+
 ### Lote 8 · `heartbeat` y la bajada de snapshots (`zemdb-client`)
 **Objetivo:** que un cliente atrasado termine al día (DC22, INV-K7).
 
-**Qué se hace:** `heartbeat` y su reacción (la señal de esquema, el head menor, la bajada si la espera, y el `snapshot_wanted` que confirma, que sube el Lote 9); un registro que deja al cliente detrás del log (`cursor < tail_seq − 1`) también lo deja esperando un snapshot (hasta este lote, lo detecta el sync siguiente, con `BehindCompaction`); la bajada por chunks, con su validación, el tope, `SnapshotSuperseded`, `RoomNotFound` en el chunk 0, el BLAKE3 y `apply_snapshot` en una tarea propia del aplicador, con DC20 ante sus errores; el commit que recibe `BehindCompaction` se pone al día y reintenta dentro del plazo; una sala que falla cerrada no manda heartbeats.
+**Qué se hace:** `heartbeat` y su reacción (la señal de esquema, el head menor, el head visto de DC21, la bajada si la espera, y el `snapshot_wanted` que confirma, que sube el Lote 9); un registro que deja al cliente detrás del log (`cursor < tail_seq − 1`) también lo deja esperando un snapshot (hasta este lote, lo detecta el sync siguiente, con `BehindCompaction`); la bajada por chunks, con su validación, el tope, `SnapshotSuperseded`, `RoomNotFound` en el chunk 0, el BLAKE3 y `apply_snapshot` en una tarea propia del aplicador, con DC20 ante sus errores; el commit que recibe `BehindCompaction` se pone al día y reintenta dentro del plazo; una sala que falla cerrada no manda heartbeats.
 
 **Tests exigidos.**
 - Un cliente que entra a una sala podada baja el snapshot activo, lo aplica y sincroniza; sin snapshot usable (`RoomNotFound`), espera y lo baja cuando un heartbeat lo anuncia.
@@ -925,4 +1092,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. Lote 1 cerrado el 28 de Octubre (`delete_room`), con la revisión de delta en verde. Lote 2 cerrado el mismo día (la encarnación en los chunks del relay), con la revisión de delta en verde. Lote 3 cerrado el mismo día (el esqueleto del cliente: transporte, metadatos y `Client::open`), con la revisión de delta en verde. Lote 4 cerrado el mismo día (apertura, registro, descarte y cierre de las salas), con la revisión de delta en verde. Lote 5 cerrado el 29 de Octubre (el aplicador y `sync`), con la revisión de delta en verde. Lote 6 cerrado el mismo día (el esquema), con la revisión de delta en verde. El próximo es el Lote 7.
+**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. Lote 1 cerrado el 28 de Octubre (`delete_room`), con la revisión de delta en verde. Lote 2 cerrado el mismo día (la encarnación en los chunks del relay), con la revisión de delta en verde. Lote 3 cerrado el mismo día (el esqueleto del cliente: transporte, metadatos y `Client::open`), con la revisión de delta en verde. Lote 4 cerrado el mismo día (apertura, registro, descarte y cierre de las salas), con la revisión de delta en verde. Lote 5 cerrado el 29 de Octubre (el aplicador y `sync`), con la revisión de delta en verde. Lote 6 cerrado el mismo día (el esquema), con la revisión de delta en verde. Lote 7 cerrado el mismo día (las escrituras), con la revisión de delta en verde en su segunda ronda. El próximo es el Lote 8.

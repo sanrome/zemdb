@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// Clients decide how to react from the code: `Unauthorized` asks for a new token,
 /// `Forbidden` is permanent, `ClientNotRegistered` asks to register again, and `Unavailable`,
-/// `Timeout` and `RequestTimeout` may be retried (commits are deduplicated by `MutationId`).
+/// `Timeout`, `Internal` and `RequestTimeout` may be retried (commits are deduplicated by
+/// `MutationId`).
 ///
 /// Encoded by variant index, so new codes are appended at the end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -22,7 +23,8 @@ pub enum ErrorCode {
     BehindCompaction,
     RateLimited,
     RoomLocked,
-    /// An unexpected server failure. Not retried automatically.
+    /// An unexpected server failure, after which the request may have taken effect. The client
+    /// SDK retries a commit with the same `MutationId`, which deduplication makes safe.
     Internal,
     /// The client token is missing, malformed, wrongly signed or expired; the client needs a
     /// new token.

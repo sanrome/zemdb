@@ -1,12 +1,15 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+use tokio::time::Instant;
+use uuid::Uuid;
 use zemdb_core::{
-    decode_message, ClientId, ClientMessage, CorrelationId, ErrorCode, RoomId, SchemaId,
-    SequenceNumber, SequencedOperation, ServerMessage,
+    decode_message, ClientId, ClientMessage, CorrelationId, ErrorCode, MutationId, Operation,
+    RoomId, SchemaId, SequenceNumber, SequencedOperation, ServerMessage,
 };
 use zemdb_storage::{StorageEngine, StorageError};
 
@@ -15,6 +18,7 @@ use crate::{ClientConfig, ClientError, MetadataStore, RoomMetadata, TransportCli
 /// The client of a device: one replica per room it opens.
 pub struct Client {
     client_id: ClientId,
+    config: ClientConfig,
     local: Local,
     transport: Box<dyn TransportClient>,
     /// Every room the client opened, open or not: a room keeps its epoch while the client lives.
@@ -68,6 +72,7 @@ struct State {
     epoch: u64,
     /// The token of the last `open_room`.
     token: String,
+    writes: Writes,
 }
 
 /// The replica of a room.
@@ -111,6 +116,167 @@ impl OpenReplica {
     }
 }
 
+/// The writes in flight in a room, and what its applier retains for them. A replica that is not
+/// open, or fails closed, has none.
+#[derive(Default)]
+struct Writes {
+    /// The highest head of the server that the replies of the epoch reported.
+    head_seen: SequenceNumber,
+    entries: HashMap<MutationId, Entry>,
+    /// The decisions other than `Ok` of the sequences after the lowest `seen` of the writes
+    /// without their `CommitAck`, by their first sequence, with their last: a rejection, or a
+    /// range the replica passed without a report, whose outcome is unknown.
+    retained: BTreeMap<SequenceNumber, (SequenceNumber, ClientError)>,
+}
+
+/// A write in flight.
+enum Entry {
+    /// Without its `CommitAck`: the applier retains the decisions of the sequences after
+    /// `seen`, the head the write saw before its first attempt, which its sequence is after.
+    Sent { seen: SequenceNumber },
+    /// With its `CommitAck`: its sequence, and the decision of the replica on it once it has
+    /// one.
+    Acked {
+        seq: SequenceNumber,
+        decision: Option<Result<(), ClientError>>,
+    },
+}
+
+/// The decision of the replica on `seq` that `retained` keeps: `Ok` unless it keeps another.
+fn decision(
+    retained: &BTreeMap<SequenceNumber, (SequenceNumber, ClientError)>,
+    seq: SequenceNumber,
+) -> Result<(), ClientError> {
+    match retained.range(..=seq).next_back() {
+        Some((_, (last, err))) if seq <= *last => Err(err.clone()),
+        _ => Ok(()),
+    }
+}
+
+impl Writes {
+    /// The lowest `seen` of the writes without their `CommitAck`.
+    fn seen(&self) -> Option<SequenceNumber> {
+        let sent = self.entries.values().filter_map(|entry| match entry {
+            Entry::Sent { seen } => Some(*seen),
+            Entry::Acked { .. } => None,
+        });
+        sent.min()
+    }
+
+    /// Drops what no write without its `CommitAck` needs.
+    fn prune(&mut self) {
+        let seen = self.seen();
+        let needed = |last: &SequenceNumber| seen.is_some_and(|seen| *last > seen);
+        self.retained.retain(|_, (last, _)| needed(last));
+    }
+
+    /// Takes the decisions of the sequences the replica applied, up to `head`: `Ok`, but for
+    /// the ranges of `decisions`. The writes waiting for one of them get it (the head moves
+    /// through every sequence after theirs), and the writes without their `CommitAck` retain
+    /// them.
+    fn applied(
+        &mut self,
+        head: SequenceNumber,
+        decisions: impl IntoIterator<Item = (SequenceNumber, SequenceNumber, ClientError)>,
+    ) {
+        let decisions = decisions
+            .into_iter()
+            .map(|(first, last, err)| (first, (last, err)));
+        self.retained.extend(decisions);
+        for entry in self.entries.values_mut() {
+            if let Entry::Acked {
+                seq,
+                decision: slot,
+            } = entry
+            {
+                if slot.is_none() && *seq <= head {
+                    *slot = Some(decision(&self.retained, *seq));
+                }
+            }
+        }
+        self.prune();
+    }
+
+    /// Takes the `CommitAck` of the write `mutation_id`, which assigns it `seq`, with the
+    /// replica at `head` (`None` if it could not be read). A sequence after the head is waited
+    /// for, and one at or below it takes the decision retained; one at or below what the write
+    /// saw is unknown, since the server sequenced it before the write's first attempt: it lost
+    /// the sequences after it and assigned them again.
+    fn acked(
+        &mut self,
+        mutation_id: &MutationId,
+        seq: SequenceNumber,
+        head: Option<SequenceNumber>,
+    ) {
+        let Some(&Entry::Sent { seen }) = self.entries.get(mutation_id) else {
+            return;
+        };
+        let decision = match head {
+            Some(head) if seq > seen && seq > head => None,
+            Some(_) if seq > seen => Some(decision(&self.retained, seq)),
+            _ => Some(Err(ClientError::OutcomeUnknown)),
+        };
+        let acked = Entry::Acked { seq, decision };
+        self.entries.insert(*mutation_id, acked);
+        self.prune();
+    }
+}
+
+/// A write in flight in a room, from before its first attempt: its entry leaves the room when
+/// the write ends or its call is dropped.
+struct InFlight {
+    room: Arc<Room>,
+    mutation_id: MutationId,
+}
+
+impl InFlight {
+    /// Enters the write `mutation_id` in `room`, whose replica is at `head`, under its applier:
+    /// it saw the higher of `head` and the head seen.
+    fn new(room: &Arc<Room>, mutation_id: MutationId, head: SequenceNumber) -> Self {
+        let writes = &mut room.state().writes;
+        let seen = head.max(writes.head_seen);
+        writes.entries.insert(mutation_id, Entry::Sent { seen });
+        Self {
+            room: Arc::clone(room),
+            mutation_id,
+        }
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let writes = &mut self.room.state().writes;
+        if writes.entries.remove(&self.mutation_id).is_some() {
+            writes.prune();
+        }
+    }
+}
+
+/// The delays between the retries of a step: a random one up to `backoff_base`, doubled after
+/// each retry up to `backoff_max` (full jitter).
+struct Backoff {
+    base: Duration,
+    max: Duration,
+    retries: u32,
+}
+
+impl Backoff {
+    fn new(config: &ClientConfig) -> Self {
+        Self {
+            base: config.backoff_base,
+            max: config.backoff_max,
+            retries: 0,
+        }
+    }
+
+    fn next(&mut self) -> Duration {
+        let ceiling = (self.base.saturating_mul(2u32.saturating_pow(self.retries))).min(self.max);
+        self.retries = self.retries.saturating_add(1);
+        let random = Uuid::new_v4().as_u128() % (ceiling.as_nanos() + 1);
+        Duration::from_nanos(u64::try_from(random).unwrap_or(u64::MAX))
+    }
+}
+
 /// Whether a reply that announces the version `version` of the schema `schema_id` changes the
 /// schema of a replica with `metadata`: another schema, or a later version of its own. An
 /// earlier version of its own comes in a delayed reply.
@@ -134,6 +300,30 @@ impl Room {
             if let Replica::Open(open) = &mut state.replica {
                 change(open);
             }
+        }
+    }
+
+    /// Takes `head`, a head of the server that a reply to a request of `epoch` reported.
+    fn saw(&self, epoch: u64, head: SequenceNumber) {
+        let mut state = self.state();
+        if state.epoch == epoch {
+            let writes = &mut state.writes;
+            writes.head_seen = writes.head_seen.max(head);
+        }
+    }
+
+    /// Whether the write `mutation_id` is still in flight: closing the room, discarding its
+    /// replica or failing it closed ends every write.
+    fn in_flight(&self, mutation_id: &MutationId) -> bool {
+        self.state().writes.entries.contains_key(mutation_id)
+    }
+
+    /// The decision of the write `mutation_id`, with its `CommitAck`, once it has one: an
+    /// unknown outcome if its room ended it.
+    fn decision(&self, mutation_id: &MutationId) -> Option<Result<(), ClientError>> {
+        match self.state().writes.entries.get(mutation_id) {
+            Some(Entry::Acked { decision, .. }) => decision.clone(),
+            _ => Some(Err(ClientError::OutcomeUnknown)),
         }
     }
 
@@ -173,6 +363,14 @@ enum Applied {
     Schema,
 }
 
+/// The last of `ops`, or `from_seq` if there are none, if they are the operations after
+/// `from_seq` in order.
+fn last_after(from_seq: SequenceNumber, ops: &[SequencedOperation]) -> Option<SequenceNumber> {
+    let in_order = (ops.iter().zip(1..))
+        .all(|(op, index)| op.seq.get().checked_sub(index) == Some(from_seq.get()));
+    in_order.then(|| ops.last().map_or(from_seq, |op| op.seq))
+}
+
 /// Whether `ops`, of a batch with `head_seq` and `has_more` in reply to a sync after `from_seq`,
 /// are the operations after it in order, up to the head at most and, unless there are more,
 /// reaching it.
@@ -182,17 +380,15 @@ fn follows(
     ops: &[SequencedOperation],
     has_more: bool,
 ) -> bool {
-    let in_order = (ops.iter().zip(1..))
-        .all(|(op, index)| op.seq.get().checked_sub(index) == Some(from_seq.get()));
-    let last = ops.last().map_or(from_seq, |op| op.seq);
     // A batch with more brings some.
-    in_order
-        && last <= head_seq
-        && if has_more {
-            !ops.is_empty()
-        } else {
-            last == head_seq
-        }
+    last_after(from_seq, ops).is_some_and(|last| {
+        last <= head_seq
+            && if has_more {
+                !ops.is_empty()
+            } else {
+                last == head_seq
+            }
+    })
 }
 
 /// The client id of `person` on the device `device_id`: `person#device`, with the device id in
@@ -215,8 +411,8 @@ impl Client {
     /// [`MemoryMetadata`](crate::MemoryMetadata). Its client id is `person#device`, with the
     /// device id that `metadata` keeps.
     ///
-    /// An invalid person is `Config`, before `metadata` is touched; an error of `metadata`,
-    /// `Storage`.
+    /// An invalid person or backoff is `Config`, before `metadata` is touched; an error of
+    /// `metadata`, `Storage`.
     pub async fn open(
         config: ClientConfig,
         storage: impl StorageEngine + 'static,
@@ -225,9 +421,16 @@ impl Client {
     ) -> Result<Self, ClientError> {
         // Every device id makes a valid client id if one does.
         client_id(&config.person, 0)?;
+        if config.backoff_base.is_zero() || config.backoff_max < config.backoff_base {
+            return Err(ClientError::Config(
+                "The backoff must start above zero, and its longest delay must not be shorter"
+                    .to_string(),
+            ));
+        }
         let device_id = metadata.open().await?;
         Ok(Self {
             client_id: client_id(&config.person, device_id)?,
+            config,
             local: Local {
                 storage: Arc::new(storage),
                 metadata: Arc::new(metadata),
@@ -326,6 +529,7 @@ impl Client {
                 ServerMessage::Registered {
                     correlation_id: reply_id,
                     room_id,
+                    head_seq,
                     schema_id,
                     schema,
                     room_incarnation,
@@ -334,6 +538,7 @@ impl Client {
                     && room_id == room.id
                     && incarnation.is_none_or(|known| known == room_incarnation) =>
                 {
+                    room.saw(epoch, head_seq);
                     let metadata = RoomMetadata {
                         room_incarnation,
                         schema_id,
@@ -415,7 +620,8 @@ impl Client {
     }
 
     /// Runs `change` on `room` under its applier, in a task of its own, once the changes before
-    /// it ended: a caller that stops waiting does not cut it halfway.
+    /// it ended: a caller that stops waiting does not cut it halfway. A replica that is not open
+    /// after it, or fails closed, ends the writes in flight, and retains nothing.
     async fn change<T, F>(
         &self,
         room: &Arc<Room>,
@@ -427,9 +633,15 @@ impl Client {
     {
         let applier = Arc::clone(&room.applier).lock_owned().await;
         let change = change(self.local.clone(), Arc::clone(room));
+        let room = Arc::clone(room);
         let task = tokio::spawn(async move {
             let _applier = applier;
-            change.await
+            let changed = change.await;
+            let mut state = room.state();
+            if !matches!(&state.replica, Replica::Open(open) if !open.failed_closed) {
+                state.writes = Writes::default();
+            }
+            changed
         });
         task.await
             .map_err(|err| ClientError::Storage(format!("A change of the replica failed: {err}")))?
@@ -560,6 +772,7 @@ impl Client {
                     "Invalid batch in reply to a sync".to_string(),
                 ));
             }
+            room.saw(epoch, head_seq);
             let applied = move |local: Local, room| local.apply(room, epoch, ops, schema, again);
             let head = match self.change(&room, applied).await {
                 Ok(Applied::Head(head)) => head,
@@ -593,6 +806,7 @@ impl Client {
                     ack_seq,
                     head_seq,
                 } if reply_id == correlation_id && room_id == room.id && ack_seq == head => {
+                    room.saw(epoch, head_seq);
                     if head_seq >= head {
                         return Ok(());
                     }
@@ -606,6 +820,186 @@ impl Client {
         }
     }
 
+    /// Writes `op` to `room_id`: commits it, and returns the decision of the replica on the
+    /// sequence the server assigned it (`Ok`, `ConstraintViolation` or `RowMissing`) once the
+    /// replica applied it, catching up with syncs if the `CommitAck` does not reach it. A room
+    /// that is not registered registers first.
+    ///
+    /// Until its `CommitAck`, it retries with a backoff, with the same mutation id, which the
+    /// server deduplicates. It sends no attempt after the deadline of the configuration (one
+    /// beyond the clock is `Config`), at which an attempt, a registration or the wait for the
+    /// applier still in progress are cut. An
+    /// attempt without a valid reply, or with `Unavailable`, `Timeout` or `Internal`, may have
+    /// been sequenced: from then on, the write ends as `OutcomeUnknown` unless a `CommitAck`
+    /// comes. `ClientNotRegistered` and `InvalidSequence` register the replica again with its
+    /// cursor, and `RequestTimeout`, `RoomLocked` and `BehindCompaction` had no effect: it
+    /// retries after them, and after a registration without a valid reply. `SchemaViolation`,
+    /// `BadRequest` and `Forbidden` are `Validation`, and any other error, the deadline, or the
+    /// room closed, discarded or failing closed end it with `Network`: without an uncertain
+    /// attempt, the write had no effect.
+    ///
+    /// A `CommitAck` is checked before it is used: its correlation id, its room, its mutation
+    /// id, and a catch-up that follows the cursor of the commit in order and, unless it has
+    /// more, reaches the sequence. From before its first attempt until its `CommitAck`, the
+    /// room retains the rejections, and the sequences applied without a report, after the
+    /// head the write saw then, which its sequence is after: a sequence the replica applied
+    /// before the `CommitAck` takes the decision retained, and one at or below that head is an
+    /// unknown outcome. After the `CommitAck`, it waits for its sequence without a deadline: if
+    /// the room is closed, its replica discarded, or failing closed before the replica applies
+    /// it with its report, the outcome is unknown.
+    pub async fn write(&self, room_id: RoomId, op: Operation) -> Result<(), ClientError> {
+        let room = self.room(&room_id)?;
+        let mutation_id = MutationId::from(Uuid::new_v4().as_u128());
+        let deadline = (Instant::now().checked_add(self.config.write_timeout))
+            .ok_or_else(|| ClientError::Config("The write timeout is too long".to_string()))?;
+        let mut backoff = Backoff::new(&self.config);
+        // Whether an attempt may have been sequenced.
+        let mut uncertain = false;
+        let ends = |uncertain, err| {
+            if uncertain {
+                ClientError::OutcomeUnknown
+            } else {
+                err
+            }
+        };
+        let expired = || ClientError::Network("No commit ack before the deadline".to_string());
+        // Closing the room, discarding its replica or failing it closed ends the write.
+        let ended =
+            || ClientError::Network("The room closed, was discarded or failed closed".into());
+        let mut in_flight = None;
+        let (seq, ops, schema, epoch) = loop {
+            // What the write saw is read under the applier, with the head it delivered.
+            let request = tokio::time::timeout_at(deadline, async {
+                let _applier = room.applier.lock().await;
+                let request = self.local.clone().request(Arc::clone(&room)).await;
+                if let Ok(Request {
+                    cursor: Some((head, _)),
+                    registered: true,
+                    ..
+                }) = &request
+                {
+                    let head = *head;
+                    in_flight.get_or_insert_with(|| InFlight::new(&room, mutation_id, head));
+                }
+                request
+            });
+            let request = request.await;
+            let gone = in_flight.is_some() && !room.in_flight(&mutation_id);
+            if gone {
+                return Err(ends(uncertain, ended()));
+            }
+            // Nothing is sent after the deadline.
+            let Some(request) = request.ok().filter(|_| Instant::now() < deadline) else {
+                return Err(ends(uncertain, expired()));
+            };
+            let request = request.map_err(|err| ends(uncertain, err))?;
+            let Some((cursor, _)) = request.cursor.filter(|_| request.registered) else {
+                let registered = tokio::time::timeout_at(deadline, async {
+                    let _registration = room.registration.lock().await;
+                    self.register(&room).await
+                });
+                match registered.await {
+                    Ok(Ok(())) => continue,
+                    // Without a valid reply, or none by the deadline, it retries until then.
+                    Ok(Err(ClientError::Network(_))) | Err(_) => {}
+                    Ok(Err(_)) if !room.in_flight(&mutation_id) && in_flight.is_some() => {
+                        return Err(ends(uncertain, ended()))
+                    }
+                    Ok(Err(err)) => return Err(ends(uncertain, err)),
+                }
+                tokio::time::sleep_until((Instant::now() + backoff.next()).min(deadline)).await;
+                continue;
+            };
+            let (epoch, correlation_id) = (request.epoch, self.correlation_id());
+            let message = ClientMessage::Commit {
+                correlation_id,
+                room_id: room.id.clone(),
+                client_id: self.client_id.clone(),
+                mutation_id,
+                last_ack_seq: cursor,
+                op: op.clone(),
+            };
+            // An attempt without a reply by the deadline is cut.
+            let reply = tokio::time::timeout_at(deadline, self.send(&message, &request.token));
+            match reply.await.ok().and_then(Result::ok) {
+                Some(ServerMessage::CommitAck {
+                    correlation_id: reply_id,
+                    room_id,
+                    mutation_id: acked,
+                    assigned_seq,
+                    catchup_ops,
+                    has_more,
+                    schema_version,
+                    schema_id,
+                    ..
+                }) if reply_id == correlation_id
+                    && room_id == room.id
+                    && acked == mutation_id
+                    && last_after(cursor, &catchup_ops)
+                        .is_some_and(|last| has_more || assigned_seq <= last) =>
+                {
+                    let last = catchup_ops.last().map_or(assigned_seq, |op| op.seq);
+                    room.saw(epoch, assigned_seq.max(last));
+                    break (
+                        assigned_seq,
+                        catchup_ops,
+                        (schema_id, schema_version),
+                        epoch,
+                    );
+                }
+                Some(ServerMessage::Error {
+                    correlation_id: reply_id,
+                    room_id,
+                    code,
+                    message,
+                }) if reply_id.is_none_or(|reply_id| reply_id == correlation_id)
+                    && room_id.as_ref().is_none_or(|room_id| *room_id == room.id) =>
+                {
+                    let refused = format!("The server refused the write: {code:?}: {message}");
+                    match code {
+                        ErrorCode::SchemaViolation
+                        | ErrorCode::BadRequest
+                        | ErrorCode::Forbidden => {
+                            return Err(ends(uncertain, ClientError::Validation(refused)))
+                        }
+                        ErrorCode::ClientNotRegistered | ErrorCode::InvalidSequence => {
+                            room.update(epoch, |open| open.registered = false)
+                        }
+                        ErrorCode::RequestTimeout
+                        | ErrorCode::RoomLocked
+                        | ErrorCode::BehindCompaction => {}
+                        ErrorCode::Unavailable | ErrorCode::Timeout | ErrorCode::Internal => {
+                            uncertain = true
+                        }
+                        _ => return Err(ends(uncertain, ClientError::Network(refused))),
+                    }
+                }
+                // No reply, or one that does not answer the commit: it may have been sequenced.
+                _ => uncertain = true,
+            }
+            tokio::time::sleep_until((Instant::now() + backoff.next()).min(deadline)).await;
+        };
+
+        let acked =
+            move |local: Local, room| local.acked(room, epoch, mutation_id, seq, ops, schema);
+        // A catch-up that announces another schema is not applied, and the sync registers again.
+        if let Ok(Applied::Schema) = self.change(&room, acked).await {
+            room.update(epoch, |open| open.registered = false);
+        }
+        let mut backoff = Backoff::new(&self.config);
+        loop {
+            if let Some(decision) = room.decision(&mutation_id) {
+                return decision;
+            }
+            // Its errors are retried: the room ends the write if it closes or fails closed.
+            let _ = self.sync(room.id.clone()).await;
+            if let Some(decision) = room.decision(&mutation_id) {
+                return decision;
+            }
+            tokio::time::sleep(backoff.next()).await;
+        }
+    }
+
     /// The room `room_id` of the client; `RoomClosed` if the client never opened it.
     fn room(&self, room_id: &RoomId) -> Result<Arc<Room>, ClientError> {
         let rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
@@ -616,25 +1010,23 @@ impl Client {
     /// The diagnosis of `room_id`; `RoomClosed` if its replica is not open in the client.
     pub async fn status(&self, room_id: RoomId) -> Result<RoomStatus, ClientError> {
         let room = self.room(&room_id)?;
-        let (registered, failed_closed, epoch) = {
+        let status = {
             let state = room.state();
-            let Replica::Open(OpenReplica {
-                registered,
-                failed_closed,
-                ..
-            }) = state.replica
-            else {
+            let Replica::Open(open) = &state.replica else {
                 return Err(ClientError::RoomClosed(room_id));
             };
-            (registered, failed_closed, state.epoch)
+            RoomStatus {
+                head_seq: SequenceNumber::new(0),
+                epoch: state.epoch,
+                registered: open.registered,
+                failed_closed: open.failed_closed,
+                writes_in_flight: state.writes.entries.len(),
+                retained: state.writes.retained.len(),
+            }
         };
         Ok(RoomStatus {
             head_seq: self.head(&room_id).await?,
-            epoch,
-            registered,
-            failed_closed,
-            writes_in_flight: 0,
-            retained: 0,
+            ..status
         })
     }
 
@@ -840,7 +1232,12 @@ impl Local {
             return Ok(Applied::Head(head));
         }
         match self.storage.apply_batch(&room.id, ops).await {
-            Ok(report) => Ok(Applied::Head(report.head_seq())),
+            Ok(report) => {
+                let rejected = report.rejected().iter();
+                let rejected = rejected.map(|(seq, reason)| (*seq, *seq, reason.clone().into()));
+                room.state().writes.applied(report.head_seq(), rejected);
+                Ok(Applied::Head(report.head_seq()))
+            }
             Err(StorageError::SchemaValidation(_)) if again => {
                 room.update(epoch, OpenReplica::fail_closed);
                 Err(ClientError::FailedClosed(room.id.clone()))
@@ -848,11 +1245,36 @@ impl Local {
             Err(StorageError::SchemaValidation(_)) => Ok(Applied::Schema),
             Err(err @ (StorageError::Io(_) | StorageError::RoomFailed { .. })) => {
                 self.clone().close(Arc::clone(&room)).await?;
-                self.open(room).await?;
+                self.clone().open(Arc::clone(&room)).await?;
+                // The sequences up to the head it opened again at have no report: all of them,
+                // if that head cannot be read.
+                let reopened = self.storage.get_head_seq(&room.id).await;
+                let reopened = reopened.unwrap_or(SequenceNumber::new(u64::MAX));
+                if reopened > head {
+                    let unknown = (head.next(), reopened, ClientError::OutcomeUnknown);
+                    room.state().writes.applied(reopened, [unknown]);
+                }
                 Err(err.into())
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// Takes the `CommitAck` of the write `mutation_id` with its sequence `seq`, and applies its
+    /// catch-up `ops`, in reply to a request of `epoch` and announcing `schema`, as
+    /// [`apply`](Self::apply) does, without failing closed.
+    async fn acked(
+        self,
+        room: Arc<Room>,
+        epoch: u64,
+        mutation_id: MutationId,
+        seq: SequenceNumber,
+        ops: Vec<SequencedOperation>,
+        schema: (SchemaId, u64),
+    ) -> Result<Applied, ClientError> {
+        let head = self.storage.get_head_seq(&room.id).await.ok();
+        room.state().writes.acked(&mutation_id, seq, head);
+        self.apply(room, epoch, ops, schema, false).await
     }
 
     /// Leaves the replica of `epoch` waiting for a snapshot if it is still at `cursor`: one that

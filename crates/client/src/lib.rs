@@ -13,6 +13,6 @@ mod transport;
 
 pub use client::{Client, RoomStatus};
 pub use config::ClientConfig;
-pub use error::ClientError;
+pub use error::{ClientError, Violation};
 pub use metadata::{FileMetadata, MemoryMetadata, MetadataStore, RoomMetadata};
 pub use transport::{endpoint, TransportClient, TransportError};

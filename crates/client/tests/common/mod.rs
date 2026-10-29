@@ -53,6 +53,14 @@ pub fn insert_task(id: i64) -> Operation {
         .unwrap()
 }
 
+/// An update of the title of row `id` of `tasks` of [`tasks_schema`].
+pub fn update_task(id: i64) -> Operation {
+    let fields = std::collections::BTreeMap::from([("title".to_string(), Value::from("done"))]);
+    tasks_schema()
+        .to_operation_update("tasks", PrimaryKey::single(id), &fields, 1000)
+        .unwrap()
+}
+
 /// A client token of `client_id` for `room_id`, valid for 300 s.
 pub fn token(client_id: &ClientId, room_id: &RoomId) -> String {
     generate_client_token(client_id, room_id, Duration::from_secs(300), AUTH_SECRET)
@@ -126,10 +134,15 @@ pub async fn setup<S: StorageEngine + Clone + 'static>(
     (server, room_id, transport, storage, client)
 }
 
-/// The correlation id and the room of `message`, a sync or an ack.
+/// The correlation id and the room of `message`, a sync, an ack or a commit.
 pub fn request(message: &ClientMessage) -> (CorrelationId, RoomId) {
     match message {
         ClientMessage::Sync {
+            correlation_id,
+            room_id,
+            ..
+        }
+        | ClientMessage::Commit {
             correlation_id,
             room_id,
             ..
@@ -143,7 +156,7 @@ pub fn request(message: &ClientMessage) -> (CorrelationId, RoomId) {
     }
 }
 
-/// Answers the next message of `kind`, a sync or an ack, with what `reply` gives for its
+/// Answers the next message of `kind`, a sync, an ack or a commit, with what `reply` gives for its
 /// correlation id and room.
 pub fn answer_next(
     transport: &TestTransport,
@@ -165,6 +178,20 @@ pub fn requests(transport: &TestTransport) -> Vec<(&'static str, u64)> {
         _ => None,
     };
     transport.sent().into_iter().filter_map(request).collect()
+}
+
+/// The commits sent through `transport`, with their mutation id and their `last_ack_seq`, in
+/// order.
+pub fn commits(transport: &TestTransport) -> Vec<(MutationId, u64)> {
+    let commit = |message: ClientMessage| match message {
+        ClientMessage::Commit {
+            mutation_id,
+            last_ack_seq,
+            ..
+        } => Some((mutation_id, last_ack_seq.get())),
+        _ => None,
+    };
+    transport.sent().into_iter().filter_map(commit).collect()
 }
 
 /// How many deregistrations went through `transport`.
@@ -215,11 +242,17 @@ impl TestServer {
 
     /// Creates `room_id` with [`tasks_schema`], registered as `tasks` if it is not yet.
     pub async fn create_room(&self, room_id: &str) -> RoomId {
-        let schema_id = SchemaId::new("tasks").unwrap();
+        self.create_room_with(room_id, "tasks", tasks_schema())
+            .await
+    }
+
+    /// Creates `room_id` with `schema`, registered as `schema_id` if it is not yet.
+    pub async fn create_room_with(&self, room_id: &str, schema_id: &str, schema: Schema) -> RoomId {
+        let schema_id = SchemaId::new(schema_id).unwrap();
         if self.state.schema_registry.get_schema(&schema_id).is_none() {
             self.state
                 .schema_registry
-                .register_schema(schema_id.clone(), tasks_schema())
+                .register_schema(schema_id.clone(), schema)
                 .unwrap();
         }
         let room_id = RoomId::new(room_id).unwrap();
@@ -310,6 +343,7 @@ impl TestServer {
             delay: Arc::default(),
             delay_next: Arc::default(),
             hold: Arc::default(),
+            lose: Arc::default(),
             sync_batch_size: Arc::default(),
         }
     }
@@ -366,6 +400,7 @@ pub struct TestTransport {
     delay: Arc<Mutex<Duration>>,
     delay_next: Arc<Mutex<Option<(ClientMessageKind, Duration)>>>,
     hold: Arc<Mutex<Vec<Hold>>>,
+    lose: Arc<Mutex<Option<ClientMessageKind>>>,
     sync_batch_size: Arc<Mutex<Option<u32>>>,
 }
 
@@ -424,6 +459,12 @@ impl TestTransport {
             .unwrap()
             .push((kind, replied_tx, release_rx));
         Held { replied, release }
+    }
+
+    /// Loses the reply to the next message of `kind`: the message reaches the server, and the
+    /// client gets no response. That message is neither held nor answered.
+    pub fn lose_next_reply(&self, kind: ClientMessageKind) {
+        *self.lose.lock().unwrap() = Some(kind);
     }
 
     /// Answers the next message of `kind` with the bytes `reply` gives for it, without reaching
@@ -489,6 +530,11 @@ impl fmt::Debug for TestTransport {
 impl TransportClient for TestTransport {
     async fn send(&self, message: &ClientMessage, token: &str) -> Result<Vec<u8>, TransportError> {
         self.sent.lock().unwrap().push(message.clone());
+        let lost = (self.lose.lock().unwrap()).take_if(|kind| *kind == message.kind());
+        if lost.is_some() {
+            self.server_reply(message, token).await?;
+            return Err(TransportError("Lost".to_string()));
+        }
         let held = {
             let mut hold = self.hold.lock().unwrap();
             let index = hold.iter().position(|(kind, ..)| *kind == message.kind());
@@ -516,6 +562,15 @@ impl TestTransport {
         if let Some(answer) = answered {
             return answer;
         }
+        self.server_reply(message, token).await
+    }
+
+    /// The server's reply to `message`.
+    async fn server_reply(
+        &self,
+        message: &ClientMessage,
+        token: &str,
+    ) -> Result<Vec<u8>, TransportError> {
         let mut message = message.clone();
         let size = *self.sync_batch_size.lock().unwrap();
         if let (ClientMessage::Sync { max_batch_size, .. }, Some(size)) = (&mut message, size) {
