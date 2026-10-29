@@ -2,7 +2,7 @@
 
 **Fecha:** 26 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lotes 0 (el contrato), 1 (`delete_room`), 2 (la encarnación en los chunks del relay), 3 (el esqueleto del cliente) y 4 (apertura, registro, descarte y cierre) cerrados. DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 5.
+**Estado:** En curso: Lotes 0 (el contrato), 1 (`delete_room`), 2 (la encarnación en los chunks del relay), 3 (el esqueleto del cliente), 4 (apertura, registro, descarte y cierre) y 5 (el aplicador y `sync`) cerrados. DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 6.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.2. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -86,7 +86,7 @@ Las de la fase que implementa esta sub-fase: DC1, DC5, DC6, DC7, DC11, DC12, DC1
 - **Validar antes de usar (INV-K12).** Cada respuesta se valida antes de tocar nada: su tipo para el pedido; la sala y la correlación del pedido cuando vienen (los errores de autenticación y de los extractores salen sin ellas); en un `CommitAck`, su `MutationId`, un catch-up contiguo desde el cursor del pedido y, sin `has_more`, una secuencia asignada que no pasa del catch-up (o del cursor, si viene vacío); en un `SyncBatch`, operaciones contiguas desde `from_seq` que no pasan de su head y, sin `has_more`, que llegan a él. Una respuesta que no valida no se aplica: para una escritura, el intento queda incierto.
 
 ### DC22 · Snapshots en el cliente
-- **Bajada (§A.6).** Cuando un registro deja al cliente detrás del log (`cursor < tail_seq − 1`), o un sync, un commit o un ack recibe `BehindCompaction`, la réplica espera un snapshot: si `Registered` o un `HeartbeatAck` anunciaron uno usable, lo baja; si no, o si el chunk 0 responde `RoomNotFound` (no hay uno usable), espera a que un heartbeat lo anuncie. Por chunks de 4 MiB (el máximo del servidor), que se juntan en memoria hasta `max_snapshot_bytes` (configurable, por defecto 512 MiB, el de `ZEMDB_MAX_SNAPSHOT_BYTES`; requisito 6): un `total_bytes` mayor es un error, y no se baja. Cada chunk se valida antes de guardarlo: la misma secuencia, `total_chunks`, `total_bytes` y hash que el primero, su índice y su largo. Ante `SnapshotSuperseded`, se descarta lo bajado y se vuelve al chunk 0. Al terminar, el BLAKE3, y `apply_snapshot` con el esquema local y `S`, en una tarea propia del aplicador, con DC20 ante sus errores. Después de instalarlo, `(head anterior, S]` queda sin reporte (DC21) y se sincroniza desde `S`. Cada chunk lleva la encarnación de los metadatos, y el relay responde `RoomReset` al chunk 0 sin ancla si la sala es otra encarnación y tiene un snapshot activo (si no tiene, `RoomNotFound`); a los anclados los cubre la purga del relay al recrear la sala, salvo que la sala nueva active un snapshot con el mismo hash, que son los mismos bytes que el chunk 0 validó en la vieja (DC23). Así el snapshot es de la encarnación de la réplica, y uno bajado en una época anterior no se instala (DC7). Un `RoomReset` en un chunk de la época actual, si la sala no falla cerrada, lleva a registrarse con el cursor (y de ahí a descartar), y un `RoomNotFound` (sin snapshot usable, o la sala borrada), a esperar un anuncio.
+- **Bajada (§A.6).** Cuando un registro deja al cliente detrás del log (`cursor < tail_seq − 1`), o un sync, un commit o un ack recibe `BehindCompaction`, la réplica espera un snapshot. En el caso de `BehindCompaction`, solo si la réplica sigue en el cursor de ese pedido: si pasó de él, la respuesta es demorada, como la del sync que un ack adelantó (precisión del Lote 5). Entonces: si `Registered` o un `HeartbeatAck` anunciaron uno usable, lo baja; si no, o si el chunk 0 responde `RoomNotFound` (no hay uno usable), espera a que un heartbeat lo anuncie. Por chunks de 4 MiB (el máximo del servidor), que se juntan en memoria hasta `max_snapshot_bytes` (configurable, por defecto 512 MiB, el de `ZEMDB_MAX_SNAPSHOT_BYTES`; requisito 6): un `total_bytes` mayor es un error, y no se baja. Cada chunk se valida antes de guardarlo: la misma secuencia, `total_chunks`, `total_bytes` y hash que el primero, su índice y su largo. Ante `SnapshotSuperseded`, se descarta lo bajado y se vuelve al chunk 0. Al terminar, el BLAKE3, y `apply_snapshot` con el esquema local y `S`, en una tarea propia del aplicador, con DC20 ante sus errores. Después de instalarlo, `(head anterior, S]` queda sin reporte (DC21) y se sincroniza desde `S`. Cada chunk lleva la encarnación de los metadatos, y el relay responde `RoomReset` al chunk 0 sin ancla si la sala es otra encarnación y tiene un snapshot activo (si no tiene, `RoomNotFound`); a los anclados los cubre la purga del relay al recrear la sala, salvo que la sala nueva active un snapshot con el mismo hash, que son los mismos bytes que el chunk 0 validó en la vieja (DC23). Así el snapshot es de la encarnación de la réplica, y uno bajado en una época anterior no se instala (DC7). Un `RoomReset` en un chunk de la época actual, si la sala no falla cerrada, lleva a registrarse con el cursor (y de ahí a descartar), y un `RoomNotFound` (sin snapshot usable, o la sala borrada), a esperar un anuncio.
 - **Subida (§A.8).** Un `snapshot_wanted` (en cualquier respuesta) se confirma con un heartbeat: si su `HeartbeatAck`, de la época actual, también lo trae, el cliente crea el snapshot en el head local (`create_snapshot`, bajo el aplicador, para que su secuencia sea el head que anuncia) y lo sube en `n = ⌈T / 4 MiB⌉` chunks de `⌈T / n⌉` bytes, el último con el resto (la regla del relay, `ARCHITECTURE.md` §6), aunque entre en un request. Ante `SnapshotSuperseded` u otro error, deja de subir (y ante `RoomReset` de la época actual, si la sala no falla cerrada, además se registra con el cursor): si hace falta, el servidor designa a otro (si no empieza a subir dentro de 60 s, o si la subida pasa 2 minutos sin chunks). No sube si falla cerrado ni mientras espera un snapshot. Cada chunk lleva la encarnación de la época en que se creó el snapshot, y el relay lo rechaza con `RoomReset` en otra encarnación (DC23); además, el cliente no manda un chunk si la época cambió, porque después de un descarte por D78 la encarnación es la misma.
 - **Memoria (requisito 5, INV-K15).** El búfer de la bajada, hasta el tope; el de la subida (`create_snapshot` devuelve un `Vec<u8>`, un snapshot de la réplica); y el segundo estado completo que arma `apply_snapshot` antes de reemplazar el primero. INV-K15 los cuenta. Una sala cuyo snapshot pasa el tope del cliente no se pone al día (INV-K7 lo exceptúa): la aplicación sube el tope o descarta la sala.
 
@@ -129,7 +129,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 | 2 | La encarnación en los chunks del relay | core, server | DC23 | R6, R5, W1, W2 | ✅ |
 | 3 | El esqueleto: comandos, transporte y metadatos | client | DC18, DC19, DC15 | W1, W2 (metadatos) | ✅ |
 | 4 | Apertura, registro, descarte y cierre | client | DC19, DC12 | K3, K5, K11 | ✅ |
-| 5 | El aplicador y `sync` | client | DC7, DC21 | K1, K12 | ⬜ |
+| 5 | El aplicador y `sync` | client | DC7, DC21 | K1, K12 | ✅ |
 | 6 | El esquema | client | DC5, DC20 | K6, C1 | ⬜ |
 | 7 | Escrituras | client | DC6, DC7, DC21 | K2, K15 | ⬜ |
 | 8 | `heartbeat` y la bajada de snapshots | client | DC20, DC22, DC23 | K7, K2, K12, K15 | ⬜ |
@@ -545,7 +545,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
      - que la réplica queda abierta sin registrar cuando falla la lectura del head para el cursor: ahora lo dicen §11 y esta nota, y lo fija el test;
      - que `head` convierte en `RoomClosed` también un `RoomNotFound` con la réplica abierta: solo pasa si alguien cierra la sala en el motor por fuera del cliente, contra "un motor, un cliente", y es inocuo (el próximo `close_room` la deja cerrada). Queda así.
 
-### Lote 5 · El aplicador y `sync` (`zemdb-client`)
+### Lote 5 · El aplicador y `sync` (`zemdb-client`) · ✅ Hecho
 **Objetivo:** el único camino de los lotes al storage (DC7, DC21) y ponerse al día.
 
 **Qué se hace:** el aplicador con su época, el prefijo, el hueco, la tarea propia de cada cambio, la reapertura ante un error del storage y el head visto; `sync` (pull paginado hasta `has_more: false` y `Ack`); la validación de `SyncBatch` y `AckConfirmed`; el registro ante un head menor o `InvalidSequence` (DC21); `BehindCompaction` deja la sala esperando un snapshot (que baja el Lote 8).
@@ -560,6 +560,166 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 **Interacciones a revisar:** `apply_batch` (`SequenceMismatch`, INV-S1); el registro del Lote 4; el presupuesto de respuestas del servidor (`Unavailable` en un sync).
 
 **Documentos:** `ARCHITECTURE.md` §11 (el aplicador y el sync); `INVARIANTES.md`: K1 y K12.
+**Hecho.**
+- **API** (`zemdb-client`):
+  - `sync(room_id)`:
+    1. Registra la sala si no lo está, bajo el lock de los registros del Lote 4: una réplica abierta, con su cursor; una vacía, sin cursor.
+    2. Pide las operaciones después del head de la réplica (`Sync`, con tantas como el servidor sirva en una respuesta) hasta que un lote sin `has_more` deja la réplica en su head.
+    3. Manda `Ack` con el head alcanzado.
+  - **Lo que presenta un pedido.** Un registro o un sync lee bajo el aplicador lo que presenta: la época, el token y, de una réplica abierta, el head de la sala del storage y la encarnación. Así espera el cambio en curso y nunca ve uno a medio camino (ni el cierre y la apertura de una reapertura, ni un descarte). `status` no espera: mientras un cambio está a medio camino, la sala es `RoomClosed`.
+  - **La validación.** Cada respuesta se valida antes de usarla:
+    - un `SyncBatch` con la correlación y la sala del pedido, cuyas operaciones siguen al cursor del pedido en orden, no pasan de su head y, sin `has_more`, llegan a él; con `has_more`, trae alguna;
+    - un `AckConfirmed` con la correlación, la sala y la secuencia del ack;
+    - un error puede venir sin la correlación y la sala.
+
+    Cualquier otra respuesta, o ninguna, es `Network` y no cambia nada. Las comparaciones de secuencias no desbordan.
+  - **Volver a registrarse.** Un head menor que el cursor del pedido (en un `SyncBatch` o en un `AckConfirmed`), `InvalidSequence` y `ClientNotRegistered` dejan la réplica sin registrar: el sync se vuelve a registrar con el cursor y sigue. Ese registro descarta la réplica ante `RoomReset` o `InvalidSequence` (Lote 4). Una segunda señal en el mismo sync es `Network`: el servidor se contradice. Una respuesta a un pedido de otra época no cambia la réplica.
+  - **La época en el registro** (pasó del Lote 4). Un `Registered` para una réplica que el aplicador descartó mientras tanto no abre ni registra la réplica de la época nueva. Un `RoomReset` o un `InvalidSequence` para ella no la descarta otra vez. En los dos casos la réplica se vuelve a registrar.
+  - **Un head que volvió atrás.** `Registered` tampoco registra una réplica abierta cuyo head, bajo el aplicador, quedó por debajo del cursor que presentó el registro (un motor en memoria que se reabrió en 0): la réplica se vuelve a registrar con su head.
+  - **`open_room` sin red** decide bajo el aplicador si la réplica quedó abierta (y entonces abre sin registrar) o vacía (y entonces es `Network`).
+  - **Esperar un snapshot.** `BehindCompaction`, en un sync o en un ack, deja la réplica esperando un snapshot si sigue en el cursor del pedido. Si pasó de ahí, la respuesta es demorada: el servidor la da a un sync que un ack adelantó, y el cliente sigue `Connected`. El sync de una réplica que espera es `Network` y no manda nada, salvo un registro que le haga falta, hasta que la sala se cierra y se vuelve a abrir, se reabre después de un error o se descarta.
+  - **El aplicador** (`apply`), un cambio de la réplica como los del Lote 4, en una tarea propia bajo el lock de la sala:
+    - un lote de otra época, o para una réplica cerrada, no se aplica;
+    - se descarta el prefijo que la réplica ya tiene;
+    - un lote que no empieza en head + 1 no se aplica, y el sync vuelve a pedir desde el head;
+    - si no, `apply_batch`, y el head nuevo es el de su `ApplyReport`.
+  - **La reapertura.** Ante `Io` o `RoomFailed` de `apply_batch`, el aplicador cierra la sala del storage y la vuelve a abrir como una apertura: un daño descarta, y otro error la deja cerrada con ese error. Si no, el error de `apply_batch` llega al sync, y la réplica reabierta queda sin registrar hasta el próximo pedido. Cualquier otro error de `apply_batch` llega al sync sin reabrir nada.
+  - Por dentro:
+    - `Replica::Open` lleva un `OpenReplica` (los metadatos, si está registrada y si espera un snapshot);
+    - `Request` es lo que presenta un pedido;
+    - `change` devuelve el resultado del cambio.
+- **Tests agregados** (21), en `crates/client/tests/sync_tests.rs`, contra el servidor en proceso. Las operaciones las confirma un cliente propio del servidor (`TestServer::commit`):
+  - `a_sync_in_small_batches_reaches_the_head_and_acknowledges_it`: con lotes de 2, pide desde 0, 2 y 4 y manda `Ack` 5. Al día, pide una vez y confirma el mismo head. Una sala que el cliente nunca abrió es `RoomClosed`.
+  - `a_sync_registers_a_room_that_is_not_registered`: sin red, el sync de una réplica vacía es `Network`. Con red, dos syncs a la vez la registran una sola vez, sin cursor.
+  - `a_reply_that_does_not_answer_the_sync_or_the_ack_is_not_used`: 21 respuestas fabricadas.
+    - Al sync: un lote válido; uno con `has_more` que llega a su head (el sync pide más igual); un hueco; operaciones fuera de orden; más allá de su head; sin llegar a él y sin `has_more`; `has_more` sin operaciones; una operación en la secuencia 0; de otra correlación; de otra sala; otro tipo; un rechazo de otra correlación o de otra sala; bytes que no decodifican.
+    - Al ack: una confirmación válida; de otra secuencia, de otra correlación o de otra sala; otro tipo; un rechazo de otra correlación; bytes que no decodifican.
+
+    Las inválidas son `Network`, no aplican nada ni registran, y el sync siguiente sigue. Las válidas mandan los pedidos que corresponden.
+  - `a_batch_asked_for_before_a_discard_is_not_applied`: un sync con la respuesta retenida mientras la sala se recrea. Otro sync recibe `ClientNotRegistered`, se registra con el cursor, recibe `RoomReset` y descarta, y el lote de la sala vieja no se aplica. Tampoco cambian la réplica nueva un `BehindCompaction` ni un `InvalidSequence` de la época anterior: ni la dejan esperando ni la dejan sin registrar.
+  - `a_batch_for_a_room_closed_meanwhile_is_not_applied`: es `RoomClosed`, y al reabrir el cursor es 0.
+  - `a_delayed_batch_applies_only_what_the_replica_lacks`:
+    - un lote de 1 a 4 que llega con la réplica en 2 aplica el 3 y el 4 sin volver a pedir, y se fija la secuencia exacta de pedidos;
+    - uno con head 2 que llega con la réplica en 4 no lleva a registrarse.
+  - `a_head_below_the_request_or_an_invalid_sequence_registers_again`: en un sync (con la réplica en 3) y en un ack (después de un sync desde 0), un head menor, `InvalidSequence` (también sin la correlación ni la sala) y `ClientNotRegistered`. En cada caso hay un registro más, con el cursor 3 y la encarnación, y el sync termina con `Ack` 3.
+  - `a_server_that_keeps_asking_to_register_again_ends_the_sync`: con todo sync respondido con `ClientNotRegistered` o con un head menor que el pedido, y con todo ack respondido igual, el sync se registra una vez más y termina con `Network`.
+  - `a_sync_or_an_ack_the_server_refuses_fails_and_changes_nothing`: `Unavailable` (el presupuesto de respuestas del servidor), `Internal` y `Unauthorized`, en un sync y en un ack.
+  - `behind_the_log_of_the_server_the_replica_waits_for_a_snapshot`: en un sync y en un ack. El sync siguiente no manda nada, y cerrar y abrir la sala vuelve a pedir. Un `BehindCompaction` demorado, que llega con la réplica ya por delante del pedido, no la deja esperando.
+  - `a_failed_write_of_a_batch_reopens_the_storage_room_and_the_next_sync_goes_on`: con la capa de archivos de prueba, falla el `sync_data` del WAL. El sync es `Storage`. La sala reabierta tiene el lote (head 3) y queda sin registrar. El sync siguiente se registra con el cursor 3 y confirma.
+  - `only_a_storage_error_after_which_the_room_may_have_changed_reopens_it`: con el motor de prueba, `Io` y `RoomFailed` reabren (un `open_room` que falla deja la sala cerrada y su error es el que llega); `SequenceMismatch` y `Other`, no.
+  - `a_reopen_that_finds_damage_discards_and_one_that_fails_to_close_leaves_the_room_out`:
+    - `SnapshotCorruption` al reabrir descarta: los metadatos se borran, el sync siguiente se registra sin cursor y la época es 2;
+    - un cierre que falla deja la sala cerrada, y abrirla de nuevo la registra con el cursor 0.
+  - `a_batch_that_does_not_follow_the_head_is_not_applied_and_the_sync_goes_on`: con el motor en memoria, reabierto en 0 después de un `Io`, un lote pedido antes (desde 3) no se aplica, y el sync vuelve a pedir desde 0.
+  - `a_sync_waits_for_a_change_of_the_replica_in_progress`: con una apertura lenta del motor de prueba, un sync que empieza mientras la sala del storage se reabre (con `status` en `RoomClosed`) espera la reapertura, se registra y termina bien.
+  - `a_registration_waits_for_a_change_of_the_replica_in_progress`: un sync espera el lock de los registros, que otro suelta (con su registro rechazado) mientras la sala del storage se reabre despacio. El registro del primero espera la reapertura en lugar de ver la sala cerrada.
+  - `a_registration_answered_after_the_replica_went_back_registers_again_with_its_head`: con el motor en memoria, un registro con el cursor 3 queda retenido mientras la sala se reabre en 0 después de un `Io`. Su `Registered` no registra la réplica, que se vuelve a registrar con el cursor 0 y se pone al día.
+  - `an_open_without_network_during_a_change_of_the_replica_opens_the_replica`: un `open_room` sin red cuyo registro falla mientras la sala del storage se reabre despacio espera la reapertura y abre la réplica sin registrar.
+  - `a_reply_to_a_registration_of_a_replica_the_applier_discarded_changes_nothing`: un registro retenido mientras el aplicador descarta la réplica (un `Io` y un daño al reabrir). Su `Registered`, o el `RoomReset` de la sala recreada, no cambian la réplica vacía, que se vuelve a registrar sin cursor: la época queda en 2.
+  - `a_sync_cut_while_it_applies_a_batch_leaves_the_batch_applied`: cortado durante la escritura del WAL (lenta), el lote se aplica entero, y el sync siguiente confirma 3.
+  - `a_sync_cut_at_any_point_leaves_a_head_the_applier_reached_whole`: con lotes de 2, cortado después de 1, 2, … polls (cada uno con 1 ms de pausa, unos 8 puntos). La sala del storage queda en un head par con sus filas, y el sync siguiente llega a 6.
+- **Fixtures** (`crates/client/tests/common/`):
+  - `TestTransport`:
+    - retiene la respuesta al próximo mensaje de un tipo (`hold_next_reply`, varias a la vez, también una fabricada);
+    - contesta el próximo mensaje de un tipo (`answer_next`), todos (`answer_every`) o los que elija un closure (`answer`, ahora público);
+    - achica los lotes de sync (`sync_batch_size`).
+  - `TestFiles::fail_next` hace fallar una operación una sola vez.
+  - `TestEngine::slow_open` demora la próxima apertura.
+  - `options`, `engine`, `open_client`, `open_room` y `status` pasan de `room_tests.rs` a `common`.
+- Contra el esqueleto (`sync` sin hacer nada) fallaban los 14 tests del primer borrador. Los demás llegaron con la verificación de mutaciones y con la revisión de delta.
+- **Mutaciones verificadas** (69, todas detectadas; seis dejan `sync` en un ciclo sin fin y las corta el timeout):
+  - lo que presenta un pedido:
+    - no registrarse antes de pedir (ciclo), o hacerlo sin el lock de los registros;
+    - mandar con la réplica esperando un snapshot;
+    - otra época (ciclo);
+    - otro cursor que el head, o ninguno;
+    - una réplica que figura registrada o que figura sin esperar;
+    - leer lo que presenta un sync o un registro fuera del aplicador;
+  - el lote:
+    - tomar uno de otra correlación o de otra sala;
+    - no registrarse ante un head menor que el pedido, o seguir sin registrarse;
+    - registrarse con el head igual al del pedido;
+    - comparar con el head actual en lugar del del pedido;
+    - aplicar un lote que no sigue al pedido, o que no sea `Network`;
+  - la continuidad (`follows`):
+    - fuera de orden; que arranca en otro lado;
+    - más allá del head; sin llegar al head y sin `has_more`;
+    - `has_more` sin operaciones;
+    - una resta que desborda;
+  - el fin del sync: terminar con un lote con `has_more`, o con uno que no dejó la réplica en su head;
+  - el ack:
+    - otro head que el alcanzado;
+    - tomar una confirmación de otra correlación, de otra sala o de otra secuencia;
+    - terminar con un head menor que el ack, o compararlo con el cursor del sync;
+  - los rechazos:
+    - tomar un error de otra correlación o de otra sala; no tomar uno sin la correlación o sin la sala;
+    - que `ClientNotRegistered` o `InvalidSequence` no registren, o que cualquier error registre;
+    - volver a pedir sin dejar la réplica sin registrar;
+    - registrarse sin tope (ciclo), o sin tope ante un rechazo, un head menor en un lote o el ack;
+    - no esperar el snapshot ante `BehindCompaction`, o esperarlo con la réplica ya por delante del pedido;
+    - un rechazo o una respuesta inválida que no son `Network`;
+    - una respuesta de otra época que cambia la réplica;
+  - la época del registro: tomar un `Registered` de otra época; descartar ante un `RoomReset` de otra época; registrar una réplica que volvió por debajo del cursor;
+  - `open_room` sin red: decidir fuera del aplicador; abrir una réplica vacía; fallar con una abierta;
+  - el aplicador:
+    - aplicar un lote de otra época o para una réplica cerrada;
+    - no descartar el prefijo;
+    - aplicar un lote que no sigue al head;
+    - el head de antes del lote;
+    - aplicar en el lugar, sin el lock ni una tarea propia;
+  - la reapertura:
+    - que `Io` o `RoomFailed` no reabran, o que cualquier error reabra;
+    - ignorar un cierre que falla;
+    - no abrir; ignorar el error de la apertura;
+    - ocultar el error de `apply_batch`.
+- **Interacciones revisadas:**
+  - **`apply_batch` (`SequenceMismatch`, INV-S1).** El aplicador nunca le pasa un lote que no sigue al head: descarta el prefijo bajo su lock, y un lote que no sigue no se aplica (test con el motor en memoria reabierto en 0). Si igual llega `SequenceMismatch`, es un error que no reabre la sala (test).
+  - **El registro del Lote 4.** El sync lo usa tal cual, bajo el lock de los registros: dos syncs a la vez registran una vez (test). Un registro con el cursor después de una señal descarta ante `RoomReset` (test, con la sala recreada) y ante `InvalidSequence` (Lote 4). Lo que presenta el registro (su cursor, su encarnación) se lee ahora bajo el aplicador, como el de un sync. El error al leer el head para el cursor sigue siendo `Storage` con la réplica abierta (test del Lote 4).
+  - **El presupuesto de respuestas del servidor.** `Unavailable` en un sync o en un ack es `Network`, no registra ni cambia nada, y el sync siguiente sigue (test).
+  - **El cierre y `shutdown` del Lote 4.** Un lote que llega para una sala cerrada no se aplica y el sync es `RoomClosed` (test). `close_room` espera el lote en curso (test de cortes).
+  - **El motor en disco ante un corte o una falla.** Un `apply_batch` cortado a la mitad marca la sala fallida, y por eso el aplicador lo corre en una tarea propia (test del corte en la escritura del WAL). Una escritura del WAL que falla deja la sala rechazando escrituras (`RoomFailed`) hasta reabrirla (test con la capa de archivos).
+  - **El motor en memoria.** Reabrir después de un error suelta sus datos: la réplica vuelve a 0, se registra con el cursor 0 y su encarnación (INV-K5) y se pone al día, y un lote pedido antes no se aplica (test).
+  - **Las lecturas fuera del aplicador.** Un sync o un registro leen lo que presentan bajo el aplicador: uno que empieza durante una reapertura la espera, en lugar de ver la sala cerrada (test). `status` sigue leyendo sin esperar. Un sync que empieza mientras otro aplica un lote pide desde el head anterior, y el aplicador descarta el prefijo (test de corte).
+  - **La época.** Una respuesta a un pedido anterior a un descarte no aplica nada ni cambia la réplica nueva: ni la deja sin registrar ni esperando un snapshot (tests). Tampoco la cambian un `Registered` ni un `RoomReset` para el registro de la réplica que el aplicador descartó (test).
+  - **El roster y el cursor del servidor.**
+    - Un sync confirma su cursor en el servidor, y ese cursor nunca baja. Por eso el servidor responde `BehindCompaction` a un sync que un ack adelantó, y deja al cliente `Connected`: esa respuesta no deja esperando a la réplica (test).
+    - Un sync o un ack de antes de un descarte, o de antes de reabrir en 0 el motor en memoria, que llega después del registro nuevo, deja el cursor del servidor por encima del head de la réplica. Es solo vivacidad, y se anota en INV-K5: el servidor puede podar lo que falta, y la réplica se pone al día con un snapshot (Lote 8). No se cierra sin la encarnación en esos mensajes.
+- **Desvíos:**
+  - El head visto (DC21) pasa al Lote 7, que es el que lo usa (`seen`): en este lote nada lo lee. Tampoco hay decisiones que entregar: llegan con las escrituras.
+  - `ClientNotRegistered` en un sync o en un ack también lleva a registrarse (DC21 lo dice para las escrituras). Sin eso, el sync de un cliente que el servidor sacó del roster, o de una sala recreada, quedaría sin salida.
+  - Un error del storage que reabre la sala termina el sync con el error, en lugar de seguir: con una falla de E/S que se repite, seguir reabriría sin fin. El sync siguiente sigue desde el head reabierto, y la réplica reabierta se vuelve a registrar.
+  - En este lote, esperar un snapshot termina solo al cerrar y volver a abrir la sala, al reabrirla después de un error o al descartar la réplica; la salida normal, la bajada, llega con el Lote 8. El otro caso de DC22, un registro que deja al cliente detrás del log, también pasa al Lote 8: mientras tanto lo detecta el sync siguiente, con un pedido de más.
+  - Una señal para volver a registrarse vale una vez por sync, y un lote con `has_more` tiene que traer operaciones. Las dos reglas acotan el sync ante un servidor que se contradice, que no lo pide DC21.
+  - El sync pide `u32::MAX` operaciones por lote, y el servidor las acota.
+  - DC22 queda precisada: un `BehindCompaction` deja esperando un snapshot solo si la réplica sigue en el cursor del pedido. El Lote 8 aplica la misma regla al de un commit.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura):
+  1. **No en verde: 3 ajustes y 6 menores.** Corrió los tests de sync 30 veces seguidas y 15 rondas de a dos en paralelo, sin fallas. Todo quedó atendido:
+     - **Un `BehindCompaction` demorado** (al sync que un ack adelantó; el servidor deja al cliente `Connected`) dejaba esperando un snapshot a una réplica al día. Ahora la espera es solo si la réplica sigue en el cursor del pedido, comparado bajo el aplicador. Hay test.
+     - **Un sync concurrente con una reapertura o un descarte veía `RoomClosed`.** Lo reprodujo cientos de veces por corrida. Ahora lo que presenta un registro o un sync se lee bajo el aplicador. Hay tests, con una apertura lenta.
+     - **Sobrevivía comparar el head de `AckConfirmed` con el cursor del sync.** Ahora los casos del ack corren después de un sync desde 0.
+     - **Un servidor que se contradice dejaba el sync en un ciclo.** Siempre `ClientNotRegistered`, o un lote vacío con `has_more`. Ahora vale una señal por sync, y un lote con `has_more` trae operaciones. Hay tests.
+     - **Sobrevivía desmarcar la réplica con la época actual.** Ahora hay test con un `InvalidSequence` de la época anterior.
+     - **Sobrevivía la resta sin chequeo en `follows`.** Ahora hay test con una operación en la secuencia 0. El chequeo del hueco ya no usa `next()`.
+     - **Faltaba el roster del servidor entre las interacciones.** Su consecuencia de vivacidad queda anotada en INV-K5.
+     - **Los desvíos:**
+       - el head visto queda nombrado en el Lote 7;
+       - el registro que deja al cliente detrás del log, en el Lote 8.
+     - **§11:**
+       - la espera termina también al reabrir;
+       - una réplica sin registrar que espera manda su registro.
+
+     Además, al leer bajo el aplicador apareció la comparación de la época de `Registered` que el Lote 4 había dejado para este lote. Un registro en vuelo mientras el aplicador descarta la réplica ahora no la cambia. Hay test.
+  2. **No en verde: 2 ajustes y 3 menores.** Los arreglos de la ronda 1 estaban bien, y no encontró deadlocks: el orden de los locks es siempre primero el de los registros y después el aplicador. Corrió los tests de sync 30 veces seguidas y 15 rondas de a dos en paralelo, sin fallas. Todo quedó atendido:
+     - **El tope de una señal por sync solo estaba probado al responder `ClientNotRegistered` a un sync.** Ahora el test cubre también el head menor en un lote y el ack.
+     - **Un `Registered` de antes de una reapertura, en la misma época, registraba la réplica reabierta en 0.** Lo reprodujo con el motor en memoria. Ahora `registered` compara el head con el cursor que presentó el registro. Hay test.
+     - **DC22 no estaba precisada.** Ahora sí, con su desvío.
+     - **`open_room` sin red decidía fuera del aplicador si la réplica quedaba abierta.** Ahora decide bajo el aplicador. Hay test.
+     - **Las líneas de estado del plan,** que dicen "en verde", quedan para la ronda que cierre así.
+  3. **En verde, sin bloqueantes ni ajustes.** Los cuatro arreglos de la ronda 2 están bien y tienen test:
+     - el guard del estado se suelta antes de leer el head en `registered`, y un head igual o mayor que el cursor registra sin ciclar;
+     - `open_room` deja pasar tal cual cualquier error que no es de red.
+
+     Probó dos mutaciones más, y las dos fallan. Corrió los tests de sync 30 veces seguidas y 15 rondas de a dos en paralelo, sin fallas. Un menor opcional, atendido: INV-K5 nombra la réplica que volvió atrás también en *Sostenida por*.
 
 ### Lote 6 · El esquema (`zemdb-client`)
 **Objetivo:** cambiar solo a un esquema que evoluciona del local, en el orden de DC5, y fallar cerrado si no (DC20).
@@ -578,7 +738,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 ### Lote 7 · Escrituras (`zemdb-client`)
 **Objetivo:** `write` con su resultado: la decisión de la réplica o el error que corresponde (DC6, DC7, DC21).
 
-**Qué se hace:** el `MutationId`, el plazo y el backoff; la reacción a cada respuesta (tabla de §A.4); `seen`, los rechazos y los rangos sin reporte retenidos; las esperas con guards RAII; el sync después del `CommitAck`; las resoluciones de DC21; la señal de esquema de `CommitAck`. El comentario de `ErrorCode::Internal` en `zemdb-core` dice que el SDK lo reintenta.
+**Qué se hace:** el `MutationId`, el plazo y el backoff; la reacción a cada respuesta (tabla de §A.4); el head visto (DC21; pasó del Lote 5, que no tenía quien lo leyera), `seen`, los rechazos y los rangos sin reporte retenidos; las esperas con guards RAII; el sync después del `CommitAck`; las resoluciones de DC21; la señal de esquema de `CommitAck`. El comentario de `ErrorCode::Internal` en `zemdb-core` dice que el SDK lo reintenta.
 
 **Tests exigidos.** Con el transporte de prueba, que pierde o fabrica respuestas, y el reloj pausado:
 - Una escritura aceptada, una rechazada por `Unique` (con el nombre de la restricción) y un `Update` de una fila que no existe (`RowMissing`).
@@ -598,7 +758,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 ### Lote 8 · `heartbeat` y la bajada de snapshots (`zemdb-client`)
 **Objetivo:** que un cliente atrasado termine al día (DC22, INV-K7).
 
-**Qué se hace:** `heartbeat` y su reacción (la señal de esquema, el head menor, la bajada si la espera, y el `snapshot_wanted` que confirma, que sube el Lote 9); la bajada por chunks, con su validación, el tope, `SnapshotSuperseded`, `RoomNotFound` en el chunk 0, el BLAKE3 y `apply_snapshot` en una tarea propia del aplicador, con DC20 ante sus errores; el commit que recibe `BehindCompaction` se pone al día y reintenta dentro del plazo; una sala que falla cerrada no manda heartbeats.
+**Qué se hace:** `heartbeat` y su reacción (la señal de esquema, el head menor, la bajada si la espera, y el `snapshot_wanted` que confirma, que sube el Lote 9); un registro que deja al cliente detrás del log (`cursor < tail_seq − 1`) también lo deja esperando un snapshot (hasta este lote, lo detecta el sync siguiente, con `BehindCompaction`); la bajada por chunks, con su validación, el tope, `SnapshotSuperseded`, `RoomNotFound` en el chunk 0, el BLAKE3 y `apply_snapshot` en una tarea propia del aplicador, con DC20 ante sus errores; el commit que recibe `BehindCompaction` se pone al día y reintenta dentro del plazo; una sala que falla cerrada no manda heartbeats.
 
 **Tests exigidos.**
 - Un cliente que entra a una sala podada baja el snapshot activo, lo aplica y sincroniza; sin snapshot usable (`RoomNotFound`), espera y lo baja cuando un heartbeat lo anuncia.
@@ -670,4 +830,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. Lote 1 cerrado el 28 de Octubre (`delete_room`), con la revisión de delta en verde. Lote 2 cerrado el mismo día (la encarnación en los chunks del relay), con la revisión de delta en verde. Lote 3 cerrado el mismo día (el esqueleto del cliente: transporte, metadatos y `Client::open`), con la revisión de delta en verde. Lote 4 cerrado el mismo día (apertura, registro, descarte y cierre de las salas), con la revisión de delta en verde. El próximo es el Lote 5.
+**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. Lote 1 cerrado el 28 de Octubre (`delete_room`), con la revisión de delta en verde. Lote 2 cerrado el mismo día (la encarnación en los chunks del relay), con la revisión de delta en verde. Lote 3 cerrado el mismo día (el esqueleto del cliente: transporte, metadatos y `Client::open`), con la revisión de delta en verde. Lote 4 cerrado el mismo día (apertura, registro, descarte y cierre de las salas), con la revisión de delta en verde. Lote 5 cerrado el 29 de Octubre (el aplicador y `sync`), con la revisión de delta en verde. El próximo es el Lote 6.

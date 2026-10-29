@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use zemdb_core::{
     decode_message, ClientId, ClientMessage, CorrelationId, ErrorCode, RoomId, SequenceNumber,
-    ServerMessage,
+    SequencedOperation, ServerMessage,
 };
 use zemdb_storage::{StorageEngine, StorageError};
 
@@ -79,11 +79,26 @@ enum Replica {
     /// Without data or metadata, until `Registered` gives the metadata to open it with: opened
     /// without metadata, or discarded.
     Empty,
-    /// Open in the storage engine, with the metadata that describe all of its data.
-    Open {
-        metadata: RoomMetadata,
-        registered: bool,
-    },
+    /// Open in the storage engine.
+    Open(OpenReplica),
+}
+
+struct OpenReplica {
+    /// The metadata that describe all of its data.
+    metadata: RoomMetadata,
+    registered: bool,
+    /// Behind the log of the server, it waits for a snapshot.
+    awaits_snapshot: bool,
+}
+
+impl OpenReplica {
+    fn new(metadata: RoomMetadata, registered: bool) -> Self {
+        Self {
+            metadata,
+            registered,
+            awaits_snapshot: false,
+        }
+    }
 }
 
 impl Room {
@@ -92,8 +107,63 @@ impl Room {
     }
 
     fn is_open(&self) -> bool {
-        matches!(self.state().replica, Replica::Open { .. })
+        matches!(self.state().replica, Replica::Open(_))
     }
+
+    /// Changes the open replica with `change` if the replica is still that of `epoch`.
+    fn update(&self, epoch: u64, change: impl FnOnce(&mut OpenReplica)) {
+        let mut state = self.state();
+        if state.epoch == epoch {
+            if let Replica::Open(open) = &mut state.replica {
+                change(open);
+            }
+        }
+    }
+
+    /// Leaves the replica of `epoch` unregistered, for the next request to register it again
+    /// with its cursor. Once per sync (`again`): a server that asks again contradicts itself.
+    fn register_again(&self, epoch: u64, again: &mut bool) -> Result<(), ClientError> {
+        if std::mem::replace(again, true) {
+            return Err(ClientError::Network(
+                "The server asked to register again twice".to_string(),
+            ));
+        }
+        self.update(epoch, |open| open.registered = false);
+        Ok(())
+    }
+}
+
+/// What the next request of a replica presents, read under its applier, so that no change of
+/// the replica is halfway.
+struct Request {
+    epoch: u64,
+    token: String,
+    /// The head and the incarnation of an open replica.
+    cursor: Option<(SequenceNumber, u128)>,
+    registered: bool,
+    awaits_snapshot: bool,
+}
+
+/// Whether `ops`, of a batch with `head_seq` and `has_more` in reply to a sync after `from_seq`,
+/// are the operations after it in order, up to the head at most and, unless there are more,
+/// reaching it.
+fn follows(
+    from_seq: SequenceNumber,
+    head_seq: SequenceNumber,
+    ops: &[SequencedOperation],
+    has_more: bool,
+) -> bool {
+    let in_order = (ops.iter().zip(1..))
+        .all(|(op, index)| op.seq.get().checked_sub(index) == Some(from_seq.get()));
+    let last = ops.last().map_or(from_seq, |op| op.seq);
+    // A batch with more brings some.
+    in_order
+        && last <= head_seq
+        && if has_more {
+            !ops.is_empty()
+        } else {
+            last == head_seq
+        }
 }
 
 /// The client id of `person` on the device `device_id`: `person#device`, with the device id in
@@ -179,7 +249,13 @@ impl Client {
         self.change(&room, Local::open).await?;
         match self.register(&room).await {
             // Without a valid reply, a replica with metadata opens all the same, to be read.
-            Err(ClientError::Network(_)) if room.is_open() => Ok(()),
+            Err(ClientError::Network(err)) => {
+                let opened = self.change(&room, |_, room| async move { Ok(room.is_open()) });
+                match opened.await? {
+                    true => Ok(()),
+                    false => Err(ClientError::Network(err)),
+                }
+            }
             registered => registered,
         }
     }
@@ -187,27 +263,17 @@ impl Client {
     /// Registers `room`, under its registration lock, unless it is registered: with the head of
     /// its storage room as its cursor and the incarnation of its metadata, or without them if it
     /// has none. `RoomReset` or `InvalidSequence` to a cursor discard the replica, which
-    /// registers again without one.
+    /// registers again without one. A reply for a replica discarded meanwhile changes nothing,
+    /// and the replica registers again.
     async fn register(&self, room: &Arc<Room>) -> Result<(), ClientError> {
         loop {
-            let (incarnation, token) = {
-                let state = room.state();
-                let incarnation = match &state.replica {
-                    Replica::Closed => return Err(ClientError::RoomClosed(room.id.clone())),
-                    Replica::Empty => None,
-                    Replica::Open {
-                        registered: true, ..
-                    } => return Ok(()),
-                    Replica::Open { metadata, .. } => Some(metadata.room_incarnation),
-                };
-                (incarnation, state.token.clone())
-            };
-            let cursor = match incarnation {
-                Some(_) => Some(self.head(&room.id).await?),
-                None => None,
-            };
-            let correlation_id =
-                CorrelationId::new(self.correlation_ids.fetch_add(1, Ordering::Relaxed));
+            let request = self.change(room, Local::request).await?;
+            if request.registered {
+                return Ok(());
+            }
+            let (epoch, token) = (request.epoch, request.token);
+            let (cursor, incarnation) = request.cursor.unzip();
+            let correlation_id = self.correlation_id();
             let message = ClientMessage::RegisterClient {
                 correlation_id,
                 room_id: room.id.clone(),
@@ -235,9 +301,9 @@ impl Client {
                         schema_id,
                         schema,
                     };
-                    return self
-                        .change(room, |local, room| local.registered(room, metadata))
-                        .await;
+                    let registered =
+                        move |local: Local, room| local.registered(room, epoch, cursor, metadata);
+                    self.change(room, registered).await?;
                 }
                 ServerMessage::Error {
                     correlation_id: reply_id,
@@ -249,7 +315,8 @@ impl Client {
                 {
                     match code {
                         ErrorCode::RoomReset | ErrorCode::InvalidSequence if cursor.is_some() => {
-                            self.change(room, Local::discard_open).await?;
+                            let discard = move |local: Local, room| local.discard_open(room, epoch);
+                            self.change(room, discard).await?;
                         }
                         code => {
                             return Err(ClientError::Network(format!(
@@ -267,6 +334,10 @@ impl Client {
         }
     }
 
+    fn correlation_id(&self) -> CorrelationId {
+        CorrelationId::new(self.correlation_ids.fetch_add(1, Ordering::Relaxed))
+    }
+
     /// Sends `message` with `token` and decodes its reply. No reply, or one that does not
     /// decode, is `Network`.
     async fn send(
@@ -281,13 +352,14 @@ impl Client {
 
     /// Runs `change` on `room` under its applier, in a task of its own, once the changes before
     /// it ended: a caller that stops waiting does not cut it halfway.
-    async fn change<F>(
+    async fn change<T, F>(
         &self,
         room: &Arc<Room>,
         change: impl FnOnce(Local, Arc<Room>) -> F,
-    ) -> Result<(), ClientError>
+    ) -> Result<T, ClientError>
     where
-        F: Future<Output = Result<(), ClientError>> + Send + 'static,
+        T: Send + 'static,
+        F: Future<Output = Result<T, ClientError>> + Send + 'static,
     {
         let applier = Arc::clone(&room.applier).lock_owned().await;
         let change = change(self.local.clone(), Arc::clone(room));
@@ -299,12 +371,149 @@ impl Client {
             .map_err(|err| ClientError::Storage(format!("A change of the replica failed: {err}")))?
     }
 
+    /// Reacts to `reply` to the request `correlation_id`, a sync or an ack of the replica of
+    /// `epoch` at `cursor`, when it is not the reply the request asks for: an error of the
+    /// request (which may come without its correlation id and its room) that asks to register
+    /// again, `ClientNotRegistered` or `InvalidSequence`, is `Ok`. Any other error is `Network`,
+    /// and after `BehindCompaction` the replica waits for a snapshot if it is still at `cursor`
+    /// (if it moved past it, the reply was delayed). Any other reply is `Network` too.
+    async fn refused(
+        &self,
+        room: &Arc<Room>,
+        epoch: u64,
+        cursor: SequenceNumber,
+        correlation_id: CorrelationId,
+        reply: ServerMessage,
+    ) -> Result<(), ClientError> {
+        let invalid = || ClientError::Network("Invalid reply to a sync or an ack".to_string());
+        let ServerMessage::Error {
+            correlation_id: reply_id,
+            room_id,
+            code,
+            message,
+        } = reply
+        else {
+            return Err(invalid());
+        };
+        if reply_id.is_some_and(|reply_id| reply_id != correlation_id)
+            || room_id.is_some_and(|room_id| room_id != room.id)
+        {
+            return Err(invalid());
+        }
+        match code {
+            ErrorCode::ClientNotRegistered | ErrorCode::InvalidSequence => return Ok(()),
+            ErrorCode::BehindCompaction => {
+                let behind = move |local: Local, room| local.behind(room, epoch, cursor);
+                self.change(room, behind).await?;
+            }
+            _ => {}
+        }
+        Err(ClientError::Network(format!(
+            "The server refused the request: {code:?}: {message}"
+        )))
+    }
+
     /// The head of the storage room of `room_id`, read outside its applier: a storage room
     /// closed meanwhile is `RoomClosed`.
     async fn head(&self, room_id: &RoomId) -> Result<SequenceNumber, ClientError> {
         match self.local.storage.get_head_seq(room_id).await {
             Err(StorageError::RoomNotFound(_)) => Err(ClientError::RoomClosed(room_id.clone())),
             head => Ok(head?),
+        }
+    }
+
+    /// Catches `room_id` up with the head of the server: asks for the operations after the head
+    /// of its replica until the server has no more, applies them through its applier, and
+    /// acknowledges the head reached. A room that is not registered registers first.
+    ///
+    /// A reply is checked before it is used: a batch with the correlation id and the room of the
+    /// request, whose operations follow the cursor of the request in order, up to its head at
+    /// most and, unless it has more, reaching it (with more, it brings some); and a confirmation
+    /// of the head acknowledged. Any other reply, or none, is `Network`. A head below the cursor
+    /// of the request, `InvalidSequence` and `ClientNotRegistered` register again, with the
+    /// cursor, and the sync goes on; a second time in a sync is `Network`. `BehindCompaction`
+    /// leaves the replica waiting for a snapshot, and the sync of a replica that waits is
+    /// `Network`, without sending anything.
+    pub async fn sync(&self, room_id: RoomId) -> Result<(), ClientError> {
+        let room = self.room(&room_id)?;
+        let mut again = false;
+        loop {
+            let request = self.change(&room, Local::request).await?;
+            let Some((from_seq, _)) = request.cursor.filter(|_| request.registered) else {
+                let _registration = room.registration.lock().await;
+                self.register(&room).await?;
+                continue;
+            };
+            if request.awaits_snapshot {
+                return Err(ClientError::Network(
+                    "The replica waits for a snapshot".to_string(),
+                ));
+            }
+            let (epoch, token) = (request.epoch, request.token);
+            let correlation_id = self.correlation_id();
+            let message = ClientMessage::Sync {
+                correlation_id,
+                room_id: room.id.clone(),
+                client_id: self.client_id.clone(),
+                from_seq,
+                // As many as the server serves in a reply.
+                max_batch_size: u32::MAX,
+            };
+            let (head_seq, ops, has_more) = match self.send(&message, &token).await? {
+                ServerMessage::SyncBatch {
+                    correlation_id: reply_id,
+                    room_id,
+                    head_seq,
+                    ops,
+                    has_more,
+                    ..
+                } if reply_id == correlation_id && room_id == room.id => (head_seq, ops, has_more),
+                reply => {
+                    self.refused(&room, epoch, from_seq, correlation_id, reply)
+                        .await?;
+                    room.register_again(epoch, &mut again)?;
+                    continue;
+                }
+            };
+            // The server may have lost sequences that the replica applied.
+            if head_seq < from_seq {
+                room.register_again(epoch, &mut again)?;
+                continue;
+            }
+            if !follows(from_seq, head_seq, &ops, has_more) {
+                return Err(ClientError::Network(
+                    "Invalid batch in reply to a sync".to_string(),
+                ));
+            }
+            let applied = self.change(&room, move |local, room| local.apply(room, epoch, ops));
+            let Some(head) = applied.await?.filter(|head| !has_more && *head >= head_seq) else {
+                continue;
+            };
+
+            let correlation_id = self.correlation_id();
+            let message = ClientMessage::Ack {
+                correlation_id,
+                room_id: room.id.clone(),
+                client_id: self.client_id.clone(),
+                ack_seq: head,
+            };
+            match self.send(&message, &token).await? {
+                ServerMessage::AckConfirmed {
+                    correlation_id: reply_id,
+                    room_id,
+                    ack_seq,
+                    head_seq,
+                } if reply_id == correlation_id && room_id == room.id && ack_seq == head => {
+                    if head_seq >= head {
+                        return Ok(());
+                    }
+                }
+                reply => {
+                    self.refused(&room, epoch, head, correlation_id, reply)
+                        .await?
+                }
+            }
+            room.register_again(epoch, &mut again)?;
         }
     }
 
@@ -320,7 +529,7 @@ impl Client {
         let room = self.room(&room_id)?;
         let (registered, epoch) = {
             let state = room.state();
-            let Replica::Open { registered, .. } = state.replica else {
+            let Replica::Open(OpenReplica { registered, .. }) = state.replica else {
                 return Err(ClientError::RoomClosed(room_id));
             };
             (registered, state.epoch)
@@ -375,6 +584,30 @@ impl fmt::Debug for Client {
 
 /// The changes of a replica, which run under its applier, in a task of their own.
 impl Local {
+    /// The request that the replica presents; `RoomClosed` if it is closed.
+    async fn request(self, room: Arc<Room>) -> Result<Request, ClientError> {
+        let (mut request, incarnation) = {
+            let state = room.state();
+            let open = match &state.replica {
+                Replica::Closed => return Err(ClientError::RoomClosed(room.id.clone())),
+                Replica::Empty => None,
+                Replica::Open(open) => Some(open),
+            };
+            let request = Request {
+                epoch: state.epoch,
+                token: state.token.clone(),
+                cursor: None,
+                registered: open.is_some_and(|open| open.registered),
+                awaits_snapshot: open.is_some_and(|open| open.awaits_snapshot),
+            };
+            (request, open.map(|open| open.metadata.room_incarnation))
+        };
+        if let Some(incarnation) = incarnation {
+            request.cursor = Some((self.storage.get_head_seq(&room.id).await?, incarnation));
+        }
+        Ok(request)
+    }
+
     /// Opens the replica of a room out of the client from its metadata. Without them, or with
     /// damaged data, discards it; any other error keeps it, and the room stays out of the
     /// client.
@@ -394,10 +627,7 @@ impl Local {
             .await
         {
             Ok(()) => {
-                room.state().replica = Replica::Open {
-                    metadata,
-                    registered: false,
-                };
+                room.state().replica = Replica::Open(OpenReplica::new(metadata, false));
                 Ok(())
             }
             Err(StorageError::SnapshotCorruption(_) | StorageError::WalCorruption(_)) => {
@@ -407,33 +637,111 @@ impl Local {
         }
     }
 
-    /// Takes `Registered`, with the metadata it gives: an empty replica saves them before its
-    /// data, and opens its storage room with their schema; an open one is registered.
-    async fn registered(self, room: Arc<Room>, metadata: RoomMetadata) -> Result<(), ClientError> {
-        match &mut room.state().replica {
-            Replica::Closed => return Err(ClientError::RoomClosed(room.id.clone())),
-            Replica::Open { registered, .. } => {
-                *registered = true;
-                return Ok(());
-            }
+    /// Takes `Registered` for the replica of `epoch` that presented `cursor`, with the metadata
+    /// it gives: an empty replica saves them before its data, and opens its storage room with
+    /// their schema; an open one is registered, unless its head went back below the cursor (a
+    /// memory room that opened again at 0), and then it registers again with its head. A
+    /// replica of another epoch is left as it is.
+    async fn registered(
+        self,
+        room: Arc<Room>,
+        epoch: u64,
+        cursor: Option<SequenceNumber>,
+        metadata: RoomMetadata,
+    ) -> Result<(), ClientError> {
+        let open = match &mut *room.state() {
+            State {
+                replica: Replica::Closed,
+                ..
+            } => return Err(ClientError::RoomClosed(room.id.clone())),
+            state if state.epoch != epoch => return Ok(()),
+            State {
+                replica: Replica::Open(_),
+                ..
+            } => true,
             // Out of the client until it opens.
-            replica => *replica = Replica::Closed,
+            State { replica, .. } => {
+                *replica = Replica::Closed;
+                false
+            }
+        };
+        if open {
+            let head = self.storage.get_head_seq(&room.id).await?;
+            if cursor.is_none_or(|cursor| cursor <= head) {
+                room.update(epoch, |open| open.registered = true);
+            }
+            return Ok(());
         }
         self.metadata.save_room(&room.id, &metadata).await?;
         self.storage
             .open_room(&room.id, metadata.schema.clone())
             .await?;
-        room.state().replica = Replica::Open {
-            metadata,
-            registered: true,
-        };
+        room.state().replica = Replica::Open(OpenReplica::new(metadata, true));
         Ok(())
     }
 
-    /// Discards the replica of an open room. One closed meanwhile is left as it is.
-    async fn discard_open(self, room: Arc<Room>) -> Result<(), ClientError> {
-        if !room.is_open() {
-            return Err(ClientError::RoomClosed(room.id.clone()));
+    /// Applies `ops`, a batch in reply to a request of `epoch`, after dropping those the replica
+    /// holds, and returns its head after them. A batch for a replica that is closed or no longer
+    /// that of `epoch` is not applied (`None`), and neither is one that does not start right
+    /// after the head. An error after which the storage room may have changed (`Io`,
+    /// `RoomFailed`) is returned once the storage room is closed and opened again from its
+    /// files, as an open does.
+    async fn apply(
+        self,
+        room: Arc<Room>,
+        epoch: u64,
+        ops: Vec<SequencedOperation>,
+    ) -> Result<Option<SequenceNumber>, ClientError> {
+        {
+            let state = room.state();
+            if state.epoch != epoch || !matches!(state.replica, Replica::Open(_)) {
+                return Ok(None);
+            }
+        }
+        let head = self.storage.get_head_seq(&room.id).await?;
+        let ops: Vec<_> = ops.into_iter().skip_while(|op| op.seq <= head).collect();
+        if ops
+            .first()
+            .is_none_or(|op| op.seq.get().checked_sub(1) != Some(head.get()))
+        {
+            return Ok(Some(head));
+        }
+        match self.storage.apply_batch(&room.id, ops).await {
+            Ok(report) => Ok(Some(report.head_seq())),
+            Err(err @ (StorageError::Io(_) | StorageError::RoomFailed { .. })) => {
+                self.clone().close(Arc::clone(&room)).await?;
+                self.open(room).await?;
+                Err(err.into())
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Leaves the replica of `epoch` waiting for a snapshot if it is still at `cursor`: one that
+    /// moved past it got a delayed reply.
+    async fn behind(
+        self,
+        room: Arc<Room>,
+        epoch: u64,
+        cursor: SequenceNumber,
+    ) -> Result<(), ClientError> {
+        if room.is_open() && self.storage.get_head_seq(&room.id).await? == cursor {
+            room.update(epoch, |open| open.awaits_snapshot = true);
+        }
+        Ok(())
+    }
+
+    /// Discards the replica of `epoch`. One closed meanwhile is left as it is (`RoomClosed`), and
+    /// so is one of another epoch.
+    async fn discard_open(self, room: Arc<Room>, epoch: u64) -> Result<(), ClientError> {
+        {
+            let state = room.state();
+            if matches!(state.replica, Replica::Closed) {
+                return Err(ClientError::RoomClosed(room.id.clone()));
+            }
+            if state.epoch != epoch {
+                return Ok(());
+            }
         }
         self.discard(room).await
     }
@@ -445,7 +753,7 @@ impl Local {
     async fn discard(self, room: Arc<Room>) -> Result<(), ClientError> {
         let replica = std::mem::take(&mut room.state().replica);
         let removed = self.metadata.remove_room(&room.id).await;
-        if let Replica::Open { .. } = replica {
+        if let Replica::Open(_) = replica {
             self.storage.close_room(&room.id).await?;
         }
         removed?;
@@ -461,7 +769,7 @@ impl Local {
     async fn close(self, room: Arc<Room>) -> Result<(), ClientError> {
         let replica = std::mem::take(&mut room.state().replica);
         match replica {
-            Replica::Open { .. } => Ok(self.storage.close_room(&room.id).await?),
+            Replica::Open(_) => Ok(self.storage.close_room(&room.id).await?),
             Replica::Empty => Ok(()),
             Replica::Closed => Err(ClientError::RoomClosed(room.id.clone())),
         }

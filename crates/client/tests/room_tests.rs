@@ -14,51 +14,7 @@ use zemdb_client::{
 };
 use zemdb_core::*;
 use zemdb_storage::format::{BATCH_HEADER_SIZE, HEADER_SIZE};
-use zemdb_storage::{
-    DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, StorageEngine, StorageError,
-};
-
-/// The options of a disk engine over `dir` that compacts only when asked to.
-fn options(dir: &Path) -> DiskStorageOptions {
-    DiskStorageOptions::new(dir).auto_compact(false)
-}
-
-fn engine(dir: &Path) -> DiskStorageEngine {
-    DiskStorageEngine::new(options(dir)).unwrap()
-}
-
-/// A client of ana over `storage`, with its metadata in `dir`.
-async fn open_client(
-    dir: &Path,
-    storage: impl StorageEngine + 'static,
-    transport: &TestTransport,
-) -> Client {
-    let metadata = FileMetadata::new(dir);
-    let client = Client::open(
-        ClientConfig::new("ana"),
-        storage,
-        metadata,
-        transport.clone(),
-    );
-    client.await.unwrap()
-}
-
-/// Opens `room_id` in `client`, with a token of the client.
-async fn open_room(client: &Client, room_id: &RoomId) -> Result<(), ClientError> {
-    let token = token(&client.client_id(), room_id);
-    client.open_room(room_id.clone(), token).await
-}
-
-fn status(head_seq: u64, epoch: u64, registered: bool) -> RoomStatus {
-    RoomStatus {
-        head_seq: SequenceNumber::new(head_seq),
-        epoch,
-        registered,
-        failed_closed: false,
-        writes_in_flight: 0,
-        retained: 0,
-    }
-}
+use zemdb_storage::{DiskStorageEngine, MemoryStorageEngine, StorageEngine, StorageError};
 
 fn closed(room_id: &RoomId) -> Result<RoomStatus, ClientError> {
     Err(ClientError::RoomClosed(room_id.clone()))

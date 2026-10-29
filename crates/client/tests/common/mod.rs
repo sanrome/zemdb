@@ -1,6 +1,6 @@
 //! Fixtures shared by the integration tests: the server in process, with a transport to it that
 //! logs what is sent and answers on demand, a file layer that logs what is done to the files and
-//! fails on demand, and a storage engine that fails on demand.
+//! fails on demand, a storage engine that fails on demand, and a client over a disk engine.
 
 // Every file in `tests/` is a crate of its own that uses only part of this module.
 #![allow(dead_code)]
@@ -17,15 +17,22 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::{tempdir, TempDir};
+use tokio::sync::oneshot;
 use tower::ServiceExt;
-use zemdb_client::{endpoint, TransportClient, TransportError};
+use zemdb_client::{
+    endpoint, Client, ClientConfig, ClientError, FileMetadata, RoomStatus, TransportClient,
+    TransportError,
+};
 use zemdb_core::*;
 use zemdb_server::{
     build_router, generate_client_token, AppState, RoomManager, SchemaRegistry, ServerConfig,
     SnapshotRelay,
 };
 use zemdb_storage::files::{NativeFile, NativeFiles, RoomFile, RoomFiles};
-use zemdb_storage::{ApplyReport, RowStream, ScanOptions, StorageEngine, StorageError};
+use zemdb_storage::{
+    ApplyReport, DiskStorageEngine, DiskStorageOptions, RowStream, ScanOptions, StorageEngine,
+    StorageError,
+};
 
 pub const AUTH_SECRET: &str = "test_cluster_secret_key_1234567890";
 pub const ADMIN_SECRET: &str = "test_admin_secret_key_12345678901";
@@ -49,6 +56,48 @@ pub fn insert_task(id: i64) -> Operation {
 /// A client token of `client_id` for `room_id`, valid for 300 s.
 pub fn token(client_id: &ClientId, room_id: &RoomId) -> String {
     generate_client_token(client_id, room_id, Duration::from_secs(300), AUTH_SECRET)
+}
+
+/// The options of a disk engine over `dir` that compacts only when asked to.
+pub fn options(dir: &Path) -> DiskStorageOptions {
+    DiskStorageOptions::new(dir).auto_compact(false)
+}
+
+pub fn engine(dir: &Path) -> DiskStorageEngine {
+    DiskStorageEngine::new(options(dir)).unwrap()
+}
+
+/// A client of ana over `storage`, with its metadata in `dir`.
+pub async fn open_client(
+    dir: &Path,
+    storage: impl StorageEngine + 'static,
+    transport: &TestTransport,
+) -> Client {
+    let metadata = FileMetadata::new(dir);
+    let client = Client::open(
+        ClientConfig::new("ana"),
+        storage,
+        metadata,
+        transport.clone(),
+    );
+    client.await.unwrap()
+}
+
+/// Opens `room_id` in `client`, with a token of the client.
+pub async fn open_room(client: &Client, room_id: &RoomId) -> Result<(), ClientError> {
+    let token = token(&client.client_id(), room_id);
+    client.open_room(room_id.clone(), token).await
+}
+
+pub fn status(head_seq: u64, epoch: u64, registered: bool) -> RoomStatus {
+    RoomStatus {
+        head_seq: SequenceNumber::new(head_seq),
+        epoch,
+        registered,
+        failed_closed: false,
+        writes_in_flight: 0,
+        retained: 0,
+    }
 }
 
 /// The pieces of a server keeping its data in a temporary directory, built as the server's tests
@@ -174,6 +223,8 @@ impl TestServer {
             sent: Arc::default(),
             answer: Arc::default(),
             delay: Arc::default(),
+            hold: Arc::default(),
+            sync_batch_size: Arc::default(),
         }
     }
 }
@@ -192,6 +243,32 @@ pub fn error_reply(correlation_id: CorrelationId, room_id: &RoomId, code: ErrorC
 /// What a [`TestTransport`] answers a message with instead of the server, if anything.
 type Answer = dyn FnMut(&ClientMessage) -> Option<Result<Vec<u8>, TransportError>> + Send;
 
+/// The kind of the messages whose reply a [`TestTransport`] holds, with the ends of a [`Held`].
+type Hold = (
+    ClientMessageKind,
+    oneshot::Sender<()>,
+    oneshot::Receiver<()>,
+);
+
+/// The reply to a message that a [`TestTransport`] holds until it is released.
+pub struct Held {
+    replied: oneshot::Receiver<()>,
+    release: oneshot::Sender<()>,
+}
+
+impl Held {
+    /// Waits until the server replied to the message.
+    pub async fn replied(&mut self) {
+        let replied = tokio::time::timeout(Duration::from_secs(10), &mut self.replied).await;
+        replied.expect("no reply came").unwrap();
+    }
+
+    /// Lets the reply reach the client.
+    pub fn release(self) {
+        self.release.send(()).unwrap();
+    }
+}
+
 /// A transport to a [`TestServer`], which logs the messages it sends and can answer them itself.
 /// Each request runs in a task of its own, as over a network, where the server goes on with a
 /// request whose client stopped waiting.
@@ -201,6 +278,8 @@ pub struct TestTransport {
     sent: Arc<Mutex<Vec<ClientMessage>>>,
     answer: Arc<Mutex<Option<Box<Answer>>>>,
     delay: Arc<Mutex<Duration>>,
+    hold: Arc<Mutex<Vec<Hold>>>,
+    sync_batch_size: Arc<Mutex<Option<u32>>>,
 }
 
 impl TestTransport {
@@ -237,6 +316,48 @@ impl TestTransport {
         *self.answer.lock().unwrap() = None;
     }
 
+    /// Makes every sync ask for at most `size` operations.
+    pub fn sync_batch_size(&self, size: u32) {
+        *self.sync_batch_size.lock().unwrap() = Some(size);
+    }
+
+    /// Holds the reply to the next message of `kind`, from the server or answered: the message
+    /// reaches the server at once, and its reply reaches the client once the [`Held`] is
+    /// released.
+    pub fn hold_next_reply(&self, kind: ClientMessageKind) -> Held {
+        let (replied_tx, replied) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        self.hold
+            .lock()
+            .unwrap()
+            .push((kind, replied_tx, release_rx));
+        Held { replied, release }
+    }
+
+    /// Answers the next message of `kind` with the bytes `reply` gives for it, without reaching
+    /// the server.
+    pub fn answer_next(
+        &self,
+        kind: ClientMessageKind,
+        reply: impl FnOnce(&ClientMessage) -> Vec<u8> + Send + 'static,
+    ) {
+        let mut reply = Some(reply);
+        self.answer(move |message| match message.kind() == kind {
+            true => reply.take().map(|reply| Ok(reply(message))),
+            false => None,
+        });
+    }
+
+    /// Answers every message of `kind` with the bytes `reply` gives for it, without reaching the
+    /// server.
+    pub fn answer_every(
+        &self,
+        kind: ClientMessageKind,
+        mut reply: impl FnMut(&ClientMessage) -> Vec<u8> + Send + 'static,
+    ) {
+        self.answer(move |message| (message.kind() == kind).then(|| Ok(reply(message))));
+    }
+
     /// Answers the next registration with the bytes `reply` gives for its correlation id and
     /// room, without reaching the server.
     pub fn answer_next_registration(
@@ -256,7 +377,9 @@ impl TestTransport {
         });
     }
 
-    fn answer(
+    /// Answers each message that `answer` gives a reply for with it, without reaching the
+    /// server, until another answer replaces it.
+    pub fn answer(
         &self,
         answer: impl FnMut(&ClientMessage) -> Option<Result<Vec<u8>, TransportError>> + Send + 'static,
     ) {
@@ -274,6 +397,24 @@ impl fmt::Debug for TestTransport {
 impl TransportClient for TestTransport {
     async fn send(&self, message: &ClientMessage, token: &str) -> Result<Vec<u8>, TransportError> {
         self.sent.lock().unwrap().push(message.clone());
+        let held = {
+            let mut hold = self.hold.lock().unwrap();
+            let index = hold.iter().position(|(kind, ..)| *kind == message.kind());
+            index.map(|index| hold.remove(index))
+        };
+        let reply = self.reply(message, token).await;
+        // A dropped hold releases the reply.
+        if let Some((_, replied, release)) = held {
+            let _ = replied.send(());
+            let _ = release.await;
+        }
+        reply
+    }
+}
+
+impl TestTransport {
+    /// The reply to `message`: the answer to it, if any, or the server's.
+    async fn reply(&self, message: &ClientMessage, token: &str) -> Result<Vec<u8>, TransportError> {
         let answered = self
             .answer
             .lock()
@@ -283,10 +424,15 @@ impl TransportClient for TestTransport {
         if let Some(answer) = answered {
             return answer;
         }
-        let request = Request::post(endpoint(message))
+        let mut message = message.clone();
+        let size = *self.sync_batch_size.lock().unwrap();
+        if let (ClientMessage::Sync { max_batch_size, .. }, Some(size)) = (&mut message, size) {
+            *max_batch_size = size;
+        }
+        let request = Request::post(endpoint(&message))
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .header(CONTENT_TYPE, "application/octet-stream")
-            .body(Body::from(encode_message(message).unwrap()))
+            .body(Body::from(encode_message(&message).unwrap()))
             .unwrap();
         let (router, delay) = (self.router.clone(), *self.delay.lock().unwrap());
         let response = tokio::spawn(async move {
@@ -306,6 +452,7 @@ impl TransportClient for TestTransport {
 #[derive(Debug, Clone, Default)]
 pub struct TestFiles {
     failing: Option<(&'static str, &'static str)>,
+    fail_next: Arc<Mutex<Option<(&'static str, &'static str)>>>,
     next_write_delay: Arc<Mutex<Option<Duration>>>,
     log: Arc<Mutex<Vec<String>>>,
 }
@@ -318,6 +465,11 @@ impl TestFiles {
             failing: Some((operation, name)),
             ..Self::default()
         }
+    }
+
+    /// Makes the next `operation` on the file named `name` fail as in [`failing`](Self::failing).
+    pub fn fail_next(&self, operation: &'static str, name: &'static str) {
+        *self.fail_next.lock().unwrap() = Some((operation, name));
     }
 
     /// Makes the next write land `delay` after it is called, even if its caller stopped
@@ -344,7 +496,13 @@ impl TestFiles {
         if !matches!(operation, "size" | "read_at") {
             self.push(format!("{operation} {}", names.join(" ")));
         }
-        if self.failing.is_some() && self.failing == names.last().map(|name| (operation, *name)) {
+        let this = names.last().map(|name| (operation, *name));
+        let mut fail_next = self.fail_next.lock().unwrap();
+        let once = fail_next.is_some() && *fail_next == this;
+        if once {
+            *fail_next = None;
+        }
+        if once || (self.failing.is_some() && self.failing == this) {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected"));
         }
         Ok(())
@@ -490,6 +648,7 @@ impl RoomFile for TestFile {
 pub struct TestEngine<E> {
     inner: E,
     failing: Arc<Mutex<Vec<(&'static str, StorageError)>>>,
+    slow_open: Arc<Mutex<Option<Duration>>>,
 }
 
 impl<E> TestEngine<E> {
@@ -497,12 +656,18 @@ impl<E> TestEngine<E> {
         Self {
             inner,
             failing: Arc::default(),
+            slow_open: Arc::default(),
         }
     }
 
     /// Makes the next call of `method` (a method of `StorageEngine`) return `error`.
     pub fn fail_next(&self, method: &'static str, error: StorageError) {
         self.failing.lock().unwrap().push((method, error));
+    }
+
+    /// Makes the next call of `open_room` start `delay` after it is called.
+    pub fn slow_open(&self, delay: Duration) {
+        *self.slow_open.lock().unwrap() = Some(delay);
     }
 
     fn check(&self, method: &str) -> Result<(), StorageError> {
@@ -517,6 +682,8 @@ impl<E> TestEngine<E> {
 #[async_trait]
 impl<E: StorageEngine> StorageEngine for TestEngine<E> {
     async fn open_room(&self, room_id: &RoomId, schema: Schema) -> Result<(), StorageError> {
+        let delay = self.slow_open.lock().unwrap().take();
+        tokio::time::sleep(delay.unwrap_or_default()).await;
         self.check("open_room")?;
         self.inner.open_room(room_id, schema).await
     }
