@@ -27,6 +27,8 @@ Este documento es el índice de fases y el backlog para después de la v0.1. Lo 
 
 **Lo que sigue:** la sub-fase 4.2 del [plan de la Fase 4](docs/proposals/2026-10-fase4-plan.md), el núcleo de la réplica contra un transporte abstracto, en curso con su [plan por lotes](docs/proposals/2026-10-fase4_2-nucleo-replica.md); cierra con la auditoría amplia del SDK (DC3). La 4.1, lo que el SDK necesita de `zemdb-core`, `zemdb-storage` y `zemdb-server`, cerró el 25 de Octubre de 2026 ([plan](docs/proposals/2026-10-fase4_1-storage-servidor.md)).
 
+**Fuera de las fases:** las [evaluaciones de performance](docs/proposals/2026-10-evaluaciones-performance.md) del servidor, en paralelo a la Fase 4. La primera mide el commit con los clientes al día.
+
 ---
 
 ## 2. Fase 5: Pruebas de Integración de Extremo a Extremo
