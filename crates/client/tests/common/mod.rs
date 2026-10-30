@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
-use axum::http::Request;
+use axum::http::{Request, StatusCode};
 use axum::Router;
 use bytes::Bytes;
 use std::fmt;
@@ -30,8 +30,8 @@ use zemdb_server::{
 };
 use zemdb_storage::files::{NativeFile, NativeFiles, RoomFile, RoomFiles};
 use zemdb_storage::{
-    ApplyReport, DiskStorageEngine, DiskStorageOptions, RowStream, ScanOptions, StorageEngine,
-    StorageError,
+    ApplyReport, DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, RowStream,
+    ScanOptions, StorageEngine, StorageError,
 };
 
 pub const AUTH_SECRET: &str = "test_cluster_secret_key_1234567890";
@@ -134,7 +134,8 @@ pub async fn setup<S: StorageEngine + Clone + 'static>(
     (server, room_id, transport, storage, client)
 }
 
-/// The correlation id and the room of `message`, a sync, an ack or a commit.
+/// The correlation id and the room of `message`, a sync, an ack, a commit, a heartbeat or a
+/// request of a chunk.
 pub fn request(message: &ClientMessage) -> (CorrelationId, RoomId) {
     match message {
         ClientMessage::Sync {
@@ -151,12 +152,22 @@ pub fn request(message: &ClientMessage) -> (CorrelationId, RoomId) {
             correlation_id,
             room_id,
             ..
+        }
+        | ClientMessage::Heartbeat {
+            correlation_id,
+            room_id,
+            ..
+        }
+        | ClientMessage::RequestSnapshotChunk {
+            correlation_id,
+            room_id,
+            ..
         } => (*correlation_id, room_id.clone()),
         message => panic!("{message:?}"),
     }
 }
 
-/// Answers the next message of `kind`, a sync, an ack or a commit, with what `reply` gives for its
+/// Answers the next message of `kind` (one of [`request`]) with what `reply` gives for its
 /// correlation id and room.
 pub fn answer_next(
     transport: &TestTransport,
@@ -212,13 +223,30 @@ pub struct TestServer {
 
 impl TestServer {
     pub fn new() -> Self {
+        Self::with(|_| {})
+    }
+
+    /// A server whose rooms seal a segment of their log every 5 operations, and delete it at
+    /// the disk maintenance that follows, every 30 s.
+    pub fn pruning() -> Self {
+        Self::with(|config| {
+            config.ram_max_ops = 5;
+            config.warm_disk_ttl_secs = 0;
+            config.cold_disk_ttl_secs = 0;
+        })
+    }
+
+    /// A server with the configuration that `change` makes of the test's.
+    pub fn with(change: impl FnOnce(&mut ServerConfig)) -> Self {
         let dir = tempdir().unwrap();
-        let config = Arc::new(ServerConfig {
+        let mut config = ServerConfig {
             data_dir: dir.path().join("data"),
             auth_secret: AUTH_SECRET.to_string(),
             admin_secret: ADMIN_SECRET.to_string(),
             ..ServerConfig::default()
-        });
+        };
+        change(&mut config);
+        let config = Arc::new(config);
         let registry = Arc::new(SchemaRegistry::new(config.data_dir.join("schemas")).unwrap());
         let relay = Arc::new(
             SnapshotRelay::new(
@@ -276,6 +304,31 @@ impl TestServer {
         metadata.unwrap().room_incarnation
     }
 
+    /// Waits until `room_id` no longer retains its log before `tail`: with a paused clock, the
+    /// disk maintenance of [`pruning`](Self::pruning) comes at no cost.
+    pub async fn prune(&self, room_id: &RoomId, tail: u64) {
+        for _ in 0..120 {
+            let bounds = self.state.room_manager.log_bounds(room_id).await.unwrap();
+            if bounds.tail_seq.get() >= tail {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        panic!("The log of {room_id} was not pruned up to {tail}");
+    }
+
+    /// Uploads `snapshot`, at the sequence `seq`, to the relay as the active snapshot of
+    /// `room_id`, as the snapshot worker.
+    pub async fn upload(&self, room_id: &RoomId, seq: u64, snapshot: Vec<u8>) {
+        let request = Request::post(format!("/rooms/{room_id}/snapshot/upload"))
+            .header(AUTHORIZATION, format!("Bearer {ADMIN_SECRET}"))
+            .header("x-snapshot-head-seq", seq.to_string())
+            .body(Body::from(snapshot))
+            .unwrap();
+        let response = build_router(self.state.clone()).oneshot(request).await;
+        assert_eq!(response.unwrap().status(), StatusCode::OK);
+    }
+
     /// Commits an insert of each of `ids` into `room_id`, as a client of its own, and returns
     /// them with the sequences they got.
     pub async fn commit(
@@ -314,7 +367,10 @@ impl TestServer {
             known_incarnation: None,
         })
         .await;
-        assert!(matches!(registered, ServerMessage::Registered { .. }));
+        // It presents the head as its cursor, also in a room that prunes its log.
+        let ServerMessage::Registered { mut head_seq, .. } = registered else {
+            panic!("{registered:?}");
+        };
         let mut sequenced = Vec::new();
         for op in ops {
             let reply = send(ClientMessage::Commit {
@@ -322,13 +378,14 @@ impl TestServer {
                 room_id: room_id.clone(),
                 client_id: client_id.clone(),
                 mutation_id: MutationId::from(uuid::Uuid::new_v4().as_u128()),
-                last_ack_seq: SequenceNumber::new(0),
+                last_ack_seq: head_seq,
                 op: op.clone(),
             })
             .await;
             let ServerMessage::CommitAck { assigned_seq, .. } = reply else {
                 panic!("{reply:?}");
             };
+            head_seq = assigned_seq;
             sequenced.push(SequencedOperation::new(assigned_seq, op));
         }
         sequenced
@@ -347,6 +404,14 @@ impl TestServer {
             sync_batch_size: Arc::default(),
         }
     }
+}
+
+/// The snapshot of a replica of `room_id` with `schema` that applied `ops`.
+pub async fn snapshot(room_id: &RoomId, schema: Schema, ops: &[SequencedOperation]) -> Vec<u8> {
+    let storage = MemoryStorageEngine::new();
+    storage.open_room(room_id, schema).await.unwrap();
+    storage.apply_batch(room_id, ops.to_vec()).await.unwrap();
+    storage.create_snapshot(room_id).await.unwrap()
 }
 
 /// The encoding of an error with `code` for the request `correlation_id` of `room_id`.

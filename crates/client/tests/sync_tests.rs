@@ -496,7 +496,9 @@ async fn a_sync_or_an_ack_the_server_refuses_fails_and_changes_nothing() {
 }
 
 #[tokio::test]
-async fn behind_the_log_of_the_server_the_replica_waits_for_a_snapshot() {
+async fn behind_the_log_of_the_server_the_replica_registers_again_with_its_cursor() {
+    // `Registered` tells whether it waits for a snapshot: here the log is whole, and the sync goes
+    // on.
     for kind in [Sync, Ack] {
         let dir = tempdir().unwrap();
         let (server, room_id, transport, _, client) = setup(dir.path(), engine(dir.path())).await;
@@ -504,27 +506,11 @@ async fn behind_the_log_of_the_server_the_replica_waits_for_a_snapshot() {
         answer_next(&transport, kind, |id, room| {
             error_reply(id, room, ErrorCode::BehindCompaction)
         });
-        let synced = client.sync(room_id.clone()).await;
-        assert!(
-            matches!(synced, Err(ClientError::Network(_))),
-            "{kind:?}: {synced:?}"
-        );
-        // While it waits, a sync sends nothing.
-        let sent = transport.sent().len();
-        let synced = client.sync(room_id.clone()).await;
-        assert!(
-            matches!(synced, Err(ClientError::Network(_))),
-            "{kind:?}: {synced:?}"
-        );
-        assert_eq!(transport.sent().len(), sent, "{kind:?}");
-        let head = if kind == Sync { 0 } else { 3 };
-        let status_now = client.status(room_id.clone()).await;
-        assert_eq!(status_now, Ok(status(head, 1, true)), "{kind:?}");
-
-        // Opened again, it asks again.
-        client.close_room(room_id.clone()).await.unwrap();
-        open_room(&client, &room_id).await.unwrap();
         client.sync(room_id.clone()).await.unwrap();
+        let cursor = if kind == Sync { 0 } else { 3 };
+        let incarnation = server.incarnation(&room_id).await;
+        let registered = transport.registrations()[1..].to_vec();
+        assert_eq!(registered, [(Some(cursor), Some(incarnation))], "{kind:?}");
         let status_now = client.status(room_id.clone()).await;
         assert_eq!(status_now, Ok(status(3, 1, true)), "{kind:?}");
     }
@@ -549,6 +535,7 @@ async fn behind_the_log_of_the_server_the_replica_waits_for_a_snapshot() {
     server.commit(&room_id, 4..=5).await;
     client.sync(room_id.clone()).await.unwrap();
     assert_eq!(client.status(room_id.clone()).await, Ok(status(5, 1, true)));
+    assert_eq!(transport.registrations().len(), 1);
 }
 
 #[tokio::test]

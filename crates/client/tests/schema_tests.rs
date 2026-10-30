@@ -487,7 +487,7 @@ async fn a_schema_that_does_not_evolve_from_the_replicas_fails_the_room_closed()
 
 #[tokio::test]
 async fn a_reply_that_comes_after_the_room_failed_closed_neither_applies_nor_registers() {
-    for late_reply in ["batch", "not registered"] {
+    for late_reply in ["batch", "not registered", "behind"] {
         let dir = tempdir().unwrap();
         let (server, room_id, transport, storage, client) =
             setup(dir.path(), engine(dir.path())).await;
@@ -495,7 +495,7 @@ async fn a_reply_that_comes_after_the_room_failed_closed_neither_applies_nor_reg
         client.sync(room_id.clone()).await.unwrap();
 
         // A sync whose reply comes once another sync learned a schema that does not evolve from
-        // the replica's: a batch with more operations, or `ClientNotRegistered`.
+        // the replica's: a batch with more operations, `ClientNotRegistered` or `BehindCompaction`.
         let ops = server.commit(&room_id, 4..=5).await;
         let incarnation = server.incarnation(&room_id).await;
         let mut syncs = 0;
@@ -509,7 +509,10 @@ async fn a_reply_that_comes_after_the_room_failed_closed_neither_applies_nor_reg
                 let id = *correlation_id;
                 Some(Ok(match (syncs, late_reply) {
                     (1, "batch") => batch(id, room_id, 5, &ops, ("tasks", 1)),
-                    (1, _) => error_reply(id, room_id, ErrorCode::ClientNotRegistered),
+                    (1, "not registered") => {
+                        error_reply(id, room_id, ErrorCode::ClientNotRegistered)
+                    }
+                    (1, _) => error_reply(id, room_id, ErrorCode::BehindCompaction),
                     _ => batch(id, room_id, 3, &[], ("tasks", 2)),
                 }))
             }

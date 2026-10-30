@@ -13,6 +13,7 @@ workspace = true
 zemdb-core = { workspace = true }
 zemdb-storage = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
 crc32fast = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -23,7 +24,6 @@ uuid = { workspace = true }
 [dev-dependencies]
 zemdb-server = { path = "../server" }
 axum = { workspace = true }
-bytes = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.4", features = ["util"] }

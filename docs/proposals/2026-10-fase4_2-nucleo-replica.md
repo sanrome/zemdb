@@ -2,7 +2,7 @@
 
 **Fecha:** 26 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lotes 0 (el contrato), 1 (`delete_room`), 2 (la encarnación en los chunks del relay), 3 (el esqueleto del cliente), 4 (apertura, registro, descarte y cierre), 5 (el aplicador y `sync`), 6 (el esquema) y 7 (las escrituras) cerrados. DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 8.
+**Estado:** En curso: Lotes 0 (el contrato), 1 (`delete_room`), 2 (la encarnación en los chunks del relay), 3 (el esqueleto del cliente), 4 (apertura, registro, descarte y cierre), 5 (el aplicador y `sync`), 6 (el esquema), 7 (las escrituras) y 8 (el heartbeat y la bajada de snapshots) cerrados. DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 9.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.2. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -132,7 +132,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 | 5 | El aplicador y `sync` | client | DC7, DC21 | K1, K12 | ✅ |
 | 6 | El esquema | client | DC5, DC20 | K6, C1 | ✅ |
 | 7 | Escrituras | client | DC6, DC7, DC21 | K2, K15 | ✅ |
-| 8 | `heartbeat` y la bajada de snapshots | client | DC20, DC22, DC23 | K7, K2, K12, K15 | ⬜ |
+| 8 | `heartbeat` y la bajada de snapshots | client | DC20, DC22, DC23 | K7, K2, K12, K15 | ✅ |
 | 9 | La subida de snapshots | client | DC22, DC23 | K7, K4 | ⬜ |
 | 10 | El arnés de simulación | client (tests) | §5.3 del plan de la fase | K1, K2, K3, K4, K7, K15 | ⬜ |
 | 11 | Robustez: fuzzing de respuestas y snapshots | client (tests) | — | K12 | ⬜ |
@@ -1017,7 +1017,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
      - lo que garantiza el plazo es que no sale ningún intento después (un registro en curso se corta), no que no salga nada;
      - con un head reabierto que no se lee, mientras una escritura vieja sin `CommitAck` retiene el rango hasta `u64::MAX`, una posterior que se aplicó con su reporte termina `OutcomeUnknown` en lugar de `Ok`. Nunca da un `Ok` falso, solo pasa con fallas inyectadas y dura a lo sumo el plazo de la vieja: queda así.
 
-### Lote 8 · `heartbeat` y la bajada de snapshots (`zemdb-client`)
+### Lote 8 · `heartbeat` y la bajada de snapshots (`zemdb-client`) · ✅ Hecho
 **Objetivo:** que un cliente atrasado termine al día (DC22, INV-K7).
 
 **Qué se hace:** `heartbeat` y su reacción (la señal de esquema, el head menor, el head visto de DC21, la bajada si la espera, y el `snapshot_wanted` que confirma, que sube el Lote 9); un registro que deja al cliente detrás del log (`cursor < tail_seq − 1`) también lo deja esperando un snapshot (hasta este lote, lo detecta el sync siguiente, con `BehindCompaction`); la bajada por chunks, con su validación, el tope, `SnapshotSuperseded`, `RoomNotFound` en el chunk 0, el BLAKE3 y `apply_snapshot` en una tarea propia del aplicador, con DC20 ante sus errores; el commit que recibe `BehindCompaction` se pone al día y reintenta dentro del plazo; una sala que falla cerrada no manda heartbeats.
@@ -1033,10 +1033,174 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 
 **Documentos:** `ARCHITECTURE.md` §11 (el heartbeat y la bajada); `INVARIANTES.md`: K7, K12 y K15.
 
+**Hecho.**
+- **API** (`zemdb-client`):
+  - **`heartbeat(room_id)`**: manda `Heartbeat` y reacciona a su `HeartbeatAck`. Una sala sin registrar se registra antes, y una que falla cerrada no manda nada (`FailedClosed`), así que deja de mandar heartbeats (requisito 2).
+    - La respuesta se valida antes de usarla: un `HeartbeatAck` con la correlación y la sala del pedido. Cualquier otra respuesta, o ninguna, es `Network`.
+    - `ClientNotRegistered`, un head menor que el de la réplica al mandar el heartbeat (requisito 8) y un ack con otro esquema, o una versión posterior del suyo (DC20), registran la réplica con su cursor, y el heartbeat se manda otra vez. Una segunda vez en el mismo heartbeat es `Network`.
+    - Su head es un head visto (DC21; pasó del Lote 7).
+    - Una réplica que espera un snapshot toma del ack si hay uno usable, y si lo hay lo baja e instala; después manda el heartbeat otra vez, desde el estado que dejó la bajada. `snapshot_wanted` se ignora hasta el Lote 9.
+  - **La espera de un snapshot.** La réplica espera un snapshot cuando `Registered` la deja detrás del log (su head menor que `tail_seq − 1`). `Registered` y cada `HeartbeatAck` dicen si hay uno usable.
+    - `BehindCompaction` a un pedido en el head de la réplica la vuelve a registrar con ese cursor, como `ClientNotRegistered`, y `Registered` dice si espera. El servidor toma ese cursor en lugar del que guardaba, que podía estar adelantado (el límite aceptado de INV-K5), así que la ve detrás del log y pide un snapshot. Uno a un cursor que la réplica ya pasó, o de otra época, es una respuesta demorada: `Network`, sin cambiar nada.
+    - Un `BehindCompaction` al cursor después de que un registro de la misma llamada encontró la réplica dentro del log viene de un hueco del log retenido (INV-Y2): el servidor pide un snapshot de arriba del hueco, y la réplica lo espera registrada. Lo decide el aplicador, en la época del pedido, sin marcar nunca la réplica registrada: una sala que falló cerrada en el medio no vuelve a mandar nada.
+    - Un sync de una réplica que espera baja el anunciado; sin anuncio, es `Network` sin mandar nada, y espera un heartbeat que lo anuncie. Un snapshot que la réplica descartó no se vuelve a bajar mientras sea el anunciado (por su secuencia).
+    - Terminan la espera un snapshot instalado, uno detrás de la réplica y un registro que la encuentra dentro del log. También cerrar, reabrir o descartar la réplica; una bajada en curso cuando la sala se cierra y se reabre en la misma época se instala igual, porque es de su encarnación.
+  - **La bajada**, una a la vez por sala: la que esperó a otra encuentra el snapshot instalado y no baja nada.
+    - Por chunks de 4 MiB (el máximo del relay), con la encarnación de los metadatos: el primero sin ancla y los demás anclados a su hash.
+    - Cada chunk se valida antes de guardarlo: la correlación, la sala y el índice del pedido; la secuencia, la cantidad de chunks, el tamaño y el hash del primero; una cantidad de chunks que su tamaño toma; y el largo que toma su índice.
+    - Un snapshot mayor que `max_snapshot_bytes` (campo nuevo de `ClientConfig`, 512 MiB) es `Config` después del primer chunk, y no se baja.
+    - Validado el primer chunk, el búfer reserva el tamaño que anuncia, dentro del tope; una reserva que falla es `Config`, nunca un abort. Vive dentro de la llamada.
+    - `SnapshotSuperseded` descarta lo bajado y vuelve al chunk 0, una vez por bajada. `RoomNotFound` deja la réplica esperando un heartbeat que anuncie uno. `RoomReset` la deja para volver a registrarse con su cursor, una vez por llamada, y es el registro el que descarta (DC23).
+    - Cualquier otra respuesta, o ninguna, descarta lo bajado: la llamada siguiente empieza otra vez del chunk 0.
+    - Al terminar, el BLAKE3 de los bytes, en el pool bloqueante de Tokio, se compara con el hash de los chunks. Un corte mientras tanto le deja los bytes a esa tarea hasta que termina.
+  - **La instalación**, bajo el aplicador y en una tarea propia, solo para la réplica de la época que pidió la bajada, y si la sala no falla cerrada: `apply_snapshot` con el esquema de los metadatos y la secuencia de los chunks.
+    - Instalado, la réplica deja de esperar, y las secuencias entre su head anterior y el del snapshot quedan sin reporte (DC21). El sync siguiente sigue desde ahí.
+    - `SnapshotBehind` no cambia nada, y la réplica deja de esperar.
+    - `SnapshotCorruption` y `SnapshotConstraints` son la señal de DC20: la réplica se registra con su cursor y se instala otra vez el mismo snapshot, con el esquema de `Registered` si cambió. Una llamada que ya se registró por otra causa termina con `Network`, y deja el snapshot para la siguiente.
+    - Si tampoco se instala, se descarta, como uno con otra secuencia que la de sus chunks (`SnapshotHeadMismatch`): `Network`, la réplica anota la secuencia del descartado y espera un heartbeat que anuncie otro. Nunca se descarta la réplica (INV-K3). Un snapshot más grande, descomprimido, que lo que toma el motor (2 GiB por defecto) es `SnapshotCorruption` para el motor, y corre la misma suerte: la sala no se pone al día, como con uno mayor que `max_snapshot_bytes` (límite aceptado de INV-K7).
+    - `Io` y `RoomFailed` reabren la sala del storage, como en `apply_batch` (el paso quedó en `Local::reopen`, que usan los dos).
+  - **Las escrituras:**
+    - `BehindCompaction` a un commit vuelve a registrar la réplica (si sigue en el cursor del commit). Si `Registered` la deja detrás del log, la escritura se pone al día con heartbeats, con el backoff y dentro del plazo, que corta también la bajada en curso, sin mandar intentos mientras espera; instalado el snapshot, reintenta con el mismo `MutationId` y su head como cursor (DC6, §A.4).
+    - Después del `CommitAck`, si la réplica espera un snapshot, la escritura manda heartbeats en lugar de syncs, para enterarse de uno.
+- **Tests agregados** (16), en `crates/client/tests/snapshot_tests.rs`, contra el servidor en proceso con poda por TTL y el reloj pausado:
+  - `a_replica_behind_the_log_downloads_the_active_snapshot_and_syncs_from_it`: un cliente que entra a una sala podada (log desde 6) baja el snapshot en 7, en un chunk con la encarnación de sus metadatos, y sincroniza desde 7 hasta 9. Dos syncs a la vez lo bajan una sola vez.
+  - `without_a_usable_snapshot_the_replica_waits_for_a_heartbeat_that_announces_one`: sin snapshot, el sync no manda nada y el heartbeat solo a sí mismo. Subido, el sync sigue esperando hasta que un heartbeat lo anuncia, y ese heartbeat lo baja y se manda otra vez. Lo mismo con `RoomNotFound` en el chunk 0, también para un sync que esperaba esa bajada, que no pide nada.
+  - `a_snapshot_replaced_during_the_download_is_downloaded_again_from_its_first_chunk`: con un snapshot de dos chunks, otro lo reemplaza después del chunk 0. El chunk 1 anclado recibe `SnapshotSuperseded` y la bajada vuelve al chunk 0. Un segundo `SnapshotSuperseded` en la misma bajada es `Network`, y no se aplica nada.
+  - `a_chunk_that_does_not_follow_the_first_is_not_used`: un chunk 1 de otro snapshot, con otra secuencia, otro tamaño, más chunks, otro índice, más corto, de otra correlación o de otra sala; un chunk 0 más corto o con más chunks que los que toma su tamaño (no se pide el chunk 1); chunks que se siguen pero no coinciden con su hash; y un error de otra correlación o de otra sala, que no deja la réplica esperando un anuncio. Ninguno cambia la réplica, y los del servidor se usan.
+  - `a_snapshot_larger_than_the_limit_of_the_client_is_not_downloaded`: con el tope un byte por debajo, `Config` después del chunk 0; con el tope justo, se baja. Sin tope, un tamaño que no entra en memoria es `Config`, sin abortar.
+  - `a_snapshot_of_a_later_schema_is_installed_once_the_replica_takes_it_from_registered`: entre el registro y la bajada, la sala pasa a la versión 2 (una columna con `UNIQUE`) y otro snapshot, de esa versión, reemplaza al anunciado. Un heartbeat que ya se registró por `ClientNotRegistered` (con un `Registered` y un ack de la versión 1, como de antes del cambio) no puede registrarse otra vez por la señal: `Network`, y el snapshot no se descarta. Con el sync, no se instala con la versión 1: la réplica se registra, toma la 2 y lo instala sin bajarlo otra vez. El `UNIQUE` queda en la réplica.
+  - `a_snapshot_whose_rows_break_a_constraint_is_dropped_and_the_replica_kept`: dos filas con el mismo tag. La réplica se registra por la señal, descarta el snapshot y lo conserva todo, y espera un heartbeat. Los heartbeats que lo vuelven a anunciar no lo bajan otra vez; con un snapshot bueno, se pone al día.
+  - `a_snapshot_that_does_not_install_leaves_the_replica_as_it_was`: con otra secuencia que la de sus chunks, se descarta sin registrarse; un error de E/S o `RoomFailed` al instalarlo (motor de prueba) reabren la sala del storage, que se registra y lo vuelve a bajar; uno que termina de bajarse con la sala ya fallada cerrada no se instala; y uno detrás de la réplica (anunciado por un `Registered` fabricado detrás del log) termina la espera.
+  - `a_room_created_again_before_a_download_never_installs_its_snapshot`: con un snapshot de otras filas en la sala nueva, el chunk 0 recibe `RoomReset`; la réplica se registra con su cursor, recibe `RoomReset`, descarta y se pone al día con el log de la sala nueva. Sin snapshot en la sala nueva, `RoomNotFound`; el heartbeat recibe `ClientNotRegistered`, se registra y descarta. Un `RoomReset` fabricado a la bajada de un heartbeat también lleva a registrarse, y como la sala es la misma, el heartbeat lo vuelve a bajar. Contra un servidor que responde `RoomReset` a cada chunk y registra igual, un sync y un heartbeat se registran una vez cada uno y terminan con `Network`.
+  - `a_room_created_again_during_a_download_never_installs_its_snapshot`: recreada entre dos chunks, el anclado recibe `SnapshotSuperseded` (la purga) y el chunk 0, `RoomReset`. Una bajada que termina después de un descarte (el de un heartbeat concurrente) no se instala.
+  - `a_write_whose_sequence_the_installed_snapshot_covers_is_an_unknown_outcome`: con dos `CommitAck` retenidos, la escritura cuya secuencia aplicó un sync antes del snapshot conserva su rechazo (`RowMissing`), y la otra, cuya secuencia cubre el snapshot, es `OutcomeUnknown`. Una tercera con `CommitAck` espera su secuencia: su sync recibe `BehindCompaction`, se registra, baja el snapshot y la escritura termina `OutcomeUnknown`. Sin snapshot todavía, una escritura con `CommitAck` que espera se entera del que se sube después por sus heartbeats.
+  - `a_commit_behind_the_log_catches_up_and_ends_with_the_decision_of_the_replica`: el commit recibe `BehindCompaction`, la escritura instala el snapshot y reintenta con el mismo `MutationId` y el cursor 7, y termina `Ok`. También si el snapshot se sube mientras espera. Sin snapshot, `Network` en el plazo, con un solo commit y entre 3 y 60 heartbeats. Una bajada en curso al vencer el plazo se corta: `Network` a los 30 s, sin otro commit. Un `BehindCompaction` que llega a un commit cuando la réplica ya pasó su cursor es demorado: la escritura reintenta sin registrarse. Un error del storage al leer el head después de `BehindCompaction` termina la escritura con `Storage`.
+  - `a_heartbeat_takes_the_head_the_schema_and_the_snapshot_its_ack_announces`: `ClientNotRegistered`, un head menor, otro esquema y una versión posterior registran con el cursor y mandan el heartbeat otra vez; una segunda vez, con un head menor o con otro esquema, es `Network`. Una respuesta de otra correlación, de otra sala, un error o bytes que no decodifican no cambian nada. El head que informa es un head visto. Un registro detrás del log (fabricado) deja la réplica esperando, y uno dentro del log termina la espera. Una sala que falla cerrada se da de baja una vez y no manda más heartbeats. Una sala sin registrar se registra antes.
+  - `a_replica_behind_a_cursor_the_server_holds_ahead_registers_and_gets_a_snapshot`: el ack del head 9 de un motor en memoria llega al servidor después de que la sala se reabrió en 0 y se registró con el cursor 0 (el límite aceptado de INV-K5), y la poda deja el log desde 6. El `BehindCompaction` del sync registra la réplica con su cursor: el servidor lo toma, la ve detrás del log y pide un snapshot, que un heartbeat encuentra.
+  - `a_replica_that_runs_into_a_gap_of_the_log_waits_for_the_snapshot_above_it`: con el segmento desde 3 vaciado en el servidor, el sync desde 2 recibe `BehindCompaction` a un cursor dentro del log, se registra, lo recibe otra vez y espera; el heartbeat baja el snapshot en 6, de arriba del hueco. Una escritura cuyo sync choca con el hueco termina `Ok`, con pocos registros.
+  - `a_download_cut_at_any_point_installs_nothing_halfway`: un sync cortado después de 1, 2, … polls deja la réplica en 0, en el snapshot o al día, y el sync siguiente se pone al día.
+- **Tests cambiados:** en `sync_tests.rs`, `behind_the_log_of_the_server_the_replica_registers_again_with_its_cursor` (antes `…_waits_for_a_snapshot`): `BehindCompaction` a un sync o a un ack registra con el cursor, y con el log entero el sync sigue; uno demorado no registra. En `schema_tests.rs`, `a_reply_that_comes_after_the_room_failed_closed_neither_applies_nor_registers` suma un `BehindCompaction` tardío, que termina con `FailedClosed`. En `write_tests.rs`, `a_refusal_after_an_uncertain_attempt_is_an_unknown_outcome` conserva `BehindCompaction`: con un `Registered` dentro del log, la escritura reintenta enseguida.
+- **Fixtures** (`crates/client/tests/common/`):
+  - `TestServer::pruning` (segmentos de 5 operaciones, borrados en la siguiente pasada de disco) y `TestServer::with`;
+  - `prune`, que espera que el log de una sala empiece en un `tail`;
+  - `upload`, la subida en un request como el worker;
+  - `snapshot`, el de una réplica en memoria que aplicó unas operaciones;
+  - `request` y `answer_next` toman también un heartbeat y un pedido de chunk;
+  - `commit_ops` presenta el head como cursor, también en una sala podada.
+- Contra el stub (`heartbeat` no hacía nada), fallaban por comportamiento los 14 tests del primer borrador; los de un cursor adelantado y de un hueco del log llegaron con la revisión de delta. El de las escrituras que cubre el snapshot no terminaba: su tercera escritura espera su secuencia sin plazo.
+- **Mutaciones verificadas** (83: 75 sobre el código después de la primera ronda de la revisión, y 8 del hueco y de `Local::behind` sobre el de la tercera; todas detectadas, dos por el timeout porque dejan un sync o una escritura en un ciclo sin fin). Una de las 8, sacar el chequeo de la sala que falla cerrada de `Local::behind`, sobrevivió: solo cambiaba el error de un `BehindCompaction` tardío, de `FailedClosed` a `Network`, porque `fail_closed` ya deja la réplica sin registrar. Se fue el chequeo, el test del Lote 6 fija `FailedClosed`, y la mutación inversa, volver a ponerlo, se detecta:
+  - el heartbeat:
+    - tomar un ack de otra correlación o de otra sala;
+    - mandarlo sin registrarse antes, o no registrarse ante `ClientNotRegistered`;
+    - sin el head menor, o con el head igual como menor;
+    - sin el head visto (ciclo);
+    - sin la señal de esquema, o sin su tope;
+    - no bajar nunca el snapshot, o tomar siempre un anuncio;
+    - terminar después de una bajada, sin mandarse otra vez;
+  - el anuncio: no guardarlo, o no mirar la secuencia del descartado;
+  - el sync: no bajar el snapshot anunciado, bajarlo sin anuncio (ciclo), o darle a la bajada un tope de registros nuevo;
+  - la bajada:
+    - sin su lock, sin volver a mirar la espera después de tomarlo, o mirando solo si espera y no si hay anuncio;
+    - `RoomReset` a un chunk como `Network`, o sin volver a registrar;
+    - tomar un chunk de otra correlación, de otra sala o de otro índice, o un error de otro pedido;
+    - sin el tope, o con el tope excluido;
+    - sin comparar cada chunk con el primero, sin la cantidad de chunks que toma el tamaño, o sin el largo de cada chunk;
+    - chunks de 64 KiB, chunks anclados sin el hash, o de otra encarnación;
+    - `SnapshotSuperseded` como `Network`, sin tope, conservando el primero o conservando los bytes;
+    - `RoomNotFound` que deja el anuncio;
+    - sin la reserva que falla (`Config`);
+    - sin el hash;
+  - la instalación:
+    - en otra época, o con la sala fallada cerrada;
+    - sin terminar la espera (después de instalar o de `SnapshotBehind`), o sin el rango sin reporte;
+    - el rango desde el head;
+    - `SnapshotBehind` como un descarte;
+    - sin la señal de esquema, `SnapshotHeadMismatch` como señal, la señal con el tope de la llamada en lugar del de la bajada, una señal que nunca se toma, o que no se registra;
+    - un descarte sin anotar su secuencia, o que deja el anuncio;
+    - un error de E/S sin reabrir, o `RoomFailed` sin reabrir;
+  - el registro:
+    - no dejar esperando a la réplica detrás del log, o dejarla con el head en `tail_seq − 1`;
+    - la réplica vacía sin la espera, o sin el anuncio de `Registered`;
+    - la abierta conservando la espera, o sin el anuncio;
+  - `BehindCompaction`:
+    - sin volver a registrar, en otra época, a cualquier cursor, como `Network` en un sync, o mirando si la sala falla cerrada;
+    - el hueco: registrar otra vez, no esperar, tomar cualquier `BehindCompaction` como hueco, o un sync que nunca lo toma;
+    - en un commit: sin mirar el cursor, sin volver a registrar, o descartando el error del storage;
+  - las escrituras:
+    - mandar intentos mientras la réplica espera, o ponerse al día con syncs;
+    - heartbeats sin backoff;
+    - ponerse al día después del plazo;
+    - después del `CommitAck`, solo syncs (la detectó el test agregado después de la corrida).
+
+  Las dos que la primera corrida había dado por equivalentes (la señal de esquema de un heartbeat de otra época y un `BehindCompaction` que pisa el anuncio) se fueron con el código que las tenía.
+- **Interacciones revisadas:**
+  - **El relay.**
+    - El cliente pide chunks de exactamente 4 MiB, el máximo que el relay no recorta, y valida el tamaño contra esa medida: un servidor con otro máximo haría fallar cada chunk con `Network`, nunca instalaría uno mal armado.
+    - `SnapshotSuperseded` llega real a un chunk anclado cuando otro snapshot reemplaza al activo (test).
+    - La purga de una sala recreada vuelve `SnapshotSuperseded` el chunk anclado de la vieja, y el chunk 0 siguiente, sin ancla, recibe `RoomReset` por la encarnación (DC23; test). Sin snapshot activo, `RoomNotFound`, sin consultar al actor (test).
+    - El ancla de retención guarda `(S, head]` para el sync que sigue a la instalación. La poda por TTL la ignora: si poda más allá de `S` entre la instalación y el sync, el sync recibe `BehindCompaction`, la réplica se vuelve a registrar y espera otra vez, y el relay descarta el snapshot viejo en el chunk 0 siguiente. Argumentado, sin test.
+    - El presupuesto de respuestas del servidor (`no_budget`) responde `Unavailable` a un chunk sin lugar: la llamada descarta lo bajado, y la siguiente empieza del chunk 0. Con un snapshot grande y un servidor cargado, la bajada puede no terminar nunca; un paso reintentado vuelve al chunk 0, así que el reintento del chunk dentro de la llamada quedó agregado al Lote 9, para la bajada y la subida.
+  - **`apply_snapshot`.**
+    - Valida el snapshot antes de reemplazar nada (INV-S5): uno dañado, con filas que no cumplen las restricciones o con otra secuencia deja la réplica como estaba (tests).
+    - `SnapshotBehind` termina la espera (test). Uno en el head es un no-op exitoso, sin rango sin reporte.
+    - En disco, `apply_snapshot` corre en una tarea propia una vez que tiene el lock de compactación, y la instalación corre además en una tarea del aplicador: soltar la llamada no la corta (test de cortes).
+  - **El aplicador y lo retenido (DC21).**
+    - La instalación entrega las decisiones con `Writes::applied` y el rango `(head, S]` como incierto, como una reapertura.
+    - Una escritura con `CommitAck` que espera una secuencia del rango termina `OutcomeUnknown`; una sin `CommitAck` retiene el rango, y su `CommitAck` en él es `OutcomeUnknown`; una aplicada una por una antes conserva su decisión, porque el rango empieza en `head + 1` (test).
+    - Una escritura que empieza mientras la réplica espera ve al menos el head de `Registered`, que no es menor que `S` si el snapshot se activó antes del registro: su secuencia queda después de `S`, y el rango no se retiene para ella. Si `S` es mayor, lo retiene. Su commit, después de la instalación, presenta `S` como cursor.
+  - **Las escrituras (Lote 7).** `BehindCompaction` era un intento sin efecto que se reintentaba (desvío del Lote 7). Ahora vuelve a registrar la réplica, y si `Registered` la deja detrás del log, la escritura se pone al día antes de reintentar. El test del Lote 7 que lo trata (`a_refusal_after_an_uncertain_attempt_is_an_unknown_outcome`) lo conserva: con un `BehindCompaction` fabricado en una sala sin podar, el `Registered` real no la deja detrás del log, y la escritura reintenta enseguida.
+  - **Los huecos del log retenido (INV-Y2).** Un hueco que el servidor encuentra al leer un segmento le hace responder `BehindCompaction` a un cursor dentro del log, marcar `unrestorable_through` y pedir un snapshot de arriba del hueco; `Registered` encuentra la réplica dentro del log. Un `BehindCompaction` al cursor después de un registro de la misma llamada la deja esperando, registrada (test; la reproducción es de la segunda ronda de la revisión). Sin quedar registrada, el registro del heartbeat siguiente borraría la espera. Para el servidor la réplica está dentro del log, así que sus heartbeats no renuevan la demanda: si vence sin que se suba un snapshot, la réplica espera hasta otra demanda o hasta registrarse otra vez, y lo mismo con un `BehindCompaction` falso, que no se distingue de un hueco. Quedan como límites aceptados en INV-K7.
+  - **El cursor que guarda el servidor (INV-K5).** El servidor calcula el estado del cliente con el mayor entre su cursor guardado y el del pedido. Un ack de antes de reabrir un motor en memoria en 0 deja guardado un cursor adelantado: con `BehindCompaction` el cliente sigue `Connected` para el servidor, que no pide un snapshot, y un heartbeat tampoco. El registro que sigue a `BehindCompaction` reemplaza ese cursor, el servidor ve al cliente `Bootstrapping` y pide uno (test; la reproducción es de la revisión de delta).
+  - **El registro (Lote 4) y el esquema (Lote 6).**
+    - `Registered` calcula la espera con el head que lee en el mismo cambio.
+    - La señal del snapshot se registra con `register`, bajo el lock de los registros. El orden de los locks es bajada, registros, aplicador; un registro nunca baja un snapshot, así que no se invierte.
+    - Un `RoomReset` a un chunk de una sala que falla cerrada no registra: `register` devuelve `FailedClosed` sin mandar nada.
+    - La señal de esquema de un snapshot tiene dos topes: uno por bajada (`signaled`), que lo instala una vez más y después lo descarta, y el de la llamada (`again`), que corta con `Network` sin descartarlo si la llamada ya se registró por otra causa (test).
+  - **Un heartbeat, un sync y una escritura a la vez.** Cada llamada lleva su `again`, que acota sus registros, también los de sus bajadas: contra un servidor que responde `RoomReset` a cada chunk, cada llamada termina (test). Las bajadas se serializan con su lock: la segunda encuentra el snapshot instalado, o el anuncio descartado por un `RoomNotFound`, y no pide nada (tests).
+  - **El lease durante una bajada larga.** Un heartbeat espera la bajada de otra llamada, o hace la suya, y los chunks no renuevan el lease. Un `SyncWorker` (4.3) que encadene los heartbeats detrás de una bajada larga dejaría vencer el lease, y el cliente `Disconnected` frenaría la poda por cursores. Quedó agregado a §4.3 del plan de la fase: que el worker no encadene los heartbeats detrás de una bajada larga.
+  - **Cerrar y reabrir durante una bajada.** En la misma época, el snapshot se instala en la sala reabierta, que es de la misma encarnación: no rompe nada, aunque la reapertura haya terminado la espera.
+  - **Un snapshot descartado que sigue usable.** El servidor no pide otro mientras ese siga usable (DEF-81), y lo sigue anunciando: la réplica anota la secuencia del descartado y no lo vuelve a bajar (test). Uno nuevo en la misma secuencia, posible solo después de que el descartado venza, no se baja hasta que se anuncie otro.
+  - **El tope de descompresión del motor.** Un snapshot más grande, descomprimido, que lo que toma el motor (`max_snapshot_uncompressed_bytes`, 2 GiB por defecto) es `SnapshotCorruption`: después de la señal se descarta. Queda como límite aceptado en INV-K7, como el de `max_snapshot_bytes`.
+  - **El reloj pausado.** El BLAKE3 corre en `spawn_blocking`, que frena el avance automático del reloj. La poda del servidor de prueba es la pasada de disco cada 30 s, gratis con el reloj pausado. Una espera de la poda puede pasar el lease de 90 s: el cliente queda `Disconnected`, sigue en el roster, y su pedido siguiente lo vuelve a conectar.
+  - **La memoria (INV-K15).** Una bajada por sala, con un búfer del tamaño que anuncia el primer chunk validado, dentro del tope; el hash y `apply_snapshot` comparten los bytes (`Bytes`), sin copiarlos. Un corte mientras se calcula el hash le deja los bytes a esa tarea hasta que termina, aunque ya empiece otra bajada. El segundo estado que arma `apply_snapshot` lo cuenta INV-K15.
+- **Desvíos:**
+  - Un snapshot mayor que el tope es `Config`. DC22 no nombra el error: la configuración no sirve para esa sala, y la aplicación sube el tope o descarta la sala. Con `Network`, el worker reintentaría sin fin.
+  - Una bajada a la vez por sala (no estaba en el plan). Sin el lock, dos llamadas a la vez bajan dos veces, el doble del tope de INV-K15.
+  - `SnapshotSuperseded` vuelve al chunk 0 una vez por bajada, y un segundo es `Network`. Un servidor que respondiera así a cada chunk dejaría al cliente bajando sin fin dentro de una llamada; el siguiente sync vuelve a intentar.
+  - `BehindCompaction` vuelve a registrar la réplica, en lugar de dejarla esperando como dice DC22; la espera la decide `Registered`. El registro es lo que hace que el servidor pida un snapshot cuando guarda un cursor adelantado (INV-K5), y cuesta un registro por `BehindCompaction`.
+  - Terminan la espera, sin estar en DC22, un snapshot detrás de la réplica y un registro que la encuentra dentro del log: la salida de una espera por un `BehindCompaction` demorado o falso.
+  - Un snapshot descartado no se vuelve a bajar mientras sea el anunciado: la réplica anota su secuencia. DC22 no lo dice; sin eso, cada heartbeat bajaría entero un snapshot envenenado (DEF-81) o uno que el motor no puede descomprimir.
+  - El heartbeat se manda otra vez después de una bajada, desde el estado que dejó: así termina con el error de la sala cerrada o fallada cerrada, y no con `Ok`.
+  - La escritura detrás del log se pone al día con heartbeats, no con syncs: sin anuncio, el sync espera, y solo un heartbeat lo trae (DC22).
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura):
+  1. **No en verde: 3 ajustes y varios menores.** Corrió los tests de snapshots y de escrituras 189 veces cada uno, y los de sync y de esquema 125 (20 seguidas y rondas de 3, 6 y 8 procesos en paralelo), sin fallas. Todo quedó atendido:
+     - **Una réplica podía esperar un snapshot sin salida (INV-K7).** Lo reprodujo con un ack demorado de antes de reabrir un motor en memoria en 0: el servidor guardaba un cursor adelantado, veía al cliente dentro del log y nunca pedía un snapshot. Ahora `BehindCompaction` vuelve a registrar la réplica con su cursor, y `Registered` decide la espera. Hay test.
+     - **Un snapshot descartado se volvía a bajar entero en cada heartbeat** (DEF-81, o uno que el motor no puede descomprimir). Ahora la réplica anota la secuencia del descartado y no lo vuelve a bajar; el tope de descompresión queda como límite aceptado en INV-K7. Hay test.
+     - **Seis reglas sin test:** un error de otra correlación o de otra sala a un chunk; el tope de los registros de la bajada de un sync; la bajada de una escritura cortada en el plazo; un `BehindCompaction` demorado a un commit; `RoomFailed` al instalar; y la espera vuelta a mirar después del lock de bajada. Ahora hay tests.
+     - **Menores:**
+       - el búfer reserva el tamaño que anuncia el primer chunk validado, en lugar de crecer hasta el doble, y una reserva que falla es `Config`;
+       - la señal de esquema de un snapshot tiene su propio tope por bajada, así que una llamada que ya se registró por otra causa no lo descarta;
+       - el heartbeat se manda otra vez después de una bajada, y ya no da `Ok` con la sala cerrada;
+       - `Room::changes` sin la época, y la instalación más corta;
+       - los textos de §11 (el plazo también corta la bajada), del mensaje de `refused` y de la nota (lo que ve `seen` mientras la réplica espera);
+       - nombrados como interacciones, para más adelante: el lease durante una bajada larga, el presupuesto de respuestas a mitad de una bajada y cerrar y reabrir durante una bajada.
+  2. **No en verde: un bloqueante, y menores.** Corrió los tests de snapshots, escrituras, sync, esquema y salas 189 veces cada uno (20 seguidas y rondas de 3, 6 y 8 procesos en paralelo), sin fallas. Los arreglos de la ronda 1 tienen test, y las 14 mutaciones que probó sobre ellos fallan. Atendido:
+     - **Bloqueante: con un hueco en el log retenido, la réplica no se ponía al día nunca.** Lo introdujo el arreglo de la ronda 1: el servidor responde `BehindCompaction` a un cursor dentro del log y pide un snapshot de arriba del hueco, pero el registro la encontraba dentro del log y la réplica nunca esperaba. Una escritura en esa sala no terminaba, con 1504 registros en 30 minutos. Ahora el segundo `BehindCompaction` del mismo sync la deja esperando, registrada. Hay test.
+     - **Menores:**
+       - el enunciado de INV-K12 dice que la reserva de una bajada tiene como tope el de INV-K15;
+       - el lease durante una bajada larga y el reintento de un chunk quedaron en el plan que los resuelve (§4.3 del plan de la fase y el Lote 9);
+       - el argumento de la nota sobre el `Unavailable`: un paso reintentado vuelve al chunk 0, así que el reintento va en la bajada del núcleo.
+  3. **En verde, con 3 menores.** Corrió los mismos tests 189 veces cada uno, sin fallas, y repitió las cuatro mutaciones del hueco, que fallan. Probó que un `BehindCompaction` después de un registro de la misma llamada solo viene de un hueco, de una poda entre el registro y el pedido (el servidor ya tomó el cursor y pide un snapshot; probado) o de un servidor que miente. Atendido:
+     - el arreglo del hueco marcaba la réplica registrada fuera del aplicador, sin mirar si la sala había fallado cerrada (en un runtime multihilo, un heartbeat de una sala que falla cerrada; argumentado, sin test): ahora lo decide `Local::behind`, bajo el aplicador, que nunca marca la réplica registrada, y un `BehindCompaction` tardío a una sala que falló cerrada termina con `FailedClosed`, como las otras respuestas tardías (test);
+     - la demanda de un hueco, que los heartbeats de la réplica no renuevan, y un `BehindCompaction` falso, que no se distingue de un hueco, quedaron como límites aceptados en INV-K7. La otra opción, que el sync de una réplica que espera sin anuncio mande un `Sync`, cuesta un pedido por llamada para una demanda que dura 7 días por defecto;
+     - la redacción de INV-K7 sobre el hueco: un `BehindCompaction` después de un registro de la misma llamada, no un segundo `BehindCompaction`.
+
+     El primero cambió código después del verde, y el revisor lo confirmó en verde en un chequeo corto: corrió la suite y sus pruebas de la ronda 3 contra el código nuevo, y está de acuerdo con sacar el chequeo de la sala que falla cerrada.
+
 ### Lote 9 · La subida de snapshots (`zemdb-client`)
 **Objetivo:** que el designado suba su snapshot (DC22, INV-K7).
 
-**Qué se hace:** la confirmación con un heartbeat, `create_snapshot` bajo el aplicador y la subida en chunks del largo que exige el relay; `SnapshotSuperseded` y los demás errores la detienen.
+**Qué se hace:** la confirmación con un heartbeat, `create_snapshot` bajo el aplicador y la subida en chunks del largo que exige el relay; `SnapshotSuperseded` y los demás errores la detienen. Además, del Lote 8: el reintento de un chunk ante una falla transitoria (sin respuesta, `Unavailable` del presupuesto de respuestas), con backoff y unas pocas veces dentro de la llamada, en la bajada y en la subida; hoy una bajada vuelve al chunk 0, y un snapshot grande con un servidor cargado puede no terminar nunca.
 
 **Tests exigidos.**
 - Sin snapshot, el designado lo sube y el atrasado lo baja; con un snapshot de un largo que no es múltiplo de 4 MiB (más de un chunk) y con uno de un chunk.
@@ -1092,4 +1256,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. Lote 1 cerrado el 28 de Octubre (`delete_room`), con la revisión de delta en verde. Lote 2 cerrado el mismo día (la encarnación en los chunks del relay), con la revisión de delta en verde. Lote 3 cerrado el mismo día (el esqueleto del cliente: transporte, metadatos y `Client::open`), con la revisión de delta en verde. Lote 4 cerrado el mismo día (apertura, registro, descarte y cierre de las salas), con la revisión de delta en verde. Lote 5 cerrado el 29 de Octubre (el aplicador y `sync`), con la revisión de delta en verde. Lote 6 cerrado el mismo día (el esquema), con la revisión de delta en verde. Lote 7 cerrado el mismo día (las escrituras), con la revisión de delta en verde en su segunda ronda. El próximo es el Lote 8.
+**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. Lote 1 cerrado el 28 de Octubre (`delete_room`), con la revisión de delta en verde. Lote 2 cerrado el mismo día (la encarnación en los chunks del relay), con la revisión de delta en verde. Lote 3 cerrado el mismo día (el esqueleto del cliente: transporte, metadatos y `Client::open`), con la revisión de delta en verde. Lote 4 cerrado el mismo día (apertura, registro, descarte y cierre de las salas), con la revisión de delta en verde. Lote 5 cerrado el 29 de Octubre (el aplicador y `sync`), con la revisión de delta en verde. Lote 6 cerrado el mismo día (el esquema), con la revisión de delta en verde. Lote 7 cerrado el mismo día (las escrituras), con la revisión de delta en verde en su segunda ronda. Lote 8 cerrado el 30 de Octubre (el heartbeat y la bajada de snapshots), con la revisión de delta en verde en su tercera ronda. El próximo es el Lote 9.

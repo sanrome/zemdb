@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -14,6 +15,9 @@ use zemdb_core::{
 use zemdb_storage::{StorageEngine, StorageError};
 
 use crate::{ClientConfig, ClientError, MetadataStore, RoomMetadata, TransportClient};
+
+/// The size of the chunks of a download: the largest that the relay serves.
+const CHUNK_BYTES: u32 = 4 << 20;
 
 /// The client of a device: one replica per room it opens.
 pub struct Client {
@@ -62,6 +66,8 @@ struct Room {
     applier: Arc<tokio::sync::Mutex<()>>,
     /// Held by an opening, with its registration: one registration at a time.
     registration: tokio::sync::Mutex<()>,
+    /// Held by the download of a snapshot: one at a time.
+    download: tokio::sync::Mutex<()>,
     state: Mutex<State>,
 }
 
@@ -92,8 +98,11 @@ struct OpenReplica {
     /// The metadata that describe all of its data.
     metadata: RoomMetadata,
     registered: bool,
-    /// Behind the log of the server, it waits for a snapshot.
-    awaits_snapshot: bool,
+    /// Behind the log of the server, it waits for a snapshot: with whether a reply announced a
+    /// usable one.
+    awaits_snapshot: Option<bool>,
+    /// The sequence of the last snapshot it dropped, which it does not download again.
+    dropped: Option<SequenceNumber>,
     /// Its schema changed to one that does not evolve from its own, or the server sent an
     /// operation that does not validate against it: it applies nothing more, and neither
     /// registers nor syncs, until it opens again.
@@ -105,7 +114,8 @@ impl OpenReplica {
         Self {
             metadata,
             registered,
-            awaits_snapshot: false,
+            awaits_snapshot: None,
+            dropped: None,
             failed_closed: false,
         }
     }
@@ -312,6 +322,35 @@ impl Room {
         }
     }
 
+    /// Whether a reply that announces the version `version` of the schema `schema_id` changes the
+    /// schema of the replica.
+    fn changes(&self, (schema_id, version): &(SchemaId, u64)) -> bool {
+        let state = self.state();
+        let open = match &state.replica {
+            Replica::Open(open) => open,
+            _ => return false,
+        };
+        changes(&open.metadata, schema_id, *version)
+    }
+
+    /// Takes the usable snapshot that a reply to a request of `epoch` announced, at `snapshot`, if
+    /// the replica waits for one: whether it waits for one announced, other than one it dropped.
+    fn announced(&self, epoch: u64, snapshot: Option<SequenceNumber>) -> bool {
+        let mut waits = false;
+        self.update(epoch, |open| {
+            if let Some(announced) = &mut open.awaits_snapshot {
+                waits = snapshot.is_some() && snapshot != open.dropped;
+                *announced = waits;
+            }
+        });
+        waits
+    }
+
+    /// Whether the replica waits for a snapshot.
+    fn awaits_snapshot(&self) -> bool {
+        matches!(&self.state().replica, Replica::Open(open) if open.awaits_snapshot.is_some())
+    }
+
     /// Whether the write `mutation_id` is still in flight: closing the room, discarding its
     /// replica or failing it closed ends every write.
     fn in_flight(&self, mutation_id: &MutationId) -> bool {
@@ -348,7 +387,7 @@ struct Request {
     /// The head and the incarnation of an open replica.
     cursor: Option<(SequenceNumber, u128)>,
     registered: bool,
-    awaits_snapshot: bool,
+    awaits_snapshot: Option<bool>,
     failed_closed: bool,
 }
 
@@ -477,6 +516,7 @@ impl Client {
                     id: room_id,
                     applier: Arc::default(),
                     registration: tokio::sync::Mutex::default(),
+                    download: tokio::sync::Mutex::default(),
                     state: Mutex::default(),
                 })
             });
@@ -530,10 +570,11 @@ impl Client {
                     correlation_id: reply_id,
                     room_id,
                     head_seq,
+                    tail_seq,
                     schema_id,
                     schema,
+                    active_snapshot_seq,
                     room_incarnation,
-                    ..
                 } if reply_id == correlation_id
                     && room_id == room.id
                     && incarnation.is_none_or(|known| known == room_incarnation) =>
@@ -544,8 +585,10 @@ impl Client {
                         schema_id,
                         schema,
                     };
-                    let registered =
-                        move |local: Local, room| local.registered(room, epoch, cursor, metadata);
+                    let snapshot = (tail_seq, active_snapshot_seq);
+                    let registered = move |local: Local, room| {
+                        local.registered(room, epoch, cursor, metadata, snapshot)
+                    };
                     match self.change(room, registered).await {
                         // Its schema failed the replica closed.
                         Err(err @ ClientError::FailedClosed(_)) => {
@@ -647,12 +690,12 @@ impl Client {
             .map_err(|err| ClientError::Storage(format!("A change of the replica failed: {err}")))?
     }
 
-    /// Reacts to `reply` to the request `correlation_id`, a sync or an ack of the replica of
-    /// `epoch` at `cursor`, when it is not the reply the request asks for: an error of the
-    /// request (which may come without its correlation id and its room) that asks to register
-    /// again, `ClientNotRegistered` or `InvalidSequence`, is `Ok`. Any other error is `Network`,
-    /// and after `BehindCompaction` the replica waits for a snapshot if it is still at `cursor`
-    /// (if it moved past it, the reply was delayed). Any other reply is `Network` too.
+    /// Reacts to `reply` to the request `correlation_id`, a sync, an ack or a heartbeat of the
+    /// replica of `epoch` at `cursor`, when it is not the reply the request asks for: an error of
+    /// the request (which may come without its correlation id and its room) that asks to register
+    /// again is `Ok`: `ClientNotRegistered`, `InvalidSequence`, and `BehindCompaction` as
+    /// [`Local::behind`] takes it, once a registration of the call (`again`) or not. Any other
+    /// error, or reply, is `Network`.
     async fn refused(
         &self,
         room: &Arc<Room>,
@@ -660,8 +703,10 @@ impl Client {
         cursor: SequenceNumber,
         correlation_id: CorrelationId,
         reply: ServerMessage,
+        again: bool,
     ) -> Result<(), ClientError> {
-        let invalid = || ClientError::Network("Invalid reply to a sync or an ack".to_string());
+        let invalid =
+            || ClientError::Network("Invalid reply to a sync, an ack or a heartbeat".into());
         let ServerMessage::Error {
             correlation_id: reply_id,
             room_id,
@@ -679,8 +724,10 @@ impl Client {
         match code {
             ErrorCode::ClientNotRegistered | ErrorCode::InvalidSequence => return Ok(()),
             ErrorCode::BehindCompaction => {
-                let behind = move |local: Local, room| local.behind(room, epoch, cursor);
-                self.change(room, behind).await?;
+                let behind = move |local: Local, room| local.behind(room, epoch, cursor, again);
+                if self.change(room, behind).await? {
+                    return Ok(());
+                }
             }
             _ => {}
         }
@@ -707,9 +754,11 @@ impl Client {
     /// most and, unless it has more, reaching it (with more, it brings some); and a confirmation
     /// of the head acknowledged. Any other reply, or none, is `Network`. A head below the cursor
     /// of the request, `InvalidSequence` and `ClientNotRegistered` register again, with the
-    /// cursor, and the sync goes on; a second time in a sync is `Network`. `BehindCompaction`
-    /// leaves the replica waiting for a snapshot, and the sync of a replica that waits is
-    /// `Network`, without sending anything.
+    /// cursor, and the sync goes on; a second time in a sync is `Network`. `BehindCompaction`,
+    /// or `Registered` behind the log, leave the replica waiting for a snapshot: it downloads
+    /// and installs the one that `Registered` or a heartbeat announced, as
+    /// [`heartbeat`](Self::heartbeat) says, and the sync goes on from it. Without one announced,
+    /// the sync is `Network`, without sending anything.
     ///
     /// A batch is applied only with the schema it announces or a later version of it: one that
     /// announces another schema, or a later version, is not applied, and the replica registers
@@ -727,10 +776,14 @@ impl Client {
                 self.register(&room).await?;
                 continue;
             };
-            if request.awaits_snapshot {
-                return Err(ClientError::Network(
-                    "The replica waits for a snapshot".to_string(),
-                ));
+            if let Some(announced) = request.awaits_snapshot {
+                if !announced {
+                    return Err(ClientError::Network(
+                        "The replica waits for a snapshot".to_string(),
+                    ));
+                }
+                self.snapshot(&room, &mut again).await?;
+                continue;
             }
             let (epoch, token) = (request.epoch, request.token);
             let correlation_id = self.correlation_id();
@@ -756,8 +809,9 @@ impl Client {
                     (head_seq, ops, has_more, (schema_id, schema_version))
                 }
                 reply => {
-                    self.refused(&room, epoch, from_seq, correlation_id, reply)
-                        .await?;
+                    let refused =
+                        self.refused(&room, epoch, from_seq, correlation_id, reply, again);
+                    refused.await?;
                     room.register_again(epoch, &mut again)?;
                     continue;
                 }
@@ -812,7 +866,7 @@ impl Client {
                     }
                 }
                 reply => {
-                    self.refused(&room, epoch, head, correlation_id, reply)
+                    self.refused(&room, epoch, head, correlation_id, reply, again)
                         .await?
                 }
             }
@@ -833,7 +887,10 @@ impl Client {
     /// been sequenced: from then on, the write ends as `OutcomeUnknown` unless a `CommitAck`
     /// comes. `ClientNotRegistered` and `InvalidSequence` register the replica again with its
     /// cursor, and `RequestTimeout`, `RoomLocked` and `BehindCompaction` had no effect: it
-    /// retries after them, and after a registration without a valid reply. `SchemaViolation`,
+    /// retries after them, and after a registration without a valid reply. After
+    /// `BehindCompaction`, or `Registered` behind the log, the replica waits for a snapshot: the
+    /// write catches up with heartbeats ([`heartbeat`](Self::heartbeat)) until it installs one,
+    /// and sends nothing meanwhile. `SchemaViolation`,
     /// `BadRequest` and `Forbidden` are `Validation`, and any other error, the deadline, or the
     /// room closed, discarded or failing closed end it with `Network`: without an uncertain
     /// attempt, the write had no effect.
@@ -893,15 +950,21 @@ impl Client {
                 return Err(ends(uncertain, expired()));
             };
             let request = request.map_err(|err| ends(uncertain, err))?;
-            let Some((cursor, _)) = request.cursor.filter(|_| request.registered) else {
-                let registered = tokio::time::timeout_at(deadline, async {
+            let ready = request.registered && request.awaits_snapshot.is_none();
+            let Some((cursor, _)) = request.cursor.filter(|_| ready) else {
+                // It registers, or, behind the log, catches up with a heartbeat, which downloads
+                // the snapshot it announces.
+                let readied = tokio::time::timeout_at(deadline, async {
+                    if request.registered {
+                        return self.heartbeat(room.id.clone()).await;
+                    }
                     let _registration = room.registration.lock().await;
                     self.register(&room).await
                 });
-                match registered.await {
-                    Ok(Ok(())) => continue,
+                match readied.await {
+                    Ok(Ok(())) if !request.registered => continue,
                     // Without a valid reply, or none by the deadline, it retries until then.
-                    Ok(Err(ClientError::Network(_))) | Err(_) => {}
+                    Ok(Ok(()) | Err(ClientError::Network(_))) | Err(_) => {}
                     Ok(Err(_)) if !room.in_flight(&mutation_id) && in_flight.is_some() => {
                         return Err(ends(uncertain, ended()))
                     }
@@ -965,9 +1028,16 @@ impl Client {
                         ErrorCode::ClientNotRegistered | ErrorCode::InvalidSequence => {
                             room.update(epoch, |open| open.registered = false)
                         }
-                        ErrorCode::RequestTimeout
-                        | ErrorCode::RoomLocked
-                        | ErrorCode::BehindCompaction => {}
+                        ErrorCode::RequestTimeout | ErrorCode::RoomLocked => {}
+                        ErrorCode::BehindCompaction => {
+                            let behind =
+                                move |local: Local, room| local.behind(room, epoch, cursor, false);
+                            let behind =
+                                tokio::time::timeout_at(deadline, self.change(&room, behind));
+                            if let Ok(Err(err)) = behind.await {
+                                return Err(ends(uncertain, err));
+                            }
+                        }
                         ErrorCode::Unavailable | ErrorCode::Timeout | ErrorCode::Internal => {
                             uncertain = true
                         }
@@ -991,13 +1061,242 @@ impl Client {
             if let Some(decision) = room.decision(&mutation_id) {
                 return decision;
             }
-            // Its errors are retried: the room ends the write if it closes or fails closed.
-            let _ = self.sync(room.id.clone()).await;
+            // Its errors are retried: the room ends the write if it closes or fails closed. Behind
+            // the log, the replica learns of a snapshot with a heartbeat.
+            let _ = match room.awaits_snapshot() {
+                true => self.heartbeat(room.id.clone()).await,
+                false => self.sync(room.id.clone()).await,
+            };
             if let Some(decision) = room.decision(&mutation_id) {
                 return decision;
             }
             tokio::time::sleep(backoff.next()).await;
         }
+    }
+
+    /// Sends a heartbeat for `room_id`, which renews the lease of the client in its room, and
+    /// reacts to its `HeartbeatAck`. A room that is not registered registers first, and one that
+    /// fails closed sends nothing (`FailedClosed`).
+    ///
+    /// A reply is checked before it is used: a `HeartbeatAck` with the correlation id and the
+    /// room of the request. Any other reply, or none, is `Network`. `ClientNotRegistered`, a head
+    /// below that of the replica when the heartbeat was sent, and an ack that announces another
+    /// schema, or a later version of its own, register the replica again with its cursor, and
+    /// the heartbeat is sent again; a second time in a heartbeat is `Network`.
+    ///
+    /// A replica that waits for a snapshot takes whether the ack announces a usable one, and
+    /// downloads the one it announces by chunks of 4 MiB, each checked against the first. One
+    /// larger than `max_snapshot_bytes` is `Config`. `SnapshotSuperseded` downloads it again
+    /// from its first chunk, once; `RoomNotFound` leaves the replica waiting for a heartbeat that
+    /// announces one; and `RoomReset` registers it again with its cursor. The snapshot is
+    /// installed with the schema of the replica once its bytes match its hash, and the next sync
+    /// goes on from it. One that does not install with that schema registers the replica again,
+    /// for `Registered` to give it the schema of the room, and is dropped if it does not install
+    /// with it either.
+    pub async fn heartbeat(&self, room_id: RoomId) -> Result<(), ClientError> {
+        let room = self.room(&room_id)?;
+        let mut again = false;
+        loop {
+            let request = self.change(&room, Local::request).await?;
+            let Some((head, _)) = request.cursor.filter(|_| request.registered) else {
+                let _registration = room.registration.lock().await;
+                self.register(&room).await?;
+                continue;
+            };
+            let (epoch, correlation_id) = (request.epoch, self.correlation_id());
+            let message = ClientMessage::Heartbeat {
+                correlation_id,
+                room_id: room.id.clone(),
+                client_id: self.client_id.clone(),
+            };
+            let (head_seq, schema, snapshot) = match self.send(&message, &request.token).await? {
+                ServerMessage::HeartbeatAck {
+                    correlation_id: reply_id,
+                    room_id,
+                    current_head_seq,
+                    active_snapshot_seq,
+                    schema_version,
+                    schema_id,
+                    ..
+                } if reply_id == correlation_id && room_id == room.id => (
+                    current_head_seq,
+                    (schema_id, schema_version),
+                    active_snapshot_seq,
+                ),
+                reply => {
+                    self.refused(&room, epoch, head, correlation_id, reply, again)
+                        .await?;
+                    room.register_again(epoch, &mut again)?;
+                    continue;
+                }
+            };
+            // The server may have lost sequences that the replica applied.
+            if head_seq < head {
+                room.register_again(epoch, &mut again)?;
+                continue;
+            }
+            room.saw(epoch, head_seq);
+            if room.changes(&schema) {
+                room.register_again(epoch, &mut again)?;
+                continue;
+            }
+            if !room.announced(epoch, snapshot) {
+                return Ok(());
+            }
+            // The next heartbeat takes the replica as the download left it.
+            self.snapshot(&room, &mut again).await?;
+        }
+    }
+
+    /// Downloads the active snapshot of `room`, if its replica waits for one announced, and
+    /// installs it ([`Local::install`]). One download at a time: one that waits for another
+    /// finds the snapshot installed. `RoomReset` to a chunk leaves the replica to register again,
+    /// and a snapshot that does not install with the schema of the replica registers it again,
+    /// once per call of the caller (`again`), before installing it once more.
+    async fn snapshot(&self, room: &Arc<Room>, again: &mut bool) -> Result<(), ClientError> {
+        let _download = room.download.lock().await;
+        let request = self.change(room, Local::request).await?;
+        let announced = request.awaits_snapshot == Some(true);
+        let Some((_, incarnation)) = request.cursor.filter(|_| announced) else {
+            return Ok(());
+        };
+        let epoch = request.epoch;
+        let Some((seq, snapshot)) = self.download(room, &request, incarnation).await? else {
+            return room.register_again(epoch, again);
+        };
+        // Whether the replica registered again for this snapshot.
+        let mut signaled = false;
+        loop {
+            let snapshot = snapshot.clone();
+            let install =
+                move |local: Local, room| local.install(room, epoch, seq, snapshot, signaled);
+            match self.change(room, install).await? {
+                Applied::Schema => {
+                    room.register_again(epoch, again)?;
+                    let _registration = room.registration.lock().await;
+                    self.register(room).await?;
+                    signaled = true;
+                }
+                Applied::Head(_) | Applied::Stale => return Ok(()),
+            }
+        }
+    }
+
+    /// Downloads the active snapshot of `room` with the incarnation `incarnation`, for the replica
+    /// of `request`, by chunks of 4 MiB: the first without an anchor, and the others anchored to
+    /// its hash. Each reply is checked before it is used: a chunk with the correlation id, the
+    /// room and the index of the request, with the sequence, the number of chunks, the size and
+    /// the hash of the first, a number of chunks that its size takes, and the length its index
+    /// takes. Returns its sequence and its bytes once they match its hash, or `None` on
+    /// `RoomReset`. One larger than `max_snapshot_bytes` is `Config`. `SnapshotSuperseded`
+    /// downloads it again from its first chunk, once per download, and `RoomNotFound` leaves the
+    /// replica waiting for a heartbeat that announces one. Any other reply, or none, is `Network`.
+    async fn download(
+        &self,
+        room: &Room,
+        request: &Request,
+        incarnation: u128,
+    ) -> Result<Option<(SequenceNumber, Bytes)>, ClientError> {
+        let chunk = u64::from(CHUNK_BYTES);
+        let (mut first, mut bytes, mut index) = (None, Vec::new(), 0);
+        let mut superseded = false;
+        let (seq, hash) = loop {
+            if let Some((seq, total_chunks, _, hash)) = first {
+                if index >= total_chunks {
+                    break (seq, hash);
+                }
+            }
+            let correlation_id = self.correlation_id();
+            let message = ClientMessage::RequestSnapshotChunk {
+                correlation_id,
+                room_id: room.id.clone(),
+                chunk_index: index,
+                chunk_size: CHUNK_BYTES,
+                snapshot_hash: first.map(|(.., hash)| hash),
+                room_incarnation: incarnation,
+            };
+            match self.send(&message, &request.token).await? {
+                ServerMessage::SnapshotChunk {
+                    correlation_id: reply_id,
+                    room_id,
+                    snapshot_head_seq,
+                    chunk_index,
+                    total_chunks,
+                    total_bytes,
+                    snapshot_hash,
+                    data,
+                } if reply_id == correlation_id && room_id == room.id && chunk_index == index => {
+                    let max = self.config.max_snapshot_bytes;
+                    if total_bytes > max {
+                        return Err(ClientError::Config(format!(
+                            "The snapshot of {total_bytes} bytes is larger than the limit of {max}"
+                        )));
+                    }
+                    let snapshot = (snapshot_head_seq, total_chunks, total_bytes, snapshot_hash);
+                    let len = total_bytes.saturating_sub(u64::from(index) * chunk);
+                    if *first.get_or_insert(snapshot) != snapshot
+                        || u64::from(total_chunks) != total_bytes.div_ceil(chunk)
+                        || u64::try_from(data.len()) != Ok(len.min(chunk))
+                    {
+                        return Err(ClientError::Network(
+                            "Invalid chunk of a snapshot".to_string(),
+                        ));
+                    }
+                    // The snapshot fits within the limit, and is held once.
+                    if index == 0 {
+                        let len = usize::try_from(total_bytes).ok();
+                        if len.is_none_or(|len| bytes.try_reserve_exact(len).is_err()) {
+                            return Err(ClientError::Config(format!(
+                                "A snapshot of {total_bytes} bytes does not fit in memory"
+                            )));
+                        }
+                    }
+                    bytes.extend_from_slice(&data);
+                    index += 1;
+                }
+                ServerMessage::Error {
+                    correlation_id: reply_id,
+                    room_id,
+                    code,
+                    message,
+                } if reply_id.is_none_or(|reply_id| reply_id == correlation_id)
+                    && room_id.as_ref().is_none_or(|room_id| *room_id == room.id) =>
+                {
+                    match code {
+                        ErrorCode::SnapshotSuperseded
+                            if !std::mem::replace(&mut superseded, true) =>
+                        {
+                            (first, bytes, index) = (None, Vec::new(), 0);
+                        }
+                        ErrorCode::RoomReset => return Ok(None),
+                        code => {
+                            if code == ErrorCode::RoomNotFound {
+                                room.announced(request.epoch, None);
+                            }
+                            return Err(ClientError::Network(format!(
+                                "The server refused a chunk of the snapshot: {code:?}: {message}"
+                            )));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(ClientError::Network(
+                        "Invalid reply to a request of a chunk".to_string(),
+                    ))
+                }
+            }
+        };
+        // Hashing a large snapshot would stall the runtime.
+        let bytes = Bytes::from(bytes);
+        let hashed = bytes.clone();
+        let hashed =
+            tokio::task::spawn_blocking(move || ServerMessage::compute_snapshot_hash(&hashed));
+        if hashed.await.ok() != Some(hash) {
+            return Err(ClientError::Network(
+                "The snapshot does not match its hash".to_string(),
+            ));
+        }
+        Ok(Some((seq, bytes)))
     }
 
     /// The room `room_id` of the client; `RoomClosed` if the client never opened it.
@@ -1084,7 +1383,7 @@ impl Local {
                 token: state.token.clone(),
                 cursor: None,
                 registered: open.is_some_and(|open| open.registered),
-                awaits_snapshot: open.is_some_and(|open| open.awaits_snapshot),
+                awaits_snapshot: open.and_then(|open| open.awaits_snapshot),
                 failed_closed: open.is_some_and(|open| open.failed_closed),
             };
             (request, open.map(|open| open.metadata.room_incarnation))
@@ -1128,7 +1427,9 @@ impl Local {
     /// it gives: an empty replica saves them before its data, and opens its storage room with
     /// their schema; an open one is registered, unless its head went back below the cursor (a
     /// memory room that opened again at 0), and then it registers again with its head. A
-    /// replica of another epoch is left as it is, and so is one that fails closed.
+    /// replica of another epoch is left as it is, and so is one that fails closed. A replica
+    /// behind the log, which the room retains from `tail_seq`, waits for a snapshot, and takes the
+    /// usable one that `Registered` announced, at `snapshot`; one inside it no longer waits.
     ///
     /// An open replica takes another schema, or a later version of its own, only if it evolves
     /// from its own: it saves the metadata before its storage room reloads the schema, and an
@@ -1140,7 +1441,10 @@ impl Local {
         epoch: u64,
         cursor: Option<SequenceNumber>,
         metadata: RoomMetadata,
+        (tail_seq, snapshot): (SequenceNumber, Option<SequenceNumber>),
     ) -> Result<(), ClientError> {
+        let waits =
+            |head: SequenceNumber| (head.get() < tail_seq.get().saturating_sub(1)).then_some(false);
         let local = match &mut *room.state() {
             State {
                 replica: Replica::Closed,
@@ -1166,7 +1470,10 @@ impl Local {
             self.storage
                 .open_room(&room.id, metadata.schema.clone())
                 .await?;
-            room.state().replica = Replica::Open(OpenReplica::new(metadata, true));
+            let mut open = OpenReplica::new(metadata, true);
+            open.awaits_snapshot = waits(SequenceNumber::new(0));
+            room.state().replica = Replica::Open(open);
+            room.announced(epoch, snapshot);
             return Ok(());
         };
         let head = self.storage.get_head_seq(&room.id).await?;
@@ -1189,7 +1496,11 @@ impl Local {
             }
             room.update(epoch, |open| open.metadata = metadata);
         }
-        room.update(epoch, |open| open.registered = true);
+        room.update(epoch, |open| {
+            open.registered = true;
+            open.awaits_snapshot = waits(head);
+        });
+        room.announced(epoch, snapshot);
         Ok(())
     }
 
@@ -1244,20 +1555,89 @@ impl Local {
             }
             Err(StorageError::SchemaValidation(_)) => Ok(Applied::Schema),
             Err(err @ (StorageError::Io(_) | StorageError::RoomFailed { .. })) => {
-                self.clone().close(Arc::clone(&room)).await?;
-                self.clone().open(Arc::clone(&room)).await?;
-                // The sequences up to the head it opened again at have no report: all of them,
-                // if that head cannot be read.
-                let reopened = self.storage.get_head_seq(&room.id).await;
-                let reopened = reopened.unwrap_or(SequenceNumber::new(u64::MAX));
-                if reopened > head {
-                    let unknown = (head.next(), reopened, ClientError::OutcomeUnknown);
-                    room.state().writes.applied(reopened, [unknown]);
-                }
+                self.reopen(room, head).await?;
                 Err(err.into())
             }
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// Closes the storage room after an error after which it may have changed, at `head` before
+    /// the change, and opens it again from its files, as an open does. The sequences after `head`
+    /// up to the one it opens at have no report: all of them, if that one cannot be read.
+    async fn reopen(self, room: Arc<Room>, head: SequenceNumber) -> Result<(), ClientError> {
+        self.clone().close(Arc::clone(&room)).await?;
+        self.clone().open(Arc::clone(&room)).await?;
+        let reopened = self.storage.get_head_seq(&room.id).await;
+        let reopened = reopened.unwrap_or(SequenceNumber::new(u64::MAX));
+        if reopened > head {
+            let unknown = (head.next(), reopened, ClientError::OutcomeUnknown);
+            room.state().writes.applied(reopened, [unknown]);
+        }
+        Ok(())
+    }
+
+    /// Installs `snapshot`, the snapshot at `seq` downloaded for the replica of `epoch`, with the
+    /// schema of its metadata, unless the replica is closed, fails closed or is no longer that of
+    /// `epoch` (`Stale`). Once installed, the replica no longer waits for a snapshot, and the
+    /// sequences after its head up to `seq` have no report. One behind the replica changes
+    /// nothing, and the replica no longer waits either. One that does not install with the schema
+    /// of the replica (`SnapshotCorruption`, `SnapshotConstraints`) is `Schema`, for the replica
+    /// to register again; once it did for it (`signaled`), it is dropped (`Network`), as is one at
+    /// another head than its chunks announce, and the replica waits for a heartbeat that
+    /// announces another. An error after which the storage room may have changed reopens it, as
+    /// [`apply`](Self::apply) does.
+    async fn install(
+        self,
+        room: Arc<Room>,
+        epoch: u64,
+        seq: SequenceNumber,
+        snapshot: Bytes,
+        signaled: bool,
+    ) -> Result<Applied, ClientError> {
+        let schema = match &*room.state() {
+            State {
+                replica: Replica::Open(open),
+                epoch: current,
+                ..
+            } if *current == epoch && !open.failed_closed => open.metadata.schema.clone(),
+            _ => return Ok(Applied::Stale),
+        };
+        let head = self.storage.get_head_seq(&room.id).await?;
+        let installed = self.storage.apply_snapshot(&room.id, schema, snapshot, seq);
+        let installed = match installed.await {
+            Ok(installed) => installed,
+            Err(StorageError::SnapshotBehind { .. }) => head,
+            Err(err) => {
+                return match err {
+                    StorageError::SnapshotCorruption(_)
+                    | StorageError::SnapshotConstraints { .. }
+                        if !signaled =>
+                    {
+                        Ok(Applied::Schema)
+                    }
+                    StorageError::SnapshotCorruption(_)
+                    | StorageError::SnapshotConstraints { .. }
+                    | StorageError::SnapshotHeadMismatch { .. } => {
+                        room.update(epoch, |open| open.dropped = Some(seq));
+                        room.announced(epoch, None);
+                        let dropped = format!("The snapshot does not install: {err}");
+                        Err(ClientError::Network(dropped))
+                    }
+                    StorageError::Io(_) | StorageError::RoomFailed { .. } => {
+                        self.reopen(room, head).await?;
+                        Err(err.into())
+                    }
+                    err => Err(err.into()),
+                }
+            }
+        };
+        room.update(epoch, |open| open.awaits_snapshot = None);
+        if installed > head {
+            let unknown = (head.next(), installed, ClientError::OutcomeUnknown);
+            room.state().writes.applied(installed, [unknown]);
+        }
+        Ok(Applied::Head(installed))
     }
 
     /// Takes the `CommitAck` of the write `mutation_id` with its sequence `seq`, and applies its
@@ -1277,18 +1657,29 @@ impl Local {
         self.apply(room, epoch, ops, schema, false).await
     }
 
-    /// Leaves the replica of `epoch` waiting for a snapshot if it is still at `cursor`: one that
-    /// moved past it got a delayed reply.
+    /// Takes `BehindCompaction` to a request of the replica of `epoch` at `cursor`, if it is still
+    /// at it: one that moved past it, or that is no longer of `epoch`, got a delayed reply. The
+    /// replica registers again (one that fails closed does not: `register` refuses), and
+    /// `Registered` tells whether it waits for a snapshot; the registration leaves the server its
+    /// cursor, which may have been ahead (INV-K5), so that the server asks for one. Once a
+    /// registration of the call (`again`) found it inside the log, it comes from a gap of the log
+    /// (INV-Y2): the replica stays registered and waits for the snapshot above it, which the
+    /// server asks for. Returns whether the replica registers again.
     async fn behind(
         self,
         room: Arc<Room>,
         epoch: u64,
         cursor: SequenceNumber,
-    ) -> Result<(), ClientError> {
-        if room.is_open() && self.storage.get_head_seq(&room.id).await? == cursor {
-            room.update(epoch, |open| open.awaits_snapshot = true);
-        }
-        Ok(())
+        again: bool,
+    ) -> Result<bool, ClientError> {
+        let at_cursor = room.is_open() && self.storage.get_head_seq(&room.id).await? == cursor;
+        let mut register = false;
+        room.update(epoch, |open| match at_cursor {
+            true if again => open.awaits_snapshot = Some(false),
+            true => (open.registered, register) = (false, true),
+            false => {}
+        });
+        Ok(register)
     }
 
     /// Discards the replica of `epoch`. One closed meanwhile is left as it is (`RoomClosed`), and

@@ -13,6 +13,8 @@ pub struct ClientConfig {
     pub backoff_base: Duration,
     /// The longest delay between two retries (5 s). Not shorter than `backoff_base`.
     pub backoff_max: Duration,
+    /// The largest snapshot the client downloads (512 MiB, the server's default).
+    pub max_snapshot_bytes: u64,
 }
 
 impl ClientConfig {
@@ -23,6 +25,7 @@ impl ClientConfig {
             write_timeout: Duration::from_secs(30),
             backoff_base: Duration::from_millis(100),
             backoff_max: Duration::from_secs(5),
+            max_snapshot_bytes: 512 << 20,
         }
     }
 }
