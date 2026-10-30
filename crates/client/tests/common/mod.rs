@@ -134,8 +134,8 @@ pub async fn setup<S: StorageEngine + Clone + 'static>(
     (server, room_id, transport, storage, client)
 }
 
-/// The correlation id and the room of `message`, a sync, an ack, a commit, a heartbeat or a
-/// request of a chunk.
+/// The correlation id and the room of `message`, a sync, an ack, a commit, a heartbeat, or a
+/// request or an upload of a chunk.
 pub fn request(message: &ClientMessage) -> (CorrelationId, RoomId) {
     match message {
         ClientMessage::Sync {
@@ -159,6 +159,11 @@ pub fn request(message: &ClientMessage) -> (CorrelationId, RoomId) {
             ..
         }
         | ClientMessage::RequestSnapshotChunk {
+            correlation_id,
+            room_id,
+            ..
+        }
+        | ClientMessage::UploadSnapshotChunk {
             correlation_id,
             room_id,
             ..
@@ -866,6 +871,7 @@ pub struct TestEngine<E> {
     inner: E,
     failing: Arc<Mutex<Vec<(&'static str, StorageError)>>>,
     slow_open: Arc<Mutex<Option<Duration>>>,
+    slow_snapshot: Arc<Mutex<Option<Duration>>>,
     before_reload: Arc<Mutex<Option<BeforeReload>>>,
 }
 
@@ -875,6 +881,7 @@ impl<E> TestEngine<E> {
             inner,
             failing: Arc::default(),
             slow_open: Arc::default(),
+            slow_snapshot: Arc::default(),
             before_reload: Arc::default(),
         }
     }
@@ -892,6 +899,11 @@ impl<E> TestEngine<E> {
     /// Makes the next call of `open_room` start `delay` after it is called.
     pub fn slow_open(&self, delay: Duration) {
         *self.slow_open.lock().unwrap() = Some(delay);
+    }
+
+    /// Makes the next call of `create_snapshot` start `delay` after it is called.
+    pub fn slow_snapshot(&self, delay: Duration) {
+        *self.slow_snapshot.lock().unwrap() = Some(delay);
     }
 
     fn check(&self, method: &str) -> Result<(), StorageError> {
@@ -987,6 +999,8 @@ impl<E: StorageEngine> StorageEngine for TestEngine<E> {
     }
 
     async fn create_snapshot(&self, room_id: &RoomId) -> Result<Vec<u8>, StorageError> {
+        let delay = self.slow_snapshot.lock().unwrap().take();
+        tokio::time::sleep(delay.unwrap_or_default()).await;
         self.check("create_snapshot")?;
         self.inner.create_snapshot(room_id).await
     }

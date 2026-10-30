@@ -1,6 +1,6 @@
-//! The heartbeats of the client and the download of snapshots, against the server in process with
-//! a paused clock, whose rooms prune their log: a replica behind it catches up from the active
-//! snapshot of the relay.
+//! The heartbeats of the client and the download and the upload of snapshots, against the server
+//! in process with a paused clock, whose rooms prune their log: a replica behind it catches up from
+//! the active snapshot of the relay, which the client that the server designates uploads.
 
 mod common;
 
@@ -14,7 +14,9 @@ use tokio::time::Instant;
 use zemdb_client::{
     Client, ClientConfig, ClientError, FileMetadata, MemoryMetadata, TransportClient,
 };
-use zemdb_core::ClientMessageKind::{Ack, Commit, Heartbeat, RegisterClient, RequestSnapshotChunk};
+use zemdb_core::ClientMessageKind::{
+    Ack, Commit, Heartbeat, RegisterClient, RequestSnapshotChunk, UploadSnapshotChunk,
+};
 use zemdb_core::*;
 use zemdb_server::RoomCommand;
 use zemdb_storage::{DiskStorageEngine, MemoryStorageEngine, StorageEngine, StorageError};
@@ -1502,4 +1504,824 @@ async fn a_download_cut_at_any_point_installs_nothing_halfway() {
             break;
         }
     }
+}
+
+/// The schema `blobs` of [`blobs_schema`], at its first version.
+const BLOBS: (&str, u64) = ("blobs", 1);
+
+/// A client of a room over a disk engine in a directory of its own.
+struct Member {
+    transport: TestTransport,
+    storage: DiskStorageEngine,
+    client: Client,
+    _dir: TempDir,
+}
+
+/// A client of `server` that opens `room_id` ([`joined`]).
+async fn member(server: &TestServer, room_id: &RoomId) -> Member {
+    let dir = tempdir().unwrap();
+    let (transport, storage, client) = joined(server, room_id, dir.path()).await;
+    Member {
+        transport,
+        storage,
+        client,
+        _dir: dir,
+    }
+}
+
+/// The inserts of the blobs 1 to 9: the first two of 2 MiB and 64 KiB, and the others of 16 bytes,
+/// so that a snapshot of them takes two chunks.
+fn blobs() -> impl Iterator<Item = Operation> {
+    (1..=9).map(|id| insert_blob(id, if id <= 2 { (2 << 20) + (64 << 10) } else { 16 }))
+}
+
+/// A server that prunes, with `room_id` of `schema` holding `ops` (9 of them) and its log pruned
+/// before 6, and two members: one at 9, and one at 0, behind the log, for which the server
+/// designates the first to upload a snapshot. With the operations of the room.
+async fn designated_with(
+    room_id: &str,
+    (schema_id, schema): (&str, Schema),
+    ops: impl IntoIterator<Item = Operation>,
+) -> (TestServer, RoomId, Vec<SequencedOperation>, Member, Member) {
+    let server = TestServer::pruning();
+    let room_id = server.create_room_with(room_id, schema_id, schema).await;
+    let designee = member(&server, &room_id).await;
+    let ops = server.commit_ops(&room_id, ops).await;
+    designee.client.sync(room_id.clone()).await.unwrap();
+    server.prune(&room_id, 6).await;
+    let lagging = member(&server, &room_id).await;
+    (server, room_id, ops, designee, lagging)
+}
+
+/// [`designated_with`] `room-b` of [`blobs`]: the snapshot of the designated member takes two
+/// chunks.
+async fn designated() -> (TestServer, RoomId, Vec<SequencedOperation>, Member, Member) {
+    designated_with("room-b", ("blobs", blobs_schema()), blobs()).await
+}
+
+/// A server with `room-b` of [`blobs`], which keeps its log, and a member of it at 9: its server
+/// asks for no snapshot.
+async fn blobs_room() -> (TestServer, RoomId, Member) {
+    let server = TestServer::new();
+    let room_id = server
+        .create_room_with("room-b", "blobs", blobs_schema())
+        .await;
+    server.commit_ops(&room_id, blobs()).await;
+    let member = member(&server, &room_id).await;
+    member.client.sync(room_id.clone()).await.unwrap();
+    (server, room_id, member)
+}
+
+/// A chunk uploaded: its index, the number of chunks and its length, and the sequence, the size,
+/// the hash and the incarnation of its snapshot.
+type Upload = (u32, u32, usize, (u64, u64, [u8; 32], u128));
+
+/// The chunks uploaded through `transport`, in order.
+fn uploads(transport: &TestTransport) -> Vec<Upload> {
+    let upload = |message: ClientMessage| match message {
+        ClientMessage::UploadSnapshotChunk {
+            snapshot_head_seq,
+            chunk_index,
+            total_chunks,
+            total_bytes,
+            snapshot_hash,
+            data,
+            room_incarnation,
+            ..
+        } => {
+            let snapshot = (
+                snapshot_head_seq.get(),
+                total_bytes,
+                snapshot_hash,
+                room_incarnation,
+            );
+            Some((chunk_index, total_chunks, data.len(), snapshot))
+        }
+        _ => None,
+    };
+    transport.sent().into_iter().filter_map(upload).collect()
+}
+
+/// The indexes of the chunks uploaded through `transport`, in order.
+fn uploaded(transport: &TestTransport) -> Vec<u32> {
+    uploads(transport)
+        .into_iter()
+        .map(|(index, ..)| index)
+        .collect()
+}
+
+/// The active snapshot of `room_id` in the relay of `server`, by its sequence.
+fn active(server: &TestServer, room_id: &RoomId) -> Option<u64> {
+    let active = server.state.snapshot_relay.active_snapshot_seq(room_id);
+    active.map(|seq| seq.get())
+}
+
+/// A `HeartbeatAck` for the heartbeat `message` at the head `head`, which announces `schema` and no
+/// snapshot, and asks its client for one.
+fn wanted(message: &ClientMessage, head: u64, (schema_id, version): (&str, u64)) -> Vec<u8> {
+    let (correlation_id, room_id) = request(message);
+    encode_message(&ServerMessage::HeartbeatAck {
+        correlation_id,
+        room_id,
+        current_head_seq: SequenceNumber::new(head),
+        snapshot_wanted: true,
+        active_snapshot_seq: None,
+        schema_version: version,
+        schema_id: SchemaId::new(schema_id).unwrap(),
+    })
+    .unwrap()
+}
+
+/// A `SyncBatch` for the sync `message` of a room at 9, without operations, which
+/// announces the schema `schema_id` and asks its client for a snapshot if `snapshot_wanted`.
+fn sync_batch(message: &ClientMessage, schema_id: &str, snapshot_wanted: bool) -> Vec<u8> {
+    let (correlation_id, room_id) = request(message);
+    encode_message(&ServerMessage::SyncBatch {
+        correlation_id,
+        room_id,
+        head_seq: SequenceNumber::new(9),
+        ops: Vec::new(),
+        has_more: false,
+        snapshot_wanted,
+        schema_version: 1,
+        schema_id: SchemaId::new(schema_id).unwrap(),
+    })
+    .unwrap()
+}
+
+/// The acknowledgment of the chunk `message`, staged or not, once `change` changes it.
+fn upload_ack(message: &ClientMessage, staged: bool, change: fn(&mut ServerMessage)) -> Vec<u8> {
+    let ClientMessage::UploadSnapshotChunk {
+        correlation_id,
+        room_id,
+        chunk_index,
+        total_chunks,
+        ..
+    } = message
+    else {
+        panic!("{message:?}");
+    };
+    let mut ack = ServerMessage::SnapshotUploadChunkAck {
+        correlation_id: *correlation_id,
+        room_id: room_id.clone(),
+        chunk_index: *chunk_index,
+        total_chunks: *total_chunks,
+        staged,
+    };
+    change(&mut ack);
+    encode_message(&ack).unwrap()
+}
+
+/// Makes the next sync through `transport` fail its room of blobs closed: its batch announces
+/// another schema, and the registration that follows gets one that does not evolve from the
+/// replica's.
+fn fail_next_sync_closed(transport: &TestTransport, room_incarnation: u128) {
+    let retyped = TableSchema::builder("blobs")
+        .primary_key("id", DataType::Int)
+        .column("data", DataType::Int);
+    let retyped = Schema::builder().table(retyped).build();
+    let (mut sync, mut registration) = (true, true);
+    transport.answer(move |message| match message {
+        ClientMessage::Sync { .. } if std::mem::take(&mut sync) => {
+            Some(Ok(sync_batch(message, "other", false)))
+        }
+        ClientMessage::RegisterClient {
+            correlation_id,
+            room_id,
+            ..
+        } if std::mem::take(&mut registration) => {
+            Some(Ok(encode_message(&ServerMessage::Registered {
+                correlation_id: *correlation_id,
+                room_id: room_id.clone(),
+                head_seq: SequenceNumber::new(9),
+                tail_seq: SequenceNumber::new(1),
+                schema_id: SchemaId::new("other").unwrap(),
+                schema: retyped.clone(),
+                active_snapshot_seq: None,
+                room_incarnation,
+            })
+            .unwrap()))
+        }
+        _ => None,
+    });
+}
+
+/// Answers the first heartbeat through `transport` with an ack of the room of blobs at 9 that asks
+/// for a snapshot, and the first chunk uploaded with what `reply` gives for it.
+fn ask_upload(
+    transport: &TestTransport,
+    mut reply: impl FnMut(&ClientMessage) -> Vec<u8> + Send + 'static,
+) {
+    let (mut heartbeat, mut chunk) = (true, true);
+    transport.answer(move |message| match message.kind() {
+        Heartbeat if std::mem::take(&mut heartbeat) => Some(Ok(wanted(message, 9, BLOBS))),
+        UploadSnapshotChunk if std::mem::take(&mut chunk) => Some(Ok(reply(message))),
+        _ => None,
+    });
+}
+
+fn failed_closed<T: std::fmt::Debug>(result: Result<T, ClientError>) {
+    let failed = matches!(result, Err(ClientError::FailedClosed(_)));
+    assert!(failed, "{result:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_designated_client_uploads_a_snapshot_that_a_client_behind_the_log_downloads() {
+    // Of one chunk, from a memory engine: once a client registers behind the log, the server
+    // designates the client at 9, whose heartbeat uploads the snapshot at its head, with the
+    // incarnation of its metadata, and is sent again.
+    let server = TestServer::pruning();
+    let room_id = server.create_room("room-a").await;
+    let (transport, storage) = (server.transport(), MemoryStorageEngine::new());
+    let config = ClientConfig::new("ana");
+    let client = Client::open(
+        config,
+        storage.clone(),
+        MemoryMetadata::default(),
+        transport.clone(),
+    );
+    let client = client.await.unwrap();
+    open_room(&client, &room_id).await.unwrap();
+    server.commit(&room_id, 1..=9).await;
+    client.sync(room_id.clone()).await.unwrap();
+    server.prune(&room_id, 6).await;
+    let lagging = member(&server, &room_id).await;
+    let sent = transport.sent().len();
+    client.heartbeat(room_id.clone()).await.unwrap();
+    let sent_now = kinds(&transport)[sent..].to_vec();
+    assert_eq!(sent_now, [Heartbeat, UploadSnapshotChunk, Heartbeat]);
+    let snapshot = storage.create_snapshot(&room_id).await.unwrap();
+    let (len, incarnation) = (snapshot.len(), server.incarnation(&room_id).await);
+    let uploaded = (9, len as u64, hash(&snapshot), incarnation);
+    assert_eq!(uploads(&transport), [(0, 1, len, uploaded)]);
+    assert_eq!(active(&server, &room_id), Some(9));
+    // The client behind the log downloads it with a heartbeat that announces it, and syncs from it.
+    lagging.client.heartbeat(room_id.clone()).await.unwrap();
+    lagging.client.sync(room_id.clone()).await.unwrap();
+    let all = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+    assert_eq!(tasks(&lagging.storage, &room_id).await, all);
+    assert_eq!(chunks(&lagging.transport), [(0, None)]);
+    assert_eq!(requests(&lagging.transport), [("sync", 9), ("ack", 9)]);
+
+    // Of two chunks, from a disk engine: a snapshot of more than 4 MiB, in chunks of the same
+    // length but the last, which holds the rest.
+    let (server, room_id, _, designee, lagging) = designated().await;
+    designee.client.heartbeat(room_id.clone()).await.unwrap();
+    let snapshot = designee.storage.create_snapshot(&room_id).await.unwrap();
+    let (len, incarnation) = (snapshot.len(), server.incarnation(&room_id).await);
+    assert!(len > 4 << 20 && len % (4 << 20) != 0, "{len}");
+    let uploaded = (9, len as u64, hash(&snapshot), incarnation);
+    let first = len.div_ceil(2);
+    let expected = [(0, 2, first, uploaded), (1, 2, len - first, uploaded)];
+    assert_eq!(uploads(&designee.transport), expected);
+    lagging.client.heartbeat(room_id.clone()).await.unwrap();
+    lagging.client.sync(room_id.clone()).await.unwrap();
+    assert_eq!(head(&lagging.client, &room_id).await, 9);
+    let downloaded = [(0, None), (1, Some(hash(&snapshot)))];
+    assert_eq!(chunks(&lagging.transport), downloaded);
+    let blob = PrimaryKey::single(1);
+    let blob = lagging.storage.get(&room_id, "blobs", &blob).await;
+    assert!(blob.unwrap().is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_snapshot_uploaded_is_that_of_the_head_it_announces() {
+    // A write that comes while the designated client creates its snapshot waits for the applier:
+    // the snapshot holds the operations up to the head it announces, and the client behind the log
+    // installs it.
+    let server = TestServer::pruning();
+    let room_id = server.create_room("room-a").await;
+    let dir = tempdir().unwrap();
+    let (transport, storage) = (server.transport(), TestEngine::new(engine(dir.path())));
+    let client = open_client(dir.path(), storage.clone(), &transport).await;
+    open_room(&client, &room_id).await.unwrap();
+    server.commit(&room_id, 1..=9).await;
+    client.sync(room_id.clone()).await.unwrap();
+    server.prune(&room_id, 6).await;
+    let lagging = member(&server, &room_id).await;
+    storage.slow_snapshot(Duration::from_secs(1));
+    let write = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        client.write(room_id.clone(), insert_task(10)).await
+    };
+    let (heartbeat, written) = tokio::join!(client.heartbeat(room_id.clone()), write);
+    heartbeat.unwrap();
+    written.unwrap();
+    let (.., (seq, _, _, _)) = uploads(&transport)[0];
+    assert_eq!(seq, 9);
+    lagging.client.heartbeat(room_id.clone()).await.unwrap();
+    lagging.client.sync(room_id.clone()).await.unwrap();
+    assert_eq!(head(&lagging.client, &room_id).await, 10);
+
+    // A write applied between the heartbeat and the creation of the snapshot is in it, and the
+    // snapshot announces its sequence.
+    let schema = ("tasks", tasks_schema());
+    let ops = (1..=9).map(insert_task);
+    let (_server, room_id, _, designee, lagging) = designated_with("room-a", schema, ops).await;
+    let mut held = designee.transport.hold_next_reply(Heartbeat);
+    let (client, room) = (&designee.client, room_id.clone());
+    let write = async move {
+        held.replied().await;
+        client.write(room, insert_task(10)).await.unwrap();
+        held.release();
+    };
+    let (heartbeat, ()) = tokio::join!(designee.client.heartbeat(room_id.clone()), write);
+    heartbeat.unwrap();
+    let (.., (seq, _, _, _)) = uploads(&designee.transport)[0];
+    assert_eq!(seq, 10);
+    lagging.client.heartbeat(room_id.clone()).await.unwrap();
+    lagging.client.sync(room_id.clone()).await.unwrap();
+    assert_eq!(head(&lagging.client, &room_id).await, 10);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_wanted_by_a_sync_is_confirmed_with_a_heartbeat_and_not_by_a_write() {
+    // The batch of a sync asks the designated client for a snapshot: the sync confirms it with a
+    // heartbeat, whose ack asks for it too, and which uploads it.
+    let sync = ClientMessageKind::Sync;
+    let (server, room_id, _, designee, _lagging) = designated().await;
+    let sent = designee.transport.sent().len();
+    designee.client.sync(room_id.clone()).await.unwrap();
+    let sent_now = kinds(&designee.transport)[sent..].to_vec();
+    let upload = [UploadSnapshotChunk, UploadSnapshotChunk];
+    assert_eq!(
+        sent_now,
+        [[sync, Ack, Heartbeat].as_slice(), &upload, &[Heartbeat]].concat()
+    );
+    assert_eq!(active(&server, &room_id), Some(9));
+    // Without a batch that asks for one, a sync sends no heartbeat; with one whose heartbeat does
+    // not ask for it, it uploads nothing.
+    let sent = designee.transport.sent().len();
+    designee.client.sync(room_id.clone()).await.unwrap();
+    assert_eq!(kinds(&designee.transport)[sent..], [sync, Ack]);
+    let transport = &designee.transport;
+    transport.answer_next(sync, |message| sync_batch(message, "blobs", true));
+    designee.client.sync(room_id.clone()).await.unwrap();
+    assert_eq!(
+        kinds(&designee.transport)[sent + 2..],
+        [sync, Ack, Heartbeat]
+    );
+    assert_eq!(uploaded(&designee.transport), [0, 1]);
+
+    // A write confirms none, so that its decision does not wait for an upload: neither that of its
+    // commit ack nor that of the batch of its sync, which takes the sequence of a commit ack
+    // without its catch-up.
+    let schema = ("tasks", tasks_schema());
+    let ops = (1..=9).map(insert_task);
+    let (server, room_id, _, designee, _lagging) = designated_with("room-a", schema, ops).await;
+    let sent = designee.transport.sent().len();
+    let write = designee.client.write(room_id.clone(), insert_task(10));
+    write.await.unwrap();
+    server.commit(&room_id, [11]).await;
+    let transport = &designee.transport;
+    transport.answer_next(Commit, |message| commit_ack(message, 11));
+    let write = designee.client.write(room_id.clone(), update_task(10));
+    write.await.unwrap();
+    let sent_now = kinds(&designee.transport)[sent..].to_vec();
+    assert_eq!(sent_now, [Commit, Commit, sync, Ack]);
+    assert_eq!(active(&server, &room_id), None);
+    // The heartbeat that follows uploads it.
+    designee.client.heartbeat(room_id.clone()).await.unwrap();
+    assert_eq!(active(&server, &room_id), Some(11));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_upload_that_gets_superseded_stops() {
+    // The snapshot worker uploads one at 9 between the designation and the upload: the first chunk
+    // of the designated client gets `SnapshotSuperseded`, and it uploads no more.
+    let (server, room_id, ops, designee, lagging) = designated().await;
+    let other = big_snapshot(&room_id, &ops, 9).await;
+    let mut held = designee.transport.hold_next_reply(Heartbeat);
+    let (server_ref, room, staged) = (&server, room_id.clone(), other.clone());
+    let upload = async move {
+        held.replied().await;
+        server_ref.upload(&room, 9, staged).await;
+        held.release();
+    };
+    let (heartbeat, ()) = tokio::join!(designee.client.heartbeat(room_id.clone()), upload);
+    network(heartbeat);
+    assert_eq!(uploaded(&designee.transport), [0]);
+    // The client behind the log catches up from that of the worker.
+    lagging.client.heartbeat(room_id.clone()).await.unwrap();
+    lagging.client.sync(room_id.clone()).await.unwrap();
+    assert_eq!(head(&lagging.client, &room_id).await, 9);
+    assert_eq!(chunks(&lagging.transport)[1], (1, Some(hash(&other))));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_room_that_fails_closed_or_waits_for_a_snapshot_uploads_none() {
+    // A replica that waits for a snapshot uploads none, also when its heartbeat asks for it.
+    let (_server, room_id, _, _designee, lagging) = designated().await;
+    let transport = &lagging.transport;
+    transport.answer_next(Heartbeat, |message| wanted(message, 9, BLOBS));
+    lagging.client.heartbeat(room_id.clone()).await.unwrap();
+    assert_eq!(uploaded(&lagging.transport), [0; 0]);
+
+    // One that fails closed between the ack that asks for it and the upload uploads nothing, and
+    // one that fails closed during the upload, no more chunks: its heartbeat ends with
+    // `FailedClosed`.
+    for (held, chunks_sent) in [(Heartbeat, vec![]), (UploadSnapshotChunk, vec![0])] {
+        let (server, room_id, _, designee, _lagging) = designated().await;
+        let mut held = designee.transport.hold_next_reply(held);
+        let incarnation = server.incarnation(&room_id).await;
+        fail_next_sync_closed(&designee.transport, incarnation);
+        let (client, room) = (&designee.client, room_id.clone());
+        let fail = async move {
+            held.replied().await;
+            failed_closed(client.sync(room).await);
+            held.release();
+        };
+        let (heartbeat, ()) = tokio::join!(designee.client.heartbeat(room_id.clone()), fail);
+        failed_closed(heartbeat);
+        assert_eq!(uploaded(&designee.transport), chunks_sent);
+        assert_eq!(active(&server, &room_id), None);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_room_created_again_after_the_designation_gets_no_snapshot_of_the_old_one() {
+    // Between the designation and the upload: the first chunk, of the old incarnation, gets
+    // `RoomReset`; the replica registers again with its cursor, gets `RoomReset` and is discarded.
+    let (server, room_id, _, designee, _lagging) = designated().await;
+    let old = server.incarnation(&room_id).await;
+    let mut held = designee.transport.hold_next_reply(Heartbeat);
+    let (server_ref, room) = (&server, room_id.clone());
+    let recreate = async move {
+        held.replied().await;
+        server_ref.recreate_room(&room).await;
+        held.release();
+    };
+    let (heartbeat, ()) = tokio::join!(designee.client.heartbeat(room_id.clone()), recreate);
+    heartbeat.unwrap();
+    let incarnations: Vec<_> = uploads(&designee.transport)
+        .into_iter()
+        .map(|(index, .., (_, _, _, incarnation))| (index, incarnation))
+        .collect();
+    assert_eq!(incarnations, [(0, old)]);
+    let registrations = designee.transport.registrations();
+    let last = &registrations[registrations.len() - 2..];
+    assert_eq!(last, [(Some(9), Some(old)), (None, None)]);
+    let status_now = designee.client.status(room_id.clone()).await;
+    assert_eq!(status_now, Ok(status(0, 2, true)));
+    assert_eq!(active(&server, &room_id), None);
+
+    // During the upload, a sync gets `ClientNotRegistered` from the new room, registers again and
+    // discards the replica: no more chunks are sent.
+    let (server, room_id, _, designee, _lagging) = designated().await;
+    let mut held = designee.transport.hold_next_reply(UploadSnapshotChunk);
+    let (server_ref, client, room) = (&server, &designee.client, room_id.clone());
+    let discard = async move {
+        held.replied().await;
+        server_ref.recreate_room(&room).await;
+        client.sync(room).await.unwrap();
+        held.release();
+    };
+    let (heartbeat, ()) = tokio::join!(designee.client.heartbeat(room_id.clone()), discard);
+    heartbeat.unwrap();
+    assert_eq!(uploaded(&designee.transport), [0]);
+    let status_now = designee.client.status(room_id.clone()).await;
+    assert_eq!(status_now, Ok(status(0, 2, true)));
+    assert_eq!(active(&server, &room_id), None);
+
+    // After a discard in the same incarnation (`InvalidSequence` to the registration of a sync,
+    // fabricated), neither, though the relay would take them.
+    let (server, room_id, _, designee, _lagging) = designated().await;
+    let mut held = designee.transport.hold_next_reply(UploadSnapshotChunk);
+    let (mut sync, mut registration) = (true, true);
+    designee
+        .transport
+        .answer(move |message| match message.kind() {
+            ClientMessageKind::Sync if std::mem::take(&mut sync) => {
+                let (id, room) = request(message);
+                Some(Ok(error_reply(id, &room, ErrorCode::ClientNotRegistered)))
+            }
+            RegisterClient if std::mem::take(&mut registration) => {
+                let (id, room) = request_of(message);
+                Some(Ok(error_reply(id, &room, ErrorCode::InvalidSequence)))
+            }
+            _ => None,
+        });
+    let (client, room) = (&designee.client, room_id.clone());
+    let discard = async move {
+        held.replied().await;
+        // Discarded, the replica registers behind the log, and waits for a snapshot.
+        network(client.sync(room).await);
+        held.release();
+    };
+    let (heartbeat, ()) = tokio::join!(designee.client.heartbeat(room_id.clone()), discard);
+    heartbeat.unwrap();
+    assert_eq!(uploaded(&designee.transport), [0]);
+    let status_now = designee.client.status(room_id.clone()).await.unwrap();
+    assert_eq!(status_now.epoch, 2);
+    assert_eq!(active(&server, &room_id), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_chunk_is_sent_again_after_a_transient_failure() {
+    // A chunk of a download without a reply, or with `Unavailable` or `Timeout`, is requested
+    // again, and the download goes on.
+    let (server, room_id, ops) = pruned_room().await;
+    let snapshot = snapshot(&room_id, tasks_schema(), &ops[..7]).await;
+    server.upload(&room_id, 7, snapshot).await;
+    for code in [None, Some(ErrorCode::Unavailable), Some(ErrorCode::Timeout)] {
+        let lagging = member(&server, &room_id).await;
+        match code {
+            None => lagging.transport.lose_next_reply(RequestSnapshotChunk),
+            Some(code) => answer_next(&lagging.transport, RequestSnapshotChunk, move |id, room| {
+                error_reply(id, room, code)
+            }),
+        }
+        lagging.client.sync(room_id.clone()).await.unwrap();
+        assert_eq!(chunks(&lagging.transport), [(0, None), (0, None)]);
+        assert_eq!(head(&lagging.client, &room_id).await, 9);
+    }
+    // A few times, after a backoff.
+    let lagging = member(&server, &room_id).await;
+    lagging
+        .transport
+        .answer_every(RequestSnapshotChunk, |message| {
+            let (id, room) = request(message);
+            error_reply(id, &room, ErrorCode::Unavailable)
+        });
+    let start = Instant::now();
+    network(lagging.client.sync(room_id.clone()).await);
+    assert_eq!(chunks(&lagging.transport).len(), 4);
+    let waited = start.elapsed();
+    assert!(
+        waited > Duration::ZERO && waited < Duration::from_secs(1),
+        "{waited:?}"
+    );
+
+    // The last chunk of an upload without a reply is sent again, and the relay, which staged it,
+    // acknowledges it again.
+    let (server, room_id, _, designee, _lagging) = designated().await;
+    let mut held = designee.transport.hold_next_reply(UploadSnapshotChunk);
+    let transport = designee.transport.clone();
+    let lose = async move {
+        held.replied().await;
+        transport.lose_next_reply(UploadSnapshotChunk);
+        held.release();
+    };
+    let (heartbeat, ()) = tokio::join!(designee.client.heartbeat(room_id.clone()), lose);
+    heartbeat.unwrap();
+    assert_eq!(uploaded(&designee.transport), [0, 1, 1]);
+    assert_eq!(active(&server, &room_id), Some(9));
+    // `Unavailable` to every chunk stops it after a few.
+    let (_server, room_id, _, designee, _lagging) = designated().await;
+    let transport = &designee.transport;
+    transport.answer_every(UploadSnapshotChunk, |message| {
+        let (id, room) = request(message);
+        error_reply(id, &room, ErrorCode::Unavailable)
+    });
+    network(designee.client.heartbeat(room_id.clone()).await);
+    assert_eq!(uploaded(&designee.transport), [0, 0, 0, 0]);
+
+    // Nor is a chunk sent again once the replica may not upload: here a sync discards it in the
+    // same incarnation (`InvalidSequence` to its registration, fabricated) while the chunk waits
+    // for its retry.
+    let schema = ("tasks", tasks_schema());
+    let ops = (1..=9).map(insert_task);
+    let (server, room_id, _, designee, _lagging) = designated_with("room-a", schema, ops).await;
+    let mut held = designee.transport.hold_next_reply(UploadSnapshotChunk);
+    let (mut chunk, mut sync, mut registration) = (true, true, true);
+    designee
+        .transport
+        .answer(move |message| match message.kind() {
+            UploadSnapshotChunk if std::mem::take(&mut chunk) => {
+                let (id, room) = request(message);
+                Some(Ok(error_reply(id, &room, ErrorCode::Unavailable)))
+            }
+            ClientMessageKind::Sync if std::mem::take(&mut sync) => {
+                let (id, room) = request(message);
+                Some(Ok(error_reply(id, &room, ErrorCode::ClientNotRegistered)))
+            }
+            RegisterClient if std::mem::take(&mut registration) => {
+                let (id, room) = request_of(message);
+                Some(Ok(error_reply(id, &room, ErrorCode::InvalidSequence)))
+            }
+            _ => None,
+        });
+    let (client, room) = (&designee.client, room_id.clone());
+    let discard = async move {
+        // The discard ends while the chunk waits for its retry.
+        held.replied().await;
+        held.release();
+        network(client.sync(room).await);
+    };
+    let (heartbeat, ()) = tokio::join!(designee.client.heartbeat(room_id.clone()), discard);
+    heartbeat.unwrap();
+    assert_eq!(uploaded(&designee.transport), [0]);
+    assert_eq!(active(&server, &room_id), None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_replica_whose_upload_failed_uploads_none_for_a_minute() {
+    // A relay that takes no snapshot of the room, above its limit; the heartbeats and the batches
+    // that ask for one are fabricated. The sync that confirms ends with the `Network` of its
+    // upload, and for a minute neither a sync nor a heartbeat uploads again.
+    let server = TestServer::with(|config| config.max_snapshot_bytes = 64);
+    let room_id = server.create_room("room-a").await;
+    server.commit(&room_id, 1..=9).await;
+    let designee = member(&server, &room_id).await;
+    designee.client.sync(room_id.clone()).await.unwrap();
+    designee.transport.answer(|message| match message.kind() {
+        Heartbeat => Some(Ok(wanted(message, 9, TASKS))),
+        ClientMessageKind::Sync => Some(Ok(sync_batch(message, "tasks", true))),
+        _ => None,
+    });
+    network(designee.client.sync(room_id.clone()).await);
+    assert_eq!(uploaded(&designee.transport), [0]);
+    designee.client.sync(room_id.clone()).await.unwrap();
+    designee.client.heartbeat(room_id.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(59)).await;
+    designee.client.heartbeat(room_id.clone()).await.unwrap();
+    assert_eq!(uploaded(&designee.transport), [0]);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    network(designee.client.heartbeat(room_id.clone()).await);
+    assert_eq!(uploaded(&designee.transport), [0, 0]);
+
+    // A snapshot that could not be created is an upload that failed too.
+    let dir = tempdir().unwrap();
+    let (transport, storage) = (server.transport(), TestEngine::new(engine(dir.path())));
+    let client = open_client(dir.path(), storage.clone(), &transport).await;
+    open_room(&client, &room_id).await.unwrap();
+    client.sync(room_id.clone()).await.unwrap();
+    transport.answer_every(Heartbeat, |message| wanted(message, 9, TASKS));
+    let error = std::io::Error::new(std::io::ErrorKind::OutOfMemory, "Injected");
+    storage.fail_next("create_snapshot", StorageError::Io(error));
+    let created = client.heartbeat(room_id.clone()).await;
+    assert!(
+        matches!(created, Err(ClientError::Storage(_))),
+        "{created:?}"
+    );
+    client.heartbeat(room_id.clone()).await.unwrap();
+    assert_eq!(uploaded(&transport), [0; 0]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_replies_to_an_upload_are_checked_before_they_are_used() {
+    // In a room that keeps its log, whose server asks for no snapshot: the heartbeat that asks for
+    // one is fabricated. An ack of another chunk stops the upload.
+    let (server, room_id, _) = blobs_room().await;
+    type Change = fn(&mut ServerMessage);
+    let changes: [(&str, Change); 4] = [
+        ("another correlation", |ack| {
+            if let ServerMessage::SnapshotUploadChunkAck { correlation_id, .. } = ack {
+                *correlation_id = CorrelationId::new(correlation_id.get() + 1);
+            }
+        }),
+        ("another room", |ack| {
+            if let ServerMessage::SnapshotUploadChunkAck { room_id, .. } = ack {
+                *room_id = RoomId::new("room-x").unwrap();
+            }
+        }),
+        ("another index", |ack| {
+            if let ServerMessage::SnapshotUploadChunkAck { chunk_index, .. } = ack {
+                *chunk_index = 1;
+            }
+        }),
+        ("more chunks", |ack| {
+            if let ServerMessage::SnapshotUploadChunkAck { total_chunks, .. } = ack {
+                *total_chunks = 3;
+            }
+        }),
+    ];
+    for (case, change) in changes {
+        let designee = member(&server, &room_id).await;
+        designee.client.sync(room_id.clone()).await.unwrap();
+        ask_upload(&designee.transport, move |message| {
+            upload_ack(message, false, change)
+        });
+        network(designee.client.heartbeat(room_id.clone()).await);
+        assert_eq!(uploaded(&designee.transport), [0], "{case}");
+    }
+    // An error of another request: `RoomReset` of another correlation or of another room does not
+    // register the replica again.
+    let errors: [Reply; 2] = [
+        |id, room| {
+            let other = CorrelationId::new(id.get() + 1);
+            error_reply(other, room, ErrorCode::RoomReset)
+        },
+        |id, _| error_reply(id, &RoomId::new("room-x").unwrap(), ErrorCode::RoomReset),
+    ];
+    for error in errors {
+        let designee = member(&server, &room_id).await;
+        designee.client.sync(room_id.clone()).await.unwrap();
+        ask_upload(&designee.transport, move |message| {
+            let (id, room) = request(message);
+            error(id, &room)
+        });
+        network(designee.client.heartbeat(room_id.clone()).await);
+        assert_eq!(uploaded(&designee.transport), [0]);
+        assert_eq!(designee.transport.registrations().len(), 1);
+    }
+
+    // A chunk staged ends the upload, also before the last one: the relay holds that snapshot.
+    let designee = member(&server, &room_id).await;
+    designee.client.sync(room_id.clone()).await.unwrap();
+    ask_upload(&designee.transport, |message| {
+        upload_ack(message, true, |_| {})
+    });
+    designee.client.heartbeat(room_id.clone()).await.unwrap();
+    assert_eq!(uploaded(&designee.transport), [0]);
+    // The last one not staged is `Network`.
+    let designee = member(&server, &room_id).await;
+    designee.client.sync(room_id.clone()).await.unwrap();
+    let mut heartbeat = true;
+    designee
+        .transport
+        .answer(move |message| match message.kind() {
+            Heartbeat if std::mem::take(&mut heartbeat) => Some(Ok(wanted(message, 9, BLOBS))),
+            UploadSnapshotChunk => Some(Ok(upload_ack(message, false, |_| {}))),
+            _ => None,
+        });
+    network(designee.client.heartbeat(room_id.clone()).await);
+    assert_eq!(uploaded(&designee.transport), [0, 1]);
+
+    // `RoomReset` to a chunk registers the replica again with its cursor, and the heartbeat is sent
+    // again; here the room is the same. A heartbeat that registered again already is `Network`.
+    let designee = member(&server, &room_id).await;
+    designee.client.sync(room_id.clone()).await.unwrap();
+    ask_upload(&designee.transport, |message| {
+        let (id, room) = request(message);
+        error_reply(id, &room, ErrorCode::RoomReset)
+    });
+    let sent = designee.transport.sent().len();
+    designee.client.heartbeat(room_id.clone()).await.unwrap();
+    let sent_now = kinds(&designee.transport)[sent..].to_vec();
+    assert_eq!(
+        sent_now,
+        [Heartbeat, UploadSnapshotChunk, RegisterClient, Heartbeat]
+    );
+    assert_eq!(
+        designee.transport.registrations()[1],
+        (Some(9), Some(server.incarnation(&room_id).await))
+    );
+    let designee = member(&server, &room_id).await;
+    designee.client.sync(room_id.clone()).await.unwrap();
+    let (mut first, mut second, mut chunk) = (true, true, true);
+    designee
+        .transport
+        .answer(move |message| match message.kind() {
+            Heartbeat if std::mem::take(&mut first) => {
+                let (id, room) = request(message);
+                Some(Ok(error_reply(id, &room, ErrorCode::ClientNotRegistered)))
+            }
+            Heartbeat if std::mem::take(&mut second) => Some(Ok(wanted(message, 9, BLOBS))),
+            UploadSnapshotChunk if std::mem::take(&mut chunk) => {
+                let (id, room) = request(message);
+                Some(Ok(error_reply(id, &room, ErrorCode::RoomReset)))
+            }
+            _ => None,
+        });
+    let sent = designee.transport.sent().len();
+    network(designee.client.heartbeat(room_id.clone()).await);
+    let sent_now = kinds(&designee.transport)[sent..].to_vec();
+    assert_eq!(
+        sent_now,
+        [Heartbeat, RegisterClient, Heartbeat, UploadSnapshotChunk]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_heartbeat_uploads_once_and_two_upload_one_at_a_time() {
+    // A heartbeat whose second ack asks for a snapshot too uploads none again.
+    let (server, room_id, designee) = blobs_room().await;
+    let transport = &designee.transport;
+    transport.answer_every(Heartbeat, |message| wanted(message, 9, BLOBS));
+    let sent = designee.transport.sent().len();
+    designee.client.heartbeat(room_id.clone()).await.unwrap();
+    let sent_now = kinds(&designee.transport)[sent..].to_vec();
+    let upload = [UploadSnapshotChunk, UploadSnapshotChunk];
+    assert_eq!(
+        sent_now,
+        [[Heartbeat].as_slice(), &upload, &[Heartbeat]].concat()
+    );
+    assert_eq!(active(&server, &room_id), Some(9));
+
+    // Two heartbeats at once upload one after the other: while the reply to the first chunk of one
+    // is held, the other sends nothing, and then it finds the snapshot staged at its first chunk.
+    let room_id = server
+        .create_room_with("room-c", "blobs", blobs_schema())
+        .await;
+    server.commit_ops(&room_id, blobs()).await;
+    let designee = member(&server, &room_id).await;
+    designee.client.sync(room_id.clone()).await.unwrap();
+    let transport = designee.transport.clone();
+    transport.answer_every(Heartbeat, |message| wanted(message, 9, BLOBS));
+    let mut held = transport.hold_next_reply(UploadSnapshotChunk);
+    let hold = async move {
+        held.replied().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(uploaded(&transport), [0]);
+        held.release();
+    };
+    let (first, second, ()) = tokio::join!(
+        designee.client.heartbeat(room_id.clone()),
+        designee.client.heartbeat(room_id.clone()),
+        hold
+    );
+    first.unwrap();
+    second.unwrap();
+    assert_eq!(uploaded(&designee.transport), [0, 1, 0]);
 }

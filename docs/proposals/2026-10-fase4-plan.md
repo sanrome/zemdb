@@ -167,7 +167,7 @@ En `zemdb-client`, contra el trait `TransportClient`, sin red real, con la forma
 
 ### 4.3 · Transporte nativo y `SyncWorker`
 - El adaptador `reqwest` sobre HTTP/2.
-- El `SyncWorker`: SSE con la reacción a cada evento, pull paginado, `Ack` del último lote, heartbeat y reconexión con *backoff* exponencial y *full jitter* (§A.5). El heartbeat de 4.2 espera una bajada de snapshot en curso, o hace la suya, y los chunks no renuevan el lease: el worker no encadena los heartbeats detrás de una bajada larga (del Lote 8 de 4.2).
+- El `SyncWorker`: SSE con la reacción a cada evento, pull paginado, `Ack` del último lote, heartbeat y reconexión con *backoff* exponencial y *full jitter* (§A.5). El heartbeat de 4.2 espera una bajada o una subida de snapshot en curso, o hace la suya, y los chunks no renuevan el lease: el worker no encadena los heartbeats detrás de una bajada o una subida larga (de los Lotes 8 y 9 de 4.2).
 - La renovación del token ante `Unauthorized`.
 
 ### 4.4 · API de Rust
@@ -308,7 +308,7 @@ Escenarios:
 
 ## 8. Seguimiento
 
-**Avance:** 4.0 cerrada el 23 de Octubre de 2026, con la revisión cruzada en verde. 4.1 cerrada el 25 de Octubre, con la revisión de cierre en verde sobre `977837f`; su [plan por lotes](2026-10-fase4_1-storage-servidor.md) lleva su seguimiento. 4.2 en curso desde el 26 de Octubre, con su [plan por lotes](2026-10-fase4_2-nucleo-replica.md): Lote 0 cerrado el 27 de Octubre, con la revisión cruzada en verde; DC18 a DC23 adoptadas el 28 de Octubre; Lotes 1 (`delete_room`), 2 (la encarnación en los chunks del relay), 3 (el esqueleto del cliente) y 4 (apertura, registro, descarte y cierre) cerrados el mismo día, y 5 (el aplicador y `sync`), 6 (el esquema) y 7 (las escrituras) el 29 de Octubre, y 8 (el heartbeat y la bajada de snapshots) el 30 de Octubre. El plan de 4.0 fue este documento más el Lote 0 de `docs/METODOLOGIA.md` §2, en estos pasos:
+**Avance:** 4.0 cerrada el 23 de Octubre de 2026, con la revisión cruzada en verde. 4.1 cerrada el 25 de Octubre, con la revisión de cierre en verde sobre `977837f`; su [plan por lotes](2026-10-fase4_1-storage-servidor.md) lleva su seguimiento. 4.2 en curso desde el 26 de Octubre, con su [plan por lotes](2026-10-fase4_2-nucleo-replica.md): Lote 0 cerrado el 27 de Octubre, con la revisión cruzada en verde; DC18 a DC23 adoptadas el 28 de Octubre; Lotes 1 (`delete_room`), 2 (la encarnación en los chunks del relay), 3 (el esqueleto del cliente) y 4 (apertura, registro, descarte y cierre) cerrados el mismo día, y 5 (el aplicador y `sync`), 6 (el esquema) y 7 (las escrituras) el 29 de Octubre, y 8 (el heartbeat y la bajada de snapshots) y 9 (la subida de snapshots) el 30 de Octubre. El plan de 4.0 fue este documento más el Lote 0 de `docs/METODOLOGIA.md` §2, en estos pasos:
 
 | Paso | Qué | Estado |
 |---|---|---|

@@ -16,8 +16,16 @@ use zemdb_storage::{StorageEngine, StorageError};
 
 use crate::{ClientConfig, ClientError, MetadataStore, RoomMetadata, TransportClient};
 
-/// The size of the chunks of a download: the largest that the relay serves.
+/// The size of the chunks of a download, the largest that the relay serves, and the largest of an
+/// upload.
 const CHUNK_BYTES: u32 = 4 << 20;
+
+/// How many times a chunk of a snapshot is sent again after a transient failure.
+const CHUNK_RETRIES: u32 = 3;
+
+/// How long a replica whose upload failed uploads no other: the time the server gives a client it
+/// designates to start uploading, after which it designates one again.
+const UPLOAD_PAUSE: Duration = Duration::from_secs(60);
 
 /// The client of a device: one replica per room it opens.
 pub struct Client {
@@ -66,8 +74,8 @@ struct Room {
     applier: Arc<tokio::sync::Mutex<()>>,
     /// Held by an opening, with its registration: one registration at a time.
     registration: tokio::sync::Mutex<()>,
-    /// Held by the download of a snapshot: one at a time.
-    download: tokio::sync::Mutex<()>,
+    /// Held by the download or the upload of a snapshot: one at a time.
+    transfer: tokio::sync::Mutex<()>,
     state: Mutex<State>,
 }
 
@@ -103,6 +111,8 @@ struct OpenReplica {
     awaits_snapshot: Option<bool>,
     /// The sequence of the last snapshot it dropped, which it does not download again.
     dropped: Option<SequenceNumber>,
+    /// When its last upload failed.
+    upload_failed: Option<Instant>,
     /// Its schema changed to one that does not evolve from its own, or the server sent an
     /// operation that does not validate against it: it applies nothing more, and neither
     /// registers nor syncs, until it opens again.
@@ -116,6 +126,7 @@ impl OpenReplica {
             registered,
             awaits_snapshot: None,
             dropped: None,
+            upload_failed: None,
             failed_closed: false,
         }
     }
@@ -351,6 +362,26 @@ impl Room {
         matches!(&self.state().replica, Replica::Open(open) if open.awaits_snapshot.is_some())
     }
 
+    /// The incarnation of the replica of `epoch`, if it may upload a snapshot: it is open, does
+    /// not fail closed, does not wait for a snapshot, and no upload of it failed in the last
+    /// [`UPLOAD_PAUSE`].
+    fn uploads(&self, epoch: u64) -> Option<u128> {
+        let state = self.state();
+        match &state.replica {
+            Replica::Open(open)
+                if state.epoch == epoch
+                    && !open.failed_closed
+                    && open.awaits_snapshot.is_none()
+                    && open
+                        .upload_failed
+                        .is_none_or(|failed| failed.elapsed() >= UPLOAD_PAUSE) =>
+            {
+                Some(open.metadata.room_incarnation)
+            }
+            _ => None,
+        }
+    }
+
     /// Whether the write `mutation_id` is still in flight: closing the room, discarding its
     /// replica or failing it closed ends every write.
     fn in_flight(&self, mutation_id: &MutationId) -> bool {
@@ -516,7 +547,7 @@ impl Client {
                     id: room_id,
                     applier: Arc::default(),
                     registration: tokio::sync::Mutex::default(),
-                    download: tokio::sync::Mutex::default(),
+                    transfer: tokio::sync::Mutex::default(),
                     state: Mutex::default(),
                 })
             });
@@ -766,9 +797,21 @@ impl Client {
     /// operation that does not validate against the schema of the replica; once the sync
     /// registered again for a signal, it fails the room closed. The sync of a room that fails
     /// closed is `FailedClosed`, without sending anything.
+    ///
+    /// A batch that asks the client for a snapshot (`snapshot_wanted`) is confirmed with a
+    /// heartbeat once the sync ends, which uploads it as [`heartbeat`](Self::heartbeat) says.
     pub async fn sync(&self, room_id: RoomId) -> Result<(), ClientError> {
+        match self.synced(room_id.clone()).await? {
+            true => self.heartbeat(room_id).await,
+            false => Ok(()),
+        }
+    }
+
+    /// [`sync`](Self::sync) without its heartbeat: returns whether a batch asked the client for a
+    /// snapshot.
+    async fn synced(&self, room_id: RoomId) -> Result<bool, ClientError> {
         let room = self.room(&room_id)?;
-        let mut again = false;
+        let (mut again, mut wanted) = (false, false);
         loop {
             let request = self.change(&room, Local::request).await?;
             let Some((from_seq, _)) = request.cursor.filter(|_| request.registered) else {
@@ -802,10 +845,11 @@ impl Client {
                     head_seq,
                     ops,
                     has_more,
+                    snapshot_wanted,
                     schema_version,
                     schema_id,
-                    ..
                 } if reply_id == correlation_id && room_id == room.id => {
+                    wanted |= snapshot_wanted;
                     (head_seq, ops, has_more, (schema_id, schema_version))
                 }
                 reply => {
@@ -862,7 +906,7 @@ impl Client {
                 } if reply_id == correlation_id && room_id == room.id && ack_seq == head => {
                     room.saw(epoch, head_seq);
                     if head_seq >= head {
-                        return Ok(());
+                        return Ok(wanted);
                     }
                 }
                 reply => {
@@ -903,7 +947,9 @@ impl Client {
     /// before the `CommitAck` takes the decision retained, and one at or below that head is an
     /// unknown outcome. After the `CommitAck`, it waits for its sequence without a deadline: if
     /// the room is closed, its replica discarded, or failing closed before the replica applies
-    /// it with its report, the outcome is unknown.
+    /// it with its report, the outcome is unknown. A write leaves a reply that asks the client
+    /// for a snapshot to the next heartbeat or sync, so that its decision does not wait for the
+    /// upload.
     pub async fn write(&self, room_id: RoomId, op: Operation) -> Result<(), ClientError> {
         let room = self.room(&room_id)?;
         let mutation_id = MutationId::from(Uuid::new_v4().as_u128());
@@ -1062,10 +1108,11 @@ impl Client {
                 return decision;
             }
             // Its errors are retried: the room ends the write if it closes or fails closed. Behind
-            // the log, the replica learns of a snapshot with a heartbeat.
+            // the log, the replica learns of a snapshot with a heartbeat. The sync confirms no
+            // snapshot wanted: the decision would wait for its upload.
             let _ = match room.awaits_snapshot() {
                 true => self.heartbeat(room.id.clone()).await,
-                false => self.sync(room.id.clone()).await,
+                false => self.synced(room.id.clone()).await.map(|_| ()),
             };
             if let Some(decision) = room.decision(&mutation_id) {
                 return decision;
@@ -1093,9 +1140,20 @@ impl Client {
     /// goes on from it. One that does not install with that schema registers the replica again,
     /// for `Registered` to give it the schema of the room, and is dropped if it does not install
     /// with it either.
+    ///
+    /// An ack that asks the client for a snapshot (`snapshot_wanted`) designates it to upload
+    /// one, once per heartbeat, and the heartbeat is sent again from the state that the upload
+    /// left. The snapshot is created at the head of the replica, under its applier, unless the
+    /// replica fails closed or waits for a snapshot, and uploaded in `n = ⌈T / 4 MiB⌉` chunks of
+    /// `⌈T / n⌉` bytes but the last, as the relay takes them, with the incarnation of the
+    /// replica; no chunk is sent once the replica is discarded. `RoomReset` registers the
+    /// replica again with its cursor, and `SnapshotSuperseded`, or any other reply, stops the
+    /// upload with `Network`; a replica whose upload failed uploads no other for a minute. A
+    /// chunk of a download or an upload without a reply, or with `Unavailable` or `Timeout`, is
+    /// sent again after a backoff, a few times.
     pub async fn heartbeat(&self, room_id: RoomId) -> Result<(), ClientError> {
         let room = self.room(&room_id)?;
-        let mut again = false;
+        let (mut again, mut uploaded) = (false, false);
         loop {
             let request = self.change(&room, Local::request).await?;
             let Some((head, _)) = request.cursor.filter(|_| request.registered) else {
@@ -1109,19 +1167,21 @@ impl Client {
                 room_id: room.id.clone(),
                 client_id: self.client_id.clone(),
             };
-            let (head_seq, schema, snapshot) = match self.send(&message, &request.token).await? {
+            let reply = self.send(&message, &request.token).await?;
+            let (head_seq, schema, snapshot, wanted) = match reply {
                 ServerMessage::HeartbeatAck {
                     correlation_id: reply_id,
                     room_id,
                     current_head_seq,
+                    snapshot_wanted,
                     active_snapshot_seq,
                     schema_version,
                     schema_id,
-                    ..
                 } if reply_id == correlation_id && room_id == room.id => (
                     current_head_seq,
                     (schema_id, schema_version),
                     active_snapshot_seq,
+                    snapshot_wanted,
                 ),
                 reply => {
                     self.refused(&room, epoch, head, correlation_id, reply, again)
@@ -1140,6 +1200,13 @@ impl Client {
                 room.register_again(epoch, &mut again)?;
                 continue;
             }
+            if wanted && !std::mem::replace(&mut uploaded, true) {
+                if let Err(err) = self.upload(&room, &request, &mut again).await {
+                    room.update(epoch, |open| open.upload_failed = Some(Instant::now()));
+                    return Err(err);
+                }
+                continue;
+            }
             if !room.announced(epoch, snapshot) {
                 return Ok(());
             }
@@ -1154,7 +1221,7 @@ impl Client {
     /// and a snapshot that does not install with the schema of the replica registers it again,
     /// once per call of the caller (`again`), before installing it once more.
     async fn snapshot(&self, room: &Arc<Room>, again: &mut bool) -> Result<(), ClientError> {
-        let _download = room.download.lock().await;
+        let _transfer = room.transfer.lock().await;
         let request = self.change(room, Local::request).await?;
         let announced = request.awaits_snapshot == Some(true);
         let Some((_, incarnation)) = request.cursor.filter(|_| announced) else {
@@ -1190,7 +1257,8 @@ impl Client {
     /// takes. Returns its sequence and its bytes once they match its hash, or `None` on
     /// `RoomReset`. One larger than `max_snapshot_bytes` is `Config`. `SnapshotSuperseded`
     /// downloads it again from its first chunk, once per download, and `RoomNotFound` leaves the
-    /// replica waiting for a heartbeat that announces one. Any other reply, or none, is `Network`.
+    /// replica waiting for a heartbeat that announces one. Any other reply, or none, is `Network`
+    /// ([`send_chunk`](Self::send_chunk) sends a chunk again a few times).
     async fn download(
         &self,
         room: &Room,
@@ -1215,8 +1283,8 @@ impl Client {
                 snapshot_hash: first.map(|(.., hash)| hash),
                 room_incarnation: incarnation,
             };
-            match self.send(&message, &request.token).await? {
-                ServerMessage::SnapshotChunk {
+            match self.send_chunk(&message, &request.token, || true).await? {
+                Some(ServerMessage::SnapshotChunk {
                     correlation_id: reply_id,
                     room_id,
                     snapshot_head_seq,
@@ -1225,7 +1293,7 @@ impl Client {
                     total_bytes,
                     snapshot_hash,
                     data,
-                } if reply_id == correlation_id && room_id == room.id && chunk_index == index => {
+                }) if reply_id == correlation_id && room_id == room.id && chunk_index == index => {
                     let max = self.config.max_snapshot_bytes;
                     if total_bytes > max {
                         return Err(ClientError::Config(format!(
@@ -1254,12 +1322,12 @@ impl Client {
                     bytes.extend_from_slice(&data);
                     index += 1;
                 }
-                ServerMessage::Error {
+                Some(ServerMessage::Error {
                     correlation_id: reply_id,
                     room_id,
                     code,
                     message,
-                } if reply_id.is_none_or(|reply_id| reply_id == correlation_id)
+                }) if reply_id.is_none_or(|reply_id| reply_id == correlation_id)
                     && room_id.as_ref().is_none_or(|room_id| *room_id == room.id) =>
                 {
                     match code {
@@ -1297,6 +1365,130 @@ impl Client {
             ));
         }
         Ok(Some((seq, bytes)))
+    }
+
+    /// Uploads a snapshot of the replica of `request` in `room`, created at its head under the
+    /// applier, unless the replica may not upload one ([`Room::uploads`]), in `n = ⌈T / 4 MiB⌉`
+    /// chunks of `⌈T / n⌉` bytes but the last, which holds the rest, as the relay takes them,
+    /// each with the incarnation of the replica. One upload at a time, also with the downloads.
+    /// No chunk is sent, or sent again, once the replica may not upload: after a discard, the
+    /// incarnation may be the same. Each reply is checked before it is used: an ack with the
+    /// correlation id, the room, the index and the number of chunks of the chunk, and the upload
+    /// ends with the one that staged it. `RoomReset` leaves the replica to register again with
+    /// its cursor, once per call of the caller (`again`). Any other reply, or none, is `Network`,
+    /// and the upload stops.
+    async fn upload(
+        &self,
+        room: &Arc<Room>,
+        request: &Request,
+        again: &mut bool,
+    ) -> Result<(), ClientError> {
+        let _transfer = room.transfer.lock().await;
+        let epoch = request.epoch;
+        let created = move |local: Local, room| local.create_snapshot(room, epoch);
+        let Some((seq, incarnation, snapshot)) = self.change(room, created).await? else {
+            return Ok(());
+        };
+        // Hashing a large snapshot would stall the runtime.
+        let snapshot = Bytes::from(snapshot);
+        let hashed = snapshot.clone();
+        let hashed =
+            tokio::task::spawn_blocking(move || ServerMessage::compute_snapshot_hash(&hashed));
+        let hash = (hashed.await)
+            .map_err(|err| ClientError::Storage(format!("Hashing the snapshot failed: {err}")))?;
+        let total_bytes = snapshot.len() as u64;
+        let chunks = snapshot.len().div_ceil(CHUNK_BYTES as usize).max(1);
+        let total_chunks = u32::try_from(chunks).unwrap_or(u32::MAX);
+        for (chunk_index, data) in
+            (0..).zip(snapshot.chunks(snapshot.len().div_ceil(chunks).max(1)))
+        {
+            let correlation_id = self.correlation_id();
+            let message = ClientMessage::UploadSnapshotChunk {
+                correlation_id,
+                room_id: room.id.clone(),
+                snapshot_head_seq: seq,
+                chunk_index,
+                total_chunks,
+                total_bytes,
+                snapshot_hash: hash,
+                data: snapshot.slice_ref(data),
+                room_incarnation: incarnation,
+            };
+            let sends = || room.uploads(epoch).is_some();
+            match self.send_chunk(&message, &request.token, sends).await? {
+                None => return Ok(()),
+                Some(ServerMessage::SnapshotUploadChunkAck {
+                    correlation_id: reply_id,
+                    room_id,
+                    chunk_index: index,
+                    total_chunks: chunks,
+                    staged,
+                }) if reply_id == correlation_id
+                    && room_id == room.id
+                    && index == chunk_index
+                    && chunks == total_chunks =>
+                {
+                    if staged {
+                        return Ok(());
+                    }
+                }
+                Some(ServerMessage::Error {
+                    correlation_id: reply_id,
+                    room_id,
+                    code,
+                    message,
+                }) if reply_id.is_none_or(|reply_id| reply_id == correlation_id)
+                    && room_id.as_ref().is_none_or(|room_id| *room_id == room.id) =>
+                {
+                    if code == ErrorCode::RoomReset {
+                        return room.register_again(epoch, again);
+                    }
+                    return Err(ClientError::Network(format!(
+                        "The server refused a chunk of the upload: {code:?}: {message}"
+                    )));
+                }
+                _ => {
+                    return Err(ClientError::Network(
+                        "Invalid reply to a chunk of an upload".to_string(),
+                    ))
+                }
+            }
+        }
+        Err(ClientError::Network(
+            "The upload of the snapshot did not complete".to_string(),
+        ))
+    }
+
+    /// Sends `message`, a chunk of a snapshot, with `token` as [`send`](Self::send) does, if
+    /// `sends` says it may, and again after a backoff, up to [`CHUNK_RETRIES`] times, while it
+    /// gets a transient failure (no reply, `Unavailable` or `Timeout`) and `sends` still says it
+    /// may. Returns the last reply, or `None` if `sends` said no.
+    async fn send_chunk(
+        &self,
+        message: &ClientMessage,
+        token: &str,
+        sends: impl Fn() -> bool,
+    ) -> Result<Option<ServerMessage>, ClientError> {
+        let (mut backoff, mut retries) = (Backoff::new(&self.config), 0);
+        loop {
+            if !sends() {
+                return Ok(None);
+            }
+            let reply = self.send(message, token).await;
+            let transient = matches!(
+                &reply,
+                Err(_)
+                    | Ok(ServerMessage::Error {
+                        code: ErrorCode::Unavailable | ErrorCode::Timeout,
+                        ..
+                    })
+            );
+            if !transient || retries == CHUNK_RETRIES {
+                return reply.map(Some);
+            }
+            retries += 1;
+            tokio::time::sleep(backoff.next()).await;
+        }
     }
 
     /// The room `room_id` of the client; `RoomClosed` if the client never opened it.
@@ -1638,6 +1830,21 @@ impl Local {
             room.state().writes.applied(installed, [unknown]);
         }
         Ok(Applied::Head(installed))
+    }
+
+    /// Creates a snapshot of the replica of `epoch` to upload it, if it may ([`Room::uploads`]),
+    /// with its head, which no change moves under the applier, and its incarnation.
+    async fn create_snapshot(
+        self,
+        room: Arc<Room>,
+        epoch: u64,
+    ) -> Result<Option<(SequenceNumber, u128, Vec<u8>)>, ClientError> {
+        let Some(incarnation) = room.uploads(epoch) else {
+            return Ok(None);
+        };
+        let head = self.storage.get_head_seq(&room.id).await?;
+        let snapshot = self.storage.create_snapshot(&room.id).await?;
+        Ok(Some((head, incarnation, snapshot)))
     }
 
     /// Takes the `CommitAck` of the write `mutation_id` with its sequence `seq`, and applies its
