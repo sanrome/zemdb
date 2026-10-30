@@ -2055,6 +2055,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "zemdb-perf"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde_json",
+ "tokio",
+ "zemdb-core",
+ "zemdb-server",
+]
+
+[[package]]
 name = "zemdb-server"
 version = "0.1.0"
 dependencies = [

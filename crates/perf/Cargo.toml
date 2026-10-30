@@ -1,0 +1,20 @@
+[package]
+name = "zemdb-perf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+zemdb-core = { workspace = true }
+zemdb-server = { path = "../server" }
+tokio = { workspace = true }
+hyper = { workspace = true, features = ["client"] }
+hyper-util = { workspace = true }
+http-body-util = "0.1"
+bytes = { workspace = true }
+serde_json = { workspace = true }
