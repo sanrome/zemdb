@@ -14,6 +14,7 @@ use bytes::Bytes;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::{tempdir, TempDir};
@@ -134,11 +135,25 @@ pub async fn setup<S: StorageEngine + Clone + 'static>(
     (server, room_id, transport, storage, client)
 }
 
-/// The correlation id and the room of `message`, a sync, an ack, a commit, a heartbeat, or a
-/// request or an upload of a chunk.
+/// The correlation id and the room of `message`.
 pub fn request(message: &ClientMessage) -> (CorrelationId, RoomId) {
     match message {
-        ClientMessage::Sync {
+        ClientMessage::RegisterClient {
+            correlation_id,
+            room_id,
+            ..
+        }
+        | ClientMessage::GetSchema {
+            correlation_id,
+            room_id,
+            ..
+        }
+        | ClientMessage::DeregisterClient {
+            correlation_id,
+            room_id,
+            ..
+        }
+        | ClientMessage::Sync {
             correlation_id,
             room_id,
             ..
@@ -168,12 +183,10 @@ pub fn request(message: &ClientMessage) -> (CorrelationId, RoomId) {
             room_id,
             ..
         } => (*correlation_id, room_id.clone()),
-        message => panic!("{message:?}"),
     }
 }
 
-/// Answers the next message of `kind` (one of [`request`]) with what `reply` gives for its
-/// correlation id and room.
+/// Answers the next message of `kind` with what `reply` gives for its correlation id and room.
 pub fn answer_next(
     transport: &TestTransport,
     kind: ClientMessageKind,
@@ -251,26 +264,20 @@ impl TestServer {
             ..ServerConfig::default()
         };
         change(&mut config);
-        let config = Arc::new(config);
-        let registry = Arc::new(SchemaRegistry::new(config.data_dir.join("schemas")).unwrap());
-        let relay = Arc::new(
-            SnapshotRelay::new(
-                config.data_dir.join("snapshots"),
-                Duration::from_secs(config.snapshot_ttl_secs),
-                config.max_snapshot_bytes,
-                Duration::from_secs(config.snapshot_upload_max_secs),
-            )
-            .unwrap(),
-        );
-        let manager = Arc::new(RoomManager::new(
-            Arc::clone(&config),
-            Arc::clone(&registry),
-            Arc::clone(&relay),
-        ));
         Self {
-            state: AppState::new(config, registry, manager, relay),
+            state: state(config),
             _dir: dir,
         }
+    }
+
+    /// Shuts every room down and builds the server again over the same directory, with the
+    /// configuration that `change` makes of its own. A request still running holds the files of
+    /// its room: wait for them first ([`TestTransport::settled`]).
+    pub async fn restart(&mut self, change: impl FnOnce(&mut ServerConfig)) {
+        self.state.room_manager.shutdown_all().await;
+        let mut config = ServerConfig::clone(&self.state.config);
+        change(&mut config);
+        self.state = state(config);
     }
 
     /// Creates `room_id` with [`tasks_schema`], registered as `tasks` if it is not yet.
@@ -407,8 +414,30 @@ impl TestServer {
             hold: Arc::default(),
             lose: Arc::default(),
             sync_batch_size: Arc::default(),
+            tasks: Arc::default(),
         }
     }
+}
+
+/// The pieces of a server with `config`, over the data it finds in its directory.
+fn state(config: ServerConfig) -> AppState {
+    let config = Arc::new(config);
+    let registry = Arc::new(SchemaRegistry::new(config.data_dir.join("schemas")).unwrap());
+    let relay = Arc::new(
+        SnapshotRelay::new(
+            config.data_dir.join("snapshots"),
+            Duration::from_secs(config.snapshot_ttl_secs),
+            config.max_snapshot_bytes,
+            Duration::from_secs(config.snapshot_upload_max_secs),
+        )
+        .unwrap(),
+    );
+    let manager = Arc::new(RoomManager::new(
+        Arc::clone(&config),
+        Arc::clone(&registry),
+        Arc::clone(&relay),
+    ));
+    AppState::new(config, registry, manager, relay)
 }
 
 /// The snapshot of a replica of `room_id` with `schema` that applied `ops`.
@@ -472,6 +501,17 @@ pub struct TestTransport {
     hold: Arc<Mutex<Vec<Hold>>>,
     lose: Arc<Mutex<Option<ClientMessageKind>>>,
     sync_batch_size: Arc<Mutex<Option<u32>>>,
+    /// How many requests are running in their task.
+    tasks: Arc<AtomicUsize>,
+}
+
+/// A request running in its task, counted by its transport until it ends.
+struct Task(Arc<AtomicUsize>);
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl TestTransport {
@@ -580,6 +620,14 @@ impl TestTransport {
         });
     }
 
+    /// Waits until the task of every request sent ended: the server is done with them, also
+    /// with those whose client stopped waiting.
+    pub async fn settled(&self) {
+        while self.tasks.load(Ordering::SeqCst) > 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     /// Answers each message that `answer` gives a reply for with it, without reaching the
     /// server, until another answer replaces it.
     pub fn answer(
@@ -654,7 +702,10 @@ impl TestTransport {
         let (router, mut delay) = (self.router.clone(), *self.delay.lock().unwrap());
         let next = (self.delay_next.lock().unwrap()).take_if(|(kind, _)| *kind == message.kind());
         delay += next.map_or(Duration::ZERO, |(_, next)| next);
+        self.tasks.fetch_add(1, Ordering::SeqCst);
+        let task = Task(Arc::clone(&self.tasks));
         let response = tokio::spawn(async move {
+            let _task = task;
             tokio::time::sleep(delay).await;
             let response = router.oneshot(request).await.unwrap();
             to_bytes(response.into_body(), usize::MAX).await

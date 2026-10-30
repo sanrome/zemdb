@@ -2023,6 +2023,7 @@ dependencies = [
  "axum",
  "bytes",
  "crc32fast",
+ "futures",
  "serde",
  "serde_json",
  "tempfile",
