@@ -26,6 +26,8 @@ esac
 export ZEMDB_AUTH_SECRET=perf_auth_secret_0123456789_0123456789
 export ZEMDB_ADMIN_SECRET=perf_admin_secret_0123456789_012345678
 export RUST_LOG=warn
+# Passed through to the server and the in-process run when set (diagnostic experiment).
+[ -n "${ZEMDB_PERF_INLINE_IO:-}" ] && export ZEMDB_PERF_INLINE_IO
 
 for rep in $(seq 1 "$REPS"); do
   for k in $KS; do

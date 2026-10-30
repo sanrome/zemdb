@@ -162,6 +162,8 @@ struct WorkerResult {
     acked: u64,
     errors: u64,
     first_error: Option<String>,
+    /// Commits that took 10 ms or more, or failed: (ms since the start, ms it took, failed).
+    stalls: Vec<(u64, u64, bool)>,
 }
 
 /// Commits until `end`, one at a time, recording the latency of the commits that complete in
@@ -171,6 +173,7 @@ async fn worker<C: Committer>(
     mut committer: C,
     shared: Arc<Shared>,
     schema: Arc<Schema>,
+    run_start: Instant,
     warmup_end: Instant,
     end: Instant,
 ) -> WorkerResult {
@@ -186,6 +189,13 @@ async fn worker<C: Committer>(
         let mutation_id = MutationId::from_u128((1 << 64) | id as u128);
         let outcome = committer.commit(mutation_id, last_ack, op).await;
         let done = Instant::now();
+        if done - start >= Duration::from_millis(10) || outcome.is_err() {
+            result.stalls.push((
+                (start - run_start).as_millis() as u64,
+                (done - start).as_millis() as u64,
+                outcome.is_err(),
+            ));
+        }
         match outcome {
             Ok(seq) => {
                 shared.max_seen.fetch_max(seq, Ordering::AcqRel);
@@ -208,6 +218,21 @@ fn cpu_ticks(pid: u32) -> u64 {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
     let fields: Vec<&str> = stat.rsplit_once(") ").unwrap().1.split(' ').collect();
     fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+}
+
+/// Context switches (voluntary and not) of every thread of `pid`.
+fn context_switches(pid: u32) -> u64 {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .unwrap()
+        .filter_map(|task| std::fs::read_to_string(task.ok()?.path().join("status")).ok())
+        .flat_map(|status| {
+            status
+                .lines()
+                .filter(|line| line.contains("ctxt_switches:"))
+                .filter_map(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
+                .collect::<Vec<_>>()
+        })
+        .sum()
 }
 
 /// `VmRSS` and `VmHWM` of `pid`, in KiB.
@@ -252,6 +277,7 @@ async fn run<C: Committer>(
                 c,
                 Arc::clone(&shared),
                 Arc::clone(&schema),
+                start,
                 warmup_end,
                 end,
             ))
@@ -261,19 +287,24 @@ async fn run<C: Committer>(
     let own_pid = std::process::id();
     tokio::time::sleep_until(warmup_end.into()).await;
     let (server_before, own_before) = (cpu_ticks(run.server_pid), cpu_ticks(own_pid));
+    let switches_before = context_switches(run.server_pid);
     tokio::time::sleep_until(end.into()).await;
     let (server_after, own_after) = (cpu_ticks(run.server_pid), cpu_ticks(own_pid));
+    let switches = context_switches(run.server_pid) - switches_before;
     let (rss_kib, hwm_kib) = memory_kib(run.server_pid);
 
     let mut latencies = Vec::new();
     let (mut acked, mut errors, mut first_error) = (0, 0, None);
+    let mut stalls = Vec::new();
     for task in tasks {
         let r = task.await.unwrap();
         latencies.extend(r.latencies_us);
         acked += r.acked;
         errors += r.errors;
         first_error = first_error.or(r.first_error);
+        stalls.extend(r.stalls);
     }
+    stalls.sort_unstable();
     latencies.sort_unstable();
     let head = head_seq.await;
 
@@ -307,6 +338,8 @@ async fn run<C: Committer>(
         "gen_cpu_pct": cpu(own_before, own_after),
         "server_rss_kib": rss_kib,
         "server_hwm_kib": hwm_kib,
+        "server_ctx_switches_per_commit": switches as f64 / latencies.len().max(1) as f64,
+        "stalls": stalls,
     });
     println!("{out}");
 }

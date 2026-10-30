@@ -16,6 +16,11 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 
 /// Runs blocking I/O `work` without stalling the other tasks of a multi-thread runtime.
 pub(crate) fn blocking_io<T>(work: impl FnOnce() -> T) -> T {
+    // Diagnostic switch of the performance spike: run the I/O in place.
+    static INLINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *INLINE.get_or_init(|| std::env::var_os("ZEMDB_PERF_INLINE_IO").is_some()) {
+        return work();
+    }
     match Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(work)
