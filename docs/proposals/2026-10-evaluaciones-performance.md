@@ -2,7 +2,7 @@
 
 **Fecha:** 30 de Octubre de 2026
 **Tipo:** Plan de evaluaciones, fuera de las fases. Documento vivo: cada evaluación agrega su sección, sus resultados y su estado en el seguimiento (§4).
-**Estado:** Propuesta. Definida la Evaluación 1 (el commit con los clientes al día); las siguientes, a definir (§5).
+**Estado:** Propuesta. La Evaluación 1 (el commit con los clientes al día) está medida, con sus resultados en §3.7; las siguientes, a definir (§5).
 **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md); cada evaluación es un spike (§3 de la metodología).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md).
 
@@ -42,8 +42,8 @@
 - **Carga en lazo cerrado:** cada uno de los *k* trabajadores del generador manda su próximo pedido cuando recibe la respuesta del anterior, así que siempre hay *k* pedidos en vuelo. Sirve para encontrar el techo, no para medir latencias bajo una tasa de llegada fija (eso puede ser un próximo paso).
 - **Corridas:** 5 s de calentamiento, 30 s medidos, 3 repeticiones; se reporta la mediana y, si las repeticiones difieren en más de un 10%, se anota.
 - **Una corrida con errores no vale.** Toda respuesta tiene que ser un `CommitAck`, y al terminar, el head de la sala tiene que ser igual a la cantidad de commits confirmados.
-- **Métricas de cada corrida:** commits/s; latencia p50, p99, p99.9 y máxima, medida en el generador con un histograma (HdrHistogram); CPU del proceso del servidor (de `/proc/<pid>/stat`); RSS del servidor al terminar y su máximo (`VmHWM`).
-- **Perfil de CPU:** con `perf` si la máquina lo permite; si no (en un contenedor sin acceso a los eventos del kernel), con un perfilador de muestreo dentro del proceso (por ejemplo, el crate `pprof`), agregado en la rama del spike. Se guarda como flamegraph junto a los resultados.
+- **Métricas de cada corrida:** commits/s; latencia p50, p99, p99.9 y máxima, medida en el generador, que guarda la latencia de cada commit y ordena todas al terminar (percentiles exactos, sin histograma); CPU del proceso del servidor (de `/proc/<pid>/stat`); RSS del servidor al terminar y su máximo (`VmHWM`); cambios de contexto del servidor por commit (de `/proc/<pid>/task/*/status`); y los commits que tardaron 10 ms o más, o fallaron, con el momento en que empezaron.
+- **Perfil de CPU:** con `perf` si la máquina lo permite; si no (en un contenedor sin acceso a los eventos del kernel), con un perfilador de muestreo dentro del proceso (por ejemplo, el crate `pprof`), agregado en la rama del spike. Se guarda junto a los resultados. En la Evaluación 1 alcanzó con `perf` (el de `linux-tools` de Ubuntu, con el evento de software `task-clock`, a 499 Hz y pilas por DWARF, sobre un binario de release con información de depuración, que no cambia el código generado).
 - **El entorno se anota con cada resultado:** CPU y núcleos, RAM, sistema de archivos y tipo de disco del directorio de datos, versión de Rust, commit de `main`, y la asignación de núcleos.
 - **Los números absolutos valen para esa máquina.** Sirven para comparar entre corridas en la misma máquina. La latencia del `fsync` en particular depende del disco: la de producción se mide en una máquina como la de producción (§5).
 
@@ -113,7 +113,97 @@ En tmpfs el `fsync` casi no cuesta, así que la 1b muestra el costo del código.
 - Una recomendación de qué optimizar primero (cada una, una propuesta aparte, DP2) y de qué evaluar después (§5).
 
 ### 3.7 Resultados
-*A completar al cerrar la evaluación.*
+
+Medidos el 30 y el 31 de Octubre de 2026. El código del spike está en la rama `perf/e1-commit`: el generador (`crates/perf`), `run_e1.sh` (una corrida por línea JSON), `summarize.sh` (la mediana de las repeticiones) y `profile_e1.sh` (el perfil de CPU).
+
+#### Entorno
+- **Máquina:** una VM (Firecracker) de 4 vCPU Intel Xeon a 2,1 GHz y 15 GiB de RAM, en la nube, con *steal time* (el host le quita CPU a ratos). Ubuntu 24.04, kernel 6.18 del huésped.
+- **Disco real:** `/dev/vda` (virtio), ext4 **sin journal**. Una escritura de 300 bytes con `O_DSYNC` tarda unos 149 µs; en tmpfs, 2 µs. Sin journal, el `fsync` es más barato que en un ext4 común: en producción, el disco puede ser más lento o (con protección ante cortes de energía) mucho más rápido.
+- **Compilación:** Rust 1.97.0, perfil `release` del workspace (sin LTO), con información de depuración.
+- **Código medido:** `main` en `9de2c1b`, más el generador. El interruptor del experimento de §3.7.4 solo actúa con su variable de entorno.
+- **Núcleos:** el servidor en 0 y 1 (Tokio arranca 2 workers), el generador en 2 y 3. En el modo sin HTTP, todo el proceso en 0 y 1.
+
+#### 3.7.1 Las mediciones (30 s, 3 repeticiones, mediana)
+
+| | *k* | commits/s | p50 | p99 | p99.9 | CPU del servidor |
+|---|---|---|---|---|---|---|
+| **1a/1b** HTTP, tmpfs | 1 | 9.362 | 99 µs | 210 µs | 637 µs | 98% |
+| | 2 | 16.829 | 108 µs | 260 µs | 798 µs | 130% |
+| | 4 | 21.696 | 159 µs | 707 µs | 1,9 ms | 141% |
+| | 8 | 26.046 | 278 µs | 828 µs | 2,2 ms | 147% |
+| | 16 | 33.139 | 438 µs | 1,2 ms | 2,5 ms | 154% |
+| | 32 | 38.213 | 774 µs | 1,9 ms | 3,3 ms | 161% |
+| | 64 | 43.362 | 1,4 ms | 3,2 ms | 4,6 ms | 167% |
+| **1c** HTTP, disco | 1 | 3.133 | 286 µs | 696 µs | 2,2 ms | 50% |
+| | 2 | 5.469 | 330 µs | 880 µs | 2,7 ms | 66% |
+| | 4 | 5.262 | 706 µs | 1,6 ms | 3,6 ms | 67% |
+| | 8 | 5.179 | 1,5 ms | 3,5 ms | 5,6 ms | 70% |
+| | 16 | 5.216 | 2,9 ms | 5,5 ms | 9,7 ms | 73% |
+| | 32 | 4.901 | 6,2 ms | 10,6 ms | 18,7 ms | 76% |
+| | 64 | 4.518 | 13,8 ms | 21,2 ms | 35,9 ms | 80% |
+| **1d** sin HTTP, tmpfs | 1 | 49.228 | 18 µs | 54 µs | 147 µs | 121%¹ |
+| | 2 | 51.474 | 24 µs | 194 µs | 930 µs | 130%¹ |
+| | 4 | 67.379 | 46 µs | 252 µs | 1,4 ms | 150%¹ |
+| | 8 | 68.776 | 105 µs | 317 µs | 1,7 ms | 158%¹ |
+| | 16 | 59.194 | 280 µs | 548 µs | 2,0 ms | 158%¹ |
+| | 32 | 44.718 | 816 µs | 1,4 ms | 3,0 ms | 152%¹ |
+| | 64 | 34.364 | 2,0 ms | 4,2 ms | 6,0 ms | 146%¹ |
+
+¹ El proceso entero, con el generador adentro. El CPU es el porcentaje de un núcleo: el servidor tiene dos (200%).
+
+- Las repeticiones difieren en menos del 10% en todos los puntos menos uno (HTTP, tmpfs, *k* = 8: 16%, por la corrida inválida de §3.7.5). El generador nunca pasó del 90% de sus núcleos.
+- **Memoria:** el RSS máximo del servidor fue de 9 a 10 MiB con *k* = 1 y creció con *k*, hasta 48 MiB en tmpfs con *k* = 64 (§3.7.4 explica la mayor parte).
+- **Latencias máximas:** la de cada corrida fue de 8 a 656 ms en tmpfs, de 30 a 86 ms sin HTTP y de 57 a 481 ms en disco. Son pocos commits (el p99.9 no pasa de 36 ms en ningún punto) y no se investigaron más (§5).
+
+#### 3.7.2 Las preguntas
+1. **Un commit en el mejor caso tarda 99 µs por HTTP (p50) y 18 µs directo al actor.** El servidor gasta unos 105 µs de CPU por commit por HTTP (98% de un núcleo para 9.362 commits/s), y el 59% de ese CPU es del kernel: el envío y la recepción por el socket, `epoll`, los `eventfd` con que Tokio despierta su driver de E/S, y dormir y despertar hilos (`futex`). Son 5 cambios de contexto por commit.
+2. **Sin disco, una sala acepta unos 43.000 commits/s por HTTP con *k* = 64, y la curva todavía sube** (el servidor llega a 167% de sus 200%). Directo al actor, el techo es 68.800 con *k* = 8, y después **baja**: a 34.000 con *k* = 64 (§3.7.3). En el techo por HTTP, el CPU se reparte así (perfil con *k* = 64): 30% en el kernel (12% en `writev` de las respuestas), 17% en `malloc` y `free`, 17% en `RoomActor::commit` (4,6% en la escritura del WAL y 4,4% en el catch-up), 4% en codificar la respuesta y 2,7% en verificar el token.
+3. **En disco, el `fsync` fija el techo: unos 5.400 commits/s desde *k* = 2, y no sube con más pedidos en vuelo** (con *k* = 64 baja a 4.500). Cada commit cuesta unos 180 µs de actor, y unos 150 µs son el `fsync` de este disco.
+4. **La capa HTTP, con la red local, se lleva unos 80 de los 99 µs de un commit con *k* = 1**, y en el techo el rendimiento pasa de 68.800 (sin HTTP) a 43.000.
+
+#### 3.7.3 El catch-up copia las operaciones
+Con *k* pedidos en vuelo, el cursor de cada commit está hasta *k* − 1 operaciones atrás, así que cada `CommitAck` lleva hasta *k* operaciones. El búfer en RAM las devuelve copiándolas enteras (`HotBuffer`, `entry.op.clone()`): cada `Vec<Value>` de cada fila. En el perfil directo al actor con *k* = 64, `catchup_after_commit` es el 31% del CPU, y la copia de los valores el 22%. Es el costo que crece con *k* y hace bajar la curva de 1d. Por HTTP pesa menos (4,4%), porque el resto cuesta más, pero esas operaciones además se codifican y se mandan: con *k* = 64, unos 15 KB por respuesta. Mandarlas es parte del protocolo de 1 RTT; copiarlas, no.
+
+#### 3.7.4 `block_in_place` (experimento de diagnóstico)
+`blocking_io` corre la E/S de cada commit con `tokio::task::block_in_place`, que le pasa el worker a otro hilo mientras dura la E/S. Para medir cuánto cuesta, la rama del spike tiene un interruptor (`ZEMDB_PERF_INLINE_IO`) que corre la E/S en el mismo hilo, sin `block_in_place`. **No es una propuesta:** sin `block_in_place`, un `fsync` lento frena a todas las salas que comparten ese worker, que es lo que `block_in_place` evita. Mismo binario, 15 s, 3 repeticiones:
+
+| | *k* | con `block_in_place` | sin | cambio | cambios de contexto por commit |
+|---|---|---|---|---|---|
+| HTTP, tmpfs | 1 | 9.465 | 11.206 | +18% | 5,0 → 3,0 |
+| | 8 | 28.508 | 40.186 | +41% | 1,2 → 0,3 |
+| | 64 | 45.421 | 60.784 | +34% | 0,3 → 0,1 |
+| HTTP, disco | 1 | 3.345 | 3.129 | −6% | 9,1 → 6,1 |
+| | 8 | 5.494 | 5.674 | +3% | 7,3 → 5,0 |
+| | 64 | 4.876 | 4.959 | +2% | 7,3 → 5,0 |
+| sin HTTP, tmpfs | 1 | 50.049 | 80.283 | +60% | 1,2 → 0,5 |
+| | 8 | 68.565 | 80.181 | +17% | 1,1 → 0,5 |
+| | 64 | 34.083 | 44.960 | +32% | 1,5 → 0,7 |
+
+- Sin disco, `block_in_place` se lleva entre un 15% y un 40% del rendimiento, y la mitad de la latencia en p99 (HTTP, *k* = 8: de 780 a 387 µs). En disco no cambia nada: el `fsync` domina.
+- **Memoria:** con *k* = 64 en tmpfs, el servidor tiene **82 hilos y 44 MiB de RSS con `block_in_place`, y 4 hilos y 12 MiB sin él**. Cada traspaso del worker puede crear un hilo en el pool de bloqueo, que queda vivo un rato antes de terminar, y glibc le da a cada hilo su propia arena de `malloc`.
+
+#### 3.7.5 Una pausa de más de 5 s
+En una de las 63 corridas (HTTP, tmpfs, *k* = 8, primera repetición), los 8 commits en vuelo recibieron a la vez `504 Timeout` ("actor did not answer in time", `ACTOR_TIMEOUT` de 5 s). Los 8 quedaron confirmados (el head terminó 8 por encima de lo confirmado al cliente), que es el comportamiento previsto: el cliente reintenta con el mismo `MutationId` y la deduplicación le devuelve la secuencia original. La corrida perdió unos 5 s de rendimiento (23.000 commits/s contra 27.000 de las otras dos). No se repitió en tres corridas más de 40 s con el registro de pausas, y el kernel no registró nada en ese intervalo. **Causa no determinada:** una pausa de la VM (que tiene *steal time*) o una del actor. El generador ya registra el momento de cada pausa para la próxima vez.
+
+#### 3.7.6 Los segmentos se sellan cada 1.000 operaciones
+`active.wal` se sella al llegar a `ram_max_ops` (1.000) o a `segment_max_bytes` (32 MiB), lo primero que pase (`ARCHITECTURE.md` §5.2). Con operaciones de unos 246 bytes, el límite es siempre el de las operaciones: un segmento de 246 KB más su `.ids` cada 1.000 commits. A 27.000 commits/s son unos 54 archivos por segundo en `segments/`, que con el TTL de 24 h del disco tibio serían del orden de millones de archivos por día con carga sostenida. Cada sellado agrega unos cuatro `fsync` (el segmento, el directorio, y el `.ids` con su directorio), poco frente a los 1.000 de sus commits, así que no limita el rendimiento de esta evaluación; lo que no se midió es cómo se comporta una sala con muchos segmentos (§5).
+
+#### 3.7.7 Hipótesis
+- **H1, confirmada.** En disco, el techo de una sala es unos 5.400 commits/s, del orden de 1 / (latencia del `fsync`), y no sube con *k*.
+- **H2, confirmada.** Con *k* = 1, HTTP y la red local se llevan unos 80 de los 99 µs de un commit, y más de la mitad del CPU del servidor está en el kernel.
+- **H3, confirmada, y más de lo esperado.** No solo cuando *k* es alto: `block_in_place` cuesta entre un 15% y un 60% del rendimiento sin disco, con cualquier *k*, y multiplica los hilos y la memoria.
+
+#### 3.7.8 Cuellos de botella, de mayor a menor
+1. **Un `fsync` por commit.** En disco limita una sala a unos 5.400 commits/s en esta máquina, sin importar la concurrencia. Dirección: compartir un `fsync` entre los commits que esperan (*group commit*), sin confirmar nada antes de que esté en disco; toca la durabilidad de cada `CommitAck`, así que es una propuesta con Lote 0 (DP2).
+2. **El traspaso del worker en cada `fsync` (`block_in_place`).** Entre un 15% y un 60% del rendimiento sin disco, de 2 a 3 cambios de contexto por commit, y 4 veces la memoria con mucha concurrencia. Dirección: hacer la E/S del log fuera de los workers de Tokio de otra forma (por ejemplo, un hilo de E/S por sala, o uno por grupo de commits si se hace el punto 1), medida también con muchas salas a la vez.
+3. **La copia de las operaciones en el catch-up.** Crece con *k* y es el 31% del CPU del actor con *k* = 64. Dirección: que el búfer en RAM comparta las operaciones (por ejemplo, con `Arc`) en lugar de copiarlas.
+4. **El costo de un pedido HTTP por operación.** Unos 80 µs por commit con *k* = 1, la mayor parte en el kernel. No tiene una dirección clara todavía: depende de cómo lleguen los pedidos detrás del proxy, y de si un commit pudiera llevar varias operaciones (un cambio del protocolo). Para evaluar aparte (§5).
+5. **`malloc` y `free`:** entre el 7% (*k* = 1) y el 17% (*k* = 64) del CPU del servidor. Probar otro asignador es barato y podría ser un próximo paso.
+
+#### 3.7.9 Recomendación
+- **Optimizar primero el punto 1 junto con el 2:** un *group commit* hace un solo `fsync` y un solo traspaso por grupo, así que ataca los dos a la vez. Antes de proponerlo, conviene medir con muchas salas a la vez (§5), porque la solución del punto 2 depende de cómo se repartan los workers entre salas.
+- **El punto 3 es un cambio chico y local**, sin garantías en juego, que se puede proponer por separado.
+- **Para producción, el disco importa tanto como el código:** con un disco con protección ante cortes de energía, el `fsync` puede bajar de cientos de microsegundos a decenas, y el techo del punto 1 se mueve en la misma proporción.
 
 ---
 
@@ -121,14 +211,17 @@ En tmpfs el `fsync` casi no cuesta, así que la 1b muestra el costo del código.
 
 | Evaluación | Qué | Estado |
 |---|---|---|
-| 1 | El commit con los clientes al día, en una sala | Propuesta |
+| 1 | El commit con los clientes al día, en una sala | Medida: resultados en §3.7, pendiente la revisión del dueño del proyecto |
 
 ---
 
 ## 5. Próximos pasos a definir
 
-Se definen después de la Evaluación 1, con lo que muestre. Candidatos, sin orden:
-- **Muchas salas a la vez:** el techo del servidor entero, y cómo se reparten los núcleos entre actores.
+Se definen con lo que mostró la Evaluación 1 (§3.7.8 y §3.7.9). Lo que dejó abierto:
+- **Muchas salas a la vez:** el techo del servidor entero, y cómo se reparten los núcleos entre actores. Es lo que hace falta antes de proponer el *group commit* y el reemplazo de `block_in_place` (§3.7.9).
+- **Las latencias máximas y la pausa de más de 5 s** (§3.7.1 y §3.7.5): corridas más largas con el registro de pausas, cruzado con los sellados de segmentos y el *steal time* de la máquina.
+- **Una sala con muchos segmentos** (§3.7.6): una corrida larga con carga sostenida, para ver si abrir la sala, el índice de segmentos o el directorio se vuelven lentos con cientos de miles de archivos.
+- **Otro asignador de memoria** (§3.7.8, punto 5): la misma Evaluación 1 con otro asignador, en la rama del spike.
 - **Varios clientes por sala con SSE:** el costo de avisar a cada uno y de su catch-up.
 - **Clientes atrasados:** el catch-up y `/sync` leyendo de RAM, de disco tibio y de disco frío (Zstd).
 - **Memoria:** RSS por sala abierta en reposo y por stream SSE; cuántas salas caben en una máquina chica.
