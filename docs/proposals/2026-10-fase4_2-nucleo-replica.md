@@ -1500,7 +1500,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
     - *Attempts*: los finales de una escritura con un error del cliente.
   - El rustdoc de `ClientError::Config`, que no nombraba el backoff, el plazo ni los snapshots, y el de `Client::write`, que no nombraba los finales con un error del cliente ni el `CommitAck` que llega después de cerrar la sala.
 - **Al backlog** (Bajos de tests y de código: `INVARIANTES.md` §1.2):
-  - **DEF-189 · Bajo · (a) · C1, K6.**
+  - **DEF-189 · Bajo · (a) · C1, K6, K16.**
     - **Qué pasa:** un guardado de los metadatos cuyo `sync_dir` falla después del rename deja el archivo visible, pero quizás no durable; la sala se cierra, y su próxima apertura lo usa.
     - **En la configuración del contrato** (`FileMetadata` en el directorio del motor), abrir la sala del storage sincroniza ese directorio antes de escribir nada bajo ese esquema.
     - **Con los metadatos en otro directorio**, que §11 excluye pero el código no impide, un crash puede conservar en el WAL las operaciones del esquema nuevo y perder el rename. La réplica reabre entonces con el esquema viejo, más angosto que su log, y diverge sin aviso.
@@ -1567,7 +1567,10 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
     - **Alcance:** por el criterio de §2, queda fuera de alcance, como DEF-192.
     - **Endurecimiento opcional**, para 4.3: que una réplica que espera un snapshot que nadie anuncia vuelva a sincronizar al rato; con el servidor, `BehindCompaction` le confirma el hueco.
     - **Test:** en `review.patch`, de la revisión de delta.
-- **Notas sin defecto y tres propuestas de invariantes** (§1.2), pendientes de la decisión del dueño del proyecto: en §3 y §4 del informe.
+- **Notas sin defecto y tres propuestas de invariantes** (§1.2): en §3 y §4 del informe. El dueño del proyecto decidió las propuestas el 31 de Octubre:
+  - la de los metadatos durables entra como INV-K16 (`INVARIANTES.md` versión 11), 🆕 para 4.5, con DEF-189 como su fix;
+  - la de la encarnación en los commits, los syncs y los acks queda como límite aceptado, en el backlog para después de la v0.1 (`ROADMAP.md` §3);
+  - la de los errores permanentes entra al contrato de 4.3, en su Lote 0.
 - **Pendientes que pasan a 4.3 y 4.5**, en sus secciones del plan de la fase:
   - DEF-195, con el adaptador `reqwest` de 4.3, y DEF-192 y DEF-196, opcionales (DEF-190 y DEF-191, que eran para antes del `SyncWorker`, se arreglaron después del cierre);
   - DEF-189 y DEF-195, con el OPFS y el transporte del navegador de 4.5.

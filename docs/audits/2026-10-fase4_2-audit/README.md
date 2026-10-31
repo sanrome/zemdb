@@ -13,7 +13,7 @@ Las partes 🆕 de 4.3 a 4.6, y K8, K9, K10, K13 y K14, quedan para la revisión
 **Resultado: en verde** (`INVARIANTES.md` §1.4). Ninguna invariante se rompe, con el criterio de §2 que el dueño del proyecto adoptó el 31 de Octubre, a partir de la revisión de delta del Lote 12: una respuesta que decodifica, responde al pedido y no viola nada que el cliente verifique cuenta como del servidor, en cualquier campo. Quedan:
 - Bajos de documentos, corregidos en el Lote 12;
 - ocho Bajos de tests y de código, al backlog (DEF-189 a DEF-196);
-- tres propuestas de invariantes, que decide el dueño del proyecto.
+- tres propuestas de invariantes, que el dueño del proyecto decidió el 31 de Octubre (§4).
 
 ---
 
@@ -104,7 +104,7 @@ El origen (a) es el rango de 4.2, `9df0de7..9de2c1b`.
 
 | DEF | Invariantes | Qué | Test |
 |---|---|---|---|
-| DEF-189 | C1, K6 | Con `FileMetadata` fuera del directorio del motor, que §11 excluye pero la API permite, un guardado con el `sync_dir` fallido y un crash dejan la réplica con un esquema más angosto que su log, y diverge sin aviso. | `replica.patch` (falla a propósito) |
+| DEF-189 | C1, K6, K16 | Con `FileMetadata` fuera del directorio del motor, que §11 excluye pero la API permite, un guardado con el `sync_dir` fallido y un crash dejan la réplica con un esquema más angosto que su log, y diverge sin aviso. | `replica.patch` (falla a propósito) |
 | DEF-190 | K7, K15 | Una réplica detrás del log, cuyo único snapshot pasa el tope, pide su primer chunk en cada heartbeat: 251 veces en 600 s. | `escrituras.patch` |
 | DEF-191 | K12, K7 | Un chunk anclado que no sigue al primero y anuncia más que el tope es `Config` y no `Network`. | `recuperacion.patch` |
 | DEF-192 | K2 | Un `HeartbeatAck` con un head más allá del servidor sube para siempre el head visto de la época, y toda escritura posterior de la sala termina incierta hasta cerrarla. Por el criterio de §2, queda fuera de alcance, y falla del lado seguro: es un endurecimiento opcional. | `recuperacion.patch` |
@@ -124,7 +124,10 @@ El origen (a) es el rango de 4.2, `9df0de7..9de2c1b`.
 
 ## 4. Propuestas de invariantes (§1.2)
 
-Agregarlas es una decisión del dueño del proyecto.
+Agregarlas es una decisión del dueño del proyecto, que las decidió el 31 de Octubre:
+- la 1 entra como INV-K16 (`INVARIANTES.md` versión 11), 🆕 para 4.5;
+- la 2 queda como límite aceptado, en el backlog para después de la v0.1 (`ROADMAP.md` §3);
+- la 3 entra al contrato de 4.3, en su Lote 0.
 
 1. **Del auditor de la réplica:** "Lo que el SDK lee de sus metadatos para abrir una sala o aplicar operaciones ya es durable: un guardado que falló no se usa hasta que su efecto sea durable."
    - Es INV-L3 ★ del lado del cliente.

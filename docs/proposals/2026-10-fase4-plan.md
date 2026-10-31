@@ -169,6 +169,7 @@ En `zemdb-client`, contra el trait `TransportClient`, sin red real, con la forma
 - El adaptador `reqwest` sobre HTTP/2.
 - El `SyncWorker`: SSE con la reacción a cada evento, pull paginado, `Ack` del último lote, heartbeat y reconexión con *backoff* exponencial y *full jitter* (§A.5). El heartbeat de 4.2 espera una bajada o una subida de snapshot en curso, o hace la suya, y los chunks no renuevan el lease: el worker no encadena los heartbeats detrás de una bajada o una subida larga (de los Lotes 8 y 9 de 4.2).
 - La renovación del token ante `Unauthorized`.
+- En su contrato (Lote 0), la invariante que propuso la auditoría de 4.2 y adoptó el dueño del proyecto: ninguna respuesta que no cuenta como del servidor (`INVARIANTES.md` §2) lleva a un error que el SDK o su worker traten como permanente para la sala. Uno así (`Config`, `FailedClosed`) sale solo de la configuración o de una respuesta que cuenta como del servidor, como un `Registered` con un esquema que no evoluciona o un lote con una operación que no valida con el esquema de `Registered`. El Lote 0 decide también si el worker trata como permanente el `Config` de una reserva que no entra en memoria, que viene del dispositivo.
 - De la auditoría de 4.2 (en la nota del Lote 12 de su plan):
   - el adaptador `reqwest` no lee un cuerpo más largo que `MAX_FRAME_SIZE`: una respuesta se decodifica sin presupuesto de valores y reserva hasta unas 24 veces su tamaño (DEF-195);
   - opcionales, porque con el worker durarían hasta que la aplicación cierre la sala, aunque solo los dispara una respuesta fuera de alcance (`INVARIANTES.md` §2): DEF-192 (un head más allá del servidor deja inciertas las escrituras de la sala) y DEF-196 (una cola que deja la réplica detrás del log la deja esperando un snapshot que nadie anuncia).
@@ -192,8 +193,8 @@ En `zemdb-client`, contra el trait `TransportClient`, sin red real, con la forma
 - S1 en Firefox, pendiente de 4.0 (DC8), y S3 en Safari y Firefox, pendiente de 4.1 (DC17).
 - La medición del codificador `ruzstd` en Safari, pendiente de 4.1 (DC9).
 - Los requisitos de la implementación del OPFS que dejó el cierre de 4.1 (DC17, en §1 de su plan).
-- Dos Bajos de la auditoría de 4.2 (DEF-189 y DEF-195, en la nota del Lote 12 de su plan):
-  - que el OPFS haga durable, al abrir la sala, un guardado de los metadatos cuyo `sync_dir` falló;
+- De la auditoría de 4.2 (DEF-189 y DEF-195, en la nota del Lote 12 de su plan):
+  - INV-K16: en nativo, que `FileMetadata` vuelva a sincronizar su directorio después de un guardado que falló, o que el código ate los metadatos al directorio del motor (DEF-189); en el OPFS, donde sincronizar un directorio no hace nada, que un guardado sea durable antes de que se escriba bajo él;
   - el tamaño máximo de una respuesta del transporte del navegador, que se decodifica sin presupuesto de valores y reserva hasta unas 24 veces su tamaño.
 - **Criterio de aceptación:** tests en un navegador headless (por ejemplo, con `wasm-bindgen-test`) en los que la réplica sobrevive a recargar la página.
 
@@ -479,7 +480,7 @@ El camino lo decide el registro (`ARCHITECTURE.md` §6):
 * Las columnas con `encrypted: true` viajan como `Value::Bytes` opacos (`ARCHITECTURE.md` §3.1). El SDK las cifra al escribir y las descifra al leer con el `CryptoEngine` de `zemdb-core`, usando como datos adicionales `(room_id, table_id, pk, column_idx)`, para que un texto cifrado de otra celda, también de otra sala, no se descifre.
 
 ### A.11. Invariantes y Auditoría del SDK
-* Las invariantes del SDK están en `docs/INVARIANTES.md` §3.11 (INV-K1 a K15), escritas en 4.0 antes del código, y su modelo de amenaza en §2 (DC10, DC11). El SDK se audita una vez contra ellas, con el método de §1, al cerrar 4.2 (DC3).
+* Las invariantes del SDK están en `docs/INVARIANTES.md` §3.11 (INV-K1 a K15, escritas en 4.0 antes del código, e INV-K16, de la auditoría de 4.2), y su modelo de amenaza en §2 (DC10, DC11). El SDK se audita una vez contra ellas, con el método de §1, al cerrar 4.2 (DC3); INV-K16 es 🆕 hasta la revisión de cierre de 4.5.
 
 ### A.12. API de JavaScript para el Navegador
 * En el navegador, el SDK compilado a wasm corre en un Web Worker dedicado, donde el OPFS da archivos síncronos (§A.2), y la página lo usa a través de un paquete con tipos de TypeScript que le habla por mensajes (DC14).
