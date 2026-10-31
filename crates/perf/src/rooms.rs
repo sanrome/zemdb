@@ -2,7 +2,7 @@
 //! what the others write, as the SDK's `sync` does (`/sync` until caught up, then `Ack`).
 //!
 //! ```text
-//! zemdb-perf rooms --addr HOST:PORT --rooms R --clients C --period T [--sse 1] [--pool 64]
+//! zemdb-perf rooms --addr HOST:PORT --rooms R --clients C --period T [--sse 1] [--pool 512]
 //!                  [--warmup S] [--secs S] [--server-pid PID] [--disk vda]
 //! ```
 //!
@@ -22,7 +22,7 @@ use hyper::client::conn::http1::{self, SendRequest};
 use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
@@ -40,6 +40,7 @@ struct Job {
     auth: Option<Arc<str>>,
     content_type: &'static str,
     body: Bytes,
+    enqueued: Instant,
     reply: oneshot::Sender<Reply>,
 }
 
@@ -50,6 +51,9 @@ struct Job {
 struct Pool {
     tx: mpsc::Sender<Job>,
     retries: Arc<AtomicU64>,
+    /// While set, how long each request waited in the queue for a free connection.
+    recording: Arc<AtomicBool>,
+    waits: Arc<Mutex<Vec<u32>>>,
 }
 
 impl Pool {
@@ -57,14 +61,23 @@ impl Pool {
         let (tx, rx) = mpsc::channel(1 << 17);
         let rx = Arc::new(tokio::sync::Mutex::new(rx));
         let retries = Arc::new(AtomicU64::new(0));
+        let recording = Arc::new(AtomicBool::new(false));
+        let waits = Arc::new(Mutex::new(Vec::new()));
         for _ in 0..connections {
             tokio::spawn(pool_worker(
                 addr.to_string(),
                 Arc::clone(&rx),
                 Arc::clone(&retries),
+                Arc::clone(&recording),
+                Arc::clone(&waits),
             ));
         }
-        Self { tx, retries }
+        Self {
+            tx,
+            retries,
+            recording,
+            waits,
+        }
     }
 
     async fn send(
@@ -82,6 +95,7 @@ impl Pool {
             auth,
             content_type,
             body: Bytes::from(body),
+            enqueued: Instant::now(),
             reply,
         };
         self.tx.send(job).await.map_err(|_| "pool closed".to_string())?;
@@ -109,6 +123,8 @@ async fn pool_worker(
     addr: String,
     rx: Arc<tokio::sync::Mutex<mpsc::Receiver<Job>>>,
     retries: Arc<AtomicU64>,
+    recording: Arc<AtomicBool>,
+    waits: Arc<Mutex<Vec<u32>>>,
 ) {
     let mut sender: Option<SendRequest<Full<Bytes>>> = None;
     loop {
@@ -116,6 +132,9 @@ async fn pool_worker(
             Some(job) => job,
             None => return,
         };
+        if recording.load(Ordering::Relaxed) {
+            waits.lock().unwrap().push(micros(job.enqueued.elapsed()));
+        }
         let mut result = Err(String::new());
         for attempt in 0..2 {
             if sender.as_ref().map_or(true, SendRequest::is_closed) {
@@ -566,7 +585,7 @@ pub async fn rooms_mode(args: &HashMap<String, String>) {
     let clients: usize = arg("clients", "1").parse().unwrap();
     let period: f64 = arg("period", "0").parse().unwrap();
     let sse = arg("sse", "0") == "1";
-    let pool_size: usize = arg("pool", "64").parse().unwrap();
+    let pool_size: usize = arg("pool", "512").parse().unwrap();
     let warmup = Duration::from_secs(arg("warmup", "15").parse().unwrap());
     let secs = Duration::from_secs(arg("secs", "60").parse().unwrap());
     let server_pid: u32 = arg("server-pid", &std::process::id().to_string()).parse().unwrap();
@@ -730,6 +749,7 @@ pub async fn rooms_mode(args: &HashMap<String, String>) {
 
     let own_pid = std::process::id();
     tokio::time::sleep_until(window_start.into()).await;
+    pool.recording.store(true, Ordering::Relaxed);
     let before = (
         cpu_ticks(server_pid),
         cpu_ticks(own_pid),
@@ -739,6 +759,7 @@ pub async fn rooms_mode(args: &HashMap<String, String>) {
         pool.retries.load(Ordering::Relaxed),
     );
     tokio::time::sleep_until(window_end.into()).await;
+    pool.recording.store(false, Ordering::Relaxed);
     let after = (
         cpu_ticks(server_pid),
         cpu_ticks(own_pid),
@@ -807,6 +828,7 @@ pub async fn rooms_mode(args: &HashMap<String, String>) {
         "commit_latency": percentiles(std::mem::take(&mut *shared.commit_latency.lock().unwrap())),
         "propagation": percentiles(std::mem::take(&mut *shared.propagation.lock().unwrap())),
         "send_lag": percentiles(std::mem::take(&mut *shared.send_lag.lock().unwrap())),
+        "pool_wait": percentiles(std::mem::take(&mut *pool.waits.lock().unwrap())),
         "commit_errors": totals[1],
         "sync_errors": totals[4],
         "sse_errors": totals[6],

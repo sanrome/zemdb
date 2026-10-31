@@ -19,6 +19,8 @@ export ZEMDB_AUTH_SECRET=perf_auth_secret_0123456789_0123456789
 export ZEMDB_ADMIN_SECRET=perf_admin_secret_0123456789_012345678
 export RUST_LOG=warn
 [ -n "${ZEMDB_PERF_INLINE_IO:-}" ] && export ZEMDB_PERF_INLINE_IO
+# A larger budget of response bytes in flight, when set (diagnostic).
+[ -n "${ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES:-}" ] && export ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES
 for rep in $(seq 1 "$REPS"); do
   rm -rf "$ROOT" && mkdir -p "$ROOT"
   ZEMDB_DATA_DIR="$ROOT/data" ZEMDB_PORT=$PORT ZEMDB_MAX_CONNECTIONS=19500 ZEMDB_MAX_SSE_STREAMS=19000 \
