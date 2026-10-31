@@ -12,6 +12,8 @@
 //! manager in this process, as `main` does, and sends the same commits to the room actor,
 //! without HTTP. Both print one JSON line with the results.
 
+mod rooms;
+
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
@@ -50,12 +52,18 @@ fn schema() -> Schema {
 }
 
 fn insert(schema: &Schema, id: i64) -> Operation {
+    insert_with(schema, id, id, 1_700_000_000_000)
+}
+
+/// An insert of row `id` with `count` and `ts` given: Evaluation 2 stores the author there and
+/// the time the row was sent.
+fn insert_with(schema: &Schema, id: i64, count: i64, ts: i64) -> Operation {
     let row = RowBuilder::new()
         .set("id", id)
         .set("text", TEXT)
-        .set("count", id)
+        .set("count", count)
         .set("done", false)
-        .set("ts", 1_700_000_000_000_i64)
+        .set("ts", ts)
         .build();
     schema.to_operation_insert(TABLE, &row, 1000).unwrap()
 }
@@ -557,6 +565,7 @@ fn main() {
         match mode.as_str() {
             "http" => http_mode(&args, run_args).await,
             "inproc" => inproc_mode(&args, run_args).await,
+            "rooms" => rooms::rooms_mode(&args).await,
             other => panic!("unknown mode {other}"),
         }
     });
