@@ -1507,15 +1507,43 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
     - **Por qué es Bajo:** solo pasa fuera de la configuración del contrato. Dentro de ella, por D91, una divergencia sin aviso conservaría la severidad de C1.
     - **Fix:** que `FileMetadata` vuelva a sincronizar su directorio antes de servir lo que guardó después de un error, o atar en el código los metadatos al directorio del motor; y que lo cumpla el OPFS, en 4.5.
     - **Test:** en `replica.patch`, que falla a propósito.
-  - **DEF-190 · Bajo · (a) · K7, K15.**
+  - **DEF-190 · Bajo · (a) · K7, K15 · ✅ Hecho (fix chico, fuera de lote).**
     - **Qué pasa:** una réplica detrás del log, cuyo único snapshot pasa `max_snapshot_bytes`, pide su primer chunk (hasta 4 MiB) en cada heartbeat. Una escritura con su `CommitAck` que la esperaba lo pidió 251 veces en 600 s.
     - **Por qué:** un snapshot más largo que el tope no queda descartado (`dropped`), como sí queda uno que no se instala. Con el `SyncWorker` de 4.3, pasaría en cada heartbeat.
-    - **Fix:** recordar como descartado el snapshot más largo que el tope, por su secuencia y el tamaño que anuncia, antes de 4.3.
-    - **Test:** en `escrituras.patch`.
-  - **DEF-191 · Bajo · (a) · K12, K7.**
+    - **Hecho:** la bajada que lo rechaza por el tope lo recuerda en la réplica (`oversized`), y la siguiente pide un primer chunk de 64 KiB (`PROBE_BYTES`), el más chico que sirve el relay, en lugar de uno de 4 MiB. Si el snapshot que sirve todavía es más largo que el tope, da `Config` otra vez, sin reservar nada. Si entra (otra subida en la misma secuencia, por ejemplo), lo baja otra vez desde su primer chunk, por chunks de 4 MiB.
+    - **Desvío del fix propuesto:** no se descarta el snapshot. La revisión de delta mostró que descartarlo por su secuencia dejaba esperando a la réplica cuando, vencido el que no entra, otro miembro sube en esa secuencia uno que sí entra (con otro motor o con otro nivel de Zstd). Así, además, cada llamada que lo intenta bajar sigue dando `Config`, y la aplicación se entera de que tiene que subir el tope. El costo es un chunk de 64 KiB por intento, en lugar de 4 MiB.
+    - **Tests** (`snapshot_tests.rs`):
+      - se extendió `a_snapshot_larger_than_the_limit_of_the_client_is_not_downloaded`: después del `Config`, un sync y un heartbeat dan `Config` otra vez, desde un primer chunk de 64 KiB;
+      - `a_snapshot_at_the_sequence_of_one_larger_than_the_limit_is_downloaded_once_it_fits`, el caso de la revisión: vencido el snapshot crudo, el mismo estado subido con Zstd en la misma secuencia se baja después de la sonda;
+      - `a_write_waiting_behind_a_snapshot_larger_than_the_limit_asks_for_small_first_chunks`, el escenario del DEF: en 600 s, la escritura con su `CommitAck` pide un primer chunk de 4 MiB, y todos los demás, de 64 KiB.
+      - el de la misma secuencia también hace fallar la bajada que sigue a la sonda: la siguiente pide 4 MiB, y ningún chunk sale anclado a la sonda.
+    - **Mutaciones** (todas detectadas):
+      - sin recordar el rechazo, fallan los tres tests;
+      - sin volver a empezar después de una sonda que entra, falla el de la misma secuencia;
+      - sin olvidar el rechazo cuando un snapshot entra, o volviendo a empezar anclado a la sonda, falla el de la misma secuencia, por la bajada que falla después de ella.
+    - **Interacciones revisadas:**
+      - **Otro anuncio, en otra secuencia:** la sonda lo baja si entra.
+      - **`RoomReset`, un descarte, cerrar y reabrir la sala:** una réplica nueva no recuerda el rechazo.
+      - **Un cliente nuevo con un tope mayor:** no hay rechazo que recordar (el caso `(len, true)` del test).
+      - **La subida del designado:** sin cambios. Mientras espera un snapshot, la réplica no sube ninguno.
+      - **`SnapshotSuperseded` durante una sonda:** vuelve a empezar con la sonda.
+      - **Una reserva que no entra en memoria:** sigue dando `Config` y no se recuerda, así que la bajada siguiente pide 4 MiB otra vez; la memoria puede liberarse.
+      - **Un registro que encuentra la réplica dentro del log:** el rechazo queda recordado, y cuesta una sonda en la bajada siguiente.
+      - **Un snapshot que entra después de la sonda y no se instala:** se descarta (`dropped`), como siempre.
+      - **El arnés de simulación:**
+        - un primer chunk fabricado más largo que su tope (6 MiB) lleva a una sonda en la bajada siguiente, que el fuzzing también puede reemplazar;
+        - ningún pedido queda anclado a uno de esos snapshots.
+        - 24 semillas pasaron.
+    - **Revisión de delta**, en dos rondas:
+      1. **No en verde**, sobre el fix que descartaba el snapshot, por el caso de la misma secuencia. Este enfoque es su arreglo (a), sin guardar el hash, porque la sonda ya trae el tamaño.
+      2. **En verde**, con un ajuste: dos mutaciones sin test, ahora detectadas por la bajada que falla después de la sonda. Sus menores, atendidos: la redacción del tope, la sonda que no reserva nada y la documentación de `oversized`, además de las dos interacciones de arriba.
+  - **DEF-191 · Bajo · (a) · K12, K7 · ✅ Hecho (fix chico, fuera de lote).**
     - **Qué pasa:** el tope de la bajada se mira antes de comparar el chunk con el primero, así que un chunk anclado que no sigue al primero y anuncia más que el tope es `Config` (subir el tope o descartar la sala) en lugar de `Network`, y el worker de 4.3 no lo reintentaría. Solo pasa con una respuesta dañada.
-    - **Fix:** mirar el tope solo en el primer chunk, antes de 4.3.
-    - **Test:** en `recuperacion.patch`.
+    - **Hecho:** el tope se mira después de las verificaciones de cada chunk. Un chunk anclado se compara con el primero, que está dentro del tope, así que el tope solo puede fallar en el primero. Un primer chunk más largo que el tope que no toma el tamaño que anuncia da `Network` y no se recuerda: la bajada siguiente lo pide como a cualquier otro.
+    - **Tests** (`snapshot_tests.rs`):
+      - un caso más en `a_chunk_that_does_not_follow_the_first_is_not_used`: un segundo chunk que anuncia `u64::MAX` bytes da `Network`;
+      - en `a_snapshot_larger_than_the_limit_of_the_client_is_not_downloaded`, un primer chunk que anuncia `u64::MAX` bytes da `Network`, y el sync siguiente pide un primer chunk de 4 MiB.
+    - **Mutación:** con el tope antes de las verificaciones, los dos tests fallan.
   - **DEF-192 · Bajo · (a) · K2.**
     - **Qué pasa:** un `HeartbeatAck` con la correlación y la sala del pedido, pero con un head más allá del del servidor, sube para siempre el head visto de la época. Desde ahí, toda escritura posterior de la sala termina `OutcomeUnknown` hasta cerrarla, aunque ningún intento haya quedado incierto y la réplica haya aplicado su secuencia.
     - **Alcance:** hace falta una respuesta dañada que decodifica y responde al pedido, que por el criterio de §2 cuenta como del servidor y queda fuera de alcance; falla del lado seguro.
@@ -1541,7 +1569,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
     - **Test:** en `review.patch`, de la revisión de delta.
 - **Notas sin defecto y tres propuestas de invariantes** (§1.2), pendientes de la decisión del dueño del proyecto: en §3 y §4 del informe.
 - **Pendientes que pasan a 4.3 y 4.5**, en sus secciones del plan de la fase:
-  - DEF-190 y DEF-191, antes del `SyncWorker` de 4.3, y DEF-195 con su adaptador `reqwest`; DEF-192 y DEF-196, opcionales;
+  - DEF-195, con el adaptador `reqwest` de 4.3, y DEF-192 y DEF-196, opcionales (DEF-190 y DEF-191, que eran para antes del `SyncWorker`, se arreglaron después del cierre);
   - DEF-189 y DEF-195, con el OPFS y el transporte del navegador de 4.5.
 - **Documentos:**
   - `INVARIANTES.md`, versión 10: el resultado en §1.4 y en el resumen, el estado de cada invariante auditada sin la marca de sin auditar, y las precisiones de arriba.

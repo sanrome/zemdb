@@ -19,6 +19,7 @@ use zemdb_core::ClientMessageKind::{
 };
 use zemdb_core::*;
 use zemdb_server::RoomCommand;
+use zemdb_storage::snapshot::{decode_snapshot_envelope, encode_snapshot_envelope};
 use zemdb_storage::{DiskStorageEngine, MemoryStorageEngine, StorageEngine, StorageError};
 
 /// The schema `tasks` of the rooms of [`TestServer::create_room`], at its first version.
@@ -200,6 +201,15 @@ fn chunks(transport: &TestTransport) -> Vec<(u32, Option<[u8; 32]>)> {
         _ => None,
     };
     transport.sent().into_iter().filter_map(chunk).collect()
+}
+
+/// The sizes of the chunks requested through `transport`, in order.
+fn chunk_sizes(transport: &TestTransport) -> Vec<u32> {
+    let size = |message: ClientMessage| match message {
+        ClientMessage::RequestSnapshotChunk { chunk_size, .. } => Some(chunk_size),
+        _ => None,
+    };
+    transport.sent().into_iter().filter_map(size).collect()
 }
 
 /// The chunk `index` of the active snapshot of `room_id`, by chunks of 4 MiB, as the snapshot
@@ -559,7 +569,7 @@ async fn a_chunk_that_does_not_follow_the_first_is_not_used() {
     let dir = tempdir().unwrap();
     let (transport, storage, client) = joined(&server, &room_id, dir.path()).await;
     type Change = fn(&mut ServerMessage);
-    let changes: [(&str, u32, Change); 10] = [
+    let changes: [(&str, u32, Change); 11] = [
         ("another snapshot", 1, |chunk| {
             if let ServerMessage::SnapshotChunk { snapshot_hash, .. } = chunk {
                 snapshot_hash[0] ^= 1;
@@ -576,6 +586,11 @@ async fn a_chunk_that_does_not_follow_the_first_is_not_used() {
         ("another length", 1, |chunk| {
             if let ServerMessage::SnapshotChunk { total_bytes, .. } = chunk {
                 *total_bytes += 1;
+            }
+        }),
+        ("a length beyond the limit", 1, |chunk| {
+            if let ServerMessage::SnapshotChunk { total_bytes, .. } = chunk {
+                *total_bytes = u64::MAX;
             }
         }),
         ("more chunks", 1, |chunk| {
@@ -692,13 +707,40 @@ async fn a_snapshot_larger_than_the_limit_of_the_client_is_not_downloaded() {
             true => assert_eq!(synced, Ok(())),
             false => {
                 assert!(matches!(synced, Err(ClientError::Config(_))), "{synced:?}");
+                // Asked for again by a first chunk of 64 KiB, it is still larger than the limit.
+                let again = [
+                    client.sync(room_id.clone()).await,
+                    client.heartbeat(room_id.clone()).await,
+                ];
+                let config = |again: &Result<_, _>| matches!(again, Err(ClientError::Config(_)));
+                assert!(again.iter().all(config), "{again:?}");
+                assert_eq!(chunk_sizes(&transport), [4 << 20, 64 << 10, 64 << 10]);
                 assert_eq!(head(&client, &room_id).await, 0);
             }
         }
     }
+    // A first chunk larger than the limit that does not take the size it announces is not used:
+    // the next download asks for it as for any other.
+    let first = chunk(&server, &room_id, 0, None).await;
+    let dir = tempdir().unwrap();
+    let transport = server.transport();
+    let config = ClientConfig {
+        max_snapshot_bytes: len - 1,
+        ..ClientConfig::new("ana")
+    };
+    let client = client_with(dir.path(), &transport, config).await;
+    open_room(&client, &room_id).await.unwrap();
+    answer_chunk(&transport, 0, first.clone(), |chunk| {
+        if let ServerMessage::SnapshotChunk { total_bytes, .. } = chunk {
+            *total_bytes = u64::MAX;
+        }
+    });
+    network(client.sync(room_id.clone()).await);
+    let synced = client.sync(room_id.clone()).await;
+    assert!(matches!(synced, Err(ClientError::Config(_))), "{synced:?}");
+    assert_eq!(chunk_sizes(&transport), [4 << 20, 4 << 20]);
 
     // Without a limit, a size that does not fit in memory is `Config` too, without aborting.
-    let first = chunk(&server, &room_id, 0, None).await;
     let dir = tempdir().unwrap();
     let transport = server.transport();
     let config = ClientConfig {
@@ -722,6 +764,89 @@ async fn a_snapshot_larger_than_the_limit_of_the_client_is_not_downloaded() {
     let synced = client.sync(room_id.clone()).await;
     assert!(matches!(synced, Err(ClientError::Config(_))), "{synced:?}");
     assert_eq!(chunks(&transport), [(0, None)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_snapshot_at_the_sequence_of_one_larger_than_the_limit_is_downloaded_once_it_fits() {
+    let server = TestServer::with(|config| {
+        (config.ram_max_ops, config.warm_disk_ttl_secs) = (5, 0);
+        (config.cold_disk_ttl_secs, config.snapshot_ttl_secs) = (0, 60);
+    });
+    let room_id = server.create_room("room-a").await;
+    let ops = server.commit(&room_id, 1..=9).await;
+    server.prune(&room_id, 6).await;
+    let raw = snapshot(&room_id, tasks_schema(), &ops[..7]).await;
+    server.upload(&room_id, 7, raw.clone()).await;
+    let dir = tempdir().unwrap();
+    let transport = server.transport();
+    let config = ClientConfig {
+        max_snapshot_bytes: raw.len() as u64 - 1,
+        ..ClientConfig::new("ana")
+    };
+    let client = client_with(dir.path(), &transport, config).await;
+    open_room(&client, &room_id).await.unwrap();
+    let synced = client.sync(room_id.clone()).await;
+    assert!(matches!(synced, Err(ClientError::Config(_))), "{synced:?}");
+
+    // Once it expires, another member uploads the same state at the same sequence, compressed.
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    let payload = decode_snapshot_envelope(&raw).unwrap();
+    let compressed = encode_snapshot_envelope(&payload, true, 3).unwrap();
+    assert!(compressed.len() < raw.len());
+    server.upload(&room_id, 7, compressed).await;
+    // The download after the probe fails: the next one asks for 4 MiB, and none is anchored.
+    let mut failed = false;
+    transport.answer(move |message| match message {
+        ClientMessage::RequestSnapshotChunk {
+            correlation_id,
+            room_id,
+            chunk_size,
+            ..
+        } if *chunk_size == 4 << 20 && !std::mem::replace(&mut failed, true) => Some(Ok(
+            error_reply(*correlation_id, room_id, ErrorCode::Internal),
+        )),
+        _ => None,
+    });
+    network(client.sync(room_id.clone()).await);
+    client.sync(room_id.clone()).await.unwrap();
+    assert_eq!(head(&client, &room_id).await, 9);
+    assert_eq!(
+        chunk_sizes(&transport),
+        [4 << 20, 64 << 10, 4 << 20, 4 << 20]
+    );
+    assert_eq!(chunks(&transport), [(0, None); 4]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_write_waiting_behind_a_snapshot_larger_than_the_limit_asks_for_small_first_chunks() {
+    let server = TestServer::pruning();
+    let room_id = server.create_room("room-a").await;
+    let dir = tempdir().unwrap();
+    let transport = server.transport();
+    let config = ClientConfig {
+        max_snapshot_bytes: 16,
+        ..ClientConfig::new("ana")
+    };
+    let client = client_with(dir.path(), &transport, config).await;
+    open_room(&client, &room_id).await.unwrap();
+    let ops = server.commit(&room_id, 1..=9).await;
+    server.prune(&room_id, 6).await;
+    server
+        .upload(
+            &room_id,
+            7,
+            snapshot(&room_id, tasks_schema(), &ops[..7]).await,
+        )
+        .await;
+    // Its `CommitAck` leaves it waiting for the sequence 10, behind the snapshot.
+    transport.answer_next(Commit, |message| commit_ack(message, 10));
+    let written = client.write(room_id.clone(), insert_task(1));
+    let waited = tokio::time::timeout(Duration::from_secs(600), written).await;
+    assert!(waited.is_err(), "{waited:?}");
+    let sizes = chunk_sizes(&transport);
+    assert!(sizes.len() > 100, "{}", sizes.len());
+    assert_eq!(sizes[0], 4 << 20);
+    assert!(sizes[1..].iter().all(|size| *size == 64 << 10));
 }
 
 #[tokio::test(start_paused = true)]

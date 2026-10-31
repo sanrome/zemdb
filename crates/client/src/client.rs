@@ -20,6 +20,10 @@ use crate::{ClientConfig, ClientError, MetadataStore, RoomMetadata, TransportCli
 /// upload.
 const CHUNK_BYTES: u32 = 4 << 20;
 
+/// The first chunk of a download after one of a snapshot larger than `max_snapshot_bytes`: the
+/// smallest the relay serves, enough to learn whether the snapshot it serves still is.
+const PROBE_BYTES: u32 = 64 << 10;
+
 /// How many times a chunk of a snapshot is sent again after a transient failure.
 const CHUNK_RETRIES: u32 = 3;
 
@@ -111,6 +115,9 @@ struct OpenReplica {
     awaits_snapshot: Option<bool>,
     /// The sequence of the last snapshot it dropped, which it does not download again.
     dropped: Option<SequenceNumber>,
+    /// The last chunk of a download it checked announced a snapshot larger than
+    /// `max_snapshot_bytes`: the next download asks for a first chunk of [`PROBE_BYTES`].
+    oversized: bool,
     /// When its last upload failed.
     upload_failed: Option<Instant>,
     /// Its schema changed to one that does not evolve from its own, or the server sent an
@@ -126,6 +133,7 @@ impl OpenReplica {
             registered,
             awaits_snapshot: None,
             dropped: None,
+            oversized: false,
             upload_failed: None,
             failed_closed: false,
         }
@@ -1136,13 +1144,13 @@ impl Client {
     ///
     /// A replica that waits for a snapshot takes whether the ack announces a usable one, and
     /// downloads the one it announces by chunks of 4 MiB, each checked against the first. One
-    /// larger than `max_snapshot_bytes` is `Config`. `SnapshotSuperseded` downloads it again
-    /// from its first chunk, once; `RoomNotFound` leaves the replica waiting for a heartbeat that
-    /// announces one; and `RoomReset` registers it again with its cursor. The snapshot is
-    /// installed with the schema of the replica once its bytes match its hash, and the next sync
-    /// goes on from it. One that does not install with that schema registers the replica again,
-    /// for `Registered` to give it the schema of the room, and is dropped if it does not install
-    /// with it either.
+    /// larger than `max_snapshot_bytes` is `Config`, also the next time, from a first chunk of
+    /// 64 KiB. `SnapshotSuperseded` downloads it again from its first chunk, once;
+    /// `RoomNotFound` leaves the replica waiting for a heartbeat that announces one; and
+    /// `RoomReset` registers it again with its cursor. The snapshot is installed with the schema
+    /// of the replica once its bytes match its hash, and the next sync goes on from it. One that
+    /// does not install with that schema registers the replica again, for `Registered` to give
+    /// it the schema of the room, and is dropped if it does not install with it either.
     ///
     /// An ack that asks the client for a snapshot (`snapshot_wanted`) designates it to upload
     /// one, once per heartbeat, and the heartbeat is sent again from the state that the upload
@@ -1258,9 +1266,12 @@ impl Client {
     /// room and the index of the request, with the sequence, the number of chunks, the size and
     /// the hash of the first, a number of chunks that its size takes, and the length its index
     /// takes. Returns its sequence and its bytes once they match its hash, or `None` on
-    /// `RoomReset`. One larger than `max_snapshot_bytes` is `Config`. `SnapshotSuperseded`
-    /// downloads it again from its first chunk, once per download, and `RoomNotFound` leaves the
-    /// replica waiting for a heartbeat that announces one. Any other reply, or none, is `Network`
+    /// `RoomReset`. One larger than `max_snapshot_bytes` is `Config`, once its first chunk is
+    /// checked; the next download asks for a first chunk of [`PROBE_BYTES`], which is `Config`
+    /// again if the snapshot is still larger than the limit, and downloads one that fits from
+    /// its first chunk again, by chunks of 4 MiB. `SnapshotSuperseded` downloads it again from
+    /// its first chunk, once per download, and `RoomNotFound` leaves the replica waiting for a
+    /// heartbeat that announces one. Any other reply, or none, is `Network`
     /// ([`send_chunk`](Self::send_chunk) sends a chunk again a few times).
     async fn download(
         &self,
@@ -1268,7 +1279,8 @@ impl Client {
         request: &Request,
         incarnation: u128,
     ) -> Result<Option<(SequenceNumber, Bytes)>, ClientError> {
-        let chunk = u64::from(CHUNK_BYTES);
+        let probe = matches!(&room.state().replica, Replica::Open(open) if open.oversized);
+        let mut size = if probe { PROBE_BYTES } else { CHUNK_BYTES };
         let (mut first, mut bytes, mut index) = (None, Vec::new(), 0);
         let mut superseded = false;
         let (seq, hash) = loop {
@@ -1282,7 +1294,7 @@ impl Client {
                 correlation_id,
                 room_id: room.id.clone(),
                 chunk_index: index,
-                chunk_size: CHUNK_BYTES,
+                chunk_size: size,
                 snapshot_hash: first.map(|(.., hash)| hash),
                 room_incarnation: incarnation,
             };
@@ -1297,12 +1309,7 @@ impl Client {
                     snapshot_hash,
                     data,
                 }) if reply_id == correlation_id && room_id == room.id && chunk_index == index => {
-                    let max = self.config.max_snapshot_bytes;
-                    if total_bytes > max {
-                        return Err(ClientError::Config(format!(
-                            "The snapshot of {total_bytes} bytes is larger than the limit of {max}"
-                        )));
-                    }
+                    let chunk = u64::from(size);
                     let snapshot = (snapshot_head_seq, total_chunks, total_bytes, snapshot_hash);
                     let len = total_bytes.saturating_sub(u64::from(index) * chunk);
                     if *first.get_or_insert(snapshot) != snapshot
@@ -1312,6 +1319,18 @@ impl Client {
                         return Err(ClientError::Network(
                             "Invalid chunk of a snapshot".to_string(),
                         ));
+                    }
+                    let max = self.config.max_snapshot_bytes;
+                    room.update(request.epoch, |open| open.oversized = total_bytes > max);
+                    if total_bytes > max {
+                        return Err(ClientError::Config(format!(
+                            "The snapshot of {total_bytes} bytes is larger than the limit of {max}"
+                        )));
+                    }
+                    // One that fits after a probe is downloaded from its start.
+                    if size == PROBE_BYTES {
+                        (size, first, bytes, index) = (CHUNK_BYTES, None, Vec::new(), 0);
+                        continue;
                     }
                     // The snapshot fits within the limit, and is held once.
                     if index == 0 {

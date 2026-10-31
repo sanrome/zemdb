@@ -170,7 +170,6 @@ En `zemdb-client`, contra el trait `TransportClient`, sin red real, con la forma
 - El `SyncWorker`: SSE con la reacción a cada evento, pull paginado, `Ack` del último lote, heartbeat y reconexión con *backoff* exponencial y *full jitter* (§A.5). El heartbeat de 4.2 espera una bajada o una subida de snapshot en curso, o hace la suya, y los chunks no renuevan el lease: el worker no encadena los heartbeats detrás de una bajada o una subida larga (de los Lotes 8 y 9 de 4.2).
 - La renovación del token ante `Unauthorized`.
 - De la auditoría de 4.2 (en la nota del Lote 12 de su plan):
-  - antes de que el worker repita los heartbeats, DEF-190 (un snapshot más largo que el tope se vuelve a pedir en cada heartbeat) y DEF-191 (un chunk anclado que anuncia más que el tope es `Config`, que el worker no reintentaría);
   - el adaptador `reqwest` no lee un cuerpo más largo que `MAX_FRAME_SIZE`: una respuesta se decodifica sin presupuesto de valores y reserva hasta unas 24 veces su tamaño (DEF-195);
   - opcionales, porque con el worker durarían hasta que la aplicación cierre la sala, aunque solo los dispara una respuesta fuera de alcance (`INVARIANTES.md` §2): DEF-192 (un head más allá del servidor deja inciertas las escrituras de la sala) y DEF-196 (una cola que deja la réplica detrás del log la deja esperando un snapshot que nadie anuncia).
 
