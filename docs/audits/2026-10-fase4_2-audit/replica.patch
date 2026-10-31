@@ -1,0 +1,864 @@
+diff --git a/crates/client/tests/metadata_tests.rs b/crates/client/tests/metadata_tests.rs
+index c26d6e7..42ca9a1 100644
+--- a/crates/client/tests/metadata_tests.rs
++++ b/crates/client/tests/metadata_tests.rs
+@@ -1,6 +1,9 @@
+ //! The durable metadata of the client: in files, through the file layer, and in memory.
+ 
+ mod common;
++/// The generators of the randomized tests of `zemdb-core` (audit of sub-phase 4.2).
++#[path = "../../core/tests/common/mod.rs"]
++mod generators;
+ 
+ use common::*;
+ use std::path::Path;
+@@ -390,3 +393,54 @@ async fn metadata_share_the_directory_of_a_disk_engine_without_touching_its_file
+     assert_eq!(engine.get_head_seq(&room()).await.unwrap().get(), 0);
+     assert_eq!(store.room(&room()).await.unwrap(), Some(metadata(5)));
+ }
++
++// ---------------------------------------------------------------------------------------------
++// Audit of sub-phase 4.2 (Lote 12, group "Réplica y log")
++
++/// Audit (INV-W2 and INV-W1 for the metadata of the client): the metadata of a room with a random
++/// valid schema (several tables, `UNIQUE` constraints and foreign keys, owners, immutable tables,
++/// encrypted and added columns), a random schema id and an incarnation anywhere in `u128`
++/// survive a save and a read unchanged, also from another store over the directory; a file with
++/// any bit flipped, or cut anywhere, counts as missing, without a panic; and so does one that
++/// holds the metadata of another room, under its own valid CRC32, only if it does not parse as
++/// the metadata of a room: the content does not name its room.
++#[tokio::test]
++async fn audit_room_metadata_with_random_schemas_survive_a_save_and_damage_counts_as_missing() {
++    let dir = tempdir().unwrap();
++    let store = FileMetadata::new(dir.path());
++    store.open().await.unwrap();
++    let mut rng = generators::Rng::new(0x0042_1200);
++    for case in 0..300u32 {
++        let schema = generators::schema(&mut rng);
++        let high = u128::from(rng.next_u64()) << 64;
++        let room_incarnation = match case % 4 {
++            0 => u128::MAX - rng.below(3) as u128,
++            1 => rng.below(3) as u128,
++            _ => high | u128::from(rng.next_u64()),
++        };
++        let metadata = RoomMetadata {
++            room_incarnation,
++            schema_id: generators::schema_id(&mut rng),
++            schema,
++        };
++        store.save_room(&room(), &metadata).await.unwrap();
++        let read = store.room(&room()).await.unwrap();
++        assert_eq!(read.as_ref(), Some(&metadata), "case {case}");
++        let other = FileMetadata::new(dir.path()).room(&room()).await.unwrap();
++        assert_eq!(other.as_ref(), Some(&metadata), "case {case}");
++        if case % 60 == 0 {
++            let bytes = std::fs::read(room_file(dir.path())).unwrap();
++            for damaged in damaged(&bytes) {
++                std::fs::write(room_file(dir.path()), &damaged).unwrap();
++                assert_eq!(store.room(&room()).await.unwrap(), None, "case {case}");
++            }
++            std::fs::write(room_file(dir.path()), &bytes).unwrap();
++        }
++    }
++    // The file of another room, copied in place of this one's, verifies and is taken.
++    let other_room = RoomId::new("room-b").unwrap();
++    store.save_room(&other_room, &metadata(9)).await.unwrap();
++    let copied = std::fs::read(dir.path().join("room_room-b.meta")).unwrap();
++    std::fs::write(room_file(dir.path()), copied).unwrap();
++    assert_eq!(store.room(&room()).await.unwrap(), Some(metadata(9)));
++}
+diff --git a/crates/client/tests/room_tests.rs b/crates/client/tests/room_tests.rs
+index 71d7dc6..d222e85 100644
+--- a/crates/client/tests/room_tests.rs
++++ b/crates/client/tests/room_tests.rs
+@@ -832,3 +832,54 @@ async fn closing_waits_for_a_change_of_the_replica_cut_by_its_caller() {
+         }
+     }
+ }
++
++// ---------------------------------------------------------------------------------------------
++// Audit of sub-phase 4.2 (Lote 12, group "Réplica y log")
++
++/// Audit (INV-K5, INV-K1, INV-W2 for the metadata of the client): the metadata file of a room
++/// replaced with that of another room, under its own valid CRC32 (the content does not name its
++/// room), verifies: the replica presents its head with the incarnation of the other room, the
++/// server resets it, and the replica is discarded and downloaded again. It fails safe: nothing
++/// of the other room is applied, and the replica ends with its own log.
++#[tokio::test]
++async fn audit_the_metadata_of_another_room_get_a_reset_and_the_replica_is_downloaded_again() {
++    let (server, dir) = (TestServer::new(), tempdir().unwrap());
++    let room_a = server.create_room("room-a").await;
++    let room_b = server.create_room("room-b").await;
++    let transport = server.transport();
++    let storage = engine(dir.path());
++    let client = open_client(dir.path(), storage.clone(), &transport).await;
++    open_room(&client, &room_a).await.unwrap();
++    open_room(&client, &room_b).await.unwrap();
++    server.commit(&room_a, 1..=3).await;
++    server.commit(&room_b, 1..=2).await;
++    client.sync(room_a.clone()).await.unwrap();
++    client.sync(room_b.clone()).await.unwrap();
++    client.shutdown().await.unwrap();
++    let (inc_a, inc_b) = (
++        server.incarnation(&room_a).await,
++        server.incarnation(&room_b).await,
++    );
++    assert_ne!(inc_a, inc_b);
++    std::fs::copy(
++        dir.path().join("room_room-a.meta"),
++        dir.path().join("room_room-b.meta"),
++    )
++    .unwrap();
++    let saved = metadata(dir.path(), &room_b).await.unwrap();
++    assert_eq!(saved.room_incarnation, inc_a);
++
++    let transport = server.transport();
++    let storage = engine(dir.path());
++    let client = open_client(dir.path(), storage.clone(), &transport).await;
++    open_room(&client, &room_b).await.unwrap();
++    assert_eq!(
++        transport.registrations(),
++        [(Some(2), Some(inc_a)), (None, None)]
++    );
++    client.sync(room_b.clone()).await.unwrap();
++    assert_eq!(client.status(room_b.clone()).await, Ok(status(2, 1, true)));
++    assert_eq!(tasks(&storage, &room_b).await, [1, 2]);
++    let saved = metadata(dir.path(), &room_b).await.unwrap();
++    assert_eq!(saved.room_incarnation, inc_b);
++}
+diff --git a/crates/client/tests/schema_tests.rs b/crates/client/tests/schema_tests.rs
+index 75751bc..41af2f7 100644
+--- a/crates/client/tests/schema_tests.rs
++++ b/crates/client/tests/schema_tests.rs
+@@ -792,3 +792,406 @@ async fn a_failed_save_or_reload_of_a_new_schema_leaves_the_room_out() {
+         assert_eq!(deregistrations(&transport), 0, "{failing}");
+     }
+ }
++
++// ---------------------------------------------------------------------------------------------
++// Audit of sub-phase 4.2 (Lote 12, group "Réplica y log")
++
++/// The log of `room_id`, as a client of the server's own receives it.
++async fn audit_log(server: &TestServer, room_id: &RoomId) -> Vec<SequencedOperation> {
++    let transport = server.transport();
++    let client_id = ClientId::new("eve#reader").unwrap();
++    let token = token(&client_id, room_id);
++    let send = |message: ClientMessage| {
++        let (transport, token) = (transport.clone(), token.clone());
++        async move {
++            let reply = transport.send(&message, &token).await.unwrap();
++            decode_message::<ServerMessage>(&reply).unwrap()
++        }
++    };
++    let registered = send(ClientMessage::RegisterClient {
++        correlation_id: CorrelationId::new(1),
++        room_id: room_id.clone(),
++        client_id: client_id.clone(),
++        auth_token: token.clone(),
++        current_seq: None,
++        known_incarnation: None,
++    })
++    .await;
++    assert!(matches!(registered, ServerMessage::Registered { .. }));
++    let mut log: Vec<SequencedOperation> = Vec::new();
++    loop {
++        let reply = send(ClientMessage::Sync {
++            correlation_id: CorrelationId::new(2),
++            room_id: room_id.clone(),
++            client_id: client_id.clone(),
++            from_seq: SequenceNumber::new(log.len() as u64),
++            max_batch_size: u32::MAX,
++        })
++        .await;
++        let ServerMessage::SyncBatch { ops, has_more, .. } = reply else {
++            panic!("{reply:?}");
++        };
++        log.extend(ops);
++        if !has_more {
++            return log;
++        }
++    }
++}
++
++/// The rows of `rows` without the nulls at the end of each, which a row gets when it is widened
++/// to a later schema in one replica and not in another.
++fn audit_trimmed(rows: &oracle::Rows) -> Vec<(u16, Vec<String>, Vec<String>)> {
++    let mut dump = oracle::dump(rows);
++    for (_, _, row) in &mut dump {
++        while row.last().is_some_and(|value| value == "Null") {
++            row.pop();
++        }
++    }
++    dump
++}
++
++/// The decision of a reference replica on an operation, as a write reports it.
++fn audit_decision(reason: Option<&oracle::Reason>) -> Result<(), ClientError> {
++    use zemdb_client::Violation;
++    let violation = match reason.cloned() {
++        None => return Ok(()),
++        Some(oracle::Reason::MissingRow) => return Err(ClientError::RowMissing),
++        Some(oracle::Reason::Duplicate) => Violation::Duplicate,
++        Some(oracle::Reason::NotOwner) => Violation::NotOwner,
++        Some(oracle::Reason::Unique(constraint)) => Violation::Unique { constraint },
++        Some(oracle::Reason::ForeignKey(constraint)) => Violation::ForeignKey { constraint },
++        Some(oracle::Reason::Restrict(constraint)) => Violation::Restrict { constraint },
++    };
++    Err(ClientError::ConstraintViolation(violation))
++}
++
++/// Audit (INV-K4, INV-K6, INV-C1 in the client, INV-K1): a column with a `UNIQUE` constraint is
++/// added to the schema while syncs, writes and heartbeats of two clients (one over a disk engine
++/// with its metadata in files, one in memory) are in flight, with several calls on the same
++/// client at once, at many points of their requests. Every reply announces the schema its
++/// operations need, before or after the reload, and the replicas switch to it only through
++/// `Registered`. Afterwards, the disk client crashes (dropped without a shutdown) and opens again
++/// from its directory. Every replica ends at the head of the log with the state of a reference
++/// replica that applies the whole log with the last schema, and of a client that joins at the
++/// end; every write that got a decision got the one of the reference replica on its operation.
++#[tokio::test(start_paused = true)]
++async fn audit_a_column_added_while_calls_are_in_flight_leaves_every_replica_as_the_log() {
++    use zemdb_client::MemoryMetadata;
++    use zemdb_storage::{DiskStorageEngine, MemoryStorageEngine};
++    let grid = (0u64..24).flat_map(|delay| [(delay, 10, 7), (delay, 3, 11), (delay, 1, 1)]);
++    for (delay, disk_ms, mem_ms) in grid {
++        let server = TestServer::new();
++        let room_id = server.create_room("room-a").await;
++        server.commit(&room_id, 1..=2).await;
++        let dir = tempdir().unwrap();
++        let (disk_t, mem_t) = (server.transport(), server.transport());
++        let disk_storage = engine(dir.path());
++        let disk = open_client(dir.path(), disk_storage.clone(), &disk_t).await;
++        let mem_storage = MemoryStorageEngine::new();
++        let mem = Client::open(
++            ClientConfig::new("bea"),
++            mem_storage.clone(),
++            MemoryMetadata::default(),
++            mem_t.clone(),
++        )
++        .await
++        .unwrap();
++        open_room(&disk, &room_id).await.unwrap();
++        open_room(&mem, &room_id).await.unwrap();
++        disk_t.slow(Duration::from_millis(disk_ms));
++        mem_t.slow(Duration::from_millis(mem_ms));
++
++        let room = || room_id.clone();
++        let mut writes: Vec<(Operation, Result<(), ClientError>)> = Vec::new();
++        // Phase A: the column is added `delay` ms after the calls start.
++        let phase_a = async {
++            tokio::join!(
++                disk.sync(room()),
++                disk.write(room(), insert_task(3)),
++                disk.heartbeat(room()),
++                mem.write(room(), update_task(1)),
++                mem.sync(room()),
++                mem.write(room(), insert_tagged(4, "a")),
++            )
++        };
++        let evolve = async {
++            tokio::time::sleep(Duration::from_millis(delay)).await;
++            add_tag_column(&server).await;
++            server
++                .commit_ops(&room_id, [insert_tagged(5, "a"), update_tag(2, "a")])
++                .await;
++        };
++        let ((_, w3, _, w1, _, w4), ()) = tokio::join!(phase_a, evolve);
++        writes.push((insert_task(3), w3));
++        writes.push((update_task(1), w1));
++        writes.push((insert_tagged(4, "a"), w4));
++
++        // Phase B: writes of the new version from both clients at once, on the same tag.
++        let (w6, w33, _, w7, w11, _) = tokio::join!(
++            disk.write(room(), insert_tagged(6, "b")),
++            disk.write(room(), update_tag(3, "c")),
++            disk.sync(room()),
++            mem.write(room(), insert_tagged(7, "b")),
++            mem.write(room(), update_tag(1, "c")),
++            mem.heartbeat(room()),
++        );
++        writes.push((insert_tagged(6, "b"), w6));
++        writes.push((update_tag(3, "c"), w33));
++        writes.push((insert_tagged(7, "b"), w7));
++        writes.push((update_tag(1, "c"), w11));
++
++        // The network heals; the disk client crashes and opens again from its directory.
++        disk_t.slow(Duration::ZERO);
++        mem_t.slow(Duration::ZERO);
++        disk_t.settled().await;
++        mem_t.settled().await;
++        drop(disk);
++        drop(disk_storage);
++        let mut reopened = None;
++        for _ in 0..200 {
++            let storage = DiskStorageEngine::new(options(dir.path())).unwrap();
++            let metadata = FileMetadata::new(dir.path());
++            let client = Client::open(
++                ClientConfig::new("ana"),
++                storage.clone(),
++                metadata,
++                disk_t.clone(),
++            );
++            match client.await {
++                Ok(client) => {
++                    reopened = Some((client, storage));
++                    break;
++                }
++                Err(_) => tokio::time::sleep(Duration::from_millis(1)).await,
++            }
++        }
++        let (disk, disk_storage) = reopened.expect("the crashed client opens again");
++        open_room(&disk, &room_id).await.unwrap();
++        disk.sync(room()).await.unwrap();
++        mem.sync(room()).await.unwrap();
++        // A client that joins at the end applies the whole log with the last schema.
++        let late_storage = MemoryStorageEngine::new();
++        let late = Client::open(
++            ClientConfig::new("eva"),
++            late_storage.clone(),
++            MemoryMetadata::default(),
++            server.transport(),
++        )
++        .await
++        .unwrap();
++        open_room(&late, &room_id).await.unwrap();
++        late.sync(room()).await.unwrap();
++
++        let log = audit_log(&server, &room_id).await;
++        let mut reference = oracle::Oracle::new(tagged_schema());
++        let rejected: BTreeMap<u64, oracle::Reason> =
++            reference.apply_batch(&log).into_iter().collect();
++        let head = log.len() as u64;
++        let expected = audit_trimmed(reference.rows());
++        for (name, client, storage) in [
++            ("disk", &disk, &disk_storage as &dyn StorageEngine),
++            ("mem", &mem, &mem_storage as &dyn StorageEngine),
++            ("late", &late, &late_storage as &dyn StorageEngine),
++        ] {
++            let status_now = client.status(room()).await.unwrap();
++            assert_eq!(status_now.head_seq.get(), head, "{delay}: {name}");
++            assert!(!status_now.failed_closed, "{delay}: {name}");
++            let mut table = BTreeMap::new();
++            for id in 1..=9 {
++                let pk = PrimaryKey::single(id);
++                if let Some(row) = storage.get_by_id(&room_id, 0, &pk).await.unwrap() {
++                    table.insert(pk, row);
++                }
++            }
++            let replica = oracle::Rows::from([(0, table)]);
++            assert_eq!(audit_trimmed(&replica), expected, "{delay}: {name}");
++        }
++        let saved = FileMetadata::new(dir.path()).room(&room_id).await.unwrap();
++        assert_eq!(saved.unwrap().schema, tagged_schema(), "{delay}");
++        // A write with a decision has the one of the reference replica on its operation.
++        for (op, result) in writes {
++            let at: Vec<u64> = log
++                .iter()
++                .filter(|logged| logged.op == op)
++                .map(|logged| logged.seq.get())
++                .collect();
++            assert!(at.len() <= 1, "{delay}: {op:?} sequenced twice");
++            match &result {
++                Ok(()) | Err(ClientError::ConstraintViolation(_) | ClientError::RowMissing) => {
++                    assert_eq!(at.len(), 1, "{delay}: {op:?} {result:?} not in the log");
++                    let expected = audit_decision(rejected.get(&at[0]));
++                    assert_eq!(result, expected, "{delay}: {op:?}");
++                }
++                // Refused by the server before it had the column, or uncertain.
++                Err(ClientError::Validation(_)) => assert!(at.is_empty(), "{delay}: {op:?}"),
++                Err(ClientError::OutcomeUnknown) => {}
++                Err(err) => panic!("{delay}: {op:?} ended with {err:?}"),
++            }
++        }
++    }
++}
++
++/// The name of the directory `dir`, as the test file layer logs it.
++fn audit_dir_name(dir: &Path) -> &'static str {
++    let name = dir.file_name().unwrap().to_str().unwrap().to_string();
++    Box::leak(name.into_boxed_str())
++}
++
++/// What the scenarios of a failed sync of the directory of the metadata share: a client over a
++/// disk engine in `data_dir`, with its metadata in `meta_dir` through `files`, at the head 2 of
++/// the version 1 of the schema; then the column with `UNIQUE` is added, and the log rejects the
++/// update of row 2 to the tag of row 1 (seq 4), after which row 1 takes another tag (seq 5).
++/// Returns the server, the room, the client, its engine and the state of the log at its head 5.
++async fn audit_failed_sync_setup(
++    data_dir: &Path,
++    meta_dir: &Path,
++    files: &TestFiles,
++    engine_files: Option<TestFiles>,
++) -> (
++    TestServer,
++    RoomId,
++    Client,
++    zemdb_storage::DiskStorageEngine<TestFiles>,
++    oracle::Rows,
++) {
++    let server = TestServer::new();
++    let room_id = server.create_room("room-a").await;
++    let engine_files = engine_files.unwrap_or_default();
++    let storage =
++        zemdb_storage::DiskStorageEngine::with_files(options(data_dir), engine_files).unwrap();
++    let client = Client::open(
++        ClientConfig::new("ana"),
++        storage.clone(),
++        FileMetadata::with_files(meta_dir, files.clone()),
++        server.transport(),
++    )
++    .await
++    .unwrap();
++    open_room(&client, &room_id).await.unwrap();
++    server.commit(&room_id, 1..=2).await;
++    client.sync(room_id.clone()).await.unwrap();
++    add_tag_column(&server).await;
++    let ops = [update_tag(1, "a"), update_tag(2, "a"), update_tag(1, "b")];
++    server.commit_ops(&room_id, ops).await;
++    let log = audit_log(&server, &room_id).await;
++    let mut reference = oracle::Oracle::new(tasks_schema());
++    reference.apply_batch(&log[..2]);
++    reference.evolve(tagged_schema());
++    let rejected = reference.apply_batch(&log[2..]);
++    let unique = oracle::Reason::Unique("tasks_tag".to_string());
++    assert_eq!(rejected, [(4, unique)]);
++    let rows = reference.rows().clone();
++    (server, room_id, client, storage, rows)
++}
++
++/// Audit (INV-C1 in the client, INV-K6, INV-D4-like atomic replace of the metadata): the save of
++/// a new schema whose rename lands but whose `sync_dir` fails is an error, and the room leaves
++/// the client; its next open, in the same process, takes the renamed file, which the failed sync
++/// did not make durable. Before the replica applies any operation of the new version, the disk
++/// engine's `open_room` syncs the same directory (the metadata live in the data directory of the
++/// engine, ARCHITECTURE.md §11), so the rename is durable by then, and the replica, reopened
++/// after a crash, has the schema its log was applied with.
++#[tokio::test]
++async fn audit_a_failed_sync_of_a_saved_schema_is_made_durable_by_the_next_open_of_the_room() {
++    let dir = tempdir().unwrap();
++    let dir_name = audit_dir_name(dir.path());
++    let files = TestFiles::default();
++    let (server, room_id, client, storage, expected) =
++        audit_failed_sync_setup(dir.path(), dir.path(), &files, Some(files.clone())).await;
++    files.fail_next("sync_dir", dir_name);
++    let failed_at = files.log().len();
++    let synced = client.sync(room_id.clone()).await;
++    assert!(matches!(synced, Err(ClientError::Storage(_))), "{synced:?}");
++    open_room(&client, &room_id).await.unwrap();
++    client.sync(room_id.clone()).await.unwrap();
++    assert_eq!(client.status(room_id.clone()).await, Ok(status(5, 1, true)));
++    let replica = rows(&storage, &room_id).await;
++    assert_eq!(audit_trimmed(&replica), audit_trimmed(&expected));
++
++    // After the failed sync: the rename of the metadata, then a sync of the directory by the
++    // open of the storage room, then the first write of the WAL with the new version.
++    let log = files.log()[failed_at..].to_vec();
++    let at = |entry: &str| log.iter().position(|logged| logged == entry);
++    let renamed = at("rename room_room-a.meta.tmp room_room-a.meta").expect("renamed");
++    let failed = renamed + 1;
++    assert_eq!(log[failed], format!("sync_dir {dir_name}"));
++    let synced_again = (log.iter().enumerate().skip(failed + 1))
++        .find(|(_, logged)| **logged == format!("sync_dir {dir_name}"))
++        .map(|(index, _)| index)
++        .expect("the directory is synced again");
++    let written = (log.iter().enumerate().skip(failed + 1))
++        .find(|(_, logged)| logged.starts_with("write_at room_room-a.wal"))
++        .map(|(index, _)| index)
++        .expect("the operations of version 2 are written");
++    assert!(synced_again < written, "{log:#?}");
++    drop(server);
++}
++
++/// Audit (INV-C1 in the client, INV-K1, INV-K4): as above, but with the metadata in a directory
++/// of their own, which the API allows ("nothing ties the two in code") and §11 does not:
++/// nothing syncs that directory after the failed sync, so a crash may keep the operations of the
++/// new version in the WAL and lose the rename. The replica then opens with the earlier schema,
++/// narrower than its log, which decides those operations without the `UNIQUE` constraint
++/// (outside the premise of INV-C1, INV-S6, INV-S7): the update the log rejected is applied, the
++/// later update removes the conflict, and the reload to the schema of `Registered` finds no row
++/// that breaks it. The replica holds another state than the log, at its head, without notice.
++/// Fails on 9de2c1b: it shows a Bajo (the durability of a failed save of the metadata rests on
++/// an undocumented sync of the engine).
++#[tokio::test]
++async fn audit_metadata_apart_from_the_engine_diverge_after_a_failed_sync_and_a_crash() {
++    let (data_dir, meta_dir) = (tempdir().unwrap(), tempdir().unwrap());
++    let meta_name = audit_dir_name(meta_dir.path());
++    let files = TestFiles::default();
++    let (server, room_id, client, storage, expected) =
++        audit_failed_sync_setup(data_dir.path(), meta_dir.path(), &files, None).await;
++    let meta_path = meta_dir.path().join("room_room-a.meta");
++    // What the disk holds durably of the metadata: the schema of version 1.
++    let durable = std::fs::read(&meta_path).unwrap();
++    files.fail_next("sync_dir", meta_name);
++    let failed_at = files.log().len();
++    let synced = client.sync(room_id.clone()).await;
++    assert!(matches!(synced, Err(ClientError::Storage(_))), "{synced:?}");
++    open_room(&client, &room_id).await.unwrap();
++    client.sync(room_id.clone()).await.unwrap();
++    let replica = rows(&storage, &room_id).await;
++    assert_eq!(audit_trimmed(&replica), audit_trimmed(&expected));
++    // Nothing synced the directory of the metadata after the failed sync.
++    let synced_meta = format!("sync_dir {meta_name}");
++    let log = files.log()[failed_at..].to_vec();
++    assert_eq!(
++        log.iter().filter(|logged| **logged == synced_meta).count(),
++        1
++    );
++
++    // A crash: the operations of the WAL were synced, the rename of the metadata was not.
++    drop(client);
++    drop(storage);
++    std::fs::write(&meta_path, &durable).unwrap();
++    let storage = zemdb_storage::DiskStorageEngine::new(options(data_dir.path())).unwrap();
++    let client = Client::open(
++        ClientConfig::new("ana"),
++        storage.clone(),
++        FileMetadata::new(meta_dir.path()),
++        server.transport(),
++    )
++    .await
++    .unwrap();
++    open_room(&client, &room_id).await.unwrap();
++    client.sync(room_id.clone()).await.unwrap();
++    let saved = FileMetadata::new(meta_dir.path())
++        .room(&room_id)
++        .await
++        .unwrap();
++    assert_eq!(saved.unwrap().schema, tagged_schema());
++    let status_now = client.status(room_id.clone()).await.unwrap();
++    assert_eq!(
++        (status_now.head_seq.get(), status_now.failed_closed),
++        (5, false)
++    );
++    let replica = rows(&storage, &room_id).await;
++    assert_eq!(
++        audit_trimmed(&replica),
++        audit_trimmed(&expected),
++        "the replica at the head of the log holds another state than the log"
++    );
++}
+diff --git a/crates/client/tests/snapshot_tests.rs b/crates/client/tests/snapshot_tests.rs
+index 9430630..30b3219 100644
+--- a/crates/client/tests/snapshot_tests.rs
++++ b/crates/client/tests/snapshot_tests.rs
+@@ -3,6 +3,13 @@
+ //! the active snapshot of the relay, which the client that the server designates uploads.
+ 
+ mod common;
++// The reference model of the storage's tests, and its generator (audit of sub-phase 4.2).
++#[path = "../../storage/tests/common/oracle.rs"]
++#[allow(dead_code)]
++mod oracle;
++#[path = "../../storage/tests/common/rng.rs"]
++#[allow(dead_code)]
++mod rng;
+ 
+ use common::*;
+ use std::future::Future;
+@@ -2325,3 +2332,113 @@ async fn a_heartbeat_uploads_once_and_two_upload_one_at_a_time() {
+     second.unwrap();
+     assert_eq!(uploaded(&designee.transport), [0, 1, 0]);
+ }
++
++// ---------------------------------------------------------------------------------------------
++// Audit of sub-phase 4.2 (Lote 12, group "Réplica y log")
++
++/// An update of the tag of row `id` of `tasks` of [`tagged_schema`].
++fn audit_update_tag(id: i64, tag: &str) -> Operation {
++    let fields = std::collections::BTreeMap::from([("tag".to_string(), Value::from(tag))]);
++    tagged_schema()
++        .to_operation_update("tasks", PrimaryKey::single(id), &fields, 1000)
++        .unwrap()
++}
++
++/// The rows of the tasks 1 to 12 of `room_id` in `storage`, without the nulls at the end of each.
++async fn audit_rows(
++    storage: &impl StorageEngine,
++    room_id: &RoomId,
++) -> Vec<(u16, Vec<String>, Vec<String>)> {
++    let mut table = std::collections::BTreeMap::new();
++    for id in 1..=12 {
++        let pk = PrimaryKey::single(id);
++        if let Some(row) = storage.get_by_id(room_id, 0, &pk).await.unwrap() {
++            table.insert(pk, row);
++        }
++    }
++    audit_trimmed(&oracle::Rows::from([(0, table)]))
++}
++
++fn audit_trimmed(rows: &oracle::Rows) -> Vec<(u16, Vec<String>, Vec<String>)> {
++    let mut dump = oracle::dump(rows);
++    for (_, _, row) in &mut dump {
++        while row.last().is_some_and(|value| value == "Null") {
++            row.pop();
++        }
++    }
++    dump
++}
++
++/// Audit (INV-K4 through the snapshot that the designated client uploads, INV-C1 and INV-K6 in
++/// the client): a column with `UNIQUE` is added to the schema while the heartbeat of the
++/// designated client (at the head 9 of the version 1) is in flight, at several points of it, and
++/// the log then rejects an update for the new constraint and removes the conflict. The client
++/// behind the pruned log learns the version 2, installs the snapshot uploaded (of either
++/// version) and syncs the rest. Both replicas end at the head of the log with the state of the
++/// reference model that applied the log with the version it was sequenced under.
++#[tokio::test(start_paused = true)]
++async fn audit_a_snapshot_uploaded_while_a_column_is_added_converges_with_the_log() {
++    for delay in [0u64, 1, 2, 3, 4, 5, 6, 8, 10, 13] {
++        let (server, room_id, mut log, designee, lagging) = designated_with(
++            "room-a",
++            ("tasks", tasks_schema()),
++            (1..=9).map(insert_task),
++        )
++        .await;
++        designee.transport.slow(Duration::from_millis(3));
++        let evolve = async {
++            tokio::time::sleep(Duration::from_millis(delay)).await;
++            let registry = &server.state.schema_registry;
++            let tag = ColumnDef::new("tag", DataType::String).nullable(true);
++            let unique = UniqueConstraint::new("tasks_tag", ["tag"]);
++            let tasks_id = SchemaId::new("tasks").unwrap();
++            let added =
++                registry.add_column_with_constraints(&tasks_id, "tasks", tag, vec![unique], vec![]);
++            added.unwrap();
++            let manager = &server.state.room_manager;
++            manager.reload_schema_for_rooms(&tasks_id).await;
++            let ops = [
++                audit_update_tag(1, "a"),
++                audit_update_tag(2, "a"),
++                audit_update_tag(1, "b"),
++                insert_tagged(10, "c"),
++            ];
++            server.commit_ops(&room_id, ops).await
++        };
++        let (_, tagged) = tokio::join!(designee.client.heartbeat(room_id.clone()), evolve);
++        log.extend(tagged);
++        designee.transport.slow(Duration::ZERO);
++        let mut caught_up = false;
++        for _ in 0..10 {
++            let _ = designee.client.heartbeat(room_id.clone()).await;
++            let _ = lagging.client.heartbeat(room_id.clone()).await;
++            if lagging.client.sync(room_id.clone()).await.is_ok() {
++                caught_up = true;
++                break;
++            }
++            tokio::time::sleep(Duration::from_secs(1)).await;
++        }
++        assert!(caught_up, "{delay}: the client behind the log catches up");
++        designee.client.sync(room_id.clone()).await.unwrap();
++        let mut reference = oracle::Oracle::new(tasks_schema());
++        reference.apply_batch(&log[..9]);
++        reference.evolve(tagged_schema());
++        let rejected = reference.apply_batch(&log[9..]);
++        assert_eq!(rejected.len(), 1, "{delay}");
++        let expected = audit_trimmed(reference.rows());
++        for (name, member) in [("designee", &designee), ("lagging", &lagging)] {
++            let status_now = member.client.status(room_id.clone()).await.unwrap();
++            assert_eq!(status_now.head_seq.get(), 13, "{delay}: {name}");
++            let replica = audit_rows(&member.storage, &room_id).await;
++            assert_eq!(replica, expected, "{delay}: {name}");
++        }
++        assert!(
++            !chunks(&lagging.transport).is_empty(),
++            "{delay}: downloaded"
++        );
++        assert!(
++            !uploads(&designee.transport).is_empty(),
++            "{delay}: uploaded"
++        );
++    }
++}
+diff --git a/crates/client/tests/sync_tests.rs b/crates/client/tests/sync_tests.rs
+index 96aa91e..db1e56d 100644
+--- a/crates/client/tests/sync_tests.rs
++++ b/crates/client/tests/sync_tests.rs
+@@ -1067,3 +1067,188 @@ async fn a_sync_cut_at_any_point_leaves_a_head_the_applier_reached_whole() {
+         }
+     }
+ }
++
++// ---------------------------------------------------------------------------------------------
++// Audit of sub-phase 4.2 (Lote 12, group "Réplica y log")
++
++/// Audit (INV-K1, the epoch of the replica): a batch of the old room, asked for at head 0 before
++/// the room is created again, arrives once the room was closed and opened again with its
++/// metadata damaged meanwhile (a bit flipped), which discarded the replica and registered it in
++/// the new room. The batch follows the head of the new, empty replica, and is not applied: the
++/// replica holds only what the new room logged.
++#[tokio::test]
++async fn audit_a_batch_held_across_a_discard_for_damaged_metadata_is_not_applied() {
++    let dir = tempdir().unwrap();
++    let (server, room_id, transport, storage, client) = setup(dir.path(), engine(dir.path())).await;
++    server.commit(&room_id, 1..=3).await;
++    let mut held = transport.hold_next_reply(Sync);
++    let late = client.sync(room_id.clone());
++    let meanwhile = async {
++        held.replied().await;
++        server.recreate_room(&room_id).await;
++        server.commit(&room_id, 7..=8).await;
++        client.close_room(room_id.clone()).await.unwrap();
++        let path = dir.path().join("room_room-a.meta");
++        let mut bytes = std::fs::read(&path).unwrap();
++        bytes[5] ^= 0x04;
++        std::fs::write(&path, bytes).unwrap();
++        open_room(&client, &room_id).await.unwrap();
++        // Discarded once more, and registered without a cursor in the new room.
++        assert_eq!(client.status(room_id.clone()).await, Ok(status(0, 2, true)));
++        held.release();
++    };
++    let (late, ()) = tokio::join!(late, meanwhile);
++    late.unwrap();
++    assert_eq!(tasks(&storage, &room_id).await, [7, 8]);
++    assert_eq!(client.status(room_id.clone()).await, Ok(status(2, 2, true)));
++    assert_eq!(transport.registrations(), [(None, None), (None, None)]);
++    let saved = FileMetadata::new(dir.path()).room(&room_id).await.unwrap();
++    assert_eq!(
++        saved.unwrap().room_incarnation,
++        server.incarnation(&room_id).await
++    );
++}
++
++/// A transport that checks every cursor a request presents as it leaves the client (INV-K5): a
++/// registration's, a sync's, an ack's and a commit's are never above the head of the storage
++/// room of the replica, and a registration's goes with the incarnation of its metadata.
++#[derive(Debug, Clone)]
++struct AuditCursors {
++    inner: TestTransport,
++    storage: DiskStorageEngine,
++    dir: std::path::PathBuf,
++    room: RoomId,
++    checked: Arc<std::sync::atomic::AtomicUsize>,
++}
++
++#[async_trait::async_trait]
++impl zemdb_client::TransportClient for AuditCursors {
++    async fn send(
++        &self,
++        message: &ClientMessage,
++        token: &str,
++    ) -> Result<Vec<u8>, zemdb_client::TransportError> {
++        let presented = match message {
++            ClientMessage::RegisterClient {
++                current_seq,
++                known_incarnation,
++                ..
++            } => {
++                assert_eq!(current_seq.is_some(), known_incarnation.is_some());
++                if let Some(known) = known_incarnation {
++                    let saved = FileMetadata::new(&self.dir).room(&self.room).await.unwrap();
++                    let saved = saved.map(|saved| saved.room_incarnation);
++                    assert_eq!(saved, Some(*known), "A cursor of another incarnation");
++                }
++                *current_seq
++            }
++            ClientMessage::Sync { from_seq, .. } => Some(*from_seq),
++            ClientMessage::Ack { ack_seq, .. } => Some(*ack_seq),
++            ClientMessage::Commit { last_ack_seq, .. } => Some(*last_ack_seq),
++            _ => None,
++        };
++        if let Some(cursor) = presented {
++            // A storage room closed meanwhile (a reopen) has no head to compare with.
++            if let Ok(head) = self.storage.get_head_seq(&self.room).await {
++                assert!(
++                    cursor <= head,
++                    "{message:?} presents {cursor:?} above {head:?}"
++                );
++                self.checked
++                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++            }
++        }
++        self.inner.send(message, token).await
++    }
++}
++
++/// Audit (INV-K5): syncs, writes, heartbeats, reopens of the room and opens with a new token run
++/// at once on one client over a disk engine, while another client commits, the room's actor is
++/// shut down (its roster comes back from disk, and the client may have to register again with
++/// its cursor) and replies are lost or delayed. No request ever presents a cursor above the head
++/// of the replica, nor a registration one of another incarnation, and the replica ends with the
++/// log.
++#[tokio::test(start_paused = true)]
++async fn audit_no_request_presents_a_cursor_above_the_head_of_the_replica() {
++    let server = TestServer::new();
++    let room_id = server.create_room("room-a").await;
++    let dir = tempdir().unwrap();
++    let storage = engine(dir.path());
++    let inner = server.transport();
++    let checked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
++    let transport = AuditCursors {
++        inner: inner.clone(),
++        storage: storage.clone(),
++        dir: dir.path().to_path_buf(),
++        room: room_id.clone(),
++        checked: Arc::clone(&checked),
++    };
++    let client = Client::open(
++        ClientConfig::new("ana"),
++        storage.clone(),
++        FileMetadata::new(dir.path()),
++        transport,
++    )
++    .await
++    .unwrap();
++    open_room(&client, &room_id).await.unwrap();
++    let mut seed: u64 = 0x4_2_12;
++    let mut next = move |n: u64| {
++        seed = seed
++            .wrapping_mul(6364136223846793005)
++            .wrapping_add(1442695040888963407);
++        (seed >> 33) % n
++    };
++    let mut id = 0;
++    for round in 0..60 {
++        inner.slow(Duration::from_millis(next(8)));
++        match next(6) {
++            0 => inner.lose_next_reply(ClientMessageKind::Ack),
++            1 => inner.lose_next_reply(ClientMessageKind::Commit),
++            2 => inner.lose_next_reply(ClientMessageKind::Sync),
++            3 => inner.slow_next(ClientMessageKind::RegisterClient, Duration::from_millis(5)),
++            _ => {}
++        }
++        let room = || room_id.clone();
++        let call = |kind: u64, id: i64| {
++            let client = &client;
++            let room = room();
++            async move {
++                let _ = match kind {
++                    0 | 1 => client.write(room, insert_task(id % 9 + 1)).await,
++                    2 => client.sync(room).await,
++                    3 => client.heartbeat(room).await,
++                    4 => {
++                        let _ = client.close_room(room.clone()).await;
++                        open_room(client, &room).await
++                    }
++                    _ => open_room(client, &room).await,
++                };
++            }
++        };
++        let (a, b, c) = (next(6), next(6), next(6));
++        id += 3;
++        let others = async {
++            if round % 3 == 0 {
++                server.commit(&room_id, [id % 9 + 1]).await;
++            }
++            if round % 7 == 3 {
++                server.state.room_manager.shutdown_room(&room_id).await;
++            }
++        };
++        tokio::join!(call(a, id), call(b, id + 1), call(c, id + 2), others);
++        inner.settled().await;
++    }
++    inner.slow(Duration::ZERO);
++    let _ = open_room(&client, &room_id).await;
++    client.sync(room_id.clone()).await.unwrap();
++    let head = server
++        .state
++        .room_manager
++        .log_bounds(&room_id)
++        .await
++        .unwrap();
++    let status_now = client.status(room_id.clone()).await.unwrap();
++    assert_eq!(status_now.head_seq, head.head_seq);
++    assert!(checked.load(std::sync::atomic::Ordering::SeqCst) > 100);
++}

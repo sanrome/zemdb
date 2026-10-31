@@ -1,0 +1,211 @@
+diff --git a/crates/client/tests/review_error_tests.rs b/crates/client/tests/review_error_tests.rs
+new file mode 100644
+index 0000000..3488107
+--- /dev/null
++++ b/crates/client/tests/review_error_tests.rs
+@@ -0,0 +1,78 @@
++//! Review of Lote 12, round 2: an error without a correlation id or a room in place of a reply.
++
++mod common;
++
++use async_trait::async_trait;
++use common::*;
++use std::sync::{Arc, Mutex};
++use tempfile::tempdir;
++use zemdb_client::{
++    Client, ClientConfig, ClientError, FileMetadata, TransportClient, TransportError,
++};
++use zemdb_core::*;
++
++/// The transport of the server, which puts `SchemaViolation` without a correlation id or a room
++/// in place of the server's reply to the next commit, once the server handled it.
++#[derive(Debug, Clone)]
++struct Tamper {
++    inner: TestTransport,
++    armed: Arc<Mutex<bool>>,
++}
++
++#[async_trait]
++impl TransportClient for Tamper {
++    async fn send(&self, message: &ClientMessage, token: &str) -> Result<Vec<u8>, TransportError> {
++        let reply = self.inner.send(message, token).await?;
++        let mut armed = self.armed.lock().unwrap();
++        if matches!(message, ClientMessage::Commit { .. }) && std::mem::take(&mut *armed) {
++            let error = ServerMessage::Error {
++                correlation_id: None,
++                room_id: None,
++                code: ErrorCode::SchemaViolation,
++                message: String::new(),
++            };
++            return Ok(encode_message(&error).unwrap());
++        }
++        Ok(reply)
++    }
++}
++
++#[tokio::test(start_paused = true)]
++async fn review_an_error_without_correlation_ends_a_sequenced_write_as_refused() {
++    let server = TestServer::new();
++    let room_id = server.create_room("room-a").await;
++    let dir = tempdir().unwrap();
++    let tamper = Tamper {
++        inner: server.transport(),
++        armed: Arc::default(),
++    };
++    let storage = engine(dir.path());
++    let client = Client::open(
++        ClientConfig::new("ana"),
++        storage.clone(),
++        FileMetadata::new(dir.path()),
++        tamper.clone(),
++    )
++    .await
++    .unwrap();
++    open_room(&client, &room_id).await.unwrap();
++
++    *tamper.armed.lock().unwrap() = true;
++    let written = client.write(room_id.clone(), insert_task(1)).await;
++    assert!(
++        matches!(written, Err(ClientError::Validation(_))),
++        "{written:?}"
++    );
++
++    // The server sequenced it, and the replica applies it.
++    let bounds = server
++        .state
++        .room_manager
++        .log_bounds(&room_id)
++        .await
++        .unwrap();
++    assert_eq!(bounds.head_seq.get(), 1);
++    client.sync(room_id.clone()).await.unwrap();
++    assert_eq!(tasks(&storage, &room_id).await, [1]);
++    client.shutdown().await.unwrap();
++}
+diff --git a/crates/client/tests/review_tail_tests.rs b/crates/client/tests/review_tail_tests.rs
+new file mode 100644
+index 0000000..ac63c42
+--- /dev/null
++++ b/crates/client/tests/review_tail_tests.rs
+@@ -0,0 +1,121 @@
++//! Review of Lote 12: a `Registered` that answers its registration but carries another tail.
++
++mod common;
++
++use async_trait::async_trait;
++use common::*;
++use std::sync::{Arc, Mutex};
++use std::time::Duration;
++use tempfile::tempdir;
++use zemdb_client::{
++    Client, ClientConfig, ClientError, FileMetadata, TransportClient, TransportError,
++};
++use zemdb_core::*;
++
++/// The transport of the server, which changes the tail of the next `Registered` it carries.
++#[derive(Debug, Clone)]
++struct Tamper {
++    inner: TestTransport,
++    tail: Arc<Mutex<Option<u64>>>,
++}
++
++#[async_trait]
++impl TransportClient for Tamper {
++    async fn send(&self, message: &ClientMessage, token: &str) -> Result<Vec<u8>, TransportError> {
++        let reply = self.inner.send(message, token).await?;
++        let decoded = decode_message::<ServerMessage>(&reply);
++        let mut tail = self.tail.lock().unwrap();
++        match (decoded, *tail) {
++            (
++                Ok(ServerMessage::Registered {
++                    correlation_id,
++                    room_id,
++                    head_seq,
++                    schema_id,
++                    schema,
++                    active_snapshot_seq,
++                    room_incarnation,
++                    ..
++                }),
++                Some(damaged),
++            ) => {
++                *tail = None;
++                let damaged = ServerMessage::Registered {
++                    correlation_id,
++                    room_id,
++                    head_seq,
++                    tail_seq: SequenceNumber::new(damaged),
++                    schema_id,
++                    schema,
++                    active_snapshot_seq,
++                    room_incarnation,
++                };
++                Ok(encode_message(&damaged).unwrap())
++            }
++            _ => Ok(reply),
++        }
++    }
++}
++
++#[tokio::test(start_paused = true)]
++async fn review_a_damaged_tail_in_registered_leaves_the_replica_waiting_until_it_reopens() {
++    let server = TestServer::new();
++    let room_id = server.create_room("room-a").await;
++    server.commit(&room_id, 1..=3).await;
++    let dir = tempdir().unwrap();
++    let tamper = Tamper {
++        inner: server.transport(),
++        tail: Arc::default(),
++    };
++    let storage = engine(dir.path());
++    let client = Client::open(
++        ClientConfig::new("ana"),
++        storage.clone(),
++        FileMetadata::new(dir.path()),
++        tamper.clone(),
++    )
++    .await
++    .unwrap();
++    open_room(&client, &room_id).await.unwrap();
++    client.sync(room_id.clone()).await.unwrap();
++    assert_eq!(
++        client.status(room_id.clone()).await.unwrap().head_seq.get(),
++        3
++    );
++
++    // The next registration gets the server's `Registered` (head 6) with only its tail
++    // changed, to one the server could have: 5, as if it had pruned up to it.
++    client.close_room(room_id.clone()).await.unwrap();
++    server.commit(&room_id, 4..=6).await;
++    *tamper.tail.lock().unwrap() = Some(5);
++    open_room(&client, &room_id).await.unwrap();
++
++    // What the worker of 4.3 would do: syncs and heartbeats, for 10 minutes.
++    for round in 0..20 {
++        let synced = client.sync(room_id.clone()).await;
++        assert!(
++            matches!(synced, Err(ClientError::Network(_))),
++            "{round}: {synced:?}"
++        );
++        client.heartbeat(room_id.clone()).await.unwrap();
++        tokio::time::sleep(Duration::from_secs(30)).await;
++    }
++    let status = client.status(room_id.clone()).await.unwrap();
++    assert_eq!((status.head_seq.get(), status.registered), (3, true));
++    let written = client.write(room_id.clone(), insert_task(7)).await;
++    assert!(
++        matches!(written, Err(ClientError::Network(_))),
++        "{written:?}"
++    );
++    assert_eq!(tasks(&storage, &room_id).await, [1, 2, 3]);
++
++    // Only closing the room and opening it again gets it out.
++    client.close_room(room_id.clone()).await.unwrap();
++    open_room(&client, &room_id).await.unwrap();
++    client.sync(room_id.clone()).await.unwrap();
++    assert_eq!(
++        client.status(room_id.clone()).await.unwrap().head_seq.get(),
++        6
++    );
++    client.shutdown().await.unwrap();
++}

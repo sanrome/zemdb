@@ -1,9 +1,9 @@
 # ROADMAP.md: Hoja de Ruta de ZemDB
 
 **Proyecto:** `ZemDB` (Motor de Base de Datos Distribuida Local-First)  
-**Fecha de Actualización:** 27 de Octubre de 2026  
+**Fecha de Actualización:** 31 de Octubre de 2026  
 **Documentos Relacionados:** [README.md](README.md) | [ARCHITECTURE.md](ARCHITECTURE.md) | [Invariantes](docs/INVARIANTES.md) | [Metodología](docs/METODOLOGIA.md) | [Plan Fase 4](docs/proposals/2026-10-fase4-plan.md)  
-**Estado:** Fases 1 a 3.11 Completadas / Fase 4 En curso (sub-fases 4.0 y 4.1 cerradas, 4.2 en curso) / Fase 5 Pendiente
+**Estado:** Fases 1 a 3.11 Completadas / Fase 4 En curso (sub-fases 4.0, 4.1 y 4.2 cerradas) / Fase 5 Pendiente
 
 Este documento es el índice de fases y el backlog para después de la v0.1. Lo que construye cada fase, en qué orden y cómo se audita vive en su plan (`docs/METODOLOGIA.md` §1); el estado vigente del sistema, en [`ARCHITECTURE.md`](ARCHITECTURE.md), y sus garantías, en [`docs/INVARIANTES.md`](docs/INVARIANTES.md). La historia de cada cambio está en los planes y en `git log`.
 
@@ -22,10 +22,10 @@ Este documento es el índice de fases y el backlog para después de la v0.1. Lo 
 | 3.9 | Primera auditoría por invariantes y su remediación | ✅ Completada | [Plan](docs/proposals/2026-10-fase3_9-remediation-plan.md) |
 | 3.10 | Segunda auditoría por invariantes; cierre por revisión del delta (D90) | ✅ Completada | [Plan](docs/proposals/2026-10-fase3_10-remediation-plan.md) |
 | 3.11 | Restricciones de integridad verificadas por las réplicas y dueño de fila | ✅ Completada | [Propuesta](docs/proposals/2026-10-fase3_11-restricciones-proposal.md) |
-| 4 | `zemdb-client`: SDK nativo en Rust y API de JavaScript para el navegador | ⏳ En curso | [Plan](docs/proposals/2026-10-fase4-plan.md), [4.1](docs/proposals/2026-10-fase4_1-storage-servidor.md), [4.2](docs/proposals/2026-10-fase4_2-nucleo-replica.md) |
+| 4 | `zemdb-client`: SDK nativo en Rust y API de JavaScript para el navegador | ⏳ En curso | [Plan](docs/proposals/2026-10-fase4-plan.md), [4.1](docs/proposals/2026-10-fase4_1-storage-servidor.md), [4.2](docs/proposals/2026-10-fase4_2-nucleo-replica.md), [auditoría del SDK](docs/audits/2026-10-fase4_2-audit/README.md) |
 | 5 | Pruebas de integración de extremo a extremo (§2) | ⏳ Pendiente | — |
 
-**Lo que sigue:** la sub-fase 4.2 del [plan de la Fase 4](docs/proposals/2026-10-fase4-plan.md), el núcleo de la réplica contra un transporte abstracto, en curso con su [plan por lotes](docs/proposals/2026-10-fase4_2-nucleo-replica.md); cierra con la auditoría amplia del SDK (DC3). La 4.1, lo que el SDK necesita de `zemdb-core`, `zemdb-storage` y `zemdb-server`, cerró el 25 de Octubre de 2026 ([plan](docs/proposals/2026-10-fase4_1-storage-servidor.md)).
+**Lo que sigue:** las sub-fases 4.3 (el transporte nativo y el `SyncWorker`) y 4.4 (la API de Rust) del [plan de la Fase 4](docs/proposals/2026-10-fase4-plan.md), que dependen solo de 4.2 y pueden ir en paralelo, cada una con su plan por lotes y su revisión de cierre. La 4.2, el núcleo de la réplica contra un transporte abstracto, cerró el 31 de Octubre de 2026 con la auditoría amplia del SDK en verde ([plan](docs/proposals/2026-10-fase4_2-nucleo-replica.md), [informe](docs/audits/2026-10-fase4_2-audit/README.md)). La 4.1, lo que el SDK necesita de `zemdb-core`, `zemdb-storage` y `zemdb-server`, cerró el 25 de Octubre de 2026 ([plan](docs/proposals/2026-10-fase4_1-storage-servidor.md)).
 
 ---
 

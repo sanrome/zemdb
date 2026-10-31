@@ -935,9 +935,12 @@ impl Client {
     /// `BehindCompaction`, or `Registered` behind the log, the replica waits for a snapshot: the
     /// write catches up with heartbeats ([`heartbeat`](Self::heartbeat)) until it installs one,
     /// and sends nothing meanwhile. `SchemaViolation`,
-    /// `BadRequest` and `Forbidden` are `Validation`, and any other error, the deadline, or the
-    /// room closed, discarded or failing closed end it with `Network`: without an uncertain
-    /// attempt, the write had no effect.
+    /// `BadRequest` and `Forbidden` are `Validation`, and any other error of the server or the
+    /// deadline end it with `Network`. Closing the room, discarding its replica or failing it
+    /// closed ends it with `Network`, or as `OutcomeUnknown` after an uncertain attempt or once
+    /// its `CommitAck` comes, also one that comes after. An error of the client (`RoomClosed` or
+    /// `FailedClosed` before it enters its room, `Storage` or `Config`) ends it with that error.
+    /// Without an uncertain attempt or a `CommitAck`, the write had no effect.
     ///
     /// A `CommitAck` is checked before it is used: its correlation id, its room, its mutation
     /// id, and a catch-up that follows the cursor of the commit in order and, unless it has

@@ -1,0 +1,1320 @@
+diff --git a/crates/client/tests/audit_recuperacion_tests.rs b/crates/client/tests/audit_recuperacion_tests.rs
+new file mode 100644
+index 0000000..2bd652c
+--- /dev/null
++++ b/crates/client/tests/audit_recuperacion_tests.rs
+@@ -0,0 +1,1215 @@
++//! Audit of the client SDK that closes sub-phase 4.2 (Lote 12), group "Recuperación y robustez"
++//! (INV-K3, K7, K12, S8, R6): tests of the paths that the suite and the simulation leave out.
++//!
++//! - A crash between any two changes of the files of a client over a disk engine (the files fail
++//!   from the `k`-th change on, as a process that died there, and the client opens again over the
++//!   same directory): during a sync with a schema change and a compaction, during the install of
++//!   the snapshot of another member, and during a discard after the room was created again with
++//!   its registration and its new metadata. The simulation crashes a client by dropping it, while
++//!   the tasks it left run to their end, so it never cuts a change of the replica halfway.
++//! - Fuzzed replies to the chunks of a download in two chunks, which the fuzzing of the
++//!   simulation (Lote 11) never produces: it only takes downloads that fit in one chunk.
++//! - Fuzzed replies to everything but a registration, under which no replica is discarded: the
++//!   simulation does not check the discards when it fuzzes.
++//! - The upload of a client of the old incarnation into a room created again whose retained log
++//!   admits its sequence, where only the incarnation of the chunks stops it.
++//! - Two behaviors shown as they are: a chunk after the first that announces more than the limit
++//!   is `Config`, and a head announced beyond the server's makes every later write of the room
++//!   an unknown outcome until it closes.
++
++mod common;
++#[path = "../../core/tests/common/mod.rs"]
++mod generators;
++
++use async_trait::async_trait;
++use common::*;
++use std::io;
++use std::path::{Path, PathBuf};
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex, Once};
++use std::time::Duration;
++use tempfile::tempdir;
++use zemdb_client::{
++    Client, ClientConfig, ClientError, FileMetadata, MetadataStore, TransportClient,
++};
++use zemdb_core::protocol::PROTOCOL_MAGIC;
++use zemdb_core::*;
++use zemdb_storage::files::{NativeFile, NativeFiles, RoomFile, RoomFiles};
++use zemdb_storage::{DiskStorageEngine, MemoryStorageEngine, StorageEngine};
++
++// ---------------------------------------------------------------------------------------------
++// A file layer that crashes
++
++/// The file system of the process, where every operation fails once `k` operations that change
++/// the files landed after [`arm`](Self::arm): what a process that died at that point leaves.
++#[derive(Debug, Clone, Default)]
++struct CrashFiles {
++    /// How many more changes land, once armed.
++    budget: Arc<Mutex<Option<usize>>>,
++    crashed: Arc<AtomicBool>,
++}
++
++impl CrashFiles {
++    fn arm(&self, changes: usize) {
++        *self.budget.lock().unwrap() = Some(changes);
++    }
++
++    fn crashed(&self) -> bool {
++        self.crashed.load(Ordering::SeqCst)
++    }
++
++    /// Fails once the process crashed; a change, also once the budget is spent.
++    fn check(&self, changes: bool) -> io::Result<()> {
++        let crashed = || io::Error::other("the process crashed");
++        if self.crashed() {
++            return Err(crashed());
++        }
++        match self.budget.lock().unwrap().as_mut() {
++            Some(0) if changes => {
++                self.crashed.store(true, Ordering::SeqCst);
++                Err(crashed())
++            }
++            Some(left) if changes => {
++                *left -= 1;
++                Ok(())
++            }
++            _ => Ok(()),
++        }
++    }
++
++    fn file(&self, file: NativeFile) -> CrashFile {
++        CrashFile {
++            file,
++            files: self.clone(),
++        }
++    }
++}
++
++#[derive(Debug)]
++struct CrashFile {
++    file: NativeFile,
++    files: CrashFiles,
++}
++
++#[async_trait]
++impl RoomFiles for CrashFiles {
++    type File = CrashFile;
++
++    async fn open_locked(&self, path: &Path) -> io::Result<Option<CrashFile>> {
++        self.check(true)?;
++        let file = NativeFiles.open_locked(path).await?;
++        Ok(file.map(|file| self.file(file)))
++    }
++
++    async fn create_locked(&self, path: &Path) -> io::Result<Option<CrashFile>> {
++        self.check(true)?;
++        let file = NativeFiles.create_locked(path).await?;
++        Ok(file.map(|file| self.file(file)))
++    }
++
++    async fn create(&self, path: &Path) -> io::Result<CrashFile> {
++        self.check(true)?;
++        Ok(self.file(NativeFiles.create(path).await?))
++    }
++
++    async fn open_read(&self, path: &Path) -> io::Result<CrashFile> {
++        self.check(false)?;
++        Ok(self.file(NativeFiles.open_read(path).await?))
++    }
++
++    async fn exists(&self, path: &Path) -> io::Result<bool> {
++        self.check(false)?;
++        NativeFiles.exists(path).await
++    }
++
++    async fn list(&self, dir: &Path, prefix: &str) -> io::Result<Vec<PathBuf>> {
++        self.check(false)?;
++        NativeFiles.list(dir, prefix).await
++    }
++
++    async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
++        self.check(true)?;
++        NativeFiles.rename(from, to).await
++    }
++
++    async fn remove(&self, path: &Path) -> io::Result<()> {
++        self.check(true)?;
++        NativeFiles.remove(path).await
++    }
++
++    async fn create_dir_all(&self, path: &Path) -> io::Result<()> {
++        self.check(true)?;
++        NativeFiles.create_dir_all(path).await
++    }
++
++    async fn sync_dir(&self, dir: &Path) -> io::Result<()> {
++        self.check(true)?;
++        NativeFiles.sync_dir(dir).await
++    }
++}
++
++#[async_trait]
++impl RoomFile for CrashFile {
++    async fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
++        self.files.check(false)?;
++        self.file.read_at(offset, len).await
++    }
++
++    async fn write_at(&self, offset: u64, bytes: Vec<u8>) -> io::Result<()> {
++        self.files.check(true)?;
++        self.file.write_at(offset, bytes).await
++    }
++
++    async fn size(&self) -> io::Result<u64> {
++        self.files.check(false)?;
++        self.file.size().await
++    }
++
++    async fn set_len(&self, len: u64) -> io::Result<()> {
++        self.files.check(true)?;
++        self.file.set_len(len).await
++    }
++
++    async fn sync_data(&self) -> io::Result<()> {
++        self.files.check(true)?;
++        self.file.sync_data().await
++    }
++
++    async fn sync_all(&self) -> io::Result<()> {
++        self.files.check(true)?;
++        self.file.sync_all().await
++    }
++
++    async fn rename(&mut self, to: &Path) -> io::Result<()> {
++        self.files.check(true)?;
++        self.file.rename(to).await
++    }
++}
++
++/// A client of ana over a disk engine in `dir` whose engine and metadata go through `files`.
++async fn crashing_client(
++    dir: &Path,
++    files: &CrashFiles,
++    transport: &TestTransport,
++) -> (DiskStorageEngine<CrashFiles>, Client) {
++    let storage = DiskStorageEngine::with_files(options(dir), files.clone()).unwrap();
++    let metadata = FileMetadata::with_files(dir, files.clone());
++    let client = Client::open(
++        ClientConfig::new("ana"),
++        storage.clone(),
++        metadata,
++        transport.clone(),
++    );
++    (storage, client.await.unwrap())
++}
++
++/// The client opened again over `dir` after a crash, on the file system of the process: the
++/// crashed one may hold its files until the tasks it left end.
++async fn reopened(dir: &Path, transport: &TestTransport) -> (DiskStorageEngine, Client) {
++    for _ in 0..200 {
++        let storage = engine(dir);
++        let metadata = FileMetadata::new(dir);
++        let client = Client::open(
++            ClientConfig::new("ana"),
++            storage.clone(),
++            metadata,
++            transport.clone(),
++        );
++        if let Ok(client) = client.await {
++            return (storage, client);
++        }
++        tokio::time::sleep(Duration::from_millis(10)).await;
++    }
++    panic!("the crashed client holds its metadata");
++}
++
++/// The tasks `1..=head`: the rows of the log of a room of [`TestServer::commit`] up to `head`.
++fn up_to(head: u64) -> Vec<i64> {
++    (1..=head as i64).collect()
++}
++
++fn tasks_id() -> SchemaId {
++    SchemaId::new("tasks").unwrap()
++}
++
++/// [`tasks_schema`] with the nullable string column `tag`, unique: its version 2.
++fn tagged_schema() -> Schema {
++    let mut schema = tasks_schema();
++    let tag = ColumnDef::new("tag", DataType::String).nullable(true);
++    let unique = UniqueConstraint::new("tasks_tag", ["tag"]);
++    schema
++        .add_column_with_constraints("tasks", tag, vec![unique], vec![])
++        .unwrap();
++    schema
++}
++
++/// Adds to the schema `tasks` of `server` the column of [`tagged_schema`], and reloads it in its
++/// rooms.
++async fn add_tag_column(server: &TestServer) {
++    let tag = ColumnDef::new("tag", DataType::String).nullable(true);
++    let unique = UniqueConstraint::new("tasks_tag", ["tag"]);
++    let registry = &server.state.schema_registry;
++    let added =
++        registry.add_column_with_constraints(&tasks_id(), "tasks", tag, vec![unique], vec![]);
++    added.unwrap();
++    let manager = &server.state.room_manager;
++    manager.reload_schema_for_rooms(&tasks_id()).await;
++}
++
++/// An insert of row `id` with `tag` into `tasks` of [`tagged_schema`].
++fn insert_tagged(id: i64, tag: &str) -> Operation {
++    let row = RowBuilder::new()
++        .set("id", id)
++        .set("title", "task")
++        .set("tag", tag)
++        .build();
++    tagged_schema()
++        .to_operation_insert("tasks", &row, 1000)
++        .unwrap()
++}
++
++// ---------------------------------------------------------------------------------------------
++// INV-K3: a crash never makes the client discard a healthy replica
++
++/// A crash at any point of a sync that takes a new version of the schema (saved in the metadata
++/// and reloaded) and applies batches, of a compaction of the storage room, and of another sync,
++/// never leaves files that the next open discards: the replica opens with its metadata, at a
++/// prefix of the log, in epoch 0, and catches up.
++#[tokio::test(start_paused = true)]
++async fn audit_k3_a_crash_at_any_point_of_a_sync_a_schema_change_or_a_compaction_keeps_the_replica()
++{
++    let mut points = None;
++    for k in 0..400 {
++        let server = TestServer::new();
++        let room_id = server.create_room("room-a").await;
++        let transport = server.transport();
++        transport.sync_batch_size(2);
++        let dir = tempdir().unwrap();
++        let files = CrashFiles::default();
++        let (storage, client) = crashing_client(dir.path(), &files, &transport).await;
++        open_room(&client, &room_id).await.unwrap();
++        server.commit(&room_id, 1..=3).await;
++        client.sync(room_id.clone()).await.unwrap();
++        let incarnation = server.incarnation(&room_id).await;
++        server.commit(&room_id, 4..=5).await;
++        add_tag_column(&server).await;
++        server.commit_ops(&room_id, [insert_tagged(6, "x")]).await;
++        server.commit(&room_id, [7]).await;
++
++        files.arm(k);
++        let committed = AtomicBool::new(false);
++        let ran = async {
++            let err = |err: &dyn std::fmt::Debug| format!("{err:?}");
++            client.sync(room_id.clone()).await.map_err(|e| err(&e))?;
++            storage.compact_room(&room_id).await.map_err(|e| err(&e))?;
++            server.commit(&room_id, 8..=9).await;
++            committed.store(true, Ordering::SeqCst);
++            client.sync(room_id.clone()).await.map_err(|e| err(&e))
++        };
++        let ran = ran.await;
++        let crashed = files.crashed();
++        assert!(ran.is_ok() || crashed, "{k}: {ran:?}");
++        drop((client, storage));
++        transport.settled().await;
++        if !committed.load(Ordering::SeqCst) {
++            server.commit(&room_id, 8..=9).await;
++        }
++
++        let (storage, client) = reopened(dir.path(), &transport).await;
++        open_room(&client, &room_id).await.unwrap();
++        let status = client.status(room_id.clone()).await.unwrap();
++        assert_eq!(
++            status.epoch, 0,
++            "{k}: the crash made the client discard the replica"
++        );
++        let head = status.head_seq.get();
++        assert_eq!(tasks(&storage, &room_id).await, up_to(head), "{k}");
++        let saved = FileMetadata::new(dir.path()).room(&room_id).await.unwrap();
++        assert_eq!(saved.unwrap().room_incarnation, incarnation, "{k}");
++        client.sync(room_id.clone()).await.unwrap();
++        assert_eq!(tasks(&storage, &room_id).await, up_to(9), "{k}");
++        let status = client.status(room_id.clone()).await.unwrap();
++        assert_eq!((status.epoch, status.failed_closed), (0, false), "{k}");
++        client.shutdown().await.unwrap();
++        if !crashed {
++            points = Some(k);
++            break;
++        }
++    }
++    let points = points.expect("the scenario ends");
++    eprintln!("{points} crash points");
++    assert!(points >= 20, "only {points} crash points");
++}
++
++/// A crash at any point of the install of the snapshot of another member (its staging, its
++/// rename, the WAL emptied) and of the sync that follows never leaves files that the next open
++/// discards: the replica opens with the metadata it had, at 0 or at a prefix of the log from the
++/// snapshot, in epoch 0, and catches up.
++#[tokio::test(start_paused = true)]
++async fn audit_k3_a_crash_at_any_point_of_installing_a_snapshot_of_another_member_keeps_the_replica(
++) {
++    let mut points = None;
++    for k in 0..400 {
++        let server = TestServer::pruning();
++        let room_id = server.create_room("room-a").await;
++        let ops = server.commit(&room_id, 1..=9).await;
++        server.prune(&room_id, 6).await;
++        let seven = snapshot(&room_id, tasks_schema(), &ops[..7]).await;
++        server.upload(&room_id, 7, seven).await;
++        let transport = server.transport();
++        let dir = tempdir().unwrap();
++        let files = CrashFiles::default();
++        let (storage, client) = crashing_client(dir.path(), &files, &transport).await;
++        // Behind the log, it waits for the snapshot.
++        open_room(&client, &room_id).await.unwrap();
++        let incarnation = server.incarnation(&room_id).await;
++
++        files.arm(k);
++        let ran = client.sync(room_id.clone()).await;
++        let crashed = files.crashed();
++        assert!(ran.is_ok() || crashed, "{k}: {ran:?}");
++        drop((client, storage));
++        transport.settled().await;
++
++        let (storage, client) = reopened(dir.path(), &transport).await;
++        open_room(&client, &room_id).await.unwrap();
++        let status = client.status(room_id.clone()).await.unwrap();
++        assert_eq!(
++            status.epoch, 0,
++            "{k}: the crash made the client discard the replica"
++        );
++        let head = status.head_seq.get();
++        assert!(head == 0 || head >= 7, "{k}: {head}");
++        assert_eq!(tasks(&storage, &room_id).await, up_to(head), "{k}");
++        let saved = FileMetadata::new(dir.path()).room(&room_id).await.unwrap();
++        assert_eq!(saved.unwrap().room_incarnation, incarnation, "{k}");
++        client.sync(room_id.clone()).await.unwrap();
++        assert_eq!(tasks(&storage, &room_id).await, up_to(9), "{k}");
++        assert_eq!(
++            client.status(room_id.clone()).await.unwrap().epoch,
++            0,
++            "{k}"
++        );
++        client.shutdown().await.unwrap();
++        if !crashed {
++            points = Some(k);
++            break;
++        }
++    }
++    let points = points.expect("the scenario ends");
++    eprintln!("{points} crash points");
++    assert!(points > 5, "only {points} crash points");
++}
++
++/// A crash at any point of the discard of a replica whose room was created again (the metadata
++/// removed, the storage room closed and deleted), of the registration that follows (the metadata
++/// of the new room saved, the storage room opened with their schema) and of its sync leaves
++/// metadata only over data of their incarnation (none, or rows of the old room under the old
++/// metadata, or rows of the new room under the new ones), and the next open ends with the replica
++/// of the new room: never a row of the old one.
++#[tokio::test(start_paused = true)]
++async fn audit_k3_a_crash_at_any_point_of_a_discard_leaves_metadata_only_over_their_own_data() {
++    let mut points = None;
++    for k in 0..400 {
++        let server = TestServer::new();
++        let room_id = server.create_room("room-a").await;
++        let transport = server.transport();
++        let dir = tempdir().unwrap();
++        let files = CrashFiles::default();
++        let (storage, client) = crashing_client(dir.path(), &files, &transport).await;
++        open_room(&client, &room_id).await.unwrap();
++        // The replica holds the tasks 1 to 3 in its snapshot, and 4 and 5 in its WAL.
++        server.commit(&room_id, 1..=3).await;
++        client.sync(room_id.clone()).await.unwrap();
++        storage.compact_room(&room_id).await.unwrap();
++        server.commit(&room_id, 4..=5).await;
++        client.sync(room_id.clone()).await.unwrap();
++        let old = server.incarnation(&room_id).await;
++        server.recreate_room(&room_id).await;
++        server.commit(&room_id, 7..=8).await;
++        let new = server.incarnation(&room_id).await;
++
++        files.arm(k);
++        let ran = client.sync(room_id.clone()).await;
++        let crashed = files.crashed();
++        assert!(ran.is_ok() || crashed, "{k}: {ran:?}");
++        drop((client, storage));
++        transport.settled().await;
++
++        // What the crash left.
++        let saved = FileMetadata::new(dir.path()).room(&room_id).await.unwrap();
++        if let Some(saved) = saved {
++            let engine = engine(dir.path());
++            engine
++                .open_room(&room_id, saved.schema.clone())
++                .await
++                .unwrap();
++            let rows = tasks(&engine, &room_id).await;
++            engine.close_room(&room_id).await.unwrap();
++            let theirs: &[i64] = match saved.room_incarnation {
++                incarnation if incarnation == old => &[1, 2, 3, 4, 5],
++                incarnation if incarnation == new => &[7, 8],
++                incarnation => panic!("{k}: metadata of another incarnation {incarnation}"),
++            };
++            assert!(
++                rows.iter().all(|row| theirs.contains(row)),
++                "{k}: the metadata of {} over the rows {rows:?}",
++                saved.room_incarnation
++            );
++        }
++
++        let (storage, client) = reopened(dir.path(), &transport).await;
++        open_room(&client, &room_id).await.unwrap();
++        client.sync(room_id.clone()).await.unwrap();
++        assert_eq!(tasks(&storage, &room_id).await, [7, 8], "{k}");
++        let saved = FileMetadata::new(dir.path()).room(&room_id).await.unwrap();
++        assert_eq!(saved.unwrap().room_incarnation, new, "{k}");
++        client.shutdown().await.unwrap();
++        if !crashed {
++            points = Some(k);
++            break;
++        }
++    }
++    let points = points.expect("the scenario ends");
++    eprintln!("{points} crash points");
++    assert!(points > 10, "only {points} crash points");
++}
++
++// ---------------------------------------------------------------------------------------------
++// INV-K12: fuzzed chunks of a download in two chunks
++
++/// The panics of the process, also those that a task catches.
++static PANICS: AtomicUsize = AtomicUsize::new(0);
++
++fn count_panics() {
++    static HOOK: Once = Once::new();
++    HOOK.call_once(|| {
++        let hook = std::panic::take_hook();
++        std::panic::set_hook(Box::new(move |info| {
++            PANICS.fetch_add(1, Ordering::SeqCst);
++            hook(info)
++        }));
++    });
++}
++
++/// Table `blobs`: an int key `id` and a bytes `data`.
++fn blobs_schema() -> Schema {
++    let table = TableSchema::builder("blobs")
++        .primary_key("id", DataType::Int)
++        .column("data", DataType::Bytes);
++    Schema::builder().table(table).build()
++}
++
++/// An insert of row `id` into `blobs` with `len` bytes that do not compress.
++fn insert_blob(id: i64, len: usize) -> Operation {
++    let mut rng = generators::Rng::new(id as u64);
++    let row = RowBuilder::new()
++        .set("id", id)
++        .set("data", rng.bytes(len))
++        .build();
++    blobs_schema()
++        .to_operation_insert("blobs", &row, 1000)
++        .unwrap()
++}
++
++/// The blobs of `room_id` of `storage`, among 1 to 9.
++async fn blobs(storage: &impl StorageEngine, room_id: &RoomId) -> Vec<i64> {
++    let mut blobs = Vec::new();
++    for id in 1..=9 {
++        let row = storage.get(room_id, "blobs", &PrimaryKey::single(id)).await;
++        if row.unwrap().is_some() {
++            blobs.push(id);
++        }
++    }
++    blobs
++}
++
++/// A chunk of the active snapshot of `room_id`, by chunks of 4 MiB, as the snapshot worker gets
++/// it.
++async fn chunk(
++    server: &TestServer,
++    room_id: &RoomId,
++    index: u32,
++    hash: Option<[u8; 32]>,
++) -> ServerMessage {
++    let message = ClientMessage::RequestSnapshotChunk {
++        correlation_id: CorrelationId::new(0),
++        room_id: room_id.clone(),
++        chunk_index: index,
++        chunk_size: 4 << 20,
++        snapshot_hash: hash,
++        room_incarnation: server.incarnation(room_id).await,
++    };
++    let reply = server.transport().send(&message, ADMIN_SECRET).await;
++    decode_message(&reply.unwrap()).unwrap()
++}
++
++/// `chunk` as the reply to `message`.
++fn as_reply_to(message: &ClientMessage, mut chunk: ServerMessage) -> ServerMessage {
++    if let ServerMessage::SnapshotChunk { correlation_id, .. } = &mut chunk {
++        *correlation_id = request(message).0;
++    }
++    chunk
++}
++
++/// The chunk `index` of `snapshot` at `seq`, by chunks of 4 MiB, in reply to `message`.
++fn chunk_of(message: &ClientMessage, snapshot: &[u8], seq: u64, index: u32) -> ServerMessage {
++    let size = 4usize << 20;
++    let start = (index as usize * size).min(snapshot.len());
++    let end = (start + size).min(snapshot.len());
++    ServerMessage::SnapshotChunk {
++        correlation_id: request(message).0,
++        room_id: request(message).1,
++        snapshot_head_seq: SequenceNumber::new(seq),
++        chunk_index: index,
++        total_chunks: snapshot.len().div_ceil(size) as u32,
++        total_bytes: snapshot.len() as u64,
++        snapshot_hash: ServerMessage::compute_snapshot_hash(snapshot),
++        data: bytes::Bytes::copy_from_slice(&snapshot[start..end]),
++    }
++}
++
++/// Whether `snapshot` installs at `seq` in a memory room of `room_id` with `schema`.
++async fn installs(room_id: &RoomId, schema: &Schema, snapshot: &[u8], seq: u64) -> bool {
++    let storage = MemoryStorageEngine::new();
++    storage.open_room(room_id, schema.clone()).await.unwrap();
++    let bytes = bytes::Bytes::copy_from_slice(snapshot);
++    let installed =
++        storage.apply_snapshot(room_id, schema.clone(), bytes, SequenceNumber::new(seq));
++    installed.await.is_ok()
++}
++
++/// What answers the chunks of a download in a round of the fuzzing.
++enum Fuzzed {
++    /// Nothing: the server answers.
++    Nothing,
++    /// A fuzzed reply to the chunk `index` in place of the server's.
++    One(u32),
++    /// Every chunk, from `snapshot` at `seq`: one that matches its hash and does not install.
++    Snapshot(Vec<u8>, u64),
++}
++
++/// A fuzzed reply to `message`, a request of a chunk of the snapshot whose chunks are `first`
++/// and `second`.
++fn fuzzed(
++    rng: &mut generators::Rng,
++    message: &ClientMessage,
++    (first, second): (&ServerMessage, &ServerMessage),
++    pool: &[Vec<u8>],
++    codes: &[ErrorCode],
++) -> Vec<u8> {
++    let index = match message {
++        ClientMessage::RequestSnapshotChunk { chunk_index, .. } => *chunk_index,
++        _ => unreachable!(),
++    };
++    let real = as_reply_to(message, if index == 0 { first } else { second }.clone());
++    let (correlation_id, room_id) = request(message);
++    match rng.below(5) {
++        0 => {
++            let mut bytes = Vec::new();
++            if rng.coin() {
++                bytes.extend(PROTOCOL_MAGIC);
++                bytes.extend([zemdb_core::protocol::PROTOCOL_VERSION, 0]);
++            }
++            bytes.extend(rng.bytes_below(256));
++            bytes
++        }
++        1 => {
++            let mut bytes = encode_message(&real).unwrap();
++            generators::mutate(rng, &mut bytes, 8, pool);
++            bytes
++        }
++        2 => encode_message(&generators::server_message(rng, codes)).unwrap(),
++        3 => error_reply(correlation_id, &room_id, *rng.pick(codes)),
++        _ => {
++            let mut chunk = real;
++            if let ServerMessage::SnapshotChunk {
++                snapshot_head_seq,
++                chunk_index,
++                total_chunks,
++                total_bytes,
++                snapshot_hash,
++                data,
++                ..
++            } = &mut chunk
++            {
++                let huge = [0, 1, u64::MAX, u64::MAX - 1, 512 << 20, (512 << 20) + 1];
++                match rng.below(6) {
++                    0 => *snapshot_head_seq = SequenceNumber::new(*rng.pick(&huge)),
++                    1 => *chunk_index = rng.u32(),
++                    2 => *total_chunks = *rng.pick(&[0, 1, 2, 3, u32::MAX]),
++                    3 => *total_bytes = *rng.pick(&huge),
++                    4 => snapshot_hash[rng.below(32)] ^= 1,
++                    _ => {
++                        let len = rng.below(data.len() + 2);
++                        let mut bytes = data.to_vec();
++                        bytes.resize(len, 0);
++                        *data = bytes::Bytes::from(bytes);
++                    }
++                }
++            }
++            encode_message(&chunk).unwrap()
++        }
++    }
++}
++
++/// No reply to a chunk of a download in two chunks (random bytes, the server's damaged, a
++/// random message, an error of the request with any code, the chunk with a field changed, or a
++/// whole snapshot that matches its hash and does not install) panics the client, moves its
++/// replica off the log or discards it, and once the network heals the replica catches up.
++#[tokio::test(start_paused = true)]
++async fn audit_k12_fuzzed_chunks_of_a_download_in_two_chunks_do_not_panic_or_move_the_replica() {
++    count_panics();
++    let server = TestServer::pruning();
++    let room_id = server
++        .create_room_with("room-b", "blobs", blobs_schema())
++        .await;
++    // The blobs 1 and 2 take more than a chunk.
++    let ops = (1..=9).map(|id| insert_blob(id, if id <= 2 { (2 << 20) + (64 << 10) } else { 16 }));
++    let ops = server.commit_ops(&room_id, ops).await;
++    server.prune(&room_id, 6).await;
++    let seven = snapshot(&room_id, blobs_schema(), &ops[..7]).await;
++    assert!(seven.len() > 4 << 20, "{}", seven.len());
++    server.upload(&room_id, 7, seven.clone()).await;
++    let hash = ServerMessage::compute_snapshot_hash(&seven);
++    let first = chunk(&server, &room_id, 0, None).await;
++    let second = chunk(&server, &room_id, 1, Some(hash)).await;
++    let pool: Vec<Vec<u8>> = generators::sample_server_messages()
++        .iter()
++        .map(|message| encode_message(message).unwrap())
++        .collect();
++    let codes = generators::all_error_codes();
++    let seed = std::env::var("AUDIT_SEED").map_or(12, |seed| seed.parse().unwrap());
++    let mut rng = generators::Rng::new(seed);
++
++    for round in 0..32 {
++        let transport = server.transport();
++        let dir = tempdir().unwrap();
++        let storage = engine(dir.path());
++        let client = open_client(dir.path(), storage.clone(), &transport).await;
++        open_room(&client, &room_id).await.unwrap();
++        let fuzzed_round = match rng.below(4) {
++            0 => {
++                // A snapshot of its own, damaged, sealed raw so that it keeps its length.
++                let mut payload =
++                    zemdb_storage::snapshot::decode_snapshot_envelope(&seven).unwrap();
++                generators::mutate(&mut rng, &mut payload, 0, &[]);
++                let fake =
++                    zemdb_storage::snapshot::encode_snapshot_envelope(&payload, false, 0).unwrap();
++                let seq = *rng.pick(&[7, 8, 9, u64::MAX]);
++                // One that installs would be a lie the client takes on trust (§2).
++                match installs(&room_id, &blobs_schema(), &fake, seq).await {
++                    true => Fuzzed::Nothing,
++                    false => Fuzzed::Snapshot(fake, seq),
++                }
++            }
++            _ => Fuzzed::One(rng.below(2) as u32),
++        };
++        let fuzzed_kind = match &fuzzed_round {
++            Fuzzed::Nothing => 0,
++            Fuzzed::One(_) => 1,
++            _ => 2,
++        };
++        // The reply is drawn when the request comes, with the generator of the round.
++        let mut round_rng = generators::Rng::new(rng.next_u64());
++        let (first_ref, second_ref, pool_ref, codes_ref) =
++            (first.clone(), second.clone(), pool.clone(), codes.clone());
++        transport.answer(move |message| {
++            let ClientMessage::RequestSnapshotChunk { chunk_index, .. } = message else {
++                return None;
++            };
++            match &fuzzed_round {
++                Fuzzed::One(index) if index == chunk_index => {
++                    let parts = (&first_ref, &second_ref);
++                    Some(Ok(fuzzed(
++                        &mut round_rng,
++                        message,
++                        parts,
++                        &pool_ref,
++                        &codes_ref,
++                    )))
++                }
++                Fuzzed::Nothing | Fuzzed::One(_) => None,
++                Fuzzed::Snapshot(fake, seq) => {
++                    let chunk = chunk_of(message, fake, *seq, *chunk_index);
++                    Some(Ok(encode_message(&chunk).unwrap()))
++                }
++            }
++        });
++        let synced = tokio::time::timeout(Duration::from_secs(600), client.sync(room_id.clone()));
++        let synced = synced.await;
++        assert!(synced.is_ok(), "{round}: a sync that does not end");
++        let kind = match &fuzzed_kind {
++            0 => "none",
++            1 => "one",
++            _ => "snapshot",
++        };
++        eprintln!("round {round}: {kind}: {:?}", synced.as_ref().unwrap());
++        let _ = tokio::time::timeout(Duration::from_secs(600), client.heartbeat(room_id.clone()))
++            .await
++            .expect("a heartbeat that does not end");
++        let status = client.status(room_id.clone()).await.unwrap();
++        // Opened without metadata, it was discarded once, and never again.
++        assert_eq!(status.epoch, 1, "{round}: {synced:?}");
++        assert!(!status.failed_closed, "{round}");
++        let head = status.head_seq.get();
++        assert!(head == 0 || (7..=9).contains(&head), "{round}: {head}");
++        let expected: Vec<i64> = (1..=head as i64).collect();
++        assert_eq!(blobs(&storage, &room_id).await, expected, "{round}");
++
++        // Healed, and opened again (a snapshot dropped is not downloaded again until then).
++        transport.online();
++        client.close_room(room_id.clone()).await.unwrap();
++        open_room(&client, &room_id).await.unwrap();
++        client.sync(room_id.clone()).await.unwrap();
++        assert_eq!(
++            blobs(&storage, &room_id).await,
++            (1..=9).collect::<Vec<_>>(),
++            "{round}"
++        );
++        assert_eq!(
++            client.status(room_id.clone()).await.unwrap().epoch,
++            1,
++            "{round}"
++        );
++        client.shutdown().await.unwrap();
++    }
++    assert_eq!(PANICS.load(Ordering::SeqCst), 0, "a panic of the process");
++}
++
++// ---------------------------------------------------------------------------------------------
++// INV-R6: the upload of a client of the old incarnation, into a room whose log admits it
++
++/// The inserts of the blobs `ids`, the first two of 2 MiB and 64 KiB, so that a snapshot of
++/// them takes two chunks, and the others of 16 bytes; `salt` changes their bytes.
++fn blobs_of(ids: std::ops::RangeInclusive<i64>, salt: i64) -> Vec<Operation> {
++    let big = (2 << 20) + (64 << 10);
++    let blob = |id: i64| {
++        let mut rng = generators::Rng::new((id + salt * 1000) as u64);
++        let len = if id <= 2 { big } else { 16 };
++        let row = RowBuilder::new()
++            .set("id", id)
++            .set("data", rng.bytes(len))
++            .build();
++        blobs_schema()
++            .to_operation_insert("blobs", &row, 1000)
++            .unwrap()
++    };
++    ids.map(blob).collect()
++}
++
++/// The chunks uploaded through `transport`: their index and the incarnation they carry.
++fn uploads(transport: &TestTransport) -> Vec<(u32, u128)> {
++    let upload = |message: ClientMessage| match message {
++        ClientMessage::UploadSnapshotChunk {
++            chunk_index,
++            room_incarnation,
++            ..
++        } => Some((chunk_index, room_incarnation)),
++        _ => None,
++    };
++    transport.sent().into_iter().filter_map(upload).collect()
++}
++
++/// A client designated (by a `HeartbeatAck` that asks it for a snapshot) while its room is created
++/// again, with another log whose retained range holds the head of the replica, sends its first
++/// chunk with the old incarnation: the relay answers `RoomReset`, so it neither starts an upload
++/// nor activates the old snapshot in the new room, the replica registers again with its cursor
++/// and is discarded, and the snapshot that a member of the new room then uploads is the new
++/// room's. Only the incarnation of the chunk stops it: the range of the new room admits the
++/// sequence of the old snapshot.
++#[tokio::test(start_paused = true)]
++async fn audit_r6_the_upload_of_a_client_of_the_old_incarnation_never_reaches_the_new_room() {
++    let server = TestServer::new();
++    let room_id = server
++        .create_room_with("room-b", "blobs", blobs_schema())
++        .await;
++    let dir = tempdir().unwrap();
++    let transport = server.transport();
++    let storage = engine(dir.path());
++    let client = open_client(dir.path(), storage.clone(), &transport).await;
++    open_room(&client, &room_id).await.unwrap();
++    server.commit_ops(&room_id, blobs_of(1..=9, 0)).await;
++    client.sync(room_id.clone()).await.unwrap();
++    let old = server.incarnation(&room_id).await;
++
++    // The designation, held while the room is created again with nine other blobs.
++    let mut held = transport.hold_next_reply(ClientMessageKind::Heartbeat);
++    transport.answer_next(ClientMessageKind::Heartbeat, |message| {
++        let (correlation_id, room_id) = request(message);
++        encode_message(&ServerMessage::HeartbeatAck {
++            correlation_id,
++            room_id,
++            current_head_seq: SequenceNumber::new(9),
++            snapshot_wanted: true,
++            active_snapshot_seq: None,
++            schema_version: 1,
++            schema_id: SchemaId::new("blobs").unwrap(),
++        })
++        .unwrap()
++    });
++    let (server_ref, room) = (&server, room_id.clone());
++    let recreate = async move {
++        held.replied().await;
++        server_ref
++            .state
++            .room_manager
++            .delete_room(&room)
++            .await
++            .unwrap();
++        server_ref
++            .create_room_with("room-b", "blobs", blobs_schema())
++            .await;
++        server_ref.commit_ops(&room, blobs_of(1..=9, 1)).await;
++        let bounds = server_ref
++            .state
++            .room_manager
++            .log_bounds(&room)
++            .await
++            .unwrap();
++        assert!(
++            bounds.tail_seq.get() <= 9 && bounds.head_seq.get() >= 9,
++            "{bounds:?}"
++        );
++        held.release();
++    };
++    let (heartbeat, ()) = tokio::join!(client.heartbeat(room_id.clone()), recreate);
++    heartbeat.unwrap();
++    let new = server.incarnation(&room_id).await;
++    assert_ne!(old, new);
++    assert_eq!(uploads(&transport), [(0, old)]);
++    let relay = &server.state.snapshot_relay;
++    assert_eq!(relay.active_snapshot_seq(&room_id), None);
++    // Registered again with its cursor, and discarded.
++    let registrations = transport.registrations();
++    let last = &registrations[registrations.len() - 2..];
++    assert_eq!(last, [(Some(9), Some(old)), (None, None)]);
++    let status_now = client.status(room_id.clone()).await.unwrap();
++    assert_eq!((status_now.epoch, status_now.head_seq.get()), (2, 0));
++    client.sync(room_id.clone()).await.unwrap();
++    let saved = FileMetadata::new(dir.path()).room(&room_id).await.unwrap();
++    assert_eq!(saved.unwrap().room_incarnation, new);
++
++    // Designated again, now in the new room, it uploads the snapshot of the new room.
++    transport.answer_next(ClientMessageKind::Heartbeat, |message| {
++        let (correlation_id, room_id) = request(message);
++        encode_message(&ServerMessage::HeartbeatAck {
++            correlation_id,
++            room_id,
++            current_head_seq: SequenceNumber::new(9),
++            snapshot_wanted: true,
++            active_snapshot_seq: None,
++            schema_version: 1,
++            schema_id: SchemaId::new("blobs").unwrap(),
++        })
++        .unwrap()
++    });
++    client.heartbeat(room_id.clone()).await.unwrap();
++    assert_eq!(uploads(&transport), [(0, old), (0, new), (1, new)]);
++    assert_eq!(
++        relay.active_snapshot_seq(&room_id).map(|s| s.get()),
++        Some(9)
++    );
++    // The rows of the snapshot in the relay are those of the new room.
++    let first = chunk(&server, &room_id, 0, None).await;
++    let ServerMessage::SnapshotChunk {
++        snapshot_hash,
++        data: head,
++        ..
++    } = first
++    else {
++        panic!("{first:?}");
++    };
++    let second = chunk(&server, &room_id, 1, Some(snapshot_hash)).await;
++    let ServerMessage::SnapshotChunk { data: tail, .. } = second else {
++        panic!("{second:?}");
++    };
++    let relayed = bytes::Bytes::from([&head[..], &tail[..]].concat());
++    let rows = |salt| {
++        let room_id = room_id.clone();
++        async move {
++            let ops = blobs_of(1..=9, salt).into_iter().zip(1..);
++            let ops = ops.map(|(op, seq)| SequencedOperation::new(SequenceNumber::new(seq), op));
++            let model = MemoryStorageEngine::new();
++            model.open_room(&room_id, blobs_schema()).await.unwrap();
++            model.apply_batch(&room_id, ops.collect()).await.unwrap();
++            let blob = model.get(&room_id, "blobs", &PrimaryKey::single(1)).await;
++            blob.unwrap()
++        }
++    };
++    let installed = MemoryStorageEngine::new();
++    installed.open_room(&room_id, blobs_schema()).await.unwrap();
++    let nine = SequenceNumber::new(9);
++    let applied = installed.apply_snapshot(&room_id, blobs_schema(), relayed, nine);
++    applied.await.unwrap();
++    let blob = installed
++        .get(&room_id, "blobs", &PrimaryKey::single(1))
++        .await;
++    let blob = blob.unwrap();
++    assert_eq!(blob, rows(1).await);
++    assert_ne!(blob, rows(0).await);
++    client.shutdown().await.unwrap();
++}
++
++// ---------------------------------------------------------------------------------------------
++// A low finding: the limit of a download is checked before a chunk is checked against the first
++
++/// A chunk after the first that does not follow it, because it announces a size larger than the
++/// limit of the client, ends the download with `Config`, which tells the application to raise the
++/// limit or discard the room (and that the worker of 4.3 is not to retry), instead of `Network`,
++/// as any other chunk that does not follow the first: the limit is checked before the chunk is
++/// compared with the first. The snapshot of the relay fits within the limit, and the next sync
++/// downloads it. It passes on 9de2c1b, showing the behavior.
++#[tokio::test(start_paused = true)]
++async fn audit_k12_a_chunk_that_does_not_follow_the_first_is_config_if_it_announces_more_than_the_limit(
++) {
++    let server = TestServer::pruning();
++    let room_id = server
++        .create_room_with("room-b", "blobs", blobs_schema())
++        .await;
++    let ops = server.commit_ops(&room_id, blobs_of(1..=9, 0)).await;
++    server.prune(&room_id, 6).await;
++    let seven = snapshot(&room_id, blobs_schema(), &ops[..7]).await;
++    server.upload(&room_id, 7, seven.clone()).await;
++    let hash = ServerMessage::compute_snapshot_hash(&seven);
++    let second = chunk(&server, &room_id, 1, Some(hash)).await;
++    let dir = tempdir().unwrap();
++    let transport = server.transport();
++    let storage = engine(dir.path());
++    let client = open_client(dir.path(), storage.clone(), &transport).await;
++    open_room(&client, &room_id).await.unwrap();
++
++    let limit = ClientConfig::new("ana").max_snapshot_bytes;
++    for (total, expected) in [(limit + 1, "Config"), (limit, "Network")] {
++        let mut second = second.clone();
++        transport.answer(move |message| match message {
++            ClientMessage::RequestSnapshotChunk { chunk_index: 1, .. } => {
++                let mut chunk = as_reply_to(message, second.clone());
++                if let ServerMessage::SnapshotChunk { total_bytes, .. } = &mut chunk {
++                    *total_bytes = total;
++                }
++                second = chunk.clone();
++                Some(Ok(encode_message(&chunk).unwrap()))
++            }
++            _ => None,
++        });
++        let synced = client.sync(room_id.clone()).await;
++        let kind = match &synced {
++            Err(ClientError::Config(_)) => "Config",
++            Err(ClientError::Network(_)) => "Network",
++            other => panic!("{other:?}"),
++        };
++        assert_eq!(kind, expected, "{total}: {synced:?}");
++    }
++    transport.online();
++    client.sync(room_id.clone()).await.unwrap();
++    assert_eq!(blobs(&storage, &room_id).await, (1..=9).collect::<Vec<_>>());
++    client.shutdown().await.unwrap();
++}
++
++// ---------------------------------------------------------------------------------------------
++// INV-K3 under fuzzing: only a reply to a registration may discard
++
++/// A transport to `inner` that puts, in place of one in three replies to anything but a
++/// registration, random bytes, the reply damaged, a random message or an error of the request
++/// with a random code; never a batch, a commit ack or a `Registered`, whose operations, sequence,
++/// schema and incarnation the client takes on trust.
++#[derive(Clone)]
++struct Fuzzing {
++    inner: TestTransport,
++    rng: Arc<Mutex<generators::Rng>>,
++    pool: Arc<Vec<Vec<u8>>>,
++    codes: Arc<Vec<ErrorCode>>,
++    on: Arc<AtomicBool>,
++}
++
++impl std::fmt::Debug for Fuzzing {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("Fuzzing").finish_non_exhaustive()
++    }
++}
++
++#[async_trait]
++impl TransportClient for Fuzzing {
++    async fn send(
++        &self,
++        message: &ClientMessage,
++        token: &str,
++    ) -> Result<Vec<u8>, zemdb_client::TransportError> {
++        let real = self.inner.send(message, token).await?;
++        if !self.on.load(Ordering::SeqCst)
++            || matches!(message, ClientMessage::RegisterClient { .. })
++        {
++            return Ok(real);
++        }
++        let fuzzed = {
++            let mut rng = self.rng.lock().unwrap();
++            if !rng.chance(1, 3) {
++                return Ok(real);
++            }
++            match rng.below(4) {
++                0 => rng.bytes_below(64),
++                1 => {
++                    let mut bytes = real.clone();
++                    generators::mutate(&mut rng, &mut bytes, 8, &self.pool);
++                    bytes
++                }
++                2 => encode_message(&generators::server_message(&mut rng, &self.codes)).unwrap(),
++                _ => {
++                    // Half of the time, one of the codes that ask the client to register again,
++                    // wait for a snapshot or download another.
++                    let asking = [
++                        ErrorCode::RoomReset,
++                        ErrorCode::InvalidSequence,
++                        ErrorCode::BehindCompaction,
++                        ErrorCode::ClientNotRegistered,
++                        ErrorCode::SnapshotSuperseded,
++                        ErrorCode::RoomNotFound,
++                    ];
++                    let code = match rng.coin() {
++                        true => *rng.pick(&asking),
++                        false => *rng.pick(&self.codes),
++                    };
++                    let (correlation_id, room_id) = request(message);
++                    error_reply(correlation_id, &room_id, code)
++                }
++            }
++        };
++        let trusted = matches!(
++            decode_message::<ServerMessage>(&fuzzed),
++            Ok(ServerMessage::SyncBatch { .. }
++                | ServerMessage::CommitAck { .. }
++                | ServerMessage::Registered { .. })
++        );
++        Ok(if trusted { real } else { fuzzed })
++    }
++}
++
++/// With one in three replies to syncs, acks, heartbeats and chunks fuzzed (an error of the request
++/// with any code among them, also `RoomReset`, `InvalidSequence` or `BehindCompaction`), a replica
++/// whose room is never created again is never discarded: only a reply to a registration with a
++/// cursor discards, and those come from the server. Its replica stays a prefix of the log, and it
++/// catches up once the network heals. The simulation turns its check of the discards off when it
++/// fuzzes.
++#[tokio::test(start_paused = true)]
++async fn audit_k3_no_fuzzed_reply_to_anything_but_a_registration_discards_the_replica() {
++    count_panics();
++    let server = TestServer::pruning();
++    let room_id = server.create_room("room-a").await;
++    let seed = std::env::var("AUDIT_SEED").map_or(3, |seed| seed.parse().unwrap());
++    let link = Fuzzing {
++        inner: server.transport(),
++        rng: Arc::new(Mutex::new(generators::Rng::new(seed))),
++        pool: Arc::new(
++            generators::sample_server_messages()
++                .iter()
++                .map(|message| encode_message(message).unwrap())
++                .collect(),
++        ),
++        codes: Arc::new(generators::all_error_codes()),
++        on: Arc::new(AtomicBool::new(true)),
++    };
++    let dir = tempdir().unwrap();
++    let storage = engine(dir.path());
++    let metadata = FileMetadata::new(dir.path());
++    let client = Client::open(
++        ClientConfig::new("ana"),
++        storage.clone(),
++        metadata,
++        link.clone(),
++    );
++    let client = client.await.unwrap();
++    open_room(&client, &room_id).await.unwrap();
++    let mut rng = generators::Rng::new(seed.reverse_bits());
++    let mut committed = 0;
++    for step in 0..400 {
++        let call = match rng.below(6) {
++            0 if committed < 40 => {
++                committed += 1;
++                server.commit(&room_id, [committed]).await;
++                continue;
++            }
++            0..=2 => client.sync(room_id.clone()).await,
++            3 | 4 => client.heartbeat(room_id.clone()).await,
++            _ => {
++                let _ = client.close_room(room_id.clone()).await;
++                open_room(&client, &room_id).await
++            }
++        };
++        let Ok(status) = client.status(room_id.clone()).await else {
++            continue;
++        };
++        assert_eq!(status.epoch, 1, "{step}: {call:?}");
++        assert!(!status.failed_closed, "{step}: {call:?}");
++        let rows = tasks_up_to_40(&storage, &room_id).await;
++        assert_eq!(rows, up_to(status.head_seq.get()), "{step}");
++    }
++    link.on.store(false, Ordering::SeqCst);
++    let _ = client.close_room(room_id.clone()).await;
++    open_room(&client, &room_id).await.unwrap();
++    client.sync(room_id.clone()).await.unwrap();
++    let status = client.status(room_id.clone()).await.unwrap();
++    assert_eq!((status.epoch, status.head_seq.get()), (1, committed as u64));
++    client.shutdown().await.unwrap();
++    assert_eq!(PANICS.load(Ordering::SeqCst), 0, "a panic of the process");
++}
++
++/// Which of the tasks 1 to 40 `room_id` of `storage` holds.
++async fn tasks_up_to_40(storage: &impl StorageEngine, room_id: &RoomId) -> Vec<i64> {
++    let mut tasks = Vec::new();
++    for id in 1..=40 {
++        let row = storage.get(room_id, "tasks", &PrimaryKey::single(id)).await;
++        if row.unwrap().is_some() {
++            tasks.push(id);
++        }
++    }
++    tasks
++}
++
++// ---------------------------------------------------------------------------------------------
++// For the group of the writes (INV-K2): a head that a reply announces raises what later writes saw
++
++/// A `HeartbeatAck` that answers the heartbeat (its correlation and its room) but announces a
++/// head far beyond the server's, as a damaged or forged reply may, raises the head seen of the
++/// epoch for good: every later write of the room, whose `CommitAck` the server gives a sequence
++/// below that head, ends as `OutcomeUnknown`, though no attempt was uncertain, the server lost
++/// nothing and the replica applied the sequence with its report, until the room is closed. It
++/// passes on 9de2c1b, showing the behavior.
++#[tokio::test(start_paused = true)]
++async fn audit_k2_a_head_announced_beyond_the_server_makes_every_later_write_unknown() {
++    let dir = tempdir().unwrap();
++    let (server, room_id, transport, storage, client) =
++        setup(dir.path(), MemoryStorageEngine::new()).await;
++    transport.answer_next(ClientMessageKind::Heartbeat, |message| {
++        let (correlation_id, room_id) = request(message);
++        encode_message(&ServerMessage::HeartbeatAck {
++            correlation_id,
++            room_id,
++            current_head_seq: SequenceNumber::new(1_000_000),
++            snapshot_wanted: false,
++            active_snapshot_seq: None,
++            schema_version: 1,
++            schema_id: SchemaId::new("tasks").unwrap(),
++        })
++        .unwrap()
++    });
++    client.heartbeat(room_id.clone()).await.unwrap();
++    for id in 1..=3 {
++        let written = client.write(room_id.clone(), insert_task(id)).await;
++        assert_eq!(written, Err(ClientError::OutcomeUnknown), "{id}");
++    }
++    // The replica applied them, with their decisions, and the server holds them once.
++    assert_eq!(tasks(&storage, &room_id).await, [1, 2, 3]);
++    let bounds = server
++        .state
++        .room_manager
++        .log_bounds(&room_id)
++        .await
++        .unwrap();
++    assert_eq!(bounds.head_seq.get(), 3);
++    // Closed and opened again, the room forgets it.
++    client.close_room(room_id.clone()).await.unwrap();
++    open_room(&client, &room_id).await.unwrap();
++    client.sync(room_id.clone()).await.unwrap();
++    assert_eq!(client.write(room_id.clone(), insert_task(4)).await, Ok(()));
++}
+diff --git a/crates/storage/src/disk/tests/delete.rs b/crates/storage/src/disk/tests/delete.rs
+index e710441..545a3bb 100644
+--- a/crates/storage/src/disk/tests/delete.rs
++++ b/crates/storage/src/disk/tests/delete.rs
+@@ -260,3 +260,94 @@ async fn delete_room_dropped_during_a_removal_completes_before_the_room_reopens(
+     engine.close_room(&room).await.unwrap();
+     assert_eq!(open_head(dir.path(), &room).await, 0);
+ }
++
++/// Audit of sub-phase 4.2 (Lote 12): every room that a crash in the middle of `apply_snapshot`
++/// leaves (the snapshot staged, renamed over the old one, the WALs emptied or not), with a rotated
++/// WAL of an interrupted compaction under it, is deleted by `delete_room` through rooms that open
++/// at a prefix of its log, also if `delete_room` is cut at any point: the old log up to 8 (its
++/// snapshot at 3, with 4 and 5 rotated and 6 to 8 in the WAL), or the installed snapshot at 12,
++/// and what of either is left as files go. The suite crashes `delete_room` only over an
++/// interrupted compaction.
++#[cfg(unix)]
++#[tokio::test]
++async fn audit_s8_crash_at_any_point_of_delete_room_after_a_cut_snapshot_install_leaves_a_prefix() {
++    let dir = tempfile::tempdir().unwrap();
++    let (data, images) = (dir.path().join("data"), dir.path().join("images"));
++    let room = RoomId::new("installed").unwrap();
++    let engine = open_engine(&data, &room).await;
++    apply_range(&engine, &room, 1..=3).await;
++    engine.compact_room(&room).await.unwrap();
++    apply_range(&engine, &room, 4..=5).await;
++    fail_compaction_leaving_compacting_wal(&engine, &room).await;
++    apply_range(&engine, &room, 6..=8).await;
++    // The snapshot of another member at 12, of the same log.
++    let member = crate::MemoryStorageEngine::new();
++    member.open_room(&room, schema()).await.unwrap();
++    member
++        .apply_batch(&room, (1..=12).map(insert).collect())
++        .await
++        .unwrap();
++    let snapshot = member.create_snapshot(&room).await.unwrap();
++
++    fail_point::arm_crash_plan(
++        &data,
++        fail_point::CrashAction::CopyAtEveryPoint(images.clone()),
++    );
++    let installed = engine
++        .apply_snapshot(
++            &room,
++            schema(),
++            snapshot.into(),
++            zemdb_core::SequenceNumber::new(12),
++        )
++        .await;
++    let install_points = fail_point::disarm_crash_plan(&data);
++    assert_eq!(installed.unwrap().get(), 12);
++    engine.close_room(&room).await.unwrap();
++    assert!(install_points.len() > 3, "{install_points:?}");
++
++    let mut cases = Vec::new();
++    for n in 1..=install_points.len() + 1 {
++        // The files at the crash, and once `apply_snapshot` returned.
++        let image = match n {
++            n if n <= install_points.len() => images.join(n.to_string()),
++            _ => data.clone(),
++        };
++        let pristine = dir.path().join(format!("pristine-{n}"));
++        fail_point::copy_files(&image, &pristine);
++        let start = open_head(&image, &room).await;
++        assert!(start == 8 || start == 12, "image {n}: {start}");
++
++        // `delete_room` over the files as the crash left them, cut at every point.
++        let deleted = dir.path().join(format!("deleted-{n}"));
++        let cuts = dir.path().join(format!("cuts-{n}"));
++        fail_point::copy_files(&pristine, &deleted);
++        fail_point::arm_crash_plan(
++            &deleted,
++            fail_point::CrashAction::CopyAtEveryPoint(cuts.clone()),
++        );
++        engine_at(&deleted).delete_room(&room).await.unwrap();
++        let delete_points = fail_point::disarm_crash_plan(&deleted);
++        let mut heads = Vec::new();
++        for m in 1..=delete_points.len() {
++            heads.push(open_head(&cuts.join(m.to_string()), &room).await);
++        }
++        heads.dedup();
++        // Every head is one of the prefixes of the log the room had, in the order the files go.
++        assert!(
++            heads.windows(2).all(|w| w[0] > w[1]),
++            "image {n}: {heads:?}"
++        );
++        assert!(
++            heads.iter().all(|head| [12, 8, 5, 3, 0].contains(head)),
++            "image {n}: {heads:?}"
++        );
++        assert_eq!(open_head(&deleted, &room).await, 0, "image {n}");
++        cases.push((start, heads));
++    }
++    cases.dedup();
++    eprintln!(
++        "{} images of apply_snapshot: {cases:?}",
++        install_points.len()
++    );
++}

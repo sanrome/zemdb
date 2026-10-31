@@ -1,0 +1,556 @@
+diff --git a/crates/client/tests/audit_writes_tests.rs b/crates/client/tests/audit_writes_tests.rs
+new file mode 100644
+index 0000000..1094ef1
+--- /dev/null
++++ b/crates/client/tests/audit_writes_tests.rs
+@@ -0,0 +1,550 @@
++//! Tests of the broad audit that closes sub-phase 4.2, group "Escrituras" (INV-K2, K11, K15):
++//! interleavings of the writes, the retries and the closing that the suite of each batch does not
++//! cover, against the server in process.
++
++mod common;
++
++use async_trait::async_trait;
++use common::*;
++use std::fmt;
++use std::future::Future;
++use std::pin::pin;
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Arc, Mutex};
++use std::task::Poll;
++use std::time::Duration;
++use tempfile::tempdir;
++use zemdb_client::{
++    Client, ClientConfig, ClientError, FileMetadata, MetadataStore, RoomStatus, TransportClient,
++    TransportError,
++};
++use zemdb_core::ClientMessageKind::{Commit, RegisterClient};
++use zemdb_core::*;
++use zemdb_storage::{DiskStorageEngine, StorageEngine, StorageError};
++
++/// A `CommitAck` for the commit `message`, which assigns it `seq` without a catch-up and with
++/// more after it, so that the write waits for a sync that applies `seq`.
++fn ack_without_catch_up(message: &ClientMessage, seq: u64) -> Vec<u8> {
++    let ClientMessage::Commit {
++        correlation_id,
++        room_id,
++        mutation_id,
++        ..
++    } = message
++    else {
++        panic!("{message:?}");
++    };
++    encode_message(&ServerMessage::CommitAck {
++        correlation_id: *correlation_id,
++        room_id: room_id.clone(),
++        mutation_id: *mutation_id,
++        assigned_seq: SequenceNumber::new(seq),
++        catchup_ops: Vec::new(),
++        has_more: true,
++        snapshot_wanted: false,
++        schema_version: 1,
++        schema_id: SchemaId::new("tasks").unwrap(),
++    })
++    .unwrap()
++}
++
++/// An insert into `tasks` whose `title` is an int: it does not validate against
++/// [`tasks_schema`], whose `title` is a string.
++fn invalid_insert(id: i64) -> Operation {
++    let table = TableSchema::builder("tasks")
++        .primary_key("id", DataType::Int)
++        .column("title", DataType::Int);
++    let schema = Schema::builder().table(table).build();
++    let row = RowBuilder::new().set("id", id).set("title", 7i64).build();
++    schema.to_operation_insert("tasks", &row, 1000).unwrap()
++}
++
++/// The writes in flight and what `room_id` of `client` retains for them.
++async fn in_flight(client: &Client, room_id: &RoomId) -> (usize, usize) {
++    let RoomStatus {
++        writes_in_flight,
++        retained,
++        ..
++    } = client.status(room_id.clone()).await.unwrap();
++    (writes_in_flight, retained)
++}
++
++/// The head of the log of `room_id` in `server`.
++async fn server_head(server: &TestServer, room_id: &RoomId) -> u64 {
++    let bounds = server.state.room_manager.log_bounds(room_id).await.unwrap();
++    bounds.head_seq.get()
++}
++
++/// The mutation ids of the commits sent through `transport`.
++fn mutation_ids(transport: &TestTransport) -> Vec<MutationId> {
++    commits(transport).into_iter().map(|(id, _)| id).collect()
++}
++
++/// A transport to a [`TestTransport`] that another can replace (a server restarted), where every
++/// commit after the first waits for `gate` before it is sent.
++#[derive(Clone)]
++struct Gated {
++    inner: Arc<Mutex<TestTransport>>,
++    commits: Arc<AtomicUsize>,
++    gate: Arc<tokio::sync::Mutex<()>>,
++}
++
++impl Gated {
++    fn new(inner: TestTransport) -> Self {
++        Self {
++            inner: Arc::new(Mutex::new(inner)),
++            commits: Arc::default(),
++            gate: Arc::default(),
++        }
++    }
++
++    fn inner(&self) -> TestTransport {
++        self.inner.lock().unwrap().clone()
++    }
++
++    fn replace(&self, inner: TestTransport) {
++        *self.inner.lock().unwrap() = inner;
++    }
++
++    /// Waits until the commit number `n` (from 1) is on its way.
++    async fn commit_sent(&self, n: usize) {
++        while self.commits.load(Ordering::SeqCst) < n {
++            tokio::time::sleep(Duration::from_millis(1)).await;
++        }
++    }
++}
++
++impl fmt::Debug for Gated {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("Gated").finish_non_exhaustive()
++    }
++}
++
++#[async_trait]
++impl TransportClient for Gated {
++    async fn send(&self, message: &ClientMessage, token: &str) -> Result<Vec<u8>, TransportError> {
++        if message.kind() == Commit && self.commits.fetch_add(1, Ordering::SeqCst) >= 1 {
++            let _open = self.gate.lock().await;
++        }
++        let inner = self.inner();
++        inner.send(message, token).await
++    }
++}
++
++/// INV-K2 (b): a write with its `CommitAck` that waits for its sequence, in a room that fails
++/// closed because the server sends an operation that does not validate even after the
++/// registration that the first one led to, ends as uncertain, retains nothing, and the client
++/// leaves the roster once. The harness never fails a room closed (its `check` asserts it), so
++/// this path is not among the causes of an uncertain result of its `check_write`.
++#[tokio::test(start_paused = true)]
++async fn audit_k2_a_write_waiting_for_its_sequence_ends_unknown_when_an_invalid_operation_fails_the_room_closed(
++) {
++    let dir = tempdir().unwrap();
++    let (_server, room_id, transport, storage, client) =
++        setup(dir.path(), engine(dir.path())).await;
++    let mut acked = false;
++    transport.answer(move |message| match message {
++        ClientMessage::Commit { .. } if !std::mem::replace(&mut acked, true) => {
++            Some(Ok(ack_without_catch_up(message, 1)))
++        }
++        ClientMessage::Sync {
++            correlation_id,
++            room_id,
++            ..
++        } => Some(Ok(encode_message(&ServerMessage::SyncBatch {
++            correlation_id: *correlation_id,
++            room_id: room_id.clone(),
++            head_seq: SequenceNumber::new(1),
++            ops: vec![SequencedOperation::new(1, invalid_insert(1))],
++            has_more: false,
++            snapshot_wanted: false,
++            schema_version: 1,
++            schema_id: SchemaId::new("tasks").unwrap(),
++        })
++        .unwrap())),
++        _ => None,
++    });
++    let written = client.write(room_id.clone(), insert_task(1)).await;
++    assert_eq!(written, Err(ClientError::OutcomeUnknown));
++    let status = client.status(room_id.clone()).await.unwrap();
++    assert!(status.failed_closed, "{status:?}");
++    assert_eq!((status.writes_in_flight, status.retained), (0, 0));
++    assert_eq!(status.head_seq.get(), 0);
++    assert_eq!(deregistrations(&transport), 1);
++    // One registration for the signal, after the one of the open.
++    assert_eq!(transport.registrations().len(), 2);
++    assert!(tasks(&storage, &room_id).await.is_empty());
++    // A write afterwards sends nothing.
++    let sent = transport.sent().len();
++    let again = client.write(room_id.clone(), insert_task(2)).await;
++    assert_eq!(again, Err(ClientError::FailedClosed(room_id.clone())));
++    assert_eq!(transport.sent().len(), sent);
++}
++
++/// INV-K2 (a) and "never twice in the log": the reply of the first attempt is lost after the
++/// server sequenced it, the server restarts, and the retry (same mutation id, same client id),
++/// after registering again if the roster lost the client, gets the first sequence: the
++/// operation is once in the log, and the write ends with the decision of the replica.
++#[tokio::test(start_paused = true)]
++async fn audit_k2_a_write_retried_across_a_server_restart_gets_its_first_sequence() {
++    let mut server = TestServer::new();
++    let room_id = server.create_room("room-a").await;
++    let dir = tempdir().unwrap();
++    let first = server.transport();
++    let gated = Gated::new(first.clone());
++    let storage = engine(dir.path());
++    let client = Client::open(
++        ClientConfig::new("ana"),
++        storage.clone(),
++        FileMetadata::new(dir.path()),
++        gated.clone(),
++    )
++    .await
++    .unwrap();
++    open_room(&client, &room_id).await.unwrap();
++
++    first.lose_next_reply(Commit);
++    let held = Arc::clone(&gated.gate).lock_owned().await;
++    let restart = async {
++        // The first attempt was sequenced and its reply lost; the retry waits at the gate.
++        gated.commit_sent(2).await;
++        gated.inner().settled().await;
++        assert_eq!(server_head(&server, &room_id).await, 1);
++        server.restart(|_| {}).await;
++        gated.replace(server.transport());
++        drop(held);
++    };
++    let (written, ()) = tokio::join!(client.write(room_id.clone(), insert_task(1)), restart);
++    assert_eq!(written, Ok(()));
++    assert_eq!(server_head(&server, &room_id).await, 1, "sequenced twice");
++    assert_eq!(tasks(&storage, &room_id).await, [1]);
++    let mut ids = mutation_ids(&first);
++    ids.extend(mutation_ids(&gated.inner()));
++    assert!(
++        ids.len() >= 2 && ids.iter().all(|id| *id == ids[0]),
++        "{ids:?}"
++    );
++    assert_eq!(in_flight(&client, &room_id).await, (0, 0));
++}
++
++/// INV-K2 (a) through a discard: the reply of the first attempt is lost after the old
++/// incarnation sequenced it, and the room is created again before the retry. The retry gets
++/// `ClientNotRegistered`, the registration that follows gets `RoomReset` and discards the
++/// replica: the write ends as uncertain, and no attempt reaches the new room.
++#[tokio::test(start_paused = true)]
++async fn audit_k2_an_uncertain_attempt_then_a_room_created_again_ends_the_write_unknown() {
++    let server = TestServer::new();
++    let room_id = server.create_room("room-a").await;
++    let dir = tempdir().unwrap();
++    let transport = server.transport();
++    let gated = Gated::new(transport.clone());
++    let storage = engine(dir.path());
++    let client = Client::open(
++        ClientConfig::new("ana"),
++        storage.clone(),
++        FileMetadata::new(dir.path()),
++        gated.clone(),
++    )
++    .await
++    .unwrap();
++    open_room(&client, &room_id).await.unwrap();
++
++    transport.lose_next_reply(Commit);
++    let held = Arc::clone(&gated.gate).lock_owned().await;
++    let recreate = async {
++        gated.commit_sent(2).await;
++        transport.settled().await;
++        assert_eq!(server_head(&server, &room_id).await, 1);
++        server.recreate_room(&room_id).await;
++        drop(held);
++    };
++    let (written, ()) = tokio::join!(client.write(room_id.clone(), insert_task(1)), recreate);
++    assert_eq!(written, Err(ClientError::OutcomeUnknown));
++    transport.settled().await;
++    // The retry got `ClientNotRegistered` from the new room, and nothing was sent afterwards.
++    assert_eq!(commits(&transport).len(), 2);
++    assert_eq!(server_head(&server, &room_id).await, 0);
++    // One discard on opening without metadata, and one for the room created again.
++    let status = client.status(room_id.clone()).await.unwrap();
++    assert_eq!(
++        (status.epoch, status.writes_in_flight, status.retained),
++        (2, 0, 0)
++    );
++    assert!(tasks(&storage, &room_id).await.is_empty());
++}
++
++/// INV-K2 (d): the room is closed and opened again, in the same epoch, while the `CommitAck` of
++/// a write is on its way. The catch-up of that `CommitAck` still reaches the reopened replica
++/// (same epoch, same incarnation), which applies the sequence with its report, but the write
++/// ended when the room closed: it is uncertain, never `Ok` nor the decision of another write.
++#[tokio::test(start_paused = true)]
++async fn audit_k2_a_commit_ack_after_the_room_closed_and_opened_again_is_unknown() {
++    let dir = tempdir().unwrap();
++    let (server, room_id, transport, storage, client) = setup(dir.path(), engine(dir.path())).await;
++    let epoch = client.status(room_id.clone()).await.unwrap().epoch;
++    let mut held = transport.hold_next_reply(Commit);
++    let mut write = pin!(client.write(room_id.clone(), update_task(9)));
++    tokio::select! {
++        written = &mut write => panic!("{written:?}"),
++        () = held.replied() => {}
++    }
++    client.close_room(room_id.clone()).await.unwrap();
++    open_room(&client, &room_id).await.unwrap();
++    assert_eq!(client.status(room_id.clone()).await.unwrap().epoch, epoch);
++    held.release();
++    assert_eq!(write.await, Err(ClientError::OutcomeUnknown));
++    // The replica applied the catch-up, with the rejection, after the write ended.
++    assert_eq!(server_head(&server, &room_id).await, 1);
++    let status = client.status(room_id.clone()).await.unwrap();
++    assert_eq!(status.head_seq.get(), 1);
++    assert_eq!((status.writes_in_flight, status.retained), (0, 0));
++    assert!(tasks(&storage, &room_id).await.is_empty());
++    // The next write takes the decision of its own sequence.
++    assert_eq!(client.write(room_id.clone(), insert_task(1)).await, Ok(()));
++    assert_eq!(tasks(&storage, &room_id).await, [1]);
++}
++
++/// INV-K2 (a): an attempt cut at the deadline, whose request reaches the server afterwards and
++/// is sequenced, makes the write uncertain, never `Network`.
++#[tokio::test(start_paused = true)]
++async fn audit_k2_an_attempt_cut_at_the_deadline_that_lands_afterwards_is_unknown() {
++    let dir = tempdir().unwrap();
++    let (server, room_id, transport, storage, client) = setup(dir.path(), engine(dir.path())).await;
++    transport.slow_next(Commit, Duration::from_secs(40));
++    let written = client.write(room_id.clone(), insert_task(1)).await;
++    assert_eq!(written, Err(ClientError::OutcomeUnknown));
++    assert_eq!(commits(&transport).len(), 1);
++    transport.settled().await;
++    assert_eq!(server_head(&server, &room_id).await, 1);
++    client.sync(room_id.clone()).await.unwrap();
++    assert_eq!(tasks(&storage, &room_id).await, [1]);
++}
++
++/// INV-K15: what a room retains for a write without its `CommitAck` is the rejections the
++/// replica applied after what the write saw, as many as the room sequenced meanwhile, and
++/// nothing once the write ends; one that starts after them retains none of them.
++#[tokio::test(start_paused = true)]
++async fn audit_k15_a_room_retains_only_the_rejections_after_seen_while_a_write_has_no_ack() {
++    let dir = tempdir().unwrap();
++    let (server, room_id, transport, _, client) = setup(dir.path(), engine(dir.path())).await;
++    // Rejections at or below the head the write sees are never retained.
++    server
++        .commit_ops(&room_id, (1..=5).map(|_| update_task(9)))
++        .await;
++    client.sync(room_id.clone()).await.unwrap();
++    transport.answer_every(Commit, |message| {
++        let (correlation_id, room_id) = request(message);
++        error_reply(correlation_id, &room_id, ErrorCode::RoomLocked)
++    });
++    let mut write = pin!(client.write(room_id.clone(), insert_task(1)));
++    let polled = std::future::poll_fn(|cx| Poll::Ready(write.as_mut().poll(cx))).await;
++    assert!(polled.is_pending());
++    assert_eq!(in_flight(&client, &room_id).await, (1, 0));
++    // Twenty rejections sequenced after what the write saw, and one accepted.
++    let mut ops: Vec<_> = (1..=20).map(|_| update_task(9)).collect();
++    ops.push(insert_task(5));
++    server.commit_ops(&room_id, ops).await;
++    tokio::select! {
++        written = &mut write => panic!("{written:?}"),
++        synced = client.sync(room_id.clone()) => synced.unwrap(),
++    }
++    assert_eq!(in_flight(&client, &room_id).await, (1, 20));
++    // A later write sees the head, and adds nothing for those.
++    let mut later = Box::pin(client.write(room_id.clone(), insert_task(2)));
++    let polled = std::future::poll_fn(|cx| Poll::Ready(later.as_mut().poll(cx))).await;
++    assert!(polled.is_pending());
++    assert_eq!(in_flight(&client, &room_id).await, (2, 20));
++    drop(later);
++    assert_eq!(in_flight(&client, &room_id).await, (1, 20));
++    // At its deadline, without effect.
++    let written = write.await;
++    assert!(
++        matches!(written, Err(ClientError::Network(_))),
++        "{written:?}"
++    );
++    assert_eq!(in_flight(&client, &room_id).await, (0, 0));
++}
++
++/// INV-K15: many writes at once on the same room, with a sync, all of them cut at the same
++/// poll: nothing stays in flight nor retained, and the next write goes on.
++#[tokio::test(start_paused = true)]
++async fn audit_k15_many_writes_cut_at_once_leave_nothing_in_flight_or_retained() {
++    let server = TestServer::new();
++    let room_id = server.create_room("room-a").await;
++    for polls in [1, 2, 3, 5, 8, 13, 21] {
++        let dir = tempdir().unwrap();
++        let transport = server.transport();
++        let storage = engine(dir.path());
++        let client = open_client(dir.path(), storage.clone(), &transport).await;
++        open_room(&client, &room_id).await.unwrap();
++        server.commit_ops(&room_id, [update_task(9)]).await;
++        transport.slow(Duration::from_millis(2));
++        let base = i64::from(polls) * 1000;
++        let writes = futures::future::join_all(
++            (0..16).map(|i| client.write(room_id.clone(), insert_task(base + i))),
++        );
++        let mut all = Box::pin(async { tokio::join!(writes, client.sync(room_id.clone())) });
++        for _ in 0..polls {
++            let polled = std::future::poll_fn(|cx| Poll::Ready(all.as_mut().poll(cx))).await;
++            if polled.is_ready() {
++                break;
++            }
++            tokio::time::sleep(Duration::from_millis(1)).await;
++        }
++        drop(all);
++        assert_eq!(in_flight(&client, &room_id).await, (0, 0), "{polls}");
++        let written = client.write(room_id.clone(), insert_task(base + 999)).await;
++        assert_eq!(written, Ok(()), "{polls}");
++        assert_eq!(in_flight(&client, &room_id).await, (0, 0), "{polls}");
++        client.shutdown().await.unwrap();
++        transport.settled().await;
++    }
++}
++
++/// INV-K11: a write whose caller is cut while its catch-up is being written, and then the
++/// client shut down: the shutdown waits for that change, so the catch-up is in the storage room
++/// opened again in the same process.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn audit_k11_shutdown_after_a_write_cut_while_its_catch_up_is_written_loses_nothing() {
++    let (server, dir) = (TestServer::new(), tempdir().unwrap());
++    let room_id = server.create_room("room-a").await;
++    let transport = server.transport();
++    let files = TestFiles::default();
++    let storage = DiskStorageEngine::with_files(options(dir.path()), files.clone()).unwrap();
++    let client = open_client(dir.path(), storage.clone(), &transport).await;
++    open_room(&client, &room_id).await.unwrap();
++    server.commit(&room_id, [1, 2]).await;
++
++    files.slow(Duration::from_millis(300));
++    tokio::select! {
++        written = client.write(room_id.clone(), insert_task(3)) => panic!("{written:?}"),
++        () = files.logged("write_at room_room-a.wal") => {}
++    }
++    client.shutdown().await.unwrap();
++    let head = storage.get_head_seq(&room_id).await;
++    assert!(
++        matches!(head, Err(StorageError::RoomNotFound(_))),
++        "{head:?}"
++    );
++
++    let storage = engine(dir.path());
++    let client = open_client(dir.path(), storage.clone(), &transport).await;
++    open_room(&client, &room_id).await.unwrap();
++    assert_eq!(
++        client.status(room_id.clone()).await.unwrap().head_seq.get(),
++        3
++    );
++    assert_eq!(tasks(&storage, &room_id).await, [1, 2, 3]);
++}
++
++/// INV-K11: a room without metadata whose registration is on its way when the client shuts
++/// down: its `Registered` arrives afterwards and opens nothing, saves no metadata, and the
++/// metadata and the storage room are free for the next client of the directory.
++#[tokio::test(start_paused = true)]
++async fn audit_k11_a_registration_that_comes_after_the_shutdown_opens_nothing() {
++    let server = TestServer::new();
++    let room_id = server.create_room("room-a").await;
++    let dir = tempdir().unwrap();
++    let transport = server.transport();
++    let storage = engine(dir.path());
++    let client = open_client(dir.path(), storage.clone(), &transport).await;
++    let mut held = transport.hold_next_reply(RegisterClient);
++    let mut opening = pin!(open_room(&client, &room_id));
++    tokio::select! {
++        opened = &mut opening => panic!("{opened:?}"),
++        () = held.replied() => {}
++    }
++    client.shutdown().await.unwrap();
++    held.release();
++    assert_eq!(opening.await, Err(ClientError::RoomClosed(room_id.clone())));
++    let head = storage.get_head_seq(&room_id).await;
++    assert!(
++        matches!(head, Err(StorageError::RoomNotFound(_))),
++        "{head:?}"
++    );
++    // The next client of the directory opens: the metadata are free, and the room has none.
++    let metadata = FileMetadata::new(dir.path());
++    metadata.open().await.unwrap();
++    assert_eq!(metadata.room(&room_id).await.unwrap(), None);
++    metadata.close().await;
++    let client = open_client(dir.path(), engine(dir.path()), &transport).await;
++    open_room(&client, &room_id).await.unwrap();
++    assert_eq!(client.status(room_id.clone()).await, Ok(status(0, 1, true)));
++}
++
++/// Bajo (INV-K2, K7, K15): a write with its `CommitAck` whose replica turns out to be behind the
++/// log, with only a snapshot larger than `max_snapshot_bytes` to catch up from, waits without
++/// end while the room is open, as INV-K2 says, and every round of its wait asks again for the
++/// first chunk of that snapshot, which it never downloads: a chunk of up to 4 MiB per backoff,
++/// for as long as the room stays open.
++#[tokio::test(start_paused = true)]
++async fn audit_bajo_a_write_waiting_behind_an_oversized_snapshot_asks_for_its_first_chunk_again_and_again(
++) {
++    let server = TestServer::pruning();
++    let room_id = server.create_room("room-a").await;
++    let dir = tempdir().unwrap();
++    let transport = server.transport();
++    let config = ClientConfig {
++        max_snapshot_bytes: 16,
++        ..ClientConfig::new("ana")
++    };
++    let client = Client::open(
++        config,
++        engine(dir.path()),
++        FileMetadata::new(dir.path()),
++        transport.clone(),
++    )
++    .await
++    .unwrap();
++    open_room(&client, &room_id).await.unwrap();
++    // The log moves past the replica, which does not know it yet.
++    let ops = server.commit(&room_id, 1..=9).await;
++    server.prune(&room_id, 6).await;
++    let image = snapshot(&room_id, tasks_schema(), &ops[..7]).await;
++    assert!(image.len() > 16);
++    server.upload(&room_id, 7, image).await;
++    // The `CommitAck` leaves the sequence 10 to the syncs of the write.
++    transport.answer_next(Commit, |message| ack_without_catch_up(message, 10));
++    let write = client.write(room_id.clone(), insert_task(1));
++    let waited = tokio::time::timeout(Duration::from_secs(600), write).await;
++    assert!(waited.is_err(), "{waited:?}");
++    let first_chunks = transport
++        .sent()
++        .iter()
++        .filter(|message| {
++            matches!(
++                message,
++                ClientMessage::RequestSnapshotChunk { chunk_index: 0, .. }
++            )
++        })
++        .count();
++    eprintln!("first chunks requested in 600 s: {first_chunks}");
++    assert!(first_chunks > 100, "{first_chunks}");
++    assert_eq!(in_flight(&client, &room_id).await, (0, 0));
++}
++
++/// Bajo (INV-K2): a `CommitAck` taken when the head of the storage room cannot be read ends the
++/// write as uncertain at once, although the room stays open and its catch-up then applies the
++/// sequence with its report: an uncertain result outside the four cases of INV-K2. It fails
++/// safe (never a wrong decision), and needs an engine whose `get_head_seq` fails on an open
++/// room, which neither the disk nor the memory engine does.
++#[tokio::test(start_paused = true)]
++async fn audit_bajo_a_commit_ack_with_an_unreadable_head_is_unknown_though_its_sequence_applies() {
++    let dir = tempdir().unwrap();
++    let storage = TestEngine::new(engine(dir.path()));
++    let (_server, room_id, transport, storage, client) = setup(dir.path(), storage).await;
++    let failing = storage.clone();
++    transport.answer(move |message| {
++        if message.kind() == Commit {
++            let injected = StorageError::Other("injected".to_string());
++            failing.fail_next("get_head_seq", injected);
++        }
++        None
++    });
++    let written = client.write(room_id.clone(), insert_task(1)).await;
++    assert_eq!(written, Err(ClientError::OutcomeUnknown));
++    // The room is open, and its catch-up applied the sequence with its report: `Ok`.
++    let status = client.status(room_id.clone()).await.unwrap();
++    assert_eq!((status.head_seq.get(), status.registered), (1, true));
++    assert_eq!(tasks(&storage, &room_id).await, [1]);
++}

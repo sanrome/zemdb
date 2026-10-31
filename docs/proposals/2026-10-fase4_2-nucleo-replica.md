@@ -2,7 +2,7 @@
 
 **Fecha:** 26 de Octubre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lotes 0 (el contrato), 1 (`delete_room`), 2 (la encarnación en los chunks del relay), 3 (el esqueleto del cliente), 4 (apertura, registro, descarte y cierre), 5 (el aplicador y `sync`), 6 (el esquema), 7 (las escrituras), 8 (el heartbeat y la bajada de snapshots), 9 (la subida de snapshots) 10 (el arnés de simulación) y 11 (el fuzzing de respuestas y snapshots) cerrados. DC18 a DC23 adoptadas el 28 de Octubre de 2026. El próximo es el Lote 12 (la auditoría amplia y el cierre).
+**Estado:** Cerrada el 31 de Octubre de 2026, con la auditoría amplia del SDK en verde sobre `9de2c1b` ([informe](../audits/2026-10-fase4_2-audit/README.md)): Lotes 0 (el contrato), 1 (`delete_room`), 2 (la encarnación en los chunks del relay), 3 (el esqueleto del cliente), 4 (apertura, registro, descarte y cierre), 5 (el aplicador y `sync`), 6 (el esquema), 7 (las escrituras), 8 (el heartbeat y la bajada de snapshots), 9 (la subida de snapshots), 10 (el arnés de simulación), 11 (el fuzzing de respuestas y snapshots) y 12 (la auditoría amplia y el cierre) cerrados. DC18 a DC23 adoptadas el 28 de Octubre de 2026.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.2. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 
@@ -136,7 +136,7 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
 | 9 | La subida de snapshots | client | DC22, DC23 | K7, K4 | ✅ |
 | 10 | El arnés de simulación | client (tests) | §5.3 del plan de la fase | K1, K2, K3, K4, K7, K15 | ✅ |
 | 11 | Robustez: fuzzing de respuestas y snapshots | client (tests) | — | K12 | ✅ |
-| 12 | Auditoría amplia y cierre | Documentos | Todas | Las de §3.11 que toca 4.2, S8 y R6 | ⬜ |
+| 12 | Auditoría amplia y cierre | Documentos | Todas | Las de §3.11 que toca 4.2, S8 y R6 | ✅ |
 
 **Orden.**
 - El Lote 0 va primero: solo documentos, con su revisión cruzada (`docs/METODOLOGIA.md` §2). Las *Propuestas* se confirman antes del Lote 1.
@@ -1477,9 +1477,94 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
        - el mensaje del contador de pánicos dice que es del proceso.
   2. **En verde, con menores de documentos.** Corrió 330 semillas del fuzzing corto (300 con 4 procesos a la vez), 16 corridas de los 4 tests del archivo y la larga del fuzzing con 4 semillas en debug, sin fallas, y no encontró falsos positivos del filtro acotado: el cliente aplica un lote solo si sigue al cursor del pedido, la misma condición del filtro. Sus menores, atendidos: la versión larga no detecta en release la mutación de la resta (no hay `overflow-checks`), lo dice la nota; el doc del módulo decía que una escritura puede terminar de cualquier modo; los conteos de la nota eran del filtro anterior, y ahora suman los suyos; y las líneas de estado del plan.
 
-### Lote 12 · Auditoría amplia y cierre
+### Lote 12 · Auditoría amplia y cierre · ✅ Hecho
 - La auditoría amplia del SDK (DC3, §3), con el método de `INVARIANTES.md` §1. Si no sale en verde, sus rupturas se arreglan en lotes nuevos de 4.2, cada uno con su revisión de delta, antes de abrir 4.3 y 4.4.
 - `INVARIANTES.md`: el estado de cada invariante auditada. El plan de la fase: 4.2 cerrada. `ROADMAP.md`: "Lo que sigue", 4.3 y 4.4.
+
+**Hecho.**
+- **La auditoría amplia** del SDK (DC3, §3) sobre `9de2c1b`, con el método de `INVARIANTES.md` §1 y tres auditores en paralelo, de contexto fresco y solo lectura, cada uno con sus corridas en una copia: réplica y log; escrituras; recuperación y robustez. **En verde** por las tres condiciones de `INVARIANTES.md` §1.4: ninguna invariante se rompe, y no hace falta ningún lote nuevo. El informe, con el argumento de cada veredicto, las corridas de los auditores y sus tests como parches, está en [`docs/audits/2026-10-fase4_2-audit/`](../audits/2026-10-fase4_2-audit/README.md).
+  - **Réplica y log:** se sostienen K1, K4, K5, K6, C1 en el cliente, y W1 y W2 de los metadatos del cliente.
+  - **Escrituras:** se sostienen K2, K11 y K15. El pendiente del Lote 10 no esconde ninguna violación: el arnés no produce el caso (c) de K2 ni una sala que falla cerrada, y los dos caminos tienen tests propios.
+  - **Recuperación y robustez:** se sostienen K3, K7 (sin el `SyncWorker` de 4.3), K12, S8 y la parte de 4.2 de R6, que sigue ❌ Bajo por DEF-188. Lo que el filtro del fuzzing del Lote 11 no fabrica queda fuera de alcance: un servidor que miente, y un snapshot falso (DEF-81, §4).
+  - **Verificación:** con los tres parches juntos sobre `9de2c1b`, pasan 164 tests de `zemdb-client` y falla, a propósito, el de DEF-189; el de `zemdb-storage` pasa.
+- **Bajos corregidos en este lote** (documentos):
+  - `INVARIANTES.md`:
+    - §2: el criterio de una respuesta que responde al pedido (abajo, en la revisión de delta).
+    - INV-K2: una escritura cuya sala se cierra antes de que llegue su `CommitAck` termina como en (d), aunque la sala se vuelva a abrir y su secuencia se aplique después.
+    - INV-K2 y K5, *Límite aceptado*: el cursor de un sync, un ack o un commit se lee bajo el aplicador y se manda después de soltarlo, así que un pedido leído antes de un descarte puede salir después.
+    - El texto viejo de la introducción de §3.11 y del *Sostenida por* de INV-K4.
+    - INV-K12: las respuestas se decodifican sin presupuesto de valores, y reservan hasta unas 24 veces su tamaño, la constante de una legítima.
+    - INV-K15: la entrada de cada sala que el cliente abrió, que vive lo que el cliente.
+  - `ARCHITECTURE.md` §11:
+    - *Schema*: un guardado de los metadatos cuyo `sync_dir` falló se vuelve durable con la próxima apertura de la sala, porque el motor en disco sincroniza su directorio al abrirla;
+    - *Attempts*: los finales de una escritura con un error del cliente.
+  - El rustdoc de `ClientError::Config`, que no nombraba el backoff, el plazo ni los snapshots, y el de `Client::write`, que no nombraba los finales con un error del cliente ni el `CommitAck` que llega después de cerrar la sala.
+- **Al backlog** (Bajos de tests y de código: `INVARIANTES.md` §1.2):
+  - **DEF-189 · Bajo · (a) · C1, K6.**
+    - **Qué pasa:** un guardado de los metadatos cuyo `sync_dir` falla después del rename deja el archivo visible, pero quizás no durable; la sala se cierra, y su próxima apertura lo usa.
+    - **En la configuración del contrato** (`FileMetadata` en el directorio del motor), abrir la sala del storage sincroniza ese directorio antes de escribir nada bajo ese esquema.
+    - **Con los metadatos en otro directorio**, que §11 excluye pero el código no impide, un crash puede conservar en el WAL las operaciones del esquema nuevo y perder el rename. La réplica reabre entonces con el esquema viejo, más angosto que su log, y diverge sin aviso.
+    - **Por qué es Bajo:** solo pasa fuera de la configuración del contrato. Dentro de ella, por D91, una divergencia sin aviso conservaría la severidad de C1.
+    - **Fix:** que `FileMetadata` vuelva a sincronizar su directorio antes de servir lo que guardó después de un error, o atar en el código los metadatos al directorio del motor; y que lo cumpla el OPFS, en 4.5.
+    - **Test:** en `replica.patch`, que falla a propósito.
+  - **DEF-190 · Bajo · (a) · K7, K15.**
+    - **Qué pasa:** una réplica detrás del log, cuyo único snapshot pasa `max_snapshot_bytes`, pide su primer chunk (hasta 4 MiB) en cada heartbeat. Una escritura con su `CommitAck` que la esperaba lo pidió 251 veces en 600 s.
+    - **Por qué:** un snapshot más largo que el tope no queda descartado (`dropped`), como sí queda uno que no se instala. Con el `SyncWorker` de 4.3, pasaría en cada heartbeat.
+    - **Fix:** recordar como descartado el snapshot más largo que el tope, por su secuencia y el tamaño que anuncia, antes de 4.3.
+    - **Test:** en `escrituras.patch`.
+  - **DEF-191 · Bajo · (a) · K12, K7.**
+    - **Qué pasa:** el tope de la bajada se mira antes de comparar el chunk con el primero, así que un chunk anclado que no sigue al primero y anuncia más que el tope es `Config` (subir el tope o descartar la sala) en lugar de `Network`, y el worker de 4.3 no lo reintentaría. Solo pasa con una respuesta dañada.
+    - **Fix:** mirar el tope solo en el primer chunk, antes de 4.3.
+    - **Test:** en `recuperacion.patch`.
+  - **DEF-192 · Bajo · (a) · K2.**
+    - **Qué pasa:** un `HeartbeatAck` con la correlación y la sala del pedido, pero con un head más allá del del servidor, sube para siempre el head visto de la época. Desde ahí, toda escritura posterior de la sala termina `OutcomeUnknown` hasta cerrarla, aunque ningún intento haya quedado incierto y la réplica haya aplicado su secuencia.
+    - **Alcance:** hace falta una respuesta dañada que decodifica y responde al pedido, que por el criterio de §2 cuenta como del servidor y queda fuera de alcance; falla del lado seguro.
+    - **Endurecimiento opcional**, para 4.3, donde con el worker duraría hasta que la aplicación cierre la sala: que una respuesta con un head menor que el visto al mandar el pedido lo vuelva a tomar del registro.
+    - **Test:** en `recuperacion.patch`.
+  - **DEF-193 · Bajo · (a) · K3.**
+    - **Qué pasa:** ningún test de la suite corta un cambio de la réplica a la mitad (el crash de la simulación suelta el cliente, pero sus tareas siguen hasta el final), y el arnés no verifica los descartes con fuzzing.
+    - **Fix:**
+      - traer a la suite, de `recuperacion.patch`, los tres tests de cortes en cada punto y el de fuzzing de todo menos los registros;
+      - en el arnés, contar los `RoomReset` e `InvalidSequence` fabricados a registros con cursor, y verificar los demás descartes.
+    - **Test:** los de `recuperacion.patch`.
+  - **DEF-194 · Bajo · (a) · K1, K5, K6.**
+    - **Qué pasa:** el arnés corre los eventos de esquema y de sala solo entre pasos, nunca con pedidos en vuelo, y no verifica los cursores (no mayores que el head del storage, y la encarnación del registro). Esos cruces los cubren tests deterministas.
+    - **Fix:** el transporte que verifica cada pedido de `replica.patch`, dentro de `Link`, y eventos concurrentes con un paso.
+    - **Test:** los de `replica.patch`.
+  - **DEF-195 · Bajo · (b) · K12.**
+    - **Qué pasa:** las respuestas se decodifican sin presupuesto de valores, desde la Fase 3.9, y reservan hasta unas 24 veces su tamaño (ahora en el enunciado de INV-K12). En wasm32, una reserva que falla aborta.
+    - **A revisar** con cada transporte: en 4.3, que el adaptador `reqwest` no lea un cuerpo más largo que `MAX_FRAME_SIZE`; en 4.5, el tamaño máximo de una respuesta del navegador, y si 24 veces ese tamaño entra en la memoria del Worker.
+  - **DEF-196 · Bajo · (a) · K7.**
+    - **Qué pasa:** un `Registered` con una cola del log (`tail_seq`) que deja la réplica detrás del log (su head, menor que `tail_seq - 1`), que el cliente no puede verificar, la deja esperando un snapshot que nadie anuncia. Los syncs fallan con `Network` y los heartbeats no la sacan hasta que la sala se cierra y se vuelve a abrir, también con el worker de 4.3.
+    - **Alcance:** por el criterio de §2, queda fuera de alcance, como DEF-192.
+    - **Endurecimiento opcional**, para 4.3: que una réplica que espera un snapshot que nadie anuncia vuelva a sincronizar al rato; con el servidor, `BehindCompaction` le confirma el hueco.
+    - **Test:** en `review.patch`, de la revisión de delta.
+- **Notas sin defecto y tres propuestas de invariantes** (§1.2), pendientes de la decisión del dueño del proyecto: en §3 y §4 del informe.
+- **Pendientes que pasan a 4.3 y 4.5**, en sus secciones del plan de la fase:
+  - DEF-190 y DEF-191, antes del `SyncWorker` de 4.3, y DEF-195 con su adaptador `reqwest`; DEF-192 y DEF-196, opcionales;
+  - DEF-189 y DEF-195, con el OPFS y el transporte del navegador de 4.5.
+- **Documentos:**
+  - `INVARIANTES.md`, versión 10: el resultado en §1.4 y en el resumen, el estado de cada invariante auditada sin la marca de sin auditar, y las precisiones de arriba.
+  - El plan de la fase: 4.2 cerrada, la precisión de DC11 y los pendientes en 4.3 y 4.5.
+  - `ROADMAP.md`: "Lo que sigue", 4.3 y 4.4.
+- **Desvíos:**
+  - W1 y W2 de los metadatos del cliente, que §3 no reparte y figuraban sin auditar, los auditó el auditor de la réplica, cuyo foco incluye los metadatos.
+  - Las decisiones D1 a D102 y DR1 a DR15, que `INVARIANTES.md` §1.6 también reparte, no se les dieron aparte a los auditores: las citan los documentos que recibieron, y estaban en el repo.
+- **Revisión de delta** de este lote (agente aparte, de contexto fresco y solo lectura), en tres rondas:
+  1. **No en verde.**
+     - **El bloqueante:** §2 sacaba de alcance una respuesta dañada que cambia lo que el cliente toma del servidor, con una lista que no nombraba los heads ni la cola. Con ese texto, DEF-192 quedaba dentro del modelo y rompía INV-K2 ★. El revisor mostró con un test el mismo borde en la cola de `Registered` contra INV-K7: DEF-196.
+     - **La decisión:** el dueño del proyecto adoptó, el 31 de Octubre, el criterio general que ya daba DC11 (2), ahora en `INVARIANTES.md` §2 y como precisión de DC11. Una respuesta que decodifica, responde al pedido (tipo, y correlación y sala si las trae) y no viola nada que el cliente verifique cuenta como del servidor, en cualquier campo. Lo que el cliente verifica sigue dentro (DEF-191).
+       - No achica nada de lo auditado: INV-K1 se sostuvo con heads falsos en el fuzzing del Lote 11.
+       - DEF-192 y DEF-196 quedan como endurecimientos opcionales.
+     - **Sus ajustes, atendidos:**
+       - el commit en la ventana de INV-K2 y K5, y el sync en la propuesta de la encarnación;
+       - el rustdoc de `write`, con el `CommitAck` que llega después de cerrar la sala.
+     - **Sus menores, atendidos:** los textos viejos de §3.11 y de INV-K4; el conteo de los tests de K2; lo que recibió cada auditor; las condiciones de un descarte; INV-E3, todavía 🆕, bajo K6 y C1; la severidad de DEF-189; el arreglo de DEF-190; *Attempts* en §11; DEF-195 en el adaptador nativo; y esta nota, más corta.
+  2. **No en verde.**
+     - **El bloqueante:** el criterio decía que la respuesta trae la correlación y la sala del pedido, y el cliente también toma un error sin ellas. El revisor mostró con un test que un `SchemaViolation` sin correlación ni sala en lugar del `CommitAck` de un commit secuenciado termina la escritura con `Validation`. El criterio dice ahora "y su correlación y su sala si las trae", lo que el cliente verifica: es la misma decisión, y el test queda en `review.patch`.
+     - **Su ajuste, atendido:** el tope del cuerpo del adaptador `reqwest` es `MAX_FRAME_SIZE`, no `MAX_MESSAGE_SIZE`, que es el del payload.
+     - **Sus menores, atendidos:** INV-K12 vale igual para esas respuestas; DEF-192 y DEF-196 duran hasta que la aplicación cierra la sala, no hasta reiniciar el cliente; el endurecimiento de DEF-192, con el head visto al mandar el pedido; el disparador exacto de DEF-196; la redacción del límite de INV-K2; y `review.patch`, formateado.
+  3. **En verde**, sin hallazgos: las cuatro formulaciones del criterio coinciden entre sí y con el código, y lo de las dos rondas anteriores quedó entero.
 
 ---
 
@@ -1499,4 +1584,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. Lote 1 cerrado el 28 de Octubre (`delete_room`), con la revisión de delta en verde. Lote 2 cerrado el mismo día (la encarnación en los chunks del relay), con la revisión de delta en verde. Lote 3 cerrado el mismo día (el esqueleto del cliente: transporte, metadatos y `Client::open`), con la revisión de delta en verde. Lote 4 cerrado el mismo día (apertura, registro, descarte y cierre de las salas), con la revisión de delta en verde. Lote 5 cerrado el 29 de Octubre (el aplicador y `sync`), con la revisión de delta en verde. Lote 6 cerrado el mismo día (el esquema), con la revisión de delta en verde. Lote 7 cerrado el mismo día (las escrituras), con la revisión de delta en verde en su segunda ronda. Lote 8 cerrado el 30 de Octubre (el heartbeat y la bajada de snapshots), con la revisión de delta en verde en su tercera ronda. Lote 9 cerrado el mismo día (la subida de snapshots y el reintento de un chunk), con la revisión de delta en verde en su tercera ronda. Lote 10 cerrado el mismo día (el arnés de simulación), con la revisión de delta en verde en su tercera ronda. Lote 11 cerrado el mismo día (el fuzzing de respuestas y snapshots), con la revisión de delta en verde en su segunda ronda. El próximo es el Lote 12.
+**Avance:** Lote 0 cerrado el 27 de Octubre de 2026, con la revisión cruzada en verde en su cuarta ronda. DC18 adoptada el 28 de Octubre, con métodos en lugar de un `execute(Command)` y los pasos `sync` y `heartbeat` como API de bajo nivel que la fachada de 4.4 esconde. DC19 a DC23 adoptadas el mismo día. Lote 1 cerrado el 28 de Octubre (`delete_room`), con la revisión de delta en verde. Lote 2 cerrado el mismo día (la encarnación en los chunks del relay), con la revisión de delta en verde. Lote 3 cerrado el mismo día (el esqueleto del cliente: transporte, metadatos y `Client::open`), con la revisión de delta en verde. Lote 4 cerrado el mismo día (apertura, registro, descarte y cierre de las salas), con la revisión de delta en verde. Lote 5 cerrado el 29 de Octubre (el aplicador y `sync`), con la revisión de delta en verde. Lote 6 cerrado el mismo día (el esquema), con la revisión de delta en verde. Lote 7 cerrado el mismo día (las escrituras), con la revisión de delta en verde en su segunda ronda. Lote 8 cerrado el 30 de Octubre (el heartbeat y la bajada de snapshots), con la revisión de delta en verde en su tercera ronda. Lote 9 cerrado el mismo día (la subida de snapshots y el reintento de un chunk), con la revisión de delta en verde en su tercera ronda. Lote 10 cerrado el mismo día (el arnés de simulación), con la revisión de delta en verde en su tercera ronda. Lote 11 cerrado el mismo día (el fuzzing de respuestas y snapshots), con la revisión de delta en verde en su segunda ronda. Lote 12 cerrado el 31 de Octubre (la auditoría amplia del SDK, en verde sobre `9de2c1b`, y el cierre), con la revisión de delta en verde en su tercera ronda. 4.2 cerrada.
