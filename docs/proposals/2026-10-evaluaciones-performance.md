@@ -29,7 +29,7 @@
 - **La primera versión** dejaba el arnés en una rama por evaluación, sin mergearlo. El dueño del proyecto trabaja solo sobre `main`, sin ramas, y la Fase 3.12 mide cada optimización con este arnés antes y después, así que el arnés pasa a `main`: el generador y sus scripts, en `tools/perf`, fuera del workspace (`exclude` en el `Cargo.toml` de la raíz), para que no entre a la CI de cada push ni a los chequeos de cierre de los lotes. Lo trae el Lote 1 de la Fase 3.12.
 - **Lo que solo sirve para un diagnóstico dentro del servidor** (los interruptores de §3.7.4 y §4.7 y el prototipo de §4.8) no entra al código de `main`. Cada evaluación describe el cambio; si hace falta repetirlo, se guarda como un parche en `tools/perf/diagnostics/`, que se aplica sobre una copia local para medir y se descarta.
 - **Lo que queda en `main` de cada evaluación:** sus resultados, con el entorno y el commit medido, y sus datos crudos en `tools/perf/results/`.
-- **Hasta el Lote 1 de la Fase 3.12,** el código de las Evaluaciones 1 y 2 está en las ramas `perf/e1-commit` y `perf/e2-salas`, que se borran cuando el lote lo trae a `main`.
+- **El Lote 1 de la Fase 3.12 lo trajo a `main`** el 1 de Noviembre de 2026, y las ramas de las evaluaciones se borraron.
 
 ### DP2 · Medir no es optimizar
 - Una evaluación cierra con sus preguntas respondidas y una lista de cuellos de botella ordenada por su costo medido, no con cambios en el servidor.
@@ -115,7 +115,7 @@ En tmpfs el `fsync` casi no cuesta, así que la 1b muestra el costo del código.
 
 ### 3.7 Resultados
 
-Medidos el 30 y el 31 de Octubre de 2026. El código entra a `main` en el Lote 1 de la Fase 3.12, en `tools/perf` (DP1): el generador, `run_e1.sh` (una corrida por línea JSON), `summarize.sh` (la mediana de las repeticiones) y `profile_e1.sh` (el perfil de CPU).
+Medidos el 30 y el 31 de Octubre de 2026. El código está en [`tools/perf`](../../tools/perf/README.md) (DP1): el generador, `run_e1.sh` (una corrida por línea JSON), `summarize.sh` (la mediana de las repeticiones) y `profile_e1.sh` (el perfil de CPU).
 
 #### Entorno
 - **Máquina:** una VM (Firecracker) de 4 vCPU Intel Xeon a 2,1 GHz y 15 GiB de RAM, en la nube, con *steal time* (el host le quita CPU a ratos). Ubuntu 24.04, kernel 6.18 del huésped.
@@ -263,7 +263,7 @@ El caso de uso típico: muchas salas, cada una con varios clientes que escriben 
 
 ### 4.7 Resultados
 
-Medidos el 31 de Octubre de 2026, en la misma máquina que la Evaluación 1 (§3.7) y con el mismo binario del servidor. El código entra a `main` en el Lote 1 de la Fase 3.12, en `tools/perf` (DP1): el modo `rooms` del generador (`rooms.rs`), `run_e2.sh` (una corrida contra un servidor nuevo), `e2_all.sh` (todas las mediciones) y `summarize_e2.sh` (la mediana de las repeticiones), con los datos crudos en `tools/perf/results/`.
+Medidos el 31 de Octubre de 2026, en la misma máquina que la Evaluación 1 (§3.7) y con el mismo binario del servidor. El código está en [`tools/perf`](../../tools/perf/README.md) (DP1): el modo `rooms` del generador (`rooms.rs`), `run_e2.sh` (una corrida contra un servidor nuevo), `e2_all.sh` (todas las mediciones) y `summarize_e2.sh` (la mediana de las repeticiones), con los datos crudos en `tools/perf/results/`.
 
 #### Cómo se midió, y en qué se apartó del plan
 - **78 corridas, 3 repeticiones por punto, todas válidas:** sin errores de commit, con el head de cada sala igual a los commits confirmados, sin huecos en lo que aplicó cada cliente, sin streams SSE cortados, con todos los clientes al día al terminar, sin advertencias en el log del servidor y con el generador por debajo del 90% de sus núcleos. El atraso del generador (desde el momento programado hasta que sale el commit) fue de unos 2 ms en p99, la resolución del temporizador de Tokio.

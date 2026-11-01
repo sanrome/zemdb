@@ -1,0 +1,27 @@
+# The measurement harness of the performance evaluations
+# (docs/proposals/2026-10-evaluaciones-performance.md). Outside the workspace: it is not built
+# by the CI or by `cargo test --workspace`. See README.md.
+[package]
+name = "zemdb-perf"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+zemdb-core = { path = "../../crates/core" }
+zemdb-server = { path = "../../crates/server" }
+tokio = { version = "1.38", features = ["full"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1.6"
+serde_json = "1.0"
+base64 = "0.22"
+
+# Debug information for the CPU profiles (`profile_e1.sh`); it does not change the generated code.
+[profile.release]
+debug = true

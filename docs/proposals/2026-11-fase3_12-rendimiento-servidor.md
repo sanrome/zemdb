@@ -135,7 +135,7 @@ Prefijo **DS**. Todas son *Propuestas* hasta el Lote 0.
 | Orden | Lote | Crates | Decisiones | Invariantes | Progreso |
 |---|---|---|---|---|---|
 | 0 | Contrato | Documentos | DS1 a DS8 | Ajustes: B1, B3, B4, B5, D1, D7, E3, L7, R3, Y2 | ⬜ |
-| 1 | El arnés en `main` y la línea de base | `tools/perf` (fuera del workspace) | DS8 | — | ⬜ |
+| 1 | El arnés en `main` y la línea de base | `tools/perf` (fuera del workspace) | DS8 | — | ✅ (la línea de base, con el Lote 2) |
 | 2 | El presupuesto de respuestas | server | DS1 | B1, B5, L1 | ⬜ |
 | 3 | La E/S fuera de los workers | server | DS2 | D1, D7, L3, L5, L7, B3, B4 | ⬜ |
 | 4 | *Group commit* | server | DS3 | D1, D2, D7, Y1, Y4, Y5, L3, B4 | ⬜ |
@@ -222,7 +222,7 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 
 **Hecho.** *Pendiente.*
 
-### Lote 1 · El arnés en `main` y la línea de base · ⬜
+### Lote 1 · El arnés en `main` y la línea de base · ✅ Hecho
 **Objetivo:** que cada lote pueda medir antes y después sin ramas (DS8, DP1).
 
 **Archivos:** `tools/perf/` (nuevo): `Cargo.toml` con su propio `[workspace]`, `src/main.rs` y `src/rooms.rs` (el generador), `run_e1.sh`, `run_e2.sh`, `e2_all.sh`, `e2f_all.sh`, `profile_e1.sh`, `summarize.sh`, `summarize_e2.sh`, `README.md`, `results/` (los datos crudos de las evaluaciones) y `diagnostics/` (los parches de diagnóstico). El `Cargo.toml` de la raíz suma `exclude = ["tools/perf"]`.
@@ -241,7 +241,13 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 
 **Entrega:** `chore(perf): the measurement harness of the performance evaluations in tools/perf (Fase 3.12, Lote 1)`.
 
-**Hecho.** *Pendiente.*
+**Hecho.**
+- **El arnés,** en `tools/perf`, con su propio `Cargo.toml` (`[workspace]`, las dependencias por camino a `crates/core` y `crates/server`, y el `Cargo.lock` de la raíz recortado, así que usa las mismas versiones) y `exclude = ["tools/perf"]` en el de la raíz; `/tools/perf/target/` en el `.gitignore`. El generador y los scripts vienen de `perf/e2-salas`, que contenía a `perf/e1-commit`, como un commit nuevo sobre `main`, sin merge. Los scripts toman el servidor de `target/release/` de la raíz y el generador de `tools/perf/target/release/`. `cargo fmt` y `cargo clippy -- -D warnings` sobre el arnés, sin advertencias (un `map_or(true, …)` pasó a `is_none_or`).
+- **Los diagnósticos,** como parches en `tools/perf/diagnostics/`: `inline-io.patch` (sin `block_in_place`) y `sse-ops.patch` (el prototipo del evento `ops`), sacados del diff de las ramas contra su base; los dos aplican sobre `main`.
+- **Los datos crudos** de las evaluaciones, en `tools/perf/results/`. En los tres archivos de la Evaluación 1 que la tenían, la lista de commits lentos de cada corrida quedó resumida (cuántos hubo y los 20 más largos): ocupaba 8 MB, y ninguna cifra de las evaluaciones sale de ella.
+- **El `README`,** con cada escenario de §5.2, cómo preparar la máquina, cómo compilar y cómo usar los diagnósticos.
+- **Verificación:** el workspace no cambió (`cargo metadata` lista los mismos cuatro crates, `cargo fmt --all -- --check` pasa y el `Cargo.lock` de la raíz no cambia); el arnés compila; cada escenario corrió en su versión corta (una repetición de 2 a 5 s: E1 en tmpfs con 1 y 8 pedidos en vuelo, en disco y directo al actor; E2 con SSE en tmpfs y sin SSE en disco) contra el servidor de `main`, con corridas válidas.
+- **Desvíos:** el lote se adelantó al Lote 0, a pedido del dueño del proyecto, para no dejar el código en ramas; no toca el servidor ni el contrato. La línea de base de la fase no se midió: se mide al arrancar el Lote 2, en la misma sesión que su resultado (§5.1, paso 0), porque la máquina de esta sesión no es la de los lotes siguientes. Las ramas `perf/e1-commit`, `perf/e2-salas` y `claude/evaluaciones-performance` se borraron.
 
 ### Lote 2 · El presupuesto de respuestas · ⬜
 **Objetivo:** que el presupuesto acote la memoria sin rechazar respuestas chicas (DS1).
@@ -437,7 +443,7 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 | Lote | Qué | Estado |
 |---|---|---|
 | 0 | Contrato | ⬜ |
-| 1 | El arnés en `main` y la línea de base | ⬜ |
+| 1 | El arnés en `main` y la línea de base | ✅ (la línea de base, con el Lote 2) |
 | 2 | El presupuesto de respuestas | ⬜ |
 | 3 | La E/S fuera de los workers | ⬜ |
 | 4 | *Group commit* | ⬜ |
@@ -446,4 +452,4 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 | 7 | El roster | ⬜ |
 | 8 | Medición final y revisión de cierre | ⬜ |
 
-**Avance:** plan escrito el 1 de Noviembre de 2026, a partir de las Evaluaciones 1 y 2. El próximo paso es el Lote 0.
+**Avance:** plan escrito el 1 de Noviembre de 2026, a partir de las Evaluaciones 1 y 2. Lote 1 cerrado el mismo día, adelantado al Lote 0 (el arnés en `main`; la línea de base se mide con el Lote 2). El próximo paso es el Lote 0.
