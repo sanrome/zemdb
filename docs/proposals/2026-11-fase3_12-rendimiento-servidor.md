@@ -2,7 +2,7 @@
 
 **Fecha:** 1 de Noviembre de 2026
 **Tipo:** Optimización del servidor y del protocolo. Documento vivo: plan, lotes y seguimiento. La fase es chica y no tiene sub-fases: este plan baja directamente a lotes (`docs/METODOLOGIA.md` §1).
-**Estado:** Propuesta. Las decisiones DS1 a DS8 se confirman con el dueño del proyecto en el Lote 0, antes de escribir código que dependa de ellas.
+**Estado:** En curso. Las decisiones DS1 a DS8 las adoptó el dueño del proyecto en el Lote 0 (1 de Noviembre de 2026); DS7, condicionada a la medición del Lote 7. El contrato está en la versión 12 de `INVARIANTES.md`.
 **Origen:** las Evaluaciones 1 y 2 del [plan de evaluaciones de performance](2026-10-evaluaciones-performance.md) (§3.7, §3.8, §4.7 y §4.8).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md), con lo propio de este plan en §5: la medición antes y después de cada lote y los checklists de cada tipo de lote.
@@ -70,18 +70,18 @@ Lo que midieron las evaluaciones, en una VM de 4 vCPU con el servidor en 2 núcl
 
 ## 3. Decisiones
 
-Prefijo **DS**. Todas son *Propuestas* hasta el Lote 0.
+Prefijo **DS**. Se escribieron como *Propuestas*, y el dueño del proyecto las adoptó en el Lote 0 (1 de Noviembre de 2026), con los números de DS5 que fijó ese lote.
 
 | ID | Decisión | Lote | Estado |
 |---|---|---|---|
-| **DS1** | El presupuesto de respuestas reserva lo que se lee, no un frame entero | 2 | Propuesta |
-| **DS2** | La E/S de los actores, en un pool fijo de hilos dedicados | 3 | Propuesta |
-| **DS3** | *Group commit* sin espera, por sala | 4 | Propuesta |
-| **DS4** | El SSE se puede apagar | 5 | Propuesta |
-| **DS5** | El evento `ops`: el SSE trae las operaciones | 5 | Propuesta |
-| **DS6** | El catch-up comparte las operaciones del búfer en RAM | 6 | Propuesta |
-| **DS7** | El roster, menos seguido, si la medición lo justifica | 7 | Propuesta, condicionada a la medición del Lote 7 |
-| **DS8** | El arnés en `main` y la medición de cada lote | 1 | Propuesta |
+| **DS1** | El presupuesto de respuestas reserva lo que se lee, no un frame entero | 2 | Adoptada (1 de Noviembre de 2026) |
+| **DS2** | La E/S de los actores, en un pool fijo de hilos dedicados | 3 | Adoptada (1 de Noviembre de 2026) |
+| **DS3** | *Group commit* sin espera, por sala | 4 | Adoptada (1 de Noviembre de 2026) |
+| **DS4** | El SSE se puede apagar | 5 | Adoptada (1 de Noviembre de 2026) |
+| **DS5** | El evento `ops`: el SSE trae las operaciones | 5 | Adoptada (1 de Noviembre de 2026) |
+| **DS6** | El catch-up comparte las operaciones del búfer en RAM | 6 | Adoptada (1 de Noviembre de 2026) |
+| **DS7** | El roster, menos seguido, si la medición lo justifica | 7 | Adoptada (1 de Noviembre de 2026), condicionada a la medición del Lote 7 |
+| **DS8** | El arnés en `main` y la medición de cada lote | 1 | Adoptada (1 de Noviembre de 2026) |
 
 ### DS1 · El presupuesto de respuestas reserva lo que se lee
 - **Hoy.** El actor reserva un frame entero (16 MiB, `reserve_frame`) antes de leer el log para un `/sync` o el catch-up de un commit, y el handler HTTP achica la reserva al tamaño real recién al codificar la respuesta (`budgeted_response`). Con el presupuesto de fábrica (256 MiB) caben 16 respuestas en ese intervalo en todo el servidor; las demás reciben `503`, y un commit se confirma sin su catch-up.
@@ -108,11 +108,12 @@ Prefijo **DS**. Todas son *Propuestas* hasta el Lote 0.
 - **Invariantes:** INV-B3, INV-B5, INV-L1, INV-W1 y INV-W2 (el código nuevo).
 
 ### DS5 · El evento `ops`: el SSE trae las operaciones
-- **Propuesta.** Cuando un commit (o un grupo, con DS3) se vuelve durable, el actor emite un evento `ops` con sus operaciones, en lugar de `head_advanced`, si ocupan hasta un tope (por ejemplo, 4 KiB codificadas, que fija el Lote 0). El evento lleva un frame del protocolo en base64 (SSE es texto), con un mensaje nuevo de `ServerMessage`, al final, que trae la sala, las operaciones, el head y el esquema de esas operaciones (`schema_id` y `schema_version`, INV-E3). Se codifica una sola vez y lo comparten todos los streams de la sala. Si las operaciones pasan el tope, el evento es `head_advanced`, como hoy, y el cliente hace `/sync`. Un stream que se atrasa recibe `lagged`, como hoy.
-- **La memoria.** El canal de eventos de cada sala retiene hasta `EVENTS_CAPACITY` (256) eventos para el stream más atrasado; con el tope de 4 KiB, hasta 1 MiB por sala con streams abiertos. El Lote 0 decide si eso entra en INV-B3 tal como está ("SSE con tope") o si hace falta un tope en bytes por sala.
+- **Propuesta.** Cuando un commit (o un grupo, con DS3) se vuelve durable, el actor emite un evento `ops` con sus operaciones, en lugar de `head_advanced`, si ocupan hasta un tope: **4 KiB**, medidos sobre el frame codificado antes del base64 (unos 5,5 KiB en el evento), que fijó el Lote 0. El evento lleva un frame del protocolo en base64 (SSE es texto), con un mensaje nuevo de `ServerMessage`, al final, que trae la sala, las operaciones, el head y el esquema de esas operaciones (`schema_id` y `schema_version`, INV-E3). Se codifica una sola vez y lo comparten todos los streams de la sala. Si las operaciones pasan el tope, el evento es `head_advanced`, como hoy, y el cliente hace `/sync`. Un stream que se atrasa recibe `lagged`, como hoy.
+- **La memoria.** El canal de eventos de cada sala retiene hasta `EVENTS_CAPACITY` (256) eventos para el stream más atrasado; con el tope de 4 KiB, más de 1 MiB por sala con un stream que no lee (1,4 MiB ya en base64), y con el tope de streams de fábrica (la mitad de 10.000 conexiones) más de 5 GiB si cada stream es de otra sala. Por eso, como decidió el Lote 0, los eventos `ops` tienen un **tope total en bytes**, propio, en todo el servidor: `ZEMDB_MAX_SSE_OPS_BYTES` (`max_sse_ops_bytes`, 64 MiB de fábrica). Cada evento cuenta los bytes que realmente se retienen (ya en base64) mientras algún canal lo retiene (los devuelve al soltarse, cuando lo leyeron todos los streams o el canal lo pisó; el Lote 5 lo prueba por los dos caminos), y el actor, antes de emitir uno, toma sus bytes del tope; si no entran, emite `head_advanced`. INV-B3 nombra ese tope. Lo que copia cada stream al escribir el evento en su conexión es transitorio, como la escritura de cualquier respuesta.
+- **Alternativas descartadas para la memoria.** Que el evento lleve referencias a las operaciones del búfer en RAM (los `Arc` de DS6) y que cada stream las codifique: multiplica el CPU por los streams de la sala, y un stream que no lee retiene igual las operaciones que el búfer ya soltó. Contar los eventos en el presupuesto de respuestas: una sola cota de memoria, pero los eventos compiten con los `/sync` y los catch-ups, que son la fuente de verdad. Dejar INV-B3 como estaba: unos 5 GiB de fábrica en el peor caso.
 - **Lo que no cambia:** la autenticación del stream y su tope; las columnas cifradas siguen cifradas (las cifra el cliente); los eventos siguen siendo un atajo, y un cliente que pierde uno lo nota por el hueco en su cursor y hace `/sync`.
 - **Antes de la primera versión no hay compatibilidad que conservar** (`GEMINI.md`): `head_advanced` queda para las operaciones grandes, no como modo alternativo.
-- **Invariantes:** INV-Y2 (lo que trae un evento es lo que está en el log, en orden, y solo lo durable), INV-D7, INV-E3, INV-B3, INV-B5, INV-A1, INV-W1, INV-W2.
+- **Invariantes:** INV-Y2 (lo que trae un evento es lo que está en el log, en orden, y solo lo durable), INV-D7, INV-E3, INV-B3 (el tope total de los eventos retenidos), INV-B5, INV-A1, INV-W1, INV-W2.
 
 ### DS6 · El catch-up comparte las operaciones del búfer en RAM
 - **Propuesta.** El búfer en RAM (`HotBuffer`) guarda cada operación en un `Arc`, y el catch-up y el `/sync` arman sus respuestas con esos `Arc` en lugar de copias. Las respuestas se codifican con un tipo del servidor que serializa exactamente los mismos bytes que el `ServerMessage` de hoy (serde serializa un `Arc<T>` como `T`).
@@ -134,7 +135,7 @@ Prefijo **DS**. Todas son *Propuestas* hasta el Lote 0.
 
 | Orden | Lote | Crates | Decisiones | Invariantes | Progreso |
 |---|---|---|---|---|---|
-| 0 | Contrato | Documentos | DS1 a DS8 | Ajustes: B1, B3, B4, B5, D1, D7, E3, L7, R3, Y2 | ⬜ |
+| 0 | Contrato | Documentos | DS1 a DS8 | Ajustes: B1, B3, B4, B5, D1, D7, E3, L7, Y2 (R3, solo con DS7) | ✅ |
 | 1 | El arnés en `main` y la línea de base | `tools/perf` (fuera del workspace) | DS8 | — | ✅ (la línea de base, con el Lote 2) |
 | 2 | El presupuesto de respuestas | server | DS1 | B1, B5, L1 | ⬜ |
 | 3 | La E/S fuera de los workers | server | DS2 | D1, D7, L3, L5, L7, B3, B4 | ⬜ |
@@ -145,11 +146,11 @@ Prefijo **DS**. Todas son *Propuestas* hasta el Lote 0.
 | 8 | Medición final y revisión de cierre | Documentos | Todas | Las que tocó la fase | ⬜ |
 
 **Orden.**
-- El Lote 0 va primero: solo documentos, con su revisión cruzada (`docs/METODOLOGIA.md` §2). Las *Propuestas* se confirman antes del Lote 1.
+- El Lote 0 va primero: solo documentos, con su revisión cruzada (`docs/METODOLOGIA.md` §2). Las *Propuestas* se confirmaron en el Lote 0, después del Lote 1, que se adelantó (su nota **Hecho**).
 - El 1 va antes de cualquier optimización: sin el arnés en `main` no hay medición.
 - El 2 no depende de los demás. El 3 va antes del 4, que hace su `fsync` en el pool del 3. El 5 va antes de que arranque la sub-fase 4.3 de la Fase 4, y después del 4, porque con el *group commit* un evento puede llevar las operaciones de un grupo. El 6, después del 2, porque cambia lo que reserva una respuesta. El 7 depende de la medición en un disco de nube y puede quedar para el final. El 8 cierra.
 
-**Tamaño estimado de producción:** el Lote 2, de 100 a 150 líneas; el 3, de 200 a 300; el 4, de 150 a 250; el 5, unas 150 entre core y servidor; el 6, unas 80; el 7, unas 50. El 1 no tiene código de producción.
+**Tamaño estimado de producción:** el Lote 2, de 100 a 150 líneas; el 3, de 200 a 300; el 4, de 150 a 250; el 5, unas 200 entre core y servidor (con el tope total de los eventos `ops`); el 6, unas 80; el 7, unas 50. El 1 no tiene código de producción.
 
 ---
 
@@ -196,7 +197,7 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 
 ---
 
-### Lote 0 · Contrato · ⬜
+### Lote 0 · Contrato · ✅ Hecho
 **Objetivo:** el contrato contra el que se revisa cada lote. Solo documentos.
 
 **Qué se hace:**
@@ -220,7 +221,13 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 
 **Entrega:** `docs: plan Fase 3.12, the performance of the server, and adjust the contract for it (Fase 3.12, Lote 0)`.
 
-**Hecho.** *Pendiente.*
+**Hecho.**
+- **Las decisiones:** el dueño del proyecto adoptó DS1 a DS8 el 1 de Noviembre de 2026, DS7 condicionada a la medición del Lote 7. Los números que el lote tenía que fijar: el tope del evento `ops` es de 4 KiB del frame codificado, antes del base64; y su memoria no entra en INV-B3 tal como estaba (más de 1 MiB por sala con un stream que no lee, más de 5 GiB de fábrica), así que DS5 suma un tope total propio de los eventos retenidos, `ZEMDB_MAX_SSE_OPS_BYTES` (64 MiB de fábrica), con la caída a `head_advanced`. El Lote 5 suma esa variable, su test y unas 50 líneas.
+- **`INVARIANTES.md`, versión 12:** INV-B1 y B5 (la reserva por lo que se lee, Lote 2); INV-B3 (los hilos del pool de E/S, Lote 3, y el tope total de los eventos `ops`, Lote 5); INV-B4 (la E/S en el pool y el `fsync` de un grupo, Lotes 3 y 4); INV-D1 e INV-D7 (el `fsync` en el pool y el del grupo, con el crash entre los registros y el `fsync` de un grupo en "Cómo intentar romperla"; el enunciado de D7 nombra también lo que escribe el propio actor, que hoy ya se sostiene por el `fsync` antes de avanzar el head, y su "Sostenida por" suma el evento `ops`); INV-L7 (las operaciones en el pool de E/S, que se espera antes de soltar `server.lock`); INV-Y2 (lo que trae un evento `ops`); INV-E3 (el esquema del evento `ops`); el riesgo aceptado de un `fsync` por commit, que pasa a uno por grupo (§4); y las decisiones DS en el reparto de §1.6. Cada ajuste queda 🆕 con su lote en la columna de estado del resumen. INV-R3 no cambia hasta el Lote 7.
+- **El plan de la Fase 4:** DC24 a DC26 siguen *Propuestas* para 4.3 y 4.4, y la dependencia de 4.3 respecto del Lote 5 ya estaba escrita (su estado, su tabla de sub-fases y la sección de 4.3); no cambió.
+- **`ROADMAP.md`:** la Fase 3.12, en curso.
+- **La revisión cruzada:** un agente aparte, de contexto fresco y solo lectura, contrastó cada enunciado nuevo con el código de `2f42e21`. Sin hallazgos Altos: lo que el diff da por cierto hoy se sostiene (la frase nueva de INV-D7, por el `sync_data` de `active.wal` antes de avanzar el head, registrar el dedup y emitir el evento; las cifras de 256 eventos y 10.000 conexiones). Cinco Medios de redacción, corregidos: en INV-D7, un `MutationId` repetido dentro de un grupo se reconoce contra el propio grupo; en INV-B3, los hilos del pool bloqueante de Tokio están acotados por su máximo de fábrica, no por la configuración, y siguen ahí el relay y, si no tiene pool propio, la compresión; en INV-L7, el pool de E/S se espera antes de soltar `server.lock` (con su test y `main.rs` en el Lote 3); y el resumen y la cabecera de la versión 12 nombran la precisión del enunciado de INV-D7. Los Bajos, también corregidos: las cifras de memoria cuentan el evento ya en base64; el test del tope del Lote 5 cubre los dos caminos de liberación (que dependen de que `broadcast` suelte el valor cuando lo leyó el último receptor, que la revisión no pudo comprobar sin el código de Tokio); `schema_registry.rs` en los archivos del Lote 3, que también usa `blocking_io`; INV-L3, Y4 e Y5 en los documentos del Lote 4; D7 en los del Lote 5; y citas y estilo.
+- **Desvíos:** el Lote 1 se había adelantado a este lote (su nota **Hecho**); no toca el contrato.
 
 ### Lote 1 · El arnés en `main` y la línea de base · ✅ Hecho
 **Objetivo:** que cada lote pueda medir antes y después sin ramas (DS8, DP1).
@@ -278,14 +285,14 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 ### Lote 3 · La E/S fuera de los workers · ⬜
 **Objetivo:** que ningún worker de Tokio haga E/S de archivos, y que los hilos no crezcan con las salas (DS2).
 
-**Archivos:** `crates/server/src/blocking.rs` (reemplazado por el pool), `log/warm_disk.rs`, `log/tiered_log.rs`, `log/cold_disk.rs` (la compresión), `durable.rs`, `actor/room.rs`, `actor/lease.rs`, `actor/manager.rs` (la apertura y el apagado), `config.rs` (`ZEMDB_IO_THREADS`), y sus tests. `ARCHITECTURE.md` §5.2 (*Blocking I/O in the Actor*) y la tabla de configuración.
+**Archivos:** `crates/server/src/blocking.rs` (reemplazado por el pool), `log/warm_disk.rs`, `log/tiered_log.rs`, `log/cold_disk.rs` (la compresión), `durable.rs`, `schema_registry.rs`, `actor/room.rs`, `actor/lease.rs`, `actor/manager.rs` (la apertura y el apagado), `main.rs` (el pool se espera antes de soltar `server.lock`), `config.rs` (`ZEMDB_IO_THREADS`), y sus tests. `ARCHITECTURE.md` §5.2 (*Blocking I/O in the Actor*) y la tabla de configuración.
 
 **Qué se hace:** el pool fijo; cada operación de archivo de un actor se manda al pool y se espera; la compresión a cold en el pool o en uno propio acotado; el apagado espera las operaciones en curso. El valor de fábrica de `ZEMDB_IO_THREADS` sale de la medición.
 
 **Tests exigidos.**
 - Con cientos de salas haciendo commits a la vez, la cantidad de hilos del proceso no pasa de los workers más el pool más una cantidad fija (hoy pasa de 400).
 - Un `fsync` lento (un fail point que lo demora) en una sala no demora a otra sala que no comparte su hilo del pool.
-- Una sala que se detiene, se apaga o se reabre con una operación en el pool la espera antes de soltar su lock (INV-L7), y el apagado no pierde nada confirmado (INV-L5).
+- Una sala que se detiene, se apaga o se reabre con una operación en el pool la espera antes de soltar su lock (INV-L7), el apagado no pierde nada confirmado (INV-L5), y el pool termina antes de soltar `server.lock`.
 - Un `fsync` que falla en el pool detiene la sala como hoy (INV-L3), y un request cancelado en cada `.await` no deja estado a medias (INV-L2).
 - Los tests de durabilidad y las imágenes de crash pasan sin cambios en sus expectativas.
 
@@ -322,7 +329,7 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 
 **Metodología:** §5.1, con los checklists de crash-safety, de concurrencia y de medición; versiones largas e imágenes de crash; dos revisores de delta, como en el Lote 3.
 
-**Documentos:** `ARCHITECTURE.md` §5.2 (el append, el sellado al final del grupo); `INVARIANTES.md`: INV-D1, D7, B4.
+**Documentos:** `ARCHITECTURE.md` §5.2 (el append, el sellado al final del grupo); `INVARIANTES.md`: INV-D1, D7, B4, y cómo se sostienen con el grupo INV-L3, Y4 e Y5.
 
 **Entrega:** `perf(server): group commit, one fsync for the commits waiting in a room (Fase 3.12, Lote 4)`.
 
@@ -331,9 +338,9 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 ### Lote 5 · El SSE: apagarlo y el evento `ops` · ⬜
 **Objetivo:** que el operador pueda apagar el SSE (DS4) y que el SSE traiga las operaciones (DS5), para que la sub-fase 4.3 se construya sobre él.
 
-**Archivos:** `crates/core/src/protocol/messages.rs` (el mensaje nuevo del evento y el código de error nuevo, al final de sus enums) y los fuzzers y tests de codificación; `crates/server/src/actor/command.rs` (`RoomEvent`), `actor/room.rs` (el evento después del `fsync`), `api/sse.rs`, `config.rs` (`ZEMDB_MAX_SSE_STREAMS=0`), y sus tests. `ARCHITECTURE.md` §7 (SSE) y la configuración.
+**Archivos:** `crates/core/src/protocol/messages.rs` (el mensaje nuevo del evento y el código de error nuevo, al final de sus enums) y los fuzzers y tests de codificación; `crates/server/src/actor/command.rs` (`RoomEvent`), `actor/room.rs` (el evento después del `fsync`), `api/sse.rs`, `config.rs` (`ZEMDB_MAX_SSE_STREAMS=0` y `ZEMDB_MAX_SSE_OPS_BYTES`), y sus tests. `ARCHITECTURE.md` §7 (SSE) y la configuración.
 
-**Qué se hace:** con el SSE apagado, `GET /events` responde el código nuevo; cuando un commit o un grupo se vuelve durable, el actor codifica una vez el mensaje con sus operaciones, si entran en el tope, y lo emite como evento `ops` (base64), y si no, `head_advanced`.
+**Qué se hace:** con el SSE apagado, `GET /events` responde el código nuevo; cuando un commit o un grupo se vuelve durable, el actor codifica una vez el mensaje con sus operaciones, si entran en el tope, y lo emite como evento `ops` (base64), si además sus bytes entran en el tope total de los eventos retenidos, y si no, `head_advanced`.
 
 **Tests exigidos.**
 - Con `ZEMDB_MAX_SSE_STREAMS=0`, `GET /events` da el código nuevo y el resto del protocolo funciona igual.
@@ -341,7 +348,7 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 - Una operación más grande que el tope llega como `head_advanced`; un stream atrasado recibe `lagged`.
 - Un miembro de otra sala, o sin token, no recibe nada (INV-A1).
 - La ida y vuelta del mensaje nuevo y del código nuevo, y su lugar en los fuzzers de mensajes (INV-W1, W2).
-- La memoria del canal de eventos de una sala con un stream que no lee queda dentro de lo que fije el Lote 0.
+- Los eventos `ops` retenidos no pasan de `ZEMDB_MAX_SSE_OPS_BYTES`, contados por los bytes que realmente se retienen: con streams que no leen en muchas salas, los eventos que no entran salen como `head_advanced`, y el tope se recupera cuando esos streams leen o se cierran y cuando el canal pisa un evento (un contador de prueba, por los dos caminos).
 
 **Interacciones a revisar:** el tope de streams por cliente y en total; el keep-alive; el cambio de esquema en una sala abierta (`schema_reloaded` y el esquema que anuncia el evento); el apagado ordenado, que corta los streams; el *group commit* del Lote 4.
 
@@ -349,7 +356,7 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 
 **Metodología:** §5.1, con los checklists del protocolo y de medición; las versiones largas de `zemdb-core` (los fuzzers) y del servidor.
 
-**Documentos:** `ARCHITECTURE.md` §7 (los eventos SSE y su formato, el código nuevo) y la configuración; `INVARIANTES.md`: INV-Y2, E3, B3; `README.md`. Y el aviso a la Fase 4: el Lote 0 de 4.3 parte de este formato.
+**Documentos:** `ARCHITECTURE.md` §7 (los eventos SSE y su formato, el código nuevo, el tope total) y la configuración; `INVARIANTES.md`: INV-Y2, D7, E3, B3; `README.md` (las dos variables). Y el aviso a la Fase 4: el Lote 0 de 4.3 parte de este formato.
 
 **Entrega:** `feat(server): the SSE can be turned off, and its events carry the operations (Fase 3.12, Lote 5)`.
 
@@ -431,7 +438,7 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 |---|---|
 | El pool de E/S o el *group commit* rompen la durabilidad de un `CommitAck` | Los checklists de crash-safety y de concurrencia, las imágenes de crash antes y después, y dos revisores de delta en los Lotes 3 y 4 |
 | El pool o el grupo suman latencia a un commit aislado | El criterio del Lote 4 incluye la latencia con un pedido en vuelo; el control E1-tmpfs con 1 pedido en vuelo, en todos los lotes |
-| La memoria del canal de eventos con el evento `ops` | El tope de DS5 y la decisión del Lote 0 sobre INV-B3; un test con un stream que no lee |
+| La memoria del canal de eventos con el evento `ops` | El tope de 4 KiB por evento y el tope total de los eventos retenidos (DS5, INV-B3); un test con streams que no leen en muchas salas |
 | El evento `ops` y la sub-fase 4.3 se desalinean | El Lote 5 va antes de 4.3, y el formato del evento se escribe en `ARCHITECTURE.md` en el mismo lote |
 | La máquina de las mediciones cambia entre lotes | La línea de base se mide en la misma sesión que el resultado (§5.1, paso 0) |
 | Un disco de nube cambia las conclusiones | El Lote 7 mide ahí antes de decidir DS7, y la medición final lo menciona si no se pudo hacer |
@@ -442,7 +449,7 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 
 | Lote | Qué | Estado |
 |---|---|---|
-| 0 | Contrato | ⬜ |
+| 0 | Contrato | ✅ |
 | 1 | El arnés en `main` y la línea de base | ✅ (la línea de base, con el Lote 2) |
 | 2 | El presupuesto de respuestas | ⬜ |
 | 3 | La E/S fuera de los workers | ⬜ |
@@ -452,4 +459,4 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 | 7 | El roster | ⬜ |
 | 8 | Medición final y revisión de cierre | ⬜ |
 
-**Avance:** plan escrito el 1 de Noviembre de 2026, a partir de las Evaluaciones 1 y 2. Lote 1 cerrado el mismo día, adelantado al Lote 0 (el arnés en `main`; la línea de base se mide con el Lote 2). El próximo paso es el Lote 0.
+**Avance:** plan escrito el 1 de Noviembre de 2026, a partir de las Evaluaciones 1 y 2. Lote 1 cerrado el mismo día, adelantado al Lote 0 (el arnés en `main`; la línea de base se mide con el Lote 2). Lote 0 cerrado el mismo día: DS1 a DS8 adoptadas y `INVARIANTES.md` en su versión 12. El próximo paso es el Lote 2, que mide al arrancar la línea de base de la fase.
