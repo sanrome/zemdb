@@ -2,7 +2,7 @@
 
 **Fecha:** 21 de Octubre de 2026
 **Tipo:** Feature. Documento vivo: plan de la fase (plan maestro) y seguimiento. Cada sub-fase tiene su propio plan por lotes, que se escribe justo antes de arrancarla.
-**Estado:** En curso: sub-fases 4.0, 4.1 y 4.2 cerradas (4.1 y 4.2 con sus planes por lotes: [4.1](2026-10-fase4_1-storage-servidor.md), [4.2](2026-10-fase4_2-nucleo-replica.md)); lo que sigue son 4.3 y 4.4, que pueden ir en paralelo.
+**Estado:** En curso: sub-fases 4.0, 4.1 y 4.2 cerradas (4.1 y 4.2 con sus planes por lotes: [4.1](2026-10-fase4_1-storage-servidor.md), [4.2](2026-10-fase4_2-nucleo-replica.md)); lo que sigue son 4.3 y 4.4, que pueden ir en paralelo. Las decisiones DC24 a DC26 (los modos de frescura, el `Ack` periódico y el evento `ops`), que salieron de las [evaluaciones de performance](2026-10-evaluaciones-performance.md), están *Propuestas* para 4.3 y 4.4; 4.3 espera además el Lote 5 de la [Fase 3.12](2026-11-fase3_12-rendimiento-servidor.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md).
 **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Catálogo de lo que hay que construir:** el Apéndice A. **Índice de fases y backlog:** [`ROADMAP.md`](../../ROADMAP.md).
@@ -74,6 +74,9 @@ Prefijo **DC**. Las *Propuestas* se confirman con el dueño del proyecto antes d
 | **DC21** | **El aplicador y las escrituras.** Precisa DC6, DC7 y DC11: cada cambio de varios pasos del aplicador en una tarea propia; los rechazos y los rangos sin reporte retenidos por el head que cada escritura vio antes de su primer intento, nunca `Ok` por la ausencia de un rechazo, las resoluciones sin decisión, los reintentos y la validación de cada respuesta; un head menor que el del pedido lleva a registrarse. Detalle en el plan de 4.2. | 4.2 | Adoptada (28 de Octubre de 2026) |
 | **DC22** | **Snapshots en el cliente.** La bajada por chunks de 4 MiB hasta `max_snapshot_bytes` (512 MiB por defecto), con cada chunk validado; la subida, confirmada por un heartbeat, siempre por chunks; y la memoria que cuenta INV-K15. Detalle en el plan de 4.2. | 4.2 | Adoptada (28 de Octubre de 2026) |
 | **DC23** | **Los chunks del relay llevan la encarnación.** `RequestSnapshotChunk` y `UploadSnapshotChunk` llevan la `room_incarnation` a la que pertenecen, y el relay responde `RoomReset` al chunk 0 sin ancla y a los de una subida si no es la de la sala; a los anclados los cubre la purga. Así un cliente de otra encarnación no baja otro snapshot que el de su encarnación ni sube nada (INV-R6). En `zemdb-core` y `zemdb-server`. Detalle en el plan de 4.2. | 4.2 | Adoptada (28 de Octubre de 2026) |
+| **DC24** | **Modos de frescura.** Cómo se entera la réplica de lo que escriben los demás, en `ClientConfig` y por sala. `periodic`, el de base: el heartbeat, que el worker manda igual para renovar el lease, informa `current_head_seq`, y si supera el head local, el worker hace `/sync`; el intervalo es configurable, menor que el `lease_timeout` (por defecto, 30 s), y la aplicación puede pedir un `sync` cuando quiera (por ejemplo, al volver a la pestaña). `live`: el worker abre el stream SSE de la sala y aplica sus eventos (DC26); la fachada de 4.4 lo enciende mientras haya un `watch` activo sobre la sala y lo apaga cuando no queda ninguno. `manual`: el heartbeat solo renueva el lease, sin `/sync`; la réplica se entera por el catch-up de sus escrituras y por los `sync` que pide la aplicación. Si el servidor tiene el SSE apagado (DS4 de la Fase 3.12), `live` cae a `periodic`. Origen: §4.8 del [plan de evaluaciones de performance](2026-10-evaluaciones-performance.md): con 1.000 salas de 10 usuarios, el SSE de señales cuesta 1,16 ms de CPU del servidor por commit, el evento con las operaciones 0,46 ms y `periodic` 0,35 ms; `periodic` sostiene 5.000 salas (50.000 usuarios) con 291 MiB, a cambio de que un usuario vea lo que escribe otro en unos 5 s típicos y hasta 25 s, o antes, con el catch-up de su propia escritura. | 4.3 / 4.4 | Propuesta (1 de Noviembre de 2026) |
+| **DC25** | **El `Ack`, periódico.** El worker no manda un `Ack` después de cada `/sync`: confirma su head cada pocos segundos si se movió (por defecto, junto con el heartbeat) y al cerrar la sala. El cursor ya avanza con el `from_seq` de cada `/sync` y el `last_ack_seq` de cada commit (INV-Y6), así que la poda del servidor se atrasa a lo sumo ese intervalo. El paso `sync` del núcleo de 4.2, que manda el `Ack` al terminar, queda como API de bajo nivel; el plan de 4.3 decide si el worker usa una variante sin `Ack`. Origen: §4.7.3 y §4.8 del plan de evaluaciones: el `Ack` es casi la mitad de los pedidos de la difusión, y sacarlo ahorra un 25% del CPU del servidor con el SSE de señales. | 4.3 | Propuesta (1 de Noviembre de 2026) |
+| **DC26** | **El evento `ops`.** En `live`, el worker consume el evento `ops` del SSE (DS5 de la [Fase 3.12](2026-11-fase3_12-rendimiento-servidor.md)): un frame del protocolo, en base64, con las operaciones de un commit o de un grupo, el head y el esquema de esas operaciones. Las valida como un `SyncBatch` (la sala, el esquema con las reglas de DC20, que sigan al cursor) y las aplica por el aplicador (DC7). Con un hueco, un `lagged` o un `head_advanced` (operaciones más grandes que el tope del evento), hace `/sync`, y junta en uno solo los avisos que llegan mientras hay un `/sync` en vuelo. Cada stream pertenece a la época de la réplica en que se abrió (DC7): los eventos de un stream de una época anterior se ignoran. Un evento que no decodifica no hace entrar en pánico al SDK (INV-K12) y lleva a un `/sync`. Depende del Lote 5 de la Fase 3.12, que va antes de 4.3. | 4.3 | Propuesta (1 de Noviembre de 2026) |
 
 ---
 
@@ -84,7 +87,7 @@ Prefijo **DC**. Las *Propuestas* se confirman con el dueño del proyecto antes d
 | 4.0 | Contrato y decisiones | Invariantes del SDK, modelo de amenaza, decisiones, spikes, diseño del arnés de simulación, app de referencia | — | Revisión cruzada del contrato | ✅ |
 | 4.1 | Storage y servidor para el cliente | Lo que el SDK necesita del storage y del servidor | 4.0 | Revisión de cierre | ✅ |
 | 4.2 | Núcleo de la réplica | La réplica por sala contra un transporte abstracto | 4.1 | **Auditoría amplia** (DC3) | ✅ |
-| 4.3 | Transporte nativo y `SyncWorker` | HTTP, SSE, reconexión, heartbeat | 4.2 | Revisión de cierre | ⬜ |
+| 4.3 | Transporte nativo y `SyncWorker` | HTTP, SSE, reconexión, heartbeat, modos de frescura | 4.2 y el Lote 5 de la Fase 3.12 | Revisión de cierre | ⬜ |
 | 4.4 | API de Rust | Fachada, `watch`, dueño, pre-chequeo, E2EE, errores | 4.2 | Revisión de cierre y app de referencia nativa | ⬜ |
 | 4.5 | Navegador (Rust) | Motor del navegador, transporte del navegador, runtime del Worker, pestañas | 4.3, 4.4 | Revisión de cierre | ⬜ |
 | 4.6 | API de JavaScript | Paquete con tipos de TypeScript sobre el Worker | 4.5 | Revisión de cierre y app de referencia en el navegador | ⬜ |
@@ -168,6 +171,7 @@ En `zemdb-client`, contra el trait `TransportClient`, sin red real, con la forma
 ### 4.3 · Transporte nativo y `SyncWorker`
 - El adaptador `reqwest` sobre HTTP/2.
 - El `SyncWorker`: SSE con la reacción a cada evento, pull paginado, `Ack` del último lote, heartbeat y reconexión con *backoff* exponencial y *full jitter* (§A.5). El heartbeat de 4.2 espera una bajada o una subida de snapshot en curso, o hace la suya, y los chunks no renuevan el lease: el worker no encadena los heartbeats detrás de una bajada o una subida larga (de los Lotes 8 y 9 de 4.2).
+- Los modos de frescura (DC24), el `Ack` periódico (DC25) y el evento `ops`, con su caída a `/sync` y a `periodic` (DC26). Dependen del Lote 5 de la [Fase 3.12](2026-11-fase3_12-rendimiento-servidor.md), que publica el formato del evento y el código del SSE apagado: el Lote 0 de 4.3 parte de ahí.
 - La renovación del token ante `Unauthorized`.
 - En su contrato (Lote 0), la invariante que propuso la auditoría de 4.2 y adoptó el dueño del proyecto: ninguna respuesta que no cuenta como del servidor (`INVARIANTES.md` §2) lleva a un error que el SDK o su worker traten como permanente para la sala. Uno así (`Config`, `FailedClosed`) sale solo de la configuración o de una respuesta que cuenta como del servidor, como un `Registered` con un esquema que no evoluciona o un lote con una operación que no valida con el esquema de `Registered`. El Lote 0 decide también si el worker trata como permanente el `Config` de una reserva que no entra en memoria, que viene del dispositivo.
 - De la auditoría de 4.2 (en la nota del Lote 12 de su plan):
@@ -177,6 +181,7 @@ En `zemdb-client`, contra el trait `TransportClient`, sin red real, con la forma
 ### 4.4 · API de Rust
 - `ZemdbClient`, `RoomHandle` y `TableHandle`: CRUD, escaneos y `watch` / `ChangeStream` (§A.3 y §A.7).
 - Dueño de fila completado por el SDK y pre-chequeo local (§A.4).
+- El modo `live` atado a los `watch` (DC24): la fachada lo enciende mientras haya un `watch` activo sobre la sala y lo apaga cuando no queda ninguno; y la API para elegir el modo de frescura y pedir un `sync`.
 - Cifrado de columnas con `CryptoEngine` (§A.10).
 - `ClientError` (§A.1).
 - Descartar a pedido de la aplicación la réplica local de una sala, para los casos que fallan cerrado (DC12, INV-K3).
@@ -436,19 +441,20 @@ Cada `insert`, `update` o `delete` es un commit de una sola operación (`ClientM
 
 ### A.5. Worker de Sincronización en Segundo Plano con Jitter (`SyncWorker`)
 * **Escucha Reactiva de SSE (opcional):**
-  - Mantiene una conexión Server-Sent Events hacia `GET /rooms/{room_id}/events`, con el token en `Authorization: Bearer` o, en el navegador, en `?token=` (`EventSource` no puede mandar headers). Cada evento tiene su reacción:
-    - `head_advanced` (dato: el nuevo head): pull paginado a `/sync`.
+  - En el modo `live` (DC24), mantiene una conexión Server-Sent Events hacia `GET /rooms/{room_id}/events`, con el token en `Authorization: Bearer` o, en el navegador, en `?token=` (`EventSource` no puede mandar headers). Cada evento tiene su reacción:
+    - `ops` (dato: un frame en base64 con operaciones, su head y su esquema; DS5 de la Fase 3.12): las aplica si siguen al cursor; si no, pull paginado a `/sync` (DC26).
+    - `head_advanced` (dato: el nuevo head; solo para operaciones más grandes que el tope del evento `ops`): pull paginado a `/sync`.
     - `schema_reloaded` (dato: el id del esquema): un registro con el cursor y el cambio del esquema local, con las reglas de §A.4 (*El esquema con que el SDK abre y aplica*) y DC20.
     - `snapshot_wanted` (sin dato): un heartbeat, cuyo `snapshot_wanted` dice si este cliente es el designado (§A.8).
     - `snapshot_available` (dato: su secuencia): si el cliente espera un snapshot, empieza la descarga (§A.6).
     - `lagged`: el stream perdió eventos; el worker hace un `/sync`.
   - SSE solo acelera: las respuestas a heartbeats, syncs y commits son la fuente de verdad, y el worker funciona igual sin stream. Un cliente tiene como mucho 2 streams por sala: un tercero cierra el más viejo.
 * **Avance del cursor:**
-  - El cursor del cliente en el servidor avanza solo con lo que el cliente confirma: el `from_seq` de cada `/sync` servido, el `last_ack_seq` de cada commit aceptado y `ClientMessage::Ack`. Después de aplicar el último lote (`has_more: false`), el worker manda `Ack` con su head local, para que la poda del servidor no espere a su próximo sync.
+  - El cursor del cliente en el servidor avanza solo con lo que el cliente confirma: el `from_seq` de cada `/sync` servido, el `last_ack_seq` de cada commit aceptado y `ClientMessage::Ack`. El worker confirma su head con `Ack` cada pocos segundos si se movió, y al cerrar la sala, no después de cada `/sync` (DC25): la poda del servidor se atrasa a lo sumo ese intervalo.
 * **Reconexión Resiliente:**
   - Si la conexión se interrumpe, el worker utiliza un algoritmo de reconexión con *Exponential Backoff* y *Full Jitter*, mitigando el riesgo de tormentas de reintentos (*thundering herd*) contra el servidor.
 * **Heartbeat Continuo:**
-  - Emite periódicamente `ClientMessage::Heartbeat`, con un intervalo menor que el `lease_timeout` de la sala (90 s por defecto), para renovar su lease e impedir que el servidor lo pase a `Disconnected`. El heartbeat no lleva cursor ni lo mueve. Su respuesta, `HeartbeatAck`, informa `current_head_seq`, `snapshot_wanted`, `active_snapshot_seq`, `schema_version` y, desde 4.1, `schema_id` (DC5).
+  - Emite periódicamente `ClientMessage::Heartbeat`, con un intervalo menor que el `lease_timeout` de la sala (90 s por defecto), para renovar su lease e impedir que el servidor lo pase a `Disconnected`. El heartbeat no lleva cursor ni lo mueve. Su respuesta, `HeartbeatAck`, informa `current_head_seq`, `snapshot_wanted`, `active_snapshot_seq`, `schema_version` y, desde 4.1, `schema_id` (DC5). En `periodic` (DC24), si `current_head_seq` supera el head local, el worker hace `/sync`.
 
 ### A.6. Onboarding de Salas y Descarga Multipart de Snapshots
 El camino lo decide el registro (`ARCHITECTURE.md` §6):
