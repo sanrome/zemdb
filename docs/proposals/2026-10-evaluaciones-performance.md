@@ -29,7 +29,7 @@
 - **La primera versión** dejaba el arnés en una rama por evaluación, sin mergearlo. El dueño del proyecto trabaja solo sobre `main`, sin ramas, y la Fase 3.12 mide cada optimización con este arnés antes y después, así que el arnés pasa a `main`: el generador y sus scripts, en `tools/perf`, fuera del workspace (`exclude` en el `Cargo.toml` de la raíz), para que no entre a la CI de cada push ni a los chequeos de cierre de los lotes. Lo trae el Lote 1 de la Fase 3.12.
 - **Lo que solo sirve para un diagnóstico dentro del servidor** (los interruptores de §3.7.4 y §4.7 y el prototipo de §4.8) no entra al código de `main`. Cada evaluación describe el cambio; si hace falta repetirlo, se guarda como un parche en `tools/perf/diagnostics/`, que se aplica sobre una copia local para medir y se descarta.
 - **Lo que queda en `main` de cada evaluación:** sus resultados, con el entorno y el commit medido, y sus datos crudos en `tools/perf/results/`.
-- **El Lote 1 de la Fase 3.12 lo trajo a `main`** el 1 de Noviembre de 2026, y las ramas de las evaluaciones se borraron.
+- **El Lote 1 de la Fase 3.12 lo trajo a `main`** el 1 de Noviembre de 2026; las ramas de las evaluaciones (`perf/e1-commit` y `perf/e2-salas`) ya no hacen falta.
 
 ### DP2 · Medir no es optimizar
 - Una evaluación cierra con sus preguntas respondidas y una lista de cuellos de botella ordenada por su costo medido, no con cambios en el servidor.
