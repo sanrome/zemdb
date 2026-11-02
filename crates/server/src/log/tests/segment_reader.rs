@@ -1,4 +1,5 @@
 use super::*;
+use crate::log::budget::op_bytes;
 use crate::log::test_support::{frames, make_op, seqs, Rng};
 use std::io::Cursor;
 
@@ -170,7 +171,8 @@ fn check_damaged_logs(seed: u64, cases: u64) {
             _ => Some(SequenceNumber::new(1)),
         };
         let from = SequenceNumber::new(rng.below(16));
-        let budget = ReadBudget::new(1 + rng.index(20), 1 + rng.below(4096));
+        let (max_ops, max_bytes) = (1 + rng.index(20), 1 + rng.below(4096));
+        let budget = || ReadBudget::new(max_ops, max_bytes);
 
         let mut source = BufReader::new(Cursor::new(&data[..]));
         let seekable = read_frames(
@@ -178,7 +180,7 @@ fn check_damaged_logs(seed: u64, cases: u64) {
             Some(data.len() as u64),
             start,
             from,
-            &mut budget.clone(),
+            &mut budget(),
         );
         match &seekable {
             Ok(read) => {
@@ -198,7 +200,7 @@ fn check_damaged_logs(seed: u64, cases: u64) {
 
         let compressed = zstd::encode_all(&data[..], 1).unwrap();
         let mut decoder = zstd::stream::read::Decoder::new(&compressed[..]).unwrap();
-        let streamed = read_frames(&mut decoder, None, start, from, &mut budget.clone());
+        let streamed = read_frames(&mut decoder, None, start, from, &mut budget());
         assert_eq!(
             format!("{streamed:?}"),
             format!("{seekable:?}"),

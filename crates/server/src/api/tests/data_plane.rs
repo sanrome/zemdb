@@ -223,6 +223,22 @@ impl Fixture {
             .unwrap()
     }
 
+    /// The budget holder of the client.
+    fn holder(&self) -> BudgetHolder {
+        (
+            self.room_id.clone(),
+            Uploader::Client(self.client_id.clone()),
+        )
+    }
+
+    /// Holds all of the client's part of the budget of response bytes in flight (the factory
+    /// part, two frames) but `room` bytes, as its unread responses would.
+    fn hold_all_but(&self, room: u64) -> Reservation {
+        let part = 2 * MAX_FRAME_SIZE as u64;
+        let budget = self.manager.response_budget();
+        budget.reserve(self.holder(), part - room).unwrap()
+    }
+
     /// Posts a commit, expecting it to be acknowledged.
     async fn commit_ok(&self, msg: &ClientMessage) {
         let (status, _, reply) = self.post("commit", msg).await;
@@ -533,28 +549,15 @@ async fn large_operations_are_split_across_catch_up_and_sync_batches() {
 }
 
 #[tokio::test]
-async fn responses_take_a_frame_of_the_clients_budget_before_they_are_built() {
-    // A frame per client, and 1 MiB more.
-    let fx = Fixture::with(|config| {
-        config.max_inflight_response_bytes_per_client = MAX_FRAME_SIZE as u64 + 1024 * 1024;
-    })
-    .await;
+async fn responses_without_room_in_the_budget_are_unavailable_before_they_are_built() {
+    let fx = Fixture::new().await;
+    // Not even what a response takes besides its operations is left.
+    let held = fx.hold_all_but(RESPONSE_OVERHEAD - 1);
     let get_schema = ClientMessage::GetSchema {
         correlation_id: CorrelationId::new(2),
         room_id: fx.room_id.clone(),
     };
-    // Unread responses hold what their encoding takes, so as many fit as the 1 MiB holds,
-    // plus the one that reserved the last frame.
-    let mut held = vec![fx.send("schema", &get_schema).await];
-    let len = held[0].body().size_hint().exact().unwrap();
-    while held.len() as u64 <= 1024 * 1024 / len {
-        held.push(fx.send("schema", &get_schema).await);
-    }
-    assert!(held
-        .iter()
-        .all(|response| response.status() == StatusCode::OK));
-
-    // Then nothing is: a snapshot chunk, before the relay reads it.
+    // Nothing is served: a snapshot chunk, before the relay reads it.
     let bounds = crate::relay::LogBounds {
         tail_seq: SequenceNumber::new(1),
         head_seq: SequenceNumber::new(1),
@@ -656,18 +659,91 @@ async fn a_request_waiting_for_its_room_holds_none_of_the_budget() {
     waiting.await;
 }
 
-/// A sync answered `Unavailable` because the client's part of the budget is taken leaves no
-/// trace: its cursor stays where the client's last commit left it, and once the held response
-/// is released the same sync is served and only then moves it.
+/// What the operation of `msg`, a commit, takes in a response as the operation `seq`.
+fn in_response(seq: u64, msg: &ClientMessage) -> u64 {
+    let ClientMessage::Commit { op, .. } = msg else {
+        panic!("expected a commit");
+    };
+    let op = SequencedOperation::new(SequenceNumber::new(seq), op.clone());
+    crate::log::budget::OpSize::of(&op).in_response()
+}
+
+/// The sequences of `ops`.
+fn seqs_of(ops: &[SequencedOperation]) -> Vec<u64> {
+    ops.iter().map(|op| op.seq.get()).collect()
+}
+
+/// The operations and `has_more` of a `SyncBatch` answered with 200.
+fn batch_of(status: StatusCode, reply: ServerMessage) -> (Vec<u64>, bool) {
+    assert_eq!(status, StatusCode::OK, "{reply:?}");
+    let ServerMessage::SyncBatch { ops, has_more, .. } = reply else {
+        panic!("expected SyncBatch, got {reply:?}");
+    };
+    (seqs_of(&ops), has_more)
+}
+
+/// The catch-up and `has_more` of a `CommitAck` answered with 200.
+fn catchup_of(status: StatusCode, reply: ServerMessage) -> (Vec<u64>, bool) {
+    assert_eq!(status, StatusCode::OK, "{reply:?}");
+    let ServerMessage::CommitAck {
+        catchup_ops,
+        has_more,
+        ..
+    } = reply
+    else {
+        panic!("expected CommitAck, got {reply:?}");
+    };
+    (seqs_of(&catchup_ops), has_more)
+}
+
+/// With little room left in the client's part, a sync returns the operations that fit with
+/// `has_more` instead of `Unavailable`, and the next one goes on from there; a commit's
+/// catch-up carries what fits, and a client up to date gets its own operation only if it fits.
 #[tokio::test]
-async fn sync_without_budget_does_not_move_the_cursor() {
-    // One frame per client.
-    let fx = Fixture::with(|config| {
-        config.max_inflight_response_bytes_per_client = MAX_FRAME_SIZE as u64;
-    })
-    .await;
-    for n in 1..=3u8 {
-        fx.commit_ok(&fx.commit(n, u64::from(n) - 1)).await;
+async fn a_sync_with_little_room_returns_a_shorter_batch_and_the_next_goes_on() {
+    let fx = Fixture::new().await;
+    // Ten operations of about 1 KiB, all of the same size.
+    let commits: Vec<ClientMessage> = (1..=10u8)
+        .map(|n| fx.commit_op(n, u64::from(n) - 1, task_with_title(i64::from(n), 1000)))
+        .collect();
+    for commit in &commits {
+        fx.commit_ok(commit).await;
+    }
+    let one = in_response(1, &commits[0]);
+    // Room for a response with three of them, and most of a fourth.
+    let held = fx.hold_all_but(RESPONSE_OVERHEAD + 4 * one - 1);
+
+    let (status, _, reply) = fx.post("sync", &fx.sync(0)).await;
+    assert_eq!(batch_of(status, reply), (vec![1, 2, 3], true));
+    let (status, _, reply) = fx.post("sync", &fx.sync(3)).await;
+    assert_eq!(batch_of(status, reply), (vec![4, 5, 6], true));
+
+    let behind = fx.commit_op(11, 6, task_with_title(11, 1000));
+    let (status, _, reply) = fx.post("commit", &behind).await;
+    assert_eq!(catchup_of(status, reply), (vec![7, 8, 9], true));
+
+    let up_to_date = fx.commit_op(12, 11, task_with_title(12, 1000));
+    let (status, _, reply) = fx.post("commit", &up_to_date).await;
+    assert_eq!(catchup_of(status, reply), (vec![12], false));
+    drop(held);
+
+    // Without room for its own operation, it gets none.
+    let held = fx.hold_all_but(RESPONSE_OVERHEAD + one - 1);
+    let up_to_date = fx.commit_op(13, 12, task_with_title(13, 1000));
+    let (status, _, reply) = fx.post("commit", &up_to_date).await;
+    assert_eq!(catchup_of(status, reply), (vec![], true));
+    drop(held);
+}
+
+/// A sync is answered `Unavailable` only when not even its first operation fits, and that
+/// leaves no trace: its cursor stays where the client's commits left it, and the same sync,
+/// with room for one operation, is served and only then moves it.
+#[tokio::test]
+async fn a_sync_without_room_for_one_operation_is_unavailable_and_changes_nothing() {
+    let fx = Fixture::new().await;
+    let commits: Vec<ClientMessage> = (1..=3u8).map(|n| fx.commit(n, 0)).collect();
+    for commit in &commits {
+        fx.commit_ok(commit).await;
     }
     let cursor = || async {
         fx.manager
@@ -679,32 +755,328 @@ async fn sync_without_budget_does_not_move_the_cursor() {
             .unwrap()
             .unwrap()
     };
-    assert_eq!(cursor().await, Some(SequenceNumber::new(2)));
+    assert_eq!(cursor().await, Some(SequenceNumber::new(0)));
 
-    // An unread response holds the client's part.
-    let get_schema = ClientMessage::GetSchema {
-        correlation_id: CorrelationId::new(2),
-        room_id: fx.room_id.clone(),
-    };
-    let held = fx.send("schema", &get_schema).await;
-    assert_eq!(held.status(), StatusCode::OK);
-    let (status, _, reply) = fx.post("sync", &fx.sync(3)).await;
+    let second = in_response(2, &commits[1]);
+    let held = fx.hold_all_but(RESPONSE_OVERHEAD + second - 1);
+    let (status, headers, reply) = fx.post("sync", &fx.sync(1)).await;
     assert_error(
         status,
         StatusCode::SERVICE_UNAVAILABLE,
         ErrorCode::Unavailable,
         &reply,
     );
+    assert!(headers.contains_key(header::RETRY_AFTER));
     assert_eq!(
         cursor().await,
-        Some(SequenceNumber::new(2)),
+        Some(SequenceNumber::new(0)),
         "a sync answered Unavailable moved the cursor"
     );
-
     drop(held);
-    let (status, _, reply) = fx.post("sync", &fx.sync(3)).await;
-    assert_eq!(status, StatusCode::OK, "{reply:?}");
-    assert_eq!(cursor().await, Some(SequenceNumber::new(3)));
+
+    let held = fx.hold_all_but(RESPONSE_OVERHEAD + second);
+    let (status, _, reply) = fx.post("sync", &fx.sync(1)).await;
+    assert_eq!(batch_of(status, reply), (vec![2], true));
+    assert_eq!(cursor().await, Some(SequenceNumber::new(1)));
+    drop(held);
+}
+
+/// A second room with a registered client and `ops` small operations committed by it.
+async fn other_room(fx: &Fixture, ops: u8) -> (RoomId, ClientId) {
+    let room_id = RoomId::new("other").unwrap();
+    fx.manager
+        .create_room(room_id.clone(), SchemaId::new("tasks").unwrap(), None)
+        .await
+        .unwrap();
+    let client_id = ClientId::new("reader").unwrap();
+    fx.manager
+        .ask(&room_id, |reply| RoomCommand::RegisterClient {
+            client_id: client_id.clone(),
+            current_seq: None,
+            known_incarnation: None,
+            reply,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    for n in 1..=ops {
+        let row = RowBuilder::new().set("id", i64::from(n)).build();
+        fx.manager
+            .ask(&room_id, |reply| RoomCommand::Commit {
+                client_id: client_id.clone(),
+                mutation_id: MutationId::new([n; 16]),
+                last_ack_seq: SequenceNumber::new(0),
+                op: schema().to_operation_insert("tasks", &row, 1000).unwrap(),
+                reply,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    (room_id, client_id)
+}
+
+/// A sync of `client_id` in `room_id` from 0, straight to the room: the response keeps its
+/// reservation, as between the room's reply and its encoding.
+async fn sync_held(
+    fx: &Fixture,
+    room_id: &RoomId,
+    client_id: &ClientId,
+) -> Result<crate::actor::command::SyncBatchResponse, ServerError> {
+    fx.manager
+        .ask(room_id, |reply| RoomCommand::Sync {
+            client_id: client_id.clone(),
+            from_seq: SequenceNumber::new(0),
+            max_batch_size: 100,
+            reply,
+        })
+        .await
+        .unwrap()
+}
+
+/// A client that does not read its responses fills only its own part, counted by what they
+/// hold: its syncs get shorter batches as the part fills, and then `Unavailable`, while a
+/// client of another room keeps getting whole batches.
+#[tokio::test]
+async fn a_client_that_does_not_read_its_responses_only_fills_its_own_part() {
+    let fx = Fixture::new().await;
+    // Ten operations of 1 MiB: a whole batch holds about 10 MiB once encoded, and about twice
+    // that while it is read.
+    for n in 1..=10u8 {
+        let commit = fx.commit_op(n, u64::from(n) - 1, task_with_title(i64::from(n), 1 << 20));
+        fx.commit_ok(&commit).await;
+    }
+    let (other, reader) = other_room(&fx, 5).await;
+
+    let mut held = Vec::new();
+    let refused = loop {
+        let response = fx.send("sync", &fx.sync(0)).await;
+        if response.status() != StatusCode::OK {
+            break response;
+        }
+        held.push(response);
+        assert!(held.len() < 32, "the client's part must run out");
+        // Another room is served whole meanwhile.
+        let batch = sync_held(&fx, &other, &reader).await.unwrap();
+        assert_eq!((batch.ops.len(), batch.has_more), (5, false));
+    };
+    // The rest of the budget is left to the other clients.
+    let factory = crate::config::ServerConfig::default();
+    let others =
+        factory.max_inflight_response_bytes - factory.max_inflight_response_bytes_per_client;
+    assert!(fx.manager.response_budget().reserved().1 as u64 >= others);
+    let body = axum::body::to_bytes(refused.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let reply = decode_message(&body).unwrap();
+    assert!(
+        matches!(
+            reply,
+            ServerMessage::Error {
+                code: ErrorCode::Unavailable,
+                ..
+            }
+        ),
+        "{reply:?}"
+    );
+    let batch = sync_held(&fx, &other, &reader).await.unwrap();
+    assert_eq!((batch.ops.len(), batch.has_more), (5, false));
+
+    // Before running out, the part gave shorter batches instead of refusing them.
+    let mut lengths = Vec::new();
+    for response in held {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let (ops, has_more) = batch_of(StatusCode::OK, decode_message(&body).unwrap());
+        assert_eq!(has_more, ops.len() < 10);
+        lengths.push(ops.len());
+    }
+    assert!(lengths.iter().any(|&len| len < 10), "{lengths:?}");
+}
+
+/// Many small responses being built at once fit in the factory budget: more than the sixteen
+/// frames it holds, from many clients and from one.
+#[tokio::test]
+async fn many_small_responses_in_flight_fit_in_the_factory_budget() {
+    let fx = Fixture::new().await;
+    fx.commit_ok(&fx.commit(1, 0)).await;
+    let clients: Vec<ClientId> = (0..40)
+        .map(|n| ClientId::new(format!("client-{n}")).unwrap())
+        .collect();
+    for client_id in &clients {
+        fx.manager
+            .ask(&fx.room_id, |reply| RoomCommand::RegisterClient {
+                client_id: client_id.clone(),
+                current_seq: None,
+                known_incarnation: None,
+                reply,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    let mut syncs = Vec::new();
+    for client_id in clients.iter().chain(std::iter::repeat_n(&fx.client_id, 40)) {
+        let batch = sync_held(&fx, &fx.room_id, client_id).await.unwrap();
+        assert_eq!(batch.ops.len(), 1);
+        syncs.push(batch);
+    }
+    let mut commits = Vec::new();
+    for (n, client_id) in clients.iter().enumerate() {
+        let row = RowBuilder::new().set("id", 100 + n as i64).build();
+        let ack = fx
+            .manager
+            .ask(&fx.room_id, |reply| RoomCommand::Commit {
+                client_id: client_id.clone(),
+                mutation_id: MutationId::from_u128(1000 + n as u128),
+                last_ack_seq: SequenceNumber::new(0),
+                op: schema().to_operation_insert("tasks", &row, 1000).unwrap(),
+                reply,
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ack.reservation.is_some() && !ack.catchup_ops.is_empty());
+        commits.push(ack);
+    }
+    drop((syncs, commits));
+    assert_eq!(fx.manager.response_budget().reserved().0, 0);
+}
+
+/// Drops the request of `msg` to `endpoint` after `polls` polls, letting the room run between
+/// them, and returns whether it had completed (its response is dropped too).
+async fn send_cancelled_after(
+    fx: &Fixture,
+    endpoint: &str,
+    msg: &ClientMessage,
+    polls: usize,
+) -> bool {
+    let mut request = std::pin::pin!(fx.send(endpoint, msg));
+    for _ in 0..polls {
+        if futures::poll!(request.as_mut()).is_ready() {
+            return true;
+        }
+        tokio::task::yield_now().await;
+    }
+    false
+}
+
+/// Every response returns what it reserved once it ends: read, dropped unread, or cancelled
+/// at any of its suspension points, before or after the room answered.
+#[tokio::test]
+async fn the_budget_returns_to_zero_once_every_response_ends_or_is_cancelled() {
+    let fx = Fixture::new().await;
+    for n in 1..=3u8 {
+        fx.commit_ok(&fx.commit(n, 0)).await;
+    }
+    let budget = fx.manager.response_budget();
+    let idle = budget.reserved();
+    assert_eq!(idle.0, 0);
+    let get_schema = ClientMessage::GetSchema {
+        correlation_id: CorrelationId::new(2),
+        room_id: fx.room_id.clone(),
+    };
+    for (endpoint, msg) in [
+        ("sync", fx.sync(0)),
+        ("commit", fx.commit(4, 0)),
+        ("register", fx.register_msg()),
+        ("schema", get_schema),
+    ] {
+        for polls in 0.. {
+            let completed = send_cancelled_after(&fx, endpoint, &msg, polls).await;
+            // The room handles its mailbox in order: once it answers this, it has answered
+            // the request, whose reply was dropped if the request was.
+            fx.manager
+                .ask(&fx.room_id, |reply| RoomCommand::GetClientCursor {
+                    client_id: fx.client_id.clone(),
+                    reply,
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(budget.reserved(), idle, "{endpoint} after {polls} polls");
+            if completed {
+                break;
+            }
+            assert!(polls < 100, "{endpoint} never completed");
+        }
+    }
+}
+
+/// A registration and a schema request reserve their known size, not a frame: they are served
+/// while the client's part has room for that, and only then.
+#[tokio::test]
+async fn registration_and_schema_reserve_their_known_size() {
+    let fx = Fixture::new().await;
+    let get_schema = ClientMessage::GetSchema {
+        correlation_id: CorrelationId::new(2),
+        room_id: fx.room_id.clone(),
+    };
+    let size = schema_response_size(&schema());
+    let held = fx.hold_all_but(size);
+    for (endpoint, msg) in [("schema", &get_schema), ("register", &fx.register_msg())] {
+        let (status, _, reply) = fx.post(endpoint, msg).await;
+        assert_eq!(status, StatusCode::OK, "{endpoint}: {reply:?}");
+    }
+    drop(held);
+    let held = fx.hold_all_but(size - 1);
+    for (endpoint, msg) in [("schema", &get_schema), ("register", &fx.register_msg())] {
+        let (status, _, reply) = fx.post(endpoint, msg).await;
+        let expected = StatusCode::SERVICE_UNAVAILABLE;
+        assert_error(status, expected, ErrorCode::Unavailable, &reply);
+    }
+    drop(held);
+}
+
+/// An operation that takes more than a frame in a response (10 MiB encoded, and as much again
+/// once read) is served with the smallest part and budget accepted, a frame each: a reservation
+/// never asks for more than a frame.
+#[tokio::test]
+async fn an_operation_larger_than_a_frame_in_a_response_is_served_with_the_smallest_budget() {
+    let fx = Fixture::with(|config| {
+        config.max_inflight_response_bytes = MAX_FRAME_SIZE as u64;
+        config.max_inflight_response_bytes_per_client = MAX_FRAME_SIZE as u64;
+    })
+    .await;
+    let commit = fx.commit_op(1, 0, task_with_title(1, 10 << 20));
+    let (status, _, reply) = fx.post("commit", &commit).await;
+    assert_eq!(catchup_of(status, reply), (vec![1], false));
+    let (status, _, reply) = fx.post("sync", &fx.sync(0)).await;
+    assert_eq!(batch_of(status, reply), (vec![1], false));
+}
+
+/// A `Registered` or `Schema` response never takes more once encoded than it reserved before
+/// its schema was copied, with every other field at its largest.
+#[test]
+fn schema_responses_reserve_at_least_what_they_take_encoded() {
+    let longest = "r".repeat(zemdb_core::id::MAX_PATH_ID_LEN);
+    let schema = schema();
+    let registered = ServerMessage::Registered {
+        correlation_id: CorrelationId::new(u64::MAX),
+        room_id: RoomId::new(longest.clone()).unwrap(),
+        head_seq: SequenceNumber::new(u64::MAX),
+        tail_seq: SequenceNumber::new(u64::MAX),
+        schema_id: SchemaId::new(longest.clone()).unwrap(),
+        schema: schema.clone(),
+        active_snapshot_seq: Some(SequenceNumber::new(u64::MAX)),
+        room_incarnation: u128::MAX,
+    };
+    let schema_msg = ServerMessage::Schema {
+        correlation_id: CorrelationId::new(u64::MAX),
+        room_id: RoomId::new(longest.clone()).unwrap(),
+        schema_id: SchemaId::new(longest).unwrap(),
+        schema: schema.clone(),
+    };
+    for msg in [registered, schema_msg] {
+        let encoded = encode_message(&msg).unwrap().len() as u64;
+        assert!(encoded <= schema_response_size(&schema), "{encoded}");
+    }
+    // And never more than a frame, the most any response takes.
+    let frame = MAX_FRAME_SIZE as u64;
+    assert_eq!(known_response_size(frame - RESPONSE_OVERHEAD), frame);
+    assert_eq!(known_response_size(frame), frame);
 }
 
 #[test]

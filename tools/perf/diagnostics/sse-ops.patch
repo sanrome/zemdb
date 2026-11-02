@@ -32,8 +32,8 @@ index d1e9ce5..6a65cd8 100644
 +        };
 +        let _ = self.events_tx.send(event);
  
-         // Catch-up for 1-RTT synchronization.
-         let reservation = self.reserve_frame(client_id);
+         // Catch-up for 1-RTT synchronization. A client that was up to date gets the operation
+         // it sent, without reading the log, if the response has room for it.
 diff --git a/crates/server/src/api/sse.rs b/crates/server/src/api/sse.rs
 index 20637ea..fab91df 100644
 --- a/crates/server/src/api/sse.rs

@@ -10,7 +10,7 @@ El generador de carga y los scripts de las [evaluaciones de performance](../../d
 | `src/rooms.rs` | El modo `rooms`, de la Evaluación 2: muchas salas, con clientes que escriben a ritmo humano y se ponen al día como el SDK (SSE, `/sync`, `Ack`, heartbeat). |
 | `run_e1.sh`, `profile_e1.sh`, `summarize.sh` | Una medición de la Evaluación 1 (una línea JSON por corrida), su perfil de CPU con `perf`, y la mediana de las repeticiones. |
 | `run_e2.sh`, `e2_all.sh`, `e2f_all.sh`, `summarize_e2.sh` | Una configuración de la Evaluación 2 contra un servidor nuevo, todas las mediciones de §4.4, las de los modos de frescura (§4.8), y la mediana de las repeticiones. |
-| `results/` | Los datos crudos de las evaluaciones. En `e1-block-in-place-*.jsonl` y `e1-mediciones.jsonl`, la lista de commits lentos de cada corrida está resumida: cuántos hubo y los 20 más largos. |
+| `results/` | Los datos crudos de las evaluaciones. En `e1-block-in-place-*.jsonl` y `e1-mediciones.jsonl`, la lista de commits lentos de cada corrida está resumida: cuántos hubo y los 20 más largos. En `results/fase3_12/`, los de la línea de base de la Fase 3.12 y los de cada lote. |
 | `diagnostics/` | Los cambios de diagnóstico del servidor, como parches (DP1): no están en el código de `main`. |
 
 ## Preparar la máquina

@@ -1,5 +1,5 @@
 use crate::error::ServerError;
-use crate::log::budget::{op_bytes, ReadBudget};
+use crate::log::budget::{OpSize, ReadBudget};
 use crate::log::policy::RoomLifecyclePolicy;
 use std::collections::VecDeque;
 use tokio::time::Instant;
@@ -10,22 +10,22 @@ use zemdb_core::protocol::messages::SequencedOperation;
 #[derive(Debug, Default)]
 pub struct HotBuffer {
     entries: VecDeque<Entry>,
-    /// What the operations in `entries` are charged ([`op_bytes`]).
+    /// What the operations in `entries` are charged ([`op_bytes`](crate::log::budget::op_bytes)).
     bytes: u64,
 }
 
-/// An operation in the buffer, with when it arrived and what it is charged.
+/// An operation in the buffer, with when it arrived and its sizes.
 #[derive(Debug)]
 struct Entry {
     op: SequencedOperation,
     at: Instant,
-    bytes: u64,
+    size: OpSize,
 }
 
 impl Entry {
     fn new(op: SequencedOperation) -> Self {
         Self {
-            bytes: op_bytes(&op),
+            size: OpSize::of(&op),
             op,
             at: Instant::now(),
         }
@@ -53,13 +53,13 @@ impl HotBuffer {
     }
 
     fn push(&mut self, entry: Entry) {
-        self.bytes = self.bytes.saturating_add(entry.bytes);
+        self.bytes = self.bytes.saturating_add(entry.size.bytes);
         self.entries.push_back(entry);
     }
 
     fn pop_front(&mut self) {
         if let Some(entry) = self.entries.pop_front() {
-            self.bytes = self.bytes.saturating_sub(entry.bytes);
+            self.bytes = self.bytes.saturating_sub(entry.size.bytes);
         }
     }
 
@@ -91,7 +91,7 @@ impl HotBuffer {
 
         self.entries
             .range(start_idx..)
-            .take_while(|entry| budget.admit(entry.bytes))
+            .take_while(|entry| budget.admit(entry.size))
             .map(|entry| entry.op.clone())
             .collect()
     }

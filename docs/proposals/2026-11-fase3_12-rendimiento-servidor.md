@@ -136,8 +136,8 @@ Prefijo **DS**. Se escribieron como *Propuestas*, y el dueño del proyecto las a
 | Orden | Lote | Crates | Decisiones | Invariantes | Progreso |
 |---|---|---|---|---|---|
 | 0 | Contrato | Documentos | DS1 a DS8 | Ajustes: B1, B3, B4, B5, D1, D7, E3, L7, Y2 (R3, solo con DS7) | ✅ |
-| 1 | El arnés en `main` y la línea de base | `tools/perf` (fuera del workspace) | DS8 | — | ✅ (la línea de base, con el Lote 2) |
-| 2 | El presupuesto de respuestas | server | DS1 | B1, B5, L1 | ⬜ |
+| 1 | El arnés en `main` y la línea de base | `tools/perf` (fuera del workspace) | DS8 | — | ✅ (la línea de base, medida con el Lote 2) |
+| 2 | El presupuesto de respuestas | server | DS1 | B1, B5, L1 | ✅ |
 | 3 | La E/S fuera de los workers | server | DS2 | D1, D7, L3, L5, L7, B3, B4 | ⬜ |
 | 4 | *Group commit* | server | DS3 | D1, D2, D7, Y1, Y4, Y5, L3, B4 | ⬜ |
 | 5 | El SSE: apagarlo y el evento `ops` | core, server | DS4, DS5 | Y2, D7, E3, B3, B5, A1, W1, W2 | ⬜ |
@@ -256,7 +256,7 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 - **Verificación:** el workspace no cambió (`cargo metadata` lista los mismos cuatro crates, `cargo fmt --all -- --check` pasa y el `Cargo.lock` de la raíz no cambia); el arnés compila; cada escenario corrió en su versión corta (una repetición de 2 a 5 s: E1 en tmpfs con 1 y 8 pedidos en vuelo, en disco y directo al actor; E2 con SSE en tmpfs y sin SSE en disco) contra el servidor de `main`, con corridas válidas.
 - **Desvíos:** el lote se adelantó al Lote 0, a pedido del dueño del proyecto, para no dejar el código en ramas; no toca el servidor ni el contrato. La línea de base de la fase no se midió: se mide al arrancar el Lote 2, en la misma sesión que su resultado (§5.1, paso 0), porque la máquina de esta sesión no es la de los lotes siguientes. Las ramas `perf/e1-commit`, `perf/e2-salas` y `claude/evaluaciones-performance` quedan para que las borre el dueño del proyecto: su contenido ya está en `main`.
 
-### Lote 2 · El presupuesto de respuestas · ⬜
+### Lote 2 · El presupuesto de respuestas · ✅ Hecho
 **Objetivo:** que el presupuesto acote la memoria sin rechazar respuestas chicas (DS1).
 
 **Archivos:** `crates/server/src/response_budget.rs`, `actor/room.rs` (`reserve_frame` y quienes lo llaman: el `/sync`, el catch-up, el registro y el esquema), `log/tiered_log.rs` (la lectura con presupuesto), `api/data_plane.rs` (`budgeted_response`), y sus tests. `ARCHITECTURE.md` §5.2 (*Bounded responses*) y §7.3.
@@ -280,7 +280,89 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 
 **Entrega:** `perf(server): reserve the response budget by what is read, not a whole frame (Fase 3.12, Lote 2)`.
 
-**Hecho.** *Pendiente.*
+**Hecho.**
+- **La reserva por lo que se lee** (`response_budget.rs`, `log/budget.rs`, `log/tiered_log.rs`, `actor/room.rs`). El actor reserva primero lo que ocupa una respuesta además de sus operaciones (`RESPONSE_OVERHEAD`: el header del frame y `RESPONSE_ENVELOPE_ALLOWANCE`). Después, `ReadBudget` hace crecer esa reserva (`Reservation::grow`) por cada operación que admite, en cualquier tier, en `OpSize::in_response`: lo que la operación cobra en memoria (`op_bytes`) más su tamaño codificado. La primera operación que no entra corta la lectura, aunque sea la primera de todas, y entonces `fetch_deltas` devuelve un lote vacío con `has_more`. El `/sync` lo contesta con `Unavailable`, sin tocar el cursor; el commit, con el catch-up vacío. Un cliente al día recibe su propia operación si la reserva crece por ella. La `HotBuffer` guarda los dos tamaños de cada operación, para no recalcularlos en cada lectura. El camino de RAM ya no copia el presupuesto de lectura: si no admitió nada, no lo tocó.
+- **Una reserva no pasa de un frame.** Más allá, crece gratis. Sin eso, una sola operación grande (hasta 16 MiB codificada y 24 MiB en memoria) pediría más que la parte más chica que se acepta (un frame) y no se serviría nunca. Una respuesta así cuenta como un frame, como contaba antes toda respuesta, aunque mientras se codifica puede ocupar hasta unas 2,5 veces eso. Va en INV-B1 y en `ARCHITECTURE.md` §7.3.
+- **`Registered` y `Schema`** reservan, antes de copiar el esquema, su tamaño codificado más `RESPONSE_OVERHEAD`, que cubre el resto de los dos mensajes (un test lo comprueba con cada campo en su máximo), y tampoco más de un frame. El chunk de snapshot sigue reservando un frame: su tamaño lo elige el cliente y se lee del archivo después de una espera.
+- **La parte de cada cliente** se busca una sola vez por reserva, y el par sala y cliente se copia solo si el cliente no tenía nada reservado (lo pidió la medición, abajo).
+- **Tests agregados** (los cuatro primeros de `data_plane.rs` fallan con la reserva del frame entero):
+  - `api/tests/data_plane.rs`: `a_sync_with_little_room_returns_a_shorter_batch_and_the_next_goes_on` (un `/sync` con poco lugar, el siguiente, el catch-up de un commit atrasado y el de uno al día, con y sin lugar para su operación); `a_sync_without_room_for_one_operation_is_unavailable_and_changes_nothing` (reemplaza a `sync_without_budget_does_not_move_the_cursor`); `a_client_that_does_not_read_its_responses_only_fills_its_own_part` (respuestas sin leer de 1 MiB por operación: lotes más cortos, después `Unavailable`, y otra sala servida entera mientras tanto); `many_small_responses_in_flight_fit_in_the_factory_budget` (80 syncs y 40 catch-ups retenidos a la vez, de 40 clientes y de uno); `the_budget_returns_to_zero_once_every_response_ends_or_is_cancelled` (sync, commit, registro y esquema cortados después de cada cantidad de polls); `registration_and_schema_reserve_their_known_size`; `schema_responses_reserve_at_least_what_they_take_encoded` (y nunca más de un frame); `an_operation_larger_than_a_frame_in_a_response_is_served_with_the_smallest_budget` (una operación de 10 MiB con la parte y el presupuesto de un frame); y `responses_without_room_in_the_budget_are_unavailable_before_they_are_built`, que reemplaza a `responses_take_a_frame_of_the_clients_budget_before_they_are_built`.
+  - `log/tests/tiered_log.rs`: `a_read_ends_where_the_reservation_of_its_response_runs_out` (en disco y en RAM, y sin lugar para la primera).
+  - `log/tests/budget.rs`: cuatro, de cómo crece la reserva y cuándo corta la lectura.
+  - `tests/response_budget.rs` (nuevo): cuatro, de `grow`, el tope de un frame y la parte de cada cliente.
+- **Mutaciones verificadas,** cada una con algún test que falla: reservar el frame entero antes de leer (los cuatro tests de comportamiento); no hacer crecer la reserva al leer (siete); dejarla crecer más allá de un frame; servir un `/sync` vacío sin lugar para su primera operación; tomar la falta de lugar en disco por un hueco del log; darle su operación a un cliente al día sin hacer crecer la reserva; reservar un frame en el registro o en el esquema; el tamaño del esquema sin el sobre; no controlar la parte del cliente al crecer o en la primera reserva; y admitir la primera operación sin lugar; también el tope de un frame en el registro y el esquema. Las mutaciones se corrieron contra los tests unitarios del servidor; las del tope de un frame y de la parte del cliente, también contra los de integración. La salida temprana del camino de RAM sin lugar no tenía test que fallara: el camino de disco, con el presupuesto agotado, no lee nada y devuelve lo mismo. Se sacó.
+- **Interacciones revisadas:**
+  - **El presupuesto de lectura del log:** la reserva se cobra en el mismo `admit`, después del tope de operaciones y de bytes, que no cambian; la primera operación, que el presupuesto de lectura siempre admite, la reserva puede rechazarla (los tests de `budget.rs` y de `tiered_log.rs`).
+  - **`MAX_FRAME_SIZE` y `MAX_MESSAGE_VALUES`:** `fit_in_response` y el tope de lectura siguen igual, y `large_operations_are_split_across_catch_up_and_sync_batches` pasa sin cambios; el tope de un frame por reserva, con su test.
+  - **Los streams HTTP/2 sin leer y `max_send_buf_size`:** la respuesta se sigue quedando con su tamaño codificado y le entrega copias a hyper. Los tests de `http_edge_tests.rs` (`responses_over_the_budget_in_flight_wait_for_held_bodies`, `client_over_its_part_of_the_budget_leaves_the_rest_to_other_rooms`) pasan sin cambios: una fila de 5 MiB no entra en lo que deja una respuesta retenida.
+  - **El relay:** sigue reservando un frame por chunk, de la misma parte del cliente (`a_request_waiting_for_its_room_holds_none_of_the_budget`; el chunk sin lugar, antes de leer el archivo, en `responses_without_room_in_the_budget_are_unavailable_before_they_are_built`).
+  - **Un commit con el catch-up vacío o parcial, y el cliente:** el SDK acepta un catch-up vacío o parcial con `has_more` (la validación del `CommitAck` en `client.rs`) y sigue con `/sync`; un `SyncBatch` vacío con `has_more`, que el SDK rechaza, el servidor no lo manda: responde `Unavailable`.
+  - **El reintento deduplicado de un commit:** reserva igual que uno nuevo (los dos commits de `responses_without_room_in_the_budget_are_unavailable_before_they_are_built`).
+  - **Los requests cancelados:** la reserva vuelve con la respuesta del actor que nadie espera, con la que no se llegó a codificar o con el body (`the_budget_returns_to_zero_once_every_response_ends_or_is_cancelled`).
+  - **INV-L1:** el `Unavailable` sigue saliendo sin esperar, con `Retry-After`.
+  - **El relay comparte la parte del cliente:** un chunk necesita un frame libre, y con el presupuesto casi lleno los syncs chicos siguen entrando mientras el chunk recibe `Unavailable`. No es peor que antes (antes, nada entraba), pero la prioridad relativa favorece a los syncs sobre un cliente que baja un snapshot.
+  - **El costo de reservar por operación:** cada operación admitida toma el lock de las partes y el semáforo, antes una vez por respuesta. En el perfil de E1-tmpfs con 8 pedidos en vuelo, el código del presupuesto pasa de un 0,9% a un 1,5% del CPU (abajo).
+  - **Una lectura en RAM sin lugar para la primera operación** pasa por `blocking_io` (un traspaso del worker sin E/S) antes de devolver el lote vacío: solo bajo presión del presupuesto, y el Lote 3 reemplaza ese camino.
+  - **La `HotBuffer`:** cada entrada guarda 8 bytes más (el tamaño codificado), fuera de `ram_max_bytes`: unos 8 MB con 1.000 salas de 1.000 operaciones.
+  - **Los parches de diagnóstico:** `sse-ops.patch` dejó de aplicar por dos líneas de contexto del commit del actor; se ajustaron, y los dos parches aplican sobre este lote.
+- **Verificación:** `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` y `cargo doc` sin advertencias; las 13 pruebas largas del servidor (`cargo test -p zemdb-server --release -- --ignored`); el checklist de medición de §5.3.
+- **La revisión de delta,** por un agente aparte, de contexto fresco y solo lectura, con las seis preguntas. No hubo hallazgos Altos ni Medios. Los ocho Bajos quedaron así:
+  - **Corregidos con tests:** el test del cliente que no lee sus respuestas no fallaba sin la parte por cliente (ahora afirma que queda libre el resto del presupuesto); faltaba un test de punta a punta del tope de un frame (el de la operación de 10 MiB); y el registro y el esquema no tenían ese tope.
+  - **Corregidos en los documentos:** "hasta el doble" era "hasta unas 2,5 veces"; y el `Unavailable` de un sync sin lugar ni para su respuesta.
+  - **Corregido en el código:** un campo `pub(crate)` sin necesidad.
+  - **Agregados a las interacciones:** el costo de reservar por operación, la lectura en RAM sin lugar, el relay y la `HotBuffer`.
+  - **La pregunta 6, la medición:** las corridas son válidas según DP3. El criterio de la propagación no queda demostrado, y es un desvío que necesita el visto bueno del dueño del proyecto (abajo).
+- **Medición.**
+  - **El entorno (DP3):** una VM de 4 vCPU (Intel Xeon a 2,80 GHz) con 15 GB, Ubuntu 24.04, kernel 6.18 y rustc 1.97.0. El servidor corre en los núcleos 0 y 1, y el generador, en el 2 y el 3, con el mismo binario del generador en todas las corridas. Los datos van en tmpfs (`/dev/shm`).
+  - **Lo que se compara:** la base es `0b03a77`; el resultado, este lote.
+  - **El diseño:** tres rondas intercaladas, para que la máquina sea la misma en las dos mitades. La tabla da la mediana y, entre paréntesis, el rango.
+  - **Los datos crudos,** en `tools/perf/results/fase3_12/lote2/`.
+
+  | Escenario | Base `0b03a77` | Resultado |
+  |---|---|---|
+  | E2-tmpfs, 1.000 salas: `503` | 926.253 | 0 |
+  | E2-tmpfs, 1.000 salas: propagación p99 | 40,2 s | 2,34 s (1,37–2,61) |
+  | E2-tmpfs, 1.000 salas, con 4 GiB de presupuesto (el diagnóstico): propagación p99 | 2,07 s (2,06–2,75), con un `503` en dos de las tres corridas | — |
+  | E2-tmpfs, 500 salas: propagación p99, commit p99 y `503` | 37,5 ms (32,7–41,9), 9,3 ms, 91.950 | 13,9 ms (12,0–21,2), 8,5 ms, 0 |
+  | E1-tmpfs, 1 pedido en vuelo: commits/s (dispersión) | 4.660 (6%) | 4.582 (−1,7%) |
+  | E1-tmpfs, 8 pedidos en vuelo: commits/s (dispersión), p99 | 14.948 (4%), 1.471 µs | 13.253 (−11,3%), 1.685 µs |
+
+  - **El criterio.**
+    - **Sin `503` del presupuesto con 1.000 salas:** se cumple.
+    - **La propagación en p99 no queda demostrada.** Los 2,34 s quedan dentro de la dispersión del diagnóstico de 4 GiB medido en esta máquina (2,07 s, de 2,06 a 2,75 s), pero no lo superan: con las seis corridas intercaladas de cada uno, dan 2,16 s contra 2,07 s.
+    - **Los 170 ms de §4.7.1 no se reproducen acá:** son de la máquina de las evaluaciones. Acá los dos están acotados por la saturación de `block_in_place` (de 169 a 177% de CPU sobre 200%, unos 300 hilos), no por el presupuesto. En el perfil de E2 con 1.000 salas, el del resultado y el del diagnóstico son casi iguales, dominados por los cambios de hilo y los despertares (`futex`, `sched_yield`), y el código del presupuesto no aparece. Eso es lo que resuelve el Lote 3.
+  - **La deriva de la máquina.** La primera medición, sin intercalar, daba el diagnóstico en 1,23 s y el resultado, una hora después, en 2,23 s. Intercalados, dieron 2,00 y 1,98 s. Por eso la medición del lote es la intercalada, y la primera se descarta (sus datos quedan en `first-*`).
+  - **El control E1-tmpfs con 8 pedidos en vuelo** baja un 11,3%, de forma sistemática, por debajo del umbral (su dispersión más un 10%: 14,1%). Entre mediciones intercaladas, la baja fue de 4,8% a 11,3%.
+    - **La causa.** Con el frame entero, la parte del cliente (2 frames) no alcanzaba para 8 commits en vuelo, y el 47% de los commits salía sin catch-up (vacío, con `has_more`), con un promedio de 3,4 operaciones. Con este lote, ninguno sale vacío, y el promedio es de 7,0. Lo midió un generador instrumentado (`probe-catchup-*`).
+    - **Lo que cuesta:** el resultado entrega casi el doble de operaciones en catch-ups por segundo (unas 93.000, contra 51.000). En el perfil, leer de la RAM y codificar el `CommitAck` cuestan el doble de CPU, y el código del presupuesto pasa de un 0,9% a un 1,5%.
+    - **Por qué la base sale mejor:** el generador de E1 no usa el catch-up ni hace `/sync`, así que la base se ahorraba un trabajo que un cliente real pagaría con un `/sync`.
+  - **El binario medido** es el de este lote, salvo dos cambios de la revisión que no tocan estos escenarios: el tope de un frame en la reserva del registro y del esquema, y un campo privado.
+- **La línea de base de la fase,** sobre `0b03a77`, con el mismo entorno, 3 repeticiones y la mediana. Los escenarios de este lote y los de control se midieron al arrancar; los demás, al cerrar. Los datos crudos van en `tools/perf/results/fase3_12/base-0b03a77/`.
+
+  | E1 | 1 pedido en vuelo | 8 | 64 |
+  |---|---|---|---|
+  | E1-tmpfs: commits/s (dispersión), p99 | 4.438 (8%), 486 µs | 14.566 (0%), 1.505 µs | 24.714 (0%), 6,2 ms |
+  | E1-disco | 1.188 (12%), 2,3 ms | 2.323 (6%), 7,5 ms | 2.075 (11%), 49 ms |
+  | E1-actor | 25.964 (3%), 126 µs | 42.545 (7%), 529 µs | 27.087 (9%), 7,2 ms |
+
+  | E2 (10 usuarios por sala, un commit por segundo por sala) | Propagación p50, p99 | `503` | CPU del servidor |
+  |---|---|---|---|
+  | E2-tmpfs, 500 salas | 2,0 ms, 36,9 ms | 89.485 | 113% |
+  | E2-tmpfs, 1.000 salas | 4,1 s, 29,8 s | 1.025.954 | 172% |
+  | E2-tmpfs, 1.000 salas, con 4 GiB de presupuesto | 730 ms, 1,23 s | 1 | 171% |
+  | E2-disco, 500 salas | 342 ms, 8,6 s | 511.918 | 165% |
+  | E2-disco, 1.000 salas (no válida por DP3: al final de cada corrida, de 2 a 32 de los 10.000 clientes seguían atrasados) | 10 s, 52 s | 665.311 | 172% |
+  | E2-modos, 1.000 salas, a (SSE con señales, `Ack` después de cada sync) | 7,8 s, 44 s | 867.680 | 176% |
+  | E2-modos, 1.000 salas, c (el prototipo del evento `ops`, `sse-ops.patch`) | 0,8 ms, 5,1 ms | 0 | 77% |
+  | E2-modos, 1.000 salas, d (sin SSE, heartbeat cada 30 s) | 5,0 s, 25 s | 0 | 61% |
+
+  - **Lo que deja ver:** esta máquina es más lenta que la de las evaluaciones, sobre todo en disco (E1-disco con 1 pedido en vuelo da 1.188 commits/s), y con 1.000 salas el servidor de fábrica colapsa siempre que los clientes hacen `/sync` después de cada evento (E2-tmpfs, E2-disco y el modo a). En el modo d, la propagación es la del heartbeat, por diseño. El modo c, sin `/sync` después de cada evento, queda en 5 ms de p99 con el 77% del CPU: es lo que buscan DS5 y el Lote 5.
+- **Desvíos:**
+  - **El tope de un frame por reserva** no estaba en DS1: lo pide que toda respuesta pueda servirse con la configuración más chica que se acepta. Lo aprobó el dueño del proyecto (2 de Noviembre de 2026).
+  - **El criterio de la propagación,** que no queda demostrado (arriba): se acepta con el visto bueno del dueño del proyecto (2 de Noviembre de 2026).
+  - **El tamaño:** unas 245 líneas de producción, contando los comentarios, contra 100 a 150 estimadas.
+  - **La línea de base de la fase** (la que el Lote 1 dejó para este lote) se midió en dos partes: los escenarios de este lote y los de control, al arrancar; E1-disco, E1-actor, E2-disco y E2-modos, al cerrar, en la misma sesión (arriba).
+  - **El aviso de la medición:** la regla de §5.1, paso 4, se aplicó contra una medición intercalada, porque la máquina cambió de velocidad con las horas.
 
 ### Lote 3 · La E/S fuera de los workers · ⬜
 **Objetivo:** que ningún worker de Tokio haga E/S de archivos, y que los hilos no crezcan con las salas (DS2).
@@ -450,8 +532,8 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 | Lote | Qué | Estado |
 |---|---|---|
 | 0 | Contrato | ✅ |
-| 1 | El arnés en `main` y la línea de base | ✅ (la línea de base, con el Lote 2) |
-| 2 | El presupuesto de respuestas | ⬜ |
+| 1 | El arnés en `main` y la línea de base | ✅ (la línea de base, medida con el Lote 2) |
+| 2 | El presupuesto de respuestas | ✅ |
 | 3 | La E/S fuera de los workers | ⬜ |
 | 4 | *Group commit* | ⬜ |
 | 5 | El SSE: apagarlo y el evento `ops` | ⬜ |
@@ -459,4 +541,4 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 | 7 | El roster | ⬜ |
 | 8 | Medición final y revisión de cierre | ⬜ |
 
-**Avance:** plan escrito el 1 de Noviembre de 2026, a partir de las Evaluaciones 1 y 2. Lote 1 cerrado el mismo día, adelantado al Lote 0 (el arnés en `main`; la línea de base se mide con el Lote 2). Lote 0 cerrado el mismo día: DS1 a DS8 adoptadas y `INVARIANTES.md` en su versión 12. El próximo paso es el Lote 2, que mide al arrancar la línea de base de la fase.
+**Avance:** plan escrito el 1 de Noviembre de 2026, a partir de las Evaluaciones 1 y 2. Lote 1 cerrado el mismo día, adelantado al Lote 0 (el arnés en `main`; la línea de base se mide con el Lote 2). Lote 0 cerrado el mismo día: DS1 a DS8 adoptadas y `INVARIANTES.md` en su versión 12. Lote 2 cerrado el 2 de Noviembre de 2026: el presupuesto de respuestas reserva por lo que se lee, sin `503` del presupuesto con 1.000 salas; con él se midió la línea de base de la fase. El próximo paso es el Lote 3.

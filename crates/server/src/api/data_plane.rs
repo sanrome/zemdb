@@ -5,8 +5,9 @@ use http_body::Body as _;
 use tokio::sync::oneshot;
 use tracing::error;
 use zemdb_core::id::{ClientId, CorrelationId, RoomId};
-use zemdb_core::protocol::codec::encode_message;
+use zemdb_core::protocol::codec::{encode_message, encoded_len, MAX_FRAME_SIZE};
 use zemdb_core::protocol::messages::{ClientMessage, ErrorCode, ServerMessage};
+use zemdb_core::schema::Schema;
 
 use crate::actor::command::RoomCommand;
 use crate::api::auth::verify_client_token_bound;
@@ -16,7 +17,7 @@ use crate::api::extract::{
 use crate::api::router::{AppState, ResponseBudget};
 use crate::error::ServerError;
 use crate::relay::Uploader;
-use crate::response_budget::{no_room, BudgetHolder, Reservation};
+use crate::response_budget::{no_room, BudgetHolder, Reservation, RESPONSE_OVERHEAD};
 
 /// Encodes `msg` as a binary frame response. A message that cannot be encoded (a bug: every
 /// response is sized to fit a frame) is logged and answered with a small `Internal` error
@@ -51,6 +52,20 @@ pub(crate) fn binary_response(status: StatusCode, msg: &ServerMessage) -> Respon
 /// [`InflightBudget::reserve_frame`](crate::response_budget::InflightBudget::reserve_frame)).
 pub(crate) fn reserve_frame(state: &AppState, holder: BudgetHolder) -> Option<Reservation> {
     state.room_manager.response_budget().reserve_frame(holder)
+}
+
+/// What a `Registered` or `Schema` response carrying `schema` reserves, known before the schema
+/// is copied into it ([`known_response_size`] of the schema's encoded size).
+fn schema_response_size(schema: &Schema) -> u64 {
+    known_response_size(encoded_len(schema).unwrap_or(u64::MAX))
+}
+
+/// What a response of `body` bytes besides its envelope reserves: those bytes and, at most,
+/// what a response takes besides its operations, but never more than a frame (the most a
+/// response takes), so that it fits in the smallest part and budget accepted.
+fn known_response_size(body: u64) -> u64 {
+    body.saturating_add(RESPONSE_OVERHEAD)
+        .min(MAX_FRAME_SIZE as u64)
 }
 
 /// The budget holder of a room's client.
@@ -118,20 +133,25 @@ async fn ask_room<R>(
     state.room_manager.ask(room_id, command).await?
 }
 
-/// 200 with the frame `ok` builds from the room's reply within `holder`'s budget, or the error
-/// frame of the request.
+/// 200 with the frame `ok` builds from the room's reply, once `holder`'s budget has room for
+/// the `size` it takes, or the error frame of the request.
 fn respond_budgeted<R>(
     state: &AppState,
     holder: BudgetHolder,
     correlation_id: CorrelationId,
     result: Result<R, ServerError>,
+    size: impl FnOnce(&R) -> u64,
     ok: impl FnOnce(RoomId, R) -> ServerMessage,
 ) -> Response {
     let room_id = holder.0.clone();
-    match (result, reserve_frame(state, holder)) {
-        (Ok(value), Some(reservation)) => budgeted_response(reservation, &ok(room_id, value)),
-        (Ok(_), None) => no_budget(correlation_id, room_id),
-        (Err(err), _) => binary_error(Some(correlation_id), Some(room_id), err),
+    let value = match result {
+        Ok(value) => value,
+        Err(err) => return binary_error(Some(correlation_id), Some(room_id), err),
+    };
+    let budget = state.room_manager.response_budget();
+    match budget.reserve(holder, size(&value)) {
+        Some(reservation) => budgeted_response(reservation, &ok(room_id, value)),
+        None => no_budget(correlation_id, room_id),
     }
 }
 
@@ -190,6 +210,7 @@ pub async fn register(
         holder,
         correlation_id,
         result,
+        |reg_resp| schema_response_size(&reg_resp.schema),
         |room_id, reg_resp| ServerMessage::Registered {
             correlation_id,
             room_id,
@@ -402,6 +423,7 @@ pub async fn get_schema(
         holder,
         correlation_id,
         result,
+        |(_, schema)| schema_response_size(schema),
         |room_id, (schema_id, schema)| ServerMessage::Schema {
             correlation_id,
             room_id,

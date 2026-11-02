@@ -111,10 +111,12 @@ pub struct ServerConfig {
     pub response_stall_timeout_secs: u64,
 
     /// Bytes of large responses (`SyncBatch`, `CommitAck`, `SnapshotChunk`, `Registered`,
-    /// `Schema`) held at once until their clients take them (default 256 MiB); each reserves a
-    /// whole frame while it is built. Without room left, a sync, a snapshot chunk, a
-    /// registration or a schema request is answered `Unavailable`, and a commit is acknowledged
-    /// without its catch-up.
+    /// `Schema`) held at once until their clients take them (default 256 MiB). A sync or a
+    /// commit's catch-up reserves what each operation takes as it reads it, and ends its batch
+    /// at the first one without room (`has_more`); a registration or a schema reserves its
+    /// known size, and a snapshot chunk a whole frame. Without room for even the first
+    /// operation, a sync, a snapshot chunk, a registration or a schema request is answered
+    /// `Unavailable`, and a commit is acknowledged without its catch-up.
     pub max_inflight_response_bytes: u64,
 
     /// Part of `max_inflight_response_bytes` one client (a room and `client_id`, or the admin

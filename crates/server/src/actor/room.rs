@@ -24,9 +24,10 @@ use crate::config::ServerConfig;
 use crate::dedup::{dedup_key, DedupLruCache};
 use crate::durable;
 use crate::error::ServerError;
+use crate::log::budget::OpSize;
 use crate::log::{RoomLifecyclePolicy, TieredLog};
 use crate::relay::{LogBounds, SnapshotRelay, Uploader};
-use crate::response_budget::{no_room, InflightBudget, Reservation};
+use crate::response_budget::{no_room, InflightBudget, Reservation, RESPONSE_OVERHEAD};
 
 /// Period of the fast maintenance tick, which only touches memory (and the roster file when
 /// it changed): lease timeouts and state transitions, snapshot signals, roster persistence and
@@ -495,9 +496,9 @@ impl RoomActor {
             // The retry is accepted, so the cursor it reports (already validated against
             // head_seq) is recorded and the client's state recomputed from it.
             self.observe(client_id, Some(last_ack_seq));
-            let reservation = self.reserve_frame(client_id);
+            let mut reservation = self.reserve_response(client_id);
             let (catchup_ops, has_more) =
-                self.catchup_after_commit(last_ack_seq, reservation.is_some());
+                self.catchup_after_commit(last_ack_seq, reservation.as_mut());
             return Ok(CommitResponse {
                 assigned_seq: existing_seq,
                 catchup_ops,
@@ -577,13 +578,18 @@ impl RoomActor {
 
         let _ = self.events_tx.send(RoomEvent::HeadAdvanced(new_seq));
 
-        // Catch-up for 1-RTT synchronization.
-        let reservation = self.reserve_frame(client_id);
-        let with_catchup = reservation.is_some();
-        let (catchup_ops, has_more) = if with_catchup && last_ack_seq.get() + 1 == new_seq.get() {
-            (vec![seq_op], false)
-        } else {
-            self.catchup_after_commit(last_ack_seq, with_catchup)
+        // Catch-up for 1-RTT synchronization. A client that was up to date gets the operation
+        // it sent, without reading the log, if the response has room for it.
+        let mut reservation = self.reserve_response(client_id);
+        let (catchup_ops, has_more) = match reservation.as_mut() {
+            Some(reservation) if last_ack_seq.get() + 1 == new_seq.get() => {
+                if reservation.grow(OpSize::of(&seq_op).in_response()) {
+                    (vec![seq_op], false)
+                } else {
+                    (Vec::new(), true)
+                }
+            }
+            reservation => self.catchup_after_commit(last_ack_seq, reservation),
         };
 
         // A failed segment rotation after a durable append leaves the segment files in an
@@ -610,16 +616,18 @@ impl RoomActor {
         })
     }
 
-    /// A frame of `client_id`'s part of the budget of response bytes in flight, reserved right
-    /// before a response is read from the log, so that a command waiting in the mailbox holds
-    /// none. The response carries it to its encoding.
-    fn reserve_frame(&self, client_id: &ClientId) -> Option<Reservation> {
+    /// What a response to `client_id` takes besides its operations ([`RESPONSE_OVERHEAD`]),
+    /// reserved from the client's part of the budget of response bytes in flight right before
+    /// the response is read from the log, so that a command waiting in the mailbox holds none.
+    /// Reading the operations grows it, and the response carries it to its encoding.
+    fn reserve_response(&self, client_id: &ClientId) -> Option<Reservation> {
         let holder = (self.room_id.clone(), Uploader::Client(client_id.clone()));
-        self.response_budget.reserve_frame(holder)
+        self.response_budget.reserve(holder, RESPONSE_OVERHEAD)
     }
 
     /// Builds the catch-up batch returned with an acknowledged commit, starting after the
-    /// client's cursor, unless the budget had no room for it (`with_catchup` unset).
+    /// client's cursor, with the operations its response's `reservation` has room for (none
+    /// without a reservation).
     ///
     /// The commit itself is already durable, so a failure here must not turn into an error
     /// reply. Without a catch-up, the batch is empty and flagged `has_more`, which sends the
@@ -628,14 +636,14 @@ impl RoomActor {
     fn catchup_after_commit(
         &self,
         last_ack_seq: SequenceNumber,
-        with_catchup: bool,
+        reservation: Option<&mut Reservation>,
     ) -> (Vec<SequencedOperation>, bool) {
-        if !with_catchup {
+        let Some(reservation) = reservation else {
             return (Vec::new(), true);
-        }
+        };
         match self
             .tiered_log
-            .fetch_deltas(last_ack_seq, COMMIT_CATCHUP_BATCH)
+            .fetch_deltas(last_ack_seq, COMMIT_CATCHUP_BATCH, Some(reservation))
         {
             Ok((ops, has_more)) => fit_in_response(ops, has_more),
             Err(err) => {
@@ -663,9 +671,12 @@ impl RoomActor {
             return Err(ServerError::BehindCompaction);
         }
 
-        let reservation = self.reserve_frame(client_id).ok_or_else(no_room)?;
+        let mut reservation = self.reserve_response(client_id).ok_or_else(no_room)?;
         let bounded_batch_size = max_batch_size.clamp(1, MAX_SYNC_BATCH);
-        let (ops, has_more) = match self.tiered_log.fetch_deltas(from_seq, bounded_batch_size) {
+        let read =
+            self.tiered_log
+                .fetch_deltas(from_seq, bounded_batch_size, Some(&mut reservation));
+        let (ops, has_more) = match read {
             Ok((ops, has_more)) => fit_in_response(ops, has_more),
             Err(e) => {
                 // The range starts inside the retained log, yet the log cannot serve it (a
@@ -680,6 +691,11 @@ impl RoomActor {
                 return Err(e);
             }
         };
+        // Not even the first operation fits in the budget of response bytes in flight: the
+        // request is answered `Unavailable` without changing anything, and is retried.
+        if ops.is_empty() && has_more {
+            return Err(no_room());
+        }
         // Asking for the operations after from_seq confirms everything up to it: the cursor
         // advances and the client becomes Connected.
         self.observe(client_id, Some(from_seq));

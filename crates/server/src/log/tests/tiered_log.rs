@@ -118,7 +118,7 @@ fn fetch_after_ram_ttl_eviction_bridges_from_active_wal() {
     log.append(make_op(11), None).unwrap();
     log.run_maintenance_sync().unwrap();
 
-    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
 
     assert_contiguous(&ops, 1, 11);
     assert!(!has_more);
@@ -151,10 +151,10 @@ fn fully_pruned_log_rejects_cursor_behind_head() {
     assert_eq!(log.head_seq().get(), 5);
     assert_eq!(log.tail_seq().get(), 6);
     assert!(matches!(
-        log.fetch_deltas(SequenceNumber::new(4), 100),
+        log.fetch_deltas(SequenceNumber::new(4), 100, None),
         Err(ServerError::BehindCompaction)
     ));
-    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(5), 100).unwrap();
+    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(5), 100, None).unwrap();
     assert!(ops.is_empty());
     assert!(!has_more);
 }
@@ -167,7 +167,7 @@ fn append_after_full_prune_keeps_tail_on_new_op() {
     log.append(make_op(6), None).unwrap();
 
     assert_eq!(log.tail_seq().get(), 6);
-    let (ops, _) = log.fetch_deltas(SequenceNumber::new(5), 100).unwrap();
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(5), 100, None).unwrap();
     assert_contiguous(&ops, 6, 6);
 }
 
@@ -190,7 +190,7 @@ fn prune_older_than_keeps_tail_on_active_wal() {
 
     assert_eq!(report.warm_deleted_count, 1);
     assert_eq!(log.tail_seq().get(), 6);
-    let (ops, _) = log.fetch_deltas(SequenceNumber::new(5), 100).unwrap();
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(5), 100, None).unwrap();
     assert_contiguous(&ops, 6, 9);
 }
 
@@ -251,7 +251,7 @@ fn losing_the_newest_segment_never_reuses_its_sequences() {
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
     assert_eq!(log.head_seq().get(), 10);
     assert!(matches!(
-        log.fetch_deltas(SequenceNumber::new(5), 100),
+        log.fetch_deltas(SequenceNumber::new(5), 100, None),
         Err(ServerError::BehindCompaction)
     ));
     log.prune_older_than(SequenceNumber::new(11)).unwrap();
@@ -333,10 +333,10 @@ fn commit_after_a_damaged_last_frame_below_the_sealed_end_survives_a_reopen() {
         let (log, mutations) = TieredLog::open_or_create(dir.path(), policy).unwrap();
         assert_eq!(log.head_seq().get(), 6);
         assert!(mutations.contains(&(mutation_for(6), SequenceNumber::new(6))));
-        let (ops, _) = log.fetch_deltas(SequenceNumber::new(5), 10).unwrap();
+        let (ops, _) = log.fetch_deltas(SequenceNumber::new(5), 10, None).unwrap();
         assert_eq!(seqs(&ops), vec![6], "ram_max_ops {ram_max_ops}");
         assert!(matches!(
-            log.fetch_deltas(SequenceNumber::new(3), 10),
+            log.fetch_deltas(SequenceNumber::new(3), 10, None),
             Err(ServerError::BehindCompaction)
         ));
     }
@@ -493,7 +493,7 @@ fn gap_inside_retained_range_reports_behind_compaction() {
     std::fs::remove_file(segment_file(&segments_dir(dir.path()), 6, 10, "wal")).unwrap();
 
     assert!(matches!(
-        log.fetch_deltas(SequenceNumber::new(0), 100),
+        log.fetch_deltas(SequenceNumber::new(0), 100, None),
         Err(ServerError::BehindCompaction)
     ));
 }
@@ -568,7 +568,7 @@ fn maintenance_fetch_and_pruning_never_list_the_segments_directory() {
     append_range(&mut log, 1, 10);
     log.run_maintenance_sync().unwrap();
     append_range(&mut log, 11, 17);
-    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
     assert_contiguous(&ops, 1, 17);
     log.prune_older_than(SequenceNumber::new(6)).unwrap();
     log.run_maintenance_sync().unwrap();
@@ -606,7 +606,7 @@ fn reopen_with_window(dir: &Path, window: usize) -> usize {
     // RAM holds only active.wal.
     assert_eq!(log.hot_buffer.min_seq().map(|s| s.get()), Some(51));
     assert_eq!(log.hot_buffer.max_seq().map(|s| s.get()), Some(53));
-    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
     assert_contiguous(&ops, 1, 53);
     reads
 }
@@ -682,7 +682,7 @@ fn fetch_reads_active_wal_through_the_handle_holding_its_lock() {
     let segments = segments_dir(dir.path());
     std::fs::rename(segments.join("active.wal"), segments.join("moved.wal")).unwrap();
 
-    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
     assert_contiguous(&ops, 1, 11);
     assert!(!has_more);
 }
@@ -773,7 +773,7 @@ fn maintenance_applies_the_ram_ttl_window_without_appends() {
         .unwrap();
     assert!(log.hot_buffer.is_empty());
     assert_eq!(log.tail_seq().get(), 1);
-    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
     assert_contiguous(&ops, 1, 5);
 }
 
@@ -817,10 +817,10 @@ fn cold_segment_is_pruned_once_its_ttl_has_passed() {
     assert_eq!(report.pruned_count, 1);
     assert_eq!(log.tail_seq().get(), 6);
     assert!(matches!(
-        log.fetch_deltas(SequenceNumber::new(2), 10),
+        log.fetch_deltas(SequenceNumber::new(2), 10, None),
         Err(ServerError::BehindCompaction)
     ));
-    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(5), 10).unwrap();
+    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(5), 10, None).unwrap();
     assert_contiguous(&ops, 6, 8);
     assert!(!has_more);
 }
@@ -912,7 +912,7 @@ fn open_keeps_the_warm_original_when_its_cold_copy_does_not_verify() {
     assert_eq!(mutations.len(), 5);
     assert_eq!(log.run_maintenance_sync().unwrap().warm_compressed_count, 1);
     assert!(cold.exists());
-    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
     assert_contiguous(&ops, 1, 5);
 }
 
@@ -946,7 +946,7 @@ fn open_never_drops_a_verified_cold_copy_for_a_damaged_warm_one() {
         assert!(cold.exists() && !warm.exists(), "frame {damaged_frame}");
         // Verifying the cold copy keeps no more at once than the open keeps in RAM.
         assert!(PEAK.get() <= log.hot_buffer.bytes());
-        let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+        let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
         assert_contiguous(&ops, 1, 7);
     }
 }
@@ -968,7 +968,7 @@ fn failed_cleanup_after_compression_keeps_the_index_on_the_cold_segment() {
     assert!(cold.exists() && !warm.exists());
     let report = log.run_maintenance_sync().unwrap();
     assert_eq!(report.warm_compressed_count, 0);
-    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
     assert_contiguous(&ops, 1, 7);
     assert_eq!(log.disk_bytes(), bytes_on_disk(&segments));
 }
@@ -1072,7 +1072,7 @@ fn failed_compression_does_not_skip_expiry() {
     assert!(result.is_err());
     assert_eq!(log.tail_seq().get(), 6);
     assert!(log.hot_buffer.is_empty());
-    let (ops, _) = log.fetch_deltas(SequenceNumber::new(5), 100).unwrap();
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(5), 100, None).unwrap();
     assert_contiguous(&ops, 6, 12);
 }
 
@@ -1186,10 +1186,12 @@ fn segment_shorter_than_its_name_leaves_ram_empty_and_commits_continue() {
     assert_eq!(log.head_seq().get(), 10);
     assert!(log.hot_buffer.is_empty());
     log.append(make_op(11), None).unwrap();
-    let (ops, _) = log.fetch_deltas(SequenceNumber::new(10), 100).unwrap();
+    let (ops, _) = log
+        .fetch_deltas(SequenceNumber::new(10), 100, None)
+        .unwrap();
     assert_contiguous(&ops, 11, 11);
     assert!(matches!(
-        log.fetch_deltas(SequenceNumber::new(8), 100),
+        log.fetch_deltas(SequenceNumber::new(8), 100, None),
         Err(ServerError::BehindCompaction)
     ));
 
@@ -1220,7 +1222,7 @@ fn missing_segment_at_the_end_of_the_disk_tiers_is_behind_compaction() {
     std::fs::remove_file(segment_file(&segments_dir(dir.path()), 6, 10, "wal.zst")).unwrap();
 
     assert!(matches!(
-        log.fetch_deltas(SequenceNumber::new(5), 100),
+        log.fetch_deltas(SequenceNumber::new(5), 100, None),
         Err(ServerError::BehindCompaction)
     ));
 }
@@ -1245,10 +1247,10 @@ fn corrupt_segment_inside_the_retained_range_is_behind_compaction() {
     corrupt_first_record(&segment_file(&segments_dir(dir.path()), 1, 5, "wal"));
 
     assert!(matches!(
-        log.fetch_deltas(SequenceNumber::new(0), 100),
+        log.fetch_deltas(SequenceNumber::new(0), 100, None),
         Err(ServerError::BehindCompaction)
     ));
-    let (ops, _) = log.fetch_deltas(SequenceNumber::new(5), 100).unwrap();
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(5), 100, None).unwrap();
     assert_contiguous(&ops, 6, 12);
 }
 
@@ -1276,7 +1278,7 @@ fn open_tolerates_a_corrupt_newest_segment() {
     assert_eq!(recovered, vec![1, 2, 3, 4, 5, 11, 12]);
     assert_eq!(log.hot_buffer.min_seq().map(|s| s.get()), Some(11));
     assert!(matches!(
-        log.fetch_deltas(SequenceNumber::new(5), 100),
+        log.fetch_deltas(SequenceNumber::new(5), 100, None),
         Err(ServerError::BehindCompaction)
     ));
     log.append(make_op(13), None).unwrap();
@@ -1356,7 +1358,7 @@ fn hot_buffer_evicts_by_bytes_below_its_operation_limit() {
     assert_eq!(log.hot_buffer.len(), 3);
     assert_eq!(log.hot_buffer.max_seq(), Some(SequenceNumber::new(10)));
     // Everything evicted is still served, from disk.
-    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
     assert_contiguous(&ops, 1, 10);
     assert!(!has_more);
 
@@ -1380,7 +1382,7 @@ fn operation_larger_than_ram_is_served_from_disk() {
     assert!(log.hot_buffer.is_empty());
     log.append(make_op(2), None).unwrap();
     assert_eq!(log.hot_buffer.len(), 1);
-    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
     assert_contiguous(&ops, 1, 2);
 }
 
@@ -1424,7 +1426,7 @@ fn fetch_returns_what_fits_in_a_response_from_ram() {
     let log = large_ops_log(dir.path(), MAX_LOG_BYTES_LIMIT);
     assert_eq!(log.hot_buffer.len(), 6);
 
-    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
 
     assert_contiguous(&ops, 1, 2);
     assert!(has_more);
@@ -1434,7 +1436,10 @@ fn fetch_returns_what_fits_in_a_response_from_ram() {
     let dir = tempdir().unwrap();
     let log = null_rows_log(dir.path(), MAX_LOG_BYTES_LIMIT);
     assert_eq!(log.hot_buffer.len(), 300);
-    assert_within_the_values_of_a_message(log.fetch_deltas(SequenceNumber::new(0), 1000).unwrap());
+    assert_within_the_values_of_a_message(
+        log.fetch_deltas(SequenceNumber::new(0), 1000, None)
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -1443,7 +1448,7 @@ fn fetch_returns_what_fits_in_a_response_from_disk() {
     let log = large_ops_log(dir.path(), MIN_LOG_BYTES_LIMIT);
     assert!(log.hot_buffer.is_empty());
 
-    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(2), 100).unwrap();
+    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(2), 100, None).unwrap();
 
     assert_contiguous(&ops, 3, 4);
     assert!(has_more);
@@ -1451,7 +1456,10 @@ fn fetch_returns_what_fits_in_a_response_from_disk() {
     let dir = tempdir().unwrap();
     let log = null_rows_log(dir.path(), MIN_LOG_BYTES_LIMIT);
     assert!(log.hot_buffer.len() < 300);
-    assert_within_the_values_of_a_message(log.fetch_deltas(SequenceNumber::new(0), 1000).unwrap());
+    assert_within_the_values_of_a_message(
+        log.fetch_deltas(SequenceNumber::new(0), 1000, None)
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -1472,7 +1480,7 @@ fn cold_segment_of_large_operations_roundtrips() {
     log.run_maintenance_sync().unwrap();
 
     assert_eq!(count_in(&log, Tier::Cold), 1);
-    let (read, has_more) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    let (read, has_more) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
     assert_eq!(read, ops);
     assert!(!has_more);
 }
@@ -1492,7 +1500,7 @@ fn maintenance_compresses_a_bounded_number_of_segments_per_pass() {
     let report = log.run_maintenance_sync().unwrap();
     assert_eq!(report.warm_compressed_count, 2);
     assert_eq!(count_in(&log, Tier::Cold), 6);
-    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
     assert_contiguous(&ops, 1, 30);
 }
 
@@ -1619,13 +1627,15 @@ fn reads_skip_damaged_frames_before_the_cursor_in_sealed_and_active_segments() {
     for index in 0..4 {
         damage_payload(&sealed, index);
     }
-    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(4), 100).unwrap();
+    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(4), 100, None).unwrap();
     assert_contiguous(&ops, 5, 12);
     assert!(!has_more);
 
     // Through the handle that holds the lock: Windows refuses any other.
     damage_payload(log.warm_disk.active_file().unwrap(), 0);
-    let (ops, _) = log.fetch_deltas(SequenceNumber::new(11), 100).unwrap();
+    let (ops, _) = log
+        .fetch_deltas(SequenceNumber::new(11), 100, None)
+        .unwrap();
     assert_contiguous(&ops, 12, 12);
 }
 
@@ -1716,7 +1726,9 @@ fn test_tiered_log_write_through_and_crash_recovery() {
     let (log2, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
     assert_eq!(log2.head_seq().get(), 10);
 
-    let (deltas, has_more) = log2.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    let (deltas, has_more) = log2
+        .fetch_deltas(SequenceNumber::new(0), 100, None)
+        .unwrap();
 
     assert_eq!(deltas, (1..=10).map(make_op).collect::<Vec<_>>());
     assert!(!has_more);
@@ -1730,16 +1742,16 @@ fn test_tiered_log_hot_buffer_fast_read() {
 
     append_plain(&mut log, 1, 5);
 
-    let (batch1, has_more1) = log.fetch_deltas(SequenceNumber::new(2), 2).unwrap();
+    let (batch1, has_more1) = log.fetch_deltas(SequenceNumber::new(2), 2, None).unwrap();
     assert_contiguous(&batch1, 3, 4);
     assert!(has_more1);
 
-    let (batch2, has_more2) = log.fetch_deltas(SequenceNumber::new(4), 10).unwrap();
+    let (batch2, has_more2) = log.fetch_deltas(SequenceNumber::new(4), 10, None).unwrap();
     assert_contiguous(&batch2, 5, 5);
     assert!(!has_more2);
 
     // Read from current head (should return empty)
-    let (batch3, has_more3) = log.fetch_deltas(SequenceNumber::new(5), 10).unwrap();
+    let (batch3, has_more3) = log.fetch_deltas(SequenceNumber::new(5), 10, None).unwrap();
     assert!(batch3.is_empty());
     assert!(!has_more3);
 }
@@ -1761,7 +1773,7 @@ fn test_tiered_log_warm_segment_rotation() {
     assert!(segments.join("active.wal").exists());
 
     // Fetch across the rotation boundary (from 0 to 6)
-    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(0), 10).unwrap();
+    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(0), 10, None).unwrap();
 
     assert_contiguous(&deltas, 1, 6);
     assert!(!has_more);
@@ -1801,7 +1813,7 @@ async fn test_tiered_log_cold_compression_and_read() {
     assert!(segment_file(&segments, 1, 5, "wal.zst").exists());
 
     // Fetch deltas directly from Cold Disk (.wal.zst)
-    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(0), 10).unwrap();
+    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(0), 10, None).unwrap();
 
     assert_contiguous(&deltas, 1, 5);
     assert!(!has_more);
@@ -1837,13 +1849,13 @@ async fn test_tiered_log_multi_tier_continuous_fetch() {
     assert_eq!(log.head_seq().get(), 15);
 
     // Fetch entire range 0..15 traversing Cold -> Warm -> Hot in a single contiguous batch
-    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(0), 20).unwrap();
+    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(0), 20, None).unwrap();
 
     assert_contiguous(&deltas, 1, 15);
     assert!(!has_more);
 
     // Paged fetch crossing from Cold (ends at 5) into Warm (starts at 6)
-    let (paged, paged_has_more) = log.fetch_deltas(SequenceNumber::new(3), 5).unwrap();
+    let (paged, paged_has_more) = log.fetch_deltas(SequenceNumber::new(3), 5, None).unwrap();
 
     assert_contiguous(&paged, 4, 8);
     assert!(paged_has_more);
@@ -1893,14 +1905,14 @@ fn test_tiered_log_proactive_pruning_by_cursor() {
     assert!(seg2_path.exists());
 
     // Cursor 2 is now expired -> BehindCompaction
-    let result = log.fetch_deltas(SequenceNumber::new(2), 10);
+    let result = log.fetch_deltas(SequenceNumber::new(2), 10, None);
     assert!(
         matches!(result, Err(ServerError::BehindCompaction)),
         "{result:?}"
     );
 
     // Cursor 5 can fetch 6..=10 smoothly
-    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(5), 10).unwrap();
+    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(5), 10, None).unwrap();
     assert_contiguous(&deltas, 6, 10);
     assert!(!has_more);
 }
@@ -1925,13 +1937,16 @@ fn test_tiered_log_hot_buffer_sliding_window_no_zero_eviction() {
     // Cursor 1 immediately precedes the buffer start (1 + 1 == 2), so 2..=6 come straight
     // from RAM, whether the limit is exactly the five left or larger.
     for limit in [5, 10] {
-        let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(1), limit).unwrap();
+        let (deltas, has_more) = log
+            .fetch_deltas(SequenceNumber::new(1), limit, None)
+            .unwrap();
         assert_contiguous(&deltas, 2, 6);
         assert!(!has_more, "limit {limit}");
     }
 
     // Fetching from cursor 4 returns 5 and 6
-    let (recent_deltas, recent_has_more) = log.fetch_deltas(SequenceNumber::new(4), 10).unwrap();
+    let (recent_deltas, recent_has_more) =
+        log.fetch_deltas(SequenceNumber::new(4), 10, None).unwrap();
     assert_contiguous(&recent_deltas, 5, 6);
     assert!(!recent_has_more);
 }
@@ -1978,7 +1993,7 @@ async fn test_tiered_log_disk_quota_saturation_pruning() {
     );
 
     // Any fetch before the new tail_seq must return BehindCompaction
-    let result = log.fetch_deltas(SequenceNumber::new(0), 10);
+    let result = log.fetch_deltas(SequenceNumber::new(0), 10, None);
     assert!(
         matches!(result, Err(ServerError::BehindCompaction)),
         "Expected BehindCompaction on quota pruned deltas, got: {result:?}"
@@ -1986,7 +2001,7 @@ async fn test_tiered_log_disk_quota_saturation_pruning() {
 
     // Fetch from the new tail cursor succeeds
     let cursor = SequenceNumber::new(log.tail_seq().get() - 1);
-    let (deltas, _) = log.fetch_deltas(cursor, 10).unwrap();
+    let (deltas, _) = log.fetch_deltas(cursor, 10, None).unwrap();
     assert!(!deltas.is_empty());
     assert_eq!(deltas[0].seq, log.tail_seq());
 }
@@ -2012,7 +2027,7 @@ fn test_tiered_log_eviction_gap_bridged_from_sealed_segments() {
     // Request range crossing the eviction boundary: from cursor 7 with limit 6 (expecting 8..=13).
     // Operations 8..=10 were evicted from RAM and must be read from the sealed segments.
     // Operations 11..=13 are present in RAM HotBuffer.
-    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(7), 6).unwrap();
+    let (deltas, has_more) = log.fetch_deltas(SequenceNumber::new(7), 6, None).unwrap();
 
     assert_contiguous(&deltas, 8, 13);
     assert!(has_more);
@@ -2044,7 +2059,9 @@ fn test_unified_wal_append_and_recovery_roundtrip() {
         .collect();
     assert_eq!(recovered_mutations2, expected);
 
-    let (deltas, has_more) = log2.fetch_deltas(SequenceNumber::new(0), 100).unwrap();
+    let (deltas, has_more) = log2
+        .fetch_deltas(SequenceNumber::new(0), 100, None)
+        .unwrap();
     assert_contiguous(&deltas, 1, 10);
     assert!(!has_more);
 }
@@ -2186,7 +2203,7 @@ fn read_chain(
     let mut at = cursor;
     loop {
         let batch = batch_size();
-        let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(at), batch)?;
+        let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(at), batch, None)?;
         assert!(ops.len() <= batch as usize, "page over its size from {at}");
         if at < log.head_seq().get() {
             assert!(!ops.is_empty(), "empty page below the head from {at}");
@@ -2244,7 +2261,7 @@ fn check_reads(log: &TieredLog, accepted: &[SequencedOperation], rng: &mut TestR
         let c = rng.below(tail - 1);
         assert!(
             matches!(
-                log.fetch_deltas(SequenceNumber::new(c), 5),
+                log.fetch_deltas(SequenceNumber::new(c), 5, None),
                 Err(ServerError::BehindCompaction)
             ),
             "{step}: cursor {c} below tail {tail}"
@@ -2476,7 +2493,7 @@ fn simulate_pages_while_the_log_changes(seeds: std::ops::Range<u64>, chains: usi
             loop {
                 let batch = 1 + rng.below(5) as u32;
                 let (tail, head) = (log.tail_seq().get(), log.head_seq().get());
-                match log.fetch_deltas(SequenceNumber::new(at), batch) {
+                match log.fetch_deltas(SequenceNumber::new(at), batch, None) {
                     Ok((ops, has_more)) => {
                         let n = ops.len() as u64;
                         assert!(
@@ -2746,14 +2763,14 @@ fn prune_failing_mid_prefix_stays_contiguous_and_reopening_finishes_it() {
     let tail = log.tail_seq().get();
     assert_eq!(tail, 4, "only the first segment went");
     let (ops, _) = log
-        .fetch_deltas(SequenceNumber::new(tail - 1), 100)
+        .fetch_deltas(SequenceNumber::new(tail - 1), 100, None)
         .unwrap();
     assert_contiguous(&ops, tail, 13);
     drop(log);
 
     let (log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
     assert_eq!(log.tail_seq().get(), 10);
-    let (ops, _) = log.fetch_deltas(SequenceNumber::new(9), 100).unwrap();
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(9), 100, None).unwrap();
     assert_contiguous(&ops, 10, 13);
 }
 
@@ -2826,11 +2843,89 @@ fn fetch_cost_does_not_grow_with_the_number_of_segments() {
         let cursor = SequenceNumber::new(segments * 2 - 1);
         let started = std::time::Instant::now();
         for _ in 0..1_000 {
-            log.fetch_deltas(cursor, 10).unwrap();
+            log.fetch_deltas(cursor, 10, None).unwrap();
         }
         started.elapsed()
     };
     let (few, many) = (cost(100), cost(50_000));
     println!("1,000 reads near the head: {few:?} with 100 segments, {many:?} with 50,000");
     assert!(many < 3 * few, "{many:?} against {few:?}");
+}
+
+/// What `make_op(first..=last)` take in a response.
+fn in_response(first: u64, last: u64) -> u64 {
+    (first..=last)
+        .map(|seq| crate::log::budget::OpSize::of(&make_op(seq)).in_response())
+        .sum()
+}
+
+/// A reservation of nothing in a budget of response bytes in flight of `total` bytes.
+fn reservation_in(
+    total: u64,
+) -> (
+    std::sync::Arc<crate::response_budget::InflightBudget>,
+    crate::response_budget::Reservation,
+) {
+    use zemdb_core::id::{ClientId, RoomId};
+    let budget = std::sync::Arc::new(crate::response_budget::InflightBudget::new(total, total));
+    let holder = (
+        RoomId::new("room").unwrap(),
+        crate::relay::Uploader::Client(ClientId::new("c").unwrap()),
+    );
+    let reservation = budget.reserve(holder, 0).unwrap();
+    (budget, reservation)
+}
+
+/// A read for a response ends at the first operation its reservation has no room for, in the
+/// disk tiers and in RAM alike, with `has_more`; one with no room for even the first returns an
+/// empty batch with `has_more`, not a gap.
+#[test]
+fn a_read_ends_where_the_reservation_of_its_response_runs_out() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 5,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    append_plain(&mut log, 1, 12);
+    assert_eq!(log.hot_buffer.min_seq(), Some(SequenceNumber::new(8)));
+
+    // From the sealed segments, with room for three operations and most of a fourth.
+    let room = in_response(1, 4) - 1;
+    let (budget, mut reservation) = reservation_in(room);
+    let (ops, has_more) = log
+        .fetch_deltas(SequenceNumber::new(0), 100, Some(&mut reservation))
+        .unwrap();
+    assert_contiguous(&ops, 1, 3);
+    assert!(has_more);
+    assert_eq!(budget.reserved().0, in_response(1, 3));
+
+    // From RAM, the same.
+    let room = in_response(9, 12) - 1;
+    let (budget, mut reservation) = reservation_in(room);
+    let (ops, has_more) = log
+        .fetch_deltas(SequenceNumber::new(8), 100, Some(&mut reservation))
+        .unwrap();
+    assert_contiguous(&ops, 9, 11);
+    assert!(has_more);
+    assert_eq!(budget.reserved().0, in_response(9, 11));
+
+    // No room for the first operation, from disk and from RAM.
+    for (from, first) in [(0, 1), (8, 9)] {
+        let (budget, mut reservation) = reservation_in(in_response(first, first) - 1);
+        let read = log.fetch_deltas(SequenceNumber::new(from), 100, Some(&mut reservation));
+        let (ops, has_more) = read.unwrap();
+        assert!(ops.is_empty() && has_more, "from {from}");
+        assert_eq!(budget.reserved().0, 0);
+    }
+
+    // With room for all, the read is the same as without a reservation.
+    let (_budget, mut reservation) = reservation_in(u64::from(u32::MAX));
+    let reserved = log
+        .fetch_deltas(SequenceNumber::new(0), 100, Some(&mut reservation))
+        .unwrap();
+    assert_eq!(
+        reserved,
+        log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap()
+    );
 }

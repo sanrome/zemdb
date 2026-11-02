@@ -11,6 +11,7 @@ use crate::log::segment_index::{
 };
 use crate::log::segment_reader::RecoveredLogData;
 use crate::log::warm_disk::{read_segment_file, WarmDiskLog};
+use crate::response_budget::Reservation;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -303,10 +304,16 @@ impl TieredLog {
     /// ([`MAX_RESPONSE_OPS_BYTES`], as [`op_bytes`](crate::log::budget::op_bytes) charges them),
     /// and at least one: operations beyond the budget are neither decoded into the batch nor
     /// cloned.
-    pub fn fetch_deltas(
+    ///
+    /// With a `reservation` (that of the response the operations go to), each operation grows
+    /// it by what it takes in the response as it is read, and the batch ends at the first one
+    /// the reservation has no room for; if not even the first fits, the batch is empty and
+    /// flagged `has_more`.
+    pub(crate) fn fetch_deltas(
         &self,
         from_seq: SequenceNumber,
         max_batch_size: u32,
+        reservation: Option<&mut Reservation>,
     ) -> Result<(Vec<SequencedOperation>, bool), ServerError> {
         if self.is_behind_retention(from_seq) {
             return Err(ServerError::BehindCompaction);
@@ -316,12 +323,15 @@ impl TieredLog {
             return Ok((Vec::new(), false));
         }
 
-        let budget = ReadBudget::new(max_batch_size as usize, MAX_RESPONSE_OPS_BYTES);
+        let mut budget = ReadBudget::new(max_batch_size as usize, MAX_RESPONSE_OPS_BYTES);
+        if let Some(reservation) = reservation {
+            budget = budget.reserving(reservation);
+        }
 
         // A cursor within the RAM window is served from memory, without touching disk.
         if let Some(min_ram) = self.hot_buffer.min_seq() {
             if from_seq.get() + 1 >= min_ram.get() {
-                let ops = self.hot_buffer.get_range(from_seq, &mut budget.clone());
+                let ops = self.hot_buffer.get_range(from_seq, &mut budget);
                 if let Some(last) = ops.last() {
                     let has_more = last.seq.get() < self.head_seq.get();
                     return Ok((ops, has_more));
@@ -340,10 +350,16 @@ impl TieredLog {
             batch.extend("hot buffer", ram_ops)?;
         }
 
-        // The range is retained, yet no tier holds the operation after the cursor (a missing
-        // segment at the end of the disk tiers, or names that claim more than the files hold).
-        // An empty answer would tell the client it is up to date, so this is a gap.
         if batch.ops.is_empty() {
+            // The response has no room for the first operation, in RAM or on disk (after a
+            // refusal in RAM, the disk tiers read nothing): the client asks again.
+            if batch.budget.is_out_of_room() {
+                return Ok((Vec::new(), true));
+            }
+            // The range is retained, yet no tier holds the operation after the cursor (a
+            // missing segment at the end of the disk tiers, or names that claim more than the
+            // files hold). An empty answer would tell the client it is up to date, so this is
+            // a gap.
             tracing::error!(
                 cursor = from_seq.get(),
                 head_seq = self.head_seq.get(),
@@ -680,16 +696,16 @@ impl TieredLog {
 }
 
 /// A contiguous run of operations being collected after a cursor.
-struct DeltaBatch {
+struct DeltaBatch<'r> {
     ops: Vec<SequencedOperation>,
     /// Sequence of the last operation collected, or the starting cursor.
     cursor: SequenceNumber,
     /// What the tiers may still return; they take each operation from it as they read it.
-    budget: ReadBudget,
+    budget: ReadBudget<'r>,
 }
 
-impl DeltaBatch {
-    fn new(cursor: SequenceNumber, budget: ReadBudget) -> Self {
+impl<'r> DeltaBatch<'r> {
+    fn new(cursor: SequenceNumber, budget: ReadBudget<'r>) -> Self {
         Self {
             ops: Vec::new(),
             cursor,

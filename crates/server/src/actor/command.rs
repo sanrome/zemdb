@@ -32,8 +32,9 @@ pub struct CommitResponse {
     pub snapshot_wanted: bool,
     pub schema_version: u64,
     pub schema_id: SchemaId,
-    /// The frame of the budget of response bytes in flight that the catch-up was read within;
-    /// without one, the catch-up is empty and flagged `has_more`.
+    /// The part of the budget of response bytes in flight that the catch-up was read within,
+    /// grown by each operation read; without one, the catch-up is empty and flagged
+    /// `has_more`.
     pub(crate) reservation: Option<Reservation>,
 }
 
@@ -47,7 +48,8 @@ pub struct SyncBatchResponse {
     pub snapshot_wanted: bool,
     pub schema_version: u64,
     pub schema_id: SchemaId,
-    /// The frame of the budget of response bytes in flight that the batch was read within.
+    /// The part of the budget of response bytes in flight that the batch was read within,
+    /// grown by each operation read.
     pub(crate) reservation: Reservation,
 }
 

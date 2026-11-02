@@ -20,7 +20,7 @@ use zemdb_core::protocol::wal_frame::{
 
 use crate::error::ServerError;
 use crate::fail_point;
-use crate::log::budget::{op_bytes, ReadBudget};
+use crate::log::budget::{OpSize, ReadBudget};
 use crate::log::io_probe::{self, IoEvent};
 
 /// Operations and mutation assignment pairs recovered from disk segments.
@@ -196,7 +196,7 @@ pub(crate) fn read_frames<S: FrameSource>(
             if op.seq <= from_seq {
                 continue;
             }
-            if !budget.admit(op_bytes(&op)) {
+            if !budget.admit(OpSize::of(&op)) {
                 break 'frames;
             }
             if let Some(mutation_id) = mutation_id {
