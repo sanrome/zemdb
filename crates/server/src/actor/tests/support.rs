@@ -3,6 +3,7 @@
 use crate::actor::manager::RoomManager;
 use crate::actor::room::ActorTimings;
 use crate::config::ServerConfig;
+use crate::io_pool::IoThreads;
 use crate::relay::SnapshotRelay;
 use crate::schema_registry::SchemaRegistry;
 use std::future::Future;
@@ -74,7 +75,8 @@ pub(super) fn test_manager(
         )
         .unwrap(),
     );
-    let mut manager = RoomManager::new(Arc::new(config), registry, Arc::clone(&relay));
+    let io = IoThreads::new(config.io_threads);
+    let mut manager = RoomManager::new(Arc::new(config), registry, Arc::clone(&relay), io);
     manager.set_timings(TEST_TIMINGS);
     (manager, relay)
 }

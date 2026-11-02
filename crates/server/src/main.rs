@@ -4,8 +4,8 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 use zemdb_server::{
-    serve_until_shutdown, AppState, RoomManager, SchemaRegistry, ServerConfig, SnapshotRelay,
-    SHUTDOWN_GRACE_PERIOD,
+    serve_until_shutdown, AppState, IoThreads, RoomManager, SchemaRegistry, ServerConfig,
+    SnapshotRelay, SHUTDOWN_GRACE_PERIOD,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -16,8 +16,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _data_dir_lock = config.lock_data_dir()?;
     let runtime = tokio::runtime::Runtime::new()?;
     let served = runtime.block_on(serve(config));
-    // Dropping the runtime waits for the blocking work still in flight, so the lock is only
-    // released once nothing writes to data_dir.
+    // Dropping the runtime waits for the blocking work still in flight, every file operation
+    // included, so the lock is only released once nothing writes to data_dir.
     drop(runtime);
     served
 }
@@ -35,6 +35,7 @@ async fn serve(config: Arc<ServerConfig>) -> Result<(), Box<dyn std::error::Erro
         Arc::clone(&config),
         Arc::clone(&schema_registry),
         Arc::clone(&snapshot_relay),
+        IoThreads::new(config.io_threads),
     ));
 
     let state = AppState::new(

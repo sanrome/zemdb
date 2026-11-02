@@ -103,7 +103,7 @@ fn tail_includes_active_wal_after_ram_ttl_eviction() {
     log.append(make_op(11), None).unwrap();
     assert_eq!(log.hot_buffer.min_seq().map(|s| s.get()), Some(11));
 
-    log.run_maintenance_sync().unwrap();
+    log.run_maintenance().unwrap();
 
     assert_eq!(log.tail_seq().get(), 1);
 }
@@ -116,7 +116,7 @@ fn fetch_after_ram_ttl_eviction_bridges_from_active_wal() {
     append_plain(&mut log, 1, 10);
     sleep(Duration::from_millis(60));
     log.append(make_op(11), None).unwrap();
-    log.run_maintenance_sync().unwrap();
+    log.run_maintenance().unwrap();
 
     let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
 
@@ -139,7 +139,7 @@ fn full_prune_policy() -> RoomLifecyclePolicy {
 fn fully_pruned_log(dir: &Path) -> TieredLog {
     let (mut log, _) = TieredLog::open_or_create(dir, full_prune_policy()).unwrap();
     append_plain(&mut log, 1, 5);
-    log.run_maintenance_sync().unwrap();
+    log.run_maintenance().unwrap();
     log
 }
 
@@ -546,7 +546,7 @@ fn open_lists_the_segments_directory_once() {
         let (mut log, _) =
             TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
         append_range(&mut log, 1, 10);
-        log.run_maintenance_sync().unwrap();
+        log.run_maintenance().unwrap();
         append_range(&mut log, 11, 17);
     }
     let segments = segments_dir(dir.path());
@@ -566,12 +566,12 @@ fn maintenance_fetch_and_pruning_never_list_the_segments_directory() {
 
     // Cold segments 1..=5 and 6..=10, sealed warm segment 11..=15, ops 16..=17 in active.wal.
     append_range(&mut log, 1, 10);
-    log.run_maintenance_sync().unwrap();
+    log.run_maintenance().unwrap();
     append_range(&mut log, 11, 17);
     let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
     assert_contiguous(&ops, 1, 17);
     log.prune_older_than(SequenceNumber::new(6)).unwrap();
-    log.run_maintenance_sync().unwrap();
+    log.run_maintenance().unwrap();
 
     assert_eq!(io_probe::count(IoEvent::Listing, &segments), after_open);
     assert_eq!(log.tail_seq().get(), 6);
@@ -581,7 +581,7 @@ fn maintenance_fetch_and_pruning_never_list_the_segments_directory() {
 fn fifty_three_compressed_ops(dir: &Path) {
     let (mut log, _) = TieredLog::open_or_create(dir, compress_at_once_policy()).unwrap();
     append_range(&mut log, 1, 50);
-    log.run_maintenance_sync().unwrap();
+    log.run_maintenance().unwrap();
     append_range(&mut log, 51, 53);
 }
 
@@ -741,7 +741,7 @@ async fn the_ram_window_expires_on_the_tokio_clock() {
 
     // Maintenance and appends keep what has not been in RAM for the whole window...
     tokio::time::advance(just_before).await;
-    log.run_maintenance().await.unwrap();
+    log.run_maintenance().unwrap();
     append_range(&mut log, 6, 6);
     assert_eq!(log.hot_buffer.len(), 6);
 
@@ -750,7 +750,7 @@ async fn the_ram_window_expires_on_the_tokio_clock() {
     append_range(&mut log, 7, 7);
     assert_eq!(log.hot_buffer.min_seq(), Some(SequenceNumber::new(6)));
     tokio::time::advance(just_before).await;
-    log.run_maintenance().await.unwrap();
+    log.run_maintenance().unwrap();
     assert_eq!(log.hot_buffer.min_seq(), Some(SequenceNumber::new(7)));
     assert_eq!(log.hot_buffer.len(), 1);
 }
@@ -765,11 +765,11 @@ fn maintenance_applies_the_ram_ttl_window_without_appends() {
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
     append_range(&mut log, 1, 5);
 
-    log.run_maintenance_sync_at(MaintenanceClock::after(Duration::from_secs(30)))
+    log.run_maintenance_at(MaintenanceClock::after(Duration::from_secs(30)))
         .unwrap();
     assert_eq!(log.hot_buffer.len(), 5);
 
-    log.run_maintenance_sync_at(MaintenanceClock::after(Duration::from_secs(61)))
+    log.run_maintenance_at(MaintenanceClock::after(Duration::from_secs(61)))
         .unwrap();
     assert!(log.hot_buffer.is_empty());
     assert_eq!(log.tail_seq().get(), 1);
@@ -791,28 +791,28 @@ fn cold_segment_is_pruned_once_its_ttl_has_passed() {
     append_range(&mut log, 1, 8);
 
     let report = log
-        .run_maintenance_sync_at(MaintenanceClock::after(Duration::from_secs(59)))
+        .run_maintenance_at(MaintenanceClock::after(Duration::from_secs(59)))
         .unwrap();
     assert_eq!(report.warm_compressed_count, 0);
 
     // Compressed one minute after sealing; the cold TTL counts from the compression.
     let compressed_at = Duration::from_secs(61);
     let report = log
-        .run_maintenance_sync_at(MaintenanceClock::after(compressed_at))
+        .run_maintenance_at(MaintenanceClock::after(compressed_at))
         .unwrap();
     assert_eq!(report.warm_compressed_count, 1);
     assert_eq!(report.pruned_count, 0);
 
     let just_before = compressed_at + Duration::from_secs(3599);
     let report = log
-        .run_maintenance_sync_at(MaintenanceClock::after(just_before))
+        .run_maintenance_at(MaintenanceClock::after(just_before))
         .unwrap();
     assert_eq!(report.pruned_count, 0);
     assert_eq!(log.tail_seq().get(), 1);
 
     let past_ttl = compressed_at + Duration::from_secs(3601);
     let report = log
-        .run_maintenance_sync_at(MaintenanceClock::after(past_ttl))
+        .run_maintenance_at(MaintenanceClock::after(past_ttl))
         .unwrap();
     assert_eq!(report.pruned_count, 1);
     assert_eq!(log.tail_seq().get(), 6);
@@ -833,7 +833,7 @@ fn disk_bytes_track_the_files_of_the_log() {
 
     append_range(&mut log, 1, 12);
     assert_eq!(log.disk_bytes(), bytes_on_disk(&segments));
-    log.run_maintenance_sync().unwrap();
+    log.run_maintenance().unwrap();
     assert_eq!(log.disk_bytes(), bytes_on_disk(&segments));
     log.prune_older_than(SequenceNumber::new(6)).unwrap();
     assert_eq!(log.disk_bytes(), bytes_on_disk(&segments));
@@ -848,13 +848,13 @@ fn quota_prunes_the_oldest_cold_segments_until_the_log_fits() {
     let dir = tempdir().unwrap();
     let (mut log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
     append_range(&mut log, 1, 15);
-    log.run_maintenance_sync().unwrap();
+    log.run_maintenance().unwrap();
     let total = log.disk_bytes();
     let oldest_cold = log.segments.iter().next().unwrap().disk_bytes();
 
     // One byte under the current size: dropping the oldest cold segment is enough.
     log.policy.max_room_disk_bytes = total - 1;
-    let report = log.run_maintenance_sync().unwrap();
+    let report = log.run_maintenance().unwrap();
 
     assert_eq!(report.pruned_count, 1);
     assert_eq!(log.tail_seq().get(), 6);
@@ -877,7 +877,7 @@ fn quota_bounds_the_disk_of_a_sustained_writer() {
         log.policy.max_room_disk_bytes = quota;
         for round in 0..5 {
             append_range(&mut log, round * 30 + 6, round * 30 + 35);
-            let report = log.run_maintenance_sync().unwrap();
+            let report = log.run_maintenance().unwrap();
             assert_eq!(report.warm_compressed_count, MAX_COMPRESSIONS_PER_PASS);
             let on_disk = bytes_on_disk(&segments_dir(dir.path()));
             assert!(
@@ -910,7 +910,7 @@ fn open_keeps_the_warm_original_when_its_cold_copy_does_not_verify() {
     assert!(warm.exists());
     assert!(!cold.exists());
     assert_eq!(mutations.len(), 5);
-    assert_eq!(log.run_maintenance_sync().unwrap().warm_compressed_count, 1);
+    assert_eq!(log.run_maintenance().unwrap().warm_compressed_count, 1);
     assert!(cold.exists());
     let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
     assert_contiguous(&ops, 1, 5);
@@ -931,7 +931,7 @@ fn open_never_drops_a_verified_cold_copy_for_a_damaged_warm_one() {
         // The removal after the compression, and its retry in the same pass.
         crate::fail_point::arm("remove_file", &warm);
         crate::fail_point::arm("remove_file", &warm);
-        log.run_maintenance_sync().unwrap();
+        log.run_maintenance().unwrap();
         drop(log);
         let warm_file = File::options().read(true).write(true).open(&warm).unwrap();
         damage_payload(&warm_file, damaged_frame);
@@ -963,10 +963,10 @@ fn failed_cleanup_after_compression_keeps_the_index_on_the_cold_segment() {
     // The cold segment is durably in place and the warm one deleted, but the directory sync
     // that makes the deletion durable fails.
     crate::fail_point::arm("compress_after_warm_removed", &warm);
-    let _ = log.run_maintenance_sync();
+    let _ = log.run_maintenance();
 
     assert!(cold.exists() && !warm.exists());
-    let report = log.run_maintenance_sync().unwrap();
+    let report = log.run_maintenance().unwrap();
     assert_eq!(report.warm_compressed_count, 0);
     let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
     assert_contiguous(&ops, 1, 7);
@@ -989,9 +989,9 @@ fn warm_copy_that_could_not_be_removed_is_removed_later() {
     // Once after the compression and once in the retry of the same pass.
     crate::fail_point::arm("remove_file", &warm);
     crate::fail_point::arm("remove_file", &warm);
-    log.run_maintenance_sync().unwrap();
+    log.run_maintenance().unwrap();
     assert!(warm.exists());
-    log.run_maintenance_sync().unwrap();
+    log.run_maintenance().unwrap();
     assert!(!warm.exists());
 
     // If it is still there when its cold copy is pruned, reopening removes it instead of
@@ -1003,8 +1003,8 @@ fn warm_copy_that_could_not_be_removed_is_removed_later() {
     for _ in 0..3 {
         crate::fail_point::arm("remove_file", &warm);
     }
-    log.run_maintenance_sync().unwrap();
-    log.run_maintenance_sync_at(expired).unwrap();
+    log.run_maintenance().unwrap();
+    log.run_maintenance_at(expired).unwrap();
     assert_eq!(log.tail_seq().get(), 6);
     assert!(warm.exists());
     drop(log);
@@ -1023,30 +1023,14 @@ fn quota_prunes_a_prefix_even_with_a_warm_segment_that_cannot_be_compressed() {
 
     // Segment 1..=5 cannot be compressed, so it stays warm in front of the cold 6..=10.
     std::fs::write(segment_file(&segments, 1, 5, "wal"), b"damaged").unwrap();
-    let _ = log.run_maintenance_sync();
+    let _ = log.run_maintenance();
     log.policy.max_room_disk_bytes = log.disk_bytes() - 1;
-    let _ = log.run_maintenance_sync();
+    let _ = log.run_maintenance();
 
     // Pruning the warm segment is enough; the cold one behind it stays.
     assert!(!segment_file(&segments, 1, 5, "wal").exists());
     assert!(segment_file(&segments, 6, 10, "wal.zst").exists());
     assert_eq!(log.tail_seq().get(), 6);
-}
-
-#[test]
-fn compression_runs_off_the_runtime_thread() {
-    let dir = tempdir().unwrap();
-    let (mut log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
-    append_range(&mut log, 1, 7);
-    let warm = segment_file(&segments_dir(dir.path()), 1, 5, "wal");
-    let (tx, rx) = std::sync::mpsc::channel();
-    crate::fail_point::arm_hook("compress_warm_segment", &warm, move || {
-        tx.send(std::thread::current().id()).unwrap();
-    });
-
-    // A current-thread runtime on this thread: compressing inline would run here.
-    assert_eq!(log.run_maintenance_sync().unwrap().warm_compressed_count, 1);
-    assert_ne!(rx.try_recv().unwrap(), std::thread::current().id());
 }
 
 #[test]
@@ -1061,13 +1045,13 @@ fn failed_compression_does_not_skip_expiry() {
     };
     let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
     append_range(&mut log, 1, 5);
-    log.run_maintenance_sync().unwrap();
+    log.run_maintenance().unwrap();
     append_range(&mut log, 6, 12);
 
     // Compressing segment 6..=10 fails, while segment 1..=5 is past its cold TTL and every
     // operation in RAM is past the RAM TTL.
     crate::fail_point::arm("sync_dir", &segments_dir(dir.path()));
-    let result = log.run_maintenance_sync_at(MaintenanceClock::after(Duration::from_secs(7200)));
+    let result = log.run_maintenance_at(MaintenanceClock::after(Duration::from_secs(7200)));
 
     assert!(result.is_err());
     assert_eq!(log.tail_seq().get(), 6);
@@ -1202,7 +1186,7 @@ fn segment_shorter_than_its_name_leaves_ram_empty_and_commits_continue() {
     shorten_warm_segment(dir.path(), 1, u64::MAX / 2, 2);
     let (mut log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
     log.append(large_op(u64::MAX / 2 + 1, 1), None).unwrap();
-    let maintenance = log.run_maintenance_sync();
+    let maintenance = log.run_maintenance();
     assert!(
         matches!(maintenance, Err(ServerError::WalCorruption(_))),
         "{maintenance:?}"
@@ -1216,7 +1200,7 @@ fn missing_segment_at_the_end_of_the_disk_tiers_is_behind_compaction() {
     let (mut log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
     append_range(&mut log, 1, 10);
     // Nothing in RAM or active.wal covers the range any more.
-    log.run_maintenance_sync_at(MaintenanceClock::after(Duration::from_secs(600)))
+    log.run_maintenance_at(MaintenanceClock::after(Duration::from_secs(600)))
         .unwrap();
     assert!(log.hot_buffer.is_empty());
     std::fs::remove_file(segment_file(&segments_dir(dir.path()), 6, 10, "wal.zst")).unwrap();
@@ -1477,7 +1461,7 @@ fn cold_segment_of_large_operations_roundtrips() {
         log.append(op.clone(), None).unwrap();
     }
 
-    log.run_maintenance_sync().unwrap();
+    log.run_maintenance().unwrap();
 
     assert_eq!(count_in(&log, Tier::Cold), 1);
     let (read, has_more) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
@@ -1493,11 +1477,11 @@ fn maintenance_compresses_a_bounded_number_of_segments_per_pass() {
     append_range(&mut log, 1, 30);
     assert_eq!(count_in(&log, Tier::Warm), 6);
 
-    let report = log.run_maintenance_sync().unwrap();
+    let report = log.run_maintenance().unwrap();
     assert_eq!(report.warm_compressed_count, MAX_COMPRESSIONS_PER_PASS);
     assert_eq!(count_in(&log, Tier::Warm), 2);
 
-    let report = log.run_maintenance_sync().unwrap();
+    let report = log.run_maintenance().unwrap();
     assert_eq!(report.warm_compressed_count, 2);
     assert_eq!(count_in(&log, Tier::Cold), 6);
     let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
@@ -1510,7 +1494,7 @@ async fn async_maintenance_compresses_a_bounded_number_of_segments_per_pass() {
     let (mut log, _) = TieredLog::open_or_create(dir.path(), compress_at_once_policy()).unwrap();
     append_range(&mut log, 1, 30);
 
-    let report = log.run_maintenance().await.unwrap();
+    let report = log.run_maintenance().unwrap();
 
     assert_eq!(report.warm_compressed_count, MAX_COMPRESSIONS_PER_PASS);
     assert_eq!(count_in(&log, Tier::Warm), 2);
@@ -1657,9 +1641,9 @@ fn segments_that_keep_failing_do_not_hold_back_newer_ones() {
 
     // The first pass tries the four oldest, which fail; the next one tries the newer ones
     // first.
-    assert!(log.run_maintenance_sync().is_err());
+    assert!(log.run_maintenance().is_err());
     assert_eq!(count_in(&log, Tier::Cold), 0);
-    assert!(log.run_maintenance_sync().is_err());
+    assert!(log.run_maintenance().is_err());
     assert_eq!(count_in(&log, Tier::Cold), 2);
 }
 
@@ -1673,11 +1657,11 @@ fn a_pass_tries_a_bounded_number_of_segments_even_when_they_fail() {
         std::fs::remove_file(path).unwrap();
     }
 
-    assert!(log.run_maintenance_sync().is_err());
+    assert!(log.run_maintenance().is_err());
     assert_eq!(log.failed_compressions.len(), MAX_COMPRESSIONS_PER_PASS);
 
     // The two not tried yet go first, then two of those that failed.
-    assert!(log.run_maintenance_sync().is_err());
+    assert!(log.run_maintenance().is_err());
     assert_eq!(log.failed_compressions.len(), 6);
 }
 
@@ -1693,14 +1677,14 @@ fn retries_rotate_through_every_failed_segment() {
     }
     // Every segment fails at least once.
     for _ in 0..3 {
-        assert!(log.run_maintenance_sync().is_err());
+        assert!(log.run_maintenance().is_err());
     }
     assert_eq!(log.failed_compressions.len(), 6);
 
     // The newest segment recovers; the four oldest keep failing.
     std::fs::write(&paths[5], newest).unwrap();
     for _ in 0..2 {
-        let _ = log.run_maintenance_sync();
+        let _ = log.run_maintenance();
     }
 
     assert_eq!(count_in(&log, Tier::Cold), 1);
@@ -1805,7 +1789,7 @@ async fn test_tiered_log_cold_compression_and_read() {
     sleep(Duration::from_millis(20));
 
     // The async pass compresses the segment off the async worker.
-    let report = log.run_maintenance().await.unwrap();
+    let report = log.run_maintenance().unwrap();
     assert_eq!(report.warm_compressed_count, 1);
 
     // Sealed .wal should be removed, and .wal.zst created
@@ -1837,7 +1821,7 @@ async fn test_tiered_log_multi_tier_continuous_fetch() {
     append_plain(&mut log, 1, 5);
     log.force_rotate_warm().unwrap();
     sleep(Duration::from_millis(20));
-    log.run_maintenance().await.unwrap();
+    log.run_maintenance().unwrap();
 
     // Operations 6..=10 are sealed to warm, without compressing them.
     append_plain(&mut log, 6, 10);
@@ -1978,7 +1962,7 @@ async fn test_tiered_log_disk_quota_saturation_pruning() {
     append_plain(&mut log, 11, 15);
 
     // Maintenance compresses the warm segments and immediately prunes cold ones over the quota.
-    let report = log.run_maintenance().await.unwrap();
+    let report = log.run_maintenance().unwrap();
     assert_eq!(report.warm_compressed_count, 2);
     assert!(
         report.pruned_count >= 1,
@@ -2315,7 +2299,7 @@ fn simulate_reads(seeds: std::ops::Range<u64>, steps: usize) {
                     }
                 }
                 5 => {
-                    log.run_maintenance_sync_at(random_clock(&mut rng)).unwrap();
+                    log.run_maintenance_at(random_clock(&mut rng)).unwrap();
                 }
                 6 => {
                     let target = 1 + rng.below(log.head_seq().get().max(1));
@@ -2439,7 +2423,7 @@ fn byte_budget_cuts_never_skip_an_operation_across_tiers() {
         accepted.push(op);
         if seq == 4 {
             // 1..=2 and 3..=4 sealed and compressed.
-            log.run_maintenance_sync().unwrap();
+            log.run_maintenance().unwrap();
         }
     }
     // 5..=6 sealed warm, 7 in active.wal and RAM.
@@ -2520,7 +2504,7 @@ fn simulate_pages_while_the_log_changes(seeds: std::ops::Range<u64>, chains: usi
                 match rng.below(8) {
                     0 | 1 => append(&mut log, &mut accepted, &mut rng),
                     2 => {
-                        log.run_maintenance_sync_at(random_clock(&mut rng)).unwrap();
+                        log.run_maintenance_at(random_clock(&mut rng)).unwrap();
                     }
                     3 => {
                         let target = 1 + rng.below(log.head_seq().get().max(1));
@@ -2669,7 +2653,7 @@ fn simulate_failures(seeds: std::ops::Range<u64>, steps: usize) {
                     }
                 }
                 6 | 7 => {
-                    let _ = log.run_maintenance_sync_at(random_clock(&mut rng));
+                    let _ = log.run_maintenance_at(random_clock(&mut rng));
                 }
                 8 => {
                     let target = 1 + rng.below(log.head_seq().get().max(1));

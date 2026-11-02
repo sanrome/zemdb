@@ -31,7 +31,8 @@ use tokio::net::TcpStream;
 use zemdb_core::*;
 use zemdb_server::api::control_plane::{CreateRoomRequest, CreateSchemaRequest, RoomDetails};
 use zemdb_server::{
-    generate_client_token, RoomCommand, RoomManager, SchemaRegistry, ServerConfig, SnapshotRelay,
+    generate_client_token, IoThreads, RoomCommand, RoomManager, SchemaRegistry, ServerConfig,
+    SnapshotRelay,
 };
 
 const SCHEMA_ID: &str = "e1-schema";
@@ -518,6 +519,7 @@ async fn inproc_mode(args: &HashMap<String, String>, mut run_args: Run) {
         Arc::clone(&config),
         Arc::clone(&registry),
         relay,
+        IoThreads::new(config.io_threads),
     ));
     let schema_id = SchemaId::new(SCHEMA_ID).unwrap();
     registry

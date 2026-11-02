@@ -9,6 +9,10 @@
 //! Hook points (`hook`, armed with `arm_hook`) follow the same rules but run a closure instead
 //! of failing, so a test can act at an exact spot of production code, for example start a
 //! concurrent writer while the first one is stopped there.
+//!
+//! A test can also ask which threads reached the fail points of the paths under a directory
+//! (`watch_threads`), for example to show that a room's file I/O never runs on the runtime's
+//! thread. Hooks do not count: several of them mark steps that are not file operations.
 
 use crate::error::ServerError;
 use std::path::Path;
@@ -28,6 +32,10 @@ pub(crate) fn arm(name: &'static str, path: &Path) {
 pub(crate) fn check(name: &'static str, path: &Path) -> Result<(), ServerError> {
     #[cfg(test)]
     {
+        // The one fail point that is not a file operation.
+        if name != "room_command_panic" {
+            note_thread(path);
+        }
         let mut armed = ARMED.lock().unwrap();
         if let Some(pos) = armed.iter().position(|(n, p)| *n == name && p == path) {
             armed.remove(pos);
@@ -76,4 +84,43 @@ pub(crate) fn hook(name: &'static str, path: &Path) {
     }
     #[cfg(not(test))]
     let _ = (name, path);
+}
+
+#[cfg(test)]
+type WatchedThreads = Vec<(std::path::PathBuf, Vec<std::thread::ThreadId>)>;
+
+#[cfg(test)]
+static WATCHED: std::sync::Mutex<WatchedThreads> = std::sync::Mutex::new(Vec::new());
+
+/// Starts recording the threads that reach a fail point for a path under `dir`.
+#[cfg(test)]
+pub(crate) fn watch_threads(dir: &Path) {
+    WATCHED
+        .lock()
+        .unwrap()
+        .push((dir.to_path_buf(), Vec::new()));
+}
+
+/// The threads that reached a fail point for a path under `dir` since [`watch_threads`] started
+/// watching it.
+#[cfg(test)]
+pub(crate) fn watched_threads(dir: &Path) -> Vec<std::thread::ThreadId> {
+    WATCHED
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(watched, _)| watched == dir)
+        .map(|(_, threads)| threads.clone())
+        .unwrap_or_default()
+}
+
+/// Records the current thread for the watched directories that hold `path`.
+#[cfg(test)]
+pub(crate) fn note_thread(path: &Path) {
+    let current = std::thread::current().id();
+    for (dir, threads) in WATCHED.lock().unwrap().iter_mut() {
+        if path.starts_with(dir) && !threads.contains(&current) {
+            threads.push(current);
+        }
+    }
 }

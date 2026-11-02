@@ -2,6 +2,7 @@
 
 use crate::api::router::AppState;
 use crate::config::ServerConfig;
+use crate::io_pool::IoThreads;
 use crate::relay::SnapshotRelay;
 use crate::schema_registry::SchemaRegistry;
 use crate::RoomManager;
@@ -41,6 +42,7 @@ impl TestState {
             Arc::clone(&config),
             Arc::clone(&registry),
             Arc::clone(&relay),
+            IoThreads::new(config.io_threads),
         ));
         Self {
             config,

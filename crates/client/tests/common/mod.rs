@@ -26,8 +26,8 @@ use zemdb_client::{
 };
 use zemdb_core::*;
 use zemdb_server::{
-    build_router, generate_client_token, AppState, RoomManager, SchemaRegistry, ServerConfig,
-    SnapshotRelay,
+    build_router, generate_client_token, AppState, IoThreads, RoomManager, SchemaRegistry,
+    ServerConfig, SnapshotRelay,
 };
 use zemdb_storage::files::{NativeFile, NativeFiles, RoomFile, RoomFiles};
 use zemdb_storage::{
@@ -436,6 +436,7 @@ fn state(config: ServerConfig) -> AppState {
         Arc::clone(&config),
         Arc::clone(&registry),
         Arc::clone(&relay),
+        IoThreads::new(config.io_threads),
     ));
     AppState::new(config, registry, manager, relay)
 }

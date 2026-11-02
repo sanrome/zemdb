@@ -24,7 +24,9 @@ use crate::config::ServerConfig;
 use crate::dedup::{dedup_key, DedupLruCache};
 use crate::durable;
 use crate::error::ServerError;
+use crate::io_pool::{run_holding, IoThreads};
 use crate::log::budget::OpSize;
+use crate::log::tiered_log::MaintenanceClock;
 use crate::log::{RoomLifecyclePolicy, TieredLog};
 use crate::relay::{LogBounds, SnapshotRelay, Uploader};
 use crate::response_budget::{no_room, InflightBudget, Reservation, RESPONSE_OVERHEAD};
@@ -91,7 +93,11 @@ pub struct RoomActor {
     schema_id: SchemaId,
     schema: Arc<Schema>,
     dedup_cache: DedupLruCache,
-    tiered_log: TieredLog,
+    /// The room's log; away only while the actor waits for an operation on it in the file I/O
+    /// threads ([`log_io`](Self::log_io)).
+    tiered_log: Option<TieredLog>,
+    /// The threads that run the file I/O of the room.
+    io: Arc<IoThreads>,
     lease_tracker: ClientLeaseTracker,
     head_seq: SequenceNumber,
     events_tx: broadcast::Sender<RoomEvent>,
@@ -123,8 +129,8 @@ impl RoomActor {
     /// `timings`. `incarnation` tells this room apart from earlier rooms created with its id,
     /// and `lifecycle_policy` is its effective policy.
     ///
-    /// Reads the room's files: async callers run it through
-    /// [`blocking_io`](crate::blocking::blocking_io).
+    /// Reads the room's files: async callers run it off the workers. `io` runs the actor's own
+    /// file I/O.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open(
         room_id: RoomId,
@@ -137,6 +143,7 @@ impl RoomActor {
         snapshot_relay: Arc<SnapshotRelay>,
         response_budget: Arc<InflightBudget>,
         timings: ActorTimings,
+        io: Arc<IoThreads>,
     ) -> Result<(mpsc::Sender<RoomCommand>, Self), ServerError> {
         let room_dir = room_dir(data_dir.as_ref(), &room_id);
         durable::create_dir_all_synced(&room_dir)?;
@@ -171,7 +178,8 @@ impl RoomActor {
             schema_id,
             schema,
             dedup_cache,
-            tiered_log,
+            tiered_log: Some(tiered_log),
+            io,
             lease_tracker,
             head_seq,
             events_tx,
@@ -247,12 +255,12 @@ impl RoomActor {
                             debug!(room = %self.room_id, "Shutdown command received, terminating actor loop");
                             #[cfg(test)]
                             crate::fail_point::hook("room_shutdown", &self.room_dir);
-                            self.persist_roster_at_stop();
+                            self.persist_roster_at_stop().await;
                             let _ = reply.send(());
                             break;
                         }
                         Some(command) => {
-                            if self.handle_command(command).is_break() {
+                            if self.handle_command(command).await.is_break() {
                                 break;
                             }
                         }
@@ -263,7 +271,7 @@ impl RoomActor {
                     }
                 }
                 _ = fast_timer.tick() => {
-                    self.run_fast_maintenance();
+                    self.run_fast_maintenance().await;
                     if self.is_idle() {
                         // A room whose idle timeout is shorter than the slow tick would never
                         // reach its first slow tick, so it runs the disk maintenance on the way
@@ -283,7 +291,7 @@ impl RoomActor {
         // Every exit flushes pending cursor changes and the clients' last activity. Dropping
         // the actor afterwards releases the log's file lock and drops any command still
         // queued, whose callers observe a closed reply channel instead of waiting forever.
-        self.persist_roster_at_stop();
+        self.persist_roster_at_stop().await;
     }
 
     /// Whether the room has been inactive for its `idle_timeout`: no command in that time,
@@ -311,14 +319,14 @@ impl RoomActor {
         self.stopping_idle = true;
         // After `close`, `recv` yields the queued commands and then `None`.
         while let Some(command) = self.receiver.recv().await {
-            self.handle_command(command)?;
+            self.handle_command(command).await?;
         }
         ControlFlow::Continue(())
     }
 
     /// Handles one command. `Break` means the room can no longer operate safely and the
     /// actor must stop so that the next request reopens it from disk.
-    fn handle_command(&mut self, command: RoomCommand) -> ControlFlow<()> {
+    async fn handle_command(&mut self, command: RoomCommand) -> ControlFlow<()> {
         #[cfg(test)]
         if crate::fail_point::check("room_command_panic", &self.room_dir).is_err() {
             panic!("injected panic while handling a room command");
@@ -367,7 +375,9 @@ impl RoomActor {
                 reply,
             } => {
                 let mut flow = ControlFlow::Continue(());
-                let res = self.commit(&client_id, mutation_id, last_ack_seq, op, &mut flow);
+                let res = self
+                    .commit(&client_id, mutation_id, last_ack_seq, op, &mut flow)
+                    .await;
                 let _ = reply.send(res);
                 return flow;
             }
@@ -378,7 +388,7 @@ impl RoomActor {
                 max_batch_size,
                 reply,
             } => {
-                let _ = reply.send(self.sync(&client_id, from_seq, max_batch_size));
+                let _ = reply.send(self.sync(&client_id, from_seq, max_batch_size).await);
             }
 
             RoomCommand::Ack {
@@ -386,7 +396,7 @@ impl RoomActor {
                 ack_seq,
                 reply,
             } => {
-                let _ = reply.send(self.ack(&client_id, ack_seq));
+                let _ = reply.send(self.ack(&client_id, ack_seq).await);
             }
 
             RoomCommand::Heartbeat { client_id, reply } => {
@@ -412,7 +422,7 @@ impl RoomActor {
                     room_id: self.room_id.clone(),
                     schema_id: self.schema_id.clone(),
                     head_seq: self.head_seq,
-                    tail_seq: self.tiered_log.tail_seq(),
+                    tail_seq: self.log().tail_seq(),
                     bootstrapping_clients: boot,
                     connected_clients: conn,
                     disconnected_clients: disc,
@@ -458,7 +468,7 @@ impl RoomActor {
             // uploader and could raise the pruning floor above the head.
             self.check_within_head(seq)?;
         }
-        let tail_seq = self.tiered_log.tail_seq();
+        let tail_seq = self.log().tail_seq();
         let state = self
             .lease_tracker
             .register_client(client_id, current_seq, tail_seq);
@@ -477,7 +487,7 @@ impl RoomActor {
 
     /// Commits `op`. Sets `flow` to `Break`, with the mailbox already closed, when the room
     /// must stop after replying.
-    fn commit(
+    async fn commit(
         &mut self,
         client_id: &ClientId,
         mutation_id: MutationId,
@@ -497,8 +507,9 @@ impl RoomActor {
             // head_seq) is recorded and the client's state recomputed from it.
             self.observe(client_id, Some(last_ack_seq));
             let mut reservation = self.reserve_response(client_id);
-            let (catchup_ops, has_more) =
-                self.catchup_after_commit(last_ack_seq, reservation.as_mut());
+            let (catchup_ops, has_more) = self
+                .catchup_after_commit(last_ack_seq, &mut reservation)
+                .await;
             return Ok(CommitResponse {
                 assigned_seq: existing_seq,
                 catchup_ops,
@@ -514,7 +525,7 @@ impl RoomActor {
         // that a rejected commit leaves no trace in the log, the head or the SSE stream. The
         // client's lifecycle state is not a reason to reject: a client that was bootstrapping
         // or dormant commits as soon as its cursor is inside the log.
-        if self.tiered_log.is_behind_retention(last_ack_seq) {
+        if self.log().is_behind_retention(last_ack_seq) {
             self.reject_behind_log(client_id, last_ack_seq);
             return Err(ServerError::BehindCompaction);
         }
@@ -547,7 +558,11 @@ impl RoomActor {
         // not be on disk, and a failed fsync cannot be retried safely. The room stops and is
         // recovered from disk by the next request; if the record survived, deduplication
         // acknowledges a retry of the same mutation with the sequence that reached disk.
-        let outcome = match self.tiered_log.append(seq_op.clone(), Some(key)) {
+        let appended = seq_op.clone();
+        let outcome = match self
+            .log_io(move |log| log.append(appended, Some(key)))
+            .await
+        {
             Ok(outcome) => outcome,
             Err(err) => {
                 error!(
@@ -589,7 +604,10 @@ impl RoomActor {
                     (Vec::new(), true)
                 }
             }
-            reservation => self.catchup_after_commit(last_ack_seq, reservation),
+            _ => {
+                self.catchup_after_commit(last_ack_seq, &mut reservation)
+                    .await
+            }
         };
 
         // A failed segment rotation after a durable append leaves the segment files in an
@@ -633,18 +651,19 @@ impl RoomActor {
     /// reply. Without a catch-up, the batch is empty and flagged `has_more`, which sends the
     /// client to `/sync`, where any underlying error (for example `BehindCompaction`) is
     /// reported.
-    fn catchup_after_commit(
-        &self,
+    async fn catchup_after_commit(
+        &mut self,
         last_ack_seq: SequenceNumber,
-        reservation: Option<&mut Reservation>,
+        reservation: &mut Option<Reservation>,
     ) -> (Vec<SequencedOperation>, bool) {
-        let Some(reservation) = reservation else {
+        let Some(held) = reservation.take() else {
             return (Vec::new(), true);
         };
-        match self
-            .tiered_log
-            .fetch_deltas(last_ack_seq, COMMIT_CATCHUP_BATCH, Some(reservation))
-        {
+        let (read, held) = self
+            .read_log(last_ack_seq, COMMIT_CATCHUP_BATCH, held)
+            .await;
+        *reservation = Some(held);
+        match read {
             Ok((ops, has_more)) => fit_in_response(ops, has_more),
             Err(err) => {
                 warn!(
@@ -657,7 +676,7 @@ impl RoomActor {
         }
     }
 
-    fn sync(
+    async fn sync(
         &mut self,
         client_id: &ClientId,
         from_seq: SequenceNumber,
@@ -666,16 +685,16 @@ impl RoomActor {
         self.ensure_registered(client_id)?;
         self.check_within_head(from_seq)?;
 
-        if self.tiered_log.is_behind_retention(from_seq) {
+        if self.log().is_behind_retention(from_seq) {
             self.reject_behind_log(client_id, from_seq);
             return Err(ServerError::BehindCompaction);
         }
 
-        let mut reservation = self.reserve_response(client_id).ok_or_else(no_room)?;
+        let reservation = self.reserve_response(client_id).ok_or_else(no_room)?;
         let bounded_batch_size = max_batch_size.clamp(1, MAX_SYNC_BATCH);
-        let read =
-            self.tiered_log
-                .fetch_deltas(from_seq, bounded_batch_size, Some(&mut reservation));
+        let (read, reservation) = self
+            .read_log(from_seq, bounded_batch_size, reservation)
+            .await;
         let (ops, has_more) = match read {
             Ok((ops, has_more)) => fit_in_response(ops, has_more),
             Err(e) => {
@@ -710,7 +729,7 @@ impl RoomActor {
         })
     }
 
-    fn ack(
+    async fn ack(
         &mut self,
         client_id: &ClientId,
         ack_seq: SequenceNumber,
@@ -721,10 +740,7 @@ impl RoomActor {
         // The cursor never moves backwards, so an ack below the stored cursor (stale or
         // out of order) changes nothing and succeeds. Retention is checked against the
         // cursor the client ends up with.
-        if self
-            .tiered_log
-            .is_behind_retention(ack_seq.max(stored_cursor))
-        {
+        if self.log().is_behind_retention(ack_seq.max(stored_cursor)) {
             self.reject_behind_log(client_id, ack_seq);
             return Err(ServerError::BehindCompaction);
         }
@@ -733,7 +749,7 @@ impl RoomActor {
         // The cursor is persisted on the next maintenance tick.
         self.observe(client_id, Some(ack_seq));
 
-        self.prune_to_retention_floor();
+        self.prune_to_retention_floor().await;
 
         Ok(self.head_seq)
     }
@@ -784,9 +800,9 @@ impl RoomActor {
         client_id: &ClientId,
         reported_cursor: Option<SequenceNumber>,
     ) -> Option<ClientState> {
-        let state =
-            self.lease_tracker
-                .observe(client_id, reported_cursor, self.tiered_log.tail_seq());
+        let state = self
+            .lease_tracker
+            .observe(client_id, reported_cursor, self.log().tail_seq());
         if state == Some(ClientState::Bootstrapping) {
             self.request_snapshot();
         }
@@ -818,7 +834,7 @@ impl RoomActor {
     /// room's incarnation.
     fn log_bounds(&self) -> LogBounds {
         LogBounds {
-            tail_seq: self.tiered_log.tail_seq(),
+            tail_seq: self.log().tail_seq(),
             head_seq: self.head_seq,
             unrestorable_through: self.unrestorable_through,
             room_incarnation: self.incarnation,
@@ -927,7 +943,7 @@ impl RoomActor {
     /// roster on disk never falls behind the retained log; otherwise a restart would treat
     /// those clients as fallen behind and force them to a snapshot. A prune that deletes no
     /// segment only trims RAM and leaves the roster for the fast tick.
-    fn prune_to_retention_floor(&mut self) {
+    async fn prune_to_retention_floor(&mut self) {
         let Some(min_ack) = self.lease_tracker.min_connected_ack_seq() else {
             return;
         };
@@ -945,12 +961,13 @@ impl RoomActor {
 
         // Segments are deleted only when they end below the floor, and none ends below the
         // current tail, so a floor at or below the tail deletes nothing.
-        if retention_floor <= self.tiered_log.tail_seq() {
+        if retention_floor <= self.log().tail_seq() {
             return;
         }
 
-        if self.tiered_log.has_prunable_below(retention_floor) {
-            if let Err(err) = self.lease_tracker.persist_if_dirty() {
+        // A prune that deletes no segment only trims RAM, without touching a file.
+        let pruned = if self.log().has_prunable_below(retention_floor) {
+            if let Err(err) = self.save_roster(false).await {
                 warn!(
                     room = %self.room_id,
                     error = %err,
@@ -958,16 +975,20 @@ impl RoomActor {
                 );
                 return;
             }
-        }
-        if let Err(err) = self.tiered_log.prune_older_than(retention_floor) {
+            self.log_io(move |log| log.prune_older_than(retention_floor))
+                .await
+        } else {
+            self.log_mut().prune_older_than(retention_floor)
+        };
+        if let Err(err) = pruned {
             warn!(room = %self.room_id, error = %err, "Proactive log pruning failed");
         }
     }
 
     /// Writes pending cursor and lease changes to the roster file. A failure is logged and the
     /// changes stay pending for the next attempt; it only delays how far the log can be pruned.
-    fn persist_roster(&mut self) {
-        if let Err(err) = self.lease_tracker.persist_if_dirty() {
+    async fn persist_roster(&mut self) {
+        if let Err(err) = self.save_roster(false).await {
             warn!(room = %self.room_id, error = %err, "Failed to persist clients roster");
         }
     }
@@ -975,40 +996,141 @@ impl RoomActor {
     /// Like [`persist_roster`](Self::persist_roster), but also writes the roster when only the
     /// clients' activity changed, so that their inactivity keeps counting after the room
     /// reopens (for example after a shutdown for inactivity).
-    fn persist_roster_at_stop(&mut self) {
-        if let Err(err) = self.lease_tracker.persist_if_dirty_or_active() {
+    async fn persist_roster_at_stop(&mut self) {
+        if let Err(err) = self.save_roster(true).await {
             warn!(room = %self.room_id, error = %err, "Failed to persist clients roster");
         }
     }
 
+    /// Writes the roster file if it changed (with `with_activity`, also if only the clients'
+    /// activity did), on the file I/O threads, carrying the log like any other operation on
+    /// the room's files.
+    async fn save_roster(&mut self, with_activity: bool) -> Result<(), ServerError> {
+        let Some((path, json)) = self.lease_tracker.unsaved(with_activity)? else {
+            return Ok(());
+        };
+        self.log_io(move |_| durable::write_checked(&path, &json))
+            .await?;
+        self.lease_tracker.saved();
+        Ok(())
+    }
+
+    /// The log, between its operations on the file I/O threads.
+    fn log(&self) -> &TieredLog {
+        self.tiered_log.as_ref().expect(LOG_IN_PLACE)
+    }
+
+    /// The log, between its operations on the file I/O threads, for what touches no file.
+    fn log_mut(&mut self) -> &mut TieredLog {
+        self.tiered_log.as_mut().expect(LOG_IN_PLACE)
+    }
+
+    /// Runs `work`, which reads or writes the room's files, on the file I/O threads of the
+    /// rooms, and waits for it without blocking the worker.
+    async fn log_io<T: Send + 'static>(
+        &mut self,
+        work: impl FnOnce(&mut TieredLog) -> T + Send + 'static,
+    ) -> T {
+        let permit = self.io.io().permit().await;
+        self.log_io_holding(permit, work).await
+    }
+
+    /// Runs `work` on a file I/O thread, holding `permit`, a permit of the pool it counts
+    /// against, and waits for it without blocking the worker. The log travels to that thread and
+    /// back, so nothing else touches it meanwhile. If the actor is dropped while it waits, the
+    /// log is dropped on that thread once `work` ends, and only then are the room's files
+    /// released.
+    async fn log_io_holding<T: Send + 'static>(
+        &mut self,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        work: impl FnOnce(&mut TieredLog) -> T + Send + 'static,
+    ) -> T {
+        let mut log = self.tiered_log.take().expect(LOG_IN_PLACE);
+        let (log, out) = run_holding(permit, move || {
+            let out = work(&mut log);
+            (log, out)
+        })
+        .await;
+        self.tiered_log = Some(log);
+        out
+    }
+
+    /// The operations after `from_seq` for a response holding `reservation`, as
+    /// [`TieredLog::fetch_deltas`] returns them: from memory when the read needs no file, and
+    /// otherwise on the file I/O threads, with the reservation.
+    async fn read_log(
+        &mut self,
+        from_seq: SequenceNumber,
+        max_batch_size: u32,
+        mut reservation: Reservation,
+    ) -> (
+        Result<(Vec<SequencedOperation>, bool), ServerError>,
+        Reservation,
+    ) {
+        if let Some(read) =
+            self.log()
+                .fetch_from_memory(from_seq, max_batch_size, Some(&mut reservation))
+        {
+            return (read, reservation);
+        }
+        self.log_io(move |log| {
+            let read = log.fetch_deltas(from_seq, max_batch_size, Some(&mut reservation));
+            (read, reservation)
+        })
+        .await
+    }
+
     /// The fast tick: memory-only maintenance, plus writing the roster if it changed.
-    fn run_fast_maintenance(&mut self) {
+    async fn run_fast_maintenance(&mut self) {
         // Connected/Bootstrapping -> Disconnected -> Dormant.
+        let tail_seq = self.log().tail_seq();
         self.lease_tracker.check_timeouts(
             self.policy.lease_timeout,
             self.policy.dormant_after,
             self.policy.forget_dormant_after,
-            self.tiered_log.tail_seq(),
+            tail_seq,
         );
 
         self.update_snapshot_signals();
         // Cursor and lease changes accumulated since the previous tick.
-        self.persist_roster();
+        self.persist_roster().await;
     }
 
     /// The slow tick: disk maintenance of the log, served from its segment index.
     async fn run_disk_maintenance(&mut self) {
-        // Compression (in spawn_blocking), RAM TTL window, cold TTL and quota.
-        if let Err(e) = self.tiered_log.run_maintenance().await {
+        // Compression, RAM TTL window, cold TTL and quota. A pass that compresses runs on a
+        // compression thread, so that it never keeps the other rooms' file I/O waiting; with
+        // none free (other rooms compressing), it leaves the warm segments for the next pass
+        // rather than stop serving the room to wait for one.
+        let compression = if self.log().has_compression_due(SystemTime::now()) {
+            self.io.compression().try_permit()
+        } else {
+            None
+        };
+        let compress = compression.is_some();
+        let permit = match compression {
+            Some(permit) => permit,
+            None => self.io.io().permit().await,
+        };
+        if let Err(e) = self
+            .log_io_holding(permit, move |log| {
+                log.run_maintenance_pass(MaintenanceClock::now(), compress)
+            })
+            .await
+        {
             warn!(room = %self.room_id, error = %e, "TieredLog maintenance error");
         }
 
         // Backup pass of the cursor-driven pruning, which normally runs on every Ack: a floor
         // can also move without an Ack (cursors reported by commits, clients becoming Dormant).
-        self.prune_to_retention_floor();
+        self.prune_to_retention_floor().await;
         self.publish_snapshot_floor();
     }
 }
+
+/// Why the log is in place outside [`RoomActor::log_io`]: the actor waits for every operation
+/// it sends, and a panic in one ends the actor.
+const LOG_IN_PLACE: &str = "the log is back after every file operation";
 
 /// Directory of the room `room_id` under the server's `data_dir`.
 pub(crate) fn room_dir(data_dir: &Path, room_id: &RoomId) -> PathBuf {

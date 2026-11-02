@@ -21,6 +21,7 @@ use crate::config::ServerConfig;
 use crate::durable;
 use crate::error::ServerError;
 use crate::fail_point;
+use crate::io_pool::IoThreads;
 use crate::log::{RoomLifecycleOverrides, RoomLifecyclePolicy};
 use crate::relay::{LogBounds, SnapshotRelay};
 use crate::response_budget::InflightBudget;
@@ -176,18 +177,22 @@ pub struct RoomManager {
     default_policy: RoomLifecyclePolicy,
     /// Timings of the room actors; always [`ActorTimings::default`] outside tests.
     timings: ActorTimings,
+    /// The threads that run the file I/O of the rooms.
+    io: Arc<IoThreads>,
 }
 
 impl RoomManager {
     /// Creates a new RoomManager with the given configuration, schema registry, and snapshot
-    /// relay. The configuration provides the server defaults of the room lifecycle policy.
-    /// Removes what the deletions of rooms left behind in `data_dir` ([`delete_room`]).
+    /// relay, whose rooms run their file I/O on `io`. The configuration provides the server
+    /// defaults of the room lifecycle policy. Removes what the deletions of rooms left behind
+    /// in `data_dir` ([`delete_room`]).
     ///
     /// [`delete_room`]: Self::delete_room
     pub fn new(
         config: Arc<ServerConfig>,
         schema_registry: Arc<SchemaRegistry>,
         snapshot_relay: Arc<SnapshotRelay>,
+        io: Arc<IoThreads>,
     ) -> Self {
         let data_dir = config.data_dir.clone();
         let default_policy = config.default_lifecycle_policy();
@@ -210,6 +215,7 @@ impl RoomManager {
             data_dir,
             default_policy,
             timings: ActorTimings::default(),
+            io,
         }
     }
 
@@ -453,6 +459,7 @@ impl RoomManager {
             Arc::clone(&self.snapshot_relay),
             Arc::clone(&self.response_budget),
             self.timings,
+            Arc::clone(&self.io),
         )?;
         let actor_id = self.next_actor_id.fetch_add(1, Ordering::Relaxed);
         let (exit_tx, exit_rx) = watch::channel(None);

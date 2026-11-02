@@ -686,9 +686,10 @@ async fn http2_client_that_stops_reading_is_disconnected() {
 
     // Syncs whose bodies are never read: flow control holds most of each one in the server.
     // On a loaded machine, the first response may stall the connection before the others get
-    // their headers out; those fail to send.
+    // their headers out; those fail to send. The room reads them one after the other (about a
+    // second each in a debug build) within the time a request waits for its room.
     let client = http2_client();
-    let sends = (0..4).map(|_| server.sync_request(&client).send());
+    let sends = (0..2).map(|_| server.sync_request(&client).send());
     let held: Vec<_> = futures::future::join_all(sends)
         .await
         .into_iter()

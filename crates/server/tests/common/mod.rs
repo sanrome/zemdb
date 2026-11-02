@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use zemdb_core::*;
 use zemdb_server::api::control_plane::RoomDetails;
 use zemdb_server::{
-    build_router, generate_client_token, serve_until_shutdown, AppState, CommitResponse,
+    build_router, generate_client_token, serve_until_shutdown, AppState, CommitResponse, IoThreads,
     RegisterResponse, RoomCommand, RoomLifecyclePolicy, RoomManager, RoomMetrics, SchemaRegistry,
     ServerConfig, ServerError, SnapshotRelay, SyncBatchResponse,
 };
@@ -127,6 +127,7 @@ pub fn build_with_policy(
         Arc::clone(&config),
         Arc::clone(&schema_registry),
         Arc::clone(&relay),
+        IoThreads::new(config.io_threads),
     );
     if let Some(policy) = policy {
         room_manager = room_manager.with_default_policy(policy);
@@ -186,6 +187,7 @@ impl Parts {
             Arc::clone(&self.config),
             Arc::clone(&self.schema_registry),
             new_relay(&self.config),
+            IoThreads::new(self.config.io_threads),
         )
     }
 

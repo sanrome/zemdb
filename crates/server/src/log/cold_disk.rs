@@ -103,18 +103,6 @@ impl ColdDiskLog {
             cleanup_error: cleanup.err(),
         })
     }
-
-    /// [`compress_warm_segment_sync`](Self::compress_warm_segment_sync) on the blocking pool.
-    pub async fn compress_warm_segment(
-        warm_path: impl AsRef<Path>,
-        cold_path: impl AsRef<Path>,
-    ) -> Result<CompressedSegment, ServerError> {
-        let warm = warm_path.as_ref().to_path_buf();
-        let cold = cold_path.as_ref().to_path_buf();
-        tokio::task::spawn_blocking(move || Self::compress_warm_segment_sync(&warm, &cold))
-            .await
-            .map_err(|e| ServerError::Internal(format!("Spawn blocking task failed: {}", e)))?
-    }
 }
 
 /// Length and CRC32 of a stream of bytes.

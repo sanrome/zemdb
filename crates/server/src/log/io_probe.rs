@@ -29,6 +29,7 @@ static EVENTS: std::sync::Mutex<Vec<(IoEvent, std::path::PathBuf, usize)>> =
 pub(crate) fn record(event: IoEvent, segments_dir: &Path) {
     #[cfg(test)]
     {
+        crate::fail_point::note_thread(segments_dir);
         let mut events = EVENTS.lock().unwrap();
         match events
             .iter_mut()

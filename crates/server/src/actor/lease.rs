@@ -112,6 +112,54 @@ impl ClientLeaseTracker {
 
     /// Atomically and durably persists the client roster to disk, clearing the dirty mark.
     pub fn save(&mut self) -> Result<(), ServerError> {
+        let json = self.roster_json()?;
+        durable::write_checked(&self.path, &json)?;
+        self.saved();
+        Ok(())
+    }
+
+    /// Persists the roster if it changed since the last successful save.
+    pub fn persist_if_dirty(&mut self) -> Result<(), ServerError> {
+        self.persist(false)
+    }
+
+    /// Persists the roster if it changed or any client was active since the last successful
+    /// save. Used when the room stops, so that the clients' last activity survives it.
+    pub fn persist_if_dirty_or_active(&mut self) -> Result<(), ServerError> {
+        self.persist(true)
+    }
+
+    /// Writes what [`unsaved`](Self::unsaved) returns, if anything, here.
+    fn persist(&mut self, with_activity: bool) -> Result<(), ServerError> {
+        if let Some((path, json)) = self.unsaved(with_activity)? {
+            durable::write_checked(&path, &json)?;
+            self.saved();
+        }
+        Ok(())
+    }
+
+    /// What [`persist_if_dirty`](Self::persist_if_dirty) would write (with `with_activity`,
+    /// [`persist_if_dirty_or_active`](Self::persist_if_dirty_or_active)): the roster file and
+    /// its JSON, for a caller that writes it elsewhere with `durable::write_checked` and then
+    /// calls [`saved`](Self::saved). The roster must not change in between.
+    pub(crate) fn unsaved(
+        &self,
+        with_activity: bool,
+    ) -> Result<Option<(PathBuf, Vec<u8>)>, ServerError> {
+        if !self.dirty && !(with_activity && self.activity_unsaved) {
+            return Ok(None);
+        }
+        Ok(Some((self.path.clone(), self.roster_json()?)))
+    }
+
+    /// Clears the dirty mark once the roster is on disk.
+    pub(crate) fn saved(&mut self) {
+        self.dirty = false;
+        self.activity_unsaved = false;
+    }
+
+    /// The JSON of the roster file.
+    fn roster_json(&self) -> Result<Vec<u8>, ServerError> {
         let (instant_now, wall_now) = (Instant::now(), SystemTime::now());
         let roster = RosterFile {
             clients: self
@@ -121,30 +169,9 @@ impl ClientLeaseTracker {
                 .collect(),
             snapshot_demand: self.snapshot_demand.map(PersistedDemand::from_time),
         };
-        let json = serde_json::to_string(&roster).map_err(|e| {
+        serde_json::to_vec(&roster).map_err(|e| {
             ServerError::Serialization(format!("Failed to serialize clients roster: {}", e))
-        })?;
-        durable::write_checked(&self.path, json.as_bytes())?;
-        self.dirty = false;
-        self.activity_unsaved = false;
-        Ok(())
-    }
-
-    /// Persists the roster if it changed since the last successful save.
-    pub fn persist_if_dirty(&mut self) -> Result<(), ServerError> {
-        if self.dirty {
-            self.save()?;
-        }
-        Ok(())
-    }
-
-    /// Persists the roster if it changed or any client was active since the last successful
-    /// save. Used when the room stops, so that the clients' last activity survives it.
-    pub fn persist_if_dirty_or_active(&mut self) -> Result<(), ServerError> {
-        if self.dirty || self.activity_unsaved {
-            self.save()?;
-        }
-        Ok(())
+        })
     }
 
     /// Wall-clock time at which the room's snapshot demand was last renewed, if it is on.

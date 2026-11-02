@@ -1,6 +1,6 @@
 use super::*;
 use crate::actor::test_support::{
-    snapshot_envelope, test_manager, test_schema, wait_until, POLL_CEILING,
+    snapshot_envelope, test_manager, test_schema, wait_until, POLL_CEILING, TEST_TIMINGS,
 };
 use crate::durable;
 use crate::fail_point;
@@ -981,6 +981,7 @@ async fn spawned_actor_reports_a_panic() {
         relay,
         Arc::new(InflightBudget::new(u64::MAX, u64::MAX)),
         ActorTimings::default(),
+        IoThreads::new(2),
     )
     .unwrap();
     let handle = tokio::spawn(actor.run());
@@ -1912,4 +1913,482 @@ async fn a_room_created_again_with_the_same_schema_gets_its_newest_version() {
         );
     }
     manager.shutdown_all().await;
+}
+
+// The file I/O of the rooms runs on the bounded pool of file I/O threads.
+
+fn active_wal(dir: &TempDir, room_id: &RoomId) -> PathBuf {
+    room_dir(dir, room_id).join("segments").join("active.wal")
+}
+
+fn insert_op(id: i64) -> zemdb_core::mutation::Operation {
+    let row = zemdb_core::value::RowBuilder::new()
+        .set("id", id)
+        .set("title", "task")
+        .build();
+    test_schema()
+        .to_operation_insert("tasks", &row, 1000)
+        .unwrap()
+}
+
+/// Opens `room_id` with the schema `first` and registers `client` in it.
+async fn open_with_client(manager: &RoomManager, room_id: &RoomId, client: &ClientId) {
+    manager
+        .get_or_spawn(room_id, Some(&SchemaId::new("first").unwrap()))
+        .await
+        .unwrap();
+    manager
+        .ask(room_id, |reply| RoomCommand::RegisterClient {
+            client_id: client.clone(),
+            current_seq: None,
+            known_incarnation: None,
+            reply,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+/// Commits operation `n` of `client`, whose cursor is at the start, and returns its sequence.
+async fn commit_nth(
+    manager: &RoomManager,
+    room_id: &RoomId,
+    client: &ClientId,
+    n: u8,
+) -> SequenceNumber {
+    manager
+        .ask(room_id, |reply| RoomCommand::Commit {
+            client_id: client.clone(),
+            mutation_id: MutationId::new([n; 16]),
+            last_ack_seq: SequenceNumber::new(0),
+            op: insert_op(n.into()),
+            reply,
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .assigned_seq
+}
+
+/// A hook that stops the thread that reaches it until `release` is sent (or 15 s pass, which
+/// it reports as not released), and tells when it was reached and when it let go.
+struct Stop {
+    reached: Arc<std::sync::atomic::AtomicBool>,
+    released: Arc<std::sync::atomic::AtomicBool>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+impl Stop {
+    fn arm(name: &'static str, path: &Path) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = || Arc::new(AtomicBool::new(false));
+        let (reached, released, done) = (flag(), flag(), flag());
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        fail_point::arm_hook(name, path, {
+            let (reached, released, done) = (
+                Arc::clone(&reached),
+                Arc::clone(&released),
+                Arc::clone(&done),
+            );
+            move || {
+                reached.store(true, Ordering::SeqCst);
+                let let_go = wait.recv_timeout(Duration::from_secs(15)).is_ok();
+                released.store(let_go, Ordering::SeqCst);
+                done.store(true, Ordering::SeqCst);
+            }
+        });
+        Self {
+            reached,
+            released,
+            done,
+            release,
+        }
+    }
+
+    async fn wait_reached(&self) {
+        let reached = Arc::clone(&self.reached);
+        wait_until("the hook is reached", move || {
+            reached.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
+    }
+
+    fn let_go(&self) {
+        // On a thread that was not stopped, nobody waits any more.
+        let _ = self.release.send(());
+    }
+
+    /// Whether the hook was let go, rather than giving up, once it is over.
+    async fn was_released(&self) -> bool {
+        let done = Arc::clone(&self.done);
+        wait_until("the hook is over", move || {
+            done.load(std::sync::atomic::Ordering::SeqCst)
+        })
+        .await;
+        self.released.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// On a runtime of a single thread, where the actors and the requests share that thread, a
+/// room whose fsync is slow does not stop another room from committing.
+#[tokio::test]
+async fn a_slow_fsync_in_one_room_does_not_hold_back_another_room() {
+    let dir = tempdir().unwrap();
+    let (manager, _relay) = test_manager(dir.path(), &["first"], |config| {
+        config.io_threads = 2;
+    });
+    let manager = Arc::new(manager);
+    let client = ClientId::new("writer").unwrap();
+    let (slow, quick) = (RoomId::new("slow").unwrap(), RoomId::new("quick").unwrap());
+    open_with_client(&manager, &slow, &client).await;
+    open_with_client(&manager, &quick, &client).await;
+
+    let stop = Stop::arm("warm_append_sync", &active_wal(&dir, &slow));
+    let slow_commit = tokio::spawn({
+        let (manager, slow, client) = (Arc::clone(&manager), slow.clone(), client.clone());
+        async move { commit_nth(&manager, &slow, &client, 1).await }
+    });
+    stop.wait_reached().await;
+    assert_eq!(
+        commit_nth(&manager, &quick, &client, 1).await,
+        SequenceNumber::new(1)
+    );
+    stop.let_go();
+    assert_eq!(slow_commit.await.unwrap(), SequenceNumber::new(1));
+    assert!(
+        stop.was_released().await,
+        "the other room's commit waited for the slow fsync"
+    );
+    manager.shutdown_all().await;
+}
+
+/// A room shut down while its fsync runs on the file I/O threads waits for it: it releases its
+/// files only afterwards, and the commit is acknowledged and on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_room_shut_down_during_its_fsync_releases_its_files_only_after_it() {
+    let dir = tempdir().unwrap();
+    let (manager, _relay) = test_manager(dir.path(), &["first"], |_| {});
+    let manager = Arc::new(manager);
+    let client = ClientId::new("writer").unwrap();
+    let room_id = RoomId::new("closing").unwrap();
+    open_with_client(&manager, &room_id, &client).await;
+
+    let stop = Stop::arm("warm_append_sync", &active_wal(&dir, &room_id));
+    let committing = tokio::spawn({
+        let (manager, room_id, client) = (Arc::clone(&manager), room_id.clone(), client.clone());
+        async move { commit_nth(&manager, &room_id, &client, 1).await }
+    });
+    stop.wait_reached().await;
+    let closing = tokio::spawn({
+        let (manager, room_id) = (Arc::clone(&manager), room_id.clone());
+        async move { manager.shutdown_room(&room_id).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !closing.is_finished(),
+        "the room shut down during its fsync"
+    );
+    assert!(
+        crate::log::tiered_log::lock_log(&room_dir(&dir, &room_id)).is_err(),
+        "the room's files were released during its fsync"
+    );
+
+    stop.let_go();
+    assert_eq!(committing.await.unwrap(), SequenceNumber::new(1));
+    assert!(closing.await.unwrap());
+    let (log, _) = crate::log::TieredLog::open_or_create(
+        room_dir(&dir, &room_id),
+        RoomLifecyclePolicy::default(),
+    )
+    .unwrap();
+    assert_eq!(log.head_seq(), SequenceNumber::new(1));
+}
+
+/// A runtime that ends while a room's fsync runs on the file I/O threads drops the room's
+/// actor, but the room's files stay taken until the fsync ends, and the runtime waits for it.
+#[test]
+fn a_room_whose_runtime_ends_during_its_fsync_keeps_its_files_until_the_fsync_ends() {
+    let dir = tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (manager, _relay) = test_manager(dir.path(), &["first"], |_| {});
+    let manager = Arc::new(manager);
+    let room_id = RoomId::new("abandoned").unwrap();
+    let stop = runtime.block_on(async {
+        let client = ClientId::new("writer").unwrap();
+        open_with_client(&manager, &room_id, &client).await;
+        let stop = Stop::arm("warm_append_sync", &active_wal(&dir, &room_id));
+        tokio::spawn({
+            let (manager, room_id) = (Arc::clone(&manager), room_id.clone());
+            async move { commit_nth(&manager, &room_id, &client, 1).await }
+        });
+        stop.wait_reached().await;
+        stop
+    });
+
+    let room = room_dir(&dir, &room_id);
+    let checker = std::thread::spawn({
+        let room = room.clone();
+        move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let taken = crate::log::tiered_log::lock_log(&room).is_err();
+            stop.let_go();
+            taken
+        }
+    });
+    drop(runtime);
+    assert!(
+        checker.join().unwrap(),
+        "the room's files were released during its fsync"
+    );
+    // The runtime waited for the fsync, and the log went with it.
+    let (log, _) =
+        crate::log::TieredLog::open_or_create(&room, RoomLifecyclePolicy::default()).unwrap();
+    assert_eq!(log.head_seq(), SequenceNumber::new(1));
+}
+
+/// A maintenance pass that compresses runs on the compression threads: another room's commit
+/// does not wait for it, even with a single file I/O thread.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_room_compressing_its_segments_does_not_hold_back_another_room() {
+    let dir = tempdir().unwrap();
+    let (manager, _relay) = test_manager(dir.path(), &["first"], |config| {
+        config.io_threads = 1;
+    });
+    let manager = Arc::new(manager.with_default_policy(RoomLifecyclePolicy {
+        ram_max_ops: 1,
+        warm_disk_ttl: Duration::ZERO,
+        ..RoomLifecyclePolicy::default()
+    }));
+    let client = ClientId::new("writer").unwrap();
+    let (compressing, writing) = (
+        RoomId::new("compressing").unwrap(),
+        RoomId::new("writing").unwrap(),
+    );
+    open_with_client(&manager, &compressing, &client).await;
+    open_with_client(&manager, &writing, &client).await;
+
+    // The commit seals its segment, which the next slow tick compresses.
+    let segments = room_dir(&dir, &compressing).join("segments");
+    let warm = crate::log::segment_index::segment_path(
+        &segments,
+        SequenceNumber::new(1),
+        SequenceNumber::new(1),
+        crate::log::segment_index::Tier::Warm,
+    );
+    let stop = Stop::arm("compress_warm_segment", &warm);
+    commit_nth(&manager, &compressing, &client, 1).await;
+    stop.wait_reached().await;
+
+    let commit = tokio::time::timeout(
+        Duration::from_secs(2),
+        commit_nth(&manager, &writing, &client, 1),
+    )
+    .await;
+    stop.let_go();
+    assert_eq!(commit.ok(), Some(SequenceNumber::new(1)));
+    assert!(stop.was_released().await);
+    manager.shutdown_all().await;
+}
+
+/// A panic in a room's file operation reaches its actor: the commit is `Internal`, the log
+/// that travelled with the operation is gone with it, and the next request reopens the room
+/// from disk.
+#[tokio::test]
+async fn a_panic_in_a_file_operation_stops_the_room_and_the_next_request_reopens_it() {
+    let dir = tempdir().unwrap();
+    let manager = new_manager(&dir);
+    let client = ClientId::new("writer").unwrap();
+    let room_id = RoomId::new("panicky-io").unwrap();
+    open_with_client(&manager, &room_id, &client).await;
+
+    fail_point::arm_hook("warm_append_sync", &active_wal(&dir, &room_id), || {
+        panic!("injected panic in a file operation");
+    });
+    let failed = manager
+        .ask(&room_id, |reply| RoomCommand::Commit {
+            client_id: client.clone(),
+            mutation_id: MutationId::new([1; 16]),
+            last_ack_seq: SequenceNumber::new(0),
+            op: insert_op(1),
+            reply,
+        })
+        .await;
+    assert!(
+        matches!(failed, Err(ServerError::Internal(_))),
+        "{failed:?}"
+    );
+
+    // The room reopens, its log lock free again, and the retry is acknowledged once.
+    open_with_client(&manager, &room_id, &client).await;
+    assert_eq!(
+        commit_nth(&manager, &room_id, &client, 1).await,
+        SequenceNumber::new(1)
+    );
+    manager.shutdown_all().await;
+}
+
+/// With every file I/O thread taken (one, held by another room's fsync), a request to another
+/// room still gets its answer within the time a request waits for its room: `Timeout`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_waiting_for_a_full_pool_is_answered_within_the_actor_timeout() {
+    let dir = tempdir().unwrap();
+    let (manager, _relay) = test_manager(dir.path(), &["first"], |config| {
+        config.io_threads = 1;
+    });
+    let manager = Arc::new(manager);
+    let client = ClientId::new("writer").unwrap();
+    let (slow, other) = (RoomId::new("slow").unwrap(), RoomId::new("other").unwrap());
+    open_with_client(&manager, &slow, &client).await;
+    open_with_client(&manager, &other, &client).await;
+
+    let stop = Stop::arm("warm_append_sync", &active_wal(&dir, &slow));
+    // Held for longer than a request waits for its room: it times out too.
+    let slow_commit = tokio::spawn({
+        let (manager, slow, client) = (Arc::clone(&manager), slow.clone(), client.clone());
+        async move {
+            manager
+                .ask(&slow, |reply| RoomCommand::Commit {
+                    client_id: client,
+                    mutation_id: MutationId::new([1; 16]),
+                    last_ack_seq: SequenceNumber::new(0),
+                    op: insert_op(1),
+                    reply,
+                })
+                .await
+                .map(|_| ())
+        }
+    });
+    stop.wait_reached().await;
+    let started = std::time::Instant::now();
+    let answer = manager
+        .ask(&other, |reply| RoomCommand::Commit {
+            client_id: client.clone(),
+            mutation_id: MutationId::new([1; 16]),
+            last_ack_seq: SequenceNumber::new(0),
+            op: insert_op(1),
+            reply,
+        })
+        .await;
+    let took = started.elapsed();
+    stop.let_go();
+    assert!(matches!(answer, Err(ServerError::Timeout(_))), "{answer:?}");
+    assert!(took < ACTOR_TIMEOUT + Duration::from_secs(1), "{took:?}");
+    slow_commit.await.unwrap().ok();
+    // The commits that timed out still went through: their retries are deduplicated.
+    for room_id in [&slow, &other] {
+        assert_eq!(
+            commit_nth(&manager, room_id, &client, 1).await,
+            SequenceNumber::new(1)
+        );
+    }
+    manager.shutdown_all().await;
+}
+
+/// A room never waits for the compression threads that other rooms hold: with both taken, a
+/// room whose segments are due compresses later and keeps serving, and so does a room with
+/// nothing to compress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_room_does_not_wait_for_the_compression_threads_of_other_rooms() {
+    let dir = tempdir().unwrap();
+    let (manager, _relay) = test_manager(dir.path(), &["first"], |_| {});
+    let manager = Arc::new(manager.with_default_policy(RoomLifecyclePolicy {
+        ram_max_ops: 1,
+        warm_disk_ttl: Duration::ZERO,
+        ..RoomLifecyclePolicy::default()
+    }));
+    let client = ClientId::new("writer").unwrap();
+    let rooms: Vec<RoomId> = ["comp-a", "comp-b", "due-c", "idle-d"]
+        .iter()
+        .map(|id| RoomId::new(*id).unwrap())
+        .collect();
+    for room_id in &rooms {
+        open_with_client(&manager, room_id, &client).await;
+    }
+    let first_warm = |room_id: &RoomId| {
+        crate::log::segment_index::segment_path(
+            &room_dir(&dir, room_id).join("segments"),
+            SequenceNumber::new(1),
+            SequenceNumber::new(1),
+            crate::log::segment_index::Tier::Warm,
+        )
+    };
+    // Rooms a and b take both compression threads.
+    let mut stops = Vec::new();
+    for room_id in &rooms[..2] {
+        let stop = Stop::arm("compress_warm_segment", &first_warm(room_id));
+        commit_nth(&manager, room_id, &client, 1).await;
+        stop.wait_reached().await;
+        stops.push(stop);
+    }
+    // Room c seals a segment, due at its next slow tick; room d has nothing to compress.
+    commit_nth(&manager, &rooms[2], &client, 1).await;
+    tokio::time::sleep(TEST_TIMINGS.slow_tick * 3).await;
+    assert!(
+        first_warm(&rooms[2]).exists(),
+        "room c compressed without a thread"
+    );
+
+    let commit = tokio::time::timeout(
+        Duration::from_secs(2),
+        commit_nth(&manager, &rooms[2], &client, 2),
+    )
+    .await;
+    let heartbeat = tokio::time::timeout(
+        Duration::from_secs(2),
+        manager.ask(&rooms[3], |reply| RoomCommand::Heartbeat {
+            client_id: client.clone(),
+            reply,
+        }),
+    )
+    .await;
+    for stop in &stops {
+        stop.let_go();
+    }
+    assert_eq!(commit.ok(), Some(SequenceNumber::new(2)));
+    assert!(matches!(heartbeat, Ok(Ok(Ok(_)))), "{heartbeat:?}");
+    manager.shutdown_all().await;
+}
+
+/// A runtime that ends while a room writes its roster on the file I/O threads keeps the room's
+/// files taken until the write ends: the roster write carries the log like any other operation
+/// on the room's files.
+#[test]
+fn a_room_whose_runtime_ends_during_its_roster_write_keeps_its_files_until_it_ends() {
+    let dir = tempdir().unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (manager, _relay) = test_manager(dir.path(), &["first"], |_| {});
+    let room_id = RoomId::new("abandoned-roster").unwrap();
+    let roster = room_dir(&dir, &room_id).join("meta_clients_abandoned-roster.json");
+    let stop = Stop::arm("write_atomic_before_rename", &roster);
+    runtime.block_on(async {
+        // The registration makes the roster dirty; the next fast tick writes it.
+        open_with_client(&manager, &room_id, &ClientId::new("writer").unwrap()).await;
+        stop.wait_reached().await;
+    });
+
+    let room = room_dir(&dir, &room_id);
+    let checker = std::thread::spawn({
+        let room = room.clone();
+        move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let taken = crate::log::tiered_log::lock_log(&room).is_err();
+            stop.let_go();
+            taken
+        }
+    });
+    drop(runtime);
+    assert!(
+        checker.join().unwrap(),
+        "the room's files were released during its roster write"
+    );
+    assert!(crate::log::tiered_log::lock_log(&room).is_ok());
 }

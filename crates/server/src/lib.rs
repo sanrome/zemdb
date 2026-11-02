@@ -6,6 +6,7 @@ mod dedup;
 mod durable;
 pub mod error;
 mod fail_point;
+mod io_pool;
 mod log;
 pub mod relay;
 mod response_budget;
@@ -27,6 +28,7 @@ pub use api::{
 };
 pub use config::ServerConfig;
 pub use error::ServerError;
+pub use io_pool::IoThreads;
 pub use log::{RoomLifecycleOverrides, RoomLifecyclePolicy};
 pub use relay::SnapshotRelay;
 pub use schema_registry::SchemaRegistry;

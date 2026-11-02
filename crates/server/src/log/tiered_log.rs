@@ -1,4 +1,3 @@
-use crate::blocking::blocking_io;
 use crate::durable;
 use crate::error::ServerError;
 use crate::log::budget::ReadBudget;
@@ -246,7 +245,7 @@ impl TieredLog {
             )));
         }
 
-        blocking_io(|| self.warm_disk.append_record(&op, mutation_id))?;
+        self.warm_disk.append_record(&op, mutation_id)?;
 
         self.hot_buffer.append(op)?;
         self.hot_buffer.apply_sliding_window(&self.policy);
@@ -260,7 +259,7 @@ impl TieredLog {
         if self.warm_disk.active_ops_count() >= self.policy.ram_max_ops
             || self.warm_disk.active_len() >= self.policy.segment_max_bytes
         {
-            if let Err(err) = blocking_io(|| self.seal_active_segment()) {
+            if let Err(err) = self.seal_active_segment() {
                 outcome.rotation_error = Some(err);
             }
         }
@@ -313,14 +312,12 @@ impl TieredLog {
         &self,
         from_seq: SequenceNumber,
         max_batch_size: u32,
-        reservation: Option<&mut Reservation>,
+        mut reservation: Option<&mut Reservation>,
     ) -> Result<(Vec<SequencedOperation>, bool), ServerError> {
-        if self.is_behind_retention(from_seq) {
-            return Err(ServerError::BehindCompaction);
-        }
-
-        if from_seq.get() >= self.head_seq.get() || max_batch_size == 0 {
-            return Ok((Vec::new(), false));
+        if let Some(read) =
+            self.fetch_from_memory(from_seq, max_batch_size, reservation.as_deref_mut())
+        {
+            return read;
         }
 
         let mut budget = ReadBudget::new(max_batch_size as usize, MAX_RESPONSE_OPS_BYTES);
@@ -328,21 +325,10 @@ impl TieredLog {
             budget = budget.reserving(reservation);
         }
 
-        // A cursor within the RAM window is served from memory, without touching disk.
-        if let Some(min_ram) = self.hot_buffer.min_seq() {
-            if from_seq.get() + 1 >= min_ram.get() {
-                let ops = self.hot_buffer.get_range(from_seq, &mut budget);
-                if let Some(last) = ops.last() {
-                    let has_more = last.seq.get() < self.head_seq.get();
-                    return Ok((ops, has_more));
-                }
-            }
-        }
-
         // Disk tiers, oldest first: the indexed sealed segments (cold, then warm), then
         // `active.wal`, which bridges the sealed segments and the RAM window.
         let mut batch = DeltaBatch::new(from_seq, budget);
-        blocking_io(|| self.fetch_from_disk(&mut batch))?;
+        self.fetch_from_disk(&mut batch)?;
 
         // If the batch reached the RAM buffer's window, the rest comes from memory.
         if !batch.is_full() && batch.cursor.get() < self.head_seq.get() {
@@ -351,8 +337,7 @@ impl TieredLog {
         }
 
         if batch.ops.is_empty() {
-            // The response has no room for the first operation, in RAM or on disk (after a
-            // refusal in RAM, the disk tiers read nothing): the client asks again.
+            // The response has no room for the first operation: the client asks again.
             if batch.budget.is_out_of_room() {
                 return Ok((Vec::new(), true));
             }
@@ -370,6 +355,41 @@ impl TieredLog {
 
         let has_more = batch.cursor.get() < self.head_seq.get();
         Ok((batch.ops, has_more))
+    }
+
+    /// What [`fetch_deltas`](Self::fetch_deltas) returns, when it needs no file: a cursor past
+    /// retention or at the head, or one within the RAM window. `None` when the read starts in
+    /// the disk tiers.
+    pub(crate) fn fetch_from_memory(
+        &self,
+        from_seq: SequenceNumber,
+        max_batch_size: u32,
+        reservation: Option<&mut Reservation>,
+    ) -> Option<Result<(Vec<SequencedOperation>, bool), ServerError>> {
+        if self.is_behind_retention(from_seq) {
+            return Some(Err(ServerError::BehindCompaction));
+        }
+        if from_seq.get() >= self.head_seq.get() || max_batch_size == 0 {
+            return Some(Ok((Vec::new(), false)));
+        }
+        let min_ram = self.hot_buffer.min_seq()?;
+        if from_seq.get() + 1 < min_ram.get() {
+            return None;
+        }
+        let mut budget = ReadBudget::new(max_batch_size as usize, MAX_RESPONSE_OPS_BYTES);
+        if let Some(reservation) = reservation {
+            budget = budget.reserving(reservation);
+        }
+        let ops = self.hot_buffer.get_range(from_seq, &mut budget);
+        match ops.last() {
+            Some(last) => {
+                let has_more = last.seq.get() < self.head_seq.get();
+                Some(Ok((ops, has_more)))
+            }
+            // The response has no room for the first operation: the client asks again.
+            None if budget.is_out_of_room() => Some(Ok((Vec::new(), true))),
+            None => None,
+        }
     }
 
     /// Fills `batch` from the sealed segments and `active.wal`.
@@ -396,32 +416,48 @@ impl TieredLog {
     }
 
     /// Disk maintenance: compresses aged warm segments into cold Zstd segments (at most
-    /// [`MAX_COMPRESSIONS_PER_PASS`]), delegating the compression to `spawn_blocking`, applies
-    /// the RAM TTL window, and prunes cold segments past their TTL and any segment over the
-    /// room's disk quota.
+    /// [`MAX_COMPRESSIONS_PER_PASS`]), applies the RAM TTL window, and prunes cold segments past
+    /// their TTL and any segment over the room's disk quota.
     ///
     /// A failed compression does not stop the other passes: the remaining segments are still
     /// compressed and the TTL and quota still apply. The first error is returned at the end.
-    pub async fn run_maintenance(&mut self) -> Result<MaintenanceReport, ServerError> {
-        self.run_maintenance_at(MaintenanceClock::now()).await
+    #[cfg(test)]
+    pub fn run_maintenance(&mut self) -> Result<MaintenanceReport, ServerError> {
+        self.run_maintenance_at(MaintenanceClock::now())
     }
 
     /// [`run_maintenance`](Self::run_maintenance) at the time `clock`.
-    async fn run_maintenance_at(
+    #[cfg(test)]
+    fn run_maintenance_at(
         &mut self,
         clock: MaintenanceClock,
+    ) -> Result<MaintenanceReport, ServerError> {
+        self.run_maintenance_pass(clock, true)
+    }
+
+    /// [`run_maintenance`](Self::run_maintenance) at the time `clock`; without `compress`, the
+    /// pass leaves the warm segments for a later one.
+    pub(crate) fn run_maintenance_pass(
+        &mut self,
+        clock: MaintenanceClock,
+        compress: bool,
     ) -> Result<MaintenanceReport, ServerError> {
         let mut report = MaintenanceReport::default();
         let mut first_error = None;
 
-        for segment in self.warm_segments_due(clock.wall) {
+        let due = if compress {
+            self.warm_segments_due(clock.wall)
+        } else {
+            Vec::new()
+        };
+        for segment in due {
             let cold_path = segment_path(
                 &self.segments_dir,
                 segment.start_seq,
                 segment.end_seq,
                 Tier::Cold,
             );
-            let result = ColdDiskLog::compress_warm_segment(&segment.path, &cold_path).await;
+            let result = ColdDiskLog::compress_warm_segment_sync(&segment.path, &cold_path);
             if let Err(err) =
                 self.record_compression(segment, cold_path, result, clock, &mut report)
             {
@@ -429,27 +465,28 @@ impl TieredLog {
             }
         }
 
-        let expired = blocking_io(|| self.expire(clock, &mut report));
+        let expired = self.expire(clock, &mut report);
         first_error.map_or(expired, Err)?;
         Ok(report)
     }
 
-    /// [`run_maintenance`](Self::run_maintenance) for tests without a runtime.
-    #[cfg(test)]
-    fn run_maintenance_sync(&mut self) -> Result<MaintenanceReport, ServerError> {
-        self.run_maintenance_sync_at(MaintenanceClock::now())
+    /// Whether a maintenance pass at `now` would compress a warm segment.
+    pub(crate) fn has_compression_due(&self, now: SystemTime) -> bool {
+        let over_quota = self.disk_bytes() > self.policy.max_room_disk_bytes;
+        self.segments
+            .iter()
+            .any(|segment| self.is_compression_due(segment, now, over_quota))
     }
 
-    /// [`run_maintenance_at`](Self::run_maintenance_at) on a runtime of its own, for tests
-    /// without one.
-    #[cfg(test)]
-    fn run_maintenance_sync_at(
-        &mut self,
-        clock: MaintenanceClock,
-    ) -> Result<MaintenanceReport, ServerError> {
-        tokio::runtime::Builder::new_current_thread()
-            .build()?
-            .block_on(self.run_maintenance_at(clock))
+    /// Whether `segment` is due for compression at `now`: a warm segment sealed for at least
+    /// `warm_disk_ttl`, or any warm segment while the log is over `max_room_disk_bytes`.
+    fn is_compression_due(
+        &self,
+        segment: &SegmentEntry,
+        now: SystemTime,
+        over_quota: bool,
+    ) -> bool {
+        segment.tier == Tier::Warm && (over_quota || age(segment, now) >= self.policy.warm_disk_ttl)
     }
 
     /// Updates the index after compressing the warm `segment` into `cold_path`. Whenever the
@@ -496,8 +533,7 @@ impl TieredLog {
         let mut due: Vec<SegmentEntry> = self
             .segments
             .iter()
-            .filter(|segment| segment.tier == Tier::Warm)
-            .filter(|segment| over_quota || age(segment, now) >= self.policy.warm_disk_ttl)
+            .filter(|segment| self.is_compression_due(segment, now, over_quota))
             .cloned()
             .collect();
         self.failed_compressions
@@ -656,7 +692,7 @@ impl TieredLog {
     /// Seals `active.wal` now, without evicting RAM.
     #[cfg(test)]
     pub fn force_rotate_warm(&mut self) -> Result<Option<PathBuf>, ServerError> {
-        blocking_io(|| self.seal_active_segment())
+        self.seal_active_segment()
     }
 
     /// Whether [`prune_older_than`](Self::prune_older_than) with `target_seq` would delete a
@@ -683,8 +719,7 @@ impl TieredLog {
             .take_while(|segment| segment.end_seq.get() < target_seq.get())
             .cloned()
             .collect();
-        let (warm_deleted_count, cold_deleted_count) =
-            blocking_io(|| self.prune_segments(&doomed))?;
+        let (warm_deleted_count, cold_deleted_count) = self.prune_segments(&doomed)?;
         self.hot_buffer.evict_older_than(target_seq);
 
         Ok(PruneReport {

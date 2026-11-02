@@ -26,19 +26,6 @@ fn warm_segment_is_kept_when_directory_sync_fails() {
     );
 }
 
-#[tokio::test]
-async fn async_compression_propagates_directory_sync_failure() {
-    let dir = tempdir().unwrap();
-    let warm = sealed_segment(dir.path());
-    let cold = segment_file(dir.path(), 1, 3, "wal.zst");
-
-    fail_point::arm("sync_dir", dir.path());
-    assert!(ColdDiskLog::compress_warm_segment(&warm, &cold)
-        .await
-        .is_err());
-    assert!(warm.exists());
-}
-
 #[test]
 fn compression_replaces_warm_segment() {
     let dir = tempdir().unwrap();

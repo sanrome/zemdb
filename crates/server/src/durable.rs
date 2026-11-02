@@ -4,7 +4,6 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::blocking::blocking_io;
 use crate::fail_point;
 
 /// Flushes a directory's entries to disk so that file creations, renames and deletions
@@ -79,19 +78,15 @@ pub(crate) fn tmp_path_for(path: &Path) -> PathBuf {
 ///
 /// Writes a temporary sibling file, syncs it, renames it over the destination and syncs the
 /// parent directory. A crash at any point leaves either the previous or the new content,
-/// never a partially written file. Callers are often async, so the blocking I/O runs through
-/// [`blocking_io`].
+/// never a partially written file.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    blocking_io(|| write_atomic_blocking(path, bytes))
-}
-
-fn write_atomic_blocking(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp_path = tmp_path_for(path);
     {
         let mut tmp_file = File::create(&tmp_path)?;
         tmp_file.write_all(bytes)?;
         tmp_file.sync_all()?;
     }
+    fail_point::hook("write_atomic_before_rename", path);
     injected("write_atomic_before_rename", path)?;
     fs::rename(&tmp_path, path)?;
     sync_parent(path)

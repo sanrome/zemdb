@@ -127,6 +127,11 @@ pub struct ServerConfig {
     /// Most SSE streams open at once (default: half of `max_connections`, at least 1). A
     /// client keeps at most 2 per room: opening a third closes its oldest.
     pub max_sse_streams: Option<usize>,
+
+    /// File operations of the rooms that run at once, each on a blocking thread of the runtime
+    /// (default 16, at most its 512). They do not grow with the rooms: an operation waits, in
+    /// the order it came, until one of them ends.
+    pub io_threads: usize,
 }
 
 /// Built-in development secrets. They are public, so `validate_secrets` rejects them.
@@ -166,6 +171,7 @@ impl Default for ServerConfig {
             max_inflight_response_bytes: 256 * 1024 * 1024,
             max_inflight_response_bytes_per_client: 2 * MAX_FRAME_SIZE as u64,
             max_sse_streams: None,
+            io_threads: 16,
         }
     }
 }
@@ -191,6 +197,10 @@ const BODY_MIN_RATE_BYTES_PER_SEC_RANGE: std::ops::RangeInclusive<u64> = 1024..=
 
 /// Accepted range of `max_connections`: from 1 to 1,000,000.
 const MAX_CONNECTIONS_RANGE: std::ops::RangeInclusive<usize> = 1..=1_000_000;
+
+/// Accepted range of `io_threads`: up to the blocking threads of the runtime (Tokio's 512), past
+/// which the operations would wait for a thread anyway.
+const IO_THREADS_RANGE: std::ops::RangeInclusive<usize> = 1..=512;
 
 /// Accepted range of `response_stall_timeout_secs`: from 5 seconds to 1 hour.
 const RESPONSE_STALL_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u64> = 5..=3600;
@@ -286,6 +296,11 @@ impl ServerConfig {
             "max_inflight_response_bytes_per_client (ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES_PER_CLIENT)",
             self.max_inflight_response_bytes_per_client,
             MAX_FRAME_SIZE as u64..=self.max_inflight_response_bytes,
+        )?;
+        check_range(
+            "io_threads (ZEMDB_IO_THREADS)",
+            self.io_threads,
+            IO_THREADS_RANGE,
         )?;
         if let Some(max) = self.max_sse_streams {
             check_range(
@@ -420,6 +435,9 @@ impl ServerConfig {
         }
         if let Some(max) = parse_var(&var, "ZEMDB_MAX_SSE_STREAMS")? {
             self.max_sse_streams = Some(max);
+        }
+        if let Some(threads) = parse_var(&var, "ZEMDB_IO_THREADS")? {
+            self.io_threads = threads;
         }
 
         use PolicySetting::*;

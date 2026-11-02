@@ -1558,6 +1558,7 @@ fn stopped_actor(
         Arc::clone(relay),
         Arc::new(InflightBudget::new(u64::MAX, u64::MAX)),
         timings,
+        IoThreads::new(2),
     )
     .unwrap();
     actor
@@ -1566,16 +1567,17 @@ fn stopped_actor(
 /// Registers `writer` and `peer` in `actor`, whose policy seals a segment every two
 /// operations; `writer` commits 1..=8 and acknowledges 8, which prunes the log, and `peer`
 /// registers at 8. Both are `Connected`.
-fn prune_stopped_actor(actor: &mut RoomActor, writer: &ClientId, peer: &ClientId) {
+async fn prune_stopped_actor(actor: &mut RoomActor, writer: &ClientId, peer: &ClientId) {
     actor.register(writer, None, None).unwrap();
     let mut flow = ControlFlow::Continue(());
     for n in 1..=8u8 {
         actor
             .commit(writer, mutation(n), seq(0), insert_op(n.into()), &mut flow)
+            .await
             .unwrap();
     }
-    actor.ack(writer, seq(8)).unwrap();
-    assert!(actor.tiered_log.tail_seq() > seq(1), "the ack must prune");
+    actor.ack(writer, seq(8)).await.unwrap();
+    assert!(actor.log().tail_seq() > seq(1), "the ack must prune");
     actor.register(peer, Some(seq(8)), Some(1)).unwrap();
 }
 
@@ -1606,10 +1608,10 @@ async fn a_client_without_heartbeats_disconnects_when_its_lease_expires_on_the_t
 
     // The lease counts from the heartbeat, and expires once it has passed whole.
     tokio::time::advance(LEASE).await;
-    actor.run_fast_maintenance();
+    actor.run_fast_maintenance().await;
     assert_eq!(state_of(&actor, &client), ClientState::Connected);
     tokio::time::advance(Duration::from_millis(1)).await;
-    actor.run_fast_maintenance();
+    actor.run_fast_maintenance().await;
     assert_eq!(state_of(&actor, &client), ClientState::Disconnected);
 }
 
@@ -1628,17 +1630,17 @@ async fn a_designation_expires_after_60_seconds_on_the_tokio_clock_and_passes_to
         ClientId::new("writer").unwrap(),
         ClientId::new("peer").unwrap(),
     );
-    prune_stopped_actor(&mut actor, &writer, &peer);
+    prune_stopped_actor(&mut actor, &writer, &peer).await;
     actor
         .register(&ClientId::new("newcomer").unwrap(), None, None)
         .unwrap();
     let first = actor.snapshot_demand.designee().cloned().unwrap();
 
     tokio::time::advance(DESIGNATION_TIMEOUT - Duration::from_millis(1)).await;
-    actor.run_fast_maintenance();
+    actor.run_fast_maintenance().await;
     assert_eq!(actor.snapshot_demand.designee(), Some(&first));
     tokio::time::advance(Duration::from_millis(1)).await;
-    actor.run_fast_maintenance();
+    actor.run_fast_maintenance().await;
     let second = actor.snapshot_demand.designee().cloned().unwrap();
     assert_ne!(second, first, "the designation must pass to another client");
     assert!([&writer, &peer].contains(&&second));
@@ -1662,29 +1664,29 @@ async fn a_snapshot_demand_expires_on_the_tokio_clock_also_after_the_room_reopen
         ClientId::new("writer").unwrap(),
         ClientId::new("peer").unwrap(),
     );
-    prune_stopped_actor(&mut actor, &writer, &peer);
+    prune_stopped_actor(&mut actor, &writer, &peer).await;
     let newcomer = ClientId::new("newcomer").unwrap();
     actor.register(&newcomer, None, None).unwrap();
 
     tokio::time::advance(TTL - Duration::from_millis(1)).await;
-    actor.run_fast_maintenance();
+    actor.run_fast_maintenance().await;
     assert!(actor.snapshot_demand.is_active());
     tokio::time::advance(Duration::from_millis(1)).await;
-    actor.run_fast_maintenance();
+    actor.run_fast_maintenance().await;
     assert!(!actor.snapshot_demand.is_active());
 
     // Renewed, and restored when the room reopens. The wall clock hardly moved, so it has
     // almost a whole TTL left.
     actor.heartbeat(&newcomer).unwrap();
-    actor.persist_roster_at_stop();
+    actor.persist_roster_at_stop().await;
     drop(actor);
     let mut actor = stopped_actor(&dir, &relay, policy, ActorTimings::default());
     assert!(actor.snapshot_demand.is_active());
     tokio::time::advance(TTL - Duration::from_secs(1)).await;
-    actor.run_fast_maintenance();
+    actor.run_fast_maintenance().await;
     assert!(actor.snapshot_demand.is_active());
     tokio::time::advance(Duration::from_secs(1)).await;
-    actor.run_fast_maintenance();
+    actor.run_fast_maintenance().await;
     assert!(!actor.snapshot_demand.is_active());
 }
 
@@ -1939,6 +1941,7 @@ async fn commands_queued_when_the_room_goes_idle_are_handled() {
         Arc::clone(&fx.relay),
         Arc::new(InflightBudget::new(u64::MAX, u64::MAX)),
         ActorTimings::default(),
+        IoThreads::new(2),
     )
     .unwrap();
 
@@ -1975,7 +1978,7 @@ async fn commands_queued_when_the_room_goes_idle_are_handled() {
 
     assert!(actor.drain_for_idle_shutdown().await.is_continue());
     // As the actor loop does on every exit.
-    actor.persist_roster_at_stop();
+    actor.persist_roster_at_stop().await;
 
     // Nothing more is accepted; what was queued was handled normally.
     assert!(sender.is_closed());
@@ -1994,6 +1997,137 @@ async fn commands_queued_when_the_room_goes_idle_are_handled() {
     assert_eq!(cursor(&sender, &client).await, Some(seq(0)));
     assert_eq!(metrics(&sender).await.head_seq, seq(1));
     fx.manager.shutdown_all().await;
+}
+
+/// On a runtime of a single thread, no file operation of a room runs on that thread: not the
+/// commits and the sealing of segments, a sync from the disk tiers, an ack that prunes, the
+/// roster or the disk maintenance.
+#[tokio::test]
+async fn no_file_operation_of_a_room_runs_on_the_runtime_thread() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 2,
+        lease_timeout: Duration::from_secs(3600),
+        ..RoomLifecyclePolicy::default()
+    };
+    let mut actor = stopped_actor(&dir, &relay_on(&dir), policy, TEST_TIMINGS);
+    let room = room_dir(dir.path(), &actor.room_id);
+    fail_point::watch_threads(&room);
+    let (writer, peer) = (
+        ClientId::new("writer").unwrap(),
+        ClientId::new("peer").unwrap(),
+    );
+    actor.register(&writer, None, None).unwrap();
+    actor.register(&peer, Some(seq(0)), Some(1)).unwrap();
+    // A segment sealed every two commits; RAM keeps the last two operations.
+    let mut flow = ControlFlow::Continue(());
+    for n in 1..=8u8 {
+        actor
+            .commit(&writer, mutation(n), seq(0), insert_op(n.into()), &mut flow)
+            .await
+            .unwrap();
+    }
+    let batch = actor.sync(&peer, seq(0), 100).await.unwrap();
+    assert_eq!(batch.ops.first().map(|op| op.seq), Some(seq(1)));
+    for client in [&peer, &writer] {
+        actor.ack(client, seq(8)).await.unwrap();
+    }
+    assert!(actor.log().tail_seq() > seq(1), "the acks must prune");
+    actor.run_fast_maintenance().await;
+    actor.run_disk_maintenance().await;
+    actor.persist_roster_at_stop().await;
+
+    let threads = fail_point::watched_threads(&room);
+    assert!(!threads.is_empty());
+    assert!(
+        !threads.contains(&std::thread::current().id()),
+        "a file operation of the room ran on the runtime's thread"
+    );
+}
+
+/// A roster write that fails, now on the file I/O threads, leaves the changes pending: the
+/// next tick writes them.
+#[tokio::test]
+async fn a_failed_roster_write_is_retried_by_the_next_tick() {
+    let dir = tempdir().unwrap();
+    let mut actor = stopped_actor(
+        &dir,
+        &relay_on(&dir),
+        RoomLifecyclePolicy::default(),
+        TEST_TIMINGS,
+    );
+    let client = ClientId::new("client").unwrap();
+    actor.register(&client, None, None).unwrap();
+    let roster = room_dir(dir.path(), &actor.room_id).join("meta_clients_room.json");
+
+    fail_point::arm("write_atomic_before_rename", &roster);
+    actor.run_fast_maintenance().await;
+    assert!(!roster.exists());
+    actor.run_fast_maintenance().await;
+    assert!(roster.exists(), "the failed write was not retried");
+}
+
+/// An ack whose prune needs the cursors on disk first prunes nothing when the roster write
+/// fails, and the next one prunes once it succeeds.
+#[tokio::test]
+async fn an_ack_whose_roster_write_fails_prunes_nothing() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 2,
+        ..RoomLifecyclePolicy::default()
+    };
+    let mut actor = stopped_actor(&dir, &relay_on(&dir), policy, TEST_TIMINGS);
+    let writer = ClientId::new("writer").unwrap();
+    actor.register(&writer, None, None).unwrap();
+    let mut flow = ControlFlow::Continue(());
+    for n in 1..=8u8 {
+        actor
+            .commit(&writer, mutation(n), seq(0), insert_op(n.into()), &mut flow)
+            .await
+            .unwrap();
+    }
+    let roster = room_dir(dir.path(), &actor.room_id).join("meta_clients_room.json");
+
+    fail_point::arm("write_atomic_before_rename", &roster);
+    actor.ack(&writer, seq(8)).await.unwrap();
+    assert_eq!(
+        actor.log().tail_seq(),
+        seq(1),
+        "pruned without the cursors on disk"
+    );
+    actor.ack(&writer, seq(8)).await.unwrap();
+    assert!(actor.log().tail_seq() > seq(1));
+}
+
+/// The disk maintenance compresses off the runtime's thread, on the compression threads.
+#[tokio::test]
+async fn compression_runs_off_the_runtime_thread() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 2,
+        warm_disk_ttl: Duration::ZERO,
+        ..RoomLifecyclePolicy::default()
+    };
+    let mut actor = stopped_actor(&dir, &relay_on(&dir), policy, TEST_TIMINGS);
+    let writer = ClientId::new("writer").unwrap();
+    actor.register(&writer, None, None).unwrap();
+    let mut flow = ControlFlow::Continue(());
+    for n in 1..=2u8 {
+        actor
+            .commit(&writer, mutation(n), seq(0), insert_op(n.into()), &mut flow)
+            .await
+            .unwrap();
+    }
+    let segments = room_dir(dir.path(), &actor.room_id).join("segments");
+    let warm = segment_path(&segments, seq(1), seq(2), Tier::Warm);
+    let (tx, rx) = std::sync::mpsc::channel();
+    fail_point::arm_hook("compress_warm_segment", &warm, move || {
+        tx.send(std::thread::current().id()).unwrap();
+    });
+
+    // A runtime of a single thread, this one: compressing in place would run here.
+    actor.run_disk_maintenance().await;
+    assert_ne!(rx.try_recv().unwrap(), std::thread::current().id());
 }
 
 #[tokio::test(start_paused = true)]
@@ -2717,6 +2851,7 @@ mod onboarding_sim {
                     designation_timeout: SNAPSHOT_DEADLINE,
                     ..TEST_TIMINGS
                 },
+                IoThreads::new(2),
             )
             .unwrap();
             self.actor = Some(actor);
@@ -2734,7 +2869,7 @@ mod onboarding_sim {
         fn bounds(&mut self) -> LogBounds {
             let a = self.a();
             LogBounds {
-                tail_seq: a.tiered_log.tail_seq(),
+                tail_seq: a.log().tail_seq(),
                 head_seq: a.head_seq,
                 unrestorable_through: a.unrestorable_through,
                 room_incarnation: a.incarnation,
@@ -2743,7 +2878,7 @@ mod onboarding_sim {
 
         /// The tail never moves back, not even across a reopen.
         fn check_tail(&mut self) {
-            let tail = self.actor.as_ref().unwrap().tiered_log.tail_seq().get();
+            let tail = self.actor.as_ref().unwrap().log().tail_seq().get();
             assert!(
                 tail >= self.max_tail,
                 "the tail moved back from {} to {tail} (tick {})",
@@ -2757,7 +2892,7 @@ mod onboarding_sim {
         fn before_prune(&mut self) -> (u64, Option<u64>) {
             let a = self.a();
             let snapshot = a.usable_snapshot_seq().map(|s| s.get());
-            (a.tiered_log.tail_seq().get(), snapshot)
+            (a.log().tail_seq().get(), snapshot)
         }
 
         /// The lowest sequence that cursor-driven pruning must keep: the cursors of connected
@@ -2797,7 +2932,7 @@ mod onboarding_sim {
         fn check_prune(&mut self, before: (u64, Option<u64>), what: &str) {
             let (tail_before, snapshot_before) = before;
             self.stats.prune_checks += 1;
-            let tail_after = self.a().tiered_log.tail_seq().get();
+            let tail_after = self.a().log().tail_seq().get();
             if tail_after == tail_before {
                 return;
             }
@@ -2842,7 +2977,7 @@ mod onboarding_sim {
             MutationId::from_u128(u128::from(n))
         }
 
-        fn add_client(&mut self, name: String, writer: bool) {
+        async fn add_client(&mut self, name: String, writer: bool) {
             let id = ClientId::new(name).unwrap();
             let inc = self.incarnation;
             let reg = self.a().register(&id, None, Some(inc)).unwrap();
@@ -2864,17 +2999,17 @@ mod onboarding_sim {
             });
             let i = self.clients.len() - 1;
             if matches!(self.clients[i].phase, Phase::Live) {
-                self.catch_up(i);
+                self.catch_up(i).await;
             }
         }
 
         /// Syncs client `i` from its cursor to the head. Returns whether it got there (false if
         /// it fell behind the log) and whether some reply asked it for a snapshot.
-        fn catch_up(&mut self, i: usize) -> (bool, bool) {
+        async fn catch_up(&mut self, i: usize) -> (bool, bool) {
             let mut wanted = false;
             for _ in 0..10_000 {
                 let (id, cursor) = (self.clients[i].id.clone(), self.clients[i].cursor);
-                match self.a().sync(&id, seq(cursor), 100) {
+                match self.a().sync(&id, seq(cursor), 100).await {
                     Ok(batch) => {
                         wanted |= batch.snapshot_wanted;
                         for (k, op) in batch.ops.iter().enumerate() {
@@ -2943,7 +3078,7 @@ mod onboarding_sim {
                 let cursor = self.clients[i].cursor;
                 let op = insert_op((self.next_mutation % 50) as i64);
                 let mut flow = ControlFlow::Continue(());
-                match self.a().commit(&id, mid, seq(cursor), op, &mut flow) {
+                match self.a().commit(&id, mid, seq(cursor), op, &mut flow).await {
                     Ok(resp) => {
                         self.stats.commits += 1;
                         wanted |= resp.snapshot_wanted;
@@ -2963,7 +3098,7 @@ mod onboarding_sim {
                 }
                 assert!(flow.is_continue());
             }
-            let (ok, w) = self.catch_up(i);
+            let (ok, w) = self.catch_up(i).await;
             wanted |= w;
             if !ok {
                 self.fall_behind(i);
@@ -2972,7 +3107,7 @@ mod onboarding_sim {
             // The ack prunes the log proactively.
             let before = self.before_prune();
             let cursor = self.clients[i].cursor;
-            match self.a().ack(&id, seq(cursor)) {
+            match self.a().ack(&id, seq(cursor)).await {
                 Ok(_) => self.check_prune(before, "an ack"),
                 Err(ServerError::BehindCompaction) => {
                     self.fall_behind(i);
@@ -3190,7 +3325,7 @@ mod onboarding_sim {
                         self.stats.downloads_ok += 1;
                         self.clients[i].cursor = s;
                         self.clients[i].phase = Phase::Live;
-                        let (ok, _) = self.catch_up(i);
+                        let (ok, _) = self.catch_up(i).await;
                         if ok {
                             let took = self.tick - since;
                             self.stats.catch_ups += 1;
@@ -3237,7 +3372,7 @@ mod onboarding_sim {
             if self.rng.permille(20) {
                 self.stats.restarts += 1;
                 let mut a = self.actor.take().unwrap();
-                a.persist_roster_at_stop();
+                a.persist_roster_at_stop().await;
                 drop(a);
                 self.open_actor();
             }
@@ -3267,7 +3402,7 @@ mod onboarding_sim {
                 self.stats.ttl_events += 1;
                 let head = self.a().head_seq.get();
                 let target = seq(head.saturating_sub(2));
-                let _ = self.a().tiered_log.prune_older_than(target);
+                let _ = self.a().log_mut().prune_older_than(target);
                 self.check_tail();
             }
             if self.gap_injection && self.rng.permille(15) {
@@ -3319,7 +3454,7 @@ mod onboarding_sim {
             }
             if self.rng.permille(25) && self.clients.len() < 16 {
                 let n = self.clients.len();
-                self.add_client(format!("newcomer-{n}"), false);
+                self.add_client(format!("newcomer-{n}"), false).await;
             }
         }
 
@@ -3341,7 +3476,7 @@ mod onboarding_sim {
                     _ => self.step_bootstrapping(i).await,
                 }
             }
-            self.a().run_fast_maintenance();
+            self.a().run_fast_maintenance().await;
             if !self.waiting().is_empty()
                 && !self.a().snapshot_demand.is_active()
                 && self.a().usable_snapshot_seq().is_none()
@@ -3383,8 +3518,8 @@ mod onboarding_sim {
         let mut exercised = [0; 3];
         for seed in SEEDS {
             let mut sim = Sim::new(seed, gaps, ttl);
-            sim.add_client("writer-a".into(), true);
-            sim.add_client("writer-b".into(), true);
+            sim.add_client("writer-a".into(), true).await;
+            sim.add_client("writer-b".into(), true).await;
             for _ in 0..TICKS {
                 sim.run_tick(false).await;
                 for (id, waited) in sim.waiting() {

@@ -108,6 +108,7 @@ impl WarmDiskLog {
         fail_point::check("warm_append_write", &active_path)?;
         file.write_all(&encoded)?;
         file.flush()?;
+        fail_point::hook("warm_append_sync", &active_path);
         fail_point::check("warm_append_sync", &active_path)?;
         file.sync_data()?;
         self.active_len += encoded.len() as u64;
