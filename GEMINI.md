@@ -66,7 +66,7 @@ No se hacen `pub` elementos internos únicamente para poder testearlos; si un te
    - Toda colección en memoria indexada o dimensionada por datos del cliente tiene un tope y un TTL.
 
 8. **Concurrencia Asíncrona:**
-   - Prohibido ejecutar I/O bloqueante o trabajo intensivo de CPU (por ejemplo, Zstd) directamente en un worker de Tokio; usar `tokio::task::spawn_blocking` o `tokio::task::block_in_place`.
+   - Prohibido ejecutar I/O bloqueante o trabajo intensivo de CPU (por ejemplo, Zstd) directamente en un worker de Tokio. En el servidor, la E/S de archivos de las salas, del manager y del registro de esquemas va a sus pools de E/S (`io_pool.rs`), que acotan cuántas operaciones corren a la vez; lo demás, a `tokio::task::spawn_blocking`. Nada de `tokio::task::block_in_place`: cada worker bloqueado a la vez necesita un hilo nuevo.
    - Prohibido mantener guards de locks síncronos (`std::sync`, iteradores o referencias de `DashMap`) a través de un `.await`.
 
 9. **Documentación Sincronizada:**

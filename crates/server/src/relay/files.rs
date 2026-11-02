@@ -26,14 +26,26 @@ pub(super) const TMP_EXTENSION: &str = "tmp";
 /// Buffer size used to hash and validate snapshot files.
 const VERIFY_BUFFER_BYTES: usize = 1024 * 1024;
 
+/// Blocking operations of the relay at once: with the file I/O pools of the rooms, they never
+/// need more threads than the server's runtime has (`IoThreads::blocking_threads`).
+static PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(crate::io_pool::RELAY_THREADS);
+
 pub(super) async fn run_blocking<T, F>(work: F) -> Result<T, ServerError>
 where
     F: FnOnce() -> Result<T, ServerError> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(work)
+    let permit = PERMITS
+        .acquire()
         .await
-        .map_err(|e| ServerError::Internal(format!("Snapshot relay task failed: {e}")))?
+        .map_err(|e| ServerError::Internal(format!("Snapshot relay task failed: {e}")))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|e| ServerError::Internal(format!("Snapshot relay task failed: {e}")))?
 }
 
 pub(super) fn snapshot_file_name(room_id: &RoomId, seq: SequenceNumber, hash: &[u8; 32]) -> String {

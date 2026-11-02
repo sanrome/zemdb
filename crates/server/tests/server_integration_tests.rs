@@ -216,6 +216,7 @@ async fn control_plane_room_lifecycle_overrides() {
     assert!(!server
         .room_manager
         .room_exists(&RoomId::new("room-policy").unwrap())
+        .await
         .unwrap());
 
     let resp = create(
@@ -818,6 +819,7 @@ async fn admin_get_room_non_existent_returns_404_without_spawning() {
         !server
             .room_manager
             .room_exists(&RoomId::new(ghost_id).unwrap())
+            .await
             .unwrap(),
         "Room should not exist in room manager"
     );

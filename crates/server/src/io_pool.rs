@@ -15,7 +15,9 @@
 //! operation runs to its end, and what it owns is dropped on its thread afterwards. A panic in
 //! an operation is resumed in the task that awaits it. Dropping the runtime waits for the
 //! operations that started, so `server.lock` is released only after them (as for any blocking
-//! work of the runtime).
+//! work of the runtime). The server's runtime has as many blocking threads as these pools and
+//! the snapshot relay may use at once ([`IoThreads::runtime_builder`]), so its threads are
+//! fixed.
 
 use std::panic;
 use std::sync::Arc;
@@ -25,6 +27,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// takes far longer than any other file operation (about 0.1–0.3 s per segment, mostly CPU),
 /// so it has a small pool of its own, which never keeps the other operations waiting.
 const COMPRESSION_THREADS: usize = 2;
+
+/// Blocking operations at once of the snapshot relay, which runs its own I/O outside these
+/// pools.
+pub(crate) const RELAY_THREADS: usize = 16;
 
 /// A pool that runs at most a fixed number of blocking operations at once, on Tokio's blocking
 /// threads.
@@ -42,7 +48,6 @@ impl IoPool {
 
     /// Runs `work` on a blocking thread once the pool has room for it, and waits for its result
     /// without blocking the caller's thread. A panic in `work` is resumed here.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn run<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> T + Send + 'static,
@@ -83,8 +88,10 @@ pub(crate) async fn run_holding<T: Send + 'static>(
     }
 }
 
-/// The pools that run the file I/O of the rooms: one that runs at most `io_threads` operations
-/// at once, and the one that compresses warm segments.
+/// The pools that run the file I/O of a server: one that runs at most `io_threads` operations
+/// at once for the rooms, the room manager and the schema registry, and the one that
+/// compresses warm segments. The snapshot relay runs its I/O on Tokio's blocking threads too,
+/// outside these pools.
 #[derive(Debug)]
 pub struct IoThreads {
     io: IoPool,
@@ -100,7 +107,26 @@ impl IoThreads {
         })
     }
 
-    /// The pool of the file operations of the rooms.
+    /// The blocking threads of a server whose rooms run at most `io_threads` file operations
+    /// at once: those of its pools and of the snapshot relay. A runtime with exactly these
+    /// starts no other, so the threads of the process stay fixed, and an operation that holds
+    /// its permit waits for a thread at most until the one that ran the previous operation
+    /// comes free.
+    pub fn blocking_threads(io_threads: usize) -> usize {
+        io_threads + COMPRESSION_THREADS + RELAY_THREADS
+    }
+
+    /// The runtime of a server whose rooms run at most `io_threads` file operations at once,
+    /// with [`blocking_threads`](Self::blocking_threads) blocking threads.
+    pub fn runtime_builder(io_threads: usize) -> tokio::runtime::Builder {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder
+            .enable_all()
+            .max_blocking_threads(Self::blocking_threads(io_threads));
+        builder
+    }
+
+    /// The pool of the file operations of the rooms, the room manager and the schema registry.
     pub(crate) fn io(&self) -> &IoPool {
         &self.io
     }

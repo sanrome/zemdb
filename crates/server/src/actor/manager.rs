@@ -16,12 +16,11 @@ use zemdb_core::schema::Schema;
 
 use crate::actor::command::RoomCommand;
 use crate::actor::room::{room_dir, ActorExit, ActorTimings, RoomActor};
-use crate::blocking::blocking_io;
 use crate::config::ServerConfig;
 use crate::durable;
 use crate::error::ServerError;
 use crate::fail_point;
-use crate::io_pool::IoThreads;
+use crate::io_pool::{IoPool, IoThreads};
 use crate::log::{RoomLifecycleOverrides, RoomLifecyclePolicy};
 use crate::relay::{LogBounds, SnapshotRelay};
 use crate::response_budget::InflightBudget;
@@ -79,7 +78,8 @@ impl RoomSlot {
     }
 
     /// Waits until the actor task has finished and returns how the actor ended. `None` if the
-    /// task vanished without reporting (it was cancelled), which also released the files.
+    /// task vanished without reporting: it was cancelled, which only happens when the runtime
+    /// shuts down, and its files are released once a file operation it left running ends.
     async fn finished(&self) -> Option<ActorExit> {
         let mut exit = self.exit.clone();
         exit.wait_for(Option::is_some)
@@ -103,14 +103,19 @@ impl RoomSlot {
     }
 }
 
-/// Exclusive right to spawn, create or delete one room.
-struct SpawnGuard<'a> {
-    locks: &'a DashMap<RoomId, Arc<Mutex<()>>>,
+/// The spawn locks of the rooms, by room.
+type SpawnLocks = Arc<DashMap<RoomId, Arc<Mutex<()>>>>;
+
+/// Exclusive right to spawn, create or delete one room. A file operation under it carries it
+/// to the file I/O threads ([`RoomManager::io_locked`]), so that it outlives a caller dropped
+/// while the operation runs.
+struct SpawnGuard {
+    locks: SpawnLocks,
     room_id: RoomId,
     guard: OwnedMutexGuard<()>,
 }
 
-impl Drop for SpawnGuard<'_> {
+impl Drop for SpawnGuard {
     /// Forgets the room's lock unless another task holds a reference to it, while the lock is
     /// still held (`guard` is dropped after this). The map and this guard account for two
     /// references; any other belongs to a task that cloned the lock and waits for it, so the
@@ -119,13 +124,13 @@ impl Drop for SpawnGuard<'_> {
     /// check, or creates a new mutex after the removal, when this critical section is over.
     fn drop(&mut self) {
         let lock = OwnedMutexGuard::mutex(&self.guard);
-        forget_lock_if_unused(self.locks, &self.room_id, lock);
+        forget_lock_if_unused(&self.locks, &self.room_id, lock);
     }
 }
 
 /// A caller waiting for a room's spawn lock.
 struct SpawnLockWait<'a> {
-    locks: &'a DashMap<RoomId, Arc<Mutex<()>>>,
+    locks: &'a SpawnLocks,
     room_id: RoomId,
     lock: Arc<Mutex<()>>,
     acquiring: Option<Pin<Box<dyn Future<Output = OwnedMutexGuard<()>> + Send>>>,
@@ -165,7 +170,7 @@ pub struct RoomManager {
     /// entry is added before the actor reads its schema, so schema reloads never miss it,
     /// and removed when the actor ends or fails to spawn.
     room_meta: Arc<DashMap<RoomId, RoomMetadata>>,
-    spawn_locks: DashMap<RoomId, Arc<Mutex<()>>>,
+    spawn_locks: SpawnLocks,
     next_actor_id: AtomicU64,
     config: Arc<ServerConfig>,
     schema_registry: Arc<SchemaRegistry>,
@@ -177,7 +182,7 @@ pub struct RoomManager {
     default_policy: RoomLifecyclePolicy,
     /// Timings of the room actors; always [`ActorTimings::default`] outside tests.
     timings: ActorTimings,
-    /// The threads that run the file I/O of the rooms.
+    /// The threads that run the file I/O of the rooms and of the manager.
     io: Arc<IoThreads>,
 }
 
@@ -207,7 +212,7 @@ impl RoomManager {
             )),
             rooms: Arc::new(DashMap::new()),
             room_meta: Arc::new(DashMap::new()),
-            spawn_locks: DashMap::new(),
+            spawn_locks: Arc::new(DashMap::new()),
             next_actor_id: AtomicU64::new(0),
             config,
             schema_registry,
@@ -217,6 +222,27 @@ impl RoomManager {
             timings: ActorTimings::default(),
             io,
         }
+    }
+
+    /// The pool of file I/O threads of the rooms, of the manager and of the schema registry.
+    pub(crate) fn io_pool(&self) -> &IoPool {
+        self.io.io()
+    }
+
+    /// Runs `work` on the file I/O threads holding the room's spawn lock, `guard`, until
+    /// `work` ends, even if the caller is dropped meanwhile: the lock never comes free while
+    /// an operation it serializes runs, and what `work` returned is dropped before it.
+    async fn io_locked<T: Send + 'static>(
+        &self,
+        guard: &mut Option<SpawnGuard>,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let held = guard
+            .take()
+            .expect("the spawn lock is back after every file operation");
+        let (out, held) = self.io_pool().run(move || (work(), held)).await;
+        *guard = Some(held);
+        out
     }
 
     /// The budget of response bytes in flight that the room actors reserve from.
@@ -281,7 +307,7 @@ impl RoomManager {
             return Ok(slot);
         }
 
-        let _guard = self.lock_room(room_id).await;
+        let mut guard = Some(self.lock_room(room_id).await);
 
         // Another task may have spawned the room while this one waited for the lock.
         if let Some(slot) = self.live_slot(room_id) {
@@ -295,18 +321,10 @@ impl RoomManager {
         // leaves the next one still waiting for the same actor.
         self.wait_for_previous_actor(room_id).await;
 
-        // Resolving the metadata and spawning the actor read and write the room's files.
-        let slot = blocking_io(|| {
-            let meta = self.resolve_metadata(room_id, schema_id)?;
-            let schema = self
-                .schema_registry
-                .get_schema(&meta.schema_id)
-                .ok_or_else(|| ServerError::SchemaNotFound(meta.schema_id.to_string()))?;
-            self.spawn_actor(room_id, &meta, schema)
-        })
-        .inspect_err(|_| {
-            self.room_meta.remove(room_id);
-        })?;
+        let meta = self
+            .resolve_metadata(room_id, schema_id, &mut guard)
+            .await?;
+        let slot = self.spawn_actor(room_id, &meta, None, &mut guard).await?;
         info!(room = %room_id, "RoomActor lazily initialized and registered in RoomManager");
         Ok(slot)
     }
@@ -320,7 +338,7 @@ impl RoomManager {
     }
 
     /// Takes the spawn lock of `room_id`.
-    async fn lock_room(&self, room_id: &RoomId) -> SpawnGuard<'_> {
+    async fn lock_room(&self, room_id: &RoomId) -> SpawnGuard {
         let lock = self.spawn_locks.entry(room_id.clone()).or_default().clone();
         let mut wait = SpawnLockWait {
             locks: &self.spawn_locks,
@@ -334,7 +352,7 @@ impl RoomManager {
             .expect("the acquisition is set above")
             .await;
         SpawnGuard {
-            locks: &self.spawn_locks,
+            locks: Arc::clone(&self.spawn_locks),
             room_id: room_id.clone(),
             guard,
         }
@@ -351,13 +369,15 @@ impl RoomManager {
     }
 
     /// The metadata of `room_id`: cached, read from `meta_room.json`, or, when `schema_id`
-    /// is given, written with that schema and the room's current lifecycle overrides.
-    fn resolve_metadata(
+    /// is given, written with that schema and the room's current lifecycle overrides. The
+    /// caller holds the room's spawn lock, `guard`.
+    async fn resolve_metadata(
         &self,
         room_id: &RoomId,
         schema_id: Option<&SchemaId>,
+        guard: &mut Option<SpawnGuard>,
     ) -> Result<RoomMetadata, ServerError> {
-        let known = self.stored_metadata(room_id)?;
+        let known = self.stored_metadata(room_id, guard).await?;
         let meta = match (schema_id, known) {
             (Some(schema_id), known) => {
                 if let Some(known) = &known {
@@ -373,7 +393,9 @@ impl RoomManager {
                     room_incarnation,
                     lifecycle,
                 };
-                write_room_metadata(&room_dir(&self.data_dir, room_id), &meta)?;
+                let (dir, written) = (room_dir(&self.data_dir, room_id), meta.clone());
+                self.io_locked(guard, move || write_room_metadata(&dir, &written))
+                    .await?;
                 meta
             }
             (None, Some(meta)) => meta,
@@ -384,7 +406,6 @@ impl RoomManager {
                 )))
             }
         };
-        self.room_meta.insert(room_id.clone(), meta.clone());
         Ok(meta)
     }
 
@@ -425,42 +446,79 @@ impl RoomManager {
         )))
     }
 
-    /// The metadata of `room_id`, cached or read from its `meta_room.json`, if it has any.
-    fn stored_metadata(&self, room_id: &RoomId) -> Result<Option<RoomMetadata>, ServerError> {
+    /// The metadata of `room_id`, cached or read from its `meta_room.json`, if it has any. The
+    /// caller holds the room's spawn lock, `guard`.
+    async fn stored_metadata(
+        &self,
+        room_id: &RoomId,
+        guard: &mut Option<SpawnGuard>,
+    ) -> Result<Option<RoomMetadata>, ServerError> {
         if let Some(meta) = self.room_meta.get(room_id) {
             return Ok(Some(meta.clone()));
         }
         let path = room_dir(&self.data_dir, room_id).join(META_ROOM_FILE);
-        durable::exists(&path)?
-            .then(|| read_room_metadata(&path))
-            .transpose()
+        self.io_locked(guard, move || {
+            durable::exists(&path)?
+                .then(|| read_room_metadata(&path))
+                .transpose()
+        })
+        .await
     }
 
     /// Opens the room with its effective lifecycle policy (the server defaults overlaid with
-    /// its overrides) and starts its actor task. The task reports how the actor ended once
-    /// the actor has released the room's files, and then forgets the slot (unless a newer
-    /// actor replaced it), so a room that stopped and receives no more requests leaves nothing
-    /// behind. A request arriving before that still finds the closed slot and waits.
-    fn spawn_actor(
+    /// its overrides), on the file I/O threads under the room's spawn lock, `guard`, and starts
+    /// its actor task. The task reports how the actor ended once the actor has released the
+    /// room's files, and then forgets the slot (unless a newer actor replaced it), so a room
+    /// that stopped and receives no more requests leaves nothing behind. A request arriving
+    /// before that still finds the closed slot and waits.
+    ///
+    /// The room is listed for schema reloads (`room_meta`) before its schema is read from the
+    /// registry, falling back to `schema`: an evolution whose reload did not list the room
+    /// happened before that read. A spawn that fails, or whose caller is dropped, unlists it.
+    async fn spawn_actor(
         &self,
         room_id: &RoomId,
         meta: &RoomMetadata,
-        schema: Arc<Schema>,
+        schema: Option<Arc<Schema>>,
+        guard: &mut Option<SpawnGuard>,
     ) -> Result<RoomSlot, ServerError> {
-        let policy = self.default_policy.with_overrides(&meta.lifecycle);
-        let (sender, actor) = RoomActor::open(
-            room_id.clone(),
-            meta.room_incarnation,
-            meta.schema_id.clone(),
-            schema,
-            &self.data_dir,
-            Arc::clone(&self.config),
-            policy,
-            Arc::clone(&self.snapshot_relay),
-            Arc::clone(&self.response_budget),
-            self.timings,
-            Arc::clone(&self.io),
-        )?;
+        self.room_meta.insert(room_id.clone(), meta.clone());
+        let mut listed = Listed {
+            room_meta: &self.room_meta,
+            room_id,
+            started: false,
+        };
+        let schema = self
+            .schema_registry
+            .get_schema(&meta.schema_id)
+            .or(schema)
+            .ok_or_else(|| ServerError::SchemaNotFound(meta.schema_id.to_string()))?;
+        let open = {
+            let (room_id, meta) = (room_id.clone(), meta.clone());
+            let policy = self.default_policy.with_overrides(&meta.lifecycle);
+            let data_dir = self.data_dir.clone();
+            let config = Arc::clone(&self.config);
+            let relay = Arc::clone(&self.snapshot_relay);
+            let budget = Arc::clone(&self.response_budget);
+            let (timings, io) = (self.timings, Arc::clone(&self.io));
+            move || {
+                RoomActor::open(
+                    room_id,
+                    meta.room_incarnation,
+                    meta.schema_id,
+                    schema,
+                    &data_dir,
+                    config,
+                    policy,
+                    relay,
+                    budget,
+                    timings,
+                    io,
+                )
+            }
+        };
+        let (sender, actor) = self.io_locked(guard, open).await?;
+        listed.started = true;
         let actor_id = self.next_actor_id.fetch_add(1, Ordering::Relaxed);
         let (exit_tx, exit_rx) = watch::channel(None);
         let slot = RoomSlot {
@@ -487,18 +545,20 @@ impl RoomManager {
     }
 
     /// Fast check if a room exists in memory or on disk.
-    pub fn room_exists(&self, room_id: &RoomId) -> Result<bool, ServerError> {
-        Ok(self.rooms.contains_key(room_id)
-            || blocking_io(|| {
-                durable::exists(&room_dir(&self.data_dir, room_id).join(META_ROOM_FILE))
-            })?)
+    pub async fn room_exists(&self, room_id: &RoomId) -> Result<bool, ServerError> {
+        if self.rooms.contains_key(room_id) {
+            return Ok(true);
+        }
+        let path = room_dir(&self.data_dir, room_id).join(META_ROOM_FILE);
+        Ok(self.io_pool().run(move || durable::exists(&path)).await?)
     }
 
     /// The metadata of a room, cached or read from its `meta_room.json`, under the spawn lock
     /// that every writer of that file holds.
     pub async fn room_metadata(&self, room_id: &RoomId) -> Result<RoomMetadata, ServerError> {
-        let _guard = self.lock_room(room_id).await;
-        blocking_io(|| self.stored_metadata(room_id))?
+        let mut guard = Some(self.lock_room(room_id).await);
+        self.stored_metadata(room_id, &mut guard)
+            .await?
             .ok_or_else(|| ServerError::RoomNotFound(room_id.to_string()))
     }
 
@@ -559,12 +619,16 @@ impl RoomManager {
         let lifecycle = lifecycle.unwrap_or_default();
         lifecycle.validate()?;
 
-        let _guard = self.lock_room(&room_id).await;
+        let mut guard = Some(self.lock_room(&room_id).await);
 
         let room_dir = room_dir(&self.data_dir, &room_id);
         let meta_room_path = room_dir.join(META_ROOM_FILE);
 
-        if self.rooms.contains_key(&room_id) || blocking_io(|| durable::exists(&meta_room_path))? {
+        if self.rooms.contains_key(&room_id)
+            || self
+                .io_locked(&mut guard, move || durable::exists(&meta_room_path))
+                .await?
+        {
             return Err(ServerError::RoomAlreadyExists(room_id.to_string()));
         }
 
@@ -582,18 +646,11 @@ impl RoomManager {
             room_incarnation: new_incarnation(),
             lifecycle,
         };
-        blocking_io(|| write_room_metadata(&room_dir, &meta))?;
-        self.room_meta.insert(room_id.clone(), meta.clone());
-
-        // Read the schema again now that the room is listed for schema reloads: an evolution
-        // whose reload did not list it happened before this read.
-        let schema = self
-            .schema_registry
-            .get_schema(&meta.schema_id)
-            .unwrap_or(schema);
-        blocking_io(|| self.spawn_actor(&room_id, &meta, schema)).inspect_err(|_| {
-            self.room_meta.remove(&room_id);
-        })?;
+        let written = meta.clone();
+        self.io_locked(&mut guard, move || write_room_metadata(&room_dir, &written))
+            .await?;
+        self.spawn_actor(&room_id, &meta, Some(schema), &mut guard)
+            .await?;
         Ok(meta)
     }
 
@@ -607,7 +664,7 @@ impl RoomManager {
     /// room's snapshot in the relay, which no room offers and [`create_room`](Self::create_room)
     /// purges.
     pub async fn delete_room(&self, room_id: &RoomId) -> Result<(), ServerError> {
-        let _guard = self.lock_room(room_id).await;
+        let mut guard = Some(self.lock_room(room_id).await);
 
         self.shutdown_room(room_id).await;
         self.room_meta.remove(room_id);
@@ -617,11 +674,14 @@ impl RoomManager {
         // the rename, which on Windows fails on a directory holding a locked file; meanwhile
         // the room lock keeps this process from reopening the log, and `server.lock` keeps
         // others off.
-        let moved = blocking_io(|| {
-            drop(crate::log::tiered_log::lock_log(&room_dir)?);
-            fs::rename(&room_dir, &deleted)?;
-            Ok::<_, ServerError>(durable::sync_parent(&room_dir)?)
-        });
+        let (from, to) = (room_dir.clone(), deleted.clone());
+        let moved = self
+            .io_locked(&mut guard, move || {
+                drop(crate::log::tiered_log::lock_log(&from)?);
+                fs::rename(&from, &to)?;
+                Ok::<_, ServerError>(durable::sync_parent(&from)?)
+            })
+            .await;
         // No room directory: reported once the relay is purged.
         let missing =
             matches!(&moved, Err(ServerError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound);
@@ -636,10 +696,12 @@ impl RoomManager {
         }
         // The room is gone. What a failure leaves is removed at the next start, or purged when
         // a room with this id is created again.
-        let removed = blocking_io(|| {
-            fail_point::check("room_removal", &room_dir)?;
-            Ok::<_, ServerError>(fs::remove_dir_all(&deleted)?)
-        });
+        let removed = self
+            .io_locked(&mut guard, move || {
+                fail_point::check("room_removal", &room_dir)?;
+                Ok::<_, ServerError>(fs::remove_dir_all(&deleted)?)
+            })
+            .await;
         for err in [purged.err(), removed.err()].into_iter().flatten() {
             warn!(room = %room_id, error = %err, "Failed to remove what a deleted room left");
         }
@@ -769,6 +831,22 @@ impl RoomManager {
             reloaded.push(room_id);
         }
         reloaded
+    }
+}
+
+/// A room listed in `room_meta` while its actor is spawned: unlisted when dropped, unless its
+/// actor started, which unlists it when it ends.
+struct Listed<'a> {
+    room_meta: &'a DashMap<RoomId, RoomMetadata>,
+    room_id: &'a RoomId,
+    started: bool,
+}
+
+impl Drop for Listed<'_> {
+    fn drop(&mut self) {
+        if !self.started {
+            self.room_meta.remove(self.room_id);
+        }
     }
 }
 

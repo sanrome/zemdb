@@ -1,0 +1,11 @@
+# started on Mon Nov  2 16:17:43 2026
+
+
+ Performance counter stats for process id '23090':
+
+          17200.72 msec task-clock                       #    1.720 CPUs utilized             
+             54938      context-switches                 #    3.194 K/sec                     
+              1756      cpu-migrations                   #  102.089 /sec                      
+
+      10.002803224 seconds time elapsed
+

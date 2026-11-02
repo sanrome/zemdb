@@ -67,9 +67,12 @@ pub async fn create_schema(
     State(state): State<AppState>,
     AdminJson(req): AdminJson<CreateSchemaRequest>,
 ) -> Result<(StatusCode, Json<Schema>), ServerError> {
+    let registry = Arc::clone(&state.schema_registry);
     let schema_arc = state
-        .schema_registry
-        .register_schema(req.schema_id, req.schema)?;
+        .room_manager
+        .io_pool()
+        .run(move || registry.register_schema(req.schema_id, req.schema))
+        .await?;
     Ok((StatusCode::CREATED, Json((*schema_arc).clone())))
 }
 
@@ -89,30 +92,43 @@ pub async fn get_schema(
 /// `POST /admin/schemas/:schema_id/columns`: appends a nullable column to a schema and reloads
 /// it in every running room that uses it.
 ///
-/// The reload runs in its own task: once the column is durable, every running room must get
-/// the new schema even if this request is dropped while the rooms are being reloaded. The
-/// handler still waits for it before answering.
+/// The write of the column and the reload run in their own task: once the column is durable,
+/// every running room must get the new schema even if this request is dropped while the column
+/// is written or the rooms are reloaded. The handler still waits for it before answering.
 pub async fn add_column(
     _auth: AdminAuth,
     State(state): State<AppState>,
     AdminPath(sid): AdminPath<SchemaId>,
     AdminJson(req): AdminJson<AddColumnRequest>,
 ) -> Result<Json<Schema>, ServerError> {
-    let updated = state.schema_registry.add_column_with_constraints(
-        &sid,
-        &req.table_name,
-        req.column,
-        req.unique,
-        req.foreign_keys,
-    )?;
-
+    let registry = Arc::clone(&state.schema_registry);
     let room_manager = Arc::clone(&state.room_manager);
-    let reload = tokio::spawn(async move { room_manager.reload_schema_for_rooms(&sid).await });
-    // The column is durable, so the answer is a success either way; a reload task that failed
-    // only leaves its rooms to read the new schema from the registry when they respawn.
-    if let Err(err) = reload.await {
-        tracing::warn!(error = %err, "Schema reload task failed after a column was added");
-    }
+    let evolution = tokio::spawn(async move {
+        let column_sid = sid.clone();
+        let updated = room_manager
+            .io_pool()
+            .run(move || {
+                registry.add_column_with_constraints(
+                    &column_sid,
+                    &req.table_name,
+                    req.column,
+                    req.unique,
+                    req.foreign_keys,
+                )
+            })
+            .await?;
+        let reload = tokio::spawn(async move { room_manager.reload_schema_for_rooms(&sid).await });
+        // The column is durable, so the answer is a success either way; a reload task that
+        // failed only leaves its rooms to read the new schema from the registry when they
+        // respawn.
+        if let Err(err) = reload.await {
+            tracing::warn!(error = %err, "Schema reload task failed after a column was added");
+        }
+        Ok::<_, ServerError>(updated)
+    });
+    let updated = evolution
+        .await
+        .map_err(|err| ServerError::Internal(format!("Schema evolution task failed: {err}")))??;
 
     Ok(Json((*updated).clone()))
 }
@@ -137,7 +153,7 @@ pub async fn get_room(
     State(state): State<AppState>,
     AdminPath(rid): AdminPath<RoomId>,
 ) -> Result<Json<RoomDetails>, ServerError> {
-    if !state.room_manager.room_exists(&rid)? {
+    if !state.room_manager.room_exists(&rid).await? {
         return Err(ServerError::RoomNotFound(rid.to_string()));
     }
     let metrics = state

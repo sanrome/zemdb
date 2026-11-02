@@ -1,6 +1,5 @@
 pub mod actor;
 pub mod api;
-mod blocking;
 pub mod config;
 mod dedup;
 mod durable;

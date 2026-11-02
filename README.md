@@ -89,6 +89,8 @@ The HTTP edge limits apply to every connection (see [`ARCHITECTURE.md` §7.3](AR
 
 Request bodies are limited to 16 MiB, and registration (`/register`, unauthenticated) to 64 KiB; a larger body is answered with HTTP 413.
 
+The rooms' file I/O (every commit ends in an `fsync`) runs off the async workers, at most `ZEMDB_IO_THREADS` operations at once (default 16, accepted 1 – 512); the rest wait their turn, so the server's threads do not grow with the rooms (see [`ARCHITECTURE.md` §5.2](ARCHITECTURE.md#52-four-tier-storage-architecture--mutation-lifecycle), *Blocking I/O in the Actor*).
+
 Each connection takes a file descriptor. Raise the open files limit of the server process above `ZEMDB_MAX_CONNECTIONS` (it is often 1,024 by default on Linux), for example with `ulimit -n 65536` or `LimitNOFILE=65536` in a systemd unit.
 
 ### Building and Testing

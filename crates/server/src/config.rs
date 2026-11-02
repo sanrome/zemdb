@@ -128,9 +128,10 @@ pub struct ServerConfig {
     /// client keeps at most 2 per room: opening a third closes its oldest.
     pub max_sse_streams: Option<usize>,
 
-    /// File operations of the rooms that run at once, each on a blocking thread of the runtime
-    /// (default 16, at most its 512). They do not grow with the rooms: an operation waits, in
-    /// the order it came, until one of them ends.
+    /// File operations of the rooms, of opening, creating and deleting them, and of the schema
+    /// registry that run at once, each on a blocking thread of the runtime (default 16, at most
+    /// its 512). They do not grow with the rooms: an operation waits, in the order it came,
+    /// until one of them ends.
     pub io_threads: usize,
 }
 

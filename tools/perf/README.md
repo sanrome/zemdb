@@ -51,7 +51,7 @@ Se aplican sobre una copia local, se compila el servidor, se mide, y se descarta
 
 | | Qué hace | Cómo se activa |
 |---|---|---|
-| `diagnostics/inline-io.patch` | Corre la E/S de los actores en el mismo hilo, sin `block_in_place` (§3.7.4 de las evaluaciones) | `ZEMDB_PERF_INLINE_IO=1` al correr los scripts |
+| `diagnostics/inline-io.patch` | Corre la E/S de los actores en el mismo hilo, el worker (§3.7.4 de las evaluaciones): hasta el Lote 2 de la Fase 3.12, sin `block_in_place`; desde el Lote 3, sin el pool de E/S | `ZEMDB_PERF_INLINE_IO=1` al correr los scripts |
 | `diagnostics/sse-ops.patch` | El prototipo del evento `ops`: el SSE trae la operación de cada commit (§4.8) | `ZEMDB_PERF_SSE_OPS=1`, y el modo `rooms` lee los eventos `ops` |
 | (sin parche) | El presupuesto de respuestas agrandado | `ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES=4294967296` |
 

@@ -99,6 +99,107 @@ async fn concurrent_column_additions_leave_every_room_with_the_latest_schema() {
     }
 }
 
+/// A column addition whose request is dropped while the column is written, on the file I/O
+/// threads, still reloads the running rooms once the column is durable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_column_addition_dropped_while_it_is_written_still_reloads_the_rooms() {
+    let dir = tempdir().unwrap();
+    let state = TestState::new(dir.path(), |config| {
+        config.admin_secret = ADMIN_SECRET.to_string();
+    });
+    let (registry, manager) = (&state.registry, &state.manager);
+    let schema_id = SchemaId::new("todo").unwrap();
+    registry
+        .register_schema(
+            schema_id.clone(),
+            Schema::builder()
+                .table(TableSchema::builder("tasks").primary_key("id", DataType::Int))
+                .build(),
+        )
+        .unwrap();
+    let room_id = RoomId::new("room-a").unwrap();
+    manager
+        .create_room(room_id.clone(), schema_id.clone(), None)
+        .await
+        .unwrap();
+    // The actor is running, so the reload reaches it.
+    room_schema(manager, &room_id).await;
+
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    fail_point::arm_hook(
+        "schema_add_column_after_read",
+        &registry.schema_path(&schema_id),
+        move || {
+            reached_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        },
+    );
+    let app = build_router(state.app_state());
+    tokio::select! {
+        status = add_column_request(app, "priority") => {
+            panic!("the addition ended with its write stopped: {status}")
+        }
+        reached = reached_rx => reached.unwrap(),
+    }
+    release_tx.send(()).unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let schema = room_schema(manager, &room_id).await;
+        if schema
+            .get_table_by_name("tasks")
+            .unwrap()
+            .get_column("priority")
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the room never got the column of the dropped addition"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// On a runtime of a single thread, the schema registry writes its files elsewhere: a schema
+/// created and a column added through the control plane.
+#[tokio::test]
+async fn the_schema_registry_writes_off_the_runtime_thread() {
+    let dir = tempdir().unwrap();
+    let state = TestState::new(dir.path(), |config| {
+        config.admin_secret = ADMIN_SECRET.to_string();
+    });
+    let schemas = state
+        .registry
+        .schema_path(&SchemaId::new("todo").unwrap())
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fail_point::watch_threads(&schemas);
+    let app = build_router(state.app_state());
+    let schema = Schema::builder()
+        .table(TableSchema::builder("tasks").primary_key("id", DataType::Int))
+        .build();
+    let body = serde_json::json!({"schema_id": "todo", "schema": schema});
+    let request = Request::post("/admin/schemas")
+        .header(header::AUTHORIZATION, format!("Bearer {ADMIN_SECRET}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let created = app.clone().oneshot(request).await.unwrap().status();
+    assert_eq!(created, StatusCode::CREATED);
+    assert_eq!(add_column_request(app, "priority").await, StatusCode::OK);
+
+    let threads = fail_point::watched_threads(&schemas);
+    assert!(!threads.is_empty());
+    assert!(
+        !threads.contains(&std::thread::current().id()),
+        "a write of the schema registry ran on the runtime's thread"
+    );
+}
+
 /// Has the relay confirm a snapshot of room `doomed` at sequence 1.
 async fn stage_doomed_snapshot(state: &TestState) {
     use crate::relay::LogBounds;
@@ -191,7 +292,7 @@ async fn room_deletion_and_creation_finish_when_the_request_is_dropped() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(rooms_left(), 0);
-    assert!(!state.manager.room_exists(&room_id).unwrap());
+    assert!(!state.manager.room_exists(&room_id).await.unwrap());
 
     // A creation dropped while the relay purges the room. Its purge waits up to 2 s, so that
     // a retry that waits for it is not blocked for good.
@@ -347,7 +448,10 @@ fn disconnected_deletion_over_tcp(shutdown: bool) {
         .unwrap();
     restarted.block_on(async {
         let state = TestState::new(dir.path(), |_| {});
-        assert!(!state.manager.room_exists(&room_id).unwrap(), "{shutdown}");
+        assert!(
+            !state.manager.room_exists(&room_id).await.unwrap(),
+            "{shutdown}"
+        );
         let rooms = std::fs::read_dir(dir.path().join("rooms")).unwrap().count();
         assert_eq!(rooms, 0, "{shutdown}");
         assert_eq!(

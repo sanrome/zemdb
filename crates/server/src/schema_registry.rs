@@ -5,7 +5,6 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use zemdb_core::schema::{ColumnDef, ForeignKey, Schema, UniqueConstraint};
 use zemdb_core::SchemaId;
 
-use crate::blocking::blocking_io;
 use crate::durable;
 use crate::error::ServerError;
 use crate::fail_point;
@@ -110,6 +109,9 @@ impl SchemaRegistry {
     /// write lock, and nothing is written. Replacing a schema could renumber its tables or
     /// drop and retype columns under rows already in the rooms' logs; schemas evolve only
     /// through [`SchemaRegistry::add_column`].
+    ///
+    /// Blocks: it writes the schema's file, and waits for another writer. The server runs it
+    /// on its file I/O threads.
     pub fn register_schema(
         &self,
         id: SchemaId,
@@ -122,14 +124,11 @@ impl SchemaRegistry {
                 schema.version()
             )));
         }
-        // Waiting for another writer is blocking too, so it happens inside `blocking_io`.
-        blocking_io(|| {
-            let _write = self.lock_writes();
-            if self.schemas.contains_key(&id) {
-                return Err(ServerError::SchemaAlreadyExists(id.to_string()));
-            }
-            self.persist(id, schema)
-        })
+        let _write = self.lock_writes();
+        if self.schemas.contains_key(&id) {
+            return Err(ServerError::SchemaAlreadyExists(id.to_string()));
+        }
+        self.persist(id, schema)
     }
 
     /// Writes `schema` to disk and publishes it. The caller holds the write lock.
@@ -164,6 +163,9 @@ impl SchemaRegistry {
 
     /// Adds a nullable column to an existing table, like [`SchemaRegistry::add_column`],
     /// together with `UNIQUE` constraints and foreign keys that include it.
+    ///
+    /// Blocks: it writes the schema's file, and waits for another writer. The server runs it
+    /// on its file I/O threads.
     pub fn add_column_with_constraints(
         &self,
         id: &SchemaId,
@@ -172,22 +174,20 @@ impl SchemaRegistry {
         unique: Vec<UniqueConstraint>,
         foreign_keys: Vec<ForeignKey>,
     ) -> Result<Arc<Schema>, ServerError> {
-        blocking_io(|| {
-            let _write = self.lock_writes();
-            let existing = self
-                .get_schema(id)
-                .ok_or_else(|| ServerError::SchemaNotFound(id.to_string()))?;
+        let _write = self.lock_writes();
+        let existing = self
+            .get_schema(id)
+            .ok_or_else(|| ServerError::SchemaNotFound(id.to_string()))?;
 
-            let mut evolved_schema = (*existing).clone();
-            fail_point::hook("schema_add_column_after_read", &self.schema_path(id));
-            // Rejects an unknown table, a duplicate column name, a non-nullable column and a
-            // constraint that is invalid or does not include the new column, changing nothing.
-            evolved_schema
-                .add_column_with_constraints(table_name, column, unique, foreign_keys)
-                .map_err(|e| ServerError::BadRequest(e.to_string()))?;
+        let mut evolved_schema = (*existing).clone();
+        fail_point::hook("schema_add_column_after_read", &self.schema_path(id));
+        // Rejects an unknown table, a duplicate column name, a non-nullable column and a
+        // constraint that is invalid or does not include the new column, changing nothing.
+        evolved_schema
+            .add_column_with_constraints(table_name, column, unique, foreign_keys)
+            .map_err(|e| ServerError::BadRequest(e.to_string()))?;
 
-            self.persist(id.clone(), evolved_schema)
-        })
+        self.persist(id.clone(), evolved_schema)
     }
 
     /// Lists all registered SchemaIds.

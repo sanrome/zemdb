@@ -129,8 +129,8 @@ impl RoomActor {
     /// `timings`. `incarnation` tells this room apart from earlier rooms created with its id,
     /// and `lifecycle_policy` is its effective policy.
     ///
-    /// Reads the room's files: async callers run it off the workers. `io` runs the actor's own
-    /// file I/O.
+    /// Reads the room's files: async callers run it on the file I/O threads, `io`, which run
+    /// the actor's file I/O as well.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open(
         room_id: RoomId,
@@ -146,6 +146,7 @@ impl RoomActor {
         io: Arc<IoThreads>,
     ) -> Result<(mpsc::Sender<RoomCommand>, Self), ServerError> {
         let room_dir = room_dir(data_dir.as_ref(), &room_id);
+        crate::fail_point::hook("room_open", &room_dir);
         durable::create_dir_all_synced(&room_dir)?;
 
         let clients_path = room_dir.join(format!("meta_clients_{}.json", room_id.as_str()));
@@ -200,7 +201,6 @@ impl RoomActor {
         // A snapshot that was already usable before this actor started is not news.
         actor.announced_snapshot = actor.usable_snapshot_seq();
         actor.restore_snapshot_demand();
-        actor.publish_snapshot_floor();
 
         info!(room = %room_id, head_seq = %head_seq, "Opened RoomActor");
 
@@ -215,6 +215,9 @@ impl RoomActor {
     /// the panic occurred loses its reply; `RoomManager` answers it with `Internal`, since
     /// retrying it could panic again. Dropping the actor afterwards releases the room's files.
     pub async fn run(mut self) -> ActorExit {
+        // Published once the actor runs, so that an actor opened for a spawn that was dropped
+        // leaves none: the task that runs the actor clears it when the actor ends.
+        self.publish_snapshot_floor();
         let outcome = AssertUnwindSafe(self.run_loop()).catch_unwind().await;
         match outcome {
             Ok(()) => ActorExit::Stopped,

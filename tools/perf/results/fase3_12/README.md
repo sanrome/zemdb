@@ -19,3 +19,17 @@ La base es `0b03a77`; el resultado, el código del lote. "Resultado 1" es el lot
 - `ab-e2-tmpfs-r1000.jsonl`, `ab-e1-tmpfs-*.jsonl`: corridas intercaladas del diagnóstico con 4 GiB contra el resultado 1 (E2 con 1.000 salas) y de la base contra el resultado 1 (E1 con 1 y 8), que mostraron que la diferencia de la primera medición era la máquina, que se volvió más lenta.
 - `ab2-e1-tmpfs-k8-*.jsonl`: E1-tmpfs con 8 pedidos en vuelo, intercalado, base contra resultado final.
 - `probe-catchup-k8-*.jsonl`: E1-tmpfs con 8 pedidos en vuelo y un generador instrumentado (una copia local, fuera del repo) que cuenta los catch-ups: `probe_acks`, `probe_catchup_ops` (las operaciones de todos los catch-ups), `probe_empty` y `probe_has_more`.
+
+## `lote3/`: la E/S fuera de los workers
+
+La base es `414cab3`; el resultado, el código del lote con `ZEMDB_IO_THREADS` = 8; el diagnóstico, `414cab3` con `inline-io.patch` (la E/S en el worker).
+
+- `first-*.jsonl`: la línea de base del paso 0, al arrancar el lote: tres rondas de la base y el diagnóstico (E1-tmpfs con 1 y 8 pedidos en vuelo; E2-tmpfs y E2-disco con 500 y 1.000 salas).
+- `sweep-io-threads.jsonl` y `sweep-io-threads-capped.jsonl`: el barrido de `ZEMDB_IO_THREADS` (1 a 16) en disco y en tmpfs, sin y con el tope de hilos bloqueantes del runtime, una corrida cada uno.
+- `variants.jsonl`: tres formas del pool, intercaladas, en tmpfs con 1.000 salas (`result`: `spawn_blocking` con semáforos, sin el tope de hilos; `maxblock`: con el tope; `dedicated`: hilos propios).
+- `final-*.jsonl`: la medición del lote, tres rondas intercaladas de la base, el resultado y el diagnóstico.
+- `final-e2-r750.jsonl`: 750 salas en tmpfs y en disco, tres rondas intercaladas de la base y el resultado, medidas después de la revisión.
+- `final-e1-disk-*.jsonl`: E1-disco con 1 y 8 pedidos en vuelo, tres rondas intercaladas de la base y el resultado con el valor de fábrica final (16).
+- `variant-gqi-*.jsonl`: E1-disco del resultado contra la misma variante con `global_queue_interval(4)` en el runtime, tres rondas intercaladas.
+- `sweep-io-threads-more.jsonl`: dos corridas más de 4 y 16 en disco con 500 y 1.000 salas, que con la primera dan tres de cada uno.
+- `profile-*.json`, `.stat` y `.txt`: el perfil en tmpfs con 1.000 salas (la corrida del generador; `perf stat`, con el CPU, los cambios de contexto y las migraciones; y el perfil plano por biblioteca y símbolo).

@@ -114,3 +114,31 @@ async fn a_long_compression_never_keeps_the_other_file_operations_waiting() {
     release_tx.send(()).unwrap();
     assert!(compressing.await.unwrap().is_ok());
 }
+
+/// The server's runtime starts no blocking thread beyond those its file I/O may use at once,
+/// however many blocking operations are waiting.
+#[test]
+fn the_server_runtime_has_a_fixed_number_of_blocking_threads() {
+    const IO_THREADS: usize = 2;
+    let runtime = IoThreads::runtime_builder(IO_THREADS).build().unwrap();
+    let threads = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    runtime.block_on(async {
+        let operations: Vec<_> = (0..60)
+            .map(|_| {
+                let threads = Arc::clone(&threads);
+                tokio::task::spawn_blocking(move || {
+                    threads.lock().unwrap().insert(std::thread::current().id());
+                    std::thread::sleep(Duration::from_millis(20));
+                })
+            })
+            .collect();
+        for operation in operations {
+            operation.await.unwrap();
+        }
+    });
+    let used = threads.lock().unwrap().len();
+    assert!(
+        used <= IoThreads::blocking_threads(IO_THREADS),
+        "{used} blocking threads"
+    );
+}

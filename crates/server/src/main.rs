@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_path = env::args().nth(1);
     let config = Arc::new(ServerConfig::load_with_env(config_path.as_deref())?);
     let _data_dir_lock = config.lock_data_dir()?;
-    let runtime = tokio::runtime::Runtime::new()?;
+    let runtime = IoThreads::runtime_builder(config.io_threads).build()?;
     let served = runtime.block_on(serve(config));
     // Dropping the runtime waits for the blocking work still in flight, every file operation
     // included, so the lock is only released once nothing writes to data_dir.

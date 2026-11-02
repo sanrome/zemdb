@@ -71,7 +71,7 @@ async fn interrupted_room_creation_leaves_no_room() {
         .create_room(room_id.clone(), SchemaId::new("first").unwrap(), None)
         .await;
     assert!(res.is_err(), "the interrupted metadata write must fail");
-    assert!(!manager.room_exists(&room_id).unwrap());
+    assert!(!manager.room_exists(&room_id).await.unwrap());
 
     manager
         .create_room(room_id.clone(), SchemaId::new("first").unwrap(), None)
@@ -727,7 +727,7 @@ async fn invalid_overrides_are_rejected_before_creating_the_room() {
         )
         .await;
     assert!(matches!(res, Err(ServerError::BadRequest(_))), "{res:?}");
-    assert!(!manager.room_exists(&room_id).unwrap());
+    assert!(!manager.room_exists(&room_id).await.unwrap());
     assert!(!room_dir(&dir, &room_id).exists());
 }
 
@@ -752,7 +752,10 @@ async fn inactive_room_shuts_down_and_reopens_with_its_overrides() {
 
     for _ in 0..2 {
         assert!(manager.get_room(&room_id).is_some());
-        assert!(manager.snapshot_relay.snapshot_floor(&room_id).is_some());
+        wait_until("the actor publishes its snapshot floor", || {
+            manager.snapshot_relay.snapshot_floor(&room_id).is_some()
+        })
+        .await;
         // Once the actor has exited, the manager keeps nothing for the room, nor the relay its
         // snapshot floor; its overrides are read from disk.
         wait_until("the inactive room shuts down", || {
@@ -1146,8 +1149,10 @@ async fn client_inactivity_keeps_counting_across_an_inactivity_shutdown() {
     manager.shutdown_all().await;
 }
 
+/// A respawn lists the room for reloads right before it reads its schema, with nothing to wait
+/// for in between: a reload that missed the room happened before that read.
 #[tokio::test]
-async fn schema_reload_racing_a_respawn_reaches_the_new_actor() {
+async fn a_respawn_racing_a_schema_reload_serves_the_new_schema() {
     let dir = tempdir().unwrap();
     let room_id = RoomId::new("evolving").unwrap();
     let schema_id = SchemaId::new("first").unwrap();
@@ -1158,11 +1163,12 @@ async fn schema_reload_racing_a_respawn_reaches_the_new_actor() {
         .unwrap();
     manager.shutdown_all().await;
 
-    // A respawn is in progress: it holds the spawn lock, has resolved the room's metadata and
-    // has read the previous schema.
-    let spawning = manager.lock_room(&room_id).await;
-    let meta = manager.resolve_metadata(&room_id, None).unwrap();
-    let previous = manager.schema_registry.get_schema(&schema_id).unwrap();
+    // A respawn is in progress: it holds the spawn lock and has resolved the room's metadata.
+    let mut spawning = Some(manager.lock_room(&room_id).await);
+    let meta = manager
+        .resolve_metadata(&room_id, None, &mut spawning)
+        .await
+        .unwrap();
 
     // Meanwhile the schema evolves and the reload runs.
     let evolved = manager
@@ -1180,11 +1186,14 @@ async fn schema_reload_racing_a_respawn_reaches_the_new_actor() {
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // The respawn completes with the schema it read.
-    manager.spawn_actor(&room_id, &meta, previous).unwrap();
+    // The respawn completes.
+    manager
+        .spawn_actor(&room_id, &meta, None, &mut spawning)
+        .await
+        .unwrap();
     drop(spawning);
 
-    assert_eq!(reload.await.unwrap(), vec![room_id.clone()]);
+    reload.await.unwrap();
     let (_, schema) = manager
         .ask(&room_id, |reply| RoomCommand::GetSchema { reply })
         .await
@@ -1565,16 +1574,16 @@ async fn a_room_moves_only_to_a_schema_that_extends_its_own() {
 /// Holds the spawn locks of `a` and `b` and starts a reload of `schema_id`, which lists both
 /// rooms and then waits for one of them. Returns that room, the other one, their guards and
 /// the reload.
-async fn reload_stalled_at_one_of<'m>(
-    manager: &'m Arc<RoomManager>,
+async fn reload_stalled_at_one_of(
+    manager: &Arc<RoomManager>,
     a: &RoomId,
     b: &RoomId,
     schema_id: &SchemaId,
 ) -> (
     RoomId,
     RoomId,
-    SpawnGuard<'m>,
-    SpawnGuard<'m>,
+    SpawnGuard,
+    SpawnGuard,
     tokio::task::JoinHandle<Vec<RoomId>>,
 ) {
     let guard_a = manager.lock_room(a).await;
@@ -1835,7 +1844,7 @@ async fn a_reload_waiting_for_a_rooms_lock_skips_it_if_it_moves_meanwhile() {
 
     // The reload lists the room and waits for its spawn lock, under which the room moves to
     // `target`, as a reassignment does: the room is checked again once the lock is taken.
-    let guard = manager.lock_room(&room).await;
+    let mut guard = Some(manager.lock_room(&room).await);
     let reload = tokio::spawn({
         let manager = Arc::clone(&manager);
         let first = first.clone();
@@ -1849,9 +1858,14 @@ async fn a_reload_waiting_for_a_rooms_lock_skips_it_if_it_moves_meanwhile() {
     })
     .await;
     manager.shutdown_room(&room).await;
-    let meta = manager.resolve_metadata(&room, Some(&target)).unwrap();
-    let schema = manager.schema_registry.get_schema(&target).unwrap();
-    manager.spawn_actor(&room, &meta, schema).unwrap();
+    let meta = manager
+        .resolve_metadata(&room, Some(&target), &mut guard)
+        .await
+        .unwrap();
+    manager
+        .spawn_actor(&room, &meta, None, &mut guard)
+        .await
+        .unwrap();
     drop(guard);
 
     assert!(reload.await.unwrap().is_empty());
@@ -2030,6 +2044,84 @@ impl Stop {
     }
 }
 
+/// Threads named `name` in this process.
+#[cfg(target_os = "linux")]
+fn threads_named(name: &str) -> usize {
+    fs::read_dir("/proc/self/task")
+        .unwrap()
+        .filter_map(|task| fs::read_to_string(task.ok()?.path().join("comm")).ok())
+        .filter(|comm| comm.trim_end() == name)
+        .count()
+}
+
+/// With hundreds of rooms committing at once, each fsync slowed down, the threads of the
+/// server's runtime stay within its workers and the blocking threads its file I/O may use.
+/// (On a runtime without that bound, the old handover of the worker, `block_in_place`, took a
+/// thread for each room blocked at once.)
+#[cfg(target_os = "linux")]
+#[test]
+fn the_threads_do_not_grow_with_the_rooms_committing_at_once() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    const ROOMS: usize = 200;
+    const WORKERS: usize = 2;
+    const IO_THREADS: usize = 4;
+    const NAME: &str = "rooms-at-once";
+    let runtime = IoThreads::runtime_builder(IO_THREADS)
+        .worker_threads(WORKERS)
+        .thread_name(NAME)
+        .build()
+        .unwrap();
+    let dir = tempdir().unwrap();
+    let peak = runtime.block_on(async {
+        let (manager, _relay) = test_manager(dir.path(), &["first"], |config| {
+            config.io_threads = IO_THREADS;
+        });
+        let manager = Arc::new(manager);
+        let client = ClientId::new("writer").unwrap();
+        let rooms: Vec<RoomId> = (0..ROOMS)
+            .map(|i| RoomId::new(format!("busy-{i}")).unwrap())
+            .collect();
+        for room_id in &rooms {
+            open_with_client(&manager, room_id, &client).await;
+            fail_point::arm_hook("warm_append_sync", &active_wal(&dir, room_id), || {
+                std::thread::sleep(Duration::from_millis(20));
+            });
+        }
+
+        let sampling = Arc::new(AtomicBool::new(true));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let sampler = std::thread::spawn({
+            let (sampling, peak) = (Arc::clone(&sampling), Arc::clone(&peak));
+            move || {
+                while sampling.load(Ordering::SeqCst) {
+                    peak.fetch_max(threads_named(NAME), Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        });
+        let commits: Vec<_> = rooms
+            .iter()
+            .map(|room_id| {
+                let (manager, room_id, client) =
+                    (Arc::clone(&manager), room_id.clone(), client.clone());
+                tokio::spawn(async move { commit_nth(&manager, &room_id, &client, 1).await })
+            })
+            .collect();
+        for commit in commits {
+            assert_eq!(commit.await.unwrap(), SequenceNumber::new(1));
+        }
+        sampling.store(false, Ordering::SeqCst);
+        sampler.join().unwrap();
+        manager.shutdown_all().await;
+        peak.load(Ordering::SeqCst)
+    });
+    let ceiling = WORKERS + IoThreads::blocking_threads(IO_THREADS);
+    assert!(
+        peak <= ceiling,
+        "{peak} threads with {ROOMS} rooms committing at once (at most {ceiling})"
+    );
+}
+
 /// On a runtime of a single thread, where the actors and the requests share that thread, a
 /// room whose fsync is slow does not stop another room from committing.
 #[tokio::test]
@@ -2151,6 +2243,44 @@ fn a_room_whose_runtime_ends_during_its_fsync_keeps_its_files_until_the_fsync_en
     assert_eq!(log.head_seq(), SequenceNumber::new(1));
 }
 
+/// A request dropped while the room it spawns opens on the file I/O threads leaves the room
+/// unlisted for schema reloads, and its spawn lock taken until the opening ends.
+#[tokio::test]
+async fn a_spawn_dropped_while_its_room_opens_leaves_nothing_and_keeps_the_lock_until_the_end() {
+    let dir = tempdir().unwrap();
+    let manager = new_manager(&dir);
+    let room_id = RoomId::new("opening").unwrap();
+    let schema = SchemaId::new("first").unwrap();
+
+    let stop = Stop::arm("room_open", &room_dir(&dir, &room_id));
+    tokio::select! {
+        spawned = manager.get_or_spawn(&room_id, Some(&schema)) => {
+            panic!("the room opened with its opening stopped: {spawned:?}")
+        }
+        () = stop.wait_reached() => {}
+    }
+    assert!(
+        !manager.room_meta.contains_key(&room_id),
+        "a dropped spawn left the room listed"
+    );
+    let locked =
+        tokio::time::timeout(Duration::from_millis(100), manager.lock_room(&room_id)).await;
+    assert!(
+        locked.is_err(),
+        "the spawn lock came free during the opening"
+    );
+
+    stop.let_go();
+    // The lock comes free once the opening ended and its actor, which never ran, was dropped:
+    // nor did it leave its snapshot floor in the relay.
+    drop(manager.lock_room(&room_id).await);
+    assert_eq!(manager.snapshot_relay.snapshot_floor(&room_id), None);
+    let sender = manager.get_or_spawn(&room_id, None).await.unwrap();
+    assert!(!sender.is_closed());
+    assert!(manager.room_meta.contains_key(&room_id));
+    manager.shutdown_all().await;
+}
+
 /// A maintenance pass that compresses runs on the compression threads: another room's commit
 /// does not wait for it, even with a single file I/O thread.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2230,6 +2360,58 @@ async fn a_panic_in_a_file_operation_stops_the_room_and_the_next_request_reopens
         SequenceNumber::new(1)
     );
     manager.shutdown_all().await;
+}
+
+/// What a file operation of the manager returns is dropped before the spawn lock it carries,
+/// also when its caller is dropped: a room opened for nobody releases its files before another
+/// spawn may take the lock and open them.
+#[tokio::test]
+async fn a_dropped_file_operation_of_the_manager_drops_its_result_before_the_spawn_lock() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    /// Records, when dropped, whether the spawn lock was still taken.
+    struct Probe {
+        lock: Arc<Mutex<()>>,
+        taken: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.taken
+                .store(self.lock.try_lock().is_err(), Ordering::SeqCst);
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+    let dir = tempdir().unwrap();
+    let manager = new_manager(&dir);
+    let room_id = RoomId::new("probed").unwrap();
+    let mut guard = Some(manager.lock_room(&room_id).await);
+    let lock = Arc::clone(&*manager.spawn_locks.get(&room_id).unwrap());
+    let flag = || Arc::new(AtomicBool::new(false));
+    let (reached, taken, dropped) = (flag(), flag(), flag());
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let probe = Probe {
+        lock,
+        taken: Arc::clone(&taken),
+        dropped: Arc::clone(&dropped),
+    };
+    let work = {
+        let reached = Arc::clone(&reached);
+        move || {
+            reached.store(true, Ordering::SeqCst);
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+            probe
+        }
+    };
+    tokio::select! {
+        _ = manager.io_locked(&mut guard, work) => panic!("the operation ended while stopped"),
+        () = wait_until("the operation runs", || reached.load(Ordering::SeqCst)) => {}
+    }
+    release_tx.send(()).unwrap();
+    wait_until("the result is dropped", || dropped.load(Ordering::SeqCst)).await;
+    assert!(
+        taken.load(Ordering::SeqCst),
+        "the spawn lock came free before the operation's result was dropped"
+    );
 }
 
 /// With every file I/O thread taken (one, held by another room's fsync), a request to another
@@ -2354,6 +2536,46 @@ async fn a_room_does_not_wait_for_the_compression_threads_of_other_rooms() {
     manager.shutdown_all().await;
 }
 
+/// On a runtime of a single thread, no file operation of the manager (a room's metadata, its
+/// existence, its opening and its deletion) runs on that thread. The rooms stop for
+/// inactivity, so that the hook of the shutdown command, which is not a file operation, is
+/// never reached.
+#[tokio::test]
+async fn no_file_operation_of_the_manager_runs_on_the_runtime_thread() {
+    let dir = tempdir().unwrap();
+    let manager = new_manager(&dir).with_default_policy(RoomLifecyclePolicy {
+        idle_timeout: Some(Duration::from_millis(100)),
+        ..RoomLifecyclePolicy::default()
+    });
+    let rooms = dir.path().join("rooms");
+    fs::create_dir_all(&rooms).unwrap();
+    fail_point::watch_threads(&rooms);
+    let room_id = RoomId::new("watched").unwrap();
+    manager
+        .create_room(room_id.clone(), SchemaId::new("first").unwrap(), None)
+        .await
+        .unwrap();
+    assert!(!manager
+        .room_exists(&RoomId::new("ghost").unwrap())
+        .await
+        .unwrap());
+    wait_until("the room stops", || manager.rooms.get(&room_id).is_none()).await;
+    manager
+        .get_or_spawn(&room_id, Some(&SchemaId::new("second").unwrap()))
+        .await
+        .unwrap();
+    wait_until("the room stops", || manager.rooms.get(&room_id).is_none()).await;
+    manager.room_metadata(&room_id).await.unwrap();
+    manager.delete_room(&room_id).await.unwrap();
+
+    let threads = fail_point::watched_threads(&rooms);
+    assert!(!threads.is_empty());
+    assert!(
+        !threads.contains(&std::thread::current().id()),
+        "a file operation of the manager ran on the runtime's thread"
+    );
+}
+
 /// A runtime that ends while a room writes its roster on the file I/O threads keeps the room's
 /// files taken until the write ends: the roster write carries the log like any other operation
 /// on the room's files.
@@ -2391,4 +2613,52 @@ fn a_room_whose_runtime_ends_during_its_roster_write_keeps_its_files_until_it_en
         "the room's files were released during its roster write"
     );
     assert!(crate::log::tiered_log::lock_log(&room).is_ok());
+}
+
+/// A schema evolution and its reload while a room opens on the file I/O threads reach the new
+/// actor: the room is listed for reloads before it reads its schema.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reload_while_a_room_opens_reaches_its_new_actor() {
+    let dir = tempdir().unwrap();
+    let room_id = RoomId::new("evolving-open").unwrap();
+    let schema_id = SchemaId::new("first").unwrap();
+    let manager = Arc::new(new_manager(&dir));
+    manager
+        .create_room(room_id.clone(), schema_id.clone(), None)
+        .await
+        .unwrap();
+    manager.shutdown_all().await;
+
+    let stop = Stop::arm("room_open", &room_dir(&dir, &room_id));
+    let respawn = tokio::spawn({
+        let (manager, room_id) = (Arc::clone(&manager), room_id.clone());
+        async move { manager.get_or_spawn(&room_id, None).await.map(|_| ()) }
+    });
+    stop.wait_reached().await;
+    let evolved = manager
+        .schema_registry
+        .add_column(
+            &schema_id,
+            "tasks",
+            zemdb_core::schema::ColumnDef::new("priority", DataType::Int).nullable(true),
+        )
+        .unwrap();
+    let reload = tokio::spawn({
+        let (manager, schema_id) = (Arc::clone(&manager), schema_id.clone());
+        async move { manager.reload_schema_for_rooms(&schema_id).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    stop.let_go();
+    respawn.await.unwrap().unwrap();
+    reload.await.unwrap();
+    let (_, schema) = manager
+        .ask(&room_id, |reply| RoomCommand::GetSchema { reply })
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        Arc::ptr_eq(&schema, &evolved),
+        "the room opened during the evolution kept the previous schema"
+    );
+    manager.shutdown_all().await;
 }
