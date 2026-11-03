@@ -684,21 +684,20 @@ async fn http2_client_that_stops_reading_is_disconnected() {
     let server = start_server(one_connection_short_stall).await;
     server.commit_large_rows(STALL_ROWS, LARGE_ROW_SIZE).await;
 
-    // Syncs whose bodies are never read: flow control holds most of each one in the server.
-    // On a loaded machine, the first response may stall the connection before the others get
-    // their headers out; those fail to send. The room reads them one after the other (about a
-    // second each in a debug build) within the time a request waits for its room.
+    // Two syncs on the same connection whose bodies are never read: flow control holds most
+    // of each one in the server. The second is sent once the headers of the first arrive, so
+    // that it does not wait for the room while the room reads the first (sent together, on a
+    // loaded machine the second could pass the time a request waits for its room). If the
+    // first response stalls the connection before the second gets its headers out, the
+    // second fails to send.
     let client = http2_client();
-    let sends = (0..2).map(|_| server.sync_request(&client).send());
-    let held: Vec<_> = futures::future::join_all(sends)
-        .await
-        .into_iter()
-        .filter_map(Result::ok)
-        .collect();
-    assert!(!held.is_empty());
-    assert!(held
-        .iter()
-        .all(|response| response.status() == StatusCode::OK));
+    let first = server.send_sync(&client).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let mut held = vec![first];
+    if let Ok(second) = server.sync_request(&client).send().await {
+        assert_eq!(second.status(), StatusCode::OK);
+        held.push(second);
+    }
     assert_new_connection_served(&server).await;
     for response in held {
         assert!(response.bytes().await.is_err(), "the body must be cut");
