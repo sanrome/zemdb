@@ -6,7 +6,7 @@ use crate::log::io_probe::IoEvent;
 use crate::log::policy::RoomLifecyclePolicy;
 use crate::log::segment_index::{encode_mutation_ids, mutation_ids_path, segment_path, Tier};
 use crate::log::segment_reader::{
-    classify_in, open_segment, read_frames, FrameRead, RecoveredLogData,
+    classify_in, classify_last_group_in, open_segment, read_frames, FrameRead, RecoveredLogData,
 };
 use fs2::FileExt;
 use std::fs::{File, OpenOptions};
@@ -14,7 +14,7 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use zemdb_core::id::{MutationId, SequenceNumber};
 use zemdb_core::protocol::messages::SequencedOperation;
-use zemdb_core::protocol::wal_frame::encode_wal_record;
+use zemdb_core::protocol::wal_frame::encode_wal_batch_in_group;
 
 /// Name of the active segment inside the segments directory.
 const ACTIVE_SEGMENT: &str = "active.wal";
@@ -82,9 +82,11 @@ impl WarmDiskLog {
     }
 
     /// Appends `records`, each operation with its mutation ID, to `active.wal`, and syncs them
-    /// all with one `sync_data`. A record that does not continue the one before it, or the
-    /// last one of `active.wal`, is rejected before anything is written. An `Err` means that
-    /// any of the records may or may not have reached the file.
+    /// all with one `sync_data`: a group of frames, each of which records how far after the
+    /// start of the group it is, so that the open can truncate a group torn by a crash during
+    /// its sync. A record that does not continue the one before it, or the last one of
+    /// `active.wal`, is rejected before anything is written. An `Err` means that any of the
+    /// records may or may not have reached the file.
     pub fn append_records(
         &mut self,
         records: &[(SequencedOperation, Option<MutationId>)],
@@ -126,8 +128,10 @@ impl WarmDiskLog {
         let file = self.active_file.as_mut().unwrap();
         let mut encoded = Vec::new();
         for (op, mutation_id) in records {
+            let group_offset = encoded.len() as u64;
             let record =
-                encode_wal_record(op, *mutation_id).map_err(|e| ServerError::Wal(e.to_string()))?;
+                encode_wal_batch_in_group(std::slice::from_ref(op), *mutation_id, group_offset)
+                    .map_err(|e| ServerError::Wal(e.to_string()))?;
             encoded.extend_from_slice(&record);
         }
 
@@ -288,9 +292,11 @@ impl WarmDiskLog {
         )?;
         drop(reader);
 
+        // Only `active.wal` can hold a group whose sync did not finish: a segment is sealed
+        // after the last group in it was synced.
         let valid_len = match read.anomaly {
             Some((at, anomaly)) => {
-                let reason = classify_in(&mut &file, at, anomaly, len)?;
+                let reason = classify_last_group_in(&mut &file, at, anomaly, len)?;
                 tracing::warn!(
                     path = ?active_path,
                     valid_len = at,

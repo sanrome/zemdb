@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use zemdb_core::id::SequenceNumber;
 use zemdb_core::mutation::Operation;
 use zemdb_core::protocol::messages::SequencedOperation;
-use zemdb_core::protocol::wal_frame::encode_wal_record;
+use zemdb_core::protocol::wal_frame::{encode_wal_batch_in_group, encode_wal_record};
 use zemdb_core::value::{PrimaryKey, Value};
 
 pub(super) use crate::test_support::TestRng as Rng;
@@ -42,4 +42,16 @@ pub(super) fn frames(seqs: RangeInclusive<u64>) -> (Vec<u8>, Vec<usize>) {
 /// test; `extension` is `wal` or `wal.zst`.
 pub(super) fn segment_file(dir: &Path, first: u64, last: u64, extension: &str) -> PathBuf {
     dir.join(format!("segment_{first:016}_{last:016}.{extension}"))
+}
+
+/// `frames`, written as one group of frames (see `encode_wal_batch_in_group`).
+pub(super) fn group_frames(seqs: RangeInclusive<u64>) -> (Vec<u8>, Vec<usize>) {
+    let mut bytes = Vec::new();
+    let mut offsets = Vec::new();
+    for seq in seqs {
+        offsets.push(bytes.len());
+        let frame = encode_wal_batch_in_group(&[make_op(seq)], None, bytes.len() as u64).unwrap();
+        bytes.extend_from_slice(&frame);
+    }
+    (bytes, offsets)
 }

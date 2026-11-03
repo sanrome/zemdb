@@ -14,8 +14,8 @@ use std::path::Path;
 use zemdb_core::id::{MutationId, SequenceNumber};
 use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::protocol::wal_frame::{
-    decode_batch_payload, find_valid_frame, parse_batch_header, BatchPayloadDecode, FrameAnomaly,
-    BATCH_HEADER_SIZE,
+    decode_batch_payload, find_frame_after_group, find_valid_frame, parse_batch_header,
+    BatchPayloadDecode, FrameAnomaly, BATCH_HEADER_SIZE,
 };
 
 use crate::error::ServerError;
@@ -167,7 +167,9 @@ pub(crate) fn read_frames<S: FrameSource>(
         let decoded = decode_batch_payload(&header, &payload)
             .map_err(|e| ServerError::WalCorruption(e.to_string()))?;
         let (ops, mutation_id) = match decoded {
-            BatchPayloadDecode::Batch { ops, mutation_id } => (ops, mutation_id),
+            BatchPayloadDecode::Batch {
+                ops, mutation_id, ..
+            } => (ops, mutation_id),
             BatchPayloadDecode::ChecksumMismatch { expected, actual } => {
                 read.anomaly = Some((
                     position,
@@ -225,6 +227,30 @@ pub(crate) fn classify_in<R: Read + Seek>(
     anomaly
         .classify(following)
         .map_err(|e| ServerError::WalCorruption(e.to_string()))
+}
+
+/// Classifies the anomaly found at `at` in `active.wal`, of length `end`, like [`classify_in`],
+/// except that valid frames after it are a torn write too when they belong to the group of
+/// commits of the damaged frame (see [`find_frame_after_group`]): that group was the last one
+/// written, and a crash during its sync can persist its frames out of order.
+pub(crate) fn classify_last_group_in<R: Read + Seek>(
+    source: &mut R,
+    at: u64,
+    anomaly: FrameAnomaly,
+    end: u64,
+) -> Result<String, ServerError> {
+    let following = find_frame_after_group(source, at, &anomaly, end)?;
+    source.seek(SeekFrom::Start(end))?;
+    match following {
+        Some(offset) => Err(ServerError::WalCorruption(format!(
+            "WAL frame corruption: {anomaly}, followed at offset {offset} by a frame that is not \
+             of its group of commits"
+        ))),
+        None => Ok(format!(
+            "{anomaly}, with no valid frame of a later group after it: treating as a torn write \
+             of the last group"
+        )),
+    }
 }
 
 #[cfg(test)]

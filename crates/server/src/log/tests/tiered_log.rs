@@ -11,7 +11,7 @@ use std::thread::sleep;
 use std::time::Duration;
 use tempfile::tempdir;
 use zemdb_core::mutation::Operation;
-use zemdb_core::protocol::wal_frame::encode_wal_record;
+use zemdb_core::protocol::wal_frame::{encode_wal_record, BATCH_HEADER_SIZE};
 use zemdb_core::value::{PrimaryKey, Value};
 
 /// Policy where RAM entries expire quickly but the active segment never rotates by count,
@@ -3002,38 +3002,444 @@ fn every_cut_of_a_group_written_before_its_fsync_recovers_the_whole_records_befo
     }
 }
 
-/// A power cut during the fsync of a group can persist a later sector of the group and not an
-/// earlier one (here, the first record of the group reads as zeros). Opening then finds damage
-/// followed by valid frames of the same group, takes it for corruption and fails without
-/// truncating anything, although no record of the group was acknowledged: an accepted risk until
-/// each record says where its group starts. With one record per fsync, only the last record
-/// could be torn.
-#[test]
-fn a_group_whose_first_record_was_lost_before_its_fsync_fails_the_open() {
-    let dir = tempdir().unwrap();
-    let policy = RoomLifecyclePolicy::default();
-    let active = segments_dir(dir.path()).join("active.wal");
-    let synced_len = {
-        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
-        append_range(&mut log, 1, 3);
-        let synced_len = log.warm_disk.active_len() as usize;
-        crate::fail_point::arm("warm_append_sync", &active);
-        assert!(log.append_group(group_of(4, 8)).is_err());
-        synced_len
-    };
-    let mut bytes = std::fs::read(&active).unwrap();
-    let first_len = encode_wal_record(&make_op(4), Some(mutation_for(4)))
-        .unwrap()
-        .len();
-    bytes[synced_len..synced_len + first_len].fill(0);
+/// The insertion of row `seq` at sequence `seq`, with a title of 200 bytes: a record of about
+/// 260 bytes, so a group of them spans several sectors.
+fn titled_op(seq: u64) -> SequencedOperation {
+    let row = zemdb_core::value::CompactRow::new(vec![
+        Value::Int(seq as i64),
+        Value::String("t".repeat(200).into()),
+    ]);
+    SequencedOperation::new(
+        SequenceNumber::new(seq),
+        Operation::insert(
+            1,
+            PrimaryKey::single(Value::Int(seq as i64)),
+            row,
+            seq * 1000,
+        ),
+    )
+}
 
+/// The records `first..=last` of `titled_op`, each with the mutation id `mutation_for(seq)`.
+fn titled_group(first: u64, last: u64) -> Vec<(SequencedOperation, Option<MutationId>)> {
+    (first..=last)
+        .map(|seq| (titled_op(seq), Some(mutation_for(seq))))
+        .collect()
+}
+
+/// The records `first..=last` of `op`, each with the mutation id `mutation_for(seq)`.
+fn group_of_ops(
+    first: u64,
+    last: u64,
+    op: fn(u64) -> SequencedOperation,
+) -> Vec<(SequencedOperation, Option<MutationId>)> {
+    (first..=last)
+        .map(|seq| (op(seq), Some(mutation_for(seq))))
+        .collect()
+}
+
+/// A record of about 1.1 KiB, larger than two sectors of 512 bytes.
+fn kib_op(seq: u64) -> SequencedOperation {
+    large_op(seq, 1_000)
+}
+
+/// A record of about 8.3 KiB, larger than two pages of 4 KiB.
+fn eight_kib_op(seq: u64) -> SequencedOperation {
+    large_op(seq, 8_300)
+}
+
+/// Writes `groups` to a new log in `dir`, each as one group of records of `op`, and returns the
+/// bytes of its `active.wal` and where each record ends. With `unsynced`, the fsync of the last
+/// group fails, so its records reach the file without being acknowledged.
+fn write_groups_of(
+    dir: &Path,
+    groups: &[(u64, u64)],
+    unsynced: bool,
+    op: fn(u64) -> SequencedOperation,
+) -> (Vec<u8>, Vec<usize>) {
+    let active = segments_dir(dir).join("active.wal");
+    let (mut log, _) = TieredLog::open_or_create(dir, RoomLifecyclePolicy::default()).unwrap();
+    let mut ends = Vec::new();
+    for (i, &(first, last)) in groups.iter().enumerate() {
+        if unsynced && i == groups.len() - 1 {
+            crate::fail_point::arm("warm_append_sync", &active);
+            assert!(log.append_group(group_of_ops(first, last, op)).is_err());
+        } else {
+            log.append_group(group_of_ops(first, last, op)).unwrap();
+        }
+        for seq in first..=last {
+            let len = encode_wal_record(&op(seq), Some(mutation_for(seq)))
+                .unwrap()
+                .len();
+            ends.push(ends.last().copied().unwrap_or(0) + len);
+        }
+    }
+    drop(log);
+    let bytes = std::fs::read(&active).unwrap();
+    assert_eq!(bytes.len(), *ends.last().unwrap());
+    (bytes, ends)
+}
+
+/// `write_groups_of` with records of `titled_op`.
+fn write_groups(dir: &Path, groups: &[(u64, u64)], unsynced: bool) -> (Vec<u8>, Vec<usize>) {
+    write_groups_of(dir, groups, unsynced, titled_op)
+}
+
+/// Opens a log whose `active.wal` holds `bytes`, in a new directory, with its mutation ids.
+type OpenedImage = Result<(TieredLog, Vec<(MutationId, SequenceNumber)>), ServerError>;
+fn open_image(bytes: &[u8]) -> (tempfile::TempDir, OpenedImage) {
     let copy = tempdir().unwrap();
-    let copy_segments = segments_dir(copy.path());
-    std::fs::create_dir_all(&copy_segments).unwrap();
-    std::fs::write(copy_segments.join("active.wal"), &bytes).unwrap();
-    assert!(TieredLog::open_or_create(copy.path(), policy).is_err());
+    let segments = segments_dir(copy.path());
+    std::fs::create_dir_all(&segments).unwrap();
+    std::fs::write(segments.join("active.wal"), bytes).unwrap();
+    let opened = TieredLog::open_or_create(copy.path(), RoomLifecyclePolicy::default());
+    (copy, opened)
+}
+
+/// A group of `records` records of `op` whose fsync failed, after `before` acknowledged ones:
+/// the bytes of `active.wal`, where each record ends and how many bytes were synced.
+struct UnsyncedGroup {
+    bytes: Vec<u8>,
+    ends: Vec<usize>,
+    synced_len: usize,
+    op: fn(u64) -> SequencedOperation,
+}
+
+impl UnsyncedGroup {
+    fn write(before: u64, records: u64, op: fn(u64) -> SequencedOperation) -> Self {
+        let dir = tempdir().unwrap();
+        let mut groups = Vec::new();
+        if before > 0 {
+            groups.push((1, before));
+        }
+        groups.push((before + 1, before + records));
+        let (bytes, ends) = write_groups_of(dir.path(), &groups, true, op);
+        let synced_len = if before > 0 {
+            ends[before as usize - 1]
+        } else {
+            0
+        };
+        Self {
+            bytes,
+            ends,
+            synced_len,
+            op,
+        }
+    }
+
+    /// The sectors of `sector` bytes that the group wrote to, as absolute indexes.
+    fn sectors(&self, sector: usize) -> std::ops::RangeInclusive<usize> {
+        self.synced_len / sector..=(self.bytes.len() - 1) / sector
+    }
+
+    /// The image a power cut leaves when the disk loses the sectors `lost`: zeros where it lost
+    /// them, never over the bytes already synced.
+    fn losing(&self, sector: usize, lost: impl Fn(usize) -> bool) -> Vec<u8> {
+        let mut image = self.bytes.clone();
+        for k in self.sectors(sector).filter(|&k| lost(k)) {
+            let start = (k * sector).max(self.synced_len);
+            let end = ((k + 1) * sector).min(self.bytes.len());
+            image[start..end].fill(0);
+        }
+        image
+    }
+
+    /// Opens `image`, which must reopen with exactly the whole records before its first damaged
+    /// one and their mutation ids, truncate the rest, and take the next record.
+    fn check_reopens(&self, image: &[u8], what: &str) {
+        let mut start = 0;
+        let whole = self
+            .ends
+            .iter()
+            .take_while(|&&end| {
+                let intact = image[start..end] == self.bytes[start..end];
+                start = end;
+                intact
+            })
+            .count() as u64;
+        let (_copy, opened) = open_image(image);
+        let (mut log, mutations) = opened.unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(log.head_seq().get(), whole, "{what}");
+        let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
+        assert_contiguous(&ops, 1, whole.min(100));
+        let expected: Vec<_> = (1..=whole)
+            .map(|seq| (mutation_for(seq), SequenceNumber::new(seq)))
+            .collect();
+        assert_eq!(mutations, expected, "{what}");
+        assert_eq!(
+            log.warm_disk.active_len(),
+            self.ends[..whole as usize].last().copied().unwrap_or(0) as u64,
+            "{what}"
+        );
+        log.append((self.op)(whole + 1), Some(mutation_for(whole + 1)))
+            .unwrap();
+    }
+}
+
+/// Of the images that a power cut during the fsync of a group of `records` records of `op` can
+/// leave, after `before` acknowledged records, when the disk loses any subset of the sectors of
+/// `sector` bytes that the group wrote, opens all of them if the group spans at most
+/// `every_up_to` sectors, and `sample` random ones otherwise (each sector lost or not with even
+/// odds). Every image reopens with exactly the whole records before the first damaged one and
+/// their mutation ids, truncates the rest, and the next record continues them.
+fn check_lost_sectors_of_a_group(
+    before: u64,
+    records: u64,
+    op: fn(u64) -> SequencedOperation,
+    sector: usize,
+    every_up_to: usize,
+    sample: u64,
+) {
+    let group = UnsyncedGroup::write(before, records, op);
+    let first = *group.sectors(sector).start();
+    let sectors = group.sectors(sector).count();
+    let mut rng = TestRng::new(sectors as u64 * 31 + records);
+    let images: Vec<Vec<bool>> = if sectors <= every_up_to {
+        (0..1u64 << sectors)
+            .map(|mask| (0..sectors).map(|k| mask & (1 << k) == 0).collect())
+            .collect()
+    } else {
+        (0..sample)
+            .map(|_| (0..sectors).map(|_| rng.below(2) == 0).collect())
+            .collect()
+    };
+    for lost in images {
+        let image = group.losing(sector, |k| lost[k - first]);
+        let what = format!(
+            "{records} records after {before}, sectors of {sector}, lost {:?}",
+            lost.iter().map(|&l| u8::from(l)).collect::<Vec<_>>()
+        );
+        group.check_reopens(&image, &what);
+    }
+}
+
+/// The groups the crash images cover: how many records, of what, and the size of the sectors.
+type SectorCase = (u64, fn(u64) -> SequencedOperation, usize);
+const SECTOR_CASES: [SectorCase; 9] = [
+    (2, titled_op, 512),
+    (4, titled_op, 512),
+    (30, titled_op, 512),
+    (64, titled_op, 512),
+    (4, titled_op, 4096),
+    (30, titled_op, 4096),
+    (30, kib_op, 512),
+    (64, kib_op, 512),
+    (64, eight_kib_op, 4096),
+];
+
+/// A power cut during the fsync of a group can persist a later sector of the group and not an
+/// earlier one, leaving damage followed by valid frames of the same group. No record of the
+/// group was acknowledged, so the open truncates the group from the damage, as it truncates a
+/// torn last record. Also when the group is the first thing in `active.wal`, and with records
+/// larger than a sector, many of which keep their header and lose part of their payload.
+#[test]
+fn losing_any_unsynced_sectors_of_a_group_reopens_with_the_whole_records_before_them() {
+    for before in [3, 0] {
+        for (records, op, sector) in SECTOR_CASES {
+            check_lost_sectors_of_a_group(before, records, op, sector, 6, 16);
+        }
+    }
+}
+
+/// `losing_any_unsynced_sectors_of_a_group_reopens_with_the_whole_records_before_them` with every
+/// image of the groups of up to 12 sectors, and 1,024 random ones of the larger groups.
+#[test]
+#[ignore = "long-running test; run with --ignored in release"]
+fn losing_any_unsynced_sectors_of_a_group_reopens_with_the_whole_records_before_them_long() {
+    for before in [3, 0] {
+        for (records, op, sector) in SECTOR_CASES {
+            check_lost_sectors_of_a_group(before, records, op, sector, 12, 1_024);
+        }
+    }
+}
+
+/// Every record of a group keeps its header and loses a sector of its payload: each one fails its
+/// payload check, more of them than the limit of failed checks of the search after a damaged
+/// frame, which must not take the torn group for corruption. Also a full group of 64 small records
+/// losing every other sector.
+#[test]
+fn a_group_whose_records_each_lost_part_of_their_payload_reopens() {
+    for (records, op, sector) in [
+        (18, kib_op as fn(u64) -> _, 512),
+        (18, eight_kib_op, 4096),
+        (64, kib_op, 512),
+    ] {
+        let group = UnsyncedGroup::write(3, records, op);
+        let lost: Vec<usize> = group.ends[2..group.ends.len() - 1]
+            .iter()
+            .map(|&start| (start + BATCH_HEADER_SIZE).div_ceil(sector))
+            .collect();
+        for (i, &k) in lost.iter().enumerate() {
+            assert!(
+                (k + 1) * sector <= group.ends[3 + i],
+                "record {i} holds a whole sector"
+            );
+        }
+        let image = group.losing(sector, |k| lost.contains(&k));
+        group.check_reopens(&image, &format!("{records} records, sectors of {sector}"));
+    }
+    let group = UnsyncedGroup::write(3, 64, titled_op);
+    let first = *group.sectors(512).start();
+    for parity in [0, 1] {
+        let image = group.losing(512, |k| (k - first) % 2 == parity);
+        group.check_reopens(&image, &format!("every other sector from {parity}"));
+    }
+}
+
+/// A value of `len` bytes that holds, at its start, the header of a frame that says its group
+/// starts `delta` bytes before it (where the record that holds the value starts), with no
+/// operations, and whose payload is the rest of the value and then the first byte of whatever
+/// frame follows the record, always the first byte of the magic: all of it known when the value
+/// is written.
+fn value_holding_a_frame(len: usize, delta: u64) -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&delta.to_le_bytes());
+    payload.push(0);
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    payload.resize(len - BATCH_HEADER_SIZE, 0x13);
+    payload.push(zemdb_core::protocol::wal_frame::BATCH_MAGIC[0]);
+    let mut header = [0u8; BATCH_HEADER_SIZE];
+    header[0..2].copy_from_slice(&zemdb_core::protocol::wal_frame::BATCH_MAGIC);
+    header[2..6].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    header[6..10].copy_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+    let crc = crc32fast::hash(&header[..14]);
+    header[14..].copy_from_slice(&crc.to_le_bytes());
+    let mut value = header.to_vec();
+    value.extend_from_slice(&payload[..payload.len() - 1]);
+    value
+}
+
+/// A member commits record 4 with a value that holds a frame that says it is of the group of the
+/// record, and whose payload reaches into the frame after the record; another member then
+/// commits record 5, alone, and gets its acknowledgement. Damage to one bit of the header of
+/// record 4 followed by record 5, of a later group, is corruption: the open fails and truncates
+/// nothing, instead of taking the stored frame for one of the damaged group, skipping the start
+/// of record 5 and truncating it as a torn write.
+#[test]
+fn a_frame_stored_in_a_value_does_not_hide_a_later_acknowledged_record() {
+    let op = |value: Vec<u8>| {
+        let row =
+            zemdb_core::value::CompactRow::new(vec![Value::Int(4), Value::Bytes(value.into())]);
+        SequencedOperation::new(
+            SequenceNumber::new(4),
+            Operation::insert(1, PrimaryKey::single(Value::Int(4)), row, 4000),
+        )
+    };
+    let len = 200;
+    let plain = encode_wal_record(&op(vec![0x55; len]), Some(mutation_for(4))).unwrap();
+    let delta = plain.len() - len;
     assert_eq!(
-        std::fs::read(copy_segments.join("active.wal")).unwrap(),
-        bytes
+        plain[delta..],
+        vec![0x55; len][..],
+        "the value ends the record"
     );
+
+    let dir = tempdir().unwrap();
+    let active = segments_dir(dir.path()).join("active.wal");
+    let (mut log, _) =
+        TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).unwrap();
+    log.append_group(titled_group(1, 3)).unwrap();
+    let at = log.warm_disk.active_len() as usize;
+    log.append_group(vec![(
+        op(value_holding_a_frame(len, delta as u64)),
+        Some(mutation_for(4)),
+    )])
+    .unwrap();
+    log.append_group(titled_group(5, 5)).unwrap();
+    drop(log);
+
+    let mut bytes = std::fs::read(&active).unwrap();
+    bytes[at + BATCH_HEADER_SIZE - 1] ^= 0x01;
+    std::fs::write(&active, &bytes).unwrap();
+    assert!(TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).is_err());
+    assert_eq!(
+        std::fs::read(&active).unwrap(),
+        bytes,
+        "nothing may be truncated"
+    );
+}
+
+/// Damage in a group followed by a frame of a later group is corruption: a group is written only
+/// after the group before it was synced, so the damaged records were acknowledged. The open fails
+/// and truncates nothing. Also when the damage reaches into the first record of the later group,
+/// whose other records are intact, and when it starts at the beginning of `active.wal`.
+#[test]
+fn damage_in_a_group_followed_by_a_later_group_fails_the_open_and_truncates_nothing() {
+    // What the damage is, the groups written, and the damage, given where each record ends.
+    type Case = (&'static str, &'static [(u64, u64)], fn(&mut [u8], &[usize]));
+    let cases: [Case; 4] = [
+        (
+            "a payload byte of a record in the middle of a group",
+            &[(1, 3), (4, 7), (8, 10)],
+            |bytes, ends| bytes[ends[4] - 10] ^= 0xFF,
+        ),
+        (
+            "the last record of a group, before a group of one",
+            &[(1, 3), (4, 6), (7, 7)],
+            |bytes, ends| bytes[ends[4]..ends[5]].fill(0),
+        ),
+        (
+            "the last record of a group and the first of the next",
+            &[(1, 3), (4, 7), (8, 10)],
+            |bytes, ends| bytes[ends[5]..ends[7]].fill(0),
+        ),
+        (
+            "the first group of the file, of one record, and the first record of the next",
+            &[(1, 1), (2, 4)],
+            |bytes, ends| bytes[..ends[1]].fill(0),
+        ),
+    ];
+    for (what, groups, damage) in cases {
+        let dir = tempdir().unwrap();
+        let (mut bytes, ends) = write_groups(dir.path(), groups, false);
+        damage(&mut bytes, &ends);
+        let (copy, opened) = open_image(&bytes);
+        assert!(opened.is_err(), "{what}: corruption must fail the open");
+        let on_disk = std::fs::read(segments_dir(copy.path()).join("active.wal")).unwrap();
+        assert_eq!(on_disk, bytes, "{what}: nothing may be truncated");
+    }
+}
+
+/// Damage in the last group of `active.wal` after its fsync cannot be told from a torn write of
+/// it: the group is truncated from the damage, acknowledged records included, and their
+/// sequences are assigned again unless another file of the log records them (here
+/// `log_meta.json`, after a rotation that recorded its end and stopped before the rename).
+#[test]
+fn damage_in_the_last_group_after_its_fsync_is_truncated_from_the_damage() {
+    let dir = tempdir().unwrap();
+    let (mut bytes, ends) = write_groups(dir.path(), &[(1, 3), (4, 7)], false);
+    bytes[ends[4] - 10] ^= 0xFF;
+    let (copy, opened) = open_image(&bytes);
+    let (mut log, _) = opened.unwrap();
+    assert_eq!(log.head_seq().get(), 4);
+    log.append_group(group_of(5, 6)).unwrap();
+    drop(log);
+    let (log, mutations) =
+        TieredLog::open_or_create(copy.path(), RoomLifecyclePolicy::default()).unwrap();
+    assert_eq!(log.head_seq().get(), 6);
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(4), 100, None).unwrap();
+    assert_eq!(ops, vec![make_op(5), make_op(6)], "5 is reused");
+    assert_eq!(mutations.len(), 6);
+
+    // With the end of the group in `log_meta.json`, its sequences are a gap instead.
+    let dir = tempdir().unwrap();
+    let active = segments_dir(dir.path()).join("active.wal");
+    let (mut log, _) =
+        TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).unwrap();
+    log.append_group(titled_group(1, 3)).unwrap();
+    log.append_group(titled_group(4, 7)).unwrap();
+    crate::fail_point::arm("exists", &active);
+    assert!(log.force_rotate_warm().is_err());
+    drop(log);
+    let mut bytes = std::fs::read(&active).unwrap();
+    bytes[ends[4] - 10] ^= 0xFF;
+    std::fs::write(&active, &bytes).unwrap();
+    let (mut log, _) =
+        TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).unwrap();
+    assert_eq!(log.head_seq().get(), 7, "7 is in log_meta.json");
+    log.append(make_op(8), Some(mutation_for(8))).unwrap();
+    assert!(matches!(
+        log.fetch_deltas(SequenceNumber::new(4), 10, None),
+        Err(ServerError::BehindCompaction)
+    ));
 }

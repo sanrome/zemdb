@@ -25,10 +25,12 @@ pub enum WalFrameError {
     Corruption(String),
 }
 
-/// Payload of a framed WAL batch: the operations and the optional mutation id for deduplication.
-/// The field order is the on-disk encoding and must match [`WalBatchPayloadRef`].
+/// Payload of a framed WAL batch: where its group of frames starts (see
+/// [`encode_wal_batch_in_group`]), the optional mutation id for deduplication and the
+/// operations. The field order is the on-disk encoding and must match [`WalBatchPayloadRef`].
 #[derive(serde::Deserialize)]
 struct WalBatchPayload {
+    group_offset: u64,
     mutation_id: Option<MutationId>,
     ops: Vec<SequencedOperation>,
 }
@@ -37,6 +39,7 @@ struct WalBatchPayload {
 /// records without copying the operations.
 #[derive(serde::Serialize)]
 struct WalBatchPayloadRef<'a> {
+    group_offset: u64,
     mutation_id: Option<MutationId>,
     ops: &'a [SequencedOperation],
 }
@@ -57,7 +60,8 @@ pub enum WalBatchDecodeResult {
     TornWrite { reason: String },
 }
 
-/// Encodes `ops` and the optional `mutation_id` as one append-only, atomically framed WAL batch.
+/// Encodes `ops` and the optional `mutation_id` as one append-only, atomically framed WAL batch,
+/// synced on its own: a group of one frame (see [`encode_wal_batch_in_group`]).
 ///
 /// Framing:
 /// - `magic`: 2 bytes, `[0xBA, 0x7C]`
@@ -70,8 +74,27 @@ pub fn encode_wal_batch(
     ops: &[SequencedOperation],
     mutation_id: Option<MutationId>,
 ) -> Result<Vec<u8>, WalFrameError> {
-    let payload = bincode::serialize(&WalBatchPayloadRef { mutation_id, ops })
-        .map_err(|e| WalFrameError::Serialization(e.to_string()))?;
+    encode_wal_batch_in_group(ops, mutation_id, 0)
+}
+
+/// Encodes `ops` and the optional `mutation_id` as one frame of a group of frames that are
+/// written one after the other and synced once, `group_offset` bytes after the start of the
+/// first frame of the group (0 for that frame).
+///
+/// A crash during that sync can persist any of the frames of the group and lose the others, so
+/// a damaged frame of the group can be followed by valid ones; [`find_frame_after_group`] tells
+/// them from frames of a later group, which are only written after the group is synced.
+pub fn encode_wal_batch_in_group(
+    ops: &[SequencedOperation],
+    mutation_id: Option<MutationId>,
+    group_offset: u64,
+) -> Result<Vec<u8>, WalFrameError> {
+    let payload = bincode::serialize(&WalBatchPayloadRef {
+        group_offset,
+        mutation_id,
+        ops,
+    })
+    .map_err(|e| WalFrameError::Serialization(e.to_string()))?;
     if payload.len() as u64 > MAX_MESSAGE_SIZE {
         return Err(WalFrameError::Corruption(format!(
             "WAL batch payload size {} exceeds MAX_MESSAGE_SIZE limit {}",
@@ -98,6 +121,7 @@ pub fn wal_record_payload_len(
     mutation_id: Option<MutationId>,
 ) -> Result<u64, WalFrameError> {
     let payload = WalBatchPayloadRef {
+        group_offset: 0,
         mutation_id,
         ops: std::slice::from_ref(op),
     };
@@ -144,6 +168,9 @@ pub enum BatchPayloadDecode {
     Batch {
         ops: Vec<SequencedOperation>,
         mutation_id: Option<MutationId>,
+        /// How many bytes before the frame its group of frames starts (see
+        /// [`encode_wal_batch_in_group`]).
+        group_offset: u64,
     },
     /// The payload does not match its checksum. Whether that is a torn write or corruption
     /// depends on what follows the frame; see [`FrameAnomaly`].
@@ -215,7 +242,11 @@ pub fn decode_batch_payload(
         });
     }
 
-    let WalBatchPayload { ops, mutation_id } = bincode::deserialize(payload).map_err(|e| {
+    let WalBatchPayload {
+        group_offset,
+        mutation_id,
+        ops,
+    } = bincode::deserialize(payload).map_err(|e| {
         WalFrameError::Corruption(format!("Failed to deserialize WAL batch operations: {e}"))
     })?;
 
@@ -227,7 +258,11 @@ pub fn decode_batch_payload(
         )));
     }
 
-    Ok(BatchPayloadDecode::Batch { ops, mutation_id })
+    Ok(BatchPayloadDecode::Batch {
+        ops,
+        mutation_id,
+        group_offset,
+    })
 }
 
 /// Why no frame could be read where the next one should start.
@@ -335,6 +370,73 @@ pub fn find_valid_frame<R: Read + Seek>(
     }
 }
 
+/// Finds, after the anomaly found at `at`, the first complete valid frame that does not belong to
+/// the group of frames of the damaged one (see [`encode_wal_batch_in_group`]), before `end`, and
+/// returns where it starts.
+///
+/// A frame belongs to that group when its group starts at or before `at`: the group of the frame
+/// before the damage, or one that starts with the damaged frame. A frame whose group starts after
+/// `at` was written after the damaged frame was synced, so the damage is corruption; when every
+/// valid frame after the damage belongs to its group, that group is the last one written and the
+/// damage is a torn write of it.
+///
+/// The search is that of [`find_valid_frame`], resumed after each frame of the group from the
+/// window it has read, `BATCH_HEADER_SIZE - 1` bytes before the end of the frame. A frame stored
+/// as a value can stretch its payload over the first bytes of the frame written after the value,
+/// which are predictable (its magic): resuming at its end would skip the start of that frame. To
+/// hide it, the stored frame has to cover, and so predict, its whole header. Frames nested in the
+/// rest of the payloads of the group are not looked at.
+///
+/// A frame of the group whose header survived the crash and whose payload did not fails its
+/// check. So that the frames of a torn group do not spend the limit of failed checks, each failed
+/// check is first charged, by the length of its payload, to an allowance of as many bytes as the
+/// search covers, which the frames of a group, that do not overlap, cannot exceed; the limit
+/// counts the checks past it. Each frame the search finds is then read and decoded, and one whose
+/// payload does not match its checksum (once the limit is spent, the search takes headers without
+/// checking them) or does not decode is returned: that can only turn a torn write into
+/// corruption. So the work stays linear in the bytes after the damage, plus the limit.
+pub fn find_frame_after_group<R: Read + Seek>(
+    reader: &mut R,
+    at: u64,
+    anomaly: &FrameAnomaly,
+    end: u64,
+) -> std::io::Result<Option<u64>> {
+    let from = at.saturating_add(anomaly.search_offset());
+    let mut search = FrameSearch::new(from, end);
+    search.free_failed_bytes = end.saturating_sub(from);
+    let mut buf = Vec::new();
+    loop {
+        let position = match search.step() {
+            FrameSearchStep::Read { offset, len } => {
+                buf.resize(len, 0);
+                reader.seek(SeekFrom::Start(offset))?;
+                reader.read_exact(&mut buf)?;
+                search.feed(&buf);
+                continue;
+            }
+            FrameSearchStep::Done(None) => return Ok(None),
+            FrameSearchStep::Done(Some(position)) => position,
+        };
+        let mut header = [0u8; BATCH_HEADER_SIZE];
+        reader.seek(SeekFrom::Start(position))?;
+        reader.read_exact(&mut header)?;
+        let Ok(header) = parse_batch_header(&header) else {
+            return Ok(Some(position));
+        };
+        buf.resize(header.payload_len(), 0);
+        reader.read_exact(&mut buf)?;
+        let in_group = matches!(
+            decode_batch_payload(&header, &buf),
+            Ok(BatchPayloadDecode::Batch { group_offset, .. })
+                if position.checked_sub(group_offset).is_some_and(|start| start <= at)
+        );
+        if !in_group {
+            return Ok(Some(position));
+        }
+        search.resume(position + (header.frame_len() - (BATCH_HEADER_SIZE - 1)) as u64);
+    }
+}
+
 /// What a [`FrameSearch`] needs next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameSearchStep {
@@ -352,6 +454,9 @@ pub enum FrameSearchStep {
 pub struct FrameSearch {
     end: u64,
     failed_checks: usize,
+    /// Bytes of payloads that may fail their check without counting towards the limit (see
+    /// [`find_frame_after_group`]).
+    free_failed_bytes: u64,
     /// Where `window` starts in the log.
     start: u64,
     window: Vec<u8>,
@@ -373,6 +478,7 @@ enum SearchState {
         hasher: crc32fast::Hasher,
         offset: u64,
         remaining: usize,
+        len: usize,
     },
     Done(Option<u64>),
 }
@@ -384,10 +490,24 @@ impl FrameSearch {
         Self {
             end,
             failed_checks: 0,
+            free_failed_bytes: 0,
             start: from,
             window: Vec::new(),
             next: 0,
             state: SearchState::NeedWindow,
+        }
+    }
+
+    /// Goes on with the search from `from`, after where it found a frame: a search that scans
+    /// the rest of a log for frames. The failed payload checks of the search so far still count.
+    fn resume(&mut self, from: u64) {
+        let candidates = (self.window.len() + 1).saturating_sub(BATCH_HEADER_SIZE) as u64;
+        if from >= self.start && from - self.start < candidates {
+            self.next = (from - self.start) as usize;
+            self.state = SearchState::Scanning;
+        } else {
+            self.start = from;
+            self.state = SearchState::NeedWindow;
         }
     }
 
@@ -422,6 +542,7 @@ impl FrameSearch {
                         position,
                         expected,
                         hasher,
+                        len,
                         ..
                     } = std::mem::replace(&mut self.state, SearchState::Scanning)
                     else {
@@ -429,6 +550,8 @@ impl FrameSearch {
                     };
                     if hasher.finalize() == expected {
                         self.state = SearchState::Done(Some(position));
+                    } else if len as u64 <= self.free_failed_bytes {
+                        self.free_failed_bytes -= len as u64;
                     } else {
                         self.failed_checks += 1;
                     }
@@ -507,6 +630,7 @@ impl FrameSearch {
                     hasher: crc32fast::Hasher::new(),
                     offset: position + BATCH_HEADER_SIZE as u64,
                     remaining: header.payload_len,
+                    len: header.payload_len,
                 }
             };
             return;
@@ -558,7 +682,9 @@ pub fn decode_wal_batch_from_slice(slice: &[u8]) -> Result<WalBatchDecodeResult,
     }
 
     match decode_batch_payload(&header, &slice[BATCH_HEADER_SIZE..frame_len])? {
-        BatchPayloadDecode::Batch { ops, mutation_id } => Ok(WalBatchDecodeResult::Ok {
+        BatchPayloadDecode::Batch {
+            ops, mutation_id, ..
+        } => Ok(WalBatchDecodeResult::Ok {
             ops,
             mutation_id,
             bytes_consumed: frame_len,

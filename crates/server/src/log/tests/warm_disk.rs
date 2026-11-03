@@ -1,6 +1,10 @@
 use super::*;
-use crate::log::test_support::{frames, make_op, segment_file, seq};
+use crate::log::test_support::{frames, make_op, segment_file, seq, seqs};
 use tempfile::tempdir;
+use zemdb_core::protocol::wal_frame::{
+    decode_batch_payload, encode_wal_record, parse_batch_header, BatchPayloadDecode,
+    BATCH_HEADER_SIZE,
+};
 
 #[test]
 fn append_into_empty_existing_active_wal_tracks_its_range_and_continues_it() {
@@ -78,7 +82,7 @@ fn write_active(dir: &Path, seqs: std::ops::RangeInclusive<u64>) -> (Vec<u8>, Ve
 /// Bytes a crash can leave where a frame was being written: a header still in zeros followed
 /// by data that is not a frame.
 fn zeroed_header_and_garbage() -> Vec<u8> {
-    let mut bytes = vec![0u8; zemdb_core::protocol::wal_frame::BATCH_HEADER_SIZE];
+    let mut bytes = vec![0u8; BATCH_HEADER_SIZE];
     bytes.extend_from_slice(&[0x13; 100]);
     bytes.extend_from_slice(&[0xBA, 0x7C, 0x01, 0x02]);
     bytes
@@ -218,4 +222,75 @@ fn records_that_do_not_continue_each_other_are_all_rejected_before_writing() {
         (log.active_end_seq(), log.active_len()),
         (Some(seq(2)), len)
     );
+}
+
+/// Each record of a group says how far after the start of its group it is: 0 for the first, and
+/// the length of the records before it in the group for the rest, also after a torn write that
+/// the open truncated.
+#[test]
+fn every_record_of_a_group_says_where_its_group_starts() {
+    let dir = tempdir().unwrap();
+    let mut log = WarmDiskLog::open_or_create(dir.path()).unwrap();
+    log.append_records(&[(make_op(1), None)]).unwrap();
+    log.append_records(&[(make_op(2), None), (make_op(3), None), (make_op(4), None)])
+        .unwrap();
+    drop(log);
+    // A torn write of a group, truncated by the open; the next group starts where it was.
+    let active = dir.path().join("active.wal");
+    let mut file = OpenOptions::new().append(true).open(&active).unwrap();
+    file.write_all(&[0xBA, 0x7C, 0x01]).unwrap();
+    drop(file);
+    let mut log = WarmDiskLog::open_or_create(dir.path()).unwrap();
+    log.append_records(&[(make_op(5), None), (make_op(6), None)])
+        .unwrap();
+    drop(log);
+
+    let bytes = std::fs::read(&active).unwrap();
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        let header = parse_batch_header(bytes[at..].first_chunk().unwrap()).unwrap();
+        let payload = &bytes[at + BATCH_HEADER_SIZE..at + header.frame_len()];
+        let BatchPayloadDecode::Batch { group_offset, .. } =
+            decode_batch_payload(&header, payload).unwrap()
+        else {
+            panic!("frame at {at} does not match its checksum");
+        };
+        found.push(group_offset);
+        at += header.frame_len();
+    }
+    let len = encode_wal_record(&make_op(2), None).unwrap().len() as u64;
+    assert_eq!(found, vec![0, 0, len, 2 * len, 0, len]);
+}
+
+/// Only `active.wal` can hold a group whose sync did not finish. Damage in a group followed by
+/// valid records of the same group truncates `active.wal` from the damage, while a sealed
+/// segment, sealed after its last group was synced, with the same damage fails to read.
+#[test]
+fn damage_followed_by_records_of_its_group_is_torn_only_in_active_wal() {
+    let dir = tempdir().unwrap();
+    let mut log = WarmDiskLog::open_or_create(dir.path()).unwrap();
+    log.append_records(&[(make_op(1), None)]).unwrap();
+    log.append_records(&[(make_op(2), None), (make_op(3), None), (make_op(4), None)])
+        .unwrap();
+    drop(log);
+    let active = dir.path().join(ACTIVE_SEGMENT);
+    let mut wal = std::fs::read(&active).unwrap();
+    let len = encode_wal_record(&make_op(2), None).unwrap().len();
+    wal[len..len + BATCH_HEADER_SIZE].fill(0);
+    std::fs::write(&active, &wal).unwrap();
+
+    let sealed = segment_file(dir.path(), 1, 4, "wal");
+    std::fs::write(&sealed, &wal).unwrap();
+    let mut all = ReadBudget::ops(usize::MAX);
+    assert!(matches!(
+        read_segment_file(&sealed, Some(1.into()), 0.into(), &mut all),
+        Err(ServerError::WalCorruption(_))
+    ));
+    std::fs::remove_file(&sealed).unwrap();
+
+    let (log, (ops, _)) =
+        WarmDiskLog::open_recovering(dir.path(), &RoomLifecyclePolicy::default()).unwrap();
+    assert_eq!(seqs(&ops), vec![1]);
+    assert_eq!(log.active_len(), len as u64);
 }

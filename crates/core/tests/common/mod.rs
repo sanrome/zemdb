@@ -1072,5 +1072,11 @@ pub fn sample_wal_log() -> Vec<u8> {
     log.extend(encode_wal_batch(&ops[1..3], None).unwrap());
     log.extend(encode_wal_batch(&[], None).unwrap());
     log.extend(encode_wal_batch(&ops[3..], Some(MutationId::from_u128(9))).unwrap());
+    // A group of two frames, written together and synced once.
+    let start = log.len();
+    for op in &ops[..2] {
+        let offset = (log.len() - start) as u64;
+        log.extend(encode_wal_batch_in_group(std::slice::from_ref(op), None, offset).unwrap());
+    }
     log
 }

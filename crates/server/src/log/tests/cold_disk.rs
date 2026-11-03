@@ -1,6 +1,6 @@
 use super::*;
 use crate::fail_point;
-use crate::log::test_support::{frames, make_op, segment_file};
+use crate::log::test_support::{frames, group_frames, make_op, segment_file};
 use crate::log::warm_disk::WarmDiskLog;
 use tempfile::tempdir;
 
@@ -71,6 +71,21 @@ fn cold_segment_damaged_before_a_valid_frame_is_corruption() {
     let dir = tempdir().unwrap();
     let (mut bytes, offsets) = frames(1..=4);
     bytes[offsets[1]..offsets[1] + zemdb_core::protocol::wal_frame::BATCH_HEADER_SIZE].fill(0);
+    let path = write_cold(dir.path(), &bytes);
+
+    assert!(matches!(
+        read_all(&path),
+        Err(ServerError::WalCorruption(_))
+    ));
+}
+
+/// A cold copy, like the sealed segment it comes from, was sealed after its last group was
+/// synced: damage followed by frames of its own group is corruption, not a torn group.
+#[test]
+fn cold_segment_damaged_before_frames_of_its_group_is_corruption() {
+    let dir = tempdir().unwrap();
+    let (mut bytes, _) = group_frames(1..=4);
+    bytes[..zemdb_core::protocol::wal_frame::BATCH_HEADER_SIZE].fill(0);
     let path = write_cold(dir.path(), &bytes);
 
     assert!(matches!(

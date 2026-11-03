@@ -43,3 +43,11 @@ La base es `9214df3` (el Lote 3); el resultado, el código del lote; la variante
 - `final-e2-r500-more.jsonl`: cuatro rondas más del control E2-tmpfs con 500 salas, intercaladas, empezando por el resultado.
 - `final-e2-r500-variant.jsonl`: el mismo control, cuatro rondas con el orden rotado de la base, el resultado y la variante.
 - `profile-*.json`, `.stat` y `.txt`: el perfil del control E2-tmpfs con 500 salas, dos rondas de la base, el resultado y la variante (la corrida del generador; `perf stat`, con el CPU, los cambios de contexto y las migraciones; y el perfil plano por biblioteca y símbolo, de la base y el resultado).
+
+## `lote4b/`: el último grupo dañado
+
+La base es `d386522` (el Lote 4); el resultado, el código del lote (cada registro lleva la distancia al inicio de su grupo, 8 bytes más). La VM cambió desde el Lote 4 (kernel `6.18.44-fc-v230`, el disco unas dos veces más rápido), así que los números no se comparan con los de `lote4/`.
+
+- `first-*.jsonl`: la línea de base del paso 0, una ronda de la base al arrancar el lote (E1-disco y E1-tmpfs con 1 y 8 pedidos en vuelo).
+- `final-e1-*.jsonl` y `final-e2.jsonl`: la medición del lote, tres rondas intercaladas de la base y el resultado: E1-disco y E1-tmpfs con 1 y 8 pedidos en vuelo, y el control E2-tmpfs con 500 salas.
+- `extra-e1-disk-*.jsonl`: tres rondas más de E1-disco con 1 pedido en vuelo, intercaladas, empezando por el resultado.

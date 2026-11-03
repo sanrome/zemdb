@@ -212,9 +212,9 @@ impl TieredLog {
             meta,
             _lock: lock,
         };
-        // Opening truncated a damaged last frame of `active.wal` below a recorded floor: the
-        // next record would not continue it, so it is sealed with its real range, and the lost
-        // operations are a gap.
+        // Opening truncated a damaged last frame, or last group of commits, of `active.wal`
+        // below a recorded floor: the next record would not continue it, so it is sealed with
+        // its real range, and the lost operations are a gap.
         if log
             .warm_disk
             .active_end_seq()

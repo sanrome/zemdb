@@ -313,6 +313,63 @@ fn check_search(log: &[u8], from: usize) {
     }
 }
 
+/// Where the group of the complete valid frame at `position` of `log` starts, if it decodes.
+fn group_start(log: &[u8], position: usize) -> Option<Result<u64, ()>> {
+    let header = parse_batch_header(log[position..].first_chunk().unwrap()).unwrap();
+    let payload = &log[position + BATCH_HEADER_SIZE..position + header.frame_len()];
+    match decode_batch_payload(&header, payload) {
+        Ok(BatchPayloadDecode::Batch { group_offset, .. }) => {
+            Some((position as u64).checked_sub(group_offset).ok_or(()))
+        }
+        Ok(BatchPayloadDecode::ChecksumMismatch { .. }) => None,
+        Err(_) => Some(Err(())),
+    }
+}
+
+/// The search after a damaged group done naively, as a loop of `find_valid_frame`; `None` when
+/// one of its searches took a header without checking its payload, where the two may differ.
+fn naive_search_after_group(log: &[u8], at: usize) -> Option<Option<u64>> {
+    let mut from = at + 1;
+    loop {
+        let found = find_valid_frame(&mut Cursor::new(log), from as u64, log.len() as u64).unwrap();
+        let Some(position) = found else {
+            return Some(None);
+        };
+        let position = position as usize;
+        match group_start(log, position)? {
+            Ok(start) if start <= at as u64 => {
+                let header = parse_batch_header(log[position..].first_chunk().unwrap()).unwrap();
+                from = position + header.frame_len() - (BATCH_HEADER_SIZE - 1);
+            }
+            _ => return Some(Some(position as u64)),
+        }
+    }
+}
+
+/// The search after a damaged group, after damage at `at` that leaves an invalid header: a frame
+/// it finds starts after the damage, has a valid header, fits in `log` and is not of the group;
+/// and unless it took a header without checking it, it finds what the naive search finds.
+fn check_search_after_group(log: &[u8], at: usize) {
+    let anomaly = FrameAnomaly::InvalidHeader(InvalidHeader::Magic([0, 0]));
+    let found =
+        find_frame_after_group(&mut Cursor::new(log), at as u64, &anomaly, log.len() as u64)
+            .expect("reads stay within the log");
+    if let Some(found) = found {
+        let position = found as usize;
+        assert!(position > at);
+        let header = parse_batch_header(log[position..].first_chunk().unwrap()).unwrap();
+        assert!(position + header.frame_len() <= log.len());
+        match group_start(log, position) {
+            Some(Ok(start)) => assert!(start > at as u64, "a frame of the group at {position}"),
+            Some(Err(())) => {}
+            None => return, // taken without checking its payload
+        }
+    }
+    if let Some(naive) = naive_search_after_group(log, at) {
+        assert_eq!(found, naive, "damage at {at}");
+    }
+}
+
 fn check_wal_logs(seed: u64, cases: u64) {
     let log = sample_wal_log();
     let offsets = frame_offsets(&log);
@@ -327,6 +384,7 @@ fn check_wal_logs(seed: u64, cases: u64) {
         check_replay(&data);
         check_first_frame(&data[(*rng.pick(&offsets)).min(data.len())..]);
         check_search(&data, rng.below(data.len() + 1));
+        check_search_after_group(&data, rng.below(data.len() + 1));
     });
 }
 
@@ -392,12 +450,12 @@ fn random_payloads_under_a_valid_header_never_panic_the_wal_decoder_long() {
 
 #[test]
 fn a_wal_payload_declaring_u64_max_operations_is_corruption() {
-    // The payload of a frame without operations is a `None` mutation id and an empty list,
-    // whose length is a fixed-width `u64`.
+    // The payload of a frame without operations is where its group starts and a `None`
+    // mutation id, then an empty list, whose length is a fixed-width `u64`.
     let frame = encode_wal_batch(&[], None).unwrap();
     let mut payload = frame[BATCH_HEADER_SIZE..].to_vec();
-    assert_eq!(payload, [0; 9]);
-    payload[1..].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert_eq!(payload, [0; 17]);
+    payload[9..].copy_from_slice(&u64::MAX.to_le_bytes());
     let mut damaged = frame[..BATCH_HEADER_SIZE].to_vec();
     damaged.extend_from_slice(&payload);
     seal_frame(&mut damaged, 0);

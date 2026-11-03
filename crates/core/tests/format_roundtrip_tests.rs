@@ -71,7 +71,8 @@ fn check_wal_logs(seed: u64, cases: u64) {
         for _ in 0..rng.between(1, 5) {
             let ops = sequenced_operations(rng, 4);
             let id = option(rng, mutation_id);
-            let frame = encode_wal_batch(&ops, id).unwrap();
+            let group_offset = if rng.coin() { 0 } else { rng.u64() };
+            let frame = encode_wal_batch_in_group(&ops, id, group_offset).unwrap();
 
             let header = parse_batch_header(frame.first_chunk().unwrap()).unwrap();
             assert_eq!(header.ops_count(), ops.len());
@@ -82,6 +83,10 @@ fn check_wal_logs(seed: u64, cases: u64) {
                     frame.len() - BATCH_HEADER_SIZE
                 );
             }
+            assert!(matches!(
+                decode_batch_payload(&header, &frame[BATCH_HEADER_SIZE..]).unwrap(),
+                BatchPayloadDecode::Batch { group_offset: back, .. } if back == group_offset
+            ));
             match decode_wal_batch_from_slice(&frame).unwrap() {
                 WalBatchDecodeResult::Ok {
                     ops: back,
