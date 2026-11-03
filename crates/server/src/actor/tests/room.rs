@@ -13,7 +13,8 @@ use crate::log::RoomLifecycleOverrides;
 use crate::test_support::TestRng;
 use std::fs;
 use std::ops::RangeInclusive;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use tempfile::{tempdir, TempDir};
 use tokio::sync::oneshot;
 use zemdb_core::id::ClientId;
@@ -1579,6 +1580,30 @@ async fn prune_stopped_actor(actor: &mut RoomActor, writer: &ClientId, peer: &Cl
     actor.ack(writer, seq(8)).await.unwrap();
     assert!(actor.log().tail_seq() > seq(1), "the ack must prune");
     actor.register(peer, Some(seq(8)), Some(1)).unwrap();
+}
+
+impl RoomActor {
+    /// Commits `op` as a group of its own, and returns its reply; `flow` is what the group
+    /// returned.
+    async fn commit(
+        &mut self,
+        client_id: &ClientId,
+        mutation_id: MutationId,
+        last_ack_seq: SequenceNumber,
+        op: Operation,
+        flow: &mut ControlFlow<()>,
+    ) -> Result<CommitResponse, ServerError> {
+        let (reply, rx) = oneshot::channel();
+        let request = CommitRequest {
+            client_id: client_id.clone(),
+            mutation_id,
+            last_ack_seq,
+            op,
+            reply,
+        };
+        *flow = self.commit_group(request).await;
+        rx.await.unwrap()
+    }
 }
 
 fn state_of(actor: &RoomActor, client: &ClientId) -> ClientState {
@@ -3648,5 +3673,721 @@ async fn a_room_reloads_only_its_own_schema() {
         events.try_recv().unwrap(),
         RoomEvent::SchemaReloaded(SchemaId::new("todo").unwrap())
     );
+    fx.manager.shutdown_all().await;
+}
+
+// The group commit: the commits waiting in the mailbox share one fsync.
+
+impl Fixture {
+    fn active_wal(&self) -> PathBuf {
+        self.room_dir().join("segments").join("active.wal")
+    }
+
+    /// How many times the room synced `active.wal` after appending records.
+    fn fsyncs(&self) -> usize {
+        io_probe::count(IoEvent::ActiveWalSync, &self.room_dir().join("segments"))
+    }
+}
+
+type CommitReply = oneshot::Receiver<Result<CommitResponse, ServerError>>;
+
+/// Sends a commit to the room without waiting for its reply.
+async fn send_commit(
+    sender: &mpsc::Sender<RoomCommand>,
+    client_id: &ClientId,
+    mutation_id: MutationId,
+    last_ack_seq: SequenceNumber,
+    op: Operation,
+) -> CommitReply {
+    let (tx, rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::Commit {
+            client_id: client_id.clone(),
+            mutation_id,
+            last_ack_seq,
+            op,
+            reply: tx,
+        })
+        .await
+        .unwrap();
+    rx
+}
+
+/// Holds the next fsync of `active` (a room's `active.wal`) until the returned sender sends or
+/// is dropped; the returned receiver tells when it is held.
+fn hold_next_fsync(active: &Path) -> (std::sync::mpsc::Sender<()>, oneshot::Receiver<()>) {
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let (held_tx, held_rx) = oneshot::channel();
+    fail_point::arm_hook("warm_append_sync", active, move || {
+        let _ = held_tx.send(());
+        let _ = release_rx.recv_timeout(POLL_CEILING);
+    });
+    (release_tx, held_rx)
+}
+
+/// Runs `check` right before the next fsync of `active`, on the thread that runs it.
+fn before_next_fsync(active: &Path, check: impl FnOnce() + Send + 'static) {
+    fail_point::arm_hook("warm_append_sync", active, check);
+}
+
+/// How many of `replies` already have an answer; any answer found is lost to the test.
+fn answered(replies: &Mutex<Vec<CommitReply>>) -> usize {
+    replies
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .map(|reply| reply.try_recv())
+        .filter(|answer| !matches!(answer, Err(oneshot::error::TryRecvError::Empty)))
+        .count()
+}
+
+fn insert_op_with_title(id: i64, title_len: usize) -> Operation {
+    let row = RowBuilder::new()
+        .set("id", id)
+        .set("title", "t".repeat(title_len))
+        .build();
+    test_schema()
+        .to_operation_insert("tasks", &row, 1000)
+        .unwrap()
+}
+
+/// The commits that arrive while an fsync runs wait in the mailbox, and the next fsync covers
+/// all of them: fewer fsyncs than commits. None is answered before that fsync, each gets the
+/// sequence of its place in the mailbox, and the group is announced once, with its head.
+#[tokio::test]
+async fn commits_waiting_behind_an_fsync_share_the_next_one() {
+    const WAITING: u8 = 10;
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    let events = subscribe(&sender).await;
+
+    let (release, held) = hold_next_fsync(&fx.active_wal());
+    let first = send_commit(&sender, &client, mutation(1), seq(0), insert_op(1)).await;
+    held.await.unwrap();
+    let replies = Arc::new(Mutex::new(Vec::new()));
+    for n in 2..=WAITING + 1 {
+        let reply = send_commit(&sender, &client, mutation(n), seq(0), insert_op(n.into())).await;
+        replies.lock().unwrap().push(reply);
+    }
+    let early = Arc::new(Mutex::new(None));
+    let events = Arc::new(Mutex::new(events));
+    let announced_early = Arc::new(Mutex::new(Vec::new()));
+    before_next_fsync(&fx.active_wal(), {
+        let (replies, early) = (Arc::clone(&replies), Arc::clone(&early));
+        let (events, announced) = (Arc::clone(&events), Arc::clone(&announced_early));
+        move || {
+            *early.lock().unwrap() = Some(answered(&replies));
+            let mut events = events.lock().unwrap();
+            while let Ok(event) = events.try_recv() {
+                announced.lock().unwrap().push(event);
+            }
+        }
+    });
+    release.send(()).unwrap();
+
+    assert_eq!(first.await.unwrap().unwrap().assigned_seq, seq(1));
+    let replies = std::mem::take(&mut *replies.lock().unwrap());
+    for (n, reply) in (2..).zip(replies) {
+        assert_eq!(reply.await.unwrap().unwrap().assigned_seq, seq(n));
+    }
+    assert_eq!(
+        fx.fsyncs(),
+        2,
+        "one fsync for the first commit and one for the rest"
+    );
+    assert_eq!(
+        *early.lock().unwrap(),
+        Some(0),
+        "a commit of the group was answered before the fsync that covers it"
+    );
+    assert_eq!(
+        *announced_early.lock().unwrap(),
+        vec![RoomEvent::HeadAdvanced(seq(1))],
+        "only the first commit may be announced before the fsync of the group"
+    );
+    let head = u64::from(WAITING) + 1;
+    let after_fsync: Vec<RoomEvent> =
+        std::iter::from_fn(|| events.lock().unwrap().try_recv().ok()).collect();
+    assert_eq!(
+        after_fsync,
+        vec![RoomEvent::HeadAdvanced(seq(head))],
+        "the group must be announced once, with its head"
+    );
+    let synced = sync_all(&sender, &client).await.unwrap();
+    let seqs: Vec<u64> = synced.ops.iter().map(|op| op.seq.get()).collect();
+    assert_eq!(seqs, (1..=head).collect::<Vec<_>>());
+    fx.manager.shutdown_all().await;
+}
+
+/// The fsync of a group fails: every commit of the group is answered `Unavailable` and the
+/// room stops. The records reached the file, so once the room reopens a retry of each, in any
+/// order, is acknowledged with the sequence it had in the group.
+#[tokio::test]
+async fn a_failed_fsync_fails_every_commit_of_its_group_and_retries_get_their_sequences() {
+    const WAITING: u8 = 5;
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+
+    let (release, held) = hold_next_fsync(&fx.active_wal());
+    let first = send_commit(&sender, &client, mutation(1), seq(0), insert_op(1)).await;
+    held.await.unwrap();
+    let mut replies = Vec::new();
+    for n in 2..=WAITING + 1 {
+        replies.push(send_commit(&sender, &client, mutation(n), seq(0), insert_op(n.into())).await);
+    }
+    // A commit of the group that is rejected keeps its own answer.
+    let invalid = send_commit(&sender, &client, mutation(99), seq(0), invalid_op()).await;
+    let active = fx.active_wal();
+    before_next_fsync(&fx.active_wal(), move || {
+        fail_point::arm("warm_append_sync", &active)
+    });
+    release.send(()).unwrap();
+
+    assert_eq!(first.await.unwrap().unwrap().assigned_seq, seq(1));
+    assert!(matches!(
+        invalid.await,
+        Ok(Err(ServerError::SchemaViolation(_)))
+    ));
+    for reply in replies {
+        assert!(
+            matches!(reply.await, Ok(Err(ServerError::Unavailable(_)))),
+            "every commit of the failed group must be answered Unavailable"
+        );
+    }
+    assert!(
+        sender.is_closed(),
+        "the room must stop after a failed fsync"
+    );
+
+    let recovered = fx.sender().await;
+    for n in (2..=WAITING + 1).rev() {
+        let retry = commit(
+            &recovered,
+            &client,
+            mutation(n),
+            seq(0),
+            insert_op(n.into()),
+        )
+        .await;
+        assert_eq!(retry.unwrap().assigned_seq, seq(n.into()));
+    }
+    let synced = sync_all(&recovered, &client).await.unwrap();
+    assert_eq!(synced.ops.len(), usize::from(WAITING) + 1);
+    fx.manager.shutdown_all().await;
+}
+
+/// In the middle of a group, a commit that is rejected leaves no trace and does not hold back
+/// the others, and a retry of a mutation earlier in the group gets its sequence.
+#[tokio::test]
+async fn a_rejected_commit_in_a_group_leaves_no_trace_and_a_repeated_one_gets_its_sequence() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let (writer, other) = (
+        ClientId::new("writer").unwrap(),
+        ClientId::new("other").unwrap(),
+    );
+    register(&sender, &writer).await;
+    register(&sender, &other).await;
+
+    let (release, held) = hold_next_fsync(&fx.active_wal());
+    let first = send_commit(&sender, &writer, mutation(1), seq(0), insert_op(1)).await;
+    held.await.unwrap();
+    let a = send_commit(&sender, &writer, mutation(2), seq(0), insert_op(2)).await;
+    let invalid = send_commit(&sender, &other, mutation(3), seq(0), invalid_op()).await;
+    let ahead = send_commit(&sender, &other, mutation(4), seq(5), insert_op(4)).await;
+    let c = send_commit(&sender, &writer, mutation(5), seq(0), insert_op(5)).await;
+    let a_again = send_commit(&sender, &writer, mutation(2), seq(0), insert_op(2)).await;
+    // The same mutation id from another client is another mutation.
+    let d = send_commit(&sender, &other, mutation(2), seq(0), insert_op(6)).await;
+    // No client has seen a sequence of the group before the group is durable.
+    let pending = send_commit(&sender, &other, mutation(7), seq(2), insert_op(7)).await;
+    release.send(()).unwrap();
+
+    assert_eq!(first.await.unwrap().unwrap().assigned_seq, seq(1));
+    assert_eq!(a.await.unwrap().unwrap().assigned_seq, seq(2));
+    assert!(matches!(
+        invalid.await.unwrap(),
+        Err(ServerError::SchemaViolation(_))
+    ));
+    assert!(matches!(
+        ahead.await.unwrap(),
+        Err(ServerError::InvalidSequence { .. })
+    ));
+    assert_eq!(c.await.unwrap().unwrap().assigned_seq, seq(3));
+    assert_eq!(a_again.await.unwrap().unwrap().assigned_seq, seq(2));
+    assert_eq!(d.await.unwrap().unwrap().assigned_seq, seq(4));
+    assert!(matches!(
+        pending.await.unwrap(),
+        Err(ServerError::InvalidSequence { .. })
+    ));
+    assert_eq!(
+        fx.fsyncs(),
+        2,
+        "the rejected commits must not hold back the group"
+    );
+
+    let synced = sync_all(&sender, &writer).await.unwrap();
+    let ids: Vec<i64> = synced
+        .ops
+        .iter()
+        .map(|op| match op.op.pk().values()[0] {
+            Value::Int(id) => id,
+            ref other => panic!("unexpected key {other:?}"),
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 2, 5, 6]);
+    assert_eq!(metrics(&sender).await.head_seq, seq(4));
+    fx.manager.shutdown_all().await;
+}
+
+/// A command that is not a commit ends the group in front of it: it is handled after that
+/// group's fsync, and before the commits behind it. A `/sync` sees the group before it, durable,
+/// and not the commit behind it; an `Ack` answers with the head of the group before it.
+#[tokio::test]
+async fn a_command_that_is_not_a_commit_ends_the_group_and_sees_it_durable() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+
+    let (release, held) = hold_next_fsync(&fx.active_wal());
+    let first = send_commit(&sender, &client, mutation(1), seq(0), insert_op(1)).await;
+    held.await.unwrap();
+    let a = send_commit(&sender, &client, mutation(2), seq(0), insert_op(2)).await;
+    let (ack_tx, ack_rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::Ack {
+            client_id: client.clone(),
+            ack_seq: seq(1),
+            reply: ack_tx,
+        })
+        .await
+        .unwrap();
+    let (sync_tx, sync_rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::Sync {
+            client_id: client.clone(),
+            from_seq: seq(0),
+            max_batch_size: 100,
+            reply: sync_tx,
+        })
+        .await
+        .unwrap();
+    let b = send_commit(&sender, &client, mutation(3), seq(0), insert_op(3)).await;
+
+    // The sync is not answered yet at the fsync of the group of `a`, and is at that of `b`.
+    let sync_reply = Arc::new(Mutex::new(sync_rx));
+    let (at_fsync_of_a, at_fsync_of_b) = (Arc::new(Mutex::new(None)), Arc::new(Mutex::new(None)));
+    before_next_fsync(&fx.active_wal(), {
+        let (sync_reply, at_a, at_b, active) = (
+            Arc::clone(&sync_reply),
+            Arc::clone(&at_fsync_of_a),
+            Arc::clone(&at_fsync_of_b),
+            fx.active_wal(),
+        );
+        move || {
+            *at_a.lock().unwrap() = Some(sync_reply.lock().unwrap().try_recv().is_ok());
+            before_next_fsync(&active, move || {
+                *at_b.lock().unwrap() = Some(sync_reply.lock().unwrap().try_recv());
+            });
+        }
+    });
+    release.send(()).unwrap();
+
+    let within = |reply| tokio::time::timeout(POLL_CEILING, reply);
+    let first = within(first)
+        .await
+        .expect("the first commit was never answered");
+    assert_eq!(first.unwrap().unwrap().assigned_seq, seq(1));
+    let a = within(a)
+        .await
+        .expect("the commit in front of the sync was never answered");
+    assert_eq!(a.unwrap().unwrap().assigned_seq, seq(2));
+    let acked = tokio::time::timeout(POLL_CEILING, ack_rx).await;
+    assert_eq!(
+        acked.expect("the ack was never answered").unwrap().unwrap(),
+        seq(2)
+    );
+    let b = within(b)
+        .await
+        .expect("the commit behind the sync was never answered");
+    assert_eq!(b.unwrap().unwrap().assigned_seq, seq(3));
+    assert_eq!(
+        *at_fsync_of_a.lock().unwrap(),
+        Some(false),
+        "the sync was answered before the fsync of the group in front of it"
+    );
+    let sync = at_fsync_of_b
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the commit behind the sync was never synced")
+        .expect("the sync must be answered before the fsync of the commit behind it")
+        .unwrap();
+    let seqs: Vec<u64> = sync.ops.iter().map(|op| op.seq.get()).collect();
+    assert_eq!(seqs, vec![1, 2]);
+    assert_eq!(sync.head_seq, seq(2));
+    assert_eq!(fx.fsyncs(), 3);
+    fx.manager.shutdown_all().await;
+}
+
+/// A group whose commits take `active.wal` past `ram_max_ops` seals it once, at the group's
+/// end, into a segment that holds the whole group.
+#[tokio::test]
+async fn a_group_that_reaches_the_segment_limit_seals_active_wal_at_its_end() {
+    let fx = Fixture::new(RoomLifecycleOverrides {
+        ram_max_ops: Some(3),
+        ..RoomLifecycleOverrides::default()
+    })
+    .await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+
+    let (release, held) = hold_next_fsync(&fx.active_wal());
+    let first = send_commit(&sender, &client, mutation(1), seq(0), insert_op(1)).await;
+    held.await.unwrap();
+    let mut replies = Vec::new();
+    for n in 2..=6u8 {
+        replies.push(send_commit(&sender, &client, mutation(n), seq(0), insert_op(n.into())).await);
+    }
+    release.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    for reply in replies {
+        reply.await.unwrap().unwrap();
+    }
+
+    let segments = fx.room_dir().join("segments");
+    assert!(
+        segment_path(&segments, seq(1), seq(6), Tier::Warm).exists(),
+        "the group must be sealed whole, at its end"
+    );
+    assert!(!segment_path(&segments, seq(1), seq(3), Tier::Warm).exists());
+    assert!(!fx.active_wal().exists());
+    let synced = sync_all(&sender, &client).await.unwrap();
+    assert_eq!(synced.ops.len(), 6);
+    fx.manager.shutdown_all().await;
+}
+
+/// Sealing `active.wal` at the end of a group fails after the group is durable: every commit
+/// of the group is acknowledged, and then the room stops.
+#[tokio::test]
+async fn a_seal_that_fails_after_a_group_acknowledges_every_commit_of_it_and_stops_the_room() {
+    let fx = Fixture::new(RoomLifecycleOverrides {
+        ram_max_ops: Some(3),
+        ..RoomLifecycleOverrides::default()
+    })
+    .await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+
+    let (release, held) = hold_next_fsync(&fx.active_wal());
+    let first = send_commit(&sender, &client, mutation(1), seq(0), insert_op(1)).await;
+    held.await.unwrap();
+    let mut replies = Vec::new();
+    for n in 2..=5u8 {
+        replies.push(send_commit(&sender, &client, mutation(n), seq(0), insert_op(n.into())).await);
+    }
+    let segments = fx.room_dir().join("segments");
+    before_next_fsync(&fx.active_wal(), move || {
+        fail_point::arm("sync_dir", &segments)
+    });
+    release.send(()).unwrap();
+
+    first.await.unwrap().unwrap();
+    for (n, reply) in (2..).zip(replies) {
+        let acked = reply
+            .await
+            .unwrap()
+            .expect("a durable commit must be acknowledged");
+        assert_eq!(acked.assigned_seq, seq(n));
+    }
+    assert!(
+        sender.is_closed(),
+        "the room must restart after a failed seal"
+    );
+    let recovered = fx.sender().await;
+    let synced = sync_all(&recovered, &client).await.unwrap();
+    assert_eq!(synced.ops.len(), 5);
+    fx.manager.shutdown_all().await;
+}
+
+/// A group takes at most its cap of commits, and at most its cap of bytes of new operations
+/// (plus the operation that reaches it): the rest wait for the next group.
+#[tokio::test]
+async fn a_group_takes_at_most_its_cap_of_commits_and_of_bytes() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+
+    let waiting = GROUP_MAX_COMMITS + 3;
+    let (release, held) = hold_next_fsync(&fx.active_wal());
+    let first = send_commit(&sender, &client, mutation(0), seq(0), insert_op(0)).await;
+    held.await.unwrap();
+    let mut replies = Vec::new();
+    for n in 1..=waiting {
+        let id = MutationId::from_u128(n as u128);
+        replies.push(send_commit(&sender, &client, id, seq(0), insert_op(n as i64)).await);
+    }
+    release.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    for reply in replies {
+        reply.await.unwrap().unwrap();
+    }
+    assert_eq!(
+        fx.fsyncs(),
+        3,
+        "the first commit, a full group and the rest"
+    );
+
+    // Operations of a quarter of the cap of bytes, and a little more: the fourth reaches it.
+    let title_len = (GROUP_MAX_BYTES / 4) as usize;
+    let (release, held) = hold_next_fsync(&fx.active_wal());
+    let first = send_commit(&sender, &client, mutation(200), seq(0), insert_op(500)).await;
+    held.await.unwrap();
+    let mut replies = Vec::new();
+    for n in 1..=6u8 {
+        let op = insert_op_with_title(500 + i64::from(n), title_len);
+        replies.push(send_commit(&sender, &client, mutation(200 + n), seq(0), op).await);
+    }
+    release.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    for reply in replies {
+        reply.await.unwrap().unwrap();
+    }
+    assert_eq!(
+        fx.fsyncs(),
+        3 + 3,
+        "the first commit, a group of four and one of two"
+    );
+    fx.manager.shutdown_all().await;
+}
+
+/// The catch-up of each commit of a group reaches the head of the group, also for a client
+/// that was up to date before it, whose own operation is not the last of the group.
+#[tokio::test]
+async fn the_catchup_of_every_commit_of_a_group_reaches_the_head_of_the_group() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let (x, y) = (ClientId::new("x").unwrap(), ClientId::new("y").unwrap());
+    register(&sender, &x).await;
+    register(&sender, &y).await;
+
+    let (release, held) = hold_next_fsync(&fx.active_wal());
+    let first = send_commit(&sender, &x, mutation(1), seq(0), insert_op(1)).await;
+    held.await.unwrap();
+    let from_x = send_commit(&sender, &x, mutation(2), seq(1), insert_op(2)).await;
+    let from_y = send_commit(&sender, &y, mutation(3), seq(1), insert_op(3)).await;
+    release.send(()).unwrap();
+    first.await.unwrap().unwrap();
+
+    for reply in [from_x, from_y] {
+        let reply = reply.await.unwrap().unwrap();
+        let seqs: Vec<u64> = reply.catchup_ops.iter().map(|op| op.seq.get()).collect();
+        assert_eq!(
+            seqs,
+            vec![2, 3],
+            "the catch-up must reach the head of the group"
+        );
+        assert!(!reply.has_more);
+    }
+    fx.manager.shutdown_all().await;
+}
+
+/// Sealing `active.wal` at the end of a group fails: as before the group commit, the room
+/// closes its mailbox before it acknowledges any commit of the group, so that a request sent
+/// once one of them is acknowledged is never taken by the stopping actor (`RoomManager` sends
+/// it to the room reopened from disk). The actor answers the second commit of the group with a
+/// catch-up read from disk, which waits for the only permit of its file I/O pool, held by the
+/// test.
+#[tokio::test]
+async fn a_group_whose_seal_fails_closes_the_mailbox_before_its_first_ack() {
+    let dir = tempdir().unwrap();
+    let io = IoThreads::new(1);
+    let config = Arc::new(ServerConfig {
+        data_dir: dir.path().to_path_buf(),
+        ..ServerConfig::default()
+    });
+    // The RAM window keeps the last 4 operations, and 4 operations seal `active.wal`.
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 4,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (sender, actor) = RoomActor::open(
+        RoomId::new("room").unwrap(),
+        1,
+        SchemaId::new("todo").unwrap(),
+        Arc::new(test_schema()),
+        dir.path(),
+        config,
+        policy,
+        relay_on(&dir),
+        Arc::new(InflightBudget::new(u64::MAX, u64::MAX)),
+        TEST_TIMINGS,
+        Arc::clone(&io),
+    )
+    .unwrap();
+    let segments = room_dir(dir.path(), &actor.room_id).join("segments");
+    let active = segments.join("active.wal");
+    let running = tokio::spawn(actor.run());
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+
+    let (release, held) = hold_next_fsync(&active);
+    let first = send_commit(&sender, &client, mutation(1), seq(0), insert_op(1)).await;
+    held.await.unwrap();
+    // The catch-up of the first commit of the group comes from the RAM window (cursor 1), that
+    // of the second from disk (cursor 0).
+    let from_ram = send_commit(&sender, &client, mutation(2), seq(1), insert_op(2)).await;
+    let from_disk = send_commit(&sender, &client, mutation(3), seq(0), insert_op(3)).await;
+    let mut rest = Vec::new();
+    for n in 4..=5u8 {
+        rest.push(send_commit(&sender, &client, mutation(n), seq(0), insert_op(n.into())).await);
+    }
+    // At the fsync of the group the test queues for the pool's permit, ahead of the catch-up
+    // read of `from_disk`, and the seal after the fsync fails.
+    let (at_fsync_tx, at_fsync_rx) = oneshot::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    before_next_fsync(&active, {
+        let segments = segments.clone();
+        move || {
+            fail_point::arm("sync_dir", &segments);
+            let _ = at_fsync_tx.send(());
+            let _ = go_rx.recv_timeout(POLL_CEILING);
+        }
+    });
+    release.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    at_fsync_rx.await.unwrap();
+    let permit = io.io().permit();
+    tokio::pin!(permit);
+    assert!(futures::poll!(&mut permit).is_pending());
+    go_tx.send(()).unwrap();
+    let permit = permit.await;
+
+    let acked = from_ram
+        .await
+        .unwrap()
+        .expect("a durable commit must be acknowledged");
+    assert_eq!(acked.assigned_seq, seq(2));
+    let closed = sender.is_closed();
+    drop(permit);
+    from_disk.await.unwrap().unwrap();
+    for reply in rest {
+        reply.await.unwrap().unwrap();
+    }
+    assert_eq!(running.await.unwrap(), ActorExit::Stopped);
+    assert!(
+        closed,
+        "the mailbox was still open once a commit of the group was acknowledged: a request sent \
+         then is taken by the stopping actor and dropped, instead of reaching the reopened room"
+    );
+}
+
+/// The fsync of a group fails with a retry of one of its own mutations in it: the retry is not
+/// acknowledged either, since the record it would acknowledge may not be on disk.
+#[tokio::test]
+async fn a_retry_in_a_group_whose_fsync_fails_is_not_acknowledged() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+
+    let (release, held) = hold_next_fsync(&fx.active_wal());
+    let first = send_commit(&sender, &client, mutation(1), seq(0), insert_op(1)).await;
+    held.await.unwrap();
+    let original = send_commit(&sender, &client, mutation(2), seq(0), insert_op(2)).await;
+    let retry = send_commit(&sender, &client, mutation(2), seq(0), insert_op(2)).await;
+    let active = fx.active_wal();
+    before_next_fsync(&fx.active_wal(), move || {
+        fail_point::arm("warm_append_sync", &active)
+    });
+    release.send(()).unwrap();
+
+    assert_eq!(first.await.unwrap().unwrap().assigned_seq, seq(1));
+    for reply in [original, retry] {
+        assert!(
+            matches!(reply.await, Ok(Err(ServerError::Unavailable(_)))),
+            "no commit of a group whose fsync failed may be acknowledged, retries included"
+        );
+    }
+    let recovered = fx.sender().await;
+    let retry = commit(&recovered, &client, mutation(2), seq(0), insert_op(2)).await;
+    assert_eq!(retry.unwrap().assigned_seq, seq(2));
+    fx.manager.shutdown_all().await;
+}
+
+/// A panic while a group is written: the commits of the group lose their replies (the manager
+/// answers them `Internal`), and the command that ended the group, held back in the mailbox,
+/// is answered `Unavailable`, as are the commands still queued behind it.
+#[tokio::test]
+async fn a_panic_during_a_group_answers_the_command_held_behind_it_unavailable() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+
+    let (release, held) = hold_next_fsync(&fx.active_wal());
+    let first = send_commit(&sender, &client, mutation(1), seq(0), insert_op(1)).await;
+    held.await.unwrap();
+    let grouped = send_commit(&sender, &client, mutation(2), seq(0), insert_op(2)).await;
+    let (heartbeat_tx, heartbeat_rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::Heartbeat {
+            client_id: client.clone(),
+            reply: heartbeat_tx,
+        })
+        .await
+        .unwrap();
+    let queued = send_commit(&sender, &client, mutation(3), seq(0), insert_op(3)).await;
+    before_next_fsync(&fx.active_wal(), || {
+        panic!("injected panic in the fsync of a group")
+    });
+    release.send(()).unwrap();
+
+    first.await.unwrap().unwrap();
+    assert!(
+        grouped.await.is_err(),
+        "a commit of the group that panicked loses its reply"
+    );
+    assert!(
+        matches!(heartbeat_rx.await, Ok(Err(ServerError::Unavailable(_)))),
+        "the command held behind the group must be answered Unavailable"
+    );
+    assert!(matches!(queued.await, Ok(Err(ServerError::Unavailable(_)))));
+    fx.manager.shutdown_all().await;
+}
+
+/// A group never assigns `u64::MAX`, also when the head that is visible is further back than
+/// the head of the group.
+#[tokio::test]
+async fn a_group_never_assigns_the_last_sequence_number() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    fx.manager.shutdown_all().await;
+    let floor = u64::MAX - 3;
+    let meta = format!(r#"{{"pruned_through_seq": {floor}, "sealed_through_seq": 0}}"#);
+    durable::write_checked(&fx.room_dir().join("log_meta.json"), meta.as_bytes()).unwrap();
+
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    let (release, held) = hold_next_fsync(&fx.active_wal());
+    let first = send_commit(&sender, &client, mutation(1), seq(floor), insert_op(1)).await;
+    held.await.unwrap();
+    let second = send_commit(&sender, &client, mutation(2), seq(floor), insert_op(2)).await;
+    let third = send_commit(&sender, &client, mutation(3), seq(floor), insert_op(3)).await;
+    release.send(()).unwrap();
+
+    assert_eq!(first.await.unwrap().unwrap().assigned_seq, seq(floor + 1));
+    assert_eq!(second.await.unwrap().unwrap().assigned_seq, seq(floor + 2));
+    let third = third.await.unwrap();
+    assert!(matches!(third, Err(ServerError::Internal(_))), "{third:?}");
+    assert_eq!(metrics(&sender).await.head_seq, seq(floor + 2));
     fx.manager.shutdown_all().await;
 }

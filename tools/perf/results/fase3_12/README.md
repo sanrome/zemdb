@@ -33,3 +33,13 @@ La base es `414cab3`; el resultado, el código del lote con `ZEMDB_IO_THREADS` =
 - `variant-gqi-*.jsonl`: E1-disco del resultado contra la misma variante con `global_queue_interval(4)` en el runtime, tres rondas intercaladas.
 - `sweep-io-threads-more.jsonl`: dos corridas más de 4 y 16 en disco con 500 y 1.000 salas, que con la primera dan tres de cada uno.
 - `profile-*.json`, `.stat` y `.txt`: el perfil en tmpfs con 1.000 salas (la corrida del generador; `perf stat`, con el CPU, los cambios de contexto y las migraciones; y el perfil plano por biblioteca y símbolo).
+
+## `lote4/`: el *group commit*
+
+La base es `9214df3` (el Lote 3); el resultado, el código del lote; la variante de diagnóstico, el código del lote con grupos de un commit (`GROUP_MAX_COMMITS` = 1).
+
+- `first-*.jsonl`: la línea de base del paso 0, una ronda de la base al arrancar el lote (E1-disco con 1, 8 y 64 pedidos en vuelo; E1-tmpfs con 1 y 8; E2-disco con 1.000 salas y E2-tmpfs con 500).
+- `final-e1-*.jsonl` y `final-e2.jsonl`: la medición del lote, tres rondas intercaladas de la base y el resultado: E1-disco con 1, 8 y 64 pedidos en vuelo, E1-tmpfs con 1 y 8, E2-tmpfs con 500 salas y E2-disco con 750 y 1.000. Con 64 en vuelo, casi todos los commits de la base pasan de 10 ms, así que su lista `stalls` hace pesados los archivos de E1-disco.
+- `final-e2-r500-more.jsonl`: cuatro rondas más del control E2-tmpfs con 500 salas, intercaladas, empezando por el resultado.
+- `final-e2-r500-variant.jsonl`: el mismo control, cuatro rondas con el orden rotado de la base, el resultado y la variante.
+- `profile-*.json`, `.stat` y `.txt`: el perfil del control E2-tmpfs con 500 salas, dos rondas de la base, el resultado y la variante (la corrida del generador; `perf stat`, con el CPU, los cambios de contexto y las migraciones; y el perfil plano por biblioteca y símbolo, de la base y el resultado).

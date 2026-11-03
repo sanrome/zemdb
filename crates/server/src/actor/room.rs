@@ -4,7 +4,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use zemdb_core::id::{ClientId, MutationId, RoomId, SchemaId, SequenceNumber};
@@ -26,7 +26,7 @@ use crate::durable;
 use crate::error::ServerError;
 use crate::io_pool::{run_holding, IoThreads};
 use crate::log::budget::OpSize;
-use crate::log::tiered_log::MaintenanceClock;
+use crate::log::tiered_log::{AppendOutcome, MaintenanceClock};
 use crate::log::{RoomLifecyclePolicy, TieredLog};
 use crate::relay::{LogBounds, SnapshotRelay, Uploader};
 use crate::response_budget::{no_room, InflightBudget, Reservation, RESPONSE_OVERHEAD};
@@ -49,6 +49,15 @@ const EVENTS_CAPACITY: usize = 256;
 
 /// Most operations returned as catch-up with an acknowledged commit.
 const COMMIT_CATCHUP_BATCH: u32 = 100;
+
+/// Most commits a group takes from the mailbox. Below [`COMMIT_CATCHUP_BATCH`], so that the
+/// catch-up of a client that was up to date before the group reaches the group's end.
+const GROUP_MAX_COMMITS: usize = 64;
+
+/// Bytes of new operations (as the RAM window counts them) after which a group takes no
+/// more commits, so that one group writes at most this much plus one operation before its
+/// `fsync`.
+const GROUP_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Largest batch a sync is served with, whatever `max_batch_size` it asks for.
 const MAX_SYNC_BATCH: u32 = 1000;
@@ -101,7 +110,7 @@ pub struct RoomActor {
     lease_tracker: ClientLeaseTracker,
     head_seq: SequenceNumber,
     events_tx: broadcast::Sender<RoomEvent>,
-    receiver: mpsc::Receiver<RoomCommand>,
+    mailbox: Mailbox,
     /// Effective lifecycle policy: the server defaults overlaid with the room's overrides.
     policy: RoomLifecyclePolicy,
     /// Directory holding the room's files; keys the fail points of this room in tests.
@@ -184,7 +193,10 @@ impl RoomActor {
             lease_tracker,
             head_seq,
             events_tx,
-            receiver: command_rx,
+            mailbox: Mailbox {
+                receiver: command_rx,
+                held: None,
+            },
             policy: lifecycle_policy,
             #[cfg(test)]
             room_dir,
@@ -212,8 +224,9 @@ impl RoomActor {
     /// A panic is caught here instead of ending the task: the room is reported as terminated
     /// by a panic and every command still queued is answered with `Unavailable`, so those
     /// callers can retry against the room reopened from disk. The command being handled when
-    /// the panic occurred loses its reply; `RoomManager` answers it with `Internal`, since
-    /// retrying it could panic again. Dropping the actor afterwards releases the room's files.
+    /// the panic occurred (with a group of commits, every commit of the group) loses its reply;
+    /// `RoomManager` answers it with `Internal`, since retrying it could panic again. Dropping
+    /// the actor afterwards releases the room's files.
     pub async fn run(mut self) -> ActorExit {
         // Published once the actor runs, so that an actor opened for a spawn that was dropped
         // leaves none: the task that runs the actor clears it when the actor ends.
@@ -227,9 +240,9 @@ impl RoomActor {
                     panic = panic_message(panic.as_ref()),
                     "RoomActor panicked; the next request reopens the room from disk"
                 );
-                self.receiver.close();
+                self.mailbox.close();
                 // After `close`, `recv` yields the queued commands and then `None`.
-                while let Some(command) = self.receiver.recv().await {
+                while let Some(command) = self.mailbox.recv().await {
                     command.reject(ServerError::Unavailable(format!(
                         "Room {} stopped after an internal error; retry the request",
                         self.room_id
@@ -251,7 +264,7 @@ impl RoomActor {
 
         loop {
             tokio::select! {
-                cmd = self.receiver.recv() => {
+                cmd = self.mailbox.recv() => {
                     self.last_command_at = Instant::now();
                     match cmd {
                         Some(RoomCommand::Shutdown { reply }) => {
@@ -318,10 +331,10 @@ impl RoomActor {
     /// `Break` means a queued command left the room unable to operate safely.
     async fn drain_for_idle_shutdown(&mut self) -> ControlFlow<()> {
         info!(room = %self.room_id, "Room inactive; shutting down its actor");
-        self.receiver.close();
+        self.mailbox.close();
         self.stopping_idle = true;
         // After `close`, `recv` yields the queued commands and then `None`.
-        while let Some(command) = self.receiver.recv().await {
+        while let Some(command) = self.mailbox.recv().await {
             self.handle_command(command).await?;
         }
         ControlFlow::Continue(())
@@ -377,12 +390,14 @@ impl RoomActor {
                 op,
                 reply,
             } => {
-                let mut flow = ControlFlow::Continue(());
-                let res = self
-                    .commit(&client_id, mutation_id, last_ack_seq, op, &mut flow)
-                    .await;
-                let _ = reply.send(res);
-                return flow;
+                let first = CommitRequest {
+                    client_id,
+                    mutation_id,
+                    last_ack_seq,
+                    op,
+                    reply,
+                };
+                return self.commit_group(first).await;
             }
 
             RoomCommand::Sync {
@@ -488,40 +503,151 @@ impl RoomActor {
         })
     }
 
-    /// Commits `op`. Sets `flow` to `Break`, with the mailbox already closed, when the room
-    /// must stop after replying.
-    async fn commit(
-        &mut self,
+    /// Commits `first` together with the commits that wait behind it in the mailbox, as one
+    /// group: up to the first command that is not a commit, and to [`GROUP_MAX_COMMITS`] commits
+    /// or [`GROUP_MAX_BYTES`] of new operations. Each commit is checked and sequenced in order,
+    /// as if it came alone, and the new mutations are written to the log and made durable with
+    /// one `fsync`. Only then does the group become visible: the deduplication window and the
+    /// head take it, it is announced once, and every commit is answered, in order.
+    ///
+    /// `Break`, with the mailbox already closed, means the room must stop.
+    async fn commit_group(&mut self, first: CommitRequest) -> ControlFlow<()> {
+        let mut group = Group::after(self.head_seq);
+        let mut next = Some(first);
+        while let Some(request) = next {
+            self.sequence(request, &mut group);
+            next = if group.is_full() {
+                None
+            } else {
+                self.mailbox.next_commit()
+            };
+        }
+
+        // A failed write or fsync leaves the log in an unknown state: any record of the group
+        // may or may not be on disk, and a failed fsync cannot be retried safely. The room
+        // stops and is recovered from disk by the next request; deduplication acknowledges a
+        // retry of a mutation whose record survived with the sequence that reached disk.
+        let records = std::mem::take(&mut group.records);
+        let written = if records.is_empty() {
+            Ok(AppendOutcome::default())
+        } else {
+            self.log_io(move |log| log.append_group(records)).await
+        };
+        let outcome = match written {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                error!(
+                    room = %self.room_id,
+                    error = %err,
+                    "Log append failed; stopping room actor for recovery from disk"
+                );
+                // Closing the mailbox before replying guarantees that a caller retrying after
+                // this reply already sees the room as stopped and gets it respawned.
+                self.mailbox.close();
+                for commit in group.commits {
+                    let res = match commit.decision {
+                        Decision::Rejected(err) => Err(err),
+                        Decision::BehindLog => {
+                            self.reject_behind_log(&commit.client_id, commit.last_ack_seq);
+                            Err(ServerError::BehindCompaction)
+                        }
+                        Decision::Retry(_) | Decision::New(_) => {
+                            Err(ServerError::Unavailable(format!(
+                                "Room {} could not persist the commit and is restarting; \
+                                 retry the request",
+                                self.room_id
+                            )))
+                        }
+                    };
+                    let _ = commit.reply.send(res);
+                }
+                return ControlFlow::Break(());
+            }
+        };
+
+        // From here on the new mutations are durable: their replies must acknowledge them, so
+        // nothing below may turn them into an error.
+        for (key, seq) in &group.keys {
+            self.dedup_cache.record(*key, *seq);
+        }
+        if group.head > self.head_seq {
+            self.head_seq = group.head;
+            let _ = self.events_tx.send(RoomEvent::HeadAdvanced(group.head));
+        }
+        // A failed segment rotation after a durable append leaves the segment files in an
+        // uncertain state. The commits are still acknowledged; then the room stops and is
+        // recovered from disk by the next request. The mailbox is closed before the first reply,
+        // as when the write fails, so that a request sent after it reaches the reopened room.
+        let rotation_failed = outcome.rotation_error.is_some();
+        if let Some(err) = outcome.rotation_error {
+            error!(
+                room = %self.room_id,
+                error = %err,
+                "Segment rotation failed after a durable commit; stopping room actor for recovery from disk"
+            );
+            self.mailbox.close();
+        }
+        for commit in group.commits {
+            let res = self
+                .answer(&commit.client_id, commit.last_ack_seq, commit.decision)
+                .await;
+            let _ = commit.reply.send(res);
+        }
+        if rotation_failed {
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Checks `request` against the room and the commits of `group` before it, and adds it to
+    /// the group with what was decided: a rejection, a retry of a mutation already in the log
+    /// or in the group, or a new mutation, sequenced after the group's head. Changes nothing
+    /// outside the group.
+    fn sequence(&self, request: CommitRequest, group: &mut Group) {
+        let CommitRequest {
+            client_id,
+            mutation_id,
+            last_ack_seq,
+            op,
+            reply,
+        } = request;
+        let decision = self
+            .decide(&client_id, mutation_id, last_ack_seq, op, group)
+            .unwrap_or_else(Decision::Rejected);
+        group.commits.push(PendingCommit {
+            client_id,
+            last_ack_seq,
+            reply,
+            decision,
+        });
+    }
+
+    /// What [`sequence`](Self::sequence) decides for one commit; an `Err` is a rejection.
+    fn decide(
+        &self,
         client_id: &ClientId,
         mutation_id: MutationId,
         last_ack_seq: SequenceNumber,
         op: Operation,
-        flow: &mut ControlFlow<()>,
-    ) -> Result<CommitResponse, ServerError> {
+        group: &mut Group,
+    ) -> Result<Decision, ServerError> {
         self.ensure_registered(client_id)?;
+        // Against the head that is visible: a commit never learns of a sequence before it is
+        // durable, the group's included.
         self.check_within_head(last_ack_seq)?;
         let key = dedup_key(client_id, &mutation_id);
 
         // Exactly-once idempotency. Checked before any rejection based on client state:
         // a retried mutation was already committed and replicated, so it must always be
-        // acknowledged with its original sequence, never reported as a failure.
-        if let Some(existing_seq) = self.dedup_cache.is_duplicate(&key) {
-            // The retry is accepted, so the cursor it reports (already validated against
-            // head_seq) is recorded and the client's state recomputed from it.
-            self.observe(client_id, Some(last_ack_seq));
-            let mut reservation = self.reserve_response(client_id);
-            let (catchup_ops, has_more) = self
-                .catchup_after_commit(last_ack_seq, &mut reservation)
-                .await;
-            return Ok(CommitResponse {
-                assigned_seq: existing_seq,
-                catchup_ops,
-                has_more,
-                snapshot_wanted: self.snapshot_wanted_for(client_id),
-                schema_version: self.schema.version(),
-                schema_id: self.schema_id.clone(),
-                reservation,
-            });
+        // acknowledged with its original sequence, never reported as a failure. A retry of a
+        // mutation earlier in the group gets that mutation's sequence.
+        if let Some(existing_seq) = self.dedup_cache.is_duplicate(&key).or_else(|| {
+            group
+                .keys
+                .iter()
+                .find_map(|(k, seq)| (*k == key).then_some(*seq))
+        }) {
+            return Ok(Decision::Retry(existing_seq));
         }
 
         // Reject a cursor behind the compaction boundary before sequencing anything, so
@@ -529,8 +655,7 @@ impl RoomActor {
         // client's lifecycle state is not a reason to reject: a client that was bootstrapping
         // or dormant commits as soon as its cursor is inside the log.
         if self.log().is_behind_retention(last_ack_seq) {
-            self.reject_behind_log(client_id, last_ack_seq);
-            return Err(ServerError::BehindCompaction);
+            return Ok(Decision::BehindLog);
         }
 
         // The owner an operation declares must be the owner of the client sending it. Checked
@@ -541,15 +666,14 @@ impl RoomActor {
             .map_err(|err| ServerError::SchemaViolation(err.to_string()))?;
 
         // The room never assigns u64::MAX, so that `head_seq + 1` always exists.
-        if self.head_seq.get() >= u64::MAX - 1 {
+        if group.head.get() >= u64::MAX - 1 {
             return Err(ServerError::Internal(format!(
                 "Room {} has no sequence numbers left",
                 self.room_id
             )));
         }
-        // The new sequence stays local until the append succeeds.
-        let new_seq = self.head_seq.next();
-        let seq_op = SequencedOperation::new(new_seq, op);
+        // The new sequence stays in the group until the group is durable.
+        let seq_op = SequencedOperation::new(group.head.next(), op);
 
         // The operation must fit alone in a log record and in a response frame. A
         // mutation that does not is the client's error: it is rejected here, before any I/O,
@@ -557,50 +681,44 @@ impl RoomActor {
         check_operation_size(&seq_op, Some(key))
             .map_err(|err| ServerError::BadRequest(err.to_string()))?;
 
-        // A failed write or fsync leaves the log in an unknown state: the record may or may
-        // not be on disk, and a failed fsync cannot be retried safely. The room stops and is
-        // recovered from disk by the next request; if the record survived, deduplication
-        // acknowledges a retry of the same mutation with the sequence that reached disk.
-        let appended = seq_op.clone();
-        let outcome = match self
-            .log_io(move |log| log.append(appended, Some(key)))
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                error!(
-                    room = %self.room_id,
-                    error = %err,
-                    "Log append failed; stopping room actor for recovery from disk"
-                );
-                // Closing the mailbox before replying guarantees that a caller retrying after
-                // this reply already sees the room as stopped and gets it respawned.
-                self.receiver.close();
-                *flow = ControlFlow::Break(());
-                return Err(ServerError::Unavailable(format!(
-                    "Room {} could not persist the commit and is restarting; retry the request",
-                    self.room_id
-                )));
+        group.head = seq_op.seq;
+        group.bytes = group.bytes.saturating_add(OpSize::of(&seq_op).bytes);
+        group.keys.push((key, seq_op.seq));
+        group.records.push((seq_op.clone(), Some(key)));
+        Ok(Decision::New(seq_op))
+    }
+
+    /// The reply to a commit of a group whose new mutations are durable, given what was decided
+    /// for it. An accepted commit records the cursor it reports, and carries the catch-up from
+    /// that cursor.
+    async fn answer(
+        &mut self,
+        client_id: &ClientId,
+        last_ack_seq: SequenceNumber,
+        decision: Decision,
+    ) -> Result<CommitResponse, ServerError> {
+        let assigned_seq = match decision {
+            Decision::Rejected(err) => return Err(err),
+            Decision::BehindLog => {
+                self.reject_behind_log(client_id, last_ack_seq);
+                return Err(ServerError::BehindCompaction);
             }
+            Decision::Retry(seq) => seq,
+            Decision::New(ref seq_op) => seq_op.seq,
         };
 
-        // From here on the mutation is durable: the reply must acknowledge it, so nothing
-        // below may return an error.
-
-        self.dedup_cache.record(key, new_seq);
-        self.head_seq = new_seq;
-
-        // Refresh the client's lease, record the cursor reported with the commit and make
-        // the client Connected. Persisted on the next maintenance tick.
+        // Refresh the client's lease, record the cursor reported with the commit (already
+        // validated against the head) and make the client Connected. Persisted on the next
+        // maintenance tick.
         self.observe(client_id, Some(last_ack_seq));
 
-        let _ = self.events_tx.send(RoomEvent::HeadAdvanced(new_seq));
-
         // Catch-up for 1-RTT synchronization. A client that was up to date gets the operation
-        // it sent, without reading the log, if the response has room for it.
+        // it sent, without reading the log, if it is the head and the response has room for it.
         let mut reservation = self.reserve_response(client_id);
-        let (catchup_ops, has_more) = match reservation.as_mut() {
-            Some(reservation) if last_ack_seq.get() + 1 == new_seq.get() => {
+        let (catchup_ops, has_more) = match (decision, reservation.as_mut()) {
+            (Decision::New(seq_op), Some(reservation))
+                if last_ack_seq.get() + 1 == seq_op.seq.get() && seq_op.seq == self.head_seq =>
+            {
                 if reservation.grow(OpSize::of(&seq_op).in_response()) {
                     (vec![seq_op], false)
                 } else {
@@ -613,21 +731,8 @@ impl RoomActor {
             }
         };
 
-        // A failed segment rotation after a durable append leaves the segment files in an
-        // uncertain state. The commit is still acknowledged; then the room stops and is
-        // recovered from disk by the next request.
-        if let Some(err) = outcome.rotation_error {
-            error!(
-                room = %self.room_id,
-                error = %err,
-                "Segment rotation failed after a durable commit; stopping room actor for recovery from disk"
-            );
-            self.receiver.close();
-            *flow = ControlFlow::Break(());
-        }
-
         Ok(CommitResponse {
-            assigned_seq: new_seq,
+            assigned_seq,
             catchup_ops,
             has_more,
             snapshot_wanted: self.snapshot_wanted_for(client_id),
@@ -1128,6 +1233,118 @@ impl RoomActor {
         // can also move without an Ack (cursors reported by commits, clients becoming Dormant).
         self.prune_to_retention_floor().await;
         self.publish_snapshot_floor();
+    }
+}
+
+/// The room's mailbox. A group of commits ends at the first command that is not a commit,
+/// which the mailbox then holds back for the next [`recv`](Self::recv), so that commands are
+/// still handled in the order they came.
+struct Mailbox {
+    receiver: mpsc::Receiver<RoomCommand>,
+    held: Option<RoomCommand>,
+}
+
+impl Mailbox {
+    /// The next command, as [`mpsc::Receiver::recv`] returns it. Cancel safe: a command is
+    /// only taken by a call that returns it.
+    async fn recv(&mut self) -> Option<RoomCommand> {
+        if let Some(command) = self.held.take() {
+            return Some(command);
+        }
+        self.receiver.recv().await
+    }
+
+    /// The next command, if it is a commit already in the mailbox. Any other command is held
+    /// back for the next [`recv`](Self::recv), and ends the group: no command is taken past it.
+    fn next_commit(&mut self) -> Option<CommitRequest> {
+        debug_assert!(self.held.is_none(), "a group goes on past a held command");
+        match self.receiver.try_recv().ok()? {
+            RoomCommand::Commit {
+                client_id,
+                mutation_id,
+                last_ack_seq,
+                op,
+                reply,
+            } => Some(CommitRequest {
+                client_id,
+                mutation_id,
+                last_ack_seq,
+                op,
+                reply,
+            }),
+            other => {
+                self.held = Some(other);
+                None
+            }
+        }
+    }
+
+    /// Closes the mailbox: senders fail, and [`recv`](Self::recv) yields the commands already
+    /// in it, then `None`.
+    fn close(&mut self) {
+        self.receiver.close();
+    }
+}
+
+/// A commit taken from the mailbox.
+struct CommitRequest {
+    client_id: ClientId,
+    mutation_id: MutationId,
+    last_ack_seq: SequenceNumber,
+    op: Operation,
+    reply: oneshot::Sender<Result<CommitResponse, ServerError>>,
+}
+
+/// A commit of a group, waiting for the group to be written to be answered.
+struct PendingCommit {
+    client_id: ClientId,
+    last_ack_seq: SequenceNumber,
+    reply: oneshot::Sender<Result<CommitResponse, ServerError>>,
+    decision: Decision,
+}
+
+/// What a group decided for one of its commits before writing anything.
+enum Decision {
+    /// Rejected, with the error it is answered: it leaves no trace.
+    Rejected(ServerError),
+    /// Rejected with `BehindCompaction`, because the cursor it carries is behind the log; the
+    /// client's state is recomputed when it is answered.
+    BehindLog,
+    /// A retry of a mutation in the log or earlier in the group, with that mutation's
+    /// sequence.
+    Retry(SequenceNumber),
+    /// A new mutation, with the sequence it was given.
+    New(SequencedOperation),
+}
+
+/// The commits of a group as they are sequenced, before their `fsync`.
+struct Group {
+    commits: Vec<PendingCommit>,
+    /// The records of the new mutations, in order, to be written to the log.
+    records: Vec<(SequencedOperation, Option<MutationId>)>,
+    /// The deduplication keys of the new mutations, in order, with their sequences.
+    keys: Vec<(MutationId, SequenceNumber)>,
+    /// The head once the new mutations are durable.
+    head: SequenceNumber,
+    /// The bytes of the new operations, as the RAM window counts them.
+    bytes: u64,
+}
+
+impl Group {
+    /// An empty group, whose first new mutation follows `head_seq`.
+    fn after(head_seq: SequenceNumber) -> Self {
+        Self {
+            commits: Vec::new(),
+            records: Vec::new(),
+            keys: Vec::new(),
+            head: head_seq,
+            bytes: 0,
+        }
+    }
+
+    /// Whether the group takes no more commits.
+    fn is_full(&self) -> bool {
+        self.commits.len() >= GROUP_MAX_COMMITS || self.bytes >= GROUP_MAX_BYTES
     }
 }
 

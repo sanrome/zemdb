@@ -199,3 +199,23 @@ fn test_multi_thread_warm_disk_log_flock_concurrency_stress() {
     next_log.append_record(&make_op(2), None).unwrap();
     assert_eq!(next_log.active_end_seq().unwrap().get(), 2);
 }
+
+/// Records that do not continue each other are rejected before any of them is written, as one
+/// that does not continue `active.wal` is.
+#[test]
+fn records_that_do_not_continue_each_other_are_all_rejected_before_writing() {
+    let dir = tempdir().unwrap();
+    let mut log = WarmDiskLog::open_or_create(dir.path()).unwrap();
+    log.append_records(&[(make_op(1), None), (make_op(2), None)])
+        .unwrap();
+    let len = log.active_len();
+
+    assert!(log
+        .append_records(&[(make_op(3), None), (make_op(5), None)])
+        .is_err());
+    assert!(log.append_records(&[(make_op(4), None)]).is_err());
+    assert_eq!(
+        (log.active_end_seq(), log.active_len()),
+        (Some(seq(2)), len)
+    );
+}

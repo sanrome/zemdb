@@ -70,17 +70,41 @@ impl WarmDiskLog {
         Ok((log, recovered))
     }
 
-    /// Appends `op` and its mutation ID to `active.wal`, synced with `sync_data`. A record
-    /// that does not continue the last one is rejected before anything is written.
+    /// Appends `op` and its mutation ID to `active.wal`, synced with `sync_data`, as a group of
+    /// one record (see [`append_records`](Self::append_records)).
+    #[cfg(test)]
     pub fn append_record(
         &mut self,
         op: &SequencedOperation,
         mutation_id: Option<MutationId>,
     ) -> Result<(), ServerError> {
-        if let Some(end) = self.active_end_seq.filter(|end| end.next() != op.seq) {
+        self.append_records(&[(op.clone(), mutation_id)])
+    }
+
+    /// Appends `records`, each operation with its mutation ID, to `active.wal`, and syncs them
+    /// all with one `sync_data`. A record that does not continue the one before it, or the
+    /// last one of `active.wal`, is rejected before anything is written. An `Err` means that
+    /// any of the records may or may not have reached the file.
+    pub fn append_records(
+        &mut self,
+        records: &[(SequencedOperation, Option<MutationId>)],
+    ) -> Result<(), ServerError> {
+        let (Some((first, _)), Some((last, _))) = (records.first(), records.last()) else {
+            return Ok(());
+        };
+        if let Some(end) = self.active_end_seq.filter(|end| end.next() != first.seq) {
             return Err(ServerError::WalCorruption(format!(
                 "Record {} does not continue active.wal, which ends at {end}",
-                op.seq
+                first.seq
+            )));
+        }
+        if let Some(pair) = records
+            .windows(2)
+            .find(|pair| pair[0].0.seq.next() != pair[1].0.seq)
+        {
+            return Err(ServerError::WalCorruption(format!(
+                "Record {} does not continue the record {} before it",
+                pair[1].0.seq, pair[0].0.seq
             )));
         }
         let active_path = self.active_path();
@@ -100,8 +124,12 @@ impl WarmDiskLog {
         }
 
         let file = self.active_file.as_mut().unwrap();
-        let encoded =
-            encode_wal_record(op, mutation_id).map_err(|e| ServerError::Wal(e.to_string()))?;
+        let mut encoded = Vec::new();
+        for (op, mutation_id) in records {
+            let record =
+                encode_wal_record(op, *mutation_id).map_err(|e| ServerError::Wal(e.to_string()))?;
+            encoded.extend_from_slice(&record);
+        }
 
         // Reads of the active segment share this handle and move its position.
         file.seek(SeekFrom::Start(self.active_len))?;
@@ -111,16 +139,20 @@ impl WarmDiskLog {
         fail_point::hook("warm_append_sync", &active_path);
         fail_point::check("warm_append_sync", &active_path)?;
         file.sync_data()?;
+        crate::log::io_probe::record(IoEvent::ActiveWalSync, &self.segments_dir);
         self.active_len += encoded.len() as u64;
-        self.active_mutations
-            .extend(mutation_id.map(|id| (id, op.seq)));
+        self.active_mutations.extend(
+            records
+                .iter()
+                .filter_map(|(op, mutation_id)| mutation_id.map(|id| (id, op.seq))),
+        );
 
         // The segment start is tracked independently of when the file handle was opened:
         // an `active.wal` recovered empty already has an open handle but no operations yet.
         if self.active_start_seq.is_none() {
-            self.active_start_seq = Some(op.seq);
+            self.active_start_seq = Some(first.seq);
         }
-        self.active_end_seq = Some(op.seq);
+        self.active_end_seq = Some(last.seq);
         Ok(())
     }
 

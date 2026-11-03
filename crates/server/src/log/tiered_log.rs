@@ -227,32 +227,50 @@ impl TieredLog {
         Ok((log, mutations))
     }
 
-    /// Appends `op` to `active.wal` (synced with `sync_data`) and then to the RAM buffer, and
-    /// seals the segment once it reaches `ram_max_ops` operations or `segment_max_bytes`.
-    ///
-    /// An `Err` means the record may not be durable. Once the record is durable the call
-    /// returns `Ok`, and a failure to seal the segment afterwards is reported in the outcome.
+    /// Appends `op` as a group of its own (see [`append_group`](Self::append_group)).
+    #[cfg(test)]
     pub fn append(
         &mut self,
         op: SequencedOperation,
         mutation_id: Option<MutationId>,
     ) -> Result<AppendOutcome, ServerError> {
-        if self.head_seq.get() != 0 && op.seq.get() != self.head_seq.get() + 1 {
+        self.append_group(vec![(op, mutation_id)])
+    }
+
+    /// Appends `records`, each operation with its mutation ID, to `active.wal`, synced with one
+    /// `sync_data` for all of them, and then to the RAM buffer; and seals the segment once,
+    /// after the last record, if it reached `ram_max_ops` operations or `segment_max_bytes`
+    /// (so a segment can pass them by a group).
+    ///
+    /// An `Err` means that any of the records may not be durable, and none is visible. Once the
+    /// records are durable the call returns `Ok`, and a failure to seal the segment afterwards
+    /// is reported in the outcome.
+    pub fn append_group(
+        &mut self,
+        records: Vec<(SequencedOperation, Option<MutationId>)>,
+    ) -> Result<AppendOutcome, ServerError> {
+        let Some((first, _)) = records.first() else {
+            return Ok(AppendOutcome::default());
+        };
+        if self.head_seq.get() != 0 && first.seq.get() != self.head_seq.get() + 1 {
             return Err(ServerError::Wal(format!(
                 "Non-contiguous sequence: expected {}, got {}",
                 self.head_seq.get() + 1,
-                op.seq.get()
+                first.seq.get()
             )));
         }
 
-        self.warm_disk.append_record(&op, mutation_id)?;
+        self.warm_disk.append_records(&records)?;
 
-        self.hot_buffer.append(op)?;
+        let appended = records.len() as u64;
+        for (op, _) in records {
+            self.hot_buffer.append(op)?;
+        }
         self.hot_buffer.apply_sliding_window(&self.policy);
 
         // `tail_seq` needs no update here: when the log was empty it already pointed at
-        // `head_seq + 1`, which is exactly the sequence of the operation just appended.
-        self.head_seq = self.head_seq.next();
+        // `head_seq + 1`, which is exactly the sequence of the first operation just appended.
+        self.head_seq = SequenceNumber::new(self.head_seq.get() + appended);
 
         // Seal at `ram_max_ops` operations or `segment_max_bytes`; RAM keeps its window.
         let mut outcome = AppendOutcome::default();

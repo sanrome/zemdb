@@ -1,0 +1,11 @@
+# started on Mon Nov  2 23:23:41 2026
+
+
+ Performance counter stats for process id '27115':
+
+          10186.93 msec task-clock                       #    1.018 CPUs utilized             
+             38555      context-switches                 #    3.785 K/sec                     
+              2701      cpu-migrations                   #  265.144 /sec                      
+
+      10.002869894 seconds time elapsed
+

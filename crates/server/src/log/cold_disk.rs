@@ -284,7 +284,8 @@ pub(crate) fn read_cold_file(
     if let Some((at, anomaly)) = read.anomaly {
         // The stream cannot seek back, so the rest of the segment is decompressed again to
         // look for a valid frame after the damage. This only happens on an anomaly, and the
-        // segment is bounded by `segment_max_bytes` plus one frame.
+        // segment is bounded by `segment_max_bytes` plus one group of commits (1 MiB of
+        // operations plus one frame).
         let mut decoder = open_decoder(File::open(path)?)?;
         let mut rest = Vec::new();
         io::copy(&mut decoder.by_ref().take(at), &mut io::sink())

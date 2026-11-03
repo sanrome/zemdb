@@ -18,6 +18,8 @@ pub(crate) enum IoEvent {
     /// `active.wal` read through its path, that is, through a second handle instead of the
     /// one holding the lock.
     ActiveWalPathRead,
+    /// `active.wal` synced after an append of records.
+    ActiveWalSync,
 }
 
 #[cfg(test)]

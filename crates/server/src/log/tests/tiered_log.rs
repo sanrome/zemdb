@@ -11,6 +11,7 @@ use std::thread::sleep;
 use std::time::Duration;
 use tempfile::tempdir;
 use zemdb_core::mutation::Operation;
+use zemdb_core::protocol::wal_frame::encode_wal_record;
 use zemdb_core::value::{PrimaryKey, Value};
 
 /// Policy where RAM entries expire quickly but the active segment never rotates by count,
@@ -2911,5 +2912,128 @@ fn a_read_ends_where_the_reservation_of_its_response_runs_out() {
     assert_eq!(
         reserved,
         log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap()
+    );
+}
+
+/// The records `first..=last`, each with the mutation id `mutation_for(seq)`.
+fn group_of(first: u64, last: u64) -> Vec<(SequencedOperation, Option<MutationId>)> {
+    (first..=last)
+        .map(|seq| (make_op(seq), Some(mutation_for(seq))))
+        .collect()
+}
+
+/// A group of records is written to `active.wal` and synced once, and only then is it visible:
+/// after a failed fsync the head and the reads are where they were.
+#[test]
+fn a_group_of_records_is_synced_once_and_is_visible_only_after_its_fsync() {
+    let dir = tempdir().unwrap();
+    let (mut log, _) =
+        TieredLog::open_or_create(dir.path(), RoomLifecyclePolicy::default()).unwrap();
+    append_range(&mut log, 1, 2);
+    let segments = segments_dir(dir.path());
+    let syncs = io_probe::count(IoEvent::ActiveWalSync, &segments);
+
+    log.append_group(group_of(3, 7)).unwrap();
+    assert_eq!(
+        io_probe::count(IoEvent::ActiveWalSync, &segments) - syncs,
+        1
+    );
+    assert_eq!(log.head_seq().get(), 7);
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
+    assert_contiguous(&ops, 1, 7);
+
+    crate::fail_point::arm("warm_append_sync", &segments.join("active.wal"));
+    assert!(log.append_group(group_of(8, 10)).is_err());
+    assert_eq!(log.head_seq().get(), 7);
+    let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
+    assert_contiguous(&ops, 1, 7);
+}
+
+/// A crash after the records of a group reached `active.wal` and before their fsync can leave
+/// any prefix of them on disk. Every cut reopens with exactly the whole records before it, with
+/// their mutation ids, truncates the rest as a torn write, and the next record continues them.
+#[test]
+fn every_cut_of_a_group_written_before_its_fsync_recovers_the_whole_records_before_it() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy::default();
+    let active = segments_dir(dir.path()).join("active.wal");
+    let synced_len = {
+        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+        append_range(&mut log, 1, 3);
+        let synced_len = log.warm_disk.active_len() as usize;
+        crate::fail_point::arm("warm_append_sync", &active);
+        assert!(log.append_group(group_of(4, 8)).is_err());
+        synced_len
+    };
+    let bytes = std::fs::read(&active).unwrap();
+    let ends: Vec<usize> = (1..=8u64)
+        .scan(0, |end, seq| {
+            *end += encode_wal_record(&make_op(seq), Some(mutation_for(seq)))
+                .unwrap()
+                .len();
+            Some(*end)
+        })
+        .collect();
+    assert_eq!(ends[2], synced_len);
+    assert_eq!(
+        bytes.len(),
+        ends[7],
+        "the whole group must reach the file before its fsync"
+    );
+
+    for cut in synced_len..=bytes.len() {
+        let copy = tempdir().unwrap();
+        let copy_segments = segments_dir(copy.path());
+        std::fs::create_dir_all(&copy_segments).unwrap();
+        std::fs::write(copy_segments.join("active.wal"), &bytes[..cut]).unwrap();
+        let whole = ends.iter().filter(|&&end| end <= cut).count() as u64;
+
+        let (mut log, mutations) = TieredLog::open_or_create(copy.path(), policy.clone())
+            .unwrap_or_else(|e| panic!("cut at {cut}: {e}"));
+        assert_eq!(log.head_seq().get(), whole, "cut at {cut}");
+        let (ops, _) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
+        assert_contiguous(&ops, 1, whole);
+        let expected: Vec<_> = (1..=whole)
+            .map(|seq| (mutation_for(seq), SequenceNumber::new(seq)))
+            .collect();
+        assert_eq!(mutations, expected, "cut at {cut}");
+        log.append(make_op(whole + 1), Some(mutation_for(whole + 1)))
+            .unwrap();
+    }
+}
+
+/// A power cut during the fsync of a group can persist a later sector of the group and not an
+/// earlier one (here, the first record of the group reads as zeros). Opening then finds damage
+/// followed by valid frames of the same group, takes it for corruption and fails without
+/// truncating anything, although no record of the group was acknowledged: an accepted risk until
+/// each record says where its group starts. With one record per fsync, only the last record
+/// could be torn.
+#[test]
+fn a_group_whose_first_record_was_lost_before_its_fsync_fails_the_open() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy::default();
+    let active = segments_dir(dir.path()).join("active.wal");
+    let synced_len = {
+        let (mut log, _) = TieredLog::open_or_create(dir.path(), policy.clone()).unwrap();
+        append_range(&mut log, 1, 3);
+        let synced_len = log.warm_disk.active_len() as usize;
+        crate::fail_point::arm("warm_append_sync", &active);
+        assert!(log.append_group(group_of(4, 8)).is_err());
+        synced_len
+    };
+    let mut bytes = std::fs::read(&active).unwrap();
+    let first_len = encode_wal_record(&make_op(4), Some(mutation_for(4)))
+        .unwrap()
+        .len();
+    bytes[synced_len..synced_len + first_len].fill(0);
+
+    let copy = tempdir().unwrap();
+    let copy_segments = segments_dir(copy.path());
+    std::fs::create_dir_all(&copy_segments).unwrap();
+    std::fs::write(copy_segments.join("active.wal"), &bytes).unwrap();
+    assert!(TieredLog::open_or_create(copy.path(), policy).is_err());
+    assert_eq!(
+        std::fs::read(copy_segments.join("active.wal")).unwrap(),
+        bytes
     );
 }
