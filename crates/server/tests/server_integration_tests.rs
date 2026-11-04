@@ -435,8 +435,199 @@ async fn data_plane_heartbeat_and_deregister() {
     assert_eq!(cursor(&room_sender, &client_id).await, None);
 }
 
+/// An insert into the tasks table of [`tasks_schema`] whose title is `title_len` bytes long.
+fn op_with_title(id: i64, title_len: usize) -> Operation {
+    let row = RowBuilder::new()
+        .set("id", id)
+        .set("title", "t".repeat(title_len))
+        .set("completed", false)
+        .build();
+    tasks_schema()
+        .to_operation_insert("tasks", &row, 1000)
+        .unwrap()
+}
+
+/// What an `ops` event carries: a `ServerMessage::OpsEvent` frame in base64.
+struct OpsEventData {
+    room_id: RoomId,
+    room_incarnation: u128,
+    head_seq: u64,
+    ops: Vec<SequencedOperation>,
+    schema_version: u64,
+    schema_id: SchemaId,
+}
+
+fn decode_ops_event(data: &str) -> OpsEventData {
+    use base64::Engine;
+    let frame = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .unwrap();
+    match decode_message(&frame).unwrap() {
+        ServerMessage::OpsEvent {
+            room_id,
+            room_incarnation,
+            head_seq,
+            ops,
+            schema_version,
+            schema_id,
+        } => OpsEventData {
+            room_id,
+            room_incarnation,
+            head_seq: head_seq.get(),
+            ops,
+            schema_version,
+            schema_id,
+        },
+        other => panic!("expected an OpsEvent frame, got {other:?}"),
+    }
+}
+
+/// Reads the events of an SSE stream, as `(event, data)`, until one announces `head`: an `ops`
+/// event that reaches it, or `head_advanced` with it.
+async fn read_events_until_head(
+    stream: &mut (impl futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Unpin),
+    head: u64,
+) -> Vec<(String, String)> {
+    use futures::StreamExt;
+    let mut text = String::new();
+    let mut events = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            while let Some(end) = text.find("\n\n") {
+                let block: String = text.drain(..end + 2).collect();
+                let field = |name: &str| {
+                    block
+                        .lines()
+                        .find_map(|line| line.strip_prefix(name))
+                        .map(|value| value.trim().to_string())
+                };
+                let (Some(event), Some(data)) = (field("event:"), field("data:")) else {
+                    continue; // a keep-alive comment
+                };
+                let reached = match event.as_str() {
+                    "ops" => decode_ops_event(&data).head_seq,
+                    "head_advanced" => data.parse().unwrap(),
+                    _ => 0,
+                };
+                events.push((event, data));
+                if reached >= head {
+                    return;
+                }
+            }
+            let chunk = stream.next().await.expect("SSE stream closed").unwrap();
+            text.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no event announced head {head}; read: {events:?}"));
+    events
+}
+
+/// A client that reads the stream receives, in `ops` events, the same operations a sync returns,
+/// in order and without gaps, with the schema they were checked with: here from three writers
+/// committing at once, with rejected and repeated commits among them.
 #[tokio::test]
-async fn sse_signals_head_advanced() {
+async fn sse_ops_events_deliver_what_a_sync_returns() {
+    let server = TestServer::start(|_| {}).await;
+    let (schema_id, room_id) = server.room_with_schema("todo-schema", "room-sse-ops").await;
+    let listener = client("listener");
+    let (listener_token, registered) = server.register(&room_id, &listener).await;
+    let ServerMessage::Registered {
+        room_incarnation, ..
+    } = registered
+    else {
+        panic!("expected Registered, got {registered:?}");
+    };
+    let events = server.events(&room_id, &listener_token).await;
+    assert_eq!(events.status(), StatusCode::OK);
+    let mut stream = events.bytes_stream();
+
+    let mut writers = Vec::new();
+    for w in 0..3i64 {
+        let writer = client(&format!("writer-{w}"));
+        let (token, _) = server.register(&room_id, &writer).await;
+        let (base_url, http) = (server.base_url.clone(), server.client.clone());
+        let room_id = room_id.clone();
+        writers.push(tokio::spawn(async move {
+            let post = |msg: ClientMessage| {
+                let request = http
+                    .post(format!("{base_url}/rooms/{room_id}/commit"))
+                    .bearer_auth(&token)
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .body(encode_message(&msg).unwrap());
+                async move { request.send().await.unwrap().status() }
+            };
+            for n in 1..=10u8 {
+                let op = op_with_title(w * 100 + i64::from(n), 8);
+                let status = post(commit_msg(&room_id, &writer, n, 0, op.clone())).await;
+                assert_eq!(status, StatusCode::OK);
+                if n % 5 == 0 {
+                    // A retry is acknowledged without a new operation.
+                    assert_eq!(
+                        post(commit_msg(&room_id, &writer, n, 0, op)).await,
+                        StatusCode::OK
+                    );
+                    // A rejected commit leaves no trace.
+                    let invalid = Operation::delete(999, PrimaryKey::single(1i64), 1000);
+                    let status = post(commit_msg(&room_id, &writer, 200 + n, 0, invalid)).await;
+                    assert_eq!(status, StatusCode::BAD_REQUEST);
+                }
+            }
+        }));
+    }
+    for writer in writers {
+        writer.await.unwrap();
+    }
+
+    let read = read_events_until_head(&mut stream, 30).await;
+    let sync = ClientMessage::Sync {
+        correlation_id: CorrelationId::new(1),
+        room_id: room_id.clone(),
+        client_id: listener.clone(),
+        from_seq: SequenceNumber::new(0),
+        max_batch_size: 1000,
+    };
+    let (status, reply) = server
+        .post_message(&room_id, "sync", &listener_token, &sync)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let ServerMessage::SyncBatch {
+        ops: synced,
+        schema_version,
+        schema_id: synced_schema,
+        ..
+    } = reply
+    else {
+        panic!("expected a SyncBatch, got {reply:?}");
+    };
+    assert_eq!(seqs(&synced), (1..=30).collect::<Vec<_>>());
+
+    let mut delivered: Vec<SequencedOperation> = Vec::new();
+    for (event, data) in &read {
+        assert_eq!(event, "ops", "every commit fits in an ops event: {read:?}");
+        let event = decode_ops_event(data);
+        assert_eq!(event.room_id, room_id);
+        assert_eq!(event.room_incarnation, room_incarnation);
+        assert_eq!(
+            event.ops.first().map(|op| op.seq.get()),
+            Some(delivered.len() as u64 + 1),
+            "each event follows the one before it"
+        );
+        assert_eq!(event.head_seq, event.ops.last().unwrap().seq.get());
+        assert_eq!(
+            (&event.schema_id, event.schema_version),
+            (&schema_id, schema_version)
+        );
+        delivered.extend(event.ops);
+    }
+    assert_eq!(delivered, synced);
+    assert_eq!(synced_schema, schema_id);
+}
+
+/// An operation whose frame does not fit in an `ops` event is announced with `head_advanced`,
+/// and the client reads it with a sync.
+#[tokio::test]
+async fn sse_announces_an_operation_too_large_for_an_event_with_head_advanced() {
     let server = TestServer::start(|_| {}).await;
     let (_, room_id) = server.room_with_schema("todo-schema", "room-sse-1").await;
     let client_id = client("writer-sse");
@@ -446,16 +637,110 @@ async fn sse_signals_head_advanced() {
     let mut stream = sse_resp.bytes_stream();
 
     let (token, _) = server.register(&room_id, &client_id).await;
-    let msg = commit_msg(&room_id, &client_id, 42, 0, make_test_op(1));
+    let msg = commit_msg(&room_id, &client_id, 42, 0, op_with_title(1, 5000));
     let (status, _) = server.post_message(&room_id, "commit", &token, &msg).await;
     assert_eq!(status, StatusCode::OK);
 
-    let text = read_sse_until(&mut stream, "data: 1").await;
+    let read = read_events_until_head(&mut stream, 1).await;
+    assert_eq!(read, vec![("head_advanced".to_string(), "1".to_string())]);
+}
+
+/// A stream receives only the events of its room: neither a token of another room nor no
+/// token opens it, and the commits of another room do not reach it.
+#[tokio::test]
+async fn a_stream_receives_only_the_events_of_its_room() {
+    let server = TestServer::start(|_| {}).await;
+    let (_, room_a) = server.room_with_schema("todo-schema", "room-sse-a").await;
+    let room_b = server
+        .create_room("room-sse-b", &SchemaId::new("todo-schema").unwrap())
+        .await;
+    let listener = client("listener");
+    let token_b = token(&listener, &room_b);
+
+    let other_room = server.events(&room_a, &token_b).await;
+    assert_eq!(other_room.status(), StatusCode::FORBIDDEN);
+    let no_token = server
+        .client
+        .get(server.url(&format!("/rooms/{room_a}/events")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_token.status(), StatusCode::UNAUTHORIZED);
+
+    let events = server.events(&room_b, &token_b).await;
+    assert_eq!(events.status(), StatusCode::OK);
+    let mut stream = events.bytes_stream();
+    let writer = client("writer");
+    let (token_a, _) = server.register(&room_a, &writer).await;
+    for n in 1..=2u8 {
+        let msg = commit_msg(&room_a, &writer, n, 0, op_with_title(n.into(), 8));
+        let (status, _) = server.post_message(&room_a, "commit", &token_a, &msg).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (token_b_writer, _) = server.register(&room_b, &writer).await;
+    let msg = commit_msg(&room_b, &writer, 1, 0, op_with_title(99, 8));
+    let (status, _) = server
+        .post_message(&room_b, "commit", &token_b_writer, &msg)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let read = read_events_until_head(&mut stream, 1).await;
+    assert_eq!(read.len(), 1, "{read:?}");
+    let event = decode_ops_event(&read[0].1);
+    assert_eq!(event.room_id, room_b);
+    assert_eq!(event.ops.len(), 1);
+    assert_eq!(event.ops[0].op, op_with_title(99, 8));
+}
+
+/// With `max_sse_streams` at 0 the event stream is off: an authenticated `GET /events` is
+/// answered `EventsDisabled` (HTTP 404), an unauthenticated one still `Unauthorized`, and the
+/// rest of the protocol works as before.
+#[tokio::test]
+async fn with_the_event_stream_off_events_are_refused_and_the_protocol_works() {
+    let server = TestServer::start(|config| config.max_sse_streams = Some(0)).await;
+    let (_, room_id) = server.room_with_schema("todo-schema", "room-sse-off").await;
+    let writer = client("writer");
+
+    let refused = server.events(&room_id, &token(&writer, &room_id)).await;
+    common::assert_binary_error(refused, StatusCode::NOT_FOUND, ErrorCode::EventsDisabled).await;
+    let no_token = server
+        .client
+        .get(server.url(&format!("/rooms/{room_id}/events")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_token.status(), StatusCode::UNAUTHORIZED);
+
+    let (token, _) = server.register(&room_id, &writer).await;
+    let msg = commit_msg(&room_id, &writer, 1, 0, op_with_title(1, 8));
+    let (status, reply) = server.post_message(&room_id, "commit", &token, &msg).await;
+    assert_eq!(status, StatusCode::OK);
     assert!(
-        text.contains("event: head_advanced"),
-        "Expected SSE head_advanced event, got: {}",
-        text
+        matches!(&reply, ServerMessage::CommitAck { assigned_seq, catchup_ops, .. }
+            if assigned_seq.get() == 1 && seqs(catchup_ops) == vec![1]),
+        "{reply:?}"
     );
+    let (status, reply) = server
+        .post_message(
+            &room_id,
+            "sync",
+            &token,
+            &ClientMessage::Sync {
+                correlation_id: CorrelationId::new(2),
+                room_id: room_id.clone(),
+                client_id: writer.clone(),
+                from_seq: SequenceNumber::new(0),
+                max_batch_size: 10,
+            },
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        matches!(&reply, ServerMessage::SyncBatch { ops, .. } if seqs(ops) == vec![1]),
+        "{reply:?}"
+    );
+    // A heartbeat is answered with its HeartbeatAck.
+    server.heartbeat_ack(&room_id, &writer, &token).await;
 }
 
 #[tokio::test]
@@ -1281,4 +1566,100 @@ async fn register_with_a_cursor_beyond_the_head_is_an_invalid_sequence() {
         .post_message(&room_id, "heartbeat", &token, &heartbeat)
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
+}
+
+/// A room deleted and created again with the same id: a client of the deleted one still holds a
+/// valid token for the room id, which opens the event stream of the new room, where the
+/// operations that follow its old cursor are another room's. Each `ops` event says the
+/// incarnation of its room, which is not the one the client registered with, so the client does
+/// not apply it and registers again (INV-K1, INV-Y7; its `/sync` is `ClientNotRegistered`).
+#[tokio::test]
+async fn the_ops_events_of_a_recreated_room_say_their_incarnation() {
+    let server = TestServer::start(|_| {}).await;
+    let (schema_id, room_id) = server
+        .room_with_schema("todo-schema", "room-sse-recreated")
+        .await;
+    let old = client("old");
+    let (old_token, registered) = server.register(&room_id, &old).await;
+    let ServerMessage::Registered {
+        room_incarnation: old_incarnation,
+        ..
+    } = registered
+    else {
+        panic!("expected Registered, got {registered:?}");
+    };
+    for n in 1..=2u8 {
+        let msg = commit_msg(&room_id, &old, n, 0, op_with_title(n.into(), 8));
+        let (status, _) = server
+            .post_message(&room_id, "commit", &old_token, &msg)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let resp = server
+        .admin(Method::DELETE, &format!("/admin/rooms/{room_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    server.create_room(room_id.as_str(), &schema_id).await;
+    let new_incarnation = server.incarnation(&room_id).await;
+    assert_ne!(new_incarnation, old_incarnation);
+
+    let other = client("other");
+    let (other_token, _) = server.register(&room_id, &other).await;
+    let events = server.events(&room_id, &old_token).await;
+    assert_eq!(events.status(), StatusCode::OK);
+    let mut stream = events.bytes_stream();
+    for n in 1..=3u8 {
+        let msg = commit_msg(&room_id, &other, n, 0, op_with_title(100 + i64::from(n), 8));
+        let (status, _) = server
+            .post_message(&room_id, "commit", &other_token, &msg)
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let read = read_events_until_head(&mut stream, 3).await;
+    for (event, data) in &read {
+        assert_eq!(event, "ops");
+        assert_eq!(decode_ops_event(data).room_incarnation, new_incarnation);
+    }
+    let sync = ClientMessage::Sync {
+        correlation_id: CorrelationId::new(9),
+        room_id: room_id.clone(),
+        client_id: old.clone(),
+        from_seq: SequenceNumber::new(2),
+        max_batch_size: 100,
+    };
+    let (status, reply) = server
+        .post_message(&room_id, "sync", &old_token, &sync)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{reply:?}");
+}
+
+/// With the event stream off, `GET /events` is refused before the room is asked anything: a
+/// room that is not open stays closed, and one that does not exist is `EventsDisabled`, not
+/// `RoomNotFound`.
+#[tokio::test]
+async fn with_the_event_stream_off_events_do_not_open_the_room() {
+    let server = TestServer::start(|config| config.max_sse_streams = Some(0)).await;
+    let (_, room_id) = server
+        .room_with_schema("todo-schema", "room-sse-off-closed")
+        .await;
+    assert!(server.room_manager.shutdown_room(&room_id).await);
+    assert!(server.room_manager.get_room(&room_id).is_none());
+
+    let refused = server
+        .events(&room_id, &token(&client("writer"), &room_id))
+        .await;
+    common::assert_binary_error(refused, StatusCode::NOT_FOUND, ErrorCode::EventsDisabled).await;
+    assert!(
+        server.room_manager.get_room(&room_id).is_none(),
+        "the refused stream opened the room"
+    );
+    let ghost = RoomId::new("room-sse-off-ghost").unwrap();
+    let refused = server
+        .events(&ghost, &token(&client("writer"), &ghost))
+        .await;
+    common::assert_binary_error(refused, StatusCode::NOT_FOUND, ErrorCode::EventsDisabled).await;
 }

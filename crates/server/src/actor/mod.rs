@@ -1,6 +1,7 @@
 pub mod command;
 pub mod lease;
 pub mod manager;
+mod ops_event;
 pub mod room;
 mod snapshot_demand;
 
@@ -14,4 +15,5 @@ pub use command::{
 };
 pub use lease::{ClientEntry, ClientLeaseTracker, ClientState};
 pub use manager::{RoomManager, RoomMetadata};
+pub use ops_event::OpsEvent;
 pub use room::{ActorExit, RoomActor};

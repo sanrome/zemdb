@@ -65,6 +65,10 @@ pub enum ServerError {
     #[error("Rate limited")]
     RateLimited,
 
+    /// The server has its event stream turned off (`max_sse_streams` is 0).
+    #[error("The event stream is turned off in this server")]
+    EventsDisabled,
+
     #[error("Serialization error: {0}")]
     Serialization(String),
 
@@ -145,6 +149,7 @@ impl ServerError {
             ServerError::Timeout(_) => ErrorCode::Timeout,
             ServerError::RequestTimeout(_) => ErrorCode::RequestTimeout,
             ServerError::RateLimited => ErrorCode::RateLimited,
+            ServerError::EventsDisabled => ErrorCode::EventsDisabled,
             ServerError::InvalidSequence { .. } => ErrorCode::InvalidSequence,
             ServerError::BadRequest(_) => ErrorCode::BadRequest,
             ServerError::SnapshotSuperseded(_) => ErrorCode::SnapshotSuperseded,
@@ -163,7 +168,9 @@ impl ServerError {
         match self {
             ServerError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             ServerError::Forbidden(_) => StatusCode::FORBIDDEN,
-            ServerError::RoomNotFound(_) | ServerError::SchemaNotFound(_) => StatusCode::NOT_FOUND,
+            ServerError::RoomNotFound(_)
+            | ServerError::SchemaNotFound(_)
+            | ServerError::EventsDisabled => StatusCode::NOT_FOUND,
             ServerError::RoomAlreadyExists(_)
             | ServerError::SchemaAlreadyExists(_)
             | ServerError::SnapshotSuperseded(_)

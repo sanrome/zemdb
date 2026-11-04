@@ -30,6 +30,7 @@ fn each_error_maps_to_its_code_and_status() {
         (e(Unauthorized), C::Unauthorized, S::UNAUTHORIZED),
         (e(Forbidden), C::Forbidden, S::FORBIDDEN),
         (RateLimited, C::RateLimited, S::TOO_MANY_REQUESTS),
+        (EventsDisabled, C::EventsDisabled, S::NOT_FOUND),
         (e(Serialization), C::Internal, S::INTERNAL_SERVER_ERROR),
         (e(Internal), C::Internal, S::INTERNAL_SERVER_ERROR),
         (e(Unavailable), C::Unavailable, S::SERVICE_UNAVAILABLE),

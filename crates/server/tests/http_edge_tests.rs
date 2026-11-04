@@ -424,7 +424,7 @@ async fn open_sse_stream_outlives_every_timeout() {
     // Without events, the stream is not waiting for the client: it is not stalled.
     tokio::time::sleep(STALL_TIMEOUT + Duration::from_secs(1)).await;
 
-    // The stream still delivers events: a commit advances the head.
+    // The stream still delivers events: a commit is announced with its operation.
     let sender = server
         .parts
         .room_manager
@@ -442,7 +442,7 @@ async fn open_sse_stream_outlives_every_timeout() {
         .await
         .unwrap();
 
-    read_sse_until(&mut events, "event: head_advanced").await;
+    read_sse_until(&mut events, "event: ops").await;
     drop(events);
     server.shutdown().await;
 }
@@ -940,7 +940,7 @@ async fn a_third_sse_stream_of_a_client_ends_its_oldest() {
     // The two newest still deliver events.
     server.commit_large_rows(1, 1).await;
     for stream in &mut streams {
-        read_sse_until(stream, "event: head_advanced").await;
+        read_sse_until(stream, "event: ops").await;
     }
     drop(streams);
     server.shutdown().await;
@@ -987,5 +987,38 @@ async fn sse_streams_over_their_limit_are_refused_and_leave_connections_for_requ
     .await
     .expect("a closed stream must free its place");
     drop((second, stream));
+    server.shutdown().await;
+}
+
+/// A stream carries the room's operations, so it ends when its token expires: tokens are not
+/// revoked, and their expiry is what ends the access of a member who was removed. Once it ends,
+/// what the room writes does not reach it, and the expired token opens no new one.
+#[tokio::test]
+async fn a_stream_ends_when_its_token_expires() {
+    let server = start_server(|_| {}).await;
+    let short = generate_client_token(
+        &server.client_id,
+        &server.room_id,
+        Duration::from_secs(2),
+        AUTH_SECRET,
+    );
+    let response = open_events(&server, "room-edge", &short).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut events = response.bytes_stream();
+
+    let mut text = String::new();
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(chunk) = events.next().await {
+            text.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the stream outlived its token: {text}");
+    assert_eq!(
+        open_events(&server, "room-edge", &short).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    server.commit_large_rows(1, 64).await;
+    assert!(!text.contains("event: ops"), "{text}");
     server.shutdown().await;
 }

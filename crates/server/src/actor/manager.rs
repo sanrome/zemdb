@@ -15,6 +15,7 @@ use zemdb_core::id::{RoomId, SchemaId};
 use zemdb_core::schema::Schema;
 
 use crate::actor::command::RoomCommand;
+use crate::actor::ops_event::OpsEventBudget;
 use crate::actor::room::{room_dir, ActorExit, ActorTimings, RoomActor};
 use crate::config::ServerConfig;
 use crate::durable;
@@ -177,6 +178,8 @@ pub struct RoomManager {
     snapshot_relay: Arc<SnapshotRelay>,
     /// Bytes of large responses in flight, which the room actors and the handlers reserve.
     response_budget: Arc<InflightBudget>,
+    /// Bytes of the `ops` events that the event channels of the room actors retain.
+    ops_events: Arc<OpsEventBudget>,
     data_dir: PathBuf,
     /// Lifecycle policy of a room without overrides.
     default_policy: RoomLifecyclePolicy,
@@ -210,6 +213,7 @@ impl RoomManager {
                 config.max_inflight_response_bytes,
                 config.max_inflight_response_bytes_per_client,
             )),
+            ops_events: Arc::new(OpsEventBudget::new(config.max_sse_ops_bytes)),
             rooms: Arc::new(DashMap::new()),
             room_meta: Arc::new(DashMap::new()),
             spawn_locks: Arc::new(DashMap::new()),
@@ -248,6 +252,12 @@ impl RoomManager {
     /// The budget of response bytes in flight that the room actors reserve from.
     pub(crate) fn response_budget(&self) -> &Arc<InflightBudget> {
         &self.response_budget
+    }
+
+    /// The bytes of the `ops` events that the event channels of the room actors retain.
+    #[cfg(test)]
+    pub(crate) fn ops_events(&self) -> &Arc<OpsEventBudget> {
+        &self.ops_events
     }
 
     /// Replaces the server defaults of the room lifecycle policy, which [`new`](Self::new)
@@ -500,6 +510,7 @@ impl RoomManager {
             let config = Arc::clone(&self.config);
             let relay = Arc::clone(&self.snapshot_relay);
             let budget = Arc::clone(&self.response_budget);
+            let ops_events = Arc::clone(&self.ops_events);
             let (timings, io) = (self.timings, Arc::clone(&self.io));
             move || {
                 RoomActor::open(
@@ -512,6 +523,7 @@ impl RoomManager {
                     policy,
                     relay,
                     budget,
+                    ops_events,
                     timings,
                     io,
                 )

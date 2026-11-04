@@ -165,8 +165,10 @@ async fn concurrent_commits_are_all_sequenced_and_signalled() {
 
     let mut last_event_seq = SequenceNumber::new(0);
     while let Ok(event) = sse_rx.try_recv() {
-        if let RoomEvent::HeadAdvanced(seq) = event {
-            last_event_seq = seq;
+        match event {
+            RoomEvent::HeadAdvanced(seq) => last_event_seq = seq,
+            RoomEvent::Ops(ops) => last_event_seq = ops.head_seq(),
+            _ => {}
         }
     }
     assert_eq!(last_event_seq, SequenceNumber::new(100));

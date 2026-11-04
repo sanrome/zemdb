@@ -25,7 +25,7 @@ use zemdb_core::id::{ClientId, CorrelationId, RoomId, SequenceNumber};
 use zemdb_core::protocol::codec::{decode_client_message, peek_client_message_kind};
 use zemdb_core::protocol::messages::{ClientMessage, ClientMessageKind};
 
-use crate::api::auth::{ensure_token_room, verify_client_token};
+use crate::api::auth::{ensure_token_room, verify_client_token, VerifiedClientToken};
 use crate::api::body_timeout::is_body_read_timeout;
 use crate::api::data_plane::{binary_error, binary_response, error_frame, unexpected_message};
 use crate::api::router::AppState;
@@ -105,7 +105,8 @@ where
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let RoomPath(room_id) = RoomPath::from_request_parts(parts, state).await?;
         let token = bearer_token(parts).ok_or_else(|| missing_token(&room_id))?;
-        let client_id = verify_token_for_room(token, &room_id, &AppState::from_ref(state))?;
+        let client_id =
+            verify_token_for_room(token, &room_id, &AppState::from_ref(state))?.client_id;
         Ok(AuthenticatedRoom { room_id, client_id })
     }
 }
@@ -120,6 +121,8 @@ where
 pub struct EventStreamAuth {
     pub room_id: RoomId,
     pub client_id: ClientId,
+    /// When the token expires (seconds since the Unix epoch): the stream ends then.
+    pub expires_at: u64,
 }
 
 #[axum::async_trait]
@@ -135,8 +138,12 @@ where
         let token = bearer_token(parts)
             .or_else(|| query_token(parts))
             .ok_or_else(|| missing_token(&room_id))?;
-        let client_id = verify_token_for_room(token, &room_id, &AppState::from_ref(state))?;
-        Ok(EventStreamAuth { room_id, client_id })
+        let verified = verify_token_for_room(token, &room_id, &AppState::from_ref(state))?;
+        Ok(EventStreamAuth {
+            room_id,
+            client_id: verified.client_id,
+            expires_at: verified.expires_at,
+        })
     }
 }
 
@@ -179,7 +186,7 @@ where
         let uploader = if is_admin {
             Uploader::Admin
         } else {
-            Uploader::Client(verify_token_for_room(token, &room_id, &app_state)?)
+            Uploader::Client(verify_token_for_room(token, &room_id, &app_state)?.client_id)
         };
 
         Ok(RelayAuth { room_id, uploader })
@@ -416,20 +423,20 @@ fn query_token(parts: &Parts) -> Option<&str> {
         .find_map(|pair| pair.strip_prefix("token="))
 }
 
-/// Verifies a client token and requires it to be issued for `room_id`. Rejections are binary
-/// frames: `Unauthorized` if the token is invalid or expired, `Forbidden` if it was issued for
-/// another room.
+/// Verifies a client token and requires it to be issued for `room_id`, returning its claims.
+/// Rejections are binary frames: `Unauthorized` if the token is invalid or expired, `Forbidden`
+/// if it was issued for another room.
 // Same rejection type as every extractor here; runs once per request.
 #[allow(clippy::result_large_err)]
 fn verify_token_for_room(
     token: &str,
     room_id: &RoomId,
     state: &AppState,
-) -> Result<ClientId, Response> {
+) -> Result<VerifiedClientToken, Response> {
     verify_client_token(token, &state.config.auth_secret)
         .and_then(|verified| {
             ensure_token_room(&verified, room_id)?;
-            Ok(verified.client_id)
+            Ok(verified)
         })
         .map_err(|err| binary_error(None, Some(room_id.clone()), err))
 }

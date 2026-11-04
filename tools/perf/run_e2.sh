@@ -24,8 +24,6 @@ export RUST_LOG=warn
 [ -n "${ZEMDB_PERF_INLINE_IO:-}" ] && export ZEMDB_PERF_INLINE_IO
 # A larger budget of response bytes in flight, when set (diagnostic).
 [ -n "${ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES:-}" ] && export ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES
-# The SSE events carry the operations, when set (prototype).
-[ -n "${ZEMDB_PERF_SSE_OPS:-}" ] && export ZEMDB_PERF_SSE_OPS
 for rep in $(seq 1 "$REPS"); do
   rm -rf "$ROOT" && mkdir -p "$ROOT"
   ZEMDB_DATA_DIR="$ROOT/data" ZEMDB_PORT=$PORT ZEMDB_MAX_CONNECTIONS=19500 ZEMDB_MAX_SSE_STREAMS=19000 \

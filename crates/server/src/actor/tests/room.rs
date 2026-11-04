@@ -1558,6 +1558,7 @@ fn stopped_actor(
         policy,
         Arc::clone(relay),
         Arc::new(InflightBudget::new(u64::MAX, u64::MAX)),
+        Arc::new(OpsEventBudget::new(u64::MAX)),
         timings,
         IoThreads::new(2),
     )
@@ -1965,6 +1966,7 @@ async fn commands_queued_when_the_room_goes_idle_are_handled() {
         RoomLifecyclePolicy::default(),
         Arc::clone(&fx.relay),
         Arc::new(InflightBudget::new(u64::MAX, u64::MAX)),
+        Arc::new(OpsEventBudget::new(u64::MAX)),
         ActorTimings::default(),
         IoThreads::new(2),
     )
@@ -2872,6 +2874,7 @@ mod onboarding_sim {
                 self.policy.clone(),
                 Arc::clone(self.relay.as_ref().unwrap()),
                 Arc::new(InflightBudget::new(u64::MAX, u64::MAX)),
+                Arc::new(OpsEventBudget::new(u64::MAX)),
                 ActorTimings {
                     designation_timeout: SNAPSHOT_DEADLINE,
                     ..TEST_TIMINGS
@@ -3753,7 +3756,8 @@ fn insert_op_with_title(id: i64, title_len: usize) -> Operation {
 
 /// The commits that arrive while an fsync runs wait in the mailbox, and the next fsync covers
 /// all of them: fewer fsyncs than commits. None is answered before that fsync, each gets the
-/// sequence of its place in the mailbox, and the group is announced once, with its head.
+/// sequence of its place in the mailbox, and the group is announced once, after that fsync,
+/// with its operations.
 #[tokio::test]
 async fn commits_waiting_behind_an_fsync_share_the_next_one() {
     const WAITING: u8 = 10;
@@ -3802,18 +3806,19 @@ async fn commits_waiting_behind_an_fsync_share_the_next_one() {
         Some(0),
         "a commit of the group was answered before the fsync that covers it"
     );
+    let early = std::mem::take(&mut *announced_early.lock().unwrap());
     assert_eq!(
-        *announced_early.lock().unwrap(),
-        vec![RoomEvent::HeadAdvanced(seq(1))],
+        early.iter().map(seqs_in).collect::<Vec<_>>(),
+        vec![vec![1]],
         "only the first commit may be announced before the fsync of the group"
     );
     let head = u64::from(WAITING) + 1;
     let after_fsync: Vec<RoomEvent> =
         std::iter::from_fn(|| events.lock().unwrap().try_recv().ok()).collect();
     assert_eq!(
-        after_fsync,
-        vec![RoomEvent::HeadAdvanced(seq(head))],
-        "the group must be announced once, with its head"
+        after_fsync.iter().map(seqs_in).collect::<Vec<_>>(),
+        vec![(2..=head).collect::<Vec<_>>()],
+        "the group must be announced once, with its operations"
     );
     let synced = sync_all(&sender, &client).await.unwrap();
     let seqs: Vec<u64> = synced.ops.iter().map(|op| op.seq.get()).collect();
@@ -4229,6 +4234,7 @@ async fn a_group_whose_seal_fails_closes_the_mailbox_before_its_first_ack() {
         policy,
         relay_on(&dir),
         Arc::new(InflightBudget::new(u64::MAX, u64::MAX)),
+        Arc::new(OpsEventBudget::new(u64::MAX)),
         TEST_TIMINGS,
         Arc::clone(&io),
     )
@@ -4389,5 +4395,417 @@ async fn a_group_never_assigns_the_last_sequence_number() {
     let third = third.await.unwrap();
     assert!(matches!(third, Err(ServerError::Internal(_))), "{third:?}");
     assert_eq!(metrics(&sender).await.head_seq, seq(floor + 2));
+    fx.manager.shutdown_all().await;
+}
+
+// The SSE event `ops`: the operations of a durable commit or group, for the room's streams.
+
+/// The operations an `ops` event carries, decoded, with the id and version of the schema it
+/// announces for them. Checks that its head is that of its last operation; panics on any other
+/// event.
+fn ops_in(event: &RoomEvent) -> (Vec<SequencedOperation>, SchemaId, u64) {
+    use base64::Engine;
+    let RoomEvent::Ops(event) = event else {
+        panic!("expected an ops event, got {event:?}");
+    };
+    let frame = base64::engine::general_purpose::STANDARD
+        .decode(event.data())
+        .unwrap();
+    match zemdb_core::protocol::codec::decode_message(&frame).unwrap() {
+        zemdb_core::protocol::messages::ServerMessage::OpsEvent {
+            head_seq,
+            ops,
+            schema_version,
+            schema_id,
+            ..
+        } => {
+            assert_eq!(head_seq, event.head_seq());
+            assert_eq!(Some(head_seq), ops.last().map(|op| op.seq));
+            (ops, schema_id, schema_version)
+        }
+        other => panic!("expected an OpsEvent frame, got {other:?}"),
+    }
+}
+
+/// The sequences of the operations an `ops` event carries.
+fn seqs_in(event: &RoomEvent) -> Vec<u64> {
+    ops_in(event).0.iter().map(|op| op.seq.get()).collect()
+}
+
+/// The events broadcast so far and not yet received.
+fn pending_events(events: &mut broadcast::Receiver<RoomEvent>) -> Vec<RoomEvent> {
+    std::iter::from_fn(|| events.try_recv().ok()).collect()
+}
+
+/// A group with commits rejected and repeated in the middle announces, in one event, exactly
+/// its new operations: consecutive, after the head before the group, and the same ones a sync
+/// returns.
+#[tokio::test]
+async fn the_ops_event_of_a_group_carries_exactly_its_new_operations() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let (writer, other) = (
+        ClientId::new("writer").unwrap(),
+        ClientId::new("other").unwrap(),
+    );
+    register(&sender, &writer).await;
+    register(&sender, &other).await;
+    let mut events = subscribe(&sender).await;
+
+    let (release, held) = hold_next_fsync(&fx.active_wal());
+    let first = send_commit(&sender, &writer, mutation(1), seq(0), insert_op(1)).await;
+    held.await.unwrap();
+    let mut replies = vec![
+        send_commit(&sender, &writer, mutation(2), seq(0), insert_op(2)).await,
+        send_commit(&sender, &other, mutation(3), seq(0), invalid_op()).await,
+        send_commit(&sender, &writer, mutation(2), seq(0), insert_op(2)).await,
+        send_commit(&sender, &other, mutation(4), seq(9), insert_op(4)).await,
+        send_commit(&sender, &other, mutation(5), seq(0), insert_op(5)).await,
+    ];
+    release.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    for reply in replies.drain(..) {
+        let _ = reply.await.unwrap();
+    }
+
+    let announced = pending_events(&mut events);
+    assert_eq!(
+        announced.iter().map(seqs_in).collect::<Vec<_>>(),
+        vec![vec![1], vec![2, 3]]
+    );
+    let delivered: Vec<SequencedOperation> =
+        announced.iter().flat_map(|event| ops_in(event).0).collect();
+    assert_eq!(delivered, sync_all(&sender, &writer).await.unwrap().ops);
+    for event in &announced {
+        let (_, schema_id, version) = ops_in(event);
+        assert_eq!((schema_id.as_str(), version), ("todo", 1));
+    }
+    fx.manager.shutdown_all().await;
+}
+
+/// A schema reload waiting between two commits ends the group in front of it: each `ops`
+/// event announces the schema its operations were checked with, and the reload is announced
+/// between them.
+#[tokio::test]
+async fn a_schema_reload_between_waiting_commits_is_announced_between_their_events() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    let mut events = subscribe(&sender).await;
+    let mut evolved = test_schema();
+    evolved
+        .add_column(
+            "tasks",
+            zemdb_core::schema::ColumnDef::new("tag", zemdb_core::value::DataType::String)
+                .nullable(true),
+        )
+        .unwrap();
+    let row = RowBuilder::new().set("id", 3).set("title", "new").build();
+    let evolved_op = evolved.to_operation_insert("tasks", &row, 1000).unwrap();
+
+    let (release, held) = hold_next_fsync(&fx.active_wal());
+    let first = send_commit(&sender, &client, mutation(1), seq(0), insert_op(1)).await;
+    held.await.unwrap();
+    let before = send_commit(&sender, &client, mutation(2), seq(0), insert_op(2)).await;
+    let (reload_tx, reload_rx) = oneshot::channel();
+    sender
+        .send(RoomCommand::ReloadSchema {
+            schema_id: SchemaId::new("todo").unwrap(),
+            schema: Arc::new(evolved),
+            reply: reload_tx,
+        })
+        .await
+        .unwrap();
+    let after = send_commit(&sender, &client, mutation(3), seq(0), evolved_op).await;
+    release.send(()).unwrap();
+    first.await.unwrap().unwrap();
+    before.await.unwrap().unwrap();
+    reload_rx.await.unwrap().unwrap();
+    after.await.unwrap().unwrap();
+
+    let announced = pending_events(&mut events);
+    assert_eq!(announced.len(), 4, "{announced:?}");
+    assert_eq!(
+        announced[2],
+        RoomEvent::SchemaReloaded(SchemaId::new("todo").unwrap())
+    );
+    let ops_events: Vec<(Vec<u64>, u64)> = [&announced[0], &announced[1], &announced[3]]
+        .into_iter()
+        .map(|event| {
+            let (ops, _, version) = ops_in(event);
+            (ops.iter().map(|op| op.seq.get()).collect(), version)
+        })
+        .collect();
+    assert_eq!(
+        ops_events,
+        vec![(vec![1], 1), (vec![2], 1), (vec![3], 2)],
+        "each event announces the version its operations were checked with"
+    );
+    fx.manager.shutdown_all().await;
+}
+
+/// Operations whose frame does not fit in an `ops` event are announced with `head_advanced`,
+/// and clients read them with a sync.
+#[tokio::test]
+async fn an_operation_too_large_for_an_event_is_announced_with_head_advanced() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    let mut events = subscribe(&sender).await;
+
+    commit(
+        &sender,
+        &client,
+        mutation(1),
+        seq(0),
+        insert_op_with_title(1, 5000),
+    )
+    .await
+    .unwrap();
+    commit(&sender, &client, mutation(2), seq(0), insert_op(2))
+        .await
+        .unwrap();
+
+    let announced = pending_events(&mut events);
+    assert_eq!(announced[0], RoomEvent::HeadAdvanced(seq(1)));
+    assert_eq!(seqs_in(&announced[1]), vec![2]);
+    assert_eq!(announced.len(), 2);
+    fx.manager.shutdown_all().await;
+}
+
+/// A stream that falls more than the channel's capacity behind is told it lagged, and then
+/// receives the events still retained, whose gap from its cursor sends the client to a sync.
+#[tokio::test]
+async fn a_stream_that_falls_behind_is_told_it_lagged() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    let mut events = subscribe(&sender).await;
+
+    let commits = EVENTS_CAPACITY as u64 + 3;
+    for n in 1..=commits {
+        let mut id = [0u8; 16];
+        id[..8].copy_from_slice(&n.to_be_bytes());
+        commit(
+            &sender,
+            &client,
+            MutationId::new(id),
+            seq(0),
+            insert_op(n as i64),
+        )
+        .await
+        .unwrap();
+    }
+
+    assert!(matches!(
+        events.recv().await,
+        Err(broadcast::error::RecvError::Lagged(3))
+    ));
+    assert_eq!(seqs_in(&events.recv().await.unwrap()), vec![4]);
+    fx.manager.shutdown_all().await;
+}
+
+/// The `ops` events of all rooms retain at most `max_sse_ops_bytes`, counted by their base64:
+/// with streams that do not read in several rooms, an event that does not fit is sent as
+/// `head_advanced`. The bytes come back when the channel drops an event, when its streams read
+/// it, and when they close.
+#[tokio::test]
+async fn retained_ops_events_stay_within_their_total_and_come_back_when_dropped() {
+    let rooms = ["room-a", "room-b", "room-c"].map(|id| RoomId::new(id).unwrap());
+    let schema_id = SchemaId::new("todo").unwrap();
+    // Every room's first event is the same size: rooms of the same length, the same operation,
+    // and incarnations of the same encoded length (random 128-bit values: checked below).
+    let first_op = SequencedOperation::new(1u64, insert_op(1));
+    let first_event = |room_id: &RoomId, incarnation: u128| {
+        OpsEventBudget::new(u64::MAX)
+            .event(room_id, incarnation, &schema_id, 1, [&first_op].into_iter())
+            .unwrap()
+            .retained()
+    };
+    let len = first_event(&rooms[0], u128::MAX);
+    let max = len * 2 + len / 2;
+    let dir = tempdir().unwrap();
+    let (manager, _relay) = new_manager_with(&dir, |config| {
+        config.max_sse_ops_bytes = max as u64;
+    });
+    let held = || manager.ops_events().held();
+    let client = ClientId::new("writer").unwrap();
+    let mut senders = Vec::new();
+    let mut streams = Vec::new();
+    for room_id in &rooms {
+        let incarnation = manager
+            .create_room(room_id.clone(), schema_id.clone(), None)
+            .await
+            .unwrap()
+            .room_incarnation;
+        assert_eq!(first_event(room_id, incarnation), len);
+        let sender = manager.get_or_spawn(room_id, None).await.unwrap();
+        register(&sender, &client).await;
+        streams.push(subscribe(&sender).await);
+        senders.push(sender);
+    }
+    let [a, b, c] = [&senders[0], &senders[1], &senders[2]];
+
+    // Two events fill the total: the third room's is sent as head_advanced.
+    commit(a, &client, mutation(1), seq(0), insert_op(1))
+        .await
+        .unwrap();
+    commit(b, &client, mutation(1), seq(0), insert_op(1))
+        .await
+        .unwrap();
+    commit(c, &client, mutation(1), seq(0), insert_op(1))
+        .await
+        .unwrap();
+    assert_eq!(held(), 2 * len);
+    assert_eq!(
+        streams[2].try_recv().unwrap(),
+        RoomEvent::HeadAdvanced(seq(1))
+    );
+
+    // The channel of the first room drops its event once it is overwritten, unread: until then
+    // every event of the room is head_advanced, and the total is never passed.
+    for n in 2..=EVENTS_CAPACITY as u64 + 1 {
+        let mut id = [0u8; 16];
+        id[..8].copy_from_slice(&n.to_be_bytes());
+        commit(a, &client, MutationId::new(id), seq(0), insert_op(n as i64))
+            .await
+            .unwrap();
+        assert!(held() <= max);
+    }
+    assert_eq!(held(), len, "the overwritten event gave its bytes back");
+    assert!(matches!(
+        streams[0].try_recv(),
+        Err(broadcast::error::TryRecvError::Lagged(1))
+    ));
+
+    // Read by the only stream of its room, an event gives its bytes back once dropped.
+    let read = streams[1].try_recv().unwrap();
+    assert_eq!(seqs_in(&read), vec![1]);
+    drop(read);
+    assert_eq!(held(), 0);
+
+    // A stream that closes gives back the bytes of what it did not read.
+    commit(b, &client, mutation(2), seq(0), insert_op(2))
+        .await
+        .unwrap();
+    assert!(held() > 0);
+    drop(streams.remove(1));
+    assert_eq!(held(), 0);
+    manager.shutdown_all().await;
+}
+
+/// The events a stream receives until its room stops and the stream ends.
+async fn events_until_the_room_stops(
+    events: &mut broadcast::Receiver<RoomEvent>,
+) -> Vec<RoomEvent> {
+    let mut received = Vec::new();
+    loop {
+        match tokio::time::timeout(POLL_CEILING, events.recv())
+            .await
+            .expect("the stream of a stopped room ends")
+        {
+            Ok(event) => received.push(event),
+            Err(broadcast::error::RecvError::Closed) => return received,
+            Err(err) => panic!("{err:?}"),
+        }
+    }
+}
+
+/// A group whose fsync fails is never announced: its commits are answered `Unavailable`, the
+/// room stops, and its streams end with only the events of what was durable. An `ops` event
+/// announced anyway would hand clients operations that may never be durable (INV-D7).
+#[tokio::test]
+async fn a_group_whose_fsync_fails_is_never_announced() {
+    const WAITING: u8 = 4;
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    let mut events = subscribe(&sender).await;
+
+    let (release, held) = hold_next_fsync(&fx.active_wal());
+    let first = send_commit(&sender, &client, mutation(1), seq(0), insert_op(1)).await;
+    held.await.unwrap();
+    let mut replies = Vec::new();
+    for n in 2..=WAITING + 1 {
+        replies.push(send_commit(&sender, &client, mutation(n), seq(0), insert_op(n.into())).await);
+    }
+    let active = fx.active_wal();
+    before_next_fsync(&fx.active_wal(), move || {
+        fail_point::arm("warm_append_sync", &active)
+    });
+    release.send(()).unwrap();
+
+    assert_eq!(first.await.unwrap().unwrap().assigned_seq, seq(1));
+    for reply in replies {
+        assert!(matches!(reply.await, Ok(Err(ServerError::Unavailable(_)))));
+    }
+    let announced = events_until_the_room_stops(&mut events).await;
+    assert_eq!(
+        announced.iter().map(seqs_in).collect::<Vec<_>>(),
+        vec![vec![1]],
+        "the failed group was announced"
+    );
+    fx.manager.shutdown_all().await;
+}
+
+/// A commit whose write fails is never announced either.
+#[tokio::test]
+async fn a_commit_whose_write_fails_is_never_announced() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    let mut events = subscribe(&sender).await;
+    commit(&sender, &client, mutation(1), seq(0), insert_op(1))
+        .await
+        .unwrap();
+
+    fail_point::arm("warm_append_write", &fx.active_wal());
+    let failed = commit(&sender, &client, mutation(2), seq(1), insert_op(2)).await;
+    assert!(
+        matches!(failed, Err(ServerError::Unavailable(_))),
+        "{failed:?}"
+    );
+
+    let announced = events_until_the_room_stops(&mut events).await;
+    assert_eq!(
+        announced.iter().map(seqs_in).collect::<Vec<_>>(),
+        vec![vec![1]],
+        "the failed commit was announced"
+    );
+    fx.manager.shutdown_all().await;
+}
+
+/// An `ops` event says the incarnation of its room, so that a client of an earlier room with
+/// the same id does not apply it.
+#[tokio::test]
+async fn an_ops_event_carries_the_incarnation_of_its_room() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    let mut events = subscribe(&sender).await;
+    commit(&sender, &client, mutation(1), seq(0), insert_op(1))
+        .await
+        .unwrap();
+
+    let RoomEvent::Ops(event) = events.try_recv().unwrap() else {
+        panic!("expected an ops event");
+    };
+    use base64::Engine;
+    let frame = base64::engine::general_purpose::STANDARD
+        .decode(event.data())
+        .unwrap();
+    let message: zemdb_core::protocol::messages::ServerMessage =
+        zemdb_core::protocol::codec::decode_message(&frame).unwrap();
+    assert!(matches!(
+        message,
+        zemdb_core::protocol::messages::ServerMessage::OpsEvent { room_incarnation, .. }
+            if room_incarnation == fx.incarnation
+    ));
     fx.manager.shutdown_all().await;
 }

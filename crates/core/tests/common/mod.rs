@@ -665,7 +665,7 @@ pub fn client_message(rng: &mut Rng) -> ClientMessage {
 pub fn server_message(rng: &mut Rng, error_codes: &[ErrorCode]) -> ServerMessage {
     let correlation_id = correlation_id(rng);
     let room_id = room_id(rng);
-    match rng.below(11) {
+    match rng.below(12) {
         0 => ServerMessage::CommitAck {
             correlation_id,
             room_id,
@@ -745,11 +745,19 @@ pub fn server_message(rng: &mut Rng, error_codes: &[ErrorCode]) -> ServerMessage
             schema_id: schema_id(rng),
             schema: schema(rng),
         },
-        _ => ServerMessage::Error {
+        10 => ServerMessage::Error {
             correlation_id: option(rng, self::correlation_id),
             room_id: rng.coin().then_some(room_id),
             code: *rng.pick(error_codes),
             message: text(rng, 30),
+        },
+        _ => ServerMessage::OpsEvent {
+            room_id,
+            room_incarnation: rng.u128(),
+            head_seq: seq(rng),
+            ops: sequenced_operations(rng, 5),
+            schema_version: rng.u64(),
+            schema_id: schema_id(rng),
         },
     }
 }
@@ -972,7 +980,7 @@ pub fn sample_client_messages() -> Vec<ClientMessage> {
     messages
 }
 
-/// Every server message kind.
+/// Every server message kind, in the order of their variants.
 pub fn sample_server_messages() -> Vec<ServerMessage> {
     let correlation_id = CorrelationId::new(1);
     vec![
@@ -1060,6 +1068,14 @@ pub fn sample_server_messages() -> Vec<ServerMessage> {
             room_id: Some(sample_room()),
             code: ErrorCode::RoomReset,
             message: "boom".into(),
+        },
+        ServerMessage::OpsEvent {
+            room_id: sample_room(),
+            room_incarnation: u128::MAX - 3,
+            head_seq: SequenceNumber::new(5),
+            ops: sample_ops(),
+            schema_version: 2,
+            schema_id: SchemaId::new("todo").unwrap(),
         },
     ]
 }

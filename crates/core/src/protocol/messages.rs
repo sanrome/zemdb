@@ -61,6 +61,10 @@ pub enum ErrorCode {
     /// the room incarnation: the client must discard its local state and register without a
     /// cursor (HTTP 409). Permanent for that state.
     RoomReset,
+    /// The server has its event stream (SSE) turned off (HTTP 404): the client learns of new
+    /// operations from its heartbeats and syncs instead. Permanent for the server's
+    /// configuration.
+    EventsDisabled,
 }
 
 /// An operation ordered by the coordination server with assigned sequence ID.
@@ -352,6 +356,24 @@ pub enum ServerMessage {
         room_id: Option<RoomId>,
         code: ErrorCode,
         message: String,
+    },
+    /// The operations of a commit, or of a group of commits, that just became durable: the
+    /// data of the SSE event `ops`, in base64. Not a reply to any request.
+    OpsEvent {
+        room_id: RoomId,
+        /// The incarnation of the room the operations belong to (that of `Registered`): an event
+        /// of another one, from a room deleted and created again with the same id, is not
+        /// applied, and the client registers again.
+        room_incarnation: u128,
+        /// The head the operations reach: the sequence of the last one.
+        head_seq: SequenceNumber,
+        /// Consecutive operations of the log, in order, starting right after the head the room
+        /// had before them.
+        ops: Vec<SequencedOperation>,
+        /// Version of the schema the operations were checked with (see `CommitAck`).
+        schema_version: u64,
+        /// Id of the schema the operations were checked with (see `CommitAck`).
+        schema_id: SchemaId,
     },
 }
 

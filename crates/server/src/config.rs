@@ -125,8 +125,15 @@ pub struct ServerConfig {
     pub max_inflight_response_bytes_per_client: u64,
 
     /// Most SSE streams open at once (default: half of `max_connections`, at least 1). A
-    /// client keeps at most 2 per room: opening a third closes its oldest.
+    /// client keeps at most 2 per room: opening a third closes its oldest. With 0 the event
+    /// stream is off, and opening one is answered `EventsDisabled`.
     pub max_sse_streams: Option<usize>,
+
+    /// Bytes of `ops` events (the operations of a commit or a group of commits, in base64)
+    /// that the event channels of all rooms retain at once (default 64 MiB). An event holds
+    /// its bytes until every stream of its room read it or its channel drops it; one that does
+    /// not fit is sent as `head_advanced` instead.
+    pub max_sse_ops_bytes: u64,
 
     /// File operations of the rooms, of opening, creating and deleting them, and of the schema
     /// registry that run at once, each on a blocking thread of the runtime (default 16, at most
@@ -172,6 +179,7 @@ impl Default for ServerConfig {
             max_inflight_response_bytes: 256 * 1024 * 1024,
             max_inflight_response_bytes_per_client: 2 * MAX_FRAME_SIZE as u64,
             max_sse_streams: None,
+            max_sse_ops_bytes: 64 * 1024 * 1024,
             io_threads: 16,
         }
     }
@@ -210,6 +218,10 @@ const RESPONSE_STALL_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u64> = 5..=360
 /// fits, to 64 GiB.
 const MAX_INFLIGHT_RESPONSE_BYTES_RANGE: std::ops::RangeInclusive<u64> =
     MAX_FRAME_SIZE as u64..=64 * 1024 * 1024 * 1024;
+
+/// Accepted range of `max_sse_ops_bytes`: up to 64 GiB; with 0, every commit is announced with
+/// `head_advanced`.
+const MAX_SSE_OPS_BYTES_RANGE: std::ops::RangeInclusive<u64> = 0..=64 * 1024 * 1024 * 1024;
 
 /// Minimum length, in bytes, of the client token secret and the admin secret.
 const MIN_SECRET_LEN: usize = 32;
@@ -307,9 +319,14 @@ impl ServerConfig {
             check_range(
                 "max_sse_streams (ZEMDB_MAX_SSE_STREAMS)",
                 max,
-                1..=self.max_connections,
+                0..=self.max_connections,
             )?;
         }
+        check_range(
+            "max_sse_ops_bytes (ZEMDB_MAX_SSE_OPS_BYTES)",
+            self.max_sse_ops_bytes,
+            MAX_SSE_OPS_BYTES_RANGE,
+        )?;
         self.lifecycle_settings()
             .check(|setting| format!("{} ({})", setting.field(), setting.env_var()))
             .map_err(ServerError::Config)
@@ -436,6 +453,9 @@ impl ServerConfig {
         }
         if let Some(max) = parse_var(&var, "ZEMDB_MAX_SSE_STREAMS")? {
             self.max_sse_streams = Some(max);
+        }
+        if let Some(bytes) = parse_var(&var, "ZEMDB_MAX_SSE_OPS_BYTES")? {
+            self.max_sse_ops_bytes = bytes;
         }
         if let Some(threads) = parse_var(&var, "ZEMDB_IO_THREADS")? {
             self.io_threads = threads;

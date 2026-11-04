@@ -6,8 +6,8 @@
 mod common;
 
 use common::*;
-use zemdb_core::protocol::encoded_len;
 use zemdb_core::protocol::wal_frame::wal_record_payload_len;
+use zemdb_core::protocol::{encoded_len, PROTOCOL_MAGIC};
 use zemdb_core::*;
 
 fn check_client_messages(seed: u64, cases: u64) {
@@ -197,4 +197,25 @@ fn random_snapshot_envelope_headers_round_trip() {
 #[ignore = "long-running randomized test; run with --ignored in release"]
 fn random_snapshot_envelope_headers_round_trip_long() {
     check_envelope_headers(0x5A9_1002, 1_000_000);
+}
+
+#[test]
+fn server_messages_keep_their_wire_indexes() {
+    // Messages are encoded by variant index: a new message goes at the end, never in between,
+    // so that the event of the operations does not renumber the replies a client decodes.
+    let messages = sample_server_messages();
+    for (index, message) in messages.iter().enumerate() {
+        let frame = encode_message(message).unwrap();
+        assert_eq!(frame[PROTOCOL_HEADER_LEN], index as u8, "{message:?}");
+    }
+    assert!(matches!(messages[11], ServerMessage::OpsEvent { .. }));
+    // The index after the last listed message is not a message: none was left out.
+    let mut frame = PROTOCOL_MAGIC.to_vec();
+    frame.extend_from_slice(&[PROTOCOL_VERSION, 0, messages.len() as u8]);
+    let err = decode_message::<ServerMessage>(&frame).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains(&format!("variant index 0 <= i < {}", messages.len())),
+        "{err}"
+    );
 }

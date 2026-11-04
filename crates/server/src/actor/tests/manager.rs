@@ -983,6 +983,7 @@ async fn spawned_actor_reports_a_panic() {
         RoomLifecyclePolicy::default(),
         relay,
         Arc::new(InflightBudget::new(u64::MAX, u64::MAX)),
+        Arc::new(OpsEventBudget::new(u64::MAX)),
         ActorTimings::default(),
         IoThreads::new(2),
     )

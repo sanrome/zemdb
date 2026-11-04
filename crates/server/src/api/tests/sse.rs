@@ -134,3 +134,15 @@ fn a_client_has_one_replacement_starting_at_a_time() {
     starting.replace_older();
     assert!(streams.open(&room, &client).is_ok());
 }
+
+#[test]
+fn with_no_streams_allowed_every_stream_is_refused_as_turned_off() {
+    let streams = Arc::new(SseStreams::new(0));
+    let (room, client) = ids("room", "client");
+    assert!(matches!(
+        streams.open(&room, &client),
+        Err(ServerError::EventsDisabled)
+    ));
+    assert_eq!(total(&streams), 0);
+    assert!(streams.lock().by_client.is_empty());
+}

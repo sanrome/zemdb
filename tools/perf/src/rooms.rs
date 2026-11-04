@@ -8,8 +8,9 @@
 //!
 //! Each client writes on average every `T` seconds at exponential intervals, without waiting for
 //! its previous write (open loop; `--period 0`: no writes). With `--sse 1` each client keeps its
-//! room's event stream open on a connection of its own, and every `head_advanced` above its
-//! cursor wakes its sync task. Commits, syncs and acks of every client go through a shared pool
+//! room's event stream open on a connection of its own: it applies the operations of an `ops`
+//! event that follows its cursor, and any other announcement above its cursor (`head_advanced`,
+//! or an `ops` event after a gap) wakes its sync task. Commits, syncs and acks of every client go through a shared pool
 //! of keep-alive connections, as behind a proxy. Each row carries its author and the time it was
 //! sent, so the propagation latency (from the scheduled send to each other client applying it)
 //! needs no shared clock.
@@ -708,17 +709,22 @@ async fn sse_reader(
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(payload)
                     .ok()
-                    .and_then(|bytes| decode_message::<SequencedOperation>(&bytes).ok());
-                if let Some(op) = decoded {
-                    let seq = op.seq.get();
-                    client.known_head.fetch_max(seq, Ordering::AcqRel);
-                    let cursor = *client.cursor.lock().unwrap();
-                    if seq == cursor + 1 {
-                        apply(&shared, &client, std::slice::from_ref(&op));
-                    } else if seq > cursor + 1 {
-                        // A gap (an event missed or not yet applied): catch up with a sync.
-                        client.notify.notify_one();
-                    }
+                    .and_then(|bytes| decode_message::<ServerMessage>(&bytes).ok());
+                let Some(ServerMessage::OpsEvent { head_seq, ops, .. }) = decoded else {
+                    // An event that does not decode is skipped: its operations come with the
+                    // next announcement above the cursor, or the heartbeat, and a sync.
+                    shared.counters.sse_errors.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+                let head = head_seq.get();
+                client.known_head.fetch_max(head, Ordering::AcqRel);
+                let cursor = *client.cursor.lock().unwrap();
+                let first = ops.first().map_or(head, |op| op.seq.get());
+                if first > cursor + 1 {
+                    // A gap (an event missed or not yet applied): catch up with a sync.
+                    client.notify.notify_one();
+                } else if head > cursor {
+                    apply(&shared, &client, &ops);
                 }
             } else if event == "head_advanced" {
                 shared.counters.sse_events.fetch_add(1, Ordering::Relaxed);

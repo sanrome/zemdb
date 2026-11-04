@@ -6,6 +6,7 @@ use zemdb_core::mutation::Operation;
 use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::schema::Schema;
 
+pub use crate::actor::ops_event::OpsEvent;
 use crate::error::ServerError;
 use crate::log::RoomLifecyclePolicy;
 use crate::relay::LogBounds;
@@ -87,7 +88,10 @@ pub struct RoomMetrics {
 /// of truth, since SSE is optional and a slow subscriber can miss events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoomEvent {
+    /// New operations are durable, up to this head; clients read them with a sync.
     HeadAdvanced(SequenceNumber),
+    /// New operations are durable, and the event carries them.
+    Ops(OpsEvent),
     SchemaReloaded(SchemaId),
     /// A client was designated to upload a snapshot. Carries no data: a client learns whether
     /// it is the designee from its next heartbeat.
@@ -149,7 +153,7 @@ pub enum RoomCommand {
         reply: oneshot::Sender<Result<HeartbeatResponse, ServerError>>,
     },
 
-    /// Subscribe to the room's signal-only SSE broadcast channel.
+    /// Subscribe to the room's SSE broadcast channel.
     SubscribeEvents {
         reply: oneshot::Sender<Result<broadcast::Receiver<RoomEvent>, ServerError>>,
     },

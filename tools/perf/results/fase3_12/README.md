@@ -51,3 +51,11 @@ La base es `d386522` (el Lote 4); el resultado, el código del lote (cada regist
 - `first-*.jsonl`: la línea de base del paso 0, una ronda de la base al arrancar el lote (E1-disco y E1-tmpfs con 1 y 8 pedidos en vuelo).
 - `final-e1-*.jsonl` y `final-e2.jsonl`: la medición del lote, tres rondas intercaladas de la base y el resultado: E1-disco y E1-tmpfs con 1 y 8 pedidos en vuelo, y el control E2-tmpfs con 500 salas.
 - `extra-e1-disk-*.jsonl`: tres rondas más de E1-disco con 1 pedido en vuelo, intercaladas, empezando por el resultado.
+
+## `lote5/`: el SSE que trae las operaciones
+
+La base es `e4300ef` (el Lote 4b, con el arreglo de un test); el resultado, el código del lote (el evento `ops`). La misma VM que `lote4b/`. El generador es el del lote, que lee el evento `ops` y sigue entendiendo `head_advanced`, y en cada medición es el mismo binario para la base y el resultado.
+
+- `final-*.jsonl`: la medición del lote, con el código final (después de los arreglos de la revisión de delta: el evento lleva la encarnación de la sala, y el total cuenta un costo fijo por evento). Tres rondas intercaladas: el escenario del lote (`final-e2f.jsonl`, E2-modos con 1.000 salas, modo a con `--ack sync` y modo c con `--ack periodic`, que en la base, sin el evento `ops`, es el modo b) y los controles (`final-e1-*.jsonl`, E1-tmpfs con 1 y 8 pedidos en vuelo; `final-e2.jsonl`, E2-tmpfs con 500 salas).
+- `first-*.jsonl`: la misma medición, antes de la revisión de delta, con su propio generador (que leía el evento sin la encarnación). La base de las dos mediciones es el mismo binario; en esta primera sesión la máquina estuvo más lenta (la base, 0,93 ms de CPU por commit en el modo c, contra 0,85 en la final).
+- `profile-first-e2f-c-result.json`: la corrida del perfil de CPU del resultado de la primera medición, en modo c (40 s, con `perf` grabando 15 s; su propagación sufre el costo de `perf`).

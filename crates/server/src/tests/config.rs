@@ -143,6 +143,7 @@ fn unparsable_environment_values_fail_naming_the_variable() {
         ("ZEMDB_RESPONSE_STALL_TIMEOUT_SECS", "1m"),
         ("ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES", "256MiB"),
         ("ZEMDB_MAX_SSE_STREAMS", "half"),
+        ("ZEMDB_MAX_SSE_OPS_BYTES", "64MiB"),
         ("ZEMDB_IO_THREADS", "all"),
     ] {
         let err = with_env(&[(name, value)]).unwrap_err();
@@ -306,6 +307,7 @@ fn empty_environment_values_count_as_unset() {
         "ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES",
         "ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES_PER_CLIENT",
         "ZEMDB_MAX_SSE_STREAMS",
+        "ZEMDB_MAX_SSE_OPS_BYTES",
         "ZEMDB_SNAPSHOT_UPLOAD_MAX_SECS",
         "ZEMDB_IO_THREADS",
     ];
@@ -328,6 +330,7 @@ fn http_limits_have_defaults_and_toml_keys() {
     );
     assert_eq!(config.snapshot_upload_max_secs, 7_200);
     assert_eq!(config.sse_stream_limit(), 5_000);
+    assert_eq!(config.max_sse_ops_bytes, 64 * 1024 * 1024);
     assert_eq!(config.io_threads, 16);
     assert_eq!(ServerConfig::from_toml_str("").unwrap(), config);
 
@@ -336,7 +339,7 @@ fn http_limits_have_defaults_and_toml_keys() {
          body_min_rate_bytes_per_sec = 4096\nmax_connections = 500\n\
          response_stall_timeout_secs = 30\nmax_inflight_response_bytes = 33554432\n\
          max_inflight_response_bytes_per_client = 16777220\nmax_sse_streams = 400\n\
-         snapshot_upload_max_secs = 60\nio_threads = 4\n",
+         snapshot_upload_max_secs = 60\nio_threads = 4\nmax_sse_ops_bytes = 1024\n",
     )
     .unwrap();
     assert_eq!(parsed.header_read_timeout_secs, 5);
@@ -349,6 +352,7 @@ fn http_limits_have_defaults_and_toml_keys() {
     assert_eq!(parsed.snapshot_upload_max_secs, 60);
     assert_eq!(parsed.io_threads, 4);
     assert_eq!(parsed.sse_stream_limit(), 400);
+    assert_eq!(parsed.max_sse_ops_bytes, 1024);
 }
 
 #[test]
@@ -360,6 +364,18 @@ fn sse_stream_limit_follows_max_connections_unless_set() {
     assert_eq!(config.sse_stream_limit(), 1);
     config.max_connections = 501;
     assert_eq!(config.sse_stream_limit(), 250);
+}
+
+#[test]
+fn zero_sse_streams_turns_the_event_stream_off_and_zero_ops_bytes_turns_off_ops_events() {
+    let config = with_env(&[
+        ("ZEMDB_MAX_SSE_STREAMS", "0"),
+        ("ZEMDB_MAX_SSE_OPS_BYTES", "0"),
+    ])
+    .unwrap();
+    config.validate().unwrap();
+    assert_eq!(config.sse_stream_limit(), 0);
+    assert_eq!(config.max_sse_ops_bytes, 0);
 }
 
 #[test]
@@ -376,11 +392,13 @@ fn http_limit_environment_variables_set_the_limits() {
             "68719476736",
         ),
         ("ZEMDB_MAX_SSE_STREAMS", "1"),
+        ("ZEMDB_MAX_SSE_OPS_BYTES", "68719476736"),
         ("ZEMDB_SNAPSHOT_UPLOAD_MAX_SECS", "86400"),
         ("ZEMDB_IO_THREADS", "512"),
     ])
     .unwrap();
     config.validate().unwrap();
+    assert_eq!(config.max_sse_ops_bytes, 64 << 30);
     assert_eq!(config.io_threads, 512);
     assert_eq!(config.response_stall_timeout_secs, 5);
     assert_eq!(config.max_inflight_response_bytes, 64 << 30);
@@ -414,9 +432,9 @@ fn http_limits_outside_their_range_fail_naming_the_variable() {
         ("ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES_PER_CLIENT", "268435457"),
         ("ZEMDB_SNAPSHOT_UPLOAD_MAX_SECS", "59"),
         ("ZEMDB_SNAPSHOT_UPLOAD_MAX_SECS", "86401"),
-        ("ZEMDB_MAX_SSE_STREAMS", "0"),
         // Above `max_connections` (10,000 by default).
         ("ZEMDB_MAX_SSE_STREAMS", "10001"),
+        ("ZEMDB_MAX_SSE_OPS_BYTES", "68719476737"),
         ("ZEMDB_IO_THREADS", "0"),
         // Above the blocking threads of the runtime.
         ("ZEMDB_IO_THREADS", "513"),

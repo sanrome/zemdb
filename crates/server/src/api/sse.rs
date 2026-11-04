@@ -5,7 +5,7 @@ use futures::stream::StreamExt;
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, oneshot};
 use zemdb_core::id::{ClientId, RoomId};
 
@@ -15,23 +15,31 @@ use crate::api::extract::EventStreamAuth;
 use crate::api::router::AppState;
 use crate::error::ServerError;
 
-/// `GET /rooms/:room_id/events`: the room's signal-only Server-Sent Events (SSE) stream.
-/// Authenticated via `EventStreamAuth` (Bearer token or `?token=` query parameter, issued for
-/// the path room). Every error, before or after authentication (a room that does not exist,
-/// an actor that stopped or did not answer in time), is a binary error frame, as in the rest of
-/// the Data Plane.
+/// `GET /rooms/:room_id/events`: the room's Server-Sent Events (SSE) stream. Authenticated via
+/// `EventStreamAuth` (Bearer token or `?token=` query parameter, issued for the path room).
+/// Every error, before or after authentication (a room that does not exist, an actor that
+/// stopped or did not answer in time, the stream turned off), is a binary error frame, as in
+/// the rest of the Data Plane.
 ///
-/// Emits lightweight signals without transmitting row payloads: `head_advanced` (new head
-/// sequence), `schema_reloaded` (schema id), `snapshot_wanted` (a client was designated to
-/// upload a snapshot; empty data, the designee learns it is the one from a heartbeat) and
+/// Emits `ops` (the operations of a commit or a group of commits once durable: a
+/// `ServerMessage::OpsEvent` frame in base64), `head_advanced` (the new head, instead of `ops`
+/// for operations too large for an event or without room in the server's total of retained
+/// events), `schema_reloaded` (schema id), `snapshot_wanted` (a client was designated to upload
+/// a snapshot; empty data, the designee learns it is the one from a heartbeat) and
 /// `snapshot_available` (sequence of a new usable snapshot). The replies to heartbeats, syncs
-/// and commits remain the source of truth; these events only let foreground clients react
-/// sooner. The stream ends when the room actor stops, the server begins shutting down, or the
-/// same client opens a newer stream for the room that leaves it over `STREAMS_PER_CLIENT`.
-/// Over `config.sse_stream_limit()` streams in all, a new one is refused with `RateLimited`.
+/// and commits remain the source of truth; these events only let foreground clients learn
+/// sooner, and a client that misses one sees a gap after its cursor and syncs. The stream ends
+/// when the room actor stops, the server begins shutting down, its token expires, or the same
+/// client opens a newer stream for the room that leaves it over `STREAMS_PER_CLIENT`. With
+/// `config.sse_stream_limit()` at 0 every stream is refused with `EventsDisabled`; over it, a
+/// new one is refused with `RateLimited`.
 pub async fn room_events(
     State(state): State<AppState>,
-    EventStreamAuth { room_id, client_id }: EventStreamAuth,
+    EventStreamAuth {
+        room_id,
+        client_id,
+        expires_at,
+    }: EventStreamAuth,
 ) -> Response {
     let mut slot = match state.sse_streams.open(&room_id, &client_id) {
         Ok(slot) => slot,
@@ -44,10 +52,14 @@ pub async fn room_events(
     slot.replace_older();
 
     let shutdown = state.shutdown.clone();
+    // The stream carries the room's operations, so it ends when its token expires: tokens are
+    // not revoked, and their expiry is what ends the access of a member who was removed.
+    let expiry = tokio::time::sleep(until(expires_at));
     let stream = futures::stream::unfold(receiver, |mut rx| async move {
         let event = Event::default();
         let event = match rx.recv().await {
             Ok(RoomEvent::HeadAdvanced(seq)) => event.event("head_advanced").data(seq.to_string()),
+            Ok(RoomEvent::Ops(ops)) => event.event("ops").data(ops.data()),
             Ok(RoomEvent::SchemaReloaded(schema_id)) => {
                 event.event("schema_reloaded").data(&schema_id)
             }
@@ -62,18 +74,27 @@ pub async fn room_events(
         Some((Ok::<_, Infallible>(event), rx))
     })
     // End the stream when the server shuts down (otherwise the graceful shutdown would wait
-    // for this connection forever) or when a newer stream takes its slot. The slot is held
-    // until then.
+    // for this connection forever), when a newer stream takes its slot, or when its token
+    // expires. The slot is held until then.
     .take_until(async move {
         tokio::select! {
             () = shutdown.wait() => {}
             _ = &mut slot.replaced => {}
+            () = expiry => {}
         }
     });
 
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(KEEP_ALIVE_INTERVAL))
         .into_response()
+}
+
+/// The time left until `expires_at` (seconds since the Unix epoch); zero if it passed.
+fn until(expires_at: u64) -> Duration {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    Duration::from_secs(expires_at).saturating_sub(now)
 }
 
 /// Interval of the SSE keep-alive comments, which keep idle proxies from closing the stream.
@@ -115,8 +136,9 @@ impl SseStreams {
         self.open.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Takes a slot for a new stream of `client_id` in `room_id`, or refuses it with
-    /// `RateLimited` when `max` streams are open, unless the client is at
+    /// Takes a slot for a new stream of `client_id` in `room_id`. Refuses it with
+    /// `EventsDisabled` when `max` is 0, the event stream turned off, and with `RateLimited`
+    /// when `max` streams are open, unless the client is at
     /// [`STREAMS_PER_CLIENT`]: then the slot replaces its oldest stream once the new one starts
     /// ([`SseSlot::replace_older`]), so a stream that fails to start replaces none. A client
     /// has one such replacement starting at a time; another is refused with `RateLimited`.
@@ -125,6 +147,9 @@ impl SseStreams {
         room_id: &RoomId,
         client_id: &ClientId,
     ) -> Result<SseSlot, ServerError> {
+        if self.max == 0 {
+            return Err(ServerError::EventsDisabled);
+        }
         let key = (room_id.clone(), client_id.clone());
         let mut open = self.lock();
         let open = &mut *open;

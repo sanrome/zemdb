@@ -19,6 +19,7 @@ use crate::actor::command::{
     SyncBatchResponse,
 };
 use crate::actor::lease::{ClientLeaseTracker, ClientState};
+use crate::actor::ops_event::OpsEventBudget;
 use crate::actor::snapshot_demand::{persistence_granularity, SnapshotDemand, DESIGNATION_TIMEOUT};
 use crate::config::ServerConfig;
 use crate::dedup::{dedup_key, DedupLruCache};
@@ -122,6 +123,9 @@ pub struct RoomActor {
     stopping_idle: bool,
     snapshot_relay: Arc<SnapshotRelay>,
     response_budget: Arc<InflightBudget>,
+    /// The server's total of the bytes retained by `ops` events, which this room's events take
+    /// from.
+    ops_events: Arc<OpsEventBudget>,
     snapshot_demand: SnapshotDemand,
     /// How stale the persisted renewal time of the snapshot demand may get.
     demand_persistence_granularity: Duration,
@@ -151,6 +155,7 @@ impl RoomActor {
         lifecycle_policy: RoomLifecyclePolicy,
         snapshot_relay: Arc<SnapshotRelay>,
         response_budget: Arc<InflightBudget>,
+        ops_events: Arc<OpsEventBudget>,
         timings: ActorTimings,
         io: Arc<IoThreads>,
     ) -> Result<(mpsc::Sender<RoomCommand>, Self), ServerError> {
@@ -204,6 +209,7 @@ impl RoomActor {
             stopping_idle: false,
             snapshot_relay,
             response_budget,
+            ops_events,
             snapshot_demand,
             demand_persistence_granularity: persistence_granularity(demand_ttl),
             announced_snapshot: None,
@@ -572,7 +578,7 @@ impl RoomActor {
         }
         if group.head > self.head_seq {
             self.head_seq = group.head;
-            let _ = self.events_tx.send(RoomEvent::HeadAdvanced(group.head));
+            let _ = self.events_tx.send(self.announcement(&group.commits));
         }
         // A failed segment rotation after a durable append leaves the segment files in an
         // uncertain state. The commits are still acknowledged; then the room stops and is
@@ -597,6 +603,30 @@ impl RoomActor {
             return ControlFlow::Break(());
         }
         ControlFlow::Continue(())
+    }
+
+    /// The event that announces the new mutations of `commits`, a group whose records are
+    /// durable and whose head is now the room's: `ops`, with their operations, if a stream
+    /// listens and the server's total of retained events has room for them; otherwise
+    /// `head_advanced`. The operations were checked with the room's schema, which a group
+    /// never changes: a schema reload in the mailbox ends the group.
+    fn announcement(&self, commits: &[PendingCommit]) -> RoomEvent {
+        let new_ops = commits.iter().filter_map(|commit| match &commit.decision {
+            Decision::New(seq_op) => Some(seq_op),
+            _ => None,
+        });
+        let event = (self.events_tx.receiver_count() > 0)
+            .then(|| {
+                self.ops_events.event(
+                    &self.room_id,
+                    self.incarnation,
+                    &self.schema_id,
+                    self.schema.version(),
+                    new_ops,
+                )
+            })
+            .flatten();
+        event.map_or(RoomEvent::HeadAdvanced(self.head_seq), RoomEvent::Ops)
     }
 
     /// Checks `request` against the room and the commits of `group` before it, and adds it to

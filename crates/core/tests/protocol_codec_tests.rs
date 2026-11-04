@@ -687,6 +687,7 @@ fn error_codes_keep_their_wire_indexes() {
         ErrorCode::SchemaAlreadyExists,
         ErrorCode::RequestTimeout,
         ErrorCode::RoomReset,
+        ErrorCode::EventsDisabled,
     ];
     for (index, code) in codes.into_iter().enumerate() {
         let frame = encode_message(&code).unwrap();
