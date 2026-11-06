@@ -3,7 +3,7 @@ use crate::dedup::DedupLruCache;
 use crate::log::budget::PEAK;
 use crate::log::io_probe::{self, IoEvent};
 use crate::log::policy::{MAX_LOG_BYTES_LIMIT, MIN_LOG_BYTES_LIMIT};
-use crate::log::test_support::{frames, make_op, segment_file, seqs};
+use crate::log::test_support::{frames, make_op, owned, segment_file, seqs};
 use crate::test_support::TestRng;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -24,7 +24,7 @@ fn ttl_eviction_policy() -> RoomLifecyclePolicy {
     }
 }
 
-fn assert_contiguous(ops: &[SequencedOperation], first: u64, last: u64) {
+fn assert_contiguous<T: std::borrow::Borrow<SequencedOperation>>(ops: &[T], first: u64, last: u64) {
     let expected: Vec<u64> = (first..=last).collect();
     assert_eq!(seqs(ops), expected);
 }
@@ -1312,7 +1312,7 @@ fn null_rows_log(dir: &Path, ram_max_bytes: u64) -> TieredLog {
 
 /// Asserts that `ops`, of [`null_row_op`], hold at most `MAX_MESSAGE_VALUES` values and are
 /// not the whole log.
-fn assert_within_the_values_of_a_message((ops, has_more): (Vec<SequencedOperation>, bool)) {
+fn assert_within_the_values_of_a_message((ops, has_more): (Vec<Arc<SequencedOperation>>, bool)) {
     let values = (ops.len() * NULL_ROW_VALUES) as u64;
     assert!(
         values <= zemdb_core::protocol::limits::MAX_MESSAGE_VALUES,
@@ -1466,7 +1466,7 @@ fn cold_segment_of_large_operations_roundtrips() {
 
     assert_eq!(count_in(&log, Tier::Cold), 1);
     let (read, has_more) = log.fetch_deltas(SequenceNumber::new(0), 100, None).unwrap();
-    assert_eq!(read, ops);
+    assert_eq!(owned(read), ops);
     assert!(!has_more);
 }
 
@@ -1715,7 +1715,7 @@ fn test_tiered_log_write_through_and_crash_recovery() {
         .fetch_deltas(SequenceNumber::new(0), 100, None)
         .unwrap();
 
-    assert_eq!(deltas, (1..=10).map(make_op).collect::<Vec<_>>());
+    assert_eq!(owned(deltas), (1..=10).map(make_op).collect::<Vec<_>>());
     assert!(!has_more);
 }
 
@@ -2198,7 +2198,7 @@ fn read_chain(
             break;
         };
         at = last.seq.get();
-        out.extend(ops);
+        out.extend(owned(ops));
         if !has_more {
             break;
         }
@@ -2482,7 +2482,7 @@ fn simulate_pages_while_the_log_changes(seeds: std::ops::Range<u64>, chains: usi
                     Ok((ops, has_more)) => {
                         let n = ops.len() as u64;
                         assert!(
-                            ops.as_slice() == &accepted[at as usize..(at + n) as usize],
+                            owned(ops) == accepted[at as usize..(at + n) as usize],
                             "{context}: page from {at}"
                         );
                         assert_eq!(has_more, at + n < head, "{context}: has_more from {at}");
@@ -2837,6 +2837,71 @@ fn fetch_cost_does_not_grow_with_the_number_of_segments() {
     assert!(many < 3 * few, "{many:?} against {few:?}");
 }
 
+/// Two responses that read the same operations of the RAM buffer share them, and each still
+/// reserves all of them, as a response with copies did (INV-B1): what a response reserves does
+/// not depend on who else holds its operations.
+#[test]
+fn each_response_reserves_the_operations_it_shares() {
+    use zemdb_core::id::{ClientId, RoomId};
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 5,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    append_plain(&mut log, 1, 12);
+    assert_eq!(log.hot_buffer.min_seq(), Some(SequenceNumber::new(8)));
+
+    let (budget, mut first) = reservation_in(u64::from(u32::MAX));
+    let holder = (
+        RoomId::new("room").unwrap(),
+        crate::relay::Uploader::Client(ClientId::new("c").unwrap()),
+    );
+    let mut second = budget.reserve(holder, 0).unwrap();
+    let from = SequenceNumber::new(7);
+    let (read, _) = log.fetch_deltas(from, 100, Some(&mut first)).unwrap();
+    let (again, _) = log.fetch_deltas(from, 100, Some(&mut second)).unwrap();
+    assert_contiguous(&read, 8, 12);
+    assert_contiguous(&again, 8, 12);
+    assert!(
+        read.iter()
+            .zip(&again)
+            .all(|(op, same)| Arc::ptr_eq(op, same)),
+        "the responses copy the operations"
+    );
+    assert_eq!(budget.reserved().0, 2 * in_response(8, 12));
+}
+
+/// A read that starts in the disk tiers and goes on in the RAM buffer, as after a seal that
+/// failed once `active.wal` was renamed (the disk tiers then end before the head), shares the
+/// operations it takes from the buffer too (DS6).
+#[test]
+fn a_read_that_goes_on_from_disk_into_ram_shares_the_operations_of_the_buffer() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 3,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    append_plain(&mut log, 1, 5);
+    crate::fail_point::arm("sync_dir", &segments_dir(dir.path()));
+    let outcome = log.append(make_op(6), None).unwrap();
+    assert!(outcome.rotation_error.is_some(), "the seal of 4..=6 fails");
+    assert_eq!(log.hot_buffer.min_seq(), Some(SequenceNumber::new(4)));
+
+    // Segment 1..=3 gives 2 and 3; the buffer, 4 to 6.
+    let (ops, has_more) = log.fetch_deltas(SequenceNumber::new(1), 100, None).unwrap();
+    assert_contiguous(&ops, 2, 6);
+    assert!(!has_more);
+    let held = log
+        .hot_buffer
+        .get_range(SequenceNumber::new(3), &mut ReadBudget::ops(10));
+    assert_contiguous(&held, 4, 6);
+    for (op, same) in ops[2..].iter().zip(&held) {
+        assert!(Arc::ptr_eq(op, same), "operation {} is a copy", op.seq);
+    }
+}
+
 /// What `make_op(first..=last)` take in a response.
 fn in_response(first: u64, last: u64) -> u64 {
     (first..=last)
@@ -2916,10 +2981,8 @@ fn a_read_ends_where_the_reservation_of_its_response_runs_out() {
 }
 
 /// The records `first..=last`, each with the mutation id `mutation_for(seq)`.
-fn group_of(first: u64, last: u64) -> Vec<(SequencedOperation, Option<MutationId>)> {
-    (first..=last)
-        .map(|seq| (make_op(seq), Some(mutation_for(seq))))
-        .collect()
+fn group_of(first: u64, last: u64) -> Vec<(Arc<SequencedOperation>, Option<MutationId>)> {
+    group_of_ops(first, last, make_op)
 }
 
 /// A group of records is written to `active.wal` and synced once, and only then is it visible:
@@ -3021,10 +3084,8 @@ fn titled_op(seq: u64) -> SequencedOperation {
 }
 
 /// The records `first..=last` of `titled_op`, each with the mutation id `mutation_for(seq)`.
-fn titled_group(first: u64, last: u64) -> Vec<(SequencedOperation, Option<MutationId>)> {
-    (first..=last)
-        .map(|seq| (titled_op(seq), Some(mutation_for(seq))))
-        .collect()
+fn titled_group(first: u64, last: u64) -> Vec<(Arc<SequencedOperation>, Option<MutationId>)> {
+    group_of_ops(first, last, titled_op)
 }
 
 /// The records `first..=last` of `op`, each with the mutation id `mutation_for(seq)`.
@@ -3032,9 +3093,9 @@ fn group_of_ops(
     first: u64,
     last: u64,
     op: fn(u64) -> SequencedOperation,
-) -> Vec<(SequencedOperation, Option<MutationId>)> {
+) -> Vec<(Arc<SequencedOperation>, Option<MutationId>)> {
     (first..=last)
-        .map(|seq| (op(seq), Some(mutation_for(seq))))
+        .map(|seq| (Arc::new(op(seq)), Some(mutation_for(seq))))
         .collect()
 }
 
@@ -3341,7 +3402,7 @@ fn a_frame_stored_in_a_value_does_not_hide_a_later_acknowledged_record() {
     log.append_group(titled_group(1, 3)).unwrap();
     let at = log.warm_disk.active_len() as usize;
     log.append_group(vec![(
-        op(value_holding_a_frame(len, delta as u64)),
+        Arc::new(op(value_holding_a_frame(len, delta as u64))),
         Some(mutation_for(4)),
     )])
     .unwrap();
@@ -3418,7 +3479,7 @@ fn damage_in_the_last_group_after_its_fsync_is_truncated_from_the_damage() {
         TieredLog::open_or_create(copy.path(), RoomLifecyclePolicy::default()).unwrap();
     assert_eq!(log.head_seq().get(), 6);
     let (ops, _) = log.fetch_deltas(SequenceNumber::new(4), 100, None).unwrap();
-    assert_eq!(ops, vec![make_op(5), make_op(6)], "5 is reused");
+    assert_eq!(owned(ops), vec![make_op(5), make_op(6)], "5 is reused");
     assert_eq!(mutations.len(), 6);
 
     // With the end of the group in `log_meta.json`, its sequences are a gap instead.

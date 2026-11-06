@@ -2,7 +2,7 @@
 
 **Fecha:** 1 de Noviembre de 2026
 **Tipo:** Optimización del servidor y del protocolo. Documento vivo: plan, lotes y seguimiento. La fase es chica y no tiene sub-fases: este plan baja directamente a lotes (`docs/METODOLOGIA.md` §1).
-**Estado:** En curso. Las decisiones DS1 a DS8 las adoptó el dueño del proyecto en el Lote 0 (1 de Noviembre de 2026); DS7, condicionada a la medición del Lote 7. DS9 salió del Lote 4 y la adoptó el dueño el 3 de Noviembre de 2026, con el mecanismo que eligió al arrancar el Lote 4b (la distancia en bytes al inicio del grupo). El contrato está en la versión 15 de `INVARIANTES.md`.
+**Estado:** En curso. Las decisiones DS1 a DS8 las adoptó el dueño del proyecto en el Lote 0 (1 de Noviembre de 2026); DS7, condicionada a la medición del Lote 7. DS9 salió del Lote 4 y la adoptó el dueño el 3 de Noviembre de 2026, con el mecanismo que eligió al arrancar el Lote 4b (la distancia en bytes al inicio del grupo). DS10 salió de la medición del Lote 6, y el dueño del proyecto la dejó para un Lote 6b el 6 de Noviembre de 2026: es una *Propuesta* que se confirma al arrancarlo. El contrato está en la versión 17 de `INVARIANTES.md`.
 **Origen:** las Evaluaciones 1 y 2 del [plan de evaluaciones de performance](2026-10-evaluaciones-performance.md) (§3.7, §3.8, §4.7 y §4.8).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md), con lo propio de este plan en §5: la medición antes y después de cada lote y los checklists de cada tipo de lote.
@@ -18,7 +18,7 @@
   - `block_in_place`, que agota el pool de hilos de Tokio con cientos de salas (DS2);
   - un `fsync` por commit, que limita una sala a unos 5.400 commits por segundo en disco (DS3);
   - el SSE, que pasa a poder apagarse (DS4) y a traer las operaciones en lugar de una señal (DS5);
-  - la copia de las operaciones en cada catch-up (DS6);
+  - la copia de las operaciones en cada catch-up (DS6), y lo que cuesta, una vez por cada operación de cada catch-up, reservar su lugar en el presupuesto de respuestas y volver a medirla (DS10, que salió del Lote 6);
   - el roster en disco cada segundo por sala activa, si una medición en un disco de nube muestra que pesa (DS7).
 - **Por qué.** Con la configuración de fábrica, un servidor de 2 núcleos sostiene unas 500 salas de 10 usuarios. Los dos primeros problemas le quitan la mitad de la capacidad real, y el SSE de señales gasta 2,5 veces más CPU por commit que uno que trae las operaciones (§1).
 - **Qué no.** Varias operaciones por commit (el outbox), una conexión WebSocket, un WAL compartido entre salas, la replicación y la durabilidad relajada (`ROADMAP.md` §3), otro asignador de memoria, la cantidad de archivos de segmento y la pausa de 5 s que no se repitió (§2.2).
@@ -56,7 +56,7 @@ Lo que midieron las evaluaciones, en una VM de 4 vCPU con el servidor en 2 núcl
 - **La E/S de los actores fuera de los workers de Tokio** (DS2, Lote 3).
 - **El *group commit*** (DS3, Lote 4).
 - **El SSE:** apagarlo (DS4) y el evento `ops` (DS5), los dos del lado del servidor y del protocolo (Lote 5). El cliente que los consume es de la Fase 4 (DC24 a DC26).
-- **El catch-up sin copias** (DS6, Lote 6).
+- **El catch-up sin copias** (DS6, Lote 6), y **la reserva por tramos** (DS10, Lote 6b).
 - **El roster**, si la medición en un disco de nube lo justifica (DS7, Lote 7).
 
 ### 2.2. No entra
@@ -83,6 +83,7 @@ Prefijo **DS**. Se escribieron como *Propuestas*, y el dueño del proyecto las a
 | **DS7** | El roster, menos seguido, si la medición lo justifica | 7 | Adoptada (1 de Noviembre de 2026), condicionada a la medición del Lote 7 |
 | **DS8** | El arnés en `main` y la medición de cada lote | 1 | Adoptada (1 de Noviembre de 2026) |
 | **DS9** | El último grupo de commits dañado es una escritura rota, como el último registro | 4b | Adoptada (3 de Noviembre de 2026; el mecanismo, al arrancar el Lote 4b) |
+| **DS10** | La reserva de una lectura, por tramos, y sin una segunda medición | 6b | Propuesta (6 de Noviembre de 2026), a confirmar al arrancar el Lote 6b |
 
 ### DS1 · El presupuesto de respuestas reserva lo que se lee
 - **Hoy.** El actor reserva un frame entero (16 MiB, `reserve_frame`) antes de leer el log para un `/sync` o el catch-up de un commit, y el handler HTTP achica la reserva al tamaño real recién al codificar la respuesta (`budgeted_response`). Con el presupuesto de fábrica (256 MiB) caben 16 respuestas en ese intervalo en todo el servidor; las demás reciben `503`, y un commit se confirma sin su catch-up.
@@ -145,6 +146,19 @@ Salió del Lote 4, y la adoptó el dueño del proyecto el 3 de Noviembre de 2026
 - **Alternativas descartadas.** Aceptar el riesgo para siempre: el grupo sirve justamente a las salas con commits a la vez, que son las expuestas. Tratar como escritura rota cualquier daño seguido de frames válidos: truncaría commits confirmados ante una corrupción real (INV-D1). Un grupo en un solo frame: el payload lleva un solo `mutation_id`, así que también cambia el formato, y más.
 - **Invariantes:** INV-D2 (la excepción de D78), INV-D3, INV-D1, INV-D8, INV-D10.
 
+### DS10 · La reserva de una lectura, por tramos, y sin una segunda medición
+Salió de la medición del Lote 6 (su nota **Hecho**). El dueño del proyecto eligió, el 6 de Noviembre de 2026, cerrar el Lote 6 con su criterio sin cumplir y dejar esto para un Lote 6b; la decisión se confirma al arrancarlo.
+- **Desde el Lote 6.** Con 64 pedidos en vuelo, cada commit de un grupo trae un catch-up de hasta unas 64 operaciones (el protocolo de 1 RTT), así que lo que se hace por operación de cada catch-up crece con el cuadrado del grupo. Sin la copia (DS6), quedan dos costos así:
+  - **la reserva de la respuesta** (DS1) crece una vez por operación (`ReadBudget::admit`, que llama a `InflightBudget::take`: un mutex, la parte del cliente en un `HashMap` y el semáforo del total), el 21% del CPU de E1-actor con 64;
+  - **`fit_in_response` vuelve a medir** cada operación con `encoded_len` (~9%), aunque la lectura ya las acotó: el presupuesto de lectura cobra `max(wire, 24 × valores)`, que nunca es menos que el tamaño codificado.
+- **Propuesta.**
+  - **La reserva por tramos:** una lectura hace crecer la reserva de su respuesta de a tramos (256 KiB en el prototipo, o lo que le falte a la operación si es más), descuenta de lo reservado lo que toma cada operación que admite y, al terminar, devuelve lo que no usó. Si un tramo no entra, la reserva crece exactamente lo que le falta a la operación, como hoy: la lectura se sigue cortando en la primera operación que no tiene lugar, y cada respuesta sigue contando todas sus operaciones.
+  - **Lo que cambia:** mientras dura una lectura (microsegundos en la RAM, milisegundos en disco), su respuesta retiene hasta un tramo más de lo que usa, en la parte de su cliente y en el total: unos 5 MiB en el peor caso de fábrica (las lecturas que pueden ir a la vez son unas 18, los workers y el pool de E/S), sobre 256 MiB. Con el presupuesto casi lleno, otra respuesta puede salir un poco más corta, o con `Unavailable`, un poco antes.
+  - **Sin la segunda medición:** `fit_in_response` deja de medir las operaciones de una lectura del log, que ya cumplen el tope de una respuesta, con un test que lo fija.
+- **Lo medido con un prototipo** (fuera del repo; la nota **Hecho** del Lote 6): E1-actor con 64 en vuelo pasa de unos 32.000 commits por segundo a unos 60.000 con la reserva por tramos sola, 39.000 sin la segunda medición sola y 98.000 con las dos; con 8, de unos 60.900 a 62.900 con las dos.
+- **Alternativas, para el Lote 6b.** Reservar una sola vez al final de la lectura, con lo que suman las operaciones admitidas, y volver a la reserva por operación si no entra: no retiene de más, pero con el presupuesto casi lleno la lectura hace el trabajo dos veces. Un tramo más chico: retiene menos de más, y visita más el presupuesto.
+- **Invariantes:** INV-B1 (cómo se cuenta la reserva), INV-B5 (la parte de cada cliente, que una lectura en curso ocupa hasta un tramo de más).
+
 ---
 
 ## 4. Lotes
@@ -158,16 +172,17 @@ Salió del Lote 4, y la adoptó el dueño del proyecto el 3 de Noviembre de 2026
 | 4 | *Group commit* | server | DS3 | D1, D2, D7, Y1, Y4, Y5, L3, B4 | ✅ |
 | 4b | El último grupo dañado | core, server | DS9 | D1, D2, D3, D8, D10 | ✅ |
 | 5 | El SSE: apagarlo y el evento `ops` | core, server | DS4, DS5 | Y2, D7, E3, B3, B5, A1, W1, W2 | ✅ |
-| 6 | El catch-up sin copias | server | DS6 | B1, W2, Y2 | ⬜ |
+| 6 | El catch-up sin copias | server | DS6 | B1, W2, Y2 | ✅ (sin cumplir su criterio: lo sigue el 6b) |
+| 6b | La reserva por tramos | server | DS10 | B1, B5 | ⬜ |
 | 7 | El roster | server | DS7 | R3, R1, D4 | ⬜ |
 | 8 | Medición final y revisión de cierre | Documentos | Todas | Las que tocó la fase | ⬜ |
 
 **Orden.**
 - El Lote 0 va primero: solo documentos, con su revisión cruzada (`docs/METODOLOGIA.md` §2). Las *Propuestas* se confirmaron en el Lote 0, después del Lote 1, que se adelantó (su nota **Hecho**).
 - El 1 va antes de cualquier optimización: sin el arnés en `main` no hay medición.
-- El 2 no depende de los demás. El 3 va antes del 4, que hace su `fsync` en el pool del 3. El 4b va después del 4 y antes del 5: cierra el riesgo que abrió el 4. El 5 va antes de que arranque la sub-fase 4.3 de la Fase 4, y después del 4, porque con el *group commit* un evento puede llevar las operaciones de un grupo. El 6, después del 2, porque cambia lo que reserva una respuesta. El 7 depende de la medición en un disco de nube y puede quedar para el final. El 8 cierra.
+- El 2 no depende de los demás. El 3 va antes del 4, que hace su `fsync` en el pool del 3. El 4b va después del 4 y antes del 5: cierra el riesgo que abrió el 4. El 5 va antes de que arranque la sub-fase 4.3 de la Fase 4, y después del 4, porque con el *group commit* un evento puede llevar las operaciones de un grupo. El 6, después del 2, porque cambia lo que reserva una respuesta. El 6b, después del 6, de cuya medición salió. El 7 depende de la medición en un disco de nube y puede quedar para el final. El 8 cierra.
 
-**Tamaño estimado de producción:** el Lote 2, de 100 a 150 líneas; el 3, de 200 a 300; el 4, de 150 a 250; el 4b, de 100 a 200; el 5, unas 200 entre core y servidor (con el tope total de los eventos `ops`); el 6, unas 80; el 7, unas 50. El 1 no tiene código de producción.
+**Tamaño estimado de producción:** el Lote 2, de 100 a 150 líneas; el 3, de 200 a 300; el 4, de 150 a 250; el 4b, de 100 a 200; el 5, unas 200 entre core y servidor (con el tope total de los eventos `ops`); el 6, unas 80; el 6b, unas 40; el 7, unas 50. El 1 no tiene código de producción.
 
 ---
 
@@ -815,7 +830,7 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
   - **El evento lleva la encarnación de la sala,** que DS5 no nombraba: lo pidió la revisión.
 - **El tamaño:** unas 206 líneas de producción agregadas, sin comentarios ni blancos (12 quitadas); dentro del tope de ~300 de `docs/METODOLOGIA.md` §4 y cerca de la estimación del plan (unas 200).
 
-### Lote 6 · El catch-up sin copias · ⬜
+### Lote 6 · El catch-up sin copias · ✅ (sin cumplir su criterio: lo sigue el 6b)
 **Objetivo:** que el catch-up y el `/sync` no copien las operaciones del búfer en RAM (DS6).
 
 **Archivos:** `crates/server/src/log/hot_buffer.rs`, `log/tiered_log.rs` (`fetch_deltas`), `actor/room.rs`, `api/data_plane.rs` (el tipo que serializa las respuestas), y sus tests.
@@ -836,6 +851,96 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 **Documentos:** `ARCHITECTURE.md` §5.2 (el búfer en RAM); `INVARIANTES.md`: INV-B1.
 
 **Entrega:** `perf(server): share the operations of the RAM buffer in catch-ups and syncs instead of copying them (Fase 3.12, Lote 6)`.
+
+**Hecho.**
+- **El búfer en RAM comparte sus operaciones** (DS6): `HotBuffer` guarda cada operación en un `Arc<SequencedOperation>` y `get_range` devuelve esos mismos `Arc`, sin copiarlas; `TieredLog::fetch_deltas` y `fetch_from_memory` devuelven `Vec<Arc<SequencedOperation>>` (el tipo `Deltas`), y lo que se lee de los segmentos y de `active.wal` se envuelve en un `Arc` al decodificarse, sin copia. `CommitResponse::catchup_ops` y `SyncBatchResponse::ops` pasan a ser `Vec<Arc<SequencedOperation>>`.
+- **El grupo de commits:** cada operación nueva se crea una vez, en un `Arc` (`Decision::New`), que comparten el registro que va al log, el búfer y la respuesta del commit que la escribió: antes, el registro llevaba una copia. `WarmDiskLog::append_records` y `TieredLog::append_group` toman los `Arc`; el registro en disco es el mismo.
+- **Las respuestas:** `CommitAck` y `SyncBatch` se codifican con `OpsReply` (en `api/data_plane.rs`), un tipo del servidor con los campos de esas dos variantes y las operaciones compartidas, que se serializa como la variante de `ServerMessage` (su índice, 0 y 2, y sus campos en su orden; un `Arc` se serializa como lo que apunta). `binary_response` y `budgeted_response` toman un `ServerMessage` o un `OpsReply` (el rasgo `Frame`). El `OpsReply` se suelta al codificarse, así que la respuesta retiene sus operaciones solo mientras se arma y se codifica, como antes sus copias.
+- **Lo que no cambia:** la reserva de DS1 (cada respuesta suma, por cada operación que lee, lo que ocupa en memoria más lo que ocupará codificada, la comparta o no, hasta el frame que una reserva nunca pasa), la ventana del búfer (por cantidad, bytes y edad, con la misma medida), el evento `ops` (que sigue copiando las operaciones nuevas de un grupo una vez, al codificarlo, y solo con algún stream) y los bytes de cada respuesta.
+- **Tests agregados** (los marcados con ⊗ fallan con el comportamiento anterior, con el esqueleto que ya tenía la API nueva y copiaba; los demás cuidan reglas que ya se cumplían y respaldan las mutaciones):
+  - `log/tests/hot_buffer.rs`: ⊗ `reads_share_the_operations_of_the_buffer` (dos lecturas comparten cada operación entre ellas y con la que se agregó); `the_window_drops_the_operations_a_read_holds_like_any_other` (por cantidad, por bytes y por edad, con una lectura que las retiene; después, la lectura es su único dueño).
+  - `log/tests/tiered_log.rs`: ⊗ `each_response_reserves_the_operations_it_shares` (dos respuestas que leen las mismas operaciones del búfer las comparten, y cada una las reserva enteras: el doble que una; INV-B1); y, de la revisión, `a_read_that_goes_on_from_disk_into_ram_shares_the_operations_of_the_buffer` (una lectura que empieza en un segmento y sigue en el búfer, como después de un sellado que falla una vez renombrado `active.wal`, comparte lo que toma del búfer).
+  - `actor/tests/room.rs`: ⊗ `catch_ups_and_syncs_share_the_operations_of_the_ram_buffer` (la operación de un cliente al día, el catch-up de uno atrasado y un `/sync` comparten cada operación).
+  - `api/tests/data_plane.rs`: `replies_with_operations_from_every_tier_are_the_bytes_of_their_message` (por HTTP, en una sala con segmentos de dos operaciones comprimidos a frío: un `/sync` y un catch-up desde los niveles de disco, frío, tibio y `active.wal`, y otro par desde la RAM, cada uno con los bytes exactos del `ServerMessage` armado con las operaciones que se escribieron; uno con `has_more`; INV-W2); `an_ops_reply_is_the_bytes_of_its_message_with_every_flag` (las dos variantes con cada valor de sus dos flags).
+  - **Adaptados** al tipo nuevo, sin cambiar lo que prueban: los que comparan o mueven las operaciones de una lectura (`seqs` y `assert_contiguous` aceptan las dos formas; `owned` las copia para comparar) y los que arman grupos de registros.
+- **Mutaciones verificadas,** cada una con algún test que falla: una lectura que copia las operaciones del búfer; el registro del grupo con una copia de la operación nueva, en lugar de la que da la respuesta del commit; una lectura que no reserva lo que ya comparte otra respuesta (la reserva contada una sola vez); la ventana que no suelta las operaciones que retiene una lectura, por cantidad y bytes, o por edad; `CommitAck` y `SyncBatch`, cada uno con otro índice de variante y con sus dos flags cambiados de lugar; `CommitAck` sin su `schema_id`; y `SyncBatch` con el head después de las operaciones. De la revisión, dos más: la parte en RAM de una lectura que empezó en disco, copiada (sobrevivía a la suite: ningún test que llegaba a esa rama miraba si compartía; ahora la atrapa `a_read_that_goes_on_from_disk_into_ram_shares_the_operations_of_the_buffer`), y el camino rápido del cliente al día respondiendo con una copia (la atrapa `catch_ups_and_syncs_share_the_operations_of_the_ram_buffer`).
+- **Interacciones revisadas:**
+  - **La contabilidad del búfer en RAM** (D73): cada operación sigue cobrando `max(wire, 24 × valores)`, y la ventana la suelta igual aunque una respuesta la retenga (`the_window_drops_the_operations_a_read_holds_like_any_other`). El `Arc` agrega 16 bytes por operación (sus dos contadores) que no se cobran, como no se cobraba el tamaño del `SequencedOperation` mismo (96 bytes). Una operación que la ventana soltó y una respuesta todavía retiene está en la reserva de esa respuesta, así que la memoria de las operaciones sigue acotada por la ventana más el presupuesto de respuestas; dos respuestas que comparten una operación la cuentan las dos, lo que sobreestima la memoria, como antes con las copias.
+  - **El evento `ops`:** se arma con las operaciones nuevas del grupo, que ahora son los `Arc` de las decisiones (`announcement` los desreferencia); sigue codificándose una vez, y sus tests del Lote 5 pasan sin cambios.
+  - **La poda** (por cursor, por TTL y por cuota): borra archivos y saca del búfer lo que ya no se retiene; una respuesta que tenía una operación la sigue teniendo hasta codificarse, como tenía su copia.
+  - **La escritura y el `fsync` de un grupo que fallan:** los registros se sueltan con el log o con las decisiones, que responden `Unavailable`; nada queda retenido.
+  - **La apertura:** el búfer se rehidrata con las operaciones decodificadas de `active.wal`, cada una en un `Arc`, sin copia.
+  - **El pool de E/S** (DS2): el log viaja con su búfer al pool y vuelve; un `Arc<SequencedOperation>` es `Send` y `Sync`, y sus contadores son atómicos, así que una respuesta puede soltar una operación en el worker de HTTP mientras el log está en el pool.
+  - **El tamaño de una respuesta** (`fit_in_response`, `encoded_len`): mide lo mismo, porque un `Arc` se serializa como lo que apunta.
+  - **El SDK y el arnés:** los bytes no cambian; el modo `inproc` de `tools/perf`, que lee `CommitResponse`, compila sin cambios.
+  - **El tope de un frame de una reserva** (de la revisión): pasado un frame, una reserva crece sin cobrar (`Reservation::grow`), así que "cada respuesta cuenta sus operaciones" vale hasta ese tope, como antes con las copias; `ARCHITECTURE.md` e INV-B1 lo dicen.
+  - **Un sellado que falla, o un segmento perdido al final de los niveles de disco** (de la revisión): una lectura que empieza en disco puede seguir en el búfer; comparte lo que toma de él (el test de arriba).
+  - **El cierre, el respawn y el apagado con respuestas en vuelo** (de la revisión): el búfer se suelta con el actor, y las respuestas que todavía no se codificaron se quedan con sus operaciones, dentro de su reserva.
+  - **Dónde se cuentan y se sueltan las operaciones** (de la revisión): sumar los contadores pasa en el actor; restarlos y liberar lo que ya nadie tiene, en el worker de HTTP que codifica la respuesta (en E1-actor, en el generador). Es parte del costo medido.
+  - **El tipo de lo que codifica `binary_response`** (de la revisión): acepta un `ServerMessage` o un `OpsReply` (el rasgo `Frame`), no cualquier `Serialize`.
+- **Verificación:** `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (1.272 tests) y `cargo doc` sin advertencias; la compilación y el clippy a `wasm32-unknown-unknown` de core, storage y client; las pruebas largas del servidor (`cargo test -p zemdb-server --release -- --ignored`), las 13 de antes, sobre `2c0a908`, y las 13 después, también tras los arreglos de la revisión; y los checklists del protocolo y de la medición:
+  - **Protocolo:** no hay variantes nuevas; el lote promete los mismos bytes, y dos tests los comparan (`an_ops_reply_is_the_bytes_of_its_message_with_every_flag` y, por HTTP y con operaciones de cada nivel, `replies_with_operations_from_every_tier_are_the_bytes_of_their_message`). Las variantes de `ServerMessage` siguen en sus índices (`server_messages_keep_their_wire_indexes`, en core).
+  - **Medición:** abajo.
+  - **La prueba larga de tiempos** `fetch_cost_does_not_grow_with_the_number_of_segments` falló con la VM cargada, sobre la base y sobre el lote; sola pasa siempre, tres veces en cada uno (unos 2 ms con 100 segmentos y con 50.000). Es preexistente: al backlog de `ROADMAP.md` (punto 19).
+- **Medición.**
+  - **El entorno (DP3):** una VM como la de los Lotes 4b y 5 (4 vCPU Intel Xeon a 2,10 GHz, 15 GB, kernel `6.18.44-fc-v233`, rustc 1.97.0), tmpfs en `/dev/shm`, el 4 de Noviembre de 2026; los números se comparan solo dentro de esta medición. E1-actor corre el actor y el generador en el mismo proceso, en los núcleos 0 y 1: el generador lleva el servidor adentro, así que hay un binario del generador por árbol, compilado de la misma fuente de `tools/perf`. Las corridas por HTTP, con el servidor en 0 y 1, el generador en 2 y 3, y el mismo binario del generador para la base y el resultado. Los servidores, en release limpio.
+  - **Lo que se compara:** la base es `2c0a908` (el Lote 5); el resultado, este lote.
+  - **El diseño:** tres rondas intercaladas, base y resultado, del escenario del lote (E1-actor con 8 y 64 pedidos en vuelo) y de los controles (E1-tmpfs con 1 y 8, E2-tmpfs con 500 salas). Como la primera medición dejó la propagación en p99 del control E2 cerca del límite del criterio, se corrieron cuatro rondas más de ese control, empezando por el resultado: 7 de cada lado. La tabla da la mediana y, entre paréntesis, el rango. Los datos crudos, en `tools/perf/results/fase3_12/lote6/`.
+
+  | Escenario | Base `2c0a908` | Resultado |
+  |---|---|---|
+  | E1-actor, 8 pedidos en vuelo: commits/s, p99 | 42.438 (40.972–42.960), 376 µs | 60.106 (59.490–60.662), 279 µs |
+  | E1-actor, 64 pedidos en vuelo: commits/s, p99 | 10.872 (10.241–11.882), 9,0 ms | 31.280 (31.046–31.641), 3,5 ms |
+  | E1-actor, con 64 sobre con 8 | 26% | 52% |
+  | E1-tmpfs, 1 pedido en vuelo (control): commits/s | 6.696 (5.779–6.945) | 6.797 (6.467–7.149) |
+  | E1-tmpfs, 8 pedidos en vuelo (control): commits/s | 24.059 (23.728–24.415) | 24.206 (22.987–24.255) |
+  | E2-tmpfs, 500 salas (control, 7 rondas): propagación p99, CPU del servidor | 2,5 ms (2,1–3,1), 25% | 2,8 ms (2,1–3,4), 25% |
+
+  - **El criterio no se cumple:** con 64 pedidos en vuelo, el resultado hace el 52% de los commits por segundo de 8, contra el 80% que pedía el plan (la base, el 26%). Con 64, casi el triple que la base; con 8, un 42% más. El dueño del proyecto aceptó el desvío el 6 de Noviembre de 2026 y dejó lo que falta para el Lote 6b (DS10).
+  - **Por qué, según el perfil** (`perf`, 8 s de E1-actor, base y resultado con 64, y resultado con 8):
+    - En la base con 64, `HotBuffer::get_range` es el 55% del CPU, casi todo copiar las operaciones (`Vec<Value>::clone`, `malloc`, `free`). En el resultado ya no hay copia.
+    - En el resultado con 64, `get_range` sigue siendo el 34%: el 21% es `ReadBudget::admit`, que hace crecer la reserva de la respuesta una vez por operación (un mutex, la parte del cliente en un `HashMap` y el semáforo del total), y el resto, sumar los contadores de los `Arc`; soltar la respuesta (restarlos) es otro 7,5%. Y `fit_in_response` vuelve a medir cada operación con `encoded_len` (~9%).
+    - Con 64 en vuelo, cada commit de un grupo trae un catch-up de hasta unas 64 operaciones, así que todo lo que se hace por operación de cada catch-up crece con el cuadrado del grupo. El plan suponía que la copia era lo único así (§3.7.3 de las evaluaciones): lo era antes del *group commit* y del presupuesto por operación.
+  - **Un prototipo de diagnóstico,** fuera del repo, con las dos cosas de DS10 (la reserva de a tramos de 256 KiB, que devuelve lo que no usó al terminar, y `fit_in_response` sin la segunda medición), en rondas intercaladas con el resultado: con 64, unos 98.000 commits por segundo (95.630–100.754), el 156% de los de 8 (unos 62.900); con la reserva por tramos sola, unos 59.700 con 64 (57.545–61.883); sin la segunda medición sola, unos 39.000. El resultado, en las mismas rondas, unos 32.000 con 64 y 60.900 con 8. Es lo que mide el Lote 6b, sobre su implementación.
+  - **Los controles:** E1-tmpfs con 1 y 8 pedidos en vuelo, un 1,5% y un 0,6% arriba, dentro de la dispersión. E2-tmpfs con 500 salas: con 3 rondas, la propagación en p99 del resultado quedaba un 29% arriba (2,4 contra 3,1 ms), justo dentro de la dispersión de la base (2,1 a 2,9 ms) más un 10%; con 7 rondas de cada lado, un 9% arriba, con los rangos superpuestos y el mismo CPU y la misma mediana: el p99 de esa carga es ruido de planificación, y el lote no cambia sus catch-ups, de una o dos operaciones.
+  - **Las corridas son válidas:** sin errores, el head igual a lo confirmado, sin huecos ni errores del SSE, sin clientes atrasados al final; en E1-actor, el proceso (actor y generador) usa el 135% de sus dos núcleos; en las corridas por HTTP, el generador, por debajo del 75% de un núcleo.
+- **La revisión de delta,** por un agente aparte, de contexto fresco y solo lectura, con las seis preguntas (el lote es chico y no toca la durabilidad, así que fue uno). Sin hallazgos Altos ni Medios:
+  - **Un Bajo, arreglado:** si la parte en RAM de una lectura que empezó en disco copiaba las operaciones, ningún test lo notaba: los que llegan a esa rama (un sellado que falla, un segmento perdido) no miraban si compartían. Lo fija `a_read_that_goes_on_from_disk_into_ram_shares_the_operations_of_the_buffer`.
+  - **Las notas, aplicadas:** el texto de INV-B1 y de `ARCHITECTURE.md` decía que cada respuesta cuenta sus operaciones "enteras", sin el tope de un frame de una reserva; INV-Y2, que DS6 nombra, no decía cómo se sostiene con operaciones compartidas (no cambian después de entrar al búfer), ni INV-B1 tenía un caso de operaciones compartidas para intentar romperla; `binary_response` aceptaba cualquier `Serialize` (ahora, el rasgo `Frame`); y un test adaptado (`damage_in_the_last_group_after_its_fsync_is_truncated_from_the_damage`) comparaba menos que antes. Las cuatro interacciones que faltaban están arriba.
+  - **Para el Lote 6b,** en su sección del plan: el error del prototipo en la reserva por tramos (acreditaba el tramo entero aunque, pasado el tope de un frame, la reserva creciera menos), el largo de los catch-ups con 8 y 64, la proporción de la línea de base de la fase (con 64, el 64% de 8 sobre `0b03a77`, en otra VM; el 26% sobre `2c0a908`) y el diseño de su medición.
+  - **Sobre la medición** (pregunta 6): es válida según DP3 y §5.2; las medianas de la tabla coinciden con los datos crudos; los controles pasan también con solo las tres primeras rondas de E2, así que agregar cuatro después de verlas no cambia el veredicto; y el perfil explica el desvío, con dos costos que el análisis no repartía: los contadores de los `Arc` (~15%) y los cambios de contexto (~18%), que siguen con el prototipo.
+- **El tamaño:** unas 134 líneas de producción agregadas, sin comentarios ni blancos (38 quitadas), dentro del tope de ~300 de `docs/METODOLOGIA.md` §4; la estimación del plan era de unas 80: unas 95 son `OpsReply` y su serialización, que repite los campos de las dos variantes. Toca además `actor/command.rs` y `log/warm_disk.rs`, que el plan no nombraba.
+- **El desvío,** con el visto bueno del dueño del proyecto (6 de Noviembre de 2026): el lote cierra con su criterio sin cumplir (con 64 pedidos en vuelo, el 52% de los commits por segundo de 8, contra el 80%). Lo que falta va al Lote 6b, con DS10 (§3), que se confirma al arrancarlo.
+
+### Lote 6b · La reserva por tramos · ⬜
+**Objetivo:** que un catch-up no visite el presupuesto de respuestas ni vuelva a medir sus operaciones una vez por operación (DS10), con el criterio que el Lote 6 no cumplió.
+
+**Archivos:** `crates/server/src/log/budget.rs` (`ReadBudget`), `response_budget.rs` (`Reservation`), `actor/room.rs` (`fit_in_response`), y sus tests.
+
+**Qué se hace:** lo de DS10, con el mecanismo que se confirme al arrancar el lote (el tramo, y si se reserva por tramos o una vez al final).
+
+**Lo que dejó el Lote 6** (su nota **Hecho**, y su revisión de delta):
+- **El prototipo tiene un error en la reserva por tramos:** `Reservation::grow` devuelve que creció aunque, pasado el tope de un frame, crezca menos que lo pedido, y el prototipo acredita el tramo entero; al terminar, devuelve de más, y una respuesta cerca de un frame queda reservando hasta un tramo menos de lo que debe (INV-B1). Hay que acreditar solo lo que creció.
+- **El largo de los catch-ups:** medirlo con 8 y 64 pedidos en vuelo (como el generador instrumentado del Lote 2). Con el *group commit* y el cursor que manda el generador (la secuencia más alta que vio confirmada), un catch-up puede llegar a `COMMIT_CATCHUP_BATCH` (100 operaciones), no a unas 64.
+- **La proporción de la línea de base de la fase:** sobre `0b03a77`, en otra VM, E1-actor hacía con 64 el 64% de los commits por segundo de 8 (27.087 contra 42.545); sobre `2c0a908`, el 26%. Con 8 no cambió; con 64 se perdió entre los Lotes 2 y 5, y ningún control lo vio (ninguno corre con 64). Una hipótesis, sin medir: antes del Lote 2, con la reserva de un frame por respuesta y un solo cliente para los 64 trabajadores del generador, muchos commits salían sin catch-up.
+- **El diseño de la medición:** al menos tres rondas intercaladas de cada variante (una mitad del prototipo, con 8, varió un 13% en dos), y la base medida en la misma sesión: la misma `2c0a908` dio en E2-tmpfs con 500 salas 2,5 ms de propagación en p99 en el Lote 6 y 1,2 en el Lote 5.
+- **Lo que queda por operación con los tramos:** los contadores de los `Arc` (un ~15% del CPU con 64, al sumarlos en el actor y restarlos al soltar la respuesta) y los cambios de contexto (~18%) siguen ahí.
+
+**Tests exigidos.**
+- Una lectura cuyas operaciones entran en un tramo visita el presupuesto una vez, y al terminar la reserva de su respuesta es la misma que con la reserva por operación (INV-B1).
+- Con el presupuesto o la parte del cliente casi llenos, la lectura se corta en la misma operación que hoy, con `has_more`, y `Unavailable` sigue siendo para cuando no entra ni la primera: los tests del Lote 2, sin cambios en sus expectativas.
+- Lo reservado de más vuelve cuando termina la lectura, también si termina con un error (una lectura de disco que falla) (INV-B5).
+- Lo que ocupan codificadas las operaciones de una lectura del log no pasa de `MAX_RESPONSE_OPS_BYTES`, salvo la primera, que entra sola: la segunda medición no hacía falta.
+
+**Interacciones a revisar:** las lecturas que van al pool de E/S con la reserva, que retienen el tramo mientras leen del disco; el tope de un frame por reserva (`Reservation::grow`), que un tramo puede alcanzar antes; el catch-up de un cliente al día, que no lee el log; las reservas del registro, del esquema y de los chunks, que no leen el log.
+
+**Medición:** E1-actor con 8 y 64 pedidos en vuelo, contra el Lote 6, y los controles. **Criterio:** con 64, al menos el 80% de los commits por segundo de 8 (el Lote 6 hizo el 52%; el prototipo, el 156%).
+
+**Metodología:** §5.1, con el checklist de medición.
+
+**Documentos:** `ARCHITECTURE.md` §5.2 (*Bounded responses*) y §7.3; `INVARIANTES.md`: INV-B1, INV-B5.
+
+**Entrega:** `perf(server): grow the reservation of a read by chunks, and measure its operations once (Fase 3.12, Lote 6b)`.
 
 **Hecho.** *Pendiente.*
 
@@ -909,8 +1014,9 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 | 4 | *Group commit* | ✅ |
 | 4b | El último grupo dañado | ✅ |
 | 5 | El SSE: apagarlo y el evento `ops` | ✅ |
-| 6 | El catch-up sin copias | ⬜ |
+| 6 | El catch-up sin copias | ✅ (sin cumplir su criterio: lo sigue el 6b) |
+| 6b | La reserva por tramos | ⬜ |
 | 7 | El roster | ⬜ |
 | 8 | Medición final y revisión de cierre | ⬜ |
 
-**Avance:** plan escrito el 1 de Noviembre de 2026, a partir de las Evaluaciones 1 y 2. Lote 1 cerrado el mismo día, adelantado al Lote 0 (el arnés en `main`; la línea de base se mide con el Lote 2). Lote 0 cerrado el mismo día: DS1 a DS8 adoptadas y `INVARIANTES.md` en su versión 12. Lote 2 cerrado el 2 de Noviembre de 2026: el presupuesto de respuestas reserva por lo que se lee, sin `503` del presupuesto con 1.000 salas; con él se midió la línea de base de la fase. Lote 3 cerrado el mismo día: la E/S de archivos de las salas corre en pools acotados, fuera de los workers de Tokio, con los hilos del proceso fijos; los criterios de 1.000 salas no se cumplen en la máquina de medición, saturada de CPU por el SSE de señales. Lote 4 cerrado el mismo día: los commits que esperan en una sala comparten un `fsync`, y una sala en disco pasa de unos 2.200 commits por segundo a 5.600 con 8 pedidos en vuelo y a 8.200 con 64; abre un riesgo, aceptado hasta el Lote 4b (DS9, agregado al plan el 3 de Noviembre de 2026): una sala cuyo grupo corta un corte de luz puede no abrir. Lote 4b cerrado el mismo día: cada registro dice a cuántos bytes de él empieza su grupo, y la apertura trunca un último grupo roto como un último registro roto, sin cambiar el rendimiento; la revisión de delta dejó un riesgo menor en `INVARIANTES.md` §4 (un miembro que predice sus propios registros siguientes). Lote 5 cerrado el mismo día: el SSE se puede apagar (`EventsDisabled`) y trae las operaciones de cada grupo de commits en el evento `ops`, con la encarnación de la sala y dos topes, el del evento y el total de los retenidos; con 1.000 salas, el CPU del servidor por commit baja de 1,16 a 0,47 ms y la propagación en p99, de 5,9 a 1,5 ms. De la revisión de delta: el stream termina cuando vence su token. El próximo paso es el Lote 6.
+**Avance:** plan escrito el 1 de Noviembre de 2026, a partir de las Evaluaciones 1 y 2. Lote 1 cerrado el mismo día, adelantado al Lote 0 (el arnés en `main`; la línea de base se mide con el Lote 2). Lote 0 cerrado el mismo día: DS1 a DS8 adoptadas y `INVARIANTES.md` en su versión 12. Lote 2 cerrado el 2 de Noviembre de 2026: el presupuesto de respuestas reserva por lo que se lee, sin `503` del presupuesto con 1.000 salas; con él se midió la línea de base de la fase. Lote 3 cerrado el mismo día: la E/S de archivos de las salas corre en pools acotados, fuera de los workers de Tokio, con los hilos del proceso fijos; los criterios de 1.000 salas no se cumplen en la máquina de medición, saturada de CPU por el SSE de señales. Lote 4 cerrado el mismo día: los commits que esperan en una sala comparten un `fsync`, y una sala en disco pasa de unos 2.200 commits por segundo a 5.600 con 8 pedidos en vuelo y a 8.200 con 64; abre un riesgo, aceptado hasta el Lote 4b (DS9, agregado al plan el 3 de Noviembre de 2026): una sala cuyo grupo corta un corte de luz puede no abrir. Lote 4b cerrado el mismo día: cada registro dice a cuántos bytes de él empieza su grupo, y la apertura trunca un último grupo roto como un último registro roto, sin cambiar el rendimiento; la revisión de delta dejó un riesgo menor en `INVARIANTES.md` §4 (un miembro que predice sus propios registros siguientes). Lote 5 cerrado el mismo día: el SSE se puede apagar (`EventsDisabled`) y trae las operaciones de cada grupo de commits en el evento `ops`, con la encarnación de la sala y dos topes, el del evento y el total de los retenidos; con 1.000 salas, el CPU del servidor por commit baja de 1,16 a 0,47 ms y la propagación en p99, de 5,9 a 1,5 ms. De la revisión de delta: el stream termina cuando vence su token. Lote 6 cerrado el 6 de Noviembre de 2026 (medido el 4): el catch-up y el `/sync` comparten las operaciones del búfer en RAM en lugar de copiarlas, y E1-actor con 64 pedidos en vuelo pasa de 10.900 a 31.300 commits por segundo (con 8, de 42.400 a 60.100); su criterio (con 64, el 80% de 8) no se cumple, con el 52%, por dos costos por operación que no son copia, y el dueño del proyecto aceptó el desvío y agregó el Lote 6b (DS10, la reserva por tramos). El próximo paso es el Lote 6b.

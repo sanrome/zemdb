@@ -12,6 +12,7 @@ use fs2::FileExt;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use zemdb_core::id::{MutationId, SequenceNumber};
 use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::protocol::wal_frame::encode_wal_batch_in_group;
@@ -78,7 +79,7 @@ impl WarmDiskLog {
         op: &SequencedOperation,
         mutation_id: Option<MutationId>,
     ) -> Result<(), ServerError> {
-        self.append_records(&[(op.clone(), mutation_id)])
+        self.append_records(&[(Arc::new(op.clone()), mutation_id)])
     }
 
     /// Appends `records`, each operation with its mutation ID, to `active.wal`, and syncs them
@@ -89,7 +90,7 @@ impl WarmDiskLog {
     /// records may or may not have reached the file.
     pub fn append_records(
         &mut self,
-        records: &[(SequencedOperation, Option<MutationId>)],
+        records: &[(Arc<SequencedOperation>, Option<MutationId>)],
     ) -> Result<(), ServerError> {
         let (Some((first, _)), Some((last, _))) = (records.first(), records.last()) else {
             return Ok(());
@@ -130,7 +131,7 @@ impl WarmDiskLog {
         for (op, mutation_id) in records {
             let group_offset = encoded.len() as u64;
             let record =
-                encode_wal_batch_in_group(std::slice::from_ref(op), *mutation_id, group_offset)
+                encode_wal_batch_in_group(std::slice::from_ref(&**op), *mutation_id, group_offset)
                     .map_err(|e| ServerError::Wal(e.to_string()))?;
             encoded.extend_from_slice(&record);
         }

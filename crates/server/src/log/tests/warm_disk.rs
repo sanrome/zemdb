@@ -210,14 +210,14 @@ fn test_multi_thread_warm_disk_log_flock_concurrency_stress() {
 fn records_that_do_not_continue_each_other_are_all_rejected_before_writing() {
     let dir = tempdir().unwrap();
     let mut log = WarmDiskLog::open_or_create(dir.path()).unwrap();
-    log.append_records(&[(make_op(1), None), (make_op(2), None)])
+    log.append_records(&[(Arc::new(make_op(1)), None), (Arc::new(make_op(2)), None)])
         .unwrap();
     let len = log.active_len();
 
     assert!(log
-        .append_records(&[(make_op(3), None), (make_op(5), None)])
+        .append_records(&[(Arc::new(make_op(3)), None), (Arc::new(make_op(5)), None)])
         .is_err());
-    assert!(log.append_records(&[(make_op(4), None)]).is_err());
+    assert!(log.append_records(&[(Arc::new(make_op(4)), None)]).is_err());
     assert_eq!(
         (log.active_end_seq(), log.active_len()),
         (Some(seq(2)), len)
@@ -231,9 +231,13 @@ fn records_that_do_not_continue_each_other_are_all_rejected_before_writing() {
 fn every_record_of_a_group_says_where_its_group_starts() {
     let dir = tempdir().unwrap();
     let mut log = WarmDiskLog::open_or_create(dir.path()).unwrap();
-    log.append_records(&[(make_op(1), None)]).unwrap();
-    log.append_records(&[(make_op(2), None), (make_op(3), None), (make_op(4), None)])
-        .unwrap();
+    log.append_records(&[(Arc::new(make_op(1)), None)]).unwrap();
+    log.append_records(&[
+        (Arc::new(make_op(2)), None),
+        (Arc::new(make_op(3)), None),
+        (Arc::new(make_op(4)), None),
+    ])
+    .unwrap();
     drop(log);
     // A torn write of a group, truncated by the open; the next group starts where it was.
     let active = dir.path().join("active.wal");
@@ -241,7 +245,7 @@ fn every_record_of_a_group_says_where_its_group_starts() {
     file.write_all(&[0xBA, 0x7C, 0x01]).unwrap();
     drop(file);
     let mut log = WarmDiskLog::open_or_create(dir.path()).unwrap();
-    log.append_records(&[(make_op(5), None), (make_op(6), None)])
+    log.append_records(&[(Arc::new(make_op(5)), None), (Arc::new(make_op(6)), None)])
         .unwrap();
     drop(log);
 
@@ -270,9 +274,13 @@ fn every_record_of_a_group_says_where_its_group_starts() {
 fn damage_followed_by_records_of_its_group_is_torn_only_in_active_wal() {
     let dir = tempdir().unwrap();
     let mut log = WarmDiskLog::open_or_create(dir.path()).unwrap();
-    log.append_records(&[(make_op(1), None)]).unwrap();
-    log.append_records(&[(make_op(2), None), (make_op(3), None), (make_op(4), None)])
-        .unwrap();
+    log.append_records(&[(Arc::new(make_op(1)), None)]).unwrap();
+    log.append_records(&[
+        (Arc::new(make_op(2)), None),
+        (Arc::new(make_op(3)), None),
+        (Arc::new(make_op(4)), None),
+    ])
+    .unwrap();
     drop(log);
     let active = dir.path().join(ACTIVE_SEGMENT);
     let mut wal = std::fs::read(&active).unwrap();

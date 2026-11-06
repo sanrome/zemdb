@@ -2,11 +2,13 @@ use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use http_body::Body as _;
+use serde::ser::{Serialize, SerializeStructVariant, Serializer};
+use std::sync::Arc;
 use tokio::sync::oneshot;
 use tracing::error;
-use zemdb_core::id::{ClientId, CorrelationId, RoomId};
+use zemdb_core::id::{ClientId, CorrelationId, MutationId, RoomId, SchemaId, SequenceNumber};
 use zemdb_core::protocol::codec::{encode_message, encoded_len, MAX_FRAME_SIZE};
-use zemdb_core::protocol::messages::{ClientMessage, ErrorCode, ServerMessage};
+use zemdb_core::protocol::messages::{ClientMessage, ErrorCode, SequencedOperation, ServerMessage};
 use zemdb_core::schema::Schema;
 
 use crate::actor::command::RoomCommand;
@@ -22,7 +24,7 @@ use crate::response_budget::{no_room, BudgetHolder, Reservation, RESPONSE_OVERHE
 /// Encodes `msg` as a binary frame response. A message that cannot be encoded (a bug: every
 /// response is sized to fit a frame) is logged and answered with a small `Internal` error
 /// frame, so the reply is still a frame.
-pub(crate) fn binary_response(status: StatusCode, msg: &ServerMessage) -> Response {
+pub(crate) fn binary_response(status: StatusCode, msg: &impl Frame) -> Response {
     let (status, bytes) = match encode_message(msg) {
         Ok(bytes) => (status, bytes),
         Err(err) => {
@@ -45,6 +47,109 @@ pub(crate) fn binary_response(status: StatusCode, msg: &ServerMessage) -> Respon
         bytes,
     )
         .into_response()
+}
+
+/// What a response frame carries: a [`ServerMessage`], or an [`OpsReply`], which encodes as one.
+pub(crate) trait Frame: Serialize {}
+
+impl Frame for ServerMessage {}
+
+impl Frame for OpsReply {}
+
+/// A `CommitAck` or a `SyncBatch` whose operations are shared with the room's RAM buffer: it
+/// encodes to exactly the bytes of the [`ServerMessage`] variant of the same name with copies of
+/// them (DS6), so that a reply is encoded without copying its operations first.
+#[derive(Debug)]
+pub(crate) enum OpsReply {
+    CommitAck {
+        correlation_id: CorrelationId,
+        room_id: RoomId,
+        mutation_id: MutationId,
+        assigned_seq: SequenceNumber,
+        catchup_ops: Vec<Arc<SequencedOperation>>,
+        has_more: bool,
+        snapshot_wanted: bool,
+        schema_version: u64,
+        schema_id: SchemaId,
+    },
+    SyncBatch {
+        correlation_id: CorrelationId,
+        room_id: RoomId,
+        head_seq: SequenceNumber,
+        ops: Vec<Arc<SequencedOperation>>,
+        has_more: bool,
+        snapshot_wanted: bool,
+        schema_version: u64,
+        schema_id: SchemaId,
+    },
+}
+
+/// The indexes of `CommitAck` and `SyncBatch` among the variants of [`ServerMessage`], which
+/// encode them.
+const COMMIT_ACK_INDEX: u32 = 0;
+const SYNC_BATCH_INDEX: u32 = 2;
+
+impl Serialize for OpsReply {
+    /// The variant of [`ServerMessage`], with its fields in its order. An `Arc` serializes as
+    /// what it points to.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::CommitAck {
+                correlation_id,
+                room_id,
+                mutation_id,
+                assigned_seq,
+                catchup_ops,
+                has_more,
+                snapshot_wanted,
+                schema_version,
+                schema_id,
+            } => {
+                let mut msg = serializer.serialize_struct_variant(
+                    "ServerMessage",
+                    COMMIT_ACK_INDEX,
+                    "CommitAck",
+                    9,
+                )?;
+                msg.serialize_field("correlation_id", correlation_id)?;
+                msg.serialize_field("room_id", room_id)?;
+                msg.serialize_field("mutation_id", mutation_id)?;
+                msg.serialize_field("assigned_seq", assigned_seq)?;
+                msg.serialize_field("catchup_ops", catchup_ops)?;
+                msg.serialize_field("has_more", has_more)?;
+                msg.serialize_field("snapshot_wanted", snapshot_wanted)?;
+                msg.serialize_field("schema_version", schema_version)?;
+                msg.serialize_field("schema_id", schema_id)?;
+                msg.end()
+            }
+            Self::SyncBatch {
+                correlation_id,
+                room_id,
+                head_seq,
+                ops,
+                has_more,
+                snapshot_wanted,
+                schema_version,
+                schema_id,
+            } => {
+                let mut msg = serializer.serialize_struct_variant(
+                    "ServerMessage",
+                    SYNC_BATCH_INDEX,
+                    "SyncBatch",
+                    8,
+                )?;
+                msg.serialize_field("correlation_id", correlation_id)?;
+                msg.serialize_field("room_id", room_id)?;
+                msg.serialize_field("head_seq", head_seq)?;
+                msg.serialize_field("ops", ops)?;
+                msg.serialize_field("has_more", has_more)?;
+                msg.serialize_field("snapshot_wanted", snapshot_wanted)?;
+                msg.serialize_field("schema_version", schema_version)?;
+                msg.serialize_field("schema_id", schema_id)?;
+                msg.end()
+            }
+        }
+    }
 }
 
 /// Reserves a frame of `holder`'s part of the budget of response bytes in flight, before the
@@ -74,7 +179,7 @@ fn client_holder(room_id: &RoomId, client_id: &ClientId) -> BudgetHolder {
 }
 
 /// 200 with `msg`, holding as much of `reservation` as its encoding takes.
-pub(crate) fn budgeted_response(mut reservation: Reservation, msg: &ServerMessage) -> Response {
+pub(crate) fn budgeted_response(mut reservation: Reservation, msg: &impl Frame) -> Response {
     let mut response = binary_response(StatusCode::OK, msg);
     reservation.shrink_to(response.body().size_hint().exact().unwrap_or(u64::MAX));
     response
@@ -259,7 +364,7 @@ pub async fn commit(
         Ok(commit_resp) => commit_resp,
         Err(err) => return binary_error(Some(correlation_id), Some(room_id), err),
     };
-    let ack = ServerMessage::CommitAck {
+    let ack = OpsReply::CommitAck {
         correlation_id,
         room_id,
         mutation_id,
@@ -308,7 +413,7 @@ pub async fn sync(
     .await;
     match result {
         Ok(sync_resp) => {
-            let batch = ServerMessage::SyncBatch {
+            let batch = OpsReply::SyncBatch {
                 correlation_id,
                 room_id: room_id.clone(),
                 head_seq: sync_resp.head_seq,

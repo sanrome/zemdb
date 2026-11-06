@@ -999,6 +999,44 @@ async fn ack_below_the_stored_cursor_is_a_successful_no_op() {
     fx.manager.shutdown_all().await;
 }
 
+/// A commit's catch-up and a sync return the operations of the RAM buffer themselves: the
+/// operation of a client up to date, the catch-up of a client behind and a sync share each
+/// operation, without copies (DS6).
+#[tokio::test]
+async fn catch_ups_and_syncs_share_the_operations_of_the_ram_buffer() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let writer = ClientId::new("writer").unwrap();
+    let behind = ClientId::new("behind").unwrap();
+    register(&sender, &writer).await;
+    register(&sender, &behind).await;
+    let own = commit(&sender, &writer, mutation(1), seq(0), insert_op(1))
+        .await
+        .unwrap();
+    commit(&sender, &writer, mutation(2), seq(1), insert_op(2))
+        .await
+        .unwrap();
+    let catch_up = commit(&sender, &behind, mutation(3), seq(0), insert_op(3))
+        .await
+        .unwrap();
+    let synced = sync_all(&sender, &writer).await.unwrap().ops;
+
+    let seqs = |ops: &[Arc<SequencedOperation>]| -> Vec<u64> {
+        ops.iter().map(|op| op.seq.get()).collect()
+    };
+    assert_eq!(seqs(&own.catchup_ops), [1]);
+    assert_eq!(seqs(&catch_up.catchup_ops), [1, 2, 3]);
+    assert_eq!(seqs(&synced), [1, 2, 3]);
+    assert!(
+        Arc::ptr_eq(&own.catchup_ops[0], &synced[0]),
+        "the operation of the client up to date is a copy"
+    );
+    for (op, same) in catch_up.catchup_ops.iter().zip(&synced) {
+        assert!(Arc::ptr_eq(op, same), "operation {} is a copy", op.seq);
+    }
+    fx.manager.shutdown_all().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn sync_from_beyond_the_head_is_an_invalid_sequence() {
     let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
@@ -2392,7 +2430,7 @@ async fn the_same_mutation_id_from_two_clients_is_two_mutations() {
         assert_eq!(ack.assigned_seq, seq(row as u64));
     }
     let synced = sync_all(&sender, &alice).await.unwrap();
-    let ops: Vec<Operation> = synced.ops.into_iter().map(|op| op.op).collect();
+    let ops: Vec<Operation> = synced.ops.iter().map(|op| op.op.clone()).collect();
     assert_eq!(ops, [insert_op(1), insert_op(2), insert_op(3)]);
 
     // Retries get their original sequences, also once the room is reopened from disk.
@@ -2532,7 +2570,7 @@ async fn commit_catchups_and_sync_chains_deliver_the_exact_suffix() {
             if let Some(last) = batch.ops.last() {
                 at = last.seq.get();
             }
-            got.extend(batch.ops.into_iter().map(|op| (op.seq.get(), op.op)));
+            got.extend(batch.ops.iter().map(|op| (op.seq.get(), op.op.clone())));
             if !batch.has_more {
                 break;
             }
@@ -4475,7 +4513,11 @@ async fn the_ops_event_of_a_group_carries_exactly_its_new_operations() {
     );
     let delivered: Vec<SequencedOperation> =
         announced.iter().flat_map(|event| ops_in(event).0).collect();
-    assert_eq!(delivered, sync_all(&sender, &writer).await.unwrap().ops);
+    let synced = sync_all(&sender, &writer).await.unwrap().ops;
+    assert_eq!(
+        delivered,
+        synced.iter().map(|op| (**op).clone()).collect::<Vec<_>>()
+    );
     for event in &announced {
         let (_, schema_id, version) = ops_in(event);
         assert_eq!((schema_id.as_str(), version), ("todo", 1));

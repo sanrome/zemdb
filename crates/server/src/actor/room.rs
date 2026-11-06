@@ -27,7 +27,7 @@ use crate::durable;
 use crate::error::ServerError;
 use crate::io_pool::{run_holding, IoThreads};
 use crate::log::budget::OpSize;
-use crate::log::tiered_log::{AppendOutcome, MaintenanceClock};
+use crate::log::tiered_log::{AppendOutcome, Deltas, MaintenanceClock};
 use crate::log::{RoomLifecyclePolicy, TieredLog};
 use crate::relay::{LogBounds, SnapshotRelay, Uploader};
 use crate::response_budget::{no_room, InflightBudget, Reservation, RESPONSE_OVERHEAD};
@@ -612,7 +612,7 @@ impl RoomActor {
     /// never changes: a schema reload in the mailbox ends the group.
     fn announcement(&self, commits: &[PendingCommit]) -> RoomEvent {
         let new_ops = commits.iter().filter_map(|commit| match &commit.decision {
-            Decision::New(seq_op) => Some(seq_op),
+            Decision::New(seq_op) => Some(&**seq_op),
             _ => None,
         });
         let event = (self.events_tx.receiver_count() > 0)
@@ -703,7 +703,7 @@ impl RoomActor {
             )));
         }
         // The new sequence stays in the group until the group is durable.
-        let seq_op = SequencedOperation::new(group.head.next(), op);
+        let seq_op = Arc::new(SequencedOperation::new(group.head.next(), op));
 
         // The operation must fit alone in a log record and in a response frame. A
         // mutation that does not is the client's error: it is rejected here, before any I/O,
@@ -714,7 +714,7 @@ impl RoomActor {
         group.head = seq_op.seq;
         group.bytes = group.bytes.saturating_add(OpSize::of(&seq_op).bytes);
         group.keys.push((key, seq_op.seq));
-        group.records.push((seq_op.clone(), Some(key)));
+        group.records.push((Arc::clone(&seq_op), Some(key)));
         Ok(Decision::New(seq_op))
     }
 
@@ -793,7 +793,7 @@ impl RoomActor {
         &mut self,
         last_ack_seq: SequenceNumber,
         reservation: &mut Option<Reservation>,
-    ) -> (Vec<SequencedOperation>, bool) {
+    ) -> (Vec<Arc<SequencedOperation>>, bool) {
         let Some(held) = reservation.take() else {
             return (Vec::new(), true);
         };
@@ -1201,10 +1201,7 @@ impl RoomActor {
         from_seq: SequenceNumber,
         max_batch_size: u32,
         mut reservation: Reservation,
-    ) -> (
-        Result<(Vec<SequencedOperation>, bool), ServerError>,
-        Reservation,
-    ) {
+    ) -> (Result<Deltas, ServerError>, Reservation) {
         if let Some(read) =
             self.log()
                 .fetch_from_memory(from_seq, max_batch_size, Some(&mut reservation))
@@ -1344,14 +1341,14 @@ enum Decision {
     /// sequence.
     Retry(SequenceNumber),
     /// A new mutation, with the sequence it was given.
-    New(SequencedOperation),
+    New(Arc<SequencedOperation>),
 }
 
 /// The commits of a group as they are sequenced, before their `fsync`.
 struct Group {
     commits: Vec<PendingCommit>,
     /// The records of the new mutations, in order, to be written to the log.
-    records: Vec<(SequencedOperation, Option<MutationId>)>,
+    records: Vec<(Arc<SequencedOperation>, Option<MutationId>)>,
     /// The deduplication keys of the new mutations, in order, with their sequences.
     keys: Vec<(MutationId, SequenceNumber)>,
     /// The head once the new mutations are durable.
@@ -1401,9 +1398,9 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
 /// alone). If any operation is left out the batch is flagged `has_more`, so the client asks
 /// for the rest.
 fn fit_in_response(
-    mut ops: Vec<SequencedOperation>,
+    mut ops: Vec<Arc<SequencedOperation>>,
     has_more: bool,
-) -> (Vec<SequencedOperation>, bool) {
+) -> (Vec<Arc<SequencedOperation>>, bool) {
     let mut total: u64 = 0;
     let fitting = ops
         .iter()

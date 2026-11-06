@@ -2,11 +2,13 @@ use crate::error::ServerError;
 use crate::log::budget::{OpSize, ReadBudget};
 use crate::log::policy::RoomLifecyclePolicy;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use tokio::time::Instant;
 use zemdb_core::id::SequenceNumber;
 use zemdb_core::protocol::messages::SequencedOperation;
 
-/// RAM cache of the newest operations of the log, as a contiguous run of sequences.
+/// RAM cache of the newest operations of the log, as a contiguous run of sequences. Each
+/// operation is shared, not copied, with the reads that return it.
 #[derive(Debug, Default)]
 pub struct HotBuffer {
     entries: VecDeque<Entry>,
@@ -17,13 +19,13 @@ pub struct HotBuffer {
 /// An operation in the buffer, with when it arrived and its sizes.
 #[derive(Debug)]
 struct Entry {
-    op: SequencedOperation,
+    op: Arc<SequencedOperation>,
     at: Instant,
     size: OpSize,
 }
 
 impl Entry {
-    fn new(op: SequencedOperation) -> Self {
+    fn new(op: Arc<SequencedOperation>) -> Self {
         Self {
             size: OpSize::of(&op),
             op,
@@ -38,7 +40,7 @@ impl HotBuffer {
     }
 
     /// Appends `op`, which must follow the last operation in the buffer.
-    pub fn append(&mut self, op: SequencedOperation) -> Result<(), ServerError> {
+    pub fn append(&mut self, op: Arc<SequencedOperation>) -> Result<(), ServerError> {
         if let Some(last) = self.entries.back() {
             let expected = last.op.seq.get() + 1;
             if op.seq.get() != expected {
@@ -64,14 +66,14 @@ impl HotBuffer {
     }
 
     /// Retrieves the contiguous operations strictly after `from_seq` that fit in `budget`,
-    /// cloning only those.
+    /// shared with the buffer.
     ///
     /// The start index is `from_seq + 1 - min_seq`: the buffer is contiguous.
     pub fn get_range(
         &self,
         from_seq: SequenceNumber,
         budget: &mut ReadBudget,
-    ) -> Vec<SequencedOperation> {
+    ) -> Vec<Arc<SequencedOperation>> {
         if budget.is_exhausted() {
             return Vec::new();
         }
@@ -92,7 +94,7 @@ impl HotBuffer {
         self.entries
             .range(start_idx..)
             .take_while(|entry| budget.admit(entry.size))
-            .map(|entry| entry.op.clone())
+            .map(|entry| Arc::clone(&entry.op))
             .collect()
     }
 
@@ -137,7 +139,7 @@ impl HotBuffer {
     pub fn rehydrate(&mut self, ops: impl IntoIterator<Item = SequencedOperation>) {
         *self = Self::default();
         for op in ops {
-            self.push(Entry::new(op));
+            self.push(Entry::new(Arc::new(op)));
         }
     }
 

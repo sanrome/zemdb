@@ -23,8 +23,15 @@ pub(super) fn make_op(seq: u64) -> SequencedOperation {
     )
 }
 
-pub(super) fn seqs(ops: &[SequencedOperation]) -> Vec<u64> {
-    ops.iter().map(|op| op.seq.get()).collect()
+/// The operations of `ops`, a read of the log, as values.
+pub(super) fn owned(ops: Vec<std::sync::Arc<SequencedOperation>>) -> Vec<SequencedOperation> {
+    ops.into_iter()
+        .map(std::sync::Arc::unwrap_or_clone)
+        .collect()
+}
+
+pub(super) fn seqs<T: std::borrow::Borrow<SequencedOperation>>(ops: &[T]) -> Vec<u64> {
+    ops.iter().map(|op| op.borrow().seq.get()).collect()
 }
 
 /// One WAL frame per operation in `seqs`, without mutation ids, and the offset of each frame.

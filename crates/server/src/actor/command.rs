@@ -27,7 +27,9 @@ pub struct RegisterResponse {
 #[derive(Debug)]
 pub struct CommitResponse {
     pub assigned_seq: SequenceNumber,
-    pub catchup_ops: Vec<SequencedOperation>,
+    /// The operations after the client's cursor, shared with the room's RAM buffer when they
+    /// come from it.
+    pub catchup_ops: Vec<Arc<SequencedOperation>>,
     pub has_more: bool,
     /// Whether this client is the one designated to upload a room snapshot.
     pub snapshot_wanted: bool,
@@ -43,7 +45,9 @@ pub struct CommitResponse {
 #[derive(Debug)]
 pub struct SyncBatchResponse {
     pub head_seq: SequenceNumber,
-    pub ops: Vec<SequencedOperation>,
+    /// The operations after the cursor, shared with the room's RAM buffer when they come from
+    /// it.
+    pub ops: Vec<Arc<SequencedOperation>>,
     pub has_more: bool,
     /// Whether this client is the one designated to upload a room snapshot.
     pub snapshot_wanted: bool,

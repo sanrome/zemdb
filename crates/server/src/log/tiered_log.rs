@@ -15,11 +15,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::time::Instant;
 use zemdb_core::id::{MutationId, SequenceNumber};
 use zemdb_core::protocol::limits::MAX_RESPONSE_OPS_BYTES;
 use zemdb_core::protocol::messages::SequencedOperation;
+
+/// A read of the log for a response: the operations after a cursor, those of the RAM buffer
+/// shared with it, and whether more follow them.
+pub(crate) type Deltas = (Vec<Arc<SequencedOperation>>, bool);
 
 /// Warm segments one maintenance pass tries to compress. The room actor waits for the pass,
 /// so this bounds how long it stops serving requests (about 0.1–0.3 s per segment of
@@ -234,7 +239,7 @@ impl TieredLog {
         op: SequencedOperation,
         mutation_id: Option<MutationId>,
     ) -> Result<AppendOutcome, ServerError> {
-        self.append_group(vec![(op, mutation_id)])
+        self.append_group(vec![(Arc::new(op), mutation_id)])
     }
 
     /// Appends `records`, each operation with its mutation ID, to `active.wal`, synced with one
@@ -247,7 +252,7 @@ impl TieredLog {
     /// is reported in the outcome.
     pub fn append_group(
         &mut self,
-        records: Vec<(SequencedOperation, Option<MutationId>)>,
+        records: Vec<(Arc<SequencedOperation>, Option<MutationId>)>,
     ) -> Result<AppendOutcome, ServerError> {
         let Some((first, _)) = records.first() else {
             return Ok(AppendOutcome::default());
@@ -315,7 +320,8 @@ impl TieredLog {
     }
 
     /// The operations after `from_seq`, read from the cold, warm and RAM tiers as one contiguous
-    /// run, or `BehindCompaction` if the cursor is past retention.
+    /// run, or `BehindCompaction` if the cursor is past retention. Those of the RAM buffer are
+    /// shared with it.
     ///
     /// Returns at most `max_batch_size` operations that fit in one response
     /// ([`MAX_RESPONSE_OPS_BYTES`], as [`op_bytes`](crate::log::budget::op_bytes) charges them),
@@ -331,7 +337,7 @@ impl TieredLog {
         from_seq: SequenceNumber,
         max_batch_size: u32,
         mut reservation: Option<&mut Reservation>,
-    ) -> Result<(Vec<SequencedOperation>, bool), ServerError> {
+    ) -> Result<Deltas, ServerError> {
         if let Some(read) =
             self.fetch_from_memory(from_seq, max_batch_size, reservation.as_deref_mut())
         {
@@ -383,7 +389,7 @@ impl TieredLog {
         from_seq: SequenceNumber,
         max_batch_size: u32,
         reservation: Option<&mut Reservation>,
-    ) -> Option<Result<(Vec<SequencedOperation>, bool), ServerError>> {
+    ) -> Option<Result<Deltas, ServerError>> {
         if self.is_behind_retention(from_seq) {
             return Some(Err(ServerError::BehindCompaction));
         }
@@ -421,14 +427,14 @@ impl TieredLog {
             }
             let (ops, _) = read_segment(segment, batch.cursor, &mut batch.budget)
                 .map_err(|err| unreadable_range(&segment.path, err))?;
-            batch.extend(segment.tier.name(), ops)?;
+            batch.extend(segment.tier.name(), ops.into_iter().map(Arc::new))?;
         }
         if !batch.is_full() && batch.cursor.get() < self.head_seq.get() {
             let ops = self
                 .warm_disk
                 .read_active_range(batch.cursor, &mut batch.budget)
                 .map_err(|err| unreadable_range(&self.warm_disk.active_path(), err))?;
-            batch.extend("active wal", ops)?;
+            batch.extend("active wal", ops.into_iter().map(Arc::new))?;
         }
         Ok(())
     }
@@ -750,7 +756,7 @@ impl TieredLog {
 
 /// A contiguous run of operations being collected after a cursor.
 struct DeltaBatch<'r> {
-    ops: Vec<SequencedOperation>,
+    ops: Vec<Arc<SequencedOperation>>,
     /// Sequence of the last operation collected, or the starting cursor.
     cursor: SequenceNumber,
     /// What the tiers may still return; they take each operation from it as they read it.
@@ -772,7 +778,11 @@ impl<'r> DeltaBatch<'r> {
 
     /// Appends `ops`, read from `tier` within the batch's budget. Each must continue the batch
     /// exactly: a gap means the log lost operations it claims to retain.
-    fn extend(&mut self, tier: &str, ops: Vec<SequencedOperation>) -> Result<(), ServerError> {
+    fn extend(
+        &mut self,
+        tier: &str,
+        ops: impl IntoIterator<Item = Arc<SequencedOperation>>,
+    ) -> Result<(), ServerError> {
         for op in ops {
             if op.seq.get() != self.cursor.get() + 1 {
                 return Err(sequence_gap(tier, self.cursor, op.seq));

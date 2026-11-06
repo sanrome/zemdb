@@ -81,6 +81,18 @@ impl Fixture {
 
     /// [`Fixture::new`] with the configuration adjusted by `configure`.
     async fn with(configure: impl FnOnce(&mut crate::config::ServerConfig)) -> Self {
+        Self::with_room(configure, None).await
+    }
+
+    /// [`Fixture::new`] over a room with the lifecycle overrides `lifecycle`.
+    async fn with_lifecycle(lifecycle: crate::log::RoomLifecycleOverrides) -> Self {
+        Self::with_room(|_| {}, Some(lifecycle)).await
+    }
+
+    async fn with_room(
+        configure: impl FnOnce(&mut crate::config::ServerConfig),
+        lifecycle: Option<crate::log::RoomLifecycleOverrides>,
+    ) -> Self {
         let dir = tempdir().unwrap();
         let state = TestState::new(dir.path(), |config| {
             config.auth_secret = AUTH_SECRET.to_string();
@@ -94,7 +106,7 @@ impl Fixture {
         let room_id = RoomId::new("room").unwrap();
         let incarnation = state
             .manager
-            .create_room(room_id.clone(), schema_id, None)
+            .create_room(room_id.clone(), schema_id, lifecycle)
             .await
             .unwrap()
             .room_incarnation;
@@ -140,6 +152,16 @@ impl Fixture {
             .body(Body::from(encode_message(msg).unwrap()))
             .unwrap();
         self.app.clone().oneshot(request).await.unwrap()
+    }
+
+    /// Posts `msg`, which must be answered with 200, and returns the body of the response.
+    async fn body_of(&self, endpoint: &str, msg: &ClientMessage) -> Vec<u8> {
+        let response = self.send(endpoint, msg).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
     }
 
     async fn post(
@@ -657,6 +679,164 @@ async fn a_request_waiting_for_its_room_holds_none_of_the_budget() {
     );
     release_tx.send(()).unwrap();
     waiting.await;
+}
+
+/// The replies that carry operations, a `SyncBatch` and a `CommitAck`, are exactly the bytes of
+/// their `ServerMessage` with copies of the operations, wherever the operations come from: cold
+/// and warm segments, `active.wal` or the RAM buffer (INV-W2, DS6).
+#[tokio::test(start_paused = true)]
+async fn replies_with_operations_from_every_tier_are_the_bytes_of_their_message() {
+    // Segments of two operations, compressed to cold at the first slow tick; two in RAM. The
+    // commits report the cursor 0, so that no segment is pruned.
+    let fx = Fixture::with_lifecycle(crate::log::RoomLifecycleOverrides {
+        ram_max_ops: Some(2),
+        warm_disk_ttl_secs: Some(0),
+        ..Default::default()
+    })
+    .await;
+    let op = |n: u8| task_with_title(n.into(), 10 * usize::from(n));
+    let commit = |n: u8, last_ack_seq: u64| fx.commit_op(n, last_ack_seq, op(n));
+    let committed = |seqs: std::ops::RangeInclusive<u8>| -> Vec<SequencedOperation> {
+        seqs.map(|n| SequencedOperation::new(SequenceNumber::new(n.into()), op(n)))
+            .collect()
+    };
+    let (_, _, first) = fx.post("commit", &commit(1, 0)).await;
+    let ServerMessage::CommitAck { schema_version, .. } = first else {
+        panic!("expected CommitAck, got {first:?}");
+    };
+    for n in 2..=4 {
+        fx.commit_ok(&commit(n, 0)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    for n in 5..=7 {
+        fx.commit_ok(&commit(n, 0)).await;
+    }
+    let segments = fx.dir.path().join("rooms/room/segments");
+    let segment = |first: u64, last: u64, tier: &str| {
+        segments.join(format!("segment_{first:016}_{last:016}.{tier}"))
+    };
+    assert!(segment(1, 2, "wal.zst").exists() && segment(3, 4, "wal.zst").exists());
+    assert!(segment(5, 6, "wal").exists());
+    let schema_id = SchemaId::new("tasks").unwrap();
+    let sync_batch = |from: u64, head: u64, ops, has_more| ServerMessage::SyncBatch {
+        correlation_id: CorrelationId::new(100 + from),
+        room_id: fx.room_id.clone(),
+        head_seq: SequenceNumber::new(head),
+        ops,
+        has_more,
+        snapshot_wanted: false,
+        schema_version,
+        schema_id: schema_id.clone(),
+    };
+    let commit_ack = |n: u8, catchup_ops| ServerMessage::CommitAck {
+        correlation_id: CorrelationId::new(n.into()),
+        room_id: fx.room_id.clone(),
+        mutation_id: MutationId::new([n; 16]),
+        assigned_seq: SequenceNumber::new(n.into()),
+        catchup_ops,
+        has_more: false,
+        snapshot_wanted: false,
+        schema_version,
+        schema_id: schema_id.clone(),
+    };
+
+    let mut three = fx.sync(0);
+    if let ClientMessage::Sync { max_batch_size, .. } = &mut three {
+        *max_batch_size = 3;
+    }
+
+    // From the disk tiers (cold, warm and active.wal), then from RAM.
+    let replies = [
+        ("sync", three, sync_batch(0, 7, committed(1..=3), true)),
+        (
+            "sync",
+            fx.sync(0),
+            sync_batch(0, 7, committed(1..=7), false),
+        ),
+        ("commit", commit(8, 0), commit_ack(8, committed(1..=8))),
+        (
+            "sync",
+            fx.sync(6),
+            sync_batch(6, 8, committed(7..=8), false),
+        ),
+        ("commit", commit(9, 7), commit_ack(9, committed(8..=9))),
+    ];
+    for (endpoint, request, expected) in replies {
+        let body = fx.body_of(endpoint, &request).await;
+        assert_eq!(decode_message::<ServerMessage>(&body).unwrap(), expected);
+        assert_eq!(body, encode_message(&expected).unwrap(), "{request:?}");
+    }
+}
+
+/// A reply with shared operations is the bytes of its `ServerMessage` with copies of them for
+/// every value of its flags, so that none of its fields is out of place (INV-W2, DS6).
+#[test]
+fn an_ops_reply_is_the_bytes_of_its_message_with_every_flag() {
+    let ops: Vec<std::sync::Arc<SequencedOperation>> = (1..=3u8)
+        .map(|n| {
+            let op = task_with_title(n.into(), n.into());
+            std::sync::Arc::new(SequencedOperation::new(SequenceNumber::new(n.into()), op))
+        })
+        .collect();
+    let copies: Vec<SequencedOperation> = ops.iter().map(|op| (**op).clone()).collect();
+    let room_id = RoomId::new("room").unwrap();
+    let schema_id = SchemaId::new("tasks").unwrap();
+    for (has_more, snapshot_wanted) in [(false, false), (false, true), (true, false), (true, true)]
+    {
+        let reply = OpsReply::CommitAck {
+            correlation_id: CorrelationId::new(7),
+            room_id: room_id.clone(),
+            mutation_id: MutationId::new([9; 16]),
+            assigned_seq: SequenceNumber::new(4),
+            catchup_ops: ops.clone(),
+            has_more,
+            snapshot_wanted,
+            schema_version: 5,
+            schema_id: schema_id.clone(),
+        };
+        let message = ServerMessage::CommitAck {
+            correlation_id: CorrelationId::new(7),
+            room_id: room_id.clone(),
+            mutation_id: MutationId::new([9; 16]),
+            assigned_seq: SequenceNumber::new(4),
+            catchup_ops: copies.clone(),
+            has_more,
+            snapshot_wanted,
+            schema_version: 5,
+            schema_id: schema_id.clone(),
+        };
+        let flags = format!("has_more {has_more}, snapshot_wanted {snapshot_wanted}");
+        assert_eq!(
+            encode_message(&reply).unwrap(),
+            encode_message(&message).unwrap(),
+            "CommitAck, {flags}"
+        );
+        let reply = OpsReply::SyncBatch {
+            correlation_id: CorrelationId::new(7),
+            room_id: room_id.clone(),
+            head_seq: SequenceNumber::new(6),
+            ops: ops.clone(),
+            has_more,
+            snapshot_wanted,
+            schema_version: 5,
+            schema_id: schema_id.clone(),
+        };
+        let message = ServerMessage::SyncBatch {
+            correlation_id: CorrelationId::new(7),
+            room_id: room_id.clone(),
+            head_seq: SequenceNumber::new(6),
+            ops: copies.clone(),
+            has_more,
+            snapshot_wanted,
+            schema_version: 5,
+            schema_id: schema_id.clone(),
+        };
+        assert_eq!(
+            encode_message(&reply).unwrap(),
+            encode_message(&message).unwrap(),
+            "SyncBatch, {flags}"
+        );
+    }
 }
 
 /// What the operation of `msg`, a commit, takes in a response as the operation `seq`.

@@ -59,8 +59,8 @@ pub fn envelope(total_len: usize, fill: u8) -> Vec<u8> {
 }
 
 /// Sequence numbers of `ops`, in order.
-pub fn seqs(ops: &[SequencedOperation]) -> Vec<u64> {
-    ops.iter().map(|op| op.seq.get()).collect()
+pub fn seqs<T: std::borrow::Borrow<SequencedOperation>>(ops: &[T]) -> Vec<u64> {
+    ops.iter().map(|op| op.borrow().seq.get()).collect()
 }
 
 /// A client token for `client_id` in `room_id`, valid for 300 s.
