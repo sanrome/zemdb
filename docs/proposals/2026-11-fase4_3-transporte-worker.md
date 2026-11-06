@@ -2,7 +2,7 @@
 
 **Fecha:** 4 de Noviembre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su quinta ronda; las precisiones de DC18 y de DC24 a DC26 y las decisiones DC27 a DC31 quedan como *Propuestas*, que se confirman con el dueño del proyecto antes del Lote 1.
+**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su quinta ronda. El dueño del proyecto adoptó el mismo día las precisiones de DC18 y de DC24 a DC26 y las decisiones DC27 a DC31 (DC27, con la condición de S4), con dos ajustes: DC26 dice explícitamente que, en el camino normal, un `ops` se aplica sin ningún `/sync`, y la verificación del `ClientId` de un token renovado pasa de 4.4 al Lote 3 (DC30). Lo que sigue es el Lote 1.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.3. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Parte de:** el SSE del servidor, del Lote 5 de la [Fase 3.12](2026-11-fase3_12-rendimiento-servidor.md) (`2c0a908`): el evento `ops` con la encarnación de la sala, el stream que termina cuando vence su token y `EventsDisabled` (`ARCHITECTURE.md` §7.2).
@@ -13,23 +13,23 @@
 
 - **Qué.** El transporte HTTP nativo del cliente, sobre `reqwest`, con el stream de eventos; el `SyncWorker`, que programa por sala los pasos del núcleo de 4.2 (heartbeat, sync, `Ack`, bajada y subida de snapshots) según el modo de frescura (DC24), con el `Ack` periódico (DC25) y el evento `ops` (DC26); la renovación del token ante `Unauthorized`; y el contrato de lo que puede detener a una sala (INV-K17, nueva).
 - **Dónde.** Solo en `zemdb-client` y sus tests, que está en el alcance auditado desde la auditoría que cerró 4.2 (`INVARIANTES.md` §1.4): cada lote, con su revisión de delta. No toca el servidor, `zemdb-core` ni `zemdb-storage`: lo que el SDK necesita del servidor (el SSE con las operaciones y el SSE apagado) está desde el Lote 5 de la Fase 3.12. El cambio de §2 de `INVARIANTES.md` aplica a los eventos SSE el criterio que ya vale para las respuestas (la precisión de DC11 que adoptó el dueño del proyecto al cerrar 4.2): no cambia el modelo de amenaza, así que no pide una auditoría amplia (§1.4).
-- **Qué no.** La fachada de Rust, `watch` y el modo `live` atado a los `watch`, el `Offline` inmediato y la verificación del `ClientId` de un token renovado (4.4); el transporte del navegador y `EventSource` (4.5); la encarnación en los commits, los syncs y los acks (backlog para después de la v0.1, `ROADMAP.md` §3).
-- **Decisiones:** las precisiones de DC18 y de DC24 a DC26 de la fase, y DC27 a DC31, nuevas (§1). Todas *Propuestas*.
+- **Qué no.** La fachada de Rust, `watch` y el modo `live` atado a los `watch`, y el `Offline` inmediato (4.4); el transporte del navegador y `EventSource` (4.5); la encarnación en los commits, los syncs y los acks (backlog para después de la v0.1, `ROADMAP.md` §3).
+- **Decisiones:** las precisiones de DC18 y de DC24 a DC26 de la fase, y DC27 a DC31, nuevas (§1), adoptadas por el dueño del proyecto el 6 de Noviembre de 2026.
 - **Cómo cierra:** con una revisión de cierre (`docs/METODOLOGIA.md` §6), con dos revisores (§3).
 
 ---
 
 ## 1. Decisiones
 
-Las de la fase que implementa esta sub-fase: DC6 (la fila de `Unauthorized` de la tabla de §A.4), DC11, DC18 (los pasos que programa el worker), DC21, DC22 y DC24 a DC26 (§3 del plan de la fase). Esta sub-fase precisa DC18 y DC24 a DC26, y agrega:
+Las de la fase que implementa esta sub-fase: DC6 (la fila de `Unauthorized` de la tabla de §A.4), DC11, DC18 (los pasos que programa el worker), DC21, DC22 y DC24 a DC26 (§3 del plan de la fase). Esta sub-fase precisa DC18 y DC24 a DC26, y agrega DC27 a DC31. El dueño del proyecto adoptó todo el 6 de Noviembre de 2026, con dos ajustes: la frase de DC26 sobre el camino normal sin `/sync`, y la verificación del `ClientId` de un token renovado, que pasa de 4.4 a DC30 (Lote 3).
 
 | ID | Decisión | Lotes | Estado |
 |---|---|---|---|
-| **DC27** | El transporte nativo: `reqwest`, plazos que no cortan un pedido que avanza, el tope de lo que lee, el stream por su propia conexión y su parser en el núcleo | 1, 2 | Propuesta (4 de Noviembre de 2026) |
-| **DC28** | El `SyncWorker`: una tarea por sala, a pedido, cuyo heartbeat no espera las transferencias | 4 a 6 | Propuesta (4 de Noviembre de 2026) |
-| **DC29** | Qué detiene a una sala: solo `FailedClosed` y `RoomClosed` | 3, 4, 7 y 8 | Propuesta (4 de Noviembre de 2026) |
-| **DC30** | La renovación del token, con un `TokenProvider` de la aplicación | 3, 7 | Propuesta (4 de Noviembre de 2026) |
-| **DC31** | Los endurecimientos opcionales de la auditoría de 4.2 (DEF-192 y DEF-196) | 6 | Propuesta (4 de Noviembre de 2026) |
+| **DC27** | El transporte nativo: `reqwest`, plazos que no cortan un pedido que avanza, el tope de lo que lee, el stream por su propia conexión y su parser en el núcleo | 1, 2 | Adoptada (6 de Noviembre de 2026), con la condición de S4 |
+| **DC28** | El `SyncWorker`: una tarea por sala, a pedido, cuyo heartbeat no espera las transferencias | 4 a 6 | Adoptada (6 de Noviembre de 2026) |
+| **DC29** | Qué detiene a una sala: solo `FailedClosed` y `RoomClosed` | 3, 4, 7 y 8 | Adoptada (6 de Noviembre de 2026) |
+| **DC30** | La renovación del token, con un `TokenProvider` de la aplicación, y la verificación del `ClientId` del token renovado | 3, 7 | Adoptada (6 de Noviembre de 2026) |
+| **DC31** | Los endurecimientos opcionales de la auditoría de 4.2 (DEF-192 y DEF-196) | 6 | Adoptada (6 de Noviembre de 2026) |
 
 ### Precisiones de DC24 · Modos de frescura
 - **Dónde se eligen.** `ClientConfig::freshness` (por defecto `periodic`) es el modo con que arranca el worker de cada sala, y `set_freshness` lo cambia por sala (DC28). La fachada de 4.4 enciende `live` mientras haya un `watch` sobre la sala.
@@ -46,6 +46,7 @@ Las de la fase que implementa esta sub-fase: DC6 (la fila de `Unauthorized` de l
 - **D78.** Un cliente en `live` presenta su cursor menos seguido (en los `Ack`, en sus escrituras y en sus syncs), como notó la revisión del Lote 5 de la Fase 3.12. Pero el heartbeat de cada intervalo compara su head con el de la réplica en cualquier modo, y uno menor lleva a registrarse con el cursor, donde `InvalidSequence` descarta (INV-K1): con el worker, la detección espera a lo sumo un intervalo, salvo que el head del servidor vuelva a alcanzar el cursor antes (el riesgo aceptado de INV-K1).
 
 ### Precisiones de DC26 · El evento `ops`
+- **En el camino normal, un `ops` se aplica sin ningún `/sync`:** sus operaciones entran a la réplica desde el evento. El worker sincroniza solo por lo que un evento no cubre: una vez al abrir cada stream (lo que pasó mientras no había stream), y ante un evento que no se puede aplicar (un hueco, `lagged`, `head_advanced`, uno que no decodifica, un cambio de esquema o una operación que no valida). El heartbeat también compara heads, pero en el camino normal el evento llega antes. En el Lote 7, antes de que el Lote 8 aplique el `ops`, cada evento todavía se trata como un aviso que lleva a un sync: es un estado intermedio entre dos lotes, para revisarlos por separado.
 - **Cada stream es de una época** (DC7): el worker anota la época de la réplica al abrirlo, no usa los eventos de un stream de otra época, y lo cierra y abre otro apenas lo nota (en su próximo evento o heartbeat). Así no se aplica un evento de antes de un descarte por D78, que deja la misma encarnación.
 - **Después de abrir un stream, un sync:** los eventos de antes de suscribirse no llegan. Primero se suscribe y después sincroniza; lo que llega mientras tanto se resuelve como cualquier aviso durante un sync.
 - **La validación de un `ops`,** antes de usarlo y en este orden:
@@ -99,7 +100,7 @@ Las de la fase que implementa esta sub-fase: DC6 (la fila de `Unauthorized` de l
 - **El proveedor tiene un plazo** (60 s). Una renovación que vence, que falla o cuyo pedido se corta no deja esperando a los demás: el siguiente que necesite un token lo vuelve a pedir.
 - **En una escritura,** un intento con `Unauthorized` no tuvo efecto (la autenticación va antes que todo), así que no la deja incierta: reintenta con el token nuevo, con el mismo `MutationId` y dentro del plazo de DC6. Sin token nuevo, termina como dice la tabla de §A.4: `OutcomeUnknown` si algún intento quedó incierto y, si no, un error sin efecto.
 - **`Forbidden`** sigue siendo permanente para ese token: una escritura termina con `Validation` (§A.4). Además, el núcleo marca el token de la sala como inservible, y el pedido siguiente de la sala (del worker, de una escritura o de un paso) le pide otro al proveedor antes de mandarse.
-- **El `ClientId` del token renovado:** verificarlo sigue en 4.4 (DC15). Mientras tanto, el servidor rechaza con `Forbidden` todo pedido cuyo mensaje nombra otro cliente que su token, así que un token de otro `ClientId` nunca secuencia una operación con otra clave de dedup (INV-Y4).
+- **El `ClientId` del token renovado** (DC15; pasó de 4.4 a este lote al adoptarse DC30): el núcleo lee el `ClientId` de cada token que le da el proveedor, del formato con que lo emite `generate_client_token` (`v1.<base64url(client_id)>.<base64url(room_id)>.<vencimiento>.<firma>`), sin verificar la firma, que es del servidor. Si no es el suyo, o el token no tiene ese formato, cuenta como sin token nuevo, y no se manda nada con él. Un test con `generate_client_token` (`zemdb-server` es dev-dependency) detecta un cambio del formato. El servidor, además, rechaza con `Forbidden` todo pedido cuyo mensaje nombra otro cliente que su token, así que un token de otro `ClientId` nunca secuencia una operación con otra clave de dedup (INV-Y4).
 - **Sin renovación proactiva:** el cliente no lee el vencimiento del token. El stream que termina con su token se vuelve a abrir, y el `Unauthorized` de ese intento renueva.
 
 ### DC31 · Los endurecimientos de la auditoría de 4.2
@@ -122,6 +123,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 | 9 | Lote 5 de la Fase 3.12 | La encarnación del evento, el stream que termina con su token y `EventsDisabled` | DC26, DC30 y DC24 | 7, 8 |
 | 10 | Lote 5 de la Fase 3.12 (nota de su revisión) | Un cliente que aplica eventos presenta su cursor menos seguido (D78) | El heartbeat compara su head en cualquier modo (DC25) | 0 (INV-K1) |
 | 11 | DC18 (plan de 4.2) | El estado de la conexión, para el `Offline` de 4.4 | `status` (DC28) | 4 |
+| 12 | Plan de la fase, §4.4 (DC15) | La verificación del `ClientId` de cada token renovado | DC30: pasó de 4.4 a 4.3 al adoptarse | 3 |
 
 ---
 
@@ -148,7 +150,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 - El 9 y el 10 son pruebas, sin producción (salvo arreglos de lo que encuentren, que van como desvíos en su nota o como lotes nuevos); el 9 antes que el 10, que reusa su transporte.
 - El 11 cierra con la revisión de cierre (§3); sus rupturas se arreglan en lotes nuevos de 4.3.
 
-**Tamaño.** Unas 150 líneas de producción el Lote 1, 200 el 2, 150 el 3, 200 el 4, 150 el 5, 150 el 6, 250 el 7 y 150 el 8.
+**Tamaño.** Unas 150 líneas de producción el Lote 1, 200 el 2, 170 el 3, 200 el 4, 150 el 5, 150 el 6, 250 el 7 y 150 el 8.
 
 **Pruebas.**
 - **El worker (Lotes 4 a 8),** contra el servidor real en proceso, como en 4.2, con el reloj pausado (el worker mide sus plazos con el reloj de Tokio) y el transporte de prueba de `crates/client/tests/common/`, que suma `events` sobre el cuerpo SSE del router. Lo que el servidor no produce (un evento dañado o de otra encarnación, un stream que calla) lo fabrica el transporte de prueba. El worker se observa sin hacer `pub` nada interno: por los pedidos que registra el transporte de prueba, por `status` y por el Control Plane del servidor (`GET /admin/rooms/{id}`, con los clientes por estado).
@@ -230,7 +232,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 - **Desvíos:**
   - la precisión de DC18, que no estaba en el plan de la fase, salió de la revisión;
   - INV-K7 suma un límite aceptado (las velocidades mínimas de una subida, que ya enunciaba INV-B2).
-- **Pendiente:** la confirmación de las *Propuestas* por el dueño del proyecto, antes del Lote 1.
+- **Las Propuestas:** el dueño del proyecto las adoptó el 6 de Noviembre de 2026, con dos ajustes: DC26 dice explícitamente que, en el camino normal, un `ops` se aplica sin `/sync`, y la verificación del `ClientId` de un token renovado pasa de 4.4 al Lote 3 (DC30).
 
 ### Lote 1 · El transporte HTTP nativo (`zemdb-client`) · ⬜
 **Objetivo:** que el núcleo hable con un servidor real por HTTP, sin leer de más y sin cortar un pedido que avanza (DC27, DEF-195).
@@ -275,13 +277,14 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 
 **Archivos:** `src/client.rs` (el envío de cada pedido, el registro y las escrituras), un módulo del `TokenProvider` y `src/lib.rs`; `tests/common/` (un proveedor de prueba) y `tests/token_tests.rs`. `ARCHITECTURE.md` §11 (*Tokens*).
 
-**Qué se hace:** el `TokenProvider` en `Client::open`; ante `Unauthorized`, la renovación, una por sala a la vez y con su plazo, y el pedido repetido una vez; ante `Forbidden`, el token marcado como inservible; en una escritura, el intento con `Unauthorized` que no queda incierto y el reintento dentro del plazo.
+**Qué se hace:** el `TokenProvider` en `Client::open`; ante `Unauthorized`, la renovación, una por sala a la vez y con su plazo, y el pedido repetido una vez; la verificación del `ClientId` del token renovado; ante `Forbidden`, el token marcado como inservible; en una escritura, el intento con `Unauthorized` que no queda incierto y el reintento dentro del plazo.
 
 **Tests exigidos.**
 - Con un token vencido (emitido con un TTL de 0), el registro, un sync, un ack, un heartbeat, un commit, y un chunk de bajada y uno de subida reciben `Unauthorized`, piden un token y se repiten con el nuevo, que usa también el pedido siguiente.
 - Varios pedidos a la vez con el mismo token vencido: una sola renovación. Un proveedor que no responde: al vencer su plazo, los pedidos fallan sin token nuevo; y una renovación cuyo pedido se corta no deja esperando a los demás.
 - Una escritura con `Unauthorized` y un token nuevo termina con la decisión de la réplica, con el mismo `MutationId`; sin token nuevo (el proveedor falla, o el nuevo también recibe `Unauthorized`), con `Network`, y con `OutcomeUnknown` si un intento anterior quedó incierto.
 - Después de un `Forbidden` (un token de otra sala), el pedido siguiente de la sala pide un token al proveedor antes de mandarse, y con uno bueno sale bien.
+- Un token renovado de otro `ClientId` (emitido con `generate_client_token` para otro dispositivo), o que no tiene el formato de un token, cuenta como sin token nuevo, y ningún pedido sale con él; uno del mismo `ClientId` se usa.
 - Negativos: `Forbidden` no se repite en el mismo pedido, y la escritura termina con `Validation`; un `Unauthorized` de otra correlación o de otra sala no renueva; un segundo `Unauthorized`, con el token renovado, no pide otro en el mismo pedido.
 
 **Interacciones a revisar:** el token de `open_room`, que reemplaza al renovado (gana el último); el lock de los registros; el plazo de una escritura, dentro del que cuenta la renovación; la baja al fallar cerrado; un pedido en vuelo cuando la sala se descarta (el token es de la sala, no de la época).
@@ -336,7 +339,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 
 **Archivos:** el worker; `src/client.rs` (`close_room`, `shutdown`, el registro y el head visto); `tests/worker_tests.rs`. `ARCHITECTURE.md` §11.
 
-**Qué se hace:** el `Ack` con cada heartbeat si el head se movió, y el último al detenerse, con su plazo; `close_room` y `shutdown` detienen el worker antes de cerrar la sala, en el orden de DC28; DEF-196 y DEF-192, si se adopta DC31.
+**Qué se hace:** el `Ack` con cada heartbeat si el head se movió, y el último al detenerse, con su plazo; `close_room` y `shutdown` detienen el worker antes de cerrar la sala, en el orden de DC28; DEF-196 y DEF-192 (DC31).
 
 **Tests exigidos.**
 - Un worker en `periodic` que sincroniza muchas veces manda un `Ack` por intervalo, no uno por sync, con el head de la réplica; uno sin cambios no manda ninguno.
@@ -443,4 +446,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** plan escrito el 4 de Noviembre de 2026. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su quinta ronda: las precisiones de DC18 y de DC24 a DC26 y DC27 a DC31, como *Propuestas*, y `INVARIANTES.md` en la versión 16.
+**Avance:** plan escrito el 4 de Noviembre de 2026. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su quinta ronda: las precisiones de DC18 y de DC24 a DC26 y DC27 a DC31, como *Propuestas*, y `INVARIANTES.md` en la versión 16. El dueño del proyecto las adoptó el mismo día, con dos ajustes (la frase de DC26 sobre el camino normal sin `/sync` y la verificación del `ClientId` en el Lote 3). Lo que sigue es el Lote 1, que arranca por S4.
