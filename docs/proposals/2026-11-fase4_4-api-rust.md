@@ -2,7 +2,7 @@
 
 **Fecha:** 6 de Noviembre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su tercera ronda. DC32 a DC37 son *Propuestas*, que se confirman con el dueño del proyecto antes del Lote 1.
+**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre de 2026, sin cambios. Lo que sigue es el Lote 1.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.4. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Parte de:** el núcleo de la réplica de 4.2 ([plan](2026-10-fase4_2-nucleo-replica.md)), y la API que la sub-fase 4.3 agrega al núcleo ([plan](2026-11-fase4_3-transporte-worker.md)): el `TokenProvider` (DC30), el worker con `start_worker` y `set_freshness`, y el estado de la conexión (DC28). 4.3 corre en paralelo: los lotes de 4.4 que usan algo de ella van después del lote de 4.3 que lo trae (§4.4 del plan de la fase).
@@ -14,23 +14,23 @@
 - **Qué.** La API de Rust del SDK: `ZemdbClient`, `RoomHandle` y `TableHandle` sobre el núcleo de 4.2, con filas y claves por nombre de columna, lecturas locales (`get`, `scan`), escrituras (`insert`, `update`, `delete`) con el dueño completado por el SDK y el pre-chequeo local, el cifrado de columnas con el `CryptoEngine` de la aplicación, `watch` y `ChangeStream`, el descarte a pedido de la aplicación, el modo `live` atado a los `watch`, `Offline`, y la app de referencia nativa como criterio de aceptación.
 - **Dónde.** En `zemdb-client`, en módulos nuevos de la fachada, para tocar lo menos posible `src/client.rs`, que 4.3 cambia en paralelo. El núcleo suma solo lo que la fachada necesita de adentro: el esquema de la réplica abierta y el motor, el estado de la conexión, el aviso de los cambios para `watch`, la cuenta de suscripciones en `status` y el descarte a pedido. Un lote en `zemdb-storage`, `StorageEngine::check_operation`, para el pre-chequeo (DC33), con el checklist de determinismo de la Fase 3.11. Todo es código del alcance auditado (el SDK lo está desde el cierre de 4.2), así que cada lote lleva su revisión de delta. El cambio de §2 de `INVARIANTES.md` precisa supuestos del cifrado que el modelo ya tenía (la aplicación y sus claves son de confianza): no cambia el modelo de amenaza y no pide una auditoría amplia (§1.4).
 - **Qué no.** El transporte, el worker y la renovación del token (4.3; la verificación del `ClientId` de un token renovado pasó a 4.3, DC30); el navegador, el runtime del Worker y las claves de cifrado en el Worker (4.5); la API de JavaScript y los errores de rango de DC14 (4.6); escaneos en streaming y consultas por índices secundarios (después de la v0.1, `ROADMAP.md` §3). La API de bajo nivel del núcleo (`Client::write`, DC18) sigue mandando la operación tal como la arma quien la llama: el dueño, el cifrado y la validación son de la fachada.
-- **Decisiones nuevas:** DC32 a DC37 (§1), *Propuestas*. DC36 precisa DC24 (adoptada): qué hace un `watch` con el modo que eligió la aplicación. DC32 precisa DC14: la clave de una escritura puede traer la columna dueño con el dueño del cliente. DC37 le suma un método público al núcleo de DC18, y precisa DC22 y DC29: descartar la sala no saca a una cuyo snapshot pasa el tope del cliente.
+- **Decisiones nuevas:** DC32 a DC37 (§1), adoptadas por el dueño del proyecto el 7 de Noviembre de 2026. DC36 precisa DC24 (adoptada): qué hace un `watch` con el modo que eligió la aplicación. DC32 precisa DC14: la clave de una escritura puede traer la columna dueño con el dueño del cliente. DC37 le suma un método público al núcleo de DC18, y precisa DC22 y DC29: descartar la sala no saca a una cuyo snapshot pasa el tope del cliente.
 - **Cómo cierra:** con una revisión de cierre (`docs/METODOLOGIA.md` §6), con dos revisores (§3), y con la app de referencia nativa corriendo sus escenarios contra un servidor local (§6 del plan de la fase).
 
 ---
 
 ## 1. Decisiones
 
-Las de la fase que implementa esta sub-fase: DC1, DC4 (la app de referencia), DC12 (el descarte a pedido), DC14 (los principios de la API: datos serializables, `watch` por id en el límite del Worker), DC15 (el dueño y el id de dispositivo), DC18 (la fachada llama a los métodos del núcleo y no expone `heartbeat`), DC24 (el modo `live` atado a los `watch`) y DC28 (el worker que arranca la fachada), con DC30 para el token. Esta sub-fase agrega:
+Las de la fase que implementa esta sub-fase: DC1, DC4 (la app de referencia), DC12 (el descarte a pedido), DC14 (los principios de la API: datos serializables, `watch` por id en el límite del Worker), DC15 (el dueño y el id de dispositivo), DC18 (la fachada llama a los métodos del núcleo y no expone `heartbeat`), DC24 (el modo `live` atado a los `watch`) y DC28 (el worker que arranca la fachada), con DC30 para el token. Esta sub-fase agrega las siguientes, que el dueño del proyecto adoptó el 7 de Noviembre de 2026, sin cambios:
 
 | ID | Decisión | Lotes | Estado |
 |---|---|---|---|
-| **DC32** | La forma de la fachada: los handles, las filas y las claves por nombre, las lecturas locales, el orden de una escritura y los errores | 2, 3 (y los errores de 4, 5 y 8) | Propuesta (6 de Noviembre de 2026) |
-| **DC33** | El dueño completado por el SDK y el pre-chequeo, con `StorageEngine::check_operation` | 1, 3, 4 | Propuesta (6 de Noviembre de 2026) |
-| **DC34** | El cifrado de columnas: los datos adicionales con la sala, `NULL` cifrado y el texto descifrado validado | 5 | Propuesta (6 de Noviembre de 2026) |
-| **DC35** | `watch`: el aviso del aplicador, una marca por suscripción y el valor recalculado al leerse | 6 | Propuesta (6 de Noviembre de 2026) |
-| **DC36** | La fachada con el worker: el modo de frescura, `live` mientras haya un `watch`, `sync`, `Offline` y el primer token (precisa DC24) | 8 | Propuesta (6 de Noviembre de 2026) |
-| **DC37** | Descartar a pedido de la aplicación: `discard_room`, en cualquier estado de la sala | 7 | Propuesta (6 de Noviembre de 2026) |
+| **DC32** | La forma de la fachada: los handles, las filas y las claves por nombre, las lecturas locales, el orden de una escritura y los errores | 2, 3 (y los errores de 4, 5 y 8) | Adoptada (7 de Noviembre de 2026) |
+| **DC33** | El dueño completado por el SDK y el pre-chequeo, con `StorageEngine::check_operation` | 1, 3, 4 | Adoptada (7 de Noviembre de 2026) |
+| **DC34** | El cifrado de columnas: los datos adicionales con la sala, `NULL` cifrado y el texto descifrado validado | 5 | Adoptada (7 de Noviembre de 2026) |
+| **DC35** | `watch`: el aviso del aplicador, una marca por suscripción y el valor recalculado al leerse | 6 | Adoptada (7 de Noviembre de 2026) |
+| **DC36** | La fachada con el worker: el modo de frescura, `live` mientras haya un `watch`, `sync`, `Offline` y el primer token (precisa DC24) | 8 | Adoptada (7 de Noviembre de 2026) |
+| **DC37** | Descartar a pedido de la aplicación: `discard_room`, en cualquier estado de la sala | 7 | Adoptada (7 de Noviembre de 2026) |
 
 ### DC32 · La forma de la fachada
 - **Dónde.** Módulos nuevos (`src/api/`: el cliente, la sala, la tabla, las filas y los errores locales), sobre el `Client` del núcleo, que no cambia de forma: sus métodos siguen públicos como API de bajo nivel (DC18), y `Client::write` manda la operación tal como la arma quien la llama, sin el dueño, el cifrado ni la validación de la fachada (el servidor verifica igual el dueño y los tipos, INV-A5). El núcleo suma, `pub(crate)`, lo que la fachada lee de adentro: el esquema de una réplica abierta, el motor y el estado de la conexión (DC36).
@@ -225,6 +225,7 @@ Depende de los Lotes 3, 4 y 7 de 4.3 (el `TokenProvider`, el worker y su estado,
   - la versión 18 de `INVARIANTES.md`: la 17 la tomó el Lote 6 de la Fase 3.12, en paralelo;
   - los ajustes de INV-K4, K7 y K17 y las notas en DC14, DC22, DC28 y DC29 no estaban en la lista inicial: salieron de la revisión.
 - **Chequeos:** el lote solo toca documentos, así que los de código no cambian; `git diff --check` limpio, y las listas de lotes e invariantes, verificadas con un script.
+- **Las Propuestas:** el dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre de 2026, sin cambios.
 
 ### Lote 1 · `check_operation` (`zemdb-storage`) · ⬜
 **Objetivo:** que el pre-chequeo del SDK pregunte al storage qué decidiría la réplica, con la misma regla que aplica el log (DC33).
@@ -458,4 +459,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** plan escrito el 6 de Noviembre de 2026, con DC32 a DC37 *Propuestas*. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su tercera ronda. Lo que sigue: la confirmación de DC32 a DC37 por el dueño del proyecto, y después el Lote 1.
+**Avance:** plan escrito el 6 de Noviembre de 2026, con DC32 a DC37 *Propuestas*. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre, sin cambios. Lo que sigue es el Lote 1.
