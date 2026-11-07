@@ -2,7 +2,7 @@
 
 **Fecha:** 4 de Noviembre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su quinta ronda. El dueño del proyecto adoptó el mismo día las precisiones de DC18 y de DC24 a DC26 y las decisiones DC27 a DC31 (DC27, con la condición de S4), con dos ajustes: DC26 dice explícitamente que, en el camino normal, un `ops` se aplica sin ningún `/sync`, y la verificación del `ClientId` de un token renovado pasa de 4.4 al Lote 3 (DC30). Lo que sigue es el Lote 1.
+**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su quinta ronda. El dueño del proyecto adoptó el mismo día las precisiones de DC18 y de DC24 a DC26 y las decisiones DC27 a DC31 (DC27, con la condición de S4), con dos ajustes: DC26 dice explícitamente que, en el camino normal, un `ops` se aplica sin ningún `/sync`, y la verificación del `ClientId` de un token renovado pasa de 4.4 al Lote 3 (DC30). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026, con S4 respondido y la revisión de delta en verde en su cuarta ronda. Lo que sigue es el Lote 2.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.3. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Parte de:** el SSE del servidor, del Lote 5 de la [Fase 3.12](2026-11-fase3_12-rendimiento-servidor.md) (`2c0a908`): el evento `ops` con la encarnación de la sala, el stream que termina cuando vence su token y `EventsDisabled` (`ARCHITECTURE.md` §7.2).
@@ -25,7 +25,7 @@ Las de la fase que implementa esta sub-fase: DC6 (la fila de `Unauthorized` de l
 
 | ID | Decisión | Lotes | Estado |
 |---|---|---|---|
-| **DC27** | El transporte nativo: `reqwest`, plazos que no cortan un pedido que avanza, el tope de lo que lee, el stream por su propia conexión y su parser en el núcleo | 1, 2 | Adoptada (6 de Noviembre de 2026), con la condición de S4 |
+| **DC27** | El transporte nativo: `reqwest`, plazos que no cortan un pedido que avanza, el tope de lo que lee, el stream por su propia conexión y su parser en el núcleo | 1, 2 | Adoptada (6 de Noviembre de 2026); S4, respondido en el Lote 1 (macOS y Windows, con su CI) |
 | **DC28** | El `SyncWorker`: una tarea por sala, a pedido, cuyo heartbeat no espera las transferencias | 4 a 6 | Adoptada (6 de Noviembre de 2026) |
 | **DC29** | Qué detiene a una sala: solo `FailedClosed` y `RoomClosed` | 3, 4, 7 y 8 | Adoptada (6 de Noviembre de 2026) |
 | **DC30** | La renovación del token, con un `TokenProvider` de la aplicación, y la verificación del `ClientId` del token renovado | 3, 7 | Adoptada (6 de Noviembre de 2026) |
@@ -71,6 +71,11 @@ Las de la fase que implementa esta sub-fase: DC6 (la fila de `Unauthorized` de l
 - **El stream va por su propia conexión,** con HTTP/1.1 (un cliente HTTP aparte del de los pedidos), sin plazo total: el de inactividad lo pone el worker (DC26). Con HTTP/2, los streams y los pedidos compartirían una conexión: el servidor acepta 32 streams a la vez por conexión (los proxies tienen su propio tope), así que muchas salas en `live` dejarían esperando a los heartbeats y a los commits; y un stream que no se lee durante 60 s con datos pendientes hace que el servidor cierre su conexión entera, con los pedidos en vuelo de todas las salas, que quedarían inciertos. El costo es una conexión por sala en `live`.
 - **El núcleo parsea el SSE** (las líneas, `event:`, `data:`, los comentarios y la línea en blanco que cierra un evento), con un tope de 64 KiB por evento (un `ops` ocupa hasta unos 5,5 KiB). Un evento o una línea más largos, o bytes que no son UTF-8, cierran el stream: el worker abre otro y sincroniza. Un solo parser para todos los transportes: el del navegador (4.5) entrega los mismos bytes (con `fetch` y el cuerpo en streaming, que además manda el token en el header) o los rearma desde `EventSource`; lo decide su plan.
 - **S4** (`docs/METODOLOGIA.md` §3), al arrancar el Lote 1, antes de su código: ¿compila `reqwest` 0.13 (con `rustls` sobre `aws-lc-rs`, su opción por defecto, y `http2`) en Linux con el MSRV del workspace (Rust 1.85: el job de MSRV construye `--workspace --lib --bins`), sin tocar la compilación a wasm32 de `zemdb-core`, `zemdb-storage` y `zemdb-client`, y cuánto suma al tiempo de compilación? ¿Cómo se arma con su API el plazo de inactividad, al recibir (`read_timeout`) y al mandar el cuerpo de un pedido, sin un plazo total? ¿Qué hace su cliente HTTP/2 cuando una conexión llega a su tope de streams: espera o abre otra? macOS y Windows los responde la CI del Lote 1; si `aws-lc-rs` no compila en alguno, la alternativa es `rustls-no-provider` con `ring`. `reqwest` 0.13.5 declara `rust-version = 1.85.0`.
+- **S4, respuesta** (6 de Noviembre de 2026, Linux x86_64 con 4 núcleos; el código del spike no se mergea):
+  - *Compila,* `reqwest` 0.13.5 con `rustls` sobre `aws-lc-rs` (`aws-lc-sys` 0.47, con `cc`, sin `cmake`) y `http2`, con Rust 1.85, una vez que el lock elige versiones que compilan con 1.85: la resolución del workspace pasa a `resolver = "3"` (elige las versiones que compilan con la `rust-version` declarada), el lock baja `idna_adapter` a 1.2.1 y los `icu_*` a 2.1 (la 1.2.2 y las 2.3 piden Rust 1.86 y 1.88; ya estaban en el lock por el `reqwest` 0.12 de los tests del servidor) y sube `yoke` y `zerovec` (con sus *derive*) a 0.8.4 y 0.11.9 (las 0.8.3 y 0.11.8 no declaran versión y no compilan con 1.85). wasm32 no cambia: `reqwest` es una dependencia solo fuera de wasm32. En frío y en debug, su árbol suma unos 20 s con 4 núcleos (`aws-lc-sys`, 14 s, en paralelo con lo demás). macOS y Windows, en la CI del lote.
+  - *El plazo de inactividad.* `read_timeout` se reinicia con cada lectura del cuerpo de la respuesta, pero hasta los headers es un solo reloj desde que sale el pedido: corta una subida lenta que avanza (medido: un cuerpo de 8 MiB que el servidor lee a unos 640 KiB/s, cortado al segundo con `read_timeout` de 1 s). Así que el transporte no usa `read_timeout` ni `timeout`: lleva su propio reloj, que avanza con cada pedazo del cuerpo que toma la capa HTTP (de 16 KiB) y con cada pedazo de la respuesta que llega. Lo que la capa HTTP ya tomó queda en sus búferes y en los del sistema, que el cliente no ve (`reqwest` no expone el socket; `TCP_NOTSENT_LOWAT` o un `SO_SNDBUF` fijo achicarían lo que no se ve, pero piden un conector propio): TCP agranda el de envío con la ventana del camino, chico en un enlace lento y de unos MiB después de uno rápido (en Linux, hasta 4 MiB, que vuelve a aceptar datos cuando salió un tercio; en loopback, donde el MSS es de 64 KiB, el último pedazo de un cuerpo de 8 MiB leído a unos 640 KiB/s se tomó 9 s antes de los headers). La espera de la respuesta cuenta desde el último pedazo tomado, así que lo que quedó en esos búferes tiene que salir dentro del plazo: con HTTP/1.1, el socket y hasta 256 KiB de hyper (después de un camino rápido, con 4 MiB, un cuerpo que sale a menos de unos 72 KiB/s puede cortarse avanzando; en el medio del cuerpo, con el socket que suelta de a un tercio, a menos de unos 22 KiB/s); con HTTP/2, a lo sumo la ventana que da el par (1 MiB el servidor de ZemDB, unos 17 KiB/s; medido: los headers llegaron 1,5 s después del último pedazo de una subida de 4 MiB a 512 KiB/s, contra 6 s con HTTP/1.1), o, detrás de un proxy con ventanas grandes, el socket y hasta 1 MiB por stream, con lo de los demás pedidos de la conexión. Queda como límite aceptado en INV-K7. Además, `reqwest` pone por defecto *keep-alive* de TCP (a los 15 s, con 3 sondas donde el sistema lo deja fijar, no en Windows) y, en Linux, `TCP_USER_TIMEOUT` de 30 s (cierra una conexión cuyos datos enviados no se confirman en ese tiempo).
+  - *HTTP/2 con su tope de streams* espera en la misma conexión, sin abrir otra (medido: 6 pedidos de 1 s con un tope de 2 tardan 3 s, en una conexión). Un pedido que espera un stream libre no avanza, y el reloj lo cuenta: con 32 pedidos en vuelo que no terminan en 60 s, el siguiente se corta (y se reintenta). Confirma el stream por su propia conexión HTTP/1.1.
+  - *Conclusión:* la condición se cumple con `aws-lc-rs`, y el plazo de inactividad lo arma el transporte. Además de lo de arriba, el transporte no sigue redirecciones (un `POST` redirigido no llegaría como frame), rechaza una URL con usuario (que `reqwest` mandaría como un segundo `Authorization`), aplica el *prior knowledge* solo con `http://`, pasa a un cliente HTTP nuevo, con conexiones nuevas, después de un pedido que corta por no avanzar (con HTTP/2, un pedido cortado no cierra su conexión, y una que deja de responder no se soltaría mientras lleguen pedidos; el cliente nuevo se arma de a uno, en el pool bloqueante, porque en Linux lee los certificados de la plataforma, en una tarea propia que no cancela quien deja de esperar, y no se arma después de un pedido que quien llama suelta antes), y usa los certificados de la plataforma y el proxy de las variables de entorno (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`; sin la feature `system-proxy` de `reqwest`, no el configurado en macOS o Windows). Lo de la URL, el *prior knowledge* y el cliente nuevo salió de la revisión de delta del lote; los pings de HTTP/2 se descartaron, porque un ping sale detrás de lo que hay en vuelo y un `WINDOW_UPDATE` no cuenta para hyper como respuesta, así que cortaban una subida lenta que avanza, con la conexión entera.
 - **Alternativas descartadas:** `hyper` directo (el pool, HTTP/2 y TLS a mano); `reqwest-eventsource` o `eventsource-stream` (sin tope por evento, y el navegador tendría otro parser); un parser del SSE en cada transporte (dos parsers, y dos superficies de fuzzing); los streams por HTTP/2, en la conexión de los pedidos (el tope de streams y el cierre de toda la conexión por un stream trabado, arriba).
 
 ### DC28 · El `SyncWorker`
@@ -132,7 +137,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 | Orden | Lote | Crates | Decisiones | Invariantes | Progreso |
 |---|---|---|---|---|---|
 | 0 | Contrato | Documentos | DC18, DC24 a DC31 | Nueva: K17. Ajustes: K1, K2, K5, K6, K7, K11, K12, K15 y §2 | ✅ |
-| 1 | El transporte HTTP nativo | client | DC27 | K12, K7 | ⬜ |
+| 1 | El transporte HTTP nativo | client | DC27 | K12, K7 | ✅ |
 | 2 | El stream de eventos: el transporte y el parser | client | DC27 | K12, K15, K7 | ⬜ |
 | 3 | La renovación del token | client | DC30, DC29 | K2, K17 | ⬜ |
 | 4 | El worker: la tarea, el heartbeat y las transferencias | client | DC28, DC29 | K7, K15, K17 | ⬜ |
@@ -234,7 +239,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
   - INV-K7 suma un límite aceptado (las velocidades mínimas de una subida, que ya enunciaba INV-B2).
 - **Las Propuestas:** el dueño del proyecto las adoptó el 6 de Noviembre de 2026, con dos ajustes: DC26 dice explícitamente que, en el camino normal, un `ops` se aplica sin `/sync`, y la verificación del `ClientId` de un token renovado pasa de 4.4 al Lote 3 (DC30).
 
-### Lote 1 · El transporte HTTP nativo (`zemdb-client`) · ⬜
+### Lote 1 · El transporte HTTP nativo (`zemdb-client`) · ✅ Hecho
 **Objetivo:** que el núcleo hable con un servidor real por HTTP, sin leer de más y sin cortar un pedido que avanza (DC27, DEF-195).
 
 **Archivos:** `crates/client/Cargo.toml` (la feature `native`, por defecto, con `reqwest`), `src/` (un módulo del transporte HTTP y `lib.rs`), y sus tests (`tests/http_transport_tests.rs`, con el servidor en un socket local). `ARCHITECTURE.md` §11 (*Transport*).
@@ -253,6 +258,133 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 
 **Entrega:** `feat(client): the native HTTP transport, over reqwest (Fase 4.3, Lote 1)`.
 
+**Hecho** (7 de Noviembre de 2026).
+- **Qué entró.**
+  - `HttpTransport` y `HttpTransportConfig`, en `src/http_transport.rs`, detrás de la feature `native` (por defecto): `reqwest` 0.13.5, con `rustls` y `http2`, y `http-body`, solo fuera de wasm32.
+  - `send` hace el `POST` del frame con `Authorization: Bearer` y `Content-Type: application/octet-stream`, y devuelve el cuerpo sea cual sea el estado HTTP.
+    - No sigue redirecciones.
+    - Lee hasta `MAX_FRAME_SIZE`: si el `Content-Length` anuncia más, falla antes de leer; sin `Content-Length`, falla en cuanto lo pasa, sin leer el resto. Lo que anuncia el `Content-Length` lo reserva con `try_reserve_exact`.
+  - Los plazos:
+    - conectar, 10 s;
+    - inactividad, 60 s, con un reloj propio que avanza con cada pedazo de 16 KiB del cuerpo que toma la capa HTTP y con cada pedazo de la respuesta que llega;
+    - sin plazo total.
+  - El pool retiene una conexión ociosa 5 s, con un máximo de 300 s.
+  - Después de un pedido que el transporte corta por no avanzar, pasa a un cliente HTTP nuevo, con conexiones nuevas, para los pedidos que siguen: con HTTP/2, el corte no cierra la conexión, y una que deja de responder no se soltaría mientras lleguen pedidos. No pasa después de un pedido que quien llama suelta antes.
+    - El cliente nuevo se arma en el pool bloqueante (en Linux, lee los certificados de la plataforma), fuera del lock y de a uno, con un guard, en una tarea propia que no cancela quien deja de esperar.
+    - Una generación evita reemplazar un cliente que ya es nuevo.
+    - Si el armado falla, queda el actual hasta el próximo corte.
+  - El prior knowledge de HTTP/2 se aplica solo con `http://`.
+  - Es `Config`:
+    - una URL que no es `http(s)://` o que tiene usuario, query o fragmento;
+    - un plazo en cero;
+    - un pool de más de 300 s (hyper-util entra en pánico en segundo plano con `Duration::MAX`);
+    - un cliente HTTP que no arranca, también con `http://`, con su causa (en Linux, por ejemplo, sin certificados de la plataforma).
+  - Unas 260 líneas de producción, sin comentarios ni líneas vacías (se estimaron 150).
+- **Tests.**
+  - `tests/http_transport_tests.rs`: 21 tests contra el servidor en un socket local, detrás de un frente TCP que reenvía, guarda los primeros bytes de cada conexión y puede callarse, y contra servidores mínimos del test.
+    - Un cliente del núcleo abre la sala, escribe, sincroniza la escritura de otro y manda un heartbeat, por HTTP/1.1 y por HTTP/2, con la versión confirmada por el frente.
+    - `Unauthorized` y `Forbidden` llegan como frames, por las dos versiones.
+    - Una respuesta lenta y una subida lenta terminan aunque duran más de 3 y de 2 veces el plazo.
+    - Una respuesta más larga que un frame, por su `Content-Length` o sin él, es un error sin leerla entera; una de exactamente un frame se lee entera.
+    - Un servidor que calla antes de los headers, en medio de la respuesta o al recibir el cuerpo corta el pedido en el plazo.
+    - Un puerto cerrado es un error.
+    - Una escritura con el servidor callado queda `OutcomeUnknown`.
+    - Una conexión ociosa más que el pool no se reusa, y dos pedidos seguidos comparten una.
+    - Después de un pedido que corta el transporte en una conexión HTTP/2 que deja de responder, el pedido siguiente va por otra conexión, aunque los pedidos sigan llegando. Lo hace dos veces seguidas, con un frente que congela las conexiones abiertas.
+    - Después de una respuesta HTTP/2 que se calla a la mitad, el pedido siguiente va por otra conexión: con un servidor axum por h2c.
+    - Una subida lenta por HTTP/2 no se corta: contra el servidor, con un frente que lleva los primeros 3 MiB a 1 MiB/s, con un horario fijo para que no lo frene un temporizador grueso, y un plazo de 750 ms. También pasa con un temporizador que imita el de Windows.
+    - Con `https://`, el handshake de TLS ofrece h2 y http/1.1, también con prior knowledge.
+    - Una configuración que no puede funcionar es `Config`.
+    - Una URL con camino lleva los endpoints debajo, con el token y el `Content-Type`.
+    - Una redirección no se sigue.
+  - `src/tests/http_transport.rs`: 4 unitarios con el reloj pausado.
+    - Un pedido que avanza no se corta nunca.
+    - Uno que deja de avanzar se corta un plazo después de su último avance.
+    - Uno que nunca avanza se corta un plazo después de empezar.
+    - El cuerpo se entrega en pedazos, y cada uno cuenta como avance, con el largo exacto.
+- **Mutaciones inversas: las 29 las mató algún test.**
+  - Los dos topes de la respuesta, y sus bordes `>=`.
+  - El reloj del pedido.
+  - El avance por pedazo del cuerpo, en el test de integración y en el unitario.
+  - El plazo por pedazo de la respuesta.
+  - Agregar un plazo total.
+  - El pool.
+  - El prior knowledge, y aplicarlo también con `https`.
+  - No seguir redirecciones.
+  - El esquema, el usuario, y la query o el fragmento de la URL.
+  - El cero de cada plazo.
+  - La barra final de la URL.
+  - El `Content-Type` y el bearer.
+  - El largo exacto del cuerpo.
+  - El reloj medido desde el último avance.
+  - Pasar a un cliente nuevo después de un corte, en el pedido o en la respuesta.
+  - Soltar la marca de que se está armando un cliente nuevo.
+  - Volver a poner los pings de HTTP/2.
+  - El tope del pool.
+  - La feature `rustls`.
+
+  Quedan sin test, con su argumento:
+  - `connect_timeout`: haría falta una dirección que descarte los SYN, y eso no es portable en la CI. Igual cubre la conexión el reloj de inactividad.
+  - `try_reserve_exact`: haría falta quedarse sin memoria.
+  - El proxy del entorno: las variables de entorno son globales al proceso, y los tests corren en paralelo.
+  - La segunda comprobación de la generación, después del armado: con un solo armado a la vez, solo cubre una carrera angosta entre la primera comprobación y la marca, en la que otro corte termina su reemplazo en el medio. Sin ella, se reemplazaría un cliente recién armado, y eso cuesta un armado y nada más.
+- **Interacciones revisadas.**
+  - El `header_read_timeout_secs` del servidor y el pool: el pool retiene la conexión menos tiempo, 5 s contra 10 s. Hay test; el test cuenta solo las conexiones que llevan bytes, porque hyper-util abre una conexión en paralelo al `checkout` y a veces la cierra sin usarla.
+  - El *stall timeout* y el plazo del cuerpo del servidor, contra los del cliente: el plazo de inactividad del cliente es igual al stall del servidor, y un cuerpo más lento que el mínimo del servidor lo corta el servidor con su 408, que llega como frame.
+  - La cola de los búferes contra la espera de los headers: queda documentada como límite aceptado de INV-K7.
+  - El tope de conexiones del servidor.
+    - Con HTTP/1.1, una conexión por pedido concurrente, que el pool suelta a los 5 s.
+    - Con HTTP/2, una por host mientras se use dentro del plazo del pool. Un pedido espera un stream libre (S4), y una conexión que deja de responder se deja para el pedido siguiente (hay test).
+  - El presupuesto de respuestas: un 503 llega como frame, por el mismo camino que el 401 y el 403 del test de errores.
+  - `TransportError` en cada paso del núcleo: en el núcleo solo se prueba el caso del servidor callado (la escritura incierta). Para los demás alcanza con que el núcleo trata igual todo `TransportError`, lo que ya se probó en 4.2 con el transporte de prueba.
+  - Con HTTP/2, los pedidos de todas las salas comparten la conexión. Un heartbeat espera en el cable detrás de los bytes de una transferencia, y un corte de la conexión deja inciertos los pedidos de todas. Va a las interacciones del Lote 4, contra el *lease*.
+  - El `write_timeout` de 30 s del núcleo es menor que el plazo de 60 s: en un commit corta primero el plazo de la escritura, que suelta el pedido, y eso no hace pasar a un cliente nuevo. Los demás pasos no tienen plazo en el núcleo, así que los acota el del transporte, y el heartbeat del worker es el que deja atrás una conexión HTTP/2 trabada. Va a las interacciones del Lote 4, con un test.
+  - Con HTTP/1.1, el corte de un pedido cierra su conexión (hyper); el cliente nuevo cuesta solo las conexiones ociosas del pool.
+  - El armado de un cliente lee los certificados de la plataforma (unos 16 ms en Linux): va al pool bloqueante, uno a la vez y a lo sumo uno por plazo.
+  - Un corte que llega mientras se arma el cliente nuevo no lo espera, así que el pedido que le sigue puede salir todavía por el viejo. Lo reintentan el núcleo y el worker, con backoff, y en el peor caso espera otro plazo.
+  - Con `rustls-platform-verifier`, en Linux el armado del cliente lee los certificados (unos 10 a 16 ms): `new` lo hace una vez, en el hilo que lo llama. En macOS y Windows, en cambio, el sistema verifica el certificado en cada handshake, con su revisión de revocación, que puede ir a la red dentro del `poll` del pedido. Es comportamiento de la dependencia, y queda para la revisión de cierre de 4.3.
+  - El cliente HTTP aparte del stream del Lote 2 no pasa a un cliente nuevo con los cortes de los pedidos. Está en las interacciones del Lote 2.
+  - El `deregister` se manda con el lock de registro tomado: es preexistente, y ahora un transporte trabado lo demora a lo sumo un plazo (antes, sin límite).
+  - `reqwest` pone por defecto keep-alive de TCP (a los 15 s, con 3 sondas salvo en Windows) y, en Linux, `TCP_USER_TIMEOUT` de 30 s. Está nombrado en ARCHITECTURE.
+  - Los tests van a `127.0.0.1`. En una máquina con `HTTP_PROXY` y sin `NO_PROXY` para loopback, pasarían por el proxy.
+  - La compilación a wasm32: el build y el clippy pasan, y `reqwest` no entra.
+  - El MSRV: `cargo +1.85 build --workspace --lib --bins` y `cargo +1.88 test --workspace --no-run` pasan con el lock nuevo.
+- **Revisión de delta, primera ronda: no verde.** Dos hallazgos Medios y cinco Bajos, todos arreglados en el lote:
+  - Medio: el test del pool fallaba de vez en cuando, por la carrera de hyper-util de arriba.
+  - Medio: el límite aceptado nuevo de INV-K7 prometía de más. Daba 22 KiB/s, el tercio del búfer en el medio del cuerpo, cuando lo que manda es la cola, unos 68 KiB/s con 4 MiB. Se corrigió en INVARIANTES, ARCHITECTURE y S4.
+  - Bajos: el prior knowledge con `https`; la URL con usuario; tests de los bordes de los topes y de TLS; la conexión HTTP/2 que deja de responder; los márgenes del test de la respuesta lenta.
+  - Notas: `try_reserve_exact`; el proxy del sistema en el texto de S4; el `write_timeout` y el `deregister` en las interacciones.
+- **Revisión de delta, segunda ronda: no verde.** Confirmó resueltos los hallazgos de la primera y encontró un Medio que traían los pings: en hyper, un ping sale detrás de lo que hay en vuelo, y un `WINDOW_UPDATE` no cuenta como respuesta, así que una subida lenta que avanza perdía la conexión entera, con los pedidos de todas las salas.
+  - Arreglo: sin pings, y con un cliente nuevo después de cada corte, que es su opción (a).
+  - Bajos: `Duration::MAX` en el pool hace entrar en pánico a hyper-util, y ahora el pool tiene un tope de 300 s. Las cifras de la cola ahora cuentan los búferes de hyper: unos 85 KiB/s.
+  - Notas: el proxy con `http://`, el keep-alive de TCP en todos los sistemas, el texto de la cabecera de `INVARIANTES.md` (hoy, la versión 19), la conexión compartida de HTTP/2 (que pasó al Lote 4), el ClientHello leído entero, y macOS y Windows en la fila de DC27.
+- **Revisión de delta, tercera ronda: no verde.** Confirmó resuelta la segunda, sin problemas de concurrencia en el cliente nuevo.
+  - Medio: el test de la subida lenta por HTTP/2 dependía del temporizador. Con el de Windows, de 15,6 ms por tic, el frente se frenaba y el test fallaba (reproducido imitándolo). Ahora el frente sigue un horario fijo, y el plazo es de 750 ms.
+  - Bajos:
+    - el cliente nuevo no llega cuando quien llama suelta el pedido: precisado en los documentos, y llevado al Lote 4;
+    - el armado del cliente bajo el lock, con E/S bloqueante: ahora va al pool bloqueante;
+    - el cliente nuevo después de un corte en la respuesta no tenía test: test nuevo.
+  - Notas:
+    - con HTTP/1.1, el corte cierra la conexión;
+    - con HTTP/2, la cola la acota la ventana del par;
+    - la conexión HTTP/2 se comparte solo dentro del plazo del pool;
+    - qué pasa si el armado falla;
+    - el keep-alive en Windows;
+    - el cliente del stream, en el Lote 2.
+
+    Todo se corrigió en ARCHITECTURE, K7, S4 y los Lotes 2 y 4.
+- **Revisión de delta, cuarta ronda: verde.** Confirmó resuelta la tercera. Sus Bajos y notas se arreglaron en el lote:
+  - Bajo: si quien llama soltaba el pedido mientras se armaba el cliente nuevo, el reemplazo se perdía (reproducido con 3 y 5 ms). Ahora el armado corre en una tarea propia; lo verifiqué a mano con 12 casos, soltando el pedido 2, 3 y 5 ms después del corte. Un corte durante el armado que no lo espera queda con su argumento, en las interacciones.
+  - Bajo: sin certificados de la plataforma, `new` fallaba también con `http://`, con un mensaje sin la causa. Ahora el `Config` lleva la cadena de causas, y el caso está documentado.
+  - Notas: que el armado lee certificados solo en Linux, y en macOS y Windows lo que se verifica en el handshake (en las interacciones); la redacción de K7; "over both versions" en ARCHITECTURE.
+- **Desvíos.**
+  - S4 cambió cómo se arma el plazo de inactividad: un reloj propio, en lugar de `read_timeout`. Lo que la capa HTTP ya tomó y queda en los búferes no se ve, y queda como límite aceptado en INV-K7, con la respuesta de S4 en DC27.
+  - `resolver = "3"` en el workspace, y versiones del lock que compilan con 1.85: `idna_adapter` 1.2.1, `icu_*` 2.1, `yoke` 0.8.4 y `zerovec` 0.11.9.
+  - En el lock quedan dos versiones de `reqwest`: la 0.12, de los tests del servidor, que no se tocan en este lote, y la 0.13, del cliente.
+  - El test de la subida lenta lee despacio solo mientras al cliente le queda más cuerpo que lo que guardan los búferes de loopback.
+  - No estaban en el plan y salieron de las revisiones: el cliente nuevo después de un corte (los pings de HTTP/2 se probaron y se descartaron), el rechazo de una URL con usuario, el prior knowledge solo con `http://` y el tope del pool.
+  - El chequeo de host de la URL se sacó: con `http` y `https`, el parser siempre exige un host.
+
 ### Lote 2 · El stream de eventos: el transporte y el parser (`zemdb-client`) · ⬜
 **Objetivo:** que el transporte abra el stream SSE por su propia conexión y que el núcleo lo lea sin pánicos ni reservas de más (DC27).
 
@@ -266,7 +398,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 - El parser (unitarios): un evento partido en cualquier punto entre bloques, varias líneas `data:`, `\r\n`, comentarios y campos desconocidos; los seis eventos del servidor y uno de nombre desconocido.
 - Negativos: un evento o una línea de más de 64 KiB, bytes que no son UTF-8, base64 inválido, y un frame que no decodifica o que es de otro mensaje son un error tipado, sin pánico; el fuzzing con bytes al azar y eventos dañados, en su versión corta y en la larga.
 
-**Interacciones a revisar:** el keep-alive del servidor, cada 15 s; el tope del evento del servidor (4 KiB de frame); el estado HTTP y el `Content-Type` del stream y de sus errores; el tope de streams por cliente (el tercero cierra el más viejo) y el total del servidor (`max_sse_streams`, la mitad de las conexiones); el *stall timeout*, que cierra la conexión de un stream que no se lee; el corte del stream en el apagado del servidor.
+**Interacciones a revisar:** el keep-alive del servidor, cada 15 s; el cliente HTTP aparte del stream, que no pasa a un cliente nuevo con los cortes de los pedidos (Lote 1); el tope del evento del servidor (4 KiB de frame); el estado HTTP y el `Content-Type` del stream y de sus errores; el tope de streams por cliente (el tercero cierra el más viejo) y el total del servidor (`max_sse_streams`, la mitad de las conexiones); el *stall timeout*, que cierra la conexión de un stream que no se lee; el corte del stream en el apagado del servidor.
 
 **Documentos:** `ARCHITECTURE.md` §11; `INVARIANTES.md`: K12, K15, K7.
 
@@ -308,7 +440,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 - Una configuración con un intervalo de heartbeat en cero o de 60 s o más, un backoff que empieza en cero o cuyo máximo es menor que su base, o un `events_retry` en cero, es `Config` al abrir el cliente.
 - `status` da el modo y el estado de la conexión, que pasa a falso con un pedido sin respuesta y vuelve a verdadero con el siguiente que la tiene; y responde `RoomClosed` para una sala vacía, sin que eso detenga a su worker.
 
-**Interacciones a revisar:** las escrituras, que hacen sus propios heartbeats; el `heartbeat` público que la aplicación llama a la vez; el lock de las transferencias; la designación y su plazo de 60 s en el servidor; el registro que hace el worker (el lock de los registros); un descarte en curso; el reloj pausado y las tareas de `spawn_blocking` del storage.
+**Interacciones a revisar:** las escrituras, que hacen sus propios heartbeats; el `heartbeat` público que la aplicación llama a la vez; el lock de las transferencias; la designación y su plazo de 60 s en el servidor; el registro que hace el worker (el lock de los registros); un descarte en curso; el reloj pausado y las tareas de `spawn_blocking` del storage; con HTTP/2, los pedidos de todas las salas comparten una conexión (de la revisión de delta del Lote 1): un heartbeat no espera a una transferencia en su tarea, pero sí en el cable, detrás de los bytes que ella ya entregó, contra el *lease* del servidor (si empieza dentro del plazo del pool desde el pedido anterior; si no, abre otra conexión). Y los heartbeats del worker, que el núcleo no corta, son los que hacen pasar al transporte a un cliente nuevo cuando la conexión HTTP/2 deja de responder: las escrituras la sueltan al vencer su plazo (30 s), antes que el del transporte (60 s), y eso no cambia el cliente; con un test.
 
 **Documentos:** `ARCHITECTURE.md` §11; `INVARIANTES.md`: K7, K15, K17.
 
@@ -446,4 +578,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** plan escrito el 4 de Noviembre de 2026. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su quinta ronda: las precisiones de DC18 y de DC24 a DC26 y DC27 a DC31, como *Propuestas*, y `INVARIANTES.md` en la versión 16. El dueño del proyecto las adoptó el mismo día, con dos ajustes (la frase de DC26 sobre el camino normal sin `/sync` y la verificación del `ClientId` en el Lote 3). Lo que sigue es el Lote 1, que arranca por S4.
+**Avance:** plan escrito el 4 de Noviembre de 2026. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su quinta ronda: las precisiones de DC18 y de DC24 a DC26 y DC27 a DC31, como *Propuestas*, y `INVARIANTES.md` en la versión 16. El dueño del proyecto las adoptó el mismo día, con dos ajustes (la frase de DC26 sobre el camino normal sin `/sync` y la verificación del `ClientId` en el Lote 3). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026: S4 respondido en DC27 (compila con `aws-lc-rs` y el MSRV; el plazo de inactividad lo arma el transporte), la revisión de delta en verde en su cuarta ronda e `INVARIANTES.md` en la versión 19 (la 18 la tomó el Lote 0 de 4.4). Lo que sigue es el Lote 2.

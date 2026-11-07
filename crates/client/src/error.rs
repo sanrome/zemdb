@@ -8,8 +8,9 @@ use zemdb_storage::{RejectReason, StorageError};
 pub enum ClientError {
     /// The configuration cannot work: a person that is empty, holds `#` or does not make a
     /// valid client id, a backoff that starts at zero or whose longest delay is shorter, a
-    /// write timeout beyond the clock, or a snapshot larger than `max_snapshot_bytes` or that
-    /// does not fit in memory.
+    /// write timeout beyond the clock, a snapshot larger than `max_snapshot_bytes` or that
+    /// does not fit in memory, or an HTTP transport whose URL or timeouts cannot work or whose
+    /// HTTP client does not start.
     #[error("Invalid configuration: {0}")]
     Config(String),
 

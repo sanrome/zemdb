@@ -8,6 +8,11 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["native"]
+# The transport over HTTP (`HttpTransport`), with `reqwest`, outside WebAssembly.
+native = ["dep:reqwest", "dep:http-body"]
+
 # The core uses Tokio's tasks and the native file layer: in WebAssembly the crate is empty.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zemdb-core = { workspace = true }
@@ -15,6 +20,8 @@ zemdb-storage = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 crc32fast = { workspace = true }
+http-body = { workspace = true, optional = true }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "http2"], optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

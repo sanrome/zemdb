@@ -1,5 +1,6 @@
 [workspace]
-resolver = "2"
+# Resolution prefers the versions that build with the declared rust-version.
+resolver = "3"
 members = [
     "crates/core",
     "crates/server",

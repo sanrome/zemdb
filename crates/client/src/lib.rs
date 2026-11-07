@@ -8,11 +8,15 @@
 mod client;
 mod config;
 mod error;
+#[cfg(feature = "native")]
+mod http_transport;
 mod metadata;
 mod transport;
 
 pub use client::{Client, RoomStatus};
 pub use config::ClientConfig;
 pub use error::{ClientError, Violation};
+#[cfg(feature = "native")]
+pub use http_transport::{HttpTransport, HttpTransportConfig};
 pub use metadata::{FileMetadata, MemoryMetadata, MetadataStore, RoomMetadata};
 pub use transport::{endpoint, TransportClient, TransportError};
