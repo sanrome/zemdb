@@ -2980,6 +2980,101 @@ fn a_read_ends_where_the_reservation_of_its_response_runs_out() {
     );
 }
 
+/// A read whose operations fit in what it reserves at a time takes from the budget of response
+/// bytes in flight once, from the disk tiers and from RAM alike, and ends with the reservation
+/// it had growing once per operation: what its operations take in the response.
+#[test]
+fn a_read_whose_operations_fit_in_a_chunk_takes_from_the_budget_once() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 5,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    append_plain(&mut log, 1, 12);
+    assert_eq!(log.hot_buffer.min_seq(), Some(SequenceNumber::new(8)));
+
+    // From the sealed segments on into RAM, and from RAM.
+    for from in [0, 7] {
+        let (budget, mut reservation) = reservation_in(u64::from(u32::MAX));
+        let takes = budget.takes();
+        let (ops, has_more) = log
+            .fetch_deltas(SequenceNumber::new(from), 100, Some(&mut reservation))
+            .unwrap();
+        assert_contiguous(&ops, from + 1, 12);
+        assert!(!has_more);
+        assert_eq!(budget.takes() - takes, 1, "from {from}");
+        assert_eq!(
+            budget.reserved().0,
+            in_response(from + 1, 12),
+            "from {from}"
+        );
+    }
+}
+
+/// What a read reserved ahead goes back to the budget when the read ends with an error too:
+/// its response keeps what the operations it read before the error take, as with no chunks.
+#[test]
+fn what_a_read_reserved_ahead_goes_back_when_it_fails_on_disk() {
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 5,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    append_plain(&mut log, 1, 12);
+    let second = segment_file(&segments_dir(dir.path()), 6, 10, "wal");
+    assert!(second.exists());
+
+    let (budget, mut reservation) = reservation_in(u64::from(u32::MAX));
+    crate::fail_point::arm("open_segment", &second);
+    let read = log.fetch_deltas(SequenceNumber::new(0), 100, Some(&mut reservation));
+    assert!(read.is_err(), "the read of 6..=10 fails");
+    assert_eq!(budget.reserved().0, in_response(1, 5));
+}
+
+/// Operations of a few bytes to 8 MiB over the cold, warm and RAM tiers: whatever the cursor,
+/// what a read of the log returns takes at most `MAX_RESPONSE_OPS_BYTES` encoded, or is a single
+/// operation, so a response needs no second measurement of what it carries.
+#[test]
+fn what_a_read_returns_fits_in_a_response_once_encoded() {
+    const SIZES_KIB: [usize; 12] = [
+        7_900, 1, 8_100, 5_300, 3, 5_100, 6_000, 1, 5_400, 8_000, 2, 7_000,
+    ];
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 2,
+        ram_max_bytes: MAX_LOG_BYTES_LIMIT,
+        warm_disk_ttl: Duration::ZERO,
+        ..RoomLifecyclePolicy::default()
+    };
+    let (mut log, _) = TieredLog::open_or_create(dir.path(), policy).unwrap();
+    for (seq, kib) in (1..).zip(SIZES_KIB) {
+        log.append(large_op(seq, kib * KIB), None).unwrap();
+        if seq == 6 {
+            log.run_maintenance().unwrap();
+        }
+    }
+    assert!(count_in(&log, Tier::Cold) > 0 && count_in(&log, Tier::Warm) > 0);
+    assert!(!log.hot_buffer.is_empty());
+
+    for from in 0..SIZES_KIB.len() as u64 {
+        let (_budget, mut reservation) = reservation_in(u64::from(u32::MAX));
+        let (ops, _) = log
+            .fetch_deltas(SequenceNumber::new(from), 100, Some(&mut reservation))
+            .unwrap();
+        let encoded: u64 = ops
+            .iter()
+            .map(|op| zemdb_core::protocol::codec::encoded_len(op).unwrap())
+            .sum();
+        assert!(
+            encoded <= MAX_RESPONSE_OPS_BYTES || ops.len() == 1,
+            "from {from}: {} operations, {encoded} bytes",
+            ops.len()
+        );
+    }
+}
+
 /// The records `first..=last`, each with the mutation id `mutation_for(seq)`.
 fn group_of(first: u64, last: u64) -> Vec<(Arc<SequencedOperation>, Option<MutationId>)> {
     group_of_ops(first, last, make_op)

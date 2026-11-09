@@ -3,7 +3,7 @@ use zemdb_core::protocol::codec::encoded_len;
 use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::value::Value;
 
-use crate::response_budget::Reservation;
+use crate::response_budget::{ReadReservation, Reservation};
 
 /// What `op` is charged against a read budget and the RAM window: its encoded size, or what
 /// its values take in memory if that is more (a `Null` takes 1 byte on the wire and 24 in
@@ -65,9 +65,9 @@ pub struct ReadBudget<'r> {
     exhausted: bool,
     /// The operations and bytes a window keeps ([`window`](Self::window)).
     window: Option<(usize, u64)>,
-    /// The reservation of the response the read builds, which grows by what each operation
-    /// admitted takes in it ([`OpSize::in_response`]).
-    reservation: Option<&'r mut Reservation>,
+    /// The reservation of the response the read builds, from which each operation admitted
+    /// takes what it takes in the response ([`OpSize::in_response`]).
+    reservation: Option<ReadReservation<'r>>,
     /// Whether the reservation had no room for an operation, which ended the read.
     out_of_room: bool,
 }
@@ -95,10 +95,12 @@ impl<'r> ReadBudget<'r> {
     }
 
     /// The same budget, for a read that builds a response holding `reservation`: each operation
-    /// it admits grows the reservation by what the operation takes in the response.
+    /// it admits takes from the reservation what the operation takes in the response, and the
+    /// read grows it by chunks ([`ReadReservation`]) and gives back what it did not use when it
+    /// ends.
     pub(crate) fn reserving(self, reservation: &'r mut Reservation) -> Self {
         Self {
-            reservation: Some(reservation),
+            reservation: Some(reservation.for_read()),
             ..self
         }
     }
@@ -124,8 +126,8 @@ impl<'r> ReadBudget<'r> {
             && self.ops < self.max_ops
             && (self.ops == 0 || self.bytes.saturating_add(size.bytes) <= self.max_bytes);
         if fits {
-            if let Some(reservation) = self.reservation.as_deref_mut() {
-                fits = reservation.grow(size.in_response());
+            if let Some(reservation) = self.reservation.as_mut() {
+                fits = reservation.take(size.in_response());
                 self.out_of_room = !fits;
             }
         }

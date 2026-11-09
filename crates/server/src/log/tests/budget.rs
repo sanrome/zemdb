@@ -83,6 +83,7 @@ fn a_reserving_read_grows_the_reservation_by_what_each_operation_takes_in_the_re
     }));
     assert!(!read.is_out_of_room());
     assert_eq!(budget.reserved().0, 240);
+    drop(read);
     drop(reserved);
     assert_eq!(budget.reserved(), (0, 1_000));
 }

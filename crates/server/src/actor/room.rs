@@ -9,8 +9,7 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use zemdb_core::id::{ClientId, MutationId, RoomId, SchemaId, SequenceNumber};
 use zemdb_core::mutation::Operation;
-use zemdb_core::protocol::codec::encoded_len;
-use zemdb_core::protocol::limits::{check_operation_size, MAX_RESPONSE_OPS_BYTES};
+use zemdb_core::protocol::limits::check_operation_size;
 use zemdb_core::protocol::messages::SequencedOperation;
 use zemdb_core::schema::Schema;
 
@@ -802,7 +801,7 @@ impl RoomActor {
             .await;
         *reservation = Some(held);
         match read {
-            Ok((ops, has_more)) => fit_in_response(ops, has_more),
+            Ok(read) => read,
             Err(err) => {
                 warn!(
                     room = %self.room_id,
@@ -834,7 +833,7 @@ impl RoomActor {
             .read_log(from_seq, bounded_batch_size, reservation)
             .await;
         let (ops, has_more) = match read {
-            Ok((ops, has_more)) => fit_in_response(ops, has_more),
+            Ok(read) => read,
             Err(e) => {
                 // The range starts inside the retained log, yet the log cannot serve it (a
                 // gap). No client can catch up through it, so the client this answer sends
@@ -1391,30 +1390,6 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
         .copied()
         .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
         .unwrap_or("non-string panic payload")
-}
-
-/// Keeps the longest prefix of `ops` that fits in one response frame
-/// ([`MAX_RESPONSE_OPS_BYTES`]), and at least one operation (every accepted operation fits
-/// alone). If any operation is left out the batch is flagged `has_more`, so the client asks
-/// for the rest.
-fn fit_in_response(
-    mut ops: Vec<Arc<SequencedOperation>>,
-    has_more: bool,
-) -> (Vec<Arc<SequencedOperation>>, bool) {
-    let mut total: u64 = 0;
-    let fitting = ops
-        .iter()
-        .position(|op| {
-            total = total.saturating_add(encoded_len(op).unwrap_or(u64::MAX));
-            total > MAX_RESPONSE_OPS_BYTES
-        })
-        .unwrap_or(ops.len())
-        .max(1);
-    if fitting < ops.len() {
-        ops.truncate(fitting);
-        return (ops, true);
-    }
-    (ops, has_more)
 }
 
 #[cfg(test)]

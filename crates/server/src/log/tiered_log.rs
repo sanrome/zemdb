@@ -328,10 +328,11 @@ impl TieredLog {
     /// and at least one: operations beyond the budget are neither decoded into the batch nor
     /// cloned.
     ///
-    /// With a `reservation` (that of the response the operations go to), each operation grows
-    /// it by what it takes in the response as it is read, and the batch ends at the first one
-    /// the reservation has no room for; if not even the first fits, the batch is empty and
-    /// flagged `has_more`.
+    /// With a `reservation` (that of the response the operations go to), each operation takes
+    /// from it what it takes in the response as it is read (the read grows it by chunks,
+    /// [`ReadReservation`](crate::response_budget::ReadReservation)), and the batch ends at the
+    /// first one the reservation has no room for; if not even the first fits, the batch is
+    /// empty and flagged `has_more`.
     pub(crate) fn fetch_deltas(
         &self,
         from_seq: SequenceNumber,

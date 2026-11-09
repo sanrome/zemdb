@@ -1037,6 +1037,47 @@ async fn catch_ups_and_syncs_share_the_operations_of_the_ram_buffer() {
     fx.manager.shutdown_all().await;
 }
 
+/// A sync and the catch-up of a commit carry what the read of the log returns, which fits in a
+/// response once encoded without measuring it again: two of three operations of 6 MiB, flagged
+/// `has_more`.
+#[tokio::test]
+async fn syncs_and_catch_ups_carry_what_fits_in_a_response() {
+    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
+    let sender = fx.sender().await;
+    let writer = ClientId::new("writer").unwrap();
+    let behind = ClientId::new("behind").unwrap();
+    register(&sender, &writer).await;
+    register(&sender, &behind).await;
+    for n in 1..=3u8 {
+        let op = insert_op_with_title(n.into(), 6 << 20);
+        commit(&sender, &writer, mutation(n), seq(u64::from(n) - 1), op)
+            .await
+            .unwrap();
+    }
+    let catch_up = commit(&sender, &behind, mutation(4), seq(0), insert_op(4))
+        .await
+        .unwrap();
+    let synced = sync_all(&sender, &writer).await.unwrap();
+
+    for (ops, has_more) in [
+        (&catch_up.catchup_ops, catch_up.has_more),
+        (&synced.ops, synced.has_more),
+    ] {
+        let seqs: Vec<u64> = ops.iter().map(|op| op.seq.get()).collect();
+        assert_eq!(seqs, [1, 2]);
+        assert!(has_more);
+        let encoded: u64 = ops
+            .iter()
+            .map(|op| zemdb_core::protocol::codec::encoded_len(op).unwrap())
+            .sum();
+        assert!(
+            encoded <= zemdb_core::protocol::limits::MAX_RESPONSE_OPS_BYTES,
+            "{encoded} bytes"
+        );
+    }
+    fx.manager.shutdown_all().await;
+}
+
 #[tokio::test(start_paused = true)]
 async fn sync_from_beyond_the_head_is_an_invalid_sequence() {
     let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
