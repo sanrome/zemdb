@@ -1,10 +1,11 @@
 use crate::fail_point;
 use crate::memory::index::tests::{
-    apply_random_batches, constrained_schema, evolved_schema, owned_schema,
-    refused_batches_change_nothing, reloads_at_random_points_decide_as_the_new_schema,
-    reloads_race_batches_and_readers, reloads_that_do_not_evolve_change_nothing,
-    reloads_that_evolve_decide_as_the_new_schema, snapshot_indexes_are_built_off_the_runtime,
-    snapshots_replace_the_indexes, snapshots_that_break_a_constraint_change_nothing,
+    apply_random_batches, checks_decide_as_batches_and_change_nothing, constrained_schema,
+    evolved_schema, oracle, owned_schema, refused_batches_change_nothing,
+    reloads_at_random_points_decide_as_the_new_schema, reloads_race_batches_and_readers,
+    reloads_that_do_not_evolve_change_nothing, reloads_that_evolve_decide_as_the_new_schema,
+    snapshot_indexes_are_built_off_the_runtime, snapshots_replace_the_indexes,
+    snapshots_that_break_a_constraint_change_nothing,
     snapshots_that_meet_the_constraints_are_installed, RandomLog, BUILD_POINT,
 };
 use crate::{MemoryStorageEngine, StorageEngine, StorageError};
@@ -166,6 +167,14 @@ async fn refused_batches_change_neither_rows_nor_indexes() {
     let room = RoomId::new("refused-batches").unwrap();
     engine.open_room(&room, constrained_schema()).await.unwrap();
     refused_batches_change_nothing(&engine, &room).await;
+}
+
+#[tokio::test]
+async fn checks_decide_as_batches_and_change_neither_rows_nor_indexes() {
+    let engine = MemoryStorageEngine::new();
+    let room = RoomId::new("checks").unwrap();
+    engine.open_room(&room, oracle::schema()).await.unwrap();
+    checks_decide_as_batches_and_change_nothing(&engine, &room).await;
 }
 
 #[tokio::test]

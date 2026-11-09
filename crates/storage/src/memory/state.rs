@@ -242,18 +242,90 @@ pub(crate) fn validate_batch(
         last = op.seq;
     }
     for op in ops {
-        resolve_table_id(room_id, schema, TableRef::Id(op.op.table_id()))?;
-        schema.validate_operation(&op.op)?;
+        validate_operation(room_id, schema, &op.op)?;
     }
     Ok(())
 }
 
+/// Checks that `op` is valid under the room's schema: an operation of one of its tables
+/// (otherwise `TableNotFound`) that the schema accepts (otherwise `SchemaValidation`).
+fn validate_operation(
+    room_id: &RoomId,
+    schema: &Schema,
+    op: &Operation,
+) -> Result<(), StorageError> {
+    resolve_table_id(room_id, schema, TableRef::Id(op.table_id()))?;
+    schema.validate_operation(op)?;
+    Ok(())
+}
+
+/// What `apply_batch` would decide about `op` as the next operation of a room with `schema`
+/// and `data`, without changing anything: `op` is checked as a batch checks each of its
+/// operations ([`validate_batch`]), and then decided by [`decide`], the code [`apply_operation`]
+/// decides with. `None` if it would be applied, or would change nothing (a delete of a row that
+/// does not exist).
+pub(crate) fn check_operation(
+    room_id: &RoomId,
+    schema: &Schema,
+    data: &RoomData,
+    op: Operation,
+) -> Result<Option<RejectReason>, StorageError> {
+    validate_operation(room_id, schema, &op)?;
+    let old = data
+        .tables
+        .get(&op.table_id())
+        .and_then(|table| table.get(op.pk()));
+    Ok(decide(data, schema, op, old).err())
+}
+
 /// Applies one operation to `data`, its rows and their indexes, or rejects it and changes
-/// nothing. The operation must already be validated against `schema`.
+/// nothing, as [`decide`] decides. The operation must already be validated against `schema`.
+pub(crate) fn apply_operation(
+    data: &mut RoomData,
+    schema: &Schema,
+    op: Operation,
+) -> Option<RejectReason> {
+    let table_id = op.table_id();
+    let old = data
+        .tables
+        .get(&table_id)
+        .and_then(|table| table.get(op.pk()));
+    let Change { pk, row } = match decide(data, schema, op, old) {
+        Ok(Some(change)) => change,
+        Ok(None) => return None,
+        Err(reason) => return Some(reason),
+    };
+    let table_schema = schema.get_table_by_id(table_id);
+    if let (Some(table_schema), Some(indexes)) = (table_schema, data.indexes.get_mut(&table_id)) {
+        indexes.update(table_schema, &pk, old, row.as_ref());
+    }
+    match row {
+        Some(row) => {
+            data.tables.entry(table_id).or_default().insert(pk, row);
+        }
+        None => {
+            if let Some(table) = data.tables.get_mut(&table_id) {
+                table.remove(&pk);
+            }
+        }
+    }
+    None
+}
+
+/// What an operation that is applied does to its table: the row it leaves under its key, or
+/// none for a delete.
+struct Change {
+    pk: PrimaryKey,
+    row: Option<CompactRow>,
+}
+
+/// Decides whether `op` is applied to `data`, the rows and indexes before it, by the rules of
+/// `schema`, without changing anything: the change it makes, `Ok(None)` if it changes nothing,
+/// or the reason it is rejected. `old` is the row of `op`'s key in `data`, if it exists. It is
+/// the only code that decides: [`apply_operation`] applies the change it returns, and
+/// [`check_operation`] reports its reason.
 ///
-/// The decision is taken before anything changes, from the rows and indexes before the
-/// operation, the operation and the rules of `schema`. The first rule that fails gives the
-/// reason, in this order:
+/// The first rule that fails gives the reason, in this order:
 /// - an update of a row that does not exist (`MissingRow`); a delete of one changes nothing and
 ///   is not reported;
 /// - an insert of an existing key of an immutable table (`Duplicate`);
@@ -265,25 +337,23 @@ pub(crate) fn validate_batch(
 ///   referencing table and in declaration order.
 ///
 /// An update widens a row written under an older schema to the table's current width before
-/// its keys are computed.
-pub(crate) fn apply_operation(
-    data: &mut RoomData,
+/// its keys are computed. `op` is taken by value so that the row an insert or an update leaves
+/// is built from its values without copying them.
+fn decide(
+    data: &RoomData,
     schema: &Schema,
     op: Operation,
-) -> Option<RejectReason> {
+    old: Option<&CompactRow>,
+) -> Result<Option<Change>, RejectReason> {
     let table_id = op.table_id();
     let table_schema = schema.get_table_by_id(table_id);
-    let old = data
-        .tables
-        .get(&table_id)
-        .and_then(|table| table.get(op.pk()));
     match (op.kind(), old) {
-        (OperationKind::Update { .. }, None) => return Some(RejectReason::MissingRow),
-        (OperationKind::Delete { .. }, None) => return None,
+        (OperationKind::Update { .. }, None) => return Err(RejectReason::MissingRow),
+        (OperationKind::Delete { .. }, None) => return Ok(None),
         _ => {}
     }
     if let Some(reason) = table_schema.and_then(|table| check_existing_row(table, &op, old)) {
-        return Some(reason);
+        return Err(reason);
     }
     let set_columns: Option<Vec<usize>> = match op.kind() {
         OperationKind::Update { updates } => Some(
@@ -317,25 +387,11 @@ pub(crate) fn apply_operation(
             Some(row) => check_row(data, schema, table, &pk, row, set_columns.as_deref()),
             None => check_references(data, schema, table_id, &pk),
         };
-        if reason.is_some() {
-            return reason;
+        if let Some(reason) = reason {
+            return Err(reason);
         }
     }
-
-    if let (Some(table_schema), Some(indexes)) = (table_schema, data.indexes.get_mut(&table_id)) {
-        indexes.update(table_schema, &pk, old, row.as_ref());
-    }
-    match row {
-        Some(row) => {
-            data.tables.entry(table_id).or_default().insert(pk, row);
-        }
-        None => {
-            if let Some(table) = data.tables.get_mut(&table_id) {
-                table.remove(&pk);
-            }
-        }
-    }
-    None
+    Ok(Some(Change { pk, row }))
 }
 
 /// The rules on the row that `op` replaces, updates or deletes, `old`, if it exists: an

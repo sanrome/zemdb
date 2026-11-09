@@ -188,6 +188,48 @@ fn the_verifier_never_panics_and_a_rejection_changes_nothing() {
     assert!(broken_rules > 0, "no operation broke a rule");
 }
 
+/// On random states, also ones that already break a rule (built from random rows without
+/// checking them), checking a random operation gives the decision that applying it then takes,
+/// and changes nothing.
+#[test]
+fn checking_decides_as_applying() {
+    let room_id = RoomId::new("room").unwrap();
+    let mut rejected = 0;
+    for seed in 0..40 {
+        let mut rng = Rng::new(seed);
+        let schema = if seed % 2 == 0 {
+            oracle::schema()
+        } else {
+            oracle::evolved_schema()
+        };
+        let mut tables: HashMap<u16, Table> = HashMap::new();
+        for _ in 0..rng.below(40) {
+            let op = oracle::random_operation(&mut rng, &schema);
+            if let OperationKind::Insert { row } = op.kind().clone() {
+                tables
+                    .entry(op.table_id())
+                    .or_default()
+                    .insert(op.pk().clone(), row);
+            }
+        }
+        let mut data = RoomData::build(&schema, tables);
+        for _ in 0..300 {
+            let op = oracle::random_operation(&mut rng, &schema);
+            let before = data.clone();
+            let checked = check_operation(&room_id, &schema, &data, op.clone()).unwrap();
+            assert_same_contents(&before, &data);
+            let described = format!("{op:?}");
+            assert_eq!(
+                checked,
+                apply_operation(&mut data, &schema, op),
+                "seed {seed}: {described}"
+            );
+            rejected += usize::from(checked.is_some());
+        }
+    }
+    assert!(rejected > 0, "no operation was rejected");
+}
+
 /// The replay of a WAL applies its records without validating them again (the engine validated
 /// them before writing them), so the verifier must not panic even on an operation the schema
 /// rejects: keys of another width or type, rows of any width, deltas of columns the table does

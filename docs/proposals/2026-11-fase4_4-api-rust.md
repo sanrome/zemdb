@@ -2,7 +2,7 @@
 
 **Fecha:** 6 de Noviembre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre de 2026, sin cambios. Lo que sigue es el Lote 1.
+**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre de 2026, sin cambios. El Lote 1 (`check_operation`) cerró el 9 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lo que sigue es el Lote 2.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.4. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Parte de:** el núcleo de la réplica de 4.2 ([plan](2026-10-fase4_2-nucleo-replica.md)), y la API que la sub-fase 4.3 agrega al núcleo ([plan](2026-11-fase4_3-transporte-worker.md)): el `TokenProvider` (DC30), el worker con `start_worker` y `set_freshness`, y el estado de la conexión (DC28). 4.3 corre en paralelo: los lotes de 4.4 que usan algo de ella van después del lote de 4.3 que lo trae (§4.4 del plan de la fase).
@@ -139,7 +139,7 @@ Depende de los Lotes 3, 4 y 7 de 4.3 (el `TokenProvider`, el worker y su estado,
 | Orden | Lote | Crates | Decisiones | Invariantes | Progreso |
 |---|---|---|---|---|---|
 | 0 | Contrato | Documentos | DC32 a DC37 | Ajustes: C3, K2, K3, K4, K7, K8, K9, K10, K12, K15, K17 y §2 | ✅ |
-| 1 | `check_operation` | storage | DC33 | C3 | ⬜ |
+| 1 | `check_operation` | storage | DC33 | C3 | ✅ |
 | 2 | La fachada y las lecturas | client | DC32 | K17 | ⬜ |
 | 3 | Las escrituras y el dueño | client | DC32, DC33 | K2, K8 | ⬜ |
 | 4 | El pre-chequeo | client | DC33 | K2, K8, K17 | ⬜ |
@@ -227,7 +227,7 @@ Depende de los Lotes 3, 4 y 7 de 4.3 (el `TokenProvider`, el worker y su estado,
 - **Chequeos:** el lote solo toca documentos, así que los de código no cambian; `git diff --check` limpio, y las listas de lotes e invariantes, verificadas con un script.
 - **Las Propuestas:** el dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre de 2026, sin cambios.
 
-### Lote 1 · `check_operation` (`zemdb-storage`) · ⬜
+### Lote 1 · `check_operation` (`zemdb-storage`) · ✅ Hecho
 **Objetivo:** que el pre-chequeo del SDK pregunte al storage qué decidiría la réplica, con la misma regla que aplica el log (DC33).
 
 **Archivos:** `crates/storage/src/engine.rs` (el método del trait), `memory/state.rs` (la decisión, separada de `apply_operation`), `memory/mod.rs`, `disk/mod.rs`, y sus tests (los unitarios de `memory/tests/` y de integración con el oráculo); en `crates/client/tests/common/`, el reenvío de `check_operation` en el motor de prueba (`TestEngine`), para que la suite del cliente siga compilando. `ARCHITECTURE.md` §8.
@@ -247,6 +247,49 @@ Depende de los Lotes 3, 4 y 7 de 4.3 (el `TokenProvider`, el worker y su estado,
 **Documentos:** `ARCHITECTURE.md` §8 (`check_operation`); `INVARIANTES.md`: C3.
 
 **Entrega:** `feat(storage): check an operation without applying it, for the precheck of the client (Fase 4.4, Lote 1)`.
+
+**Hecho** (9 de Noviembre de 2026).
+- **Qué entró.**
+  - **La decisión, separada** (`memory/state.rs`): `decide(data, schema, op, old)` decide sin mutar nada y devuelve el cambio (la fila que queda bajo la clave, o ninguna en un `DELETE`), `Ok(None)` si no cambia nada, o el motivo del rechazo. Es el mismo código que tenía `apply_operation`, con las reglas en el mismo orden, el mismo ensanchado de un `UPDATE` y los mismos motivos. `apply_operation` la llama y aplica el cambio a las filas y los índices, también en la recuperación del motor en disco, que no valida otra vez. Toma la operación por valor, así que el camino de `apply_batch` arma la fila con los valores de la operación sin copiarlos, como antes.
+  - **`check_operation(room_id, schema, data, op)`** (`state.rs`): valida la operación como un lote (`validate_operation`, que ahora usa también `validate_batch`: `TableNotFound` y `SchemaValidation`) y devuelve el motivo de `decide`.
+  - **`StorageEngine::check_operation(room_id, &op)`**, en los dos motores. La operación se clona antes del lock, y la decisión corre bajo el lock de lectura de la sala en memoria, o del estado de la sala en disco, sin el mutex del WAL: en disco no espera el `fsync` de un lote, una rotación del WAL ni una compactación, no mira si la sala está marcada como fallida y no recorre los puntos de falla del WAL. En memoria, el lock de lectura espera a un lote que se está aplicando, sin E/S, como `get` y `scan`. Una sala cerrada es `RoomNotFound`.
+  - **El reenvío en `TestEngine`** (`crates/client/tests/common/`), que puede fallar a pedido como los demás métodos.
+- **Tests.**
+  - **De integración** (`crates/storage/tests/check_operation_tests.rs`), en los dos motores:
+    - cada motivo (`MissingRow`, `Duplicate`, `NotOwner`, también en un `DELETE`, `Unique`, `ForeignKey` y `Restrict`), con el nombre de la restricción, donde `apply_batch` lo da después, y `None` donde la aplica; el `DELETE` de una fila que no existe, `None`;
+    - no cambia nada: el head y las filas, y después de verificar un `INSERT` que se aplicaría y un `DELETE` que se rechazaría, `apply_batch` decide como sin ellos;
+    - `TableNotFound`, `SchemaValidation`, y `RoomNotFound` con una sala que nunca se abrió y con una cerrada;
+    - después de `reload_schema`, decide con las restricciones nuevas (`posts_tag` y `children_alt`), donde antes era `SchemaValidation`;
+    - después de `apply_snapshot`, decide sobre las filas del snapshot, con su esquema, y el lote siguiente decide igual;
+    - una sala en disco reabierta desde un snapshot y el WAL decide sobre lo que recupera;
+    - la propiedad con el oráculo: un log al azar con una recarga del esquema en un punto al azar, compactaciones y reaperturas del motor en disco; antes de cada lote, operaciones al azar que cada motor decide como el oráculo (`Oracle::decide`, que aplica sobre un clon del oráculo, sin código de los motores), y la primera del lote, que `apply_batch` decide igual después. Una versión corta (12 logs) y una larga con `#[ignore]` (400).
+  - **Unitarios:**
+    - `memory/tests/state.rs`: sobre estados al azar que ya rompen alguna regla (filas al azar sin verificar), la decisión de `check_operation` es la de `apply_operation`;
+    - un escenario compartido por los dos motores (`memory/tests/index.rs`): las verificaciones de un log al azar, con una recarga a la mitad, dan la decisión del oráculo y no cambian las filas, los índices (entrada por entrada) ni el head; la primera operación de cada lote se decide como la decide `apply_batch`; aparecen los seis motivos;
+    - en disco (`src/tests/disk.rs`): una verificación no espera a un lote en su `fsync` (decide sobre el estado anterior, que no es durable todavía) ni a una rotación del WAL; durante una compactación decide sobre los lotes que entraron mientras tanto, y lo mismo después de reabrir; una sala marcada como fallida verifica sobre el estado que publica, y el lote siguiente da `RoomFailed`.
+- **Mutaciones inversas: las 8 las mató algún test.**
+  - Un `check_operation` que saltea las claves foráneas, y otro que saltea la regla del dueño.
+  - Uno que ignora la fila existente.
+  - Uno que no valida la operación.
+  - Uno que aplica la operación en lugar de solo decidirla, en memoria y en disco.
+  - En disco, uno que toma el mutex del WAL, y otro que rechaza una sala marcada como fallida.
+- **El checklist de determinismo de la Fase 3.11** (§5.4 de su propuesta), punto por punto. La decisión depende solo de las filas y los índices anteriores, de la operación y del esquema (`decide`, con la fila existente tomada de los mismos datos), y en su camino no se itera un `HashMap`: solo hay búsquedas. La igualdad es la de `Value`. Aplicar, reaplicar el WAL y verificar usan la misma función, en los dos motores. Se decide con el esquema publicado, el que usaría `apply_batch` en ese momento. El motivo es el mismo, y verificar no cambia nada ni avanza el head.
+- **Interacciones revisadas.**
+  - `apply_batch` y la recuperación del motor en disco comparten `decide` por `apply_operation`, sin cambios en su camino (INV-S3, INV-C1).
+  - Los índices evolucionados de `reload_schema` (INV-S7), y el estado que reemplazan la compactación y la instalación de un snapshot: `check_operation` lee el esquema y los datos bajo el mismo lock con que se publican juntos.
+  - Los puntos de falla de `room_data.build` y del WAL, que `check_operation` no recorre.
+  - La compilación a wasm32 del motor en memoria, con clippy.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura, que probó en su propia copia, con sus propias mutaciones y los tests largos en release), **primera ronda: verde.** Ningún hallazgo Alto ni Medio; recorrió el checklist de §5.4 punto por punto. Sus cuatro Bajos se arreglaron en el lote:
+  - el rustdoc del trait decía que no espera a un lote en curso, y eso vale solo en disco: el lock de lectura en memoria espera a un lote que se está aplicando, sin E/S; y el estado sobre el que decide puede venir también de una recarga del esquema o de un snapshot;
+  - `ARCHITECTURE.md` decía que el cliente ya lo pregunta antes de mandar una escritura, y eso llega con el Lote 4;
+  - faltaba un test después de `apply_snapshot`, que ahora está, en los dos motores;
+  - este plan, que faltaba actualizar.
+- **Desvíos.**
+  - La versión 21 de `INVARIANTES.md`: la 19 la tomó el Lote 1 de 4.3, y la 20, el Lote 6b de la Fase 3.12, en paralelo.
+  - `apply_operation` busca la tabla del esquema dos veces, una dentro de `decide` y otra para actualizar los índices: es un costo despreciable.
+- **Chequeos.**
+  - fmt, clippy del workspace y de wasm32 con `-D warnings`, la suite del workspace (1309 tests, sin fallas; después de los arreglos de la revisión, la del storage otra vez, con el test de `apply_snapshot`), doc con `-D warnings` y el build a wasm32.
+  - Los `--ignored` del storage en release: 22, sin fallas.
 
 ### Lote 2 · La fachada y las lecturas (`zemdb-client`) · ⬜
 **Objetivo:** los handles de DC32 y las lecturas locales, sin escrituras todavía.
@@ -459,4 +502,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** plan escrito el 6 de Noviembre de 2026, con DC32 a DC37 *Propuestas*. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre, sin cambios. Lo que sigue es el Lote 1.
+**Avance:** plan escrito el 6 de Noviembre de 2026, con DC32 a DC37 *Propuestas*. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre, sin cambios. Lote 1 (`check_operation`) cerrado el 9 de Noviembre, con la revisión de delta en verde en su primera ronda. Lo que sigue es el Lote 2.

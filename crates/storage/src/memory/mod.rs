@@ -10,9 +10,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::{Arc, PoisonError, RwLock};
-use zemdb_core::{CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation};
+use zemdb_core::{
+    CompactRow, Operation, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation,
+};
 
-use crate::engine::{batched_scan, ApplyReport, RowStream, StorageEngine};
+use crate::engine::{batched_scan, ApplyReport, RejectReason, RowStream, StorageEngine};
 use crate::error::StorageError;
 use crate::options::ScanOptions;
 use crate::snapshot::DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES;
@@ -189,6 +191,20 @@ impl StorageEngine for MemoryStorageEngine {
 
         tracing::debug!(room_id = %room_id, new_head_seq = %head_seq, "Applied batch to in-memory room");
         Ok(ApplyReport::new(*head_seq, rejected))
+    }
+
+    /// Decides `op` (see the trait) under the room's read lock, on its schema, rows and indexes
+    /// as the last change (a batch, a schema reload or a snapshot) left them.
+    async fn check_operation(
+        &self,
+        room_id: &RoomId,
+        op: &Operation,
+    ) -> Result<Option<RejectReason>, StorageError> {
+        let room_arc = self.get_room(room_id)?;
+        // Cloned before the lock, so that the lock is held only for the decision.
+        let op = op.clone();
+        let room = room_arc.read().map_err(poisoned("Room"))?;
+        state::check_operation(room_id, &room.schema, &room.data, op)
     }
 
     async fn get(

@@ -139,6 +139,15 @@ impl RandomLog {
         (ops, report)
     }
 
+    /// A random operation under the log's schema, and the reason the reference model would
+    /// reject it for as the next operation, or `None` if it would apply it. The log does not
+    /// take it.
+    pub(crate) fn next_check(&mut self) -> (Operation, Option<RejectReason>) {
+        let op = oracle::random_operation(&mut self.rng, self.model.schema());
+        let decision = self.model.decide(&op).map(reject_reason);
+        (op, decision)
+    }
+
     /// Takes `ops`, which must continue the log and be valid under its schema, as its next
     /// batch, and returns the report it must give.
     pub(crate) fn decide(&mut self, ops: &[SequencedOperation]) -> ApplyReport {
@@ -349,6 +358,53 @@ pub(crate) async fn refused_batches_change_nothing<E: RoomContents>(
         assert_same_contents(&before, &after);
     }
     before
+}
+
+/// Checks random operations on `room`, open with [`oracle::schema`] and empty, between the
+/// batches of a random log that reloads it to [`oracle::evolved_schema`] halfway: each check
+/// gives the decision of the reference model on the room's state and changes nothing (neither
+/// the rows, nor the indexes, nor the head), and the first operation of each batch, checked
+/// before it, is decided as `apply_batch` then decides it. Every reason comes up.
+pub(crate) async fn checks_decide_as_batches_and_change_nothing<E: RoomContents>(
+    engine: &E,
+    room: &RoomId,
+) {
+    let mut log = RandomLog::new(43, oracle::schema());
+    let mut reasons = std::collections::HashSet::new();
+    for step in 0..60 {
+        if step == 30 {
+            engine
+                .reload_schema(room, oracle::evolved_schema())
+                .await
+                .unwrap();
+            log.evolve(oracle::evolved_schema());
+        }
+        let head = engine.get_head_seq(room).await.unwrap();
+        let (_, before) = checked_contents(engine, room).await;
+        for _ in 0..8 {
+            let (op, expected) = log.next_check();
+            let checked = engine.check_operation(room, &op).await.unwrap();
+            assert_eq!(checked, expected, "step {step}: {op:?}");
+            if let Some(reason) = checked {
+                reasons.insert(std::mem::discriminant(&reason));
+            }
+        }
+        let (_, after) = checked_contents(engine, room).await;
+        assert_same_contents(&before, &after);
+        assert_eq!(engine.get_head_seq(room).await.unwrap(), head);
+
+        let (ops, expected) = log.next_batch();
+        let first = &ops[0];
+        let decided = expected
+            .rejected()
+            .first()
+            .filter(|(seq, _)| *seq == first.seq)
+            .map(|(_, reason)| reason.clone());
+        let checked = engine.check_operation(room, &first.op).await.unwrap();
+        assert_eq!(checked, decided, "step {step}: {:?}", first.op);
+        apply_checked(engine, room, ops, &expected).await;
+    }
+    assert_eq!(reasons.len(), 6, "not every reason came up");
 }
 
 /// Applies snapshots to `room`, open with [`constrained_schema`] and empty: one at its head,

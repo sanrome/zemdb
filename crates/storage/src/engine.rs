@@ -5,7 +5,7 @@ use std::collections::VecDeque;
 use std::ops::{Bound, RangeBounds};
 use std::pin::Pin;
 use zemdb_core::{
-    CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation, Value,
+    CompactRow, Operation, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation, Value,
 };
 
 use crate::error::StorageError;
@@ -176,6 +176,29 @@ pub trait StorageEngine: EngineConcurrencyBounds {
         room_id: &RoomId,
         ops: Vec<SequencedOperation>,
     ) -> Result<ApplyReport, StorageError>;
+
+    /// What [`apply_batch`](Self::apply_batch) would decide about `op` if it were the next
+    /// operation of the room, without applying it: the reason it would reject it, or `None` if
+    /// it would apply it. A `DELETE` of a row that does not exist changes nothing and is not
+    /// reported, so it is `None` too.
+    ///
+    /// `op` is checked as `apply_batch` checks each operation of a batch: a table the room does
+    /// not have is `StorageError::TableNotFound`, and an operation that is not valid under the
+    /// room's schema, `StorageError::SchemaValidation`. The room must be open; otherwise
+    /// `StorageError::RoomNotFound`. The decision comes from the code `apply_batch` decides
+    /// with, on the state the room publishes to its readers, and nothing changes: neither the
+    /// rows, nor the indexes of the constraints, nor the head sequence.
+    ///
+    /// It takes only the lock the room's readers take. A memory room's read lock waits for a
+    /// batch being applied, which holds it with no I/O. A disk room waits neither for a batch in
+    /// its WAL sync nor for a WAL rotation: it does not check whether the room is marked as
+    /// failed (the next `apply_batch` reports `StorageError::RoomFailed`, as before), and it
+    /// reaches none of the failure points of the WAL.
+    async fn check_operation(
+        &self,
+        room_id: &RoomId,
+        op: &Operation,
+    ) -> Result<Option<RejectReason>, StorageError>;
 
     /// Fetches a single row by primary key from a table.
     async fn get(

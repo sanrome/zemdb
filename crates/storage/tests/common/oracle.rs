@@ -74,6 +74,11 @@ impl Oracle {
         rejected
     }
 
+    /// What [`Oracle::apply`] would decide about `op`, without applying it.
+    pub fn decide(&self, op: &Operation) -> Option<Reason> {
+        self.clone().apply(op)
+    }
+
     /// Applies `op`, which must be valid under the schema, or rejects it and changes nothing.
     pub fn apply(&mut self, op: &Operation) -> Option<Reason> {
         let table = self

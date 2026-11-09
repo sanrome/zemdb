@@ -31,8 +31,8 @@ use zemdb_server::{
 };
 use zemdb_storage::files::{NativeFile, NativeFiles, RoomFile, RoomFiles};
 use zemdb_storage::{
-    ApplyReport, DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, RowStream,
-    ScanOptions, StorageEngine, StorageError,
+    ApplyReport, DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, RejectReason,
+    RowStream, ScanOptions, StorageEngine, StorageError,
 };
 
 pub const AUTH_SECRET: &str = "test_cluster_secret_key_1234567890";
@@ -1003,6 +1003,15 @@ impl<E: StorageEngine> StorageEngine for TestEngine<E> {
     ) -> Result<ApplyReport, StorageError> {
         self.check("apply_batch")?;
         self.inner.apply_batch(room_id, ops).await
+    }
+
+    async fn check_operation(
+        &self,
+        room_id: &RoomId,
+        op: &Operation,
+    ) -> Result<Option<RejectReason>, StorageError> {
+        self.check("check_operation")?;
+        self.inner.check_operation(room_id, op).await
     }
 
     async fn get(

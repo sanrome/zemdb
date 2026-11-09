@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
-use zemdb_core::{CompactRow, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation};
+use zemdb_core::{
+    CompactRow, Operation, PrimaryKey, RoomId, Schema, SequenceNumber, SequencedOperation,
+};
 
 use crate::disk::compactor::{
     absorbing_wal_path, compact_room_cow, compacting_wal_path, install_applied_snapshot,
@@ -18,12 +20,13 @@ use crate::disk::compactor::{
 };
 use crate::disk::recovery::recover_room;
 use crate::disk::wal::WalWriter;
-use crate::engine::{batched_scan, ApplyReport, RowStream, StorageEngine};
+use crate::engine::{batched_scan, ApplyReport, RejectReason, RowStream, StorageEngine};
 use crate::error::StorageError;
 use crate::fail_point;
 use crate::files::{NativeFiles, RoomFile, RoomFiles};
 use crate::memory::state::{
-    apply_operation, decode_received_snapshot, resolve_table_id, validate_batch, RoomData, TableRef,
+    apply_operation, check_operation, decode_received_snapshot, resolve_table_id, validate_batch,
+    RoomData, TableRef,
 };
 use crate::memory::RoomSnapshotRef;
 use crate::options::ScanOptions;
@@ -696,6 +699,22 @@ impl<F: RoomFiles> StorageEngine for DiskStorageEngine<F> {
 
         tracing::debug!(room_id = %room_id, head_seq = head_seq.get(), "Applied batch to disk room");
         Ok(ApplyReport::new(head_seq, rejected))
+    }
+
+    /// Decides `op` (see the trait) under the read lock of the room's state, on the state its
+    /// readers see, as the last change (a batch, a schema reload or a snapshot) published it,
+    /// which is durable. Without the WAL mutex, it neither waits for the `fsync` of a batch in
+    /// progress nor sees whether the room is marked as failed.
+    async fn check_operation(
+        &self,
+        room_id: &RoomId,
+        op: &Operation,
+    ) -> Result<Option<RejectReason>, StorageError> {
+        let room = self.get_room(room_id).await?;
+        // Cloned before the lock, so that the lock is held only for the decision.
+        let op = op.clone();
+        let state = room.state.read().await;
+        check_operation(room_id, &state.schema, &state.data, op)
     }
 
     async fn get(

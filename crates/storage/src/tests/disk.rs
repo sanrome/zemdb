@@ -3,8 +3,9 @@ use crate::engine::RejectReason;
 use crate::fail_point;
 use crate::memory::index::tests::{
     apply_checked, apply_random_batches, assert_equivalent_contents, assert_same_contents,
-    checked_contents, child_with_alt, constrained_schema, evolved_schema, insert_parent, oracle,
-    owned_schema, refused_batches_change_nothing, reloaded_schema,
+    checked_contents, checks_decide_as_batches_and_change_nothing, child_with_alt,
+    constrained_schema, evolved_schema, insert_parent, oracle, owned_schema,
+    refused_batches_change_nothing, reloaded_schema,
     reloads_at_random_points_decide_as_the_new_schema, reloads_race_batches_and_readers,
     reloads_that_do_not_evolve_change_nothing, reloads_that_evolve_decide_as_the_new_schema,
     snapshot_indexes_are_built_off_the_runtime, snapshots_replace_the_indexes,
@@ -22,7 +23,9 @@ use std::ops::RangeInclusive;
 use std::path::Path;
 use std::time::Duration;
 use support::*;
-use zemdb_core::{ColumnUpdate, Operation, PrimaryKey, RoomId, Schema, SequenceNumber, Value};
+use zemdb_core::{
+    ColumnUpdate, CompactRow, Operation, PrimaryKey, RoomId, Schema, SequenceNumber, Value,
+};
 
 /// Helpers shared with the tests of the disk engine's submodules.
 #[path = "../disk/tests/support.rs"]
@@ -2092,4 +2095,136 @@ async fn narrower_reopens_then_reloads(seed: u64) -> (usize, usize) {
         }
     }
     (reloaded, refused)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Checking an operation without applying it
+
+#[tokio::test]
+async fn checks_decide_as_batches_and_change_neither_rows_nor_indexes() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_at(dir.path());
+    let room = RoomId::new("checks").unwrap();
+    engine.open_room(&room, oracle::schema()).await.unwrap();
+    checks_decide_as_batches_and_change_nothing(&engine, &room).await;
+}
+
+/// An insert into `parents`, of [`constrained_schema`], of the key `id` with `code`.
+fn parent_with_code(id: i64, code: &str) -> Operation {
+    let row = CompactRow::new(vec![Value::Int(id), Value::String(code.into())]);
+    Operation::insert(PARENTS, PrimaryKey::single(id), row, 0)
+}
+
+/// The rejection of a second row of `parents` with the same code.
+fn code_taken() -> Option<RejectReason> {
+    Some(RejectReason::Unique {
+        constraint: "parents_code".into(),
+    })
+}
+
+/// A disk engine in `dir` with `room` open under [`constrained_schema`], holding the parent 9
+/// with the code "a" at sequence 1.
+async fn engine_with_parent(dir: &Path, room: &RoomId) -> DiskStorageEngine {
+    let engine = engine_at(dir);
+    engine.open_room(room, constrained_schema()).await.unwrap();
+    engine
+        .apply_batch(room, vec![insert_parent(1, "a")])
+        .await
+        .unwrap();
+    engine
+}
+
+/// `check_operation` of `op` in `room`, which must complete without waiting for any lock.
+fn check_now(engine: &DiskStorageEngine, room: &RoomId, op: &Operation) -> Option<RejectReason> {
+    engine
+        .check_operation(room, op)
+        .now_or_never()
+        .expect("the check waited for a lock")
+        .unwrap()
+}
+
+/// A check takes only the lock of the readers: it does not wait for a batch in its WAL sync, and
+/// decides on the state before it (the batch is not durable yet), nor for a WAL rotation, which
+/// holds the WAL mutex.
+#[tokio::test]
+async fn a_check_waits_for_neither_a_batch_in_its_sync_nor_a_wal_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("check-during-sync").unwrap();
+    let engine = engine_with_parent(dir.path(), &room).await;
+    let taken = parent_with_code(10, "a");
+    let wal_path = engine.wal_file_path(&room);
+
+    let mut pause = fail_point::arm_pause("apply_batch.sync", &wal_path);
+    let delete = Operation::delete(PARENTS, PrimaryKey::single(9i64), 0);
+    let writer = spawn_batch(&engine, &room, vec![sequenced(2, delete)]);
+    pause.reached().await;
+    assert_eq!(check_now(&engine, &room, &taken), code_taken());
+    pause.release();
+    writer.await.unwrap().unwrap();
+    assert_eq!(check_now(&engine, &room, &taken), None);
+
+    let mut pause = fail_point::arm_pause("compaction.rotate", &wal_path);
+    let compaction = spawn_compaction(&engine, &room);
+    pause.reached().await;
+    assert_eq!(check_now(&engine, &room, &taken), None);
+    pause.release();
+    compaction.await.unwrap().unwrap();
+}
+
+/// During a compaction, once the WAL is rotated, batches go on, and a check decides on the state
+/// they leave; after it, and after reopening the room, on the same state.
+#[tokio::test]
+async fn a_check_during_a_compaction_decides_on_the_batches_applied_meanwhile() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("check-during-compaction").unwrap();
+    let engine = engine_with_parent(dir.path(), &room).await;
+    let taken = parent_with_code(10, "b");
+
+    let mut pause = fail_point::arm_pause("compaction.staging", &engine.wal_file_path(&room));
+    let compaction = spawn_compaction(&engine, &room);
+    pause.reached().await;
+    assert_eq!(check_now(&engine, &room, &taken), None);
+    engine
+        .apply_batch(&room, vec![sequenced(2, parent_with_code(11, "b"))])
+        .await
+        .unwrap();
+    assert_eq!(check_now(&engine, &room, &taken), code_taken());
+    pause.release();
+    compaction.await.unwrap().unwrap();
+    assert_eq!(check_now(&engine, &room, &taken), code_taken());
+
+    engine.close_room(&room).await.unwrap();
+    let reopened = engine_at(dir.path());
+    reopened
+        .open_room(&room, constrained_schema())
+        .await
+        .unwrap();
+    assert_eq!(check_now(&reopened, &room, &taken), code_taken());
+    let other = parent_with_code(12, "c");
+    assert_eq!(check_now(&reopened, &room, &other), None);
+}
+
+/// A room marked as failed still checks, on the state it publishes (without the batch whose
+/// sync failed), and the next batch is `RoomFailed`, as before.
+#[tokio::test]
+async fn a_room_marked_as_failed_checks_on_the_state_it_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let room = RoomId::new("check-failed-room").unwrap();
+    let engine = engine_with_parent(dir.path(), &room).await;
+    let taken = parent_with_code(10, "a");
+
+    fail_point::arm("apply_batch.sync", &engine.wal_file_path(&room));
+    let delete = Operation::delete(PARENTS, PrimaryKey::single(9i64), 0);
+    assert!(engine
+        .apply_batch(&room, vec![sequenced(2, delete)])
+        .await
+        .is_err());
+    assert_eq!(check_now(&engine, &room, &taken), code_taken());
+    let result = engine
+        .apply_batch(&room, vec![sequenced(2, parent_with_code(12, "c"))])
+        .await;
+    assert!(
+        matches!(result, Err(StorageError::RoomFailed { .. })),
+        "{result:?}"
+    );
 }
