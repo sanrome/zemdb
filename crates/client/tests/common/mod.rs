@@ -11,6 +11,7 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use bytes::Bytes;
+use futures::StreamExt;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -21,8 +22,8 @@ use tempfile::{tempdir, TempDir};
 use tokio::sync::oneshot;
 use tower::ServiceExt;
 use zemdb_client::{
-    endpoint, Client, ClientConfig, ClientError, FileMetadata, RoomStatus, TransportClient,
-    TransportError,
+    endpoint, Client, ClientConfig, ClientError, EventBlocks, EventStream, FileMetadata,
+    RoomStatus, TransportClient, TransportError,
 };
 use zemdb_core::*;
 use zemdb_server::{
@@ -667,6 +668,56 @@ impl TransportClient for TestTransport {
         }
         reply
     }
+
+    async fn events(&self, room_id: &RoomId, token: &str) -> Result<EventStream, TransportError> {
+        let request = Request::get(format!("/rooms/{room_id}/events"))
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = self.router.clone().oneshot(request).await.unwrap();
+        fn no_response(err: axum::Error) -> TransportError {
+            TransportError(err.to_string())
+        }
+        if response.status() != StatusCode::OK {
+            let refusal = to_bytes(response.into_body(), MAX_FRAME_SIZE).await;
+            return Ok(EventStream::Refused(refusal.map_err(no_response)?.to_vec()));
+        }
+        let blocks = response.into_body().into_data_stream();
+        Ok(EventStream::Open(Box::pin(
+            blocks.map(|block| block.map_err(no_response)),
+        )))
+    }
+}
+
+/// The data of the next event named `name` in `blocks`, skipping what comes before it, as the
+/// server writes events (`event: {name}`, one `data` line and a blank line). Fails if it does
+/// not come within 10 s or the stream ends.
+pub async fn next_event(blocks: &mut EventBlocks, name: &str) -> String {
+    let start = format!("event: {name}\ndata: ");
+    let mut text = String::new();
+    let next = async {
+        loop {
+            if let Some(at) = text.find(&start) {
+                let data = &text[at + start.len()..];
+                if let Some(end) = data.find("\n\n") {
+                    return data[..end].to_string();
+                }
+            }
+            let block = blocks.next().await.expect("The stream ended").unwrap();
+            text.push_str(std::str::from_utf8(&block).unwrap());
+        }
+    };
+    let next = tokio::time::timeout(Duration::from_secs(10), next);
+    next.await.unwrap_or_else(|_| panic!("No {name} event"))
+}
+
+/// The operations of an `ops` event whose data is `data`.
+pub fn ops_event(data: &str) -> ServerMessage {
+    use base64::Engine;
+    let frame = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .unwrap();
+    decode_message(&frame).unwrap()
 }
 
 impl TestTransport {

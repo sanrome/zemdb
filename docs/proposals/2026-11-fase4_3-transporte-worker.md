@@ -2,7 +2,7 @@
 
 **Fecha:** 4 de Noviembre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su quinta ronda. El dueño del proyecto adoptó el mismo día las precisiones de DC18 y de DC24 a DC26 y las decisiones DC27 a DC31 (DC27, con la condición de S4), con dos ajustes: DC26 dice explícitamente que, en el camino normal, un `ops` se aplica sin ningún `/sync`, y la verificación del `ClientId` de un token renovado pasa de 4.4 al Lote 3 (DC30). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026, con S4 respondido y la revisión de delta en verde en su cuarta ronda. Lo que sigue es el Lote 2.
+**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su quinta ronda. El dueño del proyecto adoptó el mismo día las precisiones de DC18 y de DC24 a DC26 y las decisiones DC27 a DC31 (DC27, con la condición de S4), con dos ajustes: DC26 dice explícitamente que, en el camino normal, un `ops` se aplica sin ningún `/sync`, y la verificación del `ClientId` de un token renovado pasa de 4.4 al Lote 3 (DC30). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026, con S4 respondido y la revisión de delta en verde en su cuarta ronda. Lote 2 (el stream de eventos: el transporte y el parser) cerrado el 9 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lo que sigue es el Lote 3.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.3. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Parte de:** el SSE del servidor, del Lote 5 de la [Fase 3.12](2026-11-fase3_12-rendimiento-servidor.md) (`2c0a908`): el evento `ops` con la encarnación de la sala, el stream que termina cuando vence su token y `EventsDisabled` (`ARCHITECTURE.md` §7.2).
@@ -138,7 +138,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 |---|---|---|---|---|---|
 | 0 | Contrato | Documentos | DC18, DC24 a DC31 | Nueva: K17. Ajustes: K1, K2, K5, K6, K7, K11, K12, K15 y §2 | ✅ |
 | 1 | El transporte HTTP nativo | client | DC27 | K12, K7 | ✅ |
-| 2 | El stream de eventos: el transporte y el parser | client | DC27 | K12, K15, K7 | ⬜ |
+| 2 | El stream de eventos: el transporte y el parser | client | DC27 | K12, K15, K7 | ✅ |
 | 3 | La renovación del token | client | DC30, DC29 | K2, K17 | ⬜ |
 | 4 | El worker: la tarea, el heartbeat y las transferencias | client | DC28, DC29 | K7, K15, K17 | ⬜ |
 | 5 | Los modos `periodic` y `manual` | client | DC24, DC25, DC28 | K7, K15 | ⬜ |
@@ -385,7 +385,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
   - No estaban en el plan y salieron de las revisiones: el cliente nuevo después de un corte (los pings de HTTP/2 se probaron y se descartaron), el rechazo de una URL con usuario, el prior knowledge solo con `http://` y el tope del pool.
   - El chequeo de host de la URL se sacó: con `http` y `https`, el parser siempre exige un host.
 
-### Lote 2 · El stream de eventos: el transporte y el parser (`zemdb-client`) · ⬜
+### Lote 2 · El stream de eventos: el transporte y el parser (`zemdb-client`) · ✅ Hecho
 **Objetivo:** que el transporte abra el stream SSE por su propia conexión y que el núcleo lo lea sin pánicos ni reservas de más (DC27).
 
 **Archivos:** `src/transport.rs` (`events` y su resultado), el transporte HTTP, un módulo privado del parser y de la decodificación de los eventos, con sus tests unitarios en `src/tests/`; `tests/common/` (el `events` del transporte de prueba, sobre el router en proceso) y los tests del transporte HTTP. `ARCHITECTURE.md` §11.
@@ -403,6 +403,107 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 **Documentos:** `ARCHITECTURE.md` §11; `INVARIANTES.md`: K12, K15, K7.
 
 **Entrega:** `feat(client): open the event stream on its own connection and read its events within a limit (Fase 4.3, Lote 2)`.
+
+**Hecho** (9 de Noviembre de 2026).
+- **Qué entró.**
+  - `TransportClient::events(room_id, token)`, con su resultado, `EventStream`: `Open` con el cuerpo como bloques de bytes (`EventBlocks`, un `Stream` de `futures`) si el servidor responde 200, y `Refused` con los bytes de la respuesta, hasta `MAX_FRAME_SIZE`, con cualquier otro estado. La implementación por defecto responde el frame de `EventsDisabled`, con la sala y sin correlación, como un servidor con el SSE apagado.
+  - En el transporte HTTP, un segundo cliente HTTP, solo HTTP/1.1, para los streams: con `https://`, el handshake ofrece solo `http/1.1`, y el *prior knowledge* no le aplica. No pasa a un cliente nuevo con los cortes de los pedidos.
+    - El `GET /rooms/{room_id}/events` lleva `Authorization: Bearer` y `Accept: text/event-stream`.
+    - Abrir el stream tiene el plazo de conectar y, hasta los headers, el de inactividad; una negativa se lee como una respuesta (hasta un frame, con el plazo de inactividad entre sus pedazos). Un stream abierto no tiene plazo.
+    - La lectura acotada de una respuesta pasó a una función que comparten `send` y `events`; en `send`, un corte en la respuesta sigue llevando a un cliente nuevo.
+  - En el transporte de prueba, `events` sobre el router en proceso, y en `tests/common/`, un helper que lee los datos del próximo evento de un nombre.
+  - Un módulo privado, `src/events.rs`:
+    - el parser del SSE (`EventParser`): líneas con `\n`, `\r` o `\r\n` (también partidos entre bloques), los campos `event` y `data` (un espacio inicial menos; varias líneas `data` unidas con `\n`), los demás campos y los comentarios ignorados, y la línea en blanco que cierra un evento, que se entrega solo si tiene datos, con el nombre `message` si no tiene `event`. Lo que queda después de la última línea en blanco al terminar el stream se descarta.
+    - El tope: 64 KiB por evento, contando los bytes de sus líneas sin sus fines, comentarios incluidos, y así por línea. Un evento o una línea que lo pasan, o una línea que no es UTF-8, son un error que cierra el stream: el parser lo repite en cada llamada y no retiene nada, tampoco lo que llega después.
+    - `EventReader`, que lee los bloques del transporte de a un evento (un error del transporte también lo termina).
+    - La decodificación de cada evento a `RoomEvent`: `Ops` (el `OpsEvent` del frame, en base64 estándar con padding), `HeadAdvanced` y `SnapshotAvailable` con su secuencia, `SchemaReloaded`, `SnapshotWanted`, `Lagged` y `Unknown`. Lo que no decodifica es un `EventError` tipado: `Base64`, `Frame`, `NotOps` o `Sequence`, y el stream sigue.
+    - Nadie lo usa todavía: lo usa el worker desde el Lote 7. El módulo lleva `expect(dead_code)` fuera de los tests, que avisa cuando deje de hacer falta.
+  - `futures` y `base64` pasan a dependencias del cliente (ya estaban en el lock), solo fuera de wasm32.
+  - Unas 300 líneas de producción, sin comentarios ni líneas vacías (se estimaron 200): el parser, el lector y los tipos de los eventos son unas 210.
+- **Tests.**
+  - `tests/http_transport_tests.rs`: 13 tests nuevos (34 en total), contra el servidor en un socket local y contra servidores mínimos del test.
+    - El stream trae un `event: ops` con el frame del commit de otro cliente (la sala, la encarnación y las operaciones), con el transporte por HTTP/1.1 y por HTTP/2.
+    - Las negativas llegan como frames: un token vencido, vacío o que no es un token, `Unauthorized`; uno de otra sala, `Forbidden`; con el SSE apagado, `EventsDisabled` (HTTP 404).
+    - Los topes del servidor: con `max_sse_streams` en 2, un stream de otro cliente es `RateLimited`, y el tercero del mismo cliente termina el más viejo.
+    - Con el reloj real, el stream termina cuando vence su token (de 2 s), y cuando el servidor se apaga.
+    - Con 33 streams abiertos sin leer (más de los 32 que el servidor acepta en una conexión HTTP/2), un pedido del mismo transporte por HTTP/2 sale y se responde; el frente ve 33 conexiones que empiezan con el `GET` del stream y una sola de HTTP/2.
+    - El stream va debajo de la URL, con el token y `Accept: text/event-stream`, y trae el cuerpo hasta su fin.
+    - Con `https://`, el handshake del stream ofrece solo `http/1.1`, también con *prior knowledge*.
+    - Un servidor que calla antes de los headers del stream, o en medio del cuerpo de una negativa, lo corta en el plazo.
+    - Una negativa se lee entera hasta un frame, y una más larga no se lee.
+    - Una redirección no se sigue y un 204 no abre el stream: los dos son negativas.
+    - Una conexión del stream ociosa más que el pool no se reusa, y dos negativas seguidas comparten una.
+    - Un stream cortado en el medio, sin el último chunk, termina con un error y no como un fin.
+  - En los tests del Lote 1, el que corta un pedido en el plazo y el de la respuesta HTTP/2 cortada a la mitad tienen ahora un tope propio, para fallar en lugar de colgarse si el plazo deja de cortar; y el servidor mínimo que lee un pedido acepta uno sin `Content-Length`, como el `GET` del stream.
+  - `tests/events_tests.rs` (nuevo): un transporte que solo implementa `send` responde el frame de `EventsDisabled` con la sala; el transporte de prueba abre el stream del servidor en proceso, trae un `ops` y da `Unauthorized` con un token vencido.
+  - `src/tests/events.rs` (nuevo): 21 unitarios y la versión larga del fuzzing.
+    - Los seis eventos del servidor, como los escribe (con un keep-alive en el medio), partidos en dos bloques en cada punto posible y de a un byte, dan los mismos eventos.
+    - Varias líneas `data`, con y sin espacio, y una sin dos puntos; los tres fines de línea, también un `\r` al final de un bloque con el `\n` al principio del siguiente; los comentarios y los campos `id`, `retry` y desconocidos; un evento sin datos, que no se entrega y cuyo nombre no pasa al siguiente; y lo que queda sin línea en blanco.
+    - Decodifica los seis eventos del servidor, y uno de nombre desconocido (también `message`) es `Unknown`.
+    - Un evento de exactamente 64 KiB se lee; una línea de un byte más, antes de que llegue su fin, y un evento de líneas cortas que pasa el tope, también con comentarios, terminan el stream. El tope es de cada evento: 8 eventos de 16 KiB se leen.
+    - Pedir otro evento sin un bloque nuevo no da nada más, y el bloque siguiente completa el evento sin duplicar bytes.
+    - Un `\r` seguido de otra línea que sigue en el bloque siguiente: el `\n` que empieza ese bloque termina la segunda línea.
+    - 70.000 keep-alive y después un evento: los eventos sin datos no se suman al tope.
+    - Un campo sin dos puntos tiene un valor vacío.
+    - Los búferes de un evento del tope, que llega en dos pedazos, suman a lo sumo el doble del tope, y nada después de entregarlo.
+    - Después de un error, el parser no retiene nada, tampoco lo que llega, y repite el error.
+    - Bytes que no son UTF-8, en un dato, en un comentario o en un nombre, terminan el stream; un carácter partido entre dos bloques no.
+    - Base64 inválido o sin padding, un frame vacío, truncado, con bytes de más o de otro mensaje (`Error`, `Schema`), y secuencias vacías, negativas, decimales o más grandes que un `u64`, son errores tipados.
+    - El lector entrega los eventos de los bloques hasta que el stream termina, y después sigue dando el fin, sin volver a pedir el stream (un `unfold`, como el del transporte HTTP, entraría en pánico); un error del transporte o del parser lo termina, y lo repite.
+    - Un lector que se suelta mientras espera un bloque (con el reloj pausado, más de 10 veces) no pierde ni duplica nada.
+    - El fuzzing: bytes al azar (sobre todo, piezas de la sintaxis, frames de `ops` en base64 y líneas largas) y los eventos del servidor dañados (un byte cambiado, quitado o agregado, o cortados), partidos en bloques al azar, dan los eventos y el error de un modelo del formato que lee el texto entero de una vez y no comparte código con el parser; ningún evento pasa el tope, y cada uno decodifica o es un error tipado. 300 corridas en la suite y 40.000 en la larga, con `#[ignore]`.
+- **Mutaciones inversas: las 50 las mató algún test.**
+  - El parser: el `\r\n` como un solo fin, el `\r` como fin, la marca del `\r` al final de un bloque; el tope por evento y su borde `>=`, contarlo por línea en lugar de por evento, y no reiniciarlo en la línea en blanco; UTF-8 (con un decodificador con reemplazos); el evento sin datos, el nombre por defecto y que el nombre no pase al siguiente; el espacio inicial, el `\n` entre las líneas `data`, los comentarios como datos y el campo `event`; consumir el bloque cuando no trae un fin de línea; el error que se repite, no retener nada después, y el error del transporte que se repite.
+  - La decodificación: el base64 con padding, el nombre de cada uno de los seis eventos, el desconocido, la secuencia como error tipado y el frame de otro mensaje.
+  - El `events` por defecto: `EventsDisabled` y la sala.
+  - El transporte HTTP: el cliente del stream solo HTTP/1.1, el stream por su cliente y no por el de los pedidos, el bearer y el `Accept`, el plazo hasta los headers, el estado 200, la negativa acotada y la negativa que calla.
+  - Las reglas del Lote 1 que se movieron a la lectura compartida: los dos topes de la respuesta, el plazo por pedazo y el cliente nuevo después de un corte en la respuesta.
+  - Dos sobrevivieron a la primera corrida y llevaron a tests nuevos: no reiniciar el tope en la línea en blanco (8 eventos de 16 KiB se leen) y no consumir el bloque sin fin de línea (pedir otro evento sin un bloque nuevo no da nada más, ni duplica bytes). Otra, el plazo por pedazo, colgaba dos tests del Lote 1 sin tope propio, que ahora lo tienen.
+  - Siete más, de la revisión de delta, con sus tests: el `Fuse` del lector; reponer la marca del `\r` cuando sigue otro byte; reiniciar el tope también en un evento sin datos; que el cliente del stream no siga redirecciones y su pool; el error de un stream cortado en el medio; y abrir el stream solo con 200, no con cualquier 2xx.
+
+  Quedan sin test, con su argumento:
+  - el `connect_timeout` del cliente del stream: como en el Lote 1, haría falta una dirección que descarte los SYN, y eso no es portable en la CI; el plazo hasta los headers cubre también la conexión;
+  - revisar el tope antes de copiar la línea, y no después: la diferencia es transitoria (después del error el parser se vacía igual) y de a lo sumo un bloque;
+  - que el cliente del stream no cambie con los cortes de los pedidos: no hay código que lo cambie (en las interacciones).
+- **Interacciones revisadas.**
+  - El keep-alive del servidor, cada 15 s, es un comentario (`:` y una línea en blanco): el parser lo saltea sin entregar nada y no lo suma al tope (hay tests). Que cuente como señal de vida es del Lote 7: el silencio de 45 s del worker se mide en los bloques que llegan, y el lector no entrega los comentarios, así que el worker envuelve los bloques antes del lector o el lector avisa de cada bloque (anotado en el Lote 7).
+  - El cliente HTTP del stream no pasa a uno nuevo con los cortes de los pedidos: es otro campo del transporte, que `replace` no toca, y con HTTP/1.1 cada stream tiene su conexión, que se cierra al soltarlo. Una conexión trabada es solo la de su stream, y el worker la deja atrás al darlo por muerto (Lote 7). Sin test: no hay código que lo pueda romper.
+  - El tope del evento del servidor (4 KiB de frame, unos 5,5 KiB en el evento) queda muy debajo del de 64 KiB del cliente: ningún evento del servidor lo pasa.
+  - El estado HTTP y el `Content-Type`: con 200, el stream; con cualquier otro, la negativa, hasta un frame, que el núcleo decodifica (hay tests con 401, 403, 404 y 429). El `Content-Type` de un 200 no se mira: un proxy que responde 200 con otra cosa da bytes que el parser lee como cualquier otro stream, sin pánico (el fuzzing), y el worker lo trata como un stream sin eventos que termina.
+  - El tope de streams por cliente (el tercero cierra el más viejo) y el total del servidor (`max_sse_streams`): hay test; el más viejo termina como cualquier stream, y `RateLimited` llega como frame.
+  - El *stall timeout* del servidor cierra la conexión de un stream que no se lee: con su propia conexión, solo la de ese stream (el test de los 33 streams muestra una conexión por stream y los pedidos por otra).
+  - El apagado del servidor y el vencimiento del token terminan el stream: hay tests, con el reloj real.
+  - El pool del cliente del stream retiene una conexión ociosa 5 s, menos que el `header_read_timeout_secs` del servidor (10 s), así que un stream que se vuelve a abrir después de uno que terminó bien no sale por una conexión que el servidor está cerrando.
+  - El tope de conexiones del servidor: cada stream ocupa una, y `max_sse_streams` es por defecto la mitad, así que los streams no las toman todas.
+  - `new` arma dos clientes HTTP: en Linux, lee los certificados de la plataforma dos veces (unos 10 a 16 ms cada una).
+  - Los transportes que no implementan `events` (el de la simulación, los de los parches de la auditoría de 4.2) compilan igual y responden `EventsDisabled`.
+  - El proxy del entorno (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`) vale también para el cliente del stream: con `https://`, un `CONNECT` por stream; con `http://`, un proxy de reenvío que podría retener el cuerpo en su búfer, y entonces el stream parecería callado (lo cubren el heartbeat del worker y el silencio de 45 s del Lote 7).
+  - El cliente del stream comparte con el de los pedidos la configuración validada (el pool, con su tope de 300 s, y el plazo de conectar) y la política de redirecciones: un `3xx` es una negativa (hay test), que el núcleo no decodifica como frame.
+  - Un stream cuya apertura el cliente corta antes de los headers puede seguir abierto en el servidor hasta que nota la conexión cerrada (a lo sumo, en el keep-alive siguiente): ocupa un lugar de `max_sse_streams` y uno de los 2 por cliente, y el tercero del mismo cliente reemplaza al más viejo, así que reabrir no espera.
+  - La negativa reserva lo que anuncia su `Content-Length`, hasta `MAX_FRAME_SIZE`, aunque un frame de error es chico: es el mismo tope que el de una respuesta, como pide DC27.
+  - Un BOM al principio del stream no se descarta, a diferencia del formato: el servidor no manda uno, y el primer evento detrás de uno sería de un nombre desconocido (en ARCHITECTURE). `u64::from_str` acepta `+7` como secuencia: inofensivo.
+  - Cancelación: el lector se puede soltar mientras espera un bloque sin perder ni duplicar nada (hay test), como lo va a usar el worker.
+  - wasm32: el crate sigue vacío ahí, y `futures` y `base64` son dependencias solo fuera de wasm32; el build y el clippy pasan.
+  - El MSRV: `cargo +1.85 build --workspace --lib --bins` y `cargo +1.88 test --workspace --no-run` pasan; `expect` con `reason` es de Rust 1.81.
+- **Revisión de delta, primera ronda: verde.** Sin hallazgos Altos ni Medios; los Bajos y las notas se arreglaron en el lote:
+  - Bajo: el argumento para dejar el `Fuse` sin test no se sostenía (cambiando también el tipo del campo, compila, y con el `unfold` del transporte HTTP el lector entraba en pánico al pedirlo otra vez): test nuevo.
+  - Bajo: dos reglas del parser solo las mataba el fuzzing largo (la marca del `\r` y el tope de un evento sin datos, que con los keep-alive cerraría el stream a los 11 días): tests nuevos.
+  - Bajo: tres reglas del cliente del stream sin test (las redirecciones, el pool y el error de un corte en el medio): tests nuevos, y uno más para un 204.
+  - Bajo: faltaban en las interacciones el proxy del entorno, la configuración y las redirecciones compartidas, y el stream que queda abierto en el servidor después de un corte antes de los headers.
+  - Notas: el BOM (precisado en ARCHITECTURE), la capacidad de los búferes (K15 y ARCHITECTURE dicen ahora hasta unos 128 KiB, con un test), lo que el test de K15 decía de más, el silencio de 45 s del Lote 7 (anotado en sus interacciones) y la reserva de la negativa (en las interacciones).
+  - Adoptó sus tests, con otros nombres, salvo los dos que fallaban a propósito (el BOM y la capacidad), que se resolvieron en los documentos y con el test de los búferes.
+- **Desvíos.**
+  - Unas 300 líneas de producción, contra las 200 estimadas: casi todo, el parser y los tipos de los eventos.
+  - Precisiones de DC27 que el plan no decía:
+    - el tope de 64 KiB cuenta los bytes de las líneas del evento sin sus fines, con los comentarios;
+    - un evento sin datos no se entrega, y lo que queda sin línea en blanco al terminar el stream se descarta, como en el formato de SSE;
+    - abrir el stream tiene el plazo de inactividad hasta los headers, y la negativa, entre sus pedazos (DC27 dice que el de un stream abierto lo pone el worker);
+    - el pedido lleva `Accept: text/event-stream`;
+    - el `Content-Type` de un 200 no se mira.
+  - Un lector (`EventReader`) que el plan no nombraba: lee los bloques del transporte de a un evento, que es lo que cuenta INV-K15.
+  - `futures` y `base64` pasan a dependencias del cliente.
+  - Los tests del `events` por defecto y del transporte de prueba van en un archivo nuevo, `tests/events_tests.rs`.
+  - La lectura acotada de una respuesta se sacó de `send` a una función que comparte con `events`, sin cambiar lo que hace (lo confirman las mutaciones del Lote 1 que se volvieron a correr).
 
 ### Lote 3 · La renovación del token (`zemdb-client`) · ⬜
 **Objetivo:** que un token vencido o inservible no deje a la sala sin red (DC30).
@@ -502,7 +603,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 - Un stream que el transporte de prueba termina, con un `Unauthorized` a la reapertura, se vuelve a abrir con un token renovado (el vencimiento se fabrica, §2, *Pruebas*).
 - Negativos: un stream de una época anterior (la réplica descartada por `InvalidSequence` en un registro, D78) no dispara nada, y se reemplaza; un stream que calla 45 s se reemplaza; un evento que no decodifica lleva a un sync y no detiene nada.
 
-**Interacciones a revisar:** el tope de 2 streams por cliente y sala (el tercero cierra el más viejo, así que reabrir no espera al viejo); el `RateLimited` del tope total; la sala que el servidor detiene por inactividad y vuelve a levantar; el keep-alive; el apagado del servidor; las escrituras y su catch-up, cuyos eventos llegan después (en el Lote 8 se ignoran por el head); el tiempo que el worker deja de leer el stream mientras espera al aplicador, contra el *stall timeout* del servidor (que cierra solo la conexión de ese stream, DC27).
+**Interacciones a revisar:** el tope de 2 streams por cliente y sala (el tercero cierra el más viejo, así que reabrir no espera al viejo); el `RateLimited` del tope total; la sala que el servidor detiene por inactividad y vuelve a levantar; el keep-alive; el apagado del servidor; las escrituras y su catch-up, cuyos eventos llegan después (en el Lote 8 se ignoran por el head); el tiempo que el worker deja de leer el stream mientras espera al aplicador, contra el *stall timeout* del servidor (que cierra solo la conexión de ese stream, DC27); el silencio de 45 s se mide en los bloques del transporte, y el lector del Lote 2 no entrega los comentarios (el keep-alive), así que el worker envuelve los bloques antes del lector o el lector avisa de cada bloque (de la revisión de delta del Lote 2).
 
 **Documentos:** `ARCHITECTURE.md` §11; `INVARIANTES.md`: K7, K6, K12, K15, K17.
 
@@ -578,4 +679,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** plan escrito el 4 de Noviembre de 2026. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su quinta ronda: las precisiones de DC18 y de DC24 a DC26 y DC27 a DC31, como *Propuestas*, y `INVARIANTES.md` en la versión 16. El dueño del proyecto las adoptó el mismo día, con dos ajustes (la frase de DC26 sobre el camino normal sin `/sync` y la verificación del `ClientId` en el Lote 3). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026: S4 respondido en DC27 (compila con `aws-lc-rs` y el MSRV; el plazo de inactividad lo arma el transporte), la revisión de delta en verde en su cuarta ronda e `INVARIANTES.md` en la versión 19 (la 18 la tomó el Lote 0 de 4.4). Lo que sigue es el Lote 2.
+**Avance:** plan escrito el 4 de Noviembre de 2026. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su quinta ronda: las precisiones de DC18 y de DC24 a DC26 y DC27 a DC31, como *Propuestas*, y `INVARIANTES.md` en la versión 16. El dueño del proyecto las adoptó el mismo día, con dos ajustes (la frase de DC26 sobre el camino normal sin `/sync` y la verificación del `ClientId` en el Lote 3). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026: S4 respondido en DC27 (compila con `aws-lc-rs` y el MSRV; el plazo de inactividad lo arma el transporte), la revisión de delta en verde en su cuarta ronda e `INVARIANTES.md` en la versión 19 (la 18 la tomó el Lote 0 de 4.4). Lote 2 (el stream de eventos: el transporte y el parser) cerrado el 9 de Noviembre de 2026: el stream por su propio cliente HTTP/1.1, el parser con su tope de 64 KiB y la decodificación de los eventos, que todavía nadie usa; la revisión de delta en verde en su primera ronda, con sus Bajos arreglados en el lote, e `INVARIANTES.md` en la versión 22 (la 20 la tomó el Lote 6b de 3.12, y la 21, el Lote 1 de 4.4). Lo que sigue es el Lote 3.

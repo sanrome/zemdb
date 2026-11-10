@@ -1,4 +1,4 @@
-use crate::{endpoint, ClientError, TransportClient, TransportError};
+use crate::{endpoint, ClientError, EventStream, TransportClient, TransportError};
 use async_trait::async_trait;
 use bytes::Bytes;
 use http_body::{Body, Frame, SizeHint};
@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::time::Instant;
-use zemdb_core::{encode_message, ClientMessage, MAX_FRAME_SIZE};
+use zemdb_core::{encode_message, ClientMessage, RoomId, MAX_FRAME_SIZE};
 
 /// The pieces the body of a request is handed over in: each one the HTTP layer takes is
 /// progress of the request.
@@ -71,9 +71,16 @@ impl HttpTransportConfig {
 ///
 /// A response is read up to the largest frame: one that announces more, or brings more, fails
 /// without reading the rest.
+///
+/// The event streams go over an HTTP client of their own, over HTTP/1.1 only, so that each one
+/// has a connection of its own: over HTTP/2 they would share the connection of the requests,
+/// whose streams they would take, and a stream nobody reads would make the server close it.
+/// Opening a stream has the timeouts of a request until its headers; an open one has none.
 #[derive(Debug, Clone)]
 pub struct HttpTransport {
     clients: Arc<Clients>,
+    /// The HTTP client of the event streams, which the cuts of the requests do not replace.
+    streams: reqwest::Client,
     url: String,
     idle_timeout: Duration,
 }
@@ -99,15 +106,24 @@ impl Drop for Replacing<'_> {
 }
 
 impl Clients {
-    fn build(config: &HttpTransportConfig) -> Result<reqwest::Client, reqwest::Error> {
-        let mut builder = reqwest::Client::builder()
+    fn builder(config: &HttpTransportConfig) -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
             .connect_timeout(config.connect_timeout)
             .pool_idle_timeout(config.pool_idle_timeout)
-            .redirect(reqwest::redirect::Policy::none());
+            .redirect(reqwest::redirect::Policy::none())
+    }
+
+    fn build(config: &HttpTransportConfig) -> Result<reqwest::Client, reqwest::Error> {
+        let mut builder = Self::builder(config);
         if config.http2_prior_knowledge && config.url.starts_with("http://") {
             builder = builder.http2_prior_knowledge();
         }
         builder.build()
+    }
+
+    /// The client of the event streams.
+    fn build_streams(config: &HttpTransportConfig) -> Result<reqwest::Client, reqwest::Error> {
+        Self::builder(config).http1_only().build()
     }
 
     fn current(&self) -> (u64, reqwest::Client) {
@@ -157,7 +173,8 @@ impl HttpTransport {
     /// A transport with `config`: a URL that is not `http://` or `https://`, or has a user, a
     /// query or a fragment, or a timeout at zero, is `Config`, as is an HTTP client that does
     /// not start, also for `http://` (in Linux, without certificates of the platform), whose
-    /// error gives the cause. Building it reads those certificates in Linux, once.
+    /// error gives the cause. Building it reads those certificates in Linux, once for the
+    /// requests and once for the event streams.
     pub fn new(config: HttpTransportConfig) -> Result<Self, ClientError> {
         let invalid = |reason: &str| ClientError::Config(format!("{reason}: {}", config.url));
         let url = reqwest::Url::parse(&config.url).map_err(|_| invalid("Invalid server URL"))?;
@@ -185,10 +202,13 @@ impl HttpTransport {
             url: url.as_str().trim_end_matches('/').to_string(),
             ..config
         };
-        let client = Clients::build(&config).map_err(|err| {
+        let not_started = |err: reqwest::Error| {
             ClientError::Config(format!("The HTTP client did not start: {}", causes(&err)))
-        })?;
+        };
+        let client = Clients::build(&config).map_err(not_started)?;
+        let streams = Clients::build_streams(&config).map_err(not_started)?;
         Ok(Self {
+            streams,
             url: config.url.clone(),
             idle_timeout: config.idle_timeout,
             clients: Arc::new(Clients {
@@ -228,29 +248,88 @@ impl TransportClient for HttpTransport {
             return Err(stalled());
         };
         let mut response = response.map_err(|err| failed(&err))?;
+        match read_frame(&mut response, &url, self.idle_timeout).await {
+            Ok(reply) => Ok(reply),
+            Err(Read::Stalled) => {
+                self.clients.replace(generation).await;
+                Err(stalled())
+            }
+            Err(Read::Failed(err)) => Err(err),
+        }
+    }
 
-        let announced = response.content_length().unwrap_or(0);
-        let too_long = || TransportError(format!("The response from {url} is longer than a frame"));
-        if announced > MAX_FRAME_SIZE as u64 {
+    async fn events(&self, room_id: &RoomId, token: &str) -> Result<EventStream, TransportError> {
+        let url = format!("{}/rooms/{room_id}/events", self.url);
+        let idle = self.idle_timeout;
+        let stalled = || TransportError(format!("The stream {url} did not advance for {idle:?}"));
+        let request = (self.streams.get(&url))
+            .bearer_auth(token)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .send();
+        let response = tokio::time::timeout(idle, request).await;
+        let mut response = response
+            .map_err(|_| stalled())?
+            .map_err(|err| failed(&err))?;
+        if response.status() != reqwest::StatusCode::OK {
+            return match read_frame(&mut response, &url, idle).await {
+                Ok(refusal) => Ok(EventStream::Refused(refusal)),
+                Err(Read::Stalled) => Err(stalled()),
+                Err(Read::Failed(err)) => Err(err),
+            };
+        }
+        let blocks = futures::stream::unfold(Some(response), |response| async move {
+            let mut response = response?;
+            match response.chunk().await {
+                Ok(Some(block)) => Some((Ok(block), Some(response))),
+                Ok(None) => None,
+                Err(err) => Some((Err(failed(&err)), None)),
+            }
+        });
+        Ok(EventStream::Open(Box::pin(blocks)))
+    }
+}
+
+/// Why the body of a response was not read.
+enum Read {
+    /// It went the idle timeout without a piece.
+    Stalled,
+    Failed(TransportError),
+}
+
+/// The body of `response`, from `url`, read up to the largest frame, with at most `idle`
+/// between its pieces: one longer by its `Content-Length` fails before it is read, and one
+/// longer without it, without reading the rest.
+async fn read_frame(
+    response: &mut reqwest::Response,
+    url: &str,
+    idle: Duration,
+) -> Result<Vec<u8>, Read> {
+    let announced = response.content_length().unwrap_or(0);
+    let too_long = || {
+        Read::Failed(TransportError(format!(
+            "The response from {url} is longer than a frame"
+        )))
+    };
+    if announced > MAX_FRAME_SIZE as u64 {
+        return Err(too_long());
+    }
+    let mut reply = Vec::new();
+    reply.try_reserve_exact(announced as usize).map_err(|_| {
+        Read::Failed(TransportError(format!(
+            "No memory for the response from {url}"
+        )))
+    })?;
+    loop {
+        let Ok(piece) = tokio::time::timeout(idle, response.chunk()).await else {
+            return Err(Read::Stalled);
+        };
+        let Some(piece) = piece.map_err(|err| Read::Failed(failed(&err)))? else {
+            return Ok(reply);
+        };
+        if reply.len() + piece.len() > MAX_FRAME_SIZE {
             return Err(too_long());
         }
-        let mut reply = Vec::new();
-        reply
-            .try_reserve_exact(announced as usize)
-            .map_err(|_| TransportError(format!("No memory for the response from {url}")))?;
-        loop {
-            let Ok(piece) = tokio::time::timeout(self.idle_timeout, response.chunk()).await else {
-                self.clients.replace(generation).await;
-                return Err(stalled());
-            };
-            let Some(piece) = piece.map_err(|err| failed(&err))? else {
-                return Ok(reply);
-            };
-            if reply.len() + piece.len() > MAX_FRAME_SIZE {
-                return Err(too_long());
-            }
-            reply.extend_from_slice(&piece);
-        }
+        reply.extend_from_slice(&piece);
     }
 }
 

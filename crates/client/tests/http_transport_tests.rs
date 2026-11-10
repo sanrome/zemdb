@@ -5,6 +5,7 @@
 mod common;
 
 use common::*;
+use futures::StreamExt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,8 +15,8 @@ use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use zemdb_client::{
-    Client, ClientConfig, ClientError, HttpTransport, HttpTransportConfig, MemoryMetadata,
-    TransportClient,
+    Client, ClientConfig, ClientError, EventBlocks, EventStream, HttpTransport,
+    HttpTransportConfig, MemoryMetadata, TransportClient,
 };
 use zemdb_core::*;
 use zemdb_server::{generate_client_token, serve_until_shutdown};
@@ -112,6 +113,15 @@ impl Front {
         starts
             .iter()
             .all(|start| start.starts_with(b"PRI * HTTP/2.0"))
+    }
+
+    /// The connections forwarded so far that started with `prefix`.
+    fn started_with(&self, prefix: &[u8]) -> usize {
+        let starts = self.starts.lock().unwrap();
+        starts
+            .iter()
+            .filter(|start| start.starts_with(prefix))
+            .count()
     }
 
     /// Whether every connection forwarded so far started with an HTTP/1.1 `POST`.
@@ -266,8 +276,8 @@ async fn answering(
     addr
 }
 
-/// Reads an HTTP/1.1 request with a `Content-Length` until its end, `pace` giving how many
-/// bytes to read before which pause while its body is read, if any.
+/// Reads an HTTP/1.1 request until the end of the body its `Content-Length` gives (none, without
+/// it), `pace` giving how many bytes to read before which pause while its body is read, if any.
 async fn read_request(
     socket: &mut TcpStream,
     pace: Option<&(dyn Fn(usize) -> (usize, Duration) + Sync)>,
@@ -283,7 +293,8 @@ async fn read_request(
             let length = head
                 .lines()
                 .find_map(|line| line.strip_prefix("content-length: "));
-            break (end + 4, length.unwrap().trim().parse::<usize>().unwrap());
+            let length = length.map_or(0, |length| length.trim().parse::<usize>().unwrap());
+            break (end + 4, length);
         }
     };
     let mut read = received.len() - head_len;
@@ -392,7 +403,8 @@ where
 /// `send` fails within a few times `idle`, and not before it.
 async fn cut_after(transport: HttpTransport, message: ClientMessage, idle: Duration) {
     let started = Instant::now();
-    assert!(transport.send(&message, "t").await.is_err());
+    let sent = tokio::time::timeout(idle * 10, transport.send(&message, "t")).await;
+    assert!(matches!(sent, Ok(Err(_))), "{sent:?}");
     let elapsed = started.elapsed();
     assert!(
         elapsed >= idle && elapsed < idle * 10,
@@ -596,9 +608,9 @@ async fn a_response_of_exactly_a_frame_is_read_whole() {
     }
 }
 
-/// The first bytes the transport sends to an `https://` server that never answers: its TLS
-/// `ClientHello`.
-async fn client_hello(http2_prior_knowledge: bool) -> Vec<u8> {
+/// The first bytes the transport sends to an `https://` server that never answers, for a
+/// request or, if `stream`, for an event stream: its TLS `ClientHello`.
+async fn client_hello(http2_prior_knowledge: bool, stream: bool) -> Vec<u8> {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (seen, hello) = oneshot::channel();
@@ -617,8 +629,12 @@ async fn client_hello(http2_prior_knowledge: bool) -> Vec<u8> {
     config.http2_prior_knowledge = http2_prior_knowledge;
     config.idle_timeout = Duration::from_millis(500);
     let transport = HttpTransport::new(config).unwrap();
-    let message = heartbeat(&RoomId::new("r").unwrap());
-    assert!(transport.send(&message, "t").await.is_err());
+    let room_id = RoomId::new("r").unwrap();
+    if stream {
+        assert!(transport.events(&room_id, "t").await.is_err());
+    } else {
+        assert!(transport.send(&heartbeat(&room_id), "t").await.is_err());
+    }
     let hello = tokio::time::timeout(Duration::from_secs(5), hello);
     hello.await.expect("No TLS handshake").unwrap()
 }
@@ -626,7 +642,7 @@ async fn client_hello(http2_prior_knowledge: bool) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn https_offers_http2_and_http1_in_the_tls_handshake_also_with_prior_knowledge() {
     for http2_prior_knowledge in [false, true] {
-        let hello = client_hello(http2_prior_knowledge).await;
+        let hello = client_hello(http2_prior_knowledge, false).await;
         // A TLS handshake record whose protocols (ALPN) are h2 and http/1.1.
         assert_eq!(hello.first(), Some(&0x16));
         assert!(hello.windows(3).any(|bytes| bytes == b"\x02h2"));
@@ -779,7 +795,6 @@ async fn a_slow_request_body_over_http2_is_not_cut() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn after_a_response_cut_halfway_over_http2_the_next_request_goes_over_another_connection() {
-    use futures::StreamExt;
     // The first response stops after its first piece; the others come whole.
     let answered = Arc::new(AtomicUsize::new(0));
     let handler = move || {
@@ -803,7 +818,335 @@ async fn after_a_response_cut_halfway_over_http2_the_next_request_goes_over_anot
     let transport = HttpTransport::new(config).unwrap();
     let message = heartbeat(&RoomId::new("r").unwrap());
 
-    assert!(transport.send(&message, "t").await.is_err());
+    let cut = tokio::time::timeout(Duration::from_secs(5), transport.send(&message, "t")).await;
+    assert!(matches!(cut, Ok(Err(_))), "{cut:?}");
     assert_eq!(transport.send(&message, "t").await.unwrap(), b"whole");
     assert_eq!(front.accepted(), 2);
+}
+
+/// Opens the event stream of `room_id` with `token`, which the server must open.
+async fn open_stream(transport: &HttpTransport, room_id: &RoomId, token: &str) -> EventBlocks {
+    match transport.events(room_id, token).await.unwrap() {
+        EventStream::Open(blocks) => blocks,
+        EventStream::Refused(refusal) => panic!("Refused: {:?}", error_code(&refusal)),
+    }
+}
+
+/// The error code with which the server refuses the event stream of `room_id` with `token`.
+async fn refused(transport: &HttpTransport, room_id: &RoomId, token: &str) -> ErrorCode {
+    match transport.events(room_id, token).await.unwrap() {
+        EventStream::Refused(refusal) => error_code(&refusal),
+        EventStream::Open(_) => panic!("Opened"),
+    }
+}
+
+/// Waits until `blocks` ends, within 10 s.
+async fn ends(blocks: &mut EventBlocks) {
+    let end = async { while let Some(Ok(_)) = blocks.next().await {} };
+    let end = tokio::time::timeout(Duration::from_secs(10), end).await;
+    end.expect("The stream did not end");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_event_stream_brings_the_operations_of_a_commit_of_another_client() {
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let incarnation = server.incarnation(&room_id).await;
+    let (addr, _stop) = serve(&server).await;
+    let token = token(&ClientId::new("ana#phone").unwrap(), &room_id);
+    for (id, http2) in [(1, false), (2, true)] {
+        let transport = transport(format!("http://{addr}"), http2);
+        let mut blocks = open_stream(&transport, &room_id, &token).await;
+        let committed = server.commit(&room_id, [id]).await;
+        let event = ops_event(&next_event(&mut blocks, "ops").await);
+        let ServerMessage::OpsEvent {
+            room_id: of,
+            room_incarnation,
+            ops,
+            ..
+        } = event
+        else {
+            panic!("{event:?}");
+        };
+        assert_eq!(
+            (&of, room_incarnation, ops),
+            (&room_id, incarnation, committed)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_the_stream_is_refused_with_the_frame_of_the_server() {
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let other_room = server.create_room("room-b").await;
+    let (addr, _stop) = serve(&server).await;
+    let to_server = transport(format!("http://{addr}"), false);
+    let client_id = ClientId::new("ana#phone").unwrap();
+    let expired = generate_client_token(&client_id, &room_id, Duration::ZERO, AUTH_SECRET);
+    for token in [expired.as_str(), "", "not a token"] {
+        let refusal = refused(&to_server, &room_id, token).await;
+        assert_eq!(refusal, ErrorCode::Unauthorized, "{token}");
+    }
+    let elsewhere = token(&client_id, &other_room);
+    let refusal = refused(&to_server, &room_id, &elsewhere).await;
+    assert_eq!(refusal, ErrorCode::Forbidden);
+
+    let disabled = TestServer::with(|config| config.max_sse_streams = Some(0));
+    let room_id = disabled.create_room("room-a").await;
+    let (addr, _stop) = serve(&disabled).await;
+    let transport = transport(format!("http://{addr}"), false);
+    let refusal = refused(&transport, &room_id, &token(&client_id, &room_id)).await;
+    assert_eq!(refusal, ErrorCode::EventsDisabled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_limits_of_the_server_refuse_a_stream_or_end_the_oldest_of_a_client() {
+    let server = TestServer::with(|config| config.max_sse_streams = Some(2));
+    let room_id = server.create_room("room-a").await;
+    let (addr, _stop) = serve(&server).await;
+    let transport = transport(format!("http://{addr}"), false);
+    let ana = token(&ClientId::new("ana#phone").unwrap(), &room_id);
+    let mut first = open_stream(&transport, &room_id, &ana).await;
+    let _second = open_stream(&transport, &room_id, &ana).await;
+    let bob = token(&ClientId::new("bob#phone").unwrap(), &room_id);
+    assert_eq!(
+        refused(&transport, &room_id, &bob).await,
+        ErrorCode::RateLimited
+    );
+    let _third = open_stream(&transport, &room_id, &ana).await;
+    ends(&mut first).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_stream_ends_when_its_token_expires() {
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let (addr, _stop) = serve(&server).await;
+    let transport = transport(format!("http://{addr}"), false);
+    let client_id = ClientId::new("ana#phone").unwrap();
+    let short = generate_client_token(&client_id, &room_id, Duration::from_secs(2), AUTH_SECRET);
+    let mut blocks = open_stream(&transport, &room_id, &short).await;
+    ends(&mut blocks).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_stream_ends_when_the_server_shuts_down() {
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let (addr, stop) = serve(&server).await;
+    let transport = transport(format!("http://{addr}"), false);
+    let token = token(&ClientId::new("ana#phone").unwrap(), &room_id);
+    let mut blocks = open_stream(&transport, &room_id, &token).await;
+    drop(stop);
+    ends(&mut blocks).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streams_go_over_connections_of_their_own_and_do_not_hold_back_the_requests() {
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let (addr, _stop) = serve(&server).await;
+    let front = Front::new(addr).await;
+    // The server takes 32 streams at once over an HTTP/2 connection.
+    let transport = transport(front.url(), true);
+    let opening = async {
+        let mut streams = Vec::new();
+        for i in 0..33 {
+            let client_id = ClientId::new(format!("c{i}#phone")).unwrap();
+            streams.push(open_stream(&transport, &room_id, &token(&client_id, &room_id)).await);
+        }
+        streams
+    };
+    let opening = tokio::time::timeout(Duration::from_secs(10), opening);
+    let _streams = opening.await.expect("The streams did not open");
+    let ana = token(&ClientId::new("ana#phone").unwrap(), &room_id);
+    let heartbeat = heartbeat(&room_id);
+    let reply = tokio::time::timeout(Duration::from_secs(5), transport.send(&heartbeat, &ana));
+    let reply = reply.await.expect("The request was held back").unwrap();
+    assert_eq!(error_code(&reply), ErrorCode::ClientNotRegistered);
+    assert_eq!(front.started_with(b"GET /rooms/room-a/events"), 33);
+    assert_eq!(front.started_with(b"PRI * HTTP/2.0"), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_stream_goes_under_the_url_with_its_token_and_brings_the_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (seen, received) = oneshot::channel();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0; 4096];
+        let n = socket.read(&mut buf).await.unwrap();
+        let _ = seen.send(String::from_utf8_lossy(&buf[..n]).to_string());
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                    transfer-encoding: chunked\r\n\r\n";
+        socket.write_all(head.as_bytes()).await.unwrap();
+        socket.write_all(b"9\r\ndata: x\n\n\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        socket.write_all(b"0\r\n\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+    let transport = transport(format!("http://{addr}/zemdb/"), true);
+    let room_id = RoomId::new("room-a").unwrap();
+    let mut blocks = open_stream(&transport, &room_id, "secret").await;
+    let mut body = Vec::new();
+    while let Some(block) = blocks.next().await {
+        body.extend_from_slice(&block.unwrap());
+    }
+    assert_eq!(body, b"data: x\n\n");
+    let request = received.await.unwrap();
+    assert!(request.starts_with("GET /zemdb/rooms/room-a/events HTTP/1.1\r\n"));
+    let request = request.to_lowercase();
+    assert!(request.contains("authorization: bearer secret\r\n"));
+    assert!(request.contains("accept: text/event-stream\r\n"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn over_https_the_stream_offers_only_http1_in_the_tls_handshake() {
+    for http2_prior_knowledge in [false, true] {
+        let hello = client_hello(http2_prior_knowledge, true).await;
+        assert_eq!(hello.first(), Some(&0x16));
+        assert!(!hello.windows(3).any(|bytes| bytes == b"\x02h2"));
+        assert!(hello.windows(9).any(|bytes| bytes == b"\x08http/1.1"));
+    }
+}
+
+/// Opening the stream fails within a few times `idle`, and not before it.
+async fn stream_cut_after(addr: SocketAddr, idle: Duration) {
+    let transport = idle_transport(addr, idle);
+    let started = Instant::now();
+    let room_id = RoomId::new("r").unwrap();
+    let opened = tokio::time::timeout(idle * 10, transport.events(&room_id, "t")).await;
+    assert!(matches!(opened, Ok(Err(_))), "{opened:?}");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= idle && elapsed < idle * 10,
+        "Cut after {elapsed:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_silent_before_the_headers_of_the_stream_or_in_its_refusal_is_cut() {
+    let addr = accepting(64 << 10, |mut socket| async move {
+        let mut buf = vec![0; 64 << 10];
+        while socket.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+    })
+    .await;
+    let idle = Duration::from_millis(300);
+    stream_cut_after(addr, idle).await;
+
+    let head = "HTTP/1.1 404 Not Found\r\ncontent-length: 100\r\n\r\n".to_string();
+    let addr = answering(
+        head,
+        vec![0; 100],
+        10,
+        Duration::from_secs(10),
+        Arc::default(),
+    )
+    .await;
+    stream_cut_after(addr, idle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_is_read_up_to_a_frame() {
+    let refusal = b"the refusal".to_vec();
+    let head = format!(
+        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: {}\r\n\r\n",
+        refusal.len()
+    );
+    let addr = answering(head, refusal.clone(), 4, Duration::ZERO, Arc::default()).await;
+    let transport = idle_transport(addr, Duration::from_secs(5));
+    let opened = transport.events(&RoomId::new("r").unwrap(), "t").await;
+    assert!(matches!(opened, Ok(EventStream::Refused(read)) if read == refusal));
+
+    let head = format!(
+        "HTTP/1.1 404 Not Found\r\ncontent-length: {}\r\n\r\n",
+        MAX_FRAME_SIZE + 1
+    );
+    let written = Arc::new(AtomicUsize::new(0));
+    let body = vec![0; MAX_FRAME_SIZE + 1];
+    let addr = answering(head, body, 64 << 10, Duration::ZERO, Arc::clone(&written)).await;
+    let transport = idle_transport(addr, Duration::from_secs(5));
+    let opened = transport.events(&RoomId::new("r").unwrap(), "t").await;
+    assert!(opened.is_err(), "{opened:?}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(written.load(Ordering::SeqCst) <= MAX_FRAME_SIZE);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redirect_or_another_success_of_the_stream_is_a_refusal() {
+    let body = b"the body of the redirect".to_vec();
+    let head = format!(
+        "HTTP/1.1 302 Found\r\nlocation: /elsewhere\r\ncontent-length: {}\r\n\r\n",
+        body.len()
+    );
+    let addr = answering(head, body.clone(), 1 << 10, Duration::ZERO, Arc::default()).await;
+    let transport = idle_transport(addr, Duration::from_secs(1));
+    let opened = transport.events(&RoomId::new("r").unwrap(), "t").await;
+    assert!(
+        matches!(&opened, Ok(EventStream::Refused(read)) if *read == body),
+        "{opened:?}"
+    );
+
+    let head = "HTTP/1.1 204 No Content\r\n\r\n".to_string();
+    let addr = answering(head, vec![], 1, Duration::ZERO, Arc::default()).await;
+    let transport = idle_transport(addr, Duration::from_secs(1));
+    let opened = transport.events(&RoomId::new("r").unwrap(), "t").await;
+    assert!(
+        matches!(&opened, Ok(EventStream::Refused(read)) if read.is_empty()),
+        "{opened:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_connection_idle_past_the_pool_timeout_is_not_reused() {
+    let server = TestServer::with(|config| config.header_read_timeout_secs = 1);
+    let room_id = server.create_room("room-a").await;
+    let (addr, _stop) = serve(&server).await;
+    let front = Front::new(addr).await;
+    let mut config = HttpTransportConfig::new(front.url());
+    config.pool_idle_timeout = Duration::from_millis(300);
+    let transport = HttpTransport::new(config).unwrap();
+    // A refusal read whole leaves its connection in the pool.
+    assert_eq!(
+        refused(&transport, &room_id, "").await,
+        ErrorCode::Unauthorized
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        refused(&transport, &room_id, "").await,
+        ErrorCode::Unauthorized
+    );
+    assert_eq!(front.connections(), 1);
+    // Idle for longer than the pool keeps it, and less than the server does.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        refused(&transport, &room_id, "").await,
+        ErrorCode::Unauthorized
+    );
+    assert_eq!(front.connections(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_cut_in_the_middle_ends_with_an_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = vec![0; 4096];
+        let _ = socket.read(&mut buf).await.unwrap();
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                    transfer-encoding: chunked\r\n\r\n";
+        socket.write_all(head.as_bytes()).await.unwrap();
+        socket.write_all(b"9\r\ndata: x\n\n\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Closed without the last chunk: the stream was cut, it did not end.
+    });
+    let transport = transport(format!("http://{addr}"), false);
+    let room_id = RoomId::new("room-a").unwrap();
+    let mut blocks = open_stream(&transport, &room_id, "t").await;
+    assert_eq!(&blocks.next().await.unwrap().unwrap()[..], b"data: x\n\n");
+    let next = blocks.next().await;
+    assert!(matches!(next, Some(Err(_))), "{next:?}");
 }

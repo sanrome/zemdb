@@ -8,6 +8,7 @@
 mod client;
 mod config;
 mod error;
+mod events;
 #[cfg(feature = "native")]
 mod http_transport;
 mod metadata;
@@ -19,4 +20,4 @@ pub use error::{ClientError, Violation};
 #[cfg(feature = "native")]
 pub use http_transport::{HttpTransport, HttpTransportConfig};
 pub use metadata::{FileMetadata, MemoryMetadata, MetadataStore, RoomMetadata};
-pub use transport::{endpoint, TransportClient, TransportError};
+pub use transport::{endpoint, EventBlocks, EventStream, TransportClient, TransportError};
