@@ -471,20 +471,21 @@ type Hold = (
     oneshot::Receiver<()>,
 );
 
-/// The reply to a message that a [`TestTransport`] holds until it is released.
+/// The reply to a message that a [`TestTransport`] holds, or the call that a [`TestEngine`] holds,
+/// until it is released.
 pub struct Held {
     replied: oneshot::Receiver<()>,
     release: oneshot::Sender<()>,
 }
 
 impl Held {
-    /// Waits until the server replied to the message.
+    /// Waits until the server replied to the message, or the call is held.
     pub async fn replied(&mut self) {
         let replied = tokio::time::timeout(Duration::from_secs(10), &mut self.replied).await;
         replied.expect("no reply came").unwrap();
     }
 
-    /// Lets the reply reach the client.
+    /// Lets the reply reach the client, or the call reach the engine.
     pub fn release(self) {
         self.release.send(()).unwrap();
     }
@@ -966,9 +967,13 @@ impl RoomFile for TestFile {
 /// What a [`TestEngine`] runs before its next `reload_schema`.
 type BeforeReload = Box<dyn FnOnce() + Send>;
 
+/// A call of a method of a [`TestEngine`] to hold before it reaches the engine: the method, the
+/// sender that tells it was reached, and the receiver of its release.
+type EngineHold = (&'static str, oneshot::Sender<()>, oneshot::Receiver<()>);
+
 /// A storage engine that wraps `E` and fails on demand: [`fail_next`](Self::fail_next) makes the
-/// next call of a method return an error. A close that fails still closes the room, as a disk
-/// engine's does when its last sync fails.
+/// next call of a method return an error, and [`hold_next`](Self::hold_next) holds it. A close
+/// that fails still closes the room, as a disk engine's does when its last sync fails.
 #[derive(Clone)]
 pub struct TestEngine<E> {
     inner: E,
@@ -976,6 +981,7 @@ pub struct TestEngine<E> {
     slow_open: Arc<Mutex<Option<Duration>>>,
     slow_snapshot: Arc<Mutex<Option<Duration>>>,
     before_reload: Arc<Mutex<Option<BeforeReload>>>,
+    holds: Arc<Mutex<Vec<EngineHold>>>,
 }
 
 impl<E> TestEngine<E> {
@@ -986,6 +992,31 @@ impl<E> TestEngine<E> {
             slow_open: Arc::default(),
             slow_snapshot: Arc::default(),
             before_reload: Arc::default(),
+            holds: Arc::default(),
+        }
+    }
+
+    /// Holds the next call of `method` (`reload_schema` or `get_by_id`) before it reaches the
+    /// engine: [`Held::replied`] waits until the call is held, and the call goes on once the
+    /// [`Held`] is released or dropped.
+    pub fn hold_next(&self, method: &'static str) -> Held {
+        let (replied_tx, replied) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        let hold = (method, replied_tx, release_rx);
+        self.holds.lock().unwrap().push(hold);
+        Held { replied, release }
+    }
+
+    /// Waits for the release of the call of `method`, if it is held.
+    async fn hold(&self, method: &str) {
+        let held = {
+            let mut holds = self.holds.lock().unwrap();
+            let index = holds.iter().position(|(held, ..)| *held == method);
+            index.map(|index| holds.remove(index))
+        };
+        if let Some((_, reached, release)) = held {
+            let _ = reached.send(());
+            let _ = release.await;
         }
     }
 
@@ -1032,6 +1063,7 @@ impl<E: StorageEngine> StorageEngine for TestEngine<E> {
         if let Some(before) = before {
             before();
         }
+        self.hold("reload_schema").await;
         self.check("reload_schema")?;
         self.inner.reload_schema(room_id, schema).await
     }
@@ -1081,6 +1113,7 @@ impl<E: StorageEngine> StorageEngine for TestEngine<E> {
         table_id: u16,
         pk: &PrimaryKey,
     ) -> Result<Option<CompactRow>, StorageError> {
+        self.hold("get_by_id").await;
         self.check("get_by_id")?;
         self.inner.get_by_id(room_id, table_id, pk).await
     }

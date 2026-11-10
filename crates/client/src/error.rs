@@ -3,7 +3,7 @@ use std::io;
 use zemdb_core::RoomId;
 use zemdb_storage::{RejectReason, StorageError};
 
-/// The error of a call to the client.
+/// The error of a call to the client, or to its facade.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 pub enum ClientError {
     /// The configuration cannot work: a person that is empty, holds `#` or does not make a
@@ -52,6 +52,19 @@ pub enum ClientError {
     /// room, or the token does not grant it.
     #[error("The server refused the write: {0}")]
     Validation(String),
+
+    /// The operation or the read is not valid for the schema of the replica: a table, a column
+    /// or a key that is not of it, a value that is not of the type of its column, or a `NULL`
+    /// where the column does not take one. Nothing was sent. Unlike `Validation`, the server
+    /// never saw it. Its message names tables, columns and types, never values.
+    #[error("Invalid operation: {0}")]
+    InvalidOperation(String),
+
+    /// The operation or the read touches an encrypted column, which the client cannot encrypt or
+    /// decrypt. Nothing was sent, and nothing of the column was read. Its message names tables
+    /// and columns, never values.
+    #[error("Encryption error: {0}")]
+    Crypto(String),
 }
 
 /// The constraint that a write rejected by the replica would break.

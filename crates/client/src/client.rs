@@ -10,7 +10,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 use zemdb_core::{
     decode_message, ClientId, ClientMessage, CorrelationId, ErrorCode, MutationId, Operation,
-    RoomId, SchemaId, SequenceNumber, SequencedOperation, ServerMessage,
+    RoomId, Schema, SchemaId, SequenceNumber, SequencedOperation, ServerMessage,
 };
 use zemdb_storage::{StorageEngine, StorageError};
 
@@ -1518,6 +1518,34 @@ impl Client {
         let rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
         let room = rooms.get(room_id).map(Arc::clone);
         room.ok_or_else(|| ClientError::RoomClosed(room_id.clone()))
+    }
+
+    /// What `read` reads from the schema of the open replica of `room_id`, with the epoch of the
+    /// replica: `RoomClosed` if it is not open (closed, empty, or out of the client in the middle
+    /// of a change). Read under the synchronous lock of the room, without the applier, so a
+    /// change of the replica in progress does not hold it back.
+    pub(crate) fn read_schema<T>(
+        &self,
+        room_id: &RoomId,
+        read: impl FnOnce(&Schema) -> T,
+    ) -> Result<(u64, T), ClientError> {
+        let room = self.room(room_id)?;
+        let state = room.state();
+        match &state.replica {
+            Replica::Open(open) => Ok((state.epoch, read(&open.metadata.schema))),
+            _ => Err(ClientError::RoomClosed(room_id.clone())),
+        }
+    }
+
+    /// Whether the replica of `room_id` is still of `epoch`: no discard came since a read of its
+    /// schema in that epoch, so its storage room holds the same incarnation.
+    pub(crate) fn is_of_epoch(&self, room_id: &RoomId, epoch: u64) -> bool {
+        (self.room(room_id)).is_ok_and(|room| room.state().epoch == epoch)
+    }
+
+    /// The storage engine of the replicas.
+    pub(crate) fn storage(&self) -> &dyn StorageEngine {
+        &*self.local.storage
     }
 
     /// The diagnosis of `room_id`; `RoomClosed` if its replica is not open in the client.

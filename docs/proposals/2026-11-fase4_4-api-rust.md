@@ -2,7 +2,7 @@
 
 **Fecha:** 6 de Noviembre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre de 2026, sin cambios. El Lote 1 (`check_operation`) cerró el 9 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lo que sigue es el Lote 2.
+**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre de 2026, sin cambios. El Lote 1 (`check_operation`) cerró el 9 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda, y el Lote 2 (la fachada y las lecturas) el 10 de Noviembre de 2026, también en su primera ronda. Lo que sigue es el Lote 3.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.4. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Parte de:** el núcleo de la réplica de 4.2 ([plan](2026-10-fase4_2-nucleo-replica.md)), y la API que la sub-fase 4.3 agrega al núcleo ([plan](2026-11-fase4_3-transporte-worker.md)): el `TokenProvider` (DC30), el worker con `start_worker` y `set_freshness`, y el estado de la conexión (DC28). 4.3 corre en paralelo: los lotes de 4.4 que usan algo de ella van después del lote de 4.3 que lo trae (§4.4 del plan de la fase).
@@ -140,7 +140,7 @@ Depende de los Lotes 3, 4 y 7 de 4.3 (el `TokenProvider`, el worker y su estado,
 |---|---|---|---|---|---|
 | 0 | Contrato | Documentos | DC32 a DC37 | Ajustes: C3, K2, K3, K4, K7, K8, K9, K10, K12, K15, K17 y §2 | ✅ |
 | 1 | `check_operation` | storage | DC33 | C3 | ✅ |
-| 2 | La fachada y las lecturas | client | DC32 | K17 | ⬜ |
+| 2 | La fachada y las lecturas | client | DC32 | K17 | ✅ |
 | 3 | Las escrituras y el dueño | client | DC32, DC33 | K2, K8 | ⬜ |
 | 4 | El pre-chequeo | client | DC33 | K2, K8, K17 | ⬜ |
 | 5 | El cifrado de columnas | client | DC34 | K9, K12, K2 | ⬜ |
@@ -291,7 +291,7 @@ Depende de los Lotes 3, 4 y 7 de 4.3 (el `TokenProvider`, el worker y su estado,
   - fmt, clippy del workspace y de wasm32 con `-D warnings`, la suite del workspace (1309 tests, sin fallas; después de los arreglos de la revisión, la del storage otra vez, con el test de `apply_snapshot`), doc con `-D warnings` y el build a wasm32.
   - Los `--ignored` del storage en release: 22, sin fallas.
 
-### Lote 2 · La fachada y las lecturas (`zemdb-client`) · ⬜
+### Lote 2 · La fachada y las lecturas (`zemdb-client`) · ✅ Hecho
 **Objetivo:** los handles de DC32 y las lecturas locales, sin escrituras todavía.
 
 **Archivos:** `src/api/` (nuevo: el cliente, la sala, la tabla, las filas, las claves y el `scan`, con sus tests unitarios en `src/api/tests/`), `src/lib.rs`, `src/client.rs` (el esquema de una réplica abierta y el motor, `pub(crate)`), `src/error.rs` (`InvalidOperation` y `Crypto`); `tests/facade_tests.rs`. `ARCHITECTURE.md` §11 (*Facade*).
@@ -312,6 +312,65 @@ Depende de los Lotes 3, 4 y 7 de 4.3 (el `TokenProvider`, el worker y su estado,
 **Documentos:** `ARCHITECTURE.md` §11; `INVARIANTES.md`: K17 (el handle de una sala que falla cerrada).
 
 **Entrega:** `feat(client): the Rust facade, its handles and the local reads (Fase 4.4, Lote 2)`.
+
+**Hecho** (10 de Noviembre de 2026).
+- **Qué entró.**
+  - **Los handles** (`src/api/`): `ZemdbClient` (`open`, con el `CryptoEngine` opcional como `Option<Arc<dyn CryptoEngine>>`, `client_id`, `room` y `shutdown`), `RoomHandle` (`room_id`, `table`, `status` y `close`) y `TableHandle` (`name`, `room`, `get` y `scan`). Se clonan barato: comparten el cliente por un `Arc`. Un `RoomHandle` nombra su sala por el id, así que el handle de una sala cerrada y abierta otra vez la alcanza otra vez. `room` devuelve el handle también cuando `open_room` termina en `FailedClosed` con la réplica abierta, y el error de `open_room` en cualquier otro caso (una sala sin metadatos y sin respuesta, `Network`).
+  - **Las filas, las claves y el `scan`** (`row.rs`, `scan.rs`): `Row` y `Key`, mapas de columnas por nombre (`serde` transparente sobre un `BTreeMap<String, Value>`), y `Scan` (los dos límites del rango, cada uno una clave entera, la `Direction`, el límite y las columnas), con `serde` y métodos para armarlos.
+  - **Las lecturas** (`table.rs`): una lectura se planea contra el esquema de la réplica, con su época, bajo el lock síncrono de la sala y sin el aplicador (`Read::get` y `Read::scan`: la tabla, la clave, el rango y las columnas, por nombre), y después lee el storage por el id de la tabla (`get_by_id` y `scan_by_id`). Las filas toman los nombres de las columnas leídas: una fila corta tiene las que le faltan en `NULL`, y los valores que una versión posterior del esquema agregó al final quedan afuera. Después de leer, si la réplica ya no es de la misma época (un descarte en el medio, después del cual la sala del storage puede tener otra encarnación, con otro esquema), la lectura es `RoomClosed`, igual que si la sala del storage estaba cerrada cuando la lectura llegó a ella (`RoomNotFound`); una sala cerrada y abierta otra vez antes de que la lectura llegue se lee, como abrió.
+  - **Los errores** (`error.rs`): `InvalidOperation` (una tabla, una columna o una clave que no son del esquema, un valor de otro tipo o un `NULL` en la clave, una columna pedida dos veces) y `Crypto` (una lectura que daría una columna cifrada, con o sin `CryptoEngine`, después de validar la lectura, como una escritura valida por nombre antes de cifrar). Sus mensajes nombran tablas, columnas y tipos, nunca valores.
+  - **Del núcleo, `pub(crate)`** (`client.rs`): `read_schema` (lo que la fachada lee del esquema de una réplica abierta, con su época), `is_of_epoch` (si la réplica sigue en esa época) y `storage` (el motor).
+- **Tests.**
+  - **De integración** (`tests/facade_tests.rs`), contra el servidor en proceso, con una tabla con el dueño en la clave (`members`) y otra con una columna cifrada (`rounds`); la réplica se pone al día antes con el `Client` del núcleo, porque la fachada no sincroniza hasta el Lote 8:
+    - las filas por nombre: `get` de una fila de otro miembro, con la columna dueño en la clave, y una fila corta, escrita antes de agregar una columna, con ella en `NULL`; `scan` con rangos incluidos, excluidos y abiertos, hacia atrás, con límite (también 0), con columnas, y un rango invertido, que no da filas; otro handle de la sala lee lo mismo; nada se manda;
+    - sin red, una sala con metadatos abre sin registrarse y se lee, sin mandar nada;
+    - una sala que falla cerrada al abrirse tiene su handle, su `status` lo dice, y se lee, también desde otro handle;
+    - otro error de la apertura que fallar cerrada (`Storage`, al leer el head para el registro) no da el handle, aunque la réplica quede abierta;
+    - `RoomClosed`: cerrada, con su apertura fallida, con la sala del storage cerrada durante una lectura (`RoomNotFound` del motor de prueba; otro error del motor es `Storage`), vacía después de un descarte por `RoomReset` hasta `Registered`, y después de `shutdown`; una sala sin metadatos y sin red no tiene handle (`Network`);
+    - una lectura no espera a un cambio de la réplica en curso: con la recarga del esquema retenida bajo el aplicador (el motor de prueba suma `hold_next`), lee con el esquema de antes;
+    - un descarte mientras una lectura está en el storage la hace `RoomClosed`;
+    - los negativos: una tabla, una columna o una clave que no son del esquema (una columna de más o de menos, otro tipo, `NULL`), en `get` y en los límites del `scan`, y una columna pedida dos veces, son `InvalidOperation`, sin nombrar los valores; `get` y `scan` de `rounds` que dan `notes` son `Crypto`, con y sin `CryptoEngine`, y un `scan` que no la pide lee la ronda que bob abrió con texto cifrado en ella;
+    - la ida y vuelta por JSON de `Row` (con cada tipo de `Value`), `Key`, `Scan`, `Direction`, `RoomStatus` y cada `ClientError`.
+  - **Unitarios** (`src/api/tests/table.rs`), con un servidor de mentira que solo responde registros:
+    - una lectura planeada antes de que la sala del storage recargue el esquema y tome filas con la columna nueva da las columnas del esquema que leyó;
+    - una lectura planeada antes de cerrar y abrir la sala en la misma época lee; una planeada antes de un descarte por una sala creada otra vez, cuya tabla con el mismo id es otra con una fila de la misma clave (un entero), es `RoomClosed`, en `get` y en `scan`;
+    - una fila del storage, corta o con valores de más, toma los nombres de las columnas de la lectura.
+- **Mutaciones inversas: las 17 las mató algún test.**
+  - Una lectura que no verifica la época, que la verifica antes de leer el storage en lugar de después, o una verificación que ignora la época.
+  - Una lectura que se niega mientras un cambio de la réplica está en curso (en lugar de leer sin el aplicador).
+  - Una sala del storage cerrada en el medio que da `Storage` en lugar de `RoomClosed`.
+  - Una fila corta que no trae en `NULL` las columnas que le faltan.
+  - Una clave que acepta otra columna, o cualquier valor.
+  - Un `scan` que acepta una columna dos veces, que ignora sus columnas, su dirección o su límite.
+  - Un `get` o un `scan` que dan columnas cifradas, y un `get` que da `Crypto` antes de validar la clave.
+  - `room` sin el handle de una sala que falla cerrada, y `room` con el handle después de cualquier error con la réplica abierta.
+- **El checklist propio** (§2), en lo que toca a un lote de lecturas:
+  - las lecturas no mandan nada (el transporte de prueba registra también lo que se manda sin red) y no esperan al aplicador (el test con la recarga retenida);
+  - los argumentos y los resultados son datos de la fachada, serializables (la ida y vuelta por JSON); los handles no;
+  - los cambios del núcleo son tres accesos `pub(crate)`, que usa la producción;
+  - ningún mensaje de la fachada lleva valores (los tests de los negativos buscan el valor en el mensaje).
+  - Del checklist del cliente de 4.2, para lo que cambia del núcleo: los accesos leen el estado de la sala bajo su lock síncrono, sin `.await` con él tomado, y no cambian nada.
+- **Interacciones revisadas.**
+  - El aplicador: las lecturas no lo toman. Durante la reapertura de la sala del storage (DC21) o un cierre, la lectura que llega a la sala cerrada es `RoomClosed`; con el motor en disco, una lectura espera mientras el motor abre o borra una sala del storage (de cualquier sala), porque eso toma su mapa de salas.
+  - El cambio de esquema entre leer el esquema y leer el storage (DC20): el storage recarga antes de que la réplica tome el esquema, y el esquema solo crece, así que los ids de las tablas y las posiciones de las columnas leídas siguen valiendo.
+  - El descarte por `RoomReset`: la réplica vacía es `RoomClosed`, y un descarte en el medio de una lectura también, por la época.
+  - `open_room` sobre una sala abierta (otro handle, la misma sala) y sobre una que falla cerrada (el handle, también en un segundo `room`).
+  - Los cambios de 4.3 en `client.rs`: solo los tres accesos, al lado de `room`.
+  - El runtime del Worker de 4.5: `Row`, `Key`, `Scan`, `RoomStatus` y `ClientError` pasan por `serde`; `ZemdbClient`, `RoomHandle` y `TableHandle` son `Send + Sync`.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura, que probó en su propia copia con sus propias mutaciones), **primera ronda: verde.** Ningún hallazgo Alto ni Medio. Sus seis Bajos se arreglaron en el lote:
+  - `ARCHITECTURE.md` y el rustdoc de `get` prometían `RoomClosed` para una sala cerrada y abierta otra vez durante la lectura, y la lectura la lee si la sala ya abrió cuando llega a ella: se precisaron, y la verificación quedó solo en la época (`is_of_epoch`), que es lo que impide leer otra encarnación;
+  - con el motor en disco, una lectura espera a la apertura o al borrado de una sala del storage, que toman el mapa de salas del motor: se documentó (§11 de `ARCHITECTURE.md` y las interacciones de arriba);
+  - ningún test fijaba que `room` devuelve otro error de `open_room` con la réplica abierta: ahora uno lo hace, y su mutación está arriba;
+  - el unitario del descarte buscaba una clave de otro tipo que la fila de la otra tabla: ahora es la misma, y el `get` sin la verificación de la época leería esa fila;
+  - el `scan` de `rounds` que no pide `notes` leía una tabla vacía: ahora lee una ronda con texto cifrado;
+  - el encabezado de este plan, que faltaba actualizar.
+- **Desvíos.**
+  - El motor de prueba de `tests/common/` suma `hold_next` (retener la próxima llamada a `reload_schema` o `get_by_id`), para los dos tests de lecturas durante un cambio, que el plan no listaba.
+  - La guarda de `Crypto` va después de la validación por nombre: una lectura inválida para el esquema es `InvalidOperation` aunque toque una columna cifrada, como una escritura valida por nombre antes de cifrar (DC32).
+- **Chequeos.**
+  - fmt, clippy del workspace y de wasm32 con `-D warnings`, doc con `-D warnings` y el build a wasm32.
+  - La suite del workspace (1364 tests, sin fallas, antes de los arreglos de la revisión); después de ellos, otra vez fmt, clippy, wasm32 y doc, la suite del cliente (213 tests, sin fallas) y las mutaciones.
+  - Los `--ignored` del cliente en release: 3, sin fallas.
 
 ### Lote 3 · Las escrituras y el dueño (`zemdb-client`) · ⬜
 **Objetivo:** `insert`, `update` y `delete` con el dueño completado por el SDK (DC32, DC33).
@@ -502,4 +561,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** plan escrito el 6 de Noviembre de 2026, con DC32 a DC37 *Propuestas*. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre, sin cambios. Lote 1 (`check_operation`) cerrado el 9 de Noviembre, con la revisión de delta en verde en su primera ronda. Lo que sigue es el Lote 2.
+**Avance:** plan escrito el 6 de Noviembre de 2026, con DC32 a DC37 *Propuestas*. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre, sin cambios. Lote 1 (`check_operation`) cerrado el 9 de Noviembre, con la revisión de delta en verde en su primera ronda. Lote 2 (la fachada y las lecturas) cerrado el 10 de Noviembre, con la revisión de delta en verde en su primera ronda. Lo que sigue es el Lote 3.
