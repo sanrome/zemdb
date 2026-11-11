@@ -2,7 +2,7 @@
 
 **Fecha:** 6 de Noviembre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre de 2026, sin cambios. El Lote 1 (`check_operation`) cerró el 9 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda, y el Lote 2 (la fachada y las lecturas) el 10 de Noviembre de 2026, también en su primera ronda. Lo que sigue es el Lote 3.
+**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre de 2026, sin cambios. El Lote 1 (`check_operation`) cerró el 9 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda, el Lote 2 (la fachada y las lecturas) el 10 de Noviembre de 2026, también en su primera ronda, y el Lote 3 (las escrituras y el dueño) el 11 de Noviembre de 2026, también en su primera ronda. Lo que sigue es el Lote 4.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.4. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Parte de:** el núcleo de la réplica de 4.2 ([plan](2026-10-fase4_2-nucleo-replica.md)), y la API que la sub-fase 4.3 agrega al núcleo ([plan](2026-11-fase4_3-transporte-worker.md)): el `TokenProvider` (DC30), el worker con `start_worker` y `set_freshness`, y el estado de la conexión (DC28). 4.3 corre en paralelo: los lotes de 4.4 que usan algo de ella van después del lote de 4.3 que lo trae (§4.4 del plan de la fase).
@@ -141,7 +141,7 @@ Depende de los Lotes 3, 4 y 7 de 4.3 (el `TokenProvider`, el worker y su estado,
 | 0 | Contrato | Documentos | DC32 a DC37 | Ajustes: C3, K2, K3, K4, K7, K8, K9, K10, K12, K15, K17 y §2 | ✅ |
 | 1 | `check_operation` | storage | DC33 | C3 | ✅ |
 | 2 | La fachada y las lecturas | client | DC32 | K17 | ✅ |
-| 3 | Las escrituras y el dueño | client | DC32, DC33 | K2, K8 | ⬜ |
+| 3 | Las escrituras y el dueño | client | DC32, DC33 | K2, K8 | ✅ |
 | 4 | El pre-chequeo | client | DC33 | K2, K8, K17 | ⬜ |
 | 5 | El cifrado de columnas | client | DC34 | K9, K12, K2 | ⬜ |
 | 6 | `watch` | client | DC35 | K10, K15 | ⬜ |
@@ -372,7 +372,7 @@ Depende de los Lotes 3, 4 y 7 de 4.3 (el `TokenProvider`, el worker y su estado,
   - La suite del workspace (1364 tests, sin fallas, antes de los arreglos de la revisión); después de ellos, otra vez fmt, clippy, wasm32 y doc, la suite del cliente (213 tests, sin fallas) y las mutaciones.
   - Los `--ignored` del cliente en release: 3, sin fallas.
 
-### Lote 3 · Las escrituras y el dueño (`zemdb-client`) · ⬜
+### Lote 3 · Las escrituras y el dueño (`zemdb-client`) · ✅ Hecho
 **Objetivo:** `insert`, `update` y `delete` con el dueño completado por el SDK (DC32, DC33).
 
 **Archivos:** `src/api/` (la tabla y el dueño); `tests/facade_write_tests.rs`. `ARCHITECTURE.md` §11.
@@ -392,6 +392,84 @@ Depende de los Lotes 3, 4 y 7 de 4.3 (el `TokenProvider`, el worker y su estado,
 **Documentos:** `ARCHITECTURE.md` §11; `INVARIANTES.md`: K2, K8.
 
 **Entrega:** `feat(client): writes through the facade, with the owner filled by the client (Fase 4.4, Lote 3)`.
+
+**Hecho** (11 de Noviembre de 2026).
+- **Qué entró.**
+  - **Las escrituras** (`table.rs`): `TableHandle::insert(row)`, que devuelve la clave de la fila con la columna dueño, `update(key, changes)` (los cambios, una `Row`) y `delete(key)`. Siguen el orden de DC32 hasta el paso 8, sin `Offline`, el cifrado ni el pre-chequeo:
+    1. la réplica abierta: la escritura se planea contra el esquema de la réplica, con su época, bajo el lock síncrono de la sala y sin el aplicador, como una lectura (`read_schema`), así que una réplica que no está abierta, también en medio de la reapertura de su sala del storage, es `RoomClosed` sin esperar;
+    2. la validación por nombre (`write.rs`, nuevo): la tabla, las columnas, el tipo en claro de cada valor y su nulabilidad, la clave (con `primary_key` de `table.rs`, que ahora toma el dueño de una escritura), una columna obligatoria que falta en un `insert` (una nullable vale `NULL`), la columna dueño en la fila o en los cambios, una columna de la clave en los cambios y unos cambios vacíos;
+    3. el dueño (DC33): `ClientId::owner` como `Value::String`, en la columna dueño de la fila de un `insert`, y en un `update` o un `delete`, en la clave si la columna es de ella (si la clave no la trae, la completa; si la trae, con el dueño del cliente), y si no, como un delta más del `update` y como el `owner` del `delete`;
+    4. hasta el Lote 5, `Crypto` para una escritura que toca una columna cifrada: todo `insert` en su tabla (también con `NULL`, o si la omite), y un `update` que la nombra, también con `NULL`; un valor de otro tipo (un `Bytes` en una columna `String`) es `InvalidOperation` antes, en el paso 2;
+    5. la validación de la operación que se manda: `Schema::validate_operation` y `Schema::check_owner` con el `ClientId` del cliente, en el plan, y fuera del lock, `check_operation_size`, con la secuencia del peor caso y un `MutationId`, y el tope de un mensaje para el `Commit` que la lleva, con los ids del cliente y de la sala, y la correlación y el cursor del peor caso (`fitting`); antes del plan, sin el lock, una fila o unos cambios cuyos valores solos ocupan más que un mensaje ya son demasiado grandes (`bounded`), para que el plan no los copie bajo el lock de la sala;
+    6. una llamada a `write` del núcleo, por `write_in`.
+  - **La escritura va solo a la réplica de la época en que se planeó** (`client.rs`): `write_in(room_id, op, planned)`, `pub(crate)`, es el `write` del núcleo con la época del plan, y `write` la llama sin época. Cuando la escritura lee su pedido bajo el aplicador, una réplica de otra época termina la escritura con `RoomClosed` antes de cualquier intento (lo que la escritura mandó para registrarse, como el registro que encontró el descarte, no lleva la operación): un descarte, por ejemplo por un `RoomReset` en el registro de la misma escritura, después del cual la sala del storage puede tener otra encarnación, con otro esquema, cuya tabla del mismo id tomaría la operación. Un descarte con la escritura en vuelo la termina como en 4.2.
+  - **El `timestamp`** es la hora de pared en milisegundos.
+  - **Los mensajes** que arma la fachada nombran tablas, columnas y tipos, nunca valores; los de `validate_operation`, `check_owner` y `check_operation_size`, que la fachada pasa como `InvalidOperation`, tampoco llevan valores.
+- **Tests de integración** (`tests/facade_write_tests.rs`, 9), contra el servidor en proceso, con un esquema de la app de referencia con ids enteros (`rankings`, con el dueño fuera de la clave y un `UNIQUE`; `members`, con el dueño en la clave y una FK; `votes`, inmutable; `rounds`, con `notes` cifrada; y `tags`, sin dueño):
+  - `insert`, `update` y `delete` en las tres clases de tablas: la clave que devuelve `insert` sirve para `get`, `update` y `delete`, también una clave de escritura sin la columna dueño; cada `Commit` que registra el transporte declara el dueño de la persona (`ClientId::owner`, no el `ClientId`), con la hora de pared, y uno de `tags` ninguno; el `delete` de `rankings` lleva el `owner`, y los otros no; el servidor los toma todos;
+  - los negativos, sin mandar nada y sin nombrar valores: la columna dueño en la fila o en los cambios (también con el dueño del cliente), otro dueño en la clave, una columna de la clave en los cambios, unos cambios vacíos, una columna obligatoria que falta, una columna que no es de la tabla, otro tipo, `NULL` donde no va, una clave con una columna de más o de menos, un `update` y un `delete` de una tabla inmutable, y una operación más grande que el tope, por sus valores antes del plan (en un `insert` y en un `update`) o ya armada; cada uno con el mensaje de la regla que lo ataja;
+  - hasta el Lote 5, con y sin `CryptoEngine`: `notes` con un `String`, con `NULL` o sin nombrarla es `Crypto`, y con un `Bytes`, `InvalidOperation`, sin mandar nada; un `update` que no la toca y un `delete` salen;
+  - las decisiones de la réplica: `Unique`, `ForeignKey`, `Restrict`, `Duplicate` (un `insert` de una clave que está, en la tabla inmutable; en otra, la fila se reemplaza entera), `NotOwner` (reemplazar, cambiar o borrar una fila de otra persona con el dueño fuera de la clave) y `RowMissing`, y el `delete` de una fila que no está no cambia nada;
+  - dos dispositivos de una persona: uno cambia y borra las filas que escribió el otro, con el mismo dueño;
+  - una escritura incierta (la respuesta perdida, y el intento siguiente rechazado para siempre) termina `OutcomeUnknown`, con un solo `MutationId` en sus dos intentos y una sola secuencia en el log;
+  - `RoomClosed`, sin mandar nada: en medio de la reapertura de la sala del storage después de un error de `apply_batch` en el catch-up de otra escritura (con `open_room` retenido; la escritura no espera la reapertura), cerrada, vacía después de un descarte por `RoomReset` y después de `shutdown`;
+  - una escritura planeada antes de un descarte no se manda a la sala recreada: abierta sin red, sin registrar, y con la sala recreada con una tabla del id de `rankings` que tomaría su `insert`, el registro de la propia escritura la descarta, y la escritura es `RoomClosed`: lo único que sale son sus dos registros, con el cursor y sin él;
+  - una sala que falla cerrada: sus escrituras son `FailedClosed`, sin mandar nada.
+- **Tests unitarios** (`src/api/tests/write.rs`, 5):
+  - el tope de una operación, en su borde (por bisección contra `check_operation_size`): con un valor grande, donde ata la respuesta, un byte más entra con la secuencia 1 y no con la del peor caso; con muchos valores, donde ata el registro del log, uno más entra sin `MutationId` y no con él;
+  - el `Commit` que la lleva: la operación más grande que entra sola entra en el `Commit` de ids cortos y no en el de la sala de id más largo y un `ClientId` largo; y la más grande que `fitting` acepta con esos ids codifica en un `Commit` con la correlación y el cursor del peor caso, y una más grande no;
+  - la cota de los valores antes del plan;
+  - un `Writer` que completaría otro dueño: la operación que arma es válida para el esquema, y `check_owner` la frena (en un `insert` con el dueño en la clave y en un `delete` con el dueño fuera).
+- **Mutaciones inversas: las 35 las mató algún test** (25 antes de la revisión de delta, y 10 de lo que arregló).
+  - La época: el núcleo que no la verifica, la fachada que escribe sin ella.
+  - La fachada que repite una escritura incierta.
+  - El dueño: un `insert` que toma la columna dueño en la fila, un `update` que la toma en los cambios, una clave de escritura que toma otro dueño o que necesita la columna dueño, el `ClientId` entero como dueño, un `update` sin el delta del dueño fuera de la clave, un `delete` que nunca o siempre declara el dueño, y un `insert` que devuelve la clave sin la columna dueño.
+  - La validación por nombre: un `update` que toma una columna de la clave, uno sin cambios que sale, una columna obligatoria que falta que vale `NULL`, un `insert` que deja afuera una columna que no es de la tabla, y un `insert` o un `update` que no verifican el tipo.
+  - Las columnas cifradas: un `insert` en su tabla que no es `Crypto`, o que lo es solo si la nombra, y un `update` que la cambia que no es `Crypto`, o que no lo es con `NULL`.
+  - La operación que se manda: sin el tope de su tamaño, o con la secuencia 1 o sin `MutationId` en lugar del peor caso; sin el tope del `Commit` que la lleva, o con una correlación o un cursor cortos; sin `validate_operation` ni `check_owner`, o sin `check_owner` solo.
+  - La cota de los valores antes del plan: sin ella en un `insert` o en un `update`, o una cota que nunca rechaza.
+  - El motivo del mensaje `Crypto` sin tener en cuenta si la aplicación dio un `CryptoEngine`.
+  - El `timestamp` que no es la hora de pared.
+- **El checklist propio** (§2), en lo que toca a un lote de escrituras:
+  - cada escritura sigue el orden de DC32 hasta el paso 8, y todo error local sale antes de llamar a `write`, sin mandar nada (los tests miran que el transporte no registre ningún pedido), salvo el `RoomClosed` de la época, que sale de `write_in` antes de cualquier intento: lo que sale antes son los registros de la propia escritura, y el test lo fija;
+  - la fachada llama a `write` una vez por escritura y nunca la repite: un solo `MutationId` en los intentos de una escritura incierta, y su mutación;
+  - ningún valor de una columna cifrada sale de la fachada: hasta el Lote 5, una escritura que toca una es `Crypto`, y ningún mensaje lleva valores (los tests de los negativos buscan el valor en el mensaje);
+  - los argumentos y los resultados son datos de la fachada, serializables (`Row` y `Key`);
+  - el cambio del núcleo es `write_in`, `pub(crate)`, que usa la producción, y `write` no cambia de forma.
+  - Del checklist del cliente de 4.2, para lo que cambia del núcleo: `write_in` solo suma una verificación de la época del pedido, después de leerlo bajo el aplicador y antes de cualquier intento, sin un lock nuevo.
+- **Interacciones revisadas.**
+  - `write` del núcleo (DC6, DC21): una sola llamada, que reintenta con su `MutationId`; con la renovación del token de 4.3 (Lote 3, que entró a `main` durante este lote), el intento que se manda otra vez después de `Unauthorized` lleva el mismo `MutationId`, y la verificación de la época va antes del primero.
+  - La verificación del dueño en el servidor (`Schema::check_owner`, INV-A5) y en la réplica (`NotOwner`): la fachada verifica la operación armada como el servidor, y la réplica rechaza un cambio de una fila de otra persona.
+  - `MissingOwner` y `UnexpectedOwner` de `validate_operation`: el delta del dueño y el `owner` del `delete` van solo con el dueño fuera de la clave (las mutaciones de los dos lados).
+  - `ClientId::owner` con dispositivos (DC15): el dueño es la persona, y los dos dispositivos escriben las mismas filas.
+  - Una tabla inmutable: su `update` y su `delete` son `InvalidOperation` (los rechaza `validate_operation`, como el servidor), y un `insert` de una clave que está, `Duplicate`.
+  - Una sala que falla cerrada: `FailedClosed` del núcleo, que no se registra ni manda nada.
+  - El cifrado del Lote 5: el paso 6 corre dentro del plan, bajo el lock síncrono de la sala; el cifrado es asíncrono, así que el Lote 5 parte el plan: la validación por nombre y el dueño, el cifrado sin el lock, y la validación de la operación cifrada contra el esquema de la réplica de la misma época.
+  - Una recarga del esquema en la misma época entre el plan y el intento: la operación sigue valiendo, porque el esquema solo crece (`extends` conserva las posiciones) y una fila más corta vale con la versión siguiente.
+  - El límite aceptado de INV-K2 (un commit cuyo cursor se leyó antes de un descarte): la verificación de la época va al leer el pedido, bajo el aplicador, así que no achica esa ventana; con la fachada, la operación es la que se planeó contra el esquema de antes (anotado en INV-K2).
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura, que probó en su propia copia con sus propias mutaciones), **primera ronda: verde.** Ningún hallazgo Alto ni Medio. Sus cinco Bajos se arreglaron en el lote:
+  - "sin mandar nada" no valía para el `RoomClosed` de la época, antes del cual salen los registros de la propia escritura: se precisaron el rustdoc de `write_in`, §11 de `ARCHITECTURE.md`, INV-K2 y esta nota, y el test fija lo que sale;
+  - el tope de la operación no acotaba el `Commit` que la lleva: con un id de sala y un `ClientId` largos, una operación al borde no se codificaba, y la escritura quedaba incierta sin que nada saliera. `fitting` suma el tope del mensaje, con sus tests; lo del núcleo quedó pendiente (abajo);
+  - una fila enorme se copiaba bajo el lock de la sala antes de que el tope la rechazara: ahora la cota de sus valores va antes del plan (`bounded`);
+  - reglas que ningún test fijaba: `check_owner` por sí sola, la secuencia del peor caso y el `MutationId` del tope, y el motivo del mensaje `Crypto` con y sin `CryptoEngine`. Las fijan los tests unitarios de `write.rs` y una aserción más;
+  - faltaba en las interacciones la recarga del esquema entre el plan y el intento, y el rustdoc de `RoomClosed` no cubría un descarte desde el plan.
+- **Desvíos.**
+  - El núcleo suma `write_in`: el plan decía que `write` del núcleo no cambiaba, y sin la época una escritura planeada antes de un descarte por un `RoomReset` en su propio registro se mandaba a la sala recreada, donde una tabla del mismo id podía tomarla. La forma pública de `write` no cambia.
+  - Las escrituras se planean en un módulo propio (`write.rs`), que reusa los helpers de `table.rs`.
+  - El motor de prueba de `tests/common/` suma `hold_next("open_room")`, para el test de una escritura durante la reapertura de la sala del storage.
+  - La fachada suma dos topes que el plan no listaba (de la revisión de delta): el del `Commit` que lleva la operación, y la cota de los valores antes del plan.
+- **Al backlog** (de la revisión de delta, fuera de la fachada; Bajos: `INVARIANTES.md` §1.2):
+  - **DEF-197 · Bajo · (b) · K2.**
+    - **Qué pasa:** el transporte codifica cada mensaje (`TransportClient::send`), y un `Commit` cuyo payload pasa `MAX_MESSAGE_SIZE` no se codifica: con `HttpTransport` es un `TransportError`, que el núcleo toma como un intento sin respuesta. El intento queda incierto, la escritura reintenta hasta su plazo y termina `OutcomeUnknown`, aunque nada salió del dispositivo; INV-K2 pide `OutcomeUnknown` solo si algún intento pudo secuenciarse. Con el `TestTransport` de los tests, el `unwrap` de la codificación entra en pánico.
+    - **Alcance:** la fachada ya no arma un `Commit` así (`fitting` lo acota desde este lote). Queda la API de bajo nivel (`Client::write`), con una operación a menos de unos 150 bytes del tope de una operación sola y un id de sala o un `ClientId` largos.
+    - **Fix:** que el núcleo distinga "no se codificó" (nada salió: un error sin efecto) de "no hubo respuesta". Por ejemplo, que verifique antes del primer intento que el `Commit` entra en un mensaje, o que el transporte devuelva un error propio para lo que no codificó.
+    - **Test:** una escritura del núcleo con una operación que entra sola (`check_operation_size`) y cuyo `Commit`, con ids largos, no entra en un mensaje termina sin efecto, sin `OutcomeUnknown`.
+  - Varias reglas de la validación por nombre (otro dueño en la clave, una columna obligatoria que falta, una columna de la clave en los cambios, otro tipo o `NULL` en una columna en claro) las ataja también el paso 6, con otro mensaje: los tests de los negativos miran el mensaje, para que sus mutaciones no sobrevivan.
+- **Chequeos.**
+  - fmt, clippy del workspace con `-D warnings`, el build y clippy a wasm32 de `zemdb-core`, `zemdb-storage` y `zemdb-client` con `-D warnings`, y doc con `-D warnings`.
+  - La suite del workspace (1400 tests, sin fallas), sobre `main` con el Lote 3 de 4.3 integrado, antes de los arreglos de la revisión de delta; después de ellos, otra vez fmt, clippy, wasm32 y doc, y la suite del cliente (252 tests, sin fallas). En una corrida anterior, con otras compilaciones en paralelo, falló una vez un test del servidor que este lote no toca (`a_panic_in_a_file_operation_stops_the_room_and_the_next_request_reopens_it`); pasó aislado tres veces y en la suite entera.
+  - Los `--ignored` del cliente en release: 3, sin fallas. Una corrida después de los arreglos de la revisión falló a los 3 s: en `replicas_converge_over_many_long_simulations`, una llamada no terminó en 10 minutos de reloj virtual (`simulation_tests.rs:909`), y su pánico, por el contador global de pánicos, hizo fallar también a `no_reply_in_place_of_the_servers_panics_a_client_over_many_long_simulations`. No volvió a pasar en siete corridas más (dos de los dos tests y cinco de la de convergencia). La simulación escribe con `Client::write`, para el que `write_in` no cambia nada (sin época), así que no viene de este lote; la causa queda por encontrar, fuera de él.
+  - Las mutaciones, otra vez después de integrar el Lote 3 de 4.3 y después de los arreglos de la revisión: las 35 mueren.
 
 ### Lote 4 · El pre-chequeo (`zemdb-client`) · ⬜
 **Objetivo:** que una escritura que la réplica local ya rechazaría no salga (DC33).
@@ -561,4 +639,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** plan escrito el 6 de Noviembre de 2026, con DC32 a DC37 *Propuestas*. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre, sin cambios. Lote 1 (`check_operation`) cerrado el 9 de Noviembre, con la revisión de delta en verde en su primera ronda. Lote 2 (la fachada y las lecturas) cerrado el 10 de Noviembre, con la revisión de delta en verde en su primera ronda. Lo que sigue es el Lote 3.
+**Avance:** plan escrito el 6 de Noviembre de 2026, con DC32 a DC37 *Propuestas*. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre, sin cambios. Lote 1 (`check_operation`) cerrado el 9 de Noviembre, con la revisión de delta en verde en su primera ronda. Lote 2 (la fachada y las lecturas) cerrado el 10 de Noviembre, con la revisión de delta en verde en su primera ronda. Lote 3 (las escrituras y el dueño) cerrado el 11 de Noviembre, con la revisión de delta en verde en su primera ronda. Lo que sigue es el Lote 4.

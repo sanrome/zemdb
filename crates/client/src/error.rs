@@ -19,7 +19,8 @@ pub enum ClientError {
     #[error("Storage error: {0}")]
     Storage(String),
 
-    /// The room is not open in this client, or the client is shut down.
+    /// The room is not open in this client, or the client is shut down; or, for a read or a write
+    /// of the facade, its replica was discarded since it was planned against it.
     #[error("Room '{0}' is not open")]
     RoomClosed(RoomId),
 
@@ -55,8 +56,12 @@ pub enum ClientError {
 
     /// The operation or the read is not valid for the schema of the replica: a table, a column
     /// or a key that is not of it, a value that is not of the type of its column, or a `NULL`
-    /// where the column does not take one. Nothing was sent. Unlike `Validation`, the server
-    /// never saw it. Its message names tables, columns and types, never values.
+    /// where the column does not take one; in a write, also a column that it lacks and does not
+    /// take `NULL`, the owner column, which the client fills (or another owner in the key), an
+    /// update without changes or of a column of the key, or an operation that the server would
+    /// not take from the client or that is larger than its limit. Nothing was sent. Unlike
+    /// `Validation`, the server never saw it. Its message names tables, columns and types, never
+    /// values.
     #[error("Invalid operation: {0}")]
     InvalidOperation(String),
 

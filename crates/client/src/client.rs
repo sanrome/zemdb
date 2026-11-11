@@ -1124,6 +1124,20 @@ impl Client {
     /// for a snapshot to the next heartbeat or sync, so that its decision does not wait for the
     /// upload.
     pub async fn write(&self, room_id: RoomId, op: Operation) -> Result<(), ClientError> {
+        self.write_in(room_id, op, None).await
+    }
+
+    /// [`write`](Self::write), for an operation planned against the replica of `room_id` in the
+    /// epoch `planned`, if any: a replica of another epoch (a discard, after which the storage
+    /// room may hold another incarnation, with another schema) ends the write with `RoomClosed`
+    /// before any attempt, as one that is not open does. What the write sent to register, such as
+    /// the registration that found the discard, does not carry the operation.
+    pub(crate) async fn write_in(
+        &self,
+        room_id: RoomId,
+        op: Operation,
+        planned: Option<u64>,
+    ) -> Result<(), ClientError> {
         let room = self.room(&room_id)?;
         let mutation_id = MutationId::from(Uuid::new_v4().as_u128());
         let deadline = (Instant::now().checked_add(self.config.write_timeout))
@@ -1169,6 +1183,11 @@ impl Client {
                 return Err(ends(uncertain, expired()));
             };
             let request = request.map_err(|err| ends(uncertain, err))?;
+            // A discard ends a write in flight, above: one not in flight yet is not sent to
+            // another epoch than the one it was planned in.
+            if planned.is_some_and(|planned| planned != request.epoch) {
+                return Err(ends(uncertain, ClientError::RoomClosed(room.id.clone())));
+            }
             let ready = request.registered && request.awaits_snapshot.is_none();
             let Some((cursor, _)) = request.cursor.filter(|_| ready) else {
                 // It registers, or, behind the log, catches up with a heartbeat, which downloads

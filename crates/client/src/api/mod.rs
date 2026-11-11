@@ -11,6 +11,7 @@ mod room;
 mod row;
 mod scan;
 mod table;
+mod write;
 
 pub use client::ZemdbClient;
 pub use room::RoomHandle;

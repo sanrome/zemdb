@@ -96,6 +96,7 @@ columns! {
 columns! {
     /// The key of a row of a table: the values of the columns of its primary key, by their
     /// names. The key of a read has every column of the primary key, the owner column too, if it
-    /// is one of them.
+    /// is one of them; that of a write may lack the owner column, which the client fills, or have
+    /// it with the owner of the client, as the key that an insert returns has it.
     Key
 }

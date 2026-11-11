@@ -1,9 +1,12 @@
 use futures::StreamExt;
 use std::fmt;
 use std::ops::Bound;
-use zemdb_core::{ColumnDef, CompactRow, DataType, PrimaryKey, RoomId, Schema, TableSchema, Value};
+use zemdb_core::{
+    ColumnDef, CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, TableSchema, Value,
+};
 use zemdb_storage::{KeyRange, ScanDirection, ScanOptions, StorageEngine, StorageError};
 
+use super::write::{bounded, fitting, Writer};
 use super::{Direction, Key, RoomHandle, Row, Scan};
 use crate::ClientError;
 
@@ -49,6 +52,74 @@ impl TableHandle {
     pub async fn scan(&self, scan: &Scan) -> Result<Vec<Row>, ClientError> {
         let read = self.plan(|schema, crypto| Read::scan(schema, &self.name, scan, crypto))?;
         self.read(read).await
+    }
+
+    /// Inserts `row`, the `Insert` of the protocol: a row with its key already in the table is
+    /// replaced whole, except in an immutable table, where the replica rejects it (`Duplicate`).
+    /// Returns the key of the row, with the owner column, as reads take it.
+    ///
+    /// `row` has a value of its type for each column of the table, or lacks only columns that
+    /// take `NULL`, which they get, and does not have the owner column, which the client fills
+    /// with its owner ([`ClientId::owner`](zemdb_core::ClientId::owner)). Otherwise, the insert
+    /// is `InvalidOperation`, and it is `Crypto` in a table with an encrypted column; either way,
+    /// it sends nothing. Then the client writes it once ([`Client::write`](crate::Client::write)):
+    /// it returns once the replica decided on its sequence (`ConstraintViolation` if it rejects
+    /// it), and is never repeated, so `OutcomeUnknown` is an outcome that reaches the replica with
+    /// the log.
+    ///
+    /// A replica that is not open is `RoomClosed`, and so is one discarded before the insert is
+    /// sent, which may have another schema; one that fails closed is `FailedClosed`.
+    pub async fn insert(&self, row: &Row) -> Result<Key, ClientError> {
+        bounded(row.iter().map(|(_, value)| value))?;
+        let (epoch, (op, key)) =
+            self.plan_write(|writer, schema| writer.insert(schema, &self.name, row))?;
+        self.write(epoch, op).await?;
+        Ok(key)
+    }
+
+    /// Updates the row of `key` with `changes`, as [`insert`](Self::insert) writes: only the
+    /// columns that change, at least one, none of the key nor the owner column.
+    ///
+    /// `key` names the row as a read does, but it may lack the owner column, if it is of the
+    /// key, which the client fills, and if it has it, it has the owner of the client: the client
+    /// only writes its own rows, and the replica rejects an update of the row of another
+    /// (`NotOwner`), or of one that is not there (`RowMissing`). An update of an encrypted column
+    /// is `Crypto`.
+    pub async fn update(&self, key: &Key, changes: &Row) -> Result<(), ClientError> {
+        bounded(changes.iter().map(|(_, value)| value))?;
+        let (epoch, op) =
+            self.plan_write(|writer, schema| writer.update(schema, &self.name, key, changes))?;
+        self.write(epoch, op).await
+    }
+
+    /// Deletes the row of `key`, named as [`update`](Self::update) names it, as
+    /// [`insert`](Self::insert) writes. The delete of a row that is not there changes nothing.
+    pub async fn delete(&self, key: &Key) -> Result<(), ClientError> {
+        let (epoch, op) =
+            self.plan_write(|writer, schema| writer.delete(schema, &self.name, key))?;
+        self.write(epoch, op).await
+    }
+
+    /// The write that `plan` makes against the schema of the replica, with the writer of the
+    /// client, and the epoch of the replica.
+    fn plan_write<T>(
+        &self,
+        plan: impl FnOnce(&Writer<'_>, &Schema) -> Result<T, ClientError>,
+    ) -> Result<(u64, T), ClientError> {
+        let client = self.room.client();
+        let core = client.core();
+        let client_id = core.client_id();
+        let writer = Writer::new(&client_id, client.has_crypto());
+        let room_id = self.room.room_id();
+        let (epoch, write) = core.read_schema(room_id, |schema| plan(&writer, schema))?;
+        Ok((epoch, write?))
+    }
+
+    /// Writes `op`, planned in `epoch`, if it fits: once, to the replica of that epoch.
+    async fn write(&self, epoch: u64, op: Operation) -> Result<(), ClientError> {
+        let (core, room_id) = (self.room.client().core(), self.room.room_id());
+        let op = fitting(op, &core.client_id(), room_id)?;
+        core.write_in(room_id.clone(), op, Some(epoch)).await
     }
 
     /// The read that `plan` makes against the schema of the replica, given whether the
@@ -114,7 +185,7 @@ impl Read {
     /// The read of the row of `key` in the table `name` of `schema`, with every column.
     fn get(schema: &Schema, name: &str, key: &Key, crypto: bool) -> Result<Self, ClientError> {
         let table = table(schema, name)?;
-        let pk = primary_key(table, key)?;
+        let pk = primary_key(table, key, None)?;
         readable(table, None, crypto)?;
         let columns = table.columns().iter();
         Ok(Self {
@@ -186,12 +257,12 @@ impl Read {
     }
 }
 
-fn invalid(message: String) -> ClientError {
+pub(super) fn invalid(message: String) -> ClientError {
     ClientError::InvalidOperation(message)
 }
 
 /// The table `name` of `schema`.
-fn table<'a>(schema: &'a Schema, name: &str) -> Result<&'a TableSchema, ClientError> {
+pub(super) fn table<'a>(schema: &'a Schema, name: &str) -> Result<&'a TableSchema, ClientError> {
     let table = schema.get_table_by_name(name);
     table.ok_or_else(|| invalid(format!("The room has no table '{name}'")))
 }
@@ -218,7 +289,7 @@ fn readable(
 
 /// The error of a read or a write that touches the encrypted `column` of `table`, which the
 /// facade does not encrypt or decrypt.
-fn encrypted(table: &TableSchema, column: &ColumnDef, crypto: bool) -> ClientError {
+pub(super) fn encrypted(table: &TableSchema, column: &ColumnDef, crypto: bool) -> ClientError {
     let why = match crypto {
         true => "the client does not encrypt or decrypt columns yet",
         false => "the client has no CryptoEngine",
@@ -231,7 +302,11 @@ fn encrypted(table: &TableSchema, column: &ColumnDef, crypto: bool) -> ClientErr
 
 /// Checks that `value` can be in `column` of `table`: of the type of the column (the type of its
 /// values in the clear, if it is encrypted), or `NULL` if the column takes it.
-fn check_value(table: &TableSchema, column: &ColumnDef, value: &Value) -> Result<(), ClientError> {
+pub(super) fn check_value(
+    table: &TableSchema,
+    column: &ColumnDef,
+    value: &Value,
+) -> Result<(), ClientError> {
     let (name, found) = (column.name(), value.data_type());
     match found {
         DataType::Null if column.is_nullable() => Ok(()),
@@ -249,15 +324,36 @@ fn check_value(table: &TableSchema, column: &ColumnDef, value: &Value) -> Result
 }
 
 /// The primary key of `table` that `key` names: `key` has every column of the primary key, each
-/// with a value of its type, and no other column.
-fn primary_key(table: &TableSchema, key: &Key) -> Result<PrimaryKey, ClientError> {
+/// with a value of its type, and no other column. With `owner`, the owner column and the owner of
+/// the client in a write, `key` may lack that column, which then has the owner, and if it has
+/// it, it has that owner.
+pub(super) fn primary_key(
+    table: &TableSchema,
+    key: &Key,
+    owner: Option<(&str, &Value)>,
+) -> Result<PrimaryKey, ClientError> {
     let columns = table.primary_key();
     let missing = |name: &str| invalid(format!("The key of '{}' lacks '{name}'", table.name()));
     let mut values = Vec::with_capacity(columns.len());
     for name in columns {
-        let value = key.get(name).ok_or_else(|| missing(name))?;
         let column = table.get_column(name).ok_or_else(|| missing(name))?;
-        check_value(table, column, value)?;
+        let owner = owner
+            .filter(|(owner, _)| owner == name)
+            .map(|(_, owner)| owner);
+        let value = match (key.get(name), owner) {
+            (Some(value), owner) => {
+                check_value(table, column, value)?;
+                if owner.is_some_and(|owner| owner != value) {
+                    return Err(invalid(format!(
+                        "The key of '{}' has another owner than the client in '{name}'",
+                        table.name()
+                    )));
+                }
+                value
+            }
+            (None, Some(owner)) => owner,
+            (None, None) => return Err(missing(name)),
+        };
         values.push(value.clone());
     }
     // Every column of the primary key is in the key, so a key with more holds another.
@@ -273,8 +369,8 @@ fn primary_key(table: &TableSchema, key: &Key) -> Result<PrimaryKey, ClientError
 /// The bound of the keys of `table` that `bound` names.
 fn bound(table: &TableSchema, bound: &Bound<Key>) -> Result<Bound<PrimaryKey>, ClientError> {
     Ok(match bound {
-        Bound::Included(key) => Bound::Included(primary_key(table, key)?),
-        Bound::Excluded(key) => Bound::Excluded(primary_key(table, key)?),
+        Bound::Included(key) => Bound::Included(primary_key(table, key, None)?),
+        Bound::Excluded(key) => Bound::Excluded(primary_key(table, key, None)?),
         Bound::Unbounded => Bound::Unbounded,
     })
 }
