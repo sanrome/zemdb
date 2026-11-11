@@ -465,11 +465,8 @@ async fn a_server_that_keeps_asking_to_register_again_ends_the_sync() {
 
 #[tokio::test]
 async fn a_sync_or_an_ack_the_server_refuses_fails_and_changes_nothing() {
-    let codes = [
-        ErrorCode::Unavailable,
-        ErrorCode::Internal,
-        ErrorCode::Unauthorized,
-    ];
+    // `Unauthorized` renews the token (`token_tests.rs`).
+    let codes = [ErrorCode::Unavailable, ErrorCode::Internal];
     for kind in [Sync, Ack] {
         for code in codes {
             let dir = tempdir().unwrap();
@@ -672,6 +669,7 @@ async fn a_batch_that_does_not_follow_the_head_is_not_applied_and_the_sync_goes_
         storage.clone(),
         MemoryMetadata::default(),
         transport.clone(),
+        TestTokens::new(),
     )
     .await
     .unwrap();
@@ -812,6 +810,7 @@ async fn a_registration_answered_after_the_replica_went_back_registers_again_wit
         storage.clone(),
         MemoryMetadata::default(),
         transport.clone(),
+        TestTokens::new(),
     )
     .await
     .unwrap();

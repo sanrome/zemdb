@@ -1,5 +1,6 @@
 //! The ZemDB client: one replica per room, kept with the client's durable metadata
-//! ([`MetadataStore`]) and synchronized through an abstract transport ([`TransportClient`]).
+//! ([`MetadataStore`]) and synchronized through an abstract transport ([`TransportClient`]), with
+//! the tokens of the application ([`TokenProvider`]).
 //!
 //! The facade ([`ZemdbClient`], [`RoomHandle`] and [`TableHandle`]) reads the rows of a room by
 //! the names of their columns; under it, the core ([`Client`]) is the low-level API.
@@ -16,6 +17,7 @@ mod events;
 #[cfg(feature = "native")]
 mod http_transport;
 mod metadata;
+mod token;
 mod transport;
 
 pub use api::{Direction, Key, RoomHandle, Row, Scan, TableHandle, ZemdbClient};
@@ -25,4 +27,5 @@ pub use error::{ClientError, Violation};
 #[cfg(feature = "native")]
 pub use http_transport::{HttpTransport, HttpTransportConfig};
 pub use metadata::{FileMetadata, MemoryMetadata, MetadataStore, RoomMetadata};
+pub use token::{TokenError, TokenProvider};
 pub use transport::{endpoint, EventBlocks, EventStream, TransportClient, TransportError};

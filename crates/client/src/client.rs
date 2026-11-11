@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::future::Future;
@@ -14,7 +15,10 @@ use zemdb_core::{
 };
 use zemdb_storage::{StorageEngine, StorageError};
 
-use crate::{ClientConfig, ClientError, MetadataStore, RoomMetadata, TransportClient};
+use crate::token::issued_to;
+use crate::{
+    ClientConfig, ClientError, MetadataStore, RoomMetadata, TokenProvider, TransportClient,
+};
 
 /// The size of the chunks of a download, the largest that the relay serves, and the largest of an
 /// upload.
@@ -31,12 +35,16 @@ const CHUNK_RETRIES: u32 = 3;
 /// designates to start uploading, after which it designates one again.
 const UPLOAD_PAUSE: Duration = Duration::from_secs(60);
 
+/// How long the token provider has to give a token.
+const TOKEN_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The client of a device: one replica per room it opens.
 pub struct Client {
     client_id: ClientId,
     config: ClientConfig,
     local: Local,
     transport: Box<dyn TransportClient>,
+    tokens: Box<dyn TokenProvider>,
     /// Every room the client opened, open or not: a room keeps its epoch while the client lives.
     rooms: Mutex<HashMap<RoomId, Arc<Room>>>,
     correlation_ids: AtomicU64,
@@ -80,6 +88,8 @@ struct Room {
     registration: tokio::sync::Mutex<()>,
     /// Held by the download or the upload of a snapshot: one at a time.
     transfer: tokio::sync::Mutex<()>,
+    /// Held by a renewal of the token: one at a time.
+    renewal: tokio::sync::Mutex<()>,
     state: Mutex<State>,
 }
 
@@ -88,9 +98,22 @@ struct State {
     replica: Replica,
     /// How many times the client discarded the replica.
     epoch: u64,
-    /// The token of the last `open_room`.
+    /// The token of the room: that of the last `open_room`, or of the last renewal after it.
     token: String,
+    /// Whether the server forbade the token: the next request renews it before it is sent.
+    forbidden: bool,
+    /// How many renewals of the token ended, with a token or without one, and the token the last
+    /// one replaced or tried to.
+    renewals: u64,
+    renewed: String,
     writes: Writes,
+}
+
+impl State {
+    fn set_token(&mut self, token: String) {
+        self.token = token;
+        self.forbidden = false;
+    }
 }
 
 /// The replica of a room.
@@ -416,13 +439,33 @@ impl Room {
         self.update(epoch, |open| open.registered = false);
         Ok(())
     }
+
+    /// Takes a `Forbidden` to a request sent with `token`: if it is still the token of the room,
+    /// the next request renews it before it is sent.
+    fn forbid(&self, token: &str) {
+        let mut state = self.state();
+        if state.token == token {
+            state.forbidden = true;
+        }
+    }
+}
+
+/// `message` as it is sent with `token`: a registration carries it inside too.
+fn with_token<'a>(message: &'a ClientMessage, token: &str) -> Cow<'a, ClientMessage> {
+    let ClientMessage::RegisterClient { .. } = message else {
+        return Cow::Borrowed(message);
+    };
+    let mut message = message.clone();
+    if let ClientMessage::RegisterClient { auth_token, .. } = &mut message {
+        token.clone_into(auth_token);
+    }
+    Cow::Owned(message)
 }
 
 /// What the next request of a replica presents, read under its applier, so that no change of
 /// the replica is halfway.
 struct Request {
     epoch: u64,
-    token: String,
     /// The head and the incarnation of an open replica.
     cursor: Option<(SequenceNumber, u128)>,
     registered: bool,
@@ -482,10 +525,11 @@ fn client_id(person: &str, device_id: u128) -> Result<ClientId, ClientError> {
 }
 
 impl Client {
-    /// Opens the client of `config.person` over `storage`, `metadata` and `transport`. It holds
-    /// `metadata` until [`shutdown`](Self::shutdown): another client over the same metadata
-    /// fails. The metadata are those of `storage`, which no other client uses: a disk engine
-    /// with [`FileMetadata`](crate::FileMetadata) in its data directory, or a memory engine with
+    /// Opens the client of `config.person` over `storage`, `metadata` and `transport`, with
+    /// `tokens` for the new tokens of its rooms. It holds `metadata` until
+    /// [`shutdown`](Self::shutdown): another client over the same metadata fails. The metadata
+    /// are those of `storage`, which no other client uses: a disk engine with
+    /// [`FileMetadata`](crate::FileMetadata) in its data directory, or a memory engine with
     /// [`MemoryMetadata`](crate::MemoryMetadata). Its client id is `person#device`, with the
     /// device id that `metadata` keeps.
     ///
@@ -496,6 +540,7 @@ impl Client {
         storage: impl StorageEngine + 'static,
         metadata: impl MetadataStore + 'static,
         transport: impl TransportClient + 'static,
+        tokens: impl TokenProvider + 'static,
     ) -> Result<Self, ClientError> {
         // Every device id makes a valid client id if one does.
         client_id(&config.person, 0)?;
@@ -515,6 +560,7 @@ impl Client {
                 shut_down: Arc::default(),
             },
             transport: Box::new(transport),
+            tokens: Box::new(tokens),
             rooms: Mutex::default(),
             correlation_ids: AtomicU64::new(0),
         })
@@ -529,6 +575,12 @@ impl Client {
     /// Opens `room_id`, with `token` for its requests: opens its replica from its metadata and
     /// registers it, with the head of its storage room as its cursor and the incarnation of its
     /// metadata. Opening a room that is open registers it if it is not, with the new token.
+    ///
+    /// The server refusing the token of the room (`Unauthorized`) to any request renews it: the
+    /// client asks its token provider for a new one, once at a time in the room, which it takes
+    /// only if it is of its client id, and sends the request again with it, once. A token the
+    /// server forbade (`Forbidden`) is renewed before the next request of the room is sent. The
+    /// new token is the token of the room, until the next renewal or open.
     ///
     /// A room without metadata (new, or whose metadata are lost or do not verify) holds data of
     /// an unknown incarnation: its data are deleted, and it opens with the metadata of
@@ -556,13 +608,14 @@ impl Client {
                     applier: Arc::default(),
                     registration: tokio::sync::Mutex::default(),
                     transfer: tokio::sync::Mutex::default(),
+                    renewal: tokio::sync::Mutex::default(),
                     state: Mutex::default(),
                 })
             });
             Arc::clone(room)
         };
         let _registration = room.registration.lock().await;
-        room.state().token = token;
+        room.state().set_token(token);
         self.change(&room, Local::open).await?;
         match self.register(&room).await {
             // Without a valid reply, a replica with metadata opens all the same, to be read.
@@ -591,20 +644,21 @@ impl Client {
             if request.registered {
                 return Ok(());
             }
-            let (epoch, token) = (request.epoch, request.token);
+            let epoch = request.epoch;
             let (cursor, incarnation) = request.cursor.unzip();
             let correlation_id = self.correlation_id();
             let message = ClientMessage::RegisterClient {
                 correlation_id,
                 room_id: room.id.clone(),
                 client_id: self.client_id.clone(),
-                auth_token: token.clone(),
+                // Sending puts the token of the room in it.
+                auth_token: String::new(),
                 current_seq: cursor,
                 known_incarnation: incarnation,
             };
             // A reply is checked before it is used: its correlation and its room are the
             // request's when it carries them, and a cursor's incarnation does not change.
-            match self.send(&message, &token).await? {
+            match self.send(room, correlation_id, &message).await? {
                 ServerMessage::Registered {
                     correlation_id: reply_id,
                     room_id,
@@ -631,7 +685,7 @@ impl Client {
                     match self.change(room, registered).await {
                         // Its schema failed the replica closed.
                         Err(err @ ClientError::FailedClosed(_)) => {
-                            self.deregister(room, &token).await;
+                            self.deregister(room).await;
                             return Err(err);
                         }
                         registered => registered?,
@@ -672,33 +726,137 @@ impl Client {
     /// nothing is sent if the replica opened again meanwhile, and no longer fails closed. Its
     /// reply is not used: a lost deregistration, or one that a cut call never sent, leaves the
     /// entry until its lease ends.
-    async fn deregister(&self, room: &Room, token: &str) {
+    async fn deregister(&self, room: &Room) {
         let reopened = matches!(&room.state().replica, Replica::Open(open) if !open.failed_closed);
         if reopened {
             return;
         }
+        let correlation_id = self.correlation_id();
         let message = ClientMessage::DeregisterClient {
-            correlation_id: self.correlation_id(),
+            correlation_id,
             room_id: room.id.clone(),
             client_id: self.client_id.clone(),
         };
-        let _ = self.send(&message, token).await;
+        let _ = self.send(room, correlation_id, &message).await;
     }
 
     fn correlation_id(&self) -> CorrelationId {
         CorrelationId::new(self.correlation_ids.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Sends `message` with `token` and decodes its reply. No reply, or one that does not
-    /// decode, is `Network`.
+    /// Sends `message`, the request `correlation_id` of `room`, with the token of the room, and
+    /// decodes its reply. No reply, or one that does not decode, is `Network`.
+    ///
+    /// A refusal of the request (with its correlation id and its room, or without them) for its
+    /// token (`Unauthorized`) renews the token ([`renew`](Self::renew)), and the request is sent
+    /// again with the new one. One that forbids the token (`Forbidden`) leaves it to be renewed
+    /// before the next request of the room is sent, which goes with the old one if it gets no
+    /// new one. A request renews the token once at most, and returns the reply to its last
+    /// sending.
     async fn send(
         &self,
+        room: &Room,
+        correlation_id: CorrelationId,
         message: &ClientMessage,
-        token: &str,
     ) -> Result<ServerMessage, ClientError> {
-        let reply = (self.transport.send(message, token).await)
-            .map_err(|err| ClientError::Network(err.to_string()))?;
-        decode_message(&reply).map_err(|err| ClientError::Network(format!("Invalid reply: {err}")))
+        let sends = || true;
+        self.send_tracked(room, correlation_id, message, &mut false, sends)
+            .await
+    }
+
+    /// [`send`](Self::send), with `sending` set while what it sent may have taken effect without
+    /// a reply that says otherwise: a call cut while it renews the token sent nothing that did.
+    /// Nothing is sent once `sends` says no, which it asks before each sending, also after a
+    /// renewal: that is `Network`, with `sending` not set.
+    async fn send_tracked(
+        &self,
+        room: &Room,
+        correlation_id: CorrelationId,
+        message: &ClientMessage,
+        sending: &mut bool,
+        sends: impl Fn() -> bool,
+    ) -> Result<ServerMessage, ClientError> {
+        let (mut token, mut renewed) = {
+            let state = room.state();
+            (state.token.clone(), state.forbidden)
+        };
+        if renewed {
+            token = self.renew(room, &token).await.unwrap_or(token);
+        }
+        loop {
+            if !sends() {
+                return Err(ClientError::Network("The request was not sent".to_string()));
+            }
+            *sending = true;
+            let sent = with_token(message, &token);
+            let reply = self.transport.send(&sent, &token).await;
+            let reply = reply.map_err(|err| ClientError::Network(err.to_string()))?;
+            let reply: ServerMessage = decode_message(&reply)
+                .map_err(|err| ClientError::Network(format!("Invalid reply: {err}")))?;
+            let refused = match &reply {
+                ServerMessage::Error {
+                    correlation_id: reply_id,
+                    room_id,
+                    code,
+                    ..
+                } if reply_id.is_none_or(|reply_id| reply_id == correlation_id)
+                    && room_id.as_ref().is_none_or(|room_id| *room_id == room.id) =>
+                {
+                    Some(*code)
+                }
+                _ => None,
+            };
+            match refused {
+                Some(ErrorCode::Unauthorized) if !renewed => {
+                    renewed = true;
+                    // The server checks the token before anything else.
+                    *sending = false;
+                    if let Some(new) = self.renew(room, &token).await {
+                        token = new;
+                        continue;
+                    }
+                }
+                Some(ErrorCode::Forbidden) => room.forbid(&token),
+                _ => {}
+            }
+            return Ok(reply);
+        }
+    }
+
+    /// A new token of `room` for a request that sent `stale`, which the server refused or
+    /// forbade, or `None` without one. One renewal at a time in a room: a request takes the
+    /// token of the room if it is no longer `stale` (another renewal or an open replaced it),
+    /// and none if a renewal of `stale` that it waited for got none; otherwise it asks the
+    /// provider, which has [`TOKEN_TIMEOUT`] to give one. Only a token of the client id of the
+    /// client counts, and it becomes the token of the room, unless an open replaced `stale`
+    /// meanwhile: the token of the open is taken instead. A renewal whose caller stops waiting
+    /// leaves the next request that needs a token to ask for one.
+    async fn renew(&self, room: &Room, stale: &str) -> Option<String> {
+        let renewals = room.state().renewals;
+        let _renewal = room.renewal.lock().await;
+        {
+            let state = room.state();
+            if state.token != stale {
+                return Some(state.token.clone());
+            }
+            if state.renewals != renewals && state.renewed == stale {
+                return None;
+            }
+        }
+        let token = self.tokens.token(&self.client_id, &room.id);
+        let token = tokio::time::timeout(TOKEN_TIMEOUT, token).await;
+        let token =
+            (token.ok().and_then(Result::ok)).filter(|token| issued_to(token, &self.client_id));
+        let mut state = room.state();
+        state.renewals += 1;
+        stale.clone_into(&mut state.renewed);
+        if state.token != stale {
+            return Some(state.token.clone());
+        }
+        if let Some(token) = &token {
+            state.set_token(token.clone());
+        }
+        token
     }
 
     /// Runs `change` on `room` under its applier, in a task of its own, once the changes before
@@ -836,7 +994,7 @@ impl Client {
                 self.snapshot(&room, &mut again).await?;
                 continue;
             }
-            let (epoch, token) = (request.epoch, request.token);
+            let epoch = request.epoch;
             let correlation_id = self.correlation_id();
             let message = ClientMessage::Sync {
                 correlation_id,
@@ -846,7 +1004,8 @@ impl Client {
                 // As many as the server serves in a reply.
                 max_batch_size: u32::MAX,
             };
-            let (head_seq, ops, has_more, schema) = match self.send(&message, &token).await? {
+            let reply = self.send(&room, correlation_id, &message).await?;
+            let (head_seq, ops, has_more, schema) = match reply {
                 ServerMessage::SyncBatch {
                     correlation_id: reply_id,
                     room_id,
@@ -889,7 +1048,7 @@ impl Client {
                 }
                 Err(err @ ClientError::FailedClosed(_)) => {
                     let _registration = room.registration.lock().await;
-                    self.deregister(&room, &token).await;
+                    self.deregister(&room).await;
                     return Err(err);
                 }
                 Err(err) => return Err(err),
@@ -905,7 +1064,7 @@ impl Client {
                 client_id: self.client_id.clone(),
                 ack_seq: head,
             };
-            match self.send(&message, &token).await? {
+            match self.send(&room, correlation_id, &message).await? {
                 ServerMessage::AckConfirmed {
                     correlation_id: reply_id,
                     room_id,
@@ -942,13 +1101,16 @@ impl Client {
     /// retries after them, and after a registration without a valid reply. After
     /// `BehindCompaction`, or `Registered` behind the log, the replica waits for a snapshot: the
     /// write catches up with heartbeats ([`heartbeat`](Self::heartbeat)) until it installs one,
-    /// and sends nothing meanwhile. `SchemaViolation`,
-    /// `BadRequest` and `Forbidden` are `Validation`, and any other error of the server or the
-    /// deadline end it with `Network`. Closing the room, discarding its replica or failing it
-    /// closed ends it with `Network`, or as `OutcomeUnknown` after an uncertain attempt or once
-    /// its `CommitAck` comes, also one that comes after. An error of the client (`RoomClosed` or
-    /// `FailedClosed` before it enters its room, `Storage` or `Config`) ends it with that error.
-    /// Without an uncertain attempt or a `CommitAck`, the write had no effect.
+    /// and sends nothing meanwhile. `SchemaViolation`, `BadRequest` and `Forbidden` are
+    /// `Validation`, and any other error of the server or the deadline end it with `Network`. A
+    /// refusal of the token (`Unauthorized`) had no effect: the attempt goes again with a new
+    /// token, as [`open_room`](Self::open_room) says, within the deadline and unless the write
+    /// ended meanwhile, and without one it ends the write as another error does. Closing the
+    /// room, discarding its replica or failing it closed ends it with `Network`, or as
+    /// `OutcomeUnknown` after an uncertain attempt or once its `CommitAck` comes, also one that
+    /// comes after. An error of the client (`RoomClosed` or `FailedClosed` before it enters its
+    /// room, `Storage` or `Config`) ends it with that error. Without an uncertain attempt or a
+    /// `CommitAck`, the write had no effect.
     ///
     /// A `CommitAck` is checked before it is used: its correlation id, its room, its mutation
     /// id, and a catch-up that follows the cursor of the commit in order and, unless it has
@@ -1040,8 +1202,11 @@ impl Client {
                 op: op.clone(),
             };
             // An attempt without a reply by the deadline is cut.
-            let reply = tokio::time::timeout_at(deadline, self.send(&message, &request.token));
-            match reply.await.ok().and_then(Result::ok) {
+            let mut sending = false;
+            let sends = || room.in_flight(&mutation_id);
+            let reply = self.send_tracked(&room, correlation_id, &message, &mut sending, sends);
+            let reply = tokio::time::timeout_at(deadline, reply).await;
+            match reply.ok().and_then(Result::ok) {
                 Some(ServerMessage::CommitAck {
                     correlation_id: reply_id,
                     room_id,
@@ -1101,6 +1266,9 @@ impl Client {
                         _ => return Err(ends(uncertain, ClientError::Network(refused))),
                     }
                 }
+                // Cut while it renewed the token, after a refusal of it, or not sent once the
+                // write ended.
+                None if !sending => {}
                 // No reply, or one that does not answer the commit: it may have been sequenced.
                 _ => uncertain = true,
             }
@@ -1178,7 +1346,7 @@ impl Client {
                 room_id: room.id.clone(),
                 client_id: self.client_id.clone(),
             };
-            let reply = self.send(&message, &request.token).await?;
+            let reply = self.send(&room, correlation_id, &message).await?;
             let (head_seq, schema, snapshot, wanted) = match reply {
                 ServerMessage::HeartbeatAck {
                     correlation_id: reply_id,
@@ -1298,7 +1466,10 @@ impl Client {
                 snapshot_hash: first.map(|(.., hash)| hash),
                 room_incarnation: incarnation,
             };
-            match self.send_chunk(&message, &request.token, || true).await? {
+            match self
+                .send_chunk(room, correlation_id, &message, || true)
+                .await?
+            {
                 Some(ServerMessage::SnapshotChunk {
                     correlation_id: reply_id,
                     room_id,
@@ -1437,7 +1608,10 @@ impl Client {
                 room_incarnation: incarnation,
             };
             let sends = || room.uploads(epoch).is_some();
-            match self.send_chunk(&message, &request.token, sends).await? {
+            match self
+                .send_chunk(room, correlation_id, &message, sends)
+                .await?
+            {
                 None => return Ok(()),
                 Some(ServerMessage::SnapshotUploadChunkAck {
                     correlation_id: reply_id,
@@ -1481,14 +1655,17 @@ impl Client {
         ))
     }
 
-    /// Sends `message`, a chunk of a snapshot, with `token` as [`send`](Self::send) does, if
-    /// `sends` says it may, and again after a backoff, up to [`CHUNK_RETRIES`] times, while it
-    /// gets a transient failure (no reply, `Unavailable` or `Timeout`) and `sends` still says it
-    /// may. Returns the last reply, or `None` if `sends` said no.
+    /// Sends `message`, the request `correlation_id` of `room`, a chunk of a snapshot, as
+    /// [`send`](Self::send) does, if `sends` says it may, and again after a backoff, up to
+    /// [`CHUNK_RETRIES`] times, while it gets a transient failure (no reply, `Unavailable` or
+    /// `Timeout`) and `sends` still says it may. Returns the last reply, or `None` if `sends` said
+    /// no. A chunk that `sends` stops after a renewal of the token is a transient failure: `None`
+    /// after the backoff, or `Network` if it was the last time.
     async fn send_chunk(
         &self,
+        room: &Room,
+        correlation_id: CorrelationId,
         message: &ClientMessage,
-        token: &str,
         sends: impl Fn() -> bool,
     ) -> Result<Option<ServerMessage>, ClientError> {
         let (mut backoff, mut retries) = (Backoff::new(&self.config), 0);
@@ -1496,7 +1673,9 @@ impl Client {
             if !sends() {
                 return Ok(None);
             }
-            let reply = self.send(message, token).await;
+            let mut sending = false;
+            let sent = self.send_tracked(room, correlation_id, message, &mut sending, &sends);
+            let reply = sent.await;
             let transient = matches!(
                 &reply,
                 Err(_)
@@ -1622,7 +1801,6 @@ impl Local {
             };
             let request = Request {
                 epoch: state.epoch,
-                token: state.token.clone(),
                 cursor: None,
                 registered: open.is_some_and(|open| open.registered),
                 awaits_snapshot: open.and_then(|open| open.awaits_snapshot),

@@ -147,7 +147,8 @@ async fn facade(
 ) -> ZemdbClient {
     let metadata = FileMetadata::new(dir);
     let config = ClientConfig::new("ana");
-    let client = ZemdbClient::open(config, storage, metadata, transport.clone(), crypto);
+    let tokens = TestTokens::new();
+    let client = ZemdbClient::open(config, storage, metadata, transport.clone(), tokens, crypto);
     client.await.unwrap()
 }
 

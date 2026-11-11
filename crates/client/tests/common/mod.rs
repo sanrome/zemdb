@@ -12,6 +12,7 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use bytes::Bytes;
 use futures::StreamExt;
+use std::collections::VecDeque;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -23,7 +24,7 @@ use tokio::sync::oneshot;
 use tower::ServiceExt;
 use zemdb_client::{
     endpoint, Client, ClientConfig, ClientError, EventBlocks, EventStream, FileMetadata,
-    RoomStatus, TransportClient, TransportError,
+    RoomStatus, TokenError, TokenProvider, TransportClient, TransportError,
 };
 use zemdb_core::*;
 use zemdb_server::{
@@ -89,8 +90,116 @@ pub async fn open_client(
         storage,
         metadata,
         transport.clone(),
+        TestTokens::new(),
     );
     client.await.unwrap()
+}
+
+/// What a [`TestTokens`] gives when the client asks for a token.
+#[derive(Debug, Clone)]
+pub enum Issue {
+    /// A token of the client for the room, valid for this long and a second more per call
+    /// before, so that no two are the same: with zero, already expired.
+    Valid(Duration),
+    /// A token of the client for this other room, valid for 300 s.
+    ForRoom(RoomId),
+    /// A token of this other client for the room, valid for 300 s.
+    ForClient(ClientId),
+    /// This text.
+    Text(String),
+    /// A token of the client for the room, valid for an hour as with `Valid`, after this long.
+    After(Duration),
+    /// An error.
+    Fail,
+    /// Nothing, ever.
+    Hang,
+}
+
+/// A token provider of the test, which issues tokens as the backend of an application does,
+/// and gives what the test asks for.
+#[derive(Debug, Clone)]
+pub struct TestTokens {
+    /// What the next calls give, in order, before `issue`.
+    next: Arc<Mutex<VecDeque<Issue>>>,
+    issue: Arc<Mutex<Issue>>,
+    /// The client id and the room of each call, in order.
+    calls: Arc<Mutex<Vec<(ClientId, RoomId)>>>,
+    /// The tokens given, in order.
+    given: Arc<Mutex<Vec<String>>>,
+}
+
+impl TestTokens {
+    /// A provider that issues tokens valid for an hour.
+    pub fn new() -> Self {
+        Self::issuing(Issue::Valid(Duration::from_secs(3600)))
+    }
+
+    /// A provider that gives what `issue` says.
+    pub fn issuing(issue: Issue) -> Self {
+        Self {
+            next: Arc::default(),
+            issue: Arc::new(Mutex::new(issue)),
+            calls: Arc::default(),
+            given: Arc::default(),
+        }
+    }
+
+    /// Gives what `issue` says from now on.
+    pub fn set(&self, issue: Issue) {
+        *self.issue.lock().unwrap() = issue;
+    }
+
+    /// Gives what `issue` says at the next call, before what the others say.
+    pub fn then(&self, issue: Issue) {
+        self.next.lock().unwrap().push_back(issue);
+    }
+
+    /// How many times the client asked for a token.
+    pub fn calls(&self) -> usize {
+        self.calls.lock().unwrap().len()
+    }
+
+    /// The client id and the room of each call, in order.
+    pub fn asked(&self) -> Vec<(ClientId, RoomId)> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    /// The tokens given so far, in order.
+    pub fn given(&self) -> Vec<String> {
+        self.given.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl TokenProvider for TestTokens {
+    async fn token(&self, client_id: &ClientId, room_id: &RoomId) -> Result<String, TokenError> {
+        let before = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push((client_id.clone(), room_id.clone()));
+            Duration::from_secs(calls.len() as u64 - 1)
+        };
+        let next = self.next.lock().unwrap().pop_front();
+        let issue = next.unwrap_or_else(|| self.issue.lock().unwrap().clone());
+        let valid = Duration::from_secs(300);
+        let unique = |ttl: Duration| if ttl.is_zero() { ttl } else { ttl + before };
+        let token = match issue {
+            Issue::Valid(ttl) => {
+                generate_client_token(client_id, room_id, unique(ttl), AUTH_SECRET)
+            }
+            Issue::ForRoom(room) => generate_client_token(client_id, &room, valid, AUTH_SECRET),
+            Issue::ForClient(client) => generate_client_token(&client, room_id, valid, AUTH_SECRET),
+            Issue::Text(text) => text,
+            Issue::After(delay) => {
+                tokio::time::sleep(delay).await;
+                let ttl = unique(Duration::from_secs(3600));
+                generate_client_token(client_id, room_id, ttl, AUTH_SECRET)
+            }
+            Issue::Fail => return Err(TokenError("Refused".to_string())),
+            Issue::Hang => std::future::pending().await,
+        };
+        self.given.lock().unwrap().push(token.clone());
+        Ok(token)
+    }
 }
 
 /// Opens `room_id` in `client`, with a token of the client.
@@ -409,6 +518,7 @@ impl TestServer {
         TestTransport {
             router: build_router(self.state.clone()),
             sent: Arc::default(),
+            bearers: Arc::default(),
             answer: Arc::default(),
             delay: Arc::default(),
             delay_next: Arc::default(),
@@ -498,6 +608,8 @@ impl Held {
 pub struct TestTransport {
     router: Router,
     sent: Arc<Mutex<Vec<ClientMessage>>>,
+    /// The token of each message sent, in order.
+    bearers: Arc<Mutex<Vec<String>>>,
     answer: Arc<Mutex<Option<Box<Answer>>>>,
     delay: Arc<Mutex<Duration>>,
     delay_next: Arc<Mutex<Option<(ClientMessageKind, Duration)>>>,
@@ -521,6 +633,13 @@ impl TestTransport {
     /// The messages sent so far, in order.
     pub fn sent(&self) -> Vec<ClientMessage> {
         self.sent.lock().unwrap().clone()
+    }
+
+    /// The kind of each message sent so far, with the token it was sent with, in order: a
+    /// registration's, the one inside it if it is not the same.
+    pub fn bearers(&self) -> Vec<(ClientMessageKind, String)> {
+        let kinds = self.sent().into_iter().map(|message| message.kind());
+        kinds.zip(self.bearers.lock().unwrap().clone()).collect()
     }
 
     /// The registrations sent so far, as their cursor and incarnation.
@@ -650,7 +769,14 @@ impl fmt::Debug for TestTransport {
 #[async_trait]
 impl TransportClient for TestTransport {
     async fn send(&self, message: &ClientMessage, token: &str) -> Result<Vec<u8>, TransportError> {
+        let bearer = match message {
+            ClientMessage::RegisterClient { auth_token, .. } if auth_token != token => {
+                format!("{token} (inside: {auth_token})")
+            }
+            _ => token.to_string(),
+        };
         self.sent.lock().unwrap().push(message.clone());
+        self.bearers.lock().unwrap().push(bearer);
         let lost = (self.lose.lock().unwrap()).take_if(|kind| *kind == message.kind());
         if lost.is_some() {
             self.server_reply(message, token).await?;

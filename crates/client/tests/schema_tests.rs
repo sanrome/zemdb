@@ -749,6 +749,7 @@ async fn a_failed_save_or_reload_of_a_new_schema_leaves_the_room_out() {
             storage.clone(),
             FileMetadata::with_files(dir.path(), files.clone()),
             transport.clone(),
+            TestTokens::new(),
         );
         let client = client.await.unwrap();
         open_room(&client, &room_id).await.unwrap();

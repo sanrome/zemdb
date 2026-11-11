@@ -268,6 +268,7 @@ async fn errors_other_than_damage_keep_the_replica() {
             storage,
             metadata,
             transport.clone(),
+            TestTokens::new(),
         )
         .await
         .unwrap();
@@ -317,6 +318,7 @@ async fn a_discard_removes_the_metadata_before_it_touches_the_storage_room() {
         storage,
         metadata,
         transport.clone(),
+        TestTokens::new(),
     );
     open_room(&client.await.unwrap(), &room_id).await.unwrap();
 
@@ -407,6 +409,7 @@ async fn a_failed_save_of_the_metadata_of_registered_leaves_the_room_out() {
         storage.clone(),
         metadata_store,
         transport.clone(),
+        TestTokens::new(),
     )
     .await
     .unwrap();
@@ -442,6 +445,7 @@ async fn a_discard_whose_metadata_are_not_removed_keeps_the_data() {
         engine(dir.path()),
         metadata_store,
         transport.clone(),
+        TestTokens::new(),
     )
     .await
     .unwrap();
@@ -515,6 +519,7 @@ async fn a_memory_replica_reopens_empty_with_its_metadata_and_its_cursor() {
         storage.clone(),
         metadata_store,
         transport.clone(),
+        TestTokens::new(),
     )
     .await
     .unwrap();
@@ -797,6 +802,7 @@ async fn closing_waits_for_a_change_of_the_replica_cut_by_its_caller() {
             storage.clone(),
             metadata_store,
             transport.clone(),
+            TestTokens::new(),
         )
         .await
         .unwrap();

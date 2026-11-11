@@ -45,7 +45,9 @@ use axum::body::{to_bytes, Body};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{Method, Request};
 use bytes::Bytes;
-use common::{error_reply, options, request, TestServer, TestTransport, ADMIN_SECRET, AUTH_SECRET};
+use common::{
+    error_reply, options, request, TestServer, TestTokens, TestTransport, ADMIN_SECRET, AUTH_SECRET,
+};
 use futures::future::join_all;
 use futures::StreamExt;
 use oracle::{Oracle, Reason, Rows};
@@ -580,7 +582,14 @@ async fn client<S: StorageEngine + Clone + 'static>(
         max_snapshot_bytes: LIMIT,
         ..ClientConfig::new(person)
     };
-    let client = Client::open(config, storage.clone(), metadata.clone(), link.clone()).await?;
+    let client = Client::open(
+        config,
+        storage.clone(),
+        metadata.clone(),
+        link.clone(),
+        TestTokens::new(),
+    )
+    .await?;
     Ok((client, Arc::new(storage)))
 }
 

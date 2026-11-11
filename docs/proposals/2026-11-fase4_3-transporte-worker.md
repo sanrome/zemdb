@@ -2,7 +2,7 @@
 
 **Fecha:** 4 de Noviembre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su quinta ronda. El dueño del proyecto adoptó el mismo día las precisiones de DC18 y de DC24 a DC26 y las decisiones DC27 a DC31 (DC27, con la condición de S4), con dos ajustes: DC26 dice explícitamente que, en el camino normal, un `ops` se aplica sin ningún `/sync`, y la verificación del `ClientId` de un token renovado pasa de 4.4 al Lote 3 (DC30). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026, con S4 respondido y la revisión de delta en verde en su cuarta ronda. Lote 2 (el stream de eventos: el transporte y el parser) cerrado el 9 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lo que sigue es el Lote 3.
+**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su quinta ronda. El dueño del proyecto adoptó el mismo día las precisiones de DC18 y de DC24 a DC26 y las decisiones DC27 a DC31 (DC27, con la condición de S4), con dos ajustes: DC26 dice explícitamente que, en el camino normal, un `ops` se aplica sin ningún `/sync`, y la verificación del `ClientId` de un token renovado pasa de 4.4 al Lote 3 (DC30). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026, con S4 respondido y la revisión de delta en verde en su cuarta ronda. Lote 2 (el stream de eventos: el transporte y el parser) cerrado el 9 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lote 3 (la renovación del token) cerrado el 10 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda. Lo que sigue es el Lote 4.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.3. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Parte de:** el SSE del servidor, del Lote 5 de la [Fase 3.12](2026-11-fase3_12-rendimiento-servidor.md) (`2c0a908`): el evento `ops` con la encarnación de la sala, el stream que termina cuando vence su token y `EventsDisabled` (`ARCHITECTURE.md` §7.2).
@@ -139,7 +139,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 | 0 | Contrato | Documentos | DC18, DC24 a DC31 | Nueva: K17. Ajustes: K1, K2, K5, K6, K7, K11, K12, K15 y §2 | ✅ |
 | 1 | El transporte HTTP nativo | client | DC27 | K12, K7 | ✅ |
 | 2 | El stream de eventos: el transporte y el parser | client | DC27 | K12, K15, K7 | ✅ |
-| 3 | La renovación del token | client | DC30, DC29 | K2, K17 | ⬜ |
+| 3 | La renovación del token | client | DC30, DC29 | K2, K17 | ✅ |
 | 4 | El worker: la tarea, el heartbeat y las transferencias | client | DC28, DC29 | K7, K15, K17 | ⬜ |
 | 5 | Los modos `periodic` y `manual` | client | DC24, DC25, DC28 | K7, K15 | ⬜ |
 | 6 | El `Ack` periódico, detener el worker y los endurecimientos | client | DC25, DC28, DC31 | K5, K11, K2, K7 | ⬜ |
@@ -505,7 +505,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
   - Los tests del `events` por defecto y del transporte de prueba van en un archivo nuevo, `tests/events_tests.rs`.
   - La lectura acotada de una respuesta se sacó de `send` a una función que comparte con `events`, sin cambiar lo que hace (lo confirman las mutaciones del Lote 1 que se volvieron a correr).
 
-### Lote 3 · La renovación del token (`zemdb-client`) · ⬜
+### Lote 3 · La renovación del token (`zemdb-client`) · ✅ Hecho
 **Objetivo:** que un token vencido o inservible no deje a la sala sin red (DC30).
 
 **Archivos:** `src/client.rs` (el envío de cada pedido, el registro y las escrituras), un módulo del `TokenProvider` y `src/lib.rs`; `tests/common/` (un proveedor de prueba) y `tests/token_tests.rs`. `ARCHITECTURE.md` §11 (*Tokens*).
@@ -525,6 +525,102 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 **Documentos:** `ARCHITECTURE.md` §11; `INVARIANTES.md`: K2, K17.
 
 **Entrega:** `feat(client): renew the token of a room on Unauthorized (Fase 4.3, Lote 3)`.
+
+**Hecho** (10 de Noviembre de 2026).
+- **Qué entró.**
+  - `TokenProvider` (`src/token.rs`, nuevo): un trait asíncrono de la aplicación, `token(client_id, room_id)`, que devuelve un token o un `TokenError`. `Client::open` lo recibe después del transporte, y `ZemdbClient::open` de 4.4 se lo pasa (lo que su plan ya decía).
+  - El token de la sala: el del último `open_room` o el de la última renovación después de él. Cada pedido lo lee al mandarse (`Request` ya no lo lleva: el token es de la sala, no de su réplica), y el registro lo lleva también adentro.
+  - Un solo camino de envío para todos los pedidos (el registro, el sync, el ack, el heartbeat, el commit, los chunks de la bajada y de la subida, y la baja):
+    - un `Unauthorized` que responde al pedido (con su correlación y su sala, o sin ellas) renueva el token, y el pedido se repite una vez con el nuevo;
+    - un `Forbidden` marca el token de la sala si sigue siendo ese, y el pedido no se repite;
+    - un pedido de la sala con el token marcado pide otro antes de mandarse y, sin uno, se manda con el viejo;
+    - un pedido renueva una vez como mucho, también contando la renovación de antes de mandarse.
+  - La renovación (`renew`): una por sala a la vez, con un candado de Tokio y un contador de renovaciones terminadas.
+    - El pedido cuyo token ya reemplazó otra renovación o un `open_room` toma el de la sala sin pedir.
+    - El que esperó una renovación de su mismo token que no consiguió uno no consigue ninguno; uno con otro token, que esperó una renovación ajena, pide el suyo.
+    - Si no, le pide al proveedor, que tiene 60 s.
+    - Solo cuenta un token con el formato con que el servidor los emite (`v1.<cliente>.<sala>.<vencimiento>.<firma>`, con los ids en base64url sin padding, el vencimiento en dígitos y la firma en hexadecimal) y que nombra el `ClientId` propio. Ese token pasa a ser el de la sala, salvo que un `open_room` la haya reemplazado mientras se renovaba: entonces gana el del open.
+    - Una renovación cortada no cuenta como terminada, y el siguiente que necesita un token lo pide.
+  - Lo que no se manda: una escritura no manda nada más una vez que terminó (la sala cerrada, la réplica descartada o fallada cerrada) mientras se renovaba el token, y un chunk de una subida, una vez que la réplica no puede subir. El envío pregunta antes de cada vez, también después de renovar.
+  - En la escritura, el intento lleva una marca "en vuelo". El `Unauthorized` la baja antes de renovar, porque no tuvo efecto, así que un plazo que corta la renovación no deja la escritura incierta. Sin token nuevo, la escritura termina como dice la tabla de §A.4.
+  - Unas 170 líneas de producción, sin comentarios ni líneas vacías (se estimaron 170).
+- **Tests.**
+  - `tests/token_tests.rs` (nuevo, 22), contra el servidor en proceso, con un proveedor de prueba en `tests/common/` (`TestTokens`, que da tokens válidos y distintos, vencidos, de otra sala, de otro cliente, texto, con demora, un error o nada) y el token con que sale cada mensaje (`TestTransport::bearers`).
+    - Con un token vencido (TTL 0), el registro, un sync, un heartbeat y un commit reciben `Unauthorized`, piden un token para el `ClientId` y la sala, y se repiten con el nuevo, que usa también el pedido siguiente; un ack y un chunk de subida y uno de bajada con un `Unauthorized` fabricado, lo mismo.
+    - Un heartbeat, un sync y una escritura a la vez con el mismo token vencido: una sola renovación, y los tres salen con el token nuevo.
+    - Un proveedor que no responde: el heartbeat y el sync que esperan la misma renovación fallan a los 60 s, con un solo pedido al proveedor, y el pedido siguiente pide otra vez.
+    - Una renovación cortada por el plazo de su escritura: la escritura termina con `Network` a los 30 s, sin otro commit, y el heartbeat que la esperaba pide otra vez y sale bien.
+    - Una escritura con `Unauthorized` y un token nuevo termina con la decisión de la réplica, con dos commits del mismo `MutationId`. Sin token nuevo termina con `Network`, y con `OutcomeUnknown` después de un intento con `Unavailable`.
+    - Un segundo `Unauthorized`, al token renovado, no pide otro, en un heartbeat, una escritura y un pedido renovado antes de mandarse. Es con el reloj real y un tope propio, porque un pedido que pidiera otra vez no terminaría.
+    - `Forbidden` (un token de otra sala): el heartbeat falla y la escritura termina con `Validation`, sin repetirse. El pedido siguiente pide otro token antes de mandarse y sale bien. Sin token nuevo, se manda con el viejo, y con uno bueno sale bien.
+    - Un token renovado de otro `ClientId`, `not-a-token` o vacío: el pedido falla, ningún pedido sale con él, y el siguiente pide otra vez.
+    - Un `Unauthorized` de otra correlación o de otra sala no renueva (el pedido falla); uno sin correlación o sin sala, sí.
+    - El token de un `open_room` reemplaza al renovado, y también a uno marcado, sin pedir otro. Un `Forbidden` a un token que un `open_room` reemplazó mientras tanto no marca el nuevo.
+    - De la revisión de delta:
+      - una escritura cuya sala se cierra o falla cerrada mientras renueva el token, después de un `Unauthorized` o antes de su primer intento con un token marcado, termina con `Network`, sin mandar nada después, y el servidor no secuencia nada;
+      - el commit que sale otra vez con el token renovado y no tiene respuesta antes del plazo deja la escritura incierta, y el servidor lo secuenció;
+      - un pedido rechazado con otro token, que esperó la renovación ajena que no consiguió ninguno, pide el suyo;
+      - un `open_room` mientras se renueva el token gana: el pedido y el siguiente salen con su token;
+      - un token renovado de otra sala recibe `Forbidden`, y el pedido siguiente pide otro antes de mandarse;
+      - un chunk de una subida que espera la renovación no sale otra vez si la sala se cierra mientras tanto.
+  - `src/tests/token.rs` (nuevo, 3): el formato de los tokens que emite `generate_client_token`, con TTL 0 o no, para otra sala, con ids cuyo base64url tiene `-` o `_` y uno que necesitaría padding, nombra su cliente; uno de otro cliente no; y no lo nombran: vacío, sin puntos, con cuatro o seis campos, otra versión, el cliente en base64 estándar, con padding, sin codificar, vacío o que no es UTF-8, y la sala, el vencimiento o la firma fuera de su formato.
+  - Dos tests de 4.2 sacan `Unauthorized` de sus listas de errores que terminan el pedido (`a_sync_or_an_ack_the_server_refuses_fails_and_changes_nothing` y `a_refusal_of_the_server_ends_the_write`): ahora renueva, y `token_tests.rs` lo cubre.
+- **Mutaciones inversas: las 38 las mató algún test.**
+  - El formato del token, sobre su versión final: el sexto campo, la versión `v1`, comparar el cliente, el base64url sin padding, la sala en base64url, los ids no vacíos, el vencimiento en dígitos, la firma en hexadecimal y los campos no vacíos. Antes de completar el formato, también cinco campos y no cuatro.
+  - La renovación:
+    - el candado, tomar el token de la sala si ya no es el viejo, no pedir otro si la renovación que esperó (de su mismo token, y solo de ese) no consiguió ninguno, y contar las renovaciones terminadas;
+    - el plazo de 60 s, cambiado a 30 s y quitado;
+    - el `ClientId` propio, guardar el token renovado, que guardarlo borre la marca, y que gane un `open_room` hecho mientras se renovaba.
+  - El envío:
+    - renovar ante `Unauthorized`, y una sola vez, también contando la renovación de antes de mandarse;
+    - renovar antes de mandar con el token marcado;
+    - marcar ante `Forbidden` el token mandado, y solo si sigue siendo el de la sala;
+    - que `open_room` borre la marca;
+    - la correlación y la sala del `Unauthorized`;
+    - el token adentro del registro;
+    - preguntar si se puede mandar antes de cada vez; que la escritura pregunte si sigue en vuelo y el chunk, si la réplica puede subir.
+  - La escritura: la marca "en vuelo" en cada envío y no una vez, bajarla ante un `Unauthorized`, y el corte durante la renovación sin efecto.
+  - Tres reglas no tenían test en la primera versión y llevaron a tests nuevos antes de correrlas:
+    - el segundo `Unauthorized`, también después de la renovación previa a un `Forbidden`: con el reloj real y un tope propio, porque con el reloj pausado la mutación colgaba la suite;
+    - el `Forbidden` a un token ya reemplazado;
+    - el `open_room` que borra la marca.
+  - Los tests de las reglas que agregó la revisión de delta (siete mutaciones más, y cinco del formato) los mataron.
+- **Interacciones revisadas.**
+  - El token de `open_room` y el renovado: un `open_room` reemplaza al renovado y borra la marca de `Forbidden`, y una renovación posterior reemplaza al de `open_room` (hay tests). Un `open_room` durante una renovación gana sobre ella, como dice DC30: los que esperan toman su token sin pedir, y la renovación que termina después devuelve el del open y no guarda el suyo (hay test).
+  - El candado de los registros: el registro renueva con ese candado tomado, y la renovación nunca lo toma (solo el suyo), así que no hay un ciclo de candados (hay test del registro). Tampoco toma el de las transferencias ni el aplicador: ningún cambio de la réplica manda pedidos.
+  - El plazo de una escritura, dentro del que cuenta la renovación: el plazo la corta, y la escritura no queda incierta (hay test).
+  - La baja al fallar cerrada: va por el mismo envío, así que un `Unauthorized` renueva y la repite; su respuesta sigue sin usarse. Sin test propio: es el mismo código que los pedidos con test.
+  - Un pedido en vuelo cuando la sala se descarta: el token es de la sala, no de la época. Ni el descarte ni la renovación miran la época, y la renovación guarda el token en la sala.
+  - Los reintentos de un chunk (`send_chunk`): cada envío puede renovar una vez, y el que se repite después de un `Unavailable` sale con el token de la sala.
+  - Los cortes: cada `.await` nuevo es seguro ante cancelación. El candado se suelta al caer, el contador solo sube cuando el proveedor respondió, y ningún lock síncrono cruza un `.await` (hay test del corte).
+  - INV-K15: cada sala suma un token, una marca, un contador con el token de la última renovación terminada, y un candado: nada crece por pedido.
+  - La fachada de 4.4 (Lote 2, `e536d3a`): `ZemdbClient::open` recibe el proveedor después del transporte, y sus tests le pasan uno. El primer token del proveedor y la verificación de su `ClientId` en `room(room_id)` son de su Lote 8, que puede usar el mismo formato y el mismo plazo.
+  - La simulación: sus tokens valen un día, y sus fallas no tienen `Unauthorized`. Nada renueva, y sigue igual.
+  - De la revisión de delta:
+    - El ciclo de la escritura y su chequeo entre intentos (cerrar la sala, descartar la réplica o fallarla cerrada terminan la escritura) frente a la renovación, que corre dentro del envío: el envío pregunta si la escritura sigue en vuelo antes de cada vez, también después de renovar (hay tests).
+    - La baja de una sala que falla cerrada espera la misma renovación que una escritura (comparten el candado): con lo anterior, el commit de esa escritura ya no sale.
+    - `send_chunk`: su condición se pregunta también antes del envío que sigue a una renovación (hay test de la subida); la de la bajada es siempre que sí, como antes.
+    - `shutdown` durante una renovación: cierra las salas, y vale lo mismo que con `close_room`.
+    - Los demás pedidos (sync, ack, heartbeat, registro, baja) que salen después de una renovación durante la que la sala se cerró: su respuesta se descarta como antes (un cambio de la réplica da `RoomClosed`, y la baja no la usa). La ventana existía, entre leer el pedido y mandarlo, y ahora puede durar lo que tarda el proveedor; ninguno tiene efecto en la réplica.
+    - Un pedido con otro token vencido que espera una renovación ajena (hay test), y cuánto espera en total: las renovaciones que tiene delante y la suya (en `INVARIANTES.md`).
+- **Revisión de delta, primera ronda: no verde.** Dos Medios y cinco Bajos, todos arreglados en el lote:
+  - Medio: una escritura que renueva el token no volvía a mirar si seguía en vuelo. Si la sala se cerraba o fallaba cerrada mientras tanto, el intento salía igual, el servidor lo secuenciaba y la escritura terminaba incierta en lugar de con `Network` (contra INV-K2 e INV-K6, y contra lo que 4.2 promete al cerrar). Lo mismo pasaba con un chunk de una subida. Ahora el envío pregunta antes de cada vez, con tests.
+  - Medio: que el intento mandado otra vez y cortado por el plazo deje la escritura incierta no tenía test: test nuevo.
+  - Bajo: marcar el token mandado (el renovado) ante `Forbidden` no tenía test: test nuevo, con un token renovado de otra sala.
+  - Bajo: un pedido rechazado con otro token tomaba el fracaso de una renovación ajena. Ahora la toma solo si era de su mismo token, con test.
+  - Bajo: una renovación que terminaba después de un `open_room` pisaba su token, contra DC30 ("el de un `open_room` posterior reemplaza al renovado"). Ahora gana el del open, con test.
+  - Bajo: la renovación previa a un `Forbidden` cuenta como la única del pedido; va en *Desvíos*.
+  - Bajo: documentos. "Ningún pedido espera más de 60 s" era inexacto, porque uno detrás de una renovación cortada espera también la suya. "Un open con otro token" borra la marca: lo hace cualquier open. Y había dos líneas de docstring de más de 100 caracteres.
+  - El formato verificado solo en parte iba contra la letra de DC30: ahora se verifica entero (la sala, el vencimiento y la firma, sin validarlos), con tests y sus mutaciones.
+  - Adoptó sus tests de reproducción, con otros nombres.
+- **Revisión de delta, segunda ronda: verde.** Verificó los siete arreglos de la primera ronda y el formato completo, y mató otras 8 mutaciones de lo nuevo (el envío que pregunta una sola vez, la escritura y el chunk sin su condición, la marca "en vuelo" antes de preguntar, y las variantes de H4 y H5). Sin Altos ni Medios. Sus dos Bajos, de redacción, se arreglaron: en estas interacciones, el `open_room` durante una renovación (decía lo de antes del arreglo) y lo que suma cada sala, y el docstring de `send_chunk` (un chunk que su condición frena después de una renovación es una falla transitoria: `None` después del backoff, o `Network` si era la última vez).
+- **Desvíos.**
+  - `TokenProvider::token` recibe también el `ClientId`: el proveedor se da antes de que exista el cliente, y así el backend no necesita guardar el id.
+  - Precisiones de DC30, que DC30 no decía:
+    - El pedido con un token marcado que no consigue uno nuevo se manda con el viejo. Mandarlo deja que un `Forbidden` que no vino del servidor no frene la sala (INV-K17), y uno real vuelve a dar `Forbidden`.
+    - Esa renovación de antes de mandarse es la única del pedido: un `Unauthorized` al token que trajo no pide otro, y el pedido siguiente lo vuelve a pedir. Así, un pedido le pide al proveedor una vez como mucho.
+    - Un `open_room` durante una renovación gana sobre ella.
+  - `INVARIANTES.md` toma la versión 24: la 23 la tomó el Lote 2 de 4.4.
 
 ### Lote 4 · El worker: la tarea, el heartbeat y las transferencias (`zemdb-client`) · ⬜
 **Objetivo:** que una sala mantenga su lease y haga lo que el servidor le pide sin que la aplicación la atienda (DC28, DC29, INV-K7).
@@ -679,4 +775,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** plan escrito el 4 de Noviembre de 2026. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su quinta ronda: las precisiones de DC18 y de DC24 a DC26 y DC27 a DC31, como *Propuestas*, y `INVARIANTES.md` en la versión 16. El dueño del proyecto las adoptó el mismo día, con dos ajustes (la frase de DC26 sobre el camino normal sin `/sync` y la verificación del `ClientId` en el Lote 3). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026: S4 respondido en DC27 (compila con `aws-lc-rs` y el MSRV; el plazo de inactividad lo arma el transporte), la revisión de delta en verde en su cuarta ronda e `INVARIANTES.md` en la versión 19 (la 18 la tomó el Lote 0 de 4.4). Lote 2 (el stream de eventos: el transporte y el parser) cerrado el 9 de Noviembre de 2026: el stream por su propio cliente HTTP/1.1, el parser con su tope de 64 KiB y la decodificación de los eventos, que todavía nadie usa; la revisión de delta en verde en su primera ronda, con sus Bajos arreglados en el lote, e `INVARIANTES.md` en la versión 22 (la 20 la tomó el Lote 6b de 3.12, y la 21, el Lote 1 de 4.4). Lo que sigue es el Lote 3.
+**Avance:** plan escrito el 4 de Noviembre de 2026. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su quinta ronda: las precisiones de DC18 y de DC24 a DC26 y DC27 a DC31, como *Propuestas*, y `INVARIANTES.md` en la versión 16. El dueño del proyecto las adoptó el mismo día, con dos ajustes (la frase de DC26 sobre el camino normal sin `/sync` y la verificación del `ClientId` en el Lote 3). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026: S4 respondido en DC27 (compila con `aws-lc-rs` y el MSRV; el plazo de inactividad lo arma el transporte), la revisión de delta en verde en su cuarta ronda e `INVARIANTES.md` en la versión 19 (la 18 la tomó el Lote 0 de 4.4). Lote 2 (el stream de eventos: el transporte y el parser) cerrado el 9 de Noviembre de 2026: el stream por su propio cliente HTTP/1.1, el parser con su tope de 64 KiB y la decodificación de los eventos, que todavía nadie usa; la revisión de delta en verde en su primera ronda, con sus Bajos arreglados en el lote, e `INVARIANTES.md` en la versión 22 (la 20 la tomó el Lote 6b de 3.12, y la 21, el Lote 1 de 4.4). Lote 3 (la renovación del token) cerrado el 10 de Noviembre de 2026: el `TokenProvider` en `Client::open` y en la fachada de 4.4, la renovación ante `Unauthorized` (una por sala a la vez, con su plazo de 60 s, y el pedido repetido una vez), la verificación del formato y del `ClientId` del token renovado, el token marcado ante `Forbidden`, y la escritura que no queda incierta por un `Unauthorized` ni manda nada después de terminar; la revisión de delta en verde en su segunda ronda, e `INVARIANTES.md` en la versión 24 (la 23 la tomó el Lote 2 de 4.4). Lo que sigue es el Lote 4.

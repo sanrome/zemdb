@@ -4,7 +4,7 @@ use zemdb_core::{ClientId, CryptoEngine, RoomId};
 use zemdb_storage::StorageEngine;
 
 use super::RoomHandle;
-use crate::{Client, ClientConfig, ClientError, MetadataStore, TransportClient};
+use crate::{Client, ClientConfig, ClientError, MetadataStore, TokenProvider, TransportClient};
 
 /// The client of a device, through the facade: the [`Client`] of the core, and the
 /// [`CryptoEngine`] of the application, if it has encrypted columns. A clone shares the client,
@@ -20,17 +20,18 @@ struct Inner {
 }
 
 impl ZemdbClient {
-    /// Opens the [`Client`] of `config.person` over `storage`, `metadata` and `transport`, as
-    /// [`Client::open`] does, with `crypto` for the encrypted columns of its rooms, if the
-    /// application has one.
+    /// Opens the [`Client`] of `config.person` over `storage`, `metadata` and `transport`, with
+    /// `tokens` for the new tokens of its rooms, as [`Client::open`] does, and `crypto` for the
+    /// encrypted columns of its rooms, if the application has one.
     pub async fn open(
         config: ClientConfig,
         storage: impl StorageEngine + 'static,
         metadata: impl MetadataStore + 'static,
         transport: impl TransportClient + 'static,
+        tokens: impl TokenProvider + 'static,
         crypto: Option<Arc<dyn CryptoEngine>>,
     ) -> Result<Self, ClientError> {
-        let client = Client::open(config, storage, metadata, transport).await?;
+        let client = Client::open(config, storage, metadata, transport, tokens).await?;
         let inner = Inner { client, crypto };
         Ok(Self {
             inner: Arc::new(inner),

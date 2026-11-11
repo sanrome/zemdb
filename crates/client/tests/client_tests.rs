@@ -18,7 +18,14 @@ async fn open_with(
 ) -> Result<Client, ClientError> {
     let transport = TestServer::new().transport();
     let storage = MemoryStorageEngine::default();
-    Client::open(ClientConfig::new(person), storage, metadata, transport).await
+    Client::open(
+        ClientConfig::new(person),
+        storage,
+        metadata,
+        transport,
+        TestTokens::new(),
+    )
+    .await
 }
 
 async fn open(dir: &Path) -> Result<Client, ClientError> {

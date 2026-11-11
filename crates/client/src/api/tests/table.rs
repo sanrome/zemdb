@@ -1,5 +1,8 @@
 use super::*;
-use crate::{ClientConfig, MemoryMetadata, TransportClient, TransportError, ZemdbClient};
+use crate::{
+    ClientConfig, MemoryMetadata, TokenError, TokenProvider, TransportClient, TransportError,
+    ZemdbClient,
+};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -90,6 +93,17 @@ fn room_id() -> RoomId {
     RoomId::new("room-a").unwrap()
 }
 
+/// A token provider that gives no token: the server of the test takes any.
+#[derive(Debug)]
+struct NoTokens;
+
+#[async_trait]
+impl TokenProvider for NoTokens {
+    async fn token(&self, _: &zemdb_core::ClientId, _: &RoomId) -> Result<String, TokenError> {
+        Err(TokenError("No tokens".to_string()))
+    }
+}
+
 /// A client of ana over a memory engine, with `room-a` of `server` open, and its table `table`.
 async fn open(server: &Server, table: &str) -> (ZemdbClient, TableHandle) {
     let client = ZemdbClient::open(
@@ -97,6 +111,7 @@ async fn open(server: &Server, table: &str) -> (ZemdbClient, TableHandle) {
         MemoryStorageEngine::new(),
         MemoryMetadata::default(),
         server.clone(),
+        NoTokens,
         None,
     );
     let client = client.await.unwrap();

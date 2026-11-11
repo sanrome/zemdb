@@ -173,7 +173,13 @@ async fn joined(
 /// A client with `config` over a disk engine in `dir`.
 async fn client_with(dir: &Path, transport: &TestTransport, config: ClientConfig) -> Client {
     let metadata = FileMetadata::new(dir);
-    let client = Client::open(config, engine(dir), metadata, transport.clone());
+    let client = Client::open(
+        config,
+        engine(dir),
+        metadata,
+        transport.clone(),
+        TestTokens::new(),
+    );
     client.await.unwrap()
 }
 
@@ -1539,6 +1545,7 @@ async fn a_replica_behind_a_cursor_the_server_holds_ahead_registers_and_gets_a_s
         storage,
         MemoryMetadata::default(),
         transport.clone(),
+        TestTokens::new(),
     );
     let client = opened.await.unwrap();
     open_room(&client, &room_id).await.unwrap();
@@ -1864,6 +1871,7 @@ async fn the_designated_client_uploads_a_snapshot_that_a_client_behind_the_log_d
         storage.clone(),
         MemoryMetadata::default(),
         transport.clone(),
+        TestTokens::new(),
     );
     let client = client.await.unwrap();
     open_room(&client, &room_id).await.unwrap();

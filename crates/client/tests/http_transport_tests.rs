@@ -148,7 +148,7 @@ fn idle_transport(addr: SocketAddr, idle: Duration) -> HttpTransport {
 
 async fn open(transport: HttpTransport, config: ClientConfig) -> Client {
     let (storage, metadata) = (MemoryStorageEngine::new(), MemoryMetadata::default());
-    Client::open(config, storage, metadata, transport)
+    Client::open(config, storage, metadata, transport, TestTokens::new())
         .await
         .unwrap()
 }

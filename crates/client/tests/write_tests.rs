@@ -430,8 +430,8 @@ async fn a_refusal_of_the_server_ends_the_write() {
     );
     for (code, refused) in [
         (ErrorCode::BadRequest, true),
+        // `Unauthorized` renews the token (`token_tests.rs`).
         (ErrorCode::Forbidden, true),
-        (ErrorCode::Unauthorized, false),
         (ErrorCode::RoomNotFound, false),
         (ErrorCode::SchemaNotFound, false),
         (ErrorCode::ProtocolVersionMismatch, false),
@@ -1265,7 +1265,13 @@ async fn the_backoff_is_random_up_to_its_longest_delay() {
         ..ClientConfig::new("ana")
     };
     let metadata = FileMetadata::new(dir.path());
-    let client = Client::open(config, engine(dir.path()), metadata, transport.clone());
+    let client = Client::open(
+        config,
+        engine(dir.path()),
+        metadata,
+        transport.clone(),
+        TestTokens::new(),
+    );
     let client = client.await.unwrap();
     open_room(&client, &room_id).await.unwrap();
     let sent = Arc::new(Mutex::new(Vec::new()));
@@ -1299,7 +1305,14 @@ async fn the_backoff_is_random_up_to_its_longest_delay() {
         };
         let dir = tempdir().unwrap();
         let metadata = FileMetadata::new(dir.path());
-        let opened = Client::open(config, engine(dir.path()), metadata, transport.clone()).await;
+        let opened = Client::open(
+            config,
+            engine(dir.path()),
+            metadata,
+            transport.clone(),
+            TestTokens::new(),
+        )
+        .await;
         assert!(
             matches!(opened, Err(ClientError::Config(_))),
             "{base} {max}"
@@ -1312,7 +1325,13 @@ async fn the_backoff_is_random_up_to_its_longest_delay() {
     };
     let dir = tempdir().unwrap();
     let metadata = FileMetadata::new(dir.path());
-    let client = Client::open(config, engine(dir.path()), metadata, transport.clone());
+    let client = Client::open(
+        config,
+        engine(dir.path()),
+        metadata,
+        transport.clone(),
+        TestTokens::new(),
+    );
     let client = client.await.unwrap();
     open_room(&client, &room_id).await.unwrap();
     let written = client.write(room_id.clone(), insert_task(1)).await;
