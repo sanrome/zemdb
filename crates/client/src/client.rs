@@ -4,8 +4,9 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::ops::Deref;
+use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -16,8 +17,10 @@ use zemdb_core::{
 use zemdb_storage::{StorageEngine, StorageError};
 
 use crate::token::issued_to;
+use crate::worker::Worker;
 use crate::{
-    ClientConfig, ClientError, MetadataStore, RoomMetadata, TokenProvider, TransportClient,
+    ClientConfig, ClientError, Freshness, MetadataStore, RoomMetadata, TokenProvider,
+    TransportClient, WorkerStatus,
 };
 
 /// The size of the chunks of a download, the largest that the relay serves, and the largest of an
@@ -48,6 +51,10 @@ pub struct Client {
     /// Every room the client opened, open or not: a room keeps its epoch while the client lives.
     rooms: Mutex<HashMap<RoomId, Arc<Room>>>,
     correlation_ids: AtomicU64,
+    /// How many references to the client the tasks of its workers took, and how many they let
+    /// go, each a count that only grows ([`Held`]).
+    taken: AtomicU64,
+    released: AtomicU64,
 }
 
 /// The diagnosis of a room open in the client ([`Client::status`]).
@@ -68,6 +75,8 @@ pub struct RoomStatus {
     /// The rejections and the ranges without a report that the room keeps for the writes in
     /// flight.
     pub retained: usize,
+    /// The worker of the room, if it has one.
+    pub worker: Option<WorkerStatus>,
 }
 
 /// The local side of the client, which the changes of the replicas use from their tasks.
@@ -91,6 +100,8 @@ struct Room {
     /// Held by a renewal of the token: one at a time.
     renewal: tokio::sync::Mutex<()>,
     state: Mutex<State>,
+    /// The worker of the room, if it started one: running, or stopped by one of its steps.
+    worker: Mutex<Option<Worker>>,
 }
 
 #[derive(Default)]
@@ -106,6 +117,8 @@ struct State {
     /// one replaced or tried to.
     renewals: u64,
     renewed: String,
+    /// Whether the last request of the room got a reply, once one ended.
+    connected: Option<bool>,
     writes: Writes,
 }
 
@@ -305,8 +318,9 @@ impl Drop for InFlight {
 }
 
 /// The delays between the retries of a step: a random one up to `backoff_base`, doubled after
-/// each retry up to `backoff_max` (full jitter).
-struct Backoff {
+/// each retry up to `backoff_max` (full jitter); for the worker of a room, up to `retry_base`,
+/// doubled up to `retry_max`.
+pub(crate) struct Backoff {
     base: Duration,
     max: Duration,
     retries: u32,
@@ -321,12 +335,25 @@ impl Backoff {
         }
     }
 
-    fn next(&mut self) -> Duration {
+    pub(crate) fn worker(config: &ClientConfig) -> Self {
+        Self {
+            base: config.retry_base,
+            max: config.retry_max,
+            retries: 0,
+        }
+    }
+
+    pub(crate) fn next(&mut self) -> Duration {
         let ceiling = (self.base.saturating_mul(2u32.saturating_pow(self.retries))).min(self.max);
         self.retries = self.retries.saturating_add(1);
-        let random = Uuid::new_v4().as_u128() % (ceiling.as_nanos() + 1);
-        Duration::from_nanos(u64::try_from(random).unwrap_or(u64::MAX))
+        jitter(ceiling)
     }
+}
+
+/// A random delay up to `ceiling`.
+pub(crate) fn jitter(ceiling: Duration) -> Duration {
+    let random = Uuid::new_v4().as_u128() % (ceiling.as_nanos() + 1);
+    Duration::from_nanos(u64::try_from(random).unwrap_or(u64::MAX))
 }
 
 /// Whether a reply that announces the version `version` of the schema `schema_id` changes the
@@ -440,6 +467,18 @@ impl Room {
         Ok(())
     }
 
+    fn worker(&self) -> MutexGuard<'_, Option<Worker>> {
+        self.worker.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Stops the worker of the room, if it has one, and waits until its tasks ended.
+    async fn stop_worker(&self) {
+        let worker = self.worker().take();
+        if let Some(worker) = worker {
+            worker.stop().await;
+        }
+    }
+
     /// Takes a `Forbidden` to a request sent with `token`: if it is still the token of the room,
     /// the next request renews it before it is sent.
     fn forbid(&self, token: &str) {
@@ -460,6 +499,76 @@ fn with_token<'a>(message: &'a ClientMessage, token: &str) -> Cow<'a, ClientMess
         token.clone_into(auth_token);
     }
     Cow::Owned(message)
+}
+
+/// A reference to the client that a task of one of its workers holds (a heartbeat or a
+/// transfer), which the client counts while it is held: once the application drops the client,
+/// only those hold it.
+pub(crate) struct Held(Arc<Client>);
+
+impl Held {
+    /// A reference to `client`, unless it was dropped.
+    pub(crate) fn upgrade(client: &Weak<Client>) -> Option<Self> {
+        client.upgrade().map(Self::counted)
+    }
+
+    /// `client`, counted once it is held, so that the count never passes the references.
+    fn counted(client: Arc<Client>) -> Self {
+        client.taken.fetch_add(1, Ordering::SeqCst);
+        Self(client)
+    }
+
+    /// Whether the application dropped the client: only the tasks of its workers hold it. A
+    /// reference taken or let go while it reads leaves it as not dropped, to be asked again.
+    pub(crate) fn dropped(&self) -> bool {
+        let counts = || {
+            let taken = self.0.taken.load(Ordering::SeqCst);
+            (taken, self.0.released.load(Ordering::SeqCst))
+        };
+        let (taken, released) = counts();
+        fence(Ordering::SeqCst);
+        let strong = Arc::strong_count(&self.0) as u64;
+        fence(Ordering::SeqCst);
+        counts() == (taken, released) && strong <= taken.saturating_sub(released)
+    }
+}
+
+impl Clone for Held {
+    fn clone(&self) -> Self {
+        Self::counted(Arc::clone(&self.0))
+    }
+}
+
+impl Deref for Held {
+    type Target = Client;
+
+    fn deref(&self) -> &Client {
+        &self.0
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        // No longer counted before it lets the client go.
+        self.0.released.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// What the ack of a heartbeat of the worker asks it to transfer.
+pub(crate) enum Transfer {
+    /// The snapshot that the server designated the client to upload, from the replica of this
+    /// epoch.
+    Upload(u64),
+    /// The snapshot that the replica waits for, which the ack announced.
+    Download,
+}
+
+/// The ack of a heartbeat of the replica of `epoch`: whether it designates the client to upload
+/// a snapshot, and the usable snapshot it announces.
+struct Beat {
+    epoch: u64,
+    wanted: bool,
+    snapshot: Option<SequenceNumber>,
 }
 
 /// What the next request of a replica presents, read under its applier, so that no change of
@@ -533,8 +642,8 @@ impl Client {
     /// [`MemoryMetadata`](crate::MemoryMetadata). Its client id is `person#device`, with the
     /// device id that `metadata` keeps.
     ///
-    /// An invalid person or backoff is `Config`, before `metadata` is touched; an error of
-    /// `metadata`, `Storage`.
+    /// An invalid person, backoff or configuration of the worker is `Config`, before `metadata`
+    /// is touched; an error of `metadata`, `Storage`.
     pub async fn open(
         config: ClientConfig,
         storage: impl StorageEngine + 'static,
@@ -544,11 +653,29 @@ impl Client {
     ) -> Result<Self, ClientError> {
         // Every device id makes a valid client id if one does.
         client_id(&config.person, 0)?;
-        if config.backoff_base.is_zero() || config.backoff_max < config.backoff_base {
-            return Err(ClientError::Config(
-                "The backoff must start above zero, and its longest delay must not be shorter"
-                    .to_string(),
-            ));
+        let interval = config.heartbeat_interval;
+        let invalid = [
+            (
+                config.backoff_base.is_zero() || config.backoff_max < config.backoff_base,
+                "The backoff must start above zero, and its longest delay must not be shorter",
+            ),
+            // The server waits as long for a client it designates to start uploading.
+            (
+                interval.is_zero() || interval >= UPLOAD_PAUSE,
+                "The heartbeat interval must be above zero and below 60 s",
+            ),
+            (
+                config.retry_base.is_zero() || config.retry_max < config.retry_base,
+                "The retries of the worker must start above zero, and their longest delay must \
+                 not be shorter",
+            ),
+            (
+                config.events_retry.is_zero(),
+                "The retry of the event stream must be above zero",
+            ),
+        ];
+        if let Some((_, invalid)) = invalid.into_iter().find(|(invalid, _)| *invalid) {
+            return Err(ClientError::Config(invalid.to_string()));
         }
         let device_id = metadata.open().await?;
         Ok(Self {
@@ -563,6 +690,8 @@ impl Client {
             tokens: Box::new(tokens),
             rooms: Mutex::default(),
             correlation_ids: AtomicU64::new(0),
+            taken: AtomicU64::new(0),
+            released: AtomicU64::new(0),
         })
     }
 
@@ -610,6 +739,7 @@ impl Client {
                     transfer: tokio::sync::Mutex::default(),
                     renewal: tokio::sync::Mutex::default(),
                     state: Mutex::default(),
+                    worker: Mutex::default(),
                 })
             });
             Arc::clone(room)
@@ -790,6 +920,7 @@ impl Client {
             *sending = true;
             let sent = with_token(message, &token);
             let reply = self.transport.send(&sent, &token).await;
+            room.state().connected = Some(reply.is_ok());
             let reply = reply.map_err(|err| ClientError::Network(err.to_string()))?;
             let reply: ServerMessage = decode_message(&reply)
                 .map_err(|err| ClientError::Network(format!("Invalid reply: {err}")))?;
@@ -1353,10 +1484,28 @@ impl Client {
         let room = self.room(&room_id)?;
         let (mut again, mut uploaded) = (false, false);
         loop {
-            let request = self.change(&room, Local::request).await?;
+            let beat = self.beat(&room, &mut again).await?;
+            if beat.wanted && !std::mem::replace(&mut uploaded, true) {
+                self.upload(&room, beat.epoch, &mut again).await?;
+                continue;
+            }
+            if !room.announced(beat.epoch, beat.snapshot) {
+                return Ok(());
+            }
+            // The next heartbeat takes the replica as the download left it.
+            self.snapshot(&room, &mut again).await?;
+        }
+    }
+
+    /// Sends a heartbeat of `room` and takes its ack, as [`heartbeat`](Self::heartbeat) says,
+    /// without transferring anything: registering the replica first if it is not registered, and
+    /// again, once per call of the caller (`again`), when the ack asks for it.
+    async fn beat(&self, room: &Arc<Room>, again: &mut bool) -> Result<Beat, ClientError> {
+        loop {
+            let request = self.change(room, Local::request).await?;
             let Some((head, _)) = request.cursor.filter(|_| request.registered) else {
                 let _registration = room.registration.lock().await;
-                self.register(&room).await?;
+                self.register(room).await?;
                 continue;
             };
             let (epoch, correlation_id) = (request.epoch, self.correlation_id());
@@ -1365,7 +1514,7 @@ impl Client {
                 room_id: room.id.clone(),
                 client_id: self.client_id.clone(),
             };
-            let reply = self.send(&room, correlation_id, &message).await?;
+            let reply = self.send(room, correlation_id, &message).await?;
             let (head_seq, schema, snapshot, wanted) = match reply {
                 ServerMessage::HeartbeatAck {
                     correlation_id: reply_id,
@@ -1382,34 +1531,56 @@ impl Client {
                     snapshot_wanted,
                 ),
                 reply => {
-                    self.refused(&room, epoch, head, correlation_id, reply, again)
+                    self.refused(room, epoch, head, correlation_id, reply, *again)
                         .await?;
-                    room.register_again(epoch, &mut again)?;
+                    room.register_again(epoch, again)?;
                     continue;
                 }
             };
             // The server may have lost sequences that the replica applied.
             if head_seq < head {
-                room.register_again(epoch, &mut again)?;
+                room.register_again(epoch, again)?;
                 continue;
             }
             room.saw(epoch, head_seq);
             if room.changes(&schema) {
-                room.register_again(epoch, &mut again)?;
+                room.register_again(epoch, again)?;
                 continue;
             }
-            if wanted && !std::mem::replace(&mut uploaded, true) {
-                if let Err(err) = self.upload(&room, &request, &mut again).await {
-                    room.update(epoch, |open| open.upload_failed = Some(Instant::now()));
-                    return Err(err);
-                }
-                continue;
-            }
-            if !room.announced(epoch, snapshot) {
-                return Ok(());
-            }
-            // The next heartbeat takes the replica as the download left it.
-            self.snapshot(&room, &mut again).await?;
+            return Ok(Beat {
+                epoch,
+                wanted,
+                snapshot,
+            });
+        }
+    }
+
+    /// A heartbeat of the worker of `room_id`, as [`beat`](Self::beat) sends it: returns what
+    /// its ack asks to transfer, the snapshot that the replica waits for if the ack announces it,
+    /// or else the one that the ack designates the client to upload.
+    pub(crate) async fn worker_beat(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Option<Transfer>, ClientError> {
+        let room = self.room(room_id)?;
+        let beat = self.beat(&room, &mut false).await?;
+        if room.announced(beat.epoch, beat.snapshot) {
+            return Ok(Some(Transfer::Download));
+        }
+        Ok(beat.wanted.then_some(Transfer::Upload(beat.epoch)))
+    }
+
+    /// Runs `transfer` for the worker of `room_id`, as a heartbeat would.
+    pub(crate) async fn transfer(
+        &self,
+        room_id: &RoomId,
+        transfer: Transfer,
+    ) -> Result<(), ClientError> {
+        let room = self.room(room_id)?;
+        let mut again = false;
+        match transfer {
+            Transfer::Upload(epoch) => self.upload(&room, epoch, &mut again).await,
+            Transfer::Download => self.snapshot(&room, &mut again).await,
         }
     }
 
@@ -1579,7 +1750,7 @@ impl Client {
         Ok(Some((seq, bytes)))
     }
 
-    /// Uploads a snapshot of the replica of `request` in `room`, created at its head under the
+    /// Uploads a snapshot of the replica of `epoch` in `room`, created at its head under the
     /// applier, unless the replica may not upload one ([`Room::uploads`]), in `n = ⌈T / 4 MiB⌉`
     /// chunks of `⌈T / n⌉` bytes but the last, which holds the rest, as the relay takes them,
     /// each with the incarnation of the replica. One upload at a time, also with the downloads.
@@ -1588,15 +1759,29 @@ impl Client {
     /// correlation id, the room, the index and the number of chunks of the chunk, and the upload
     /// ends with the one that staged it. `RoomReset` leaves the replica to register again with
     /// its cursor, once per call of the caller (`again`). Any other reply, or none, is `Network`,
-    /// and the upload stops.
+    /// and the upload stops; a replica whose upload failed uploads no other for
+    /// [`UPLOAD_PAUSE`].
     async fn upload(
         &self,
         room: &Arc<Room>,
-        request: &Request,
+        epoch: u64,
+        again: &mut bool,
+    ) -> Result<(), ClientError> {
+        let uploaded = self.upload_snapshot(room, epoch, again).await;
+        if uploaded.is_err() {
+            room.update(epoch, |open| open.upload_failed = Some(Instant::now()));
+        }
+        uploaded
+    }
+
+    /// [`upload`](Self::upload), without taking its failure.
+    async fn upload_snapshot(
+        &self,
+        room: &Arc<Room>,
+        epoch: u64,
         again: &mut bool,
     ) -> Result<(), ClientError> {
         let _transfer = room.transfer.lock().await;
-        let epoch = request.epoch;
         let created = move |local: Local, room| local.create_snapshot(room, epoch);
         let Some((seq, incarnation, snapshot)) = self.change(room, created).await? else {
             return Ok(());
@@ -1756,34 +1941,121 @@ impl Client {
         &*self.local.storage
     }
 
-    /// The diagnosis of `room_id`; `RoomClosed` if its replica is not open in the client.
+    /// The diagnosis of `room_id`, with its worker if it has one; `RoomClosed` if its replica is
+    /// not open in the client.
     pub async fn status(&self, room_id: RoomId) -> Result<RoomStatus, ClientError> {
         let room = self.room(&room_id)?;
-        let status = {
+        let (status, connected) = {
             let state = room.state();
             let Replica::Open(open) = &state.replica else {
                 return Err(ClientError::RoomClosed(room_id));
             };
-            RoomStatus {
+            let status = RoomStatus {
                 head_seq: SequenceNumber::new(0),
                 epoch: state.epoch,
                 registered: open.registered,
                 failed_closed: open.failed_closed,
                 writes_in_flight: state.writes.entries.len(),
                 retained: state.writes.retained.len(),
-            }
+                worker: None,
+            };
+            (status, state.connected)
         };
+        let worker = room
+            .worker()
+            .as_ref()
+            .map(|worker| worker.status(connected));
         Ok(RoomStatus {
             head_seq: self.head(&room_id).await?,
+            worker,
             ..status
         })
     }
 
-    /// Closes `room_id` once the changes of its replica in progress ended, closing its storage
-    /// room, which waits for the operations of the storage in progress. An error closing it is
-    /// reported, and the room leaves the client all the same.
+    /// Starts the worker of `room_id`, in the mode of the configuration
+    /// ([`ClientConfig::freshness`]), unless it has one that runs. The room is open in the
+    /// client, also unregistered or empty after a registration that failed: the first heartbeat
+    /// of the worker registers it. A room that the client never opened, or closed, is
+    /// `RoomClosed`.
+    ///
+    /// The worker is a task of its own, which holds the client by a weak reference: it ends once
+    /// the application drops the client. It sends a heartbeat every
+    /// [`heartbeat_interval`](ClientConfig::heartbeat_interval), the first at a random moment
+    /// within the first, which renews the lease of the client and takes what its ack says, as
+    /// [`heartbeat`](Self::heartbeat) does, but transfers nothing: the snapshot the ack
+    /// announces, if the replica waits for it, or else the one the server designates the client
+    /// to upload, goes in a task of its own, one at a time, and the heartbeats go on meanwhile.
+    /// A heartbeat that fails is sent again after a backoff with full jitter (a random delay up
+    /// to [`retry_base`](ClientConfig::retry_base), doubled after each retry up to
+    /// [`retry_max`](ClientConfig::retry_max)), and the first that succeeds goes back to the
+    /// interval; a transfer that fails is asked for again by the next heartbeat.
+    ///
+    /// Only its own steps stop it, when they find the room failing closed (`FailedClosed`) or out
+    /// of the client (`RoomClosed`); any other error is tried again, and [`status`](Self::status)
+    /// gives the last. [`stop_worker`](Self::stop_worker), [`close_room`](Self::close_room) and
+    /// [`shutdown`](Self::shutdown) stop it.
+    pub async fn start_worker(self: &Arc<Self>, room_id: RoomId) -> Result<(), ClientError> {
+        self.run_worker(room_id, None).await
+    }
+
+    /// Sets the mode of the worker of `room_id` to `freshness`, starting it in that mode as
+    /// [`start_worker`](Self::start_worker) does if it has none that runs.
+    pub async fn set_freshness(
+        self: &Arc<Self>,
+        room_id: RoomId,
+        freshness: Freshness,
+    ) -> Result<(), ClientError> {
+        self.run_worker(room_id, Some(freshness)).await
+    }
+
+    /// Starts the worker of `room_id` in `freshness`, or in the mode of the configuration, unless
+    /// it has one that runs, whose mode it sets to `freshness`, if any.
+    async fn run_worker(
+        self: &Arc<Self>,
+        room_id: RoomId,
+        freshness: Option<Freshness>,
+    ) -> Result<(), ClientError> {
+        let room = self.room(&room_id)?;
+        // Under the applier: a change in progress takes the replica out of the client meanwhile.
+        let opened = |_, room: Arc<Room>| async move {
+            Ok(!matches!(room.state().replica, Replica::Closed))
+        };
+        if !self.change(&room, opened).await? {
+            return Err(ClientError::RoomClosed(room_id));
+        }
+        let mut worker = room.worker();
+        match &*worker {
+            Some(running) if running.is_running() => {
+                if let Some(freshness) = freshness {
+                    running.set_freshness(freshness);
+                }
+            }
+            _ => {
+                let freshness = freshness.unwrap_or(self.config.freshness);
+                *worker = Some(Worker::start(self, room_id, freshness));
+            }
+        }
+        Ok(())
+    }
+
+    /// Stops the worker of `room_id`, if it has one, at its next `.await`, and waits until it
+    /// and its transfer ended. A room that the client never opened is `RoomClosed`.
+    pub async fn stop_worker(&self, room_id: RoomId) -> Result<(), ClientError> {
+        self.room(&room_id)?.stop_worker().await;
+        Ok(())
+    }
+
+    /// The configuration of the client.
+    pub(crate) fn config(&self) -> &ClientConfig {
+        &self.config
+    }
+
+    /// Closes `room_id` once its worker stopped and the changes of its replica in progress
+    /// ended, closing its storage room, which waits for the operations of the storage in
+    /// progress. An error closing it is reported, and the room leaves the client all the same.
     pub async fn close_room(&self, room_id: RoomId) -> Result<(), ClientError> {
         let room = self.room(&room_id)?;
+        room.stop_worker().await;
         self.change(&room, Local::close).await
     }
 
@@ -1797,6 +2069,7 @@ impl Client {
             let rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
             rooms.values().map(Arc::clone).collect()
         };
+        futures::future::join_all(rooms.iter().map(|room| room.stop_worker())).await;
         let mut closed = Ok(());
         for room in rooms {
             match self.change(&room, Local::close).await {

@@ -216,6 +216,7 @@ pub fn status(head_seq: u64, epoch: u64, registered: bool) -> RoomStatus {
         failed_closed: false,
         writes_in_flight: 0,
         retained: 0,
+        worker: None,
     }
 }
 
@@ -518,6 +519,7 @@ impl TestServer {
         TestTransport {
             router: build_router(self.state.clone()),
             sent: Arc::default(),
+            instants: Arc::default(),
             bearers: Arc::default(),
             answer: Arc::default(),
             delay: Arc::default(),
@@ -601,6 +603,11 @@ impl Held {
     }
 }
 
+/// How many messages a [`TestTransport`] sends at most: a client that sends more retries without
+/// waiting, and gets no reply to the rest, so that a test with the paused clock fails instead of
+/// spinning, since such a client keeps the clock from going on.
+const MAX_SENT: usize = 20_000;
+
 /// A transport to a [`TestServer`], which logs the messages it sends and can answer them itself.
 /// Each request runs in a task of its own, as over a network, where the server goes on with a
 /// request whose client stopped waiting.
@@ -608,6 +615,8 @@ impl Held {
 pub struct TestTransport {
     router: Router,
     sent: Arc<Mutex<Vec<ClientMessage>>>,
+    /// When each message was sent, in order.
+    instants: Arc<Mutex<Vec<tokio::time::Instant>>>,
     /// The token of each message sent, in order.
     bearers: Arc<Mutex<Vec<String>>>,
     answer: Arc<Mutex<Option<Box<Answer>>>>,
@@ -633,6 +642,12 @@ impl TestTransport {
     /// The messages sent so far, in order.
     pub fn sent(&self) -> Vec<ClientMessage> {
         self.sent.lock().unwrap().clone()
+    }
+
+    /// Each message sent so far, with when it was sent, in order.
+    pub fn sent_at(&self) -> Vec<(ClientMessage, tokio::time::Instant)> {
+        let instants = self.instants.lock().unwrap().clone();
+        self.sent().into_iter().zip(instants).collect()
     }
 
     /// The kind of each message sent so far, with the token it was sent with, in order: a
@@ -769,6 +784,9 @@ impl fmt::Debug for TestTransport {
 #[async_trait]
 impl TransportClient for TestTransport {
     async fn send(&self, message: &ClientMessage, token: &str) -> Result<Vec<u8>, TransportError> {
+        if self.sent.lock().unwrap().len() >= MAX_SENT {
+            std::future::pending::<()>().await;
+        }
         let bearer = match message {
             ClientMessage::RegisterClient { auth_token, .. } if auth_token != token => {
                 format!("{token} (inside: {auth_token})")
@@ -776,6 +794,7 @@ impl TransportClient for TestTransport {
             _ => token.to_string(),
         };
         self.sent.lock().unwrap().push(message.clone());
+        (self.instants.lock().unwrap()).push(tokio::time::Instant::now());
         self.bearers.lock().unwrap().push(bearer);
         let lost = (self.lose.lock().unwrap()).take_if(|kind| *kind == message.kind());
         if lost.is_some() {
@@ -1122,9 +1141,10 @@ impl<E> TestEngine<E> {
         }
     }
 
-    /// Holds the next call of `method` (`open_room`, `reload_schema`, `get_by_id` or
-    /// `check_operation`) before it reaches the engine: [`Held::replied`] waits until the call is
-    /// held, and the call goes on once the [`Held`] is released or dropped.
+    /// Holds the next call of `method` (`open_room`, `reload_schema`, `get_by_id`,
+    /// `check_operation`, `close_room` or `delete_room`) before it reaches the engine:
+    /// [`Held::replied`] waits until the call is held, and the call goes on once the [`Held`] is
+    /// released or dropped.
     pub fn hold_next(&self, method: &'static str) -> Held {
         let (replied_tx, replied) = oneshot::channel();
         let (release, release_rx) = oneshot::channel();
@@ -1196,12 +1216,14 @@ impl<E: StorageEngine> StorageEngine for TestEngine<E> {
     }
 
     async fn close_room(&self, room_id: &RoomId) -> Result<(), StorageError> {
+        self.hold("close_room").await;
         let closed = self.inner.close_room(room_id).await;
         self.check("close_room")?;
         closed
     }
 
     async fn delete_room(&self, room_id: &RoomId) -> Result<(), StorageError> {
+        self.hold("delete_room").await;
         self.check("delete_room")?;
         self.inner.delete_room(room_id).await
     }

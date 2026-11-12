@@ -19,13 +19,15 @@ mod http_transport;
 mod metadata;
 mod token;
 mod transport;
+mod worker;
 
 pub use api::{Direction, Key, RoomHandle, Row, Scan, TableHandle, ZemdbClient};
 pub use client::{Client, RoomStatus};
-pub use config::ClientConfig;
+pub use config::{ClientConfig, Freshness};
 pub use error::{ClientError, Rejection, Violation};
 #[cfg(feature = "native")]
 pub use http_transport::{HttpTransport, HttpTransportConfig};
 pub use metadata::{FileMetadata, MemoryMetadata, MetadataStore, RoomMetadata};
 pub use token::{TokenError, TokenProvider};
 pub use transport::{endpoint, EventBlocks, EventStream, TransportClient, TransportError};
+pub use worker::WorkerStatus;

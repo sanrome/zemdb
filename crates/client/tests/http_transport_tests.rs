@@ -745,6 +745,42 @@ async fn an_http2_connection_that_stops_answering_is_replaced() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_heartbeats_of_the_worker_leave_behind_an_http2_connection_that_stops_answering() {
+    // A write lets its request go at its deadline, before the transport cuts it for not
+    // advancing, so the transport keeps the connection that stopped answering; the heartbeats of
+    // the worker, which the client does not cut, leave it behind.
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let (addr, _stop) = serve(&server).await;
+    let front = FreezingFront::new(addr).await;
+    let mut config = HttpTransportConfig::new(format!("http://{}", front.addr));
+    config.http2_prior_knowledge = true;
+    config.idle_timeout = Duration::from_millis(400);
+    let transport = HttpTransport::new(config).unwrap();
+    let config = ClientConfig {
+        write_timeout: Duration::from_millis(200),
+        heartbeat_interval: Duration::from_millis(300),
+        retry_base: Duration::from_millis(50),
+        retry_max: Duration::from_millis(100),
+        ..ClientConfig::new("ana")
+    };
+    let client = Arc::new(open(transport, config).await);
+    let token = token(&client.client_id(), &room_id);
+    client.open_room(room_id.clone(), token).await.unwrap();
+    front.freeze();
+    for id in 1..=3 {
+        let written = client.write(room_id.clone(), insert_task(id)).await;
+        assert!(written.is_err(), "{written:?}");
+    }
+    assert_eq!(front.accepted(), 1);
+
+    client.start_worker(room_id.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(front.accepted(), 2);
+    client.write(room_id.clone(), insert_task(4)).await.unwrap();
+}
+
 /// A TCP front of a server that carries what the client sends at `rate` bytes per second for
 /// its first `limited` bytes, and at once afterwards. It follows a schedule from its start, so a
 /// timer that wakes late (by up to a tick of the system clock, 15.6 ms in Windows) does not
