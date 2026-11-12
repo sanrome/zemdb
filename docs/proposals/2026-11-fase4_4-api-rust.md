@@ -2,7 +2,7 @@
 
 **Fecha:** 6 de Noviembre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre de 2026, sin cambios. El Lote 1 (`check_operation`) cerró el 9 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda, el Lote 2 (la fachada y las lecturas) el 10 de Noviembre de 2026, también en su primera ronda, y el Lote 3 (las escrituras y el dueño) el 11 de Noviembre de 2026, también en su primera ronda. Lo que sigue es el Lote 4.
+**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre de 2026, sin cambios. El Lote 1 (`check_operation`) cerró el 9 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda, el Lote 2 (la fachada y las lecturas) el 10 de Noviembre de 2026, también en su primera ronda, el Lote 3 (las escrituras y el dueño) el 11 de Noviembre de 2026, también en su primera ronda, y el Lote 4 (el pre-chequeo) el 12 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda. Lo que sigue es el Lote 5.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.4. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Parte de:** el núcleo de la réplica de 4.2 ([plan](2026-10-fase4_2-nucleo-replica.md)), y la API que la sub-fase 4.3 agrega al núcleo ([plan](2026-11-fase4_3-transporte-worker.md)): el `TokenProvider` (DC30), el worker con `start_worker` y `set_freshness`, y el estado de la conexión (DC28). 4.3 corre en paralelo: los lotes de 4.4 que usan algo de ella van después del lote de 4.3 que lo trae (§4.4 del plan de la fase).
@@ -142,7 +142,7 @@ Depende de los Lotes 3, 4 y 7 de 4.3 (el `TokenProvider`, el worker y su estado,
 | 1 | `check_operation` | storage | DC33 | C3 | ✅ |
 | 2 | La fachada y las lecturas | client | DC32 | K17 | ✅ |
 | 3 | Las escrituras y el dueño | client | DC32, DC33 | K2, K8 | ✅ |
-| 4 | El pre-chequeo | client | DC33 | K2, K8, K17 | ⬜ |
+| 4 | El pre-chequeo | client | DC33 | K2, K8, K17 | ✅ |
 | 5 | El cifrado de columnas | client | DC34 | K9, K12, K2 | ⬜ |
 | 6 | `watch` | client | DC35 | K10, K15 | ⬜ |
 | 7 | Descartar a pedido | client | DC37 | K3, K2, K10, K15, K17 | ⬜ |
@@ -471,7 +471,7 @@ Depende de los Lotes 3, 4 y 7 de 4.3 (el `TokenProvider`, el worker y su estado,
   - Los `--ignored` del cliente en release: 3, sin fallas. Una corrida después de los arreglos de la revisión falló a los 3 s: en `replicas_converge_over_many_long_simulations`, una llamada no terminó en 10 minutos de reloj virtual (`simulation_tests.rs:909`), y su pánico, por el contador global de pánicos, hizo fallar también a `no_reply_in_place_of_the_servers_panics_a_client_over_many_long_simulations`. No volvió a pasar en siete corridas más (dos de los dos tests y cinco de la de convergencia). La simulación escribe con `Client::write`, para el que `write_in` no cambia nada (sin época), así que no viene de este lote; la causa queda por encontrar, fuera de él.
   - Las mutaciones, otra vez después de integrar el Lote 3 de 4.3 y después de los arreglos de la revisión: las 35 mueren.
 
-### Lote 4 · El pre-chequeo (`zemdb-client`) · ⬜
+### Lote 4 · El pre-chequeo (`zemdb-client`) · ✅ Hecho
 **Objetivo:** que una escritura que la réplica local ya rechazaría no salga (DC33).
 
 **Archivos:** `src/api/` (la tabla), `src/config.rs` (`precheck`), `src/error.rs` (`PrecheckFailed`); `tests/common/` (que el motor de prueba haga fallar `check_operation` a pedido) y `tests/precheck_tests.rs`. `ARCHITECTURE.md` §11.
@@ -490,6 +490,74 @@ Depende de los Lotes 3, 4 y 7 de 4.3 (el `TokenProvider`, el worker y su estado,
 **Documentos:** `ARCHITECTURE.md` §11; `INVARIANTES.md`: K2, K8, K17 (el pre-chequeo sin decisión).
 
 **Entrega:** `feat(client): the local precheck of a write (Fase 4.4, Lote 4)`.
+
+**Hecho** (12 de Noviembre de 2026).
+- **Qué entró.**
+  - **El pre-chequeo** (`table.rs`, `write.rs`): el paso 7 de DC32, justo antes de `write_in` y después de `fitting`, sobre la operación que se manda: `check_operation` del storage, sin el aplicador. Lo que decide (`prechecked`, en `write.rs`):
+    - `None`: la escritura sigue (también el `DELETE` de una fila que no está, que no cambia nada);
+    - un motivo: `PrecheckFailed`, con el motivo, sin mandar nada;
+    - `TableNotFound` y `SchemaValidation`: `InvalidOperation` (una guarda, abajo), con el error del storage, que nombra tablas, columnas y tipos, nunca valores;
+    - `RoomNotFound` (la sala del storage se cerró en el medio, también en su reapertura después de un error): `RoomClosed`;
+    - cualquier otro error: el pre-chequeo queda sin decisión, y la escritura sigue.
+
+    `TableNotFound` y `SchemaValidation` son una guarda, como los lista DC33: en una misma época, la sala del storage toma un esquema nuevo antes que la réplica (`reload_schema` va antes de que cambien los metadatos), y el esquema solo crece, así que la operación planeada contra el esquema de la réplica vale contra el de la sala del storage; otra encarnación la ataja antes la época (abajo). Y con los motores de `zemdb-storage`, `check_operation` no da otros errores que esos, `RoomNotFound` y el `Other` del lock envenenado de una sala en memoria: la rama sin decisión es defensiva, y lo que deja con escrituras a una sala en disco marcada como fallida es que su verificación no mira la marca y decide como siempre.
+  - **La época, también en el pre-chequeo:** como después de una lectura, una réplica que ya no es de la época del plan cuando el pre-chequeo leyó es `RoomClosed`, sin mandar nada: después de un descarte, la sala del storage puede tener otra encarnación, con otro esquema, cuya decisión no es la de esta réplica (y cuya tabla del mismo id puede no tomar la operación, que sería `InvalidOperation`). Sin esto, el pre-chequeo daba la decisión de la otra encarnación (`PrecheckFailed`, por ejemplo con `RowMissing` en una sala recreada vacía) o su error (`InvalidOperation`), en lugar de `RoomClosed`.
+  - **Una réplica que falla cerrada** no se pone al día, así que el pre-chequeo no decide sobre ella (`fails_closed`, `pub(crate)`, nuevo en el núcleo, que solo lee el estado de la réplica): la escritura llega a `write_in`, que da `FailedClosed` sin mandar nada, como pide DC32. Sin esto, una escritura que la réplica congelada rechazaría era `PrecheckFailed`, y la aplicación esperaría un catch-up que no llega.
+  - **`ClientError::PrecheckFailed(Rejection)`** (`error.rs`), con `Rejection` nuevo y serializable: `Constraint(Violation)`, el mismo `Violation` de `ConstraintViolation`, o `RowMissing`. `From<RejectReason>` da el `Rejection`, y el `ClientError` de una decisión de la réplica sale de él, así que los dos dan siempre el mismo motivo.
+  - **`ClientConfig::precheck`** (`config.rs`), activado por defecto; el núcleo no lo usa (`Client::write` nunca pre-chequea), y la fachada lo lee al abrirse.
+- **Tests de integración** (`tests/precheck_tests.rs`, 9), contra el servidor en proceso, con la liga de rankings del Lote 3 sin `rounds`:
+  - con la réplica al día, cada motivo (`Unique`, `ForeignKey`, `Restrict`, `Duplicate`, `NotOwner` al reemplazar, cambiar y borrar una fila de otra persona, y `RowMissing`) es `PrecheckFailed` con ese motivo, sin ningún `Commit`; el `delete` de una fila que no está sale;
+  - con el pre-chequeo apagado, las mismas escrituras salen, una secuencia cada una, y la réplica las decide (`ConstraintViolation` con el mismo `Violation`, o `RowMissing`);
+  - una réplica atrasada (abierta y registrada, sin el log) frena la membresía de un ranking que el log tiene, sin mandar nada, mientras otra réplica igual de atrasada sin el pre-chequeo la manda y el log la toma; después de ponerse al día, la de la primera sale;
+  - una escritura que pasa el pre-chequeo y que otra, secuenciada antes (el mismo nombre único), hace rechazar termina con `ConstraintViolation`, con su `Commit`;
+  - los errores del storage, con el motor de prueba: `SchemaValidation` y `TableNotFound` son `InvalidOperation`, y `RoomNotFound`, `RoomClosed`, sin mandar nada; una escritura que la fachada no planea (una columna que no es de la tabla) o que no entra (`fitting`) no llega al pre-chequeo; con `Io` o `RoomFailed`, la escritura sale y la réplica decide (un `Unique` y un `Ok`);
+  - la sala del storage que se cierra durante el pre-chequeo: con `check_operation` retenido, el catch-up de otra escritura falla al aplicarse y la sala del storage se reabre (DC21, con `open_room` retenido); el pre-chequeo llega a la sala cerrada y es `RoomClosed`, y solo sale la otra escritura;
+  - un descarte durante el pre-chequeo: con `check_operation` retenido, otra escritura registra la réplica, que se descarta por `RoomReset` y se abre con la sala recreada; el pre-chequeo es `RoomClosed`, y lo único que sale son los dos registros de la otra escritura. Dos casos: la sala recreada con una tabla del id de `rankings` que no toma el `insert` (sería `InvalidOperation`), y con el mismo esquema, vacía, que rechazaría el `update` de un ranking que la réplica del plan tiene (sería `PrecheckFailed` con `RowMissing`);
+  - una sala que falla cerrada (un `Registered` con un esquema que no evoluciona): un `update` de una fila que la réplica no tiene, el `delete` de un ranking con un miembro y un `insert` que pasaría son `FailedClosed`, sin mandar nada.
+- **Los datos serializables** (`tests/facade_tests.rs`): el round-trip de `ClientError` suma `PrecheckFailed`, con un motivo de restricción y con `RowMissing`.
+- **Tests unitarios** (`src/api/tests/write.rs`, 1 más): `prechecked` con cada motivo, con los pares esperados escritos a mano (y los mismos para `ClientError::from` de una secuencia), y con cada clase de error del storage.
+- **Mutaciones inversas: las 21 las mató algún test.**
+  - El pre-chequeo: la fachada que nunca lo hace o que lo hace siempre, sin mirar la configuración (en el `ZemdbClient` o al decidir cada escritura), apagado por defecto, o antes de `fitting`.
+  - La época: el pre-chequeo que no la verifica, o que la verifica solo cuando el storage da un error.
+  - La sala que falla cerrada: el pre-chequeo que decide sobre ella, o que toma a toda réplica abierta como fallada cerrada.
+  - Lo que decide: un motivo que pasa, o que es la decisión de la réplica (`ConstraintViolation`) en lugar de `PrecheckFailed`; `TableNotFound`, `SchemaValidation` o `RoomNotFound` sin decisión; `RoomNotFound` como error del storage; cualquier otro error que frena la escritura.
+  - El motivo: `RowMissing` o `NotOwner` como otra violación, o `ForeignKey` y `Restrict` cruzados, en el `Rejection` y en la decisión de una secuencia.
+- **El checklist propio** (§2), en lo que toca al pre-chequeo:
+  - va en el paso 7 de DC32, después de `fitting` y justo antes de `write_in`, y todo lo que lo frena termina la escritura sin mandar nada (los tests miran que el transporte no registre ningún `Commit`, o solo los registros de otra escritura);
+  - es un consejo: no toma el aplicador, y lo que no decide deja seguir la escritura;
+  - sus mensajes nombran tablas, columnas y tipos: el de `InvalidOperation` lleva el error del storage, cuyos mensajes (`TableNotFound`, `ValidationError`) no llevan valores, y `PrecheckFailed` lleva el nombre de la restricción;
+  - `Rejection` es un dato de la fachada, serializable, y el round-trip lo fija;
+  - el núcleo suma solo `fails_closed`, `pub(crate)`, que lee el estado de la réplica bajo su lock síncrono, sin un lock nuevo.
+- **Interacciones revisadas.**
+  - `check_operation` y el aplicador: el pre-chequeo no lo toma, así que lee el estado publicado de la sala del storage, que puede estar atrasado respecto del aplicador en curso; con la época verificada después, una lectura de otra encarnación no decide.
+  - Una sala del motor en disco marcada como fallida por la compactación: su `check_operation` no mira la marca y decide; si un error del storage lo deja sin decisión, la escritura sale, y el `apply_batch` de su catch-up da `RoomFailed`, que reabre la sala (DC21).
+  - `RoomNotFound` durante una reapertura: la sala del storage está cerrada entre `close` y `open` de `reopen`, con la misma época; el pre-chequeo es `RoomClosed`, como una lectura (el test lo fija con la reapertura real).
+  - El cifrado del Lote 5: el pre-chequeo va sobre la operación que se manda, después del cifrado; las restricciones, la clave y la columna dueño no incluyen columnas cifradas, así que decide lo mismo sobre el texto cifrado.
+  - INV-K2: el pre-chequeo es un error local más, sin mandar nada, y una escritura que lo pasa termina como en el Lote 3.
+- **Desvíos.**
+  - El plan pedía "después de un `sync` pasa"; `sync` llega a la fachada en el Lote 8 (DC36), así que la réplica se pone al día con el catch-up de otra escritura, que el pre-chequeo deja salir.
+  - El pre-chequeo verifica la época de la réplica después de leer, como una lectura: el plan no lo listaba.
+  - Los tests del Lote 3 (`facade_write_tests.rs`) corren con el pre-chequeo apagado: prueban la escritura hasta su llamada a `write` y la decisión de la réplica sobre su secuencia, también desde una réplica atrasada (dos de ellos, el de las columnas cifradas y el de los dos dispositivos, escriben antes de que la réplica tenga las filas del log, que el pre-chequeo frenaría con `RowMissing`).
+  - El motor de prueba de `tests/common/` suma `hold_next("check_operation")`.
+  - El núcleo suma `fails_closed` (`pub(crate)`), de la revisión de delta, para que una sala que falla cerrada dé `FailedClosed` también con el pre-chequeo.
+  - El motivo de `PrecheckFailed` es un tipo nuevo, `Rejection`, porque `RowMissing` no es un `Violation`.
+  - Hasta el Lote 8, la fachada no tiene `sync`: una escritura frenada por una réplica atrasada sale después de que otra escritura, que el pre-chequeo deja salir, ponga al día la réplica con su catch-up, o con el pre-chequeo apagado (anotado en §11 de `ARCHITECTURE.md`).
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura, que probó en su propia copia con 24 mutaciones propias, de las que murieron 23), **primera ronda: no verde**, con un Medio y siete Bajos, todos arreglados en el lote:
+  - **Medio:** una sala que falla cerrada daba `PrecheckFailed` en lugar de `FailedClosed` (DC32), en una escritura que la réplica congelada rechazaría; el test de `FailedClosed` del Lote 3 lo escondía, porque corre con el pre-chequeo apagado. El pre-chequeo no decide sobre una réplica que falla cerrada (arriba), con su test.
+  - **Bajos:**
+    - la verificación de la época solo la fijaba un test en que la sala nueva da un error: la mutación que la verifica solo con un error sobrevivía; el segundo caso del test del descarte la mata;
+    - el round-trip de `ClientError` no tenía `PrecheckFailed`;
+    - el rustdoc de `insert`, `update` y `delete` no nombraba el pre-chequeo;
+    - §11 e INV-K17 justificaban la rama sin decisión con una sala en disco marcada como fallida, cuya verificación no da ese error; y "el esquema cambió desde el plan" no puede pasar en una misma época: se reescribieron (arriba);
+    - desvíos sin anotar (el catch-up en lugar de `sync`, la salida de una escritura frenada hasta el Lote 8, `Rejection`, los tests del Lote 3 sin el pre-chequeo, el `hold` del motor de prueba) y el plan sin actualizar en el parche;
+    - el test unitario sacaba los motivos esperados de la misma función que mapea: `ForeignKey` y `Restrict` cruzados no los mataba (sí cuatro tests de integración); ahora los pares van escritos a mano;
+    - un comentario del motor de prueba sin reacomodar a 100 columnas.
+- **Segunda ronda: verde.** Ningún hallazgo Alto ni Medio; confirmó los ocho arreglos y revisó las carreras de `fails_closed` (una réplica que pasa a fallar cerrada después del pre-chequeo, o un descarte entre la época y `fails_closed`, los ataja `write_in`). De sus 29 mutaciones murieron 27; las dos que sobreviven son equivalentes (`fails_closed` antes de la época, y `FailedClosed` devuelto por el pre-chequeo en lugar de por `write_in`). Sus tres Bajos, de documentación, se arreglaron en el lote: el rustdoc de `prechecked` y esta nota todavía decían que el esquema de la sala del storage cambia desde el plan, el plan tenía pendientes de cierre (la tabla de §2, el Estado y el Seguimiento), y la nota decía que sin la época del pre-chequeo `write_in` mandaba los registros de la escritura antes de `RoomClosed`, cuando lo que la época evita es la decisión o el error de otra encarnación.
+- **Chequeos.**
+  - fmt, clippy del workspace con `-D warnings`, el build y clippy a wasm32 de `zemdb-core`, `zemdb-storage` y `zemdb-client` con `-D warnings`, y doc con `-D warnings`.
+  - La suite del workspace, antes de los arreglos de la revisión de delta: 1413 tests, sin fallas, con `--no-fail-fast`. En una corrida anterior, con la revisión compilando en paralelo, falló una vez el test del servidor que ya había fallado así en el Lote 3 (`a_panic_in_a_file_operation_stops_the_room_and_the_next_request_reopens_it`, esta vez con un `Timeout` del actor en lugar de `Internal`); pasó aislado tres veces y en la suite siguiente. Este lote no toca el servidor.
+  - Los `--ignored` del cliente en release: 3, sin fallas. Una corrida anterior falló en las dos simulaciones largas porque el disco del contenedor se llenó (`No space left on device`, entre las compilaciones de este lote y las de la revisión); con espacio liberado, pasaron.
+  - Después de los arreglos de la revisión de delta: otra vez fmt, clippy, wasm32 y doc, la suite del cliente (262 tests, sin fallas) y las 21 mutaciones, que mueren.
 
 ### Lote 5 · El cifrado de columnas (`zemdb-client`) · ⬜
 **Objetivo:** que una columna cifrada nunca salga de la fachada ni se guarde en claro, y que lo que no descifra sea un error (DC34).
@@ -639,4 +707,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** plan escrito el 6 de Noviembre de 2026, con DC32 a DC37 *Propuestas*. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre, sin cambios. Lote 1 (`check_operation`) cerrado el 9 de Noviembre, con la revisión de delta en verde en su primera ronda. Lote 2 (la fachada y las lecturas) cerrado el 10 de Noviembre, con la revisión de delta en verde en su primera ronda. Lote 3 (las escrituras y el dueño) cerrado el 11 de Noviembre, con la revisión de delta en verde en su primera ronda. Lo que sigue es el Lote 4.
+**Avance:** plan escrito el 6 de Noviembre de 2026, con DC32 a DC37 *Propuestas*. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su tercera ronda. El dueño del proyecto adoptó DC32 a DC37 el 7 de Noviembre, sin cambios. Lote 1 (`check_operation`) cerrado el 9 de Noviembre, con la revisión de delta en verde en su primera ronda. Lote 2 (la fachada y las lecturas) cerrado el 10 de Noviembre, con la revisión de delta en verde en su primera ronda. Lote 3 (las escrituras y el dueño) cerrado el 11 de Noviembre, con la revisión de delta en verde en su primera ronda. Lote 4 (el pre-chequeo) cerrado el 12 de Noviembre, con la revisión de delta en verde en su segunda ronda (la primera, con un Medio y siete Bajos, arreglados en el lote). Lo que sigue es el Lote 5.

@@ -1,5 +1,6 @@
 use super::*;
-use zemdb_core::{DataType, OwnerIdentity};
+use crate::{Rejection, Violation};
+use zemdb_core::{DataType, OwnerIdentity, ValidationError};
 
 fn client() -> ClientId {
     ClientId::new("ana#phone").unwrap()
@@ -159,5 +160,72 @@ fn an_operation_with_an_owner_other_than_the_client_is_not_sent() {
             message.contains("other than the owner of the client"),
             "{message}"
         );
+    }
+}
+
+#[test]
+fn the_precheck_takes_the_decision_and_the_errors_of_the_storage() {
+    let room = room_id();
+    let name = || "rankings_name".to_string();
+    let constraint = Rejection::Constraint;
+    let reasons = [
+        (RejectReason::MissingRow, Rejection::RowMissing),
+        (RejectReason::Duplicate, constraint(Violation::Duplicate)),
+        (RejectReason::NotOwner, constraint(Violation::NotOwner)),
+        (
+            RejectReason::Unique { constraint: name() },
+            constraint(Violation::Unique { constraint: name() }),
+        ),
+        (
+            RejectReason::ForeignKey { constraint: name() },
+            constraint(Violation::ForeignKey { constraint: name() }),
+        ),
+        (
+            RejectReason::Restrict { constraint: name() },
+            constraint(Violation::Restrict { constraint: name() }),
+        ),
+    ];
+    assert_eq!(prechecked(Ok(None), &room), Ok(()));
+    // The reason of a rejection is the one the replica gives on a sequence.
+    for (reason, rejection) in reasons {
+        let decided = match rejection.clone() {
+            Rejection::Constraint(violation) => ClientError::ConstraintViolation(violation),
+            Rejection::RowMissing => ClientError::RowMissing,
+        };
+        assert_eq!(ClientError::from(reason.clone()), decided);
+        let failed = prechecked(Ok(Some(reason)), &room);
+        assert_eq!(failed, Err(ClientError::PrecheckFailed(rejection)));
+    }
+
+    // A storage room that does not take the operation, or is closed.
+    let no_table = StorageError::TableNotFound {
+        room_id: room.clone(),
+        table: "rankings".to_string(),
+    };
+    let invalid = ValidationError::EmptyUpdate("rankings".to_string());
+    for err in [no_table, StorageError::SchemaValidation(invalid)] {
+        let shown = err.to_string();
+        let message = match prechecked(Err(err), &room) {
+            Err(ClientError::InvalidOperation(message)) => message,
+            other => panic!("{other:?}"),
+        };
+        assert!(message.ends_with(&shown), "{message}");
+    }
+    let closed = prechecked(Err(StorageError::RoomNotFound(room.clone())), &room);
+    assert_eq!(closed, Err(ClientError::RoomClosed(room.clone())));
+
+    // Any other error leaves the precheck without a decision.
+    let others = [
+        StorageError::Io(std::io::Error::other("The disk failed")),
+        StorageError::RoomFailed {
+            room_id: room.clone(),
+            reason: "A compaction failed".to_string(),
+        },
+        StorageError::Serialization("A row".to_string()),
+        StorageError::RoomAlreadyOpen(room.clone()),
+        StorageError::RoomLocked(room.clone()),
+    ];
+    for err in others {
+        assert_eq!(prechecked(Err(err), &room), Ok(()));
     }
 }

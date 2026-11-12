@@ -70,6 +70,23 @@ pub enum ClientError {
     /// and columns, never values.
     #[error("Encryption error: {0}")]
     Crypto(String),
+
+    /// The precheck of a write of the facade: the replica, in its state, would reject the write
+    /// for this reason, so nothing was sent. Unlike `ConstraintViolation` and `RowMissing`, it is
+    /// not the decision of the replica on a sequence: the replica may be behind the log, and the
+    /// same write may be taken once it catches up. `ClientConfig::precheck` turns it off.
+    #[error("The replica would reject the write: {0:?}")]
+    PrecheckFailed(Rejection),
+}
+
+/// Why the replica would reject a write, as it rejects one on a sequence: the reason of a
+/// `PrecheckFailed`, with the same `Violation` as a `ConstraintViolation`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Rejection {
+    /// The row would break this constraint of the schema.
+    Constraint(Violation),
+    /// An update of a row that does not exist.
+    RowMissing,
 }
 
 /// The constraint that a write rejected by the replica would break.
@@ -93,7 +110,7 @@ impl From<io::Error> for ClientError {
     }
 }
 
-impl From<RejectReason> for ClientError {
+impl From<RejectReason> for Rejection {
     fn from(reason: RejectReason) -> Self {
         let violation = match reason {
             RejectReason::MissingRow => return Self::RowMissing,
@@ -103,7 +120,16 @@ impl From<RejectReason> for ClientError {
             RejectReason::ForeignKey { constraint } => Violation::ForeignKey { constraint },
             RejectReason::Restrict { constraint } => Violation::Restrict { constraint },
         };
-        Self::ConstraintViolation(violation)
+        Self::Constraint(violation)
+    }
+}
+
+impl From<RejectReason> for ClientError {
+    fn from(reason: RejectReason) -> Self {
+        match Rejection::from(reason) {
+            Rejection::Constraint(violation) => Self::ConstraintViolation(violation),
+            Rejection::RowMissing => Self::RowMissing,
+        }
     }
 }
 

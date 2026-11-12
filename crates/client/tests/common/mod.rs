@@ -1122,9 +1122,9 @@ impl<E> TestEngine<E> {
         }
     }
 
-    /// Holds the next call of `method` (`open_room`, `reload_schema` or `get_by_id`) before it
-    /// reaches the engine: [`Held::replied`] waits until the call is held, and the call goes on
-    /// once the [`Held`] is released or dropped.
+    /// Holds the next call of `method` (`open_room`, `reload_schema`, `get_by_id` or
+    /// `check_operation`) before it reaches the engine: [`Held::replied`] waits until the call is
+    /// held, and the call goes on once the [`Held`] is released or dropped.
     pub fn hold_next(&self, method: &'static str) -> Held {
         let (replied_tx, replied) = oneshot::channel();
         let (release, release_rx) = oneshot::channel();
@@ -1220,6 +1220,7 @@ impl<E: StorageEngine> StorageEngine for TestEngine<E> {
         room_id: &RoomId,
         op: &Operation,
     ) -> Result<Option<RejectReason>, StorageError> {
+        self.hold("check_operation").await;
         self.check("check_operation")?;
         self.inner.check_operation(room_id, op).await
     }

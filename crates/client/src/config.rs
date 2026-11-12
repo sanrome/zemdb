@@ -15,6 +15,12 @@ pub struct ClientConfig {
     pub backoff_max: Duration,
     /// The largest snapshot the client downloads (512 MiB, the server's default).
     pub max_snapshot_bytes: u64,
+    /// Whether a write of the facade is prechecked (on by default): before it is sent, the
+    /// storage tells what the replica would decide on it in its state, and one that the replica
+    /// would reject is `PrecheckFailed`, with nothing sent. An advice: the replica may be behind
+    /// the log, or change before the server sequences the write. The core never prechecks
+    /// ([`Client::write`](crate::Client::write)).
+    pub precheck: bool,
 }
 
 impl ClientConfig {
@@ -26,6 +32,7 @@ impl ClientConfig {
             backoff_base: Duration::from_millis(100),
             backoff_max: Duration::from_secs(5),
             max_snapshot_bytes: 512 << 20,
+            precheck: true,
         }
     }
 }

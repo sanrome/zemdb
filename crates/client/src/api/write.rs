@@ -6,6 +6,8 @@ use zemdb_core::{
     SequencedOperation, TableSchema, Value, MAX_MESSAGE_SIZE,
 };
 
+use zemdb_storage::{RejectReason, StorageError};
+
 use super::table::{check_value, encrypted, invalid, primary_key, table};
 use super::{Key, Row};
 use crate::ClientError;
@@ -230,6 +232,32 @@ pub(super) fn bounded<'a>(values: impl IntoIterator<Item = &'a Value>) -> Result
         }
     }
     Ok(())
+}
+
+/// What the precheck of a write decides (DC33) from what the storage room `room_id` checked of
+/// its operation: nothing if the replica would take it, and `PrecheckFailed` with the reason if
+/// it would reject it. A storage room that does not take the operation (`TableNotFound` or
+/// `SchemaValidation`) is `InvalidOperation`: a guard, since the storage room takes a new schema
+/// before the replica does, and the schema only grows. One that is closed (a close, or the
+/// reopening after an error) is `RoomClosed`. Any other error leaves the precheck without a
+/// decision, and the write goes on: an advice never stops a write for a fault of the storage,
+/// which the write meets on its own (an error of the `apply_batch` of its catch-up reopens the
+/// storage room, DC21).
+pub(super) fn prechecked(
+    checked: Result<Option<RejectReason>, StorageError>,
+    room_id: &RoomId,
+) -> Result<(), ClientError> {
+    match checked {
+        Ok(None) => Ok(()),
+        Ok(Some(reason)) => Err(ClientError::PrecheckFailed(reason.into())),
+        Err(err @ (StorageError::TableNotFound { .. } | StorageError::SchemaValidation(_))) => {
+            Err(invalid(format!(
+                "The storage room does not take the operation: {err}"
+            )))
+        }
+        Err(StorageError::RoomNotFound(_)) => Err(ClientError::RoomClosed(room_id.clone())),
+        Err(_) => Ok(()),
+    }
 }
 
 /// The owner column of `table`, if it has one.

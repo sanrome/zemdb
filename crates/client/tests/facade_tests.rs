@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tempfile::{tempdir, TempDir};
 use zemdb_client::{
-    ClientConfig, ClientError, Direction, FileMetadata, Key, RoomHandle, RoomStatus, Row, Scan,
-    TransportError, Violation, ZemdbClient,
+    ClientConfig, ClientError, Direction, FileMetadata, Key, Rejection, RoomHandle, RoomStatus,
+    Row, Scan, TransportError, Violation, ZemdbClient,
 };
 use zemdb_core::{
     encode_message, ClientMessage, ColumnDef, CryptoEngine, DataType, NoOpCryptoEngine, Operation,
@@ -597,6 +597,11 @@ fn the_data_of_the_facade_go_through_serde_and_back() {
         ClientError::Validation("validation".into()),
         ClientError::InvalidOperation("invalid".into()),
         ClientError::Crypto("crypto".into()),
+        ClientError::PrecheckFailed(Rejection::Constraint(Violation::Unique {
+            constraint: constraint(),
+        })),
+        ClientError::PrecheckFailed(Rejection::Constraint(Violation::NotOwner)),
+        ClientError::PrecheckFailed(Rejection::RowMissing),
     ];
     for error in errors {
         assert_eq!(json_trip(&error), error);

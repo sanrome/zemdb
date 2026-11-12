@@ -111,7 +111,9 @@ async fn league() -> (TestServer, RoomId) {
     (server, room_id)
 }
 
-/// A facade of `person` over `storage`, with its metadata in `dir`.
+/// A facade of `person` over `storage`, with its metadata in `dir`, without the precheck: these
+/// tests are of a write up to its call to `write`, and of the decision of the replica on its
+/// sequence, also from a replica behind the log (`precheck_tests.rs` tests the precheck).
 async fn facade(
     dir: &Path,
     storage: impl StorageEngine + 'static,
@@ -120,7 +122,10 @@ async fn facade(
     crypto: Option<Arc<dyn CryptoEngine>>,
 ) -> ZemdbClient {
     let metadata = FileMetadata::new(dir);
-    let config = ClientConfig::new(person);
+    let config = ClientConfig {
+        precheck: false,
+        ..ClientConfig::new(person)
+    };
     let tokens = TestTokens::new();
     let client = ZemdbClient::open(config, storage, metadata, transport.clone(), tokens, crypto);
     client.await.unwrap()

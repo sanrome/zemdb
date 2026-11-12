@@ -23,7 +23,7 @@ mod transport;
 pub use api::{Direction, Key, RoomHandle, Row, Scan, TableHandle, ZemdbClient};
 pub use client::{Client, RoomStatus};
 pub use config::ClientConfig;
-pub use error::{ClientError, Violation};
+pub use error::{ClientError, Rejection, Violation};
 #[cfg(feature = "native")]
 pub use http_transport::{HttpTransport, HttpTransportConfig};
 pub use metadata::{FileMetadata, MemoryMetadata, MetadataStore, RoomMetadata};

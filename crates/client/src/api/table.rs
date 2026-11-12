@@ -6,7 +6,7 @@ use zemdb_core::{
 };
 use zemdb_storage::{KeyRange, ScanDirection, ScanOptions, StorageEngine, StorageError};
 
-use super::write::{bounded, fitting, Writer};
+use super::write::{bounded, fitting, prechecked, Writer};
 use super::{Direction, Key, RoomHandle, Row, Scan};
 use crate::ClientError;
 
@@ -62,13 +62,16 @@ impl TableHandle {
     /// take `NULL`, which they get, and does not have the owner column, which the client fills
     /// with its owner ([`ClientId::owner`](zemdb_core::ClientId::owner)). Otherwise, the insert
     /// is `InvalidOperation`, and it is `Crypto` in a table with an encrypted column; either way,
-    /// it sends nothing. Then the client writes it once ([`Client::write`](crate::Client::write)):
-    /// it returns once the replica decided on its sequence (`ConstraintViolation` if it rejects
-    /// it), and is never repeated, so `OutcomeUnknown` is an outcome that reaches the replica with
-    /// the log.
+    /// it sends nothing. With the precheck (`ClientConfig::precheck`, on by default), an insert
+    /// that the replica would reject in its state is `PrecheckFailed`, with the reason, and is not
+    /// sent either: an advice, since the replica may be behind the log. Then the client writes it
+    /// once ([`Client::write`](crate::Client::write)): it returns once the replica decided on its
+    /// sequence (`ConstraintViolation` if it rejects it), and is never repeated, so
+    /// `OutcomeUnknown` is an outcome that reaches the replica with the log.
     ///
     /// A replica that is not open is `RoomClosed`, and so is one discarded before the insert is
-    /// sent, which may have another schema; one that fails closed is `FailedClosed`.
+    /// sent, which may have another schema; one that fails closed is `FailedClosed`, without the
+    /// precheck.
     pub async fn insert(&self, row: &Row) -> Result<Key, ClientError> {
         bounded(row.iter().map(|(_, value)| value))?;
         let (epoch, (op, key)) =
@@ -83,8 +86,9 @@ impl TableHandle {
     /// `key` names the row as a read does, but it may lack the owner column, if it is of the
     /// key, which the client fills, and if it has it, it has the owner of the client: the client
     /// only writes its own rows, and the replica rejects an update of the row of another
-    /// (`NotOwner`), or of one that is not there (`RowMissing`). An update of an encrypted column
-    /// is `Crypto`.
+    /// (`NotOwner`), or of one that is not there (`RowMissing`), and so does the precheck, if the
+    /// replica has the row of another or lacks it (`PrecheckFailed`). An update of an encrypted
+    /// column is `Crypto`.
     pub async fn update(&self, key: &Key, changes: &Row) -> Result<(), ClientError> {
         bounded(changes.iter().map(|(_, value)| value))?;
         let (epoch, op) =
@@ -93,7 +97,8 @@ impl TableHandle {
     }
 
     /// Deletes the row of `key`, named as [`update`](Self::update) names it, as
-    /// [`insert`](Self::insert) writes. The delete of a row that is not there changes nothing.
+    /// [`insert`](Self::insert) writes, also with the precheck. The delete of a row that is not
+    /// there changes nothing, and the precheck lets it out.
     pub async fn delete(&self, key: &Key) -> Result<(), ClientError> {
         let (epoch, op) =
             self.plan_write(|writer, schema| writer.delete(schema, &self.name, key))?;
@@ -115,11 +120,33 @@ impl TableHandle {
         Ok((epoch, write?))
     }
 
-    /// Writes `op`, planned in `epoch`, if it fits: once, to the replica of that epoch.
+    /// Writes `op`, planned in `epoch`, if it fits and, with the precheck, if the replica would
+    /// take it: once, to the replica of that epoch.
     async fn write(&self, epoch: u64, op: Operation) -> Result<(), ClientError> {
-        let (core, room_id) = (self.room.client().core(), self.room.room_id());
+        let (client, room_id) = (self.room.client(), self.room.room_id());
+        let core = client.core();
         let op = fitting(op, &core.client_id(), room_id)?;
+        if client.prechecks() {
+            self.precheck(epoch, &op).await?;
+        }
         core.write_in(room_id.clone(), op, Some(epoch)).await
+    }
+
+    /// The precheck of `op`, planned in `epoch` (DC33): what the replica would decide on it in
+    /// the state its storage room publishes, without the applier, as [`prechecked`] takes it.
+    /// `RoomClosed` if, once it checked, the replica is no longer of that epoch, as after a read.
+    /// A replica that fails closed, then, leaves it without a decision: its state no longer
+    /// catches up, and its writes are `FailedClosed`, which the write gives without sending.
+    async fn precheck(&self, epoch: u64, op: &Operation) -> Result<(), ClientError> {
+        let (core, room_id) = (self.room.client().core(), self.room.room_id());
+        let checked = core.storage().check_operation(room_id, op).await;
+        if !core.is_of_epoch(room_id, epoch) {
+            return Err(ClientError::RoomClosed(room_id.clone()));
+        }
+        if core.fails_closed(room_id) {
+            return Ok(());
+        }
+        prechecked(checked, room_id)
     }
 
     /// The read that `plan` makes against the schema of the replica, given whether the

@@ -1741,6 +1741,16 @@ impl Client {
         (self.room(room_id)).is_ok_and(|room| room.state().epoch == epoch)
     }
 
+    /// Whether the replica of `room_id` is open and fails closed: it applies nothing more until
+    /// it opens again, and its writes are `FailedClosed`.
+    pub(crate) fn fails_closed(&self, room_id: &RoomId) -> bool {
+        let Ok(room) = self.room(room_id) else {
+            return false;
+        };
+        let state = room.state();
+        matches!(&state.replica, Replica::Open(open) if open.failed_closed)
+    }
+
     /// The storage engine of the replicas.
     pub(crate) fn storage(&self) -> &dyn StorageEngine {
         &*self.local.storage

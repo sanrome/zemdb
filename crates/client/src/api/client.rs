@@ -17,6 +17,8 @@ pub struct ZemdbClient {
 struct Inner {
     client: Client,
     crypto: Option<Arc<dyn CryptoEngine>>,
+    /// Whether the writes are prechecked (`ClientConfig::precheck`).
+    precheck: bool,
 }
 
 impl ZemdbClient {
@@ -31,8 +33,13 @@ impl ZemdbClient {
         tokens: impl TokenProvider + 'static,
         crypto: Option<Arc<dyn CryptoEngine>>,
     ) -> Result<Self, ClientError> {
+        let precheck = config.precheck;
         let client = Client::open(config, storage, metadata, transport, tokens).await?;
-        let inner = Inner { client, crypto };
+        let inner = Inner {
+            client,
+            crypto,
+            precheck,
+        };
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -75,6 +82,11 @@ impl ZemdbClient {
     pub(super) fn has_crypto(&self) -> bool {
         self.inner.crypto.is_some()
     }
+
+    /// Whether the writes are prechecked.
+    pub(super) fn prechecks(&self) -> bool {
+        self.inner.precheck
+    }
 }
 
 impl fmt::Debug for ZemdbClient {
@@ -82,6 +94,7 @@ impl fmt::Debug for ZemdbClient {
         f.debug_struct("ZemdbClient")
             .field("client_id", &self.inner.client.client_id())
             .field("crypto", &self.has_crypto())
+            .field("precheck", &self.prechecks())
             .finish_non_exhaustive()
     }
 }
