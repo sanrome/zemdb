@@ -56,4 +56,4 @@ Se aplican sobre una copia local, se compila el servidor, se mide, y se descarta
 | `diagnostics/inline-io.patch` | Corre la E/S de los actores en el mismo hilo, el worker (§3.7.4 de las evaluaciones): hasta el Lote 2 de la Fase 3.12, sin `block_in_place`; desde el Lote 3, sin el pool de E/S | `ZEMDB_PERF_INLINE_IO=1` al correr los scripts |
 | (sin parche) | El presupuesto de respuestas agrandado | `ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES=4294967296` |
 
-`git apply tools/perf/diagnostics/inline-io.patch` desde la raíz. Los parches se escribieron sobre el `main` de la Fase 3.12; un lote que toque esos archivos puede hacer que dejen de aplicar.
+`git apply tools/perf/diagnostics/inline-io.patch` desde la raíz. El parche aplica sobre `6b93115`, donde lo rehízo el Lote 8 de la Fase 3.12; un lote que toque `io_pool.rs` puede hacer que deje de aplicar.

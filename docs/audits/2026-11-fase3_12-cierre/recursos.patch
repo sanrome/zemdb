@@ -1,0 +1,325 @@
+diff --git a/crates/core/tests/review_c_group_search_memory.rs b/crates/core/tests/review_c_group_search_memory.rs
+new file mode 100644
+index 0000000..e34beef
+--- /dev/null
++++ b/crates/core/tests/review_c_group_search_memory.rs
+@@ -0,0 +1,131 @@
++//! Review C of the closing review of Fase 3.12: what the search after a damaged frame of the last
++//! group of commits (`find_frame_after_group`, Lote 4b) allocates when the bytes after the damage
++//! hold a frame that a member stored as a value.
++//!
++//! The search decodes the payload of every frame it finds after the damage, to read where its
++//! group starts. Log records are decoded without a budget of values (they come from operations
++//! the server accepted), but a frame the search finds after the damage can be any bytes a member
++//! wrote: a payload of `Null`s takes 4 bytes per value in the log and 24 decoded.
++//!
++//! The file holds a single test, because it measures the peak resident memory of the whole
++//! process (`VmHWM` in `/proc/self/status`, reset through `/proc/self/clear_refs`): Linux only.
++
++use std::io::Cursor;
++
++use zemdb_core::mutation::Operation;
++use zemdb_core::protocol::codec::{MAX_FRAME_SIZE, MAX_MESSAGE_SIZE};
++use zemdb_core::protocol::limits::MAX_MESSAGE_VALUES;
++use zemdb_core::protocol::messages::SequencedOperation;
++use zemdb_core::protocol::wal_frame::{
++    encode_wal_batch_in_group, find_frame_after_group, FrameAnomaly, InvalidHeader,
++    BATCH_HEADER_SIZE, BATCH_MAGIC,
++};
++use zemdb_core::schema::MAX_COLUMNS;
++use zemdb_core::value::{CompactRow, PrimaryKey, Value};
++
++/// A field of `/proc/self/status`, in bytes.
++fn status_bytes(field: &str) -> usize {
++    let status = std::fs::read_to_string("/proc/self/status").unwrap();
++    let line = status
++        .lines()
++        .find(|line| line.starts_with(field))
++        .unwrap_or_else(|| panic!("no {field} in /proc/self/status"));
++    let kib: usize = line
++        .split_whitespace()
++        .nth(1)
++        .and_then(|kib| kib.parse().ok())
++        .unwrap();
++    kib * 1024
++}
++
++/// Resets the peak resident memory of the process (`VmHWM`) to what it holds now, and returns
++/// that.
++fn reset_peak() -> usize {
++    std::fs::write("/proc/self/clear_refs", "5").unwrap();
++    status_bytes("VmRSS:")
++}
++
++/// Bytes before the operations in a payload of the log: where its group starts (8 bytes), no
++/// mutation id (1) and the number of operations (8).
++const PAYLOAD_PREFIX: usize = 17;
++
++/// A frame of the log holding `count` copies of `encoded_op`, the encoding of one operation in a
++/// payload, built from the bytes alone, so that the test never holds the operations decoded.
++fn frame_of(encoded_op: &[u8], count: usize) -> Vec<u8> {
++    let mut payload = Vec::with_capacity(PAYLOAD_PREFIX + encoded_op.len() * count);
++    payload.extend_from_slice(&0u64.to_le_bytes());
++    payload.push(0);
++    payload.extend_from_slice(&(count as u64).to_le_bytes());
++    for _ in 0..count {
++        payload.extend_from_slice(encoded_op);
++    }
++    let mut frame = Vec::with_capacity(BATCH_HEADER_SIZE + payload.len());
++    frame.extend_from_slice(&BATCH_MAGIC);
++    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
++    frame.extend_from_slice(&crc32fast::hash(&payload).to_le_bytes());
++    frame.extend_from_slice(&(count as u32).to_le_bytes());
++    let header_crc = crc32fast::hash(&frame);
++    frame.extend_from_slice(&header_crc.to_le_bytes());
++    frame.extend_from_slice(&payload);
++    frame
++}
++
++/// The search after a damaged frame of the last group decodes no more values than a client
++/// message may (`MAX_MESSAGE_VALUES`), so that opening a room whose last group was torn holds at
++/// most what reading one frame of its log takes: the frame, and the values of one operation.
++///
++/// Here the bytes after the damage hold a valid frame, as a member can store one in a `Bytes`
++/// value of its commit (`DS9`'s accepted risk is that it turns a torn write into corruption, not
++/// what it allocates): a full payload of operations whose rows are `MAX_COLUMNS` `Null`s, about
++/// 4 million values, about 100 MB decoded from 16 MiB in the log.
++#[cfg(target_os = "linux")]
++#[test]
++fn review_c_the_search_after_a_damaged_group_decodes_no_more_values_than_a_client_message_may() {
++    let (encoded_op, count) = {
++        let row = CompactRow::new(vec![Value::Null; MAX_COLUMNS]);
++        let op =
++            SequencedOperation::new(1, Operation::insert(0, PrimaryKey::single(1i64), row, 100));
++        let one = encode_wal_batch_in_group(std::slice::from_ref(&op), None, 0).unwrap();
++        let encoded_op = one[BATCH_HEADER_SIZE + PAYLOAD_PREFIX..].to_vec();
++        // The frame built from the bytes alone is the one the log writes.
++        assert_eq!(frame_of(&encoded_op, 1), one);
++        let count = (MAX_MESSAGE_SIZE as usize - PAYLOAD_PREFIX) / encoded_op.len();
++        (encoded_op, count)
++    };
++    let values = (count * MAX_COLUMNS) as u64;
++    assert!(
++        values > 3 * MAX_MESSAGE_VALUES,
++        "the frame holds {values} values"
++    );
++
++    // Damage that leaves no header at offset 0, and the stored frame right after it.
++    let mut log = vec![0u8; BATCH_HEADER_SIZE];
++    log.extend_from_slice(&frame_of(&encoded_op, count));
++    drop(encoded_op);
++    let anomaly = FrameAnomaly::InvalidHeader(InvalidHeader::Magic([0, 0]));
++    let end = log.len() as u64;
++    let mut reader = Cursor::new(log.as_slice());
++
++    let before = reset_peak();
++    let found = find_frame_after_group(&mut reader, 0, &anomaly, end).unwrap();
++    let allocated = status_bytes("VmHWM:").saturating_sub(before);
++    eprintln!(
++        "values in the stored frame: {values}; peak resident memory of the search: {allocated} \
++         bytes ({} MiB); before it: {} MiB",
++        allocated >> 20,
++        before >> 20
++    );
++
++    // Its group starts after the damage, so it is a later write: corruption, the room fails to
++    // open, as `DS9` accepts.
++    assert_eq!(found, Some(BATCH_HEADER_SIZE as u64));
++    // What one frame of the log takes read and decoded: the frame, and at most the values of a
++    // client message, with room for the rest of the operations and the allocator.
++    let bound =
++        MAX_FRAME_SIZE + MAX_MESSAGE_VALUES as usize * std::mem::size_of::<Value>() + (8 << 20);
++    assert!(
++        allocated <= bound,
++        "the search took {allocated} bytes of resident memory at once, over {bound}: it decoded {values} \
++         values of a frame a member stored"
++    );
++}
+diff --git a/crates/server/src/actor/tests/manager.rs b/crates/server/src/actor/tests/manager.rs
+index 06caa50..6c7b024 100644
+--- a/crates/server/src/actor/tests/manager.rs
++++ b/crates/server/src/actor/tests/manager.rs
+@@ -2663,3 +2663,127 @@ async fn a_reload_while_a_room_opens_reaches_its_new_actor() {
+     );
+     manager.shutdown_all().await;
+ }
++
++// Review C of the closing review of Fase 3.12: an opening that ends after the request that
++// started it stopped waiting for its room.
++
++/// Commits `n` of `client` in `room_id` from the cursor 0, without waiting for its answer.
++fn spawn_commit(
++    manager: &Arc<RoomManager>,
++    room_id: &RoomId,
++    client: &ClientId,
++    n: u8,
++) -> tokio::task::JoinHandle<Result<(), ServerError>> {
++    let (manager, room_id, client) = (Arc::clone(manager), room_id.clone(), client.clone());
++    tokio::spawn(async move {
++        manager
++            .ask(&room_id, |reply| RoomCommand::Commit {
++                client_id: client,
++                mutation_id: MutationId::new([n; 16]),
++                last_ack_seq: SequenceNumber::new(0),
++                op: insert_op(n.into()),
++                reply,
++            })
++            .await
++            .map(|_| ())
++    })
++}
++
++/// A heartbeat of `client` to `room_id`, as the room manager answers it.
++async fn heartbeat_of(
++    manager: &RoomManager,
++    room_id: &RoomId,
++    client: &ClientId,
++) -> Result<(), ServerError> {
++    manager
++        .ask(room_id, |reply| RoomCommand::Heartbeat {
++            client_id: client.clone(),
++            reply,
++        })
++        .await
++        .map(|_| ())
++}
++
++/// A room whose opening ends after the request that started it gave up waiting for its room
++/// (`ACTOR_TIMEOUT`) is open for the next request: the opening is not thrown away with the
++/// request. Before the file I/O pool the opening ran in place (`block_in_place`), could not be
++/// cut, and the room stayed open; since the pool, the opened actor is dropped with the request,
++/// so a room whose opening takes longer than `ACTOR_TIMEOUT` never opens, and every request to
++/// it is `Timeout`, however many times it is retried.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn review_c_an_opening_that_outlasts_its_request_is_kept_for_the_next_one() {
++    let dir = tempdir().unwrap();
++    let manager = new_manager(&dir);
++    let client = ClientId::new("writer").unwrap();
++    let room_id = RoomId::new("slow-open").unwrap();
++    open_with_client(&manager, &room_id, &client).await;
++    assert!(manager.shutdown_room(&room_id).await);
++    assert!(manager.get_room(&room_id).is_none());
++
++    // The next opening stops until the request that starts it has timed out.
++    let stop = Stop::arm("room_open", &room_dir(&dir, &room_id));
++    let started = std::time::Instant::now();
++    let first = heartbeat_of(&manager, &room_id, &client).await;
++    assert!(matches!(first, Err(ServerError::Timeout(_))), "{first:?}");
++    assert!(started.elapsed() < ACTOR_TIMEOUT + Duration::from_secs(1));
++    stop.wait_reached().await;
++    stop.let_go();
++    assert!(stop.was_released().await, "the opening gave up waiting for the test");
++
++    // The opening is over once it lets go of the room's spawn lock, which it carries.
++    drop(manager.lock_room(&room_id).await);
++    assert!(
++        manager.get_room(&room_id).is_some(),
++        "the room opened for a request that timed out was dropped: the next request opens it \
++         again, and with an opening this slow no request to the room is ever served"
++    );
++    assert_eq!(heartbeat_of(&manager, &room_id, &client).await.ok(), Some(()));
++    manager.shutdown_all().await;
++}
++
++/// The same with a full pool of file I/O threads: a request to a closed room waits for the
++/// pool behind another room's `fsync`, and its opening, which takes far less than
++/// `ACTOR_TIMEOUT` on its own, starts so late that it ends after the request timed out. The
++/// room it opened is kept for the next request. Under a sustained load whose wait for the pool
++/// is close to `ACTOR_TIMEOUT`, as it is after a restart with many rooms on a slow disk, every
++/// opening that starts is one whose request is about to give up, so if the openings are thrown
++/// away no closed room opens while the load lasts.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn review_c_an_opening_that_waited_for_a_full_pool_is_kept_for_the_next_request() {
++    let dir = tempdir().unwrap();
++    let (manager, _relay) = test_manager(dir.path(), &["first"], |config| {
++        config.io_threads = 1;
++    });
++    let manager = Arc::new(manager);
++    let client = ClientId::new("writer").unwrap();
++    let (busy, closed) = (RoomId::new("busy").unwrap(), RoomId::new("closed").unwrap());
++    open_with_client(&manager, &busy, &client).await;
++    open_with_client(&manager, &closed, &client).await;
++    assert!(manager.shutdown_room(&closed).await);
++
++    // The only file I/O thread is held by a commit of `busy` for 4 s after the request to
++    // `closed` starts; then `closed` opens, in 2.5 s: past the request's `ACTOR_TIMEOUT`.
++    let stop = Stop::arm("warm_append_sync", &active_wal(&dir, &busy));
++    let busy_commit = spawn_commit(&manager, &busy, &client, 1);
++    stop.wait_reached().await;
++    fail_point::arm_hook("room_open", &room_dir(&dir, &closed), || {
++        std::thread::sleep(Duration::from_millis(2500));
++    });
++    let request = tokio::spawn({
++        let (manager, closed, client) = (Arc::clone(&manager), closed.clone(), client.clone());
++        async move { heartbeat_of(&manager, &closed, &client).await }
++    });
++    tokio::time::sleep(Duration::from_secs(4)).await;
++    stop.let_go();
++    let answer = request.await.unwrap();
++    assert!(matches!(answer, Err(ServerError::Timeout(_))), "{answer:?}");
++    assert!(stop.was_released().await);
++    busy_commit.await.unwrap().ok();
++
++    drop(manager.lock_room(&closed).await);
++    assert!(
++        manager.get_room(&closed).is_some(),
++        "the room opened after waiting for the pool was dropped with the request that timed out"
++    );
++    manager.shutdown_all().await;
++}
+diff --git a/crates/server/src/api/tests/data_plane.rs b/crates/server/src/api/tests/data_plane.rs
+index 5eff4f4..6832011 100644
+--- a/crates/server/src/api/tests/data_plane.rs
++++ b/crates/server/src/api/tests/data_plane.rs
+@@ -1372,3 +1372,51 @@ async fn first_chunk_does_not_serve_a_snapshot_below_a_gap_found_after_it_was_pi
+     );
+     assert_eq!(fx.relay.active_snapshot_seq(&fx.room_id), None);
+ }
++
++/// Review C of the closing review of Fase 3.12: every response returns what it reserved once
++/// it ends, also when its operations are read from the disk tiers, on the file I/O pool with the
++/// reservation, which the read grows by chunks there, and the request is cancelled at any of its
++/// suspension points, before or after the room answered. With a RAM window of one operation,
++/// every commit seals its segment, and a sync or a catch-up from the cursor 0 reads two sealed
++/// segments before the RAM buffer.
++#[tokio::test]
++async fn review_c_the_budget_returns_to_zero_when_responses_read_from_disk_end_or_are_cancelled() {
++    let fx = Fixture::with_lifecycle(crate::log::RoomLifecycleOverrides {
++        ram_max_ops: Some(1),
++        ..Default::default()
++    })
++    .await;
++    for n in 1..=3u8 {
++        fx.commit_ok(&fx.commit(n, 0)).await;
++    }
++    let segments = fx.dir.path().join("rooms/room/segments");
++    for seq in 1..=2u64 {
++        let segment = segments.join(format!("segment_{seq:016}_{seq:016}.wal"));
++        assert!(segment.exists(), "{segment:?}");
++    }
++    let budget = fx.manager.response_budget();
++    let idle = budget.reserved();
++    assert_eq!(idle.0, 0);
++    for (endpoint, msg) in [("sync", fx.sync(0)), ("commit", fx.commit(4, 0))] {
++        for polls in 0.. {
++            let completed = send_cancelled_after(&fx, endpoint, &msg, polls).await;
++            fx.manager
++                .ask(&fx.room_id, |reply| RoomCommand::GetClientCursor {
++                    client_id: fx.client_id.clone(),
++                    reply,
++                })
++                .await
++                .unwrap()
++                .unwrap();
++            assert_eq!(budget.reserved(), idle, "{endpoint} after {polls} polls");
++            if completed {
++                break;
++            }
++            assert!(polls < 100, "{endpoint} never completed");
++        }
++    }
++    // The last of them read from disk and was answered whole.
++    let (status, _, reply) = fx.post("sync", &fx.sync(0)).await;
++    assert_eq!(batch_of(status, reply), ((1..=4u64).collect::<Vec<_>>(), false));
++    assert_eq!(budget.reserved(), idle);
++}

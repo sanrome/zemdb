@@ -1,0 +1,348 @@
+diff --git a/crates/server/src/actor/tests/manager.rs b/crates/server/src/actor/tests/manager.rs
+index 06caa50..b6c4bee 100644
+--- a/crates/server/src/actor/tests/manager.rs
++++ b/crates/server/src/actor/tests/manager.rs
+@@ -2663,3 +2663,156 @@ async fn a_reload_while_a_room_opens_reaches_its_new_actor() {
+     );
+     manager.shutdown_all().await;
+ }
++
++// Review A of the closing review of Fase 3.12 (durability, recovery and lifecycle).
++
++/// The client's cursor in the roster file at `path`, if the file holds the client.
++fn review_a_cursor_in_roster(path: &Path, client_id: &ClientId) -> Option<SequenceNumber> {
++    let bytes = fs::read(path).ok()?;
++    let roster: serde_json::Value =
++        serde_json::from_str(durable::verified_json(&bytes)?).unwrap();
++    let entries: Vec<crate::actor::lease::ClientEntry> =
++        serde_json::from_value(roster["clients"].clone()).unwrap();
++    entries
++        .into_iter()
++        .find(|entry| &entry.client_id == client_id)
++        .map(|entry| entry.last_ack_seq)
++}
++
++/// A room stopped by a failed fsync writes its roster on the file I/O threads on its way out.
++/// A request that arrives meanwhile reopens the room only once that write ended and the old
++/// actor released the room's files, and the reopened room reads the roster that the stop wrote
++/// (INV-L7, INV-L5, INV-R3): an operation of the old actor never lands after the room reopens.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn review_a_a_room_stopped_by_a_failed_fsync_reopens_only_after_its_stop_wrote_the_roster()
++{
++    let dir = tempdir().unwrap();
++    // A period longer than the test: the fast tick does not write the last changes.
++    let (manager, _relay) = test_manager(dir.path(), &["first"], |config| {
++        config.roster_persist_secs = 300;
++    });
++    let manager = Arc::new(manager);
++    let client = ClientId::new("writer").unwrap();
++    let room_id = RoomId::new("failing").unwrap();
++    open_with_client(&manager, &room_id, &client).await;
++    assert_eq!(
++        commit_nth(&manager, &room_id, &client, 1).await,
++        SequenceNumber::new(1)
++    );
++    // A commit that reports cursor 1, and a heartbeat, so that the stop has something to write
++    // whatever the fast tick wrote.
++    let second = manager
++        .ask(&room_id, |reply| RoomCommand::Commit {
++            client_id: client.clone(),
++            mutation_id: MutationId::new([2; 16]),
++            last_ack_seq: SequenceNumber::new(1),
++            op: insert_op(2),
++            reply,
++        })
++        .await
++        .unwrap()
++        .unwrap();
++    assert_eq!(second.assigned_seq, SequenceNumber::new(2));
++    manager
++        .ask(&room_id, |reply| RoomCommand::Heartbeat {
++            client_id: client.clone(),
++            reply,
++        })
++        .await
++        .unwrap()
++        .unwrap();
++
++    let roster = room_dir(&dir, &room_id).join(format!("meta_clients_{room_id}.json"));
++    let stop = Stop::arm("write_atomic_before_rename", &roster);
++    fail_point::arm("warm_append_sync", &active_wal(&dir, &room_id));
++    let failed = manager
++        .ask(&room_id, |reply| RoomCommand::Commit {
++            client_id: client.clone(),
++            mutation_id: MutationId::new([3; 16]),
++            last_ack_seq: SequenceNumber::new(2),
++            op: insert_op(3),
++            reply,
++        })
++        .await
++        .unwrap();
++    assert!(
++        matches!(failed, Err(ServerError::Unavailable(_))),
++        "{failed:?}"
++    );
++    stop.wait_reached().await;
++
++    let reopening = tokio::spawn({
++        let (manager, room_id, client) = (Arc::clone(&manager), room_id.clone(), client.clone());
++        async move {
++            manager
++                .ask(&room_id, |reply| RoomCommand::GetClientCursor {
++                    client_id: client.clone(),
++                    reply,
++                })
++                .await
++        }
++    });
++    tokio::time::sleep(Duration::from_millis(200)).await;
++    assert!(
++        !reopening.is_finished(),
++        "the room reopened while its stop was writing the roster"
++    );
++    assert!(
++        crate::log::tiered_log::lock_log(&room_dir(&dir, &room_id)).is_err(),
++        "the room's files were released while its stop was writing the roster"
++    );
++
++    stop.let_go();
++    assert!(stop.was_released().await, "the stop's write was not held");
++    let cursor = reopening.await.unwrap().unwrap().unwrap();
++    assert_eq!(
++        cursor,
++        Some(SequenceNumber::new(1)),
++        "the reopened room must read the roster that the stop wrote"
++    );
++    assert_eq!(
++        review_a_cursor_in_roster(&roster, &client),
++        Some(SequenceNumber::new(1))
++    );
++    manager.shutdown_all().await;
++}
++
++/// With one file I/O thread and a roster period longer than the test, the rooms that
++/// `shutdown_all` closes together each write, on their way out and in turn on that thread, the
++/// cursor of their last change, which no tick wrote (INV-L5, INV-R3).
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn review_a_shutdown_all_with_one_io_thread_writes_every_roster_changed_within_its_period()
++{
++    let dir = tempdir().unwrap();
++    let (manager, _relay) = test_manager(dir.path(), &["first"], |config| {
++        config.io_threads = 1;
++        config.roster_persist_secs = 300;
++    });
++    let client = ClientId::new("writer").unwrap();
++    let mut rooms = Vec::new();
++    for i in 0..8 {
++        let room_id = RoomId::new(format!("closing-{i}")).unwrap();
++        open_with_client(&manager, &room_id, &client).await;
++        commit_nth(&manager, &room_id, &client, 1).await;
++        manager
++            .ask(&room_id, |reply| RoomCommand::Ack {
++                client_id: client.clone(),
++                ack_seq: SequenceNumber::new(1),
++                reply,
++            })
++            .await
++            .unwrap()
++            .unwrap();
++        rooms.push(room_id);
++    }
++
++    manager.shutdown_all().await;
++    for room_id in &rooms {
++        let roster = room_dir(&dir, room_id).join(format!("meta_clients_{room_id}.json"));
++        assert_eq!(
++            review_a_cursor_in_roster(&roster, &client),
++            Some(SequenceNumber::new(1)),
++            "{room_id} lost the cursor of its last ack in the shutdown"
++        );
++    }
++}
+diff --git a/crates/server/src/actor/tests/room.rs b/crates/server/src/actor/tests/room.rs
+index c4bb1af..aca96f7 100644
+--- a/crates/server/src/actor/tests/room.rs
++++ b/crates/server/src/actor/tests/room.rs
+@@ -5246,3 +5246,128 @@ async fn an_ops_event_carries_the_incarnation_of_its_room() {
+     ));
+     fx.manager.shutdown_all().await;
+ }
++
++// Review A of the closing review of Fase 3.12 (durability, recovery and lifecycle).
++
++/// A prune that deletes on the slow tick, after a commit reported the cursor that moved the
++/// floor (no Ack prunes), writes the roster before it deletes, also inside the roster's period:
++/// the cursor on disk never falls behind the pruned tail (INV-R1, D56, with the grid of DS7).
++// Paused time: the test moves the Tokio clock and runs the ticks itself.
++#[tokio::test(start_paused = true)]
++async fn review_a_a_prune_that_deletes_on_the_slow_tick_writes_the_roster_first() {
++    tokio::time::advance(CLOCK_AHEAD).await;
++    let dir = tempdir().unwrap();
++    let policy = RoomLifecyclePolicy {
++        ram_max_ops: 2,
++        ..RoomLifecyclePolicy::default()
++    };
++    let mut actor = roster_actor(&dir, &relay_on(&dir), policy);
++    let client = ClientId::new("writer").unwrap();
++    actor.register(&client, None, None).unwrap();
++    let mut flow = ControlFlow::Continue(());
++    for n in 1..=4u8 {
++        actor
++            .commit(&client, mutation(n), seq(0), insert_op(n.into()), &mut flow)
++            .await
++            .unwrap();
++    }
++    actor.run_fast_maintenance().await;
++    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(0)));
++
++    tokio::time::advance(Duration::from_secs(1)).await;
++    // The commit reports cursor 4, which moves the floor; it prunes nothing itself.
++    actor
++        .commit(&client, mutation(5), seq(4), insert_op(5), &mut flow)
++        .await
++        .unwrap();
++    assert_eq!(actor.log().tail_seq(), seq(1));
++    assert!(
++        !actor.roster_due(),
++        "the slow tick must run inside the roster's period"
++    );
++    actor.run_disk_maintenance().await;
++    let tail = actor.log().tail_seq();
++    assert!(tail > seq(1), "the slow tick must prune a segment");
++    let on_disk = cursor_on_disk(&dir, &client).unwrap();
++    assert!(
++        on_disk.get() + 1 >= tail.get(),
++        "the cursor on disk {on_disk} is behind the pruned tail {tail}"
++    );
++}
++
++/// A group of commits whose fsync fails leaves nothing of it confirmed, deduplicated or
++/// announced once the room reopens from disk without its records: with the records lost (here
++/// cut from `active.wal` while the room is stopped, as a power cut before the reopen would
++/// leave it), a retry of each mutation of the group is a new mutation, written and synced
++/// again, sequenced after what was durable and announced only then (INV-D1, INV-D7, INV-L3).
++#[tokio::test]
++async fn review_a_a_failed_group_whose_records_are_lost_leaves_nothing_behind() {
++    const WAITING: u8 = 3;
++    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
++    let sender = fx.sender().await;
++    let client = ClientId::new("writer").unwrap();
++    register(&sender, &client).await;
++
++    // Holds the fsync of commit 1, and notes how long `active.wal` is then: its record only.
++    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
++    let (held_tx, held_rx) = oneshot::channel();
++    let synced_len = Arc::new(Mutex::new(0u64));
++    fail_point::arm_hook("warm_append_sync", &fx.active_wal(), {
++        let (active, synced_len) = (fx.active_wal(), Arc::clone(&synced_len));
++        move || {
++            *synced_len.lock().unwrap() = fs::metadata(&active).unwrap().len();
++            let _ = held_tx.send(());
++            let _ = release_rx.recv_timeout(POLL_CEILING);
++        }
++    });
++    let first = send_commit(&sender, &client, mutation(1), seq(0), insert_op(1)).await;
++    held_rx.await.unwrap();
++    let mut replies = Vec::new();
++    for n in 2..=WAITING + 1 {
++        replies.push(send_commit(&sender, &client, mutation(n), seq(0), insert_op(n.into())).await);
++    }
++    let active = fx.active_wal();
++    before_next_fsync(&fx.active_wal(), move || {
++        fail_point::arm("warm_append_sync", &active)
++    });
++    release_tx.send(()).unwrap();
++    assert_eq!(first.await.unwrap().unwrap().assigned_seq, seq(1));
++    for reply in replies {
++        assert!(matches!(reply.await, Ok(Err(ServerError::Unavailable(_)))));
++    }
++
++    // The room stops; then the records of the failed group are lost.
++    assert!(sender.is_closed(), "the room must stop after a failed fsync");
++    fx.manager.shutdown_room(&fx.room_id).await;
++    let synced_len = *synced_len.lock().unwrap();
++    let file = fs::OpenOptions::new()
++        .write(true)
++        .open(fx.active_wal())
++        .unwrap();
++    assert!(
++        file.metadata().unwrap().len() > synced_len,
++        "the records of the failed group reached the file"
++    );
++    file.set_len(synced_len).unwrap();
++    drop(file);
++
++    let recovered = fx.sender().await;
++    let mut events = subscribe(&recovered).await;
++    let fsyncs = fx.fsyncs();
++    for n in 2..=WAITING + 1 {
++        let retry = commit(&recovered, &client, mutation(n), seq(0), insert_op(n.into()))
++            .await
++            .unwrap();
++        assert_eq!(retry.assigned_seq, seq(n.into()));
++    }
++    assert_eq!(
++        fx.fsyncs() - fsyncs,
++        usize::from(WAITING),
++        "every retry must be written and synced again, as a new mutation"
++    );
++    let announced: Vec<Vec<u64>> = pending_events(&mut events).iter().map(seqs_in).collect();
++    assert_eq!(announced, vec![vec![2], vec![3], vec![4]]);
++    let synced = sync_all(&recovered, &client).await.unwrap();
++    assert_eq!(synced.ops.len(), usize::from(WAITING) + 1);
++    fx.manager.shutdown_all().await;
++}
+diff --git a/crates/server/src/log/tests/tiered_log.rs b/crates/server/src/log/tests/tiered_log.rs
+index 5c87319..6e3199b 100644
+--- a/crates/server/src/log/tests/tiered_log.rs
++++ b/crates/server/src/log/tests/tiered_log.rs
+@@ -3599,3 +3599,49 @@ fn damage_in_the_last_group_after_its_fsync_is_truncated_from_the_damage() {
+         Err(ServerError::BehindCompaction)
+     ));
+ }
++
++// Review A of the closing review of Fase 3.12 (durability, recovery and lifecycle).
++
++/// Damage after its fsync to a group that is not the last one written (a media failure in group
++/// 4..=7, acknowledged), when the power cut during the fsync of the group written after it
++/// (record 8, never acknowledged) lost every sector of that group: nothing valid of the later
++/// group is left, so the open takes the damaged group for the last one, as DS9 does for the last
++/// group, and truncates acknowledged records of it; their sequences are assigned again. With any
++/// frame of the later group left, the same damage is corruption and nothing is truncated. Fixes
++/// the behaviour behind the reading of "the last group" in `INVARIANTES.md` (INV-D2, D3 and the
++/// row of D78 in §4): the last group of which valid frames are left.
++#[test]
++fn review_a_damage_in_a_synced_group_whose_later_group_was_lost_whole_truncates_it() {
++    let dir = tempdir().unwrap();
++    let (mut bytes, ends) = write_groups(dir.path(), &[(1, 3), (4, 7), (8, 8)], true);
++    // Media damage to record 5, synced and acknowledged with its group 4..=7.
++    bytes[ends[4] - 10] ^= 0xFF;
++
++    // Record 8, of a later group, is left: corruption, and nothing is truncated.
++    let (copy, opened) = open_image(&bytes);
++    assert!(opened.is_err(), "a frame of a later group follows the damage");
++    let on_disk = std::fs::read(segments_dir(copy.path()).join("active.wal")).unwrap();
++    assert_eq!(on_disk, bytes, "nothing may be truncated");
++
++    // The power cut lost every sector of record 8 (the file kept its length).
++    bytes[ends[6]..ends[7]].fill(0);
++    let (copy, opened) = open_image(&bytes);
++    let (mut log, mutations) = opened.expect("damage followed only by its own group is torn");
++    assert_eq!(
++        log.head_seq().get(),
++        4,
++        "records 5..=7, acknowledged, are truncated with the damaged group"
++    );
++    assert_eq!(mutations.len(), 4);
++    assert_eq!(
++        std::fs::read(segments_dir(copy.path()).join("active.wal"))
++            .unwrap()
++            .len(),
++        ends[3],
++        "active.wal is truncated from the damaged record on"
++    );
++    // The sequence of record 5 is assigned again, to another operation.
++    log.append_group(group_of(5, 5)).unwrap();
++    let (ops, _) = log.fetch_deltas(SequenceNumber::new(4), 10, None).unwrap();
++    assert_eq!(owned(ops), vec![make_op(5)]);
++}

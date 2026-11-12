@@ -2,7 +2,7 @@
 
 **Fecha:** 30 de Octubre de 2026
 **Tipo:** Plan de evaluaciones, fuera de las fases. Documento vivo: cada evaluación agrega su sección, sus resultados y su estado en el seguimiento (§5).
-**Estado:** Vigente. DP1 a DP3 adoptadas el 1 de Noviembre de 2026 (DP1, con un cambio). Las Evaluaciones 1 (el commit con los clientes al día, §3) y 2 (muchas salas, con escrituras a ritmo humano, §4) están cerradas, con sus resultados en §3.7, §4.7 y §4.8. Lo que se aplica de ellas está en el plan de la [Fase 3.12](2026-11-fase3_12-rendimiento-servidor.md), y lo del SDK, en el de la [Fase 4](2026-10-fase4-plan.md). Las siguientes evaluaciones, a definir (§6).
+**Estado:** Vigente. DP1 a DP3 adoptadas el 1 de Noviembre de 2026 (DP1, con un cambio). Las Evaluaciones 1 (el commit con los clientes al día, §3) y 2 (muchas salas, con escrituras a ritmo humano, §4) están cerradas, con sus resultados en §3.7, §4.7 y §4.8, y las dos se repitieron después de la Fase 3.12 (§4.9). Lo que se aplica de ellas está en el plan de la [Fase 3.12](2026-11-fase3_12-rendimiento-servidor.md), y lo del SDK, en el de la [Fase 4](2026-10-fase4-plan.md). Las siguientes evaluaciones, a definir (§6).
 **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md); cada evaluación es un spike (§3 de la metodología).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md).
 
@@ -415,6 +415,39 @@ Orientan las propuestas; no son decisiones adoptadas, y las del SDK y el protoco
 - **Si quedan las señales, al menos el `Ack` periódico (b).**
 - **El servidor debería poder apagar el SSE** (por ejemplo, con `ZEMDB_MAX_SSE_STREAMS=0`), y el SDK pasar a `periodic` cuando se lo rechazan.
 
+### 4.9 Las Evaluaciones 1 y 2 después de la Fase 3.12
+
+La [Fase 3.12](2026-11-fase3_12-rendimiento-servidor.md) aplicó lo que encontraron estas evaluaciones, y su Lote 8 las repitió enteras, el 12 de Noviembre de 2026, con el mismo arnés.
+- **Las variantes:** la base es `0b03a77`, su línea de base, que es el servidor de estas evaluaciones con el arnés en `main`; el resultado es `6b93115`, el último commit de la fase.
+- **El diseño:** intercaladas, 3 rondas por escenario, en una misma VM: 4 vCPU Intel Xeon a 2,10 GHz, 15 GiB, kernel `6.18.44-fc-v378` y Rust 1.97.0, con el servidor en 2 núcleos y el generador en los otros 2. Es otra máquina que la de §3.7 y §4.7, así que los números absolutos no se comparan con los de arriba (DP3).
+- **Los detalles:** la nota **Hecho** del Lote 8, y los datos crudos, en `tools/perf/results/fase3_12/lote8/`.
+
+| Escenario | Base (`0b03a77`) | Resultado (`6b93115`) |
+|---|---|---|
+| **E1-disco, 1 / 8 / 64 pedidos en vuelo:** commits/s | 1.593 / 3.479 / 3.004 | 1.534 / 6.791 / 18.230 |
+| **E1-tmpfs, 1 / 8 / 64:** commits/s | 6.612 / 21.454 / 33.916 | 6.068 / 20.673 / 23.650 |
+| **E1-actor, 1 / 8 / 64:** commits/s | 41.195 / 59.101 / 29.102 | 16.673 / 56.886 / 63.393 |
+| **E2-tmpfs, 1.000 salas:** propagación p99, `503`, CPU por commit, hilos | 11,3 s; ~1 millón por corrida; 1,59 ms; ~340 | 2,1 ms; 0; 0,44 ms; 37 |
+| **E2-tmpfs, 500 salas:** propagación p99, CPU por commit | 23 ms; 1,57 ms | 2,2 ms; 0,50 ms |
+| **E2-disco, 1.000 salas:** propagación p99, escrituras al disco por commit | 21,0 s; 8,6 | 4,9 ms; 3,8 |
+| **E2-disco, 500 salas:** propagación p99, escrituras por commit | 31 ms; 7,4 | 4,1 ms; 3,8 |
+| **E2-disco en un disco de nube emulado** (3.000 escrituras por segundo), 1.000 / 500 salas: propagación p99 | 24,2 s / 55 ms | 109 ms / 5,6 ms |
+| **E2-modos, 1.000 salas, a / c / d:** propagación p99 | 11,3 s / 115 ms / 25,3 s | 2,1 ms / 2,1 ms / 25,3 s |
+| **E2-modos, a / c / d:** CPU del servidor por commit | 1,63 / 1,01 / 0,42 ms | 0,48 / 0,49 / 0,37 ms |
+
+- **Lo que cambió:** los cuellos de botella de §3.7.8 y §4.7.5, en el orden de la fase:
+  - el presupuesto de respuestas reserva lo que se lee, y no hay más `503` de presupuesto;
+  - la E/S de las salas va a un pool fijo, sin `block_in_place`, y el servidor tiene 37 hilos con cualquier cantidad de salas;
+  - el *group commit* comparte un `fsync` entre los commits que esperan;
+  - el evento `ops` trae las operaciones, y los clientes no hacen `/sync` después de cada evento;
+  - el catch-up comparte las operaciones del búfer en RAM y las reserva por tramos;
+  - el roster se escribe cada 10 s.
+- **La meta de la fase,** con 1.000 salas de fábrica, se cumple: la propagación por debajo de 10 ms en p99, y menos de 0,5 ms de CPU del servidor por commit con el evento `ops`.
+- **Lo que baja, y por qué:**
+  - **Con 1 pedido en vuelo,** de un 4% a un 8% por HTTP: el traspaso de cada `fsync` al pool, unos 27 µs. En E1-actor, donde el commit en tmpfs es casi solo eso, baja un 60%.
+  - **E1-tmpfs con 64 en vuelo, un 30%:** el resultado manda en el catch-up de cada commit unas 59 operaciones, contra 4 de la base, que dejaba el 91% de los catch-ups vacíos. En la base, eso lo pagaría el cliente con un `/sync`.
+- **Lo que quedó para después** está en §6: la pausa del mantenimiento de disco y el costo del traspaso al pool.
+
 ---
 
 ## 5. Seguimiento
@@ -429,10 +462,12 @@ Orientan las propuestas; no son decisiones adoptadas, y las del SDK y el protoco
 ## 6. Próximos pasos a definir
 
 Se definen con lo que muestren las evaluaciones anteriores. Lo que dejaron abierto las Evaluaciones 1 y 2:
-- **Repetir la Evaluación 2 después de cada optimización** de §4.7.6, con el mismo arnés.
+- **Repetir la Evaluación 2 después de cada optimización** de §4.7.6, con el mismo arnés. Hecho en la Fase 3.12: cada lote midió su escenario, y su Lote 8 repitió las dos evaluaciones enteras (§4.9).
 - **Los modos de frescura en disco real** (§4.8 se midió en tmpfs), y salas de 50 usuarios con los modos c y d.
 - **El envío de los eventos SSE:** juntar varios eventos en una escritura, y cuánto acerca eso al modo c al techo de §4.8.3.
-- **Un disco de nube con límite de operaciones por segundo** (§4.7.2, pregunta 3): las 7 a 9 escrituras por commit, sobre todo las del roster, pueden ser el límite ahí.
+- **Un disco de nube con límite de operaciones por segundo** (§4.7.2, pregunta 3): las 7 a 9 escrituras por commit, sobre todo las del roster, pueden ser el límite ahí. La Fase 3.12 lo midió en uno emulado, con un límite de escrituras por segundo y sin la latencia de un disco de red (su Lote 7, que escribe el roster cada 10 s, y su Lote 8, §4.9). Falta uno real. Queda lo del propio commit: unas 3 escrituras y 1 flush, de `active.wal`, el journal de ext4 y sus flush. Un `active.wal` preasignado con `fdatasync`, para que un commit no escriba el journal, sería una propuesta aparte.
+- **La pausa del mantenimiento de disco** (el Lote 8 de la Fase 3.12): el tick lento (cada 30 s) hace esperar a los commits de su sala mientras corre la compresión, la ventana de la RAM, el TTL, la cuota y la poda, y su duración crece con lo que la sala escribió desde el anterior, unos 0,6 s en E1-disco con 64 pedidos en vuelo. Con una sala a ritmo humano no se nota. Lo acortaría no esperar ese mantenimiento para atender los commits, o repartirlo entre ticks.
+- **El traspaso de cada `fsync` al pool de E/S** (los Lotes 3 y 8 de la Fase 3.12): unos 27 µs por commit, de un 4% a un 8% con un solo pedido en vuelo por HTTP y un 60% en E1-actor, donde el commit en tmpfs es casi solo eso.
 - **Más de 1.750 salas o más streams:** en una máquina donde se pueda subir el límite de archivos abiertos, o con el generador en otra máquina.
 - **Las latencias máximas y la pausa de más de 5 s** (§3.7.1 y §3.7.5): corridas más largas con el registro de pausas, cruzado con los sellados de segmentos y el *steal time* de la máquina.
 - **Una sala con muchos segmentos** (§3.7.6): una corrida larga con carga sostenida, para ver si abrir la sala, el índice de segmentos o el directorio se vuelven lentos con cientos de miles de archivos.

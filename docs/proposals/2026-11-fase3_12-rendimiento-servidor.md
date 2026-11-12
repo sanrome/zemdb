@@ -2,7 +2,7 @@
 
 **Fecha:** 1 de Noviembre de 2026
 **Tipo:** Optimización del servidor y del protocolo. Documento vivo: plan, lotes y seguimiento. La fase es chica y no tiene sub-fases: este plan baja directamente a lotes (`docs/METODOLOGIA.md` §1).
-**Estado:** En curso. Las decisiones DS1 a DS8 las adoptó el dueño del proyecto en el Lote 0 (1 de Noviembre de 2026); DS7, condicionada a la medición del Lote 7. DS9 salió del Lote 4 y la adoptó el dueño el 3 de Noviembre de 2026, con el mecanismo que eligió al arrancar el Lote 4b (la distancia en bytes al inicio del grupo). DS10 salió de la medición del Lote 6; el dueño del proyecto la dejó para un Lote 6b el 6 de Noviembre de 2026 y la adoptó al arrancarlo, el 7, con tramos de 256 KiB y sin tramos en una lectura después de uno que no entra. DS7 la adoptó el dueño del proyecto con la medición del Lote 7, el 10 de Noviembre de 2026, con N = 10 s y otro criterio, el 11 le sumó una fase por sala, y el 12, con la revisión de delta, que cada sala escriba en los puntos de su propia grilla. El contrato está en la versión 27 de `INVARIANTES.md`.
+**Estado:** En curso. Las decisiones DS1 a DS8 las adoptó el dueño del proyecto en el Lote 0 (1 de Noviembre de 2026); DS7, condicionada a la medición del Lote 7. DS9 salió del Lote 4 y la adoptó el dueño el 3 de Noviembre de 2026, con el mecanismo que eligió al arrancar el Lote 4b (la distancia en bytes al inicio del grupo). DS10 salió de la medición del Lote 6; el dueño del proyecto la dejó para un Lote 6b el 6 de Noviembre de 2026 y la adoptó al arrancarlo, el 7, con tramos de 256 KiB y sin tramos en una lectura después de uno que no entra. DS7 la adoptó el dueño del proyecto con la medición del Lote 7, el 10 de Noviembre de 2026, con N = 10 s y otro criterio, el 11 le sumó una fase por sala, y el 12, con la revisión de delta, que cada sala escriba en los puntos de su propia grilla. El Lote 8 midió la fase entera y corrió su revisión de cierre, que no salió en verde: el dueño del proyecto eligió, el 12 de Noviembre de 2026, arreglar sus dos rupturas en dos lotes nuevos, el 8b y el 8c, con los que cierra la fase. El contrato está en la versión 30 de `INVARIANTES.md`.
 **Origen:** las Evaluaciones 1 y 2 del [plan de evaluaciones de performance](2026-10-evaluaciones-performance.md) (§3.7, §3.8, §4.7 y §4.8).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md), con lo propio de este plan en §5: la medición antes y después de cada lote y los checklists de cada tipo de lote.
@@ -143,7 +143,7 @@ Salió del Lote 4, y la adoptó el dueño del proyecto el 3 de Noviembre de 2026
   - **Un bit** no ve dónde empieza el grupo: un daño que toma el último registro de un grupo sincronizado y el primero del último grupo, con el resto de este intacto, deja después del daño solo registros que "continúan", y la apertura truncaría un commit confirmado de un grupo que no es el último.
   - **La secuencia** resuelve ese caso comparándola con la del registro dañado, que es la del último registro válido más uno; pero si el daño empieza al principio de `active.wal` no hay registro válido antes, y la secuencia del dañado no se sabe sin otro archivo.
   - **La distancia en bytes** da la posición del inicio del grupo, que se compara con la del daño, que la apertura siempre conoce.
-- **El costo aceptado:** si el disco daña el último grupo después de su `fsync` (una falla del medio, no un corte), se truncan hasta un grupo de commits confirmados (64 commits o 1 MiB de operaciones) en lugar de un registro: la excepción de D78 pasa del último registro al último grupo, con la misma justificación (no se distingue de una escritura rota).
+- **El costo aceptado:** si el disco daña el último grupo después de su `fsync` (una falla del medio, no un corte), se truncan hasta un grupo de commits confirmados (64 commits, o 1 MiB de operaciones más la que lo alcanza) en lugar de un registro: la excepción de D78 pasa del último registro al último grupo, con la misma justificación (no se distingue de una escritura rota).
 - **Lo que exige:** un cambio del formato del registro del WAL del servidor (antes de la primera versión no hay compatibilidad que conservar, `GEMINI.md`): 8 bytes más por registro. El WAL del storage escribe un frame por `fsync`, así que no lo necesita; como comparte el formato del frame, sus frames llevan el campo en 0 (un grupo de uno), y sus reglas no cambian.
 - **Alternativas descartadas.** Aceptar el riesgo para siempre: el grupo sirve justamente a las salas con commits a la vez, que son las expuestas. Tratar como escritura rota cualquier daño seguido de frames válidos: truncaría commits confirmados ante una corrupción real (INV-D1). Un grupo en un solo frame: el payload lleva un solo `mutation_id`, así que también cambia el formato, y más.
 - **Invariantes:** INV-D2 (la excepción de D78), INV-D3, INV-D1, INV-D8, INV-D10.
@@ -177,14 +177,16 @@ Salió de la medición del Lote 6 (su nota **Hecho**). El dueño del proyecto el
 | 6 | El catch-up sin copias | server | DS6 | B1, W2, Y2 | ✅ (sin cumplir su criterio: lo sigue el 6b) |
 | 6b | La reserva por tramos | server | DS10 | B1, B5 | ✅ |
 | 7 | El roster | server | DS7 | R3, R1, D4 | ✅ |
-| 8 | Medición final y revisión de cierre | Documentos | Todas | Las que tocó la fase | ⬜ |
+| 8 | Medición final y revisión de cierre | Documentos | Todas | Las que tocó la fase | ✅ (su revisión de cierre no salió en verde: la siguen el 8b y el 8c) |
+| 8b | La búsqueda después de un grupo, con el tope de valores | core | — | B1, W1 | ⬜ |
+| 8c | Una sala que abre después de que venció su pedido | server | — | L1 | ⬜ |
 
 **Orden.**
 - El Lote 0 va primero: solo documentos, con su revisión cruzada (`docs/METODOLOGIA.md` §2). Las *Propuestas* se confirmaron en el Lote 0, después del Lote 1, que se adelantó (su nota **Hecho**).
 - El 1 va antes de cualquier optimización: sin el arnés en `main` no hay medición.
-- El 2 no depende de los demás. El 3 va antes del 4, que hace su `fsync` en el pool del 3. El 4b va después del 4 y antes del 5: cierra el riesgo que abrió el 4. El 5 va antes de que arranque la sub-fase 4.3 de la Fase 4, y después del 4, porque con el *group commit* un evento puede llevar las operaciones de un grupo. El 6, después del 2, porque cambia lo que reserva una respuesta. El 6b, después del 6, de cuya medición salió. El 7 depende de la medición en un disco de nube y puede quedar para el final. El 8 cierra.
+- El 2 no depende de los demás. El 3 va antes del 4, que hace su `fsync` en el pool del 3. El 4b va después del 4 y antes del 5: cierra el riesgo que abrió el 4. El 5 va antes de que arranque la sub-fase 4.3 de la Fase 4, y después del 4, porque con el *group commit* un evento puede llevar las operaciones de un grupo. El 6, después del 2, porque cambia lo que reserva una respuesta. El 6b, después del 6, de cuya medición salió. El 7 depende de la medición en un disco de nube y puede quedar para el final. El 8 mide la fase y la revisa; el 8b y el 8c arreglan lo que encontró su revisión de cierre, y el 8c cierra la fase.
 
-**Tamaño estimado de producción:** el Lote 2, de 100 a 150 líneas; el 3, de 200 a 300; el 4, de 150 a 250; el 4b, de 100 a 200; el 5, unas 200 entre core y servidor (con el tope total de los eventos `ops`); el 6, unas 80; el 6b, unas 40; el 7, unas 50. El 1 no tiene código de producción.
+**Tamaño estimado de producción:** el Lote 2, de 100 a 150 líneas; el 3, de 200 a 300; el 4, de 150 a 250; el 4b, de 100 a 200; el 5, unas 200 entre core y servidor (con el tope total de los eventos `ops`); el 6, unas 80; el 6b, unas 40; el 7, unas 50; el 8b, unas 15; el 8c, unas 40. El 1 no tiene código de producción.
 
 ---
 
@@ -1166,7 +1168,7 @@ Mediana, y el rango de las 3 rondas:
 
 **Tamaño:** unas 40 líneas de producción, en `config.rs` y `actor/room.rs` (85+/11− con docstrings y comentarios), más `tools/perf/cloud_disk.sh` (39), fuera del workspace; los tests, 394+/12−.
 
-### Lote 8 · Medición final y revisión de cierre · ⬜
+### Lote 8 · Medición final y revisión de cierre · ✅ Hecho (su revisión de cierre no salió en verde: la siguen el 8b y el 8c)
 **Objetivo:** cerrar la fase.
 
 **Qué se hace:**
@@ -1182,7 +1184,210 @@ Mediana, y el rango de las 3 rondas:
 - **La pausa del tick lento:** en E1-actor con 64 pedidos en vuelo, los commits en vuelo esperan juntos, a los 30 s de abrir la sala, el mantenimiento de disco (`SLOW_TICK_PERIOD`): unos 30 ms sobre `cf3e374` y unos 65 ms con el Lote 6b, que escribe el triple de operaciones entre dos ticks. La medición final dice cuánto dura en cada escenario y si pide un lote.
 - **E1-tmpfs con 1 pedido en vuelo:** quedó entre un 3% y un 8% abajo según las rondas, dentro del límite y en un camino que el lote no cambia; la medición final lo vuelve a mirar contra la línea de base de la fase.
 
-**Entrega:** `docs: close Fase 3.12 with its final measurement and the closing review (Fase 3.12, Lote 8)`.
+**Entrega:** `docs: the final measurement and the closing review of Fase 3.12 (Fase 3.12, Lote 8)`.
+
+**Hecho.**
+
+**La medición final** (12 de Noviembre de 2026, en una VM de 4 vCPU Intel Xeon a 2,10 GHz, 15 GiB, kernel `6.18.44-fc-v378`, Rust 1.97.0; el servidor en los núcleos 0 y 1, el generador en el 2 y el 3).
+- **Las variantes:**
+  - La base es `0b03a77`, la de la línea de base de la fase (el commit anterior al Lote 2).
+  - El resultado es `6b93115`, el último commit de la fase. Los commits de la Fase 4 desde `0b03a77`, y los que llegaron a `main` durante el lote, no tocan el servidor ni `core`.
+  - Los dos servidores, compilados en release limpio. Las corridas por HTTP usan el mismo binario del generador, el de `6b93115`, que entiende `head_advanced` y el evento `ops`. E1-actor usa el generador de cada árbol, que lleva el servidor adentro.
+- **Los escenarios:** los 12 de §5.2, más E2-disco en el disco de nube emulado del Lote 7, con 3.000 escrituras por segundo. Los datos van en tmpfs (`/dev/shm`), en el disco de la VM (`vda`, ext4) y en el emulado (`tools/perf/cloud_disk.sh`).
+- **El diseño:** los escenarios corrieron uno detrás de otro. En cada uno, base y resultado intercalados, 3 rondas, así que un reinicio de la VM solo habría invalidado el escenario en curso. No hubo ninguno: todos corrieron en la misma VM, sin reiniciarse, en 1 h 46 min.
+- **Las corridas son todas válidas según DP3:** sin errores, el head igual a lo confirmado, sin huecos ni errores del SSE, sin advertencias del servidor, y el generador por debajo del 60% de sus núcleos en las corridas por HTTP. Al final de cada corrida, todos los clientes están al día, salvo en el modo d, que se pone al día con el heartbeat.
+
+Mediana, y el rango de las 3 rondas. E1, en commits por segundo:
+
+| E1 | Base (`0b03a77`) | Resultado (`6b93115`) | |
+|---|---|---|---|
+| E1-tmpfs, 1 pedido en vuelo | 6.612 (6.055–6.716) | 6.068 (5.725–6.168) | −8% |
+| E1-tmpfs, 8 | 21.454 (21.336–22.347) | 20.673 (20.517–21.872) | −4% |
+| E1-tmpfs, 64 | 33.916 (33.820–33.964); p99 4,5 ms | 23.650 (18.713–23.996); p99 6,0 ms | −30% |
+| E1-disco, 1 | 1.593 (1.465–1.596) | 1.534 (1.496–1.626) | −4% |
+| E1-disco, 8 | 3.479 (3.338–3.550); p99 5,3 ms | 6.791 (6.447–6.853); p99 3,8 ms | ×2,0 |
+| E1-disco, 64 | 3.004 (2.917–3.033); p99 32,9 ms | 18.230 (18.003–18.497); p99 8,0 ms | ×6,1 |
+| E1-actor, 1 | 41.195 (39.935–43.950) | 16.673 (15.476–17.434) | −60% |
+| E1-actor, 8 | 59.101 (54.339–60.674) | 56.886 (55.648–58.368) | −4% |
+| E1-actor, 64 | 29.102 (28.009–30.426); p99 5,6 ms | 63.393 (61.889–67.584); p99 1,8 ms | ×2,2 |
+
+E2, con 10 usuarios por sala que escriben en promedio cada 10 s (un commit por segundo por sala):
+
+| E2 | Base: propagación p50 y p99 | Base: `503`, CPU por commit | Resultado: propagación p50 y p99 | Resultado: `503`, CPU por commit |
+|---|---|---|---|---|
+| E2-tmpfs, 500 salas | 1,1 y 23 ms | 14.907; 1,57 ms | 0,6 y 2,2 ms | 0; 0,50 ms |
+| E2-tmpfs, 1.000 salas | 376 ms y 11,3 s | 1.002.866; 1,59 ms | 0,6 y 2,1 ms | 0; 0,44 ms |
+| E2-disco, 500 salas | 2,0 y 31 ms | 55.641; 1,90 ms | 1,2 y 4,1 ms | 0; 0,67 ms |
+| E2-disco, 1.000 salas | 2,5 y 21,0 s | 1.085.394; 1,74 ms | 1,2 y 4,9 ms | 0; 0,62 ms |
+| E2-disco emulado con 3.000 escrituras por segundo, 500 salas | 3,0 y 55 ms (commit p99, 26 ms) | 74.664; 1,72 ms | 1,9 y 5,6 ms (commit p99, 5,5 ms) | 0; 0,60 ms |
+| E2-disco emulado con 3.000 por segundo, 1.000 salas | 2,7 y 24,2 s (commit p99, 426 ms) | 934.804; 1,41 ms | 18 y 109 ms, de 88 a 705 (commit p99, 107 ms) | 0; 0,48 ms |
+| E2-modos, 1.000 salas, modo a (SSE, `Ack` después de cada `/sync`) | 395 ms y 11,3 s | 1.088.316; 1,63 ms | 0,6 y 2,1 ms | 0; 0,48 ms |
+| E2-modos, 1.000 salas, modo c (SSE, `Ack` periódico; en la base, señales) | 1,4 y 115 ms, de 68 a 2.312 | 194.144; 1,01 ms | 0,6 y 2,1 ms | 0; 0,49 ms |
+| E2-modos, 1.000 salas, modo d (sin SSE, heartbeat cada 30 s) | 5,0 y 25,3 s | 0; 0,42 ms | 5,0 y 25,3 s | 0; 0,37 ms |
+
+- **Más de E2:**
+  - **Los hilos del servidor:** de 251 a 485 en la base, y 515 en el disco emulado con 1.000 salas (el máximo de Tokio es 512); de 36 a 37 en el resultado.
+  - **La memoria del servidor con 1.000 salas en tmpfs:** de 372 a 287 MiB.
+  - **Las escrituras al disco por commit,** en E2-disco: de 7,40 a 3,78 con 500 salas (−49%) y de 8,63 a 3,78 con 1.000 (−56%); los flush, de 1,48 a 1,15 y de 1,65 a 1,11. En el disco emulado con el límite no se comparan: con la cola, el kernel junta más pedidos (de 3,46 a 3,15 con 500 salas, y de 2,65 a 2,23 con 1.000, donde la base colapsa).
+- **Lo que cambia la carga, no solo el servidor:** desde el Lote 5, el generador aplica el evento `ops` sin `/sync` ni `Ack`. En la base hay de 2.600 a 9.500 `/sync` por segundo, y en el resultado, ninguno (salvo los del heartbeat del modo d, en los dos). Por eso los modos a y c del resultado son la misma carga (como anotó el Lote 5).
+- **La meta de la fase** (§0) se cumple en esta máquina:
+  - con 1.000 salas y la configuración de fábrica, la propagación en p99 es de 2,1 ms en tmpfs y de 4,9 ms en disco, debajo de 10 ms;
+  - con el evento `ops`, el servidor gasta 0,44 ms de CPU por commit en E2-tmpfs (0,48 y 0,49 en los modos a y c), debajo de 0,5.
+- **E1-tmpfs con 64 pedidos en vuelo, −30%: la base hacía menos trabajo.** Lo midió un diagnóstico con un generador que cuenta los catch-ups (2 rondas, `diag-probe-*`):
+  - **En la base,** el 91% de los commits recibe el catch-up vacío, con `has_more`: la reserva de un frame entero no entraba en la parte del cliente. Cada commit trae 4,1 operaciones en promedio, en unos 660 bytes por respuesta.
+  - **En el resultado,** ninguno sale vacío. Cada commit trae 58,7 operaciones, en 8,5 KB: el servidor entrega unos 1,4 millones de operaciones por segundo en catch-ups, contra unas 140.000.
+  - **En el perfil** (`diag-profile-*`), codificar los mensajes es el 13,1% del CPU del servidor, contra el 3,9% en la base.
+  - **Con 8 en vuelo,** lo mismo en chico: el 47% de los catch-ups vacíos, y 3,4 operaciones por commit contra 7,7.
+  - Es lo que anotó el Lote 2: la base se ahorraba un trabajo que un cliente real pagaría con un `/sync`.
+- **Con 1 pedido en vuelo (E1-tmpfs −8%, E1-disco −4%, E1-actor −60%): el traspaso de cada `fsync` al pool de E/S** del Lote 3.
+  - **El diagnóstico sin el pool** (`tools/perf/diagnostics/inline-io.patch`, 3 rondas intercaladas, `diag-inline-*`): E1-tmpfs con 1 en vuelo da 6.653 commits por segundo en la base, 6.200 en el resultado y 7.664 en el resultado sin el pool. En p50, 137, 143 y 115 µs.
+  - **Cuánto cuesta el traspaso:** unos 27 µs por commit, el 7% en este escenario. Sin él, el resultado queda un 15% por encima de la base.
+  - **En E1-actor,** sin HTTP y en tmpfs, el commit es casi solo ese traspaso: 20 µs en p50 en la base, 56 en el resultado.
+  - Es el costo que el Lote 3 midió y aceptó para no bloquear el worker (DS2), y que el *group commit* reparte con 8 o más en vuelo.
+  - Era lo que los Lotes 6b y 7 dejaron mirar contra la línea de base de la fase: E1-tmpfs con 1 queda un 8% abajo, por esto.
+- **La pausa del tick lento** (lo que dejó el Lote 6b). Es la mayor demora de los commits que empiezan entre los 29 y los 33 s de abrir la sala; el generador anota los de 10 ms o más.
+
+  | Pausa a los 30 s | 1 pedido en vuelo | 8 | 64 |
+  |---|---|---|---|
+  | E1-tmpfs: base / resultado | 10 ms o menos / 10 ms o menos | 19–22 / 19–30 ms | 33–52 / 25–29 ms |
+  | E1-disco: base / resultado | 59–84 / 41–58 ms | 161–187 / 288–330 ms | 167–181 / 521–625 ms |
+  | E1-actor: base / resultado | 41–49 / 14–16 ms | 51–75 / 51–68 ms | 31–57 / 61–96 ms |
+
+  - **Por qué crece:** con lo que la sala escribió desde el tick anterior. El mantenimiento de disco (la compresión, la ventana de la RAM, el TTL, la cuota y la poda por cursores) corre en el pool, y el actor lo espera. En E1-disco con 64 en vuelo son unas 550.000 operaciones en 30 s, cerca de 1 µs por operación, contra unas 90.000 de la base.
+  - **En el caso de uso no pesa:** una sala de E2, con un commit por segundo, escribe unas 30 operaciones por tick.
+  - **No pide un lote en esta fase.** Lo recomendó el lote y lo eligió el dueño del proyecto, el 12 de Noviembre de 2026. Va a los próximos pasos del plan de evaluaciones (§6): no esperar el mantenimiento de disco para atender los commits, o repartirlo entre ticks.
+- **La tabla de la fase entera,** también en el plan de evaluaciones (§4.9).
+- Los datos crudos, los diagnósticos y el entorno: `tools/perf/results/fase3_12/lote8/` y su sección del `README`.
+
+**La revisión de cierre** (`docs/METODOLOGIA.md` §6, sobre `6b93115`).
+- **Los revisores:** tres agentes aparte, de contexto fresco y en modo solo lectura sobre el repo, uno por grupo de las invariantes de §6:
+  - durabilidad y ciclo de vida: D1, D2, D3, D7, L3, L5, L7, R1 y R3;
+  - entrega, esquema, aislamiento y formatos: Y1, Y2, Y4, Y5, E3, A1, W1 y W2;
+  - recursos y disponibilidad: B1, B3, B4, B5, L1 y L2.
+- **Cómo trabajaron:** sobre el diff de la fase (`0b03a77..6b93115` en `crates/server` y `crates/core`, que solo tocan commits de la fase), el plan con las notas **Hecho**, `INVARIANTES.md` y `ARCHITECTURE.md`. Lo hicieron en dos etapas: leer y escribir tests en una copia propia mientras corría la medición, y compilarlos y correrlos después.
+- **El resultado: no sale en verde.** Las invariantes se sostienen, salvo dos rupturas, cada una con un test que falla en `6b93115`:
+  - **INV-L1, Media, de origen (a), del Lote 3 (`9214df3`).**
+    - **El escenario:** una sala cuya apertura, con su espera en el pool de E/S, pasa de `ACTOR_TIMEOUT` se descarta con el pedido que venció, y el siguiente la abre de nuevo desde cero. Una sala que tarda más de 5 s en abrir no abre nunca, y con la cola del pool cerca de 5 s, casi ninguna sala cerrada abre.
+    - **Por qué antes no pasaba:** la apertura corría con `block_in_place`, sin un `.await` que el plazo pudiera cortar, y la sala quedaba registrada aunque el pedido recibiera `Timeout`.
+    - **Los tests,** que fallan 3 de 3: una apertura frenada en el fail point `room_open`, y una que espera a que se libere el pool de un solo hilo, ocupado por un `fsync` de otra sala.
+    - **El arreglo que propone el revisor,** probado en su copia: la apertura en una tarea propia. Con él, los dos tests pasan.
+    - Lo arregla el **Lote 8c**.
+  - **INV-B1 ★ e INV-W1 ★, del Lote 4b (`d2a3848`).**
+    - **El escenario:** la búsqueda después de un grupo dañado (`find_frame_after_group`) decodifica entero cada frame que encuentra, sin el tope de valores de un mensaje. Un frame que un miembro guarda en un valor, con 4,1 millones de valores en 16 MiB, hace que la apertura reserve 111 MiB de una vez, unas cuatro veces la cota, si un daño cae en el header de ese registro.
+    - **Por qué la severidad:** un solo disparador raro, que falla cerrado (la sala no abre, o trunca el grupo roto como acepta DS9). El revisor la propone Media, pero rompe dos ★, así que no entra en D91.
+    - Lo arregla el **Lote 8b**.
+  - **Cómo siguen:** el dueño del proyecto eligió, el 12 de Noviembre de 2026, arreglarlas en dos lotes nuevos, cada uno con su revisión de delta, antes de cerrar la fase (`docs/METODOLOGIA.md` §6).
+- **Lo que se sostiene, con 11 tests nuevos que pasan:**
+  - **Durabilidad (5):** un grupo fallido cuyos registros se perdieron; la parada por un fallo, que reabre recién después de escribir el roster; el apagado de 8 salas con un solo hilo de E/S y un período de 300 s; la poda del tick lento, que escribe el roster antes de borrar; y el daño de abajo.
+  - **Entrega (5):** rechazos de cada causa dentro de un grupo; `BehindCompaction` dentro de un grupo; un grupo más grande que la ventana de la RAM, leído del segmento que sella; los eventos a través de una reapertura después de una evolución del esquema; y un `Timeout` de un commit que queda secuenciado.
+  - **Recursos (1):** el presupuesto vuelve a cero con respuestas leídas de disco, terminadas o canceladas en cada `.await`.
+  - **Dónde están:** pasan en `6b93115`, y los revisores de durabilidad y de entrega probaron los suyos con mutaciones inversas (cuatro y dos), que los hacen fallar. Quedan como parches en [`docs/audits/2026-11-fase3_12-cierre/`](../audits/2026-11-fase3_12-cierre/README.md), junto con los tres que fallan.
+- **Un Bajo de documentos que decidió el dueño del proyecto,** de origen (a), del Lote 4b (INV-D1, D2, D3).
+  - **El escenario:** un daño del medio en un grupo ya sincronizado que no es el último, y un corte durante el `fsync` del grupo siguiente que lo pierde entero. La apertura trunca registros confirmados del grupo dañado; antes del Lote 4b fallaba, sin perder nada.
+  - **Por qué es Bajo:** los bytes no se distinguen de un último grupo roto con un daño del medio, que es el riesgo de D78 extendido por DS9 (§4 de `INVARIANTES.md`), y el costo es el mismo, un grupo. El test lo fija.
+  - **Lo que cambia:** el texto dice ahora "el último grupo del que quedan frames válidos" (INV-D2, INV-D3 y la fila de §4), con el visto bueno del dueño del proyecto.
+- **Los demás Bajos:**
+  - **Corregidos en los documentos:**
+    - en `INVARIANTES.md`, lo que sostiene INV-Y1 e Y5 desde el *group commit*;
+    - el enunciado de INV-Y4: un reintento que cae en un grupo cuyo `fsync` falla recibe `Unavailable`;
+    - el enunciado de INV-Y5: un error incierto, como un `Timeout`, no es un rechazo, y un rechazo tampoco emite `ops`;
+    - el hilo principal en INV-B3;
+    - lo automatizable de INV-W1 y W2;
+    - la introducción y el estado de cada invariante de la fase en el resumen;
+    - DS1 a DS10 en §1.6;
+    - el tope de un grupo, 1 MiB más la operación que lo alcanza, en la fila de §4 y en DS9;
+    - en `ARCHITECTURE.md`, los pánicos con un grupo (§5.4) y que un rechazo no emite `ops` (§7.2 *Ordering*).
+  - **Al Lote 8c,** que toca ese código: el docstring de `RoomActor::announcement`, que no nombra el tope de 4 KiB del evento; y el enunciado de INV-L1 y lo que dice `ARCHITECTURE.md` del reintento de un `Timeout` (§7.2) y de la reapertura en el apagado (§5.4).
+  - **Al backlog (`ROADMAP.md` §3, punto 19):**
+    - `InflightBudget::take` toma primero del total y después revisa la parte del cliente, así que por un instante un cliente con su parte llena saca hasta un tramo (256 KiB) del total. Bajo, de origen (b).
+    - El vencimiento de un stream se calcula una vez con la hora de pared y se espera con el reloj monotónico: un salto de la hora hacia adelante lo alarga. Nota, de origen (c).
+
+**Lo demás del lote.**
+- **`tools/perf/diagnostics/inline-io.patch`,** rehecho sobre `6b93115`: no aplicaba desde el Lote 3, parte 2, porque se había escrito sobre una versión intermedia de `io_pool.rs`. Ahora corre la E/S en el lugar desde `run_holding`, por donde pasan todas las operaciones del pool.
+- **Documentos:**
+  - `INVARIANTES.md`, versión 30. La 4.3 y la 4.4 tomaron la 28 y la 29 durante el lote.
+  - `ARCHITECTURE.md` §5.4 y §7.2.
+  - Este plan: el Lote 8, y los Lotes 8b y 8c.
+  - El plan de evaluaciones: §4.9, la tabla de la fase, y §6.
+  - `ROADMAP.md`.
+  - Los `README` del arnés y de los resultados.
+  - El informe de la revisión, en `docs/audits/2026-11-fase3_12-cierre/`.
+  - `README.md` no cambia: ya describe la configuración de la fase.
+
+**Desvíos.**
+- **La fase no cierra con este lote:** la revisión de cierre no salió en verde, y la siguen los Lotes 8b y 8c (arriba). La fase cierra con el último de ellos.
+- **Tres revisores, en lugar de uno,** como en los Lotes 3 y 4, por el tamaño del delta (unas 8.200 líneas, con los tests) y las 23 invariantes; cada uno, con su grupo.
+- **La revisión en dos etapas,** para no competir por CPU con la medición.
+- **E2-disco en el disco emulado, solo con 3.000 escrituras por segundo:** sin límite, el emulado repite lo de `vda`, y el Lote 7 ya lo midió.
+- **Los diagnósticos** (el generador que cuenta los catch-ups, el servidor sin el pool, los perfiles) no estaban en el plan: explican lo que baja en E1.
+
+### Lote 8b · La búsqueda después de un grupo, con el tope de valores · ⬜
+**Objetivo:** que la apertura de `active.wal` después de un daño no reserve más que lo que permite un mensaje. La revisión de cierre del Lote 8 rompió ahí INV-B1 ★ e INV-W1 ★. El dueño del proyecto eligió arreglarlo en un lote nuevo (12 de Noviembre de 2026).
+
+**Lo que encontró la revisión:**
+- **El escenario:** desde el Lote 4b, `find_frame_after_group` (`crates/core/src/protocol/wal_frame.rs`) decodifica entero cada frame válido que encuentra después del daño (`decode_batch_payload`, con `bincode` y sin presupuesto de valores), solo para leer a cuántos bytes empieza su grupo. Un miembro puede guardar en un valor un frame válido con unas 63 operaciones de 65.535 `Null` (4,1 millones de valores en 16 MiB). Si un daño cae justo en el header de ese registro, la apertura decodifica ese frame y reserva 111 MiB de una vez, según el test de la revisión: unas cuatro veces la cota de un mensaje (`MAX_MESSAGE_VALUES`).
+- **Antes del Lote 4b,** la búsqueda (`find_valid_frame`) no decodificaba.
+- **Por qué pesa:** es un solo disparador raro, y falla cerrado (la sala no abre, o trunca el grupo roto como acepta DS9), pero rompe dos ★.
+
+**Archivos:** `crates/core/src/protocol/wal_frame.rs` y sus tests.
+
+**Qué se hace:**
+- **La propuesta de la revisión:** la búsqueda decodifica cada frame que encuentra con el tope de valores de un mensaje (`ValueBudget` con `MAX_MESSAGE_VALUES`), y toma el agotamiento como un frame que no decodifica, que la apertura ya trata como corrupción. Un frame que escribió el servidor nunca pasa ese tope.
+- **La alternativa:** leer solo la distancia al inicio del grupo, el primer campo del payload, sin decodificar las operaciones.
+- Se decide con el dueño del proyecto al arrancar (paso 0).
+
+**Tests exigidos:**
+- El de la revisión, traído al repo con un nombre propio y sin códigos (`docs/audits/2026-11-fase3_12-cierre/`): un frame guardado con más valores que un mensaje, encontrado después de un daño, no reserva más que la cota, y la apertura lo trata como corrupción.
+- Un frame de un grupo genuino, al tope de un mensaje, sigue decodificando y la apertura trunca el grupo roto como hoy.
+- El fuzzer de la búsqueda y las imágenes de crash del Lote 4b, sin cambios en sus expectativas.
+
+**Interacciones a revisar:** la apertura de `active.wal` (`classify_last_group_in`); los segmentos sellados y las colds, que no usan la búsqueda; el storage, que comparte el formato del frame pero no la búsqueda; y lo que queda en §4 de `INVARIANTES.md` sobre un frame guardado en un valor.
+
+**Metodología:** §5.1, con el checklist de crash-safety; las versiones largas de `zemdb-core` y del servidor; la compilación a `wasm32-unknown-unknown`, porque toca `core`; y la medición de los controles.
+
+**Documentos:** `INVARIANTES.md`, el estado de INV-B1 e INV-W1; `ARCHITECTURE.md`, si describe la búsqueda.
+
+**Entrega:** `fix(core): the search after a damaged group decodes within the value budget of a message (Fase 3.12, Lote 8b)`.
+
+**Hecho.** *Pendiente.*
+
+### Lote 8c · Una sala que abre después de que venció su pedido · ⬜
+**Objetivo:** que una sala cuya apertura pasa de `ACTOR_TIMEOUT` abra igual. La revisión de cierre del Lote 8 rompió ahí INV-L1. El dueño del proyecto eligió arreglarlo en un lote nuevo (12 de Noviembre de 2026). Cierra la fase.
+
+**Lo que encontró la revisión:**
+- **El mecanismo:** desde el Lote 3, parte 2 (`9214df3`), `RoomManager::ask` pone el plazo de `ACTOR_TIMEOUT` sobre `slot()`, y la apertura (`spawn_actor`, que corre `RoomActor::open` en el pool con `io_locked`) es un `.await` de ese pedido. Si el plazo vence, el actor recién abierto se descarta, y el pedido siguiente abre la sala de nuevo desde cero.
+- **Las consecuencias:** una sala cuya apertura, con su espera en el pool, dura más de 5 s no abre nunca. Con la cola del pool cerca de 5 s (como la que midió el Lote 7 en un disco de nube antes de DS7), casi toda apertura se descarta.
+- **Antes del Lote 3,** la apertura corría con `block_in_place`, sin un `.await`, y la sala quedaba registrada aunque el pedido recibiera `Timeout`.
+- **Los tests de la revisión** fallan en `6b93115` (3 de 3) y pasan con el arreglo que propone.
+
+**Archivos:** `crates/server/src/actor/manager.rs` y sus tests; el docstring de `RoomActor::announcement` (`actor/room.rs`), un Bajo de la revisión.
+
+**Qué se hace:**
+- **La propuesta de la revisión,** probada en su copia (unas 40 líneas): la apertura y el registro de su actor corren en una tarea propia (`tokio::spawn`), que se lleva el lock de spawn y `Listed`, y quien la lanzó espera su `JoinHandle`. Una apertura que nadie espera registra igual su actor, y el pedido sigue recibiendo `Timeout` a los 5 s.
+- **La alternativa:** no cortar la apertura.
+- Se decide con el dueño del proyecto al arrancar (paso 0).
+
+**Tests exigidos:**
+- Los dos de la revisión, traídos al repo con un nombre propio y sin códigos (`docs/audits/2026-11-fase3_12-cierre/`): una apertura frenada, y una que espera el pool lleno.
+- `a_spawn_dropped_while_its_room_opens_leaves_nothing_and_keeps_the_lock_until_the_end` pasa a fijar lo nuevo: una apertura cortada termina, registra la sala y retiene el lock hasta el final.
+- Una apertura que falla deja la sala sin registrar y el lock libre.
+- Una sala que se borra mientras su apertura corre.
+
+**Interacciones a revisar:**
+- INV-L2: una sala abierta por un pedido cortado no es estado a medias.
+- INV-L7: el lock, hasta que termina la operación que serializa.
+- Las recargas del esquema (`Listed`) y el borrado de una sala.
+- El apagado (`shutdown_all`) con una apertura en vuelo.
+- `wait_for_previous_actor`, y el relay, que también abre salas.
+
+**Metodología:** §5.1, con el checklist de concurrencia del servidor; las versiones largas del servidor; y la medición de los controles.
+
+**Documentos:**
+- `INVARIANTES.md`: el estado y el enunciado de INV-L1, y el cierre de la fase.
+- `ARCHITECTURE.md`: el reintento de un `Timeout` (§7.2) y la reapertura en el apagado (§5.4).
+- Este plan, con el cierre de la fase, el plan de evaluaciones y `ROADMAP.md`.
+
+**Entrega:** `fix(server): a room whose opening outlasts its request stays open, and close Fase 3.12 (Fase 3.12, Lote 8c)`.
 
 **Hecho.** *Pendiente.*
 
@@ -1191,7 +1396,7 @@ Mediana, y el rango de las 3 rondas:
 ## 6. Cómo se audita y cómo se prueba
 
 - **Revisión de delta en cada lote,** con la pregunta de §5.4; en los Lotes 3 y 4, con dos revisores independientes (durabilidad y concurrencia).
-- **Revisión de cierre de la fase** en el Lote 8, contra INV-B1, B3, B4, B5, D1, D2, D3, D7, E3, L1, L2, L3, L5, L7, R1, R3, Y1, Y2, Y4, Y5, A1, W1 y W2. No hace falta una auditoría amplia: el servidor ya está en el alcance auditado y el modelo de amenaza no cambia (`INVARIANTES.md` §1.4).
+- **Revisión de cierre de la fase** en el Lote 8, contra INV-B1, B3, B4, B5, D1, D2, D3, D7, E3, L1, L2, L3, L5, L7, R1, R3, Y1, Y2, Y4, Y5, A1, W1 y W2. No salió en verde (INV-L1, B1 y W1): la siguen los Lotes 8b y 8c, cada uno con su revisión de delta (`docs/METODOLOGIA.md` §6). No hace falta una auditoría amplia: el servidor ya está en el alcance auditado y el modelo de amenaza no cambia (`INVARIANTES.md` §1.4).
 - **Las cuatro capas de pruebas** (`docs/METODOLOGIA.md` §7): una prueba por regla en cada lote; las imágenes de crash y los fail points para los Lotes 3, 4 y 7; los fuzzers de mensajes para el Lote 5; y la medición como una capa más, que no prueba corrección pero sí que el lote hace lo que promete.
 
 ---
@@ -1223,6 +1428,8 @@ Mediana, y el rango de las 3 rondas:
 | 6 | El catch-up sin copias | ✅ (sin cumplir su criterio: lo sigue el 6b) |
 | 6b | La reserva por tramos | ✅ |
 | 7 | El roster | ✅ (sin cumplir la primera parte de su criterio, con el visto bueno del dueño del proyecto) |
-| 8 | Medición final y revisión de cierre | ⬜ |
+| 8 | Medición final y revisión de cierre | ✅ (su revisión de cierre no salió en verde: la siguen el 8b y el 8c) |
+| 8b | La búsqueda después de un grupo, con el tope de valores | ⬜ |
+| 8c | Una sala que abre después de que venció su pedido | ⬜ |
 
-**Avance:** plan escrito el 1 de Noviembre de 2026, a partir de las Evaluaciones 1 y 2. Lote 1 cerrado el mismo día, adelantado al Lote 0 (el arnés en `main`; la línea de base se mide con el Lote 2). Lote 0 cerrado el mismo día: DS1 a DS8 adoptadas y `INVARIANTES.md` en su versión 12. Lote 2 cerrado el 2 de Noviembre de 2026: el presupuesto de respuestas reserva por lo que se lee, sin `503` del presupuesto con 1.000 salas; con él se midió la línea de base de la fase. Lote 3 cerrado el mismo día: la E/S de archivos de las salas corre en pools acotados, fuera de los workers de Tokio, con los hilos del proceso fijos; los criterios de 1.000 salas no se cumplen en la máquina de medición, saturada de CPU por el SSE de señales. Lote 4 cerrado el mismo día: los commits que esperan en una sala comparten un `fsync`, y una sala en disco pasa de unos 2.200 commits por segundo a 5.600 con 8 pedidos en vuelo y a 8.200 con 64; abre un riesgo, aceptado hasta el Lote 4b (DS9, agregado al plan el 3 de Noviembre de 2026): una sala cuyo grupo corta un corte de luz puede no abrir. Lote 4b cerrado el mismo día: cada registro dice a cuántos bytes de él empieza su grupo, y la apertura trunca un último grupo roto como un último registro roto, sin cambiar el rendimiento; la revisión de delta dejó un riesgo menor en `INVARIANTES.md` §4 (un miembro que predice sus propios registros siguientes). Lote 5 cerrado el mismo día: el SSE se puede apagar (`EventsDisabled`) y trae las operaciones de cada grupo de commits en el evento `ops`, con la encarnación de la sala y dos topes, el del evento y el total de los retenidos; con 1.000 salas, el CPU del servidor por commit baja de 1,16 a 0,47 ms y la propagación en p99, de 5,9 a 1,5 ms. De la revisión de delta: el stream termina cuando vence su token. Lote 6 cerrado el 6 de Noviembre de 2026 (medido el 4): el catch-up y el `/sync` comparten las operaciones del búfer en RAM en lugar de copiarlas, y E1-actor con 64 pedidos en vuelo pasa de 10.900 a 31.300 commits por segundo (con 8, de 42.400 a 60.100); su criterio (con 64, el 80% de 8) no se cumple, con el 52%, por dos costos por operación que no son copia, y el dueño del proyecto aceptó el desvío y agregó el Lote 6b (DS10, la reserva por tramos). Lote 6b cerrado el 8 de Noviembre de 2026: el dueño del proyecto adoptó DS10 al arrancarlo, y la lectura del log que arma una respuesta hace crecer su reserva de a tramos de 256 KiB, en lugar de una vez por operación, y la respuesta no vuelve a medir lo que lleva; E1-actor con 64 pedidos en vuelo pasa de 30.900 a 93.200 commits por segundo (con 8, de 66.800 a 73.200), el 127% de los de 8, y cumple el criterio que el Lote 6 no cumplió. Lote 7 cerrado el 11 de Noviembre de 2026: medido en un disco de nube emulado (con un límite de escrituras por segundo), el roster resultó el 30% de las unas 4 escrituras al disco de cada commit, y con 3.000 por segundo decidía si 1.000 salas aguantaban; el dueño del proyecto adoptó DS7 con N = 10 s, otro criterio y una grilla por sala, y el roster de cada sala se escribe como mucho cada 10 s, en los puntos de su grilla: con 3.000 escrituras por segundo, 1.000 salas pasan de colapsar (el 84% de sus commits, 17 s en p99) a sostenerlos todos, y 500, de 43–54 a 4 ms en p99; sin límite, las escrituras por commit bajan un 28% con 1.000 salas y un 26% con 500, debajo del 30% que pedía su criterio (la fase de la grilla cuesta unos 6 puntos), con el visto bueno del dueño del proyecto. El próximo paso es el Lote 8.
+**Avance:** plan escrito el 1 de Noviembre de 2026, a partir de las Evaluaciones 1 y 2. Lote 1 cerrado el mismo día, adelantado al Lote 0 (el arnés en `main`; la línea de base se mide con el Lote 2). Lote 0 cerrado el mismo día: DS1 a DS8 adoptadas y `INVARIANTES.md` en su versión 12. Lote 2 cerrado el 2 de Noviembre de 2026: el presupuesto de respuestas reserva por lo que se lee, sin `503` del presupuesto con 1.000 salas; con él se midió la línea de base de la fase. Lote 3 cerrado el mismo día: la E/S de archivos de las salas corre en pools acotados, fuera de los workers de Tokio, con los hilos del proceso fijos; los criterios de 1.000 salas no se cumplen en la máquina de medición, saturada de CPU por el SSE de señales. Lote 4 cerrado el mismo día: los commits que esperan en una sala comparten un `fsync`, y una sala en disco pasa de unos 2.200 commits por segundo a 5.600 con 8 pedidos en vuelo y a 8.200 con 64; abre un riesgo, aceptado hasta el Lote 4b (DS9, agregado al plan el 3 de Noviembre de 2026): una sala cuyo grupo corta un corte de luz puede no abrir. Lote 4b cerrado el mismo día: cada registro dice a cuántos bytes de él empieza su grupo, y la apertura trunca un último grupo roto como un último registro roto, sin cambiar el rendimiento; la revisión de delta dejó un riesgo menor en `INVARIANTES.md` §4 (un miembro que predice sus propios registros siguientes). Lote 5 cerrado el mismo día: el SSE se puede apagar (`EventsDisabled`) y trae las operaciones de cada grupo de commits en el evento `ops`, con la encarnación de la sala y dos topes, el del evento y el total de los retenidos; con 1.000 salas, el CPU del servidor por commit baja de 1,16 a 0,47 ms y la propagación en p99, de 5,9 a 1,5 ms. De la revisión de delta: el stream termina cuando vence su token. Lote 6 cerrado el 6 de Noviembre de 2026 (medido el 4): el catch-up y el `/sync` comparten las operaciones del búfer en RAM en lugar de copiarlas, y E1-actor con 64 pedidos en vuelo pasa de 10.900 a 31.300 commits por segundo (con 8, de 42.400 a 60.100); su criterio (con 64, el 80% de 8) no se cumple, con el 52%, por dos costos por operación que no son copia, y el dueño del proyecto aceptó el desvío y agregó el Lote 6b (DS10, la reserva por tramos). Lote 6b cerrado el 8 de Noviembre de 2026: el dueño del proyecto adoptó DS10 al arrancarlo, y la lectura del log que arma una respuesta hace crecer su reserva de a tramos de 256 KiB, en lugar de una vez por operación, y la respuesta no vuelve a medir lo que lleva; E1-actor con 64 pedidos en vuelo pasa de 30.900 a 93.200 commits por segundo (con 8, de 66.800 a 73.200), el 127% de los de 8, y cumple el criterio que el Lote 6 no cumplió. Lote 7 cerrado el 11 de Noviembre de 2026: medido en un disco de nube emulado (con un límite de escrituras por segundo), el roster resultó el 30% de las unas 4 escrituras al disco de cada commit, y con 3.000 por segundo decidía si 1.000 salas aguantaban; el dueño del proyecto adoptó DS7 con N = 10 s, otro criterio y una grilla por sala, y el roster de cada sala se escribe como mucho cada 10 s, en los puntos de su grilla: con 3.000 escrituras por segundo, 1.000 salas pasan de colapsar (el 84% de sus commits, 17 s en p99) a sostenerlos todos, y 500, de 43–54 a 4 ms en p99; sin límite, las escrituras por commit bajan un 28% con 1.000 salas y un 26% con 500, debajo del 30% que pedía su criterio (la fase de la grilla cuesta unos 6 puntos), con el visto bueno del dueño del proyecto. Lote 8 cerrado el 12 de Noviembre de 2026: la medición final de la fase, contra su línea de base y en la misma VM, cumple la meta de §0 (con 1.000 salas, la propagación en p99 pasa de 11,3 s a 2,1 ms en tmpfs y de 21 s a 4,9 ms en disco, sin `503`, con 0,44 ms de CPU del servidor por commit y 37 hilos), y una sala en disco con 64 pedidos en vuelo pasa de 3.000 a 18.200 commits por segundo. Su revisión de cierre, con tres revisores, no salió en verde: una sala cuya apertura pasa de `ACTOR_TIMEOUT` no abre (INV-L1, desde el Lote 3), y la búsqueda después de un grupo dañado puede reservar 111 MiB (INV-B1 y W1, desde el Lote 4b). El dueño del proyecto eligió arreglarlas en los Lotes 8b y 8c. El próximo paso es el Lote 8b.

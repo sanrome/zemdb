@@ -1,16 +1,17 @@
 diff --git a/crates/server/src/io_pool.rs b/crates/server/src/io_pool.rs
-index fa43b97..e81af41 100644
+index 327a457..4af9aee 100644
 --- a/crates/server/src/io_pool.rs
 +++ b/crates/server/src/io_pool.rs
-@@ -46,6 +46,11 @@ impl IoPool {
-         &self,
-         work: impl FnOnce() -> T + Send + 'static,
-     ) -> T {
-+        // Diagnostic switch of the performance spike: run the I/O in place, on the worker.
-+        static INLINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-+        if *INLINE.get_or_init(|| std::env::var_os("ZEMDB_PERF_INLINE_IO").is_some()) {
-+            return work();
-+        }
-         let permit = Arc::clone(&self.permits)
-             .acquire_owned()
-             .await
+@@ -75,6 +75,12 @@ pub(crate) async fn run_holding<T: Send + 'static>(
+     permit: OwnedSemaphorePermit,
+     work: impl FnOnce() -> T + Send + 'static,
+ ) -> T {
++    // Diagnostic switch of the performance spike: run the I/O in place, on the worker.
++    static INLINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if *INLINE.get_or_init(|| std::env::var_os("ZEMDB_PERF_INLINE_IO").is_some()) {
++        let _permit = permit;
++        return work();
++    }
+     let task = tokio::task::spawn_blocking(move || {
+         let _permit = permit;
+         work()

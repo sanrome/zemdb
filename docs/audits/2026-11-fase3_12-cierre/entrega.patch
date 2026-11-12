@@ -1,0 +1,441 @@
+diff --git a/crates/server/src/actor/tests/room.rs b/crates/server/src/actor/tests/room.rs
+index c4bb1af..fe24f91 100644
+--- a/crates/server/src/actor/tests/room.rs
++++ b/crates/server/src/actor/tests/room.rs
+@@ -5246,3 +5246,436 @@ async fn an_ops_event_carries_the_incarnation_of_its_room() {
+     ));
+     fx.manager.shutdown_all().await;
+ }
++
++// Closing review of the phase (reviewer B): sequence, delivery, schema and isolation across the
++// group commit, the `ops` event and the operations shared with the RAM buffer.
++
++/// The operations, schema version and room incarnation of an `ops` event.
++fn review_b_event_parts(event: &RoomEvent) -> (Vec<SequencedOperation>, u64, u128) {
++    use base64::Engine;
++    let RoomEvent::Ops(event) = event else {
++        panic!("expected an ops event, got {event:?}");
++    };
++    let frame = base64::engine::general_purpose::STANDARD
++        .decode(event.data())
++        .unwrap();
++    match zemdb_core::protocol::codec::decode_message(&frame).unwrap() {
++        zemdb_core::protocol::messages::ServerMessage::OpsEvent {
++            ops,
++            schema_version,
++            room_incarnation,
++            head_seq,
++            ..
++        } => {
++            assert_eq!(Some(head_seq), ops.last().map(|op| op.seq));
++            (ops, schema_version, room_incarnation)
++        }
++        other => panic!("expected an OpsEvent frame, got {other:?}"),
++    }
++}
++
++/// In the middle of a group, commits rejected for each reason a commit can be rejected there
++/// (its operation, its size, its client, its cursor) leave no trace: none moves the cursor of
++/// its client, though each names a cursor above it; their mutation ids stay free for the next
++/// commits of the same client, which are new mutations; the sequences of the group stay
++/// contiguous; and only the new operations are announced. After a reopen, the window rebuilt
++/// from the log recognizes exactly those new mutations.
++#[tokio::test]
++async fn review_b_commits_rejected_in_a_group_move_no_cursor_and_free_their_mutation_ids() {
++    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
++    let sender = fx.sender().await;
++    let (writer, other) = (
++        ClientId::new("writer").unwrap(),
++        ClientId::new("other").unwrap(),
++    );
++    let ghost = ClientId::new("ghost").unwrap();
++    register(&sender, &writer).await;
++    register(&sender, &other).await;
++    commit(&sender, &writer, mutation(1), seq(0), insert_op(1))
++        .await
++        .unwrap();
++    assert_eq!(cursor(&sender, &other).await, Some(seq(0)));
++    let mut events = subscribe(&sender).await;
++
++    let (release, held) = hold_next_fsync(&fx.active_wal());
++    let first = send_commit(&sender, &writer, mutation(2), seq(1), insert_op(2)).await;
++    held.await.unwrap();
++    // Rejected, each with a cursor inside the log (1), above the cursor of `other` (0). The
++    // commit in front is durable when they are checked: the visible head is then 2.
++    let invalid = send_commit(&sender, &other, mutation(10), seq(1), invalid_op()).await;
++    let too_large = send_commit(
++        &sender,
++        &other,
++        mutation(11),
++        seq(1),
++        insert_op_with_title(11, 17 << 20),
++    )
++    .await;
++    let unregistered = send_commit(&sender, &ghost, mutation(12), seq(1), insert_op(12)).await;
++    // A cursor that names a sequence of its own group (3), not visible yet.
++    let ahead = send_commit(&sender, &other, mutation(13), seq(3), insert_op(13)).await;
++    // The same mutation ids, now accepted: new mutations, not retries.
++    let again_invalid = send_commit(&sender, &other, mutation(10), seq(0), insert_op(20)).await;
++    let again_large = send_commit(&sender, &other, mutation(11), seq(0), insert_op(21)).await;
++    let again_ahead = send_commit(&sender, &other, mutation(13), seq(0), insert_op(23)).await;
++    release.send(()).unwrap();
++
++    assert_eq!(first.await.unwrap().unwrap().assigned_seq, seq(2));
++    assert!(matches!(
++        invalid.await.unwrap(),
++        Err(ServerError::SchemaViolation(_))
++    ));
++    assert!(matches!(
++        too_large.await.unwrap(),
++        Err(ServerError::BadRequest(_))
++    ));
++    assert!(matches!(
++        unregistered.await.unwrap(),
++        Err(ServerError::ClientNotRegistered(_))
++    ));
++    assert!(matches!(
++        ahead.await.unwrap(),
++        Err(ServerError::InvalidSequence { .. })
++    ));
++    assert_eq!(again_invalid.await.unwrap().unwrap().assigned_seq, seq(3));
++    assert_eq!(again_large.await.unwrap().unwrap().assigned_seq, seq(4));
++    assert_eq!(again_ahead.await.unwrap().unwrap().assigned_seq, seq(5));
++
++    // No rejected commit recorded its cursor (1): the cursor of `other` is still 0, the one
++    // its accepted commits reported, and the unregistered client is still not in the roster.
++    assert_eq!(cursor(&sender, &other).await, Some(seq(0)));
++    assert_eq!(cursor(&sender, &ghost).await, None);
++    assert_eq!(metrics(&sender).await.head_seq, seq(5));
++    assert_eq!(fx.fsyncs(), 3, "the first commit, the one in front, the group");
++
++    // Announced: the commit in front and the new operations of the group, the log itself.
++    let announced = pending_events(&mut events);
++    assert_eq!(
++        announced.iter().map(seqs_in).collect::<Vec<_>>(),
++        vec![vec![2], vec![3, 4, 5]]
++    );
++    let synced = sync_all(&sender, &writer).await.unwrap().ops;
++    let delivered: Vec<SequencedOperation> =
++        announced.iter().flat_map(|event| ops_in(event).0).collect();
++    assert_eq!(
++        delivered,
++        synced[1..]
++            .iter()
++            .map(|op| (**op).clone())
++            .collect::<Vec<_>>()
++    );
++    let ids: Vec<i64> = synced
++        .iter()
++        .map(|op| match op.op.pk().values()[0] {
++            Value::Int(id) => id,
++            ref other => panic!("unexpected key {other:?}"),
++        })
++        .collect();
++    assert_eq!(ids, vec![1, 2, 20, 21, 23]);
++
++    // Reopened from disk, the window of the log recognizes the new mutations, not the
++    // rejected ones.
++    fx.manager.shutdown_room(&fx.room_id).await;
++    let sender = fx.sender().await;
++    for (id, expected) in [(10, 3), (11, 4), (13, 5)] {
++        let retry = commit(&sender, &other, mutation(id), seq(0), insert_op(99))
++            .await
++            .unwrap();
++        assert_eq!(retry.assigned_seq, seq(expected), "mutation {id}");
++    }
++    assert_eq!(metrics(&sender).await.head_seq, seq(5));
++    fx.manager.shutdown_all().await;
++}
++
++/// In the middle of a group, a commit whose cursor fell behind the log is rejected with
++/// `BehindCompaction` and leaves no trace: the cursor its client has inside the log is not
++/// lowered, it is not announced, its mutation id stays free, and the group's sequences stay
++/// contiguous around it.
++// Paused time: no maintenance tick changes the lifecycle states under test.
++#[tokio::test(start_paused = true)]
++async fn review_b_a_commit_behind_the_log_in_a_group_leaves_no_trace() {
++    let (fx, writer, tail) = pruned_room().await;
++    let behind = seq(tail.get() - 2);
++    let client = ClientId::new("client").unwrap();
++    let sender = fx
++        .restart_with_roster(&[(&writer, "Connected", 8), (&client, "Connected", 8)])
++        .await;
++    let mut events = subscribe(&sender).await;
++
++    let (release, held) = hold_next_fsync(&fx.active_wal());
++    let first = send_commit(&sender, &writer, mutation(30), seq(8), insert_op(30)).await;
++    held.await.unwrap();
++    let stale = send_commit(&sender, &client, mutation(31), behind, insert_op(31)).await;
++    let fresh = send_commit(&sender, &client, mutation(31), seq(8), insert_op(32)).await;
++    let next = send_commit(&sender, &writer, mutation(33), seq(8), insert_op(33)).await;
++    release.send(()).unwrap();
++
++    assert_eq!(first.await.unwrap().unwrap().assigned_seq, seq(9));
++    assert!(matches!(
++        stale.await.unwrap(),
++        Err(ServerError::BehindCompaction)
++    ));
++    assert_eq!(fresh.await.unwrap().unwrap().assigned_seq, seq(10));
++    assert_eq!(next.await.unwrap().unwrap().assigned_seq, seq(11));
++
++    assert_eq!(cursor(&sender, &client).await, Some(seq(8)));
++    assert_eq!(states(&sender).await, (0, 2, 0, 0));
++    assert_eq!(metrics(&sender).await.head_seq, seq(11));
++    let announced = pending_events(&mut events);
++    assert_eq!(
++        announced
++            .iter()
++            .filter(|event| matches!(event, RoomEvent::Ops(_)))
++            .map(seqs_in)
++            .collect::<Vec<_>>(),
++        vec![vec![9], vec![10, 11]]
++    );
++    let synced = sync_from(&sender, &writer, seq(8)).await.unwrap();
++    let ids: Vec<i64> = synced
++        .ops
++        .iter()
++        .map(|op| match op.op.pk().values()[0] {
++            Value::Int(id) => id,
++            ref other => panic!("unexpected key {other:?}"),
++        })
++        .collect();
++    assert_eq!(ids, vec![30, 32, 33]);
++    fx.manager.shutdown_all().await;
++}
++
++/// A group larger than the RAM window, which seals `active.wal` at its end: the catch-up of
++/// each of its commits is read from the sealed segment on the file I/O threads, with the
++/// reservation by chunks, and still carries exactly the operations after its cursor up to the
++/// head of the group, the same ones a sync returns and, from the head before the group, the
++/// ones its `ops` event carries.
++#[tokio::test]
++async fn review_b_catch_ups_of_a_group_larger_than_the_ram_window_are_the_log() {
++    let fx = Fixture::new(RoomLifecycleOverrides {
++        ram_max_ops: Some(2),
++        ..RoomLifecycleOverrides::default()
++    })
++    .await;
++    let sender = fx.sender().await;
++    let writer = ClientId::new("writer").unwrap();
++    register(&sender, &writer).await;
++    let clients: Vec<ClientId> = (0..5)
++        .map(|n| ClientId::new(format!("c{n}")).unwrap())
++        .collect();
++    for client in &clients {
++        register(&sender, client).await;
++    }
++    let mut events = subscribe(&sender).await;
++
++    let (release, held) = hold_next_fsync(&fx.active_wal());
++    let first = send_commit(&sender, &writer, mutation(1), seq(0), insert_op(1)).await;
++    held.await.unwrap();
++    let mut replies = Vec::new();
++    for (n, client) in (2u8..).zip(&clients) {
++        // Cursors 0 and 1: from before the RAM window, which keeps the last two.
++        let cursor = seq(u64::from(n % 2));
++        replies.push((
++            cursor,
++            send_commit(&sender, client, mutation(n), cursor, insert_op(n.into())).await,
++        ));
++    }
++    release.send(()).unwrap();
++    first.await.unwrap().unwrap();
++    let mut answered = Vec::new();
++    for (cursor, reply) in replies {
++        answered.push((cursor, reply.await.unwrap().unwrap()));
++    }
++
++    let segments = fx.room_dir().join("segments");
++    let mut names: Vec<String> = fs::read_dir(&segments)
++        .unwrap()
++        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
++        .collect();
++    names.sort();
++    assert!(
++        segment_path(&segments, seq(1), seq(6), Tier::Warm).exists(),
++        "the group must have sealed active.wal at its end: {names:?}"
++    );
++    let synced: Vec<SequencedOperation> = sync_all(&sender, &writer)
++        .await
++        .unwrap()
++        .ops
++        .iter()
++        .map(|op| (**op).clone())
++        .collect();
++    assert_eq!(synced.len(), 6);
++    for (n, (cursor, reply)) in (2u64..).zip(answered) {
++        assert_eq!(reply.assigned_seq, seq(n));
++        let catch_up: Vec<SequencedOperation> =
++            reply.catchup_ops.iter().map(|op| (**op).clone()).collect();
++        assert_eq!(
++            catch_up,
++            synced[cursor.get() as usize..].to_vec(),
++            "the catch-up of commit {n} from {cursor}"
++        );
++        assert!(!reply.has_more);
++    }
++    let announced = pending_events(&mut events);
++    let delivered: Vec<SequencedOperation> =
++        announced.iter().flat_map(|event| ops_in(event).0).collect();
++    assert_eq!(delivered, synced);
++    fx.manager.shutdown_all().await;
++}
++
++/// Across a reopen of the room after its schema evolved: the stream of the actor that stops
++/// receives the events of that actor (its operations, then the reload, then its operations
++/// with the new version) and then ends, without any of the actor that replaces it; the
++/// stream of the new actor announces its operations with the version the registry holds and
++/// the incarnation of the room. The operations of both streams, in order, are the log.
++#[tokio::test]
++async fn review_b_events_across_a_reopen_after_an_evolution_continue_the_log() {
++    let dir = tempdir().unwrap();
++    let schema_id = SchemaId::new("todo").unwrap();
++    let registry =
++        Arc::new(crate::schema_registry::SchemaRegistry::new(dir.path().join("schemas")).unwrap());
++    registry
++        .register_schema(schema_id.clone(), test_schema())
++        .unwrap();
++    let config = ServerConfig {
++        data_dir: dir.path().to_path_buf(),
++        roster_persist_secs: 1,
++        idle_timeout_secs: 0,
++        ..ServerConfig::default()
++    };
++    let relay = Arc::new(
++        SnapshotRelay::new(
++            dir.path().join("snapshots"),
++            Duration::from_secs(60),
++            ServerConfig::default().max_snapshot_bytes,
++            Duration::from_secs(ServerConfig::default().snapshot_upload_max_secs),
++        )
++        .unwrap(),
++    );
++    let io = IoThreads::new(config.io_threads);
++    let mut manager = RoomManager::new(Arc::new(config), Arc::clone(&registry), relay, io);
++    manager.set_timings(TEST_TIMINGS);
++    let room_id = RoomId::new("room").unwrap();
++    let incarnation = manager
++        .create_room(room_id.clone(), schema_id.clone(), None)
++        .await
++        .unwrap()
++        .room_incarnation;
++
++    let sender = manager.get_or_spawn(&room_id, None).await.unwrap();
++    let client = ClientId::new("writer").unwrap();
++    register(&sender, &client).await;
++    let mut before = subscribe(&sender).await;
++    commit(&sender, &client, mutation(1), seq(0), insert_op(1))
++        .await
++        .unwrap();
++
++    let evolved = registry
++        .add_column(
++            &schema_id,
++            "tasks",
++            zemdb_core::schema::ColumnDef::new("tag", zemdb_core::value::DataType::String)
++                .nullable(true),
++        )
++        .unwrap();
++    assert_eq!(
++        manager.reload_schema_for_rooms(&schema_id).await,
++        vec![room_id.clone()]
++    );
++    let tagged = |id: i64| {
++        let row = RowBuilder::new()
++            .set("id", id)
++            .set("title", "t")
++            .set("tag", "x")
++            .build();
++        evolved.to_operation_insert("tasks", &row, 1000).unwrap()
++    };
++    commit(&sender, &client, mutation(2), seq(1), tagged(2))
++        .await
++        .unwrap();
++    manager.shutdown_room(&room_id).await;
++    let old = events_until_the_room_stops(&mut before).await;
++
++    let sender = manager.get_or_spawn(&room_id, None).await.unwrap();
++    let mut after = subscribe(&sender).await;
++    commit(&sender, &client, mutation(3), seq(2), tagged(3))
++        .await
++        .unwrap();
++    let new = pending_events(&mut after);
++
++    assert_eq!(old.len(), 3, "{old:?}");
++    assert_eq!(old[1], RoomEvent::SchemaReloaded(schema_id.clone()));
++    let parts: Vec<(Vec<u64>, u64, u128)> = [&old[0], &old[2]]
++        .into_iter()
++        .chain(new.iter())
++        .map(|event| {
++            let (ops, version, room) = review_b_event_parts(event);
++            (ops.iter().map(|op| op.seq.get()).collect(), version, room)
++        })
++        .collect();
++    assert_eq!(
++        parts,
++        vec![
++            (vec![1], 1, incarnation),
++            (vec![2], 2, incarnation),
++            (vec![3], 2, incarnation),
++        ]
++    );
++    let delivered: Vec<SequencedOperation> = [&old[0], &old[2]]
++        .into_iter()
++        .chain(new.iter())
++        .flat_map(|event| review_b_event_parts(event).0)
++        .collect();
++    let synced: Vec<SequencedOperation> = sync_all(&sender, &client)
++        .await
++        .unwrap()
++        .ops
++        .iter()
++        .map(|op| (**op).clone())
++        .collect();
++    assert_eq!(delivered, synced);
++    manager.shutdown_all().await;
++}
++
++/// A commit whose answer the room manager stops waiting for (`Timeout`) while the group in
++/// front of it waits for its fsync is still sequenced when the room gets to it: `Timeout`
++/// leaves the commit uncertain, it does not reject it, and a retry gets its sequence.
++// Paused time: the actor timeout passes while the fsync is held, without waiting for it.
++#[tokio::test(start_paused = true)]
++async fn review_b_a_commit_answered_timeout_while_a_group_syncs_is_still_sequenced() {
++    let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
++    let sender = fx.sender().await;
++    let client = ClientId::new("writer").unwrap();
++    register(&sender, &client).await;
++
++    let (release, held) = hold_next_fsync(&fx.active_wal());
++    let first = send_commit(&sender, &client, mutation(1), seq(0), insert_op(1)).await;
++    held.await.unwrap();
++    let asked = fx.manager.ask(&fx.room_id, |reply| RoomCommand::Commit {
++        client_id: client.clone(),
++        mutation_id: mutation(2),
++        last_ack_seq: seq(0),
++        op: insert_op(2),
++        reply,
++    });
++    let (answer, ()) = tokio::join!(asked, async {
++        tokio::task::yield_now().await;
++        tokio::time::advance(crate::actor::manager::ACTOR_TIMEOUT + Duration::from_millis(100))
++            .await;
++    });
++    assert!(
++        matches!(answer, Err(ServerError::Timeout(_))),
++        "{answer:?}"
++    );
++    release.send(()).unwrap();
++    assert_eq!(first.await.unwrap().unwrap().assigned_seq, seq(1));
++
++    let retry = commit(&sender, &client, mutation(2), seq(0), insert_op(2))
++        .await
++        .unwrap();
++    assert_eq!(
++        retry.assigned_seq,
++        seq(2),
++        "the commit answered Timeout was sequenced"
++    );
++    assert_eq!(metrics(&sender).await.head_seq, seq(2));
++    fx.manager.shutdown_all().await;
++}

@@ -86,3 +86,19 @@ E2-disco en un disco de nube emulado (`tools/perf/cloud_disk.sh`): un archivo de
 - `second-*`: la segunda, con la fase sola (antes de la grilla), el 11 de Noviembre de 2026 (kernel `6.18.44-fc-v378`), con los mismos escenarios y controles que `first-*`.
 - `final-*`: la medición del lote sobre el código final, con la grilla, el 12 de Noviembre de 2026, en la misma VM que `second-*`, con los mismos escenarios y controles.
 - `phase-e2-disk.jsonl`: lo que cuesta la fase, en la misma VM que `second-*`, el 11 de Noviembre de 2026, sobre la versión con la fase sola: la base, el resultado sin la fase (la primera escritura de cada sala en su primer tick con un cambio) y el resultado, intercalados, 3 rondas rotando el orden, sin límite, con 500 y 1.000 salas.
+
+## `lote8/`: la medición final de la fase
+
+Los 12 escenarios de §5.2 del plan, más E2-disco en el disco de nube emulado del Lote 7 con 3.000 escrituras por segundo.
+- **Las variantes:** la base `0b03a77` (la línea de base de la fase) y el resultado `6b93115` (su último commit).
+- **El diseño:** intercaladas por escenario, 3 rondas, el 12 de Noviembre de 2026.
+- **El entorno:** una sola VM, sin reinicios (`*.vm.json` guarda su `boot_id`): 4 vCPU Intel Xeon a 2,10 GHz, 15 GiB, kernel `6.18.44-fc-v378` y Rust 1.97.0.
+- **El generador:** las corridas por HTTP usan el de `6b93115` para las dos variantes; E1-actor, el de cada árbol.
+
+Los archivos:
+- **`<escenario>-base.jsonl` y `<escenario>-final.jsonl`:** las corridas de cada variante, en el orden en que corrieron. En los de E1, cada ronda es una línea por cantidad de pedidos en vuelo (1, 8 y 64); en los de E2, una por ronda, con la variante en su `label`.
+  - Los escenarios: `e1-tmpfs`, `e1-disk` y `e1-inproc` (E1-actor); `e2-tmpfs-r500` y `-r1000`; `e2-disk-r500` y `-r1000` (el disco de la VM, `vda`); `e2-cloud3000-r500` y `-r1000` (el emulado, con `--disk loop1`); y `e2-modes-a`, `-c` y `-d`, con 1.000 salas.
+  - En `e1-disk-base.jsonl` con 64 en vuelo, casi todos los commits pasan de 10 ms: su lista de commits lentos quedó resumida (`stalls_count`, y en `stalls` los 20 más largos, que incluyen la pausa de los 30 s).
+- **`diag-probe-*.jsonl`:** E1-tmpfs con 8 y 64 en vuelo, base y resultado, 2 rondas, con un generador instrumentado (una copia local, fuera del repo) que cuenta los catch-ups: `probe_acks`, `probe_catchup_ops` (las operaciones de todos los catch-ups), `probe_empty`, `probe_has_more` y `probe_response_bytes`.
+- **`diag-inline-*.jsonl`:** E1-tmpfs con 1 en vuelo, 3 rondas intercaladas: la base, el resultado (`final`) y el resultado sin el pool de E/S (`noio`, `diagnostics/inline-io.patch` con `ZEMDB_PERF_INLINE_IO=1`).
+- **`diag-profile-*-k64.*`:** el perfil de CPU del servidor (`profile_e1.sh`, 8 s) en E1-tmpfs con 64 en vuelo, base y resultado: los 40 símbolos de más peso (`.txt`) y la corrida (`.json`).
