@@ -62,7 +62,8 @@ impl ClientConfig {
 /// How soon the worker of a room catches its replica up with what the others write.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Freshness {
-    /// At once, by the event stream of the room, and at the latest with each heartbeat.
+    /// At once, by the event stream of the room, and at the latest with each heartbeat. Until the
+    /// worker opens the event stream, as [`Freshness::Periodic`].
     Live,
     /// With each heartbeat whose ack reports a head past the replica's.
     #[default]

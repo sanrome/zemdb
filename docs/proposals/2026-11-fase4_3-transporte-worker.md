@@ -2,7 +2,7 @@
 
 **Fecha:** 4 de Noviembre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su quinta ronda. El dueño del proyecto adoptó el mismo día las precisiones de DC18 y de DC24 a DC26 y las decisiones DC27 a DC31 (DC27, con la condición de S4), con dos ajustes: DC26 dice explícitamente que, en el camino normal, un `ops` se aplica sin ningún `/sync`, y la verificación del `ClientId` de un token renovado pasa de 4.4 al Lote 3 (DC30). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026, con S4 respondido y la revisión de delta en verde en su cuarta ronda. Lote 2 (el stream de eventos: el transporte y el parser) cerrado el 9 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lote 3 (la renovación del token) cerrado el 10 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda. Lote 4 (el worker: la tarea, el heartbeat y las transferencias) cerrado el 12 de Noviembre de 2026. Lo que sigue es el Lote 5.
+**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su quinta ronda. El dueño del proyecto adoptó el mismo día las precisiones de DC18 y de DC24 a DC26 y las decisiones DC27 a DC31 (DC27, con la condición de S4), con dos ajustes: DC26 dice explícitamente que, en el camino normal, un `ops` se aplica sin ningún `/sync`, y la verificación del `ClientId` de un token renovado pasa de 4.4 al Lote 3 (DC30). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026, con S4 respondido y la revisión de delta en verde en su cuarta ronda. Lote 2 (el stream de eventos: el transporte y el parser) cerrado el 9 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lote 3 (la renovación del token) cerrado el 10 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda. Lote 4 (el worker: la tarea, el heartbeat y las transferencias) cerrado el 12 de Noviembre de 2026. Lote 5 (los modos `periodic` y `manual`) cerrado el 12 de Noviembre de 2026. Lo que sigue es el Lote 6.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.3. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Parte de:** el SSE del servidor, del Lote 5 de la [Fase 3.12](2026-11-fase3_12-rendimiento-servidor.md) (`2c0a908`): el evento `ops` con la encarnación de la sala, el stream que termina cuando vence su token y `EventsDisabled` (`ARCHITECTURE.md` §7.2).
@@ -141,7 +141,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 | 2 | El stream de eventos: el transporte y el parser | client | DC27 | K12, K15, K7 | ✅ |
 | 3 | La renovación del token | client | DC30, DC29 | K2, K17 | ✅ |
 | 4 | El worker: la tarea, el heartbeat y las transferencias | client | DC28, DC29 | K7, K15, K17 | ✅ |
-| 5 | Los modos `periodic` y `manual` | client | DC24, DC25, DC28 | K7, K15 | ⬜ |
+| 5 | Los modos `periodic` y `manual` | client | DC24, DC25, DC28 | K7, K15 | ✅ |
 | 6 | El `Ack` periódico, detener el worker y los endurecimientos | client | DC25, DC28, DC31 | K5, K11, K2, K7 | ⬜ |
 | 7 | El modo `live`: el stream en el worker | client | DC24, DC26, DC29, DC30 | K7, K6, K12, K15, K17 | ⬜ |
 | 8 | El evento `ops` | client | DC26, DC29 | K1, K6, K2, K7, K12, K17 | ⬜ |
@@ -775,7 +775,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
     - **Test:** la simulación con la semilla 11 hasta que vuelva a fallar, con un registro de los pasos de la réplica que diverge; después, un test determinista del camino.
     - El log de la corrida quedó en el scratchpad de la sesión, fuera del repositorio.
 
-### Lote 5 · Los modos `periodic` y `manual` (`zemdb-client`) · ⬜
+### Lote 5 · Los modos `periodic` y `manual` (`zemdb-client`) · ✅ Hecho
 **Objetivo:** que en `periodic` la réplica se entere sola de lo que escriben los demás, sin un `Ack` por sync (DC24, DC25).
 
 **Archivos:** el worker; `src/client.rs` (el sync sin `Ack`); `tests/worker_tests.rs`. `ARCHITECTURE.md` §11.
@@ -795,6 +795,75 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 
 **Entrega:** `feat(client): the periodic and manual modes of the worker (Fase 4.3, Lote 5)`.
 
+**Hecho** (12 de Noviembre de 2026).
+- **Qué entró.**
+  - En `periodic`, y en `live` hasta que el worker abra el stream (Lote 7), un heartbeat del worker cuyo ack informa un head mayor que el de la réplica lleva a un sync. No sincroniza una réplica que espera un snapshot: la bajada que pide el mismo ack instala uno, y el heartbeat siguiente sincroniza desde él (un sync suyo fallaría con `Network` mientras no hay uno anunciado, o esperaría la bajada del worker).
+  - El sync del worker es el de los pasos sin su `Ack` ni su heartbeat (una variante interna de `sync`): termina cuando un lote sin `has_more` deja la réplica en su head. El `sync` público y los syncs de las escrituras siguen mandando el `Ack`. El cursor del servidor avanza con el `from_seq` de cada `Sync`, así que con los syncs del worker solos queda un sync detrás de la réplica (el `Ack` periódico es del Lote 6).
+  - Corre en una tarea propia, como las transferencias, y retiene al cliente por la referencia contada del Lote 4. A lo sumo uno por sala: un heartbeat que encuentra el head adelante mientras corre marca uno más (una marca, no una cola), que arranca cuando termina, y los heartbeats siguen mientras tanto.
+  - Un lote de ese sync con `snapshot_wanted` se confirma con un heartbeat en la tarea de las transferencias, salvo que corra una: el `heartbeat` público, que sube si su ack designa al cliente y baja lo anunciado.
+  - En `manual`, ningún heartbeat lleva a un sync, y el worker sigue subiendo y bajando. El modo se lee en cada heartbeat, así que `set_freshness` vale desde el siguiente, y una marca pendiente no arranca su sync si el modo pasó a `manual` mientras tanto.
+  - El resultado del sync cuenta como el de cualquier paso: `FailedClosed` o `RoomClosed` lo detienen en el momento; otro error queda en `status`, y el heartbeat siguiente que encuentra el head adelante lo vuelve a pedir; uno que sale bien borra el error.
+  - Detenerlo corta el sync y la transferencia, y espera los dos. Un sync que termina con uno más marcado después de que la aplicación soltó el cliente no arranca otro: el worker se detiene.
+  - Unas 79 líneas de producción netas (116 agregadas y 37 quitadas, sin comentarios ni líneas vacías), contra 150 estimadas: el worker lanza sus tareas con dos funciones (la transferencia y el sync), que comparten la espera y el corte del final.
+- **Tests.** `tests/worker_tests.rs` (15 más, 34 en total), con el reloj pausado:
+  - En `periodic` y en `live`, lo que escribe otro cliente llega a la réplica en a lo sumo un intervalo, sin llamar a `sync`: un sync por cada head que un heartbeat encontró adelante, y ninguno con la réplica al día.
+  - Los syncs del worker no mandan `Ack`, y el `sync` de la aplicación sí.
+  - En `manual`, lo que escribe otro cliente no llega en tres intervalos con heartbeats, sin ningún sync; llega con un `sync` de la aplicación y con el catch-up de una escritura; vuelto a `periodic` con `set_freshness`, el heartbeat siguiente sincroniza.
+  - En `manual`, el designado sube su snapshot y el atrasado lo baja.
+  - Tres heartbeats con el head adelante mientras el sync del worker está retenido no mandan otro sync; cuando termina, uno más, desde donde dejó la réplica, y ninguno después. Si el modo pasa a `manual` mientras tanto, la marca no arranca su sync (de la revisión de delta).
+  - Un lote del sync del worker con `snapshot_wanted`: el designado sube en el momento, sin esperar al heartbeat siguiente. El ack de su primer heartbeat está fabricado como lo daría el servidor un momento antes de la designación (con el head adelante, sin designarlo): con el servidor solo, el escenario armado ya traía la designación en ese ack.
+  - El `sync` de la aplicación mientras el del worker está retenido: los dos terminan, la réplica queda en el head y el worker sin error.
+  - Un sync del worker sin respuesta deja el worker andando con `Network`, y el heartbeat siguiente lo vuelve a pedir y lo borra; un sync que sale bien borra también el error de un heartbeat que falló mientras corría (de la revisión de delta); uno cuyos lotes traen una operación que no valida, también después de registrarse otra vez, hace fallar cerrada la sala y detiene el worker antes del heartbeat siguiente.
+  - Detenerlo con un sync en vuelo lo corta (la cuenta de referencias del `Arc`); el de un cliente soltado con un sync en vuelo termina en su heartbeat siguiente y el cliente se suelta; y si el sync termina con uno más marcado mientras el worker de otra sala retiene al cliente con su heartbeat en vuelo, el worker se detiene sin mandarlo, y el cliente se suelta con el heartbeat siguiente del otro.
+  - De las interacciones: una escritura cuya secuencia aplica el sync del worker antes de su `CommitAck` termina con la decisión de la réplica (`RowMissing`); un sync del worker detrás del log (`BehindCompaction`) se registra y baja el snapshot anunciado una sola vez, mientras los heartbeats siguen y la bajada que piden espera la suya; un cambio de esquema durante un sync del worker lo registra con su cursor y aplica el lote con el esquema nuevo.
+  - Los 19 de antes siguen pasando sin cambios (el de la bajada larga verifica, además, que una réplica que espera un snapshot no sincroniza por el head). La suite del worker pasó 20 de 20 veces seguidas.
+- **Mutaciones inversas: 34 de las 36 las mató algún test** (los logs, en el scratchpad de la sesión: `mut5/run1.log`, la corrida entera; la de la que mató el test reescrito; y `mut5/run3.log`, las de los arreglos de la revisión de delta, con las reglas que cambiaron).
+  - El sync sin `Ack`: el del worker, la bandera con que lo llama, y el `Ack` del `sync` público y de los syncs de las escrituras (la de las escrituras la matan dos tests de `write_tests.rs`).
+  - Cuándo un heartbeat lleva a un sync: el head estrictamente mayor, la réplica que espera un snapshot (la mata el test de la bajada larga del Lote 4), nunca, siempre, y que el ack del worker pase el resultado.
+  - Los modos: `manual` no sincroniza, `live` sí, el modo se lee en cada heartbeat, y una marca no arranca su sync en `manual`.
+  - La tarea: el sync en su tarea y no adentro del ciclo, a lo sumo uno, la marca, tomarla una vez y lanzar el que marca.
+  - La confirmación: que el lote la pida, lanzarla, el heartbeat de la tarea de las transferencias, y que ese heartbeat suba (uno sin la subida no la confirma).
+  - El resultado del sync: que cuente, que `FailedClosed` lo detenga, y que uno que sale bien borre el error.
+  - El cliente soltado al terminar un sync con uno más marcado: la primera corrida la dejó viva, porque el sync suelta su referencia antes de que el worker lo vea terminar, así que sin otra tarea que retenga al cliente la referencia débil ya no sube. El test se reescribió con otra sala cuyo heartbeat queda en vuelo, y la mata.
+  - Detenerlo: cortar el sync.
+  - Las reglas del Lote 4 que este lote movió: a lo sumo una transferencia, cortarla, que cortar aborte, preguntar si el cliente se soltó, la bajada y la subida que pide el ack, y que el fin de una transferencia no mande un heartbeat.
+  - Dos sobreviven, de la misma clase que la que sobrevivió en el Lote 4: esperar el sync y la transferencia después de cortarlos. Con el planificador de los tests, una tarea cortada mientras espera se suelta antes de que retome quien espera al worker, así que sin la espera la cuenta de referencias da lo mismo; es lo que pide DC28 ("espera que terminen") y lo que la garantiza en un runtime de varios hilos.
+- **Interacciones revisadas.**
+  - Las escrituras y sus syncs: siguen igual, con su `Ack`. El sync del worker aplica por el aplicador, que saltea lo que la réplica ya aplicó y guarda para las escrituras en vuelo lo que decidió, como cualquier sync (con test: la escritura cuya secuencia aplica el worker termina con su decisión, y con la mutación que quita el `Ack` de las escrituras fallan dos tests de `write_tests.rs`).
+  - El `sync` público: corre a la par del del worker, cada uno con su cursor leído bajo el aplicador, y el lote atrasado de uno no es una violación (con test).
+  - La bajada que hace un sync cuando la réplica espera un snapshot anunciado: el sync del worker que se registra detrás del log baja el snapshot dentro de su tarea, con el lock de las transferencias, y la bajada que pide un heartbeat mientras tanto lo espera y lo encuentra instalado (con test). Una réplica que ya espera un snapshot no arranca un sync del worker.
+  - Un cambio de esquema durante el sync del worker: no aplica el lote, se registra con su cursor (el lock de los registros, el mismo del heartbeat del worker y de `open_room`) y aplica con el esquema nuevo (con test).
+  - El heartbeat de la confirmación: es el `heartbeat` público en la tarea de las transferencias, con el lock de las transferencias; una confirmación que llega mientras corre una transferencia no se guarda: la que corre es una bajada (la réplica espera un snapshot y no puede subir) o una subida, y si no, el heartbeat siguiente vuelve a traer la designación dentro de los 60 s del servidor (el intervalo es menor).
+  - El cursor del servidor sin `Ack`: el servidor toma el `from_seq` de cada `Sync` como cursor, así que con el worker solo queda en el `from_seq` del último sync, un sync detrás del head de la réplica, y sin límite mientras nadie escribe, hasta el `Ack` periódico del Lote 6. INV-K5 vale (el cursor sigue siendo un head que la réplica alcanzó), y la poda por cursores lo ve atrasado, un costo. Pero una poda por TTL o por cuota que pasa ese cursor deja al cliente `Bootstrapping` en cada heartbeat, aunque su réplica esté en el head, y no puede ser designado: otro cliente atrasado puede quedar sin snapshot mientras la sala calla, hasta que el cliente sincronice con `Ack` (lo encontró la revisión de delta, con un test; no es una regresión, porque sin este lote el worker no sincronizaba). Queda escrito en INV-K7, y el escenario pasa a los tests exigidos del Lote 6, que lo cierra.
+  - El orden del `select!` del worker, que elige al azar entre las tareas que terminaron y el heartbeat: una transferencia que terminó y que el worker todavía no recogió hace que se pierda la confirmación de un sync que termina a la vez (la trae el heartbeat siguiente, dentro de los 60 s de la designación); un sync que terminó sin recoger hace que un heartbeat marque uno más, que no trae nada (de la revisión de delta).
+  - D78 (INV-K1): el heartbeat sigue comparando su head con el de la réplica antes que nada, y uno menor lleva a registrarse, en cualquier modo.
+  - El estado de la conexión y la renovación del token: el sync del worker va por el mismo envío que los pasos, así que anota la conexión y renueva ante `Unauthorized`.
+  - HTTP/2: el sync del worker comparte la conexión con los demás pedidos, como cualquier sync.
+  - Detenerlo con `stop_worker`, `close_room` y `shutdown`: cortan el sync en su próximo `.await` y lo esperan; los cambios de la réplica que lanzó corren hasta el final en sus tareas (DC21), así que no queda nada a medias (con test).
+  - El cliente soltado: el sync retiene al cliente como la transferencia, y el worker que encuentra que solo sus tareas lo retienen se detiene en su heartbeat siguiente, o al terminar el sync si tiene uno más marcado o una confirmación (con tests).
+  - INV-K15: por sala con worker, a lo sumo un sync en vuelo y una marca; nada crece por heartbeat.
+  - La fachada de 4.4: no cambia; su Lote 8 arranca el worker, y `sync` sigue público para la aplicación.
+- **Revisión de delta, primera ronda: verde.** Ningún Alto ni Medio; siete Bajos, arreglados en el lote:
+  - el cursor del servidor sin `Ack` (arriba, en las interacciones): la nota decía "un costo, no una ruptura", y no lo es para este lote solo; va a INV-K7 y a los tests exigidos del Lote 6;
+  - que un sync que sale bien borre el error no tenía test: ahora lo tiene;
+  - una marca pendiente de antes de pasar a `manual` arrancaba su sync, sin test y un poco contra el modo: ahora no lo arranca, con test;
+  - el docstring de la referencia contada y el de `stop_worker`, y *The task* de `ARCHITECTURE.md`, no nombraban el sync;
+  - "la transferencia la pone al día" decía de más: la bajada deja la réplica en el snapshot, y el resto llega con el sync del heartbeat siguiente;
+  - dos detalles de texto (una coma de la fila de INV-K7 y la cuenta de los tests de antes);
+  - y las dos mutaciones de la espera después del corte, conocidas.
+  
+  Además, el orden del `select!` (arriba, en las interacciones).
+- **Desvíos.**
+  - Precisiones de DC24 y DC28 que el plan no decía:
+    - Una réplica que espera un snapshot no sincroniza por el head: la bajada instala uno, y el heartbeat siguiente sincroniza desde él.
+    - Un sync del worker que falla no tiene backoff propio: lo vuelve a pedir el heartbeat siguiente que encuentra el head adelante (como las transferencias del Lote 4).
+    - El modo se lee en cada heartbeat, y una marca pendiente no arranca su sync si el modo pasó a `manual` (de la revisión de delta).
+    - Una confirmación que llega mientras corre una transferencia no se guarda (arriba, en las interacciones).
+    - El heartbeat de la confirmación es el `heartbeat` público: sube una vez y baja lo anunciado, como el del `sync` público.
+    - Un sync que sale bien borra el error del worker, como cualquier paso.
+  - `INVARIANTES.md` toca también INV-K17 (el sync como paso del worker que lo detiene), que el plan no listaba para este lote, y toma la versión 31: la 30 la tomó la revisión de cierre de la Fase 3.12.
+  - El test de `snapshot_wanted` fabrica el ack del primer heartbeat (arriba, en los tests).
+
 ### Lote 6 · El `Ack` periódico, detener el worker y los endurecimientos (`zemdb-client`) · ⬜
 **Objetivo:** que el cursor del servidor avance sin un `Ack` por sync, y que cerrar con el worker no pierda nada (DC25, DC28, DC31).
 
@@ -806,6 +875,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 - Un worker en `periodic` que sincroniza muchas veces manda un `Ack` por intervalo, no uno por sync, con el head de la réplica; uno sin cambios no manda ninguno.
 - `close_room` y `shutdown` mandan el último `Ack` si el head se movió (en `shutdown`, el de varias salas a la vez) y, sin red, no tardan más que su plazo. Después, ninguna tarea del worker toca la sala, y el motor en disco la reabre con todo lo aplicado (INV-K11).
 - Un `AckConfirmed` con un head menor que el confirmado registra la réplica con su cursor.
+- Un lector que solo sincroniza con su worker, en una sala que no recibe escrituras, cuyo log se poda por TTL más allá del cursor que le dejó su último sync: sigue `Connected` en el servidor y puede ser designado, así que un cliente atrasado recibe un snapshot sin que el lector llame a `sync` (de la revisión de delta del Lote 5: sin el `Ack` periódico, queda `Bootstrapping` y el atrasado sin snapshot).
 - DEF-196: una réplica que espera un snapshot que nadie anuncia (un `Registered` fabricado, detrás del log) deja de esperar con el registro de los 10 heartbeats. DEF-192: después de un `HeartbeatAck` fabricado con un head más allá del servidor, el siguiente, con el head real, registra la réplica, y una escritura posterior termina con la decisión de la réplica.
 
 **Interacciones a revisar:** la poda por cursores (el cursor del servidor avanza a lo sumo un intervalo tarde, INV-Y6); la poda por cuota o por TTL de un log que alcanza el cursor guardado de un cliente en `live`, que se atrasa hasta un intervalo: el heartbeat lo deja `Bootstrapping` en el servidor y abre una demanda de snapshot que la réplica no necesita (un costo, no una ruptura); el `last_ack_seq` de los commits y el `from_seq` de los syncs; la baja al fallar cerrado; apagar el runtime después de `shutdown` (D93); lo que retienen las escrituras (DEF-192 no cambia el `seen` ya anotado); dos llamadores que detienen el worker a la vez (`stop_worker` y `close_room`, o `shutdown`), de los que el segundo no espera al worker que detiene el primero, así que podría cerrar la sala antes del último `Ack` (de la revisión de delta del Lote 4).

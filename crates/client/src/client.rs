@@ -501,7 +501,7 @@ fn with_token<'a>(message: &'a ClientMessage, token: &str) -> Cow<'a, ClientMess
     Cow::Owned(message)
 }
 
-/// A reference to the client that a task of one of its workers holds (a heartbeat or a
+/// A reference to the client that a task of one of its workers holds (a heartbeat, a sync or a
 /// transfer), which the client counts while it is held: once the application drops the client,
 /// only those hold it.
 pub(crate) struct Held(Arc<Client>);
@@ -554,21 +554,33 @@ impl Drop for Held {
     }
 }
 
-/// What the ack of a heartbeat of the worker asks it to transfer.
+/// What a step of the worker asks it to transfer.
 pub(crate) enum Transfer {
-    /// The snapshot that the server designated the client to upload, from the replica of this
-    /// epoch.
+    /// The snapshot that the ack of a heartbeat designated the client to upload, from the
+    /// replica of this epoch.
     Upload(u64),
-    /// The snapshot that the replica waits for, which the ack announced.
+    /// The snapshot that the replica waits for, which the ack of a heartbeat announced.
     Download,
+    /// A heartbeat with its transfers, as [`Client::heartbeat`] sends it: a batch of a sync of
+    /// the worker asked the client for a snapshot, which the ack of a heartbeat confirms.
+    Beat,
 }
 
 /// The ack of a heartbeat of the replica of `epoch`: whether it designates the client to upload
-/// a snapshot, and the usable snapshot it announces.
+/// a snapshot, the usable snapshot it announces, and whether its head passed that of the
+/// replica, which does not wait for a snapshot.
 struct Beat {
     epoch: u64,
     wanted: bool,
     snapshot: Option<SequenceNumber>,
+    behind: bool,
+}
+
+/// What the ack of a heartbeat of the worker asks of it: a transfer, and whether to sync, since
+/// the head of the server passed that of the replica, which does not wait for a snapshot.
+pub(crate) struct Asked {
+    pub(crate) transfer: Option<Transfer>,
+    pub(crate) behind: bool,
 }
 
 /// What the next request of a replica presents, read under its applier, so that no change of
@@ -1098,15 +1110,21 @@ impl Client {
     /// A batch that asks the client for a snapshot (`snapshot_wanted`) is confirmed with a
     /// heartbeat once the sync ends, which uploads it as [`heartbeat`](Self::heartbeat) says.
     pub async fn sync(&self, room_id: RoomId) -> Result<(), ClientError> {
-        match self.synced(room_id.clone()).await? {
+        match self.synced(room_id.clone(), true).await? {
             true => self.heartbeat(room_id).await,
             false => Ok(()),
         }
     }
 
-    /// [`sync`](Self::sync) without its heartbeat: returns whether a batch asked the client for a
-    /// snapshot.
-    async fn synced(&self, room_id: RoomId) -> Result<bool, ClientError> {
+    /// A sync of the worker of `room_id`: [`sync`](Self::sync) without its heartbeat nor its
+    /// acknowledgement. Returns whether a batch asked the client for a snapshot.
+    pub(crate) async fn worker_sync(&self, room_id: &RoomId) -> Result<bool, ClientError> {
+        self.synced(room_id.clone(), false).await
+    }
+
+    /// [`sync`](Self::sync) without its heartbeat, and without acknowledging the head reached
+    /// unless `ack`: returns whether a batch asked the client for a snapshot.
+    async fn synced(&self, room_id: RoomId, ack: bool) -> Result<bool, ClientError> {
         let room = self.room(&room_id)?;
         let (mut again, mut wanted) = (false, false);
         loop {
@@ -1186,6 +1204,9 @@ impl Client {
             };
             if has_more || head < head_seq {
                 continue;
+            }
+            if !ack {
+                return Ok(wanted);
             }
 
             let correlation_id = self.correlation_id();
@@ -1441,7 +1462,7 @@ impl Client {
             // snapshot wanted: the decision would wait for its upload.
             let _ = match room.awaits_snapshot() {
                 true => self.heartbeat(room.id.clone()).await,
-                false => self.synced(room.id.clone()).await.map(|_| ()),
+                false => self.synced(room.id.clone(), true).await.map(|_| ()),
             };
             if let Some(decision) = room.decision(&mutation_id) {
                 return decision;
@@ -1551,23 +1572,26 @@ impl Client {
                 epoch,
                 wanted,
                 snapshot,
+                behind: head_seq > head && request.awaits_snapshot.is_none(),
             });
         }
     }
 
     /// A heartbeat of the worker of `room_id`, as [`beat`](Self::beat) sends it: returns what
     /// its ack asks to transfer, the snapshot that the replica waits for if the ack announces it,
-    /// or else the one that the ack designates the client to upload.
-    pub(crate) async fn worker_beat(
-        &self,
-        room_id: &RoomId,
-    ) -> Result<Option<Transfer>, ClientError> {
+    /// or else the one that the ack designates the client to upload, and whether its head
+    /// passed that of the replica.
+    pub(crate) async fn worker_beat(&self, room_id: &RoomId) -> Result<Asked, ClientError> {
         let room = self.room(room_id)?;
         let beat = self.beat(&room, &mut false).await?;
-        if room.announced(beat.epoch, beat.snapshot) {
-            return Ok(Some(Transfer::Download));
-        }
-        Ok(beat.wanted.then_some(Transfer::Upload(beat.epoch)))
+        let transfer = match room.announced(beat.epoch, beat.snapshot) {
+            true => Some(Transfer::Download),
+            false => beat.wanted.then_some(Transfer::Upload(beat.epoch)),
+        };
+        Ok(Asked {
+            transfer,
+            behind: beat.behind,
+        })
     }
 
     /// Runs `transfer` for the worker of `room_id`, as a heartbeat would.
@@ -1581,6 +1605,7 @@ impl Client {
         match transfer {
             Transfer::Upload(epoch) => self.upload(&room, epoch, &mut again).await,
             Transfer::Download => self.snapshot(&room, &mut again).await,
+            Transfer::Beat => self.heartbeat(room_id.clone()).await,
         }
     }
 
@@ -1985,10 +2010,14 @@ impl Client {
     /// [`heartbeat`](Self::heartbeat) does, but transfers nothing: the snapshot the ack
     /// announces, if the replica waits for it, or else the one the server designates the client
     /// to upload, goes in a task of its own, one at a time, and the heartbeats go on meanwhile.
+    /// Unless its mode is [`Freshness::Manual`], a heartbeat whose ack reports a head past that
+    /// of the replica leads to a sync, in a task of its own, which acknowledges nothing: one at a
+    /// time, and one more once it ends if a heartbeat asked for one meanwhile. A batch of it that
+    /// asks the client for a snapshot is confirmed by a heartbeat in the task of the transfers.
     /// A heartbeat that fails is sent again after a backoff with full jitter (a random delay up
     /// to [`retry_base`](ClientConfig::retry_base), doubled after each retry up to
     /// [`retry_max`](ClientConfig::retry_max)), and the first that succeeds goes back to the
-    /// interval; a transfer that fails is asked for again by the next heartbeat.
+    /// interval; a transfer or a sync that fails is asked for again by the next heartbeat.
     ///
     /// Only its own steps stop it, when they find the room failing closed (`FailedClosed`) or out
     /// of the client (`RoomClosed`); any other error is tried again, and [`status`](Self::status)
@@ -2038,8 +2067,8 @@ impl Client {
         Ok(())
     }
 
-    /// Stops the worker of `room_id`, if it has one, at its next `.await`, and waits until it
-    /// and its transfer ended. A room that the client never opened is `RoomClosed`.
+    /// Stops the worker of `room_id`, if it has one, at its next `.await`, and waits until it,
+    /// its sync and its transfer ended. A room that the client never opened is `RoomClosed`.
     pub async fn stop_worker(&self, room_id: RoomId) -> Result<(), ClientError> {
         self.room(&room_id)?.stop_worker().await;
         Ok(())

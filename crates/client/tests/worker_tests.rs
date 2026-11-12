@@ -1,5 +1,6 @@
 //! The worker of a room against the server in process: its heartbeats, the snapshots it uploads
-//! and downloads in a task of their own, the retries of its steps, what stops it, and its status.
+//! and downloads in a task of their own, the syncs of its modes, the retries of its steps, what
+//! stops it, and its status.
 //! With the paused clock, but where steps fail one after another: there, with the real clock,
 //! short delays and a limit of its own, since a worker that retried without waiting would not let
 //! a paused clock go on.
@@ -15,7 +16,9 @@ use zemdb_client::{
     Client, ClientConfig, ClientError, FileMetadata, Freshness, MemoryMetadata, RoomStatus,
     WorkerStatus,
 };
-use zemdb_core::ClientMessageKind::{Heartbeat, RegisterClient, RequestSnapshotChunk, Sync};
+use zemdb_core::ClientMessageKind::{
+    Ack, Heartbeat, RegisterClient, RequestSnapshotChunk, Sync, UploadSnapshotChunk,
+};
 use zemdb_core::*;
 use zemdb_server::RoomCommand;
 use zemdb_storage::{MemoryStorageEngine, StorageEngine, StorageError};
@@ -946,6 +949,529 @@ async fn the_status_gives_the_mode_of_the_worker_and_whether_the_last_request_go
     );
     let status: Result<RoomStatus, _> = client.status(room_a.clone()).await;
     assert_eq!(status, Err(closed));
+}
+
+/// A server with `room-a`, and a client over a memory engine whose worker runs in `freshness`
+/// with a heartbeat every `interval`, with the room open.
+async fn worker_in(
+    freshness: Freshness,
+    interval: Duration,
+) -> (
+    TestServer,
+    RoomId,
+    TestTransport,
+    MemoryStorageEngine,
+    Arc<Client>,
+) {
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let (transport, storage) = (server.transport(), MemoryStorageEngine::new());
+    let config = ClientConfig {
+        freshness,
+        ..every(interval)
+    };
+    let client = client_over(storage.clone(), &transport, config).await;
+    open_room(&client, &room_id).await.unwrap();
+    client.start_worker(room_id.clone()).await.unwrap();
+    (server, room_id, transport, storage, client)
+}
+
+/// The head of the replica of `room_id` of `client`.
+async fn head(client: &Client, room_id: &RoomId) -> u64 {
+    client.status(room_id.clone()).await.unwrap().head_seq.get()
+}
+
+/// An interval and a little more: within it, the next heartbeat goes, and the sync it leads to
+/// ends (with the paused clock, the server in process and memory engines, a sync takes no time).
+fn past(interval: Duration) -> Duration {
+    interval + Duration::from_millis(10)
+}
+
+#[tokio::test(start_paused = true)]
+async fn in_periodic_and_live_what_another_client_writes_reaches_the_replica_within_an_interval() {
+    // `live` without its event stream, which comes later, as `periodic`.
+    let interval = Duration::from_secs(10);
+    for freshness in [Freshness::Periodic, Freshness::Live] {
+        let (server, room_id, transport, storage, client) = worker_in(freshness, interval).await;
+        for id in 1..=3 {
+            server.commit(&room_id, [id]).await;
+            tokio::time::sleep(past(interval)).await;
+            assert_eq!(head(&client, &room_id).await, id as u64, "{freshness:?}");
+        }
+        assert_eq!(tasks(&storage, &room_id).await, [1, 2, 3], "{freshness:?}");
+        // A sync for each head that a heartbeat found ahead, and none once the replica is there.
+        let syncs = [("sync", 0), ("sync", 1), ("sync", 2)];
+        assert_eq!(requests(&transport), syncs, "{freshness:?}");
+        tokio::time::sleep(interval * 3).await;
+        assert_eq!(requests(&transport), syncs, "{freshness:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_syncs_of_the_worker_send_no_ack_and_the_sync_of_the_application_does() {
+    let interval = Duration::from_secs(10);
+    let (server, room_id, transport, _storage, client) =
+        worker_in(Freshness::Periodic, interval).await;
+    for id in 1..=2 {
+        server.commit(&room_id, [id]).await;
+        tokio::time::sleep(past(interval)).await;
+    }
+    assert_eq!(head(&client, &room_id).await, 2);
+    assert_eq!(requests(&transport), [("sync", 0), ("sync", 1)]);
+    assert!(sent_of(&transport, Ack).is_empty());
+
+    server.commit(&room_id, [3]).await;
+    client.sync(room_id.clone()).await.unwrap();
+    let requests = requests(&transport);
+    assert_eq!(requests[2..], [("sync", 2), ("ack", 3)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn in_manual_what_another_client_writes_reaches_the_replica_with_a_sync_or_a_write() {
+    let interval = Duration::from_secs(10);
+    let (server, room_id, transport, storage, client) =
+        worker_in(Freshness::Manual, interval).await;
+    // The heartbeats go on, and none leads to a sync.
+    server.commit(&room_id, [1]).await;
+    tokio::time::sleep(interval * 3).await;
+    assert!(heartbeats(&transport, &room_id).len() >= 3);
+    assert_eq!(head(&client, &room_id).await, 0);
+    assert!(sent_of(&transport, Sync).is_empty());
+
+    // The sync and the writes of the application catch the replica up.
+    client.sync(room_id.clone()).await.unwrap();
+    assert_eq!(head(&client, &room_id).await, 1);
+    server.commit(&room_id, [2]).await;
+    tokio::time::sleep(interval * 3).await;
+    assert_eq!(head(&client, &room_id).await, 1);
+    client.write(room_id.clone(), insert_task(3)).await.unwrap();
+    assert_eq!(tasks(&storage, &room_id).await, [1, 2, 3]);
+
+    // Back in `periodic`, the next heartbeat leads to a sync.
+    server.commit(&room_id, [4]).await;
+    let syncs = sent_of(&transport, Sync).len();
+    client
+        .set_freshness(room_id.clone(), Freshness::Periodic)
+        .await
+        .unwrap();
+    tokio::time::sleep(past(interval)).await;
+    assert_eq!(head(&client, &room_id).await, 4);
+    assert_eq!(sent_of(&transport, Sync).len(), syncs + 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn in_manual_the_worker_still_uploads_the_snapshot_and_downloads_it() {
+    let (server, room_id, designee, lagging) = designated().await;
+    for member in [&designee, &lagging] {
+        let client = &member.client;
+        client
+            .set_freshness(room_id.clone(), Freshness::Manual)
+            .await
+            .unwrap();
+    }
+    // Within the 60 s of the designation, and a heartbeat of the client behind the log.
+    tokio::time::sleep(Duration::from_secs(91)).await;
+    let active = server.state.snapshot_relay.active_snapshot_seq(&room_id);
+    assert_eq!(active, Some(SequenceNumber::new(9)));
+    assert_eq!(head(&lagging.client, &room_id).await, 9);
+    let all = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+    assert_eq!(tasks(&lagging.storage, &room_id).await, all);
+    assert!(sent_of(&lagging.transport, Sync).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn heartbeats_with_the_head_ahead_during_a_held_sync_of_the_worker_ask_for_one_more() {
+    let interval = Duration::from_secs(10);
+    let (server, room_id, transport, storage, _client) =
+        worker_in(Freshness::Periodic, interval).await;
+    let mut held = transport.hold_next_reply(Sync);
+    server.commit(&room_id, [1]).await;
+    tokio::time::sleep(past(interval)).await;
+    held.replied().await;
+    // Three heartbeats find the head ahead while the sync of the worker is held: no sync more is
+    // sent meanwhile.
+    server.commit(&room_id, 2..=4).await;
+    let before = heartbeats(&transport, &room_id).len();
+    tokio::time::sleep(interval * 3).await;
+    assert!(heartbeats(&transport, &room_id).len() >= before + 3);
+    assert_eq!(requests(&transport), [("sync", 0)]);
+
+    // Once it ends, one more, from where it left the replica, long before the next heartbeat.
+    held.release();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(requests(&transport), [("sync", 0), ("sync", 1)]);
+    assert_eq!(tasks(&storage, &room_id).await, [1, 2, 3, 4]);
+    tokio::time::sleep(interval * 3).await;
+    assert_eq!(requests(&transport).len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sync_marked_before_the_mode_turns_manual_does_not_start() {
+    let interval = Duration::from_secs(10);
+    let (server, room_id, transport, _storage, client) =
+        worker_in(Freshness::Periodic, interval).await;
+    let mut held = transport.hold_next_reply(Sync);
+    server.commit(&room_id, [1]).await;
+    tokio::time::sleep(past(interval)).await;
+    held.replied().await;
+    // A heartbeat marks one sync more, and then the mode turns `manual`.
+    server.commit(&room_id, [2]).await;
+    tokio::time::sleep(interval).await;
+    client
+        .set_freshness(room_id.clone(), Freshness::Manual)
+        .await
+        .unwrap();
+    held.release();
+    tokio::time::sleep(interval * 3).await;
+    assert_eq!(requests(&transport), [("sync", 0)]);
+    assert_eq!(head(&client, &room_id).await, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sync_of_the_worker_that_succeeds_clears_the_error_of_a_heartbeat() {
+    // A failed heartbeat is retried after a backoff of up to 30 s.
+    let interval = Duration::from_secs(10);
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let transport = server.transport();
+    let config = ClientConfig {
+        retry_base: Duration::from_secs(30),
+        retry_max: Duration::from_secs(30),
+        ..every(interval)
+    };
+    let client = client_with(&transport, config).await;
+    open_room(&client, &room_id).await.unwrap();
+    client.start_worker(room_id.clone()).await.unwrap();
+    let mut held = transport.hold_next_reply(Sync);
+    server.commit(&room_id, [1]).await;
+    tokio::time::sleep(past(interval)).await;
+    held.replied().await;
+    // A heartbeat fails while the sync is held.
+    transport.offline();
+    tokio::time::sleep(interval).await;
+    let failed = worker(&client, &room_id).await.unwrap();
+    assert!(
+        matches!(failed.last_error, Some(ClientError::Network(_))),
+        "{failed:?}"
+    );
+    transport.online();
+    held.release();
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(head(&client, &room_id).await, 1);
+    assert_eq!(worker(&client, &room_id).await.unwrap().last_error, None);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_batch_of_a_sync_of_the_worker_that_asks_for_a_snapshot_has_it_uploaded_at_once() {
+    // A member at 7 of a room at 8, with its log pruned before 6 (the server seals a segment
+    // every 5 operations, so 6 to 8 stay), and a client behind the log, for which the server
+    // designates the member.
+    let server = TestServer::pruning();
+    let room_id = server.create_room("room-a").await;
+    let designee = member(&server, &room_id).await;
+    server.commit(&room_id, 1..=7).await;
+    designee.client.sync(room_id.clone()).await.unwrap();
+    server.commit(&room_id, [8]).await;
+    server.prune(&room_id, 6).await;
+    let _lagging = member(&server, &room_id).await;
+    // The ack of the first heartbeat of its worker, as the server would give it a moment before
+    // the designation, finds the head ahead and does not designate it; the batch of the sync
+    // that follows does.
+    answer_next(&designee.transport, Heartbeat, |correlation_id, room_id| {
+        encode_message(&ServerMessage::HeartbeatAck {
+            correlation_id,
+            room_id: room_id.clone(),
+            current_head_seq: SequenceNumber::new(8),
+            snapshot_wanted: false,
+            active_snapshot_seq: None,
+            schema_version: 1,
+            schema_id: SchemaId::new("tasks").unwrap(),
+        })
+        .unwrap()
+    });
+    designee.client.start_worker(room_id.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(31)).await;
+    // A heartbeat in the task of the transfers confirms the designation, and the member uploads
+    // its snapshot at once, without waiting for the next heartbeat of the interval (30 s).
+    let active = server.state.snapshot_relay.active_snapshot_seq(&room_id);
+    assert_eq!(active, Some(SequenceNumber::new(8)));
+    let first = heartbeats(&designee.transport, &room_id)[0];
+    let uploaded = sent_of(&designee.transport, UploadSnapshotChunk);
+    assert!(
+        uploaded[0] - first < Duration::from_secs(1),
+        "{first:?} {uploaded:?}"
+    );
+    // Its own sync, and that of its worker.
+    let requests = requests(&designee.transport);
+    assert_eq!(requests, [("sync", 0), ("ack", 7), ("sync", 7)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sync_of_the_application_during_one_of_the_worker_ends_and_both_leave_the_head() {
+    let interval = Duration::from_secs(10);
+    let (server, room_id, transport, storage, client) =
+        worker_in(Freshness::Periodic, interval).await;
+    // The batch of the sync of the worker, up to 3, is held while the application syncs up to 5.
+    let mut held = transport.hold_next_reply(Sync);
+    server.commit(&room_id, 1..=3).await;
+    tokio::time::sleep(past(interval)).await;
+    held.replied().await;
+    server.commit(&room_id, 4..=5).await;
+    client.sync(room_id.clone()).await.unwrap();
+    assert_eq!(head(&client, &room_id).await, 5);
+    held.release();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(head(&client, &room_id).await, 5);
+    assert_eq!(tasks(&storage, &room_id).await, [1, 2, 3, 4, 5]);
+    let running = worker(&client, &room_id).await.unwrap();
+    assert!(
+        running.running && running.last_error.is_none(),
+        "{running:?}"
+    );
+    let requests = requests(&transport);
+    assert_eq!(requests, [("sync", 0), ("sync", 0), ("ack", 5)]);
+}
+
+/// An insert of row `id` into `tasks` of [`retyped`]: it does not validate against
+/// [`tasks_schema`].
+fn insert_retyped(id: i64) -> Operation {
+    let row = RowBuilder::new().set("id", id).set("title", 7).build();
+    retyped().to_operation_insert("tasks", &row, 1000).unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sync_of_the_worker_without_a_reply_goes_on_and_one_that_fails_closed_stops_it() {
+    let interval = Duration::from_secs(10);
+    let (server, room_id, transport, _storage, client) =
+        worker_in(Freshness::Periodic, interval).await;
+    // Without a reply, the worker goes on with the error, and the next heartbeat asks again.
+    transport.lose_next_reply(Sync);
+    server.commit(&room_id, [1]).await;
+    tokio::time::sleep(past(interval)).await;
+    let lost = worker(&client, &room_id).await.unwrap();
+    assert!(lost.running, "{lost:?}");
+    assert!(
+        matches!(lost.last_error, Some(ClientError::Network(_))),
+        "{lost:?}"
+    );
+    tokio::time::sleep(interval).await;
+    assert_eq!(head(&client, &room_id).await, 1);
+    assert_eq!(worker(&client, &room_id).await.unwrap().last_error, None);
+
+    // Every batch brings an operation that does not validate against the schema of the replica,
+    // also after the sync registered again: the room fails closed, and the worker stops at once.
+    let op = SequencedOperation::new(SequenceNumber::new(2), insert_retyped(2));
+    transport.answer_every(Sync, move |message| {
+        let (correlation_id, room_id) = request(message);
+        encode_message(&ServerMessage::SyncBatch {
+            correlation_id,
+            room_id,
+            head_seq: SequenceNumber::new(2),
+            ops: vec![op.clone()],
+            has_more: false,
+            snapshot_wanted: false,
+            schema_version: 1,
+            schema_id: SchemaId::new("tasks").unwrap(),
+        })
+        .unwrap()
+    });
+    server.commit(&room_id, [2]).await;
+    let mut waited = Duration::ZERO;
+    while !client.status(room_id.clone()).await.unwrap().failed_closed {
+        assert!(waited < interval * 3, "The room did not fail closed");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        waited += Duration::from_millis(100);
+    }
+    let beats = heartbeats(&transport, &room_id).len();
+    // Long before the next heartbeat.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let stopped = worker(&client, &room_id).await.unwrap();
+    assert!(!stopped.running, "{stopped:?}");
+    let failed_closed = Some(ClientError::FailedClosed(room_id.clone()));
+    assert_eq!(stopped.last_error, failed_closed);
+    assert_eq!(heartbeats(&transport, &room_id).len(), beats);
+}
+
+#[tokio::test(start_paused = true)]
+async fn stopping_the_worker_cuts_its_sync_and_that_of_a_client_dropped_during_one_ends() {
+    // Whether the sync of the worker still runs shows in the references to the client, which it
+    // holds while it runs.
+    let interval = Duration::from_secs(10);
+    let (server, room_id, transport, _storage, client) =
+        worker_in(Freshness::Periodic, interval).await;
+    let mut held = transport.hold_next_reply(Sync);
+    server.commit(&room_id, [1]).await;
+    tokio::time::sleep(past(interval)).await;
+    held.replied().await;
+    assert_eq!(Arc::strong_count(&client), 2);
+    soon(client.stop_worker(room_id.clone())).await.unwrap();
+    assert_eq!(Arc::strong_count(&client), 1);
+    drop(held);
+
+    // Dropped with the sync of its worker in flight, the client goes once the next heartbeat
+    // finds that only the sync holds it, and the heartbeats stop.
+    let mut held = transport.hold_next_reply(Sync);
+    client.start_worker(room_id.clone()).await.unwrap();
+    tokio::time::sleep(past(interval)).await;
+    held.replied().await;
+    let dropped = Arc::downgrade(&client);
+    drop(client);
+    tokio::time::sleep(past(interval)).await;
+    assert!(dropped.upgrade().is_none());
+    let before = transport.sent().len();
+    tokio::time::sleep(interval * 6).await;
+    assert_eq!(transport.sent().len(), before);
+    drop(held);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_client_dropped_while_its_worker_marks_one_more_sync_goes_once_the_sync_ends() {
+    // The worker of another room holds the client meanwhile, with its heartbeat in flight.
+    let server = TestServer::new();
+    let (room_a, room_b) = (
+        server.create_room("room-a").await,
+        server.create_room("room-b").await,
+    );
+    let transport = server.transport();
+    let interval = Duration::from_secs(10);
+    let client = client_with(&transport, every(interval)).await;
+    open_room(&client, &room_a).await.unwrap();
+    open_room(&client, &room_b).await.unwrap();
+    let mut beating = transport.hold_next_reply(Heartbeat);
+    client.start_worker(room_b.clone()).await.unwrap();
+    tokio::time::sleep(past(interval)).await;
+    beating.replied().await;
+    let mut held = transport.hold_next_reply(Sync);
+    client.start_worker(room_a.clone()).await.unwrap();
+    server.commit(&room_a, [1]).await;
+    tokio::time::sleep(past(interval)).await;
+    held.replied().await;
+    // A heartbeat marks one sync more meanwhile.
+    server.commit(&room_a, [2]).await;
+    tokio::time::sleep(interval).await;
+    let dropped = Arc::downgrade(&client);
+    drop(client);
+    // The sync ends long before the next heartbeat: the worker stops instead of starting the
+    // one more.
+    let before = transport.sent().len();
+    held.release();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(transport.sent().len(), before);
+    // The other worker stops at its next heartbeat, and the client goes.
+    beating.release();
+    tokio::time::sleep(past(interval)).await;
+    assert!(dropped.upgrade().is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_write_whose_sequence_the_sync_of_the_worker_applies_ends_with_its_decision() {
+    // The `CommitAck` of an update of a missing row is held while the sync of the worker applies
+    // its sequence, and rejects it.
+    let interval = Duration::from_secs(10);
+    let (_server, room_id, transport, _storage, client) =
+        worker_in(Freshness::Periodic, interval).await;
+    let mut held = transport.hold_next_reply(ClientMessageKind::Commit);
+    let write = tokio::spawn({
+        let (client, room_id) = (Arc::clone(&client), room_id.clone());
+        async move { client.write(room_id, update_task(5)).await }
+    });
+    held.replied().await;
+    tokio::time::sleep(past(interval)).await;
+    assert_eq!(head(&client, &room_id).await, 1);
+    held.release();
+    assert_eq!(write.await.unwrap(), Err(ClientError::RowMissing));
+    assert_eq!(requests(&transport), [("sync", 0)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sync_of_the_worker_behind_the_log_downloads_the_snapshot_once_as_heartbeats_go_on() {
+    // A replica at 0 of a room pruned before 6, with a snapshot at 9, whose worker runs in
+    // `manual` meanwhile.
+    let server = TestServer::pruning();
+    let room_id = server.create_room("room-a").await;
+    let (transport, storage) = (server.transport(), MemoryStorageEngine::new());
+    let interval = Duration::from_secs(10);
+    let config = ClientConfig {
+        freshness: Freshness::Manual,
+        ..every(interval)
+    };
+    let client = client_over(storage.clone(), &transport, config).await;
+    open_room(&client, &room_id).await.unwrap();
+    client.start_worker(room_id.clone()).await.unwrap();
+    let ops = server.commit(&room_id, 1..=9).await;
+    server.prune(&room_id, 6).await;
+    let snapshot = snapshot(&room_id, tasks_schema(), &ops).await;
+    server.upload(&room_id, 9, snapshot).await;
+    // In `periodic`, a heartbeat finds the head ahead: its sync gets `BehindCompaction`,
+    // registers again, and downloads the snapshot that `Registered` announces, with its first
+    // chunk held. The heartbeats go on, and theirs wait for that download.
+    let mut held = transport.hold_next_reply(RequestSnapshotChunk);
+    client
+        .set_freshness(room_id.clone(), Freshness::Periodic)
+        .await
+        .unwrap();
+    tokio::time::sleep(past(interval)).await;
+    held.replied().await;
+    let before = heartbeats(&transport, &room_id).len();
+    tokio::time::sleep(interval * 2).await;
+    assert!(heartbeats(&transport, &room_id).len() >= before + 2);
+    held.release();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(head(&client, &room_id).await, 9);
+    let all = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+    assert_eq!(tasks(&storage, &room_id).await, all);
+    assert_eq!(sent_of(&transport, RequestSnapshotChunk).len(), 1);
+    let running = worker(&client, &room_id).await.unwrap();
+    assert!(
+        running.running && running.last_error.is_none(),
+        "{running:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_schema_change_during_a_sync_of_the_worker_registers_it_again_and_applies_with_it() {
+    // The ack of a heartbeat leaves the server before its schema changes, and the batch of the
+    // sync it leads to announces the new version.
+    let interval = Duration::from_secs(10);
+    let (server, room_id, transport, storage, client) =
+        worker_in(Freshness::Periodic, interval).await;
+    server.commit(&room_id, [1]).await;
+    let mut held = transport.hold_next_reply(Heartbeat);
+    tokio::time::sleep(past(interval)).await;
+    held.replied().await;
+    let schema_id = SchemaId::new("tasks").unwrap();
+    let tag = || ColumnDef::new("tag", DataType::String).nullable(true);
+    let registry = &server.state.schema_registry;
+    let added = registry.add_column_with_constraints(&schema_id, "tasks", tag(), vec![], vec![]);
+    added.unwrap();
+    let rooms = &server.state.room_manager;
+    rooms.reload_schema_for_rooms(&schema_id).await;
+    let mut tagged = tasks_schema();
+    tagged
+        .add_column_with_constraints("tasks", tag(), vec![], vec![])
+        .unwrap();
+    let row = RowBuilder::new()
+        .set("id", 2)
+        .set("title", "task")
+        .set("tag", "a")
+        .build();
+    let insert = tagged.to_operation_insert("tasks", &row, 1000).unwrap();
+    server.commit_ops(&room_id, [insert]).await;
+    held.release();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    // It did not apply the batch, registered again with its cursor, and took the new schema.
+    let incarnation = server.incarnation(&room_id).await;
+    let registrations = [(None, None), (Some(0), Some(incarnation))];
+    assert_eq!(transport.registrations(), registrations);
+    assert_eq!(requests(&transport), [("sync", 0), ("sync", 0)]);
+    assert_eq!(head(&client, &room_id).await, 2);
+    // The row 2, with its tag, applies only with the new schema.
+    assert_eq!(tasks(&storage, &room_id).await, [1, 2]);
+    let running = worker(&client, &room_id).await.unwrap();
+    assert!(
+        running.running && running.last_error.is_none(),
+        "{running:?}"
+    );
 }
 
 /// A change of a configuration.
