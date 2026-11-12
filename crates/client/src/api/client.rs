@@ -83,6 +83,11 @@ impl ZemdbClient {
         self.inner.crypto.is_some()
     }
 
+    /// The [`CryptoEngine`] of the application, if it gave one.
+    pub(super) fn crypto(&self) -> Option<&dyn CryptoEngine> {
+        self.inner.crypto.as_deref()
+    }
+
     /// Whether the writes are prechecked.
     pub(super) fn prechecks(&self) -> bool {
         self.inner.precheck

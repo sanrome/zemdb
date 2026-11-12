@@ -19,6 +19,7 @@ zemdb-core = { workspace = true }
 zemdb-storage = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+bincode = { workspace = true }
 bytes = { workspace = true }
 crc32fast = { workspace = true }
 futures = { workspace = true }

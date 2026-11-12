@@ -65,11 +65,20 @@ pub enum ClientError {
     #[error("Invalid operation: {0}")]
     InvalidOperation(String),
 
-    /// The operation or the read touches an encrypted column, which the client cannot encrypt or
-    /// decrypt. Nothing was sent, and nothing of the column was read. Its message names tables
-    /// and columns, never values.
+    /// A write or a read of the facade touches an encrypted column, and the client has no
+    /// `CryptoEngine`, or the `CryptoEngine` failed to encrypt a value of the write. Nothing was
+    /// sent, and nothing was read. Its message names tables and columns, never values.
     #[error("Encryption error: {0}")]
     Crypto(String),
+
+    /// A read of the facade gives the value of an encrypted column that does not decrypt with the
+    /// `CryptoEngine` and the additional data of its cell (another key, or the ciphertext of
+    /// another cell, also of another room), or whose plaintext is not one value of the type of its
+    /// column, as a member may write it. The read gives nothing, never a value made up; one that
+    /// does not give that column reads the others. Its message names tables, columns and types,
+    /// never values.
+    #[error("Decryption error: {0}")]
+    Decryption(String),
 
     /// The precheck of a write of the facade: the replica, in its state, would reject the write
     /// for this reason, so nothing was sent. Unlike `ConstraintViolation` and `RowMissing`, it is

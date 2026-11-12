@@ -51,6 +51,11 @@ impl Server {
         let mut room = self.0.lock().unwrap();
         *room = (room.0 + 1, schema);
     }
+
+    /// Moves the room to `schema`, in the same incarnation.
+    fn evolve(&self, schema: Schema) {
+        self.0.lock().unwrap().1 = schema;
+    }
 }
 
 #[async_trait]
@@ -237,4 +242,42 @@ fn a_row_of_the_storage_is_named_with_the_columns_of_the_read() {
         ("tag", Value::from("red")),
     ]);
     assert_eq!(named(&columns, long), long_named);
+}
+
+#[tokio::test]
+async fn a_write_checked_after_a_reload_of_the_schema_is_valid_and_after_a_discard_room_closed() {
+    let server = Server::new(tasks_schema());
+    let (client, table) = open(&server, "tasks").await;
+    let one = Row::new().with("id", 1).with("title", "one");
+    let plan = || {
+        let (epoch, (draft, _)) = table
+            .plan_write(|writer, schema| writer.insert(schema, "tasks", &one))
+            .unwrap();
+        (epoch, draft)
+    };
+
+    // Planned, and then the replica takes a schema that extends its own, in the same epoch: the
+    // insert, shorter than a row of it, is still valid.
+    let (epoch, draft) = plan();
+    let op = draft.seal(None, &room_id()).await.unwrap();
+    server.evolve(tagged_schema());
+    table.room().close().await.unwrap();
+    client.room(room_id(), "token".to_string()).await.unwrap();
+    let tagged = table
+        .room()
+        .client()
+        .core()
+        .read_schema(&room_id(), Schema::clone);
+    assert_eq!(tagged, Ok((epoch, tagged_schema())));
+    assert_eq!(table.checked(epoch, op.clone()), Ok(op));
+
+    // Discarded for a room created again, whose table of the same id does not take the insert:
+    // it is not checked against the schema of the new room.
+    let (epoch, draft) = plan();
+    let op = draft.seal(None, &room_id()).await.unwrap();
+    server.recreate(notes_schema());
+    table.room().close().await.unwrap();
+    client.room(room_id(), "token".to_string()).await.unwrap();
+    let closed = Err(ClientError::RoomClosed(room_id()));
+    assert_eq!(table.checked(epoch, op), closed);
 }

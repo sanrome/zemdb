@@ -7,6 +7,7 @@
 //! [`ClientError`](crate::ClientError)); its handles are not, and are cheap to clone.
 
 mod client;
+mod crypto;
 mod room;
 mod row;
 mod scan;

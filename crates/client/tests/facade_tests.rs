@@ -172,6 +172,13 @@ fn is_crypto<T: std::fmt::Debug>(result: Result<T, ClientError>) -> String {
     }
 }
 
+fn is_decryption<T: std::fmt::Debug>(result: Result<T, ClientError>) -> String {
+    match result {
+        Err(ClientError::Decryption(message)) => message,
+        other => panic!("Not Decryption: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn the_rows_of_a_room_up_to_date_are_read_by_the_names_of_their_columns() {
     let (server, room_id, dir) = ranked().await;
@@ -464,7 +471,7 @@ async fn a_room_without_metadata_has_no_handle_without_the_server() {
 }
 
 #[tokio::test]
-async fn what_is_not_of_the_schema_is_invalid_and_an_encrypted_column_is_not_read() {
+async fn what_is_not_of_the_schema_is_invalid_and_an_encrypted_column_needs_a_crypto_engine() {
     let (server, room_id, dir) = ranked().await;
     let transport = server.transport();
     let client = facade(dir.path(), engine(dir.path()), &transport, None).await;
@@ -502,12 +509,14 @@ async fn what_is_not_of_the_schema_is_invalid_and_an_encrypted_column_is_not_rea
     let twice = Scan::new().columns(["member_id", "nickname", "member_id"]);
     is_invalid(members_table.scan(&twice).await);
 
-    // A read that gives the encrypted `notes` is `Crypto`, also with a `CryptoEngine`; one that
+    // Without a `CryptoEngine`, a read that gives the encrypted `notes` is `Crypto`; one that
     // does not give it reads.
     let rounds = room.table("rounds").unwrap();
     let round = Key::new().with("round_id", 1);
     let message = is_crypto(rounds.get(&round).await);
-    assert!(message.contains("'notes'"), "{message}");
+    let no_engine =
+        "The column 'notes' of 'rounds' is encrypted, and the client has no CryptoEngine";
+    assert_eq!(message, no_engine);
     is_crypto(rounds.scan(&Scan::new()).await);
     is_crypto(rounds.scan(&Scan::new().columns(["title", "notes"])).await);
     let clear = Scan::new().columns(["round_id", "title"]);
@@ -529,8 +538,10 @@ async fn what_is_not_of_the_schema_is_invalid_and_an_encrypted_column_is_not_rea
         .unwrap()
         .table("rounds")
         .unwrap();
-    is_crypto(rounds.get(&round).await);
-    is_crypto(rounds.scan(&Scan::new().columns(["notes"])).await);
+    // With one, the ciphertext of the round 1, which `NoOpCryptoEngine` gives back as it is, is
+    // not a value: the read is `Decryption`, never the bytes as if they were the value.
+    is_decryption(rounds.get(&round).await);
+    is_decryption(rounds.scan(&Scan::new().columns(["notes"])).await);
     // Nothing was sent but the registration of the second client.
     let sent_now = transport.sent();
     assert_eq!(sent_now.len(), sent + 1);
@@ -597,6 +608,7 @@ fn the_data_of_the_facade_go_through_serde_and_back() {
         ClientError::Validation("validation".into()),
         ClientError::InvalidOperation("invalid".into()),
         ClientError::Crypto("crypto".into()),
+        ClientError::Decryption("decryption".into()),
         ClientError::PrecheckFailed(Rejection::Constraint(Violation::Unique {
             constraint: constraint(),
         })),

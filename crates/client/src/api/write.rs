@@ -8,30 +8,28 @@ use zemdb_core::{
 
 use zemdb_storage::{RejectReason, StorageError};
 
-use super::table::{check_value, encrypted, invalid, primary_key, table};
+use super::crypto::Draft;
+use super::table::{check_value, invalid, primary_key, table};
 use super::{Key, Row};
 use crate::ClientError;
 
-/// What the writes of a client are planned with against the schema of the replica: the client,
-/// whose owner fills the owner column of each write (DC33), whether the application has a
-/// `CryptoEngine`, and the timestamp of the write.
-pub(super) struct Writer<'a> {
-    client: &'a ClientId,
+/// What the writes of a client are planned with against the schema of the replica (steps 2 and 3
+/// of DC32): the owner of the client, which fills the owner column of each write (DC33), and the
+/// timestamp of the write. A write is planned as a [`Draft`], with the values of its encrypted
+/// columns in the clear.
+pub(super) struct Writer {
     /// The owner of the client, as the owner column holds it.
     owner: Value,
-    crypto: bool,
     /// The wall clock, in milliseconds: informative, since the order is that of the sequences.
     timestamp: u64,
 }
 
-impl<'a> Writer<'a> {
-    pub(super) fn new(client: &'a ClientId, crypto: bool) -> Self {
+impl Writer {
+    pub(super) fn new(client: &ClientId) -> Self {
         let since = SystemTime::now().duration_since(UNIX_EPOCH);
         let millis = since.map_or(0, |since| since.as_millis());
         Self {
-            client,
             owner: Value::from(client.owner()),
-            crypto,
             timestamp: u64::try_from(millis).unwrap_or(u64::MAX),
         }
     }
@@ -44,7 +42,7 @@ impl<'a> Writer<'a> {
         schema: &Schema,
         name: &str,
         row: &Row,
-    ) -> Result<(Operation, Key), ClientError> {
+    ) -> Result<(Draft, Key), ClientError> {
         let table = table(schema, name)?;
         if let Some((name, _)) = row
             .iter()
@@ -77,11 +75,6 @@ impl<'a> Writer<'a> {
             };
             values.push(value);
         }
-        // Until the client encrypts, every insert into a table with an encrypted column touches
-        // it: NULL is encrypted too.
-        if let Some(column) = table.columns().iter().find(|column| column.is_encrypted()) {
-            return Err(encrypted(table, column, self.crypto));
-        }
         let pk: Vec<_> = (table.primary_key().iter())
             .filter_map(|name| values.get(table.column_index(name)?).cloned())
             .collect();
@@ -95,7 +88,7 @@ impl<'a> Writer<'a> {
             CompactRow::new(values),
             self.timestamp,
         );
-        Ok((self.checked(schema, op)?, key))
+        Ok((Draft::new(op, table), key))
     }
 
     /// The update of the row of `key` in the table `name` of `schema` with `changes`: at least a
@@ -106,7 +99,7 @@ impl<'a> Writer<'a> {
         name: &str,
         key: &Key,
         changes: &Row,
-    ) -> Result<Operation, ClientError> {
+    ) -> Result<Draft, ClientError> {
         let table = table(schema, name)?;
         let pk = self.key(table, key)?;
         if changes.is_empty() {
@@ -117,7 +110,6 @@ impl<'a> Writer<'a> {
         }
         let owner = owner_column(table);
         let mut updates = Vec::with_capacity(changes.len() + 1);
-        let mut encrypted_column = None;
         for (name, value) in changes {
             let (index, column) = column(table, name)?;
             if owner.is_some_and(|owner| owner.name() == name) {
@@ -130,21 +122,14 @@ impl<'a> Writer<'a> {
                 )));
             }
             check_value(table, column, value)?;
-            if column.is_encrypted() {
-                encrypted_column.get_or_insert(column);
-            }
             updates.push(ColumnUpdate::new(index, value.clone()));
-        }
-        // Until the client encrypts, an update of an encrypted column touches it, also with NULL.
-        if let Some(column) = encrypted_column {
-            return Err(encrypted(table, column, self.crypto));
         }
         // An owner column outside the key goes as one more delta, which the operation needs.
         if let Some(index) = owner_outside_key(table) {
             updates.push(ColumnUpdate::new(index, self.owner.clone()));
         }
         let op = Operation::update(table.table_id(), pk, updates, self.timestamp);
-        self.checked(schema, op)
+        Ok(Draft::new(op, table))
     }
 
     /// The delete of the row of `key` in the table `name` of `schema`.
@@ -153,7 +138,7 @@ impl<'a> Writer<'a> {
         schema: &Schema,
         name: &str,
         key: &Key,
-    ) -> Result<Operation, ClientError> {
+    ) -> Result<Draft, ClientError> {
         let table = table(schema, name)?;
         let pk = self.key(table, key)?;
         let (table_id, timestamp) = (table.table_id(), self.timestamp);
@@ -162,7 +147,7 @@ impl<'a> Writer<'a> {
             Some(_) => Operation::delete_with_owner(table_id, pk, self.owner.clone(), timestamp),
             None => Operation::delete(table_id, pk, timestamp),
         };
-        self.checked(schema, op)
+        Ok(Draft::new(op, table))
     }
 
     /// The primary key of `table` that the key of a write names, as a read names it, but for the
@@ -172,15 +157,20 @@ impl<'a> Writer<'a> {
         let owner = owner_column(table).map(|owner| (owner.name(), &self.owner));
         primary_key(table, key, owner)
     }
+}
 
-    /// `op` if the server takes it from the client: valid for `schema`, with the owner of the
-    /// client if its table has one (INV-A5).
-    fn checked(&self, schema: &Schema, op: Operation) -> Result<Operation, ClientError> {
-        (schema.validate_operation(&op))
-            .and_then(|()| schema.check_owner(&op, self.client))
-            .map_err(|err| invalid(err.to_string()))?;
-        Ok(op)
-    }
+/// `op`, the operation that `client` sends, if the server takes it from the client (step 6 of
+/// DC32): valid for `schema`, with a ciphertext in each encrypted column it carries, and with the
+/// owner of the client if its table has one (INV-A5).
+pub(super) fn checked(
+    schema: &Schema,
+    op: Operation,
+    client: &ClientId,
+) -> Result<Operation, ClientError> {
+    (schema.validate_operation(&op))
+        .and_then(|()| schema.check_owner(&op, client))
+        .map_err(|err| invalid(err.to_string()))?;
+    Ok(op)
 }
 
 /// `op`, a write of `client` in `room_id`, if it fits: alone in a record of the log and in a

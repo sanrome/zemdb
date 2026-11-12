@@ -1,6 +1,7 @@
 //! Fixtures shared by the integration tests: the server in process, with a transport to it that
 //! logs what is sent and answers on demand, a file layer that logs what is done to the files and
-//! fails on demand, a storage engine that fails on demand, and a client over a disk engine.
+//! fails on demand, a storage engine that fails on demand, a `CryptoEngine` that authenticates its
+//! additional data, and a client over a disk engine.
 
 // Every file in `tests/` is a crate of its own that uses only part of this module.
 #![allow(dead_code)]
@@ -14,9 +15,10 @@ use bytes::Bytes;
 use futures::StreamExt;
 use std::collections::VecDeque;
 use std::fmt;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::{tempdir, TempDir};
@@ -1142,9 +1144,9 @@ impl<E> TestEngine<E> {
     }
 
     /// Holds the next call of `method` (`open_room`, `reload_schema`, `get_by_id`,
-    /// `check_operation`, `close_room` or `delete_room`) before it reaches the engine:
-    /// [`Held::replied`] waits until the call is held, and the call goes on once the [`Held`] is
-    /// released or dropped.
+    /// `check_operation`, `close_room` or `delete_room`) before it reaches the engine, or the next
+    /// `get_by_id` once the engine read its row (`get_by_id:read`): [`Held::replied`] waits until
+    /// the call is held, and the call goes on once the [`Held`] is released or dropped.
     pub fn hold_next(&self, method: &'static str) -> Held {
         let (replied_tx, replied) = oneshot::channel();
         let (release, release_rx) = oneshot::channel();
@@ -1265,7 +1267,9 @@ impl<E: StorageEngine> StorageEngine for TestEngine<E> {
     ) -> Result<Option<CompactRow>, StorageError> {
         self.hold("get_by_id").await;
         self.check("get_by_id")?;
-        self.inner.get_by_id(room_id, table_id, pk).await
+        let row = self.inner.get_by_id(room_id, table_id, pk).await;
+        self.hold("get_by_id:read").await;
+        row
     }
 
     async fn scan<'a>(
@@ -1312,5 +1316,125 @@ impl<E: StorageEngine> StorageEngine for TestEngine<E> {
             .inner
             .apply_snapshot(room_id, schema, snapshot, expected_head_seq);
         applied.await
+    }
+}
+
+/// The length of the tag of a ciphertext of a [`TestCrypto`].
+const TAG_LEN: usize = 16;
+
+/// An encryption that a [`TestCrypto`] holds: the sender that tells it was reached, and the
+/// receiver of its release.
+type CryptoHold = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+/// A `CryptoEngine` of the tests that authenticates the additional data as an AEAD does: a
+/// ciphertext is a tag of the additional data and the masked plaintext, and then the plaintext
+/// masked with a keystream, so that it never holds the plaintext; decrypting fails unless the tag
+/// is that of the additional data it is given. Its key is the same for every room, so that only
+/// the additional data tell the rooms apart. On demand, it fails to encrypt, with the plaintext in
+/// its message, or holds an encryption.
+#[derive(Clone, Default)]
+pub struct TestCrypto {
+    fail_encrypt: Arc<AtomicBool>,
+    holds: Arc<Mutex<Vec<CryptoHold>>>,
+    encryptions: Arc<AtomicUsize>,
+    decryptions: Arc<AtomicUsize>,
+}
+
+impl TestCrypto {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Makes the encryptions fail, or not.
+    pub fn fail_encrypt(&self, fail: bool) {
+        self.fail_encrypt.store(fail, Ordering::SeqCst);
+    }
+
+    /// Holds the next encryption: [`Held::replied`] waits until it is held, and it goes on once
+    /// the [`Held`] is released or dropped.
+    pub fn hold_next_encrypt(&self) -> Held {
+        let (replied_tx, replied) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        self.holds.lock().unwrap().push((replied_tx, release_rx));
+        Held { replied, release }
+    }
+
+    /// How many values it encrypted.
+    pub fn encryptions(&self) -> usize {
+        self.encryptions.load(Ordering::SeqCst)
+    }
+
+    /// How many ciphertexts it was asked to decrypt.
+    pub fn decryptions(&self) -> usize {
+        self.decryptions.load(Ordering::SeqCst)
+    }
+
+    /// The ciphertext of `plaintext` with `aad`, as a member with the key makes it.
+    pub fn seal(aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
+        let masked = Self::masked(plaintext);
+        let mut ciphertext = Self::tag(aad, &masked).to_vec();
+        ciphertext.extend(masked);
+        ciphertext
+    }
+
+    /// `bytes` masked with the keystream, which unmasks them too.
+    fn masked(bytes: &[u8]) -> Vec<u8> {
+        let block = |index: usize| {
+            let mut hasher = DefaultHasher::new();
+            ("keystream", index / 8).hash(&mut hasher);
+            hasher.finish().to_le_bytes()[index % 8]
+        };
+        (bytes.iter().enumerate())
+            .map(|(index, byte)| byte ^ block(index))
+            .collect()
+    }
+
+    fn tag(aad: &[u8], masked: &[u8]) -> [u8; TAG_LEN] {
+        let mut tag = [0; TAG_LEN];
+        for (half, part) in tag.chunks_mut(8).enumerate() {
+            let mut hasher = DefaultHasher::new();
+            ("tag", half, aad, masked).hash(&mut hasher);
+            part.copy_from_slice(&hasher.finish().to_le_bytes());
+        }
+        tag
+    }
+}
+
+#[async_trait]
+impl CryptoEngine for TestCrypto {
+    async fn encrypt(
+        &self,
+        _room_id: &RoomId,
+        aad: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        let held = self.holds.lock().unwrap().pop();
+        if let Some((reached, release)) = held {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+        if self.fail_encrypt.load(Ordering::SeqCst) {
+            let shown = String::from_utf8_lossy(plaintext).into_owned();
+            return Err(CryptoError::Encryption(format!("No key for {shown}")));
+        }
+        self.encryptions.fetch_add(1, Ordering::SeqCst);
+        Ok(Self::seal(aad, plaintext))
+    }
+
+    async fn decrypt(
+        &self,
+        _room_id: &RoomId,
+        aad: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        self.decryptions.fetch_add(1, Ordering::SeqCst);
+        let tagged = (ciphertext.split_at_checked(TAG_LEN))
+            .filter(|(tag, masked)| *tag == Self::tag(aad, masked));
+        match tagged {
+            Some((_, masked)) => Ok(Self::masked(masked)),
+            None => Err(CryptoError::Decryption(
+                "The tag does not match".to_string(),
+            )),
+        }
     }
 }

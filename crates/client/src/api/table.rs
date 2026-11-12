@@ -2,11 +2,13 @@ use futures::StreamExt;
 use std::fmt;
 use std::ops::Bound;
 use zemdb_core::{
-    ColumnDef, CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, TableSchema, Value,
+    ColumnDef, CompactRow, CryptoEngine, DataType, Operation, PrimaryKey, RoomId, Schema,
+    TableSchema, Value,
 };
 use zemdb_storage::{KeyRange, ScanDirection, ScanOptions, StorageEngine, StorageError};
 
-use super::write::{bounded, fitting, prechecked, Writer};
+use super::crypto::{decrypt, no_engine, Cell, Draft};
+use super::write::{bounded, checked, fitting, prechecked, Writer};
 use super::{Direction, Key, RoomHandle, Row, Scan};
 use crate::ClientError;
 
@@ -40,7 +42,14 @@ impl TableHandle {
     /// open (closed, or empty after a discard until the room registers) is `RoomClosed`, and so
     /// is a read whose storage room is closed when it reaches it (a close, or the reopening after
     /// an error), or whose replica was discarded meanwhile. A table, a key or a value that are not
-    /// of the schema are `InvalidOperation`, and a table with an encrypted column, `Crypto`.
+    /// of the schema are `InvalidOperation`.
+    ///
+    /// The value of an encrypted column is decrypted with the `CryptoEngine` of the application,
+    /// with the additional data of its cell, and has the type of its column; a `NULL` that the
+    /// replica holds (a row written before the column was added) is `NULL`. A table with an
+    /// encrypted column is `Crypto` without a `CryptoEngine`, and a value that does not decrypt
+    /// with the additional data of its cell, or whose plaintext is not one value of the type of its
+    /// column, is `Decryption`: the read gives no row.
     pub async fn get(&self, key: &Key) -> Result<Option<Row>, ClientError> {
         let read = self.plan(|schema, crypto| Read::get(schema, &self.name, key, crypto))?;
         Ok(self.read(read).await?.pop())
@@ -48,7 +57,8 @@ impl TableHandle {
 
     /// The rows of the replica that `scan` asks for, in its order, as [`get`](Self::get) reads
     /// them: with every column of the schema of the replica, or with those `scan` names (the
-    /// table has each, once). A scan that gives an encrypted column is `Crypto`.
+    /// table has each, once). A value of an encrypted column that does not decrypt fails the whole
+    /// scan (`Decryption`); a scan that does not name that column reads the others.
     pub async fn scan(&self, scan: &Scan) -> Result<Vec<Row>, ClientError> {
         let read = self.plan(|schema, crypto| Read::scan(schema, &self.name, scan, crypto))?;
         self.read(read).await
@@ -58,13 +68,17 @@ impl TableHandle {
     /// replaced whole, except in an immutable table, where the replica rejects it (`Duplicate`).
     /// Returns the key of the row, with the owner column, as reads take it.
     ///
-    /// `row` has a value of its type for each column of the table, or lacks only columns that
-    /// take `NULL`, which they get, and does not have the owner column, which the client fills
-    /// with its owner ([`ClientId::owner`](zemdb_core::ClientId::owner)). Otherwise, the insert
-    /// is `InvalidOperation`, and it is `Crypto` in a table with an encrypted column; either way,
-    /// it sends nothing. With the precheck (`ClientConfig::precheck`, on by default), an insert
-    /// that the replica would reject in its state is `PrecheckFailed`, with the reason, and is not
-    /// sent either: an advice, since the replica may be behind the log. Then the client writes it
+    /// `row` has a value of its type for each column of the table (the type of its values in the
+    /// clear, in an encrypted column), or lacks only columns that take `NULL`, which they get, and
+    /// does not have the owner column, which the client fills with its owner
+    /// ([`ClientId::owner`](zemdb_core::ClientId::owner)). Otherwise, the insert is
+    /// `InvalidOperation`, and it sends nothing. The value of each encrypted column of the table,
+    /// `NULL` too, is sent encrypted with the `CryptoEngine` of the application, with the
+    /// additional data of its cell: without a `CryptoEngine`, or if it fails to encrypt one, the
+    /// insert is `Crypto`, and sends nothing. With the precheck (`ClientConfig::precheck`, on by
+    /// default), an insert that the replica would reject in its state is `PrecheckFailed`, with
+    /// the reason, and is not sent either: an advice, since the replica may be behind the log.
+    /// Then the client writes it
     /// once ([`Client::write`](crate::Client::write)): it returns once the replica decided on its
     /// sequence (`ConstraintViolation` if it rejects it), and is never repeated, so
     /// `OutcomeUnknown` is an outcome that reaches the replica with the log.
@@ -74,9 +88,9 @@ impl TableHandle {
     /// precheck.
     pub async fn insert(&self, row: &Row) -> Result<Key, ClientError> {
         bounded(row.iter().map(|(_, value)| value))?;
-        let (epoch, (op, key)) =
+        let (epoch, (draft, key)) =
             self.plan_write(|writer, schema| writer.insert(schema, &self.name, row))?;
-        self.write(epoch, op).await?;
+        self.write(epoch, draft).await?;
         Ok(key)
     }
 
@@ -87,49 +101,65 @@ impl TableHandle {
     /// key, which the client fills, and if it has it, it has the owner of the client: the client
     /// only writes its own rows, and the replica rejects an update of the row of another
     /// (`NotOwner`), or of one that is not there (`RowMissing`), and so does the precheck, if the
-    /// replica has the row of another or lacks it (`PrecheckFailed`). An update of an encrypted
-    /// column is `Crypto`.
+    /// replica has the row of another or lacks it (`PrecheckFailed`). A change of an encrypted
+    /// column, `NULL` too, is encrypted as an insert encrypts it.
     pub async fn update(&self, key: &Key, changes: &Row) -> Result<(), ClientError> {
         bounded(changes.iter().map(|(_, value)| value))?;
-        let (epoch, op) =
+        let (epoch, draft) =
             self.plan_write(|writer, schema| writer.update(schema, &self.name, key, changes))?;
-        self.write(epoch, op).await
+        self.write(epoch, draft).await
     }
 
     /// Deletes the row of `key`, named as [`update`](Self::update) names it, as
     /// [`insert`](Self::insert) writes, also with the precheck. The delete of a row that is not
     /// there changes nothing, and the precheck lets it out.
     pub async fn delete(&self, key: &Key) -> Result<(), ClientError> {
-        let (epoch, op) =
+        let (epoch, draft) =
             self.plan_write(|writer, schema| writer.delete(schema, &self.name, key))?;
-        self.write(epoch, op).await
+        self.write(epoch, draft).await
     }
 
     /// The write that `plan` makes against the schema of the replica, with the writer of the
     /// client, and the epoch of the replica.
     fn plan_write<T>(
         &self,
-        plan: impl FnOnce(&Writer<'_>, &Schema) -> Result<T, ClientError>,
+        plan: impl FnOnce(&Writer, &Schema) -> Result<T, ClientError>,
     ) -> Result<(u64, T), ClientError> {
-        let client = self.room.client();
-        let core = client.core();
-        let client_id = core.client_id();
-        let writer = Writer::new(&client_id, client.has_crypto());
+        let core = self.room.client().core();
+        let writer = Writer::new(&core.client_id());
         let room_id = self.room.room_id();
         let (epoch, write) = core.read_schema(room_id, |schema| plan(&writer, schema))?;
         Ok((epoch, write?))
     }
 
-    /// Writes `op`, planned in `epoch`, if it fits and, with the precheck, if the replica would
-    /// take it: once, to the replica of that epoch.
-    async fn write(&self, epoch: u64, op: Operation) -> Result<(), ClientError> {
+    /// Writes `draft`, planned in `epoch`, in the order of DC32 from its step 5: with its
+    /// encrypted columns encrypted, if the server takes it from the client, if it fits and, with
+    /// the precheck, if the replica would take it; once, to the replica of that epoch.
+    async fn write(&self, epoch: u64, draft: Draft) -> Result<(), ClientError> {
         let (client, room_id) = (self.room.client(), self.room.room_id());
         let core = client.core();
+        let op = draft.seal(client.crypto(), room_id).await?;
+        let op = self.checked(epoch, op)?;
         let op = fitting(op, &core.client_id(), room_id)?;
         if client.prechecks() {
             self.precheck(epoch, &op).await?;
         }
         core.write_in(room_id.clone(), op, Some(epoch)).await
+    }
+
+    /// `op`, as it is sent, if the server takes it from the client ([`checked`]), against the
+    /// schema of the replica of `epoch`, in which it was planned: `RoomClosed` if the replica is
+    /// no longer of that epoch (a discard while it was encrypted), whose schema may be another. In
+    /// that epoch the schema may have grown since the plan, and the operation is valid all the
+    /// same: the schema only grows.
+    fn checked(&self, epoch: u64, op: Operation) -> Result<Operation, ClientError> {
+        let (core, room_id) = (self.room.client().core(), self.room.room_id());
+        let client_id = core.client_id();
+        let (now, op) = core.read_schema(room_id, |schema| checked(schema, op, &client_id))?;
+        if now != epoch {
+            return Err(ClientError::RoomClosed(room_id.clone()));
+        }
+        op
     }
 
     /// The precheck of `op`, planned in `epoch` (DC33): what the replica would decide on it in
@@ -168,16 +198,21 @@ impl TableHandle {
     /// `RoomClosed` if the storage room is closed when the read reaches it (a close, or the
     /// reopening after an error), or if, once it read, the replica is no longer of that epoch (a
     /// discard, after which the storage room may hold another incarnation, with another schema).
+    /// Then its encrypted columns are decrypted, with the `CryptoEngine` of the application.
     async fn read(&self, (epoch, read): (u64, Read)) -> Result<Vec<Row>, ClientError> {
-        let (core, room_id) = (self.room.client().core(), self.room.room_id());
-        let rows = read.fetch(core.storage(), room_id).await;
+        let client = self.room.client();
+        let (core, room_id) = (client.core(), self.room.room_id());
+        let fetched = read.fetch(core.storage(), room_id).await;
         if !core.is_of_epoch(room_id, epoch) {
             return Err(ClientError::RoomClosed(room_id.clone()));
         }
-        match rows {
-            Err(StorageError::RoomNotFound(_)) => Err(ClientError::RoomClosed(room_id.clone())),
-            rows => Ok(rows?),
-        }
+        let fetched = match fetched {
+            Err(StorageError::RoomNotFound(_)) => {
+                return Err(ClientError::RoomClosed(room_id.clone()))
+            }
+            fetched => fetched?,
+        };
+        read.rows(fetched, client.crypto(), room_id).await
     }
 }
 
@@ -194,11 +229,16 @@ impl fmt::Debug for TableHandle {
 /// names of the values of the rows it reads.
 #[derive(Debug)]
 struct Read {
+    /// The name of the table.
+    table: String,
     table_id: u16,
     /// The columns of the values of a row of the storage, in their order. A row with fewer
     /// values (a short row) has the others in `NULL`, and the values of one with more (written
     /// with a later version of the schema, which adds columns at the end) are left out.
     columns: Vec<String>,
+    /// The encrypted columns among `columns`: their place among the values of a row of the
+    /// read, their position in the table and their definition.
+    sealed: Vec<(usize, u16, ColumnDef)>,
     target: Target,
 }
 
@@ -213,11 +253,13 @@ impl Read {
     fn get(schema: &Schema, name: &str, key: &Key, crypto: bool) -> Result<Self, ClientError> {
         let table = table(schema, name)?;
         let pk = primary_key(table, key, None)?;
-        readable(table, None, crypto)?;
+        let sealed = sealed(table, None, crypto)?;
         let columns = table.columns().iter();
         Ok(Self {
+            table: table.name().to_string(),
             table_id: table.table_id(),
             columns: columns.map(|column| column.name().to_string()).collect(),
+            sealed,
             target: Target::Key(pk),
         })
     }
@@ -239,7 +281,7 @@ impl Read {
             start: bound(table, &scan.start)?,
             end: bound(table, &scan.end)?,
         };
-        readable(table, projection.as_deref(), crypto)?;
+        let sealed = sealed(table, projection.as_deref(), crypto)?;
         let direction = match scan.direction {
             Direction::Forward => ScanDirection::Forward,
             Direction::Backward => ScanDirection::Backward,
@@ -251,34 +293,63 @@ impl Read {
             projection,
         };
         Ok(Self {
+            table: table.name().to_string(),
             table_id: table.table_id(),
             columns,
+            sealed,
             target: Target::Scan(options),
         })
     }
 
-    /// The rows of the read in the storage room `room_id` of `storage`, by the names of their
-    /// columns.
+    /// The rows of the read in the storage room `room_id` of `storage`, with their primary keys,
+    /// as the storage holds them.
     async fn fetch(
-        self,
+        &self,
         storage: &dyn StorageEngine,
         room_id: &RoomId,
-    ) -> Result<Vec<Row>, StorageError> {
-        let options = match self.target {
+    ) -> Result<Vec<(PrimaryKey, CompactRow)>, StorageError> {
+        let options = match &self.target {
             Target::Key(pk) => {
-                let row = storage.get_by_id(room_id, self.table_id, &pk).await?;
-                return Ok(row
-                    .map(|row| named(&self.columns, row))
-                    .into_iter()
-                    .collect());
+                let row = storage.get_by_id(room_id, self.table_id, pk).await?;
+                return Ok(row.map(|row| (pk.clone(), row)).into_iter().collect());
             }
-            Target::Scan(options) => options,
+            Target::Scan(options) => options.clone(),
         };
         let mut stream = storage.scan_by_id(room_id, self.table_id, options).await?;
         let mut rows = Vec::new();
         while let Some(item) = stream.next().await {
-            let (_, row) = item?;
-            rows.push(named(&self.columns, row));
+            rows.push(item?);
+        }
+        Ok(rows)
+    }
+
+    /// The rows that the read fetched from the storage room `room_id`, by the names of their
+    /// columns, with the value of each encrypted column decrypted with `crypto` for its cell.
+    async fn rows(
+        &self,
+        fetched: Vec<(PrimaryKey, CompactRow)>,
+        crypto: Option<&dyn CryptoEngine>,
+        room_id: &RoomId,
+    ) -> Result<Vec<Row>, ClientError> {
+        let mut rows = Vec::with_capacity(fetched.len());
+        for (pk, row) in fetched {
+            let mut values = row.into_values();
+            for (place, index, column) in &self.sealed {
+                // A short row lacks the column, which reads `NULL`.
+                let Some(value) = values.get_mut(*place) else {
+                    continue;
+                };
+                let crypto = crypto.ok_or_else(|| no_engine(&self.table, column.name()))?;
+                let cell = Cell {
+                    room_id,
+                    table_id: self.table_id,
+                    pk: &pk,
+                    column_idx: *index,
+                };
+                let stored = std::mem::replace(value, Value::Null);
+                *value = decrypt(crypto, cell, stored, &self.table, column).await?;
+            }
+            rows.push(named(&self.columns, CompactRow::new(values)));
         }
         Ok(rows)
     }
@@ -294,37 +365,38 @@ pub(super) fn table<'a>(schema: &'a Schema, name: &str) -> Result<&'a TableSchem
     table.ok_or_else(|| invalid(format!("The room has no table '{name}'")))
 }
 
-/// Checks that a read of `table` that gives the columns at `projection`, or every column, gives
-/// no encrypted column.
-fn readable(
+/// The encrypted columns that a read of `table` gives, of those at `projection` or of every
+/// column, with their place among the values of a row it reads, their position in the table and
+/// their definition; `Crypto` if it gives one and the application has no `CryptoEngine`.
+fn sealed(
     table: &TableSchema,
     projection: Option<&[u16]>,
     crypto: bool,
-) -> Result<(), ClientError> {
+) -> Result<Vec<(usize, u16, ColumnDef)>, ClientError> {
     let columns = table.columns();
-    let given = match projection {
-        None => columns.iter().find(|column| column.is_encrypted()),
-        Some(indices) => (indices.iter())
-            .filter_map(|index| columns.get(usize::from(*index)))
-            .find(|column| column.is_encrypted()),
+    // A table has at most `u16::MAX` columns.
+    let every: Vec<u16>;
+    let indices = match projection {
+        Some(indices) => indices,
+        None => {
+            every = (0..columns.len())
+                .filter_map(|index| u16::try_from(index).ok())
+                .collect();
+            &every
+        }
     };
-    match given {
-        Some(column) => Err(encrypted(table, column, crypto)),
-        None => Ok(()),
+    let sealed: Vec<_> = (indices.iter().enumerate())
+        .filter_map(|(place, index)| {
+            let column = columns.get(usize::from(*index))?;
+            column
+                .is_encrypted()
+                .then(|| (place, *index, column.clone()))
+        })
+        .collect();
+    match sealed.first() {
+        Some((_, _, column)) if !crypto => Err(no_engine(table.name(), column.name())),
+        _ => Ok(sealed),
     }
-}
-
-/// The error of a read or a write that touches the encrypted `column` of `table`, which the
-/// facade does not encrypt or decrypt.
-pub(super) fn encrypted(table: &TableSchema, column: &ColumnDef, crypto: bool) -> ClientError {
-    let why = match crypto {
-        true => "the client does not encrypt or decrypt columns yet",
-        false => "the client has no CryptoEngine",
-    };
-    let (table, column) = (table.name(), column.name());
-    ClientError::Crypto(format!(
-        "The column '{column}' of '{table}' is encrypted, and {why}"
-    ))
 }
 
 /// Checks that `value` can be in `column` of `table`: of the type of the column (the type of its

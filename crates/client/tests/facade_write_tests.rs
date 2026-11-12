@@ -14,9 +14,9 @@ use zemdb_client::{
     ZemdbClient,
 };
 use zemdb_core::{
-    encode_message, ClientMessage, ClientMessageKind, CryptoEngine, DataType, ErrorCode,
-    NoOpCryptoEngine, Operation, OperationKind, OwnerIdentity, RoomId, RowBuilder, Schema,
-    SchemaId, SequenceNumber, ServerMessage, TableSchema, Value,
+    encode_message, ClientMessage, ClientMessageKind, CryptoEngine, DataType, ErrorCode, Operation,
+    OperationKind, OwnerIdentity, RoomId, RowBuilder, Schema, SchemaId, SequenceNumber,
+    ServerMessage, TableSchema, Value,
 };
 use zemdb_storage::{StorageEngine, StorageError};
 
@@ -393,61 +393,52 @@ async fn what_is_not_of_the_schema_or_gives_the_owner_is_invalid_and_sends_nothi
 }
 
 #[tokio::test]
-async fn until_the_client_encrypts_a_write_that_touches_an_encrypted_column_is_crypto() {
+async fn without_a_crypto_engine_a_write_that_touches_an_encrypted_column_is_crypto() {
     let (server, room_id) = league().await;
-    for crypto in [
-        None,
-        Some(Arc::new(NoOpCryptoEngine) as Arc<dyn CryptoEngine>),
-    ] {
-        let has_crypto = crypto.is_some();
-        let dir = tempdir().unwrap();
-        let transport = server.transport();
-        let client = facade(dir.path(), engine(dir.path()), &transport, "ana", crypto).await;
-        let room = open(&client, &room_id).await.unwrap();
-        let sent = transport.sent().len();
-        let rounds = room.table("rounds").unwrap();
-        let round = |notes: Option<Value>| {
-            let round = Row::new().with("round_id", 2).with("title", "Final");
-            match notes {
-                Some(notes) => round.with("notes", notes),
-                None => round,
-            }
-        };
+    let dir = tempdir().unwrap();
+    let transport = server.transport();
+    let client = facade(dir.path(), engine(dir.path()), &transport, "ana", None).await;
+    let room = open(&client, &room_id).await.unwrap();
+    let sent = transport.sent().len();
+    let rounds = room.table("rounds").unwrap();
+    let round = |notes: Option<Value>| {
+        let round = Row::new().with("round_id", 2).with("title", "Final");
+        match notes {
+            Some(notes) => round.with("notes", notes),
+            None => round,
+        }
+    };
 
-        // With its type, with NULL, or omitted, which is NULL: every insert into the table
-        // touches it.
-        let message = is_crypto(rounds.insert(&round(Some("secret".into()))).await);
-        assert!(message.contains("'notes'"), "{message}");
-        assert!(!message.contains("secret"), "{message}");
-        let why = match has_crypto {
-            true => "does not encrypt or decrypt columns yet",
-            false => "has no CryptoEngine",
-        };
-        assert!(message.contains(why), "{message}");
-        is_crypto(rounds.insert(&round(Some(Value::Null))).await);
-        is_crypto(rounds.insert(&round(None)).await);
-        let notes = |notes: Value| Row::new().with("notes", notes);
-        let kickoff = Key::new().with("round_id", 1);
-        is_crypto(rounds.update(&kickoff, &notes("secret".into())).await);
-        is_crypto(rounds.update(&kickoff, &notes(Value::Null)).await);
-        // With a value of another type, a ciphertext among them, it is invalid by name first.
-        let bytes = || Value::from(vec![0xc1_u8, 0x9a]);
-        is_invalid(rounds.insert(&round(Some(bytes()))).await);
-        is_invalid(rounds.update(&kickoff, &notes(bytes())).await);
-        let untitled = Row::new().with("round_id", 2).with("notes", "secret");
-        is_invalid(rounds.insert(&untitled).await);
-        assert_eq!(transport.sent().len(), sent);
+    // With its type, with NULL, or omitted, which is NULL: every insert into the table touches
+    // it, since NULL is encrypted too.
+    let message = is_crypto(rounds.insert(&round(Some("secret".into()))).await);
+    assert!(message.contains("'notes'"), "{message}");
+    assert!(!message.contains("secret"), "{message}");
+    assert!(message.contains("has no CryptoEngine"), "{message}");
+    is_crypto(rounds.insert(&round(Some(Value::Null))).await);
+    is_crypto(rounds.insert(&round(None)).await);
+    let notes = |notes: Value| Row::new().with("notes", notes);
+    let kickoff = Key::new().with("round_id", 1);
+    is_crypto(rounds.update(&kickoff, &notes("secret".into())).await);
+    is_crypto(rounds.update(&kickoff, &notes(Value::Null)).await);
+    // With a value of another type, a ciphertext among them, it is invalid by name first.
+    let bytes = || Value::from(vec![0xc1_u8, 0x9a]);
+    is_invalid(rounds.insert(&round(Some(bytes()))).await);
+    is_invalid(rounds.update(&kickoff, &notes(bytes())).await);
+    let untitled = Row::new().with("round_id", 2).with("notes", "secret");
+    is_invalid(rounds.insert(&untitled).await);
+    assert_eq!(transport.sent().len(), sent);
 
-        // A write that does not touch it goes out.
-        let retitled = Row::new().with("title", "Opening");
-        rounds.update(&kickoff, &retitled).await.unwrap();
-        let clear = Scan::new().columns(["round_id", "title"]);
-        let opening = Row::new().with("round_id", 1).with("title", "Opening");
-        assert_eq!(rounds.scan(&clear).await, Ok(vec![opening]));
-        let ops = committed(&transport, sent);
-        assert_eq!(ops.len(), 1);
-        client.shutdown().await.unwrap();
-    }
+    // A write that does not touch it goes out.
+    let retitled = Row::new().with("title", "Opening");
+    rounds.update(&kickoff, &retitled).await.unwrap();
+    let clear = Scan::new().columns(["round_id", "title"]);
+    let opening = Row::new().with("round_id", 1).with("title", "Opening");
+    assert_eq!(rounds.scan(&clear).await, Ok(vec![opening]));
+    let ops = committed(&transport, sent);
+    assert_eq!(ops.len(), 1);
+    client.shutdown().await.unwrap();
+
     // And so does a delete.
     let dir = tempdir().unwrap();
     let transport = server.transport();

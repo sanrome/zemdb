@@ -136,30 +136,30 @@ fn owned_schema() -> Schema {
     Schema::builder().table(members).table(rankings).build()
 }
 
-#[test]
-fn an_operation_with_an_owner_other_than_the_client_is_not_sent() {
-    let (schema, ana) = (owned_schema(), client());
+#[tokio::test]
+async fn an_operation_with_an_owner_other_than_the_client_is_not_sent() {
+    let (schema, ana, room) = (owned_schema(), client(), room_id());
     let member = Row::new().with("ranking_id", 1).with("display_name", "Ana");
     let ranking = Key::new().with("ranking_id", 1);
-    let writer = Writer::new(&ana, false);
-    assert!(writer.insert(&schema, "members", &member).is_ok());
-    assert!(writer.delete(&schema, "rankings", &ranking).is_ok());
-
     // A writer that would fill another owner: the operation it builds is valid for the schema,
     // and its owner is checked against the client before it is sent.
-    let mut writer = Writer::new(&ana, false);
-    writer.owner = Value::from("bob");
-    let inserted = writer.insert(&schema, "members", &member).map(drop);
-    let deleted = writer.delete(&schema, "rankings", &ranking).map(drop);
-    for result in [inserted, deleted] {
-        let message = match result {
-            Err(ClientError::InvalidOperation(message)) => message,
-            other => panic!("{other:?}"),
-        };
-        assert!(
-            message.contains("other than the owner of the client"),
-            "{message}"
-        );
+    let mut other = Writer::new(&ana);
+    other.owner = Value::from("bob");
+    for (writer, valid) in [(Writer::new(&ana), true), (other, false)] {
+        let (inserted, _) = writer.insert(&schema, "members", &member).unwrap();
+        let deleted = writer.delete(&schema, "rankings", &ranking).unwrap();
+        for draft in [inserted, deleted] {
+            let op = draft.seal(None, &room).await.unwrap();
+            assert_eq!(schema.validate_operation(&op), Ok(()));
+            match checked(&schema, op, &ana) {
+                Ok(_) if valid => {}
+                Err(ClientError::InvalidOperation(message)) if !valid => {
+                    let other = "other than the owner of the client";
+                    assert!(message.contains(other), "{message}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 }
 
