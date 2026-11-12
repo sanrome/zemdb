@@ -93,14 +93,7 @@ impl Fixture {
 
     /// The client's cursor in the roster file, if the file holds the client.
     fn persisted_cursor(&self, client_id: &ClientId) -> Option<SequenceNumber> {
-        let roster: serde_json::Value =
-            serde_json::from_str(durable::verified_json(&fs::read(self.roster_path()).ok()?)?)
-                .unwrap();
-        let entries: Vec<ClientEntry> = serde_json::from_value(roster["clients"].clone()).unwrap();
-        entries
-            .into_iter()
-            .find(|e| &e.client_id == client_id)
-            .map(|e| e.last_ack_seq)
+        cursor_in_roster(&self.roster_path(), client_id)
     }
 
     async fn sender(&self) -> mpsc::Sender<RoomCommand> {
@@ -109,6 +102,17 @@ impl Fixture {
             .await
             .unwrap()
     }
+}
+
+/// The client's cursor in the roster file at `path`, if the file holds the client.
+fn cursor_in_roster(path: &Path, client_id: &ClientId) -> Option<SequenceNumber> {
+    let roster: serde_json::Value =
+        serde_json::from_str(durable::verified_json(&fs::read(path).ok()?)?).unwrap();
+    let entries: Vec<ClientEntry> = serde_json::from_value(roster["clients"].clone()).unwrap();
+    entries
+        .into_iter()
+        .find(|e| &e.client_id == client_id)
+        .map(|e| e.last_ack_seq)
 }
 
 fn new_manager_with(
@@ -1623,13 +1627,28 @@ fn stopped_actor(
     policy: RoomLifecyclePolicy,
     timings: ActorTimings,
 ) -> RoomActor {
-    let config = Arc::new(ServerConfig {
+    stopped_actor_with(dir, relay, policy, timings, 1, |_| {})
+}
+
+/// [`stopped_actor`], with the room's `incarnation` and the server configuration adjusted by
+/// `configure`.
+fn stopped_actor_with(
+    dir: &TempDir,
+    relay: &Arc<SnapshotRelay>,
+    policy: RoomLifecyclePolicy,
+    timings: ActorTimings,
+    incarnation: u128,
+    configure: impl FnOnce(&mut ServerConfig),
+) -> RoomActor {
+    let mut config = ServerConfig {
         data_dir: dir.path().to_path_buf(),
         ..ServerConfig::default()
-    });
+    };
+    configure(&mut config);
+    let config = Arc::new(config);
     let (_sender, actor) = RoomActor::open(
         RoomId::new("room").unwrap(),
-        1,
+        incarnation,
         SchemaId::new("todo").unwrap(),
         Arc::new(test_schema()),
         dir.path(),
@@ -1694,6 +1713,341 @@ fn state_of(actor: &RoomActor, client: &ClientId) -> ClientState {
 /// ahead of the system's monotonic clock: a deadline measured on the system clock would then
 /// expire at once or never.
 const CLOCK_AHEAD: Duration = Duration::from_secs(3600);
+
+/// Least time between two writes of the roster by the fast tick in the tests of that period.
+const ROSTER_PERSIST: Duration = Duration::from_secs(4);
+
+/// The room of the tests of the roster's period: [`stopped_actor`] with `policy`, whose fast
+/// tick writes the roster at most once every [`ROSTER_PERSIST`], and whose clients' leases
+/// outlast the tests. Its incarnation, 1, puts its first write 1 ms into the first period: in
+/// practice, on the first tick.
+fn roster_actor(
+    dir: &TempDir,
+    relay: &Arc<SnapshotRelay>,
+    policy: RoomLifecyclePolicy,
+) -> RoomActor {
+    roster_actor_of(dir, relay, policy, 1)
+}
+
+/// [`roster_actor`], with the room's `incarnation`.
+fn roster_actor_of(
+    dir: &TempDir,
+    relay: &Arc<SnapshotRelay>,
+    policy: RoomLifecyclePolicy,
+    incarnation: u128,
+) -> RoomActor {
+    let policy = RoomLifecyclePolicy {
+        lease_timeout: Duration::from_secs(3600),
+        ..policy
+    };
+    stopped_actor_with(dir, relay, policy, TEST_TIMINGS, incarnation, |config| {
+        config.roster_persist_secs = ROSTER_PERSIST.as_secs();
+    })
+}
+
+/// The client's cursor in the roster file of the room of [`stopped_actor`] on `dir`.
+fn cursor_on_disk(dir: &TempDir, client_id: &ClientId) -> Option<SequenceNumber> {
+    let room_id = RoomId::new("room").unwrap();
+    let path =
+        room_dir(dir.path(), &room_id).join(format!("meta_clients_{}.json", room_id.as_str()));
+    cursor_in_roster(&path, client_id)
+}
+
+/// Registers `client` in `actor` and commits two operations from it, with its cursor at 0.
+async fn register_and_commit_two(actor: &mut RoomActor, client: &ClientId) {
+    actor.register(client, None, None).unwrap();
+    let mut flow = ControlFlow::Continue(());
+    for n in 1..=2u8 {
+        actor
+            .commit(client, mutation(n), seq(0), insert_op(n.into()), &mut flow)
+            .await
+            .unwrap();
+    }
+}
+
+// Paused time: the test moves the Tokio clock and runs the fast tick itself.
+#[tokio::test(start_paused = true)]
+async fn the_fast_tick_writes_a_changed_roster_at_most_once_every_roster_persist_secs() {
+    tokio::time::advance(CLOCK_AHEAD).await;
+    let dir = tempdir().unwrap();
+    let mut actor = roster_actor(&dir, &relay_on(&dir), RoomLifecyclePolicy::default());
+    let client = ClientId::new("writer").unwrap();
+    register_and_commit_two(&mut actor, &client).await;
+    // The first tick that finds the roster changed writes it.
+    actor.run_fast_maintenance().await;
+    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(0)));
+
+    // A change waits for the tick of the grid's next point, a period after that write.
+    actor.ack(&client, seq(1)).await.unwrap();
+    for _ in 0..ROSTER_PERSIST.as_secs() - 1 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        actor.run_fast_maintenance().await;
+        assert_eq!(cursor_on_disk(&dir, &client), Some(seq(0)));
+    }
+    tokio::time::advance(Duration::from_secs(1)).await;
+    actor.run_fast_maintenance().await;
+    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(1)));
+
+    // And the next change, for the point after that.
+    actor.ack(&client, seq(2)).await.unwrap();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    actor.run_fast_maintenance().await;
+    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(1)));
+}
+
+// Paused time: the test moves the Tokio clock and runs the fast tick itself.
+#[tokio::test(start_paused = true)]
+async fn a_room_first_writes_its_roster_at_the_point_of_the_period_its_incarnation_gives() {
+    tokio::time::advance(CLOCK_AHEAD).await;
+    let dir = tempdir().unwrap();
+    // 2.5 s into the period of 4 s.
+    let incarnation = 4_000 * 1_000_000 + 2_500;
+    let mut actor = roster_actor_of(
+        &dir,
+        &relay_on(&dir),
+        RoomLifecyclePolicy::default(),
+        incarnation,
+    );
+    let client = ClientId::new("writer").unwrap();
+    register_and_commit_two(&mut actor, &client).await;
+
+    let tick = TEST_TIMINGS.fast_tick;
+    for _ in 0..4 {
+        actor.run_fast_maintenance().await;
+        assert_eq!(cursor_on_disk(&dir, &client), None);
+        tokio::time::advance(tick).await;
+    }
+    // 2 s in, a tick before the phase, it does not write yet; 2.5 s in, it does.
+    actor.run_fast_maintenance().await;
+    assert_eq!(cursor_on_disk(&dir, &client), None);
+    tokio::time::advance(tick).await;
+    actor.run_fast_maintenance().await;
+    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(0)));
+
+    // From then on, a period after each write.
+    actor.ack(&client, seq(1)).await.unwrap();
+    tokio::time::advance(ROSTER_PERSIST - tick).await;
+    actor.run_fast_maintenance().await;
+    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(0)));
+    tokio::time::advance(tick).await;
+    actor.run_fast_maintenance().await;
+    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(1)));
+}
+
+// Paused time: the test moves the Tokio clock and runs the fast tick itself.
+#[tokio::test(start_paused = true)]
+async fn the_tick_of_the_period_writes_the_roster_even_if_it_runs_a_little_early() {
+    tokio::time::advance(CLOCK_AHEAD).await;
+    let dir = tempdir().unwrap();
+    let mut actor = roster_actor(&dir, &relay_on(&dir), RoomLifecyclePolicy::default());
+    let client = ClientId::new("writer").unwrap();
+    register_and_commit_two(&mut actor, &client).await;
+    actor.run_fast_maintenance().await;
+    actor.ack(&client, seq(1)).await.unwrap();
+
+    // The tick before the period's does not write it, nor one 0.6 of a tick early.
+    let tick = TEST_TIMINGS.fast_tick;
+    tokio::time::advance(ROSTER_PERSIST - tick).await;
+    actor.run_fast_maintenance().await;
+    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(0)));
+    tokio::time::advance(tick * 2 / 5).await;
+    actor.run_fast_maintenance().await;
+    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(0)));
+    // The period's tick does, though it comes 0.4 of a tick early: half a tick of slack.
+    tokio::time::advance(tick / 5).await;
+    actor.run_fast_maintenance().await;
+    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(1)));
+}
+
+// Paused time: the test moves the Tokio clock and runs the fast tick itself.
+#[tokio::test(start_paused = true)]
+async fn a_write_off_the_grid_does_not_move_the_grid_of_a_room() {
+    tokio::time::advance(CLOCK_AHEAD).await;
+    let dir = tempdir().unwrap();
+    // The grid: 2.5 s, 6.5 s, 10.5 s, 14.5 s... after the room opens.
+    let incarnation = 4_000 * 1_000_000 + 2_500;
+    let mut actor = roster_actor_of(
+        &dir,
+        &relay_on(&dir),
+        RoomLifecyclePolicy::default(),
+        incarnation,
+    );
+    let client = ClientId::new("writer").unwrap();
+    register_and_commit_two(&mut actor, &client).await;
+    let tick = TEST_TIMINGS.fast_tick;
+    tokio::time::advance(tick * 5).await;
+    actor.run_fast_maintenance().await;
+    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(0)));
+
+    // Unchanged until 12 s: the change of then goes with the next tick, off the grid.
+    tokio::time::advance(Duration::from_millis(9_500)).await;
+    actor.ack(&client, seq(1)).await.unwrap();
+    actor.run_fast_maintenance().await;
+    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(1)));
+
+    // The next change waits for the grid's next point, 14.5 s, not for 12 s plus a period.
+    actor.ack(&client, seq(2)).await.unwrap();
+    for _ in 0..4 {
+        tokio::time::advance(tick).await;
+        actor.run_fast_maintenance().await;
+        assert_eq!(cursor_on_disk(&dir, &client), Some(seq(1)));
+    }
+    tokio::time::advance(tick).await;
+    actor.run_fast_maintenance().await;
+    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(2)));
+}
+
+// Paused time: the test moves the Tokio clock and runs the fast tick itself.
+#[tokio::test(start_paused = true)]
+async fn the_next_point_counts_from_when_a_write_was_asked_for_not_from_when_the_io_threads_ran_it()
+{
+    tokio::time::advance(CLOCK_AHEAD).await;
+    let dir = tempdir().unwrap();
+    let mut actor = roster_actor(&dir, &relay_on(&dir), RoomLifecyclePolicy::default());
+    let client = ClientId::new("writer").unwrap();
+    register_and_commit_two(&mut actor, &client).await;
+
+    // The file I/O threads are busy for longer than a period: the write waits for them.
+    let pool = Arc::clone(&actor.io);
+    let busy = [
+        pool.io().try_permit().unwrap(),
+        pool.io().try_permit().unwrap(),
+    ];
+    let wait = ROSTER_PERSIST + TEST_TIMINGS.fast_tick;
+    tokio::join!(actor.run_fast_maintenance(), async move {
+        tokio::time::advance(wait).await;
+        drop(busy);
+    });
+    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(0)));
+
+    // The write was asked for at the grid's first point, so the next one is already due:
+    // the wait for the threads does not add to what a crash may lose.
+    actor.ack(&client, seq(1)).await.unwrap();
+    actor.run_fast_maintenance().await;
+    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(1)));
+}
+
+// Paused time: the test moves the Tokio clock and runs the fast tick itself.
+#[tokio::test(start_paused = true)]
+async fn a_change_to_a_roster_not_written_for_roster_persist_secs_goes_with_the_next_tick() {
+    tokio::time::advance(CLOCK_AHEAD).await;
+    let dir = tempdir().unwrap();
+    let mut actor = roster_actor(&dir, &relay_on(&dir), RoomLifecyclePolicy::default());
+    let client = ClientId::new("writer").unwrap();
+    register_and_commit_two(&mut actor, &client).await;
+    actor.run_fast_maintenance().await;
+    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(0)));
+
+    // Ticks that find nothing to write do not start the period again.
+    for _ in 0..3 * ROSTER_PERSIST.as_secs() {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        actor.run_fast_maintenance().await;
+    }
+    actor.ack(&client, seq(1)).await.unwrap();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    actor.run_fast_maintenance().await;
+    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(1)));
+}
+
+// Paused time: the test moves the Tokio clock and runs the fast tick itself.
+#[tokio::test(start_paused = true)]
+async fn a_crash_loses_only_the_roster_changes_since_its_last_write() {
+    tokio::time::advance(CLOCK_AHEAD).await;
+    let dir = tempdir().unwrap();
+    let relay = relay_on(&dir);
+    let mut actor = roster_actor(&dir, &relay, RoomLifecyclePolicy::default());
+    let (writer, peer) = (
+        ClientId::new("writer").unwrap(),
+        ClientId::new("peer").unwrap(),
+    );
+    register_and_commit_two(&mut actor, &writer).await;
+    actor.run_fast_maintenance().await;
+    actor.ack(&writer, seq(2)).await.unwrap();
+    actor.register(&peer, None, None).unwrap();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    actor.run_fast_maintenance().await;
+    // A crash: the room's memory is lost, its files stay as they are.
+    drop(actor);
+
+    let mut reopened = roster_actor(&dir, &relay, RoomLifecyclePolicy::default());
+    // The lost progress of a cursor only makes the room keep more of its log.
+    let writer_entry = reopened.lease_tracker.get_client(&writer).unwrap();
+    assert_eq!(writer_entry.last_ack_seq, seq(0));
+    assert_eq!(reopened.log().tail_seq(), seq(1));
+    // A lost registration makes the client register again.
+    assert!(matches!(
+        reopened.heartbeat(&peer),
+        Err(ServerError::ClientNotRegistered(_))
+    ));
+    reopened.register(&peer, None, None).unwrap();
+    reopened.heartbeat(&peer).unwrap();
+}
+
+// Paused time: the test moves the Tokio clock and runs the fast tick itself.
+#[tokio::test(start_paused = true)]
+async fn a_prune_that_deletes_writes_the_roster_before_its_period_ends() {
+    tokio::time::advance(CLOCK_AHEAD).await;
+    let dir = tempdir().unwrap();
+    let policy = RoomLifecyclePolicy {
+        ram_max_ops: 2,
+        ..RoomLifecyclePolicy::default()
+    };
+    let mut actor = roster_actor(&dir, &relay_on(&dir), policy);
+    let client = ClientId::new("writer").unwrap();
+    actor.register(&client, None, None).unwrap();
+    let mut flow = ControlFlow::Continue(());
+    for n in 1..=4u8 {
+        actor
+            .commit(&client, mutation(n), seq(0), insert_op(n.into()), &mut flow)
+            .await
+            .unwrap();
+    }
+    actor.run_fast_maintenance().await;
+    assert_eq!(cursor_on_disk(&dir, &client), Some(seq(0)));
+
+    tokio::time::advance(Duration::from_secs(1)).await;
+    actor.ack(&client, seq(4)).await.unwrap();
+    let tail = actor.log().tail_seq();
+    assert!(tail > seq(1), "the ack must prune a segment");
+    let on_disk = cursor_on_disk(&dir, &client).unwrap();
+    assert!(
+        on_disk.get() + 1 >= tail.get(),
+        "the cursor on disk {on_disk} is behind the pruned tail {tail}"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_writes_the_roster_changes_that_wait_for_their_period() {
+    // The room first writes its roster within a period of opening, and then once a period.
+    let fx = Fixture::with_options(
+        RoomLifecycleOverrides::default(),
+        |config| config.roster_persist_secs = ROSTER_PERSIST.as_secs(),
+        None,
+    )
+    .await;
+    let sender = fx.sender().await;
+    let client = ClientId::new("writer").unwrap();
+    register(&sender, &client).await;
+    commit(&sender, &client, mutation(1), seq(0), insert_op(1))
+        .await
+        .unwrap();
+    wait_until("the roster is written", || {
+        fx.persisted_cursor(&client) == Some(seq(0))
+    })
+    .await;
+    commit(&sender, &client, mutation(2), seq(1), insert_op(2))
+        .await
+        .unwrap();
+    tokio::time::sleep(TEST_TIMINGS.fast_tick * 2 + Duration::from_millis(100)).await;
+    assert_eq!(
+        fx.persisted_cursor(&client),
+        Some(seq(0)),
+        "the ticks within the period must not write the roster"
+    );
+
+    assert!(fx.manager.shutdown_room(&fx.room_id).await);
+    assert_eq!(fx.persisted_cursor(&client), Some(seq(1)));
+}
 
 // Paused time: the test moves the Tokio clock and runs the fast tick itself.
 #[tokio::test(start_paused = true)]

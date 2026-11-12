@@ -1,0 +1,41 @@
+--- a/crates/server/src/actor/room.rs
++++ b/crates/server/src/actor/room.rs
+@@ -134,6 +134,8 @@
+     /// cannot be restored, so it is not usable and a new upload replaces it.
+     unrestorable_through: Option<SequenceNumber>,
+     timings: ActorTimings,
++    /// Diagnostic of the performance harness: when the fast tick last wrote the roster.
++    roster_written_at: Instant,
+ }
+ 
+ impl RoomActor {
+@@ -214,6 +216,7 @@
+             announced_snapshot: None,
+             unrestorable_through: None,
+             timings,
++            roster_written_at: Instant::now(),
+         };
+         // A snapshot that was already usable before this actor started is not news.
+         actor.announced_snapshot = actor.usable_snapshot_seq();
+@@ -1226,6 +1229,21 @@
+         );
+ 
+         self.update_snapshot_signals();
++        // Diagnostic switch of the performance harness: the fast tick writes the roster only
++        // every ZEMDB_PERF_ROSTER_EVERY_SECS seconds (the stop and the prunes, as always).
++        static EVERY: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
++        let every = *EVERY.get_or_init(|| {
++            std::env::var("ZEMDB_PERF_ROSTER_EVERY_SECS")
++                .ok()
++                .and_then(|secs| secs.parse().ok())
++                .map(Duration::from_secs)
++        });
++        if let Some(every) = every {
++            if self.roster_written_at.elapsed() < every {
++                return;
++            }
++            self.roster_written_at = Instant::now();
++        }
+         // Cursor and lease changes accumulated since the previous tick.
+         self.persist_roster().await;
+     }

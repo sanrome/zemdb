@@ -92,6 +92,8 @@ Request bodies are limited to 16 MiB, and registration (`/register`, unauthentic
 
 The rooms' file I/O (every commit ends in an `fsync`) runs off the async workers, at most `ZEMDB_IO_THREADS` operations at once (default 16, accepted 1 – 512); the rest wait their turn, so the server's threads do not grow with the rooms (see [`ARCHITECTURE.md` §5.2](ARCHITECTURE.md#52-four-tier-storage-architecture--mutation-lifecycle), *Blocking I/O in the Actor*).
 
+A room whose clients' cursors change writes its client roster at most once every `ZEMDB_ROSTER_PERSIST_SECS` seconds (default 10, accepted 1 – 300), with two `fsync`; a crash loses at most about that much of its changes, which only makes the room keep more of its log, a client register again, or a client need a snapshot it would not have needed (see [`ARCHITECTURE.md` §5.2](ARCHITECTURE.md#52-four-tier-storage-architecture--mutation-lifecycle), *Client Roster Persistence*). On a disk with a limit of operations per second, a longer period leaves more of them for the commits.
+
 Each connection takes a file descriptor. Raise the open files limit of the server process above `ZEMDB_MAX_CONNECTIONS` (it is often 1,024 by default on Linux), for example with `ulimit -n 65536` or `LimitNOFILE=65536` in a systemd unit.
 
 ### Building and Testing

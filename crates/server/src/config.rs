@@ -140,6 +140,15 @@ pub struct ServerConfig {
     /// its 512). They do not grow with the rooms: an operation waits, in the order it came,
     /// until one of them ends.
     pub io_threads: usize,
+
+    /// Period of the writes of a room's client roster by its maintenance tick (seconds, default
+    /// 10, from 1 to 300): each room writes it, when it changed, on the points of its own grid,
+    /// one every period from a point of the first one that differs between rooms, so that rooms
+    /// that open together do not write together. A change waits at most until the first point
+    /// after the previous write, so a crash loses at most about this much of the roster's
+    /// changes. The roster is still written before a prune that deletes segments and when the
+    /// room stops.
+    pub roster_persist_secs: u64,
 }
 
 /// Built-in development secrets. They are public, so `validate_secrets` rejects them.
@@ -181,6 +190,7 @@ impl Default for ServerConfig {
             max_sse_streams: None,
             max_sse_ops_bytes: 64 * 1024 * 1024,
             io_threads: 16,
+            roster_persist_secs: 10,
         }
     }
 }
@@ -210,6 +220,9 @@ const MAX_CONNECTIONS_RANGE: std::ops::RangeInclusive<usize> = 1..=1_000_000;
 /// Accepted range of `io_threads`: up to the blocking threads of the runtime (Tokio's 512), past
 /// which the operations would wait for a thread anyway.
 const IO_THREADS_RANGE: std::ops::RangeInclusive<usize> = 1..=512;
+
+/// Accepted range of `roster_persist_secs`: from 1 second (every fast tick) to 5 minutes.
+const ROSTER_PERSIST_SECS_RANGE: std::ops::RangeInclusive<u64> = 1..=300;
 
 /// Accepted range of `response_stall_timeout_secs`: from 5 seconds to 1 hour.
 const RESPONSE_STALL_TIMEOUT_SECS_RANGE: std::ops::RangeInclusive<u64> = 5..=3600;
@@ -314,6 +327,11 @@ impl ServerConfig {
             "io_threads (ZEMDB_IO_THREADS)",
             self.io_threads,
             IO_THREADS_RANGE,
+        )?;
+        check_range(
+            "roster_persist_secs (ZEMDB_ROSTER_PERSIST_SECS)",
+            self.roster_persist_secs,
+            ROSTER_PERSIST_SECS_RANGE,
         )?;
         if let Some(max) = self.max_sse_streams {
             check_range(
@@ -459,6 +477,9 @@ impl ServerConfig {
         }
         if let Some(threads) = parse_var(&var, "ZEMDB_IO_THREADS")? {
             self.io_threads = threads;
+        }
+        if let Some(secs) = parse_var(&var, "ZEMDB_ROSTER_PERSIST_SECS")? {
+            self.roster_persist_secs = secs;
         }
 
         use PolicySetting::*;

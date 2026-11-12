@@ -48,7 +48,9 @@ pub(super) fn snapshot_envelope() -> bytes::Bytes {
 
 /// A manager on `dir` with [`TEST_TIMINGS`], whose registry holds `test_schema` under each of
 /// `schemas` (registered only if missing, so that a manager reopened on the same directory
-/// finds them already there), and whose configuration is adjusted by `configure`.
+/// finds them already there), and whose configuration is adjusted by `configure`. Its rooms
+/// write their rosters at most once a second, the shortest period, so that tests waiting for
+/// a roster on disk stay fast.
 pub(super) fn test_manager(
     dir: &Path,
     schemas: &[&str],
@@ -56,6 +58,7 @@ pub(super) fn test_manager(
 ) -> (RoomManager, Arc<SnapshotRelay>) {
     let mut config = ServerConfig {
         data_dir: dir.to_path_buf(),
+        roster_persist_secs: 1,
         ..ServerConfig::default()
     };
     configure(&mut config);

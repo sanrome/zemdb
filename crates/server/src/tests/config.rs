@@ -145,6 +145,7 @@ fn unparsable_environment_values_fail_naming_the_variable() {
         ("ZEMDB_MAX_SSE_STREAMS", "half"),
         ("ZEMDB_MAX_SSE_OPS_BYTES", "64MiB"),
         ("ZEMDB_IO_THREADS", "all"),
+        ("ZEMDB_ROSTER_PERSIST_SECS", "10s"),
     ] {
         let err = with_env(&[(name, value)]).unwrap_err();
         assert!(
@@ -310,6 +311,7 @@ fn empty_environment_values_count_as_unset() {
         "ZEMDB_MAX_SSE_OPS_BYTES",
         "ZEMDB_SNAPSHOT_UPLOAD_MAX_SECS",
         "ZEMDB_IO_THREADS",
+        "ZEMDB_ROSTER_PERSIST_SECS",
     ];
     let vars: Vec<(&str, &str)> = names.iter().map(|name| (*name, "")).collect();
     assert_eq!(with_env(&vars).unwrap(), strong_config());
@@ -353,6 +355,29 @@ fn http_limits_have_defaults_and_toml_keys() {
     assert_eq!(parsed.io_threads, 4);
     assert_eq!(parsed.sse_stream_limit(), 400);
     assert_eq!(parsed.max_sse_ops_bytes, 1024);
+}
+
+#[test]
+fn roster_persist_secs_has_a_default_a_toml_key_a_variable_and_a_range() {
+    assert_eq!(ServerConfig::default().roster_persist_secs, 10);
+    let parsed = ServerConfig::from_toml_str("roster_persist_secs = 2\n").unwrap();
+    assert_eq!(parsed.roster_persist_secs, 2);
+
+    for secs in ["1", "300"] {
+        let config = with_env(&[("ZEMDB_ROSTER_PERSIST_SECS", secs)]).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.roster_persist_secs.to_string(), secs);
+    }
+    for secs in ["0", "301"] {
+        let err = with_env(&[("ZEMDB_ROSTER_PERSIST_SECS", secs)])
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(
+            matches!(&err, ServerError::Config(msg) if msg.contains("ZEMDB_ROSTER_PERSIST_SECS")),
+            "ZEMDB_ROSTER_PERSIST_SECS={secs}: {err:?}"
+        );
+    }
 }
 
 #[test]

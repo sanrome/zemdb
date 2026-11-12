@@ -2,7 +2,7 @@
 
 **Fecha:** 1 de Noviembre de 2026
 **Tipo:** Optimización del servidor y del protocolo. Documento vivo: plan, lotes y seguimiento. La fase es chica y no tiene sub-fases: este plan baja directamente a lotes (`docs/METODOLOGIA.md` §1).
-**Estado:** En curso. Las decisiones DS1 a DS8 las adoptó el dueño del proyecto en el Lote 0 (1 de Noviembre de 2026); DS7, condicionada a la medición del Lote 7. DS9 salió del Lote 4 y la adoptó el dueño el 3 de Noviembre de 2026, con el mecanismo que eligió al arrancar el Lote 4b (la distancia en bytes al inicio del grupo). DS10 salió de la medición del Lote 6; el dueño del proyecto la dejó para un Lote 6b el 6 de Noviembre de 2026 y la adoptó al arrancarlo, el 7, con tramos de 256 KiB y sin tramos en una lectura después de uno que no entra. El contrato está en la versión 20 de `INVARIANTES.md`.
+**Estado:** En curso. Las decisiones DS1 a DS8 las adoptó el dueño del proyecto en el Lote 0 (1 de Noviembre de 2026); DS7, condicionada a la medición del Lote 7. DS9 salió del Lote 4 y la adoptó el dueño el 3 de Noviembre de 2026, con el mecanismo que eligió al arrancar el Lote 4b (la distancia en bytes al inicio del grupo). DS10 salió de la medición del Lote 6; el dueño del proyecto la dejó para un Lote 6b el 6 de Noviembre de 2026 y la adoptó al arrancarlo, el 7, con tramos de 256 KiB y sin tramos en una lectura después de uno que no entra. DS7 la adoptó el dueño del proyecto con la medición del Lote 7, el 10 de Noviembre de 2026, con N = 10 s y otro criterio, el 11 le sumó una fase por sala, y el 12, con la revisión de delta, que cada sala escriba en los puntos de su propia grilla. El contrato está en la versión 27 de `INVARIANTES.md`.
 **Origen:** las Evaluaciones 1 y 2 del [plan de evaluaciones de performance](2026-10-evaluaciones-performance.md) (§3.7, §3.8, §4.7 y §4.8).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md), con lo propio de este plan en §5: la medición antes y después de cada lote y los checklists de cada tipo de lote.
@@ -80,7 +80,7 @@ Prefijo **DS**. Se escribieron como *Propuestas*, y el dueño del proyecto las a
 | **DS4** | El SSE se puede apagar | 5 | Adoptada (1 de Noviembre de 2026) |
 | **DS5** | El evento `ops`: el SSE trae las operaciones | 5 | Adoptada (1 de Noviembre de 2026) |
 | **DS6** | El catch-up comparte las operaciones del búfer en RAM | 6 | Adoptada (1 de Noviembre de 2026) |
-| **DS7** | El roster, menos seguido, si la medición lo justifica | 7 | Adoptada (1 de Noviembre de 2026), condicionada a la medición del Lote 7 |
+| **DS7** | El roster, menos seguido, si la medición lo justifica | 7 | Adoptada (1 de Noviembre de 2026), condicionada a la medición del Lote 7; con ella, el dueño del proyecto la adoptó el 10 de Noviembre de 2026, con N = 10 s y otro criterio |
 | **DS8** | El arnés en `main` y la medición de cada lote | 1 | Adoptada (1 de Noviembre de 2026) |
 | **DS9** | El último grupo de commits dañado es una escritura rota, como el último registro | 4b | Adoptada (3 de Noviembre de 2026; el mecanismo, al arrancar el Lote 4b) |
 | **DS10** | La reserva de una lectura, por tramos, y sin una segunda medición | 6b | Adoptada (7 de Noviembre de 2026, al arrancar el Lote 6b) |
@@ -125,6 +125,8 @@ Prefijo **DS**. Se escribieron como *Propuestas*, y el dueño del proyecto las a
 ### DS7 · El roster, menos seguido, si la medición lo justifica
 - **Hoy.** El tick rápido (1 s) reescribe el roster de cada sala si cambió algún cursor, con una escritura atómica de dos `fsync` (el temporal y el directorio). INV-R3 acepta perder hasta ~1 s de cambios del roster en un corte.
 - **Propuesta, condicionada.** El Lote 7 mide primero la Evaluación 2 en un disco de nube con límite de operaciones por segundo. Si el roster pesa (si las escrituras por segundo del disco limitan antes que el CPU), el roster se escribe cada N segundos (`ZEMDB_ROSTER_PERSIST_SECS`, con un valor de fábrica que fija la medición) en lugar de cada tick, y INV-R3 pasa de "~1 s" a "~N s". Se mantiene que el roster se persiste antes de cualquier poda que borre (D56). Si no pesa, DS7 se descarta y el lote cierra solo con la medición.
+- **La medición del Lote 7** (9 de Noviembre de 2026, sobre `efb3ec4`): E2-disco en un disco de nube emulado, con 500 y 1.000 salas, sin límite y con 3.000 y 1.000 operaciones de escritura por segundo, contra un diagnóstico que escribe el roster cada 10 s (la nota **Hecho** del Lote 7). Desde los Lotes 3 a 6, un commit cuesta unas 4 escrituras al disco, no las 7 a 9 de la Evaluación 2, y el roster es el 30% de ellas (con un commit por segundo por sala); el resto es del commit (`active.wal`, el journal de ext4 y sus flush). Pero con 3.000 operaciones por segundo, 1.000 salas colapsan escribiendo el roster en cada tick (815 de 1.001 commits por segundo, 19 s en p99) y lo sostienen escribiéndolo cada 10 s (0,2 a 0,5 s en p99).
+- **Adoptada** por el dueño del proyecto el 10 de Noviembre de 2026, con esa medición: el tick rápido escribe un roster que cambió como mucho una vez cada `roster_persist_secs` (`ZEMDB_ROSTER_PERSIST_SECS`, 10 s de fábrica, de 1 a 300), y la poda que borra y la parada lo escriben siempre. INV-R3 pasa de "~1 s" a "~`roster_persist_secs`". El criterio del Lote 7 cambia, porque el de antes (las escrituras por commit, a menos de la mitad) suponía que el roster era la mayor parte de ellas (§4, Lote 7). El 11 de Noviembre de 2026, con la primera medición del lote, el dueño del proyecto sumó que la primera escritura del roster de cada sala caiga en un punto de su primer período que sale de su encarnación: las salas que abren juntas (en la medición, y después de reiniciar el servidor) escribían el roster en el mismo tick, período tras período, y con 3.000 escrituras por segundo y 500 salas esa ráfaga llevaba el commit de 4 a 30–46 ms en p99. El 12 de Noviembre de 2026, con la revisión de delta, el dueño del proyecto sumó que cada sala escriba en los puntos de su propia grilla (la fase y después cada período), y que una escritura fuera de ella (la de una poda que borra, o la de un cambio después de un período sin cambios) no la mueva: si no, las salas que pasan un período quietas a la vez, o que podan juntas en el tick lento, volvían a escribir en el mismo tick.
 - **Invariantes:** INV-R3, INV-R1, INV-D4.
 
 ### DS8 · El arnés en `main` y la medición de cada lote
@@ -174,7 +176,7 @@ Salió de la medición del Lote 6 (su nota **Hecho**). El dueño del proyecto el
 | 5 | El SSE: apagarlo y el evento `ops` | core, server | DS4, DS5 | Y2, D7, E3, B3, B5, A1, W1, W2 | ✅ |
 | 6 | El catch-up sin copias | server | DS6 | B1, W2, Y2 | ✅ (sin cumplir su criterio: lo sigue el 6b) |
 | 6b | La reserva por tramos | server | DS10 | B1, B5 | ✅ |
-| 7 | El roster | server | DS7 | R3, R1, D4 | ⬜ |
+| 7 | El roster | server | DS7 | R3, R1, D4 | ✅ |
 | 8 | Medición final y revisión de cierre | Documentos | Todas | Las que tocó la fase | ⬜ |
 
 **Orden.**
@@ -992,7 +994,7 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
   - **Sobre la medición** (pregunta 6): es válida según DP3 y §5.2, las medianas y los rangos coinciden con los datos crudos, el criterio se cumple en cada ronda (con 64, el 123% de 8 o más) y ningún control pasa su dispersión más un 10%. Los chequeos se volvieron a correr sobre `main` con lo que entró de la sub-fase 4.3.
 - **El tamaño:** unas 72 líneas de producción agregadas, sin comentarios ni blancos, y 35 quitadas (`fit_in_response` y sus usos), dentro del tope de ~300 de `docs/METODOLOGIA.md` §4; la estimación del plan era de unas 40 netas, y son 37 (unas 10 de las agregadas son el conteo de visitas al presupuesto, solo de los tests).
 
-### Lote 7 · El roster · ⬜
+### Lote 7 · El roster · ✅ Hecho
 **Objetivo:** decidir DS7 con una medición en un disco de nube y, si se adopta, implementarla.
 
 **Archivos, si se adopta:** `crates/server/src/actor/room.rs` (el tick), `actor/lease.rs`, `config.rs` (`ZEMDB_ROSTER_PERSIST_SECS`), y sus tests. `ARCHITECTURE.md` §5.2 (*Client Roster Persistence*).
@@ -1006,7 +1008,7 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 
 **Interacciones a revisar:** los cursores que reportan los commits y los `Ack`; los estados del lease (`Connected`, `Disconnected`, `Dormant`); la designación de snapshots; la apertura con un roster viejo.
 
-**Medición:** E2-disco en el disco de nube, con 500 y 1.000 salas. **Criterio, si se adopta:** las escrituras al disco por commit bajan a menos de la mitad (hoy, entre 7 y 9).
+**Medición:** E2-disco en el disco de nube, con 500 y 1.000 salas. **Criterio, si se adopta:** las escrituras al disco por commit bajan a menos de la mitad (hoy, entre 7 y 9). **El criterio con que se adoptó** (el dueño del proyecto, el 10 de Noviembre de 2026, con la medición de la decisión, que dio unas 4 escrituras por commit y el roster en el 30% de ellas): en E2-disco sin límite, las escrituras al disco por commit bajan al menos un 30% con 500 y con 1.000 salas; y con 3.000 operaciones de escritura por segundo, 1.000 salas sostienen sus commits (los confirmados por segundo, al menos el 99% de los programados, en corridas válidas).
 
 **Metodología:** §5.1, con los checklists de crash-safety y de medición, si se adopta. Si se descarta, el lote cierra con la medición en su nota **Hecho** y DS7 pasa a *Descartada*.
 
@@ -1014,7 +1016,155 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 
 **Entrega:** `perf(server): persist the client roster every few seconds instead of every tick (Fase 3.12, Lote 7)`, si se adopta.
 
-**Hecho.** *Pendiente.*
+**Hecho** (12 de Noviembre de 2026).
+
+**La medición de la decisión** (9 y 10 de Noviembre de 2026, sobre `efb3ec4`, en una VM de 4 vCPU Intel Xeon a 2,10 GHz, 15 GiB, kernel `6.18.44-fc-v310`, Rust 1.97.0; servidor en los núcleos 0 y 1, generador en 2 y 3).
+- **Dónde:** la VM no tiene un disco de nube, así que el dueño del proyecto eligió emularlo, y dejar la medición en uno real para más adelante.
+  - El disco emulado: un archivo de 3 GB con ext4, como loop device con E/S directa, y otro loop device encima, montado; el límite de escrituras por segundo de blkio (cgroup v1: la VM no tiene v2) va sobre el de abajo, donde cada escritura y cada flush del sistema de archivos llega como un bio, después de juntarse, como en un disco. Sobre el dispositivo del sistema de archivos, el límite cuenta los bios antes de juntarse (con esta carga, unos 1,9 por pedido), y con "3.000" el disco veía unas 1.100 operaciones por segundo.
+  - Lo que no emula: la latencia de un disco de red (de 0,5 a 2 ms por escritura en uno de nube, 0,15 ms en esta VM; el kernel no tiene device-mapper para sumarla). Y cuenta los flush contra el límite, que un disco de nube quizás no cuente: es la versión pesimista.
+  - El script: `tools/perf/cloud_disk.sh`.
+- **Qué:** E2-disco (10 clientes por sala, un commit por segundo por sala) con 500 y 1.000 salas, sin límite y con 3.000 y 1.000 escrituras por segundo (con 1.000, también 250 salas), intercalando `main` con un diagnóstico que escribe el roster en el tick cada 10 s (`roster-every.patch`, en los resultados del lote).
+- **Las rondas:** 2, no 3: la VM se reinició durante la tercera (y antes, una vez, mientras se esperaba la respuesta del dueño). La ronda 2 no tiene la última corrida (el diagnóstico con 1.000 escrituras por segundo y 1.000 salas, que colapsa igual). Las dos rondas coinciden en cada punto.
+
+Mediana de las 2 rondas, o los dos valores; "operaciones" son las escrituras más los flush, lo que cuenta el límite:
+
+| E2-disco | `main` | El roster cada 10 s (diagnóstico) |
+|---|---|---|
+| Sin límite, 500 salas: escrituras (operaciones) por commit | 4,21 (6,56) | 3,02 (4,76) |
+| Sin límite, 1.000 salas: escrituras (operaciones) por commit; commit p99 | 4,12 (6,15); 6–10 ms | 2,74 (4,18); 4 ms |
+| 3.000 por segundo, 500 salas: commit p99 | 50–68 ms | 4 ms |
+| 3.000 por segundo, 1.000 salas: commits por segundo (de 1.001 programados); p99 | 815–816, colapsa; 19 s | 1.007–1.014; 0,2–0,5 s |
+| 1.000 por segundo, 250 salas: commit p99 | 143–167 ms | 68–72 ms |
+| 1.000 por segundo, 500 salas: commits por segundo (de 503); p99 | 418–420, colapsa; 18 s | 515–519; 2,2–2,8 s |
+| 1.000 por segundo, 1.000 salas | colapsa, con errores (299–302 commits por segundo) | colapsa, con errores (374) |
+
+- **Lo que dijo:** un commit cuesta unas 4 escrituras al disco, no las 7 a 9 de la Evaluación 2 (los Lotes 3 a 6 cambiaron la carga: sin `block_in_place`, con *group commit*, con el evento `ops` y sin los `/sync` de cada aviso), y el roster es el 30% de ellas; el resto es el commit (`active.wal`, el journal de ext4 y sus flush). Con un disco limitado, el roster decide si 1.000 salas aguantan: con 3.000 operaciones por segundo, `main` colapsa y el diagnóstico sostiene sus commits. Con eso el dueño del proyecto adoptó DS7 con N = 10 s y el criterio de la sección del lote, en lugar del de "menos de la mitad", que el roster no puede dar solo.
+
+**Lo que se hizo.**
+- `config.rs`: `roster_persist_secs` (`ZEMDB_ROSTER_PERSIST_SECS`, 10 de fábrica, de 1 a 300).
+- `actor/room.rs`: el tick rápido escribe un roster que cambió en los puntos de la grilla de la sala: el primero, cuando abrió el actor más una fase del primer período que sale de su encarnación (aleatoria); los demás, cada período. Después de cada escritura (la del tick, la de una poda que borra o la de la parada), el próximo vencimiento (`roster_due_at`) es el primer punto de la grilla más de medio tick después de que se pidió esa escritura, antes de su espera en el pool de E/S. Una escritura fuera de la grilla no la mueve. Con medio tick de margen: un tick llega un poco antes o después que un punto, y sin el margen el roster de una sala con carga se escribiría a veces un tick tarde, y con 1 s, salteando ticks. Una escritura que falla no mueve el vencimiento, y la reintenta el tick siguiente; un cambio en una sala cuyo roster no cambió en un período entero va con el tick siguiente, fuera de la grilla.
+- La poda que borra y la parada lo escriben como antes, sin esperar el período.
+- **La fase, agregada con la primera medición del lote** (el dueño del proyecto, el 11 de Noviembre de 2026): sin ella, la primera escritura de cada sala caía en el primer tick con un cambio, y las salas que abren juntas (en la medición, las 500 en 2 s; en producción, después de reiniciar el servidor) escribían el roster en el mismo tick, período tras período. Con 3.000 escrituras por segundo y 500 salas, los dos segundos de cada período con la ráfaga (unas 700 operaciones por segundo más, de 2.100 a entre 2.700 y 3.080) llevaban el commit a 30–46 ms en p99, contra 4 ms en el diagnóstico de la decisión, cuyas escrituras se desfasaban solas (caían a veces a los 10 s y a veces a los 11). Lo que cuesta: el primer cambio de una sala recién abierta puede esperar hasta un período en lugar de un tick, dentro del tope de INV-R3.
+- **La grilla, agregada con la revisión de delta** (el dueño del proyecto, el 12 de Noviembre de 2026): con la fase sola, cada escritura empezaba el período de nuevo, así que la fase se perdía en dos casos, y las salas volvían a escribir en el mismo tick. El primero, si varias pasaban un período sin cambios a la vez (un corte de red, un reinicio del proxy) y volvían juntas. El segundo, con una poda que borra en el tick lento, que escribe el roster y cae alineado en salas que abrieron juntas. Con la grilla, una escritura fuera de ella no la mueve. Un cambio en una sala quieta sigue yendo con el tick siguiente, así que la grilla no suma espera.
+- `actor/tests/support.rs`: las salas de `test_manager` escriben el roster con el período más corto, 1 s, como los demás tiempos acortados de los tests.
+
+**Tests agregados** (⊗ = fallan con el comportamiento anterior).
+- `actor/tests/room.rs`, con el actor detenido y el reloj de Tokio pausado (el test corre los ticks), con un período de 4 s (distinto del de fábrica) y la encarnación 1 (la primera escritura, a 1 ms del inicio: en el primer tick), salvo donde se dice:
+  - ⊗ `the_fast_tick_writes_a_changed_roster_at_most_once_every_roster_persist_secs`: el primer tick escribe; un cambio espera al tick de un período después de esa escritura; el período empieza de nuevo con cada escritura.
+  - ⊗ `a_room_first_writes_its_roster_at_the_point_of_the_period_its_incarnation_gives`: con una encarnación que da 2,5 s, los ticks hasta los 2 s no escriben, el de los 2,5 s sí, y después, un período después de cada escritura.
+  - ⊗ `the_tick_of_the_period_writes_the_roster_even_if_it_runs_a_little_early`: el tick anterior al del período no escribe, ni uno que llega 0,6 de tick antes; uno que llega 0,4 de tick antes, sí (el margen, entre 0,4 y 0,6 de tick).
+  - ⊗ `a_write_off_the_grid_does_not_move_the_grid_of_a_room` (de la revisión de delta): con una grilla en 2,5, 6,5, 10,5 y 14,5 s, un cambio después de un período sin cambios va con el tick siguiente, a los 12 s, y el siguiente espera al punto de los 14,5 s, no a los 16.
+  - `the_next_point_counts_from_when_a_write_was_asked_for_not_from_when_the_io_threads_ran_it` (de la revisión de delta): una escritura que espera más de un período al pool de E/S (el test toma sus permisos) deja vencido el punto siguiente, así que esa espera no se suma a lo que puede perder un crash.
+  - `a_change_to_a_roster_not_written_for_roster_persist_secs_goes_with_the_next_tick`: los ticks sin nada que escribir no mueven el vencimiento, y un cambio después de un período sin cambios va con el tick siguiente.
+  - ⊗ `a_crash_loses_only_the_roster_changes_since_its_last_write` (INV-R3): después de un crash dentro del período, el cursor vuelve al de la última escritura (la sala retiene más) y un registro perdido da `ClientNotRegistered`, y el cliente se registra de nuevo.
+  - `a_prune_that_deletes_writes_the_roster_before_its_period_ends` (INV-R1, D56): una poda que borra dentro del período escribe el roster antes.
+  - ⊗ `shutdown_writes_the_roster_changes_that_wait_for_their_period` (INV-L5), con el manager y una encarnación aleatoria: los ticks dentro del período no escriben el cambio, y el apagado sí.
+- `tests/config.rs`: ⊗ `roster_persist_secs_has_a_default_a_toml_key_a_variable_and_a_range`; y la variable, en las listas de valores que no se leen y de variables vacías.
+
+**Mutaciones verificadas** (15, sobre la versión final; todas atrapadas; el script, `mutate.py`, toca cada archivo al restaurarlo):
+- **Lo que escribe el tick:** el roster en cada tick (el comportamiento de antes); la grilla sin la fase, empezando al abrir; sin el margen; con 3/4 y con 1/4 de tick de margen; una escritura que no mueve el vencimiento; y cada tick, también uno sin nada que escribir, que lo mueve.
+- **La grilla:** una escritura que empieza el período en lugar de seguir la grilla (la versión de antes de la revisión, que solo atrapa `a_write_off_the_grid_does_not_move_the_grid_of_a_room`); el punto siguiente contado desde el final de la escritura, después de su espera en el pool (solo lo atrapa `the_next_point_counts_from_when_a_write_was_asked_for_not_from_when_the_io_threads_ran_it`); y el punto siguiente sin el medio tick, que hace escribir al tick siguiente.
+- **El período y la configuración:** el período de 10 s fijo, sin leer `roster_persist_secs`; la variable que no se lee; y la variable sin validar.
+- **Lo que no espera el período:**
+  - una poda que borra que espera el período para escribir el roster;
+  - la parada que espera el período. Esta la atrapan también tests del manager, de la parada por inactividad y por fallo, y `snapshot_demand_survives_a_room_restart`.
+- **Antes:** las mismas mutaciones, menos las de la grilla, se verificaron también sobre la versión sin fase y sobre la versión con la fase sola.
+
+**Interacciones revisadas.**
+- **Los cursores** que reportan los commits (también los de un grupo), los `Ack` y los `/sync`: marcan el roster cambiado, como antes, y se escriben dentro del período (los tests del período, el del crash y el del apagado).
+- **Los estados del lease** y sus transiciones en el tick (`Disconnected`, `Dormant`, el olvido de un `Dormant`): también marcan el roster cambiado y se escriben dentro del período. Después de un crash, la sala vuelve con el estado de la última escritura y el tick lo recalcula con el cursor y la última actividad, como con el segundo de antes, solo que el período es más largo.
+- **La última actividad** (`last_seen`): la actividad sola no marca el roster cambiado; su valor en disco se refresca con la escritura siguiente, que ahora puede llegar un período después. Después de un crash, la inactividad restaurada puede ser hasta un período más larga: un cliente puede pasar a `Disconnected` antes (vuelve con su pedido siguiente), con el lease de fábrica de 90 s; está en `ARCHITECTURE.md` desde antes, con el tick.
+- **La demanda de snapshot persistida:** una renovación marca el roster cambiado cuando la guardada envejeció más que su granularidad, y se escribe dentro del período: después de un crash, una demanda restaurada puede vencer hasta un período antes (en `ARCHITECTURE.md`); `snapshot_demand_survives_a_room_restart` pasa. **La designación**, solo en memoria, no cambia.
+- **La poda por cursores y D56:** una poda que borra escribe el roster antes, sin esperar el período, y su escritura empieza el período (`a_prune_that_deletes_writes_the_roster_before_its_period_ends`, `pruning_on_ack_persists_cursor_before_deleting_segments`). Una poda que no borra no escribe, como antes (`acks_that_prune_no_segment_do_not_write_the_roster`).
+- **La parada** por apagado, inactividad o fallo escribe el roster sin esperar el período; **el pánico**, no, como antes. Un apagado que pasa sus 10 s de gracia pierde, en las salas a las que no llegó, lo de un crash: ahora, hasta un período (en `ARCHITECTURE.md`, *Graceful Shutdown*).
+- **Una baja que se pierde en un crash,** ahora dentro de un período en lugar de un segundo: el cliente vuelve al roster, pasa a `Disconnected` con su lease y retiene la poda por cursores hasta que el TTL o la cuota mueven la cola más allá de su cursor (o hasta `dormant_after_secs`, si está fijado). Es más retención, la consecuencia que acepta INV-R3, y está en `ARCHITECTURE.md` desde antes.
+- **Una escritura que falla** no empieza el período, y la reintenta el tick siguiente (`a_failed_roster_write_is_retried_by_the_next_tick`, que atrapó dos mutaciones).
+- **La espera en el pool de E/S:** la escritura espera su turno como antes; con el pool lleno, lo que se pierde puede pasar del período por esa espera (INV-R3).
+- **La apertura con un roster viejo:** el mismo camino; el test del crash reabre y mira las consecuencias.
+- **Una sala que se reabre seguido** (por inactividad): cada apertura de la misma encarnación tiene la misma fase, y la parada escribe el roster, así que no pierde nada; una sala recreada tiene otra encarnación y otra fase.
+- **Las escrituras fuera de la grilla:** la de una poda que borra, la de un cambio después de un período sin cambios y la de la parada no la mueven, así que las salas no vuelven a quedar en fase (`a_write_off_the_grid_does_not_move_the_grid_of_a_room`).
+
+**Checklists** (§5.3).
+- **De crash-safety:** ninguna operación de archivo cambia de orden ni de lugar respecto de los locks (la escritura del roster es la misma `write_atomic` en el pool de E/S, con el log; solo es menos seguida); ninguna operación soltada aterriza después de cerrar o reabrir la sala (se espera como antes); cada `sync` sigue sobre el mismo archivo y directorio, y ningún resultado se descarta (un error se registra y se reintenta); los fail points siguen en el mismo paso, con el mismo nombre; las imágenes de crash pasan sin cambios (las pruebas largas).
+- **De la medición:** la base y el resultado en la misma VM, con el mismo binario del generador; corridas válidas según DP3; el entorno, abajo.
+
+**Verificación.**
+- Los chequeos de `docs/METODOLOGIA.md` §4, regla 4: `fmt`, `clippy` y `doc` sin advertencias; 1.425 tests del workspace en verde, sobre el `main` de `7c11c10` (10 del lote); el lote no toca `core`, `storage` ni `client`.
+- Las pruebas largas del servidor en release, sobre la versión final: 14 de 14 (las imágenes de crash sin cambios en sus expectativas; `fetch_cost_does_not_grow_with_the_number_of_segments` también, en la corrida de todas).
+- La suite del actor, tres veces seguidas, sin tests inestables por la fase aleatoria de las salas del manager.
+- **Windows:** los tests leen el roster cuando el actor no lo tiene abierto (`write_atomic` lo cierra antes del rename).
+
+**La medición del lote** (12 de Noviembre de 2026, sobre el código final, en una VM de 4 vCPU Intel Xeon a 2,10 GHz, 15 GiB, kernel `6.18.44-fc-v378`, Rust 1.97.0; servidor en los núcleos 0 y 1, generador en 2 y 3).
+- **Las variantes:**
+  - La base es el servidor de `efb3ec4`, el mismo binario que el de `main` (`7c11c10`), porque los commits de la 4.3 y la 4.4 desde entonces no tocan el servidor ni `core`.
+  - El resultado es el del lote, con la grilla.
+  - El generador es el mismo binario para las dos.
+- **Las corridas:** tres rondas intercaladas. Todas son válidas según DP3: sin errores, con el head igual a lo confirmado, sin huecos ni streams cortados, con todos los clientes al día, sin advertencias del servidor y con el generador por debajo del 90% de sus núcleos.
+
+Mediana, y el rango de las 3 rondas:
+
+| | Base (`efb3ec4`) | Resultado | |
+|---|---|---|---|
+| **E2-disco sin límite, 500 salas: escrituras por commit** (operaciones) | 4,28, de 4,21 a 4,29 (6,71) | 3,18, de 3,18 a 3,20 (5,07) | −26% |
+| **E2-disco sin límite, 1.000 salas: escrituras por commit** (operaciones) | 3,98, de 3,92 a 4,02 (5,89) | 2,85, de 2,85 a 2,86 (4,36) | −28% |
+| E2-disco sin límite, 1.000 salas: commit p99 | de 6,6 a 15,4 ms | de 4,8 a 7,7 ms | |
+| E2-disco con 3.000 por segundo, 500 salas: commit p99 | de 43 a 54 ms | de 3,8 a 4,3 ms | |
+| **E2-disco con 3.000 por segundo, 1.000 salas: commits por segundo** (de 1.002 programados) | de 834 a 847 (el 84%); p99 de 17,0 a 17,6 s | de 1.002 a 1.011 (todos); p99 de 0,07 a 0,38 s | |
+| Control: E1-tmpfs con 1 pedido en vuelo, commits por segundo | 6.047, de 6.038 a 6.059 | 5.989, de 5.830 a 6.100 | −1% |
+| Control: E1-tmpfs con 8, commits por segundo | 25.004, de 24.709 a 25.408 | 22.532, de 22.301 a 23.922 | −9,9% |
+| Control: E2-tmpfs con 500 salas, propagación p99 | 1,00 ms, de 1,00 a 1,01 | 0,91 ms, de 0,88 a 0,94 | −9% |
+
+- **El criterio, segunda parte (se cumple):** con 3.000 operaciones por segundo, 1.000 salas sostienen sus commits: todos los programados, contra el 84% de la base, que colapsa.
+- **El criterio, primera parte (no se cumple):** sin límite, las escrituras por commit bajan un 26% con 500 salas y un 28% con 1.000, debajo del 30%.
+  - La fase cuesta unos 6 puntos (abajo).
+  - El resto es que la base varía entre mediciones más que el resultado. Con 500 salas, la base dio 4,22 escrituras por commit en la primera medición, 3,84 en la segunda y 4,28 en esta, las dos últimas en la misma VM; el resultado, entre 3,1 y 3,2 en la segunda, en la de la fase y en esta.
+  - El dueño del proyecto aceptó el desvío el 11 de Noviembre de 2026, con los números de la segunda medición (−19% y −29,8%).
+- **Los controles:** ninguno empeora más que su dispersión más un 10%.
+  - E1-tmpfs con 1: −1%, con una dispersión de la base del 0,4%.
+  - E1-tmpfs con 8: −9,9%, con una del 2,8%. Es el más cerca de su límite, y en un camino donde el lote solo escribe menos: en la segunda medición, el mismo control dio +32%.
+  - E2-tmpfs: −9% de propagación en p99, es decir, mejor.
+- **Lo que cuesta la fase,** medido aparte en la misma VM, el 11 de Noviembre de 2026, sobre la versión con la fase sola, que en régimen escribe en los mismos ticks que la grilla.
+  - **Cómo:** sin límite, con la base, el resultado sin la fase y el resultado, intercalados, 3 rondas, rotando el orden.
+  - **Con 500 salas:** 3,90, 2,96 y 3,19 escrituras por commit (−24% sin la fase, −18% con ella).
+  - **Con 1.000 salas:** 3,73, 2,54 y 2,75 (−32% y −26%); el commit p99, de 41 a 132 ms, de 26 a 251 ms y de 9 a 27 ms.
+  - **Lo que cuesta:** unas 0,2 escrituras y 0,2 flush por commit, un 7–8% más que sin ella. Con una escritura del roster cada 10 commits, son unas 2 escrituras y 2 flush más por roster: un commit del journal de ext4 propio por cada uno de sus dos `fsync`, en lugar de compartirlo con los rosters que se escriben en el mismo segundo. Es coherente en magnitud, pero no se midió directamente (`/proc/fs/jbd2/<dev>/info` lo diría).
+  - **Lo que gana:** el disco no recibe ráfagas, que con un límite de operaciones por segundo es lo que pesa.
+- **La primera medición del lote, sin la fase** (10 de Noviembre de 2026, en otra VM, kernel `6.18.44-fc-v338`), con el mismo script:
+  - **Sin límite:** de 4,22 a 2,93 escrituras por commit con 500 salas (−31%), y de 4,17 a 2,64 con 1.000 (−37%).
+  - **Con 3.000 por segundo y 1.000 salas:** de 807–819 commits por segundo (colapsa, 19 s en p99) a 1.002–1.003 (0,47–0,55 s en p99).
+  - **Con 3.000 por segundo y 500 salas:** de 44–58 a 31–46 ms en p99, contra 4 ms del diagnóstico de la decisión.
+  - **La ráfaga:** una corrida con las operaciones al disco segundo a segundo la mostró: dos segundos de cada 10 con unas 700 operaciones por segundo más, contra el límite. De ahí, la fase.
+- **La segunda, con la fase sola** (11 de Noviembre de 2026, en la VM de esta):
+  - **Sin límite:** de 3,84 a 3,10 escrituras por commit con 500 salas (−19%), y de 4,01 a 2,81 con 1.000 (−29,8%).
+  - **Con 3.000 por segundo y 500 salas:** de 40–57 a 5,6–7,9 ms en p99.
+  - **Con 3.000 por segundo y 1.000 salas:** de 814–822 commits por segundo (colapsa) a 1.005–1.014.
+- **El orden:** en las tres mediciones del lote, la base corrió antes que el resultado en cada par; solo la medición de la fase rota el orden de las variantes.
+- Los datos crudos, los scripts y el entorno: `tools/perf/results/fase3_12/lote7/` y su sección del `README`.
+
+**Revisión de delta** (sobre la versión con la fase, antes de la grilla). Un revisor aparte, de contexto fresco y en modo solo lectura, con la pregunta 6 de §5.4. No encontró ningún hallazgo Alto ni ninguna invariante rota, y los checklists se cumplen.
+- **Medio, en la nota:** daba por cumplido el −30% con 1.000 salas, que es −29,8%, y atribuía a la fase todo el desvío con 500. Corregido arriba.
+- **Bajo, la fase se perdía** después de un período sin cambios o de una poda que borra. El dueño del proyecto eligió la grilla de cada sala (arriba). El test que mostraba el problema, escrito por el revisor, quedó como `a_write_off_the_grid_does_not_move_the_grid_of_a_room`.
+- **Bajo, una regla sin test:** que el punto siguiente cuente desde que se pidió la escritura y no desde que terminó. Desde el final, con el pool lleno, la espera se sumaría dos veces a lo que pierde un crash. Ahora la cubre `the_next_point_counts_from_when_a_write_was_asked_for_not_from_when_the_io_threads_ran_it`.
+- **Notas, aplicadas:**
+  - el margen, que los tests aceptaban entre un cuarto de tick y uno entero, y ahora entre 0,4 y 0,6;
+  - tres comentarios de `room.rs` que decían que el roster se escribía en el tick siguiente;
+  - el apagado que pasa su gracia, en `ARCHITECTURE.md`;
+  - la baja perdida en un crash, en las interacciones;
+  - la fecha y la fase del encabezado de la versión de `INVARIANTES.md` del lote (la 27: la 4.3 y la 4.4 tomaron de la 23 a la 26), y una coma del `ROADMAP.md`;
+  - los números, redondeados en lugar de truncados;
+  - el orden de las corridas;
+  - la explicación del journal de ext4, que no se midió directamente.
+- **Nota, sin test:** que la escritura de una poda que borra mueva el vencimiento al punto siguiente. Deshacerlo solo agrega escrituras.
+
+**Desvíos.**
+- **La medición, en un disco de nube emulado,** no en uno real: lo eligió el dueño del proyecto, y la de un disco real queda para más adelante (la sección del Lote 8).
+- **El criterio cambió al adoptar DS7,** y su primera parte no se cumple (sin límite, en la medición final, −26% de escrituras por commit con 500 salas y −28% con 1.000, contra el 30%): unos 6 puntos son de la fase, que el dueño del proyecto sumó con la primera medición del lote, y el resto, de cuánto varía la base entre mediciones. El dueño del proyecto aceptó el desvío (arriba).
+- **La medición de la decisión tiene 2 rondas,** no 3: la VM se reinició durante la tercera. Las dos coinciden en cada punto, con diferencias mucho mayores que su dispersión.
+- **`actor/lease.rs` no cambia** (el plan lo listaba): el período vive en el actor, donde corre el tick.
+- **El diagnóstico de la decisión** (`roster-every.patch`) no va a `tools/perf/diagnostics/`: la variable del lote hace lo mismo. Queda en los resultados del lote, para repetir esa medición sobre `efb3ec4`.
+- **Las salas de `test_manager`** escriben el roster cada segundo (el período más corto), como los demás tiempos acortados de los tests, para que los que ya esperaban el roster en disco no dependan de la fase de cada sala.
+
+**Tamaño:** unas 40 líneas de producción, en `config.rs` y `actor/room.rs` (85+/11− con docstrings y comentarios), más `tools/perf/cloud_disk.sh` (39), fuera del workspace; los tests, 394+/12−.
 
 ### Lote 8 · Medición final y revisión de cierre · ⬜
 **Objetivo:** cerrar la fase.
@@ -1023,6 +1173,10 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 - **La medición final:** todos los escenarios de §5.2 sobre el último commit de la fase, contra la línea de base del Lote 1, en la misma máquina; una tabla de la fase entera, también en el plan de evaluaciones.
 - **La revisión de cierre** (`docs/METODOLOGIA.md` §6), contra todas las invariantes que tocó la fase, mirando solo lo que la fase cambió y los mecanismos con los que interactúa (§6).
 - **Los documentos:** `ARCHITECTURE.md`, `INVARIANTES.md` con el estado de cada invariante, `ROADMAP.md` y `README.md`.
+
+**Lo que dejó el Lote 7** (su nota **Hecho**):
+- **Un disco de nube real:** el Lote 7 midió en uno emulado (`tools/perf/cloud_disk.sh`: un límite de escrituras por segundo, sin la latencia de un disco de red, y contando los flush). La medición en uno real, que el dueño del proyecto dejó para más adelante, no es parte de este lote; la medición final puede correr E2-disco también en el emulado.
+- **Lo que queda de cada commit en el disco:** unas 2,5 a 3 escrituras y de 1 a 1,5 flush por commit, con un commit por segundo por sala, son del propio commit (`active.wal`, el journal de ext4 y sus flush). Bajarlas (por ejemplo, con un `active.wal` preasignado y `fdatasync`, para que un commit no escriba el journal) sería otra decisión, fuera de este plan.
 
 **Lo que dejó el Lote 6b** (su nota **Hecho**):
 - **La pausa del tick lento:** en E1-actor con 64 pedidos en vuelo, los commits en vuelo esperan juntos, a los 30 s de abrir la sala, el mantenimiento de disco (`SLOW_TICK_PERIOD`): unos 30 ms sobre `cf3e374` y unos 65 ms con el Lote 6b, que escribe el triple de operaciones entre dos ticks. La medición final dice cuánto dura en cada escenario y si pide un lote.
@@ -1068,7 +1222,7 @@ Además de las cinco de `docs/METODOLOGIA.md` §5, paso 4: **6. ¿La medición e
 | 5 | El SSE: apagarlo y el evento `ops` | ✅ |
 | 6 | El catch-up sin copias | ✅ (sin cumplir su criterio: lo sigue el 6b) |
 | 6b | La reserva por tramos | ✅ |
-| 7 | El roster | ⬜ |
+| 7 | El roster | ✅ (sin cumplir la primera parte de su criterio, con el visto bueno del dueño del proyecto) |
 | 8 | Medición final y revisión de cierre | ⬜ |
 
-**Avance:** plan escrito el 1 de Noviembre de 2026, a partir de las Evaluaciones 1 y 2. Lote 1 cerrado el mismo día, adelantado al Lote 0 (el arnés en `main`; la línea de base se mide con el Lote 2). Lote 0 cerrado el mismo día: DS1 a DS8 adoptadas y `INVARIANTES.md` en su versión 12. Lote 2 cerrado el 2 de Noviembre de 2026: el presupuesto de respuestas reserva por lo que se lee, sin `503` del presupuesto con 1.000 salas; con él se midió la línea de base de la fase. Lote 3 cerrado el mismo día: la E/S de archivos de las salas corre en pools acotados, fuera de los workers de Tokio, con los hilos del proceso fijos; los criterios de 1.000 salas no se cumplen en la máquina de medición, saturada de CPU por el SSE de señales. Lote 4 cerrado el mismo día: los commits que esperan en una sala comparten un `fsync`, y una sala en disco pasa de unos 2.200 commits por segundo a 5.600 con 8 pedidos en vuelo y a 8.200 con 64; abre un riesgo, aceptado hasta el Lote 4b (DS9, agregado al plan el 3 de Noviembre de 2026): una sala cuyo grupo corta un corte de luz puede no abrir. Lote 4b cerrado el mismo día: cada registro dice a cuántos bytes de él empieza su grupo, y la apertura trunca un último grupo roto como un último registro roto, sin cambiar el rendimiento; la revisión de delta dejó un riesgo menor en `INVARIANTES.md` §4 (un miembro que predice sus propios registros siguientes). Lote 5 cerrado el mismo día: el SSE se puede apagar (`EventsDisabled`) y trae las operaciones de cada grupo de commits en el evento `ops`, con la encarnación de la sala y dos topes, el del evento y el total de los retenidos; con 1.000 salas, el CPU del servidor por commit baja de 1,16 a 0,47 ms y la propagación en p99, de 5,9 a 1,5 ms. De la revisión de delta: el stream termina cuando vence su token. Lote 6 cerrado el 6 de Noviembre de 2026 (medido el 4): el catch-up y el `/sync` comparten las operaciones del búfer en RAM en lugar de copiarlas, y E1-actor con 64 pedidos en vuelo pasa de 10.900 a 31.300 commits por segundo (con 8, de 42.400 a 60.100); su criterio (con 64, el 80% de 8) no se cumple, con el 52%, por dos costos por operación que no son copia, y el dueño del proyecto aceptó el desvío y agregó el Lote 6b (DS10, la reserva por tramos). Lote 6b cerrado el 8 de Noviembre de 2026: el dueño del proyecto adoptó DS10 al arrancarlo, y la lectura del log que arma una respuesta hace crecer su reserva de a tramos de 256 KiB, en lugar de una vez por operación, y la respuesta no vuelve a medir lo que lleva; E1-actor con 64 pedidos en vuelo pasa de 30.900 a 93.200 commits por segundo (con 8, de 66.800 a 73.200), el 127% de los de 8, y cumple el criterio que el Lote 6 no cumplió. El próximo paso es el Lote 7.
+**Avance:** plan escrito el 1 de Noviembre de 2026, a partir de las Evaluaciones 1 y 2. Lote 1 cerrado el mismo día, adelantado al Lote 0 (el arnés en `main`; la línea de base se mide con el Lote 2). Lote 0 cerrado el mismo día: DS1 a DS8 adoptadas y `INVARIANTES.md` en su versión 12. Lote 2 cerrado el 2 de Noviembre de 2026: el presupuesto de respuestas reserva por lo que se lee, sin `503` del presupuesto con 1.000 salas; con él se midió la línea de base de la fase. Lote 3 cerrado el mismo día: la E/S de archivos de las salas corre en pools acotados, fuera de los workers de Tokio, con los hilos del proceso fijos; los criterios de 1.000 salas no se cumplen en la máquina de medición, saturada de CPU por el SSE de señales. Lote 4 cerrado el mismo día: los commits que esperan en una sala comparten un `fsync`, y una sala en disco pasa de unos 2.200 commits por segundo a 5.600 con 8 pedidos en vuelo y a 8.200 con 64; abre un riesgo, aceptado hasta el Lote 4b (DS9, agregado al plan el 3 de Noviembre de 2026): una sala cuyo grupo corta un corte de luz puede no abrir. Lote 4b cerrado el mismo día: cada registro dice a cuántos bytes de él empieza su grupo, y la apertura trunca un último grupo roto como un último registro roto, sin cambiar el rendimiento; la revisión de delta dejó un riesgo menor en `INVARIANTES.md` §4 (un miembro que predice sus propios registros siguientes). Lote 5 cerrado el mismo día: el SSE se puede apagar (`EventsDisabled`) y trae las operaciones de cada grupo de commits en el evento `ops`, con la encarnación de la sala y dos topes, el del evento y el total de los retenidos; con 1.000 salas, el CPU del servidor por commit baja de 1,16 a 0,47 ms y la propagación en p99, de 5,9 a 1,5 ms. De la revisión de delta: el stream termina cuando vence su token. Lote 6 cerrado el 6 de Noviembre de 2026 (medido el 4): el catch-up y el `/sync` comparten las operaciones del búfer en RAM en lugar de copiarlas, y E1-actor con 64 pedidos en vuelo pasa de 10.900 a 31.300 commits por segundo (con 8, de 42.400 a 60.100); su criterio (con 64, el 80% de 8) no se cumple, con el 52%, por dos costos por operación que no son copia, y el dueño del proyecto aceptó el desvío y agregó el Lote 6b (DS10, la reserva por tramos). Lote 6b cerrado el 8 de Noviembre de 2026: el dueño del proyecto adoptó DS10 al arrancarlo, y la lectura del log que arma una respuesta hace crecer su reserva de a tramos de 256 KiB, en lugar de una vez por operación, y la respuesta no vuelve a medir lo que lleva; E1-actor con 64 pedidos en vuelo pasa de 30.900 a 93.200 commits por segundo (con 8, de 66.800 a 73.200), el 127% de los de 8, y cumple el criterio que el Lote 6 no cumplió. Lote 7 cerrado el 11 de Noviembre de 2026: medido en un disco de nube emulado (con un límite de escrituras por segundo), el roster resultó el 30% de las unas 4 escrituras al disco de cada commit, y con 3.000 por segundo decidía si 1.000 salas aguantaban; el dueño del proyecto adoptó DS7 con N = 10 s, otro criterio y una grilla por sala, y el roster de cada sala se escribe como mucho cada 10 s, en los puntos de su grilla: con 3.000 escrituras por segundo, 1.000 salas pasan de colapsar (el 84% de sus commits, 17 s en p99) a sostenerlos todos, y 500, de 43–54 a 4 ms en p99; sin límite, las escrituras por commit bajan un 28% con 1.000 salas y un 26% con 500, debajo del 30% que pedía su criterio (la fase de la grilla cuesta unos 6 puntos), con el visto bueno del dueño del proyecto. El próximo paso es el Lote 8.

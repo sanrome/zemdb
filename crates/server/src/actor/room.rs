@@ -32,8 +32,8 @@ use crate::relay::{LogBounds, SnapshotRelay, Uploader};
 use crate::response_budget::{no_room, InflightBudget, Reservation, RESPONSE_OVERHEAD};
 
 /// Period of the fast maintenance tick, which only touches memory (and the roster file when
-/// it changed): lease timeouts and state transitions, snapshot signals, roster persistence and
-/// the inactivity check.
+/// it changed, at most once every `roster_persist_secs`): lease timeouts and state
+/// transitions, snapshot signals, roster persistence and the inactivity check.
 const FAST_TICK_PERIOD: Duration = Duration::from_secs(1);
 
 /// Period of the slow maintenance tick, the disk maintenance of the log: compression of aged
@@ -134,6 +134,14 @@ pub struct RoomActor {
     /// cannot be restored, so it is not usable and a new upload replaces it.
     unrestorable_through: Option<SequenceNumber>,
     timings: ActorTimings,
+    /// The period of the room's roster grid (`roster_persist_secs`).
+    roster_persist_period: Duration,
+    /// The first point of the room's roster grid: when the actor opened plus a point of the
+    /// first period that the room's incarnation gives. The others follow every period.
+    roster_grid_start: Instant,
+    /// From when the fast tick may write a changed roster: the first point of the grid after
+    /// the last write (before the first write, the grid's first point).
+    roster_due_at: Instant,
 }
 
 impl RoomActor {
@@ -186,6 +194,9 @@ impl RoomActor {
         let demand_ttl = lifecycle_policy.snapshot_demand_ttl;
         let snapshot_demand = SnapshotDemand::new(demand_ttl, timings.designation_timeout);
 
+        let roster_persist_period = Duration::from_secs(config.roster_persist_secs);
+        let roster_grid_start = Instant::now() + roster_phase(incarnation, roster_persist_period);
+
         let mut actor = Self {
             room_id: room_id.clone(),
             incarnation,
@@ -214,6 +225,9 @@ impl RoomActor {
             announced_snapshot: None,
             unrestorable_through: None,
             timings,
+            roster_persist_period,
+            roster_grid_start,
+            roster_due_at: roster_grid_start,
         };
         // A snapshot that was already usable before this actor started is not news.
         actor.announced_snapshot = actor.usable_snapshot_seq();
@@ -737,8 +751,8 @@ impl RoomActor {
         };
 
         // Refresh the client's lease, record the cursor reported with the commit (already
-        // validated against the head) and make the client Connected. Persisted on the next
-        // maintenance tick.
+        // validated against the head) and make the client Connected. Persisted by the fast
+        // tick, within the roster's period.
         self.observe(client_id, Some(last_ack_seq));
 
         // Catch-up for 1-RTT synchronization. A client that was up to date gets the operation
@@ -883,7 +897,8 @@ impl RoomActor {
         }
 
         // Advance the cursor, refresh the lease and make the client Connected.
-        // The cursor is persisted on the next maintenance tick.
+        // The cursor is persisted by the fast tick within the roster's period, or before a
+        // prune that deletes.
         self.observe(client_id, Some(ack_seq));
 
         self.prune_to_retention_floor().await;
@@ -988,9 +1003,9 @@ impl RoomActor {
 
     /// Some client needs a snapshot: unless a usable one exists, turns the snapshot demand on
     /// (or renews it) and makes sure a client is designated to upload one. The renewal is
-    /// persisted with the roster on the next maintenance tick, but only once the stored
-    /// renewal time is [`persistence_granularity`] old, so a client waiting for a snapshot
-    /// does not cause a roster write per heartbeat.
+    /// persisted with the roster by the fast tick, within the roster's period, but only once
+    /// the stored renewal time is [`persistence_granularity`] old, so a client waiting for a
+    /// snapshot does not cause a roster write per heartbeat.
     fn request_snapshot(&mut self) {
         if self.usable_snapshot_seq().is_some() {
             return;
@@ -1146,10 +1161,28 @@ impl RoomActor {
         let Some((path, json)) = self.lease_tracker.unsaved(with_activity)? else {
             return Ok(());
         };
+        let started = Instant::now();
         self.log_io(move |_| durable::write_checked(&path, &json))
             .await?;
         self.lease_tracker.saved();
+        self.roster_due_at = self.next_roster_point(started);
         Ok(())
+    }
+
+    /// The first point of the roster grid more than half a tick after `instant`, when a write
+    /// started: the next one the fast tick may write the roster at. Half a tick, because a tick
+    /// that early writes for a point ([`roster_due`](Self::roster_due)). A write outside the
+    /// grid (a prune's, or one after the roster stayed unchanged for a period) does not move
+    /// the grid, so rooms whose phases differ keep writing on different ticks.
+    fn next_roster_point(&self, instant: Instant) -> Instant {
+        let start = self.roster_grid_start;
+        let after = instant + self.timings.fast_tick / 2;
+        let Some(since) = after.checked_duration_since(start) else {
+            return start;
+        };
+        let period = self.roster_persist_period;
+        let points = since.as_nanos() / period.as_nanos().max(1) + 1;
+        start + period * u32::try_from(points).unwrap_or(u32::MAX)
     }
 
     /// The log, between its operations on the file I/O threads.
@@ -1214,7 +1247,8 @@ impl RoomActor {
         .await
     }
 
-    /// The fast tick: memory-only maintenance, plus writing the roster if it changed.
+    /// The fast tick: memory-only maintenance, plus writing the roster if it changed, at most
+    /// once per point of the room's roster grid.
     async fn run_fast_maintenance(&mut self) {
         // Connected/Bootstrapping -> Disconnected -> Dormant.
         let tail_seq = self.log().tail_seq();
@@ -1226,8 +1260,19 @@ impl RoomActor {
         );
 
         self.update_snapshot_signals();
-        // Cursor and lease changes accumulated since the previous tick.
-        self.persist_roster().await;
+        // Cursor and lease changes accumulated since the roster was last written, which wait
+        // for the next point of the room's grid after that write; a prune that deletes and the
+        // stop write them anyway.
+        if self.roster_due() {
+            self.persist_roster().await;
+        }
+    }
+
+    /// Whether the fast tick writes a changed roster: once `roster_due_at` came. A tick runs a
+    /// little earlier or later than a point of the grid, so half a tick of slack keeps the
+    /// writes on the tick of each point (with a period of one tick, on every tick).
+    fn roster_due(&self) -> bool {
+        Instant::now() + self.timings.fast_tick / 2 >= self.roster_due_at
     }
 
     /// The slow tick: disk maintenance of the log, served from its segment index.
@@ -1381,6 +1426,14 @@ const LOG_IN_PLACE: &str = "the log is back after every file operation";
 /// Directory of the room `room_id` under the server's `data_dir`.
 pub(crate) fn room_dir(data_dir: &Path, room_id: &RoomId) -> PathBuf {
     data_dir.join("rooms").join(room_id.as_str())
+}
+
+/// The point of the first period where the roster grid of a room's actor starts: from its
+/// incarnation, which is random, so that rooms that open together (after a restart) do not
+/// write their rosters on the same tick, period after period.
+fn roster_phase(incarnation: u128, period: Duration) -> Duration {
+    let period_ms = u64::try_from(period.as_millis()).unwrap_or(u64::MAX);
+    Duration::from_millis((incarnation as u64).checked_rem(period_ms).unwrap_or(0))
 }
 
 /// Text of a caught panic payload, when it is a string.

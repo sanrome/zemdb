@@ -10,6 +10,7 @@ El generador de carga y los scripts de las [evaluaciones de performance](../../d
 | `src/rooms.rs` | El modo `rooms`, de la Evaluación 2: muchas salas, con clientes que escriben a ritmo humano y se ponen al día como el SDK (SSE, `/sync`, `Ack`, heartbeat). |
 | `run_e1.sh`, `profile_e1.sh`, `summarize.sh` | Una medición de la Evaluación 1 (una línea JSON por corrida), su perfil de CPU con `perf`, y la mediana de las repeticiones. |
 | `run_e2.sh`, `e2_all.sh`, `e2f_all.sh`, `summarize_e2.sh` | Una configuración de la Evaluación 2 contra un servidor nuevo, todas las mediciones de §4.4, las de los modos de frescura (§4.8), y la mediana de las repeticiones. |
+| `cloud_disk.sh` | Un disco de nube emulado, con un límite de escrituras por segundo, para E2-disco (Lote 7 de la Fase 3.12): ver abajo. |
 | `results/` | Los datos crudos de las evaluaciones. En `e1-block-in-place-*.jsonl` y `e1-mediciones.jsonl`, la lista de commits lentos de cada corrida está resumida: cuántos hubo y los 20 más largos. En `results/fase3_12/`, los de la línea de base de la Fase 3.12 y los de cada lote. |
 | `diagnostics/` | Los cambios de diagnóstico del servidor, como parches (DP1): no están en el código de `main`. |
 
@@ -20,6 +21,7 @@ El generador de carga y los scripts de las [evaluaciones de performance](../../d
 - **El límite de archivos abiertos por proceso** (`ulimit -n`) acota cuántos streams SSE se pueden abrir: uno por sala y uno por stream. Con 20.000, alcanza para unas 1.750 salas de 10 clientes.
 - **`perf`,** para los perfiles: en Ubuntu, `apt-get install linux-tools-generic`; `profile_e1.sh` lo busca en `PERF` o en el camino de la versión 6.8.
 - **tmpfs** en `/dev/shm`, para medir sin el costo del disco; y un directorio en el disco real (`DISK_ROOT`).
+- **Un disco de nube emulado,** cuando la máquina no tiene uno con un límite de operaciones por segundo (como root, con cgroup v1): `tools/perf/cloud_disk.sh setup IMG /mnt/zemdb-cloud` arma un archivo `IMG` con ext4 en dos loop devices apilados y lo monta; `cloud_disk.sh limit IMG 3000` pone el límite de escrituras por segundo (0 lo saca), que cuenta cada escritura y cada flush del sistema de archivos, como un disco; y las corridas van con `DISK_ROOT=/mnt/zemdb-cloud/e2` y `--disk $(tools/perf/cloud_disk.sh disk IMG)`. No emula la latencia de un disco de red, y un reinicio de la máquina pierde los loop devices.
 
 ## Compilar
 
