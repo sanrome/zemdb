@@ -8,9 +8,7 @@ mod common;
 
 use bytes::Bytes;
 use common::*;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering::SeqCst;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::Instant;
 use zemdb_client::{
@@ -376,23 +374,28 @@ async fn the_worker_tries_a_heartbeat_again_after_a_delay_that_doubles_and_start
     };
     let client = client_with(&transport, config).await;
     open_room(&client, &room_id).await.unwrap();
-    let failing = Arc::new(AtomicUsize::new(0));
+    // How many heartbeats fail from now on.
+    let failing = Arc::new(Mutex::new(0));
     let fails = Arc::clone(&failing);
     transport.answer(move |message| {
-        let failed = fails.fetch_update(SeqCst, SeqCst, |left| left.checked_sub(1));
-        match (message.kind(), failed) {
-            (Heartbeat, Ok(_)) => {
+        if message.kind() != Heartbeat {
+            return None;
+        }
+        let mut left = fails.lock().unwrap();
+        match *left {
+            0 => None,
+            _ => {
+                *left -= 1;
                 let (correlation_id, room_id) = request(message);
                 let unavailable = error_reply(correlation_id, &room_id, ErrorCode::Unavailable);
                 Some(Ok(unavailable))
             }
-            _ => None,
         }
     });
 
     // Twelve heartbeats fail: each is sent again within a delay that doubles from the base up to
     // the longest, and the first that succeeds goes back to the interval.
-    failing.store(12, SeqCst);
+    *failing.lock().unwrap() = 12;
     client.start_worker(room_id.clone()).await.unwrap();
     // The first within an interval, the retries within 79 s, and two more intervals.
     tokio::time::sleep(interval * 4).await;
@@ -410,7 +413,7 @@ async fn the_worker_tries_a_heartbeat_again_after_a_delay_that_doubles_and_start
     // After a heartbeat that succeeded, the delay starts again from the base.
     for _ in 0..4 {
         let before = heartbeats(&transport, &room_id).len();
-        failing.store(1, SeqCst);
+        *failing.lock().unwrap() = 1;
         tokio::time::sleep(interval + base * 2).await;
         let sent = heartbeats(&transport, &room_id);
         let retried = sent[before + 1] - sent[before];
