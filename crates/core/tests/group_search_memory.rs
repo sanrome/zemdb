@@ -10,6 +10,8 @@
 //! environment variable), so that no case reuses memory that another one freed and the process
 //! still holds.
 
+#![cfg(target_os = "linux")]
+
 use std::io::Cursor;
 use std::process::Command;
 
@@ -205,7 +207,6 @@ fn run_case(index: usize) {
 /// group (the search goes on after it and finds nothing else: a torn write). The last one holds
 /// two frames of the damaged group, the second larger than the first: growing the buffer it reads
 /// payloads into must not hold the first payload and the second at once.
-#[cfg(target_os = "linux")]
 #[test]
 fn the_search_after_a_damaged_group_holds_at_most_a_frame_whatever_the_frames_after_the_damage_hold(
 ) {
