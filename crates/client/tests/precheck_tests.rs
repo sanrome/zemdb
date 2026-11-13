@@ -442,7 +442,7 @@ async fn a_write_whose_storage_room_closes_during_its_precheck_is_room_closed() 
     );
 
     // The precheck of the insert of `red` waits while the catch-up of the insert of `blue` fails
-    // to apply, and its storage room reopens (DC21): it reaches the storage room closed.
+    // to apply, and its storage room reopens: it reaches the storage room closed.
     let mut checking = storage.hold_next("check_operation");
     let held = tags.clone();
     let prechecked = tokio::spawn(async move { held.insert(&red).await });

@@ -1534,7 +1534,7 @@ async fn a_heartbeat_takes_the_head_the_schema_and_the_snapshot_its_ack_announce
 #[tokio::test(start_paused = true)]
 async fn a_replica_behind_a_cursor_the_server_holds_ahead_registers_and_gets_a_snapshot() {
     // The ack of the head 9 reaches the server once its memory room opened again at 0, and
-    // registered with the cursor 0: it leaves the server a cursor ahead of the replica (INV-K5).
+    // registered with the cursor 0: it leaves the server a cursor ahead of the replica.
     let server = TestServer::pruning();
     let room_id = server.create_room("room-a").await;
     let ops = server.commit(&room_id, 1..=9).await;

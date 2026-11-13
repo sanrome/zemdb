@@ -2554,10 +2554,10 @@ impl Local {
     /// at it: one that moved past it, or that is no longer of `epoch`, got a delayed reply. The
     /// replica registers again (one that fails closed does not: `register` refuses), and
     /// `Registered` tells whether it waits for a snapshot; the registration leaves the server its
-    /// cursor, which may have been ahead (INV-K5), so that the server asks for one. Once a
-    /// registration of the call (`again`) found it inside the log, it comes from a gap of the log
-    /// (INV-Y2): the replica stays registered and waits for the snapshot above it, which the
-    /// server asks for. Returns whether the replica registers again.
+    /// cursor, which may have been ahead, so that the server asks for one. Once a registration of
+    /// the call (`again`) found it inside the log, it comes from a gap of the log: the replica
+    /// stays registered and waits for the snapshot above it, which the server asks for. Returns
+    /// whether the replica registers again.
     async fn behind(
         self,
         room: Arc<Room>,

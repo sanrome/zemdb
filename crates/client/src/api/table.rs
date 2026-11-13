@@ -187,9 +187,9 @@ impl TableHandle {
         Ok((epoch, write?))
     }
 
-    /// Writes `draft`, planned in `epoch`, in the order of DC32 from its step 5: with its
-    /// encrypted columns encrypted, if the server takes it from the client, if it fits and, with
-    /// the precheck, if the replica would take it; once, to the replica of that epoch.
+    /// Writes `draft`, planned in `epoch`, in the order of a write from its encryption on: with
+    /// its encrypted columns encrypted, if the server takes it from the client, if it fits and,
+    /// with the precheck, if the replica would take it; once, to the replica of that epoch.
     async fn write(&self, epoch: u64, draft: Draft) -> Result<(), ClientError> {
         let (client, room_id) = (self.room.client(), self.room.room_id());
         let core = client.core();
@@ -217,7 +217,7 @@ impl TableHandle {
         op
     }
 
-    /// The precheck of `op`, planned in `epoch` (DC33): what the replica would decide on it in
+    /// The precheck of `op`, planned in `epoch`: what the replica would decide on it in
     /// the state its storage room publishes, without the applier, as [`prechecked`] takes it.
     /// `RoomClosed` if, once it checked, the replica is no longer of that epoch, as after a read.
     /// A replica that fails closed, then, leaves it without a decision: its state no longer

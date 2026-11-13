@@ -13,9 +13,9 @@ use super::table::{check_value, invalid, primary_key, table};
 use super::{Key, Row};
 use crate::ClientError;
 
-/// What the writes of a client are planned with against the schema of the replica (steps 2 and 3
-/// of DC32): the owner of the client, which fills the owner column of each write (DC33), and the
-/// timestamp of the write. A write is planned as a [`Draft`], with the values of its encrypted
+/// What the writes of a client are planned with against the schema of the replica, by name: the
+/// owner of the client, which fills the owner column of each write, and the timestamp of the
+/// write. A write is planned as a [`Draft`], with the values of its encrypted
 /// columns in the clear.
 pub(super) struct Writer {
     /// The owner of the client, as the owner column holds it.
@@ -159,9 +159,9 @@ impl Writer {
     }
 }
 
-/// `op`, the operation that `client` sends, if the server takes it from the client (step 6 of
-/// DC32): valid for `schema`, with a ciphertext in each encrypted column it carries, and with the
-/// owner of the client if its table has one (INV-A5).
+/// `op`, the operation that `client` sends, if the server takes it from the client: valid for
+/// `schema`, with a ciphertext in each encrypted column it carries, and with the owner of the
+/// client if its table has one, as the server checks them.
 pub(super) fn checked(
     schema: &Schema,
     op: Operation,
@@ -224,7 +224,7 @@ pub(super) fn bounded<'a>(values: impl IntoIterator<Item = &'a Value>) -> Result
     Ok(())
 }
 
-/// What the precheck of a write decides (DC33) from what the storage room `room_id` checked of
+/// What the precheck of a write decides from what the storage room `room_id` checked of
 /// its operation: nothing if the replica would take it, and `PrecheckFailed` with the reason if
 /// it would reject it. A storage room that does not take the operation (`TableNotFound` or
 /// `SchemaValidation`) is `InvalidOperation`: a guard, since the storage room takes a new schema
@@ -232,7 +232,7 @@ pub(super) fn bounded<'a>(values: impl IntoIterator<Item = &'a Value>) -> Result
 /// reopening after an error) is `RoomClosed`. Any other error leaves the precheck without a
 /// decision, and the write goes on: an advice never stops a write for a fault of the storage,
 /// which the write meets on its own (an error of the `apply_batch` of its catch-up reopens the
-/// storage room, DC21).
+/// storage room).
 pub(super) fn prechecked(
     checked: Result<Option<RejectReason>, StorageError>,
     room_id: &RoomId,

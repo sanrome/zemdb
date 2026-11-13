@@ -167,7 +167,7 @@ fn sealed(values: &[Value], secret: &[u8]) {
     }
 }
 
-/// The additional data of a cell, in the encoding that DC34 fixes, as a member with the key
+/// The additional data of a cell, in the encoding that the facade fixes, as a member with the key
 /// builds them: their version, and then the room id, the table id, the values of the primary key
 /// and the position of the column, in the encoding of the protocol.
 fn additional_data(room_id: &RoomId, table_id: u16, pk: &[Value], column_idx: u16) -> Vec<u8> {

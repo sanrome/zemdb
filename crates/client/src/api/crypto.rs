@@ -1,4 +1,4 @@
-//! The encrypted columns of the facade (DC34): a write encrypts the value of each encrypted
+//! The encrypted columns of the facade: a write encrypts the value of each encrypted
 //! column that it carries with the `CryptoEngine` of the application, `NULL` too, with the
 //! additional data of its cell, and a read decrypts it.
 
@@ -30,7 +30,7 @@ pub(super) struct Cell<'a> {
 }
 
 impl Cell<'_> {
-    /// The additional data of the cell (INV-K9): their version, and then the room id, the table
+    /// The additional data of the cell: their version, and then the room id, the table
     /// id, the values of the primary key and the position of the column, in the encoding of the
     /// protocol, where a value has one encoding and each field holds its length, so two cells never
     /// share them. A `Float` of the key goes as `Value` compares it, with `-0.0` as `0.0`, so that
@@ -52,9 +52,8 @@ fn canonical(value: &Value) -> Value {
     }
 }
 
-/// A write planned against the schema of the replica, by name and with its owner (steps 2 and 3
-/// of DC32), with the values of its encrypted columns still in the clear, which
-/// [`seal`](Self::seal) encrypts (step 5).
+/// A write planned against the schema of the replica, by name and with its owner, with the
+/// values of its encrypted columns still in the clear, which [`seal`](Self::seal) encrypts.
 #[derive(Debug)]
 pub(super) struct Draft {
     op: Operation,
