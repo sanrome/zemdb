@@ -659,9 +659,22 @@ async fn the_head_seen_comes_from_every_reply_of_the_epoch() {
         let ops = server.commit(&room_id, 1..=3).await;
         // A reply reports the head 9, above the head of the server.
         match source {
-            "sync" => answer_next(&transport, Sync, move |correlation_id, room_id| {
-                batch_to_nine(correlation_id, room_id, ops)
-            }),
+            // The next batch of the sync is refused: one with the real head, below 9, would
+            // register the replica again, which takes the head of `Registered` as the head seen.
+            "sync" => {
+                let mut batches = 0;
+                transport.answer(move |message| {
+                    if message.kind() != Sync {
+                        return None;
+                    }
+                    let (correlation_id, room_id) = request(message);
+                    batches += 1;
+                    Some(Ok(match batches {
+                        1 => batch_to_nine(correlation_id, &room_id, ops.clone()),
+                        _ => error_reply(correlation_id, &room_id, ErrorCode::Unavailable),
+                    }))
+                });
+            }
             "ack" => answer_next(
                 &transport,
                 ClientMessageKind::Ack,
@@ -677,7 +690,11 @@ async fn the_head_seen_comes_from_every_reply_of_the_epoch() {
             ),
             _ => {}
         }
-        client.sync(room_id.clone()).await.unwrap();
+        let synced = client.sync(room_id.clone()).await;
+        match source {
+            "sync" => assert!(matches!(synced, Err(ClientError::Network(_))), "{synced:?}"),
+            _ => synced.unwrap(),
+        }
         if source == "commit" {
             // The ack of a write that waits for its sequence, and is dropped.
             transport.answer_next(Commit, |message| commit_ack(message, 9, &[], true, TASKS));

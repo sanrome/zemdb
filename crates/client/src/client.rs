@@ -19,7 +19,7 @@ use zemdb_storage::{StorageEngine, StorageError};
 
 use crate::token::issued_to;
 use crate::watch::{Change, Watched, Watches};
-use crate::worker::Worker;
+use crate::worker::{Ended, Worker};
 use crate::{
     ClientConfig, ClientError, Freshness, MetadataStore, RoomMetadata, TokenProvider,
     TransportClient, WorkerStatus,
@@ -106,6 +106,9 @@ struct Room {
     state: Mutex<State>,
     /// The worker of the room, if it started one: running, or stopped by one of its steps.
     worker: Mutex<Option<Worker>>,
+    /// The end of the last worker that a caller stopped: a caller that stops the worker while
+    /// another stops it waits for it too.
+    stopping: Mutex<Option<Ended>>,
 }
 
 #[derive(Default)]
@@ -155,6 +158,9 @@ struct OpenReplica {
     /// The metadata that describe all of its data.
     metadata: RoomMetadata,
     registered: bool,
+    /// The highest head that the server took as the cursor of the client: that of the
+    /// registration that registered it, or of an acknowledgement that the server confirmed.
+    acknowledged: SequenceNumber,
     /// Behind the log of the server, it waits for a snapshot: with whether a reply announced a
     /// usable one.
     awaits_snapshot: Option<bool>,
@@ -176,6 +182,7 @@ impl OpenReplica {
         Self {
             metadata,
             registered,
+            acknowledged: SequenceNumber::new(0),
             awaits_snapshot: None,
             dropped: None,
             oversized: false,
@@ -400,6 +407,48 @@ impl Room {
         }
     }
 
+    /// Takes `head`, a head of the server that a reply to a request of `epoch` reported below
+    /// the highest that the replies before the request reported, as the highest it saw: one of
+    /// those reported a head beyond the server's, and the registration that follows gives the
+    /// head of the server again. The writes in flight keep the head they saw.
+    fn saw_below(&self, epoch: u64, head: SequenceNumber) {
+        let mut state = self.state();
+        if state.epoch == epoch {
+            state.writes.head_seen = head;
+        }
+    }
+
+    /// The highest head of the server that the replies of `epoch` reported, if it is still the
+    /// epoch of the replica.
+    fn head_seen(&self, epoch: u64) -> SequenceNumber {
+        let state = self.state();
+        match state.epoch == epoch {
+            true => state.writes.head_seen,
+            false => SequenceNumber::new(0),
+        }
+    }
+
+    /// Takes the confirmation of the acknowledgement of `head` by the replica of `epoch`.
+    fn confirmed(&self, epoch: u64, head: SequenceNumber) {
+        self.update(epoch, |open| {
+            open.acknowledged = open.acknowledged.max(head)
+        });
+    }
+
+    /// Leaves the replica to register again, with its cursor, at its next request.
+    fn unregister(&self) {
+        if let Replica::Open(open) = &mut self.state().replica {
+            open.registered = false;
+        }
+    }
+
+    /// Whether the replica of `epoch` waits for a snapshot that no reply announced.
+    fn waits_for_none(&self, epoch: u64) -> bool {
+        let state = self.state();
+        let waits = |open: &OpenReplica| open.awaits_snapshot == Some(false);
+        matches!(&state.replica, Replica::Open(open) if state.epoch == epoch && waits(open))
+    }
+
     /// Whether a reply that announces the version `version` of the schema `schema_id` changes the
     /// schema of the replica.
     fn changes(&self, (schema_id, version): &(SchemaId, u64)) -> bool {
@@ -480,11 +529,24 @@ impl Room {
         self.worker.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Stops the worker of the room, if it has one, and waits until its tasks ended.
+    fn stopping(&self) -> MutexGuard<'_, Option<Ended>> {
+        self.stopping.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Stops the worker of the room, if it has one, and waits until its tasks ended, with its
+    /// last acknowledgement; also until those of a worker that another caller stops ended, even
+    /// if that caller was cut.
     async fn stop_worker(&self) {
-        let worker = self.worker().take();
-        if let Some(worker) = worker {
-            worker.stop().await;
+        let ended = {
+            let mut worker = self.worker();
+            let mut stopping = self.stopping();
+            if let Some(worker) = worker.take() {
+                *stopping = Some(worker.stop());
+            }
+            stopping.clone()
+        };
+        if let Some(ended) = ended {
+            let _ = ended.await;
         }
     }
 
@@ -662,11 +724,26 @@ struct Beat {
     behind: bool,
 }
 
+/// Which acknowledgement of the head of the replica the worker sends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Acking {
+    /// After a heartbeat: if the head passed the last one that the server took as the cursor.
+    Moved,
+    /// After a heartbeat: also if the head did not move, unless the replica waits for a
+    /// snapshot, since the server may have taken a lower cursor since (a registration that
+    /// reached it late, or a roster it lost).
+    Again,
+    /// Once the worker stopped: if the head moved, one request, which registers nothing.
+    Last,
+}
+
 /// What the ack of a heartbeat of the worker asks of it: a transfer, and whether to sync, since
-/// the head of the server passed that of the replica, which does not wait for a snapshot.
+/// the head of the server passed that of the replica, which does not wait for a snapshot; and
+/// whether the replica waits for a snapshot that no reply announced.
 pub(crate) struct Asked {
     pub(crate) transfer: Option<Transfer>,
     pub(crate) behind: bool,
+    pub(crate) waits: bool,
 }
 
 /// What the next request of a replica presents, read under its applier, so that no change of
@@ -676,6 +753,11 @@ struct Request {
     /// The head and the incarnation of an open replica.
     cursor: Option<(SequenceNumber, u128)>,
     registered: bool,
+    /// The head that the server last took as the cursor of the client.
+    acknowledged: SequenceNumber,
+    /// The highest head of the server that the replies of the epoch reported before the request:
+    /// the reply to it does not report a lower one, unless the server lost sequences.
+    head_seen: SequenceNumber,
     awaits_snapshot: Option<bool>,
     failed_closed: bool,
 }
@@ -838,6 +920,7 @@ impl Client {
                     renewal: tokio::sync::Mutex::default(),
                     state: Mutex::default(),
                     worker: Mutex::default(),
+                    stopping: Mutex::default(),
                 })
             });
             Arc::clone(room)
@@ -1180,8 +1263,11 @@ impl Client {
     /// request, whose operations follow the cursor of the request in order, up to its head at
     /// most and, unless it has more, reaching it (with more, it brings some); and a confirmation
     /// of the head acknowledged. Any other reply, or none, is `Network`. A head below the cursor
-    /// of the request, `InvalidSequence` and `ClientNotRegistered` register again, with the
-    /// cursor, and the sync goes on; a second time in a sync is `Network`. `BehindCompaction`,
+    /// of the request, or below the highest head that the replies before the request reported,
+    /// `InvalidSequence` and `ClientNotRegistered` register again, with the cursor, and the sync
+    /// goes on; a second time in a sync is `Network`. After a head below the highest one
+    /// reported, which a reply reported beyond the head of the server, the highest is that head,
+    /// and then that of `Registered`. `BehindCompaction`,
     /// or `Registered` behind the log, leave the replica waiting for a snapshot: it downloads
     /// and installs the one that `Registered` or a heartbeat announced, as
     /// [`heartbeat`](Self::heartbeat) says, and the sync goes on from it. Without one announced,
@@ -1273,6 +1359,12 @@ impl Client {
                     "Invalid batch in reply to a sync".to_string(),
                 ));
             }
+            // A reply before reported a head beyond the server's.
+            if head_seq < request.head_seen {
+                room.saw_below(epoch, head_seq);
+                room.register_again(epoch, &mut again)?;
+                continue;
+            }
             room.saw(epoch, head_seq);
             let applied = move |local: Local, room| local.apply(room, epoch, ops, schema, again);
             let head = match self.change(&room, applied).await {
@@ -1295,30 +1387,91 @@ impl Client {
             if !ack {
                 return Ok(wanted);
             }
+            let seen = room.head_seen(epoch);
+            if self.acknowledge(&room, epoch, head, seen, again).await? {
+                return Ok(wanted);
+            }
+            room.register_again(epoch, &mut again)?;
+        }
+    }
 
-            let correlation_id = self.correlation_id();
-            let message = ClientMessage::Ack {
-                correlation_id,
-                room_id: room.id.clone(),
-                client_id: self.client_id.clone(),
-                ack_seq: head,
+    /// Acknowledges `head`, which the replica of `epoch` of `room` reached, when the highest head
+    /// of the server that it saw is `seen`: whether the server confirmed it, with a head not
+    /// below either. A confirmation with a lower head, or a refusal that [`refused`](Self::refused)
+    /// takes, asks to register again (`false`), once a registration of the call (`again`) or not.
+    async fn acknowledge(
+        &self,
+        room: &Arc<Room>,
+        epoch: u64,
+        head: SequenceNumber,
+        seen: SequenceNumber,
+        again: bool,
+    ) -> Result<bool, ClientError> {
+        let correlation_id = self.correlation_id();
+        let message = ClientMessage::Ack {
+            correlation_id,
+            room_id: room.id.clone(),
+            client_id: self.client_id.clone(),
+            ack_seq: head,
+        };
+        match self.send(room, correlation_id, &message).await? {
+            ServerMessage::AckConfirmed {
+                correlation_id: reply_id,
+                room_id,
+                ack_seq,
+                head_seq,
+            } if reply_id == correlation_id && room_id == room.id && ack_seq == head => {
+                // The server may have lost sequences that the replica applied, or a reply before
+                // reported a head beyond it.
+                match head_seq < seen {
+                    true => room.saw_below(epoch, head_seq),
+                    false => room.saw(epoch, head_seq),
+                }
+                if head_seq >= head.max(seen) {
+                    room.confirmed(epoch, head);
+                    return Ok(true);
+                }
+            }
+            reply => {
+                self.refused(room, epoch, head, correlation_id, reply, again)
+                    .await?
+            }
+        }
+        Ok(false)
+    }
+
+    /// Acknowledges the head of the replica of `room_id` for its worker, as `acking` says, if it
+    /// is open, as [`sync`](Self::sync) does. A replica that is not registered, or whose
+    /// acknowledgement gets a reply that asks to register again, registers, with its cursor,
+    /// which presents the head; unless the acknowledgement is the last: then it sends one
+    /// request at most, and registers nothing.
+    pub(crate) async fn worker_ack(
+        &self,
+        room_id: &RoomId,
+        acking: Acking,
+    ) -> Result<(), ClientError> {
+        let room = self.room(room_id)?;
+        let mut again = false;
+        loop {
+            let request = self.change(&room, Local::request).await?;
+            let anyway = acking == Acking::Again && request.awaits_snapshot.is_none();
+            let Some((head, _)) =
+                (request.cursor).filter(|(head, _)| anyway || *head > request.acknowledged)
+            else {
+                return Ok(());
             };
-            match self.send(&room, correlation_id, &message).await? {
-                ServerMessage::AckConfirmed {
-                    correlation_id: reply_id,
-                    room_id,
-                    ack_seq,
-                    head_seq,
-                } if reply_id == correlation_id && room_id == room.id && ack_seq == head => {
-                    room.saw(epoch, head_seq);
-                    if head_seq >= head {
-                        return Ok(wanted);
-                    }
+            if !request.registered {
+                if acking == Acking::Last {
+                    return Ok(());
                 }
-                reply => {
-                    self.refused(&room, epoch, head, correlation_id, reply, again)
-                        .await?
-                }
+                let _registration = room.registration.lock().await;
+                self.register(&room).await?;
+                continue;
+            }
+            let epoch = request.epoch;
+            let acknowledged = self.acknowledge(&room, epoch, head, request.head_seen, again);
+            if acknowledged.await? {
+                return Ok(());
             }
             room.register_again(epoch, &mut again)?;
         }
@@ -1564,9 +1717,10 @@ impl Client {
     ///
     /// A reply is checked before it is used: a `HeartbeatAck` with the correlation id and the
     /// room of the request. Any other reply, or none, is `Network`. `ClientNotRegistered`, a head
-    /// below that of the replica when the heartbeat was sent, and an ack that announces another
-    /// schema, or a later version of its own, register the replica again with its cursor, and
-    /// the heartbeat is sent again; a second time in a heartbeat is `Network`.
+    /// below that of the replica when the heartbeat was sent, or below the highest head that the
+    /// replies before it reported (as [`sync`](Self::sync) says), and an ack that announces
+    /// another schema, or a later version of its own, register the replica again with its
+    /// cursor, and the heartbeat is sent again; a second time in a heartbeat is `Network`.
     ///
     /// A replica that waits for a snapshot takes whether the ack announces a usable one, and
     /// downloads the one it announces by chunks of 4 MiB, each checked against the first. One
@@ -1645,8 +1799,12 @@ impl Client {
                     continue;
                 }
             };
-            // The server may have lost sequences that the replica applied.
-            if head_seq < head {
+            // The server may have lost sequences that the replica applied, or a reply before
+            // reported a head beyond it.
+            if head_seq < request.head_seen {
+                room.saw_below(epoch, head_seq);
+            }
+            if head_seq < head.max(request.head_seen) {
                 room.register_again(epoch, again)?;
                 continue;
             }
@@ -1664,12 +1822,21 @@ impl Client {
         }
     }
 
-    /// A heartbeat of the worker of `room_id`, as [`beat`](Self::beat) sends it: returns what
-    /// its ack asks to transfer, the snapshot that the replica waits for if the ack announces it,
-    /// or else the one that the ack designates the client to upload, and whether its head
-    /// passed that of the replica.
-    pub(crate) async fn worker_beat(&self, room_id: &RoomId) -> Result<Asked, ClientError> {
+    /// A heartbeat of the worker of `room_id`, as [`beat`](Self::beat) sends it, registering the
+    /// replica first, with its cursor, if `register` (`Registered` decides again whether it waits
+    /// for a snapshot, with the tail of the log): returns what its ack asks to transfer, the
+    /// snapshot that the replica waits for if the ack announces it, or else the one that the ack
+    /// designates the client to upload; whether its head passed that of the replica; and whether
+    /// the replica waits for a snapshot that no reply announced.
+    pub(crate) async fn worker_beat(
+        &self,
+        room_id: &RoomId,
+        register: bool,
+    ) -> Result<Asked, ClientError> {
         let room = self.room(room_id)?;
+        if register {
+            room.unregister();
+        }
         let beat = self.beat(&room, &mut false).await?;
         let transfer = match room.announced(beat.epoch, beat.snapshot) {
             true => Some(Transfer::Download),
@@ -1678,6 +1845,7 @@ impl Client {
         Ok(Asked {
             transfer,
             behind: beat.behind,
+            waits: room.waits_for_none(beat.epoch),
         })
     }
 
@@ -2122,21 +2290,33 @@ impl Client {
     /// of the replica leads to a sync, in a task of its own, which acknowledges nothing: one at a
     /// time, and one more once it ends if a heartbeat asked for one meanwhile. A batch of it that
     /// asks the client for a snapshot is confirmed by a heartbeat in the task of the transfers.
+    /// In every mode, after each heartbeat that succeeds, the worker acknowledges the head of the
+    /// replica if it passed the last one that the server took as the cursor of the client (from
+    /// a registration or a confirmed acknowledgement), and every tenth also if it did not move,
+    /// unless the replica waits for a snapshot (the server may have taken a lower cursor since),
+    /// as [`sync`](Self::sync) does: a reply that asks to register again registers the replica,
+    /// with its cursor. A replica that waits for a
+    /// snapshot that no reply announced registers again, with its cursor, after ten heartbeats
+    /// in a row that leave it waiting.
     /// A heartbeat that fails is sent again after a backoff with full jitter (a random delay up
     /// to [`retry_base`](ClientConfig::retry_base), doubled after each retry up to
     /// [`retry_max`](ClientConfig::retry_max)), and the first that succeeds goes back to the
-    /// interval; a transfer or a sync that fails is asked for again by the next heartbeat.
+    /// interval; an acknowledgement, a transfer or a sync that fails is asked for again by the
+    /// next heartbeat.
     ///
     /// Only its own steps stop it, when they find the room failing closed (`FailedClosed`) or out
     /// of the client (`RoomClosed`); any other error is tried again, and [`status`](Self::status)
     /// gives the last. [`stop_worker`](Self::stop_worker), [`close_room`](Self::close_room) and
-    /// [`shutdown`](Self::shutdown) stop it.
+    /// [`shutdown`](Self::shutdown) stop it, and then it acknowledges the head of the replica
+    /// once more if it moved. Starting it while a call stops it waits for that stop, with its
+    /// last acknowledgement (5 s at most), so a room has one worker at a time.
     pub async fn start_worker(self: &Arc<Self>, room_id: RoomId) -> Result<(), ClientError> {
         self.run_worker(room_id, None).await
     }
 
     /// Sets the mode of the worker of `room_id` to `freshness`, starting it in that mode as
-    /// [`start_worker`](Self::start_worker) does if it has none that runs.
+    /// [`start_worker`](Self::start_worker) does if it has none that runs: also once a stop in
+    /// progress ended.
     pub async fn set_freshness(
         self: &Arc<Self>,
         room_id: RoomId,
@@ -2153,30 +2333,48 @@ impl Client {
         freshness: Option<Freshness>,
     ) -> Result<(), ClientError> {
         let room = self.room(&room_id)?;
-        // Under the applier: a change in progress takes the replica out of the client meanwhile.
-        let opened = |_, room: Arc<Room>| async move {
-            Ok(!matches!(room.state().replica, Replica::Closed))
-        };
-        if !self.change(&room, opened).await? {
-            return Err(ClientError::RoomClosed(room_id));
-        }
-        let mut worker = room.worker();
-        match &*worker {
-            Some(running) if running.is_running() => {
-                if let Some(freshness) = freshness {
-                    running.set_freshness(freshness);
+        loop {
+            // Under the applier: a change in progress takes the replica out of the client
+            // meanwhile.
+            let opened = |_, room: Arc<Room>| async move {
+                Ok(!matches!(room.state().replica, Replica::Closed))
+            };
+            if !self.change(&room, opened).await? {
+                return Err(ClientError::RoomClosed(room_id));
+            }
+            // A stop in progress ends first, with its last acknowledgement: one worker at a
+            // time. Under both locks, as a stop takes them.
+            let ended = {
+                let mut worker = room.worker();
+                let stopping = room.stopping();
+                match stopping.as_ref().filter(|ended| ended.peek().is_none()) {
+                    Some(ended) => ended.clone(),
+                    None => {
+                        match &*worker {
+                            Some(running) if running.is_running() => {
+                                if let Some(freshness) = freshness {
+                                    running.set_freshness(freshness);
+                                }
+                            }
+                            _ => {
+                                let freshness = freshness.unwrap_or(self.config.freshness);
+                                *worker = Some(Worker::start(self, room_id, freshness));
+                            }
+                        }
+                        return Ok(());
+                    }
                 }
-            }
-            _ => {
-                let freshness = freshness.unwrap_or(self.config.freshness);
-                *worker = Some(Worker::start(self, room_id, freshness));
-            }
+            };
+            let _ = ended.await;
         }
-        Ok(())
     }
 
     /// Stops the worker of `room_id`, if it has one, at its next `.await`, and waits until it,
-    /// its sync and its transfer ended. A room that the client never opened is `RoomClosed`.
+    /// its sync and its transfer ended; then the worker acknowledges the head of the replica if
+    /// it passed the last one that the server took as the cursor of the client: one request,
+    /// which registers nothing, within 5 s. A call while another stops the worker waits for that
+    /// stop too, also if the other call is cut. A room that the client never opened is
+    /// `RoomClosed`.
     pub async fn stop_worker(&self, room_id: RoomId) -> Result<(), ClientError> {
         self.room(&room_id)?.stop_worker().await;
         Ok(())
@@ -2187,19 +2385,21 @@ impl Client {
         &self.config
     }
 
-    /// Closes `room_id` once its worker stopped and the changes of its replica in progress
-    /// ended, closing its storage room, which waits for the operations of the storage in
-    /// progress. An error closing it is reported, and the room leaves the client all the same.
+    /// Closes `room_id` once its worker stopped, as [`stop_worker`](Self::stop_worker) stops it,
+    /// with its last acknowledgement, and the changes of its replica in progress ended, closing
+    /// its storage room, which waits for the operations of the storage in progress. An error
+    /// closing it is reported, and the room leaves the client all the same.
     pub async fn close_room(&self, room_id: RoomId) -> Result<(), ClientError> {
         let room = self.room(&room_id)?;
         room.stop_worker().await;
         self.change(&room, Local::close).await
     }
 
-    /// Shuts the client down: closes every room as [`close_room`](Self::close_room) does, so that
-    /// the runtime can be shut down without losing anything, and releases the metadata for
-    /// another client. The first error closing a room is reported, once every room is closed. No
-    /// room opens afterwards.
+    /// Shuts the client down: closes every room as [`close_room`](Self::close_room) does, with the
+    /// workers of all of them stopped at once, and their last acknowledgements, so that the
+    /// runtime can be shut down without losing anything, and releases the metadata for another
+    /// client. The first error closing a room is reported, once every room is closed. No room
+    /// opens afterwards.
     pub async fn shutdown(&self) -> Result<(), ClientError> {
         self.local.shut_down.store(true, Ordering::SeqCst);
         let rooms: Vec<_> = {
@@ -2242,6 +2442,8 @@ impl Local {
                 epoch: state.epoch,
                 cursor: None,
                 registered: open.is_some_and(|open| open.registered),
+                acknowledged: open.map_or(SequenceNumber::new(0), |open| open.acknowledged),
+                head_seen: state.writes.head_seen,
                 awaits_snapshot: open.and_then(|open| open.awaits_snapshot),
                 failed_closed: open.is_some_and(|open| open.failed_closed),
             };
@@ -2360,6 +2562,7 @@ impl Local {
         }
         room.update(epoch, |open| {
             open.registered = true;
+            open.acknowledged = cursor.unwrap_or(SequenceNumber::new(0));
             open.awaits_snapshot = waits(head);
         });
         room.announced(epoch, snapshot);

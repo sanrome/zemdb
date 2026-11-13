@@ -351,11 +351,11 @@ fn fail_next_heartbeat_closed(transport: &TestTransport, room_incarnation: u128)
 }
 
 /// A `Registered` of `room_incarnation` for the registration `message`, with the schema `tasks`, at
-/// the head `tail` of a log retained from `tail`, which announces the snapshot at `snapshot`.
+/// the head `head` of a log retained from `tail`, which announces the snapshot at `snapshot`.
 fn registered_at(
     message: &ClientMessage,
     room_incarnation: u128,
-    tail: u64,
+    (head, tail): (u64, u64),
     snapshot: Option<u64>,
 ) -> Vec<u8> {
     let ClientMessage::RegisterClient {
@@ -369,7 +369,7 @@ fn registered_at(
     encode_message(&ServerMessage::Registered {
         correlation_id: *correlation_id,
         room_id: room_id.clone(),
-        head_seq: SequenceNumber::new(tail),
+        head_seq: SequenceNumber::new(head),
         tail_seq: SequenceNumber::new(tail),
         schema_id: SchemaId::new("tasks").unwrap(),
         schema: tasks_schema(),
@@ -380,11 +380,13 @@ fn registered_at(
 }
 
 /// Makes the next heartbeat through `transport` get `ClientNotRegistered`, and the registration
-/// that follows, [`registered_at`] with `tail` and `snapshot`.
+/// that follows, [`registered_at`] with `head`, `tail` and `snapshot`. With the head of the server
+/// as `head`, the next reply of the server does not report a lower one, which would register
+/// again.
 fn register_next_heartbeat(
     transport: &TestTransport,
     room_incarnation: u128,
-    tail: u64,
+    (head, tail): (u64, u64),
     snapshot: Option<u64>,
 ) {
     let (mut heartbeat, mut registration) = (true, true);
@@ -393,9 +395,12 @@ fn register_next_heartbeat(
             let (id, room) = request(message);
             Some(Ok(error_reply(id, &room, ErrorCode::ClientNotRegistered)))
         }
-        RegisterClient if std::mem::take(&mut registration) => {
-            Some(Ok(registered_at(message, room_incarnation, tail, snapshot)))
-        }
+        RegisterClient if std::mem::take(&mut registration) => Some(Ok(registered_at(
+            message,
+            room_incarnation,
+            (head, tail),
+            snapshot,
+        ))),
         _ => None,
     });
 }
@@ -902,7 +907,7 @@ async fn a_snapshot_of_a_later_schema_is_installed_once_the_replica_takes_it_fro
         };
         let reply = match (answered, message.kind()) {
             (0, Heartbeat) => error_reply(id, &room, ErrorCode::ClientNotRegistered),
-            (1, RegisterClient) => registered_at(message, incarnation, 9, Some(10)),
+            (1, RegisterClient) => registered_at(message, incarnation, (9, 9), Some(10)),
             (2, Heartbeat) => heartbeat_ack(id, &room, 10, TASKS, Some(10)),
             _ => return None,
         };
@@ -1062,7 +1067,8 @@ async fn a_snapshot_that_does_not_install_leaves_the_replica_as_it_was() {
         .await;
     server.commit(&room_id, [4]).await;
     // A registration that finds it behind the log, with the snapshot at 2 announced.
-    register_next_heartbeat(&transport, server.incarnation(&room_id).await, 9, Some(2));
+    let incarnation = server.incarnation(&room_id).await;
+    register_next_heartbeat(&transport, incarnation, (4, 9), Some(2));
     client.heartbeat(room_id.clone()).await.unwrap();
     assert_eq!(chunks(&transport), [(0, None)]);
     client.sync(room_id.clone()).await.unwrap();
@@ -1485,10 +1491,21 @@ async fn a_heartbeat_takes_the_head_the_schema_and_the_snapshot_its_ack_announce
     transport.answer_next(Commit, |message| commit_ack(message, 5));
     let written = client.write(room_id.clone(), insert_task(4)).await;
     assert_eq!(written, Err(ClientError::OutcomeUnknown));
+    // The next heartbeat gets the head of the server, below 9: the replica registers again, with
+    // its cursor, and takes that head as the head it saw.
+    let (sent, registrations) = (transport.sent().len(), transport.registrations().len());
+    client.heartbeat(room_id.clone()).await.unwrap();
+    assert_eq!(
+        kinds(&transport)[sent..],
+        [Heartbeat, RegisterClient, Heartbeat]
+    );
+    let incarnation = server.incarnation(&room_id).await;
+    let registration = transport.registrations()[registrations];
+    assert_eq!(registration, (Some(3), Some(incarnation)));
 
     // A registration that finds the replica behind the log leaves it waiting for a snapshot, and
     // one that finds it inside the log ends its wait.
-    register_next_heartbeat(&transport, server.incarnation(&room_id).await, 9, None);
+    register_next_heartbeat(&transport, server.incarnation(&room_id).await, (3, 9), None);
     client.heartbeat(room_id.clone()).await.unwrap();
     let sent = transport.sent().len();
     network(client.sync(room_id.clone()).await);

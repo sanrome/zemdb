@@ -1,11 +1,13 @@
+use futures::future::{self, FutureExt};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use zemdb_core::RoomId;
 
-use crate::client::{jitter, Backoff, Held, Transfer};
+use crate::client::{jitter, Acking, Backoff, Held, Transfer};
 use crate::{Client, ClientConfig, ClientError, Freshness};
 
 /// The worker of a room, as [`Client::status`](crate::Client::status) gives it.
@@ -23,6 +25,17 @@ pub struct WorkerStatus {
     pub last_error: Option<ClientError>,
 }
 
+/// How long the worker waits for its last acknowledgement once it is stopped.
+const LAST_ACK: Duration = Duration::from_secs(5);
+
+/// How many heartbeats in a row leave the replica waiting for a snapshot that no reply announced
+/// before the next one registers it again.
+const WAITING_BEATS: u32 = 10;
+
+/// Every how many heartbeats that succeed the worker acknowledges the head of the replica also if
+/// it did not move.
+const ACK_AGAIN_BEATS: u32 = 10;
+
 /// What the worker of a room shares with its task.
 struct Shared {
     freshness: Freshness,
@@ -33,15 +46,20 @@ fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
     shared.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// The end of the task of a worker: it resolves once the task ended, also for each caller that
+/// waits for a stop when another caller started it, or once that caller was cut.
+pub(crate) type Ended = future::Shared<oneshot::Receiver<()>>;
+
 /// The worker of a room: a task of its own, which holds the client by a `Weak`, so that it ends
 /// once the application drops the client: at once, or at its next heartbeat if a task of a
-/// worker, of any room, holds the client meanwhile (a heartbeat, a sync or a transfer). Dropping
-/// the worker stops its task too.
+/// worker, of any room, holds the client meanwhile (a heartbeat, an acknowledgement, a sync or a
+/// transfer). Dropping the worker stops its task too.
 pub(crate) struct Worker {
     shared: Arc<Mutex<Shared>>,
     /// Dropped to stop the task.
     stop: oneshot::Sender<()>,
     task: JoinHandle<()>,
+    ended: Ended,
 }
 
 impl Worker {
@@ -52,18 +70,25 @@ impl Worker {
             last_error: None,
         }));
         let (stop, stopped) = oneshot::channel();
+        // Dropped with the task, once it ended.
+        let (ending, ended) = oneshot::channel::<()>();
         let config = client.config().clone();
-        let task = run(
+        let run = run(
             Arc::downgrade(client),
             config,
             room_id,
             Arc::clone(&shared),
             stopped,
         );
+        let task = async move {
+            let _ending = ending;
+            run.await;
+        };
         Self {
             shared,
             stop,
             task: tokio::spawn(task),
+            ended: ended.shared(),
         }
     }
 
@@ -86,12 +111,12 @@ impl Worker {
         }
     }
 
-    /// Stops its task at its next `.await`, and waits until the task, its sync and its transfer
-    /// ended.
-    pub(crate) async fn stop(self) {
-        let Self { stop, task, .. } = self;
+    /// Stops its task at its next `.await`: the task cuts its sync and its transfer, waits until
+    /// they ended, and sends its last acknowledgement. Returns what resolves once the task ended.
+    pub(crate) fn stop(self) -> Ended {
+        let Self { stop, ended, .. } = self;
         drop(stop);
-        let _ = task.await;
+        ended
     }
 }
 
@@ -164,16 +189,22 @@ fn sync(
 }
 
 /// The task of the worker of `room_id`, until `stop` is dropped, the client is dropped, or a
-/// step stops it; then it cuts its sync and its transfer, and waits until they ended. It sends
-/// a heartbeat every interval, the first at a random moment within the first, so that the
-/// clients that start together do not send theirs together. A heartbeat transfers nothing: the
-/// snapshot its ack asks to upload or announces goes in a task of its own, one at a time, and
-/// the heartbeats go on meanwhile. Unless the mode is `Manual`, a heartbeat whose ack reports a
-/// head past that of the replica leads to a sync, in a task of its own, without an
-/// acknowledgement: one at a time, and one more once it ends if a heartbeat asked for one
-/// meanwhile and the mode still syncs. A batch of the sync that asks the client for a snapshot is confirmed by a
-/// heartbeat in the task of the transfers. A heartbeat that fails is sent again after a backoff
-/// with full jitter, and the first that succeeds goes back to the interval.
+/// step stops it; then it cuts its sync and its transfer, waits until they ended, and, unless
+/// the client was dropped, acknowledges the head of the replica if it moved, once and within
+/// [`LAST_ACK`] (a replica that failed closed or left the client sends nothing). It sends a
+/// heartbeat every interval, the first at a random moment within the first, so that the clients
+/// that start together do not send theirs together, and after each one that succeeds, the
+/// acknowledgement of the head of the replica if it moved, and every [`ACK_AGAIN_BEATS`] also if
+/// it did not, unless the replica waits for a snapshot. A heartbeat
+/// transfers nothing: the snapshot its ack asks to upload or announces goes in a task of its
+/// own, one at a time, and the heartbeats go on meanwhile. Unless the mode is `Manual`, a
+/// heartbeat whose ack reports a head past that of the replica leads to a sync, in a task of its
+/// own, without an acknowledgement: one at a time, and one more once it ends if a heartbeat asked
+/// for one meanwhile and the mode still syncs. A batch of the sync that asks the client for a
+/// snapshot is confirmed by a heartbeat in the task of the transfers. After [`WAITING_BEATS`]
+/// heartbeats in a row that leave the replica waiting for a snapshot that no reply announced, the
+/// next one registers it again. A heartbeat that fails is sent again after a backoff with full
+/// jitter, and the first that succeeds goes back to the interval.
 async fn run(
     weak: Weak<Client>,
     config: ClientConfig,
@@ -187,6 +218,11 @@ async fn run(
     let mut syncing: Option<JoinHandle<Result<bool, ClientError>>> = None;
     // Whether a heartbeat asked for a sync while one ran.
     let mut pending = false;
+    // How many heartbeats in a row left the replica waiting for a snapshot that no reply
+    // announced.
+    let mut waiting = 0;
+    // How many heartbeats succeeded since the last one acknowledged the head anyway.
+    let mut beats = 0;
     loop {
         tokio::select! {
             _ = &mut stop => break,
@@ -225,9 +261,13 @@ async fn run(
             break;
         };
         let started = Instant::now();
+        let register = waiting >= WAITING_BEATS;
+        if register {
+            waiting = 0;
+        }
         let beat = tokio::select! {
             _ = &mut stop => break,
-            beat = client.worker_beat(&room_id) => beat,
+            beat = client.worker_beat(&room_id, register) => beat,
         };
         let asked = match beat {
             Ok(asked) => asked,
@@ -242,6 +282,19 @@ async fn run(
         ended(&shared, Ok(()));
         backoff = Backoff::worker(&config);
         next = started + config.heartbeat_interval;
+        waiting = if asked.waits { waiting + 1 } else { 0 };
+        beats = (beats + 1) % ACK_AGAIN_BEATS;
+        let acking = match beats {
+            0 => Acking::Again,
+            _ => Acking::Moved,
+        };
+        let acked = tokio::select! {
+            _ = &mut stop => break,
+            acked = client.worker_ack(&room_id, acking) => acked,
+        };
+        if ended(&shared, acked) {
+            break;
+        }
         if let Some(wanted) = asked.transfer {
             transfer(&mut transferring, &client, &room_id, wanted);
         }
@@ -255,6 +308,10 @@ async fn run(
     }
     if let Some(transferring) = transferring {
         let _ = transferring.await;
+    }
+    if let Some(client) = held(&weak) {
+        let last = client.worker_ack(&room_id, Acking::Last);
+        let _ = tokio::time::timeout(LAST_ACK, last).await;
     }
 }
 
