@@ -50,7 +50,8 @@ pub struct Client {
     local: Local,
     transport: Box<dyn TransportClient>,
     tokens: Box<dyn TokenProvider>,
-    /// Every room the client opened, open or not: a room keeps its epoch while the client lives.
+    /// Every room the client opened or discarded, open or not: a room keeps its epoch while the
+    /// client lives.
     rooms: Mutex<HashMap<RoomId, Arc<Room>>>,
     correlation_ids: AtomicU64,
     /// How many references to the client the tasks of its workers took, and how many they let
@@ -64,8 +65,8 @@ pub struct Client {
 pub struct RoomStatus {
     /// The head sequence of the replica.
     pub head_seq: SequenceNumber,
-    /// How many times the client discarded the replica since it first opened the room, counting
-    /// the discard of a room opened without metadata.
+    /// How many times the client discarded the replica since the room entered the client (its
+    /// first open or discard), counting the discard of a room opened without metadata.
     pub epoch: u64,
     /// Whether the client is registered in the room.
     pub registered: bool,
@@ -144,7 +145,7 @@ impl State {
 /// The replica of a room.
 #[derive(Default)]
 enum Replica {
-    /// Out of the client: not opened, closed, or a change of it failed.
+    /// Out of the client: not opened, closed, discarded on request, or a change of it failed.
     #[default]
     Closed,
     /// Without data or metadata, until `Registered` gives the metadata to open it with: opened
@@ -909,22 +910,7 @@ impl Client {
     /// read: the client leaves the roster of the room, and the room neither registers nor syncs
     /// until it is closed and opened again.
     pub async fn open_room(&self, room_id: RoomId, token: String) -> Result<(), ClientError> {
-        let room = {
-            let mut rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
-            let room = rooms.entry(room_id.clone()).or_insert_with(|| {
-                Arc::new(Room {
-                    id: room_id,
-                    applier: Arc::default(),
-                    registration: tokio::sync::Mutex::default(),
-                    transfer: tokio::sync::Mutex::default(),
-                    renewal: tokio::sync::Mutex::default(),
-                    state: Mutex::default(),
-                    worker: Mutex::default(),
-                    stopping: Mutex::default(),
-                })
-            });
-            Arc::clone(room)
-        };
+        let room = self.entry(room_id);
         let _registration = room.registration.lock().await;
         room.state().set_token(token);
         self.change(&room, Local::open).await?;
@@ -939,6 +925,24 @@ impl Client {
             }
             registered => registered,
         }
+    }
+
+    /// The room `room_id` of the client, which enters it, out of the client, if it was not in it.
+    fn entry(&self, room_id: RoomId) -> Arc<Room> {
+        let mut rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
+        let room = rooms.entry(room_id.clone()).or_insert_with(|| {
+            Arc::new(Room {
+                id: room_id,
+                applier: Arc::default(),
+                registration: tokio::sync::Mutex::default(),
+                transfer: tokio::sync::Mutex::default(),
+                renewal: tokio::sync::Mutex::default(),
+                state: Mutex::default(),
+                worker: Mutex::default(),
+                stopping: Mutex::default(),
+            })
+        });
+        Arc::clone(room)
     }
 
     /// Registers `room`, under its registration lock, unless it is registered: with the head of
@@ -2176,7 +2180,8 @@ impl Client {
         }
     }
 
-    /// The room `room_id` of the client; `RoomClosed` if the client never opened it.
+    /// The room `room_id` of the client; `RoomClosed` if it never entered the client (neither
+    /// opened nor discarded).
     fn room(&self, room_id: &RoomId) -> Result<Arc<Room>, ClientError> {
         let rooms = self.rooms.lock().unwrap_or_else(PoisonError::into_inner);
         let room = rooms.get(room_id).map(Arc::clone);
@@ -2276,8 +2281,8 @@ impl Client {
     /// Starts the worker of `room_id`, in the mode of the configuration
     /// ([`ClientConfig::freshness`]), unless it has one that runs. The room is open in the
     /// client, also unregistered or empty after a registration that failed: the first heartbeat
-    /// of the worker registers it. A room that the client never opened, or closed, is
-    /// `RoomClosed`.
+    /// of the worker registers it. A room that the client never opened, or closed or discarded,
+    /// is `RoomClosed`.
     ///
     /// The worker is a task of its own, which holds the client by a weak reference: it ends once
     /// the application drops the client. It sends a heartbeat every
@@ -2306,10 +2311,11 @@ impl Client {
     ///
     /// Only its own steps stop it, when they find the room failing closed (`FailedClosed`) or out
     /// of the client (`RoomClosed`); any other error is tried again, and [`status`](Self::status)
-    /// gives the last. [`stop_worker`](Self::stop_worker), [`close_room`](Self::close_room) and
-    /// [`shutdown`](Self::shutdown) stop it, and then it acknowledges the head of the replica
-    /// once more if it moved. Starting it while a call stops it waits for that stop, with its
-    /// last acknowledgement (5 s at most), so a room has one worker at a time.
+    /// gives the last. [`stop_worker`](Self::stop_worker), [`close_room`](Self::close_room),
+    /// [`discard_room`](Self::discard_room) and [`shutdown`](Self::shutdown) stop it, and then it
+    /// acknowledges the head of the replica once more if it moved. Starting it while a call stops
+    /// it waits for that stop, with its last acknowledgement (5 s at most), so a room has one
+    /// worker at a time.
     pub async fn start_worker(self: &Arc<Self>, room_id: RoomId) -> Result<(), ClientError> {
         self.run_worker(room_id, None).await
     }
@@ -2334,17 +2340,16 @@ impl Client {
     ) -> Result<(), ClientError> {
         let room = self.room(&room_id)?;
         loop {
-            // Under the applier: a change in progress takes the replica out of the client
-            // meanwhile.
-            let opened = |_, room: Arc<Room>| async move {
-                Ok(!matches!(room.state().replica, Replica::Closed))
-            };
-            if !self.change(&room, opened).await? {
-                return Err(ClientError::RoomClosed(room_id));
-            }
             // A stop in progress ends first, with its last acknowledgement: one worker at a
-            // time. Under both locks, as a stop takes them.
+            // time. Under the applier, until the worker is in the room: a change in progress
+            // takes the replica out of the client meanwhile, and one that takes it out
+            // afterwards finds the worker, to stop it.
             let ended = {
+                let _applier = room.applier.lock().await;
+                if matches!(room.state().replica, Replica::Closed) {
+                    return Err(ClientError::RoomClosed(room_id));
+                }
+                // Under both locks, as a stop takes them.
                 let mut worker = room.worker();
                 let stopping = room.stopping();
                 match stopping.as_ref().filter(|ended| ended.peek().is_none()) {
@@ -2373,8 +2378,8 @@ impl Client {
     /// its sync and its transfer ended; then the worker acknowledges the head of the replica if
     /// it passed the last one that the server took as the cursor of the client: one request,
     /// which registers nothing, within 5 s. A call while another stops the worker waits for that
-    /// stop too, also if the other call is cut. A room that the client never opened is
-    /// `RoomClosed`.
+    /// stop too, also if the other call is cut. A room that never entered the client (neither
+    /// opened nor discarded) is `RoomClosed`.
     pub async fn stop_worker(&self, room_id: RoomId) -> Result<(), ClientError> {
         self.room(&room_id)?.stop_worker().await;
         Ok(())
@@ -2393,6 +2398,50 @@ impl Client {
         let room = self.room(&room_id)?;
         room.stop_worker().await;
         self.change(&room, Local::close).await
+    }
+
+    /// Discards the local replica of `room_id` at the request of the application, in any state:
+    /// open, failing closed, out of the client after an open that failed (`SnapshotConstraints`
+    /// or `SchemaMismatch`, say), or never opened by this client, with the files of an earlier
+    /// run (the room enters the client, as an open enters it). It is the way out of a room that
+    /// fails closed or does not open; not of one whose snapshot is larger than
+    /// `max_snapshot_bytes`, since the empty replica needs the same snapshot: that limit is
+    /// raised instead.
+    ///
+    /// It stops the worker of the room, as [`stop_worker`](Self::stop_worker) stops it, with its
+    /// last acknowledgement while the replica is still open, and then, under the registration
+    /// lock and the applier
+    /// (after the registration and the change of the replica in progress), it ends the writes
+    /// in flight as a discard does (one with its `CommitAck` ends as unknown, and one without it
+    /// with `Network`, or as unknown after an uncertain attempt) and the `watch` streams of the
+    /// room, and discards the replica: removes its metadata durably, with the temporary file of
+    /// a cut save, closes its storage room if it is open, deletes its data and starts a new
+    /// epoch, so a request in flight changes nothing. The room is left out of the client: its
+    /// next open opens it as new, without metadata (it deletes again, and starts one more
+    /// epoch), registers it without a cursor and catches it up from the server, with the schema
+    /// of the room. An error at a step stops the discard (`Storage`), with the room out of the
+    /// client: once its metadata are removed, the next open deletes again. It sends nothing else
+    /// to the server: the entry of the client in the roster of the room ends with its lease, or
+    /// the next registration replaces it. A worker started while the discard waited is stopped
+    /// once the replica is discarded, and acknowledges nothing. Once the client shut down, it is
+    /// `RoomClosed`.
+    pub async fn discard_room(&self, room_id: RoomId) -> Result<(), ClientError> {
+        // A room does not enter a client shut down; one that shuts down meanwhile is seen under
+        // the applier.
+        if self.local.shut_down.load(Ordering::SeqCst) {
+            return Err(ClientError::RoomClosed(room_id));
+        }
+        let room = self.entry(room_id);
+        room.stop_worker().await;
+        let registration = room.registration.lock().await;
+        let discarded = self.change(&room, Local::forget).await;
+        drop(registration);
+        // A worker started while the discard waited for the registration lock, on the replica
+        // it discarded. Nothing is awaited since the lock was let go: an open that waited for it
+        // gets a worker on its new replica before this stop only if another thread runs the
+        // open and starts the worker in between.
+        room.stop_worker().await;
+        discarded
     }
 
     /// Shuts the client down: closes every room as [`close_room`](Self::close_room) does, with the
@@ -2793,11 +2842,28 @@ impl Local {
         self.discard(room).await
     }
 
-    /// Discards the replica: removes its metadata, closes its storage room and
-    /// deletes its data, and starts a new epoch, empty until `Registered`. The metadata go
-    /// first, so an error or a crash at any step leaves a room without metadata, which its next
-    /// open deletes again; an error leaves the room out of the client.
+    /// Discards the replica, empty until `Registered`.
     async fn discard(self, room: Arc<Room>) -> Result<(), ClientError> {
+        self.delete(Arc::clone(&room)).await?;
+        room.state().replica = Replica::Empty;
+        room.notify(&Change::All);
+        Ok(())
+    }
+
+    /// Discards the replica at the request of the application, in any state, and leaves the
+    /// room out of the client; once the client shut down, it is `RoomClosed`.
+    async fn forget(self, room: Arc<Room>) -> Result<(), ClientError> {
+        if self.shut_down.load(Ordering::SeqCst) {
+            return Err(ClientError::RoomClosed(room.id.clone()));
+        }
+        self.delete(room).await
+    }
+
+    /// Takes the replica out of the client, removes its metadata, closes its storage room if it
+    /// is open, deletes its data and starts a new epoch. The metadata go first, so an error or a
+    /// crash at any step leaves a room without metadata, which its next open deletes again; an
+    /// error stops it, and leaves the room out of the client.
+    async fn delete(self, room: Arc<Room>) -> Result<(), ClientError> {
         let replica = std::mem::take(&mut room.state().replica);
         let removed = self.metadata.remove_room(&room.id).await;
         if let Replica::Open(_) = replica {
@@ -2805,12 +2871,7 @@ impl Local {
         }
         removed?;
         self.storage.delete_room(&room.id).await?;
-        {
-            let mut state = room.state();
-            state.replica = Replica::Empty;
-            state.epoch += 1;
-        }
-        room.notify(&Change::All);
+        room.state().epoch += 1;
         Ok(())
     }
 

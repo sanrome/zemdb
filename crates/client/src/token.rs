@@ -7,6 +7,13 @@ use zemdb_core::{ClientId, RoomId};
 /// Where the client gets a new token of a room: the application, whose backend issues them. The
 /// client asks for one when the server refuses the token of a room (`Unauthorized`), and before
 /// the next request of a room after the server forbade its token (`Forbidden`).
+///
+/// The request may be a registration, which holds the registration lock of the room while it
+/// waits for the token: a provider that opens or discards the same room from inside
+/// [`token`](Self::token) waits for that lock until the client stops waiting for the token
+/// (60 s) and drops it, and the request goes on as without a new token. If the registration is
+/// one of the worker of the room, a discard from inside it stops that worker first, which drops
+/// the registration with the discard in it: nothing is discarded, and the room has no worker.
 #[async_trait]
 pub trait TokenProvider: Debug + Send + Sync {
     /// A new token of `client_id` for `room_id`, as the backend issues them.

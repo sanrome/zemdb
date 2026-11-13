@@ -67,6 +67,15 @@ impl ZemdbClient {
         Ok(RoomHandle::new(self.clone(), room_id))
     }
 
+    /// Discards the local replica of `room_id`, as [`Client::discard_room`] does, in any state:
+    /// also a room without a handle, because its open failed (`SnapshotConstraints` or
+    /// `SchemaMismatch`, say), or one that this client never opened. Its `watch` streams end,
+    /// and its handles read `RoomClosed` until [`room`](Self::room) opens it again, as new, with
+    /// the schema and the state of the server.
+    pub async fn discard_room(&self, room_id: RoomId) -> Result<(), ClientError> {
+        self.inner.client.discard_room(room_id).await
+    }
+
     /// Shuts the client down, as [`Client::shutdown`] does: every room closes, and its handles
     /// read `RoomClosed`.
     pub async fn shutdown(&self) -> Result<(), ClientError> {

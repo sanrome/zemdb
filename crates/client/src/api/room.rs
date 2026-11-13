@@ -51,6 +51,15 @@ impl RoomHandle {
         self.client.core().close_room(self.room_id.clone()).await
     }
 
+    /// Discards the local replica of the room, as
+    /// [`Client::discard_room`](crate::Client::discard_room) does: the way out of a room that
+    /// fails closed. Its `watch` streams end, and the handle reads `RoomClosed` until
+    /// [`ZemdbClient::room`] opens the room again, as new, with the schema and the state of the
+    /// server.
+    pub async fn discard(&self) -> Result<(), ClientError> {
+        self.client.core().discard_room(self.room_id.clone()).await
+    }
+
     pub(super) fn client(&self) -> &ZemdbClient {
         &self.client
     }
