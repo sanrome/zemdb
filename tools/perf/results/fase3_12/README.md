@@ -102,3 +102,14 @@ Los archivos:
 - **`diag-probe-*.jsonl`:** E1-tmpfs con 8 y 64 en vuelo, base y resultado, 2 rondas, con un generador instrumentado (una copia local, fuera del repo) que cuenta los catch-ups: `probe_acks`, `probe_catchup_ops` (las operaciones de todos los catch-ups), `probe_empty`, `probe_has_more` y `probe_response_bytes`.
 - **`diag-inline-*.jsonl`:** E1-tmpfs con 1 en vuelo, 3 rondas intercaladas: la base, el resultado (`final`) y el resultado sin el pool de E/S (`noio`, `diagnostics/inline-io.patch` con `ZEMDB_PERF_INLINE_IO=1`).
 - **`diag-profile-*-k64.*`:** el perfil de CPU del servidor (`profile_e1.sh`, 8 s) en E1-tmpfs con 64 en vuelo, base y resultado: los 40 símbolos de más peso (`.txt`) y la corrida (`.json`).
+
+## `lote8b/`: la búsqueda después de un grupo, sin decodificar las operaciones
+
+Los escenarios de control de §5.2 del plan: E1-tmpfs con 1 y 8 pedidos en vuelo y E2-tmpfs con 500 salas. El lote no toca el camino de un commit (cambia qué lee la apertura de un frame después de un daño), así que no tiene un escenario propio.
+- **Las variantes:** la base es el servidor de `6b93115` (el de `lote8/`, el mismo código que `e9f9139`, el commit anterior al lote, que solo cambió el cliente), y el resultado, el código del lote. Los dos, en release con la información de depuración, como en `lote8/`.
+- **El diseño:** tres rondas intercaladas, empezando por la base, el 13 de Noviembre de 2026; y tres más de E2-tmpfs empezando por el resultado (`-rev`), porque sus seis primeras corridas crecían con el tiempo.
+- **El entorno:** una sola VM, sin reinicios (`*.vm.json` guarda su `boot_id`): 4 vCPU Intel Xeon a 2,30 GHz, 15 GiB, kernel `6.18.44-fc-v445` y Rust 1.97.0. Es otra VM que la de `lote8/`.
+- **El generador:** el de `6b93115`, para las dos variantes.
+
+Los archivos: `<escenario>-base.jsonl` y `<escenario>-result.jsonl`, con las corridas de cada variante en el orden en que corrieron (en los de E1, una línea por cantidad de pedidos en vuelo en cada ronda); los escenarios son `e1-tmpfs`, `e2-tmpfs-r500` y `e2-tmpfs-r500-rev`.
+- **`e2-tmpfs-r500-aa-<variante>.jsonl`:** una comparación A/A, después de la revisión de delta, que vio la cola de E2 más alta en el resultado: E2-tmpfs con 500 salas y cuatro servidores en un cuadrado latino de cuatro rondas (cada uno una vez en cada lugar de una ronda: `a b base result`, `b a result base`, `base result a b` y `result base b a`). `a` es `main` sin el lote (`2249e0b`) y `b`, `main` con el lote ya revisado, compilados igual y en el mismo lugar (`aa/a` y `aa/b` en una carpeta temporal); `base` y `result`, los binarios de las corridas de arriba (`result` es el lote antes de la revisión).

@@ -313,17 +313,25 @@ fn check_search(log: &[u8], from: usize) {
     }
 }
 
-/// Where the group of the complete valid frame at `position` of `log` starts, if it decodes.
+/// Where the group of the frame with a valid header at `position` of `log` starts, as the first
+/// field of its payload says, whether the rest decodes or not, read from the bytes alone: `None`
+/// if its payload does not match its checksum, and an error if the payload is too short to say
+/// it or says a start before the log.
 fn group_start(log: &[u8], position: usize) -> Option<Result<u64, ()>> {
     let header = parse_batch_header(log[position..].first_chunk().unwrap()).unwrap();
     let payload = &log[position + BATCH_HEADER_SIZE..position + header.frame_len()];
-    match decode_batch_payload(&header, payload) {
-        Ok(BatchPayloadDecode::Batch { group_offset, .. }) => {
-            Some((position as u64).checked_sub(group_offset).ok_or(()))
-        }
-        Ok(BatchPayloadDecode::ChecksumMismatch { .. }) => None,
-        Err(_) => Some(Err(())),
+    let expected = u32::from_le_bytes(log[position + 6..position + 10].try_into().unwrap());
+    if crc32fast::hash(payload) != expected {
+        return None;
     }
+    let Some(group_offset) = payload.first_chunk::<8>() else {
+        return Some(Err(()));
+    };
+    Some(
+        (position as u64)
+            .checked_sub(u64::from_le_bytes(*group_offset))
+            .ok_or(()),
+    )
 }
 
 /// The search after a damaged group done naively, as a loop of `find_valid_frame`; `None` when

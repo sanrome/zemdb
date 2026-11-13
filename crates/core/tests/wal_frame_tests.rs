@@ -744,24 +744,102 @@ fn after_a_damaged_frame_with_a_valid_header_the_search_starts_where_it_ends() {
     );
 }
 
-#[test]
-fn a_valid_frame_after_the_damage_that_does_not_decode_is_not_of_the_group() {
-    // Where its group starts, and then an option tag that is neither `None` nor `Some`.
-    let mut payload = vec![0u8; 8];
-    payload.push(2);
-    payload.extend_from_slice(&[0u8; 8]);
+/// A header with a valid checksum for `payload`, which declares one operation.
+fn sealed_header_for(payload: &[u8]) -> [u8; BATCH_HEADER_SIZE] {
     let mut header = [0u8; BATCH_HEADER_SIZE];
     header[0..2].copy_from_slice(&BATCH_MAGIC);
     header[2..6].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    header[6..10].copy_from_slice(&crc32fast::hash(&payload).to_le_bytes());
+    header[6..10].copy_from_slice(&crc32fast::hash(payload).to_le_bytes());
     header[10..14].copy_from_slice(&1u32.to_le_bytes());
-    let header = seal_header(header);
-    assert!(decode_batch_payload(&parse_batch_header(&header).unwrap(), &payload).is_err());
+    seal_header(header)
+}
 
-    let mut log = vec![0u8; BATCH_HEADER_SIZE];
-    log.extend_from_slice(&header);
+#[test]
+fn a_valid_frame_after_the_damage_is_of_the_group_it_says_without_decoding_its_operations() {
+    // The search reads where the group of a frame starts, the first field of its payload, and
+    // not the operations after it: a frame whose payload matches its checksum and does not
+    // decode is of the group it says, the damaged one or a later one. Here, after where its
+    // group starts, nothing (a payload of just that field), 8 more bytes, or an option tag that
+    // is neither `None` nor `Some` and 8 bytes.
+    let rests: [&[u8]; 3] = [&[], &[0x13; 8], &[2, 0, 0, 0, 0, 0, 0, 0, 0]];
+    for rest in rests {
+        for (group_offset, expected) in [
+            (BATCH_HEADER_SIZE as u64, None),
+            (0, Some(BATCH_HEADER_SIZE as u64)),
+        ] {
+            let mut payload = group_offset.to_le_bytes().to_vec();
+            payload.extend_from_slice(rest);
+            let header = sealed_header_for(&payload);
+            let decoded = decode_batch_payload(&parse_batch_header(&header).unwrap(), &payload);
+            assert!(decoded.is_err());
+
+            let mut log = vec![0u8; BATCH_HEADER_SIZE];
+            log.extend_from_slice(&header);
+            log.extend_from_slice(&payload);
+            let what = format!("{} bytes, {group_offset}", payload.len());
+            assert_eq!(after_group(&log, 0), expected, "{what}");
+        }
+    }
+}
+
+#[test]
+fn a_valid_frame_after_the_damage_too_short_to_say_where_its_group_starts_is_not_of_it() {
+    // A payload shorter than the field that says where its group starts, under a valid header:
+    // the frame cannot be of the damaged group, whatever its bytes are. Here they are the first
+    // bytes of a field that would say the damaged group, and the bytes after the frame are the
+    // rest of it, so that reading the field past the payload, or completing it, says the
+    // damaged group.
+    let damaged_group = (BATCH_HEADER_SIZE as u64).to_le_bytes();
+    for len in [0, 1, 7] {
+        let payload = damaged_group[..len].to_vec();
+        let mut log = vec![0u8; BATCH_HEADER_SIZE];
+        log.extend_from_slice(&sealed_header_for(&payload));
+        log.extend_from_slice(&payload);
+        log.extend_from_slice(&damaged_group[len..]);
+        assert_eq!(
+            after_group(&log, 0),
+            Some(BATCH_HEADER_SIZE as u64),
+            "{len}"
+        );
+    }
+}
+
+#[test]
+fn a_header_taken_without_its_check_whose_payload_does_not_match_is_not_of_the_group() {
+    // Once the limit of failed checks is spent, the search takes the next valid header without
+    // checking its payload, and where its group starts is read only from a payload that matches
+    // its checksum: one that says the damaged group but does not match is a later write. After
+    // the damage: 17 headers whose payloads, of 4 KiB each, overlap and fail their checks (the
+    // allowance takes the first, the limit the next 16), the frame, and room for the payloads.
+    const PAYLOAD: u32 = 4096;
+    let mut log = delete_frame(1);
+    zero_header(&mut log, 0);
+    for _ in 0..17 {
+        log.extend_from_slice(&long_fake_header(PAYLOAD));
+    }
+    let position = log.len();
+    let mut payload = (position as u64).to_le_bytes().to_vec();
+    payload.push(0);
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    let mut header = sealed_header_for(&payload);
+    header[6..10].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+    log.extend_from_slice(&seal_header(header));
     log.extend_from_slice(&payload);
-    assert_eq!(after_group(&log, 0), Some(BATCH_HEADER_SIZE as u64));
+    log.extend(std::iter::repeat_n(
+        0x13,
+        PAYLOAD as usize + BATCH_HEADER_SIZE,
+    ));
+    assert_eq!(
+        (log.len() as u64 - 1) / u64::from(PAYLOAD),
+        1,
+        "one absorbed"
+    );
+
+    assert_eq!(after_group(&log, 0), Some(position as u64));
+    // With its checksum, the same frame is of the damaged group.
+    let header = sealed_header_for(&payload);
+    log[position..position + BATCH_HEADER_SIZE].copy_from_slice(&header);
+    assert_eq!(after_group(&log, 0), None);
 }
 
 #[test]

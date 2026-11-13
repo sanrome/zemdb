@@ -35,6 +35,13 @@ struct WalBatchPayload {
     ops: Vec<SequencedOperation>,
 }
 
+/// The first field of [`WalBatchPayload`], with the same encoding: where the group of a frame
+/// starts, read without decoding the operations after it (see [`find_frame_after_group`]).
+#[derive(serde::Deserialize)]
+struct WalBatchPayloadGroup {
+    group_offset: u64,
+}
+
 /// Borrowed form of [`WalBatchPayload`], with the same encoding, used to encode and measure
 /// records without copying the operations.
 #[derive(serde::Serialize)]
@@ -265,6 +272,21 @@ pub fn decode_batch_payload(
     })
 }
 
+/// How many bytes before the frame with `header` its group of frames starts (see
+/// [`encode_wal_batch_in_group`]), read from the first field of `payload` without decoding the
+/// rest: `None` if the payload does not match its checksum or is too short to hold that field.
+///
+/// `payload` must be exactly `header.payload_len()` bytes long.
+fn payload_group_offset(header: &BatchHeader, payload: &[u8]) -> Option<u64> {
+    if crc32fast::hash(payload) != header.payload_crc32 {
+        return None;
+    }
+    // `bincode::deserialize` allows trailing bytes: the operations are not read.
+    bincode::deserialize::<WalBatchPayloadGroup>(payload)
+        .ok()
+        .map(|payload| payload.group_offset)
+}
+
 /// Why no frame could be read where the next one should start.
 ///
 /// An anomaly is either a torn write, the last frame cut short by a crash, or corruption in
@@ -391,10 +413,13 @@ pub fn find_valid_frame<R: Read + Seek>(
 /// check. So that the frames of a torn group do not spend the limit of failed checks, each failed
 /// check is first charged, by the length of its payload, to an allowance of as many bytes as the
 /// search covers, which the frames of a group, that do not overlap, cannot exceed; the limit
-/// counts the checks past it. Each frame the search finds is then read and decoded, and one whose
-/// payload does not match its checksum (once the limit is spent, the search takes headers without
-/// checking them) or does not decode is returned: that can only turn a torn write into
-/// corruption. So the work stays linear in the bytes after the damage, plus the limit.
+/// counts the checks past it. Each frame the search finds is then read, and where its group starts
+/// is read from the first field of its payload, without decoding the operations after it: a frame
+/// stored as a value can hold any operations, which decoded can take several times the bytes of
+/// the frame. One whose payload does not match its checksum (once the limit is spent, the search
+/// takes headers without checking them) or is too short to say where its group starts is
+/// returned: that can only turn a torn write into corruption. So the work stays linear in the
+/// bytes after the damage, plus the limit, and the memory is at most a frame.
 pub fn find_frame_after_group<R: Read + Seek>(
     reader: &mut R,
     at: u64,
@@ -423,13 +448,18 @@ pub fn find_frame_after_group<R: Read + Seek>(
         let Ok(header) = parse_batch_header(&header) else {
             return Ok(Some(position));
         };
+        // A payload longer than the buffer gets a new one: growing it could copy the previous
+        // payload and hold both at once.
+        if buf.capacity() < header.payload_len() {
+            buf = Vec::new();
+        }
         buf.resize(header.payload_len(), 0);
         reader.read_exact(&mut buf)?;
-        let in_group = matches!(
-            decode_batch_payload(&header, &buf),
-            Ok(BatchPayloadDecode::Batch { group_offset, .. })
-                if position.checked_sub(group_offset).is_some_and(|start| start <= at)
-        );
+        let in_group = payload_group_offset(&header, &buf).is_some_and(|group_offset| {
+            position
+                .checked_sub(group_offset)
+                .is_some_and(|start| start <= at)
+        });
         if !in_group {
             return Ok(Some(position));
         }

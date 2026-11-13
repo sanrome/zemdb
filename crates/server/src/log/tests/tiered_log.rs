@@ -3442,6 +3442,46 @@ fn a_group_whose_records_each_lost_part_of_their_payload_reopens() {
     }
 }
 
+/// Record 5 is as large as a record can be (its payload is `MAX_MESSAGE_SIZE`); the others are
+/// [`titled_op`].
+fn largest_fifth_op(seq: u64) -> SequencedOperation {
+    if seq != 5 {
+        return titled_op(seq);
+    }
+    let overhead = zemdb_core::protocol::wal_frame::wal_record_payload_len(
+        &large_op(seq, 0),
+        Some(mutation_for(seq)),
+    )
+    .unwrap();
+    large_op(
+        seq,
+        (zemdb_core::protocol::codec::MAX_MESSAGE_SIZE - overhead) as usize,
+    )
+}
+
+/// A torn group with a record as large as a record can be, after the damage or damaged: the
+/// search after the damage takes it, and the records after it, for records of the group, and the
+/// open truncates the group from the damage.
+#[test]
+fn a_torn_group_with_a_record_as_large_as_a_message_reopens() {
+    let group = UnsyncedGroup::write(3, 3, largest_fifth_op);
+    let fifth = group.ends[3]..group.ends[4];
+    assert_eq!(
+        fifth.len(),
+        BATCH_HEADER_SIZE + zemdb_core::protocol::codec::MAX_MESSAGE_SIZE as usize
+    );
+
+    // The header of record 4 lost: records 5 and 6 follow it.
+    let mut image = group.bytes.clone();
+    image[group.ends[2]..group.ends[2] + BATCH_HEADER_SIZE].fill(0);
+    group.check_reopens(&image, "the header of record 4");
+
+    // A sector of the payload of record 5 lost: record 6 follows it.
+    let mut image = group.bytes.clone();
+    image[fifth.start + 4096..fifth.start + 4608].fill(0);
+    group.check_reopens(&image, "a sector of record 5");
+}
+
 /// A value of `len` bytes that holds, at its start, the header of a frame that says its group
 /// starts `delta` bytes before it (where the record that holds the value starts), with no
 /// operations, and whose payload is the rest of the value and then the first byte of whatever
