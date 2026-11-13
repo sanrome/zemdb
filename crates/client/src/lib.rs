@@ -19,9 +19,10 @@ mod http_transport;
 mod metadata;
 mod token;
 mod transport;
+mod watch;
 mod worker;
 
-pub use api::{Direction, Key, RoomHandle, Row, Scan, TableHandle, ZemdbClient};
+pub use api::{ChangeStream, Direction, Key, RoomHandle, Row, Scan, TableHandle, ZemdbClient};
 pub use client::{Client, RoomStatus};
 pub use config::{ClientConfig, Freshness};
 pub use error::{ClientError, Rejection, Violation};

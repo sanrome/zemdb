@@ -219,6 +219,7 @@ pub fn status(head_seq: u64, epoch: u64, registered: bool) -> RoomStatus {
         writes_in_flight: 0,
         retained: 0,
         worker: None,
+        watches: 0,
     }
 }
 
@@ -1143,10 +1144,11 @@ impl<E> TestEngine<E> {
         }
     }
 
-    /// Holds the next call of `method` (`open_room`, `reload_schema`, `get_by_id`,
+    /// Holds the next call of `method` (`open_room`, `reload_schema`, `apply_batch`, `get_by_id`,
     /// `check_operation`, `close_room` or `delete_room`) before it reaches the engine, or the next
     /// `get_by_id` once the engine read its row (`get_by_id:read`): [`Held::replied`] waits until
-    /// the call is held, and the call goes on once the [`Held`] is released or dropped.
+    /// the call is held, and the call goes on once the [`Held`] is released or dropped. A
+    /// [`Held`] dropped before a call reaches it holds none.
     pub fn hold_next(&self, method: &'static str) -> Held {
         let (replied_tx, replied) = oneshot::channel();
         let (release, release_rx) = oneshot::channel();
@@ -1159,6 +1161,8 @@ impl<E> TestEngine<E> {
     async fn hold(&self, method: &str) {
         let held = {
             let mut holds = self.holds.lock().unwrap();
+            // A hold whose `Held` was dropped before a call reached it holds nothing.
+            holds.retain(|(_, reached, _)| !reached.is_closed());
             let index = holds.iter().position(|(held, ..)| *held == method);
             index.map(|index| holds.remove(index))
         };
@@ -1173,7 +1177,10 @@ impl<E> TestEngine<E> {
         *self.before_reload.lock().unwrap() = Some(Box::new(before));
     }
 
-    /// Makes the next call of `method` (a method of `StorageEngine`) return `error`.
+    /// Makes the next call of `method` (a method of `StorageEngine`) return `error`, or the next
+    /// `apply_batch` once the engine applied it (`apply_batch:applied`), or panic then
+    /// (`apply_batch:panic`, whose error is not used), or the next `close_room` once the engine
+    /// closed the room (`close_room:panic`).
     pub fn fail_next(&self, method: &'static str, error: StorageError) {
         self.failing.lock().unwrap().push((method, error));
     }
@@ -1221,6 +1228,9 @@ impl<E: StorageEngine> StorageEngine for TestEngine<E> {
         self.hold("close_room").await;
         let closed = self.inner.close_room(room_id).await;
         self.check("close_room")?;
+        if self.check("close_room:panic").is_err() {
+            panic!("The engine panics once it closed the room");
+        }
         closed
     }
 
@@ -1235,8 +1245,14 @@ impl<E: StorageEngine> StorageEngine for TestEngine<E> {
         room_id: &RoomId,
         ops: Vec<SequencedOperation>,
     ) -> Result<ApplyReport, StorageError> {
+        self.hold("apply_batch").await;
         self.check("apply_batch")?;
-        self.inner.apply_batch(room_id, ops).await
+        let applied = self.inner.apply_batch(room_id, ops).await?;
+        self.check("apply_batch:applied")?;
+        if self.check("apply_batch:panic").is_err() {
+            panic!("The engine panics once it applied the batch");
+        }
+        Ok(applied)
     }
 
     async fn check_operation(

@@ -40,6 +40,12 @@ impl RoomHandle {
         self.client.core().status(self.room_id.clone()).await
     }
 
+    /// Catches the replica up with the server, as [`Client::sync`](crate::Client::sync) does:
+    /// the changes it applies reach the [`watch`](TableHandle::watch) streams of the room.
+    pub async fn sync(&self) -> Result<(), ClientError> {
+        self.client.core().sync(self.room_id.clone()).await
+    }
+
     /// Closes the room, as [`Client::close_room`](crate::Client::close_room) does.
     pub async fn close(&self) -> Result<(), ClientError> {
         self.client.core().close_room(self.room_id.clone()).await

@@ -8,8 +8,11 @@ use zemdb_core::{
 use zemdb_storage::{KeyRange, ScanDirection, ScanOptions, StorageEngine, StorageError};
 
 use super::crypto::{decrypt, no_engine, Cell, Draft};
+use super::watch::Watch;
 use super::write::{bounded, checked, fitting, prechecked, Writer};
-use super::{Direction, Key, RoomHandle, Row, Scan};
+use super::{ChangeStream, Direction, Key, RoomHandle, Row, Scan};
+use crate::client::Subscription;
+use crate::watch::Watched;
 use crate::ClientError;
 
 /// A table of a room, by its name, which each call resolves against the schema of the replica:
@@ -62,6 +65,58 @@ impl TableHandle {
     pub async fn scan(&self, scan: &Scan) -> Result<Vec<Row>, ClientError> {
         let read = self.plan(|schema, crypto| Read::scan(schema, &self.name, scan, crypto))?;
         self.read(read).await
+    }
+
+    /// The row of `key`, as [`get`](Self::get) reads it, and then again each time it changes in
+    /// the replica: a stream whose first element is its current value, and then one per change,
+    /// once visible in the replica (and durable, with a disk engine), and only if the row is not
+    /// the last one emitted. It sends nothing.
+    ///
+    /// The stream is subscribed before it reads its first value, so a change in the middle reads
+    /// it again. A batch that the replica applies reads it again if it holds an operation of its
+    /// key that the replica took (one it rejects changes nothing, and is never emitted), and so
+    /// do a snapshot installed, the reopening of the storage room after an error, a reload of the
+    /// schema (a column added appears in `NULL`), and the replica opened or discarded. A consumer
+    /// that reads late gets the current row, skipping those in between.
+    ///
+    /// A read that fails (`InvalidOperation`, `Crypto`, `Decryption`, `Storage`) is an element,
+    /// the stream goes on, and the next row is compared with the last one emitted; a key or a
+    /// table that the schema does not take is read again only once every row may have changed.
+    /// While the replica is empty (after a discard, until the room registers) or out of the
+    /// client in the middle of a change, it emits nothing, and the change that opens it reads it
+    /// again. It ends once the room is out of the client at the end of a change: closed, the
+    /// client shut down, or taken out by an error; and at once in a room out of the client.
+    pub fn watch(&self, key: &Key) -> ChangeStream<Option<Row>> {
+        let watch = Watch::Row(key.clone());
+        ChangeStream::new(self.clone(), watch, |mut rows| rows.pop())
+    }
+
+    /// The rows that `scan` asks for, as [`scan`](Self::scan) reads them, and then again each
+    /// time they change in the replica, as [`watch`](Self::watch) reads its row: a batch reads
+    /// them again if it holds an operation of the table that the replica took, and they are
+    /// emitted only if they are not the last ones.
+    pub fn watch_scan(&self, scan: &Scan) -> ChangeStream<Vec<Row>> {
+        let watch = Watch::Rows(scan.clone());
+        ChangeStream::new(self.clone(), watch, |rows| rows)
+    }
+
+    /// The rows that `watch` reads, for its stream, which `subscription` holds: planned against
+    /// the schema of the replica, the subscription looks at the row or the table it resolved
+    /// before the storage is read, so a batch that the read does not see marks it again. A read
+    /// that the schema does not take, or that finds the replica empty or out of the client, looks
+    /// at nothing that a batch changes.
+    pub(super) async fn watched(
+        &self,
+        watch: &Watch,
+        subscription: &Subscription,
+    ) -> Result<Vec<Row>, ClientError> {
+        let planned = self.plan(|schema, crypto| match watch {
+            Watch::Row(key) => Read::get(schema, &self.name, key, crypto),
+            Watch::Rows(scan) => Read::scan(schema, &self.name, scan, crypto),
+        });
+        let planned = planned.inspect_err(|_| subscription.watch(Watched::Unresolved))?;
+        subscription.watch(planned.1.watched());
+        self.read(planned).await
     }
 
     /// Inserts `row`, the `Insert` of the protocol: a row with its key already in the table is
@@ -299,6 +354,15 @@ impl Read {
             sealed,
             target: Target::Scan(options),
         })
+    }
+
+    /// What a subscription of a watch with this read looks at: the row of its key, or the rows of
+    /// its table.
+    fn watched(&self) -> Watched {
+        match &self.target {
+            Target::Key(pk) => Watched::Row(self.table_id, pk.clone()),
+            Target::Scan(_) => Watched::Table(self.table_id),
+        }
     }
 
     /// The rows of the read in the storage room `room_id` of `storage`, with their primary keys,

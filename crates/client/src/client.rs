@@ -7,6 +7,7 @@ use std::future::Future;
 use std::ops::Deref;
 use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::task::Waker;
 use std::time::Duration;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -17,6 +18,7 @@ use zemdb_core::{
 use zemdb_storage::{StorageEngine, StorageError};
 
 use crate::token::issued_to;
+use crate::watch::{Change, Watched, Watches};
 use crate::worker::Worker;
 use crate::{
     ClientConfig, ClientError, Freshness, MetadataStore, RoomMetadata, TokenProvider,
@@ -77,6 +79,8 @@ pub struct RoomStatus {
     pub retained: usize,
     /// The worker of the room, if it has one.
     pub worker: Option<WorkerStatus>,
+    /// The subscriptions of `watch` to the room whose streams are alive.
+    pub watches: usize,
 }
 
 /// The local side of the client, which the changes of the replicas use from their tasks.
@@ -120,6 +124,11 @@ struct State {
     /// Whether the last request of the room got a reply, once one ended.
     connected: Option<bool>,
     writes: Writes,
+    /// The subscriptions of `watch` to the room.
+    watches: Watches,
+    /// Whether a change of the replica is in progress, under the applier: a replica out of the
+    /// client in the middle of one may come back.
+    changing: bool,
 }
 
 impl State {
@@ -485,6 +494,83 @@ impl Room {
         let mut state = self.state();
         if state.token == token {
             state.forbidden = true;
+        }
+    }
+
+    /// Whether the room has subscriptions of `watch`.
+    fn is_watched(&self) -> bool {
+        !self.state().watches.is_empty()
+    }
+
+    /// Notifies `change`, once visible in the replica, to the subscriptions of the room: marks
+    /// those it touches, under the lock of the room, and wakes their streams without it.
+    fn notify(&self, change: &Change) {
+        let woken = self.state().watches.mark(change);
+        woken.into_iter().for_each(Waker::wake);
+    }
+}
+
+/// A change of the replica of a room in progress, from the start of its task to its end, also
+/// if its task panics or is cut. At the end, if the change left the replica out of the client,
+/// every subscription of `watch` to the room ends, under the lock of the room with which a
+/// subscription is entered, so none entered in the middle of the change is left waiting; and a
+/// change that panicked with the replica in the client marks all of them, since it may have
+/// changed the replica without its notice.
+struct Settled(Arc<Room>);
+
+impl Settled {
+    fn new(room: Arc<Room>) -> Self {
+        room.state().changing = true;
+        Self(room)
+    }
+}
+
+impl Drop for Settled {
+    fn drop(&mut self) {
+        let woken = {
+            let mut state = self.0.state();
+            state.changing = false;
+            match state.replica {
+                Replica::Closed => state.watches.end(),
+                _ if std::thread::panicking() => state.watches.mark(&Change::All),
+                _ => Vec::new(),
+            }
+        };
+        woken.into_iter().for_each(Waker::wake);
+    }
+}
+
+/// A subscription of `watch` to a room, from before its stream reads its first value: it leaves
+/// the room when it is dropped.
+pub(crate) struct Subscription {
+    /// The room, and the id of the subscription in it; `None` if the subscription ended as it was
+    /// made, in a room out of the client.
+    entry: Option<(Arc<Room>, u64)>,
+}
+
+impl Subscription {
+    /// Sets what the subscription looks at, which the batches that change it mark.
+    pub(crate) fn watch(&self, watched: Watched) {
+        if let Some((room, id)) = &self.entry {
+            room.state().watches.watch(*id, watched);
+        }
+    }
+
+    /// Waits until a change marks the subscription, and takes the mark: `true`, or `false` once
+    /// the room ended it. A mark that comes in the meantime is not lost: the stream takes it, or
+    /// leaves its waker, under the lock with which the applier marks.
+    pub(crate) async fn changed(&self) -> bool {
+        let Some((room, id)) = &self.entry else {
+            return false;
+        };
+        std::future::poll_fn(|cx| room.state().watches.poll(*id, cx)).await
+    }
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        if let Some((room, id)) = &self.entry {
+            room.state().watches.remove(*id);
         }
     }
 }
@@ -1019,6 +1105,7 @@ impl Client {
         let room = Arc::clone(room);
         let task = tokio::spawn(async move {
             let _applier = applier;
+            let _settled = Settled::new(Arc::clone(&room));
             let changed = change.await;
             let mut state = room.state();
             if !matches!(&state.replica, Replica::Open(open) if !open.failed_closed) {
@@ -1945,6 +2032,26 @@ impl Client {
         }
     }
 
+    /// Subscribes to the changes of the replica of `room_id`, for a `watch`: the
+    /// subscription is entered marked, before its stream reads its first value, and the applier
+    /// marks it after each change of the replica that touches what it looks at. In a room out of
+    /// the client with no change in progress (never opened, or closed), it ends as it is made.
+    pub(crate) fn subscribe(&self, room_id: &RoomId) -> Subscription {
+        let Ok(room) = self.room(room_id) else {
+            return Subscription { entry: None };
+        };
+        let id = {
+            let mut state = room.state();
+            if matches!(state.replica, Replica::Closed) && !state.changing {
+                return Subscription { entry: None };
+            }
+            state.watches.add()
+        };
+        Subscription {
+            entry: Some((room, id)),
+        }
+    }
+
     /// Whether the replica of `room_id` is still of `epoch`: no discard came since a read of its
     /// schema in that epoch, so its storage room holds the same incarnation.
     pub(crate) fn is_of_epoch(&self, room_id: &RoomId, epoch: u64) -> bool {
@@ -1983,6 +2090,7 @@ impl Client {
                 writes_in_flight: state.writes.entries.len(),
                 retained: state.writes.retained.len(),
                 worker: None,
+                watches: state.watches.len(),
             };
             (status, state.connected)
         };
@@ -2165,6 +2273,7 @@ impl Local {
         {
             Ok(()) => {
                 room.state().replica = Replica::Open(OpenReplica::new(metadata, false));
+                room.notify(&Change::All);
                 Ok(())
             }
             Err(StorageError::SnapshotCorruption(_) | StorageError::WalCorruption(_)) => {
@@ -2225,6 +2334,7 @@ impl Local {
             open.awaits_snapshot = waits(SequenceNumber::new(0));
             room.state().replica = Replica::Open(open);
             room.announced(epoch, snapshot);
+            room.notify(&Change::All);
             return Ok(());
         };
         let head = self.storage.get_head_seq(&room.id).await?;
@@ -2246,6 +2356,7 @@ impl Local {
                 return Err(err);
             }
             room.update(epoch, |open| open.metadata = metadata);
+            room.notify(&Change::All);
         }
         room.update(epoch, |open| {
             open.registered = true;
@@ -2293,11 +2404,24 @@ impl Local {
         {
             return Ok(Applied::Head(head));
         }
+        // The keys that the batch may change, for the subscriptions of the room; without any when
+        // the batch starts, one entered in the middle is marked by every row.
+        let keys = room.is_watched().then(|| {
+            let keys = ops
+                .iter()
+                .map(|op| (op.seq, op.op.table_id(), op.op.pk().clone()));
+            keys.collect::<Vec<_>>()
+        });
         match self.storage.apply_batch(&room.id, ops).await {
             Ok(report) => {
                 let rejected = report.rejected().iter();
                 let rejected = rejected.map(|(seq, reason)| (*seq, *seq, reason.clone().into()));
                 room.state().writes.applied(report.head_seq(), rejected);
+                let changed = match keys {
+                    Some(keys) => Change::applied(keys, report.rejected()),
+                    None => Change::All,
+                };
+                room.notify(&changed);
                 Ok(Applied::Head(report.head_seq()))
             }
             Err(StorageError::SchemaValidation(_)) if again => {
@@ -2357,7 +2481,10 @@ impl Local {
         let head = self.storage.get_head_seq(&room.id).await?;
         let installed = self.storage.apply_snapshot(&room.id, schema, snapshot, seq);
         let installed = match installed.await {
-            Ok(installed) => installed,
+            Ok(installed) => {
+                room.notify(&Change::All);
+                installed
+            }
             Err(StorageError::SnapshotBehind { .. }) => head,
             Err(err) => {
                 return match err {
@@ -2475,9 +2602,12 @@ impl Local {
         }
         removed?;
         self.storage.delete_room(&room.id).await?;
-        let mut state = room.state();
-        state.replica = Replica::Empty;
-        state.epoch += 1;
+        {
+            let mut state = room.state();
+            state.replica = Replica::Empty;
+            state.epoch += 1;
+        }
+        room.notify(&Change::All);
         Ok(())
     }
 
