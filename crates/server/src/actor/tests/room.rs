@@ -1005,7 +1005,7 @@ async fn ack_below_the_stored_cursor_is_a_successful_no_op() {
 
 /// A commit's catch-up and a sync return the operations of the RAM buffer themselves: the
 /// operation of a client up to date, the catch-up of a client behind and a sync share each
-/// operation, without copies (DS6).
+/// operation, without copies.
 #[tokio::test]
 async fn catch_ups_and_syncs_share_the_operations_of_the_ram_buffer() {
     let fx = Fixture::new(RoomLifecycleOverrides::default()).await;
@@ -5153,7 +5153,7 @@ async fn events_until_the_room_stops(
 
 /// A group whose fsync fails is never announced: its commits are answered `Unavailable`, the
 /// room stops, and its streams end with only the events of what was durable. An `ops` event
-/// announced anyway would hand clients operations that may never be durable (INV-D7).
+/// announced anyway would hand clients operations that may never be durable.
 #[tokio::test]
 async fn a_group_whose_fsync_fails_is_never_announced() {
     const WAITING: u8 = 4;

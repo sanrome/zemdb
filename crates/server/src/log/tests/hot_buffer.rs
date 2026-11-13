@@ -29,7 +29,7 @@ fn range_queries_return_only_contiguous_operations_within_the_budget() {
 }
 
 /// A read returns the operations of the buffer themselves, not copies of them: two reads of a
-/// range share each operation with each other and with what was appended (DS6).
+/// range share each operation with each other and with what was appended.
 #[test]
 fn reads_share_the_operations_of_the_buffer() {
     let mut buffer = HotBuffer::new();

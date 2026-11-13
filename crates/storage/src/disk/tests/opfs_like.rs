@@ -1,9 +1,9 @@
-//! The disk engine on a file layer that refuses what the Origin Private File System refuses
-//! (spike S3 of DC17): moving or removing a file with a handle open, at the source or at the
-//! destination, read-only handles included. It renames an open file as a layer on the OPFS will:
-//! it closes the handle, moves the file and opens it again. Its paths are virtual, mapped to a
-//! real directory, and nothing exists at them: an operation of the engine on its files that does
-//! not go through the layer fails.
+//! The disk engine on a file layer that refuses what the Origin Private File System refuses, as a
+//! spike on the OPFS found: moving or removing a file with a handle open, at the source or at the
+//! destination, read-only handles included. It renames an open file as a layer on the OPFS will: it
+//! closes the handle, moves the file and opens it again. Its paths are virtual, mapped to a real
+//! directory, and nothing exists at them: an operation of the engine on its files that does not go
+//! through the layer fails.
 
 use super::snapshot_with_rows;
 use super::support::*;
@@ -355,7 +355,7 @@ async fn reopen_on(
     open_on(layer, room).await
 }
 
-/// How the engine opens or creates each of its files (DC17): the lock file and the WAL with their
+/// How the engine opens or creates each of its files: the lock file and the WAL with their
 /// lock, creating them if missing; the fresh WAL of a rotation and the staged snapshots with their
 /// lock, never adopting a file; the copy of an absorption truncating; the snapshot and the rotated
 /// WAL for reading.

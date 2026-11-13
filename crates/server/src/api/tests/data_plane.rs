@@ -683,7 +683,7 @@ async fn a_request_waiting_for_its_room_holds_none_of_the_budget() {
 
 /// The replies that carry operations, a `SyncBatch` and a `CommitAck`, are exactly the bytes of
 /// their `ServerMessage` with copies of the operations, wherever the operations come from: cold
-/// and warm segments, `active.wal` or the RAM buffer (INV-W2, DS6).
+/// and warm segments, `active.wal` or the RAM buffer.
 #[tokio::test(start_paused = true)]
 async fn replies_with_operations_from_every_tier_are_the_bytes_of_their_message() {
     // Segments of two operations, compressed to cold at the first slow tick; two in RAM. The
@@ -769,7 +769,7 @@ async fn replies_with_operations_from_every_tier_are_the_bytes_of_their_message(
 }
 
 /// A reply with shared operations is the bytes of its `ServerMessage` with copies of them for
-/// every value of its flags, so that none of its fields is out of place (INV-W2, DS6).
+/// every value of its flags, so that none of its fields is out of place.
 #[test]
 fn an_ops_reply_is_the_bytes_of_its_message_with_every_flag() {
     let ops: Vec<std::sync::Arc<SequencedOperation>> = (1..=3u8)

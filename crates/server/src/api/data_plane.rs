@@ -58,7 +58,7 @@ impl Frame for OpsReply {}
 
 /// A `CommitAck` or a `SyncBatch` whose operations are shared with the room's RAM buffer: it
 /// encodes to exactly the bytes of the [`ServerMessage`] variant of the same name with copies of
-/// them (DS6), so that a reply is encoded without copying its operations first.
+/// them, so that a reply is encoded without copying its operations first.
 #[derive(Debug)]
 pub(crate) enum OpsReply {
     CommitAck {

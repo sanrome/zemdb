@@ -769,7 +769,7 @@ fn a_frame_stored_in_a_torn_frame_of_the_group_is_found() {
     // A frame of the group whose header survived and whose payload did not fails its check, and
     // the search goes on inside its payload, where a frame stored as a value, which starts a
     // group of its own, is taken for a later write: corruption, which truncates nothing (the
-    // risk accepted with D79, for any torn frame of the group).
+    // risk accepted for any torn frame of the group).
     let first = encode_wal_batch_in_group(&[delete_op(1)], None, 0).unwrap();
     let row = CompactRow::new(vec![Value::Int(1), Value::Bytes(delete_frame(9).into())]);
     let op = SequencedOperation::new(2, Operation::insert(0, PrimaryKey::single(1i64), row, 100));

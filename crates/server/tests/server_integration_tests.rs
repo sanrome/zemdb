@@ -1572,7 +1572,7 @@ async fn register_with_a_cursor_beyond_the_head_is_an_invalid_sequence() {
 /// valid token for the room id, which opens the event stream of the new room, where the
 /// operations that follow its old cursor are another room's. Each `ops` event says the
 /// incarnation of its room, which is not the one the client registered with, so the client does
-/// not apply it and registers again (INV-K1, INV-Y7; its `/sync` is `ClientNotRegistered`).
+/// not apply it and registers again (its `/sync` is `ClientNotRegistered`).
 #[tokio::test]
 async fn the_ops_events_of_a_recreated_room_say_their_incarnation() {
     let server = TestServer::start(|_| {}).await;

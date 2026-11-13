@@ -2838,8 +2838,8 @@ fn fetch_cost_does_not_grow_with_the_number_of_segments() {
 }
 
 /// Two responses that read the same operations of the RAM buffer share them, and each still
-/// reserves all of them, as a response with copies did (INV-B1): what a response reserves does
-/// not depend on who else holds its operations.
+/// reserves all of them, as a response with copies did: what a response reserves does not depend
+/// on who else holds its operations.
 #[test]
 fn each_response_reserves_the_operations_it_shares() {
     use zemdb_core::id::{ClientId, RoomId};
@@ -2874,7 +2874,7 @@ fn each_response_reserves_the_operations_it_shares() {
 
 /// A read that starts in the disk tiers and goes on in the RAM buffer, as after a seal that
 /// failed once `active.wal` was renamed (the disk tiers then end before the head), shares the
-/// operations it takes from the buffer too (DS6).
+/// operations it takes from the buffer too.
 #[test]
 fn a_read_that_goes_on_from_disk_into_ram_shares_the_operations_of_the_buffer() {
     let dir = tempdir().unwrap();
