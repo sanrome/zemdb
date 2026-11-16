@@ -564,6 +564,7 @@ impl TestServer {
             events_hold: Arc::default(),
             streams: Arc::default(),
             hushed: Arc::default(),
+            takes: Arc::default(),
         }
     }
 }
@@ -686,6 +687,39 @@ pub struct TestTransport {
     streams: Arc<Mutex<Vec<Control>>>,
     /// The clients whose heartbeats get no reply, and are not logged.
     hushed: Arc<Mutex<Vec<ClientId>>>,
+    /// The events to take out of the streams, by their name, with where each one goes.
+    takes: Arc<Mutex<Vec<Take>>>,
+}
+
+/// The name of an event that a [`TestTransport`] takes out of the stream it comes in, with where
+/// its text goes.
+type Take = (String, oneshot::Sender<String>);
+
+/// An event that a [`TestTransport`] took out of the stream it came in.
+pub struct Taken(oneshot::Receiver<String>);
+
+impl Taken {
+    /// The text of the event, once it came: within 60 s.
+    pub async fn text(self) -> String {
+        let text = tokio::time::timeout(Duration::from_secs(60), self.0).await;
+        text.expect("No event came").unwrap()
+    }
+}
+
+/// Takes `block` out of its stream for the first of `takes` whose event it is, if any, and gives
+/// it its text: the server writes each event in a block of its own.
+fn taken(takes: &Mutex<Vec<Take>>, block: &Bytes) -> bool {
+    let Ok(text) = std::str::from_utf8(block) else {
+        return false;
+    };
+    let mut takes = takes.lock().unwrap();
+    let of = |(name, _): &Take| text.starts_with(&format!("event: {name}\n"));
+    let Some(index) = takes.iter().position(of) else {
+        return false;
+    };
+    let (_, take) = takes.remove(index);
+    let _ = take.send(text.to_string());
+    true
 }
 
 /// A request running in its task, counted by its transport until it ends.
@@ -908,10 +942,15 @@ impl TransportClient for TestTransport {
             return Ok(opened);
         };
         // The stream ends with its own end or once ended, and what is written into it comes
-        // between its blocks.
+        // between its blocks; the events taken out of it are not among them.
         let (control, controlled) = futures::channel::mpsc::unbounded();
         self.streams.lock().unwrap().push(control);
+        let takes = Arc::clone(&self.takes);
         let own = blocks
+            .filter(move |block| {
+                let taken = block.as_ref().is_ok_and(|block| taken(&takes, block));
+                std::future::ready(!taken)
+            })
             .map(Some)
             .chain(futures::stream::once(async { None }));
         let written = controlled.map(|block: Option<Bytes>| block.map(Ok));
@@ -963,6 +1002,15 @@ impl TestTransport {
         for control in streams.iter() {
             let _ = control.unbounded_send(None);
         }
+    }
+
+    /// Takes the next event named `name` that a stream brings out of it, as a network that loses
+    /// it: the client does not read it, and the test gets its text, to write it into the stream
+    /// later ([`inject`](Self::inject)) or never.
+    pub fn take_next_event(&self, name: &str) -> Taken {
+        let (take, taken) = oneshot::channel();
+        self.takes.lock().unwrap().push((name.to_string(), take));
+        Taken(taken)
     }
 
     /// Answers each opening of an event stream that `answer` gives an answer for with it, without

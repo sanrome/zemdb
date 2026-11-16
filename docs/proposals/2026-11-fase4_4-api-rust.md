@@ -962,6 +962,7 @@ Una versión corta en la suite y una larga con `#[ignore]`.
 
 ### Lote 11 · Revisión de cierre y cierre · ⬜
 - La revisión de cierre (§3), con la app de referencia como criterio de aceptación. Si no sale en verde, sus rupturas se arreglan en lotes nuevos de 4.4, cada uno con su revisión de delta.
+- **Pendiente del Lote 8 de 4.3** (de su revisión de delta, que cerró después del Lote 8 de este plan): el estado de la conexión lo cambian solo los pedidos, y desde el Lote 8 de 4.3 un evento `ops` se aplica sin un sync. En `live`, hasta ese lote, cada `ops` llevaba a un sync, que lo refrescaba. Ahora, después de un pedido sin respuesta que no es un heartbeat (cuyo reintento llega dentro de su backoff), `connected` queda en `false` hasta el próximo heartbeat, a lo sumo un intervalo después, aunque el stream siga trayendo operaciones: una escritura de la fachada en ese lapso es `Offline`. Es lo que dice DC36 (el estado de la conexión es el de los pedidos); que la revisión decida si un evento cuenta como una respuesta para `Offline`, o lo deje como un límite.
 - `INVARIANTES.md`: el estado de cada invariante revisada. El plan de la fase: 4.4 cerrada. `ROADMAP.md`: "Lo que sigue".
 
 ---

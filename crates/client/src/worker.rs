@@ -62,7 +62,8 @@ pub(crate) type Ended = future::Shared<oneshot::Receiver<()>>;
 /// The worker of a room: a task of its own, which holds the client by a `Weak`, so that it ends
 /// once the application drops the client: at once, or at its next heartbeat if a task of a
 /// worker, of any room, holds the client meanwhile (a heartbeat, an acknowledgement, a sync, a
-/// transfer or the opening of its event stream). Dropping the worker stops its task too.
+/// transfer, the opening of its event stream or the application of an event). Dropping the
+/// worker stops its task too.
 pub(crate) struct Worker {
     shared: Arc<Mutex<Shared>>,
     /// Wakes the task when its mode changes.
@@ -136,9 +137,9 @@ impl Worker {
         }
     }
 
-    /// Stops its task at its next `.await`: the task closes its event stream, cuts its sync, its
-    /// transfer and the opening of its stream, waits until they ended, and sends its last
-    /// acknowledgement. Returns what resolves once the task ended.
+    /// Stops its task at its next `.await`: the task closes its event stream, cuts the
+    /// application of an event, its sync, its transfer and the opening of its stream, waits until
+    /// they ended, and sends its last acknowledgement. Returns what resolves once the task ended.
     pub(crate) fn stop(self) -> Ended {
         let Self { stop, ended, .. } = self;
         drop(stop);
@@ -254,22 +255,28 @@ async fn read(stream: &mut Option<Stream>) -> Result<Option<SseEvent>, StreamErr
     }
 }
 
-/// Takes `event`, of the stream of the worker of `room_id`, as a notice: a sync for the
-/// operations it brings or does not decode, for a head that moved or for events missed; a
-/// registration, with the cursor, for a change of the schema, which the sync of the worker sends
-/// first; and a heartbeat in the task of the transfers for a designation, or for a snapshot when
-/// the replica waits for one.
+/// Takes `event`, of the stream that the worker of `room_id` opened for the replica of `epoch`:
+/// the operations it brings, in the task of the applications ([`Client::worker_apply`]), which
+/// runs none; and any other as a notice: a sync for one that does not decode, for a head that
+/// moved or for events missed; a registration, with the cursor, for a change of the schema,
+/// which the sync of the worker sends first; and a heartbeat in the task of the transfers for a
+/// designation, or for a snapshot when the replica waits for one.
 fn notice(
     event: &SseEvent,
-    client: &Held,
-    room_id: &RoomId,
+    (client, room_id, epoch): (&Held, &RoomId, u64),
     (syncing, pending): (
         &mut Option<JoinHandle<Result<bool, ClientError>>>,
         &mut bool,
     ),
     transferring: &mut Option<JoinHandle<Result<(), ClientError>>>,
+    applying: &mut Option<JoinHandle<Result<bool, ClientError>>>,
 ) {
     match event.decode() {
+        Ok(RoomEvent::Ops(event)) => {
+            let (client, room_id) = (client.clone(), room_id.clone());
+            let task = async move { client.worker_apply(&room_id, epoch, event).await };
+            *applying = Some(tokio::spawn(task));
+        }
         Ok(RoomEvent::SchemaReloaded) => {
             client.unregister(room_id);
             sync(syncing, pending, client, room_id);
@@ -281,7 +288,7 @@ fn notice(
             }
         }
         Ok(RoomEvent::Unknown) => {}
-        Ok(RoomEvent::Ops(_) | RoomEvent::HeadAdvanced(_) | RoomEvent::Lagged) | Err(_) => {
+        Ok(RoomEvent::HeadAdvanced(_) | RoomEvent::Lagged) | Err(_) => {
             sync(syncing, pending, client, room_id);
         }
     }
@@ -338,32 +345,34 @@ fn sync(
     *sync = Some(tokio::spawn(task));
 }
 
-/// The task of the worker of `room_id`, until `stop` is dropped, the client is dropped, or a
-/// step stops it; then it closes its event stream, cuts its sync, its transfer and the opening
-/// of its stream, waits until they ended, and, unless the client was dropped, acknowledges the
-/// head of the replica if it moved, once and within [`LAST_ACK`] (a replica that failed closed
-/// or left the client sends nothing). It sends a heartbeat every interval, the first at a random
-/// moment within the first, so that the clients that start together do not send theirs
-/// together, and after each one that succeeds, the acknowledgement of the head of the replica if
-/// it moved, and every [`ACK_AGAIN_BEATS`] also if it did not, unless the replica waits for a
-/// snapshot. A heartbeat transfers nothing: the snapshot its ack asks to upload or announces goes
-/// in a task of its own, one at a time, and the heartbeats go on meanwhile. Unless the mode is
-/// `Manual`, a heartbeat whose ack reports a head past that of the replica leads to a sync, in a
-/// task of its own, without an acknowledgement: one at a time, and one more once it ends if a
-/// heartbeat or an event asked for one meanwhile and the mode still syncs. A batch of the sync
+/// The task of the worker of `room_id`, until `stop` is dropped, the client is dropped, or a step
+/// stops it; then it closes its event stream, cuts the application of an event, its sync, its
+/// transfer and the opening of its stream, waits until they ended, and, unless the client was
+/// dropped, acknowledges the head of the replica if it moved, once and within [`LAST_ACK`] (a
+/// replica that failed closed or left the client sends nothing). It sends a heartbeat every
+/// interval, the first at a random moment within the first, so that the clients that start together
+/// do not send theirs together, and after each one that succeeds, the acknowledgement of the head
+/// of the replica if it moved, and every [`ACK_AGAIN_BEATS`] also if it did not, unless the replica
+/// waits for a snapshot. A heartbeat transfers nothing: the snapshot its ack asks to upload or
+/// announces goes in a task of its own, one at a time, and the heartbeats go on meanwhile. Unless
+/// the mode is `Manual`, a heartbeat whose ack reports a head past that of the replica leads to a
+/// sync, in a task of its own, without an acknowledgement: one at a time, and one more once it ends
+/// if a heartbeat or an event asked for one meanwhile and the mode still syncs. A batch of the sync
 /// that asks the client for a snapshot is confirmed by a heartbeat in the task of the transfers.
 /// After [`WAITING_BEATS`] heartbeats in a row that leave the replica waiting for a snapshot that
-/// no reply announced, the next one registers it again. A heartbeat that fails is sent again
-/// after a backoff with full jitter, and the first that succeeds goes back to the interval.
+/// no reply announced, the next one registers it again. A heartbeat that fails is sent again after
+/// a backoff with full jitter, and the first that succeeds goes back to the interval.
 ///
 /// In `Live`, it opens the event stream of the room (in a task of its own), and syncs once it is
-/// open, for what came before it subscribed; each event of it is a notice ([`notice`]), once its
-/// epoch is that of the replica: a stream of another epoch, which an event or a heartbeat finds,
-/// is replaced at once. Its end, an error reading or opening it, or [`SILENCE`] without a block
-/// open another one after a backoff with full jitter, which an event starts over; the refusal
-/// of a server with its event stream turned off, after `events_retry`. Its mode is read at each
-/// step, and a change of it wakes the task, which opens the stream or closes it once the step in
-/// progress ends; the waits before opening it again are kept across modes.
+/// open, for what came before it subscribed; it takes each event of it ([`notice`]), once its epoch
+/// is that of the replica: a stream of another epoch, which an event or a heartbeat finds, is
+/// replaced at once. The operations of an event go through the applier in a task of their own, one
+/// event at a time: the stream is not read meanwhile, and once it ends, a sync if the event asked
+/// for one and the mode still syncs. Its end, an error reading or opening it, or [`SILENCE`]
+/// without a block open another one after a backoff with full jitter, which an event starts over;
+/// the refusal of a server with its event stream turned off, after `events_retry`. Its mode is read
+/// at each step, and a change of it wakes the task, which opens the stream or closes it once the
+/// step in progress ends; the waits before opening it again are kept across modes.
 ///
 /// [`SILENCE`]: crate::events::SILENCE
 async fn run(
@@ -377,6 +386,8 @@ async fn run(
     let mut next = Instant::now() + jitter(config.heartbeat_interval);
     let mut transferring: Option<JoinHandle<Result<(), ClientError>>> = None;
     let mut syncing: Option<JoinHandle<Result<bool, ClientError>>> = None;
+    // The application of the operations of an event: whether it asks for a sync.
+    let mut applying: Option<JoinHandle<Result<bool, ClientError>>> = None;
     // Whether a heartbeat or an event asked for a sync while one ran.
     let mut pending = false;
     // How many heartbeats in a row left the replica waiting for a snapshot that no reply
@@ -454,7 +465,31 @@ async fn run(
                 }
                 continue;
             }
-            read = read(&mut events.stream) => {
+            applied = ended_task(&mut applying) => {
+                applying = None;
+                let wanted = match applied {
+                    Ok(wanted) => {
+                        ended(&shared, Ok(()));
+                        wanted
+                    }
+                    Err(err) => {
+                        if ended(&shared, Err(err)) {
+                            break;
+                        }
+                        true
+                    }
+                };
+                // Unless the mode turned `Manual` meanwhile.
+                if wanted && syncs(&shared) {
+                    let Some(client) = held(&weak) else {
+                        break;
+                    };
+                    sync(&mut syncing, &mut pending, &client, &room_id);
+                }
+                continue;
+            }
+            // One event at a time: none is read while the operations of one are applied.
+            read = read(&mut events.stream), if applying.is_none() => {
                 let Some(client) = held(&weak) else {
                     break;
                 };
@@ -466,13 +501,13 @@ async fn run(
                     }
                 };
                 let epoch = events.stream.as_ref().map(|stream| stream.epoch);
-                if !epoch.is_some_and(|epoch| client.is_of_epoch(&room_id, epoch)) {
+                let Some(epoch) = epoch.filter(|epoch| client.is_of_epoch(&room_id, *epoch)) else {
                     events.replace();
                     continue;
-                }
+                };
                 events.backoff = Backoff::worker(&config);
-                let syncing = (&mut syncing, &mut pending);
-                notice(&event, &client, &room_id, syncing, &mut transferring);
+                let (of, syncing) = ((&client, &room_id, epoch), (&mut syncing, &mut pending));
+                notice(&event, of, syncing, &mut transferring, &mut applying);
                 continue;
             }
             () = tokio::time::sleep_until(events.retry_at), if events.due(live) => {
@@ -544,8 +579,11 @@ async fn run(
     } = events;
     drop(stream);
     drop(showing);
-    let (syncing, transferring, opening) =
-        (syncing.map(cut), transferring.map(cut), opening.map(cut));
+    let (applying, syncing) = (applying.map(cut), syncing.map(cut));
+    let (transferring, opening) = (transferring.map(cut), opening.map(cut));
+    if let Some(applying) = applying {
+        let _ = applying.await;
+    }
     if let Some(syncing) = syncing {
         let _ = syncing.await;
     }

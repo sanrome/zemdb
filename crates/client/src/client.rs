@@ -17,7 +17,7 @@ use zemdb_core::{
 };
 use zemdb_storage::{StorageEngine, StorageError};
 
-use crate::events::EventReader;
+use crate::events::{EventReader, OpsEvent};
 use crate::token::issued_to;
 use crate::watch::{Change, Watched, Watches};
 use crate::worker::{Ended, Worker};
@@ -651,9 +651,9 @@ fn with_token<'a>(message: &'a ClientMessage, token: &str) -> Cow<'a, ClientMess
     Cow::Owned(message)
 }
 
-/// A reference to the client that a task of one of its workers holds (a heartbeat, a sync or a
-/// transfer), which the client counts while it is held: once the application drops the client,
-/// only those hold it.
+/// A reference to the client that a task of one of its workers holds (a heartbeat, a sync, a
+/// transfer, the opening of its event stream or the application of an event), which the client
+/// counts while it is held: once the application drops the client, only those hold it.
 pub(crate) struct Held(Arc<Client>);
 
 impl Held {
@@ -1961,6 +1961,67 @@ impl Client {
         }
     }
 
+    /// Applies the operations of `event`, an `ops` event of the stream that the worker of
+    /// `room_id` opened for the replica of `epoch`: returns whether the replica needs a sync for
+    /// what the event does not bring. The event is checked before it is used, in this order:
+    /// of the room of the stream, with operations in order that reach its head (otherwise, a
+    /// sync, as for an event that does not decode); of the incarnation of the replica, which
+    /// otherwise registers again with its cursor, for the registration to discard it; and with
+    /// its schema or an earlier version of it, for otherwise the replica registers again to take
+    /// the schema of the room. Then its head is a head seen, and the applier applies the
+    /// operations after the head of the replica, as a batch of a sync, without failing the room
+    /// closed: one that does not validate against the schema of the replica registers it again.
+    /// A gap after the head, and a replica that is not open in `epoch`, ask for a sync.
+    pub(crate) async fn worker_apply(
+        &self,
+        room_id: &RoomId,
+        epoch: u64,
+        event: OpsEvent,
+    ) -> Result<bool, ClientError> {
+        let room = self.room(room_id)?;
+        let OpsEvent {
+            room_id: of,
+            room_incarnation,
+            head_seq,
+            ops,
+            schema_version,
+            schema_id,
+        } = event;
+        let before = ops.first().and_then(|op| op.seq.get().checked_sub(1));
+        let whole = before
+            .is_some_and(|before| last_after(SequenceNumber::new(before), &ops) == Some(head_seq));
+        if of != room.id || !whole {
+            return Ok(true);
+        }
+        let schema = (schema_id, schema_version);
+        let fits = match &*room.state() {
+            State {
+                replica: Replica::Open(open),
+                epoch: current,
+                ..
+            } if *current == epoch => {
+                let metadata = &open.metadata;
+                metadata.room_incarnation == room_incarnation
+                    && !changes(metadata, &schema.0, schema.1)
+            }
+            _ => return Ok(true),
+        };
+        if !fits {
+            room.update(epoch, |open| open.registered = false);
+            return Ok(true);
+        }
+        room.saw(epoch, head_seq);
+        let applied = move |local: Local, room| local.apply(room, epoch, ops, schema, false);
+        match self.change(&room, applied).await? {
+            Applied::Head(head) => Ok(head < head_seq),
+            Applied::Stale => Ok(true),
+            Applied::Schema => {
+                room.update(epoch, |open| open.registered = false);
+                Ok(true)
+            }
+        }
+    }
+
     /// Leaves the replica of `room_id` to register again, with its cursor, at its next request.
     pub(crate) fn unregister(&self, room_id: &RoomId) {
         if let Ok(room) = self.room(room_id) {
@@ -2462,20 +2523,24 @@ impl Client {
     /// next heartbeat.
     ///
     /// In [`Freshness::Live`], the worker also opens the event stream of the room, and syncs once
-    /// it is open, for what came before it subscribed. Each event is a notice: one with
-    /// operations (`ops`), with a head that moved (`head_advanced`), that tells of events missed
-    /// (`lagged`) or that does not decode leads to a sync, one at a time as those of the
-    /// heartbeats; a change of the schema (`schema_reloaded`), to a registration with the
-    /// cursor, which that sync sends first; and a designation (`snapshot_wanted`), or a new
-    /// snapshot (`snapshot_available`) if the replica waits for one, to a heartbeat in the task
-    /// of the transfers. A stream opened before a discard of the replica is replaced at its next
-    /// event or heartbeat, and its event is not taken. Its end, an error opening or reading it,
-    /// and 45 s without a byte (the server sends a keep-alive every 15 s) open another one after
-    /// a backoff as that of the heartbeats, which an event starts over; a refusal for its token
-    /// renews it, as for a request. A server with its event stream turned off leaves the worker
-    /// as in `Periodic`, which the status shows, until it tries again after
-    /// [`events_retry`](ClientConfig::events_retry). The heartbeats go on as in `Periodic`, so
-    /// what a stream does not bring arrives within an interval.
+    /// it is open, for what came before it subscribed. The operations of an event with operations
+    /// (`ops`) reach the replica from it, through the applier, once it is checked: of the room, in
+    /// order up to its head, and of the incarnation and the schema of the replica, which otherwise
+    /// registers again and syncs; one that does not follow the head of the replica leads to a sync,
+    /// and one with an operation that does not validate, to a registration and a sync, without
+    /// failing the room closed. Any other event is a notice: one with a head that moved
+    /// (`head_advanced`), that tells of events missed (`lagged`) or that does not decode leads to a
+    /// sync, one at a time as those of the heartbeats; a change of the schema (`schema_reloaded`),
+    /// to a registration with the cursor, which that sync sends first; and a designation
+    /// (`snapshot_wanted`), or a new snapshot (`snapshot_available`) if the replica waits for one,
+    /// to a heartbeat in the task of the transfers. A stream opened before a discard of the replica
+    /// is replaced at its next event or heartbeat, and its event is not taken. Its end, an error
+    /// opening or reading it, and 45 s without a byte (the server sends a keep-alive every 15 s)
+    /// open another one after a backoff as that of the heartbeats, which an event starts over; a
+    /// refusal for its token renews it, as for a request. A server with its event stream turned off
+    /// leaves the worker as in `Periodic`, which the status shows, until it tries again after
+    /// [`events_retry`](ClientConfig::events_retry). The heartbeats go on as in `Periodic`, so what
+    /// a stream does not bring arrives within an interval.
     ///
     /// Only its own steps stop it, when they find the room failing closed (`FailedClosed`) or out
     /// of the client (`RoomClosed`); any other error is tried again, and [`status`](Self::status)
@@ -2545,13 +2610,13 @@ impl Client {
         }
     }
 
-    /// Stops the worker of `room_id`, if it has one, at its next `.await`, and waits until it,
-    /// its sync, its transfer and the opening of its event stream ended, with the stream closed;
-    /// then the worker acknowledges the head of the replica if it passed the last one that the
-    /// server took as the cursor of the client: one request, which registers nothing, within
-    /// 5 s. A call while another stops the worker waits for that
-    /// stop too, also if the other call is cut. A room that never entered the client (neither
-    /// opened nor discarded) is `RoomClosed`.
+    /// Stops the worker of `room_id`, if it has one, at its next `.await`, and waits until it, the
+    /// application of an event, its sync, its transfer and the opening of its event stream ended,
+    /// with the stream closed; then the worker acknowledges the head of the replica if it passed
+    /// the last one that the server took as the cursor of the client: one request, which registers
+    /// nothing, within 5 s. A call while another stops the worker waits for that stop too, also if
+    /// the other call is cut. A room that never entered the client (neither opened nor discarded)
+    /// is `RoomClosed`.
     pub async fn stop_worker(&self, room_id: RoomId) -> Result<(), ClientError> {
         self.room(&room_id)?.stop_worker().await;
         Ok(())
