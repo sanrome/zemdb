@@ -984,14 +984,21 @@ async fn a_refusal_of_the_stream_for_another_room_or_a_request_is_an_error_and_a
         tokio::time::sleep(Duration::from_millis(10)).await;
         let refusal = refusals.remove(0);
         transport.answer_next_events(move |_| Ok(refusal));
+        let mut refusing = transport.hold_next_events();
         transport.end_streams();
-        opens(&transport, count, Duration::from_secs(5)).await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        refusing.replied().await;
+        // The next opening waits before it reaches the server, so the status is that of the
+        // refusal.
+        let mut next = transport.hold_next_events();
+        refusing.release();
+        next.replied().await;
+        assert_eq!(transport.stream_opens().len(), count + 1);
         let status = worker(&client, &room_id).await;
         assert_eq!(status.effective, Freshness::Live);
         let network = matches!(status.last_error, Some(ClientError::Network(_)));
         assert!(network && !status.stream_open, "{status:?}");
         // The next opening, after a wait and long before the next heartbeat, clears the error.
+        next.release();
         opened(&client, &room_id).await;
         assert_eq!(worker(&client, &room_id).await.last_error, None);
     }

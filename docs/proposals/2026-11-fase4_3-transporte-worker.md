@@ -1075,10 +1075,11 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
   - **Sin depender de cuándo cae el primer heartbeat.**
     - La suite del worker, la de `live` y la de los snapshots pasaron 30 de 30 veces seguidas. Con el árbol de la revisión, la del worker y la de `live` pasaron 30 de 30.
     - En esa corrida, el test del SSE encendido después de un error falló una vez: el tercer intento podía caer dentro de los 10 ms que esperaba antes de mirar el estado. Ahora retiene el segundo y el tercer intento, y mira el estado entre los dos. La suite de `live` pasó después 100 de 100.
+    - **La CI de `fd09b6e` falló en macOS** por la misma carrera en el test de la negativa de otra sala: la apertura que sigue a la negativa, con una espera al azar de hasta 2 s, ya había borrado el error cuando el test lo miró, 10 ms después (una vez en unas 200 vueltas). Ahora ese test también retiene la apertura rechazada y la siguiente, y mira el estado entre las dos. La suite de `live` pasó 100 de 100, y las mutaciones que solo ese test mataba se volvieron a correr (`mut7/run7.log`).
     - Con el primer heartbeat fijo a los 5 ms o a 1 ns del final del intervalo, pasan los de `live` y los tres del Lote 5 del pendiente. Fallan solo el del primer heartbeat al azar, que lo prueba a propósito, y, a 1 ns del final, tres de los Lotes 4 a 6 (en los desvíos).
     - A 2 ms del final pasan todos.
   - **MSRV y versiones largas.** Con Rust 1.88 pasan los 20 binarios de tests del cliente, y con 1.85 compila el workspace. Pasan las pruebas largas del cliente (`--release --ignored`): el fuzzing de los eventos y del cifrado, la simulación y los `watch`.
-- **Mutaciones inversas: 52 de las 53 las mata algún test, y con la otra la suite no termina.** El log, en el scratchpad de la sesión: `mut7/run1.log` a `run6.log`.
+- **Mutaciones inversas: 52 de las 53 las mata algún test, y con la otra la suite no termina.** El log, en el scratchpad de la sesión: `mut7/run1.log` a `run7.log`.
   - **El silencio:** sin plazo, sin anotar el bloque, el plazo por lectura y no por bloque, 48 s, y no repetir `Silent`.
   - **La apertura:**
     - sin `FailedClosed`;
