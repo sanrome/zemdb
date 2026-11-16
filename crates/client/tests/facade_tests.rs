@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tempfile::{tempdir, TempDir};
 use zemdb_client::{
-    ClientConfig, ClientError, Direction, FileMetadata, Key, Rejection, RoomHandle, RoomStatus,
-    Row, Scan, TransportError, Violation, ZemdbClient,
+    ClientError, Direction, FileMetadata, Key, Rejection, RoomHandle, RoomStatus, Row, Scan,
+    TransportError, Violation, ZemdbClient,
 };
 use zemdb_core::{
     encode_message, ClientMessage, ColumnDef, CryptoEngine, DataType, NoOpCryptoEngine, Operation,
@@ -146,16 +146,17 @@ async fn facade(
     crypto: Option<Arc<dyn CryptoEngine>>,
 ) -> ZemdbClient {
     let metadata = FileMetadata::new(dir);
-    let config = ClientConfig::new("ana");
+    let config = manual("ana");
     let tokens = TestTokens::new();
     let client = ZemdbClient::open(config, storage, metadata, transport.clone(), tokens, crypto);
-    client.await.unwrap()
+    let client = client.await.unwrap();
+    transport.hush(&client.client_id());
+    client
 }
 
-/// Opens `room_id` through `client`, with a token of the client.
+/// Opens `room_id` through `client`, with the token that its token provider gives.
 async fn open(client: &ZemdbClient, room_id: &RoomId) -> Result<RoomHandle, ClientError> {
-    let token = token(&client.client_id(), room_id);
-    client.room(room_id.clone(), token).await
+    client.room(room_id.clone()).await
 }
 
 fn is_invalid<T: std::fmt::Debug>(result: Result<T, ClientError>) -> String {
@@ -185,7 +186,10 @@ async fn the_rows_of_a_room_up_to_date_are_read_by_the_names_of_their_columns() 
     let transport = server.transport();
     let client = facade(dir.path(), engine(dir.path()), &transport, None).await;
     let room = open(&client, &room_id).await.unwrap();
-    assert_eq!(room.status().await, Ok(status(8, 0, true)));
+    assert_eq!(
+        room.status().await,
+        Ok(manual_worker(status(8, 0, true), Some(true)))
+    );
     let members_table = room.table("members").unwrap();
     let sent = transport.sent().len();
 
@@ -248,7 +252,8 @@ async fn without_network_the_reads_give_what_the_replica_holds_and_send_nothing(
     let client = facade(dir.path(), engine(dir.path()), &transport, None).await;
     // A room with metadata opens unregistered, to be read.
     let room = open(&client, &room_id).await.unwrap();
-    assert_eq!(room.status().await, Ok(status(8, 0, false)));
+    let offline = manual_worker(status(8, 0, false), Some(false));
+    assert_eq!(room.status().await, Ok(offline));
     let sent = transport.sent().len();
     let members_table = room.table("members").unwrap();
     let bob = members_table.get(&key(5, "bob")).await;
@@ -384,7 +389,10 @@ async fn a_room_whose_replica_is_not_open_is_room_closed() {
     // Once registered, it reads the room created again, empty, with its schema.
     transport.online();
     open(&client, &room_id).await.unwrap();
-    assert_eq!(room.status().await, Ok(status(0, 1, true)));
+    assert_eq!(
+        room.status().await,
+        Ok(manual_worker(status(0, 1, true), Some(true)))
+    );
     let tasks_table = room.table("tasks").unwrap();
     assert_eq!(tasks_table.scan(&Scan::new()).await, Ok(vec![]));
     let gone = members_table.get(&key(1, "bob")).await;
@@ -455,7 +463,10 @@ async fn a_discard_while_a_read_is_in_the_storage_room_makes_it_room_closed() {
     let bob = key(1, "bob");
     let (read, ()) = tokio::join!(members_table.get(&bob), discard);
     assert_eq!(read, Err(ClientError::RoomClosed(room_id.clone())));
-    assert_eq!(room.status().await, Ok(status(0, 1, true)));
+    assert_eq!(
+        room.status().await,
+        Ok(manual_worker(status(0, 1, true), Some(true)))
+    );
 }
 
 #[tokio::test]
@@ -591,7 +602,7 @@ fn the_data_of_the_facade_go_through_serde_and_back() {
         ClientError::Storage("storage".into()),
         ClientError::RoomClosed(room_id.clone()),
         ClientError::Network("network".into()),
-        ClientError::FailedClosed(room_id),
+        ClientError::FailedClosed(room_id.clone()),
         ClientError::ConstraintViolation(Violation::Unique {
             constraint: constraint(),
         }),
@@ -614,6 +625,7 @@ fn the_data_of_the_facade_go_through_serde_and_back() {
         })),
         ClientError::PrecheckFailed(Rejection::Constraint(Violation::NotOwner)),
         ClientError::PrecheckFailed(Rejection::RowMissing),
+        ClientError::Offline(room_id),
     ];
     for error in errors {
         assert_eq!(json_trip(&error), error);

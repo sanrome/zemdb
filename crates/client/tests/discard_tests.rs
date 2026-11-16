@@ -138,20 +138,21 @@ async fn facade(
 ) -> ZemdbClient {
     let metadata = FileMetadata::new(dir);
     let client = ZemdbClient::open(
-        ClientConfig::new("ana"),
+        manual("ana"),
         storage,
         metadata,
         transport.clone(),
         TestTokens::new(),
         None,
     );
-    client.await.unwrap()
+    let client = client.await.unwrap();
+    transport.hush(&client.client_id());
+    client
 }
 
-/// Opens `room_id` through `client`, with a token of the client.
+/// Opens `room_id` through `client`, with the token that its token provider gives.
 async fn room(client: &ZemdbClient, room_id: &RoomId) -> Result<RoomHandle, ClientError> {
-    let token = token(&client.client_id(), room_id);
-    client.room(room_id.clone(), token).await
+    client.room(room_id.clone()).await
 }
 
 fn task_key(id: i64) -> Key {
@@ -175,12 +176,12 @@ async fn pending<T: std::fmt::Debug>(future: impl Future<Output = T>) {
     assert!(ended.is_err(), "It ended: {ended:?}");
 }
 
-/// The status of a room open and registered at `head_seq` in the epoch `epoch`, with `watches`
-/// subscriptions.
+/// The status of a room of the facade open and registered at `head_seq` in the epoch `epoch`,
+/// with `watches` subscriptions.
 fn watched(head_seq: u64, epoch: u64, watches: usize) -> RoomStatus {
     RoomStatus {
         watches,
-        ..status(head_seq, epoch, true)
+        ..manual_worker(status(head_seq, epoch, true), Some(true))
     }
 }
 
@@ -242,7 +243,7 @@ async fn a_room_that_fails_closed_is_discarded_and_opens_with_the_schema_and_sta
     assert_eq!((saved.schema_id, saved.schema), (tasks_id(), tagged));
     handle.sync().await.unwrap();
     // One epoch more for the discard, and one more for the open without metadata.
-    assert_eq!(handle.status().await, Ok(status(3, 3, true)));
+    assert_eq!(handle.status().await, Ok(watched(3, 3, 0)));
     let rows = tasks.scan(&Scan::new()).await.unwrap();
     let tagged_row = task(3, "task").with("tag", "new");
     let untagged = |id| task(id, "task").with("tag", Value::Null);
@@ -326,7 +327,7 @@ async fn rooms_that_do_not_open_and_a_room_this_client_never_opened_are_discarde
         assert_eq!(transport.registrations(), [(None, None)], "{case}");
         handle.sync().await.unwrap();
         // A new client, whose open without metadata starts the epoch 1.
-        assert_eq!(handle.status().await, Ok(status(3, 1, true)), "{case}");
+        assert_eq!(handle.status().await, Ok(watched(3, 1, 0)), "{case}");
         let tasks = handle.table("tasks").unwrap();
         let rows = tasks.scan(&Scan::new()).await.unwrap();
         let expected: Vec<_> = (1..=3).map(|id| task(id, "task")).collect();

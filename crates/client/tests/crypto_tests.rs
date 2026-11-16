@@ -16,8 +16,9 @@ use zemdb_client::{
     Row, Scan, Violation, ZemdbClient,
 };
 use zemdb_core::{
-    ClientMessage, ClientMessageKind, ColumnDef, CryptoEngine, DataType, Operation, OperationKind,
-    OwnerIdentity, PrimaryKey, RoomId, RowBuilder, Schema, SchemaId, TableSchema, Value,
+    ClientMessage, ClientMessageKind, ColumnDef, CryptoEngine, DataType, ErrorCode, Operation,
+    OperationKind, OwnerIdentity, PrimaryKey, RoomId, RowBuilder, Schema, SchemaId, TableSchema,
+    Value,
 };
 use zemdb_storage::snapshot::decode_snapshot_envelope;
 use zemdb_storage::{MemoryStorageEngine, ScanOptions, StorageEngine};
@@ -85,17 +86,18 @@ async fn facade(
     crypto: Option<Arc<TestCrypto>>,
 ) -> ZemdbClient {
     let metadata = FileMetadata::new(dir);
-    let config = ClientConfig::new(person);
+    let config = manual(person);
     let tokens = TestTokens::new();
     let crypto = crypto.map(|crypto| crypto as Arc<dyn CryptoEngine>);
     let client = ZemdbClient::open(config, storage, metadata, transport.clone(), tokens, crypto);
-    client.await.unwrap()
+    let client = client.await.unwrap();
+    transport.hush(&client.client_id());
+    client
 }
 
-/// Opens `room_id` through `client`, with a token of the client.
+/// Opens `room_id` through `client`, with the token that its token provider gives.
 async fn open(client: &ZemdbClient, room_id: &RoomId) -> RoomHandle {
-    let token = token(&client.client_id(), room_id);
-    client.room(room_id.clone(), token).await.unwrap()
+    client.room(room_id.clone()).await.unwrap()
 }
 
 /// The operations of the commits sent through `transport` after its first `from` messages.
@@ -719,8 +721,9 @@ async fn an_encrypted_column_added_later_reads_null_in_the_rows_written_before_i
     assert_eq!(entries.scan(&Scan::new()).await, Ok(all));
 }
 
-/// Opens the replica of `room` of `client` again without the server, unregistered, while the room
-/// is created again on `server` with `schema`.
+/// Opens the replica of `room` of `client` again with its registration refused, unregistered,
+/// while the room is created again on `server` with `schema`. The refusal is a reply: the room is
+/// not offline.
 async fn created_again_while_unregistered(
     server: &TestServer,
     transport: &TestTransport,
@@ -730,14 +733,17 @@ async fn created_again_while_unregistered(
 ) {
     let room_id = room.room_id();
     room.close().await.unwrap();
-    transport.offline();
+    answer_next(
+        transport,
+        ClientMessageKind::RegisterClient,
+        |correlation_id, room_id| error_reply(correlation_id, room_id, ErrorCode::RateLimited),
+    );
     open(client, room_id).await;
     let rooms = &server.state.room_manager;
     rooms.delete_room(room_id).await.unwrap();
     server
         .create_room_with(room_id.as_str(), "again", schema)
         .await;
-    transport.online();
 }
 
 /// What `call`, a call through `room`, gives when, while `held` holds it, the insert of a tag
@@ -756,7 +762,8 @@ async fn discarded_meanwhile<T>(
         let tag = Row::new().with("tag", "red");
         let tagged = room.table("tags").unwrap().insert(&tag).await;
         assert_eq!(tagged, Err(ClientError::RoomClosed(room.room_id().clone())));
-        assert_eq!(room.status().await, Ok(status(0, 2, true)));
+        let registered = manual_worker(status(0, 2, true), Some(true));
+        assert_eq!(room.status().await, Ok(registered));
         held.release();
     };
     let (called, ()) = tokio::join!(call, discarding);

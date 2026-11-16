@@ -9,12 +9,12 @@ use std::future::Future;
 use std::path::Path;
 use tempfile::tempdir;
 use zemdb_client::{
-    ClientConfig, ClientError, FileMetadata, Key, Rejection, RoomHandle, Row, Violation,
-    ZemdbClient,
+    ClientError, FileMetadata, Key, Rejection, RoomHandle, Row, Violation, ZemdbClient,
 };
 use zemdb_core::{
-    encode_message, ClientMessage, ClientMessageKind, DataType, Operation, OwnerIdentity, RoomId,
-    RowBuilder, Schema, SchemaId, SequenceNumber, ServerMessage, TableSchema, ValidationError,
+    encode_message, ClientMessage, ClientMessageKind, DataType, ErrorCode, Operation,
+    OwnerIdentity, RoomId, RowBuilder, Schema, SchemaId, SequenceNumber, ServerMessage,
+    TableSchema, ValidationError,
 };
 use zemdb_storage::{DiskStorageEngine, StorageEngine, StorageError};
 
@@ -102,19 +102,20 @@ async fn facade(
     precheck: bool,
 ) -> ZemdbClient {
     let metadata = FileMetadata::new(dir);
-    let mut config = ClientConfig::new(person);
+    let mut config = manual(person);
     if !precheck {
         config.precheck = false;
     }
     let tokens = TestTokens::new();
     let client = ZemdbClient::open(config, storage, metadata, transport.clone(), tokens, None);
-    client.await.unwrap()
+    let client = client.await.unwrap();
+    transport.hush(&client.client_id());
+    client
 }
 
-/// Opens `room_id` through `client`, with a token of the client.
+/// Opens `room_id` through `client`, with the token that its token provider gives.
 async fn open(client: &ZemdbClient, room_id: &RoomId) -> RoomHandle {
-    let token = token(&client.client_id(), room_id);
-    client.room(room_id.clone(), token).await.unwrap()
+    client.room(room_id.clone()).await.unwrap()
 }
 
 /// The number of commits sent through `transport`.
@@ -470,8 +471,8 @@ async fn a_write_whose_storage_room_closes_during_its_precheck_is_room_closed() 
 }
 
 /// Ana's facade of `room_id` over a [`TestEngine`] and a transport, with her ranking 2 in the
-/// replica, which then opens again without the server, unregistered, while the room is created
-/// again with `schema`.
+/// replica, which then opens again with its registration refused, unregistered, while the room is
+/// created again with `schema`.
 async fn reopened_before_the_room_is_created_again(
     server: &TestServer,
     room_id: &RoomId,
@@ -490,7 +491,12 @@ async fn reopened_before_the_room_is_created_again(
     let rankings = room.table("rankings").unwrap();
     rankings.insert(&ranking(2, "Ana's")).await.unwrap();
     room.close().await.unwrap();
-    transport.offline();
+    // Refused, with a reply: the room is not offline.
+    answer_next(
+        &transport,
+        ClientMessageKind::RegisterClient,
+        |correlation_id, room_id| error_reply(correlation_id, room_id, ErrorCode::RateLimited),
+    );
     open(&client, room_id).await;
     let opened = room.status().await.unwrap();
     assert_eq!((opened.epoch, opened.registered), (1, false));
@@ -499,7 +505,6 @@ async fn reopened_before_the_room_is_created_again(
     server
         .create_room_with(room_id.as_str(), "again", schema)
         .await;
-    transport.online();
     (storage, transport, client, room)
 }
 
@@ -520,7 +525,8 @@ async fn discarded_during_the_precheck(
         let tag = Row::new().with("tag", "red");
         let tagged = room.table("tags").unwrap().insert(&tag).await;
         assert_eq!(tagged, Err(ClientError::RoomClosed(room.room_id().clone())));
-        assert_eq!(room.status().await, Ok(status(0, 2, true)));
+        let registered = manual_worker(status(0, 2, true), Some(true));
+        assert_eq!(room.status().await, Ok(registered));
         checking.release();
     };
     let (written, ()) = tokio::join!(write, discarding);

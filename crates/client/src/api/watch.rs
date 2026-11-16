@@ -6,7 +6,7 @@ use std::fmt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use super::{Key, Row, Scan, TableHandle};
+use super::{Key, RoomHandle, Row, Scan, TableHandle};
 use crate::client::Subscription;
 use crate::ClientError;
 
@@ -21,8 +21,15 @@ use crate::ClientError;
 /// change takes it out of the client in its middle (the reopening of its storage room after an
 /// error), and ends once the room is out of the client at the end of a change (it is closed, the
 /// client shuts down, or an error took it out). Dropping the stream drops its subscription.
+///
+/// While the stream is alive, a room in [`Freshness::Periodic`](crate::Freshness::Periodic) has
+/// its worker in `Live` ([`RoomHandle::set_freshness`](super::RoomHandle::set_freshness)): its
+/// first stream asks the worker for `Live`, and dropping its last one for `Periodic`, at once
+/// and without waiting, also without a runtime.
 pub struct ChangeStream<T> {
     values: BoxStream<'static, Result<T, ClientError>>,
+    /// Dropped after `values`, once the subscription is out of the room.
+    _tuned: Tuned,
 }
 
 impl<T> Stream for ChangeStream<T> {
@@ -52,8 +59,9 @@ impl<T: Clone + PartialEq + Send + 'static> ChangeStream<T> {
     /// The stream of `watch` of `table`, whose value is `value` of the rows it reads. Its
     /// subscription is entered now, before its first read.
     pub(super) fn new(table: TableHandle, watch: Watch, value: fn(Vec<Row>) -> T) -> Self {
-        let room = table.room();
+        let room = table.room().clone();
         let subscription = room.client().core().subscribe(room.room_id());
+        room.client().tune(room.room_id());
         let watcher = Watcher {
             table,
             watch,
@@ -67,7 +75,18 @@ impl<T: Clone + PartialEq + Send + 'static> ChangeStream<T> {
         });
         Self {
             values: values.fuse().boxed(),
+            _tuned: Tuned(room),
         }
+    }
+}
+
+/// The room of a stream, whose worker takes the mode that follows from the subscriptions of the
+/// room once the subscription of the stream is out of it.
+struct Tuned(RoomHandle);
+
+impl Drop for Tuned {
+    fn drop(&mut self) {
+        self.0.client().tune(self.0.room_id());
     }
 }
 

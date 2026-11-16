@@ -25,8 +25,8 @@ use tempfile::{tempdir, TempDir};
 use tokio::sync::oneshot;
 use tower::ServiceExt;
 use zemdb_client::{
-    endpoint, Client, ClientConfig, ClientError, EventBlocks, EventStream, FileMetadata,
-    RoomStatus, TokenError, TokenProvider, TransportClient, TransportError,
+    endpoint, Client, ClientConfig, ClientError, EventBlocks, EventStream, FileMetadata, Freshness,
+    RoomStatus, TokenError, TokenProvider, TransportClient, TransportError, WorkerStatus,
 };
 use zemdb_core::*;
 use zemdb_server::{
@@ -204,10 +204,38 @@ impl TokenProvider for TestTokens {
     }
 }
 
+/// The configuration of a client of `person` in `Manual`, for the tests of the facade whose
+/// worker is not what they test: neither its heartbeats nor its `watch` streams sync the
+/// replica, and with [`TestTransport::hush`] its worker waits for its first heartbeat until it
+/// is stopped.
+pub fn manual(person: &str) -> ClientConfig {
+    ClientConfig {
+        freshness: Freshness::Manual,
+        ..ClientConfig::new(person)
+    }
+}
+
 /// Opens `room_id` in `client`, with a token of the client.
 pub async fn open_room(client: &Client, room_id: &RoomId) -> Result<(), ClientError> {
     let token = token(&client.client_id(), room_id);
     client.open_room(room_id.clone(), token).await
+}
+
+/// `status` with the worker of the room, which runs in `Manual` without an error, with
+/// `connected` for the room.
+pub fn manual_worker(status: RoomStatus, connected: Option<bool>) -> RoomStatus {
+    let worker = WorkerStatus {
+        freshness: Freshness::Manual,
+        effective: Freshness::Manual,
+        stream_open: false,
+        running: true,
+        connected,
+        last_error: None,
+    };
+    RoomStatus {
+        worker: Some(worker),
+        ..status
+    }
 }
 
 pub fn status(head_seq: u64, epoch: u64, registered: bool) -> RoomStatus {
@@ -535,6 +563,7 @@ impl TestServer {
             events_answer: Arc::default(),
             events_hold: Arc::default(),
             streams: Arc::default(),
+            hushed: Arc::default(),
         }
     }
 }
@@ -655,6 +684,8 @@ pub struct TestTransport {
     events_hold: Arc<Mutex<Option<HoldEvents>>>,
     /// What writes into each event stream opened, in order.
     streams: Arc<Mutex<Vec<Control>>>,
+    /// The clients whose heartbeats get no reply, and are not logged.
+    hushed: Arc<Mutex<Vec<ClientId>>>,
 }
 
 /// A request running in its task, counted by its transport until it ends.
@@ -667,6 +698,14 @@ impl Drop for Task {
 }
 
 impl TestTransport {
+    /// Leaves the heartbeats of `client_id` without a reply, ever, and out of the messages sent:
+    /// the worker of a room of that client, in `Manual`, waits for its first heartbeat and sends
+    /// nothing else until it is stopped, when it acknowledges the head of the replica if it
+    /// moved. For the tests of the facade whose worker is not what they test.
+    pub fn hush(&self, client_id: &ClientId) {
+        self.hushed.lock().unwrap().push(client_id.clone());
+    }
+
     /// The messages sent so far, in order.
     pub fn sent(&self) -> Vec<ClientMessage> {
         self.sent.lock().unwrap().clone()
@@ -812,6 +851,11 @@ impl fmt::Debug for TestTransport {
 #[async_trait]
 impl TransportClient for TestTransport {
     async fn send(&self, message: &ClientMessage, token: &str) -> Result<Vec<u8>, TransportError> {
+        if let ClientMessage::Heartbeat { client_id, .. } = message {
+            if self.hushed.lock().unwrap().contains(client_id) {
+                std::future::pending::<()>().await;
+            }
+        }
         if self.sent.lock().unwrap().len() >= MAX_SENT {
             std::future::pending::<()>().await;
         }

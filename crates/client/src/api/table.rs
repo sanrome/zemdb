@@ -127,7 +127,10 @@ impl TableHandle {
     /// clear, in an encrypted column), or lacks only columns that take `NULL`, which they get, and
     /// does not have the owner column, which the client fills with its owner
     /// ([`ClientId::owner`](zemdb_core::ClientId::owner)). Otherwise, the insert is
-    /// `InvalidOperation`, and it sends nothing. The value of each encrypted column of the table,
+    /// `InvalidOperation`, and it sends nothing. In a room whose worker runs and whose last
+    /// request got no reply, it is `Offline`, and sends nothing either (one that fails closed is
+    /// `FailedClosed`): a network that goes down after this check leaves the write to its
+    /// retries, as for any write. The value of each encrypted column of the table,
     /// `NULL` too, is sent encrypted with the `CryptoEngine` of the application, with the
     /// additional data of its cell: without a `CryptoEngine`, or if it fails to encrypt one, the
     /// insert is `Crypto`, and sends nothing. With the precheck (`ClientConfig::precheck`, on by
@@ -187,12 +190,16 @@ impl TableHandle {
         Ok((epoch, write?))
     }
 
-    /// Writes `draft`, planned in `epoch`, in the order of a write from its encryption on: with
-    /// its encrypted columns encrypted, if the server takes it from the client, if it fits and,
-    /// with the precheck, if the replica would take it; once, to the replica of that epoch.
+    /// Writes `draft`, planned in `epoch`, in the order of a write from the connection on: unless
+    /// the room is offline, with its encrypted columns encrypted, if the server takes it from the
+    /// client, if it fits and, with the precheck, if the replica would take it; once, to the
+    /// replica of that epoch.
     async fn write(&self, epoch: u64, draft: Draft) -> Result<(), ClientError> {
         let (client, room_id) = (self.room.client(), self.room.room_id());
         let core = client.core();
+        if core.is_offline(room_id) {
+            return Err(ClientError::Offline(room_id.clone()));
+        }
         let op = draft.seal(client.crypto(), room_id).await?;
         let op = self.checked(epoch, op)?;
         let op = fitting(op, &core.client_id(), room_id)?;

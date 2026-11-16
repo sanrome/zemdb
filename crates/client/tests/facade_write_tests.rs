@@ -124,17 +124,18 @@ async fn facade(
     let metadata = FileMetadata::new(dir);
     let config = ClientConfig {
         precheck: false,
-        ..ClientConfig::new(person)
+        ..manual(person)
     };
     let tokens = TestTokens::new();
     let client = ZemdbClient::open(config, storage, metadata, transport.clone(), tokens, crypto);
-    client.await.unwrap()
+    let client = client.await.unwrap();
+    transport.hush(&client.client_id());
+    client
 }
 
-/// Opens `room_id` through `client`, with a token of the client.
+/// Opens `room_id` through `client`, with the token that its token provider gives.
 async fn open(client: &ZemdbClient, room_id: &RoomId) -> Result<RoomHandle, ClientError> {
-    let token = token(&client.client_id(), room_id);
-    client.room(room_id.clone(), token).await
+    client.room(room_id.clone()).await
 }
 
 /// The operations of the commits sent through `transport` after its first `from` messages.
@@ -683,19 +684,24 @@ async fn a_write_planned_before_a_discard_is_not_sent_to_the_room_created_again(
     let client = facade(dir.path(), engine(dir.path()), &transport, "ana", None).await;
     let room = open(&client, &room_id).await.unwrap();
     let rankings = room.table("rankings").unwrap();
-    // The replica (opened without metadata, so in the epoch 1, and not synced) opens again
-    // without the server, unregistered, and the room is created again with a table of the id of
-    // `rankings` that would take its insert.
+    // The replica (opened without metadata, so in the epoch 1, and not synced) opens again with
+    // its registration refused, unregistered, and the room is created again with a table of the
+    // id of `rankings` that would take its insert. The refusal is a reply: the room is not
+    // offline.
     room.close().await.unwrap();
-    transport.offline();
+    answer_next(
+        &transport,
+        ClientMessageKind::RegisterClient,
+        |correlation_id, room_id| error_reply(correlation_id, room_id, ErrorCode::RateLimited),
+    );
     open(&client, &room_id).await.unwrap();
-    assert_eq!(room.status().await, Ok(status(0, 1, false)));
+    let unregistered = manual_worker(status(0, 1, false), Some(true));
+    assert_eq!(room.status().await, Ok(unregistered));
     let rooms = &server.state.room_manager;
     rooms.delete_room(&room_id).await.unwrap();
     server
         .create_room_with(room_id.as_str(), "notes", notes_schema())
         .await;
-    transport.online();
     let sent = transport.sent().len();
 
     // The insert registers the replica, which is discarded for `RoomReset` and opens with the
@@ -711,7 +717,8 @@ async fn a_write_planned_before_a_discard_is_not_sent_to_the_room_created_again(
     assert_eq!(kinds, [register, register]);
     let registrations = transport.registrations();
     assert_eq!(registrations.last(), Some(&(None, None)));
-    assert_eq!(room.status().await, Ok(status(0, 2, true)));
+    let registered = manual_worker(status(0, 2, true), Some(true));
+    assert_eq!(room.status().await, Ok(registered));
     assert_eq!(head(&server, &room_id).await, 0);
     // A new write resolves the table against the new schema, which has no `rankings`.
     is_invalid(rankings.insert(&ranking).await);

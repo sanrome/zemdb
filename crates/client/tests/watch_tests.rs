@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::tempdir;
 use zemdb_client::{
-    ChangeStream, ClientConfig, ClientError, FileMetadata, Key, RoomHandle, Row, Scan, TableHandle,
+    ChangeStream, ClientError, FileMetadata, Key, RoomHandle, Row, Scan, TableHandle,
     TransportError, ZemdbClient,
 };
 use zemdb_core::{
@@ -232,7 +232,7 @@ async fn ana(
     transport: &TestTransport,
 ) -> ZemdbClient {
     let metadata = FileMetadata::new(dir);
-    let config = ClientConfig::new("ana");
+    let config = manual("ana");
     let crypto: Arc<dyn CryptoEngine> = TestCrypto::new();
     let tokens = TestTokens::new();
     let client = ZemdbClient::open(
@@ -243,13 +243,14 @@ async fn ana(
         tokens,
         Some(crypto),
     );
-    client.await.unwrap()
+    let client = client.await.unwrap();
+    transport.hush(&client.client_id());
+    client
 }
 
-/// Opens `room_id` through `client`, with a token of the client.
+/// Opens `room_id` through `client`, with the token that its token provider gives.
 async fn open(client: &ZemdbClient, room_id: &RoomId) -> RoomHandle {
-    let token = token(&client.client_id(), room_id);
-    client.room(room_id.clone(), token).await.unwrap()
+    client.room(room_id.clone()).await.unwrap()
 }
 
 /// Ana's room, synced with the server: bob's ranking, which ana joined as `Ana`.

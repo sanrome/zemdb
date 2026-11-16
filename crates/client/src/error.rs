@@ -86,6 +86,13 @@ pub enum ClientError {
     /// same write may be taken once it catches up. `ClientConfig::precheck` turns it off.
     #[error("The replica would reject the write: {0:?}")]
     PrecheckFailed(Rejection),
+
+    /// A write of the facade in a room whose worker runs and whose last request got no reply:
+    /// nothing was sent. The next request of the room that gets a reply (a heartbeat of the
+    /// worker, or a sync) lets the writes go again. Reads are never offline, nor is a room that
+    /// fails closed, whose writes are `FailedClosed`.
+    #[error("Room '{0}' is offline")]
+    Offline(RoomId),
 }
 
 /// Why the replica would reject a write, as it rejects one on a sequence: the reason of a

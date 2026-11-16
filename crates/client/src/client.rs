@@ -921,9 +921,22 @@ impl Client {
     /// read: the client leaves the roster of the room, and the room neither registers nor syncs
     /// until it is closed and opened again.
     pub async fn open_room(&self, room_id: RoomId, token: String) -> Result<(), ClientError> {
+        self.open_with(room_id, Some(token)).await
+    }
+
+    /// Opens `room_id` as [`open_room`](Self::open_room) does, with `token` for its requests if
+    /// there is one; without one, the room keeps its token, or has none if it never had one: its
+    /// registration is then refused for its token (`Unauthorized`), which renews it.
+    pub(crate) async fn open_with(
+        &self,
+        room_id: RoomId,
+        token: Option<String>,
+    ) -> Result<(), ClientError> {
         let room = self.entry(room_id);
         let _registration = room.registration.lock().await;
-        room.state().set_token(token);
+        if let Some(token) = token {
+            room.state().set_token(token);
+        }
         self.change(&room, Local::open).await?;
         match self.register(&room).await {
             // Without a valid reply, a replica with metadata opens all the same, to be read.
@@ -1184,6 +1197,30 @@ impl Client {
             state.set_token(token.clone());
         }
         token
+    }
+
+    /// The first token of `room_id`, which the token provider has [`TOKEN_TIMEOUT`] to give:
+    /// `None` without one (the provider fails, or does not answer in time), and `Config` for one
+    /// that is not of the client id of the client, or not in the format in which the server
+    /// issues tokens, which nothing is sent with. Once the client shut down, it is `RoomClosed`,
+    /// without asking.
+    pub(crate) async fn first_token(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<Option<String>, ClientError> {
+        if self.local.shut_down.load(Ordering::SeqCst) {
+            return Err(ClientError::RoomClosed(room_id.clone()));
+        }
+        let token = self.tokens.token(&self.client_id, room_id);
+        match tokio::time::timeout(TOKEN_TIMEOUT, token).await {
+            Ok(Ok(token)) if issued_to(&token, &self.client_id) => Ok(Some(token)),
+            Ok(Ok(_)) => Err(ClientError::Config(
+                "The token provider gave a token that is not of the client id of the client, or \
+                 not in the format of the server"
+                    .to_string(),
+            )),
+            Ok(Err(_)) | Err(_) => Ok(None),
+        }
     }
 
     /// Runs `change` on `room` under its applier, in a task of its own, once the changes before
@@ -2306,6 +2343,38 @@ impl Client {
         Subscription {
             entry: Some((room, id)),
         }
+    }
+
+    /// Whether `room_id` has subscriptions of `watch` whose streams are alive.
+    pub(crate) fn is_watched(&self, room_id: &RoomId) -> bool {
+        self.room(room_id).is_ok_and(|room| room.is_watched())
+    }
+
+    /// Sets the mode of the worker of `room_id` to `freshness` if it has one that runs, which
+    /// takes it once its step in progress ends, as [`set_freshness`](Self::set_freshness) sets
+    /// it; without one, nothing starts. Nothing waits here.
+    pub(crate) fn tune_worker(&self, room_id: &RoomId, freshness: Freshness) {
+        if let Ok(room) = self.room(room_id) {
+            if let Some(worker) = room.worker().as_ref().filter(|worker| worker.is_running()) {
+                worker.set_freshness(freshness);
+            }
+        }
+    }
+
+    /// Whether `room_id` is offline: it has a worker that runs, and the last request of the room
+    /// got no reply. Without a worker, or before the first request of the room, it has no state of
+    /// its connection, and is not; nor is a replica that fails closed, whose writes are
+    /// `FailedClosed` (its worker stops at its next step).
+    pub(crate) fn is_offline(&self, room_id: &RoomId) -> bool {
+        let Ok(room) = self.room(room_id) else {
+            return false;
+        };
+        let offline = {
+            let state = room.state();
+            let failed = matches!(&state.replica, Replica::Open(open) if open.failed_closed);
+            state.connected == Some(false) && !failed
+        };
+        offline && room.worker().as_ref().is_some_and(Worker::is_running)
     }
 
     /// Whether the replica of `room_id` is still of `epoch`: no discard came since a read of its

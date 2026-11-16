@@ -38,6 +38,8 @@ fn notes_schema() -> Schema {
 
 /// A server of one room that answers registrations only: `Registered` with its incarnation and
 /// schema, at the cursor of the registration, or `RoomReset` to a cursor of another incarnation.
+/// The heartbeats of the worker of the room get no reply, which the reads of the tests do not
+/// mind.
 #[derive(Debug, Clone)]
 struct Server(Arc<Mutex<(u128, Schema)>>);
 
@@ -98,7 +100,8 @@ fn room_id() -> RoomId {
     RoomId::new("room-a").unwrap()
 }
 
-/// A token provider that gives no token: the server of the test takes any.
+/// A token provider that gives no token: the room opens without one, and the server of the test
+/// takes it.
 #[derive(Debug)]
 struct NoTokens;
 
@@ -120,7 +123,7 @@ async fn open(server: &Server, table: &str) -> (ZemdbClient, TableHandle) {
         None,
     );
     let client = client.await.unwrap();
-    let room = client.room(room_id(), "token".to_string()).await.unwrap();
+    let room = client.room(room_id()).await.unwrap();
     let table = room.table(table).unwrap();
     (client, table)
 }
@@ -201,7 +204,7 @@ async fn a_read_across_a_discard_is_room_closed_and_one_across_a_reopening_is_no
     // Closed and opened again in the same epoch: a memory room opens empty.
     let read = get(&table, 1);
     table.room().close().await.unwrap();
-    client.room(room_id(), "token".to_string()).await.unwrap();
+    client.room(room_id()).await.unwrap();
     assert_eq!(table.read(read).await, Ok(vec![]));
 
     // Discarded for a room created again, whose table of the same id is another, with a row of
@@ -209,7 +212,7 @@ async fn a_read_across_a_discard_is_room_closed_and_one_across_a_reopening_is_no
     let (read, rows) = (get(&table, 1), scan(&table));
     server.recreate(notes_schema());
     table.room().close().await.unwrap();
-    client.room(room_id(), "token".to_string()).await.unwrap();
+    client.room(room_id()).await.unwrap();
     let note = RowBuilder::new().set("number", 1).set("size", 7);
     let note = insert(&notes_schema(), "notes", note);
     apply(&client, [note]).await;
@@ -262,7 +265,7 @@ async fn a_write_checked_after_a_reload_of_the_schema_is_valid_and_after_a_disca
     let op = draft.seal(None, &room_id()).await.unwrap();
     server.evolve(tagged_schema());
     table.room().close().await.unwrap();
-    client.room(room_id(), "token".to_string()).await.unwrap();
+    client.room(room_id()).await.unwrap();
     let tagged = table
         .room()
         .client()
@@ -277,7 +280,7 @@ async fn a_write_checked_after_a_reload_of_the_schema_is_valid_and_after_a_disca
     let op = draft.seal(None, &room_id()).await.unwrap();
     server.recreate(notes_schema());
     table.room().close().await.unwrap();
-    client.room(room_id(), "token".to_string()).await.unwrap();
+    client.room(room_id()).await.unwrap();
     let closed = Err(ClientError::RoomClosed(room_id()));
     assert_eq!(table.checked(epoch, op), closed);
 }
