@@ -17,11 +17,12 @@ use zemdb_core::{
 };
 use zemdb_storage::{StorageEngine, StorageError};
 
+use crate::events::EventReader;
 use crate::token::issued_to;
 use crate::watch::{Change, Watched, Watches};
 use crate::worker::{Ended, Worker};
 use crate::{
-    ClientConfig, ClientError, Freshness, MetadataStore, RoomMetadata, TokenProvider,
+    ClientConfig, ClientError, EventStream, Freshness, MetadataStore, RoomMetadata, TokenProvider,
     TransportClient, WorkerStatus,
 };
 
@@ -740,11 +741,21 @@ pub(crate) enum Acking {
 
 /// What the ack of a heartbeat of the worker asks of it: a transfer, and whether to sync, since
 /// the head of the server passed that of the replica, which does not wait for a snapshot; and
-/// whether the replica waits for a snapshot that no reply announced.
+/// whether the replica waits for a snapshot that no reply announced; with the epoch of the
+/// replica that sent it.
 pub(crate) struct Asked {
     pub(crate) transfer: Option<Transfer>,
     pub(crate) behind: bool,
     pub(crate) waits: bool,
+    pub(crate) epoch: u64,
+}
+
+/// What opening the event stream of a room gave its worker.
+pub(crate) enum Opened {
+    /// The stream is open: its events, and the epoch of the replica when it opened.
+    Stream(EventReader, u64),
+    /// The server has its event stream turned off.
+    Disabled,
 }
 
 /// What the next request of a replica presents, read under its applier, so that no change of
@@ -1850,7 +1861,79 @@ impl Client {
             transfer,
             behind: beat.behind,
             waits: room.waits_for_none(beat.epoch),
+            epoch: beat.epoch,
         })
+    }
+
+    /// Opens the event stream of `room_id` for its worker, with the token of the room, once it
+    /// read the epoch of the replica under the applier: `RoomClosed` if the replica is out of the
+    /// client, and `FailedClosed` if it fails closed, without opening anything. A refusal for
+    /// its token (`Unauthorized`) renews the token and opens the stream once more with the new
+    /// one, and one that forbids the token leaves it to be renewed first by the next request of
+    /// the room, as [`send`](Self::send) does. `EventsDisabled` is [`Opened::Disabled`]; no
+    /// response, any other refusal, or one that is not for the room, is `Network`.
+    pub(crate) async fn worker_events(&self, room_id: &RoomId) -> Result<Opened, ClientError> {
+        let room = self.room(room_id)?;
+        let request = self.change(&room, Local::request).await?;
+        if request.failed_closed {
+            return Err(ClientError::FailedClosed(room.id.clone()));
+        }
+        let (mut token, mut renewed) = {
+            let state = room.state();
+            (state.token.clone(), state.forbidden)
+        };
+        if renewed {
+            token = self.renew(&room, &token).await.unwrap_or(token);
+        }
+        loop {
+            let opened = self.transport.events(&room.id, &token).await;
+            let refusal = match opened.map_err(|err| ClientError::Network(err.to_string()))? {
+                EventStream::Open(blocks) => {
+                    return Ok(Opened::Stream(EventReader::new(blocks), request.epoch));
+                }
+                EventStream::Refused(refusal) => refusal,
+            };
+            let code = match decode_message(&refusal) {
+                Ok(ServerMessage::Error {
+                    correlation_id: None,
+                    room_id,
+                    code,
+                    ..
+                }) if room_id.as_ref().is_none_or(|room_id| *room_id == room.id) => code,
+                _ => {
+                    return Err(ClientError::Network(
+                        "Invalid refusal of the event stream".to_string(),
+                    ))
+                }
+            };
+            match code {
+                ErrorCode::EventsDisabled => return Ok(Opened::Disabled),
+                ErrorCode::Unauthorized if !renewed => {
+                    renewed = true;
+                    if let Some(new) = self.renew(&room, &token).await {
+                        token = new;
+                        continue;
+                    }
+                }
+                ErrorCode::Forbidden => room.forbid(&token),
+                _ => {}
+            }
+            return Err(ClientError::Network(format!(
+                "The server refused the event stream: {code:?}"
+            )));
+        }
+    }
+
+    /// Leaves the replica of `room_id` to register again, with its cursor, at its next request.
+    pub(crate) fn unregister(&self, room_id: &RoomId) {
+        if let Ok(room) = self.room(room_id) {
+            room.unregister();
+        }
+    }
+
+    /// Whether the replica of `room_id` waits for a snapshot.
+    pub(crate) fn awaits_snapshot(&self, room_id: &RoomId) -> bool {
+        self.room(room_id).is_ok_and(|room| room.awaits_snapshot())
     }
 
     /// Runs `transfer` for the worker of `room_id`, as a heartbeat would.
@@ -2309,6 +2392,22 @@ impl Client {
     /// interval; an acknowledgement, a transfer or a sync that fails is asked for again by the
     /// next heartbeat.
     ///
+    /// In [`Freshness::Live`], the worker also opens the event stream of the room, and syncs once
+    /// it is open, for what came before it subscribed. Each event is a notice: one with
+    /// operations (`ops`), with a head that moved (`head_advanced`), that tells of events missed
+    /// (`lagged`) or that does not decode leads to a sync, one at a time as those of the
+    /// heartbeats; a change of the schema (`schema_reloaded`), to a registration with the
+    /// cursor, which that sync sends first; and a designation (`snapshot_wanted`), or a new
+    /// snapshot (`snapshot_available`) if the replica waits for one, to a heartbeat in the task
+    /// of the transfers. A stream opened before a discard of the replica is replaced at its next
+    /// event or heartbeat, and its event is not taken. Its end, an error opening or reading it,
+    /// and 45 s without a byte (the server sends a keep-alive every 15 s) open another one after
+    /// a backoff as that of the heartbeats, which an event starts over; a refusal for its token
+    /// renews it, as for a request. A server with its event stream turned off leaves the worker
+    /// as in `Periodic`, which the status shows, until it tries again after
+    /// [`events_retry`](ClientConfig::events_retry). The heartbeats go on as in `Periodic`, so
+    /// what a stream does not bring arrives within an interval.
+    ///
     /// Only its own steps stop it, when they find the room failing closed (`FailedClosed`) or out
     /// of the client (`RoomClosed`); any other error is tried again, and [`status`](Self::status)
     /// gives the last. [`stop_worker`](Self::stop_worker), [`close_room`](Self::close_room),
@@ -2322,7 +2421,10 @@ impl Client {
 
     /// Sets the mode of the worker of `room_id` to `freshness`, starting it in that mode as
     /// [`start_worker`](Self::start_worker) does if it has none that runs: also once a stop in
-    /// progress ended.
+    /// progress ended. A worker that runs takes the mode once its step in progress ends (at once,
+    /// unless a heartbeat with its acknowledgement is in flight): in [`Freshness::Live`] it opens
+    /// the event stream of the room, once the wait after an error or a refusal of the stream
+    /// allows, and in another mode it closes it.
     pub async fn set_freshness(
         self: &Arc<Self>,
         room_id: RoomId,
@@ -2375,9 +2477,10 @@ impl Client {
     }
 
     /// Stops the worker of `room_id`, if it has one, at its next `.await`, and waits until it,
-    /// its sync and its transfer ended; then the worker acknowledges the head of the replica if
-    /// it passed the last one that the server took as the cursor of the client: one request,
-    /// which registers nothing, within 5 s. A call while another stops the worker waits for that
+    /// its sync, its transfer and the opening of its event stream ended, with the stream closed;
+    /// then the worker acknowledges the head of the replica if it passed the last one that the
+    /// server took as the cursor of the client: one request, which registers nothing, within
+    /// 5 s. A call while another stops the worker waits for that
     /// stop too, also if the other call is cut. A room that never entered the client (neither
     /// opened nor discarded) is `RoomClosed`.
     pub async fn stop_worker(&self, room_id: RoomId) -> Result<(), ClientError> {

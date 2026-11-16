@@ -1,16 +1,13 @@
 //! The event stream of a room: its bytes split into events, each one read whole up to a limit,
 //! and each event decoded before the replica checks it.
-// Nothing reads the stream yet but the tests of this module.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the sync worker is not here yet")
-)]
 
 use crate::{EventBlocks, TransportError};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use bytes::{Buf, Bytes};
 use futures::stream::{Fuse, StreamExt};
+use std::time::Duration;
+use tokio::time::Instant;
 use zemdb_core::{
     decode_message, DecodeError, RoomId, SchemaId, SequenceNumber, SequencedOperation,
     ServerMessage,
@@ -28,6 +25,10 @@ pub(crate) struct SseEvent {
     pub(crate) data: String,
 }
 
+/// How long a stream may bring nothing before it is taken for dead: three keep-alives of the
+/// server, which sends one every 15 s.
+pub(crate) const SILENCE: Duration = Duration::from_secs(45);
+
 /// Why a stream cannot be read further: it is closed, and another one opened.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum StreamError {
@@ -35,6 +36,8 @@ pub(crate) enum StreamError {
     TooLong,
     #[error("The stream is not UTF-8")]
     NotUtf8,
+    #[error("The stream brought nothing for {SILENCE:?}")]
+    Silent,
     #[error(transparent)]
     Transport(TransportError),
 }
@@ -152,6 +155,9 @@ impl EventParser {
 pub(crate) struct EventReader {
     blocks: Fuse<EventBlocks>,
     parser: EventParser,
+    /// When the last block came, or the stream opened: the stream may bring nothing for
+    /// [`SILENCE`] after it, counted also across reads that were cut.
+    heard: Instant,
 }
 
 impl EventReader {
@@ -159,18 +165,28 @@ impl EventReader {
         Self {
             blocks: blocks.fuse(),
             parser: EventParser::default(),
+            heard: Instant::now(),
         }
     }
 
-    /// The next event, or `None` once the stream ends. After an error the stream cannot be
-    /// read further: every call returns it again.
+    /// The next event, or `None` once the stream ends. A stream that brings no block for
+    /// [`SILENCE`], also the comments of its keep-alives, is `Silent`. After an error the stream
+    /// cannot be read further: every call returns it again.
     pub(crate) async fn next(&mut self) -> Result<Option<SseEvent>, StreamError> {
         loop {
             if let Some(event) = self.parser.next_event()? {
                 return Ok(Some(event));
             }
-            match self.blocks.next().await {
-                Some(Ok(block)) => self.parser.push(block),
+            let next = self.blocks.next();
+            let Ok(next) = tokio::time::timeout_at(self.heard + SILENCE, next).await else {
+                self.parser.fail(StreamError::Silent);
+                return Err(StreamError::Silent);
+            };
+            match next {
+                Some(Ok(block)) => {
+                    self.heard = Instant::now();
+                    self.parser.push(block);
+                }
                 Some(Err(err)) => {
                     self.parser.fail(StreamError::Transport(err.clone()));
                     return Err(StreamError::Transport(err));

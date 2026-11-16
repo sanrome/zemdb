@@ -426,6 +426,39 @@ async fn a_reader_cut_while_it_waits_for_a_block_loses_nothing() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_stream_that_brings_no_block_for_45_seconds_is_silent_also_across_cut_reads() {
+    // Two keep-alives, 40 s apart, and then nothing, with the stream still open; read with a
+    // timeout of 7 s, so that every read is cut: the silence counts from the last block.
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let blocks = futures::stream::unfold(receiver, |mut receiver| async move {
+        let block: Option<Result<Bytes, TransportError>> = receiver.recv().await;
+        block.map(|block| (block, receiver))
+    });
+    let mut reader = EventReader::new(Box::pin(blocks));
+    let start = Instant::now();
+    let keep_alives = sender.clone();
+    tokio::spawn(async move {
+        for _ in 0..2 {
+            tokio::time::sleep(Duration::from_secs(40)).await;
+            keep_alives.send(Ok(Bytes::from_static(b":\n\n"))).unwrap();
+        }
+    });
+    let mut cut = 0;
+    let silent = loop {
+        assert!(cut < 30, "Never silent");
+        match tokio::time::timeout(Duration::from_secs(7), reader.next()).await {
+            Ok(read) => break read,
+            Err(_) => cut += 1,
+        }
+    };
+    assert_eq!(silent, Err(StreamError::Silent));
+    assert_eq!(start.elapsed(), Duration::from_secs(125));
+    // An event that comes afterwards is not read.
+    sender.send(Ok(Bytes::from_static(b"data: x\n\n"))).unwrap();
+    assert_eq!(reader.next().await, Err(StreamError::Silent));
+}
+
 /// A pseudo-random generator for the fuzzing (xorshift64*).
 struct Rng(u64);
 

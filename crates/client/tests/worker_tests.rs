@@ -282,6 +282,8 @@ async fn a_room_opened_without_network_registers_with_the_first_heartbeat_that_g
     assert!(status.registered, "{status:?}");
     let running = WorkerStatus {
         freshness: Freshness::Periodic,
+        effective: Freshness::Periodic,
+        stream_open: false,
         running: true,
         connected: Some(true),
         last_error: None,
@@ -542,6 +544,8 @@ async fn a_room_failing_closed_stops_its_worker() {
     assert!(status.failed_closed, "{status:?}");
     let stopped = WorkerStatus {
         freshness: Freshness::Periodic,
+        effective: Freshness::Periodic,
+        stream_open: false,
         running: false,
         connected: Some(true),
         last_error: Some(ClientError::FailedClosed(room_id.clone())),
@@ -636,6 +640,8 @@ async fn a_room_that_a_step_takes_out_of_the_client_stops_its_worker() {
     assert_eq!(heartbeats(&transport, &room_id).len(), before);
     let stopped = WorkerStatus {
         freshness: Freshness::Periodic,
+        effective: Freshness::Periodic,
+        stream_open: false,
         running: false,
         connected: Some(true),
         last_error: Some(ClientError::RoomClosed(room_id.clone())),
@@ -909,22 +915,26 @@ async fn the_status_gives_the_mode_of_the_worker_and_whether_the_last_request_go
     assert_eq!(worker(&client, &room_a).await, None);
 
     // The mode of the configuration, which `set_freshness` changes; starting the worker again
-    // leaves it as it is.
+    // leaves it as it is. In `live`, with its event stream open.
     client.start_worker(room_a.clone()).await.unwrap();
     let mode = |freshness| {
         Some(WorkerStatus {
             freshness,
+            effective: freshness,
+            stream_open: freshness == Freshness::Live,
             running: true,
             connected: Some(true),
             last_error: None,
         })
     };
+    tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(worker(&client, &room_a).await, mode(Freshness::Live));
     client
         .set_freshness(room_a.clone(), Freshness::Manual)
         .await
         .unwrap();
     client.start_worker(room_a.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(worker(&client, &room_a).await, mode(Freshness::Manual));
     // A room without a worker starts one in the mode it gets.
     client
@@ -991,32 +1001,32 @@ fn past(interval: Duration) -> Duration {
 }
 
 #[tokio::test(start_paused = true)]
-async fn in_periodic_and_live_what_another_client_writes_reaches_the_replica_within_an_interval() {
-    // `live` without its event stream, which comes later, as `periodic`.
+async fn in_periodic_what_another_client_writes_reaches_the_replica_within_an_interval() {
     let interval = Duration::from_secs(10);
-    for freshness in [Freshness::Periodic, Freshness::Live] {
-        let (server, room_id, transport, storage, client) = worker_in(freshness, interval).await;
-        for id in 1..=3 {
-            server.commit(&room_id, [id]).await;
-            tokio::time::sleep(past(interval)).await;
-            assert_eq!(head(&client, &room_id).await, id as u64, "{freshness:?}");
-        }
-        assert_eq!(tasks(&storage, &room_id).await, [1, 2, 3], "{freshness:?}");
-        // A sync for each head that a heartbeat found ahead, after the ack of the head that the
-        // sync before left, and once the replica is there, only the ack of its head.
-        let syncs = [
-            ("sync", 0),
-            ("ack", 1),
-            ("sync", 1),
-            ("ack", 2),
-            ("sync", 2),
-        ];
-        assert_eq!(requests(&transport), syncs, "{freshness:?}");
-        tokio::time::sleep(interval * 3).await;
-        let requests = requests(&transport);
-        assert_eq!(requests[..5], syncs, "{freshness:?}");
-        assert_eq!(requests[5..], [("ack", 3)], "{freshness:?}");
+    let (server, room_id, transport, storage, client) =
+        worker_in(Freshness::Periodic, interval).await;
+    for id in 1..=3 {
+        server.commit(&room_id, [id]).await;
+        tokio::time::sleep(past(interval)).await;
+        assert_eq!(head(&client, &room_id).await, id as u64);
     }
+    assert_eq!(tasks(&storage, &room_id).await, [1, 2, 3]);
+    // A sync for each head that a heartbeat found ahead, after the ack of the head that the sync
+    // before left, and once the replica is there, only the ack of its head.
+    let syncs = [
+        ("sync", 0),
+        ("ack", 1),
+        ("sync", 1),
+        ("ack", 2),
+        ("sync", 2),
+    ];
+    assert_eq!(requests(&transport), syncs);
+    tokio::time::sleep(interval * 3).await;
+    let requests = requests(&transport);
+    assert_eq!(requests[..5], syncs);
+    assert_eq!(requests[5..], [("ack", 3)]);
+    // In `periodic`, no event stream.
+    assert!(transport.stream_opens().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -1215,7 +1225,6 @@ async fn a_sync_of_the_application_during_one_of_the_worker_ends_and_both_leave_
     // The batch of the sync of the worker, up to 3, is held while the application syncs up to 5.
     let mut held = transport.hold_next_reply(Sync);
     server.commit(&room_id, 1..=3).await;
-    tokio::time::sleep(past(interval)).await;
     held.replied().await;
     server.commit(&room_id, 4..=5).await;
     client.sync(room_id.clone()).await.unwrap();
@@ -1248,15 +1257,22 @@ async fn a_sync_of_the_worker_without_a_reply_goes_on_and_one_that_fails_closed_
     // Without a reply, the worker goes on with the error, and the next heartbeat asks again.
     transport.lose_next_reply(Sync);
     server.commit(&room_id, [1]).await;
-    tokio::time::sleep(past(interval)).await;
-    let lost = worker(&client, &room_id).await.unwrap();
+    let mut waited = 0;
+    let lost = loop {
+        let lost = worker(&client, &room_id).await.unwrap();
+        if lost.last_error.is_some() {
+            break lost;
+        }
+        assert!(waited < 60_000, "The sync of the worker did not fail");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        waited += 1;
+    };
     assert!(lost.running, "{lost:?}");
     assert!(
         matches!(lost.last_error, Some(ClientError::Network(_))),
         "{lost:?}"
     );
-    tokio::time::sleep(interval).await;
-    assert_eq!(head(&client, &room_id).await, 1);
+    synced_to(&client, &room_id, 1).await;
     assert_eq!(worker(&client, &room_id).await.unwrap().last_error, None);
 
     // Every batch brings an operation that does not validate against the schema of the replica,
@@ -1442,7 +1458,6 @@ async fn a_schema_change_during_a_sync_of_the_worker_registers_it_again_and_appl
         worker_in(Freshness::Periodic, interval).await;
     server.commit(&room_id, [1]).await;
     let mut held = transport.hold_next_reply(Heartbeat);
-    tokio::time::sleep(past(interval)).await;
     held.replied().await;
     let schema_id = SchemaId::new("tasks").unwrap();
     let tag = || ColumnDef::new("tag", DataType::String).nullable(true);

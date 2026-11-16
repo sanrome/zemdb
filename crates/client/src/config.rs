@@ -63,7 +63,8 @@ impl ClientConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Freshness {
     /// At once, by the event stream of the room, and at the latest with each heartbeat. Until the
-    /// worker opens the event stream, as [`Freshness::Periodic`].
+    /// worker opens the event stream, and while the server has it turned off, as
+    /// [`Freshness::Periodic`].
     Live,
     /// With each heartbeat whose ack reports a head past the replica's.
     #[default]

@@ -2,7 +2,7 @@
 
 **Fecha:** 4 de Noviembre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su quinta ronda. El dueño del proyecto adoptó el mismo día las precisiones de DC18 y de DC24 a DC26 y las decisiones DC27 a DC31 (DC27, con la condición de S4), con dos ajustes: DC26 dice explícitamente que, en el camino normal, un `ops` se aplica sin ningún `/sync`, y la verificación del `ClientId` de un token renovado pasa de 4.4 al Lote 3 (DC30). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026, con S4 respondido y la revisión de delta en verde en su cuarta ronda. Lote 2 (el stream de eventos: el transporte y el parser) cerrado el 9 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lote 3 (la renovación del token) cerrado el 10 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda. Lote 4 (el worker: la tarea, el heartbeat y las transferencias) cerrado el 12 de Noviembre de 2026. Lote 5 (los modos `periodic` y `manual`) cerrado el 12 de Noviembre de 2026. Lote 6 (el `Ack` periódico, detener el worker y los endurecimientos) cerrado el 13 de Noviembre de 2026. Lo que sigue es el Lote 7.
+**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su quinta ronda. El dueño del proyecto adoptó el mismo día las precisiones de DC18 y de DC24 a DC26 y las decisiones DC27 a DC31 (DC27, con la condición de S4), con dos ajustes: DC26 dice explícitamente que, en el camino normal, un `ops` se aplica sin ningún `/sync`, y la verificación del `ClientId` de un token renovado pasa de 4.4 al Lote 3 (DC30). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026, con S4 respondido y la revisión de delta en verde en su cuarta ronda. Lote 2 (el stream de eventos: el transporte y el parser) cerrado el 9 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lote 3 (la renovación del token) cerrado el 10 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda. Lote 4 (el worker: la tarea, el heartbeat y las transferencias) cerrado el 12 de Noviembre de 2026. Lote 5 (los modos `periodic` y `manual`) cerrado el 12 de Noviembre de 2026. Lote 6 (el `Ack` periódico, detener el worker y los endurecimientos) cerrado el 13 de Noviembre de 2026. Lote 7 (el modo `live`: el stream en el worker) cerrado el 16 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lo que sigue es el Lote 8.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.3. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Parte de:** el SSE del servidor, del Lote 5 de la [Fase 3.12](2026-11-fase3_12-rendimiento-servidor.md) (`2c0a908`): el evento `ops` con la encarnación de la sala, el stream que termina cuando vence su token y `EventsDisabled` (`ARCHITECTURE.md` §7.2).
@@ -143,7 +143,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 | 4 | El worker: la tarea, el heartbeat y las transferencias | client | DC28, DC29 | K7, K15, K17 | ✅ |
 | 5 | Los modos `periodic` y `manual` | client | DC24, DC25, DC28 | K7, K15 | ✅ |
 | 6 | El `Ack` periódico, detener el worker y los endurecimientos | client | DC25, DC28, DC31 | K5, K11, K2, K7 | ✅ |
-| 7 | El modo `live`: el stream en el worker | client | DC24, DC26, DC29, DC30 | K7, K6, K12, K15, K17 | ⬜ |
+| 7 | El modo `live`: el stream en el worker | client | DC24, DC26, DC29, DC30 | K7, K6, K12, K15, K17 | ✅ |
 | 8 | El evento `ops` | client | DC26, DC29 | K1, K6, K2, K7, K12, K17 | ⬜ |
 | 9 | El arnés de simulación con el worker y el SSE | client (tests) | §5.3 del plan de la fase | K1, K2, K3, K4, K7, K15, K17 | ⬜ |
 | 10 | Robustez: fuzzing de los eventos | client (tests) | — | K12, K17 | ⬜ |
@@ -985,7 +985,7 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
   - **Tres tests del Lote 5 que fallan de vez en cuando** (`a_schema_change_during_a_sync_of_the_worker_registers_it_again_and_applies_with_it`, `a_sync_of_the_application_during_one_of_the_worker_ends_and_both_leave_the_head` y `a_sync_of_the_worker_without_a_reply_goes_on_and_one_that_fails_closed_stops_it`): suponen un solo heartbeat en `past(interval)`, y fallan sin este lote cuando el primero cae en los primeros 10 ms (cerca de una vez en mil). No son de este lote: van al Lote 7, que vuelve a tocar los tests del worker.
   - **`INVARIANTES.md`** toma la versión 34: la 32 la tomó el Lote 6 de 4.4, y la 33, el Lote 8b de 3.12.
 
-### Lote 7 · El modo `live`: el stream en el worker (`zemdb-client`) · ⬜
+### Lote 7 · El modo `live`: el stream en el worker (`zemdb-client`) · ✅ Hecho
 **Objetivo:** que una sala en `live` se entere enseguida de lo que escriben los demás (DC24, DC26), con cada evento como un aviso; aplicar el `ops` sin sync es del Lote 8.
 
 **Pendiente del Lote 6** (de su revisión de delta): tres tests del Lote 5 que suponen un solo heartbeat en `past(interval)` y fallan cuando el primero cae en los primeros 10 ms (`a_schema_change_during_a_sync_of_the_worker_registers_it_again_and_applies_with_it`, `a_sync_of_the_application_during_one_of_the_worker_ends_and_both_leave_the_head` y `a_sync_of_the_worker_without_a_reply_goes_on_and_one_that_fails_closed_stops_it`): que esperen el sync, como los del Lote 6 (`synced_to`), y que pasen con el primer heartbeat fijo a los 5 ms.
@@ -1010,6 +1010,166 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 
 **Entrega:** `feat(client): the live mode, with the event stream of the room (Fase 4.3, Lote 7)`.
 
+**Hecho** (16 de Noviembre de 2026).
+- **Qué entró.**
+  - **La apertura.** En `live`, el worker abre el stream de la sala en una tarea propia, como el sync y la transferencia, con el token de la sala, después de leer la época de la réplica bajo el aplicador. Una réplica fuera del cliente (`RoomClosed`) o que falla cerrada (`FailedClosed`) detiene el worker sin abrir nada. Abrirlo es un paso del worker: su error se ve en `status`, y una apertura que sale bien lo borra. No cambia el estado de la conexión de la sala, que dan los pedidos.
+    - `Unauthorized` renueva el token y abre otra vez con el nuevo, y `Forbidden` deja el token para que el pedido siguiente lo renueve primero, como en un pedido (DC30).
+    - `EventsDisabled`: el worker sigue como en `periodic` hasta reintentar después de `events_retry`.
+    - Cualquier otra negativa, una que no es de la sala (de otra sala, o con una correlación) o una que no decodifica, y la falta de respuesta, son un error del paso.
+  - **El sync después de abrirlo**, por lo que pasó antes de suscribirse.
+  - **Los avisos.** Cada evento es un aviso, si el stream es de la época de la réplica:
+    - `ops`, `head_advanced`, `lagged` o uno que no decodifica: un sync del worker, juntado con los de los heartbeats (uno en vuelo y una marca);
+    - `schema_reloaded`: la réplica queda sin registrar, y el sync del worker que lo sigue se registra primero con el cursor;
+    - `snapshot_wanted`, y `snapshot_available` si la réplica espera un snapshot: un heartbeat en la tarea de las transferencias, como lo manda `heartbeat`, que sube o baja el snapshot (si hay una transferencia en curso, nada: la pide el heartbeat siguiente);
+    - uno de nombre desconocido: nada.
+
+    Ningún evento detiene el worker ni es un error suyo.
+  - **La época.** El worker anota la época con que abrió el stream. Uno de otra época se reemplaza en el momento, sin espera, cuando lo nota su próximo evento, que no se usa, o su próximo heartbeat (`Asked` lleva la época de la réplica que lo mandó).
+  - **Reabrirlo.** Su fin, un error al leerlo y una apertura que falla abren otro después de un backoff con *full jitter* como el de los heartbeats (`retry_base`, que se duplica hasta `retry_max`). Un evento lo vuelve a empezar, así que un stream que termina enseguida, o un servidor que lo rechaza, se reabre con una espera que se duplica, y no una vez por segundo. Los errores al leerlo son:
+    - un evento o una línea demasiado largos;
+    - bytes que no son UTF-8;
+    - un error del transporte;
+    - 45 s sin un bloque.
+  - **El silencio de 45 s** se mide dentro del lector, en los bloques del transporte, con los comentarios del keep-alive. `EventReader` anota cuándo llegó el último bloque, y su lectura vence a los 45 s de él, también entre lecturas cortadas (`StreamError::Silent`). Después, como con los demás errores, no lee nada más.
+  - **El modo.** `set_freshness` despierta la tarea (un `Notify`), que abre el stream en `live`, y lo cierra o corta su apertura en otro modo. Lo hace cuando termina el paso en curso: en el momento, salvo que haya un heartbeat en vuelo. El modo se lee en cada paso. Detener el worker cierra el stream, corta su apertura y espera que termine.
+  - **`status`.** `WorkerStatus` suma `effective` (`periodic` en `live` con el SSE apagado, hasta que se abra un stream) y `stream_open`, que un guard baja al terminar la tarea.
+  - **El módulo de los eventos** deja su `expect(dead_code)`: lo usa el worker.
+  - **El tamaño.** Unas 260 líneas de producción, sin comentarios ni líneas vacías (se estimaron 250).
+- **Tests.** `tests/live_tests.rs` (nuevo, 28 tests), contra el servidor en proceso y con el reloj pausado. El intervalo es de 59 s, y los tests actúan después de un heartbeat (`after_a_heartbeat`): lo que llega a la réplica en menos de un segundo llegó por el stream. Uno más, unitario, en `src/tests/events.rs`.
+  - **Lo que escribe otro** llega por el stream en el momento, un sync por evento, sin ningún heartbeat.
+  - **El stream cortado.** Se abre otro después de una espera de hasta `retry_base`. Lo escrito mientras estaba cortado (con la reapertura retenida antes de llegar al servidor) no llega por ningún evento, y llega con el sync de después de abrirlo.
+  - **Muchos eventos** durante un sync retenido llevan a un solo sync más.
+  - **`lagged`** (fabricado) y **`head_advanced`** (real, con una operación más grande que el tope del evento) llevan a un sync.
+  - **`schema_reloaded`**, real, con una columna nueva: la réplica se registra con su cursor y su encarnación, guarda el esquema nuevo en sus metadatos, y el sync del worker no encuentra nada más (un solo sync).
+  - **`snapshot_wanted`**: el designado sube su snapshot en menos de un segundo, sin esperar su heartbeat, con los dos heartbeats que manda `heartbeat` en la tarea de las transferencias. **`snapshot_available`**, por una subida del worker de snapshots del servidor: la réplica que espera lo baja igual.
+  - **Lo que no lleva a nada:** un `snapshot_available` con la réplica sin esperar, un evento de nombre desconocido y un comentario no llevan a ningún sync, heartbeat ni bajada.
+  - **El SSE apagado**, con el servidor real (`max_sse_streams` en 0): `live` cae a `periodic` (lo dice `status`), lo escrito llega con el heartbeat, y el worker vuelve a intentar el stream después de `events_retry`, no antes.
+  - **El SSE apagado y encendido**, con la negativa fabricada: una apertura sin respuesta deja `Network` en `status`, y la siguiente, rechazada con `EventsDisabled`, lo borra y deja el modo efectivo en `periodic`. Cuando el servidor lo vuelve a encender, el worker abre el stream después de `events_retry`, con su sync, y lo escrito llega por evento.
+  - **El token.** Un stream que termina, con un `Unauthorized` a la reapertura, se vuelve a abrir con un token renovado. Una reapertura `Forbidden` hace que la siguiente, después de una espera, pida el token antes de abrir.
+  - **El fin con el token**, en tiempo virtual: el stream se reabre con el mismo token, que en hora de pared sigue vigente, sin pedir otro, y con un sync después.
+  - **Un stream de una época anterior** (la réplica descartada por `InvalidSequence` en el registro de un sync de la aplicación): su evento no lleva a ningún heartbeat, y el stream se reemplaza con su sync. Sin un evento, el heartbeat siguiente lo nota.
+  - **El silencio.** Un stream fabricado que calla se reemplaza a los 45 s y no antes; el del servidor, con su keep-alive cada 15 s, sigue abierto 120 s.
+  - **Los eventos que no se pueden usar.** Uno que no decodifica (`ops` sin base64, `head_advanced` sin secuencia) lleva a un sync y no detiene nada. Uno de más de 64 KiB cierra el stream: se abre otro, con su sync, sin error en `status`.
+  - **El modo.** `set_freshness(Live)` abre el stream en el momento, y `manual` lo cierra; `stop_worker` lo cierra. Una apertura retenida la corta otro modo, y también una detención, que no la espera: nada retiene al cliente después.
+  - **La espera entre aperturas.** Con streams que terminan enseguida sin un evento, unas 25 aperturas en 300 s; con streams que traen un evento, más de 60 en 60 s. Con aperturas rechazadas (`RateLimited`), la espera también se duplica, y `status` muestra el error salvo después de un heartbeat.
+  - **La apertura que encuentra la sala fuera del cliente** (un sync de la aplicación cuyo descarte no pudo borrar los datos) o **fallando cerrada** (un `Registered` con un esquema que no evoluciona) detiene el worker sin abrir nada, mucho antes del heartbeat siguiente.
+  - **Una negativa que no es de la sala** (`EventsDisabled` de otra sala, o con una correlación) es un error, y no cambia el modo efectivo. La apertura siguiente lo borra.
+  - **La sala que el servidor detiene** termina el stream: el worker abre otro, y lo escrito después llega por evento.
+  - **De la revisión de delta:**
+    - un worker que un paso detiene con el stream abierto lo muestra cerrado en `status`;
+    - también lo muestra cerrado mientras está en vuelo el `Ack` que sigue al heartbeat que reemplazó un stream de otra época (con un stream callado, para que no lo note un evento);
+    - un servidor que rechaza todas las aperturas por el token: cada apertura renueva una vez, y las aperturas esperan cada vez más;
+    - con un stream abierto pero callado (un proxy que lo retiene), el heartbeat trae lo que escribe otro;
+    - un cliente soltado mientras un sync del worker lo retiene termina el worker en el evento siguiente, mucho antes del heartbeat;
+    - el worker abre un stream a la vez, al arrancar y cuando termina, y nada retiene al cliente después.
+  - **El silencio del lector** (unitario): con dos keep-alive a 40 s de distancia y lecturas cortadas cada 7 s, el lector da `Silent` a los 125 s, a 45 s del último bloque, y no lee un evento que llega después.
+  - **Cambios en tests de otros lotes:**
+    - `worker_tests.rs`: `WorkerStatus` con sus dos campos.
+    - El test de `periodic` y `live` del Lote 5 queda solo en `periodic`, ahora sin ningún stream: `live` abre el suyo.
+    - El del estado espera que el stream se abra y se cierre.
+    - **El pendiente del Lote 6:** los tres tests del Lote 5 esperan el sync, o el error, en lugar de dormir un intervalo.
+    - En `tests/common/`:
+      - el transporte de prueba cuenta las aperturas del stream con su token y su instante, las retiene, las contesta a pedido, escribe bloques en los streams que abrió, los termina y cuenta los que el cliente sigue leyendo;
+      - tiene un tope de aperturas como el de los mensajes, para que una mutación que reabre sin esperar falle y no se cuelgue;
+      - `Held::replied` espera hasta 60 s, más que cualquier intervalo.
+  - **Sin depender de cuándo cae el primer heartbeat.**
+    - La suite del worker, la de `live` y la de los snapshots pasaron 30 de 30 veces seguidas. Con el árbol de la revisión, la del worker y la de `live` pasaron 30 de 30.
+    - En esa corrida, el test del SSE encendido después de un error falló una vez: el tercer intento podía caer dentro de los 10 ms que esperaba antes de mirar el estado. Ahora retiene el segundo y el tercer intento, y mira el estado entre los dos. La suite de `live` pasó después 100 de 100.
+    - Con el primer heartbeat fijo a los 5 ms o a 1 ns del final del intervalo, pasan los de `live` y los tres del Lote 5 del pendiente. Fallan solo el del primer heartbeat al azar, que lo prueba a propósito, y, a 1 ns del final, tres de los Lotes 4 a 6 (en los desvíos).
+    - A 2 ms del final pasan todos.
+  - **MSRV y versiones largas.** Con Rust 1.88 pasan los 20 binarios de tests del cliente, y con 1.85 compila el workspace. Pasan las pruebas largas del cliente (`--release --ignored`): el fuzzing de los eventos y del cifrado, la simulación y los `watch`.
+- **Mutaciones inversas: 52 de las 53 las mata algún test, y con la otra la suite no termina.** El log, en el scratchpad de la sesión: `mut7/run1.log` a `run6.log`.
+  - **El silencio:** sin plazo, sin anotar el bloque, el plazo por lectura y no por bloque, 48 s, y no repetir `Silent`.
+  - **La apertura:**
+    - sin `FailedClosed`;
+    - sin renovar el token marcado, ni ante `Unauthorized`;
+    - sin marcar `Forbidden`;
+    - `EventsDisabled` como un error;
+    - la negativa de cualquier sala o con correlación;
+    - la época en 0.
+  - **El núcleo:** `unregister` sin efecto, `awaits_snapshot` siempre falso o siempre verdadero, y la época de `Asked` en 0.
+  - **El modo y el estado:**
+    - sin `Notify`, o sin esperarlo;
+    - sin cerrar fuera de `live`, ni cortar la apertura;
+    - el modo efectivo siempre el pedido;
+    - sin compartir `disabled` ni `stream_open`;
+    - el stream también en `periodic`.
+  - **El resultado de la apertura:**
+    - un error que nunca detiene;
+    - reabrir sin espera;
+    - una apertura que no borra el error;
+    - sin marcar `disabled`, reintentarlo con el backoff, o no borrarlo;
+    - sin el sync después de abrir.
+  - **La lectura:**
+    - reabrir sin espera tras el fin;
+    - sin comparar la época en el evento, ni en el heartbeat;
+    - sin reiniciar el backoff con un evento;
+    - abrir otro mientras uno se abre;
+    - no cortar la apertura al detenerse.
+  - **Los avisos:**
+    - `schema_reloaded` solo con un sync, o sin nada;
+    - `snapshot_wanted` sin nada;
+    - `snapshot_available` sin nada, o siempre;
+    - un evento desconocido que sincroniza;
+    - `ops`, `head_advanced`, `lagged` o uno que no decodifica sin nada.
+  - **Cuatro casos en la primera corrida:**
+    - **Dos sobrevivieron** y llevaron a tests más fuertes:
+      - Que `Silent` se repita: sin eso, la lectura siguiente también vencía, porque el último bloque seguía lejos. Ahora un evento que llega después del silencio no se lee.
+      - Que una apertura borre el error: el sync que la sigue también lo borraba. Ahora se ve con una apertura rechazada con `EventsDisabled`, que no lleva a un sync.
+    - **No cortar la apertura al detenerse** colgaba el test, que ahora tiene un plazo propio.
+    - **Abrir otro stream mientras uno se abre** deja al worker lanzando aperturas sin espera. Cada vuelta reemplaza la apertura en vuelo por una nueva, que nunca alcanza a terminar, y las tareas se acumulan sin fin, también sin nada retenido. El reloj pausado no avanza y el proceso se queda sin memoria, así que la suite no termina. Ningún test lo dice mejor con el reloj pausado: el test de la revisión de delta, que lo mataba sin agotar la memoria, se colgaba igual en esta máquina. Queda el test de un stream a la vez, al arrancar y al reabrir.
+  - **Cinco más, de la revisión de delta, con sus tests:**
+    - `status` que no se limpia al terminar la tarea, ni después del reemplazo en el heartbeat;
+    - no marcar la renovación en la apertura (reabría sin espera ni límite);
+    - el heartbeat que no sincroniza con el stream abierto;
+    - seguir en un evento con el cliente soltado.
+  - **Una dependencia corregida.** Un test nuevo dependía del backoff que dejó el anterior: fallaba 13 de 30 veces hasta que inyectó un evento para reiniciar la espera. Las tres mutaciones que solo él mataba se volvieron a correr.
+- **Interacciones revisadas.**
+  - **El tope de 2 streams por cliente y sala.** El worker suelta el stream viejo antes de abrir otro: su conexión se cierra, y el servidor lo nota en su próxima escritura, a lo sumo el keep-alive siguiente. Mientras tanto, el nuevo es el segundo, y uno más reemplazaría al más viejo, así que reabrir nunca espera al viejo (el test del Lote 2 del tercer stream que termina el más viejo).
+  - **El `RateLimited` del tope total** es una negativa más, con su espera que se duplica (con test).
+  - **La sala que el servidor detiene.** Con un suscriptor, el servidor no la detiene por inactividad. Si se detiene igual, el stream termina y el worker abre otro, que la vuelve a levantar (con test).
+  - **El keep-alive** cuenta para el silencio: un stream del servidor que calla no se reemplaza (con test).
+  - **El apagado del servidor** termina el stream como cualquier fin (el test del Lote 2), y las aperturas sin respuesta esperan cada vez más. Sin test con el reloj pausado: el servidor de prueba reiniciado es otro router, que el transporte del cliente no ve.
+  - **Las escrituras y su catch-up.** En `live`, el evento del commit propio llega después del catch-up y lleva a un sync que no trae nada: un pedido más por escritura, hasta que el Lote 8 ignore ese evento por el head.
+  - **El tiempo que el worker no lee el stream.** Mientras manda un heartbeat y su `Ack`, que esperan el aplicador, no lee. Lo que llegó espera en la conexión, y cuenta para el silencio apenas se lee: el plazo mira el último bloque, pero una lectura que encuentra un bloque listo lo toma antes de vencer. El *stall timeout* del servidor cierra solo la conexión de ese stream (DC27).
+  - **El silencio** se mide en los bloques del transporte y no en los eventos: el lector no entrega los comentarios, así que lo mide él (la nota de la revisión de delta del Lote 2).
+  - **Los syncs de los eventos y de los heartbeats** comparten la tarea y la marca del worker: a lo sumo uno en vuelo y uno más (con test). Los de las escrituras y de la aplicación van por su lado, como antes.
+  - **La renovación del token** es la misma que la de los pedidos, una por sala a la vez: el stream y un pedido que reciben `Unauthorized` con el mismo token esperan la misma renovación.
+  - **El descarte por D78** deja la misma encarnación, y solo la época distingue los eventos de antes (con test). `discard_room` detiene el worker antes de descartar, con su stream.
+  - **Una réplica que espera un snapshot** no sincroniza: el sync después de abrir el stream es `Network` sin mandar nada, y queda en `status` hasta el heartbeat siguiente.
+  - **El cliente que se suelta.** La apertura en vuelo retiene al cliente como un paso más, y el worker la corta al detenerse. Un evento con el cliente soltado termina la tarea, como un heartbeat.
+  - **4.4.** El `set_freshness` de un `watch` (Lote 8 de 4.4) tiene efecto cuando termina el paso en curso, y espera una detención en curso como antes.
+  - **`set_freshness` con un heartbeat en vuelo** (de la revisión de delta). La tarea no mira el modo mientras manda un heartbeat y su `Ack`: lo toma al terminarlos, que puede ser hasta el plazo del transporte y del proveedor de tokens. Así lo dicen ahora los docstrings y §11.
+  - **`schema_reloaded` con un registro en vuelo** (de un heartbeat, una escritura o la aplicación; de la revisión de delta). El registro deja la réplica sin registrar, pero un `Registered` con el esquema viejo que llega después la vuelve a dejar registrada. Lo cubren el esquema que anuncia cada `SyncBatch`, que el sync de ese aviso trae (un lote con una versión posterior registra otra vez), y el de cada `HeartbeatAck`: la réplica toma el esquema nuevo en ese sync o en el heartbeat siguiente.
+  - **El estado de `status` al terminar la tarea** (de la revisión de delta). `stream_open` lo pone un guard que lo baja al terminar la tarea, también si se corta, como pide `GEMINI.md` para un estado transitorio (con test).
+  - **El MSRV y wasm32:** `Notify` y `timeout_at` son de Tokio, ya en el MSRV. El crate sigue vacío en wasm32.
+- **Revisión de delta, primera ronda: verde.** Sin hallazgos Altos ni Medios. Los seis Bajos se arreglaron en el lote:
+  - **Bajo:** `status` mostraba el stream abierto con el worker ya detenido, y durante el `Ack` después de un reemplazo en el heartbeat. Ahora lo pone un guard RAII que lo baja al terminar la tarea, y se actualiza después del reemplazo (tests nuevos).
+  - **Bajo:** el modo no se toma en el momento mientras hay un heartbeat en vuelo, y volver a `live` respeta la espera de la reapertura o la de `events_retry`. Los docstrings, §11 y estos desvíos lo dicen ahora.
+  - **Bajo:** tres reglas sin test, ahora con test:
+    - la marca de la renovación en la apertura;
+    - el sync del heartbeat en `live` con el stream abierto;
+    - el `break` de un evento con el cliente soltado.
+  - **Bajo:** dos esperas de los tests sin tope propio (`after_a_heartbeat` y la del error del Lote 5), que ahora lo tienen. Además, un test para la mutación que agota la memoria, que acá no la mata sin colgarse (en las mutaciones).
+  - **Bajo:** faltaban interacciones: `set_freshness` con un heartbeat en vuelo, `schema_reloaded` con un registro en vuelo y el estado al terminar la tarea.
+  - **Bajo:** los docstrings de `Worker::stop` y de `stop_worker` no nombraban la apertura del stream.
+
+  El revisor volvió a correr las mutaciones y la suite con el primer heartbeat fijo, con los mismos resultados.
+- **Desvíos.**
+  - **Precisiones de DC26 que el plan no decía:**
+    - **la espera de la reapertura** vuelve a empezar con un evento del stream, no con una apertura que sale bien, para que un stream que termina enseguida no se reabra una vez por segundo con un sync cada vez;
+    - **el registro de `schema_reloaded`** lo manda el sync del worker, que se registra primero porque la réplica quedó sin registrar: un registro y un sync, en lugar de un registro solo;
+    - **una negativa del stream** que no es de la sala, o que trae una correlación, es un error;
+    - **la apertura** es un paso del worker, con su error en `status`, que no cambia el estado de la conexión.
+  - **Precisión de DC28:** el modo se toma cuando termina el paso en curso (un `Notify`), no en el heartbeat siguiente como en el Lote 5, para que `live` abra el stream enseguida.
+    - Mientras hay un heartbeat en vuelo, al terminarlo.
+    - La espera de la reapertura y la de `events_retry` se conservan entre modos.
+  - **Los errores de lectura del stream** y su fin no van a `status`: los de la apertura sí.
+  - **El silencio** se mide en el lector del Lote 2, que anota su último bloque, y no en un envoltorio de los bloques en el worker: así vale también entre lecturas que el worker corta en su `select!`.
+  - **`WorkerStatus`** suma dos campos públicos: `effective` y `stream_open`.
+  - **Un pendiente para el Lote 9.** La verificación con el primer heartbeat a 1 ns del final del intervalo, que no se había hecho en los lotes anteriores, encontró tres tests de los Lotes 4 a 6 que fallan así: el reloj de Tokio redondea el heartbeat al mismo milisegundo en que termina la espera del test, una vez en unas 10.000 corridas. Quedan anotados en el Lote 9.
+  - **Dos tests del pendiente del Lote 5** tenían ese mismo borde con el plazo de 10 s de `Held::replied`, que ahora es de 60 s.
+
 ### Lote 8 · El evento `ops` (`zemdb-client`) · ⬜
 **Objetivo:** que un evento `ops` se aplique sin un `/sync`, y solo si es de la encarnación y de la época de la réplica y sigue a su head (DC26, INV-K1).
 
@@ -1033,6 +1193,8 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 
 ### Lote 9 · El arnés de simulación con el worker y el SSE (`zemdb-client`, tests) · ⬜
 **Objetivo:** las invariantes del cliente con el worker en marcha, en ejecuciones al azar.
+
+**Pendiente del Lote 7** (de su verificación con el primer heartbeat fijo): tres tests de los Lotes 4 a 6 fallan cuando el primer heartbeat cae en el último milisegundo del intervalo, porque el reloj de Tokio lo redondea al mismo instante en que termina la espera del test (`a_reader_that_syncs_only_with_its_worker_stays_connected_past_a_prune_and_is_designated`, `a_snapshot_larger_than_the_limit_and_an_error_of_the_storage_do_not_stop_the_worker` e `in_manual_what_another_client_writes_reaches_the_replica_with_a_sync_or_a_write`): una vez en unas 10.000 corridas cada uno. Que esperen el estado que miden, como `synced_to`, y que pasen con el primer heartbeat fijo a 1 ns del final del intervalo.
 
 **Qué se hace:** el transporte de la simulación (`Link`, en `tests/simulation_tests.rs`) implementa `events`, y el arnés de 4.2 (§5.3 del plan de la fase) suma clientes con worker, en un modo al azar que cambia en el medio; el SSE por el transporte que inyecta fallas (cortar el stream, perder eventos, demorarlos, mandar `lagged`, callar); tokens que vencen, fabricados como dice §2 (*Pruebas*): el proveedor de prueba da a veces tokens ya vencidos, y el transporte termina streams y responde `Unauthorized`; y el SSE apagado en algunos reinicios del servidor. El reloj pausado hace correr los intervalos.
 
@@ -1080,4 +1242,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** plan escrito el 4 de Noviembre de 2026. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su quinta ronda: las precisiones de DC18 y de DC24 a DC26 y DC27 a DC31, como *Propuestas*, y `INVARIANTES.md` en la versión 16. El dueño del proyecto las adoptó el mismo día, con dos ajustes (la frase de DC26 sobre el camino normal sin `/sync` y la verificación del `ClientId` en el Lote 3). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026: S4 respondido en DC27 (compila con `aws-lc-rs` y el MSRV; el plazo de inactividad lo arma el transporte), la revisión de delta en verde en su cuarta ronda e `INVARIANTES.md` en la versión 19 (la 18 la tomó el Lote 0 de 4.4). Lote 2 (el stream de eventos: el transporte y el parser) cerrado el 9 de Noviembre de 2026: el stream por su propio cliente HTTP/1.1, el parser con su tope de 64 KiB y la decodificación de los eventos, que todavía nadie usa; la revisión de delta en verde en su primera ronda, con sus Bajos arreglados en el lote, e `INVARIANTES.md` en la versión 22 (la 20 la tomó el Lote 6b de 3.12, y la 21, el Lote 1 de 4.4). Lote 3 (la renovación del token) cerrado el 10 de Noviembre de 2026: el `TokenProvider` en `Client::open` y en la fachada de 4.4, la renovación ante `Unauthorized` (una por sala a la vez, con su plazo de 60 s, y el pedido repetido una vez), la verificación del formato y del `ClientId` del token renovado, el token marcado ante `Forbidden`, y la escritura que no queda incierta por un `Unauthorized` ni manda nada después de terminar; la revisión de delta en verde en su segunda ronda, e `INVARIANTES.md` en la versión 24 (la 23 la tomó el Lote 2 de 4.4). Lote 4 (el worker: la tarea, el heartbeat y las transferencias) cerrado el 12 de Noviembre de 2026: `start_worker`, `set_freshness` y `stop_worker`, una tarea por sala que tiene al cliente por un `Weak`, un heartbeat por intervalo (el primero al azar) que no espera las transferencias, que corren en su tarea, los reintentos con backoff y *full jitter*, lo que lo detiene (solo `FailedClosed` y `RoomClosed` de sus pasos), `close_room` y `shutdown` que lo detienen antes de cerrar, y el worker y el estado de la conexión en `status`; e `INVARIANTES.md` en la versión 28 (la 25 y la 26 las tomaron los Lotes 3 y 4 de 4.4, y la 27, el Lote 7 de 3.12). Lote 5 (los modos `periodic` y `manual`) cerrado el 12 de Noviembre de 2026: en `periodic`, y en `live` hasta el stream, un heartbeat cuyo ack informa un head mayor que el de la réplica lleva a un sync del worker, sin `Ack`, en su tarea, uno a la vez y uno más marcado; en `manual`, ninguno, y el worker igual sube y baja snapshots; la revisión de delta en verde en su primera ronda, e `INVARIANTES.md` en la versión 31 (la 29 la tomó el Lote 5 de 4.4, y la 30, la revisión de cierre de 3.12). Lote 6 (el `Ack` periódico, detener el worker y los endurecimientos) cerrado el 13 de Noviembre de 2026: el `Ack` del head de la réplica con cada heartbeat que sale bien, si pasó del último que el servidor tomó como cursor, y el último al detener el worker, con su plazo de 5 s, antes de cerrar la sala; un llamador que detiene el worker mientras otro lo detiene espera esa detención; DEF-196 (una réplica que espera un snapshot que nadie anuncia se registra otra vez después de 10 heartbeats) y DEF-192 (una respuesta con un head menor que el visto baja el head visto y registra la réplica); e `INVARIANTES.md` en la versión 34 (la 32 la tomó el Lote 6 de 4.4, y la 33, el Lote 8b de 3.12). Lo que sigue es el Lote 7.
+**Avance:** plan escrito el 4 de Noviembre de 2026. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su quinta ronda: las precisiones de DC18 y de DC24 a DC26 y DC27 a DC31, como *Propuestas*, y `INVARIANTES.md` en la versión 16. El dueño del proyecto las adoptó el mismo día, con dos ajustes (la frase de DC26 sobre el camino normal sin `/sync` y la verificación del `ClientId` en el Lote 3). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026: S4 respondido en DC27 (compila con `aws-lc-rs` y el MSRV; el plazo de inactividad lo arma el transporte), la revisión de delta en verde en su cuarta ronda e `INVARIANTES.md` en la versión 19 (la 18 la tomó el Lote 0 de 4.4). Lote 2 (el stream de eventos: el transporte y el parser) cerrado el 9 de Noviembre de 2026: el stream por su propio cliente HTTP/1.1, el parser con su tope de 64 KiB y la decodificación de los eventos, que todavía nadie usa; la revisión de delta en verde en su primera ronda, con sus Bajos arreglados en el lote, e `INVARIANTES.md` en la versión 22 (la 20 la tomó el Lote 6b de 3.12, y la 21, el Lote 1 de 4.4). Lote 3 (la renovación del token) cerrado el 10 de Noviembre de 2026: el `TokenProvider` en `Client::open` y en la fachada de 4.4, la renovación ante `Unauthorized` (una por sala a la vez, con su plazo de 60 s, y el pedido repetido una vez), la verificación del formato y del `ClientId` del token renovado, el token marcado ante `Forbidden`, y la escritura que no queda incierta por un `Unauthorized` ni manda nada después de terminar; la revisión de delta en verde en su segunda ronda, e `INVARIANTES.md` en la versión 24 (la 23 la tomó el Lote 2 de 4.4). Lote 4 (el worker: la tarea, el heartbeat y las transferencias) cerrado el 12 de Noviembre de 2026: `start_worker`, `set_freshness` y `stop_worker`, una tarea por sala que tiene al cliente por un `Weak`, un heartbeat por intervalo (el primero al azar) que no espera las transferencias, que corren en su tarea, los reintentos con backoff y *full jitter*, lo que lo detiene (solo `FailedClosed` y `RoomClosed` de sus pasos), `close_room` y `shutdown` que lo detienen antes de cerrar, y el worker y el estado de la conexión en `status`; e `INVARIANTES.md` en la versión 28 (la 25 y la 26 las tomaron los Lotes 3 y 4 de 4.4, y la 27, el Lote 7 de 3.12). Lote 5 (los modos `periodic` y `manual`) cerrado el 12 de Noviembre de 2026: en `periodic`, y en `live` hasta el stream, un heartbeat cuyo ack informa un head mayor que el de la réplica lleva a un sync del worker, sin `Ack`, en su tarea, uno a la vez y uno más marcado; en `manual`, ninguno, y el worker igual sube y baja snapshots; la revisión de delta en verde en su primera ronda, e `INVARIANTES.md` en la versión 31 (la 29 la tomó el Lote 5 de 4.4, y la 30, la revisión de cierre de 3.12). Lote 6 (el `Ack` periódico, detener el worker y los endurecimientos) cerrado el 13 de Noviembre de 2026: el `Ack` del head de la réplica con cada heartbeat que sale bien, si pasó del último que el servidor tomó como cursor, y el último al detener el worker, con su plazo de 5 s, antes de cerrar la sala; un llamador que detiene el worker mientras otro lo detiene espera esa detención; DEF-196 (una réplica que espera un snapshot que nadie anuncia se registra otra vez después de 10 heartbeats) y DEF-192 (una respuesta con un head menor que el visto baja el head visto y registra la réplica); e `INVARIANTES.md` en la versión 34 (la 32 la tomó el Lote 6 de 4.4, y la 33, el Lote 8b de 3.12). Lote 7 (el modo `live`: el stream en el worker) cerrado el 16 de Noviembre de 2026: en `live`, el worker abre el stream de la sala y sincroniza después de abrirlo, y cada evento es un aviso (un sync, un registro con el cursor o un heartbeat en la tarea de las transferencias), si el stream es de la época de la réplica; lo reabre después de su fin, de un error o de 45 s sin un bloque, con un backoff que un evento vuelve a empezar, y con el token renovado ante `Unauthorized`; con el SSE apagado sigue como en `periodic` hasta `events_retry`; `set_freshness` lo abre o lo cierra en el momento, y `status` dice el modo efectivo y si el stream está abierto; e `INVARIANTES.md` en la versión 36 (la 35 la tomó el Lote 7 de 4.4). Lo que sigue es el Lote 8.

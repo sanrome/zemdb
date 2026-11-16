@@ -531,6 +531,10 @@ impl TestServer {
             lose: Arc::default(),
             sync_batch_size: Arc::default(),
             tasks: Arc::default(),
+            opens: Arc::default(),
+            events_answer: Arc::default(),
+            events_hold: Arc::default(),
+            streams: Arc::default(),
         }
     }
 }
@@ -579,6 +583,18 @@ pub fn error_reply(correlation_id: CorrelationId, room_id: &RoomId, code: ErrorC
 /// What a [`TestTransport`] answers a message with instead of the server, if anything.
 type Answer = dyn FnMut(&ClientMessage) -> Option<Result<Vec<u8>, TransportError>> + Send;
 
+/// What a [`TestTransport`] answers the opening of the event stream of a room with instead of
+/// the server, if anything.
+type EventsAnswer = dyn FnMut(&RoomId) -> Option<Result<EventStream, TransportError>> + Send;
+
+/// The ends of an opening of an event stream that a [`TestTransport`] holds, as those of
+/// [`Hold`].
+type HoldEvents = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+/// What a [`TestTransport`] writes into an event stream it opened: a block, between those of the
+/// stream, or its end (`None`).
+type Control = futures::channel::mpsc::UnboundedSender<Option<Bytes>>;
+
 /// The kind of the messages whose reply a [`TestTransport`] holds, with the ends of a [`Held`].
 type Hold = (
     ClientMessageKind,
@@ -594,9 +610,10 @@ pub struct Held {
 }
 
 impl Held {
-    /// Waits until the server replied to the message, or the call is held.
+    /// Waits until the server replied to the message, or the call is held: within 60 s, longer
+    /// than an interval of the heartbeats of a worker, so that its first heartbeat comes before.
     pub async fn replied(&mut self) {
-        let replied = tokio::time::timeout(Duration::from_secs(10), &mut self.replied).await;
+        let replied = tokio::time::timeout(Duration::from_secs(60), &mut self.replied).await;
         replied.expect("no reply came").unwrap();
     }
 
@@ -606,9 +623,10 @@ impl Held {
     }
 }
 
-/// How many messages a [`TestTransport`] sends at most: a client that sends more retries without
-/// waiting, and gets no reply to the rest, so that a test with the paused clock fails instead of
-/// spinning, since such a client keeps the clock from going on.
+/// How many messages a [`TestTransport`] sends at most, and how many event streams it opens: a
+/// client that sends more retries without waiting, and gets no reply to the rest, so that a test
+/// with the paused clock fails instead of spinning, since such a client keeps the clock from going
+/// on.
 const MAX_SENT: usize = 20_000;
 
 /// A transport to a [`TestServer`], which logs the messages it sends and can answer them itself.
@@ -630,6 +648,13 @@ pub struct TestTransport {
     sync_batch_size: Arc<Mutex<Option<u32>>>,
     /// How many requests are running in their task.
     tasks: Arc<AtomicUsize>,
+    /// The token of each opening of an event stream, refused or not, with when it came, in order.
+    opens: Arc<Mutex<Vec<(String, tokio::time::Instant)>>>,
+    events_answer: Arc<Mutex<Option<Box<EventsAnswer>>>>,
+    /// The ends of the next opening of an event stream to hold.
+    events_hold: Arc<Mutex<Option<HoldEvents>>>,
+    /// What writes into each event stream opened, in order.
+    streams: Arc<Mutex<Vec<Control>>>,
 }
 
 /// A request running in its task, counted by its transport until it ends.
@@ -819,6 +844,117 @@ impl TransportClient for TestTransport {
     }
 
     async fn events(&self, room_id: &RoomId, token: &str) -> Result<EventStream, TransportError> {
+        if self.opens.lock().unwrap().len() >= MAX_SENT {
+            std::future::pending::<()>().await;
+        }
+        (self.opens.lock().unwrap()).push((token.to_string(), tokio::time::Instant::now()));
+        let held = self.events_hold.lock().unwrap().take();
+        if let Some((replied, release)) = held {
+            let _ = replied.send(());
+            let _ = release.await;
+        }
+        let answered = (self.events_answer.lock().unwrap())
+            .as_mut()
+            .and_then(|answer| answer(room_id));
+        let opened = match answered {
+            Some(answer) => answer?,
+            None => self.server_events(room_id, token).await?,
+        };
+        let EventStream::Open(blocks) = opened else {
+            return Ok(opened);
+        };
+        // The stream ends with its own end or once ended, and what is written into it comes
+        // between its blocks.
+        let (control, controlled) = futures::channel::mpsc::unbounded();
+        self.streams.lock().unwrap().push(control);
+        let own = blocks
+            .map(Some)
+            .chain(futures::stream::once(async { None }));
+        let written = controlled.map(|block: Option<Bytes>| block.map(Ok));
+        let blocks = futures::stream::select(own, written)
+            .take_while(|block| std::future::ready(block.is_some()))
+            .filter_map(std::future::ready);
+        Ok(EventStream::Open(Box::pin(blocks)))
+    }
+}
+
+impl TestTransport {
+    /// The token of each opening of an event stream so far, refused or not, in order.
+    pub fn stream_opens(&self) -> Vec<String> {
+        let opens = self.opens.lock().unwrap();
+        opens.iter().map(|(token, _)| token.clone()).collect()
+    }
+
+    /// When each opening of an event stream so far came, in order.
+    pub fn stream_opens_at(&self) -> Vec<tokio::time::Instant> {
+        self.opens
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, at)| *at)
+            .collect()
+    }
+
+    /// How many event streams that it opened are still read by the client: it dropped the rest.
+    pub fn streams_open(&self) -> usize {
+        let streams = self.streams.lock().unwrap();
+        streams
+            .iter()
+            .filter(|control| !control.is_closed())
+            .count()
+    }
+
+    /// Writes `text` into each event stream open, between its blocks.
+    pub fn inject(&self, text: &str) {
+        let block = Bytes::copy_from_slice(text.as_bytes());
+        let streams = self.streams.lock().unwrap();
+        for control in streams.iter() {
+            let _ = control.unbounded_send(Some(block.clone()));
+        }
+    }
+
+    /// Ends each event stream open, as a server that ends it.
+    pub fn end_streams(&self) {
+        let streams = self.streams.lock().unwrap();
+        for control in streams.iter() {
+            let _ = control.unbounded_send(None);
+        }
+    }
+
+    /// Answers each opening of an event stream that `answer` gives an answer for with it, without
+    /// reaching the server, until another answer replaces it.
+    pub fn answer_events(
+        &self,
+        answer: impl FnMut(&RoomId) -> Option<Result<EventStream, TransportError>> + Send + 'static,
+    ) {
+        *self.events_answer.lock().unwrap() = Some(Box::new(answer));
+    }
+
+    /// Answers the next opening of an event stream with what `answer` gives, without reaching the
+    /// server.
+    pub fn answer_next_events(
+        &self,
+        answer: impl FnOnce(&RoomId) -> Result<EventStream, TransportError> + Send + 'static,
+    ) {
+        let mut answer = Some(answer);
+        self.answer_events(move |room_id| answer.take().map(|answer| answer(room_id)));
+    }
+
+    /// Holds the next opening of an event stream before it reaches the server or its answer:
+    /// [`Held::replied`] waits until it came, and it goes on once released.
+    pub fn hold_next_events(&self) -> Held {
+        let (replied_tx, replied) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        *self.events_hold.lock().unwrap() = Some((replied_tx, release_rx));
+        Held { replied, release }
+    }
+
+    /// The server's answer to opening the event stream of `room_id` with `token`.
+    async fn server_events(
+        &self,
+        room_id: &RoomId,
+        token: &str,
+    ) -> Result<EventStream, TransportError> {
         let request = Request::get(format!("/rooms/{room_id}/events"))
             .header(AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::empty())
@@ -836,6 +972,22 @@ impl TransportClient for TestTransport {
             blocks.map(|block| block.map_err(no_response)),
         )))
     }
+}
+
+/// The refusal of an event stream of `room_id` with `code`, as the server writes it.
+pub fn refused(room_id: &RoomId, code: ErrorCode) -> EventStream {
+    let refusal = ServerMessage::Error {
+        correlation_id: None,
+        room_id: Some(room_id.clone()),
+        code,
+        message: "Fabricated".to_string(),
+    };
+    EventStream::Refused(encode_message(&refusal).unwrap())
+}
+
+/// An open event stream that never sends anything.
+pub fn silent() -> EventStream {
+    EventStream::Open(Box::pin(futures::stream::pending()))
 }
 
 /// The data of the next event named `name` in `blocks`, skipping what comes before it, as the
