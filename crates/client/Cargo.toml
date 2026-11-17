@@ -34,7 +34,13 @@ uuid = { workspace = true }
 [dev-dependencies]
 zemdb-server = { path = "../server" }
 axum = { workspace = true }
+blake3 = { workspace = true }
 smallvec = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.4", features = ["util"] }
+
+# The reference app, which reaches its server with the transport over HTTP (`native`).
+[[example]]
+name = "ranking"
+required-features = ["native"]
