@@ -16,6 +16,16 @@
 //! the model. It runs over random schemas and over the one of the reference app, with its
 //! scenarios.
 //!
+//! With workers, some clients run the worker of their room, in a mode drawn at random that steps
+//! change, while the steps call them too and they are crashed or have their room closed and
+//! opened again, which stops the worker until the client starts it again. Their event streams
+//! lose, delay and cut events, tell of events missed, go silent and end as their token expires;
+//! the network takes tokens as expired, the token provider gives one already expired now and
+//! then, and the server turns its event stream off in some restarts. After each step, also no
+//! worker stopped; and once the network heals, the clients whose worker syncs by itself reach the
+//! head of the room within a fixed number of intervals without a call of the test, and those in
+//! `Manual`, with a sync.
+//!
 //! Fuzzing, the network also puts other replies in place of some of the server's: random bytes,
 //! the reply damaged, random messages, errors of the request, and snapshots that match their hash
 //! but install with no schema of the room, or announced larger than the limit of the clients. None
@@ -28,7 +38,8 @@
 //! The ignored variants run longer: `cargo test --release -- --ignored`. A run prints
 //! its seed first, and `SIM_SEED` runs from another one (`SIM_SEEDS`, how many): a seed repeats
 //! the steps and the events, but not the faults, drawn in the order the requests are sent, which
-//! the jitter of the backoffs and the blocking pool change.
+//! the jitter of the backoffs and the blocking pool change; nor, with workers, the writes before
+//! the network heals, which go on until enough of them land.
 
 mod common;
 #[path = "../../core/tests/common/mod.rs"]
@@ -46,7 +57,8 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{Method, Request};
 use bytes::Bytes;
 use common::{
-    error_reply, options, request, TestServer, TestTokens, TestTransport, ADMIN_SECRET, AUTH_SECRET,
+    error_reply, options, refused, request, Issue, TestServer, TestTokens, TestTransport,
+    ADMIN_SECRET, AUTH_SECRET,
 };
 use futures::future::join_all;
 use futures::StreamExt;
@@ -58,21 +70,23 @@ use std::fmt;
 use std::future::{poll_fn, Future};
 use std::io;
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::task::Poll;
 use std::time::Duration;
 use tempfile::{tempdir, TempDir};
 use tower::ServiceExt;
 use zemdb_client::{
-    Client, ClientConfig, ClientError, FileMetadata, MemoryMetadata, MetadataStore, RoomMetadata,
-    TransportClient, TransportError, Violation,
+    Client, ClientConfig, ClientError, EventBlocks, EventStream, FileMetadata, Freshness,
+    MemoryMetadata, MetadataStore, RoomMetadata, TransportClient, TransportError, Violation,
 };
 use zemdb_core::protocol::PROTOCOL_MAGIC;
 use zemdb_core::*;
 use zemdb_server::{build_router, generate_client_token, ServerConfig};
 use zemdb_storage::snapshot::{decode_snapshot_envelope, encode_snapshot_envelope};
-use zemdb_storage::{DiskStorageEngine, MemoryStorageEngine, ScanOptions, StorageEngine};
+use zemdb_storage::{
+    DiskStorageEngine, MemoryStorageEngine, ScanOptions, StorageEngine, StorageError,
+};
 
 /// The index of the archivist among the clients.
 const ARCHIVIST: usize = 0;
@@ -83,6 +97,20 @@ const COPIES: usize = 16;
 /// The largest snapshot the clients download: longer than a chunk of 4 MiB, so that a client that
 /// downloads a longer one asks for its second chunk.
 const LIMIT: u64 = 6 << 20;
+
+/// How often the workers send a heartbeat, and the longest wait before they try a step again.
+const INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long a worker in `Live` waits to open its event stream again once the server answered that
+/// it is turned off.
+const EVENTS_RETRY: Duration = Duration::from_secs(60);
+
+/// How many intervals a client whose worker syncs by itself takes at most to reach the head of
+/// the room once the network heals: its next heartbeat, which may register it again with a
+/// renewed token after a backoff, the designation of a client to upload a snapshot if it is
+/// behind the log, which the server gives another after 60 s if that one does not start, the
+/// upload, the heartbeat that announces the snapshot, and the sync after the download.
+const HEAL_INTERVALS: u32 = 12;
 
 /// The panics of the process, also those that a task catches.
 static PANICS: AtomicUsize = AtomicUsize::new(0);
@@ -135,6 +163,20 @@ struct Network {
     server: Mutex<TestTransport>,
     rng: Mutex<Rng>,
     faulty: AtomicBool,
+    /// Whether the server restarts: no request and no opening of an event stream reaches it.
+    down: AtomicBool,
+    /// The openings of event streams that may reach the server, which a restart waits for.
+    openings: Arc<AtomicUsize>,
+    /// The tokens that expired: the server refuses each request and opening with one with
+    /// `Unauthorized`.
+    expired: Mutex<HashSet<String>>,
+    /// How many `ops` events reached the clients.
+    ops: AtomicUsize,
+    /// The clients without network: none of their requests reaches the server, and their event
+    /// streams are cut.
+    offline: Mutex<HashSet<usize>>,
+    /// How many times it injected each fault of the event streams and of the tokens.
+    faults: Mutex<BTreeMap<&'static str, usize>>,
     fuzz: Mutex<Option<Fuzz>>,
     record: Mutex<Record>,
     /// The schemas of the room so far, and the hashes of the snapshots announced larger than
@@ -214,6 +256,39 @@ impl Network {
     fn uploads(&self, client: usize) -> u64 {
         let record = self.record.lock().unwrap();
         record.uploads.get(&client).copied().unwrap_or_default()
+    }
+
+    /// Whether `token` expired.
+    fn expired(&self, token: &str) -> bool {
+        self.expired.lock().unwrap().contains(token)
+    }
+
+    /// Takes `token` as expired from now on.
+    fn expire(&self, token: &str) {
+        self.expired.lock().unwrap().insert(token.to_string());
+    }
+
+    /// Whether client `client` has no network.
+    fn offline(&self, client: usize) -> bool {
+        self.offline.lock().unwrap().contains(&client)
+    }
+
+    /// Counts an injection of `fault`.
+    fn injected(&self, fault: &'static str) {
+        *self.faults.lock().unwrap().entry(fault).or_default() += 1;
+    }
+
+    /// Counts `reply`, of the server, if it refuses the token of its request: one that the token
+    /// provider gave already expired, since those the network takes as expired do not reach it.
+    fn refused(&self, reply: &[u8]) {
+        let refusal = decode_message::<ServerMessage>(reply);
+        if let Ok(ServerMessage::Error {
+            code: ErrorCode::Unauthorized,
+            ..
+        }) = refusal
+        {
+            self.injected("token refused by the server");
+        }
     }
 
     /// `reply`, the reply to `message`, or now and then, while the network fuzzes, another in its
@@ -422,9 +497,110 @@ impl Fuzz {
     }
 }
 
+/// No response to a request.
+fn lost() -> TransportError {
+    TransportError("Lost".to_string())
+}
+
+/// The reply of the server to a request of `room_id` with a token that expired.
+fn unauthorized(room_id: &RoomId) -> Vec<u8> {
+    encode_message(&ServerMessage::Error {
+        correlation_id: None,
+        room_id: Some(room_id.clone()),
+        code: ErrorCode::Unauthorized,
+        message: "Expired".to_string(),
+    })
+    .unwrap()
+}
+
+/// An opening of an event stream on its way to the server, counted until it ends.
+struct Opening(Arc<AtomicUsize>);
+
+impl Opening {
+    fn new(openings: &Arc<AtomicUsize>) -> Self {
+        openings.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(openings))
+    }
+}
+
+impl Drop for Opening {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The `lagged` event, as the server writes it for events that a stream missed.
+const LAGGED: &[u8] = b"event: lagged\ndata: true\n\n";
+
+/// `blocks`, the event stream that `token` of client `client` opened, with the faults that `net`
+/// injects at each block while it is faulty: a block lost, or late, with those after it; `lagged`
+/// in its place; the connection cut; a stream that goes silent; or its token that expires, which
+/// ends it. The stream of a client without network is cut. It counts the `ops` events that reach
+/// the client.
+fn faulty_blocks(
+    blocks: EventBlocks,
+    net: Arc<Network>,
+    (client, token): (usize, String),
+) -> EventBlocks {
+    let blocks = futures::stream::unfold(Some(blocks), move |blocks| {
+        let (net, token) = (Arc::clone(&net), token.clone());
+        async move {
+            let mut blocks = blocks?;
+            loop {
+                let block = blocks.next().await?;
+                if net.offline(client) {
+                    return Some((Err(TransportError("Offline".to_string())), None));
+                }
+                let fault = {
+                    let mut rng = net.rng.lock().unwrap();
+                    let faulty = net.faulty.load(Ordering::SeqCst);
+                    (faulty.then(|| rng.below(100)), rng.below(3000))
+                };
+                match fault {
+                    (Some(0 | 1), _) => {
+                        net.injected("event lost");
+                        continue;
+                    }
+                    (Some(2 | 3), delay) => {
+                        net.injected("event late");
+                        tokio::time::sleep(Duration::from_millis(delay)).await;
+                    }
+                    (Some(4), _) => {
+                        net.injected("lagged");
+                        return Some((Ok(Bytes::from_static(LAGGED)), Some(blocks)));
+                    }
+                    (Some(5), _) => {
+                        net.injected("stream cut");
+                        return Some((Err(TransportError("Cut".to_string())), None));
+                    }
+                    (Some(6), _) => {
+                        net.injected("stream silent");
+                        std::future::pending().await
+                    }
+                    (Some(7), _) => {
+                        net.injected("stream expired");
+                        net.expire(&token);
+                        return None;
+                    }
+                    _ => {}
+                }
+                if block
+                    .as_ref()
+                    .is_ok_and(|block| block.starts_with(b"event: ops\n"))
+                {
+                    net.ops.fetch_add(1, Ordering::SeqCst);
+                }
+                return Some((block, Some(blocks)));
+            }
+        }
+    });
+    Box::pin(blocks)
+}
+
 /// The transport of client `client` over the network, which loses, delays and repeats its
-/// requests, answers some with `Unavailable`, and fuzzes their replies, if it is `faulty`. It
-/// checks that no download goes past the first chunk of a snapshot larger than the limit.
+/// requests, answers some with `Unavailable`, expires their tokens, and fuzzes their replies, if
+/// it is `faulty`; and which loses, delays and cuts the events of its streams. It checks that no
+/// download goes past the first chunk of a snapshot larger than the limit.
 #[derive(Clone)]
 struct Link {
     net: Arc<Network>,
@@ -469,16 +645,28 @@ impl TransportClient for Link {
             commits.sent += 1;
             commits.ids.insert((*mutation_id, client_id.clone()));
         }
-        let server = net.server.lock().unwrap().clone();
         let deliver = || async {
+            // A server that restarts takes nothing, and a client without network sends nothing.
+            if net.down.load(Ordering::SeqCst) || net.offline(self.client) {
+                return Err(lost());
+            }
+            let server = net.server.lock().unwrap().clone();
             let reply = server.send(message, token).await;
             if let Ok(reply) = &reply {
                 net.took(self.client, reply);
+                net.refused(reply);
             }
             reply
         };
-        let lost = || TransportError("Lost".to_string());
+        // Nothing answers a client without network, or a request while the server restarts.
+        if net.down.load(Ordering::SeqCst) || net.offline(self.client) {
+            return Err(lost());
+        }
+        let (_, room_id) = request(message);
+        let expired = self.faulty && net.expired(token);
         let reply = match fault {
+            // The server refuses a token that expired before anything else.
+            _ if expired => unauthorized(&room_id),
             // Lost on its way, or its reply lost.
             Some(0) => return Err(lost()),
             Some(1) => {
@@ -507,6 +695,12 @@ impl TransportClient for Link {
                 let (correlation_id, room_id) = request(message);
                 error_reply(correlation_id, &room_id, ErrorCode::Unavailable)
             }
+            // Its token expires now.
+            Some(6) => {
+                net.injected("token expired");
+                net.expire(token);
+                unauthorized(&room_id)
+            }
             _ => deliver().await?,
         };
         let reply = match self.faulty {
@@ -516,6 +710,52 @@ impl TransportClient for Link {
         net.observe(self.client, message, &reply);
         Ok(reply)
     }
+
+    /// The event stream of `room_id`, which, if the transport is `faulty`, gets no response now
+    /// and then, is refused for a token that expires or for a server without room for it, and
+    /// loses, delays and cuts its events ([`faulty_blocks`]).
+    async fn events(&self, room_id: &RoomId, token: &str) -> Result<EventStream, TransportError> {
+        let net = &self.net;
+        if net.down.load(Ordering::SeqCst) || net.offline(self.client) {
+            return Err(lost());
+        }
+        let faulty = self.faulty && net.faulty.load(Ordering::SeqCst);
+        let fault = faulty.then(|| net.rng.lock().unwrap().below(20));
+        match fault {
+            _ if self.faulty && net.expired(token) => {
+                return Ok(refused(room_id, ErrorCode::Unauthorized));
+            }
+            Some(0) => {
+                net.injected("opening lost");
+                return Err(lost());
+            }
+            Some(1) => {
+                net.injected("opening expired");
+                net.expire(token);
+                return Ok(refused(room_id, ErrorCode::Unauthorized));
+            }
+            Some(2) => {
+                net.injected("opening refused");
+                return Ok(refused(room_id, ErrorCode::RateLimited));
+            }
+            _ => {}
+        }
+        let server = net.server.lock().unwrap().clone();
+        let opened = {
+            let _opening = Opening::new(&net.openings);
+            server.events(room_id, token).await?
+        };
+        if let EventStream::Refused(refusal) = &opened {
+            net.refused(refusal);
+        }
+        Ok(match opened {
+            EventStream::Open(blocks) if self.faulty => {
+                let of = (self.client, token.to_string());
+                EventStream::Open(faulty_blocks(blocks, Arc::clone(net), of))
+            }
+            opened => opened,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -524,6 +764,13 @@ impl TransportClient for Link {
 /// A metadata store that the checks read too.
 #[derive(Debug, Clone)]
 struct Shared(Arc<dyn MetadataStore>);
+
+impl Shared {
+    /// The metadata of `room_id`, as the checks read them.
+    async fn of(&self, room_id: &RoomId) -> Option<RoomMetadata> {
+        self.0.room(room_id).await.unwrap()
+    }
+}
 
 #[async_trait]
 impl MetadataStore for Shared {
@@ -552,34 +799,55 @@ impl MetadataStore for Shared {
 struct Member {
     person: &'static str,
     dir: Option<TempDir>,
-    client: Client,
+    client: Arc<Client>,
     /// Its engine, which the checks read too.
     storage: Arc<dyn StorageEngine>,
     metadata: Shared,
+    /// Its token provider, and how many tokens the client had asked for when the provider was
+    /// told to give one already expired, until the client asks for it.
+    tokens: TestTokens,
+    expiring: Option<usize>,
+    /// The mode of the worker of its room, if it runs one.
+    worker: Option<Freshness>,
     /// The incarnation of its metadata when it opened, the last one if it had none, and the
-    /// opens of the room without its metadata: its epoch counts no discard but one per open
+    /// opens of the room that may discard it: its epoch counts no discard but one per such open
     /// and one per incarnation after that one.
     since: usize,
     discards: u64,
+    /// The discards that the opens of the step may add once a registration got `RoomReset`.
+    resetting: u64,
 }
 
 impl Member {
-    /// Counts an open of `room_id`, which discards the replica if it has no metadata.
-    async fn opening(&mut self, room_id: &RoomId) {
-        let metadata = self.metadata.room(room_id).await.unwrap();
-        self.discards += u64::from(metadata.is_none());
+    /// Counts an open of `room_id`, which discards the replica if it has no metadata. One with the
+    /// metadata of an incarnation before `last` may find none too, in this step alone: a
+    /// registration with `RoomReset` in the same step, of its worker or of another call, discards
+    /// the replica first, and the open discards the empty replica once more.
+    async fn opening(&mut self, room_id: &RoomId, last: Option<u128>) {
+        let metadata = self.metadata.of(room_id).await;
+        match metadata {
+            None => self.discards += 1,
+            Some(metadata) if last.is_some_and(|last| metadata.room_incarnation != last) => {
+                self.resetting += 1
+            }
+            Some(_) => {}
+        }
     }
 }
 
-/// A client of `person` over `storage`, `metadata` and `link`, with `storage` for the checks.
+/// A client of `person` over `storage`, `metadata`, `link` and `tokens`, with `storage` for the
+/// checks.
 async fn client<S: StorageEngine + Clone + 'static>(
     person: &str,
     storage: S,
     metadata: &Shared,
-    link: &Link,
-) -> Result<(Client, Arc<dyn StorageEngine>), ClientError> {
+    (link, tokens): (&Link, &TestTokens),
+) -> Result<(Arc<Client>, Arc<dyn StorageEngine>), ClientError> {
     let config = ClientConfig {
         max_snapshot_bytes: LIMIT,
+        heartbeat_interval: INTERVAL,
+        retry_max: INTERVAL,
+        events_retry: EVENTS_RETRY,
         ..ClientConfig::new(person)
     };
     let client = Client::open(
@@ -587,35 +855,39 @@ async fn client<S: StorageEngine + Clone + 'static>(
         storage.clone(),
         metadata.clone(),
         link.clone(),
-        TestTokens::new(),
+        tokens.clone(),
     )
     .await?;
-    Ok((client, Arc::new(storage)))
+    Ok((Arc::new(client), Arc::new(storage)))
 }
 
-/// Opens `room_id` in `client`, with a token for a day.
+/// Opens `room_id` in `client`, with a token for a day and a second more per open before, so that
+/// each open gives the room a token of its own, which replaces one the network took as expired.
 async fn open_room(client: &Client, room_id: &RoomId) -> Result<(), ClientError> {
-    let token = generate_client_token(
-        &client.client_id(),
-        room_id,
-        Duration::from_secs(86_400),
-        AUTH_SECRET,
-    );
+    static OPENS: AtomicU64 = AtomicU64::new(0);
+    let valid = Duration::from_secs(86_400 + OPENS.fetch_add(1, Ordering::SeqCst));
+    let token = generate_client_token(&client.client_id(), room_id, valid, AUTH_SECRET);
     client.open_room(room_id.clone(), token).await
 }
 
-/// Every row of every table of `schema` in `room_id` of `storage`.
-async fn rows(storage: &dyn StorageEngine, room_id: &RoomId, schema: &Schema) -> Rows {
+/// Every row of every table of `schema` in `room_id` of `storage`, or the error of reading them:
+/// a worker may be discarding the replica.
+async fn rows(
+    storage: &dyn StorageEngine,
+    room_id: &RoomId,
+    schema: &Schema,
+) -> Result<Rows, StorageError> {
     let mut rows = Rows::new();
     for table in schema.table_ids() {
-        let scan = storage.scan_by_id(room_id, table, ScanOptions::new());
-        let mut scan = scan.await.unwrap();
+        let mut scan = storage
+            .scan_by_id(room_id, table, ScanOptions::new())
+            .await?;
         while let Some(row) = scan.next().await {
-            let (pk, row) = row.unwrap();
+            let (pk, row) = row?;
             rows.entry(table).or_default().insert(pk, row);
         }
     }
-    rows
+    Ok(rows)
 }
 
 /// The rows of `rows` without the nulls at the end of each: an update widens a row to the width
@@ -871,6 +1143,8 @@ enum Action {
     Heartbeat,
     /// Closes the room and opens it again.
     Reopen,
+    /// Sets the mode of the worker of the room.
+    Freshness(Freshness),
 }
 
 /// An action of client `member`, dropped after `polls` polls of it, and the client crashed
@@ -916,8 +1190,13 @@ async fn cut<T>(action: impl Future<Output = T>, polls: Option<u64>, may_wait: b
 
 struct Sim {
     kind: Kind,
-    /// Whether the network fuzzes the replies.
+    /// Whether the network fuzzes the replies, and whether some clients run a worker.
     fuzz: bool,
+    workers: bool,
+    /// Whether the server has its event stream turned off since its last restart.
+    events_off: bool,
+    /// The clients whose worker syncs by itself that are behind the log, without network.
+    behind_log: BTreeSet<usize>,
     rng: Rng,
     server: TestServer,
     net: Arc<Network>,
@@ -935,11 +1214,13 @@ struct Sim {
 
 impl Sim {
     /// A server with a room of the schema of `kind`, the archivist and four clients: a disk and a
-    /// memory one of each of two persons. The network fuzzes the replies if `fuzz`.
-    async fn new(seed: u64, kind: Kind, fuzz: bool) -> Self {
+    /// memory one of each of two persons, those of the second with a worker if `workers`, the
+    /// one over the disk in `Live` and the other in a random mode. The network fuzzes the replies
+    /// if `fuzz`.
+    async fn new(seed: u64, kind: Kind, fuzz: bool, workers: bool) -> Self {
         eprintln!(
-            "Simulation of seed {seed} over {kind:?}, fuzzing: {fuzz}: SIM_SEED={seed} repeats \
-             its steps"
+            "Simulation of seed {seed} over {kind:?}, fuzzing: {fuzz}, with workers: {workers}: \
+             SIM_SEED={seed} repeats its steps"
         );
         count_panics();
         let server = TestServer::with(|config| config.ram_max_ops = 5);
@@ -951,6 +1232,12 @@ impl Sim {
             server: Mutex::new(server.transport()),
             rng: Mutex::new(Rng::new(!seed)),
             faulty: AtomicBool::new(true),
+            down: AtomicBool::new(false),
+            openings: Arc::default(),
+            expired: Mutex::default(),
+            ops: AtomicUsize::new(0),
+            offline: Mutex::default(),
+            faults: Mutex::default(),
             fuzz: Mutex::new(fuzz.then(|| Fuzz::new(seed))),
             record: Mutex::default(),
             schemas: Mutex::new(vec![schema.clone()]),
@@ -959,6 +1246,9 @@ impl Sim {
         let mut sim = Self {
             kind,
             fuzz,
+            workers,
+            events_off: false,
+            behind_log: BTreeSet::new(),
             rng: Rng::new(seed),
             server,
             net,
@@ -974,16 +1264,25 @@ impl Sim {
         let request = json!({"schema_id": sim.schema_id, "schema": sim.schema});
         sim.admin(Method::POST, "/schemas", Some(request)).await;
         sim.create_room().await;
-        for (person, disk) in [
-            ("Z", false),
-            ("A", true),
-            ("B", true),
-            ("B", false),
-            ("A", false),
+        for (person, disk, worker) in [
+            ("Z", false, None),
+            ("A", true, None),
+            ("B", true, Some(Freshness::Live)),
+            ("B", false, Some(sim.freshness())),
+            ("A", false, None),
         ] {
-            sim.join(person, disk).await;
+            sim.join(person, disk, worker.filter(|_| workers)).await;
         }
         sim
+    }
+
+    /// A random mode for a worker, `Live` half of the time.
+    fn freshness(&mut self) -> Freshness {
+        match self.rng.below(4) {
+            0 | 1 => Freshness::Live,
+            2 => Freshness::Periodic,
+            _ => Freshness::Manual,
+        }
     }
 
     /// Sends `body` to `path` of the Control Plane, and returns the JSON of its answer.
@@ -1022,8 +1321,14 @@ impl Sim {
     }
 
     /// Opens client `index` of `person` over a memory engine, or over the disk engine of `dir`,
-    /// and the room in it.
-    async fn open(&self, index: usize, person: &'static str, dir: Option<TempDir>) -> Member {
+    /// and the room in it, with its worker in `worker`, if any.
+    async fn open(
+        &self,
+        index: usize,
+        person: &'static str,
+        dir: Option<TempDir>,
+        worker: Option<Freshness>,
+    ) -> Member {
         let link = Link {
             net: Arc::clone(&self.net),
             client: index,
@@ -1033,15 +1338,20 @@ impl Sim {
             Some(dir) => Arc::new(FileMetadata::new(dir.path())),
             None => Arc::new(MemoryMetadata::default()),
         });
-        // A client that crashed holds its metadata until the tasks it left end.
+        let tokens = TestTokens::new();
+        // A client that crashed holds its metadata until the tasks it left end, those of its
+        // worker too.
         let mut opened = None;
-        for _ in 0..200 {
+        for _ in 0..6000 {
             let attempt = match &dir {
                 Some(dir) => {
                     let storage = DiskStorageEngine::new(options(dir.path())).unwrap();
-                    client(person, storage, &metadata, &link).await
+                    client(person, storage, &metadata, (&link, &tokens)).await
                 }
-                None => client(person, MemoryStorageEngine::new(), &metadata, &link).await,
+                None => {
+                    let storage = MemoryStorageEngine::new();
+                    client(person, storage, &metadata, (&link, &tokens)).await
+                }
             };
             match attempt {
                 Ok(client) => {
@@ -1052,17 +1362,24 @@ impl Sim {
             }
         }
         let (client, storage) = opened.expect("The metadata of a crashed client stay held");
-        let incarnation = metadata.room(&self.room).await.unwrap();
+        let incarnation = metadata.of(&self.room).await;
         let incarnation = incarnation.map(|metadata| self.incarnation(metadata.room_incarnation));
         let _ = open_room(&client, &self.room).await;
+        if let Some(worker) = worker {
+            let _ = client.set_freshness(self.room.clone(), worker).await;
+        }
         Member {
             person,
             dir,
             client,
             storage,
             metadata,
+            tokens,
+            expiring: None,
+            worker,
             since: incarnation.unwrap_or(self.incarnations.len() - 1),
             discards: u64::from(incarnation.is_none()),
+            resetting: 0,
         }
     }
 
@@ -1075,44 +1392,62 @@ impl Sim {
         index.expect("An incarnation of the room")
     }
 
-    /// Adds a client of `person`, over a disk engine if `disk`, with the room open.
-    async fn join(&mut self, person: &'static str, disk: bool) {
+    /// Adds a client of `person`, over a disk engine if `disk`, with the room open, and its
+    /// worker in `worker`, if any.
+    async fn join(&mut self, person: &'static str, disk: bool, worker: Option<Freshness>) {
         let dir = disk.then(|| tempdir().unwrap());
-        let member = self.open(self.members.len(), person, dir).await;
+        let member = self.open(self.members.len(), person, dir, worker).await;
         self.members.push(member);
     }
 
-    /// Crashes client `index`, over a disk engine, and opens it again from its directory: the
-    /// tasks it left run on.
+    /// Crashes client `index`, over a disk engine, and opens it again from its directory, with its
+    /// worker in the mode it had: the tasks it left run on.
     async fn crash(&mut self, index: usize) {
         let mut crashed = self.members.remove(index);
-        let (person, dir) = (crashed.person, crashed.dir.take());
+        let (person, dir, worker) = (crashed.person, crashed.dir.take(), crashed.worker);
         drop(crashed);
-        let member = self.open(index, person, dir).await;
+        let member = self.open(index, person, dir, worker).await;
         self.members.insert(index, member);
     }
 
-    /// Waits until the server is done with every request, and the replicas with the changes
-    /// that dropped calls left: the paused clock moves only once every task waits.
+    /// Waits until the server is done with every request and every opening of an event stream,
+    /// and the replicas with the changes that dropped calls left: the paused clock moves only
+    /// once every task waits. Fails if they do not end within ten minutes.
     async fn settle(&self) {
         let server = self.net.server.lock().unwrap().clone();
-        server.settled().await;
+        let settled = async {
+            loop {
+                server.settled().await;
+                if self.net.openings.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        let settled = tokio::time::timeout(Duration::from_secs(600), settled).await;
+        settled.expect("A request or an opening of an event stream does not end");
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
     /// Restarts the server over its directory, pruning the log of its rooms by quota at each
-    /// maintenance if `pruning`, once it is done with every request.
+    /// maintenance if `pruning`, and with its event stream turned off if `events_off`. The server
+    /// takes no request meanwhile, and restarts once it is done with those it took: the workers
+    /// send theirs at any time. Shutting its rooms down ends their event streams.
     async fn restart(&mut self, pruning: bool) {
+        self.net.down.store(true, Ordering::SeqCst);
         self.settle().await;
         let quota = match pruning {
             true => 0,
             false => ServerConfig::default().max_room_disk_bytes,
         };
-        let restarted = self
-            .server
-            .restart(|config| config.max_room_disk_bytes = quota);
+        let streams = self.events_off.then_some(0);
+        let restarted = self.server.restart(|config| {
+            config.max_room_disk_bytes = quota;
+            config.max_sse_streams = streams;
+        });
         restarted.await;
         *self.net.server.lock().unwrap() = self.server.transport();
+        self.net.down.store(false, Ordering::SeqCst);
     }
 
     /// Prunes every sealed segment of the log, wherever the cursors of the clients are: a
@@ -1158,7 +1493,7 @@ impl Sim {
 
     /// Moves the room to a new schema that extends its own with a column and keeps its
     /// constraints: shuts the room down and spawns it with that schema, until the Control Plane
-    /// reports it.
+    /// reports it: a request of a worker in between may spawn it again with its schema.
     async fn reassign(&mut self) {
         self.columns += 1;
         self.schemas += 1;
@@ -1171,7 +1506,11 @@ impl Sim {
         self.admin(Method::POST, "/schemas", Some(request)).await;
         let manager = &self.server.state.room_manager;
         let path = format!("/rooms/{}", self.room);
-        while self.admin(Method::GET, &path, None).await["schema_id"] != json!(schema_id) {
+        for attempt in 0.. {
+            if self.admin(Method::GET, &path, None).await["schema_id"] == json!(schema_id) {
+                break;
+            }
+            assert!(attempt < 100, "The room does not move to its new schema");
             manager.shutdown_room(&self.room).await;
             manager
                 .get_or_spawn(&self.room, Some(&schema_id))
@@ -1190,7 +1529,8 @@ impl Sim {
     }
 
     /// Before step `step`, an event of the server: every few steps, the next one, and a few more
-    /// at random. A pruned room gets a client that joins it.
+    /// at random. With workers, a restart turns the event stream off now and then, and the next
+    /// one on again. A pruned room gets a client that joins it, every other with a worker.
     async fn event(&mut self, step: usize) {
         const EVENTS: usize = 8;
         let event = match step % EVENTS {
@@ -1199,7 +1539,10 @@ impl Sim {
             _ => return,
         };
         match event % EVENTS {
-            0 | 4 => self.restart(false).await,
+            0 | 4 => {
+                self.events_off = self.workers && !self.events_off && self.rng.chance(30);
+                self.restart(false).await
+            }
             1 | 5 => {
                 if self.prune().await && self.members.len() < 8 {
                     let n = self.members.len();
@@ -1207,7 +1550,8 @@ impl Sim {
                         Kind::Random => ["A", "B"][n % 2],
                         Kind::Ranking => "C",
                     };
-                    self.join(person, n % 2 == 0).await;
+                    let worker = (self.workers && n % 2 == 1).then(|| self.freshness());
+                    self.join(person, n % 2 == 0, worker).await;
                 }
             }
             2 | 6 => self.add_column().await,
@@ -1242,13 +1586,26 @@ impl Sim {
 
     /// What the clients do in a random step, none, one or two calls each: some of the calls
     /// dropped at a random await, and the client crashed afterwards if it is over a disk engine.
+    /// A client with a worker changes its mode now and then. The token provider of a client gives
+    /// one already expired now and then, once it gave the one before.
     fn plans(&mut self) -> Vec<Plan> {
+        for member in &mut self.members[ARCHIVIST + 1..] {
+            // Drawn first: the renewals depend on the faults, which a seed does not repeat.
+            let expired = self.rng.chance(5);
+            let calls = member.tokens.calls();
+            if expired && member.expiring.is_none_or(|asked| calls > asked) {
+                member.tokens.then(Issue::Valid(Duration::ZERO));
+                member.expiring = Some(calls);
+            }
+        }
         let mut plans = Vec::new();
         for member in (1..self.members.len()).flat_map(|member| [member, member]) {
             if !self.rng.chance(50) {
                 continue;
             }
+            let worker = self.members[member].worker.is_some();
             let action = match self.rng.below(10) {
+                _ if worker && self.rng.chance(10) => Action::Freshness(self.freshness()),
                 0..=4 => Action::Write(self.operation(member)),
                 5 | 6 => Action::Sync,
                 7 | 8 => Action::Heartbeat,
@@ -1268,12 +1625,15 @@ impl Sim {
         plans
     }
 
-    /// Runs `plans` at once and crashes the clients they say. Then the archivist catches up,
-    /// and every write that ended and every replica are checked.
+    /// Runs `plans` at once and crashes the clients they say; with workers, they then run by
+    /// themselves for a random time within an interval. Then the archivist catches up, every write
+    /// that ended and every replica are checked, and each client with a worker starts it again if
+    /// it stopped.
     async fn step(&mut self, plans: &[Plan]) {
+        let last = self.incarnations.last().map(|incarnation| incarnation.id);
         for plan in plans {
             if let Action::Reopen = plan.action {
-                self.members[plan.member].opening(&self.room).await;
+                self.members[plan.member].opening(&self.room, last).await;
             }
         }
         let room_id = &self.room;
@@ -1286,6 +1646,7 @@ impl Sim {
             ));
         }
         let may_wait = self.net.fuzz.lock().unwrap().is_some();
+        let net = &self.net;
         let outcomes = join_all(plans.iter().map(|plan| {
             let client = &self.members[plan.member].client;
             let action = async move {
@@ -1297,36 +1658,89 @@ impl Sim {
                         let _ = client.close_room(room_id.clone()).await;
                         open_room(client, room_id).await
                     }
+                    Action::Freshness(freshness) => {
+                        client.set_freshness(room_id.clone(), *freshness).await
+                    }
                 }
             };
-            cut(action, plan.polls, may_wait)
+            // The epoch and the downloads of the client once a write ended: what its replica may
+            // have skipped meanwhile.
+            async move {
+                let outcome = cut(action, plan.polls, may_wait).await;
+                let status = client.status(room_id.clone()).await;
+                let ended = (
+                    status.ok().map(|status| status.epoch),
+                    net.downloads(plan.member),
+                );
+                (outcome, ended)
+            }
         }))
         .await;
         let crashed: BTreeSet<usize> = plans.iter().filter(|p| p.crash).map(|p| p.member).collect();
         for &member in &crashed {
             self.crash(member).await;
         }
+        if self.workers {
+            let idle = self.rng.below(INTERVAL.as_millis() as u64);
+            tokio::time::sleep(Duration::from_millis(idle)).await;
+        }
         self.settle().await;
         self.archive().await;
-        for (plan, outcome) in plans.iter().zip(outcomes) {
+        for (plan, (outcome, (epoch_then, downloads_then))) in plans.iter().zip(outcomes) {
             let (Action::Write(op), Some(result)) = (&plan.action, outcome) else {
                 continue;
             };
             let (epoch, downloads) = before[plan.member];
-            let status = self.members[plan.member]
-                .client
-                .status(self.room.clone())
-                .await;
-            let epoch_changed = status.ok().map(|status| status.epoch) != epoch;
-            let downloaded = self.net.downloads(plan.member) > downloads;
+            let epoch_changed = epoch_then != epoch;
+            let downloaded = downloads_then > downloads;
             let reopened = plans
                 .iter()
                 .any(|other| other.member == plan.member && matches!(other.action, Action::Reopen));
             let skipped = crashed.contains(&plan.member) || epoch_changed || downloaded || reopened;
             self.check_write(plan.member, op, result, skipped);
         }
-        for member in &self.members {
-            self.check(member).await;
+        for (index, member) in self.members.iter().enumerate() {
+            let of = |plan: &&Plan| plan.member == index;
+            let reopened = plans
+                .iter()
+                .filter(of)
+                .any(|p| matches!(p.action, Action::Reopen));
+            let changed =
+                (plans.iter().filter(of)).any(|p| matches!(p.action, Action::Freshness(_)));
+            let closed = reopened && changed && !crashed.contains(&index);
+            self.check(member, closed).await;
+        }
+        // The discards of the step that the opens did add stay; the others go.
+        for member in &mut self.members {
+            if let Ok(status) = member.client.status(self.room.clone()).await {
+                let after = (self.incarnations.len() - 1 - member.since) as u64;
+                let added = status.epoch.saturating_sub(member.discards + after);
+                member.discards += added.min(member.resetting);
+                member.resetting = 0;
+            }
+        }
+        self.run_workers().await;
+    }
+
+    /// Has each client with a worker run it, in the mode it has, as an application does: also
+    /// once a crash, or a close of its room, stopped it, and before its room opens again, so
+    /// that its first heartbeat registers the replica that a registration that failed left empty.
+    async fn run_workers(&mut self) {
+        for member in &mut self.members {
+            let Some(mut freshness) = member.worker else {
+                continue;
+            };
+            // That of a step that changed it, also if the step was cut.
+            if let Ok(status) = member.client.status(self.room.clone()).await {
+                if let Some(worker) = status.worker {
+                    freshness = worker.freshness;
+                }
+            }
+            member.worker = Some(freshness);
+            let _ = member
+                .client
+                .set_freshness(self.room.clone(), freshness)
+                .await;
         }
     }
 
@@ -1396,39 +1810,227 @@ impl Sim {
 
     /// Checks the replica of `member`, if its room is open: it holds what the model holds at its
     /// head; it was discarded only once per open without metadata and once per incarnation after
-    /// that of its metadata when the client opened, unless fuzzing; it does not fail closed; and
-    /// its room keeps nothing for a write, with none in flight.
-    async fn check(&self, member: &Member) {
-        let Ok(status) = member.client.status(self.room.clone()).await else {
-            return;
-        };
+    /// that of its metadata when the client opened, unless fuzzing; it does not fail closed; its
+    /// room keeps nothing for a write, with none in flight; and its worker, if it has one, runs,
+    /// unless the step `closed` its room while it changed the mode of the worker: a worker that the
+    /// change started while the room closed stops at its next step, as the room is out of the
+    /// client. Its worker may change the replica meanwhile: its rows are read again until its head
+    /// and its epoch are the same before and after reading them.
+    async fn check(&self, member: &Member, closed: bool) {
         let client = member.client.client_id();
-        assert!(!status.failed_closed, "{client} fails closed");
-        let kept = (status.writes_in_flight, status.retained);
-        assert_eq!(kept, (0, 0), "{client} keeps something for its writes");
-        let after = self.incarnations.len() - 1 - member.since;
-        let discards = member.discards + after as u64;
-        assert!(
-            self.fuzz || status.epoch <= discards,
-            "{client} discarded a sound replica"
-        );
-        let metadata = member.metadata.room(&self.room).await.unwrap();
-        let incarnation = metadata
-            .expect("An open replica has metadata")
-            .room_incarnation;
-        let incarnation = &self.incarnations[self.incarnation(incarnation)];
-        let head = status.head_seq.get() as usize;
-        assert!(
-            head <= incarnation.log.len(),
-            "{client} is ahead of the log"
-        );
-        let replica = rows(&*member.storage, &self.room, &self.schema).await;
-        let model = incarnation.rows(head, &self.schema);
-        assert_eq!(trimmed(&replica), trimmed(&model), "{client} at {head}");
+        let mut unread = String::new();
+        for _ in 0..1000 {
+            let Ok(status) = member.client.status(self.room.clone()).await else {
+                return;
+            };
+            assert!(!status.failed_closed, "{client} fails closed");
+            let kept = (status.writes_in_flight, status.retained);
+            assert_eq!(kept, (0, 0), "{client} keeps something for its writes");
+            let after = self.incarnations.len() - 1 - member.since;
+            let discards = member.discards + member.resetting + after as u64;
+            assert!(
+                self.fuzz || status.epoch <= discards,
+                "{client} discarded a sound replica"
+            );
+            if let Some(worker) = &status.worker {
+                let room_closed = Some(ClientError::RoomClosed(self.room.clone()));
+                let stopped = closed && worker.last_error == room_closed;
+                assert!(
+                    worker.running || stopped,
+                    "The worker of {client} stopped: {worker:?}"
+                );
+            }
+            let metadata = member.metadata.of(&self.room).await;
+            let replica = rows(&*member.storage, &self.room, &self.schema).await;
+            let again = member.client.status(self.room.clone()).await;
+            let still = again.is_ok_and(|again| {
+                (again.epoch, again.head_seq) == (status.epoch, status.head_seq)
+            });
+            match (metadata, replica, still) {
+                (Some(metadata), Ok(replica), true) => {
+                    let incarnation = self.incarnation(metadata.room_incarnation);
+                    let incarnation = &self.incarnations[incarnation];
+                    let head = status.head_seq.get() as usize;
+                    assert!(
+                        head <= incarnation.log.len(),
+                        "{client} is ahead of the log"
+                    );
+                    let model = incarnation.rows(head, &self.schema);
+                    assert_eq!(trimmed(&replica), trimmed(&model), "{client} at {head}");
+                    return;
+                }
+                (metadata, replica, _) => {
+                    let incarnation = metadata.map(|metadata| metadata.room_incarnation);
+                    unread = format!("{incarnation:?}, {:?}", replica.err());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("The replica of {client} does not hold still: {unread}");
     }
 
-    /// Heals the network, and has every client open its room, sync and send heartbeats until
-    /// all of them are registered at the head of the room, in its last incarnation. No panic
+    /// Sets the mode of the worker of each client that runs one, in turn `Periodic`, `Live` and
+    /// `Manual`, as an application does, so that the network heals with each mode.
+    async fn assign_modes(&mut self) {
+        let modes = [Freshness::Periodic, Freshness::Live, Freshness::Manual];
+        let workers = self
+            .members
+            .iter_mut()
+            .filter(|member| member.worker.is_some());
+        for (member, freshness) in workers.zip(modes.into_iter().cycle()) {
+            member.worker = Some(freshness);
+            let _ = member
+                .client
+                .set_freshness(self.room.clone(), freshness)
+                .await;
+        }
+    }
+
+    /// The clients whose worker syncs by itself.
+    fn syncing(&self) -> Vec<usize> {
+        let syncs =
+            |member: &Member| matches!(member.worker, Some(Freshness::Live | Freshness::Periodic));
+        (0..self.members.len())
+            .filter(|&index| syncs(&self.members[index]))
+            .collect()
+    }
+
+    /// Leaves the clients with a worker without network while the others write, until the log is
+    /// past their heads by ten sequences if `pruning`, or by one: once they are back, they are
+    /// behind the head. If `pruning`, the log is pruned too: those whose worker syncs by itself
+    /// are behind the log, most of them, and catch up from a snapshot that another client
+    /// uploads, such as the archivist, at the head.
+    async fn isolate(&mut self, pruning: bool) {
+        let workers: BTreeSet<usize> = (self.members.iter().enumerate())
+            .filter(|(_, member)| member.worker.is_some())
+            .map(|(index, _)| index)
+            .collect();
+        // With their room open, as their application leaves it, so that their heads are known.
+        for &index in &workers {
+            self.opened(index).await;
+        }
+        self.run_workers().await;
+        *self.net.offline.lock().unwrap() = workers.iter().copied().collect();
+        // What they took before that, and the changes it brought.
+        self.settle().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut top = 0;
+        for &index in &workers {
+            if let Ok(status) = self.members[index].client.status(self.room.clone()).await {
+                top = top.max(status.head_seq.get());
+            }
+        }
+        let past = top + if pruning { 10 } else { 1 };
+        let writers: Vec<usize> = (ARCHIVIST + 1..self.members.len())
+            .filter(|index| !workers.contains(index))
+            .collect();
+        for _ in 0..30 {
+            if self.incarnations.last().unwrap().log.len() as u64 >= past {
+                break;
+            }
+            let plans: Vec<Plan> = writers
+                .iter()
+                .map(|&index| Plan::new(index, Action::Write(self.operation(index))))
+                .collect();
+            self.step(&plans).await;
+        }
+        let head = self.incarnations.last().unwrap().log.len() as u64;
+        assert!(head >= past, "The others write nothing: {head}, not {past}");
+        if !pruning {
+            return;
+        }
+        assert!(self.prune().await, "The log was not pruned");
+        let manager = &self.server.state.room_manager;
+        let tail = manager.log_bounds(&self.room).await.unwrap().tail_seq.get();
+        for index in self.syncing() {
+            let status = self.members[index].client.status(self.room.clone()).await;
+            if status.is_ok_and(|status| status.head_seq.get() + 1 < tail) {
+                self.behind_log.insert(index);
+            }
+        }
+        assert!(
+            self.syncing().is_empty() || !self.behind_log.is_empty(),
+            "No client with a worker is behind the log at {tail}"
+        );
+    }
+
+    /// Whether `member` is registered at the head of the room, in its last incarnation.
+    async fn at_head(&self, member: &Member) -> bool {
+        let incarnation = self.incarnations.last().unwrap();
+        let status = member.client.status(self.room.clone()).await;
+        let metadata = member.metadata.of(&self.room).await;
+        status.is_ok_and(|status| {
+            status.registered && status.head_seq.get() as usize == incarnation.log.len()
+        }) && metadata.is_some_and(|metadata| metadata.room_incarnation == incarnation.id)
+    }
+
+    /// Gives the clients with a worker their network back, and has every client open its room:
+    /// those whose worker syncs by itself, all of them behind the head, reach it within
+    /// [`HEAL_INTERVALS`], with no other call, and those behind the log, with a snapshot; while
+    /// those without a worker send a heartbeat every interval, the archivist too, as their
+    /// application does: the server may designate one of them to upload a snapshot.
+    async fn rejoin(&mut self) {
+        let syncing = self.syncing();
+        if !self.net.offline.lock().unwrap().is_empty() {
+            for &index in &syncing {
+                let member = &self.members[index];
+                let client = member.client.client_id();
+                assert!(
+                    !self.at_head(member).await,
+                    "{client} is at the head without network"
+                );
+            }
+        }
+        let behind_log = std::mem::take(&mut self.behind_log);
+        let downloads: Vec<u64> = behind_log.iter().map(|&i| self.net.downloads(i)).collect();
+        self.net.offline.lock().unwrap().clear();
+        let back = tokio::time::Instant::now();
+        for member in 0..self.members.len() {
+            self.opened(member).await;
+        }
+        self.run_workers().await;
+        let mut beat = back;
+        loop {
+            let mut behind = Vec::new();
+            for &index in &syncing {
+                let member = &self.members[index];
+                if !self.at_head(member).await {
+                    behind.push(member.client.client_id());
+                }
+            }
+            if behind.is_empty() {
+                for (&index, downloads) in behind_log.iter().zip(downloads) {
+                    let client = self.members[index].client.client_id();
+                    let downloaded = self.net.downloads(index) > downloads;
+                    assert!(
+                        downloaded,
+                        "{client} left the log behind without a snapshot"
+                    );
+                }
+                return;
+            }
+            let elapsed = back.elapsed();
+            assert!(
+                elapsed <= INTERVAL * HEAL_INTERVALS,
+                "{behind:?} did not reach the head of the room by themselves in {elapsed:?}"
+            );
+            if tokio::time::Instant::now() >= beat {
+                for member in &self.members {
+                    if member.worker.is_none() {
+                        let _ = member.client.heartbeat(self.room.clone()).await;
+                    }
+                }
+                beat += INTERVAL;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    /// Heals the network, and has every client open its room until all of them are registered at
+    /// the head of the room, in its last incarnation. First, those whose worker syncs by itself
+    /// get there by themselves ([`rejoin`](Self::rejoin)); with workers, once more after they were
+    /// without network again while the others wrote, behind the head alone. Then those without a
+    /// worker sync and send heartbeats, and those whose worker runs in `Manual` sync. No panic
     /// happened meanwhile.
     async fn heal(&mut self) {
         self.net.faulty.store(false, Ordering::SeqCst);
@@ -1439,24 +2041,29 @@ impl Sim {
                 let _ = member.client.close_room(self.room.clone()).await;
             }
         }
+        self.rejoin().await;
+        if self.workers {
+            self.isolate(false).await;
+            self.rejoin().await;
+        }
         for _ in 0..60 {
             for member in 0..self.members.len() {
                 self.opened(member).await;
             }
+            self.run_workers().await;
             for action in [Action::Sync, Action::Heartbeat] {
-                let members = 1..self.members.len();
+                let calls = |member: &Member| match member.worker {
+                    None => true,
+                    Some(Freshness::Manual) => matches!(action, Action::Sync),
+                    Some(_) => false,
+                };
+                let members = (1..self.members.len()).filter(|&i| calls(&self.members[i]));
                 let plans: Vec<Plan> = members.map(|i| Plan::new(i, action.clone())).collect();
                 self.step(&plans).await;
             }
-            let incarnation = self.incarnations.last().unwrap();
             let mut done = true;
             for member in &self.members {
-                let status = member.client.status(self.room.clone()).await;
-                let metadata = member.metadata.room(&self.room).await.unwrap();
-                done &= status.is_ok_and(|status| {
-                    status.registered && status.head_seq.get() as usize == incarnation.log.len()
-                }) && metadata
-                    .is_some_and(|metadata| metadata.room_incarnation == incarnation.id);
+                done &= self.at_head(member).await;
             }
             if done {
                 let panics = PANICS.load(Ordering::SeqCst);
@@ -1479,7 +2086,7 @@ impl Sim {
             if member.client.status(self.room.clone()).await.is_ok() {
                 return;
             }
-            member.opening(&self.room).await;
+            member.opening(&self.room, None).await;
             let _ = open_room(&member.client, &self.room).await;
         }
         panic!("The room does not open");
@@ -1560,16 +2167,56 @@ fn seeds(first: u64, count: u64) -> std::ops::Range<u64> {
     first..first + setting("SIM_SEEDS", count)
 }
 
-/// A simulation of `steps` random steps over `kind`, fuzzing the replies if `fuzz`, with the
-/// network healed at the end.
-async fn simulate(seed: u64, kind: Kind, steps: usize, fuzz: bool) {
-    let mut sim = Sim::new(seed, kind, fuzz).await;
+/// The faults of the event streams and of the tokens.
+const FAULTS: [&str; 10] = [
+    "event lost",
+    "event late",
+    "lagged",
+    "stream cut",
+    "stream silent",
+    "stream expired",
+    "opening lost",
+    "opening expired",
+    "opening refused",
+    "token expired",
+];
+
+/// A simulation of `steps` random steps over `kind`, fuzzing the replies if `fuzz`, and else with
+/// workers, with the network healed at the end: then some event with operations reached a client,
+/// and the event streams or their openings had faults. Returns how many times the network
+/// injected each fault of the event streams and of the tokens.
+async fn simulate(
+    seed: u64,
+    kind: Kind,
+    steps: usize,
+    fuzz: bool,
+) -> BTreeMap<&'static str, usize> {
+    let mut sim = Sim::new(seed, kind, fuzz, !fuzz).await;
     for step in 0..steps {
         sim.event(step).await;
         let plans = sim.plans();
         sim.step(&plans).await;
     }
+    if sim.workers {
+        sim.assign_modes().await;
+        sim.isolate(true).await;
+    }
     sim.heal().await;
+    if sim.workers {
+        let ops = sim.net.ops.load(Ordering::SeqCst);
+        assert!(ops > 0, "No event with operations reached a client");
+    }
+    let faults = sim.net.faults.lock().unwrap().clone();
+    // Of a block or of an opening: some runs have few blocks of their own.
+    let streams = FAULTS[..9]
+        .iter()
+        .filter_map(|fault| faults.get(fault))
+        .sum::<usize>();
+    assert!(
+        fuzz || streams > 0,
+        "No fault of an event stream: {faults:?}"
+    );
+    faults
 }
 
 #[tokio::test(start_paused = true)]
@@ -1589,9 +2236,21 @@ async fn rankings_converge_through_faults_restarts_pruning_and_schema_changes() 
 #[tokio::test(start_paused = true)]
 #[ignore = "long-running simulation; run with --ignored in release"]
 async fn replicas_converge_over_many_long_simulations() {
+    let mut faults = BTreeMap::new();
     for seed in seeds(1, 16) {
-        simulate(seed, Kind::Random, 400, false).await;
-        simulate(seed, Kind::Ranking, 400, false).await;
+        for kind in [Kind::Random, Kind::Ranking] {
+            for (fault, count) in simulate(seed, kind, 400, false).await {
+                *faults.entry(fault).or_insert(0) += count;
+            }
+        }
+    }
+    // Every fault of the event streams and of the tokens, and a token that the provider gave
+    // already expired, which the server refused.
+    for fault in FAULTS.iter().chain(&["token refused by the server"]) {
+        assert!(
+            faults.get(fault).is_some_and(|count| *count > 0),
+            "{fault}: {faults:?}"
+        );
     }
 }
 
@@ -1618,7 +2277,7 @@ async fn no_reply_in_place_of_the_servers_panics_a_client_over_many_long_simulat
 /// the snapshot of another member.
 #[tokio::test(start_paused = true)]
 async fn the_ranking_converges_and_rejects_what_breaks_its_rules() {
-    let mut sim = Sim::new(seeds(0, 1).start, Kind::Ranking, false).await;
+    let mut sim = Sim::new(seeds(0, 1).start, Kind::Ranking, false, false).await;
     // A and B over disk engines, and the second device of B over a memory engine.
     let (a, b, b2) = (1, 2, 3);
     let (r, first, second) = (uuid(1), uuid(11), uuid(12));
@@ -1650,7 +2309,7 @@ async fn the_ranking_converges_and_rejects_what_breaks_its_rules() {
     sim.synced(a).await;
     assert!(sim.prune().await);
     sim.synced(a).await;
-    sim.join("C", true).await;
+    sim.join("C", true, None).await;
     let c = sim.members.len() - 1;
     sim.opened(c).await;
     for _ in 0..20 {

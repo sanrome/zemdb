@@ -153,8 +153,13 @@ struct Member {
 
 /// A client of `server` that opens `room_id`.
 async fn member(server: &TestServer, room_id: &RoomId) -> Member {
+    member_with(server, room_id, ClientConfig::new("ana")).await
+}
+
+/// A client of `server` with `config` that opens `room_id`.
+async fn member_with(server: &TestServer, room_id: &RoomId, config: ClientConfig) -> Member {
     let (transport, storage) = (server.transport(), MemoryStorageEngine::new());
-    let client = client_over(storage.clone(), &transport, ClientConfig::new("ana")).await;
+    let client = client_over(storage.clone(), &transport, config).await;
     open_room(&client, room_id).await.unwrap();
     Member {
         transport,
@@ -222,6 +227,22 @@ fn sent_of(transport: &TestTransport, kind: ClientMessageKind) -> Vec<Instant> {
     let sent = transport.sent_at().into_iter();
     let of = |(message, _): &(ClientMessage, Instant)| message.kind() == kind;
     sent.filter(of).map(|(_, at)| at).collect()
+}
+
+/// Waits until `count` messages of `kind` went through `transport`, within `within`, and returns
+/// at once: the first heartbeat of a worker comes anywhere in its first interval, so a test that
+/// sleeps a number of intervals may wake in the instant of the last heartbeat, before it.
+async fn sent_count(
+    transport: &TestTransport,
+    kind: ClientMessageKind,
+    count: usize,
+    within: Duration,
+) {
+    let deadline = Instant::now() + within;
+    while sent_of(transport, kind).len() < count {
+        assert!(Instant::now() < deadline, "No {count} messages of {kind:?}");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -575,7 +596,8 @@ async fn a_snapshot_larger_than_the_limit_and_an_error_of_the_storage_do_not_sto
     let client = client_over(storage.clone(), &transport, config).await;
     open_room(&client, &room_id).await.unwrap();
     client.start_worker(room_id.clone()).await.unwrap();
-    tokio::time::sleep(interval * 3).await;
+    // Three heartbeats come within four intervals, wherever the first falls in the first.
+    sent_count(&transport, RequestSnapshotChunk, 3, interval * 4).await;
     let sizes = transport
         .sent()
         .into_iter()
@@ -583,9 +605,9 @@ async fn a_snapshot_larger_than_the_limit_and_an_error_of_the_storage_do_not_sto
             ClientMessage::RequestSnapshotChunk { chunk_size, .. } => Some(chunk_size),
             _ => None,
         });
-    // One request of a chunk per heartbeat, wherever the heartbeats fall in the 30 s.
+    // One request of a chunk per heartbeat.
     let sizes: Vec<_> = sizes.collect();
-    assert!((3..=4).contains(&sizes.len()), "{sizes:?}");
+    assert_eq!(sizes.len(), 3, "{sizes:?}");
     let probes = sizes[1..].iter().all(|size| *size == 64 << 10);
     assert!(sizes[0] == 4 << 20 && probes, "{sizes:?}");
     assert_eq!(sizes.len(), heartbeats(&transport, &room_id).len());
@@ -600,8 +622,7 @@ async fn a_snapshot_larger_than_the_limit_and_an_error_of_the_storage_do_not_sto
     let before = heartbeats(&transport, &room_id).len();
     let io = || StorageError::Io(std::io::Error::other("Fabricated"));
     storage.fail_next("get_head_seq", io());
-    tokio::time::sleep(interval * 3).await;
-    assert!(heartbeats(&transport, &room_id).len() >= before + 2);
+    sent_count(&transport, Heartbeat, before + 2, interval * 3).await;
     assert!(worker(&client, &room_id).await.unwrap().running);
 }
 
@@ -1036,8 +1057,7 @@ async fn in_manual_what_another_client_writes_reaches_the_replica_with_a_sync_or
         worker_in(Freshness::Manual, interval).await;
     // The heartbeats go on, and none leads to a sync.
     server.commit(&room_id, [1]).await;
-    tokio::time::sleep(interval * 3).await;
-    assert!(heartbeats(&transport, &room_id).len() >= 3);
+    sent_count(&transport, Heartbeat, 3, interval * 4).await;
     assert_eq!(head(&client, &room_id).await, 0);
     assert!(sent_of(&transport, Sync).is_empty());
 
@@ -1899,14 +1919,15 @@ async fn a_close_during_a_stop_of_the_worker_waits_for_its_last_ack_also_if_the_
 #[tokio::test(start_paused = true)]
 async fn a_reader_that_syncs_only_with_its_worker_stays_connected_past_a_prune_and_is_designated() {
     // A room that gets no writes once the reader caught up with its worker: its log is pruned
-    // past the cursor that the last sync of the worker left the server.
+    // past the cursor that the last sync of the worker left the server. The first heartbeat of
+    // the reader comes within 10 s, before the first maintenance of the server, at 30 s, which
+    // would leave it behind the log.
     let server = TestServer::pruning();
     let room_id = server.create_room("room-a").await;
     server.commit(&room_id, 1..=10).await;
-    let reader = member(&server, &room_id).await;
+    let reader = member_with(&server, &room_id, every(Duration::from_secs(10))).await;
     reader.client.start_worker(room_id.clone()).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(61)).await;
-    assert_eq!(head(&reader.client, &room_id).await, 10);
+    synced_to(&reader.client, &room_id, 10).await;
     server.prune(&room_id, 11).await;
     // Once the lease of the client that wrote ended, and the reader sent heartbeats after the
     // prune, the server takes the reader as connected, not behind its log.
@@ -1915,9 +1936,16 @@ async fn a_reader_that_syncs_only_with_its_worker_stays_connected_past_a_prune_a
 
     // A client behind the log gets the snapshot that the server designates the reader to upload,
     // without the reader calling a step.
+    // Its first heartbeat, the designation at the next of the reader, and its next heartbeat,
+    // which announces the snapshot uploaded.
     let lagging = member(&server, &room_id).await;
     lagging.client.start_worker(room_id.clone()).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(91)).await;
+    for _ in 0..91 {
+        if head(&lagging.client, &room_id).await == 10 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
     assert!(!sent_of(&reader.transport, UploadSnapshotChunk).is_empty());
     assert_eq!(head(&lagging.client, &room_id).await, 10);
     let all = [1, 2, 3, 4, 5, 6, 7, 8, 9];
