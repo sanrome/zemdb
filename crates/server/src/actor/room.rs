@@ -247,8 +247,9 @@ impl RoomActor {
     /// `RoomManager` answers it with `Internal`, since retrying it could panic again. Dropping
     /// the actor afterwards releases the room's files.
     pub async fn run(mut self) -> ActorExit {
-        // Published once the actor runs, so that an actor opened for a spawn that was dropped
-        // leaves none: the task that runs the actor clears it when the actor ends.
+        // Published once the actor runs, so that an actor dropped before it runs (its opening
+        // cut by the runtime shutting down) leaves none: the task that runs the actor clears it
+        // when the actor ends.
         self.publish_snapshot_floor();
         let outcome = AssertUnwindSafe(self.run_loop()).catch_unwind().await;
         match outcome {
@@ -620,9 +621,10 @@ impl RoomActor {
 
     /// The event that announces the new mutations of `commits`, a group whose records are
     /// durable and whose head is now the room's: `ops`, with their operations, if a stream
-    /// listens and the server's total of retained events has room for them; otherwise
-    /// `head_advanced`. The operations were checked with the room's schema, which a group
-    /// never changes: a schema reload in the mailbox ends the group.
+    /// listens, their frame is at most `MAX_OPS_EVENT_FRAME` (4 KiB) and the server's total of
+    /// retained events has room for them; otherwise `head_advanced`. The operations were
+    /// checked with the room's schema, which a group never changes: a schema reload in the
+    /// mailbox ends the group.
     fn announcement(&self, commits: &[PendingCommit]) -> RoomEvent {
         let new_ops = commits.iter().filter_map(|commit| match &commit.decision {
             Decision::New(seq_op) => Some(&**seq_op),

@@ -418,7 +418,7 @@ Orientan las propuestas; no son decisiones adoptadas, y las del SDK y el protoco
 ### 4.9 Las Evaluaciones 1 y 2 después de la Fase 3.12
 
 La [Fase 3.12](2026-11-fase3_12-rendimiento-servidor.md) aplicó lo que encontraron estas evaluaciones, y su Lote 8 las repitió enteras, el 12 de Noviembre de 2026, con el mismo arnés.
-- **Las variantes:** la base es `0b03a77`, su línea de base, que es el servidor de estas evaluaciones con el arnés en `main`; el resultado es `6b93115`, el último commit de la fase.
+- **Las variantes:** la base es `0b03a77`, su línea de base, que es el servidor de estas evaluaciones con el arnés en `main`; el resultado es `6b93115`, el último commit de la fase antes de los Lotes 8b y 8c, que arreglaron lo que encontró su revisión de cierre sin tocar el camino de un commit (cada uno midió los escenarios de control, que no cambian).
 - **El diseño:** intercaladas, 3 rondas por escenario, en una misma VM: 4 vCPU Intel Xeon a 2,10 GHz, 15 GiB, kernel `6.18.44-fc-v378` y Rust 1.97.0, con el servidor en 2 núcleos y el generador en los otros 2. Es otra máquina que la de §3.7 y §4.7, así que los números absolutos no se comparan con los de arriba (DP3).
 - **Los detalles:** la nota **Hecho** del Lote 8, y los datos crudos, en `tools/perf/results/fase3_12/lote8/`.
 

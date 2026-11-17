@@ -108,8 +108,8 @@ impl RoomSlot {
 type SpawnLocks = Arc<DashMap<RoomId, Arc<Mutex<()>>>>;
 
 /// Exclusive right to spawn, create or delete one room. A file operation under it carries it
-/// to the file I/O threads ([`RoomManager::io_locked`]), so that it outlives a caller dropped
-/// while the operation runs.
+/// to the file I/O threads ([`RoomManager::io_locked`]), and an opening of the room to its end
+/// ([`Opening`]), so that it outlives a caller dropped while the operation or the opening runs.
 struct SpawnGuard {
     locks: SpawnLocks,
     room_id: RoomId,
@@ -334,7 +334,10 @@ impl RoomManager {
         let meta = self
             .resolve_metadata(room_id, schema_id, &mut guard)
             .await?;
-        let slot = self.spawn_actor(room_id, &meta, None, &mut guard).await?;
+        let guard = guard
+            .take()
+            .expect("the spawn lock is back after every file operation");
+        let slot = self.spawn_actor(room_id, &meta, None, guard).await?;
         info!(room = %room_id, "RoomActor lazily initialized and registered in RoomManager");
         Ok(slot)
     }
@@ -482,21 +485,29 @@ impl RoomManager {
     /// that stopped and receives no more requests leaves nothing behind. A request arriving
     /// before that still finds the closed slot and waits.
     ///
+    /// The opening and the registration of its actor run in a task of their own, which
+    /// carries the spawn lock until the actor is registered ([`Opening`]): a caller dropped
+    /// meanwhile, a request that timed out or whose client went away, does not cut it, and the
+    /// room is open for the next request.
+    ///
     /// The room is listed for schema reloads (`room_meta`) before its schema is read from the
     /// registry, falling back to `schema`: an evolution whose reload did not list the room
-    /// happened before that read. A spawn that fails, or whose caller is dropped, unlists it.
+    /// happened before that read. A spawn that fails unlists it, under the spawn lock.
     async fn spawn_actor(
         &self,
         room_id: &RoomId,
         meta: &RoomMetadata,
         schema: Option<Arc<Schema>>,
-        guard: &mut Option<SpawnGuard>,
+        guard: SpawnGuard,
     ) -> Result<RoomSlot, ServerError> {
         self.room_meta.insert(room_id.clone(), meta.clone());
-        let mut listed = Listed {
-            room_meta: &self.room_meta,
-            room_id,
-            started: false,
+        let opening = Opening {
+            listed: Listed {
+                room_meta: Arc::clone(&self.room_meta),
+                room_id: room_id.clone(),
+                started: false,
+            },
+            _guard: guard,
         };
         let schema = self
             .schema_registry
@@ -529,31 +540,51 @@ impl RoomManager {
                 )
             }
         };
-        let (sender, actor) = self.io_locked(guard, open).await?;
-        listed.started = true;
         let actor_id = self.next_actor_id.fetch_add(1, Ordering::Relaxed);
-        let (exit_tx, exit_rx) = watch::channel(None);
-        let slot = RoomSlot {
-            sender,
-            exit: exit_rx,
-            actor_id,
-        };
-        self.rooms.insert(room_id.clone(), slot.clone());
-
         let (rooms, room_meta) = (Arc::clone(&self.rooms), Arc::clone(&self.room_meta));
-        let relay = Arc::clone(&self.snapshot_relay);
+        let (relay, io) = (Arc::clone(&self.snapshot_relay), Arc::clone(&self.io));
         let room_id = room_id.clone();
-        tokio::spawn(async move {
-            let exit = actor.run().await;
-            // Before the exit is reported: a respawn waits for it, under the spawn lock, before
-            // adding the room's metadata and snapshot floor again. Taking the spawn lock here
-            // would deadlock.
-            room_meta.remove(&room_id);
-            relay.clear_snapshot_floor(&room_id);
-            rooms.remove_if(&room_id, |_, slot| slot.actor_id == actor_id);
-            exit_tx.send_replace(Some(exit));
+        let opened = tokio::spawn(async move {
+            // The opening travels to the file I/O threads with the room's listing and its
+            // spawn lock: if this task is dropped meanwhile, which only happens when the runtime
+            // shuts down, the opened actor is dropped there, and then the listing and the lock.
+            let (opened, mut opening) = io.io().run(move || (open(), opening)).await;
+            // Nobody may be waiting for the opening any more to report its error.
+            let (sender, actor) = opened.inspect_err(|err| {
+                warn!(room = %room_id, error = %err, "Failed to open a room");
+            })?;
+            opening.listed.started = true;
+            let (exit_tx, exit_rx) = watch::channel(None);
+            let slot = RoomSlot {
+                sender,
+                exit: exit_rx,
+                actor_id,
+            };
+            rooms.insert(room_id.clone(), slot.clone());
+            fail_point::hook("room_registered", Path::new(room_id.as_str()));
+
+            tokio::spawn(async move {
+                let exit = actor.run().await;
+                // Before the exit is reported: a respawn waits for it, under the spawn lock,
+                // before adding the room's metadata and snapshot floor again. Taking the spawn
+                // lock here would deadlock.
+                room_meta.remove(&room_id);
+                relay.clear_snapshot_floor(&room_id);
+                rooms.remove_if(&room_id, |_, slot| slot.actor_id == actor_id);
+                exit_tx.send_replace(Some(exit));
+            });
+            // The spawn lock comes free here, once the actor is registered.
+            drop(opening);
+            Ok::<_, ServerError>(slot)
         });
-        Ok(slot)
+        match opened.await {
+            Ok(slot) => slot,
+            Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+            Err(_) => Err(ServerError::Unavailable(format!(
+                "Room {} did not open: the server is shutting down",
+                meta.room_id
+            ))),
+        }
     }
 
     /// Fast check if a room exists in memory or on disk.
@@ -661,7 +692,10 @@ impl RoomManager {
         let written = meta.clone();
         self.io_locked(&mut guard, move || write_room_metadata(&room_dir, &written))
             .await?;
-        self.spawn_actor(&room_id, &meta, Some(schema), &mut guard)
+        let guard = guard
+            .take()
+            .expect("the spawn lock is back after every file operation");
+        self.spawn_actor(&room_id, &meta, Some(schema), guard)
             .await?;
         Ok(meta)
     }
@@ -736,7 +770,9 @@ impl RoomManager {
     /// dropped the command's reply stopped while handling it or while it was queued: the
     /// request is `Unavailable` (it may be retried; the next request respawns the room), or
     /// `Internal` if the actor panicked while handling it. An actor that does not take and
-    /// answer the command in time is `Timeout`, which may be retried.
+    /// answer the command in time, its room's opening included, is `Timeout`, which may be
+    /// retried: an opening that outlasts the request goes on, and the room is open for the
+    /// retry.
     pub async fn ask<R>(
         &self,
         room_id: &RoomId,
@@ -848,18 +884,28 @@ impl RoomManager {
 
 /// A room listed in `room_meta` while its actor is spawned: unlisted when dropped, unless its
 /// actor started, which unlists it when it ends.
-struct Listed<'a> {
-    room_meta: &'a DashMap<RoomId, RoomMetadata>,
-    room_id: &'a RoomId,
+struct Listed {
+    room_meta: Arc<DashMap<RoomId, RoomMetadata>>,
+    room_id: RoomId,
     started: bool,
 }
 
-impl Drop for Listed<'_> {
+impl Drop for Listed {
     fn drop(&mut self) {
         if !self.started {
-            self.room_meta.remove(self.room_id);
+            self.room_meta.remove(&self.room_id);
+            fail_point::hook("room_unlisted", Path::new(self.room_id.as_str()));
         }
     }
+}
+
+/// What an opening of a room carries until it ends, even if its caller is dropped: the room's
+/// listing for schema reloads and its spawn lock, which it only holds. The fields are dropped
+/// in order, so a room whose opening failed is unlisted while its lock is still taken, and a
+/// spawn that takes the lock afterwards lists it again for good.
+struct Opening {
+    listed: Listed,
+    _guard: SpawnGuard,
 }
 
 /// Removes the directories that deleted rooms left in `rooms_dir` (see [`DELETED_ROOM_PREFIX`]).

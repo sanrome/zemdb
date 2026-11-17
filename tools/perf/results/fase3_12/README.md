@@ -113,3 +113,13 @@ Los escenarios de control de §5.2 del plan: E1-tmpfs con 1 y 8 pedidos en vuelo
 
 Los archivos: `<escenario>-base.jsonl` y `<escenario>-result.jsonl`, con las corridas de cada variante en el orden en que corrieron (en los de E1, una línea por cantidad de pedidos en vuelo en cada ronda); los escenarios son `e1-tmpfs`, `e2-tmpfs-r500` y `e2-tmpfs-r500-rev`.
 - **`e2-tmpfs-r500-aa-<variante>.jsonl`:** una comparación A/A, después de la revisión de delta, que vio la cola de E2 más alta en el resultado: E2-tmpfs con 500 salas y cuatro servidores en un cuadrado latino de cuatro rondas (cada uno una vez en cada lugar de una ronda: `a b base result`, `b a result base`, `base result a b` y `result base b a`). `a` es `main` sin el lote (`2249e0b`) y `b`, `main` con el lote ya revisado, compilados igual y en el mismo lugar (`aa/a` y `aa/b` en una carpeta temporal); `base` y `result`, los binarios de las corridas de arriba (`result` es el lote antes de la revisión).
+
+## `lote8c/`: una sala que abre después de que venció su pedido
+
+Los escenarios de control de §5.2 del plan: E1-tmpfs con 1 y 8 pedidos en vuelo y E2-tmpfs con 500 salas. El lote no toca el camino de un commit (cambia dónde corre la apertura de una sala), así que no tiene un escenario propio.
+- **Las variantes:** la base es el servidor de `6b93115` (el de `lote8/` y `lote8b/`), y el resultado, el código del lote sobre `be969a6`, que tiene también el Lote 8b. Los dos, en release con la información de depuración, como en `lote8/`.
+- **El diseño:** tres rondas intercaladas, empezando por la base, el 16 de Noviembre de 2026; y tres más de E2-tmpfs empezando por el resultado (`-rev`), como en `lote8b/`.
+- **El entorno:** una sola VM, sin reinicios (`*.vm.json` guarda su `boot_id`): 4 vCPU Intel Xeon a 2,10 GHz, 15 GiB, kernel `6.18.44-fc-v470` y Rust 1.97.0. Es otra VM que la de `lote8b/`.
+- **El generador:** el de `6b93115`, para las dos variantes.
+
+Los archivos: `<escenario>-base.jsonl` y `<escenario>-result.jsonl`, con las corridas de cada variante en el orden en que corrieron (en los de E1, una línea por cantidad de pedidos en vuelo en cada ronda); los escenarios son `e1-tmpfs`, `e2-tmpfs-r500` y `e2-tmpfs-r500-rev`.
