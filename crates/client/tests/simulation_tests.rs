@@ -26,13 +26,13 @@
 //! head of the room within a fixed number of intervals without a call of the test, and those in
 //! `Manual`, with a sync.
 //!
-//! With workers, two clients also go through the facade, of two persons without another client of
-//! the facade: one with the `CryptoEngine` of the tests and one without it, whose writes and reads
-//! of an encrypted column are `Crypto`; each with its worker, in a random mode, the first without
-//! the precheck and the second with it. They write what the others write, by the names of the
-//! columns, with the plaintext of each encrypted value, which carries a mark, and now and then with
-//! the owner column, which the facade does not send; and they open and drop `watch` and
-//! `watch_scan` streams of random keys and ranges, each read by a task of its own, as an
+//! With workers and without fuzzing, two clients also go through the facade, of two persons without
+//! another client of the facade: one with the `CryptoEngine` of the tests and one without it, whose
+//! writes and reads of an encrypted column are `Crypto`; each with its worker, in a random mode,
+//! the first without the precheck and the second with it. They write what the others write, by the
+//! names of the columns, with the plaintext of each encrypted value, which carries a mark, and now
+//! and then with the owner column, which the facade does not send; and they open and drop `watch`
+//! and `watch_scan` streams of random keys and ranges, each read by a task of its own, as an
 //! application reads it. The core of the others writes the encrypted notes of the reference app
 //! encrypted, as a member with the key does. After each step, also:
 //! - every operation that a client of the facade sent declares the owner of its client;
@@ -45,14 +45,20 @@
 //!   direct read, or an error after it, of a state in between; no stream gave its last value
 //!   again; and the status of the room counts the subscriptions of the streams alive.
 //!
-//! Fuzzing, the network also puts other replies in place of some of the server's: random bytes,
-//! the reply damaged, random messages, errors of the request, and snapshots that match their hash
-//! but install with no schema of the room, or announced larger than the limit of the clients. None
-//! tells a client otherwise than the server what it takes on trust. No client panics, every
-//! replica holds what the model holds at its head, and no download goes past the first chunk of a
-//! snapshot larger than the limit; a write may end with any error, and a call may wait for what
-//! those replies announced, until it is dropped after ten minutes and its room opens again at the
-//! end.
+//! Fuzzing, with workers too, the network also puts other replies in place of some of the
+//! server's: random bytes, the reply damaged, random messages, errors of the request, and
+//! snapshots that match their hash but install with no schema of the room, or announced larger
+//! than the limit of the clients. In place of some openings of event streams, it puts refusals at
+//! random; and in place of some of their blocks, random bytes, the event damaged, its frame
+//! damaged, a line without an end, an `ops` event with a random message, with an operation that
+//! does not validate, or with operations of the room that the log does not have at its
+//! sequences, of another room or of another incarnation, and other events with random data. None
+//! tells a client otherwise than the server what it takes on trust, nor brings it operations it
+//! cannot tell from the server's. No client panics, no worker stops, every replica holds what the
+//! model holds at its head, and no download goes past the first chunk of a snapshot larger than
+//! the limit; a write may end with any error, and a call may wait for what those replies
+//! announced, until it is dropped after ten minutes. Before the network heals, it fuzzes no more,
+//! and the rooms open again.
 //!
 //! The ignored variants run longer: `cargo test --release -- --ignored`. A run prints
 //! its seed first, and `SIM_SEED` runs from another one (`SIM_SEEDS`, how many): a seed repeats
@@ -74,6 +80,8 @@ use async_trait::async_trait;
 use axum::body::{to_bytes, Body};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{Method, Request};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use bytes::Bytes;
 use common::{
     additional_data, encoded, error_reply, options, refused, request, Issue, TestCrypto,
@@ -394,6 +402,47 @@ impl Network {
         }
     }
 
+    /// `block`, of the event stream of `room_id` whose lines `lines` read so far, or now and then,
+    /// while the network fuzzes, another in its place ([`Fuzz::event`]), unless a line that it
+    /// ends lies ([`event_lies`]). Returns whether it is another.
+    fn fuzzed_block(&self, room_id: &RoomId, lines: &Lines, block: Bytes) -> (Bytes, bool) {
+        let mut fuzz = self.fuzz.lock().unwrap();
+        let Some(fuzz) = fuzz.as_mut() else {
+            return (block, false);
+        };
+        let real = ops_event(&block);
+        let Some((kind, fuzzed)) = fuzz.event(&block, room_id, real.as_ref()) else {
+            return (block, false);
+        };
+        let real = match real {
+            Some(ServerMessage::OpsEvent { ops, .. }) => ops,
+            _ => Vec::new(),
+        };
+        let schemas = self.schemas.lock().unwrap();
+        let lies = (lines.clone().read(&fuzzed).iter())
+            .any(|line| event_lies(line, room_id, &real, &fuzz.incarnations, &schemas));
+        if lies {
+            self.injected("forgery left out");
+            return (block, false);
+        }
+        self.injected(kind);
+        (Bytes::from(fuzzed), true)
+    }
+
+    /// While the network fuzzes, now and then a refusal in place of `opened`, the opening of the
+    /// event stream of `room_id` ([`Fuzz::refusal`]).
+    fn fuzzed_opening(&self, room_id: &RoomId, opened: EventStream) -> EventStream {
+        let refusal =
+            (self.fuzz.lock().unwrap().as_mut()).and_then(|fuzz| fuzz.refusal(room_id, &opened));
+        match refusal {
+            Some(refusal) => {
+                self.injected("refusal at random");
+                EventStream::Refused(refusal)
+            }
+            None => opened,
+        }
+    }
+
     /// `reply`, the reply to `message`, or now and then, while the network fuzzes, another in its
     /// place: to the request of the first chunk of a snapshot that fits in one, half the time, the
     /// chunk of another snapshot ([`Fuzz::snapshot`]), unless that one installs with a schema of
@@ -513,20 +562,29 @@ fn lies(message: &ClientMessage, fuzzed: &ServerMessage, real: Option<&ServerMes
 }
 
 /// What the network fuzzes with: its generator, valid replies that a damaged one takes bytes
-/// from, and the codes of the errors.
+/// from, and those replies as `ops` events, for a damaged event; the codes of the errors; the
+/// last operations that `ops` events brought, which forged events carry; and the incarnations
+/// that forged events carry, of no room.
 struct Fuzz {
     rng: generators::Rng,
     pool: Vec<Vec<u8>>,
+    events: Vec<Vec<u8>>,
     codes: Vec<ErrorCode>,
+    ops: Vec<Operation>,
+    incarnations: HashSet<u128>,
 }
 
 impl Fuzz {
     fn new(seed: u64) -> Self {
         let samples = generators::sample_server_messages();
+        let pool: Vec<Vec<u8>> = samples.iter().map(|m| encode_message(m).unwrap()).collect();
         Self {
             rng: generators::Rng::new(seed.reverse_bits()),
-            pool: samples.iter().map(|m| encode_message(m).unwrap()).collect(),
+            events: pool.iter().map(|frame| ops_block(frame)).collect(),
+            pool,
             codes: generators::all_error_codes(),
+            ops: Vec::new(),
+            incarnations: HashSet::new(),
         }
     }
 
@@ -598,6 +656,302 @@ impl Fuzz {
         let total_bytes = data.len() as u64;
         (data, total_bytes)
     }
+
+    /// One time in five, a block in place of `block`, of the event stream of `room_id`, whose
+    /// `ops` event is `real`, if it is one, with the name of what it is: random bytes, mostly
+    /// pieces of the syntax of a stream; `block` damaged; the frame of `real` damaged, in base64
+    /// again; a line without an end, at times longer than a client reads; an `ops` event with a
+    /// random message; `real` with other operations of the room at its sequences, of another
+    /// room or of another incarnation; another event with random data; or `real` with one of its
+    /// operations in its table and of its key but with random data, which does not validate,
+    /// unless by chance. Without `real`, a random message in place of those made of it.
+    fn event(
+        &mut self,
+        block: &[u8],
+        room_id: &RoomId,
+        real: Option<&ServerMessage>,
+    ) -> Option<(&'static str, Vec<u8>)> {
+        if let Some(ServerMessage::OpsEvent { ops, .. }) = real {
+            self.ops.extend(ops.iter().map(|op| op.op.clone()));
+            let excess = self.ops.len().saturating_sub(64);
+            self.ops.drain(..excess);
+        }
+        let rng = &mut self.rng;
+        if !rng.chance(1, 5) {
+            return None;
+        }
+        let kind = rng.below(9);
+        let forged = match (kind, real) {
+            (5 | 6, Some(real)) => forged(rng, real, &self.ops),
+            _ => None,
+        };
+        Some(match (kind, real, forged) {
+            (0, ..) => ("random bytes", random_stream(rng, &self.pool)),
+            (1, ..) => {
+                let mut bytes = block.to_vec();
+                generators::mutate(rng, &mut bytes, 0, &self.events);
+                ("event damaged", bytes)
+            }
+            (2, Some(real), _) => {
+                let mut frame = encode_message(real).unwrap();
+                generators::mutate(rng, &mut frame, PROTOCOL_HEADER_LEN, &self.pool);
+                ("frame damaged", ops_block(&frame))
+            }
+            (3, ..) => {
+                let mut line = b"data: ".to_vec();
+                line.resize(line.len() + rng.below(2 * EVENT_LIMIT), b'A');
+                ("endless line", line)
+            }
+            (5 | 6, _, Some(mut forged)) => {
+                let ServerMessage::OpsEvent {
+                    room_id: of,
+                    room_incarnation,
+                    ..
+                } = &mut forged
+                else {
+                    unreachable!("A forged event is an ops event")
+                };
+                let name = match kind {
+                    5 => {
+                        while *of == *room_id {
+                            *of = generators::room_id(rng);
+                        }
+                        "another room"
+                    }
+                    _ => {
+                        *room_incarnation = rng.u128();
+                        self.incarnations.insert(*room_incarnation);
+                        "another incarnation"
+                    }
+                };
+                (name, ops_block(&encode_message(&forged).unwrap()))
+            }
+            (7, ..) => ("random event", random_event(rng)),
+            (8, Some(real), _) => {
+                let mut invalid = real.clone();
+                if let ServerMessage::OpsEvent { ops, .. } = &mut invalid {
+                    if !ops.is_empty() {
+                        let at = rng.below(ops.len());
+                        let op = &mut ops[at].op;
+                        let (table, pk) = (op.table_id(), op.pk().clone());
+                        let kind = generators::operation_kind(rng);
+                        *op = Operation::new(table, pk, op.timestamp(), kind);
+                    }
+                }
+                (
+                    "invalid operation",
+                    ops_block(&encode_message(&invalid).unwrap()),
+                )
+            }
+            _ => {
+                let message = generators::server_message(rng, &self.codes);
+                (
+                    "random message",
+                    ops_block(&encode_message(&message).unwrap()),
+                )
+            }
+        })
+    }
+
+    /// One time in five, a refusal of the event stream of `room_id` in place of `opened`: random
+    /// bytes; the refusal of `opened` damaged, if it is one; a random message; or an error of the
+    /// room with a random code.
+    fn refusal(&mut self, room_id: &RoomId, opened: &EventStream) -> Option<Vec<u8>> {
+        let rng = &mut self.rng;
+        if !rng.chance(1, 5) {
+            return None;
+        }
+        Some(match (rng.below(4), opened) {
+            (0, _) => rng.bytes_below(256),
+            (1, EventStream::Refused(refusal)) => {
+                let mut bytes = refusal.clone();
+                generators::mutate(rng, &mut bytes, PROTOCOL_HEADER_LEN, &self.pool);
+                bytes
+            }
+            (1 | 2, _) => encode_message(&generators::server_message(rng, &self.codes)).unwrap(),
+            _ => encode_message(&ServerMessage::Error {
+                correlation_id: None,
+                room_id: Some(room_id.clone()),
+                code: *rng.pick(&self.codes),
+                message: "Fabricated".to_string(),
+            })
+            .unwrap(),
+        })
+    }
+}
+
+/// The block of an `ops` event with `frame` as its data, as the server writes it.
+fn ops_block(frame: &[u8]) -> Vec<u8> {
+    format!("event: ops\ndata: {}\n\n", STANDARD.encode(frame)).into_bytes()
+}
+
+/// The `ops` event that `block` is, as the server writes it.
+fn ops_event(block: &[u8]) -> Option<ServerMessage> {
+    let data = block.strip_prefix(b"event: ops\ndata: ")?;
+    let end = data.iter().position(|&byte| byte == b'\n')?;
+    let frame = STANDARD.decode(&data[..end]).ok()?;
+    let event = decode_message(&frame).ok()?;
+    matches!(event, ServerMessage::OpsEvent { .. }).then_some(event)
+}
+
+/// `event`, an `ops` event, with another operation of `pool` at each of its sequences, if `pool`
+/// has another one for each: operations of the room that the log does not have there.
+fn forged(
+    rng: &mut generators::Rng,
+    event: &ServerMessage,
+    pool: &[Operation],
+) -> Option<ServerMessage> {
+    let mut forged = event.clone();
+    let ServerMessage::OpsEvent { ops, .. } = &mut forged else {
+        return None;
+    };
+    for op in ops {
+        let others: Vec<&Operation> = pool.iter().filter(|other| **other != op.op).collect();
+        if others.is_empty() {
+            return None;
+        }
+        op.op = (*rng.pick(&others)).clone();
+    }
+    Some(forged)
+}
+
+/// Random bytes, mostly pieces of the syntax of an event stream, numbers, and the frames of
+/// `pool` in base64.
+fn random_stream(rng: &mut generators::Rng, pool: &[Vec<u8>]) -> Vec<u8> {
+    const PIECES: [&[u8]; 15] = [
+        b"data:",
+        b"data: ",
+        b"event: ",
+        b"ops",
+        b"head_advanced",
+        b"snapshot_available",
+        b"lagged",
+        b"\n",
+        b"\r",
+        b"\r\n",
+        b"\n\n",
+        b":",
+        b" ",
+        b"=",
+        b"\xc3\xb1",
+    ];
+    let mut bytes = Vec::new();
+    for _ in 0..rng.below(100) {
+        match rng.below(10) {
+            0 => bytes.push(rng.next_u64() as u8),
+            1 => bytes.extend(STANDARD.encode(rng.pick(pool)).bytes()),
+            2 => bytes.extend(rng.u64().to_string().bytes()),
+            _ => {
+                let piece: &&[u8] = rng.pick(&PIECES);
+                bytes.extend_from_slice(piece)
+            }
+        }
+    }
+    bytes
+}
+
+/// An event of the stream other than `ops`, or of a name the client does not know, with random
+/// data: a number, text or nothing.
+fn random_event(rng: &mut generators::Rng) -> Vec<u8> {
+    const NAMES: [&str; 6] = [
+        "head_advanced",
+        "snapshot_available",
+        "schema_reloaded",
+        "snapshot_wanted",
+        "lagged",
+        "unknown",
+    ];
+    let name = rng.pick(&NAMES);
+    let data = match rng.below(3) {
+        0 => rng.u64().to_string(),
+        1 => generators::text(rng, 16),
+        _ => String::new(),
+    };
+    format!("event: {name}\ndata: {data}\n\n").into_bytes()
+}
+
+/// The lines of an event stream as a client reads them: a line feed, a carriage return or both
+/// end each one. The part of a line longer than a client reads is left out.
+#[derive(Clone, Default)]
+struct Lines {
+    /// The line in progress, and whether it is longer than a client reads.
+    line: Vec<u8>,
+    long: bool,
+}
+
+impl Lines {
+    /// The lines that `block` ends, after what came before it, except those longer than a
+    /// client reads.
+    fn read(&mut self, block: &[u8]) -> Vec<Vec<u8>> {
+        let mut ended = Vec::new();
+        for &byte in block {
+            match byte {
+                b'\n' | b'\r' => {
+                    let line = std::mem::take(&mut self.line);
+                    if !std::mem::take(&mut self.long) {
+                        ended.push(line);
+                    }
+                }
+                _ if self.long => {}
+                _ if self.line.len() == EVENT_LIMIT => {
+                    self.line.clear();
+                    self.long = true;
+                }
+                _ => self.line.push(byte),
+            }
+        }
+        ended
+    }
+}
+
+/// Whether `line`, of the event stream of `room_id`, is the data of an `ops` event that the
+/// client cannot tell from one of the server's, in place of an event with `real`, the operations
+/// of the server: of the room, with operations in order that reach its head, of an incarnation
+/// not in `forged`, since the client takes those of the room for its own, and with operations
+/// from one of its sequences on, those after the head of a replica, that validate with a schema
+/// of `schemas` and bring some other than those of `real`: the client drops what its replica
+/// holds and validates the rest. Its name, and the other lines of its event, are not looked at:
+/// an event with more than one `data` line is not base64.
+fn event_lies(
+    line: &[u8],
+    room_id: &RoomId,
+    real: &[SequencedOperation],
+    forged: &HashSet<u128>,
+    schemas: &[Schema],
+) -> bool {
+    let Some(data) = line.strip_prefix(b"data:") else {
+        return false;
+    };
+    let data = data.strip_prefix(b" ").unwrap_or(data);
+    let Ok(frame) = STANDARD.decode(data) else {
+        return false;
+    };
+    let Ok(ServerMessage::OpsEvent {
+        room_id: of,
+        room_incarnation,
+        head_seq,
+        ops,
+        ..
+    }) = decode_message(&frame)
+    else {
+        return false;
+    };
+    let in_order =
+        (ops.windows(2)).all(|pair| pair[0].seq.get().checked_add(1) == Some(pair[1].seq.get()));
+    let whole = in_order
+        && ops.first().is_some_and(|op| op.seq.get() > 0)
+        && ops.last().is_some_and(|op| op.seq == head_seq);
+    let validates = |ops: &[SequencedOperation]| {
+        let valid =
+            |schema: &Schema| (ops.iter()).all(|op| schema.validate_operation(&op.op).is_ok());
+        schemas.iter().any(valid)
+    };
+    // What the client applies after the head of its replica, from any of its sequences.
+    let forges = |from: usize| {
+        let applied = &ops[from..];
+        applied.iter().any(|op| !real.contains(op)) && validates(applied)
+    };
+    of == *room_id && whole && !forged.contains(&room_incarnation) && (0..ops.len()).any(forges)
 }
 
 /// Whether `bytes` hold `needle`.
@@ -668,20 +1022,25 @@ impl Drop for Opening {
 /// The `lagged` event, as the server writes it for events that a stream missed.
 const LAGGED: &[u8] = b"event: lagged\ndata: true\n\n";
 
-/// `blocks`, the event stream that `token` of client `client` opened, with the faults that `net`
-/// injects at each block while it is faulty: a block lost, or late, with those after it; `lagged`
-/// in its place; the connection cut; a stream that goes silent; or its token that expires, which
-/// ends it. The stream of a client without network is cut. It counts the `ops` events that reach
-/// the client, and those of a client of the facade if it is one.
+/// The longest event, and so the longest line, that a client reads from an event stream.
+const EVENT_LIMIT: usize = 64 << 10;
+
+/// `blocks`, the event stream of `room_id` that `token` of client `client` opened, with the faults
+/// that `net` injects at each block while it is faulty: a block lost, or late, with those after
+/// it; `lagged` in its place; the connection cut; a stream that goes silent; or its token that
+/// expires, which ends it. While the network fuzzes, another block in place of some
+/// ([`Network::fuzzed_block`]). The stream of a client without network is cut. It counts the
+/// `ops` events of the server that reach the client, and those of a client of the facade if it
+/// is one.
 fn faulty_blocks(
     blocks: EventBlocks,
     net: Arc<Network>,
-    (client, token, facade): (usize, String, bool),
+    (room_id, client, token, facade): (RoomId, usize, String, bool),
 ) -> EventBlocks {
-    let blocks = futures::stream::unfold(Some(blocks), move |blocks| {
-        let (net, token) = (Arc::clone(&net), token.clone());
+    let blocks = futures::stream::unfold(Some((blocks, Lines::default())), move |state| {
+        let (net, room_id, token) = (Arc::clone(&net), room_id.clone(), token.clone());
         async move {
-            let mut blocks = blocks?;
+            let (mut blocks, mut lines) = state?;
             loop {
                 let block = blocks.next().await?;
                 if net.offline(client) {
@@ -692,7 +1051,7 @@ fn faulty_blocks(
                     let faulty = net.faulty.load(Ordering::SeqCst);
                     (faulty.then(|| rng.below(100)), rng.below(3000))
                 };
-                match fault {
+                let block = match fault {
                     (Some(0 | 1), _) => {
                         net.injected("event lost");
                         continue;
@@ -700,10 +1059,11 @@ fn faulty_blocks(
                     (Some(2 | 3), delay) => {
                         net.injected("event late");
                         tokio::time::sleep(Duration::from_millis(delay)).await;
+                        block
                     }
                     (Some(4), _) => {
                         net.injected("lagged");
-                        return Some((Ok(Bytes::from_static(LAGGED)), Some(blocks)));
+                        Ok(Bytes::from_static(LAGGED))
                     }
                     (Some(5), _) => {
                         net.injected("stream cut");
@@ -718,18 +1078,20 @@ fn faulty_blocks(
                         net.expire(&token);
                         return None;
                     }
-                    _ => {}
-                }
-                if block
-                    .as_ref()
-                    .is_ok_and(|block| block.starts_with(b"event: ops\n"))
-                {
+                    _ => block,
+                };
+                let Ok(block) = block else {
+                    return Some((block, Some((blocks, lines))));
+                };
+                let (block, fuzzed) = net.fuzzed_block(&room_id, &lines, block);
+                lines.read(&block);
+                if !fuzzed && block.starts_with(b"event: ops\n") {
                     net.ops.fetch_add(1, Ordering::SeqCst);
                     if facade {
                         net.saw("ops event to a client of the facade");
                     }
                 }
-                return Some((block, Some(blocks)));
+                return Some((Ok(block), Some((blocks, lines))));
             }
         }
     });
@@ -880,7 +1242,8 @@ impl TransportClient for Link {
 
     /// The event stream of `room_id`, which, if the transport is `faulty`, gets no response now
     /// and then, is refused for a token that expires or for a server without room for it, and
-    /// loses, delays and cuts its events ([`faulty_blocks`]).
+    /// loses, delays and cuts its events ([`faulty_blocks`]); and while the network fuzzes, gets
+    /// a refusal at random in place of some openings, and other blocks in place of some of its.
     async fn events(&self, room_id: &RoomId, token: &str) -> Result<EventStream, TransportError> {
         let net = &self.net;
         if net.down.load(Ordering::SeqCst) || net.offline(self.client) {
@@ -915,12 +1278,15 @@ impl TransportClient for Link {
         if let EventStream::Refused(refusal) = &opened {
             net.refused(refusal);
         }
-        Ok(match opened {
-            EventStream::Open(blocks) if self.faulty => {
-                let of = (self.client, token.to_string(), self.facade);
+        if !self.faulty {
+            return Ok(opened);
+        }
+        Ok(match net.fuzzed_opening(room_id, opened) {
+            EventStream::Open(blocks) => {
+                let of = (room_id.clone(), self.client, token.to_string(), self.facade);
                 EventStream::Open(faulty_blocks(blocks, Arc::clone(net), of))
             }
-            opened => opened,
+            refused => refused,
         })
     }
 }
@@ -1736,12 +2102,12 @@ struct Sim {
 impl Sim {
     /// A server with a room of the schema of `kind`, the archivist and four clients of the core: a
     /// disk and a memory one of each of two persons, those of the second with a worker if
-    /// `workers`, the one over the disk in `Live` and the other in a random mode. With `workers`,
-    /// also two clients of the facade, of two persons without another, each with its worker in a
-    /// random mode: one over the disk, with the `CryptoEngine` of the tests and without the
-    /// precheck, so that its writes of encrypted values go out also when its replica would reject
-    /// them, and one over memory, without it and with the precheck. The network fuzzes the replies
-    /// if `fuzz`.
+    /// `workers`, the one over the disk in `Live` and the other in a random mode. With `workers`
+    /// and without `fuzz`, also two clients of the facade, of two persons without another, each
+    /// with its worker in a random mode: one over the disk, with the `CryptoEngine` of the tests
+    /// and without the precheck, so that its writes of encrypted values go out also when its
+    /// replica would reject them, and one over memory, without it and with the precheck. The
+    /// network fuzzes the replies and the event streams if `fuzz`.
     async fn new(seed: u64, kind: Kind, fuzz: bool, workers: bool) -> Self {
         eprintln!(
             "Simulation of seed {seed} over {kind:?}, fuzzing: {fuzz}, with workers: {workers}: \
@@ -1803,7 +2169,7 @@ impl Sim {
             sim.join(person, disk, worker.filter(|_| workers), None)
                 .await;
         }
-        if workers {
+        if workers && !fuzz {
             let persons = match kind {
                 Kind::Random => ["A", "B"],
                 Kind::Ranking => ["C", "B"],
@@ -2812,8 +3178,8 @@ impl Sim {
     }
 
     /// Leaves the clients with a worker without network while the others write, until the log is
-    /// past their heads by ten sequences if `pruning`, or by one: once they are back, they are
-    /// behind the head. If `pruning`, the log is pruned too: those whose worker syncs by itself
+    /// past their heads, and its head before, by ten sequences if `pruning`, or by one: once they
+    /// are back, they are behind the head. If `pruning`, the log is pruned too: those whose worker syncs by itself
     /// are behind the log, most of them, and catch up from a snapshot that another client
     /// uploads, such as the archivist, at the head. A replica that is still of an earlier
     /// incarnation of the room (a client that crashed opens again from its metadata, and its
@@ -2824,8 +3190,9 @@ impl Sim {
             .filter(|(_, member)| member.worker.is_some())
             .map(|(index, _)| index)
             .collect();
-        // With their room open, as their application leaves it, so that their heads are known.
-        for &index in &workers {
+        // With their rooms open, as their applications leave them, so that the heads of the
+        // workers are known and the others write.
+        for index in 0..self.members.len() {
             self.opened(index).await;
         }
         self.run_workers().await;
@@ -2844,7 +3211,10 @@ impl Sim {
                 top = top.max(status.head_seq.get());
             }
         }
-        let past = top + if pruning { 10 } else { 1 };
+        // Past the head of the log too, which may be ahead of theirs, so that the writes seal a
+        // segment that the prune drops.
+        let head = self.incarnations.last().unwrap().log.len() as u64;
+        let past = top.max(head) + if pruning { 10 } else { 1 };
         let writers: Vec<usize> = (ARCHIVIST + 1..self.members.len())
             .filter(|index| !workers.contains(index))
             .collect();
@@ -2968,13 +3338,7 @@ impl Sim {
     /// happened meanwhile.
     async fn heal(&mut self) {
         self.net.faulty.store(false, Ordering::SeqCst);
-        // The replies in place of the server's may have left a replica waiting for a snapshot that
-        // the server does not announce, until its room opens again.
-        if self.net.fuzz.lock().unwrap().take().is_some() {
-            for member in &self.members[ARCHIVIST + 1..] {
-                let _ = member.device.close_room(&self.room).await;
-            }
-        }
+        self.unfuzz().await;
         self.rejoin().await;
         if self.workers {
             self.isolate(false).await;
@@ -3010,6 +3374,17 @@ impl Sim {
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
         panic!("The clients did not reach the head of the room");
+    }
+
+    /// Has the network fuzz no more. The replies in place of the server's may have left a replica
+    /// waiting for a snapshot that the server does not announce, until its room opens again: every
+    /// client but the archivist closes its room, which stops its worker.
+    async fn unfuzz(&mut self) {
+        if self.net.fuzz.lock().unwrap().take().is_some() {
+            for member in &self.members[ARCHIVIST + 1..] {
+                let _ = member.device.close_room(&self.room).await;
+            }
+        }
     }
 
     /// Opens the room in client `member` until it is open. Each attempt counts as an open without
@@ -3137,28 +3512,43 @@ const CASES: [&str; 14] = [
 /// streams and of the tokens, and how many times the checks saw each case of the facade.
 type Counts = BTreeMap<&'static str, usize>;
 
-/// A simulation of `steps` random steps over `kind`, fuzzing the replies if `fuzz`, and else with
-/// workers, with the network healed at the end: then some event with operations reached a client,
-/// and the event streams or their openings had faults; and the clients of the facade wrote, had
-/// streams checked and got events with operations, and the snapshots uploaded were decoded, and,
-/// over the reference app, a commit of the facade and a snapshot held its notes encrypted. Returns
-/// the faults that the network injected and the cases of the facade that the checks saw.
+/// What the network puts in place of blocks of the event streams while it fuzzes.
+const FUZZED: [&str; 9] = [
+    "random bytes",
+    "event damaged",
+    "frame damaged",
+    "endless line",
+    "random message",
+    "another room",
+    "another incarnation",
+    "random event",
+    "invalid operation",
+];
+
+/// A simulation of `steps` random steps over `kind`, with workers, fuzzing the replies and the
+/// event streams if `fuzz`, with the network healed at the end, once it fuzzes no more: then some
+/// event with operations of the server reached a client, the event streams or their openings had
+/// faults, and, fuzzing, other blocks took the place of some; and without fuzzing, the clients of
+/// the facade wrote, had streams checked and got events with operations, and the snapshots
+/// uploaded were decoded, and, over the reference app, a commit of the facade and a snapshot held
+/// its notes encrypted. Returns what the network injected (the faults of the event streams and of
+/// the tokens, and each block and refusal in place of the server's) and the cases of the facade
+/// that the checks saw.
 async fn simulate(seed: u64, kind: Kind, steps: usize, fuzz: bool) -> (Counts, Counts) {
-    let mut sim = Sim::new(seed, kind, fuzz, !fuzz).await;
+    let mut sim = Sim::new(seed, kind, fuzz, true).await;
     for step in 0..steps {
         sim.event(step).await;
         let plans = sim.plans();
         sim.step(&plans).await;
     }
-    if sim.workers {
-        sim.assign_modes().await;
-        sim.isolate(true).await;
-    }
+    sim.unfuzz().await;
+    sim.assign_modes().await;
+    sim.isolate(true).await;
     sim.heal().await;
+    let ops = sim.net.ops.load(Ordering::SeqCst);
+    assert!(ops > 0, "No event with operations reached a client");
     let cases = sim.net.cases.lock().unwrap().clone();
-    if sim.workers {
-        let ops = sim.net.ops.load(Ordering::SeqCst);
-        assert!(ops > 0, "No event with operations reached a client");
+    if !fuzz {
         let mut seen = vec![CASES[0], CASES[7], CASES[9], CASES[10]];
         if let Kind::Ranking = kind {
             seen.extend([CASES[6], CASES[8]]);
@@ -3176,11 +3566,31 @@ async fn simulate(seed: u64, kind: Kind, steps: usize, fuzz: bool) -> (Counts, C
         .iter()
         .filter_map(|fault| faults.get(fault))
         .sum::<usize>();
+    assert!(streams > 0, "No fault of an event stream: {faults:?}");
+    let fuzzed = FUZZED
+        .iter()
+        .filter_map(|kind| faults.get(kind))
+        .sum::<usize>();
     assert!(
-        fuzz || streams > 0,
-        "No fault of an event stream: {faults:?}"
+        !fuzz || fuzzed > 0,
+        "No block in place of the server's: {faults:?}"
     );
     (faults, cases)
+}
+
+/// Adds the counts of `faults` to `total`.
+fn add(total: &mut Counts, faults: Counts) {
+    for (fault, count) in faults {
+        *total.entry(fault).or_insert(0) += count;
+    }
+}
+
+/// Checks that `faults` has every one of `kinds`.
+fn every(faults: &Counts, kinds: &[&str]) {
+    for kind in kinds {
+        let happened = faults.get(kind).is_some_and(|count| *count > 0);
+        assert!(happened, "{kind}: {faults:?}");
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -3204,31 +3614,20 @@ async fn replicas_converge_over_many_long_simulations() {
     for seed in seeds(1, 16) {
         for kind in [Kind::Random, Kind::Ranking] {
             let (injected, seen) = simulate(seed, kind, 400, false).await;
-            for (counts, more) in [(&mut faults, injected), (&mut cases, seen)] {
-                for (name, count) in more {
-                    *counts.entry(name).or_insert(0) += count;
-                }
-            }
+            add(&mut faults, injected);
+            add(&mut cases, seen);
         }
     }
     // Every fault of the event streams and of the tokens, and a token that the provider gave
     // already expired, which the server refused; and every case of the facade.
-    for fault in FAULTS.iter().chain(&["token refused by the server"]) {
-        assert!(
-            faults.get(fault).is_some_and(|count| *count > 0),
-            "{fault}: {faults:?}"
-        );
-    }
-    for case in CASES {
-        assert!(
-            cases.get(case).is_some_and(|count| *count > 0),
-            "{case}: {cases:?}"
-        );
-    }
+    every(&faults, &FAULTS);
+    every(&faults, &["token refused by the server"]);
+    every(&cases, &CASES);
 }
 
 #[tokio::test(start_paused = true)]
-async fn no_reply_in_place_of_the_servers_panics_a_client_or_moves_its_replica_off_the_log() {
+async fn no_reply_or_event_in_place_of_the_servers_panics_a_client_or_moves_its_replica_off_the_log(
+) {
     for seed in seeds(0, 1) {
         simulate(seed, Kind::Random, 96, true).await;
         simulate(seed, Kind::Ranking, 96, true).await;
@@ -3237,11 +3636,16 @@ async fn no_reply_in_place_of_the_servers_panics_a_client_or_moves_its_replica_o
 
 #[tokio::test(start_paused = true)]
 #[ignore = "long-running simulation; run with --ignored in release"]
-async fn no_reply_in_place_of_the_servers_panics_a_client_over_many_long_simulations() {
+async fn no_reply_or_event_in_place_of_the_servers_panics_a_client_over_many_long_simulations() {
+    let mut faults = BTreeMap::new();
     for seed in seeds(1, 16) {
-        simulate(seed, Kind::Random, 400, true).await;
-        simulate(seed, Kind::Ranking, 400, true).await;
+        for kind in [Kind::Random, Kind::Ranking] {
+            add(&mut faults, simulate(seed, kind, 400, true).await.0);
+        }
     }
+    // Every kind of block in place of the server's, and a refusal at random.
+    every(&faults, &FUZZED);
+    every(&faults, &["refusal at random"]);
 }
 
 /// The scenarios of the reference app, over the faulty network: the members of a ranking vote and

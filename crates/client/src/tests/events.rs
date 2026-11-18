@@ -606,3 +606,158 @@ fn random_and_damaged_streams_are_read_without_panics_however_they_are_split_lon
         fuzz(seed, 2_000);
     }
 }
+
+/// The parser through the transport over HTTP, against a server of the test that writes the
+/// streams at random as the bodies of its responses.
+#[cfg(feature = "native")]
+mod over_http {
+    use super::*;
+    use crate::{EventStream, HttpTransport, HttpTransportConfig, TransportClient};
+    use std::io;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::mpsc;
+
+    /// How the server of the test frames the body of a stream.
+    #[derive(Debug, Clone, Copy)]
+    enum Framing {
+        /// In chunks, with its last one, or cut without it.
+        Chunked,
+        ChunkedCut,
+        /// With its length, whole, or cut before its end.
+        Length,
+        LengthCut,
+        /// Until the connection closes.
+        Close,
+    }
+
+    const FRAMINGS: [Framing; 5] = [
+        Framing::Chunked,
+        Framing::ChunkedCut,
+        Framing::Length,
+        Framing::LengthCut,
+        Framing::Close,
+    ];
+
+    /// Serves a stream on `listener` for each of `streams`, one connection each, in order.
+    async fn serve(listener: TcpListener, mut streams: mpsc::UnboundedReceiver<Stream>) {
+        while let Some((framing, pieces)) = streams.recv().await {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _ = write(socket, framing, &pieces).await;
+        }
+    }
+
+    /// How a stream is framed, and the pieces of its body.
+    type Stream = (Framing, Vec<Vec<u8>>);
+
+    /// Once the client of `socket` sent its request, writes a response with HTTP 200 whose body
+    /// is `pieces`, one piece at a time, framed with `framing`, and closes the connection. A
+    /// write after the client went away fails, and nothing more is written.
+    async fn write(mut socket: TcpStream, framing: Framing, pieces: &[Vec<u8>]) -> io::Result<()> {
+        let mut request = Vec::new();
+        while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+            let mut buf = [0; 1024];
+            let read = socket.read(&mut buf).await?;
+            if read == 0 {
+                return Ok(());
+            }
+            request.extend_from_slice(&buf[..read]);
+        }
+        let len: usize = pieces.iter().map(Vec::len).sum();
+        let framed = match framing {
+            Framing::Chunked | Framing::ChunkedCut => "transfer-encoding: chunked\r\n".to_string(),
+            Framing::Length => format!("content-length: {len}\r\n"),
+            Framing::LengthCut => format!("content-length: {}\r\n", len + 1),
+            Framing::Close => String::new(),
+        };
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\
+             {framed}\r\n"
+        );
+        socket.write_all(head.as_bytes()).await?;
+        let chunked = matches!(framing, Framing::Chunked | Framing::ChunkedCut);
+        for piece in pieces {
+            if chunked {
+                let size = format!("{:x}\r\n", piece.len());
+                socket.write_all(size.as_bytes()).await?;
+            }
+            socket.write_all(piece).await?;
+            if chunked {
+                socket.write_all(b"\r\n").await?;
+            }
+            socket.flush().await?;
+            tokio::task::yield_now().await;
+        }
+        if let Framing::Chunked = framing {
+            socket.write_all(b"0\r\n\r\n").await?;
+        }
+        socket.shutdown().await
+    }
+
+    /// Reads streams at random, and the events of the server damaged, through the transport
+    /// over HTTP, written by the server of the test in pieces of lengths at random, framed at
+    /// random: the reader gives the events of the model and its error, or else the end of the
+    /// stream, or an error of the transport where it was cut; and each event decodes or is a
+    /// typed error.
+    async fn fuzz_over_http(seed: u64, runs: usize) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (streams, planned) = mpsc::unbounded_channel();
+        let server = tokio::spawn(serve(listener, planned));
+        let transport = HttpTransport::new(HttpTransportConfig::new(url)).unwrap();
+        let mut rng = Rng(seed | 1);
+        for run in 0..runs {
+            let bytes = match run % 2 {
+                0 => random_stream(&mut rng),
+                _ => damaged_stream(&mut rng),
+            };
+            let framing = FRAMINGS[rng.below(FRAMINGS.len())];
+            let pieces = random_blocks(&mut rng, &bytes);
+            streams
+                .send((framing, pieces.into_iter().map(<[u8]>::to_vec).collect()))
+                .unwrap();
+            let opened = transport.events(&room(), "token").await;
+            let Ok(EventStream::Open(blocks)) = opened else {
+                panic!("Seed {seed}, run {run}: not opened");
+            };
+            let mut reader = EventReader::new(blocks);
+            let mut read = Vec::new();
+            let ended = loop {
+                match reader.next().await {
+                    Ok(Some(event)) => read.push(event),
+                    Ok(None) => break None,
+                    Err(err) => break Some(err),
+                }
+            };
+            let (events, failed) = model(&bytes);
+            let run = format!("Seed {seed}, run {run}, {framing:?}");
+            assert_eq!(read, events, "{run}");
+            match (failed, framing) {
+                (Some(failed), _) => assert_eq!(ended, Some(failed), "{run}"),
+                (None, Framing::ChunkedCut | Framing::LengthCut) => assert!(
+                    matches!(ended, Some(StreamError::Transport(_))),
+                    "{run}: {ended:?}"
+                ),
+                (None, _) => assert_eq!(ended, None, "{run}"),
+            }
+            for event in &read {
+                let _ = event.decode();
+            }
+        }
+        drop(streams);
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streams_at_random_are_read_through_the_http_transport_as_the_model_reads_them() {
+        fuzz_over_http(1, 100).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "long: run with --ignored"]
+    async fn streams_at_random_are_read_through_the_http_transport_as_the_model_reads_them_long() {
+        for seed in 1..=20 {
+            fuzz_over_http(seed, 500).await;
+        }
+    }
+}
