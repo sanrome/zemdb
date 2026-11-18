@@ -11,6 +11,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{Request, StatusCode};
 use axum::Router;
+use bincode::Options;
 use bytes::Bytes;
 use futures::StreamExt;
 use std::collections::VecDeque;
@@ -1577,6 +1578,23 @@ impl<E: StorageEngine> StorageEngine for TestEngine<E> {
             .apply_snapshot(room_id, schema, snapshot, expected_head_seq);
         applied.await
     }
+}
+
+/// The additional data of a cell, in the encoding that the facade fixes, as a member with the key
+/// builds them: their version, and then the room id, the table id, the values of the primary key
+/// and the position of the column, in the encoding of the protocol.
+pub fn additional_data(room_id: &RoomId, table_id: u16, pk: &[Value], column_idx: u16) -> Vec<u8> {
+    let mut data = vec![1];
+    let fields = (room_id.as_str(), table_id, pk, column_idx);
+    let encoding = bincode::DefaultOptions::new();
+    encoding.serialize_into(&mut data, &fields).unwrap();
+    data
+}
+
+/// `value` in the encoding of the protocol, as the facade encrypts the value of a cell, with its
+/// type.
+pub fn encoded(value: &Value) -> Vec<u8> {
+    bincode::DefaultOptions::new().serialize(value).unwrap()
 }
 
 /// The length of the tag of a ciphertext of a [`TestCrypto`].

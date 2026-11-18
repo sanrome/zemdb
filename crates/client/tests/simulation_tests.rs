@@ -26,6 +26,25 @@
 //! head of the room within a fixed number of intervals without a call of the test, and those in
 //! `Manual`, with a sync.
 //!
+//! With workers, two clients also go through the facade, of two persons without another client of
+//! the facade: one with the `CryptoEngine` of the tests and one without it, whose writes and reads
+//! of an encrypted column are `Crypto`; each with its worker, in a random mode, the first without
+//! the precheck and the second with it. They write what the others write, by the names of the
+//! columns, with the plaintext of each encrypted value, which carries a mark, and now and then with
+//! the owner column, which the facade does not send; and they open and drop `watch` and
+//! `watch_scan` streams of random keys and ranges, each read by a task of its own, as an
+//! application reads it. The core of the others writes the encrypted notes of the reference app
+//! encrypted, as a member with the key does. After each step, also:
+//! - every operation that a client of the facade sent declares the owner of its client;
+//! - no request holds the mark, nor the snapshot of an upload, decoded;
+//! - each write of the facade ended as a write of the core does, and one that the facade decides
+//!   locally (`PrecheckFailed`, `Offline`, `InvalidOperation`, `Crypto`, `FailedClosed`) sent
+//!   nothing; one with the owner column, also of the owner of the client, or with a key of another
+//!   owner is `InvalidOperation`;
+//! - with the streams read until they hold still, the last element of each is the value of a
+//!   direct read, or an error after it, of a state in between; no stream gave its last value
+//!   again; and the status of the room counts the subscriptions of the streams alive.
+//!
 //! Fuzzing, the network also puts other replies in place of some of the server's: random bytes,
 //! the reply damaged, random messages, errors of the request, and snapshots that match their hash
 //! but install with no schema of the room, or announced larger than the limit of the clients. None
@@ -57,10 +76,11 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{Method, Request};
 use bytes::Bytes;
 use common::{
-    error_reply, options, refused, request, Issue, TestServer, TestTokens, TestTransport,
-    ADMIN_SECRET, AUTH_SECRET,
+    additional_data, encoded, error_reply, options, refused, request, Issue, TestCrypto,
+    TestServer, TestTokens, TestTransport, ADMIN_SECRET, AUTH_SECRET,
 };
 use futures::future::join_all;
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use oracle::{Oracle, Reason, Rows};
 use rng::Rng;
@@ -69,16 +89,19 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::future::{poll_fn, Future};
 use std::io;
+use std::ops::Bound;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::{tempdir, TempDir};
+use tokio::task::JoinHandle;
 use tower::ServiceExt;
 use zemdb_client::{
-    Client, ClientConfig, ClientError, EventBlocks, EventStream, FileMetadata, Freshness,
-    MemoryMetadata, MetadataStore, RoomMetadata, TransportClient, TransportError, Violation,
+    Client, ClientConfig, ClientError, Direction, EventBlocks, EventStream, FileMetadata,
+    Freshness, Key, MemoryMetadata, MetadataStore, RoomHandle, RoomMetadata, RoomStatus, Row, Scan,
+    TableHandle, TransportClient, TransportError, Violation, ZemdbClient,
 };
 use zemdb_core::protocol::PROTOCOL_MAGIC;
 use zemdb_core::*;
@@ -90,6 +113,15 @@ use zemdb_storage::{
 
 /// The index of the archivist among the clients.
 const ARCHIVIST: usize = 0;
+
+/// The room of the simulation, which keeps its id when it is created again.
+const ROOM: &str = "room-sim";
+
+/// The mark that the plaintext of each encrypted value carries, which no request holds.
+const MARK: &[u8] = b"NOTES-IN-THE-CLEAR";
+
+/// The most `watch` streams that a client of the facade keeps at once.
+const WATCHES: usize = 4;
 
 /// The model is copied every this many sequences.
 const COPIES: usize = 16;
@@ -148,12 +180,22 @@ struct Commits {
 struct Record {
     /// The operations that reached the archivist, in the incarnation of the room it follows.
     log: BTreeMap<u64, Operation>,
-    /// The commits of each write, by the timestamp of its operation.
-    commits: HashMap<u64, Commits>,
+    /// The commits of each write, by its client and the timestamp of its operation: a tag of its
+    /// own in a write of the core, and the wall clock in one of the facade, which writes once per
+    /// step at most, a millisecond after the step before. Two clients of the facade write the same
+    /// operation only in a table without an owner, which one of them writes at most in a step:
+    /// elsewhere, each operation declares the owner of its client.
+    commits: HashMap<(usize, u64), Commits>,
+    /// The operations that each client of the facade sent in the step, by their mutation ids.
+    sent: HashMap<usize, BTreeMap<MutationId, Operation>>,
     /// How many chunks of a snapshot each client received, and how many chunks of its uploads the
     /// relay took, whether their reply reached it or not.
     downloads: HashMap<usize, u64>,
     uploads: HashMap<usize, u64>,
+    /// The chunks sent of each snapshot uploaded, by its hash, until they are all there, and the
+    /// hashes of the snapshots decoded.
+    uploaded: HashMap<[u8; 32], BTreeMap<u32, Bytes>>,
+    decoded: HashSet<[u8; 32]>,
 }
 
 /// The network between the clients and the server: the transport to the server, which a restart
@@ -177,6 +219,11 @@ struct Network {
     offline: Mutex<HashSet<usize>>,
     /// How many times it injected each fault of the event streams and of the tokens.
     faults: Mutex<BTreeMap<&'static str, usize>>,
+    /// How many times the checks saw each case of the facade.
+    cases: Mutex<BTreeMap<&'static str, usize>>,
+    /// The mark as the `CryptoEngine` of the tests encrypts it in a value, which the requests and
+    /// the snapshots of the encrypted values hold.
+    sealed_mark: Vec<u8>,
     fuzz: Mutex<Option<Fuzz>>,
     record: Mutex<Record>,
     /// The schemas of the room so far, and the hashes of the snapshots announced larger than
@@ -200,7 +247,7 @@ impl Network {
                 },
                 reply,
             ) => {
-                let commits = record.commits.get_mut(&op.timestamp()).unwrap();
+                let commits = record.commits.get_mut(&(client, op.timestamp())).unwrap();
                 match reply {
                     ServerMessage::CommitAck {
                         mutation_id: acked,
@@ -276,6 +323,62 @@ impl Network {
     /// Counts an injection of `fault`.
     fn injected(&self, fault: &'static str) {
         *self.faults.lock().unwrap().entry(fault).or_default() += 1;
+    }
+
+    /// Counts a `case` of the facade that the checks saw.
+    fn saw(&self, case: &'static str) {
+        *self.cases.lock().unwrap().entry(case).or_default() += 1;
+    }
+
+    /// Checks that `message`, which client `client` sends, does not hold the mark, nor the snapshot
+    /// it uploads, decoded once each of its chunks was sent: the plaintext of an encrypted value
+    /// never goes out. It counts the commits of the facade, and the snapshots, that hold a value
+    /// encrypted: the encrypted values go out, encrypted.
+    fn check_sealed(&self, client: usize, facade: bool, message: &ClientMessage) {
+        let bytes = encode_message(message).unwrap();
+        assert!(
+            !holds(&bytes, MARK),
+            "Client {client} sends the plaintext of an encrypted value: {message:?}"
+        );
+        if facade
+            && matches!(message, ClientMessage::Commit { .. })
+            && holds(&bytes, &self.sealed_mark)
+        {
+            self.saw("commit with a value encrypted");
+        }
+        let ClientMessage::UploadSnapshotChunk {
+            chunk_index,
+            total_chunks,
+            snapshot_hash,
+            data,
+            ..
+        } = message
+        else {
+            return;
+        };
+        let snapshot = {
+            let mut record = self.record.lock().unwrap();
+            if record.decoded.contains(snapshot_hash) {
+                return;
+            }
+            let chunks = record.uploaded.entry(*snapshot_hash).or_default();
+            chunks.insert(*chunk_index, data.clone());
+            if chunks.len() < *total_chunks as usize {
+                return;
+            }
+            let chunks = record.uploaded.remove(snapshot_hash).unwrap();
+            record.decoded.insert(*snapshot_hash);
+            chunks.into_values().flatten().collect::<Vec<u8>>()
+        };
+        let payload = decode_snapshot_envelope(&snapshot).unwrap();
+        assert!(
+            !holds(&payload, MARK),
+            "Client {client} uploads a snapshot with the plaintext of an encrypted value"
+        );
+        self.saw("snapshot uploaded, decoded");
+        if holds(&payload, &self.sealed_mark) {
+            self.saw("snapshot with a value encrypted");
+        }
     }
 
     /// Counts `reply`, of the server, if it refuses the token of its request: one that the token
@@ -497,6 +600,39 @@ impl Fuzz {
     }
 }
 
+/// Whether `bytes` hold `needle`.
+fn holds(bytes: &[u8], needle: &[u8]) -> bool {
+    bytes.windows(needle.len()).any(|window| window == needle)
+}
+
+/// The plaintext of an encrypted value: a note with the mark, `n` after it.
+fn note(n: u64) -> Value {
+    let mut note = String::from_utf8(MARK.to_vec()).unwrap();
+    note.push_str(&format!(" {n}"));
+    Value::String(note.into())
+}
+
+/// The mark as the `CryptoEngine` of the tests encrypts it in a note: the plaintext of a note,
+/// with its type, is the encoding of the protocol of its value, which puts the mark at the same
+/// place in each, and the `CryptoEngine` masks each byte by its place alone.
+fn sealed_mark() -> Vec<u8> {
+    let plaintext = encoded(&note(0));
+    let at = (plaintext.windows(MARK.len()))
+        .position(|window| window == MARK)
+        .unwrap();
+    let ciphertext = TestCrypto::seal(b"", &plaintext);
+    let tag = ciphertext.len() - plaintext.len();
+    let sealed = ciphertext[tag + at..tag + at + MARK.len()].to_vec();
+    assert_eq!(
+        encoded(&note(u64::MAX))
+            .windows(MARK.len())
+            .position(|w| w == MARK),
+        Some(at)
+    );
+    assert_ne!(sealed, MARK);
+    sealed
+}
+
 /// No response to a request.
 fn lost() -> TransportError {
     TransportError("Lost".to_string())
@@ -536,11 +672,11 @@ const LAGGED: &[u8] = b"event: lagged\ndata: true\n\n";
 /// injects at each block while it is faulty: a block lost, or late, with those after it; `lagged`
 /// in its place; the connection cut; a stream that goes silent; or its token that expires, which
 /// ends it. The stream of a client without network is cut. It counts the `ops` events that reach
-/// the client.
+/// the client, and those of a client of the facade if it is one.
 fn faulty_blocks(
     blocks: EventBlocks,
     net: Arc<Network>,
-    (client, token): (usize, String),
+    (client, token, facade): (usize, String, bool),
 ) -> EventBlocks {
     let blocks = futures::stream::unfold(Some(blocks), move |blocks| {
         let (net, token) = (Arc::clone(&net), token.clone());
@@ -589,6 +725,9 @@ fn faulty_blocks(
                     .is_ok_and(|block| block.starts_with(b"event: ops\n"))
                 {
                     net.ops.fetch_add(1, Ordering::SeqCst);
+                    if facade {
+                        net.saw("ops event to a client of the facade");
+                    }
                 }
                 return Some((block, Some(blocks)));
             }
@@ -600,12 +739,15 @@ fn faulty_blocks(
 /// The transport of client `client` over the network, which loses, delays and repeats its
 /// requests, answers some with `Unavailable`, expires their tokens, and fuzzes their replies, if
 /// it is `faulty`; and which loses, delays and cuts the events of its streams. It checks that no
-/// download goes past the first chunk of a snapshot larger than the limit.
+/// download goes past the first chunk of a snapshot larger than the limit, that no request holds
+/// the plaintext of an encrypted value ([`Network::check_sealed`]), and, for a client of the
+/// `facade`, that each operation it sends declares the owner of its client.
 #[derive(Clone)]
 struct Link {
     net: Arc<Network>,
     client: usize,
     faulty: bool,
+    facade: bool,
 }
 
 impl fmt::Debug for Link {
@@ -628,6 +770,24 @@ impl TransportClient for Link {
             let oversized = net.oversized.lock().unwrap().contains(hash);
             assert!(!oversized, "A snapshot larger than the limit is downloaded");
         }
+        net.check_sealed(self.client, self.facade, message);
+        if let ClientMessage::Commit { op, client_id, .. } = message {
+            // The owner column is the same in every schema of the room.
+            let owner = match self.facade {
+                true => net
+                    .schemas
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .check_owner(op, client_id),
+                false => Ok(()),
+            };
+            assert!(
+                owner.is_ok(),
+                "{client_id}, of the facade, sends {op:?}, with another owner"
+            );
+        }
         let (fault, delay) = {
             let mut rng = net.rng.lock().unwrap();
             let faulty = self.faulty && net.faulty.load(Ordering::SeqCst);
@@ -641,9 +801,16 @@ impl TransportClient for Link {
         } = message
         {
             let mut record = net.record.lock().unwrap();
-            let commits = record.commits.entry(op.timestamp()).or_default();
+            let commits = record
+                .commits
+                .entry((self.client, op.timestamp()))
+                .or_default();
             commits.sent += 1;
             commits.ids.insert((*mutation_id, client_id.clone()));
+            if self.facade {
+                let sent = record.sent.entry(self.client).or_default();
+                sent.insert(*mutation_id, op.clone());
+            }
         }
         let deliver = || async {
             // A server that restarts takes nothing, and a client without network sends nothing.
@@ -750,7 +917,7 @@ impl TransportClient for Link {
         }
         Ok(match opened {
             EventStream::Open(blocks) if self.faulty => {
-                let of = (self.client, token.to_string());
+                let of = (self.client, token.to_string(), self.facade);
                 EventStream::Open(faulty_blocks(blocks, Arc::clone(net), of))
             }
             opened => opened,
@@ -795,11 +962,22 @@ impl MetadataStore for Shared {
     }
 }
 
-/// A client of the simulation, over a memory engine or the disk engine of its directory.
+/// What a client of the facade has: the `CryptoEngine` of the tests, or none, and the precheck, or
+/// not.
+#[derive(Debug, Clone, Copy)]
+struct Through {
+    crypto: bool,
+    precheck: bool,
+}
+
+/// A client of the simulation, over a memory engine or the disk engine of its directory, of the
+/// core or of the facade.
 struct Member {
     person: &'static str,
     dir: Option<TempDir>,
-    client: Arc<Client>,
+    device: Device,
+    /// What it has, if it is a client of the facade.
+    facade: Option<Through>,
     /// Its engine, which the checks read too.
     storage: Arc<dyn StorageEngine>,
     metadata: Shared,
@@ -807,7 +985,8 @@ struct Member {
     /// told to give one already expired, until the client asks for it.
     tokens: TestTokens,
     expiring: Option<usize>,
-    /// The mode of the worker of its room, if it runs one.
+    /// The mode of the worker of its room, if it runs one: the mode of the room, in a client of the
+    /// facade, whose worker runs in `Live` while a room in `Periodic` is watched.
     worker: Option<Freshness>,
     /// The incarnation of its metadata when it opened, the last one if it had none, and the
     /// opens of the room that may discard it: its epoch counts no discard but one per such open
@@ -835,30 +1014,300 @@ impl Member {
     }
 }
 
-/// A client of `person` over `storage`, `metadata`, `link` and `tokens`, with `storage` for the
-/// checks.
-async fn client<S: StorageEngine + Clone + 'static>(
-    person: &str,
+/// A client of the simulation: one of the core, which the steps call through its low-level API,
+/// or one of the facade.
+enum Device {
+    Core(Arc<Client>),
+    Facade(Facade),
+}
+
+impl Device {
+    fn client_id(&self) -> ClientId {
+        match self {
+            Self::Core(client) => client.client_id(),
+            Self::Facade(facade) => facade.client.client_id(),
+        }
+    }
+
+    fn facade(&self) -> Option<&Facade> {
+        match self {
+            Self::Core(_) => None,
+            Self::Facade(facade) => Some(facade),
+        }
+    }
+
+    async fn status(&self, room_id: &RoomId) -> Result<RoomStatus, ClientError> {
+        match self {
+            Self::Core(client) => client.status(room_id.clone()).await,
+            Self::Facade(facade) => facade.handle(room_id)?.status().await,
+        }
+    }
+
+    async fn sync(&self, room_id: &RoomId) -> Result<(), ClientError> {
+        match self {
+            Self::Core(client) => client.sync(room_id.clone()).await,
+            Self::Facade(facade) => facade.handle(room_id)?.sync().await,
+        }
+    }
+
+    /// A heartbeat of the core: the worker of a client of the facade sends its heartbeats.
+    async fn heartbeat(&self, room_id: &RoomId) -> Result<(), ClientError> {
+        match self {
+            Self::Core(client) => client.heartbeat(room_id.clone()).await,
+            Self::Facade(_) => unreachable!("A client of the facade has no heartbeats of its own"),
+        }
+    }
+
+    /// A write of the core, of `op` as it is.
+    async fn write(&self, room_id: &RoomId, op: &Operation) -> Result<(), ClientError> {
+        match self {
+            Self::Core(client) => client.write(room_id.clone(), op.clone()).await,
+            Self::Facade(_) => unreachable!("A client of the facade writes by the names"),
+        }
+    }
+
+    async fn close_room(&self, room_id: &RoomId) -> Result<(), ClientError> {
+        match self {
+            Self::Core(client) => client.close_room(room_id.clone()).await,
+            Self::Facade(facade) => facade.handle(room_id)?.close().await,
+        }
+    }
+
+    /// Opens `room_id`: in the core with a token of its own ([`open_room`]), and in the facade with
+    /// one of its token provider, which starts its worker.
+    async fn open_room(&self, room_id: &RoomId) -> Result<(), ClientError> {
+        match self {
+            Self::Core(client) => open_room(client, room_id).await,
+            Self::Facade(facade) => facade.open(room_id).await,
+        }
+    }
+
+    /// Sets the mode of the worker of `room_id` to `freshness`: the core starts the worker in it if
+    /// it has none that runs, and the facade sets the mode of the room, which its worker takes if
+    /// it runs.
+    async fn set_freshness(
+        &self,
+        room_id: &RoomId,
+        freshness: Freshness,
+    ) -> Result<(), ClientError> {
+        match self {
+            Self::Core(client) => client.set_freshness(room_id.clone(), freshness).await,
+            Self::Facade(facade) => {
+                facade.handle(room_id)?.set_freshness(freshness);
+                Ok(())
+            }
+        }
+    }
+
+    /// Runs the worker of `room_id` in `freshness`, as an application does: the core starts it, or
+    /// sets its mode; the facade sets the mode of the room, and, if its room is open without a
+    /// worker that runs, gets its handle again, which starts one.
+    async fn run_worker(&self, room_id: &RoomId, freshness: Freshness) -> Result<(), ClientError> {
+        self.set_freshness(room_id, freshness).await?;
+        let Self::Facade(facade) = self else {
+            return Ok(());
+        };
+        let status = facade.handle(room_id)?.status().await?;
+        match status.worker.is_some_and(|worker| worker.running) {
+            true => Ok(()),
+            false => facade.open(room_id).await,
+        }
+    }
+}
+
+/// A client of the facade: the handle of its room once it opened it, which reaches the room as the
+/// client has it at each call, and its `watch` streams.
+struct Facade {
+    client: ZemdbClient,
+    room: OnceLock<RoomHandle>,
+    watches: Mutex<Vec<Watcher>>,
+}
+
+impl Facade {
+    fn new(client: ZemdbClient) -> Self {
+        Self {
+            client,
+            room: OnceLock::new(),
+            watches: Mutex::default(),
+        }
+    }
+
+    /// The handle of `room_id`, or `RoomClosed` if it never opened it.
+    fn handle(&self, room_id: &RoomId) -> Result<&RoomHandle, ClientError> {
+        self.room
+            .get()
+            .ok_or_else(|| ClientError::RoomClosed(room_id.clone()))
+    }
+
+    async fn open(&self, room_id: &RoomId) -> Result<(), ClientError> {
+        let handle = self.client.room(room_id.clone()).await?;
+        let _ = self.room.set(handle);
+        Ok(())
+    }
+
+    /// Writes `call` in `room_id`.
+    async fn write(&self, room_id: &RoomId, call: &Call) -> Result<(), ClientError> {
+        let room = self.handle(room_id)?;
+        match call {
+            Call::Insert(table, row) => room.table(table)?.insert(row).await.map(drop),
+            Call::Update(table, key, changes) => room.table(table)?.update(key, changes).await,
+            Call::Delete(table, key) => room.table(table)?.delete(key).await,
+        }
+    }
+
+    /// Opens the stream of `watch` in `room_id`, and drops the oldest if it has [`WATCHES`].
+    fn watch(&self, room_id: &RoomId, watch: &Watch) -> Result<(), ClientError> {
+        let room = self.handle(room_id)?;
+        let watched = match watch {
+            Watch::Row(table, key) => Watched::Row(room.table(table)?, key.clone()),
+            Watch::Rows(table, scan) => Watched::Rows(room.table(table)?, scan.clone()),
+        };
+        let watcher = Watcher::new(watched);
+        let mut watches = self.watches.lock().unwrap();
+        if watches.len() == WATCHES {
+            watches.remove(0);
+        }
+        watches.push(watcher);
+        Ok(())
+    }
+
+    /// Drops the stream `n` modulo how many it has, if it has one.
+    fn unwatch(&self, n: usize) {
+        let mut watches = self.watches.lock().unwrap();
+        if !watches.is_empty() {
+            let n = n % watches.len();
+            watches.remove(n);
+        }
+    }
+}
+
+/// A write of a step, as the checks take it: of the core, of its operation, tagged; or of the
+/// facade, with what makes the facade refuse it, if any.
+enum Written<'a> {
+    Core(&'a Operation),
+    Facade(Option<&'static str>),
+}
+
+/// A write of a client of the facade, by the names of the columns: an insert of a row, an update
+/// of the row of a key with some changes, or a delete of the row of a key, in a table.
+#[derive(Debug, Clone)]
+enum Call {
+    Insert(String, Row),
+    Update(String, Key, Row),
+    Delete(String, Key),
+}
+
+/// What a `watch` of a client of the facade reads: the row of a key, or the rows of a scan, of a
+/// table.
+#[derive(Debug, Clone)]
+enum Watch {
+    Row(String, Key),
+    Rows(String, Scan),
+}
+
+/// A [`Watch`] of a table of a room.
+#[derive(Debug, Clone)]
+enum Watched {
+    Row(TableHandle, Key),
+    Rows(TableHandle, Scan),
+}
+
+impl Watched {
+    /// The stream of its values, as rows.
+    fn stream(&self) -> BoxStream<'static, Result<Vec<Row>, ClientError>> {
+        match self {
+            Self::Row(table, key) => {
+                let rows = |row: Option<Row>| -> Vec<Row> { row.into_iter().collect() };
+                table.watch(key).map(move |row| row.map(rows)).boxed()
+            }
+            Self::Rows(table, scan) => table.watch_scan(scan).boxed(),
+        }
+    }
+
+    /// What a direct read of the replica gives, as its stream reads it.
+    async fn read(&self) -> Result<Vec<Row>, ClientError> {
+        match self {
+            Self::Row(table, key) => Ok(table.get(key).await?.into_iter().collect()),
+            Self::Rows(table, scan) => table.scan(scan).await,
+        }
+    }
+}
+
+/// What the stream of a watch gave: how many elements, the last, and its last value; whether it
+/// gave a value equal to the one before, and whether it ended.
+#[derive(Default)]
+struct Seen {
+    elements: usize,
+    last: Option<Result<Vec<Row>, ClientError>>,
+    value: Option<Vec<Row>>,
+    repeated: bool,
+    ended: bool,
+}
+
+/// A `watch` or a `watch_scan` of a client of the facade, whose stream a task of its own reads, as
+/// an application reads it, until the watch is dropped, which drops the stream at any `.await`.
+struct Watcher {
+    watched: Watched,
+    seen: Arc<Mutex<Seen>>,
+    task: JoinHandle<()>,
+}
+
+impl Watcher {
+    /// Subscribes the stream of `watched` now, and starts the task that reads it.
+    fn new(watched: Watched) -> Self {
+        let mut stream = watched.stream();
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let shared = Arc::clone(&seen);
+        let task = tokio::spawn(async move {
+            while let Some(element) = stream.next().await {
+                let mut seen = shared.lock().unwrap();
+                seen.elements += 1;
+                if let Ok(rows) = &element {
+                    seen.repeated |= seen.value.as_ref() == Some(rows);
+                    seen.value = Some(rows.clone());
+                }
+                seen.last = Some(element);
+            }
+            shared.lock().unwrap().ended = true;
+        });
+        Self {
+            watched,
+            seen,
+            task,
+        }
+    }
+}
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The client of `person` over `storage`, `metadata`, `link` and `tokens`, with `config`, with
+/// `storage` for the checks: of the core, or of the facade, `through` what it has.
+async fn device<S: StorageEngine + Clone + 'static>(
+    config: ClientConfig,
     storage: S,
     metadata: &Shared,
     (link, tokens): (&Link, &TestTokens),
-) -> Result<(Arc<Client>, Arc<dyn StorageEngine>), ClientError> {
-    let config = ClientConfig {
-        max_snapshot_bytes: LIMIT,
-        heartbeat_interval: INTERVAL,
-        retry_max: INTERVAL,
-        events_retry: EVENTS_RETRY,
-        ..ClientConfig::new(person)
+    through: Option<Through>,
+) -> Result<(Device, Arc<dyn StorageEngine>), ClientError> {
+    let (metadata, link, tokens) = (metadata.clone(), link.clone(), tokens.clone());
+    let device = match through {
+        None => {
+            let client = Client::open(config, storage.clone(), metadata, link, tokens);
+            Device::Core(Arc::new(client.await?))
+        }
+        Some(through) => {
+            let crypto = through
+                .crypto
+                .then(|| TestCrypto::new() as Arc<dyn CryptoEngine>);
+            let client = ZemdbClient::open(config, storage.clone(), metadata, link, tokens, crypto);
+            Device::Facade(Facade::new(client.await?))
+        }
     };
-    let client = Client::open(
-        config,
-        storage.clone(),
-        metadata.clone(),
-        link.clone(),
-        tokens.clone(),
-    )
-    .await?;
-    Ok((Arc::new(client), Arc::new(storage)))
+    Ok((device, Arc::new(storage)))
 }
 
 /// Opens `room_id` in `client`, with a token for a day and a second more per open before, so that
@@ -916,6 +1365,39 @@ fn decision(reason: Option<&Reason>) -> Result<(), ClientError> {
     Err(ClientError::ConstraintViolation(violation))
 }
 
+/// The case of `result`, the end of a write of the facade: one that the facade decides locally
+/// sends nothing.
+fn facade_case(result: &Result<(), ClientError>) -> &'static str {
+    match result {
+        Ok(()) => "write taken",
+        Err(ClientError::ConstraintViolation(_) | ClientError::RowMissing) => {
+            "write rejected by the replica"
+        }
+        Err(ClientError::OutcomeUnknown) => "write unknown",
+        Err(ClientError::PrecheckFailed(_)) => "decided locally: PrecheckFailed",
+        Err(ClientError::Offline(_)) => "decided locally: Offline",
+        Err(ClientError::InvalidOperation(_)) => "decided locally: InvalidOperation",
+        Err(ClientError::Crypto(_)) => "decided locally: Crypto",
+        Err(ClientError::FailedClosed(_)) => "decided locally: FailedClosed",
+        Err(_) => "write failed",
+    }
+}
+
+/// The wall clock, in milliseconds, as the facade takes the timestamps of its writes.
+fn wall_clock() -> u64 {
+    let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    u64::try_from(since.as_millis()).unwrap()
+}
+
+/// The key of the row of `op`, by the names of the columns of the primary key of `table`.
+fn key_of(table: &TableSchema, op: &Operation) -> Key {
+    let mut key = Key::new();
+    for (name, value) in table.primary_key().iter().zip(op.pk().values()) {
+        key.set(name.clone(), value.clone());
+    }
+    key
+}
+
 // ---------------------------------------------------------------------------------------------
 // The model
 
@@ -968,6 +1450,12 @@ impl Incarnation {
     fn landed(&self, tag: u64) -> Vec<u64> {
         let tagged = self.log.iter().filter(|op| op.op.timestamp() == tag);
         tagged.map(|op| op.seq.get()).collect()
+    }
+
+    /// The sequences of the operations of the log equal to `op`.
+    fn landed_as(&self, op: &Operation) -> Vec<u64> {
+        let same = self.log.iter().filter(|logged| logged.op == *op);
+        same.map(|op| op.seq.get()).collect()
     }
 }
 
@@ -1044,14 +1532,27 @@ fn member(ranking: Value, person: &str) -> Operation {
     insert(MEMBERS, 2, vec![ranking, person.into(), person.into()])
 }
 
-/// A round, with its notes as the bytes they are encrypted to.
+/// The position of `notes` in `rounds`.
+const NOTES: u16 = 4;
+
+/// A round, with its notes encrypted as a member with the key encrypts them, with the additional
+/// data of their cell: the clients of the facade read them.
 fn round(ranking: Value, round: Value, person: &str, title: &str) -> Operation {
-    let notes = Value::Bytes(b"sealed".to_vec().into());
+    let notes = notes(&ranking, &round, NOTES);
     insert(
         ROUNDS,
         2,
         vec![ranking, round, person.into(), title.into(), notes],
     )
+}
+
+/// The notes of the round `round` of `ranking`, always the same plaintext, encrypted with the
+/// additional data of the cell of the column at `column` of its row: those of another column than
+/// [`NOTES`] do not decrypt (`Decryption`).
+fn notes(ranking: &Value, round: &Value, column: u16) -> Value {
+    let room_id = RoomId::new(ROOM).unwrap();
+    let cell = additional_data(&room_id, ROUNDS, &[ranking.clone(), round.clone()], column);
+    Value::Bytes(TestCrypto::seal(&cell, &encoded(&note(0))).into())
 }
 
 fn vote(voter: &str, ranking: Value, round: Value, candidate: &str) -> Operation {
@@ -1063,7 +1564,8 @@ fn vote(voter: &str, ranking: Value, round: Value, candidate: &str) -> Operation
 }
 
 /// An operation of `person` over two rankings, three rounds and three persons: mostly votes,
-/// and few deletes.
+/// and few deletes. The notes of a round change now and then to some that do not decrypt, and
+/// back to those of the core: a round that the core opened is then the same row as before.
 fn ranking_operation(rng: &mut Rng, person: &str) -> Operation {
     let ranking_id = uuid(1 + u128::from(rng.below(2)));
     let round_id = uuid(11 + u128::from(rng.below(3)));
@@ -1090,6 +1592,16 @@ fn ranking_operation(rng: &mut Rng, person: &str) -> Operation {
         12 => {
             let pk = PrimaryKey::composite([ranking_id, round_id]);
             Operation::delete_with_owner(ROUNDS, pk, person, 0)
+        }
+        roll @ (13 | 14) => {
+            let column = if roll == 13 { NOTES - 1 } else { NOTES };
+            let notes = notes(&ranking_id, &round_id, column);
+            let pk = PrimaryKey::composite([ranking_id, round_id]);
+            let updates = vec![
+                ColumnUpdate::new(2, person),
+                ColumnUpdate::new(NOTES, notes),
+            ];
+            Operation::update(ROUNDS, pk, updates, 0)
         }
         _ => vote(person, ranking_id, round_id, candidate),
     }
@@ -1138,13 +1650,18 @@ enum Kind {
 /// What a client does in a step.
 #[derive(Debug, Clone)]
 enum Action {
+    /// A write of the core, and one of the facade, with what makes the facade refuse it, if any.
     Write(Operation),
+    Call(Call, Option<&'static str>),
     Sync,
     Heartbeat,
     /// Closes the room and opens it again.
     Reopen,
     /// Sets the mode of the worker of the room.
     Freshness(Freshness),
+    /// Opens a `watch` stream of the facade, and drops one, of those it has.
+    Watch(Watch),
+    Unwatch(usize),
 }
 
 /// An action of client `member`, dropped after `polls` polls of it, and the client crashed
@@ -1210,12 +1727,20 @@ struct Sim {
     /// The archivist first.
     members: Vec<Member>,
     tags: u64,
+    /// The notes written by the facade, which number the next one, and the wall clock, in
+    /// milliseconds, at the end of the last step with writes of the facade.
+    notes: u64,
+    wall: u64,
 }
 
 impl Sim {
-    /// A server with a room of the schema of `kind`, the archivist and four clients: a disk and a
-    /// memory one of each of two persons, those of the second with a worker if `workers`, the
-    /// one over the disk in `Live` and the other in a random mode. The network fuzzes the replies
+    /// A server with a room of the schema of `kind`, the archivist and four clients of the core: a
+    /// disk and a memory one of each of two persons, those of the second with a worker if
+    /// `workers`, the one over the disk in `Live` and the other in a random mode. With `workers`,
+    /// also two clients of the facade, of two persons without another, each with its worker in a
+    /// random mode: one over the disk, with the `CryptoEngine` of the tests and without the
+    /// precheck, so that its writes of encrypted values go out also when its replica would reject
+    /// them, and one over memory, without it and with the precheck. The network fuzzes the replies
     /// if `fuzz`.
     async fn new(seed: u64, kind: Kind, fuzz: bool, workers: bool) -> Self {
         eprintln!(
@@ -1238,6 +1763,8 @@ impl Sim {
             ops: AtomicUsize::new(0),
             offline: Mutex::default(),
             faults: Mutex::default(),
+            cases: Mutex::default(),
+            sealed_mark: sealed_mark(),
             fuzz: Mutex::new(fuzz.then(|| Fuzz::new(seed))),
             record: Mutex::default(),
             schemas: Mutex::new(vec![schema.clone()]),
@@ -1252,7 +1779,7 @@ impl Sim {
             rng: Rng::new(seed),
             server,
             net,
-            room: RoomId::new("room-sim").unwrap(),
+            room: RoomId::new(ROOM).unwrap(),
             schema_id: SchemaId::new("sim-0").unwrap(),
             schema,
             schemas: 0,
@@ -1260,6 +1787,8 @@ impl Sim {
             incarnations: Vec::new(),
             members: Vec::new(),
             tags: 0,
+            notes: 0,
+            wall: 0,
         };
         let request = json!({"schema_id": sim.schema_id, "schema": sim.schema});
         sim.admin(Method::POST, "/schemas", Some(request)).await;
@@ -1271,7 +1800,20 @@ impl Sim {
             ("B", false, Some(sim.freshness())),
             ("A", false, None),
         ] {
-            sim.join(person, disk, worker.filter(|_| workers)).await;
+            sim.join(person, disk, worker.filter(|_| workers), None)
+                .await;
+        }
+        if workers {
+            let persons = match kind {
+                Kind::Random => ["A", "B"],
+                Kind::Ranking => ["C", "B"],
+            };
+            for (person, crypto) in persons.into_iter().zip([true, false]) {
+                let worker = Some(sim.freshness());
+                let precheck = !crypto;
+                let through = Some(Through { crypto, precheck });
+                sim.join(person, crypto, worker, through).await;
+            }
         }
         sim
     }
@@ -1321,36 +1863,47 @@ impl Sim {
     }
 
     /// Opens client `index` of `person` over a memory engine, or over the disk engine of `dir`,
-    /// and the room in it, with its worker in `worker`, if any.
+    /// with `tokens` as its token provider, and the room in it, with its worker in `worker`, if
+    /// any: of the core, or of the facade, `through` what it has.
     async fn open(
         &self,
-        index: usize,
-        person: &'static str,
+        (index, person): (usize, &'static str),
         dir: Option<TempDir>,
-        worker: Option<Freshness>,
+        (worker, through): (Option<Freshness>, Option<Through>),
+        tokens: TestTokens,
     ) -> Member {
         let link = Link {
             net: Arc::clone(&self.net),
             client: index,
             faulty: index != ARCHIVIST,
+            facade: through.is_some(),
+        };
+        let config = ClientConfig {
+            max_snapshot_bytes: LIMIT,
+            heartbeat_interval: INTERVAL,
+            retry_max: INTERVAL,
+            events_retry: EVENTS_RETRY,
+            precheck: through.is_none_or(|through| through.precheck),
+            freshness: worker.unwrap_or(Freshness::Periodic),
+            ..ClientConfig::new(person)
         };
         let metadata = Shared(match &dir {
             Some(dir) => Arc::new(FileMetadata::new(dir.path())),
             None => Arc::new(MemoryMetadata::default()),
         });
-        let tokens = TestTokens::new();
         // A client that crashed holds its metadata until the tasks it left end, those of its
         // worker too.
         let mut opened = None;
         for _ in 0..6000 {
+            let (config, of) = (config.clone(), (&link, &tokens));
             let attempt = match &dir {
                 Some(dir) => {
                     let storage = DiskStorageEngine::new(options(dir.path())).unwrap();
-                    client(person, storage, &metadata, (&link, &tokens)).await
+                    device(config, storage, &metadata, of, through).await
                 }
                 None => {
                     let storage = MemoryStorageEngine::new();
-                    client(person, storage, &metadata, (&link, &tokens)).await
+                    device(config, storage, &metadata, of, through).await
                 }
             };
             match attempt {
@@ -1361,17 +1914,18 @@ impl Sim {
                 Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
             }
         }
-        let (client, storage) = opened.expect("The metadata of a crashed client stay held");
+        let (device, storage) = opened.expect("The metadata of a crashed client stay held");
         let incarnation = metadata.of(&self.room).await;
         let incarnation = incarnation.map(|metadata| self.incarnation(metadata.room_incarnation));
-        let _ = open_room(&client, &self.room).await;
+        let _ = device.open_room(&self.room).await;
         if let Some(worker) = worker {
-            let _ = client.set_freshness(self.room.clone(), worker).await;
+            let _ = device.run_worker(&self.room, worker).await;
         }
         Member {
             person,
             dir,
-            client,
+            device,
+            facade: through,
             storage,
             metadata,
             tokens,
@@ -1393,20 +1947,37 @@ impl Sim {
     }
 
     /// Adds a client of `person`, over a disk engine if `disk`, with the room open, and its
-    /// worker in `worker`, if any.
-    async fn join(&mut self, person: &'static str, disk: bool, worker: Option<Freshness>) {
+    /// worker in `worker`, if any: of the core, or of the facade, `through` what it has.
+    async fn join(
+        &mut self,
+        person: &'static str,
+        disk: bool,
+        worker: Option<Freshness>,
+        through: Option<Through>,
+    ) {
         let dir = disk.then(|| tempdir().unwrap());
-        let member = self.open(self.members.len(), person, dir, worker).await;
+        let of = (self.members.len(), person);
+        let member = self
+            .open(of, dir, (worker, through), TestTokens::new())
+            .await;
         self.members.push(member);
     }
 
     /// Crashes client `index`, over a disk engine, and opens it again from its directory, with its
-    /// worker in the mode it had: the tasks it left run on.
+    /// worker in the mode it had, what it had of the facade and its token provider: the tasks it
+    /// left run on, and its `watch` streams are dropped. The provider is of its application, which
+    /// a crash of the device leaves as it was: a new one would give the tokens of the first again,
+    /// for the same client, room and expiry, which the network took as expired.
     async fn crash(&mut self, index: usize) {
         let mut crashed = self.members.remove(index);
         let (person, dir, worker) = (crashed.person, crashed.dir.take(), crashed.worker);
+        let (through, tokens, expiring) =
+            (crashed.facade, crashed.tokens.clone(), crashed.expiring);
         drop(crashed);
-        let member = self.open(index, person, dir, worker).await;
+        let mut member = self
+            .open((index, person), dir, (worker, through), tokens)
+            .await;
+        member.expiring = expiring;
         self.members.insert(index, member);
     }
 
@@ -1530,7 +2101,8 @@ impl Sim {
 
     /// Before step `step`, an event of the server: every few steps, the next one, and a few more
     /// at random. With workers, a restart turns the event stream off now and then, and the next
-    /// one on again. A pruned room gets a client that joins it, every other with a worker.
+    /// one on again. A pruned room gets a client of the core that joins it, every other with a
+    /// worker, up to eight of them.
     async fn event(&mut self, step: usize) {
         const EVENTS: usize = 8;
         let event = match step % EVENTS {
@@ -1544,14 +2116,15 @@ impl Sim {
                 self.restart(false).await
             }
             1 | 5 => {
-                if self.prune().await && self.members.len() < 8 {
+                let core = self.members.iter().filter(|m| m.facade.is_none()).count();
+                if self.prune().await && core < 8 {
                     let n = self.members.len();
                     let person = match self.kind {
                         Kind::Random => ["A", "B"][n % 2],
                         Kind::Ranking => "C",
                     };
                     let worker = (self.workers && n % 2 == 1).then(|| self.freshness());
-                    self.join(person, n % 2 == 0, worker).await;
+                    self.join(person, n % 2 == 0, worker, None).await;
                 }
             }
             2 | 6 => self.add_column().await,
@@ -1567,21 +2140,191 @@ impl Sim {
     }
 
     /// A random operation for client `member`: over random schemas, of its own owner but for a
-    /// few, which the server refuses.
+    /// few, which the server refuses. For a client of the facade, which declares its own owner and
+    /// refuses a key of another, also of another owner: over random schemas, as they are drawn,
+    /// and over the schema of the reference app, one in five of any person; and the one with the
+    /// `CryptoEngine` opens a round of its own two times in five, with notes.
     fn operation(&mut self, member: usize) -> Operation {
         let person = self.members[member].person;
+        let facade = self.members[member].facade;
+        let crypto = facade.is_some_and(|through| through.crypto);
+        let facade = facade.is_some();
         let op = match self.kind {
+            Kind::Random if facade => oracle::random_operation(&mut self.rng, &self.schema),
+            Kind::Ranking if crypto && self.rng.chance(40) => {
+                let (ranking_id, round_id) = (1 + self.rng.below(2), 11 + self.rng.below(3));
+                let title = ["Ronda 1", "Ronda 2"][self.rng.below(2) as usize];
+                let (ranking_id, round_id) = (u128::from(ranking_id), u128::from(round_id));
+                round(uuid(ranking_id), uuid(round_id), person, title)
+            }
             Kind::Random => {
-                let client_id = self.members[member].client.client_id();
+                let client_id = self.members[member].device.client_id();
                 let mut op = oracle::random_operation(&mut self.rng, &self.schema);
                 while self.schema.check_owner(&op, &client_id).is_err() && !self.rng.chance(10) {
                     op = oracle::random_operation(&mut self.rng, &self.schema);
                 }
                 op
             }
+            Kind::Ranking if facade && self.rng.chance(20) => self.random_operation(),
             Kind::Ranking => ranking_operation(&mut self.rng, person),
         };
         self.tag(op)
+    }
+
+    /// A random operation of the schema of the room, of any person.
+    fn random_operation(&mut self) -> Operation {
+        match self.kind {
+            Kind::Random => oracle::random_operation(&mut self.rng, &self.schema),
+            Kind::Ranking => {
+                let person = ["A", "B", "C"][self.rng.below(3) as usize];
+                ranking_operation(&mut self.rng, person)
+            }
+        }
+    }
+
+    /// The write of the facade of `person` that makes `op`, by the names of the columns of the
+    /// schema of the room: the values of its row but its nulls, or its changes, and the key of its
+    /// row. In place of the ciphertext of an encrypted column, it writes a plaintext, and an
+    /// update also writes one half of the time. The owner column, which the client fills, goes in
+    /// the row or the changes one time in ten, with the owner of the client or another, and in the
+    /// key, if it has it, two times in five with the owner of the client, and one in five with
+    /// another: the facade refuses all of those but the key with the owner of the client.
+    fn call(&mut self, person: &str, op: &Operation) -> (Call, Option<&'static str>) {
+        let table = self.schema.get_table_by_id(op.table_id()).unwrap().clone();
+        let owner = table.owner().map(|owner| owner.column().to_string());
+        let is_owner = |name: &str| owner.as_deref() == Some(name);
+        let other = self.other(person);
+        let given = self.rng.chance(10).then(|| match self.rng.chance(50) {
+            true => Value::from(person),
+            false => other.clone(),
+        });
+        let mut key = Key::new();
+        let mut foreign = false;
+        for (name, value) in table.primary_key().iter().zip(op.pk().values()) {
+            match self.rng.below(5) {
+                _ if !is_owner(name) => key.set(name.clone(), value.clone()),
+                0 | 1 => None,
+                2 | 3 => key.set(name.clone(), person),
+                _ => {
+                    foreign = true;
+                    key.set(name.clone(), other.clone())
+                }
+            };
+        }
+        // What the facade refuses: the owner column in a row or the changes, and a key of another.
+        let given = given.filter(|_| owner.is_some());
+        let refused = match (op.kind(), &given) {
+            (OperationKind::Delete { .. }, _) | (OperationKind::Update { .. }, None) if foreign => {
+                Some("refused: a key of another owner")
+            }
+            (OperationKind::Delete { .. }, _) => None,
+            (_, Some(_)) => Some("refused: the owner column given"),
+            (_, None) => None,
+        };
+        let name = table.name().to_string();
+        let call = match op.kind() {
+            OperationKind::Insert { row } => {
+                let mut values = Row::new();
+                for (column, value) in table.columns().iter().zip(row.values()) {
+                    match &given {
+                        _ if !is_owner(column.name()) => {}
+                        Some(given) => {
+                            values.set(column.name(), given.clone());
+                            continue;
+                        }
+                        None => continue,
+                    }
+                    if !value.is_null() {
+                        values.set(column.name(), self.plaintext(column, value));
+                    }
+                }
+                Call::Insert(name, values)
+            }
+            OperationKind::Update { updates } => {
+                let mut changes = Row::new();
+                for update in updates {
+                    let column = &table.columns()[usize::from(update.column_idx())];
+                    if !is_owner(column.name()) {
+                        changes.set(column.name(), self.plaintext(column, update.value()));
+                    }
+                }
+                for column in table.columns().iter().filter(|c| c.is_encrypted()) {
+                    if self.rng.chance(50) {
+                        changes.set(column.name(), self.plaintext(column, &Value::Null));
+                    }
+                }
+                if let (Some(owner), Some(given)) = (&owner, given) {
+                    changes.set(owner.clone(), given);
+                }
+                Call::Update(name, key, changes)
+            }
+            OperationKind::Delete { .. } => Call::Delete(name, key),
+        };
+        (call, refused)
+    }
+
+    /// Another person than `person`, as the owner columns hold them.
+    fn other(&mut self, person: &str) -> Value {
+        let persons = match self.kind {
+            Kind::Random => &["A", "B"][..],
+            Kind::Ranking => &["A", "B", "C"][..],
+        };
+        let others: Vec<&str> = persons.iter().copied().filter(|p| *p != person).collect();
+        Value::from(others[self.rng.below(others.len() as u64) as usize])
+    }
+
+    /// What a client of the facade writes in `column` in place of `value`: in an encrypted column,
+    /// the plaintext of a new note, or a null one time in five, if it takes it; in another,
+    /// `value`.
+    fn plaintext(&mut self, column: &ColumnDef, value: &Value) -> Value {
+        if !column.is_encrypted() {
+            return value.clone();
+        }
+        if column.is_nullable() && self.rng.chance(20) {
+            return Value::Null;
+        }
+        self.notes += 1;
+        note(self.notes)
+    }
+
+    /// A random `watch` of a client of the facade: of the row of the key of a random operation,
+    /// or of a scan of its table, from that key, or from the start, to the key of another of the
+    /// table or to the end, forward or backward, with a limit now and then, and only some of the
+    /// columns now and then; of the table of the rounds of the reference app if `rounds`.
+    fn watch(&mut self, rounds: bool) -> Watch {
+        let mut op = self.random_operation();
+        while rounds && op.table_id() != ROUNDS {
+            op = self.random_operation();
+        }
+        let table = self.schema.get_table_by_id(op.table_id()).unwrap().clone();
+        let name = table.name().to_string();
+        if self.rng.chance(50) {
+            return Watch::Row(name, key_of(&table, &op));
+        }
+        let other = self.random_operation();
+        let end = (other.table_id() == op.table_id()).then(|| key_of(&table, &other));
+        let bound = |rng: &mut Rng, key: Option<Key>| match (key, rng.below(3)) {
+            (None, _) | (_, 0) => Bound::Unbounded,
+            (Some(key), 1) => Bound::Included(key),
+            (Some(key), _) => Bound::Excluded(key),
+        };
+        let mut scan = Scan {
+            start: bound(&mut self.rng, Some(key_of(&table, &op))),
+            end: bound(&mut self.rng, end),
+            ..Scan::new()
+        };
+        if self.rng.chance(50) {
+            scan.direction = Direction::Backward;
+        }
+        if self.rng.chance(30) {
+            scan.limit = Some(1 + self.rng.below(3) as usize);
+        }
+        if self.rng.chance(30) {
+            let columns = table.columns().iter().filter(|_| self.rng.chance(50));
+            let columns: Vec<String> = columns.map(|c| c.name().to_string()).collect();
+            scan.columns = (!columns.is_empty()).then_some(columns);
+        }
+        Watch::Rows(name, scan)
     }
 
     /// What the clients do in a random step, none, one or two calls each: some of the calls
@@ -1599,15 +2342,42 @@ impl Sim {
             }
         }
         let mut plans = Vec::new();
+        let (mut wrote, mut unowned) = (BTreeSet::new(), false);
         for member in (1..self.members.len()).flat_map(|member| [member, member]) {
             if !self.rng.chance(50) {
                 continue;
             }
             let worker = self.members[member].worker.is_some();
+            let facade = self.members[member].facade.is_some();
+            // A client of the facade writes once per step at most, and only one of them in a table
+            // without an owner, so that their writes are told apart by their timestamps and their
+            // owners; and it watches in place of the heartbeats of the core.
             let action = match self.rng.below(10) {
                 _ if worker && self.rng.chance(10) => Action::Freshness(self.freshness()),
+                0..=4 if facade && !wrote.insert(member) => Action::Sync,
+                0..=4 if facade => {
+                    let op = self.operation(member);
+                    let table = self.schema.get_table_by_id(op.table_id()).unwrap();
+                    match table.owner() {
+                        None if std::mem::replace(&mut unowned, true) => Action::Sync,
+                        _ => {
+                            let person = self.members[member].person;
+                            let (call, refused) = self.call(person, &op);
+                            Action::Call(call, refused)
+                        }
+                    }
+                }
                 0..=4 => Action::Write(self.operation(member)),
-                5 | 6 => Action::Sync,
+                5 | 6 if !facade => Action::Sync,
+                5 => Action::Sync,
+                6 | 7 if facade => {
+                    // Of the rounds, half of the time, in the client that reads their notes.
+                    let crypto = self.members[member].facade.is_some_and(|f| f.crypto);
+                    let ranking = matches!(self.kind, Kind::Ranking);
+                    let rounds = crypto && ranking && self.rng.chance(50);
+                    Action::Watch(self.watch(rounds))
+                }
+                8 if facade => Action::Unwatch(self.rng.below(WATCHES as u64) as usize),
                 7 | 8 => Action::Heartbeat,
                 _ => Action::Reopen,
             };
@@ -1627,8 +2397,8 @@ impl Sim {
 
     /// Runs `plans` at once and crashes the clients they say; with workers, they then run by
     /// themselves for a random time within an interval. Then the archivist catches up, every write
-    /// that ended and every replica are checked, and each client with a worker starts it again if
-    /// it stopped.
+    /// that ended, every replica and the `watch` streams of the facade are checked, and each client
+    /// with a worker starts it again if it stopped.
     async fn step(&mut self, plans: &[Plan]) {
         let last = self.incarnations.last().map(|incarnation| incarnation.id);
         for plan in plans {
@@ -1636,10 +2406,17 @@ impl Sim {
                 self.members[plan.member].opening(&self.room, last).await;
             }
         }
+        // The writes of the facade, whose timestamps are of the wall clock, go a millisecond
+        // after those of the step before.
+        let calls = plans.iter().any(|p| matches!(p.action, Action::Call(..)));
+        while calls && wall_clock() <= self.wall {
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        self.net.record.lock().unwrap().sent.clear();
         let room_id = &self.room;
         let mut before = Vec::new();
         for (index, member) in self.members.iter().enumerate() {
-            let status = member.client.status(room_id.clone()).await;
+            let status = member.device.status(room_id).await;
             before.push((
                 status.ok().map(|status| status.epoch),
                 self.net.downloads(index),
@@ -1648,18 +2425,22 @@ impl Sim {
         let may_wait = self.net.fuzz.lock().unwrap().is_some();
         let net = &self.net;
         let outcomes = join_all(plans.iter().map(|plan| {
-            let client = &self.members[plan.member].client;
+            let device = &self.members[plan.member].device;
             let action = async move {
                 match &plan.action {
-                    Action::Write(op) => client.write(room_id.clone(), op.clone()).await,
-                    Action::Sync => client.sync(room_id.clone()).await,
-                    Action::Heartbeat => client.heartbeat(room_id.clone()).await,
+                    Action::Write(op) => device.write(room_id, op).await,
+                    Action::Call(call, _) => device.facade().unwrap().write(room_id, call).await,
+                    Action::Sync => device.sync(room_id).await,
+                    Action::Heartbeat => device.heartbeat(room_id).await,
                     Action::Reopen => {
-                        let _ = client.close_room(room_id.clone()).await;
-                        open_room(client, room_id).await
+                        let _ = device.close_room(room_id).await;
+                        device.open_room(room_id).await
                     }
-                    Action::Freshness(freshness) => {
-                        client.set_freshness(room_id.clone(), *freshness).await
+                    Action::Freshness(freshness) => device.set_freshness(room_id, *freshness).await,
+                    Action::Watch(watch) => device.facade().unwrap().watch(room_id, watch),
+                    Action::Unwatch(n) => {
+                        device.facade().unwrap().unwatch(*n);
+                        Ok(())
                     }
                 }
             };
@@ -1667,7 +2448,7 @@ impl Sim {
             // have skipped meanwhile.
             async move {
                 let outcome = cut(action, plan.polls, may_wait).await;
-                let status = client.status(room_id.clone()).await;
+                let status = device.status(room_id).await;
                 let ended = (
                     status.ok().map(|status| status.epoch),
                     net.downloads(plan.member),
@@ -1676,6 +2457,16 @@ impl Sim {
             }
         }))
         .await;
+        if calls {
+            self.wall = wall_clock();
+        }
+        // The mode of the room in a client of the facade, which sets it at once.
+        for plan in plans {
+            let member = &mut self.members[plan.member];
+            if let (Action::Freshness(freshness), Some(_)) = (&plan.action, member.facade) {
+                member.worker = Some(*freshness);
+            }
+        }
         let crashed: BTreeSet<usize> = plans.iter().filter(|p| p.crash).map(|p| p.member).collect();
         for &member in &crashed {
             self.crash(member).await;
@@ -1687,7 +2478,12 @@ impl Sim {
         self.settle().await;
         self.archive().await;
         for (plan, (outcome, (epoch_then, downloads_then))) in plans.iter().zip(outcomes) {
-            let (Action::Write(op), Some(result)) = (&plan.action, outcome) else {
+            let written = match &plan.action {
+                Action::Write(op) => Written::Core(op),
+                Action::Call(_, refused) => Written::Facade(*refused),
+                _ => continue,
+            };
+            let Some(result) = outcome else {
                 continue;
             };
             let (epoch, downloads) = before[plan.member];
@@ -1697,22 +2493,27 @@ impl Sim {
                 .iter()
                 .any(|other| other.member == plan.member && matches!(other.action, Action::Reopen));
             let skipped = crashed.contains(&plan.member) || epoch_changed || downloaded || reopened;
-            self.check_write(plan.member, op, result, skipped);
+            self.check_write(plan.member, written, result, skipped);
         }
         for (index, member) in self.members.iter().enumerate() {
             let of = |plan: &&Plan| plan.member == index;
-            let reopened = plans
-                .iter()
-                .filter(of)
-                .any(|p| matches!(p.action, Action::Reopen));
+            let reopens = (plans.iter().filter(of))
+                .filter(|p| matches!(p.action, Action::Reopen))
+                .count();
             let changed =
                 (plans.iter().filter(of)).any(|p| matches!(p.action, Action::Freshness(_)));
-            let closed = reopened && changed && !crashed.contains(&index);
-            self.check(member, closed).await;
+            // In the facade, an open starts the worker, as the change of the mode does in the core.
+            let closed = match member.facade {
+                None => reopens > 0 && changed,
+                Some(_) => reopens > 1,
+            };
+            self.check(member, closed && !crashed.contains(&index))
+                .await;
+            self.check_watches(member).await;
         }
         // The discards of the step that the opens did add stay; the others go.
         for member in &mut self.members {
-            if let Ok(status) = member.client.status(self.room.clone()).await {
+            if let Ok(status) = member.device.status(&self.room).await {
                 let after = (self.incarnations.len() - 1 - member.since) as u64;
                 let added = status.epoch.saturating_sub(member.discards + after);
                 member.discards += added.min(member.resetting);
@@ -1730,27 +2531,25 @@ impl Sim {
             let Some(mut freshness) = member.worker else {
                 continue;
             };
-            // That of a step that changed it, also if the step was cut.
-            if let Ok(status) = member.client.status(self.room.clone()).await {
+            // That of a step that changed it, also if the step was cut. In the facade, the mode
+            // of the room, which the step set.
+            if let (Ok(status), None) = (member.device.status(&self.room).await, member.facade) {
                 if let Some(worker) = status.worker {
                     freshness = worker.freshness;
                 }
             }
             member.worker = Some(freshness);
-            let _ = member
-                .client
-                .set_freshness(self.room.clone(), freshness)
-                .await;
+            let _ = member.device.run_worker(&self.room, freshness).await;
         }
     }
 
     /// Has the archivist catch up with the room, and the model apply what it received.
     async fn archive(&mut self) {
-        let archivist = &self.members[ARCHIVIST].client;
-        let _ = archivist.sync(self.room.clone()).await;
+        let archivist = &self.members[ARCHIVIST].device;
+        let _ = archivist.sync(&self.room).await;
         let manager = &self.server.state.room_manager;
         let head = manager.log_bounds(&self.room).await.unwrap().head_seq.get();
-        let status = archivist.status(self.room.clone()).await.unwrap();
+        let status = archivist.status(&self.room).await.unwrap();
         assert_eq!(status.head_seq.get(), head, "The archivist is behind");
         let incarnation = self.incarnations.last_mut().unwrap();
         let record = self.net.record.lock().unwrap();
@@ -1765,22 +2564,33 @@ impl Sim {
         incarnation.extend(log.collect());
     }
 
-    /// Checks how a write of `op` by client `member` ended: with the decision of the model on
-    /// the sequence its commit got; as uncertain only if an attempt was and no `CommitAck` came,
-    /// or one came and its replica may have `skipped` the sequence, discarded, with a snapshot or
-    /// closed; and with any other error only if it had no effect. Fuzzing, a reply in place of the
-    /// server's may end it with any error.
+    /// Checks how a write by client `member` ended, of the operation it sent, if any: with the
+    /// decision of the model on the sequence its commit got; as uncertain only if an attempt was
+    /// and no `CommitAck` came, or one came and its replica may have `skipped` the sequence,
+    /// discarded, with a snapshot or closed; and with any other error only if it had no effect. One
+    /// that the facade decides locally sent nothing, and one that it refuses is `InvalidOperation`,
+    /// unless the room is not open (`RoomClosed`). Fuzzing, a reply in place of the server's may
+    /// end it with any error.
     fn check_write(
         &self,
         member: usize,
-        op: &Operation,
+        written: Written,
         result: Result<(), ClientError>,
         skipped: bool,
     ) {
         let record = self.net.record.lock().unwrap();
-        let commits = record.commits.get(&op.timestamp());
         let incarnation = self.incarnations.last().unwrap();
-        let landed = incarnation.landed(op.timestamp());
+        let (op, landed) = match written {
+            Written::Core(op) => (Some(op), incarnation.landed(op.timestamp())),
+            Written::Facade(_) => {
+                let sent = record.sent.get(&member);
+                let sent: Vec<&Operation> = sent.into_iter().flat_map(|s| s.values()).collect();
+                assert!(sent.len() <= 1, "Client {member} sent {sent:?} for a write");
+                let op = sent.first().copied();
+                (op, op.map_or(Vec::new(), |op| incarnation.landed_as(op)))
+            }
+        };
+        let commits = op.and_then(|op| record.commits.get(&(member, op.timestamp())));
         let acks: Vec<u64> = commits.map_or(Vec::new(), |c| c.acks.iter().copied().collect());
         let uncertain = commits.is_some_and(|c| c.sent > c.answered);
         let write = format!(
@@ -1791,6 +2601,27 @@ impl Sim {
             commits.is_none_or(|c| c.ids.len() == 1),
             "{write}: other ids"
         );
+        if let Written::Facade(refused) = written {
+            let case = facade_case(&result);
+            if case.starts_with("decided locally") {
+                assert!(
+                    op.is_none(),
+                    "{write}: the facade decided it locally and sent it"
+                );
+            }
+            self.net.saw(case);
+            if let Some(refused) = refused {
+                let closed = matches!(result, Err(ClientError::RoomClosed(_)));
+                let invalid = matches!(result, Err(ClientError::InvalidOperation(_)));
+                assert!(
+                    invalid || closed,
+                    "{write}: the facade did not refuse it, {refused}"
+                );
+                if invalid {
+                    self.net.saw(refused);
+                }
+            }
+        }
         assert!(landed.len() <= 1, "{write}: sequenced twice");
         assert!(acks.is_empty() || acks == landed, "{write}");
         match result {
@@ -1812,15 +2643,16 @@ impl Sim {
     /// head; it was discarded only once per open without metadata and once per incarnation after
     /// that of its metadata when the client opened, unless fuzzing; it does not fail closed; its
     /// room keeps nothing for a write, with none in flight; and its worker, if it has one, runs,
-    /// unless the step `closed` its room while it changed the mode of the worker: a worker that the
-    /// change started while the room closed stops at its next step, as the room is out of the
-    /// client. Its worker may change the replica meanwhile: its rows are read again until its head
-    /// and its epoch are the same before and after reading them.
+    /// unless the step `closed` its room while it changed the mode of the worker, or, in the
+    /// facade, while it opened the room again: a worker that the change, or the open, started
+    /// while the room closed stops at its next step, as the room is out of the client. Its worker
+    /// may change the replica meanwhile: its rows are read again until its head and its epoch are
+    /// the same before and after reading them.
     async fn check(&self, member: &Member, closed: bool) {
-        let client = member.client.client_id();
+        let client = member.device.client_id();
         let mut unread = String::new();
         for _ in 0..1000 {
-            let Ok(status) = member.client.status(self.room.clone()).await else {
+            let Ok(status) = member.device.status(&self.room).await else {
                 return;
             };
             assert!(!status.failed_closed, "{client} fails closed");
@@ -1842,7 +2674,7 @@ impl Sim {
             }
             let metadata = member.metadata.of(&self.room).await;
             let replica = rows(&*member.storage, &self.room, &self.schema).await;
-            let again = member.client.status(self.room.clone()).await;
+            let again = member.device.status(&self.room).await;
             let still = again.is_ok_and(|again| {
                 (again.epoch, again.head_seq) == (status.epoch, status.head_seq)
             });
@@ -1869,6 +2701,93 @@ impl Sim {
         panic!("The replica of {client} does not hold still: {unread}");
     }
 
+    /// Checks the `watch` streams of `member`, if it is a client of the facade with its room open,
+    /// once they read what the replica changed: the last element of each is the value of a direct
+    /// read of the replica, or an error after it, of a state in between; none gave its last value
+    /// again; and the status of the room counts a subscription per stream alive, without those
+    /// dropped or ended. Its worker may change the replica meanwhile: the streams and the replica
+    /// are read again until no stream gives an element between a direct read of each and the
+    /// next, and the head and the epoch of the replica are the same before and after.
+    async fn check_watches(&self, member: &Member) {
+        let Some(facade) = member.device.facade() else {
+            return;
+        };
+        let client = member.device.client_id();
+        let mut unread = String::new();
+        for _ in 0..1000 {
+            let Ok(status) = member.device.status(&self.room).await else {
+                return;
+            };
+            // The paused clock moves once every task waits, the tasks of the streams too.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            let watched: Vec<(Watched, Arc<Mutex<Seen>>)> = {
+                let mut watches = facade.watches.lock().unwrap();
+                watches.retain(|watcher| !watcher.seen.lock().unwrap().ended);
+                let watched = watches.iter();
+                watched
+                    .map(|w| (w.watched.clone(), Arc::clone(&w.seen)))
+                    .collect()
+            };
+            let elements = || -> Vec<(usize, bool)> {
+                let seen = watched.iter().map(|(_, seen)| seen.lock().unwrap());
+                seen.map(|seen| (seen.elements, seen.ended)).collect()
+            };
+            let given = elements();
+            let mut reads = Vec::new();
+            for (watched, _) in &watched {
+                reads.push(watched.read().await);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            let again = member.device.status(&self.room).await;
+            let still = again.as_ref().is_ok_and(|again| {
+                (again.epoch, again.head_seq) == (status.epoch, status.head_seq)
+            });
+            let closed = (reads.iter()).any(|read| matches!(read, Err(ClientError::RoomClosed(_))));
+            if !still || closed || elements() != given {
+                unread = format!("{given:?} and then {:?}, {reads:?}", elements());
+                continue;
+            }
+            let alive = again.unwrap().watches;
+            assert_eq!(
+                alive,
+                watched.len(),
+                "The status of {client} counts {alive} watches, with {} streams alive",
+                watched.len()
+            );
+            for ((watched, seen), read) in watched.iter().zip(reads) {
+                let seen = seen.lock().unwrap();
+                assert!(
+                    !seen.repeated,
+                    "A watch of {client} gave its last value again: {watched:?}"
+                );
+                let last = seen.last.as_ref();
+                let reflects = match (&read, last) {
+                    (Ok(rows), Some(Ok(last))) => rows == last,
+                    (Ok(rows), Some(Err(_))) => seen.value.as_ref() == Some(rows),
+                    (Err(err), Some(Err(last))) => err == last,
+                    _ => false,
+                };
+                let values = read.iter().flatten().flat_map(|row| row.iter());
+                let clear = |value: &Value| match value {
+                    Value::String(text) => holds(text.as_bytes(), MARK),
+                    _ => false,
+                };
+                if values.into_iter().any(|(_, value)| clear(value)) {
+                    self.net.saw("note read in the clear");
+                }
+                assert!(
+                    reflects,
+                    "A watch of {client}, {watched:?}, gave {last:?} last, after {:?}, and a read \
+                     gives {read:?}",
+                    seen.value
+                );
+                self.net.saw("watch checked");
+            }
+            return;
+        }
+        panic!("The watches of {client} do not hold still: {unread}");
+    }
+
     /// Sets the mode of the worker of each client that runs one, in turn `Periodic`, `Live` and
     /// `Manual`, as an application does, so that the network heals with each mode.
     async fn assign_modes(&mut self) {
@@ -1879,10 +2798,7 @@ impl Sim {
             .filter(|member| member.worker.is_some());
         for (member, freshness) in workers.zip(modes.into_iter().cycle()) {
             member.worker = Some(freshness);
-            let _ = member
-                .client
-                .set_freshness(self.room.clone(), freshness)
-                .await;
+            let _ = member.device.run_worker(&self.room, freshness).await;
         }
     }
 
@@ -1899,7 +2815,10 @@ impl Sim {
     /// past their heads by ten sequences if `pruning`, or by one: once they are back, they are
     /// behind the head. If `pruning`, the log is pruned too: those whose worker syncs by itself
     /// are behind the log, most of them, and catch up from a snapshot that another client
-    /// uploads, such as the archivist, at the head.
+    /// uploads, such as the archivist, at the head. A replica that is still of an earlier
+    /// incarnation of the room (a client that crashed opens again from its metadata, and its
+    /// registration may fail before it is without network) is behind the head and the log at any
+    /// head of its own.
     async fn isolate(&mut self, pruning: bool) {
         let workers: BTreeSet<usize> = (self.members.iter().enumerate())
             .filter(|(_, member)| member.worker.is_some())
@@ -1914,9 +2833,14 @@ impl Sim {
         // What they took before that, and the changes it brought.
         self.settle().await;
         tokio::time::sleep(Duration::from_secs(1)).await;
+        // A replica of an earlier incarnation, whose registrations did not meet the room created
+        // again, is behind the head at any head of its own.
         let mut top = 0;
         for &index in &workers {
-            if let Ok(status) = self.members[index].client.status(self.room.clone()).await {
+            if let (Ok(status), true) = (
+                self.members[index].device.status(&self.room).await,
+                self.of_last(&self.members[index]).await,
+            ) {
                 top = top.max(status.head_seq.get());
             }
         }
@@ -1942,9 +2866,12 @@ impl Sim {
         assert!(self.prune().await, "The log was not pruned");
         let manager = &self.server.state.room_manager;
         let tail = manager.log_bounds(&self.room).await.unwrap().tail_seq.get();
+        // One of an earlier incarnation is discarded with the `RoomReset` of its registration, and
+        // registers again without a cursor: behind the log too.
         for index in self.syncing() {
-            let status = self.members[index].client.status(self.room.clone()).await;
-            if status.is_ok_and(|status| status.head_seq.get() + 1 < tail) {
+            let status = self.members[index].device.status(&self.room).await;
+            let earlier = !self.of_last(&self.members[index]).await;
+            if status.is_ok_and(|status| status.head_seq.get() + 1 < tail || earlier) {
                 self.behind_log.insert(index);
             }
         }
@@ -1954,10 +2881,17 @@ impl Sim {
         );
     }
 
+    /// Whether the replica of `member` is of the last incarnation of the room, by its metadata.
+    async fn of_last(&self, member: &Member) -> bool {
+        let last = self.incarnations.last().unwrap().id;
+        let metadata = member.metadata.of(&self.room).await;
+        metadata.is_some_and(|metadata| metadata.room_incarnation == last)
+    }
+
     /// Whether `member` is registered at the head of the room, in its last incarnation.
     async fn at_head(&self, member: &Member) -> bool {
         let incarnation = self.incarnations.last().unwrap();
-        let status = member.client.status(self.room.clone()).await;
+        let status = member.device.status(&self.room).await;
         let metadata = member.metadata.of(&self.room).await;
         status.is_ok_and(|status| {
             status.registered && status.head_seq.get() as usize == incarnation.log.len()
@@ -1974,7 +2908,7 @@ impl Sim {
         if !self.net.offline.lock().unwrap().is_empty() {
             for &index in &syncing {
                 let member = &self.members[index];
-                let client = member.client.client_id();
+                let client = member.device.client_id();
                 assert!(
                     !self.at_head(member).await,
                     "{client} is at the head without network"
@@ -1995,12 +2929,12 @@ impl Sim {
             for &index in &syncing {
                 let member = &self.members[index];
                 if !self.at_head(member).await {
-                    behind.push(member.client.client_id());
+                    behind.push(member.device.client_id());
                 }
             }
             if behind.is_empty() {
                 for (&index, downloads) in behind_log.iter().zip(downloads) {
-                    let client = self.members[index].client.client_id();
+                    let client = self.members[index].device.client_id();
                     let downloaded = self.net.downloads(index) > downloads;
                     assert!(
                         downloaded,
@@ -2017,7 +2951,7 @@ impl Sim {
             if tokio::time::Instant::now() >= beat {
                 for member in &self.members {
                     if member.worker.is_none() {
-                        let _ = member.client.heartbeat(self.room.clone()).await;
+                        let _ = member.device.heartbeat(&self.room).await;
                     }
                 }
                 beat += INTERVAL;
@@ -2038,7 +2972,7 @@ impl Sim {
         // the server does not announce, until its room opens again.
         if self.net.fuzz.lock().unwrap().take().is_some() {
             for member in &self.members[ARCHIVIST + 1..] {
-                let _ = member.client.close_room(self.room.clone()).await;
+                let _ = member.device.close_room(&self.room).await;
             }
         }
         self.rejoin().await;
@@ -2083,11 +3017,11 @@ impl Sim {
     async fn opened(&mut self, member: usize) {
         for _ in 0..100 {
             let member = &mut self.members[member];
-            if member.client.status(self.room.clone()).await.is_ok() {
+            if member.device.status(&self.room).await.is_ok() {
                 return;
             }
             member.opening(&self.room, None).await;
-            let _ = open_room(&member.client, &self.room).await;
+            let _ = member.device.open_room(&self.room).await;
         }
         panic!("The room does not open");
     }
@@ -2095,12 +3029,7 @@ impl Sim {
     /// Syncs client `member` until a sync ends well.
     async fn synced(&self, member: usize) {
         for _ in 0..100 {
-            if self.members[member]
-                .client
-                .sync(self.room.clone())
-                .await
-                .is_ok()
-            {
+            if self.members[member].device.sync(&self.room).await.is_ok() {
                 return;
             }
         }
@@ -2181,16 +3110,40 @@ const FAULTS: [&str; 10] = [
     "token expired",
 ];
 
+/// The cases of the facade: its writes taken, rejected by the replica and decided locally without
+/// a network, with a key or a row that it refuses, without a `CryptoEngine` and by the precheck; a
+/// commit, and a snapshot uploaded, that hold encrypted values, and the snapshots uploaded,
+/// decoded; the `watch` streams checked, and the events with operations that reached a client of
+/// the facade; the writes that it refuses, with the owner column or a key of another owner; and a
+/// note read in the clear.
+const CASES: [&str; 14] = [
+    "write taken",
+    "write rejected by the replica",
+    "decided locally: Offline",
+    "decided locally: InvalidOperation",
+    "decided locally: Crypto",
+    "decided locally: PrecheckFailed",
+    "commit with a value encrypted",
+    "snapshot uploaded, decoded",
+    "snapshot with a value encrypted",
+    "watch checked",
+    "ops event to a client of the facade",
+    "refused: the owner column given",
+    "refused: a key of another owner",
+    "note read in the clear",
+];
+
+/// What the network counted in a simulation: how many times it injected each fault of the event
+/// streams and of the tokens, and how many times the checks saw each case of the facade.
+type Counts = BTreeMap<&'static str, usize>;
+
 /// A simulation of `steps` random steps over `kind`, fuzzing the replies if `fuzz`, and else with
 /// workers, with the network healed at the end: then some event with operations reached a client,
-/// and the event streams or their openings had faults. Returns how many times the network
-/// injected each fault of the event streams and of the tokens.
-async fn simulate(
-    seed: u64,
-    kind: Kind,
-    steps: usize,
-    fuzz: bool,
-) -> BTreeMap<&'static str, usize> {
+/// and the event streams or their openings had faults; and the clients of the facade wrote, had
+/// streams checked and got events with operations, and the snapshots uploaded were decoded, and,
+/// over the reference app, a commit of the facade and a snapshot held its notes encrypted. Returns
+/// the faults that the network injected and the cases of the facade that the checks saw.
+async fn simulate(seed: u64, kind: Kind, steps: usize, fuzz: bool) -> (Counts, Counts) {
     let mut sim = Sim::new(seed, kind, fuzz, !fuzz).await;
     for step in 0..steps {
         sim.event(step).await;
@@ -2202,9 +3155,20 @@ async fn simulate(
         sim.isolate(true).await;
     }
     sim.heal().await;
+    let cases = sim.net.cases.lock().unwrap().clone();
     if sim.workers {
         let ops = sim.net.ops.load(Ordering::SeqCst);
         assert!(ops > 0, "No event with operations reached a client");
+        let mut seen = vec![CASES[0], CASES[7], CASES[9], CASES[10]];
+        if let Kind::Ranking = kind {
+            seen.extend([CASES[6], CASES[8]]);
+        }
+        for case in seen {
+            assert!(
+                cases.get(case).is_some_and(|count| *count > 0),
+                "{case}: {cases:?}"
+            );
+        }
     }
     let faults = sim.net.faults.lock().unwrap().clone();
     // Of a block or of an opening: some runs have few blocks of their own.
@@ -2216,7 +3180,7 @@ async fn simulate(
         fuzz || streams > 0,
         "No fault of an event stream: {faults:?}"
     );
-    faults
+    (faults, cases)
 }
 
 #[tokio::test(start_paused = true)]
@@ -2236,20 +3200,29 @@ async fn rankings_converge_through_faults_restarts_pruning_and_schema_changes() 
 #[tokio::test(start_paused = true)]
 #[ignore = "long-running simulation; run with --ignored in release"]
 async fn replicas_converge_over_many_long_simulations() {
-    let mut faults = BTreeMap::new();
+    let (mut faults, mut cases) = (Counts::new(), Counts::new());
     for seed in seeds(1, 16) {
         for kind in [Kind::Random, Kind::Ranking] {
-            for (fault, count) in simulate(seed, kind, 400, false).await {
-                *faults.entry(fault).or_insert(0) += count;
+            let (injected, seen) = simulate(seed, kind, 400, false).await;
+            for (counts, more) in [(&mut faults, injected), (&mut cases, seen)] {
+                for (name, count) in more {
+                    *counts.entry(name).or_insert(0) += count;
+                }
             }
         }
     }
     // Every fault of the event streams and of the tokens, and a token that the provider gave
-    // already expired, which the server refused.
+    // already expired, which the server refused; and every case of the facade.
     for fault in FAULTS.iter().chain(&["token refused by the server"]) {
         assert!(
             faults.get(fault).is_some_and(|count| *count > 0),
             "{fault}: {faults:?}"
+        );
+    }
+    for case in CASES {
+        assert!(
+            cases.get(case).is_some_and(|count| *count > 0),
+            "{case}: {cases:?}"
         );
     }
 }
@@ -2309,7 +3282,7 @@ async fn the_ranking_converges_and_rejects_what_breaks_its_rules() {
     sim.synced(a).await;
     assert!(sim.prune().await);
     sim.synced(a).await;
-    sim.join("C", true, None).await;
+    sim.join("C", true, None, None).await;
     let c = sim.members.len() - 1;
     sim.opened(c).await;
     for _ in 0..20 {

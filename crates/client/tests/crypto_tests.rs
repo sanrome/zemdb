@@ -5,7 +5,6 @@
 
 mod common;
 
-use bincode::Options;
 use common::*;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -167,21 +166,6 @@ fn sealed(values: &[Value], secret: &[u8]) {
         };
         assert!(!holds(bytes, secret), "{value:?}");
     }
-}
-
-/// The additional data of a cell, in the encoding that the facade fixes, as a member with the key
-/// builds them: their version, and then the room id, the table id, the values of the primary key
-/// and the position of the column, in the encoding of the protocol.
-fn additional_data(room_id: &RoomId, table_id: u16, pk: &[Value], column_idx: u16) -> Vec<u8> {
-    let mut data = vec![1];
-    let fields = (room_id.as_str(), table_id, pk, column_idx);
-    let encoding = bincode::DefaultOptions::new();
-    encoding.serialize_into(&mut data, &fields).unwrap();
-    data
-}
-
-fn encoded(value: &Value) -> Vec<u8> {
-    bincode::DefaultOptions::new().serialize(value).unwrap()
 }
 
 /// An update of `column` of the round `round` of [`league_schema`] to `value`, as a member writes
