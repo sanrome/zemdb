@@ -2,7 +2,7 @@
 
 **Fecha:** 4 de Noviembre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su quinta ronda. El dueño del proyecto adoptó el mismo día las precisiones de DC18 y de DC24 a DC26 y las decisiones DC27 a DC31 (DC27, con la condición de S4), con dos ajustes: DC26 dice explícitamente que, en el camino normal, un `ops` se aplica sin ningún `/sync`, y la verificación del `ClientId` de un token renovado pasa de 4.4 al Lote 3 (DC30). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026, con S4 respondido y la revisión de delta en verde en su cuarta ronda. Lote 2 (el stream de eventos: el transporte y el parser) cerrado el 9 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lote 3 (la renovación del token) cerrado el 10 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda. Lote 4 (el worker: la tarea, el heartbeat y las transferencias) cerrado el 12 de Noviembre de 2026. Lote 5 (los modos `periodic` y `manual`) cerrado el 12 de Noviembre de 2026. Lote 6 (el `Ack` periódico, detener el worker y los endurecimientos) cerrado el 13 de Noviembre de 2026. Lote 7 (el modo `live`: el stream en el worker) cerrado el 16 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lote 8 (el evento `ops`) cerrado el 16 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lote 9 (el arnés de simulación con el worker y el SSE) cerrado el 17 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda. Lote 10 (robustez: el fuzzing de los eventos) cerrado el 18 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lo que sigue es el Lote 11, la revisión de cierre.
+**Estado:** En curso: Lote 0 (el contrato) cerrado el 6 de Noviembre de 2026, con la revisión cruzada en verde en su quinta ronda. El dueño del proyecto adoptó el mismo día las precisiones de DC18 y de DC24 a DC26 y las decisiones DC27 a DC31 (DC27, con la condición de S4), con dos ajustes: DC26 dice explícitamente que, en el camino normal, un `ops` se aplica sin ningún `/sync`, y la verificación del `ClientId` de un token renovado pasa de 4.4 al Lote 3 (DC30). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026, con S4 respondido y la revisión de delta en verde en su cuarta ronda. Lote 2 (el stream de eventos: el transporte y el parser) cerrado el 9 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lote 3 (la renovación del token) cerrado el 10 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda. Lote 4 (el worker: la tarea, el heartbeat y las transferencias) cerrado el 12 de Noviembre de 2026. Lote 5 (los modos `periodic` y `manual`) cerrado el 12 de Noviembre de 2026. Lote 6 (el `Ack` periódico, detener el worker y los endurecimientos) cerrado el 13 de Noviembre de 2026. Lote 7 (el modo `live`: el stream en el worker) cerrado el 16 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lote 8 (el evento `ops`) cerrado el 16 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lote 9 (el arnés de simulación con el worker y el SSE) cerrado el 17 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda. Lote 10 (robustez: el fuzzing de los eventos) cerrado el 18 de Noviembre de 2026, con la revisión de delta en verde en su primera ronda. Lote 11 (la revisión de cierre) cerrado el 18 de Noviembre de 2026: la revisión no salió en verde, y la siguen los Lotes 11b y 11c. Lo que sigue es el Lote 11b.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.3. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Parte de:** el SSE del servidor, del Lote 5 de la [Fase 3.12](2026-11-fase3_12-rendimiento-servidor.md) (`2c0a908`): el evento `ops` con la encarnación de la sala, el stream que termina cuando vence su token y `EventsDisabled` (`ARCHITECTURE.md` §7.2).
@@ -147,15 +147,18 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 | 8 | El evento `ops` | client | DC26, DC29 | K1, K6, K2, K7, K12, K17 | ✅ |
 | 9 | El arnés de simulación con el worker y el SSE | client (tests) | §5.3 del plan de la fase | K1, K2, K3, K4, K7, K15, K17 | ✅ |
 | 10 | Robustez: fuzzing de los eventos | client (tests) | — | K12, K17 | ✅ |
-| 11 | Revisión de cierre y cierre | Documentos | Todas | Las de §3.11 que toca 4.3 | ⬜ |
+| 11 | Revisión de cierre y cierre | Documentos | Todas | Las de §3.11 que toca 4.3 | ✅ (su revisión de cierre no salió en verde: la siguen el 11b y el 11c) |
+| 11b | El head de un `ops`, visto solo con sus operaciones validadas | client | DC26 | K2 | ⬜ |
+| 11c | Ninguna configuración que acepta el cliente lleva a un pánico, y el cierre de 4.3 | client | DC28 | K12, K17, K7 | ⬜ |
 
 **Orden.**
 - El Lote 0 va primero: solo documentos, con su revisión cruzada (`docs/METODOLOGIA.md` §2). Las *Propuestas* se confirman antes del Lote 1.
 - El 1 y el 2 (el transporte) y el 3 (el token) no dependen entre sí. Del 4 al 8, en orden: cada uno usa lo anterior, y el 7 usa además el `events` del 2 y la renovación del 3.
 - El 9 y el 10 son pruebas, sin producción (salvo arreglos de lo que encuentren, que van como desvíos en su nota o como lotes nuevos); el 9 antes que el 10, que reusa su transporte.
 - El 11 cierra con la revisión de cierre (§3); sus rupturas se arreglan en lotes nuevos de 4.3.
+- El 11b y el 11c arreglan lo que rompió la revisión de cierre, en ese orden; el 11c cierra 4.3.
 
-**Tamaño.** Unas 150 líneas de producción el Lote 1, 200 el 2, 170 el 3, 200 el 4, 150 el 5, 150 el 6, 250 el 7 y 150 el 8.
+**Tamaño.** Unas 150 líneas de producción el Lote 1, 200 el 2, 170 el 3, 200 el 4, 150 el 5, 150 el 6, 250 el 7, 150 el 8, unas 10 el 11b y unas 20 el 11c.
 
 **Pruebas.**
 - **El worker (Lotes 4 a 8),** contra el servidor real en proceso, como en 4.2, con el reloj pausado (el worker mide sus plazos con el reloj de Tokio) y el transporte de prueba de `crates/client/tests/common/`, que suma `events` sobre el cuerpo SSE del router. Lo que el servidor no produce (un evento dañado o de otra encarnación, un stream que calla) lo fabrica el transporte de prueba. El worker se observa sin hacer `pub` nada interno: por los pedidos que registra el transporte de prueba, por `status` y por el Control Plane del servidor (`GET /admin/rooms/{id}`, con los clientes por estado).
@@ -1469,9 +1472,196 @@ Los dos opcionales que el plan de la fase deja a 4.3. Solo los dispara una respu
 
   Faltaban también cuatro interacciones, ahora en la lista: el tramo que el cliente descarta, las verificaciones del cierre con fuzzing, las llamadas soltadas con los workers en marcha y el head de un `ops` que no valida. Y K12 no nombraba la excepción de DC29. Con el filtro nuevo, una tanda más de 40 semillas de fuzzing en verde. Su segunda ronda, en verde: confirmó los arreglos (el filtro nuevo, con casos armados a mano y la simulación con contadores; la variante de la operación que no valida sigue llegando, y su mutación muere), con un Bajo de documentación, arreglado: el encabezado de la versión 42 no decía que las salas se reabren, y K12 decía "cada cliente", cuando `unfuzz` deja afuera al archivista.
 
-### Lote 11 · Revisión de cierre y cierre · ⬜
+### Lote 11 · Revisión de cierre y cierre · ✅ Hecho (su revisión de cierre no salió en verde: la siguen el 11b y el 11c)
 - La revisión de cierre (§3). Si no sale en verde, sus rupturas se arreglan en lotes nuevos de 4.3, cada uno con su revisión de delta.
 - `INVARIANTES.md`: el estado de cada invariante revisada. El plan de la fase: 4.3 cerrada. `ROADMAP.md`: "Lo que sigue".
+
+**Hecho** (18 de Noviembre de 2026).
+- **La revisión de cierre** (§3), sobre `ea1cafe`, con dos revisores en paralelo, de contexto fresco y solo lectura, cada uno con sus corridas en un clon del repo:
+  - **Los revisores:** Worker y réplica (K1, K4, K5, K6, K7, K11 y K17) y Transporte y robustez (K2, K3, K12 y K15).
+  - **Lo que recibió cada uno:**
+    - `INVARIANTES.md` (§1, §2, el resumen, §3.11 y §4) y `ARCHITECTURE.md` §11;
+    - este plan y el de la fase (DC1 a DC37, §4.3 y §5);
+    - la auditoría de 4.2, con su plan, y `GEMINI.md`;
+    - el código y los arneses.
+  - **El origen (a)** es un commit de 4.3: los de los Lotes 0 a 10, entre los que hay commits de 4.4 y de 3.12.
+  - **El resultado: no salió en verde.** Se rompen INV-K2 ★ e INV-K12 ★, cada una con una Media de origen (a).
+  - **Los tests de la revisión,** como parches contra `ea1cafe`, están en [`docs/audits/2026-11-fase4_3-cierre/`](../audits/2026-11-fase4_3-cierre/README.md).
+- **Las rupturas:**
+  - **INV-K2 ★ · Media · (a), del Lote 8 (`19a5ae2`).**
+    - **El defecto:** `worker_apply` toma el head del evento como head visto después de las cuatro verificaciones de DC26, pero antes de validar sus operaciones.
+    - **El escenario:**
+      - llega un `ops` de la sala, de la encarnación y del esquema de la réplica, cuya operación en `h+1` no valida;
+      - ese evento no cuenta como del servidor (§2 de `INVARIANTES.md`): el cliente lo verifica, y se registra otra vez;
+      - aun así deja su head `F` como head visto;
+      - una escritura que entra antes de que el sync que pide lo corrija (DEF-192) anota `seen = F`;
+      - su `CommitAck` en `h+1` la termina en `OutcomeUnknown`, con la secuencia aplicada y su reporte, que no es ninguno de los casos (a) a (d) de K2.
+    - **El alcance:** falla cerrada (la escritura queda incierta, y nada se pierde ni se inventa), y dura hasta ese sync.
+    - **Por qué no lo vio el fuzzing del Lote 10:** pone esos eventos con el head real, y con fuzzing no verifica las escrituras inciertas.
+    - **El test:** `review_b_an_ops_event_that_does_not_validate_leaves_no_head_seen_for_the_writes_after_it` da `Err(OutcomeUnknown)` en lugar de `Ok(())`.
+    - Lo arregla el **Lote 11b**.
+  - **INV-K12 ★, INV-K17 e INV-K7 · Media · (a), del Lote 7 (`fd09b6e`), con la validación de la configuración del Lote 4 (`0bb4167`).**
+    - **El escenario:**
+      - la aplicación configura `events_retry: Duration::MAX`, la forma habitual de decir "nunca", y `Client::open` lo acepta: solo rechaza el cero, y el rustdoc dice "Above zero";
+      - llega un `EventsDisabled`: un servidor con el SSE apagado, o una negativa de la red, que cuenta como del servidor;
+      - la tarea del worker entra en pánico al sumar el plazo al instante.
+    - **Lo que deja:**
+      - el worker queda detenido (`running: false`, sin `last_error`), sin heartbeats, sin syncs del worker y sin último `Ack`;
+      - con la fachada, cada sala vigilada pierde su worker, y lo vuelve a perder cada vez que la fachada lo arranca.
+    - **La severidad:** los dos revisores lo encontraron por separado.
+      - Uno lo calificó Bajo: es una configuración de la aplicación, como el `Duration::MAX` del pool en el Lote 1.
+      - El otro, Medio.
+      - El dueño del proyecto eligió Medio (18 de Noviembre de 2026): el SDK acepta el valor como válido, y una respuesta del servidor lo hace caer.
+    - **Los tests,** que fallan con el pánico:
+      - `review_a_an_events_retry_beyond_the_clock_leaves_a_live_worker_running_as_in_periodic`;
+      - `review_a_a_refusal_events_disabled_with_events_retry_beyond_the_clock_does_not_stop_the_worker`;
+      - `review_b_an_events_retry_of_duration_max_does_not_stop_the_worker_of_a_room`.
+    - Lo arregla el **Lote 11c**.
+- **Lo que se sostiene,** con el argumento de cada revisor:
+  - **K1 ★.**
+    - `worker_apply` sigue el orden de DC26. Mira la época al leer el evento y con el lock del estado, sin un `.await` entre la validación y el head visto.
+    - Bajo el aplicador, `Local::apply` repite la época, la falla cerrada y el esquema, descarta lo que la réplica ya tiene y no aplica un hueco.
+    - La encarnación se compara fuera del aplicador, y alcanza: en una época, una réplica abierta no cambia de encarnación.
+    - Sin test propio: un `ops` de otro id de esquema. Lo cubre `changes`, probada en `schema_tests.rs`.
+  - **K4 ★.** `Sim::check` compara cada réplica con el oráculo después de cada paso, también con los workers, las fallas del stream, los tokens que vencen, el SSE apagado y el fuzzing. Con la red curada, `heal` exige que todos lleguen al head.
+  - **K5.**
+    - El `Ack` periódico se lee bajo el aplicador, y sale solo si pasó del último. El último `Ack` tiene su plazo.
+    - Todo lo que cambia la respuesta está atado a la época.
+  - **K6 ★.**
+    - Solo `Registered` cambia el esquema.
+    - Una operación de un evento que no valida da `Schema`, nunca `FailedClosed`.
+    - `schema_reloaded` deja la réplica sin registrar.
+  - **K7, salvo `events_retry`.**
+    - Se sostienen los heartbeats, el backoff, los modos, el stream, DEF-196, las transferencias en su tarea y la cota de la simulación.
+    - Sin test, una carrera: si el `select!` no recogió todavía una transferencia que terminó, la que pide el heartbeat siguiente no arranca. Es de la clase anotada en el Lote 5, y cuesta a lo sumo un intervalo.
+  - **K11.**
+    - `close_room`, `shutdown`, `discard_room` y `stop_worker` pasan por la misma detención, que corta y espera las tareas, manda el último `Ack` y recién después cierra la sala.
+    - Un segundo llamador espera el mismo fin.
+    - Un worker que se arranca entre la detención y el cierre ve `RoomClosed`. Está argumentado, y con `shutdown` no tiene test.
+    - Un cliente soltado no manda el último `Ack`.
+  - **K17, salvo `events_retry`.**
+    - Solo detienen al worker `FailedClosed` y `RoomClosed`.
+    - `FailedClosed` sale de un `Registered` que no evoluciona, o de un `SyncBatch` después de que el mismo sync se volvió a registrar, nunca de un evento.
+    - Lo demás se reintenta.
+  - **K2 ★, salvo el `ops` que no valida.**
+    - La renovación del token.
+    - El head visto de DEF-192: `saw_below` solo lo baja.
+    - El head de un `ops` genuino.
+    - Una escritura mientras el worker sincroniza, aplica un evento, transfiere o se detiene.
+  - **K3 ★.**
+    - El worker descarta solo como en 4.2: por el registro, ante `RoomReset` o un `InvalidSequence` a un cursor, o por un daño local al reabrir.
+    - Ninguno de sus caminos descarta una réplica sana: DEF-196, un `ops` de otra encarnación o de otro esquema, `schema_reloaded`, un `Registered` con otra encarnación y un snapshot que se instala.
+    - `review_b_a_forged_ops_of_another_incarnation_keeps_a_sound_replica` prueba el `ops` falsificado de otra encarnación en una sala sana, que ningún test determinista probaba, y pasa.
+  - **K12 ★, salvo `events_retry`.**
+    - Se sostienen la respuesta acotada, el parser, los pánicos de las tareas (que se vuelven `Storage`), los tokens y el túnel del proxy.
+    - El fuzzing pasó con semillas nuevas.
+  - **K15.**
+    - Hay una tarea de cada clase por sala, sin colas.
+    - El stream se lee de a un evento.
+    - Detener el worker corta y espera todas sus tareas.
+- **Indeterminada, para K7:** lo que dejó el Lote 1, el verificador de la plataforma.
+  - **Lo que hace cada sistema:**
+    - En macOS, `SecTrustEvaluateWithError` es síncrono, y puede ir a la red sin tope.
+    - En Windows, la revisión de la revocación acumula hasta 10 s de descargas.
+  - **Por qué lo puede trabar:**
+    - Las dos llamadas corren dentro del `poll` del handshake, y bloquean un hilo del runtime.
+    - `connect_timeout` no las corta.
+    - Con TLS 1.2, una verificación de más de 10 s cortaría la conexión cada vez, si el sistema no recuerda la URL caída.
+  - **Lo que no toca:** K2. Un plazo que vence tarde corta igual, y el intento cuenta como incierto.
+  - **Lo que faltó:** correrlo en esos sistemas contra un certificado cuya URL de OCSP o de CRL no responda.
+  - Queda para la revisión que lo pueda correr (D90): la de cierre de la Fase 4, en 4.7.
+- **Las corridas** de los revisores en `ea1cafe`:
+  - **Las suites:** `worker_tests` (51), `live_tests` (47), `token_tests` (22), `http_transport_tests` (35), `events_tests` (2) y los 32 unitarios del parser, del transporte y del token, también los largos.
+  - **La simulación:**
+    - sin fuzzing, con las semillas 700 a 715;
+    - con el fuzzing de los eventos, con las semillas 600 a 623, de cada esquema.
+  - **El fuzzing del parser:** 40 semillas de 2000 corridas, y 20 de 500 a través del transporte HTTP.
+- **La verificación del coordinador:** con los dos parches juntos sobre `ea1cafe`, fallan los cuatro tests de las rupturas y el del Bajo de K12, y pasan los demás, también los dos largos del parser.
+- **Bajos corregidos en este lote** (documentos):
+  - **INV-K12, *Sostenida por*:** sin `Content-Length`, el búfer de una respuesta crece hasta el doble de `MAX_FRAME_SIZE`, con reservas que abortan si no hay memoria. El texto decía que reservaba a lo sumo ese largo.
+    - El test `review_b_a_response_without_a_length_reserves_at_most_a_frame` mide 32.768.000 bytes reservados para un frame de 16 MiB más 4.
+    - Es proporcional, así que K12 se sostiene. Va con DEF-195.
+  - **`ARCHITECTURE.md` §11, *Timeouts that do not cut a request that advances*, y el rustdoc de `HttpTransportConfig::connect_timeout`:** en macOS y Windows, la verificación del certificado corre dentro del handshake, y un temporizador no la corta.
+  - **`ARCHITECTURE.md` §11, *The task*:** la aplicación de un evento retiene al cliente, y el worker de un cliente soltado se detiene también cuando esa aplicación termina pidiendo un sync. Ya lo decían los rustdoc, y lo prueba `live_tests.rs`.
+- **A un lote nuevo** (un Bajo de tests): el plazo de conexión, sin test desde los Lotes 1 y 2, que lo dejaron porque en la CI no hay una dirección que descarte los SYN.
+  - `review_b_a_tls_handshake_the_server_never_answers_is_cut_by_the_connect_timeout` lo prueba en loopback, contra un servidor `https://` que no contesta el `ClientHello`, y pasa.
+  - Mata la mutación que quita el plazo, que sobrevive a los 35 tests de `http_transport_tests.rs`.
+  - Lo trae el Lote 11c.
+- **Una observación, sin hallazgo:** un evento leído en la misma vuelta en que el worker pasa a `manual` puede lanzar un sync en `manual`, porque `notice` no mira el modo. Es un sync de más, sin efecto.
+- **Las propuestas,** que el dueño del proyecto adoptó el 18 de Noviembre de 2026:
+  - **De los dos revisores:** en INV-K12 y DC28, ninguna configuración que aceptan `Client::open` y `HttpTransport::new` lleva a un pánico ni detiene un worker. Entra con el Lote 11c.
+  - **Del revisor de transporte:** una precisión de DC26 y de INV-K2. El head de un `ops` es un head visto recién cuando sus operaciones también validan, así que un evento que no cuenta como del servidor no deja incierta ninguna escritura. Entra con el Lote 11b.
+- **Desvíos:**
+  - **Respecto de §3:** el revisor de transporte respondió también por el verificador de la plataforma, que el Lote 1 dejó para esta revisión y que toca a K7, del otro revisor.
+  - **La compilación:** los revisores compilaron sin información de depuración, para que sus dos targets entraran en el disco.
+
+### Lote 11b · El head de un `ops`, visto solo con sus operaciones validadas (`zemdb-client`) · ⬜
+**Objetivo:** que un `ops` que no cuenta como del servidor no deje incierta ninguna escritura.
+- La revisión de cierre del Lote 11 rompió ahí INV-K2 ★, con una Media de origen (a), del Lote 8.
+- El dueño del proyecto eligió arreglarla en un lote nuevo (18 de Noviembre de 2026), y adoptó la precisión de DC26 que propuso la revisión.
+
+**Archivos:** `crates/client/src/client.rs` (`worker_apply`) y `crates/client/tests/live_tests.rs`.
+
+**Qué se hace:**
+- **La validación de las operaciones.** `worker_apply` valida también las operaciones del evento con el esquema de la réplica (`Schema::validate_operation`), junto con las demás verificaciones de DC26 y antes de tomar su head como head visto.
+- **Si una no valida:** el evento deja la réplica sin registrar y pide un sync, como uno de otro esquema, sin head visto y sin pasar por el aplicador.
+- **La alternativa, descartada:** tomar el head después de aplicar. Se probó en un clon al cerrar el Lote 11, y rompe `a_write_that_waits_for_the_applier_when_an_event_comes_saw_the_head_of_the_event`, del Lote 8: una escritura que espera el aplicador mientras llega un evento genuino tiene que haber visto su head, para no retener sus rechazos.
+- **La precisión de DC26** (§1), con lo que dicen INV-K2 y `ARCHITECTURE.md`.
+
+**Tests exigidos:**
+- **El de la revisión,** traído al repo con otro nombre y sin códigos.
+- **El head de un evento genuino:** sigue siendo un head visto antes del aplicador. Es el test del Lote 8, sin cambios.
+- **Los dos tests del Lote 8 que usan un evento cuya operación no valida,** ajustados:
+  - `an_event_with_an_operation_that_does_not_validate_registers_and_syncs_and_never_fails_closed`, que esperaba un segundo registro, el que corregía el head visto;
+  - `a_client_dropped_while_an_application_holds_it_ends_the_worker_once_it_ends`, que usaba ese evento para retener `apply_batch`.
+- **La simulación con el fuzzing de los eventos,** con su clase "invalid operation", sin cambios en sus expectativas.
+
+**Interacciones a revisar:**
+- una operación de una versión anterior del esquema, que valida con el local (INV-E3);
+- un esquema que cambia entre la verificación y el aplicador (`Local::apply` repite `changes`);
+- una operación de una tabla que el esquema no tiene, que hoy llega a `apply_batch` como un error del storage;
+- operaciones que la réplica ya tiene;
+- el costo de validar cada operación dos veces.
+
+**Documentos:**
+- `INVARIANTES.md`: INV-K2 y su estado;
+- `ARCHITECTURE.md` §11, *Its operations*;
+- el rustdoc de `worker_apply`;
+- las precisiones de DC26.
+
+**Entrega:** `fix(client): the head of an ops event is a head seen once its operations validate (Fase 4.3, Lote 11b)`.
+
+### Lote 11c · Ninguna configuración que acepta el cliente lleva a un pánico, y el cierre de 4.3 (`zemdb-client`) · ⬜
+**Objetivo:** que ningún valor que aceptan `Client::open` y `HttpTransport::new` lleve después a un pánico, ni detenga un worker.
+- La revisión de cierre del Lote 11 rompió ahí INV-K12 ★, INV-K17 e INV-K7, con una Media de origen (a), del Lote 7.
+- El dueño del proyecto eligió arreglarla en un lote nuevo (18 de Noviembre de 2026), y adoptó la precisión de INV-K12 y DC28 que propusieron los dos revisores.
+
+**Archivos:** `crates/client/src/worker.rs`, `config.rs`, `client.rs` (`Client::open`) y `http_transport.rs`, y sus tests.
+
+**Qué se hace:**
+- **El reintento del stream después de `EventsDisabled`** se suma al instante sin desbordar. Un `events_retry` que no cabe en el reloj no vuelve a intentar el stream mientras el worker no cambie de modo, como si dijera "nunca". O, si el paso 0 lo prefiere, es `Config` al abrir, como el `write_timeout` que no cabe en el reloj.
+- **Cada plazo que aceptan `ClientConfig` y `HttpTransportConfig`, con su valor más grande:**
+  - `write_timeout`, que ya es `Config` si no cabe en el reloj;
+  - `backoff_base`, `backoff_max`, `retry_base` y `retry_max`: la espera con *full jitter* se acota en `u64::MAX` nanosegundos, que caben en el reloj;
+  - `heartbeat_interval`, debajo de 60 s;
+  - `connect_timeout` e `idle_timeout`;
+  - `pool_idle_timeout`, que no pasa de 300 s.
+  - Un plazo que hoy puede desbordar se acota como `events_retry`.
+- **La precisión de INV-K12 y DC28** que adoptó el dueño del proyecto.
+
+**Tests exigidos:**
+- **Los de la revisión,** traídos al repo con otro nombre y sin códigos: el SSE apagado del servidor, y una negativa `EventsDisabled` de la red, con `events_retry: Duration::MAX`. El worker sigue, en `periodic`.
+- **Cada plazo de la configuración en `Duration::MAX`:** el cliente abre o da `Config`, y nada entra en pánico. El worker sigue con sus heartbeats, las escrituras terminan y el transporte manda.
+- **El plazo de conexión de la revisión:** un handshake de TLS que el servidor no contesta se corta en el plazo de conexión.
+
+**Documentos:**
+- `INVARIANTES.md`: INV-K12, K17 y K7, con su estado y el de cada invariante revisada;
+- `ARCHITECTURE.md` §11;
+- el rustdoc de `ClientConfig` y de `HttpTransportConfig`;
+- DC28;
+- el cierre de 4.3, que pasó a este lote: el plan de la fase, con 4.3 cerrada, y `ROADMAP.md`, "Lo que sigue".
+
+**Entrega:** `fix(client): no configuration the client takes panics a task or stops a worker, and close Fase 4.3 (Fase 4.3, Lote 11c)`.
 
 ---
 
@@ -1490,4 +1680,4 @@ Cada uno recibe `INVARIANTES.md`, `ARCHITECTURE.md`, este plan, el de la fase (d
 
 ## 4. Seguimiento
 
-**Avance:** plan escrito el 4 de Noviembre de 2026. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su quinta ronda: las precisiones de DC18 y de DC24 a DC26 y DC27 a DC31, como *Propuestas*, y `INVARIANTES.md` en la versión 16. El dueño del proyecto las adoptó el mismo día, con dos ajustes (la frase de DC26 sobre el camino normal sin `/sync` y la verificación del `ClientId` en el Lote 3). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026: S4 respondido en DC27 (compila con `aws-lc-rs` y el MSRV; el plazo de inactividad lo arma el transporte), la revisión de delta en verde en su cuarta ronda e `INVARIANTES.md` en la versión 19 (la 18 la tomó el Lote 0 de 4.4). Lote 2 (el stream de eventos: el transporte y el parser) cerrado el 9 de Noviembre de 2026: el stream por su propio cliente HTTP/1.1, el parser con su tope de 64 KiB y la decodificación de los eventos, que todavía nadie usa; la revisión de delta en verde en su primera ronda, con sus Bajos arreglados en el lote, e `INVARIANTES.md` en la versión 22 (la 20 la tomó el Lote 6b de 3.12, y la 21, el Lote 1 de 4.4). Lote 3 (la renovación del token) cerrado el 10 de Noviembre de 2026: el `TokenProvider` en `Client::open` y en la fachada de 4.4, la renovación ante `Unauthorized` (una por sala a la vez, con su plazo de 60 s, y el pedido repetido una vez), la verificación del formato y del `ClientId` del token renovado, el token marcado ante `Forbidden`, y la escritura que no queda incierta por un `Unauthorized` ni manda nada después de terminar; la revisión de delta en verde en su segunda ronda, e `INVARIANTES.md` en la versión 24 (la 23 la tomó el Lote 2 de 4.4). Lote 4 (el worker: la tarea, el heartbeat y las transferencias) cerrado el 12 de Noviembre de 2026: `start_worker`, `set_freshness` y `stop_worker`, una tarea por sala que tiene al cliente por un `Weak`, un heartbeat por intervalo (el primero al azar) que no espera las transferencias, que corren en su tarea, los reintentos con backoff y *full jitter*, lo que lo detiene (solo `FailedClosed` y `RoomClosed` de sus pasos), `close_room` y `shutdown` que lo detienen antes de cerrar, y el worker y el estado de la conexión en `status`; e `INVARIANTES.md` en la versión 28 (la 25 y la 26 las tomaron los Lotes 3 y 4 de 4.4, y la 27, el Lote 7 de 3.12). Lote 5 (los modos `periodic` y `manual`) cerrado el 12 de Noviembre de 2026: en `periodic`, y en `live` hasta el stream, un heartbeat cuyo ack informa un head mayor que el de la réplica lleva a un sync del worker, sin `Ack`, en su tarea, uno a la vez y uno más marcado; en `manual`, ninguno, y el worker igual sube y baja snapshots; la revisión de delta en verde en su primera ronda, e `INVARIANTES.md` en la versión 31 (la 29 la tomó el Lote 5 de 4.4, y la 30, la revisión de cierre de 3.12). Lote 6 (el `Ack` periódico, detener el worker y los endurecimientos) cerrado el 13 de Noviembre de 2026: el `Ack` del head de la réplica con cada heartbeat que sale bien, si pasó del último que el servidor tomó como cursor, y el último al detener el worker, con su plazo de 5 s, antes de cerrar la sala; un llamador que detiene el worker mientras otro lo detiene espera esa detención; DEF-196 (una réplica que espera un snapshot que nadie anuncia se registra otra vez después de 10 heartbeats) y DEF-192 (una respuesta con un head menor que el visto baja el head visto y registra la réplica); e `INVARIANTES.md` en la versión 34 (la 32 la tomó el Lote 6 de 4.4, y la 33, el Lote 8b de 3.12). Lote 7 (el modo `live`: el stream en el worker) cerrado el 16 de Noviembre de 2026: en `live`, el worker abre el stream de la sala y sincroniza después de abrirlo, y cada evento es un aviso (un sync, un registro con el cursor o un heartbeat en la tarea de las transferencias), si el stream es de la época de la réplica; lo reabre después de su fin, de un error o de 45 s sin un bloque, con un backoff que un evento vuelve a empezar, y con el token renovado ante `Unauthorized`; con el SSE apagado sigue como en `periodic` hasta `events_retry`; `set_freshness` lo abre o lo cierra en el momento, y `status` dice el modo efectivo y si el stream está abierto; e `INVARIANTES.md` en la versión 36 (la 35 la tomó el Lote 7 de 4.4). Lote 8 (el evento `ops`) cerrado el 16 de Noviembre de 2026: las operaciones de un evento `ops` llegan a la réplica por el aplicador, sin un sync, una vez validado (de la sala del stream, con operaciones contiguas que terminan en su head, de la época, de la encarnación y del esquema de la réplica), con su head como un head visto; un hueco, otra encarnación, otro esquema o una operación que no valida llevan a un sync o a un registro, nunca a fallar cerrada la sala; un evento a la vez, sin leer el stream mientras se aplica; e `INVARIANTES.md` en la versión 38 (la 37 la tomó el Lote 8 de 4.4). Lote 9 (el arnés de simulación con el worker y el SSE) cerrado el 17 de Noviembre de 2026: la simulación de 4.2 suma clientes con worker, en modos al azar que cambian, sobre un stream que pierde, demora y corta eventos, con tokens que vencen y el SSE apagado en algunos reinicios; con la red curada, los workers que sincronizan solos vuelven al head sin una llamada del test en a lo sumo 12 intervalos, detrás del log y detrás del head; ningún worker se detiene; y los tres tests de los Lotes 4 a 6 que dependían de cuándo cae el primer heartbeat esperan el estado que miden; solo tests, e `INVARIANTES.md` en la versión 41 (la 39 la tomó el Lote 10 de 4.4, y la 40, el Lote 8c de 3.12). Lote 10 (robustez: el fuzzing de los eventos) cerrado el 18 de Noviembre de 2026: el fuzzing de la simulación corre con los workers, con bloques del stream que no son del servidor (bytes al azar, eventos dañados, líneas sin fin, `ops` con un mensaje al azar, con una operación que no valida o falsificados de otra sala o de otra encarnación) y negativas al azar, sin entregar un `ops` que el cliente no distingue de uno del servidor; ningún worker se detiene ni ninguna sala falla cerrada; y el parser se prueba a través del transporte HTTP contra un servidor del test; solo tests, e `INVARIANTES.md` en la versión 43 (la 42 la tomó el Lote 9 de 4.4). Lo que sigue es el Lote 11, la revisión de cierre.
+**Avance:** plan escrito el 4 de Noviembre de 2026. Lote 0 (el contrato) cerrado el 6 de Noviembre, con la revisión cruzada en verde en su quinta ronda: las precisiones de DC18 y de DC24 a DC26 y DC27 a DC31, como *Propuestas*, y `INVARIANTES.md` en la versión 16. El dueño del proyecto las adoptó el mismo día, con dos ajustes (la frase de DC26 sobre el camino normal sin `/sync` y la verificación del `ClientId` en el Lote 3). Lote 1 (el transporte HTTP nativo) cerrado el 7 de Noviembre de 2026: S4 respondido en DC27 (compila con `aws-lc-rs` y el MSRV; el plazo de inactividad lo arma el transporte), la revisión de delta en verde en su cuarta ronda e `INVARIANTES.md` en la versión 19 (la 18 la tomó el Lote 0 de 4.4). Lote 2 (el stream de eventos: el transporte y el parser) cerrado el 9 de Noviembre de 2026: el stream por su propio cliente HTTP/1.1, el parser con su tope de 64 KiB y la decodificación de los eventos, que todavía nadie usa; la revisión de delta en verde en su primera ronda, con sus Bajos arreglados en el lote, e `INVARIANTES.md` en la versión 22 (la 20 la tomó el Lote 6b de 3.12, y la 21, el Lote 1 de 4.4). Lote 3 (la renovación del token) cerrado el 10 de Noviembre de 2026: el `TokenProvider` en `Client::open` y en la fachada de 4.4, la renovación ante `Unauthorized` (una por sala a la vez, con su plazo de 60 s, y el pedido repetido una vez), la verificación del formato y del `ClientId` del token renovado, el token marcado ante `Forbidden`, y la escritura que no queda incierta por un `Unauthorized` ni manda nada después de terminar; la revisión de delta en verde en su segunda ronda, e `INVARIANTES.md` en la versión 24 (la 23 la tomó el Lote 2 de 4.4). Lote 4 (el worker: la tarea, el heartbeat y las transferencias) cerrado el 12 de Noviembre de 2026: `start_worker`, `set_freshness` y `stop_worker`, una tarea por sala que tiene al cliente por un `Weak`, un heartbeat por intervalo (el primero al azar) que no espera las transferencias, que corren en su tarea, los reintentos con backoff y *full jitter*, lo que lo detiene (solo `FailedClosed` y `RoomClosed` de sus pasos), `close_room` y `shutdown` que lo detienen antes de cerrar, y el worker y el estado de la conexión en `status`; e `INVARIANTES.md` en la versión 28 (la 25 y la 26 las tomaron los Lotes 3 y 4 de 4.4, y la 27, el Lote 7 de 3.12). Lote 5 (los modos `periodic` y `manual`) cerrado el 12 de Noviembre de 2026: en `periodic`, y en `live` hasta el stream, un heartbeat cuyo ack informa un head mayor que el de la réplica lleva a un sync del worker, sin `Ack`, en su tarea, uno a la vez y uno más marcado; en `manual`, ninguno, y el worker igual sube y baja snapshots; la revisión de delta en verde en su primera ronda, e `INVARIANTES.md` en la versión 31 (la 29 la tomó el Lote 5 de 4.4, y la 30, la revisión de cierre de 3.12). Lote 6 (el `Ack` periódico, detener el worker y los endurecimientos) cerrado el 13 de Noviembre de 2026: el `Ack` del head de la réplica con cada heartbeat que sale bien, si pasó del último que el servidor tomó como cursor, y el último al detener el worker, con su plazo de 5 s, antes de cerrar la sala; un llamador que detiene el worker mientras otro lo detiene espera esa detención; DEF-196 (una réplica que espera un snapshot que nadie anuncia se registra otra vez después de 10 heartbeats) y DEF-192 (una respuesta con un head menor que el visto baja el head visto y registra la réplica); e `INVARIANTES.md` en la versión 34 (la 32 la tomó el Lote 6 de 4.4, y la 33, el Lote 8b de 3.12). Lote 7 (el modo `live`: el stream en el worker) cerrado el 16 de Noviembre de 2026: en `live`, el worker abre el stream de la sala y sincroniza después de abrirlo, y cada evento es un aviso (un sync, un registro con el cursor o un heartbeat en la tarea de las transferencias), si el stream es de la época de la réplica; lo reabre después de su fin, de un error o de 45 s sin un bloque, con un backoff que un evento vuelve a empezar, y con el token renovado ante `Unauthorized`; con el SSE apagado sigue como en `periodic` hasta `events_retry`; `set_freshness` lo abre o lo cierra en el momento, y `status` dice el modo efectivo y si el stream está abierto; e `INVARIANTES.md` en la versión 36 (la 35 la tomó el Lote 7 de 4.4). Lote 8 (el evento `ops`) cerrado el 16 de Noviembre de 2026: las operaciones de un evento `ops` llegan a la réplica por el aplicador, sin un sync, una vez validado (de la sala del stream, con operaciones contiguas que terminan en su head, de la época, de la encarnación y del esquema de la réplica), con su head como un head visto; un hueco, otra encarnación, otro esquema o una operación que no valida llevan a un sync o a un registro, nunca a fallar cerrada la sala; un evento a la vez, sin leer el stream mientras se aplica; e `INVARIANTES.md` en la versión 38 (la 37 la tomó el Lote 8 de 4.4). Lote 9 (el arnés de simulación con el worker y el SSE) cerrado el 17 de Noviembre de 2026: la simulación de 4.2 suma clientes con worker, en modos al azar que cambian, sobre un stream que pierde, demora y corta eventos, con tokens que vencen y el SSE apagado en algunos reinicios; con la red curada, los workers que sincronizan solos vuelven al head sin una llamada del test en a lo sumo 12 intervalos, detrás del log y detrás del head; ningún worker se detiene; y los tres tests de los Lotes 4 a 6 que dependían de cuándo cae el primer heartbeat esperan el estado que miden; solo tests, e `INVARIANTES.md` en la versión 41 (la 39 la tomó el Lote 10 de 4.4, y la 40, el Lote 8c de 3.12). Lote 10 (robustez: el fuzzing de los eventos) cerrado el 18 de Noviembre de 2026: el fuzzing de la simulación corre con los workers, con bloques del stream que no son del servidor (bytes al azar, eventos dañados, líneas sin fin, `ops` con un mensaje al azar, con una operación que no valida o falsificados de otra sala o de otra encarnación) y negativas al azar, sin entregar un `ops` que el cliente no distingue de uno del servidor; ningún worker se detiene ni ninguna sala falla cerrada; y el parser se prueba a través del transporte HTTP contra un servidor del test; solo tests, e `INVARIANTES.md` en la versión 43 (la 42 la tomó el Lote 9 de 4.4). Lote 11 (la revisión de cierre) cerrado el 18 de Noviembre de 2026, sobre `ea1cafe`, con dos revisores: no salió en verde. Rompió INV-K2 ★ (un `ops` cuya operación no valida deja su head como head visto, y una escritura incierta con su secuencia aplicada) e INV-K12 ★, K17 y K7 (un `events_retry` que no cabe en el reloj hace entrar en pánico al worker ante `EventsDisabled`), con dos Medias de origen (a). Las arreglan los Lotes 11b y 11c. Se corrigieron Bajos de documentos, e `INVARIANTES.md` queda en la versión 44. Lo que sigue es el Lote 11b.

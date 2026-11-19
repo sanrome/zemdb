@@ -28,6 +28,9 @@ pub struct HttpTransportConfig {
     /// the paths of the Data Plane go under it (`{url}/rooms/{room_id}/commit`).
     pub url: String,
     /// The longest a connection may take to open, with its TLS handshake (10 s). Above zero.
+    /// On macOS and Windows the system verifies the certificate within the handshake, with a
+    /// check of its revocation that may go to the network: a timer cannot cut that call while it
+    /// blocks.
     pub connect_timeout: Duration,
     /// The longest a request may go without advancing (60 s), however long it takes in all.
     /// Above zero.

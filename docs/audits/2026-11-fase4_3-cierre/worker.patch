@@ -1,0 +1,124 @@
+diff --git a/crates/client/tests/review_a_worker.rs b/crates/client/tests/review_a_worker.rs
+new file mode 100644
+index 0000000..92fb367
+--- /dev/null
++++ b/crates/client/tests/review_a_worker.rs
+@@ -0,0 +1,118 @@
++//! Tests of the closing review of Fase 4.3, reviewer A (the worker and the replica): the worker
++//! of a room against the server in process, with the paused clock.
++
++mod common;
++
++use common::*;
++use std::sync::Arc;
++use std::time::Duration;
++use tokio::time::Instant;
++use zemdb_client::{Client, ClientConfig, Freshness, MemoryMetadata, WorkerStatus};
++use zemdb_core::*;
++use zemdb_storage::{MemoryStorageEngine, StorageEngine};
++
++/// A client with `config` over `storage` and a memory store of metadata, through `transport`.
++async fn client_over(
++    storage: impl StorageEngine + 'static,
++    transport: &TestTransport,
++    config: ClientConfig,
++    tokens: &TestTokens,
++) -> Arc<Client> {
++    let metadata = MemoryMetadata::default();
++    let client = Client::open(config, storage, metadata, transport.clone(), tokens.clone());
++    Arc::new(client.await.unwrap())
++}
++
++/// The worker of `room_id` of `client`, as its status gives it.
++async fn worker(client: &Client, room_id: &RoomId) -> WorkerStatus {
++    let status = client.status(room_id.clone()).await.unwrap();
++    status.worker.unwrap()
++}
++
++/// The head of the replica of `room_id` of `client`.
++async fn head(client: &Client, room_id: &RoomId) -> u64 {
++    client.status(room_id.clone()).await.unwrap().head_seq.get()
++}
++
++/// `events_retry` is "above zero", as `Client::open` checks: `Duration::MAX`, the idiom for
++/// "never again", opens the client. Once the server answers that its event stream is off
++/// (`EventsDisabled`, which INV-K17 and DC24 make permanent for the configuration of the server,
++/// not for the room), a worker in `Live` has to go on as in `Periodic`: it keeps running, and
++/// what another client writes reaches the replica with a heartbeat.
++#[tokio::test(start_paused = true)]
++async fn review_a_an_events_retry_beyond_the_clock_leaves_a_live_worker_running_as_in_periodic() {
++    let server = TestServer::with(|config| config.max_sse_streams = Some(0));
++    let room_id = server.create_room("room-a").await;
++    let (transport, tokens) = (server.transport(), TestTokens::new());
++    let config = ClientConfig {
++        freshness: Freshness::Live,
++        heartbeat_interval: Duration::from_secs(10),
++        events_retry: Duration::MAX,
++        ..ClientConfig::new("ana")
++    };
++    let client = client_over(MemoryStorageEngine::new(), &transport, config, &tokens).await;
++    open_room(&client, &room_id).await.unwrap();
++    client.start_worker(room_id.clone()).await.unwrap();
++    tokio::time::sleep(Duration::from_millis(10)).await;
++    assert_eq!(transport.stream_opens().len(), 1, "The worker tried the stream");
++    let status = worker(&client, &room_id).await;
++    assert!(
++        status.running,
++        "The refusal of the stream stopped the worker: {status:?}"
++    );
++    assert_eq!(status.effective, Freshness::Periodic);
++
++    // What another client writes comes with a heartbeat, as in `Periodic`.
++    server.commit(&room_id, [1]).await;
++    let start = Instant::now();
++    while head(&client, &room_id).await != 1 {
++        assert!(
++            start.elapsed() <= Duration::from_secs(25),
++            "No heartbeat synced: {:?}",
++            worker(&client, &room_id).await
++        );
++        tokio::time::sleep(Duration::from_millis(10)).await;
++    }
++}
++
++/// The same with a refusal that the network writes in place of the server's: an `EventsDisabled`
++/// that decodes and is of the room counts as of the server (INVARIANTES §2, DC26), and leaves the
++/// worker as in `Periodic`, not stopped.
++#[tokio::test(start_paused = true)]
++async fn review_a_a_refusal_events_disabled_with_events_retry_beyond_the_clock_does_not_stop_the_worker(
++) {
++    let server = TestServer::new();
++    let room_id = server.create_room("room-a").await;
++    let (transport, tokens) = (server.transport(), TestTokens::new());
++    transport.answer_next_events(|room_id| Ok(refused(room_id, ErrorCode::EventsDisabled)));
++    let config = ClientConfig {
++        freshness: Freshness::Live,
++        heartbeat_interval: Duration::from_secs(10),
++        events_retry: Duration::MAX,
++        ..ClientConfig::new("ana")
++    };
++    let client = client_over(MemoryStorageEngine::new(), &transport, config, &tokens).await;
++    open_room(&client, &room_id).await.unwrap();
++    client.start_worker(room_id.clone()).await.unwrap();
++    tokio::time::sleep(Duration::from_millis(10)).await;
++    assert_eq!(transport.stream_opens().len(), 1, "The worker tried the stream");
++    // Two intervals: heartbeats go on.
++    let beats = || {
++        let sent = transport.sent();
++        let beat = |message: &&ClientMessage| message.kind() == ClientMessageKind::Heartbeat;
++        sent.iter().filter(beat).count()
++    };
++    let before = beats();
++    tokio::time::sleep(Duration::from_secs(21)).await;
++    let status = worker(&client, &room_id).await;
++    assert!(
++        status.running,
++        "The refusal of the stream stopped the worker: {status:?}"
++    );
++    assert!(
++        beats() >= before + 2,
++        "The worker sends no heartbeats: {} then {}",
++        before,
++        beats()
++    );
++}

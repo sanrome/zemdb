@@ -1,0 +1,350 @@
+diff --git a/crates/client/src/tests/events.rs b/crates/client/src/tests/events.rs
+index 9d308d4..b9e742c 100644
+--- a/crates/client/src/tests/events.rs
++++ b/crates/client/src/tests/events.rs
+@@ -607,6 +607,15 @@ fn random_and_damaged_streams_are_read_without_panics_however_they_are_split_lon
+     }
+ }
+ 
++/// Revisión B del cierre de 4.3: el fuzzing del parser con otras semillas que las de la suite.
++#[test]
++#[ignore = "review: run with --ignored"]
++fn review_b_random_and_damaged_streams_with_other_seeds() {
++    for seed in 1_000..1_040 {
++        fuzz(seed, 2_000);
++    }
++}
++
+ /// The parser through the transport over HTTP, against a server of the test that writes the
+ /// streams at random as the bodies of its responses.
+ #[cfg(feature = "native")]
+@@ -760,4 +769,13 @@ mod over_http {
+             fuzz_over_http(seed, 500).await;
+         }
+     }
++
++    /// Revisión B del cierre de 4.3: el fuzzing a través del transporte HTTP con otras semillas.
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    #[ignore = "review: run with --ignored"]
++    async fn review_b_streams_over_http_with_other_seeds() {
++        for seed in 1_000..1_020 {
++            fuzz_over_http(seed, 500).await;
++        }
++    }
+ }
+diff --git a/crates/client/tests/review_b_transporte.rs b/crates/client/tests/review_b_transporte.rs
+new file mode 100644
+index 0000000..278393a
+--- /dev/null
++++ b/crates/client/tests/review_b_transporte.rs
+@@ -0,0 +1,310 @@
++//! Revisión B del cierre de 4.3 (transporte y robustez): tests de la revisión, fuera de la suite.
++#![cfg(feature = "native")]
++
++mod common;
++
++use base64::engine::general_purpose::STANDARD;
++use base64::Engine;
++use common::*;
++use std::sync::Arc;
++use std::time::Duration;
++use tokio::io::{AsyncReadExt, AsyncWriteExt};
++use tokio::net::TcpListener;
++use tokio::time::Instant;
++use zemdb_client::{
++    Client, ClientConfig, ClientError, Freshness, HttpTransport, HttpTransportConfig,
++    MemoryMetadata, TransportClient, WorkerStatus,
++};
++use zemdb_core::ClientMessageKind::Sync;
++use zemdb_core::*;
++use zemdb_storage::{MemoryStorageEngine, StorageEngine};
++
++const INTERVAL: Duration = Duration::from_secs(59);
++
++fn live() -> ClientConfig {
++    ClientConfig {
++        freshness: Freshness::Live,
++        heartbeat_interval: INTERVAL,
++        ..ClientConfig::new("ana")
++    }
++}
++
++async fn client_over(
++    storage: impl StorageEngine + 'static,
++    transport: &TestTransport,
++    config: ClientConfig,
++) -> Arc<Client> {
++    let client = Client::open(
++        config,
++        storage,
++        MemoryMetadata::default(),
++        transport.clone(),
++        TestTokens::new(),
++    );
++    Arc::new(client.await.unwrap())
++}
++
++async fn worker(client: &Client, room_id: &RoomId) -> WorkerStatus {
++    client.status(room_id.clone()).await.unwrap().worker.unwrap()
++}
++
++async fn opened(client: &Client, room_id: &RoomId) {
++    let start = Instant::now();
++    while !worker(client, room_id).await.stream_open {
++        assert!(start.elapsed() < Duration::from_secs(5), "No stream opened");
++        tokio::time::sleep(Duration::from_millis(1)).await;
++    }
++    tokio::time::sleep(Duration::from_millis(10)).await;
++}
++
++async fn head(client: &Client, room_id: &RoomId) -> u64 {
++    client.status(room_id.clone()).await.unwrap().head_seq.get()
++}
++
++async fn reaches(client: &Client, room_id: &RoomId, at: u64) {
++    let start = Instant::now();
++    while head(client, room_id).await != at {
++        assert!(start.elapsed() < Duration::from_secs(1), "{room_id} not at {at}");
++        tokio::time::sleep(Duration::from_millis(1)).await;
++    }
++}
++
++fn heartbeats(transport: &TestTransport) -> usize {
++    let sent = transport.sent();
++    sent.iter()
++        .filter(|message| message.kind() == ClientMessageKind::Heartbeat)
++        .count()
++}
++
++async fn after_a_heartbeat(transport: &TestTransport) {
++    let (before, start) = (heartbeats(transport), Instant::now());
++    while heartbeats(transport) == before {
++        assert!(start.elapsed() < INTERVAL + Duration::from_secs(2));
++        tokio::time::sleep(Duration::from_millis(1)).await;
++    }
++    tokio::time::sleep(Duration::from_millis(10)).await;
++}
++
++fn ops_text(event: &ServerMessage) -> String {
++    let data = STANDARD.encode(encode_message(event).unwrap());
++    format!("event: ops\ndata: {data}\n\n")
++}
++
++fn ops_of(room_id: &RoomId, incarnation: u128, ops: Vec<SequencedOperation>, head: u64) -> ServerMessage {
++    ServerMessage::OpsEvent {
++        room_id: room_id.clone(),
++        room_incarnation: incarnation,
++        head_seq: SequenceNumber::new(head),
++        ops,
++        schema_version: 1,
++        schema_id: SchemaId::new("tasks").unwrap(),
++    }
++}
++
++fn after(head: u64, ops: impl IntoIterator<Item = Operation>) -> Vec<SequencedOperation> {
++    let sequenced = (head + 1..).zip(ops);
++    sequenced
++        .map(|(seq, op)| SequencedOperation::new(SequenceNumber::new(seq), op))
++        .collect()
++}
++
++/// Un insert en `tasks` de un esquema cuyo `title` es un entero: no valida con `tasks_schema`.
++fn retyped_insert(id: i64) -> Operation {
++    let retyped = TableSchema::builder("tasks")
++        .primary_key("id", DataType::Int)
++        .column("title", DataType::Int);
++    let schema = Schema::builder().table(retyped).build();
++    let row = RowBuilder::new().set("id", id).set("title", 7).build();
++    schema.to_operation_insert("tasks", &row, 1000).unwrap()
++}
++
++/// K3: un `ops` falsificado de otra encarnación en una sala sana (el servidor no la recreó)
++/// lleva a registrarse con el cursor y la encarnación de la réplica, y nada se descarta.
++#[tokio::test(start_paused = true)]
++async fn review_b_a_forged_ops_of_another_incarnation_keeps_a_sound_replica() {
++    let server = TestServer::new();
++    let room_id = server.create_room("room-a").await;
++    let (transport, storage) = (server.transport(), MemoryStorageEngine::new());
++    let client = client_over(storage.clone(), &transport, live()).await;
++    open_room(&client, &room_id).await.unwrap();
++    client.start_worker(room_id.clone()).await.unwrap();
++    opened(&client, &room_id).await;
++    server.commit(&room_id, [1, 2]).await;
++    reaches(&client, &room_id, 2).await;
++    after_a_heartbeat(&transport).await;
++    let incarnation = server.incarnation(&room_id).await;
++    let epoch = client.status(room_id.clone()).await.unwrap().epoch;
++    let registrations = transport.registrations().len();
++
++    let forged = ops_of(
++        &room_id,
++        incarnation.wrapping_add(1),
++        after(2, [insert_task(3)]),
++        3,
++    );
++    transport.inject(&ops_text(&forged));
++    tokio::time::sleep(Duration::from_millis(50)).await;
++
++    let status = client.status(room_id.clone()).await.unwrap();
++    assert_eq!(status.epoch, epoch, "A sound replica was discarded");
++    assert_eq!(status.head_seq.get(), 2);
++    assert!(status.registered && !status.failed_closed, "{status:?}");
++    assert_eq!(tasks(&storage, &room_id).await, [1, 2]);
++    assert_eq!(
++        transport.registrations()[registrations..],
++        [(Some(2), Some(incarnation))]
++    );
++    let worker = worker(&client, &room_id).await;
++    assert!(worker.running && worker.last_error.is_none(), "{worker:?}");
++    // Y lo que escribe otro sigue llegando por eventos.
++    server.commit(&room_id, [3]).await;
++    reaches(&client, &room_id, 3).await;
++}
++
++/// K2: un `ops` que no cuenta como del servidor (su primera operación después del head no valida
++/// con el esquema de la réplica) y que anuncia un head más allá del servidor deja ese head como
++/// head visto, y una escritura que entra después, con su `CommitAck` y su secuencia aplicada por
++/// la réplica, termina `OutcomeUnknown`, que no es ninguno de los cuatro casos de INV-K2.
++#[tokio::test(start_paused = true)]
++async fn review_b_an_ops_event_that_does_not_validate_leaves_no_head_seen_for_the_writes_after_it()
++{
++    let server = TestServer::new();
++    let room_id = server.create_room("room-a").await;
++    let (transport, storage) = (server.transport(), MemoryStorageEngine::new());
++    let client = client_over(storage.clone(), &transport, live()).await;
++    open_room(&client, &room_id).await.unwrap();
++    client.start_worker(room_id.clone()).await.unwrap();
++    opened(&client, &room_id).await;
++    server.commit(&room_id, [1]).await;
++    reaches(&client, &room_id, 1).await;
++    after_a_heartbeat(&transport).await;
++    let incarnation = server.incarnation(&room_id).await;
++
++    // La operación en 2 no valida, así que el evento no es del servidor; las demás llegan a 10.
++    let mut ops = vec![retyped_insert(2)];
++    ops.extend((3..=10).map(insert_task));
++    let forged = ops_of(&room_id, incarnation, after(1, ops), 10);
++    // El sync al que lleva (después de registrarse) espera su respuesta: la corrección de
++    // DEF-192 no llega antes de la escritura.
++    let mut held = transport.hold_next_reply(Sync);
++    transport.inject(&ops_text(&forged));
++    held.replied().await;
++    let status = client.status(room_id.clone()).await.unwrap();
++    assert!(status.registered && !status.failed_closed, "{status:?}");
++
++    let written = client.write(room_id.clone(), insert_task(4)).await;
++    let commits = commits(&transport);
++    assert_eq!(commits.len(), 1, "{commits:?}");
++    reaches(&client, &room_id, 2).await;
++    assert_eq!(tasks(&storage, &room_id).await, [1, 4]);
++    held.release();
++    assert_eq!(
++        written,
++        Ok(()),
++        "The write of sequence 2, with its CommitAck and applied by the replica"
++    );
++}
++
++/// K12/K17: `events_retry` admite cualquier valor por encima de cero, y con `Duration::MAX` el
++/// `EventsDisabled` de un servidor con el SSE apagado no detiene al worker (ni entra en pánico
++/// su tarea).
++#[tokio::test(start_paused = true)]
++async fn review_b_an_events_retry_of_duration_max_does_not_stop_the_worker_of_a_room() {
++    let server = TestServer::with(|config| config.max_sse_streams = Some(0));
++    let room_id = server.create_room("room-a").await;
++    let transport = server.transport();
++    let config = ClientConfig {
++        heartbeat_interval: Duration::from_secs(10),
++        events_retry: Duration::MAX,
++        ..live()
++    };
++    let client = client_over(MemoryStorageEngine::new(), &transport, config).await;
++    open_room(&client, &room_id).await.unwrap();
++    client.start_worker(room_id.clone()).await.unwrap();
++    tokio::time::sleep(Duration::from_millis(10)).await;
++    assert_eq!(transport.stream_opens().len(), 1);
++    let status = worker(&client, &room_id).await;
++    assert!(status.running, "The worker stopped: {status:?}");
++    assert_eq!(status.effective, Freshness::Periodic);
++    // Y sigue mandando heartbeats.
++    server.commit(&room_id, [1]).await;
++    tokio::time::sleep(Duration::from_secs(25)).await;
++    assert_eq!(head(&client, &room_id).await, 1);
++}
++
++/// K12 (el texto de "Sostenida por", Lote 1 de 4.3): sin `Content-Length`, el cuerpo de una
++/// respuesta de exactamente un frame se lee entero, pero su búfer crece al doble con cada
++/// pedazo que no entra, con una reserva que aborta si no hay memoria, hasta casi el doble de
++/// `MAX_FRAME_SIZE`: "reserva a lo sumo ese largo" vale solo con `Content-Length`.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn review_b_a_response_without_a_length_reserves_at_most_a_frame() {
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let addr = listener.local_addr().unwrap();
++    tokio::spawn(async move {
++        let (mut socket, _) = listener.accept().await.unwrap();
++        let mut request = Vec::new();
++        while !request.windows(4).any(|end| end == b"\r\n\r\n") {
++            let mut buf = [0; 4096];
++            let read = socket.read(&mut buf).await.unwrap();
++            request.extend_from_slice(&buf[..read]);
++        }
++        // Lo que queda del pedido (el cuerpo del heartbeat) no importa.
++        let head = "HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n";
++        socket.write_all(head.as_bytes()).await.unwrap();
++        for piece in vec![1u8; MAX_FRAME_SIZE].chunks(1000) {
++            socket.write_all(piece).await.unwrap();
++        }
++        socket.shutdown().await.unwrap();
++    });
++    let transport = HttpTransport::new(HttpTransportConfig::new(format!("http://{addr}"))).unwrap();
++    let message = ClientMessage::Heartbeat {
++        correlation_id: CorrelationId::new(1),
++        room_id: RoomId::new("r").unwrap(),
++        client_id: ClientId::new("ana#phone").unwrap(),
++    };
++    let reply = transport.send(&message, "t").await.unwrap();
++    assert_eq!(reply.len(), MAX_FRAME_SIZE);
++    assert!(
++        reply.capacity() <= MAX_FRAME_SIZE,
++        "The reply of {} bytes reserved {} bytes",
++        reply.len(),
++        reply.capacity()
++    );
++}
++
++/// DC27 (sin test en los Lotes 1 y 2, que lo dejaron por los SYN que no se pueden descartar en la
++/// CI): el plazo de conexión acota también el handshake de TLS, y eso sí se prueba en loopback,
++/// con un servidor `https://` que acepta la conexión y nunca contesta el `ClientHello`: el pedido
++/// y la apertura del stream se cortan en el plazo de conexión, mucho antes del de inactividad.
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn review_b_a_tls_handshake_the_server_never_answers_is_cut_by_the_connect_timeout() {
++    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++    let addr = listener.local_addr().unwrap();
++    tokio::spawn(async move {
++        let mut sockets = Vec::new();
++        loop {
++            let (mut socket, _) = listener.accept().await.unwrap();
++            let mut buf = [0; 4096];
++            let _ = socket.read(&mut buf).await;
++            sockets.push(socket);
++        }
++    });
++    let mut config = HttpTransportConfig::new(format!("https://{addr}"));
++    config.connect_timeout = Duration::from_millis(300);
++    config.idle_timeout = Duration::from_secs(30);
++    let transport = HttpTransport::new(config).unwrap();
++    let message = ClientMessage::Heartbeat {
++        correlation_id: CorrelationId::new(1),
++        room_id: RoomId::new("r").unwrap(),
++        client_id: ClientId::new("ana#phone").unwrap(),
++    };
++    let started = std::time::Instant::now();
++    let sent = tokio::time::timeout(Duration::from_secs(10), transport.send(&message, "t")).await;
++    assert!(matches!(sent, Ok(Err(_))), "{sent:?}");
++    assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
++    let started = std::time::Instant::now();
++    let room_id = RoomId::new("r").unwrap();
++    let opened = tokio::time::timeout(Duration::from_secs(10), transport.events(&room_id, "t")).await;
++    assert!(matches!(opened, Ok(Err(_))), "{opened:?}");
++    assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
++}
