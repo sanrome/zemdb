@@ -82,10 +82,11 @@ impl TableHandle {
     /// A read that fails (`InvalidOperation`, `Crypto`, `Decryption`, `Storage`) is an element,
     /// the stream goes on, and the next row is compared with the last one emitted; a key or a
     /// table that the schema does not take is read again only once every row may have changed.
-    /// While the replica is empty (after a discard, until the room registers) or out of the
-    /// client in the middle of a change, it emits nothing, and the change that opens it reads it
-    /// again. It ends once the room is out of the client at the end of a change: closed, the
-    /// client shut down, or taken out by an error; and at once in a room out of the client.
+    /// While the replica is empty (a new one, or one that the SDK discarded, until the room
+    /// registers) or out of the client in the middle of a change, it emits nothing, and the
+    /// change that opens it reads it again. It ends once the room is out of the client at the end
+    /// of a change: closed, discarded on request, the client shut down, or taken out by an error;
+    /// and at once in a room out of the client.
     pub fn watch(&self, key: &Key) -> ChangeStream<Option<Row>> {
         let watch = Watch::Row(key.clone());
         ChangeStream::new(self.clone(), watch, |mut rows| rows.pop())

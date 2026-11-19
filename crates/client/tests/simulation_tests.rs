@@ -100,7 +100,7 @@ use std::io;
 use std::ops::Bound;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock, PoisonError};
 use std::task::Poll;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::{tempdir, TempDir};
@@ -152,8 +152,9 @@ const EVENTS_RETRY: Duration = Duration::from_secs(60);
 /// upload, the heartbeat that announces the snapshot, and the sync after the download.
 const HEAL_INTERVALS: u32 = 12;
 
-/// The panics of the process, also those that a task catches.
-static PANICS: AtomicUsize = AtomicUsize::new(0);
+/// The panics of the process, also those that a task catches, each with the runtime of the thread
+/// it happened in: its tasks' and their blocking threads', or none for a thread outside any.
+static PANICS: Mutex<Vec<Option<tokio::runtime::Id>>> = Mutex::new(Vec::new());
 
 /// Counts the panics of the process in [`PANICS`].
 fn count_panics() {
@@ -161,10 +162,25 @@ fn count_panics() {
     HOOK.call_once(|| {
         let hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            PANICS.fetch_add(1, Ordering::SeqCst);
+            let runtime = tokio::runtime::Handle::try_current().ok();
+            let mut panics = PANICS.lock().unwrap_or_else(PoisonError::into_inner);
+            panics.push(runtime.map(|runtime| runtime.id()));
+            drop(panics);
             hook(info)
         }));
     });
+}
+
+/// The panics of the process that may be of the simulation of the current runtime: those of its
+/// threads and those of a thread outside any runtime, not those of the other tests of the binary,
+/// each with a runtime of its own.
+fn panics() -> usize {
+    let current = tokio::runtime::Handle::current().id();
+    let panics = PANICS.lock().unwrap_or_else(PoisonError::into_inner);
+    panics
+        .iter()
+        .filter(|runtime| runtime.is_none_or(|runtime| runtime == current))
+        .count()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3179,9 +3195,9 @@ impl Sim {
 
     /// Leaves the clients with a worker without network while the others write, until the log is
     /// past their heads, and its head before, by ten sequences if `pruning`, or by one: once they
-    /// are back, they are behind the head. If `pruning`, the log is pruned too: those whose worker syncs by itself
-    /// are behind the log, most of them, and catch up from a snapshot that another client
-    /// uploads, such as the archivist, at the head. A replica that is still of an earlier
+    /// are back, they are behind the head. If `pruning`, the log is pruned too: those whose worker
+    /// syncs by itself are behind the log, most of them, and catch up from a snapshot that another
+    /// client uploads, such as the archivist, at the head. A replica that is still of an earlier
     /// incarnation of the room (a client that crashed opens again from its metadata, and its
     /// registration may fail before it is without network) is behind the head and the log at any
     /// head of its own.
@@ -3364,10 +3380,10 @@ impl Sim {
                 done &= self.at_head(member).await;
             }
             if done {
-                let panics = PANICS.load(Ordering::SeqCst);
                 assert_eq!(
-                    panics, 0,
-                    "A panic in the process, which a task may have caught"
+                    panics(),
+                    0,
+                    "A panic in the simulation, which a task may have caught"
                 );
                 return;
             }

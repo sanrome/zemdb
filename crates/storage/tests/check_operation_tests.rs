@@ -344,6 +344,73 @@ async fn invalid_operations_and_rooms_that_are_not_open_are_errors() {
     }
 }
 
+/// An update or a delete that is not valid under the schema of the room is `SchemaValidation`, as
+/// `apply_batch` refuses it, in both engines, and the check changes nothing: an update of an
+/// owner outside the key without its delta, a delete without its owner or with one where the
+/// table has none, an update or a delete of an immutable table, an update of a column of the
+/// key or of one that is not there, and a delete with a key of another type.
+#[tokio::test]
+async fn an_update_or_a_delete_that_does_not_validate_is_schema_validation() {
+    let state = vec![
+        parent(1, Some("a")),
+        post(1, "A"),
+        vote("A", 1),
+        entry(1, "A"),
+    ];
+    let engines = Engines::open(&oracle::schema(), state).await;
+    let schema = oracle::schema();
+    let one = || vec![Value::Int(1)];
+    let invalid = [
+        (
+            "an update without its owner",
+            update(POSTS, one(), vec![(2, s("slug"))]),
+        ),
+        ("a delete without its owner", delete(POSTS, one())),
+        ("a delete with an owner", delete_as(PARENTS, one(), "A")),
+        (
+            "an update of an immutable table",
+            update(VOTES, vec![s("A"), Value::Int(1)], vec![(2, Value::Int(2))]),
+        ),
+        (
+            "a delete of an immutable table",
+            delete_as(LEDGER, one(), "A"),
+        ),
+        (
+            "an update of the key",
+            update(PARENTS, one(), vec![(0, Value::Int(2))]),
+        ),
+        (
+            "an update of no column",
+            update(PARENTS, one(), vec![(9, Value::Int(2))]),
+        ),
+        (
+            "a delete of a key of another type",
+            delete(PARENTS, vec![s("1")]),
+        ),
+    ];
+    for (name, engine) in engines.each() {
+        let room = &engines.room;
+        let head = engine.get_head_seq(room).await.unwrap();
+        let rows = oracle::dump(&room_rows(engine, room, &schema).await);
+        for (case, op) in &invalid {
+            let checked = engine.check_operation(room, op).await;
+            assert!(
+                matches!(checked, Err(StorageError::SchemaValidation(_))),
+                "{name}, {case}: {checked:?}"
+            );
+            let batch = vec![SequencedOperation::new(head.get() + 1, op.clone())];
+            let applied = engine.apply_batch(room, batch).await;
+            assert!(
+                matches!(applied, Err(StorageError::SchemaValidation(_))),
+                "{name}, {case}: {applied:?}"
+            );
+        }
+        assert_eq!(engine.get_head_seq(room).await.unwrap(), head, "{name}");
+        let after = oracle::dump(&room_rows(engine, room, &schema).await);
+        assert_eq!(after, rows, "{name}");
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Schema reloads and reopens
 

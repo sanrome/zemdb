@@ -1,7 +1,8 @@
 //! The encrypted columns of the facade against the server in process: a value of an encrypted
 //! column goes out, and is stored, only encrypted, with the additional data of its cell, and is
-//! read in the clear; what does not decrypt, or does not decrypt to a value of the type of its
-//! column, is `Decryption`.
+//! read in the clear, also one of type `Bytes`, whose plaintext the server would take as it is;
+//! what does not decrypt, or does not decrypt to a value of the type of its column, is
+//! `Decryption`; and a write cut while it encrypts or is prechecked sends nothing.
 
 mod common;
 
@@ -15,9 +16,9 @@ use zemdb_client::{
     Row, Scan, Violation, ZemdbClient,
 };
 use zemdb_core::{
-    ClientMessage, ClientMessageKind, ColumnDef, CryptoEngine, DataType, ErrorCode, Operation,
-    OperationKind, OwnerIdentity, PrimaryKey, RoomId, RowBuilder, Schema, SchemaId, TableSchema,
-    Value,
+    encode_message, ClientMessage, ClientMessageKind, ColumnDef, CryptoEngine, DataType, ErrorCode,
+    Operation, OperationKind, OwnerIdentity, PrimaryKey, RoomId, RowBuilder, Schema, SchemaId,
+    TableSchema, Value,
 };
 use zemdb_storage::snapshot::decode_snapshot_envelope;
 use zemdb_storage::{MemoryStorageEngine, ScanOptions, StorageEngine};
@@ -142,7 +143,11 @@ fn holds(bytes: &[u8], needle: &[u8]) -> bool {
 
 /// The values of the encrypted columns that `op` carries, for [`league_schema`].
 fn encrypted_values(op: &Operation) -> Vec<Value> {
-    let schema = league_schema();
+    encrypted_values_in(&league_schema(), op)
+}
+
+/// The values of the encrypted columns that `op` carries, for `schema`.
+fn encrypted_values_in(schema: &Schema, op: &Operation) -> Vec<Value> {
     let table = schema.get_table_by_id(op.table_id()).unwrap();
     let encrypted = |index: usize| table.columns()[index].is_encrypted();
     match op.kind() {
@@ -196,6 +201,50 @@ fn is_invalid<T: std::fmt::Debug>(result: Result<T, ClientError>) -> String {
         Err(ClientError::InvalidOperation(message)) => message,
         other => panic!("Not InvalidOperation: {other:?}"),
     }
+}
+
+/// The schema `files`, with one table: an int key `id`, a string `name`, the nullable encrypted
+/// bytes `blob` and the encrypted bytes `digest`, which does not take `NULL`. A ciphertext is a
+/// `Value::Bytes` too, so the validation of the operation that is sent
+/// (`Schema::validate_operation`) takes the plaintext of these columns as it is: only the facade
+/// tells them apart.
+fn files_schema() -> Schema {
+    let files = TableSchema::builder("files")
+        .primary_key("id", DataType::Int)
+        .column("name", DataType::String)
+        .nullable_column("blob", DataType::Bytes)
+        .encrypted_column("blob", DataType::Bytes)
+        .encrypted_column("digest", DataType::Bytes);
+    Schema::builder().table(files).build()
+}
+
+/// The mark that the plaintext of every value of [`files_schema`] holds.
+const MARK: &[u8] = b"BLOB-IN-THE-CLEAR";
+
+/// `MARK` followed by `tail`, as the plaintext of a value.
+fn marked(tail: &str) -> Vec<u8> {
+    [MARK, tail.as_bytes()].concat()
+}
+
+fn file_key(id: i64) -> Key {
+    Key::new().with("id", id)
+}
+
+/// Checks that no file under `dir` holds `needle`, and that there are files.
+fn no_file_holds(dir: &Path, needle: &[u8]) {
+    let mut pending = vec![dir.to_path_buf()];
+    let mut files = 0;
+    while let Some(path) = pending.pop() {
+        if path.is_dir() {
+            for entry in std::fs::read_dir(&path).unwrap() {
+                pending.push(entry.unwrap().path());
+            }
+        } else if let Ok(bytes) = std::fs::read(&path) {
+            files += 1;
+            assert!(!holds(&bytes, needle), "{} holds it", path.display());
+        }
+    }
+    assert!(files > 0, "No file under {}", dir.display());
 }
 
 #[tokio::test]
@@ -313,6 +362,106 @@ async fn encrypted_columns_go_out_and_are_stored_encrypted_and_read_in_the_clear
     catch_up(&bob_room, "bob").await;
     let bob_members = bob_room.table("members").unwrap();
     assert_eq!(bob_members.get(&ana).await, Ok(Some(member)));
+}
+
+#[tokio::test]
+async fn an_encrypted_bytes_column_goes_out_and_is_stored_only_encrypted() {
+    let server = TestServer::new();
+    let room_id = server
+        .create_room_with("room-a", "files", files_schema())
+        .await;
+    let dir = tempdir().unwrap();
+    let (transport, crypto) = (server.transport(), TestCrypto::new());
+    let storage = engine(dir.path());
+    let client = facade(
+        dir.path(),
+        storage.clone(),
+        &transport,
+        "ana",
+        Some(Arc::clone(&crypto)),
+    )
+    .await;
+    let room = open(&client, &room_id).await;
+    let files = room.table("files").unwrap();
+
+    // An insert with both columns, an update of `blob`, an insert without `blob`, which is
+    // `NULL`, and an update of `blob` to `NULL`: every value of an encrypted column, `NULL`
+    // too, is encrypted once.
+    let first = Row::new()
+        .with("id", 1)
+        .with("name", "first")
+        .with("blob", marked("blob-1"))
+        .with("digest", marked("digest-1"));
+    assert_eq!(files.insert(&first).await, Ok(file_key(1)));
+    let blob = Row::new().with("blob", marked("blob-2"));
+    files.update(&file_key(1), &blob).await.unwrap();
+    let second = Row::new()
+        .with("id", 2)
+        .with("name", "second")
+        .with("digest", marked("digest-2"));
+    files.insert(&second).await.unwrap();
+    let cleared = Row::new().with("blob", Value::Null);
+    files.update(&file_key(2), &cleared).await.unwrap();
+    assert_eq!(crypto.encryptions(), 2 + 1 + 2 + 1);
+
+    // No message holds the plaintext, and each commit carries a ciphertext in each encrypted
+    // column that it writes, `NULL` too.
+    for message in transport.sent() {
+        let bytes = encode_message(&message).unwrap();
+        assert!(!holds(&bytes, MARK), "{message:?}");
+    }
+    let ops = committed(&transport, 0);
+    assert_eq!(ops.len(), 4);
+    for op in &ops {
+        let values = encrypted_values_in(&files_schema(), op);
+        assert!(!values.is_empty(), "{op:?}");
+        sealed(&values, MARK);
+    }
+
+    // Neither the storage of the client nor the files of the client or of the server hold it.
+    let mut scan = storage
+        .scan_by_id(&room_id, 0, ScanOptions::default())
+        .await
+        .unwrap();
+    let mut rows = 0;
+    while let Some(item) = futures::StreamExt::next(&mut scan).await {
+        let (_, row) = item.unwrap();
+        rows += 1;
+        // The encrypted columns, at their positions in the row.
+        sealed(&[2, 3].map(|index| row.get(index).unwrap().clone()), MARK);
+    }
+    assert_eq!(rows, 2);
+    no_file_holds(dir.path(), MARK);
+    no_file_holds(&server.state.config.data_dir, MARK);
+
+    // The facade reads them in the clear, with their type, and so does another member.
+    let first = Row::new()
+        .with("id", 1)
+        .with("name", "first")
+        .with("blob", marked("blob-2"))
+        .with("digest", marked("digest-1"));
+    let second = Row::new()
+        .with("id", 2)
+        .with("name", "second")
+        .with("blob", Value::Null)
+        .with("digest", marked("digest-2"));
+    assert_eq!(files.get(&file_key(1)).await, Ok(Some(first.clone())));
+    assert_eq!(files.get(&file_key(2)).await, Ok(Some(second.clone())));
+    let bob_dir = tempdir().unwrap();
+    let bob_transport = server.transport();
+    let bob = facade(
+        bob_dir.path(),
+        MemoryStorageEngine::new(),
+        &bob_transport,
+        "bob",
+        Some(TestCrypto::new()),
+    )
+    .await;
+    let bob_room = open(&bob, &room_id).await;
+    bob_room.sync().await.unwrap();
+    let bob_files = bob_room.table("files").unwrap();
+    assert_eq!(bob_files.get(&file_key(1)).await, Ok(Some(first)));
+    assert_eq!(bob_files.get(&file_key(2)).await, Ok(Some(second)));
 }
 
 #[tokio::test(start_paused = true)]
@@ -789,6 +938,60 @@ async fn a_write_whose_replica_is_discarded_while_it_encrypts_is_room_closed() {
     let inserted = discarded_meanwhile(&transport, &room, encrypting, insert).await;
     assert_eq!(inserted, Err(ClientError::RoomClosed(room_id.clone())));
     assert_eq!(head(&server, &room_id).await, 0);
+}
+
+#[tokio::test]
+async fn a_write_cut_while_it_encrypts_or_prechecks_sends_nothing_and_leaves_nothing() {
+    let (server, room_id) = league("room-a").await;
+    let dir = tempdir().unwrap();
+    let (transport, crypto) = (server.transport(), TestCrypto::new());
+    let storage = TestEngine::new(engine(dir.path()));
+    let client = facade(
+        dir.path(),
+        storage.clone(),
+        &transport,
+        "ana",
+        Some(Arc::clone(&crypto)),
+    )
+    .await;
+    let room = open(&client, &room_id).await;
+    let rounds = room.table("rounds").unwrap();
+    let row = |id: i64| round(id, &format!("Round {id}")).with("notes", "secret");
+    let sent = transport.sent().len();
+
+    // Cut while the `CryptoEngine` encrypts its first value.
+    let mut encrypting = crypto.hold_next_encrypt();
+    let cut = rounds.clone();
+    let write = tokio::spawn(async move { cut.insert(&row(1)).await });
+    encrypting.replied().await;
+    write.abort();
+    assert!(write.await.unwrap_err().is_cancelled());
+    drop(encrypting);
+
+    // Cut while the storage prechecks it.
+    let mut checking = storage.hold_next("check_operation");
+    let cut = rounds.clone();
+    let write = tokio::spawn(async move { cut.insert(&row(2)).await });
+    checking.replied().await;
+    write.abort();
+    assert!(write.await.unwrap_err().is_cancelled());
+    drop(checking);
+
+    // Nothing went out, nothing is in flight, and nothing is retained for them.
+    assert_eq!(transport.sent().len(), sent);
+    let status = room.status().await.unwrap();
+    assert_eq!((status.writes_in_flight, status.retained), (0, 0));
+    assert_eq!(rounds.get(&round_key(1)).await, Ok(None));
+    assert_eq!(rounds.get(&round_key(2)).await, Ok(None));
+
+    // The same writes then go out, once each, and the replica takes them.
+    assert_eq!(rounds.insert(&row(1)).await, Ok(round_key(1)));
+    assert_eq!(rounds.insert(&row(2)).await, Ok(round_key(2)));
+    assert_eq!(committed(&transport, sent).len(), 2);
+    let status = room.status().await.unwrap();
+    assert_eq!((status.writes_in_flight, status.retained), (0, 0));
+    let read = rounds.get(&round_key(2)).await.unwrap().unwrap();
+    assert_eq!(read.get("notes"), Some(&Value::from("secret")));
 }
 
 #[tokio::test]

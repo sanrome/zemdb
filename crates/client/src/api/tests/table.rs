@@ -284,3 +284,49 @@ async fn a_write_checked_after_a_reload_of_the_schema_is_valid_and_after_a_disca
     let closed = Err(ClientError::RoomClosed(room_id()));
     assert_eq!(table.checked(epoch, op), closed);
 }
+
+/// [`tasks_schema`] with the nullable encrypted string column `secret`: its version 2.
+fn secret_schema() -> Schema {
+    let mut schema = tasks_schema();
+    let secret = ColumnDef::new("secret", DataType::String)
+        .nullable(true)
+        .encrypted(true);
+    schema.add_column("tasks", secret).unwrap();
+    schema
+}
+
+/// An insert planned against a schema without an encrypted column that a reload in the same
+/// epoch adds before the operation is checked is valid as it is, a row shorter than the table:
+/// it goes without a value of that column, which is read `NULL`, so the server sees that cell
+/// empty, and a client without a `CryptoEngine` sends it, without `Crypto`. So does a replica
+/// that has not learned the column yet: only the encrypted columns of the schema that a write is
+/// planned with are encrypted, `NULL` too.
+#[tokio::test]
+async fn an_insert_planned_before_an_encrypted_column_is_added_goes_without_it() {
+    let server = Server::new(tasks_schema());
+    let (client, table) = open(&server, "tasks").await;
+    let one = Row::new().with("id", 1).with("title", "one");
+    let (epoch, (draft, _)) = table
+        .plan_write(|writer, schema| writer.insert(schema, "tasks", &one))
+        .unwrap();
+    // Nothing to encrypt in the plan, so no `CryptoEngine` is needed.
+    let op = draft.seal(None, &room_id()).await.unwrap();
+
+    server.evolve(secret_schema());
+    table.room().close().await.unwrap();
+    client.room(room_id()).await.unwrap();
+    let evolved = (table.room().client().core()).read_schema(&room_id(), Schema::clone);
+    assert_eq!(evolved, Ok((epoch, secret_schema())));
+    let zemdb_core::OperationKind::Insert { row } = op.kind() else {
+        panic!("{op:?}");
+    };
+    assert_eq!(row.len(), 2);
+    assert_eq!(table.checked(epoch, op.clone()), Ok(op));
+
+    // Planned now, the same insert needs a `CryptoEngine`, for the `NULL` of `secret`.
+    let (_, (draft, _)) = table
+        .plan_write(|writer, schema| writer.insert(schema, "tasks", &one))
+        .unwrap();
+    let crypto = draft.seal(None, &room_id()).await;
+    assert!(matches!(crypto, Err(ClientError::Crypto(_))), "{crypto:?}");
+}

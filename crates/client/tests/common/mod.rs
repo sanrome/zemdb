@@ -506,11 +506,24 @@ impl TestServer {
         let client_id = ClientId::new("bob#writer").unwrap();
         let token = token(&client_id, room_id);
         let correlation_id = CorrelationId::new(1);
+        // A room that does not answer in time under load is asked again with the same request,
+        // as the SDK does: the same `MutationId` is sequenced once.
         let send = |message: ClientMessage| {
             let (transport, token) = (transport.clone(), token.clone());
             async move {
-                let reply = transport.send(&message, &token).await.unwrap();
-                decode_message::<ServerMessage>(&reply).unwrap()
+                for _ in 0..20 {
+                    let reply = transport.send(&message, &token).await.unwrap();
+                    let reply = decode_message::<ServerMessage>(&reply).unwrap();
+                    let ServerMessage::Error {
+                        code: ErrorCode::Timeout | ErrorCode::Unavailable | ErrorCode::Internal,
+                        ..
+                    } = reply
+                    else {
+                        return reply;
+                    };
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                panic!("The room did not answer {message:?}");
             }
         };
         let registered = send(ClientMessage::RegisterClient {

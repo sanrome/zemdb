@@ -15,12 +15,13 @@ use crate::ClientError;
 /// value changes in the replica. It holds its last value and a mark, nothing per change: a
 /// consumer that reads late gets the current value, skipping those in between.
 ///
-/// A read that fails (`Decryption`, `Storage`) is an element, and the stream goes on: the next
-/// value is compared with the last one emitted, and the next change reads it again. The stream
-/// emits nothing while the replica is empty (after a discard, until the room registers) or a
-/// change takes it out of the client in its middle (the reopening of its storage room after an
-/// error), and ends once the room is out of the client at the end of a change (it is closed, the
-/// client shuts down, or an error took it out). Dropping the stream drops its subscription.
+/// A read that fails (`InvalidOperation`, `Crypto`, `Decryption`, `Storage`) is an element, and
+/// the stream goes on: the next value is compared with the last one emitted, and the next change
+/// reads it again. The stream emits nothing while the replica is empty (a new one, or one that
+/// the SDK discarded, until the room registers) or a change takes it out of the client in its
+/// middle (the reopening of its storage room after an error), and ends once the room is out of
+/// the client at the end of a change (it is closed, discarded on request, the client shuts
+/// down, or an error took it out). Dropping the stream drops its subscription.
 ///
 /// While the stream is alive, a room in [`Freshness::Periodic`](crate::Freshness::Periodic) has
 /// its worker in `Live` ([`RoomHandle::set_freshness`](super::RoomHandle::set_freshness)): its

@@ -632,6 +632,59 @@ async fn a_room_without_a_worker_is_not_offline() {
     assert!(worker(&room).await.running);
 }
 
+#[tokio::test(start_paused = true)]
+async fn in_live_a_write_stays_offline_while_events_bring_operations_until_a_heartbeat() {
+    // The state of the connection is that of the requests: in `live`, after a request
+    // without a reply that is not a heartbeat, the writes are `Offline` until the next heartbeat
+    // of the worker, an interval after the last one, although the event stream goes on bringing
+    // the operations of the others meanwhile. A `sync` with a reply lets them go at once.
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let (transport, tokens) = (server.transport(), TestTokens::new());
+    let client = facade(&transport, config(Freshness::Live), &tokens).await;
+    let room = client.room(room_id.clone()).await.unwrap();
+    until(&room, live).await;
+    after_a_heartbeat(&transport).await;
+    let beat = *sent_of(&transport, Heartbeat).last().unwrap();
+    let tasks = room.table("tasks").unwrap();
+    let mut all = tasks.watch_scan(&Scan::new());
+    assert_eq!(all.next().await, Some(Ok(vec![])));
+
+    // A sync of the application whose reply is lost.
+    transport.lose_next_reply(Sync);
+    let synced = room.sync().await;
+    assert!(matches!(synced, Err(ClientError::Network(_))), "{synced:?}");
+    assert_eq!(worker(&room).await.connected, Some(false));
+
+    // What another client writes goes on arriving by the stream, without a sync...
+    let syncs = sent_of(&transport, Sync).len();
+    server.commit(&room_id, [1]).await;
+    assert_eq!(all.next().await, Some(Ok(vec![task_row(1)])));
+    server.commit(&room_id, [2]).await;
+    assert_eq!(all.next().await, Some(Ok(vec![task_row(1), task_row(2)])));
+    assert_eq!(sent_of(&transport, Sync).len(), syncs);
+    // ...but a write is `Offline`, with nothing sent, until the next heartbeat.
+    let offline = Err(ClientError::Offline(room_id.clone()));
+    let sent = transport.sent().len();
+    tokio::time::sleep(INTERVAL / 2).await;
+    assert_eq!(tasks.insert(&task_row(3)).await.map(drop), offline);
+    assert_eq!(transport.sent().len(), sent);
+    while sent_of(&transport, Heartbeat).last() == Some(&beat) {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let next = *sent_of(&transport, Heartbeat).last().unwrap();
+    assert_eq!(next - beat, INTERVAL);
+    until(&room, |worker| worker.connected == Some(true)).await;
+    assert_eq!(tasks.insert(&task_row(3)).await, Ok(task_key(3)));
+
+    // The same lapse, ended by a `sync` with a reply instead of the heartbeat.
+    transport.lose_next_reply(Sync);
+    assert!(room.sync().await.is_err());
+    assert_eq!(tasks.insert(&task_row(4)).await.map(drop), offline);
+    room.sync().await.unwrap();
+    assert_eq!(tasks.insert(&task_row(4)).await, Ok(task_key(4)));
+}
+
 // ---------------------------------------------------------------------------------------------
 // The first token
 

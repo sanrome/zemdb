@@ -1,0 +1,375 @@
+diff --git a/crates/client/tests/discard_tests.rs b/crates/client/tests/discard_tests.rs
+index cbc0f3c..2dfe289 100644
+--- a/crates/client/tests/discard_tests.rs
++++ b/crates/client/tests/discard_tests.rs
+@@ -987,3 +987,51 @@ async fn the_worker_stopped_first_acknowledges_the_head_of_the_replica_it_discar
+     transport.settled().await;
+     assert_eq!(acks(&transport).len(), before + 1);
+ }
++
++// ---------------------------------------------------------------------------------------------
++// The closing review of 4.4 (replica and reactivity)
++
++#[tokio::test]
++async fn review_b_discarding_a_room_leaves_the_replica_the_metadata_and_the_watch_of_another() {
++    // The discard on request touches only its room: another room open in the client, with a
++    // `watch` stream, keeps its replica, its metadata, its epoch and its stream; also when the
++    // room discarded is one that the client never opened.
++    let server = TestServer::new();
++    let (a, b) = (
++        server.create_room("room-a").await,
++        server.create_room("room-b").await,
++    );
++    server.commit(&a, 1..=2).await;
++    server.commit(&b, 1..=3).await;
++    let dir = tempdir().unwrap();
++    let transport = server.transport();
++    let client = facade(dir.path(), engine(dir.path()), &transport).await;
++    let (room_a, room_b) = (
++        room(&client, &a).await.unwrap(),
++        room(&client, &b).await.unwrap(),
++    );
++    room_a.sync().await.unwrap();
++    room_b.sync().await.unwrap();
++    let tasks_b = room_b.table("tasks").unwrap();
++    let mut stream = tasks_b.watch_scan(&Scan::new());
++    let three: Vec<_> = (1..=3).map(|id| task(id, "task")).collect();
++    assert_eq!(next(&mut stream).await, Some(Ok(three.clone())));
++    let saved_b = metadata(dir.path(), &b).await.unwrap();
++    assert_eq!(room_b.status().await, Ok(watched(3, 1, 1)));
++
++    room_a.discard().await.unwrap();
++    client
++        .discard_room(RoomId::new("room-c").unwrap())
++        .await
++        .unwrap();
++    assert_eq!(room_a.status().await, closed(&a));
++    assert_eq!(metadata(dir.path(), &a).await, None);
++    // The other room is as it was, and its stream goes on.
++    assert_eq!(metadata(dir.path(), &b).await, Some(saved_b));
++    assert_eq!(room_b.status().await, Ok(watched(3, 1, 1)));
++    assert_eq!(tasks_b.scan(&Scan::new()).await, Ok(three.clone()));
++    server.commit(&b, [4]).await;
++    room_b.sync().await.unwrap();
++    let four: Vec<_> = (1..=4).map(|id| task(id, "task")).collect();
++    assert_eq!(next(&mut stream).await, Some(Ok(four)));
++}
+diff --git a/crates/client/tests/facade_worker_tests.rs b/crates/client/tests/facade_worker_tests.rs
+index e1fff1f..76ad353 100644
+--- a/crates/client/tests/facade_worker_tests.rs
++++ b/crates/client/tests/facade_worker_tests.rs
+@@ -808,3 +808,59 @@ async fn without_a_token_a_room_without_metadata_has_no_handle_nor_worker() {
+         assert_eq!(transport.stream_opens().len(), 0, "{case}");
+     }
+ }
++
++// ---------------------------------------------------------------------------------------------
++// The closing review of 4.4 (replica and reactivity)
++
++#[tokio::test(start_paused = true)]
++async fn review_b_in_live_a_write_stays_offline_while_events_bring_operations_until_a_heartbeat() {
++    // The state of the connection is that of the requests (DC36): in `live`, after a request
++    // without a reply that is not a heartbeat, the writes are `Offline` until the next heartbeat
++    // of the worker, an interval after the last one, although the event stream goes on bringing
++    // the operations of the others meanwhile. A `sync` with a reply lets them go at once.
++    let server = TestServer::new();
++    let room_id = server.create_room("room-a").await;
++    let (transport, tokens) = (server.transport(), TestTokens::new());
++    let client = facade(&transport, config(Freshness::Live), &tokens).await;
++    let room = client.room(room_id.clone()).await.unwrap();
++    until(&room, live).await;
++    after_a_heartbeat(&transport).await;
++    let beat = *sent_of(&transport, Heartbeat).last().unwrap();
++    let tasks = room.table("tasks").unwrap();
++    let mut all = tasks.watch_scan(&Scan::new());
++    assert_eq!(all.next().await, Some(Ok(vec![])));
++
++    // A sync of the application whose reply is lost.
++    transport.lose_next_reply(Sync);
++    let synced = room.sync().await;
++    assert!(matches!(synced, Err(ClientError::Network(_))), "{synced:?}");
++    assert_eq!(worker(&room).await.connected, Some(false));
++
++    // What another client writes goes on arriving by the stream, without a sync...
++    let syncs = sent_of(&transport, Sync).len();
++    server.commit(&room_id, [1]).await;
++    assert_eq!(all.next().await, Some(Ok(vec![task_row(1)])));
++    server.commit(&room_id, [2]).await;
++    assert_eq!(all.next().await, Some(Ok(vec![task_row(1), task_row(2)])));
++    assert_eq!(sent_of(&transport, Sync).len(), syncs);
++    // ...but a write is `Offline`, with nothing sent, until the next heartbeat.
++    let offline = Err(ClientError::Offline(room_id.clone()));
++    let sent = transport.sent().len();
++    tokio::time::sleep(INTERVAL / 2).await;
++    assert_eq!(tasks.insert(&task_row(3)).await.map(drop), offline);
++    assert_eq!(transport.sent().len(), sent);
++    while sent_of(&transport, Heartbeat).last() == Some(&beat) {
++        tokio::time::sleep(Duration::from_millis(1)).await;
++    }
++    let next = *sent_of(&transport, Heartbeat).last().unwrap();
++    assert_eq!(next - beat, INTERVAL);
++    until(&room, |worker| worker.connected == Some(true)).await;
++    assert_eq!(tasks.insert(&task_row(3)).await, Ok(task_key(3)));
++
++    // The same lapse, ended by a `sync` with a reply instead of the heartbeat.
++    transport.lose_next_reply(Sync);
++    assert!(room.sync().await.is_err());
++    assert_eq!(tasks.insert(&task_row(4)).await.map(drop), offline);
++    room.sync().await.unwrap();
++    assert_eq!(tasks.insert(&task_row(4)).await, Ok(task_key(4)));
++}
+diff --git a/crates/client/tests/ranking_app_tests.rs b/crates/client/tests/ranking_app_tests.rs
+index 63cc0bd..cdbc9b6 100644
+--- a/crates/client/tests/ranking_app_tests.rs
++++ b/crates/client/tests/ranking_app_tests.rs
+@@ -48,3 +48,122 @@ async fn the_standings_watched_change_as_the_votes_arrive() {
+ async fn the_notes_never_travel_in_the_clear() {
+     scenarios::notes().await.unwrap();
+ }
++
++// ---------------------------------------------------------------------------------------------
++// The closing review of 4.4 (replica and reactivity)
++
++/// Every row of every table of the app in the replica of `room`, with the notes decrypted.
++async fn every_row(room: &zemdb_client::RoomHandle) -> Vec<Vec<zemdb_client::Row>> {
++    let mut tables = Vec::new();
++    for table in ["rankings", "members", "rounds", "votes"] {
++        let table = room.table(table).unwrap();
++        tables.push(table.scan(&zemdb_client::Scan::new()).await.unwrap());
++    }
++    tables
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn review_b_replicas_that_write_at_once_hold_the_same_rows_of_every_table() {
++    // K4 over the whole state, not only the standings: four devices (two of carla, one of them
++    // in `manual`) write at once without catching up first, among them two rounds with the same
++    // title and two votes of carla in one round, which the log decides; once every replica is at
++    // the head of the room, all of them hold the same rows of every table.
++    use zemdb_client::{ClientConfig, ClientError, Freshness};
++    let server = app::Server::start().await.unwrap();
++    let backend = server.backend();
++    backend.register_schema().await.unwrap();
++    let room_id = backend
++        .create_room("friends", app::Retention::Default)
++        .await
++        .unwrap();
++    let manual = |config: &mut ClientConfig| config.freshness = Freshness::Manual;
++    let mut devices = Vec::new();
++    for (person, manual_mode) in [
++        ("ana", false),
++        ("bob", false),
++        ("carla", false),
++        ("carla", true),
++    ] {
++        let device = match manual_mode {
++            false => app::Device::with(&server, person, |_| {}).await.unwrap(),
++            true => app::Device::with(&server, person, manual).await.unwrap(),
++        };
++        let room = device.room(&room_id).await.unwrap();
++        devices.push((device, room));
++    }
++    let ranking = app::create_ranking(&devices[0].1, "Bowling").await.unwrap();
++    for ((_, room), name) in devices.iter().zip(["Ana", "Bob", "Carla"]) {
++        room.sync().await.unwrap();
++        app::join(room, ranking, name).await.unwrap();
++    }
++    for (_, room) in &devices {
++        room.sync().await.unwrap();
++    }
++    let round = app::open_round(&devices[0].1, ranking, "Round 1", "Lane 4")
++        .await
++        .unwrap();
++    for (_, room) in &devices {
++        room.sync().await.unwrap();
++    }
++
++    // At once, without catching up first.
++    let rooms: Vec<_> = devices.iter().map(|(_, room)| room.clone()).collect();
++    let writes = rooms.iter().enumerate().map(|(i, room)| {
++        let room = room.clone();
++        async move {
++            let candidate = ["bob", "carla", "ana", "bob"][i];
++            let voted = app::vote(&room, ranking, round, candidate).await;
++            let opened = match i {
++                0 | 1 => app::open_round(&room, ranking, "Round 2", "Lane 7")
++                    .await
++                    .map(drop),
++                _ => Ok(()),
++            };
++            (voted, opened)
++        }
++    });
++    let written = futures::future::join_all(writes).await;
++    for (voted, opened) in &written {
++        for result in [voted, opened] {
++            let decided = matches!(
++                result,
++                Ok(()) | Err(ClientError::ConstraintViolation(_) | ClientError::PrecheckFailed(_))
++            );
++            assert!(decided, "{written:?}");
++        }
++    }
++    // Two rounds titled the same: one of them at most is in the log's order first.
++    let (_, head) = server.log(&room_id).await.unwrap();
++    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
++    for room in &rooms {
++        loop {
++            room.sync().await.unwrap();
++            if room.status().await.unwrap().head_seq.get() == head {
++                break;
++            }
++            assert!(
++                tokio::time::Instant::now() < deadline,
++                "{:?}",
++                room.status().await
++            );
++            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++        }
++    }
++    let first = every_row(&rooms[0]).await;
++    let rounds = &first[2];
++    let titled = |title: &str| {
++        rounds
++            .iter()
++            .filter(|row| row.get("title").and_then(zemdb_core::Value::as_str) == Some(title))
++            .count()
++    };
++    assert_eq!((titled("Round 1"), titled("Round 2")), (1, 1), "{rounds:?}");
++    // One vote of carla in the round, from either device.
++    let carlas = (first[3].iter())
++        .filter(|row| row.get("voter").and_then(zemdb_core::Value::as_str) == Some("carla"))
++        .count();
++    assert_eq!(carlas, 1, "{:?}", first[3]);
++    for room in &rooms[1..] {
++        assert_eq!(every_row(room).await, first);
++    }
++}
+diff --git a/crates/client/tests/watch_tests.rs b/crates/client/tests/watch_tests.rs
+index 0abb1fe..8b69316 100644
+--- a/crates/client/tests/watch_tests.rs
++++ b/crates/client/tests/watch_tests.rs
+@@ -1307,3 +1307,47 @@ async fn streams_read_in_tasks_of_other_threads_end_with_the_value_of_a_direct_r
+ async fn streams_read_in_tasks_of_other_threads_end_with_the_value_of_a_direct_read_long() {
+     in_other_threads(1..=20, 300).await;
+ }
++
++// ---------------------------------------------------------------------------------------------
++// The closing review of 4.4 (replica and reactivity)
++
++#[tokio::test]
++async fn review_b_after_a_failed_read_of_a_scan_rows_equal_to_the_last_emitted_are_not_emitted() {
++    // The branch of DC35 that the simulation does not reach, through a `watch_scan` and an error
++    // of the storage (the test above goes through a `watch` and `Decryption`): a read of a state
++    // in between that fails is an element, and once the replica is still in a state equal to the
++    // last value emitted, that value does not come again; the last element is that error, and the
++    // next change is compared with the last value emitted.
++    let (server, room_id) = league(TestServer::new()).await;
++    let dir = tempdir().unwrap();
++    let transport = server.transport();
++    let storage = TestEngine::new(engine(dir.path()));
++    let client = ana(dir.path(), storage.clone(), &transport).await;
++    let room = joined(&client, &room_id).await;
++    let members = room.table("members").unwrap();
++    let mut everyone = members.watch_scan(&Scan::new());
++    let both = vec![member("ana", "Ana"), member("bob", "Bob")];
++    assert_eq!(next(&mut everyone).await, Some(Ok(both.clone())));
++    let commit = |op| server.commit_ops(&room_id, [op]);
++
++    // Bob takes another name, whose read fails.
++    storage.fail_next("scan_by_id", io());
++    commit(renames("bob", "Roberto")).await;
++    room.sync().await.unwrap();
++    let failed = next(&mut everyone).await;
++    assert!(
++        matches!(failed, Some(Err(ClientError::Storage(_)))),
++        "{failed:?}"
++    );
++    // And his name again: the rows are those of the last value emitted, which does not come again.
++    commit(renames("bob", "Bob")).await;
++    room.sync().await.unwrap();
++    quiet(&mut everyone).await;
++    assert_eq!(members.scan(&Scan::new()).await, Ok(both));
++    assert_eq!(watches(&room).await, 1);
++    // The next change is emitted.
++    commit(renames("bob", "Robert")).await;
++    room.sync().await.unwrap();
++    let renamed = vec![member("ana", "Ana"), member("bob", "Robert")];
++    assert_eq!(next(&mut everyone).await, Some(Ok(renamed)));
++}
+diff --git a/crates/client/tests/worker_tests.rs b/crates/client/tests/worker_tests.rs
+index 2525390..56d5762 100644
+--- a/crates/client/tests/worker_tests.rs
++++ b/crates/client/tests/worker_tests.rs
+@@ -2408,3 +2408,71 @@ async fn a_start_waiting_for_the_applier_while_a_stop_begins_waits_for_that_stop
+     soon(client.close_room(room_id.clone())).await.unwrap();
+     assert_eq!(acks(&transport), [3]);
+ }
++
++// ---------------------------------------------------------------------------------------------
++// The closing review of 4.4 (replica and reactivity)
++
++#[tokio::test(start_paused = true)]
++async fn review_b_a_worker_started_between_the_stop_and_the_close_of_a_close_sends_nothing() {
++    // The window of `close_room` and `shutdown`: a start that takes the applier after their stop
++    // of the worker and before their close (here, both wait while a write holds the applier, the
++    // start first) leaves a worker in the room they close. It sends nothing: its first step finds
++    // the room out of the client and stops it (`RoomClosed`), and its last ack reads the room
++    // closed. Opened again, the room shows that worker stopped, and a start gives it another.
++    let interval = Duration::from_secs(10);
++    let server = TestServer::new();
++    let room_id = server.create_room("room-a").await;
++    let transport = server.transport();
++    let engine = TestEngine::new(MemoryStorageEngine::new());
++    let client = client_over(engine.clone(), &transport, every(interval)).await;
++    open_room(&client, &room_id).await.unwrap();
++    for (id, shutdown) in [(1, false), (2, true)] {
++        let mut applying = engine.hold_next("apply_batch");
++        let write = tokio::spawn({
++            let (client, room_id) = (Arc::clone(&client), room_id.clone());
++            async move { client.write(room_id, insert_task(id)).await }
++        });
++        soon(applying.replied()).await;
++        let starting = tokio::spawn({
++            let (client, room_id) = (Arc::clone(&client), room_id.clone());
++            async move { client.start_worker(room_id).await }
++        });
++        tokio::time::sleep(Duration::from_millis(1)).await;
++        let closing = tokio::spawn({
++            let (client, room_id) = (Arc::clone(&client), room_id.clone());
++            async move {
++                match shutdown {
++                    false => client.close_room(room_id).await,
++                    true => client.shutdown().await,
++                }
++            }
++        });
++        tokio::time::sleep(Duration::from_millis(1)).await;
++        applying.release();
++        assert_eq!(soon(write).await.unwrap(), Ok(()), "{shutdown}");
++        // The start got the applier first, with the room still open.
++        assert_eq!(soon(starting).await.unwrap(), Ok(()), "{shutdown}");
++        assert_eq!(soon(closing).await.unwrap(), Ok(()), "{shutdown}");
++        let closed = Err(ClientError::RoomClosed(room_id.clone()));
++        assert_eq!(client.status(room_id.clone()).await, closed, "{shutdown}");
++        let sent = transport.sent().len();
++        tokio::time::sleep(interval * 3).await;
++        // Nothing went, and no task of a worker is left: none holds the client, even weakly.
++        assert_eq!(transport.sent().len(), sent, "{shutdown}");
++        assert_eq!(Arc::weak_count(&client), 0, "{shutdown}");
++        if shutdown {
++            break;
++        }
++        // Opened again, the room has no worker that runs (the one of the window stopped at its
++        // first step), and a start gives it one.
++        open_room(&client, &room_id).await.unwrap();
++        let stale = worker(&client, &room_id).await;
++        assert!(
++            stale.as_ref().is_none_or(|stale| !stale.running),
++            "{stale:?}"
++        );
++        client.start_worker(room_id.clone()).await.unwrap();
++        assert!(worker(&client, &room_id).await.unwrap().running);
++        soon(client.stop_worker(room_id.clone())).await.unwrap();
++    }
++}

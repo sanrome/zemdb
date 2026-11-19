@@ -1011,6 +1011,47 @@ async fn a_read_that_fails_is_an_element_and_the_next_value_is_compared_with_the
     assert_eq!(next(&mut second).await, Some(Ok(renamed)));
 }
 
+#[tokio::test]
+async fn after_a_failed_read_of_a_scan_rows_equal_to_the_last_emitted_are_not_emitted() {
+    // As the test before, through a `watch_scan` and an error of the storage instead of a `watch`
+    // and `Decryption`: a read of a state in between that fails is an element, and once the
+    // replica is still in a state equal to the last value emitted, that value does not come
+    // again; the last element is that error, and the next change is compared with the last value
+    // emitted.
+    let (server, room_id) = league(TestServer::new()).await;
+    let dir = tempdir().unwrap();
+    let transport = server.transport();
+    let storage = TestEngine::new(engine(dir.path()));
+    let client = ana(dir.path(), storage.clone(), &transport).await;
+    let room = joined(&client, &room_id).await;
+    let members = room.table("members").unwrap();
+    let mut everyone = members.watch_scan(&Scan::new());
+    let both = vec![member("ana", "Ana"), member("bob", "Bob")];
+    assert_eq!(next(&mut everyone).await, Some(Ok(both.clone())));
+    let commit = |op| server.commit_ops(&room_id, [op]);
+
+    // Bob takes another name, whose read fails.
+    storage.fail_next("scan_by_id", io());
+    commit(renames("bob", "Roberto")).await;
+    room.sync().await.unwrap();
+    let failed = next(&mut everyone).await;
+    assert!(
+        matches!(failed, Some(Err(ClientError::Storage(_)))),
+        "{failed:?}"
+    );
+    // And his name again: the rows are those of the last value emitted, which does not come again.
+    commit(renames("bob", "Bob")).await;
+    room.sync().await.unwrap();
+    quiet(&mut everyone).await;
+    assert_eq!(members.scan(&Scan::new()).await, Ok(both));
+    assert_eq!(watches(&room).await, 1);
+    // The next change is emitted.
+    commit(renames("bob", "Robert")).await;
+    room.sync().await.unwrap();
+    let renamed = vec![member("ana", "Ana"), member("bob", "Robert")];
+    assert_eq!(next(&mut everyone).await, Some(Ok(renamed)));
+}
+
 /// What a watch of the property reads, with its stream and the last value it gave.
 enum Watched {
     Row(Key, ChangeStream<Option<Row>>, Option<Option<Row>>),

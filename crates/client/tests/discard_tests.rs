@@ -482,6 +482,51 @@ async fn the_watch_streams_end_and_a_write_during_the_discard_is_room_closed() {
     assert_eq!(handle.status().await, Ok(watched(2, 3, 1)));
 }
 
+#[tokio::test]
+async fn discarding_a_room_leaves_the_replica_the_metadata_and_the_watch_of_another() {
+    // The discard on request touches only its room: another room open in the client, with a
+    // `watch` stream, keeps its replica, its metadata, its epoch and its stream; also when the
+    // room discarded is one that the client never opened.
+    let server = TestServer::new();
+    let (a, b) = (
+        server.create_room("room-a").await,
+        server.create_room("room-b").await,
+    );
+    server.commit(&a, 1..=2).await;
+    server.commit(&b, 1..=3).await;
+    let dir = tempdir().unwrap();
+    let transport = server.transport();
+    let client = facade(dir.path(), engine(dir.path()), &transport).await;
+    let (room_a, room_b) = (
+        room(&client, &a).await.unwrap(),
+        room(&client, &b).await.unwrap(),
+    );
+    room_a.sync().await.unwrap();
+    room_b.sync().await.unwrap();
+    let tasks_b = room_b.table("tasks").unwrap();
+    let mut stream = tasks_b.watch_scan(&Scan::new());
+    let three: Vec<_> = (1..=3).map(|id| task(id, "task")).collect();
+    assert_eq!(next(&mut stream).await, Some(Ok(three.clone())));
+    let saved_b = metadata(dir.path(), &b).await.unwrap();
+    assert_eq!(room_b.status().await, Ok(watched(3, 1, 1)));
+
+    room_a.discard().await.unwrap();
+    client
+        .discard_room(RoomId::new("room-c").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(room_a.status().await, closed(&a));
+    assert_eq!(metadata(dir.path(), &a).await, None);
+    // The other room is as it was, and its stream goes on.
+    assert_eq!(metadata(dir.path(), &b).await, Some(saved_b));
+    assert_eq!(room_b.status().await, Ok(watched(3, 1, 1)));
+    assert_eq!(tasks_b.scan(&Scan::new()).await, Ok(three.clone()));
+    server.commit(&b, [4]).await;
+    room_b.sync().await.unwrap();
+    let four: Vec<_> = (1..=4).map(|id| task(id, "task")).collect();
+    assert_eq!(next(&mut stream).await, Some(Ok(four)));
+}
+
 // ---------------------------------------------------------------------------------------------
 // The requests in flight
 

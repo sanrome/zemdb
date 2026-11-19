@@ -539,8 +539,21 @@ impl Room {
     /// last acknowledgement; also until those of a worker that another caller stops ended, even
     /// if that caller was cut.
     async fn stop_worker(&self) {
+        self.stop_worker_if(|_| true).await;
+    }
+
+    /// Stops the worker of the room as [`stop_worker`](Self::stop_worker) does if `stops` takes
+    /// the state of the room, which it reads under the lock of the worker; otherwise it does
+    /// nothing. A worker starts only on a replica in the client, seen under the applier, and
+    /// enters the room under the lock of the worker: so the one there while the replica is out
+    /// of the client, and no change is bringing it back (an open, or the reopening of its
+    /// storage room), started before it left.
+    async fn stop_worker_if(&self, stops: impl FnOnce(&State) -> bool) {
         let ended = {
             let mut worker = self.worker();
+            if !stops(&self.state()) {
+                return;
+            }
             let mut stopping = self.stopping();
             if let Some(worker) = worker.take() {
                 *stopping = Some(worker.stop());
@@ -2495,7 +2508,7 @@ impl Client {
     /// ([`ClientConfig::freshness`]), unless it has one that runs. The room is open in the
     /// client, also unregistered or empty after a registration that failed: the first heartbeat
     /// of the worker registers it. A room that the client never opened, or closed or discarded,
-    /// is `RoomClosed`.
+    /// is `RoomClosed`, and so is any once the client began to shut down.
     ///
     /// The worker is a task of its own, which holds the client by a weak reference: it ends once
     /// the application drops the client. It sends a heartbeat every
@@ -2558,7 +2571,8 @@ impl Client {
     /// progress ended. A worker that runs takes the mode once its step in progress ends (at once,
     /// unless a heartbeat with its acknowledgement is in flight): in [`Freshness::Live`] it opens
     /// the event stream of the room, once the wait after an error or a refusal of the stream
-    /// allows, and in another mode it closes it.
+    /// allows, and in another mode it closes it. Once the client began to shut down, it is
+    /// `RoomClosed`, also with a worker that runs, whose mode it does not set.
     pub async fn set_freshness(
         self: &Arc<Self>,
         room_id: RoomId,
@@ -2582,7 +2596,9 @@ impl Client {
             // afterwards finds the worker, to stop it.
             let ended = {
                 let _applier = room.applier.lock().await;
-                if matches!(room.state().replica, Replica::Closed) {
+                // A client that shuts down starts no worker: its rooms close one at a time.
+                let shut_down = self.local.shut_down.load(Ordering::SeqCst);
+                if shut_down || matches!(room.state().replica, Replica::Closed) {
                     return Err(ClientError::RoomClosed(room_id));
                 }
                 // Under both locks, as a stop takes them.
@@ -2630,11 +2646,21 @@ impl Client {
     /// Closes `room_id` once its worker stopped, as [`stop_worker`](Self::stop_worker) stops it,
     /// with its last acknowledgement, and the changes of its replica in progress ended, closing
     /// its storage room, which waits for the operations of the storage in progress. An error
-    /// closing it is reported, and the room leaves the client all the same.
+    /// closing it is reported, and the room leaves the client all the same. A worker started
+    /// while the close waited for the applier is stopped once the room is closed, if it is still
+    /// out of the client with no change in progress, and acknowledges nothing; otherwise, as with
+    /// a call cut once its close started, that worker stops at its first step, without sending
+    /// anything, and one of the room opened again meanwhile goes on.
     pub async fn close_room(&self, room_id: RoomId) -> Result<(), ClientError> {
         let room = self.room(&room_id)?;
         room.stop_worker().await;
-        self.change(&room, Local::close).await
+        let closed = self.change(&room, Local::close).await;
+        // A worker started before the close took the applier, on the replica it closed; not one
+        // of the room opened again meanwhile, nor of one that a change of it takes out of the
+        // client for a moment.
+        let out = |state: &State| matches!(state.replica, Replica::Closed) && !state.changing;
+        room.stop_worker_if(out).await;
+        closed
     }
 
     /// Discards the local replica of `room_id` at the request of the application, in any state:
@@ -2684,8 +2710,11 @@ impl Client {
     /// Shuts the client down: closes every room as [`close_room`](Self::close_room) does, with the
     /// workers of all of them stopped at once, and their last acknowledgements, so that the
     /// runtime can be shut down without losing anything, and releases the metadata for another
-    /// client. The first error closing a room is reported, once every room is closed. No room
-    /// opens afterwards.
+    /// client. The first error closing a room is reported, once every room is closed. Once it
+    /// starts, no worker starts (`RoomClosed`). With threads, a start that read the client not
+    /// shutting down just before leaves a worker that runs until its room closes, and that is
+    /// stopped once every room is closed: its last acknowledgement reads the room closed, and
+    /// sends nothing. No room opens afterwards.
     pub async fn shutdown(&self) -> Result<(), ClientError> {
         self.local.shut_down.store(true, Ordering::SeqCst);
         let rooms: Vec<_> = {
@@ -2694,12 +2723,14 @@ impl Client {
         };
         futures::future::join_all(rooms.iter().map(|room| room.stop_worker())).await;
         let mut closed = Ok(());
-        for room in rooms {
-            match self.change(&room, Local::close).await {
+        for room in &rooms {
+            match self.change(room, Local::close).await {
                 Err(ClientError::RoomClosed(_)) => {}
                 result => closed = closed.and(result),
             }
         }
+        // The workers whose start saw the flag down, after the first stop; no room opens again.
+        futures::future::join_all(rooms.iter().map(|room| room.stop_worker())).await;
         self.local.metadata.close().await;
         closed
     }

@@ -2408,3 +2408,188 @@ async fn a_start_waiting_for_the_applier_while_a_stop_begins_waits_for_that_stop
     soon(client.close_room(room_id.clone())).await.unwrap();
     assert_eq!(acks(&transport), [3]);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_worker_started_between_the_stop_and_the_close_of_a_close_is_stopped_by_it() {
+    // A start that takes the applier after the stop of the worker of `close_room` and before its
+    // close (here, both wait while a write holds the applier, the start first) leaves a worker in
+    // the room it closes, which it stops once the room is closed: when it returns, no task of a
+    // worker is left, and the worker acknowledged nothing, since its last ack reads the room
+    // closed; nothing goes afterwards. Opened again, the room has no worker that runs, and a
+    // start gives it one. In `shutdown`, that start is `RoomClosed`: the client starts no worker
+    // once it shuts down.
+    let interval = Duration::from_secs(10);
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let transport = server.transport();
+    let engine = TestEngine::new(MemoryStorageEngine::new());
+    let client = client_over(engine.clone(), &transport, every(interval)).await;
+    open_room(&client, &room_id).await.unwrap();
+    for (id, shutdown) in [(1, false), (2, true)] {
+        let mut applying = engine.hold_next("apply_batch");
+        let write = tokio::spawn({
+            let (client, room_id) = (Arc::clone(&client), room_id.clone());
+            async move { client.write(room_id, insert_task(id)).await }
+        });
+        soon(applying.replied()).await;
+        let starting = tokio::spawn({
+            let (client, room_id) = (Arc::clone(&client), room_id.clone());
+            async move { client.start_worker(room_id).await }
+        });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let closing = tokio::spawn({
+            let (client, room_id) = (Arc::clone(&client), room_id.clone());
+            async move {
+                match shutdown {
+                    false => client.close_room(room_id).await,
+                    true => client.shutdown().await,
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let acked = acks(&transport);
+        applying.release();
+        assert_eq!(soon(write).await.unwrap(), Ok(()), "{shutdown}");
+        // The start got the applier first, with the room still open.
+        let started = match shutdown {
+            false => Ok(()),
+            true => Err(ClientError::RoomClosed(room_id.clone())),
+        };
+        assert_eq!(soon(starting).await.unwrap(), started, "{shutdown}");
+        assert_eq!(soon(closing).await.unwrap(), Ok(()), "{shutdown}");
+        // No task of a worker is left: none holds the client, even weakly.
+        assert_eq!(Arc::weak_count(&client), 0, "{shutdown}");
+        assert_eq!(acks(&transport), acked, "{shutdown}");
+        let closed = Err(ClientError::RoomClosed(room_id.clone()));
+        assert_eq!(client.status(room_id.clone()).await, closed, "{shutdown}");
+        let sent = transport.sent().len();
+        tokio::time::sleep(interval * 3).await;
+        assert_eq!(transport.sent().len(), sent, "{shutdown}");
+        if shutdown {
+            break;
+        }
+        // Opened again, the room has no worker that runs, and a start gives it one.
+        open_room(&client, &room_id).await.unwrap();
+        let stale = worker(&client, &room_id).await;
+        assert!(
+            stale.as_ref().is_none_or(|stale| !stale.running),
+            "{stale:?}"
+        );
+        client.start_worker(room_id.clone()).await.unwrap();
+        assert!(worker(&client, &room_id).await.unwrap().running);
+        soon(client.stop_worker(room_id.clone())).await.unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_room_opened_again_before_its_close_looks_at_it_keeps_its_worker() {
+    // The close of `close_room` ends while its caller is not polled, and meanwhile the room opens
+    // again and gets a worker. When `close_room` goes on, it finds the room open: that worker is
+    // of the room opened again, and it keeps running.
+    let interval = Duration::from_secs(10);
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let transport = server.transport();
+    let engine = TestEngine::new(MemoryStorageEngine::new());
+    let client = client_over(engine.clone(), &transport, every(interval)).await;
+    open_room(&client, &room_id).await.unwrap();
+    let mut close = std::pin::pin!(client.close_room(room_id.clone()));
+    assert!(futures::poll!(close.as_mut()).is_pending());
+    // The open waits for the applier, so the close ended before it.
+    open_room(&client, &room_id).await.unwrap();
+    client.start_worker(room_id.clone()).await.unwrap();
+    assert!(worker(&client, &room_id).await.unwrap().running);
+    assert_eq!(soon(close).await, Ok(()));
+    let after = worker(&client, &room_id).await;
+    assert!(
+        after.as_ref().is_some_and(|after| after.running),
+        "{after:?}"
+    );
+    soon(client.stop_worker(room_id.clone())).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_start_while_the_client_shuts_down_is_room_closed_also_in_a_room_not_closed_yet() {
+    // While `shutdown` closes one room (its storage close held), a start in another room, not
+    // closed yet, is `RoomClosed` at once, and one in the room it closes, once the close ends:
+    // no worker starts, and nothing goes out during the shutdown or afterwards.
+    let interval = Duration::from_secs(10);
+    let server = TestServer::new();
+    let a = server.create_room("room-a").await;
+    let b = server.create_room("room-b").await;
+    let transport = server.transport();
+    let engine = TestEngine::new(MemoryStorageEngine::new());
+    let client = client_over(engine.clone(), &transport, every(interval)).await;
+    open_room(&client, &a).await.unwrap();
+    open_room(&client, &b).await.unwrap();
+    let mut closing = engine.hold_next("close_room");
+    let shutdown = tokio::spawn({
+        let client = Arc::clone(&client);
+        async move { client.shutdown().await }
+    });
+    soon(closing.replied()).await;
+    let sent = transport.sent().len();
+    let start = |room_id: &RoomId| {
+        let (client, room_id) = (Arc::clone(&client), room_id.clone());
+        tokio::spawn(async move { client.start_worker(room_id).await })
+    };
+    let (start_a, start_b) = (start(&a), start(&b));
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    // The rooms close in no fixed order: the start in the one that the shutdown closes waits.
+    let ((open, started), (closed, held)) = match (start_a.is_finished(), start_b.is_finished()) {
+        (true, false) => ((a.clone(), start_a), (b.clone(), start_b)),
+        (false, true) => ((b.clone(), start_b), (a.clone(), start_a)),
+        other => panic!("{other:?}"),
+    };
+    let open_closed = Err(ClientError::RoomClosed(open.clone()));
+    assert_eq!(started.await.unwrap(), open_closed);
+    server.commit(&open, [1, 2]).await;
+    tokio::time::sleep(interval * 3).await;
+    assert_eq!(transport.sent().len(), sent);
+    closing.release();
+    assert_eq!(soon(shutdown).await.unwrap(), Ok(()));
+    let closed = Err(ClientError::RoomClosed(closed));
+    assert_eq!(soon(held).await.unwrap(), closed);
+    assert_eq!(Arc::weak_count(&client), 0);
+    tokio::time::sleep(interval * 3).await;
+    assert_eq!(transport.sent().len(), sent);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_room_opened_again_and_out_of_the_client_for_a_moment_keeps_its_worker_after_a_close() {
+    // As the test before, but when `close_room` looks at the room opened again, a change of it
+    // has it out of the client for a moment: a sync whose batch fails reopens its storage room,
+    // held here. `close_room` leaves the worker, which is of the room opened again, and it keeps
+    // running once the room is back.
+    let interval = Duration::from_secs(10);
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let transport = server.transport();
+    let engine = TestEngine::new(MemoryStorageEngine::new());
+    let client = client_over(engine.clone(), &transport, every(interval)).await;
+    open_room(&client, &room_id).await.unwrap();
+    let mut close = std::pin::pin!(client.close_room(room_id.clone()));
+    assert!(futures::poll!(close.as_mut()).is_pending());
+    open_room(&client, &room_id).await.unwrap();
+    client.start_worker(room_id.clone()).await.unwrap();
+    assert!(worker(&client, &room_id).await.unwrap().running);
+    server.commit(&room_id, [1]).await;
+    let failure = StorageError::Io(std::io::Error::other("the batch fails"));
+    engine.fail_next("apply_batch", failure);
+    let mut opening = engine.hold_next("open_room");
+    let syncing = tokio::spawn({
+        let (client, room_id) = (Arc::clone(&client), room_id.clone());
+        async move { client.sync(room_id).await }
+    });
+    soon(opening.replied()).await;
+    let closed = futures::poll!(close.as_mut());
+    assert_eq!(closed, std::task::Poll::Ready(Ok(())));
+    opening.release();
+    let _ = soon(syncing).await.unwrap();
+    let after = worker(&client, &room_id).await;
+    assert!(
+        after.as_ref().is_some_and(|after| after.running),
+        "{after:?}"
+    );
+    soon(client.stop_worker(room_id.clone())).await.unwrap();
+}

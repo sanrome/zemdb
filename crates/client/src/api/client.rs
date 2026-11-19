@@ -77,7 +77,8 @@ impl ZemdbClient {
     /// handle of the room does not start another; [`RoomHandle::close`] stops it. A room whose
     /// replica fails closed (the schema of the server does not evolve from the replica's) has
     /// its handle all the same, to be read and discarded, without a worker: its status says it
-    /// fails closed. A room closed while it starts its worker is `RoomClosed`.
+    /// fails closed. A room closed while it starts its worker is `RoomClosed`, or, if the close
+    /// takes the applier after the start, gets its worker stopped by the close.
     ///
     /// Each call asks the provider first, also for a room that is open, which keeps its token if
     /// the provider gives none; after [`shutdown`](Self::shutdown), it is `RoomClosed` without
