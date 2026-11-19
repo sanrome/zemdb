@@ -1729,3 +1729,28 @@ impl CryptoEngine for TestCrypto {
         }
     }
 }
+
+/// The longest delay that fits in the clock from `now`: one more nanosecond does not.
+pub fn longest_from(now: tokio::time::Instant) -> Duration {
+    let fits = |delay: Duration| now.checked_add(delay).is_some();
+    let (mut low, mut high) = (0u64, u64::MAX);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if fits(Duration::from_secs(mid)) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let secs = Duration::from_secs(low);
+    let (mut low, mut high) = (0u64, 999_999_999u64);
+    while low < high {
+        let mid = low + (high - low).div_ceil(2);
+        if fits(secs + Duration::from_nanos(mid)) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    secs + Duration::from_nanos(low)
+}

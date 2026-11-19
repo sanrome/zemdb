@@ -456,6 +456,128 @@ async fn with_the_event_stream_off_live_falls_to_periodic_and_tries_it_again_aft
 }
 
 #[tokio::test(start_paused = true)]
+async fn with_the_event_stream_off_an_events_retry_beyond_the_clock_runs_as_in_periodic_for_good() {
+    let server = TestServer::with(|config| config.max_sse_streams = Some(0));
+    let room_id = server.create_room("room-a").await;
+    let (transport, tokens) = (server.transport(), TestTokens::new());
+    // The longest delay, as for "never".
+    let config = ClientConfig {
+        events_retry: Duration::MAX,
+        ..live()
+    };
+    let client = client_over(MemoryStorageEngine::new(), &transport, config, &tokens).await;
+    open_room(&client, &room_id).await.unwrap();
+    client.start_worker(room_id.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(transport.stream_opens().len(), 1);
+    let status = worker(&client, &room_id).await;
+    assert_eq!(status.effective, Freshness::Periodic);
+    assert!(status.running && status.last_error.is_none(), "{status:?}");
+
+    // What another client writes comes with the next heartbeat.
+    server.commit(&room_id, [1]).await;
+    let start = Instant::now();
+    while head(&client, &room_id).await != 1 {
+        assert!(
+            start.elapsed() <= INTERVAL + Duration::from_secs(1),
+            "No heartbeat synced"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    // A day later, the stream was not tried again.
+    tokio::time::sleep(Duration::from_secs(86_400)).await;
+    assert_eq!(transport.stream_opens().len(), 1);
+    let status = worker(&client, &room_id).await;
+    assert!(status.running && status.last_error.is_none(), "{status:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refusal_events_disabled_with_an_events_retry_beyond_the_clock_leaves_the_worker_running()
+{
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let (transport, tokens) = (server.transport(), TestTokens::new());
+    // The network refuses the opening as the server would with its event stream off.
+    transport.answer_next_events(|room_id| Ok(refused(room_id, ErrorCode::EventsDisabled)));
+    let config = ClientConfig {
+        heartbeat_interval: Duration::from_secs(10),
+        events_retry: Duration::MAX,
+        ..live()
+    };
+    let client = client_over(MemoryStorageEngine::new(), &transport, config, &tokens).await;
+    open_room(&client, &room_id).await.unwrap();
+    client.start_worker(room_id.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(transport.stream_opens().len(), 1);
+    let before = heartbeats(&transport);
+    tokio::time::sleep(Duration::from_secs(21)).await;
+    let status = worker(&client, &room_id).await;
+    assert!(status.running && status.last_error.is_none(), "{status:?}");
+    assert_eq!(status.effective, Freshness::Periodic);
+    assert!(heartbeats(&transport) >= before + 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_events_retry_beyond_the_clock_holds_across_modes_and_a_new_worker_tries_the_stream() {
+    let server = TestServer::with(|config| config.max_sse_streams = Some(0));
+    let room_id = server.create_room("room-a").await;
+    let (transport, tokens) = (server.transport(), TestTokens::new());
+    let config = ClientConfig {
+        heartbeat_interval: Duration::from_secs(10),
+        events_retry: Duration::MAX,
+        ..live()
+    };
+    let client = client_over(MemoryStorageEngine::new(), &transport, config, &tokens).await;
+    open_room(&client, &room_id).await.unwrap();
+    client.start_worker(room_id.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(transport.stream_opens().len(), 1);
+    // Out of `Live` and back: the wait holds.
+    let periodic = client.set_freshness(room_id.clone(), Freshness::Periodic);
+    periodic.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    client
+        .set_freshness(room_id.clone(), Freshness::Live)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    assert_eq!(transport.stream_opens().len(), 1);
+    assert_eq!(
+        worker(&client, &room_id).await.effective,
+        Freshness::Periodic
+    );
+    // A worker started again tries the stream again.
+    client.stop_worker(room_id.clone()).await.unwrap();
+    client.start_worker(room_id.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(transport.stream_opens().len(), 2);
+    let status = worker(&client, &room_id).await;
+    assert!(status.running && status.last_error.is_none(), "{status:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_events_retry_that_fits_in_the_clock_by_less_than_a_millisecond_leaves_the_worker_running(
+) {
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let (transport, tokens) = (server.transport(), TestTokens::new());
+    transport.answer_next_events(|room_id| Ok(refused(room_id, ErrorCode::EventsDisabled)));
+    // It fits, and the timer rounds it up past the clock.
+    let config = ClientConfig {
+        heartbeat_interval: Duration::from_secs(10),
+        events_retry: longest_from(Instant::now()) - Duration::from_micros(500),
+        ..live()
+    };
+    let client = client_over(MemoryStorageEngine::new(), &transport, config, &tokens).await;
+    open_room(&client, &room_id).await.unwrap();
+    client.start_worker(room_id.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(transport.stream_opens().len(), 1);
+    let status = worker(&client, &room_id).await;
+    assert!(status.running && status.last_error.is_none(), "{status:?}");
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_live_worker_whose_server_turns_its_event_stream_on_opens_it_after_events_retry() {
     let config = ClientConfig {
         events_retry: Duration::from_secs(120),

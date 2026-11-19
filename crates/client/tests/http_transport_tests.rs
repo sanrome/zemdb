@@ -535,6 +535,68 @@ async fn a_transport_that_cannot_work_is_config() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transport_with_its_longest_timeouts_sends_requests_and_opens_streams() {
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let (addr, _stop) = serve(&server).await;
+    let mut config = HttpTransportConfig::new(format!("http://{addr}"));
+    config.connect_timeout = Duration::MAX;
+    config.idle_timeout = Duration::MAX;
+    config.pool_idle_timeout = Duration::from_secs(300);
+    let client = open(
+        HttpTransport::new(config.clone()).unwrap(),
+        ClientConfig::new("ana"),
+    )
+    .await;
+    let client_token = token(&client.client_id(), &room_id);
+    let opened = client.open_room(room_id.clone(), client_token.clone());
+    opened.await.unwrap();
+    client.write(room_id.clone(), insert_task(1)).await.unwrap();
+    client.heartbeat(room_id.clone()).await.unwrap();
+    let transport = HttpTransport::new(config).unwrap();
+    let _blocks = open_stream(&transport, &room_id, &client_token).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tls_handshake_that_the_server_never_answers_is_cut_by_the_connect_timeout() {
+    // A server that takes the connection and the `ClientHello`, and never answers it.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut hello = [0; 4096];
+            let _ = socket.read(&mut hello).await;
+            sockets.push(socket);
+        }
+    });
+    let mut config = HttpTransportConfig::new(format!("https://{addr}"));
+    config.connect_timeout = Duration::from_millis(300);
+    config.idle_timeout = Duration::from_secs(30);
+    let transport = HttpTransport::new(config).unwrap();
+    let room_id = RoomId::new("room-a").unwrap();
+    // The request and the opening of a stream, each cut long before the idle timeout.
+    let message = heartbeat(&room_id);
+    let started = Instant::now();
+    let sent = tokio::time::timeout(Duration::from_secs(10), transport.send(&message, "t"));
+    assert!(matches!(sent.await, Ok(Err(_))));
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    let started = Instant::now();
+    let opened = tokio::time::timeout(Duration::from_secs(10), transport.events(&room_id, "t"));
+    assert!(matches!(opened.await, Ok(Err(_))));
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_server_url_with_a_path_takes_the_endpoints_under_it() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

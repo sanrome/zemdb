@@ -1,3 +1,4 @@
+use crate::config::NEVER;
 use crate::{endpoint, ClientError, EventStream, TransportClient, TransportError};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -27,13 +28,13 @@ pub struct HttpTransportConfig {
     /// The URL of the server, `http://` or `https://`, without a user, a query or a fragment:
     /// the paths of the Data Plane go under it (`{url}/rooms/{room_id}/commit`).
     pub url: String,
-    /// The longest a connection may take to open, with its TLS handshake (10 s). Above zero.
-    /// On macOS and Windows the system verifies the certificate within the handshake, with a
-    /// check of its revocation that may go to the network: a timer cannot cut that call while it
-    /// blocks.
+    /// The longest a connection may take to open, with its TLS handshake (10 s). Above zero,
+    /// and at most about thirty years: a longer one is thirty years. On macOS and Windows the
+    /// system verifies the certificate within the handshake, with a check of its revocation that
+    /// may go to the network: a timer cannot cut that call while it blocks.
     pub connect_timeout: Duration,
     /// The longest a request may go without advancing (60 s), however long it takes in all.
-    /// Above zero.
+    /// Above zero, and at most about thirty years: a longer one is thirty years.
     pub idle_timeout: Duration,
     /// How long an idle connection is kept for another request (5 s): below the time the
     /// server keeps it (`header_read_timeout_secs`, 10 s by default). At most 300 s, the
@@ -201,8 +202,12 @@ impl HttpTransport {
                 "The pool keeps an idle connection for at most {MAX_POOL_IDLE:?}"
             )));
         }
+        // At most [`NEVER`]: a timeout that fits in the clock by less than the timer of Tokio
+        // rounds it up by would panic the timer.
         let config = HttpTransportConfig {
             url: url.as_str().trim_end_matches('/').to_string(),
+            connect_timeout: config.connect_timeout.min(NEVER),
+            idle_timeout: config.idle_timeout.min(NEVER),
             ..config
         };
         let not_started = |err: reqwest::Error| {

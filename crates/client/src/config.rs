@@ -1,13 +1,20 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// About thirty years, the longest deadline of the client (the waits of its backoffs may be
+/// longer): a deadline that far is one that does not come while the client runs, and it fits in
+/// the clock, also once the timer of Tokio rounds it up.
+pub(crate) const NEVER: Duration = Duration::from_secs(30 * 365 * 86_400);
+
 /// The configuration of a [`Client`](crate::Client).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
     /// The person the client writes as, the part of its client id before `#`: the id the
     /// backend issues the person's tokens with. Not empty, and without `#`.
     pub person: String,
-    /// How long a write retries until its `CommitAck` (30 s): no attempt is sent after it.
+    /// How long a write retries until its `CommitAck` (30 s): no attempt is sent after it. One
+    /// that does not fit in the clock makes each write `Config`, and one that fits but is longer
+    /// than about thirty years is thirty years.
     pub write_timeout: Duration,
     /// The longest first delay between two retries (100 ms), which doubles after each retry.
     /// Above zero.
@@ -36,7 +43,9 @@ pub struct ClientConfig {
     /// than `retry_base`.
     pub retry_max: Duration,
     /// How long a worker in [`Freshness::Live`] waits to open the event stream again after the
-    /// server answered that its events are disabled (10 min). Above zero.
+    /// server answered that its events are disabled (10 min). Above zero. One longer than about
+    /// thirty years, such as `Duration::MAX`, is never: the worker does not try the stream again
+    /// while it runs, also when its mode changes.
     pub events_retry: Duration,
 }
 

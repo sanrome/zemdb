@@ -1562,6 +1562,45 @@ async fn a_configuration_of_the_worker_that_cannot_work_is_config() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_client_with_every_delay_at_its_longest_panics_no_task() {
+    let server = TestServer::with(|config| config.max_sse_streams = Some(0));
+    let room_id = server.create_room("room-a").await;
+    let transport = server.transport();
+    // Each delay that the client takes at its longest, and the longest interval.
+    let config = ClientConfig {
+        freshness: Freshness::Live,
+        heartbeat_interval: Duration::from_millis(59_999),
+        backoff_base: Duration::MAX,
+        backoff_max: Duration::MAX,
+        retry_base: Duration::MAX,
+        retry_max: Duration::MAX,
+        events_retry: Duration::MAX,
+        ..ClientConfig::new("ana")
+    };
+    let client = client_with(&transport, config).await;
+    open_room(&client, &room_id).await.unwrap();
+    client.start_worker(room_id.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    // The event stream is off, so the worker runs as in `Periodic`.
+    let status = worker(&client, &room_id).await.unwrap();
+    assert!(status.running && status.last_error.is_none(), "{status:?}");
+    assert_eq!(status.effective, Freshness::Periodic);
+    // Without the network, a heartbeat fails and waits its backoff, and a write ends at its
+    // deadline.
+    transport.offline();
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let written = client.write(room_id.clone(), insert_task(1)).await;
+    let ended = matches!(
+        written,
+        Err(ClientError::Network(_) | ClientError::OutcomeUnknown)
+    );
+    assert!(ended, "{written:?}");
+    let status = worker(&client, &room_id).await.unwrap();
+    let failed = matches!(status.last_error, Some(ClientError::Network(_)));
+    assert!(status.running && failed, "{status:?}");
+}
+
 /// The heads that the acks through `transport` acknowledged, in order.
 fn acks(transport: &TestTransport) -> Vec<u64> {
     let acks = requests(transport)

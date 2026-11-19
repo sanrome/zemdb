@@ -17,6 +17,7 @@ use zemdb_core::{
 };
 use zemdb_storage::{StorageEngine, StorageError};
 
+use crate::config::NEVER;
 use crate::events::{EventReader, OpsEvent};
 use crate::token::issued_to;
 use crate::watch::{Change, Watched, Watches};
@@ -1597,8 +1598,12 @@ impl Client {
     ) -> Result<(), ClientError> {
         let room = self.room(&room_id)?;
         let mutation_id = MutationId::from(Uuid::new_v4().as_u128());
-        let deadline = (Instant::now().checked_add(self.config.write_timeout))
+        let now = Instant::now();
+        let deadline = (now.checked_add(self.config.write_timeout))
             .ok_or_else(|| ClientError::Config("The write timeout is too long".to_string()))?;
+        // At most [`NEVER`]: one that fits in the clock by less than the timer rounds it up by
+        // would panic the timer.
+        let deadline = deadline.min(now + NEVER);
         let mut backoff = Backoff::new(&self.config);
         // Whether an attempt may have been sequenced.
         let mut uncertain = false;

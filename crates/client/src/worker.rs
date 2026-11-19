@@ -8,6 +8,7 @@ use tokio::time::Instant;
 use zemdb_core::RoomId;
 
 use crate::client::{jitter, Acking, Backoff, Held, Opened, Transfer};
+use crate::config::NEVER;
 use crate::events::{EventReader, RoomEvent, SseEvent, StreamError};
 use crate::{Client, ClientConfig, ClientError, Freshness};
 
@@ -41,6 +42,13 @@ const WAITING_BEATS: u32 = 10;
 /// Every how many heartbeats that succeed the worker acknowledges the head of the replica also if
 /// it did not move.
 const ACK_AGAIN_BEATS: u32 = 10;
+
+/// The instant `delay` from now, or [`NEVER`] from now if it is longer: one that fits in the
+/// clock by less than the timer of Tokio rounds it up by would panic the timer. The waits of the
+/// backoffs need none: they are at most `u64::MAX` nanoseconds, which fit.
+fn after(delay: Duration) -> Instant {
+    Instant::now() + delay.min(NEVER)
+}
 
 /// What the worker of a room shares with its task.
 struct Shared {
@@ -451,7 +459,7 @@ async fn run(
                 match opened {
                     Opened::Disabled => {
                         events.disabled = true;
-                        events.retry_at = Instant::now() + config.events_retry;
+                        events.retry_at = after(config.events_retry);
                     }
                     Opened::Stream(reader, epoch) => {
                         events.disabled = false;

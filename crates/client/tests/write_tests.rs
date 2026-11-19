@@ -1359,6 +1359,29 @@ async fn the_backoff_is_random_up_to_its_longest_delay() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_write_timeout_that_fits_in_the_clock_by_less_than_a_millisecond_ends_the_write() {
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let transport = server.transport();
+    // It fits, and the timer rounds it up past the clock.
+    let config = ClientConfig {
+        write_timeout: longest_from(Instant::now()) - Duration::from_micros(500),
+        ..ClientConfig::new("ana")
+    };
+    let dir = tempdir().unwrap();
+    let client = Client::open(
+        config,
+        engine(dir.path()),
+        FileMetadata::new(dir.path()),
+        transport.clone(),
+        TestTokens::new(),
+    );
+    let client = client.await.unwrap();
+    open_room(&client, &room_id).await.unwrap();
+    assert_eq!(client.write(room_id.clone(), insert_task(1)).await, Ok(()));
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_write_and_a_sync_of_a_room_that_is_not_registered_register_it_once() {
     let dir = tempdir().unwrap();
     let (_server, room_id, transport, _, client) = setup(dir.path(), engine(dir.path())).await;

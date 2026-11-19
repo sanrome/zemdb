@@ -71,3 +71,17 @@ async fn the_body_is_handed_over_in_pieces_and_each_piece_taken_is_progress() {
     assert!(body.is_end_stream());
     assert_eq!(body.size_hint().exact(), Some(0));
 }
+
+#[test]
+fn the_timeouts_of_the_transport_are_at_most_never() {
+    let mut config = HttpTransportConfig::new("http://localhost");
+    config.connect_timeout = Duration::MAX;
+    config.idle_timeout = Duration::MAX;
+    let transport = HttpTransport::new(config).unwrap();
+    assert_eq!(transport.idle_timeout, NEVER);
+    let config = &transport.clients.config;
+    assert_eq!(
+        (config.connect_timeout, config.idle_timeout),
+        (NEVER, NEVER)
+    );
+}
