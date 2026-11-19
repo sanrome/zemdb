@@ -1979,12 +1979,15 @@ impl Client {
     /// what the event does not bring. The event is checked before it is used, in this order:
     /// of the room of the stream, with operations in order that reach its head (otherwise, a
     /// sync, as for an event that does not decode); of the incarnation of the replica, which
-    /// otherwise registers again with its cursor, for the registration to discard it; and with
-    /// its schema or an earlier version of it, for otherwise the replica registers again to take
-    /// the schema of the room. Then its head is a head seen, and the applier applies the
-    /// operations after the head of the replica, as a batch of a sync, without failing the room
-    /// closed: one that does not validate against the schema of the replica registers it again.
-    /// A gap after the head, and a replica that is not open in `epoch`, ask for a sync.
+    /// otherwise registers again with its cursor, for the registration to discard it; with its
+    /// schema or an earlier version of it, for otherwise the replica registers again to take the
+    /// schema of the room; and with operations that validate against the schema of the replica,
+    /// for otherwise the event is not the server's, and the replica registers again too, never
+    /// failing the room closed. Only then is its head a head seen, so that an event that is not
+    /// the server's leaves no write uncertain, and the applier applies the operations after the
+    /// head of the replica, as a batch of a sync; a batch that the engine does not take registers
+    /// the replica again too. A gap after the head, and a replica that is not open in `epoch`,
+    /// ask for a sync.
     pub(crate) async fn worker_apply(
         &self,
         room_id: &RoomId,
@@ -2014,8 +2017,10 @@ impl Client {
                 ..
             } if *current == epoch => {
                 let metadata = &open.metadata;
+                let valid = |op: &SequencedOperation| metadata.schema.validate_operation(&op.op);
                 metadata.room_incarnation == room_incarnation
                     && !changes(metadata, &schema.0, schema.1)
+                    && ops.iter().all(|op| valid(op).is_ok())
             }
             _ => return Ok(true),
         };

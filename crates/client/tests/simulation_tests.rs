@@ -924,9 +924,9 @@ impl Lines {
 /// client cannot tell from one of the server's, in place of an event with `real`, the operations
 /// of the server: of the room, with operations in order that reach its head, of an incarnation
 /// not in `forged`, since the client takes those of the room for its own, and with operations
-/// from one of its sequences on, those after the head of a replica, that validate with a schema
-/// of `schemas` and bring some other than those of `real`: the client drops what its replica
-/// holds and validates the rest. Its name, and the other lines of its event, are not looked at:
+/// that all validate with a schema of `schemas`, some of them other than those of `real`: the
+/// client validates every operation of the event, and applies those after the head of its
+/// replica. Its name, and the other lines of its event, are not looked at:
 /// an event with more than one `data` line is not base64.
 fn event_lies(
     line: &[u8],
@@ -962,12 +962,8 @@ fn event_lies(
             |schema: &Schema| (ops.iter()).all(|op| schema.validate_operation(&op.op).is_ok());
         schemas.iter().any(valid)
     };
-    // What the client applies after the head of its replica, from any of its sequences.
-    let forges = |from: usize| {
-        let applied = &ops[from..];
-        applied.iter().any(|op| !real.contains(op)) && validates(applied)
-    };
-    of == *room_id && whole && !forged.contains(&room_incarnation) && (0..ops.len()).any(forges)
+    let forges = ops.iter().any(|op| !real.contains(op)) && validates(&ops);
+    of == *room_id && whole && !forged.contains(&room_incarnation) && forges
 }
 
 /// Whether `bytes` hold `needle`.

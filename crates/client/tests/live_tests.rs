@@ -1553,6 +1553,16 @@ fn retyped_insert(id: i64) -> Operation {
     retyped().to_operation_insert("tasks", &row, 1000).unwrap()
 }
 
+/// An insert of row `id` into a table `tags`, which [`tasks_schema`] does not have.
+fn insert_tag(id: i64) -> Operation {
+    let tags = TableSchema::builder("tags")
+        .table_id(7)
+        .primary_key("id", DataType::Int);
+    let schema = Schema::builder().table(tags).build();
+    let row = RowBuilder::new().set("id", id).build();
+    schema.to_operation_insert("tags", &row, 1000).unwrap()
+}
+
 #[tokio::test(start_paused = true)]
 async fn an_event_with_an_operation_that_does_not_validate_registers_and_syncs_and_never_fails_closed(
 ) {
@@ -1567,23 +1577,70 @@ async fn an_event_with_an_operation_that_does_not_validate_registers_and_syncs_a
     server.commit(&room_id, [1]).await;
     reaches(&client, &room_id, 1).await;
     after_a_heartbeat(&transport).await;
-    let (registrations, before) = (transport.registrations().len(), syncs(&transport));
     let incarnation = server.incarnation(&room_id).await;
-    let event = ops_of(&room_id, incarnation, after(1, [retyped_insert(2)]), 2, 1);
-    transport.inject(&ops_text(&event));
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    // The batch of the sync after the registration has a head below that of the event, which was
-    // a head seen: the sync registers once more and asks again, and it is the sync that decides.
-    let registered_again = transport.registrations();
-    let cursor = (Some(1), Some(incarnation));
-    assert_eq!(registered_again[registrations..], [cursor, cursor]);
-    assert_eq!(syncs(&transport), before + 2);
-    assert_eq!(tasks(&storage, &room_id).await, [1]);
-    assert_eq!(registered(&client, &room_id).await, (true, false));
-    let status = worker(&client, &room_id).await;
-    assert!(status.running && status.last_error.is_none(), "{status:?}");
+    // An operation that does not validate against the schema of the replica, one of a table that
+    // the schema does not have, and one that does not validate after one that does.
+    let events = [
+        vec![retyped_insert(2)],
+        vec![insert_tag(2)],
+        vec![insert_task(2), retyped_insert(3)],
+    ];
+    for ops in events {
+        let (registrations, before) = (transport.registrations().len(), syncs(&transport));
+        let head = 1 + ops.len() as u64;
+        let event = ops_of(&room_id, incarnation, after(1, ops), head, 1);
+        transport.inject(&ops_text(&event));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // The event leaves no head seen: the replica registers once and syncs, and it is the sync
+        // that decides.
+        let cursor = (Some(1), Some(incarnation));
+        assert_eq!(
+            transport.registrations()[registrations..],
+            [cursor],
+            "{event:?}"
+        );
+        assert_eq!(syncs(&transport), before + 1, "{event:?}");
+        assert_eq!(tasks(&storage, &room_id).await, [1]);
+        assert_eq!(registered(&client, &room_id).await, (true, false));
+        let status = worker(&client, &room_id).await;
+        assert!(status.running && status.last_error.is_none(), "{status:?}");
+    }
     server.commit(&room_id, [2]).await;
     reaches(&client, &room_id, 2).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_event_whose_operation_does_not_validate_leaves_no_head_seen_for_the_writes_after_it() {
+    let Live {
+        server,
+        room_id,
+        transport,
+        storage,
+        client,
+        ..
+    } = started(TestServer::new(), live()).await;
+    server.commit(&room_id, [1]).await;
+    reaches(&client, &room_id, 1).await;
+    after_a_heartbeat(&transport).await;
+    let incarnation = server.incarnation(&room_id).await;
+    // Its operation at 2 does not validate, so the event is not the server's, and it reaches a
+    // head of 10, past that of the server.
+    let ops = [retyped_insert(2)]
+        .into_iter()
+        .chain((3..=10).map(insert_task));
+    let event = ops_of(&room_id, incarnation, after(1, ops), 10, 1);
+    // The sync that the event asks for waits for its reply: no head of the server comes before
+    // the write.
+    let mut held = transport.hold_next_reply(Sync);
+    transport.inject(&ops_text(&event));
+    held.replied().await;
+    assert_eq!(registered(&client, &room_id).await, (true, false));
+    let written = client.write(room_id.clone(), insert_task(4)).await;
+    assert_eq!(commits(&transport).len(), 1);
+    assert_eq!(tasks(&storage, &room_id).await, [1, 4]);
+    held.release();
+    // The write of sequence 2, with its acknowledgement, which the replica applied.
+    assert_eq!(written, Ok(()));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1684,7 +1741,6 @@ async fn stopping_the_worker_while_it_applies_an_event_leaves_the_batch_whole() 
 async fn an_event_that_asks_for_a_sync_once_the_mode_turned_manual_leads_to_none() {
     let (server, room_id, transport, storage, client) = engine_started().await;
     let (registrations, before) = (transport.registrations().len(), syncs(&transport));
-    let incarnation = server.incarnation(&room_id).await;
     // A sync holds the applier, and the change of the mode, which takes it too, waits behind it.
     let lost = transport.take_next_event("ops");
     server.commit(&room_id, [1]).await;
@@ -1697,19 +1753,43 @@ async fn an_event_that_asks_for_a_sync_once_the_mode_turned_manual_leads_to_none
         tokio::spawn(async move { client.set_freshness(room_id, Freshness::Manual).await })
     };
     tokio::time::sleep(Duration::from_millis(10)).await;
-    // The application of an event with an operation that does not validate waits behind both.
-    let event = ops_of(&room_id, incarnation, after(1, [retyped_insert(2)]), 2, 1);
-    transport.inject(&ops_text(&event));
+    // The event of 3, without that of 2: its application waits behind both, and finds a gap.
+    let second = transport.take_next_event("ops");
+    server.commit(&room_id, [2]).await;
+    let _ = second.text().await;
+    let third = transport.take_next_event("ops");
+    server.commit(&room_id, [3]).await;
+    transport.inject(&third.text().await);
     tokio::time::sleep(Duration::from_millis(10)).await;
     held.release();
     setting.await.unwrap().unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
-    // The replica registers again at its next request.
+    // The sync that the gap asks for does not go in `Manual`.
     assert_eq!(head(&client, &room_id).await, 1);
-    assert_eq!(registered(&client, &room_id).await, (false, false));
+    assert_eq!(registered(&client, &room_id).await, (true, false));
     assert_eq!(syncs(&transport), before + 1);
     assert_eq!(transport.registrations().len(), registrations);
     assert_eq!(worker(&client, &room_id).await.freshness, Freshness::Manual);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_event_whose_batch_the_engine_refuses_registers_and_syncs_and_never_fails_closed() {
+    let (server, room_id, transport, storage, client) = engine_started().await;
+    let (registrations, before) = (transport.registrations().len(), syncs(&transport));
+    let lost = transport.take_next_event("ops");
+    server.commit(&room_id, [1]).await;
+    let text = lost.text().await;
+    // The event validates, and the engine refuses its batch, as it would one that does not.
+    let invalid = StorageError::SchemaValidation(ValidationError::TableNotFound("tasks".into()));
+    storage.fail_next("apply_batch", invalid);
+    transport.inject(&text);
+    reaches(&client, &room_id, 1).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(registered(&client, &room_id).await, (true, false));
+    assert_eq!(transport.registrations().len(), registrations + 1);
+    assert_eq!(syncs(&transport), before + 1);
+    let status = worker(&client, &room_id).await;
+    assert!(status.running && status.last_error.is_none(), "{status:?}");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1831,7 +1911,11 @@ async fn a_client_dropped_while_an_application_holds_it_ends_the_worker_once_it_
     transport.inject("event: lagged\ndata: true\n\n");
     sync.replied().await;
     let mut held = storage.hold_next("apply_batch");
-    let event = ops_of(&room_id, incarnation, after(0, [retyped_insert(1)]), 1, 1);
+    // The engine refuses the batch of the event once it goes on, so the application asks for a
+    // sync.
+    let invalid = StorageError::SchemaValidation(ValidationError::TableNotFound("tasks".into()));
+    storage.fail_next("apply_batch", invalid);
+    let event = ops_of(&room_id, incarnation, after(0, [insert_task(1)]), 1, 1);
     transport.inject(&ops_text(&event));
     held.replied().await;
     drop(client);
