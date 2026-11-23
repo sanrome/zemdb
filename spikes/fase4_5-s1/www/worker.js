@@ -642,7 +642,7 @@ function panicClose() {
 // DC41 follow-up: does an in-flight operation of the holder land after the waiter has the
 // handle of client.lock, not only after the lock?
 // ---------------------------------------------------------------------------------------
-async function dc41hold({ lock, dir, inflight }) {
+async function dc41hold({ lock, dir, inflight, extra = 0 }) {
   const d = await L.dirPath(dir);
   return new Promise((resolve, reject) => {
     navigator.locks.request(lock, async () => {
@@ -653,6 +653,8 @@ async function dc41hold({ lock, dir, inflight }) {
         }
         const fh = await d.getFileHandle('client.lock', { create: true });
         keep.clientLock = await fh.createSyncAccessHandle();
+        keep.extra = [];
+        for (let k = 0; k < extra; k++) keep.extra.push(await (await d.getFileHandle(`h_${k}`, { create: true })).createSyncAccessHandle());
         resolve({ t: Date.now() });
       } catch (e) { reject(e); }
       await new Promise(() => {});
@@ -664,7 +666,7 @@ function dc41fire({ dir, inflight, mode }) {
     const fhs = [];
     for (let k = 0; k < inflight; k++) fhs.push(await d.getFileHandle(`m_${k}`));
     for (let k = 0; k < inflight; k++) { fhs[k].move(d, `mv_${k}`).catch(() => {}); d.removeEntry(`r_${k}`).catch(() => {}); }
-    if (mode === 'closeThenTerminate') keep.clientLock.close();
+    if (mode === 'closeThenTerminate') { keep.clientLock.close(); for (const h of keep.extra ?? []) h.close(); }
     const t = Date.now();
     if (mode === 'selfClose') { self.close(); return 'closed'; }
     self.postMessage({ endNow: mode === 'closeThenTerminate' ? 'terminate' : mode, t });
@@ -681,8 +683,13 @@ function dc41wait({ lock, dir, listMs }) {
       const count = n => ({ moved: n.filter(x => x.startsWith('F:mv_')).length, removed: 20 - n.filter(x => x.startsWith('F:r_')).length });
       const snaps = [];
       let h = null, tH = null, tries = 0;
-      const list = async () => { const t = performance.now() - tG; const names = await L.listNames(d); snaps.push({ t: +t.toFixed(1), names: names.join('|'), c: count(names) }); };
+      const list = async () => {
+        const t = performance.now() - tG; const names = await L.listNames(d);
+        snaps.push({ t: +t.toFixed(2), tEnd: +(performance.now() - tG).toFixed(2), names: names.join('|'), c: count(names) });
+      };
       await list();
+      // While the handle is not yet open, a second loop lists back to back.
+      const poller = (async () => { while (!h && performance.now() - tG < 5000) await list(); })();
       for (;;) {
         if (!h) { tries++; try { h = await fh.createSyncAccessHandle(); tH = +(performance.now() - tG).toFixed(1); } catch (e) { /* still taken */ } }
         await list();
@@ -691,11 +698,16 @@ function dc41wait({ lock, dir, listMs }) {
         if (!h && now > 5000) break;
         await L.sleep(3);
       }
+      await poller;
       if (h) h.close();
+      snaps.sort((x, y) => x.t - y.t);
       const changes = [];
+      // A listing reads the directory somewhere in [t, tEnd]. A change first seen by a listing
+      // that ended before the handle opened was there before it; one missed by a listing that
+      // started after the handle opened landed after it; otherwise it is "around".
       for (let k = 1; k < snaps.length; k++) {
-        if (snaps[k].names !== snaps[k - 1].names) changes.push({ betweenMs: [snaps[k - 1].t, snaps[k].t], ...snaps[k].c,
-          when: tH === null ? 'no handle' : (snaps[k - 1].t >= tH ? 'after handle' : (snaps[k].t <= tH ? 'before handle' : 'around handle')) });
+        if (snaps[k].names !== snaps[k - 1].names) changes.push({ betweenMs: [snaps[k - 1].t, snaps[k].tEnd], ...snaps[k].c,
+          when: tH === null ? 'no handle' : (snaps[k].tEnd <= tH ? 'before handle' : (snaps[k - 1].t >= tH ? 'after handle' : 'around handle')) });
       }
       const last = changes[changes.length - 1];
       bus.emit('dc41result', { lock, handleAfterGrantMs: tH, tries, listings: snaps.length, atGrant: snaps[0].c,

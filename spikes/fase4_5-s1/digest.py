@@ -220,9 +220,10 @@ def main():
             P(key, row.get('iter'), 'killAt', row.get('killAtMsAfterSetup'), 'recheckSame', row.get('recheckSameState'), json.dumps(keep)[:700],
               row.get('error', ''))
         P(key, 'iterations', len(r.get('rows', [])), 'notOk', bad)
-    if 'dc41' in s:
-        r = s['dc41']
-        P('dc41 run', r.get('run'))
+    for dkey in ('dc41', 'dc41x'):
+      if dkey in s:
+        r = s[dkey]
+        P(dkey, 'run', r.get('run'), 'extraHandles', r.get('extraHandles'))
         by = {}
         for row in r.get('rows') or []:
             m = by.setdefault(row['mode'], {'iters': 0, 'itersWithChangesAfterLock': 0, 'itersWithChangesAfterHandle': 0,
@@ -249,10 +250,10 @@ def main():
         for mode, m in by.items():
             hs = sorted(m.pop('hs'))
             m['handleAfterGrantMs'] = {'min': hs[0], 'p50': hs[len(hs) // 2], 'max': hs[-1]} if hs else None
-            P(f'dc41 {mode}: {json.dumps(m)}')
+            P(f'{dkey} {mode}: {json.dumps(m)}')
         for row in r.get('rows') or []:
             if row.get('changes') or row.get('error'):
-                P(f"dc41 row {row['mode']} {row['i']}: handle {row.get('handleAfterGrantMs')} ms tries {row.get('tries')} atGrant {row.get('atGrant')} "
+                P(f"{dkey} row {row['mode']} {row['i']}: handle {row.get('handleAfterGrantMs')} ms tries {row.get('tries')} atGrant {row.get('atGrant')} "
                   f"final {row.get('final')} changes {json.dumps(row.get('changes'))[:400]} {row.get('error') or ''}")
     if 'bgfreeze' in s:
         r = s['bgfreeze']

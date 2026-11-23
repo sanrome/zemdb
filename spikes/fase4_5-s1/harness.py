@@ -657,12 +657,12 @@ class Driver:
             print(key.upper(), json.dumps({'iter': it, 'killAt': r.get('killAtMsAfterSetup'), 'fu': r.get('fu')})[:600], flush=True)
         self.save(key, {'kinds': kinds, 'calibration': cal, 'seriesMs': series_ms, 'rows': rows})
 
-    def t_dc41(self, iters=20):
-        r = self.run('dc41', {'modes': ['terminate', 'selfClose', 'closeThenTerminate', 'closeTab'], 'iters': iters}, 2400)
+    def t_dc41(self, iters=20, extra=0, key='dc41'):
+        r = self.run('dc41', {'modes': ['terminate', 'selfClose', 'closeThenTerminate', 'closeTab'], 'iters': iters, 'extra': extra}, 2400)
         rows = (r['results'][0] or {}).get('rows') if r['results'] else None
         if not rows:
             rows = [e['row'] for e in HUB.of_token(r['token'], 'dc41row')]
-        self.save('dc41', {'run': {k: r[k] for k in ('token', 'ended', 'secs', 'errors', 'how')}, 'rows': rows})
+        self.save(key, {'run': {k: r[k] for k in ('token', 'ended', 'secs', 'errors', 'how')}, 'extraHandles': extra, 'rows': rows})
 
     def t_s5q1m(self, iters=20):
         """Moves only (temp, flush, move over the target): a series of 600 moves, killed at random."""
@@ -1093,6 +1093,8 @@ def main():
                 drv.t_fu(t[3:], a.iters)
             elif t == 'dc41':
                 drv.t_dc41(a.iters)
+            elif t == 'dc41x':
+                drv.t_dc41(a.iters, extra=49, key='dc41x')
             else:
                 getattr(drv, f't_{t}')()
         except Exception as e:  # noqa: BLE001

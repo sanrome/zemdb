@@ -396,7 +396,7 @@ export async function dc41(T, a) {
       const lock = `dc41-${T.token}-${mode}-${i}`;
       const dir = `dc41-${T.token}/${mode}-${i}`;
       const A = await T.openCtx('A');
-      await T.bus.call(A.w, 'dc41hold', { lock, dir, inflight: 20 });
+      await T.bus.call(A.w, 'dc41hold', { lock, dir, inflight: 20, extra: a.extra ?? 0 });
       const B = await waiter();
       const q = await T.bus.call(B.w, 'dc41wait', { lock, dir, listMs: 1000 });
       const result = T.bus.waitEvent(m => m.event === 'dc41result' && m.lock === lock, 15000, 'dc41result');
