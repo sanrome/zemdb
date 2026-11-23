@@ -1,0 +1,4 @@
+# The unit tests in wasm32 (`cargo test --target wasm32-unknown-unknown`) run in a browser,
+# with the `wasm-bindgen-test-runner` of the version of `wasm-bindgen` in Cargo.lock.
+[target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"

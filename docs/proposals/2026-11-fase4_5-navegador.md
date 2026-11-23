@@ -2,7 +2,7 @@
 
 **Fecha:** 19 de Noviembre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 (el contrato) cerrado el 23 de Noviembre de 2026, con la revisión cruzada en verde en su sexta ronda y DC46 en su principio, con su protocolo para el paso D (§1.3). El dueño del proyecto adoptó DC40 y DC43 el 22 de Noviembre de 2026, y eligió ese día la pestaña líder para DC41, de donde sale DC46; adoptó las demás el 23 (DC46, en su principio: su protocolo, en el paso D). La CI de `main`, en verde sobre `91850bf`.
+**Estado:** En curso: Lote 1 (el arnés del navegador) hecho el 23 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda; el paso S1, en curso. Lote 0 (el contrato) cerrado el 23 de Noviembre de 2026, con la revisión cruzada en verde en su sexta ronda y DC46 en su principio, con su protocolo para el paso D (§1.3). El dueño del proyecto adoptó DC40 y DC43 el 22 de Noviembre de 2026, y eligió ese día la pestaña líder para DC41, de donde sale DC46; adoptó las demás el 23 (DC46, en su principio: su protocolo, en el paso D). La CI de `main`, en verde sobre `91850bf`.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.5. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Parte de:** el núcleo de 4.2 ([plan](2026-10-fase4_2-nucleo-replica.md)), el worker y el transporte de 4.3 ([plan](2026-11-fase4_3-transporte-worker.md)), la fachada de 4.4 ([plan](2026-11-fase4_4-api-rust.md)) y la capa de archivos de 4.1 (DC17, [plan](2026-10-fase4_1-storage-servidor.md)). Depende de 4.3, que cerró el 19 de Noviembre de 2026 con sus Lotes 11b y 11c (`496da6c`), mientras se escribía este plan: ningún lote de 4.5 la espera.
@@ -258,7 +258,7 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 |---|---|---|---|---|---|
 | 0 | Contrato | Documentos | DC38 a DC46 | Ajustes: §2, §4, S1 a S8, L7, W1 y W2 sobre el OPFS, y K1 a K13 y K15 a K17 en el navegador |✅ |
 | S1 | Spikes: S1 en Firefox, S3 en Safari y Firefox, S5 | Fuera del repo | DC8, DC17, DC39 a DC41, DC45, DC46 | — | ⬜ |
-| 1 | El arnés del navegador | `tools/browser` (pruebas) y CI | DC44 | — | ⬜ |
+| 1 | El arnés del navegador | `tools/browser` (pruebas) y CI | DC44 | — | ✅ |
 | 2 | La capa del OPFS: el directorio | storage | DC39, DC38, DC45 | S1 a S8 y L7 sobre el OPFS | ⬜ |
 | 3 | La capa del OPFS: los archivos | storage | DC39, DC44 | S1 a S8 y L7 sobre el OPFS | ⬜ |
 | 4 | El motor en disco en wasm32 | storage | DC39, DC38 | S1 a S8, L7, W1 y W2 sobre el OPFS | ⬜ |
@@ -359,7 +359,7 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 
    Como cada ronda sobre DC46 encontraba casos nuevos de un protocolo entre pestañas, el dueño del proyecto eligió el 23 de Noviembre de 2026 cerrar el Lote 0 con DC46 en su principio (lo que garantiza y su mecanismo básico) y diseñar el protocolo en el paso D, solo de documentos, con su propia revisión cruzada, después del paso S1 (S5 contesta lo que más lo condiciona), con los hallazgos de las rondas séptima a novena como sus requisitos (§1.3). Con eso, DC46, `INVARIANTES.md` y los Lotes 13 y 14 se redujeron al principio; el reintento de `client.lock`, `Offline` sin líder, el *ping* y el resto del detalle salieron del contrato y quedaron como requisitos.
 
-### Lote 1 · El arnés del navegador (`tools/browser`, pruebas, y la CI) · ⬜
+### Lote 1 · El arnés del navegador (`tools/browser`, pruebas, y la CI) · ✅ Hecho (23 de Noviembre de 2026)
 **Objetivo:** poder probar en un navegador headless, en la CI, lo que hagan los lotes siguientes, con recargas, dos pestañas y el Worker terminado, y correr tests unitarios en wasm32 (DC44).
 
 **Archivos:** `tools/browser/` (su `Cargo.toml`, con su `[workspace]`, el crate de pruebas en wasm32, el servidor de pruebas, la página y su script, el runner de Playwright, `package.json` y su lock, y un `README.md`); el `exclude` del `Cargo.toml` de la raíz; `.github/workflows/ci.yml` (el job `browser`).
@@ -377,6 +377,132 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 **Documentos:** `tools/browser/README.md`; el plan.
 
 **Entrega:** `test(client): the harness of the tests in a browser (Fase 4.5, Lote 1)`.
+
+**Hecho** (23 de Noviembre de 2026).
+- **Qué entró.**
+  - **El workspace del arnés** (`tools/browser/`), fuera del de la raíz (su `exclude`).
+    - Su `Cargo.lock` tiene `wasm-bindgen` 0.2.129, como el de la raíz. `build.sh` compara la versión de los dos locks con la del CLI.
+    - Su `package.json` fija Playwright 1.63.0, con su lock.
+  - **El crate de pasos** (`steps/`), en wasm32 con `wasm-bindgen`.
+    - Cada función exportada es un paso: recibe el id de la corrida y falla con un error que dice qué falló.
+    - Un pánico hace fallar su paso, con el mensaje del pánico.
+    - Sus tests unitarios (`src/tests/`) corren en un Worker dedicado, con `wasm-bindgen-test-runner`.
+  - **El servidor de pruebas** (`server/`). Sirve un solo origen en `127.0.0.1`, con HTTP/1.1. Tiene:
+    - el router de `zemdb-server` sobre un directorio temporal, armado como en la simulación;
+    - los archivos de la página;
+    - las rutas del arnés: el Control Plane con el secreto de admin, los tokens y el corte de la red. Con la red cortada, un pedido al router cierra su conexión sin respuesta, y una respuesta en curso (un stream de eventos) se corta.
+
+    Se detiene cuando se cierra su entrada (es decir, cuando termina el runner que lo arrancó) o con Ctrl+C: cierra las conexiones, apaga las salas y borra su directorio. Sale con error si una conexión entró en pánico.
+  - **La página** (`www/`). Corre en orden las acciones de las suites de su URL, que pueden ser:
+    - un paso en su Worker;
+    - recargar la página;
+    - un paso en una segunda página del mismo contexto;
+    - terminar su Worker;
+    - cerrar la segunda página.
+
+    Guarda su avance en `sessionStorage` y deja el resultado en la página. Cada carga de una página nombra a sus Workers con un id al azar: con él, un paso sabe si corre en una página que se recargó o en la segunda.
+  - **El runner** (`run.mjs`).
+    - Levanta el servidor en un puerto libre, corre las suites por defecto en Chromium sin ventana, y después la suite `isolation` en otro contexto, con el mismo id.
+    - Falla si:
+      - un paso falla (con su nombre);
+      - un paso corrió en la segunda página sin que el contexto abriera una;
+      - la página tomó otro id que el de su URL;
+      - el servidor no se detiene a tiempo y con éxito.
+    - `--self-check` prueba el propio runner.
+  - **El job `browser` de la CI**, en `ubuntu-latest`. Corre:
+    - el fmt y el clippy del arnés y los tests del servidor de pruebas;
+    - el build, y Chromium con Playwright;
+    - el runner y su self-check;
+    - los tests unitarios en wasm32, con el chromedriver del runner.
+- **Tests.**
+  - **Las suites:**
+    - `reload`: lo escrito en el OPFS antes de recargar se lee después, en otra carga de la página;
+    - `isolation`: otro contexto no lo ve;
+    - `tabs`: la segunda página ve el mismo OPFS y no puede abrir el archivo que tiene la primera; terminado el Worker de la primera, lo abre;
+    - `server`:
+      - un esquema y una sala, creados por el Control Plane;
+      - el registro de un cliente con un token del arnés;
+      - el corte de la red: un stream abierto se corta y un pedido falla como sin red; con la red de vuelta, el router contesta.
+  - **El self-check:** las suites `fails`, `fails_in_peer` y `panics`, cuyos pasos fallan a propósito (en la primera página y en la segunda) o entran en pánico, hacen fallar la corrida con el nombre del paso y su error.
+  - **Un test unitario en wasm32,** en un Worker dedicado con el OPFS. Que uno que falla haga fallar `cargo test`, con código 1, se comprobó una vez, y ese test se sacó.
+  - **Dos tests nativos de `page_file`:** ninguna ruta sale de `www/`.
+- **Mutaciones inversas: las 18 quedan muertas, salvo una equivalente.**
+  - **La primera tanda, 10.** Mueren estas:
+    - el corte que termina limpio una respuesta;
+    - las respuestas sin corte;
+    - el servidor que no se detiene;
+    - `terminate`, que no termina el Worker;
+    - los pasos de la segunda página, en el Worker de la primera;
+    - la página que no se recarga;
+    - la aislación en el mismo contexto;
+    - el runner que da por buena una página que falla;
+    - el Worker que da todo por bueno.
+
+    La equivalente es el chequeo de la red al empezar un pedido al router: el `select!` que espera el corte también lo ve.
+  - **Las que sobrevivieron a la revisión de delta, 5, y ahora mueren:**
+    - la recarga cambiada por terminar el Worker;
+    - un Worker de la misma página como segunda página;
+    - la segunda página que da todo por bueno;
+    - la página que no toma el id de su URL, en un contexto compartido;
+    - el servidor que sirve cualquier ruta.
+  - **Las de las correcciones, 3:**
+    - un pánico en una ruta del arnés;
+    - el Worker sin el listener de sus errores;
+    - de la segunda ronda, otro Worker de la misma página como segunda página, con un nombre nuevo, que ahora el runner rechaza.
+- **Interacciones revisadas.**
+  - **El servidor se arma como la simulación,** con `build_router` sobre un directorio temporal. Lo sirve un loop propio, sin lo que suma `serve_until_shutdown`:
+    - los límites de las conexiones;
+    - los plazos de los headers y de una respuesta trabada;
+    - h2c;
+    - la reserva de una respuesta hasta el fin de su cuerpo;
+    - el barrido de los snapshots vencidos.
+
+    El README lo lista.
+  - **No deja tareas sueltas.**
+    - Las conexiones van en un `JoinSet`, que se drena con un plazo de 5 s y después se aborta.
+    - Después vienen `shutdown_all` y el drop del runtime, que espera las tareas bloqueantes.
+    - El runner verifica que el servidor salga en menos de 15 s y con código 0. La revisión midió 56 ms, con un stream abierto.
+  - **La CI de siempre no cambia:** el job es nuevo, el lock de la raíz no cambia y `cargo metadata` de la raíz lista los mismos cuatro crates.
+  - **El tiempo del job:** se ve en la CI.
+- **Revisión de delta** (agente aparte, de contexto fresco y solo lectura, que probó en su propia copia con sus propias mutaciones).
+  - **Primera ronda: ningún Alto, 4 Medios y 10 Bajos.**
+    - **Los Medios, corregidos:**
+      - una recarga cambiada por terminar el Worker pasaba: ahora `reload_read` compara la carga de la página;
+      - una segunda página que fuera otro Worker de la misma página pasaba: ahora `tabs_taken` compara la página que tiene el archivo;
+      - el self-check no cubría un paso que falla en la segunda página: ahora corre `fails_in_peer`;
+      - un pánico perdía su mensaje: un paso `async` que entra en pánico no rechaza su promesa, y su trap es un error del Worker. Ahora el Worker hace fallar los pasos en vuelo con el mensaje del pánico, y el self-check lo prueba con `panics`.
+    - **Los Bajos, corregidos:**
+      - el plazo del `stop` del runner, que demoraba 15 s cada corrida;
+      - una frase falsa del README sobre `--no-sandbox`;
+      - los tests unitarios, a `src/tests/` como pide `GEMINI.md`;
+      - las rutas de la página, en una función con sus tests;
+      - el runner, que no comparaba el id de la corrida;
+      - un pánico del servidor, que no hacía fallar la corrida;
+      - el fmt del job, que revisaba también la raíz;
+      - el cache de los navegadores de Playwright;
+      - lo que el servidor no hace de `serve_until_shutdown`, y el aviso de `nohup`, en el README.
+    - **El Bajo que queda:** que el runner falle si el servidor no se detiene no tiene una prueba permanente. Lo prueba la mutación del servidor que no se detiene.
+  - **Segunda ronda, acotada a las correcciones: verde.** Ningún Alto ni Medio, y nada que las correcciones rompieran.
+    - **Sus tres Bajos.** Uno se corrigió: otro Worker de la misma página, con un nombre nuevo, pasaba por segunda página. Ahora el runner exige que el contexto haya abierto una segunda página cuando un paso corrió en ella.
+    - **Dos quedan sin prueba permanente,** como el de la primera ronda, aunque funcionan probados a mano:
+      - la salida con error del servidor ante el pánico de una conexión;
+      - el `unhandledrejection` del Worker.
+    - **Uno no tiene consecuencia:** sin el `preventDefault`, el error llega también a la página, que encuentra el paso ya resuelto.
+- **Desvíos.**
+  - **El paso que falla a propósito queda,** con los de `fails_in_peer` y `panics`, como el self-check del runner. Así se comprueba en cada corrida de la CI. El plan decía sacarlo.
+  - **Las respuestas armadas para el tope y los plazos del transporte** (DC44 (2)) van con el Lote 9, que prueba el transporte con ellas.
+  - **La suite `server`,** además de los tests exigidos: prueba las rutas del servidor de pruebas de DC44.
+  - **El origen es `127.0.0.1`, no `localhost`:** también es un contexto seguro, sin la resolución a `::1`.
+  - **Los tests unitarios en wasm32, acá:** el chromedriver del entorno (147) no es el de su Chrome (153), y no se pudo bajar otro. Corrieron con ese chromedriver, con `--disable-build-check` (`CHROMEDRIVER_REMOTE`). En la CI, con el del runner.
+  - **El runner acepta `--browser firefox|webkit`,** pero solo corre Chromium. Firefox entra en la CI después de S1, como dice DC44.
+- **Chequeos.**
+  - **Del arnés:**
+    - fmt y clippy (los pasos en wasm32 y el servidor, con `-D warnings`) y los tests del servidor;
+    - el build;
+    - el runner (8 pasos) y su self-check, en Chromium 157 (Playwright 1.63);
+    - los tests unitarios en wasm32, en Chrome 153.
+  - **De la raíz,** aunque el lote no toca sus crates: fmt, clippy, doc con `-D warnings`, wasm32 con clippy, y la suite del workspace (1647 tests, sin fallas). Los `--ignored` en release no corresponden, porque no cambia ningún crate.
+  - **La CI:** en el commit del lote.
 
 ### Lote 2 · La capa del OPFS: el directorio (`zemdb-storage`) · ⬜
 **Objetivo:** la parte de `OpfsFiles` que trabaja sobre el directorio, con la tarea que retiene una promesa soltada (DC39, DC38), y el método de la capa de DC45.

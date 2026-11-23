@@ -7,8 +7,9 @@ members = [
     "crates/client",
     "crates/storage",
 ]
-# The measurement harness, a workspace of its own (tools/perf/README.md).
-exclude = ["tools/perf"]
+# The measurement harness (tools/perf/README.md) and the harness of the tests in a browser
+# (tools/browser/README.md), workspaces of their own.
+exclude = ["tools/perf", "tools/browser"]
 
 [workspace.package]
 version = "0.1.0"

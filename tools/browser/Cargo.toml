@@ -1,0 +1,21 @@
+# The harness of the tests in a browser (README.md). A workspace of its own, outside the root
+# workspace: neither `cargo test --workspace` nor the CI jobs of the workspace build it; the
+# `browser` job of the CI does.
+[workspace]
+resolver = "3"
+members = ["steps", "server"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+clone_on_ref_ptr = "warn"
+inefficient_to_string = "warn"
+large_types_passed_by_value = "warn"
