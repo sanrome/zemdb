@@ -577,10 +577,10 @@ class Driver:
         r2 = self.run('s1q2check', {'dir': dirn}, 60)
         self.save('s1q2', {'beforeKill': r1, 'afterKill': r2})
 
-    def series_once(self, dirn, cycles, kinds, kill_after_last=False, kill_at=None, recheck=False):
+    def series_once(self, dirn, cycles, kinds, kill_after_last=False, kill_at=None, recheck=False, followup=False):
         """One series; killed by the page (kill_after_last), at `kill_at` s after its setup, or
         never; then the profile reopened and the directory checked."""
-        args = {'dir': dirn, 'cycles': cycles, 'kinds': kinds, 'killAfterLast': kill_after_last}
+        args = {'dir': dirn, 'cycles': cycles, 'kinds': kinds, 'killAfterLast': kill_after_last, 'siblings': followup}
         token = HUB.new_token('series', args)
         self.b.launch(self.url(token))
         setup = HUB.wait(lambda e: e.get('token') == token and e.get('event') in ('series-setup-done', 'error'), 120)
@@ -611,12 +611,16 @@ class Driver:
         if state is None:
             return {**info, 'error': 'no check', 'check': chk}
         out = {**info, **analyze_series(cycles, kinds, reported, state)}
+        if followup:
+            out['fu'] = analyze_followup(cycles, kinds, reported, state)
         if recheck:
             chk2 = self.run('checkSeries', {'dir': dirn}, 120)
             state2 = chk2['results'][0] if chk2['results'] else None
             out['recheckSameState'] = state2 == state
             if state2 != state:
                 out['recheck'] = analyze_series(cycles, kinds, reported, state2) if state2 else chk2
+                if followup and state2:
+                    out['recheck']['fu'] = analyze_followup(cycles, kinds, reported, state2)
         return out
 
     def t_s5q1a(self, reps=3):
@@ -630,6 +634,35 @@ class Driver:
                 rows.append(r)
                 print('S5Q1a', json.dumps({k: r.get(k) for k in ('variant', 'reportedMax', 'visiblePrefix', 'nonPrefixCount', 'reportedButNotVisibleCount', 'targetValid', 'targetGen', 'anomalies')}), flush=True)
         self.save('s5q1a', rows)
+
+    FU_VARIANTS = {
+        'a': ['tmpCreate', 'tmpWritten', 'moveFree'],
+        'b': ['tmpCreate', 'tmpWritten', 'removeTarget', 'move'],
+        'c': ['tmpCreate', 'tmpWritten', 'move'],
+    }
+
+    def t_fu(self, variant, iters=20, cycles=600):
+        """Follow-up of DC39: (a) move to a free name, (b) removeEntry then move, (c) move over
+        the target; with sibling files, random SIGKILL, raw state."""
+        kinds = self.FU_VARIANTS[variant]
+        key = f'fu_{variant}'
+        cal = self.series_once(f'{key}-cal-{uuid.uuid4().hex[:4]}', cycles, kinds, followup=True)
+        series_ms = (cal.get('finished') or {}).get('ms') or 5000
+        rows = []
+        for it in range(iters):
+            kill_at = random.uniform(0.02, 0.95) * series_ms / 1000
+            r = self.series_once(f'{key}-{it}-{uuid.uuid4().hex[:4]}', cycles, kinds, kill_at=kill_at, recheck=True, followup=True)
+            r['iter'] = it
+            rows.append({k: v for k, v in r.items() if k not in ('visible',)})
+            print(key.upper(), json.dumps({'iter': it, 'killAt': r.get('killAtMsAfterSetup'), 'fu': r.get('fu')})[:600], flush=True)
+        self.save(key, {'kinds': kinds, 'calibration': cal, 'seriesMs': series_ms, 'rows': rows})
+
+    def t_dc41(self, iters=20):
+        r = self.run('dc41', {'modes': ['terminate', 'selfClose', 'closeThenTerminate', 'closeTab'], 'iters': iters}, 2400)
+        rows = (r['results'][0] or {}).get('rows') if r['results'] else None
+        if not rows:
+            rows = [e['row'] for e in HUB.of_token(r['token'], 'dc41row')]
+        self.save('dc41', {'run': {k: r[k] for k in ('token', 'ended', 'secs', 'errors', 'how')}, 'rows': rows})
 
     def t_s5q1m(self, iters=20):
         """Moves only (temp, flush, move over the target): a series of 600 moves, killed at random."""
@@ -825,6 +858,62 @@ def analyze_series(cycles, kinds, reported, state):
             'perKind': per_kind, 'raw': raw, 'lastReported': last}
 
 
+def analyze_followup(cycles, kinds, reported, state):
+    """The follow-up questions on DC39, from the state after a kill."""
+    ops = [(k, i) for i in range(1, cycles + 1) for k in kinds]
+    res = {ops[q - 1] for q in reported}
+
+    def gen_of(e):
+        g = (e or {}).get('gen') or {}
+        return g.get('gen') if g.get('valid') else None
+
+    w_flush = max([i for (k, i) in res if k == 'tmpWritten'], default=0)
+    w_move = max([i for (k, i) in res if k in ('move', 'moveFree')], default=0)
+    temps = {int(n[2:]): e for n, e in state.items() if n.startswith('t_') and n[2:].isdigit()}
+    valid_temps = sorted(i for i, e in temps.items() if gen_of(e) == i)
+    bad_temps = sorted(i for i, e in temps.items() if gen_of(e) != i)
+    other = (state.get('other') or {}).get('children') or {}
+    sib = {'sib': gen_of(state.get('sib')) == 9001, 'other/sib2': gen_of(other.get('sib2')) == 9002,
+           'other/deeper': (other.get('deeper') or {}).get('kind') == 'dir'}
+    out = {'lastResolvedFlush': w_flush, 'lastResolvedMove': w_move, 'validTemps': valid_temps[-3:],
+           'tempsNotWhole': [(i, temps[i].get('size')) for i in bad_temps],
+           'siblingsIntact': all(sib.values()), 'siblings': sib,
+           'unexpectedNames': sorted(n for n in state if not (n in ('target', 'sib', 'other') or n[:2] in ('t_', 'g_')))}
+    # A temp that is not whole is allowed only for a generation whose flush had not resolved.
+    out['tempNotWholeAfterResolvedFlush'] = [i for i in bad_temps if ('tmpWritten', i) in res]
+    if 'moveFree' in kinds:
+        gs = {int(n[2:]): e for n, e in state.items() if n.startswith('g_') and n[2:].isdigit()}
+        problems = []
+        for i in range(1, cycles + 1):
+            g, t = gs.get(i), temps.get(i)
+            if g is not None and gen_of(g) != i:
+                problems.append({'i': i, 'what': 'moved file not whole', 'size': g.get('size')})
+            if ('moveFree', i) in res and gen_of(g) != i:
+                problems.append({'i': i, 'what': 'resolved move: moved file missing or not whole'})
+            if ('tmpWritten', i) in res and gen_of(g) != i and gen_of(t) != i:
+                problems.append({'i': i, 'what': 'resolved flush: neither the temp nor the moved file is whole'})
+            if g is not None and t is not None:
+                problems.append({'i': i, 'what': 'both the temp and the moved file exist'})
+        out.update({'movedFiles': len(gs), 'maxMoved': max(gs) if gs else 0, 'problems': problems[:10], 'problemCount': len(problems),
+                    'ok': not problems and not out['tempNotWholeAfterResolvedFlush'] and out['siblingsIntact']})
+    else:
+        tgt = state.get('target')
+        tg = gen_of(tgt)
+        newest_temp = valid_temps[-1] if valid_temps else None
+        best = max([x for x in (tg, newest_temp) if x is not None], default=None)
+        out.update({'target': None if tgt is None else {'size': tgt.get('size'), 'gen': tg},
+                    'targetMissing': tgt is None, 'targetNotWhole': tgt is not None and tg is None,
+                    'newestWholeTemp': newest_temp, 'bestWholeGeneration': best,
+                    'newestResolvedFlushAvailable': best is not None and best >= w_flush,
+                    'lastResolvedMoveCovered': best is not None and best >= w_move})
+        out['ok'] = (out['newestResolvedFlushAvailable'] and not out['targetNotWhole'] and out['siblingsIntact']
+                     and not out['tempNotWholeAfterResolvedFlush'])
+        if 'removeTarget' not in kinds:
+            # (c): a bad target, and is the newest temp whole, at least the last resolved move?
+            out['targetBad'] = tgt is None or tg is None
+    return out
+
+
 # What the directory of the rejections must hold if no rejected operation had an effect.
 REJ_EXPECTED = {'srcLocked': 'SRC-LOCKED', 'src2': 'SRC2', 'dstLocked': 'DST-LOCKED', 'src4': 'SRC4', 'src5': 'SRC5',
                 'src6': 'SRC6', 'afile': 'AFILE', 'removeLocked': 'RM-LOCKED', 'removeWritable': 'RM-WRITABLE',
@@ -1000,6 +1089,10 @@ def main():
                 drv.t_s5q1b(a.iters)
             elif t == 's5q1m':
                 drv.t_s5q1m(a.iters)
+            elif t.startswith('fu_'):
+                drv.t_fu(t[3:], a.iters)
+            elif t == 'dc41':
+                drv.t_dc41(a.iters)
             else:
                 getattr(drv, f't_{t}')()
         except Exception as e:  # noqa: BLE001

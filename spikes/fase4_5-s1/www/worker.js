@@ -406,13 +406,20 @@ function killNow({ reason }) { return L.logSync(`/kill?token=${TOKEN}`, { reason
 // ---------------------------------------------------------------------------------------
 // S5 question 1: a series of directory operations, killed from the server.
 // ---------------------------------------------------------------------------------------
-async function series({ dir: dirName, cycles, kinds, killAfterLast }) {
+async function series({ dir: dirName, cycles, kinds, killAfterLast, siblings }) {
   const d = await L.dirPath(dirName);
   // Setup: the target at generation 0, the files the series removes, the file it flushes.
   await L.writeFile(d, 'target', L.genContent(0));
   for (let i = 1; i <= cycles; i++) if (kinds.includes('remove')) await d.getFileHandle(`r_${i}`, { create: true });
   let fl = null;
   if (kinds.includes('flushNoClose')) fl = await (await d.getFileHandle('fl', { create: true })).createSyncAccessHandle();
+  if (siblings) {
+    // Files and directories the series never touches: are they ever damaged?
+    await L.writeFile(d, 'sib', L.genContent(9001));
+    const other = await d.getDirectoryHandle('other', { create: true });
+    await L.writeFile(other, 'sib2', L.genContent(9002));
+    await other.getDirectoryHandle('deeper', { create: true });
+  }
   L.logSync('/log', { event: 'series-setup-done', dir: dirName, cycles, kinds });
   const rep = new L.Reporter({ event: 'series-resolved', dir: dirName });
   let seq = 0;
@@ -424,6 +431,8 @@ async function series({ dir: dirName, cycles, kinds, killAfterLast }) {
         case 'tmpCreate': tmp = await d.getFileHandle(`t_${i}`, { create: true }); break;
         case 'tmpWritten': { const h = await tmp.createSyncAccessHandle(); h.write(L.genContent(i), { at: 0 }); h.flush(); h.close(); break; }
         case 'move': await tmp.move(d, 'target'); break;
+        case 'moveFree': await tmp.move(d, `g_${i}`); break;
+        case 'removeTarget': await d.removeEntry('target'); break;
         case 'createFile': await d.getFileHandle(`f_${i}`, { create: true }); break;
         case 'createDir': await d.getDirectoryHandle(`d_${i}`, { create: true }); break;
         case 'remove': await d.removeEntry(`r_${i}`); break;
@@ -448,7 +457,18 @@ async function checkSeries({ dir: dirName }) {
   const d = await L.dirPath(dirName, false);
   const entries = {};
   for await (const [name, h] of d.entries()) {
-    if (h.kind === 'directory') { entries[name] = { kind: 'dir' }; continue; }
+    if (h.kind === 'directory') {
+      entries[name] = { kind: 'dir' };
+      if (name === 'other') {
+        entries[name].children = {};
+        for await (const [n2, h2] of h.entries()) {
+          if (h2.kind === 'directory') { entries[name].children[n2] = { kind: 'dir' }; continue; }
+          const b2 = await L.readAll(h2);
+          entries[name].children[n2] = { kind: 'file', size: b2.length, gen: L.parseGen(b2) };
+        }
+      }
+      continue;
+    }
     const b = await L.readAll(h);
     entries[name] = { kind: 'file', size: b.length, ...(b.length ? { gen: L.parseGen(b) } : {}) };
   }
@@ -616,6 +636,81 @@ function panicClose() {
   bus.emit('ending', { mode: 'panicClose', t });
   setTimeout(() => { self.close(); throw new Error('simulated panic, after self.close()'); }, 0);
   return 'scheduled';
+}
+
+// ---------------------------------------------------------------------------------------
+// DC41 follow-up: does an in-flight operation of the holder land after the waiter has the
+// handle of client.lock, not only after the lock?
+// ---------------------------------------------------------------------------------------
+async function dc41hold({ lock, dir, inflight }) {
+  const d = await L.dirPath(dir);
+  return new Promise((resolve, reject) => {
+    navigator.locks.request(lock, async () => {
+      try {
+        for (let k = 0; k < inflight; k++) {
+          await L.writeFile(d, `m_${k}`, new TextEncoder().encode(`M${k}`));
+          await d.getFileHandle(`r_${k}`, { create: true });
+        }
+        const fh = await d.getFileHandle('client.lock', { create: true });
+        keep.clientLock = await fh.createSyncAccessHandle();
+        resolve({ t: Date.now() });
+      } catch (e) { reject(e); }
+      await new Promise(() => {});
+    });
+  });
+}
+function dc41fire({ dir, inflight, mode }) {
+  return L.dirPath(dir).then(async d => {
+    const fhs = [];
+    for (let k = 0; k < inflight; k++) fhs.push(await d.getFileHandle(`m_${k}`));
+    for (let k = 0; k < inflight; k++) { fhs[k].move(d, `mv_${k}`).catch(() => {}); d.removeEntry(`r_${k}`).catch(() => {}); }
+    if (mode === 'closeThenTerminate') keep.clientLock.close();
+    const t = Date.now();
+    if (mode === 'selfClose') { self.close(); return 'closed'; }
+    self.postMessage({ endNow: mode === 'closeThenTerminate' ? 'terminate' : mode, t });
+    return 'fired';
+  });
+}
+function dc41wait({ lock, dir, listMs }) {
+  return L.dirPath(dir).then(async d => {
+    const fh = await d.getFileHandle('client.lock', { create: true });
+    navigator.locks.request(lock, async () => {
+      // One sequential loop: an attempt at the handle (until it opens), then a listing. A change
+      // between two listings that both started after the handle opened landed after the handle.
+      const tG = performance.now();
+      const count = n => ({ moved: n.filter(x => x.startsWith('F:mv_')).length, removed: 20 - n.filter(x => x.startsWith('F:r_')).length });
+      const snaps = [];
+      let h = null, tH = null, tries = 0;
+      const list = async () => { const t = performance.now() - tG; const names = await L.listNames(d); snaps.push({ t: +t.toFixed(1), names: names.join('|'), c: count(names) }); };
+      await list();
+      for (;;) {
+        if (!h) { tries++; try { h = await fh.createSyncAccessHandle(); tH = +(performance.now() - tG).toFixed(1); } catch (e) { /* still taken */ } }
+        await list();
+        const now = performance.now() - tG;
+        if (h && now - tH > listMs) break;
+        if (!h && now > 5000) break;
+        await L.sleep(3);
+      }
+      if (h) h.close();
+      const changes = [];
+      for (let k = 1; k < snaps.length; k++) {
+        if (snaps[k].names !== snaps[k - 1].names) changes.push({ betweenMs: [snaps[k - 1].t, snaps[k].t], ...snaps[k].c,
+          when: tH === null ? 'no handle' : (snaps[k - 1].t >= tH ? 'after handle' : (snaps[k].t <= tH ? 'before handle' : 'around handle')) });
+      }
+      const last = changes[changes.length - 1];
+      bus.emit('dc41result', { lock, handleAfterGrantMs: tH, tries, listings: snaps.length, atGrant: snaps[0].c,
+        final: snaps[snaps.length - 1].c, changes,
+        lastChangeAfterGrantMs: last ? last.betweenMs : null,
+        lastChangeAfterHandleMs: last && tH !== null ? [+(last.betweenMs[0] - tH).toFixed(1), +(last.betweenMs[1] - tH).toFixed(1)] : null,
+        changesAfterHandle: changes.filter(c => c.when === 'after handle').length,
+        changesAroundHandle: changes.filter(c => c.when === 'around handle').length });
+    });
+    for (let k = 0; k < 200; k++) {
+      if ((await navigator.locks.query()).pending.some(p => p.name === lock)) return { queued: true };
+      await L.sleep(5);
+    }
+    return { queued: false };
+  });
 }
 
 // ---------------------------------------------------------------------------------------
@@ -845,6 +940,7 @@ async function opfsMark({ mark }) {
 }
 
 const handlers = {
+  dc41hold, dc41fire, dc41wait,
   heartbeat: args => { heartbeat(args); return Promise.resolve('started'); }, opfsMark,
   capabilities, matrix, s3, holdFile, closeFile, tryOpen, openWhenFree,
   writeFlushNoClose, readCheck, killNow, series, checkSeries, rejections, checkRejections,

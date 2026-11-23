@@ -203,6 +203,57 @@ def main():
         P('q6 handover on tab close ms', json.dumps(r.get('handoverStats')), [h.get('ms', h.get('error')) for h in r.get('handover', [])])
         for e in s['q6'].get('errors', []):
             P('q6 ERROR', json.dumps(e)[:400])
+    for key in ('fu_a', 'fu_b', 'fu_c'):
+        if key not in s:
+            continue
+        r = s[key]
+        cal = (r.get('calibration') or {}).get('fu') or {}
+        P(key, 'kinds', r.get('kinds'), 'seriesMs', r.get('seriesMs'), 'calibration ok', cal.get('ok'))
+        bad = 0
+        for row in r.get('rows', []):
+            fu = row.get('fu') or {}
+            bad += not fu.get('ok')
+            keep = {k: fu.get(k) for k in ('ok', 'lastResolvedFlush', 'lastResolvedMove', 'validTemps', 'tempsNotWhole', 'target',
+                                           'targetMissing', 'targetNotWhole', 'newestWholeTemp', 'newestResolvedFlushAvailable',
+                                           'lastResolvedMoveCovered', 'movedFiles', 'maxMoved', 'problemCount', 'problems',
+                                           'siblingsIntact', 'unexpectedNames', 'tempNotWholeAfterResolvedFlush') if k in fu}
+            P(key, row.get('iter'), 'killAt', row.get('killAtMsAfterSetup'), 'recheckSame', row.get('recheckSameState'), json.dumps(keep)[:700],
+              row.get('error', ''))
+        P(key, 'iterations', len(r.get('rows', [])), 'notOk', bad)
+    if 'dc41' in s:
+        r = s['dc41']
+        P('dc41 run', r.get('run'))
+        by = {}
+        for row in r.get('rows') or []:
+            m = by.setdefault(row['mode'], {'iters': 0, 'itersWithChangesAfterLock': 0, 'itersWithChangesAfterHandle': 0,
+                                             'itersWithChangesAroundHandle': 0, 'lastChangeAfterGrantMsMax': None,
+                                             'lastChangeAfterHandleMsMax': None, 'hs': [], 'errors': 0})
+            m['iters'] += 1
+            if row.get('error'):
+                m['errors'] += 1
+                continue
+            if row.get('changes'):
+                m['itersWithChangesAfterLock'] += 1
+                lc = row['lastChangeAfterGrantMs']
+                if m['lastChangeAfterGrantMsMax'] is None or lc[1] > m['lastChangeAfterGrantMsMax'][1]:
+                    m['lastChangeAfterGrantMsMax'] = lc
+            if row.get('changesAfterHandle'):
+                m['itersWithChangesAfterHandle'] += 1
+                lh = row['lastChangeAfterHandleMs']
+                if m['lastChangeAfterHandleMsMax'] is None or lh[1] > m['lastChangeAfterHandleMsMax'][1]:
+                    m['lastChangeAfterHandleMsMax'] = lh
+            if row.get('changesAroundHandle'):
+                m['itersWithChangesAroundHandle'] += 1
+            if row.get('handleAfterGrantMs') is not None:
+                m['hs'].append(row['handleAfterGrantMs'])
+        for mode, m in by.items():
+            hs = sorted(m.pop('hs'))
+            m['handleAfterGrantMs'] = {'min': hs[0], 'p50': hs[len(hs) // 2], 'max': hs[-1]} if hs else None
+            P(f'dc41 {mode}: {json.dumps(m)}')
+        for row in r.get('rows') or []:
+            if row.get('changes') or row.get('error'):
+                P(f"dc41 row {row['mode']} {row['i']}: handle {row.get('handleAfterGrantMs')} ms tries {row.get('tries')} atGrant {row.get('atGrant')} "
+                  f"final {row.get('final')} changes {json.dumps(row.get('changes'))[:400]} {row.get('error') or ''}")
     if 'bgfreeze' in s:
         r = s['bgfreeze']
         st = r.get('setup') or {}

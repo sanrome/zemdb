@@ -385,3 +385,34 @@ export async function bgfreeze(T, a) {
   await T.log({ event: 'bgfreeze-setup', aKind: A.kind, bKind: B.kind, aInfo, bInfo, lock });
   await new Promise(() => {}); // the driver reads the heartbeats and the grant from the server's log
 }
+
+// --- DC41 follow-up: the holder's in-flight operations against the waiter's client.lock handle. --
+export async function dc41(T, a) {
+  const rows = [];
+  let Bctx = null;
+  const waiter = async () => (Bctx ??= await T.openCtx('B'));
+  for (const mode of a.modes) {
+    for (let i = 0; i < a.iters; i++) {
+      const lock = `dc41-${T.token}-${mode}-${i}`;
+      const dir = `dc41-${T.token}/${mode}-${i}`;
+      const A = await T.openCtx('A');
+      await T.bus.call(A.w, 'dc41hold', { lock, dir, inflight: 20 });
+      const B = await waiter();
+      const q = await T.bus.call(B.w, 'dc41wait', { lock, dir, listMs: 1000 });
+      const result = T.bus.waitEvent(m => m.event === 'dc41result' && m.lock === lock, 15000, 'dc41result');
+      result.catch(() => {});
+      T.bus.send(A.w, 'dc41fire', { dir, inflight: 20, mode });
+      let r;
+      try { r = await result; } catch (err) { r = { error: L.errInfo(err) }; }
+      const row = { mode, i, aKind: A.kind, queued: q.queued, ...r };
+      delete row.event; delete row.from; delete row.t;
+      rows.push(row);
+      await T.log({ event: 'dc41row', row });
+      if (r.error) { await T.endCtx(B, 'closeTab'); Bctx = null; }
+      await T.endCtx(A, 'closeTab');
+      await L.sleep(50);
+    }
+  }
+  if (Bctx) await T.endCtx(Bctx, 'closeTab');
+  return { rows };
+}

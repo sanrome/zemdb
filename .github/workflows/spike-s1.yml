@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 env:
-  FIREFOX_TESTS: info,s5q1b,s5q1m,s5q1a,q4
+  FIREFOX_TESTS: fu_a,fu_b,fu_c
   SAFARI_TESTS: info,opfs_normal_mark,s1q1,matrix,s1q2,s5q1a,s5q1rej,s5q1b,q3,q4,q6,q2,zstd,q5,safaridriver
   ITERS: "20"
 
