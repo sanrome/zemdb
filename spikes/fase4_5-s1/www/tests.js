@@ -97,15 +97,19 @@ export async function checkRejections(T, a) { return T.worker.call('checkRejecti
 // --- S5 question 2: the waiter that gets the lock, and the holder's handles. -----------------
 export async function q2(T, a) {
   const rows = [];
+  // One waiter tab serves every iteration (a new one only after an error), so each iteration
+  // opens a single new tab, the holder's.
+  let Bctx = null;
+  const waiter = async () => (Bctx ??= await T.openCtx('B'));
   for (const mode of a.modes) {
     for (let i = 0; i < a.iters; i++) {
       const lock = `q2-${T.token}-${mode}-${i}`;
       const dir = `q2-${T.token}/${mode}-${i}`;
       const A = await T.openCtx('A');
       await T.bus.call(A.w, 'q2hold', { lock, dir, n: a.n });
-      const B = await T.openCtx('B');
+      const B = await waiter();
       const q = await T.bus.call(B.w, 'q2wait', { lock, dir, n: a.n });
-      const result = T.bus.waitEvent(m => m.event === 'q2result' && m.lock === lock, 20000, 'q2result');
+      const result = T.bus.waitEvent(m => m.event === 'q2result' && m.lock === lock, 12000, 'q2result');
       const ending = T.bus.waitEvent(m => m.event === 'ending' && (m.from === A.page || m.from === A.w), 10000, 'ending');
       result.catch(() => {}); ending.catch(() => {});
       const tCmd = Date.now();
@@ -117,7 +121,8 @@ export async function q2(T, a) {
       rows.push({ mode, i, aKind: A.kind, bKind: B.kind, queued: q.queued, tEnd: e.t, endMissing: !!e.missing,
                   handoverMs: r.tGrant ? r.tGrant - e.t : null, failures: r.failures, errors: r.errors,
                   retry: r.retry, openMs: r.openMs, error: r.error });
-      await T.endCtx(B, 'closeTab');
+      await T.log({ event: 'q2row', row: rows[rows.length - 1] });
+      if (r.error) { await T.endCtx(B, 'closeTab'); Bctx = null; }
       if (mode !== 'closeTab') await T.endCtx(A, 'closeTab');
       await L.sleep(50);
     }
@@ -130,9 +135,9 @@ export async function q2(T, a) {
       const dir = `q2f-${T.token}/${mode}-${i}`;
       const A = await T.openCtx('A');
       await T.bus.call(A.w, 'q2hold', { lock, dir, n: 0, inflight: a.inflightOps });
-      const B = await T.openCtx('B');
+      const B = await waiter();
       await T.bus.call(B.w, 'q2wait', { lock, dir, n: 0, listMs: 1000 });
-      const result = T.bus.waitEvent(m => m.event === 'q2result' && m.lock === lock, 20000, 'q2result');
+      const result = T.bus.waitEvent(m => m.event === 'q2result' && m.lock === lock, 12000, 'q2result');
       result.catch(() => {});
       T.bus.send(A.w, 'fireAndEnd', { dir, inflight: a.inflightOps, mode });
       let r;
@@ -141,11 +146,13 @@ export async function q2(T, a) {
       inflight.push({ mode, i, aKind: A.kind, landedAtGrant: { moved: first.filter(x => x.startsWith('F:mv_')).length,
         removed: a.inflightOps - first.filter(x => x.startsWith('F:r_')).length },
         changesAfterGrant: r.listing?.changes ?? null, lists: r.listing?.lists, error: r.error });
-      await T.endCtx(B, 'closeTab');
+      await T.log({ event: 'q2inflightRow', row: inflight[inflight.length - 1] });
+      if (r.error) { await T.endCtx(B, 'closeTab'); Bctx = null; }
       await T.endCtx(A, 'closeTab');
       await L.sleep(50);
     }
   }
+  if (Bctx) await T.endCtx(Bctx, 'closeTab');
   return { rows, inflight };
 }
 
@@ -171,11 +178,15 @@ export async function q3(T, a) {
 // --- S5 question 4: fetch streaming, from the worker. ---------------------------------------
 export async function q4(T, a) {
   const out = {};
-  out.timed = await T.worker.call('streamTimed', { id: `${T.token}-timed`, chunks: 20, size: 1024, interval: 250 });
-  out.timedSmall = await T.worker.call('streamTimed', { id: `${T.token}-small`, chunks: 20, size: 16, interval: 100 });
-  out.abort = await T.worker.call('streamAbort', { id: `${T.token}-abort`, readChunks: 5 });
+  const sub = async (key, cmd, args, ms) => {
+    try { out[key] = await T.worker.call(cmd, args, ms); } catch (e) { out[key] = { error: L.errInfo(e) }; }
+    await T.log({ event: 'q4sub', key, value: out[key] });
+  };
+  await sub('timed', 'streamTimed', { id: `${T.token}-timed`, chunks: 20, size: 1024, interval: 250 });
+  await sub('timedSmall', 'streamTimed', { id: `${T.token}-small`, chunks: 20, size: 16, interval: 100 });
+  await sub('abort', 'streamAbort', { id: `${T.token}-abort`, readChunks: 5 });
   await L.sleep(1500);
-  out.flood = await T.worker.call('streamFlood', { id: `${T.token}-flood`, readBytes: 1 << 20, pauseMs: 8000 }, 60000);
+  await sub('flood', 'streamFlood', { id: `${T.token}-flood`, readBytes: 1 << 20, pauseMs: 8000 }, 60000);
   await L.sleep(1000);
   return out;
 }
@@ -358,9 +369,19 @@ export async function zstd(T, a) {
 }
 
 // --- Safari: does a WebDriver session keep the OPFS (and see the normal session's)? ---------
-export async function opfsMark(T, a) {
-  const d = await L.dirPath('webdriver-check');
-  const before = await L.listNames(d);
-  await L.writeFile(d, a.mark, new TextEncoder().encode(a.mark));
-  return { before, after: await L.listNames(d), userAgent: navigator.userAgent };
+export async function opfsMark(T, a) { return T.worker.call('opfsMark', a); }
+
+// --- Safari: a lock holder in a background tab that the browser may suspend. ------------------
+export async function bgfreeze(T, a) {
+  const lock = `bgf-${T.token}`;
+  const A = await T.openCtx('A');
+  await T.bus.call(A.w, 'lockHold', { lock });
+  T.bus.send(A.w, 'heartbeat', { label: 'holder', periodMs: 5000, totalMs: a.totalMs });
+  const B = await T.openCtx('B');
+  await T.bus.call(B.w, 'lockWaitReport', { lock });
+  T.bus.send(B.w, 'heartbeat', { label: 'waiter', periodMs: 5000, totalMs: a.totalMs });
+  const aInfo = await T.bus.call(A.page, 'info', {}).catch(e => L.errInfo(e));
+  const bInfo = await T.bus.call(B.page, 'info', {}).catch(e => L.errInfo(e));
+  await T.log({ event: 'bgfreeze-setup', aKind: A.kind, bKind: B.kind, aInfo, bInfo, lock });
+  await new Promise(() => {}); // the driver reads the heartbeats and the grant from the server's log
 }

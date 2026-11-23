@@ -17,7 +17,10 @@ if (!alive.ok) {
   const bus = new L.Bus(TOKEN, `${NAME}.page`);
   const worker = new Worker(`worker.js?token=${TOKEN}&name=${NAME}.w`, { type: 'module' });
   const hiddenSince = { t: document.visibilityState === 'hidden' ? Date.now() : null };
-  document.addEventListener('visibilitychange', () => { hiddenSince.t = document.visibilityState === 'hidden' ? Date.now() : null; });
+  document.addEventListener('visibilitychange', () => {
+    hiddenSince.t = document.visibilityState === 'hidden' ? Date.now() : null;
+    L.log({ event: 'ctx-visibility', name: NAME, vis: document.visibilityState });
+  });
   const end = mode => {
     const t = Date.now();
     bus.emit('ending', { name: NAME, mode, t });

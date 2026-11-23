@@ -663,6 +663,10 @@ class Driver:
         r = self.run('q2', {'modes': ['terminate', 'closeTab', 'reload', 'panicClose'], 'iters': iters, 'n': 50,
                             'inflightModes': ['terminate', 'selfClose', 'closeTab', 'reload'], 'inflightIters': iters,
                             'inflightOps': 20, 'driverOpen': self.b.kind == 'safari'}, 3000)
+        if not r['results'] or not r['results'][0]:
+            # Timed out: the rows logged so far.
+            r['results'] = [{'rows': [e['row'] for e in HUB.of_token(r['token'], 'q2row')],
+                             'inflight': [e['row'] for e in HUB.of_token(r['token'], 'q2inflightRow')], 'partial': True}]
         self.save('q2', summarize_q2(r))
 
     def t_q3(self):
@@ -671,6 +675,8 @@ class Driver:
     def t_q4(self):
         r = self.run('q4', {}, 180)
         server = [e for e in HUB.events if str(e.get('id', '')).startswith(r['token']) and e.get('event') != 'flood-samples']
+        if not r['results'] or not r['results'][0]:
+            r['results'] = [{e['key']: e['value'] for e in HUB.of_token(r['token'], 'q4sub')}]
         self.save('q4', {'page': r, 'server': server})
 
     def t_q4h2(self):
@@ -707,6 +713,27 @@ class Driver:
                             'driverOpen': self.b.kind == 'safari'}, total / 1000 + 180)
         timers = [e for e in HUB.of_token(r['token']) if e.get('event') in ('timer', 'visibility', 'visibility-after-open', 'blank-open', 'blank-closing')]
         self.save('q5', {'page': r, 'events': timers, 'summary': summarize_q5(timers)})
+
+    def t_bgfreeze(self, total_ms=int(os.environ.get('BGFREEZE_MS', '450000'))):
+        """Safari: a lock holder's tab in the background for 7.5 min; heartbeats of both workers."""
+        r = self.run('bgfreeze', {'totalMs': total_ms, 'driverOpen': self.b.kind == 'safari'}, total_ms / 1000 + 30, until=('never',))
+        evs = HUB.of_token(r['token'])
+        setup = next((e for e in evs if e.get('event') == 'bgfreeze-setup'), None)
+        beats = {}
+        for e in evs:
+            if e.get('event') == 'heartbeat':
+                beats.setdefault(e['label'], []).append(e)
+        out = {'page': r, 'setup': setup, 'granted': [e for e in evs if e.get('event') == 'granted'],
+               'visibility': [{k: e.get(k) for k in ('name', 'vis', 'ts')} for e in evs if e.get('event') == 'ctx-visibility']}
+        t0 = setup['ts'] if setup else None
+        for label, bs in beats.items():
+            ts = [b['ts'] for b in bs]
+            gaps = [round(b - a) for a, b in zip(ts, ts[1:])]
+            big = [{'afterSetupMs': round(ts[k] - t0) if t0 else None, 'gapMs': g} for k, g in enumerate(gaps) if g > 15000]
+            out[label] = {'beats': len(bs), 'firstAfterSetupMs': round(ts[0] - t0) if t0 and ts else None,
+                          'lastAfterSetupMs': round(ts[-1] - t0) if t0 and ts else None, 'maxGapMs': max(gaps) if gaps else None,
+                          'gapsOver15s': big, 'maxLateMs': max((b.get('lateMs') or 0) for b in bs)}
+        self.save('bgfreeze', out)
 
     def t_q6(self):
         self.save('q6', self.run('q6', {'handoverIters': 20, 'driverOpen': self.b.kind == 'safari'}, 900))

@@ -26,6 +26,7 @@ jobs:
           snap list 2>/dev/null | grep -i firefox || true
           lscpu | grep -E 'Model name|^CPU\(s\)'; free -g; head -2 /etc/os-release; python3 --version
       - name: Run the spikes in Firefox
+        timeout-minutes: 70
         working-directory: spikes/fase4_5-s1
         run: |
           xvfb-run -a -s "-screen 0 1280x900x24" python3 harness.py --browser firefox \
@@ -40,30 +41,40 @@ jobs:
     if: ${{ !contains(github.event.head_commit.message, '[firefox-only]') }}
     runs-on: macos-latest
     timeout-minutes: 110
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [a, b]
+    env:
+      PART_TESTS: ${{ matrix.part == 'a' && 'info,opfs_normal_mark,s1q1,matrix,s1q2,s5q1rej,s5q1b,s5q1m,zstd,safaridriver' || 'q4,bgfreeze,q2' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        if: matrix.part == 'a'
       - name: Environment
         run: |
           set -x
           sysctl -n machdep.cpu.brand_string; sysctl -n hw.ncpu; sysctl -n hw.memsize; sw_vers
           defaults read /Applications/Safari.app/Contents/Info.plist CFBundleShortVersionString
           defaults read /Applications/Safari.app/Contents/Info.plist CFBundleVersion
-          python3 --version; rustc --version
+          python3 --version
       - name: Build the payload generator
+        if: matrix.part == 'a'
         working-directory: spikes/fase4_5-s1/rust/payload-gen
         run: CARGO_INCREMENTAL=0 cargo build --release
       - name: Generate the payload
+        if: matrix.part == 'a'
         run: spikes/fase4_5-s1/rust/payload-gen/target/release/payload-gen gen "$RUNNER_TEMP/payload"
       - name: Enable safaridriver
         run: sudo safaridriver --enable
       - name: Run the spikes in Safari
+        timeout-minutes: 85
         working-directory: spikes/fase4_5-s1
         run: |
           python3 harness.py --browser safari --out "$RUNNER_TEMP/res" --payload-dir "$RUNNER_TEMP/payload" \
-            --tests "$SAFARI_TESTS" --iters "$ITERS" 2>&1 | grep -E '^(===|server on|SCREENSHOT|Traceback|  File|[A-Za-z]*Error)' | cut -c1-400
+            --tests "$PART_TESTS" --iters "$ITERS" 2>&1 | grep -E '^(===|server on|SCREENSHOT|Traceback|  File|[A-Za-z]*Error)' | cut -c1-400
       - name: Native zstd decodes the browser's envelopes
-        if: always()
+        if: always() && matrix.part == 'a'
         run: |
           ls -la "$RUNNER_TEMP/res/uploads" || true
           spikes/fase4_5-s1/rust/payload-gen/target/release/payload-gen verify \

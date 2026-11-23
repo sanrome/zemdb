@@ -101,7 +101,7 @@ async function matrix({ dir: dirName }) {
     const d = await fresh();
     const f = await L.writeFile(d, 'a', content);
     const f2 = await d.getFileHandle('a');
-    R.sah_movedAwayByOtherHandle_move = await L.attempt(() => f2.move('b'));
+    R.sah_movedAwayByOtherHandle_move = await L.attempt(() => f2.move(d, 'b'));
     R.sah_movedAwayByOtherHandle = await L.attempt(() => f.createSyncAccessHandle());
     R.sah_movedAwayByOtherHandle.after = await snapDir(d);
     R.sah_movedAwayByOtherHandle.oldHandleName = f.name;
@@ -199,7 +199,7 @@ async function matrix({ dir: dirName }) {
     const d = await fresh();
     const src = await L.writeFile(d, 'src', content);
     const ws = await src.createWritable().catch(e => null);
-    R.move_sourceWritableOpen = ws ? await L.attempt(() => src.move('dst')) : { skipped: 'no createWritable' };
+    R.move_sourceWritableOpen = ws ? await L.attempt(() => src.move(d, 'dst')) : { skipped: 'no createWritable' };
     if (ws) await ws.abort().catch(() => {});
     R.move_sourceWritableOpen_after = await snapDir(d);
   }
@@ -224,17 +224,19 @@ async function matrix({ dir: dirName }) {
     const src = await L.writeFile(d, 'src', content);
     await d.getDirectoryHandle('adir', { create: true });
     for (const [k, name] of Object.entries({ slash: 'a/b', dotdot: '..', dot: '.', empty: '' })) {
-      R[`move_invalidName_${k}`] = await L.attempt(() => src.move(name));
+      R[`move_invalidName_${k}`] = await L.attempt(() => src.move(d, name));
     }
-    R.move_ontoExistingDirectory = await L.attempt(() => src.move('adir'));
-    R.move_ontoItself = await L.attempt(() => src.move('src'));
+    R.move_ontoExistingDirectory = await L.attempt(() => src.move(d, 'adir'));
+    R.move_ontoItself = await L.attempt(() => src.move(d, 'src'));
     R.move_invalid_after = await snapDir(d);
   }
   {
     const d = await fresh();
     const sub = await d.getDirectoryHandle('sub', { create: true });
     await L.writeFile(sub, 'x', content);
-    R.move_directory = await L.attempt(() => sub.move('sub2'));
+    R.move_directory = await L.attempt(() => sub.move(d, 'sub2'));
+    const one = await L.writeFile(d, 'one', content);
+    R.move_oneArgumentForm = await L.attempt(() => one.move('one-renamed'));
     R.move_directory_after = await snapDir(d);
   }
 
@@ -300,11 +302,12 @@ async function s3({ dir: dirName }) {
     const a = await L.writeFile(d, 'a', enc('A'));
     const b = await L.writeFile(d, 'b', enc('B'));
     let h = await a.createSyncAccessHandle();
-    A.q2_moveSourceOpen = await L.attempt(() => a.move('x'));
+    A.q2_moveSourceOpen = await L.attempt(() => a.move(d, 'x'));
     h.close();
     A.q2_moveSourceOpen_after = await snapDir(d);
     h = await b.createSyncAccessHandle();
-    A.q2_moveOntoOpenDestination = await L.attempt(() => a.move('b'));
+    A.q2_moveOntoOpenDestination = await L.attempt(() => a.move(d, 'b'));
+    A.q2_openHandleAfterMoveOnto = await L.attempt(async () => { const b2 = new Uint8Array(8); const k = h.read(b2, { at: 0 }); return new TextDecoder().decode(b2.subarray(0, k)); });
     h.close();
     A.q2_moveOntoOpenDestination_after = await snapDir(d);
   }
@@ -319,7 +322,7 @@ async function s3({ dir: dirName }) {
   { // Q4: the FileSystemFileHandle after its move()
     const d = await root.getDirectoryHandle('q4', { create: true });
     const a = await L.writeFile(d, 'a', enc('A'));
-    await a.move('moved');
+    await a.move(d, 'moved');
     A.q4_nameAfterMove = a.name;
     A.q4_getFileAfterMove = await L.attempt(() => text(a));
     A.q4_isSameEntryAsNewName = await L.attempt(async () => a.isSameEntry(await d.getFileHandle('moved')));
@@ -330,7 +333,7 @@ async function s3({ dir: dirName }) {
     });
     A.q4_after = await snapDir(d);
     // And moved twice (the WAL's rotation and its rollback).
-    await a.move('a');
+    await a.move(d, 'a');
     A.q4_movedBack_name = a.name;
     A.q4_movedBack_sah = await L.attempt(async () => { const h = await a.createSyncAccessHandle(); const s = h.getSize(); h.close(); return s; });
   }
@@ -420,7 +423,7 @@ async function series({ dir: dirName, cycles, kinds, killAfterLast }) {
       switch (kind) {
         case 'tmpCreate': tmp = await d.getFileHandle(`t_${i}`, { create: true }); break;
         case 'tmpWritten': { const h = await tmp.createSyncAccessHandle(); h.write(L.genContent(i), { at: 0 }); h.flush(); h.close(); break; }
-        case 'move': if (i % 2) await tmp.move(d, 'target'); else await tmp.move('target'); break;
+        case 'move': await tmp.move(d, 'target'); break;
         case 'createFile': await d.getFileHandle(`f_${i}`, { create: true }); break;
         case 'createDir': await d.getDirectoryHandle(`d_${i}`, { create: true }); break;
         case 'remove': await d.removeEntry(`r_${i}`); break;
@@ -601,7 +604,7 @@ function fireAndEnd({ dir, inflight, mode }) {
     for (let k = 0; k < inflight; k++) fhs.push(await d.getFileHandle(`m_${k}`));
     // Nothing is awaited from here on.
     const t = Date.now();
-    for (let k = 0; k < inflight; k++) { fhs[k].move(`mv_${k}`).catch(() => {}); d.removeEntry(`r_${k}`).catch(() => {}); }
+    for (let k = 0; k < inflight; k++) { fhs[k].move(d, `mv_${k}`).catch(() => {}); d.removeEntry(`r_${k}`).catch(() => {}); }
     if (mode === 'selfClose') { bus.emit('ending', { mode, t }); self.close(); return 'closed'; }
     self.postMessage({ endNow: mode, t });
     return 'fired';
@@ -639,7 +642,7 @@ async function lockWaitTimed({ lock }) {
   return { waitedMs: tGrant - t0, tGrant };
 }
 function lockWaitReport({ lock }) {
-  navigator.locks.request(lock, () => { bus.emit('granted', { lock, tGrant: Date.now() }); });
+  navigator.locks.request(lock, () => { const tGrant = Date.now(); bus.emit('granted', { lock, tGrant }); L.log({ event: 'granted', lock, tGrant }); });
   return navigator.locks.query().then(q => ({ queued: q.pending.some(p => p.name === lock) }));
 }
 async function lockAbort({ lock, abortAfterMs }) {
@@ -822,7 +825,27 @@ function bgTimers({ totalMs }) {
 }
 
 // ---------------------------------------------------------------------------------------
+// A timer chain that logs each beat straight to the server (not through any page).
+async function heartbeat({ label, periodMs, totalMs }) {
+  const tEnd = Date.now() + totalMs;
+  while (Date.now() < tEnd) {
+    const t0 = performance.now();
+    await new Promise(r => setTimeout(r, periodMs));
+    L.log({ event: 'heartbeat', label, lateMs: +(performance.now() - t0 - periodMs).toFixed(1) });
+  }
+  return 'done';
+}
+
+// Safari's WebDriver check: does this session see the OPFS of earlier ones?
+async function opfsMark({ mark }) {
+  const d = await L.dirPath('webdriver-check');
+  const before = await L.listNames(d);
+  await L.writeFile(d, mark, new TextEncoder().encode(mark));
+  return { before, after: await L.listNames(d), userAgent: navigator.userAgent };
+}
+
 const handlers = {
+  heartbeat: args => { heartbeat(args); return Promise.resolve('started'); }, opfsMark,
   capabilities, matrix, s3, holdFile, closeFile, tryOpen, openWhenFree,
   writeFlushNoClose, readCheck, killNow, series, checkSeries, rejections, checkRejections,
   q2hold, q2wait, fireAndEnd, panicClose,

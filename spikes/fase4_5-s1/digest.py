@@ -203,6 +203,13 @@ def main():
         P('q6 handover on tab close ms', json.dumps(r.get('handoverStats')), [h.get('ms', h.get('error')) for h in r.get('handover', [])])
         for e in s['q6'].get('errors', []):
             P('q6 ERROR', json.dumps(e)[:400])
+    if 'bgfreeze' in s:
+        r = s['bgfreeze']
+        st = r.get('setup') or {}
+        P('bgfreeze setup', json.dumps({k: st.get(k) for k in ('aKind', 'bKind', 'aInfo', 'bInfo')}))
+        P('bgfreeze holder', json.dumps(r.get('holder')))
+        P('bgfreeze waiter', json.dumps(r.get('waiter')))
+        P('bgfreeze granted', json.dumps(r.get('granted'))[:400], 'visibility', json.dumps(r.get('visibility'))[:600])
     if 'freeze' in s:
         r = (s['freeze'].get('results') or [{}])[0] or {}
         for run in r.get('runs', []):
