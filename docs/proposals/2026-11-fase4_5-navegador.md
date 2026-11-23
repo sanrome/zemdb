@@ -2,7 +2,7 @@
 
 **Fecha:** 19 de Noviembre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 0 (el contrato) cerrado el 23 de Noviembre de 2026, con la revisión cruzada en verde en su sexta ronda y DC46 en su principio, con su protocolo para el paso D (§1.3). El dueño del proyecto adoptó DC40 y DC43 el 22 de Noviembre de 2026, y eligió ese día la pestaña líder para DC41, de donde sale DC46; las demás decisiones, *Propuestas*.
+**Estado:** En curso: Lote 0 (el contrato) cerrado el 23 de Noviembre de 2026, con la revisión cruzada en verde en su sexta ronda y DC46 en su principio, con su protocolo para el paso D (§1.3). El dueño del proyecto adoptó DC40 y DC43 el 22 de Noviembre de 2026, y eligió ese día la pestaña líder para DC41, de donde sale DC46; adoptó las demás el 23 (DC46, en su principio: su protocolo, en el paso D). La CI de `main`, en verde sobre `91850bf`.
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.5. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Parte de:** el núcleo de 4.2 ([plan](2026-10-fase4_2-nucleo-replica.md)), el worker y el transporte de 4.3 ([plan](2026-11-fase4_3-transporte-worker.md)), la fachada de 4.4 ([plan](2026-11-fase4_4-api-rust.md)) y la capa de archivos de 4.1 (DC17, [plan](2026-10-fase4_1-storage-servidor.md)). Depende de 4.3, que cerró el 19 de Noviembre de 2026 con sus Lotes 11b y 11c (`496da6c`), mientras se escribía este plan: ningún lote de 4.5 la espera.
@@ -23,7 +23,7 @@
 - **Dónde.** En `zemdb-storage` (la capa del OPFS y el motor en disco en wasm32) y en `zemdb-client` (lo demás), los dos en el alcance auditado: cada lote, con su revisión de delta. Las pruebas del navegador, en un arnés nuevo (`tools/browser/`, DC44), con su job de la CI. El servidor no cambia.
 - **El modelo de amenaza.** No cambia de forma: DC11 ya pone en el alcance el navegador, el origen como la aplicación y la concurrencia entre pestañas, y en (3) extiende al OPFS el supuesto del disco. §2 de `INVARIANTES.md` precisa ese supuesto (lo que en el OPFS hace las veces de sincronizar un directorio: `move()`, crear y borrar entradas) y lo que el SDK le pide al navegador para coordinar las pestañas (los Web Locks, su cola y los handles exclusivos, y el `BroadcastChannel` entre ellas), como §2 ya confía en el sistema operativo para `flock`; dice que las demás pestañas del origen, que usan el SDK a través de la líder, también son la aplicación; y dice dónde está el `CryptoEngine` en el navegador. Por eso no pide una auditoría amplia (§1.4): las garantías nuevas se auditan en la revisión de cierre (§3). Si el dueño del proyecto lo ve como un cambio del modelo, la revisión de cierre se hace con el método de una auditoría amplia.
 - **Qué no.** El paquete de TypeScript, el codec de objetos de JavaScript con las representaciones de DC14 (INV-K14), `persist()` desde la página, Vite y la app de referencia en el navegador (4.6); CORS en el servidor; un lock por sala; un `CryptoEngine` en JavaScript cargado en el Worker; partir en pasos el trabajo de CPU largo del Worker (todo eso, al backlog si hace falta).
-- **Decisiones nuevas:** DC38 a DC46 (§1): DC40 y DC43, adoptadas por el dueño del proyecto el 22 de Noviembre de 2026; las demás, *Propuestas*. Precisan decisiones de la fase:
+- **Decisiones nuevas:** DC38 a DC46 (§1), adoptadas por el dueño del proyecto: DC40 y DC43 el 22 de Noviembre de 2026, y las demás el 23 (DC46, en su principio: su protocolo, en el paso D). Precisan decisiones de la fase:
   - DC8 y DC17 (la implementación del OPFS, DC39; la coordinación entre pestañas, DC41 y DC46);
   - DC27 y §A.5 (el stream del navegador por `fetch`, y no por `EventSource`, DC40);
   - DC28 (en wasm32, los syncs del worker de a uno y sus transferencias de a una, DC40);
@@ -41,15 +41,15 @@ Las de la fase que implementa esta sub-fase: DC8 (el OPFS), DC9 (`ruzstd` para e
 
 | ID | Decisión | Lotes | Estado |
 |---|---|---|---|
-| **DC38** | La feature `wasm` y el runtime del cliente: tareas, plazos, reloj, azar y hora del navegador, sin `Send` en wasm32 | 2, 4, 7, 8 | Propuesta |
-| **DC39** | El motor del navegador: `DiskStorageEngine` sobre `OpfsFiles`, una capa de archivos del OPFS | 2, 3, 4, 8 | Propuesta, con la condición de S1 en Firefox, S3 en Safari y Firefox y la pregunta 1 de S5 (§1.2) |
+| **DC38** | La feature `wasm` y el runtime del cliente: tareas, plazos, reloj, azar y hora del navegador, sin `Send` en wasm32 | 2, 4, 7, 8 | Adoptada (23 de Noviembre de 2026) |
+| **DC39** | El motor del navegador: `DiskStorageEngine` sobre `OpfsFiles`, una capa de archivos del OPFS | 2, 3, 4, 8 | Adoptada (23 de Noviembre de 2026), con la condición de S1 en Firefox, S3 en Safari y Firefox y la pregunta 1 de S5 (§1.2) |
 | **DC40** | El transporte del navegador: `fetch`, también para el stream de eventos, con el tope de lo que lee y de sus streams | 9 | Adoptada (22 de Noviembre de 2026) |
-| **DC41** | Una pestaña líder por directorio del cliente, con un Web Lock, y el Worker que la página termina en `pagehide` | 10, 12, 15 | Propuesta, con la pregunta 2 de S5; el dueño del proyecto eligió la pestaña líder el 22 de Noviembre de 2026 |
-| **DC42** | El runtime del Worker: un despachador de comandos serializables, y su punto de entrada con un codec intercambiable | 6, 12 | Propuesta |
+| **DC41** | Una pestaña líder por directorio del cliente, con un Web Lock, y el Worker que la página termina en `pagehide` | 10, 12, 15 | Adoptada (23 de Noviembre de 2026); la pestaña líder, elegida el 22; con la pregunta 2 de S5 |
+| **DC42** | El runtime del Worker: un despachador de comandos serializables, y su punto de entrada con un codec intercambiable | 6, 12 | Adoptada (23 de Noviembre de 2026) |
 | **DC43** | Las claves en el Worker: un `CryptoEngine` del SDK sobre WebCrypto, AES-GCM con un `CryptoKey` por sala | 11, 12 | Adoptada (22 de Noviembre de 2026) |
-| **DC44** | Las pruebas en el navegador: el arnés, la página que se recarga sola, Playwright, los tests unitarios en wasm32 y la CI | 1, 3, 15 | Propuesta |
-| **DC45** | DEF-189: los metadatos, durables antes de servirse | 2, 5, 8 | Propuesta, con la pregunta 1 de S5 |
-| **DC46** | Las demás pestañas: usan el SDK a través de la pestaña líder, por un `BroadcastChannel`, con el relevo cuando la líder se va | 6, 13, 14, 15 | Propuesta, con la pregunta 6 de S5 |
+| **DC44** | Las pruebas en el navegador: el arnés, la página que se recarga sola, Playwright, los tests unitarios en wasm32 y la CI | 1, 3, 15 | Adoptada (23 de Noviembre de 2026), con Safari en un runner de macOS (§1.2) |
+| **DC45** | DEF-189: los metadatos, durables antes de servirse | 2, 5, 8 | Adoptada (23 de Noviembre de 2026), con la pregunta 1 de S5 |
+| **DC46** | Las demás pestañas: usan el SDK a través de la pestaña líder, por un `BroadcastChannel`, con el relevo cuando la líder se va | 6, 13, 14, 15 | Adoptada en su principio (23 de Noviembre de 2026); su protocolo, en el paso D, con la pregunta 6 de S5 |
 
 ### DC38 · La feature `wasm` y el runtime del cliente
 - **La feature.** `wasm` compila en wasm32 el cliente entero (el núcleo, el worker, la fachada y los metadatos sobre la capa de archivos), con `wasm-bindgen`, `wasm-bindgen-futures`, `js-sys` y `web-sys`. `native` sigue por defecto y solo tiene efecto fuera de wasm32; `wasm`, solo en wasm32. Sin `wasm`, en wasm32, el crate sigue vacío, como hoy. La CI suma `cargo check --target wasm32-unknown-unknown -p zemdb-client --no-default-features --features wasm` (§4.5 del plan de la fase) y su clippy, en el job de WebAssembly.
@@ -163,10 +163,10 @@ Las de la fase que implementa esta sub-fase: DC8 (el OPFS), DC9 (`ruzstd` para e
   2. un servidor de pruebas en Rust: el router de `zemdb-server` (`build_router`, como la simulación), los archivos de la página y unas rutas de prueba (crear el esquema y la sala por el Control Plane, emitir tokens con `generate_client_token`, apagar el router para probar sin red, y respuestas armadas para el tope y los plazos del transporte), en un solo origen de `localhost` (un contexto seguro, sin CORS; habla HTTP/1.1);
   3. una página que corre los pasos en orden, guarda su avance en `sessionStorage` y se recarga sola entre pasos, abre una segunda página para las pruebas de pestañas y termina el Worker, y deja el resultado en la página.
 
-  Playwright (Node) corre la página sin ventana en la CI; una persona la abre en cualquier navegador (Safari, en la Mac del dueño del proyecto) y lee el resultado.
+  Playwright (Node) corre la página sin ventana en la CI; una persona la abre en cualquier navegador y lee el resultado, y un runner de macOS la corre en Safari (§1.2).
 - **Los tests unitarios en wasm32.** Lo interno que una prueba de integración no alcanza (el handle muerto del OPFS, que pide hacer fallar una reapertura) va en tests unitarios del crate, `#[cfg(test)]`, con `wasm-bindgen-test` en un Worker dedicado (`run_in_dedicated_worker`), que corre `wasm-bindgen-test-runner` con el Chrome y el chromedriver del runner de la CI. `GEMINI.md` no deja hacer `pub` lo interno para probarlo.
 - **El criterio de aceptación** (§4.5 del plan de la fase): una sala con filas que llegaron del servidor, la página recargada, y la sala que abre sin red desde sus metadatos y lee las mismas filas; después, con red, se pone al día. Además: el Worker terminado en medio de un lote, y la sala que reabre en un prefijo (INV-K1, INV-S3); dos pestañas (INV-K13); el cifrado (INV-K9); y todo eso por `postMessage`, a través del runtime del Worker.
-- **La CI:** un job `browser` en `ubuntu-latest`, en cada push y pull request como los demás: compila el wasm y el servidor de pruebas, instala Chromium con Playwright y corre la página, corre los tests unitarios en wasm32, y pasa el fmt y el clippy del arnés. Firefox también, con Playwright, si S1 en Firefox sale bien. Safari, en la Mac del dueño del proyecto, antes de la revisión de cierre (§1.2, el paso S2).
+- **La CI:** un job `browser` en `ubuntu-latest`, en cada push y pull request como los demás: compila el wasm y el servidor de pruebas, instala Chromium con Playwright y corre la página, corre los tests unitarios en wasm32, y pasa el fmt y el clippy del arnés. Firefox también, con Playwright, si S1 en Firefox sale bien. Safari, en un runner de `macos-latest` con `safaridriver`, antes de la revisión de cierre (§1.2, el paso S2); WebKit con Playwright en Linux, si hace falta, como un motor de más, que no reemplaza a Safari.
 - **Lo que no depende del navegador** (el despachador, `rt` en nativo, DEF-189) se prueba en la suite de siempre.
 - **Alternativas descartadas:** `wasm-bindgen-test` también para la integración (va por WebDriver: no recarga la página en medio de una prueba ni abre dos pestañas); un proxy en Node delante del servidor, en lugar del servidor de pruebas en Rust, que arma el servidor real en proceso como la simulación.
 
@@ -225,12 +225,15 @@ Las de la fase que implementa esta sub-fase: DC8 (el OPFS), DC9 (`ruzstd` para e
   6. Entre los Workers de dos pestañas, por un `BroadcastChannel`: ¿llegan los mensajes de uno en orden, también un `CryptoKey` no extraíble, y cuánto tarda una ida y vuelta? Al cerrarse la pestaña que tiene el Web Lock, ¿cuánto tarda el primero de la cola en recibirlo? Una pestaña en segundo plano que tiene un Web Lock, ¿se congela (Chrome en Android, Safari en iOS), y mientras tanto la cola le da el lock a otra? ¿Un `AbortSignal` saca de la cola un pedido que espera? ¿Una página prerenderizada recibe sus Web Locks recién cuando se muestra? (DC46.)
 
   En Chromium, sin ventana, con Playwright y un perfil persistente que se corta con `SIGKILL`, sin la Mac; en Safari y Firefox, en la Mac.
-- **La medición del codificador `ruzstd` en Safari** (DC9): el programa del Lote 6 de 4.1 (el `cdylib`, la página que mide y el generador nativo del payload), en la Mac, como lo midió DC9. Si ese programa no está, se rearma con lo que describe DC9.
+- **La medición del codificador `ruzstd` en Safari** (DC9): el programa del Lote 6 de 4.1 (el `cdylib`, la página que mide y el generador nativo del payload), en Safari en un runner de `macos-latest`. El hardware no es el de DC9, así que se anota cuál es, y los tiempos no se comparan uno a uno. Si ese programa no está, se rearma con lo que describe DC9.
 
-**Cuándo hacen falta la Mac o un runner de macOS:**
+**Cuándo y dónde corren Safari y Firefox:**
 - **Paso S1, después del Lote 0 y antes del Lote 2** (la capa del OPFS): S1 en Firefox, S3 en Safari y Firefox, y S5 en Safari y Firefox. Una respuesta negativa reabre DC8 o DC39, o cambia los errores que mapea la capa, así que va antes de escribirla. Puede ir en paralelo con el Lote 1 (el arnés), que no depende de ellos. S5 en Chromium va en el mismo paso.
 - **Paso S2, después del Lote 15 y antes de la revisión de cierre:** la página de aceptación del arnés (DC44) en Safari y en Firefox, y la medición de `ruzstd` en Safari. Es la condición de DC8 para cerrar 4.5.
-- **La Mac o un runner:** Firefox, y las preguntas que no cortan el navegador, se pueden correr en un runner de `macos-latest` (Safari con `safaridriver`), desde un workflow en una rama que no se mergea. Cortar Safari (S1 (2), S5 (1)) cierra las ventanas del que lo usa, y la medición de `ruzstd` se compara con la de DC9 en la misma máquina: esas dos piden la Mac.
+- **Dónde, sin la Mac** (el dueño del proyecto ya no tiene Safari, y Safari no corre en Linux):
+  - Firefox, en Linux: con Playwright en este entorno, si se puede bajar, o en un runner de `ubuntu-latest`, que lo trae instalado.
+  - Safari, en un runner de `macos-latest`, con `safaridriver`, desde un workflow en la rama de trabajo de la sesión, que no se mergea (el código de un spike no entra a `main`). En un runner no hay ventanas de nadie, así que también se puede cortar Safari (S1 (2), S5 (1)).
+  - WebKit con Playwright en Linux es el mismo motor que Safari, pero no Safari: sirve de motor de más, no lo reemplaza.
 
 ### 1.3. Requisitos de diseño de DC46 (para el paso D)
 
@@ -677,11 +680,12 @@ Sus rupturas se arreglan en lotes nuevos de 4.5, cada uno con su revisión de de
 
 ## 4. Seguimiento
 
-**Avance:** Lote 0 (el contrato) cerrado el 23 de Noviembre de 2026; sigue el paso S1, con el Lote 1 en paralelo.
+**Avance:** Lote 0 (el contrato) cerrado el 23 de Noviembre de 2026, con la CI de `main` en verde sobre `91850bf` y todas sus decisiones adoptadas; sigue el paso S1, con el Lote 1 en paralelo.
 
 | Paso | Qué | Estado |
 |---|---|---|
 | 1 | Este plan, con DC38 a DC46 | ✅ |
 | 2 | El contrato: `INVARIANTES.md` versión 48, el plan de la fase y `ROADMAP.md` | ✅ |
 | 3 | La revisión cruzada del Lote 0 | ✅ Verde en su sexta ronda, después de 4 bloqueantes, 27 ajustes y unos 80 menores en las seis, todos corregidos. La séptima a la novena, acotadas a la pestaña líder (DC46), con 1 bloqueante y 7 u 8 ajustes cada una: el dueño del proyecto eligió el 23 de Noviembre de 2026 dejar DC46 en su principio y pasar su protocolo al paso D, con esos hallazgos como requisitos (§1.3) |
-| 4 | Las *Propuestas*, con el dueño del proyecto | ⏳ El 22 de Noviembre de 2026 adoptó DC40 (el stream por `fetch`, el tope de streams y los permisos del worker, fijos) y DC43 (WebCrypto), eligió la pestaña líder para DC41 (de ahí DC46) y aceptó `InUse` en nativo y la revisión de cierre sin auditoría amplia. Quedan DC38, DC39, DC41, DC42, DC44, DC45 y DC46 |
+| 4 | Las *Propuestas*, con el dueño del proyecto | ✅ El 22 de Noviembre de 2026 adoptó DC40 (el stream por `fetch`, el tope de streams y los permisos del worker, fijos) y DC43 (WebCrypto), eligió la pestaña líder para DC41 (de ahí DC46) y aceptó `InUse` en nativo y la revisión de cierre sin auditoría amplia. El 23 adoptó las demás: DC38, DC39 (con su condición), DC41, DC42, DC44 (con Safari en un runner de macOS, porque ya no tiene Safari), DC45 y DC46 en su principio |
+| 5 | La CI de `main` | ✅ En verde sobre `91850bf` (23 de Noviembre de 2026) |
