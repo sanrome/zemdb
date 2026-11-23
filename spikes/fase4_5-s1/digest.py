@@ -99,20 +99,27 @@ def main():
             P('s5q1a', row.get('variant'), 'reported', row.get('reportedMax'), 'visiblePrefix', row.get('visiblePrefix'), 'of', row.get('opsTotal'),
               'nonPrefix', row.get('nonPrefixCount'), 'reportedNotVisible', row.get('reportedButNotVisibleCount'),
               'targetValid', row.get('targetValid'), 'gen', row.get('targetGen'), 'anomalies', row.get('anomalies'), row.get('error', ''))
-    if 's5q1b' in s:
-        r = s['s5q1b']
+    for key in ('s5q1b', 's5q1m'):
+        if key not in s:
+            continue
+        r = s[key]
         c = r.get('calibration', {})
-        P('s5q1b calibration seriesMs', r.get('seriesMs'), 'ops', c.get('opsTotal'), 'visible', c.get('visiblePrefix'), 'nonPrefix', c.get('nonPrefixCount'))
+        P(key, 'calibration seriesMs', r.get('seriesMs'), 'ops', c.get('opsTotal'), 'visible', c.get('visiblePrefix'), 'nonPrefix', c.get('nonPrefixCount'))
         bad = 0
         for row in r.get('rows', []):
             flag = row.get('nonPrefixCount') or row.get('reportedButNotVisibleCount') or not row.get('targetValid') or row.get('anomalies') or row.get('error')
             bad += bool(flag)
-            P('s5q1b', row.get('iter'), 'killAt', row.get('killAtMsAfterSetup'), 'finishedBefore', row.get('finishedBeforeKill'),
+            P(key, row.get('iter'), 'killAt', row.get('killAtMsAfterSetup'), 'finishedBefore', row.get('finishedBeforeKill'),
               'reported', row.get('reportedMax'), 'visiblePrefix', row.get('visiblePrefix'), 'inFlightVisible', row.get('inFlightVisible'),
               'nonPrefix', row.get('nonPrefixCount'), 'reportedNotVisible', row.get('reportedButNotVisibleCount'), 'targetGen', row.get('targetGen'),
               'targetValid', row.get('targetValid'), 'incompleteTemps', row.get('tempsWithIncompleteContent'), 'anomalies', row.get('anomalies'),
-              row.get('error', ''), 'FLAG' if flag else '')
-        P('s5q1b iterations', len(r.get('rows', [])), 'flagged', bad)
+              row.get('error', ''), 'recheckSame', row.get('recheckSameState'), 'FLAG' if flag else '')
+            if flag or row.get('recheckSameState') is False:
+                P(key, row.get('iter'), 'RAW lastReported', row.get('lastReported'), 'perKind', json.dumps(row.get('perKind')))
+                P(key, row.get('iter'), 'RAW', json.dumps(row.get('raw'))[:1500])
+                if row.get('recheck'):
+                    P(key, row.get('iter'), 'RECHECK', json.dumps({k: row['recheck'].get(k) for k in ('targetGen', 'targetValid', 'raw', 'perKind')})[:1500])
+        P(key, 'iterations', len(r.get('rows', [])), 'flagged', bad)
     if 's5q1rej' in s:
         r = s['s5q1rej']
         b = (r['beforeKill'].get('results') or [{}])[0] or {}

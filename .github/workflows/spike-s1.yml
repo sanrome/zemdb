@@ -8,12 +8,13 @@ on:
   workflow_dispatch:
 
 env:
-  FIREFOX_TESTS: info,s1q1,matrix,s1q2,s5q1a,s5q1rej,s5q1b,q3,q4,q6,q2,q5
+  FIREFOX_TESTS: info,s5q1b,s5q1m,s5q1a,q4
   SAFARI_TESTS: info,opfs_normal_mark,s1q1,matrix,s1q2,s5q1a,s5q1rej,s5q1b,q3,q4,q6,q2,zstd,q5,safaridriver
   ITERS: "20"
 
 jobs:
   firefox:
+    if: ${{ !contains(github.event.head_commit.message, '[safari-only]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 80
     steps:
@@ -36,6 +37,7 @@ jobs:
         run: python3 digest.py "$RUNNER_TEMP/res"
 
   safari:
+    if: ${{ !contains(github.event.head_commit.message, '[firefox-only]') }}
     runs-on: macos-latest
     timeout-minutes: 110
     steps:

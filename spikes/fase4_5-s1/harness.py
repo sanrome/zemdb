@@ -577,7 +577,7 @@ class Driver:
         r2 = self.run('s1q2check', {'dir': dirn}, 60)
         self.save('s1q2', {'beforeKill': r1, 'afterKill': r2})
 
-    def series_once(self, dirn, cycles, kinds, kill_after_last=False, kill_at=None):
+    def series_once(self, dirn, cycles, kinds, kill_after_last=False, kill_at=None, recheck=False):
         """One series; killed by the page (kill_after_last), at `kill_at` s after its setup, or
         never; then the profile reopened and the directory checked."""
         args = {'dir': dirn, 'cycles': cycles, 'kinds': kinds, 'killAfterLast': kill_after_last}
@@ -610,7 +610,14 @@ class Driver:
         state = chk['results'][0] if chk['results'] else None
         if state is None:
             return {**info, 'error': 'no check', 'check': chk}
-        return {**info, **analyze_series(cycles, kinds, reported, state)}
+        out = {**info, **analyze_series(cycles, kinds, reported, state)}
+        if recheck:
+            chk2 = self.run('checkSeries', {'dir': dirn}, 120)
+            state2 = chk2['results'][0] if chk2['results'] else None
+            out['recheckSameState'] = state2 == state
+            if state2 != state:
+                out['recheck'] = analyze_series(cycles, kinds, reported, state2) if state2 else chk2
+        return out
 
     def t_s5q1a(self, reps=3):
         rows = []
@@ -624,19 +631,23 @@ class Driver:
                 print('S5Q1a', json.dumps({k: r.get(k) for k in ('variant', 'reportedMax', 'visiblePrefix', 'nonPrefixCount', 'reportedButNotVisibleCount', 'targetValid', 'targetGen', 'anomalies')}), flush=True)
         self.save('s5q1a', rows)
 
-    def t_s5q1b(self, iters=20, cycles=300):
-        kinds = ['tmpCreate', 'tmpWritten', 'move', 'createFile', 'createDir', 'remove']
-        cal = self.series_once(f's5b-cal-{uuid.uuid4().hex[:4]}', cycles, kinds)
+    def t_s5q1m(self, iters=20):
+        """Moves only (temp, flush, move over the target): a series of 600 moves, killed at random."""
+        self.t_s5q1b(iters, cycles=600, kinds=['tmpCreate', 'tmpWritten', 'move'], key='s5q1m')
+
+    def t_s5q1b(self, iters=20, cycles=300, kinds=None, key='s5q1b'):
+        kinds = kinds or ['tmpCreate', 'tmpWritten', 'move', 'createFile', 'createDir', 'remove']
+        cal = self.series_once(f'{key}-cal-{uuid.uuid4().hex[:4]}', cycles, kinds)
         fin = cal.get('finished') or {}
         series_ms = fin.get('ms') or 5000
         rows = []
         for it in range(iters):
             kill_at = random.uniform(0.02, 0.95) * series_ms / 1000
-            r = self.series_once(f's5b-{it}-{uuid.uuid4().hex[:4]}', cycles, kinds, kill_at=kill_at)
+            r = self.series_once(f'{key}-{it}-{uuid.uuid4().hex[:4]}', cycles, kinds, kill_at=kill_at, recheck=True)
             r['iter'] = it
             rows.append(r)
-            print('S5Q1b', json.dumps({k: v for k, v in r.items() if k != 'visible'})[:800], flush=True)
-        self.save('s5q1b', {'calibration': {k: v for k, v in cal.items() if k != 'visible'}, 'seriesMs': series_ms, 'rows': rows})
+            print('S5Q1b', json.dumps({k: v for k, v in r.items() if k not in ('visible', 'raw')})[:800], flush=True)
+        self.save(key, {'calibration': cal, 'seriesMs': series_ms, 'rows': rows})
 
     def t_s5q1rej(self):
         dirn = f's5rej-{uuid.uuid4().hex[:6]}'
@@ -761,11 +772,30 @@ def analyze_series(cycles, kinds, reported, state):
     if 'flushNoClose' in kinds and flgen is None:
         anomalies.append({'fl': state.get('fl')})
     partial_temps = [n for n, e in state.items() if n.startswith('t_') and not ((e.get('gen') or {}).get('valid'))]
+    # Per kind: how many of its operations are visible from the start, and whether they form a prefix.
+    per_kind = {}
+    for kind in kinds:
+        vk = [vis(kind, i) for i in range(1, cycles + 1)]
+        pk = next((j for j, v in enumerate(vk) if not v), len(vk))
+        per_kind[kind] = {'prefix': pk, 'visible': sum(1 for v in vk if v), 'isPrefix': not any(vk[pk:])}
+
+    def idx(prefix, pred):
+        return sorted(int(n[len(prefix):]) for n, e in state.items() if n.startswith(prefix) and n[len(prefix):].isdigit() and pred(e))
+    raw = {'target': tgt or None, 'temps': {n: {'size': e.get('size'), **(e.get('gen') or {})} for n, e in state.items() if n.startswith('t_')},
+           'files': (lambda xs: {'count': len(xs), 'max': xs[-1] if xs else 0})(idx('f_', lambda e: True)),
+           'dirs': (lambda xs: {'count': len(xs), 'max': xs[-1] if xs else 0})(idx('d_', lambda e: True)),
+           'removeFilesLeft': (lambda xs: {'count': len(xs), 'min': xs[0] if xs else None})(idx('r_', lambda e: True)),
+           'others': sorted(n for n in state if not (n == 'target' or n == 'fl' or n[:2] in ('t_', 'f_', 'd_', 'r_')))}
+    last = None
+    if reported:
+        k, i = ops[max(reported) - 1]
+        last = {'seq': max(reported), 'kind': k, 'i': i}
     return {'opsTotal': len(ops), 'visiblePrefix': prefix, 'nonPrefixVisible': non_prefix[:20],
             'nonPrefixCount': len(non_prefix), 'reportedButNotVisible': missing[:20], 'reportedButNotVisibleCount': len(missing),
             'targetValid': tgen is not None, 'targetGen': tgen, 'target': tgt, 'anomalies': anomalies[:20],
             'tempsWithIncompleteContent': partial_temps, 'entries': len(state),
-            'inFlightVisible': max(0, prefix - (max(reported) if reported else 0))}
+            'inFlightVisible': max(0, prefix - (max(reported) if reported else 0)),
+            'perKind': per_kind, 'raw': raw, 'lastReported': last}
 
 
 # What the directory of the rejections must hold if no rejected operation had an effect.
@@ -941,6 +971,8 @@ def main():
                 drv.t_q2(a.iters)
             elif t == 's5q1b':
                 drv.t_s5q1b(a.iters)
+            elif t == 's5q1m':
+                drv.t_s5q1m(a.iters)
             else:
                 getattr(drv, f't_{t}')()
         except Exception as e:  # noqa: BLE001
