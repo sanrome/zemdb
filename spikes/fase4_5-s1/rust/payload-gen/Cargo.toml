@@ -1,0 +1,20 @@
+# The native side of DC9's ruzstd encoder measurement: writes the payload (the uncompressed
+# Bincode of a DiskStorageEngine snapshot of 756,000 rows) and the native envelope, and checks
+# that native zstd decodes the browser's envelopes to the same bytes. Never merged.
+[package]
+name = "payload-gen"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+zemdb-core = { path = "../../../../crates/core" }
+zemdb-storage = { path = "../../../../crates/storage" }
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros"] }
+tempfile = "3.10"
+crc32fast = "1.4"
+
+[profile.release]
+opt-level = 3
+
+[workspace]

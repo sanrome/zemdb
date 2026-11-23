@@ -1,0 +1,21 @@
+# DC9's ruzstd encoder measurement, rebuilt for the Paso S1 of Fase 4.5: a cdylib for
+# wasm32-unknown-unknown without wasm-bindgen, with plain `extern "C"` exports, that calls
+# zemdb-storage's snapshot-envelope encoding (ruzstd `Fastest` in wasm32). Never merged.
+[package]
+name = "zstd-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zemdb-storage = { path = "../../../../crates/storage" }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
+
+[workspace]

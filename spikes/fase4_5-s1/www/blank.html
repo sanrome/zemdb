@@ -1,0 +1,12 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>foreground tab</title>
+<body><pre id="out">This tab is in front, so the test's tab is in the background.</pre>
+<script>
+  // Closes itself after ?closeAfter= ms (a tab opened by script, or with one history entry).
+  const ms = Number(new URLSearchParams(location.search).get('closeAfter') || 0);
+  const token = new URLSearchParams(location.search).get('token');
+  const log = o => fetch('/log', { method: 'POST', body: JSON.stringify({ token, who: 'blank', t: Date.now(), ...o }) });
+  log({ event: 'blank-open', vis: document.visibilityState });
+  if (ms) setTimeout(() => { log({ event: 'blank-closing' }); setTimeout(() => window.close(), 200); }, ms);
+</script>

@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>prerendered</title>
+<body><pre id="out">prerendered page</pre>
+<script type="module">
+  // Chromium only: when does a page prerendered by speculation rules get its Web Locks, from
+  // the page and from its dedicated worker? Logs each step with document.prerendering.
+  const token = new URLSearchParams(location.search).get('token');
+  const t0 = Date.now();
+  const log = o => fetch('/log', { method: 'POST', body: JSON.stringify({ token, who: 'prerendered', t: Date.now(),
+    prerendering: document.prerendering, vis: document.visibilityState, sinceLoadMs: Date.now() - t0, ...o }) });
+  log({ event: 'pr-start', wasPrerendered: document.prerendering });
+  let activatedAt = document.prerendering ? null : Date.now();
+  document.addEventListener('prerenderingchange', () => { activatedAt = Date.now(); log({ event: 'pr-activated' }); });
+  log({ event: 'pr-lock-requested', where: 'page' });
+  navigator.locks.request(`pr-${token}-page`, () => { log({ event: 'pr-lock-granted', where: 'page', beforeActivation: activatedAt === null }); });
+  navigator.locks.request(`pr-${token}-ifavail`, { ifAvailable: true }, l => { log({ event: 'pr-lock-granted', where: 'page-ifAvailable', lockIsNull: l === null, beforeActivation: activatedAt === null }); });
+  const src = `const tk=${JSON.stringify(token)};
+    const log = o => fetch('/log', { method: 'POST', body: JSON.stringify({ token: tk, who: 'prerendered.w', t: Date.now(), ...o }) });
+    log({ event: 'pr-worker-start' });
+    navigator.locks.request('pr-' + tk + '-worker', () => { log({ event: 'pr-lock-granted', where: 'worker' }); postMessage('granted'); });
+    navigator.storage.getDirectory().then(() => log({ event: 'pr-opfs-ok', where: 'worker' }), e => log({ event: 'pr-opfs-err', where: 'worker', name: e.name }));`;
+  try {
+    const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+    w.onmessage = () => log({ event: 'pr-worker-granted-seen-by-page', beforeActivation: activatedAt === null });
+    log({ event: 'pr-worker-created' });
+  } catch (e) { log({ event: 'pr-worker-error', name: e.name, message: e.message }); }
+  setTimeout(async function wait() {
+    if (activatedAt === null) { setTimeout(wait, 200); return; }
+    setTimeout(() => log({ event: 'done' }), 2000);
+  }, 200);
+</script>

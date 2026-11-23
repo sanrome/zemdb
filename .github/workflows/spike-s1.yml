@@ -1,0 +1,72 @@
+# Paso S1 of Fase 4.5: the browser spikes (S1 in Firefox, the error matrix, S3, S5, and DC9's
+# ruzstd encoder in Safari). Spike code on the session branch only, never merged to main.
+name: spike-s1
+
+on:
+  push:
+    branches: [claude/awesome-clarke-qkzvn2]
+  workflow_dispatch:
+
+env:
+  FIREFOX_TESTS: info,s1q1,matrix,s1q2,s5q1a,s5q1rej,s5q1b,q3,q4,q6,q2,q5
+  SAFARI_TESTS: info,opfs_normal_mark,s1q1,matrix,s1q2,s5q1a,s5q1rej,s5q1b,q3,q4,q6,q2,zstd,q5,safaridriver
+  ITERS: "3"
+
+jobs:
+  firefox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    steps:
+      - uses: actions/checkout@v4
+      - name: Environment
+        run: |
+          set -x
+          which firefox; readlink -f "$(which firefox)"; firefox --version || true
+          snap list 2>/dev/null | grep -i firefox || true
+          lscpu | grep -E 'Model name|^CPU\(s\)'; free -g; head -2 /etc/os-release; python3 --version
+      - name: Run the spikes in Firefox
+        working-directory: spikes/fase4_5-s1
+        run: |
+          xvfb-run -a -s "-screen 0 1280x900x24" python3 harness.py --browser firefox \
+            --binary "$(readlink -f "$(which firefox)")" --out "$RUNNER_TEMP/res" \
+            --tests "$FIREFOX_TESTS" --iters "$ITERS" 2>&1 | grep -v '^EV ' | cut -c1-3000
+      - name: Results
+        if: always()
+        working-directory: spikes/fase4_5-s1
+        run: python3 digest.py "$RUNNER_TEMP/res" --blob
+
+  safari:
+    runs-on: macos-latest
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Environment
+        run: |
+          set -x
+          sysctl -n machdep.cpu.brand_string; sysctl -n hw.ncpu; sysctl -n hw.memsize; sw_vers
+          defaults read /Applications/Safari.app/Contents/Info.plist CFBundleShortVersionString
+          defaults read /Applications/Safari.app/Contents/Info.plist CFBundleVersion
+          python3 --version; rustc --version
+      - name: Build the payload generator
+        working-directory: spikes/fase4_5-s1/rust/payload-gen
+        run: CARGO_INCREMENTAL=0 cargo build --release
+      - name: Generate the payload
+        run: spikes/fase4_5-s1/rust/payload-gen/target/release/payload-gen gen "$RUNNER_TEMP/payload"
+      - name: Enable safaridriver
+        run: sudo safaridriver --enable
+      - name: Run the spikes in Safari
+        working-directory: spikes/fase4_5-s1
+        run: |
+          python3 harness.py --browser safari --out "$RUNNER_TEMP/res" --payload-dir "$RUNNER_TEMP/payload" \
+            --tests "$SAFARI_TESTS" --iters "$ITERS" 2>&1 | grep -v '^EV ' | cut -c1-3000
+      - name: Native zstd decodes the browser's envelopes
+        if: always()
+        run: |
+          ls -la "$RUNNER_TEMP/res/uploads" || true
+          spikes/fase4_5-s1/rust/payload-gen/target/release/payload-gen verify \
+            "$RUNNER_TEMP/payload/payload.bin" "$RUNNER_TEMP"/res/uploads/*.zmsn || true
+      - name: Results
+        if: always()
+        working-directory: spikes/fase4_5-s1
+        run: python3 digest.py "$RUNNER_TEMP/res" --blob
