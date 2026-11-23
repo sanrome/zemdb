@@ -10,7 +10,7 @@ on:
 env:
   FIREFOX_TESTS: info,s1q1,matrix,s1q2,s5q1a,s5q1rej,s5q1b,q3,q4,q6,q2,q5
   SAFARI_TESTS: info,opfs_normal_mark,s1q1,matrix,s1q2,s5q1a,s5q1rej,s5q1b,q3,q4,q6,q2,zstd,q5,safaridriver
-  ITERS: "3"
+  ITERS: "20"
 
 jobs:
   firefox:
@@ -29,11 +29,11 @@ jobs:
         run: |
           xvfb-run -a -s "-screen 0 1280x900x24" python3 harness.py --browser firefox \
             --binary "$(readlink -f "$(which firefox)")" --out "$RUNNER_TEMP/res" \
-            --tests "$FIREFOX_TESTS" --iters "$ITERS" 2>&1 | grep -v '^EV ' | cut -c1-3000
+            --tests "$FIREFOX_TESTS" --iters "$ITERS" 2>&1 | grep -E '^(===|server on|Traceback|  File|[A-Za-z]*Error)' | cut -c1-400
       - name: Results
         if: always()
         working-directory: spikes/fase4_5-s1
-        run: python3 digest.py "$RUNNER_TEMP/res" --blob
+        run: python3 digest.py "$RUNNER_TEMP/res"
 
   safari:
     runs-on: macos-latest
@@ -59,7 +59,7 @@ jobs:
         working-directory: spikes/fase4_5-s1
         run: |
           python3 harness.py --browser safari --out "$RUNNER_TEMP/res" --payload-dir "$RUNNER_TEMP/payload" \
-            --tests "$SAFARI_TESTS" --iters "$ITERS" 2>&1 | grep -v '^EV ' | cut -c1-3000
+            --tests "$SAFARI_TESTS" --iters "$ITERS" 2>&1 | grep -E '^(===|server on|SCREENSHOT|Traceback|  File|[A-Za-z]*Error)' | cut -c1-400
       - name: Native zstd decodes the browser's envelopes
         if: always()
         run: |
@@ -69,4 +69,4 @@ jobs:
       - name: Results
         if: always()
         working-directory: spikes/fase4_5-s1
-        run: python3 digest.py "$RUNNER_TEMP/res" --blob
+        run: python3 digest.py "$RUNNER_TEMP/res"

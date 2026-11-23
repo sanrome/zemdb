@@ -291,6 +291,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             elif mode == 'flood':
                 state = {'sent': 0, 'done': False}
                 port = HUB.port
+                cport = self.client_address[1]
+
+                def queues():
+                    # Only the flood's connection: the lines that name its client port.
+                    hexp = f':{cport:04X}'
+                    return [l for l in sock_queues(port) if hexp in l or f'.{cport} ' in l]
 
                 def monitor():
                     last, since, stalled = -1, time.time(), False
@@ -307,7 +313,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                         elif not stalled and time.time() - since >= 2.0:
                             stalled = True
                             HUB.add({'event': 'flood-stall', 'id': sid, 't': now_ms(), 'stalledSinceMs': since * 1000,
-                                     'sentAtStall': s, 'queues': sock_queues(port)})
+                                     'sentAtStall': s, 'clientPort': cport, 'queues': queues()})
                     HUB.add({'event': 'flood-samples', 'id': sid, 'samples': samples[::5]})
                 threading.Thread(target=monitor, daemon=True).start()
                 block = b'x' * 65536
@@ -406,6 +412,7 @@ class Browser:
                     '--disable-search-engine-choice-screen']
             if self.cdp:
                 args += ['--remote-debugging-port=0', '--remote-allow-origins=*']
+            args += getattr(self, 'extra', [])
             if not os.environ.get('DISPLAY'):
                 args.append('--headless=new')
             args.append(url)
@@ -535,8 +542,10 @@ class Driver:
         if not keep:
             self.b.kill()
         HUB.finish(token)
+        how = [{'popupWorks': e.get('popupWorks'), 'driverOpenWorks': e.get('driverOpenWorks')} for e in HUB.of_token(token, 'result')
+               if 'popupWorks' in e or 'driverOpenWorks' in e]
         return {'token': token, 'ended': ev.get('event') if ev else 'timeout', 'secs': round(time.time() - t0, 1),
-                'results': results, 'errors': errors}
+                'results': results, 'errors': errors, 'how': how}
 
     # --- the tests -------------------------------------------------------------------
     def t_info(self):
@@ -652,6 +661,34 @@ class Driver:
         r = self.run('q4', {}, 180)
         server = [e for e in HUB.events if str(e.get('id', '')).startswith(r['token']) and e.get('event') != 'flood-samples']
         self.save('q4', {'page': r, 'server': server})
+
+    def t_q4h2(self):
+        """Chromium only: question 4 over HTTP/2 (node:http2, a self-signed certificate)."""
+        d = os.path.join(HUB.out_dir, 'h2cert')
+        os.makedirs(d, exist_ok=True)
+        cert, key = os.path.join(d, 'cert.pem'), os.path.join(d, 'key.pem')
+        subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', key, '-out', cert, '-days', '2',
+                        '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost'], capture_output=True, check=True)
+        with socket.socket() as so:
+            so.bind(('127.0.0.1', 0))
+            h2port = so.getsockname()[1]
+        p = subprocess.Popen([os.environ.get('NODE', 'node'), os.path.join(HERE, 'h2server.mjs'), str(HUB.port), str(h2port), cert, key],
+                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        print(p.stdout.readline().strip(), flush=True)
+        self.b.extra = ['--ignore-certificate-errors']
+        token = HUB.new_token('q4', {})
+        try:
+            self.b.launch(f'https://localhost:{h2port}/run.html?token={token}')
+            ev = HUB.wait(lambda e: e.get('token') == token and e.get('event') == 'done', 180)
+        finally:
+            self.b.kill()
+            self.b.extra = []
+            p.kill()
+        HUB.finish(token)
+        r = {'token': token, 'ended': ev and ev.get('event'), 'results': [e.get('result') for e in HUB.of_token(token, 'result')],
+             'errors': HUB.of_token(token, 'error')}
+        server = [e for e in HUB.events if str(e.get('id', '')).startswith(token)]
+        self.save('q4h2', {'page': r, 'server': server})
 
     def t_q5(self, visible_ms=60000, hidden_ms=390000):
         total = visible_ms + hidden_ms + 30000
@@ -798,7 +835,8 @@ def summarize_q2(r):
         if row.get('error'):
             m['errors'] += 1
         m['landedAtGrant'].append(row.get('landedAtGrant'))
-    return {'run': {k: r[k] for k in ('token', 'ended', 'secs', 'errors')}, 'byMode': by, 'inflight': inf, 'rawRows': rows,
+    return {'run': {k: r[k] for k in ('token', 'ended', 'secs', 'errors', 'how')}, 'ended': r['ended'], 'secs': r['secs'],
+            'errors': r['errors'], 'how': r['how'], 'byMode': by, 'inflight': inf, 'rawRows': rows,
             'rawInflight': res.get('inflight')}
 
 

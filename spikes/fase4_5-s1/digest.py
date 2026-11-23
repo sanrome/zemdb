@@ -16,8 +16,8 @@ import sys
 def err(v):
     if not isinstance(v, dict):
         return str(v)
-    if 'ok' in v:
-        return 'ok' if v['ok'] else f"{v['err']['name']}"
+    if 'ok' in v and ('err' in v or v['ok'] is True):
+        return 'ok' if v['ok'] is True else f"{v['err']['name']}"
     return json.dumps(v)[:200]
 
 
@@ -27,9 +27,13 @@ def main():
     P = lambda *a: print('D', *a)  # noqa: E731
     env = s.get('env', {})
     P('env', env.get('browser'), env.get('version'), env.get('uname'), 'display', env.get('display'))
-    for k in s:
+    for k, v in s.items():
         if k.endswith('-exception'):
-            P('EXCEPTION', k, s[k])
+            P('EXCEPTION', k, v)
+        elif isinstance(v, dict) and 'ended' in v:
+            P('ended', k, v.get('ended'), v.get('secs'), 'errors', len(v.get('errors') or []), 'how', v.get('how'))
+        elif isinstance(v, dict) and isinstance(v.get('page'), dict):
+            P('ended', k, v['page'].get('ended'), v['page'].get('secs'), 'errors', len(v['page'].get('errors') or []), 'how', v['page'].get('how'))
     if 'info' in s:
         r = (s['info'].get('results') or [{}])[0] or {}
         pg, w = r.get('page', {}), r.get('worker', {})
@@ -60,7 +64,7 @@ def main():
         for k, v in (r.get('local') or {}).items():
             if k.endswith('_after') or k.endswith('after'):
                 P(f'matrix {k}: {json.dumps(v)[:300]}')
-            elif isinstance(v, dict) and 'ok' in v:
+            elif isinstance(v, dict) and 'ok' in v and 'ms' in v:
                 extra = ''
                 if 'after' in v:
                     extra = ' after=' + json.dumps(v['after'])[:200]
@@ -121,13 +125,20 @@ def main():
         P('q2 run', r.get('run'))
         for m, v in (r.get('byMode') or {}).items():
             P(f'q2 {m}: iters {v["iters"]} itersWithTakenHandles {v["itersWithTakenHandles"]} handlesTaken {v["handlesTaken"]} errors {v["errors"]} handoverMs {v["handoverMs"]} kinds {v["kinds"]} problems {v["problems"][:3]}')
+        shown = {}
         for row in r.get('rawRows') or []:
-            if row.get('failures'):
-                P(f"q2 row {row['mode']} {row['i']}: taken {row['failures']} retry {json.dumps(row.get('retry'))[:200]}")
+            if row.get('failures') and shown.get(row['mode'], 0) < 6:
+                shown[row['mode']] = shown.get(row['mode'], 0) + 1
+                P(f"q2 row {row['mode']} {row['i']}: taken {row['failures']} handoverMs {row.get('handoverMs')} retry {json.dumps(row.get('retry'))[:200]}")
+        for m in sorted({row['mode'] for row in r.get('rawRows') or []}):
+            frees = [row['retry'][-1]['afterMs'] for row in r['rawRows'] if row['mode'] == m and row.get('retry') and row['retry'][-1]['stillTaken'] == 0]
+            P(f'q2 {m}: all handles free after (ms since grant) {sorted(frees)}')
         for m, v in (r.get('inflight') or {}).items():
             P(f'q2 inflight {m}: iters {v["iters"]} itersWithChangesAfterGrant {v["itersWithChangesAfterGrant"]} errors {v["errors"]}')
         for row in r.get('rawInflight') or []:
             ch = row.get('changesAfterGrant') or []
+            if not ch and not row.get('error'):
+                continue
             P(f"q2 inflight row {row['mode']} {row['i']}: kind {row.get('aKind')} atGrant {row.get('landedAtGrant')} changes {[(c['atMs'], sum(1 for n in c['names'] if n.startswith('F:mv_')), sum(1 for n in c['names'] if n.startswith('F:r_'))) for c in ch]} lists {row.get('lists')} {row.get('error') or ''}")
     if 'q3' in s:
         r = (s['q3'].get('results') or [{}])[0] or {}
@@ -148,6 +159,18 @@ def main():
                 P('q4 server', json.dumps({k: v for k, v in e.items() if k != 'perChunk'})[:900])
         for e in s['q4']['page'].get('errors', []):
             P('q4 ERROR', json.dumps(e)[:400])
+    if 'q4h2' in s:
+        r = (s['q4h2']['page'].get('results') or [{}])[0] or {}
+        for k in ('timed', 'timedSmall'):
+            t = r.get(k) or {}
+            P(f'q4h2 {k}: proto {t.get("httpVersion")} reads {t.get("reads")} chunks {t.get("chunks")} lagMs {[c["lagMs"] for c in t.get("perChunk", [])]}')
+        P('q4h2 abort', json.dumps(r.get('abort')))
+        P('q4h2 flood', json.dumps(r.get('flood')))
+        for e in s['q4h2'].get('server', []):
+            if e.get('event') != 'stream-sent':
+                P('q4h2 server', json.dumps({k: v for k, v in e.items() if k != 'perChunk'})[:900])
+        for e in s['q4h2']['page'].get('errors', []):
+            P('q4h2 ERROR', json.dumps(e)[:400])
     if 'q5' in s:
         r = s['q5']
         P('q5 ended', r['page'].get('ended'), 'result', r['page'].get('results'))
