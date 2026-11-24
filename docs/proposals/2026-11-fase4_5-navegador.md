@@ -2,7 +2,7 @@
 
 **Fecha:** 19 de Noviembre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: Lote 1 (el arnés del navegador) hecho el 23 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda; el paso S1, en curso. Lote 0 (el contrato) cerrado el 23 de Noviembre de 2026, con la revisión cruzada en verde en su sexta ronda y DC46 en su principio, con su protocolo para el paso D (§1.3). El dueño del proyecto adoptó DC40 y DC43 el 22 de Noviembre de 2026, y eligió ese día la pestaña líder para DC41, de donde sale DC46; adoptó las demás el 23 (DC46, en su principio: su protocolo, en el paso D). La CI de `main`, en verde sobre `91850bf`.
+**Estado:** En curso: el paso S1 (los spikes) hecho el 23 de Noviembre de 2026, en Chromium, Firefox y Safari (§1.2.1): revisa DC39 (un `move()` sobre un archivo existente no es atómico en Firefox) y DC41 (el Web Lock llega antes de que se suelten los handles), las dos adoptadas por el dueño del proyecto el 24 de Noviembre de 2026, y suma notas en DC40, DC44, DC45 y DC46. Lote 1 (el arnés del navegador) hecho el 23 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda; la CI de `main`, en verde sobre `27e7320`. Lote 0 (el contrato) cerrado el 23 de Noviembre de 2026, con la revisión cruzada en verde en su sexta ronda y DC46 en su principio, con su protocolo para el paso D (§1.3). El dueño del proyecto adoptó DC40 y DC43 el 22 de Noviembre de 2026, y eligió ese día la pestaña líder para DC41, de donde sale DC46; adoptó las demás el 23 (DC46, en su principio: su protocolo, en el paso D).
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.5. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Parte de:** el núcleo de 4.2 ([plan](2026-10-fase4_2-nucleo-replica.md)), el worker y el transporte de 4.3 ([plan](2026-11-fase4_3-transporte-worker.md)), la fachada de 4.4 ([plan](2026-11-fase4_4-api-rust.md)) y la capa de archivos de 4.1 (DC17, [plan](2026-10-fase4_1-storage-servidor.md)). Depende de 4.3, que cerró el 19 de Noviembre de 2026 con sus Lotes 11b y 11c (`496da6c`), mientras se escribía este plan: ningún lote de 4.5 la espera.
@@ -21,7 +21,7 @@
   - los metadatos durables antes de servirse (DEF-189, INV-K16);
   - las pruebas en navegadores headless, con el criterio de aceptación: la réplica sobrevive a recargar la página.
 - **Dónde.** En `zemdb-storage` (la capa del OPFS y el motor en disco en wasm32) y en `zemdb-client` (lo demás), los dos en el alcance auditado: cada lote, con su revisión de delta. Las pruebas del navegador, en un arnés nuevo (`tools/browser/`, DC44), con su job de la CI. El servidor no cambia.
-- **El modelo de amenaza.** No cambia de forma: DC11 ya pone en el alcance el navegador, el origen como la aplicación y la concurrencia entre pestañas, y en (3) extiende al OPFS el supuesto del disco. §2 de `INVARIANTES.md` precisa ese supuesto (lo que en el OPFS hace las veces de sincronizar un directorio: `move()`, crear y borrar entradas) y lo que el SDK le pide al navegador para coordinar las pestañas (los Web Locks, su cola y los handles exclusivos, y el `BroadcastChannel` entre ellas), como §2 ya confía en el sistema operativo para `flock`; dice que las demás pestañas del origen, que usan el SDK a través de la líder, también son la aplicación; y dice dónde está el `CryptoEngine` en el navegador. Por eso no pide una auditoría amplia (§1.4): las garantías nuevas se auditan en la revisión de cierre (§3). Si el dueño del proyecto lo ve como un cambio del modelo, la revisión de cierre se hace con el método de una auditoría amplia.
+- **El modelo de amenaza.** No cambia de forma: DC11 ya pone en el alcance el navegador, el origen como la aplicación y la concurrencia entre pestañas, y en (3) extiende al OPFS el supuesto del disco. §2 de `INVARIANTES.md` precisa ese supuesto (lo que en el OPFS hace las veces de sincronizar un directorio: un `move()` a un nombre libre, y crear y borrar entradas) y lo que el SDK le pide al navegador para coordinar las pestañas (los Web Locks, su cola y los handles exclusivos, y el `BroadcastChannel` entre ellas), como §2 ya confía en el sistema operativo para `flock`; dice que las demás pestañas del origen, que usan el SDK a través de la líder, también son la aplicación; y dice dónde está el `CryptoEngine` en el navegador. Por eso no pide una auditoría amplia (§1.4): las garantías nuevas se auditan en la revisión de cierre (§3). Si el dueño del proyecto lo ve como un cambio del modelo, la revisión de cierre se hace con el método de una auditoría amplia.
 - **Qué no.** El paquete de TypeScript, el codec de objetos de JavaScript con las representaciones de DC14 (INV-K14), `persist()` desde la página, Vite y la app de referencia en el navegador (4.6); CORS en el servidor; un lock por sala; un `CryptoEngine` en JavaScript cargado en el Worker; partir en pasos el trabajo de CPU largo del Worker (todo eso, al backlog si hace falta).
 - **Decisiones nuevas:** DC38 a DC46 (§1), adoptadas por el dueño del proyecto: DC40 y DC43 el 22 de Noviembre de 2026, y las demás el 23 (DC46, en su principio: su protocolo, en el paso D). Precisan decisiones de la fase:
   - DC8 y DC17 (la implementación del OPFS, DC39; la coordinación entre pestañas, DC41 y DC46);
@@ -30,7 +30,7 @@
   - DC14 y DC18 (el enum de comandos, DC42, con las demás pestañas, DC46);
   - DC32 (un error nuevo, `InUse`, DC41; los errores de las demás pestañas, en el paso D de DC46);
   - DC34 (en el navegador, el `CryptoEngine` es el del SDK, con las claves de la aplicación, DC43).
-- **Spikes:** S1 en Firefox (DC8) y S3 en Safari y Firefox (DC17), pendientes de 4.0 y 4.1, y S5, nuevo (§1.2). Los de Safari y Firefox necesitan la Mac del dueño del proyecto o un runner de macOS: §1.2 dice cuándo.
+- **Spikes:** S1 en Firefox (DC8) y S3 en Safari y Firefox (DC17), pendientes de 4.0 y 4.1, y S5, nuevo (§1.2). Los respondió el paso S1, con Firefox en un runner de `ubuntu-latest` y Safari en uno de `macos-latest` (§1.2.1), y revisaron DC39 y DC41.
 - **Cómo cierra:** con una revisión de cierre (`docs/METODOLOGIA.md` §6), con tres revisores (§3), con las pruebas del navegador en verde en Chromium en la CI y la página de aceptación corrida en Safari y Firefox.
 
 ---
@@ -42,14 +42,14 @@ Las de la fase que implementa esta sub-fase: DC8 (el OPFS), DC9 (`ruzstd` para e
 | ID | Decisión | Lotes | Estado |
 |---|---|---|---|
 | **DC38** | La feature `wasm` y el runtime del cliente: tareas, plazos, reloj, azar y hora del navegador, sin `Send` en wasm32 | 2, 4, 7, 8 | Adoptada (23 de Noviembre de 2026) |
-| **DC39** | El motor del navegador: `DiskStorageEngine` sobre `OpfsFiles`, una capa de archivos del OPFS | 2, 3, 4, 8 | Adoptada (23 de Noviembre de 2026), con la condición de S1 en Firefox, S3 en Safari y Firefox y la pregunta 1 de S5 (§1.2) |
+| **DC39** | El motor del navegador: `DiskStorageEngine` sobre `OpfsFiles`, una capa de archivos del OPFS | 2, 3, 4, 8 | Adoptada (23 de Noviembre de 2026); revisada con el paso S1 (§1.2.1): las generaciones, adoptadas el 24 de Noviembre de 2026 |
 | **DC40** | El transporte del navegador: `fetch`, también para el stream de eventos, con el tope de lo que lee y de sus streams | 9 | Adoptada (22 de Noviembre de 2026) |
-| **DC41** | Una pestaña líder por directorio del cliente, con un Web Lock, y el Worker que la página termina en `pagehide` | 10, 12, 15 | Adoptada (23 de Noviembre de 2026); la pestaña líder, elegida el 22; con la pregunta 2 de S5 |
+| **DC41** | Una pestaña líder por directorio del cliente, con un Web Lock, y el Worker que la página termina en `pagehide` | 10, 12, 15 | Adoptada (23 de Noviembre de 2026); la pestaña líder, elegida el 22; revisada con el paso S1 (§1.2.1): la espera de los handles después del lock, adoptada el 24 de Noviembre de 2026 |
 | **DC42** | El runtime del Worker: un despachador de comandos serializables, y su punto de entrada con un codec intercambiable | 6, 12 | Adoptada (23 de Noviembre de 2026) |
 | **DC43** | Las claves en el Worker: un `CryptoEngine` del SDK sobre WebCrypto, AES-GCM con un `CryptoKey` por sala | 11, 12 | Adoptada (22 de Noviembre de 2026) |
 | **DC44** | Las pruebas en el navegador: el arnés, la página que se recarga sola, Playwright, los tests unitarios en wasm32 y la CI | 1, 3, 15 | Adoptada (23 de Noviembre de 2026), con Safari en un runner de macOS (§1.2) |
-| **DC45** | DEF-189: los metadatos, durables antes de servirse | 2, 5, 8 | Adoptada (23 de Noviembre de 2026), con la pregunta 1 de S5 |
-| **DC46** | Las demás pestañas: usan el SDK a través de la pestaña líder, por un `BroadcastChannel`, con el relevo cuando la líder se va | 6, 13, 14, 15 | Adoptada en su principio (23 de Noviembre de 2026); su protocolo, en el paso D, con la pregunta 6 de S5 |
+| **DC45** | DEF-189: los metadatos, durables antes de servirse | 2, 5, 8 | Adoptada (23 de Noviembre de 2026); S5 (1), respondida (§1.2.1) |
+| **DC46** | Las demás pestañas: usan el SDK a través de la pestaña líder, por un `BroadcastChannel`, con el relevo cuando la líder se va | 6, 13, 14, 15 | Adoptada en su principio (23 de Noviembre de 2026); su protocolo, en el paso D, con S5 (6) respondida (§1.2.1) |
 
 ### DC38 · La feature `wasm` y el runtime del cliente
 - **La feature.** `wasm` compila en wasm32 el cliente entero (el núcleo, el worker, la fachada y los metadatos sobre la capa de archivos), con `wasm-bindgen`, `wasm-bindgen-futures`, `js-sys` y `web-sys`. `native` sigue por defecto y solo tiene efecto fuera de wasm32; `wasm`, solo en wasm32. Sin `wasm`, en wasm32, el crate sigue vacío, como hoy. La CI suma `cargo check --target wasm32-unknown-unknown -p zemdb-client --no-default-features --features wasm` (§4.5 del plan de la fase) y su clippy, en el job de WebAssembly.
@@ -80,23 +80,57 @@ Las de la fase que implementa esta sub-fase: DC8 (el OPFS), DC9 (`ruzstd` para e
 - **Los bindings.** `web-sys` no trae `move()` de un archivo, y trae `navigator.locks` solo con `--cfg=web_sys_unstable_apis`, que obligaría a todo el que compile el crate: lo que falte va con bindings propios (`#[wasm_bindgen] extern`), que compilan con `forbid(unsafe_code)`.
 - **La raíz:** el directorio del OPFS del origen (`navigator.storage.getDirectory()`, en el Worker), y bajo él las rutas que usa el motor, separadas por `/`: el `data_dir` del motor es un directorio relativo a esa raíz. Una ruta con `..`, o que sale de la raíz, se rechaza. Los metadatos del cliente (`FileMetadata`) van en el mismo directorio que el motor, como en nativo (§11 de `ARCHITECTURE.md`).
 - **Los archivos:** un `FileSystemSyncAccessHandle` por archivo abierto, en el modo por defecto (`readwrite`), exclusivo también para leer: es el único modo de Safari, y Chrome tiene otros (`read-only`, `readwrite-unsafe`) que no se usan (S1).
-  - `open_locked` y `create_locked` dan `None` cuando otro handle tiene el archivo, con el error que da cada navegador al abrir un handle (S1: `NoModificationAllowedError` en Chrome, `InvalidStateError` en Safari, donde puede salir también por otras causas, que el paso S1 mira; Firefox, en ese paso). En otro lugar, esos errores son errores.
+  - `open_locked` y `create_locked` dan `None` cuando otro handle tiene el archivo, con el error que da cada navegador al abrir un handle: `NoModificationAllowedError` en Chromium y Firefox, e `InvalidStateError` en Safari, que lo da solo por eso (§1.2.1). En las demás operaciones (`open_read`, `create`, `remove`, `rename`), un archivo tomado da un `io::Error` propio de la capa, *tomado*, que envuelve un tipo de `zemdb-storage` y se reconoce con `downcast`. El error del navegador que lo indica depende de la operación (§1.2.1):
+    - `createSyncAccessHandle` y `move()` dan `NoModificationAllowedError` en Chromium y Firefox, e `InvalidStateError` en Safari;
+    - `removeEntry` da `NoModificationAllowedError` en los tres, y en Safari solo por un archivo tomado o con un stream abierto.
+
+    Ese error lo reintenta la apertura de DC41 durante su plazo, después de recibir el lock (en un relevo, al recargar la página, o ante una operación soltada del mismo Worker). En otro momento es un error como cualquiera.
   - `read_at` da exactamente lo pedido o falla: repite una lectura corta (el requisito de DC17).
   - `write_at` escribe todo; `size`, `set_len`, `sync_data` y `sync_all` son `getSize`, `truncate` y `flush`.
-  - Renombrar un archivo abierto cierra el handle, hace `move()` y lo reabre sobre el mismo `FileSystemFileHandle` (DC17, S3). Si la reapertura falla, el handle queda muerto: toda operación siguiente falla, y nunca escribe en otro archivo (DC17).
-- **El directorio:** `exists`, `list` (las entradas del directorio, por prefijo), `rename` (`move()` sobre un destino que se reemplaza, sin handles abiertos en ninguno de los dos), `remove` (`removeEntry`) y `create_dir_all`; `sync_dir` no hace nada, y su contrato pasa a decir que, donde no hace nada, solo se garantizan durables los cambios de las operaciones que salieron bien (si hace durable uno que ya ocurrió, lo dice el método de DC45). `create_locked` verifica que el archivo no exista y después lo crea, porque el OPFS no tiene un *create-new* atómico: es seguro bajo el lock de la sala y con una pestaña por directorio (DC17, DC41).
+  - Renombrar un archivo abierto cierra el handle, hace `move()` y lo reabre sobre el mismo `FileSystemFileHandle` (DC17, S3). Si la reapertura falla, el handle queda muerto: toda operación siguiente falla, y nunca escribe en otro archivo (DC17). `move()` va siempre con la forma `move(directorio, nombre)`, la única de Safari. En Safari, abrir un `FileSystemFileHandle` cuya entrada se borró, o se movió por otro handle, la vuelve a crear vacía (§1.2.1): la capa solo reabre el handle que acaba de mover, bajo el lock de la sala.
+- **El directorio:** `exists`, `list` (las entradas del directorio, por prefijo), `rename` (sin handles abiertos en el origen ni en el destino, y sin `move()` sobre un archivo existente: abajo, *Las generaciones*), `remove` (`removeEntry`) y `create_dir_all`; `sync_dir` no hace nada, y su contrato pasa a decir que, donde no hace nada, solo se garantizan durables los cambios de las operaciones que salieron bien (si hace durable uno que ya ocurrió, lo dice el método de DC45). `create_locked` verifica que el archivo no exista y después lo crea, porque el OPFS no tiene un *create-new* atómico: es seguro bajo el lock de la sala y con una pestaña por directorio (DC17, DC41).
+- **Las generaciones** (con el paso S1; adoptadas el 24 de Noviembre de 2026). En Firefox, un `move()` sobre un archivo existente no es atómico ante un corte: con uno en vuelo, el destino queda vacío o no está, y se pierde también lo que dejaron los anteriores (S5 (1)). En cambio, un `move()` a un nombre libre no se dañó en ninguno de los 20 cortes del seguimiento (§1.2.1). Por eso la capa del OPFS nunca mueve sobre un archivo existente, en ningún navegador.
+  - **Los nombres.** Cada nombre del motor es, en el OPFS, una serie de generaciones: el nombre y, después de su primer reemplazo, el nombre con un sufijo de generación creciente, que ningún nombre del motor ni de los metadatos puede tener. Un nombre vale lo de su generación más nueva, y para la capa existe si existe alguna generación.
+  - **Renombrar.** `rename` y el `rename` del handle abierto (en la rotación del WAL y en su vuelta atrás) siguen estos pasos:
+    1. borran las generaciones viejas del origen, si las hay. Si eso falla, el `rename` falla sin cambiar el valor de ningún nombre. En el `rename` del handle, este paso va antes de cerrar el handle, así un `rename` que falla deja el WAL usable, como en nativo;
+    2. mueven la generación más nueva del origen a la generación siguiente del destino, o al nombre si el destino no existe: siempre a un nombre libre;
+    3. borran las generaciones viejas del destino, sin esperar que salga bien.
+
+    Una vez resuelto el `move()`, `rename` da `Ok`, porque el valor ya es el nuevo. Una generación vieja que no se pudo borrar (por un `NotFound`, o porque estaba abierta) no cambia el valor, y se borra en el próximo `rename` o `remove` de ese nombre. Así, un `rename` que falla no cambió nada, como espera el motor (`apply_snapshot`, INV-S5).
+  - **Borrar.** `remove` borra las generaciones de la más vieja a la más nueva. Un corte o un error en el medio deja el nombre con su valor o sin ninguno, nunca con uno anterior.
+  - **Lo demás.** `exists`, `open_locked`, `create` (que trunca la más nueva) y `open_read` usan la generación más nueva. `create_locked` da `AlreadyExists` si existe alguna. `list` da cada nombre una sola vez, sin el sufijo.
+  - **Resolver un nombre.** El OPFS no lista por prefijo, así que cada operación que resuelve un nombre (`exists`, las aperturas, `create`, `create_locked`, `rename` y `remove`) recorre las entradas del directorio en esa misma operación, y de ahí saca sus generaciones y la siguiente. Las compara por el nombre exacto, una vez quitado el sufijo, y no por prefijo, porque `room_{id}.wal` es prefijo de `room_{id}.wal.compacting`.
+    - **El costo** es proporcional a todas las entradas del directorio, con las de todas las salas del cliente y sus metadatos, así que abrir N salas cuesta del orden de N² entradas recorridas. Con las decenas de salas por cliente que se esperan es poco; si hiciera falta, un índice del directorio es una optimización de la capa.
+  - **Las tareas y los locks.** Todos los pasos de un reemplazo corren en la tarea de su operación (INV-L7). Las dos capas de un directorio, la del motor y la de los metadatos, no se cruzan: cada una renombra solo sus nombres, bajo su lock (el de la sala, o `client.lock`). Nada limpia el directorio al abrirlo: una generación vieja que quedó solo ocupa lugar hasta el próximo reemplazo de su nombre.
+  - **Los errores de `move()`.** La capa no usa el error de `move()` para saber si falta el origen o el directorio del destino, porque en Safari y en Firefox puede ser `UnknownError` (§1.2.1). Lo sabe por el listado.
+
+  Una generación nueva está entera, porque el motor escribe el origen con `flush()` antes de renombrarlo (DC17). Un corte deja el nombre en su generación vieja o en la nueva, como un `rename` en nativo. El motor y los metadatos no cambian: el reemplazo atómico lo da la capa, con el supuesto de §2 sobre el `move()` a un nombre libre.
+
+  Esto precisa lo que eligió el dueño del proyecto el 23 de Noviembre de 2026: no confiar en un `move()` sobre un archivo existente. Las generaciones no validan el destino al reabrir ni lo completan desde un temporal: nunca lo dejan expuesto. Las alternativas descartadas, abajo, dicen por qué.
 - **Una operación soltada termina** (INV-L7, DC17). Las operaciones del OPFS que son promesas (obtener un handle de archivo o de directorio, `createSyncAccessHandle`, `move()`, `removeEntry`, listar) siguen en el navegador aunque se suelte el future que las espera, así que la capa las corre en una tarea propia (la de `sys`, DC38) que retiene el handle, y su lock, hasta que la promesa termina: la próxima operación sobre ese archivo la espera. Las síncronas (`read`, `write`, `flush`, `truncate`, `getSize`) terminan en la misma llamada.
 - **Los errores:** cada `DOMException` pasa a un `io::ErrorKind` (`NotFoundError` a `NotFound`, la cuota llena a `StorageFull`), con su nombre en el mensaje.
 - **El motor en wasm32:** sus tareas, con la de DC38; su trabajo de CPU, en el lugar; el `.snap`, comprimido con `ruzstd` `Fastest` (DC9), y `zstd_level`, validado contra lo que da en wasm32 (hoy, con `zstd::compression_level_range()`); los nombres temporales, con el azar de DC38; y el módulo de los *fail points*, que hoy no compila en wasm32, compila ahí, donde fuera de los tests no hace nada, como en nativo (sus pausas, que esperan con `Instant`, quedan para los tests nativos).
 - **Supuestos** (§2 de `INVARIANTES.md`). En el OPFS, sincronizar un directorio no hace nada, así que lo que en nativo hace durable `sync_dir` tiene que serlo cuando su promesa resuelve:
   - lo escrito con `flush()` sobrevive como lo sincronizado con `fsync` (ya está, S1);
-  - un `move()` resuelto es atómico y durable, como un `rename` seguido de sincronizar el directorio;
+  - un `move()` a un nombre libre resuelto es atómico y durable, como un `rename` seguido de sincronizar el directorio (sobre un archivo existente, no: *Las generaciones*);
   - una entrada creada (un archivo, con `getFileHandle` y `create`, o un directorio, con `getDirectoryHandle` y `create`) o borrada (`removeEntry`) cuya promesa resolvió es durable, en el orden en que resolvieron sus promesas, como un cambio de directorio sincronizado.
 
-  De eso dependen la instalación de un snapshot, la rotación del WAL, el directorio de datos, el WAL y el `.lock` que crea la apertura de una sala, los borrados de `delete_room` (INV-S8), y los guardados y los borrados de los metadatos del cliente (INV-K16). Son supuestos, como `flush()`: S5 los prueba donde se puede, cortando el navegador, que no es un corte de energía.
-- **Condición:** si S1 o S3 en Firefox, o S3 en Safari, contestan que no (por ejemplo, un navegador sin `move()` de un archivo), DC39, y con ella DC8, se revisan antes del Lote 2. Lo mismo si S5 (1) contesta que un `move()`, una creación o un `removeEntry` que se rechazan pueden haber tenido efecto: en nativo, el `sync_dir` siguiente hace durable un cambio así (el de la apertura de una sala, para el WAL que creó una apertura anterior; el de `delete_room`, para un borrado), y en el OPFS DC39 tiene que decir qué hace el motor con él. Por ejemplo, si un `removeEntry` del `.snap` o de `.wal.compacting` se rechaza después de borrar, `delete_room` lo da por hecho al reintentar (un `NotFound` es éxito), y el archivo podría reaparecer después de un corte, en contra de INV-S8: el `.snap`, con la sala que se dio por borrada; `.wal.compacting`, sin su `.snap` (un estado que no es un prefijo). El WAL activo no: al reintentar, `lock_room_files` lo vuelve a crear y `delete_room` lo borra otra vez.
+  De eso dependen la instalación de un snapshot, la rotación del WAL, el directorio de datos, el WAL y el `.lock` que crea la apertura de una sala, los borrados de `delete_room` (INV-S8), y los guardados y los borrados de los metadatos del cliente (INV-K16). Son supuestos, como `flush()`. S5 los probó en Chromium, Firefox y Safari cortando el navegador, que no es un corte de energía (§1.2.1).
+- **La condición del paso S1** (S1 en Firefox, S3 en Safari y Firefox, y S5 (1)).
+  - S1 y S3 contestaron que sí en los tres navegadores. Safari, además, reemplaza un destino que tiene un handle abierto (S3 (2)); la capa no lo usa, porque el motor nunca renombra sobre un archivo abierto (DC17).
+  - Ninguna operación rechazada tuvo efecto (§1.2.1).
+  - El `move()` sobre un archivo existente de Firefox revisó esta decisión: de ahí *Las generaciones*.
+  - **Queda sin probar** un rechazo después de un error de E/S, porque no se pudo provocar. Si uno tuviera efecto, en el OPFS ningún `sync_dir` lo haría durable. Por ejemplo, si un `removeEntry` del `.snap` o de `.wal.compacting` se rechaza después de borrar, `delete_room` lo da por hecho al reintentar (para él, un `NotFound` es éxito), y el archivo podría reaparecer después de un corte, en contra de INV-S8:
+    - el `.snap`, con la sala que ya se dio por borrada;
+    - `.wal.compacting`, sin su `.snap`, que es un estado que no es un prefijo.
+
+    Va al §4 de `INVARIANTES.md`, como riesgo aceptado.
 - **Límites:** la réplica vive en la memoria del Worker (en wasm32, hasta 4 GiB, y el navegador puede dar menos), dos veces mientras se instala un snapshot (INV-K15); en wasm32 una reserva que falla deja la instancia inservible, como un pánico (DC42). Sin `persist()`, el navegador puede borrar el OPFS del origen: una pérdida total (§2).
-- **Alternativas descartadas:** IndexedDB (DC8); un motor del navegador escrito aparte (DC17).
+- **Alternativas descartadas:**
+  - IndexedDB (DC8);
+  - un motor del navegador escrito aparte (DC17);
+  - al reabrir, completar desde un temporal entero un destino que falta o no valida. Es la opción que eligió el dueño del proyecto, en la forma en que se formuló. La capa no sabe qué temporal corresponde a qué destino, porque los temporales de los snapshots tienen un nombre al azar. Tampoco sabe si está entero uno de nombre fijo (`.wal.compacting.tmp`, `.meta.tmp`), ni cómo validar cada formato. Además, en Firefox el destino roto puede faltar o tener 0 bytes;
+  - borrar el destino antes del `move()`: en Firefox también lo dejó vacío (§1.2.1).
 
 ### DC40 · El transporte del navegador
 - **`FetchTransport`,** un `TransportClient` del cliente con la feature `wasm`, sobre el `fetch` del ámbito global (el del Worker), con `web-sys` y sin otra dependencia. Cada mensaje es el cuerpo de un `POST` a su endpoint (`endpoint`), con el token en `Authorization: Bearer`, sin cookies (`credentials: "omit"`), sin caché y sin seguir redirecciones, como el nativo. La URL del servidor, en el mismo origen que la página o con CORS (abajo).
@@ -111,7 +145,12 @@ Las de la fase que implementa esta sub-fase: DC8 (el OPFS), DC9 (`ruzstd` para e
 - **El tope de streams.** La conexión la elige el navegador. Con HTTP/1.1, el stream de cada sala en `live` ocupa una de las pocas conexiones por origen (seis en los navegadores comunes), compartidas entre pestañas. Con seis salas con un `watch` (DC36), los pedidos se quedarían sin conexión: escrituras inciertas y clientes que no se ponen al día (INV-K7).
   - Por eso el transporte de un cliente abre a lo sumo `max_streams` streams a la vez (2 por defecto, configurable). Con varios clientes en el origen, o con otras conexiones largas de la aplicación, la aplicación lo baja; con HTTP/2, lo puede subir.
   - Uno de más se niega en el lugar, con el frame de `RateLimited`. El worker lo reintenta con su backoff, y la sala sigue como en `periodic` (su heartbeat compara su head, DC24); `status` la muestra en `live`, con el stream cerrado (`stream_open` en falso).
-  - Con HTTP/2, el stream comparte la conexión de los pedidos, y mientras el worker aplica un evento no lo lee (INV-K15): el navegador frena lo que recibe (S5, pregunta 4).
+  - Con HTTP/2, el stream comparte la conexión de los pedidos.
+  - **Un stream que el worker no lee.** El worker no lee el stream mientras aplica un evento (INV-K15), durante un trabajo de CPU largo (DC38), ni mientras Safari suspende su Worker en segundo plano (S5 (6)). Lo que hace el navegador mientras tanto lo midió S5 (4) (§1.2.1):
+    - con HTTP/1.1, Chromium frena lo que recibe a los 12 a 15 MB, Firefox recién a unos 4 GiB, y Safari no frena;
+    - con HTTP/2, medido solo en Chromium, frena a los 12,6 MB.
+
+    Lo que el navegador junta queda en su propia memoria, fuera de la del Worker y del tope de lo que lee el SDK. El volumen lo pone el servidor, con los eventos de la sala. Va al §4 de `INVARIANTES.md`, como riesgo aceptado.
   - La alternativa, que el dueño del proyecto puede preferir: HTTP/2 entre el navegador y el proxy como supuesto de §2, sin tope.
 - **CORS:** el servidor no tiene CORS. La aplicación lo sirve en su mismo origen, por el proxy que termina TLS (§2), o con un proxy que agregue los headers. CORS en el servidor queda fuera de 4.5 (al backlog, si la app real lo necesita). Las pruebas sirven la página y el servidor desde un mismo origen (DC44).
 - **Alternativas descartadas:**
@@ -121,10 +160,21 @@ Las de la fase que implementa esta sub-fase: DC8 (el OPFS), DC9 (`ruzstd` para e
 
 ### DC41 · Una pestaña líder por directorio (INV-K13)
 - **El lock.** En wasm32, `FileMetadata::open` toma, antes de tocar ningún archivo (también antes de crear su directorio), un Web Lock exclusivo (`navigator.locks.request`) cuyo nombre sale de la ruta normalizada de su directorio del OPFS, y lo conserva hasta su `close` (el de `shutdown`), hasta que se suelta el store o hasta que termina el Worker. La unidad es el directorio: `FileMetadata` retiene `client.lock` mientras está abierto, y en el OPFS su handle es exclusivo, así que a lo sumo una pestaña tiene un cliente sobre ese directorio, con todas sus salas (INV-K13). Los metadatos van en el directorio del motor (DC39), así que el lock cubre los dos. Un lock por sala pediría unos metadatos sin `client.lock` en el navegador: no en la v0.1.
-- **La segunda pestaña.** Sin la opción de esperar, abrir el store falla enseguida con `ClientError::InUse`, nuevo (precisa DC32; su código para JavaScript, en 4.6), sin tocar ningún archivo. Con la opción del store del navegador (en su constructor), espera en la cola del lock, y abre cuando la otra pestaña lo suelta: es la que usa el runtime del Worker, que mientras tanto atiende a su página a través de la pestaña que lo tiene, la líder (DC46). Nunca reintenta los archivos (INV-K13). El contrato de `MetadataStore::open` pasa a decir cómo informa un store tomado: con un error propio, que solo da el store (un `io::Error` que envuelve un tipo del cliente, reconocido con `downcast`; hoy es un `WouldBlock`, que otro paso podría dar), y `Client::open` lo pasa a `InUse`, también en nativo, cuando otro cliente, de este proceso o de otro, tiene `client.lock` (hoy, `Storage`). Para eso, la capa nativa da `None` solo con el error de un lock tomado, comparado por su código (`raw_os_error()`) con el de `fs2::lock_contended_error()` (`EWOULDBLOCK` en Unix, `ERROR_LOCK_VIOLATION` en Windows) y no por su `kind()`, y cualquier otro error al tomar el lock es un error, no `InUse`. En nativo no hay espera.
+- **La segunda pestaña.** Sin la opción de esperar, abrir el store falla enseguida con `ClientError::InUse`, nuevo (precisa DC32; su código para JavaScript, en 4.6), sin tocar ningún archivo. Con la opción del store del navegador (en su constructor), espera en la cola del lock, y abre cuando la otra pestaña lo suelta: es la que usa el runtime del Worker, que mientras tanto atiende a su página a través de la pestaña que lo tiene, la líder (DC46). Nunca reintenta los archivos (INV-K13), salvo los handles que el Worker que terminó todavía no soltó, después de recibir el lock (abajo, *El orden al terminar*). El contrato de `MetadataStore::open` pasa a decir cómo informa un store tomado: con un error propio, que solo da el store (un `io::Error` que envuelve un tipo del cliente, reconocido con `downcast`; hoy es un `WouldBlock`, que otro paso podría dar), y `Client::open` lo pasa a `InUse`, también en nativo, cuando otro cliente, de este proceso o de otro, tiene `client.lock` (hoy, `Storage`). Para eso, la capa nativa da `None` solo con el error de un lock tomado, comparado por su código (`raw_os_error()`) con el de `fs2::lock_contended_error()` (`EWOULDBLOCK` en Unix, `ERROR_LOCK_VIOLATION` en Windows) y no por su `kind()`, y cualquier otro error al tomar el lock es un error, no `InUse`. En nativo no hay espera.
 - **`pagehide`.** La página termina el Worker (en 4.6, su paquete; en 4.5, el arnés de pruebas). Terminarlo es un crash (INV-K11): lo aplicado es durable, y el navegador suelta los handles y el Web Lock. Una página que vuelve del *back/forward cache* arranca otro Worker. Si la que se va es la líder, la reemplaza la primera de la cola (DC46). El `shutdown` ordenado, con el último `Ack` de cada sala (DC28), es para cuando la aplicación cierra el cliente: en `pagehide` no hay tiempo de esperarlo. La página también termina el Worker ante su evento `error`, el de un pánico o de una reserva que falla (DC42).
-- **El orden al terminar** (S5, pregunta 2): si el navegador suelta el Web Lock antes que los handles, la pestaña que lo toma puede encontrar `client.lock` todavía tomado; abrir falla entonces con `InUse`, y la aplicación vuelve a abrir, lo que toma el lock primero. Si S5 lo muestra, DC41 se revisa antes del Lote 10 (el requisito 8 de §1.3); también si una promesa del OPFS que el Worker dejó en vuelo (un `move()`, un `removeEntry`) puede terminar después de que otra pestaña tomó el directorio.
-- **Alternativas descartadas:** reintentar el handle (INV-K13 lo prohíbe: compite con la otra pestaña archivo por archivo); `readwrite-unsafe` (solo Chrome, y rompe la exclusión); solo la primera pestaña con el SDK, y las demás con `InUse` (la primera versión de esta decisión: la segunda pestaña no podía ni leer, y abrir una aplicación en dos pestañas es lo común); un `SharedWorker` (no tiene `FileSystemSyncAccessHandle`, así que igual haría falta una pestaña que abra los archivos).
+- **El orden al terminar** (con el paso S1; adoptado el 24 de Noviembre de 2026).
+  - **Lo que midió S5 (§1.2.1):**
+    - el navegador suelta el Web Lock de un Worker que termina antes que sus handles, en los tres navegadores, y suelta los handles de a poco: la pestaña que recibe el lock encuentra archivos tomados durante 10 a 99 ms;
+    - en Chromium, un `move()` que el Worker terminado dejó en vuelo puede aterrizar después de que la otra pestaña recibió el lock, hasta unos 25 ms después; en Firefox y Safari no aterrizó ninguno (80 iteraciones en cada uno);
+    - en el seguimiento, en Chromium, ninguno aterrizó después de que la otra pestaña tomó el handle de `client.lock` (160 iteraciones).
+  - **Lo que hace la apertura.** Con el Web Lock tomado, ninguna otra instancia viva tiene el directorio. Un handle tomado solo puede ser del Worker que terminó, o de una operación soltada de este mismo Worker (INV-L7), y las dos lo van a soltar. Por eso, en wasm32, durante un plazo de unos segundos desde que recibe el lock:
+    - `FileMetadata::open` espera el handle de `client.lock`, y lo vuelve a pedir cada pocos milisegundos. No toca ningún otro archivo hasta tenerlo.
+    - Después, ante `RoomLocked` o ante el error *tomado* de la capa (DC39), el cliente vuelve a intentar la apertura entera de una sala y la operación de los metadatos (leerlos, o repetir un guardado), porque el navegador puede seguir soltando los demás handles en cualquier orden. Pasa con los temporales de una compactación o de una instalación cortadas, que la recuperación borra; con las lecturas de la recuperación; y con el temporal de un guardado de los metadatos cortado.
+
+    Si vence el plazo, la apertura del store da `InUse` (y la de una sala, el error que dé). Si la apertura del store falla, el store suelta el Web Lock, para que no se trabe la cola.
+  - Son las únicas veces que el SDK reintenta un handle (INV-K13), y resuelven el requisito 8 de §1.3. El Lote 10 lo prueba con los pasos del arnés: con muchos handles abiertos en la página que se va, y con su Worker terminado en medio de una compactación y en medio de un guardado de los metadatos.
+  - Que una operación en vuelo termine antes de que el navegador suelte el handle de `client.lock` es un supuesto de §2, con lo que midió el seguimiento en Chromium.
+- **Alternativas descartadas:** reintentar los handles sin el lock del directorio (INV-K13 lo prohíbe: compite con la otra pestaña archivo por archivo; con el lock, solo se espera al Worker que terminó); `readwrite-unsafe` (solo Chrome, y rompe la exclusión); solo la primera pestaña con el SDK, y las demás con `InUse` (la primera versión de esta decisión: la segunda pestaña no podía ni leer, y abrir una aplicación en dos pestañas es lo común); un `SharedWorker` (no tiene `FileSystemSyncAccessHandle`, así que igual haría falta una pestaña que abra los archivos).
 
 ### DC42 · El runtime del Worker (DC14, DC18)
 - **El despachador,** un módulo del cliente (`src/dispatch/`) que no depende del navegador: corre y se prueba también en nativo. Es API pública del cliente: la usa el punto de entrada del Worker, y el de 4.6 puede vivir en otro crate. Recibe un `Command` y da un `Reply`, y publica `Notice`s, todos datos serializables (DC14) sobre los tipos de la fachada (`Row`, `Key`, `Scan`, `RoomStatus`, `Freshness`, `ClientError`). Es el enum de comandos que DC18 dejaba para el runtime del Worker:
@@ -166,14 +216,14 @@ Las de la fase que implementa esta sub-fase: DC8 (el OPFS), DC9 (`ruzstd` para e
   Playwright (Node) corre la página sin ventana en la CI; una persona la abre en cualquier navegador y lee el resultado, y un runner de macOS la corre en Safari (§1.2).
 - **Los tests unitarios en wasm32.** Lo interno que una prueba de integración no alcanza (el handle muerto del OPFS, que pide hacer fallar una reapertura) va en tests unitarios del crate, `#[cfg(test)]`, con `wasm-bindgen-test` en un Worker dedicado (`run_in_dedicated_worker`), que corre `wasm-bindgen-test-runner` con el Chrome y el chromedriver del runner de la CI. `GEMINI.md` no deja hacer `pub` lo interno para probarlo.
 - **El criterio de aceptación** (§4.5 del plan de la fase): una sala con filas que llegaron del servidor, la página recargada, y la sala que abre sin red desde sus metadatos y lee las mismas filas; después, con red, se pone al día. Además: el Worker terminado en medio de un lote, y la sala que reabre en un prefijo (INV-K1, INV-S3); dos pestañas (INV-K13); el cifrado (INV-K9); y todo eso por `postMessage`, a través del runtime del Worker.
-- **La CI:** un job `browser` en `ubuntu-latest`, en cada push y pull request como los demás: compila el wasm y el servidor de pruebas, instala Chromium con Playwright y corre la página, corre los tests unitarios en wasm32, y pasa el fmt y el clippy del arnés. Firefox también, con Playwright, si S1 en Firefox sale bien. Safari, en un runner de `macos-latest` con `safaridriver`, antes de la revisión de cierre (§1.2, el paso S2); WebKit con Playwright en Linux, si hace falta, como un motor de más, que no reemplaza a Safari.
+- **La CI:** un job `browser` en `ubuntu-latest`, en cada push y pull request como los demás: compila el wasm y el servidor de pruebas, instala Chromium con Playwright y corre la página, corre los tests unitarios en wasm32, y pasa el fmt y el clippy del arnés. Firefox también, con Playwright, desde el Lote 2 (S1 en Firefox salió bien, §1.2.1). El Firefox de Playwright es un build propio, no el Firefox 160 que midió el paso S1. Safari, en un runner de `macos-latest`, antes de la revisión de cierre (§1.2, el paso S2): abierto con `open -a Safari` y no con `safaridriver`, porque las sesiones de `safaridriver` tienen un almacenamiento efímero (§1.2.1); WebKit con Playwright en Linux, si hace falta, como un motor de más, que no reemplaza a Safari.
 - **Lo que no depende del navegador** (el despachador, `rt` en nativo, DEF-189) se prueba en la suite de siempre.
 - **Alternativas descartadas:** `wasm-bindgen-test` también para la integración (va por WebDriver: no recarga la página en medio de una prueba ni abre dos pestañas); un proxy en Node delante del servidor, en lugar del servidor de pruebas en Rust, que arma el servidor real en proceso como la simulación.
 
 ### DC45 · DEF-189: los metadatos, durables antes de servirse (INV-K16)
 - **La regla.** `FileMetadata` hace durables los metadatos de una sala antes de servirlos (`room`) la primera vez desde que se abrió el store, y después de un guardado o un borrado que falló, en cualquier paso: así nada se escribe bajo un guardado que no es durable (INV-K16), también si después de la falla el store se cerró y se volvió a abrir sin un crash, lo que haría olvidarla. Si no puede, la lectura falla (un error, nunca metadatos que faltan, como hoy), así que la sala no abre.
 - **En nativo:** sincroniza su directorio (al abrir el store, y antes de servir después de una falla). Vale con los metadatos en cualquier directorio, también fuera del directorio del motor, que §11 de `ARCHITECTURE.md` excluía sin que el código lo impidiera.
-- **En el OPFS,** donde sincronizar el directorio no hace nada: un guardado que resolvió es durable por el supuesto de `move()` (DC39), y uno que falló pudo haber movido el archivo sin que sea durable (un `move()` rechazado con efecto incierto, que el supuesto no cubre; S5, pregunta 1). Por eso, antes de servir, vuelve a guardar lo que lee (temporal, `flush()` y `move()`), y repite un borrado que falló. Repetir un borrado cubre solo uno rechazado sin efecto: uno rechazado que borró (`remove_room` toma un `NotFound` como éxito) depende de la respuesta de S5 (1), como en DC39.
+- **En el OPFS,** donde sincronizar el directorio no hace nada: un guardado que resolvió es durable por el reemplazo de la capa (DC39, *Las generaciones*). Uno que falló pudo haber tenido efecto sin que sea durable: S5 no vio ningún rechazo con efecto, pero no pudo provocar uno después de un error de E/S (§1.2.1). Por eso, antes de servir, vuelve a guardar lo que lee (temporal, `flush()` y el `rename` de la capa), y repite un borrado que falló. Repetir un borrado cubre solo uno rechazado sin efecto: uno rechazado que borró (`remove_room` toma un `NotFound` como éxito) es el riesgo aceptado de DC39.
 - **Cómo sabe cuál:** un método nuevo de `RoomFiles` (Lote 2, con su nota en DC17) dice si `sync_dir` hace durable un cambio de directorio que ya ocurrió: en nativo, sí (también en Windows, donde lo hace el journal de NTFS: el riesgo aceptado de §4 de `INVARIANTES.md`); en el OPFS, no. En nativo, eso supone que un `sync_dir` que sale bien hace durable lo que uno anterior que falló no hizo: en Linux, después de un EIO, no está garantizado (el riesgo aceptado de §4, en la fila del EIO en Linux). El Lote 5 prueba las dos ramas en nativo, con una capa de prueba que dice que no.
 - **Alternativa descartada:** atar los metadatos al directorio del motor (que la API arme los dos juntos): cambia `ZemdbClient::open` y deja INV-K16 colgada de un efecto de la apertura del motor.
 
@@ -185,7 +235,7 @@ Las de la fase que implementa esta sub-fase: DC8 (el OPFS), DC9 (`ruzstd` para e
   - cuando la líder se va, la primera de la cola del lock la reemplaza, y lo de cada pestaña (sus claves, sus salas y sus `watch`) pasa a la líder nueva: los `watch` siguen, sin quedar colgados ni repetir un valor (INV-K10);
   - un seguidor no le manda nada a una líder con otra versión del protocolo, otra persona u otro servidor: su página recibe `InUse` (INV-K8);
   - lo que la líder retiene por cada pestaña que atiende, y lo que retiene cada seguidor, está acotado (INV-K15).
-- **Límites:** cada pestaña carga el wasm del SDK aunque no abra nada (unos 500 KB, S1); un comando de un seguidor suma un salto entre Workers (S5, pregunta 6); un relevo deja inciertas las escrituras en vuelo de los seguidores, como un crash las de la líder; el claro de una columna cifrada viaja entre los Workers de las pestañas, que son la aplicación (§2, INV-K9); con una líder congelada en segundo plano, las demás esperan (S5, pregunta 6).
+- **Límites:** cada pestaña carga el wasm del SDK aunque no abra nada (unos 500 KB, S1); un comando de un seguidor suma un salto entre Workers (menos de 1 ms de mediana entre los Workers de dos pestañas, S5 (6)); un relevo deja inciertas las escrituras en vuelo de los seguidores, como un crash las de la líder; el claro de una columna cifrada viaja entre los Workers de las pestañas, que son la aplicación (§2, INV-K9); con una líder congelada en segundo plano, las demás esperan. Safari suspende a los ~4 minutos el Worker de una pestaña en segundo plano sin soltar su Web Lock, y Chromium conserva el lock de una pestaña congelada (S5 (6), §1.2.1).
 - **El protocolo** (los canales, cómo se encuentra a la líder y cómo se sabe que se fue, el relevo, el token, las claves, los errores, las salas de varias pestañas) se diseña en el paso D (§2): solo documentos, con su propia revisión cruzada, después del paso S1 y antes del Lote 13, con los requisitos de §1.3, que salieron de las rondas séptima a novena de la revisión cruzada del Lote 0.
 - **Alternativas descartadas:** la elección y el reenvío en la página, en el paquete de 4.6 (el lock lo tendría la página, y una página en el *back/forward cache* podría retenerlo; además, el relevo quedaría fuera del código auditado); una réplica por pestaña (cada pestaña sería otro dispositivo, con su propio almacenamiento y sus propias bajadas).
 
@@ -199,9 +249,9 @@ Las de la fase que implementa esta sub-fase: DC8 (el OPFS), DC9 (`ruzstd` para e
 | 4 | §4.5, DC14 y DC18 | El runtime del Worker, y el enum de comandos que DC18 deja para él | DC42 | 6, 12 |
 | 5 | §4.5 e INV-K9 | Cómo le llegan al Worker las claves o el `CryptoEngine` de la aplicación | DC43 (el paso desde la página es de 4.6) | 11, 12 |
 | 6 | §4.5, INV-K13 e INV-K11 | Una sola pestaña abre cada sala (`navigator.locks`, S1), y el Worker suelta sus archivos en `pagehide` | DC41 y DC46: una pestaña líder por directorio, que atiende a las demás, y el Worker terminado en `pagehide` | 10, 13, 14, 15 |
-| 7 | DC8 | S1 en Firefox | §1.2, paso S1 | — |
-| 8 | DC17 | S3 en Safari y Firefox | §1.2, paso S1 | — |
-| 9 | DC9 | La medición del codificador `ruzstd` en Safari | §1.2, paso S2 | — |
+| 7 | DC8 | S1 en Firefox | §1.2.1, respondido en el paso S1 | — |
+| 8 | DC17 | S3 en Safari y Firefox | §1.2.1, respondido en el paso S1 | — |
+| 9 | DC9 | La medición del codificador `ruzstd` en Safari | §1.2.1, adelantada al paso S1 | — |
 | 10 | Auditoría de 4.2 (DEF-189) e INV-K16 | En nativo, los metadatos fuera del directorio del motor; en el OPFS, un guardado durable antes de escribir bajo él | DC45, con el supuesto de DC39 y S5 en el OPFS | 5, 8 |
 | 11 | Auditoría de 4.2 (DEF-195) | El tamaño máximo de una respuesta del transporte del navegador, y si 24 veces ese tamaño entra en la memoria del Worker | DC40: el tope de lo que lee, y en wasm32 los syncs del worker de a uno y sus transferencias de a una | 9 |
 | 12 | Nota del Lote 6 de 4.4 | `ChangeStream` usa un `BoxStream`, que pide `Send` | DC38 | 8 |
@@ -224,28 +274,156 @@ Las de la fase que implementa esta sub-fase: DC8 (el OPFS), DC9 (`ruzstd` para e
   5. En una pestaña en segundo plano, ¿cuánto se demora un `setTimeout` de 30 s en el Worker dedicado, y cuánto tarda la página en contestarle un mensaje (un pedido de token)? (INV-K7, el heartbeat; DC46.)
   6. Entre los Workers de dos pestañas, por un `BroadcastChannel`: ¿llegan los mensajes de uno en orden, también un `CryptoKey` no extraíble, y cuánto tarda una ida y vuelta? Al cerrarse la pestaña que tiene el Web Lock, ¿cuánto tarda el primero de la cola en recibirlo? Una pestaña en segundo plano que tiene un Web Lock, ¿se congela (Chrome en Android, Safari en iOS), y mientras tanto la cola le da el lock a otra? ¿Un `AbortSignal` saca de la cola un pedido que espera? ¿Una página prerenderizada recibe sus Web Locks recién cuando se muestra? (DC46.)
 
-  En Chromium, sin ventana, con Playwright y un perfil persistente que se corta con `SIGKILL`, sin la Mac; en Safari y Firefox, en la Mac.
+  En Chromium, sin ventana, con Playwright y un perfil persistente que se corta con `SIGKILL`, sin la Mac; en Safari y Firefox, en la Mac. (Así se planeó; cómo corrió de verdad, en §1.2.1.)
 - **La medición del codificador `ruzstd` en Safari** (DC9): el programa del Lote 6 de 4.1 (el `cdylib`, la página que mide y el generador nativo del payload), en Safari en un runner de `macos-latest`. El hardware no es el de DC9, así que se anota cuál es, y los tiempos no se comparan uno a uno. Si ese programa no está, se rearma con lo que describe DC9.
 
 **Cuándo y dónde corren Safari y Firefox:**
-- **Paso S1, después del Lote 0 y antes del Lote 2** (la capa del OPFS): S1 en Firefox, S3 en Safari y Firefox, y S5 en Safari y Firefox. Una respuesta negativa reabre DC8 o DC39, o cambia los errores que mapea la capa, así que va antes de escribirla. Puede ir en paralelo con el Lote 1 (el arnés), que no depende de ellos. S5 en Chromium va en el mismo paso.
-- **Paso S2, después del Lote 15 y antes de la revisión de cierre:** la página de aceptación del arnés (DC44) en Safari y en Firefox, y la medición de `ruzstd` en Safari. Es la condición de DC8 para cerrar 4.5.
+- **Paso S1, después del Lote 0 y antes del Lote 2** (la capa del OPFS): S1 en Firefox, S3 en Safari y Firefox, y S5 en Safari y Firefox. Una respuesta negativa reabre DC8 o DC39, o cambia los errores que mapea la capa, así que va antes de escribirla. Puede ir en paralelo con el Lote 1 (el arnés), que no depende de ellos. S5 en Chromium va en el mismo paso. Hecho el 23 de Noviembre de 2026 (§1.2.1).
+- **Paso S2, después del Lote 15 y antes de la revisión de cierre:** la página de aceptación del arnés (DC44) en Safari y en Firefox (la medición de `ruzstd` en Safari se adelantó al paso S1, §1.2.1). Es la condición de DC8 para cerrar 4.5.
 - **Dónde, sin la Mac** (el dueño del proyecto ya no tiene Safari, y Safari no corre en Linux):
   - Firefox, en Linux: con Playwright en este entorno, si se puede bajar, o en un runner de `ubuntu-latest`, que lo trae instalado.
-  - Safari, en un runner de `macos-latest`, con `safaridriver`, desde un workflow en la rama de trabajo de la sesión, que no se mergea (el código de un spike no entra a `main`). En un runner no hay ventanas de nadie, así que también se puede cortar Safari (S1 (2), S5 (1)).
+  - Safari, en un runner de `macos-latest` (al final, abierto con `open -a Safari` y no con `safaridriver`, §1.2.1), desde un workflow en la rama de trabajo de la sesión, que no se mergea (el código de un spike no entra a `main`). En un runner no hay ventanas de nadie, así que también se puede cortar Safari (S1 (2), S5 (1)).
   - WebKit con Playwright en Linux es el mismo motor que Safari, pero no Safari: sirve de motor de más, no lo reemplaza.
+
+### 1.2.1. Las respuestas del paso S1
+
+Se corrieron el 23 de Noviembre de 2026, en tres navegadores:
+- **Chromium 153** (Chrome for Testing), con ventana bajo Xvfb, en Ubuntu 24.04, con un Xeon de 2,1 GHz y 4 núcleos. Para congelar una página se usó CDP, el protocolo de depuración de Chrome.
+- **Firefox 160**, en `ubuntu-latest` (Ubuntu 26.04), con ventana bajo `xvfb-run`.
+- **Safari 27.2**, en `macos-latest` (macOS 26.7, un M1 virtual de 3 núcleos), abierto con `open -a Safari` en la sesión gráfica del runner.
+
+Un corte es un `SIGKILL` del navegador entero, y en Safari también de sus procesos de WebKit; después se reabre el mismo perfil. No es un corte de energía: la caché de páginas del sistema sobrevive. Las pestañas son pestañas reales; en Safari las abre el runner, porque Safari bloquea los pop-ups. El código del spike está en la rama de trabajo de la sesión (`spikes/fase4_5-s1/`, con cinco corridas en los runners, la última del seguimiento), sin mergear.
+
+- **S1 en Firefox.**
+  1. Sí. Desde Rust (`wasm-bindgen` 0.2.129 y `web-sys` 0.3.106), en un Worker de módulo, funcionan:
+     - escribir y leer en un offset, también una lectura corta al final;
+     - `flush`, `truncate`, `getSize` y `close`;
+     - reabrir con el mismo handle o con otro, y leer después de recargar la página.
+
+     6,1 MB se escriben en 10 ms y se leen en 4 ms.
+  2. Sí. Lo escrito con `flush`, sin `close`, se lee después de `terminate()`, de cerrar la pestaña y de un corte.
+  3. Un segundo handle falla enseguida con `NoModificationAllowedError`: en el mismo Worker, desde otra pestaña o en paralelo.
+     - Se libera unos 15 ms después de cerrar la pestaña que lo tenía.
+     - No hay modos compartidos: la opción `mode` se ignora.
+     - `navigator.locks` existe en el Worker.
+  4. `persisted()` da `false`, y la cuota es de 10 GiB.
+     - `persist()` no resuelve sin el usuario; probablemente queda en un pedido de permiso. Es para 4.6, que lo llama desde la página con un plazo.
+     - En el Worker no existe.
+  5. El tamaño del wasm no se midió, porque no depende del navegador.
+
+  El criterio (1) de DC8 se cumple en los tres navegadores.
+- **Los errores de cada navegador.**
+  - **Al abrir un handle con otro handle tomado**, o con un stream de escritura abierto: Chromium y Firefox dan `NoModificationAllowedError`, y Safari, `InvalidStateError`. Safari da `InvalidStateError` solo en ese caso. No lo da:
+    - por una entrada borrada o movida;
+    - por un directorio padre borrado;
+    - ni después de `close()`.
+  - **Al abrir o crear una entrada**, en los tres:
+    - una que falta da `NotFoundError`;
+    - un nombre con `/`, `..` o `.`, o vacío, da `TypeError`;
+    - un archivo donde va un directorio da `TypeMismatchError`.
+
+    Crear dentro de un directorio borrado da `NotFoundError` en Chromium y `UnknownError` en Firefox. En Safari, un archivo da `UnknownError`, y un directorio vuelve a crear el directorio borrado.
+  - **Al mover:**
+    - un origen que falta da `NotFoundError` en Chromium y Firefox, y `UnknownError` en Safari;
+    - un directorio de destino que falta da `NotFoundError` en Chromium, y `UnknownError` en Firefox y Safari;
+    - un origen con un stream de escritura abierto falla en Chromium y Firefox, pero Safari lo mueve.
+  - **Además, en Safari:**
+    - solo existe la forma `move(dir, nombre)`;
+    - si la entrada de un `FileSystemFileHandle` se borró, o se movió por otro handle, `createSyncAccessHandle` la vuelve a crear vacía.
+- **S3 en Safari y Firefox.**
+  1. Sí en los dos, también entre directorios. Safari solo con `move(dir, nombre)`.
+  2. **Mover un archivo abierto** falla sin cambiar nada: `NoModificationAllowedError` en Firefox, `InvalidStateError` en Safari. **Moverlo sobre un destino abierto** falla en Firefox; Safari, en cambio, lo reemplaza, y el handle abierto sigue leyendo el contenido viejo.
+  3. No: `removeEntry` de un archivo abierto falla con `NoModificationAllowedError` y no lo borra.
+  4. Sí.
+
+  Todos tienen `move()` de un archivo, y todos reemplazan el destino.
+- **S5.**
+  1. **Un corte justo después de que la promesa resuelve** deja el cambio entero en los tres navegadores. Se probaron cinco operaciones: un `move()`, crear un archivo, crear un directorio, `removeEntry`, y `flush` sin `close`. Fueron 3 cortes por operación, 15 por navegador. El corte lo hace el servidor, al que el Worker le pide con un `XMLHttpRequest` síncrono, antes de contestarle.
+     - **Un corte al azar en medio de una serie:**
+       - en Chromium y Safari (40 cortes en cada uno, de los que unos pocos cayeron después de que la serie había terminado), lo que se ve es siempre un prefijo, en el orden en que resolvieron las promesas, y el destino de cada `move()` es siempre un archivo entero, el viejo o el nuevo;
+       - **en Firefox, no.** En 12 de 60 cortes, siempre con un `move()` sobre un archivo existente en vuelo, el destino quedó vacío o no estaba, y con él se perdió lo que habían dejado los `move()` que ya habían resuelto. El temporal más nuevo seguía entero, y lo demás (crear y borrar) era un prefijo exacto.
+     - **Los rechazos:** ninguno de los que se pudieron provocar tuvo efecto, de 16 a 19 clases en cada navegador (un archivo tomado, una entrada que falta, un nombre inválido, un tipo que no coincide). Uno después de un error de E/S no se pudo provocar.
+     - **Un `move()` sobre un directorio vacío:** Firefox lo reemplaza, Safari mueve el archivo adentro, y Chromium da `InvalidModificationError`.
+  2. **El Web Lock llega antes de que se suelten los handles, en los tres navegadores, y los handles se sueltan de a poco.** Se terminó la pestaña que tenía el lock y 50 handles, de cuatro formas: `terminate()`, cerrarla, recargarla, y un error seguido de `close()`. Con cada una, la que esperaba encontró handles tomados en estas iteraciones:
+     - de 18 a 20 de 20, en Chromium y Firefox;
+     - de 7 a 15 de 20, en Safari.
+
+     Al recibir el lock seguían tomados entre 1 y 50 de los 50, y se liberaron de 10 a 99 ms después.
+     - **En Chromium, un `move()` en vuelo de un Worker terminado aterriza después de que la otra pestaña tomó el lock**, de 17 a 25 ms después. Pasó en 10 de 20 `terminate()` y en 4 de 20 `close()` del Worker. Al cerrar o recargar la pestaña, nunca. Los `removeEntry` en vuelo ya habían aterrizado siempre. En Firefox y Safari no aterrizó nada después del lock, en 80 iteraciones en cada uno.
+  3. Con `ifAvailable`, la segunda pestaña recibe `null` enseguida en los tres, en menos de 10 ms. Sin `ifAvailable`, espera, y recibe el lock de 0 a 6 ms después de que se suelta.
+  4. **El cuerpo de un `fetch`:** en los tres, con HTTP/1.1, llega bloque a bloque, cada bloque de 0 a 7 ms después de que se envía. `abort()` rechaza la lectura pendiente con `AbortError` y cierra la conexión. Con HTTP/2, que se midió solo en Chromium, pasa lo mismo, con un `RST_STREAM`.
+     - **Si el Worker deja de leer:** Chromium frena lo que recibe, y el servidor se traba a los 12 a 15 MB (con HTTP/2, a los 12,6 MB). Firefox frena recién a unos 4 GiB (4,3 GB). Safari no frena: recibe 4,6 y 6,6 GB en 8 s, hasta que falla el `fetch`.
+  5. **Una pestaña en segundo plano, unos 390 s:**
+     - en Chromium y Firefox, el `setTimeout` de 30 s del Worker se demora menos de 1 ms, y la página contesta en menos de 2 ms. Chromium frena a uno por minuto los timers de la página, pero no los del Worker.
+     - **Safari suspende el Worker dedicado a los ~240 s**, y cuando la pestaña vuelve, sus timers se disparan de 124 a 147 s tarde.
+  6. **Entre los Workers de dos pestañas,** por un `BroadcastChannel`, en los tres:
+     - los mensajes llegan en orden (se mandaron 5.000, también de 64 KiB);
+     - un `CryptoKey` no extraíble llega usable, y sigue sin poder exportarse;
+     - una ida y vuelta tarda menos de 1 ms de mediana.
+
+     **El lock, al cerrarse la pestaña que lo tiene:** el primero de la cola lo recibe de 2 a 15 ms después en Chromium y Firefox, y de 24 a 117 ms después en Safari. Un `AbortSignal` saca de la cola un pedido que espera, en los tres.
+
+     **Una pestaña congelada:**
+     - en Chromium, congelada con CDP, conserva el lock hasta que se descongela;
+     - **Safari suspende la pestaña en segundo plano con el lock tomado, y la que espera no lo recibe** (se esperó 210 s);
+     - en Firefox no se vio una suspensión en 6,5 minutos;
+     - en Android e iOS no se probó.
+
+     **El prerender:** en Chromium, una página prerenderizada recibe sus Web Locks recién cuando se muestra, de 17 a 31 ms después. Firefox y Safari no prerenderizan.
+- **El codificador `ruzstd` en Safari** (DC9). El programa original no estaba, y se rearmó:
+  - un `cdylib` sin `wasm-bindgen`, de 266 KB, que llama a `encode_snapshot_envelope`;
+  - el generador nativo del payload: el snapshot de `DiskStorageEngine` de 756.000 filas, de 104,3 MB.
+
+  No es el mismo contenido que el de DC9: el `zstd` nativo de nivel 3 lo comprime a 10,3 MB, no a 8,8 MB.
+
+  | | Hardware | Comprimir (6 corridas: 2 cargas de 3) | Resultado | Decodificar el envelope nativo | Decodificar el suyo |
+  |---|---|---|---|---|---|
+  | Safari 27.2 | el M1 virtual del runner | de 0,59 a 0,67 s (en otro runner, de 0,65 a 0,92 s) | 18,5 MB | de 0,24 a 0,30 s | de 0,18 a 0,19 s |
+  | Chromium 153 | un Xeon con la misma descripción que el de DC9 | de 0,99 a 1,16 s | 18,5 MB | de 0,38 a 0,44 s | de 0,27 a 0,32 s |
+
+  El `zstd` nativo decodifica a los mismos bytes lo que comprimió el navegador. Los tiempos se pueden comparar con los de DC9; los tamaños no, porque el payload es otro.
+- **`safaridriver`:** sus sesiones tienen un almacenamiento propio y efímero: ven el OPFS vacío, y no ven el de Safari. Por eso la página de aceptación corre en Safari con `open -a Safari` (DC44, paso S2).
+- **El seguimiento.** Corrió después de que el dueño del proyecto eligiera no confiar en `move()`, con 20 cortes por serie y dos reaperturas por corte.
+  - **En Firefox:**
+    - un `move()` de un temporal a un nombre libre no dañó nada en ninguno de los 20 cortes: ni el archivo movido, ni su temporal, ni las generaciones anteriores;
+    - borrar el destino antes del `move()` no alcanza: 3 de 20 cortes lo dejaron con 0 bytes;
+    - sobre un archivo existente, 7 de 20 cortes dejaron el destino roto, sin el archivo o con 0 bytes. En los 7, el temporal más nuevo estaba entero, de una generación igual o posterior a la del último `move()` resuelto, y nunca se dañó otro archivo.
+
+    En Chromium, como control, los dos primeros casos salieron limpios.
+  - **En Chromium, DC41:** la pestaña que recibe el lock pide el handle de `client.lock` cada vez que termina un listado del directorio, y lista el directorio de seguido hasta tenerlo y durante 1 s después. Se probaron 160 iteraciones: cuatro formas de terminar la otra pestaña, con 1 handle y con 50.
+    - Ninguna operación en vuelo de la pestaña que terminó aterrizó después de que se tomó el handle.
+    - Algunos `move()` aterrizaron después del lock. Las ventanas de listado en que se vieron terminan a los 13 ms del lock como máximo, y una vez a los 191 ms, con el handle a los 191,1 ms.
+    - Cerrar los handles antes de `terminate()` no lo evita del todo: pasó en 1 de 20.
+    - El handle salió al primer pedido en todas las iteraciones, de 1,8 a 18 ms después del lock, y una vez a los 191 ms. El reintento que propone DC41 no llegó a ejercitarse.
+    - Los otros 49 handles no se miraron.
+- **Lo que no se midió:**
+  - un rechazo después de un error de E/S;
+  - HTTP/2 en Firefox y Safari;
+  - la congelación en Firefox, y en Android e iOS;
+  - en Firefox, un corte entre el `move()` a una generación nueva y el `removeEntry` de la vieja (lo cubre el supuesto de orden de §2);
+  - un corte de energía;
+  - S1 (5).
+
+**Lo que cambia:**
+- **DC39** (adoptada el 24 de Noviembre de 2026). La capa del OPFS reemplaza un archivo con generaciones, sin `move()` sobre uno existente. Usa siempre la forma `move(directorio, nombre)`, toma los errores de cada navegador de esta sección, y la condición queda respondida.
+- **DC41** (adoptada el 24 de Noviembre de 2026). Con el lock tomado, la apertura espera durante un plazo los handles que el Worker que terminó todavía no soltó, y si falla, suelta el lock. Resuelve el requisito 8 de §1.3.
+- **DC40.** Firefox y Safari no frenan lo que reciben como Chromium; va al §4 de `INVARIANTES.md`.
+- **DC44.** Safari corre con `open -a Safari`, y Firefox entra al job `browser` desde el Lote 2, con el Firefox de Playwright.
+- **DC45.** Un guardado es durable por las generaciones, y la repetición antes de servir se queda.
+- **DC46 y el paso D** reciben la suspensión de Safari con el lock tomado (el requisito 3 de §1.3), el prerender y las latencias entre pestañas.
+- **Para 4.6:** en Firefox `persist()` no resuelve sin el usuario, así que la página tiene que llamarlo con un plazo.
 
 ### 1.3. Requisitos de diseño de DC46 (para el paso D)
 
 Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sobre versiones detalladas de DC46 que no llegaron a verde. El paso D los resuelve, con su revisión cruzada:
 1. **Encontrar a la líder.** Una pestaña que se abre después del anuncio de la líder no lo recibe (un `BroadcastChannel` no repite), y dos pueden preguntar a la vez. La versión del protocolo y la configuración (la persona y el servidor) van en la pregunta, la respuesta y el anuncio, con un formato que no cambie entre versiones, para que una líder vieja conteste y su seguidor reciba `InUse` y no `Offline`.
 2. **Saber que la líder se fue,** sin que un anuncio viejo engañe: el lock de la pestaña de ella, tomado antes de su primer mensaje, sin número de relevo. El `shutdown` de la líder tiene que soltarlo y no mandar nada después de avisar: el fin de los `watch` que produce cerrar el cliente va por otro canal, sin orden con el aviso. Recibir el lock del directorio termina el seguimiento de la anterior.
-3. **Nada se ejecuta después de que su pestaña lo dio por terminado.** Los comandos que un seguidor manda quedan en la cola del Worker de la líder, y una líder ocupada en un trabajo de CPU largo (DC39) o congelada los ejecuta cuando vuelve a correr. Por eso el seguidor da por terminado un comando solo cuando la líder se fue (DC46); un *ping*, si hace falta, solo informa. Una líder congelada deja esperando a las demás: el límite, la condición sobre S5 (6) y la salida posible de terminar el Worker en el evento `freeze`.
+3. **Nada se ejecuta después de que su pestaña lo dio por terminado.** Los comandos que un seguidor manda quedan en la cola del Worker de la líder, y una líder ocupada en un trabajo de CPU largo (DC39) o congelada los ejecuta cuando vuelve a correr. Por eso el seguidor da por terminado un comando solo cuando la líder se fue (DC46); un *ping*, si hace falta, solo informa. Una líder congelada deja esperando a las demás: el límite, la condición sobre S5 (6) y la salida posible de terminar el Worker en el evento `freeze`. S5 (6) midió que Safari suspende a los ~4 minutos el Worker de una pestaña en segundo plano, sin soltar su lock (§1.2.1).
 4. **Lo que deja una pestaña que se va:** sus suscripciones, sus salas y los comandos suyos que la líder termina después (un `room` o un `watch` que se abre cuando la pestaña ya no está tiene que soltarse).
 5. **El relevo:** qué devuelve cada comando en vuelo (una escritura y un `discard`, `OutcomeUnknown`; los que se pueden repetir); el orden de la restauración de cada pestaña (sus claves, sus salas, el modo, sus `watch`) y lo que se manda otra vez después; un `close` o un `unwatch` en vuelo; el modo de una sala, que no puede depender del orden en que restauran las pestañas; un `watch` que no queda colgado ni repite un valor (la confirmación de punta a punta, un valor que no se publica por igual al último, un error repetido); y la líder nueva, que restaura lo de su propia página.
 6. **El token:** a qué página se lo pide la líder, con el `TokenProvider` de hoy, que no sabe qué pestaña lo pidió (la renovación es una por sala), y qué pasa si esa página está en segundo plano (S5, pregunta 5).
 7. **Las claves:** una que llega tarde, con un `watch` en `Decryption` (DC35: un error no cambia el último valor emitido, así que volver a leer el mismo valor no emite nada); con código nuevo del núcleo para marcar las suscripciones de la sala, o volviendo a suscribir sin bajar el modo `live` (INV-K18). Claves distintas para una sala en pestañas distintas.
-8. **La apertura en el relevo:** el handle de `client.lock` que todavía tiene el Worker que terminó (S5, pregunta 2), con un plazo, en el Lote 10 (que lo necesita para sus propios tests), y la excepción que eso sería en INV-K13 y DC41; qué pasa con el lock del directorio después de un error al abrir.
+8. **La apertura en el relevo:** los handles que todavía tiene el Worker que terminó (el de `client.lock`, y los de las salas y los de los metadatos) quedan resueltos en DC41 con el paso S1: la espera con un plazo, en el Lote 10. DC41 decide además que el store suelta el lock si la apertura falla. Al paso D le queda qué hace la pestaña en el relevo después de ese error: si vuelve a la cola, y qué les dice a sus seguidores.
 9. **Los errores:** `Offline` sin líder, frente a DC36 y a la fachada de hoy ("las lecturas nunca son `Offline`", y lleva una sala); `OutcomeUnknown` para un `discard`; `InUse` y el `shutdown` de un seguidor en el enunciado de INV-K2; y los archivos de 4.4 que cambian con eso.
 10. **La memoria:** un canal por pestaña para lo que va a una sola (un `scan` grande no se copia en todas); lo que retiene un seguidor; los pedidos de lock que se cancelan con un `AbortSignal`.
 11. **Lo que una pestaña le hace a las demás:** `close` por pestaña, que termina sus `watch` en esa sala; `discard` y `set_freshness`, del cliente (DC37, DC36).
@@ -257,7 +435,7 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 | Orden | Lote | Crates | Decisiones | Invariantes | Progreso |
 |---|---|---|---|---|---|
 | 0 | Contrato | Documentos | DC38 a DC46 | Ajustes: §2, §4, S1 a S8, L7, W1 y W2 sobre el OPFS, y K1 a K13 y K15 a K17 en el navegador |✅ |
-| S1 | Spikes: S1 en Firefox, S3 en Safari y Firefox, S5 | Fuera del repo | DC8, DC17, DC39 a DC41, DC45, DC46 | — | ⬜ |
+| S1 | Spikes: S1 en Firefox, S3 en Safari y Firefox, S5 | Fuera del repo | DC8, DC17, DC39 a DC41, DC45, DC46 | — | ✅ |
 | 1 | El arnés del navegador | `tools/browser` (pruebas) y CI | DC44 | — | ✅ |
 | 2 | La capa del OPFS: el directorio | storage | DC39, DC38, DC45 | S1 a S8 y L7 sobre el OPFS | ⬜ |
 | 3 | La capa del OPFS: los archivos | storage | DC39, DC44 | S1 a S8 y L7 sobre el OPFS | ⬜ |
@@ -285,7 +463,7 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 - El 1 y el 15 son pruebas y herramientas, sin producción (salvo arreglos de lo que encuentren, que van como desvíos en su nota o como lotes nuevos).
 - El 16 cierra con la revisión de cierre (§3); sus rupturas se arreglan en lotes nuevos de 4.5.
 
-**Tamaño.** Unas 200 líneas de producción el Lote 2, 220 el 3 (la capa nativa, con el mismo contrato, tiene unas 300 sin comentarios), 120 el 4, 60 el 5, 280 el 6 (si pasa de 300, se parte: los comandos y el despachador; las suscripciones y el token), 120 el 7 (mecánico), 200 el 8, 280 el 9, 100 el 10, 150 el 11 y 180 el 12; las del 13 y el 14, las estima el paso D. El arnés del 1 y las pruebas del 15 no son producción.
+**Tamaño.** Unas 260 líneas de producción el Lote 2 (con las generaciones de DC39), 220 el 3 (la capa nativa, con el mismo contrato, tiene unas 300 sin comentarios), 120 el 4, 60 el 5, 280 el 6 (si pasa de 300, se parte: los comandos y el despachador; las suscripciones y el token), 120 el 7 (mecánico), 200 el 8, 280 el 9, 100 el 10, 150 el 11 y 180 el 12; las del 13 y el 14, las estima el paso D. El arnés del 1 y las pruebas del 15 no son producción.
 
 **Chequeos de cierre de cada lote:** los de `docs/METODOLOGIA.md` §4 (regla 4), con el de wasm32 del cliente con `--no-default-features --features wasm` desde el Lote 8; las versiones largas en release (regla 5) de los crates tocados; desde el Lote 1, las pruebas del navegador (`tools/browser`) en Chromium y los tests unitarios en wasm32, con el fmt y el clippy del arnés, en los lotes que tocan algo que corre en el navegador; las mutaciones inversas en una copia del repo; y la revisión de delta (§5, paso 4).
 
@@ -302,7 +480,7 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 - Toda operación del OPFS que es una promesa termina aunque se suelte su future, y retiene su handle hasta entonces (INV-L7, DC39).
 - Nada que no se serializa cruza el límite del Worker, salvo el `CryptoKey` de una sala (DC42, DC43).
 - El claro de una columna cifrada no sale del Worker salvo hacia la aplicación: su página, o el Worker de la pestaña que lo pidió, por el canal de esa pestaña (INV-K9, DC46).
-- Ningún archivo del directorio se toca antes de tener el lock de la pestaña (INV-K13).
+- Ningún archivo del directorio se toca antes de tener el lock de la pestaña (INV-K13), ni, después de recibirlo, antes del handle de `client.lock` (DC41).
 - Una escritura o un `discard` de una pestaña se ejecuta a lo sumo una vez, en la líder a la que se mandó, y nunca después de que su pestaña lo dio por terminado (DC46, INV-K2).
 
 ### Lote 0 · Contrato · ✅ Hecho (23 de Noviembre de 2026)
@@ -502,18 +680,68 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
     - el runner (8 pasos) y su self-check, en Chromium 157 (Playwright 1.63);
     - los tests unitarios en wasm32, en Chrome 153.
   - **De la raíz,** aunque el lote no toca sus crates: fmt, clippy, doc con `-D warnings`, wasm32 con clippy, y la suite del workspace (1647 tests, sin fallas). Los `--ignored` en release no corresponden, porque no cambia ningún crate.
-  - **La CI:** en el commit del lote.
+  - **La CI de `main`,** en verde sobre `27e7320`, con sus nueve jobs. El de `browser` tardó 4 min 40 s en frío; lo que más tardó fue instalar `wasm-bindgen-cli`, 1 min 36 s.
+
+### Paso S1 · Los spikes (fuera del repo) · ✅ Hecho (23 de Noviembre de 2026)
+**Qué corrió** (§1.2): S1 en Firefox, S3 en Safari y Firefox, S5 en los tres navegadores y la medición de `ruzstd` en Safari.
+- **Dónde:** Firefox en un runner de `ubuntu-latest`, Safari en uno de `macos-latest`, y Chromium en el entorno de la sesión.
+- **El código,** en la rama de trabajo de la sesión (`spikes/fase4_5-s1/`), sin mergear.
+- **Las respuestas,** en §1.2.1.
+- **Un spike de seguimiento,** después de que el dueño del proyecto eligiera no confiar en `move()`:
+  - en Firefox, midió el `move()` a un nombre libre y el borrado antes del `move()`;
+  - en Chromium, midió si una operación en vuelo aterriza después del handle de `client.lock`.
+
+**Qué cambia.**
+- **Revisa** DC39 (las generaciones) y DC41 (la espera de los handles después del lock), que el dueño del proyecto adoptó el 24 de Noviembre de 2026, con la revisión cruzada en verde.
+- **Suma notas:**
+  - en DC40, DC44, DC45 y DC46 y en §1.3;
+  - en los Lotes 2 y 3 (las generaciones, y Firefox en el job `browser`), 4 (la instalación de un snapshot, cortada), 8 y 10 (la espera);
+  - en el checklist propio;
+  - en el plan de la fase (DC8, DC9, DC17, DC39, DC41, DC44 y DC45, sus pendientes y su avance) y en el de 4.1 (S3).
+- **`INVARIANTES.md`, versión 49:** §2, §3.2, INV-K13, INV-K16 y dos filas de §4.
+- **La revisión cruzada** de este cambio, que es solo de documentos, la hizo un agente aparte, de contexto fresco y solo lectura, que contrastó los números con los datos crudos y las generaciones con el código del motor. **Salió en verde en su cuarta ronda.**
+  1. **Primera ronda: 2 bloqueantes, 10 ajustes y unos 25 menores, corregidos.**
+     - **Los bloqueantes:**
+       - *Las generaciones* no decían qué da un `rename` cuyo borrado de las viejas falla. Propagar ese error habría sido un rechazo con efecto, en contra de `apply_snapshot` y de INV-S5. Tampoco decían en qué orden borra `remove`. Ahora `rename` da `Ok` una vez resuelto el `move()`, y `remove` borra de la más vieja a la más nueva.
+       - Esperar solo `client.lock` no cubría los demás handles, que el navegador suelta de a poco. Ahora la espera, con su plazo, cubre también las salas y los metadatos.
+     - **Los ajustes:**
+       - la limpieza al abrir el directorio, que se sacó;
+       - `create_locked`, `list` y el rename del handle con las generaciones, también en el Lote 3;
+       - lo que eligió el dueño del proyecto, ahora precisado, con su forma literal en las alternativas;
+       - los números de §1.2.1 y de DC41: de 10 a 99 ms, el reintento que no se ejercitó, y que solo los `move()` aterrizaron tarde;
+       - la tabla de errores de `move()`;
+       - el caso de `.wal.compacting` en el riesgo aceptado;
+       - el Web Lock, que se suelta si la apertura falla;
+       - el supuesto de §2, sin enunciarlo de más;
+       - los estados del plan de la fase;
+       - la fila del stream en §4, y DC40.
+  2. **Segunda ronda, acotada a las correcciones: 3 ajustes y 9 menores, corregidos.** Los ajustes:
+     - la limpieza al abrir, que todavía estaba en el Lote 2;
+     - el error *tomado* de la capa, para que la espera reintente también los temporales, las lecturas de la recuperación y el guardado de los metadatos;
+     - cómo se resuelve un nombre: se recorre todo el directorio y se compara por el nombre exacto.
+  3. **Tercera ronda: 1 ajuste y 4 menores, corregidos.** El ajuste: el error *tomado* va por operación, porque en Safari `removeEntry` da `NoModificationAllowedError`.
+  4. **Cuarta ronda: verde.**
+
+**Entrega:** `docs: the answers of the spikes of Fase 4.5, and the decisions they revise (Fase 4.5, Paso S1)`.
 
 ### Lote 2 · La capa del OPFS: el directorio (`zemdb-storage`) · ⬜
 **Objetivo:** la parte de `OpfsFiles` que trabaja sobre el directorio, con la tarea que retiene una promesa soltada (DC39, DC38), y el método de la capa de DC45.
 
-**Archivos:** `crates/storage/src/lib.rs` (`files` en wasm32), `files/mod.rs` (`native` solo fuera de wasm32; los traits sin `Send` en wasm32, DC38; y el método que dice si `sync_dir` hace durable un cambio que ya ocurrió, DC45, en la capa nativa, la de prueba y la del OPFS, y en `TestFiles`, de `crates/client/tests/common/`; con el contrato de `sync_dir` reescrito, DC39), `files/opfs.rs` (nuevo), `sys.rs` (lanzar una tarea, DC38), `crates/storage/Cargo.toml` (`web-sys`, `js-sys`, `wasm-bindgen` y `wasm-bindgen-futures`, solo en wasm32), los pasos del arnés y `ARCHITECTURE.md` §8 (*File Layer*).
+**Archivos:** `crates/storage/src/lib.rs` (`files` en wasm32), `files/mod.rs` (`native` solo fuera de wasm32; los traits sin `Send` en wasm32, DC38; y el método que dice si `sync_dir` hace durable un cambio que ya ocurrió, DC45, en la capa nativa, la de prueba y la del OPFS, y en `TestFiles`, de `crates/client/tests/common/`; con el contrato de `sync_dir` reescrito y el error *tomado* en el de `open_read`, `create`, `remove` y `rename`, DC39), `files/opfs.rs` (nuevo), `sys.rs` (lanzar una tarea, DC38), `crates/storage/Cargo.toml` (`web-sys`, `js-sys`, `wasm-bindgen` y `wasm-bindgen-futures`, solo en wasm32), los pasos del arnés, `.github/workflows/ci.yml` (Firefox en el job `browser`) y `ARCHITECTURE.md` §8 (*File Layer*).
 
-**Qué se hace:** la raíz y las rutas, los bindings que faltan, los errores, la tarea de `sys` y las operaciones del directorio de DC39 (`exists`, `list`, `rename`, `remove`, `create_dir_all`, `sync_dir`), sobre archivos sin handles abiertos. Lo que S1 y S3 contestaron en cada navegador decide qué error es cuál.
+**Qué se hace:** la raíz y las rutas, los bindings que faltan, los errores, la tarea de `sys` y las operaciones del directorio de DC39 (`exists`, `list`, `rename`, `remove`, `create_dir_all`, `sync_dir`), sobre archivos sin handles abiertos, con las generaciones de un nombre (DC39). Los errores de cada navegador son los de §1.2.1, con el error *tomado* de `remove` y `rename` (DC39). Firefox entra en el job `browser` (DC44).
 
 **Tests exigidos** (pasos del arnés, sobre la capa real):
 - Cada operación del directorio, y su resultado después de recargar.
-- Renombrar o borrar un archivo con un handle abierto (abierto con `web-sys` en el paso) falla sin cambiar nada (S3); renombrar reemplaza el destino.
+- Renombrar un archivo con un handle abierto en el origen, o borrarlo, falla con el error *tomado* y sin cambiar nada (S3), con el handle abierto con `web-sys` en el paso. Renombrar reemplaza el destino. Un destino abierto no hace fallar el `rename`, porque el `move()` va a un nombre libre. El motor, de todos modos, nunca renombra sobre un archivo abierto (DC17).
+- Las generaciones:
+  - un `rename` sobre un nombre que existe no mueve sobre él;
+  - el nombre vale su generación más nueva en cada operación, también después de recargar;
+  - `list` da los nombres sin el sufijo;
+  - un nombre con dos generaciones (las que deja un corte, fabricadas en el paso) vale la más nueva, y el próximo `rename` o `remove` borra la vieja;
+  - `remove` borra de la más vieja a la más nueva;
+  - un `rename` cuyo borrado de las viejas falla, con una abierta en el paso, da `Ok` con el valor nuevo;
+  - el origen de un `rename` con generaciones viejas queda sin ninguna.
 - Una ruta con `..`, o fuera de la raíz, se rechaza sin tocar nada.
 - Una operación que es una promesa, soltada: termina, y la siguiente sobre el mismo archivo la espera.
 - Un `NotFound` y la cuota llena salen con su `ErrorKind`.
@@ -529,10 +757,10 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 
 **Archivos:** `crates/storage/src/files/opfs.rs` y sus tests unitarios en wasm32; lo que esos tests necesitan, porque los de hoy no compilan en wasm32 (usan `#[tokio::test]`, `zstd`, el motor en disco y los *fail points*): los módulos de tests nativos de `crates/storage/src/` fuera de wasm32, `wasm-bindgen-test` en `crates/storage/Cargo.toml` (solo para los tests en wasm32), el runner (`.cargo/config.toml`) y el comando de la CI (`cargo test --target wasm32-unknown-unknown -p zemdb-storage --lib`); los pasos del arnés y `ARCHITECTURE.md` §8.
 
-**Qué se hace:** `open_locked`, `create_locked`, `create` y `open_read`, con un `FileSystemSyncAccessHandle` cada uno; `read_at`, `write_at`, `size`, `set_len`, `sync_data` y `sync_all`; renombrar el archivo abierto; el handle muerto.
+**Qué se hace:** `open_locked`, `create_locked`, `create` y `open_read`, con un `FileSystemSyncAccessHandle` cada uno y sobre la generación más nueva de su nombre (`create_locked`, `AlreadyExists` si existe alguna; `open_read` y `create`, el error *tomado* de DC39 con otro handle sobre el archivo); `read_at`, `write_at`, `size`, `set_len`, `sync_data` y `sync_all`; renombrar el archivo abierto, con las generaciones del destino (DC39); el handle muerto.
 
 **Tests exigidos:**
-- **Pasos del arnés:** leer y escribir en un offset, el largo, truncar, `flush`, y lo escrito después de recargar; `open_locked` y `create_locked` dan `None` con otro handle sobre el archivo, también desde un Worker de otra página; `create_locked` sobre uno que existe es `AlreadyExists` y no lo trunca; renombrar el archivo abierto lo sigue, y el handle sigue sirviendo; `read_at` más allá del fin es `UnexpectedEof`, nunca una lectura corta.
+- **Pasos del arnés:** leer y escribir en un offset, el largo, truncar, `flush`, y lo escrito después de recargar; `open_locked` y `create_locked` dan `None` con otro handle sobre el archivo, también desde un Worker de otra página; `create_locked` sobre uno que existe es `AlreadyExists` y no lo trunca; renombrar el archivo abierto lo sigue, también sobre un nombre que existe (a su generación siguiente), y el handle sigue sirviendo; cada apertura usa la generación más nueva de su nombre, y `create_locked` da `AlreadyExists` con cualquier generación; `open_read` y `create` dan el error *tomado* con otro handle sobre el archivo; `read_at` más allá del fin es `UnexpectedEof`, nunca una lectura corta.
 - **Tests unitarios en wasm32:** el handle muerto (la reapertura después del `move()` que falla, forzada con un mecanismo de `opfs.rs` bajo `cfg(test)`: los *fail points* compilan en wasm32 recién en el Lote 4): toda operación siguiente falla, y no escribe en ningún archivo.
 
 **Interacciones a revisar:** los requisitos de DC17; la búsqueda de frames y el replay, que no admiten una lectura corta; la rotación y su vuelta atrás.
@@ -549,10 +777,10 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 **Qué se hace:** las tareas del motor (`open_room`, `apply_snapshot`, `delete_room`, `compact_room` y la compactación automática) con la tarea de `sys`; el motor, la recuperación y la compactación compilados en wasm32; el `.snap` con `ruzstd` `Fastest`; los nombres temporales al azar; el módulo de los *fail points*, también en wasm32 (DC39); el lint del storage. En la capa de prueba nativa, el segundo handle rechazado (DEF-184) y los dos tests del handle muerto de la revisión de cierre de 4.1 (DEF-185).
 
 **Tests exigidos:**
-- **En el navegador:** una sala que aplica lotes, se recarga la página y reabre con todo lo aplicado; el Worker terminado en medio de un lote, y la sala que reabre en un prefijo del log; una compactación, también terminada en el medio, y la sala que reabre igual; `apply_snapshot` de un snapshot nativo (Zstd) y de uno propio (`ruzstd`), también después de recargar; `delete_room`, también terminado en el medio; una segunda página que abre la misma sala recibe `RoomLocked`.
+- **En el navegador:** una sala que aplica lotes, se recarga la página y reabre con todo lo aplicado; el Worker terminado en medio de un lote, y la sala que reabre en un prefijo del log; una compactación, también terminada en el medio, y la sala que reabre igual; `apply_snapshot` de un snapshot nativo (Zstd) y de uno propio (`ruzstd`), también después de recargar; `delete_room`, también terminado en el medio; el Worker terminado en medio de la instalación de un snapshot, y la sala que reabre con el viejo o con el nuevo; una segunda página que abre la misma sala recibe `RoomLocked`.
 - **En nativo:** la suite del storage entera, sin cambios; DEF-184 y DEF-185 en la capa de prueba.
 
-**Interacciones a revisar:** INV-S1, S3, S4, S5 y S8, cuyos mecanismos (las tareas propias, el lock del WAL) cambian de runtime en wasm32; INV-L7 (las tareas del motor retienen los locks, D86 y D89); el decodificador y el codificador `ruzstd` (INV-W1, W2); la compactación automática, que se lanza sin que nadie la espere; un `move()`, una creación o un `removeEntry` que se rechazan con efecto en el OPFS (S5, pregunta 1; DC39).
+**Interacciones a revisar:** INV-S1, S3, S4, S5 y S8, cuyos mecanismos (las tareas propias, el lock del WAL) cambian de runtime en wasm32; INV-L7 (las tareas del motor retienen los locks, D86 y D89); el decodificador y el codificador `ruzstd` (INV-W1, W2); la compactación automática, que se lanza sin que nadie la espere; un rechazo con efecto en el OPFS (el riesgo aceptado de DC39); las generaciones bajo la instalación de un snapshot, la rotación y su vuelta atrás, y la limpieza de temporales de la recuperación.
 
 **Documentos:** `ARCHITECTURE.md` §8 (el motor en wasm32); `INVARIANTES.md`: el estado de S1 a S8, L7, W1 y W2 sobre el OPFS.
 
@@ -635,7 +863,7 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 - Un guardado de metadatos y una recarga: abre con lo guardado; después de un guardado que falló, `room` vuelve a guardar antes de servir (DC45).
 - **En nativo:** la suite entera, sin cambios.
 
-**Interacciones a revisar:** todo lo que corre en una tarea propia en el núcleo (DC21) y en el worker (DC28); los timers del navegador (S5, pregunta 5); INV-K16 en el OPFS (el guardado con `move()`); la memoria del Worker.
+**Interacciones a revisar:** todo lo que corre en una tarea propia en el núcleo (DC21) y en el worker (DC28); los timers del navegador (S5, pregunta 5); INV-K16 en el OPFS (el guardado con el `rename` de la capa, sus generaciones); la memoria del Worker.
 
 **Documentos:** `ARCHITECTURE.md` §11 (el cliente en wasm32); `INVARIANTES.md`: K1 a K8, K10, K11 y K16 en el navegador.
 
@@ -668,13 +896,13 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 
 **Archivos:** `crates/client/src/metadata.rs` (el Web Lock en `FileMetadata::open` en wasm32, la opción de esperar en su constructor, y el error propio de un store tomado), `client.rs` y `error.rs` (`InUse`), `crates/storage/src/files/native.rs` (`None` solo con el lock tomado, con un *fail point* en la toma del lock), `crates/storage/src/files/mod.rs` (el contrato de `create_locked`: un error también puede dejar el archivo creado), `crates/storage/src/files/tests/native.rs`, la expectativa de `a_second_client_over_the_same_directory_fails_until_the_first_shuts_down` (`crates/client/tests/client_tests.rs`), que pasa de `Storage` a `InUse`, los pasos del arnés y `ARCHITECTURE.md` §11.
 
-**Qué se hace:** DC41, también `InUse` en nativo, sin el punto de entrada del Worker (Lote 12), que lo usa.
+**Qué se hace:** DC41, con la espera, durante un plazo desde el Web Lock, de los handles que el Worker que terminó todavía no soltó (el de `client.lock`, y después los de las salas y los de los metadatos, ante `RoomLocked` y el error *tomado* de la capa, que dan los Lotes 2 y 3), y también `InUse` en nativo, sin el punto de entrada del Worker (Lote 12), que lo usa.
 
 **Tests exigidos:**
-- **Pasos del arnés, con dos páginas del mismo contexto:** la segunda recibe `InUse` sin tocar ningún archivo (una capa que cuenta las operaciones, alrededor de la del OPFS, no ve ninguna); con la opción de esperar, la segunda abre cuando la primera hace `shutdown`, y cuando su Worker termina; recargar la página que tiene el cliente: la página nueva lo abre; dos directorios distintos se abren a la vez en dos páginas.
+- **Pasos del arnés, con dos páginas del mismo contexto:** la segunda recibe `InUse` sin tocar ningún archivo (una capa que cuenta las operaciones, alrededor de la del OPFS, no ve ninguna); con la opción de esperar, la segunda abre cuando la primera hace `shutdown`, y cuando su Worker termina; recargar la página que tiene el cliente: la página nueva lo abre; dos directorios distintos se abren a la vez en dos páginas. Con la opción de esperar, la segunda abre aunque el handle de `client.lock` y los de las salas sigan tomados un rato después de recibir el lock (el paso lo provoca terminando el Worker de la primera con muchos handles abiertos, en medio de una compactación y en medio de un guardado de los metadatos). Si no se sueltan en el plazo, la apertura del store da `InUse` y suelta el lock, y la de una sala da su propio error.
 - **En nativo:** un segundo cliente sobre un directorio tomado recibe `InUse`. En el storage, un error inyectado al tomar el lock (el *fail point* nuevo, en `files/tests/native.rs`) es un `Err`, no `None`: con el código de hoy, que da `None` con cualquier error, el test falla. En el cliente, con `TestFiles` que falla en el `open_locked` de `client.lock`, `Client::open` da `Storage`, no `InUse`.
 
-**Interacciones a revisar:** `FileMetadata` y `client.lock`; el `RoomLocked` del motor en disco, que sale del mismo `None` de la capa nativa (`lock_room_files`, y `create_locked` en la rotación y en el snapshot temporal, en `compactor.rs`), y la capa de prueba `opfs_like.rs`, que delega en ella; el snapshot temporal que `create_locked` creó antes de fallar al tomar su lock, que `stage_file` hoy deja si sale por el error (tiene que borrarlo, como con `None`); `shutdown` (DC28) y el último `Ack`; el orden en que el navegador suelta los handles y el lock (S5, pregunta 2).
+**Interacciones a revisar:** `FileMetadata` y `client.lock`; el `RoomLocked` del motor en disco, que sale del mismo `None` de la capa nativa (`lock_room_files`, y `create_locked` en la rotación y en el snapshot temporal, en `compactor.rs`), y la capa de prueba `opfs_like.rs`, que delega en ella; el snapshot temporal que `create_locked` creó antes de fallar al tomar su lock, que `stage_file` hoy deja si sale por el error (tiene que borrarlo, como con `None`); `shutdown` (DC28) y el último `Ack`; el orden en que el navegador suelta los handles y el lock, y las operaciones en vuelo de un Worker terminado (S5 (2), §1.2.1).
 
 **Documentos:** `ARCHITECTURE.md` §11; `INVARIANTES.md`: K13, K11 y K17.
 
@@ -767,7 +995,7 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 - los `watch` de los seguidores siguen después del relevo, también los de una columna cifrada, sin repetir un valor ni quedar colgados;
 - en la líder no queda nada de lo que un seguidor dio por terminado.
 
-**Interacciones a revisar:** el orden en que el navegador suelta el lock y los handles de la líder que se va (S5, pregunta 2); sus escrituras en vuelo (INV-K11, INV-K2); el `watch` que se vuelve a suscribir (INV-K10); el worker de cada sala en la líder nueva, que arranca como al abrir (DC36); las claves (INV-K9); los tokens de las salas que se vuelven a abrir (DC30).
+**Interacciones a revisar:** el orden en que el navegador suelta el lock y los handles de la líder que se va (S5 (2), §1.2.1; la espera de DC41); sus escrituras en vuelo (INV-K11, INV-K2); el `watch` que se vuelve a suscribir (INV-K10); el worker de cada sala en la líder nueva, que arranca como al abrir (DC36); las claves (INV-K9); los tokens de las salas que se vuelven a abrir (DC30).
 
 **Documentos:** `ARCHITECTURE.md` §11; `INVARIANTES.md`: K2, K9, K10, K11, K13 y K15.
 
