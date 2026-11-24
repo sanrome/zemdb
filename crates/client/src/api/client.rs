@@ -121,6 +121,12 @@ impl ZemdbClient {
         self.inner.client.shutdown().await
     }
 
+    /// The handle of `room_id`, without opening it: what it reaches is the room as the client has
+    /// it at each call, as with the handle that [`room`](Self::room) gives.
+    pub(crate) fn handle(&self, room_id: RoomId) -> RoomHandle {
+        RoomHandle::new(self.clone(), room_id)
+    }
+
     /// The client of the core.
     pub(super) fn core(&self) -> &Arc<Client> {
         &self.inner.client
