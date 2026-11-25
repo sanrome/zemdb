@@ -4,6 +4,7 @@
 //! write in a room whose last request got no reply is `Offline`. With the paused clock, but for the
 //! streams opened and dropped from several threads, and with the longest interval of the
 //! heartbeats, so that, once one went, what a test waits for comes long before the next one.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

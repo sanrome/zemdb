@@ -2,6 +2,7 @@
 //! current value of its read and then the value each time it changes in the replica, after each
 //! change of the applier, never for an operation the replica rejects, and ends once the room is
 //! out of the client.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

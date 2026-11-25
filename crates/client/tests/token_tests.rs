@@ -1,6 +1,7 @@
 //! The renewal of the token of a room: the client asks the application for a new one when the
 //! server refuses it (`Unauthorized`), and before the next request after the server forbade it
 //! (`Forbidden`), and sends with it only a token of its own client id.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

@@ -2,7 +2,7 @@
 
 **Fecha:** 19 de Noviembre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: el paso S1 (los spikes) hecho el 23 de Noviembre de 2026, en Chromium, Firefox y Safari (§1.2.1): revisa DC39 (un `move()` sobre un archivo existente no es atómico en Firefox) y DC41 (el Web Lock llega antes de que se suelten los handles), las dos adoptadas por el dueño del proyecto el 24 de Noviembre de 2026, y suma notas en DC40, DC44, DC45 y DC46. Lote 1 (el arnés del navegador) hecho el 23 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda; el Lote 6a (los comandos y el despachador del runtime del Worker), hecho el 24 de Noviembre de 2026, con el 6b (las suscripciones y el token) por hacer; la CI de `main`, en verde sobre `8038b07`. Lote 0 (el contrato) cerrado el 23 de Noviembre de 2026, con la revisión cruzada en verde en su sexta ronda y DC46 en su principio, con su protocolo para el paso D (§1.3). El dueño del proyecto adoptó DC40 y DC43 el 22 de Noviembre de 2026, y eligió ese día la pestaña líder para DC41, de donde sale DC46; adoptó las demás el 23 (DC46, en su principio: su protocolo, en el paso D).
+**Estado:** En curso: el paso S1 (los spikes) hecho el 23 de Noviembre de 2026, en Chromium, Firefox y Safari (§1.2.1): revisa DC39 (un `move()` sobre un archivo existente no es atómico en Firefox) y DC41 (el Web Lock llega antes de que se suelten los handles), las dos adoptadas por el dueño del proyecto el 24 de Noviembre de 2026, y suma notas en DC40, DC44, DC45 y DC46. Lote 1 (el arnés del navegador) hecho el 23 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda; el Lote 6a (los comandos y el despachador del runtime del Worker), hecho el 24 de Noviembre de 2026, con el 6b (las suscripciones y el token) por hacer; el Lote 7 (el runtime del cliente detrás de `rt`), hecho el 24 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda; la CI de `main`, en verde sobre `2dab234`. Lote 0 (el contrato) cerrado el 23 de Noviembre de 2026, con la revisión cruzada en verde en su sexta ronda y DC46 en su principio, con su protocolo para el paso D (§1.3). El dueño del proyecto adoptó DC40 y DC43 el 22 de Noviembre de 2026, y eligió ese día la pestaña líder para DC41, de donde sale DC46; adoptó las demás el 23 (DC46, en su principio: su protocolo, en el paso D).
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.5. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Parte de:** el núcleo de 4.2 ([plan](2026-10-fase4_2-nucleo-replica.md)), el worker y el transporte de 4.3 ([plan](2026-11-fase4_3-transporte-worker.md)), la fachada de 4.4 ([plan](2026-11-fase4_4-api-rust.md)) y la capa de archivos de 4.1 (DC17, [plan](2026-10-fase4_1-storage-servidor.md)). Depende de 4.3, que cerró el 19 de Noviembre de 2026 con sus Lotes 11b y 11c (`496da6c`), mientras se escribía este plan: ningún lote de 4.5 la espera.
@@ -66,7 +66,7 @@ Las de la fase que implementa esta sub-fase: DC8 (el OPFS), DC9 (`ruzstd` para e
   - el trabajo de CPU, en el lugar (no hay pool);
   - el azar, con `crypto.getRandomValues`, por `getrandom` con su feature `wasm_js`. `uuid` no compila en wasm32 sin elegir su fuente: el cliente y el storage sacan el azar de `getrandom` en wasm32, o activan su feature `js`;
   - la hora, con `Date.now()`.
-- **Un lint** (`clippy::disallowed_methods`, con un `clippy.toml` en `crates/client` y en `crates/storage`) deja fuera de `rt` y de `sys` lo que en wasm32 entra en pánico o no corre: `std::time::Instant::now`, `SystemTime::now`, `tokio::spawn`, `spawn_blocking` y los timers de Tokio. Vale solo al compilar para wasm32 (fuera de wasm32, los crates lo permiten con `cfg_attr`), así que no toca los tests ni el servidor, que siguen con Tokio.
+- **Un lint** (`clippy::disallowed_methods`, con un `clippy.toml` en `crates/client` y en `crates/storage`) deja fuera de `rt` y de `sys` lo que en wasm32 entra en pánico o no corre: `std::time::Instant::now`, `SystemTime::now`, `tokio::spawn`, `spawn_blocking` y los timers de Tokio. Vale solo al compilar para wasm32 (fuera de wasm32, los crates lo permiten con `cfg_attr`), así que no toca los tests ni el servidor, que siguen con Tokio. *Precisado en el Lote 7:* en el cliente vale también en nativo, fuera de sus tests unitarios (`cfg_attr(test, ..)`), para que la CI vea un uso nuevo fuera de `rt` antes de que el crate compile en wasm32; sus tests de integración y su ejemplo lo permiten con un `allow` cada uno. El storage hace lo mismo en el Lote 4.
 - **El storage** suma lo mismo para sus tareas (`open_room`, `apply_snapshot`, `delete_room` y la compactación, hoy con `tokio::spawn`) y el azar de sus nombres temporales, en su módulo `sys`, donde ya está `run_blocking`: la tarea, en el Lote 2, que la usa para las promesas del OPFS; las del motor y el azar, en el 4.
 - **Sin `Send` en wasm32.** Como `StorageEngine` (`EngineConcurrencyBounds`) y `CryptoEngine` (`CryptoConcurrencyBounds`) hoy, con `async_trait(?Send)`, los traits que implementa la plataforma o la aplicación (`TransportClient`, `TokenProvider`, `MetadataStore`, `RoomFiles` y `RoomFile`) no piden `Send` ni `Sync` en wasm32, donde los objetos de JavaScript no lo son, y los streams tampoco (`EventBlocks`, y `ChangeStream`, que pasa a un `LocalBoxStream`: el pendiente de la nota del Lote 6 de 4.4). En nativo no cambia nada.
 - **Lo que no cambia:** `tokio::sync` (que el storage ya usa en wasm32) y `select!`; el formato, el protocolo y lo que hace cada paso del núcleo y del worker.
@@ -443,7 +443,7 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 | 5 | Los metadatos, durables antes de servirse | client | DC45 | K16 | ⬜ |
 | 6a | El despachador del runtime del Worker: los comandos y el despachador | client | DC42, DC46 | K2, K15 | ✅ |
 | 6b | El despachador del runtime del Worker: las suscripciones y el token | client | DC42, DC46 | K10, K15 | ⬜ |
-| 7 | El runtime del cliente detrás de `rt` | client | DC38 | — (sin cambio de comportamiento) | ⬜ |
+| 7 | El runtime del cliente detrás de `rt` | client | DC38 | — (sin cambio de comportamiento) | ✅ |
 | 8 | El cliente en wasm32: la feature `wasm` | client | DC38, DC39, DC45 | K1 a K8, K10, K11 y K16 en el navegador | ⬜ |
 | 9 | El transporte del navegador | client | DC40 | K7, K12, K15, K17 | ⬜ |
 | 10 | Una pestaña por directorio | client y storage | DC41 | K13, K11, K17 | ⬜ |
@@ -464,7 +464,7 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 - El 1 y el 15 son pruebas y herramientas, sin producción (salvo arreglos de lo que encuentren, que van como desvíos en su nota o como lotes nuevos).
 - El 16 cierra con la revisión de cierre (§3); sus rupturas se arreglan en lotes nuevos de 4.5.
 
-**Tamaño.** Unas 260 líneas de producción el Lote 2 (con las generaciones de DC39), 220 el 3 (la capa nativa, con el mismo contrato, tiene unas 300 sin comentarios), 120 el 4, 60 el 5, 280 el 6 (si pasa de 300, se parte: los comandos y el despachador; las suscripciones y el token; salieron unas 480, y se partió: 299 el 6a), 120 el 7 (mecánico), 200 el 8, 280 el 9, 100 el 10, 150 el 11 y 180 el 12; las del 13 y el 14, las estima el paso D. El arnés del 1 y las pruebas del 15 no son producción.
+**Tamaño.** Unas 260 líneas de producción el Lote 2 (con las generaciones de DC39), 220 el 3 (la capa nativa, con el mismo contrato, tiene unas 300 sin comentarios), 120 el 4, 60 el 5, 280 el 6 (si pasa de 300, se parte: los comandos y el despachador; las suscripciones y el token; salieron unas 480, y se partió: 299 el 6a), 120 el 7 (mecánico; salieron 161), 200 el 8, 280 el 9, 100 el 10, 150 el 11 y 180 el 12; las del 13 y el 14, las estima el paso D. El arnés del 1 y las pruebas del 15 no son producción.
 
 **Chequeos de cierre de cada lote:** los de `docs/METODOLOGIA.md` §4 (regla 4), con el de wasm32 del cliente con `--no-default-features --features wasm` desde el Lote 8; las versiones largas en release (regla 5) de los crates tocados; desde el Lote 1, las pruebas del navegador (`tools/browser`) en Chromium y los tests unitarios en wasm32, con el fmt y el clippy del arnés, en los lotes que tocan algo que corre en el navegador; las mutaciones inversas en una copia del repo; y la revisión de delta (§5, paso 4).
 
@@ -773,7 +773,7 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 ### Lote 4 · El motor en disco en wasm32 (`zemdb-storage`) · ⬜
 **Objetivo:** `DiskStorageEngine<OpfsFiles>` en wasm32, sin cambiar nada en nativo (DC38, DC39).
 
-**Archivos:** `crates/storage/src/sys.rs` (el azar), `disk/mod.rs` (las tareas, y `zstd_level` y su validación), `disk/compactor.rs` (los nombres temporales), `disk/recovery.rs`, `lib.rs` (el motor en disco y los *fail points* en wasm32), `fail_point.rs`, `disk/tests` (fuera de wasm32), `crates/storage/Cargo.toml` (`getrandom`, o la fuente de `uuid`, en wasm32), el `clippy.toml` del storage (el lint de DC38), `disk/tests/opfs_like.rs` (DEF-184 y DEF-185), los pasos del arnés y `ARCHITECTURE.md` §8.
+**Archivos:** `crates/storage/src/sys.rs` (el azar), `disk/mod.rs` (las tareas, y `zstd_level` y su validación), `disk/compactor.rs` (los nombres temporales), `disk/recovery.rs`, `lib.rs` (el motor en disco y los *fail points* en wasm32), `fail_point.rs`, `disk/tests` (fuera de wasm32), `crates/storage/Cargo.toml` (`getrandom`, o la fuente de `uuid`, en wasm32), el `clippy.toml` del storage (el lint de DC38, también en nativo fuera de los tests unitarios, como en el cliente desde el Lote 7), `disk/tests/opfs_like.rs` (DEF-184 y DEF-185), los pasos del arnés y `ARCHITECTURE.md` §8.
 
 **Qué se hace:** las tareas del motor (`open_room`, `apply_snapshot`, `delete_room`, `compact_room` y la compactación automática) con la tarea de `sys`; el motor, la recuperación y la compactación compilados en wasm32; el `.snap` con `ruzstd` `Fastest`; los nombres temporales al azar; el módulo de los *fail points*, también en wasm32 (DC39); el lint del storage. En la capa de prueba nativa, el segundo handle rechazado (DEF-184) y los dos tests del handle muerto de la revisión de cierre de 4.1 (DEF-185).
 
@@ -901,6 +901,7 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
   - los tests del despachador, más de 130 veces por ronda de la revisión, también bajo carga.
 
   En dos corridas de la suite del cliente, hechas mientras corrían las mutaciones, fallaron una vez dos tests del transporte que el lote no toca: uno depende de una pausa de 1,5 s, y el otro, de que nadie tome un puerto recién soltado. Los dos pasaron solos, y en la suite entera sin otra carga.
+- **La CI de `main`,** en verde sobre `2dab234`.
 
 #### Lote 6b · Las suscripciones y el token (`zemdb-client`) · ⬜
 **Objetivo:** lo que queda de DC42 en el despachador: `watch`, con un valor en vuelo por suscripción, y el token que el Worker le pide a la página.
@@ -915,7 +916,7 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 
 **Entrega:** `feat(client): the subscriptions and the tokens of the dispatcher of the browser worker (Fase 4.5, Lote 6b)`.
 
-### Lote 7 · El runtime del cliente detrás de `rt` (`zemdb-client`) · ⬜
+### Lote 7 · El runtime del cliente detrás de `rt` (`zemdb-client`) · ✅ Hecho (24 de Noviembre de 2026)
 **Objetivo:** que el cliente tome sus tareas, plazos, reloj, azar y hora de un módulo propio (DC38), en nativo, sin cambiar nada. Después de que cierre 4.3.
 
 **Archivos:** `crates/client/src/rt.rs` (nuevo), `client.rs` (también las cotas `Send` de su tarea propia), `worker.rs` (sus `JoinHandle`), `events.rs`, `metadata.rs`, `http_transport.rs`, `api/write.rs`, `dispatch/`, y el `clippy.toml` del cliente (el lint de DC38; el del storage va en el Lote 4).
@@ -933,6 +934,115 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 
 **Entrega:** `refactor(client): the tasks, the timers, the clock and the randomness of the client behind a module of its own (Fase 4.5, Lote 7)`.
 
+**Hecho** (24 de Noviembre de 2026).
+- **Qué entró.**
+  - **El módulo `rt`** (`crates/client/src/rt.rs`), interno, con todo lo que el cliente tomaba de Tokio y del sistema. En nativo cada función es la de Tokio o la del sistema, sin nada en el medio:
+    - **las tareas:** `spawn`, que da un `Task`, el handle de una tarea que corre hasta su fin aunque nadie la espere (soltarlo la deja seguir), con `abort` (el corte, en su próximo `.await`) e `is_finished`. Esperarlo da lo que dio la tarea, o un `TaskError` si entró en pánico o se cortó, con el mismo texto que el `JoinError` de Tokio;
+    - **el trabajo de CPU:** `spawn_blocking`, que también da un `Task` (en nativo, en el pool bloqueante de Tokio);
+    - **los plazos y el reloj:** `now`, el instante monotónico, de tipo `rt::Instant` (en nativo, el de Tokio, que controla el reloj pausado); `sleep_until`; `sleep`; y `timeout` y `timeout_at`, que dan un `Elapsed` propio. `sleep` y `timeout` cuentan desde la llamada, como los de Tokio;
+    - **el azar:** `random_uuid`, un UUID versión 4 como número, como se sacaban los `MutationId`, el id de dispositivo y el *jitter*;
+    - **la hora de pared:** `wall_millis`, en milisegundos desde 1970, con el 0 y el `u64::MAX` de antes;
+    - **las cotas de una tarea:** `MaybeSend`, que en nativo es `Send`.
+  - **La forma, pensada para el Lote 8.** Fuera de `rt`, nadie nombra un tipo del runtime de Tokio:
+    - `Task`, `TaskError` y `Elapsed` son tipos propios, que en wasm32 pueden ser un `spawn_local` con su corte, y `setTimeout`;
+    - `rt::Instant` se usa solo con `+`, `checked_add`, `saturating_duration_since` y las comparaciones, que un tipo propio sobre `performance.now()` puede dar;
+    - las tareas, el trabajo de CPU y lo que dan piden `MaybeSend`, que en wasm32 no pedirá nada.
+
+    La parte de wasm32 no entra: el crate sigue vacío en wasm32 hasta el Lote 8.
+  - **Cada uso migrado** (fuera de los tests):
+
+    | Archivo | Antes | Ahora |
+    |---|---|---|
+    | `client.rs` | `tokio::spawn` (la tarea del aplicador, en `change`, con sus cotas `Send`) | `rt::spawn`, con `MaybeSend` |
+    | | `spawn_blocking` ×2 (el hash de un snapshot bajado y el de uno subido) | `rt::spawn_blocking` |
+    | | `timeout` ×2 (el token, en `renew` y `first_token`); `timeout_at` ×4, `sleep_until` ×2 y `sleep` ×1 (la escritura); `sleep` ×1 (los reintentos de un chunk) | `rt::timeout`, `rt::timeout_at`, `rt::sleep_until` y `rt::sleep` |
+    | | `Instant::now` ×5 (el plazo de la escritura, su chequeo, sus dos backoffs y `upload_failed`); `elapsed` ×1 (`uploads`) | `rt::now`; `rt::now().saturating_duration_since(..)`, la cuenta del `elapsed` de Tokio |
+    | | `Uuid::new_v4` ×2 (`jitter` y el `MutationId`) | `rt::random_uuid` |
+    | `worker.rs` | `tokio::spawn` ×5 (la tarea del worker, la aplicación de un evento, la transferencia, el sync y la apertura del stream) y sus 13 `JoinHandle` | `rt::spawn` y `rt::Task` |
+    | | `sleep_until` ×2, `timeout` ×1 (`LAST_ACK`) e `Instant::now` ×7 | `rt::sleep_until`, `rt::timeout` y `rt::now` |
+    | `events.rs` | `timeout_at` ×1 (`SILENCE`) e `Instant::now` ×2 | `rt::timeout_at` y `rt::now` |
+    | `metadata.rs` | `tokio::spawn` ×1 (`FileMetadata::run`, con sus cotas `Send`) y `Uuid::new_v4` ×2 (el id de dispositivo) | `rt::spawn`, con `MaybeSend`, y `rt::random_uuid` |
+    | `http_transport.rs` | `tokio::spawn` ×1 y `spawn_blocking` ×1 (el reemplazo del cliente HTTP), `timeout` ×3, `Instant::now` ×2 y `elapsed` ×1 (`Progress`) | `rt::spawn`, `rt::spawn_blocking`, `rt::timeout`, `rt::now` y `rt::now().saturating_duration_since(..)` |
+    | `api/write.rs` | `SystemTime::now` (el `timestamp` de una operación) | `rt::wall_millis` |
+    | `dispatch/mod.rs` | `tokio::spawn` ×1 (`Shared::spawn`) | `rt::spawn` (el cambio mínimo: sus cotas siguen en `Send`) |
+
+    En total: 9 `tokio::spawn`, 3 `spawn_blocking`, 6 `timeout`, 5 `timeout_at`, 4 `sleep_until`, 2 `sleep`, 16 `Instant::now`, 2 `elapsed`, 4 `Uuid::new_v4` y 1 `SystemTime::now`. Quedan `tokio::sync` y `select!`, que DC38 deja.
+  - **El lint** (`crates/client/clippy.toml`): `clippy::disallowed_methods`, con 17 entradas, cada una con su razón y su reemplazo en `rt`. Son `tokio::task::spawn` (que es también `tokio::spawn`), `spawn_blocking`, `sleep`, `sleep_until`, `timeout`, `timeout_at`, `interval`, `interval_at`, `Instant::now` y `elapsed` de Tokio y de `std`, `SystemTime::now` y `elapsed`, `Uuid::new_v4`, y `std::thread::spawn` y `std::thread::sleep`. Vale para todo el código del crate, también en nativo: `lib.rs` lo permite solo en sus tests unitarios (`cfg_attr(test, ..)`), y `rt.rs` siempre (`#![allow]`).
+  - **161 líneas de producción**, sin comentarios, líneas en blanco ni la declaración del módulo de tests unitarios (3 líneas): 84 en `rt.rs`, y 77 que cambian en los demás archivos, por 87 que salen. Son 24 por 28 en `client.rs`, 28 por 34 en `worker.rs`, 9 por 9 en `http_transport.rs`, 6 por 5 en `metadata.rs`, 4 por 4 en `events.rs`, 2 por 5 en `api/write.rs`, 2 por 2 en `dispatch/mod.rs` y 2 en `lib.rs`. El plan estimaba 120. Aparte, `clippy.toml` (17 entradas) y una línea en cada test de integración y en el ejemplo (en los desvíos).
+- **Tests** (`crates/client/src/tests/rt.rs`, 14), unitarios porque `rt` es interno:
+  - `a_task_runs_until_its_end_after_its_handle_is_dropped` (el primero exigido): la tarea sigue, y pasa por un `.await` después de que se soltó su handle.
+  - `cutting_a_task_stops_it_at_its_next_await_and_drops_what_it_holds` (el segundo): cortada mientras espera, no sigue aunque llegue lo que espera, y suelta lo que tiene. Además, `a_task_that_ended_gives_what_it_gave_also_once_cut` y `a_task_that_panicked_gives_an_error`. Los dos de un error comparan su texto con el del `JoinError` de Tokio, que es lo que el worker muestra.
+  - Con el reloj pausado (el tercero):
+    - `a_sleep_until_wakes_at_its_deadline_and_never_before`: pendiente 1 ms antes, despierta en el plazo, y el reloj llega solo hasta ahí;
+    - `a_deadline_gives_the_future_that_ends_before_it_and_cuts_the_one_that_does_not` (`timeout_at`, y lo que el future tenía suelto al cortarse);
+    - `a_timeout_counts_from_its_call` y `a_sleep_counts_from_its_call`;
+    - `a_duration_whose_end_does_not_fit_in_the_clock_never_comes`: un `sleep` y un `timeout` de `Duration::MAX` siguen pendientes diez años después, y un `timeout` así da lo que da su future;
+    - `the_instant_is_that_of_the_clock_of_tokio`;
+    - `the_timers_count_by_the_clock_of_tokio`, que adelanta el reloj una hora antes de medir cada timer: un plazo que mirara el reloj del sistema se cumpliría enseguida.
+  - `the_work_of_the_cpu_runs_out_of_the_thread_of_the_runtime`, `a_random_uuid_is_of_version_4_and_at_random` (mil distintos, de versión 4 y de la variante RFC 4122) y `the_wall_clock_is_the_time_of_the_system_in_milliseconds`.
+  - **La suite del cliente entera, sin tocar ninguna expectativa:** los tests de integración y el ejemplo solo suman el `allow` del lint (en los desvíos), y la simulación, con su reloj pausado, pasa igual.
+  - **El lint**, en nativo (el test exigido; el de wasm32 pasa al Lote 8, en los desvíos):
+    - el clippy del workspace (`--all-targets`) y el del cliente sin `native` (`--no-default-features --all-targets`) pasan, con `-D warnings`: la producción no llama nada de la lista fuera de `rt`;
+    - un `tokio::spawn` en `Shared::spawn` (`dispatch/mod.rs`) lo hace fallar con `use of a disallowed method tokio::task::spawn`. Se probó una vez y se sacó; también, una vez, un `tokio::spawn` en `Worker::start`;
+    - una llamada de cada entrada fuera de `rt` lo hace fallar con todas: las 15 primeras, en la copia de las mutaciones, y `std::thread::spawn` y `std::thread::sleep`, en `dispatch/mod.rs`. Así, cada ruta de `clippy.toml` resuelve en nativo (también `tokio::spawn`, por el reexport);
+    - sin el `cfg_attr` de `lib.rs`, fallan los tests unitarios del crate, que usan Tokio: el `cfg_attr` es lo que los deja.
+- **Mutaciones inversas: las 14 mueren** (en una copia, cada una sola, con los tests de `rt` y los de la suite que la tocan).
+  - **Las tareas:**
+    - que soltar el handle corte la tarea: el primer test de `rt`, 23 del despachador (sus comandos no responden) y 6 del worker (el último ack);
+    - que el corte no corte: el segundo test de `rt`, y 5 del worker (detenerlo corta su sync y su transferencia);
+    - que `is_finished` dé siempre `false`: `a_task_that_ended_gives_what_it_gave_also_once_cut`, y 5 del worker (su `running` después de que un paso lo detiene);
+    - `spawn_blocking` en el hilo del runtime: `the_work_of_the_cpu_runs_out_of_the_thread_of_the_runtime`.
+  - **El reloj y los plazos:**
+    - `rt::now` con el reloj del sistema: 6 tests de `rt` y 3 de `Progress`, en el transporte HTTP. La simulación no termina: se cortó a los 17 minutos, y sin la mutación tarda 28 s;
+    - el plazo de `rt::timeout` con el reloj del sistema: `the_timers_count_by_the_clock_of_tokio` y un test de `Progress` (otros dos no terminan). La simulación pasa: ningún plazo de `rt::timeout` (el token, `LAST_ACK` y los del transporte HTTP) decide lo que ella mira;
+    - `sleep_until` 100 ms antes, `sleep` de la mitad y `timeout_at` 100 ms después: de dos a cuatro tests de `rt` cada una. La simulación pasa con las tres, porque mira la convergencia y no cuándo vence cada plazo;
+    - `timeout` que cuenta desde el primer `poll`: `a_timeout_counts_from_its_call`.
+  - **El azar y la hora:**
+    - un `random_uuid` fijo: su test, y 6 de las escrituras (todas con el mismo `MutationId`);
+    - `wall_millis` en 0: su test. Nada más mira el `timestamp`, que es informativo.
+  - **Las dos cuentas de `elapsed`, al revés:** la de la pausa de las subidas, con `a_replica_whose_upload_failed_uploads_none_for_a_minute`; la de `Progress`, con dos tests del transporte HTTP.
+
+  Ninguna de las 14 sobrevivió: los tests de `rt` se escribieron antes, para ellas.
+  - **Las de la primera ronda de la revisión de delta:**
+    - un `Display` fijo de `TaskError` sobrevivía, y pidió un test: ahora los dos tests de un error comparan su texto, y mueren los dos;
+    - un `sleep` y un `timeout` acotados a un año: muere `a_duration_whose_end_does_not_fit_in_the_clock_never_comes`;
+    - sin el `#[track_caller]` de `spawn`, sobrevive: dónde se lanzó una tarea solo se ve con un *panic hook*, que es global a los tests, o con `tokio_unstable`. No cambia lo que hace la tarea.
+- **Interacciones revisadas.**
+  - **El reloj pausado de la simulación.** `rt::now`, `sleep`, `sleep_until`, `timeout` y `timeout_at` son los de Tokio, así que el reloj pausado sigue controlando cada plazo: la simulación y los tests con `start_paused` pasan sin cambios, y mueren las mutaciones de un reloj del sistema, de un plazo que cuenta desde el primer `poll` y de un `sleep_until` que duerme menos. `sleep` y `timeout` calculan su plazo en la llamada, como los de Tokio, y no en el primer `poll`, como lo habría hecho un `async fn`.
+  - **Las tareas que corren hasta su fin** (DC21): el aplicador (`change`), `FileMetadata::run`, el reemplazo del cliente HTTP y las tareas del despachador siguen aunque su llamador deje de esperarlas. Soltar un `Task` no corta su tarea, como soltar un `JoinHandle`, y el primer test lo fija.
+  - **El corte del worker** (DC28): `cut` es `Task::abort`, que corta en el próximo `.await` como `JoinHandle::abort`, y el worker sigue esperando cada tarea cortada antes de su último ack; `is_running` sigue leyendo `is_finished`. El trabajo de `spawn_blocking` no se corta una vez empezado, como hoy (su docstring lo dice).
+  - **El lint con los `[lints]` del workspace:** `disallowed_methods` es de `clippy::style`, que avisa por defecto, y con el `-D warnings` de la CI es un error. El `allow` del atributo del crate, solo con `cfg(test)`, le gana a los niveles de la línea de comandos, y los `[lints]` del workspace no lo nombran. El `clippy.toml` vale para todos los targets del paquete: los tests unitarios pasan por el `cfg_attr` de `lib.rs`, pero los de integración y el ejemplo no. La biblioteca que compilan los tests de integración no lleva `cfg(test)`, así que el lint la revisa también ahí.
+- **Desvíos y precisiones.**
+  - **El lint vale también en nativo,** y no solo al compilar para wasm32, como decía DC38. `lib.rs` lo permite solo en sus tests unitarios (`cfg_attr(test, ..)`), así que el clippy nativo de la CI ya rechaza un uso nuevo fuera de `rt`: también en `http_transport.rs`, que no compila en wasm32, y en lo que el Lote 6b suma en `dispatch/`. Es más estricto que DC38, y en wasm32 vale desde que el crate compile ahí (Lote 8). Sale de la primera ronda de la revisión de delta: con el `cfg_attr(not(target_arch = "wasm32"), ..)` de antes, el crate lo permitía en nativo y estaba vacío en wasm32, así que el lint no vigilaba nada hasta el Lote 8.
+  - **El test del lint en el chequeo de wasm32** no se puede hacer en este lote: el crate es `#![cfg(not(target_arch = "wasm32"))]`, vacío en wasm32 hasta el Lote 8. Se probó en nativo (arriba), y pasa a los tests exigidos del Lote 8. Ahí no puede ser con un `tokio::spawn`: en wasm32, Tokio va solo con `sync`, como en el storage, así que un `tokio::spawn` no compila, y el test probaría el compilador y no el lint. Va con `std::time::Instant::now`, `SystemTime::now` o `Uuid::new_v4`, que compilan en wasm32 y solo el lint rechaza. Las entradas de Tokio de `clippy.toml` no resuelven en wasm32: clippy avisa que no nombran una función alcanzable, y `-D warnings` no vuelve ese aviso un error. Van a necesitar `allow-invalid = true` o un cfg.
+  - **Los tests de integración y el ejemplo,** crates aparte que leen el mismo `clippy.toml` y no pasan por el `cfg_attr` de `lib.rs`, llevan cada uno un `#![allow(clippy::disallowed_methods)]` (22 archivos, una línea cada uno). Sin él, el clippy nativo de la CI (`--all-targets`) fallaba en ellos, que usan Tokio en todas partes. DC38 decía que el `cfg_attr` del crate bastaba para no tocar los tests.
+  - **Más entradas que las de DC38:** los `elapsed` (de Tokio, de `std::time::Instant` y de `SystemTime`), que llaman a `now`; `interval` e `interval_at`; `Uuid::new_v4`, que en wasm32 no compila sin elegir su fuente; y, de la revisión de delta, `std::thread::spawn` y `std::thread::sleep`, que en wasm32-unknown-unknown entran en pánico. El cliente no los usa en producción (`std::thread::panicking` no está en la lista).
+  - **`#[track_caller]`** en `spawn`, `spawn_blocking`, `sleep`, `sleep_until`, `timeout` y `timeout_at`, como en Tokio (de la revisión de delta): el pánico sin runtime y el lugar donde se lanzó la tarea apuntan a quien llama, y no a `rt`.
+  - **`rt::sleep`,** además del `sleep_until` del plan: los dos `sleep` del cliente siguen siendo `tokio::time::sleep`. Un `sleep` o un `timeout` cuyo fin no cabe en el reloj no vence nunca, como en Tokio, que lo pone a unos treinta años: sus docstrings lo dicen, y un test lo fija.
+  - **Los dos `elapsed`** pasan a `rt::now().saturating_duration_since(..)`, que es lo que hace el `elapsed` de Tokio.
+  - **`random_uuid` sigue siendo un UUID versión 4,** y no 128 bits al azar: los `MutationId`, los ids de dispositivo y el *jitter* salen como antes.
+  - **`http_transport.rs`,** que es solo nativo (`reqwest`), pasa también por `rt`, como dice el plan.
+  - **El despachador,** con el cambio mínimo (el `tokio::spawn` de `Shared::spawn`), por el Lote 6b, que se hizo en paralelo: este lote entra primero a `main`, y el 6b pasa a `rt` lo que suma en `dispatch/`, que el lint nativo ya no deja fuera de `rt`.
+  - **`ARCHITECTURE.md` e `INVARIANTES.md`** no cambian: el lote no cambia ningún comportamiento.
+- **La revisión de delta** la hizo un agente aparte, de contexto fresco y solo lectura, que probó en su propia copia con sus propias mutaciones. Comparó cada función de `rt` con el código de Tokio 1.53.1 (cuándo se calcula un plazo, el de un fin que no cabe, soltar el handle, el corte, `is_finished`, el texto del error, el `elapsed`), y la tabla y las líneas de la nota con el delta. **Salió en verde en su segunda ronda.**
+  1. **Primera ronda: ningún Alto, 2 Medios y 4 Bajos, corregidos.** En nativo el comportamiento no cambiaba.
+     - **Los Medios:**
+       - El lint no vigilaba nada: el crate lo permitía en nativo y estaba vacío en wasm32, así que un `tokio::spawn` nuevo en `dispatch/` no daba ningún aviso, mientras el Lote 6b sumaba tareas ahí. Ahora vale también en nativo, fuera de los tests unitarios (en los desvíos, y una precisión en DC38).
+       - La prueba del lint que pasaba al Lote 8 no figuraba en el Lote 8, y con un `tokio::spawn` no probaría el lint: en wasm32 no compila. Ahora es un test exigido del Lote 8, con lo que compila en wasm32.
+     - **Los Bajos:** `#[track_caller]` en las seis funciones, como en Tokio; un test del texto de `TaskError` (la mutación de un `Display` fijo sobrevivía); `std::thread::spawn` y `std::thread::sleep` en el lint; y lo que pasa con un fin que no cabe en el reloj, en los docstrings y en un test.
+  2. **Segunda ronda, acotada a los arreglos: verde, con 2 Bajos de documentación, corregidos:** el docstring del módulo `rt`, que decía que el lint valía solo al compilar para wasm32; y DC38 y el Lote 4, que lo seguían diciendo para el storage. Inyectó un uso fuera de `rt` en `http_transport.rs`, `events.rs` y `client.rs`, también sin `native`, y el clippy nativo falla con cada uno; los tests unitarios siguen permitidos.
+
+  Queda sin test el `#[track_caller]` de `spawn`: solo se ve con un *panic hook*, que es global al binario de los tests unitarios.
+- **Chequeos:**
+  - fmt; clippy del workspace con `-D warnings`, y el del cliente sin `native` (`--no-default-features --all-targets`); el build y el clippy de wasm32 de `zemdb-core`, `zemdb-storage` y `zemdb-client`, con `-D warnings` (el cliente, vacío en wasm32); y doc con `-D warnings` (también el del cliente con `--document-private-items`, por los docs de `rt`);
+  - la suite del workspace, con 1688 tests y sin fallas, después de los arreglos de la primera ronda de la revisión de delta (1687 antes);
+  - los `--ignored` del cliente en release, con 7 tests y sin fallas;
+  - la prueba del lint, arriba.
+
+  Todos, salvo la prueba del lint, se repitieron en `main` con el lote integrado y los arreglos de las dos rondas, con los mismos números.
+
+  En la primera corrida de la suite, con otro agente compilando en la misma máquina, falló una vez `the_heartbeats_of_the_worker_leave_behind_an_http2_connection_that_stops_answering`: su última escritura, con un plazo de 200 ms, dio `OutcomeUnknown`. Es el test de la pausa de 1,5 s que ya registra la nota del 6a. Pasó cinco veces solo, tres veces con su binario entero, y en la segunda corrida de la suite.
+
 ### Lote 8 · El cliente en wasm32: la feature `wasm` (`zemdb-client`) · ⬜
 **Objetivo:** el cliente entero en wasm32 (DC38), con el motor del OPFS y sus metadatos (DC39, DC45).
 
@@ -946,6 +1056,7 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 - Una tarea del aplicador soltada por su llamador termina (DC21).
 - Un `watch` emite en wasm32 (`ChangeStream` sin `Send`).
 - Un guardado de metadatos y una recarga: abre con lo guardado; después de un guardado que falló, `room` vuelve a guardar antes de servir (DC45).
+- **El lint de DC38 en el chequeo de wasm32** (el del Lote 7, que ahí no se podía hacer; se prueba una vez y se saca): una llamada fuera de `rt` a `std::time::Instant::now`, a `SystemTime::now` o a `Uuid::new_v4` (este, si `uuid` tiene su fuente en wasm32), que compilan en wasm32 y solo el lint rechaza, hace fallar el clippy de wasm32 con `-D warnings`. Un `tokio::spawn` no sirve: en wasm32, Tokio va solo con `sync`, y no compilaría. Las entradas de Tokio del `clippy.toml` del cliente no resuelven en wasm32 (clippy avisa que no nombran una función alcanzable, y `-D warnings` no vuelve ese aviso un error): necesitan `allow-invalid = true` o un cfg.
 - **En nativo:** la suite entera, sin cambios.
 
 **Interacciones a revisar:** todo lo que corre en una tarea propia en el núcleo (DC21) y en el worker (DC28); los timers del navegador (S5, pregunta 5); INV-K16 en el OPFS (el guardado con el `rename` de la capa, sus generaciones); la memoria del Worker.

@@ -1,4 +1,5 @@
 //! Opening and shutting down the client, and the transport to the server in process.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

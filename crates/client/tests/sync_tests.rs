@@ -1,5 +1,6 @@
 //! Syncing the rooms of the client through their applier, against the server in process, where a
 //! client of the server's own commits the operations.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

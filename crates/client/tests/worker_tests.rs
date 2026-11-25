@@ -4,6 +4,7 @@
 //! With the paused clock, but where steps fail one after another: there, with the real clock,
 //! short delays and a limit of its own, since a worker that retried without waiting would not let
 //! a paused clock go on.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

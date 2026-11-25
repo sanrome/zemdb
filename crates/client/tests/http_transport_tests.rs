@@ -1,6 +1,7 @@
 //! The HTTP transport against the server on a local socket, and against minimal servers of the
 //! test for what the server does not do: answering slowly, too much, or not at all.
 #![cfg(feature = "native")]
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

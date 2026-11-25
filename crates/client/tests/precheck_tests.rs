@@ -1,6 +1,7 @@
 //! The precheck of the writes of the facade against the server in process: a write that the
 //! replica, in its state, would reject is not sent; and what the precheck does when the replica is
 //! behind the log, changes before the write is sequenced, or its storage fails.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

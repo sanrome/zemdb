@@ -5,6 +5,7 @@
 //! the stream turned off; and the mode that opens and closes it.
 //! With the longest interval of the heartbeats, so that, once a heartbeat went, what a test waits
 //! for comes long before the next one: what reaches the replica meanwhile came by the stream.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

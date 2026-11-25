@@ -10,6 +10,10 @@
 //! The core uses Tokio's tasks and the native file layer, so in WebAssembly the crate is empty.
 #![cfg(not(target_arch = "wasm32"))]
 #![forbid(unsafe_code)]
+// What does not run in WebAssembly is called only from the runtime of the client (`rt`): the lint
+// that refuses it elsewhere holds for all the code of the crate but its unit tests, which run on
+// Tokio.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 mod api;
 mod client;
@@ -20,6 +24,7 @@ mod events;
 #[cfg(feature = "native")]
 mod http_transport;
 mod metadata;
+mod rt;
 mod token;
 mod transport;
 mod watch;

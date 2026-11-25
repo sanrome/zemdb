@@ -1,6 +1,7 @@
 //! The writes of the client, against the server in process with a paused clock: each ends once,
 //! with the decision of the replica on its sequence, a refusal of the server, an error without
 //! effect or an unknown outcome.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

@@ -3,6 +3,7 @@
 //! own, with its reply to its tab; the client opens once, and after its shutdown every command on
 //! a room is `RoomClosed`; a tab that left releases its rooms; and every command and reply goes
 //! through `bincode` unchanged.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

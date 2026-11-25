@@ -1,5 +1,6 @@
 //! The event stream of a transport: by default refused as by a server with its event stream
 //! turned off, and over the test transport, the stream of the server in process.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

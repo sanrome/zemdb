@@ -1,4 +1,5 @@
 //! The durable metadata of the client: in files, through the file layer, and in memory.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

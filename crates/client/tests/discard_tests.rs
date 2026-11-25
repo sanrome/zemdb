@@ -2,6 +2,7 @@
 //! in process: in any state of the room, with the steps of the automatic discard in their order,
 //! ending its writes in flight and its `watch` streams, and leaving the room out of the client,
 //! for its next open to open it as new from the server.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

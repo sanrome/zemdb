@@ -20,7 +20,7 @@ pub use command::{
     Answer, Command, DispatchConfig, Message, Reply, Request, RoomCall, Table, TableCall,
 };
 
-use crate::{ClientError, ZemdbClient};
+use crate::{rt, ClientError, ZemdbClient};
 
 /// What a command gives.
 type Outcome = Result<Answer, ClientError>;
@@ -178,7 +178,7 @@ impl Shared {
         F: Future<Output = Outcome> + Send + 'static,
     {
         let shared = Arc::clone(self);
-        tokio::spawn(async move {
+        rt::spawn(async move {
             let result = call.await;
             shared.reply(tab, id, result);
         });
