@@ -1,8 +1,9 @@
 //! The dispatcher of the runtime of a browser Worker, in native, over the facade against the
 //! server in process: each command gives what its call of the facade gives, in a task of its
 //! own, with its reply to its tab; the client opens once, and after its shutdown every command on
-//! a room is `RoomClosed`; a tab that left releases its rooms; and every command and reply goes
-//! through `bincode` unchanged.
+//! a room is `RoomClosed`; a tab that left releases its rooms and ends its subscriptions; a
+//! subscription has one value in flight until its tab confirms it; the tokens come from a tab of
+//! the room; and every command, reply and notice goes through `bincode` unchanged.
 #![allow(clippy::disallowed_methods)]
 
 mod common;
@@ -15,16 +16,17 @@ mod rng;
 use async_trait::async_trait;
 use common::*;
 use rng::Rng;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ops::Bound;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tempfile::tempdir;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use zemdb_client::dispatch::{
-    Answer, Command, DispatchConfig, Dispatcher, Message, Platform, Reply, Request, RoomCall,
-    Table, TableCall,
+    Answer, Command, DispatchConfig, Dispatcher, Message, Notice, PageTokens, Platform, Reply,
+    Request, RoomCall, Table, TableCall, Watch,
 };
 use zemdb_client::{
     ClientConfig, ClientError, Direction, FileMetadata, Freshness, Key, Rejection, RoomHandle,
@@ -34,6 +36,7 @@ use zemdb_core::{
     ClientId, ClientMessage, ClientMessageKind, DataType, ErrorCode, OwnerIdentity, RoomId,
     RowBuilder, Schema, SequenceNumber, TableSchema, Value,
 };
+use zemdb_server::generate_client_token;
 use zemdb_storage::{DiskStorageEngine, StorageError};
 
 /// The tab of the commands of a test with one tab.
@@ -44,11 +47,14 @@ const TAB: u64 = 7;
 
 /// The platform of the tests: a client of the facade over a disk engine and its metadata in the
 /// directory of the configuration, through the transport to the server in process, with a token
-/// provider that issues valid tokens, and without a `CryptoEngine`. Its heartbeats get no reply,
-/// so that its worker sends nothing else (`TestTransport::hush`).
+/// provider that issues valid tokens (or the one of the dispatcher, which asks the page), and
+/// without a `CryptoEngine`. Its heartbeats get no reply, so that its worker sends nothing else
+/// (`TestTransport::hush`).
 #[derive(Clone)]
 struct TestPlatform {
     transport: TestTransport,
+    /// Whether the client takes its tokens from the page, through the dispatcher.
+    asks_the_page: bool,
     /// The last client it opened, and its storage engine.
     opened: Arc<Mutex<Option<ZemdbClient>>>,
     engine: Arc<Mutex<Option<TestEngine<DiskStorageEngine>>>>,
@@ -60,9 +66,18 @@ impl TestPlatform {
     fn new(transport: &TestTransport) -> Self {
         Self {
             transport: transport.clone(),
+            asks_the_page: false,
             opened: Arc::default(),
             engine: Arc::default(),
             gate: Arc::default(),
+        }
+    }
+
+    /// A platform whose client takes its tokens from the page.
+    fn asking_the_page(transport: &TestTransport) -> Self {
+        Self {
+            asks_the_page: true,
+            ..Self::new(transport)
         }
     }
 
@@ -79,15 +94,23 @@ impl TestPlatform {
 
 #[async_trait]
 impl Platform for TestPlatform {
-    async fn open(&self, config: DispatchConfig) -> Result<ZemdbClient, ClientError> {
+    async fn open(
+        &self,
+        config: DispatchConfig,
+        tokens: PageTokens,
+    ) -> Result<ZemdbClient, ClientError> {
         drop(self.gate.lock().await);
         let dir = Path::new(&config.directory);
         let storage = TestEngine::new(DiskStorageEngine::new(options(dir))?);
         *self.engine.lock().unwrap() = Some(storage.clone());
         let metadata = FileMetadata::new(dir);
-        let (transport, tokens) = (self.transport.clone(), TestTokens::new());
-        let client =
-            ZemdbClient::open(config.client, storage, metadata, transport, tokens, None).await?;
+        let transport = self.transport.clone();
+        let client = if self.asks_the_page {
+            ZemdbClient::open(config.client, storage, metadata, transport, tokens, None).await?
+        } else {
+            let tokens = TestTokens::new();
+            ZemdbClient::open(config.client, storage, metadata, transport, tokens, None).await?
+        };
         self.transport.hush(&client.client_id());
         *self.opened.lock().unwrap() = Some(client.clone());
         Ok(client)
@@ -95,25 +118,53 @@ impl Platform for TestPlatform {
 }
 
 /// The page of a test: it sends the commands of its tabs to its dispatcher, and takes the replies
-/// that the dispatcher publishes.
+/// and the notices that the dispatcher publishes.
 struct Page {
-    dispatcher: Dispatcher,
-    replies: mpsc::UnboundedReceiver<Reply>,
+    dispatcher: Arc<OnceLock<Dispatcher>>,
+    messages: mpsc::UnboundedReceiver<Message>,
+    /// Every message that came, in the order it came.
+    log: Vec<Message>,
     /// The replies that came before the test asked for them, in the order they came.
     early: Vec<Reply>,
+    /// The notices that came and the test did not take yet, in the order they came.
+    notices: VecDeque<Notice>,
     last: u64,
+    /// The longest it waits for a reply or a notice.
+    wait: Duration,
 }
 
 impl Page {
     fn new(platform: &TestPlatform) -> Self {
-        let (sender, replies) = mpsc::unbounded_channel();
-        // The page may be gone once the test ends, with commands still in flight.
-        let publish = move |Message::Reply(reply)| drop(sender.send(reply));
+        Self::with(platform, |_, _| {})
+    }
+
+    /// A page whose dispatcher runs `hook` with each message as it publishes it, before the page
+    /// takes it: `hook` may dispatch a command.
+    fn with(
+        platform: &TestPlatform,
+        hook: impl Fn(&Dispatcher, &Message) + Send + Sync + 'static,
+    ) -> Self {
+        let (sender, messages) = mpsc::unbounded_channel();
+        let dispatcher = Arc::new(OnceLock::new());
+        let hooked = Arc::downgrade(&dispatcher);
+        let publish = move |message: Message| {
+            let dispatcher = hooked.upgrade();
+            if let Some(dispatcher) = dispatcher.as_ref().and_then(|once| once.get()) {
+                hook(dispatcher, &message);
+            }
+            // The page may be gone once the test ends, with commands still in flight.
+            drop(sender.send(message));
+        };
+        let set = dispatcher.set(Dispatcher::new(platform.clone(), publish));
+        assert!(set.is_ok());
         Self {
-            dispatcher: Dispatcher::new(platform.clone(), publish),
-            replies,
+            dispatcher,
+            messages,
+            log: Vec::new(),
             early: Vec::new(),
+            notices: VecDeque::new(),
             last: 0,
+            wait: Duration::from_secs(30),
         }
     }
 
@@ -121,31 +172,52 @@ impl Page {
     fn send(&mut self, tab: u64, request: Request) -> u64 {
         self.last += 1;
         let id = self.last;
-        self.dispatcher.dispatch(Command { tab, id, request });
+        let dispatcher = self.dispatcher.get().unwrap();
+        dispatcher.dispatch(Command { tab, id, request });
         id
+    }
+
+    /// Keeps `message`, as a reply or a notice.
+    fn keep(&mut self, message: Message) {
+        self.log.push(message.clone());
+        match message {
+            Message::Reply(reply) => self.early.push(reply),
+            Message::Notice(notice) => self.notices.push_back(notice),
+        }
+    }
+
+    /// Keeps the next message that comes, within the wait of the page.
+    async fn take(&mut self) {
+        let message = tokio::time::timeout(self.wait, self.messages.recv());
+        let message = message.await.expect("Nothing came").unwrap();
+        self.keep(message);
     }
 
     /// The next reply that comes, or the first that came early.
     async fn next(&mut self) -> Reply {
-        if !self.early.is_empty() {
-            return self.early.remove(0);
+        while self.early.is_empty() {
+            self.take().await;
         }
-        let reply = tokio::time::timeout(Duration::from_secs(30), self.replies.recv());
-        reply.await.expect("No reply came").unwrap()
+        self.early.remove(0)
     }
 
     /// The reply to the command `id`, keeping the others that come before it.
     async fn reply(&mut self, id: u64) -> Reply {
-        if let Some(index) = self.early.iter().position(|reply| reply.id == id) {
-            return self.early.remove(index);
-        }
         loop {
-            let reply = tokio::time::timeout(Duration::from_secs(30), self.replies.recv());
-            let reply = reply.await.expect("No reply came").unwrap();
-            if reply.id == id {
-                return reply;
+            if let Some(index) = self.early.iter().position(|reply| reply.id == id) {
+                return self.early.remove(index);
             }
-            self.early.push(reply);
+            self.take().await;
+        }
+    }
+
+    /// The next notice that comes, or the first that came and was not taken.
+    async fn notice(&mut self) -> Notice {
+        loop {
+            if let Some(notice) = self.notices.pop_front() {
+                return notice;
+            }
+            self.take().await;
         }
     }
 
@@ -157,19 +229,47 @@ impl Page {
         reply.result
     }
 
-    /// The ids of the replies that came, or come within `wait`, keeping them for later.
-    async fn arrived(&mut self, wait: Duration) -> Vec<u64> {
+    /// Keeps what came, or comes within `wait`.
+    async fn settle(&mut self, wait: Duration) {
         tokio::time::sleep(wait).await;
-        while let Ok(reply) = self.replies.try_recv() {
-            self.early.push(reply);
+        while let Ok(message) = self.messages.try_recv() {
+            self.keep(message);
         }
-        self.early.iter().map(|reply| reply.id).collect()
     }
 
-    /// Whether no reply came, nor comes within 100 ms.
+    /// Whether the reply to the command `id` came already, keeping what came.
+    fn has_replied(&mut self, id: u64) -> bool {
+        while let Ok(message) = self.messages.try_recv() {
+            self.keep(message);
+        }
+        self.early.iter().any(|reply| reply.id == id)
+    }
+
+    /// Whether no reply nor notice came, nor comes within 100 ms.
     async fn quiet(&mut self) -> bool {
-        let next = tokio::time::timeout(Duration::from_millis(100), self.replies.recv());
-        self.early.is_empty() && next.await.is_err()
+        self.settle(Duration::from_millis(100)).await;
+        self.early.is_empty() && self.notices.is_empty()
+    }
+
+    /// Whether no notice came, nor comes within 100 ms, keeping the replies that come.
+    async fn no_notice(&mut self) -> bool {
+        self.settle(Duration::from_millis(100)).await;
+        self.notices.is_empty()
+    }
+
+    /// Where in the log the reply to the command `id` is.
+    fn logged_reply(&self, id: u64) -> usize {
+        let reply = |message: &Message| matches!(message, Message::Reply(reply) if reply.id == id);
+        self.log.iter().position(reply).expect("No reply")
+    }
+
+    /// Where in the log `notice` is.
+    fn logged_notice(&self, notice: &Notice) -> usize {
+        let wanted = Message::Notice(notice.clone());
+        self.log
+            .iter()
+            .position(|message| *message == wanted)
+            .expect("No notice")
     }
 }
 
@@ -186,17 +286,23 @@ fn open(dir: &Path) -> Request {
     Request::Open(Box::new(config(dir)))
 }
 
-/// A page whose dispatcher opened the client of ana over `dir`, through a transport to `server`,
-/// with its platform and the transport.
-async fn opened(server: &TestServer, dir: &Path) -> (Page, TestPlatform, TestTransport) {
-    let transport = server.transport();
-    let platform = TestPlatform::new(&transport);
-    let mut page = Page::new(&platform);
+/// A page whose dispatcher opened the client of ana over `dir` with `platform`.
+async fn opened_with(platform: &TestPlatform, dir: &Path) -> Page {
+    let mut page = Page::new(platform);
     let client_id = page.call(TAB, open(dir)).await;
     assert_eq!(
         client_id,
         Ok(Answer::ClientId(platform.opened().client_id()))
     );
+    page
+}
+
+/// A page whose dispatcher opened the client of ana over `dir`, through a transport to `server`,
+/// with its platform and the transport.
+async fn opened(server: &TestServer, dir: &Path) -> (Page, TestPlatform, TestTransport) {
+    let transport = server.transport();
+    let platform = TestPlatform::new(&transport);
+    let page = opened_with(&platform, dir).await;
     (page, platform, transport)
 }
 
@@ -990,16 +1096,14 @@ async fn a_slow_open_does_not_hold_back_the_calls_of_other_rooms_through_a_tab_t
         calls.push(page.send(4, on_room(room_id, RoomCall::Open)));
         calls.push(page.send(4, on_room(room_id, RoomCall::Close)));
     }
-    let came = page.arrived(Duration::from_millis(500)).await;
-    for id in &calls {
-        assert!(came.contains(id), "{id} waited for the slow open");
+    // Each replies while the slow open is still held, and the notice waits for it.
+    for id in calls {
+        assert_eq!(page.reply(id).await.result, Ok(Answer::Done), "{id}");
     }
+    assert!(!page.has_replied(left));
     held.release();
     assert_eq!(page.reply(opening).await.result, Ok(Answer::Done));
     assert_eq!(page.reply(left).await.result, Ok(Answer::Done));
-    for id in calls {
-        assert_eq!(page.reply(id).await.result, Ok(Answer::Done));
-    }
     assert!(is_open(&mut page, &slow).await);
 }
 
@@ -1028,20 +1132,15 @@ async fn a_tab_that_left_releases_each_of_its_rooms_without_waiting_for_a_slow_o
             let open = on_room(room_id, RoomCall::Open);
             page.send(2, open)
         }));
-        let came = page.arrived(Duration::from_millis(300)).await;
-        for id in &opens {
-            assert!(
-                came.contains(id),
-                "round {round}: {id} waited for the slow open"
-            );
+        // Each replies while the slow open is still held, and the notice waits for it.
+        for id in opens {
+            let reply = page.reply(id).await;
+            assert_eq!(reply.result, Ok(Answer::Done), "round {round}: {id}");
         }
-        assert!(!came.contains(&left), "round {round}");
+        assert!(!page.has_replied(left), "round {round}");
         held.release();
         assert_eq!(page.reply(opening).await.result, Ok(Answer::Done));
         assert_eq!(page.reply(left).await.result, Ok(Answer::Done));
-        for id in opens {
-            assert_eq!(page.reply(id).await.result, Ok(Answer::Done));
-        }
         // The slow room closed with the notice, and the others are of tab 2.
         assert!(!is_open(&mut page, &slow).await, "round {round}");
         assert_eq!(page.call(2, Request::Left).await, Ok(Answer::Done));
@@ -1152,13 +1251,12 @@ async fn the_reads_writes_and_other_calls_of_a_room_do_not_wait_for_its_close() 
             on_room(&room_id, RoomCall::SetFreshness(Freshness::Manual)),
         ),
     ];
-    let came = page.arrived(Duration::from_millis(300)).await;
+    // Each replies while the close is still held.
     for id in calls {
-        assert!(came.contains(&id), "{id} waited for the close");
         let reply = page.reply(id).await;
         assert!(reply.result.is_ok(), "{reply:?}");
     }
-    assert!(!came.contains(&close));
+    assert!(!page.has_replied(close));
     held.release();
     assert_eq!(page.reply(close).await.result, Ok(Answer::Done));
 }
@@ -1229,14 +1327,18 @@ struct PanicsOnce {
 
 #[async_trait]
 impl Platform for PanicsOnce {
-    async fn open(&self, config: DispatchConfig) -> Result<ZemdbClient, ClientError> {
+    async fn open(
+        &self,
+        config: DispatchConfig,
+        tokens: PageTokens,
+    ) -> Result<ZemdbClient, ClientError> {
         if !self
             .panicked
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
             panic!("The platform panics");
         }
-        self.inner.open(config).await
+        self.inner.open(config, tokens).await
     }
 }
 
@@ -1250,7 +1352,11 @@ async fn a_command_that_panics_has_no_reply_and_the_dispatcher_goes_on() {
         panicked: Arc::default(),
     };
     let (sender, mut replies) = mpsc::unbounded_channel();
-    let publish = move |Message::Reply(reply)| drop(sender.send(reply));
+    let publish = move |message| {
+        if let Message::Reply(reply) = message {
+            drop(sender.send(reply));
+        }
+    };
     let dispatcher = Dispatcher::new(platform, publish);
     let command = |id| Command {
         tab: TAB,
@@ -1269,6 +1375,910 @@ async fn a_command_that_panics_has_no_reply_and_the_dispatcher_goes_on() {
         reply.result,
         Ok(Answer::ClientId(inner.opened().client_id()))
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The subscriptions
+
+fn watch(room_id: &RoomId, what: Watch) -> Request {
+    Request::Watch(notes_of(room_id), what)
+}
+
+/// The id of the subscription that `result`, the reply to a `Watch`, gives.
+fn subscription(result: Result<Answer, ClientError>) -> u64 {
+    match result {
+        Ok(Answer::Subscription(subscription)) => subscription,
+        result => panic!("{result:?}"),
+    }
+}
+
+/// Subscribes `tab` to `what` of the notes of `room_id`, and gives the id of the subscription.
+async fn subscribe(page: &mut Page, tab: u64, room_id: &RoomId, what: Watch) -> u64 {
+    subscription(page.call(tab, watch(room_id, what)).await)
+}
+
+/// The notice of `value`, of `subscription` of `tab`.
+fn value_of(tab: u64, subscription: u64, value: Answer) -> Notice {
+    Notice::Value {
+        tab,
+        subscription,
+        value: Ok(value),
+    }
+}
+
+fn ended(tab: u64, subscription: u64) -> Notice {
+    Notice::Ended { tab, subscription }
+}
+
+async fn confirm(page: &mut Page, tab: u64, subscription: u64) {
+    let confirmed = page.call(tab, Request::Confirm(subscription)).await;
+    assert_eq!(confirmed, Ok(Answer::Done));
+}
+
+async fn unwatch(page: &mut Page, tab: u64, subscription: u64) {
+    let unwatched = page.call(tab, Request::Unwatch(subscription)).await;
+    assert_eq!(unwatched, Ok(Answer::Done));
+}
+
+/// Inserts the note `number` of ana, with `text`, from `tab`, and gives it as a read gives it.
+async fn insert(page: &mut Page, tab: u64, room_id: &RoomId, number: i64, text: &str) -> Row {
+    let row = TableCall::Insert(new_note(number, text));
+    let written = page.call(tab, on_notes(room_id, row)).await;
+    assert_eq!(written, Ok(Answer::Key(key(number, "ana"))));
+    note(number, "ana", text)
+}
+
+/// How many subscriptions `room_id` has, as its status tells.
+async fn watches(page: &mut Page, room_id: &RoomId) -> usize {
+    status_of(page, room_id).await.watches
+}
+
+#[tokio::test]
+async fn a_subscription_has_one_value_in_flight_until_its_tab_confirms_it_and_then_the_last() {
+    let (server, room_id) = notes().await;
+    let dir = tempdir().unwrap();
+    let (mut page, _, _) = opened(&server, dir.path()).await;
+    open_room(&mut page, TAB, &room_id).await;
+    let bob = note(1, "bob", "Hello");
+    // Its reply comes first, and then its first value: the current one.
+    let id = page.send(TAB, watch(&room_id, Watch::Rows(Scan::new())));
+    let all = subscription(page.reply(id).await.result);
+    let first = value_of(TAB, all, Answer::Rows(vec![bob.clone()]));
+    assert_eq!(page.notice().await, first);
+    assert!(page.logged_reply(id) < page.logged_notice(&first));
+
+    // Many changes without a confirmation: no value comes, and its stream keeps the last one,
+    // which comes once the value in flight is confirmed.
+    let mut rows = vec![bob.clone()];
+    for number in 2..=6 {
+        rows.push(insert(&mut page, TAB, &room_id, number, &format!("Note {number}")).await);
+    }
+    assert!(page.no_notice().await);
+    assert_eq!(watches(&mut page, &room_id).await, 1);
+    confirm(&mut page, TAB, all).await;
+    let last = value_of(TAB, all, Answer::Rows(rows.clone()));
+    assert_eq!(page.notice().await, last);
+    // Confirmed with nothing changed, nothing comes; the next change comes once confirmed.
+    confirm(&mut page, TAB, all).await;
+    assert!(page.no_notice().await);
+    rows.push(insert(&mut page, TAB, &room_id, 7, "Note 7").await);
+    let last = value_of(TAB, all, Answer::Rows(rows.clone()));
+    assert_eq!(page.notice().await, last);
+
+    // `Unwatch` ends it, with its value in flight: nothing of it comes afterwards, and the room
+    // has no subscription.
+    unwatch(&mut page, TAB, all).await;
+    assert_eq!(watches(&mut page, &room_id).await, 0);
+    confirm(&mut page, TAB, all).await;
+    insert(&mut page, TAB, &room_id, 8, "Note 8").await;
+    assert!(page.no_notice().await);
+    unwatch(&mut page, TAB, all).await;
+
+    // The close of its room ends a subscription at once, and one with its value in flight once
+    // it is confirmed; then it changes nothing.
+    let watch_bob = Watch::Row(key(1, "bob"));
+    let one = subscribe(&mut page, TAB, &room_id, watch_bob).await;
+    let value = value_of(TAB, one, Answer::Row(Some(bob.clone())));
+    assert_eq!(page.notice().await, value);
+    confirm(&mut page, TAB, one).await;
+    let two = subscribe(&mut page, TAB, &room_id, Watch::Rows(Scan::new().limit(1))).await;
+    let value = value_of(TAB, two, Answer::Rows(vec![bob.clone()]));
+    assert_eq!(page.notice().await, value);
+    let closed = page.call(TAB, on_room(&room_id, RoomCall::Close)).await;
+    assert_eq!(closed, Ok(Answer::Done));
+    assert_eq!(page.notice().await, ended(TAB, one));
+    assert!(page.no_notice().await);
+    confirm(&mut page, TAB, two).await;
+    assert_eq!(page.notice().await, ended(TAB, two));
+    confirm(&mut page, TAB, two).await;
+    unwatch(&mut page, TAB, two).await;
+    assert!(page.no_notice().await);
+    // Opened again, the room has none.
+    open_room(&mut page, TAB, &room_id).await;
+    assert_eq!(watches(&mut page, &room_id).await, 0);
+}
+
+#[tokio::test]
+async fn a_confirmation_without_a_value_in_flight_is_not_kept_for_the_next_value() {
+    let (server, room_id) = notes().await;
+    let dir = tempdir().unwrap();
+    let (mut page, _, _) = opened(&server, dir.path()).await;
+    open_room(&mut page, TAB, &room_id).await;
+    let all = subscribe(&mut page, TAB, &room_id, Watch::Rows(Scan::new())).await;
+    let bob = note(1, "bob", "Hello");
+    let first = value_of(TAB, all, Answer::Rows(vec![bob.clone()]));
+    assert_eq!(page.notice().await, first);
+    // Two confirmations: the second finds no value in flight.
+    confirm(&mut page, TAB, all).await;
+    confirm(&mut page, TAB, all).await;
+    let world = insert(&mut page, TAB, &room_id, 2, "World").await;
+    let next = value_of(TAB, all, Answer::Rows(vec![bob, world]));
+    assert_eq!(page.notice().await, next);
+    // That value waits for its own confirmation.
+    insert(&mut page, TAB, &room_id, 3, "Again").await;
+    assert!(page.no_notice().await);
+}
+
+#[tokio::test]
+async fn an_unwatch_or_a_left_ends_a_subscription_without_a_value_in_flight() {
+    let (server, room_id) = notes().await;
+    let dir = tempdir().unwrap();
+    let (mut page, _, _) = opened(&server, dir.path()).await;
+    open_room(&mut page, TAB, &room_id).await;
+    // Subscriptions of tabs 1 and 2, whose first values were confirmed: they wait for a change.
+    let bob = Answer::Rows(vec![note(1, "bob", "Hello")]);
+    let mut subscriptions = Vec::new();
+    for tab in [1, 2] {
+        let subscription = subscribe(&mut page, tab, &room_id, Watch::Rows(Scan::new())).await;
+        let value = value_of(tab, subscription, bob.clone());
+        assert_eq!(page.notice().await, value);
+        confirm(&mut page, tab, subscription).await;
+        subscriptions.push(subscription);
+    }
+    assert_eq!(watches(&mut page, &room_id).await, 2);
+    // With no change in the room, the `Unwatch` of tab 1 and the notice that tab 2 left end them.
+    unwatch(&mut page, 1, subscriptions[0]).await;
+    assert_eq!(page.call(2, Request::Left).await, Ok(Answer::Done));
+    assert_eq!(watches(&mut page, &room_id).await, 0);
+    assert!(page.no_notice().await);
+}
+
+#[tokio::test]
+async fn a_tab_that_leaves_during_the_shutdown_does_not_wait_for_its_close() {
+    let (server, room_id) = notes().await;
+    let dir = tempdir().unwrap();
+    let (mut page, platform, _) = opened(&server, dir.path()).await;
+    open_room(&mut page, 1, &room_id).await;
+    let all = subscribe(&mut page, 1, &room_id, Watch::Rows(Scan::new())).await;
+    let bob = Answer::Rows(vec![note(1, "bob", "Hello")]);
+    assert_eq!(page.notice().await, value_of(1, all, bob));
+    // The shutdown closes the room, and its close in the storage engine is held.
+    let mut closing = platform.engine().hold_next("close_room");
+    let shutdown = page.send(TAB, Request::Shutdown);
+    closing.replied().await;
+    // The tab that holds the room leaves: the notice ends its subscription, and closes nothing,
+    // so it does not wait for the close of the shutdown.
+    assert_eq!(page.call(1, Request::Left).await, Ok(Answer::Done));
+    assert!(!page.has_replied(shutdown));
+    // Its subscription ended: confirmed now, its value in flight brings no end of its stream.
+    confirm(&mut page, 1, all).await;
+    closing.release();
+    assert_eq!(page.reply(shutdown).await.result, Ok(Answer::Done));
+    assert!(page.no_notice().await);
+}
+
+#[tokio::test]
+async fn a_tab_that_left_during_the_shutdown_gets_no_request_of_a_token_of_it() {
+    let (server, room_id) = notes().await;
+    let dir = tempdir().unwrap();
+    let transport = server.transport();
+    let platform = TestPlatform::asking_the_page(&transport);
+    let mut page = opened_with(&platform, dir.path()).await;
+    let client_id = platform.opened().client_id();
+    // Tab 1 opens the room, and tab 2 opens it too, with a token that expired, which becomes the
+    // token of the room.
+    for (tab, given) in [
+        (1, token(&client_id, &room_id)),
+        (2, expired(&client_id, &room_id)),
+    ] {
+        let opening = page.send(tab, on_room(&room_id, RoomCall::Open));
+        let (asked_tab, request, _) = asked(&mut page, &client_id).await;
+        assert_eq!(asked_tab, tab);
+        answer(&mut page, tab, request, &given).await;
+        assert_eq!(page.reply(opening).await.result, Ok(Answer::Done));
+    }
+    // Tab 2 writes, and the refusal of its commit for its token is held; the shutdown comes, with
+    // its close of the room in the storage engine held; and tab 1 leaves.
+    let mut refused = transport.hold_next_reply(ClientMessageKind::Commit);
+    let late = TableCall::Insert(new_note(3, "Late"));
+    let writing = page.send(2, on_notes(&room_id, late));
+    refused.replied().await;
+    let mut closing = platform.engine().hold_next("close_room");
+    let shutdown = page.send(TAB, Request::Shutdown);
+    closing.replied().await;
+    assert_eq!(page.call(1, Request::Left).await, Ok(Answer::Done));
+    // The refusal comes: the renewal of the write goes to tab 2, which still holds the room, and
+    // not to tab 1, which left.
+    refused.release();
+    let (asked_tab, request, _) = asked(&mut page, &client_id).await;
+    assert_eq!(asked_tab, 2);
+    let unanswered = page.call(2, Request::Token(request, None)).await;
+    assert_eq!(unanswered, Ok(Answer::Done));
+    closing.release();
+    assert_eq!(page.reply(shutdown).await.result, Ok(Answer::Done));
+    let written = page.reply(writing).await.result;
+    assert!(written.is_err(), "{written:?}");
+}
+
+#[tokio::test]
+async fn a_watch_gives_what_the_facade_gives_for_a_room_or_a_table_it_cannot_read() {
+    let (server, room_id) = notes().await;
+    let dir = tempdir().unwrap();
+    let platform = TestPlatform::new(&server.transport());
+    let mut page = Page::new(&platform);
+    let all = || watch(&room_id, Watch::Rows(Scan::new()));
+    let closed = Err(ClientError::RoomClosed(room_id.clone()));
+    // Before the open, and in a room that is not open, `RoomClosed`.
+    assert_eq!(page.call(TAB, all()).await, closed);
+    let opened = page.call(TAB, open(dir.path())).await;
+    assert!(matches!(opened, Ok(Answer::ClientId(_))), "{opened:?}");
+    assert_eq!(page.call(TAB, all()).await, closed);
+    open_room(&mut page, TAB, &room_id).await;
+    // A table that the schema does not have is `InvalidOperation`, and a key that the schema
+    // does not take is a read that fails: a value of the subscription.
+    let nope = Table {
+        room_id: room_id.clone(),
+        name: "nope".to_string(),
+    };
+    let watched = page.call(TAB, Request::Watch(nope, Watch::Rows(Scan::new())));
+    let watched = watched.await;
+    assert!(
+        matches!(watched, Err(ClientError::InvalidOperation(_))),
+        "{watched:?}"
+    );
+    let mood = Key::new().with("mood", "glad");
+    let wrong = subscribe(&mut page, TAB, &room_id, Watch::Row(mood)).await;
+    let notice = page.notice().await;
+    let Notice::Value {
+        tab: TAB,
+        subscription,
+        value: Err(ClientError::InvalidOperation(_)),
+    } = notice
+    else {
+        panic!("{notice:?}");
+    };
+    assert_eq!(subscription, wrong);
+    assert_eq!(watches(&mut page, &room_id).await, 1);
+}
+
+#[tokio::test]
+async fn a_shutdown_ends_the_subscriptions_with_their_streams() {
+    let (server, room_id) = notes().await;
+    let dir = tempdir().unwrap();
+    let (mut page, _, _) = opened(&server, dir.path()).await;
+    open_room(&mut page, TAB, &room_id).await;
+    let bob = note(1, "bob", "Hello");
+    let confirmed = subscribe(&mut page, TAB, &room_id, Watch::Row(key(1, "bob"))).await;
+    let value = value_of(TAB, confirmed, Answer::Row(Some(bob.clone())));
+    assert_eq!(page.notice().await, value);
+    confirm(&mut page, TAB, confirmed).await;
+    let in_flight = subscribe(&mut page, TAB, &room_id, Watch::Rows(Scan::new())).await;
+    let value = value_of(TAB, in_flight, Answer::Rows(vec![bob]));
+    assert_eq!(page.notice().await, value);
+    assert_eq!(page.call(TAB, Request::Shutdown).await, Ok(Answer::Done));
+    assert_eq!(page.notice().await, ended(TAB, confirmed));
+    assert!(page.no_notice().await);
+    confirm(&mut page, TAB, in_flight).await;
+    assert_eq!(page.notice().await, ended(TAB, in_flight));
+    // Afterwards, a watch is `RoomClosed`.
+    let watched = page
+        .call(TAB, watch(&room_id, Watch::Rows(Scan::new())))
+        .await;
+    assert_eq!(watched, Err(ClientError::RoomClosed(room_id.clone())));
+}
+
+#[tokio::test]
+async fn a_discard_on_request_ends_the_subscriptions_of_its_room() {
+    let (server, room_id) = notes().await;
+    let dir = tempdir().unwrap();
+    let (mut page, _, _) = opened(&server, dir.path()).await;
+    open_room(&mut page, TAB, &room_id).await;
+    let bob = note(1, "bob", "Hello");
+    let world = insert(&mut page, TAB, &room_id, 2, "World").await;
+    let one = subscribe(&mut page, TAB, &room_id, Watch::Row(key(2, "ana"))).await;
+    let value = value_of(TAB, one, Answer::Row(Some(world.clone())));
+    assert_eq!(page.notice().await, value);
+    confirm(&mut page, TAB, one).await;
+    let two = subscribe(&mut page, 2, &room_id, Watch::Rows(Scan::new())).await;
+    let value = value_of(2, two, Answer::Rows(vec![bob.clone(), world]));
+    assert_eq!(page.notice().await, value);
+    // Another tab discards the room: each subscription ends, the one with its value in flight
+    // once it is confirmed.
+    let discarded = page.call(3, on_room(&room_id, RoomCall::Discard)).await;
+    assert_eq!(discarded, Ok(Answer::Done));
+    assert_eq!(page.notice().await, ended(TAB, one));
+    assert!(page.no_notice().await);
+    confirm(&mut page, 2, two).await;
+    assert_eq!(page.notice().await, ended(2, two));
+    // Opened again, as new, the room has none, and a new one reads the replica of the server.
+    open_room(&mut page, TAB, &room_id).await;
+    assert_eq!(watches(&mut page, &room_id).await, 0);
+    let three = subscribe(&mut page, TAB, &room_id, Watch::Rows(Scan::new())).await;
+    let rows = vec![bob, note(2, "ana", "World")];
+    assert_eq!(
+        page.notice().await,
+        value_of(TAB, three, Answer::Rows(rows))
+    );
+}
+
+/// The subscription of `notice`, a value.
+fn subscription_of(notice: &Notice) -> u64 {
+    match notice {
+        Notice::Value { subscription, .. } => *subscription,
+        notice => panic!("{notice:?}"),
+    }
+}
+
+#[tokio::test]
+async fn each_value_goes_to_the_tab_of_its_subscription_and_a_tab_that_left_ends_only_its_own() {
+    let (server, room_id) = notes().await;
+    let dir = tempdir().unwrap();
+    let (mut page, _, _) = opened(&server, dir.path()).await;
+    let (one, two, three) = (1, 2, 3);
+    open_room(&mut page, one, &room_id).await;
+    open_room(&mut page, two, &room_id).await;
+    // Tabs 1 and 2 watch the same row, and tab 3, which did not open the room, every row.
+    let ana = Watch::Row(key(2, "ana"));
+    let first = subscribe(&mut page, one, &room_id, ana.clone()).await;
+    assert_eq!(page.notice().await, value_of(one, first, Answer::Row(None)));
+    let second = subscribe(&mut page, two, &room_id, ana).await;
+    assert_eq!(
+        page.notice().await,
+        value_of(two, second, Answer::Row(None))
+    );
+    let third = subscribe(&mut page, three, &room_id, Watch::Rows(Scan::new())).await;
+    let bob = note(1, "bob", "Hello");
+    let value = value_of(three, third, Answer::Rows(vec![bob.clone()]));
+    assert_eq!(page.notice().await, value);
+    assert!(first != second && second != third && first != third);
+    for (tab, subscription) in [(one, first), (two, second), (three, third)] {
+        confirm(&mut page, tab, subscription).await;
+    }
+    // A change: each subscription gets its value, at its own tab.
+    let world = insert(&mut page, two, &room_id, 2, "World").await;
+    let mut values = Vec::new();
+    for _ in 0..3 {
+        values.push(page.notice().await);
+    }
+    values.sort_by_key(subscription_of);
+    let row = Answer::Row(Some(world.clone()));
+    let mut expected = vec![
+        value_of(one, first, row.clone()),
+        value_of(two, second, row),
+        value_of(three, third, Answer::Rows(vec![bob.clone(), world])),
+    ];
+    expected.sort_by_key(subscription_of);
+    assert_eq!(values, expected);
+    // The confirmation and the `Unwatch` of a subscription of another tab change nothing.
+    confirm(&mut page, two, first).await;
+    unwatch(&mut page, two, first).await;
+    let bye = Row::new().with("text", "Bye");
+    let updated = page
+        .call(
+            two,
+            on_notes(&room_id, TableCall::Update(key(2, "ana"), bye)),
+        )
+        .await;
+    assert_eq!(updated, Ok(Answer::Done));
+    assert!(page.no_notice().await);
+    assert_eq!(watches(&mut page, &room_id).await, 3);
+
+    // Tab 1 leaves: its subscription ends, and those of the others do not. The room stays open:
+    // tab 2 opened it too.
+    assert_eq!(page.call(one, Request::Left).await, Ok(Answer::Done));
+    assert_eq!(watches(&mut page, &room_id).await, 2);
+    confirm(&mut page, one, first).await;
+    confirm(&mut page, two, second).await;
+    let bye = note(2, "ana", "Bye");
+    let value = value_of(two, second, Answer::Row(Some(bye.clone())));
+    assert_eq!(page.notice().await, value);
+    // Tab 3 leaves, with its value in flight: its subscription ends too, though it did not open
+    // the room.
+    assert_eq!(page.call(three, Request::Left).await, Ok(Answer::Done));
+    assert_eq!(watches(&mut page, &room_id).await, 1);
+    confirm(&mut page, three, third).await;
+    assert!(page.no_notice().await);
+    // Tab 2 leaves: the room closes, and its subscription ends with nothing to tab 2.
+    assert_eq!(page.call(two, Request::Left).await, Ok(Answer::Done));
+    assert!(!is_open(&mut page, &room_id).await);
+    assert!(page.no_notice().await);
+}
+
+#[tokio::test]
+async fn in_periodic_the_worker_is_live_while_the_room_has_a_subscription_of_the_dispatcher() {
+    let (server, room_id) = notes().await;
+    let dir = tempdir().unwrap();
+    let (mut page, _, _) = opened(&server, dir.path()).await;
+    let periodic = RoomCall::SetFreshness(Freshness::Periodic);
+    assert_eq!(
+        page.call(TAB, on_room(&room_id, periodic)).await,
+        Ok(Answer::Done)
+    );
+    open_room(&mut page, TAB, &room_id).await;
+    async fn mode(page: &mut Page, room_id: &RoomId) -> Freshness {
+        status_of(page, room_id).await.worker.unwrap().freshness
+    }
+    assert_eq!(mode(&mut page, &room_id).await, Freshness::Periodic);
+    // The first subscription asks the worker for `Live`; ending one of two leaves it in `Live`,
+    // and ending the last, with the tab that left, asks for `Periodic`.
+    let first = subscribe(&mut page, 1, &room_id, Watch::Rows(Scan::new())).await;
+    assert_eq!(subscription_of(&page.notice().await), first);
+    assert_eq!(mode(&mut page, &room_id).await, Freshness::Live);
+    let second = subscribe(&mut page, 2, &room_id, Watch::Row(key(1, "bob"))).await;
+    assert_eq!(subscription_of(&page.notice().await), second);
+    unwatch(&mut page, 1, first).await;
+    assert_eq!(mode(&mut page, &room_id).await, Freshness::Live);
+    assert_eq!(page.call(2, Request::Left).await, Ok(Answer::Done));
+    assert_eq!(mode(&mut page, &room_id).await, Freshness::Periodic);
+    // One that ends with its room, which opens again in `Periodic`.
+    let third = subscribe(&mut page, 1, &room_id, Watch::Rows(Scan::new())).await;
+    assert_eq!(subscription_of(&page.notice().await), third);
+    assert_eq!(mode(&mut page, &room_id).await, Freshness::Live);
+    confirm(&mut page, 1, third).await;
+    let closed = page.call(TAB, on_room(&room_id, RoomCall::Close)).await;
+    assert_eq!(closed, Ok(Answer::Done));
+    assert_eq!(page.notice().await, ended(1, third));
+    open_room(&mut page, TAB, &room_id).await;
+    assert_eq!(mode(&mut page, &room_id).await, Freshness::Periodic);
+}
+
+#[tokio::test]
+async fn dropping_the_dispatcher_ends_its_subscriptions() {
+    let (server, room_id) = notes().await;
+    let dir = tempdir().unwrap();
+    let (mut page, platform, _) = opened(&server, dir.path()).await;
+    open_room(&mut page, TAB, &room_id).await;
+    let confirmed = subscribe(&mut page, TAB, &room_id, Watch::Row(key(1, "bob"))).await;
+    page.notice().await;
+    confirm(&mut page, TAB, confirmed).await;
+    subscribe(&mut page, TAB, &room_id, Watch::Rows(Scan::new())).await;
+    page.notice().await;
+    assert_eq!(watches(&mut page, &room_id).await, 2);
+    drop(page);
+    let room = platform.opened().room(room_id.clone()).await.unwrap();
+    let start = Instant::now();
+    while room.status().await.unwrap().watches > 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "The subscriptions stay"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_that_answers_from_inside_what_publishes_gets_its_tokens_and_the_last_value() {
+    let (server, room_id) = notes().await;
+    let dir = tempdir().unwrap();
+    let platform = TestPlatform::asking_the_page(&server.transport());
+    // The page confirms each value, and answers each request of a token, from inside the function
+    // that publishes it.
+    let hook = |dispatcher: &Dispatcher, message: &Message| {
+        let (tab, request) = match message {
+            Message::Notice(Notice::Value {
+                tab, subscription, ..
+            }) => (*tab, Request::Confirm(*subscription)),
+            Message::Notice(Notice::Token {
+                tab,
+                request,
+                client_id,
+                room_id,
+            }) => (
+                *tab,
+                Request::Token(*request, Some(token(client_id, room_id))),
+            ),
+            _ => return,
+        };
+        let id = 0;
+        dispatcher.dispatch(Command { tab, id, request });
+    };
+    let mut page = Page::with(&platform, hook);
+    let opened = page.call(TAB, open(dir.path())).await;
+    assert!(matches!(opened, Ok(Answer::ClientId(_))), "{opened:?}");
+    open_room(&mut page, TAB, &room_id).await;
+    let all = subscribe(&mut page, TAB, &room_id, Watch::Rows(Scan::new())).await;
+    // Writes one after another, while the values come and are confirmed.
+    let mut rows = vec![note(1, "bob", "Hello")];
+    for number in 2..=40 {
+        rows.push(insert(&mut page, TAB, &room_id, number, &format!("Note {number}")).await);
+    }
+    // Once the replica is still, the last value is the last state, and each value is a state
+    // after the one before.
+    let last = value_of(TAB, all, Answer::Rows(rows));
+    while page.notices.back() != Some(&last) {
+        page.take().await;
+    }
+    let counts = page.notices.iter().map(|notice| match notice {
+        Notice::Value {
+            tab: TAB,
+            subscription,
+            value: Ok(Answer::Rows(rows)),
+        } if *subscription == all => rows.len(),
+        Notice::Token { .. } => 0,
+        notice => panic!("{notice:?}"),
+    });
+    let counts = Vec::from_iter(counts.filter(|count| *count > 0));
+    assert!(
+        counts.windows(2).all(|pair| pair[0] < pair[1]),
+        "{counts:?}"
+    );
+    assert_eq!(counts.last(), Some(&40));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_page_gets_the_reply_to_a_watch_first_and_nothing_after_its_unwatch_or_its_left() {
+    let (server, room_id) = notes().await;
+    let dir = tempdir().unwrap();
+    let platform = TestPlatform::new(&server.transport());
+    // The page takes a while with the reply to a watch, longer than with a value, which it tells.
+    let (publishing, mut published) = mpsc::unbounded_channel();
+    let hook = move |_: &Dispatcher, message: &Message| match message {
+        Message::Reply(Reply {
+            result: Ok(Answer::Subscription(_)),
+            ..
+        }) => std::thread::sleep(Duration::from_millis(300)),
+        Message::Notice(Notice::Value { subscription, .. }) => {
+            let _ = publishing.send(*subscription);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        _ => {}
+    };
+    let mut page = Page::with(&platform, hook);
+    let opened = page.call(TAB, open(dir.path())).await;
+    assert!(matches!(opened, Ok(Answer::ClientId(_))), "{opened:?}");
+    open_room(&mut page, TAB, &room_id).await;
+    // How the tab ends the subscription: with `Unwatch` (`None`), with the notice that it left, or
+    // with two of those at once.
+    let rounds = [
+        (TAB, vec![None]),
+        (2, vec![Some(Request::Left)]),
+        (3, vec![Some(Request::Left)]),
+        (4, vec![None, Some(Request::Left)]),
+        (5, vec![None, None]),
+        (6, vec![Some(Request::Left), Some(Request::Left)]),
+        (8, vec![Some(Request::Left), None]),
+    ];
+    for (tab, endings) in rounds {
+        // The first value comes once the page took the reply.
+        let id = page.send(tab, watch(&room_id, Watch::Rows(Scan::new())));
+        let subscription = subscription(page.reply(id).await.result);
+        // The tab ends it while the page takes its value: the value comes before each reply.
+        let publishing = tokio::time::timeout(Duration::from_secs(30), published.recv());
+        assert_eq!(publishing.await.unwrap(), Some(subscription));
+        let ended = Vec::from_iter(endings.into_iter().map(|ending| {
+            let ending = ending.unwrap_or(Request::Unwatch(subscription));
+            page.send(tab, ending)
+        }));
+        for id in &ended {
+            assert_eq!(page.reply(*id).await.result, Ok(Answer::Done), "{tab}");
+        }
+        // Once they replied, the subscription and its stream are out of the room.
+        assert_eq!(watches(&mut page, &room_id).await, 0, "{tab}");
+        page.settle(Duration::from_millis(200)).await;
+        let rows = Answer::Rows(vec![note(1, "bob", "Hello")]);
+        let value = page.logged_notice(&value_of(tab, subscription, rows));
+        assert!(page.logged_reply(id) < value, "{tab}");
+        for id in ended {
+            assert!(value < page.logged_reply(id), "{tab}: {id}");
+        }
+        page.notices.clear();
+    }
+    assert_eq!(watches(&mut page, &room_id).await, 0);
+}
+
+#[tokio::test]
+async fn a_page_that_unwatches_from_inside_the_reply_to_its_watch_ends_the_subscription() {
+    let (server, room_id) = notes().await;
+    let dir = tempdir().unwrap();
+    let platform = TestPlatform::new(&server.transport());
+    // Tab 2 ends each of its subscriptions as soon as it takes the reply that gives its id.
+    let hook = |dispatcher: &Dispatcher, message: &Message| {
+        if let Message::Reply(Reply {
+            tab: 2,
+            result: Ok(Answer::Subscription(subscription)),
+            ..
+        }) = message
+        {
+            let request = Request::Unwatch(*subscription);
+            let id = 1000;
+            dispatcher.dispatch(Command {
+                tab: 2,
+                id,
+                request,
+            });
+        }
+    };
+    let mut page = Page::with(&platform, hook);
+    let opened = page.call(TAB, open(dir.path())).await;
+    assert!(matches!(opened, Ok(Answer::ClientId(_))), "{opened:?}");
+    open_room(&mut page, TAB, &room_id).await;
+    subscribe(&mut page, 2, &room_id, Watch::Rows(Scan::new())).await;
+    assert_eq!(page.reply(1000).await.result, Ok(Answer::Done));
+    insert(&mut page, TAB, &room_id, 2, "World").await;
+    assert!(page.no_notice().await);
+    assert_eq!(watches(&mut page, &room_id).await, 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The tokens
+
+/// The tab of the next request of a token that comes, and its id and its room, which is of the
+/// client.
+async fn asked(page: &mut Page, client: &ClientId) -> (u64, u64, RoomId) {
+    match page.notice().await {
+        Notice::Token {
+            tab,
+            request,
+            client_id,
+            room_id,
+        } if client_id == *client => (tab, request, room_id),
+        notice => panic!("{notice:?}"),
+    }
+}
+
+/// Answers the request `request` from `tab` with `token`.
+async fn answer(page: &mut Page, tab: u64, request: u64, token: &str) {
+    let answered = page.call(tab, Request::Token(request, Some(token.to_string())));
+    assert_eq!(answered.await, Ok(Answer::Done));
+}
+
+/// A page whose dispatcher opened over `dir` the client of ana, which takes its tokens from the
+/// page, through a transport to `server`, with its transport and its client id.
+async fn asking(server: &TestServer, dir: &Path) -> (Page, TestTransport, ClientId) {
+    let transport = server.transport();
+    let platform = TestPlatform::asking_the_page(&transport);
+    let mut page = opened_with(&platform, dir).await;
+    // The waits of the client, on the paused clock.
+    page.wait = Duration::from_secs(3600);
+    (page, transport, platform.opened().client_id())
+}
+
+/// A token of `client_id` for `room_id` that already expired, in the format of the server.
+fn expired(client_id: &ClientId, room_id: &RoomId) -> String {
+    generate_client_token(client_id, room_id, Duration::ZERO, AUTH_SECRET)
+}
+
+#[tokio::test(start_paused = true)]
+async fn with_the_token_of_its_tab_a_room_opens_and_without_one_in_time_it_opens_as_without_one() {
+    let (server, room_id) = notes().await;
+    let other = notes_in(&server, "room-b").await;
+    let dir = tempdir().unwrap();
+    let (mut page, transport, client_id) = asking(&server, dir.path()).await;
+    // The open asks its tab, and the room opens with the token that the tab gives, which its
+    // registration carries.
+    let opening = page.send(1, on_room(&room_id, RoomCall::Open));
+    let (tab, request, asked_for) = asked(&mut page, &client_id).await;
+    assert_eq!((tab, &asked_for), (1, &room_id));
+    let given = token(&client_id, &room_id);
+    answer(&mut page, 1, request, &given).await;
+    assert_eq!(page.reply(opening).await.result, Ok(Answer::Done));
+    assert!(status_of(&mut page, &room_id).await.registered);
+    let registered = (ClientMessageKind::RegisterClient, given);
+    assert_eq!(transport.bearers(), [registered]);
+
+    // Without an answer within the 60 s of the client, the open goes on as without a token: its
+    // registration goes without one, and is refused for it, which asks the tab once more.
+    let start = Instant::now();
+    let opening = page.send(1, on_room(&other, RoomCall::Open));
+    let (tab, first, asked_for) = asked(&mut page, &client_id).await;
+    assert_eq!((tab, &asked_for), (1, &other));
+    let (tab, second, asked_for) = asked(&mut page, &client_id).await;
+    assert_eq!((tab, &asked_for), (1, &other));
+    assert_eq!(start.elapsed(), Duration::from_secs(60));
+    assert_ne!(first, second);
+    // An answer that comes late changes nothing, and a room without metadata does not open.
+    answer(&mut page, 1, first, &token(&client_id, &other)).await;
+    let opened = page.reply(opening).await.result;
+    let waited = start.elapsed();
+    let sent = transport.bearers()[1..].to_vec();
+    assert_eq!(sent, [(ClientMessageKind::RegisterClient, String::new())]);
+    // As with a token provider that does not answer, in the facade.
+    let twin_dir = tempdir().unwrap();
+    let (twin, tokens) = (server.transport(), TestTokens::issuing(Issue::Hang));
+    let metadata = FileMetadata::new(twin_dir.path());
+    let storage = engine(twin_dir.path());
+    let facade = ZemdbClient::open(manual("ana"), storage, metadata, twin.clone(), tokens, None);
+    let facade = facade.await.unwrap();
+    twin.hush(&facade.client_id());
+    let start = Instant::now();
+    let room = facade.room(other.clone()).await;
+    assert_eq!(opened, room.map(|_| Answer::Done));
+    assert!(matches!(opened, Err(ClientError::Network(_))), "{opened:?}");
+    assert_eq!(start.elapsed(), waited);
+    assert_eq!(twin.bearers(), sent);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_request_of_a_token_goes_to_the_tab_that_opens_its_room_or_else_to_one_that_holds_it() {
+    let server = TestServer::new();
+    let [a, b, c, d] = [
+        notes_in(&server, "room-a").await,
+        notes_in(&server, "room-b").await,
+        notes_in(&server, "room-c").await,
+        notes_in(&server, "room-d").await,
+    ];
+    let dir = tempdir().unwrap();
+    let (mut page, transport, client_id) = asking(&server, dir.path()).await;
+    // Each open asks its own tab, and the answer of another tab changes nothing: tab 1 opens A,
+    // and tab 2 opens B, and A too.
+    for (tab, room_id) in [(1, &a), (2, &b), (2, &a)] {
+        let opening = page.send(tab, on_room(room_id, RoomCall::Open));
+        let (asked_tab, request, asked_for) = asked(&mut page, &client_id).await;
+        assert_eq!((asked_tab, asked_for), (tab, room_id.clone()));
+        let given = token(&client_id, room_id);
+        answer(&mut page, 3 - tab, request, &given).await;
+        assert!(page.quiet().await, "{room_id}");
+        answer(&mut page, tab, request, &given).await;
+        assert_eq!(page.reply(opening).await.result, Ok(Answer::Done));
+    }
+    // A renewal out of an open goes to the first of the tabs that opened the room: tab 2 opens A
+    // again with a token that expired, which becomes its token, and its write is refused for it.
+    let opening = page.send(2, on_room(&a, RoomCall::Open));
+    let (asked_tab, request, _) = asked(&mut page, &client_id).await;
+    assert_eq!(asked_tab, 2);
+    answer(&mut page, 2, request, &expired(&client_id, &a)).await;
+    assert_eq!(page.reply(opening).await.result, Ok(Answer::Done));
+    let row = TableCall::Insert(new_note(2, "World"));
+    let writing = page.send(2, on_notes(&a, row));
+    let (asked_tab, request, asked_for) = asked(&mut page, &client_id).await;
+    assert_eq!((asked_tab, asked_for), (1, a.clone()));
+    answer(&mut page, 1, request, &token(&client_id, &a)).await;
+    let written = page.reply(writing).await.result;
+    assert_eq!(written, Ok(Answer::Key(key(2, "ana"))));
+
+    // Two requests to the same tab at once, answered in the other order: each answer goes to its
+    // request, and each room registers with its own token.
+    let opening = [
+        page.send(1, on_room(&c, RoomCall::Open)),
+        page.send(1, on_room(&d, RoomCall::Open)),
+    ];
+    let mut requests = HashMap::new();
+    for _ in 0..2 {
+        let (asked_tab, request, asked_for) = asked(&mut page, &client_id).await;
+        assert_eq!(asked_tab, 1);
+        requests.insert(asked_for, request);
+    }
+    let (for_c, for_d) = (token(&client_id, &c), token(&client_id, &d));
+    answer(&mut page, 1, requests[&d], &for_d).await;
+    answer(&mut page, 1, requests[&c], &for_c).await;
+    for id in opening {
+        assert_eq!(page.reply(id).await.result, Ok(Answer::Done));
+    }
+    let bearers = transport.bearers();
+    for given in [for_c, for_d] {
+        let registered = (ClientMessageKind::RegisterClient, given);
+        assert!(bearers.contains(&registered), "{bearers:?}");
+    }
+    assert!(page.no_notice().await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_tab_that_left_ends_the_requests_of_a_token_to_it_and_gets_no_more() {
+    let server = TestServer::new();
+    let [a, e] = [
+        notes_in(&server, "room-a").await,
+        notes_in(&server, "room-e").await,
+    ];
+    let dir = tempdir().unwrap();
+    let (mut page, _, client_id) = asking(&server, dir.path()).await;
+    for tab in [1, 2] {
+        let opening = page.send(tab, on_room(&a, RoomCall::Open));
+        let (_, request, _) = asked(&mut page, &client_id).await;
+        answer(&mut page, tab, request, &token(&client_id, &a)).await;
+        assert_eq!(page.reply(opening).await.result, Ok(Answer::Done));
+    }
+    // Tab 1 opens E, whose request waits, and leaves: the request ends at once, and the open goes
+    // on without a token; its registration, refused for it, has no tab left to ask, and E,
+    // without metadata, does not open.
+    let start = Instant::now();
+    let opening = page.send(1, on_room(&e, RoomCall::Open));
+    let (asked_tab, _, asked_for) = asked(&mut page, &client_id).await;
+    assert_eq!((asked_tab, &asked_for), (1, &e));
+    let left = page.send(1, Request::Left);
+    let opened = page.reply(opening).await.result;
+    assert!(matches!(opened, Err(ClientError::Network(_))), "{opened:?}");
+    assert_eq!(page.reply(left).await.result, Ok(Answer::Done));
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(page.no_notice().await);
+    // A stays open, of tab 2, and a renewal of its token goes to tab 2.
+    let opening = page.send(2, on_room(&a, RoomCall::Open));
+    let (asked_tab, request, _) = asked(&mut page, &client_id).await;
+    assert_eq!(asked_tab, 2);
+    answer(&mut page, 2, request, &expired(&client_id, &a)).await;
+    assert_eq!(page.reply(opening).await.result, Ok(Answer::Done));
+    let row = TableCall::Insert(new_note(2, "World"));
+    let writing = page.send(2, on_notes(&a, row));
+    let (asked_tab, request, _) = asked(&mut page, &client_id).await;
+    assert_eq!(asked_tab, 2);
+    answer(&mut page, 2, request, &token(&client_id, &a)).await;
+    let written = page.reply(writing).await.result;
+    assert_eq!(written, Ok(Answer::Key(key(2, "ana"))));
+    // Once its notice replied, tab 1 gets requests again: it opens A again, which tab 2 holds, and
+    // the request of its open goes to it.
+    let opening = page.send(1, on_room(&a, RoomCall::Open));
+    let (asked_tab, request, _) = asked(&mut page, &client_id).await;
+    assert_eq!(asked_tab, 1);
+    answer(&mut page, 1, request, &token(&client_id, &a)).await;
+    assert_eq!(page.reply(opening).await.result, Ok(Answer::Done));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_renewal_of_an_open_goes_to_its_tab_while_an_open_of_another_tab_waits_for_its_turn() {
+    let server = TestServer::new();
+    let b = notes_in(&server, "room-b").await;
+    let dir = tempdir().unwrap();
+    let (mut page, _, client_id) = asking(&server, dir.path()).await;
+    // Tab 1 opens B, and does not answer its request; tab 2 opens B meanwhile, after it.
+    let start = Instant::now();
+    let first = page.send(1, on_room(&b, RoomCall::Open));
+    let (asked_tab, _, _) = asked(&mut page, &client_id).await;
+    assert_eq!(asked_tab, 1);
+    let second = page.send(2, on_room(&b, RoomCall::Open));
+    // At 60 s, the registration of the first goes without a token, and its renewal asks tab 1,
+    // whose open is still the one in the turn of the room.
+    let (asked_tab, request, _) = asked(&mut page, &client_id).await;
+    assert_eq!(asked_tab, 1);
+    assert_eq!(start.elapsed(), Duration::from_secs(60));
+    answer(&mut page, 1, request, &token(&client_id, &b)).await;
+    assert_eq!(page.reply(first).await.result, Ok(Answer::Done));
+    // Then the open of tab 2 takes its turn, and asks tab 2.
+    let (asked_tab, request, _) = asked(&mut page, &client_id).await;
+    assert_eq!(asked_tab, 2);
+    answer(&mut page, 2, request, &token(&client_id, &b)).await;
+    assert_eq!(page.reply(second).await.result, Ok(Answer::Done));
+}
+
+#[tokio::test]
+async fn a_request_of_a_token_during_the_shutdown_goes_to_a_tab_of_its_room() {
+    let (server, room_id) = notes().await;
+    let dir = tempdir().unwrap();
+    let transport = server.transport();
+    let platform = TestPlatform::asking_the_page(&transport);
+    let mut page = opened_with(&platform, dir.path()).await;
+    let client_id = platform.opened().client_id();
+    // Tab 1 opens the room, and opens it again with a token that expired, which becomes its
+    // token.
+    for given in [token(&client_id, &room_id), expired(&client_id, &room_id)] {
+        let opening = page.send(1, on_room(&room_id, RoomCall::Open));
+        let (asked_tab, request, _) = asked(&mut page, &client_id).await;
+        assert_eq!(asked_tab, 1);
+        answer(&mut page, 1, request, &given).await;
+        assert_eq!(page.reply(opening).await.result, Ok(Answer::Done));
+    }
+    // A write, whose commit is refused for its token, with the refusal held; and the shutdown,
+    // whose close of the room in the storage engine is held.
+    let mut refused = transport.hold_next_reply(ClientMessageKind::Commit);
+    let late = TableCall::Insert(new_note(3, "Late"));
+    let writing = page.send(1, on_notes(&room_id, late));
+    refused.replied().await;
+    let mut closing = platform.engine().hold_next("close_room");
+    let shutdown = page.send(1, Request::Shutdown);
+    closing.replied().await;
+    // The refusal comes during the shutdown: the renewal of the write asks tab 1, which held the
+    // room when the shutdown came.
+    refused.release();
+    let (asked_tab, request, asked_for) = asked(&mut page, &client_id).await;
+    assert_eq!((asked_tab, asked_for), (1, room_id.clone()));
+    let unanswered = page.call(1, Request::Token(request, None)).await;
+    assert_eq!(unanswered, Ok(Answer::Done));
+    closing.release();
+    assert_eq!(page.reply(shutdown).await.result, Ok(Answer::Done));
+    let written = page.reply(writing).await.result;
+    assert!(written.is_err(), "{written:?}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1414,6 +2424,13 @@ fn requests(rng: &mut Rng) -> Vec<Request> {
         TableCall::Delete(columns(rng)),
     ];
     requests.extend(calls.map(|call| Request::Table(table(rng), call)));
+    requests.extend([
+        Request::Watch(table(rng), Watch::Row(columns(rng))),
+        Request::Watch(table(rng), Watch::Rows(scan(rng))),
+        Request::Unwatch(rng.next_u64()),
+        Request::Confirm(rng.next_u64()),
+        Request::Token(rng.next_u64(), rng.chance(50).then(|| text(rng))),
+    ]);
     requests
 }
 
@@ -1476,16 +2493,41 @@ fn answers(rng: &mut Rng) -> Vec<Answer> {
         worker: rng.chance(50).then_some(worker),
         watches: rng.next_u64() as usize,
     };
-    let person = text(rng).replace('\u{7f}', "");
-    let client_id = ClientId::new(format!("p{person}#{}", rng.next_u64())).unwrap();
     vec![
         Answer::Done,
-        Answer::ClientId(client_id),
+        Answer::ClientId(client_id(rng)),
         Answer::Status(status),
         Answer::Row(rng.chance(50).then(|| columns(rng))),
         Answer::Rows((0..rng.below(4)).map(|_| columns(rng)).collect()),
         Answer::Key(columns(rng)),
+        Answer::Subscription(rng.next_u64()),
     ]
+}
+
+fn client_id(rng: &mut Rng) -> ClientId {
+    let person = text(rng).replace('\u{7f}', "");
+    ClientId::new(format!("p{person}#{}", rng.next_u64())).unwrap()
+}
+
+/// Each notice, with values at random: a value of each answer and each error.
+fn notices(rng: &mut Rng) -> Vec<Notice> {
+    let results = (answers(rng).into_iter().map(Ok)).chain(errors(rng).into_iter().map(Err));
+    let mut notices = Vec::from_iter(results.map(|value| Notice::Value {
+        tab: rng.next_u64(),
+        subscription: rng.next_u64(),
+        value,
+    }));
+    notices.push(Notice::Ended {
+        tab: rng.next_u64(),
+        subscription: rng.next_u64(),
+    });
+    notices.push(Notice::Token {
+        tab: rng.next_u64(),
+        request: rng.next_u64(),
+        client_id: client_id(rng),
+        room_id: room_id(rng),
+    });
+    notices
 }
 
 /// `value` decoded from its encoding with `options`, which encodes it again to the same bytes: a
@@ -1502,7 +2544,7 @@ where
 }
 
 #[test]
-fn every_command_and_reply_goes_through_bincode_unchanged() {
+fn every_command_reply_and_notice_goes_through_bincode_unchanged() {
     use bincode::Options;
     let mut rng = Rng::new(0x5eed_d15c);
     let fixint = bincode::DefaultOptions::new().with_fixint_encoding();
@@ -1527,6 +2569,11 @@ fn every_command_and_reply_goes_through_bincode_unchanged() {
             });
             round_trip(&reply, fixint);
             round_trip(&reply, varint);
+        }
+        for notice in notices(&mut rng) {
+            let notice = Message::Notice(notice);
+            round_trip(&notice, fixint);
+            round_trip(&notice, varint);
         }
     }
 }

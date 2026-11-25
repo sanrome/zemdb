@@ -1,36 +1,47 @@
 //! The dispatcher of the runtime of a browser Worker: it takes the [`Command`]s of the pages, as
-//! serializable data, runs each one as a call to the facade, and publishes the [`Reply`] of each,
-//! also serializable.
+//! serializable data, runs each one as a call to the facade, and publishes the [`Reply`] of each
+//! and its [`Notice`]s, also serializable: the values of the subscriptions of `watch`, one at a
+//! time, their ends, and the requests of a token.
 //!
 //! It does not depend on the browser: the [`Platform`] opens the client over the storage, the
 //! metadata and the transport of the platform, and the entry point of the Worker decodes the
 //! messages of the pages and posts what the dispatcher publishes.
 
 mod command;
+mod subscription;
+mod token;
 
 use async_trait::async_trait;
 use futures::future::OptionFuture;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use tokio::sync::oneshot::{self, error::TryRecvError};
 use zemdb_core::RoomId;
 
 pub use command::{
-    Answer, Command, DispatchConfig, Message, Reply, Request, RoomCall, Table, TableCall,
+    Answer, Command, DispatchConfig, Message, Notice, Reply, Request, RoomCall, Table, TableCall,
+    Watch,
 };
+pub use token::PageTokens;
 
 use crate::{rt, ClientError, ZemdbClient};
+use subscription::Watcher;
 
 /// What a command gives.
 type Outcome = Result<Answer, ClientError>;
 
 /// What opens the client of a dispatcher: the platform, which builds the storage engine, the
-/// metadata, the transport and the token provider over what the configuration names.
+/// metadata and the transport over what the configuration names.
 #[async_trait]
 pub trait Platform: Send + Sync {
-    /// Opens the client of `config`, as [`ZemdbClient::open`] does.
-    async fn open(&self, config: DispatchConfig) -> Result<ZemdbClient, ClientError>;
+    /// Opens the client of `config`, as [`ZemdbClient::open`] does, with `tokens` as its token
+    /// provider, which asks the pages for the tokens.
+    async fn open(
+        &self,
+        config: DispatchConfig,
+        tokens: PageTokens,
+    ) -> Result<ZemdbClient, ClientError>;
 }
 
 /// The dispatcher of the commands of the pages of a client.
@@ -42,6 +53,11 @@ pub trait Platform: Send + Sync {
 /// tab that left: those of a room run one at a time, in the order they were dispatched. Each
 /// command is one call to the facade, and the dispatcher never repeats a write. The client opens
 /// once; once it shuts down, every command on a room is `RoomClosed`.
+///
+/// A subscription of `watch` is a task that publishes the values of its stream to its tab, each
+/// once the tab confirmed the one before, and then the end of its stream; it also ends with
+/// `Unwatch`, once its tab left, and once the dispatcher is dropped. A request of a token goes to
+/// a tab of its room.
 ///
 /// A command that panics ends without a reply, in native, and the turns it took or waited for
 /// end with it: the next call of each room goes on. In WebAssembly, a panic closes the Worker.
@@ -71,11 +87,23 @@ struct State {
     /// turn, what ends once the last of them dispatched ended; until another turn starts, also
     /// per room whose turns all ended.
     turns: HashMap<RoomId, oneshot::Receiver<()>>,
+    /// The tab whose open of each room runs in its turn.
+    opening: HashMap<RoomId, u64>,
+    /// The tabs whose notice that they left is in flight, once per notice.
+    leaving: Vec<u64>,
+    /// The last id given to a subscription or to a request of a token.
+    last: u64,
+    /// The subscriptions, each with its tab, until their tasks end.
+    subscriptions: HashMap<u64, (u64, Watcher)>,
+    /// The requests of a token that the client waits for, each with the tab it went to.
+    tokens: HashMap<u64, (u64, oneshot::Sender<Option<String>>)>,
+    /// Whether the dispatcher was dropped: no tab answers a request of a token any more.
+    dropped: bool,
 }
 
 impl Dispatcher {
-    /// A dispatcher whose client `platform` opens, which publishes its replies with `publish`,
-    /// without holding any lock: `publish` may dispatch a command.
+    /// A dispatcher whose client `platform` opens, which publishes its replies and its notices
+    /// with `publish`, without holding any lock: `publish` may dispatch a command.
     pub fn new(
         platform: impl Platform + 'static,
         publish: impl Fn(Message) + Send + Sync + 'static,
@@ -92,7 +120,9 @@ impl Dispatcher {
 
     /// Runs `command` in a task of its own, of the Tokio runtime it is called in, and publishes
     /// its reply once it ends. A command that does not reach the client (a `ClientId`, or a
-    /// command on a room before the open or after the shutdown) replies at once.
+    /// command on a room before the open or after the shutdown) replies at once, and so do
+    /// `Watch`, `Confirm` and `Token`. `Unwatch`, `Confirm` and `Token` change nothing for a
+    /// subscription or a request that ended, or that is not of the tab.
     pub fn dispatch(&self, command: Command) {
         let Command { tab, id, request } = command;
         let shared = &self.shared;
@@ -115,6 +145,8 @@ impl Dispatcher {
                     let (turn, shared) = (shared.turn(&room_id), Arc::clone(shared));
                     self.shared.spawn(tab, id, async move {
                         let _turn = turn.await;
+                        let opening =
+                            (call == RoomCall::Open).then(|| shared.opening(&room_id, tab));
                         let answer = room(client, room_id.clone(), call).await;
                         let mut state = shared.state();
                         if call != RoomCall::Open {
@@ -122,6 +154,8 @@ impl Dispatcher {
                         } else if answer.is_ok() && !state.shut_down {
                             state.rooms.entry(room_id).or_default().insert(tab);
                         }
+                        // The tab holds the room before the mark of its open goes.
+                        drop((state, opening));
                         answer
                     });
                 }
@@ -132,7 +166,80 @@ impl Dispatcher {
                 Ok(client) => shared.spawn(tab, id, on_table(client, table, call)),
                 Err(err) => shared.reply(tab, id, Err(err)),
             },
+            Request::Watch(table, watch) => subscription::start(shared, tab, id, table, watch),
+            Request::Unwatch(subscription) => {
+                let mut state = shared.state();
+                let watcher = state.subscriptions.get_mut(&subscription);
+                let ended = watcher.filter(|entry| entry.0 == tab).map(|(_, w)| w.end());
+                drop(state);
+                shared.spawn(tab, id, async move {
+                    OptionFuture::from(ended).await;
+                    Ok(Answer::Done)
+                });
+            }
+            Request::Confirm(subscription) => {
+                let mut state = shared.state();
+                let watcher = state.subscriptions.get_mut(&subscription);
+                let watcher = watcher.filter(|entry| entry.0 == tab);
+                if let Some(confirm) = watcher.and_then(|(_, watcher)| watcher.confirm.take()) {
+                    // A task cut meanwhile does not take it.
+                    let _ = confirm.send(());
+                }
+                drop(state);
+                shared.reply(tab, id, Ok(Answer::Done));
+            }
+            Request::Token(request, token) => {
+                if let Some(answer) = take(&mut shared.state().tokens, tab, request) {
+                    // A provider that stopped waiting meanwhile does not take it.
+                    let _ = answer.send(token);
+                }
+                shared.reply(tab, id, Ok(Answer::Done));
+            }
             Request::Left => shared.left(tab, id),
+        }
+    }
+}
+
+impl Drop for Dispatcher {
+    /// Ends the subscriptions, whose tasks would keep the dispatcher otherwise, and the requests
+    /// of a token, which no tab answers any more.
+    fn drop(&mut self) {
+        let mut state = self.shared.state();
+        state.dropped = true;
+        let ended = (
+            std::mem::take(&mut state.subscriptions),
+            std::mem::take(&mut state.tokens),
+        );
+        drop((state, ended));
+    }
+}
+
+impl State {
+    /// A new id of a subscription or of a request of a token.
+    fn next_id(&mut self) -> u64 {
+        self.last += 1;
+        self.last
+    }
+}
+
+/// The entry `id` of `tab` in `entries`, taken out of them: an entry of another tab stays.
+fn take<T>(entries: &mut HashMap<u64, (u64, T)>, tab: u64, id: u64) -> Option<T> {
+    match entries.get(&id) {
+        Some((of, _)) if *of == tab => entries.remove(&id).map(|(_, entry)| entry),
+        _ => None,
+    }
+}
+
+/// What undoes a change of the state of a dispatcher.
+type Change = Box<dyn FnOnce(&mut State) + Send>;
+
+/// A change of the state of a dispatcher, undone once this is dropped, also on a panic.
+struct Undo(Weak<Shared>, Option<Change>);
+
+impl Drop for Undo {
+    fn drop(&mut self) {
+        if let (Some(shared), Some(undo)) = (self.0.upgrade(), self.1.take()) {
+            undo(&mut shared.state());
         }
     }
 }
@@ -144,6 +251,36 @@ impl Shared {
 
     fn reply(&self, tab: u64, id: u64, result: Outcome) {
         (self.publish)(Message::Reply(Reply { tab, id, result }));
+    }
+
+    fn notice(&self, notice: Notice) {
+        (self.publish)(Message::Notice(notice));
+    }
+
+    /// What undoes `undo` on the state once it is dropped.
+    fn undo(self: &Arc<Self>, undo: impl FnOnce(&mut State) + Send + 'static) -> Undo {
+        Undo(Arc::downgrade(self), Some(Box::new(undo)))
+    }
+
+    /// Marks `tab` as the tab whose open of `room_id` runs in its turn, until what it gives is
+    /// dropped.
+    fn opening(self: &Arc<Self>, room_id: &RoomId, tab: u64) -> Undo {
+        self.state().opening.insert(room_id.clone(), tab);
+        let room_id = room_id.clone();
+        self.undo(move |state| {
+            state.opening.remove(&room_id);
+        })
+    }
+
+    /// Marks `tab` in `state` as a tab whose notice that it left is in flight, until what it gives
+    /// is dropped: no request of a token goes to it meanwhile.
+    fn leaving(self: &Arc<Self>, state: &mut State, tab: u64) -> Undo {
+        state.leaving.push(tab);
+        self.undo(move |state| {
+            if let Some(at) = state.leaving.iter().position(|of| *of == tab) {
+                state.leaving.swap_remove(at);
+            }
+        })
     }
 
     /// The open client, for a command on `room_id`: `RoomClosed` before the open and once the
@@ -196,7 +333,8 @@ impl Shared {
         };
         let shared = Arc::clone(self);
         self.spawn(tab, id, async move {
-            let client = shared.platform.open(config).await?;
+            let tokens = PageTokens::new(&shared);
+            let client = shared.platform.open(config, tokens).await?;
             let client_id = client.client_id();
             // A shutdown that came meanwhile waits for the life lock, and shuts it down.
             shared.state().client = Some(client);
@@ -206,35 +344,53 @@ impl Shared {
     }
 
     /// Shuts the client down once the open in flight, if any, ended: every command on a room
-    /// that comes afterwards is `RoomClosed`.
+    /// that comes afterwards is `RoomClosed`, and the subscriptions end with their streams. The
+    /// tabs of the rooms are forgotten once the client shut down, so that a request of a token
+    /// meanwhile (the last acknowledgement of a worker, a write in flight) goes to a tab of its
+    /// room.
     fn shutdown(self: &Arc<Self>, tab: u64, id: u64) {
-        let mut state = self.state();
-        (state.shut_down, state.rooms) = (true, HashMap::new());
+        self.state().shut_down = true;
         let shared = Arc::clone(self);
         self.spawn(tab, id, async move {
             let _life = shared.life.lock().await;
             let client = shared.state().client.clone();
-            match client {
+            let shut = match client {
                 Some(client) => client.shutdown().await.map(|()| Answer::Done),
                 None => Ok(Answer::Done),
-            }
+            };
+            shared.state().rooms.clear();
+            shut
         });
     }
 
-    /// Closes the rooms that `tab` opened and no other tab did, each in the turn of the room: once
-    /// the calls of the room dispatched before it ended, and before those dispatched after it. It
-    /// takes the turn of the rooms that the tab holds and of those with a turn in flight, which
-    /// may be of the tab, and waits for each on its own, so that a room does not wait for another.
+    /// Ends the subscriptions of `tab` and the requests of a token to it, and closes the rooms
+    /// that it opened and no other tab did (it releases them, but closes none, once the client
+    /// shuts down, which closes them),
+    /// each in the turn of the room: once the calls of the room dispatched before it ended, and
+    /// before those dispatched after it. It takes the turn of
+    /// the rooms that the tab holds and of those with a turn in flight, which may be of the tab,
+    /// and waits for each on its own, so that a room does not wait for another. Until it replies,
+    /// no request of a token goes to the tab, and once it replies, no notice of its subscriptions
+    /// comes.
     fn left(self: &Arc<Self>, tab: u64, id: u64) {
-        let (client, rooms) = {
-            let state = self.state();
+        let Some(client) = self.state().client.clone() else {
+            return self.reply(tab, id, Ok(Answer::Done));
+        };
+        let (leaving, rooms, watchers) = {
+            let mut state = self.state();
+            // With the requests to the tab ending, so that no other goes to it.
+            let leaving = self.leaving(&mut state, tab);
+            state.tokens.retain(|_, (of, _)| *of != tab);
+            // Also those that an `Unwatch` cut, whose tasks may not have ended yet.
+            let of_tab = state
+                .subscriptions
+                .values_mut()
+                .filter(|(of, _)| *of == tab);
+            let watchers = Vec::from_iter(of_tab.map(|(_, watcher)| watcher.end()));
             let mut rooms = HashSet::<RoomId>::from_iter(state.turns.keys().cloned());
             let held = state.rooms.iter().filter(|(_, tabs)| tabs.contains(&tab));
             rooms.extend(held.map(|(room_id, _)| room_id.clone()));
-            (state.client.clone(), rooms)
-        };
-        let Some(client) = client else {
-            return self.reply(tab, id, Ok(Answer::Done));
+            (leaving, rooms, watchers)
         };
         let closes = Vec::from_iter(rooms.into_iter().map(|room_id| {
             let (turn, shared, client) = (self.turn(&room_id), Arc::clone(self), client.clone());
@@ -251,17 +407,25 @@ impl Shared {
             }
         }));
         self.spawn(tab, id, async move {
-            let closed = futures::future::join_all(closes).await.into_iter();
+            let _leaving = leaving;
+            let ended = futures::future::join_all(watchers);
+            let (closed, _) = futures::future::join(futures::future::join_all(closes), ended).await;
+            let closed = closed.into_iter();
             closed.collect::<Result<Vec<()>, _>>().map(|_| Answer::Done)
         });
     }
 
-    /// Whether `tab` held `room_id`, and was the last tab that did: then the room leaves `rooms`.
+    /// Takes `tab` out of the tabs of `room_id`, and the room out of `rooms` once no tab holds it:
+    /// whether the tab held the room, was the last tab that did, and the room is to be closed,
+    /// which it never is once the client shuts down, since the shutdown closes every room. So a
+    /// notice that a tab left does not reach the client then, and no request of a token of the
+    /// shutdown goes to the tab once the notice replied.
     fn release(&self, room_id: &RoomId, tab: u64) -> bool {
         let mut state = self.state();
         let tabs = state.rooms.get_mut(room_id);
         tabs.is_some_and(|tabs| tabs.remove(&tab) && tabs.is_empty())
             && state.rooms.remove(room_id).is_some()
+            && !state.shut_down
     }
 }
 
