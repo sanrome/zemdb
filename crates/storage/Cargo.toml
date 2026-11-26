@@ -29,6 +29,19 @@ uuid = { workspace = true }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokio = { version = "1.38", default-features = false, features = ["sync"] }
 ruzstd = { workspace = true }
+# The file layer over the Origin Private File System of the browser (`files::opfs`). The version
+# of wasm-bindgen is the one of the CLI of the browser harness (tools/browser/build.sh).
+wasm-bindgen = "0.2.129"
+wasm-bindgen-futures = "0.4.79"
+js-sys = "0.3.106"
+web-sys = { version = "0.3.106", features = [
+    "DomException",
+    "FileSystemDirectoryHandle",
+    "FileSystemGetDirectoryOptions",
+    "StorageManager",
+    "WorkerGlobalScope",
+    "WorkerNavigator",
+] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -4,7 +4,6 @@ pub mod engine;
 pub mod error;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod fail_point;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod files;
 pub mod memory;
 pub mod options;

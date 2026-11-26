@@ -46,3 +46,18 @@ pub(crate) async fn run_blocking<T, E: Into<StorageError>>(
 ) -> Result<T, StorageError> {
     f().map_err(Into::into)
 }
+
+/// Runs `task` until its end, in the event loop of the browser, even if nobody awaits it, and
+/// gives its output to the receiver it returns, while someone waits for it.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn spawn<T: 'static>(
+    task: impl std::future::Future<Output = T> + 'static,
+) -> tokio::sync::oneshot::Receiver<T> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    wasm_bindgen_futures::spawn_local(async move {
+        let output = task.await;
+        // The receiver is gone if nobody waits any more: the task ran to its end all the same.
+        drop(sender.send(output));
+    });
+    receiver
+}

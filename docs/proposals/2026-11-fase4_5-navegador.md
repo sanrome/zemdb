@@ -2,7 +2,7 @@
 
 **Fecha:** 19 de Noviembre de 2026
 **Tipo:** Plan de sub-fase (`docs/METODOLOGIA.md` §1). Documento vivo: lotes y seguimiento.
-**Estado:** En curso: el paso S1 (los spikes) hecho el 23 de Noviembre de 2026, en Chromium, Firefox y Safari (§1.2.1): revisa DC39 (un `move()` sobre un archivo existente no es atómico en Firefox) y DC41 (el Web Lock llega antes de que se suelten los handles), las dos adoptadas por el dueño del proyecto el 24 de Noviembre de 2026, y suma notas en DC40, DC44, DC45 y DC46. Lote 1 (el arnés del navegador) hecho el 23 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda; el Lote 6a (los comandos y el despachador del runtime del Worker), hecho el 24 de Noviembre de 2026, y el 6b (las suscripciones y el token), hecho el mismo día, con su revisión de delta en verde en su cuarta ronda; el Lote 7 (el runtime del cliente detrás de `rt`), hecho el 24 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda; la CI de `main`, en verde sobre `2dab234`. Lote 0 (el contrato) cerrado el 23 de Noviembre de 2026, con la revisión cruzada en verde en su sexta ronda y DC46 en su principio, con su protocolo para el paso D (§1.3). El dueño del proyecto adoptó DC40 y DC43 el 22 de Noviembre de 2026, y eligió ese día la pestaña líder para DC41, de donde sale DC46; adoptó las demás el 23 (DC46, en su principio: su protocolo, en el paso D).
+**Estado:** En curso: el paso S1 (los spikes) hecho el 23 de Noviembre de 2026, en Chromium, Firefox y Safari (§1.2.1): revisa DC39 (un `move()` sobre un archivo existente no es atómico en Firefox) y DC41 (el Web Lock llega antes de que se suelten los handles), las dos adoptadas por el dueño del proyecto el 24 de Noviembre de 2026, y suma notas en DC40, DC44, DC45 y DC46. Lote 1 (el arnés del navegador) hecho el 23 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda; el Lote 6a (los comandos y el despachador del runtime del Worker), hecho el 24 de Noviembre de 2026, y el 6b (las suscripciones y el token), hecho el mismo día, con su revisión de delta en verde en su cuarta ronda; el Lote 7 (el runtime del cliente detrás de `rt`), hecho el 24 de Noviembre de 2026, con la revisión de delta en verde en su segunda ronda; el Lote 2 (la capa del OPFS: el directorio, con las generaciones de DC39, y Firefox en el job `browser`), hecho el 26 de Noviembre de 2026, con la revisión de delta pendiente; la CI de `main`, en verde sobre `2dab234`. Lote 0 (el contrato) cerrado el 23 de Noviembre de 2026, con la revisión cruzada en verde en su sexta ronda y DC46 en su principio, con su protocolo para el paso D (§1.3). El dueño del proyecto adoptó DC40 y DC43 el 22 de Noviembre de 2026, y eligió ese día la pestaña líder para DC41, de donde sale DC46; adoptó las demás el 23 (DC46, en su principio: su protocolo, en el paso D).
 **Plan de la fase:** [`2026-10-fase4-plan.md`](2026-10-fase4-plan.md), §4.5. **Metodología:** [`docs/METODOLOGIA.md`](../METODOLOGIA.md).
 **Contrato:** [`docs/INVARIANTES.md`](../INVARIANTES.md) y [`ARCHITECTURE.md`](../../ARCHITECTURE.md). Reglas de código: [`GEMINI.md`](../../GEMINI.md).
 **Parte de:** el núcleo de 4.2 ([plan](2026-10-fase4_2-nucleo-replica.md)), el worker y el transporte de 4.3 ([plan](2026-11-fase4_3-transporte-worker.md)), la fachada de 4.4 ([plan](2026-11-fase4_4-api-rust.md)) y la capa de archivos de 4.1 (DC17, [plan](2026-10-fase4_1-storage-servidor.md)). Depende de 4.3, que cerró el 19 de Noviembre de 2026 con sus Lotes 11b y 11c (`496da6c`), mientras se escribía este plan: ningún lote de 4.5 la espera.
@@ -437,7 +437,7 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 | 0 | Contrato | Documentos | DC38 a DC46 | Ajustes: §2, §4, S1 a S8, L7, W1 y W2 sobre el OPFS, y K1 a K13 y K15 a K17 en el navegador |✅ |
 | S1 | Spikes: S1 en Firefox, S3 en Safari y Firefox, S5 | Fuera del repo | DC8, DC17, DC39 a DC41, DC45, DC46 | — | ✅ |
 | 1 | El arnés del navegador | `tools/browser` (pruebas) y CI | DC44 | — | ✅ |
-| 2 | La capa del OPFS: el directorio | storage | DC39, DC38, DC45 | S1 a S8 y L7 sobre el OPFS | ⬜ |
+| 2 | La capa del OPFS: el directorio | storage | DC39, DC38, DC45 | S1 a S8 y L7 sobre el OPFS | ✅ |
 | 3 | La capa del OPFS: los archivos | storage | DC39, DC44 | S1 a S8 y L7 sobre el OPFS | ⬜ |
 | 4 | El motor en disco en wasm32 | storage | DC39, DC38 | S1 a S8, L7, W1 y W2 sobre el OPFS | ⬜ |
 | 5 | Los metadatos, durables antes de servirse | client | DC45 | K16 | ⬜ |
@@ -464,7 +464,7 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 - El 1 y el 15 son pruebas y herramientas, sin producción (salvo arreglos de lo que encuentren, que van como desvíos en su nota o como lotes nuevos).
 - El 16 cierra con la revisión de cierre (§3); sus rupturas se arreglan en lotes nuevos de 4.5.
 
-**Tamaño.** Unas 260 líneas de producción el Lote 2 (con las generaciones de DC39), 220 el 3 (la capa nativa, con el mismo contrato, tiene unas 300 sin comentarios), 120 el 4, 60 el 5, 280 el 6 (si pasa de 300, se parte: los comandos y el despachador; las suscripciones y el token; salieron unas 480, y se partió: 299 el 6a y 293 el 6b), 120 el 7 (mecánico; salieron 161), 200 el 8, 280 el 9, 100 el 10, 150 el 11 y 180 el 12; las del 13 y el 14, las estima el paso D. El arnés del 1 y las pruebas del 15 no son producción.
+**Tamaño.** Unas 260 líneas de producción el Lote 2 (con las generaciones de DC39; salieron 363, de las que 44 son las aperturas que todavía no abren, que reemplaza el 3), 220 el 3 (la capa nativa, con el mismo contrato, tiene unas 300 sin comentarios), 120 el 4, 60 el 5, 280 el 6 (si pasa de 300, se parte: los comandos y el despachador; las suscripciones y el token; salieron unas 480, y se partió: 299 el 6a y 293 el 6b), 120 el 7 (mecánico; salieron 161), 200 el 8, 280 el 9, 100 el 10, 150 el 11 y 180 el 12; las del 13 y el 14, las estima el paso D. El arnés del 1 y las pruebas del 15 no son producción.
 
 **Chequeos de cierre de cada lote:** los de `docs/METODOLOGIA.md` §4 (regla 4), con el de wasm32 del cliente con `--no-default-features --features wasm` desde el Lote 8; las versiones largas en release (regla 5) de los crates tocados; desde el Lote 1, las pruebas del navegador (`tools/browser`) en Chromium y los tests unitarios en wasm32, con el fmt y el clippy del arnés, en los lotes que tocan algo que corre en el navegador; las mutaciones inversas en una copia del repo; y la revisión de delta (§5, paso 4).
 
@@ -725,7 +725,7 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 
 **Entrega:** `docs: the answers of the spikes of Fase 4.5, and the decisions they revise (Fase 4.5, Paso S1)`.
 
-### Lote 2 · La capa del OPFS: el directorio (`zemdb-storage`) · ⬜
+### Lote 2 · La capa del OPFS: el directorio (`zemdb-storage`) · ✅ Hecho (26 de Noviembre de 2026)
 **Objetivo:** la parte de `OpfsFiles` que trabaja sobre el directorio, con la tarea que retiene una promesa soltada (DC39, DC38), y el método de la capa de DC45.
 
 **Archivos:** `crates/storage/src/lib.rs` (`files` en wasm32), `files/mod.rs` (`native` solo fuera de wasm32; los traits sin `Send` en wasm32, DC38; y el método que dice si `sync_dir` hace durable un cambio que ya ocurrió, DC45, en la capa nativa, la de prueba y la del OPFS, y en `TestFiles`, de `crates/client/tests/common/`; con el contrato de `sync_dir` reescrito y el error *tomado* en el de `open_read`, `create`, `remove` y `rename`, DC39), `files/opfs.rs` (nuevo), `sys.rs` (lanzar una tarea, DC38), `crates/storage/Cargo.toml` (`web-sys`, `js-sys`, `wasm-bindgen` y `wasm-bindgen-futures`, solo en wasm32), los pasos del arnés, `.github/workflows/ci.yml` (Firefox en el job `browser`) y `ARCHITECTURE.md` §8 (*File Layer*).
@@ -752,6 +752,129 @@ Salieron de las rondas séptima a novena de la revisión cruzada del Lote 0, sob
 **Documentos:** `ARCHITECTURE.md` §8; `INVARIANTES.md`: el estado de L7 sobre el OPFS.
 
 **Entrega:** `feat(storage): the directory of the file layer over the Origin Private File System (Fase 4.5, Lote 2)`.
+
+**Hecho** (26 de Noviembre de 2026).
+- **Qué entró.**
+  - **`OpfsFiles`** (`crates/storage/src/files/opfs.rs`, nuevo, solo en wasm32), la capa sobre el OPFS del origen desde el Worker dedicado, en su parte del directorio:
+    - **la raíz y las rutas:** una ruta es relativa a la raíz del OPFS (`navigator.storage.getDirectory()`), con sus nombres separados por `/`; los nombres vacíos y `.` no cuentan. Una ruta absoluta, una con `..` y una con un nombre con `~` se rechazan con `InvalidInput` antes de la primera promesa, así que no tocan nada. Cada operación baja desde la raíz con `getDirectoryHandle` (con `create` en `create_dir_all`);
+    - **los bindings:** `move(directorio, nombre)`, que `web-sys` no tiene, en un tipo propio (`MovableFile`, con `js_name = FileSystemFileHandle`) y con `catch`, que compila con el `forbid(unsafe_code)` del crate. Lo demás es de `web-sys` (`getDirectoryHandle`, `getFileHandle`, `removeEntry` y `keys()`) y de `js-sys` (el iterador asíncrono);
+    - **los errores:** cada error del navegador pasa a un `io::Error` con su nombre en el mensaje (`{la llamada}: {nombre}: {mensaje}`): `NotFoundError` a `NotFound`, `QuotaExceededError` a `StorageFull`, un `TypeError` a `InvalidInput`, `NotAllowedError` y `SecurityError` a `PermissionDenied`, y los demás a `Other`. El de un archivo tomado es el error *tomado*, según la llamada (§1.2.1): `NoModificationAllowedError` o `InvalidStateError` para `move()`, como para `createSyncAccessHandle`, y `NoModificationAllowedError` para `removeEntry`;
+    - **las operaciones del directorio, con las generaciones de DC39.** Cada una lista el directorio (`keys()`) y saca de ahí las generaciones de sus nombres, por el nombre exacto:
+      - `exists`: si hay alguna generación. Un directorio que falta da `false`, como `try_exists` en nativo, y cualquier otro error es un error;
+      - `list`: los nombres con el prefijo, sin el sufijo, cada uno una vez y en orden;
+      - `rename`: los tres pasos de DC39. Borra las viejas del origen, y si no puede, falla sin cambiar el valor de ningún nombre; mueve la más nueva a la generación siguiente del destino, o al nombre si el destino no existe, siempre una entrada libre; y borra las viejas del destino sin fallar (una que queda se registra con `tracing::debug!`). Sabe por el listado si falta el origen (`NotFound`), y por el `NotFoundError` de `getDirectoryHandle` si falta el directorio del destino, y no por el error de `move()`;
+      - `remove`: de la más vieja a la más nueva, y `NotFound` si no hay ninguna;
+      - `create_dir_all`; y `sync_dir`, que solo valida la ruta;
+      - `sync_dir_covers_earlier_changes`, que da `false`;
+    - **una operación soltada termina:** cada operación corre, con todos sus pasos, en una tarea propia (`sys::spawn`). Las operaciones de la capa corren de a una en el Worker, con un turno (un `tokio::sync::Mutex` estático) que el llamador toma antes de lanzar la tarea y que la tarea retiene hasta que termina: la siguiente espera a la que su llamador soltó, y una soltada antes de su turno no corre;
+    - **las aperturas** (`open_locked`, `create_locked`, `create` y `open_read`) dan `Unsupported`, y `OpfsFile` no tiene valores (su único campo es `Infallible`): las reemplaza el Lote 3.
+  - **Lo que la capa decide sin el navegador** (`files/opfs_names.rs`, nuevo, que compila en wasm32 y en los tests nativos):
+    - partir una ruta en sus nombres, rechazando lo de arriba;
+    - la entrada de una generación (`nombre~N`, con `N` en decimal canónico desde 1; la generación 0 es el nombre), y la generación de una entrada;
+    - las generaciones de un nombre entre las entradas, de la más vieja a la más nueva, y la siguiente;
+    - el listado sin sufijos;
+    - el `ErrorKind` de cada nombre de error, y los errores de un archivo tomado de `move()` y de `removeEntry`.
+  - **El contrato** (`files/mod.rs` y `lib.rs`):
+    - `files` compila en wasm32, con `native` solo fuera y `opfs` solo en wasm32;
+    - `RoomFiles` y `RoomFile` piden `EngineConcurrencyBounds` (en nativo, `Send + Sync`, como antes) y van con `async_trait(?Send)` en wasm32;
+    - el contrato de `sync_dir`, reescrito: hace durables los cambios de las operaciones que salieron bien, y donde no hace nada solo esos se garantizan; si hace durable uno que ya ocurrió, lo dice el método nuevo;
+    - `sync_dir_covers_earlier_changes` (DC45), sin implementación por defecto: `true` en `NativeFiles`; `false` en `OpfsFiles`; y en las dos capas de prueba, la del storage (`disk/tests/opfs_like.rs`) y `TestFiles` (`crates/client/tests/common/`), lo que dice la nativa, sobre la que corren;
+    - `FileTaken`, el error *tomado*: un `io::Error` de tipo `ResourceBusy` que lo envuelve, con `FileTaken::error` para armarlo y `FileTaken::is` para reconocerlo con `downcast`. Lo nombran los contratos de `create`, `open_read`, `rename` y `remove`.
+  - **La tarea de `sys`** (`sys::spawn`, solo en wasm32): corre un future con `wasm_bindgen_futures::spawn_local` hasta su fin aunque nadie lo espere, y le da su resultado a un `oneshot::Receiver` mientras alguien lo espere.
+  - **`crates/storage/Cargo.toml`:** `wasm-bindgen` 0.2.129, `wasm-bindgen-futures` 0.4.79, `js-sys` 0.3.106 y `web-sys` 0.3.106 (con seis features), solo en wasm32. El `Cargo.lock` de la raíz suma solo esas dependencias de `zemdb-storage`: los paquetes ya estaban.
+  - **El arnés:** el crate de pasos depende de `zemdb-storage` por ruta y de `futures` (por `now_or_never`); la suite `files`, nueva y entre las de por defecto (abajo); y su `README.md` (Firefox y las suites).
+  - **La CI:** Firefox en el job `browser`, que pasa a llamarse `Browser (Chromium and Firefox)`. Instala el Chromium y el Firefox de Playwright, y corre el runner y su self-check con cada uno. La clave del caché de los navegadores nombra a los dos, para que el caché de antes, solo con Chromium, no se reuse.
+  - **363 líneas de producción**, sin comentarios, líneas en blanco ni la declaración de los módulos de tests unitarios: 235 en `opfs.rs`, 81 en `opfs_names.rs`, 39 que entran en `mod.rs` por 5 que salen, 11 en `sys.rs`, 3 en `native.rs` y 1 que sale de `lib.rs` (369 nuevas y 6 que salen). El plan estimaba 260.
+    - De ellas, 44 son las aperturas que todavía no abren (`OpfsFile` sin valores y los cuatro `Unsupported`), que reemplaza el Lote 3: sin ellas, 319.
+    - Lo demás de más está en lo que la estimación no contaba: el error *tomado* y el contrato (unas 40), y el turno, la tarea y el error de cada llamada.
+    - Si hubiera que partirlo, el corte sería la base (el contrato, `FileTaken`, el método de DC45, la tarea, las rutas, los errores, el turno, `exists`, `list`, `create_dir_all` y `sync_dir`), unas 200, y las generaciones (`rename`, `remove` y su parte de `opfs_names.rs`), unas 160. Se dejó entero porque `exists` y `list` ya resuelven las generaciones de un nombre.
+- **Tests.**
+  - **Nativos** (12, unitarios del storage, porque lo que prueban es interno):
+    - de `opfs_names.rs` (`files/tests/opfs_names.rs`, 10):
+      - `a_path_is_split_into_its_names_from_the_root`;
+      - `a_path_that_leaves_the_root_or_has_the_mark_of_a_generation_is_refused`: `..` en cualquier lugar, una ruta absoluta, `~` en un directorio o en el archivo, y un archivo sin nombre;
+      - `the_first_generation_of_a_name_is_the_name_itself`: ida y vuelta, también con `u64::MAX`;
+      - `an_entry_that_no_generation_has_is_not_one`: `~0`, `~01`, `~+1`, `~`, `~x`, `~1~2`, `~1` y un número que no cabe;
+      - `the_generations_of_a_name_are_those_of_exactly_that_name_from_the_oldest`: `room_a.wal` frente a `room_a.wal.compacting`, `room_a.wa` y `room_ab.wal`;
+      - `a_replacement_goes_to_a_free_entry`, también sin ninguna después de `u64::MAX`;
+      - `a_listing_gives_each_name_once_without_its_generations`;
+      - `each_error_of_the_browser_has_its_kind`, con la cuota llena;
+      - `a_taken_file_is_the_error_that_each_browser_gives_it`, de una mutación que sobrevivía (abajo);
+      - `no_name_of_the_engine_or_of_the_metadata_has_the_mark_of_a_generation`, con los nombres reales: los de `DiskStorageEngine` (`.lock`, `.snap` y `.wal`), `compacting_wal_path`, `absorbing_wal_path` y el temporal de un snapshot, con el id de sala más largo y todos sus caracteres, y los de `FileMetadata`, escritos en el test porque son del cliente. Cada uno es su propia generación 0;
+    - de `mod.rs` (`src/tests/files.rs`, 2): `the_error_of_a_taken_file_is_recognized_and_no_other_is` (otro `ResourceBusy`, o un `Other` con el nombre del error, no lo es) y `sync_dir_covers_the_earlier_changes_on_the_file_system_of_the_process`.
+  - **Pasos del arnés** (la suite `files`, con una recarga, sobre la capa real). Los archivos los hace el paso con `web-sys`, porque la capa todavía no abre, y cada paso compara las entradas exactas que deja cada operación, con sus generaciones:
+    - `files_write`, cada operación del directorio: `create_dir_all`; `exists`, también de un archivo en un directorio que falta; `list`; `sync_dir`; `rename` a un nombre libre (al nombre mismo) y sobre uno que existe (a `b~1` y después a `b~2`, borrando la vieja, y nunca sobre él); y `remove`. Después fabrica lo que deja un corte: `g` y `g~3`; `h`, `h~1` y `h~2`; y `p.wal` con `p.wal.compacting~1`. `list` da cada nombre una vez, sin el sufijo;
+    - `files_after_reload`, después de recargar: las entradas de antes y lo que tienen; `exists` de cada nombre; y `list`. Después, `g` renombrado mueve `g~3` y borra `g`; `h` sobre `b` deja solo `b~3`, con lo de `h~2`, y nada de `h`; `remove(p.wal)` deja `p.wal.compacting~1`; y `remove` de un nombre con dos generaciones borra las dos;
+    - `files_taken`, con un handle de `web-sys` abierto en el paso:
+      - con el origen abierto, `rename` y `remove` dan el error *tomado* (`FileTaken::is` y `ResourceBusy`) y no cambian nada;
+      - con el destino abierto, `rename` da `Ok`, con el valor nuevo en `t~1`, y la vieja, abierta, queda;
+      - con la generación vieja del origen abierta, `rename` falla sin cambiar nada;
+      - `remove` con la más vieja abierta falla enseguida, y el nombre conserva su valor; con la más nueva abierta, borra antes las viejas y falla en ella, que queda con su valor;
+      - cerrados los handles, los `remove` siguientes las borran, también la vieja de `t`;
+    - `files_refused`: `create_dir_all` con `..` después de un nombre que se podría crear, absoluto y con `~`; `rename` hacia y desde `..` (con un origen que tiene una generación vieja, que no se borra) y de un nombre con `~`; y `remove`, `exists`, `list` y `sync_dir` con rutas así. Todos dan `InvalidInput`, y ni la raíz del OPFS ni el directorio de la corrida cambian;
+    - `files_dropped`: un `rename` sondeado una vez y soltado (`now_or_never`), con generaciones viejas en su origen, termina, y el `exists` siguiente lo espera; un `remove` soltado mientras espera su turno, detrás de otro `rename` soltado, no corre nunca;
+    - `files_errors`: `rename` de un origen que falta, `remove` de uno que falta, `list` de un directorio que falta y `rename` a un directorio que falta dan `NotFound`, los dos últimos con `NotFoundError` en el mensaje (y el último borra solo la generación vieja de su origen); `exists` debajo de un archivo es un error (`TypeMismatchError`), no un archivo que falta; y `sync_dir_covers_earlier_changes` da `false`.
+  - **La cuota llena no se pudo provocar en el navegador.** En este lote la capa no escribe, y el arnés no tiene cómo fijar la cuota del origen en los dos navegadores (el Chromium de Playwright lo permite por CDP, que Firefox no tiene). El `ErrorKind` de `QuotaExceededError` lo prueba `each_error_of_the_browser_has_its_kind`, en nativo, y los pasos prueban el nombre de un `DOMException` como llega del navegador, con `NotFoundError`. El Lote 3, que escribe, puede volver a intentarlo.
+  - **La suite del workspace, sin tocar ninguna expectativa:** la capa nativa y las de prueba solo suman el método.
+- **Mutaciones inversas: 48 corridas, en una copia, cada mutación sola: 31 contra los pasos del arnés en Chromium y 17 contra los tests nativos. Mueren todas salvo una, que pidió un test y ahora muere.**
+  - **Contra los pasos:**
+    - un `move()` sobre la generación más nueva del destino, que el Chromium acepta y reemplaza: `files_write` (las entradas);
+    - mover la generación más vieja del origen: `files_after_reload` (`k` tiene lo de `g`);
+    - las generaciones por prefijo: `files_write`;
+    - `remove` de la más nueva a la más vieja: `files_taken` (el nombre pierde su valor);
+    - un `rename` que falla si no pudo borrar las viejas del destino: `files_taken`;
+    - no borrar las viejas del origen, o borrarlas después del `move()`: `files_after_reload`;
+    - borrar las viejas del destino antes del `move()`: `files_taken` (con el origen abierto, `t` desaparece). La primera forma de esta mutación armaba la promesa del `move()` antes de los borrados, y moría por un rechazo sin manejar: se rehízo con la promesa después, y muere por el valor;
+    - no rechazar `..`, una ruta absoluta o `~`, y un `sync_dir` que no valida su ruta: `files_refused`;
+    - la operación en el future de su llamador, sin tarea, y sin el turno: `files_dropped` (el `exists` no ve el `rename`); el turno tomado dentro de la tarea: `files_dropped` (el `remove` soltado corre);
+    - `list` con las entradas crudas, y con nombres repetidos: `files_write`;
+    - `NotFoundError` a `Other`: `files_write` (`exists` en un directorio que falta); el nombre del error fuera del mensaje: `files_errors`;
+    - el error *tomado* que no se arma, `removeEntry` o `move()` sin `NoModificationAllowedError`, y `FileTaken::is` que no lo reconoce: `files_taken`;
+    - `sync_dir_covers_earlier_changes` en `true`: `files_errors`;
+    - `exists` que toma cualquier error por un archivo que falta: `files_errors` (debajo de un archivo); y que da un error con un directorio que falta: `files_write`;
+    - `remove` de un nombre que falta que sale bien: `files_errors`;
+    - `create_dir_all` sin `create`, y la generación siguiente igual a la más nueva: `files_write`;
+    - **la que sobrevivía:** `move()` sin `InvalidStateError`, el error de Safari, que ni el Chromium ni el Firefox de la CI dan. Pidió un test: las listas de los errores de un archivo tomado pasaron a `opfs_names.rs`, y `a_taken_file_is_the_error_that_each_browser_gives_it` las fija. Safari las prueba en el paso S2.
+  - **Contra los tests nativos,** cada una con un test que falla:
+    - las generaciones por prefijo, sin ordenar, de un nombre con `~`, la 0 con sufijo y una no canónica;
+    - la siguiente igual a la más nueva, y el listado repetido;
+    - no rechazar `..`, una ruta absoluta o `~`;
+    - `NotFoundError` y `QuotaExceededError` a `Other`;
+    - `move()` sin `InvalidStateError`, y `removeEntry` con él;
+    - `FileTaken::is` que reconoce cualquier error que envuelve algo, y el error *tomado* de otro tipo;
+    - la capa nativa que dice que su `sync_dir` no cubre los cambios anteriores.
+- **Interacciones revisadas.**
+  - **Los requisitos de DC17** (§1 del plan de 4.1). Renombrar y borrar por ruta, sin handles abiertos en el origen ni en el destino: con las generaciones, un destino abierto ya no hace fallar el `rename` (el `move()` va a un nombre libre), y un origen abierto da el error *tomado* sin cambiar nada. Lo demás (`read_at` exacto, `create_locked` sin un *create-new* atómico y el handle muerto) es del Lote 3.
+  - **Lo que el motor da por hecho del directorio** (`crates/storage/src/disk/`, que todavía no compila en wasm32):
+    - **la instalación de un snapshot y la compactación:** el `rename` del temporal sobre `.snap`, y el de la copia de una absorción sobre `.wal.compacting`, que existen, van a su generación siguiente, y el valor es el nuevo una vez resuelto el `move()`. Un `rename` que falla no cambió ningún valor, como espera `apply_snapshot` (INV-S5). El temporal nunca tiene generaciones viejas, porque lo crea `create_locked`;
+    - **los borrados de `delete_room`:** `remove` de `.snap`, `.wal.compacting`, la copia de una absorción y los temporales, con un `NotFound` como éxito. Borra todas las generaciones de cada nombre, de la más vieja, así que un borrado que falla en el medio deja el nombre con su valor, y el reintento lo termina (INV-S8). `room_{id}.wal` y `room_{id}.wal.compacting` no se confunden;
+    - **la búsqueda de temporales** (la recuperación y `delete_room`, con `list(data_dir, "room_{id}.snap.tmp.")`): da cada temporal una vez, sin sufijo; y `exists` de `.wal.compacting` (la compactación y la recuperación) mira todas sus generaciones;
+    - **los metadatos** (`FileMetadata`): su guardado es `create` del temporal, `rename` sobre el archivo y `sync_dir`, y su borrado, `remove` del archivo y del temporal, con los mismos casos. Su lectura (`open_read`) es del Lote 3;
+    - **`create_dir_all` y `sync_dir` de `open_room`,** también del padre de un `data_dir` de un solo nombre: la ruta vacía, que es la raíz.
+  - **La capa nativa y las de prueba no cambian de comportamiento:** suman el método, que en las tres da `true`, y los traits siguen pidiendo `Send + Sync` en nativo. El clippy y la suite del workspace pasan sin tocar nada.
+  - **INV-L7:** todos los pasos de una operación (los listados, los borrados y el `move()` de un reemplazo) corren en su tarea, con el turno, hasta el fin: ningún paso queda en el future del llamador después de su primer `poll`.
+- **Desvíos y precisiones.**
+  - **Las aperturas, en este lote,** dan `Unsupported`, y `OpfsFile` es un tipo sin valores, con los métodos de `RoomFile` vacíos (`match self.never {}`): el plan no decía cómo quedaban. El motor sobre la capa es del Lote 4, así que nada las llama.
+  - **El sufijo** es `~` seguido de la generación en decimal canónico, desde 1. Una entrada con `~` que no es una generación de la capa (`a~0`, `a~01`, `a~+1`, `a~b~1`) no es de ningún nombre: ninguna operación la lista ni la borra. La capa rechaza `~` en cualquier nombre de una ruta, también en los directorios, así que tampoco el directorio que elige la aplicación puede tenerlo. Ningún nombre real lo tiene (el test de arriba).
+  - **El turno es uno por Worker, de todas las operaciones de la capa,** y no uno por nombre: el plan lo dejaba abierto. Es más simple, y una operación espera también a las de otro `OpfsFiles` del mismo Worker (por ejemplo, las de un motor soltado con una operación en vuelo). El costo es que las promesas de dos salas no se solapan; si hiciera falta, un turno por nombre (dos en un `rename`, tomados en orden) es una optimización de la capa. El llamador toma el turno antes de lanzar la tarea, así que una operación soltada antes de su turno no corre nunca.
+  - **La tarea de `sys` es solo de wasm32.** En nativo no hace falta en este lote: `NativeFiles` sigue en el pool bloqueante, y las tareas del motor siguen con `tokio::spawn` hasta el Lote 4, que les da su forma en los dos. Da un `oneshot::Receiver`: si la tarea no llega a mandar su resultado, la capa da un error, nunca un pánico.
+  - **Una ruta absoluta se rechaza,** como una que sale de la raíz: las rutas de la capa son relativas a la raíz del OPFS. Se parten por `/` como texto, igual en wasm32 y en los tests nativos de Windows.
+  - **`exists` en un directorio que falta da `false`,** y `list` incluye los directorios, como en nativo (`try_exists` y `read_dir`).
+  - **Los errores que DC39 no nombra:** un `TypeError` (un nombre inválido) a `InvalidInput`, y `NotAllowedError` y `SecurityError` a `PermissionDenied`; `TypeMismatchError` y `UnknownError`, a `Other`.
+  - **El error *tomado* es de tipo `ResourceBusy`,** y `FileTaken::error` es público, para que otra capa, como la de prueba del cliente en el Lote 10, lo pueda dar.
+  - **`rename` sobre sí mismo** mueve la generación más nueva a la siguiente. El motor no lo hace.
+  - **La capa de prueba del storage** (`opfs_like.rs`) solo suma el método: sus negativas siguen siendo `Other`, y no el error *tomado*. El Lote 4 la ajusta (DEF-184).
+  - **Los tests unitarios en wasm32:** ninguno nuevo. Lo interno que no depende del navegador va en tests nativos (`opfs_names.rs`), y lo que depende de él, en los pasos; los del storage en wasm32 los prepara el Lote 3. Los del arnés corrieron con el chromedriver del entorno (147, con Chrome 153) y `--disable-build-check`, como en el Lote 1.
+  - **Firefox no corrió acá:** el proxy del entorno no deja bajar el de Playwright (un 403 de `cdn.playwright.dev` y de `playwright.download.prss.microsoft.com`), así que se prueba en la CI. Queda por ver ahí que los contextos del Firefox de Playwright tengan el OPFS (el paso S1 midió un Firefox 160 de verdad, y no el build de Playwright) y que el runner (la segunda página y el self-check) ande ahí.
+  - **Los pasos conocen el formato de las entradas** (`nombre~N`), porque fabrican lo que deja un corte: es el formato en el OPFS, que documenta `ARCHITECTURE.md` §8, y no un detalle interno.
+  - **`INVARIANTES.md`, versión 52:** INV-L7 sobre el OPFS, ✅ en las operaciones del directorio (en su texto y en el resumen), y en §3.2, el reemplazo y el borrado de la capa. S1 a S8 siguen 🆕 sobre el OPFS hasta que el motor corra ahí (Lote 4).
+- **La revisión de delta:** *pendiente; la hace un agente aparte, de contexto fresco y solo lectura.*
+- **Chequeos:**
+  - fmt de la raíz; clippy del workspace con `-D warnings`; el build y el clippy de wasm32 de `zemdb-core`, `zemdb-storage` y `zemdb-client`, con `-D warnings`; y doc con `-D warnings` (también el del storage en wasm32, que la CI no corre);
+  - la suite del workspace, con 1726 tests y sin fallas (57 ignorados), con el lote terminado. En una corrida anterior, sin el último test nativo y con las mutaciones del arnés corriendo en la misma máquina, falló una vez `the_heartbeats_of_the_worker_leave_behind_an_http2_connection_that_stops_answering`, el de la pausa de 1,5 s que ya registran las notas del 6a y del 7: pasó tres veces solo, y con su binario entero;
+  - los `--ignored` del cliente en release, con 7 tests y sin fallas;
+  - **del arnés:** fmt; los dos clippy (los pasos en wasm32 con `--all-targets`, y el servidor), con `-D warnings`; los tests del servidor (2); `build.sh`; `npm ci`; el runner (14 pasos) y su self-check, en Chromium 157 (Playwright 1.63); y el test unitario en wasm32, en Chrome 153;
+  - **los pasos nuevos, repetidos:** el runner entero, diez veces seguidas, todas en verde.
 
 ### Lote 3 · La capa del OPFS: los archivos (`zemdb-storage`) · ⬜
 **Objetivo:** el resto de `OpfsFiles`: abrir y crear con su lock, la E/S posicional, renombrar el archivo abierto y el handle muerto (DC39).

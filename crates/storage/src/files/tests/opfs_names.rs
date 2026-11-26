@@ -1,0 +1,195 @@
+use super::*;
+use crate::disk::compactor::{absorbing_wal_path, compacting_wal_path};
+use crate::{DiskStorageEngine, DiskStorageOptions};
+use std::path::PathBuf;
+use zemdb_core::RoomId;
+
+fn names(path: &str) -> io::Result<Vec<String>> {
+    dir_names(Path::new(path))
+}
+
+fn refused(result: io::Result<impl std::fmt::Debug>) {
+    let err = result.unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+}
+
+#[test]
+fn a_path_is_split_into_its_names_from_the_root() {
+    assert_eq!(names("zemdb/data").unwrap(), ["zemdb", "data"]);
+    assert_eq!(names("./zemdb//data/").unwrap(), ["zemdb", "data"]);
+    assert_eq!(names("").unwrap(), Vec::<String>::new());
+    assert_eq!(names(".").unwrap(), Vec::<String>::new());
+    let (dirs, name) = file_names(Path::new("zemdb/data/room_a.wal")).unwrap();
+    assert_eq!(
+        (dirs, name.as_str()),
+        (vec!["zemdb".into(), "data".into()], "room_a.wal")
+    );
+    let (dirs, name) = file_names(Path::new("client.lock")).unwrap();
+    assert_eq!((dirs.len(), name.as_str()), (0, "client.lock"));
+}
+
+#[test]
+fn a_path_that_leaves_the_root_or_has_the_mark_of_a_generation_is_refused() {
+    for path in [
+        "..",
+        "../data",
+        "zemdb/../data",
+        "zemdb/data/..",
+        "/zemdb",
+        "/",
+        "zemdb/data~1",
+        "zemdb~/data",
+        "~",
+    ] {
+        refused(names(path));
+        refused(file_names(Path::new(path)));
+    }
+    // A file needs a name.
+    refused(file_names(Path::new("")));
+    refused(file_names(Path::new("./")));
+}
+
+#[test]
+fn the_first_generation_of_a_name_is_the_name_itself() {
+    assert_eq!(entry("room_a.wal", 0), "room_a.wal");
+    assert_eq!(entry("room_a.wal", 1), "room_a.wal~1");
+    assert_eq!(entry("room_a.wal", 12), "room_a.wal~12");
+    for generation in [0, 1, 9, 10, 12, u64::MAX] {
+        let entry = entry("room_a.wal", generation);
+        assert_eq!(super::generation(&entry), Some(("room_a.wal", generation)));
+    }
+}
+
+#[test]
+fn an_entry_that_no_generation_has_is_not_one() {
+    for entry in [
+        "room_a.wal~0",
+        "room_a.wal~01",
+        "room_a.wal~+1",
+        "room_a.wal~",
+        "room_a.wal~x",
+        "room_a.wal~1~2",
+        "~1",
+        "room_a.wal~18446744073709551616",
+    ] {
+        assert_eq!(generation(entry), None, "{entry}");
+    }
+}
+
+#[test]
+fn the_generations_of_a_name_are_those_of_exactly_that_name_from_the_oldest() {
+    let entries = [
+        "room_a.wal~2",
+        "room_a.wal.compacting",
+        "room_a.wal",
+        "room_a.wal.compacting~4",
+        "room_a.wal~10",
+        "room_a.wa",
+        "room_a.wal~x",
+        "room_ab.wal~3",
+    ];
+    assert_eq!(generations(entries, "room_a.wal"), [0, 2, 10]);
+    assert_eq!(generations(entries, "room_a.wal.compacting"), [0, 4]);
+    assert_eq!(generations(entries, "room_a.wa"), [0]);
+    assert_eq!(generations(entries, "room_ab.wal"), [3]);
+    assert_eq!(generations(entries, "room_b.wal"), Vec::<u64>::new());
+}
+
+#[test]
+fn a_replacement_goes_to_a_free_entry() {
+    assert_eq!(next(&[]).unwrap(), 0);
+    assert_eq!(next(&[0]).unwrap(), 1);
+    assert_eq!(next(&[0, 2, 10]).unwrap(), 11);
+    assert!(next(&[3, u64::MAX]).is_err());
+}
+
+#[test]
+fn a_listing_gives_each_name_once_without_its_generations() {
+    let entries: Vec<String> = [
+        "room_a.snap.tmp.x~3",
+        "room_a.snap",
+        "room_a.snap.tmp.x",
+        "room_a.snap~1",
+        "room_a.snap.tmp.y~2",
+        "room_a.snap~x",
+        "room_b.snap",
+    ]
+    .map(String::from)
+    .into();
+    let found: Vec<&str> = super::names(&entries, "room_a.snap").into_iter().collect();
+    assert_eq!(
+        found,
+        ["room_a.snap", "room_a.snap.tmp.x", "room_a.snap.tmp.y"]
+    );
+    let found: Vec<&str> = super::names(&entries, "room_a.snap.tmp.")
+        .into_iter()
+        .collect();
+    assert_eq!(found, ["room_a.snap.tmp.x", "room_a.snap.tmp.y"]);
+    assert_eq!(super::names(&entries, "").len(), 4);
+}
+
+#[test]
+fn each_error_of_the_browser_has_its_kind() {
+    assert_eq!(error_kind("NotFoundError"), io::ErrorKind::NotFound);
+    assert_eq!(error_kind("QuotaExceededError"), io::ErrorKind::StorageFull);
+    assert_eq!(error_kind("TypeError"), io::ErrorKind::InvalidInput);
+    assert_eq!(
+        error_kind("NotAllowedError"),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(error_kind("SecurityError"), io::ErrorKind::PermissionDenied);
+    for name in [
+        "UnknownError",
+        "InvalidModificationError",
+        "TypeMismatchError",
+        "",
+    ] {
+        assert_eq!(error_kind(name), io::ErrorKind::Other, "{name}");
+    }
+}
+
+/// A file that another handle has open is the error each browser gives it: for a `move()`, the
+/// same as for `createSyncAccessHandle` (Safari's included, which only Safari gives); for a
+/// `removeEntry`, the same in the three, where `InvalidStateError` is another error.
+#[test]
+fn a_taken_file_is_the_error_that_each_browser_gives_it() {
+    assert_eq!(
+        TAKEN_BY_MOVE,
+        ["NoModificationAllowedError", "InvalidStateError"]
+    );
+    assert_eq!(TAKEN_BY_REMOVE, ["NoModificationAllowedError"]);
+}
+
+/// Every name that the engine and the metadata of the client give their files, with the longest
+/// room id and every character a room id may have, is a path the layer takes, and is the first
+/// generation of itself: none can be taken for the generation of another.
+#[test]
+fn no_name_of_the_engine_or_of_the_metadata_has_the_mark_of_a_generation() {
+    let room = RoomId::new(format!("az09-_{}", "x".repeat(58))).unwrap();
+    let engine = DiskStorageEngine::new(DiskStorageOptions::new("zemdb/data")).unwrap();
+    let wal = engine.wal_file_path(&room);
+    let snap = engine.snap_file_path(&room);
+    let staged = snap.with_extension(format!("snap.tmp.{}", uuid::Uuid::new_v4()));
+    let mut paths = vec![
+        engine.lock_file_path(&room),
+        snap,
+        staged,
+        compacting_wal_path(&wal),
+        absorbing_wal_path(&wal),
+        wal,
+    ];
+    // The files of `FileMetadata`, in the client.
+    for name in ["client.lock", "client.meta", "client.meta.tmp"] {
+        paths.push(PathBuf::from(name));
+    }
+    for name in [format!("room_{room}.meta"), format!("room_{room}.meta.tmp")] {
+        paths.push(PathBuf::from(name));
+    }
+    for path in paths {
+        // Only its name: the separator of a native path is not that of the OPFS on Windows.
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let (dirs, own) = file_names(Path::new(name)).unwrap();
+        assert!(dirs.is_empty() && own == name, "{path:?}");
+        assert_eq!(generation(name), Some((name, 0)), "{path:?}");
+    }
+}

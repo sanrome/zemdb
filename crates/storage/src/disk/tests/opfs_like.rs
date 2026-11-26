@@ -178,6 +178,10 @@ impl RoomFiles for OpfsLikeFiles {
     async fn sync_dir(&self, dir: &Path) -> io::Result<()> {
         self.native.sync_dir(&self.real(dir)).await
     }
+
+    fn sync_dir_covers_earlier_changes(&self) -> bool {
+        self.native.sync_dir_covers_earlier_changes()
+    }
 }
 
 #[derive(Debug)]

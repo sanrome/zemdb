@@ -1,18 +1,28 @@
 //! The file layer of the disk engine: the operations it makes on its data directory and on the
 //! files it opens there.
 //!
-//! [`NativeFiles`] implements it on the file system of the process. The operations are those the
+//! `NativeFiles` implements it on the file system of the process, and, in WebAssembly,
+//! `OpfsFiles` on the Origin Private File System of a browser. The operations are those the
 //! engine makes, and only on files in its data directory (the data directory itself and its
 //! ancestors, for [`RoomFiles::create_dir_all`] and [`RoomFiles::sync_dir`]). Every operation is
-//! asynchronous: on the Origin Private File System of a browser, opening a file, renaming it,
-//! removing it and listing a directory are promises.
+//! asynchronous: on the Origin Private File System, opening a file, renaming it, removing it and
+//! listing a directory are promises.
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod native;
+#[cfg(target_arch = "wasm32")]
+pub mod opfs;
+#[cfg(any(target_arch = "wasm32", test))]
+mod opfs_names;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use native::{NativeFile, NativeFiles};
+#[cfg(target_arch = "wasm32")]
+pub use opfs::{OpfsFile, OpfsFiles};
 
+use crate::engine::EngineConcurrencyBounds;
 use async_trait::async_trait;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -21,8 +31,11 @@ use std::path::{Path, PathBuf};
 /// A file renamed or removed by path has no handle open, nor does the destination of a rename:
 /// the Origin Private File System refuses to move or remove a file that has one. An open file is
 /// renamed through its handle ([`RoomFile::rename`]).
-#[async_trait]
-pub trait RoomFiles: Debug + Send + Sync + 'static {
+///
+/// `Send + Sync`, except in WebAssembly, where the objects of JavaScript are neither.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait RoomFiles: Debug + EngineConcurrencyBounds + 'static {
     /// A file opened by this directory.
     type File: RoomFile;
 
@@ -36,32 +49,50 @@ pub trait RoomFiles: Debug + Send + Sync + 'static {
     /// `None` if the lock cannot be taken; the file is then left created.
     async fn create_locked(&self, path: &Path) -> io::Result<Option<Self::File>>;
 
-    /// Creates `path` for writing, emptying it if it exists, without a lock.
+    /// Creates `path` for writing, emptying it if it exists, without a lock. Where the layer
+    /// cannot open a file besides another handle, one open on `path` fails it with the error of
+    /// a taken file ([`FileTaken`]).
     async fn create(&self, path: &Path) -> io::Result<Self::File>;
 
-    /// Opens the existing file `path` for reading, without a lock.
+    /// Opens the existing file `path` for reading, without a lock. Where the layer cannot open a
+    /// file besides another handle, one open on `path` fails it with the error of a taken file
+    /// ([`FileTaken`]).
     async fn open_read(&self, path: &Path) -> io::Result<Self::File>;
 
     /// Whether `path` exists. An error is not a missing file.
     async fn exists(&self, path: &Path) -> io::Result<bool>;
 
-    /// The paths of the files in `dir` whose names start with `prefix`. Fails if any entry of
-    /// `dir` cannot be read.
+    /// The paths of the files in `dir` whose names start with `prefix`, each once. Fails if any
+    /// entry of `dir` cannot be read.
     async fn list(&self, dir: &Path, prefix: &str) -> io::Result<Vec<PathBuf>>;
 
-    /// Renames `from` to `to`, replacing `to` if it exists.
+    /// Renames `from` to `to`, replacing `to` if it exists. A rename that fails changes what
+    /// neither `from` nor `to` holds. Where the layer cannot move a file with a handle open, one
+    /// open on `from` fails it with the error of a taken file ([`FileTaken`]).
     async fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
 
-    /// Removes the file `path`; [`io::ErrorKind::NotFound`] if there is none.
+    /// Removes the file `path`; [`io::ErrorKind::NotFound`] if there is none. Where the layer
+    /// cannot remove a file with a handle open, one open on `path` fails it with the error of a
+    /// taken file ([`FileTaken`]).
     async fn remove(&self, path: &Path) -> io::Result<()>;
 
     /// Creates the directory `path` and any missing ancestors, making each new entry durable
     /// before it returns.
     async fn create_dir_all(&self, path: &Path) -> io::Result<()>;
 
-    /// Makes the changes to the entries of `dir` (files created, renamed or removed in it)
-    /// durable. A no-op where they are durable without it.
+    /// Makes durable the changes to the entries of `dir` (files created, renamed or removed in
+    /// it) of the operations that succeeded. Where it does nothing, because each such change is
+    /// durable once its operation succeeds, only those are guaranteed durable: a change that an
+    /// operation that failed left behind may stay, and not be durable. Whether it also makes
+    /// durable a change that already happened, that of an operation that failed included, is
+    /// what [`sync_dir_covers_earlier_changes`](Self::sync_dir_covers_earlier_changes) says.
     async fn sync_dir(&self, dir: &Path) -> io::Result<()>;
+
+    /// Whether [`sync_dir`](Self::sync_dir) makes durable every change to the entries of the
+    /// directory that already happened, also one that an operation that failed left behind. On
+    /// the file system of the process it does (on Windows, where it does nothing, the journal of
+    /// NTFS does); on the Origin Private File System it does not.
+    fn sync_dir_covers_earlier_changes(&self) -> bool;
 }
 
 /// A file opened by a [`RoomFiles`], read and written at explicit offsets: it has no position.
@@ -70,8 +101,11 @@ pub trait RoomFiles: Debug + Send + Sync + 'static {
 /// and the handle keeps its file, and its lock, until then: operations run one at a time, in the
 /// order they were called, and the error of one that nobody awaited is reported by the next
 /// operation on the handle, which then does not run.
-#[async_trait]
-pub trait RoomFile: Debug + Send + Sync + 'static {
+///
+/// `Send + Sync`, except in WebAssembly, where the objects of JavaScript are neither.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait RoomFile: Debug + EngineConcurrencyBounds + 'static {
     /// Reads `len` bytes at `offset`; [`io::ErrorKind::UnexpectedEof`] if the file ends first.
     async fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>>;
 
@@ -94,3 +128,37 @@ pub trait RoomFile: Debug + Send + Sync + 'static {
     /// keeps its lock. Nothing else may have `to` open.
     async fn rename(&mut self, to: &Path) -> io::Result<()>;
 }
+
+/// The error of an operation on a file that another handle has open, where the layer cannot
+/// make it besides that handle, as on the Origin Private File System, whose handles are
+/// exclusive. It is an [`io::Error`] of kind [`io::ErrorKind::ResourceBusy`] that wraps this
+/// type, and [`FileTaken::is`] recognizes it: another error of that kind is not this one.
+#[derive(Debug)]
+pub struct FileTaken {
+    message: String,
+}
+
+impl FileTaken {
+    /// The error of a taken file, with `message`, which says what was taken.
+    pub fn error(message: impl Into<String>) -> io::Error {
+        let message = message.into();
+        io::Error::new(io::ErrorKind::ResourceBusy, Self { message })
+    }
+
+    /// Whether `err` is the error of a taken file.
+    pub fn is(err: &io::Error) -> bool {
+        err.get_ref().is_some_and(|inner| inner.is::<Self>())
+    }
+}
+
+impl fmt::Display for FileTaken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for FileTaken {}
+
+#[cfg(test)]
+#[path = "../tests/files.rs"]
+mod tests;

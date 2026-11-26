@@ -17,6 +17,16 @@ export const suites = {
     { closePeer: true },
   ],
   server: [{ run: 'server_register' }, { run: 'server_offline' }],
+  // The directory of the file layer of the storage over the OPFS, on the real layer.
+  files: [
+    { run: 'files_write' },
+    { reload: true },
+    { run: 'files_after_reload' },
+    { run: 'files_taken' },
+    { run: 'files_refused' },
+    { run: 'files_dropped' },
+    { run: 'files_errors' },
+  ],
   // Only the runner runs these: `isolation` in another context of the browser, with the run id
   // of a run of `reload`; the other three in its self-check, which checks that a step that fails,
   // in either page, or that panics, fails the run with its name and its error.
@@ -27,4 +37,4 @@ export const suites = {
 };
 
 // The suites of a page whose URL names none.
-export const defaults = ['reload', 'tabs', 'server'];
+export const defaults = ['reload', 'tabs', 'server', 'files'];
