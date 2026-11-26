@@ -56,7 +56,7 @@ jobs:
       - run: cargo clippy -p zemdb-core -p zemdb-storage -p zemdb-client --target wasm32-unknown-unknown -- -D warnings
 
   browser:
-    name: Browser (Chromium)
+    name: Browser (Chromium and Firefox)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -90,10 +90,13 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-${{ hashFiles('tools/browser/package-lock.json') }}
-      - run: npx playwright install --with-deps chromium
+          key: playwright-${{ runner.os }}-chromium-firefox-${{ hashFiles('tools/browser/package-lock.json') }}
+      # The Chromium and the Firefox of Playwright, builds of its own.
+      - run: npx playwright install --with-deps chromium firefox
       - run: node run.mjs
       - run: node run.mjs --self-check
+      - run: node run.mjs --browser firefox
+      - run: node run.mjs --browser firefox --self-check
       # The unit tests in wasm32, in a dedicated Worker of the Chrome of the runner.
       - run: CHROMEDRIVER="$CHROMEWEBDRIVER/chromedriver" cargo test -p zemdb-browser-steps --target wasm32-unknown-unknown
 

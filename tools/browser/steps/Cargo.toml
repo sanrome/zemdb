@@ -17,6 +17,9 @@ crate-type = ["cdylib", "rlib"]
 # Only in wasm32: elsewhere the crate is empty.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 zemdb-core = { path = "../../../crates/core" }
+# The file layer over the OPFS, which the suite `files` tests.
+zemdb-storage = { path = "../../../crates/storage" }
+futures = "0.3"
 # The same version as in the Cargo.lock of the root, and as the CLI that the CI installs.
 wasm-bindgen = "=0.2.129"
 wasm-bindgen-futures = "0.4"

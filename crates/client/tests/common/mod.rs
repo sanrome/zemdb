@@ -1307,6 +1307,10 @@ impl RoomFiles for TestFiles {
         self.run("sync_dir", &[name(dir)])?;
         NativeFiles.sync_dir(dir).await
     }
+
+    fn sync_dir_covers_earlier_changes(&self) -> bool {
+        NativeFiles.sync_dir_covers_earlier_changes()
+    }
 }
 
 /// A file opened by [`TestFiles`], which logs what is done to it, and when it is closed.

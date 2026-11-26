@@ -122,6 +122,10 @@ impl RoomFiles for NativeFiles {
         let dir = dir.to_path_buf();
         blocking(move || sync_dir(&dir)).await
     }
+
+    fn sync_dir_covers_earlier_changes(&self) -> bool {
+        true
+    }
 }
 
 /// Creates `path` and any missing parent directories, syncing the parent of every directory it
