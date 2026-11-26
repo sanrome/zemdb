@@ -29,7 +29,7 @@ fn a_path_is_split_into_its_names_from_the_root() {
 }
 
 #[test]
-fn a_path_that_leaves_the_root_or_has_the_mark_of_a_generation_is_refused() {
+fn a_path_or_a_prefix_that_the_layer_does_not_take_is_refused() {
     for path in [
         "..",
         "../data",
@@ -40,13 +40,31 @@ fn a_path_that_leaves_the_root_or_has_the_mark_of_a_generation_is_refused() {
         "zemdb/data~1",
         "zemdb~/data",
         "~",
+        "zemdb/b\\c",
+        "zemdb\\/data",
+        "zemdb/b\0c",
     ] {
         refused(names(path));
         refused(file_names(Path::new(path)));
     }
-    // A file needs a name.
-    refused(file_names(Path::new("")));
-    refused(file_names(Path::new("./")));
+    // A file needs a name, and it is the last one of its path.
+    for path in [
+        "",
+        ".",
+        "./",
+        "zemdb/",
+        "zemdb/f/",
+        "zemdb/f/.",
+        "zemdb/f//",
+    ] {
+        refused(file_names(Path::new(path)));
+    }
+    assert_eq!(names("zemdb/f/.").unwrap(), ["zemdb", "f"]);
+    // No name has the mark of a generation, so a listing does not look for it.
+    refused(prefix("room_a.snap~"));
+    refused(prefix("~"));
+    assert_eq!(prefix("room_a.snap.tmp.").unwrap(), "room_a.snap.tmp.");
+    assert_eq!(prefix("").unwrap(), "");
 }
 
 #[test]

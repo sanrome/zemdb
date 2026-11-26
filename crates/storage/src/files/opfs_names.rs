@@ -21,7 +21,8 @@ pub(crate) const TAKEN_BY_REMOVE: &[&str] = &["NoModificationAllowedError"];
 
 /// The names of the directories of the directory `path`, from the root of the layer. A path is
 /// relative to the root: an absolute one, or one with `..`, is refused, as is a name with
-/// [`GENERATION`]. Empty names and `.` stand for no directory.
+/// [`GENERATION`], or with `\` (which Chromium does not take) or a NUL character (refused as a
+/// precaution). Empty names and `.` stand for no directory.
 pub(crate) fn dir_names(path: &Path) -> io::Result<Vec<String>> {
     let text = path.to_str().ok_or_else(|| refused(path, "is not UTF-8"))?;
     if text.starts_with('/') {
@@ -32,16 +33,31 @@ pub(crate) fn dir_names(path: &Path) -> io::Result<Vec<String>> {
         .map(|name| match name {
             ".." => Err(refused(path, "leaves the root")),
             _ if name.contains(GENERATION) => Err(refused(path, "has a name with '~'")),
+            _ if name.contains(['\\', '\0']) => Err(refused(path, "has a name with '\\' or NUL")),
             _ => Ok(name.to_owned()),
         })
         .collect()
 }
 
-/// The names of the directories of the file `path`, as [`dir_names`] gives them, and its own.
+/// The names of the directories of the file `path`, as [`dir_names`] gives them, and its own,
+/// which is its last name: a path that ends in `/` or in `.` names no file.
 pub(crate) fn file_names(path: &Path) -> io::Result<(Vec<String>, String)> {
     let mut names = dir_names(path)?;
-    let name = names.pop().ok_or_else(|| refused(path, "names no file"))?;
-    Ok((names, name))
+    let last = path.to_str().and_then(|text| text.rsplit('/').next());
+    match (names.pop(), last) {
+        (Some(name), Some(last)) if name == last => Ok((names, name)),
+        _ => Err(refused(path, "does not end in the name of a file")),
+    }
+}
+
+/// `prefix`, the start of the names that a listing gives, which no name has if it has
+/// [`GENERATION`].
+pub(crate) fn prefix(prefix: &str) -> io::Result<String> {
+    if prefix.contains(GENERATION) {
+        let message = format!("the prefix {prefix:?} has '~', which no name has");
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+    }
+    Ok(prefix.to_owned())
 }
 
 fn refused(path: &Path, why: &str) -> io::Error {

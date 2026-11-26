@@ -53,12 +53,12 @@ The default ones, in this order:
 - **`tabs`:** a second page of the same context sees the same OPFS and cannot open the file that the first one has open; once the first one terminates its Worker, it opens it.
 - **`server`:** the routes of the test server: a schema and a room created through the Control Plane, the registration of a client with a token of the harness, and the cut of the network.
 - **`files`:** the directory of the file layer of the storage over the OPFS (`zemdb_storage::files::OpfsFiles`), on the real layer. The layer opens no file yet, so the steps make the files with the browser, under `harness/files-{run}/`, and check the entries that each operation leaves by their names, generations included (the name, and then the name with `~1`, `~2`...):
-  - `files_write`: each operation (`create_dir_all`, `exists`, `list`, `rename` to a free name and onto one that exists, `remove`, `sync_dir`); then the generations that a cut leaves, made by the step;
+  - `files_write`: each operation (`create_dir_all`, `exists`, `list`, `rename` to a free name, onto one that exists and to another directory, `remove`, `sync_dir`); then the generations that a cut leaves, made by the step;
   - `files_after_reload`, after the page reloads: what the operations left, and each name holding its newest generation, which a rename moves, removing the old ones of its source; a removal removes every generation of exactly its name, never of one that starts with it;
   - `files_taken`: with a handle of the browser open on the source, on an old generation of it, or on the newest, the rename and the removal fail with the error of a taken file (`FileTaken`), and no value changes; with the destination open, the rename succeeds, and its old generation stays;
-  - `files_refused`: an absolute path, one with `..` and one with `~` are refused, and nothing in the OPFS changes;
-  - `files_dropped`: a rename dropped once it started runs to its end, and the next operation waits for it; a removal dropped before its turn never runs;
-  - `files_errors`: what is missing is `NotFound`, with the name of the error of the browser when it says so.
+  - `files_refused`: an absolute path, one with `..`, one with a name with `~` or `\`, the path of a file that ends in `/` or `.`, and a listing for a prefix with `~` are refused, and nothing in the OPFS changes;
+  - `files_dropped`: a rename dropped once it started runs to its end, and the next operation waits for it, also for the removals that come after its move; a removal dropped before its turn never runs;
+  - `files_errors`: what is missing is `NotFound`, with the name of the error of the browser when it says so, and a rename to a missing directory touches nothing; a removal skips a generation that something else removed in the meantime.
 
 The runner runs `isolation` on its own, and `fails`, `fails_in_peer` and `panics` in its self-check.
 

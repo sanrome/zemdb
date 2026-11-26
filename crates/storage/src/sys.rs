@@ -5,8 +5,9 @@ use std::path::Path;
 /// are written to durable storage on POSIX filesystems.
 ///
 /// A no-op elsewhere: on Windows `File::open` cannot open a directory (that needs
-/// `FILE_FLAG_BACKUP_SEMANTICS`) and NTFS journals directory changes itself, and in
-/// WebAssembly there is no file system.
+/// `FILE_FLAG_BACKUP_SEMANTICS`) and NTFS journals directory changes itself; and in WebAssembly
+/// `std::fs` has no file system, and the file layer over the Origin Private File System does not
+/// call this (an entry there is durable once the promise that changed it resolves).
 pub fn sync_dir(dir_path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {

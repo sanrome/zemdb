@@ -8,6 +8,7 @@
 
 use crate::js::failed;
 use crate::opfs::{file_handle, harness_dir, open, read_all, write_all};
+use futures::future::Either;
 use futures::FutureExt;
 use js_sys::IteratorNext;
 use std::collections::BTreeSet;
@@ -24,12 +25,14 @@ fn base(run: &str) -> PathBuf {
     PathBuf::from(format!("harness/files-{run}"))
 }
 
-/// The directory `name` of the run, through the browser, created if missing.
-async fn dir(run: &str, name: &str) -> Result<FileSystemDirectoryHandle, JsError> {
+/// The directory `path` of the run, with its names separated by `/`, through the browser,
+/// created if missing.
+async fn dir(run: &str, path: &str) -> Result<FileSystemDirectoryHandle, JsError> {
     let options = FileSystemGetDirectoryOptions::new();
     options.set_create(true);
     let mut dir = harness_dir().await?;
-    for name in [&format!("files-{run}"), name] {
+    let base = format!("files-{run}");
+    for name in std::iter::once(base.as_str()).chain(path.split('/')) {
         let next = dir.get_directory_handle_with_options(name, &options);
         let next = JsFuture::from(next)
             .await
@@ -223,6 +226,24 @@ pub async fn files_write(run: String) -> Result<(), JsError> {
     files.remove(&path("c")).await.map_err(layer("remove c"))?;
     expect_entries(&dir, &["b~2", "deep"], "removing c").await?;
 
+    // To another directory, onto a name with two generations there, from one with two here.
+    let deep = self::dir(&run, "data/deep").await?;
+    for (dir, entry, bytes) in [
+        (&dir, "x", "x0"),
+        (&dir, "x~1", "x1"),
+        (&deep, "x", "deep x0"),
+        (&deep, "x~2", "deep x2"),
+    ] {
+        put(dir, entry, bytes.as_bytes()).await?;
+    }
+    files
+        .rename(&path("x"), &data.join("deep").join("x"))
+        .await
+        .map_err(layer("rename x deep/x"))?;
+    expect_entries(&dir, &["b~2", "deep"], "renaming x to deep/x").await?;
+    expect_entries(&deep, &["x~3"], "renaming x to deep/x").await?;
+    expect_holds(&deep, "x~3", b"x1").await?;
+
     // Two generations of g and three of h, as cuts in the middle of replacements leave them, and
     // a name that starts with another.
     for (entry, bytes) in [
@@ -283,6 +304,9 @@ pub async fn files_after_reload(run: String) -> Result<(), JsError> {
     ];
     expect_entries(&dir, &left, "the reload").await?;
     expect_holds(&dir, "b~2", b"e1").await?;
+    let deep = self::dir(&run, "data/deep").await?;
+    expect_entries(&deep, &["x~3"], "the reload").await?;
+    expect_holds(&deep, "x~3", b"x1").await?;
     for (name, expected) in [
         ("b", true),
         ("g", true),
@@ -421,8 +445,9 @@ pub async fn files_taken(run: String) -> Result<(), JsError> {
     expect_entries(&dir, &[], "removing u and t").await
 }
 
-/// A path that is absolute, has `..` or has a name with `~` is refused, and nothing is touched:
-/// neither the root of the OPFS nor the directory of the run.
+/// A path that is absolute, has `..`, has a name with `~` or `\`, or is that of a file and ends in
+/// `/` or `.`, is refused, as is a listing for a prefix with `~`, and nothing is touched: neither
+/// the root of the OPFS nor the directory of the run.
 #[wasm_bindgen]
 pub async fn files_refused(run: String) -> Result<(), JsError> {
     let files = OpfsFiles;
@@ -484,13 +509,36 @@ pub async fn files_refused(run: String) -> Result<(), JsError> {
     )?;
     expect_error(files.exists(&outside).await, invalid, "exists with ..")?;
     expect_error(files.list(Path::new(".."), "").await, invalid, "list ..")?;
+    expect_error(files.list(&refused, "r~").await, invalid, "list r~")?;
     expect_error(files.sync_dir(&absolute).await, invalid, "sync_dir /")?;
+
+    // A file path that ends in `/` or in `.` names no file: not the directory, nor the file.
+    files
+        .create_dir_all(&refused.join("sub"))
+        .await
+        .map_err(layer("create_dir_all"))?;
+    let sub = PathBuf::from(format!("{}/sub/", refused.display()));
+    expect_error(files.remove(&sub).await, invalid, "remove sub/")?;
+    for path in [
+        format!("{}/r/", refused.display()),
+        format!("{}/r/.", refused.display()),
+    ] {
+        let what = format!("exists {path}");
+        expect_error(files.exists(Path::new(&path)).await, invalid, &what)?;
+    }
+    // A name that a browser does not take, refused before its directory is made.
+    let backslash = refused.join("n").join("b\\c");
+    expect_error(
+        files.create_dir_all(&backslash).await,
+        invalid,
+        "create_dir_all with \\",
+    )?;
 
     let after = entries(&root).await?;
     check(after == before, || {
         format!("the root of the OPFS had {before:?}, and has {after:?}")
     })?;
-    expect_entries(&dir, &["r", "r~1"], "the refused operations").await
+    expect_entries(&dir, &["r", "r~1", "sub"], "the refused operations").await
 }
 
 /// An operation dropped by its caller once it started runs to its end, and the next operation
@@ -529,11 +577,36 @@ pub async fn files_dropped(run: String) -> Result<(), JsError> {
     })?;
     let found = files.exists(&path("c")).await.map_err(layer("exists c"))?;
     check(found, || "the removal dropped before its turn ran".into())?;
-    expect_entries(&dir, &["c"], "the dropped removal").await
+    expect_entries(&dir, &["c"], "the dropped removal").await?;
+
+    // The next operation waits also for the last steps of a dropped one: after the move, the
+    // removals of the 200 old generations of its destination.
+    for generation in 0..200 {
+        file_handle(&dir, &generation_entry("d", generation), true)
+            .await
+            .map_err(failed("getFileHandle"))?;
+    }
+    let rename = files.rename(&path("c"), &path("d")).now_or_never();
+    check(rename.is_none(), || {
+        "the rename onto d ended before its first promise".into()
+    })?;
+    files.exists(&path("c")).await.map_err(layer("exists c"))?;
+    expect_entries(&dir, &["d~200"], "the dropped rename onto d").await?;
+    expect_holds(&dir, "d~200", b"a2").await
+}
+
+/// The entry of the generation `generation` of `name`, as the layer names it.
+fn generation_entry(name: &str, generation: u32) -> String {
+    if generation == 0 {
+        name.to_owned()
+    } else {
+        format!("{name}~{generation}")
+    }
 }
 
 /// What is missing is `NotFound`, with the name of the error of the browser when it is the one
-/// that says so; and `sync_dir` does not make an earlier change durable.
+/// that says so, and with nothing touched; a removal skips a generation that is gone; and
+/// `sync_dir` does not make an earlier change durable.
 #[wasm_bindgen]
 pub async fn files_errors(run: String) -> Result<(), JsError> {
     let files = OpfsFiles;
@@ -567,9 +640,43 @@ pub async fn files_errors(run: String) -> Result<(), JsError> {
     check(err.to_string().contains("NotFoundError"), || {
         format!("the error of the rename does not name the error of the browser: {err}")
     })?;
-    // The old generation of x went, and x holds the same.
-    expect_entries(&dir, &["x~1"], "the rename that failed").await?;
+    // The directory of the destination is found first: nothing was touched, not even the old
+    // generation of x.
+    expect_entries(&dir, &["x", "x~1"], "the rename that failed").await?;
     expect_holds(&dir, "x~1", b"x1").await?;
+
+    // A generation that someone else removes while the removal is under way, as the removal of
+    // a Worker that ended may land: the removal goes on with the newer ones, and removes them.
+    for generation in 0..300 {
+        file_handle(&dir, &generation_entry("v", generation), true)
+            .await
+            .map_err(failed("getFileHandle"))?;
+    }
+    let v = path("v");
+    let removal = std::pin::pin!(files.remove(&v));
+    let meanwhile = std::pin::pin!(async {
+        // Once `v` is gone, the removal listed its generations and removes them, from the oldest.
+        while file_handle(&dir, "v", false).await.is_ok() {}
+        JsFuture::from(dir.remove_entry("v~250"))
+            .await
+            .map_err(failed(
+                "removeEntry(v~250), before the removal of the layer reached it",
+            ))
+    });
+    // A removal that ends first, before the step removed `v~250`, fails the step at once.
+    match futures::future::select(removal, meanwhile).await {
+        Either::Left((removed, _)) => {
+            return Err(JsError::new(&format!(
+                "the removal of v ended, with {removed:?}, before the step removed v~250"
+            )));
+        }
+        Either::Right((meanwhile, removal)) => {
+            meanwhile?;
+            let removed = removal.await;
+            removed.map_err(layer("remove v, with v~250 removed in the middle"))?;
+        }
+    }
+    expect_entries(&dir, &["x", "x~1"], "the removal of v").await?;
 
     // An error is not a missing file: a file where a directory goes is one.
     put(&dir, "f", b"f").await?;

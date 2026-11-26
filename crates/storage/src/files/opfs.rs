@@ -2,8 +2,13 @@
 //! Worker the SDK runs in.
 //!
 //! A path is relative to the root of the OPFS of the origin (`navigator.storage.getDirectory()`),
-//! with its names separated by `/`. One that is absolute, has `..` or has a name with `~` is
-//! refused, with [`io::ErrorKind::InvalidInput`], before anything is touched.
+//! with its names separated by `/`. Refused with [`io::ErrorKind::InvalidInput`], before
+//! anything is touched, are: a path that is absolute or has `..`; one with a name that has `~`,
+//! `\` or a NUL character; the path of a file that ends in `/` or in `.`, which names no file; and
+//! the prefix of a listing with `~`. So the names that a browser is known not to take never reach
+//! it: `/`, `.`, `..` and the empty name, in every browser, and `\`, in Chromium (NUL is refused
+//! as a precaution, untried). A browser may still refuse another name with a `TypeError`, which
+//! is [`io::ErrorKind::InvalidInput`] too.
 //!
 //! **The generations of a name.** A name is, in the OPFS, a series of entries, its generations:
 //! the name itself, and after its first replacement the name followed by `~` and a number that
@@ -198,8 +203,8 @@ impl RoomFiles for OpfsFiles {
     }
 
     async fn list(&self, dir: &Path, prefix: &str) -> io::Result<Vec<PathBuf>> {
-        let names = opfs_names::dir_names(dir)?;
-        let (dir, prefix) = (dir.to_path_buf(), prefix.to_owned());
+        let (names, prefix) = (opfs_names::dir_names(dir)?, opfs_names::prefix(prefix)?);
+        let dir = dir.to_path_buf();
         run(async move {
             let entries = entries(&directory(&names, false).await?).await?;
             let found = opfs_names::names(&entries, &prefix);
@@ -208,21 +213,26 @@ impl RoomFiles for OpfsFiles {
         .await
     }
 
-    /// Removes the old generations of `from`, if any, and fails if it cannot, with the value of
-    /// no name changed; moves the newest to the next generation of `to`, a free entry; and then
-    /// removes the old generations of `to`, without failing if it cannot: one left over changes
-    /// no value, and the next replacement or removal of its name removes it.
+    /// Finds the directories of `from` and of `to`, so that one that is missing fails it with
+    /// nothing touched; removes the old generations of `from`, if any, and fails if it cannot,
+    /// with the value of no name changed; moves the newest to the next generation of `to`, a free
+    /// entry; and then removes the old generations of `to`, without failing if it cannot: one
+    /// left over changes no value, and the next replacement or removal of its name removes it.
     async fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let (from_dirs, from) = opfs_names::file_names(from)?;
         let (to_dirs, to) = opfs_names::file_names(to)?;
         run(async move {
             let from_dir = directory(&from_dirs, false).await?;
+            let to_dir = if to_dirs == from_dirs {
+                from_dir.clone()
+            } else {
+                directory(&to_dirs, false).await?
+            };
             let mut old = generations(&from_dir, &from).await?;
             let newest = entry(&from, old.pop().ok_or_else(|| missing(&from))?);
             for generation in old {
                 remove_entry(&from_dir, &entry(&from, generation)).await?;
             }
-            let to_dir = directory(&to_dirs, false).await?;
             let replaced = generations(&to_dir, &to).await?;
             let target = entry(&to, opfs_names::next(&replaced)?);
             let what = format!("getFileHandle({newest})");
@@ -245,19 +255,25 @@ impl RoomFiles for OpfsFiles {
     }
 
     /// Removes the generations of `path` from the oldest to the newest, so that one that fails
-    /// leaves the name with its value.
+    /// leaves the name with its value. One that is gone already is skipped: the removal is
+    /// [`io::ErrorKind::NotFound`] only if it removed none.
     async fn remove(&self, path: &Path) -> io::Result<()> {
         let (dirs, name) = opfs_names::file_names(path)?;
         run(async move {
             let dir = directory(&dirs, false).await?;
-            let generations = generations(&dir, &name).await?;
-            if generations.is_empty() {
-                return Err(missing(&name));
+            let mut removed = false;
+            for generation in generations(&dir, &name).await? {
+                match remove_entry(&dir, &entry(&name, generation)).await {
+                    Ok(()) => removed = true,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
+                }
             }
-            for generation in generations {
-                remove_entry(&dir, &entry(&name, generation)).await?;
+            if removed {
+                Ok(())
+            } else {
+                Err(missing(&name))
             }
-            Ok(())
         })
         .await
     }
