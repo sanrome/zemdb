@@ -6,8 +6,10 @@ use std::time::Duration;
 /// the clock, also once the timer of Tokio rounds it up.
 pub(crate) const NEVER: Duration = Duration::from_secs(30 * 365 * 86_400);
 
-/// The configuration of a [`Client`](crate::Client).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The configuration of a [`Client`](crate::Client), which [`Client::open`](crate::Client::open)
+/// checks. It is serializable, for the dispatcher of a browser Worker
+/// ([`DispatchConfig`](crate::dispatch::DispatchConfig)).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientConfig {
     /// The person the client writes as, the part of its client id before `#`: the id the
     /// backend issues the person's tokens with. Not empty, and without `#`.

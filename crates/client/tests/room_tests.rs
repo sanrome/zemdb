@@ -1,5 +1,6 @@
 //! Opening, registering, discarding and closing the rooms of the client, against the server in
 //! process.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

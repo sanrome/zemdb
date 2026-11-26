@@ -9,8 +9,6 @@ use std::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::Waker;
 use std::time::Duration;
-use tokio::time::Instant;
-use uuid::Uuid;
 use zemdb_core::{
     decode_message, ClientId, ClientMessage, CorrelationId, ErrorCode, MutationId, Operation,
     RoomId, Schema, SchemaId, SequenceNumber, SequencedOperation, ServerMessage,
@@ -19,6 +17,7 @@ use zemdb_storage::{StorageEngine, StorageError};
 
 use crate::config::NEVER;
 use crate::events::{EventReader, OpsEvent};
+use crate::rt::{self, Instant, MaybeSend};
 use crate::token::issued_to;
 use crate::watch::{Change, Watched, Watches};
 use crate::worker::{Ended, Worker};
@@ -371,7 +370,7 @@ impl Backoff {
 
 /// A random delay up to `ceiling`.
 pub(crate) fn jitter(ceiling: Duration) -> Duration {
-    let random = Uuid::new_v4().as_u128() % (ceiling.as_nanos() + 1);
+    let random = rt::random_uuid() % (ceiling.as_nanos() + 1);
     Duration::from_nanos(u64::try_from(random).unwrap_or(u64::MAX))
 }
 
@@ -491,9 +490,9 @@ impl Room {
                 if state.epoch == epoch
                     && !open.failed_closed
                     && open.awaits_snapshot.is_none()
-                    && open
-                        .upload_failed
-                        .is_none_or(|failed| failed.elapsed() >= UPLOAD_PAUSE) =>
+                    && open.upload_failed.is_none_or(|failed| {
+                        rt::now().saturating_duration_since(failed) >= UPLOAD_PAUSE
+                    }) =>
             {
                 Some(open.metadata.room_incarnation)
             }
@@ -1198,7 +1197,7 @@ impl Client {
             }
         }
         let token = self.tokens.token(&self.client_id, &room.id);
-        let token = tokio::time::timeout(TOKEN_TIMEOUT, token).await;
+        let token = rt::timeout(TOKEN_TIMEOUT, token).await;
         let token =
             (token.ok().and_then(Result::ok)).filter(|token| issued_to(token, &self.client_id));
         let mut state = room.state();
@@ -1226,7 +1225,7 @@ impl Client {
             return Err(ClientError::RoomClosed(room_id.clone()));
         }
         let token = self.tokens.token(&self.client_id, room_id);
-        match tokio::time::timeout(TOKEN_TIMEOUT, token).await {
+        match rt::timeout(TOKEN_TIMEOUT, token).await {
             Ok(Ok(token)) if issued_to(&token, &self.client_id) => Ok(Some(token)),
             Ok(Ok(_)) => Err(ClientError::Config(
                 "The token provider gave a token that is not of the client id of the client, or \
@@ -1246,13 +1245,13 @@ impl Client {
         change: impl FnOnce(Local, Arc<Room>) -> F,
     ) -> Result<T, ClientError>
     where
-        T: Send + 'static,
-        F: Future<Output = Result<T, ClientError>> + Send + 'static,
+        T: MaybeSend + 'static,
+        F: Future<Output = Result<T, ClientError>> + MaybeSend + 'static,
     {
         let applier = Arc::clone(&room.applier).lock_owned().await;
         let change = change(self.local.clone(), Arc::clone(room));
         let room = Arc::clone(room);
-        let task = tokio::spawn(async move {
+        let task = rt::spawn(async move {
             let _applier = applier;
             let _settled = Settled::new(Arc::clone(&room));
             let changed = change.await;
@@ -1597,8 +1596,8 @@ impl Client {
         planned: Option<u64>,
     ) -> Result<(), ClientError> {
         let room = self.room(&room_id)?;
-        let mutation_id = MutationId::from(Uuid::new_v4().as_u128());
-        let now = Instant::now();
+        let mutation_id = MutationId::from(rt::random_uuid());
+        let now = rt::now();
         let deadline = (now.checked_add(self.config.write_timeout))
             .ok_or_else(|| ClientError::Config("The write timeout is too long".to_string()))?;
         // At most [`NEVER`]: one that fits in the clock by less than the timer rounds it up by
@@ -1621,7 +1620,7 @@ impl Client {
         let mut in_flight = None;
         let (seq, ops, schema, epoch) = loop {
             // What the write saw is read under the applier, with the head it delivered.
-            let request = tokio::time::timeout_at(deadline, async {
+            let request = rt::timeout_at(deadline, async {
                 let _applier = room.applier.lock().await;
                 let request = self.local.clone().request(Arc::clone(&room)).await;
                 if let Ok(Request {
@@ -1641,7 +1640,7 @@ impl Client {
                 return Err(ends(uncertain, ended()));
             }
             // Nothing is sent after the deadline.
-            let Some(request) = request.ok().filter(|_| Instant::now() < deadline) else {
+            let Some(request) = request.ok().filter(|_| rt::now() < deadline) else {
                 return Err(ends(uncertain, expired()));
             };
             let request = request.map_err(|err| ends(uncertain, err))?;
@@ -1654,7 +1653,7 @@ impl Client {
             let Some((cursor, _)) = request.cursor.filter(|_| ready) else {
                 // It registers, or, behind the log, catches up with a heartbeat, which downloads
                 // the snapshot it announces.
-                let readied = tokio::time::timeout_at(deadline, async {
+                let readied = rt::timeout_at(deadline, async {
                     if request.registered {
                         return self.heartbeat(room.id.clone()).await;
                     }
@@ -1670,7 +1669,7 @@ impl Client {
                     }
                     Ok(Err(err)) => return Err(ends(uncertain, err)),
                 }
-                tokio::time::sleep_until((Instant::now() + backoff.next()).min(deadline)).await;
+                rt::sleep_until((rt::now() + backoff.next()).min(deadline)).await;
                 continue;
             };
             let (epoch, correlation_id) = (request.epoch, self.correlation_id());
@@ -1686,7 +1685,7 @@ impl Client {
             let mut sending = false;
             let sends = || room.in_flight(&mutation_id);
             let reply = self.send_tracked(&room, correlation_id, &message, &mut sending, sends);
-            let reply = tokio::time::timeout_at(deadline, reply).await;
+            let reply = rt::timeout_at(deadline, reply).await;
             match reply.ok().and_then(Result::ok) {
                 Some(ServerMessage::CommitAck {
                     correlation_id: reply_id,
@@ -1735,8 +1734,7 @@ impl Client {
                         ErrorCode::BehindCompaction => {
                             let behind =
                                 move |local: Local, room| local.behind(room, epoch, cursor, false);
-                            let behind =
-                                tokio::time::timeout_at(deadline, self.change(&room, behind));
+                            let behind = rt::timeout_at(deadline, self.change(&room, behind));
                             if let Ok(Err(err)) = behind.await {
                                 return Err(ends(uncertain, err));
                             }
@@ -1753,7 +1751,7 @@ impl Client {
                 // No reply, or one that does not answer the commit: it may have been sequenced.
                 _ => uncertain = true,
             }
-            tokio::time::sleep_until((Instant::now() + backoff.next()).min(deadline)).await;
+            rt::sleep_until((rt::now() + backoff.next()).min(deadline)).await;
         };
 
         let acked =
@@ -1777,7 +1775,7 @@ impl Client {
             if let Some(decision) = room.decision(&mutation_id) {
                 return decision;
             }
-            tokio::time::sleep(backoff.next()).await;
+            rt::sleep(backoff.next()).await;
         }
     }
 
@@ -2228,8 +2226,7 @@ impl Client {
         // Hashing a large snapshot would stall the runtime.
         let bytes = Bytes::from(bytes);
         let hashed = bytes.clone();
-        let hashed =
-            tokio::task::spawn_blocking(move || ServerMessage::compute_snapshot_hash(&hashed));
+        let hashed = rt::spawn_blocking(move || ServerMessage::compute_snapshot_hash(&hashed));
         if hashed.await.ok() != Some(hash) {
             return Err(ClientError::Network(
                 "The snapshot does not match its hash".to_string(),
@@ -2257,7 +2254,7 @@ impl Client {
     ) -> Result<(), ClientError> {
         let uploaded = self.upload_snapshot(room, epoch, again).await;
         if uploaded.is_err() {
-            room.update(epoch, |open| open.upload_failed = Some(Instant::now()));
+            room.update(epoch, |open| open.upload_failed = Some(rt::now()));
         }
         uploaded
     }
@@ -2277,8 +2274,7 @@ impl Client {
         // Hashing a large snapshot would stall the runtime.
         let snapshot = Bytes::from(snapshot);
         let hashed = snapshot.clone();
-        let hashed =
-            tokio::task::spawn_blocking(move || ServerMessage::compute_snapshot_hash(&hashed));
+        let hashed = rt::spawn_blocking(move || ServerMessage::compute_snapshot_hash(&hashed));
         let hash = (hashed.await)
             .map_err(|err| ClientError::Storage(format!("Hashing the snapshot failed: {err}")))?;
         let total_bytes = snapshot.len() as u64;
@@ -2380,7 +2376,7 @@ impl Client {
                 return reply.map(Some);
             }
             retries += 1;
-            tokio::time::sleep(backoff.next()).await;
+            rt::sleep(backoff.next()).await;
         }
     }
 

@@ -1,4 +1,5 @@
 use crate::config::NEVER;
+use crate::rt::{self, Instant};
 use crate::{endpoint, ClientError, EventStream, TransportClient, TransportError};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -11,7 +12,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::time::Instant;
 use zemdb_core::{encode_message, ClientMessage, RoomId, MAX_FRAME_SIZE};
 
 /// The pieces the body of a request is handed over in: each one the HTTP layer takes is
@@ -151,10 +151,10 @@ impl Clients {
             return;
         }
         let clients = Arc::clone(self);
-        let replacement = tokio::spawn(async move {
+        let replacement = rt::spawn(async move {
             let _replacing = Replacing(&clients.replacing);
             let config = clients.config.clone();
-            let built = tokio::task::spawn_blocking(move || Self::build(&config)).await;
+            let built = rt::spawn_blocking(move || Self::build(&config)).await;
             let Ok(Ok(client)) = built else {
                 return;
             };
@@ -274,7 +274,7 @@ impl TransportClient for HttpTransport {
             .bearer_auth(token)
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .send();
-        let response = tokio::time::timeout(idle, request).await;
+        let response = rt::timeout(idle, request).await;
         let mut response = response
             .map_err(|_| stalled())?
             .map_err(|err| failed(&err))?;
@@ -328,7 +328,7 @@ async fn read_frame(
         )))
     })?;
     loop {
-        let Ok(piece) = tokio::time::timeout(idle, response.chunk()).await else {
+        let Ok(piece) = rt::timeout(idle, response.chunk()).await else {
             return Err(Read::Stalled);
         };
         let Some(piece) = piece.map_err(|err| Read::Failed(failed(&err)))? else {
@@ -364,14 +364,14 @@ struct Progress(Arc<Mutex<Instant>>);
 
 impl Progress {
     fn new() -> Self {
-        Self(Arc::new(Mutex::new(Instant::now())))
+        Self(Arc::new(Mutex::new(rt::now())))
     }
 
     fn advance(&self) {
         *self
             .0
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = rt::now();
     }
 
     fn last(&self) -> Instant {
@@ -385,11 +385,11 @@ impl Progress {
     async fn while_advancing<F: Future>(&self, request: F, idle: Duration) -> Option<F::Output> {
         let mut request = std::pin::pin!(request);
         loop {
-            let left = idle.saturating_sub(self.last().elapsed());
+            let left = idle.saturating_sub(rt::now().saturating_duration_since(self.last()));
             if left.is_zero() {
                 return None;
             }
-            if let Ok(output) = tokio::time::timeout(left, request.as_mut()).await {
+            if let Ok(output) = rt::timeout(left, request.as_mut()).await {
                 return Some(output);
             }
         }

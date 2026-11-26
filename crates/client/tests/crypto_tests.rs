@@ -3,6 +3,7 @@
 //! read in the clear, also one of type `Bytes`, whose plaintext the server would take as it is;
 //! what does not decrypt, or does not decrypt to a value of the type of its column, is
 //! `Decryption`; and a write cut while it encrypts or is prechecked sends nothing.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

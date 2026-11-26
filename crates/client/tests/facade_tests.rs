@@ -1,5 +1,6 @@
 //! The facade of the client against the server in process: its handles, and the local reads of
 //! the replica by the names of the columns.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

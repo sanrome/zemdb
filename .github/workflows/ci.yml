@@ -55,6 +55,48 @@ jobs:
       - run: cargo build -p zemdb-core -p zemdb-storage -p zemdb-client --target wasm32-unknown-unknown
       - run: cargo clippy -p zemdb-core -p zemdb-storage -p zemdb-client --target wasm32-unknown-unknown -- -D warnings
 
+  browser:
+    name: Browser (Chromium)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/browser
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/browser
+      # The CLI of the version of wasm-bindgen in the lock of the harness (build.sh checks that
+      # it is the one of the root's lock too), with its wasm-bindgen-test-runner.
+      - run: >-
+          cargo install wasm-bindgen-cli --locked --version
+          "$(awk '$0 == "name = \"wasm-bindgen\"" { getline; gsub(/version = |"/, ""); print }' Cargo.lock)"
+      # The harness only: with --all it would also check the crates of the root, as the job fmt.
+      - run: cargo fmt -- --check
+      - run: cargo clippy -p zemdb-browser-steps --target wasm32-unknown-unknown --all-targets -- -D warnings
+      - run: cargo clippy -p zemdb-browser-server --all-targets -- -D warnings
+      - run: cargo test -p zemdb-browser-server
+      - run: sh build.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tools/browser/package-lock.json
+      - run: npm ci
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('tools/browser/package-lock.json') }}
+      - run: npx playwright install --with-deps chromium
+      - run: node run.mjs
+      - run: node run.mjs --self-check
+      # The unit tests in wasm32, in a dedicated Worker of the Chrome of the runner.
+      - run: CHROMEDRIVER="$CHROMEWEBDRIVER/chromedriver" cargo test -p zemdb-browser-steps --target wasm32-unknown-unknown
+
   docs:
     name: Docs
     runs-on: ubuntu-latest

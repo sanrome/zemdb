@@ -1,4 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
 use zemdb_core::protocol::codec::encoded_len;
 use zemdb_core::{
     check_operation_size, ClientId, ClientMessage, ColumnDef, ColumnUpdate, CompactRow,
@@ -11,7 +10,7 @@ use zemdb_storage::{RejectReason, StorageError};
 use super::crypto::Draft;
 use super::table::{check_value, invalid, primary_key, table};
 use super::{Key, Row};
-use crate::ClientError;
+use crate::{rt, ClientError};
 
 /// What the writes of a client are planned with against the schema of the replica, by name: the
 /// owner of the client, which fills the owner column of each write, and the timestamp of the
@@ -26,11 +25,9 @@ pub(super) struct Writer {
 
 impl Writer {
     pub(super) fn new(client: &ClientId) -> Self {
-        let since = SystemTime::now().duration_since(UNIX_EPOCH);
-        let millis = since.map_or(0, |since| since.as_millis());
         Self {
             owner: Value::from(client.owner()),
-            timestamp: u64::try_from(millis).unwrap_or(u64::MAX),
+            timestamp: rt::wall_millis(),
         }
     }
 

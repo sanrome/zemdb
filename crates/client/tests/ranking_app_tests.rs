@@ -2,6 +2,7 @@
 //! a local socket, with the devices reaching it over HTTP; and, beyond them, devices that write at
 //! once and end with the same rows of every table.
 #![cfg(feature = "native")]
+#![allow(clippy::disallowed_methods)]
 
 #[path = "../examples/ranking/app.rs"]
 mod app;

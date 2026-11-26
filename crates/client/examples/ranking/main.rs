@@ -5,6 +5,7 @@
 //! ```text
 //! cargo run -p zemdb-client --example ranking
 //! ```
+#![allow(clippy::disallowed_methods)]
 
 mod app;
 mod scenarios;

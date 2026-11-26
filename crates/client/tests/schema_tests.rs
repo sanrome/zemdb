@@ -1,6 +1,7 @@
 //! The schema of the replicas of the client, against the server in process: learned from
 //! `Registered` only, switched to only if it evolves from the replica's, and failing the room
 //! closed if it does not.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

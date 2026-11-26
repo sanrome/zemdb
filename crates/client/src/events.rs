@@ -1,13 +1,13 @@
 //! The event stream of a room: its bytes split into events, each one read whole up to a limit,
 //! and each event decoded before the replica checks it.
 
+use crate::rt::{self, Instant};
 use crate::{EventBlocks, TransportError};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use bytes::{Buf, Bytes};
 use futures::stream::{Fuse, StreamExt};
 use std::time::Duration;
-use tokio::time::Instant;
 use zemdb_core::{
     decode_message, DecodeError, RoomId, SchemaId, SequenceNumber, SequencedOperation,
     ServerMessage,
@@ -165,7 +165,7 @@ impl EventReader {
         Self {
             blocks: blocks.fuse(),
             parser: EventParser::default(),
-            heard: Instant::now(),
+            heard: rt::now(),
         }
     }
 
@@ -178,13 +178,13 @@ impl EventReader {
                 return Ok(Some(event));
             }
             let next = self.blocks.next();
-            let Ok(next) = tokio::time::timeout_at(self.heard + SILENCE, next).await else {
+            let Ok(next) = rt::timeout_at(self.heard + SILENCE, next).await else {
                 self.parser.fail(StreamError::Silent);
                 return Err(StreamError::Silent);
             };
             match next {
                 Some(Ok(block)) => {
-                    self.heard = Instant::now();
+                    self.heard = rt::now();
                     self.parser.push(block);
                 }
                 Some(Err(err)) => {

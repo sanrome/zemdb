@@ -1,6 +1,7 @@
 //! The writes of the facade against the server in process: the order of a write, with the owner
 //! that the client fills, the validation by name before anything is sent, and the decisions of
 //! the replica.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 

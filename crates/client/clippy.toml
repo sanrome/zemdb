@@ -1,0 +1,23 @@
+# What panics or does not run in WebAssembly is called only from the runtime of the client
+# (`src/rt.rs`). The lint holds for the code of the crate, also in native; its unit tests allow it
+# (`src/lib.rs`), and so do its integration tests and its example, crates of their own that read
+# this file too: they all run on Tokio.
+disallowed-methods = [
+    { path = "tokio::task::spawn", reason = "Tokio has no runtime in WebAssembly: use `rt::spawn`" },
+    { path = "tokio::task::spawn_blocking", reason = "Tokio has no runtime in WebAssembly: use `rt::spawn_blocking`" },
+    { path = "tokio::time::sleep", reason = "Tokio has no timers in WebAssembly: use `rt::sleep`" },
+    { path = "tokio::time::sleep_until", reason = "Tokio has no timers in WebAssembly: use `rt::sleep_until`" },
+    { path = "tokio::time::timeout", reason = "Tokio has no timers in WebAssembly: use `rt::timeout`" },
+    { path = "tokio::time::timeout_at", reason = "Tokio has no timers in WebAssembly: use `rt::timeout_at`" },
+    { path = "tokio::time::interval", reason = "Tokio has no timers in WebAssembly: use `rt::sleep_until`" },
+    { path = "tokio::time::interval_at", reason = "Tokio has no timers in WebAssembly: use `rt::sleep_until`" },
+    { path = "tokio::time::Instant::now", reason = "it panics in WebAssembly: use `rt::now`" },
+    { path = "tokio::time::Instant::elapsed", reason = "it panics in WebAssembly: use `rt::now`" },
+    { path = "std::time::Instant::now", reason = "it panics in WebAssembly: use `rt::now`" },
+    { path = "std::time::Instant::elapsed", reason = "it panics in WebAssembly: use `rt::now`" },
+    { path = "std::time::SystemTime::now", reason = "it panics in WebAssembly: use `rt::wall_millis`" },
+    { path = "std::time::SystemTime::elapsed", reason = "it panics in WebAssembly: use `rt::wall_millis`" },
+    { path = "uuid::Uuid::new_v4", reason = "it has no randomness in WebAssembly without choosing its source: use `rt::random_uuid`" },
+    { path = "std::thread::spawn", reason = "it panics in WebAssembly: use `rt::spawn` or `rt::spawn_blocking`" },
+    { path = "std::thread::sleep", reason = "it panics in WebAssembly: use `rt::sleep`" },
+]

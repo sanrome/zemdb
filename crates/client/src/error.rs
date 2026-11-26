@@ -10,7 +10,9 @@ pub enum ClientError {
     /// valid client id, a backoff that starts at zero or whose longest delay is shorter, a
     /// write timeout beyond the clock, a snapshot larger than `max_snapshot_bytes` or that
     /// does not fit in memory, or an HTTP transport whose URL or timeouts cannot work or whose
-    /// HTTP client does not start.
+    /// HTTP client does not start. For the dispatcher of a browser Worker, also a command that
+    /// the state of its client does not allow: one that needs the client before it opens, or an
+    /// open once it opened, while it opens or once it shut down.
     #[error("Invalid configuration: {0}")]
     Config(String),
 

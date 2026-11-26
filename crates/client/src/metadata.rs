@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use zemdb_core::{RoomId, Schema, SchemaId};
 use zemdb_storage::files::{NativeFiles, RoomFile, RoomFiles};
 
+use crate::rt::{self, MaybeSend};
+
 /// The metadata of the replica of a room, which describe all of its data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomMetadata {
@@ -89,12 +91,12 @@ impl<F: RoomFiles> FileMetadata<F> {
     /// it ended.
     async fn run<T, Fut>(&self, op: impl FnOnce(Arc<F>, PathBuf) -> Fut) -> io::Result<T>
     where
-        T: Send + 'static,
-        Fut: Future<Output = io::Result<T>> + Send + 'static,
+        T: MaybeSend + 'static,
+        Fut: Future<Output = io::Result<T>> + MaybeSend + 'static,
     {
         let lock = Arc::clone(&self.lock).lock_owned().await;
         let op = op(Arc::clone(&self.files), self.dir.clone());
-        let task = tokio::spawn(async move {
+        let task = rt::spawn(async move {
             let _lock = lock;
             op.await
         });
@@ -164,7 +166,7 @@ impl<F: RoomFiles> MetadataStore for FileMetadata<F> {
                 let device_id = match read::<Device>(&*files, &dir, "client.meta").await? {
                     Some(device) => device.device_id,
                     None => {
-                        let device_id = uuid::Uuid::new_v4().as_u128();
+                        let device_id = rt::random_uuid();
                         write(&*files, &dir, "client.meta", &Device { device_id }).await?;
                         device_id
                     }
@@ -225,7 +227,7 @@ pub struct MemoryMetadata {
 #[async_trait]
 impl MetadataStore for MemoryMetadata {
     async fn open(&self) -> io::Result<u128> {
-        Ok(uuid::Uuid::new_v4().as_u128())
+        Ok(rt::random_uuid())
     }
 
     async fn close(&self) {}

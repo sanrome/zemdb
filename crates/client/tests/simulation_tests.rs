@@ -65,6 +65,7 @@
 //! the steps and the events, but not the faults, drawn in the order the requests are sent, which
 //! the jitter of the backoffs and the blocking pool change; nor, with workers, the writes before
 //! the network heals, which go on until enough of them land.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 #[path = "../../core/tests/common/mod.rs"]

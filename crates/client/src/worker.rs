@@ -3,13 +3,12 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 use tokio::sync::{oneshot, Notify};
-use tokio::task::JoinHandle;
-use tokio::time::Instant;
 use zemdb_core::RoomId;
 
 use crate::client::{jitter, Acking, Backoff, Held, Opened, Transfer};
 use crate::config::NEVER;
 use crate::events::{EventReader, RoomEvent, SseEvent, StreamError};
+use crate::rt::{self, Instant, Task};
 use crate::{Client, ClientConfig, ClientError, Freshness};
 
 /// The worker of a room, as [`Client::status`](crate::Client::status) gives it.
@@ -47,7 +46,7 @@ const ACK_AGAIN_BEATS: u32 = 10;
 /// clock by less than the timer of Tokio rounds it up by would panic the timer. The waits of the
 /// backoffs need none: they are at most `u64::MAX` nanoseconds, which fit.
 fn after(delay: Duration) -> Instant {
-    Instant::now() + delay.min(NEVER)
+    rt::now() + delay.min(NEVER)
 }
 
 /// What the worker of a room shares with its task.
@@ -78,7 +77,7 @@ pub(crate) struct Worker {
     changed: Arc<Notify>,
     /// Dropped to stop the task.
     stop: oneshot::Sender<()>,
-    task: JoinHandle<()>,
+    task: Task<()>,
     ended: Ended,
 }
 
@@ -111,7 +110,7 @@ impl Worker {
             shared,
             changed,
             stop,
-            task: tokio::spawn(task),
+            task: rt::spawn(task),
             ended: ended.shared(),
         }
     }
@@ -180,7 +179,7 @@ fn live(shared: &Mutex<Shared>) -> bool {
 /// The event stream of a worker in `Live`: open, being opened, or to be opened at `retry_at`.
 struct Events {
     stream: Option<Stream>,
-    opening: Option<JoinHandle<Result<Opened, ClientError>>>,
+    opening: Option<Task<Result<Opened, ClientError>>>,
     /// When to open it, once it is neither open nor being opened.
     retry_at: Instant,
     /// The waits before it opens again after an error or its end, which start over with an
@@ -203,7 +202,7 @@ impl Events {
         Self {
             stream: None,
             opening: None,
-            retry_at: Instant::now(),
+            retry_at: rt::now(),
             backoff: Backoff::worker(config),
             disabled: false,
         }
@@ -221,14 +220,14 @@ impl Events {
     /// a wait.
     fn lost(&mut self) {
         self.stream = None;
-        self.retry_at = Instant::now() + self.backoff.next();
+        self.retry_at = rt::now() + self.backoff.next();
     }
 
     /// Takes the stream for one of another epoch: another one opens at once, so that no event of
     /// the replica of that epoch is taken for one of this.
     fn replace(&mut self) {
         self.stream = None;
-        self.retry_at = Instant::now();
+        self.retry_at = rt::now();
     }
 
     /// Whether the stream is due to open: in `Live`, neither open nor being opened.
@@ -272,18 +271,15 @@ async fn read(stream: &mut Option<Stream>) -> Result<Option<SseEvent>, StreamErr
 fn notice(
     event: &SseEvent,
     (client, room_id, epoch): (&Held, &RoomId, u64),
-    (syncing, pending): (
-        &mut Option<JoinHandle<Result<bool, ClientError>>>,
-        &mut bool,
-    ),
-    transferring: &mut Option<JoinHandle<Result<(), ClientError>>>,
-    applying: &mut Option<JoinHandle<Result<bool, ClientError>>>,
+    (syncing, pending): (&mut Option<Task<Result<bool, ClientError>>>, &mut bool),
+    transferring: &mut Option<Task<Result<(), ClientError>>>,
+    applying: &mut Option<Task<Result<bool, ClientError>>>,
 ) {
     match event.decode() {
         Ok(RoomEvent::Ops(event)) => {
             let (client, room_id) = (client.clone(), room_id.clone());
             let task = async move { client.worker_apply(&room_id, epoch, event).await };
-            *applying = Some(tokio::spawn(task));
+            *applying = Some(rt::spawn(task));
         }
         Ok(RoomEvent::SchemaReloaded) => {
             client.unregister(room_id);
@@ -309,9 +305,7 @@ fn held(weak: &Weak<Client>) -> Option<Held> {
 }
 
 /// What a task of the worker returns once it ends: a task that panicked or was cut is `Storage`.
-async fn ended_task<T>(
-    task: &mut Option<JoinHandle<Result<T, ClientError>>>,
-) -> Result<T, ClientError> {
+async fn ended_task<T>(task: &mut Option<Task<Result<T, ClientError>>>) -> Result<T, ClientError> {
     let ended = match task {
         Some(task) => task.await,
         None => std::future::pending().await,
@@ -325,7 +319,7 @@ async fn ended_task<T>(
 
 /// Starts `wanted` in the task of the transfers, unless a transfer runs.
 fn transfer(
-    transfer: &mut Option<JoinHandle<Result<(), ClientError>>>,
+    transfer: &mut Option<Task<Result<(), ClientError>>>,
     client: &Held,
     room_id: &RoomId,
     wanted: Transfer,
@@ -333,13 +327,13 @@ fn transfer(
     if transfer.is_none() {
         let (client, room_id) = (client.clone(), room_id.clone());
         let task = async move { client.transfer(&room_id, wanted).await };
-        *transfer = Some(tokio::spawn(task));
+        *transfer = Some(rt::spawn(task));
     }
 }
 
 /// Starts a sync in the task of the syncs, unless a sync runs: then marks one more for after it.
 fn sync(
-    sync: &mut Option<JoinHandle<Result<bool, ClientError>>>,
+    sync: &mut Option<Task<Result<bool, ClientError>>>,
     pending: &mut bool,
     client: &Held,
     room_id: &RoomId,
@@ -350,7 +344,7 @@ fn sync(
     }
     let (client, room_id) = (client.clone(), room_id.clone());
     let task = async move { client.worker_sync(&room_id).await };
-    *sync = Some(tokio::spawn(task));
+    *sync = Some(rt::spawn(task));
 }
 
 /// The task of the worker of `room_id`, until `stop` is dropped, the client is dropped, or a step
@@ -391,11 +385,11 @@ async fn run(
     mut stop: oneshot::Receiver<()>,
 ) {
     let mut backoff = Backoff::worker(&config);
-    let mut next = Instant::now() + jitter(config.heartbeat_interval);
-    let mut transferring: Option<JoinHandle<Result<(), ClientError>>> = None;
-    let mut syncing: Option<JoinHandle<Result<bool, ClientError>>> = None;
+    let mut next = rt::now() + jitter(config.heartbeat_interval);
+    let mut transferring: Option<Task<Result<(), ClientError>>> = None;
+    let mut syncing: Option<Task<Result<bool, ClientError>>> = None;
     // The application of the operations of an event: whether it asks for a sync.
-    let mut applying: Option<JoinHandle<Result<bool, ClientError>>> = None;
+    let mut applying: Option<Task<Result<bool, ClientError>>> = None;
     // Whether a heartbeat or an event asked for a sync while one ran.
     let mut pending = false;
     // How many heartbeats in a row left the replica waiting for a snapshot that no reply
@@ -518,21 +512,21 @@ async fn run(
                 notice(&event, of, syncing, &mut transferring, &mut applying);
                 continue;
             }
-            () = tokio::time::sleep_until(events.retry_at), if events.due(live) => {
+            () = rt::sleep_until(events.retry_at), if events.due(live) => {
                 let Some(client) = held(&weak) else {
                     break;
                 };
                 let room_id = room_id.clone();
                 let task = async move { client.worker_events(&room_id).await };
-                events.opening = Some(tokio::spawn(task));
+                events.opening = Some(rt::spawn(task));
                 continue;
             }
-            () = tokio::time::sleep_until(next) => {}
+            () = rt::sleep_until(next) => {}
         }
         let Some(client) = held(&weak) else {
             break;
         };
-        let started = Instant::now();
+        let started = rt::now();
         let register = waiting >= WAITING_BEATS;
         if register {
             waiting = 0;
@@ -544,7 +538,7 @@ async fn run(
         let asked = match beat {
             Ok(asked) => asked,
             Err(err) => {
-                next = Instant::now() + backoff.next();
+                next = rt::now() + backoff.next();
                 match ended(&shared, Err(err)) {
                     true => break,
                     false => continue,
@@ -603,12 +597,12 @@ async fn run(
     }
     if let Some(client) = held(&weak) {
         let last = client.worker_ack(&room_id, Acking::Last);
-        let _ = tokio::time::timeout(LAST_ACK, last).await;
+        let _ = rt::timeout(LAST_ACK, last).await;
     }
 }
 
 /// `task`, cut at its next `.await`.
-fn cut<T>(task: JoinHandle<T>) -> JoinHandle<T> {
+fn cut<T>(task: Task<T>) -> Task<T> {
     task.abort();
     task
 }

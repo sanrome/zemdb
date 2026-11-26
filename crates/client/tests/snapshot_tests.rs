@@ -1,6 +1,7 @@
 //! The heartbeats of the client and the download and the upload of snapshots, against the server
 //! in process with a paused clock, whose rooms prune their log: a replica behind it catches up from
 //! the active snapshot of the relay, which the client that the server designates uploads.
+#![allow(clippy::disallowed_methods)]
 
 mod common;
 
