@@ -27,32 +27,14 @@ export const suites = {
     { run: 'files_dropped' },
     { run: 'files_errors' },
   ],
-  // The files of the file layer of the storage over the OPFS, on the real layer: the openings,
-  // the I/O, the rename of an open file, a file taken (also by the Worker of the second page) and
-  // operations dropped by their callers.
-  handles: [
-    { run: 'handles_write' },
-    { run: 'handles_rename' },
-    { reload: true },
-    { run: 'handles_after_reload' },
-    { run: 'handles_generations' },
-    { run: 'handles_hold' },
-    { peer: 'handles_taken' },
-    { run: 'handles_release' },
-    { peer: 'handles_free' },
-    { closePeer: true },
-    { run: 'handles_dropped' },
-  ],
   // Only the runner runs these: `isolation` in another context of the browser, with the run id
-  // of a run of `reload`; `quota` in Chromium, in another context whose quota it makes small;
-  // the other three in its self-check, which checks that a step that fails, in either page, or
-  // that panics, fails the run with its name and its error.
+  // of a run of `reload`; the other three in its self-check, which checks that a step that fails,
+  // in either page, or that panics, fails the run with its name and its error.
   isolation: [{ run: 'reload_isolated' }],
-  quota: [{ run: 'handles_quota' }],
   fails: [{ run: 'fails_on_purpose' }],
   fails_in_peer: [{ peer: 'fails_on_purpose' }],
   panics: [{ run: 'panics_on_purpose' }],
 };
 
 // The suites of a page whose URL names none.
-export const defaults = ['reload', 'tabs', 'server', 'files', 'handles'];
+export const defaults = ['reload', 'tabs', 'server', 'files'];

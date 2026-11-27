@@ -1,5 +1,0 @@
-# The unit tests in wasm32 of the crates of the root (`cargo test --target wasm32-unknown-unknown
-# -p zemdb-storage --lib`) run in a browser, with the `wasm-bindgen-test-runner` of the version of
-# `wasm-bindgen` in Cargo.lock. Only that target has a runner: nothing changes natively.
-[target.wasm32-unknown-unknown]
-runner = "wasm-bindgen-test-runner"

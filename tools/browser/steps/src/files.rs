@@ -21,13 +21,13 @@ use web_sys::{FileSystemDirectoryHandle, FileSystemGetDirectoryOptions};
 use zemdb_storage::files::{FileTaken, OpfsFiles, RoomFiles};
 
 /// The directory of a run, relative to the root of the OPFS, where the paths of the layer are.
-pub(crate) fn base(run: &str) -> PathBuf {
+fn base(run: &str) -> PathBuf {
     PathBuf::from(format!("harness/files-{run}"))
 }
 
 /// The directory `path` of the run, with its names separated by `/`, through the browser,
 /// created if missing.
-pub(crate) async fn dir(run: &str, path: &str) -> Result<FileSystemDirectoryHandle, JsError> {
+async fn dir(run: &str, path: &str) -> Result<FileSystemDirectoryHandle, JsError> {
     let options = FileSystemGetDirectoryOptions::new();
     options.set_create(true);
     let mut dir = harness_dir().await?;
@@ -60,7 +60,7 @@ async fn entries(dir: &FileSystemDirectoryHandle) -> Result<BTreeSet<String>, Js
 }
 
 /// Fails unless the entries of `dir` are exactly `expected`, after `what`.
-pub(crate) async fn expect_entries(
+async fn expect_entries(
     dir: &FileSystemDirectoryHandle,
     expected: &[&str],
     what: &str,
@@ -73,11 +73,7 @@ pub(crate) async fn expect_entries(
 }
 
 /// Makes the entry `entry` of `dir` with `bytes`, through the browser.
-pub(crate) async fn put(
-    dir: &FileSystemDirectoryHandle,
-    entry: &str,
-    bytes: &[u8],
-) -> Result<(), JsError> {
+async fn put(dir: &FileSystemDirectoryHandle, entry: &str, bytes: &[u8]) -> Result<(), JsError> {
     let file = file_handle(dir, entry, true)
         .await
         .map_err(failed("getFileHandle"))?;
@@ -103,7 +99,7 @@ async fn get(dir: &FileSystemDirectoryHandle, entry: &str) -> Result<Vec<u8>, Js
 }
 
 /// Fails unless the entry `entry` of `dir` holds `bytes`.
-pub(crate) async fn expect_holds(
+async fn expect_holds(
     dir: &FileSystemDirectoryHandle,
     entry: &str,
     bytes: &[u8],
@@ -120,7 +116,7 @@ pub(crate) async fn expect_holds(
 
 /// A sync access handle of the browser on the entry `entry` of `dir`, which another one cannot
 /// take while it is open.
-pub(crate) async fn hold(
+async fn hold(
     dir: &FileSystemDirectoryHandle,
     entry: &str,
 ) -> Result<web_sys::FileSystemSyncAccessHandle, JsError> {
@@ -130,7 +126,7 @@ pub(crate) async fn hold(
     open(&file).await.map_err(failed("createSyncAccessHandle"))
 }
 
-pub(crate) fn check(holds: bool, what: impl FnOnce() -> String) -> Result<(), JsError> {
+fn check(holds: bool, what: impl FnOnce() -> String) -> Result<(), JsError> {
     if holds {
         Ok(())
     } else {
@@ -139,12 +135,12 @@ pub(crate) fn check(holds: bool, what: impl FnOnce() -> String) -> Result<(), Js
 }
 
 /// Makes an error of the layer the failure of `what`.
-pub(crate) fn layer(what: &str) -> impl FnOnce(io::Error) -> JsError + '_ {
+fn layer(what: &str) -> impl FnOnce(io::Error) -> JsError + '_ {
     move |err| JsError::new(&format!("{what}: {err}"))
 }
 
 /// The error of `result`, an operation that has to fail, of the kind `kind`.
-pub(crate) fn expect_error<T>(
+fn expect_error<T>(
     result: io::Result<T>,
     kind: io::ErrorKind,
     what: &str,
@@ -160,7 +156,7 @@ pub(crate) fn expect_error<T>(
 }
 
 /// The error of `result`, which has to be the error of a taken file.
-pub(crate) fn expect_taken<T>(result: io::Result<T>, what: &str) -> Result<(), JsError> {
+fn expect_taken<T>(result: io::Result<T>, what: &str) -> Result<(), JsError> {
     let err = expect_error(result, io::ErrorKind::ResourceBusy, what)?;
     check(FileTaken::is(&err), || {
         format!("{what} failed with {err}, which is not the error of a taken file")

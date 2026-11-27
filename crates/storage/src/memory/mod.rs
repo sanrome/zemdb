@@ -325,6 +325,6 @@ impl StorageEngine for MemoryStorageEngine {
     }
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 #[path = "../tests/memory.rs"]
 mod tests;

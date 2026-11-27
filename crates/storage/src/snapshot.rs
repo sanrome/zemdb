@@ -538,6 +538,6 @@ fn invalid_frame(reason: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, reason.to_string())
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 #[path = "tests/snapshot.rs"]
 mod tests;

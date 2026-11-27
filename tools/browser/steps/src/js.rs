@@ -73,22 +73,6 @@ pub async fn sleep(ms: i32) -> Result<(), JsError> {
     Ok(())
 }
 
-/// `step`, failed if it does not end within `ms` milliseconds: an operation that hangs fails its
-/// step there, saying which step, and not only at the limit of the page for a step.
-pub async fn within<T>(
-    ms: i32,
-    what: &str,
-    step: impl std::future::Future<Output = Result<T, JsError>>,
-) -> Result<T, JsError> {
-    let limit = JsFuture::from(timer(ms, JsValue::UNDEFINED)?);
-    match futures::future::select(std::pin::pin!(step), limit).await {
-        futures::future::Either::Left((done, _)) => done,
-        futures::future::Either::Right(_) => Err(JsError::new(&format!(
-            "{what} did not end within {ms} ms: an operation hangs"
-        ))),
-    }
-}
-
 /// The milliseconds since the Worker started (`performance.now()`).
 pub fn now() -> Result<f64, JsError> {
     let performance = scope()?
