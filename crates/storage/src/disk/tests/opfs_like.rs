@@ -359,20 +359,31 @@ async fn the_layer_refuses_a_second_handle_on_a_file() {
             matches!(&created, Err(err) if err.kind() == io::ErrorKind::AlreadyExists),
             "{mode:?}: {created:?}"
         );
-        assert_eq!(std::fs::read(layer.real(&a)).unwrap(), b"held", "{mode:?}");
+        // Read once the handle is closed: on Windows, another handle cannot read a locked file.
         drop(file);
+        assert_eq!(std::fs::read(layer.real(&a)).unwrap(), b"held", "{mode:?}");
         drop(layer.open_locked(&a).await.unwrap().unwrap());
     }
     assert_eq!(layer.refused().len(), 9);
+}
 
-    // A file created between the check of `create_locked` and its opening, as on the OPFS, where
-    // another handle can take it there: here, a handle whose file was removed outside the layer.
+/// A file created between the check of `create_locked` and its opening, as on the OPFS, where
+/// another handle can take it there, is `None`, and is left created: here, a handle whose file was
+/// removed outside the layer. Only on Unix: on Windows a file removed with a handle open stays,
+/// pending deletion, until the handle closes, and nothing can create it again meanwhile.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_layer_refuses_a_second_handle_on_a_file_that_create_locked_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let layer = OpfsLikeFiles::new(dir.path());
+    let a = layer.virtual_root.join("a");
+    drop(layer.create(&a).await.unwrap());
     let reader = layer.open_read(&a).await.unwrap();
     std::fs::remove_file(layer.real(&a)).unwrap();
     assert!(layer.create_locked(&a).await.unwrap().is_none());
     assert!(layer.real(&a).exists(), "the file is left created");
     drop(reader);
-    assert_eq!(layer.refused().len(), 10);
+    assert_eq!(layer.refused().len(), 1);
 }
 
 #[tokio::test]

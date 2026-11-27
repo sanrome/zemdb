@@ -912,5 +912,5 @@ fn snapshot_head_outcome(
 mod tests;
 
 #[cfg(all(test, target_arch = "wasm32"))]
-#[path = "tests/opfs.rs"]
+#[path = "tests/wasm32.rs"]
 mod tests;

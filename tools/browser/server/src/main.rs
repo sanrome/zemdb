@@ -14,8 +14,9 @@
 //!     with `zstd`) whose rows are `{"rows": n}` rows of the schema of the snapshots
 //!     ([`snapshot_schema`]);
 //!   - `/harness/snapshot/check?head=<n>`: applies the snapshot of the body, made in the browser,
-//!     to a native `MemoryStorageEngine` at the head `n`, and answers how many of the rows of the
-//!     schema of the snapshots, up to `n`, it holds as the browser wrote them.
+//!     to a native `MemoryStorageEngine` at the head `n`, and answers `{same} of {rows}`: how many
+//!     of its rows are the rows `1..=n` of the schema of the snapshots as the browser wrote them,
+//!     and how many rows it holds.
 //!
 //! It prints `listening on http://127.0.0.1:<port>/` once it accepts connections. It stops when
 //! its standard input closes (the runner that started it ends) or on Ctrl+C: it closes the
@@ -28,6 +29,7 @@ use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE};
 use axum::http::{HeaderValue, Method, Request, Response, StatusCode, Uri};
 use axum::Router;
 use bytes::Bytes;
+use futures::StreamExt;
 use http_body::{Frame, SizeHint};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
@@ -56,7 +58,9 @@ use zemdb_server::{
     build_router, generate_client_token, AppState, IoThreads, RoomManager, SchemaRegistry,
     ServerConfig, SnapshotRelay,
 };
-use zemdb_storage::{DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, StorageEngine};
+use zemdb_storage::{
+    DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, ScanOptions, StorageEngine,
+};
 
 /// The secret of the client tokens. The server only listens on `127.0.0.1`, for the tests.
 const AUTH_SECRET: &str = "zemdb browser harness: client tokens";
@@ -497,8 +501,9 @@ async fn native_snapshot(body: &[u8]) -> Response<Body> {
 }
 
 /// Applies `snapshot`, made in the browser, to a native memory engine at the head of `query`
-/// (`head=<n>`), and answers how many of the rows `1..=n` of the snapshots of the harness it
-/// holds, each as [`snapshot_values`] makes it.
+/// (`head=<n>`), and answers `{same} of {rows}`: how many of the rows it holds are those of the
+/// keys `1..=n`, each as [`snapshot_values`] makes it, and how many it holds. Its only table is
+/// `users`: the engine refuses a snapshot with a table that the schema does not have.
 async fn check_snapshot(query: &str, snapshot: Bytes) -> Response<Body> {
     let Some(head) = query
         .strip_prefix("head=")
@@ -511,21 +516,26 @@ async fn check_snapshot(query: &str, snapshot: Bytes) -> Response<Body> {
         let room = RoomId::new("harness-check")?;
         let schema = snapshot_schema();
         engine.open_room(&room, schema.clone()).await?;
-        let head = SequenceNumber::from(head);
-        engine.apply_snapshot(&room, schema, snapshot, head).await?;
-        let mut same = 0u64;
-        for key in 1..=head.get() {
-            let found = engine
-                .get(&room, "users", &PrimaryKey::single(key as i64))
-                .await?;
-            if found == Some(snapshot_values(key)) {
+        engine
+            .apply_snapshot(&room, schema, snapshot, SequenceNumber::from(head))
+            .await?;
+        // The rows come in key order: the n-th has to be the row of the key n.
+        let (mut same, mut rows) = (0u64, 0u64);
+        let mut scan = engine.scan(&room, "users", ScanOptions::new()).await?;
+        while let Some(found) = scan.next().await {
+            let (pk, row) = found?;
+            rows += 1;
+            let expected = (1..=head)
+                .contains(&rows)
+                .then(|| (PrimaryKey::single(rows as i64), snapshot_values(rows)));
+            if expected == Some((pk, row)) {
                 same += 1;
             }
         }
-        Ok::<_, Box<dyn Error>>(same)
+        Ok::<_, Box<dyn Error>>(format!("{same} of {rows}"))
     };
     match checked.await {
-        Ok(same) => text(StatusCode::OK, same.to_string()),
+        Ok(counted) => text(StatusCode::OK, counted),
         Err(err) => text(StatusCode::UNPROCESSABLE_ENTITY, err.to_string()),
     }
 }

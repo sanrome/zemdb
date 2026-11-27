@@ -338,6 +338,71 @@ async fn create_locked_is_none_for_a_file_taken_once_it_found_the_name_free() {
     assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
 }
 
+/// The disk engine on the layer, with a rotation whose fresh WAL `create_locked` leaves created
+/// and cannot open (another handle takes it as it creates it): the rotation is rolled back, which
+/// moves the rotated WAL to the next generation of the fresh one, and cannot remove the one that
+/// is taken, so it stays until the next replacement of the name. The compaction is `RoomLocked`,
+/// the room stays usable, with its writes in the WAL it rolled back, and the next compaction
+/// removes the old generation.
+#[wasm_bindgen_test]
+async fn a_rotation_rolled_back_onto_a_wal_left_created_writes_to_its_next_generation() {
+    use crate::{DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError};
+    use zemdb_core::{
+        CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequencedOperation,
+        TableSchema, Value,
+    };
+    let schema = || {
+        let users = TableSchema::builder("users")
+            .table_id(0)
+            .primary_key("id", DataType::Int)
+            .column("name", DataType::String);
+        Schema::builder().table(users).build()
+    };
+    let insert = |seq: u64| {
+        let row = CompactRow::new(vec![Value::Int(seq as i64), Value::String("u".into())]);
+        let op = Operation::insert(0, PrimaryKey::single(seq as i64), row, 100);
+        vec![SequencedOperation::new(seq, op)]
+    };
+    let dir = fresh("engine-rollback").await;
+    let options = DiskStorageOptions::new(&dir).auto_compact(false);
+    let room = RoomId::new("back").unwrap();
+    let engine = DiskStorageEngine::new(options.clone()).unwrap();
+    engine.open_room(&room, schema()).await.unwrap();
+    for seq in 1..=3 {
+        engine.apply_batch(&room, insert(seq)).await.unwrap();
+    }
+
+    let held = Held::default();
+    arm("open", "room_back.wal", hold(&dir, "room_back.wal", &held));
+    let compacted = engine.compact_room(&room).await;
+    assert!(
+        matches!(&compacted, Err(StorageError::RoomLocked(_))),
+        "{compacted:?}"
+    );
+    let_go(&held);
+    assert_eq!(
+        entries_of(&dir).await,
+        [
+            "room_back.lock",
+            "room_back.snap",
+            "room_back.wal",
+            "room_back.wal~1"
+        ]
+    );
+    assert!(holds(&dir, "room_back.wal").await.is_empty());
+    engine.apply_batch(&room, insert(4)).await.unwrap();
+    engine.compact_room(&room).await.unwrap();
+    assert_eq!(
+        entries_of(&dir).await,
+        ["room_back.lock", "room_back.snap~1", "room_back.wal"]
+    );
+    engine.close_room(&room).await.unwrap();
+    let engine = DiskStorageEngine::new(options).unwrap();
+    engine.open_room(&room, schema()).await.unwrap();
+    assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), 4);
+    engine.apply_batch(&room, insert(5)).await.unwrap();
+}
+
 /// The disk engine on the layer, with a rotation of its WAL whose reopening fails: the WAL is
 /// dead. The compaction fails and readers still see every row; the next write fails on the dead
 /// WAL and marks the room as failed; closing it gives the error of its sync; and the room reopens

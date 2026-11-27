@@ -13,10 +13,11 @@
 //! A step *in flight* leaves a loop of operations running in the Worker, which records how far it
 //! got in a file of the harness outside the data directory: after each step that the engine
 //! acknowledged, 8 bytes written at once and flushed, which a cut leaves whole. It returns once the
-//! loop ran a few steps, so the cut never falls before the loop started, and the loop never ends,
-//! so it never falls after; the page then terminates the Worker, wherever the loop is. The next
-//! step reopens the room, in a new Worker, checks it against that record, whatever the point of
-//! the cut, and notes where it fell.
+//! loop ran a few steps, so the cut never falls before the loop started; the page then terminates
+//! the Worker, wherever the loop is. The loop does not end while the Worker lives: if a step of it
+//! fails, or it ends, it records so, and the step that follows fails, so the cut never falls after
+//! its end unseen. The next step reopens the room, in a new Worker, checks it against that record,
+//! whatever the point of the cut, and notes where it fell.
 //!
 //! Each step fails if it does not end within [`LIMIT_MS`], so that an operation that hangs fails
 //! it there.
@@ -119,11 +120,28 @@ fn row(key: u64) -> CompactRow {
 
 /// A batch that inserts the row of each key of `keys`, each at the sequence of its key.
 fn batch(keys: RangeInclusive<u64>) -> Vec<SequencedOperation> {
+    batch_of(keys, row)
+}
+
+/// A batch that inserts `row_of(key)` for each key of `keys`, each at the sequence of its key.
+fn batch_of(
+    keys: RangeInclusive<u64>,
+    row_of: impl Fn(u64) -> CompactRow,
+) -> Vec<SequencedOperation> {
     keys.map(|key| {
-        let op = Operation::insert(0, PrimaryKey::single(key as i64), row(key), 100);
+        let op = Operation::insert(0, PrimaryKey::single(key as i64), row_of(key), 100);
         SequencedOperation::new(key, op)
     })
     .collect()
+}
+
+/// The row of the key `key` that the cycle `cycle` of `deletes` writes, which no other cycle
+/// writes.
+fn cycle_row(key: u64, cycle: u64) -> CompactRow {
+    CompactRow::new(vec![
+        Value::Int(key as i64),
+        Value::String(format!("user {key} of the cycle {cycle}").into()),
+    ])
 }
 
 fn room_id(name: &str) -> Result<RoomId, JsError> {
@@ -165,6 +183,16 @@ async fn open_released(engine: &DiskStorageEngine, room: &RoomId) -> Result<(), 
 /// Fails unless `room` is at `head`, with the row of each key up to it as [`row`] makes it, and
 /// no row past it.
 async fn expect_rows(engine: &DiskStorageEngine, room: &RoomId, head: u64) -> Result<(), JsError> {
+    expect_rows_of(engine, room, head, row).await
+}
+
+/// [`expect_rows`], with the row of each key as `row_of` makes it.
+async fn expect_rows_of(
+    engine: &DiskStorageEngine,
+    room: &RoomId,
+    head: u64,
+    row_of: impl Fn(u64) -> CompactRow,
+) -> Result<(), JsError> {
     let found = engine.get_head_seq(room).await;
     let found = found.map_err(storage("get_head_seq"))?.get();
     check(found == head, || {
@@ -175,7 +203,7 @@ async fn expect_rows(engine: &DiskStorageEngine, room: &RoomId, head: u64) -> Re
             .get(room, "users", &PrimaryKey::single(key as i64))
             .await;
         let got = got.map_err(storage("get"))?;
-        let expected = (key <= head).then(|| row(key));
+        let expected = (key <= head).then(|| row_of(key));
         check(got == expected, || {
             format!("{room} at {head} has {got:?} under the key {key}, not {expected:?}")
         })?;
@@ -240,8 +268,22 @@ async fn snapshot_header(dir: &Path, room: &str) -> Result<FileHeader, JsError> 
 }
 
 /// How far a loop in flight got: 8 bytes at the start of the file `progress-{name}` of the run,
-/// outside the data directories.
+/// outside the data directories. Dropped, which happens only when its loop ends (a Worker that is
+/// terminated drops nothing), it records [`ENDED`].
 struct Progress(FileSystemSyncAccessHandle);
+
+/// What a loop in flight records when it ends, which it does only if a step of it failed or it
+/// returned: the step that reads it then fails.
+const ENDED: u64 = u64::MAX;
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        // If it cannot record, the step that reads the record finds the last step instead, and
+        // the step that started the loop saw it fail (`in_flight`).
+        drop(self.record(ENDED));
+        self.0.close();
+    }
+}
 
 impl Progress {
     async fn dir(run: &str) -> Result<FileSystemDirectoryHandle, JsError> {
@@ -302,7 +344,11 @@ impl Progress {
         let bytes: [u8; 8] = bytes?.try_into().map_err(|bytes: Vec<u8>| {
             JsError::new(&format!("a record of {} bytes", bytes.len()))
         })?;
-        Ok(u64::from_le_bytes(bytes))
+        let recorded = u64::from_le_bytes(bytes);
+        check(recorded != ENDED, || {
+            format!("the loop {name} ended before the Worker was terminated: a step of it failed, or it returned")
+        })?;
+        Ok(recorded)
     }
 }
 
@@ -318,7 +364,8 @@ struct Flight {
 /// recording in `progress` what each one gives, with a turn of the event loop after each `burst`
 /// of them; once it ran [`STARTED`] of them, and then for a random part of the time they took,
 /// so that the cut that follows falls at a random point of a later one, gives back, or gives the
-/// error of one that failed.
+/// error of one that failed, also during that time. A step that fails ends the loop, which
+/// records [`ENDED`] as it drops `progress`.
 async fn in_flight<S, F>(progress: Progress, burst: u64, mut step: S) -> Result<(), JsError>
 where
     S: FnMut() -> F + 'static,
@@ -339,19 +386,26 @@ where
                 return;
             }
             shared.steps.set(shared.steps.get() + 1);
-            if shared.steps.get() % burst == 0 && sleep(0).await.is_err() {
-                return;
+            if shared.steps.get() % burst == 0 {
+                if let Err(err) = sleep(0).await {
+                    let err = JsValue::from(err);
+                    *shared.failed.borrow_mut() = Some(crate::js::describe(&err));
+                    return;
+                }
             }
         }
     });
+    let failed = |flight: &Flight| match flight.failed.borrow().clone() {
+        Some(err) => Err(JsError::new(&format!("the loop in flight failed: {err}"))),
+        None => Ok(()),
+    };
     loop {
-        if let Some(err) = flight.failed.borrow().clone() {
-            return Err(JsError::new(&format!("the loop in flight failed: {err}")));
-        }
+        failed(&flight)?;
         let steps = flight.steps.get();
         if steps >= STARTED {
             let took = now()? - started;
-            return sleep((js_sys::Math::random() * took) as i32).await;
+            sleep((js_sys::Math::random() * took) as i32).await?;
+            return failed(&flight);
         }
         sleep(1).await?;
     }
@@ -826,7 +880,8 @@ async fn deletes_in_flight(run: &str) -> Result<(), JsError> {
                     opened.map_err(storage("open_room"))?;
                     for first in (1..=DELETE_ROWS).step_by(DELETE_BATCH as usize) {
                         let last = first + DELETE_BATCH - 1;
-                        let applied = engine.apply_batch(&room, batch(first..=last)).await;
+                        let rows = batch_of(first..=last, |key| cycle_row(key, cycle));
+                        let applied = engine.apply_batch(&room, rows).await;
                         applied.map_err(storage("apply_batch"))?;
                         if last == DELETE_ROWS - DELETE_BATCH {
                             let compacted = engine.compact_room(&room).await;
@@ -860,7 +915,10 @@ async fn deletes_in_flight(run: &str) -> Result<(), JsError> {
 }
 
 /// After the Worker was terminated with deletions in flight: `deletes` reopens at a prefix of the
-/// log of its cycle, or empty, and deleting it again leaves it empty.
+/// log of the cycle that the record says, with the rows of that cycle, or empty, and deleting it
+/// again leaves it empty. With the cut in a deletion, the prefixes are those that each removal
+/// leaves (all of it, the snapshot alone, or nothing); once the cycle deleted the room, they are
+/// those of the writing of the next cycle.
 #[wasm_bindgen]
 pub async fn engine_deletes_cut(run: String) -> Result<(), JsError> {
     within(LIMIT_MS, "engine_deletes_cut", deletes_cut(&run)).await
@@ -868,9 +926,24 @@ pub async fn engine_deletes_cut(run: String) -> Result<(), JsError> {
 
 async fn deletes_cut(run: &str) -> Result<(), JsError> {
     let recorded = Progress::read(run, "deletes").await?;
-    check(recorded >= STARTED, || {
-        format!("the loop recorded {recorded}: it had not started")
+    let (cycle, phase) = (recorded / 4, recorded % 4);
+    // Each cycle records twice: once closed, and once deleted.
+    let steps = match phase {
+        DELETING => cycle * 2 + 1,
+        DELETED => cycle * 2 + 2,
+        _ => 0,
+    };
+    check(steps >= STARTED, || {
+        format!("the loop recorded {recorded}, after {steps} steps: it had not started")
     })?;
+    // The heads that the cut may leave, and the cycle whose rows the room holds.
+    let (heads, rows_of) = match phase {
+        DELETING => (vec![DELETE_ROWS, DELETE_ROWS - DELETE_BATCH, 0], cycle),
+        _ => (
+            (0..=DELETE_ROWS).step_by(DELETE_BATCH as usize).collect(),
+            cycle + 1,
+        ),
+    };
     let dir = scenario(run, "deletes");
     let left = entries_of(&dir).await?;
     let room = room_id("deletes")?;
@@ -881,15 +954,13 @@ async fn deletes_cut(run: &str) -> Result<(), JsError> {
         .await
         .map_err(storage("get_head_seq"))?;
     let head = head.get();
-    check(head <= DELETE_ROWS && head % DELETE_BATCH == 0, || {
-        format!("the room reopens at {head}, which is no prefix of the log of its cycle")
+    check(heads.contains(&head), || {
+        format!("with {recorded} recorded, the room reopens at {head}, which is none of {heads:?}")
     })?;
-    expect_rows(&engine, &room, head).await?;
-    let (cycle, phase) = (recorded / 4, recorded % 4);
+    expect_rows_of(&engine, &room, head, |key| cycle_row(key, rows_of)).await?;
     let phase = match phase {
         DELETING => "deleting the room, once closed",
-        DELETED => "writing the room again, once deleted",
-        _ => "writing the room",
+        _ => "writing the room again, once deleted",
     };
     note(&format!(
         "engine_deletes_cut: the cut fell in the cycle {cycle}, {phase}, and the room reopens at \
@@ -987,9 +1058,10 @@ async fn snapshots(run: &str) -> Result<(), JsError> {
     .map_err(failed("/harness/snapshot/check"))?;
     let status = response.status();
     let answer = text(&response).await?;
-    check(status == 200 && answer == NATIVE_ROWS.to_string(), || {
-        format!("the native engine read the snapshot of the browser: HTTP {status}: {answer}")
-    })?;
+    check(
+        status == 200 && answer == format!("{NATIVE_ROWS} of {NATIVE_ROWS}"),
+        || format!("the native engine read the snapshot of the browser: HTTP {status}: {answer}"),
+    )?;
     let installed = engine
         .apply_snapshot(&own, schema(), snapshot.into(), NATIVE_ROWS.into())
         .await;
@@ -1117,6 +1189,10 @@ async fn locked(run: &str) -> Result<(), JsError> {
 /// closed.
 #[wasm_bindgen]
 pub async fn engine_release(_run: String) -> Result<(), JsError> {
+    within(LIMIT_MS, "engine_release", release()).await
+}
+
+async fn release() -> Result<(), JsError> {
     let held = HELD.with(|held| held.borrow_mut().pop());
     let engine = held.ok_or_else(|| JsError::new("engine_hold kept no engine"))?;
     let room = room_id("locked")?;
@@ -1242,6 +1318,7 @@ async fn open_rooms(run: &str, rooms: usize) -> Result<(), JsError> {
         .collect::<Result<Vec<_>, _>>()?;
     let mut passes = Vec::new();
     let mut opened = rooms;
+    let mut entries = 0;
     for _ in 0..2 {
         let engine = engine_at(&dir)?;
         let started = now()?;
@@ -1270,14 +1347,16 @@ async fn open_rooms(run: &str, rooms: usize) -> Result<(), JsError> {
             "{done} in {took:.0} ms ({:.1} ms a room{stopped})",
             took / done.max(1) as f64
         ));
+        if passes.len() == 1 {
+            // The rooms that the first pass created, three entries each.
+            entries = done * 3;
+        }
         opened = done;
     }
     note(&format!(
         "opening {rooms} rooms over the OPFS, in a directory of their own: {} the first time, and \
          {} again, with {} entries in the directory",
-        passes[0],
-        passes[1],
-        opened * 3
+        passes[0], passes[1], entries
     ));
     Ok(())
 }

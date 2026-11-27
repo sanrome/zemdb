@@ -7,9 +7,9 @@
 //
 // Without --suites it runs the default suites of the page, then the suite `isolation` in
 // another context of the browser, with the same run id, the suite `rooms` in a third one, and in
-// Chromium the suite `quota` in a fourth context, whose quota it makes small through CDP. `--suites quota` runs that suite alone,
-// with its quota, and only in Chromium. --executable runs another build of the browser than the
-// one of Playwright. A step can print a console message that starts with `harness note: `,
+// Chromium the suite `quota` in a fourth context, whose quota it makes small through CDP.
+// `--suites quota` runs that suite alone, with its quota, and only in Chromium. --executable runs
+// another build of the browser than the one of Playwright. A step can print a console message that starts with `harness note: `,
 // which the runner prints as a note of the run. --self-check checks the runner itself:
 // a run of each of the suites `fails`, `fails_in_peer` and `panics`, whose step fails or panics
 // on purpose, has to fail, naming the step and giving its error.
