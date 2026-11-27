@@ -43,6 +43,17 @@ async fn holds(path: &Path, entry: &str) -> Vec<u8> {
     bytes
 }
 
+/// Makes the entry `entry` of the directory `path` with `bytes`, through the browser.
+async fn put(path: &Path, entry: &str, bytes: &[u8]) {
+    let file = file_handle(&handle_of(path).await, entry, true)
+        .await
+        .unwrap();
+    let access = access(&file, entry, &[]).await.unwrap();
+    let written = access.write_with_u8_array_and_options(bytes, &at(0));
+    access.close();
+    assert_eq!(written.unwrap() as usize, bytes.len());
+}
+
 /// A sync access handle that a test holds on an entry, from an action.
 type Held = Rc<RefCell<Option<FileSystemSyncAccessHandle>>>;
 
@@ -181,14 +192,21 @@ async fn a_dropped_rename_that_cannot_reopen_gives_its_error_to_the_next_operati
     let held = Held::default();
     arm("rename.moved", "f", hold(&dir, "f", &held));
     assert!(file.rename(&dir.join("f")).now_or_never().is_none());
-    expect_dead(&mut file, &dir.join("g"), "createSyncAccessHandle(f)").await;
+    // The next rename gives that error before it refuses its path, and does not run.
+    let err = file.rename(Path::new("../x")).await.unwrap_err();
+    assert!(
+        err.to_string().contains("createSyncAccessHandle(f)"),
+        "{err}"
+    );
+    expect_dead(&mut file, &dir.join("g"), "is closed").await;
     let_go(&held);
     assert_eq!(entries_of(&dir).await, ["f"]);
     assert_eq!(holds(&dir, "f").await, b"e0");
 }
 
 /// A move that fails reopens the file where it was: the rename fails with the error of the
-/// move, and the file goes on, open, under its name; a later rename moves it.
+/// move, and the file goes on, open, under its name and its generation, which a later rename
+/// moves, leaving the old generation of the destination of the one that failed.
 #[wasm_bindgen_test]
 async fn a_move_that_fails_reopens_the_file_where_it_was() {
     let dir = fresh("move-fails").await;
@@ -198,22 +216,85 @@ async fn a_move_that_fails_reopens_the_file_where_it_was() {
         .unwrap()
         .unwrap();
     file.write_at(0, b"h0".to_vec()).await.unwrap();
+    put(&dir, "k", b"k0").await;
 
     // Taken once the rename closed it, and let go once its move failed.
     let held = Held::default();
     arm("rename.closed", "h", hold(&dir, "h", &held));
     let release = Rc::clone(&held);
-    arm("rename.moved", "k", async move { let_go(&release) });
+    arm("rename.moved", "k~1", async move { let_go(&release) });
     let err = file.rename(&dir.join("k")).await.unwrap_err();
     assert!(FileTaken::is(&err), "{err}");
     assert!(held.borrow().is_none());
 
     file.write_at(2, b"x".to_vec()).await.unwrap();
     assert_eq!(file.read_at(0, 3).await.unwrap(), b"h0x");
-    assert_eq!(entries_of(&dir).await, ["h"]);
-    file.rename(&dir.join("k")).await.unwrap();
+    assert_eq!(entries_of(&dir).await, ["h", "k"]);
+    file.rename(&dir.join("m")).await.unwrap();
     assert_eq!(file.read_at(0, 3).await.unwrap(), b"h0x");
-    assert_eq!(entries_of(&dir).await, ["k"]);
+    assert_eq!(entries_of(&dir).await, ["k", "m"]);
+    assert_eq!(holds(&dir, "k").await, b"k0");
+}
+
+/// A move and a reopening that both fail, the file taken by another handle all along: the
+/// rename fails with the error of the reopening, which is not the error of a taken file (the
+/// file did not stay as it was: it is closed), and the file is dead.
+#[wasm_bindgen_test]
+async fn a_move_and_a_reopening_that_fail_leave_the_file_dead_and_not_taken() {
+    let dir = fresh("both-fail").await;
+    let mut file = OpfsFiles
+        .open_locked(&dir.join("q"))
+        .await
+        .unwrap()
+        .unwrap();
+    file.write_at(0, b"q0".to_vec()).await.unwrap();
+    let held = Held::default();
+    arm("rename.closed", "q", hold(&dir, "q", &held));
+    let err = file.rename(&dir.join("r")).await.unwrap_err();
+    let_go(&held);
+    assert!(!FileTaken::is(&err), "{err}");
+    assert!(
+        err.to_string().contains("createSyncAccessHandle(q)"),
+        "{err}"
+    );
+    expect_dead(&mut file, &dir.join("s"), "is closed").await;
+    assert_eq!(entries_of(&dir).await, ["q"]);
+    assert_eq!(holds(&dir, "q").await, b"q0");
+}
+
+/// A move that fails, but that moved the file all the same (here another handle moves it in
+/// its place): the rename does not reopen the file at its source, where Safari would create it
+/// again, empty, and the file is dead.
+#[wasm_bindgen_test]
+async fn a_move_that_fails_and_moved_the_file_leaves_it_dead_without_reopening_its_source() {
+    let dir = fresh("move-moved").await;
+    let mut file = OpfsFiles
+        .open_locked(&dir.join("u"))
+        .await
+        .unwrap()
+        .unwrap();
+    file.write_at(0, b"u0".to_vec()).await.unwrap();
+    let held = Held::default();
+    arm("rename.closed", "u", hold(&dir, "u", &held));
+    let (release, path) = (Rc::clone(&held), dir.clone());
+    arm("rename.moved", "w", async move {
+        let_go(&release);
+        let dir = handle_of(&path).await;
+        let entry = file_handle(&dir, "u", false).await.unwrap();
+        let entry: &MovableFile = entry.unchecked_ref();
+        JsFuture::from(entry.move_to(&dir, "w").unwrap())
+            .await
+            .unwrap();
+    });
+    let err = file.rename(&dir.join("w")).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("a move that failed left it no entry"),
+        "{err}"
+    );
+    expect_dead(&mut file, &dir.join("x"), "is closed").await;
+    assert_eq!(entries_of(&dir).await, ["w"]);
+    assert_eq!(holds(&dir, "w").await, b"u0");
 }
 
 /// `create_locked` checks that the name has no generation and then creates it: a file that

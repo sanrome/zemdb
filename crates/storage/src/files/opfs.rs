@@ -521,16 +521,17 @@ impl OpfsFile {
 /// Renames the file of `open` to the name `to` of the directory of `to_dirs`, with the steps of
 /// a replacement: the first one before it closes the sync access handle, so that a rename that
 /// fails there leaves the file open; then it closes it, moves the file and reopens it on the
-/// same handle of its entry, which followed it. A move that fails reopens the file where it was;
-/// a reopening that fails leaves it closed, and every later operation fails.
+/// same handle of its entry, which followed it. A move that fails reopens the file where it was,
+/// if the listing still has its entry there, and otherwise leaves it closed; so does a reopening
+/// that fails, and every later operation fails.
 async fn rename_open(open: &RefCell<Open>, to_dirs: Vec<String>, to: String) -> io::Result<()> {
-    let (file, from_dirs, from, moved) = {
+    let (file, from_dirs, from, generation) = {
         let open = open.borrow();
         let (dirs, name) = (open.dirs.clone(), open.name.clone());
         (open.file.clone(), dirs, name, open.generation)
     };
     let (from_dir, to_dir) = directories(&from_dirs, &to_dirs).await?;
-    let replacement = replace_first(&from_dir, &from, Some(moved), &to_dir, &to).await?;
+    let replacement = replace_first(&from_dir, &from, Some(generation), &to_dir, &to).await?;
     if let Some(access) = open.borrow_mut().access.take() {
         access.close();
     }
@@ -539,8 +540,13 @@ async fn rename_open(open: &RefCell<Open>, to_dirs: Vec<String>, to: String) -> 
     point("rename.moved", &replacement.target).await;
     let reopened = if moved.is_ok() {
         &replacement.target
-    } else {
+    } else if generations(&from_dir, &from).await?.contains(&generation) {
         &replacement.source
+    } else {
+        // A move that failed and moved the file all the same: reopening it at its source would
+        // create it there again, empty, in Safari.
+        let message = format!("{from} is closed: a move that failed left it no entry");
+        return Err(io::Error::other(message));
     };
     open.borrow_mut().access = Some(access(&file, reopened, &[]).await?);
     moved?;
@@ -559,11 +565,17 @@ impl RoomFile for OpfsFile {
     /// Repeats a read that gives less than asked, until the file ends.
     async fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         let read = self.call("read", |access| {
-            Ok(opfs_names::read_exact(offset, len, |buf, at_offset| {
-                let read = access.read_with_u8_array_and_options(buf, &at(at_offset));
-                read.map(|read| read as usize)
-                    .map_err(|err| error("read", &err, &[]))
-            }))
+            let size = access.get_size()? as u64;
+            Ok(opfs_names::read_exact(
+                offset,
+                len,
+                size,
+                |buf, at_offset| {
+                    let read = access.read_with_u8_array_and_options(buf, &at(at_offset));
+                    read.map(|read| read as usize)
+                        .map_err(|err| error("read", &err, &[]))
+                },
+            ))
         });
         read.await?
     }
@@ -602,12 +614,14 @@ impl RoomFile for OpfsFile {
     /// Takes the handle's permit, then the turn of the layer, and runs in a task of its own the
     /// steps of [`RoomFiles::rename`], without taking the turn again: the first one before it
     /// closes the sync access handle; then it closes it, moves the file and reopens it on the
-    /// same handle of its entry. A move that fails reopens the file where it was; a reopening
-    /// that fails leaves it closed, and every later operation fails. `to` may not be open.
+    /// same handle of its entry. A move that fails reopens the file where it was, if its entry is
+    /// still there; a reopening that fails, or a source with no entry, leaves it closed, and every
+    /// later operation fails. The error of an earlier rename that nobody awaited comes before
+    /// anything else, also before a refused `to`, which may not be open.
     async fn rename(&mut self, to: &Path) -> io::Result<()> {
-        let (to_dirs, to) = opfs_names::file_names(to)?;
         let permit = Arc::clone(&self.permit).lock_owned().await;
         self.open.borrow_mut().access()?;
+        let (to_dirs, to) = opfs_names::file_names(to)?;
         let (sender, receiver) = oneshot::channel();
         let mut outcome = Outcome {
             receiver,

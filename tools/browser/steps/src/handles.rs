@@ -144,7 +144,43 @@ async fn write(run: &str) -> Result<(), JsError> {
         .map_err(layer("write_at"))?;
     created.sync_all().await.map_err(layer("sync_all"))?;
     drop(created);
-    expect_holds(&dir, "c", b"new").await
+    expect_holds(&dir, "c", b"new").await?;
+
+    // `create` of a name that does not exist creates it.
+    let fresh = files
+        .create(&io_dir.join("n"))
+        .await
+        .map_err(layer("create n"))?;
+    expect_size(&fresh, 0).await?;
+    fresh
+        .write_at(0, b"fresh".to_vec())
+        .await
+        .map_err(layer("write_at"))?;
+    drop(fresh);
+    expect_entries(&dir, &["c", "n", "w"], "create n").await?;
+    expect_holds(&dir, "n", b"fresh").await?;
+
+    // A write that ends at 2^53, the end of the offsets of the browser: it goes to the browser,
+    // which cannot write it, and fails whatever count the browser gives; and nothing is written.
+    let last = open(&files, &io_dir.join("n")).await?;
+    let what = "write_at((1 << 53) - 1, 1 byte)";
+    match last.write_at((1 << 53) - 1, vec![1]).await {
+        Ok(()) => return Err(JsError::new(&format!("{what} succeeded"))),
+        Err(err) => note(&format!("{what} failed with {err} ({:?})", err.kind())),
+    }
+    expect_size(&last, 5).await?;
+    let what = "write_at(1 << 53, 1 byte), past the end of the offsets";
+    expect_error(
+        last.write_at(1 << 53, vec![1]).await,
+        ErrorKind::InvalidInput,
+        what,
+    )?;
+    expect_size(&last, 5).await
+}
+
+/// Prints `what` as a note of the run, which the runner shows (`run.mjs`).
+fn note(what: &str) {
+    web_sys::console::log_1(&format!("harness note: {what}").into());
 }
 
 /// Renaming an open file, as the rotation of a WAL and its rollback do: the handle follows the
@@ -205,6 +241,32 @@ async fn rename(run: &str) -> Result<(), JsError> {
     expect_entries(&dir, &["deep"], "renaming the open snap to deep/x").await?;
     expect_entries(&deep, &["x~1"], "renaming the open snap to deep/x").await?;
     expect_read(&wal, 0, b"w1w2w3").await?;
+    // The file follows its directory: within it, with an old generation of its name left there,
+    // which the next rename removes.
+    put(&deep, "x", b"left").await?;
+    wal.rename(&base.join("deep").join("y"))
+        .await
+        .map_err(layer("rename deep/x to deep/y"))?;
+    expect_entries(&deep, &["y"], "renaming the open deep/x to deep/y").await?;
+    expect_read(&wal, 0, b"w1w2w3").await?;
+
+    // A generation of the name of the open file newer than the one it has, which the engine never
+    // leaves: the rename removes it too, so the name has none left.
+    let fresh = open(&files, &path("p")).await?;
+    put(&dir, "p~4", b"p4").await?;
+    let mut fresh = fresh;
+    fresh
+        .rename(&path("o"))
+        .await
+        .map_err(layer("rename p to o, with p~4"))?;
+    expect_entries(
+        &dir,
+        &["deep", "o"],
+        "renaming the open p, with a newer p~4",
+    )
+    .await?;
+    drop(fresh);
+    files.remove(&path("o")).await.map_err(layer("remove o"))?;
 
     // From a name with old generations, onto one that exists; then, from where it went, with an
     // old generation there that a replacement could not remove, which the next one removes.
@@ -249,7 +311,7 @@ async fn rename(run: &str) -> Result<(), JsError> {
     expect_entries(&dir, &["deep", "s", "v"], "renaming the open u to v").await?;
 
     drop((wal, q, u));
-    expect_holds(&deep, "x~1", b"w1w2w3").await?;
+    expect_holds(&deep, "y", b"w1w2w3").await?;
     expect_holds(&dir, "s", b"q2").await?;
     expect_holds(&dir, "v", b"u1!").await
 }
@@ -278,6 +340,13 @@ async fn after_reload(run: &str) -> Result<(), JsError> {
     expect_size(&created, 3).await?;
     expect_read(&created, 0, b"new").await?;
     drop(created);
+    let fresh = files
+        .open_read(&io_dir.join("n"))
+        .await
+        .map_err(layer("open_read n"))?;
+    expect_size(&fresh, 5).await?;
+    expect_read(&fresh, 0, b"fresh").await?;
+    drop(fresh);
     let file = open(&files, &io_dir.join("w")).await?;
     file.write_at(4099, b"LD".to_vec())
         .await
@@ -293,8 +362,8 @@ async fn after_reload(run: &str) -> Result<(), JsError> {
     )
     .await?;
     let deep = dir(run, "open-rename/deep").await?;
-    expect_entries(&deep, &["x~1"], "the reload").await?;
-    for (name, bytes) in [("deep/x", "w1w2w3"), ("s", "q2"), ("v", "u1!")] {
+    expect_entries(&deep, &["y"], "the reload").await?;
+    for (name, bytes) in [("deep/y", "w1w2w3"), ("s", "q2"), ("v", "u1!")] {
         let file = files
             .open_read(&rename.join(name))
             .await
@@ -641,8 +710,11 @@ async fn dropped(run: &str) -> Result<(), JsError> {
     expect_entries(&dir, &["a", "d", "d~1", "g"], "the dropped rename of c").await
 }
 
-/// In a context whose quota the runner made small: a write over the quota fails with
-/// `StorageFull`, from the `QuotaExceededError` of the browser, and the file goes on.
+/// In a context whose quota the runner made small: a write over the quota fails, and the file
+/// goes on. The browser says so in one of two ways, and the step notes which one it saw: a
+/// `QuotaExceededError`, which is `StorageFull`; or, in Chromium 153, a count of bytes written
+/// larger than what it was given (`4294967288`), which the layer refuses with an error that has
+/// the count.
 #[wasm_bindgen]
 pub async fn handles_quota(run: String) -> Result<(), JsError> {
     within(LIMIT_MS, "handles_quota", quota(&run)).await
@@ -660,14 +732,24 @@ async fn quota(run: &str) -> Result<(), JsError> {
         .await
         .map_err(layer("write_at, under the quota"))?;
     let what = "write_at of 16 MiB, over the quota";
-    let err = expect_error(
-        file.write_at(1024, vec![2; 16 << 20]).await,
-        ErrorKind::StorageFull,
-        what,
-    )?;
-    check(err.to_string().contains("QuotaExceededError"), || {
-        format!("{what} failed with {err}, which does not name the error of the browser")
+    let err = match file.write_at(1024, vec![2; 16 << 20]).await {
+        Ok(()) => return Err(JsError::new(&format!("{what} succeeded"))),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    let full = err.kind() == ErrorKind::StorageFull && message.contains("QuotaExceededError");
+    let miscounted = err.kind() == ErrorKind::Other && message.contains("more than asked");
+    check(full || miscounted, || {
+        format!(
+            "{what} failed with {err} ({:?}), neither the quota nor a count",
+            err.kind()
+        )
     })?;
     file.sync_all().await.map_err(layer("sync_all"))?;
+    let size = file.size().await.map_err(layer("size"))?;
+    note(&format!(
+        "{what} failed with {err} ({:?}), and left the file with {size} bytes",
+        err.kind()
+    ));
     expect_read(&file, 0, &[1; 1024]).await
 }

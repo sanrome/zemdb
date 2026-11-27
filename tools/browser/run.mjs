@@ -1,12 +1,16 @@
 // The runner of the browser harness (README.md). Starts the test server on a free port, opens
 // the page in a browser without a window with Playwright, and fails if a step fails, naming it.
 //
-//   node run.mjs [--browser chromium|firefox|webkit] [--server <binary>] [--suites <a,b>] [--headed]
-//   node run.mjs --self-check [--browser ...] [--server ...]
+//   node run.mjs [--browser chromium|firefox|webkit] [--executable <path>] [--server <binary>]
+//                [--suites <a,b>] [--headed]
+//   node run.mjs --self-check [--browser ...] [--executable ...] [--server ...]
 //
 // Without --suites it runs the default suites of the page, then the suite `isolation` in
 // another context of the browser, with the same run id, and in Chromium the suite `quota` in a
-// third context, whose quota it makes small through CDP. --self-check checks the runner itself:
+// third context, whose quota it makes small through CDP. `--suites quota` runs that suite alone,
+// with its quota, and only in Chromium. --executable runs another build of the browser than the
+// one of Playwright. A step can print a console message that starts with `harness note: `,
+// which the runner prints as a note of the run. --self-check checks the runner itself:
 // a run of each of the suites `fails`, `fails_in_peer` and `panics`, whose step fails or panics
 // on purpose, has to fail, naming the step and giving its error.
 import { spawn } from 'node:child_process';
@@ -24,6 +28,8 @@ const SERVER_START_TIMEOUT_MS = 30_000;
 const SERVER_STOP_TIMEOUT_MS = 15_000;
 // The quota of the origin for the suite `quota`, whose step writes over it.
 const QUOTA_BYTES = 4 * 1024 * 1024;
+// The start of a console message of a step that the runner prints, as a note of the run.
+const NOTE = 'harness note: ';
 
 const options = parseArgs(process.argv.slice(2));
 process.exitCode = options.selfCheck ? await selfCheck() : await run();
@@ -32,6 +38,7 @@ function parseArgs(args) {
   const options = {
     browser: 'chromium',
     server: `${here}target/debug/zemdb-browser-server`,
+    executable: null,
     suites: null,
     headed: false,
     selfCheck: false,
@@ -47,6 +54,7 @@ function parseArgs(args) {
     switch (args[i]) {
       case '--browser': options.browser = value(); break;
       case '--server': options.server = value(); break;
+      case '--executable': options.executable = value(); break;
       case '--suites': options.suites = value(); break;
       case '--headed': options.headed = true; break;
       case '--self-check': options.selfCheck = true; break;
@@ -56,11 +64,15 @@ function parseArgs(args) {
   if (!['chromium', 'firefox', 'webkit'].includes(options.browser)) {
     usage(`unknown browser ${options.browser}`);
   }
+  const named = options.suites?.split(',') ?? [];
+  if (named.includes('quota') && (named.length > 1 || options.browser !== 'chromium')) {
+    usage('the suite quota runs alone, and only in Chromium: its quota is set through CDP');
+  }
   return options;
 }
 
 function usage(problem) {
-  console.error(`${problem}\nusage: node run.mjs [--browser chromium|firefox|webkit] [--server <binary>] [--suites <a,b>] [--headed] [--self-check]`);
+  console.error(`${problem}\nusage: node run.mjs [--browser chromium|firefox|webkit] [--executable <path>] [--server <binary>] [--suites <a,b>] [--headed] [--self-check]`);
   process.exit(2);
 }
 
@@ -73,15 +85,20 @@ async function run() {
   let browser = null;
   let failed = false;
   try {
-    browser = await playwright[options.browser].launch({ headless: !options.headed });
+    const executablePath = options.executable ?? undefined;
+    browser = await playwright[options.browser].launch({ headless: !options.headed, executablePath });
     console.log(`${options.browser} ${browser.version()}, test server at ${server.url}`);
     const runId = randomBytes(8).toString('hex');
-    const pages = options.suites === null
+    const quotaPage = { query: `?suites=quota&run=${runId}`, quota: QUOTA_BYTES };
+    let pages = options.suites === null
       ? [{ query: `?run=${runId}` }, { query: `?suites=isolation&run=${runId}` }]
       : [{ query: `?suites=${encodeURIComponent(options.suites)}&run=${runId}` }];
+    if (options.suites === 'quota') {
+      pages = [quotaPage];
+    }
     // The quota of an origin can be set only through CDP, which only Chromium has.
     if (options.suites === null && options.browser === 'chromium') {
-      pages.push({ query: `?suites=quota&run=${runId}`, quota: QUOTA_BYTES });
+      pages.push(quotaPage);
     } else if (options.suites === null) {
       console.log(`quota: not run in ${options.browser}, which has no CDP to set the quota of the origin`);
     }
@@ -119,7 +136,12 @@ async function run() {
 async function runPage(context, url, quota) {
   const log = [];
   const watch = (page, name) => {
-    page.on('console', (message) => log.push(`[${name}] ${message.type()}: ${message.text()}`));
+    page.on('console', (message) => {
+      log.push(`[${name}] ${message.type()}: ${message.text()}`);
+      if (message.text().startsWith(NOTE)) {
+        console.log(`note (${name}): ${message.text().slice(NOTE.length)}`);
+      }
+    });
     page.on('pageerror', (error) => log.push(`[${name}] uncaught: ${error.message}`));
     page.on('crash', () => log.push(`[${name}] crashed`));
   };
@@ -247,6 +269,9 @@ async function selfCheck() {
   let failed = false;
   for (const { suite, failure } of checks) {
     const args = [fileURLToPath(import.meta.url), '--browser', options.browser, '--server', options.server, '--suites', suite];
+    if (options.executable !== null) {
+      args.push('--executable', options.executable);
+    }
     const child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let output = '';
     child.stdout.on('data', (chunk) => { output += chunk; });

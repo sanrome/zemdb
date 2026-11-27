@@ -193,8 +193,9 @@ impl Short {
     }
 }
 
-/// A read that gives fewer bytes than asked is repeated until it has them all; one past the end
-/// is `UnexpectedEof`, never fewer bytes; and an error of a read is the error.
+/// A read that gives fewer bytes than asked is repeated until it has them all; one that ends past
+/// the size of the file is `UnexpectedEof` before it reserves or reads anything, and so is one
+/// whose file ends before its size; and an error of a read is the error.
 #[test]
 fn a_read_repeats_until_it_has_every_byte_or_the_file_ends() {
     let mut file = Short {
@@ -203,21 +204,50 @@ fn a_read_repeats_until_it_has_every_byte_or_the_file_ends() {
         calls: 0,
     };
     let mut read = |buf: &mut [u8], at| file.read(buf, at);
-    assert_eq!(read_exact(1, 8, &mut read).unwrap(), b"12345678");
-    assert_eq!(read_exact(0, 10, &mut read).unwrap(), b"0123456789");
-    assert_eq!(read_exact(10, 0, &mut read).unwrap(), b"");
-    for (offset, len) in [(6, 5), (12, 1)] {
-        let err = read_exact(offset, len, &mut read).unwrap_err();
+    assert_eq!(read_exact(1, 8, 10, &mut read).unwrap(), b"12345678");
+    assert_eq!(read_exact(0, 10, 10, &mut read).unwrap(), b"0123456789");
+    assert_eq!(read_exact(10, 0, 10, &mut read).unwrap(), b"");
+    // Past the end, as far as the largest length or offset: nothing is reserved or read.
+    for (offset, len) in [(6, 5), (12, 1), (0, usize::MAX), (u64::MAX, 2)] {
+        let err = read_exact(offset, len, 10, &mut read).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{offset} {len}");
     }
-    assert_eq!(file.calls, 3 + 4 + 3 + 1);
+    // A file that ends before the size it had.
+    let err = read_exact(8, 4, 12, &mut read).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    assert_eq!(file.calls, 3 + 4 + 2);
     let failing = |_: &mut [u8], _| Err(io::Error::from(io::ErrorKind::StorageFull));
-    let err = read_exact(0, 1, failing).unwrap_err();
+    let err = read_exact(0, 1, 1, failing).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::StorageFull);
 }
 
+/// A count larger than what was asked, as Chromium 153 gives for a write over the quota, is an
+/// error with the count, never a read or a write done.
+#[test]
+fn a_count_larger_than_what_was_asked_is_an_error() {
+    let mut calls = 0;
+    let says_more = |bytes: &[u8], _| {
+        calls += 1;
+        Ok(if calls == 1 {
+            2
+        } else {
+            bytes.len() + 4_294_967_288
+        })
+    };
+    let err = write_all(0, b"abcde", says_more).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::Other);
+    assert!(err.to_string().contains("4294967291 bytes for 3"), "{err}");
+    assert_eq!(calls, 2);
+    let says_more = |buf: &mut [u8], _| Ok(buf.len() + 1);
+    let err = read_exact(0, 4, 10, says_more).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::Other);
+    assert!(err.to_string().contains("5 bytes for 4"), "{err}");
+}
+
 /// A write that writes fewer bytes than given is repeated until it wrote them all, and one that
-/// writes none is `WriteZero`; an error of a write is the error.
+/// writes none is `WriteZero`; one that would end past 2^53, where the offsets of the browser
+/// are no longer exact, is refused before anything is written; and an error of a write is the
+/// error.
 #[test]
 fn a_write_repeats_until_it_wrote_every_byte() {
     let mut file = Short {
@@ -239,6 +269,18 @@ fn a_write_repeats_until_it_wrote_every_byte() {
     let failing = |_: &[u8], _| Err(io::Error::from(io::ErrorKind::StorageFull));
     let err = write_all(0, b"a", failing).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::StorageFull);
+
+    let mut at_offsets = Vec::new();
+    let mut last = |bytes: &[u8], at| {
+        at_offsets.push(at);
+        Ok(bytes.len())
+    };
+    write_all(MAX_END - 1, b"z", &mut last).unwrap();
+    for (offset, bytes) in [(MAX_END - 1, &b"zz"[..]), (MAX_END, b"z"), (u64::MAX, b"z")] {
+        let err = write_all(offset, bytes, &mut last).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{offset}");
+    }
+    assert_eq!(at_offsets, [MAX_END - 1]);
 }
 
 #[test]

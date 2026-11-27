@@ -144,47 +144,76 @@ pub(crate) fn opened(generations: &[u64], name: &str, how: Opening) -> io::Resul
     }
 }
 
-/// Reads `len` bytes at `offset` with `read`, which reads into a buffer at an offset and gives how
-/// many bytes it read, none at the end of the file: it repeats a read that gives fewer, until it
-/// has them all, and is [`io::ErrorKind::UnexpectedEof`] if the file ends first.
+/// The end of the offsets of a file of the browser, which are numbers of JavaScript: exact up to
+/// 2^53. A write that would end past it is refused.
+pub(crate) const MAX_END: u64 = 1 << 53;
+
+/// Reads `len` bytes at `offset` of a file of `size` bytes with `read`, which reads into a buffer
+/// at an offset and gives how many bytes it read, none at the end of the file. A read that ends
+/// past `size` is [`io::ErrorKind::UnexpectedEof`] before anything is reserved or read; one that
+/// gives fewer bytes than asked is repeated until it has them all, and if the file ends first, is
+/// `UnexpectedEof` too. A count larger than what was asked is an error: the browser did not read
+/// what it says.
 pub(crate) fn read_exact(
     offset: u64,
     len: usize,
+    size: u64,
     mut read: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
 ) -> io::Result<Vec<u8>> {
+    if (offset.checked_add(len as u64)).is_none_or(|end| end > size) {
+        let message = format!("read: {len} bytes from {offset} end past the file, of {size}");
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, message));
+    }
     let mut bytes = vec![0; len];
     let mut done = 0;
     while done < len {
-        match read(&mut bytes[done..], offset.saturating_add(done as u64))? {
+        match read(&mut bytes[done..], offset + done as u64)? {
             0 => {
                 let message = format!("read: the file ends at {done} of {len} bytes from {offset}");
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, message));
             }
-            read => done += read.min(len - done),
+            read if read > len - done => return Err(miscounted("read", read, len - done)),
+            read => done += read,
         }
     }
     Ok(bytes)
 }
 
 /// Writes `bytes` at `offset` with `write`, which writes a buffer at an offset and gives how many
-/// bytes it wrote: it repeats a write that writes fewer, and is [`io::ErrorKind::WriteZero`] if
-/// one writes none.
+/// bytes it wrote. A write that would end past [`MAX_END`] is
+/// [`io::ErrorKind::InvalidInput`], before anything is written; one that writes fewer bytes than
+/// given is repeated, and one that writes none is [`io::ErrorKind::WriteZero`]. A count larger
+/// than what was given is an error: the browser did not write what it says.
 pub(crate) fn write_all(
     offset: u64,
     bytes: &[u8],
     mut write: impl FnMut(&[u8], u64) -> io::Result<usize>,
 ) -> io::Result<()> {
+    if (offset.checked_add(bytes.len() as u64)).is_none_or(|end| end > MAX_END) {
+        let message = format!("write: {} bytes at {offset} end past 2^53", bytes.len());
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+    }
     let mut done = 0;
     while done < bytes.len() {
-        match write(&bytes[done..], offset.saturating_add(done as u64))? {
+        let rest = bytes.len() - done;
+        match write(&bytes[done..], offset + done as u64)? {
             0 => {
                 let message = format!("write: wrote {done} of {} bytes", bytes.len());
                 return Err(io::Error::new(io::ErrorKind::WriteZero, message));
             }
-            written => done += written.min(bytes.len() - done),
+            written if written > rest => return Err(miscounted("write", written, rest)),
+            written => done += written,
         }
     }
     Ok(())
+}
+
+/// The error of a `what` (a read or a write) of `asked` bytes for which the browser gave a count
+/// of `count`, more than asked: it did not do what it says. Chromium 153 gives one for a write
+/// over the quota, instead of a `QuotaExceededError`.
+fn miscounted(what: &str, count: usize, asked: usize) -> io::Error {
+    let message = format!("{what}: the browser says {count} bytes for {asked}, more than asked");
+    io::Error::other(message)
 }
 
 /// The names of `entries` that start with `prefix`, without the suffix of their generation: each
