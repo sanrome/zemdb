@@ -149,8 +149,9 @@ pub(crate) fn opened(generations: &[u64], name: &str, how: Opening) -> io::Resul
 pub(crate) const MAX_END: u64 = 1 << 53;
 
 /// Reads `len` bytes at `offset` of a file of `size` bytes with `read`, which reads into a buffer
-/// at an offset and gives how many bytes it read, none at the end of the file. A read that ends
-/// past `size` is [`io::ErrorKind::UnexpectedEof`] before anything is reserved or read; one that
+/// at an offset and gives how many bytes it read, none at the end of the file. A read of no bytes
+/// gives none, wherever it is, as on the file system of the process. A read that ends past
+/// `size` is [`io::ErrorKind::UnexpectedEof`] before anything is reserved or read; one that
 /// gives fewer bytes than asked is repeated until it has them all, and if the file ends first, is
 /// `UnexpectedEof` too. A count larger than what was asked is an error: the browser did not read
 /// what it says.
@@ -160,6 +161,9 @@ pub(crate) fn read_exact(
     size: u64,
     mut read: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
 ) -> io::Result<Vec<u8>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
     if (offset.checked_add(len as u64)).is_none_or(|end| end > size) {
         let message = format!("read: {len} bytes from {offset} end past the file, of {size}");
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, message));

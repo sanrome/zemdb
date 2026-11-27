@@ -236,6 +236,30 @@ async fn a_move_that_fails_reopens_the_file_where_it_was() {
     assert_eq!(holds(&dir, "k").await, b"k0");
 }
 
+/// A move to another directory that fails reopens the file where it was, which it finds in the
+/// listing of the directory of the file, not of the destination.
+#[wasm_bindgen_test]
+async fn a_move_to_another_directory_that_fails_reopens_the_file_where_it_was() {
+    let dir = fresh("move-fails-elsewhere").await;
+    OpfsFiles.create_dir_all(&dir.join("sub")).await.unwrap();
+    let mut file = OpfsFiles
+        .open_locked(&dir.join("i"))
+        .await
+        .unwrap()
+        .unwrap();
+    file.write_at(0, b"i0".to_vec()).await.unwrap();
+    let held = Held::default();
+    arm("rename.closed", "i", hold(&dir, "i", &held));
+    let release = Rc::clone(&held);
+    arm("rename.moved", "j", async move { let_go(&release) });
+    let err = file.rename(&dir.join("sub").join("j")).await.unwrap_err();
+    assert!(FileTaken::is(&err), "{err}");
+    file.write_at(2, b"!".to_vec()).await.unwrap();
+    assert_eq!(file.read_at(0, 3).await.unwrap(), b"i0!");
+    assert_eq!(entries_of(&dir).await, ["i", "sub"]);
+    assert!(entries_of(&dir.join("sub")).await.is_empty());
+}
+
 /// A move and a reopening that both fail, the file taken by another handle all along: the
 /// rename fails with the error of the reopening, which is not the error of a taken file (the
 /// file did not stay as it was: it is closed), and the file is dead.

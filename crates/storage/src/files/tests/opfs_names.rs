@@ -206,7 +206,14 @@ fn a_read_repeats_until_it_has_every_byte_or_the_file_ends() {
     let mut read = |buf: &mut [u8], at| file.read(buf, at);
     assert_eq!(read_exact(1, 8, 10, &mut read).unwrap(), b"12345678");
     assert_eq!(read_exact(0, 10, 10, &mut read).unwrap(), b"0123456789");
-    assert_eq!(read_exact(10, 0, 10, &mut read).unwrap(), b"");
+    // No bytes are none, wherever they are, as `read_exact_at` gives them natively.
+    for offset in [10, 12, u64::MAX] {
+        assert_eq!(
+            read_exact(offset, 0, 10, &mut read).unwrap(),
+            b"",
+            "{offset}"
+        );
+    }
     // Past the end, as far as the largest length or offset: nothing is reserved or read.
     for (offset, len) in [(6, 5), (12, 1), (0, usize::MAX), (u64::MAX, 2)] {
         let err = read_exact(offset, len, 10, &mut read).unwrap_err();

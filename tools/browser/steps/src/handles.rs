@@ -99,7 +99,9 @@ async fn write(run: &str) -> Result<(), JsError> {
     expect_read(&file, 5, &[0; 4091]).await?;
     expect_read(&file, 4097, b"ORLD").await?;
     expect_read(&file, 4101, b"").await?;
-    for (offset, len) in [(4099, 5), (4101, 1), (1 << 20, 1)] {
+    expect_read(&file, 1 << 20, b"").await?;
+    // Also the largest length, which the layer refuses before it reserves it.
+    for (offset, len) in [(4099, 5), (4101, 1), (1 << 20, 1), (0, usize::MAX)] {
         let what = format!("read_at({offset}, {len}), past the end");
         expect_error(
             file.read_at(offset, len).await,

@@ -522,8 +522,8 @@ impl OpfsFile {
 /// a replacement: the first one before it closes the sync access handle, so that a rename that
 /// fails there leaves the file open; then it closes it, moves the file and reopens it on the
 /// same handle of its entry, which followed it. A move that fails reopens the file where it was,
-/// if the listing still has its entry there, and otherwise leaves it closed; so does a reopening
-/// that fails, and every later operation fails.
+/// if the listing of its directory still has its entry there, and otherwise leaves it closed; so
+/// does a listing that fails, and a reopening that fails, and every later operation fails.
 async fn rename_open(open: &RefCell<Open>, to_dirs: Vec<String>, to: String) -> io::Result<()> {
     let (file, from_dirs, from, generation) = {
         let open = open.borrow();
@@ -565,17 +565,16 @@ impl RoomFile for OpfsFile {
     /// Repeats a read that gives less than asked, until the file ends.
     async fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         let read = self.call("read", |access| {
-            let size = access.get_size()? as u64;
-            Ok(opfs_names::read_exact(
-                offset,
-                len,
-                size,
-                |buf, at_offset| {
-                    let read = access.read_with_u8_array_and_options(buf, &at(at_offset));
-                    read.map(|read| read as usize)
-                        .map_err(|err| error("read", &err, &[]))
-                },
-            ))
+            let size = access.get_size();
+            Ok(size
+                .map_err(|err| error("getSize", &err, &[]))
+                .and_then(|size| {
+                    opfs_names::read_exact(offset, len, size as u64, |buf, at_offset| {
+                        let read = access.read_with_u8_array_and_options(buf, &at(at_offset));
+                        read.map(|read| read as usize)
+                            .map_err(|err| error("read", &err, &[]))
+                    })
+                }))
         });
         read.await?
     }
