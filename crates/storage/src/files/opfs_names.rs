@@ -1,5 +1,6 @@
 //! What the layer over the Origin Private File System decides without the browser: the names of
-//! a path, the generations of a name, and what each error of the browser is.
+//! a path, the generations of a name and the one that an opening opens, a read and a write that
+//! repeat until they are done, and what each error of the browser is.
 
 use std::collections::BTreeSet;
 use std::io;
@@ -10,10 +11,14 @@ use std::path::Path;
 /// `_`), and the layer refuses a path with it, so no name can be taken for a generation.
 pub(crate) const GENERATION: char = '~';
 
+/// The errors the browser gives a `createSyncAccessHandle` of a file that another handle has
+/// open: `NoModificationAllowedError` in Chromium and Firefox, and `InvalidStateError` in Safari,
+/// which gives it for nothing else.
+pub(crate) const TAKEN_BY_OPEN: &[&str] = &["NoModificationAllowedError", "InvalidStateError"];
+
 /// The errors the browser gives a `move()` of a file that another handle has open, as it gives
-/// them to `createSyncAccessHandle`: `NoModificationAllowedError` in Chromium and Firefox, and
-/// `InvalidStateError` in Safari.
-pub(crate) const TAKEN_BY_MOVE: &[&str] = &["NoModificationAllowedError", "InvalidStateError"];
+/// them to `createSyncAccessHandle`.
+pub(crate) const TAKEN_BY_MOVE: &[&str] = TAKEN_BY_OPEN;
 
 /// The error the browser gives a `removeEntry` of a file that another handle has open, in the
 /// three.
@@ -110,6 +115,78 @@ pub(crate) fn next(generations: &[u64]) -> io::Result<u64> {
     }
 }
 
+/// What an opening opens: the newest generation of its name, or the name itself if it has none.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Opening {
+    /// As found (`open_locked`).
+    Found,
+    /// Only the name itself, which must have no generation (`create_locked`).
+    New,
+    /// Emptied (`create`).
+    Emptied,
+    /// Only the newest generation, which must exist (`open_read`).
+    Existing,
+}
+
+/// The generation of `name` that `how` opens, among `generations`, its own from the oldest.
+pub(crate) fn opened(generations: &[u64], name: &str, how: Opening) -> io::Result<u64> {
+    match (generations.last(), how) {
+        (Some(_), Opening::New) => {
+            let message = format!("{name} exists");
+            Err(io::Error::new(io::ErrorKind::AlreadyExists, message))
+        }
+        (Some(&newest), _) => Ok(newest),
+        (None, Opening::Existing) => {
+            let message = format!("{name} does not exist");
+            Err(io::Error::new(io::ErrorKind::NotFound, message))
+        }
+        (None, _) => Ok(0),
+    }
+}
+
+/// Reads `len` bytes at `offset` with `read`, which reads into a buffer at an offset and gives how
+/// many bytes it read, none at the end of the file: it repeats a read that gives fewer, until it
+/// has them all, and is [`io::ErrorKind::UnexpectedEof`] if the file ends first.
+pub(crate) fn read_exact(
+    offset: u64,
+    len: usize,
+    mut read: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
+) -> io::Result<Vec<u8>> {
+    let mut bytes = vec![0; len];
+    let mut done = 0;
+    while done < len {
+        match read(&mut bytes[done..], offset.saturating_add(done as u64))? {
+            0 => {
+                let message = format!("read: the file ends at {done} of {len} bytes from {offset}");
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, message));
+            }
+            read => done += read.min(len - done),
+        }
+    }
+    Ok(bytes)
+}
+
+/// Writes `bytes` at `offset` with `write`, which writes a buffer at an offset and gives how many
+/// bytes it wrote: it repeats a write that writes fewer, and is [`io::ErrorKind::WriteZero`] if
+/// one writes none.
+pub(crate) fn write_all(
+    offset: u64,
+    bytes: &[u8],
+    mut write: impl FnMut(&[u8], u64) -> io::Result<usize>,
+) -> io::Result<()> {
+    let mut done = 0;
+    while done < bytes.len() {
+        match write(&bytes[done..], offset.saturating_add(done as u64))? {
+            0 => {
+                let message = format!("write: wrote {done} of {} bytes", bytes.len());
+                return Err(io::Error::new(io::ErrorKind::WriteZero, message));
+            }
+            written => done += written.min(bytes.len() - done),
+        }
+    }
+    Ok(())
+}
+
 /// The names of `entries` that start with `prefix`, without the suffix of their generation: each
 /// once, in order.
 pub(crate) fn names<'a>(entries: &'a [String], prefix: &str) -> BTreeSet<&'a str> {
@@ -132,6 +209,6 @@ pub(crate) fn error_kind(name: &str) -> io::ErrorKind {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "tests/opfs_names.rs"]
 mod tests;

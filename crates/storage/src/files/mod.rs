@@ -159,6 +159,6 @@ impl fmt::Display for FileTaken {
 
 impl std::error::Error for FileTaken {}
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "../tests/files.rs"]
 mod tests;

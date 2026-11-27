@@ -146,6 +146,101 @@ fn a_listing_gives_each_name_once_without_its_generations() {
     assert_eq!(super::names(&entries, "").len(), 4);
 }
 
+/// Each opening opens the newest generation of its name, or the name itself if it has none;
+/// `create_locked` only a name with none, and `open_read` only one with some.
+#[test]
+fn an_opening_opens_the_newest_generation_or_the_name_itself() {
+    for how in [Opening::Found, Opening::Emptied] {
+        assert_eq!(opened(&[], "a", how).unwrap(), 0, "{how:?}");
+        assert_eq!(opened(&[0, 3, 7], "a", how).unwrap(), 7, "{how:?}");
+    }
+    assert_eq!(opened(&[], "a", Opening::New).unwrap(), 0);
+    for generations in [&[0][..], &[2], &[0, 1]] {
+        let err = opened(generations, "a", Opening::New).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists, "{generations:?}");
+    }
+    assert_eq!(opened(&[1, 4], "a", Opening::Existing).unwrap(), 4);
+    let err = opened(&[], "a", Opening::Existing).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+}
+
+/// A file of `contents` read or written at most `step` bytes at a time, as a sync access handle
+/// may do, which reads nothing past its end and grows as it is written.
+struct Short {
+    contents: Vec<u8>,
+    step: usize,
+    calls: usize,
+}
+
+impl Short {
+    fn read(&mut self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.calls += 1;
+        let start = (offset as usize).min(self.contents.len());
+        let n = buf.len().min(self.step).min(self.contents.len() - start);
+        buf[..n].copy_from_slice(&self.contents[start..start + n]);
+        Ok(n)
+    }
+
+    fn write(&mut self, bytes: &[u8], offset: u64) -> io::Result<usize> {
+        self.calls += 1;
+        let n = bytes.len().min(self.step);
+        let end = offset as usize + n;
+        if self.contents.len() < end {
+            self.contents.resize(end, 0);
+        }
+        self.contents[offset as usize..end].copy_from_slice(&bytes[..n]);
+        Ok(n)
+    }
+}
+
+/// A read that gives fewer bytes than asked is repeated until it has them all; one past the end
+/// is `UnexpectedEof`, never fewer bytes; and an error of a read is the error.
+#[test]
+fn a_read_repeats_until_it_has_every_byte_or_the_file_ends() {
+    let mut file = Short {
+        contents: b"0123456789".to_vec(),
+        step: 3,
+        calls: 0,
+    };
+    let mut read = |buf: &mut [u8], at| file.read(buf, at);
+    assert_eq!(read_exact(1, 8, &mut read).unwrap(), b"12345678");
+    assert_eq!(read_exact(0, 10, &mut read).unwrap(), b"0123456789");
+    assert_eq!(read_exact(10, 0, &mut read).unwrap(), b"");
+    for (offset, len) in [(6, 5), (12, 1)] {
+        let err = read_exact(offset, len, &mut read).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{offset} {len}");
+    }
+    assert_eq!(file.calls, 3 + 4 + 3 + 1);
+    let failing = |_: &mut [u8], _| Err(io::Error::from(io::ErrorKind::StorageFull));
+    let err = read_exact(0, 1, failing).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::StorageFull);
+}
+
+/// A write that writes fewer bytes than given is repeated until it wrote them all, and one that
+/// writes none is `WriteZero`; an error of a write is the error.
+#[test]
+fn a_write_repeats_until_it_wrote_every_byte() {
+    let mut file = Short {
+        contents: b"abc".to_vec(),
+        step: 2,
+        calls: 0,
+    };
+    write_all(1, b"XYZW", |bytes, at| file.write(bytes, at)).unwrap();
+    assert_eq!(file.contents, b"aXYZW");
+    assert_eq!(file.calls, 2);
+    let mut calls = 0;
+    let stuck = |bytes: &[u8], _| {
+        calls += 1;
+        Ok(if calls == 1 { bytes.len().min(2) } else { 0 })
+    };
+    let err = write_all(0, b"abcde", stuck).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::WriteZero);
+    assert_eq!(calls, 2);
+    let failing = |_: &[u8], _| Err(io::Error::from(io::ErrorKind::StorageFull));
+    let err = write_all(0, b"a", failing).unwrap_err();
+    assert_eq!(err.kind(), io::ErrorKind::StorageFull);
+}
+
 #[test]
 fn each_error_of_the_browser_has_its_kind() {
     assert_eq!(error_kind("NotFoundError"), io::ErrorKind::NotFound);
@@ -172,9 +267,10 @@ fn each_error_of_the_browser_has_its_kind() {
 #[test]
 fn a_taken_file_is_the_error_that_each_browser_gives_it() {
     assert_eq!(
-        TAKEN_BY_MOVE,
+        TAKEN_BY_OPEN,
         ["NoModificationAllowedError", "InvalidStateError"]
     );
+    assert_eq!(TAKEN_BY_MOVE, TAKEN_BY_OPEN);
     assert_eq!(TAKEN_BY_REMOVE, ["NoModificationAllowedError"]);
 }
 

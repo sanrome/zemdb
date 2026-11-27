@@ -4,8 +4,9 @@
 //   node run.mjs [--browser chromium|firefox|webkit] [--server <binary>] [--suites <a,b>] [--headed]
 //   node run.mjs --self-check [--browser ...] [--server ...]
 //
-// Without --suites it runs the default suites of the page, and then the suite `isolation` in
-// another context of the browser, with the same run id. --self-check checks the runner itself:
+// Without --suites it runs the default suites of the page, then the suite `isolation` in
+// another context of the browser, with the same run id, and in Chromium the suite `quota` in a
+// third context, whose quota it makes small through CDP. --self-check checks the runner itself:
 // a run of each of the suites `fails`, `fails_in_peer` and `panics`, whose step fails or panics
 // on purpose, has to fail, naming the step and giving its error.
 import { spawn } from 'node:child_process';
@@ -21,6 +22,8 @@ const PAGE_TIMEOUT_MS = 180_000;
 const SERVER_START_TIMEOUT_MS = 30_000;
 // The test server closes its connections within 5 s, and then shuts its rooms down.
 const SERVER_STOP_TIMEOUT_MS = 15_000;
+// The quota of the origin for the suite `quota`, whose step writes over it.
+const QUOTA_BYTES = 4 * 1024 * 1024;
 
 const options = parseArgs(process.argv.slice(2));
 process.exitCode = options.selfCheck ? await selfCheck() : await run();
@@ -74,12 +77,19 @@ async function run() {
     console.log(`${options.browser} ${browser.version()}, test server at ${server.url}`);
     const runId = randomBytes(8).toString('hex');
     const pages = options.suites === null
-      ? [`?run=${runId}`, `?suites=isolation&run=${runId}`]
-      : [`?suites=${encodeURIComponent(options.suites)}&run=${runId}`];
-    for (const query of pages) {
-      // A context of its own for each page: the second default one checks the isolation.
+      ? [{ query: `?run=${runId}` }, { query: `?suites=isolation&run=${runId}` }]
+      : [{ query: `?suites=${encodeURIComponent(options.suites)}&run=${runId}` }];
+    // The quota of an origin can be set only through CDP, which only Chromium has.
+    if (options.suites === null && options.browser === 'chromium') {
+      pages.push({ query: `?suites=quota&run=${runId}`, quota: QUOTA_BYTES });
+    } else if (options.suites === null) {
+      console.log(`quota: not run in ${options.browser}, which has no CDP to set the quota of the origin`);
+    }
+    for (const { query, quota } of pages) {
+      // A context of its own for each page: the second default one checks the isolation, and
+      // the third has a small quota.
       const context = await browser.newContext();
-      const result = await runPage(context, `${server.url}${query}`);
+      const result = await runPage(context, `${server.url}${query}`, quota);
       await context.close();
       // The isolation is checked with the run id of the URL: a page that took another one would
       // look for the files of another run.
@@ -104,8 +114,9 @@ async function run() {
 }
 
 // Opens `url` and waits for its result, across the reloads of the page. The console of the
-// page, of its Worker and of the second page is printed if the run fails.
-async function runPage(context, url) {
+// page, of its Worker and of the second page is printed if the run fails. With `quota`, the
+// quota of the origin in the context is that many bytes, set through CDP before the page opens.
+async function runPage(context, url, quota) {
   const log = [];
   const watch = (page, name) => {
     page.on('console', (message) => log.push(`[${name}] ${message.type()}: ${message.text()}`));
@@ -118,6 +129,10 @@ async function runPage(context, url) {
     pages += 1;
   });
   const page = await context.newPage();
+  if (quota !== undefined) {
+    const cdp = await context.newCDPSession(page);
+    await cdp.send('Storage.overrideQuotaForOrigin', { origin: new URL(url).origin, quotaSize: quota });
+  }
   await page.goto(url);
   const deadline = Date.now() + PAGE_TIMEOUT_MS;
   for (;;) {
