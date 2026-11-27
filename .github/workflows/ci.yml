@@ -54,6 +54,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p zemdb-core -p zemdb-storage -p zemdb-client --target wasm32-unknown-unknown
       - run: cargo clippy -p zemdb-core -p zemdb-storage -p zemdb-client --target wasm32-unknown-unknown -- -D warnings
+      # The unit tests of the storage in wasm32, which the browser job runs (its integration
+      # tests are native only).
+      - run: cargo clippy -p zemdb-storage --target wasm32-unknown-unknown --lib --profile test -- -D warnings
 
   browser:
     name: Browser (Chromium and Firefox)
@@ -97,8 +100,12 @@ jobs:
       - run: node run.mjs --self-check
       - run: node run.mjs --browser firefox
       - run: node run.mjs --browser firefox --self-check
-      # The unit tests in wasm32, in a dedicated Worker of the Chrome of the runner.
+      # The unit tests in wasm32, in a dedicated Worker of the Chrome of the runner: those of the
+      # harness, and from the root those of the storage (its layer over the OPFS), with the
+      # wasm-bindgen-test-runner installed above, which .cargo/config.toml names.
       - run: CHROMEDRIVER="$CHROMEWEBDRIVER/chromedriver" cargo test -p zemdb-browser-steps --target wasm32-unknown-unknown
+      - run: CHROMEDRIVER="$CHROMEWEBDRIVER/chromedriver" cargo test --target wasm32-unknown-unknown -p zemdb-storage --lib
+        working-directory: .
 
   docs:
     name: Docs

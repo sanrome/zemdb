@@ -146,6 +146,6 @@ pub(crate) fn constraint_key(row: &CompactRow, columns: &[usize]) -> Option<Prim
         .then(|| PrimaryKey::composite(columns.iter().filter_map(value).cloned()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "tests/index.rs"]
 pub(crate) mod tests;

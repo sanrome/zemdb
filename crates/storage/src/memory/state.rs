@@ -177,7 +177,7 @@ impl RoomData {
         &self.tables
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) fn indexes(&self) -> &HashMap<u16, TableIndexes> {
         &self.indexes
     }
@@ -609,6 +609,6 @@ pub(crate) fn decode_received_snapshot(
     Ok((payload.head_seq, data))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "tests/state.rs"]
 mod tests;
