@@ -9,6 +9,7 @@
 #![cfg(target_arch = "wasm32")]
 
 mod files;
+mod handles;
 mod js;
 mod opfs;
 mod reload;

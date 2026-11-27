@@ -37,7 +37,11 @@ js-sys = "0.3.106"
 web-sys = { version = "0.3.106", features = [
     "DomException",
     "FileSystemDirectoryHandle",
+    "FileSystemFileHandle",
     "FileSystemGetDirectoryOptions",
+    "FileSystemGetFileOptions",
+    "FileSystemReadWriteOptions",
+    "FileSystemSyncAccessHandle",
     "StorageManager",
     "WorkerGlobalScope",
     "WorkerNavigator",
@@ -47,3 +51,9 @@ web-sys = { version = "0.3.106", features = [
 tempfile = { workspace = true }
 # The unit tests check the WebAssembly Zstandard codec natively, against `zstd`.
 ruzstd = { workspace = true }
+
+# The unit tests in wasm32 (`cargo test --target wasm32-unknown-unknown --lib`), which run in a
+# dedicated Worker of a browser with the `wasm-bindgen-test-runner` of `.cargo/config.toml`: the
+# version of the lock of the browser harness.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3.79"

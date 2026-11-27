@@ -14,31 +14,38 @@
 //! the name itself, and after its first replacement the name followed by `~` and a number that
 //! grows (`room_a.wal~1`, `room_a.wal~2`). A name holds what its newest generation holds, and it
 //! exists if any of them does. A replacement never moves a file onto an existing entry, which
-//! Firefox does not do atomically if the browser is cut in the middle: [`RoomFiles::rename`]
-//! moves the newest generation of the source to the next generation of the destination, always
-//! a free entry. Each operation lists the directory to find the generations of its names,
-//! comparing names exactly.
+//! Firefox does not do atomically if the browser is cut in the middle: [`RoomFiles::rename`], and
+//! the rename of an open file ([`RoomFile::rename`]), move the file to the next generation of the
+//! destination, always a free entry. Each operation lists the directory to find the generations
+//! of its names, comparing names exactly, and an opening opens the newest generation of its name.
 //!
 //! **An operation dropped by its caller.** A promise of the OPFS goes on in the browser even if
-//! the future that awaits it is dropped, so every operation runs in a task of its own, with all
-//! its steps, until it ends. The operations of the layer run one at a time, across every
-//! [`OpfsFiles`] of the Worker: the next one waits for the one its caller dropped.
+//! the future that awaits it is dropped, so every operation that awaits one (those of the
+//! directory, the openings and the rename of an open file) runs in a task of its own, with all its
+//! steps, until it ends. Those operations run one at a time, across every [`OpfsFiles`] and
+//! [`OpfsFile`] of the Worker: the next one waits for the one its caller dropped. The other
+//! operations of a file are synchronous calls of its `FileSystemSyncAccessHandle`, which end in
+//! the same call.
 
-use super::opfs_names::{self, entry, TAKEN_BY_MOVE, TAKEN_BY_REMOVE};
+use super::opfs_names::{self, entry, Opening, TAKEN_BY_MOVE, TAKEN_BY_OPEN, TAKEN_BY_REMOVE};
 use super::{FileTaken, RoomFile, RoomFiles};
 use crate::sys;
 use async_trait::async_trait;
 use js_sys::{IteratorNext, Promise};
-use std::convert::Infallible;
+use std::cell::RefCell;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
-use tokio::sync::Mutex;
+use std::rc::Rc;
+use std::sync::Arc;
+use tokio::sync::{oneshot, Mutex};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    DomException, FileSystemDirectoryHandle, FileSystemGetDirectoryOptions, WorkerGlobalScope,
+    DomException, FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetDirectoryOptions,
+    FileSystemGetFileOptions, FileSystemReadWriteOptions, FileSystemSyncAccessHandle,
+    WorkerGlobalScope,
 };
 
 #[wasm_bindgen]
@@ -56,21 +63,20 @@ extern "C" {
     ) -> Result<Promise, JsValue>;
 }
 
-/// The turn of the operations of the layer, in every [`OpfsFiles`] of the Worker: an operation
-/// holds it from its start to its end.
+/// The turn of the operations of the layer that await promises, in every [`OpfsFiles`] and
+/// [`OpfsFile`] of the Worker: an operation holds it from its start to its end. It is the last
+/// lock an operation takes, and nothing that holds it waits for another operation of the layer.
 static TURN: Mutex<()> = Mutex::const_new(());
 
 /// The Origin Private File System of the origin, from a dedicated Worker.
-///
-/// It does not open files yet: [`RoomFiles::open_locked`], [`RoomFiles::create_locked`],
-/// [`RoomFiles::create`] and [`RoomFiles::open_read`] fail with
-/// [`io::ErrorKind::Unsupported`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OpfsFiles;
 
 /// Runs `operation` in a task of its own once the operations before it ended, and gives its
 /// result. The task holds the turn until the operation ends, even if its caller stops waiting;
-/// an operation whose caller stopped waiting before its turn never runs.
+/// an operation whose caller stopped waiting before its turn never runs. A result that nobody
+/// waits for any more is dropped as the task ends, before the next operation runs: an opening
+/// that its caller dropped closes its file before then.
 async fn run<T: 'static>(
     operation: impl Future<Output = io::Result<T>> + 'static,
 ) -> io::Result<T> {
@@ -130,6 +136,21 @@ async fn directory(names: &[String], create: bool) -> io::Result<FileSystemDirec
     Ok(dir)
 }
 
+/// The directories of the names `from` and `to`, with one handle when they are the same, so
+/// that a missing one fails a rename before anything is touched.
+async fn directories(
+    from: &[String],
+    to: &[String],
+) -> io::Result<(FileSystemDirectoryHandle, FileSystemDirectoryHandle)> {
+    let from_dir = directory(from, false).await?;
+    let to_dir = if to == from {
+        from_dir.clone()
+    } else {
+        directory(to, false).await?
+    };
+    Ok((from_dir, to_dir))
+}
+
 /// The names of the entries of `dir`.
 async fn entries(dir: &FileSystemDirectoryHandle) -> io::Result<Vec<String>> {
     let keys = dir.keys();
@@ -154,6 +175,31 @@ async fn generations(dir: &FileSystemDirectoryHandle, name: &str) -> io::Result<
     ))
 }
 
+/// The handle of the entry `entry` of `dir`, created if missing when `create`.
+async fn file_handle(
+    dir: &FileSystemDirectoryHandle,
+    entry: &str,
+    create: bool,
+) -> io::Result<FileSystemFileHandle> {
+    let options = FileSystemGetFileOptions::new();
+    options.set_create(create);
+    let what = format!("getFileHandle({entry})");
+    let file = dir.get_file_handle_with_options(entry, &options);
+    Ok(wait(&what, file, &[]).await?.unchecked_into())
+}
+
+/// A sync access handle on `file`, the entry `entry`: the error of a taken file if another one
+/// has it and `taken` names the error of the browser.
+async fn access(
+    file: &FileSystemFileHandle,
+    entry: &str,
+    taken: &[&str],
+) -> io::Result<FileSystemSyncAccessHandle> {
+    let what = format!("createSyncAccessHandle({entry})");
+    let access = file.create_sync_access_handle();
+    Ok(wait(&what, access, taken).await?.unchecked_into())
+}
+
 async fn remove_entry(dir: &FileSystemDirectoryHandle, entry: &str) -> io::Result<()> {
     let what = format!("removeEntry({entry})");
     wait(&what, dir.remove_entry(entry), TAKEN_BY_REMOVE)
@@ -165,29 +211,134 @@ fn missing(name: &str) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("{name} does not exist"))
 }
 
-fn unsupported(path: &Path) -> io::Error {
-    let message = format!("the OPFS layer does not open {path:?}: it opens no file yet");
-    io::Error::new(io::ErrorKind::Unsupported, message)
+/// What a replacement moves, once its first step is done: `source`, an entry of the source, to
+/// `target`, the entry of the generation `generation` of the destination, free, whose older
+/// generations are `replaced`.
+struct Replacement {
+    source: String,
+    target: String,
+    generation: u64,
+    replaced: Vec<u64>,
+}
+
+/// The first step of the replacement of `to`, in `to_dir`, with `from`, in `from_dir`: removes
+/// the generations of `from` other than `moved` (its newest, if `None`), and fails if it cannot,
+/// with the value of no name changed; then finds the next generation of `to`.
+async fn replace_first(
+    from_dir: &FileSystemDirectoryHandle,
+    from: &str,
+    moved: Option<u64>,
+    to_dir: &FileSystemDirectoryHandle,
+    to: &str,
+) -> io::Result<Replacement> {
+    let mut old = generations(from_dir, from).await?;
+    let moved = match moved {
+        Some(moved) => moved,
+        None => *old.last().ok_or_else(|| missing(from))?,
+    };
+    old.retain(|&generation| generation != moved);
+    for generation in old {
+        remove_entry(from_dir, &entry(from, generation)).await?;
+    }
+    let replaced = generations(to_dir, to).await?;
+    let generation = opfs_names::next(&replaced)?;
+    let (source, target) = (entry(from, moved), entry(to, generation));
+    Ok(Replacement {
+        source,
+        target,
+        generation,
+        replaced,
+    })
+}
+
+/// The second step: moves `file`, the source of `replacement`, to its target in `to_dir`.
+async fn move_entry(
+    file: &FileSystemFileHandle,
+    to_dir: &FileSystemDirectoryHandle,
+    replacement: &Replacement,
+) -> io::Result<()> {
+    let target = &replacement.target;
+    let what = format!("move({}, {target})", replacement.source);
+    let file: &MovableFile = file.unchecked_ref();
+    let moved = file
+        .move_to(to_dir, target)
+        .map_err(|err| error(&what, &err, TAKEN_BY_MOVE))?;
+    wait(&what, moved, TAKEN_BY_MOVE).await.map(drop)
+}
+
+/// The last step: removes the old generations of `to`, without failing if it cannot: one left
+/// over changes no value, and the next replacement or removal of its name removes it.
+async fn replace_last(to_dir: &FileSystemDirectoryHandle, to: &str, replaced: Vec<u64>) {
+    for generation in replaced {
+        if let Err(err) = remove_entry(to_dir, &entry(to, generation)).await {
+            tracing::debug!(%err, "an old generation stays until its name is replaced");
+        }
+    }
+}
+
+/// The file `name` of the directory of `dirs`, opened as `how` says. Another handle on the file
+/// is the error of a taken file.
+async fn open_newest(dirs: Vec<String>, name: String, how: Opening) -> io::Result<OpfsFile> {
+    let dir = directory(&dirs, false).await?;
+    let generation = opfs_names::opened(&generations(&dir, &name).await?, &name, how)?;
+    let entry = entry(&name, generation);
+    let file = file_handle(&dir, &entry, how != Opening::Existing).await?;
+    point("open", &entry).await;
+    let access = access(&file, &entry, TAKEN_BY_OPEN).await?;
+    let open = Open {
+        file,
+        access: Some(access),
+        dirs,
+        name,
+        generation,
+        unseen: None,
+    };
+    let file = OpfsFile {
+        permit: Arc::default(),
+        open: Rc::new(RefCell::new(open)),
+    };
+    if how == Opening::Emptied {
+        let emptied = file.open.borrow_mut().access()?.truncate_with_f64(0.0);
+        emptied.map_err(|err| error("truncate", &err, &[]))?;
+    }
+    Ok(file)
+}
+
+/// `None` for the error of a taken file, which another handle has.
+fn unless_taken(opened: io::Result<OpfsFile>) -> io::Result<Option<OpfsFile>> {
+    match opened {
+        Err(err) if FileTaken::is(&err) => Ok(None),
+        opened => opened.map(Some),
+    }
 }
 
 #[async_trait(?Send)]
 impl RoomFiles for OpfsFiles {
     type File = OpfsFile;
 
+    /// Opens the newest generation of the name, or creates the name itself if it has none.
     async fn open_locked(&self, path: &Path) -> io::Result<Option<OpfsFile>> {
-        Err(unsupported(path))
+        let (dirs, name) = opfs_names::file_names(path)?;
+        unless_taken(run(open_newest(dirs, name, Opening::Found)).await)
     }
 
+    /// The OPFS has no atomic creation of a new file: it checks that the name has no
+    /// generation, and then creates it, which is safe under the lock of the room, with one tab
+    /// per directory.
     async fn create_locked(&self, path: &Path) -> io::Result<Option<OpfsFile>> {
-        Err(unsupported(path))
+        let (dirs, name) = opfs_names::file_names(path)?;
+        unless_taken(run(open_newest(dirs, name, Opening::New)).await)
     }
 
+    /// Empties the newest generation of the name.
     async fn create(&self, path: &Path) -> io::Result<OpfsFile> {
-        Err(unsupported(path))
+        let (dirs, name) = opfs_names::file_names(path)?;
+        run(open_newest(dirs, name, Opening::Emptied)).await
     }
 
     async fn open_read(&self, path: &Path) -> io::Result<OpfsFile> {
-        Err(unsupported(path))
+        let (dirs, name) = opfs_names::file_names(path)?;
+        run(open_newest(dirs, name, Opening::Existing)).await
     }
 
     async fn exists(&self, path: &Path) -> io::Result<bool> {
@@ -222,33 +373,11 @@ impl RoomFiles for OpfsFiles {
         let (from_dirs, from) = opfs_names::file_names(from)?;
         let (to_dirs, to) = opfs_names::file_names(to)?;
         run(async move {
-            let from_dir = directory(&from_dirs, false).await?;
-            let to_dir = if to_dirs == from_dirs {
-                from_dir.clone()
-            } else {
-                directory(&to_dirs, false).await?
-            };
-            let mut old = generations(&from_dir, &from).await?;
-            let newest = entry(&from, old.pop().ok_or_else(|| missing(&from))?);
-            for generation in old {
-                remove_entry(&from_dir, &entry(&from, generation)).await?;
-            }
-            let replaced = generations(&to_dir, &to).await?;
-            let target = entry(&to, opfs_names::next(&replaced)?);
-            let what = format!("getFileHandle({newest})");
-            let file: MovableFile = wait(&what, from_dir.get_file_handle(&newest), &[])
-                .await?
-                .unchecked_into();
-            let what = format!("move({newest}, {target})");
-            let moved = file
-                .move_to(&to_dir, &target)
-                .map_err(|err| error(&what, &err, TAKEN_BY_MOVE))?;
-            wait(&what, moved, TAKEN_BY_MOVE).await?;
-            for generation in replaced {
-                if let Err(err) = remove_entry(&to_dir, &entry(&to, generation)).await {
-                    tracing::debug!(%err, "an old generation stays until its name is replaced");
-                }
-            }
+            let (from_dir, to_dir) = directories(&from_dirs, &to_dirs).await?;
+            let replacement = replace_first(&from_dir, &from, None, &to_dir, &to).await?;
+            let file = file_handle(&from_dir, &replacement.source, false).await?;
+            move_entry(&file, &to_dir, &replacement).await?;
+            replace_last(&to_dir, &to, replacement.replaced).await;
             Ok(())
         })
         .await
@@ -294,39 +423,262 @@ impl RoomFiles for OpfsFiles {
     }
 }
 
-/// A file opened by [`OpfsFiles`], which opens none yet.
+/// A file opened by [`OpfsFiles`]: a `FileSystemSyncAccessHandle` on a generation of its name,
+/// exclusive, also for reading.
+///
+/// Its operations run one at a time, in the order they were called, each once it has the
+/// handle's permit. All but its rename are synchronous calls of the sync access handle. Its
+/// rename awaits promises, so it runs in a task of its own, with the permit and then the turn of
+/// the layer, until it ends; its error, if nobody awaited it, is the one of the next operation,
+/// which then does not run. The handle closes its sync access handle when it is dropped, once
+/// its last operation ended.
 #[derive(Debug)]
 pub struct OpfsFile {
-    never: Infallible,
+    /// The permit of the operations of the file.
+    permit: Arc<Mutex<()>>,
+    /// What the file shares with its rename in flight, which holds it until it ends.
+    open: Rc<RefCell<Open>>,
+}
+
+/// An open file of the OPFS: its entry, where it is, and its sync access handle.
+#[derive(Debug)]
+struct Open {
+    /// The handle of its entry, which follows the file when it moves.
+    file: FileSystemFileHandle,
+    /// The sync access handle, which only a rename closes and reopens: `None` once a reopening
+    /// failed, which leaves the file dead.
+    access: Option<FileSystemSyncAccessHandle>,
+    /// The names of the directory of the file.
+    dirs: Vec<String>,
+    /// The name of the file, in that directory.
+    name: String,
+    /// The generation of the name that the file is.
+    generation: u64,
+    /// The error of an operation that nobody awaited, for the next one.
+    unseen: Option<io::Error>,
+}
+
+impl Open {
+    /// The sync access handle, unless an operation that nobody awaited failed, whose error it
+    /// gives once, or a rename could not reopen the file, which is then dead.
+    fn access(&mut self) -> io::Result<&FileSystemSyncAccessHandle> {
+        if let Some(err) = self.unseen.take() {
+            return Err(err);
+        }
+        self.access.as_ref().ok_or_else(|| {
+            let message = format!("{} is closed: a rename could not reopen it", self.name);
+            io::Error::other(message)
+        })
+    }
+}
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        if let Some(access) = self.access.take() {
+            access.close();
+        }
+    }
+}
+
+/// The result of the rename of an open file, as its caller awaits it. Dropped before the result
+/// is taken, it keeps the rename's error for the next operation: the rename may have sent it
+/// just before.
+struct Outcome {
+    receiver: oneshot::Receiver<io::Result<()>>,
+    open: Rc<RefCell<Open>>,
+}
+
+impl Drop for Outcome {
+    fn drop(&mut self) {
+        self.receiver.close();
+        if let Ok(Err(err)) = self.receiver.try_recv() {
+            self.open.borrow_mut().unseen.get_or_insert(err);
+        }
+    }
+}
+
+/// The options of a read or a write at `offset`.
+fn at(offset: u64) -> FileSystemReadWriteOptions {
+    let options = FileSystemReadWriteOptions::new();
+    options.set_at(offset as f64);
+    options
+}
+
+impl OpfsFile {
+    /// Runs `op`, a synchronous call, on the sync access handle once the operations before it
+    /// ended (see [`Open::access`]).
+    async fn call<T>(
+        &self,
+        what: &str,
+        op: impl FnOnce(&FileSystemSyncAccessHandle) -> Result<T, JsValue>,
+    ) -> io::Result<T> {
+        let _permit = self.permit.lock().await;
+        let mut open = self.open.borrow_mut();
+        op(open.access()?).map_err(|err| error(what, &err, &[]))
+    }
+}
+
+/// Renames the file of `open` to the name `to` of the directory of `to_dirs`, with the steps of
+/// a replacement: the first one before it closes the sync access handle, so that a rename that
+/// fails there leaves the file open; then it closes it, moves the file and reopens it on the
+/// same handle of its entry, which followed it. A move that fails reopens the file where it was,
+/// if the listing of its directory still has its entry there, and otherwise leaves it closed; so
+/// does a listing that fails, and a reopening that fails, and every later operation fails.
+async fn rename_open(open: &RefCell<Open>, to_dirs: Vec<String>, to: String) -> io::Result<()> {
+    let (file, from_dirs, from, generation) = {
+        let open = open.borrow();
+        let (dirs, name) = (open.dirs.clone(), open.name.clone());
+        (open.file.clone(), dirs, name, open.generation)
+    };
+    let (from_dir, to_dir) = directories(&from_dirs, &to_dirs).await?;
+    let replacement = replace_first(&from_dir, &from, Some(generation), &to_dir, &to).await?;
+    if let Some(access) = open.borrow_mut().access.take() {
+        access.close();
+    }
+    point("rename.closed", &replacement.source).await;
+    let moved = move_entry(&file, &to_dir, &replacement).await;
+    point("rename.moved", &replacement.target).await;
+    let reopened = if moved.is_ok() {
+        &replacement.target
+    } else if generations(&from_dir, &from).await?.contains(&generation) {
+        &replacement.source
+    } else {
+        // A move that failed and moved the file all the same: reopening it at its source would
+        // create it there again, empty, in Safari.
+        let message = format!("{from} is closed: a move that failed left it no entry");
+        return Err(io::Error::other(message));
+    };
+    open.borrow_mut().access = Some(access(&file, reopened, &[]).await?);
+    moved?;
+    {
+        let mut open = open.borrow_mut();
+        open.dirs = to_dirs;
+        open.name = to.clone();
+        open.generation = replacement.generation;
+    }
+    replace_last(&to_dir, &to, replacement.replaced).await;
+    Ok(())
 }
 
 #[async_trait(?Send)]
 impl RoomFile for OpfsFile {
-    async fn read_at(&self, _: u64, _: usize) -> io::Result<Vec<u8>> {
-        match self.never {}
+    /// Repeats a read that gives less than asked, until the file ends.
+    async fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let read = self.call("read", |access| {
+            let size = access.get_size();
+            Ok(size
+                .map_err(|err| error("getSize", &err, &[]))
+                .and_then(|size| {
+                    opfs_names::read_exact(offset, len, size as u64, |buf, at_offset| {
+                        let read = access.read_with_u8_array_and_options(buf, &at(at_offset));
+                        read.map(|read| read as usize)
+                            .map_err(|err| error("read", &err, &[]))
+                    })
+                }))
+        });
+        read.await?
     }
 
-    async fn write_at(&self, _: u64, _: Vec<u8>) -> io::Result<()> {
-        match self.never {}
+    async fn write_at(&self, offset: u64, bytes: Vec<u8>) -> io::Result<()> {
+        let written = self.call("write", |access| {
+            Ok(opfs_names::write_all(offset, &bytes, |buf, at_offset| {
+                let written = access.write_with_u8_array_and_options(buf, &at(at_offset));
+                written
+                    .map(|written| written as usize)
+                    .map_err(|err| error("write", &err, &[]))
+            }))
+        });
+        written.await?
     }
 
     async fn size(&self) -> io::Result<u64> {
-        match self.never {}
+        let size = self.call("getSize", FileSystemSyncAccessHandle::get_size);
+        Ok(size.await? as u64)
     }
 
-    async fn set_len(&self, _: u64) -> io::Result<()> {
-        match self.never {}
+    async fn set_len(&self, len: u64) -> io::Result<()> {
+        self.call("truncate", |access| access.truncate_with_f64(len as f64))
+            .await
     }
 
+    /// `flush()`, as [`sync_all`](Self::sync_all): the OPFS has no metadata to sync apart.
     async fn sync_data(&self) -> io::Result<()> {
-        match self.never {}
+        self.call("flush", FileSystemSyncAccessHandle::flush).await
     }
 
     async fn sync_all(&self) -> io::Result<()> {
-        match self.never {}
+        self.call("flush", FileSystemSyncAccessHandle::flush).await
     }
 
-    async fn rename(&mut self, _: &Path) -> io::Result<()> {
-        match self.never {}
+    /// Takes the handle's permit, then the turn of the layer, and runs in a task of its own the
+    /// steps of [`RoomFiles::rename`], without taking the turn again: the first one before it
+    /// closes the sync access handle; then it closes it, moves the file and reopens it on the
+    /// same handle of its entry. A move that fails reopens the file where it was, if its entry is
+    /// still there; a reopening that fails, or a source with no entry, leaves it closed, and every
+    /// later operation fails. The error of an earlier rename that nobody awaited comes before
+    /// anything else, also before a refused `to`, which may not be open.
+    async fn rename(&mut self, to: &Path) -> io::Result<()> {
+        let permit = Arc::clone(&self.permit).lock_owned().await;
+        self.open.borrow_mut().access()?;
+        let (to_dirs, to) = opfs_names::file_names(to)?;
+        let (sender, receiver) = oneshot::channel();
+        let mut outcome = Outcome {
+            receiver,
+            open: Rc::clone(&self.open),
+        };
+        let open = Rc::clone(&self.open);
+        run(async move {
+            let renamed = rename_open(&open, to_dirs, to).await;
+            if let Err(Err(err)) = sender.send(renamed) {
+                open.borrow_mut().unseen.get_or_insert(err);
+            }
+            drop(permit);
+            Ok(())
+        })
+        .await?;
+        (&mut outcome.receiver)
+            .await
+            .unwrap_or_else(|_| Err(io::Error::other("the rename did not complete")))
     }
 }
+
+/// A point of an operation, in its task, where a unit test acts on the entry `entry`: there it
+/// runs the action armed for them, if any.
+#[cfg(test)]
+async fn point(name: &'static str, entry: &str) {
+    let armed = ARMED.with(|armed| {
+        let mut armed = armed.borrow_mut();
+        let found = armed
+            .iter()
+            .position(|(at, on, _)| *at == name && on == entry)?;
+        Some(armed.remove(found).2)
+    });
+    if let Some(action) = armed {
+        action.await;
+    }
+}
+
+#[cfg(not(test))]
+async fn point(_: &'static str, _: &str) {}
+
+/// An action of a unit test, which an operation awaits at a point.
+#[cfg(test)]
+type Action = std::pin::Pin<Box<dyn Future<Output = ()>>>;
+
+#[cfg(test)]
+thread_local! {
+    /// The actions that the unit tests armed, with their points and their entries: each runs
+    /// once, the first time an operation reaches its point on its entry.
+    static ARMED: RefCell<Vec<(&'static str, String, Action)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Arms `action` for the point `point` of an operation on the entry `entry`.
+#[cfg(test)]
+fn arm(point: &'static str, entry: &str, action: impl Future<Output = ()> + 'static) {
+    let action: Action = Box::pin(action);
+    ARMED.with(|armed| armed.borrow_mut().push((point, entry.to_owned(), action)));
+}
+
+#[cfg(test)]
+#[path = "tests/opfs.rs"]
+mod tests;
