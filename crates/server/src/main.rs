@@ -45,6 +45,7 @@ async fn serve(config: Arc<ServerConfig>) -> Result<(), Box<dyn std::error::Erro
         snapshot_relay,
     );
 
+    zemdb_server::stage_probe::spawn_signal_listener();
     let addr = format!("{}:{}", config.host, config.port);
     let listener = TcpListener::bind(&addr).await?;
 

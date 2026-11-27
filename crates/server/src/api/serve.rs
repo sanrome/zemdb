@@ -3,6 +3,7 @@
 //! Connections speak HTTP/1.1 or HTTP/2 without TLS (h2c with prior knowledge), detected from
 //! their first bytes. TLS is expected to end at a reverse proxy in front of the server.
 
+use crate::stage_probe::{self as probe, Stage};
 use axum::body::{Body, Bytes};
 use axum::extract::Request;
 use axum::{BoxError, Router};
@@ -257,11 +258,29 @@ async fn serve_connection(
     let service = {
         let activity = Arc::clone(&activity);
         let app = TowerToHyperService::new(app);
-        hyper::service::service_fn(move |request: Request<Incoming>| {
+        hyper::service::service_fn(move |mut request: Request<Incoming>| {
+            let called = std::time::Instant::now();
+            let read_done = activity.read_done.load(Ordering::Relaxed);
+            if read_done != 0 {
+                probe::value(
+                    Stage::http_parse,
+                    probe::nanos(called).saturating_sub(read_done),
+                );
+                activity
+                    .request_start
+                    .store(activity.read_start.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            request.extensions_mut().insert(probe::Called(called));
             let in_progress = activity.begin_request();
+            let activity = Arc::clone(&activity);
             let response = app.call(request);
             async move {
                 let mut response = response.await?;
+                let done = std::time::Instant::now();
+                if let Some(probe::Handled(handled)) = response.extensions().get().copied() {
+                    probe::record(Stage::axum_out, done.saturating_duration_since(handled));
+                    activity.service_done.store(probe::nanos(done), Ordering::Relaxed);
+                }
                 let budget = response.extensions_mut().remove::<ResponseBudget>();
                 // The request stays in progress until its response body is done or dropped.
                 Ok::<_, Infallible>(
@@ -336,6 +355,12 @@ struct Activity {
     next_request: AtomicU64,
     /// Notified when `waiting` changes. Its single waiter is [`Activity::stalled`].
     waiting_changed: Notify,
+    /// Diagnostic ([`crate::stage_probe::nanos`]): the last read that brought bytes, the read
+    /// that brought the request in progress, and when the service had its response.
+    read_start: AtomicU64,
+    read_done: AtomicU64,
+    request_start: AtomicU64,
+    service_done: AtomicU64,
 }
 
 impl Activity {
@@ -498,6 +523,28 @@ impl TrackedIo {
         self.activity.set_write_blocked(poll.is_pending());
         poll
     }
+
+    /// Diagnostic: the first write after the service had a response is that response.
+    fn probe_write(&self, start: std::time::Instant, poll: &Poll<io::Result<usize>>) {
+        if !matches!(poll, Poll::Ready(Ok(n)) if *n > 0) {
+            return;
+        }
+        let service_done = self.activity.service_done.swap(0, Ordering::Relaxed);
+        if service_done == 0 {
+            return;
+        }
+        let end = std::time::Instant::now();
+        let start_ns = probe::nanos(start);
+        probe::value(Stage::http_write_prep, start_ns.saturating_sub(service_done));
+        probe::record(Stage::sock_write, end.saturating_duration_since(start));
+        let request_start = self.activity.request_start.load(Ordering::Relaxed);
+        if request_start != 0 {
+            probe::value(
+                Stage::server_total,
+                probe::nanos(end).saturating_sub(request_start),
+            );
+        }
+    }
 }
 
 impl AsyncRead for TrackedIo {
@@ -508,7 +555,14 @@ impl AsyncRead for TrackedIo {
     ) -> Poll<io::Result<()>> {
         let this = &mut *self;
         let before = buf.filled().len();
+        let start = std::time::Instant::now();
         let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if buf.filled().len() > before {
+            let end = std::time::Instant::now();
+            probe::record(Stage::sock_read, end.saturating_duration_since(start));
+            this.activity.read_start.store(probe::nanos(start), Ordering::Relaxed);
+            this.activity.read_done.store(probe::nanos(end), Ordering::Relaxed);
+        }
         if let Some(protocol) = this.detection.feed(&buf.filled()[before..]) {
             this.activity.set_protocol(protocol);
         }
@@ -522,7 +576,9 @@ impl AsyncWrite for TrackedIo {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        let start = std::time::Instant::now();
         let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
+        self.probe_write(start, &poll);
         self.track_write(poll)
     }
 
@@ -531,7 +587,9 @@ impl AsyncWrite for TrackedIo {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
+        let start = std::time::Instant::now();
         let poll = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
+        self.probe_write(start, &poll);
         self.track_write(poll)
     }
 

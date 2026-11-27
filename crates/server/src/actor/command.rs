@@ -39,6 +39,8 @@ pub struct CommitResponse {
     /// grown by each operation read; without one, the catch-up is empty and flagged
     /// `has_more`.
     pub(crate) reservation: Option<Reservation>,
+    /// Diagnostic: when the room sent this reply.
+    pub replied_at: std::time::Instant,
 }
 
 /// Response returned upon requesting delta operations via Sync.
@@ -134,6 +136,8 @@ pub enum RoomCommand {
         last_ack_seq: SequenceNumber,
         op: Operation,
         reply: oneshot::Sender<Result<CommitResponse, ServerError>>,
+        /// Diagnostic: when the command was built.
+        sent_at: std::time::Instant,
     },
 
     /// Fetch a batch of sequenced operations starting after `from_seq`.

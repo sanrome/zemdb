@@ -22,7 +22,9 @@ pub(crate) fn sync_dir(dir_path: &Path) -> std::io::Result<()> {
         } else {
             dir_path
         };
-        File::open(target)?.sync_all()?;
+        if !crate::stage_probe::no_fsync() {
+            File::open(target)?.sync_all()?;
+        }
     }
     Ok(())
 }
@@ -84,7 +86,9 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     {
         let mut tmp_file = File::create(&tmp_path)?;
         tmp_file.write_all(bytes)?;
-        tmp_file.sync_all()?;
+        if !crate::stage_probe::no_fsync() {
+            tmp_file.sync_all()?;
+        }
     }
     fail_point::hook("write_atomic_before_rename", path);
     injected("write_atomic_before_rename", path)?;

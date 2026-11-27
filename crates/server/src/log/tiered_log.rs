@@ -265,13 +265,17 @@ impl TieredLog {
             )));
         }
 
-        self.warm_disk.append_records(&records)?;
+        if !crate::stage_probe::no_wal() {
+            self.warm_disk.append_records(&records)?;
+        }
 
+        let mut at = std::time::Instant::now();
         let appended = records.len() as u64;
         for (op, _) in records {
             self.hot_buffer.append(op)?;
         }
         self.hot_buffer.apply_sliding_window(&self.policy);
+        crate::stage_probe::lap(crate::stage_probe::Stage::hot_append, &mut at);
 
         // `tail_seq` needs no update here: when the log was empty it already pointed at
         // `head_seq + 1`, which is exactly the sequence of the first operation just appended.
@@ -285,6 +289,7 @@ impl TieredLog {
             if let Err(err) = self.seal_active_segment() {
                 outcome.rotation_error = Some(err);
             }
+            crate::stage_probe::lap(crate::stage_probe::Stage::seal, &mut at);
         }
 
         Ok(outcome)

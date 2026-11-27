@@ -1,4 +1,5 @@
 use crate::durable;
+use crate::stage_probe::{self as probe, Stage};
 use crate::error::ServerError;
 use crate::fail_point;
 use crate::log::budget::ReadBudget;
@@ -127,6 +128,7 @@ impl WarmDiskLog {
         }
 
         let file = self.active_file.as_mut().unwrap();
+        let mut at = std::time::Instant::now();
         let mut encoded = Vec::new();
         for (op, mutation_id) in records {
             let group_offset = encoded.len() as u64;
@@ -136,14 +138,20 @@ impl WarmDiskLog {
             encoded.extend_from_slice(&record);
         }
 
+        probe::value(Stage::wal_bytes, encoded.len() as u64);
+        probe::lap(Stage::wal_encode, &mut at);
         // Reads of the active segment share this handle and move its position.
         file.seek(SeekFrom::Start(self.active_len))?;
         fail_point::check("warm_append_write", &active_path)?;
         file.write_all(&encoded)?;
         file.flush()?;
+        probe::lap(Stage::wal_write, &mut at);
         fail_point::hook("warm_append_sync", &active_path);
         fail_point::check("warm_append_sync", &active_path)?;
-        file.sync_data()?;
+        if !probe::no_fsync() {
+            file.sync_data()?;
+        }
+        probe::lap(Stage::wal_fsync, &mut at);
         crate::log::io_probe::record(IoEvent::ActiveWalSync, &self.segments_dir);
         self.active_len += encoded.len() as u64;
         self.active_mutations.extend(

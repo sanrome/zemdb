@@ -4,16 +4,19 @@
 //! ```text
 //! zemdb-perf http   --addr HOST:PORT --room ROOM --k K [--warmup S] [--secs S] [--server-pid PID]
 //! zemdb-perf inproc --data-dir DIR --k K [--warmup S] [--secs S]
+//! zemdb-perf ideal  [--n COMMITS] [--echo 0|1]
 //! ```
 //!
 //! `http` creates the schema and the room in a running server (secrets from `ZEMDB_AUTH_SECRET`
 //! and `ZEMDB_ADMIN_SECRET`), registers one client and commits with `k` requests in flight,
 //! each worker over its own HTTP/1.1 keep-alive connection. `inproc` builds the server's room
 //! manager in this process, as `main` does, and sends the same commits to the room actor,
-//! without HTTP. Both print one JSON line with the results.
+//! without HTTP. Both print one JSON line with the results. `ideal` is the bound to compare them
+//! against: see `ideal.rs`.
 
 #![recursion_limit = "256"]
 
+mod ideal;
 mod rooms;
 
 use bytes::Bytes;
@@ -164,6 +167,7 @@ impl Committer for InprocCommitter {
                 last_ack_seq: SequenceNumber::new(last_ack_seq),
                 op,
                 reply,
+                sent_at: Instant::now(),
             })
             .await;
         match result {
@@ -235,6 +239,23 @@ async fn worker<C: Committer>(
                 result.first_error.get_or_insert(err);
             }
         }
+    }
+}
+
+/// Diagnostic: resets (`USR1`) or dumps (`USR2`) the stage probes of the server, to the file
+/// `ZEMDB_PERF_STAGES` names.
+fn stage_probes(server_pid: u32, signal: &str) {
+    let Some(path) = std::env::var_os("ZEMDB_PERF_STAGES") else {
+        return;
+    };
+    if server_pid != std::process::id() {
+        let _ = std::process::Command::new("kill")
+            .args([format!("-{signal}"), server_pid.to_string()])
+            .status();
+    } else if signal == "USR1" {
+        zemdb_server::stage_probe::reset();
+    } else {
+        std::fs::write(path, zemdb_server::stage_probe::dump()).unwrap();
     }
 }
 
@@ -311,9 +332,11 @@ async fn run<C: Committer>(
 
     let own_pid = std::process::id();
     tokio::time::sleep_until(warmup_end.into()).await;
+    stage_probes(run.server_pid, "USR1");
     let (server_before, own_before) = (cpu_ticks(run.server_pid), cpu_ticks(own_pid));
     let switches_before = context_switches(run.server_pid);
     tokio::time::sleep_until(end.into()).await;
+    stage_probes(run.server_pid, "USR2");
     let (server_after, own_after) = (cpu_ticks(run.server_pid), cpu_ticks(own_pid));
     let switches = context_switches(run.server_pid) - switches_before;
     let (rss_kib, hwm_kib) = memory_kib(run.server_pid);
@@ -584,6 +607,9 @@ fn main() {
         server_pid: num("server-pid", u64::from(std::process::id())) as u32,
     };
 
+    if mode == "ideal" {
+        return ideal::ideal_mode(&args);
+    }
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         match mode.as_str() {

@@ -10,6 +10,7 @@ mod log;
 pub mod relay;
 mod response_budget;
 pub mod schema_registry;
+pub mod stage_probe;
 
 #[cfg(test)]
 #[path = "tests/support.rs"]
