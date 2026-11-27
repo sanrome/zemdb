@@ -342,8 +342,8 @@ async fn create_locked_is_none_for_a_file_taken_once_it_found_the_name_free() {
 /// and cannot open (another handle takes it as it creates it): the rotation is rolled back, which
 /// moves the rotated WAL to the next generation of the fresh one, and cannot remove the one that
 /// is taken, so it stays until the next replacement of the name. The compaction is `RoomLocked`,
-/// the room stays usable, with its writes in the WAL it rolled back, and the next compaction
-/// removes the old generation.
+/// the room stays usable, with its writes in the WAL it rolled back, which the recovery reads
+/// when the room reopens, and the next compaction removes the old generation.
 #[wasm_bindgen_test]
 async fn a_rotation_rolled_back_onto_a_wal_left_created_writes_to_its_next_generation() {
     use crate::{DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError};
@@ -391,6 +391,9 @@ async fn a_rotation_rolled_back_onto_a_wal_left_created_writes_to_its_next_gener
     );
     assert!(holds(&dir, "room_back.wal").await.is_empty());
     engine.apply_batch(&room, insert(4)).await.unwrap();
+    engine.close_room(&room).await.unwrap();
+    engine.open_room(&room, schema()).await.unwrap();
+    assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), 4);
     engine.compact_room(&room).await.unwrap();
     assert_eq!(
         entries_of(&dir).await,

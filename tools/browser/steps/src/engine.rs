@@ -14,10 +14,10 @@
 //! got in a file of the harness outside the data directory: after each step that the engine
 //! acknowledged, 8 bytes written at once and flushed, which a cut leaves whole. It returns once the
 //! loop ran a few steps, so the cut never falls before the loop started; the page then terminates
-//! the Worker, wherever the loop is. The loop does not end while the Worker lives: if a step of it
-//! fails, or it ends, it records so, and the step that follows fails, so the cut never falls after
-//! its end unseen. The next step reopens the room, in a new Worker, checks it against that record,
-//! whatever the point of the cut, and notes where it fell.
+//! the Worker, wherever the loop is. The next step reopens the room, in a new Worker, checks it
+//! against that record, whatever the point of the cut, and notes where it fell. The loop ends only
+//! if a step of it fails: then it records so, and the step that started it fails if it sees it,
+//! and so does the next step, so the cut never falls after its end unseen.
 //!
 //! Each step fails if it does not end within [`LIMIT_MS`], so that an operation that hangs fails
 //! it there.
@@ -346,7 +346,10 @@ impl Progress {
         })?;
         let recorded = u64::from_le_bytes(bytes);
         check(recorded != ENDED, || {
-            format!("the loop {name} ended before the Worker was terminated: a step of it failed, or it returned")
+            format!(
+                "the loop {name} ended before the Worker was terminated: a step of it failed, or \
+                 it returned"
+            )
         })?;
         Ok(recorded)
     }
@@ -586,7 +589,8 @@ async fn batches_cut(run: &str) -> Result<(), JsError> {
         "between two batches, or in one before its write"
     };
     note(&format!(
-        "engine_batches_cut: the cut fell {fell}: {acknowledged} rows acknowledged, {head} in the room"
+        "engine_batches_cut: the cut fell {fell}: {acknowledged} rows acknowledged, {head} in the \
+         room"
     ));
     let applied = engine.apply_batch(&room, batch(head + 1..=head + 5)).await;
     applied.map_err(storage("apply_batch"))?;
