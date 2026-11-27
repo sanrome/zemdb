@@ -1,5 +1,4 @@
 use axum::extract::State;
-use crate::stage_probe::{self as probe, Stage};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use http_body::Body as _;
@@ -337,7 +336,6 @@ pub async fn commit(
     auth: AuthenticatedRoom,
     BinaryMessage(msg): BinaryMessage,
 ) -> Response {
-    let mut at = probe::take();
     let ClientMessage::Commit {
         correlation_id,
         room_id,
@@ -354,27 +352,18 @@ pub async fn commit(
         return binary_error(Some(correlation_id), Some(room_id), err);
     }
 
-    probe::lap(Stage::handler_pre, &mut at);
-    let sent_at = at;
     let result = ask_room(&state, &room_id, |reply| RoomCommand::Commit {
         client_id,
         mutation_id,
         last_ack_seq,
         op,
         reply,
-        sent_at,
     })
     .await;
     let commit_resp = match result {
         Ok(commit_resp) => commit_resp,
         Err(err) => return binary_error(Some(correlation_id), Some(room_id), err),
     };
-    at = std::time::Instant::now();
-    probe::record(Stage::actor_total, at.saturating_duration_since(sent_at));
-    probe::record(
-        Stage::to_handler,
-        at.saturating_duration_since(commit_resp.replied_at),
-    );
     let ack = OpsReply::CommitAck {
         correlation_id,
         room_id,
@@ -388,17 +377,10 @@ pub async fn commit(
     };
     // The commit is durable, so it is never answered with an error: without room in the
     // budget, the room acknowledged it without its catch-up, which sends the client to `/sync`.
-    let mut response = match commit_resp.reservation {
+    match commit_resp.reservation {
         Some(reservation) => budgeted_response(reservation, &ack),
         None => binary_response(StatusCode::OK, &ack),
-    };
-    probe::value(
-        Stage::response_bytes,
-        http_body::Body::size_hint(response.body()).exact().unwrap_or(0),
-    );
-    probe::lap(Stage::encode, &mut at);
-    response.extensions_mut().insert(probe::Handled(at));
-    response
+    }
 }
 
 /// `POST /rooms/:room_id/sync`: the next batch of operations after the client's cursor.

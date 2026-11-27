@@ -1,5 +1,4 @@
 use futures::FutureExt;
-use crate::stage_probe::{self as probe, Stage};
 use std::ops::ControlFlow;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -410,7 +409,6 @@ impl RoomActor {
                 last_ack_seq,
                 op,
                 reply,
-                sent_at,
             } => {
                 let first = CommitRequest {
                     client_id,
@@ -418,7 +416,6 @@ impl RoomActor {
                     last_ack_seq,
                     op,
                     reply,
-                    sent_at,
                 };
                 return self.commit_group(first).await;
             }
@@ -551,22 +548,11 @@ impl RoomActor {
         // stops and is recovered from disk by the next request; deduplication acknowledges a
         // retry of a mutation whose record survived with the sequence that reached disk.
         let records = std::mem::take(&mut group.records);
-        probe::value(Stage::group_commits, group.commits.len() as u64);
-        let dispatched = std::time::Instant::now();
         let written = if records.is_empty() {
             Ok(AppendOutcome::default())
         } else {
-            let (written, done) = self
-                .log_io(move |log| {
-                    probe::record(Stage::io_dispatch, dispatched.elapsed());
-                    let written = log.append_group(records);
-                    (written, std::time::Instant::now())
-                })
-                .await;
-            probe::record(Stage::io_return, done.elapsed());
-            written
+            self.log_io(move |log| log.append_group(records)).await
         };
-        let mut at = std::time::Instant::now();
         let outcome = match written {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -621,17 +607,10 @@ impl RoomActor {
             );
             self.mailbox.close();
         }
-        probe::lap(Stage::publish, &mut at);
         for commit in group.commits {
-            let mut at = std::time::Instant::now();
-            let mut res = self
+            let res = self
                 .answer(&commit.client_id, commit.last_ack_seq, commit.decision)
                 .await;
-            if let Ok(resp) = &mut res {
-                probe::value(Stage::catchup_ops, resp.catchup_ops.len() as u64);
-                probe::lap(Stage::answer, &mut at);
-                resp.replied_at = at;
-            }
             let _ = commit.reply.send(res);
         }
         if rotation_failed {
@@ -676,14 +655,10 @@ impl RoomActor {
             last_ack_seq,
             op,
             reply,
-            sent_at,
         } = request;
-        let mut at = std::time::Instant::now();
-        probe::record(Stage::to_actor, at.saturating_duration_since(sent_at));
         let decision = self
             .decide(&client_id, mutation_id, last_ack_seq, op, group)
             .unwrap_or_else(Decision::Rejected);
-        probe::lap(Stage::sequence, &mut at);
         group.commits.push(PendingCommit {
             client_id,
             last_ack_seq,
@@ -809,7 +784,6 @@ impl RoomActor {
             schema_version: self.schema.version(),
             schema_id: self.schema_id.clone(),
             reservation,
-            replied_at: std::time::Instant::now(),
         })
     }
 
@@ -1243,10 +1217,6 @@ impl RoomActor {
         permit: tokio::sync::OwnedSemaphorePermit,
         work: impl FnOnce(&mut TieredLog) -> T + Send + 'static,
     ) -> T {
-        if probe::inline_io() {
-            drop(permit);
-            return work(self.tiered_log.as_mut().expect(LOG_IN_PLACE));
-        }
         let mut log = self.tiered_log.take().expect(LOG_IN_PLACE);
         let (log, out) = run_holding(permit, move || {
             let out = work(&mut log);
@@ -1368,14 +1338,12 @@ impl Mailbox {
                 last_ack_seq,
                 op,
                 reply,
-                sent_at,
             } => Some(CommitRequest {
                 client_id,
                 mutation_id,
                 last_ack_seq,
                 op,
                 reply,
-                sent_at,
             }),
             other => {
                 self.held = Some(other);
@@ -1398,7 +1366,6 @@ struct CommitRequest {
     last_ack_seq: SequenceNumber,
     op: Operation,
     reply: oneshot::Sender<Result<CommitResponse, ServerError>>,
-    sent_at: std::time::Instant,
 }
 
 /// A commit of a group, waiting for the group to be written to be answered.

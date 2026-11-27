@@ -1,0 +1,6 @@
+{"case":"tmpfs","rooms":4,"k":16,"commits_per_sec":25438.333333333336,"server_cpu_pct":184.0,"gen_cpu_pct":92.08333333333333,"mean_us":2515.2154040758423,"p99_us":5374,"errors":0}
+{"case":"disk","rooms":4,"k":16,"commits_per_sec":22217.916666666668,"server_cpu_pct":144.83333333333331,"gen_cpu_pct":89.16666666666666,"mean_us":2879.6323067827066,"p99_us":8157,"errors":0}
+{"case":"tmpfs","rooms":16,"k":4,"commits_per_sec":28273.166666666664,"server_cpu_pct":186.08333333333331,"gen_cpu_pct":110.91666666666666,"mean_us":2262.9828013695137,"p99_us":5771,"errors":0}
+{"case":"disk","rooms":16,"k":4,"commits_per_sec":16448.916666666668,"server_cpu_pct":153.41666666666666,"gen_cpu_pct":97.08333333333333,"mean_us":3890.1118752841985,"p99_us":14141,"errors":0}
+{"case":"tmpfs","rooms":32,"k":1,"commits_per_sec":23372.999999999993,"server_cpu_pct":159.33333333333334,"gen_cpu_pct":109.75,"mean_us":1368.5362342092435,"p99_us":4318,"errors":0}
+{"case":"disk","rooms":32,"k":1,"commits_per_sec":15014.5,"server_cpu_pct":154.58333333333334,"gen_cpu_pct":102.41666666666666,"mean_us":2130.484777012865,"p99_us":9125,"errors":0}

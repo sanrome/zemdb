@@ -1,0 +1,2 @@
+{"check_ns":284.753534,"commits":4000000.0,"commits_per_sec":863296.5598293376,"confirm_ns":292.098586,"echo":false,"mode":"ideal","receive_ns":497.290295,"request_bytes":184,"response_bytes":51,"staged_total_ns":1268.7162545,"whole_ns":1158.350498,"write_in_memory_ns":194.5738395}
+{"check_ns":291.53755075,"commits":4000000.0,"commits_per_sec":702111.8129818072,"confirm_ns":555.7265335,"echo":true,"mode":"ideal","receive_ns":504.952862,"request_bytes":184,"response_bytes":195,"staged_total_ns":1555.26613325,"whole_ns":1424.27456925,"write_in_memory_ns":203.049187}

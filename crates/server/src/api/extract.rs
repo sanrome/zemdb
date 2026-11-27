@@ -10,7 +10,6 @@
 //! Rejections of the admin API ([`AdminPath`], [`AdminJson`]) are `ServerError::BadRequest`,
 //! rendered as JSON.
 
-use crate::stage_probe::{self as probe, Stage};
 use axum::body::Bytes;
 use axum::extract::rejection::{BytesRejection, JsonRejection};
 use axum::extract::{FromRef, FromRequest, FromRequestParts, Path, Request};
@@ -104,16 +103,10 @@ where
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let mut at = std::time::Instant::now();
-        if let Some(probe::Called(called)) = parts.extensions.get().copied() {
-            probe::record(Stage::route, at.saturating_duration_since(called));
-        }
         let RoomPath(room_id) = RoomPath::from_request_parts(parts, state).await?;
         let token = bearer_token(parts).ok_or_else(|| missing_token(&room_id))?;
         let client_id =
             verify_token_for_room(token, &room_id, &AppState::from_ref(state))?.client_id;
-        probe::lap(Stage::auth, &mut at);
-        probe::hand(at);
         Ok(AuthenticatedRoom { room_id, client_id })
     }
 }
@@ -220,14 +213,8 @@ where
     type Rejection = Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let mut at = probe::take();
         let (room_id, body) = read_frame(req, state).await?;
-        probe::value(Stage::request_bytes, body.len() as u64);
-        probe::lap(Stage::body_read, &mut at);
-        let decoded = decode_client_message(&body);
-        probe::lap(Stage::decode, &mut at);
-        probe::hand(at);
-        decoded
+        decode_client_message(&body)
             .map(BinaryMessage)
             .map_err(|e| binary_error(None, room_id, e.into()))
     }

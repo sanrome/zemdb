@@ -10,6 +10,8 @@ El generador de carga y los scripts de las [evaluaciones de performance](../../d
 | `src/rooms.rs` | El modo `rooms`, de la Evaluación 2: muchas salas, con clientes que escriben a ritmo humano y se ponen al día como el SDK (SSE, `/sync`, `Ack`, heartbeat). |
 | `run_e1.sh`, `profile_e1.sh`, `summarize.sh` | Una medición de la Evaluación 1 (una línea JSON por corrida), su perfil de CPU con `perf`, y la mediana de las repeticiones. |
 | `run_e2.sh`, `e2_all.sh`, `e2f_all.sh`, `summarize_e2.sh` | Una configuración de la Evaluación 2 contra un servidor nuevo, todas las mediciones de §4.4, las de los modos de frescura (§4.8), y la mediana de las repeticiones. |
+| `src/ideal.rs` | El modo `ideal`: el commit mínimo en un hilo, sin disco, red ni runtime, como cota contra la cual comparar al servidor ([análisis de las escrituras](../../docs/proposals/2026-11-analisis-escrituras-servidor.md)). |
+| `run_stages.sh`, `stages.py` | La Evaluación 1 con las sondas por etapa de `diagnostics/write-stages.patch`, y su resumen: cuánto tarda cada parte de un commit. |
 | `cloud_disk.sh` | Un disco de nube emulado, con un límite de escrituras por segundo, para E2-disco (Lote 7 de la Fase 3.12): ver abajo. |
 | `results/` | Los datos crudos de las evaluaciones. En `e1-block-in-place-*.jsonl` y `e1-mediciones.jsonl`, la lista de commits lentos de cada corrida está resumida: cuántos hubo y los 20 más largos. En `results/fase3_12/`, los de la línea de base de la Fase 3.12 y los de cada lote. |
 | `diagnostics/` | Los cambios de diagnóstico del servidor, como parches (DP1): no están en el código de `main`. |
@@ -54,6 +56,7 @@ Se aplican sobre una copia local, se compila el servidor, se mide, y se descarta
 | | Qué hace | Cómo se activa |
 |---|---|---|
 | `diagnostics/inline-io.patch` | Corre la E/S de los actores en el mismo hilo, el worker (§3.7.4 de las evaluaciones): hasta el Lote 2 de la Fase 3.12, sin `block_in_place`; desde el Lote 3, sin el pool de E/S | `ZEMDB_PERF_INLINE_IO=1` al correr los scripts |
+| `diagnostics/write-stages.patch` | Las sondas por etapa de un commit (un histograma de cada una), y tres interruptores: sin `fsync`, sin escribir el WAL, y la E/S de las salas en el hilo del actor. Toca también el generador, que les avisa a las sondas cuándo empezar y cuándo volcar | `tools/perf/run_stages.sh CASO salida.jsonl`; aplica sobre `ede29c4` |
 | (sin parche) | El presupuesto de respuestas agrandado | `ZEMDB_MAX_INFLIGHT_RESPONSE_BYTES=4294967296` |
 
 `git apply tools/perf/diagnostics/inline-io.patch` desde la raíz. El parche aplica sobre `6b93115`, donde lo rehízo el Lote 8 de la Fase 3.12; un lote que toque `io_pool.rs` puede hacer que deje de aplicar.

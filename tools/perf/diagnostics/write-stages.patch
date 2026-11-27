@@ -1,0 +1,787 @@
+diff --git a/crates/server/src/actor/command.rs b/crates/server/src/actor/command.rs
+index 029a7d2..54b90e5 100644
+--- a/crates/server/src/actor/command.rs
++++ b/crates/server/src/actor/command.rs
+@@ -39,6 +39,8 @@ pub struct CommitResponse {
+     /// grown by each operation read; without one, the catch-up is empty and flagged
+     /// `has_more`.
+     pub(crate) reservation: Option<Reservation>,
++    /// Diagnostic: when the room sent this reply.
++    pub replied_at: std::time::Instant,
+ }
+ 
+ /// Response returned upon requesting delta operations via Sync.
+@@ -134,6 +136,8 @@ pub enum RoomCommand {
+         last_ack_seq: SequenceNumber,
+         op: Operation,
+         reply: oneshot::Sender<Result<CommitResponse, ServerError>>,
++        /// Diagnostic: when the command was built.
++        sent_at: std::time::Instant,
+     },
+ 
+     /// Fetch a batch of sequenced operations starting after `from_seq`.
+diff --git a/crates/server/src/actor/room.rs b/crates/server/src/actor/room.rs
+index 9dd1e8e..2327469 100644
+--- a/crates/server/src/actor/room.rs
++++ b/crates/server/src/actor/room.rs
+@@ -1,4 +1,5 @@
+ use futures::FutureExt;
++use crate::stage_probe::{self as probe, Stage};
+ use std::ops::ControlFlow;
+ use std::panic::AssertUnwindSafe;
+ use std::path::{Path, PathBuf};
+@@ -409,6 +410,7 @@ impl RoomActor {
+                 last_ack_seq,
+                 op,
+                 reply,
++                sent_at,
+             } => {
+                 let first = CommitRequest {
+                     client_id,
+@@ -416,6 +418,7 @@ impl RoomActor {
+                     last_ack_seq,
+                     op,
+                     reply,
++                    sent_at,
+                 };
+                 return self.commit_group(first).await;
+             }
+@@ -548,11 +551,22 @@ impl RoomActor {
+         // stops and is recovered from disk by the next request; deduplication acknowledges a
+         // retry of a mutation whose record survived with the sequence that reached disk.
+         let records = std::mem::take(&mut group.records);
++        probe::value(Stage::group_commits, group.commits.len() as u64);
++        let dispatched = std::time::Instant::now();
+         let written = if records.is_empty() {
+             Ok(AppendOutcome::default())
+         } else {
+-            self.log_io(move |log| log.append_group(records)).await
++            let (written, done) = self
++                .log_io(move |log| {
++                    probe::record(Stage::io_dispatch, dispatched.elapsed());
++                    let written = log.append_group(records);
++                    (written, std::time::Instant::now())
++                })
++                .await;
++            probe::record(Stage::io_return, done.elapsed());
++            written
+         };
++        let mut at = std::time::Instant::now();
+         let outcome = match written {
+             Ok(outcome) => outcome,
+             Err(err) => {
+@@ -607,10 +621,17 @@ impl RoomActor {
+             );
+             self.mailbox.close();
+         }
++        probe::lap(Stage::publish, &mut at);
+         for commit in group.commits {
+-            let res = self
++            let mut at = std::time::Instant::now();
++            let mut res = self
+                 .answer(&commit.client_id, commit.last_ack_seq, commit.decision)
+                 .await;
++            if let Ok(resp) = &mut res {
++                probe::value(Stage::catchup_ops, resp.catchup_ops.len() as u64);
++                probe::lap(Stage::answer, &mut at);
++                resp.replied_at = at;
++            }
+             let _ = commit.reply.send(res);
+         }
+         if rotation_failed {
+@@ -655,10 +676,14 @@ impl RoomActor {
+             last_ack_seq,
+             op,
+             reply,
++            sent_at,
+         } = request;
++        let mut at = std::time::Instant::now();
++        probe::record(Stage::to_actor, at.saturating_duration_since(sent_at));
+         let decision = self
+             .decide(&client_id, mutation_id, last_ack_seq, op, group)
+             .unwrap_or_else(Decision::Rejected);
++        probe::lap(Stage::sequence, &mut at);
+         group.commits.push(PendingCommit {
+             client_id,
+             last_ack_seq,
+@@ -784,6 +809,7 @@ impl RoomActor {
+             schema_version: self.schema.version(),
+             schema_id: self.schema_id.clone(),
+             reservation,
++            replied_at: std::time::Instant::now(),
+         })
+     }
+ 
+@@ -1217,6 +1243,10 @@ impl RoomActor {
+         permit: tokio::sync::OwnedSemaphorePermit,
+         work: impl FnOnce(&mut TieredLog) -> T + Send + 'static,
+     ) -> T {
++        if probe::inline_io() {
++            drop(permit);
++            return work(self.tiered_log.as_mut().expect(LOG_IN_PLACE));
++        }
+         let mut log = self.tiered_log.take().expect(LOG_IN_PLACE);
+         let (log, out) = run_holding(permit, move || {
+             let out = work(&mut log);
+@@ -1338,12 +1368,14 @@ impl Mailbox {
+                 last_ack_seq,
+                 op,
+                 reply,
++                sent_at,
+             } => Some(CommitRequest {
+                 client_id,
+                 mutation_id,
+                 last_ack_seq,
+                 op,
+                 reply,
++                sent_at,
+             }),
+             other => {
+                 self.held = Some(other);
+@@ -1366,6 +1398,7 @@ struct CommitRequest {
+     last_ack_seq: SequenceNumber,
+     op: Operation,
+     reply: oneshot::Sender<Result<CommitResponse, ServerError>>,
++    sent_at: std::time::Instant,
+ }
+ 
+ /// A commit of a group, waiting for the group to be written to be answered.
+diff --git a/crates/server/src/api/data_plane.rs b/crates/server/src/api/data_plane.rs
+index ed49c05..a000009 100644
+--- a/crates/server/src/api/data_plane.rs
++++ b/crates/server/src/api/data_plane.rs
+@@ -1,4 +1,5 @@
+ use axum::extract::State;
++use crate::stage_probe::{self as probe, Stage};
+ use axum::http::{header, StatusCode};
+ use axum::response::{IntoResponse, Response};
+ use http_body::Body as _;
+@@ -336,6 +337,7 @@ pub async fn commit(
+     auth: AuthenticatedRoom,
+     BinaryMessage(msg): BinaryMessage,
+ ) -> Response {
++    let mut at = probe::take();
+     let ClientMessage::Commit {
+         correlation_id,
+         room_id,
+@@ -352,18 +354,27 @@ pub async fn commit(
+         return binary_error(Some(correlation_id), Some(room_id), err);
+     }
+ 
++    probe::lap(Stage::handler_pre, &mut at);
++    let sent_at = at;
+     let result = ask_room(&state, &room_id, |reply| RoomCommand::Commit {
+         client_id,
+         mutation_id,
+         last_ack_seq,
+         op,
+         reply,
++        sent_at,
+     })
+     .await;
+     let commit_resp = match result {
+         Ok(commit_resp) => commit_resp,
+         Err(err) => return binary_error(Some(correlation_id), Some(room_id), err),
+     };
++    at = std::time::Instant::now();
++    probe::record(Stage::actor_total, at.saturating_duration_since(sent_at));
++    probe::record(
++        Stage::to_handler,
++        at.saturating_duration_since(commit_resp.replied_at),
++    );
+     let ack = OpsReply::CommitAck {
+         correlation_id,
+         room_id,
+@@ -377,10 +388,17 @@ pub async fn commit(
+     };
+     // The commit is durable, so it is never answered with an error: without room in the
+     // budget, the room acknowledged it without its catch-up, which sends the client to `/sync`.
+-    match commit_resp.reservation {
++    let mut response = match commit_resp.reservation {
+         Some(reservation) => budgeted_response(reservation, &ack),
+         None => binary_response(StatusCode::OK, &ack),
+-    }
++    };
++    probe::value(
++        Stage::response_bytes,
++        http_body::Body::size_hint(response.body()).exact().unwrap_or(0),
++    );
++    probe::lap(Stage::encode, &mut at);
++    response.extensions_mut().insert(probe::Handled(at));
++    response
+ }
+ 
+ /// `POST /rooms/:room_id/sync`: the next batch of operations after the client's cursor.
+diff --git a/crates/server/src/api/extract.rs b/crates/server/src/api/extract.rs
+index de74e03..e0d1aa5 100644
+--- a/crates/server/src/api/extract.rs
++++ b/crates/server/src/api/extract.rs
+@@ -10,6 +10,7 @@
+ //! Rejections of the admin API ([`AdminPath`], [`AdminJson`]) are `ServerError::BadRequest`,
+ //! rendered as JSON.
+ 
++use crate::stage_probe::{self as probe, Stage};
+ use axum::body::Bytes;
+ use axum::extract::rejection::{BytesRejection, JsonRejection};
+ use axum::extract::{FromRef, FromRequest, FromRequestParts, Path, Request};
+@@ -103,10 +104,16 @@ where
+     type Rejection = Response;
+ 
+     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
++        let mut at = std::time::Instant::now();
++        if let Some(probe::Called(called)) = parts.extensions.get().copied() {
++            probe::record(Stage::route, at.saturating_duration_since(called));
++        }
+         let RoomPath(room_id) = RoomPath::from_request_parts(parts, state).await?;
+         let token = bearer_token(parts).ok_or_else(|| missing_token(&room_id))?;
+         let client_id =
+             verify_token_for_room(token, &room_id, &AppState::from_ref(state))?.client_id;
++        probe::lap(Stage::auth, &mut at);
++        probe::hand(at);
+         Ok(AuthenticatedRoom { room_id, client_id })
+     }
+ }
+@@ -213,8 +220,14 @@ where
+     type Rejection = Response;
+ 
+     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
++        let mut at = probe::take();
+         let (room_id, body) = read_frame(req, state).await?;
+-        decode_client_message(&body)
++        probe::value(Stage::request_bytes, body.len() as u64);
++        probe::lap(Stage::body_read, &mut at);
++        let decoded = decode_client_message(&body);
++        probe::lap(Stage::decode, &mut at);
++        probe::hand(at);
++        decoded
+             .map(BinaryMessage)
+             .map_err(|e| binary_error(None, room_id, e.into()))
+     }
+diff --git a/crates/server/src/api/serve.rs b/crates/server/src/api/serve.rs
+index db6b9d5..28cda07 100644
+--- a/crates/server/src/api/serve.rs
++++ b/crates/server/src/api/serve.rs
+@@ -3,6 +3,7 @@
+ //! Connections speak HTTP/1.1 or HTTP/2 without TLS (h2c with prior knowledge), detected from
+ //! their first bytes. TLS is expected to end at a reverse proxy in front of the server.
+ 
++use crate::stage_probe::{self as probe, Stage};
+ use axum::body::{Body, Bytes};
+ use axum::extract::Request;
+ use axum::{BoxError, Router};
+@@ -257,11 +258,29 @@ async fn serve_connection(
+     let service = {
+         let activity = Arc::clone(&activity);
+         let app = TowerToHyperService::new(app);
+-        hyper::service::service_fn(move |request: Request<Incoming>| {
++        hyper::service::service_fn(move |mut request: Request<Incoming>| {
++            let called = std::time::Instant::now();
++            let read_done = activity.read_done.load(Ordering::Relaxed);
++            if read_done != 0 {
++                probe::value(
++                    Stage::http_parse,
++                    probe::nanos(called).saturating_sub(read_done),
++                );
++                activity
++                    .request_start
++                    .store(activity.read_start.load(Ordering::Relaxed), Ordering::Relaxed);
++            }
++            request.extensions_mut().insert(probe::Called(called));
+             let in_progress = activity.begin_request();
++            let activity = Arc::clone(&activity);
+             let response = app.call(request);
+             async move {
+                 let mut response = response.await?;
++                let done = std::time::Instant::now();
++                if let Some(probe::Handled(handled)) = response.extensions().get().copied() {
++                    probe::record(Stage::axum_out, done.saturating_duration_since(handled));
++                    activity.service_done.store(probe::nanos(done), Ordering::Relaxed);
++                }
+                 let budget = response.extensions_mut().remove::<ResponseBudget>();
+                 // The request stays in progress until its response body is done or dropped.
+                 Ok::<_, Infallible>(
+@@ -336,6 +355,12 @@ struct Activity {
+     next_request: AtomicU64,
+     /// Notified when `waiting` changes. Its single waiter is [`Activity::stalled`].
+     waiting_changed: Notify,
++    /// Diagnostic ([`crate::stage_probe::nanos`]): the last read that brought bytes, the read
++    /// that brought the request in progress, and when the service had its response.
++    read_start: AtomicU64,
++    read_done: AtomicU64,
++    request_start: AtomicU64,
++    service_done: AtomicU64,
+ }
+ 
+ impl Activity {
+@@ -498,6 +523,28 @@ impl TrackedIo {
+         self.activity.set_write_blocked(poll.is_pending());
+         poll
+     }
++
++    /// Diagnostic: the first write after the service had a response is that response.
++    fn probe_write(&self, start: std::time::Instant, poll: &Poll<io::Result<usize>>) {
++        if !matches!(poll, Poll::Ready(Ok(n)) if *n > 0) {
++            return;
++        }
++        let service_done = self.activity.service_done.swap(0, Ordering::Relaxed);
++        if service_done == 0 {
++            return;
++        }
++        let end = std::time::Instant::now();
++        let start_ns = probe::nanos(start);
++        probe::value(Stage::http_write_prep, start_ns.saturating_sub(service_done));
++        probe::record(Stage::sock_write, end.saturating_duration_since(start));
++        let request_start = self.activity.request_start.load(Ordering::Relaxed);
++        if request_start != 0 {
++            probe::value(
++                Stage::server_total,
++                probe::nanos(end).saturating_sub(request_start),
++            );
++        }
++    }
+ }
+ 
+ impl AsyncRead for TrackedIo {
+@@ -508,7 +555,14 @@ impl AsyncRead for TrackedIo {
+     ) -> Poll<io::Result<()>> {
+         let this = &mut *self;
+         let before = buf.filled().len();
++        let start = std::time::Instant::now();
+         let poll = Pin::new(&mut this.inner).poll_read(cx, buf);
++        if buf.filled().len() > before {
++            let end = std::time::Instant::now();
++            probe::record(Stage::sock_read, end.saturating_duration_since(start));
++            this.activity.read_start.store(probe::nanos(start), Ordering::Relaxed);
++            this.activity.read_done.store(probe::nanos(end), Ordering::Relaxed);
++        }
+         if let Some(protocol) = this.detection.feed(&buf.filled()[before..]) {
+             this.activity.set_protocol(protocol);
+         }
+@@ -522,7 +576,9 @@ impl AsyncWrite for TrackedIo {
+         cx: &mut Context<'_>,
+         buf: &[u8],
+     ) -> Poll<io::Result<usize>> {
++        let start = std::time::Instant::now();
+         let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
++        self.probe_write(start, &poll);
+         self.track_write(poll)
+     }
+ 
+@@ -531,7 +587,9 @@ impl AsyncWrite for TrackedIo {
+         cx: &mut Context<'_>,
+         bufs: &[io::IoSlice<'_>],
+     ) -> Poll<io::Result<usize>> {
++        let start = std::time::Instant::now();
+         let poll = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
++        self.probe_write(start, &poll);
+         self.track_write(poll)
+     }
+ 
+diff --git a/crates/server/src/durable.rs b/crates/server/src/durable.rs
+index 9eca89a..f4d971f 100644
+--- a/crates/server/src/durable.rs
++++ b/crates/server/src/durable.rs
+@@ -22,7 +22,9 @@ pub(crate) fn sync_dir(dir_path: &Path) -> std::io::Result<()> {
+         } else {
+             dir_path
+         };
+-        File::open(target)?.sync_all()?;
++        if !crate::stage_probe::no_fsync() {
++            File::open(target)?.sync_all()?;
++        }
+     }
+     Ok(())
+ }
+@@ -84,7 +86,9 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+     {
+         let mut tmp_file = File::create(&tmp_path)?;
+         tmp_file.write_all(bytes)?;
+-        tmp_file.sync_all()?;
++        if !crate::stage_probe::no_fsync() {
++            tmp_file.sync_all()?;
++        }
+     }
+     fail_point::hook("write_atomic_before_rename", path);
+     injected("write_atomic_before_rename", path)?;
+diff --git a/crates/server/src/lib.rs b/crates/server/src/lib.rs
+index e33e010..dcba554 100644
+--- a/crates/server/src/lib.rs
++++ b/crates/server/src/lib.rs
+@@ -10,6 +10,7 @@ mod log;
+ pub mod relay;
+ mod response_budget;
+ pub mod schema_registry;
++pub mod stage_probe;
+ 
+ #[cfg(test)]
+ #[path = "tests/support.rs"]
+diff --git a/crates/server/src/log/tiered_log.rs b/crates/server/src/log/tiered_log.rs
+index 3f63c78..3e72e1a 100644
+--- a/crates/server/src/log/tiered_log.rs
++++ b/crates/server/src/log/tiered_log.rs
+@@ -265,13 +265,17 @@ impl TieredLog {
+             )));
+         }
+ 
+-        self.warm_disk.append_records(&records)?;
++        if !crate::stage_probe::no_wal() {
++            self.warm_disk.append_records(&records)?;
++        }
+ 
++        let mut at = std::time::Instant::now();
+         let appended = records.len() as u64;
+         for (op, _) in records {
+             self.hot_buffer.append(op)?;
+         }
+         self.hot_buffer.apply_sliding_window(&self.policy);
++        crate::stage_probe::lap(crate::stage_probe::Stage::hot_append, &mut at);
+ 
+         // `tail_seq` needs no update here: when the log was empty it already pointed at
+         // `head_seq + 1`, which is exactly the sequence of the first operation just appended.
+@@ -285,6 +289,7 @@ impl TieredLog {
+             if let Err(err) = self.seal_active_segment() {
+                 outcome.rotation_error = Some(err);
+             }
++            crate::stage_probe::lap(crate::stage_probe::Stage::seal, &mut at);
+         }
+ 
+         Ok(outcome)
+diff --git a/crates/server/src/log/warm_disk.rs b/crates/server/src/log/warm_disk.rs
+index e412803..25dcf73 100644
+--- a/crates/server/src/log/warm_disk.rs
++++ b/crates/server/src/log/warm_disk.rs
+@@ -1,4 +1,5 @@
+ use crate::durable;
++use crate::stage_probe::{self as probe, Stage};
+ use crate::error::ServerError;
+ use crate::fail_point;
+ use crate::log::budget::ReadBudget;
+@@ -127,6 +128,7 @@ impl WarmDiskLog {
+         }
+ 
+         let file = self.active_file.as_mut().unwrap();
++        let mut at = std::time::Instant::now();
+         let mut encoded = Vec::new();
+         for (op, mutation_id) in records {
+             let group_offset = encoded.len() as u64;
+@@ -136,14 +138,20 @@ impl WarmDiskLog {
+             encoded.extend_from_slice(&record);
+         }
+ 
++        probe::value(Stage::wal_bytes, encoded.len() as u64);
++        probe::lap(Stage::wal_encode, &mut at);
+         // Reads of the active segment share this handle and move its position.
+         file.seek(SeekFrom::Start(self.active_len))?;
+         fail_point::check("warm_append_write", &active_path)?;
+         file.write_all(&encoded)?;
+         file.flush()?;
++        probe::lap(Stage::wal_write, &mut at);
+         fail_point::hook("warm_append_sync", &active_path);
+         fail_point::check("warm_append_sync", &active_path)?;
+-        file.sync_data()?;
++        if !probe::no_fsync() {
++            file.sync_data()?;
++        }
++        probe::lap(Stage::wal_fsync, &mut at);
+         crate::log::io_probe::record(IoEvent::ActiveWalSync, &self.segments_dir);
+         self.active_len += encoded.len() as u64;
+         self.active_mutations.extend(
+diff --git a/crates/server/src/main.rs b/crates/server/src/main.rs
+index 74c226f..05a2c12 100644
+--- a/crates/server/src/main.rs
++++ b/crates/server/src/main.rs
+@@ -45,6 +45,7 @@ async fn serve(config: Arc<ServerConfig>) -> Result<(), Box<dyn std::error::Erro
+         snapshot_relay,
+     );
+ 
++    zemdb_server::stage_probe::spawn_signal_listener();
+     let addr = format!("{}:{}", config.host, config.port);
+     let listener = TcpListener::bind(&addr).await?;
+ 
+diff --git a/crates/server/src/stage_probe.rs b/crates/server/src/stage_probe.rs
+new file mode 100644
+index 0000000..67fd452
+--- /dev/null
++++ b/crates/server/src/stage_probe.rs
+@@ -0,0 +1,233 @@
++//! Diagnostic probes of the stages of a commit (`tools/perf/diagnostics/write-stages.patch`).
++//! Not part of `main`: applied on a local copy to measure, then discarded.
++//!
++//! Each stage has a histogram of nanoseconds (8 buckets per power of two), with its count and
++//! sum. `reset` clears them and `dump` returns them as JSON. The switches come from the
++//! environment, read once:
++//! - `ZEMDB_PERF_STAGES`: the probes record (in the server binary, also the file that SIGUSR2
++//!   writes the dump to, after SIGUSR1 resets);
++//! - `ZEMDB_PERF_NO_FSYNC`: no `fsync` anywhere (the OS writes the pages back when it wants);
++//! - `ZEMDB_PERF_NO_WAL`: a commit writes nothing to `active.wal` (memory only);
++//! - `ZEMDB_PERF_INLINE_IO`: the file operations of a room run on the worker, not the pool.
++
++use std::cell::Cell;
++use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++use std::sync::OnceLock;
++use std::time::{Duration, Instant};
++
++macro_rules! stages {
++    ($($name:ident),* $(,)?) => {
++        #[allow(non_camel_case_types)]
++        #[derive(Clone, Copy)]
++        #[repr(usize)]
++        pub enum Stage { $($name),* }
++        const NAMES: &[&str] = &[$(stringify!($name)),*];
++    };
++}
++
++stages! {
++    // The connection (HTTP/1.1, one request in flight per connection).
++    sock_read,       // the read syscall that brought the request
++    http_parse,      // read done -> the service is called (hyper parses the head)
++    route,           // service called -> the first extractor starts (router, layers)
++    auth,            // the path room and the token
++    body_read,       // the body, collected
++    decode,          // decode_client_message
++    handler_pre,     // decoded -> the command is built
++    // The room.
++    to_actor,        // command built -> the actor takes it (send, wake, queue)
++    sequence,        // decide: the checks of one commit
++    io_dispatch,     // group sequenced -> its write starts on an I/O thread
++    wal_encode,
++    wal_write,
++    wal_fsync,
++    hot_append,      // the RAM buffer and its window
++    seal,            // the segment sealed after a group, when it is
++    io_return,       // write done -> the actor goes on
++    publish,         // dedup window, head, SSE announcement
++    answer,          // lease, reservation, catch-up of one commit
++    // Back.
++    to_handler,      // reply sent -> the handler goes on
++    encode,          // the ack, encoded, and its response
++    axum_out,        // handler done -> the service has the response
++    http_write_prep, // service done -> the write syscall starts (hyper encodes the head)
++    sock_write,      // the write syscall
++    // Totals.
++    actor_total,     // command built -> reply received
++    server_total,    // read syscall starts -> write syscall done
++    // Values, not times.
++    group_commits,
++    catchup_ops,
++    request_bytes,
++    response_bytes,
++    wal_bytes,
++}
++
++const BUCKETS: usize = 496;
++
++struct Hist {
++    count: AtomicU64,
++    sum: AtomicU64,
++    buckets: [AtomicU64; BUCKETS],
++}
++
++#[allow(clippy::declare_interior_mutable_const)]
++const ZERO: AtomicU64 = AtomicU64::new(0);
++#[allow(clippy::declare_interior_mutable_const)]
++const EMPTY: Hist = Hist {
++    count: ZERO,
++    sum: ZERO,
++    buckets: [ZERO; BUCKETS],
++};
++static HISTS: [Hist; 64] = [EMPTY; 64];
++
++fn flag(name: &str) -> bool {
++    std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0")
++}
++
++/// Whether the probes record.
++pub fn on() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| flag("ZEMDB_PERF_STAGES"))
++}
++
++pub fn no_fsync() -> bool {
++    static V: OnceLock<bool> = OnceLock::new();
++    *V.get_or_init(|| flag("ZEMDB_PERF_NO_FSYNC"))
++}
++
++pub fn no_wal() -> bool {
++    static V: OnceLock<bool> = OnceLock::new();
++    *V.get_or_init(|| flag("ZEMDB_PERF_NO_WAL"))
++}
++
++pub fn inline_io() -> bool {
++    static V: OnceLock<bool> = OnceLock::new();
++    *V.get_or_init(|| flag("ZEMDB_PERF_INLINE_IO"))
++}
++
++fn bucket(v: u64) -> usize {
++    if v < 8 {
++        return v as usize;
++    }
++    let e = 63 - v.leading_zeros() as usize;
++    8 + (e - 3) * 8 + ((v >> (e - 3)) & 7) as usize
++}
++
++/// Records the value `v` for `stage`.
++pub fn value(stage: Stage, v: u64) {
++    if !on() {
++        return;
++    }
++    let h = &HISTS[stage as usize];
++    h.count.fetch_add(1, Relaxed);
++    h.sum.fetch_add(v, Relaxed);
++    h.buckets[bucket(v)].fetch_add(1, Relaxed);
++}
++
++/// Records `d` for `stage`.
++pub fn record(stage: Stage, d: Duration) {
++    value(stage, d.as_nanos() as u64);
++}
++
++/// Records for `stage` the time since `*last`, and moves `*last` to now.
++pub fn lap(stage: Stage, last: &mut Instant) {
++    let now = Instant::now();
++    record(stage, now.saturating_duration_since(*last));
++    *last = now;
++}
++
++/// Nanoseconds of `at` since the first call, never 0: what the connection keeps in an atomic.
++pub fn nanos(at: Instant) -> u64 {
++    static EPOCH: OnceLock<Instant> = OnceLock::new();
++    let epoch = *EPOCH.get_or_init(|| at.checked_sub(Duration::from_secs(1)).unwrap_or(at));
++    (at.saturating_duration_since(epoch).as_nanos() as u64).max(1)
++}
++
++thread_local! {
++    static HANDOFF: Cell<Option<Instant>> = const { Cell::new(None) };
++}
++
++/// Leaves `at` for the code that runs next on this thread, in the same poll.
++pub fn hand(at: Instant) {
++    HANDOFF.with(|c| c.set(Some(at)));
++}
++
++/// Takes what [`hand`] left, or now.
++pub fn take() -> Instant {
++    HANDOFF
++        .with(Cell::take)
++        .unwrap_or_else(Instant::now)
++}
++
++/// The time the service was called, in the request's extensions.
++#[derive(Clone, Copy)]
++pub struct Called(pub Instant);
++
++/// The time the handler ended, in the response's extensions.
++#[derive(Clone, Copy)]
++pub struct Handled(pub Instant);
++
++pub fn reset() {
++    for h in &HISTS {
++        h.count.store(0, Relaxed);
++        h.sum.store(0, Relaxed);
++        for b in &h.buckets {
++            b.store(0, Relaxed);
++        }
++    }
++}
++
++/// `{"stage": {"count": n, "sum": n, "buckets": [[index, count], ...]}, ...}`
++pub fn dump() -> String {
++    let mut out = String::from("{");
++    for (i, name) in NAMES.iter().enumerate() {
++        let h = &HISTS[i];
++        if i > 0 {
++            out.push(',');
++        }
++        out.push_str(&format!(
++            "\"{name}\":{{\"count\":{},\"sum\":{},\"buckets\":[",
++            h.count.load(Relaxed),
++            h.sum.load(Relaxed)
++        ));
++        let mut first = true;
++        for (b, n) in h.buckets.iter().enumerate() {
++            let n = n.load(Relaxed);
++            if n > 0 {
++                if !first {
++                    out.push(',');
++                }
++                first = false;
++                out.push_str(&format!("[{b},{n}]"));
++            }
++        }
++        out.push_str("]}");
++    }
++    out.push('}');
++    out
++}
++
++/// In the server binary: SIGUSR1 resets the probes and SIGUSR2 writes their dump to the file
++/// `ZEMDB_PERF_STAGES` names.
++#[cfg(unix)]
++pub fn spawn_signal_listener() {
++    use tokio::signal::unix::{signal, SignalKind};
++    let Some(path) = std::env::var_os("ZEMDB_PERF_STAGES").filter(|v| !v.is_empty()) else {
++        return;
++    };
++    tokio::spawn(async move {
++        let mut usr1 = signal(SignalKind::user_defined1()).unwrap();
++        let mut usr2 = signal(SignalKind::user_defined2()).unwrap();
++        loop {
++            tokio::select! {
++                _ = usr1.recv() => reset(),
++                _ = usr2.recv() => {
++                    let tmp = std::path::PathBuf::from(format!("{}.tmp", path.to_string_lossy()));
++                    std::fs::write(&tmp, dump()).unwrap();
++                    std::fs::rename(&tmp, &path).unwrap();
++                }
++            }
++        }
++    });
++}
+diff --git a/tools/perf/src/main.rs b/tools/perf/src/main.rs
+index 8812d1a..3dac240 100644
+--- a/tools/perf/src/main.rs
++++ b/tools/perf/src/main.rs
+@@ -167,6 +167,7 @@ impl Committer for InprocCommitter {
+                 last_ack_seq: SequenceNumber::new(last_ack_seq),
+                 op,
+                 reply,
++                sent_at: Instant::now(),
+             })
+             .await;
+         match result {
+@@ -241,6 +242,23 @@ async fn worker<C: Committer>(
+     }
+ }
+ 
++/// Diagnostic: resets (`USR1`) or dumps (`USR2`) the stage probes of the server, to the file
++/// `ZEMDB_PERF_STAGES` names.
++fn stage_probes(server_pid: u32, signal: &str) {
++    let Some(path) = std::env::var_os("ZEMDB_PERF_STAGES") else {
++        return;
++    };
++    if server_pid != std::process::id() {
++        let _ = std::process::Command::new("kill")
++            .args([format!("-{signal}"), server_pid.to_string()])
++            .status();
++    } else if signal == "USR1" {
++        zemdb_server::stage_probe::reset();
++    } else {
++        std::fs::write(path, zemdb_server::stage_probe::dump()).unwrap();
++    }
++}
++
+ /// CPU time (user + system) of `pid`, in clock ticks.
+ fn cpu_ticks(pid: u32) -> u64 {
+     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+@@ -314,9 +332,11 @@ async fn run<C: Committer>(
+ 
+     let own_pid = std::process::id();
+     tokio::time::sleep_until(warmup_end.into()).await;
++    stage_probes(run.server_pid, "USR1");
+     let (server_before, own_before) = (cpu_ticks(run.server_pid), cpu_ticks(own_pid));
+     let switches_before = context_switches(run.server_pid);
+     tokio::time::sleep_until(end.into()).await;
++    stage_probes(run.server_pid, "USR2");
+     let (server_after, own_after) = (cpu_ticks(run.server_pid), cpu_ticks(own_pid));
+     let switches = context_switches(run.server_pid) - switches_before;
+     let (rss_kib, hwm_kib) = memory_kib(run.server_pid);
