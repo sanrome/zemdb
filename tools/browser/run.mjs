@@ -6,8 +6,8 @@
 //   node run.mjs --self-check [--browser ...] [--executable ...] [--server ...]
 //
 // Without --suites it runs the default suites of the page, then the suite `isolation` in
-// another context of the browser, with the same run id, and in Chromium the suite `quota` in a
-// third context, whose quota it makes small through CDP. `--suites quota` runs that suite alone,
+// another context of the browser, with the same run id, the suite `rooms` in a third one, and in
+// Chromium the suite `quota` in a fourth context, whose quota it makes small through CDP. `--suites quota` runs that suite alone,
 // with its quota, and only in Chromium. --executable runs another build of the browser than the
 // one of Playwright. A step can print a console message that starts with `harness note: `,
 // which the runner prints as a note of the run. --self-check checks the runner itself:
@@ -21,8 +21,9 @@ import { randomBytes } from 'node:crypto';
 import * as playwright from 'playwright';
 
 const here = fileURLToPath(new URL('.', import.meta.url));
-// The longest a page may take to run its suites, across its reloads.
-const PAGE_TIMEOUT_MS = 180_000;
+// The longest a page may take to run its suites, across its reloads: Firefox runs those of the
+// OPFS some fifteen times more slowly than Chromium.
+const PAGE_TIMEOUT_MS = 300_000;
 const SERVER_START_TIMEOUT_MS = 30_000;
 // The test server closes its connections within 5 s, and then shuts its rooms down.
 const SERVER_STOP_TIMEOUT_MS = 15_000;
@@ -91,7 +92,11 @@ async function run() {
     const runId = randomBytes(8).toString('hex');
     const quotaPage = { query: `?suites=quota&run=${runId}`, quota: QUOTA_BYTES };
     let pages = options.suites === null
-      ? [{ query: `?run=${runId}` }, { query: `?suites=isolation&run=${runId}` }]
+      ? [
+        { query: `?run=${runId}` },
+        { query: `?suites=isolation&run=${runId}` },
+        { query: `?suites=rooms&run=${runId}` },
+      ]
       : [{ query: `?suites=${encodeURIComponent(options.suites)}&run=${runId}` }];
     if (options.suites === 'quota') {
       pages = [quotaPage];
@@ -103,8 +108,8 @@ async function run() {
       console.log(`quota: not run in ${options.browser}, which has no CDP to set the quota of the origin`);
     }
     for (const { query, quota } of pages) {
-      // A context of its own for each page: the second default one checks the isolation, and
-      // the third has a small quota.
+      // A context of its own for each page: the second default one checks the isolation, the
+      // third measures, and the fourth has a small quota.
       const context = await browser.newContext();
       const result = await runPage(context, `${server.url}${query}`, quota);
       await context.close();

@@ -6,6 +6,12 @@
 //! parallel never interfere with each other, and each armed point fires once. A crash plan
 //! instead counts every point reached for the files of a directory, so that a simulation can
 //! crash or fail its scenario at each of them.
+//!
+//! It builds in WebAssembly too, where outside test builds every point does nothing as well. The
+//! unit tests in WebAssembly can arm the fail points and the pauses; the blocking pauses, which
+//! wait on a thread with a timeout, and the thread points are for the native tests.
+// The unit tests in WebAssembly use only some of the points.
+#![cfg_attr(all(test, target_arch = "wasm32"), allow(dead_code))]
 
 use crate::error::StorageError;
 use std::path::Path;
@@ -262,12 +268,12 @@ pub(crate) async fn pause(name: &'static str, path: &Path) {
 }
 
 /// How long a blocking pause waits to be released before it panics.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 const BLOCKING_PAUSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// A blocking pause point armed for one path: signals `reached` when hit, then blocks its thread
 /// until `release`.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 type ArmedBlockingPause = (
     &'static str,
     std::path::PathBuf,
@@ -275,18 +281,18 @@ type ArmedBlockingPause = (
     std::sync::mpsc::Receiver<()>,
 );
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 static BLOCKING_PAUSES: std::sync::Mutex<Vec<ArmedBlockingPause>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Handle of an armed blocking pause point, held by the test.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) struct BlockingPause {
     reached: tokio::sync::oneshot::Receiver<()>,
     release: std::sync::mpsc::Sender<()>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 impl BlockingPause {
     /// Waits until the operation reaches the pause point.
     pub(crate) async fn reached(&mut self) {
@@ -301,7 +307,7 @@ impl BlockingPause {
 
 /// Arms the blocking pause point `name` for `path`: the next `pause_blocking` with the same pair
 /// blocks its thread until the returned handle is released.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn arm_blocking_pause(name: &'static str, path: &Path) -> BlockingPause {
     let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -332,7 +338,7 @@ pub(crate) fn pause_blocking(name: &'static str, path: &Path) {
 /// of the native file layer, which the points of the engine around them already place.
 #[inline(always)]
 pub(crate) fn hold_blocking(name: &'static str, path: &Path) {
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     if let Some((_, _, reached, release)) =
         take(&BLOCKING_PAUSES, |(n, p, _, _)| *n == name && p == path)
     {
@@ -341,12 +347,12 @@ pub(crate) fn hold_blocking(name: &'static str, path: &Path) {
             panic!("pause point {name} was not released: the runtime is blocked");
         }
     }
-    #[cfg(not(test))]
+    #[cfg(any(not(test), target_arch = "wasm32"))]
     let _ = (name, path);
 }
 
 /// The thread points reached, each with a thread that reached it.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 static THREAD_POINTS: std::sync::Mutex<Vec<(&'static str, std::thread::ThreadId)>> =
     std::sync::Mutex::new(Vec::new());
 
@@ -354,7 +360,7 @@ static THREAD_POINTS: std::sync::Mutex<Vec<(&'static str, std::thread::ThreadId)
 /// work never runs on the thread of its runtime.
 #[inline(always)]
 pub(crate) fn thread_point(name: &'static str) {
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     {
         let reached = (name, std::thread::current().id());
         let mut points = THREAD_POINTS.lock().unwrap();
@@ -362,12 +368,12 @@ pub(crate) fn thread_point(name: &'static str) {
             points.push(reached);
         }
     }
-    #[cfg(not(test))]
+    #[cfg(any(not(test), target_arch = "wasm32"))]
     let _ = name;
 }
 
 /// Whether the current thread ever reached the thread point `name`.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn reached_on_this_thread(name: &'static str) -> bool {
     let reached = (name, std::thread::current().id());
     THREAD_POINTS.lock().unwrap().contains(&reached)

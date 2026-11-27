@@ -9,7 +9,13 @@
 //!   - `/harness/token`: a client token for `{"client_id", "room_id"}`, valid for `ttl_secs`
 //!     (300 by default);
 //!   - `/harness/network`: `{"up": false}` cuts the network between the page and the router,
-//!     and `{"up": true}` restores it.
+//!     and `{"up": true}` restores it;
+//!   - `/harness/snapshot`: the snapshot of a room of a native `DiskStorageEngine` (compressed
+//!     with `zstd`) whose rows are `{"rows": n}` rows of the schema of the snapshots
+//!     ([`snapshot_schema`]);
+//!   - `/harness/snapshot/check?head=<n>`: applies the snapshot of the body, made in the browser,
+//!     to a native `MemoryStorageEngine` at the head `n`, and answers how many of the rows of the
+//!     schema of the snapshots, up to `n`, it holds as the browser wrote them.
 //!
 //! It prints `listening on http://127.0.0.1:<port>/` once it accepts connections. It stops when
 //! its standard input closes (the runner that started it ends) or on Ctrl+C: it closes the
@@ -42,10 +48,15 @@ use tokio::task::{JoinError, JoinSet};
 use tower::ServiceExt;
 use tracing_subscriber::EnvFilter;
 use zemdb_core::id::{ClientId, RoomId};
+use zemdb_core::{
+    CompactRow, DataType, Operation, PrimaryKey, Schema, SequenceNumber, SequencedOperation,
+    TableSchema, Value,
+};
 use zemdb_server::{
     build_router, generate_client_token, AppState, IoThreads, RoomManager, SchemaRegistry,
     ServerConfig, SnapshotRelay,
 };
+use zemdb_storage::{DiskStorageEngine, DiskStorageOptions, MemoryStorageEngine, StorageEngine};
 
 /// The secret of the client tokens. The server only listens on `127.0.0.1`, for the tests.
 const AUTH_SECRET: &str = "zemdb browser harness: client tokens";
@@ -57,6 +68,10 @@ const GRACE: Duration = Duration::from_secs(5);
 const MAX_HARNESS_BODY: usize = 64 * 1024;
 /// Validity of a client token when the request does not give one.
 const DEFAULT_TOKEN_TTL_SECS: u64 = 300;
+/// The largest body of a request to `/harness/snapshot/check`, a snapshot of the browser.
+const MAX_SNAPSHOT_BODY: usize = 4 * 1024 * 1024;
+/// The most rows of a snapshot of `/harness/snapshot`.
+const MAX_SNAPSHOT_ROWS: u64 = 100_000;
 
 fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt()
@@ -267,12 +282,19 @@ impl Harness {
         if let Some(admin) = route.strip_prefix("admin/") {
             return self.control_plane(admin, request).await;
         }
-        let Ok(body) = axum::body::to_bytes(request.into_body(), MAX_HARNESS_BODY).await else {
+        let limit = match route {
+            "snapshot/check" => MAX_SNAPSHOT_BODY,
+            _ => MAX_HARNESS_BODY,
+        };
+        let query = request.uri().query().unwrap_or_default().to_owned();
+        let Ok(body) = axum::body::to_bytes(request.into_body(), limit).await else {
             return text(StatusCode::BAD_REQUEST, "the body could not be read".into());
         };
         match route {
             "token" => token(&body),
             "network" => self.set_network(&body),
+            "snapshot" => native_snapshot(&body).await,
+            "snapshot/check" => check_snapshot(&query, body).await,
             _ => status(StatusCode::NOT_FOUND),
         }
     }
@@ -410,6 +432,102 @@ fn token(body: &[u8]) -> Response<Body> {
         StatusCode::OK,
         generate_client_token(&client_id, &room_id, ttl, AUTH_SECRET),
     )
+}
+
+/// The schema of the snapshots of the harness, the one of the steps of the suite `engine`
+/// (`steps/src/engine.rs`): a table `users` (id 0) with an integer key `id` and a string `name`.
+fn snapshot_schema() -> Schema {
+    let users = TableSchema::builder("users")
+        .table_id(0)
+        .primary_key("id", DataType::Int)
+        .column("name", DataType::String);
+    Schema::builder().table(users).build()
+}
+
+/// The row of the key `key` in the snapshots of the harness: "user {key}".
+fn snapshot_values(key: u64) -> CompactRow {
+    CompactRow::new(vec![
+        Value::Int(key as i64),
+        Value::String(format!("user {key}").into()),
+    ])
+}
+
+/// The insert of the row of the key `key`, at the sequence `key`.
+fn snapshot_row(key: u64) -> SequencedOperation {
+    let op = Operation::insert(0, PrimaryKey::single(key as i64), snapshot_values(key), 100);
+    SequencedOperation::new(key, op)
+}
+
+/// The snapshot of a room of a native disk engine with the rows of `{"rows": n}`, compressed
+/// with `zstd` at the default level of the engine.
+async fn native_snapshot(body: &[u8]) -> Response<Body> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SnapshotRequest {
+        rows: u64,
+    }
+    let rows = match serde_json::from_slice::<SnapshotRequest>(body) {
+        Ok(request) if request.rows <= MAX_SNAPSHOT_ROWS => request.rows,
+        Ok(_) => return text(StatusCode::BAD_REQUEST, "too many rows".into()),
+        Err(err) => return text(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+    let made = async {
+        let dir = tempfile::tempdir()?;
+        let engine = DiskStorageEngine::new(DiskStorageOptions::new(dir.path()))?;
+        let room = RoomId::new("harness-snapshot")?;
+        engine.open_room(&room, snapshot_schema()).await?;
+        for key in 1..=rows {
+            engine.apply_batch(&room, vec![snapshot_row(key)]).await?;
+        }
+        let snapshot = engine.create_snapshot(&room).await?;
+        engine.close_room(&room).await?;
+        Ok::<_, Box<dyn Error>>(snapshot)
+    };
+    match made.await {
+        Ok(snapshot) => {
+            let mut response = Response::new(Body::from(snapshot));
+            response.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            response
+        }
+        Err(err) => text(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+/// Applies `snapshot`, made in the browser, to a native memory engine at the head of `query`
+/// (`head=<n>`), and answers how many of the rows `1..=n` of the snapshots of the harness it
+/// holds, each as [`snapshot_values`] makes it.
+async fn check_snapshot(query: &str, snapshot: Bytes) -> Response<Body> {
+    let Some(head) = query
+        .strip_prefix("head=")
+        .and_then(|head| head.parse::<u64>().ok())
+    else {
+        return text(StatusCode::BAD_REQUEST, "the query is head=<n>".into());
+    };
+    let checked = async {
+        let engine = MemoryStorageEngine::new();
+        let room = RoomId::new("harness-check")?;
+        let schema = snapshot_schema();
+        engine.open_room(&room, schema.clone()).await?;
+        let head = SequenceNumber::from(head);
+        engine.apply_snapshot(&room, schema, snapshot, head).await?;
+        let mut same = 0u64;
+        for key in 1..=head.get() {
+            let found = engine
+                .get(&room, "users", &PrimaryKey::single(key as i64))
+                .await?;
+            if found == Some(snapshot_values(key)) {
+                same += 1;
+            }
+        }
+        Ok::<_, Box<dyn Error>>(same)
+    };
+    match checked.await {
+        Ok(same) => text(StatusCode::OK, same.to_string()),
+        Err(err) => text(StatusCode::UNPROCESSABLE_ENTITY, err.to_string()),
+    }
 }
 
 /// Resolves once the network is down.

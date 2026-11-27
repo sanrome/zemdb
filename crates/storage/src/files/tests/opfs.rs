@@ -337,3 +337,79 @@ async fn create_locked_is_none_for_a_file_taken_once_it_found_the_name_free() {
     let err = OpfsFiles.create_locked(&path).await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
 }
+
+/// The disk engine on the layer, with a rotation of its WAL whose reopening fails: the WAL is
+/// dead. The compaction fails and readers still see every row; the next write fails on the dead
+/// WAL and marks the room as failed; closing it gives the error of its sync; and the room reopens
+/// with every row, from `.wal.compacting`, and writes and compacts.
+#[wasm_bindgen_test]
+async fn a_rotation_of_the_engine_that_cannot_reopen_the_wal_loses_nothing() {
+    use crate::{DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError};
+    use zemdb_core::{
+        CompactRow, DataType, Operation, PrimaryKey, RoomId, Schema, SequencedOperation,
+        TableSchema, Value,
+    };
+    let schema = || {
+        let users = TableSchema::builder("users")
+            .table_id(0)
+            .primary_key("id", DataType::Int)
+            .column("name", DataType::String);
+        Schema::builder().table(users).build()
+    };
+    let insert = |seq: u64| {
+        let row = CompactRow::new(vec![Value::Int(seq as i64), Value::String("u".into())]);
+        let op = Operation::insert(0, PrimaryKey::single(seq as i64), row, 100);
+        vec![SequencedOperation::new(seq, op)]
+    };
+    let dir = fresh("engine-dead").await;
+    let options = DiskStorageOptions::new(&dir).auto_compact(false);
+    let room = RoomId::new("dead").unwrap();
+    let engine = DiskStorageEngine::new(options.clone()).unwrap();
+    engine.open_room(&room, schema()).await.unwrap();
+    for seq in 1..=5 {
+        engine.apply_batch(&room, insert(seq)).await.unwrap();
+    }
+
+    let held = Held::default();
+    let compacting = "room_dead.wal.compacting";
+    arm("rename.moved", compacting, hold(&dir, compacting, &held));
+    let compacted = engine.compact_room(&room).await;
+    assert!(
+        matches!(&compacted, Err(StorageError::Io(err)) if !FileTaken::is(err)),
+        "{compacted:?}"
+    );
+    let_go(&held);
+    assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), 5);
+    let written = engine.apply_batch(&room, insert(6)).await;
+    assert!(matches!(written, Err(StorageError::Io(_))), "{written:?}");
+    let refused = engine.apply_batch(&room, insert(6)).await;
+    assert!(
+        matches!(refused, Err(StorageError::RoomFailed { .. })),
+        "{refused:?}"
+    );
+    let closed = engine.close_room(&room).await;
+    assert!(matches!(closed, Err(StorageError::Io(_))), "{closed:?}");
+    drop(engine);
+    // The dead WAL holds no handle and wrote nowhere: the files are the lock, the snapshot of a
+    // new room and the rotated WAL.
+    assert_eq!(
+        entries_of(&dir).await,
+        ["room_dead.lock", "room_dead.snap", compacting]
+    );
+
+    let engine = DiskStorageEngine::new(options.clone()).unwrap();
+    engine.open_room(&room, schema()).await.unwrap();
+    assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), 5);
+    for seq in 6..=7 {
+        engine.apply_batch(&room, insert(seq)).await.unwrap();
+    }
+    engine.compact_room(&room).await.unwrap();
+    engine.close_room(&room).await.unwrap();
+    let engine = DiskStorageEngine::new(options).unwrap();
+    engine.open_room(&room, schema()).await.unwrap();
+    assert_eq!(engine.get_head_seq(&room).await.unwrap().get(), 7);
+    for key in 1..=7 {
+        let row = engine.get(&room, "users", &PrimaryKey::single(key)).await;
+        assert!(row.unwrap().is_some(), "row {key} lost");
+    }
+}

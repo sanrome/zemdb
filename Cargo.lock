@@ -2492,6 +2492,7 @@ dependencies = [
  "crc32fast",
  "fs2",
  "futures",
+ "getrandom 0.4.3",
  "imbl",
  "js-sys",
  "ruzstd",

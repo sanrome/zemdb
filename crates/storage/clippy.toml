@@ -1,0 +1,25 @@
+# What panics or does not run in WebAssembly is called only from `src/sys.rs`. The lint holds for
+# the code of the crate, also natively; its unit tests allow it (`src/lib.rs`), and so do its
+# integration tests, crates of their own that read this file too: they all run on Tokio. The
+# native file layer allows it too (`src/files/mod.rs`): it is on Tokio's blocking pool, and never
+# builds in WebAssembly. In WebAssembly Tokio has only `sync` and `uuid` is not a dependency, so
+# their paths do not resolve there (`allow-invalid`): there the lint sees the rest.
+disallowed-methods = [
+    { path = "tokio::task::spawn", reason = "Tokio has no runtime in WebAssembly: use `sys::spawn`", allow-invalid = true },
+    { path = "tokio::task::spawn_blocking", reason = "Tokio has no runtime in WebAssembly: use `sys::run_blocking`", allow-invalid = true },
+    { path = "tokio::time::sleep", reason = "Tokio has no timers in WebAssembly", allow-invalid = true },
+    { path = "tokio::time::sleep_until", reason = "Tokio has no timers in WebAssembly", allow-invalid = true },
+    { path = "tokio::time::timeout", reason = "Tokio has no timers in WebAssembly", allow-invalid = true },
+    { path = "tokio::time::timeout_at", reason = "Tokio has no timers in WebAssembly", allow-invalid = true },
+    { path = "tokio::time::interval", reason = "Tokio has no timers in WebAssembly", allow-invalid = true },
+    { path = "tokio::time::interval_at", reason = "Tokio has no timers in WebAssembly", allow-invalid = true },
+    { path = "tokio::time::Instant::now", reason = "it panics in WebAssembly", allow-invalid = true },
+    { path = "tokio::time::Instant::elapsed", reason = "it panics in WebAssembly", allow-invalid = true },
+    { path = "std::time::Instant::now", reason = "it panics in WebAssembly" },
+    { path = "std::time::Instant::elapsed", reason = "it panics in WebAssembly" },
+    { path = "std::time::SystemTime::now", reason = "it panics in WebAssembly" },
+    { path = "std::time::SystemTime::elapsed", reason = "it panics in WebAssembly" },
+    { path = "uuid::Uuid::new_v4", reason = "it has no randomness in WebAssembly without choosing its source: use `sys::random_name`", allow-invalid = true },
+    { path = "std::thread::spawn", reason = "it panics in WebAssembly: use `sys::spawn` or `sys::run_blocking`" },
+    { path = "std::thread::sleep", reason = "it panics in WebAssembly" },
+]
