@@ -1,20 +1,23 @@
 //! The disk engine on a file layer that refuses what the Origin Private File System refuses, as a
 //! spike on the OPFS found: moving or removing a file with a handle open, at the source or at the
-//! destination, read-only handles included. It renames an open file as a layer on the OPFS will: it
-//! closes the handle, moves the file and opens it again. Its paths are virtual, mapped to a real
-//! directory, and nothing exists at them: an operation of the engine on its files that does not go
-//! through the layer fails.
+//! destination, read-only handles included, and opening a file that another handle has open, as
+//! `createSyncAccessHandle` refuses it (`None` for `open_locked` and `create_locked`, the error of
+//! a taken file for `create` and `open_read`). It renames an open file as the layer on the OPFS
+//! does: it closes the handle, moves the file and opens it again, and if it cannot open it again,
+//! the handle is dead. Its paths are virtual, mapped to a real directory, and nothing exists at
+//! them: an operation of the engine on its files that does not go through the layer fails.
 
 use super::snapshot_with_rows;
 use super::support::*;
 use crate::disk::compactor::{absorbing_wal_path, compacting_wal_path};
 use crate::fail_point;
-use crate::files::{NativeFile, NativeFiles, RoomFile, RoomFiles};
+use crate::files::{FileTaken, NativeFile, NativeFiles, RoomFile, RoomFiles};
 use crate::{DiskStorageEngine, DiskStorageOptions, StorageEngine, StorageError};
 use async_trait::async_trait;
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use zemdb_core::{RoomId, SequenceNumber};
@@ -42,6 +45,8 @@ struct OpfsLikeFiles {
     virtual_root: PathBuf,
     real_root: PathBuf,
     handles: Arc<Mutex<Handles>>,
+    /// Makes the next reopening after a move fail, as a reopening on the OPFS can.
+    fail_reopen: Arc<AtomicBool>,
 }
 
 impl OpfsLikeFiles {
@@ -54,6 +59,7 @@ impl OpfsLikeFiles {
             virtual_root: dir.join("virtual"),
             real_root,
             handles: Arc::default(),
+            fail_reopen: Arc::default(),
         }
     }
 
@@ -73,15 +79,22 @@ impl OpfsLikeFiles {
         self.handles().refused.clone()
     }
 
-    /// Fails as the OPFS does if `path` has more than `own` handles open.
+    /// Fails with the error of a taken file, as the OPFS does, if `path` has more than `own`
+    /// handles open.
     fn refuse_if_open(&self, what: &str, path: &Path, own: usize) -> io::Result<()> {
         let mut handles = self.handles();
         if handles.open.get(path).copied().unwrap_or(0) > own {
             let refusal = format!("NoModificationAllowedError: {what} {path:?}, open elsewhere");
             handles.refused.push(refusal.clone());
-            return Err(io::Error::other(refusal));
+            return Err(FileTaken::error(refusal));
         }
         Ok(())
+    }
+
+    /// Whether opening `path` is refused, as `createSyncAccessHandle` refuses a file that another
+    /// handle has open, with the refusal recorded.
+    fn taken(&self, path: &Path) -> bool {
+        self.refuse_if_open("cannot open", path, 0).is_err()
     }
 
     fn register(&self, native: NativeFile, path: &Path, mode: Mode) -> OpfsLikeFile {
@@ -97,6 +110,9 @@ impl OpfsLikeFiles {
     /// Opens the real file of `path` again as `mode` opened it.
     async fn reopen(&self, path: &Path, mode: Mode) -> io::Result<NativeFile> {
         let real = self.real(path);
+        if self.fail_reopen.swap(false, Ordering::SeqCst) {
+            return Err(io::Error::other("the file could not be opened again"));
+        }
         match mode {
             Mode::Locked => self
                 .native
@@ -119,20 +135,30 @@ impl RoomFiles for OpfsLikeFiles {
         self.handles()
             .opened
             .push((path.to_path_buf(), "open_locked"));
+        if self.taken(path) {
+            return Ok(None);
+        }
         let native = self.native.open_locked(&self.real(path)).await?;
         Ok(native.map(|native| self.register(native, path, Mode::Locked)))
     }
 
+    /// Created before it is refused, as on the OPFS, which checks that the file is missing and
+    /// then creates it, and only then opens it: the file is left created.
     async fn create_locked(&self, path: &Path) -> io::Result<Option<OpfsLikeFile>> {
         self.handles()
             .opened
             .push((path.to_path_buf(), "create_locked"));
         let native = self.native.create_locked(&self.real(path)).await?;
+        if self.taken(path) {
+            return Ok(None);
+        }
         Ok(native.map(|native| self.register(native, path, Mode::Locked)))
     }
 
+    /// Refused before it empties the file, as on the OPFS, which empties it once it is open.
     async fn create(&self, path: &Path) -> io::Result<OpfsLikeFile> {
         self.handles().opened.push((path.to_path_buf(), "create"));
+        self.refuse_if_open("cannot open", path, 0)?;
         let native = self.native.create(&self.real(path)).await?;
         Ok(self.register(native, path, Mode::Write))
     }
@@ -141,6 +167,7 @@ impl RoomFiles for OpfsLikeFiles {
         self.handles()
             .opened
             .push((path.to_path_buf(), "open_read"));
+        self.refuse_if_open("cannot open", path, 0)?;
         let native = self.native.open_read(&self.real(path)).await?;
         Ok(self.register(native, path, Mode::Read))
     }
@@ -269,6 +296,14 @@ impl RoomFile for OpfsLikeFile {
     }
 }
 
+/// Checks that `result` is the error of a taken file.
+fn assert_taken<T: std::fmt::Debug>(result: io::Result<T>) {
+    assert!(
+        matches!(&result, Err(err) if FileTaken::is(err)),
+        "{result:?}"
+    );
+}
+
 /// Opens a file of `layer` at `path`, which exists, as `mode`.
 async fn open_as(layer: &OpfsLikeFiles, path: &Path, mode: Mode) -> OpfsLikeFile {
     match mode {
@@ -288,9 +323,9 @@ async fn the_layer_refuses_to_move_or_remove_a_file_with_a_handle_open() {
 
     for mode in [Mode::Locked, Mode::Write, Mode::Read] {
         let handle = open_as(&layer, &a, mode).await;
-        assert!(layer.rename(&a, &b).await.is_err(), "{mode:?}");
-        assert!(layer.rename(&b, &a).await.is_err(), "{mode:?}");
-        assert!(layer.remove(&a).await.is_err(), "{mode:?}");
+        assert_taken(layer.rename(&a, &b).await);
+        assert_taken(layer.rename(&b, &a).await);
+        assert_taken(layer.remove(&a).await);
         drop(handle);
         layer.rename(&a, &b).await.unwrap();
         layer.rename(&b, &a).await.unwrap();
@@ -301,6 +336,56 @@ async fn the_layer_refuses_to_move_or_remove_a_file_with_a_handle_open() {
     assert!(!layer.virtual_root.exists());
 }
 
+/// A file that a handle has open is not opened again, as `createSyncAccessHandle` refuses it:
+/// `open_locked` and `create_locked` give `None`, `create` and `open_read` the error of a taken
+/// file, and nothing changes what the file holds.
+#[tokio::test]
+async fn the_layer_refuses_a_second_handle_on_a_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let layer = OpfsLikeFiles::new(dir.path());
+    let a = layer.virtual_root.join("a");
+    for mode in [Mode::Locked, Mode::Write, Mode::Read] {
+        std::fs::write(layer.real(&a), b"held").unwrap();
+        let file = open_as(&layer, &a, mode).await;
+        if let Mode::Write = mode {
+            file.write_at(0, b"held".to_vec()).await.unwrap();
+        }
+        assert!(layer.open_locked(&a).await.unwrap().is_none(), "{mode:?}");
+        assert_taken(layer.open_read(&a).await);
+        assert_taken(layer.create(&a).await);
+        // It exists, which `create_locked` finds first.
+        let created = layer.create_locked(&a).await.map(drop);
+        assert!(
+            matches!(&created, Err(err) if err.kind() == io::ErrorKind::AlreadyExists),
+            "{mode:?}: {created:?}"
+        );
+        // Read once the handle is closed: on Windows, another handle cannot read a locked file.
+        drop(file);
+        assert_eq!(std::fs::read(layer.real(&a)).unwrap(), b"held", "{mode:?}");
+        drop(layer.open_locked(&a).await.unwrap().unwrap());
+    }
+    assert_eq!(layer.refused().len(), 9);
+}
+
+/// A file created between the check of `create_locked` and its opening, as on the OPFS, where
+/// another handle can take it there, is `None`, and is left created: here, a handle whose file was
+/// removed outside the layer. Only on Unix: on Windows a file removed with a handle open stays,
+/// pending deletion, until the handle closes, and nothing can create it again meanwhile.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_layer_refuses_a_second_handle_on_a_file_that_create_locked_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let layer = OpfsLikeFiles::new(dir.path());
+    let a = layer.virtual_root.join("a");
+    drop(layer.create(&a).await.unwrap());
+    let reader = layer.open_read(&a).await.unwrap();
+    std::fs::remove_file(layer.real(&a)).unwrap();
+    assert!(layer.create_locked(&a).await.unwrap().is_none());
+    assert!(layer.real(&a).exists(), "the file is left created");
+    drop(reader);
+    assert_eq!(layer.refused().len(), 1);
+}
+
 #[tokio::test]
 async fn the_layer_renames_an_open_file_by_closing_moving_and_reopening_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -309,31 +394,35 @@ async fn the_layer_renames_an_open_file_by_closing_moving_and_reopening_it() {
     let mut file = layer.open_locked(&a).await.unwrap().unwrap();
     file.write_at(0, b"wal".to_vec()).await.unwrap();
 
-    // Another handle at the source or at the destination refuses the move.
-    let reader = layer.open_read(&a).await.unwrap();
-    assert!(file.rename(&b).await.is_err());
-    drop(reader);
+    // Another handle at the destination refuses the move.
     drop(layer.create(&b).await.unwrap());
     let reader = layer.open_read(&b).await.unwrap();
-    assert!(file.rename(&b).await.is_err());
+    assert_taken(file.rename(&b).await);
     drop(reader);
-    assert_eq!(layer.refused().len(), 2);
-    assert!(layer.open_locked(&a).await.unwrap().is_none());
+    assert_eq!(layer.refused().len(), 1);
 
     file.rename(&b).await.unwrap();
     assert!(!layer.exists(&a).await.unwrap());
     assert_eq!(file.read_at(0, 3).await.unwrap(), b"wal");
-    assert!(
-        layer.open_locked(&b).await.unwrap().is_none(),
-        "reopened without its lock"
-    );
+    let native = layer.native.open_locked(&layer.real(&b)).await.unwrap();
+    assert!(native.is_none(), "reopened without its lock");
 
     // A move that fails opens the file again where it was.
     let nowhere = layer.virtual_root.join("missing").join("c");
     assert!(file.rename(&nowhere).await.is_err());
     assert_eq!(file.read_at(0, 3).await.unwrap(), b"wal");
-    assert!(layer.open_locked(&b).await.unwrap().is_none());
-    assert_eq!(layer.refused().len(), 2);
+    let native = layer.native.open_locked(&layer.real(&b)).await.unwrap();
+    assert!(native.is_none(), "reopened without its lock");
+    assert_eq!(layer.refused().len(), 1);
+
+    // A reopening that fails leaves the handle dead: every later operation fails.
+    layer.fail_reopen.store(true, Ordering::SeqCst);
+    assert!(file.rename(&a).await.is_err());
+    assert!(layer.real(&a).exists() && !layer.real(&b).exists());
+    assert!(file.read_at(0, 3).await.is_err());
+    assert!(file.write_at(0, b"lost".to_vec()).await.is_err());
+    assert!(file.rename(&b).await.is_err());
+    assert_eq!(std::fs::read(layer.real(&a)).unwrap(), b"wal");
 }
 
 /// A disk engine on `layer`, with its data directory under the layer's root, that compacts only
@@ -641,4 +730,84 @@ async fn delete_room_returns_a_removal_the_layer_refuses() {
     drop(held);
     engine.open_room(&room, schema()).await.unwrap();
     assert_rows(&engine, &room, 5).await;
+}
+
+/// A rotation whose move succeeds and whose reopening fails leaves the WAL's handle dead, as on
+/// the OPFS: the rotation fails, without marking the room as failed, and readers still see every
+/// acknowledged row; the next write fails on the dead handle and marks the room as failed; closing
+/// it gives the error of its sync; and the room reopens with every row, from `.wal.compacting`.
+#[tokio::test]
+async fn a_rotation_that_leaves_a_dead_handle_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let layer = OpfsLikeFiles::new(dir.path());
+    let room = RoomId::new("opfs-dead-handle").unwrap();
+    let engine = open_on(&layer, &room).await;
+    let wal_path = engine.wal_file_path(&room);
+    apply_range(&engine, &room, 1..=5).await;
+
+    layer.fail_reopen.store(true, Ordering::SeqCst);
+    let compacted = engine.compact_room(&room).await;
+    assert!(compacted.is_err(), "{compacted:?}");
+    assert!(layer.real(&compacting_wal_path(&wal_path)).exists());
+    assert!(!layer.real(&wal_path).exists());
+    assert_rows(&engine, &room, 5).await;
+    let written = engine.apply_batch(&room, vec![insert(6)]).await;
+    assert!(matches!(written, Err(StorageError::Io(_))), "{written:?}");
+    assert_room_failed(&engine, &room, 6).await;
+    let closed = engine.close_room(&room).await;
+    assert!(matches!(closed, Err(StorageError::Io(_))), "{closed:?}");
+    assert!(matches!(
+        engine.get_head_seq(&room).await,
+        Err(StorageError::RoomNotFound(_))
+    ));
+    drop(engine);
+
+    let engine = open_on(&layer, &room).await;
+    assert_rows(&engine, &room, 5).await;
+    apply_range(&engine, &room, 6..=7).await;
+    engine.compact_room(&room).await.unwrap();
+    let engine = reopen_on(engine, &layer, &room).await;
+    assert_rows(&engine, &room, 7).await;
+    assert_clean(engine, &layer, &room).await;
+}
+
+/// The rollback of a rotation whose fresh WAL cannot be created moves the WAL back, and if its
+/// reopening fails, the handle is dead and the room is marked as failed: it reopens with every
+/// acknowledged row.
+#[tokio::test]
+async fn a_rollback_that_leaves_a_dead_handle_marks_the_room_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let layer = OpfsLikeFiles::new(dir.path());
+    let room = RoomId::new("opfs-dead-rollback").unwrap();
+    let engine = open_on(&layer, &room).await;
+    let wal_path = engine.wal_file_path(&room);
+    apply_range(&engine, &room, 1..=5).await;
+
+    fail_point::arm("compaction.rotate_open", &wal_path);
+    // The rotation moves the WAL and reopens it; the rollback moves it back and cannot reopen it.
+    let mut renamed = fail_point::arm_pause("compaction.rotate_renamed", &wal_path);
+    let compaction = {
+        let (engine, room) = (engine.clone(), room.clone());
+        tokio::spawn(async move { engine.compact_room(&room).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), renamed.reached())
+        .await
+        .expect("the rotation renames the WAL");
+    layer.fail_reopen.store(true, Ordering::SeqCst);
+    renamed.release();
+    let compacted = compaction.await.unwrap();
+    assert!(compacted.is_err(), "{compacted:?}");
+    assert!(layer.real(&wal_path).exists());
+    assert!(!layer.real(&compacting_wal_path(&wal_path)).exists());
+    assert_room_failed(&engine, &room, 6).await;
+    let closed = engine.close_room(&room).await;
+    assert!(matches!(closed, Err(StorageError::Io(_))), "{closed:?}");
+    drop(engine);
+
+    let engine = open_on(&layer, &room).await;
+    assert_rows(&engine, &room, 5).await;
+    apply_range(&engine, &room, 6..=6).await;
+    let engine = reopen_on(engine, &layer, &room).await;
+    assert_rows(&engine, &room, 6).await;
+    assert_clean(engine, &layer, &room).await;
 }
