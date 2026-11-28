@@ -4,7 +4,6 @@
 //! reloads, compactions and reopens; and it changes nothing.
 //!
 //! The ignored variant runs many more logs: `cargo test --release -- --ignored`.
-#![allow(clippy::disallowed_methods)]
 
 mod common;
 

@@ -8,10 +8,7 @@
 //! asynchronous: on the Origin Private File System, opening a file, renaming it, removing it and
 //! listing a directory are promises.
 
-// The native layer runs on Tokio's blocking pool, which the lint of the crate keeps out of
-// everything that builds in WebAssembly; the layer never does.
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(clippy::disallowed_methods)]
 pub mod native;
 #[cfg(target_arch = "wasm32")]
 pub mod opfs;
@@ -22,15 +19,6 @@ mod opfs_names;
 pub use native::{NativeFile, NativeFiles};
 #[cfg(target_arch = "wasm32")]
 pub use opfs::{OpfsFile, OpfsFiles};
-
-/// The file layer of the platform, the one of `DiskStorageEngine::new`: natively the file system
-/// of the process, and in WebAssembly the Origin Private File System.
-#[cfg(not(target_arch = "wasm32"))]
-pub type PlatformFiles = NativeFiles;
-/// The file layer of the platform, the one of `DiskStorageEngine::new`: natively the file system
-/// of the process, and in WebAssembly the Origin Private File System.
-#[cfg(target_arch = "wasm32")]
-pub type PlatformFiles = OpfsFiles;
 
 use crate::engine::EngineConcurrencyBounds;
 use async_trait::async_trait;

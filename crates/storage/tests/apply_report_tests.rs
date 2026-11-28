@@ -2,7 +2,6 @@
 //! apply. The only one it does not apply is an update of a row that does not exist, reported as
 //! `MissingRow`; the head moves past it all the same. Both engines report the same, and a
 //! reopened disk room replays the same decisions.
-#![allow(clippy::disallowed_methods)]
 
 mod common;
 

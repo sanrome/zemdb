@@ -300,14 +300,9 @@ async fn load_snapshot(
         )));
     }
 
-    // A payload that does not fit in memory (in wasm32, past 4 GiB) is not read short.
-    let payload_len = usize::try_from(base.snapshot_len).map_err(|_| {
-        StorageError::Other(format!(
-            "The snapshot payload is too large to load: {} bytes",
-            base.snapshot_len
-        ))
-    })?;
-    let read = snap_file.read_at(HEADER_SIZE as u64, payload_len).await;
+    let read = snap_file
+        .read_at(HEADER_SIZE as u64, base.snapshot_len as usize)
+        .await;
     let compressed_snap = fail_point::io_result("recovery.snapshot_body", snap_path, read)?;
     drop(snap_file);
 
@@ -503,6 +498,6 @@ pub(crate) async fn recover_room<F: RoomFiles>(
     })
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 #[path = "tests/recovery.rs"]
 mod tests;

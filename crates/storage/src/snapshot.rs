@@ -172,6 +172,7 @@ const STREAM_BUFFER: usize = 64 * 1024;
 /// Deserializes `T` from the Zstandard stream `compressed` as it decompresses it, reading at
 /// most `limit` decompressed bytes. The stream must end right after the value and, if
 /// `exact_len` is given, be exactly that long.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn deserialize_zstd<T: DeserializeOwned>(
     compressed: &[u8],
     limit: u64,
@@ -181,17 +182,11 @@ pub(crate) fn deserialize_zstd<T: DeserializeOwned>(
 }
 
 /// Compresses `payload` into one Zstandard frame, as [`encode_snapshot_envelope`] compresses its
-/// body: natively with `zstd` at `level`, and in WebAssembly with `ruzstd` at its `Fastest`
-/// level, the only one of [`zstd_levels`] there.
+/// body: with `zstd` at `level`. Its only user, the disk engine, does not build in WebAssembly
+/// yet; there it will be `ruzstd`'s `Fastest` level, as for the envelope.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn compress_zstd(payload: &[u8], level: i32) -> Result<Vec<u8>, StorageError> {
     PlatformZstd::compress(payload, level)
-}
-
-/// The levels that [`compress_zstd`] gives: natively those of `zstd`
-/// (`zstd::compression_level_range()`); in WebAssembly only 1, the level that `ruzstd`'s
-/// `Fastest` stands for (its other levels are not implemented, and `zstd`'s would be ignored).
-pub(crate) fn zstd_levels() -> std::ops::RangeInclusive<i32> {
-    PlatformZstd::levels()
 }
 
 /// [`deserialize_zstd`], decompressing with `Z`.
@@ -329,9 +324,6 @@ fn decompress_bounded<Z: ZstdCodec>(
 /// accepts, `ruzstd` some inconsistent literal sections that `zstd` accepts, and without a
 /// checksum both may accept it with different bytes), which is a false snapshot either way.
 trait ZstdCodec {
-    /// The levels it compresses at.
-    fn levels() -> std::ops::RangeInclusive<i32>;
-
     /// Compresses `payload` into one frame.
     fn compress(payload: &[u8], level: i32) -> Result<Vec<u8>, StorageError>;
 
@@ -351,10 +343,6 @@ struct Libzstd;
 
 #[cfg(not(target_arch = "wasm32"))]
 impl ZstdCodec for Libzstd {
-    fn levels() -> std::ops::RangeInclusive<i32> {
-        zstd::compression_level_range()
-    }
-
     fn compress(payload: &[u8], level: i32) -> Result<Vec<u8>, StorageError> {
         zstd::encode_all(payload, level)
             .map_err(|e| StorageError::Serialization(format!("Zstd compression failed: {e}")))
@@ -392,11 +380,6 @@ struct Ruzstd;
 
 #[cfg(any(target_arch = "wasm32", test))]
 impl ZstdCodec for Ruzstd {
-    /// Only 1, the level that `Fastest` stands for.
-    fn levels() -> std::ops::RangeInclusive<i32> {
-        1..=1
-    }
-
     /// `ruzstd`'s `Fastest` level, similar to `zstd`'s level 1; `level` is ignored. The frame
     /// ends with a checksum of its content.
     fn compress(payload: &[u8], _level: i32) -> Result<Vec<u8>, StorageError> {

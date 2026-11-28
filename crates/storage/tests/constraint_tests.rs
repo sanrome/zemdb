@@ -5,7 +5,6 @@
 //! agree with both engines on random logs.
 //!
 //! The ignored variant runs many more logs: `cargo test --release -- --ignored`.
-#![allow(clippy::disallowed_methods)]
 
 mod common;
 

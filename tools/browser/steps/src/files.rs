@@ -43,7 +43,7 @@ pub(crate) async fn dir(run: &str, path: &str) -> Result<FileSystemDirectoryHand
 }
 
 /// The names of the entries of `dir`, through the browser.
-pub(crate) async fn entries(dir: &FileSystemDirectoryHandle) -> Result<BTreeSet<String>, JsError> {
+async fn entries(dir: &FileSystemDirectoryHandle) -> Result<BTreeSet<String>, JsError> {
     let keys = dir.keys();
     let mut found = BTreeSet::new();
     loop {

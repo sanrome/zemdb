@@ -8,7 +8,6 @@
 //! Worker, with `wasm-bindgen-test-runner`.
 #![cfg(target_arch = "wasm32")]
 
-mod engine;
 mod files;
 mod handles;
 mod js;

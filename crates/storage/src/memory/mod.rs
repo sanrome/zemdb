@@ -287,8 +287,10 @@ impl StorageEngine for MemoryStorageEngine {
         // Checked before decoding, so that an unopened room is reported without decoding.
         self.get_room(room_id)?;
 
+        #[cfg(not(target_arch = "wasm32"))]
         let fail_key = std::path::PathBuf::from(room_id.as_str());
         let (schema, (snapshot_head, data)) = run_blocking(move || {
+            #[cfg(not(target_arch = "wasm32"))]
             crate::fail_point::pause_blocking("apply_snapshot.decode", &fail_key);
             let received = decode_received_snapshot(
                 &snapshot,

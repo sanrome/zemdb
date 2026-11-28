@@ -3,7 +3,6 @@
 //! rest; a disk replica holds the same after a compaction and a reopen. With integrity
 //! constraints, they also reject the same operations for the same reasons, as the reference
 //! model does.
-#![allow(clippy::disallowed_methods)]
 
 mod common;
 

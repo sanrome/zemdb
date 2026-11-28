@@ -10,7 +10,7 @@ use crate::error::StorageError;
 use crate::fail_point;
 use crate::files::{RoomFile, RoomFiles};
 use crate::memory::{RoomSnapshotRef, Table};
-use crate::sys::{random_name, run_blocking};
+use crate::sys::run_blocking;
 
 /// Path of the WAL segment rotated out by an in-progress (or interrupted) compaction.
 pub(crate) fn compacting_wal_path(wal_path: &Path) -> PathBuf {
@@ -21,12 +21,6 @@ pub(crate) fn compacting_wal_path(wal_path: &Path) -> PathBuf {
 /// `.wal.compacting`.
 pub(crate) fn absorbing_wal_path(wal_path: &Path) -> PathBuf {
     wal_path.with_extension("wal.compacting.tmp")
-}
-
-/// A path for a snapshot staged next to `snap_path`, at random: `room_{id}.snap.tmp.` followed by
-/// [`random_name`], which the recovery and `delete_room` find by that prefix.
-pub(crate) fn staged_snapshot_path(snap_path: &Path) -> Result<PathBuf, StorageError> {
-    Ok(snap_path.with_extension(format!("snap.tmp.{}", random_name()?)))
 }
 
 /// Holds a room's compaction flag and releases it when dropped, including on early returns
@@ -380,7 +374,7 @@ async fn stage_file(
     payload: Vec<u8>,
     room_id: &RoomId,
 ) -> Result<StagedSnapshot, StorageError> {
-    let tmp_path = staged_snapshot_path(snap_path)?;
+    let tmp_path = snap_path.with_extension(format!("snap.tmp.{}", uuid::Uuid::new_v4()));
     let compressed_len = payload.len() as u64;
 
     let tmp = files.create_locked(&tmp_path).await?;
@@ -563,6 +557,6 @@ pub(crate) async fn sync_parent(files: &impl RoomFiles, path: &Path) -> Result<(
     Ok(files.sync_dir(parent).await?)
 }
 
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 #[path = "tests/compactor.rs"]
 mod tests;

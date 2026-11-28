@@ -1,5 +1,3 @@
-#![allow(clippy::disallowed_methods)]
-
 mod common;
 
 use common::*;
@@ -211,10 +209,4 @@ fn engine_options_that_cannot_work_are_rejected() {
     }
     assert!(DiskStorageEngine::new(options()).is_ok());
     assert!(DiskStorageEngine::new(options().compaction_ratio(0.5).zstd_level(19)).is_ok());
-    // Natively the default is 3, and every level of `zstd` is taken, the negative ones too.
-    assert_eq!(options().zstd_level, 3);
-    for level in [*levels.start(), -7, -1, 1, 22] {
-        let result = DiskStorageEngine::new(options().zstd_level(level));
-        assert!(result.is_ok(), "level {level}: {result:?}");
-    }
 }

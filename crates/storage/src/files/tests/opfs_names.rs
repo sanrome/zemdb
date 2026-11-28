@@ -1,5 +1,5 @@
 use super::*;
-use crate::disk::compactor::{absorbing_wal_path, compacting_wal_path, staged_snapshot_path};
+use crate::disk::compactor::{absorbing_wal_path, compacting_wal_path};
 use crate::{DiskStorageEngine, DiskStorageOptions};
 use std::path::PathBuf;
 use zemdb_core::RoomId;
@@ -332,7 +332,7 @@ fn no_name_of_the_engine_or_of_the_metadata_has_the_mark_of_a_generation() {
     let engine = DiskStorageEngine::new(DiskStorageOptions::new("zemdb/data")).unwrap();
     let wal = engine.wal_file_path(&room);
     let snap = engine.snap_file_path(&room);
-    let staged = staged_snapshot_path(&snap).unwrap();
+    let staged = snap.with_extension(format!("snap.tmp.{}", uuid::Uuid::new_v4()));
     let mut paths = vec![
         engine.lock_file_path(&room),
         snap,
