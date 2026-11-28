@@ -28,7 +28,7 @@ use zemdb_client::{
 };
 use zemdb_core::ClientMessageKind::Sync;
 use zemdb_core::*;
-use zemdb_storage::{StorageEngine, StorageError};
+use zemdb_storage::{DiskStorageEngine, StorageEngine, StorageError};
 
 fn tasks_id() -> SchemaId {
     SchemaId::new("tasks").unwrap()
@@ -793,4 +793,259 @@ async fn a_failed_save_or_reload_of_a_new_schema_leaves_the_room_out() {
         assert_eq!(tasks(&storage, &room_id).await, [1, 2, 3, 4], "{failing}");
         assert_eq!(deregistrations(&transport), 0, "{failing}");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A save of the new schema whose sync of the directory failed
+
+/// The rows of `rows` without the nulls at the end of each, which a row gets when it is widened
+/// to a later schema in one replica and not in another.
+fn without_trailing_nulls(rows: &oracle::Rows) -> Vec<(u16, Vec<String>, Vec<String>)> {
+    let mut dump = oracle::dump(rows);
+    for (_, _, row) in &mut dump {
+        while row.last().is_some_and(|value| value == "Null") {
+            row.pop();
+        }
+    }
+    dump
+}
+
+/// What the cases of a failed sync of the directory of the metadata share: a client over a disk
+/// engine in `data_dir`, with its metadata in `meta_dir`, both through `files`, at the head 2 of
+/// the version 1 of the schema; then the column with `UNIQUE` is added, and the log rejects the
+/// update of row 2 to the tag of row 1 (seq 4), after which row 1 takes another tag (seq 5).
+/// Returns the server, the room, the client, its engine and the rows of the log at its head 5.
+async fn failed_sync_setup(
+    data_dir: &Path,
+    meta_dir: &Path,
+    files: &TestFiles,
+) -> (
+    TestServer,
+    RoomId,
+    Client,
+    DiskStorageEngine<TestFiles>,
+    oracle::Rows,
+) {
+    let server = TestServer::new();
+    let room_id = server.create_room("room-a").await;
+    let storage = DiskStorageEngine::with_files(options(data_dir), files.clone()).unwrap();
+    let client = Client::open(
+        ClientConfig::new("ana"),
+        storage.clone(),
+        FileMetadata::with_files(meta_dir, files.clone()),
+        server.transport(),
+        TestTokens::new(),
+    )
+    .await
+    .unwrap();
+    open_room(&client, &room_id).await.unwrap();
+    let mut reference = oracle::Oracle::new(tasks_schema());
+    reference.apply_batch(&server.commit(&room_id, 1..=2).await);
+    client.sync(room_id.clone()).await.unwrap();
+    add_tag_column(&server).await;
+    reference.evolve(tagged_schema());
+    let ops = [update_tag(1, "a"), update_tag(2, "a"), update_tag(1, "b")];
+    let rejected = reference.apply_batch(&server.commit_ops(&room_id, ops).await);
+    let unique = oracle::Reason::Unique("tasks_tag".to_string());
+    assert_eq!(rejected, [(4, unique)]);
+    let rows = reference.rows().clone();
+    (server, room_id, client, storage, rows)
+}
+
+/// The index in the log of `files` of the only operation that failed, the sync of the directory
+/// `dir_name` of a save of the metadata of `room-a`, right after its rename; and the log.
+fn failed_sync(files: &TestFiles, dir_name: &str) -> (usize, Vec<String>) {
+    let (log, failures) = (files.log(), files.failures());
+    let [failed] = failures[..] else {
+        panic!("{failures:?}");
+    };
+    assert_eq!(log[failed], format!("sync_dir {dir_name}"), "{log:#?}");
+    let rename = "rename room_room-a.meta.tmp room_room-a.meta";
+    assert_eq!(log[failed - 1], rename, "{log:#?}");
+    (failed, log)
+}
+
+/// Checks that the log of `files`, where the sync of the directory `dir_name` of a save of the
+/// metadata of `room-a` failed, has a sync of that directory after the failed one and before the
+/// first write of the WAL of the room, with the operations of the new version.
+fn assert_durable_before_written(files: &TestFiles, dir_name: &str) {
+    let (failed, log) = failed_sync(files, dir_name);
+    let synced = format!("sync_dir {dir_name}");
+    let after_failed = || log.iter().skip(failed + 1);
+    let synced_again = (after_failed().position(|logged| *logged == synced))
+        .expect("the directory is synced again");
+    let written = (after_failed()
+        .position(|logged| logged.starts_with("write_at room_room-a.wal")))
+    .expect("the operations of version 2 are written");
+    assert!(synced_again < written, "{log:#?}");
+}
+
+#[tokio::test]
+async fn a_failed_sync_of_a_saved_schema_is_made_durable_before_the_room_writes_under_it() {
+    let dir = tempdir().unwrap();
+    let dir_name = dir_name(dir.path());
+    let files = TestFiles::default();
+    let (_server, room_id, client, storage, expected) =
+        failed_sync_setup(dir.path(), dir.path(), &files).await;
+    files.fail_next("sync_dir", dir_name);
+    let synced = client.sync(room_id.clone()).await;
+    assert!(matches!(synced, Err(ClientError::Storage(_))), "{synced:?}");
+    open_room(&client, &room_id).await.unwrap();
+    client.sync(room_id.clone()).await.unwrap();
+    assert_eq!(client.status(room_id.clone()).await, Ok(status(5, 1, true)));
+    let replica = rows(&storage, &room_id).await;
+    assert_eq!(
+        without_trailing_nulls(&replica),
+        without_trailing_nulls(&expected)
+    );
+    // With the metadata in the directory of the engine, the store and the open of the storage
+    // room both sync it.
+    assert_durable_before_written(&files, dir_name);
+}
+
+/// The metadata in a directory of their own: the sync of the store is the only one of that
+/// directory, and a crash after the replica applied the operations of the new version keeps the
+/// rename of their save. Without it, the replica would open with the earlier schema, narrower
+/// than its log, which decides those operations without the `UNIQUE` constraint: the update
+/// that the log rejected would be applied, the later one would remove the conflict, and the
+/// reload to the schema of `Registered` would find no row that breaks it.
+#[tokio::test]
+async fn metadata_apart_from_the_engine_are_durable_before_the_room_writes_after_a_failed_sync() {
+    let (data_dir, meta_dir) = (tempdir().unwrap(), tempdir().unwrap());
+    let meta_name = dir_name(meta_dir.path());
+    let files = TestFiles::default();
+    let (server, room_id, client, storage, expected) =
+        failed_sync_setup(data_dir.path(), meta_dir.path(), &files).await;
+    let meta_path = meta_dir.path().join("room_room-a.meta");
+    // What the metadata held before the save: the schema of version 1, durable since the save of
+    // `Registered` synced their directory.
+    let before_save = std::fs::read(&meta_path).unwrap();
+    files.fail_next("sync_dir", meta_name);
+    let synced = client.sync(room_id.clone()).await;
+    assert!(matches!(synced, Err(ClientError::Storage(_))), "{synced:?}");
+    open_room(&client, &room_id).await.unwrap();
+    client.sync(room_id.clone()).await.unwrap();
+    let replica = rows(&storage, &room_id).await;
+    assert_eq!(
+        without_trailing_nulls(&replica),
+        without_trailing_nulls(&expected)
+    );
+    assert_durable_before_written(&files, meta_name);
+
+    // A crash keeps what the syncs made durable: the operations the WAL synced, and the rename
+    // of the save, the last one of the file, if a sync of the directory of the metadata followed
+    // the one that failed. Otherwise, the metadata go back to what they held before it.
+    let (failed, log) = failed_sync(&files, meta_name);
+    let after_failed = &log[failed + 1..];
+    let rename = "rename room_room-a.meta.tmp room_room-a.meta".to_string();
+    assert!(!after_failed.contains(&rename), "{log:#?}");
+    let durable = after_failed.contains(&format!("sync_dir {meta_name}"));
+    drop(client);
+    drop(storage);
+    if !durable {
+        std::fs::write(&meta_path, &before_save).unwrap();
+    }
+    let storage = DiskStorageEngine::new(options(data_dir.path())).unwrap();
+    let client = Client::open(
+        ClientConfig::new("ana"),
+        storage.clone(),
+        FileMetadata::new(meta_dir.path()),
+        server.transport(),
+        TestTokens::new(),
+    )
+    .await
+    .unwrap();
+    open_room(&client, &room_id).await.unwrap();
+    client.sync(room_id.clone()).await.unwrap();
+    assert_eq!(
+        metadata(meta_dir.path(), &room_id).await.schema,
+        tagged_schema()
+    );
+    let status_now = client.status(room_id.clone()).await.unwrap();
+    assert_eq!(
+        (status_now.head_seq.get(), status_now.failed_closed),
+        (5, false)
+    );
+    let replica = rows(&storage, &room_id).await;
+    assert_eq!(
+        without_trailing_nulls(&replica),
+        without_trailing_nulls(&expected),
+        "the replica at the head of the log holds another state than the log"
+    );
+}
+
+#[tokio::test]
+async fn a_sync_that_fails_before_the_metadata_of_a_failed_save_are_served_fails_the_open() {
+    let (data_dir, meta_dir) = (tempdir().unwrap(), tempdir().unwrap());
+    let meta_name = dir_name(meta_dir.path());
+    let files = TestFiles::default();
+    let (_server, room_id, client, storage, expected) =
+        failed_sync_setup(data_dir.path(), meta_dir.path(), &files).await;
+    files.fail_next("sync_dir", meta_name);
+    let synced = client.sync(room_id.clone()).await;
+    assert!(matches!(synced, Err(ClientError::Storage(_))), "{synced:?}");
+
+    files.fail_next("sync_dir", meta_name);
+    let failed_at = files.log().len();
+    let opened = open_room(&client, &room_id).await;
+    assert!(matches!(opened, Err(ClientError::Storage(_))), "{opened:?}");
+    let closed = Err(ClientError::RoomClosed(room_id.clone()));
+    assert_eq!(client.status(room_id.clone()).await, closed);
+    // Nothing was served: neither the metadata were read nor the storage room opened.
+    let log = files.log()[failed_at..].to_vec();
+    assert!(log.contains(&format!("sync_dir {meta_name}")), "{log:#?}");
+    let served = ["open_read room_room-a.meta", "open_locked room_room-a.lock"];
+    assert!(!served.iter().any(|entry| log.contains(&entry.to_string())));
+
+    open_room(&client, &room_id).await.unwrap();
+    client.sync(room_id.clone()).await.unwrap();
+    assert_eq!(client.status(room_id.clone()).await, Ok(status(5, 1, true)));
+    let replica = rows(&storage, &room_id).await;
+    assert_eq!(
+        without_trailing_nulls(&replica),
+        without_trailing_nulls(&expected)
+    );
+}
+
+#[tokio::test]
+async fn a_client_opened_again_after_a_failed_save_syncs_the_metadata_before_it_serves_them() {
+    let (data_dir, meta_dir) = (tempdir().unwrap(), tempdir().unwrap());
+    let meta_name = dir_name(meta_dir.path());
+    let files = TestFiles::default();
+    let (server, room_id, client, storage, expected) =
+        failed_sync_setup(data_dir.path(), meta_dir.path(), &files).await;
+    files.fail_next("sync_dir", meta_name);
+    let synced = client.sync(room_id.clone()).await;
+    assert!(matches!(synced, Err(ClientError::Storage(_))), "{synced:?}");
+    client.shutdown().await.unwrap();
+
+    let reopened_at = files.log().len();
+    let client = Client::open(
+        ClientConfig::new("ana"),
+        storage.clone(),
+        FileMetadata::with_files(meta_dir.path(), files.clone()),
+        server.transport(),
+        TestTokens::new(),
+    )
+    .await
+    .unwrap();
+    open_room(&client, &room_id).await.unwrap();
+    client.sync(room_id.clone()).await.unwrap();
+    let replica = rows(&storage, &room_id).await;
+    assert_eq!(
+        without_trailing_nulls(&replica),
+        without_trailing_nulls(&expected)
+    );
+    // The open of the store syncs the directory before it serves anything; the new store knows
+    // nothing of the failure, so that is the only sync before the metadata of the room are read.
+    let log = files.log()[reopened_at..].to_vec();
+    let at = |entry: &str| log.iter().position(|logged| logged == entry).expect(entry);
+    let synced_meta = format!("sync_dir {meta_name}");
+    assert!(at("open_locked client.lock") < at(&synced_meta), "{log:#?}");
+    assert!(at(&synced_meta) < at("open_read client.meta"), "{log:#?}");
+    let read = at("open_read room_room-a.meta");
+    let syncs = log[..read].iter().filter(|logged| **logged == synced_meta);
+    assert_eq!(syncs.count(), 1, "{log:#?}");
+    let written = (log.iter()).position(|logged| logged.starts_with("write_at room_room-a.wal"));
+    assert!(read < written.expect("written"), "{log:#?}");
 }

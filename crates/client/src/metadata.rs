@@ -36,7 +36,10 @@ pub trait MetadataStore: Debug + Send + Sync {
     async fn close(&self);
 
     /// The metadata of `room_id`, or `None` if it has none. An error reading them is an error,
-    /// never missing metadata.
+    /// never missing metadata. While the store is open, from [`open`](Self::open) to
+    /// [`close`](Self::close), what it serves is as durable as the store keeps its metadata, also
+    /// after a save or a removal of them that failed; a store that is not open serves what it
+    /// reads, without that guarantee.
     async fn room(&self, room_id: &RoomId) -> io::Result<Option<RoomMetadata>>;
 
     /// Replaces the metadata of `room_id`, durably and atomically.
@@ -47,8 +50,8 @@ pub trait MetadataStore: Debug + Send + Sync {
     async fn remove_room(&self, room_id: &RoomId) -> io::Result<()>;
 }
 
-/// The metadata in files of a directory, through a file layer: the data directory of a disk
-/// engine, next to its files and with names it does not use.
+/// The metadata in files of a directory, through a file layer: any directory, also the data
+/// directory of a disk engine, next to its files and with names it does not use.
 ///
 /// - `client.lock`, whose exclusive lock the store holds while it is open;
 /// - `client.meta`, the device id;
@@ -59,6 +62,15 @@ pub trait MetadataStore: Debug + Send + Sync {
 /// not verify counts as missing. A temporary file is never read: the next save replaces it, and
 /// removing the metadata of its room removes it.
 ///
+/// While the store is open, the metadata of a room are durable before they are served: the
+/// first time since the store opened, and after a save or a removal of them that failed, at any
+/// step. Where a sync of the directory makes durable what already happened
+/// (`sync_dir_covers_earlier_changes`), as on the file system of the process, the store syncs
+/// the directory and its parent when it opens, and the directory before it serves a room after
+/// a failure. Where it does not, as on the Origin Private File System, it saves again what it
+/// reads before it serves it, and repeats a removal that failed, serving no metadata. If it
+/// cannot, reading the room fails, so the room does not open.
+///
 /// Each operation runs in a task of its own, which runs to its end even if its caller stops
 /// waiting, after the operations before it: none lands after a later one, and the lock of
 /// `client.lock` is released only once the last one ended.
@@ -66,9 +78,37 @@ pub trait MetadataStore: Debug + Send + Sync {
 pub struct FileMetadata<F: RoomFiles = NativeFiles> {
     files: Arc<F>,
     dir: PathBuf,
-    /// The handle of `client.lock` while the store is open, under the lock each operation holds.
-    lock: Arc<tokio::sync::Mutex<Option<F::File>>>,
+    state: Arc<tokio::sync::Mutex<State<F>>>,
 }
+
+/// What the operations of a [`FileMetadata`] share, under the lock each one holds while it runs
+/// in its task.
+#[derive(Debug)]
+struct State<F: RoomFiles> {
+    /// The handle of `client.lock` while the store is open.
+    lock: Option<F::File>,
+    /// What the store knows of the metadata of each room since it opened, by the name of their
+    /// file, which holds while it is open. Those of a room it knows nothing of are durable where
+    /// a sync of the directory makes durable what already happened, since the open synced it;
+    /// elsewhere, they are served for the first time.
+    rooms: HashMap<String, Known>,
+}
+
+/// What a [`FileMetadata`] knows of the metadata of a room. A save or a removal marks them failed
+/// before its first step, and durable once it succeeded, in its task, which runs to its end even
+/// if its caller stopped waiting: an error at any step, or a panic, leaves them marked failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Known {
+    /// Saved, removed or made durable since the store opened.
+    Durable,
+    /// A save of them failed.
+    SaveFailed,
+    /// A removal of them failed.
+    RemovalFailed,
+}
+
+/// The lock of the [`State`] of a [`FileMetadata`], which an operation holds in its task.
+type Held<F> = tokio::sync::OwnedMutexGuard<State<F>>;
 
 impl FileMetadata {
     /// The metadata in `dir`, on the file system of the process.
@@ -80,26 +120,26 @@ impl FileMetadata {
 impl<F: RoomFiles> FileMetadata<F> {
     /// The metadata in `dir`, through `files`.
     pub fn with_files(dir: impl Into<PathBuf>, files: F) -> Self {
+        let state = State {
+            lock: None,
+            rooms: HashMap::new(),
+        };
         Self {
             files: Arc::new(files),
             dir: dir.into(),
-            lock: Arc::default(),
+            state: Arc::new(tokio::sync::Mutex::new(state)),
         }
     }
 
-    /// Runs `op` on the files and the directory in a task of its own, once the operations before
-    /// it ended.
-    async fn run<T, Fut>(&self, op: impl FnOnce(Arc<F>, PathBuf) -> Fut) -> io::Result<T>
+    /// Runs `op` on the files, the directory and the state of the store in a task of its own,
+    /// once the operations before it ended: the task holds the state until `op` ends.
+    async fn run<T, Fut>(&self, op: impl FnOnce(Arc<F>, PathBuf, Held<F>) -> Fut) -> io::Result<T>
     where
         T: MaybeSend + 'static,
         Fut: Future<Output = io::Result<T>> + MaybeSend + 'static,
     {
-        let lock = Arc::clone(&self.lock).lock_owned().await;
-        let op = op(Arc::clone(&self.files), self.dir.clone());
-        let task = rt::spawn(async move {
-            let _lock = lock;
-            op.await
-        });
+        let state = Arc::clone(&self.state).lock_owned().await;
+        let task = rt::spawn(op(Arc::clone(&self.files), self.dir.clone(), state));
         task.await
             .map_err(|err| io::Error::other(format!("Metadata task failed: {err}")))?
     }
@@ -146,6 +186,17 @@ async fn write(
     files.sync_dir(dir).await
 }
 
+/// Removes the file `name` of `dir` and its temporary file, if they are there.
+async fn remove(files: &impl RoomFiles, dir: &Path, name: &str) -> io::Result<()> {
+    for path in [dir.join(name), dir.join(format!("{name}.tmp"))] {
+        match files.remove(&path).await {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            removed => removed?,
+        }
+    }
+    files.sync_dir(dir).await
+}
+
 /// The content of `client.meta`.
 #[derive(Serialize, Deserialize)]
 struct Device {
@@ -156,13 +207,23 @@ struct Device {
 impl<F: RoomFiles> MetadataStore for FileMetadata<F> {
     async fn open(&self) -> io::Result<u128> {
         let (lock, device_id) = self
-            .run(|files, dir| async move {
+            .run(|files, dir, mut state| async move {
                 files.create_dir_all(&dir).await?;
                 let lock = files.open_locked(&dir.join("client.lock")).await?;
                 let lock = lock.ok_or_else(|| {
                     let message = format!("{} is held by another client", dir.display());
                     io::Error::new(io::ErrorKind::WouldBlock, message)
                 })?;
+                // Where it does, this sync makes durable what the operations before this open
+                // left, those that failed included, before anything is served, and so does the
+                // sync of the parent for the entry of the directory, whose creation may not have
+                // been synced; elsewhere, each room is saved again the first time it is served.
+                // So the store forgets its failures, which another store over the same directory
+                // never knew.
+                for synced in [Some(dir.as_path()), dir.parent()].into_iter().flatten() {
+                    files.sync_dir(synced).await?;
+                }
+                state.rooms.clear();
                 let device_id = match read::<Device>(&*files, &dir, "client.meta").await? {
                     Some(device) => device.device_id,
                     None => {
@@ -174,36 +235,58 @@ impl<F: RoomFiles> MetadataStore for FileMetadata<F> {
                 Ok((lock, device_id))
             })
             .await?;
-        *self.lock.lock().await = Some(lock);
+        self.state.lock().await.lock = Some(lock);
         Ok(device_id)
     }
 
     async fn close(&self) {
-        *self.lock.lock().await = None;
+        self.state.lock().await.lock = None;
     }
 
     async fn room(&self, room_id: &RoomId) -> io::Result<Option<RoomMetadata>> {
         let name = room_file(room_id);
-        self.run(|files, dir| async move { read(&*files, &dir, &name).await })
-            .await
+        self.run(|files, dir, mut state| async move {
+            let known = state.rooms.get(&name).copied();
+            let metadata = if files.sync_dir_covers_earlier_changes() {
+                if known.is_some_and(|known| known != Known::Durable) {
+                    files.sync_dir(&dir).await?;
+                }
+                read(&*files, &dir, &name).await?
+            } else if known == Some(Known::RemovalFailed) {
+                remove(&*files, &dir, &name).await?;
+                None
+            } else {
+                let metadata = read::<RoomMetadata>(&*files, &dir, &name).await?;
+                let unknown = known != Some(Known::Durable);
+                if let Some(metadata) = metadata.as_ref().filter(|_| unknown) {
+                    write(&*files, &dir, &name, metadata).await?;
+                }
+                metadata
+            };
+            state.rooms.insert(name, Known::Durable);
+            Ok(metadata)
+        })
+        .await
     }
 
     async fn save_room(&self, room_id: &RoomId, metadata: &RoomMetadata) -> io::Result<()> {
         let (name, metadata) = (room_file(room_id), metadata.clone());
-        self.run(|files, dir| async move { write(&*files, &dir, &name, &metadata).await })
-            .await
+        self.run(|files, dir, mut state| async move {
+            state.rooms.insert(name.clone(), Known::SaveFailed);
+            write(&*files, &dir, &name, &metadata).await?;
+            state.rooms.insert(name, Known::Durable);
+            Ok(())
+        })
+        .await
     }
 
     async fn remove_room(&self, room_id: &RoomId) -> io::Result<()> {
         let name = room_file(room_id);
-        self.run(|files, dir| async move {
-            for path in [dir.join(&name), dir.join(format!("{name}.tmp"))] {
-                match files.remove(&path).await {
-                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                    removed => removed?,
-                }
-            }
-            files.sync_dir(&dir).await
+        self.run(|files, dir, mut state| async move {
+            state.rooms.insert(name.clone(), Known::RemovalFailed);
+            remove(&*files, &dir, &name).await?;
+            state.rooms.insert(name, Known::Durable);
+            Ok(())
         })
         .await
     }

@@ -1177,13 +1177,16 @@ impl TestTransport {
 
 /// The file system of the process through a layer that logs what is done to each file (by its
 /// name, without its reads), and where one operation on one file can fail with an I/O error (not
-/// a missing file) and a write can be slow.
+/// a missing file) or panic, and a write can be slow.
 #[derive(Debug, Clone, Default)]
 pub struct TestFiles {
     failing: Option<(&'static str, &'static str)>,
     fail_next: Arc<Mutex<Option<(&'static str, &'static str)>>>,
+    panic_next: Arc<Mutex<Option<(&'static str, &'static str)>>>,
     next_write_delay: Arc<Mutex<Option<Duration>>>,
     log: Arc<Mutex<Vec<String>>>,
+    failures: Arc<Mutex<Vec<usize>>>,
+    sync_dir_covers_only_its_own: bool,
 }
 
 impl TestFiles {
@@ -1196,9 +1199,25 @@ impl TestFiles {
         }
     }
 
+    /// A layer whose `sync_dir` says, as on the Origin Private File System, that it does not
+    /// make durable a change that already happened: only those of the operations that succeeded
+    /// ([`RoomFiles::sync_dir_covers_earlier_changes`] is `false`).
+    pub fn with_the_sync_dir_of_the_opfs() -> Self {
+        Self {
+            sync_dir_covers_only_its_own: true,
+            ..Self::default()
+        }
+    }
+
     /// Makes the next `operation` on the file named `name` fail as in [`failing`](Self::failing).
     pub fn fail_next(&self, operation: &'static str, name: &'static str) {
         *self.fail_next.lock().unwrap() = Some((operation, name));
+    }
+
+    /// Makes the next `operation` on the file named `name` panic once it is logged, as one that
+    /// fails does.
+    pub fn panic_next(&self, operation: &'static str, name: &'static str) {
+        *self.panic_next.lock().unwrap() = Some((operation, name));
     }
 
     /// Makes the next write land `delay` after it is called, even if its caller stopped
@@ -1207,9 +1226,16 @@ impl TestFiles {
         *self.next_write_delay.lock().unwrap() = Some(delay);
     }
 
-    /// What was done to the files so far, in order, as `operation name`.
+    /// What was done to the files so far, in order, as `operation name`. An operation that fails
+    /// is logged before it fails.
     pub fn log(&self) -> Vec<String> {
         self.log.lock().unwrap().clone()
+    }
+
+    /// The indices in the [`log`](Self::log) of the operations that failed, in the order they
+    /// failed (a read, which is not logged, is not among them).
+    pub fn failures(&self) -> Vec<usize> {
+        self.failures.lock().unwrap().clone()
     }
 
     /// Waits until an entry that starts with `entry` is in the log.
@@ -1219,19 +1245,29 @@ impl TestFiles {
         }
     }
 
-    /// Logs `operation` on the files `names` unless it is a read, and fails if it is the failing
-    /// one on the last of them.
+    /// Logs `operation` on the files `names` unless it is a read, and fails, or panics, if it is
+    /// the failing one, or the one to panic, on the last of them.
     fn run(&self, operation: &'static str, names: &[&str]) -> io::Result<()> {
-        if !matches!(operation, "size" | "read_at") {
-            self.push(format!("{operation} {}", names.join(" ")));
-        }
+        let logged = (!matches!(operation, "size" | "read_at")).then(|| {
+            let mut log = self.log.lock().unwrap();
+            log.push(format!("{operation} {}", names.join(" ")));
+            log.len() - 1
+        });
         let this = names.last().map(|name| (operation, *name));
+        // The lock is released before the panic, which would poison it.
+        let panics = (self.panic_next.lock().unwrap()).take_if(|next| Some(*next) == this);
+        if panics.is_some() {
+            panic!("injected panic in {operation}");
+        }
         let mut fail_next = self.fail_next.lock().unwrap();
         let once = fail_next.is_some() && *fail_next == this;
         if once {
             *fail_next = None;
         }
         if once || (self.failing.is_some() && self.failing == this) {
+            if let Some(index) = logged {
+                self.failures.lock().unwrap().push(index);
+            }
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected"));
         }
         Ok(())
@@ -1252,6 +1288,12 @@ impl TestFiles {
 
 fn name(path: &Path) -> &str {
     path.file_name().and_then(|name| name.to_str()).unwrap()
+}
+
+/// The name of the directory `dir` as a [`TestFiles`] logs it, which [`TestFiles::fail_next`]
+/// takes.
+pub fn dir_name(dir: &Path) -> &'static str {
+    Box::leak(name(dir).to_string().into_boxed_str())
 }
 
 #[async_trait]
@@ -1309,7 +1351,7 @@ impl RoomFiles for TestFiles {
     }
 
     fn sync_dir_covers_earlier_changes(&self) -> bool {
-        NativeFiles.sync_dir_covers_earlier_changes()
+        !self.sync_dir_covers_only_its_own && NativeFiles.sync_dir_covers_earlier_changes()
     }
 }
 
