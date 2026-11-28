@@ -458,7 +458,6 @@ async fn metadata_of_registered_whose_sync_failed_are_made_durable_before_the_ro
         () = held.replied() => {}
     }
     files.fail_next("sync_dir", meta_name);
-    let failed_at = files.log().len();
     held.release();
     let opened = opening.await;
     assert!(matches!(opened, Err(ClientError::Storage(_))), "{opened:?}");
@@ -483,12 +482,15 @@ async fn metadata_of_registered_whose_sync_failed_are_made_durable_before_the_ro
     assert_eq!(transport.registrations(), registrations);
     // A sync of their directory after the one that failed, before the storage room opens, and
     // so before anything is written under them.
-    let log = files.log()[failed_at..].to_vec();
+    let (log, failures) = (files.log(), files.failures());
+    let [failed] = failures[..] else {
+        panic!("{failures:?}");
+    };
     let synced = format!("sync_dir {meta_name}");
-    let at = |entry: &str| log.iter().position(|logged| logged == entry).expect(entry);
-    let renamed = at("rename room_room-a.meta.tmp room_room-a.meta");
-    assert_eq!(log[renamed + 1], synced, "{log:#?}");
-    let after_failed = || log.iter().skip(renamed + 2);
+    assert_eq!(log[failed], synced, "{log:#?}");
+    let rename = "rename room_room-a.meta.tmp room_room-a.meta";
+    assert_eq!(log[failed - 1], rename, "{log:#?}");
+    let after_failed = || log.iter().skip(failed + 1);
     let synced_again = after_failed().position(|logged| *logged == synced);
     let opened = after_failed().position(|logged| logged == "open_locked room_room-a.lock");
     let written = after_failed().position(|logged| logged.starts_with("write_at room_room-a.wal"));

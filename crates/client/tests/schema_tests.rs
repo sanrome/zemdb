@@ -852,17 +852,26 @@ async fn failed_sync_setup(
     (server, room_id, client, storage, rows)
 }
 
-/// Checks that `log`, from before a save of the metadata of `room-a` whose sync of the directory
-/// `dir_name` failed right after its rename, has a sync of that directory after the failed one
-/// and before the first write of the WAL of the room, with the operations of the new version.
-fn assert_durable_before_written(log: &[String], dir_name: &str) {
+/// The index in the log of `files` of the only operation that failed, the sync of the directory
+/// `dir_name` of a save of the metadata of `room-a`, right after its rename; and the log.
+fn failed_sync(files: &TestFiles, dir_name: &str) -> (usize, Vec<String>) {
+    let (log, failures) = (files.log(), files.failures());
+    let [failed] = failures[..] else {
+        panic!("{failures:?}");
+    };
+    assert_eq!(log[failed], format!("sync_dir {dir_name}"), "{log:#?}");
+    let rename = "rename room_room-a.meta.tmp room_room-a.meta";
+    assert_eq!(log[failed - 1], rename, "{log:#?}");
+    (failed, log)
+}
+
+/// Checks that the log of `files`, where the sync of the directory `dir_name` of a save of the
+/// metadata of `room-a` failed, has a sync of that directory after the failed one and before the
+/// first write of the WAL of the room, with the operations of the new version.
+fn assert_durable_before_written(files: &TestFiles, dir_name: &str) {
+    let (failed, log) = failed_sync(files, dir_name);
     let synced = format!("sync_dir {dir_name}");
-    let renamed = log
-        .iter()
-        .position(|logged| logged == "rename room_room-a.meta.tmp room_room-a.meta")
-        .expect("renamed");
-    assert_eq!(log[renamed + 1], synced, "{log:#?}");
-    let after_failed = || log.iter().skip(renamed + 2);
+    let after_failed = || log.iter().skip(failed + 1);
     let synced_again = (after_failed().position(|logged| *logged == synced))
         .expect("the directory is synced again");
     let written = (after_failed()
@@ -879,7 +888,6 @@ async fn a_failed_sync_of_a_saved_schema_is_made_durable_before_the_room_writes_
     let (_server, room_id, client, storage, expected) =
         failed_sync_setup(dir.path(), dir.path(), &files).await;
     files.fail_next("sync_dir", dir_name);
-    let failed_at = files.log().len();
     let synced = client.sync(room_id.clone()).await;
     assert!(matches!(synced, Err(ClientError::Storage(_))), "{synced:?}");
     open_room(&client, &room_id).await.unwrap();
@@ -892,7 +900,7 @@ async fn a_failed_sync_of_a_saved_schema_is_made_durable_before_the_room_writes_
     );
     // With the metadata in the directory of the engine, the store and the open of the storage
     // room both sync it.
-    assert_durable_before_written(&files.log()[failed_at..], dir_name);
+    assert_durable_before_written(&files, dir_name);
 }
 
 /// The metadata in a directory of their own: the sync of the store is the only one of that
@@ -913,7 +921,6 @@ async fn metadata_apart_from_the_engine_are_durable_before_the_room_writes_after
     // `Registered` synced their directory.
     let before_save = std::fs::read(&meta_path).unwrap();
     files.fail_next("sync_dir", meta_name);
-    let failed_at = files.log().len();
     let synced = client.sync(room_id.clone()).await;
     assert!(matches!(synced, Err(ClientError::Storage(_))), "{synced:?}");
     open_room(&client, &room_id).await.unwrap();
@@ -923,20 +930,16 @@ async fn metadata_apart_from_the_engine_are_durable_before_the_room_writes_after
         without_trailing_nulls(&replica),
         without_trailing_nulls(&expected)
     );
-    let log = files.log()[failed_at..].to_vec();
-    assert_durable_before_written(&log, meta_name);
+    assert_durable_before_written(&files, meta_name);
 
     // A crash keeps what the syncs made durable: the operations the WAL synced, and the rename
-    // of the save, the only one since, if a sync of the directory of the metadata followed the
-    // one that failed. Otherwise, the metadata go back to what they held before it.
-    let rename = "rename room_room-a.meta.tmp room_room-a.meta";
-    let renames: Vec<usize> = (log.iter().enumerate())
-        .filter(|(_, logged)| *logged == rename)
-        .map(|(index, _)| index)
-        .collect();
-    assert_eq!(renames.len(), 1, "{log:#?}");
-    let synced_meta = format!("sync_dir {meta_name}");
-    let durable = log[renames[0] + 2..].contains(&synced_meta);
+    // of the save, the last one of the file, if a sync of the directory of the metadata followed
+    // the one that failed. Otherwise, the metadata go back to what they held before it.
+    let (failed, log) = failed_sync(&files, meta_name);
+    let after_failed = &log[failed + 1..];
+    let rename = "rename room_room-a.meta.tmp room_room-a.meta".to_string();
+    assert!(!after_failed.contains(&rename), "{log:#?}");
+    let durable = after_failed.contains(&format!("sync_dir {meta_name}"));
     drop(client);
     drop(storage);
     if !durable {

@@ -36,7 +36,9 @@ pub trait MetadataStore: Debug + Send + Sync {
     async fn close(&self);
 
     /// The metadata of `room_id`, or `None` if it has none. An error reading them is an error,
-    /// never missing metadata.
+    /// never missing metadata. While the store is open, from [`open`](Self::open) to
+    /// [`close`](Self::close), what it serves is durable; a store that is not open serves what it
+    /// reads, without that guarantee.
     async fn room(&self, room_id: &RoomId) -> io::Result<Option<RoomMetadata>>;
 
     /// Replaces the metadata of `room_id`, durably and atomically.
@@ -59,12 +61,13 @@ pub trait MetadataStore: Debug + Send + Sync {
 /// not verify counts as missing. A temporary file is never read: the next save replaces it, and
 /// removing the metadata of its room removes it.
 ///
-/// The metadata of a room are durable before they are served: the first time since the store
-/// opened, and after a save or a removal of them that failed, at any step. Where a sync of the
-/// directory makes durable what already happened (`sync_dir_covers_earlier_changes`), as on the
-/// file system of the process, the store syncs it when it opens and before it serves a room
-/// after a failure. Where it does not, as on the Origin Private File System, it saves again what
-/// it reads before it serves it, and repeats a removal that failed, serving no metadata. If it
+/// While the store is open, the metadata of a room are durable before they are served: the
+/// first time since the store opened, and after a save or a removal of them that failed, at any
+/// step. Where a sync of the directory makes durable what already happened
+/// (`sync_dir_covers_earlier_changes`), as on the file system of the process, the store syncs
+/// the directory and its parent when it opens, and the directory before it serves a room after
+/// a failure. Where it does not, as on the Origin Private File System, it saves again what it
+/// reads before it serves it, and repeats a removal that failed, serving no metadata. If it
 /// cannot, reading the room fails, so the room does not open.
 ///
 /// Each operation runs in a task of its own, which runs to its end even if its caller stops
@@ -84,9 +87,9 @@ struct State<F: RoomFiles> {
     /// The handle of `client.lock` while the store is open.
     lock: Option<F::File>,
     /// What the store knows of the metadata of each room since it opened, by the name of their
-    /// file. Those of a room it knows nothing of are durable where a sync of the directory makes
-    /// durable what already happened, since the open synced it; elsewhere, they are served for
-    /// the first time.
+    /// file, which holds while it is open. Those of a room it knows nothing of are durable where
+    /// a sync of the directory makes durable what already happened, since the open synced it;
+    /// elsewhere, they are served for the first time.
     rooms: HashMap<String, Known>,
 }
 
@@ -211,10 +214,14 @@ impl<F: RoomFiles> MetadataStore for FileMetadata<F> {
                     io::Error::new(io::ErrorKind::WouldBlock, message)
                 })?;
                 // Where it does, this sync makes durable what the operations before this open
-                // left, those that failed included, before anything is served; elsewhere, each
-                // room is saved again the first time it is served. So the store forgets its
-                // failures, which another store over the same directory never knew.
-                files.sync_dir(&dir).await?;
+                // left, those that failed included, before anything is served, and so does the
+                // sync of the parent for the entry of the directory, whose creation may not have
+                // been synced; elsewhere, each room is saved again the first time it is served.
+                // So the store forgets its failures, which another store over the same directory
+                // never knew.
+                for synced in [Some(dir.as_path()), dir.parent()].into_iter().flatten() {
+                    files.sync_dir(synced).await?;
+                }
                 state.rooms.clear();
                 let device_id = match read::<Device>(&*files, &dir, "client.meta").await? {
                     Some(device) => device.device_id,

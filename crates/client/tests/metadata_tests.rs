@@ -72,7 +72,8 @@ async fn a_file_is_replaced_by_a_synced_temporary_file_renamed_with_no_handle_op
     store.save_room(&room(), &metadata(5)).await.unwrap();
     store.close().await;
 
-    let dir_name = dir.path().file_name().unwrap().to_str().unwrap();
+    let parent_name = dir_name(dir.path().parent().unwrap());
+    let dir_name = dir_name(dir.path());
     let replace = |name: &str| {
         [
             format!("create {name}.tmp"),
@@ -87,6 +88,7 @@ async fn a_file_is_replaced_by_a_synced_temporary_file_renamed_with_no_handle_op
         format!("create_dir_all {dir_name}"),
         "open_locked client.lock".to_string(),
         format!("sync_dir {dir_name}"),
+        format!("sync_dir {parent_name}"),
         "open_read client.meta".to_string(),
     ];
     expected.extend(replace("client.meta"));
@@ -572,6 +574,7 @@ async fn a_store_opened_again_syncs_the_directory_before_it_serves_anything() {
             "create_dir_all data",
             "open_locked client.lock",
             "sync_dir data",
+            &format!("sync_dir {}", dir_name(dir.path())),
             "open_read client.meta",
             "close client.meta",
         ];
@@ -632,6 +635,70 @@ async fn a_save_cut_by_its_caller_that_fails_in_its_task_is_synced_before_it_is_
 }
 
 #[tokio::test]
+async fn an_open_syncs_the_directory_and_then_its_parent_or_fails() {
+    let dir = tempdir().unwrap();
+    let data = dir.path().join("data");
+    let parent = format!("sync_dir {}", dir_name(dir.path()));
+    let files = TestFiles::default();
+    let store = FileMetadata::with_files(&data, files.clone());
+    store.open().await.unwrap();
+    let opened = [
+        "create_dir_all data",
+        "open_locked client.lock",
+        "sync_dir data",
+        &parent,
+        "open_read client.meta",
+    ];
+    assert_eq!(files.log()[..5], opened);
+    store.close().await;
+    // Once the directory exists, its creation is not synced again: the open syncs its entry.
+    let before = files.log().len();
+    store.open().await.unwrap();
+    assert_eq!(files.log()[before..][..4], opened[..4]);
+    store.close().await;
+
+    // A sync of the parent that fails fails the open, which serves nothing.
+    let files = TestFiles::failing("sync_dir", dir_name(dir.path()));
+    let flaky = FileMetadata::with_files(&data, files.clone());
+    assert!(flaky.open().await.is_err());
+    assert_eq!(files.log(), [&opened[..4], &["close client.lock"]].concat());
+}
+
+#[tokio::test]
+async fn a_save_or_a_removal_whose_task_panics_after_its_rename_leaves_the_room_marked() {
+    let layers = [
+        ("native", TestFiles::default()),
+        ("opfs", TestFiles::with_the_sync_dir_of_the_opfs()),
+    ];
+    for (layer, files) in layers {
+        for removal in [false, true] {
+            let dir = tempdir().unwrap();
+            let store = saved_store(dir.path(), &files).await;
+            // The last step panics: the save renamed its file, or the removal removed it.
+            files.panic_next("sync_dir", "data");
+            let failed = match removal {
+                false => store.save_room(&room(), &metadata(6)).await,
+                true => store.remove_room(&room()).await,
+            };
+            let panicked = failed.expect_err("the task panicked").to_string();
+            assert!(panicked.contains("panicked"), "{panicked}");
+            let kept = after_failing(removal, ("sync_dir", "data"));
+            let expected = match (layer, removal) {
+                ("native", _) => {
+                    let mut synced = vec!["sync_dir data".to_string()];
+                    synced.extend(read_log(kept.is_some()));
+                    synced
+                }
+                (_, false) => [read_log(true), save_log()].concat(),
+                (_, true) => removal_log(),
+            };
+            let (read, log) = served(&store, &files).await;
+            assert_eq!((read, log), (kept, expected), "{layer} {removal}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn without_a_sync_that_covers_earlier_changes_the_first_read_of_a_room_saves_it_again() {
     let dir = tempdir().unwrap();
     let data = dir.path().join("data");
@@ -663,6 +730,30 @@ async fn without_a_sync_that_covers_earlier_changes_the_first_read_of_a_room_sav
     store.open().await.unwrap();
     let (read, log) = served(&store, &files).await;
     assert_eq!((read, log), (Some(metadata(6)), saved_again));
+}
+
+#[tokio::test]
+async fn without_a_sync_that_covers_earlier_changes_metadata_that_do_not_verify_are_not_saved() {
+    let dir = tempdir().unwrap();
+    let data = dir.path().join("data");
+    let earlier = FileMetadata::new(&data);
+    earlier.open().await.unwrap();
+    earlier.save_room(&room(), &metadata(5)).await.unwrap();
+    earlier.close().await;
+    let bytes = std::fs::read(room_file(&data)).unwrap();
+    std::fs::write(room_file(&data), &bytes[..bytes.len() - 1]).unwrap();
+
+    let files = TestFiles::with_the_sync_dir_of_the_opfs();
+    let store = FileMetadata::with_files(&data, files.clone());
+    store.open().await.unwrap();
+    for read in ["first", "second"] {
+        let (served_now, log) = served(&store, &files).await;
+        assert_eq!((served_now, log), (None, read_log(true)), "{read}");
+    }
+    assert_eq!(
+        std::fs::read(room_file(&data)).unwrap(),
+        bytes[..bytes.len() - 1]
+    );
 }
 
 #[tokio::test]
@@ -700,6 +791,27 @@ async fn without_a_sync_that_covers_earlier_changes_a_failed_removal_is_repeated
         assert!(!data.join("room_room-a.meta.tmp").exists(), "{step:?}");
         let (read, log) = served(&store, &files).await;
         assert_eq!((read, log), (None, read_log(false)), "{step:?}");
+
+        // With the store closed and opened again, the removal is not repeated: the open forgot
+        // it, and what it left is saved again and served the first time.
+        let dir = tempdir().unwrap();
+        let store = saved_store(dir.path(), &files).await;
+        fail(&store, &files, true, step).await;
+        store.close().await;
+        store.open().await.unwrap();
+        let kept = after_failing(true, step);
+        let mut first_read = read_log(kept.is_some());
+        if kept.is_some() {
+            first_read.extend(save_log());
+        }
+        let (read, log) = served(&store, &files).await;
+        assert_eq!((&read, log), (&kept, first_read), "{step:?}");
+        let (read, log) = served(&store, &files).await;
+        assert_eq!(
+            (read, log),
+            (kept.clone(), read_log(kept.is_some())),
+            "{step:?}"
+        );
     }
 }
 
