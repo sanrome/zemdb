@@ -2228,3 +2228,28 @@ async fn a_room_marked_as_failed_checks_on_the_state_it_publishes() {
         "{result:?}"
     );
 }
+
+/// The automatic compaction runs in a task of its own that nobody awaits: once the batch that
+/// triggers it returns, the compaction holds the compaction lock and has not run yet, and it runs
+/// to its end, with the lock, while nothing awaits it.
+#[tokio::test]
+async fn the_automatic_compaction_runs_in_a_task_that_nobody_awaits() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = crate::DiskStorageOptions::new(dir.path())
+        .min_compaction_bytes(1)
+        .compaction_ratio(0.01);
+    let engine = DiskStorageEngine::new(options).unwrap();
+    let room = RoomId::new("auto-compaction").unwrap();
+    engine.open_room(&room, schema()).await.unwrap();
+    engine.apply_batch(&room, vec![insert(1)]).await.unwrap();
+
+    let opened = engine.get_room(&room).await.unwrap();
+    assert!(
+        opened.compaction.try_lock().is_err(),
+        "the batch waited for the compaction, or did not launch it"
+    );
+    assert_eq!(opened.state.read().await.snapshot_seq.get(), 0);
+    drop(opened.compaction.lock().await);
+    assert_eq!(opened.state.read().await.snapshot_seq.get(), 1);
+    assert!(!compacting_wal_path(&engine.wal_file_path(&room)).exists());
+}

@@ -9,6 +9,7 @@
 //!   constraints only if they meet them.
 //!
 //! The ignored variants run many more cases: `cargo test --release -- --ignored`.
+#![allow(clippy::disallowed_methods)]
 
 use bytes::Bytes;
 use futures::StreamExt;

@@ -13,6 +13,9 @@ workspace = true
 [dependencies]
 zemdb-core = { path = "../../../crates/core" }
 zemdb-server = { path = "../../../crates/server" }
+# The native snapshots of the suite `engine`, and the check of those of the browser.
+zemdb-storage = { path = "../../../crates/storage" }
+futures = "0.3"
 axum = "0.7"
 bytes = "1.6"
 http-body = "1"

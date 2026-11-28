@@ -19,7 +19,7 @@ const CLIENT: &str = "harness#page";
 const CUT_WAIT_MS: i32 = 5000;
 
 /// A request to the origin of the page, from the Worker.
-async fn fetch(
+pub(crate) async fn fetch(
     method: &str,
     path: &str,
     headers: &[(&str, &str)],
@@ -41,7 +41,7 @@ async fn fetch(
     Ok(response.unchecked_into())
 }
 
-async fn bytes(response: &Response) -> Result<Vec<u8>, JsError> {
+pub(crate) async fn bytes(response: &Response) -> Result<Vec<u8>, JsError> {
     let buffer = response.array_buffer().map_err(failed("arrayBuffer"))?;
     let buffer = JsFuture::from(buffer)
         .await
@@ -49,7 +49,7 @@ async fn bytes(response: &Response) -> Result<Vec<u8>, JsError> {
     Ok(Uint8Array::new(&buffer).to_vec())
 }
 
-async fn text(response: &Response) -> Result<String, JsError> {
+pub(crate) async fn text(response: &Response) -> Result<String, JsError> {
     Ok(String::from_utf8_lossy(&bytes(response).await?).into_owned())
 }
 

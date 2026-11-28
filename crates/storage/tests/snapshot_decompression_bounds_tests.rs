@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods)]
+
 use zemdb_core::*;
 use zemdb_storage::snapshot::{
     decode_snapshot_envelope, decode_snapshot_envelope_with_limit, encode_snapshot_envelope,

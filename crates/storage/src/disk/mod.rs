@@ -23,15 +23,15 @@ use crate::disk::wal::WalWriter;
 use crate::engine::{batched_scan, ApplyReport, RejectReason, RowStream, StorageEngine};
 use crate::error::StorageError;
 use crate::fail_point;
-use crate::files::{NativeFiles, RoomFile, RoomFiles};
+use crate::files::{PlatformFiles, RoomFile, RoomFiles};
 use crate::memory::state::{
     apply_operation, check_operation, decode_received_snapshot, resolve_table_id, validate_batch,
     RoomData, TableRef,
 };
 use crate::memory::RoomSnapshotRef;
 use crate::options::ScanOptions;
-use crate::snapshot::DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES;
-use crate::sys::run_blocking;
+use crate::snapshot::{zstd_levels, DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES};
+use crate::sys::{self, run_blocking};
 
 /// Options to configure `DiskStorageEngine`.
 #[derive(Debug, Clone)]
@@ -43,8 +43,9 @@ pub struct DiskStorageOptions {
     pub compaction_ratio: f64,
     /// Minimum WAL size in bytes before automatic compaction can trigger (default: 64 KB).
     pub min_compaction_bytes: u64,
-    /// Zstandard compression level for base snapshots (default: 3), within
-    /// `zstd::compression_level_range()`.
+    /// Zstandard compression level for base snapshots, one of the levels of the platform: natively
+    /// those of `zstd::compression_level_range()` (default: 3); in WebAssembly only 1 (the default
+    /// there), which `ruzstd` gives with its `Fastest` level.
     pub zstd_level: i32,
     /// Whether automatic compaction is enabled during write batches (default: true).
     pub auto_compact: bool,
@@ -60,7 +61,7 @@ impl DiskStorageOptions {
             data_dir: data_dir.into(),
             compaction_ratio: 3.0,
             min_compaction_bytes: 64 * 1024,
-            zstd_level: 3,
+            zstd_level: DEFAULT_ZSTD_LEVEL,
             auto_compact: true,
             max_snapshot_uncompressed_bytes: DEFAULT_MAX_SNAPSHOT_UNCOMPRESSED_BYTES,
         }
@@ -96,6 +97,13 @@ impl DiskStorageOptions {
         self
     }
 }
+
+/// The default of [`DiskStorageOptions::zstd_level`].
+#[cfg(not(target_arch = "wasm32"))]
+const DEFAULT_ZSTD_LEVEL: i32 = 3;
+/// The default of [`DiskStorageOptions::zstd_level`]: the only level in WebAssembly.
+#[cfg(target_arch = "wasm32")]
+const DEFAULT_ZSTD_LEVEL: i32 = 1;
 
 /// The append-only WAL of an open room. Lives behind the room's WAL mutex.
 #[derive(Debug)]
@@ -238,12 +246,13 @@ pub(crate) struct DiskRoom<F: RoomFiles> {
 ///   `0xBA7C` and a CRC32.
 ///
 /// Every operation on the room's files goes through the file layer `F` (see [`crate::files`]),
-/// by default the file system of the process.
+/// by default the one of the platform: the file system of the process, or in WebAssembly the
+/// Origin Private File System.
 ///
 /// See `DiskRoom` for the locking of an open room and `compactor::compact_room_cow` for how
 /// the WAL is folded into a new snapshot.
 #[derive(Debug)]
-pub struct DiskStorageEngine<F: RoomFiles = NativeFiles> {
+pub struct DiskStorageEngine<F: RoomFiles = PlatformFiles> {
     options: DiskStorageOptions,
     files: Arc<F>,
     rooms: Arc<RwLock<HashMap<RoomId, Arc<DiskRoom<F>>>>>,
@@ -260,18 +269,18 @@ impl<F: RoomFiles> Clone for DiskStorageEngine<F> {
 }
 
 impl DiskStorageEngine {
-    /// Creates an engine with `options` on the file system of the process (see
+    /// Creates an engine with `options` on the file layer of the platform (see
     /// [`Self::with_files`]).
     pub fn new(options: DiskStorageOptions) -> Result<Self, StorageError> {
-        Self::with_files(options, NativeFiles)
+        Self::with_files(options, PlatformFiles::default())
     }
 }
 
 impl<F: RoomFiles> DiskStorageEngine<F> {
     /// Creates an engine with `options` whose files go through `files`, or `InvalidOptions` if
     /// `compaction_ratio` is not a finite number above 0 (with NaN, 0 or a negative ratio, every
-    /// batch would compact once the WAL reaches `min_compaction_bytes`) or `zstd_level` is
-    /// outside the levels Zstandard accepts.
+    /// batch would compact once the WAL reaches `min_compaction_bytes`) or `zstd_level` is not a
+    /// level of the platform ([`DiskStorageOptions::zstd_level`]).
     pub fn with_files(options: DiskStorageOptions, files: F) -> Result<Self, StorageError> {
         let ratio = options.compaction_ratio;
         if !(ratio.is_finite() && ratio > 0.0) {
@@ -279,7 +288,7 @@ impl<F: RoomFiles> DiskStorageEngine<F> {
                 "compaction_ratio must be a finite number above 0, got {ratio}"
             )));
         }
-        let levels = zstd::compression_level_range();
+        let levels = zstd_levels();
         if !levels.contains(&options.zstd_level) {
             return Err(StorageError::InvalidOptions(format!(
                 "zstd_level must be between {} and {}, got {}",
@@ -394,7 +403,7 @@ impl<F: RoomFiles> DiskStorageEngine<F> {
         let lock = self.compaction_lock(room_id).await?;
         let (room, guard) = self.lock_compaction(room_id, lock).await?;
         let options = self.options.clone();
-        tokio::spawn(async move {
+        sys::spawn(async move {
             let _guard = guard;
             compact_room_cow(room, &options).await
         })
@@ -449,7 +458,7 @@ impl<F: RoomFiles> StorageEngine for DiskStorageEngine<F> {
         let lock_path = self.lock_file_path(&room_id);
         let zstd_level = self.options.zstd_level;
         let files = Arc::clone(&self.files);
-        tokio::spawn(async move {
+        sys::spawn(async move {
             files.create_dir_all(&data_dir).await?;
             let (lock, wal_file) =
                 lock_room_files(&*files, &lock_path, &wal_path, &room_id).await?;
@@ -531,7 +540,7 @@ impl<F: RoomFiles> StorageEngine for DiskStorageEngine<F> {
         let (snap_path, wal_path) = (self.snap_file_path(&room_id), self.wal_file_path(&room_id));
         let lock_path = self.lock_file_path(&room_id);
         let files = Arc::clone(&self.files);
-        tokio::spawn(async move {
+        sys::spawn(async move {
             let _rooms = rooms;
             files.create_dir_all(&data_dir).await?;
             let (_lock, wal_file) =
@@ -688,12 +697,13 @@ impl<F: RoomFiles> StorageEngine for DiskStorageEngine<F> {
             if let Ok(compaction_guard) = Arc::clone(&room.compaction).try_lock_owned() {
                 let room = Arc::clone(&room);
                 let options_clone = self.options.clone();
-                tokio::spawn(async move {
+                // Nobody awaits it: it runs to its end with the compaction lock.
+                drop(sys::spawn(async move {
                     let _guard = compaction_guard;
                     if let Err(e) = compact_room_cow(room, &options_clone).await {
                         tracing::error!(error = %e, "Background auto-compaction failed");
                     }
-                });
+                }));
             }
         }
 
@@ -820,7 +830,7 @@ impl<F: RoomFiles> StorageEngine for DiskStorageEngine<F> {
         crate::fail_point::pause("apply_snapshot.lock", &self.wal_file_path(room_id)).await;
         let (room, compaction_guard) = self.lock_compaction(room_id, lock).await?;
         let zstd_level = self.options.zstd_level;
-        tokio::spawn(async move {
+        sys::spawn(async move {
             let _compaction_guard = compaction_guard;
             // A first check spares staging a snapshot that cannot be applied. Writers may still
             // advance the head until the WAL mutex is taken.
@@ -897,6 +907,10 @@ fn snapshot_head_outcome(
     (snapshot == current).then_some(Ok(current))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 #[path = "../tests/disk.rs"]
+mod tests;
+
+#[cfg(all(test, target_arch = "wasm32"))]
+#[path = "tests/wasm32.rs"]
 mod tests;

@@ -64,7 +64,6 @@ impl RoomData {
     /// `tables` with the indexes of the constraints of `schema` built from their rows, in
     /// O(N log N) per constraint: outside WebAssembly, callers run it on the blocking pool.
     pub(crate) fn build(schema: &Schema, tables: HashMap<u16, Table>) -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
         crate::fail_point::thread_point("room_data.build");
         let indexes = schema
             .tables()
@@ -98,7 +97,6 @@ impl RoomData {
     /// `from_rows` it takes O(tables and constraints), and is only right for rows that hold
     /// `NULL` in every column their schema lacks, which every new constraint includes.
     pub(crate) fn evolved(&self, schema: &Schema, from_rows: bool) -> Self {
-        #[cfg(not(target_arch = "wasm32"))]
         if from_rows {
             crate::fail_point::thread_point("room_data.build");
         }
@@ -131,9 +129,7 @@ impl RoomData {
     /// [`RoomData::check`], for the constraints that `schema` adds to `older`, the schema it
     /// evolves from (`Schema::evolves_from`): each of them includes a column that its table
     /// lacks in `older`, so a row of a table of `older` is checked as an update of those
-    /// columns, and a table that `older` lacks is checked whole. Only the disk engine, which is
-    /// not built for WebAssembly, needs it.
-    #[cfg(not(target_arch = "wasm32"))]
+    /// columns, and a table that `older` lacks is checked whole. Only the disk engine needs it.
     pub(crate) fn check_added(&self, older: &Schema, schema: &Schema) -> Result<(), StorageError> {
         self.check_constraints(schema, |table| {
             let old = older.get_table_by_id(table.table_id())?;
@@ -148,7 +144,6 @@ impl RoomData {
         schema: &Schema,
         new_columns: impl Fn(&TableSchema) -> Option<Vec<usize>>,
     ) -> Result<(), StorageError> {
-        #[cfg(not(target_arch = "wasm32"))]
         crate::fail_point::thread_point("room_data.build");
         for table in schema.tables() {
             let set_columns = new_columns(table);
