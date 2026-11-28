@@ -723,6 +723,54 @@ async fn a_failed_step_stops_the_discard_and_the_next_open_deletes_again() {
     assert_eq!(tasks(&storage, &room_id).await, [1, 2, 3]);
 }
 
+#[tokio::test]
+async fn a_removal_whose_sync_failed_is_made_durable_before_the_next_open_reads_the_metadata() {
+    let (server, data_dir, meta_dir) = (TestServer::new(), tempdir().unwrap(), tempdir().unwrap());
+    let room_id = server.create_room("room-a").await;
+    let meta_name = dir_name(meta_dir.path());
+    let files = TestFiles::default();
+    let storage = DiskStorageEngine::with_files(options(data_dir.path()), files.clone()).unwrap();
+    let transport = server.transport();
+    let client = Client::open(
+        ClientConfig::new("ana"),
+        storage.clone(),
+        FileMetadata::with_files(meta_dir.path(), files.clone()),
+        transport.clone(),
+        TestTokens::new(),
+    )
+    .await
+    .unwrap();
+    open_room(&client, &room_id).await.unwrap();
+    server.commit(&room_id, 1..=3).await;
+    client.sync(room_id.clone()).await.unwrap();
+
+    // The removal removes the file of the metadata, and the sync of their directory fails.
+    files.fail_next("sync_dir", meta_name);
+    let failed_at = files.log().len();
+    let discarded = client.discard_room(room_id.clone()).await;
+    assert!(
+        matches!(discarded, Err(ClientError::Storage(_))),
+        "{discarded:?}"
+    );
+    assert_eq!(client.status(room_id.clone()).await, closed(&room_id));
+    assert_eq!(metadata(meta_dir.path(), &room_id).await, None);
+
+    // The next open finds no metadata, deletes the data and registers without a cursor; before
+    // it reads the metadata, a sync of their directory makes the removal durable.
+    open_room(&client, &room_id).await.unwrap();
+    assert_eq!(transport.registrations(), [(None, None), (None, None)]);
+    assert!(tasks(&storage, &room_id).await.is_empty());
+    let log = files.log()[failed_at..].to_vec();
+    let synced = format!("sync_dir {meta_name}");
+    let removal = ["remove room_room-a.meta", "remove room_room-a.meta.tmp"];
+    assert_eq!(log[..3], [removal[0], removal[1], &synced], "{log:#?}");
+    let read = (log
+        .iter()
+        .position(|logged| logged == "open_read room_room-a.meta"))
+    .expect("read");
+    assert_eq!(log[read - 1], synced, "{log:#?}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_write_waiting_for_the_discard_is_room_closed_and_after_shutdown_it_is_room_closed() {
     let dir = tempdir().unwrap();

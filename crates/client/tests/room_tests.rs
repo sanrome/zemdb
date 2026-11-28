@@ -432,6 +432,72 @@ async fn a_failed_save_of_the_metadata_of_registered_leaves_the_room_out() {
 }
 
 #[tokio::test]
+async fn metadata_of_registered_whose_sync_failed_are_made_durable_before_the_room_writes() {
+    let (server, data_dir, meta_dir) = (TestServer::new(), tempdir().unwrap(), tempdir().unwrap());
+    let room_id = server.create_room("room-a").await;
+    let meta_name = dir_name(meta_dir.path());
+    let files = TestFiles::default();
+    let storage = DiskStorageEngine::with_files(options(data_dir.path()), files.clone()).unwrap();
+    let transport = server.transport();
+    let client = Client::open(
+        ClientConfig::new("ana"),
+        storage.clone(),
+        FileMetadata::with_files(meta_dir.path(), files.clone()),
+        transport.clone(),
+        TestTokens::new(),
+    )
+    .await
+    .unwrap();
+    // Without metadata, the open removes them first, and syncs their directory; the sync that
+    // fails is that of the save of `Registered`.
+    let mut held = transport.hold_next_reply(ClientMessageKind::RegisterClient);
+    let opening = open_room(&client, &room_id);
+    tokio::pin!(opening);
+    tokio::select! {
+        opened = &mut opening => panic!("the registration is held: {opened:?}"),
+        () = held.replied() => {}
+    }
+    files.fail_next("sync_dir", meta_name);
+    let failed_at = files.log().len();
+    held.release();
+    let opened = opening.await;
+    assert!(matches!(opened, Err(ClientError::Storage(_))), "{opened:?}");
+    // The room is not served with them: it stays out of the client, and its storage room does
+    // not open.
+    assert_eq!(client.status(room_id.clone()).await, closed(&room_id));
+    let head = storage.get_head_seq(&room_id).await;
+    assert!(
+        matches!(head, Err(StorageError::RoomNotFound(_))),
+        "{head:?}"
+    );
+    // Their rename landed, so the next open reads them.
+    let incarnation = server.incarnation(&room_id).await;
+    let saved = metadata(meta_dir.path(), &room_id).await;
+    assert_eq!(saved.map(|saved| saved.room_incarnation), Some(incarnation));
+
+    server.commit(&room_id, 1..=3).await;
+    open_room(&client, &room_id).await.unwrap();
+    client.sync(room_id.clone()).await.unwrap();
+    assert_eq!(tasks(&storage, &room_id).await, [1, 2, 3]);
+    let registrations = [(None, None), (Some(0), Some(incarnation))];
+    assert_eq!(transport.registrations(), registrations);
+    // A sync of their directory after the one that failed, before the storage room opens, and
+    // so before anything is written under them.
+    let log = files.log()[failed_at..].to_vec();
+    let synced = format!("sync_dir {meta_name}");
+    let at = |entry: &str| log.iter().position(|logged| logged == entry).expect(entry);
+    let renamed = at("rename room_room-a.meta.tmp room_room-a.meta");
+    assert_eq!(log[renamed + 1], synced, "{log:#?}");
+    let after_failed = || log.iter().skip(renamed + 2);
+    let synced_again = after_failed().position(|logged| *logged == synced);
+    let opened = after_failed().position(|logged| logged == "open_locked room_room-a.lock");
+    let written = after_failed().position(|logged| logged.starts_with("write_at room_room-a.wal"));
+    let (synced_again, opened) = (synced_again.expect("synced"), opened.expect("opened"));
+    assert!(synced_again < opened, "{log:#?}");
+    assert!(opened < written.expect("written"), "{log:#?}");
+}
+
+#[tokio::test]
 async fn a_discard_whose_metadata_are_not_removed_keeps_the_data() {
     let (server, dir) = (TestServer::new(), tempdir().unwrap());
     let room_id = server.create_room("room-a").await;

@@ -1500,13 +1500,14 @@ Y los dos que §5.3 del plan de la fase deja a este plan: cómo espera el arnés
     - *Attempts*: los finales de una escritura con un error del cliente.
   - El rustdoc de `ClientError::Config`, que no nombraba el backoff, el plazo ni los snapshots, y el de `Client::write`, que no nombraba los finales con un error del cliente ni el `CommitAck` que llega después de cerrar la sala.
 - **Al backlog** (Bajos de tests y de código: `INVARIANTES.md` §1.2):
-  - **DEF-189 · Bajo · (a) · C1, K6, K16.**
+  - **DEF-189 · Bajo · (a) · C1, K6, K16 · ✅ Hecho (28 de Noviembre de 2026, en el Lote 5 de [4.5](2026-11-fase4_5-navegador.md)).**
     - **Qué pasa:** un guardado de los metadatos cuyo `sync_dir` falla después del rename deja el archivo visible, pero quizás no durable; la sala se cierra, y su próxima apertura lo usa.
     - **En la configuración del contrato** (`FileMetadata` en el directorio del motor), abrir la sala del storage sincroniza ese directorio antes de escribir nada bajo ese esquema.
     - **Con los metadatos en otro directorio**, que §11 excluye pero el código no impide, un crash puede conservar en el WAL las operaciones del esquema nuevo y perder el rename. La réplica reabre entonces con el esquema viejo, más angosto que su log, y diverge sin aviso.
     - **Por qué es Bajo:** solo pasa fuera de la configuración del contrato. Dentro de ella, por D91, una divergencia sin aviso conservaría la severidad de C1.
     - **Fix:** que `FileMetadata` vuelva a sincronizar su directorio antes de servir lo que guardó después de un error, o atar en el código los metadatos al directorio del motor; y que lo cumpla el OPFS, en 4.5.
     - **Test:** en `replica.patch`, que falla a propósito.
+    - **Hecho** con la primera forma del fix, y no atando los metadatos al directorio del motor (DC45 del plan de 4.5): `FileMetadata` hace durables los metadatos de una sala antes de servirlos la primera vez desde que se abrió el store y después de un guardado o un borrado que falló, en cualquier paso; en nativo, sincronizando su directorio al abrir el store y antes de servir después de una falla, así que valen en cualquier directorio; en el OPFS, volviendo a guardar lo que lee y repitiendo un borrado que falló (en el código desde el mismo lote, y en el navegador en el Lote 8 de 4.5). Los dos tests de `replica.patch` entraron a la suite con otro nombre y sin códigos (`crates/client/tests/schema_tests.rs`): el de los metadatos en otro directorio ya no diverge, con el crash sacado del log de la capa de prueba.
   - **DEF-190 · Bajo · (a) · K7, K15 · ✅ Hecho (fix chico, fuera de lote).**
     - **Qué pasa:** una réplica detrás del log, cuyo único snapshot pasa `max_snapshot_bytes`, pide su primer chunk (hasta 4 MiB) en cada heartbeat. Una escritura con su `CommitAck` que la esperaba lo pidió 251 veces en 600 s.
     - **Por qué:** un snapshot más largo que el tope no queda descartado (`dropped`), como sí queda uno que no se instala. Con el `SyncWorker` de 4.3, pasaría en cada heartbeat.

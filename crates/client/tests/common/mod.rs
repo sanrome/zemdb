@@ -1184,6 +1184,7 @@ pub struct TestFiles {
     fail_next: Arc<Mutex<Option<(&'static str, &'static str)>>>,
     next_write_delay: Arc<Mutex<Option<Duration>>>,
     log: Arc<Mutex<Vec<String>>>,
+    sync_dir_covers_only_its_own: bool,
 }
 
 impl TestFiles {
@@ -1192,6 +1193,16 @@ impl TestFiles {
     pub fn failing(operation: &'static str, name: &'static str) -> Self {
         Self {
             failing: Some((operation, name)),
+            ..Self::default()
+        }
+    }
+
+    /// A layer whose `sync_dir` says, as on the Origin Private File System, that it does not
+    /// make durable a change that already happened: only those of the operations that succeeded
+    /// ([`RoomFiles::sync_dir_covers_earlier_changes`] is `false`).
+    pub fn with_the_sync_dir_of_the_opfs() -> Self {
+        Self {
+            sync_dir_covers_only_its_own: true,
             ..Self::default()
         }
     }
@@ -1254,6 +1265,12 @@ fn name(path: &Path) -> &str {
     path.file_name().and_then(|name| name.to_str()).unwrap()
 }
 
+/// The name of the directory `dir` as a [`TestFiles`] logs it, which [`TestFiles::fail_next`]
+/// takes.
+pub fn dir_name(dir: &Path) -> &'static str {
+    Box::leak(name(dir).to_string().into_boxed_str())
+}
+
 #[async_trait]
 impl RoomFiles for TestFiles {
     type File = TestFile;
@@ -1309,7 +1326,7 @@ impl RoomFiles for TestFiles {
     }
 
     fn sync_dir_covers_earlier_changes(&self) -> bool {
-        NativeFiles.sync_dir_covers_earlier_changes()
+        !self.sync_dir_covers_only_its_own && NativeFiles.sync_dir_covers_earlier_changes()
     }
 }
 
